@@ -35,20 +35,39 @@ def list_navigation_dates(root_kind: RootKind, settings: NavigationSettings | No
 
 def _parse_metadata(metadata_path: Path) -> list[TopicInfo]:
     payload = yaml.safe_load(metadata_path.read_text(encoding="utf-8")) or {}
-    bag_info = payload.get("rosbag2_bagfile_information") or {}
-    topic_entries = bag_info.get("topics_with_message_count") or []
+    if not isinstance(payload, dict):
+        raise ValueError("metadata must be a mapping")
+
+    bag_info = payload.get("rosbag2_bagfile_information")
+    if not isinstance(bag_info, dict):
+        raise ValueError("missing rosbag2_bagfile_information")
+
+    topic_entries = bag_info.get("topics_with_message_count")
+    if not isinstance(topic_entries, list):
+        raise ValueError("missing or invalid topics_with_message_count")
 
     topics: list[TopicInfo] = []
-    for entry in topic_entries:
-        topic_metadata = entry.get("topic_metadata") or {}
+    for index, entry in enumerate(topic_entries):
+        if not isinstance(entry, dict):
+            raise ValueError(f"topic entry {index} must be a mapping")
+
+        topic_metadata = entry.get("topic_metadata")
+        if not isinstance(topic_metadata, dict):
+            raise ValueError(f"topic entry {index} missing topic_metadata")
+
         name = topic_metadata.get("name")
-        if not name:
-            continue
+        if not isinstance(name, str) or not name:
+            raise ValueError(f"topic entry {index} missing topic name")
+
+        message_count = entry.get("message_count")
+        if isinstance(message_count, bool) or not isinstance(message_count, int) or message_count < 0:
+            raise ValueError(f"topic entry {index} has invalid message_count")
+
         topics.append(
             TopicInfo(
                 name=name,
                 type=topic_metadata.get("type"),
-                message_count=entry.get("message_count") or 0,
+                message_count=message_count,
             )
         )
     return topics
@@ -95,14 +114,17 @@ def classify_navigation_dataset(
 
 @function_tool
 def list_navigation_dates_tool(root_kind: RootKind) -> dict:
+    """List available navigation dataset dates under a VLADatasets root kind."""
     return {"dates": list_navigation_dates(root_kind)}
 
 
 @function_tool
 def inspect_raw_date_tool(date: str) -> dict:
+    """Inspect raw navigation metadata for one date and report segment topics or errors."""
     return inspect_raw_date(date).model_dump(mode="json")
 
 
-@function_tool
+@function_tool(strict_mode=False)
 def classify_navigation_dataset_tool(date: str, segments: list[str] | None = None) -> dict:
+    """Classify a raw navigation date using all segments, or a selected segment list when provided."""
     return classify_navigation_dataset(date, segments=segments).model_dump(mode="json")
