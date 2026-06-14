@@ -32,3 +32,7 @@ vla-nav-agent plan --date 20270605 --dry-run
 ```bash
 vla-nav-agent run --date 20270605
 ```
+
+## Server runbook
+
+See `docs/navigation-server-runbook.md` for server setup, dry-run, and full execution commands.
