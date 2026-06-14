@@ -118,6 +118,51 @@ def test_dry_run_execution_steps_are_composable_without_prior_outputs(tmp_path):
     assert not (root / "finish_data").exists()
 
 
+def test_dry_run_chain_from_raw_fixtures_only_does_not_create_intermediate_dirs(tmp_path):
+    root = tmp_path / "VLADatasets"
+    raw_date = root / "raw_data" / "20270605"
+    (raw_date / "20260605_152856").mkdir(parents=True)
+    settings = NavigationSettings(vladatasets_root=root, processing_root=Path("/processing"))
+
+    prepare_result = prepare_raw_data("20270605", settings=settings, dry_run=True)
+    extract_result = extract_and_sync_navigation_data(
+        "20270605",
+        "go2w_like",
+        settings=settings,
+        dry_run=True,
+    )
+    assemble_result = assemble_finish_temp("20270605", settings=settings, dry_run=True)
+
+    assert prepare_result.ok is True
+    assert extract_result.ok is True
+    assert assemble_result.ok is True
+    assert extract_result.details["selected_segments"] == ["20260605_152856"]
+    assert assemble_result.details["selected_segments"] == ["20260605_152856"]
+    assert assemble_result.details["copied_clips"] == ["20260605_152856"]
+    assert not (root / "raw_data" / "20270605_temp").exists()
+    assert not (root / "clip_data" / "20270605").exists()
+    assert not (root / "finish_data" / "20270605_temp").exists()
+
+
+def test_extract_and_sync_reports_missing_sync_data_after_successful_commands(tmp_path, monkeypatch):
+    root = tmp_path / "VLADatasets"
+    (root / "raw_data" / "20270605_temp" / "20260605_152856").mkdir(parents=True)
+    settings = NavigationSettings(vladatasets_root=root)
+
+    def fake_run_command(command, cwd=None, dry_run=False, timeout_seconds=None):
+        return CommandRecord(command=command, cwd=cwd, dry_run=dry_run, return_code=0)
+
+    monkeypatch.setattr("vla_data_juicer_agents.navigation.execution_tools.run_command", fake_run_command)
+
+    result = extract_and_sync_navigation_data("20270605", "go2w_like", settings=settings, dry_run=False)
+
+    assert result.ok is False
+    assert "Missing expected sync_data" in result.message
+    assert result.details["missing_sync_data"] == [
+        str(root / "clip_data" / "20270605" / "20260605_152856" / "sync_data")
+    ]
+
+
 def test_generate_gridmap_reports_missing_output_after_successful_command(tmp_path, monkeypatch):
     settings = NavigationSettings(vladatasets_root=tmp_path / "VLADatasets")
 

@@ -32,6 +32,14 @@ def _selected_segments(raw_date_path: Path, segments: list[str] | None) -> list[
     return segments
 
 
+def _selected_segments_for_dry_run(primary_path: Path, fallback_path: Path, segments: list[str] | None) -> list[str]:
+    if primary_path.exists():
+        return _selected_segments(primary_path, segments)
+    if segments is not None and not fallback_path.exists():
+        return segments
+    return _selected_segments(fallback_path, segments)
+
+
 def _resolve_data_path(path: str | Path, settings: NavigationSettings) -> Path:
     resolved = Path(path)
     if not resolved.is_absolute():
@@ -141,7 +149,10 @@ def extract_and_sync_navigation_data(
     settings = settings or NavigationSettings()
     profile = get_profile(dataset_profile)
     raw_temp_path = settings.raw_data_root / f"{date}_temp"
-    selected = _selected_segments(raw_temp_path, segments)
+    if dry_run:
+        selected = _selected_segments_for_dry_run(raw_temp_path, settings.raw_data_root / date, segments)
+    else:
+        selected = _selected_segments(raw_temp_path, segments)
     extract_script = settings.datatoolbox_src / "1_extract_data_from_bag_multi_process_ros2_U.py"
     sync_script = settings.datatoolbox_src / "2_sync_data_multi_process_U.py"
     commands = []
@@ -194,14 +205,28 @@ def extract_and_sync_navigation_data(
             )
         )
 
-    ok = _commands_ok(commands)
+    missing_sync_data = [
+        settings.clip_data_root / date / segment / "sync_data"
+        for segment in selected
+        if not dry_run and not (settings.clip_data_root / date / segment / "sync_data").exists()
+    ]
+    ok = _commands_ok(commands) and not missing_sync_data
     return ToolResult(
         ok=ok,
         tool_name="extract_and_sync_navigation_data",
-        message="Extracted and synchronized navigation data." if ok else "Extract/sync failed.",
+        message=(
+            "Extracted and synchronized navigation data."
+            if ok
+            else f"Missing expected sync_data: {missing_sync_data[0]}" if missing_sync_data else "Extract/sync failed."
+        ),
         produced_paths=[settings.clip_data_root / date],
         commands=commands,
-        details={"profile": profile.name, "selected_segments": selected, "dry_run": dry_run},
+        details={
+            "profile": profile.name,
+            "selected_segments": selected,
+            "missing_sync_data": [str(path) for path in missing_sync_data],
+            "dry_run": dry_run,
+        },
     )
 
 
@@ -214,7 +239,10 @@ def assemble_finish_temp(
     date = _validate_date(date)
     settings = settings or NavigationSettings()
     clip_date_root = settings.clip_data_root / date
-    selected = _selected_segments(clip_date_root, segments)
+    if dry_run:
+        selected = _selected_segments_for_dry_run(clip_date_root, settings.raw_data_root / date, segments)
+    else:
+        selected = _selected_segments(clip_date_root, segments)
     finish_temp = settings.finish_data_root / f"{date}_temp"
     samples_date_root = finish_temp / "samples" / date
     sensor_source = settings.processing_root / "NoobScenes" / "params" / "20260409_U" / "sensors"
