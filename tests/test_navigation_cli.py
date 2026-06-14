@@ -1,4 +1,6 @@
 import asyncio
+import json
+from pathlib import Path
 
 import pytest
 
@@ -27,3 +29,23 @@ def test_run_no_llm_is_rejected_without_dashscope_key(monkeypatch, capsys):
     captured = capsys.readouterr()
     assert exit_code == 2
     assert "--no-llm only supports the plan command" in captured.err
+
+
+def test_no_llm_plan_writes_run_state(tmp_path, monkeypatch, capsys):
+    fixture_root = Path(__file__).parent / "fixtures" / "navigation" / "VLADatasets"
+    runs_root = tmp_path / "runs"
+    monkeypatch.setenv("VLA_VLADATASETS_ROOT", str(fixture_root))
+    monkeypatch.setenv("VLA_RUNS_ROOT", str(runs_root))
+
+    exit_code = asyncio.run(async_main(["plan", "--date", "20270605", "--dry-run", "--no-llm"]))
+
+    capsys.readouterr()
+    assert exit_code == 0
+    run_dirs = list((runs_root / "20270605").iterdir())
+    assert len(run_dirs) == 1
+    run_dir = run_dirs[0]
+    assert json.loads((run_dir / "request.json").read_text(encoding="utf-8"))["date"] == "20270605"
+    assert json.loads((run_dir / "plan.json").read_text(encoding="utf-8"))["date"] == "20270605"
+    final_report = json.loads((run_dir / "final_report.json").read_text(encoding="utf-8"))
+    assert final_report["status"] == "planned"
+    assert final_report["ok"] is True

@@ -6,8 +6,10 @@ import json
 import sys
 
 from vla_data_juicer_agents.navigation.agents import create_executor_agent, create_plan_agent
+from vla_data_juicer_agents.navigation.config import NavigationSettings
 from vla_data_juicer_agents.navigation.inspection import classify_navigation_dataset
 from vla_data_juicer_agents.navigation.models import NavigationRequest
+from vla_data_juicer_agents.navigation.run_state import WorkflowRunStore
 from vla_data_juicer_agents.navigation.workflow import (
     build_deterministic_plan_template,
     run_executor_agent,
@@ -42,21 +44,39 @@ async def async_main(argv: list[str] | None = None) -> int:
         if args.command != "plan":
             print("--no-llm only supports the plan command.", file=sys.stderr)
             return 2
+    settings = NavigationSettings()
+    run_store = WorkflowRunStore(settings.runs_root)
+    run_dir = run_store.create_run(request.date)
+    run_store.write_json(run_dir, "request.json", request.model_dump(mode="json"))
+
+    if args.no_llm:
         classification = classify_navigation_dataset(request.date, request.segments)
         if not classification.profile_name:
             print(json.dumps(classification.model_dump(), indent=2, ensure_ascii=False))
+            run_store.write_json(
+                run_dir,
+                "final_report.json",
+                {"status": "failed", "ok": False, "classification": classification.model_dump(mode="json")},
+            )
             return 2
         plan = build_deterministic_plan_template(request.date, classification.profile_name, request.segments)
     else:
         plan_agent = create_plan_agent(model=args.model)
         plan = await run_plan_agent(plan_agent, request)
+    run_store.write_json(run_dir, "plan.json", plan.model_dump(mode="json"))
 
     if args.command == "plan":
+        run_store.write_json(run_dir, "final_report.json", {"status": "planned", "ok": True})
         print(plan.model_dump_json(indent=2))
         return 0
 
     executor_agent = create_executor_agent(model=args.model, dry_run=args.dry_run)
     final_output = await run_executor_agent(executor_agent, plan)
+    run_store.write_json(
+        run_dir,
+        "final_report.json",
+        {"status": "completed", "ok": True, "final_output": final_output},
+    )
     print(final_output)
     return 0
 

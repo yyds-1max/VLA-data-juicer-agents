@@ -14,6 +14,7 @@ from vla_data_juicer_agents.navigation.execution_tools import (
     prepare_raw_data,
     run_initial_annotation_gui,
     run_noobscene_preprocessing,
+    run_tracking_and_projection,
 )
 from vla_data_juicer_agents.navigation.models import CommandRecord
 
@@ -52,6 +53,77 @@ def test_generate_gridmap_from_pcd_dry_run_builds_command(tmp_path):
     assert "20270605" in command
     assert "--segments" in command
     assert "20260605_152856" in command
+
+
+def test_noobscene_preprocessing_dry_run_includes_develop_generation_outputs(tmp_path):
+    root = tmp_path / "VLADatasets"
+    settings = NavigationSettings(vladatasets_root=root, processing_root=Path("/processing"))
+    finish_temp = settings.finish_data_root / "20270605_temp"
+
+    result = run_noobscene_preprocessing(finish_temp, settings=settings, dry_run=True)
+
+    commands = [record.command for record in result.commands]
+    produced_paths = {path.as_posix() for path in result.produced_paths}
+    assert any(command[-1] == "./main_smart_odom.py" for command in commands)
+    assert (finish_temp / "v1.0-trainval").as_posix() in produced_paths
+    assert (finish_temp / "maps" / "map.png").as_posix() in produced_paths
+
+
+def test_tracking_and_projection_dry_run_runs_tracking_for_matching_yaml(tmp_path):
+    root = tmp_path / "VLADatasets"
+    finish_temp = root / "finish_data" / "20270605_temp"
+    clip = finish_temp / "samples" / "20270605" / "20260605_152856"
+    clip.mkdir(parents=True)
+    (clip / "master_color_color_color.yaml").write_text("{}", encoding="utf-8")
+    settings = NavigationSettings(vladatasets_root=root, processing_root=Path("/processing"))
+
+    result = run_tracking_and_projection(
+        finish_temp,
+        root / "finish_data" / "20270605",
+        settings=settings,
+        dry_run=True,
+    )
+
+    assert any(record.command == ["./bin/main"] for record in result.commands)
+    assert result.details["tracking_yaml_count"] == 1
+
+
+def test_generate_gridmap_requires_grid_json_after_successful_command(tmp_path, monkeypatch):
+    root = tmp_path / "VLADatasets"
+    (root / "clip_data" / "20270605" / "20260605_152856").mkdir(parents=True)
+    settings = NavigationSettings(vladatasets_root=root)
+
+    def fake_run_command(command, cwd=None, dry_run=False, timeout_seconds=None):
+        return CommandRecord(command=command, cwd=cwd, dry_run=dry_run, return_code=0)
+
+    monkeypatch.setattr("vla_data_juicer_agents.navigation.execution_tools.run_command", fake_run_command)
+
+    result = generate_gridmap_from_pcd("20270605", settings=settings, dry_run=False)
+
+    assert result.ok is False
+    assert "grid_map" in result.message
+
+
+def test_u_legacy_like_dry_run_reports_topic_mapping_and_lidar_query_dir(tmp_path):
+    root = tmp_path / "VLADatasets"
+    (root / "raw_data" / "20270605_temp" / "20260605_152856").mkdir(parents=True)
+    settings = NavigationSettings(vladatasets_root=root, datatoolbox_src=Path("/datatoolbox/src"))
+
+    result = extract_and_sync_navigation_data("20270605", "u_legacy_like", settings=settings, dry_run=True)
+
+    sync_commands = [record.command for record in result.commands if "2_sync_data_multi_process_U.py" in record.command[1]]
+    assert result.details["extract_topics"] == [
+        "/cam_video5/csi_cam/image_raw/compressed",
+        "/lidar_points",
+        "/utlidar/robot_odom_systime",
+    ]
+    assert result.details["sync_topic_map"] == {
+        "cam_video5": "fisheye_front",
+        "lidar_points": "r32_rslidar_points",
+        "utlidar": "odom",
+    }
+    assert sync_commands
+    assert sync_commands[0][sync_commands[0].index("--query_dir") + 1] == "lidar_points"
 
 
 def test_bound_dry_run_prepare_tool_does_not_create_outputs(tmp_path, monkeypatch):
@@ -186,3 +258,13 @@ def test_extract_and_sync_empty_segment_root_is_not_successful(tmp_path):
 
     assert result.ok is False
     assert "No selected segments" in result.message
+    assert result.details["extract_topics"] == [
+        "/cam_video4/csi_cam/image_raw/compressed",
+        "/rs32_lidar_points",
+        "/sport_odom",
+    ]
+    assert result.details["sync_topic_map"] == {
+        "cam_video4": "fisheye_front",
+        "rs32_lidar_points": "r32_rslidar_points",
+        "sport_odom": "odom",
+    }

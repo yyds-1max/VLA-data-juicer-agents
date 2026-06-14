@@ -1,4 +1,5 @@
 import shutil
+import re
 from pathlib import Path
 from typing import Any
 
@@ -68,6 +69,25 @@ def _missing_outputs(produced_paths: list[Path], dry_run: bool) -> list[Path]:
     return [path for path in produced_paths if not path.exists()]
 
 
+def _replace_with_symlink(link_path: Path, target_path: Path) -> None:
+    if link_path.is_symlink() or link_path.is_file():
+        link_path.unlink()
+    elif link_path.exists():
+        raise FileExistsError(f"Refusing to replace existing directory with symlink: {link_path}")
+    link_path.symlink_to(target_path, target_is_directory=True)
+
+
+def _copy_directory_contents(source: Path, target: Path) -> None:
+    target.mkdir(parents=True, exist_ok=True)
+    for child in source.iterdir():
+        destination = target / child.name
+        if child.is_dir():
+            shutil.copytree(child, destination, dirs_exist_ok=True)
+        elif child.is_file():
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(child, destination)
+
+
 def prepare_raw_data(
     date: str,
     segments: list[str] | None = None,
@@ -121,19 +141,22 @@ def generate_gridmap_from_pcd(
 
     record = run_command(command, dry_run=dry_run)
     produced_paths = [settings.clip_data_root / date]
+    grid_jsons = [] if dry_run else sorted((settings.clip_data_root / date).glob("**/grid_map/*.json"))
     missing_outputs = _missing_outputs(produced_paths, dry_run)
-    ok = (dry_run or record.return_code == 0) and not missing_outputs
+    missing_grid_json = not dry_run and record.return_code == 0 and not missing_outputs and not grid_jsons
+    ok = (dry_run or record.return_code == 0) and not missing_outputs and not missing_grid_json
     return ToolResult(
         ok=ok,
         tool_name="generate_gridmap_from_pcd",
         message=(
             "Generated gridmap from PCD."
             if ok
+            else f"Missing expected grid_map JSON under: {settings.clip_data_root / date}" if missing_grid_json
             else f"Missing expected output: {missing_outputs[0]}" if missing_outputs else "Gridmap generation failed."
         ),
         produced_paths=produced_paths,
         commands=[record],
-        details={"date": date, "segments": segments, "dry_run": dry_run},
+        details={"date": date, "segments": segments, "dry_run": dry_run, "grid_json_count": len(grid_jsons)},
     )
 
 
@@ -162,7 +185,13 @@ def extract_and_sync_navigation_data(
             tool_name="extract_and_sync_navigation_data",
             message="No selected segments for extract/sync.",
             produced_paths=[settings.clip_data_root / date],
-            details={"profile": profile.name, "selected_segments": selected, "dry_run": dry_run},
+            details={
+                "profile": profile.name,
+                "selected_segments": selected,
+                "extract_topics": list(profile.extract_topics),
+                "sync_topic_map": dict(profile.sync_topic_map),
+                "dry_run": dry_run,
+            },
         )
 
     for segment in selected:
@@ -210,7 +239,18 @@ def extract_and_sync_navigation_data(
         for segment in selected
         if not dry_run and not (settings.clip_data_root / date / segment / "sync_data").exists()
     ]
-    ok = _commands_ok(commands) and not missing_sync_data
+    expected_sync_dirs = tuple(profile.sync_topic_map.values())
+    missing_sync_topic_dirs = []
+    if not dry_run:
+        for segment in selected:
+            sync_root = settings.clip_data_root / date / segment / "sync_data"
+            if not sync_root.exists():
+                continue
+            sync_clips = sorted(path for path in sync_root.iterdir() if path.is_dir())
+            if not any(all((clip / child_name).is_dir() for child_name in expected_sync_dirs) for clip in sync_clips):
+                missing_sync_topic_dirs.append(str(sync_root))
+
+    ok = _commands_ok(commands) and not missing_sync_data and not missing_sync_topic_dirs
     return ToolResult(
         ok=ok,
         tool_name="extract_and_sync_navigation_data",
@@ -224,7 +264,10 @@ def extract_and_sync_navigation_data(
         details={
             "profile": profile.name,
             "selected_segments": selected,
+            "extract_topics": list(profile.extract_topics),
+            "sync_topic_map": dict(profile.sync_topic_map),
             "missing_sync_data": [str(path) for path in missing_sync_data],
+            "missing_sync_topic_dirs": missing_sync_topic_dirs,
             "dry_run": dry_run,
         },
     )
@@ -294,11 +337,14 @@ def run_noobscene_preprocessing(
 ) -> ToolResult:
     settings = settings or NavigationSettings()
     root = _resolve_data_path(finish_temp_path, settings)
+    noobscene_root = settings.processing_root / "NoobScenes"
+    trainval_path = root / "v1.0-trainval"
+    map_path = root / "maps" / "map.png"
     commands = [
         run_command(
             [
                 settings.python_bin,
-                str(settings.processing_root / "NoobScenes" / "include" / "0_creat_box.py"),
+                str(noobscene_root / "include" / "0_creat_box.py"),
                 "--dataset_root",
                 str(root),
             ],
@@ -307,7 +353,7 @@ def run_noobscene_preprocessing(
         run_command(
             [
                 settings.python_bin,
-                str(settings.processing_root / "NoobScenes" / "include" / "1_odom_convert.py"),
+                str(noobscene_root / "include" / "1_odom_convert.py"),
                 "--temp_path",
                 str(root),
             ],
@@ -316,14 +362,36 @@ def run_noobscene_preprocessing(
         run_command(
             [
                 settings.python_bin,
-                str(settings.processing_root / "NoobScenes" / "include" / "2_resize.py"),
+                str(noobscene_root / "include" / "2_resize.py"),
                 "--temp_path",
                 str(root),
             ],
             dry_run=dry_run,
         ),
     ]
-    produced_paths = [root / "v1.0-trainval"]
+    if dry_run or _commands_ok(commands):
+        if not dry_run:
+            trainval_path.mkdir(parents=True, exist_ok=True)
+            _replace_with_symlink(noobscene_root / "samples", root / "samples")
+
+        commands.append(
+            run_command(
+                [settings.python_bin, "./main_smart_odom.py"],
+                cwd=noobscene_root,
+                dry_run=dry_run,
+            )
+        )
+
+        if not dry_run and commands[-1].return_code == 0:
+            develop_path = noobscene_root / "v1.0-develop"
+            if develop_path.exists():
+                _copy_directory_contents(develop_path, trainval_path)
+            source_map = noobscene_root / "maps" / "map.png"
+            if source_map.exists() and not map_path.exists():
+                map_path.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(source_map, map_path)
+
+    produced_paths = [trainval_path, map_path]
     missing_outputs = _missing_outputs(produced_paths, dry_run)
     ok = _commands_and_outputs_ok(commands, produced_paths, dry_run)
     return ToolResult(
@@ -373,6 +441,13 @@ def run_tracking_and_projection(
     root = _resolve_data_path(finish_temp_path, settings)
     final = _resolve_data_path(finish_path, settings)
     pt_project = settings.processing_root / "2_pt_project"
+    tracking_root = settings.processing_root / "1_onnx_tam"
+    tracking_yaml_re = re.compile(r"^((master|other[0-9]+)_[a-z]+_[a-z]+_[a-z]+)\.yaml$")
+    tracking_yamls = sorted(
+        path
+        for path in (root / "samples").glob("*/*/*.yaml")
+        if tracking_yaml_re.match(path.name)
+    )
     commands = [
         run_command(
             [
@@ -383,53 +458,92 @@ def run_tracking_and_projection(
             ],
             dry_run=dry_run,
         ),
-        run_command(
-            [settings.python_bin, "main.py", "--data_root", str(root)],
-            cwd=settings.processing_root / "NuscenesAanlysis_smart_pts_project",
-            dry_run=dry_run,
-        ),
-        run_command(
-            [settings.python_bin, str(pt_project / "0_img2world.py"), str(root)],
-            cwd=pt_project,
-            dry_run=dry_run,
-        ),
-        run_command(
-            [settings.python_bin, str(pt_project / "4_speed_direction_odom.py"), str(root)],
-            cwd=pt_project,
-            dry_run=dry_run,
-        ),
-        run_command(
-            [settings.python_bin, str(pt_project / "2_othermethod_cjl.py"), str(root)],
-            cwd=pt_project,
-            dry_run=dry_run,
-        ),
-        run_command(
-            [
-                settings.python_bin,
-                str(pt_project / "3_move_dir.py"),
-                "--root_path",
-                str(final),
-                "--temp_path",
-                str(root),
-            ],
-            cwd=pt_project,
-            dry_run=dry_run,
-        ),
     ]
+    tracking_error = None
+    if not dry_run and not tracking_yamls:
+        tracking_error = f"No tracking YAML files found under {root / 'samples'}"
+
+    if tracking_error is None:
+        for yaml_path in tracking_yamls:
+            match = tracking_yaml_re.match(yaml_path.name)
+            assert match is not None
+            yaml_stem = match.group(1)
+            if not dry_run:
+                dog_yaml = tracking_root / "Data" / "3_param" / "dog.yaml"
+                dog_yaml.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(yaml_path, dog_yaml)
+
+            tracking_record = run_command(["./bin/main"], cwd=tracking_root, dry_run=dry_run)
+            commands.append(tracking_record)
+            if not dry_run and tracking_record.return_code != 0:
+                tracking_error = f"Tracking command failed for {yaml_path}"
+                break
+
+            if not dry_run:
+                output_root = tracking_root / "Data" / "1_img_output"
+                tracking_img = output_root / "tracking_img"
+                tracking_img_target = yaml_path.parent / f"tracking_img_{yaml_stem}"
+                if tracking_img.exists():
+                    shutil.move(str(tracking_img), str(tracking_img_target))
+
+                img_points = output_root / "img_points.txt"
+                if img_points.exists():
+                    shutil.move(str(img_points), str(yaml_path.parent / f"img_{yaml_stem}.txt"))
+
+                tracking_img.mkdir(parents=True, exist_ok=True)
+
+    if tracking_error is None and _commands_ok(commands):
+        commands.extend(
+            [
+                run_command(
+                    [settings.python_bin, "main.py", "--data_root", str(root)],
+                    cwd=settings.processing_root / "NuscenesAanlysis_smart_pts_project",
+                    dry_run=dry_run,
+                ),
+                run_command(
+                    [settings.python_bin, str(pt_project / "0_img2world.py"), str(root)],
+                    cwd=pt_project,
+                    dry_run=dry_run,
+                ),
+                run_command(
+                    [settings.python_bin, str(pt_project / "4_speed_direction_odom.py"), str(root)],
+                    cwd=pt_project,
+                    dry_run=dry_run,
+                ),
+                run_command(
+                    [settings.python_bin, str(pt_project / "2_othermethod_cjl.py"), str(root)],
+                    cwd=pt_project,
+                    dry_run=dry_run,
+                ),
+                run_command(
+                    [
+                        settings.python_bin,
+                        str(pt_project / "3_move_dir.py"),
+                        "--root_path",
+                        str(final),
+                        "--temp_path",
+                        str(root),
+                    ],
+                    cwd=pt_project,
+                    dry_run=dry_run,
+                ),
+            ]
+        )
     produced_paths = [final]
     missing_outputs = _missing_outputs(produced_paths, dry_run)
-    ok = _commands_and_outputs_ok(commands, produced_paths, dry_run)
+    ok = tracking_error is None and _commands_and_outputs_ok(commands, produced_paths, dry_run)
     return ToolResult(
         ok=ok,
         tool_name="run_tracking_and_projection",
         message=(
             "Ran tracking and projection."
             if ok
+            else tracking_error if tracking_error
             else f"Missing expected output: {missing_outputs[0]}" if missing_outputs else "Tracking/projection failed."
         ),
         produced_paths=produced_paths,
         commands=commands,
-        details={"dry_run": dry_run},
+        details={"dry_run": dry_run, "tracking_yaml_count": len(tracking_yamls)},
     )
 
 
