@@ -1,12 +1,21 @@
 import shutil
 from pathlib import Path
+from typing import Any
 
 from agents import function_tool
 
 from vla_data_juicer_agents.navigation.config import NavigationSettings
-from vla_data_juicer_agents.navigation.models import ToolResult
+from vla_data_juicer_agents.navigation.models import DATE_RE, ToolResult
 from vla_data_juicer_agents.navigation.profiles import get_profile
 from vla_data_juicer_agents.navigation.subprocess_runner import run_command
+
+
+def _validate_date(date: str) -> str:
+    import re
+
+    if not re.match(DATE_RE, date):
+        raise ValueError("date must use YYYYMMDD format")
+    return date
 
 
 def _selected_segments(raw_date_path: Path, segments: list[str] | None) -> list[str]:
@@ -25,13 +34,30 @@ def _selected_segments(raw_date_path: Path, segments: list[str] | None) -> list[
 
 def _resolve_data_path(path: str | Path, settings: NavigationSettings) -> Path:
     resolved = Path(path)
-    if resolved.is_absolute():
-        return resolved
-    return settings.vladatasets_root / resolved
+    if not resolved.is_absolute():
+        resolved = settings.vladatasets_root / resolved
+
+    root = settings.vladatasets_root.resolve(strict=False)
+    resolved = resolved.resolve(strict=False)
+    if not resolved.is_relative_to(root):
+        raise ValueError(f"Resolved path must be within {root}: {resolved}")
+    return resolved
 
 
 def _commands_ok(commands) -> bool:
-    return all(command.dry_run or command.return_code == 0 for command in commands)
+    return bool(commands) and all(command.dry_run or command.return_code == 0 for command in commands)
+
+
+def _commands_and_outputs_ok(commands, produced_paths: list[Path], dry_run: bool) -> bool:
+    if not _commands_ok(commands):
+        return False
+    return dry_run or all(path.exists() for path in produced_paths)
+
+
+def _missing_outputs(produced_paths: list[Path], dry_run: bool) -> list[Path]:
+    if dry_run:
+        return []
+    return [path for path in produced_paths if not path.exists()]
 
 
 def prepare_raw_data(
@@ -40,6 +66,7 @@ def prepare_raw_data(
     settings: NavigationSettings | None = None,
     dry_run: bool = False,
 ) -> ToolResult:
+    date = _validate_date(date)
     settings = settings or NavigationSettings()
     raw_date_path = settings.raw_data_root / date
     selected = _selected_segments(raw_date_path, segments)
@@ -71,6 +98,7 @@ def generate_gridmap_from_pcd(
     settings: NavigationSettings | None = None,
     dry_run: bool = False,
 ) -> ToolResult:
+    date = _validate_date(date)
     settings = settings or NavigationSettings()
     command = [
         settings.python_bin,
@@ -84,12 +112,18 @@ def generate_gridmap_from_pcd(
         command.extend(["--segments", *segments])
 
     record = run_command(command, dry_run=dry_run)
-    ok = dry_run or record.return_code == 0
+    produced_paths = [settings.clip_data_root / date]
+    missing_outputs = _missing_outputs(produced_paths, dry_run)
+    ok = (dry_run or record.return_code == 0) and not missing_outputs
     return ToolResult(
         ok=ok,
         tool_name="generate_gridmap_from_pcd",
-        message="Generated gridmap from PCD." if ok else "Gridmap generation failed.",
-        produced_paths=[settings.clip_data_root / date],
+        message=(
+            "Generated gridmap from PCD."
+            if ok
+            else f"Missing expected output: {missing_outputs[0]}" if missing_outputs else "Gridmap generation failed."
+        ),
+        produced_paths=produced_paths,
         commands=[record],
         details={"date": date, "segments": segments, "dry_run": dry_run},
     )
@@ -103,6 +137,7 @@ def extract_and_sync_navigation_data(
     settings: NavigationSettings | None = None,
     dry_run: bool = False,
 ) -> ToolResult:
+    date = _validate_date(date)
     settings = settings or NavigationSettings()
     profile = get_profile(dataset_profile)
     raw_temp_path = settings.raw_data_root / f"{date}_temp"
@@ -110,6 +145,14 @@ def extract_and_sync_navigation_data(
     extract_script = settings.datatoolbox_src / "1_extract_data_from_bag_multi_process_ros2_U.py"
     sync_script = settings.datatoolbox_src / "2_sync_data_multi_process_U.py"
     commands = []
+    if not selected:
+        return ToolResult(
+            ok=False,
+            tool_name="extract_and_sync_navigation_data",
+            message="No selected segments for extract/sync.",
+            produced_paths=[settings.clip_data_root / date],
+            details={"profile": profile.name, "selected_segments": selected, "dry_run": dry_run},
+        )
 
     for segment in selected:
         data_path = raw_temp_path / segment
@@ -168,6 +211,7 @@ def assemble_finish_temp(
     settings: NavigationSettings | None = None,
     dry_run: bool = False,
 ) -> ToolResult:
+    date = _validate_date(date)
     settings = settings or NavigationSettings()
     clip_date_root = settings.clip_data_root / date
     selected = _selected_segments(clip_date_root, segments)
@@ -178,9 +222,18 @@ def assemble_finish_temp(
 
     for segment in selected:
         sync_root = clip_date_root / segment / "sync_data"
-        if not sync_root.exists():
+        if not sync_root.exists() and not dry_run:
             raise FileNotFoundError(f"Missing sync_data directory: {sync_root}")
-        for src_clip in sorted(path for path in sync_root.iterdir() if path.is_dir()):
+        if dry_run and not sync_root.exists():
+            copied_clips.append(segment)
+            continue
+
+        src_clips = sorted(path for path in sync_root.iterdir() if path.is_dir())
+        if dry_run and not src_clips:
+            copied_clips.append(segment)
+            continue
+
+        for src_clip in src_clips:
             dst_clip = samples_date_root / src_clip.name
             copied_clips.append(src_clip.name)
             if dry_run:
@@ -242,12 +295,18 @@ def run_noobscene_preprocessing(
             dry_run=dry_run,
         ),
     ]
-    ok = _commands_ok(commands)
+    produced_paths = [root / "v1.0-trainval"]
+    missing_outputs = _missing_outputs(produced_paths, dry_run)
+    ok = _commands_and_outputs_ok(commands, produced_paths, dry_run)
     return ToolResult(
         ok=ok,
         tool_name="run_noobscene_preprocessing",
-        message="Ran NoobScenes preprocessing." if ok else "NoobScenes preprocessing failed.",
-        produced_paths=[root / "v1.0-trainval"],
+        message=(
+            "Ran NoobScenes preprocessing."
+            if ok
+            else f"Missing expected output: {missing_outputs[0]}" if missing_outputs else "NoobScenes preprocessing failed."
+        ),
+        produced_paths=produced_paths,
         commands=commands,
         details={"dry_run": dry_run},
     )
@@ -329,12 +388,18 @@ def run_tracking_and_projection(
             dry_run=dry_run,
         ),
     ]
-    ok = _commands_ok(commands)
+    produced_paths = [final]
+    missing_outputs = _missing_outputs(produced_paths, dry_run)
+    ok = _commands_and_outputs_ok(commands, produced_paths, dry_run)
     return ToolResult(
         ok=ok,
         tool_name="run_tracking_and_projection",
-        message="Ran tracking and projection." if ok else "Tracking/projection failed.",
-        produced_paths=[final],
+        message=(
+            "Ran tracking and projection."
+            if ok
+            else f"Missing expected output: {missing_outputs[0]}" if missing_outputs else "Tracking/projection failed."
+        ),
+        produced_paths=produced_paths,
         commands=commands,
         details={"dry_run": dry_run},
     )
@@ -345,6 +410,7 @@ def validate_navigation_outputs(
     settings: NavigationSettings | None = None,
     dry_run: bool = False,
 ) -> ToolResult:
+    date = _validate_date(date)
     settings = settings or NavigationSettings()
     final = settings.finish_data_root / date
     exists = final.exists()
@@ -358,46 +424,69 @@ def validate_navigation_outputs(
     )
 
 
-@function_tool(strict_mode=False)
-def prepare_raw_data_tool(date: str, segments: list[str] | None = None) -> dict:
-    return prepare_raw_data(date, segments).model_dump(mode="json")
+def build_execution_tools(dry_run: bool = False) -> list[Any]:
+    @function_tool(strict_mode=False, name_override="prepare_raw_data_tool")
+    def bound_prepare_raw_data_tool(date: str, segments: list[str] | None = None) -> dict:
+        return prepare_raw_data(date, segments, dry_run=dry_run).model_dump(mode="json")
+
+    @function_tool(strict_mode=False, name_override="extract_and_sync_navigation_data_tool")
+    def bound_extract_and_sync_navigation_data_tool(
+        date: str,
+        dataset_profile: str,
+        segments: list[str] | None = None,
+        processes_num: int = 4,
+    ) -> dict:
+        return extract_and_sync_navigation_data(
+            date,
+            dataset_profile,
+            segments,
+            processes_num,
+            dry_run=dry_run,
+        ).model_dump(mode="json")
+
+    @function_tool(strict_mode=False, name_override="generate_gridmap_from_pcd_tool")
+    def bound_generate_gridmap_from_pcd_tool(date: str, segments: list[str] | None = None) -> dict:
+        return generate_gridmap_from_pcd(date, segments, dry_run=dry_run).model_dump(mode="json")
+
+    @function_tool(strict_mode=False, name_override="assemble_finish_temp_tool")
+    def bound_assemble_finish_temp_tool(date: str, segments: list[str] | None = None) -> dict:
+        return assemble_finish_temp(date, segments, dry_run=dry_run).model_dump(mode="json")
+
+    @function_tool(strict_mode=False, name_override="run_noobscene_preprocessing_tool")
+    def bound_run_noobscene_preprocessing_tool(finish_temp_path: str) -> dict:
+        return run_noobscene_preprocessing(finish_temp_path, dry_run=dry_run).model_dump(mode="json")
+
+    @function_tool(strict_mode=False, name_override="run_initial_annotation_gui_tool")
+    def bound_run_initial_annotation_gui_tool(finish_temp_path: str) -> dict:
+        return run_initial_annotation_gui(finish_temp_path, dry_run=dry_run).model_dump(mode="json")
+
+    @function_tool(strict_mode=False, name_override="run_tracking_and_projection_tool")
+    def bound_run_tracking_and_projection_tool(finish_temp_path: str, finish_path: str) -> dict:
+        return run_tracking_and_projection(finish_temp_path, finish_path, dry_run=dry_run).model_dump(mode="json")
+
+    @function_tool(strict_mode=False, name_override="validate_navigation_outputs_tool")
+    def bound_validate_navigation_outputs_tool(date: str) -> dict:
+        return validate_navigation_outputs(date, dry_run=dry_run).model_dump(mode="json")
+
+    return [
+        bound_prepare_raw_data_tool,
+        bound_extract_and_sync_navigation_data_tool,
+        bound_generate_gridmap_from_pcd_tool,
+        bound_assemble_finish_temp_tool,
+        bound_run_noobscene_preprocessing_tool,
+        bound_run_initial_annotation_gui_tool,
+        bound_run_tracking_and_projection_tool,
+        bound_validate_navigation_outputs_tool,
+    ]
 
 
-@function_tool(strict_mode=False)
-def extract_and_sync_navigation_data_tool(
-    date: str,
-    dataset_profile: str,
-    segments: list[str] | None = None,
-    processes_num: int = 4,
-) -> dict:
-    return extract_and_sync_navigation_data(date, dataset_profile, segments, processes_num).model_dump(mode="json")
-
-
-@function_tool(strict_mode=False)
-def generate_gridmap_from_pcd_tool(date: str, segments: list[str] | None = None) -> dict:
-    return generate_gridmap_from_pcd(date, segments).model_dump(mode="json")
-
-
-@function_tool(strict_mode=False)
-def assemble_finish_temp_tool(date: str, segments: list[str] | None = None) -> dict:
-    return assemble_finish_temp(date, segments).model_dump(mode="json")
-
-
-@function_tool(strict_mode=False)
-def run_noobscene_preprocessing_tool(finish_temp_path: str) -> dict:
-    return run_noobscene_preprocessing(finish_temp_path).model_dump(mode="json")
-
-
-@function_tool(strict_mode=False)
-def run_initial_annotation_gui_tool(finish_temp_path: str) -> dict:
-    return run_initial_annotation_gui(finish_temp_path).model_dump(mode="json")
-
-
-@function_tool(strict_mode=False)
-def run_tracking_and_projection_tool(finish_temp_path: str, finish_path: str) -> dict:
-    return run_tracking_and_projection(finish_temp_path, finish_path).model_dump(mode="json")
-
-
-@function_tool(strict_mode=False)
-def validate_navigation_outputs_tool(date: str) -> dict:
-    return validate_navigation_outputs(date).model_dump(mode="json")
+(
+    prepare_raw_data_tool,
+    extract_and_sync_navigation_data_tool,
+    generate_gridmap_from_pcd_tool,
+    assemble_finish_temp_tool,
+    run_noobscene_preprocessing_tool,
+    run_initial_annotation_gui_tool,
+    run_tracking_and_projection_tool,
+    validate_navigation_outputs_tool,
+) = build_execution_tools(dry_run=False)

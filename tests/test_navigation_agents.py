@@ -1,9 +1,17 @@
+import asyncio
 import json
+from types import SimpleNamespace
 
 import pytest
 
 from vla_data_juicer_agents.navigation.agents import create_executor_agent, create_plan_agent
 from vla_data_juicer_agents.navigation.workflow import build_deterministic_plan_template
+
+
+def _invoke_tool(tool, arguments):
+    ctx = SimpleNamespace(tool_name=tool.name, run_config=None, context=None)
+    payload = asyncio.run(tool.on_invoke_tool(ctx, json.dumps(arguments)))
+    return json.loads(payload) if isinstance(payload, str) else payload
 
 
 def test_create_plan_agent_has_read_only_tools(monkeypatch):
@@ -22,6 +30,23 @@ def test_create_executor_agent_has_execution_tools(monkeypatch):
 
     assert "prepare_raw_data_tool" in tool_names
     assert "run_initial_annotation_gui_tool" in tool_names
+
+
+def test_create_executor_agent_dry_run_binds_execution_tools(tmp_path, monkeypatch):
+    monkeypatch.setenv("DASHSCOPE_API_KEY", "test-key")
+    root = tmp_path / "VLADatasets"
+    raw_date = root / "raw_data" / "20270605"
+    (raw_date / "20260605_152856").mkdir(parents=True)
+    monkeypatch.setenv("VLA_VLADATASETS_ROOT", str(root))
+    agent = create_executor_agent(dry_run=True)
+    tool = {tool.name: tool for tool in agent.tools}["prepare_raw_data_tool"]
+
+    result = _invoke_tool(tool, {"date": "20270605"})
+
+    assert result["ok"] is True
+    assert result["details"]["dry_run"] is True
+    assert not (root / "raw_data" / "20270605_temp").exists()
+    assert not (root / "clip_data" / "20270605").exists()
 
 
 def test_executor_agent_has_sdk_tool_for_each_plan_step(monkeypatch):

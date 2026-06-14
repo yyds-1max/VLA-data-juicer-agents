@@ -4,14 +4,7 @@ from agents import Agent, OpenAIChatCompletionsModel, set_tracing_disabled
 from openai import AsyncOpenAI
 
 from vla_data_juicer_agents.navigation.execution_tools import (
-    assemble_finish_temp_tool,
-    extract_and_sync_navigation_data_tool,
-    generate_gridmap_from_pcd_tool,
-    prepare_raw_data_tool,
-    run_initial_annotation_gui_tool,
-    run_noobscene_preprocessing_tool,
-    run_tracking_and_projection_tool,
-    validate_navigation_outputs_tool,
+    build_execution_tools,
 )
 from vla_data_juicer_agents.navigation.inspection import (
     classify_navigation_dataset_tool,
@@ -81,14 +74,5 @@ def create_executor_agent(model: str | None = None, dry_run: bool = False) -> Ag
         name="Navigation ReAct Executor-Agent",
         instructions=instructions,
         model=create_qwen_model(model),
-        tools=[
-            prepare_raw_data_tool,
-            extract_and_sync_navigation_data_tool,
-            generate_gridmap_from_pcd_tool,
-            assemble_finish_temp_tool,
-            run_noobscene_preprocessing_tool,
-            run_initial_annotation_gui_tool,
-            run_tracking_and_projection_tool,
-            validate_navigation_outputs_tool,
-        ],
+        tools=build_execution_tools(dry_run=dry_run),
     )
