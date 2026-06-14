@@ -37,6 +37,8 @@ Supported profiles are u_legacy_like and go2w_like.
 EXECUTOR_AGENT_INSTRUCTIONS = """
 You are the Navigation ReAct Executor-Agent.
 Read WorkflowPlan JSON and execute matching tools step-by-step.
+For each WorkflowStep.tool_name, call the SDK tool with the same name plus "_tool"; for example,
+prepare_raw_data maps to prepare_raw_data_tool and run_initial_annotation_gui maps to run_initial_annotation_gui_tool.
 Stop on any failed tool result.
 The gen_box.py GUI step is human-blocking via run_initial_annotation_gui and blocks until the human finishes.
 Stage one covers prepare.sh, run_U.sh, and run_odom.sh only; do not include run_fix.sh.
@@ -46,7 +48,10 @@ Supported profiles are u_legacy_like and go2w_like.
 
 
 def create_qwen_model(model: str | None = None) -> OpenAIChatCompletionsModel:
-    api_key = os.environ["DASHSCOPE_API_KEY"]
+    api_key = os.environ.get("DASHSCOPE_API_KEY")
+    if not api_key:
+        raise RuntimeError("DASHSCOPE_API_KEY is required to create the navigation Qwen model.")
+
     base_url = os.environ.get("DASHSCOPE_BASE_URL", DEFAULT_DASHSCOPE_BASE_URL)
     model_name = model or os.environ.get("VLA_AGENT_MODEL", DEFAULT_NAVIGATION_MODEL)
     client = AsyncOpenAI(api_key=api_key, base_url=base_url)

@@ -1,14 +1,52 @@
+import json
+import re
+from typing import Any
+
+from pydantic import ValidationError
 from agents import Runner
 
 from vla_data_juicer_agents.navigation.models import NavigationRequest, WorkflowPlan, WorkflowStep
 
 
 def _finish_temp_path(date: str) -> str:
-    return f"finish_temp/{date}"
+    return f"finish_data/{date}_temp"
 
 
 def _finish_path(date: str) -> str:
-    return f"finish/{date}"
+    return f"finish_data/{date}"
+
+
+def _raw_output_excerpt(output: object, max_length: int = 120) -> str:
+    raw = "" if output is None else str(output)
+    raw = raw.replace("\n", "\\n")
+    return raw[:max_length]
+
+
+def _json_text_from_output(output: str) -> str:
+    text = output.strip()
+    fenced_match = re.fullmatch(r"```(?:json)?\s*(.*?)\s*```", text, flags=re.DOTALL | re.IGNORECASE)
+    if fenced_match:
+        return fenced_match.group(1).strip()
+    return text
+
+
+def _parse_workflow_plan_output(output: object) -> WorkflowPlan:
+    if isinstance(output, WorkflowPlan):
+        return output
+
+    try:
+        if isinstance(output, dict):
+            return WorkflowPlan.model_validate(output)
+
+        if isinstance(output, str) and output.strip():
+            payload: Any = json.loads(_json_text_from_output(output))
+            return WorkflowPlan.model_validate(payload)
+    except (json.JSONDecodeError, TypeError, ValidationError, ValueError) as exc:
+        raise ValueError(
+            f"Unable to parse WorkflowPlan output: {exc}; raw output excerpt={_raw_output_excerpt(output)!r}"
+        ) from exc
+
+    raise ValueError(f"Unable to parse WorkflowPlan output: empty or unsupported output; raw output excerpt={_raw_output_excerpt(output)!r}")
 
 
 def build_deterministic_plan_template(
@@ -96,7 +134,7 @@ async def run_plan_agent(agent, request: NavigationRequest) -> WorkflowPlan:
         f"NavigationRequest JSON:\n{request.model_dump_json()}"
     )
     result = await Runner.run(agent, prompt)
-    return WorkflowPlan.model_validate_json(result.final_output)
+    return _parse_workflow_plan_output(result.final_output)
 
 
 async def run_executor_agent(agent, plan: WorkflowPlan) -> str:
