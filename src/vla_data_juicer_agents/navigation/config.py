@@ -1,0 +1,52 @@
+import os
+from pathlib import Path
+
+from pydantic import BaseModel, Field
+
+
+DEFAULT_VLADATASETS_ROOT = Path("/media/heying/hy_data1/VLADatasets")
+DEFAULT_PROCESSING_ROOT = Path(
+    "/media/heying/hy_data1/Trajectory_visualization/"
+    "Object_location_gh_v3_fisheye_five_U_add_SF_01"
+)
+DEFAULT_DATATOOLBOX_SRC = Path("/media/heying/hy_data2/GT_dog/modules_ros2/DataToolbox/src")
+
+
+def _env_path(name: str, default: Path) -> Path:
+    value = os.getenv(name)
+    return Path(value) if value else default
+
+
+class NavigationSettings(BaseModel):
+    vladatasets_root: Path = Field(
+        default_factory=lambda: _env_path("VLA_VLADATASETS_ROOT", DEFAULT_VLADATASETS_ROOT)
+    )
+    processing_root: Path = Field(
+        default_factory=lambda: _env_path("VLA_PROCESSING_ROOT", DEFAULT_PROCESSING_ROOT)
+    )
+    datatoolbox_src: Path = Field(
+        default_factory=lambda: _env_path("VLA_DATATOOLBOX_SRC", DEFAULT_DATATOOLBOX_SRC)
+    )
+    runs_root: Path = Field(default_factory=lambda: _env_path("VLA_RUNS_ROOT", Path("runs/navigation")))
+    python_bin: str = Field(default_factory=lambda: os.getenv("VLA_PYTHON_BIN", "python3"))
+    process_owner: str | None = Field(default_factory=lambda: os.getenv("VLA_PROCESS_OWNER"))
+
+    @property
+    def raw_data_root(self) -> Path:
+        return self.vladatasets_root / "raw_data"
+
+    @property
+    def clip_data_root(self) -> Path:
+        return self.vladatasets_root / "clip_data"
+
+    @property
+    def finish_data_root(self) -> Path:
+        return self.vladatasets_root / "finish_data"
+
+    @property
+    def pcd_to_grid_script(self) -> Path:
+        return self.datatoolbox_src / "data_toolbox" / "pcd_to_grid" / "pcd_to_grid.py"
+
+    @property
+    def gen_box_script(self) -> Path:
+        return self.datatoolbox_src / "data_toolbox" / "gen_box" / "gen_box.py"
