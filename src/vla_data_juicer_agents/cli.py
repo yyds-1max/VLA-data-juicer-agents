@@ -1,0 +1,65 @@
+from __future__ import annotations
+
+import argparse
+import asyncio
+import json
+
+from vla_data_juicer_agents.navigation.agents import create_executor_agent, create_plan_agent
+from vla_data_juicer_agents.navigation.inspection import classify_navigation_dataset
+from vla_data_juicer_agents.navigation.models import NavigationRequest
+from vla_data_juicer_agents.navigation.workflow import (
+    build_deterministic_plan_template,
+    run_executor_agent,
+    run_plan_agent,
+)
+
+
+def parse_args(argv: list[str] | None = None):
+    parser = argparse.ArgumentParser(description="VLA navigation workflow agent")
+    subparsers = parser.add_subparsers(dest="command", required=True)
+
+    for command in ("plan", "run"):
+        sub = subparsers.add_parser(command)
+        sub.add_argument("--date", required=True)
+        sub.add_argument("--segments", nargs="*", default=None)
+        sub.add_argument("--dry-run", action="store_true")
+        sub.add_argument("--model", default=None, help="Qwen model id; defaults to VLA_AGENT_MODEL or qwen3.5-plus.")
+        sub.add_argument(
+            "--no-llm",
+            action="store_true",
+            help="Only build the deterministic plan template for local dry-run debugging.",
+        )
+
+    return parser.parse_args(argv)
+
+
+async def async_main(argv: list[str] | None = None) -> int:
+    args = parse_args(argv)
+    request = NavigationRequest(date=args.date, segments=args.segments, dry_run=args.dry_run)
+
+    if args.no_llm:
+        classification = classify_navigation_dataset(request.date, request.segments)
+        if not classification.profile_name:
+            print(json.dumps(classification.model_dump(), indent=2, ensure_ascii=False))
+            return 2
+        plan = build_deterministic_plan_template(request.date, classification.profile_name, request.segments)
+    else:
+        plan_agent = create_plan_agent(model=args.model)
+        plan = await run_plan_agent(plan_agent, request)
+
+    if args.command == "plan":
+        print(plan.model_dump_json(indent=2))
+        return 0
+
+    executor_agent = create_executor_agent(model=args.model, dry_run=args.dry_run)
+    final_output = await run_executor_agent(executor_agent, plan)
+    print(final_output)
+    return 0
+
+
+def main(argv: list[str] | None = None) -> int:
+    return asyncio.run(async_main(argv))
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
