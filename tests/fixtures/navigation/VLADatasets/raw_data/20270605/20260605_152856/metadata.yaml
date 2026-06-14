@@ -1,0 +1,27 @@
+rosbag2_bagfile_information:
+  version: 5
+  storage_identifier: sqlite3
+  relative_file_paths:
+    - 20260605_152856_0.db3
+  duration:
+    nanoseconds: 21872824365
+  starting_time:
+    nanoseconds_since_epoch: 1780644537605923086
+  message_count: 17655
+  topics_with_message_count:
+    - topic_metadata:
+        name: /cam_video4/csi_cam/image_raw/compressed
+        type: sensor_msgs/msg/CompressedImage
+      message_count: 219
+    - topic_metadata:
+        name: /rs32_lidar_points
+        type: sensor_msgs/msg/PointCloud2
+      message_count: 218
+    - topic_metadata:
+        name: /sport_imu
+        type: sensor_msgs/msg/Imu
+      message_count: 10910
+    - topic_metadata:
+        name: /sport_odom
+        type: nav_msgs/msg/Odometry
+      message_count: 6308
