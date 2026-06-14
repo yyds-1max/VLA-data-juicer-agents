@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import json
+import sys
 
 from vla_data_juicer_agents.navigation.agents import create_executor_agent, create_plan_agent
 from vla_data_juicer_agents.navigation.inspection import classify_navigation_dataset
@@ -21,7 +22,7 @@ def parse_args(argv: list[str] | None = None):
     for command in ("plan", "run"):
         sub = subparsers.add_parser(command)
         sub.add_argument("--date", required=True)
-        sub.add_argument("--segments", nargs="*", default=None)
+        sub.add_argument("--segments", nargs="+", default=None)
         sub.add_argument("--dry-run", action="store_true")
         sub.add_argument("--model", default=None, help="Qwen model id; defaults to VLA_AGENT_MODEL or qwen3.5-plus.")
         sub.add_argument(
@@ -38,6 +39,9 @@ async def async_main(argv: list[str] | None = None) -> int:
     request = NavigationRequest(date=args.date, segments=args.segments, dry_run=args.dry_run)
 
     if args.no_llm:
+        if args.command != "plan":
+            print("--no-llm only supports the plan command.", file=sys.stderr)
+            return 2
         classification = classify_navigation_dataset(request.date, request.segments)
         if not classification.profile_name:
             print(json.dumps(classification.model_dump(), indent=2, ensure_ascii=False))

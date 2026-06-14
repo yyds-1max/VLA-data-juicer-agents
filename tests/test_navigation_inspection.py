@@ -1,7 +1,10 @@
 from pathlib import Path
 
+import pytest
+
 from vla_data_juicer_agents.navigation.config import NavigationSettings
 from vla_data_juicer_agents.navigation.inspection import (
+    classify_navigation_dataset,
     classify_navigation_dataset_tool,
     inspect_raw_date,
     list_navigation_dates,
@@ -60,6 +63,13 @@ rosbag2_bagfile_information:
     result = inspect_raw_date("20270605", settings=settings)
 
     assert result.segments[0].errors
+
+
+def test_classify_navigation_dataset_rejects_missing_requested_segment():
+    settings = NavigationSettings(vladatasets_root=FIXTURE_ROOT)
+
+    with pytest.raises(FileNotFoundError, match="missing"):
+        classify_navigation_dataset("20270605", ["missing"], settings=settings)
 
 
 def test_classify_navigation_dataset_tool_schema_allows_omitting_segments():

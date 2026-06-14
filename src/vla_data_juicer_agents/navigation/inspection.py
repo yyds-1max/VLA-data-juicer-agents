@@ -106,6 +106,11 @@ def classify_navigation_dataset(
     selected_segments = inspection.segments
     if segments is not None:
         selected_names = set(segments)
+        existing_names = {segment.name for segment in inspection.segments}
+        missing_names = sorted(selected_names - existing_names)
+        if missing_names:
+            missing_text = ", ".join(missing_names)
+            raise FileNotFoundError(f"requested raw segment(s) not found for {date}: {missing_text}")
         selected_segments = [segment for segment in inspection.segments if segment.name in selected_names]
 
     topic_names = {topic.name for segment in selected_segments for topic in segment.topics}
