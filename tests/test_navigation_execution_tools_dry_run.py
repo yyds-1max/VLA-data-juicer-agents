@@ -111,7 +111,9 @@ def test_u_legacy_like_dry_run_reports_topic_mapping_and_lidar_query_dir(tmp_pat
 
     result = extract_and_sync_navigation_data("20270605", "u_legacy_like", settings=settings, dry_run=True)
 
-    sync_commands = [record.command for record in result.commands if "2_sync_data_multi_process_U.py" in record.command[1]]
+    sync_commands = [
+        record.command for record in result.commands if "2_sync_data_multi_process_U_legacy.py" in record.command[1]
+    ]
     assert result.details["extract_topics"] == [
         "/cam_video5/csi_cam/image_raw/compressed",
         "/lidar_points",
@@ -124,6 +126,78 @@ def test_u_legacy_like_dry_run_reports_topic_mapping_and_lidar_query_dir(tmp_pat
     }
     assert sync_commands
     assert sync_commands[0][sync_commands[0].index("--query_dir") + 1] == "lidar_points"
+
+
+def test_extract_and_sync_uses_profile_specific_script_paths_in_dry_run(tmp_path):
+    root = tmp_path / "VLADatasets"
+    (root / "raw_data" / "20270605_temp" / "20260605_152856").mkdir(parents=True)
+    settings = NavigationSettings(vladatasets_root=root, datatoolbox_src=Path("/datatoolbox/src"))
+
+    u_result = extract_and_sync_navigation_data("20270605", "u_legacy_like", settings=settings, dry_run=True)
+    go2w_result = extract_and_sync_navigation_data("20270605", "go2w_like", settings=settings, dry_run=True)
+
+    u_scripts = [Path(record.command[1]).name for record in u_result.commands]
+    go2w_scripts = [Path(record.command[1]).name for record in go2w_result.commands]
+    assert u_scripts == [
+        "1_extract_data_from_bag_multi_process_ros2_U_legacy.py",
+        "2_sync_data_multi_process_U_legacy.py",
+    ]
+    assert go2w_scripts == [
+        "1_extract_data_from_bag_multi_process_ros2_U.py",
+        "2_sync_data_multi_process_U.py",
+    ]
+    assert all("_legacy.py" not in script for script in go2w_scripts)
+
+
+def test_tracking_moves_original_data_outputs_to_clip_dir(tmp_path, monkeypatch):
+    root = tmp_path / "VLADatasets"
+    processing_root = tmp_path / "processing"
+    finish_temp = root / "finish_data" / "20270605_temp"
+    finish = root / "finish_data" / "20270605"
+    clip = finish_temp / "samples" / "20270605" / "20260605_152856"
+    clip.mkdir(parents=True)
+    yaml_path = clip / "master_color_color_color.yaml"
+    yaml_path.write_text("{}", encoding="utf-8")
+    finish.mkdir(parents=True)
+    settings = NavigationSettings(vladatasets_root=root, processing_root=processing_root)
+
+    def fake_run_command(command, cwd=None, dry_run=False, timeout_seconds=None):
+        if command == ["./bin/main"]:
+            output_root = processing_root / "Data" / "1_img_output"
+            (output_root / "tracking_img").mkdir(parents=True)
+            (output_root / "tracking_img" / "frame.txt").write_text("frame", encoding="utf-8")
+            (output_root / "img_points.txt").write_text("points", encoding="utf-8")
+        return CommandRecord(command=command, cwd=cwd, dry_run=dry_run, return_code=0)
+
+    monkeypatch.setattr("vla_data_juicer_agents.navigation.execution_tools.run_command", fake_run_command)
+
+    result = run_tracking_and_projection(finish_temp, finish, settings=settings, dry_run=False)
+
+    assert result.ok is True
+    assert (clip / "tracking_img_master_color_color_color" / "frame.txt").read_text(encoding="utf-8") == "frame"
+    assert (clip / "img_master_color_color_color.txt").read_text(encoding="utf-8") == "points"
+
+
+def test_generate_gridmap_requires_grid_json_under_requested_segment(tmp_path, monkeypatch):
+    root = tmp_path / "VLADatasets"
+    date = "20270605"
+    requested_segment = "20260605_152856"
+    other_segment = "20260605_152930"
+    (root / "clip_data" / date / requested_segment).mkdir(parents=True)
+    other_grid_map = root / "clip_data" / date / other_segment / "sync_data" / "clip_a" / "grid_map"
+    other_grid_map.mkdir(parents=True)
+    (other_grid_map / "a.json").write_text("{}", encoding="utf-8")
+    settings = NavigationSettings(vladatasets_root=root)
+
+    def fake_run_command(command, cwd=None, dry_run=False, timeout_seconds=None):
+        return CommandRecord(command=command, cwd=cwd, dry_run=dry_run, return_code=0)
+
+    monkeypatch.setattr("vla_data_juicer_agents.navigation.execution_tools.run_command", fake_run_command)
+
+    result = generate_gridmap_from_pcd(date, [requested_segment], settings=settings, dry_run=False)
+
+    assert result.ok is False
+    assert requested_segment in result.message
 
 
 def test_bound_dry_run_prepare_tool_does_not_create_outputs(tmp_path, monkeypatch):

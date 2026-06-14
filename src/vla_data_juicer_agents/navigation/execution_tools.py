@@ -141,9 +141,26 @@ def generate_gridmap_from_pcd(
 
     record = run_command(command, dry_run=dry_run)
     produced_paths = [settings.clip_data_root / date]
-    grid_jsons = [] if dry_run else sorted((settings.clip_data_root / date).glob("**/grid_map/*.json"))
+    if dry_run:
+        grid_jsons = []
+        missing_grid_segments = []
+    elif segments:
+        segment_grid_jsons = {
+            segment: sorted((settings.clip_data_root / date / segment).glob("**/grid_map/*.json"))
+            for segment in segments
+        }
+        grid_jsons = [path for paths in segment_grid_jsons.values() for path in paths]
+        missing_grid_segments = [segment for segment, paths in segment_grid_jsons.items() if not paths]
+    else:
+        grid_jsons = sorted((settings.clip_data_root / date).glob("**/grid_map/*.json"))
+        missing_grid_segments = []
     missing_outputs = _missing_outputs(produced_paths, dry_run)
-    missing_grid_json = not dry_run and record.return_code == 0 and not missing_outputs and not grid_jsons
+    missing_grid_json = (
+        not dry_run
+        and record.return_code == 0
+        and not missing_outputs
+        and (bool(missing_grid_segments) if segments else not grid_jsons)
+    )
     ok = (dry_run or record.return_code == 0) and not missing_outputs and not missing_grid_json
     return ToolResult(
         ok=ok,
@@ -151,12 +168,22 @@ def generate_gridmap_from_pcd(
         message=(
             "Generated gridmap from PCD."
             if ok
+            else (
+                "Missing expected grid_map JSON under requested segments: "
+                f"{', '.join(missing_grid_segments)}"
+            ) if missing_grid_segments
             else f"Missing expected grid_map JSON under: {settings.clip_data_root / date}" if missing_grid_json
             else f"Missing expected output: {missing_outputs[0]}" if missing_outputs else "Gridmap generation failed."
         ),
         produced_paths=produced_paths,
         commands=[record],
-        details={"date": date, "segments": segments, "dry_run": dry_run, "grid_json_count": len(grid_jsons)},
+        details={
+            "date": date,
+            "segments": segments,
+            "dry_run": dry_run,
+            "grid_json_count": len(grid_jsons),
+            "missing_grid_segments": missing_grid_segments,
+        },
     )
 
 
@@ -176,8 +203,12 @@ def extract_and_sync_navigation_data(
         selected = _selected_segments_for_dry_run(raw_temp_path, settings.raw_data_root / date, segments)
     else:
         selected = _selected_segments(raw_temp_path, segments)
-    extract_script = settings.datatoolbox_src / "1_extract_data_from_bag_multi_process_ros2_U.py"
-    sync_script = settings.datatoolbox_src / "2_sync_data_multi_process_U.py"
+    if profile.name == "u_legacy_like":
+        extract_script = settings.datatoolbox_src / "1_extract_data_from_bag_multi_process_ros2_U_legacy.py"
+        sync_script = settings.datatoolbox_src / "2_sync_data_multi_process_U_legacy.py"
+    else:
+        extract_script = settings.datatoolbox_src / "1_extract_data_from_bag_multi_process_ros2_U.py"
+        sync_script = settings.datatoolbox_src / "2_sync_data_multi_process_U.py"
     commands = []
     if not selected:
         return ToolResult(
@@ -442,6 +473,8 @@ def run_tracking_and_projection(
     final = _resolve_data_path(finish_path, settings)
     pt_project = settings.processing_root / "2_pt_project"
     tracking_root = settings.processing_root / "1_onnx_tam"
+    param_dir = settings.processing_root / "Data" / "3_param"
+    img_output_dir = settings.processing_root / "Data" / "1_img_output"
     tracking_yaml_re = re.compile(r"^((master|other[0-9]+)_[a-z]+_[a-z]+_[a-z]+)\.yaml$")
     tracking_yamls = sorted(
         path
@@ -469,7 +502,7 @@ def run_tracking_and_projection(
             assert match is not None
             yaml_stem = match.group(1)
             if not dry_run:
-                dog_yaml = tracking_root / "Data" / "3_param" / "dog.yaml"
+                dog_yaml = param_dir / "dog.yaml"
                 dog_yaml.parent.mkdir(parents=True, exist_ok=True)
                 shutil.copy2(yaml_path, dog_yaml)
 
@@ -480,13 +513,12 @@ def run_tracking_and_projection(
                 break
 
             if not dry_run:
-                output_root = tracking_root / "Data" / "1_img_output"
-                tracking_img = output_root / "tracking_img"
+                tracking_img = img_output_dir / "tracking_img"
                 tracking_img_target = yaml_path.parent / f"tracking_img_{yaml_stem}"
                 if tracking_img.exists():
                     shutil.move(str(tracking_img), str(tracking_img_target))
 
-                img_points = output_root / "img_points.txt"
+                img_points = img_output_dir / "img_points.txt"
                 if img_points.exists():
                     shutil.move(str(img_points), str(yaml_path.parent / f"img_{yaml_stem}.txt"))
 
