@@ -45,8 +45,8 @@ class NavigationSettings(BaseModel):
 
     @property
     def pcd_to_grid_script(self) -> Path:
-        return self.datatoolbox_src / "data_toolbox" / "pcd_to_grid" / "pcd_to_grid.py"
+        return self.processing_root / "other_code" / "pcd_to_grid.py"
 
     @property
     def gen_box_script(self) -> Path:
-        return self.datatoolbox_src / "data_toolbox" / "gen_box" / "gen_box.py"
+        return self.processing_root / "0_1th_box" / "gen_box.py"

@@ -54,7 +54,7 @@ class RawDateInspection(BaseModel):
 
 
 class ProfileClassification(BaseModel):
-    profile_name: str
+    profile_name: str | None
     confidence: float
     matched_topics: list[str] = Field(default_factory=list)
     missing_topics: list[str] = Field(default_factory=list)

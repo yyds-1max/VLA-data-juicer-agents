@@ -1,7 +1,12 @@
 import pytest
 
 from vla_data_juicer_agents.navigation.config import NavigationSettings
-from vla_data_juicer_agents.navigation.models import NavigationRequest, WorkflowPlan, WorkflowStep
+from vla_data_juicer_agents.navigation.models import (
+    NavigationRequest,
+    ProfileClassification,
+    WorkflowPlan,
+    WorkflowStep,
+)
 
 
 def test_navigation_request_defaults_to_all_segments():
@@ -23,6 +28,19 @@ def test_navigation_settings_derives_data_roots(tmp_path):
     assert settings.raw_data_root == tmp_path / "VLADatasets" / "raw_data"
     assert settings.clip_data_root == tmp_path / "VLADatasets" / "clip_data"
     assert settings.finish_data_root == tmp_path / "VLADatasets" / "finish_data"
+
+
+def test_navigation_settings_derives_processing_scripts(tmp_path):
+    settings = NavigationSettings(processing_root=tmp_path / "processing")
+
+    assert settings.pcd_to_grid_script == tmp_path / "processing" / "other_code" / "pcd_to_grid.py"
+    assert settings.gen_box_script == tmp_path / "processing" / "0_1th_box" / "gen_box.py"
+
+
+def test_profile_classification_accepts_missing_profile():
+    classification = ProfileClassification(profile_name=None, confidence=0.0)
+
+    assert classification.profile_name is None
 
 
 def test_workflow_plan_keeps_ordered_steps():
