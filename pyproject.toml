@@ -21,6 +21,7 @@ dev = [
 
 [project.scripts]
 vla-nav-agent = "vla_data_juicer_agents.cli:main"
+vla-data-agent = "vla_data_juicer_agents.session_cli:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]

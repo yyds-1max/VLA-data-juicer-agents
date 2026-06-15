@@ -62,6 +62,22 @@ This constructs and executes dry-run tools through the Executor-Agent and requir
 
 AgentScope `reply_stream(...)` events for LLM calls, tool calls, tool results, and final replies are written under each run directory as `events.jsonl`.
 
+## Conversational main Agent
+
+Use `vla-data-agent` when you want a user-facing main Agent that accepts natural language, reasons with a real LLM, and dispatches registered tools. The session Agent exposes `vla_run_workflow` through the shared tool registry and uses it for complex navigation VLA requests.
+
+```bash
+vla-data-agent --message "处理 20270605 的导航 VLA 数据，先 dry-run"
+```
+
+Interactive mode is also available:
+
+```bash
+vla-data-agent
+```
+
+The conversational Agent requires normal LLM settings such as `DASHSCOPE_API_KEY`; it does not provide a deterministic `--no-llm` router path.
+
 ## Runtime isolation
 
 See `docs/navigation-runtime-isolation.md` for the Agent/legacy runtime split, required environment variables, server preflight checks, wrapper behavior, dry-run verification, and operational boundaries.

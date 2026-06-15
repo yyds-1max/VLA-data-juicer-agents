@@ -1,0 +1,52 @@
+from __future__ import annotations
+
+import os
+from typing import Any
+
+from agentscope.tool import Toolkit
+
+from vla_data_juicer_agents.adapters.agentscope import build_agentscope_tool
+from vla_data_juicer_agents.capabilities.session.runtime import SessionToolRuntime
+from vla_data_juicer_agents.core.tool import ToolContext, ToolSpec, list_tool_specs
+
+
+_GROUP_PRIORITY = {
+    "vla": 10,
+    "workflow": 20,
+}
+
+
+def _tool_context(runtime: SessionToolRuntime) -> ToolContext:
+    root = str(runtime.storage_root())
+    return ToolContext(
+        working_dir=str(runtime.state.working_dir or "./.djx"),
+        artifacts_dir=root,
+        env=dict(os.environ),
+        runtime_values={
+            "session_runtime": runtime,
+            "emit_event": runtime.emit_event,
+        },
+    )
+
+
+def _sort_key(spec: ToolSpec) -> tuple[int, int, str]:
+    priority = min((_GROUP_PRIORITY.get(tag, 999) for tag in spec.tags), default=999)
+    name_priority = 0 if spec.name == "vla_run_workflow" else 1
+    return priority, name_priority, spec.name
+
+
+def get_session_tool_specs() -> list[ToolSpec]:
+    return sorted(list_tool_specs(), key=_sort_key)
+
+
+def build_session_toolkit(runtime: SessionToolRuntime) -> Toolkit:
+    tools = [
+        build_agentscope_tool(
+            spec,
+            ctx_factory=lambda runtime=runtime: _tool_context(runtime),
+            runtime_invoke=runtime.invoke_tool,
+        )
+        for spec in get_session_tool_specs()
+    ]
+    return Toolkit(tools=tools)
+
