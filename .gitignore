@@ -1,8 +1,58 @@
+# Python environments and caches
 .venv/
 venv/
+env/
+ENV/
 __pycache__/
-*.pyc
+*.py[cod]
+*$py.class
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+.coverage.*
+htmlcov/
+
+# Build and packaging artifacts
+build/
+dist/
+*.egg-info/
+pip-wheel-metadata/
+
+# Local configuration and secrets
 .env
+.env.*
+!.env.example
+*.pem
+*.key
+*.crt
+*.p12
+*.pfx
+
+# Runtime outputs and logs
+*.log
+logs/
+output/
+outputs/
+artifacts/
+tmp/
+temp/
+
+# Local data/model artifacts
+data/
+datasets/
+models/
+checkpoints/
+*.ckpt
+*.pt
+*.pth
+*.safetensors
+
+# Project-local docs and agent working notes
+docs/
+
+# OS and editor files
 .DS_Store
+Thumbs.db
 .idea/
 .vscode/
