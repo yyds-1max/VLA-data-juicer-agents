@@ -44,6 +44,8 @@ class VLASessionAgent:
             "Default to dry_run=false and perform real data processing for normal user requests.\n"
             "Set dry_run=true only when the user explicitly says dry_run in the request.\n"
             "Do not infer dry_run=true from words like preview, inspect, check, plan, first look, or similar cautious phrasing.\n"
+            "dry_run is still an execution mode: for direct dry_run processing requests, keep approve=true and execute the dry-run stage loop.\n"
+            "do not set approve=false merely because dry_run=true.\n"
             "Use approve=true for direct run/process requests. If the user asks only to plan, set approve=false.\n"
             "Never claim that the workflow ran unless the vla_run_workflow tool was called and its result is reflected.\n"
             "After tool calls, summarize status, run_dir, artifacts, failures, and next steps.\n"

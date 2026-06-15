@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from typing import Any, Literal
 
 from pydantic import BaseModel, Field
@@ -40,7 +41,24 @@ def _normalize_segments(value: str | list[str] | None) -> list[str] | None:
     raw = value.strip()
     if not raw or raw.lower() == "all":
         return None
+    if raw.startswith("["):
+        try:
+            payload = json.loads(raw)
+        except json.JSONDecodeError:
+            payload = None
+        if isinstance(payload, list):
+            items = [str(item).strip() for item in payload if str(item).strip()]
+            return items or None
     return [item.strip() for item in raw.split(",") if item.strip()] or None
+
+
+def _normalize_model(value: str | None) -> str | None:
+    if value is None:
+        return None
+    model = str(value).strip()
+    if not model or model.lower() in {"none", "null"}:
+        return None
+    return model
 
 
 def _artifact_paths(run_dir) -> dict[str, str]:
@@ -54,6 +72,7 @@ def _artifact_paths(run_dir) -> dict[str, str]:
 
 async def run_vla_workflow(ctx: ToolContext, raw_args: RunVLAWorkflowInput | dict[str, Any]) -> dict[str, Any]:
     args = raw_args if isinstance(raw_args, RunVLAWorkflowInput) else RunVLAWorkflowInput.model_validate(raw_args)
+    model = _normalize_model(args.model)
     request = NavigationRequest(
         date=args.date,
         segments=_normalize_segments(args.segments),
@@ -65,7 +84,7 @@ async def run_vla_workflow(ctx: ToolContext, raw_args: RunVLAWorkflowInput | dic
     run_store.write_json(run_dir, "request.json", request.model_dump(mode="json"))
 
     try:
-        plan_agent = create_plan_agent(model=args.model, request=request)
+        plan_agent = create_plan_agent(model=model, request=request)
         plan = await run_plan_agent(plan_agent, request, run_store=run_store, run_dir=run_dir)
         run_store.write_json(run_dir, "plan.json", plan.model_dump(mode="json"))
 
@@ -80,7 +99,7 @@ async def run_vla_workflow(ctx: ToolContext, raw_args: RunVLAWorkflowInput | dic
             run_store.write_json(run_dir, "final_report.json", payload)
             return payload
 
-        executor_agent = create_executor_agent(model=args.model, dry_run=args.dry_run)
+        executor_agent = create_executor_agent(model=model, dry_run=args.dry_run)
         final_output = await run_executor_agent(executor_agent, plan, run_store=run_store, run_dir=run_dir)
         payload = RunVLAWorkflowOutput(
             ok=True,
@@ -118,4 +137,3 @@ VLA_RUN_WORKFLOW = ToolSpec(
     effects="execute",
     confirmation="required",
 )
-

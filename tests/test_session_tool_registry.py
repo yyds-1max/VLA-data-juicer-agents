@@ -7,7 +7,7 @@ from vla_data_juicer_agents.core.tool import ToolContext, get_tool_spec, list_to
 from vla_data_juicer_agents.capabilities.session.orchestrator import VLASessionAgent
 from vla_data_juicer_agents.capabilities.session.runtime import SessionState, SessionToolRuntime
 from vla_data_juicer_agents.capabilities.session.toolkit import get_session_tool_specs
-from vla_data_juicer_agents.tools.vla.run_workflow import run_vla_workflow
+from vla_data_juicer_agents.tools.vla.run_workflow import _normalize_model, _normalize_segments, run_vla_workflow
 
 
 def test_tool_registry_exposes_vla_workflow_tool():
@@ -55,6 +55,14 @@ def test_session_prompt_allows_dry_run_only_when_user_says_dry_run():
     assert "Default to dry_run=false and perform real data processing" in prompt
     assert "Do not infer dry_run=true" in prompt
     assert "inspection without mutation" not in prompt
+
+
+def test_session_prompt_keeps_dry_run_requests_approved_for_execution():
+    agent = VLASessionAgent(use_llm_router=False)
+    prompt = agent.session_system_prompt()
+
+    assert "dry_run is still an execution mode" in prompt
+    assert "do not set approve=false merely because dry_run=true" in prompt
 
 
 def test_session_agent_builds_real_agentscope_agent(monkeypatch):
@@ -142,3 +150,16 @@ def test_vla_run_workflow_tool_reuses_plan_and_executor_agents(tmp_path, monkeyp
     assert Path(payload["run_dir"]).is_dir()
     assert calls[0] == ("plan", "plan-agent", "20270605", ["20260605_152856"], True, True, True)
     assert calls[1] == ("execute", "executor-dry-True", plan, True, True)
+
+
+def test_vla_run_workflow_normalizes_llm_string_arguments():
+    assert _normalize_segments('["20260605_152856"]') == ["20260605_152856"]
+    assert _normalize_segments("20260605_152856,20260605_153000") == [
+        "20260605_152856",
+        "20260605_153000",
+    ]
+    assert _normalize_model(None) is None
+    assert _normalize_model("") is None
+    assert _normalize_model("None") is None
+    assert _normalize_model("null") is None
+    assert _normalize_model("qwen-plus") == "qwen-plus"
