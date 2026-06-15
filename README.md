@@ -8,12 +8,12 @@ This project builds an OpenAI Agents SDK workflow for the first-stage navigation
 4. assemble `finish_data/<date>_temp`
 5. run `run_odom.sh` stages through initial annotation, tracking, projection, and final move
 
-Stage one intentionally excludes `run_fix.sh`.
+Stage one intentionally excludes `run_fix.sh`; it is out of scope and is not run by this agent. The first-stage scope covers only `prepare.sh`, `run_U.sh`, and `run_odom.sh`. `gen_box.py` is the only human GUI step.
 
 ## WSL setup
 
 ```bash
-python3 -m venv .venv
+python3.12 -m venv .venv
 source .venv/bin/activate
 pip install -e ".[dev]"
 export DASHSCOPE_API_KEY="sk-..."
@@ -21,17 +21,49 @@ export DASHSCOPE_BASE_URL="https://dashscope.aliyuncs.com/compatible-mode/v1"
 export VLA_AGENT_MODEL="qwen3.5-plus"
 ```
 
+The Agent runtime stays on Python 3.12 with the OpenAI Agents SDK. Legacy ROS2/CUDA/GUI/tracking scripts run in a separate subprocess runtime:
+
+```bash
+export AGENT_DATA_PYTHON="/usr/bin/python3.8"
+export AGENT_DATA_ENV_SETUP="/path/to/setup_data_runtime.sh"
+export VLA_GT_DOG_ROOT="/media/heying/hy_data2/GT_dog"
+```
+
+Do not import ROS, CUDA, OpenCV, Open3D, PCL, GUI, or legacy project modules in the Agent runtime. Keep those dependencies behind the subprocess wrapper so Python 3.12 agent planning does not inherit Python 3.8/ROS2/CUDA library state.
+
 ## Dry run
 
 ```bash
-vla-nav-agent plan --date 20270605 --dry-run
+vla-nav-agent plan --date 20270605 --dry-run --no-llm
 ```
+
+This plan dry-run prints the deterministic plan, selected profile, and stage-one step selection. It does not execute tools and does not create wrapper command records.
+
+For wrapper command inspection, run:
+
+```bash
+pytest tests/test_navigation_runtime.py tests/test_navigation_execution_tools_dry_run.py -q
+```
+
+The execution-tool dry-run tests assert wrapped legacy command shape, including `bash -lc`, `source`, and `exec "$AGENT_DATA_PYTHON"` when `AGENT_DATA_ENV_SETUP` is configured.
 
 ## Execute
 
 ```bash
 vla-nav-agent run --date 20270605
 ```
+
+To exercise dry-run execution through the Executor-Agent, use:
+
+```bash
+vla-nav-agent run --date 20270605 --segments 20260605_152856 --dry-run
+```
+
+This constructs and executes dry-run tools through the Executor-Agent and requires the normal LLM settings.
+
+## Runtime isolation
+
+See `docs/navigation-runtime-isolation.md` for the Agent/legacy runtime split, required environment variables, server preflight checks, wrapper behavior, dry-run verification, and operational boundaries.
 
 ## Server runbook
 
