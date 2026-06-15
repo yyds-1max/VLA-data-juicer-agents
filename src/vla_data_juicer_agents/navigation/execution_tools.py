@@ -1,9 +1,10 @@
 import shutil
 import re
+import json
 from pathlib import Path
 from typing import Any
 
-from agents import function_tool
+from agentscope.tool import FunctionTool
 
 from vla_data_juicer_agents.navigation.config import NavigationSettings
 from vla_data_juicer_agents.navigation.models import DATE_RE, ToolResult
@@ -14,6 +15,19 @@ from vla_data_juicer_agents.navigation.runtime import (
     run_u_python_command,
 )
 from vla_data_juicer_agents.navigation.subprocess_runner import run_command
+
+
+def _normalize_segments_arg(segments: list[str] | str | None) -> list[str] | None:
+    if segments is None:
+        return None
+    if isinstance(segments, str):
+        stripped = segments.strip()
+        if stripped.startswith("["):
+            payload = json.loads(stripped)
+            if isinstance(payload, list) and all(isinstance(item, str) for item in payload):
+                return payload
+        return [stripped] if stripped else None
+    return segments
 
 
 def _validate_date(date: str) -> str:
@@ -614,59 +628,60 @@ def validate_navigation_outputs(
     )
 
 
-def build_execution_tools(dry_run: bool = False) -> list[Any]:
-    @function_tool(strict_mode=False, name_override="prepare_raw_data_tool")
-    def bound_prepare_raw_data_tool(date: str, segments: list[str] | None = None) -> dict:
-        return prepare_raw_data(date, segments, dry_run=dry_run).model_dump(mode="json")
+def _make_function_tool(func, name: str, dry_run: bool):
+    return FunctionTool(
+        func,
+        name=name,
+        is_concurrency_safe=False,
+        is_read_only=dry_run,
+    )
 
-    @function_tool(strict_mode=False, name_override="extract_and_sync_navigation_data_tool")
+
+def build_execution_tools(dry_run: bool = False) -> list[Any]:
+    def bound_prepare_raw_data_tool(date: str, segments: list[str] | str | None = None) -> dict:
+        return prepare_raw_data(date, _normalize_segments_arg(segments), dry_run=dry_run).model_dump(mode="json")
+
     def bound_extract_and_sync_navigation_data_tool(
         date: str,
         dataset_profile: str,
-        segments: list[str] | None = None,
+        segments: list[str] | str | None = None,
         processes_num: int = 4,
     ) -> dict:
         return extract_and_sync_navigation_data(
             date,
             dataset_profile,
-            segments,
+            _normalize_segments_arg(segments),
             processes_num,
             dry_run=dry_run,
         ).model_dump(mode="json")
 
-    @function_tool(strict_mode=False, name_override="generate_gridmap_from_pcd_tool")
-    def bound_generate_gridmap_from_pcd_tool(date: str, segments: list[str] | None = None) -> dict:
-        return generate_gridmap_from_pcd(date, segments, dry_run=dry_run).model_dump(mode="json")
+    def bound_generate_gridmap_from_pcd_tool(date: str, segments: list[str] | str | None = None) -> dict:
+        return generate_gridmap_from_pcd(date, _normalize_segments_arg(segments), dry_run=dry_run).model_dump(mode="json")
 
-    @function_tool(strict_mode=False, name_override="assemble_finish_temp_tool")
-    def bound_assemble_finish_temp_tool(date: str, segments: list[str] | None = None) -> dict:
-        return assemble_finish_temp(date, segments, dry_run=dry_run).model_dump(mode="json")
+    def bound_assemble_finish_temp_tool(date: str, segments: list[str] | str | None = None) -> dict:
+        return assemble_finish_temp(date, _normalize_segments_arg(segments), dry_run=dry_run).model_dump(mode="json")
 
-    @function_tool(strict_mode=False, name_override="run_noobscene_preprocessing_tool")
     def bound_run_noobscene_preprocessing_tool(finish_temp_path: str) -> dict:
         return run_noobscene_preprocessing(finish_temp_path, dry_run=dry_run).model_dump(mode="json")
 
-    @function_tool(strict_mode=False, name_override="run_initial_annotation_gui_tool")
     def bound_run_initial_annotation_gui_tool(finish_temp_path: str) -> dict:
         return run_initial_annotation_gui(finish_temp_path, dry_run=dry_run).model_dump(mode="json")
 
-    @function_tool(strict_mode=False, name_override="run_tracking_and_projection_tool")
     def bound_run_tracking_and_projection_tool(finish_temp_path: str, finish_path: str) -> dict:
         return run_tracking_and_projection(finish_temp_path, finish_path, dry_run=dry_run).model_dump(mode="json")
 
-    @function_tool(strict_mode=False, name_override="validate_navigation_outputs_tool")
     def bound_validate_navigation_outputs_tool(date: str) -> dict:
         return validate_navigation_outputs(date, dry_run=dry_run).model_dump(mode="json")
 
     return [
-        bound_prepare_raw_data_tool,
-        bound_extract_and_sync_navigation_data_tool,
-        bound_generate_gridmap_from_pcd_tool,
-        bound_assemble_finish_temp_tool,
-        bound_run_noobscene_preprocessing_tool,
-        bound_run_initial_annotation_gui_tool,
-        bound_run_tracking_and_projection_tool,
-        bound_validate_navigation_outputs_tool,
+        _make_function_tool(bound_prepare_raw_data_tool, "prepare_raw_data_tool", dry_run),
+        _make_function_tool(bound_extract_and_sync_navigation_data_tool, "extract_and_sync_navigation_data_tool", dry_run),
+        _make_function_tool(bound_generate_gridmap_from_pcd_tool, "generate_gridmap_from_pcd_tool", dry_run),
+        _make_function_tool(bound_assemble_finish_temp_tool, "assemble_finish_temp_tool", dry_run),
+        _make_function_tool(bound_run_noobscene_preprocessing_tool, "run_noobscene_preprocessing_tool", dry_run),
+        _make_function_tool(bound_run_initial_annotation_gui_tool, "run_initial_annotation_gui_tool", dry_run),
+        _make_function_tool(bound_run_tracking_and_projection_tool, "run_tracking_and_projection_tool", dry_run),
+        _make_function_tool(bound_validate_navigation_outputs_tool, "validate_navigation_outputs_tool", dry_run),
     ]
 
 

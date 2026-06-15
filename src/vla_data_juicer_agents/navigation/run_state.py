@@ -27,3 +27,16 @@ class WorkflowRunStore:
         with path.open("w", encoding="utf-8") as handle:
             json.dump(payload, handle, indent=2, ensure_ascii=False)
         return path
+
+    def append_jsonl(self, run_dir: Path, relative_name: str, payload: dict[str, Any]) -> Path:
+        resolved_run_dir = run_dir.resolve()
+        path = (run_dir / relative_name).resolve()
+        try:
+            path.relative_to(resolved_run_dir)
+        except ValueError as exc:
+            raise ValueError(f"run-state write target escapes run directory: {relative_name}") from exc
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with path.open("a", encoding="utf-8") as handle:
+            json.dump(payload, handle, ensure_ascii=False, default=str)
+            handle.write("\n")
+        return path

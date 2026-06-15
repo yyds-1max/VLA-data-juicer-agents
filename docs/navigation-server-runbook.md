@@ -18,7 +18,7 @@ export AGENT_DATA_PYTHON="/usr/bin/python3.8"
 export AGENT_DATA_ENV_SETUP="/path/to/setup_data_runtime.sh"
 ```
 
-The active shell and `.venv` are the Agent runtime: Python 3.12 plus the OpenAI Agents SDK and DashScope/OpenAI-compatible settings. `AGENT_DATA_PYTHON` and `AGENT_DATA_ENV_SETUP` define the legacy subprocess runtime for Python 3.8, ROS2, CUDA, GUI, and tracking tools.
+The active shell and `.venv` are the Agent runtime: Python 3.12 plus AgentScope and DashScope/Qwen settings. `AGENT_DATA_PYTHON` and `AGENT_DATA_ENV_SETUP` define the legacy subprocess runtime for Python 3.8, ROS2, CUDA, GUI, and tracking tools.
 
 ## Server preflight
 

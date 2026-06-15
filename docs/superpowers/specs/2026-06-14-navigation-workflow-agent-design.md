@@ -17,6 +17,8 @@ The workflow does not include `run_fix.sh` in this stage.
 
 The system must use the OpenAI Agents SDK with real LLM-backed agents. The ReAct Plan-Agent and ReAct Executor-Agent must be implemented as SDK `Agent` instances run through `Runner`; they must not be replaced by a deterministic rule engine. Deterministic code is allowed only inside tools for parsing, validation, command execution, and postcondition checks.
 
+The model provider is Alibaba Cloud Model Studio / DashScope. Agents should use Qwen through the OpenAI-compatible Chat Completions endpoint, with `qwen3.5-plus` as the intended model name unless the Alibaba Cloud console exposes a different exact model id.
+
 ## Source Context
 
 Navigation processing code and sample data are currently under:
@@ -42,14 +44,18 @@ The implementation plan should include:
 - Create or reuse a WSL project directory for this repository.
 - Create a Python virtual environment, for example `.venv`.
 - Install the OpenAI Agents SDK with `pip install openai-agents`.
-- Configure `OPENAI_API_KEY` in the WSL shell environment.
+- Configure `DASHSCOPE_API_KEY` in the WSL shell environment.
+- Configure `DASHSCOPE_BASE_URL`, defaulting to `https://dashscope.aliyuncs.com/compatible-mode/v1`.
+- Configure `VLA_AGENT_MODEL`, defaulting to `qwen3.5-plus`.
 - Keep path configuration externalized so local Windows/WSL paths and server Linux paths can be swapped without editing business logic.
 
-The OpenAI Agents SDK quickstart documents virtual environments, SDK installation, API key setup, `Agent`, `Runner`, function tools, multi-agent orchestration, and tracing:
+The OpenAI Agents SDK quickstart documents virtual environments, SDK installation, API key setup, `Agent`, `Runner`, function tools, multi-agent orchestration, and tracing. Its model provider documentation supports non-OpenAI OpenAI-compatible endpoints through `AsyncOpenAI` plus `OpenAIChatCompletionsModel`. Alibaba Cloud documents that Qwen models can be called through an OpenAI-compatible endpoint by changing API key, base URL, and model name.
 
 - https://openai.github.io/openai-agents-python/quickstart/
 - https://openai.github.io/openai-agents-python/tools/
 - https://openai.github.io/openai-agents-python/tracing/
+- https://openai.github.io/openai-agents-python/models/
+- https://help.aliyun.com/zh/model-studio/compatibility-of-openai-with-dashscope
 
 ## Architecture
 
@@ -446,8 +452,7 @@ Stage one does not:
 
 ## Open Questions For Implementation Planning
 
-- Which OpenAI model should be the default for Plan-Agent and Executor-Agent in the local/server environment?
+- Confirm whether the exact Alibaba Cloud model id is `qwen3.5-plus`; if the console exposes another exact id, use that value in `VLA_AGENT_MODEL`.
 - Should subprocess tools stream stdout/stderr to the terminal while also saving logs?
 - Should the first implementation create wrapper scripts beside the original processing code or copy selected logic into this repository?
 - What exact server user/group ownership behavior should replace `sudo chown -R heying:heying` during local WSL development?
-

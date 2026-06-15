@@ -61,8 +61,8 @@ async def async_main(argv: list[str] | None = None) -> int:
             return 2
         plan = build_deterministic_plan_template(request.date, classification.profile_name, request.segments)
     else:
-        plan_agent = create_plan_agent(model=args.model)
-        plan = await run_plan_agent(plan_agent, request)
+        plan_agent = create_plan_agent(model=args.model, request=request)
+        plan = await run_plan_agent(plan_agent, request, run_store=run_store, run_dir=run_dir)
     run_store.write_json(run_dir, "plan.json", plan.model_dump(mode="json"))
 
     if args.command == "plan":
@@ -71,7 +71,7 @@ async def async_main(argv: list[str] | None = None) -> int:
         return 0
 
     executor_agent = create_executor_agent(model=args.model, dry_run=args.dry_run)
-    final_output = await run_executor_agent(executor_agent, plan)
+    final_output = await run_executor_agent(executor_agent, plan, run_store=run_store, run_dir=run_dir)
     run_store.write_json(
         run_dir,
         "final_report.json",

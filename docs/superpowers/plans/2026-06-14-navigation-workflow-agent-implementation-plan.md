@@ -2,11 +2,11 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** Build the first-stage LLM-backed navigation workflow agent that plans and executes `prepare.sh -> run_U.sh -> run_odom.sh` for the `20270515` and `20270605` data families.
+**Goal:** Build the first-stage Qwen-backed navigation workflow agent that plans and executes `prepare.sh -> run_U.sh -> run_odom.sh` for the `20270515` and `20270605` data families.
 
-**Architecture:** Create a focused Python package with OpenAI Agents SDK agents, deterministic function tools, Pydantic workflow models, path/profile configuration, subprocess wrappers, and dry-run tests. The Plan-Agent and Executor-Agent are real SDK `Agent` instances run through `Runner`; deterministic rules live only inside tools for inspection, validation, command construction, and postcondition checks.
+**Architecture:** Create a focused Python package with OpenAI Agents SDK agents, deterministic function tools, Pydantic workflow models, path/profile configuration, subprocess wrappers, and dry-run tests. The Plan-Agent and Executor-Agent are real SDK `Agent` instances run through `Runner`, using Alibaba Cloud DashScope Qwen through an OpenAI-compatible Chat Completions model object; deterministic rules live only inside tools for inspection, validation, command construction, and postcondition checks.
 
-**Tech Stack:** Python 3.11+, OpenAI Agents SDK (`openai-agents`), Pydantic, PyYAML, pytest, WSL virtual environment, existing ROS/navigation scripts.
+**Tech Stack:** Python 3.11+, OpenAI Agents SDK (`openai-agents`), OpenAI Python client for compatible endpoints, Alibaba Cloud DashScope Qwen (`qwen3.5-plus` by default), Pydantic, PyYAML, pytest, WSL virtual environment, existing ROS/navigation scripts.
 
 ---
 
@@ -87,6 +87,7 @@ description = "LLM-backed navigation data processing agents for VLA data workflo
 readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
+    "openai>=1.0.0",
     "openai-agents>=0.2.0",
     "pydantic>=2.7",
     "PyYAML>=6.0",
@@ -131,7 +132,9 @@ Stage one intentionally excludes `run_fix.sh`.
 python3 -m venv .venv
 source .venv/bin/activate
 pip install -e ".[dev]"
-export OPENAI_API_KEY="sk-..."
+export DASHSCOPE_API_KEY="sk-..."
+export DASHSCOPE_BASE_URL="https://dashscope.aliyuncs.com/compatible-mode/v1"
+export VLA_AGENT_MODEL="qwen3.5-plus"
 ```
 
 ## Dry run
@@ -829,7 +832,8 @@ from vla_data_juicer_agents.navigation.agents import create_executor_agent, crea
 from vla_data_juicer_agents.navigation.workflow import build_deterministic_plan_template
 
 
-def test_create_plan_agent_has_read_only_tools():
+def test_create_plan_agent_has_read_only_tools(monkeypatch):
+    monkeypatch.setenv("DASHSCOPE_API_KEY", "test-key")
     agent = create_plan_agent()
     tool_names = {tool.name for tool in agent.tools}
 
@@ -837,7 +841,8 @@ def test_create_plan_agent_has_read_only_tools():
     assert "classify_navigation_dataset_tool" in tool_names
 
 
-def test_create_executor_agent_has_execution_tools():
+def test_create_executor_agent_has_execution_tools(monkeypatch):
+    monkeypatch.setenv("DASHSCOPE_API_KEY", "test-key")
     agent = create_executor_agent(dry_run=True)
     tool_names = {tool.name for tool in agent.tools}
 
@@ -985,7 +990,10 @@ Create `src/vla_data_juicer_agents/navigation/agents.py`:
 ```python
 from __future__ import annotations
 
-from agents import Agent
+import os
+
+from agents import Agent, OpenAIChatCompletionsModel, set_tracing_disabled
+from openai import AsyncOpenAI
 
 from vla_data_juicer_agents.navigation.execution_tools import (
     assemble_finish_temp_tool,
@@ -1025,11 +1033,20 @@ Never invent filesystem results; rely on tool outputs.
 """
 
 
-def create_plan_agent(model: str = "gpt-4.1") -> Agent:
+def create_qwen_model(model: str | None = None) -> OpenAIChatCompletionsModel:
+    api_key = os.environ["DASHSCOPE_API_KEY"]
+    base_url = os.getenv("DASHSCOPE_BASE_URL", "https://dashscope.aliyuncs.com/compatible-mode/v1")
+    model_name = model or os.getenv("VLA_AGENT_MODEL", "qwen3.5-plus")
+    client = AsyncOpenAI(api_key=api_key, base_url=base_url)
+    return OpenAIChatCompletionsModel(model=model_name, openai_client=client)
+
+
+def create_plan_agent(model: str | None = None) -> Agent:
+    set_tracing_disabled(True)
     return Agent(
         name="Navigation ReAct Plan-Agent",
         instructions=PLAN_INSTRUCTIONS,
-        model=model,
+        model=create_qwen_model(model),
         tools=[
             list_navigation_dates_tool,
             inspect_raw_date_tool,
@@ -1038,11 +1055,12 @@ def create_plan_agent(model: str = "gpt-4.1") -> Agent:
     )
 
 
-def create_executor_agent(model: str = "gpt-4.1", dry_run: bool = False) -> Agent:
+def create_executor_agent(model: str | None = None, dry_run: bool = False) -> Agent:
+    set_tracing_disabled(True)
     return Agent(
         name="Navigation ReAct Executor-Agent",
         instructions=f"{EXECUTOR_INSTRUCTIONS}\nDry run mode: {dry_run}",
-        model=model,
+        model=create_qwen_model(model),
         tools=[
             prepare_raw_data_tool,
             extract_and_sync_navigation_data_tool,
@@ -1575,7 +1593,7 @@ def parse_args(argv: list[str] | None = None):
         sub.add_argument("--date", required=True)
         sub.add_argument("--segments", nargs="*", default=None)
         sub.add_argument("--dry-run", action="store_true")
-        sub.add_argument("--model", default="gpt-4.1")
+        sub.add_argument("--model", default=None, help="Qwen model id; defaults to VLA_AGENT_MODEL or qwen3.5-plus.")
         sub.add_argument("--no-llm", action="store_true", help="Only build the deterministic plan template for local dry-run debugging.")
 
     return parser.parse_args(argv)
@@ -1668,7 +1686,9 @@ cd /path/to/VLA-data-juicer-agents
 python3 -m venv .venv
 source .venv/bin/activate
 pip install -e ".[dev]"
-export OPENAI_API_KEY="sk-..."
+export DASHSCOPE_API_KEY="sk-..."
+export DASHSCOPE_BASE_URL="https://dashscope.aliyuncs.com/compatible-mode/v1"
+export VLA_AGENT_MODEL="qwen3.5-plus"
 export VLA_VLADATASETS_ROOT="/media/heying/hy_data1/VLADatasets"
 export VLA_PROCESSING_ROOT="/media/heying/hy_data1/Trajectory_visualization/Object_location_gh_v3_fisheye_five_U_add_SF_01"
 export VLA_DATATOOLBOX_SRC="/media/heying/hy_data2/GT_dog/modules_ros2/DataToolbox/src"

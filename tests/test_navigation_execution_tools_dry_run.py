@@ -1,4 +1,5 @@
 import asyncio
+import inspect
 import json
 from pathlib import Path
 from types import SimpleNamespace
@@ -20,9 +21,46 @@ from vla_data_juicer_agents.navigation.models import CommandRecord
 
 
 def _invoke_tool(tool, arguments):
-    ctx = SimpleNamespace(tool_name=tool.name, run_config=None, context=None)
-    payload = asyncio.run(tool.on_invoke_tool(ctx, json.dumps(arguments)))
-    return json.loads(payload) if isinstance(payload, str) else payload
+    async def _call():
+        payload = tool(**arguments)
+        if inspect.isawaitable(payload):
+            payload = await payload
+        return _decode_tool_payload(payload)
+
+    return asyncio.run(_call())
+
+
+def _decode_tool_payload(payload):
+    if isinstance(payload, dict):
+        return payload
+    if isinstance(payload, str):
+        return json.loads(payload)
+    if hasattr(payload, "content"):
+        return _decode_tool_payload(payload.content)
+    if hasattr(payload, "model_dump"):
+        return payload.model_dump(mode="json")
+    if isinstance(payload, (list, tuple)):
+        texts = [
+            block.text
+            for block in payload
+            if hasattr(block, "text") and isinstance(block.text, str)
+        ]
+        if texts:
+            return _decode_tool_payload("".join(texts))
+    return payload
+
+
+def test_invoke_tool_helper_uses_agentscope_call_protocol():
+    class FakeAgentScopeTool:
+        name = "fake_tool"
+
+        async def __call__(self, value: str):
+            return SimpleNamespace(content=[SimpleNamespace(text=json.dumps({"value": value}))])
+
+        def on_invoke_tool(self, *_args, **_kwargs):
+            raise AssertionError("OpenAI on_invoke_tool must not be used")
+
+    assert _invoke_tool(FakeAgentScopeTool(), {"value": "ok"}) == {"value": "ok"}
 
 
 def _command_text(command: list[str]) -> str:
@@ -49,6 +87,20 @@ def test_prepare_raw_data_dry_run_defaults_to_all_segments(tmp_path):
     assert result.ok is True
     assert "20260605_152856" in result.details["selected_segments"]
     assert "20260605_152930" in result.details["selected_segments"]
+
+
+def test_prepare_raw_data_tool_accepts_json_segments_string(tmp_path, monkeypatch):
+    root = tmp_path / "VLADatasets"
+    raw_date = root / "raw_data" / "20270605"
+    (raw_date / "20260605_152856").mkdir(parents=True)
+    monkeypatch.setenv("VLA_VLADATASETS_ROOT", str(root))
+    tool = {tool.name: tool for tool in build_execution_tools(dry_run=True)}["prepare_raw_data_tool"]
+
+    result = _invoke_tool(tool, {"date": "20270605", "segments": '["20260605_152856"]'})
+
+    assert result["ok"] is True
+    assert result["details"]["selected_segments"] == ["20260605_152856"]
+    assert not (root / "raw_data" / "20270605_temp").exists()
 
 
 def test_generate_gridmap_from_pcd_dry_run_builds_command(tmp_path):

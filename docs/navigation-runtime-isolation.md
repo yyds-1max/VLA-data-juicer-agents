@@ -4,18 +4,19 @@
 
 The navigation agent uses two Python runtimes on purpose:
 
-- Agent runtime: Python 3.12 with the OpenAI Agents SDK, Pydantic, pytest, the CLI, planning, dry-run orchestration, and DashScope/OpenAI-compatible client settings.
+- Agent runtime: Python 3.12 with AgentScope, Pydantic, pytest, the CLI, planning, dry-run orchestration, and native DashScope/Qwen model settings.
 - Legacy runtime: Python 3.8 inside subprocess commands for ROS2, CUDA, OpenCV, Open3D, PCL, GUI annotation, and tracking scripts.
 
 Keep the boundary strict. The Agent runtime must not import ROS, CUDA, OpenCV, Open3D, PCL, GUI, or legacy navigation modules, because those dependencies are tied to the Python 3.8/ROS2/CUDA environment and can pollute or crash the Python 3.12 agent process. The agent should build plans and wrapper commands; legacy code should execute only after a subprocess has entered the legacy runtime.
 
-DashScope/OpenAI-compatible settings remain unchanged in the Agent runtime:
+DashScope settings remain in the Agent runtime:
 
 ```bash
 export DASHSCOPE_API_KEY="sk-..."
-export DASHSCOPE_BASE_URL="https://dashscope.aliyuncs.com/compatible-mode/v1"
 export VLA_AGENT_MODEL="qwen3.5-plus"
 ```
+
+`DASHSCOPE_BASE_URL` remains an optional override for custom DashScope-compatible deployments. The default is AgentScope's DashScope-compatible endpoint.
 
 ## Runtime env vars
 
@@ -87,6 +88,8 @@ vla-nav-agent run --date 20270605 --segments 20260605_152856 --dry-run
 ```
 
 This constructs and executes dry-run tools without running the full legacy pipeline. It requires the normal LLM settings; do not add `--no-llm`.
+
+During AgentScope-backed `plan` and `run` commands, the workflow consumes `agent.reply_stream(...)` and appends model-call, tool-call, tool-result, text-delta, and reply lifecycle events to `events.jsonl` in the run directory.
 
 ## Operational boundaries
 

@@ -1,6 +1,6 @@
 # VLA Data Juicer Agents
 
-This project builds an OpenAI Agents SDK workflow for the first-stage navigation data pipeline:
+This project builds an AgentScope workflow for the first-stage navigation data pipeline:
 
 1. prepare raw ROS bag segment links
 2. extract and synchronize navigation data
@@ -17,11 +17,10 @@ python3.12 -m venv .venv
 source .venv/bin/activate
 pip install -e ".[dev]"
 export DASHSCOPE_API_KEY="sk-..."
-export DASHSCOPE_BASE_URL="https://dashscope.aliyuncs.com/compatible-mode/v1"
 export VLA_AGENT_MODEL="qwen3.5-plus"
 ```
 
-The Agent runtime stays on Python 3.12 with the OpenAI Agents SDK. Legacy ROS2/CUDA/GUI/tracking scripts run in a separate subprocess runtime:
+The Agent runtime stays on Python 3.12 with AgentScope and native DashScope/Qwen model support. Legacy ROS2/CUDA/GUI/tracking scripts run in a separate subprocess runtime:
 
 ```bash
 export AGENT_DATA_PYTHON="/usr/bin/python3.8"
@@ -60,6 +59,8 @@ vla-nav-agent run --date 20270605 --segments 20260605_152856 --dry-run
 ```
 
 This constructs and executes dry-run tools through the Executor-Agent and requires the normal LLM settings.
+
+AgentScope `reply_stream(...)` events for LLM calls, tool calls, tool results, and final replies are written under each run directory as `events.jsonl`.
 
 ## Runtime isolation
 

@@ -1,9 +1,10 @@
 import re
+import json
 from pathlib import Path
 from typing import Literal
 
 import yaml
-from agents import function_tool
+from agentscope.tool import FunctionTool
 
 from vla_data_juicer_agents.navigation.config import NavigationSettings
 from vla_data_juicer_agents.navigation.models import RawDateInspection, SegmentInspection, TopicInfo
@@ -12,6 +13,19 @@ from vla_data_juicer_agents.navigation.profiles import classify_topics
 
 DATE_RE = re.compile(r"^[0-9]{8}$")
 RootKind = Literal["raw_data", "clip_data", "finish_data"]
+
+
+def _normalize_segments(segments: list[str] | str | None) -> list[str] | None:
+    if segments is None:
+        return None
+    if isinstance(segments, str):
+        stripped = segments.strip()
+        if stripped.startswith("["):
+            payload = json.loads(stripped)
+            if isinstance(payload, list) and all(isinstance(item, str) for item in payload):
+                return payload
+        return [stripped] if stripped else None
+    return segments
 
 
 def _root_for(root_kind: RootKind, settings: NavigationSettings) -> Path:
@@ -117,19 +131,28 @@ def classify_navigation_dataset(
     return classify_topics(topic_names)
 
 
-@function_tool
-def list_navigation_dates_tool(root_kind: RootKind) -> dict:
+def _make_function_tool(func, name: str):
+    return FunctionTool(func, name=name, is_read_only=True)
+
+
+def _list_navigation_dates_tool(root_kind: RootKind) -> dict:
     """List available navigation dataset dates under a VLADatasets root kind."""
     return {"dates": list_navigation_dates(root_kind)}
 
 
-@function_tool
-def inspect_raw_date_tool(date: str) -> dict:
+def _inspect_raw_date_tool(date: str) -> dict:
     """Inspect raw navigation metadata for one date and report segment topics or errors."""
     return inspect_raw_date(date).model_dump(mode="json")
 
 
-@function_tool(strict_mode=False)
-def classify_navigation_dataset_tool(date: str, segments: list[str] | None = None) -> dict:
+def _classify_navigation_dataset_tool(date: str, segments: list[str] | str | None = None) -> dict:
     """Classify a raw navigation date using all segments, or a selected segment list when provided."""
-    return classify_navigation_dataset(date, segments=segments).model_dump(mode="json")
+    return classify_navigation_dataset(date, segments=_normalize_segments(segments)).model_dump(mode="json")
+
+
+list_navigation_dates_tool = _make_function_tool(_list_navigation_dates_tool, "list_navigation_dates_tool")
+inspect_raw_date_tool = _make_function_tool(_inspect_raw_date_tool, "inspect_raw_date_tool")
+classify_navigation_dataset_tool = _make_function_tool(
+    _classify_navigation_dataset_tool,
+    "classify_navigation_dataset_tool",
+)

@@ -73,6 +73,6 @@ def test_classify_navigation_dataset_rejects_missing_requested_segment():
 
 
 def test_classify_navigation_dataset_tool_schema_allows_omitting_segments():
-    required = classify_navigation_dataset_tool.params_json_schema.get("required", [])
+    required = classify_navigation_dataset_tool.input_schema.get("required", [])
 
     assert "segments" not in required
