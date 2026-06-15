@@ -8,6 +8,11 @@ from agents import function_tool
 from vla_data_juicer_agents.navigation.config import NavigationSettings
 from vla_data_juicer_agents.navigation.models import DATE_RE, ToolResult
 from vla_data_juicer_agents.navigation.profiles import get_profile
+from vla_data_juicer_agents.navigation.runtime import (
+    data_runtime_command,
+    python_data_command,
+    run_u_python_command,
+)
 from vla_data_juicer_agents.navigation.subprocess_runner import run_command
 
 
@@ -128,16 +133,15 @@ def generate_gridmap_from_pcd(
 ) -> ToolResult:
     date = _validate_date(date)
     settings = settings or NavigationSettings()
-    command = [
-        settings.python_bin,
-        str(settings.pcd_to_grid_script),
+    args = [
         "--base-path",
-        str(settings.clip_data_root),
+        settings.clip_data_root,
         "--date",
         date,
     ]
     if segments:
-        command.extend(["--segments", *segments])
+        args.extend(["--segments", *segments])
+    command = python_data_command(settings.runtime, settings.pcd_to_grid_script, args)
 
     record = run_command(command, dry_run=dry_run)
     produced_paths = [settings.clip_data_root / date]
@@ -204,11 +208,11 @@ def extract_and_sync_navigation_data(
     else:
         selected = _selected_segments(raw_temp_path, segments)
     if profile.name == "u_legacy_like":
-        extract_script = settings.datatoolbox_src / "1_extract_data_from_bag_multi_process_ros2_U_legacy.py"
-        sync_script = settings.datatoolbox_src / "2_sync_data_multi_process_U_legacy.py"
+        extract_script_name = "1_extract_data_from_bag_multi_process_ros2_U_legacy.py"
+        sync_script_name = "2_sync_data_multi_process_U_legacy.py"
     else:
-        extract_script = settings.datatoolbox_src / "1_extract_data_from_bag_multi_process_ros2_U.py"
-        sync_script = settings.datatoolbox_src / "2_sync_data_multi_process_U.py"
+        extract_script_name = "1_extract_data_from_bag_multi_process_ros2_U.py"
+        sync_script_name = "2_sync_data_multi_process_U.py"
     commands = []
     if not selected:
         return ToolResult(
@@ -230,36 +234,46 @@ def extract_and_sync_navigation_data(
         save_path = settings.clip_data_root / date / segment
         commands.append(
             run_command(
-                [
-                    settings.python_bin,
-                    str(extract_script),
-                    "--data_path",
-                    str(data_path),
-                    "--save_path",
-                    str(save_path),
-                    "--processes_num",
-                    str(processes_num),
-                ],
+                run_u_python_command(
+                    settings.runtime,
+                    script_name=extract_script_name,
+                    args=[
+                        "--data_path",
+                        data_path,
+                        "--save_path",
+                        save_path,
+                        "--processes_num",
+                        str(processes_num),
+                    ],
+                    ros2_setup_bash=settings.ros2_setup_bash,
+                    ros2_ws_setup_bash=settings.ros2_ws_setup_bash,
+                    shm_msgs_lib_dir=settings.shm_msgs_lib_dir,
+                ),
                 cwd=settings.datatoolbox_src,
                 dry_run=dry_run,
             )
         )
         commands.append(
             run_command(
-                [
-                    settings.python_bin,
-                    str(sync_script),
-                    "--data_path",
-                    str(save_path),
-                    "--query_dir",
-                    profile.lidar_dirs[-1],
-                    "--output_dir",
-                    "sync_data",
-                    "--sequence_prefix",
-                    f"{segment}_zhigu_wuhan",
-                    "--processes_num",
-                    str(processes_num),
-                ],
+                run_u_python_command(
+                    settings.runtime,
+                    script_name=sync_script_name,
+                    args=[
+                        "--data_path",
+                        save_path,
+                        "--query_dir",
+                        profile.lidar_dirs[-1],
+                        "--output_dir",
+                        "sync_data",
+                        "--sequence_prefix",
+                        f"{segment}_zhigu_wuhan",
+                        "--processes_num",
+                        str(processes_num),
+                    ],
+                    ros2_setup_bash=settings.ros2_setup_bash,
+                    ros2_ws_setup_bash=settings.ros2_ws_setup_bash,
+                    shm_msgs_lib_dir=settings.shm_msgs_lib_dir,
+                ),
                 cwd=settings.datatoolbox_src,
                 dry_run=dry_run,
             )
@@ -373,30 +387,27 @@ def run_noobscene_preprocessing(
     map_path = root / "maps" / "map.png"
     commands = [
         run_command(
-            [
-                settings.python_bin,
-                str(noobscene_root / "include" / "0_creat_box.py"),
-                "--dataset_root",
-                str(root),
-            ],
+            python_data_command(
+                settings.runtime,
+                noobscene_root / "include" / "0_creat_box.py",
+                ["--dataset_root", root],
+            ),
             dry_run=dry_run,
         ),
         run_command(
-            [
-                settings.python_bin,
-                str(noobscene_root / "include" / "1_odom_convert.py"),
-                "--temp_path",
-                str(root),
-            ],
+            python_data_command(
+                settings.runtime,
+                noobscene_root / "include" / "1_odom_convert.py",
+                ["--temp_path", root],
+            ),
             dry_run=dry_run,
         ),
         run_command(
-            [
-                settings.python_bin,
-                str(noobscene_root / "include" / "2_resize.py"),
-                "--temp_path",
-                str(root),
-            ],
+            python_data_command(
+                settings.runtime,
+                noobscene_root / "include" / "2_resize.py",
+                ["--temp_path", root],
+            ),
             dry_run=dry_run,
         ),
     ]
@@ -407,7 +418,7 @@ def run_noobscene_preprocessing(
 
         commands.append(
             run_command(
-                [settings.python_bin, "./main_smart_odom.py"],
+                python_data_command(settings.runtime, "./main_smart_odom.py"),
                 cwd=noobscene_root,
                 dry_run=dry_run,
             )
@@ -447,7 +458,7 @@ def run_initial_annotation_gui(
     settings = settings or NavigationSettings()
     root = _resolve_data_path(finish_temp_path, settings)
     record = run_command(
-        [settings.python_bin, str(settings.gen_box_script), "--dataset_root", str(root)],
+        python_data_command(settings.runtime, settings.gen_box_script, ["--dataset_root", root]),
         dry_run=dry_run,
     )
     yaml_count = 0 if dry_run else len(list((root / "samples").glob("*/*/*.yaml")))
@@ -483,12 +494,11 @@ def run_tracking_and_projection(
     )
     commands = [
         run_command(
-            [
-                settings.python_bin,
-                str(settings.processing_root / "0_1th_box" / "img2video.py"),
-                "--dataset_root",
-                str(root),
-            ],
+            python_data_command(
+                settings.runtime,
+                settings.processing_root / "0_1th_box" / "img2video.py",
+                ["--dataset_root", root],
+            ),
             dry_run=dry_run,
         ),
     ]
@@ -506,7 +516,11 @@ def run_tracking_and_projection(
                 dog_yaml.parent.mkdir(parents=True, exist_ok=True)
                 shutil.copy2(yaml_path, dog_yaml)
 
-            tracking_record = run_command(["./bin/main"], cwd=tracking_root, dry_run=dry_run)
+            tracking_record = run_command(
+                data_runtime_command(settings.runtime, ["./bin/main"]),
+                cwd=tracking_root,
+                dry_run=dry_run,
+            )
             commands.append(tracking_record)
             if not dry_run and tracking_record.return_code != 0:
                 tracking_error = f"Tracking command failed for {yaml_path}"
@@ -528,34 +542,36 @@ def run_tracking_and_projection(
         commands.extend(
             [
                 run_command(
-                    [settings.python_bin, "main.py", "--data_root", str(root)],
+                    python_data_command(settings.runtime, "main.py", ["--data_root", root]),
                     cwd=settings.processing_root / "NuscenesAanlysis_smart_pts_project",
                     dry_run=dry_run,
                 ),
                 run_command(
-                    [settings.python_bin, str(pt_project / "0_img2world.py"), str(root)],
+                    python_data_command(settings.runtime, pt_project / "0_img2world.py", [root]),
                     cwd=pt_project,
                     dry_run=dry_run,
                 ),
                 run_command(
-                    [settings.python_bin, str(pt_project / "4_speed_direction_odom.py"), str(root)],
+                    python_data_command(settings.runtime, pt_project / "4_speed_direction_odom.py", [root]),
                     cwd=pt_project,
                     dry_run=dry_run,
                 ),
                 run_command(
-                    [settings.python_bin, str(pt_project / "2_othermethod_cjl.py"), str(root)],
+                    python_data_command(settings.runtime, pt_project / "2_othermethod_cjl.py", [root]),
                     cwd=pt_project,
                     dry_run=dry_run,
                 ),
                 run_command(
-                    [
-                        settings.python_bin,
-                        str(pt_project / "3_move_dir.py"),
-                        "--root_path",
-                        str(final),
-                        "--temp_path",
-                        str(root),
-                    ],
+                    python_data_command(
+                        settings.runtime,
+                        pt_project / "3_move_dir.py",
+                        [
+                            "--root_path",
+                            final,
+                            "--temp_path",
+                            root,
+                        ],
+                    ),
                     cwd=pt_project,
                     dry_run=dry_run,
                 ),

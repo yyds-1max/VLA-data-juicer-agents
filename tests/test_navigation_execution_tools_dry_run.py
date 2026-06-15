@@ -25,6 +25,18 @@ def _invoke_tool(tool, arguments):
     return json.loads(payload) if isinstance(payload, str) else payload
 
 
+def _command_text(command: list[str]) -> str:
+    return command[2] if command[:2] == ["bash", "-lc"] else " ".join(command)
+
+
+def _argument_after(command: list[str], option: str) -> str | None:
+    if command[:2] == ["bash", "-lc"]:
+        parts = command[2].split()
+    else:
+        parts = command
+    return parts[parts.index(option) + 1] if option in parts else None
+
+
 def test_prepare_raw_data_dry_run_defaults_to_all_segments(tmp_path):
     root = tmp_path / "VLADatasets"
     raw_date = root / "raw_data" / "20270605"
@@ -55,6 +67,25 @@ def test_generate_gridmap_from_pcd_dry_run_builds_command(tmp_path):
     assert "20260605_152856" in command
 
 
+def test_generate_gridmap_from_pcd_dry_run_uses_data_runtime_setup(tmp_path):
+    settings = NavigationSettings(
+        vladatasets_root=tmp_path / "VLADatasets",
+        processing_root=Path("/processing"),
+        data_python="/usr/bin/python3.8",
+        data_env_setup=Path("/env/setup_data_runtime.sh"),
+    )
+
+    result = generate_gridmap_from_pcd("20270605", ["20260605_152856"], settings=settings, dry_run=True)
+
+    command = result.commands[0].command
+    assert command[:2] == ["bash", "-lc"]
+    shell = command[2]
+    assert "source /env/setup_data_runtime.sh" in shell
+    assert 'exec "$AGENT_DATA_PYTHON" /processing/other_code/pcd_to_grid.py' in shell
+    assert "--date 20270605" in shell
+    assert "--segments 20260605_152856" in shell
+
+
 def test_noobscene_preprocessing_dry_run_includes_develop_generation_outputs(tmp_path):
     root = tmp_path / "VLADatasets"
     settings = NavigationSettings(vladatasets_root=root, processing_root=Path("/processing"))
@@ -67,6 +98,43 @@ def test_noobscene_preprocessing_dry_run_includes_develop_generation_outputs(tmp
     assert any(command[-1] == "./main_smart_odom.py" for command in commands)
     assert (finish_temp / "v1.0-trainval").as_posix() in produced_paths
     assert (finish_temp / "maps" / "map.png").as_posix() in produced_paths
+
+
+def test_noobscene_preprocessing_dry_run_uses_data_runtime_setup(tmp_path):
+    root = tmp_path / "VLADatasets"
+    settings = NavigationSettings(
+        vladatasets_root=root,
+        processing_root=Path("/processing"),
+        data_env_setup=Path("/env/setup_data_runtime.sh"),
+    )
+    finish_temp = settings.finish_data_root / "20270605_temp"
+
+    result = run_noobscene_preprocessing(finish_temp, settings=settings, dry_run=True)
+
+    shells = [_command_text(record.command) for record in result.commands]
+    assert all(record.command[:2] == ["bash", "-lc"] for record in result.commands)
+    assert all("source /env/setup_data_runtime.sh" in shell for shell in shells)
+    assert any("/processing/NoobScenes/include/0_creat_box.py" in shell for shell in shells)
+    assert any("/processing/NoobScenes/include/1_odom_convert.py" in shell for shell in shells)
+    assert any("/processing/NoobScenes/include/2_resize.py" in shell for shell in shells)
+    assert any('exec "$AGENT_DATA_PYTHON" ./main_smart_odom.py' in shell for shell in shells)
+
+
+def test_initial_annotation_gui_dry_run_uses_data_runtime_setup(tmp_path):
+    settings = NavigationSettings(
+        vladatasets_root=tmp_path / "VLADatasets",
+        processing_root=Path("/processing"),
+        data_env_setup=Path("/env/setup_data_runtime.sh"),
+    )
+    finish_temp = settings.finish_data_root / "20270605_temp"
+
+    result = run_initial_annotation_gui(finish_temp, settings=settings, dry_run=True)
+
+    command = result.commands[0].command
+    assert command[:2] == ["bash", "-lc"]
+    shell = command[2]
+    assert "source /env/setup_data_runtime.sh" in shell
+    assert 'exec "$AGENT_DATA_PYTHON" /processing/0_1th_box/gen_box.py' in shell
 
 
 def test_tracking_and_projection_dry_run_runs_tracking_for_matching_yaml(tmp_path):
@@ -84,8 +152,35 @@ def test_tracking_and_projection_dry_run_runs_tracking_for_matching_yaml(tmp_pat
         dry_run=True,
     )
 
-    assert any(record.command == ["./bin/main"] for record in result.commands)
+    assert any(_command_text(record.command).endswith("./bin/main") for record in result.commands)
     assert result.details["tracking_yaml_count"] == 1
+
+
+def test_tracking_binary_dry_run_uses_data_runtime_setup(tmp_path):
+    root = tmp_path / "VLADatasets"
+    finish_temp = root / "finish_data" / "20270605_temp"
+    clip = finish_temp / "samples" / "20270605" / "20260605_152856"
+    clip.mkdir(parents=True)
+    (clip / "master_color_color_color.yaml").write_text("{}", encoding="utf-8")
+    settings = NavigationSettings(
+        vladatasets_root=root,
+        processing_root=Path("/processing"),
+        data_env_setup=Path("/env/setup_data_runtime.sh"),
+    )
+
+    result = run_tracking_and_projection(
+        finish_temp,
+        root / "finish_data" / "20270605",
+        settings=settings,
+        dry_run=True,
+    )
+
+    tracking_commands = [
+        record.command for record in result.commands if _command_text(record.command).endswith("./bin/main")
+    ]
+    assert tracking_commands
+    assert tracking_commands[0][:2] == ["bash", "-lc"]
+    assert "source /env/setup_data_runtime.sh && exec ./bin/main" in tracking_commands[0][2]
 
 
 def test_generate_gridmap_requires_grid_json_after_successful_command(tmp_path, monkeypatch):
@@ -112,7 +207,7 @@ def test_u_legacy_like_dry_run_reports_topic_mapping_and_lidar_query_dir(tmp_pat
     result = extract_and_sync_navigation_data("20270605", "u_legacy_like", settings=settings, dry_run=True)
 
     sync_commands = [
-        record.command for record in result.commands if "2_sync_data_multi_process_U_legacy.py" in record.command[1]
+        record.command for record in result.commands if "2_sync_data_multi_process_U_legacy.py" in _command_text(record.command)
     ]
     assert result.details["extract_topics"] == [
         "/cam_video5/csi_cam/image_raw/compressed",
@@ -125,7 +220,61 @@ def test_u_legacy_like_dry_run_reports_topic_mapping_and_lidar_query_dir(tmp_pat
         "utlidar": "odom",
     }
     assert sync_commands
-    assert sync_commands[0][sync_commands[0].index("--query_dir") + 1] == "lidar_points"
+    assert _argument_after(sync_commands[0], "--query_dir") == "lidar_points"
+
+
+def test_extract_and_sync_dry_run_uses_u_runtime_setup_and_profile_script(tmp_path):
+    root = tmp_path / "VLADatasets"
+    (root / "raw_data" / "20270605_temp" / "20260605_152856").mkdir(parents=True)
+    settings = NavigationSettings(
+        vladatasets_root=root,
+        datatoolbox_src=Path("/datatoolbox/src"),
+        data_python="/usr/bin/python3.8",
+        data_env_setup=Path("/env/setup_data_runtime.sh"),
+        gt_dog_root=Path("/gt_dog"),
+    )
+
+    result = extract_and_sync_navigation_data("20270605", "u_legacy_like", settings=settings, dry_run=True)
+
+    shells = [record.command[2] for record in result.commands]
+    assert all(record.command[:2] == ["bash", "-lc"] for record in result.commands)
+    assert any("source /env/setup_data_runtime.sh" in shell for shell in shells)
+    assert all("source /gt_dog/modules/message/ros2/install/setup.bash" in shell for shell in shells)
+    assert all("source /gt_dog/modules/ros2_ws/src/install/setup.bash" in shell for shell in shells)
+    assert all("/gt_dog/modules/message/shm/install/shm_msgs/lib" in shell for shell in shells)
+    assert "1_extract_data_from_bag_multi_process_ros2_U_legacy.py" in shells[0]
+    assert "2_sync_data_multi_process_U_legacy.py" in shells[1]
+
+
+def test_projection_python_steps_dry_run_use_data_runtime_setup(tmp_path):
+    root = tmp_path / "VLADatasets"
+    finish_temp = root / "finish_data" / "20270605_temp"
+    clip = finish_temp / "samples" / "20270605" / "20260605_152856"
+    clip.mkdir(parents=True)
+    (clip / "master_color_color_color.yaml").write_text("{}", encoding="utf-8")
+    settings = NavigationSettings(
+        vladatasets_root=root,
+        processing_root=Path("/processing"),
+        data_env_setup=Path("/env/setup_data_runtime.sh"),
+    )
+
+    result = run_tracking_and_projection(
+        finish_temp,
+        root / "finish_data" / "20270605",
+        settings=settings,
+        dry_run=True,
+    )
+
+    shells = [_command_text(record.command) for record in result.commands]
+    assert any("/processing/0_1th_box/img2video.py" in shell for shell in shells)
+    assert any("exec \"$AGENT_DATA_PYTHON\" main.py --data_root" in shell for shell in shells)
+    assert any("/processing/2_pt_project/0_img2world.py" in shell for shell in shells)
+    assert any("/processing/2_pt_project/4_speed_direction_odom.py" in shell for shell in shells)
+    assert any("/processing/2_pt_project/2_othermethod_cjl.py" in shell for shell in shells)
+    assert any("/processing/2_pt_project/3_move_dir.py" in shell for shell in shells)
+    for shell in shells:
+        if "$AGENT_DATA_PYTHON" in shell or "./bin/main" in shell:
+            assert "source /env/setup_data_runtime.sh" in shell
 
 
 def test_extract_and_sync_uses_profile_specific_script_paths_in_dry_run(tmp_path):
@@ -136,8 +285,22 @@ def test_extract_and_sync_uses_profile_specific_script_paths_in_dry_run(tmp_path
     u_result = extract_and_sync_navigation_data("20270605", "u_legacy_like", settings=settings, dry_run=True)
     go2w_result = extract_and_sync_navigation_data("20270605", "go2w_like", settings=settings, dry_run=True)
 
-    u_scripts = [Path(record.command[1]).name for record in u_result.commands]
-    go2w_scripts = [Path(record.command[1]).name for record in go2w_result.commands]
+    u_scripts = [
+        script_name
+        for script_name in (
+            "1_extract_data_from_bag_multi_process_ros2_U_legacy.py",
+            "2_sync_data_multi_process_U_legacy.py",
+        )
+        if any(script_name in _command_text(record.command) for record in u_result.commands)
+    ]
+    go2w_scripts = [
+        script_name
+        for script_name in (
+            "1_extract_data_from_bag_multi_process_ros2_U.py",
+            "2_sync_data_multi_process_U.py",
+        )
+        if any(script_name in _command_text(record.command) for record in go2w_result.commands)
+    ]
     assert u_scripts == [
         "1_extract_data_from_bag_multi_process_ros2_U_legacy.py",
         "2_sync_data_multi_process_U_legacy.py",
