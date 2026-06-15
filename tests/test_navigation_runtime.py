@@ -7,6 +7,7 @@ from vla_data_juicer_agents.navigation.runtime import (
     quote_argv,
     run_u_python_command,
 )
+from vla_data_juicer_agents.navigation.config import NavigationSettings
 
 
 def test_quote_argv_quotes_shell_arguments():
@@ -74,3 +75,26 @@ def test_run_u_python_command_sources_ros_and_shm_paths():
         'exec "$AGENT_DATA_PYTHON" 1_extract_data_from_bag_multi_process_ros2_U.py '
         "--data_path /raw"
     ) in shell
+
+
+def test_navigation_settings_reads_legacy_runtime_env(monkeypatch, tmp_path):
+    monkeypatch.setenv("AGENT_DATA_PYTHON", "/usr/bin/python3.8")
+    monkeypatch.setenv("AGENT_DATA_ENV_SETUP", str(tmp_path / "setup_data_runtime.sh"))
+    monkeypatch.setenv("VLA_GT_DOG_ROOT", str(tmp_path / "GT_dog"))
+
+    settings = NavigationSettings()
+
+    assert settings.runtime.data_python == "/usr/bin/python3.8"
+    assert settings.runtime.data_env_setup == tmp_path / "setup_data_runtime.sh"
+    assert (
+        settings.ros2_setup_bash
+        == tmp_path / "GT_dog" / "modules" / "message" / "ros2" / "install" / "setup.bash"
+    )
+    assert (
+        settings.ros2_ws_setup_bash
+        == tmp_path / "GT_dog" / "modules" / "ros2_ws" / "src" / "install" / "setup.bash"
+    )
+    assert (
+        settings.shm_msgs_lib_dir
+        == tmp_path / "GT_dog" / "modules" / "message" / "shm" / "install" / "shm_msgs" / "lib"
+    )
