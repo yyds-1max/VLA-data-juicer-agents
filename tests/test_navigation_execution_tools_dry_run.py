@@ -1,6 +1,7 @@
 import asyncio
 import inspect
 import json
+import shutil
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -379,7 +380,6 @@ def test_tracking_moves_original_data_outputs_to_clip_dir(tmp_path, monkeypatch)
     def fake_run_command(command, cwd=None, dry_run=False, timeout_seconds=None):
         if command == ["./bin/main"]:
             output_root = processing_root / "Data" / "1_img_output"
-            (output_root / "tracking_img").mkdir(parents=True)
             (output_root / "tracking_img" / "frame.txt").write_text("frame", encoding="utf-8")
             (output_root / "img_points.txt").write_text("points", encoding="utf-8")
         return CommandRecord(command=command, cwd=cwd, dry_run=dry_run, return_code=0)
@@ -391,6 +391,152 @@ def test_tracking_moves_original_data_outputs_to_clip_dir(tmp_path, monkeypatch)
     assert result.ok is True
     assert (clip / "tracking_img_master_color_color_color" / "frame.txt").read_text(encoding="utf-8") == "frame"
     assert (clip / "img_master_color_color_color.txt").read_text(encoding="utf-8") == "points"
+
+
+def test_tracking_prepares_clean_output_dir_before_each_non_dry_run_job(tmp_path, monkeypatch):
+    root = tmp_path / "VLADatasets"
+    processing_root = tmp_path / "processing"
+    output_root = processing_root / "Data" / "1_img_output"
+    stale_tracking = output_root / "tracking_img"
+    stale_tracking.mkdir(parents=True)
+    (stale_tracking / "old_frame.txt").write_text("old", encoding="utf-8")
+    (output_root / "img_points.txt").write_text("old-points", encoding="utf-8")
+    finish_temp = root / "finish_data" / "20270605_temp"
+    finish = root / "finish_data" / "20270605"
+    clip = finish_temp / "samples" / "20270605" / "20260605_152856"
+    clip.mkdir(parents=True)
+    (clip / "master_color_color_color.yaml").write_text("{}", encoding="utf-8")
+    finish.mkdir(parents=True)
+    settings = NavigationSettings(vladatasets_root=root, processing_root=processing_root)
+
+    def fake_run_command(command, cwd=None, dry_run=False, timeout_seconds=None):
+        if command == ["./bin/main"]:
+            assert stale_tracking.is_dir()
+            assert list(stale_tracking.iterdir()) == []
+            assert not (output_root / "img_points.txt").exists()
+            (stale_tracking / "frame.jpg").write_text("frame", encoding="utf-8")
+            (output_root / "img_points.txt").write_text("points", encoding="utf-8")
+        return CommandRecord(command=command, cwd=cwd, dry_run=dry_run, return_code=0)
+
+    monkeypatch.setattr("vla_data_juicer_agents.navigation.execution_tools.run_command", fake_run_command)
+
+    result = run_tracking_and_projection(finish_temp, finish, settings=settings, dry_run=False)
+
+    assert result.ok is True
+    assert (clip / "tracking_img_master_color_color_color" / "frame.jpg").read_text(encoding="utf-8") == "frame"
+    assert (clip / "img_master_color_color_color.txt").read_text(encoding="utf-8") == "points"
+    assert result.details["completed_tracking_jobs"] == 1
+    assert result.details["failed_tracking_yaml"] is None
+    assert len(result.details["moved_outputs"]) == 2
+
+
+def test_tracking_fails_when_command_does_not_create_tracking_img(tmp_path, monkeypatch):
+    root = tmp_path / "VLADatasets"
+    processing_root = tmp_path / "processing"
+    finish_temp = root / "finish_data" / "20270605_temp"
+    finish = root / "finish_data" / "20270605"
+    clip = finish_temp / "samples" / "20270605" / "20260605_152856"
+    clip.mkdir(parents=True)
+    (clip / "master_color_color_color.yaml").write_text("{}", encoding="utf-8")
+    finish.mkdir(parents=True)
+    settings = NavigationSettings(vladatasets_root=root, processing_root=processing_root)
+
+    def fake_run_command(command, cwd=None, dry_run=False, timeout_seconds=None):
+        if command == ["./bin/main"]:
+            output_root = processing_root / "Data" / "1_img_output"
+            shutil.rmtree(output_root / "tracking_img")
+            (output_root / "img_points.txt").write_text("points", encoding="utf-8")
+        return CommandRecord(command=command, cwd=cwd, dry_run=dry_run, return_code=0)
+
+    monkeypatch.setattr("vla_data_juicer_agents.navigation.execution_tools.run_command", fake_run_command)
+
+    result = run_tracking_and_projection(finish_temp, finish, settings=settings, dry_run=False)
+
+    assert result.ok is False
+    assert "Missing tracking output directory" in result.message
+    assert result.details["failed_tracking_yaml"] == str(clip / "master_color_color_color.yaml")
+
+
+def test_tracking_fails_when_command_does_not_create_img_points(tmp_path, monkeypatch):
+    root = tmp_path / "VLADatasets"
+    processing_root = tmp_path / "processing"
+    finish_temp = root / "finish_data" / "20270605_temp"
+    finish = root / "finish_data" / "20270605"
+    clip = finish_temp / "samples" / "20270605" / "20260605_152856"
+    clip.mkdir(parents=True)
+    (clip / "master_color_color_color.yaml").write_text("{}", encoding="utf-8")
+    finish.mkdir(parents=True)
+    settings = NavigationSettings(vladatasets_root=root, processing_root=processing_root)
+
+    def fake_run_command(command, cwd=None, dry_run=False, timeout_seconds=None):
+        if command == ["./bin/main"]:
+            output_root = processing_root / "Data" / "1_img_output"
+            (output_root / "tracking_img" / "frame.jpg").write_text("frame", encoding="utf-8")
+        return CommandRecord(command=command, cwd=cwd, dry_run=dry_run, return_code=0)
+
+    monkeypatch.setattr("vla_data_juicer_agents.navigation.execution_tools.run_command", fake_run_command)
+
+    result = run_tracking_and_projection(finish_temp, finish, settings=settings, dry_run=False)
+
+    assert result.ok is False
+    assert "Missing tracking points file" in result.message
+    assert result.details["failed_tracking_yaml"] == str(clip / "master_color_color_color.yaml")
+
+
+def test_tracking_replaces_existing_moved_outputs_on_rerun(tmp_path, monkeypatch):
+    root = tmp_path / "VLADatasets"
+    processing_root = tmp_path / "processing"
+    finish_temp = root / "finish_data" / "20270605_temp"
+    finish = root / "finish_data" / "20270605"
+    clip = finish_temp / "samples" / "20270605" / "20260605_152856"
+    clip.mkdir(parents=True)
+    (clip / "master_color_color_color.yaml").write_text("{}", encoding="utf-8")
+    target_tracking = clip / "tracking_img_master_color_color_color"
+    target_tracking.mkdir()
+    (target_tracking / "old_frame.jpg").write_text("old", encoding="utf-8")
+    (clip / "img_master_color_color_color.txt").write_text("old-points", encoding="utf-8")
+    finish.mkdir(parents=True)
+    settings = NavigationSettings(vladatasets_root=root, processing_root=processing_root)
+
+    def fake_run_command(command, cwd=None, dry_run=False, timeout_seconds=None):
+        if command == ["./bin/main"]:
+            output_root = processing_root / "Data" / "1_img_output"
+            (output_root / "tracking_img" / "frame.jpg").write_text("new", encoding="utf-8")
+            (output_root / "img_points.txt").write_text("new-points", encoding="utf-8")
+        return CommandRecord(command=command, cwd=cwd, dry_run=dry_run, return_code=0)
+
+    monkeypatch.setattr("vla_data_juicer_agents.navigation.execution_tools.run_command", fake_run_command)
+
+    result = run_tracking_and_projection(finish_temp, finish, settings=settings, dry_run=False)
+
+    assert result.ok is True
+    assert not (target_tracking / "old_frame.jpg").exists()
+    assert (target_tracking / "frame.jpg").read_text(encoding="utf-8") == "new"
+    assert (clip / "img_master_color_color_color.txt").read_text(encoding="utf-8") == "new-points"
+
+
+def test_tracking_dry_run_does_not_delete_or_move_existing_tracking_outputs(tmp_path):
+    root = tmp_path / "VLADatasets"
+    processing_root = tmp_path / "processing"
+    output_root = processing_root / "Data" / "1_img_output"
+    stale_tracking = output_root / "tracking_img"
+    stale_tracking.mkdir(parents=True)
+    (stale_tracking / "old_frame.jpg").write_text("old", encoding="utf-8")
+    (output_root / "img_points.txt").write_text("old-points", encoding="utf-8")
+    finish_temp = root / "finish_data" / "20270605_temp"
+    finish = root / "finish_data" / "20270605"
+    clip = finish_temp / "samples" / "20270605" / "20260605_152856"
+    clip.mkdir(parents=True)
+    (clip / "master_color_color_color.yaml").write_text("{}", encoding="utf-8")
+    settings = NavigationSettings(vladatasets_root=root, processing_root=processing_root)
+
+    result = run_tracking_and_projection(finish_temp, finish, settings=settings, dry_run=True)
+
+    assert result.ok is True
+    assert (stale_tracking / "old_frame.jpg").read_text(encoding="utf-8") == "old"
+    assert (output_root / "img_points.txt").read_text(encoding="utf-8") == "old-points"
+    assert not (clip / "tracking_img_master_color_color_color").exists()
+    assert not (clip / "img_master_color_color_color.txt").exists()
 
 
 def test_generate_gridmap_requires_grid_json_under_requested_segment(tmp_path, monkeypatch):

@@ -107,6 +107,46 @@ def _copy_directory_contents(source: Path, target: Path) -> None:
             shutil.copy2(child, destination)
 
 
+def _delete_existing_path(path: Path) -> None:
+    if path.is_dir() and not path.is_symlink():
+        shutil.rmtree(path)
+    elif path.exists() or path.is_symlink():
+        path.unlink()
+
+
+def _prepare_tracking_output(img_output_dir: Path) -> tuple[bool, str | None]:
+    tracking_img = img_output_dir / "tracking_img"
+    img_points = img_output_dir / "img_points.txt"
+    try:
+        img_output_dir.mkdir(parents=True, exist_ok=True)
+        _delete_existing_path(tracking_img)
+        _delete_existing_path(img_points)
+        tracking_img.mkdir(parents=True, exist_ok=False)
+    except OSError as exc:
+        return False, f"Failed to prepare tracking output directory: {tracking_img}: {exc}"
+    return True, None
+
+
+def _replace_path(source: Path, target: Path, kind: str) -> tuple[bool, str | None]:
+    if kind == "dir":
+        if not source.exists() or not source.is_dir() or source.is_symlink():
+            return False, f"Missing tracking output directory: {source}"
+    elif kind == "file":
+        if not source.exists() or not source.is_file():
+            return False, f"Missing tracking points file: {source}"
+    else:
+        raise ValueError(f"Unsupported path kind: {kind}")
+
+    try:
+        _delete_existing_path(target)
+        target.parent.mkdir(parents=True, exist_ok=True)
+        shutil.move(str(source), str(target))
+    except OSError as exc:
+        label = "tracking output directory" if kind == "dir" else "tracking points file"
+        return False, f"Failed to move {label}: {source} -> {target}: {exc}"
+    return True, None
+
+
 def prepare_raw_data(
     date: str,
     segments: list[str] | None = None,
@@ -517,6 +557,9 @@ def run_tracking_and_projection(
         ),
     ]
     tracking_error = None
+    completed_tracking_jobs = 0
+    failed_tracking_yaml = None
+    moved_outputs: list[dict[str, str]] = []
     if not dry_run and not tracking_yamls:
         tracking_error = f"No tracking YAML files found under {root / 'samples'}"
 
@@ -526,6 +569,11 @@ def run_tracking_and_projection(
             assert match is not None
             yaml_stem = match.group(1)
             if not dry_run:
+                prepared, prepare_error = _prepare_tracking_output(img_output_dir)
+                if not prepared:
+                    tracking_error = prepare_error
+                    failed_tracking_yaml = str(yaml_path)
+                    break
                 dog_yaml = param_dir / "dog.yaml"
                 dog_yaml.parent.mkdir(parents=True, exist_ok=True)
                 shutil.copy2(yaml_path, dog_yaml)
@@ -538,19 +586,33 @@ def run_tracking_and_projection(
             commands.append(tracking_record)
             if not dry_run and tracking_record.return_code != 0:
                 tracking_error = f"Tracking command failed for {yaml_path}"
+                failed_tracking_yaml = str(yaml_path)
                 break
 
             if not dry_run:
                 tracking_img = img_output_dir / "tracking_img"
                 tracking_img_target = yaml_path.parent / f"tracking_img_{yaml_stem}"
-                if tracking_img.exists():
-                    shutil.move(str(tracking_img), str(tracking_img_target))
-
                 img_points = img_output_dir / "img_points.txt"
-                if img_points.exists():
-                    shutil.move(str(img_points), str(yaml_path.parent / f"img_{yaml_stem}.txt"))
-
-                tracking_img.mkdir(parents=True, exist_ok=True)
+                img_points_target = yaml_path.parent / f"img_{yaml_stem}.txt"
+                for source, target, kind in (
+                    (tracking_img, tracking_img_target, "dir"),
+                    (img_points, img_points_target, "file"),
+                ):
+                    moved, move_error = _replace_path(source, target, kind)
+                    if not moved:
+                        tracking_error = move_error
+                        failed_tracking_yaml = str(yaml_path)
+                        break
+                    moved_outputs.append(
+                        {
+                            "source": str(source),
+                            "target": str(target),
+                            "kind": kind,
+                        }
+                    )
+                if tracking_error is not None:
+                    break
+                completed_tracking_jobs += 1
 
     if tracking_error is None and _commands_ok(commands):
         commands.extend(
@@ -605,7 +667,13 @@ def run_tracking_and_projection(
         ),
         produced_paths=produced_paths,
         commands=commands,
-        details={"dry_run": dry_run, "tracking_yaml_count": len(tracking_yamls)},
+        details={
+            "dry_run": dry_run,
+            "tracking_yaml_count": len(tracking_yamls),
+            "completed_tracking_jobs": completed_tracking_jobs,
+            "failed_tracking_yaml": failed_tracking_yaml,
+            "moved_outputs": moved_outputs,
+        },
     )
 
 

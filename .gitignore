@@ -51,6 +51,9 @@ checkpoints/
 # Project-local docs and agent working notes
 docs/
 
+# 数据
+服务器端数据/
+
 # OS and editor files
 .DS_Store
 Thumbs.db
