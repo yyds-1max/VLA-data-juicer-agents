@@ -453,7 +453,7 @@ def test_build_execution_tools_registers_split_execution_tools(monkeypatch, tmp_
 def test_validate_navigation_outputs_checks_grid_map(tmp_path):
     root = tmp_path / "VLADatasets"
     final = root / "finish_data" / "20270605"
-    (final / "samples" / "20270605" / "clip_a" / "grid_map").mkdir(parents=True)
+    (final / "20260605_152856" / "clip_a" / "grid_map").mkdir(parents=True)
     settings = NavigationSettings(vladatasets_root=root)
 
     result = validate_navigation_outputs("20270605", settings=settings, dry_run=False)
@@ -461,6 +461,18 @@ def test_validate_navigation_outputs_checks_grid_map(tmp_path):
     assert result.ok is True
     assert "grid_map" in result.details["checked_outputs"]
     assert any(path.name == "grid_map" for path in result.produced_paths)
+
+
+def test_validate_navigation_outputs_rejects_temp_style_grid_map(tmp_path):
+    root = tmp_path / "VLADatasets"
+    final = root / "finish_data" / "20270605"
+    (final / "samples" / "20270605" / "clip_a" / "grid_map").mkdir(parents=True)
+    settings = NavigationSettings(vladatasets_root=root)
+
+    result = validate_navigation_outputs("20270605", settings=settings, dry_run=False)
+
+    assert result.ok is False
+    assert "grid_map" in result.message or "Missing final output" in result.message
 
 
 def test_extract_and_sync_uses_profile_specific_script_paths_in_dry_run(tmp_path):

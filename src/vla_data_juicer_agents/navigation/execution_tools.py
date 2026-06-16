@@ -892,7 +892,16 @@ def validate_navigation_outputs(
     date = _validate_date(date)
     settings = settings or NavigationSettings()
     final = settings.finish_data_root / date
-    grid_map_dirs = [] if dry_run else sorted((final / "samples" / date).glob("*/grid_map"))
+    if dry_run or not final.exists():
+        grid_map_dirs = []
+    else:
+        grid_map_dirs = sorted(
+            clip / "grid_map"
+            for segment in final.iterdir()
+            if segment.is_dir() and segment.name != "samples"
+            for clip in segment.iterdir()
+            if clip.is_dir() and (clip / "grid_map").is_dir()
+        )
     exists = final.exists()
     has_grid_map = bool(grid_map_dirs)
     ok = dry_run or (exists and has_grid_map)
