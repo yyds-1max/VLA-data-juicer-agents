@@ -13,10 +13,14 @@ from vla_data_juicer_agents.navigation.execution_tools import (
     build_execution_tools,
     extract_and_sync_navigation_data,
     generate_gridmap_from_pcd,
+    prepare_gridmap_for_projection,
     prepare_raw_data,
     run_initial_annotation_gui,
     run_noobscene_preprocessing,
+    run_projection_and_trajectory,
+    run_tracking,
     run_tracking_and_projection,
+    validate_navigation_outputs,
 )
 from vla_data_juicer_agents.navigation.models import CommandRecord
 
@@ -148,7 +152,10 @@ def test_noobscene_preprocessing_dry_run_includes_develop_generation_outputs(tmp
 
     commands = [record.command for record in result.commands]
     produced_paths = {path.as_posix() for path in result.produced_paths}
-    assert any(command[-1] == "./main_smart_odom.py" for command in commands)
+    command_texts = [_command_text(command) for command in commands]
+    main_index = next(index for index, text in enumerate(command_texts) if text.endswith("./main_smart_odom.py"))
+    img2video_index = next(index for index, text in enumerate(command_texts) if "img2video.py" in text)
+    assert main_index < img2video_index
     assert (finish_temp / "v1.0-trainval").as_posix() in produced_paths
     assert (finish_temp / "maps" / "map.png").as_posix() in produced_paths
 
@@ -171,6 +178,79 @@ def test_noobscene_preprocessing_dry_run_uses_data_runtime_setup(tmp_path):
     assert any("/processing/NoobScenes/include/1_odom_convert.py" in shell for shell in shells)
     assert any("/processing/NoobScenes/include/2_resize.py" in shell for shell in shells)
     assert any('exec "$AGENT_DATA_PYTHON" ./main_smart_odom.py' in shell for shell in shells)
+    assert any("/processing/0_1th_box/img2video.py" in shell for shell in shells)
+
+
+def test_assemble_finish_temp_copies_only_server_finish_inputs_and_profile_sensors(tmp_path):
+    root = tmp_path / "VLADatasets"
+    processing_root = tmp_path / "processing"
+    clip = root / "clip_data" / "20270605" / "20260605_152856" / "sync_data" / "clip_a"
+    for child_name in ("fisheye_front", "r32_rslidar_points", "grid_map", "odom"):
+        child = clip / child_name
+        child.mkdir(parents=True)
+        (child / "data.txt").write_text(child_name, encoding="utf-8")
+    sensor_source = processing_root / "NoobScenes" / "params" / "20260529_go2w" / "sensors"
+    sensor_source.mkdir(parents=True)
+    (sensor_source / "calib.json").write_text("{}", encoding="utf-8")
+    settings = NavigationSettings(vladatasets_root=root, processing_root=processing_root)
+
+    result = assemble_finish_temp("20270605", dataset_profile="go2w_like", settings=settings, dry_run=False)
+
+    dst = root / "finish_data" / "20270605_temp" / "samples" / "20270605" / "clip_a"
+    assert result.ok is True
+    assert (dst / "fisheye_front" / "data.txt").read_text(encoding="utf-8") == "fisheye_front"
+    assert (dst / "r32_rslidar_points" / "data.txt").read_text(encoding="utf-8") == "r32_rslidar_points"
+    assert (dst / "sensors" / "calib.json").exists()
+    assert not (dst / "grid_map").exists()
+    assert not (dst / "odom").exists()
+    assert result.details["sensor_source"].endswith("20260529_go2w/sensors")
+
+
+def test_prepare_gridmap_for_projection_copies_and_transforms_existing_gridmap(tmp_path):
+    root = tmp_path / "VLADatasets"
+    source = root / "clip_data" / "20270605" / "20260605_152856" / "sync_data" / "clip_a" / "grid_map"
+    source.mkdir(parents=True)
+    (source / "map.json").write_text(json.dumps({"data": list(range(200 * 200)), "meta": "kept"}), encoding="utf-8")
+    (source / "map.bin").write_text("binary-ish", encoding="utf-8")
+    finish_temp = root / "finish_data" / "20270605_temp"
+    settings = NavigationSettings(vladatasets_root=root)
+
+    result = prepare_gridmap_for_projection(
+        "20270605",
+        segments=["20260605_152856"],
+        finish_temp_path=finish_temp,
+        settings=settings,
+        dry_run=False,
+    )
+
+    target = finish_temp / "samples" / "20270605" / "clip_a" / "grid_map"
+    transformed = json.loads((target / "map.json").read_text(encoding="utf-8"))
+    assert result.ok is True
+    assert result.details["source_mode"] == "existing_gridmap"
+    assert result.details["prepared_gridmap_count"] == 2
+    assert transformed["meta"] == "kept"
+    assert transformed["data"][:4] == [39800, 39600, 39400, 39200]
+    assert transformed["data"][-4:] == [799, 599, 399, 199]
+    assert (target / "map.bin").read_text(encoding="utf-8") == "binary-ish"
+
+
+def test_prepare_gridmap_for_projection_dry_run_falls_back_to_generation_command(tmp_path):
+    root = tmp_path / "VLADatasets"
+    (root / "clip_data" / "20270605" / "20260605_152856").mkdir(parents=True)
+    settings = NavigationSettings(vladatasets_root=root, processing_root=Path("/processing"))
+
+    result = prepare_gridmap_for_projection(
+        "20270605",
+        segments=["20260605_152856"],
+        settings=settings,
+        dry_run=True,
+    )
+
+    assert result.ok is True
+    assert result.details["source_mode"] == "generated_from_pointcloud"
+    assert result.details["prepared_gridmap_count"] == 0
+    assert result.details["generated_command_count"] == 1
+    assert any("/processing/other_code/pcd_to_grid.py" in _command_text(record.command) for record in result.commands)
 
 
 def test_initial_annotation_gui_dry_run_uses_data_runtime_setup(tmp_path):
@@ -198,14 +278,25 @@ def test_tracking_and_projection_dry_run_runs_tracking_for_matching_yaml(tmp_pat
     (clip / "master_color_color_color.yaml").write_text("{}", encoding="utf-8")
     settings = NavigationSettings(vladatasets_root=root, processing_root=Path("/processing"))
 
-    result = run_tracking_and_projection(
-        finish_temp,
-        root / "finish_data" / "20270605",
-        settings=settings,
-        dry_run=True,
-    )
+    result = run_tracking(finish_temp, settings=settings, dry_run=True)
 
     assert any(_command_text(record.command).endswith("./bin/main") for record in result.commands)
+    assert result.details["tracking_yaml_count"] == 1
+
+
+def test_run_tracking_dry_run_only_runs_tracking_loop(tmp_path):
+    root = tmp_path / "VLADatasets"
+    finish_temp = root / "finish_data" / "20270605_temp"
+    clip = finish_temp / "samples" / "20270605" / "20260605_152856"
+    clip.mkdir(parents=True)
+    (clip / "master_color_color_color.yaml").write_text("{}", encoding="utf-8")
+    settings = NavigationSettings(vladatasets_root=root, processing_root=Path("/processing"))
+
+    result = run_tracking(finish_temp, settings=settings, dry_run=True)
+
+    shells = [_command_text(record.command) for record in result.commands]
+    assert result.ok is True
+    assert shells == ["./bin/main"]
     assert result.details["tracking_yaml_count"] == 1
 
 
@@ -311,7 +402,7 @@ def test_projection_python_steps_dry_run_use_data_runtime_setup(tmp_path):
         data_env_setup=Path("/env/setup_data_runtime.sh"),
     )
 
-    result = run_tracking_and_projection(
+    result = run_projection_and_trajectory(
         finish_temp,
         root / "finish_data" / "20270605",
         settings=settings,
@@ -319,7 +410,6 @@ def test_projection_python_steps_dry_run_use_data_runtime_setup(tmp_path):
     )
 
     shells = [_command_text(record.command) for record in result.commands]
-    assert any("/processing/0_1th_box/img2video.py" in shell for shell in shells)
     assert any("exec \"$AGENT_DATA_PYTHON\" main.py --data_root" in shell for shell in shells)
     assert any("/processing/2_pt_project/0_img2world.py" in shell for shell in shells)
     assert any("/processing/2_pt_project/4_speed_direction_odom.py" in shell for shell in shells)
@@ -328,6 +418,49 @@ def test_projection_python_steps_dry_run_use_data_runtime_setup(tmp_path):
     for shell in shells:
         if "$AGENT_DATA_PYTHON" in shell or "./bin/main" in shell:
             assert "source /env/setup_data_runtime.sh" in shell
+
+
+def test_projection_and_trajectory_uses_go2w_trajectory_script(tmp_path):
+    root = tmp_path / "VLADatasets"
+    finish_temp = root / "finish_data" / "20270605_temp"
+    settings = NavigationSettings(vladatasets_root=root, processing_root=Path("/processing"))
+
+    result = run_projection_and_trajectory(
+        finish_temp,
+        root / "finish_data" / "20270605",
+        dataset_profile="go2w_like",
+        settings=settings,
+        dry_run=True,
+    )
+
+    shells = [_command_text(record.command) for record in result.commands]
+    assert any("/processing/2_pt_project/2_othermethod_cjl_0525.py" in shell for shell in shells)
+    assert not any("/processing/0_1th_box/img2video.py" in shell for shell in shells)
+    assert not any(shell.endswith("./bin/main") for shell in shells)
+
+
+def test_build_execution_tools_registers_split_execution_tools(monkeypatch, tmp_path):
+    monkeypatch.setenv("VLA_VLADATASETS_ROOT", str(tmp_path / "VLADatasets"))
+
+    names = {tool.name for tool in build_execution_tools(dry_run=True)}
+
+    assert "run_tracking_tool" in names
+    assert "prepare_gridmap_for_projection_tool" in names
+    assert "run_projection_and_trajectory_tool" in names
+    assert "run_tracking_and_projection_tool" in names
+
+
+def test_validate_navigation_outputs_checks_grid_map(tmp_path):
+    root = tmp_path / "VLADatasets"
+    final = root / "finish_data" / "20270605"
+    (final / "samples" / "20270605" / "clip_a" / "grid_map").mkdir(parents=True)
+    settings = NavigationSettings(vladatasets_root=root)
+
+    result = validate_navigation_outputs("20270605", settings=settings, dry_run=False)
+
+    assert result.ok is True
+    assert "grid_map" in result.details["checked_outputs"]
+    assert any(path.name == "grid_map" for path in result.produced_paths)
 
 
 def test_extract_and_sync_uses_profile_specific_script_paths_in_dry_run(tmp_path):
@@ -386,7 +519,7 @@ def test_tracking_moves_original_data_outputs_to_clip_dir(tmp_path, monkeypatch)
 
     monkeypatch.setattr("vla_data_juicer_agents.navigation.execution_tools.run_command", fake_run_command)
 
-    result = run_tracking_and_projection(finish_temp, finish, settings=settings, dry_run=False)
+    result = run_tracking(finish_temp, settings=settings, dry_run=False)
 
     assert result.ok is True
     assert (clip / "tracking_img_master_color_color_color" / "frame.txt").read_text(encoding="utf-8") == "frame"
@@ -420,7 +553,7 @@ def test_tracking_prepares_clean_output_dir_before_each_non_dry_run_job(tmp_path
 
     monkeypatch.setattr("vla_data_juicer_agents.navigation.execution_tools.run_command", fake_run_command)
 
-    result = run_tracking_and_projection(finish_temp, finish, settings=settings, dry_run=False)
+    result = run_tracking(finish_temp, settings=settings, dry_run=False)
 
     assert result.ok is True
     assert (clip / "tracking_img_master_color_color_color" / "frame.jpg").read_text(encoding="utf-8") == "frame"
@@ -450,7 +583,7 @@ def test_tracking_fails_when_command_does_not_create_tracking_img(tmp_path, monk
 
     monkeypatch.setattr("vla_data_juicer_agents.navigation.execution_tools.run_command", fake_run_command)
 
-    result = run_tracking_and_projection(finish_temp, finish, settings=settings, dry_run=False)
+    result = run_tracking(finish_temp, settings=settings, dry_run=False)
 
     assert result.ok is False
     assert "Missing tracking output directory" in result.message
@@ -476,7 +609,7 @@ def test_tracking_fails_when_command_does_not_create_img_points(tmp_path, monkey
 
     monkeypatch.setattr("vla_data_juicer_agents.navigation.execution_tools.run_command", fake_run_command)
 
-    result = run_tracking_and_projection(finish_temp, finish, settings=settings, dry_run=False)
+    result = run_tracking(finish_temp, settings=settings, dry_run=False)
 
     assert result.ok is False
     assert "Missing tracking points file" in result.message
@@ -507,7 +640,7 @@ def test_tracking_replaces_existing_moved_outputs_on_rerun(tmp_path, monkeypatch
 
     monkeypatch.setattr("vla_data_juicer_agents.navigation.execution_tools.run_command", fake_run_command)
 
-    result = run_tracking_and_projection(finish_temp, finish, settings=settings, dry_run=False)
+    result = run_tracking(finish_temp, settings=settings, dry_run=False)
 
     assert result.ok is True
     assert not (target_tracking / "old_frame.jpg").exists()
@@ -530,7 +663,7 @@ def test_tracking_dry_run_does_not_delete_or_move_existing_tracking_outputs(tmp_
     (clip / "master_color_color_color.yaml").write_text("{}", encoding="utf-8")
     settings = NavigationSettings(vladatasets_root=root, processing_root=processing_root)
 
-    result = run_tracking_and_projection(finish_temp, finish, settings=settings, dry_run=True)
+    result = run_tracking(finish_temp, settings=settings, dry_run=True)
 
     assert result.ok is True
     assert (stale_tracking / "old_frame.jpg").read_text(encoding="utf-8") == "old"

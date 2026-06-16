@@ -18,6 +18,7 @@ def _validate_date(value: str) -> str:
 class NavigationRequest(BaseModel):
     date: str
     segments: list[str] | None = None
+    scene_mode: Literal["in", "out"] | None = None
     dry_run: bool = False
 
     @field_validator("date")
@@ -74,6 +75,7 @@ class WorkflowStep(BaseModel):
 class WorkflowPlan(BaseModel):
     date: str
     segments: list[str] | None = None
+    scene_mode: Literal["in", "out"]
     dataset_profile: str
     steps: list[WorkflowStep]
 

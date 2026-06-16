@@ -31,6 +31,9 @@ Do not hand-write script-level plans; final WorkflowPlan JSON must come from fin
 Stage one covers prepare.sh, run_U.sh, and run_odom.sh only; do not include run_fix.sh.
 Only human-blocking step is gen_box.py via run_initial_annotation_gui.
 Default all raw segments if not specified.
+scene_mode is required and must be either "in" or "out".
+Prepare gridmap after run_tracking and before run_projection_and_trajectory.
+Supported execution tool names include run_tracking, prepare_gridmap_for_projection, and run_projection_and_trajectory.
 Supported profiles are u_legacy_like and go2w_like.
 """.strip()
 
@@ -44,6 +47,9 @@ Stop on any failed tool result.
 The gen_box.py GUI step is human-blocking via run_initial_annotation_gui and blocks until the human finishes.
 Stage one covers prepare.sh, run_U.sh, and run_odom.sh only; do not include run_fix.sh.
 Default all raw segments if not specified.
+scene_mode is required and must be either "in" or "out".
+Prepare gridmap after run_tracking and before run_projection_and_trajectory.
+Supported execution tool names include run_tracking, prepare_gridmap_for_projection, and run_projection_and_trajectory.
 Supported profiles are u_legacy_like and go2w_like.
 """.strip()
 

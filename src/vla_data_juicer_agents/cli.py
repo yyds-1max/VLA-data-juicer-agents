@@ -25,6 +25,7 @@ def parse_args(argv: list[str] | None = None):
         sub = subparsers.add_parser(command)
         sub.add_argument("--date", required=True)
         sub.add_argument("--segments", nargs="+", default=None)
+        sub.add_argument("--scene-mode", choices=("in", "out"), default=None)
         sub.add_argument("--dry-run", action="store_true")
         sub.add_argument("--model", default=None, help="Qwen model id; defaults to VLA_AGENT_MODEL or qwen3.5-plus.")
         sub.add_argument(
@@ -38,7 +39,16 @@ def parse_args(argv: list[str] | None = None):
 
 async def async_main(argv: list[str] | None = None) -> int:
     args = parse_args(argv)
-    request = NavigationRequest(date=args.date, segments=args.segments, dry_run=args.dry_run)
+    if args.scene_mode is None:
+        print("Missing required --scene-mode {in,out}; please provide in or out.", file=sys.stderr)
+        return 2
+
+    request = NavigationRequest(
+        date=args.date,
+        segments=args.segments,
+        scene_mode=args.scene_mode,
+        dry_run=args.dry_run,
+    )
 
     if args.no_llm:
         if args.command != "plan":
@@ -59,7 +69,12 @@ async def async_main(argv: list[str] | None = None) -> int:
                 {"status": "failed", "ok": False, "classification": classification.model_dump(mode="json")},
             )
             return 2
-        plan = build_deterministic_plan_template(request.date, classification.profile_name, request.segments)
+        plan = build_deterministic_plan_template(
+            request.date,
+            classification.profile_name,
+            request.segments,
+            scene_mode=request.scene_mode,
+        )
     else:
         plan_agent = create_plan_agent(model=args.model, request=request)
         plan = await run_plan_agent(plan_agent, request, run_store=run_store, run_dir=run_dir)

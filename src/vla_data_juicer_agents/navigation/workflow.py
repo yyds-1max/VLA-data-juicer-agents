@@ -1,7 +1,7 @@
 import json
 import re
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 from agentscope.event import ConfirmResult, UserConfirmResultEvent
 from agentscope.message import UserMsg
@@ -10,6 +10,13 @@ from pydantic import ValidationError
 from vla_data_juicer_agents.navigation.models import NavigationRequest, WorkflowPlan, WorkflowStep
 from vla_data_juicer_agents.navigation.plan_draft import build_plan_from_draft
 from vla_data_juicer_agents.navigation.run_state import WorkflowRunStore
+
+
+class _SceneModeMissing:
+    pass
+
+
+_SCENE_MODE_MISSING = _SceneModeMissing()
 
 
 def _finish_temp_path(date: str) -> str:
@@ -57,7 +64,12 @@ def build_deterministic_plan_template(
     date: str,
     dataset_profile: str,
     segments: list[str] | None,
+    *,
+    scene_mode: Literal["in", "out"] | _SceneModeMissing = _SCENE_MODE_MISSING,
 ) -> WorkflowPlan:
+    if scene_mode not in {"in", "out"}:
+        raise ValueError("scene_mode is required before building WorkflowPlan; expected 'in' or 'out'.")
+
     finish_temp_path = _finish_temp_path(date)
     finish_path = _finish_path(date)
     common_arguments = {"date": date, "segments": segments}
@@ -65,6 +77,7 @@ def build_deterministic_plan_template(
     return WorkflowPlan(
         date=date,
         segments=segments,
+        scene_mode=scene_mode,
         dataset_profile=dataset_profile,
         steps=[
             WorkflowStep(
@@ -81,17 +94,9 @@ def build_deterministic_plan_template(
                 expected_outputs=[f"clip_data/{date}"],
             ),
             WorkflowStep(
-                step_id="generate_gridmap_from_pcd",
-                tool_name="generate_gridmap_from_pcd",
-                arguments=common_arguments,
-                preconditions=["extract_and_sync_navigation_data"],
-                expected_outputs=[f"gridmap/{date}"],
-                failure_behavior="skip_if_gridmap_exists",
-            ),
-            WorkflowStep(
                 step_id="assemble_finish_temp",
                 tool_name="assemble_finish_temp",
-                arguments=common_arguments,
+                arguments={**common_arguments, "dataset_profile": dataset_profile},
                 preconditions=["extract_and_sync_navigation_data"],
                 expected_outputs=[finish_temp_path],
             ),
@@ -111,17 +116,36 @@ def build_deterministic_plan_template(
                 human_blocking=True,
             ),
             WorkflowStep(
-                step_id="run_tracking_and_projection",
-                tool_name="run_tracking_and_projection",
-                arguments={"finish_temp_path": finish_temp_path, "finish_path": finish_path},
+                step_id="run_tracking",
+                tool_name="run_tracking",
+                arguments={"finish_temp_path": finish_temp_path},
                 preconditions=["run_initial_annotation_gui"],
+                expected_outputs=[finish_path],
+            ),
+            WorkflowStep(
+                step_id="prepare_gridmap_for_projection",
+                tool_name="prepare_gridmap_for_projection",
+                arguments={**common_arguments, "finish_temp_path": finish_temp_path},
+                preconditions=["run_tracking"],
+                expected_outputs=[f"gridmap/{date}"],
+                failure_behavior="skip_if_gridmap_exists",
+            ),
+            WorkflowStep(
+                step_id="run_projection_and_trajectory",
+                tool_name="run_projection_and_trajectory",
+                arguments={
+                    "finish_temp_path": finish_temp_path,
+                    "finish_path": finish_path,
+                    "dataset_profile": dataset_profile,
+                },
+                preconditions=["prepare_gridmap_for_projection"],
                 expected_outputs=[finish_path],
             ),
             WorkflowStep(
                 step_id="validate_navigation_outputs",
                 tool_name="validate_navigation_outputs",
                 arguments={"date": date},
-                preconditions=["run_tracking_and_projection"],
+                preconditions=["run_projection_and_trajectory"],
                 expected_outputs=[finish_path],
             ),
         ],
@@ -220,7 +244,10 @@ async def run_plan_agent(
         "final strict WorkflowPlan JSON must come from finalize_workflow_plan_tool. Stage one covers "
         "prepare.sh, run_U.sh, and run_odom.sh only; do not include run_fix.sh. Default to all raw "
         "segments when segments are not specified. Supported dataset profiles are u_legacy_like and "
-        "go2w_like. The only human-blocking step is gen_box.py via run_initial_annotation_gui.\n\n"
+        "go2w_like. scene_mode is required and must be either in or out. Gridmap preparation must happen "
+        "after run_tracking and before projection. Supported execution tool names include run_tracking, "
+        "prepare_gridmap_for_projection, and run_projection_and_trajectory. The only human-blocking step "
+        "is gen_box.py via run_initial_annotation_gui.\n\n"
         f"NavigationRequest JSON:\n{request.model_dump_json()}"
         f"{draft_prompt}"
     )
@@ -241,7 +268,10 @@ async def run_executor_agent(
     prompt = (
         "Execute this WorkflowPlan JSON step-by-step using the matching execution tools. Stop on any "
         "failed tool result. The gen_box.py GUI step is human-blocking via run_initial_annotation_gui; "
-        "wait until the human finishes before continuing. Return a concise final execution summary.\n\n"
+        "wait until the human finishes before continuing. scene_mode is required and must be either in "
+        "or out. Prepare gridmap after run_tracking and before run_projection_and_trajectory. Supported "
+        "tool names include run_tracking, prepare_gridmap_for_projection, and run_projection_and_trajectory. "
+        "Return a concise final execution summary.\n\n"
         f"WorkflowPlan JSON:\n{plan.model_dump_json()}"
     )
     return await _run_agent_stream(agent, prompt, run_store=run_store, run_dir=run_dir)

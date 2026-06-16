@@ -118,7 +118,18 @@ def test_vla_run_workflow_tool_reuses_plan_and_executor_agents(tmp_path, monkeyp
     )
 
     async def fake_run_plan_agent(agent, request, run_store=None, run_dir=None):
-        calls.append(("plan", agent, request.date, request.segments, request.dry_run, bool(run_store), bool(run_dir)))
+        calls.append(
+            (
+                "plan",
+                agent,
+                request.date,
+                request.segments,
+                request.scene_mode,
+                request.dry_run,
+                bool(run_store),
+                bool(run_dir),
+            )
+        )
         return plan
 
     async def fake_run_executor_agent(agent, workflow_plan, run_store=None, run_dir=None):
@@ -138,6 +149,7 @@ def test_vla_run_workflow_tool_reuses_plan_and_executor_agents(tmp_path, monkeyp
             {
                 "date": "20270605",
                 "segments": ["20260605_152856"],
+                "scene_mode": "out",
                 "dry_run": True,
                 "approve": True,
             },
@@ -148,8 +160,30 @@ def test_vla_run_workflow_tool_reuses_plan_and_executor_agents(tmp_path, monkeyp
     assert payload["status"] == "completed"
     assert payload["final_output"] == "execution summary"
     assert Path(payload["run_dir"]).is_dir()
-    assert calls[0] == ("plan", "plan-agent", "20270605", ["20260605_152856"], True, True, True)
+    assert calls[0] == ("plan", "plan-agent", "20270605", ["20260605_152856"], "out", True, True, True)
     assert calls[1] == ("execute", "executor-dry-True", plan, True, True)
+
+
+def test_vla_run_workflow_tool_requires_scene_mode(tmp_path):
+    ctx = ToolContext(working_dir=str(tmp_path), artifacts_dir=str(tmp_path / ".djx"))
+
+    payload = asyncio.run(
+        run_vla_workflow(
+            ctx,
+            {
+                "date": "20270605",
+                "segments": ["20260605_152856"],
+                "dry_run": True,
+                "approve": True,
+            },
+        )
+    )
+
+    assert payload["ok"] is False
+    assert payload["status"] == "needs_user_input"
+    assert payload["error_type"] == "missing_scene_mode"
+    assert "in" in payload["message"]
+    assert "out" in payload["message"]
 
 
 def test_vla_run_workflow_normalizes_llm_string_arguments():

@@ -15,6 +15,18 @@ def test_navigation_request_defaults_to_all_segments():
     assert request.date == "20270605"
     assert request.segments is None
     assert request.dry_run is False
+    assert request.scene_mode is None
+
+
+def test_navigation_request_accepts_scene_mode():
+    request = NavigationRequest(date="20270605", scene_mode="in")
+
+    assert request.scene_mode == "in"
+
+
+def test_navigation_request_rejects_unknown_scene_mode():
+    with pytest.raises(ValueError):
+        NavigationRequest(date="20270605", scene_mode="indoor")
 
 
 def test_navigation_request_rejects_bad_date():
@@ -47,6 +59,7 @@ def test_workflow_plan_keeps_ordered_steps():
     plan = WorkflowPlan(
         date="20270605",
         segments=["20260605_152856"],
+        scene_mode="out",
         dataset_profile="go2w_like",
         steps=[
             WorkflowStep(
@@ -59,3 +72,21 @@ def test_workflow_plan_keeps_ordered_steps():
     )
 
     assert plan.steps[0].tool_name == "prepare_raw_data"
+    assert plan.scene_mode == "out"
+
+
+def test_workflow_plan_rejects_missing_scene_mode():
+    with pytest.raises(ValueError):
+        WorkflowPlan(
+            date="20270605",
+            scene_mode=None,
+            dataset_profile="go2w_like",
+            steps=[WorkflowStep(step_id="prepare", tool_name="prepare_raw_data")],
+        )
+
+    with pytest.raises(ValueError):
+        WorkflowPlan(
+            date="20270605",
+            dataset_profile="go2w_like",
+            steps=[WorkflowStep(step_id="prepare", tool_name="prepare_raw_data")],
+        )

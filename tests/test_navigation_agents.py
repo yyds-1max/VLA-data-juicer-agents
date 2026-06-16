@@ -9,6 +9,7 @@ from agentscope.event import RequireUserConfirmEvent
 from agentscope.message import ToolCallBlock
 
 from vla_data_juicer_agents.navigation.models import NavigationRequest
+from vla_data_juicer_agents.navigation.plan_draft import WorkflowPlanDraftState
 from vla_data_juicer_agents.navigation.run_state import WorkflowRunStore
 from vla_data_juicer_agents.navigation.agents import create_executor_agent, create_plan_agent
 from vla_data_juicer_agents.navigation.workflow import build_deterministic_plan_template, run_plan_agent
@@ -68,7 +69,7 @@ def test_create_plan_agent_has_read_only_tools(monkeypatch):
 
 def test_create_plan_agent_with_request_has_draft_tools(monkeypatch):
     monkeypatch.setenv("DASHSCOPE_API_KEY", "test-key")
-    request = NavigationRequest(date="20270605", dry_run=True)
+    request = NavigationRequest(date="20270605", dry_run=True, scene_mode="out")
     agent = create_plan_agent(request=request)
     tool_names = {tool.name for tool in agent.tools}
 
@@ -141,7 +142,7 @@ def test_plan_agent_classification_tool_accepts_json_segments_string(tmp_path, m
 
 def test_plan_agent_draft_tools_finalize_internal_workflow_plan(monkeypatch):
     monkeypatch.setenv("DASHSCOPE_API_KEY", "test-key")
-    request = NavigationRequest(date="20270605", dry_run=True)
+    request = NavigationRequest(date="20270605", dry_run=True, scene_mode="out")
     agent = create_plan_agent(request=request)
     tools = {tool.name: tool for tool in agent.tools}
 
@@ -151,24 +152,56 @@ def test_plan_agent_draft_tools_finalize_internal_workflow_plan(monkeypatch):
     assert update_result["ok"] is True
     plan = finalize_result["workflow_plan_json"]
     assert plan["date"] == "20270605"
+    assert plan["scene_mode"] == "out"
     assert plan["dataset_profile"] == "go2w_like"
     assert [step["tool_name"] for step in plan["steps"]] == [
         "prepare_raw_data",
         "extract_and_sync_navigation_data",
-        "generate_gridmap_from_pcd",
         "assemble_finish_temp",
         "run_noobscene_preprocessing",
         "run_initial_annotation_gui",
-        "run_tracking_and_projection",
+        "run_tracking",
+        "prepare_gridmap_for_projection",
+        "run_projection_and_trajectory",
         "validate_navigation_outputs",
     ]
+
+
+def test_plan_agent_draft_missing_fields_include_scene_mode():
+    state = WorkflowPlanDraftState(request=NavigationRequest(date="20270605", dry_run=True))
+
+    update_result = state.update(profile="go2w_like")
+    snapshot = state.schema_snapshot()
+
+    assert update_result["ok"] is True
+    assert snapshot["scene_mode"] == "<in|out>"
+    assert "scene_mode" in state.missing_fields()
+    assert "scene_mode" in snapshot["missing_fields"]
+
+
+def test_plan_agent_draft_finalize_requires_scene_mode(monkeypatch):
+    monkeypatch.setenv("DASHSCOPE_API_KEY", "test-key")
+    request = NavigationRequest(date="20270605", dry_run=True)
+    agent = create_plan_agent(request=request)
+    tools = {tool.name: tool for tool in agent.tools}
+
+    update_result = _invoke_tool(tools["update_workflow_plan_draft_tool"], {"profile": "go2w_like"})
+
+    assert update_result["ok"] is True
+    with pytest.raises(ValueError, match="scene_mode is required"):
+        _invoke_tool(tools["finalize_workflow_plan_tool"], {})
 
 
 def test_executor_agent_has_sdk_tool_for_each_plan_step(monkeypatch):
     monkeypatch.setenv("DASHSCOPE_API_KEY", "test-key")
     agent = create_executor_agent(dry_run=True)
     tool_names = {tool.name for tool in agent.tools}
-    plan = build_deterministic_plan_template(date="20270605", dataset_profile="go2w_like", segments=None)
+    plan = build_deterministic_plan_template(
+        date="20270605",
+        dataset_profile="go2w_like",
+        segments=None,
+        scene_mode="out",
+    )
 
     missing_tools = [f"{step.tool_name}_tool" for step in plan.steps if f"{step.tool_name}_tool" not in tool_names]
 
@@ -176,8 +209,30 @@ def test_executor_agent_has_sdk_tool_for_each_plan_step(monkeypatch):
     assert "prepare_raw_data_tool" in agent.instructions
 
 
+def test_plan_template_requires_scene_mode():
+    with pytest.raises(ValueError, match="scene_mode is required"):
+        build_deterministic_plan_template(
+            date="20270605",
+            dataset_profile="go2w_like",
+            segments=None,
+        )
+
+    with pytest.raises(ValueError, match="scene_mode is required"):
+        build_deterministic_plan_template(
+            date="20270605",
+            dataset_profile="go2w_like",
+            segments=None,
+            scene_mode=None,
+        )
+
+
 def test_plan_template_includes_human_gui_step():
-    plan = build_deterministic_plan_template(date="20270605", dataset_profile="go2w_like", segments=None)
+    plan = build_deterministic_plan_template(
+        date="20270605",
+        dataset_profile="go2w_like",
+        segments=None,
+        scene_mode="out",
+    )
 
     gui_steps = [step for step in plan.steps if step.tool_name == "run_initial_annotation_gui"]
     assert len(gui_steps) == 1
@@ -185,26 +240,84 @@ def test_plan_template_includes_human_gui_step():
 
 
 def test_plan_template_uses_finish_data_paths_for_gui_and_validation():
-    plan = build_deterministic_plan_template(date="20270605", dataset_profile="go2w_like", segments=None)
+    plan = build_deterministic_plan_template(
+        date="20270605",
+        dataset_profile="go2w_like",
+        segments=None,
+        scene_mode="out",
+    )
     steps = {step.tool_name: step for step in plan.steps}
 
+    assert plan.scene_mode == "out"
+    assert steps["assemble_finish_temp"].arguments == {
+        "date": "20270605",
+        "segments": None,
+        "dataset_profile": "go2w_like",
+    }
     assert steps["run_noobscene_preprocessing"].arguments == {"finish_temp_path": "finish_data/20270605_temp"}
     assert steps["run_noobscene_preprocessing"].expected_outputs == ["finish_data/20270605_temp"]
     assert steps["run_initial_annotation_gui"].arguments == {"finish_temp_path": "finish_data/20270605_temp"}
     assert steps["run_initial_annotation_gui"].expected_outputs == ["finish_data/20270605_temp"]
-    assert steps["run_tracking_and_projection"].arguments == {
+    assert steps["run_tracking"].arguments == {"finish_temp_path": "finish_data/20270605_temp"}
+    assert steps["run_tracking"].expected_outputs == ["finish_data/20270605"]
+    assert steps["prepare_gridmap_for_projection"].arguments == {
+        "date": "20270605",
+        "segments": None,
+        "finish_temp_path": "finish_data/20270605_temp",
+    }
+    assert steps["prepare_gridmap_for_projection"].expected_outputs == ["gridmap/20270605"]
+    assert steps["run_projection_and_trajectory"].arguments == {
         "finish_temp_path": "finish_data/20270605_temp",
         "finish_path": "finish_data/20270605",
+        "dataset_profile": "go2w_like",
     }
-    assert steps["run_tracking_and_projection"].expected_outputs == ["finish_data/20270605"]
+    assert steps["run_projection_and_trajectory"].expected_outputs == ["finish_data/20270605"]
     assert steps["validate_navigation_outputs"].arguments == {"date": "20270605"}
     assert steps["validate_navigation_outputs"].expected_outputs == ["finish_data/20270605"]
+
+
+def test_plan_template_uses_expected_step_order_without_legacy_gridmap_step():
+    plan = build_deterministic_plan_template(
+        date="20270605",
+        dataset_profile="go2w_like",
+        segments=["20260605_152856"],
+        scene_mode="in",
+    )
+
+    assert [step.tool_name for step in plan.steps] == [
+        "prepare_raw_data",
+        "extract_and_sync_navigation_data",
+        "assemble_finish_temp",
+        "run_noobscene_preprocessing",
+        "run_initial_annotation_gui",
+        "run_tracking",
+        "prepare_gridmap_for_projection",
+        "run_projection_and_trajectory",
+        "validate_navigation_outputs",
+    ]
+    assert "generate_gridmap_from_pcd" not in [step.tool_name for step in plan.steps]
+    assert plan.scene_mode == "in"
+
+
+def test_agent_instructions_require_scene_mode_and_new_projection_tools(monkeypatch):
+    monkeypatch.setenv("DASHSCOPE_API_KEY", "test-key")
+
+    plan_agent = create_plan_agent()
+    executor_agent = create_executor_agent(dry_run=True)
+
+    for instructions in (plan_agent.instructions, executor_agent.instructions):
+        assert "scene_mode" in instructions
+        assert "run_tracking" in instructions
+        assert "prepare_gridmap_for_projection" in instructions
+        assert "run_projection_and_trajectory" in instructions
+        assert "tracking" in instructions
+        assert "projection" in instructions
 
 
 def test_parse_workflow_plan_output_accepts_json_string():
     from vla_data_juicer_agents.navigation.workflow import _parse_workflow_plan_output
 
-    payload = build_deterministic_plan_template("20270605", "go2w_like", None).model_dump(mode="json")
+    payload = build_deterministic_plan_template("20270605", "go2w_like", None, scene_mode="out").model_dump(mode="json")
 
     plan = _parse_workflow_plan_output(json.dumps(payload))
 
@@ -215,7 +328,7 @@ def test_parse_workflow_plan_output_accepts_json_string():
 def test_parse_workflow_plan_output_accepts_dict():
     from vla_data_juicer_agents.navigation.workflow import _parse_workflow_plan_output
 
-    payload = build_deterministic_plan_template("20270605", "go2w_like", None).model_dump(mode="json")
+    payload = build_deterministic_plan_template("20270605", "go2w_like", None, scene_mode="out").model_dump(mode="json")
 
     plan = _parse_workflow_plan_output(payload)
 
@@ -225,7 +338,7 @@ def test_parse_workflow_plan_output_accepts_dict():
 def test_parse_workflow_plan_output_accepts_fenced_json():
     from vla_data_juicer_agents.navigation.workflow import _parse_workflow_plan_output
 
-    payload = build_deterministic_plan_template("20270605", "go2w_like", None).model_dump(mode="json")
+    payload = build_deterministic_plan_template("20270605", "go2w_like", None, scene_mode="out").model_dump(mode="json")
     fenced = f"```json\n{json.dumps(payload)}\n```"
 
     plan = _parse_workflow_plan_output(fenced)
@@ -250,8 +363,8 @@ def test_create_qwen_model_requires_dashscope_key(monkeypatch):
 
 
 def test_run_plan_agent_streams_events_to_run_state(tmp_path):
-    request = NavigationRequest(date="20270605", dry_run=True)
-    plan = build_deterministic_plan_template("20270605", "go2w_like", None)
+    request = NavigationRequest(date="20270605", dry_run=True, scene_mode="out")
+    plan = build_deterministic_plan_template("20270605", "go2w_like", None, scene_mode="out")
     plan_json = plan.model_dump_json()
     run_store = WorkflowRunStore(tmp_path / "runs")
     run_dir = run_store.create_run(request.date)
@@ -285,8 +398,8 @@ def test_run_plan_agent_streams_events_to_run_state(tmp_path):
 
 
 def test_run_plan_agent_auto_confirms_tool_calls(tmp_path):
-    request = NavigationRequest(date="20270605", dry_run=True)
-    plan = build_deterministic_plan_template("20270605", "go2w_like", None)
+    request = NavigationRequest(date="20270605", dry_run=True, scene_mode="out")
+    plan = build_deterministic_plan_template("20270605", "go2w_like", None, scene_mode="out")
     run_store = WorkflowRunStore(tmp_path / "runs")
     run_dir = run_store.create_run(request.date)
 

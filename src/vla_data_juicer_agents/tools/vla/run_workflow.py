@@ -16,6 +16,7 @@ from vla_data_juicer_agents.navigation.workflow import run_executor_agent, run_p
 class RunVLAWorkflowInput(BaseModel):
     date: str
     segments: str | list[str] | None = None
+    scene_mode: Literal["in", "out"] | None = None
     dry_run: bool = False
     approve: bool = True
     model: str | None = None
@@ -72,10 +73,19 @@ def _artifact_paths(run_dir) -> dict[str, str]:
 
 async def run_vla_workflow(ctx: ToolContext, raw_args: RunVLAWorkflowInput | dict[str, Any]) -> dict[str, Any]:
     args = raw_args if isinstance(raw_args, RunVLAWorkflowInput) else RunVLAWorkflowInput.model_validate(raw_args)
+    if args.scene_mode is None:
+        return RunVLAWorkflowOutput(
+            ok=False,
+            status="needs_user_input",
+            error_type="missing_scene_mode",
+            message="Please provide scene_mode as either 'in' or 'out' before running the VLA navigation workflow.",
+        ).model_dump(mode="json")
+
     model = _normalize_model(args.model)
     request = NavigationRequest(
         date=args.date,
         segments=_normalize_segments(args.segments),
+        scene_mode=args.scene_mode,
         dry_run=args.dry_run,
     )
     settings = NavigationSettings()

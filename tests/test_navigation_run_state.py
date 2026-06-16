@@ -1,14 +1,18 @@
+import asyncio
+
 import pytest
 
 from vla_data_juicer_agents.navigation.models import NavigationRequest, WorkflowPlan, WorkflowStep
 from vla_data_juicer_agents.navigation.run_state import WorkflowRunStore
+from vla_data_juicer_agents.tools.vla.run_workflow import RunVLAWorkflowInput, run_vla_workflow
 
 
 def test_workflow_run_store_writes_request_and_plan(tmp_path):
     store = WorkflowRunStore(root=tmp_path)
-    request = NavigationRequest(date="20270605")
+    request = NavigationRequest(date="20270605", scene_mode="out")
     plan = WorkflowPlan(
         date="20270605",
+        scene_mode="out",
         dataset_profile="go2w_like",
         steps=[WorkflowStep(step_id="prepare", tool_name="prepare_raw_data")],
     )
@@ -19,6 +23,24 @@ def test_workflow_run_store_writes_request_and_plan(tmp_path):
 
     assert (run_dir / "request.json").exists()
     assert (run_dir / "plan.json").exists()
+
+
+def test_run_vla_workflow_requires_scene_mode_before_creating_run(tmp_path, monkeypatch):
+    monkeypatch.setenv("VLA_RUNS_ROOT", str(tmp_path / "runs"))
+
+    result = asyncio.run(
+        run_vla_workflow(
+            ctx=None,
+            raw_args=RunVLAWorkflowInput(date="20270605", dry_run=True, approve=False),
+        )
+    )
+
+    assert result["ok"] is False
+    assert result["status"] == "needs_user_input"
+    assert result["error_type"] == "missing_scene_mode"
+    assert "in" in result["message"]
+    assert "out" in result["message"]
+    assert not (tmp_path / "runs").exists()
 
 
 def test_workflow_run_store_rejects_paths_outside_run_dir(tmp_path):
