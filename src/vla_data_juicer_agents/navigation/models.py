@@ -62,6 +62,42 @@ class ProfileClassification(BaseModel):
     notes: list[str] = Field(default_factory=list)
 
 
+class StageVariantDecision(BaseModel):
+    variant: str
+    reason: str = ""
+    evidence: list[str] = Field(default_factory=list)
+
+
+class PlanIssue(BaseModel):
+    type: str
+    message: str = ""
+    evidence: list[str] = Field(default_factory=list)
+
+
+class NavigationDataProfile(BaseModel):
+    date: str
+    segments: list[str] | None = None
+    scene_mode: Literal["in", "out"]
+    dataset_profile: Literal["u_legacy_like", "go2w_like"]
+    gridmap_source: Literal[
+        "existing_gridmap",
+        "generated_from_pcd",
+        "projection_ready",
+        "unknown",
+    ] = "unknown"
+    projection_input_ready: bool = False
+    pcd_gridmap_tool_available: bool = True
+    stage_variants: dict[str, StageVariantDecision] = Field(default_factory=dict)
+    blocking_issues: list[PlanIssue] = Field(default_factory=list)
+    warnings: list[PlanIssue] = Field(default_factory=list)
+    evidence: dict[str, list[str]] = Field(default_factory=dict)
+
+    @field_validator("date")
+    @classmethod
+    def validate_date(cls, value: str) -> str:
+        return _validate_date(value)
+
+
 class WorkflowStep(BaseModel):
     step_id: str
     tool_name: str
@@ -70,6 +106,10 @@ class WorkflowStep(BaseModel):
     expected_outputs: list[str] = Field(default_factory=list)
     human_blocking: bool = False
     failure_behavior: str = "stop"
+    variant: str | None = None
+    effects: Literal["read", "write", "execute", "external"] | None = None
+    decision_ref: str | None = None
+    evidence: list[str] = Field(default_factory=list)
 
 
 class WorkflowPlan(BaseModel):

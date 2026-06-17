@@ -590,6 +590,7 @@ def prepare_gridmap_for_projection(
     finish_temp_path: str | Path | None = None,
     settings: NavigationSettings | None = None,
     dry_run: bool = False,
+    gridmap_variant: str | None = None,
 ) -> ToolResult:
     date = _validate_date(date)
     settings = settings or NavigationSettings()
@@ -599,7 +600,25 @@ def prepare_gridmap_for_projection(
     gridmap_dirs = _discover_gridmap_dirs(date, segments, settings)
     source_mode = "existing_gridmap"
 
-    if not gridmap_dirs:
+    if not gridmap_dirs and gridmap_variant == "copy_existing_gridmap":
+        return ToolResult(
+            ok=False,
+            tool_name="prepare_gridmap_for_projection",
+            message=f"No existing grid_map found under: {settings.clip_data_root / date}",
+            produced_paths=[root / "samples" / date],
+            details={
+                "date": date,
+                "segments": segments,
+                "source_mode": "missing_existing_gridmap",
+                "gridmap_variant": gridmap_variant,
+                "prepared_gridmap_count": 0,
+                "generated_command_count": 0,
+                "copied_targets": [],
+                "dry_run": dry_run,
+            },
+        )
+
+    if not gridmap_dirs and gridmap_variant in {None, "generate_from_pcd"}:
         generated_result = generate_gridmap_from_pcd(date, segments, settings=settings, dry_run=dry_run)
         commands.extend(generated_result.commands)
         source_mode = "generated_from_pointcloud"
@@ -634,6 +653,7 @@ def prepare_gridmap_for_projection(
             "date": date,
             "segments": segments,
             "source_mode": source_mode,
+            "gridmap_variant": gridmap_variant,
             "prepared_gridmap_count": prepared_count,
             "generated_command_count": len(commands),
             "copied_targets": copied_targets,
@@ -975,12 +995,14 @@ def build_execution_tools(dry_run: bool = False) -> list[Any]:
         date: str,
         segments: list[str] | str | None = None,
         finish_temp_path: str | None = None,
+        gridmap_variant: str | None = None,
     ) -> dict:
         return prepare_gridmap_for_projection(
             date,
             _normalize_segments_arg(segments),
             finish_temp_path=finish_temp_path,
             dry_run=dry_run,
+            gridmap_variant=gridmap_variant,
         ).model_dump(mode="json")
 
     def bound_run_projection_and_trajectory_tool(

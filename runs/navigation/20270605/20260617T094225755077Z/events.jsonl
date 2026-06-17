@@ -1,0 +1,2 @@
+{"event_type": "REPLY_START", "payload": {"id": "7e6e8d6ce9b740b191474c12857fcd08", "created_at": "2026-06-17T17:42:25.804197", "metadata": {}, "type": "REPLY_START", "session_id": "e68d403ebc104f84ab3b2f7e264b7b09", "reply_id": "f1fe42ad8c1f4d02b5ff3efc600d9c5d", "name": "Navigation ReAct Plan-Agent", "role": "assistant"}}
+{"event_type": "MODEL_CALL_START", "payload": {"id": "3a64f6bcc24c4b3e817f9907def3848d", "created_at": "2026-06-17T17:42:25.833330", "metadata": {}, "type": "MODEL_CALL_START", "reply_id": "f1fe42ad8c1f4d02b5ff3efc600d9c5d", "model_name": "qwen3.5-plus"}}

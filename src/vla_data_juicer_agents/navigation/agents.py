@@ -1,16 +1,21 @@
 import os
+from pathlib import Path
 
 from agentscope.agent import Agent
 from agentscope.credential import DashScopeCredential
 from agentscope.model import DashScopeChatModel
 from agentscope.tool import Toolkit
 
+from vla_data_juicer_agents.navigation.catalog import list_navigation_tool_capabilities_tool
 from vla_data_juicer_agents.navigation.execution_tools import (
     build_execution_tools,
 )
 from vla_data_juicer_agents.navigation.inspection import (
     classify_navigation_dataset_tool,
+    inspect_gridmap_artifacts_tool,
+    inspect_processing_state_tool,
     inspect_raw_date_tool,
+    inspect_runtime_assets_tool,
 )
 from vla_data_juicer_agents.navigation.models import NavigationRequest
 from vla_data_juicer_agents.navigation.plan_draft import WorkflowPlanDraftState, build_plan_draft_tools
@@ -23,19 +28,52 @@ DEFAULT_NAVIGATION_MODEL = "qwen3.5-plus"
 PLAN_AGENT_INSTRUCTIONS = """
 You are the Navigation ReAct Plan-Agent.
 Use only read-only tools to inspect and classify navigation datasets.
-Maintain the internal WorkflowPlan draft with get_workflow_plan_draft_tool,
-update_workflow_plan_draft_tool, and finalize_workflow_plan_tool.
-After inspecting and classifying the dataset, call update_workflow_plan_draft_tool
-with the inferred dataset_profile, then call finalize_workflow_plan_tool.
-Do not hand-write script-level plans; final WorkflowPlan JSON must come from finalize_workflow_plan_tool.
-Stage one covers prepare.sh, run_U.sh, and run_odom.sh only; do not include run_fix.sh.
-Only human-blocking step is gen_box.py via run_initial_annotation_gui.
+Read and follow docs/navigation-plan-agent-guidance.md (navigation-plan-agent-guidance).
+Build a lightweight NavigationDataProfile, not a large data inventory.
+Use stage_variants to choose only variants exposed by list_navigation_tool_capabilities_tool.
 Default all raw segments if not specified.
 scene_mode is required and must be either "in" or "out".
+Stage one covers prepare.sh, run_U.sh, and run_odom.sh only; do not include run_fix.sh.
+Only human-blocking step is gen_box.py via run_initial_annotation_gui.
 Prepare gridmap after run_tracking and before run_projection_and_trajectory.
 Supported execution tool names include run_tracking, prepare_gridmap_for_projection, and run_projection_and_trajectory.
 Supported profiles are u_legacy_like and go2w_like.
 """.strip()
+
+
+DRAFT_PLAN_AGENT_INSTRUCTIONS = """
+Maintain the internal WorkflowPlan draft with get_workflow_plan_draft_tool,
+update_workflow_plan_draft_tool, and finalize_workflow_plan_tool.
+Before each action, inspect the current draft state: navigation_data_profile_schema,
+data_profile_draft, filled_fields, missing_fields, next_tool_candidates, and ready_to_finish.
+Each ReAct round must do exactly one step: call one read-only inspection/classification tool,
+then merge only the newly learned facts with update_workflow_plan_draft_tool(data_profile_patch=...).
+Use data_profile_patch for partial NavigationDataProfile facts; do not invent a complete profile in one shot.
+Only call finalize_workflow_plan_tool after ready_to_finish is true and missing_fields is empty.
+Do not hand-write script-level plans; final WorkflowPlan JSON must come from finalize_workflow_plan_tool.
+""".strip()
+
+
+def _load_plan_agent_guidance() -> str:
+    guidance_path = Path(__file__).resolve().parents[3] / "docs" / "navigation-plan-agent-guidance.md"
+    try:
+        return guidance_path.read_text(encoding="utf-8").strip()
+    except OSError:
+        return "navigation-plan-agent-guidance: use lightweight NavigationDataProfile and stage_variants."
+
+
+def _plan_agent_instructions(*, include_draft_tools: bool) -> str:
+    parts = [PLAN_AGENT_INSTRUCTIONS]
+    if include_draft_tools:
+        parts.append(DRAFT_PLAN_AGENT_INSTRUCTIONS)
+        parts.append(f"Guidance excerpt:\n{_load_plan_agent_guidance()}")
+    else:
+        parts.append(
+            "No request-bound draft tools are registered; return strict WorkflowPlan JSON if asked to plan directly. "
+            "Guidance reference: navigation-plan-agent-guidance; use lightweight NavigationDataProfile, "
+            "stage_variants, and list_navigation_tool_capabilities_tool."
+        )
+    return "\n\n".join(parts)
 
 
 EXECUTOR_AGENT_INSTRUCTIONS = """
@@ -89,9 +127,13 @@ def create_plan_agent(model: str | None = None, request: NavigationRequest | Non
         tools=[
             inspect_raw_date_tool,
             classify_navigation_dataset_tool,
+            inspect_processing_state_tool,
+            inspect_gridmap_artifacts_tool,
+            inspect_runtime_assets_tool,
+            list_navigation_tool_capabilities_tool,
             *draft_tools,
         ],
-        instructions=PLAN_AGENT_INSTRUCTIONS,
+        instructions=_plan_agent_instructions(include_draft_tools=draft_state is not None),
         model=model,
     )
     agent.workflow_plan_draft_state = draft_state

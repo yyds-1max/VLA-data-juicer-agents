@@ -6,7 +6,13 @@ from vla_data_juicer_agents.navigation.config import NavigationSettings
 from vla_data_juicer_agents.navigation.inspection import (
     classify_navigation_dataset,
     classify_navigation_dataset_tool,
+    inspect_gridmap_artifacts,
+    inspect_gridmap_artifacts_tool,
+    inspect_processing_state,
+    inspect_processing_state_tool,
     inspect_raw_date,
+    inspect_runtime_assets,
+    inspect_runtime_assets_tool,
     list_navigation_dates,
 )
 
@@ -76,3 +82,80 @@ def test_classify_navigation_dataset_tool_schema_allows_omitting_segments():
     required = classify_navigation_dataset_tool.input_schema.get("required", [])
 
     assert "segments" not in required
+
+
+def test_inspect_processing_state_summarizes_existing_intermediate_outputs(tmp_path):
+    root = tmp_path / "VLADatasets"
+    (root / "raw_data" / "20270605_temp" / "segment_a").mkdir(parents=True)
+    (root / "clip_data" / "20270605" / "segment_a" / "sync_data").mkdir(parents=True)
+    (root / "finish_data" / "20270605_temp" / "samples" / "20270605" / "clip_a").mkdir(parents=True)
+    (root / "finish_data" / "20270605" / "segment_a" / "clip_a" / "grid_map").mkdir(parents=True)
+    settings = NavigationSettings(vladatasets_root=root)
+
+    result = inspect_processing_state("20270605", ["segment_a"], settings=settings)
+
+    assert result == {
+        "date": "20270605",
+        "segments": ["segment_a"],
+        "has_raw_temp": True,
+        "has_clip_sync_data": True,
+        "has_finish_temp_samples": True,
+        "has_final_outputs": True,
+        "has_final_grid_map": True,
+    }
+
+
+def test_inspect_gridmap_artifacts_reports_projection_ready_before_generation(tmp_path):
+    root = tmp_path / "VLADatasets"
+    (root / "finish_data" / "20270605_temp" / "samples" / "20270605" / "clip_a" / "grid_map").mkdir(parents=True)
+    settings = NavigationSettings(vladatasets_root=root)
+
+    result = inspect_gridmap_artifacts("20270605", ["segment_a"], settings=settings)
+
+    assert result["gridmap_source"] == "projection_ready"
+    assert result["projection_input_ready"] is True
+    assert result["available_gridmap_paths"]
+
+
+def test_inspect_gridmap_artifacts_reports_existing_clip_gridmap(tmp_path):
+    root = tmp_path / "VLADatasets"
+    gridmap_dir = root / "clip_data" / "20270605" / "segment_a" / "sync_data" / "clip_a" / "grid_map"
+    gridmap_dir.mkdir(parents=True)
+    (gridmap_dir / "grid_map.json").write_text("{}", encoding="utf-8")
+    settings = NavigationSettings(vladatasets_root=root)
+
+    result = inspect_gridmap_artifacts("20270605", ["segment_a"], settings=settings)
+
+    assert result["gridmap_source"] == "existing_gridmap"
+    assert result["projection_input_ready"] is False
+    assert str(gridmap_dir) in result["available_gridmap_paths"]
+
+
+def test_inspect_runtime_assets_reports_variant_supporting_scripts(tmp_path):
+    processing_root = tmp_path / "processing"
+    (processing_root / "other_code").mkdir(parents=True)
+    (processing_root / "0_1th_box").mkdir(parents=True)
+    (processing_root / "2_pt_project").mkdir(parents=True)
+    (processing_root / "other_code" / "pcd_to_grid.py").write_text("# pcd\n", encoding="utf-8")
+    (processing_root / "0_1th_box" / "gen_box.py").write_text("# gui\n", encoding="utf-8")
+    (processing_root / "2_pt_project" / "2_othermethod_cjl.py").write_text("# legacy\n", encoding="utf-8")
+    (processing_root / "2_pt_project" / "2_othermethod_cjl_0525.py").write_text("# go2w\n", encoding="utf-8")
+    settings = NavigationSettings(vladatasets_root=tmp_path / "VLADatasets", processing_root=processing_root)
+
+    result = inspect_runtime_assets(settings=settings)
+
+    assert result["pcd_gridmap_tool_available"] is True
+    assert result["manual_annotation_gui_available"] is True
+    assert result["projection_variants"] == {
+        "cjl_with_gridmap": True,
+        "cjl_0525_with_gridmap": True,
+    }
+
+
+def test_new_plan_agent_inspection_tools_are_read_only():
+    assert inspect_processing_state_tool.name == "inspect_processing_state_tool"
+    assert inspect_gridmap_artifacts_tool.name == "inspect_gridmap_artifacts_tool"
+    assert inspect_runtime_assets_tool.name == "inspect_runtime_assets_tool"
+    assert inspect_processing_state_tool.is_read_only is True
+    assert inspect_gridmap_artifacts_tool.is_read_only is True
+    assert inspect_runtime_assets_tool.is_read_only is True

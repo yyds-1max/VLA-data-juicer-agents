@@ -1,0 +1,186 @@
+{
+  "date": "20270605",
+  "segments": null,
+  "scene_mode": "out",
+  "dataset_profile": "go2w_like",
+  "steps": [
+    {
+      "step_id": "prepare_raw_data",
+      "tool_name": "prepare_raw_data",
+      "arguments": {
+        "date": "20270605",
+        "segments": null
+      },
+      "preconditions": [],
+      "expected_outputs": [
+        "raw_data/20270605_temp"
+      ],
+      "human_blocking": false,
+      "failure_behavior": "stop",
+      "variant": null,
+      "effects": null,
+      "decision_ref": null,
+      "evidence": []
+    },
+    {
+      "step_id": "extract_and_sync_navigation_data",
+      "tool_name": "extract_and_sync_navigation_data",
+      "arguments": {
+        "date": "20270605",
+        "segments": null,
+        "dataset_profile": "go2w_like"
+      },
+      "preconditions": [
+        "prepare_raw_data"
+      ],
+      "expected_outputs": [
+        "clip_data/20270605"
+      ],
+      "human_blocking": false,
+      "failure_behavior": "stop",
+      "variant": "go2w_like",
+      "effects": "execute",
+      "decision_ref": null,
+      "evidence": []
+    },
+    {
+      "step_id": "assemble_finish_temp",
+      "tool_name": "assemble_finish_temp",
+      "arguments": {
+        "date": "20270605",
+        "segments": null,
+        "dataset_profile": "go2w_like"
+      },
+      "preconditions": [
+        "extract_and_sync_navigation_data"
+      ],
+      "expected_outputs": [
+        "finish_data/20270605_temp"
+      ],
+      "human_blocking": false,
+      "failure_behavior": "stop",
+      "variant": null,
+      "effects": null,
+      "decision_ref": null,
+      "evidence": []
+    },
+    {
+      "step_id": "run_noobscene_preprocessing",
+      "tool_name": "run_noobscene_preprocessing",
+      "arguments": {
+        "finish_temp_path": "finish_data/20270605_temp"
+      },
+      "preconditions": [
+        "assemble_finish_temp"
+      ],
+      "expected_outputs": [
+        "finish_data/20270605_temp"
+      ],
+      "human_blocking": false,
+      "failure_behavior": "stop",
+      "variant": null,
+      "effects": null,
+      "decision_ref": null,
+      "evidence": []
+    },
+    {
+      "step_id": "run_initial_annotation_gui",
+      "tool_name": "run_initial_annotation_gui",
+      "arguments": {
+        "finish_temp_path": "finish_data/20270605_temp"
+      },
+      "preconditions": [
+        "run_noobscene_preprocessing"
+      ],
+      "expected_outputs": [
+        "finish_data/20270605_temp"
+      ],
+      "human_blocking": true,
+      "failure_behavior": "stop",
+      "variant": null,
+      "effects": null,
+      "decision_ref": null,
+      "evidence": []
+    },
+    {
+      "step_id": "run_tracking",
+      "tool_name": "run_tracking",
+      "arguments": {
+        "finish_temp_path": "finish_data/20270605_temp"
+      },
+      "preconditions": [
+        "run_initial_annotation_gui"
+      ],
+      "expected_outputs": [
+        "finish_data/20270605"
+      ],
+      "human_blocking": false,
+      "failure_behavior": "stop",
+      "variant": null,
+      "effects": null,
+      "decision_ref": null,
+      "evidence": []
+    },
+    {
+      "step_id": "prepare_gridmap_for_projection",
+      "tool_name": "prepare_gridmap_for_projection",
+      "arguments": {
+        "date": "20270605",
+        "segments": null,
+        "finish_temp_path": "finish_data/20270605_temp"
+      },
+      "preconditions": [
+        "run_tracking"
+      ],
+      "expected_outputs": [
+        "gridmap/20270605"
+      ],
+      "human_blocking": false,
+      "failure_behavior": "skip_if_gridmap_exists",
+      "variant": null,
+      "effects": null,
+      "decision_ref": null,
+      "evidence": []
+    },
+    {
+      "step_id": "run_projection_and_trajectory",
+      "tool_name": "run_projection_and_trajectory",
+      "arguments": {
+        "finish_temp_path": "finish_data/20270605_temp",
+        "finish_path": "finish_data/20270605",
+        "dataset_profile": "go2w_like"
+      },
+      "preconditions": [
+        "prepare_gridmap_for_projection"
+      ],
+      "expected_outputs": [
+        "finish_data/20270605"
+      ],
+      "human_blocking": false,
+      "failure_behavior": "stop",
+      "variant": "cjl_0525_with_gridmap",
+      "effects": "execute",
+      "decision_ref": null,
+      "evidence": []
+    },
+    {
+      "step_id": "validate_navigation_outputs",
+      "tool_name": "validate_navigation_outputs",
+      "arguments": {
+        "date": "20270605"
+      },
+      "preconditions": [
+        "run_projection_and_trajectory"
+      ],
+      "expected_outputs": [
+        "finish_data/20270605"
+      ],
+      "human_blocking": false,
+      "failure_behavior": "stop",
+      "variant": null,
+      "effects": null,
+      "decision_ref": null,
+      "evidence": []
+    }
+  ]
+}

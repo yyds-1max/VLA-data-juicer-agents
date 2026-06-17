@@ -6,15 +6,18 @@ from typing import Any
 from agentscope.tool import FunctionTool
 from pydantic import BaseModel, Field
 
-from vla_data_juicer_agents.navigation.models import NavigationRequest, WorkflowPlan
+from vla_data_juicer_agents.navigation.models import NavigationDataProfile, NavigationRequest, WorkflowPlan
 from vla_data_juicer_agents.navigation.profiles import get_profile
 
 
 class WorkflowPlanDraftState(BaseModel):
     request: NavigationRequest
     dataset_profile: str | None = None
+    data_profile_draft: dict[str, Any] = Field(default_factory=dict)
+    data_profile: NavigationDataProfile | None = None
     finalized_plan: WorkflowPlan | None = None
     validation_errors: list[str] = Field(default_factory=list)
+    completed_observations: list[dict[str, str]] = Field(default_factory=list)
 
     @property
     def date(self) -> str:
@@ -28,24 +31,89 @@ class WorkflowPlanDraftState(BaseModel):
     def scene_mode(self) -> str | None:
         return self.request.scene_mode
 
-    def missing_fields(self) -> list[str]:
-        missing = []
-        if self.scene_mode not in {"in", "out"}:
-            missing.append("scene_mode")
-        if self.dataset_profile is None:
-            missing.append("dataset_profile")
-        if self.finalized_plan is None:
-            missing.append("finalized_plan")
-        return missing
-
-    def schema_snapshot(self) -> dict[str, Any]:
-        return {
+    def _request_data_profile_seed(self) -> dict[str, Any]:
+        seed: dict[str, Any] = {
             "date": self.date,
             "segments": self.segments,
-            "scene_mode": self.scene_mode or "<in|out>",
-            "dataset_profile": self.dataset_profile or "<u_legacy_like|go2w_like>",
+        }
+        if self.scene_mode is not None:
+            seed["scene_mode"] = self.scene_mode
+        return seed
+
+    def current_data_profile_draft(self) -> dict[str, Any]:
+        draft = self._request_data_profile_seed()
+        _deep_merge(draft, self.data_profile_draft)
+        if self.dataset_profile is not None and "dataset_profile" not in draft:
+            draft["dataset_profile"] = self.dataset_profile
+        return draft
+
+    def filled_fields(self) -> list[str]:
+        return sorted(_filled_paths(self.current_data_profile_draft()))
+
+    def missing_fields(self) -> list[str]:
+        draft = self.current_data_profile_draft()
+        missing: list[str] = []
+        if draft.get("scene_mode") not in {"in", "out"}:
+            missing.append("scene_mode")
+        if draft.get("dataset_profile") not in {"u_legacy_like", "go2w_like"}:
+            missing.append("dataset_profile")
+        gridmap_source = draft.get("gridmap_source")
+        blocking_issues = draft.get("blocking_issues") or []
+        if blocking_issues:
+            return missing
+        if gridmap_source not in {"existing_gridmap", "generated_from_pcd", "projection_ready"} and not blocking_issues:
+            missing.append("gridmap_source")
+        if "pcd_gridmap_tool_available" not in draft:
+            missing.append("pcd_gridmap_tool_available")
+        stage_variants = draft.get("stage_variants") or {}
+        for stage_name in (
+            "extract_and_sync_navigation_data",
+            "prepare_gridmap_for_projection",
+            "run_projection_and_trajectory",
+        ):
+            if stage_name not in stage_variants:
+                missing.append(f"stage_variants.{stage_name}")
+        return missing
+
+    def ready_to_finish(self) -> bool:
+        return self.data_profile is not None and not self.data_profile.blocking_issues and not self.missing_fields()
+
+    def next_tool_candidates(self) -> list[str]:
+        missing = set(self.missing_fields())
+        candidates: list[str] = []
+        if "dataset_profile" in missing:
+            candidates.append("classify_navigation_dataset_tool")
+        if "gridmap_source" in missing or "stage_variants.prepare_gridmap_for_projection" in missing:
+            candidates.append("inspect_gridmap_artifacts_tool")
+        if "pcd_gridmap_tool_available" in missing or any(field.startswith("stage_variants.") for field in missing):
+            candidates.append("inspect_runtime_assets_tool")
+            candidates.append("list_navigation_tool_capabilities_tool")
+        if not candidates:
+            candidates.append("get_workflow_plan_draft_tool")
+        return list(dict.fromkeys(candidates))
+
+    def schema_snapshot(self) -> dict[str, Any]:
+        data_profile_draft = self.current_data_profile_draft()
+        return {
+            "date": data_profile_draft.get("date", self.date),
+            "segments": data_profile_draft.get("segments"),
+            "scene_mode": data_profile_draft.get("scene_mode") or "<in|out>",
+            "dataset_profile": data_profile_draft.get("dataset_profile") or "<u_legacy_like|go2w_like>",
+            "navigation_data_profile_schema": _navigation_data_profile_schema(),
+            "data_profile_draft": data_profile_draft,
+            "data_profile": self.data_profile.model_dump(mode="json") if self.data_profile is not None else None,
             "steps": "<generated by finalize_workflow_plan_tool after dataset_profile is valid>",
+            "filled_fields": self.filled_fields(),
             "missing_fields": self.missing_fields(),
+            "required_observations": [
+                "dataset_classification",
+                "gridmap_artifacts",
+                "runtime_assets_or_tool_capabilities",
+            ],
+            "completed_observations": list(self.completed_observations),
+            "next_tool_candidates": self.next_tool_candidates(),
+            "ready_to_finish": self.ready_to_finish(),
+            "ready_to_finalize": self.ready_to_finish(),
             "allowed_dataset_profiles": ["u_legacy_like", "go2w_like"],
             "allowed_tool_order": [
                 "prepare_raw_data",
@@ -60,8 +128,26 @@ class WorkflowPlanDraftState(BaseModel):
             ],
         }
 
-    def update(self, dataset_profile: str | None = None, profile: str | None = None) -> dict[str, Any]:
+    def update(
+        self,
+        dataset_profile: str | None = None,
+        profile: str | None = None,
+        data_profile: dict[str, Any] | NavigationDataProfile | None = None,
+        data_profile_patch: dict[str, Any] | None = None,
+        observation_id: str | None = None,
+        used_tool: str | None = None,
+    ) -> dict[str, Any]:
         self.validation_errors.clear()
+        patch: dict[str, Any] = {}
+        if data_profile is not None:
+            patch = (
+                data_profile.model_dump(mode="json")
+                if isinstance(data_profile, NavigationDataProfile)
+                else dict(data_profile)
+            )
+        if data_profile_patch is not None:
+            _deep_merge(patch, data_profile_patch)
+
         candidate_profile = dataset_profile or profile
         if candidate_profile is not None:
             try:
@@ -72,7 +158,34 @@ class WorkflowPlanDraftState(BaseModel):
                 )
             else:
                 self.dataset_profile = candidate_profile
+                patch["dataset_profile"] = candidate_profile
+        if patch:
+            _deep_merge(self.data_profile_draft, patch)
+        draft_profile = self.current_data_profile_draft().get("dataset_profile")
+        if draft_profile in {"u_legacy_like", "go2w_like"}:
+            self.dataset_profile = draft_profile
+        if observation_id is not None or used_tool is not None:
+            observation: dict[str, str] = {}
+            if observation_id is not None:
+                observation["observation_id"] = observation_id
+            if used_tool is not None:
+                observation["used_tool"] = used_tool
+            self.completed_observations.append(observation)
+        self._refresh_data_profile_from_draft()
         return self.status()
+
+    def _refresh_data_profile_from_draft(self) -> None:
+        if self.missing_fields():
+            self.data_profile = None
+            return
+        try:
+            parsed_profile = NavigationDataProfile.model_validate(self.current_data_profile_draft())
+        except Exception as exc:
+            self.data_profile = None
+            self.validation_errors.append(f"invalid data_profile: {exc}")
+        else:
+            self.data_profile = parsed_profile
+            self.dataset_profile = parsed_profile.dataset_profile
 
     def status(self) -> dict[str, Any]:
         return {
@@ -85,20 +198,44 @@ class WorkflowPlanDraftState(BaseModel):
 def build_plan_from_draft(state: WorkflowPlanDraftState) -> WorkflowPlan:
     from vla_data_juicer_agents.navigation.workflow import build_deterministic_plan_template
 
+    state._refresh_data_profile_from_draft()
+    if state.data_profile is None:
+        missing = ", ".join(state.missing_fields()) or "invalid profile fields"
+        raise ValueError(f"NavigationDataProfile draft is incomplete; missing: {missing}")
     if state.dataset_profile is None:
         raise ValueError("dataset_profile is required before finalizing WorkflowPlan")
-    if state.scene_mode not in {"in", "out"}:
+    if state.data_profile.scene_mode not in {"in", "out"}:
         raise ValueError("scene_mode is required before finalizing WorkflowPlan; expected 'in' or 'out'.")
-    return build_deterministic_plan_template(state.date, state.dataset_profile, state.segments, scene_mode=state.scene_mode)
+    if state.data_profile is not None and state.data_profile.blocking_issues:
+        issues = ", ".join(issue.type for issue in state.data_profile.blocking_issues)
+        raise ValueError(f"cannot finalize WorkflowPlan with blocking issues: {issues}")
+    return build_deterministic_plan_template(
+        state.data_profile.date,
+        state.data_profile.dataset_profile,
+        state.data_profile.segments,
+        scene_mode=state.data_profile.scene_mode,
+        data_profile=state.data_profile,
+    )
 
 
 def build_plan_draft_tools(state: WorkflowPlanDraftState) -> list[FunctionTool]:
     def update_workflow_plan_draft_tool(
         dataset_profile: str | None = None,
         profile: str | None = None,
+        data_profile: dict[str, Any] | None = None,
+        data_profile_patch: dict[str, Any] | None = None,
+        observation_id: str | None = None,
+        used_tool: str | None = None,
     ) -> dict[str, Any]:
-        """Update the internal WorkflowPlan draft with newly inferred profile fields."""
-        return state.update(dataset_profile=dataset_profile, profile=profile)
+        """Merge one ReAct-round NavigationDataProfile patch into the internal draft."""
+        return state.update(
+            dataset_profile=dataset_profile,
+            profile=profile,
+            data_profile=data_profile,
+            data_profile_patch=data_profile_patch,
+            observation_id=observation_id,
+            used_tool=used_tool,
+        )
 
     def get_workflow_plan_draft_tool() -> dict[str, Any]:
         """Return the current WorkflowPlan draft schema, filled fields, missing fields, and validation errors."""
@@ -119,3 +256,37 @@ def build_plan_draft_tools(state: WorkflowPlanDraftState) -> list[FunctionTool]:
         FunctionTool(get_workflow_plan_draft_tool, name="get_workflow_plan_draft_tool", is_read_only=True),
         FunctionTool(finalize_workflow_plan_tool, name="finalize_workflow_plan_tool", is_read_only=True),
     ]
+
+
+def _deep_merge(target: dict[str, Any], patch: dict[str, Any]) -> dict[str, Any]:
+    for key, value in patch.items():
+        if isinstance(value, dict) and isinstance(target.get(key), dict):
+            _deep_merge(target[key], value)
+        else:
+            target[key] = value
+    return target
+
+
+def _filled_paths(value: Any, prefix: str = "") -> set[str]:
+    paths: set[str] = set()
+    if isinstance(value, dict):
+        for key, child in value.items():
+            child_prefix = f"{prefix}.{key}" if prefix else str(key)
+            paths.update(_filled_paths(child, child_prefix))
+    elif value is not None:
+        paths.add(prefix)
+    return paths
+
+
+def _navigation_data_profile_schema() -> dict[str, Any]:
+    schema = NavigationDataProfile.model_json_schema()
+    properties = schema.setdefault("properties", {})
+    properties.setdefault("scene_mode", {})["enum"] = ["in", "out"]
+    properties.setdefault("dataset_profile", {})["enum"] = ["u_legacy_like", "go2w_like"]
+    properties.setdefault("gridmap_source", {})["enum"] = [
+        "existing_gridmap",
+        "generated_from_pcd",
+        "projection_ready",
+        "unknown",
+    ]
+    return schema

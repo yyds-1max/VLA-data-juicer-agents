@@ -45,6 +45,43 @@ def _decode_tool_payload(payload):
     return payload
 
 
+def _complete_go2w_profile_patch():
+    return {
+        "dataset_profile": "go2w_like",
+        "gridmap_source": "existing_gridmap",
+        "pcd_gridmap_tool_available": True,
+        "stage_variants": {
+            "extract_and_sync_navigation_data": {
+                "variant": "go2w_like",
+                "reason": "dataset classified as go2w_like",
+                "evidence": ["classify_navigation_dataset_tool"],
+            },
+            "prepare_gridmap_for_projection": {
+                "variant": "copy_existing_gridmap",
+                "reason": "grid_map artifacts already exist",
+                "evidence": ["inspect_gridmap_artifacts_tool"],
+            },
+            "run_projection_and_trajectory": {
+                "variant": "cjl_0525_with_gridmap",
+                "reason": "go2w_like uses the 0525 projection script",
+                "evidence": ["inspect_runtime_assets_tool"],
+            },
+        },
+    }
+
+
+def _message_text(content):
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        return "".join(
+            block.text
+            for block in content
+            if hasattr(block, "text") and isinstance(block.text, str)
+        )
+    return str(content)
+
+
 def test_invoke_tool_helper_uses_agentscope_call_protocol():
     class FakeAgentScopeTool:
         name = "fake_tool"
@@ -65,6 +102,10 @@ def test_create_plan_agent_has_read_only_tools(monkeypatch):
 
     assert "inspect_raw_date_tool" in tool_names
     assert "classify_navigation_dataset_tool" in tool_names
+    assert "inspect_processing_state_tool" in tool_names
+    assert "inspect_gridmap_artifacts_tool" in tool_names
+    assert "inspect_runtime_assets_tool" in tool_names
+    assert "list_navigation_tool_capabilities_tool" in tool_names
 
 
 def test_create_plan_agent_with_request_has_draft_tools(monkeypatch):
@@ -76,6 +117,15 @@ def test_create_plan_agent_with_request_has_draft_tools(monkeypatch):
     assert "update_workflow_plan_draft_tool" in tool_names
     assert "get_workflow_plan_draft_tool" in tool_names
     assert "finalize_workflow_plan_tool" in tool_names
+
+
+def test_create_plan_agent_without_request_does_not_prompt_for_missing_draft_tools(monkeypatch):
+    monkeypatch.setenv("DASHSCOPE_API_KEY", "test-key")
+
+    agent = create_plan_agent()
+
+    assert "finalize_workflow_plan_tool" not in {tool.name for tool in agent.tools}
+    assert "finalize_workflow_plan_tool" not in agent.instructions
 
 
 def test_create_executor_agent_has_execution_tools(monkeypatch):
@@ -146,7 +196,14 @@ def test_plan_agent_draft_tools_finalize_internal_workflow_plan(monkeypatch):
     agent = create_plan_agent(request=request)
     tools = {tool.name: tool for tool in agent.tools}
 
-    update_result = _invoke_tool(tools["update_workflow_plan_draft_tool"], {"profile": "go2w_like"})
+    update_result = _invoke_tool(
+        tools["update_workflow_plan_draft_tool"],
+        {
+            "data_profile_patch": _complete_go2w_profile_patch(),
+            "observation_id": "complete_profile",
+            "used_tool": "inspect_gridmap_artifacts_tool",
+        },
+    )
     finalize_result = _invoke_tool(tools["finalize_workflow_plan_tool"], {})
 
     assert update_result["ok"] is True
@@ -188,7 +245,7 @@ def test_plan_agent_draft_finalize_requires_scene_mode(monkeypatch):
     update_result = _invoke_tool(tools["update_workflow_plan_draft_tool"], {"profile": "go2w_like"})
 
     assert update_result["ok"] is True
-    with pytest.raises(ValueError, match="scene_mode is required"):
+    with pytest.raises(ValueError, match="NavigationDataProfile draft is incomplete.*scene_mode"):
         _invoke_tool(tools["finalize_workflow_plan_tool"], {})
 
 
@@ -314,6 +371,17 @@ def test_agent_instructions_require_scene_mode_and_new_projection_tools(monkeypa
         assert "projection" in instructions
 
 
+def test_plan_agent_instructions_reference_guidance_and_lightweight_profile(monkeypatch):
+    monkeypatch.setenv("DASHSCOPE_API_KEY", "test-key")
+
+    plan_agent = create_plan_agent()
+
+    assert "navigation-plan-agent-guidance" in plan_agent.instructions
+    assert "lightweight NavigationDataProfile" in plan_agent.instructions
+    assert "stage_variants" in plan_agent.instructions
+    assert "list_navigation_tool_capabilities_tool" in plan_agent.instructions
+
+
 def test_parse_workflow_plan_output_accepts_json_string():
     from vla_data_juicer_agents.navigation.workflow import _parse_workflow_plan_output
 
@@ -436,3 +504,46 @@ def test_run_plan_agent_auto_confirms_tool_calls(tmp_path):
     assert len(agent.inputs) == 2
     assert agent.inputs[1].confirm_results[0].confirmed is True
     assert "REQUIRE_USER_CONFIRM" in [event["event_type"] for event in events]
+
+
+def test_run_plan_agent_rejects_invalid_plan_variant(tmp_path):
+    request = NavigationRequest(date="20270605", dry_run=True, scene_mode="out")
+    plan = build_deterministic_plan_template("20270605", "go2w_like", None, scene_mode="out")
+    gridmap = next(step for step in plan.steps if step.tool_name == "prepare_gridmap_for_projection")
+    gridmap.variant = "made_up_variant"
+    run_store = WorkflowRunStore(tmp_path / "runs")
+    run_dir = run_store.create_run(request.date)
+
+    class FakeInvalidPlanAgent:
+        async def reply_stream(self, _msg):
+            yield SimpleNamespace(type="TEXT_BLOCK_DELTA", delta=plan.model_dump_json())
+            yield SimpleNamespace(type="REPLY_END", reply_id="reply_1")
+
+    with pytest.raises(ValueError, match="WorkflowPlan validation failed"):
+        asyncio.run(run_plan_agent(FakeInvalidPlanAgent(), request, run_store=run_store, run_dir=run_dir))
+
+
+def test_run_plan_agent_prompt_injects_current_profile_draft_state():
+    request = NavigationRequest(date="20270605", dry_run=True, scene_mode="out")
+    plan = build_deterministic_plan_template("20270605", "go2w_like", None, scene_mode="out")
+
+    class FakeDraftAwareAgent:
+        def __init__(self):
+            self.workflow_plan_draft_state = WorkflowPlanDraftState(request=request)
+            self.prompts = []
+
+        async def reply_stream(self, msg):
+            self.prompts.append(_message_text(msg.content))
+            yield SimpleNamespace(type="TEXT_BLOCK_DELTA", delta=plan.model_dump_json())
+            yield SimpleNamespace(type="REPLY_END", reply_id="reply_1")
+
+    agent = FakeDraftAwareAgent()
+
+    asyncio.run(run_plan_agent(agent, request))
+
+    prompt = agent.prompts[0]
+    assert "NavigationDataProfile schema" in prompt
+    assert "data_profile_draft" in prompt
+    assert "missing_fields" in prompt
+    assert "ready_to_finish" in prompt
+    assert "data_profile_patch" in prompt

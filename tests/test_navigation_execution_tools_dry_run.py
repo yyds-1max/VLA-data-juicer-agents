@@ -22,7 +22,7 @@ from vla_data_juicer_agents.navigation.execution_tools import (
     run_tracking_and_projection,
     validate_navigation_outputs,
 )
-from vla_data_juicer_agents.navigation.models import CommandRecord
+from vla_data_juicer_agents.navigation.models import CommandRecord, ToolResult
 
 
 def _invoke_tool(tool, arguments):
@@ -472,6 +472,63 @@ def test_validate_navigation_outputs_rejects_temp_style_grid_map(tmp_path):
     result = validate_navigation_outputs("20270605", settings=settings, dry_run=False)
 
     assert result.ok is False
+
+
+def test_prepare_gridmap_copy_existing_variant_does_not_generate_when_missing(tmp_path, monkeypatch):
+    settings = NavigationSettings(vladatasets_root=tmp_path / "VLADatasets")
+
+    def fail_generate(*args, **kwargs):
+        raise AssertionError("copy_existing_gridmap variant must not generate from PCD")
+
+    monkeypatch.setattr(
+        "vla_data_juicer_agents.navigation.execution_tools.generate_gridmap_from_pcd",
+        fail_generate,
+    )
+
+    result = prepare_gridmap_for_projection(
+        "20270605",
+        ["segment_a"],
+        settings=settings,
+        dry_run=False,
+        gridmap_variant="copy_existing_gridmap",
+    )
+
+    assert result.ok is False
+    assert result.details["source_mode"] == "missing_existing_gridmap"
+
+
+def test_prepare_gridmap_generate_variant_runs_pcd_generator_when_missing(tmp_path, monkeypatch):
+    settings = NavigationSettings(vladatasets_root=tmp_path / "VLADatasets")
+    calls = []
+
+    def fake_generate(date, segments=None, settings=None, dry_run=False):
+        calls.append({"date": date, "segments": segments, "dry_run": dry_run})
+        gridmap_dir = settings.clip_data_root / date / "segment_a" / "sync_data" / "clip_a" / "grid_map"
+        gridmap_dir.mkdir(parents=True)
+        (gridmap_dir / "grid_map.json").write_text("{}", encoding="utf-8")
+        return ToolResult(
+            ok=True,
+            tool_name="generate_gridmap_from_pcd",
+            message="generated",
+            produced_paths=[settings.clip_data_root / date],
+        )
+
+    monkeypatch.setattr(
+        "vla_data_juicer_agents.navigation.execution_tools.generate_gridmap_from_pcd",
+        fake_generate,
+    )
+
+    result = prepare_gridmap_for_projection(
+        "20270605",
+        ["segment_a"],
+        settings=settings,
+        dry_run=False,
+        gridmap_variant="generate_from_pcd",
+    )
+
+    assert result.ok is True
+    assert calls == [{"date": "20270605", "segments": ["segment_a"], "dry_run": False}]
+    assert result.details["source_mode"] == "generated_from_pointcloud"
     assert "grid_map" in result.message or "Missing final output" in result.message
 
 
