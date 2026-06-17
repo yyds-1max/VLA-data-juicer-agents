@@ -13,6 +13,9 @@ from vla_data_juicer_agents.navigation.plan_draft import build_plan_from_draft
 from vla_data_juicer_agents.navigation.run_state import WorkflowRunStore
 
 
+MAX_AGENT_TOOL_CONFIRMATION_ROUNDS = 30
+
+
 class _SceneModeMissing:
     pass
 
@@ -282,7 +285,7 @@ async def _run_agent_stream(
     output_chunks: list[str] = []
     tool_output_chunks: list[str] = []
     next_input: object = UserMsg(name="user", content=prompt)
-    for _ in range(10):
+    for _ in range(MAX_AGENT_TOOL_CONFIRMATION_ROUNDS):
         confirm_results: list[ConfirmResult] = []
         reply_id: str | None = None
         async for event in agent.reply_stream(next_input):
@@ -302,7 +305,10 @@ async def _run_agent_stream(
         if reply_id is None:
             raise RuntimeError("AgentScope requested tool confirmation without a reply id.")
         next_input = UserConfirmResultEvent(reply_id=reply_id, confirm_results=confirm_results)
-    raise RuntimeError("AgentScope tool confirmation loop exceeded 10 iterations.")
+    raise RuntimeError(
+        "AgentScope tool confirmation loop exceeded "
+        f"{MAX_AGENT_TOOL_CONFIRMATION_ROUNDS} iterations."
+    )
 
 
 async def run_plan_agent(

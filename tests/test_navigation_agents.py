@@ -526,6 +526,38 @@ def test_run_plan_agent_auto_confirms_tool_calls(tmp_path):
     assert "REQUIRE_USER_CONFIRM" in [event["event_type"] for event in events]
 
 
+def test_agent_stream_allows_ten_tool_confirmation_rounds():
+    from vla_data_juicer_agents.navigation.workflow import _run_agent_stream
+
+    class FakeTenToolAgent:
+        def __init__(self):
+            self.inputs = []
+
+        async def reply_stream(self, msg):
+            self.inputs.append(msg)
+            if len(self.inputs) <= 10:
+                yield RequireUserConfirmEvent(
+                    reply_id=f"reply_{len(self.inputs)}",
+                    tool_calls=[
+                        ToolCallBlock(
+                            id=f"call_{len(self.inputs)}",
+                            name="get_workflow_plan_draft_tool",
+                            input="{}",
+                        )
+                    ],
+                )
+                return
+            yield SimpleNamespace(type="TEXT_BLOCK_DELTA", delta="finished")
+            yield SimpleNamespace(type="REPLY_END", reply_id="reply_final")
+
+    agent = FakeTenToolAgent()
+
+    output = asyncio.run(_run_agent_stream(agent, "prompt"))
+
+    assert output == "finished"
+    assert len(agent.inputs) == 11
+
+
 def test_run_plan_agent_rejects_invalid_plan_variant(tmp_path):
     request = NavigationRequest(date="20270605", dry_run=True, scene_mode="out")
     plan = build_deterministic_plan_template("20270605", "go2w_like", None, scene_mode="out")
