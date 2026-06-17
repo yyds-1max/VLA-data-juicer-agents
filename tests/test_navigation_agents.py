@@ -224,6 +224,26 @@ def test_plan_agent_draft_tools_finalize_internal_workflow_plan(monkeypatch):
     ]
 
 
+def test_plan_agent_update_tool_accepts_json_string_data_profile_patch(monkeypatch):
+    monkeypatch.setenv("DASHSCOPE_API_KEY", "test-key")
+    request = NavigationRequest(date="20270515", dry_run=True, scene_mode="out")
+    agent = create_plan_agent(request=request)
+    tool = {tool.name: tool for tool in agent.tools}["update_workflow_plan_draft_tool"]
+
+    result = _invoke_tool(
+        tool,
+        {
+            "data_profile_patch": '{"dataset_profile": "u_legacy_like"}',
+            "observation_id": "dataset_classification",
+            "used_tool": "classify_navigation_dataset_tool",
+        },
+    )
+
+    assert result["ok"] is True
+    assert result["draft"]["data_profile_draft"]["dataset_profile"] == "u_legacy_like"
+    assert "gridmap_source" in result["draft"]["missing_fields"]
+
+
 def test_plan_agent_draft_missing_fields_include_scene_mode():
     state = WorkflowPlanDraftState(request=NavigationRequest(date="20270605", dry_run=True))
 

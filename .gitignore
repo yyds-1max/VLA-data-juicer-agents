@@ -54,6 +54,9 @@ docs/
 # 数据
 服务器端数据/
 
+# 运行日志
+runs/
+
 # OS and editor files
 .DS_Store
 Thumbs.db

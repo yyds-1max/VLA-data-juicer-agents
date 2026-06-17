@@ -132,21 +132,24 @@ class WorkflowPlanDraftState(BaseModel):
         self,
         dataset_profile: str | None = None,
         profile: str | None = None,
-        data_profile: dict[str, Any] | NavigationDataProfile | None = None,
-        data_profile_patch: dict[str, Any] | None = None,
+        data_profile: dict[str, Any] | NavigationDataProfile | str | None = None,
+        data_profile_patch: dict[str, Any] | str | None = None,
         observation_id: str | None = None,
         used_tool: str | None = None,
     ) -> dict[str, Any]:
         self.validation_errors.clear()
         patch: dict[str, Any] = {}
         if data_profile is not None:
-            patch = (
-                data_profile.model_dump(mode="json")
-                if isinstance(data_profile, NavigationDataProfile)
-                else dict(data_profile)
-            )
+            patch = _coerce_profile_patch(data_profile, field_name="data_profile", errors=self.validation_errors)
         if data_profile_patch is not None:
-            _deep_merge(patch, data_profile_patch)
+            _deep_merge(
+                patch,
+                _coerce_profile_patch(
+                    data_profile_patch,
+                    field_name="data_profile_patch",
+                    errors=self.validation_errors,
+                ),
+            )
 
         candidate_profile = dataset_profile or profile
         if candidate_profile is not None:
@@ -222,8 +225,8 @@ def build_plan_draft_tools(state: WorkflowPlanDraftState) -> list[FunctionTool]:
     def update_workflow_plan_draft_tool(
         dataset_profile: str | None = None,
         profile: str | None = None,
-        data_profile: dict[str, Any] | None = None,
-        data_profile_patch: dict[str, Any] | None = None,
+        data_profile: dict[str, Any] | str | None = None,
+        data_profile_patch: dict[str, Any] | str | None = None,
         observation_id: str | None = None,
         used_tool: str | None = None,
     ) -> dict[str, Any]:
@@ -265,6 +268,27 @@ def _deep_merge(target: dict[str, Any], patch: dict[str, Any]) -> dict[str, Any]
         else:
             target[key] = value
     return target
+
+
+def _coerce_profile_patch(
+    value: dict[str, Any] | NavigationDataProfile | str,
+    *,
+    field_name: str,
+    errors: list[str],
+) -> dict[str, Any]:
+    if isinstance(value, NavigationDataProfile):
+        return value.model_dump(mode="json")
+    if isinstance(value, dict):
+        return value
+    try:
+        payload = json.loads(value)
+    except json.JSONDecodeError as exc:
+        errors.append(f"invalid {field_name}: expected object or JSON object string: {exc}")
+        return {}
+    if not isinstance(payload, dict):
+        errors.append(f"invalid {field_name}: expected JSON object string")
+        return {}
+    return payload
 
 
 def _filled_paths(value: Any, prefix: str = "") -> set[str]:
