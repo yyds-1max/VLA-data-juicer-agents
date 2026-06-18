@@ -313,12 +313,6 @@ async def _run_agent_stream(
                 reply_id: str | None = None
                 async for event in agent.reply_stream(next_input):
                     adapter.accept(event)
-                    event_record = {
-                        "event_type": _event_type(event),
-                        "payload": _event_payload(event),
-                    }
-                    if run_store is not None and run_dir is not None:
-                        run_store.append_jsonl(run_dir, "events.jsonl", event_record)
                     output_chunks.append(_event_text_delta(event))
                     tool_output_chunks.append(_event_tool_result_delta(event))
                     if _event_type(event) == "REQUIRE_USER_CONFIRM":
@@ -358,6 +352,9 @@ async def run_plan_agent(
     request: NavigationRequest,
     run_store: WorkflowRunStore | None = None,
     run_dir: Path | None = None,
+    *,
+    event_scope: EventScope | None = None,
+    cancellation: CancellationContext | None = None,
 ) -> WorkflowPlan:
     draft_state = getattr(agent, "workflow_plan_draft_state", None)
     draft_prompt = ""
@@ -391,11 +388,19 @@ async def run_plan_agent(
         "go2w_like. scene_mode is required and must be either in or out. Gridmap preparation must happen "
         "after run_tracking and before projection. Supported execution tool names include run_tracking, "
         "prepare_gridmap_for_projection, and run_projection_and_trajectory. The only human-blocking step "
-        "is gen_box.py via run_initial_annotation_gui.\n\n"
+        "is gen_box.py via run_initial_annotation_gui. Report progress in one or two action-oriented sentences: "
+        "state one established fact and the next action. Do not dump prompts or raw tool results.\n\n"
         f"NavigationRequest JSON:\n{request.model_dump_json()}"
         f"{draft_prompt}"
     )
-    output = await _run_agent_stream(agent, prompt, run_store=run_store, run_dir=run_dir)
+    output = await _run_agent_stream(
+        agent,
+        prompt,
+        run_store=run_store,
+        run_dir=run_dir,
+        event_scope=event_scope,
+        cancellation=cancellation,
+    )
     if draft_state is not None and draft_state.finalized_plan is not None:
         return _validated_workflow_plan(draft_state.finalized_plan, data_profile=draft_state.data_profile)
     if draft_state is not None and not output.strip() and draft_state.dataset_profile is not None:
@@ -408,6 +413,9 @@ async def run_executor_agent(
     plan: WorkflowPlan,
     run_store: WorkflowRunStore | None = None,
     run_dir: Path | None = None,
+    *,
+    event_scope: EventScope | None = None,
+    cancellation: CancellationContext | None = None,
 ) -> str:
     prompt = (
         "Execute this WorkflowPlan JSON step-by-step using the matching execution tools. Stop on any "
@@ -415,7 +423,15 @@ async def run_executor_agent(
         "wait until the human finishes before continuing. scene_mode is required and must be either in "
         "or out. Prepare gridmap after run_tracking and before run_projection_and_trajectory. Supported "
         "tool names include run_tracking, prepare_gridmap_for_projection, and run_projection_and_trajectory. "
-        "Return a concise final execution summary.\n\n"
+        "Report progress in one or two action-oriented sentences: state one established fact and the next action. "
+        "Do not dump prompts or raw tool results. Return a concise final execution summary.\n\n"
         f"WorkflowPlan JSON:\n{plan.model_dump_json()}"
     )
-    return await _run_agent_stream(agent, prompt, run_store=run_store, run_dir=run_dir)
+    return await _run_agent_stream(
+        agent,
+        prompt,
+        run_store=run_store,
+        run_dir=run_dir,
+        event_scope=event_scope,
+        cancellation=cancellation,
+    )

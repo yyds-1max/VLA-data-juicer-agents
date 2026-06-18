@@ -6,6 +6,7 @@ from agentscope.credential import DashScopeCredential
 from agentscope.model import DashScopeChatModel
 from agentscope.tool import Toolkit
 
+from vla_data_juicer_agents.core.cancellation import CancellationContext
 from vla_data_juicer_agents.navigation.catalog import list_navigation_tool_capabilities_tool
 from vla_data_juicer_agents.navigation.execution_tools import (
     build_execution_tools,
@@ -38,6 +39,8 @@ Only human-blocking step is gen_box.py via run_initial_annotation_gui.
 Prepare gridmap after run_tracking and before run_projection_and_trajectory.
 Supported execution tool names include run_tracking, prepare_gridmap_for_projection, and run_projection_and_trajectory.
 Supported profiles are u_legacy_like and go2w_like.
+Report progress in one or two action-oriented sentences: state one established fact and the next action.
+Do not dump prompts or raw tool results.
 """.strip()
 
 
@@ -89,6 +92,8 @@ scene_mode is required and must be either "in" or "out".
 Prepare gridmap after run_tracking and before run_projection_and_trajectory.
 Supported execution tool names include run_tracking, prepare_gridmap_for_projection, and run_projection_and_trajectory.
 Supported profiles are u_legacy_like and go2w_like.
+Report progress in one or two action-oriented sentences: state one established fact and the next action.
+Do not dump prompts or raw tool results.
 """.strip()
 
 
@@ -140,7 +145,11 @@ def create_plan_agent(model: str | None = None, request: NavigationRequest | Non
     return agent
 
 
-def create_executor_agent(model: str | None = None, dry_run: bool = False) -> Agent:
+def create_executor_agent(
+    model: str | None = None,
+    dry_run: bool = False,
+    cancellation: CancellationContext | None = None,
+) -> Agent:
     instructions = EXECUTOR_AGENT_INSTRUCTIONS
     if dry_run:
         instructions = f"{instructions}\nDry-run mode is enabled; report planned actions without real mutations."
@@ -148,6 +157,6 @@ def create_executor_agent(model: str | None = None, dry_run: bool = False) -> Ag
     return _create_navigation_agent(
         name="Navigation ReAct Executor-Agent",
         instructions=instructions,
-        tools=build_execution_tools(dry_run=dry_run),
+        tools=build_execution_tools(dry_run=dry_run, cancellation=cancellation),
         model=model,
     )

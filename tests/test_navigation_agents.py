@@ -11,8 +11,19 @@ from agentscope.message import ToolCallBlock
 from vla_data_juicer_agents.navigation.models import NavigationRequest
 from vla_data_juicer_agents.navigation.plan_draft import WorkflowPlanDraftState
 from vla_data_juicer_agents.navigation.run_state import WorkflowRunStore
-from vla_data_juicer_agents.navigation.agents import create_executor_agent, create_plan_agent
-from vla_data_juicer_agents.navigation.workflow import build_deterministic_plan_template, run_plan_agent
+from vla_data_juicer_agents.core.cancellation import CancellationContext, TurnCancelled, current_cancellation
+from vla_data_juicer_agents.core.events import EventEmitter, JsonlEventSink
+from vla_data_juicer_agents.navigation.agents import (
+    EXECUTOR_AGENT_INSTRUCTIONS,
+    PLAN_AGENT_INSTRUCTIONS,
+    create_executor_agent,
+    create_plan_agent,
+)
+from vla_data_juicer_agents.navigation.workflow import (
+    build_deterministic_plan_template,
+    run_executor_agent,
+    run_plan_agent,
+)
 
 
 def _invoke_tool(tool, arguments):
@@ -164,6 +175,30 @@ def test_create_executor_agent_dry_run_binds_execution_tools(tmp_path, monkeypat
     assert result["details"]["dry_run"] is True
     assert not (root / "raw_data" / "20270605_temp").exists()
     assert not (root / "clip_data" / "20270605").exists()
+
+
+def test_executor_tools_check_and_bind_shared_cancellation(monkeypatch):
+    monkeypatch.setenv("DASHSCOPE_API_KEY", "test-key")
+    cancellation = CancellationContext()
+    seen = []
+
+    def fake_prepare(date, segments=None, dry_run=False):
+        seen.append(current_cancellation())
+        return SimpleNamespace(model_dump=lambda mode="json": {"ok": True})
+
+    monkeypatch.setattr(
+        "vla_data_juicer_agents.navigation.execution_tools.prepare_raw_data",
+        fake_prepare,
+    )
+    agent = create_executor_agent(dry_run=True, cancellation=cancellation)
+    tool = {tool.name: tool for tool in agent.tools}["prepare_raw_data_tool"]
+
+    assert _invoke_tool(tool, {"date": "20270605"}) == {"ok": True}
+    assert seen == [cancellation]
+    cancellation.cancel()
+    with pytest.raises(TurnCancelled):
+        _invoke_tool(tool, {"date": "20270605"})
+    assert seen == [cancellation]
 
 
 def test_plan_agent_classification_tool_accepts_empty_segments_string(tmp_path, monkeypatch):
@@ -456,6 +491,11 @@ def test_run_plan_agent_streams_events_to_run_state(tmp_path):
     plan_json = plan.model_dump_json()
     run_store = WorkflowRunStore(tmp_path / "runs")
     run_dir = run_store.create_run(request.date)
+    scope = EventEmitter(JsonlEventSink(run_dir / "events.jsonl")).scope(
+        "navigation.plan",
+        run_id="plan-run",
+        parent_run_id="workflow-run",
+    )
 
     class FakeStreamAgent:
         async def reply_stream(self, _msg):
@@ -466,7 +506,13 @@ def test_run_plan_agent_streams_events_to_run_state(tmp_path):
             yield SimpleNamespace(type="REPLY_END", reply_id="reply_1")
 
     parsed_plan = asyncio.run(
-        run_plan_agent(FakeStreamAgent(), request, run_store=run_store, run_dir=run_dir)
+        run_plan_agent(
+            FakeStreamAgent(),
+            request,
+            run_store=run_store,
+            run_dir=run_dir,
+            event_scope=scope,
+        )
     )
 
     events_path = run_dir / "events.jsonl"
@@ -475,14 +521,12 @@ def test_run_plan_agent_streams_events_to_run_state(tmp_path):
         for line in events_path.read_text(encoding="utf-8").splitlines()
     ]
     assert parsed_plan == plan
-    assert [event["event_type"] for event in events] == [
-        "MODEL_CALL_START",
-        "TOOL_CALL_START",
-        "TOOL_RESULT_END",
-        "TEXT_BLOCK_DELTA",
-        "REPLY_END",
+    assert [(event["type"], event["source"], event["run_id"], event["parent_run_id"]) for event in events] == [
+        ("agent_start", "navigation.plan", "plan-run", "workflow-run"),
+        ("agent_end", "navigation.plan", "plan-run", "workflow-run"),
     ]
-    assert events[1]["payload"]["name"] == "inspect_raw_date_tool"
+    assert events[-1]["payload"] == {"status": "completed"}
+    assert all("event_type" not in event for event in events)
 
 
 def test_run_plan_agent_auto_confirms_tool_calls(tmp_path):
@@ -490,6 +534,7 @@ def test_run_plan_agent_auto_confirms_tool_calls(tmp_path):
     plan = build_deterministic_plan_template("20270605", "go2w_like", None, scene_mode="out")
     run_store = WorkflowRunStore(tmp_path / "runs")
     run_dir = run_store.create_run(request.date)
+    scope = EventEmitter(JsonlEventSink(run_dir / "events.jsonl")).scope("navigation.plan")
 
     class FakeConfirmingAgent:
         def __init__(self):
@@ -514,7 +559,15 @@ def test_run_plan_agent_auto_confirms_tool_calls(tmp_path):
 
     agent = FakeConfirmingAgent()
 
-    parsed_plan = asyncio.run(run_plan_agent(agent, request, run_store=run_store, run_dir=run_dir))
+    parsed_plan = asyncio.run(
+        run_plan_agent(
+            agent,
+            request,
+            run_store=run_store,
+            run_dir=run_dir,
+            event_scope=scope,
+        )
+    )
 
     events = [
         json.loads(line)
@@ -523,7 +576,10 @@ def test_run_plan_agent_auto_confirms_tool_calls(tmp_path):
     assert parsed_plan == plan
     assert len(agent.inputs) == 2
     assert agent.inputs[1].confirm_results[0].confirmed is True
-    assert "REQUIRE_USER_CONFIRM" in [event["event_type"] for event in events]
+    assert [(event["type"], event["payload"]) for event in events] == [
+        ("agent_start", {}),
+        ("agent_end", {"status": "completed"}),
+    ]
 
 
 def test_agent_stream_allows_ten_tool_confirmation_rounds():
@@ -599,3 +655,32 @@ def test_run_plan_agent_prompt_injects_current_profile_draft_state():
     assert "missing_fields" in prompt
     assert "ready_to_finish" in prompt
     assert "data_profile_patch" in prompt
+
+
+def test_navigation_prompts_require_concise_action_oriented_progress():
+    required = "one or two action-oriented sentences"
+    for instructions in (PLAN_AGENT_INSTRUCTIONS, EXECUTOR_AGENT_INSTRUCTIONS):
+        assert required in instructions
+        assert "established fact" in instructions
+        assert "next action" in instructions
+        assert "Do not dump prompts or raw tool results" in instructions
+
+    request = NavigationRequest(date="20270605", dry_run=True, scene_mode="out")
+    plan = build_deterministic_plan_template("20270605", "go2w_like", None, scene_mode="out")
+
+    class CapturingAgent:
+        def __init__(self, output):
+            self.output = output
+            self.prompts = []
+
+        async def reply_stream(self, msg):
+            self.prompts.append(_message_text(msg.content))
+            yield SimpleNamespace(type="TEXT_BLOCK_DELTA", delta=self.output)
+
+    plan_agent = CapturingAgent(plan.model_dump_json())
+    executor_agent = CapturingAgent("done")
+    asyncio.run(run_plan_agent(plan_agent, request))
+    asyncio.run(run_executor_agent(executor_agent, plan))
+
+    assert required in plan_agent.prompts[0]
+    assert required in executor_agent.prompts[0]

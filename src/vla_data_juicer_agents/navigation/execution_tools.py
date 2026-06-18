@@ -6,6 +6,11 @@ from typing import Any
 
 from agentscope.tool import FunctionTool
 
+from vla_data_juicer_agents.core.cancellation import (
+    CancellationContext,
+    bind_cancellation,
+    current_cancellation,
+)
 from vla_data_juicer_agents.navigation.config import NavigationSettings
 from vla_data_juicer_agents.navigation.models import DATE_RE, ToolResult
 from vla_data_juicer_agents.navigation.profiles import get_profile
@@ -949,9 +954,31 @@ def _make_function_tool(func, name: str, dry_run: bool):
     )
 
 
-def build_execution_tools(dry_run: bool = False) -> list[Any]:
+def _execute_with_cancellation(
+    cancellation: CancellationContext | None,
+    function,
+    *args,
+    **kwargs,
+):
+    active_cancellation = cancellation or current_cancellation()
+    if active_cancellation is not None:
+        active_cancellation.raise_if_cancelled()
+    with bind_cancellation(active_cancellation):
+        return function(*args, **kwargs)
+
+
+def build_execution_tools(
+    dry_run: bool = False,
+    cancellation: CancellationContext | None = None,
+) -> list[Any]:
     def bound_prepare_raw_data_tool(date: str, segments: list[str] | str | None = None) -> dict:
-        return prepare_raw_data(date, _normalize_segments_arg(segments), dry_run=dry_run).model_dump(mode="json")
+        return _execute_with_cancellation(
+            cancellation,
+            prepare_raw_data,
+            date,
+            _normalize_segments_arg(segments),
+            dry_run=dry_run,
+        ).model_dump(mode="json")
 
     def bound_extract_and_sync_navigation_data_tool(
         date: str,
@@ -959,7 +986,9 @@ def build_execution_tools(dry_run: bool = False) -> list[Any]:
         segments: list[str] | str | None = None,
         processes_num: int = 4,
     ) -> dict:
-        return extract_and_sync_navigation_data(
+        return _execute_with_cancellation(
+            cancellation,
+            extract_and_sync_navigation_data,
             date,
             dataset_profile,
             _normalize_segments_arg(segments),
@@ -968,14 +997,22 @@ def build_execution_tools(dry_run: bool = False) -> list[Any]:
         ).model_dump(mode="json")
 
     def bound_generate_gridmap_from_pcd_tool(date: str, segments: list[str] | str | None = None) -> dict:
-        return generate_gridmap_from_pcd(date, _normalize_segments_arg(segments), dry_run=dry_run).model_dump(mode="json")
+        return _execute_with_cancellation(
+            cancellation,
+            generate_gridmap_from_pcd,
+            date,
+            _normalize_segments_arg(segments),
+            dry_run=dry_run,
+        ).model_dump(mode="json")
 
     def bound_assemble_finish_temp_tool(
         date: str,
         segments: list[str] | str | None = None,
         dataset_profile: str | None = None,
     ) -> dict:
-        return assemble_finish_temp(
+        return _execute_with_cancellation(
+            cancellation,
+            assemble_finish_temp,
             date,
             _normalize_segments_arg(segments),
             dataset_profile=dataset_profile,
@@ -983,13 +1020,28 @@ def build_execution_tools(dry_run: bool = False) -> list[Any]:
         ).model_dump(mode="json")
 
     def bound_run_noobscene_preprocessing_tool(finish_temp_path: str) -> dict:
-        return run_noobscene_preprocessing(finish_temp_path, dry_run=dry_run).model_dump(mode="json")
+        return _execute_with_cancellation(
+            cancellation,
+            run_noobscene_preprocessing,
+            finish_temp_path,
+            dry_run=dry_run,
+        ).model_dump(mode="json")
 
     def bound_run_initial_annotation_gui_tool(finish_temp_path: str) -> dict:
-        return run_initial_annotation_gui(finish_temp_path, dry_run=dry_run).model_dump(mode="json")
+        return _execute_with_cancellation(
+            cancellation,
+            run_initial_annotation_gui,
+            finish_temp_path,
+            dry_run=dry_run,
+        ).model_dump(mode="json")
 
     def bound_run_tracking_tool(finish_temp_path: str) -> dict:
-        return run_tracking(finish_temp_path, dry_run=dry_run).model_dump(mode="json")
+        return _execute_with_cancellation(
+            cancellation,
+            run_tracking,
+            finish_temp_path,
+            dry_run=dry_run,
+        ).model_dump(mode="json")
 
     def bound_prepare_gridmap_for_projection_tool(
         date: str,
@@ -997,7 +1049,9 @@ def build_execution_tools(dry_run: bool = False) -> list[Any]:
         finish_temp_path: str | None = None,
         gridmap_variant: str | None = None,
     ) -> dict:
-        return prepare_gridmap_for_projection(
+        return _execute_with_cancellation(
+            cancellation,
+            prepare_gridmap_for_projection,
             date,
             _normalize_segments_arg(segments),
             finish_temp_path=finish_temp_path,
@@ -1010,7 +1064,9 @@ def build_execution_tools(dry_run: bool = False) -> list[Any]:
         finish_path: str,
         dataset_profile: str | None = None,
     ) -> dict:
-        return run_projection_and_trajectory(
+        return _execute_with_cancellation(
+            cancellation,
+            run_projection_and_trajectory,
             finish_temp_path,
             finish_path,
             dataset_profile=dataset_profile,
@@ -1022,7 +1078,9 @@ def build_execution_tools(dry_run: bool = False) -> list[Any]:
         finish_path: str,
         dataset_profile: str | None = None,
     ) -> dict:
-        return run_tracking_and_projection(
+        return _execute_with_cancellation(
+            cancellation,
+            run_tracking_and_projection,
             finish_temp_path,
             finish_path,
             dataset_profile=dataset_profile,
@@ -1030,7 +1088,12 @@ def build_execution_tools(dry_run: bool = False) -> list[Any]:
         ).model_dump(mode="json")
 
     def bound_validate_navigation_outputs_tool(date: str) -> dict:
-        return validate_navigation_outputs(date, dry_run=dry_run).model_dump(mode="json")
+        return _execute_with_cancellation(
+            cancellation,
+            validate_navigation_outputs,
+            date,
+            dry_run=dry_run,
+        ).model_dump(mode="json")
 
     return [
         _make_function_tool(bound_prepare_raw_data_tool, "prepare_raw_data_tool", dry_run),

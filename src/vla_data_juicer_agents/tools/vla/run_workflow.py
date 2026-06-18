@@ -5,6 +5,8 @@ from typing import Any, Literal
 
 from pydantic import BaseModel, Field
 
+from vla_data_juicer_agents.core.cancellation import CancellationContext, TurnCancelled
+from vla_data_juicer_agents.core.events import EventEmitter, JsonlEventSink
 from vla_data_juicer_agents.core.tool import ToolContext, ToolSpec
 from vla_data_juicer_agents.navigation.agents import create_executor_agent, create_plan_agent
 from vla_data_juicer_agents.navigation.config import NavigationSettings
@@ -101,10 +103,38 @@ async def run_vla_workflow(ctx: ToolContext, raw_args: RunVLAWorkflowInput | dic
     run_store = WorkflowRunStore(settings.runs_root)
     run_dir = run_store.create_run(request.date)
     run_store.write_json(run_dir, "request.json", request.model_dump(mode="json"))
+    runtime_values = ctx.runtime_values
+    incoming_scope = runtime_values.get("event_scope")
+    incoming_emitter = runtime_values.get("event_emitter")
+    emitter = incoming_emitter or getattr(incoming_scope, "emitter", None) or EventEmitter()
+    emitter = emitter.with_sink(JsonlEventSink(run_dir / "events.jsonl"))
+    workflow_scope = emitter.scope(
+        "navigation.workflow",
+        parent_run_id=getattr(incoming_scope, "run_id", None),
+    )
+    plan_scope = workflow_scope.child("navigation.plan")
+    executor_scope = workflow_scope.child("navigation.executor")
+    cancellation = runtime_values.get("cancellation") or CancellationContext()
+    workflow_scope.emit("agent_start")
+    terminal_status: str | None = None
+
+    def emit_terminal(status: str) -> None:
+        nonlocal terminal_status
+        if terminal_status is None:
+            terminal_status = status
+            workflow_scope.emit("agent_end", status=status)
 
     try:
+        cancellation.raise_if_cancelled()
         plan_agent = create_plan_agent(model=model, request=request)
-        plan = await run_plan_agent(plan_agent, request, run_store=run_store, run_dir=run_dir)
+        plan = await run_plan_agent(
+            plan_agent,
+            request,
+            run_store=run_store,
+            run_dir=run_dir,
+            event_scope=plan_scope,
+            cancellation=cancellation,
+        )
         run_store.write_json(run_dir, "plan.json", plan.model_dump(mode="json"))
 
         if not args.approve:
@@ -116,10 +146,22 @@ async def run_vla_workflow(ctx: ToolContext, raw_args: RunVLAWorkflowInput | dic
                 message="VLA workflow plan is awaiting approval before execution.",
             ).model_dump(mode="json")
             run_store.write_json(run_dir, "final_report.json", payload)
+            emit_terminal("completed")
             return payload
 
-        executor_agent = create_executor_agent(model=model, dry_run=args.dry_run)
-        final_output = await run_executor_agent(executor_agent, plan, run_store=run_store, run_dir=run_dir)
+        executor_agent = create_executor_agent(
+            model=model,
+            dry_run=args.dry_run,
+            cancellation=cancellation,
+        )
+        final_output = await run_executor_agent(
+            executor_agent,
+            plan,
+            run_store=run_store,
+            run_dir=run_dir,
+            event_scope=executor_scope,
+            cancellation=cancellation,
+        )
         payload = RunVLAWorkflowOutput(
             ok=True,
             status="completed",
@@ -129,7 +171,20 @@ async def run_vla_workflow(ctx: ToolContext, raw_args: RunVLAWorkflowInput | dic
             message=final_output,
         ).model_dump(mode="json")
         run_store.write_json(run_dir, "final_report.json", payload)
+        emit_terminal("completed")
         return payload
+    except TurnCancelled as exc:
+        payload = RunVLAWorkflowOutput(
+            ok=False,
+            status="interrupted",
+            run_dir=str(run_dir),
+            artifacts=_artifact_paths(run_dir),
+            error_type=type(exc).__name__,
+            message=str(exc),
+        ).model_dump(mode="json")
+        run_store.write_json(run_dir, "final_report.json", payload)
+        emit_terminal("interrupted")
+        raise
     except Exception as exc:
         payload = RunVLAWorkflowOutput(
             ok=False,
@@ -140,6 +195,7 @@ async def run_vla_workflow(ctx: ToolContext, raw_args: RunVLAWorkflowInput | dic
             message=str(exc),
         ).model_dump(mode="json")
         run_store.write_json(run_dir, "final_report.json", payload)
+        emit_terminal("failed")
         return payload
 
 
