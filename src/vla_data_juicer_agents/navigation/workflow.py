@@ -327,6 +327,7 @@ async def _run_agent_stream(
                 if active_cancellation is not None:
                     active_cancellation.raise_if_cancelled()
                 if not confirm_results:
+                    adapter.close_active_tools("completed")
                     scope.emit("agent_end", status="completed")
                     return "".join(output_chunks) or "".join(tool_output_chunks)
                 if reply_id is None:
@@ -337,14 +338,17 @@ async def _run_agent_stream(
             f"{MAX_AGENT_TOOL_CONFIRMATION_ROUNDS} iterations."
         )
     except TurnCancelled:
+        adapter.close_active_tools("interrupted")
         scope.emit("agent_end", status="interrupted")
         raise
     except asyncio.CancelledError as exc:
+        adapter.close_active_tools("interrupted")
         scope.emit("agent_end", status="interrupted")
         if active_cancellation is not None and active_cancellation.cancelled:
             raise TurnCancelled("The current turn was interrupted.") from exc
         raise
     except BaseException:
+        adapter.close_active_tools("failed")
         scope.emit("agent_end", status="failed")
         raise
 

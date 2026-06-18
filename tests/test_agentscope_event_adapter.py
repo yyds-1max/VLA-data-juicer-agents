@@ -79,6 +79,20 @@ def test_emit_tool_events_false_suppresses_tool_events():
     assert events == []
 
 
+def test_close_active_tools_is_idempotent():
+    scope, events = _scope_and_events()
+    adapter = AgentScopeEventAdapter(scope)
+
+    adapter.accept(SimpleNamespace(type="TOOL_RESULT_START", tool_call_id="call-1", tool_call_name="inspect"))
+    adapter.close_active_tools("failed")
+    adapter.close_active_tools("failed")
+
+    assert [(event["type"], event["payload"]) for event in events] == [
+        ("tool_start", {"tool": "inspect", "call_id": "call-1", "args": ""}),
+        ("tool_end", {"tool": "inspect", "call_id": "call-1", "status": "failed", "summary": ""}),
+    ]
+
+
 def test_agent_lifecycle_is_emitted_once_across_confirmation_rounds():
     scope, events = _scope_and_events()
 
@@ -112,6 +126,11 @@ def test_agent_cancellation_emits_interrupted_end_and_tracks_agent():
 
     class BlockingAgent:
         async def reply_stream(self, _message):
+            yield SimpleNamespace(
+                type="TOOL_RESULT_START",
+                tool_call_id="call-1",
+                tool_call_name="inspect",
+            )
             started.set()
             await asyncio.Future()
             yield
@@ -135,7 +154,32 @@ def test_agent_cancellation_emits_interrupted_end_and_tracks_agent():
 
     assert [(event["type"], event["payload"]) for event in events] == [
         ("agent_start", {}),
+        ("tool_start", {"tool": "inspect", "call_id": "call-1", "args": ""}),
+        ("tool_end", {"tool": "inspect", "call_id": "call-1", "status": "interrupted", "summary": ""}),
         ("agent_end", {"status": "interrupted"}),
+    ]
+
+
+def test_agent_failure_closes_active_tool_before_failed_end():
+    scope, events = _scope_and_events()
+
+    class FailingAgent:
+        async def reply_stream(self, _message):
+            yield SimpleNamespace(
+                type="TOOL_RESULT_START",
+                tool_call_id="call-1",
+                tool_call_name="inspect",
+            )
+            raise RuntimeError("stream failed")
+
+    with pytest.raises(RuntimeError, match="stream failed"):
+        asyncio.run(_run_agent_stream(FailingAgent(), "prompt", event_scope=scope))
+
+    assert [(event["type"], event["payload"]) for event in events] == [
+        ("agent_start", {}),
+        ("tool_start", {"tool": "inspect", "call_id": "call-1", "args": ""}),
+        ("tool_end", {"tool": "inspect", "call_id": "call-1", "status": "failed", "summary": ""}),
+        ("agent_end", {"status": "failed"}),
     ]
 
 

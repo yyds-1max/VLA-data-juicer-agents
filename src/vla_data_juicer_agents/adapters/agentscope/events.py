@@ -106,6 +106,22 @@ class AgentScopeEventAdapter:
                     summary=summarize_progress("".join(state.result)),
                 )
 
+    def close_active_tools(self, status: str) -> None:
+        tools = self._tools
+        self._tools = {}
+        self._thinking.clear()
+        if not self._emit_tool_events:
+            return
+        for call_id, state in tools.items():
+            if state.started:
+                self._scope.emit(
+                    "tool_end",
+                    tool=state.name,
+                    call_id=call_id,
+                    status=status,
+                    summary=summarize_progress("".join(state.result)),
+                )
+
     @staticmethod
     def _tool_status(state: object) -> str:
         value = getattr(state, "value", state)
