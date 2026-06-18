@@ -48,6 +48,9 @@ class VLASessionAgent:
             "do not set approve=false merely because dry_run=true.\n"
             "Use approve=true for direct run/process requests. If the user asks only to plan, set approve=false.\n"
             "Never claim that the workflow ran unless the vla_run_workflow tool was called and its result is reflected.\n"
+            "Keep progress or thinking updates to one or two action-oriented sentences.\n"
+            "State one established fact and the next action.\n"
+            "Do not dump or repeat prompts or raw tool results.\n"
             "After tool calls, summarize status, run_dir, artifacts, failures, and next steps.\n"
             "Respond in the same language as the user."
         )

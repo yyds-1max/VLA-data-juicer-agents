@@ -69,6 +69,15 @@ def test_session_prompt_keeps_dry_run_requests_approved_for_execution():
     assert "do not set approve=false merely because dry_run=true" in prompt
 
 
+def test_session_prompt_guides_concise_action_oriented_progress():
+    agent = VLASessionAgent(use_llm_router=False)
+    prompt = agent.session_system_prompt()
+
+    assert "progress or thinking updates to one or two action-oriented sentences" in prompt
+    assert "State one established fact and the next action" in prompt
+    assert "Do not dump or repeat prompts or raw tool results" in prompt
+
+
 def test_session_agent_builds_real_agentscope_agent(monkeypatch):
     seen = {}
 
