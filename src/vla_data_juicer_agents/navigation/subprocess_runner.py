@@ -15,20 +15,37 @@ def _tail(value: str) -> str:
     return value[-OUTPUT_LIMIT:]
 
 
-def _terminate_process_group(process: subprocess.Popen[str]) -> None:
-    if process.poll() is not None:
-        return
+def _process_group_exists(pgid: int) -> bool:
     try:
-        os.killpg(process.pid, signal.SIGTERM)
-        process.wait(timeout=1.0)
-    except subprocess.TimeoutExpired:
-        try:
-            os.killpg(process.pid, signal.SIGKILL)
-        except ProcessLookupError:
-            return
-        process.wait(timeout=1.0)
+        os.killpg(pgid, 0)
     except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    return True
+
+
+def _terminate_process_group(process: subprocess.Popen[str]) -> None:
+    pgid = process.pid
+    try:
+        os.killpg(pgid, signal.SIGTERM)
+    except ProcessLookupError:
+        process.poll()
         return
+
+    deadline = time.monotonic() + 1.0
+    while time.monotonic() < deadline:
+        process.poll()
+        if not _process_group_exists(pgid):
+            return
+        time.sleep(0.05)
+
+    if _process_group_exists(pgid):
+        try:
+            os.killpg(pgid, signal.SIGKILL)
+        except (PermissionError, ProcessLookupError):
+            pass
+    process.wait(timeout=1.0)
 
 
 def run_command(

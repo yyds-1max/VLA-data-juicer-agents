@@ -91,3 +91,22 @@ def test_run_command_preserves_timeout_error() -> None:
             [sys.executable, "-c", "import time; time.sleep(30)"],
             timeout_seconds=0.1,
         )
+
+
+def test_timeout_kills_descendants_that_ignore_sigterm() -> None:
+    descendant_code = (
+        "import signal, time; "
+        "signal.signal(signal.SIGTERM, signal.SIG_IGN); "
+        "time.sleep(5)"
+    )
+    parent_code = (
+        "import subprocess, sys, time; "
+        f"subprocess.Popen([sys.executable, '-c', {descendant_code!r}]); "
+        "time.sleep(5)"
+    )
+    started = time.monotonic()
+
+    with pytest.raises(subprocess.TimeoutExpired):
+        run_command([sys.executable, "-c", parent_code], timeout_seconds=0.1)
+
+    assert time.monotonic() - started < 3
