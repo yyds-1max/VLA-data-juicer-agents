@@ -1,0 +1,135 @@
+import asyncio
+from types import SimpleNamespace
+
+import pytest
+from agentscope.event import RequireUserConfirmEvent
+from agentscope.message import ToolCallBlock
+
+from vla_data_juicer_agents.adapters.agentscope.events import (
+    AgentScopeEventAdapter,
+    summarize_progress,
+)
+from vla_data_juicer_agents.core.cancellation import CancellationContext, TurnCancelled
+from vla_data_juicer_agents.core.events import CallbackEventSink, EventEmitter
+from vla_data_juicer_agents.navigation.workflow import _run_agent_stream
+
+
+def _scope_and_events():
+    events = []
+    scope = EventEmitter(CallbackEventSink(events.append)).scope("plan-agent", run_id="run-1")
+    return scope, events
+
+
+def test_thinking_end_emits_normalized_bounded_reasoning():
+    scope, events = _scope_and_events()
+    adapter = AgentScopeEventAdapter(scope)
+
+    adapter.accept(SimpleNamespace(type="THINKING_BLOCK_DELTA", block_id="thought-1", delta="Thought:  inspect   inputs. "))
+    adapter.accept(SimpleNamespace(type="THINKING_BLOCK_DELTA", block_id="thought-1", delta="Then choose a tool! Ignore this third sentence."))
+    adapter.accept(SimpleNamespace(type="THINKING_BLOCK_END", block_id="thought-1"))
+
+    assert [(event["type"], event["payload"]) for event in events] == [
+        ("reasoning", {"summary": "inspect inputs. Then choose a tool!"})
+    ]
+    assert summarize_progress("思考：  查看\n状态。 继续执行。 第三句。") == "查看 状态。 继续执行。"
+    assert len(summarize_progress("Thought: " + "x" * 300)) <= 240
+
+
+def test_tool_result_emits_paired_start_and_end_with_result_state():
+    scope, events = _scope_and_events()
+    adapter = AgentScopeEventAdapter(scope)
+
+    adapter.accept(SimpleNamespace(type="TOOL_CALL_START", tool_call_id="call-1", tool_call_name="inspect"))
+    adapter.accept(SimpleNamespace(type="TOOL_CALL_DELTA", tool_call_id="call-1", delta='{"date":'))
+    adapter.accept(SimpleNamespace(type="TOOL_CALL_DELTA", tool_call_id="call-1", delta=' "20270605"}'))
+    adapter.accept(SimpleNamespace(type="TOOL_RESULT_START", tool_call_id="call-1", tool_call_name="inspect"))
+    adapter.accept(SimpleNamespace(type="TOOL_RESULT_TEXT_DELTA", tool_call_id="call-1", delta="Found   navigation data. "))
+    adapter.accept(SimpleNamespace(type="TOOL_RESULT_TEXT_DELTA", tool_call_id="call-1", delta="Ready."))
+    adapter.accept(SimpleNamespace(type="TOOL_RESULT_END", tool_call_id="call-1", state="success"))
+
+    assert [(event["type"], event["payload"]) for event in events] == [
+        ("tool_start", {"tool": "inspect", "call_id": "call-1", "args": '{"date": "20270605"}'}),
+        ("tool_end", {"tool": "inspect", "call_id": "call-1", "status": "completed", "summary": "Found navigation data. Ready."}),
+    ]
+
+
+@pytest.mark.parametrize(
+    ("state", "status"),
+    [("error", "failed"), ("denied", "failed"), ("interrupted", "interrupted")],
+)
+def test_tool_result_maps_non_success_states(state, status):
+    scope, events = _scope_and_events()
+    adapter = AgentScopeEventAdapter(scope)
+
+    adapter.accept(SimpleNamespace(type="TOOL_RESULT_START", tool_call_id="call-1", tool_call_name="inspect"))
+    adapter.accept(SimpleNamespace(type="TOOL_RESULT_END", tool_call_id="call-1", state=state))
+
+    assert events[-1]["payload"]["status"] == status
+
+
+def test_emit_tool_events_false_suppresses_tool_events():
+    scope, events = _scope_and_events()
+    adapter = AgentScopeEventAdapter(scope, emit_tool_events=False)
+
+    adapter.accept(SimpleNamespace(type="TOOL_RESULT_START", tool_call_id="call-1", tool_call_name="inspect"))
+    adapter.accept(SimpleNamespace(type="TOOL_RESULT_TEXT_DELTA", tool_call_id="call-1", delta="done"))
+    adapter.accept(SimpleNamespace(type="TOOL_RESULT_END", tool_call_id="call-1", state="success"))
+
+    assert events == []
+
+
+def test_agent_lifecycle_is_emitted_once_across_confirmation_rounds():
+    scope, events = _scope_and_events()
+
+    class ConfirmingAgent:
+        def __init__(self):
+            self.calls = 0
+
+        async def reply_stream(self, _message):
+            self.calls += 1
+            if self.calls == 1:
+                yield RequireUserConfirmEvent(
+                    reply_id="reply-1",
+                    tool_calls=[ToolCallBlock(id="call-1", name="inspect", input="{}")],
+                )
+                return
+            yield SimpleNamespace(type="TEXT_BLOCK_DELTA", delta="finished")
+
+    output = asyncio.run(_run_agent_stream(ConfirmingAgent(), "prompt", event_scope=scope))
+
+    assert output == "finished"
+    assert [(event["type"], event["payload"]) for event in events] == [
+        ("agent_start", {}),
+        ("agent_end", {"status": "completed"}),
+    ]
+
+
+def test_agent_cancellation_emits_interrupted_end_and_tracks_agent():
+    scope, events = _scope_and_events()
+    cancellation = CancellationContext()
+
+    class CancellingAgent:
+        async def reply_stream(self, _message):
+            yield RequireUserConfirmEvent(
+                reply_id="reply-1",
+                tool_calls=[ToolCallBlock(id="call-1", name="inspect", input="{}")],
+            )
+            cancellation._cancelled.set()
+
+        async def interrupt(self):
+            pass
+
+    with pytest.raises(TurnCancelled):
+        asyncio.run(
+            _run_agent_stream(
+                CancellingAgent(),
+                "prompt",
+                event_scope=scope,
+                cancellation=cancellation,
+            )
+        )
+
+    assert [(event["type"], event["payload"]) for event in events] == [
+        ("agent_start", {}),
+        ("agent_end", {"status": "interrupted"}),
+    ]

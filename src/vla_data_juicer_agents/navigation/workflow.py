@@ -1,5 +1,6 @@
 import json
 import re
+from contextlib import AsyncExitStack
 from pathlib import Path
 from typing import Any, Literal
 
@@ -7,6 +8,13 @@ from agentscope.event import ConfirmResult, UserConfirmResultEvent
 from agentscope.message import UserMsg
 from pydantic import ValidationError
 
+from vla_data_juicer_agents.adapters.agentscope.events import AgentScopeEventAdapter
+from vla_data_juicer_agents.core.cancellation import (
+    CancellationContext,
+    TurnCancelled,
+    current_cancellation,
+)
+from vla_data_juicer_agents.core.events import EventEmitter, EventScope
 from vla_data_juicer_agents.navigation.models import NavigationDataProfile, NavigationRequest, WorkflowPlan, WorkflowStep
 from vla_data_juicer_agents.navigation.plan_validation import validate_workflow_plan
 from vla_data_juicer_agents.navigation.plan_draft import build_plan_from_draft
@@ -281,34 +289,58 @@ async def _run_agent_stream(
     prompt: str,
     run_store: WorkflowRunStore | None = None,
     run_dir: Path | None = None,
+    *,
+    event_scope: EventScope | None = None,
+    cancellation: CancellationContext | None = None,
+    emit_tool_events: bool = True,
 ) -> str:
+    scope = event_scope or EventEmitter().scope("agent")
+    adapter = AgentScopeEventAdapter(scope, emit_tool_events=emit_tool_events)
+    active_cancellation = cancellation or current_cancellation()
     output_chunks: list[str] = []
     tool_output_chunks: list[str] = []
     next_input: object = UserMsg(name="user", content=prompt)
-    for _ in range(MAX_AGENT_TOOL_CONFIRMATION_ROUNDS):
-        confirm_results: list[ConfirmResult] = []
-        reply_id: str | None = None
-        async for event in agent.reply_stream(next_input):
-            event_record = {
-                "event_type": _event_type(event),
-                "payload": _event_payload(event),
-            }
-            if run_store is not None and run_dir is not None:
-                run_store.append_jsonl(run_dir, "events.jsonl", event_record)
-            output_chunks.append(_event_text_delta(event))
-            tool_output_chunks.append(_event_tool_result_delta(event))
-            if _event_type(event) == "REQUIRE_USER_CONFIRM":
-                reply_id = getattr(event, "reply_id", None)
-                confirm_results.extend(_confirmation_results(event))
-        if not confirm_results:
-            return "".join(output_chunks) or "".join(tool_output_chunks)
-        if reply_id is None:
-            raise RuntimeError("AgentScope requested tool confirmation without a reply id.")
-        next_input = UserConfirmResultEvent(reply_id=reply_id, confirm_results=confirm_results)
-    raise RuntimeError(
-        "AgentScope tool confirmation loop exceeded "
-        f"{MAX_AGENT_TOOL_CONFIRMATION_ROUNDS} iterations."
-    )
+    scope.emit("agent_start")
+    try:
+        async with AsyncExitStack() as stack:
+            if active_cancellation is not None:
+                await stack.enter_async_context(active_cancellation.track_agent(agent))
+            for _ in range(MAX_AGENT_TOOL_CONFIRMATION_ROUNDS):
+                if active_cancellation is not None:
+                    active_cancellation.raise_if_cancelled()
+                confirm_results: list[ConfirmResult] = []
+                reply_id: str | None = None
+                async for event in agent.reply_stream(next_input):
+                    adapter.accept(event)
+                    event_record = {
+                        "event_type": _event_type(event),
+                        "payload": _event_payload(event),
+                    }
+                    if run_store is not None and run_dir is not None:
+                        run_store.append_jsonl(run_dir, "events.jsonl", event_record)
+                    output_chunks.append(_event_text_delta(event))
+                    tool_output_chunks.append(_event_tool_result_delta(event))
+                    if _event_type(event) == "REQUIRE_USER_CONFIRM":
+                        reply_id = getattr(event, "reply_id", None)
+                        confirm_results.extend(_confirmation_results(event))
+                if active_cancellation is not None:
+                    active_cancellation.raise_if_cancelled()
+                if not confirm_results:
+                    scope.emit("agent_end", status="completed")
+                    return "".join(output_chunks) or "".join(tool_output_chunks)
+                if reply_id is None:
+                    raise RuntimeError("AgentScope requested tool confirmation without a reply id.")
+                next_input = UserConfirmResultEvent(reply_id=reply_id, confirm_results=confirm_results)
+        raise RuntimeError(
+            "AgentScope tool confirmation loop exceeded "
+            f"{MAX_AGENT_TOOL_CONFIRMATION_ROUNDS} iterations."
+        )
+    except TurnCancelled:
+        scope.emit("agent_end", status="interrupted")
+        raise
+    except BaseException:
+        scope.emit("agent_end", status="failed")
+        raise
 
 
 async def run_plan_agent(
