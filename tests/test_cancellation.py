@@ -1,7 +1,4 @@
 import asyncio
-import concurrent.futures
-import inspect
-import logging
 import subprocess
 import sys
 import threading
@@ -18,28 +15,47 @@ from vla_data_juicer_agents.core.cancellation import (
 from vla_data_juicer_agents.navigation.subprocess_runner import run_command
 
 
-class InterruptibleAgent:
-    def __init__(self) -> None:
-        self.interrupt_count = 0
-        self.interrupted = asyncio.Event()
-
-    async def interrupt(self) -> None:
-        self.interrupt_count += 1
-        self.interrupted.set()
-
-
-def test_cancel_interrupts_each_registered_agent_once() -> None:
+def test_cancel_cancels_active_task_for_agent_without_interrupt() -> None:
     async def exercise() -> None:
         cancellation = CancellationContext()
-        agents = [InterruptibleAgent(), InterruptibleAgent()]
+        started = asyncio.Event()
 
-        async with cancellation.track_agent(agents[0]):
-            async with cancellation.track_agent(agents[1]):
-                assert cancellation.cancel() is True
-                assert cancellation.cancel() is False
-                await asyncio.gather(*(agent.interrupted.wait() for agent in agents))
+        async def worker() -> str:
+            try:
+                async with cancellation.track_agent(object()):
+                    started.set()
+                    await asyncio.Future()
+            except asyncio.CancelledError:
+                return "cancelled"
+            return "completed"
 
-        assert [agent.interrupt_count for agent in agents] == [1, 1]
+        task = asyncio.create_task(worker())
+        await started.wait()
+
+        assert cancellation.cancel() is True
+        assert await task == "cancelled"
+
+    asyncio.run(exercise())
+
+
+def test_cancel_cancels_each_registered_task_once() -> None:
+    async def exercise() -> None:
+        cancellation = CancellationContext()
+        started = [asyncio.Event(), asyncio.Event()]
+
+        async def worker(index: int) -> None:
+            async with cancellation.track_agent(object()):
+                started[index].set()
+                await asyncio.Future()
+
+        tasks = [asyncio.create_task(worker(index)) for index in range(2)]
+        await asyncio.gather(*(event.wait() for event in started))
+
+        assert cancellation.cancel() is True
+        assert cancellation.cancel() is False
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+
+        assert all(isinstance(result, asyncio.CancelledError) for result in results)
 
     asyncio.run(exercise())
 
@@ -66,7 +82,7 @@ def test_track_agent_rejects_already_cancelled_context() -> None:
         cancellation.cancel()
 
         with pytest.raises(TurnCancelled):
-            async with cancellation.track_agent(InterruptibleAgent()):
+            async with cancellation.track_agent(object()):
                 pytest.fail("cancelled context yielded")
 
     asyncio.run(exercise())
@@ -75,59 +91,39 @@ def test_track_agent_rejects_already_cancelled_context() -> None:
 def test_nested_registration_keeps_agent_tracked_until_outer_exit() -> None:
     async def exercise() -> None:
         cancellation = CancellationContext()
-        agent = InterruptibleAgent()
+        ready = asyncio.Event()
 
-        async with cancellation.track_agent(agent):
+        async def worker() -> None:
+            agent = object()
             async with cancellation.track_agent(agent):
                 async with cancellation.track_agent(agent):
-                    pass
-                assert cancellation.cancel() is True
-                await asyncio.wait_for(agent.interrupted.wait(), timeout=0.5)
+                    async with cancellation.track_agent(agent):
+                        pass
+                    ready.set()
+                    await asyncio.Future()
 
-        assert agent.interrupt_count == 1
-
-    asyncio.run(exercise())
-
-
-def test_cancel_closes_interrupt_coroutine_when_loop_closes_during_scheduling(monkeypatch) -> None:
-    scheduled = []
-
-    def fail_scheduling(coroutine, _loop):
-        scheduled.append(coroutine)
-        raise RuntimeError("event loop is closed")
-
-    monkeypatch.setattr(asyncio, "run_coroutine_threadsafe", fail_scheduling)
-
-    async def exercise() -> None:
-        cancellation = CancellationContext()
-        async with cancellation.track_agent(InterruptibleAgent()):
-            assert cancellation.cancel() is True
+        task = asyncio.create_task(worker())
+        await ready.wait()
+        assert cancellation.cancel() is True
+        with pytest.raises(asyncio.CancelledError):
+            await task
 
     asyncio.run(exercise())
 
-    assert len(scheduled) == 1
-    assert inspect.getcoroutinestate(scheduled[0]) == inspect.CORO_CLOSED
 
-
-def test_cancel_consumes_and_logs_interrupt_failure(monkeypatch, caplog) -> None:
-    interrupt_future: concurrent.futures.Future[None] = concurrent.futures.Future()
-
-    def schedule(coroutine, _loop):
-        coroutine.close()
-        return interrupt_future
-
-    monkeypatch.setattr(asyncio, "run_coroutine_threadsafe", schedule)
-
+def test_cancel_handles_loop_close_during_scheduling(monkeypatch) -> None:
     async def exercise() -> None:
         cancellation = CancellationContext()
-        async with cancellation.track_agent(InterruptibleAgent()):
+        loop = asyncio.get_running_loop()
+
+        def fail_scheduling(_callback, *_args):
+            raise RuntimeError("event loop is closed")
+
+        monkeypatch.setattr(loop, "call_soon_threadsafe", fail_scheduling)
+        async with cancellation.track_agent(object()):
             assert cancellation.cancel() is True
-            interrupt_future.set_exception(RuntimeError("interrupt failed"))
 
-    with caplog.at_level(logging.ERROR):
-        asyncio.run(exercise())
-
-    assert "interrupt failed" in caplog.text
+    asyncio.run(exercise())
 
 
 def test_run_command_can_be_cancelled_promptly() -> None:

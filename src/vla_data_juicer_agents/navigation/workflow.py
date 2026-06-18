@@ -1,3 +1,4 @@
+import asyncio
 import json
 import re
 from contextlib import AsyncExitStack
@@ -338,6 +339,9 @@ async def _run_agent_stream(
     except TurnCancelled:
         scope.emit("agent_end", status="interrupted")
         raise
+    except asyncio.CancelledError as exc:
+        scope.emit("agent_end", status="interrupted")
+        raise TurnCancelled("The current turn was interrupted.") from exc
     except BaseException:
         scope.emit("agent_end", status="failed")
         raise

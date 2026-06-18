@@ -8,7 +8,7 @@ from dataclasses import dataclass, field
 from vla_data_juicer_agents.core.events import EventScope
 
 
-_SENTENCE_RE = re.compile(r".*?[.!?。！？](?:\s+|$)")
+_SENTENCE_RE = re.compile(r".*?[.!?。！？]")
 
 
 def _event_type(event: object) -> str:
@@ -36,8 +36,9 @@ def summarize_progress(text: object, *, max_chars: int = 240) -> str:
     if not normalized:
         return ""
 
-    sentences = [match.group(0).strip() for match in _SENTENCE_RE.finditer(normalized)]
-    consumed = sum(match.end() - match.start() for match in _SENTENCE_RE.finditer(normalized))
+    matches = list(_SENTENCE_RE.finditer(normalized))
+    sentences = [match.group(0).strip() for match in matches]
+    consumed = matches[-1].end() if matches else 0
     if consumed < len(normalized):
         sentences.append(normalized[consumed:].strip())
     summary = " ".join(sentence for sentence in sentences[:2] if sentence)

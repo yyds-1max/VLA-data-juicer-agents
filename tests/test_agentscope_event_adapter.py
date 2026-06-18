@@ -32,6 +32,7 @@ def test_thinking_end_emits_normalized_bounded_reasoning():
         ("reasoning", {"summary": "inspect inputs. Then choose a tool!"})
     ]
     assert summarize_progress("思考：  查看\n状态。 继续执行。 第三句。") == "查看 状态。 继续执行。"
+    assert summarize_progress("思考：一。二。三。") == "一。 二。"
     assert len(summarize_progress("Thought: " + "x" * 300)) <= 240
 
 
@@ -128,6 +129,23 @@ def test_agent_cancellation_emits_interrupted_end_and_tracks_agent():
                 cancellation=cancellation,
             )
         )
+
+    assert [(event["type"], event["payload"]) for event in events] == [
+        ("agent_start", {}),
+        ("agent_end", {"status": "interrupted"}),
+    ]
+
+
+def test_asyncio_cancellation_emits_interrupted_end_and_becomes_turn_cancelled():
+    scope, events = _scope_and_events()
+
+    class CancelledAgent:
+        async def reply_stream(self, _message):
+            raise asyncio.CancelledError
+            yield
+
+    with pytest.raises(TurnCancelled):
+        asyncio.run(_run_agent_stream(CancelledAgent(), "prompt", event_scope=scope))
 
     assert [(event["type"], event["payload"]) for event in events] == [
         ("agent_start", {}),
