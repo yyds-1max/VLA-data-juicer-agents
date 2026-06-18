@@ -108,27 +108,30 @@ def test_agent_lifecycle_is_emitted_once_across_confirmation_rounds():
 def test_agent_cancellation_emits_interrupted_end_and_tracks_agent():
     scope, events = _scope_and_events()
     cancellation = CancellationContext()
+    started = asyncio.Event()
 
-    class CancellingAgent:
+    class BlockingAgent:
         async def reply_stream(self, _message):
-            yield RequireUserConfirmEvent(
-                reply_id="reply-1",
-                tool_calls=[ToolCallBlock(id="call-1", name="inspect", input="{}")],
-            )
-            cancellation._cancelled.set()
+            started.set()
+            await asyncio.Future()
+            yield
 
-        async def interrupt(self):
-            pass
-
-    with pytest.raises(TurnCancelled):
-        asyncio.run(
+    async def exercise():
+        task = asyncio.create_task(
             _run_agent_stream(
-                CancellingAgent(),
+                BlockingAgent(),
                 "prompt",
                 event_scope=scope,
                 cancellation=cancellation,
             )
         )
+        await started.wait()
+        assert cancellation.cancel() is True
+        with pytest.raises(TurnCancelled):
+            await task
+        assert cancellation.cancel() is False
+
+    asyncio.run(exercise())
 
     assert [(event["type"], event["payload"]) for event in events] == [
         ("agent_start", {}),
@@ -136,16 +139,26 @@ def test_agent_cancellation_emits_interrupted_end_and_tracks_agent():
     ]
 
 
-def test_asyncio_cancellation_emits_interrupted_end_and_becomes_turn_cancelled():
+def test_asyncio_timeout_preserves_timeout_error_and_emits_interrupted_end():
     scope, events = _scope_and_events()
+    cancellation = CancellationContext()
 
-    class CancelledAgent:
+    class BlockingAgent:
         async def reply_stream(self, _message):
-            raise asyncio.CancelledError
+            await asyncio.Future()
             yield
 
-    with pytest.raises(TurnCancelled):
-        asyncio.run(_run_agent_stream(CancelledAgent(), "prompt", event_scope=scope))
+    async def exercise():
+        with pytest.raises(TimeoutError):
+            async with asyncio.timeout(0.01):
+                await _run_agent_stream(
+                    BlockingAgent(),
+                    "prompt",
+                    event_scope=scope,
+                    cancellation=cancellation,
+                )
+
+    asyncio.run(exercise())
 
     assert [(event["type"], event["payload"]) for event in events] == [
         ("agent_start", {}),

@@ -341,7 +341,9 @@ async def _run_agent_stream(
         raise
     except asyncio.CancelledError as exc:
         scope.emit("agent_end", status="interrupted")
-        raise TurnCancelled("The current turn was interrupted.") from exc
+        if active_cancellation is not None and active_cancellation.cancelled:
+            raise TurnCancelled("The current turn was interrupted.") from exc
+        raise
     except BaseException:
         scope.emit("agent_end", status="failed")
         raise
