@@ -106,7 +106,7 @@ async def run_vla_workflow(ctx: ToolContext, raw_args: RunVLAWorkflowInput | dic
     runtime_values = ctx.runtime_values
     incoming_scope = runtime_values.get("event_scope")
     incoming_emitter = runtime_values.get("event_emitter")
-    emitter = incoming_emitter or getattr(incoming_scope, "emitter", None) or EventEmitter()
+    emitter = getattr(incoming_scope, "emitter", None) or incoming_emitter or EventEmitter()
     emitter = emitter.with_sink(JsonlEventSink(run_dir / "events.jsonl"))
     workflow_scope = emitter.scope(
         "navigation.workflow",

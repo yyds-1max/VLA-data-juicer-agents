@@ -245,6 +245,54 @@ def test_vla_run_workflow_tool_reuses_plan_and_executor_agents(tmp_path, monkeyp
     assert all(set(event) == {"type", "source", "run_id", "parent_run_id", "timestamp", "payload"} for event in persisted)
 
 
+def test_vla_run_workflow_prefers_scope_emitter_over_independent_emitter(tmp_path, monkeypatch):
+    scope_events = []
+    independent_events = []
+    scope_emitter = EventEmitter(CallbackEventSink(scope_events.append))
+    independent_emitter = EventEmitter(CallbackEventSink(independent_events.append))
+    parent_scope = scope_emitter.scope("session", run_id="session-run")
+    plan = SimpleNamespace(
+        model_dump=lambda mode="json": {"date": "20270605", "dataset_profile": "go2w_like", "steps": []},
+    )
+
+    async def fake_run_plan_agent(*args, **kwargs):
+        return plan
+
+    monkeypatch.setenv("VLA_RUNS_ROOT", str(tmp_path / "runs"))
+    monkeypatch.setattr("vla_data_juicer_agents.tools.vla.run_workflow.create_plan_agent", lambda **kwargs: object())
+    monkeypatch.setattr("vla_data_juicer_agents.tools.vla.run_workflow.run_plan_agent", fake_run_plan_agent)
+    ctx = ToolContext(
+        working_dir=str(tmp_path),
+        runtime_values={
+            "event_scope": parent_scope,
+            "event_emitter": independent_emitter,
+        },
+    )
+
+    payload = asyncio.run(
+        run_vla_workflow(
+            ctx,
+            {
+                "date": "20270605",
+                "scene_mode": "out",
+                "dry_run": True,
+                "approve": False,
+            },
+        )
+    )
+
+    assert [(event["type"], event["parent_run_id"]) for event in scope_events] == [
+        ("agent_start", "session-run"),
+        ("agent_end", "session-run"),
+    ]
+    assert independent_events == []
+    persisted = [
+        json.loads(line)
+        for line in (Path(payload["run_dir"]) / "events.jsonl").read_text(encoding="utf-8").splitlines()
+    ]
+    assert persisted == scope_events
+
+
 def test_vla_run_workflow_reraises_cancellation_after_interrupted_report(tmp_path, monkeypatch):
     events = []
     cancellation = CancellationContext()
