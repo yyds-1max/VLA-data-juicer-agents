@@ -3,6 +3,7 @@ from datetime import datetime, timezone
 
 from vla_data_juicer_agents.core.events import (
     CallbackEventSink,
+    CompositeEventSink,
     EventEmitter,
     JsonlEventSink,
 )
@@ -55,3 +56,29 @@ def test_jsonl_sink_writes_one_json_object_per_event(tmp_path):
     assert len(lines) == 2
     assert "处理中" in lines[0]
     assert [json.loads(line) for line in lines] == [first, second]
+
+
+def test_emitter_and_composite_accept_iterable_sinks():
+    first = []
+    second = []
+    composite = CompositeEventSink(
+        [CallbackEventSink(first.append), CallbackEventSink(second.append)]
+    )
+    emitter = EventEmitter([composite])
+
+    event = emitter.scope("worker", run_id="run-1").emit("step.started", {})
+
+    assert first == [event]
+    assert second == [event]
+
+
+def test_scope_emit_accepts_keyword_payload():
+    captured = []
+    child = EventEmitter([CallbackEventSink(captured.append)]).scope(
+        "worker", run_id="run-1"
+    )
+
+    event = child.emit("reasoning", summary="text")
+
+    assert event["payload"] == {"summary": "text"}
+    assert captured == [event]

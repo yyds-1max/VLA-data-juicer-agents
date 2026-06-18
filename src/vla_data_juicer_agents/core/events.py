@@ -4,11 +4,11 @@ from __future__ import annotations
 
 import json
 import logging
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Protocol
+from typing import Any, Protocol, cast
 from uuid import uuid4
 
 
@@ -22,6 +22,15 @@ class EventSink(Protocol):
 
     def publish(self, event: Mapping[str, Any]) -> None:
         """Publish an event."""
+
+
+SinkInput = EventSink | Iterable[EventSink]
+
+
+def _normalize_sinks(sinks: tuple[SinkInput, ...]) -> tuple[EventSink, ...]:
+    if len(sinks) == 1 and not hasattr(sinks[0], "publish"):
+        return tuple(cast(Iterable[EventSink], sinks[0]))
+    return tuple(cast(EventSink, sink) for sink in sinks)
 
 
 class CallbackEventSink:
@@ -50,8 +59,8 @@ class JsonlEventSink:
 class CompositeEventSink:
     """Publish to every sink, isolating failures between destinations."""
 
-    def __init__(self, *sinks: EventSink) -> None:
-        self._sinks = tuple(sinks)
+    def __init__(self, *sinks: SinkInput) -> None:
+        self._sinks = _normalize_sinks(sinks)
 
     def publish(self, event: Mapping[str, Any]) -> None:
         for sink in self._sinks:
@@ -64,9 +73,9 @@ class CompositeEventSink:
 class EventEmitter:
     """Publish normalized events to one or more sinks."""
 
-    def __init__(self, *sinks: EventSink) -> None:
-        self._sinks = tuple(sinks)
-        self._composite = CompositeEventSink(*sinks)
+    def __init__(self, *sinks: SinkInput) -> None:
+        self._sinks = _normalize_sinks(sinks)
+        self._composite = CompositeEventSink(*self._sinks)
 
     def with_sink(self, sink: EventSink) -> EventEmitter:
         return EventEmitter(*self._sinks, sink)
@@ -104,14 +113,21 @@ class EventScope:
             parent_run_id=self.run_id,
         )
 
-    def emit(self, event_type: str, payload: Mapping[str, Any]) -> Event:
+    def emit(
+        self,
+        event_type: str,
+        payload: Mapping[str, Any] | None = None,
+        **payload_fields: Any,
+    ) -> Event:
+        normalized_payload = dict(payload) if payload is not None else {}
+        normalized_payload.update(payload_fields)
         event = {
             "type": event_type,
             "source": self.source,
             "run_id": self.run_id,
             "parent_run_id": self.parent_run_id,
             "timestamp": datetime.now(timezone.utc).isoformat(timespec="milliseconds"),
-            "payload": dict(payload),
+            "payload": normalized_payload,
         }
         self.emitter.publish(event)
         return event
