@@ -28,9 +28,13 @@ SinkInput = EventSink | Iterable[EventSink]
 
 
 def _normalize_sinks(sinks: tuple[SinkInput, ...]) -> tuple[EventSink, ...]:
-    if len(sinks) == 1 and not hasattr(sinks[0], "publish"):
-        return tuple(cast(Iterable[EventSink], sinks[0]))
-    return tuple(cast(EventSink, sink) for sink in sinks)
+    normalized = []
+    for sink in sinks:
+        if hasattr(sink, "publish"):
+            normalized.append(cast(EventSink, sink))
+        else:
+            normalized.extend(cast(Iterable[EventSink], sink))
+    return tuple(normalized)
 
 
 class CallbackEventSink:
@@ -50,10 +54,10 @@ class JsonlEventSink:
         self._path = Path(path)
 
     def publish(self, event: Mapping[str, Any]) -> None:
+        serialized = json.dumps(dict(event), ensure_ascii=False)
         self._path.parent.mkdir(parents=True, exist_ok=True)
         with self._path.open("a", encoding="utf-8") as output:
-            json.dump(dict(event), output, ensure_ascii=False)
-            output.write("\n")
+            output.write(serialized + "\n")
 
 
 class CompositeEventSink:

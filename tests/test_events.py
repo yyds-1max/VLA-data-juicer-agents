@@ -1,6 +1,8 @@
 import json
 from datetime import datetime, timezone
 
+import pytest
+
 from vla_data_juicer_agents.core.events import (
     CallbackEventSink,
     CompositeEventSink,
@@ -82,3 +84,37 @@ def test_scope_emit_accepts_keyword_payload():
 
     assert event["payload"] == {"summary": "text"}
     assert captured == [event]
+
+
+def test_jsonl_sink_does_not_write_partial_line_when_serialization_fails(tmp_path):
+    path = tmp_path / "events.jsonl"
+    sink = JsonlEventSink(path)
+
+    with pytest.raises(TypeError):
+        sink.publish({"payload": object()})
+    sink.publish({"type": "valid", "payload": {}})
+
+    lines = path.read_text(encoding="utf-8").splitlines()
+    assert [json.loads(line) for line in lines] == [{"type": "valid", "payload": {}}]
+
+
+def test_sink_constructors_flatten_each_iterable_argument():
+    first = []
+    second = []
+    third = []
+    fourth = []
+    emitter = EventEmitter(
+        [CallbackEventSink(first.append)], CallbackEventSink(second.append)
+    )
+    composite = CompositeEventSink(
+        [CallbackEventSink(third.append)], [CallbackEventSink(fourth.append)]
+    )
+
+    event = EventEmitter(emitter, composite).scope("worker", run_id="run-1").emit(
+        "step.started", {}
+    )
+
+    assert first == [event]
+    assert second == [event]
+    assert third == [event]
+    assert fourth == [event]
