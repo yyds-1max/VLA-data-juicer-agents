@@ -86,6 +86,61 @@ def test_scope_emit_accepts_keyword_payload():
     assert captured == [event]
 
 
+def test_event_transform_sanitizes_returned_event_and_all_sinks_once():
+    first = []
+    second = []
+    transform_calls = []
+
+    def redact(event):
+        transform_calls.append(event)
+        return {
+            **event,
+            "payload": {"summary": event["payload"]["summary"].replace("hunter2", "[REDACTED]")},
+        }
+
+    emitter = EventEmitter(
+        CallbackEventSink(first.append),
+        CallbackEventSink(second.append),
+        event_transform=redact,
+    )
+
+    event = emitter.scope("worker", run_id="run-1").emit(
+        "reasoning",
+        summary="password=hunter2",
+    )
+
+    assert len(transform_calls) == 1
+    assert event["payload"] == {"summary": "password=[REDACTED]"}
+    assert first == [event]
+    assert second == [event]
+
+
+def test_with_sink_preserves_event_transform(tmp_path):
+    captured = []
+    path = tmp_path / "events.jsonl"
+
+    def redact(event):
+        return {
+            **event,
+            "payload": {"summary": event["payload"]["summary"].replace("hunter2", "[REDACTED]")},
+        }
+
+    emitter = EventEmitter(
+        CallbackEventSink(captured.append),
+        event_transform=redact,
+    ).with_sink(JsonlEventSink(path))
+
+    event = emitter.scope("worker", run_id="run-1").emit(
+        "reasoning",
+        summary="password=hunter2",
+    )
+
+    persisted = json.loads(path.read_text(encoding="utf-8"))
+    assert captured == [event]
+    assert persisted == event
+    assert "hunter2" not in json.dumps({"captured": captured, "persisted": persisted})
+
+
 def test_jsonl_sink_does_not_write_partial_line_when_serialization_fails(tmp_path):
     path = tmp_path / "events.jsonl"
     sink = JsonlEventSink(path)

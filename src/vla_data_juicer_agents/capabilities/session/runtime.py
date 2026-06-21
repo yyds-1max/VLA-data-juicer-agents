@@ -17,10 +17,9 @@ from vla_data_juicer_agents.core.events import CallbackEventSink, EventEmitter, 
 
 
 _PREVIEW_LIMIT = 240
-_AUTHORIZATION_ASSIGNMENT_PATTERN = re.compile(
+_AUTHORIZATION_ASSIGNMENT_PREFIX_PATTERN = re.compile(
     r"\b(authorization(?:[_-]?header)?)\b"
-    r"(\s*[=:]\s*)"
-    r"[^;\r\n]*",
+    r"(\s*[=:]\s*)",
     flags=re.IGNORECASE,
 )
 _SECRET_ASSIGNMENT_PATTERN = re.compile(
@@ -58,6 +57,7 @@ class SessionToolRuntime:
         self.state = state
         self._event_emitter = EventEmitter(
             CallbackEventSink(event_callback) if event_callback is not None else (),
+            event_transform=self.redact_event,
         )
         self._turn_lock = threading.RLock()
         self._active_context: TurnContext | None = None
@@ -112,7 +112,7 @@ class SessionToolRuntime:
     def emit_event(self, event_type: str, **payload: Any) -> None:
         context = self.turn_context()
         if context is not None:
-            context.scope.emit(event_type, **self.redact_payload(payload))
+            context.scope.emit(event_type, **payload)
 
     def storage_root(self) -> Path:
         return Path(self.state.working_dir or "./.djx").expanduser()
@@ -141,26 +141,69 @@ class SessionToolRuntime:
             return cls.redact_text(value)
         return value
 
+    @classmethod
+    def redact_event(cls, event: dict[str, Any]) -> dict[str, Any]:
+        redacted = dict(event)
+        redacted["payload"] = cls.redact_payload(event.get("payload", {}))
+        return redacted
+
     @staticmethod
     def _is_sensitive_key(normalized_key: str) -> bool:
         return (
             "authorization" in normalized_key
-            or normalized_key.endswith(("token", "password", "credential", "credentials", "apikey"))
+            or normalized_key.endswith(
+                (
+                    "token",
+                    "password",
+                    "credential",
+                    "credentials",
+                    "apikey",
+                    "privatekey",
+                    "passwordhash",
+                )
+            )
             or normalized_key.endswith("secret")
             or ("secret" in normalized_key and normalized_key.endswith("key"))
         )
 
     @staticmethod
     def redact_text(value: str) -> str:
-        redacted = _AUTHORIZATION_ASSIGNMENT_PATTERN.sub(
-            lambda match: f"{match.group(1)}{match.group(2)}[REDACTED]",
-            value,
-        )
+        redacted = SessionToolRuntime._redact_authorization_assignments(value)
         redacted = _SECRET_ASSIGNMENT_PATTERN.sub(
             lambda match: f"{match.group(1)}{match.group(2)}[REDACTED]",
             redacted,
         )
         return _BEARER_PATTERN.sub(lambda match: f"{match.group(1)} [REDACTED]", redacted)
+
+    @staticmethod
+    def _redact_authorization_assignments(value: str) -> str:
+        parts: list[str] = []
+        cursor = 0
+        while match := _AUTHORIZATION_ASSIGNMENT_PREFIX_PATTERN.search(value, cursor):
+            parts.append(value[cursor : match.start()])
+            parts.append(f"{match.group(1)}{match.group(2)}[REDACTED]")
+            cursor = SessionToolRuntime._authorization_value_end(value, match.end())
+        parts.append(value[cursor:])
+        return "".join(parts)
+
+    @staticmethod
+    def _authorization_value_end(value: str, start: int) -> int:
+        quote: str | None = None
+        escaped = False
+        for index in range(start, len(value)):
+            character = value[index]
+            if quote is not None:
+                if escaped:
+                    escaped = False
+                elif character == "\\":
+                    escaped = True
+                elif character == quote:
+                    quote = None
+            elif character in {"'", '"'}:
+                quote = character
+            elif character in {";", "\r", "\n"}:
+                return index
+        return len(value)
 
     @classmethod
     def _preview(cls, value: Any) -> str:

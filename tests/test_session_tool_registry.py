@@ -287,6 +287,10 @@ def test_session_runtime_public_redaction_handles_secret_key_variants_without_fa
         "authorization_header": "Digest username=visible",
         "client_credentials": "client-secret",
         "aws_secret_access_key": "aws-secret",
+        "private_key": "private-secret",
+        "privateKey": "camel-private-secret",
+        "password_hash": "hash-secret",
+        "passwordHash": "camel-hash-secret",
         "nested": [
             {"access_token": "access-secret"},
             {"access-token": "dash-access-secret"},
@@ -306,6 +310,10 @@ def test_session_runtime_public_redaction_handles_secret_key_variants_without_fa
         "authorization_header": "[REDACTED]",
         "client_credentials": "[REDACTED]",
         "aws_secret_access_key": "[REDACTED]",
+        "private_key": "[REDACTED]",
+        "privateKey": "[REDACTED]",
+        "password_hash": "[REDACTED]",
+        "passwordHash": "[REDACTED]",
         "nested": [
             {"access_token": "[REDACTED]"},
             {"access-token": "[REDACTED]"},
@@ -403,6 +411,51 @@ def test_session_runtime_redacts_full_authorization_assignment(message, redacted
 )
 def test_session_runtime_redacts_authorization_values_without_scheme_enumeration(message, redacted):
     assert SessionToolRuntime.redact_text(message) == redacted
+
+
+def test_session_runtime_redacts_authorization_until_unquoted_delimiter():
+    message = (
+        'Authorization=Digest username="u;admin", realm="secret-realm", '
+        'response="secret-response"; safe after\n'
+        'authorization: Custom value="escaped \\"; quote"; retained'
+    )
+
+    redacted = SessionToolRuntime.redact_text(message)
+
+    assert redacted == (
+        "Authorization=[REDACTED]; safe after\n"
+        "authorization: [REDACTED]; retained"
+    )
+    assert "secret-realm" not in redacted
+    assert "secret-response" not in redacted
+
+
+def test_session_agent_redacts_secrets_from_streamed_reasoning_events():
+    events = []
+    session = VLASessionAgent(use_llm_router=False, event_callback=events.append)
+
+    class SecretThinkingAgent:
+        async def reply_stream(self, msg):
+            del msg
+            yield SimpleNamespace(
+                type="THINKING_BLOCK_DELTA",
+                block_id="thinking-1",
+                delta="Inspect password=hunter2 before choosing a tool.",
+            )
+            yield SimpleNamespace(type="THINKING_BLOCK_END", block_id="thinking-1")
+            yield SimpleNamespace(type="TEXT_BLOCK_DELTA", delta="done")
+            yield SimpleNamespace(type="REPLY_END", reply_id="reply")
+
+    session._react_agent = SecretThinkingAgent()
+
+    reply = asyncio.run(session.handle_message_async("inspect"))
+
+    assert reply.text == "done"
+    reasoning = next(event for event in events if event["type"] == "reasoning")
+    assert reasoning["payload"]["summary"] == (
+        "Inspect password=[REDACTED] before choosing a tool."
+    )
+    assert "hunter2" not in json.dumps(events)
 
 
 def test_session_runtime_redacts_secrets_from_tool_previews_and_errors():
@@ -898,6 +951,64 @@ def test_vla_run_workflow_prefers_scope_emitter_over_independent_emitter(tmp_pat
         for line in (Path(payload["run_dir"]) / "events.jsonl").read_text(encoding="utf-8").splitlines()
     ]
     assert persisted == scope_events
+
+
+def test_vla_run_workflow_redacts_child_events_in_callback_and_jsonl(tmp_path, monkeypatch):
+    events = []
+    runtime = SessionToolRuntime(state=SessionState(), event_callback=events.append)
+    parent_scope = runtime.event_emitter.scope("main", run_id="session-run")
+    plan = SimpleNamespace(
+        model_dump=lambda mode="json": {
+            "date": "20270605",
+            "dataset_profile": "go2w_like",
+            "steps": [],
+        },
+    )
+
+    async def fake_run_plan_agent(*args, event_scope=None, **kwargs):
+        event_scope.emit("reasoning", summary="password=hunter2")
+        return plan
+
+    monkeypatch.setenv("VLA_RUNS_ROOT", str(tmp_path / "runs"))
+    monkeypatch.setattr(
+        "vla_data_juicer_agents.tools.vla.run_workflow.create_plan_agent",
+        lambda **kwargs: object(),
+    )
+    monkeypatch.setattr(
+        "vla_data_juicer_agents.tools.vla.run_workflow.run_plan_agent",
+        fake_run_plan_agent,
+    )
+    ctx = ToolContext(
+        working_dir=str(tmp_path),
+        runtime_values={
+            "event_scope": parent_scope,
+            "event_emitter": runtime.event_emitter,
+        },
+    )
+
+    payload = asyncio.run(
+        run_vla_workflow(
+            ctx,
+            {
+                "date": "20270605",
+                "scene_mode": "out",
+                "dry_run": True,
+                "approve": False,
+            },
+        )
+    )
+
+    persisted_text = (Path(payload["run_dir"]) / "events.jsonl").read_text(
+        encoding="utf-8"
+    )
+    assert "hunter2" not in json.dumps(events)
+    assert "hunter2" not in persisted_text
+    assert next(event for event in events if event["type"] == "reasoning")[
+        "payload"
+    ] == {"summary": "password=[REDACTED]"}
+    assert json.loads(persisted_text.splitlines()[1])["payload"] == {
+        "summary": "password=[REDACTED]"
+    }
 
 
 def test_vla_run_workflow_reraises_cancellation_after_interrupted_report(tmp_path, monkeypatch):

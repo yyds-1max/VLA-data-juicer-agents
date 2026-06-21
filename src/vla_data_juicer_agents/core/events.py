@@ -15,6 +15,7 @@ from uuid import uuid4
 logger = logging.getLogger(__name__)
 
 Event = dict[str, Any]
+EventTransform = Callable[[Event], Mapping[str, Any]]
 
 
 class EventSink(Protocol):
@@ -77,12 +78,21 @@ class CompositeEventSink:
 class EventEmitter:
     """Publish normalized events to one or more sinks."""
 
-    def __init__(self, *sinks: SinkInput) -> None:
+    def __init__(
+        self,
+        *sinks: SinkInput,
+        event_transform: EventTransform | None = None,
+    ) -> None:
         self._sinks = _normalize_sinks(sinks)
         self._composite = CompositeEventSink(*self._sinks)
+        self._event_transform = event_transform or (lambda event: event)
 
     def with_sink(self, sink: EventSink) -> EventEmitter:
-        return EventEmitter(*self._sinks, sink)
+        return EventEmitter(
+            *self._sinks,
+            sink,
+            event_transform=self._event_transform,
+        )
 
     def scope(
         self,
@@ -97,8 +107,10 @@ class EventEmitter:
             parent_run_id=parent_run_id,
         )
 
-    def publish(self, event: Mapping[str, Any]) -> None:
-        self._composite.publish(event)
+    def publish(self, event: Mapping[str, Any]) -> Event:
+        published = dict(self._event_transform(dict(event)))
+        self._composite.publish(published)
+        return published
 
 
 @dataclass(frozen=True)
@@ -133,5 +145,4 @@ class EventScope:
             "timestamp": datetime.now(timezone.utc).isoformat(timespec="milliseconds"),
             "payload": normalized_payload,
         }
-        self.emitter.publish(event)
-        return event
+        return self.emitter.publish(event)
