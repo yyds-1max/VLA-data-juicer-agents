@@ -24,7 +24,9 @@ def _tool_context(runtime: SessionToolRuntime) -> ToolContext:
         env=dict(os.environ),
         runtime_values={
             "session_runtime": runtime,
-            "emit_event": runtime.emit_event,
+            "event_emitter": runtime.event_emitter,
+            "event_scope": runtime.active_scope,
+            "cancellation": runtime.active_cancellation,
         },
     )
 
@@ -49,4 +51,3 @@ def build_session_toolkit(runtime: SessionToolRuntime) -> Toolkit:
         for spec in get_session_tool_specs()
     ]
     return Toolkit(tools=tools)
-

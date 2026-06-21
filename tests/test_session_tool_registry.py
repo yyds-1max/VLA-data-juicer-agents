@@ -1,5 +1,6 @@
 import asyncio
 import json
+import threading
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -10,7 +11,7 @@ from vla_data_juicer_agents.core.events import CallbackEventSink, EventEmitter
 from vla_data_juicer_agents.core.tool import ToolContext, get_tool_spec, list_tool_specs
 from vla_data_juicer_agents.capabilities.session.orchestrator import VLASessionAgent
 from vla_data_juicer_agents.capabilities.session.runtime import SessionState, SessionToolRuntime
-from vla_data_juicer_agents.capabilities.session.toolkit import get_session_tool_specs
+from vla_data_juicer_agents.capabilities.session.toolkit import _tool_context, get_session_tool_specs
 from vla_data_juicer_agents.tools.vla.run_workflow import _normalize_model, _normalize_segments, run_vla_workflow
 
 
@@ -120,6 +121,228 @@ def test_session_handle_message_uses_llm_agent_not_keyword_router(monkeypatch):
         {"role": "user", "content": "请处理 20270605 的导航 VLA 数据"},
         {"role": "assistant", "content": "已调用 VLA workflow。"},
     ]
+
+
+def test_session_runtime_exposes_active_normalized_turn_context():
+    runtime = SessionToolRuntime(state=SessionState())
+    scope = runtime.event_emitter.scope("main", run_id="turn-1")
+    cancellation = CancellationContext()
+
+    runtime.begin_turn(scope, cancellation)
+    ctx = _tool_context(runtime)
+
+    assert runtime.active_scope is scope
+    assert runtime.active_cancellation is cancellation
+    assert ctx.runtime_values == {
+        "session_runtime": runtime,
+        "event_emitter": runtime.event_emitter,
+        "event_scope": scope,
+        "cancellation": cancellation,
+    }
+
+    runtime.end_turn()
+    assert runtime.active_scope is None
+    assert runtime.active_cancellation is None
+
+
+def test_session_runtime_emits_paired_bounded_tool_events():
+    events = []
+    runtime = SessionToolRuntime(state=SessionState(), event_callback=events.append)
+    scope = runtime.event_emitter.scope("main", run_id="turn-1")
+    runtime.begin_turn(scope, CancellationContext())
+
+    payload = asyncio.run(
+        runtime.invoke_tool(
+            "inspect",
+            {"query": "x" * 500},
+            lambda: {"ok": True, "message": "done " + ("y" * 500)},
+        )
+    )
+
+    assert payload["ok"] is True
+    assert [(event["type"], event["source"], event["run_id"]) for event in events] == [
+        ("tool_start", "main", "turn-1"),
+        ("tool_end", "main", "turn-1"),
+    ]
+    assert events[0]["payload"]["call_id"] == events[1]["payload"]["call_id"]
+    assert len(events[0]["payload"]["args"]) <= 240
+    assert events[1]["payload"]["status"] == "completed"
+    assert len(events[1]["payload"]["result"]) <= 240
+    assert len(events[1]["payload"]["summary"]) <= 240
+
+
+def test_session_runtime_emits_failed_tool_end_before_reraising():
+    events = []
+    runtime = SessionToolRuntime(state=SessionState(), event_callback=events.append)
+    runtime.begin_turn(runtime.event_emitter.scope("main"), CancellationContext())
+
+    def fail():
+        raise ValueError("bad input")
+
+    with pytest.raises(ValueError, match="bad input"):
+        asyncio.run(runtime.invoke_tool("inspect", {}, fail))
+
+    assert [event["type"] for event in events] == ["tool_start", "tool_end"]
+    assert events[-1]["payload"]["status"] == "failed"
+    assert events[-1]["payload"]["error_type"] == "ValueError"
+    assert events[-1]["payload"]["summary"] == "bad input"
+
+
+def test_session_agent_reuses_agent_across_turns_and_emits_one_final_each():
+    events = []
+    session = VLASessionAgent(use_llm_router=False, event_callback=events.append)
+
+    class FakeStreamingAgent:
+        def __init__(self):
+            self.inputs = []
+
+        async def reply_stream(self, msg):
+            self.inputs.append(str(msg.content))
+            yield SimpleNamespace(type="TEXT_BLOCK_DELTA", delta=f"reply-{len(self.inputs)}")
+            yield SimpleNamespace(type="REPLY_END", reply_id=f"reply-{len(self.inputs)}")
+
+    fake_agent = FakeStreamingAgent()
+    session._react_agent = fake_agent
+
+    reply1 = asyncio.run(session.handle_message_async("记住日期 20270605"))
+    reply2 = asyncio.run(session.handle_message_async("刚才的日期是什么？"))
+
+    assert reply1.text == "reply-1"
+    assert reply2.text == "reply-2"
+    assert len(fake_agent.inputs) == 2
+    assert session.state.history[0]["content"] == "记住日期 20270605"
+    assert session.state.history[-1]["content"] == reply2.text
+    assert [event["type"] for event in events].count("final") == 2
+    assert all(event["source"] == "main" for event in events)
+
+
+@pytest.mark.parametrize("alias", ["exit", "quit", "q", "退出"])
+def test_session_exit_aliases_emit_one_final_and_stop(alias):
+    events = []
+    session = VLASessionAgent(use_llm_router=False, event_callback=events.append)
+
+    reply = asyncio.run(session.handle_message_async(alias))
+
+    assert reply.stop is True
+    assert reply.interrupted is False
+    assert [event["type"] for event in events] == ["final"]
+    assert events[0]["payload"] == {"text": "Session ended.", "stop": True}
+    assert session.state.history[-1] == {"role": "assistant", "content": reply.text}
+
+
+def test_session_help_and_failure_each_emit_exactly_one_final():
+    events = []
+    session = VLASessionAgent(use_llm_router=False, event_callback=events.append)
+
+    help_reply = asyncio.run(session.handle_message_async("help"))
+
+    class FailingAgent:
+        async def reply_stream(self, msg):
+            del msg
+            raise RuntimeError("model unavailable")
+            yield
+
+    session._react_agent = FailingAgent()
+    failed_reply = asyncio.run(session.handle_message_async("do work"))
+
+    assert failed_reply.stop is False
+    assert failed_reply.interrupted is False
+    assert "model unavailable" in failed_reply.text
+    assert [event["type"] for event in events].count("final") == 2
+    assert events[-1]["payload"] == {"text": failed_reply.text, "stop": False}
+    assert session.state.history[-1] == {"role": "assistant", "content": failed_reply.text}
+    assert help_reply.text == session.state.history[1]["content"]
+
+
+def test_session_request_interrupt_is_idle_safe_and_active_turn_is_reusable():
+    events = []
+    started = threading.Event()
+    result = {}
+    session = VLASessionAgent(use_llm_router=False, event_callback=events.append)
+
+    class InterruptibleAgent:
+        def __init__(self):
+            self.calls = 0
+
+        async def reply_stream(self, msg):
+            del msg
+            self.calls += 1
+            if self.calls == 1:
+                started.set()
+                await asyncio.Event().wait()
+            yield SimpleNamespace(type="TEXT_BLOCK_DELTA", delta="still reusable")
+            yield SimpleNamespace(type="REPLY_END", reply_id="reply")
+
+    fake_agent = InterruptibleAgent()
+    session._react_agent = fake_agent
+
+    assert session.request_interrupt() is False
+
+    def run_turn():
+        result["reply"] = asyncio.run(session.handle_message_async("start long task"))
+
+    worker = threading.Thread(target=run_turn)
+    worker.start()
+    assert started.wait(timeout=2)
+    assert session.request_interrupt() is True
+    assert session.request_interrupt() is False
+    worker.join(timeout=2)
+
+    assert worker.is_alive() is False
+    interrupted = result["reply"]
+    assert interrupted.stop is False
+    assert interrupted.interrupted is True
+    assert "中断" in interrupted.text
+    assert session.request_interrupt() is False
+
+    resumed = asyncio.run(session.handle_message_async("continue"))
+    assert resumed.text == "still reusable"
+    assert resumed.interrupted is False
+    assert [event["type"] for event in events].count("final") == 2
+    assert [event["payload"]["status"] for event in events if event["type"] == "agent_end"] == [
+        "interrupted",
+        "completed",
+    ]
+
+
+def test_session_outer_tool_events_are_normalized_without_stream_duplicates():
+    events = []
+    session = VLASessionAgent(use_llm_router=False, event_callback=events.append)
+
+    class ToolStreamingAgent:
+        async def reply_stream(self, msg):
+            del msg
+            await session._tool_runtime.invoke_tool(
+                "vla_run_workflow",
+                {"date": "20270605"},
+                lambda: {"ok": True, "status": "completed", "message": "workflow done"},
+            )
+            yield SimpleNamespace(
+                type="TOOL_CALL_START",
+                tool_call_id="stream-call",
+                tool_call_name="vla_run_workflow",
+            )
+            yield SimpleNamespace(type="TOOL_CALL_DELTA", tool_call_id="stream-call", delta='{"date":"20270605"}')
+            yield SimpleNamespace(
+                type="TOOL_RESULT_START",
+                tool_call_id="stream-call",
+                tool_call_name="vla_run_workflow",
+            )
+            yield SimpleNamespace(type="TOOL_RESULT_TEXT_DELTA", tool_call_id="stream-call", delta="workflow done")
+            yield SimpleNamespace(type="TOOL_RESULT_END", tool_call_id="stream-call", state="success")
+            yield SimpleNamespace(type="TEXT_BLOCK_DELTA", delta="done")
+            yield SimpleNamespace(type="REPLY_END", reply_id="reply")
+
+    session._react_agent = ToolStreamingAgent()
+
+    reply = asyncio.run(session.handle_message_async("run workflow"))
+
+    assert reply.text == "done"
+    tool_events = [event for event in events if event["type"].startswith("tool_")]
+    assert [event["type"] for event in tool_events] == ["tool_start", "tool_end"]
+    assert all(event["source"] == "main" for event in tool_events)
+    assert tool_events[0]["payload"]["call_id"] == tool_events[1]["payload"]["call_id"]
+    assert tool_events[1]["payload"]["status"] == "completed"
 
 
 def test_vla_run_workflow_tool_reuses_plan_and_executor_agents(tmp_path, monkeypatch):

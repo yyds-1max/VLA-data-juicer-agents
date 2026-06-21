@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import threading
 from dataclasses import dataclass
 from typing import Any, Callable
 
@@ -9,6 +10,8 @@ from agentscope.message import UserMsg
 
 from vla_data_juicer_agents.capabilities.session.runtime import SessionState, SessionToolRuntime
 from vla_data_juicer_agents.capabilities.session.toolkit import build_session_toolkit
+from vla_data_juicer_agents.core.cancellation import CancellationContext, TurnCancelled
+from vla_data_juicer_agents.core.events import EventScope
 from vla_data_juicer_agents.navigation.agents import create_qwen_model
 from vla_data_juicer_agents.navigation.workflow import _run_agent_stream
 
@@ -17,6 +20,7 @@ from vla_data_juicer_agents.navigation.workflow import _run_agent_stream
 class SessionReply:
     text: str
     stop: bool = False
+    interrupted: bool = False
 
 
 class VLASessionAgent:
@@ -32,6 +36,8 @@ class VLASessionAgent:
         self._model = model
         self._tool_runtime = SessionToolRuntime(state=self.state, event_callback=event_callback)
         self._react_agent = self.build_react_agent() if use_llm_router else None
+        self._turn_lock = threading.RLock()
+        self._active_cancellation: CancellationContext | None = None
 
     def session_system_prompt(self) -> str:
         return (
@@ -75,35 +81,74 @@ class VLASessionAgent:
         )
 
     @staticmethod
-    def _simple_reply(text: str, *, stop: bool = False) -> SessionReply:
-        return SessionReply(text=text, stop=stop)
+    def _simple_reply(text: str, *, stop: bool = False, interrupted: bool = False) -> SessionReply:
+        return SessionReply(text=text, stop=stop, interrupted=interrupted)
+
+    def request_interrupt(self) -> bool:
+        with self._turn_lock:
+            cancellation = self._active_cancellation
+        return cancellation.cancel() if cancellation is not None else False
+
+    def _record_reply(
+        self,
+        scope: EventScope,
+        text: str,
+        *,
+        stop: bool = False,
+        interrupted: bool = False,
+    ) -> SessionReply:
+        self.state.history.append({"role": "assistant", "content": text})
+        scope.emit("final", text=text, stop=stop)
+        return self._simple_reply(text, stop=stop, interrupted=interrupted)
 
     async def handle_message_async(self, message: str) -> SessionReply:
         text = message.strip()
         if not text:
             return self._simple_reply("Please enter a non-empty message.")
-        lowered = text.lower()
-        if lowered in {"exit", "quit", "q"}:
-            self.state.history.append({"role": "user", "content": text})
-            self.state.history.append({"role": "assistant", "content": "Session ended."})
-            return self._simple_reply("Session ended.", stop=True)
-        if lowered in {"help", "h", "?"}:
-            help_text = (
-                "Describe the data-processing task in natural language. "
-                "For navigation VLA requests, include the date such as 20270605 and optional segments."
-            )
-            self.state.history.append({"role": "user", "content": text})
-            self.state.history.append({"role": "assistant", "content": help_text})
-            return self._simple_reply(help_text)
-        if self._react_agent is None:
-            raise RuntimeError("LLM session agent is unavailable; initialize with use_llm_router=True.")
-
+        scope = self._tool_runtime.event_emitter.scope("main")
+        cancellation = CancellationContext()
+        with self._turn_lock:
+            if self._active_cancellation is not None:
+                raise RuntimeError("A session turn is already active.")
+            self._active_cancellation = cancellation
+        self._tool_runtime.begin_turn(scope, cancellation)
         self.state.history.append({"role": "user", "content": text})
-        prompt = self._context_prompt(text)
-        output = await _run_agent_stream(self._react_agent, prompt)
-        output = output.strip() or "The request was processed, but no displayable text was returned."
-        self.state.history.append({"role": "assistant", "content": output})
-        return self._simple_reply(output)
+        try:
+            lowered = text.lower()
+            if lowered in {"exit", "quit", "q", "退出"}:
+                return self._record_reply(scope, "Session ended.", stop=True)
+            if lowered in {"help", "h", "?"}:
+                help_text = (
+                    "Describe the data-processing task in natural language. "
+                    "For navigation VLA requests, include the date such as 20270605 and optional segments."
+                )
+                return self._record_reply(scope, help_text)
+            if self._react_agent is None:
+                raise RuntimeError("LLM session agent is unavailable; initialize with use_llm_router=True.")
+
+            prompt = self._context_prompt(text)
+            output = await _run_agent_stream(
+                self._react_agent,
+                prompt,
+                event_scope=scope,
+                cancellation=cancellation,
+                emit_tool_events=False,
+            )
+            output = output.strip() or "The request was processed, but no displayable text was returned."
+            return self._record_reply(scope, output)
+        except TurnCancelled:
+            return self._record_reply(
+                scope,
+                "当前任务已中断，可以继续输入下一条请求。",
+                interrupted=True,
+            )
+        except Exception as exc:
+            return self._record_reply(scope, f"Session turn failed: {exc}")
+        finally:
+            self._tool_runtime.end_turn()
+            with self._turn_lock:
+                if self._active_cancellation is cancellation:
+                    self._active_cancellation = None
 
     def handle_message(self, message: str) -> SessionReply:
         return asyncio.run(self.handle_message_async(message))
