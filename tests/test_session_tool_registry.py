@@ -260,6 +260,24 @@ def test_session_runtime_emit_event_uses_normalized_active_scope():
     assert events[0]["payload"] == {"summary": "checking"}
 
 
+def test_session_runtime_emit_event_recursively_redacts_payload():
+    events = []
+    runtime = SessionToolRuntime(state=SessionState(), event_callback=events.append)
+    turn = runtime.begin_turn(runtime.event_emitter.scope("main", run_id="turn-1"), CancellationContext())
+
+    runtime.emit_event(
+        "reasoning",
+        summary="before authorization=Basic dXNlcjpwYXNz; after",
+        details={"nested": [{"token": "hidden"}, "Bearer standalone-secret"]},
+    )
+
+    runtime.end_turn(turn)
+    assert events[0]["payload"] == {
+        "summary": "before authorization=[REDACTED]; after",
+        "details": {"nested": [{"token": "[REDACTED]"}, "Bearer [REDACTED]"]},
+    }
+
+
 def test_session_runtime_emits_paired_bounded_tool_events():
     events = []
     runtime = SessionToolRuntime(state=SessionState(), event_callback=events.append)
@@ -284,6 +302,44 @@ def test_session_runtime_emits_paired_bounded_tool_events():
     assert events[1]["payload"]["status"] == "completed"
     assert len(events[1]["payload"]["result"]) <= 240
     assert len(events[1]["payload"]["summary"]) <= 240
+
+
+@pytest.mark.parametrize(
+    ("message", "redacted"),
+    [
+        (
+            "before authorization=Basic dXNlcjpwYXNz; after",
+            "before authorization=[REDACTED]; after",
+        ),
+        (
+            "before Authorization: Digest digest-credential, after",
+            "before Authorization: [REDACTED], after",
+        ),
+        (
+            "before authorization=Bearer whitespace-credential; after",
+            "before authorization=[REDACTED]; after",
+        ),
+        (
+            "before authorization=Bearer-hyphen-credential; after",
+            "before authorization=[REDACTED]; after",
+        ),
+    ],
+)
+def test_session_runtime_redacts_full_authorization_assignment(message, redacted):
+    events = []
+    runtime = SessionToolRuntime(state=SessionState(), event_callback=events.append)
+    runtime.begin_turn(runtime.event_emitter.scope("main"), CancellationContext())
+
+    asyncio.run(
+        runtime.invoke_tool(
+            "inspect",
+            {},
+            lambda: {"ok": True, "message": message},
+        )
+    )
+
+    completed = next(event for event in events if event["type"] == "tool_end")
+    assert completed["payload"]["summary"] == redacted
 
 
 def test_session_runtime_redacts_secrets_from_tool_previews_and_errors():

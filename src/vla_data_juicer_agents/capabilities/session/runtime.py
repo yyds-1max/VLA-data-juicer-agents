@@ -25,6 +25,12 @@ _SECRET_KEY_PARTS = (
     "authorization",
     "credential",
 )
+_AUTHORIZATION_ASSIGNMENT_PATTERN = re.compile(
+    r"\b(authorization)\b"
+    r"(\s*[=:]\s*)"
+    r"(?:(?:Basic|Digest)\s+[^\s,;]+|Bearer(?:\s+|-)[^\s,;]+)",
+    flags=re.IGNORECASE,
+)
 _SECRET_ASSIGNMENT_PATTERN = re.compile(
     r"\b(api[_-]?key|token|password|secret|authorization|credential)\b"
     r"(\s*[=:]\s*)"
@@ -114,7 +120,7 @@ class SessionToolRuntime:
     def emit_event(self, event_type: str, **payload: Any) -> None:
         context = self.turn_context()
         if context is not None:
-            context.scope.emit(event_type, **payload)
+            context.scope.emit(event_type, **self._redact(payload))
 
     def storage_root(self) -> Path:
         return Path(self.state.working_dir or "./.djx").expanduser()
@@ -145,9 +151,13 @@ class SessionToolRuntime:
 
     @staticmethod
     def _redact_string(value: str) -> str:
-        redacted = _SECRET_ASSIGNMENT_PATTERN.sub(
+        redacted = _AUTHORIZATION_ASSIGNMENT_PATTERN.sub(
             lambda match: f"{match.group(1)}{match.group(2)}[REDACTED]",
             value,
+        )
+        redacted = _SECRET_ASSIGNMENT_PATTERN.sub(
+            lambda match: f"{match.group(1)}{match.group(2)}[REDACTED]",
+            redacted,
         )
         return _BEARER_PATTERN.sub(lambda match: f"{match.group(1)} [REDACTED]", redacted)
 
