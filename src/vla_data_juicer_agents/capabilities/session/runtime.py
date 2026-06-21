@@ -17,14 +17,15 @@ from vla_data_juicer_agents.core.events import CallbackEventSink, EventEmitter, 
 
 
 _PREVIEW_LIMIT = 240
-_SECRET_KEY_PARTS = (
-    "api_key",
+_SECRET_KEY_SUFFIXES = (
+    "apikey",
     "token",
     "password",
     "secret",
-    "authorization",
+    "secretkey",
     "credential",
 )
+_SECRET_KEYS = frozenset({"authorization", "credentials"})
 _AUTHORIZATION_ASSIGNMENT_PATTERN = re.compile(
     r"\b(authorization)\b"
     r"(\s*[=:]\s*)"
@@ -120,7 +121,7 @@ class SessionToolRuntime:
     def emit_event(self, event_type: str, **payload: Any) -> None:
         context = self.turn_context()
         if context is not None:
-            context.scope.emit(event_type, **self._redact(payload))
+            context.scope.emit(event_type, **self.redact_payload(payload))
 
     def storage_root(self) -> Path:
         return Path(self.state.working_dir or "./.djx").expanduser()
@@ -132,25 +133,26 @@ class SessionToolRuntime:
         }
 
     @classmethod
-    def _redact(cls, value: Any) -> Any:
+    def redact_payload(cls, value: Any) -> Any:
         if isinstance(value, Mapping):
             redacted = {}
             for key, item in value.items():
-                normalized_key = str(key).lower()
+                normalized_key = re.sub(r"[_-]", "", str(key).lower())
                 redacted[key] = (
                     "[REDACTED]"
-                    if any(part in normalized_key for part in _SECRET_KEY_PARTS)
-                    else cls._redact(item)
+                    if normalized_key in _SECRET_KEYS
+                    or any(normalized_key.endswith(suffix) for suffix in _SECRET_KEY_SUFFIXES)
+                    else cls.redact_payload(item)
                 )
             return redacted
         if isinstance(value, (list, tuple, set, frozenset)):
-            return [cls._redact(item) for item in value]
+            return [cls.redact_payload(item) for item in value]
         if isinstance(value, str):
-            return cls._redact_string(value)
+            return cls.redact_text(value)
         return value
 
     @staticmethod
-    def _redact_string(value: str) -> str:
+    def redact_text(value: str) -> str:
         redacted = _AUTHORIZATION_ASSIGNMENT_PATTERN.sub(
             lambda match: f"{match.group(1)}{match.group(2)}[REDACTED]",
             value,
@@ -164,10 +166,10 @@ class SessionToolRuntime:
     @classmethod
     def _preview(cls, value: Any) -> str:
         if isinstance(value, str):
-            text = cls._redact_string(value)
+            text = cls.redact_text(value)
             return text if len(text) <= _PREVIEW_LIMIT else text[: _PREVIEW_LIMIT - 3] + "..."
         try:
-            text = json.dumps(cls._redact(value), ensure_ascii=False, default=str)
+            text = json.dumps(cls.redact_payload(value), ensure_ascii=False, default=str)
         except (TypeError, ValueError):
             text = str(value)
         return text if len(text) <= _PREVIEW_LIMIT else text[: _PREVIEW_LIMIT - 3] + "..."

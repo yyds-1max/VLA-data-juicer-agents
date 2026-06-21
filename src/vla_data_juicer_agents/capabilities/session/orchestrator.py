@@ -102,12 +102,13 @@ class VLASessionAgent:
         stop: bool = False,
         interrupted: bool = False,
     ) -> SessionReply:
-        scope.emit("final", text=text, stop=stop)
+        safe_text = self._tool_runtime.redact_text(text)
+        scope.emit("final", text=safe_text, stop=stop)
         try:
-            self.state.history.append({"role": "assistant", "content": text})
+            self.state.history.append({"role": "assistant", "content": safe_text})
         except Exception:
             _logger.exception("Failed to append the session reply to history")
-        return self._simple_reply(text, stop=stop, interrupted=interrupted)
+        return self._simple_reply(safe_text, stop=stop, interrupted=interrupted)
 
     async def handle_message_async(self, message: str) -> SessionReply:
         text = message.strip()

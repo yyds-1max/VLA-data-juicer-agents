@@ -278,6 +278,38 @@ def test_session_runtime_emit_event_recursively_redacts_payload():
     }
 
 
+def test_session_runtime_public_redaction_handles_secret_key_variants_without_false_positives():
+    payload = {
+        "api_key": "underscore-secret",
+        "api-key": "dash-secret",
+        "apiKey": "camel-secret",
+        "apikey": "compact-secret",
+        "nested": [
+            {"access_token": "access-secret"},
+            {"access-token": "dash-access-secret"},
+            {"accessToken": "camel-access-secret"},
+        ],
+        "token_count": 3,
+        "secretary": "unchanged",
+    }
+
+    redacted = SessionToolRuntime.redact_payload(payload)
+
+    assert redacted == {
+        "api_key": "[REDACTED]",
+        "api-key": "[REDACTED]",
+        "apiKey": "[REDACTED]",
+        "apikey": "[REDACTED]",
+        "nested": [
+            {"access_token": "[REDACTED]"},
+            {"access-token": "[REDACTED]"},
+            {"accessToken": "[REDACTED]"},
+        ],
+        "token_count": 3,
+        "secretary": "unchanged",
+    }
+
+
 def test_session_runtime_emits_paired_bounded_tool_events():
     events = []
     runtime = SessionToolRuntime(state=SessionState(), event_callback=events.append)
@@ -440,6 +472,42 @@ def test_session_agent_reuses_agent_across_turns_and_emits_one_final_each():
     assert session.state.history[-1]["content"] == reply2.text
     assert [event["type"] for event in events].count("final") == 2
     assert all(event["source"] == "main" for event in events)
+
+
+def test_session_agent_redacts_secrets_from_final_event_reply_and_history():
+    events = []
+    session = VLASessionAgent(use_llm_router=False, event_callback=events.append)
+
+    class SecretEchoingAgent:
+        async def reply_stream(self, msg):
+            del msg
+            yield SimpleNamespace(
+                type="TEXT_BLOCK_DELTA",
+                delta=(
+                    "authorization=Basic basic-secret; "
+                    "Bearer bearer-secret; password=hunter2; normal text"
+                ),
+            )
+            yield SimpleNamespace(type="REPLY_END", reply_id="reply")
+
+    session._react_agent = SecretEchoingAgent()
+
+    reply = asyncio.run(session.handle_message_async("show result"))
+
+    expected = (
+        "authorization=[REDACTED]; "
+        "Bearer [REDACTED]; password=[REDACTED]; normal text"
+    )
+    assert reply.text == expected
+    assert events[-1]["payload"]["text"] == expected
+    assert session.state.history[-1] == {"role": "assistant", "content": expected}
+    serialized = json.dumps(
+        {"reply": reply.text, "events": events, "history": session.state.history},
+        ensure_ascii=False,
+    )
+    assert "basic-secret" not in serialized
+    assert "bearer-secret" not in serialized
+    assert "hunter2" not in serialized
 
 
 @pytest.mark.parametrize("alias", ["exit", "quit", "q", "退出"])
