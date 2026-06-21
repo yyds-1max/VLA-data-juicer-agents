@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import threading
 from dataclasses import dataclass
 from typing import Any, Callable
@@ -14,6 +15,10 @@ from vla_data_juicer_agents.core.cancellation import CancellationContext, TurnCa
 from vla_data_juicer_agents.core.events import EventScope
 from vla_data_juicer_agents.navigation.agents import create_qwen_model
 from vla_data_juicer_agents.navigation.workflow import _run_agent_stream
+
+
+_logger = logging.getLogger(__name__)
+_FAILED_TURN_TEXT = "Session turn failed. Please try again."
 
 
 @dataclass
@@ -97,8 +102,11 @@ class VLASessionAgent:
         stop: bool = False,
         interrupted: bool = False,
     ) -> SessionReply:
-        self.state.history.append({"role": "assistant", "content": text})
         scope.emit("final", text=text, stop=stop)
+        try:
+            self.state.history.append({"role": "assistant", "content": text})
+        except Exception:
+            _logger.exception("Failed to append the session reply to history")
         return self._simple_reply(text, stop=stop, interrupted=interrupted)
 
     async def handle_message_async(self, message: str) -> SessionReply:
@@ -111,8 +119,9 @@ class VLASessionAgent:
             if self._active_cancellation is not None:
                 raise RuntimeError("A session turn is already active.")
             self._active_cancellation = cancellation
+        turn = None
         try:
-            self._tool_runtime.begin_turn(scope, cancellation)
+            turn = self._tool_runtime.begin_turn(scope, cancellation)
             self.state.history.append({"role": "user", "content": text})
             lowered = text.lower()
             if lowered in {"exit", "quit", "q", "退出"}:
@@ -142,10 +151,12 @@ class VLASessionAgent:
                 "当前任务已中断，可以继续输入下一条请求。",
                 interrupted=True,
             )
-        except Exception as exc:
-            return self._record_reply(scope, f"Session turn failed: {exc}")
+        except Exception:
+            _logger.exception("Session turn failed")
+            return self._record_reply(scope, _FAILED_TURN_TEXT)
         finally:
-            self._tool_runtime.end_turn()
+            if turn is not None:
+                self._tool_runtime.end_turn(turn)
             with self._turn_lock:
                 if self._active_cancellation is cancellation:
                     self._active_cancellation = None

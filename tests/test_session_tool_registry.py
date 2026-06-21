@@ -128,7 +128,7 @@ def test_session_runtime_exposes_active_normalized_turn_context():
     scope = runtime.event_emitter.scope("main", run_id="turn-1")
     cancellation = CancellationContext()
 
-    runtime.begin_turn(scope, cancellation)
+    turn = runtime.begin_turn(scope, cancellation)
     ctx = _tool_context(runtime)
 
     assert runtime.active_scope is scope
@@ -138,11 +138,93 @@ def test_session_runtime_exposes_active_normalized_turn_context():
         "event_emitter": runtime.event_emitter,
         "event_scope": scope,
         "cancellation": cancellation,
+        "emit_event": runtime.emit_event,
     }
 
-    runtime.end_turn()
+    runtime.end_turn(turn)
     assert runtime.active_scope is None
     assert runtime.active_cancellation is None
+
+
+def test_session_runtime_old_turn_end_does_not_clear_new_owner():
+    runtime = SessionToolRuntime(state=SessionState())
+    first = runtime.begin_turn(runtime.event_emitter.scope("main", run_id="first"), CancellationContext())
+    second = runtime.begin_turn(runtime.event_emitter.scope("main", run_id="second"), CancellationContext())
+
+    runtime.end_turn(first)
+
+    assert runtime.active_scope is second.scope
+    assert runtime.active_cancellation is second.cancellation
+
+    runtime.end_turn(second)
+    assert runtime.active_scope is None
+
+
+def test_session_runtime_background_task_keeps_originating_turn_context():
+    events = []
+    runtime = SessionToolRuntime(state=SessionState(), event_callback=events.append)
+
+    async def scenario():
+        first = runtime.begin_turn(runtime.event_emitter.scope("main", run_id="first"), CancellationContext())
+        release = asyncio.Event()
+
+        async def invoke_from_first_turn():
+            await release.wait()
+            ctx = _tool_context(runtime)
+            await runtime.invoke_tool("inspect", {}, lambda: {"ok": True, "message": "done"})
+            return ctx.runtime_values
+
+        child = asyncio.create_task(invoke_from_first_turn())
+        second = runtime.begin_turn(runtime.event_emitter.scope("main", run_id="second"), CancellationContext())
+        release.set()
+        values = await child
+        runtime.end_turn(first)
+        assert runtime.active_scope is second.scope
+        runtime.end_turn(second)
+        return first, values
+
+    first, values = asyncio.run(scenario())
+
+    assert values["event_scope"] is first.scope
+    assert values["cancellation"] is first.cancellation
+    assert [event["run_id"] for event in events] == ["first", "first"]
+
+
+def test_session_runtime_idle_inspection_ignores_stale_child_binding():
+    runtime = SessionToolRuntime(state=SessionState())
+
+    async def scenario():
+        turn = runtime.begin_turn(runtime.event_emitter.scope("main", run_id="first"), CancellationContext())
+        release = asyncio.Event()
+
+        async def inspect_after_end():
+            await release.wait()
+            return runtime.active_scope, runtime.active_cancellation, runtime.turn_context()
+
+        child = asyncio.create_task(inspect_after_end())
+        runtime.end_turn(turn)
+        release.set()
+        return turn, await child
+
+    turn, (active_scope, active_cancellation, bound_context) = asyncio.run(scenario())
+
+    assert active_scope is None
+    assert active_cancellation is None
+    assert bound_context is turn
+
+
+def test_session_runtime_emit_event_uses_normalized_active_scope():
+    events = []
+    runtime = SessionToolRuntime(state=SessionState(), event_callback=events.append)
+    turn = runtime.begin_turn(runtime.event_emitter.scope("main", run_id="turn-1"), CancellationContext())
+
+    runtime.emit_event("reasoning", summary="checking")
+
+    runtime.end_turn(turn)
+    assert [(event["type"], event["source"], event["run_id"]) for event in events] == [
+        ("reasoning", "main", "turn-1"),
+    ]
+    assert events[0]["payload"] == {"summary": "checking"}
 
 
 def test_session_runtime_emits_paired_bounded_tool_events():
@@ -171,6 +253,44 @@ def test_session_runtime_emits_paired_bounded_tool_events():
     assert len(events[1]["payload"]["summary"]) <= 240
 
 
+def test_session_runtime_redacts_secrets_from_tool_previews_and_errors():
+    events = []
+    runtime = SessionToolRuntime(state=SessionState(), event_callback=events.append)
+    runtime.begin_turn(runtime.event_emitter.scope("main"), CancellationContext())
+
+    asyncio.run(
+        runtime.invoke_tool(
+            "inspect",
+            {"API_KEY": "args-secret", "nested": [{"Authorization": "Bearer hidden"}]},
+            lambda: {"ok": True, "token": "result-secret", "message": "safe"},
+        )
+    )
+
+    def fail():
+        raise ValueError("password=hunter2")
+
+    with pytest.raises(ValueError, match="hunter2"):
+        asyncio.run(runtime.invoke_tool("inspect", {"query": "safe"}, fail))
+
+    def interrupt():
+        raise TurnCancelled("token=interrupt-secret")
+
+    with pytest.raises(TurnCancelled, match="interrupt-secret"):
+        asyncio.run(runtime.invoke_tool("inspect", {}, interrupt))
+
+    serialized = json.dumps(events, ensure_ascii=False)
+    assert "args-secret" not in serialized
+    assert "Bearer hidden" not in serialized
+    assert "result-secret" not in serialized
+    assert "hunter2" not in serialized
+    assert "interrupt-secret" not in serialized
+    assert serialized.count("[REDACTED]") >= 3
+    assert [event["payload"]["summary"] for event in events if event["type"] == "tool_end"][-2:] == [
+        "Tool execution failed.",
+        "Tool execution interrupted.",
+    ]
+
+
 def test_session_runtime_emits_failed_tool_end_before_reraising():
     events = []
     runtime = SessionToolRuntime(state=SessionState(), event_callback=events.append)
@@ -185,7 +305,7 @@ def test_session_runtime_emits_failed_tool_end_before_reraising():
     assert [event["type"] for event in events] == ["tool_start", "tool_end"]
     assert events[-1]["payload"]["status"] == "failed"
     assert events[-1]["payload"]["error_type"] == "ValueError"
-    assert events[-1]["payload"]["summary"] == "bad input"
+    assert events[-1]["payload"]["summary"] == "Tool execution failed."
 
 
 def test_session_agent_reuses_agent_across_turns_and_emits_one_final_each():
@@ -247,7 +367,7 @@ def test_session_help_and_failure_each_emit_exactly_one_final():
 
     assert failed_reply.stop is False
     assert failed_reply.interrupted is False
-    assert "model unavailable" in failed_reply.text
+    assert failed_reply.text == "Session turn failed. Please try again."
     assert [event["type"] for event in events].count("final") == 2
     assert events[-1]["payload"] == {"text": failed_reply.text, "stop": False}
     assert session.state.history[-1] == {"role": "assistant", "content": failed_reply.text}
@@ -280,7 +400,7 @@ def test_session_turn_setup_failure_releases_ownership_and_allows_next_turn():
 
     failed = asyncio.run(session.handle_message_async("first"))
 
-    assert "history unavailable" in failed.text
+    assert failed.text == "Session turn failed. Please try again."
     assert session.request_interrupt() is False
     assert session._tool_runtime.active_scope is None
     assert session._tool_runtime.active_cancellation is None
@@ -290,6 +410,27 @@ def test_session_turn_setup_failure_releases_ownership_and_allows_next_turn():
     assert resumed.text == "recovered"
     assert session.request_interrupt() is False
     assert [event["type"] for event in events].count("final") == 2
+
+
+def test_session_history_failure_cannot_suppress_final_event():
+    events = []
+    session = VLASessionAgent(use_llm_router=False, event_callback=events.append)
+
+    class BrokenHistory(list):
+        def append(self, value):
+            del value
+            raise RuntimeError("credential=private-value")
+
+    session.state.history = BrokenHistory()
+
+    reply = asyncio.run(session.handle_message_async("help"))
+
+    serialized = json.dumps(events, ensure_ascii=False)
+    assert reply.text == "Session turn failed. Please try again."
+    assert [event["type"] for event in events] == ["final"]
+    assert events[0]["payload"] == {"text": reply.text, "stop": False}
+    assert "private-value" not in serialized
+    assert session.request_interrupt() is False
 
 
 def test_session_request_interrupt_is_idle_safe_and_active_turn_is_reusable():

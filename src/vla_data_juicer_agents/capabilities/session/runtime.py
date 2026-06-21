@@ -4,7 +4,8 @@ import asyncio
 import inspect
 import json
 import threading
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Mapping
+from contextvars import ContextVar
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -15,12 +16,27 @@ from vla_data_juicer_agents.core.events import CallbackEventSink, EventEmitter, 
 
 
 _PREVIEW_LIMIT = 240
+_SECRET_KEY_PARTS = (
+    "api_key",
+    "token",
+    "password",
+    "secret",
+    "authorization",
+    "credential",
+)
 
 
 @dataclass
 class SessionState:
     working_dir: str = "./.djx"
     history: list[dict[str, str]] = field(default_factory=list)
+
+
+@dataclass(frozen=True)
+class TurnContext:
+    scope: EventScope
+    cancellation: CancellationContext
+    owner_id: str
 
 
 class SessionToolRuntime:
@@ -30,8 +46,11 @@ class SessionToolRuntime:
             CallbackEventSink(event_callback) if event_callback is not None else (),
         )
         self._turn_lock = threading.RLock()
-        self._active_scope: EventScope | None = None
-        self._active_cancellation: CancellationContext | None = None
+        self._active_context: TurnContext | None = None
+        self._bound_context: ContextVar[TurnContext | None] = ContextVar(
+            f"session_turn_{id(self)}",
+            default=None,
+        )
 
     @property
     def event_emitter(self) -> EventEmitter:
@@ -39,23 +58,45 @@ class SessionToolRuntime:
 
     @property
     def active_scope(self) -> EventScope | None:
-        with self._turn_lock:
-            return self._active_scope
+        context = self.active_context
+        return context.scope if context is not None else None
 
     @property
     def active_cancellation(self) -> CancellationContext | None:
-        with self._turn_lock:
-            return self._active_cancellation
+        context = self.active_context
+        return context.cancellation if context is not None else None
 
-    def begin_turn(self, scope: EventScope, cancellation: CancellationContext) -> None:
+    @property
+    def active_context(self) -> TurnContext | None:
         with self._turn_lock:
-            self._active_scope = scope
-            self._active_cancellation = cancellation
+            return self._active_context
 
-    def end_turn(self) -> None:
+    def turn_context(self) -> TurnContext | None:
+        bound = self._bound_context.get()
+        if bound is not None:
+            return bound
         with self._turn_lock:
-            self._active_scope = None
-            self._active_cancellation = None
+            return self._active_context
+
+    def begin_turn(self, scope: EventScope, cancellation: CancellationContext) -> TurnContext:
+        context = TurnContext(scope=scope, cancellation=cancellation, owner_id=f"turn_{uuid4().hex}")
+        with self._turn_lock:
+            self._active_context = context
+        self._bound_context.set(context)
+        return context
+
+    def end_turn(self, context: TurnContext) -> None:
+        bound = self._bound_context.get()
+        if bound is not None and bound.owner_id == context.owner_id:
+            self._bound_context.set(None)
+        with self._turn_lock:
+            if self._active_context is not None and self._active_context.owner_id == context.owner_id:
+                self._active_context = None
+
+    def emit_event(self, event_type: str, **payload: Any) -> None:
+        context = self.turn_context()
+        if context is not None:
+            context.scope.emit(event_type, **payload)
 
     def storage_root(self) -> Path:
         return Path(self.state.working_dir or "./.djx").expanduser()
@@ -66,13 +107,29 @@ class SessionToolRuntime:
             "history_length": len(self.state.history),
         }
 
-    @staticmethod
-    def _preview(value: Any) -> str:
+    @classmethod
+    def _redact(cls, value: Any) -> Any:
+        if isinstance(value, Mapping):
+            redacted = {}
+            for key, item in value.items():
+                normalized_key = str(key).lower()
+                redacted[key] = (
+                    "[REDACTED]"
+                    if any(part in normalized_key for part in _SECRET_KEY_PARTS)
+                    else cls._redact(item)
+                )
+            return redacted
+        if isinstance(value, (list, tuple, set, frozenset)):
+            return [cls._redact(item) for item in value]
+        return value
+
+    @classmethod
+    def _preview(cls, value: Any) -> str:
         if isinstance(value, str):
             text = value
             return text if len(text) <= _PREVIEW_LIMIT else text[: _PREVIEW_LIMIT - 3] + "..."
         try:
-            text = json.dumps(value, ensure_ascii=False, default=str)
+            text = json.dumps(cls._redact(value), ensure_ascii=False, default=str)
         except (TypeError, ValueError):
             text = str(value)
         return text if len(text) <= _PREVIEW_LIMIT else text[: _PREVIEW_LIMIT - 3] + "..."
@@ -84,8 +141,9 @@ class SessionToolRuntime:
         fn: Callable[[], dict[str, Any] | Awaitable[dict[str, Any]]],
     ) -> dict[str, Any]:
         call_id = f"tool_{uuid4().hex[:10]}"
-        scope = self.active_scope
-        cancellation = self.active_cancellation
+        context = self.turn_context()
+        scope = context.scope if context is not None else None
+        cancellation = context.cancellation if context is not None else None
         if cancellation is not None:
             cancellation.raise_if_cancelled()
         if scope is not None:
@@ -108,7 +166,7 @@ class SessionToolRuntime:
                     ok=False,
                     status="interrupted",
                     error_type=type(exc).__name__,
-                    summary=self._preview(str(exc)),
+                    summary="Tool execution interrupted.",
                 )
             raise
         except asyncio.CancelledError as exc:
@@ -133,7 +191,7 @@ class SessionToolRuntime:
                     ok=False,
                     status="failed",
                     error_type=type(exc).__name__,
-                    summary=self._preview(str(exc)),
+                    summary="Tool execution failed.",
                 )
             raise
         ok = bool(payload.get("ok", True)) if isinstance(payload, dict) else True

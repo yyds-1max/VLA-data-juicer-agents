@@ -18,6 +18,7 @@ _GROUP_PRIORITY = {
 
 def _tool_context(runtime: SessionToolRuntime) -> ToolContext:
     root = str(runtime.storage_root())
+    turn = runtime.turn_context()
     return ToolContext(
         working_dir=str(runtime.state.working_dir or "./.djx"),
         artifacts_dir=root,
@@ -25,8 +26,9 @@ def _tool_context(runtime: SessionToolRuntime) -> ToolContext:
         runtime_values={
             "session_runtime": runtime,
             "event_emitter": runtime.event_emitter,
-            "event_scope": runtime.active_scope,
-            "cancellation": runtime.active_cancellation,
+            "event_scope": turn.scope if turn is not None else None,
+            "cancellation": turn.cancellation if turn is not None else None,
+            "emit_event": runtime.emit_event,
         },
     )
 
