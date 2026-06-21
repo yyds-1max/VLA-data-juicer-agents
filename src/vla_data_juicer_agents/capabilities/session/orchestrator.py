@@ -111,9 +111,9 @@ class VLASessionAgent:
             if self._active_cancellation is not None:
                 raise RuntimeError("A session turn is already active.")
             self._active_cancellation = cancellation
-        self._tool_runtime.begin_turn(scope, cancellation)
-        self.state.history.append({"role": "user", "content": text})
         try:
+            self._tool_runtime.begin_turn(scope, cancellation)
+            self.state.history.append({"role": "user", "content": text})
             lowered = text.lower()
             if lowered in {"exit", "quit", "q", "退出"}:
                 return self._record_reply(scope, "Session ended.", stop=True)

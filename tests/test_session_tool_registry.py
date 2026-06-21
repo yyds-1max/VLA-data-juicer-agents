@@ -254,6 +254,44 @@ def test_session_help_and_failure_each_emit_exactly_one_final():
     assert help_reply.text == session.state.history[1]["content"]
 
 
+def test_session_turn_setup_failure_releases_ownership_and_allows_next_turn():
+    events = []
+    session = VLASessionAgent(use_llm_router=False, event_callback=events.append)
+
+    class FailingHistory(list):
+        def __init__(self):
+            super().__init__()
+            self.failed = False
+
+        def append(self, value):
+            if not self.failed:
+                self.failed = True
+                raise RuntimeError("history unavailable")
+            super().append(value)
+
+    class FakeStreamingAgent:
+        async def reply_stream(self, msg):
+            del msg
+            yield SimpleNamespace(type="TEXT_BLOCK_DELTA", delta="recovered")
+            yield SimpleNamespace(type="REPLY_END", reply_id="reply")
+
+    session.state.history = FailingHistory()
+    session._react_agent = FakeStreamingAgent()
+
+    failed = asyncio.run(session.handle_message_async("first"))
+
+    assert "history unavailable" in failed.text
+    assert session.request_interrupt() is False
+    assert session._tool_runtime.active_scope is None
+    assert session._tool_runtime.active_cancellation is None
+
+    resumed = asyncio.run(session.handle_message_async("second"))
+
+    assert resumed.text == "recovered"
+    assert session.request_interrupt() is False
+    assert [event["type"] for event in events].count("final") == 2
+
+
 def test_session_request_interrupt_is_idle_safe_and_active_turn_is_reusable():
     events = []
     started = threading.Event()
