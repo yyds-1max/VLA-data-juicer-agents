@@ -17,19 +17,10 @@ from vla_data_juicer_agents.core.events import CallbackEventSink, EventEmitter, 
 
 
 _PREVIEW_LIMIT = 240
-_SECRET_KEY_SUFFIXES = (
-    "apikey",
-    "token",
-    "password",
-    "secret",
-    "secretkey",
-    "credential",
-)
-_SECRET_KEYS = frozenset({"authorization", "credentials"})
 _AUTHORIZATION_ASSIGNMENT_PATTERN = re.compile(
-    r"\b(authorization)\b"
+    r"\b(authorization(?:[_-]?header)?)\b"
     r"(\s*[=:]\s*)"
-    r"(?:(?:Basic|Digest)\s+[^\s,;]+|Bearer(?:\s+|-)[^\s,;]+)",
+    r"[^;\r\n]*",
     flags=re.IGNORECASE,
 )
 _SECRET_ASSIGNMENT_PATTERN = re.compile(
@@ -140,8 +131,7 @@ class SessionToolRuntime:
                 normalized_key = re.sub(r"[_-]", "", str(key).lower())
                 redacted[key] = (
                     "[REDACTED]"
-                    if normalized_key in _SECRET_KEYS
-                    or any(normalized_key.endswith(suffix) for suffix in _SECRET_KEY_SUFFIXES)
+                    if cls._is_sensitive_key(normalized_key)
                     else cls.redact_payload(item)
                 )
             return redacted
@@ -150,6 +140,15 @@ class SessionToolRuntime:
         if isinstance(value, str):
             return cls.redact_text(value)
         return value
+
+    @staticmethod
+    def _is_sensitive_key(normalized_key: str) -> bool:
+        return (
+            "authorization" in normalized_key
+            or normalized_key.endswith(("token", "password", "credential", "credentials", "apikey"))
+            or normalized_key.endswith("secret")
+            or ("secret" in normalized_key and normalized_key.endswith("key"))
+        )
 
     @staticmethod
     def redact_text(value: str) -> str:

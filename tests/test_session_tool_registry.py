@@ -284,6 +284,9 @@ def test_session_runtime_public_redaction_handles_secret_key_variants_without_fa
         "api-key": "dash-secret",
         "apiKey": "camel-secret",
         "apikey": "compact-secret",
+        "authorization_header": "Digest username=visible",
+        "client_credentials": "client-secret",
+        "aws_secret_access_key": "aws-secret",
         "nested": [
             {"access_token": "access-secret"},
             {"access-token": "dash-access-secret"},
@@ -300,6 +303,9 @@ def test_session_runtime_public_redaction_handles_secret_key_variants_without_fa
         "api-key": "[REDACTED]",
         "apiKey": "[REDACTED]",
         "apikey": "[REDACTED]",
+        "authorization_header": "[REDACTED]",
+        "client_credentials": "[REDACTED]",
+        "aws_secret_access_key": "[REDACTED]",
         "nested": [
             {"access_token": "[REDACTED]"},
             {"access-token": "[REDACTED]"},
@@ -345,7 +351,7 @@ def test_session_runtime_emits_paired_bounded_tool_events():
         ),
         (
             "before Authorization: Digest digest-credential, after",
-            "before Authorization: [REDACTED], after",
+            "before Authorization: [REDACTED]",
         ),
         (
             "before authorization=Bearer whitespace-credential; after",
@@ -372,6 +378,31 @@ def test_session_runtime_redacts_full_authorization_assignment(message, redacted
 
     completed = next(event for event in events if event["type"] == "tool_end")
     assert completed["payload"]["summary"] == redacted
+
+
+@pytest.mark.parametrize(
+    ("message", "redacted"),
+    [
+        (
+            'before authorization=Digest username="u", realm="r", response="secret"; safe after',
+            "before authorization=[REDACTED]; safe after",
+        ),
+        (
+            "before authorization: ApiKey secret; safe after",
+            "before authorization: [REDACTED]; safe after",
+        ),
+        (
+            "before authorization=Token secret; safe after",
+            "before authorization=[REDACTED]; safe after",
+        ),
+        (
+            "before authorization=Negotiate secret; safe after",
+            "before authorization=[REDACTED]; safe after",
+        ),
+    ],
+)
+def test_session_runtime_redacts_authorization_values_without_scheme_enumeration(message, redacted):
+    assert SessionToolRuntime.redact_text(message) == redacted
 
 
 def test_session_runtime_redacts_secrets_from_tool_previews_and_errors():
