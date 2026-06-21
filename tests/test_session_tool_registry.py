@@ -190,6 +190,38 @@ def test_session_runtime_background_task_keeps_originating_turn_context():
     assert [event["run_id"] for event in events] == ["first", "first"]
 
 
+def test_session_runtime_closed_background_turn_cannot_emit_or_invoke_into_new_turn():
+    events = []
+    executed = []
+    runtime = SessionToolRuntime(state=SessionState(), event_callback=events.append)
+
+    async def scenario():
+        first = runtime.begin_turn(runtime.event_emitter.scope("main", run_id="first"), CancellationContext())
+        release = asyncio.Event()
+
+        async def invoke_after_first_ends():
+            await release.wait()
+            runtime.emit_event("reasoning", summary="too late")
+            with pytest.raises(TurnCancelled, match="ended"):
+                await runtime.invoke_tool(
+                    "inspect",
+                    {},
+                    lambda: executed.append("ran") or {"ok": True},
+                )
+
+        child = asyncio.create_task(invoke_after_first_ends())
+        runtime.end_turn(first)
+        second = runtime.begin_turn(runtime.event_emitter.scope("main", run_id="second"), CancellationContext())
+        release.set()
+        await child
+        runtime.end_turn(second)
+
+    asyncio.run(scenario())
+
+    assert executed == []
+    assert events == []
+
+
 def test_session_runtime_idle_inspection_ignores_stale_child_binding():
     runtime = SessionToolRuntime(state=SessionState())
 
@@ -210,7 +242,8 @@ def test_session_runtime_idle_inspection_ignores_stale_child_binding():
 
     assert active_scope is None
     assert active_cancellation is None
-    assert bound_context is turn
+    assert bound_context is None
+    assert turn.closed is True
 
 
 def test_session_runtime_emit_event_uses_normalized_active_scope():
@@ -262,7 +295,15 @@ def test_session_runtime_redacts_secrets_from_tool_previews_and_errors():
         runtime.invoke_tool(
             "inspect",
             {"API_KEY": "args-secret", "nested": [{"Authorization": "Bearer hidden"}]},
-            lambda: {"ok": True, "token": "result-secret", "message": "safe"},
+            lambda: {
+                "ok": True,
+                "token": "result-secret",
+                "message": (
+                    "use safe mode; authorization=Bearer-visible-secret; "
+                    "password:password-visible; API-Key:dash-visible; ToKeN=case-visible; "
+                    "credential:cred-visible; Bearer standalone-visible; note remains"
+                ),
+            },
         )
     )
 
@@ -282,9 +323,18 @@ def test_session_runtime_redacts_secrets_from_tool_previews_and_errors():
     assert "args-secret" not in serialized
     assert "Bearer hidden" not in serialized
     assert "result-secret" not in serialized
+    assert "Bearer-visible-secret" not in serialized
+    assert "password-visible" not in serialized
+    assert "dash-visible" not in serialized
+    assert "case-visible" not in serialized
+    assert "cred-visible" not in serialized
+    assert "standalone-visible" not in serialized
     assert "hunter2" not in serialized
     assert "interrupt-secret" not in serialized
     assert serialized.count("[REDACTED]") >= 3
+    completed = next(event for event in events if event["type"] == "tool_end")
+    assert "use safe mode" in completed["payload"]["summary"]
+    assert "note remains" in completed["payload"]["summary"]
     assert [event["payload"]["summary"] for event in events if event["type"] == "tool_end"][-2:] == [
         "Tool execution failed.",
         "Tool execution interrupted.",

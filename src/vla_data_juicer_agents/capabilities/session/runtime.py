@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import inspect
 import json
+import re
 import threading
 from collections.abc import Awaitable, Callable, Mapping
 from contextvars import ContextVar
@@ -24,6 +25,13 @@ _SECRET_KEY_PARTS = (
     "authorization",
     "credential",
 )
+_SECRET_ASSIGNMENT_PATTERN = re.compile(
+    r"\b(api[_-]?key|token|password|secret|authorization|credential)\b"
+    r"(\s*[=:]\s*)"
+    r"(?:Bearer(?:\s+|-)[^\s,;]+|\"[^\"]*\"|'[^']*'|[^\s,;]+)",
+    flags=re.IGNORECASE,
+)
+_BEARER_PATTERN = re.compile(r"\b(Bearer)(?:\s+|-)[^\s,;]+", flags=re.IGNORECASE)
 
 
 @dataclass
@@ -37,6 +45,14 @@ class TurnContext:
     scope: EventScope
     cancellation: CancellationContext
     owner_id: str
+    _closed: threading.Event = field(default_factory=threading.Event, repr=False, compare=False)
+
+    @property
+    def closed(self) -> bool:
+        return self._closed.is_set()
+
+    def close(self) -> None:
+        self._closed.set()
 
 
 class SessionToolRuntime:
@@ -74,9 +90,10 @@ class SessionToolRuntime:
     def turn_context(self) -> TurnContext | None:
         bound = self._bound_context.get()
         if bound is not None:
-            return bound
+            return None if bound.closed else bound
         with self._turn_lock:
-            return self._active_context
+            active = self._active_context
+            return active if active is not None and not active.closed else None
 
     def begin_turn(self, scope: EventScope, cancellation: CancellationContext) -> TurnContext:
         context = TurnContext(scope=scope, cancellation=cancellation, owner_id=f"turn_{uuid4().hex}")
@@ -86,6 +103,7 @@ class SessionToolRuntime:
         return context
 
     def end_turn(self, context: TurnContext) -> None:
+        context.close()
         bound = self._bound_context.get()
         if bound is not None and bound.owner_id == context.owner_id:
             self._bound_context.set(None)
@@ -121,12 +139,22 @@ class SessionToolRuntime:
             return redacted
         if isinstance(value, (list, tuple, set, frozenset)):
             return [cls._redact(item) for item in value]
+        if isinstance(value, str):
+            return cls._redact_string(value)
         return value
+
+    @staticmethod
+    def _redact_string(value: str) -> str:
+        redacted = _SECRET_ASSIGNMENT_PATTERN.sub(
+            lambda match: f"{match.group(1)}{match.group(2)}[REDACTED]",
+            value,
+        )
+        return _BEARER_PATTERN.sub(lambda match: f"{match.group(1)} [REDACTED]", redacted)
 
     @classmethod
     def _preview(cls, value: Any) -> str:
         if isinstance(value, str):
-            text = value
+            text = cls._redact_string(value)
             return text if len(text) <= _PREVIEW_LIMIT else text[: _PREVIEW_LIMIT - 3] + "..."
         try:
             text = json.dumps(cls._redact(value), ensure_ascii=False, default=str)
@@ -141,6 +169,9 @@ class SessionToolRuntime:
         fn: Callable[[], dict[str, Any] | Awaitable[dict[str, Any]]],
     ) -> dict[str, Any]:
         call_id = f"tool_{uuid4().hex[:10]}"
+        bound = self._bound_context.get()
+        if bound is not None and bound.closed:
+            raise TurnCancelled("The originating session turn has ended.")
         context = self.turn_context()
         scope = context.scope if context is not None else None
         cancellation = context.cancellation if context is not None else None
