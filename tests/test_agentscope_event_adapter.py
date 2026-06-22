@@ -68,6 +68,24 @@ def test_tool_result_maps_non_success_states(state, status):
     assert events[-1]["payload"]["status"] == status
 
 
+def test_tool_result_success_with_false_ok_payload_maps_failed():
+    scope, events = _scope_and_events()
+    adapter = AgentScopeEventAdapter(scope)
+
+    adapter.accept(SimpleNamespace(type="TOOL_RESULT_START", tool_call_id="call-1", tool_call_name="track"))
+    adapter.accept(
+        SimpleNamespace(
+            type="TOOL_RESULT_TEXT_DELTA",
+            tool_call_id="call-1",
+            delta='{"ok": false, "message": "Tracking failed."}',
+        )
+    )
+    adapter.accept(SimpleNamespace(type="TOOL_RESULT_END", tool_call_id="call-1", state="success"))
+
+    assert events[-1]["payload"]["status"] == "failed"
+    assert "Tracking failed." in events[-1]["payload"]["summary"]
+
+
 def test_emit_tool_events_false_suppresses_tool_events():
     scope, events = _scope_and_events()
     adapter = AgentScopeEventAdapter(scope, emit_tool_events=False)

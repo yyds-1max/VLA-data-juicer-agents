@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import re
 from dataclasses import dataclass, field
 
@@ -98,12 +99,13 @@ class AgentScopeEventAdapter:
         elif event_type == "TOOL_RESULT_END":
             state = self._tools.pop(call_id, _ToolState())
             if self._emit_tool_events and state.started:
+                result_text = "".join(state.result)
                 self._scope.emit(
                     "tool_end",
                     tool=state.name,
                     call_id=call_id,
-                    status=self._tool_status(getattr(event, "state", "success")),
-                    summary=summarize_progress("".join(state.result)),
+                    status=self._tool_status(getattr(event, "state", "success"), result_text),
+                    summary=summarize_progress(result_text),
                 )
 
     def close_active_tools(self, status: str) -> None:
@@ -123,11 +125,22 @@ class AgentScopeEventAdapter:
                 )
 
     @staticmethod
-    def _tool_status(state: object) -> str:
+    def _tool_status(state: object, result_text: str = "") -> str:
         value = getattr(state, "value", state)
         normalized = _text(value).lower()
         if normalized == "interrupted":
             return "interrupted"
-        if normalized in {"success", "completed"}:
+        if normalized in {"success", "completed"} and not _result_payload_failed(result_text):
             return "completed"
         return "failed"
+
+
+def _result_payload_failed(result_text: str) -> bool:
+    text = result_text.strip()
+    if not text:
+        return False
+    try:
+        payload = json.loads(text)
+    except json.JSONDecodeError:
+        return False
+    return isinstance(payload, dict) and payload.get("ok") is False
