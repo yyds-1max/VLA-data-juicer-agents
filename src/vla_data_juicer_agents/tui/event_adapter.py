@@ -60,6 +60,17 @@ def apply_event(state: TuiState, event: dict[str, Any]) -> None:
             source=source,
             started_at=timestamp,
         )
+        state.timeline.append(
+            TimelineItem(
+                kind="agent",
+                source_label=label,
+                text="started",
+                status="started",
+                timestamp=timestamp,
+                run_id=run_id,
+                parent_run_id=parent_run_id,
+            ),
+        )
         return
 
     if event_type == "agent_end":

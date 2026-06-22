@@ -124,6 +124,26 @@ def test_spinner_prefers_oldest_tool_then_deepest_active_agent():
     assert state.spinner_text() == "[Plan] running classify"
 
 
+def test_agent_start_adds_lifecycle_item_and_still_drives_spinner():
+    state = TuiState()
+
+    apply_event(
+        state,
+        event(
+            "agent_start",
+            "navigation.plan",
+            run_id="plan_run",
+            parent_run_id="main_run",
+        ),
+    )
+
+    assert state.spinner_text() == "[Plan] thinking"
+    assert state.timeline[-1].kind == "agent"
+    assert state.timeline[-1].status == "started"
+    assert state.timeline[-1].text == "started"
+    assert state.timeline[-1].source_label == "Plan"
+
+
 def test_tools_with_same_call_id_are_scoped_to_their_run():
     state = TuiState()
     apply_event(

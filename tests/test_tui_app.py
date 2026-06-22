@@ -9,10 +9,11 @@ from rich.console import Console
 
 from vla_data_juicer_agents.tui.app import (
     _ThinkingSpinner,
+    _run_turn,
     _render_timeline_item,
     run_tui_session,
 )
-from vla_data_juicer_agents.tui.models import TimelineItem
+from vla_data_juicer_agents.tui.models import TimelineItem, TuiState
 
 
 def event(
@@ -280,6 +281,36 @@ def test_keyboard_interrupt_while_turn_runs_requests_interrupt_once():
     assert controller.messages == ["do work"]
     assert controller.interrupt_calls == 1
     assert not thread.is_alive()
+
+
+def test_keyboard_interrupt_after_turn_completion_consumes_result():
+    stream = io.StringIO()
+
+    class InterruptingConsole(Console):
+        def print(self, *args, **kwargs):
+            text = "".join(str(arg) for arg in args)
+            if "completed final" in text:
+                raise KeyboardInterrupt
+            return super().print(*args, **kwargs)
+
+    controller = FakeController()
+    controller.running_polls = [False]
+    controller.events_by_message = [[event("final", text="completed final", stop=False)]]
+    result = SimpleNamespace(text="raw final", stop=False, interrupted=False)
+    controller.results = [result]
+
+    returned = _run_turn(
+        controller=controller,
+        message="finish",
+        state=TuiState(),
+        console=InterruptingConsole(file=stream, force_terminal=True),
+        spinner=_ThinkingSpinner(stream=stream),
+    )
+
+    assert returned is None
+    assert controller.messages == ["finish"]
+    assert controller.results == []
+    assert controller.interrupt_calls == 0
 
 
 @pytest.mark.parametrize("exit_word", ["exit", "quit", "q", "退出"])

@@ -213,6 +213,11 @@ def _run_turn(
         return result
     except KeyboardInterrupt:
         spinner.clear()
+        if not controller.is_running:
+            try:
+                controller.consume_turn_result()
+            except RuntimeError:
+                pass
         console.print("No running task to interrupt.")
         return None
 
