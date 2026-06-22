@@ -76,6 +76,14 @@ Interactive mode is also available:
 vla-data-agent
 ```
 
+Controls:
+- Ctrl+D: exit the session at the input prompt
+- exit / quit / q / 退出: end the session normally
+- Ctrl+C: interrupt the current turn and keep the session open
+
+The transcript shows grouped Main, Workflow, Plan, and Executor progress summaries and tool events.
+`vla-nav-agent plan/run` remains the command-oriented navigation diagnostic entry point.
+
 The conversational Agent requires normal LLM settings such as `DASHSCOPE_API_KEY`; it does not provide a deterministic `--no-llm` router path.
 
 ## Runtime isolation
