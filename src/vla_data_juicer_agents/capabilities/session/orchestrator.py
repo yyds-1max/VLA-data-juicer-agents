@@ -116,7 +116,7 @@ class VLASessionAgent:
         interrupted: bool = False,
     ) -> SessionReply:
         safe_text = self._tool_runtime.redact_text(text)
-        scope.emit("final", text=safe_text, stop=stop)
+        scope.emit("final", text=safe_text, stop=stop, interrupted=interrupted)
         try:
             self.state.history.append({"role": "assistant", "content": safe_text})
         except Exception:

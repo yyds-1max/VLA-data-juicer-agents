@@ -604,7 +604,11 @@ def test_session_exit_aliases_emit_one_final_and_stop(alias):
     assert reply.stop is True
     assert reply.interrupted is False
     assert [event["type"] for event in events] == ["final"]
-    assert events[0]["payload"] == {"text": "Session ended.", "stop": True}
+    assert events[0]["payload"] == {
+        "text": "Session ended.",
+        "stop": True,
+        "interrupted": False,
+    }
     assert session.state.history[-1] == {"role": "assistant", "content": reply.text}
 
 
@@ -627,7 +631,11 @@ def test_session_help_and_failure_each_emit_exactly_one_final():
     assert failed_reply.interrupted is False
     assert failed_reply.text == "Session turn failed. Please try again."
     assert [event["type"] for event in events].count("final") == 2
-    assert events[-1]["payload"] == {"text": failed_reply.text, "stop": False}
+    assert events[-1]["payload"] == {
+        "text": failed_reply.text,
+        "stop": False,
+        "interrupted": False,
+    }
     assert session.state.history[-1] == {"role": "assistant", "content": failed_reply.text}
     assert help_reply.text == session.state.history[1]["content"]
 
@@ -686,7 +694,11 @@ def test_session_history_failure_cannot_suppress_final_event():
     serialized = json.dumps(events, ensure_ascii=False)
     assert reply.text == "Session turn failed. Please try again."
     assert [event["type"] for event in events] == ["final"]
-    assert events[0]["payload"] == {"text": reply.text, "stop": False}
+    assert events[0]["payload"] == {
+        "text": reply.text,
+        "stop": False,
+        "interrupted": False,
+    }
     assert "private-value" not in serialized
     assert session.request_interrupt() is False
 
@@ -730,6 +742,7 @@ def test_session_request_interrupt_is_idle_safe_and_active_turn_is_reusable():
     assert interrupted.stop is False
     assert interrupted.interrupted is True
     assert "中断" in interrupted.text
+    assert events[-1]["payload"]["interrupted"] is True
     assert session.request_interrupt() is False
 
     resumed = asyncio.run(session.handle_message_async("continue"))
@@ -755,6 +768,7 @@ def test_session_pending_interrupt_is_applied_when_turn_installs_cancellation():
     assert "中断" in reply.text
     assert session.request_interrupt() is False
     assert [event["type"] for event in events] == ["final"]
+    assert events[0]["payload"]["interrupted"] is True
 
 
 def test_session_late_pending_interrupt_does_not_leak_into_next_turn():

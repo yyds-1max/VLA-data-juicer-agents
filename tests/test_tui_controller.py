@@ -5,6 +5,7 @@ from types import SimpleNamespace
 
 import pytest
 
+from vla_data_juicer_agents.capabilities.session.orchestrator import VLASessionAgent
 from vla_data_juicer_agents.tui.controller import SessionController
 
 
@@ -245,7 +246,11 @@ def test_worker_exception_emits_one_final_event_and_keeps_controller_reusable():
     assert failed.stop is False
     assert failed.text == "Session turn failed: model disconnected"
     assert [(event["type"], event["source"]) for event in events] == [("final", "main")]
-    assert events[0]["payload"] == {"text": failed.text, "stop": False}
+    assert events[0]["payload"] == {
+        "text": failed.text,
+        "stop": False,
+        "interrupted": False,
+    }
 
     recovered = run_turn(controller, "second")
     assert recovered.text == "second"
@@ -268,10 +273,34 @@ def test_worker_cancelled_error_still_produces_one_final_and_consumable_result()
     assert result.stop is False
     assert result.interrupted is False
     assert [event["type"] for event in events] == ["final"]
-    assert events[0]["payload"] == {"text": result.text, "stop": False}
+    assert events[0]["payload"] == {
+        "text": result.text,
+        "stop": False,
+        "interrupted": False,
+    }
 
 
-def test_exception_after_final_keeps_displayed_result_without_duplicate_final():
+def test_process_level_base_exception_propagates_without_synthetic_final():
+    class ExitingAgent(FakeAgent):
+        def handle_message(self, message):
+            raise SystemExit("shutdown requested")
+
+    controller = SessionController(agent_factory=lambda **kwargs: ExitingAgent(kwargs["event_callback"]))
+    controller.start()
+
+    with pytest.raises(SystemExit, match="shutdown requested"):
+        controller._run_turn("exit now")
+
+    assert controller.drain_events() == []
+
+
+@pytest.mark.parametrize(
+    ("stop", "interrupted"),
+    [(True, False), (False, True)],
+)
+def test_exception_after_final_keeps_complete_terminal_result_without_duplicate_final(
+    stop, interrupted
+):
     class FinalThenFailAgent(FakeAgent):
         def handle_message(self, message):
             self.messages.append(message)
@@ -283,7 +312,11 @@ def test_exception_after_final_keeps_displayed_result_without_duplicate_final():
                         "run_id": "run_1",
                         "parent_run_id": None,
                         "timestamp": "2026-06-22T00:00:00+00:00",
-                        "payload": {"text": "already displayed", "stop": False},
+                        "payload": {
+                            "text": "already displayed",
+                            "stop": stop,
+                            "interrupted": interrupted,
+                        },
                     }
                 )
                 raise RuntimeError("late cleanup failure")
@@ -296,6 +329,55 @@ def test_exception_after_final_keeps_displayed_result_without_duplicate_final():
     events = controller.drain_events()
 
     assert result.text == "already displayed"
-    assert result.stop is False
+    assert result.stop is stop
+    assert result.interrupted is interrupted
     assert [event["type"] for event in events] == ["final"]
     assert run_turn(controller, "second").text == "second"
+
+
+def test_real_session_agent_accepts_pending_interrupt_and_clears_it_for_next_turn():
+    entered_handle = threading.Event()
+    allow_cancellation_install = threading.Event()
+    created = {}
+
+    class ControlledStreamAgent:
+        async def reply_stream(self, msg):
+            del msg
+            yield SimpleNamespace(type="TEXT_BLOCK_DELTA", delta="next turn completed")
+            yield SimpleNamespace(type="REPLY_END", reply_id="reply")
+
+    def factory(**kwargs):
+        session = VLASessionAgent(
+            use_llm_router=False,
+            working_dir=kwargs["working_dir"],
+            model=kwargs["model"],
+            event_callback=kwargs["event_callback"],
+        )
+        session._react_agent = ControlledStreamAgent()
+        real_handle_message = session.handle_message
+
+        def gated_handle_message(message):
+            entered_handle.set()
+            assert allow_cancellation_install.wait(timeout=2)
+            return real_handle_message(message)
+
+        session.handle_message = gated_handle_message
+        created["session"] = session
+        return session
+
+    controller = SessionController(agent_factory=factory)
+    controller.start()
+    controller.submit_turn("first")
+    assert entered_handle.wait(timeout=1)
+
+    assert controller.request_interrupt() is True
+    allow_cancellation_install.set()
+    wait_until_idle(controller)
+
+    interrupted = controller.consume_turn_result()
+    assert interrupted.interrupted is True
+
+    resumed = run_turn(controller, "second")
+    assert resumed.text == "next turn completed"
+    assert resumed.interrupted is False
+    assert created["session"].request_interrupt(allow_pending=True) is False

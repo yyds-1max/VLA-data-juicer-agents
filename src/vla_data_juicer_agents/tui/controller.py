@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import queue
 import threading
 from copy import deepcopy
@@ -119,8 +120,29 @@ class SessionController:
                 self._turn_final_reply = SessionReply(
                     text=str(payload.get("text", "")),
                     stop=bool(payload.get("stop", False)),
+                    interrupted=bool(payload.get("interrupted", False)),
                 )
         self._events.put(copied)
+
+    def _failure_result(self, exc: BaseException) -> SessionReply:
+        detail = str(exc) or type(exc).__name__
+        text = f"Session turn failed: {detail}"
+        with self._lock:
+            emitted_final = self._turn_emitted_final
+            final_reply = self._turn_final_reply
+        result = final_reply or SessionReply(text=text, stop=False)
+        if not emitted_final:
+            self._on_agent_event(
+                {
+                    "type": "final",
+                    "source": "main",
+                    "run_id": f"turn_{uuid4().hex}",
+                    "parent_run_id": None,
+                    "timestamp": datetime.now(timezone.utc).isoformat(timespec="milliseconds"),
+                    "payload": {"text": text, "stop": False, "interrupted": False},
+                }
+            )
+        return result
 
     def _run_turn(self, message: str) -> None:
         with self._lock:
@@ -129,23 +151,9 @@ class SessionController:
             return
         try:
             result = agent.handle_message(message)
-        except BaseException as exc:
-            detail = str(exc) or type(exc).__name__
-            text = f"Session turn failed: {detail}"
-            with self._lock:
-                emitted_final = self._turn_emitted_final
-                final_reply = self._turn_final_reply
-            result = final_reply or SessionReply(text=text, stop=False)
-            if not emitted_final:
-                self._on_agent_event(
-                    {
-                        "type": "final",
-                        "source": "main",
-                        "run_id": f"turn_{uuid4().hex}",
-                        "parent_run_id": None,
-                        "timestamp": datetime.now(timezone.utc).isoformat(timespec="milliseconds"),
-                        "payload": {"text": text, "stop": False},
-                    }
-                )
+        except asyncio.CancelledError as exc:
+            result = self._failure_result(exc)
+        except Exception as exc:
+            result = self._failure_result(exc)
         with self._lock:
             self._result = result
