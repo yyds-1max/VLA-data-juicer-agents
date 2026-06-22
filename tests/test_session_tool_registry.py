@@ -742,6 +742,34 @@ def test_session_request_interrupt_is_idle_safe_and_active_turn_is_reusable():
     ]
 
 
+def test_session_pending_interrupt_is_applied_when_turn_installs_cancellation():
+    events = []
+    session = VLASessionAgent(use_llm_router=False, event_callback=events.append)
+
+    session.prepare_turn()
+    assert session.request_interrupt(allow_pending=True) is True
+
+    reply = asyncio.run(session.handle_message_async("help"))
+
+    assert reply.interrupted is True
+    assert "中断" in reply.text
+    assert session.request_interrupt() is False
+    assert [event["type"] for event in events] == ["final"]
+
+
+def test_session_late_pending_interrupt_does_not_leak_into_next_turn():
+    session = VLASessionAgent(use_llm_router=False)
+
+    session.prepare_turn()
+    first = asyncio.run(session.handle_message_async("help"))
+    assert first.interrupted is False
+
+    assert session.request_interrupt(allow_pending=True) is False
+    second = asyncio.run(session.handle_message_async("help"))
+
+    assert second.interrupted is False
+
+
 def test_session_outer_tool_events_are_normalized_without_stream_duplicates():
     events = []
     session = VLASessionAgent(use_llm_router=False, event_callback=events.append)

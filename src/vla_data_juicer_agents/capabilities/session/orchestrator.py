@@ -43,6 +43,8 @@ class VLASessionAgent:
         self._react_agent = self.build_react_agent() if use_llm_router else None
         self._turn_lock = threading.RLock()
         self._active_cancellation: CancellationContext | None = None
+        self._turn_scheduled = False
+        self._pending_interrupt = False
 
     def session_system_prompt(self) -> str:
         return (
@@ -89,9 +91,20 @@ class VLASessionAgent:
     def _simple_reply(text: str, *, stop: bool = False, interrupted: bool = False) -> SessionReply:
         return SessionReply(text=text, stop=stop, interrupted=interrupted)
 
-    def request_interrupt(self) -> bool:
+    def prepare_turn(self) -> None:
+        with self._turn_lock:
+            if self._turn_scheduled or self._active_cancellation is not None:
+                raise RuntimeError("A session turn is already active.")
+            self._turn_scheduled = True
+
+    def request_interrupt(self, *, allow_pending: bool = False) -> bool:
         with self._turn_lock:
             cancellation = self._active_cancellation
+            if cancellation is None and allow_pending and self._turn_scheduled:
+                if self._pending_interrupt:
+                    return False
+                self._pending_interrupt = True
+                return True
         return cancellation.cancel() if cancellation is not None else False
 
     def _record_reply(
@@ -111,17 +124,23 @@ class VLASessionAgent:
         return self._simple_reply(safe_text, stop=stop, interrupted=interrupted)
 
     async def handle_message_async(self, message: str) -> SessionReply:
-        text = message.strip()
-        if not text:
-            return self._simple_reply("Please enter a non-empty message.")
         scope = self._tool_runtime.event_emitter.scope("main")
         cancellation = CancellationContext()
         with self._turn_lock:
             if self._active_cancellation is not None:
                 raise RuntimeError("A session turn is already active.")
             self._active_cancellation = cancellation
+            self._turn_scheduled = False
+            pending_interrupt = self._pending_interrupt
+            self._pending_interrupt = False
+        if pending_interrupt:
+            cancellation.cancel()
         turn = None
         try:
+            cancellation.raise_if_cancelled()
+            text = message.strip()
+            if not text:
+                return self._simple_reply("Please enter a non-empty message.")
             turn = self._tool_runtime.begin_turn(scope, cancellation)
             self.state.history.append({"role": "user", "content": text})
             lowered = text.lower()

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import queue
 import threading
+from copy import deepcopy
 from collections.abc import Callable
 from datetime import datetime, timezone
 from typing import Any
@@ -30,9 +31,11 @@ class SessionController:
         self._events: queue.Queue[dict[str, Any]] = queue.Queue()
         self._lock = threading.RLock()
         self._agent: VLASessionAgent | None = None
+        self._agent_supports_pending_interrupt = False
         self._worker: threading.Thread | None = None
         self._result: SessionReply | None = None
         self._turn_emitted_final = False
+        self._turn_final_reply: SessionReply | None = None
 
     def start(self) -> None:
         with self._lock:
@@ -43,6 +46,9 @@ class SessionController:
                 working_dir=self._working_dir,
                 model=self._model,
                 event_callback=self._on_agent_event,
+            )
+            self._agent_supports_pending_interrupt = callable(
+                getattr(self._agent, "prepare_turn", None)
             )
 
     @property
@@ -60,7 +66,10 @@ class SessionController:
                 if self._result is not None:
                     raise RuntimeError("Consume the completed turn result before starting another turn.")
             self._turn_emitted_final = False
+            self._turn_final_reply = None
             self._result = None
+            if self._agent_supports_pending_interrupt:
+                self._agent.prepare_turn()
             self._worker = threading.Thread(
                 target=self._run_turn,
                 args=(message,),
@@ -96,13 +105,21 @@ class SessionController:
             if self._worker is None or not self._worker.is_alive() or self._agent is None:
                 return False
             agent = self._agent
+            supports_pending = self._agent_supports_pending_interrupt
+        if supports_pending:
+            return agent.request_interrupt(allow_pending=True)
         return agent.request_interrupt()
 
     def _on_agent_event(self, event: dict[str, Any]) -> None:
-        copied = dict(event)
+        copied = deepcopy(event)
         with self._lock:
             if copied.get("type") == "final":
                 self._turn_emitted_final = True
+                payload = copied.get("payload", {})
+                self._turn_final_reply = SessionReply(
+                    text=str(payload.get("text", "")),
+                    stop=bool(payload.get("stop", False)),
+                )
         self._events.put(copied)
 
     def _run_turn(self, message: str) -> None:
@@ -112,11 +129,13 @@ class SessionController:
             return
         try:
             result = agent.handle_message(message)
-        except Exception as exc:
-            text = f"Session turn failed: {exc}"
-            result = SessionReply(text=text, stop=False)
+        except BaseException as exc:
+            detail = str(exc) or type(exc).__name__
+            text = f"Session turn failed: {detail}"
             with self._lock:
                 emitted_final = self._turn_emitted_final
+                final_reply = self._turn_final_reply
+            result = final_reply or SessionReply(text=text, stop=False)
             if not emitted_final:
                 self._on_agent_event(
                     {
