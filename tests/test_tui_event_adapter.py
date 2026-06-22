@@ -124,6 +124,100 @@ def test_spinner_prefers_oldest_tool_then_deepest_active_agent():
     assert state.spinner_text() == "[Plan] running classify"
 
 
+def test_tools_with_same_call_id_are_scoped_to_their_run():
+    state = TuiState()
+    apply_event(
+        state,
+        event(
+            "tool_start",
+            "navigation.plan",
+            run_id="plan_run",
+            call_id="shared",
+            tool="classify",
+        ),
+    )
+    apply_event(
+        state,
+        event(
+            "tool_start",
+            "navigation.executor",
+            run_id="executor_run",
+            call_id="shared",
+            tool="inspect",
+        ),
+    )
+
+    assert len(state.active_tools) == 2
+    assert state.spinner_text() == "[Plan] running classify"
+
+    apply_event(
+        state,
+        event(
+            "tool_end",
+            "navigation.plan",
+            run_id="plan_run",
+            call_id="shared",
+            tool="classify",
+        ),
+    )
+
+    assert list(state.active_tools) == [("executor_run", "shared")]
+    assert state.spinner_text() == "[Executor] running inspect"
+
+
+def test_tool_end_clears_order_and_reused_identity_gets_new_priority():
+    state = TuiState()
+    apply_event(
+        state,
+        event(
+            "tool_start",
+            "navigation.plan",
+            run_id="plan_run",
+            call_id="reused",
+            tool="first",
+        ),
+    )
+    apply_event(
+        state,
+        event(
+            "tool_start",
+            "navigation.executor",
+            run_id="executor_run",
+            call_id="other",
+            tool="second",
+        ),
+    )
+    apply_event(
+        state,
+        event(
+            "tool_end",
+            "navigation.plan",
+            run_id="plan_run",
+            call_id="reused",
+            tool="first",
+        ),
+    )
+
+    assert state.tool_call_order == [("executor_run", "other")]
+
+    apply_event(
+        state,
+        event(
+            "tool_start",
+            "navigation.plan",
+            run_id="plan_run",
+            call_id="reused",
+            tool="third",
+        ),
+    )
+
+    assert state.tool_call_order == [
+        ("executor_run", "other"),
+        ("plan_run", "reused"),
+    ]
+    assert state.spinner_text() == "[Executor] running second"
+
+
 def test_agent_end_removes_active_agent_and_adds_lifecycle_item():
     state = TuiState()
     apply_event(

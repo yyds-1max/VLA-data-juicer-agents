@@ -82,7 +82,8 @@ def apply_event(state: TuiState, event: dict[str, Any]) -> None:
         call_id = str(payload.get("call_id", "")).strip()
         if not call_id:
             return
-        state.active_tools[call_id] = ToolCallState(
+        tool_identity = (run_id, call_id)
+        state.active_tools[tool_identity] = ToolCallState(
             call_id=call_id,
             tool=str(payload.get("tool", "unknown_tool")).strip() or "unknown_tool",
             source=source,
@@ -91,13 +92,16 @@ def apply_event(state: TuiState, event: dict[str, Any]) -> None:
             started_at=timestamp,
             args_preview=str(payload.get("args", "")).strip(),
         )
-        if call_id not in state.tool_call_order:
-            state.tool_call_order.append(call_id)
+        if tool_identity not in state.tool_call_order:
+            state.tool_call_order.append(tool_identity)
         return
 
     if event_type == "tool_end":
         call_id = str(payload.get("call_id", "")).strip()
-        active = state.active_tools.pop(call_id, None)
+        tool_identity = (run_id, call_id)
+        active = state.active_tools.pop(tool_identity, None)
+        if tool_identity in state.tool_call_order:
+            state.tool_call_order.remove(tool_identity)
         tool = str(payload.get("tool", "")).strip() or (
             active.tool if active is not None else "unknown_tool"
         )

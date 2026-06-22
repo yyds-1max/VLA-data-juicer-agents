@@ -52,14 +52,14 @@ class TimelineItem:
 class TuiState:
     timeline: list[TimelineItem] = field(default_factory=list)
     active_agents: dict[str, AgentState] = field(default_factory=dict)
-    active_tools: dict[str, ToolCallState] = field(default_factory=dict)
-    tool_call_order: list[str] = field(default_factory=list)
+    active_tools: dict[tuple[str, str], ToolCallState] = field(default_factory=dict)
+    tool_call_order: list[tuple[str, str]] = field(default_factory=list)
     stop: bool = False
     _final_runs: set[str] = field(default_factory=set, repr=False)
 
     def spinner_text(self) -> str:
-        for call_id in self.tool_call_order:
-            tool = self.active_tools.get(call_id)
+        for tool_identity in self.tool_call_order:
+            tool = self.active_tools.get(tool_identity)
             if tool is not None:
                 return f"[{source_label(tool.source)}] running {tool.tool}"
 
