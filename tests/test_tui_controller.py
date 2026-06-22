@@ -45,7 +45,7 @@ class FakeAgent:
         return True
 
 
-def test_controller_reuses_one_agent_for_two_turns():
+def test_controller_start_is_idempotent_and_reuses_one_agent_for_two_turns():
     created = []
 
     def factory(**kwargs):
@@ -59,6 +59,7 @@ def test_controller_reuses_one_agent_for_two_turns():
         agent_factory=factory,
     )
 
+    controller.start()
     controller.start()
     first = run_turn(controller, "first")
     second = run_turn(controller, "second")
