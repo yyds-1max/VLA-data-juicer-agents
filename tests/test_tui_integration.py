@@ -262,12 +262,26 @@ def test_controller_events_render_approved_main_workflow_plan_executor_chain():
         ("tool_end", "main"),
         ("final", "main"),
     ]
-    assert {event["run_id"]: event["parent_run_id"] for event in events} == {
-        "main_1": None,
-        "workflow_1": "main_1",
-        "plan_1": "workflow_1",
-        "executor_1": "workflow_1",
-    }
+    assert [
+        (event["source"], event["run_id"], event["parent_run_id"]) for event in events
+    ] == [
+        ("main", "main_1", None),
+        ("main", "main_1", None),
+        ("navigation.workflow", "workflow_1", "main_1"),
+        ("navigation.plan", "plan_1", "workflow_1"),
+        ("navigation.plan", "plan_1", "workflow_1"),
+        ("navigation.plan", "plan_1", "workflow_1"),
+        ("navigation.plan", "plan_1", "workflow_1"),
+        ("navigation.plan", "plan_1", "workflow_1"),
+        ("navigation.executor", "executor_1", "workflow_1"),
+        ("navigation.executor", "executor_1", "workflow_1"),
+        ("navigation.executor", "executor_1", "workflow_1"),
+        ("navigation.executor", "executor_1", "workflow_1"),
+        ("navigation.executor", "executor_1", "workflow_1"),
+        ("navigation.workflow", "workflow_1", "main_1"),
+        ("main", "main_1", None),
+        ("main", "main_1", None),
+    ]
 
     tool_completions = [
         item for item in state.timeline if item.kind == "tool" and item.tool == "vla_run_workflow"
