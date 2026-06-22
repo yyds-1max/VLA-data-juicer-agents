@@ -12,6 +12,7 @@ dependencies = [
     "agentscope==2.0.1",
     "pydantic>=2.7",
     "PyYAML>=6.0",
+    "rich>=13.7.0",
 ]
 
 [project.optional-dependencies]
