@@ -36,6 +36,16 @@ PUBLIC_PROGRESS_PROMPT = (
 )
 
 
+def _response_language_prompt(response_language: str | None) -> str:
+    language = str(response_language or "").strip()
+    if not language:
+        return ""
+    return (
+        f"User-facing progress summaries and final workflow summaries must be written in {language}. "
+        f"Keep the literal marker `Progress:` in English, but write the summary text after it in {language}.\n\n"
+    )
+
+
 class _SceneModeMissing:
     pass
 
@@ -371,6 +381,7 @@ async def run_plan_agent(
     *,
     event_scope: EventScope | None = None,
     cancellation: CancellationContext | None = None,
+    response_language: str | None = None,
 ) -> WorkflowPlan:
     draft_state = getattr(agent, "workflow_plan_draft_state", None)
     draft_prompt = ""
@@ -406,6 +417,7 @@ async def run_plan_agent(
         "after run_tracking and before projection. Supported execution tool names include run_tracking, "
         "prepare_gridmap_for_projection, and run_projection_and_trajectory. The only human-blocking step "
         f"is gen_box.py via run_initial_annotation_gui. {PUBLIC_PROGRESS_PROMPT}\n\n"
+        f"{_response_language_prompt(response_language)}"
         f"NavigationRequest JSON:\n{request.model_dump_json()}"
         f"{draft_prompt}"
     )
@@ -432,6 +444,7 @@ async def run_executor_agent(
     *,
     event_scope: EventScope | None = None,
     cancellation: CancellationContext | None = None,
+    response_language: str | None = None,
 ) -> str:
     prompt = (
         "Execute this WorkflowPlan JSON step-by-step using the matching execution tools. Stop on any "
@@ -440,6 +453,7 @@ async def run_executor_agent(
         "or out. Prepare gridmap after run_tracking and before run_projection_and_trajectory. Supported "
         "tool names include run_tracking, prepare_gridmap_for_projection, and run_projection_and_trajectory. "
         f"{PUBLIC_PROGRESS_PROMPT} Return a concise final execution summary.\n\n"
+        f"{_response_language_prompt(response_language)}"
         f"WorkflowPlan JSON:\n{plan.model_dump_json()}"
     )
     return await _run_agent_stream(

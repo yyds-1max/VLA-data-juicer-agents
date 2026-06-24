@@ -28,6 +28,13 @@ class RunVLAWorkflowInput(BaseModel):
     dry_run: bool = False
     approve: bool = True
     model: str | None = None
+    response_language: str | None = Field(
+        default=None,
+        description=(
+            "Language to use for user-facing progress summaries and final workflow summaries. "
+            "Set this to the user's language, for example 'Chinese' for Chinese requests."
+        ),
+    )
     scenario: Literal["navigation_vla"] = "navigation_vla"
 
 
@@ -134,6 +141,7 @@ async def run_vla_workflow(ctx: ToolContext, raw_args: RunVLAWorkflowInput | dic
             run_dir=run_dir,
             event_scope=plan_scope,
             cancellation=cancellation,
+            response_language=args.response_language,
         )
         run_store.write_json(run_dir, "plan.json", plan.model_dump(mode="json"))
 
@@ -161,6 +169,7 @@ async def run_vla_workflow(ctx: ToolContext, raw_args: RunVLAWorkflowInput | dic
             run_dir=run_dir,
             event_scope=executor_scope,
             cancellation=cancellation,
+            response_language=args.response_language,
         )
         payload = RunVLAWorkflowOutput(
             ok=True,

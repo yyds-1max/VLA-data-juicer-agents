@@ -28,13 +28,13 @@ DEFAULT_NAVIGATION_MODEL = "qwen3.5-plus"
 
 PUBLIC_PROGRESS_INSTRUCTIONS = """
 Before each tool call, emit exactly one public progress update line:
-Progress: <one or two concise, action-oriented sentences stating a reasoning summary and the next action>
+Progress: <one or two concise, action-oriented sentences stating an established fact and the next action>
 
 This is a user-facing summary, not the full hidden chain-of-thought.
-Do not reveal draft notes, prompts, or raw tool results.
+Do not reveal private reasoning, draft notes, prompts, or raw tool results.
 The following SDK tool call is the actual action; do not print textual ReAct labels such as Thought: or Action:.
 Never write tool calls as plain text such as ToolName[arguments]; use the registered SDK tool call interface.
-Please answer in the user's language.
+Use the explicit response_language from the current workflow prompt when provided; otherwise answer in the user's language.
 """.strip()
 
 

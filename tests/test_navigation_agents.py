@@ -662,7 +662,7 @@ def test_navigation_prompts_require_concise_action_oriented_progress():
         assert "Progress: <one or two concise, action-oriented sentences" in instructions
         assert "established fact" in instructions
         assert "next action" in instructions
-        assert "not hidden chain-of-thought" in instructions
+        assert "not the full hidden chain-of-thought" in instructions
         assert "Do not reveal private reasoning" in instructions
         assert "do not print textual ReAct labels" in instructions
         assert "ToolName[arguments]" in instructions
@@ -681,11 +681,14 @@ def test_navigation_prompts_require_concise_action_oriented_progress():
 
     plan_agent = CapturingAgent(plan.model_dump_json())
     executor_agent = CapturingAgent("done")
-    asyncio.run(run_plan_agent(plan_agent, request))
-    asyncio.run(run_executor_agent(executor_agent, plan))
+    asyncio.run(run_plan_agent(plan_agent, request, response_language="Chinese"))
+    asyncio.run(run_executor_agent(executor_agent, plan, response_language="Chinese"))
 
     assert "Progress: <one or two concise, action-oriented sentences" in plan_agent.prompts[0]
     assert "Progress: <one or two concise, action-oriented sentences" in executor_agent.prompts[0]
+    assert "must be written in Chinese" in plan_agent.prompts[0]
+    assert "must be written in Chinese" in executor_agent.prompts[0]
+    assert "write the summary text after it in Chinese" in plan_agent.prompts[0]
     assert "Action: choose" not in plan_agent.prompts[0]
     assert "Call one read-only tool with ToolName[arguments]" not in plan_agent.prompts[0]
     assert "Do not output textual Thought: or Action: lines" in plan_agent.prompts[0]

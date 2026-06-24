@@ -41,6 +41,7 @@ def test_session_toolkit_exposes_vla_workflow_input_schema():
     assert "segments" in properties
     assert "dry_run" in properties
     assert "approve" in properties
+    assert "response_language" in properties
 
 
 def test_session_prompt_routes_complex_vla_requests_to_workflow():
@@ -48,6 +49,8 @@ def test_session_prompt_routes_complex_vla_requests_to_workflow():
     prompt = agent.session_system_prompt()
 
     assert "call vla_run_workflow exactly once" in prompt
+    assert "response_language" in prompt
+    assert "Set vla_run_workflow.response_language to the user's language" in prompt
     assert "Do not use deterministic Python keyword routing" in prompt
     assert "Respond in the same language as the user" in prompt
 
@@ -845,6 +848,7 @@ def test_vla_run_workflow_tool_reuses_plan_and_executor_agents(tmp_path, monkeyp
         *,
         event_scope=None,
         cancellation=None,
+        response_language=None,
     ):
         calls.append(
             (
@@ -858,6 +862,7 @@ def test_vla_run_workflow_tool_reuses_plan_and_executor_agents(tmp_path, monkeyp
                 bool(run_dir),
                 event_scope,
                 cancellation,
+                response_language,
             )
         )
         return plan
@@ -870,6 +875,7 @@ def test_vla_run_workflow_tool_reuses_plan_and_executor_agents(tmp_path, monkeyp
         *,
         event_scope=None,
         cancellation=None,
+        response_language=None,
     ):
         calls.append(
             (
@@ -880,6 +886,7 @@ def test_vla_run_workflow_tool_reuses_plan_and_executor_agents(tmp_path, monkeyp
                 bool(run_dir),
                 event_scope,
                 cancellation,
+                response_language,
             )
         )
         return "execution summary"
@@ -911,6 +918,7 @@ def test_vla_run_workflow_tool_reuses_plan_and_executor_agents(tmp_path, monkeyp
                 "scene_mode": "out",
                 "dry_run": True,
                 "approve": True,
+                "response_language": "Chinese",
             },
         )
     )
@@ -932,10 +940,12 @@ def test_vla_run_workflow_tool_reuses_plan_and_executor_agents(tmp_path, monkeyp
     assert calls[0][8].source == "navigation.plan"
     assert calls[0][8].parent_run_id == events[0]["run_id"]
     assert calls[0][9] is cancellation
+    assert calls[0][10] == "Chinese"
     assert calls[1][:5] == ("execute", "executor-dry-True", plan, True, True)
     assert calls[1][5].source == "navigation.executor"
     assert calls[1][5].parent_run_id == events[0]["run_id"]
     assert calls[1][6] is cancellation
+    assert calls[1][7] == "Chinese"
     assert [(event["type"], event["source"], event["parent_run_id"], event["payload"]) for event in events] == [
         ("agent_start", "navigation.workflow", "session-run", {}),
         ("agent_end", "navigation.workflow", "session-run", {"status": "completed"}),
