@@ -10,6 +10,10 @@ from vla_data_juicer_agents.core.events import EventScope
 
 
 _SENTENCE_RE = re.compile(r".*?[.!?。！？]")
+_PROGRESS_MARKER_RE = re.compile(
+    r"^\s*(?:Progress|进度|思考摘要|思考)\s*[:：]\s*(?P<summary>.+?)\s*$",
+    flags=re.IGNORECASE | re.DOTALL,
+)
 
 
 def _event_type(event: object) -> str:
@@ -133,6 +137,48 @@ class AgentScopeEventAdapter:
         if normalized in {"success", "completed"} and not _result_payload_failed(result_text):
             return "completed"
         return "failed"
+
+
+class ProgressSummaryFilter:
+    """Convert public progress marker text into reasoning events."""
+
+    def __init__(self, scope: EventScope) -> None:
+        self._scope = scope
+        self._buffer = ""
+
+    def consume_text_delta(self, delta: object) -> str:
+        self._buffer += _text(delta)
+        output: list[str] = []
+        while "\n" in self._buffer:
+            line, self._buffer = self._buffer.split("\n", 1)
+            rendered = self._consume_line(line)
+            if rendered is not None:
+                output.append(rendered + "\n")
+        return "".join(output)
+
+    def flush_progress_only(self) -> None:
+        if self._is_progress_line(self._buffer):
+            self._consume_line(self._buffer)
+            self._buffer = ""
+
+    def flush(self) -> str:
+        buffered = self._buffer
+        self._buffer = ""
+        rendered = self._consume_line(buffered)
+        return "" if rendered is None else rendered
+
+    def _consume_line(self, line: str) -> str | None:
+        match = _PROGRESS_MARKER_RE.match(line)
+        if match is None:
+            return line
+        summary = summarize_progress(match.group("summary"))
+        if summary:
+            self._scope.emit("reasoning", summary=summary)
+        return None
+
+    @staticmethod
+    def _is_progress_line(line: str) -> bool:
+        return bool(_PROGRESS_MARKER_RE.match(line))
 
 
 def _result_payload_failed(result_text: str) -> bool:

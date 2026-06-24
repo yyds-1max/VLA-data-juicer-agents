@@ -74,9 +74,10 @@ def test_session_prompt_guides_concise_action_oriented_progress():
     agent = VLASessionAgent(use_llm_router=False)
     prompt = agent.session_system_prompt()
 
-    assert "progress or thinking updates to one or two action-oriented sentences" in prompt
-    assert "State one established fact and the next action" in prompt
-    assert "Do not dump or repeat prompts or raw tool results" in prompt
+    assert "Progress: <one or two concise, action-oriented sentences" in prompt
+    assert "established fact and the next action" in prompt
+    assert "not hidden chain-of-thought" in prompt
+    assert "Do not reveal private reasoning" in prompt
 
 
 def test_session_agent_builds_real_agentscope_agent(monkeypatch):

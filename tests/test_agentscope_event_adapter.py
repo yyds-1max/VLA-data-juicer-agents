@@ -36,6 +36,57 @@ def test_thinking_end_emits_normalized_bounded_reasoning():
     assert len(summarize_progress("Thought: " + "x" * 300)) <= 240
 
 
+def test_progress_marker_text_becomes_reasoning_and_is_removed_from_output():
+    scope, events = _scope_and_events()
+
+    class ProgressAgent:
+        async def reply_stream(self, _message):
+            yield SimpleNamespace(
+                type="TEXT_BLOCK_DELTA",
+                delta="Progress: Raw data exists; next I will inspect the profile.\n",
+            )
+            yield SimpleNamespace(type="TEXT_BLOCK_DELTA", delta="final answer")
+
+    output = asyncio.run(_run_agent_stream(ProgressAgent(), "prompt", event_scope=scope))
+
+    assert output == "final answer"
+    assert [(event["type"], event["payload"]) for event in events] == [
+        ("agent_start", {}),
+        ("reasoning", {"summary": "Raw data exists; next I will inspect the profile."}),
+        ("agent_end", {"status": "completed"}),
+    ]
+
+
+def test_progress_marker_without_newline_flushes_before_tool_event():
+    scope, events = _scope_and_events()
+
+    class ProgressBeforeToolAgent:
+        async def reply_stream(self, _message):
+            yield SimpleNamespace(
+                type="TEXT_BLOCK_DELTA",
+                delta="Progress: Need the raw segment metadata; next I will inspect the date.",
+            )
+            yield SimpleNamespace(
+                type="TOOL_RESULT_START",
+                tool_call_id="call-1",
+                tool_call_name="inspect_raw_date_tool",
+            )
+            yield SimpleNamespace(type="TOOL_RESULT_TEXT_DELTA", tool_call_id="call-1", delta="done")
+            yield SimpleNamespace(type="TOOL_RESULT_END", tool_call_id="call-1", state="success")
+            yield SimpleNamespace(type="TEXT_BLOCK_DELTA", delta="final")
+
+    output = asyncio.run(_run_agent_stream(ProgressBeforeToolAgent(), "prompt", event_scope=scope))
+
+    assert output == "final"
+    assert [(event["type"], event["payload"].get("summary")) for event in events] == [
+        ("agent_start", None),
+        ("reasoning", "Need the raw segment metadata; next I will inspect the date."),
+        ("tool_start", None),
+        ("tool_end", "done"),
+        ("agent_end", None),
+    ]
+
+
 def test_tool_result_emits_paired_start_and_end_with_result_state():
     scope, events = _scope_and_events()
     adapter = AgentScopeEventAdapter(scope)

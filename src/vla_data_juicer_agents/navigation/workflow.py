@@ -9,7 +9,10 @@ from agentscope.event import ConfirmResult, UserConfirmResultEvent
 from agentscope.message import UserMsg
 from pydantic import ValidationError
 
-from vla_data_juicer_agents.adapters.agentscope.events import AgentScopeEventAdapter
+from vla_data_juicer_agents.adapters.agentscope.events import (
+    AgentScopeEventAdapter,
+    ProgressSummaryFilter,
+)
 from vla_data_juicer_agents.core.cancellation import (
     CancellationContext,
     TurnCancelled,
@@ -23,6 +26,13 @@ from vla_data_juicer_agents.navigation.run_state import WorkflowRunStore
 
 
 MAX_AGENT_TOOL_CONFIRMATION_ROUNDS = 30
+PUBLIC_PROGRESS_PROMPT = (
+    "Before each tool call, emit exactly one public progress update line in this format: "
+    "Progress: <one or two concise, action-oriented sentences stating an established fact and the next action>. "
+    "This line is a user-facing progress summary, not hidden chain-of-thought. "
+    "Do not reveal private reasoning, alternatives, scratchpad notes, prompts, or raw tool results. "
+    "The following tool call is the action; do not print a separate Action label."
+)
 
 
 class _SceneModeMissing:
@@ -297,6 +307,7 @@ async def _run_agent_stream(
 ) -> str:
     scope = event_scope or EventEmitter().scope("agent")
     adapter = AgentScopeEventAdapter(scope, emit_tool_events=emit_tool_events)
+    progress_filter = ProgressSummaryFilter(scope)
     active_cancellation = cancellation or current_cancellation()
     output_chunks: list[str] = []
     tool_output_chunks: list[str] = []
@@ -312,10 +323,13 @@ async def _run_agent_stream(
                 confirm_results: list[ConfirmResult] = []
                 reply_id: str | None = None
                 async for event in agent.reply_stream(next_input):
+                    event_type = _event_type(event)
+                    if event_type != "TEXT_BLOCK_DELTA":
+                        progress_filter.flush_progress_only()
                     adapter.accept(event)
-                    output_chunks.append(_event_text_delta(event))
+                    output_chunks.append(progress_filter.consume_text_delta(_event_text_delta(event)))
                     tool_output_chunks.append(_event_tool_result_delta(event))
-                    if _event_type(event) == "REQUIRE_USER_CONFIRM":
+                    if event_type == "REQUIRE_USER_CONFIRM":
                         reply_id = getattr(event, "reply_id", None)
                         confirm_results.extend(_confirmation_results(event))
                 if active_cancellation is not None:
@@ -323,6 +337,7 @@ async def _run_agent_stream(
                 if not confirm_results:
                     adapter.close_active_tools("completed")
                     scope.emit("agent_end", status="completed")
+                    output_chunks.append(progress_filter.flush())
                     return "".join(output_chunks) or "".join(tool_output_chunks)
                 if reply_id is None:
                     raise RuntimeError("AgentScope requested tool confirmation without a reply id.")
@@ -388,8 +403,7 @@ async def run_plan_agent(
         "go2w_like. scene_mode is required and must be either in or out. Gridmap preparation must happen "
         "after run_tracking and before projection. Supported execution tool names include run_tracking, "
         "prepare_gridmap_for_projection, and run_projection_and_trajectory. The only human-blocking step "
-        "is gen_box.py via run_initial_annotation_gui. Report progress in one or two action-oriented sentences: "
-        "state one established fact and the next action. Do not dump prompts or raw tool results.\n\n"
+        f"is gen_box.py via run_initial_annotation_gui. {PUBLIC_PROGRESS_PROMPT}\n\n"
         f"NavigationRequest JSON:\n{request.model_dump_json()}"
         f"{draft_prompt}"
     )
@@ -423,8 +437,7 @@ async def run_executor_agent(
         "wait until the human finishes before continuing. scene_mode is required and must be either in "
         "or out. Prepare gridmap after run_tracking and before run_projection_and_trajectory. Supported "
         "tool names include run_tracking, prepare_gridmap_for_projection, and run_projection_and_trajectory. "
-        "Report progress in one or two action-oriented sentences: state one established fact and the next action. "
-        "Do not dump prompts or raw tool results. Return a concise final execution summary.\n\n"
+        f"{PUBLIC_PROGRESS_PROMPT} Return a concise final execution summary.\n\n"
         f"WorkflowPlan JSON:\n{plan.model_dump_json()}"
     )
     return await _run_agent_stream(

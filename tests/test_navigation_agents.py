@@ -658,12 +658,12 @@ def test_run_plan_agent_prompt_injects_current_profile_draft_state():
 
 
 def test_navigation_prompts_require_concise_action_oriented_progress():
-    required = "one or two action-oriented sentences"
     for instructions in (PLAN_AGENT_INSTRUCTIONS, EXECUTOR_AGENT_INSTRUCTIONS):
-        assert required in instructions
+        assert "Progress: <one or two concise, action-oriented sentences" in instructions
         assert "established fact" in instructions
         assert "next action" in instructions
-        assert "Do not dump prompts or raw tool results" in instructions
+        assert "not hidden chain-of-thought" in instructions
+        assert "Do not reveal private reasoning" in instructions
 
     request = NavigationRequest(date="20270605", dry_run=True, scene_mode="out")
     plan = build_deterministic_plan_template("20270605", "go2w_like", None, scene_mode="out")
@@ -682,5 +682,5 @@ def test_navigation_prompts_require_concise_action_oriented_progress():
     asyncio.run(run_plan_agent(plan_agent, request))
     asyncio.run(run_executor_agent(executor_agent, plan))
 
-    assert required in plan_agent.prompts[0]
-    assert required in executor_agent.prompts[0]
+    assert "Progress: <one or two concise, action-oriented sentences" in plan_agent.prompts[0]
+    assert "Progress: <one or two concise, action-oriented sentences" in executor_agent.prompts[0]

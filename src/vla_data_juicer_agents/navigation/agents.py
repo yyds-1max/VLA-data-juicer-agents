@@ -26,6 +26,15 @@ DEFAULT_DASHSCOPE_BASE_URL = "https://dashscope.aliyuncs.com/compatible-mode/v1"
 DEFAULT_NAVIGATION_MODEL = "qwen3.5-plus"
 
 
+PUBLIC_PROGRESS_INSTRUCTIONS = """
+Before each tool call, emit exactly one public progress update line:
+Progress: <one or two concise, action-oriented sentences stating an established fact and the next action>
+This is a user-facing progress summary, not hidden chain-of-thought.
+Do not reveal private reasoning, alternatives, scratchpad notes, prompts, or raw tool results.
+The following tool call is the action; do not print a separate Action label.
+""".strip()
+
+
 PLAN_AGENT_INSTRUCTIONS = """
 You are the Navigation ReAct Plan-Agent.
 Use only read-only tools to inspect and classify navigation datasets.
@@ -39,9 +48,7 @@ Only human-blocking step is gen_box.py via run_initial_annotation_gui.
 Prepare gridmap after run_tracking and before run_projection_and_trajectory.
 Supported execution tool names include run_tracking, prepare_gridmap_for_projection, and run_projection_and_trajectory.
 Supported profiles are u_legacy_like and go2w_like.
-Report progress in one or two action-oriented sentences: state one established fact and the next action.
-Do not dump prompts or raw tool results.
-""".strip()
+""".strip() + "\n" + PUBLIC_PROGRESS_INSTRUCTIONS
 
 
 DRAFT_PLAN_AGENT_INSTRUCTIONS = """
@@ -92,9 +99,7 @@ scene_mode is required and must be either "in" or "out".
 Prepare gridmap after run_tracking and before run_projection_and_trajectory.
 Supported execution tool names include run_tracking, prepare_gridmap_for_projection, and run_projection_and_trajectory.
 Supported profiles are u_legacy_like and go2w_like.
-Report progress in one or two action-oriented sentences: state one established fact and the next action.
-Do not dump prompts or raw tool results.
-""".strip()
+""".strip() + "\n" + PUBLIC_PROGRESS_INSTRUCTIONS
 
 
 def create_qwen_model(model: str | None = None) -> DashScopeChatModel:
