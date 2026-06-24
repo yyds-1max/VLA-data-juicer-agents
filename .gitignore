@@ -57,6 +57,9 @@ docs/
 # 运行日志
 runs/
 
+# Codex
+.superpowers
+
 # OS and editor files
 .DS_Store
 Thumbs.db

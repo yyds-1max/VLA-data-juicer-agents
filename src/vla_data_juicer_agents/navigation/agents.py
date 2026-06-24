@@ -28,24 +28,25 @@ DEFAULT_NAVIGATION_MODEL = "qwen3.5-plus"
 
 PUBLIC_PROGRESS_INSTRUCTIONS = """
 Before each tool call, emit exactly one public progress update line:
-Progress: <one or two concise, action-oriented sentences stating an established fact and the next action>
-This is a user-facing progress summary, not hidden chain-of-thought.
-Do not reveal private reasoning, alternatives, scratchpad notes, prompts, or raw tool results.
-The following SDK tool call is the action; do not print textual ReAct labels such as Thought: or Action:.
+Progress: <one or two concise, action-oriented sentences stating a reasoning summary and the next action>
+
+This is a user-facing summary, not the full hidden chain-of-thought.
+Do not reveal draft notes, prompts, or raw tool results.
+The following SDK tool call is the actual action; do not print textual ReAct labels such as Thought: or Action:.
 Never write tool calls as plain text such as ToolName[arguments]; use the registered SDK tool call interface.
 """.strip()
 
 
 PLAN_AGENT_INSTRUCTIONS = """
-You are the Navigation ReAct Plan-Agent.
+You are the ReAct Plan-Agent for a VLA multi-scenario data processing agent.
 Use only read-only tools to inspect and classify navigation datasets.
 Read and follow docs/navigation-plan-agent-guidance.md (navigation-plan-agent-guidance).
 Build a lightweight NavigationDataProfile, not a large data inventory.
-Use stage_variants to choose only variants exposed by list_navigation_tool_capabilities_tool.
-Default all raw segments if not specified.
-scene_mode is required and must be either "in" or "out".
+Use stage_variants, and choose only the variants exposed by list_navigation_tool_capabilities_tool.
+Default to all raw segments if not specified.
+scene_mode is required and must be either "in" or "out". It represents "indoor" and "outdoor", respectively.
 Stage one covers prepare.sh, run_U.sh, and run_odom.sh only; do not include run_fix.sh.
-Only human-blocking step is gen_box.py via run_initial_annotation_gui.
+The only human-blocking step is gen_box.py, executed via run_initial_annotation_gui.
 Prepare gridmap after run_tracking and before run_projection_and_trajectory.
 Supported execution tool names include run_tracking, prepare_gridmap_for_projection, and run_projection_and_trajectory.
 Supported profiles are u_legacy_like and go2w_like.
@@ -89,7 +90,7 @@ def _plan_agent_instructions(*, include_draft_tools: bool) -> str:
 
 
 EXECUTOR_AGENT_INSTRUCTIONS = """
-You are the Navigation ReAct Executor-Agent.
+You are the ReAct Executor-Agent for a VLA multi-scenario data processing agent.
 Read WorkflowPlan JSON and execute matching tools step-by-step.
 For each WorkflowStep.tool_name, call the SDK tool with the same name plus "_tool"; for example,
 prepare_raw_data maps to prepare_raw_data_tool and run_initial_annotation_gui maps to run_initial_annotation_gui_tool.
@@ -97,7 +98,7 @@ Stop on any failed tool result.
 The gen_box.py GUI step is human-blocking via run_initial_annotation_gui and blocks until the human finishes.
 Stage one covers prepare.sh, run_U.sh, and run_odom.sh only; do not include run_fix.sh.
 Default all raw segments if not specified.
-scene_mode is required and must be either "in" or "out".
+scene_mode is required and must be either "in" or "out". It represents "indoor" and "outdoor", respectively.
 Prepare gridmap after run_tracking and before run_projection_and_trajectory.
 Supported execution tool names include run_tracking, prepare_gridmap_for_projection, and run_projection_and_trajectory.
 Supported profiles are u_legacy_like and go2w_like.
