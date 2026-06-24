@@ -72,6 +72,10 @@ def _command_text(command: list[str]) -> str:
     return command[2] if command[:2] == ["bash", "-lc"] else " ".join(command)
 
 
+def _is_tracking_binary_command(command: list[str]) -> bool:
+    return _command_text(command).endswith("./bin/main")
+
+
 def _argument_after(command: list[str], option: str) -> str | None:
     if command[:2] == ["bash", "-lc"]:
         parts = command[2].split()
@@ -117,11 +121,12 @@ def test_generate_gridmap_from_pcd_dry_run_builds_command(tmp_path):
     result = generate_gridmap_from_pcd("20270605", ["20260605_152856"], settings=settings, dry_run=True)
 
     command = result.commands[0].command
-    assert command[:2] == ["python3", "/processing/other_code/pcd_to_grid.py"]
-    assert "--date" in command
-    assert "20270605" in command
-    assert "--segments" in command
-    assert "20260605_152856" in command
+    shell = _command_text(command)
+    assert "/processing/other_code/pcd_to_grid.py" in shell
+    assert "--date" in shell
+    assert "20270605" in shell
+    assert "--segments" in shell
+    assert "20260605_152856" in shell
 
 
 def test_generate_gridmap_from_pcd_dry_run_uses_data_runtime_setup(tmp_path):
@@ -296,7 +301,8 @@ def test_run_tracking_dry_run_only_runs_tracking_loop(tmp_path):
 
     shells = [_command_text(record.command) for record in result.commands]
     assert result.ok is True
-    assert shells == ["./bin/main"]
+    assert len(shells) == 1
+    assert shells[0].endswith("./bin/main")
     assert result.details["tracking_yaml_count"] == 1
 
 
@@ -622,7 +628,7 @@ def test_tracking_moves_original_data_outputs_to_clip_dir(tmp_path, monkeypatch)
     settings = NavigationSettings(vladatasets_root=root, processing_root=processing_root)
 
     def fake_run_command(command, cwd=None, dry_run=False, timeout_seconds=None):
-        if command == ["./bin/main"]:
+        if _is_tracking_binary_command(command):
             output_root = processing_root / "Data" / "1_img_output"
             (output_root / "tracking_img" / "frame.txt").write_text("frame", encoding="utf-8")
             (output_root / "img_points.txt").write_text("points", encoding="utf-8")
@@ -654,7 +660,7 @@ def test_tracking_prepares_clean_output_dir_before_each_non_dry_run_job(tmp_path
     settings = NavigationSettings(vladatasets_root=root, processing_root=processing_root)
 
     def fake_run_command(command, cwd=None, dry_run=False, timeout_seconds=None):
-        if command == ["./bin/main"]:
+        if _is_tracking_binary_command(command):
             assert stale_tracking.is_dir()
             assert list(stale_tracking.iterdir()) == []
             assert not (output_root / "img_points.txt").exists()
@@ -686,7 +692,7 @@ def test_tracking_fails_when_command_does_not_create_tracking_img(tmp_path, monk
     settings = NavigationSettings(vladatasets_root=root, processing_root=processing_root)
 
     def fake_run_command(command, cwd=None, dry_run=False, timeout_seconds=None):
-        if command == ["./bin/main"]:
+        if _is_tracking_binary_command(command):
             output_root = processing_root / "Data" / "1_img_output"
             shutil.rmtree(output_root / "tracking_img")
             (output_root / "img_points.txt").write_text("points", encoding="utf-8")
@@ -713,7 +719,7 @@ def test_tracking_fails_when_command_does_not_create_img_points(tmp_path, monkey
     settings = NavigationSettings(vladatasets_root=root, processing_root=processing_root)
 
     def fake_run_command(command, cwd=None, dry_run=False, timeout_seconds=None):
-        if command == ["./bin/main"]:
+        if _is_tracking_binary_command(command):
             output_root = processing_root / "Data" / "1_img_output"
             (output_root / "tracking_img" / "frame.jpg").write_text("frame", encoding="utf-8")
         return CommandRecord(command=command, cwd=cwd, dry_run=dry_run, return_code=0)
@@ -743,7 +749,7 @@ def test_tracking_replaces_existing_moved_outputs_on_rerun(tmp_path, monkeypatch
     settings = NavigationSettings(vladatasets_root=root, processing_root=processing_root)
 
     def fake_run_command(command, cwd=None, dry_run=False, timeout_seconds=None):
-        if command == ["./bin/main"]:
+        if _is_tracking_binary_command(command):
             output_root = processing_root / "Data" / "1_img_output"
             (output_root / "tracking_img" / "frame.jpg").write_text("new", encoding="utf-8")
             (output_root / "img_points.txt").write_text("new-points", encoding="utf-8")
