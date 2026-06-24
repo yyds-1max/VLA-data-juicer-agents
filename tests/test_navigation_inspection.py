@@ -6,6 +6,8 @@ from vla_data_juicer_agents.navigation.config import NavigationSettings
 from vla_data_juicer_agents.navigation.inspection import (
     classify_navigation_dataset,
     classify_navigation_dataset_tool,
+    infer_navigation_topic_params,
+    infer_navigation_topic_params_tool,
     inspect_gridmap_artifacts,
     inspect_gridmap_artifacts_tool,
     inspect_processing_state,
@@ -82,6 +84,124 @@ def test_classify_navigation_dataset_tool_schema_allows_omitting_segments():
     required = classify_navigation_dataset_tool.input_schema.get("required", [])
 
     assert "segments" not in required
+
+
+def test_infer_navigation_topic_params_detects_u_like_fixture():
+    settings = NavigationSettings(vladatasets_root=FIXTURE_ROOT)
+
+    result = infer_navigation_topic_params("20270515", settings=settings)
+
+    assert result.profile_hint == "u_like"
+    assert result.confidence == 1.0
+    assert result.topic_whitelist == [
+        "/cam_video5/csi_cam/image_raw/compressed",
+        "/lidar_points",
+        "/utlidar/robot_odom_systime",
+    ]
+    assert result.topic_map == {
+        "cam_video5": "fisheye_front",
+        "lidar_points": "r32_rslidar_points",
+        "utlidar": "odom",
+    }
+    assert result.query_dir == "lidar_points"
+    assert result.blocking_issues == []
+
+
+def test_infer_navigation_topic_params_detects_go2w_fixture():
+    settings = NavigationSettings(vladatasets_root=FIXTURE_ROOT)
+
+    result = infer_navigation_topic_params("20270605", settings=settings)
+
+    assert result.profile_hint == "go2w_like"
+    assert result.topic_whitelist == [
+        "/cam_video4/csi_cam/image_raw/compressed",
+        "/rs32_lidar_points",
+        "/sport_odom",
+    ]
+    assert result.topic_map == {
+        "cam_video4": "fisheye_front",
+        "rs32_lidar_points": "r32_rslidar_points",
+        "sport_odom": "odom",
+    }
+    assert result.query_dir == "rs32_lidar_points"
+
+
+def test_infer_navigation_topic_params_detects_hybrid_fixture(tmp_path):
+    metadata_path = tmp_path / "VLADatasets" / "raw_data" / "20270606" / "segment_a" / "metadata.yaml"
+    metadata_path.parent.mkdir(parents=True)
+    metadata_path.write_text(
+        """
+rosbag2_bagfile_information:
+  topics_with_message_count:
+    - topic_metadata:
+        name: /cam_video5/csi_cam/image_raw/compressed
+        type: sensor_msgs/msg/CompressedImage
+      message_count: 10
+    - topic_metadata:
+        name: /lidar_points
+        type: sensor_msgs/msg/PointCloud2
+      message_count: 10
+    - topic_metadata:
+        name: /sport_odom
+        type: nav_msgs/msg/Odometry
+      message_count: 10
+""",
+        encoding="utf-8",
+    )
+    settings = NavigationSettings(vladatasets_root=tmp_path / "VLADatasets")
+
+    result = infer_navigation_topic_params("20270606", settings=settings)
+
+    assert result.profile_hint == "hybrid"
+    assert result.topic_whitelist == [
+        "/cam_video5/csi_cam/image_raw/compressed",
+        "/lidar_points",
+        "/sport_odom",
+    ]
+    assert result.topic_map == {
+        "cam_video5": "fisheye_front",
+        "lidar_points": "r32_rslidar_points",
+        "sport_odom": "odom",
+    }
+    assert result.query_dir == "lidar_points"
+    assert result.blocking_issues == []
+
+
+def test_infer_navigation_topic_params_reports_blocking_issue_when_required_topic_missing(tmp_path):
+    metadata_path = tmp_path / "VLADatasets" / "raw_data" / "20270606" / "segment_a" / "metadata.yaml"
+    metadata_path.parent.mkdir(parents=True)
+    metadata_path.write_text(
+        """
+rosbag2_bagfile_information:
+  topics_with_message_count:
+    - topic_metadata:
+        name: /cam_video5/csi_cam/image_raw/compressed
+        type: sensor_msgs/msg/CompressedImage
+      message_count: 10
+    - topic_metadata:
+        name: /lidar_points
+        type: sensor_msgs/msg/PointCloud2
+      message_count: 10
+""",
+        encoding="utf-8",
+    )
+    settings = NavigationSettings(vladatasets_root=tmp_path / "VLADatasets")
+
+    result = infer_navigation_topic_params("20270606", settings=settings)
+
+    assert result.profile_hint is None
+    assert result.topic_whitelist == [
+        "/cam_video5/csi_cam/image_raw/compressed",
+        "/lidar_points",
+    ]
+    assert result.query_dir == "lidar_points"
+    assert result.blocking_issues
+    assert any(issue.type == "missing_navigation_topic_params" for issue in result.blocking_issues)
+
+
+def test_infer_navigation_topic_params_tool_is_read_only():
+    assert infer_navigation_topic_params_tool.name == "infer_navigation_topic_params_tool"
+    assert infer_navigation_topic_params_tool.is_read_only is True
 
 
 def test_inspect_processing_state_summarizes_existing_intermediate_outputs(tmp_path):

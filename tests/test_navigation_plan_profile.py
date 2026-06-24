@@ -3,6 +3,7 @@ from pydantic import ValidationError
 from vla_data_juicer_agents.navigation.models import (
     NavigationDataProfile,
     NavigationRequest,
+    NavigationTopicParams,
     PlanIssue,
     StageVariantDecision,
     WorkflowStep,
@@ -30,11 +31,31 @@ def _complete_stage_variants(gridmap_variant: str, gridmap_reason: str, gridmap_
     }
 
 
+def _go2w_topic_params() -> NavigationTopicParams:
+    return NavigationTopicParams(
+        profile_hint="go2w_like",
+        confidence=1.0,
+        topic_whitelist=[
+            "/cam_video4/csi_cam/image_raw/compressed",
+            "/rs32_lidar_points",
+            "/sport_odom",
+        ],
+        topic_map={
+            "cam_video4": "fisheye_front",
+            "rs32_lidar_points": "r32_rslidar_points",
+            "sport_odom": "odom",
+        },
+        query_dir="rs32_lidar_points",
+        evidence=["infer_navigation_topic_params_tool"],
+    )
+
+
 def test_lightweight_navigation_data_profile_keeps_only_variant_decision_facts():
     profile = NavigationDataProfile(
         date="20270605",
         scene_mode="out",
         dataset_profile="go2w_like",
+        topic_params=_go2w_topic_params(),
         gridmap_source="generated_from_pcd",
         pcd_gridmap_tool_available=True,
         stage_variants={
@@ -59,6 +80,7 @@ def test_navigation_data_profile_records_blocking_issues_without_active_details(
         date="20270605",
         scene_mode="out",
         dataset_profile="go2w_like",
+        topic_params=_go2w_topic_params(),
         gridmap_source="unknown",
         pcd_gridmap_tool_available=False,
         blocking_issues=[
@@ -115,6 +137,7 @@ def test_plan_from_lightweight_profile_skips_gridmap_when_projection_input_ready
         date="20270605",
         scene_mode="out",
         dataset_profile="go2w_like",
+        topic_params=_go2w_topic_params(),
         gridmap_source="projection_ready",
         projection_input_ready=True,
         stage_variants=_complete_stage_variants(
@@ -145,6 +168,7 @@ def test_workflow_plan_draft_snapshot_exposes_react_profile_state_panel():
         "u_legacy_like",
         "go2w_like",
     ]
+    assert "topic_params" in snapshot["navigation_data_profile_schema"]["properties"]
     assert snapshot["data_profile_draft"] == {
         "date": "20270605",
         "scene_mode": "out",
@@ -153,8 +177,10 @@ def test_workflow_plan_draft_snapshot_exposes_react_profile_state_panel():
     assert "date" in snapshot["filled_fields"]
     assert "scene_mode" in snapshot["filled_fields"]
     assert "dataset_profile" in snapshot["missing_fields"]
+    assert "topic_params" in snapshot["missing_fields"]
     assert "stage_variants.prepare_gridmap_for_projection" in snapshot["missing_fields"]
     assert snapshot["ready_to_finish"] is False
+    assert "infer_navigation_topic_params_tool" in snapshot["next_tool_candidates"]
     assert "classify_navigation_dataset_tool" in snapshot["next_tool_candidates"]
 
 
@@ -166,6 +192,7 @@ def test_workflow_plan_draft_merges_data_profile_patches_across_react_rounds():
     first = state.update(
         data_profile_patch={
             "dataset_profile": "go2w_like",
+            "topic_params": _go2w_topic_params().model_dump(mode="json"),
             "stage_variants": {
                 "extract_and_sync_navigation_data": {
                     "variant": "go2w_like",
@@ -202,6 +229,7 @@ def test_workflow_plan_draft_merges_data_profile_patches_across_react_rounds():
     assert second["ok"] is True
     draft = second["draft"]["data_profile_draft"]
     assert draft["dataset_profile"] == "go2w_like"
+    assert draft["topic_params"]["query_dir"] == "rs32_lidar_points"
     assert draft["gridmap_source"] == "existing_gridmap"
     assert draft["stage_variants"]["extract_and_sync_navigation_data"]["variant"] == "go2w_like"
     assert draft["stage_variants"]["prepare_gridmap_for_projection"]["variant"] == "copy_existing_gridmap"
@@ -242,6 +270,30 @@ def test_plan_from_draft_requires_complete_navigation_data_profile():
         build_plan_from_draft(state)
 
 
+def test_plan_from_draft_requires_topic_params_before_finalizing():
+    state = WorkflowPlanDraftState(
+        request=NavigationRequest(date="20270605", scene_mode="out")
+    )
+
+    state.update(
+        data_profile_patch={
+            "dataset_profile": "go2w_like",
+            "gridmap_source": "existing_gridmap",
+            "pcd_gridmap_tool_available": True,
+            "stage_variants": _complete_stage_variants(
+                "copy_existing_gridmap",
+                "grid_map artifacts already exist",
+                ["inspect_gridmap_artifacts_tool"],
+            ),
+        }
+    )
+
+    assert "topic_params" in state.missing_fields()
+    assert state.ready_to_finish() is False
+    with pytest_raises_value_error("topic_params"):
+        build_plan_from_draft(state)
+
+
 def test_plan_from_lightweight_profile_keeps_gridmap_generation_variant():
     state = WorkflowPlanDraftState(
         request=NavigationRequest(date="20270605", scene_mode="out")
@@ -250,6 +302,7 @@ def test_plan_from_lightweight_profile_keeps_gridmap_generation_variant():
         date="20270605",
         scene_mode="out",
         dataset_profile="go2w_like",
+        topic_params=_go2w_topic_params(),
         gridmap_source="generated_from_pcd",
         stage_variants=_complete_stage_variants(
             "generate_from_pcd",
@@ -276,6 +329,7 @@ def test_plan_from_lightweight_profile_writes_variant_metadata_for_profile_drive
         date="20270605",
         scene_mode="out",
         dataset_profile="go2w_like",
+        topic_params=_go2w_topic_params(),
         gridmap_source="existing_gridmap",
         stage_variants={
             "extract_and_sync_navigation_data": StageVariantDecision(
@@ -301,6 +355,17 @@ def test_plan_from_lightweight_profile_writes_variant_metadata_for_profile_drive
     steps = {step.tool_name: step for step in plan.steps}
 
     assert steps["extract_and_sync_navigation_data"].variant == "go2w_like"
+    assert steps["extract_and_sync_navigation_data"].arguments["topic_whitelist"] == [
+        "/cam_video4/csi_cam/image_raw/compressed",
+        "/rs32_lidar_points",
+        "/sport_odom",
+    ]
+    assert steps["extract_and_sync_navigation_data"].arguments["topic_map"] == {
+        "cam_video4": "fisheye_front",
+        "rs32_lidar_points": "r32_rslidar_points",
+        "sport_odom": "odom",
+    }
+    assert steps["extract_and_sync_navigation_data"].arguments["query_dir"] == "rs32_lidar_points"
     assert steps["extract_and_sync_navigation_data"].decision_ref == (
         "data_profile.stage_variants.extract_and_sync_navigation_data"
     )
@@ -318,6 +383,7 @@ def test_plan_from_lightweight_profile_rejects_blocking_issues():
         date="20270605",
         scene_mode="out",
         dataset_profile="go2w_like",
+        topic_params=_go2w_topic_params(),
         gridmap_source="unknown",
         pcd_gridmap_tool_available=False,
         blocking_issues=[

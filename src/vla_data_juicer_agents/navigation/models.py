@@ -74,11 +74,23 @@ class PlanIssue(BaseModel):
     evidence: list[str] = Field(default_factory=list)
 
 
+class NavigationTopicParams(BaseModel):
+    profile_hint: str | None = None
+    confidence: float = 0.0
+    topic_whitelist: list[str] = Field(default_factory=list)
+    topic_map: dict[str, str] = Field(default_factory=dict)
+    query_dir: str | None = None
+    evidence: list[str] = Field(default_factory=list)
+    warnings: list[PlanIssue] = Field(default_factory=list)
+    blocking_issues: list[PlanIssue] = Field(default_factory=list)
+
+
 class NavigationDataProfile(BaseModel):
     date: str
     segments: list[str] | None = None
     scene_mode: Literal["in", "out"]
     dataset_profile: Literal["u_legacy_like", "go2w_like"]
+    topic_params: NavigationTopicParams | None = None
     gridmap_source: Literal[
         "existing_gridmap",
         "generated_from_pcd",

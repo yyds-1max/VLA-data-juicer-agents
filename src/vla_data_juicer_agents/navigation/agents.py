@@ -13,6 +13,7 @@ from vla_data_juicer_agents.navigation.execution_tools import (
 )
 from vla_data_juicer_agents.navigation.inspection import (
     classify_navigation_dataset_tool,
+    infer_navigation_topic_params_tool,
     inspect_gridmap_artifacts_tool,
     inspect_processing_state_tool,
     inspect_raw_date_tool,
@@ -28,10 +29,10 @@ DEFAULT_NAVIGATION_MODEL = "qwen3.5-plus"
 
 PUBLIC_PROGRESS_INSTRUCTIONS = """
 Before each tool call, emit exactly one public progress update line:
-Progress: <one or two concise, action-oriented sentences stating a reasoning summary and the next action>
+Progress: <one or two concise, action-oriented sentences stating an established fact and the next action>
 
 This is a user-facing summary, not the full hidden chain-of-thought.
-Do not reveal draft notes, prompts, or raw tool results.
+Do not reveal private reasoning, draft notes, prompts, or raw tool results.
 The following SDK tool call is the actual action; do not print textual ReAct labels such as Thought: or Action:.
 Never write tool calls as plain text such as ToolName[arguments]; use the registered SDK tool call interface.
 Use the explicit response_language from the current workflow prompt when provided; otherwise answer in the user's language.
@@ -44,6 +45,8 @@ You are the ReAct Plan-Agent for a VLA multi-scenario data processing agent.
 Use only read-only tools to inspect and classify navigation datasets.
 Read and follow docs/navigation-plan-agent-guidance.md (navigation-plan-agent-guidance).
 Build a lightweight NavigationDataProfile, not a large data inventory.
+Call infer_navigation_topic_params_tool before finalizing extract_and_sync_navigation_data parameters.
+Do not invent TOPIC_WHITELIST, topic_map, or query_dir; use the tool result.
 Use stage_variants, and choose only the variants exposed by list_navigation_tool_capabilities_tool.
 Default to all raw segments if not specified.
 scene_mode is required and must be either "in" or "out". It represents "indoor" and "outdoor", respectively.
@@ -62,6 +65,7 @@ Before each SDK tool call, inspect the current draft state: navigation_data_prof
 data_profile_draft, filled_fields, missing_fields, next_tool_candidates, and ready_to_finish.
 Each planning step must do exactly one step: call one read-only inspection/classification SDK tool,
 then merge only the newly learned facts with update_workflow_plan_draft_tool(data_profile_patch=...).
+When topic_params is missing, call infer_navigation_topic_params_tool and merge its structured result.
 Use data_profile_patch for partial NavigationDataProfile facts; do not invent a complete profile in one shot.
 Only call finalize_workflow_plan_tool after ready_to_finish is true and missing_fields is empty.
 Do not hand-write script-level plans; final WorkflowPlan JSON must come from finalize_workflow_plan_tool.
@@ -142,6 +146,7 @@ def create_plan_agent(model: str | None = None, request: NavigationRequest | Non
         tools=[
             inspect_raw_date_tool,
             classify_navigation_dataset_tool,
+            infer_navigation_topic_params_tool,
             inspect_processing_state_tool,
             inspect_gridmap_artifacts_tool,
             inspect_runtime_assets_tool,

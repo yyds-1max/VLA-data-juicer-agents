@@ -57,6 +57,11 @@ class WorkflowPlanDraftState(BaseModel):
             missing.append("scene_mode")
         if draft.get("dataset_profile") not in {"u_legacy_like", "go2w_like"}:
             missing.append("dataset_profile")
+        topic_params = draft.get("topic_params")
+        if not isinstance(topic_params, dict):
+            missing.append("topic_params")
+        elif topic_params.get("blocking_issues"):
+            missing.append("topic_params.blocking_issues")
         gridmap_source = draft.get("gridmap_source")
         blocking_issues = draft.get("blocking_issues") or []
         if blocking_issues:
@@ -76,13 +81,21 @@ class WorkflowPlanDraftState(BaseModel):
         return missing
 
     def ready_to_finish(self) -> bool:
-        return self.data_profile is not None and not self.data_profile.blocking_issues and not self.missing_fields()
+        return (
+            self.data_profile is not None
+            and self.data_profile.topic_params is not None
+            and not self.data_profile.topic_params.blocking_issues
+            and not self.data_profile.blocking_issues
+            and not self.missing_fields()
+        )
 
     def next_tool_candidates(self) -> list[str]:
         missing = set(self.missing_fields())
         candidates: list[str] = []
         if "dataset_profile" in missing:
             candidates.append("classify_navigation_dataset_tool")
+        if "topic_params" in missing or "topic_params.blocking_issues" in missing:
+            candidates.append("infer_navigation_topic_params_tool")
         if "gridmap_source" in missing or "stage_variants.prepare_gridmap_for_projection" in missing:
             candidates.append("inspect_gridmap_artifacts_tool")
         if "pcd_gridmap_tool_available" in missing or any(field.startswith("stage_variants.") for field in missing):
@@ -107,6 +120,7 @@ class WorkflowPlanDraftState(BaseModel):
             "missing_fields": self.missing_fields(),
             "required_observations": [
                 "dataset_classification",
+                "navigation_topic_params",
                 "gridmap_artifacts",
                 "runtime_assets_or_tool_capabilities",
             ],
@@ -205,6 +219,11 @@ def build_plan_from_draft(state: WorkflowPlanDraftState) -> WorkflowPlan:
     if state.data_profile is None:
         missing = ", ".join(state.missing_fields()) or "invalid profile fields"
         raise ValueError(f"NavigationDataProfile draft is incomplete; missing: {missing}")
+    if state.data_profile.topic_params is None:
+        raise ValueError("topic_params is required before finalizing WorkflowPlan")
+    if state.data_profile.topic_params.blocking_issues:
+        issues = ", ".join(issue.type for issue in state.data_profile.topic_params.blocking_issues)
+        raise ValueError(f"cannot finalize WorkflowPlan with blocking topic params: {issues}")
     if state.dataset_profile is None:
         raise ValueError("dataset_profile is required before finalizing WorkflowPlan")
     if state.data_profile.scene_mode not in {"in", "out"}:

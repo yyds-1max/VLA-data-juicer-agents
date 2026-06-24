@@ -59,6 +59,7 @@ def _decode_tool_payload(payload):
 def _complete_go2w_profile_patch():
     return {
         "dataset_profile": "go2w_like",
+        "topic_params": _go2w_topic_params(),
         "gridmap_source": "existing_gridmap",
         "pcd_gridmap_tool_available": True,
         "stage_variants": {
@@ -78,6 +79,27 @@ def _complete_go2w_profile_patch():
                 "evidence": ["inspect_runtime_assets_tool"],
             },
         },
+    }
+
+
+def _go2w_topic_params():
+    return {
+        "profile_hint": "go2w_like",
+        "confidence": 1.0,
+        "topic_whitelist": [
+            "/cam_video4/csi_cam/image_raw/compressed",
+            "/rs32_lidar_points",
+            "/sport_odom",
+        ],
+        "topic_map": {
+            "cam_video4": "fisheye_front",
+            "rs32_lidar_points": "r32_rslidar_points",
+            "sport_odom": "odom",
+        },
+        "query_dir": "rs32_lidar_points",
+        "evidence": ["infer_navigation_topic_params_tool"],
+        "warnings": [],
+        "blocking_issues": [],
     }
 
 
@@ -116,6 +138,7 @@ def test_create_plan_agent_has_read_only_tools(monkeypatch):
     assert "inspect_processing_state_tool" in tool_names
     assert "inspect_gridmap_artifacts_tool" in tool_names
     assert "inspect_runtime_assets_tool" in tool_names
+    assert "infer_navigation_topic_params_tool" in tool_names
     assert "list_navigation_tool_capabilities_tool" in tool_names
 
 

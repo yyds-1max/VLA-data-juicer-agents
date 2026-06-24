@@ -7,12 +7,72 @@ import yaml
 from agentscope.tool import FunctionTool
 
 from vla_data_juicer_agents.navigation.config import NavigationSettings
-from vla_data_juicer_agents.navigation.models import RawDateInspection, SegmentInspection, TopicInfo
+from vla_data_juicer_agents.navigation.models import (
+    NavigationTopicParams,
+    PlanIssue,
+    RawDateInspection,
+    SegmentInspection,
+    TopicInfo,
+)
 from vla_data_juicer_agents.navigation.profiles import classify_topics
 
 
 DATE_RE = re.compile(r"^[0-9]{8}$")
 RootKind = Literal["raw_data", "clip_data", "finish_data"]
+
+_TOPIC_PARAM_PATTERNS = [
+    {
+        "profile_hint": "u_like",
+        "topics": [
+            "/cam_video5/csi_cam/image_raw/compressed",
+            "/lidar_points",
+            "/utlidar/robot_odom_systime",
+        ],
+        "topic_map": {
+            "cam_video5": "fisheye_front",
+            "lidar_points": "r32_rslidar_points",
+            "utlidar": "odom",
+        },
+        "query_dir": "lidar_points",
+    },
+    {
+        "profile_hint": "go2w_like",
+        "topics": [
+            "/cam_video4/csi_cam/image_raw/compressed",
+            "/rs32_lidar_points",
+            "/sport_odom",
+        ],
+        "topic_map": {
+            "cam_video4": "fisheye_front",
+            "rs32_lidar_points": "r32_rslidar_points",
+            "sport_odom": "odom",
+        },
+        "query_dir": "rs32_lidar_points",
+    },
+    {
+        "profile_hint": "hybrid",
+        "topics": [
+            "/cam_video5/csi_cam/image_raw/compressed",
+            "/lidar_points",
+            "/sport_odom",
+        ],
+        "topic_map": {
+            "cam_video5": "fisheye_front",
+            "lidar_points": "r32_rslidar_points",
+            "sport_odom": "odom",
+        },
+        "query_dir": "lidar_points",
+    },
+]
+
+_KNOWN_TOPIC_ORDER = [
+    "/cam_video5/csi_cam/image_raw/compressed",
+    "/cam_video4/csi_cam/image_raw/compressed",
+    "/lidar_points",
+    "/rs32_lidar_points",
+    "/utlidar/robot_odom_systime",
+    "/sport_odom",
+]
 
 
 def _normalize_segments(segments: list[str] | str | None) -> list[str] | None:
@@ -131,6 +191,95 @@ def classify_navigation_dataset(
     return classify_topics(topic_names)
 
 
+def _select_inspection_segments(
+    inspection: RawDateInspection,
+    segments: list[str] | None,
+) -> list[SegmentInspection]:
+    if segments is None:
+        return inspection.segments
+    selected_names = set(segments)
+    existing_names = {segment.name for segment in inspection.segments}
+    missing_names = sorted(selected_names - existing_names)
+    if missing_names:
+        missing_text = ", ".join(missing_names)
+        raise FileNotFoundError(f"requested raw segment(s) not found for {inspection.date}: {missing_text}")
+    return [segment for segment in inspection.segments if segment.name in selected_names]
+
+
+def infer_navigation_topic_params(
+    date: str,
+    segments: list[str] | None = None,
+    settings: NavigationSettings | None = None,
+) -> NavigationTopicParams:
+    inspection = inspect_raw_date(date, settings=settings)
+    selected_segments = _select_inspection_segments(inspection, segments)
+    topic_names = {topic.name for segment in selected_segments for topic in segment.topics}
+    evidence = [
+        str(segment.metadata_path)
+        for segment in selected_segments
+        if segment.metadata_path is not None and segment.topics
+    ]
+    warnings = [
+        PlanIssue(
+            type="raw_metadata_error",
+            message=error,
+            evidence=[str(segment.metadata_path)] if segment.metadata_path is not None else [segment.name],
+        )
+        for segment in selected_segments
+        for error in segment.errors
+    ]
+    warnings.extend(
+        PlanIssue(type="raw_date_error", message=error, evidence=[str(inspection.path)])
+        for error in inspection.errors
+    )
+
+    full_matches = [
+        pattern for pattern in _TOPIC_PARAM_PATTERNS if set(pattern["topics"]).issubset(topic_names)
+    ]
+    if len(full_matches) == 1:
+        match = full_matches[0]
+        return NavigationTopicParams(
+            profile_hint=str(match["profile_hint"]),
+            confidence=1.0,
+            topic_whitelist=list(match["topics"]),
+            topic_map=dict(match["topic_map"]),
+            query_dir=str(match["query_dir"]),
+            evidence=evidence,
+            warnings=warnings,
+        )
+
+    known_existing = [topic for topic in _KNOWN_TOPIC_ORDER if topic in topic_names]
+    partial_scores = [
+        len(set(pattern["topics"]).intersection(topic_names)) / len(pattern["topics"])
+        for pattern in _TOPIC_PARAM_PATTERNS
+    ]
+    blocking_message = "Could not infer a unique camera/lidar/odom topic parameter set from raw metadata."
+    if len(full_matches) > 1:
+        blocking_message = "Multiple navigation topic parameter patterns matched raw metadata."
+    return NavigationTopicParams(
+        profile_hint=None,
+        confidence=max(partial_scores, default=0.0),
+        topic_whitelist=known_existing,
+        topic_map={},
+        query_dir=(
+            "lidar_points"
+            if "/lidar_points" in topic_names and "/rs32_lidar_points" not in topic_names
+            else "rs32_lidar_points"
+            if "/rs32_lidar_points" in topic_names and "/lidar_points" not in topic_names
+            else None
+        ),
+        evidence=evidence,
+        warnings=warnings,
+        blocking_issues=[
+            PlanIssue(
+                type="missing_navigation_topic_params",
+                message=blocking_message,
+                evidence=known_existing or evidence,
+            )
+        ],
+    )
+
+
 def _selected_segment_names(date_root: Path, segments: list[str] | None) -> list[str]:
     if segments is not None:
         return segments
@@ -241,6 +390,14 @@ def _classify_navigation_dataset_tool(date: str, segments: list[str] | str | Non
     return classify_navigation_dataset(date, segments=_normalize_segments(segments)).model_dump(mode="json")
 
 
+def _infer_navigation_topic_params_tool(date: str, segments: list[str] | str | None = None) -> dict:
+    """Infer TOPIC_WHITELIST, topic_map, and query_dir from raw navigation metadata topics."""
+    params = infer_navigation_topic_params(date, segments=_normalize_segments(segments))
+    payload = params.model_dump(mode="json")
+    payload["ok"] = not params.blocking_issues
+    return payload
+
+
 def _inspect_processing_state_tool(date: str, segments: list[str] | str | None = None) -> dict:
     """Inspect existing navigation intermediate outputs without modifying data."""
     return inspect_processing_state(date, segments=_normalize_segments(segments))
@@ -261,6 +418,10 @@ inspect_raw_date_tool = _make_function_tool(_inspect_raw_date_tool, "inspect_raw
 classify_navigation_dataset_tool = _make_function_tool(
     _classify_navigation_dataset_tool,
     "classify_navigation_dataset_tool",
+)
+infer_navigation_topic_params_tool = _make_function_tool(
+    _infer_navigation_topic_params_tool,
+    "infer_navigation_topic_params_tool",
 )
 inspect_processing_state_tool = _make_function_tool(_inspect_processing_state_tool, "inspect_processing_state_tool")
 inspect_gridmap_artifacts_tool = _make_function_tool(_inspect_gridmap_artifacts_tool, "inspect_gridmap_artifacts_tool")

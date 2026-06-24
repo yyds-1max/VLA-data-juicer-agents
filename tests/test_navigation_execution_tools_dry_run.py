@@ -367,6 +367,48 @@ def test_u_legacy_like_dry_run_reports_topic_mapping_and_lidar_query_dir(tmp_pat
     assert _argument_after(sync_commands[0], "--query_dir") == "lidar_points"
 
 
+def test_extract_and_sync_dry_run_accepts_explicit_topic_params(tmp_path):
+    root = tmp_path / "VLADatasets"
+    (root / "raw_data" / "20270605_temp" / "20260605_152856").mkdir(parents=True)
+    settings = NavigationSettings(vladatasets_root=root, datatoolbox_src=Path("/datatoolbox/src"))
+    topic_whitelist = [
+        "/cam_video5/csi_cam/image_raw/compressed",
+        "/lidar_points",
+        "/sport_odom",
+    ]
+    topic_map = {
+        "cam_video5": "fisheye_front",
+        "lidar_points": "r32_rslidar_points",
+        "sport_odom": "odom",
+    }
+
+    result = extract_and_sync_navigation_data(
+        "20270605",
+        "u_legacy_like",
+        topic_whitelist=topic_whitelist,
+        topic_map=topic_map,
+        query_dir="lidar_points",
+        settings=settings,
+        dry_run=True,
+    )
+
+    assert result.ok is True
+    assert result.details["extract_topics"] == topic_whitelist
+    assert result.details["sync_topic_map"] == topic_map
+    assert result.details["query_dir"] == "lidar_points"
+    command_texts = [_command_text(record.command) for record in result.commands]
+    assert any("/navigation/processing/extract_ros2_bag.py" in text for text in command_texts)
+    assert any("/navigation/processing/sync_navigation_data.py" in text for text in command_texts)
+    assert any("--topic_whitelist_file" in text for text in command_texts)
+    assert any("--topic_map_file" in text for text in command_texts)
+    assert not any("1_extract_data_from_bag_multi_process_ros2_U_legacy.py" in text for text in command_texts)
+    assert not any("2_sync_data_multi_process_U_legacy.py" in text for text in command_texts)
+    sync_commands = [
+        record.command for record in result.commands if "sync_navigation_data.py" in _command_text(record.command)
+    ]
+    assert _argument_after(sync_commands[0], "--query_dir") == "lidar_points"
+
+
 def test_extract_and_sync_dry_run_uses_u_runtime_setup_and_profile_script(tmp_path):
     root = tmp_path / "VLADatasets"
     (root / "raw_data" / "20270605_temp" / "20260605_152856").mkdir(parents=True)

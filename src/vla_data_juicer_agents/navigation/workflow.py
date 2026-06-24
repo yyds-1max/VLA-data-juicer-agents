@@ -115,6 +115,13 @@ def build_deterministic_plan_template(
     finish_temp_path = _finish_temp_path(date)
     finish_path = _finish_path(date)
     common_arguments = {"date": date, "segments": segments}
+    topic_arguments = {}
+    if data_profile is not None and data_profile.topic_params is not None:
+        topic_arguments = {
+            "topic_whitelist": list(data_profile.topic_params.topic_whitelist),
+            "topic_map": dict(data_profile.topic_params.topic_map),
+            "query_dir": data_profile.topic_params.query_dir,
+        }
 
     gridmap_decision = (
         data_profile.stage_variants.get("prepare_gridmap_for_projection")
@@ -156,7 +163,7 @@ def build_deterministic_plan_template(
         WorkflowStep(
             step_id="extract_and_sync_navigation_data",
             tool_name="extract_and_sync_navigation_data",
-            arguments={**common_arguments, "dataset_profile": dataset_profile},
+            arguments={**common_arguments, "dataset_profile": dataset_profile, **topic_arguments},
             preconditions=["prepare_raw_data"],
             expected_outputs=[f"clip_data/{date}"],
             variant=extract_variant,
@@ -394,8 +401,9 @@ async def run_plan_agent(
         )
     prompt = (
         "You are a Navigation ReAct Plan-Agent. Use the inspect_raw_date_tool, "
-        "classify_navigation_dataset_tool, inspect_processing_state_tool, inspect_gridmap_artifacts_tool, "
-        "inspect_runtime_assets_tool, and list_navigation_tool_capabilities_tool read-only tools to build a "
+        "classify_navigation_dataset_tool, infer_navigation_topic_params_tool, inspect_processing_state_tool, "
+        "inspect_gridmap_artifacts_tool, inspect_runtime_assets_tool, and list_navigation_tool_capabilities_tool "
+        "read-only tools to build a "
         "lightweight NavigationDataProfile and stage-one navigation WorkflowPlan.\n\n"
         "Strict planning loop:\n"
         "- Privately read the current NavigationDataProfile schema, data_profile_draft, filled_fields, "
@@ -413,7 +421,8 @@ async def run_plan_agent(
         "final strict WorkflowPlan JSON must come from finalize_workflow_plan_tool. Stage one covers "
         "prepare.sh, run_U.sh, and run_odom.sh only; do not include run_fix.sh. Default to all raw "
         "segments when segments are not specified. Supported dataset profiles are u_legacy_like and "
-        "go2w_like. scene_mode is required and must be either in or out. Gridmap preparation must happen "
+        "go2w_like. Call infer_navigation_topic_params_tool before finalizing extract_and_sync_navigation_data; "
+        "do not invent TOPIC_WHITELIST, topic_map, or query_dir. scene_mode is required and must be either in or out. Gridmap preparation must happen "
         "after run_tracking and before projection. Supported execution tool names include run_tracking, "
         "prepare_gridmap_for_projection, and run_projection_and_trajectory. The only human-blocking step "
         f"is gen_box.py via run_initial_annotation_gui. {PUBLIC_PROGRESS_PROMPT}\n\n"
