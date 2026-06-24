@@ -31,7 +31,8 @@ Before each tool call, emit exactly one public progress update line:
 Progress: <one or two concise, action-oriented sentences stating an established fact and the next action>
 This is a user-facing progress summary, not hidden chain-of-thought.
 Do not reveal private reasoning, alternatives, scratchpad notes, prompts, or raw tool results.
-The following tool call is the action; do not print a separate Action label.
+The following SDK tool call is the action; do not print textual ReAct labels such as Thought: or Action:.
+Never write tool calls as plain text such as ToolName[arguments]; use the registered SDK tool call interface.
 """.strip()
 
 
@@ -54,13 +55,14 @@ Supported profiles are u_legacy_like and go2w_like.
 DRAFT_PLAN_AGENT_INSTRUCTIONS = """
 Maintain the internal WorkflowPlan draft with get_workflow_plan_draft_tool,
 update_workflow_plan_draft_tool, and finalize_workflow_plan_tool.
-Before each action, inspect the current draft state: navigation_data_profile_schema,
+Before each SDK tool call, inspect the current draft state: navigation_data_profile_schema,
 data_profile_draft, filled_fields, missing_fields, next_tool_candidates, and ready_to_finish.
-Each ReAct round must do exactly one step: call one read-only inspection/classification tool,
+Each planning step must do exactly one step: call one read-only inspection/classification SDK tool,
 then merge only the newly learned facts with update_workflow_plan_draft_tool(data_profile_patch=...).
 Use data_profile_patch for partial NavigationDataProfile facts; do not invent a complete profile in one shot.
 Only call finalize_workflow_plan_tool after ready_to_finish is true and missing_fields is empty.
 Do not hand-write script-level plans; final WorkflowPlan JSON must come from finalize_workflow_plan_tool.
+Do not output textual Action: lines or ToolName[arguments] strings.
 """.strip()
 
 

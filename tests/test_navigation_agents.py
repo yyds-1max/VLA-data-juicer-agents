@@ -664,6 +664,8 @@ def test_navigation_prompts_require_concise_action_oriented_progress():
         assert "next action" in instructions
         assert "not hidden chain-of-thought" in instructions
         assert "Do not reveal private reasoning" in instructions
+        assert "do not print textual ReAct labels" in instructions
+        assert "ToolName[arguments]" in instructions
 
     request = NavigationRequest(date="20270605", dry_run=True, scene_mode="out")
     plan = build_deterministic_plan_template("20270605", "go2w_like", None, scene_mode="out")
@@ -684,3 +686,6 @@ def test_navigation_prompts_require_concise_action_oriented_progress():
 
     assert "Progress: <one or two concise, action-oriented sentences" in plan_agent.prompts[0]
     assert "Progress: <one or two concise, action-oriented sentences" in executor_agent.prompts[0]
+    assert "Action: choose" not in plan_agent.prompts[0]
+    assert "Call one read-only tool with ToolName[arguments]" not in plan_agent.prompts[0]
+    assert "Do not output textual Thought: or Action: lines" in plan_agent.prompts[0]
