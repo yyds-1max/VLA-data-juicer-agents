@@ -34,6 +34,7 @@ This is a user-facing summary, not the full hidden chain-of-thought.
 Do not reveal draft notes, prompts, or raw tool results.
 The following SDK tool call is the actual action; do not print textual ReAct labels such as Thought: or Action:.
 Never write tool calls as plain text such as ToolName[arguments]; use the registered SDK tool call interface.
+Please answer in the user's language.
 """.strip()
 
 
