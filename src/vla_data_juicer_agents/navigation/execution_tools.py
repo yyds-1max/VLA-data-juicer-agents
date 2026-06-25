@@ -109,6 +109,21 @@ def _commands_and_outputs_ok(commands, produced_paths: list[Path], dry_run: bool
     return dry_run or all(path.exists() for path in produced_paths)
 
 
+def _missing_topic_param_names(
+    topic_whitelist: list[str] | None,
+    topic_map: dict[str, str] | None,
+    query_dir: str | None,
+) -> list[str]:
+    missing = []
+    if not topic_whitelist:
+        missing.append("topic_whitelist")
+    if not topic_map:
+        missing.append("topic_map")
+    if not query_dir:
+        missing.append("query_dir")
+    return missing
+
+
 def _missing_outputs(produced_paths: list[Path], dry_run: bool) -> list[Path]:
     if dry_run:
         return []
@@ -441,21 +456,30 @@ def extract_and_sync_navigation_data(
     date = _validate_date(date)
     settings = settings or NavigationSettings()
     profile = get_profile(dataset_profile)
+    missing_topic_params = _missing_topic_param_names(topic_whitelist, topic_map, query_dir)
+    if missing_topic_params:
+        return ToolResult(
+            ok=False,
+            tool_name="extract_and_sync_navigation_data",
+            message=(
+                "Missing required explicit navigation topic parameter(s): "
+                + ", ".join(missing_topic_params)
+            ),
+            produced_paths=[settings.clip_data_root / date],
+            details={
+                "profile": profile.name,
+                "missing_topic_params": missing_topic_params,
+                "dry_run": dry_run,
+            },
+        )
     raw_temp_path = settings.raw_data_root / f"{date}_temp"
     if dry_run:
         selected = _selected_segments_for_dry_run(raw_temp_path, settings.raw_data_root / date, segments)
     else:
         selected = _selected_segments(raw_temp_path, segments)
-    if profile.name == "u_legacy_like":
-        extract_script_name = "1_extract_data_from_bag_multi_process_ros2_U_legacy.py"
-        sync_script_name = "2_sync_data_multi_process_U_legacy.py"
-    else:
-        extract_script_name = "1_extract_data_from_bag_multi_process_ros2_U.py"
-        sync_script_name = "2_sync_data_multi_process_U.py"
-    use_repository_scripts = topic_whitelist is not None or topic_map is not None or query_dir is not None
-    effective_topic_whitelist = list(topic_whitelist or profile.extract_topics)
-    effective_topic_map = dict(topic_map or profile.sync_topic_map)
-    effective_query_dir = query_dir or profile.lidar_dirs[-1]
+    effective_topic_whitelist = list(topic_whitelist)
+    effective_topic_map = dict(topic_map)
+    effective_query_dir = query_dir
     commands = []
     if not selected:
         return ToolResult(
@@ -469,7 +493,7 @@ def extract_and_sync_navigation_data(
                 "extract_topics": effective_topic_whitelist,
                 "sync_topic_map": effective_topic_map,
                 "query_dir": effective_query_dir,
-                "script_source": "repository" if use_repository_scripts else "profile_fallback",
+                "script_source": "repository",
                 "dry_run": dry_run,
             },
         )
@@ -480,14 +504,13 @@ def extract_and_sync_navigation_data(
         config_dir = save_path / "_agent_config"
         topic_whitelist_file = config_dir / "topic_whitelist.json"
         topic_map_file = config_dir / "topic_map.json"
-        if use_repository_scripts:
-            _write_json_parameter_file(topic_whitelist_file, effective_topic_whitelist, dry_run)
-            _write_json_parameter_file(topic_map_file, effective_topic_map, dry_run)
+        _write_json_parameter_file(topic_whitelist_file, effective_topic_whitelist, dry_run)
+        _write_json_parameter_file(topic_map_file, effective_topic_map, dry_run)
         commands.append(
             run_command(
                 run_u_python_command(
                     settings.runtime,
-                    script_name=REPOSITORY_EXTRACT_SCRIPT if use_repository_scripts else extract_script_name,
+                    script_name=REPOSITORY_EXTRACT_SCRIPT,
                     args=[
                         "--data_path",
                         data_path,
@@ -496,63 +519,37 @@ def extract_and_sync_navigation_data(
                         "--processes_num",
                         str(processes_num),
                     ]
-                    + (
-                        ["--topic_whitelist_file", topic_whitelist_file]
-                        if use_repository_scripts
-                        else []
-                    ),
+                    + ["--topic_whitelist_file", topic_whitelist_file],
                     ros2_setup_bash=settings.ros2_setup_bash,
                     ros2_ws_setup_bash=settings.ros2_ws_setup_bash,
                     shm_msgs_lib_dir=settings.shm_msgs_lib_dir,
                 ),
-                cwd=None if use_repository_scripts else settings.datatoolbox_src,
+                cwd=None,
                 dry_run=dry_run,
             )
         )
-        sync_command = (
-            python_data_command(
-                settings.runtime,
-                REPOSITORY_SYNC_SCRIPT,
-                [
-                    "--data_path",
-                    save_path,
-                    "--query_dir",
-                    effective_query_dir,
-                    "--output_dir",
-                    "sync_data",
-                    "--sequence_prefix",
-                    f"{segment}_zhigu_wuhan",
-                    "--processes_num",
-                    str(processes_num),
-                    "--topic_map_file",
-                    topic_map_file,
-                ],
-            )
-            if use_repository_scripts
-            else run_u_python_command(
-                settings.runtime,
-                script_name=sync_script_name,
-                args=[
-                    "--data_path",
-                    save_path,
-                    "--query_dir",
-                    effective_query_dir,
-                    "--output_dir",
-                    "sync_data",
-                    "--sequence_prefix",
-                    f"{segment}_zhigu_wuhan",
-                    "--processes_num",
-                    str(processes_num),
-                ],
-                ros2_setup_bash=settings.ros2_setup_bash,
-                ros2_ws_setup_bash=settings.ros2_ws_setup_bash,
-                shm_msgs_lib_dir=settings.shm_msgs_lib_dir,
-            )
+        sync_command = python_data_command(
+            settings.runtime,
+            REPOSITORY_SYNC_SCRIPT,
+            [
+                "--data_path",
+                save_path,
+                "--query_dir",
+                effective_query_dir,
+                "--output_dir",
+                "sync_data",
+                "--sequence_prefix",
+                f"{segment}_zhigu_wuhan",
+                "--processes_num",
+                str(processes_num),
+                "--topic_map_file",
+                topic_map_file,
+            ],
         )
         commands.append(
             run_command(
                 sync_command,
-                cwd=None if use_repository_scripts else settings.datatoolbox_src,
+                cwd=None,
                 dry_run=dry_run,
             )
         )
@@ -590,7 +587,7 @@ def extract_and_sync_navigation_data(
             "extract_topics": effective_topic_whitelist,
             "sync_topic_map": effective_topic_map,
             "query_dir": effective_query_dir,
-            "script_source": "repository" if use_repository_scripts else "profile_fallback",
+            "script_source": "repository",
             "missing_sync_data": [str(path) for path in missing_sync_data],
             "missing_sync_topic_dirs": missing_sync_topic_dirs,
             "dry_run": dry_run,

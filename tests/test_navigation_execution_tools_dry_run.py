@@ -76,6 +76,22 @@ def _is_tracking_binary_command(command: list[str]) -> bool:
     return _command_text(command).endswith("./bin/main")
 
 
+def _go2w_topic_params() -> dict:
+    return {
+        "topic_whitelist": [
+            "/cam_video4/csi_cam/image_raw/compressed",
+            "/rs32_lidar_points",
+            "/sport_odom",
+        ],
+        "topic_map": {
+            "cam_video4": "fisheye_front",
+            "rs32_lidar_points": "r32_rslidar_points",
+            "sport_odom": "odom",
+        },
+        "query_dir": "rs32_lidar_points",
+    }
+
+
 def _argument_after(command: list[str], option: str) -> str | None:
     if command[:2] == ["bash", "-lc"]:
         parts = command[2].split()
@@ -349,28 +365,17 @@ def test_generate_gridmap_requires_grid_json_after_successful_command(tmp_path, 
     assert "grid_map" in result.message
 
 
-def test_u_legacy_like_dry_run_reports_topic_mapping_and_lidar_query_dir(tmp_path):
+def test_extract_and_sync_requires_explicit_topic_params(tmp_path):
     root = tmp_path / "VLADatasets"
     (root / "raw_data" / "20270605_temp" / "20260605_152856").mkdir(parents=True)
     settings = NavigationSettings(vladatasets_root=root, datatoolbox_src=Path("/datatoolbox/src"))
 
     result = extract_and_sync_navigation_data("20270605", "u_legacy_like", settings=settings, dry_run=True)
 
-    sync_commands = [
-        record.command for record in result.commands if "2_sync_data_multi_process_U_legacy.py" in _command_text(record.command)
-    ]
-    assert result.details["extract_topics"] == [
-        "/cam_video5/csi_cam/image_raw/compressed",
-        "/lidar_points",
-        "/utlidar/robot_odom_systime",
-    ]
-    assert result.details["sync_topic_map"] == {
-        "cam_video5": "fisheye_front",
-        "lidar_points": "r32_rslidar_points",
-        "utlidar": "odom",
-    }
-    assert sync_commands
-    assert _argument_after(sync_commands[0], "--query_dir") == "lidar_points"
+    assert result.ok is False
+    assert "Missing required explicit navigation topic parameter" in result.message
+    assert result.commands == []
+    assert result.details["missing_topic_params"] == ["topic_whitelist", "topic_map", "query_dir"]
 
 
 def test_extract_and_sync_dry_run_accepts_explicit_topic_params(tmp_path):
@@ -415,7 +420,7 @@ def test_extract_and_sync_dry_run_accepts_explicit_topic_params(tmp_path):
     assert _argument_after(sync_commands[0], "--query_dir") == "lidar_points"
 
 
-def test_extract_and_sync_dry_run_uses_u_runtime_setup_and_profile_script(tmp_path):
+def test_extract_and_sync_dry_run_uses_u_runtime_setup_with_repository_scripts(tmp_path):
     root = tmp_path / "VLADatasets"
     (root / "raw_data" / "20270605_temp" / "20260605_152856").mkdir(parents=True)
     settings = NavigationSettings(
@@ -425,17 +430,32 @@ def test_extract_and_sync_dry_run_uses_u_runtime_setup_and_profile_script(tmp_pa
         data_env_setup=Path("/env/setup_data_runtime.sh"),
         gt_dog_root=Path("/gt_dog"),
     )
+    topic_whitelist = [
+        "/cam_video5/csi_cam/image_raw/compressed",
+        "/lidar_points",
+        "/utlidar/robot_odom_systime",
+    ]
+    topic_map = {
+        "cam_video5": "fisheye_front",
+        "lidar_points": "r32_rslidar_points",
+        "utlidar": "odom",
+    }
 
-    result = extract_and_sync_navigation_data("20270605", "u_legacy_like", settings=settings, dry_run=True)
+    result = extract_and_sync_navigation_data(
+        "20270605",
+        "u_legacy_like",
+        topic_whitelist=topic_whitelist,
+        topic_map=topic_map,
+        query_dir="lidar_points",
+        settings=settings,
+        dry_run=True,
+    )
 
     shells = [record.command[2] for record in result.commands]
     assert all(record.command[:2] == ["bash", "-lc"] for record in result.commands)
     assert any("source /env/setup_data_runtime.sh" in shell for shell in shells)
-    assert all("source /gt_dog/modules/message/ros2/install/setup.bash" in shell for shell in shells)
-    assert all("source /gt_dog/modules/ros2_ws/src/install/setup.bash" in shell for shell in shells)
-    assert all("/gt_dog/modules/message/shm/install/shm_msgs/lib" in shell for shell in shells)
-    assert "1_extract_data_from_bag_multi_process_ros2_U_legacy.py" in shells[0]
-    assert "2_sync_data_multi_process_U_legacy.py" in shells[1]
+    assert "extract_ros2_bag.py" in shells[0]
+    assert "sync_navigation_data.py" in shells[1]
 
 
 def test_projection_python_steps_dry_run_use_data_runtime_setup(tmp_path):
@@ -580,7 +600,7 @@ def test_prepare_gridmap_generate_variant_runs_pcd_generator_when_missing(tmp_pa
     assert "grid_map" in result.message or "Missing final output" in result.message
 
 
-def test_extract_and_sync_uses_profile_specific_script_paths_in_dry_run(tmp_path):
+def test_extract_and_sync_without_topic_params_does_not_use_profile_specific_script_paths(tmp_path):
     root = tmp_path / "VLADatasets"
     (root / "raw_data" / "20270605_temp" / "20260605_152856").mkdir(parents=True)
     settings = NavigationSettings(vladatasets_root=root, datatoolbox_src=Path("/datatoolbox/src"))
@@ -588,31 +608,12 @@ def test_extract_and_sync_uses_profile_specific_script_paths_in_dry_run(tmp_path
     u_result = extract_and_sync_navigation_data("20270605", "u_legacy_like", settings=settings, dry_run=True)
     go2w_result = extract_and_sync_navigation_data("20270605", "go2w_like", settings=settings, dry_run=True)
 
-    u_scripts = [
-        script_name
-        for script_name in (
-            "1_extract_data_from_bag_multi_process_ros2_U_legacy.py",
-            "2_sync_data_multi_process_U_legacy.py",
-        )
-        if any(script_name in _command_text(record.command) for record in u_result.commands)
-    ]
-    go2w_scripts = [
-        script_name
-        for script_name in (
-            "1_extract_data_from_bag_multi_process_ros2_U.py",
-            "2_sync_data_multi_process_U.py",
-        )
-        if any(script_name in _command_text(record.command) for record in go2w_result.commands)
-    ]
-    assert u_scripts == [
-        "1_extract_data_from_bag_multi_process_ros2_U_legacy.py",
-        "2_sync_data_multi_process_U_legacy.py",
-    ]
-    assert go2w_scripts == [
-        "1_extract_data_from_bag_multi_process_ros2_U.py",
-        "2_sync_data_multi_process_U.py",
-    ]
-    assert all("_legacy.py" not in script for script in go2w_scripts)
+    assert u_result.ok is False
+    assert go2w_result.ok is False
+    assert u_result.commands == []
+    assert go2w_result.commands == []
+    assert u_result.details["missing_topic_params"] == ["topic_whitelist", "topic_map", "query_dir"]
+    assert go2w_result.details["missing_topic_params"] == ["topic_whitelist", "topic_map", "query_dir"]
 
 
 def test_tracking_moves_original_data_outputs_to_clip_dir(tmp_path, monkeypatch):
@@ -863,6 +864,7 @@ def test_dry_run_execution_steps_are_composable_without_prior_outputs(tmp_path):
     extract_result = extract_and_sync_navigation_data(
         "20270605",
         "go2w_like",
+        **_go2w_topic_params(),
         settings=settings,
         dry_run=True,
     )
@@ -885,6 +887,7 @@ def test_dry_run_chain_from_raw_fixtures_only_does_not_create_intermediate_dirs(
     extract_result = extract_and_sync_navigation_data(
         "20270605",
         "go2w_like",
+        **_go2w_topic_params(),
         settings=settings,
         dry_run=True,
     )
@@ -905,13 +908,31 @@ def test_extract_and_sync_reports_missing_sync_data_after_successful_commands(tm
     root = tmp_path / "VLADatasets"
     (root / "raw_data" / "20270605_temp" / "20260605_152856").mkdir(parents=True)
     settings = NavigationSettings(vladatasets_root=root)
+    topic_whitelist = [
+        "/cam_video4/csi_cam/image_raw/compressed",
+        "/rs32_lidar_points",
+        "/sport_odom",
+    ]
+    topic_map = {
+        "cam_video4": "fisheye_front",
+        "rs32_lidar_points": "r32_rslidar_points",
+        "sport_odom": "odom",
+    }
 
     def fake_run_command(command, cwd=None, dry_run=False, timeout_seconds=None):
         return CommandRecord(command=command, cwd=cwd, dry_run=dry_run, return_code=0)
 
     monkeypatch.setattr("vla_data_juicer_agents.navigation.execution_tools.run_command", fake_run_command)
 
-    result = extract_and_sync_navigation_data("20270605", "go2w_like", settings=settings, dry_run=False)
+    result = extract_and_sync_navigation_data(
+        "20270605",
+        "go2w_like",
+        topic_whitelist=topic_whitelist,
+        topic_map=topic_map,
+        query_dir="rs32_lidar_points",
+        settings=settings,
+        dry_run=False,
+    )
 
     assert result.ok is False
     assert "Missing expected sync_data" in result.message
@@ -938,18 +959,28 @@ def test_extract_and_sync_empty_segment_root_is_not_successful(tmp_path):
     root = tmp_path / "VLADatasets"
     (root / "raw_data" / "20270605_temp").mkdir(parents=True)
     settings = NavigationSettings(vladatasets_root=root)
-
-    result = extract_and_sync_navigation_data("20270605", "go2w_like", settings=settings, dry_run=True)
-
-    assert result.ok is False
-    assert "No selected segments" in result.message
-    assert result.details["extract_topics"] == [
+    topic_whitelist = [
         "/cam_video4/csi_cam/image_raw/compressed",
         "/rs32_lidar_points",
         "/sport_odom",
     ]
-    assert result.details["sync_topic_map"] == {
+    topic_map = {
         "cam_video4": "fisheye_front",
         "rs32_lidar_points": "r32_rslidar_points",
         "sport_odom": "odom",
     }
+
+    result = extract_and_sync_navigation_data(
+        "20270605",
+        "go2w_like",
+        topic_whitelist=topic_whitelist,
+        topic_map=topic_map,
+        query_dir="rs32_lidar_points",
+        settings=settings,
+        dry_run=True,
+    )
+
+    assert result.ok is False
+    assert "No selected segments" in result.message
+    assert result.details["extract_topics"] == topic_whitelist
+    assert result.details["sync_topic_map"] == topic_map

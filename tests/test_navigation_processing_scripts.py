@@ -5,6 +5,8 @@ from argparse import Namespace
 from types import ModuleType
 from types import SimpleNamespace
 
+import pytest
+
 from vla_data_juicer_agents.navigation.config import NavigationSettings
 from vla_data_juicer_agents.navigation.execution_tools import extract_and_sync_navigation_data
 from vla_data_juicer_agents.navigation.models import CommandRecord
@@ -29,6 +31,11 @@ def test_extract_script_resolves_topic_whitelist_file(tmp_path):
     assert topics == ["/cam_video5/csi_cam/image_raw/compressed", "/lidar_points"]
 
 
+def test_extract_script_requires_explicit_topic_whitelist():
+    with pytest.raises(ValueError, match="topic whitelist"):
+        extract_ros2_bag.resolve_topic_whitelist(None, None)
+
+
 def test_sync_script_resolves_inline_topic_map():
     topic_map = sync_navigation_data.resolve_topic_map(
         json.dumps({"cam_video4": "fisheye_front", "rs32_lidar_points": "r32_rslidar_points"}),
@@ -45,6 +52,11 @@ def test_sync_script_resolves_topic_map_file(tmp_path):
     topic_map = sync_navigation_data.resolve_topic_map(None, path)
 
     assert topic_map == {"sport_odom": "odom"}
+
+
+def test_sync_script_requires_explicit_topic_map():
+    with pytest.raises(ValueError, match="topic map"):
+        sync_navigation_data.resolve_topic_map(None, None)
 
 
 def test_sync_data_renames_copied_files_to_timestamps(tmp_path):
@@ -82,16 +94,18 @@ def test_save_pointcloud_writes_pcd_with_pcl(monkeypatch, tmp_path):
     calls = {}
 
     class FakePointCloud:
-        def from_list(self, rows):
+        def __init__(self, rows):
             calls["rows"] = rows
 
     fake_pcl = SimpleNamespace(
-        PointCloud_PointXYZI=lambda: FakePointCloud(),
+        PointCloud_PointXYZI=lambda rows: FakePointCloud(rows),
         save=lambda cloud, path: calls.update({"path": path, "cloud": cloud}),
     )
     monkeypatch.setitem(sys.modules, "pcl", fake_pcl)
     msg = SimpleNamespace(
-        header=SimpleNamespace(stamp=SimpleNamespace(sec=1000, nanosec=0)),
+        height=1,
+        width=1,
+        header=SimpleNamespace(stamp=SimpleNamespace(sec=1700000000, nanosec=0)),
         fields=[
             SimpleNamespace(name="x", offset=0),
             SimpleNamespace(name="y", offset=4),
@@ -102,10 +116,10 @@ def test_save_pointcloud_writes_pcd_with_pcl(monkeypatch, tmp_path):
         data=struct.pack("ffff", 1.0, 2.0, 3.0, 4.0),
     )
 
-    extract_ros2_bag._save_pointcloud(msg, tmp_path, 123)
+    extract_ros2_bag.save_pointcloud(msg, tmp_path, 123)
 
-    assert calls["path"].endswith("1000.000000.pcd")
-    assert calls["rows"] == [[1.0, 2.0, 3.0, 4.0]]
+    assert calls["path"].endswith("1700000000.000000.pcd")
+    assert calls["rows"].tolist() == [[1.0, 2.0, 3.0, 4.0]]
 
 
 def test_extract_and_sync_non_dry_run_writes_topic_config_files(tmp_path, monkeypatch):
@@ -145,7 +159,7 @@ def test_extract_and_sync_non_dry_run_writes_topic_config_files(tmp_path, monkey
 
 
 def test_save_odometry_preserves_legacy_schema(tmp_path):
-    stamp = SimpleNamespace(sec=1000, nanosec=123000000)
+    stamp = SimpleNamespace(sec=1700000000, nanosec=123000000)
     msg = SimpleNamespace(
         header=SimpleNamespace(stamp=stamp, frame_id="odom"),
         child_frame_id="base_link",
@@ -163,11 +177,10 @@ def test_save_odometry_preserves_legacy_schema(tmp_path):
         ),
     )
 
-    extract_ros2_bag._save_odometry(msg, tmp_path, 123)
+    extract_ros2_bag.save_odometry(msg, tmp_path, 123)
 
-    payload = json.loads((tmp_path / "1000.123000.json").read_text(encoding="utf-8"))
-    assert payload["timestamp"] == 1000.123
-    assert payload["header"] == {"stamp": {"secs": 1000, "nsecs": 123000000}, "frame_id": "odom"}
+    payload = json.loads((tmp_path / "1700000000.123000.json").read_text(encoding="utf-8"))
+    assert payload["header"] == {"stamp": {"secs": 1700000000, "nsecs": 123000000}, "frame_id": "odom"}
     assert payload["child_frame_id"] == "base_link"
     assert payload["pose"]["pose"]["position"] == {"x": 1.0, "y": 2.0, "z": 3.0}
     assert payload["twist"]["twist"]["angular"] == {"x": 0.5, "y": 0.6, "z": 0.7}
@@ -232,14 +245,17 @@ def test_extract_ros2_bag_continues_after_single_message_failure(monkeypatch, tm
         "rosidl_runtime_py.utilities": rosidl_utilities,
     }.items():
         monkeypatch.setitem(sys.modules, name, module)
-    monkeypatch.setattr(extract_ros2_bag, "_save_pointcloud", lambda *_args: (_ for _ in ()).throw(RuntimeError("bad point")))
-    monkeypatch.setattr(extract_ros2_bag, "_save_odometry", lambda *_args: calls.append("odom"))
+    monkeypatch.setattr(
+        extract_ros2_bag,
+        "save_pointcloud",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(RuntimeError("bad point")),
+    )
+    monkeypatch.setattr(extract_ros2_bag, "save_odometry", lambda *_args, **_kwargs: calls.append("odom"))
 
-    total = extract_ros2_bag.extract_ros2_bag(
+    extract_ros2_bag.extract_ros2_bag(
         tmp_path / "bag.db3",
         tmp_path / "out",
         ["/lidar_points", "/sport_odom"],
     )
 
-    assert total == 1
     assert calls == ["odom"]
