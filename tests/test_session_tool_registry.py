@@ -12,6 +12,9 @@ from vla_data_juicer_agents.core.tool import ToolContext, get_tool_spec, list_to
 from vla_data_juicer_agents.capabilities.session.orchestrator import VLASessionAgent
 from vla_data_juicer_agents.capabilities.session.runtime import SessionState, SessionToolRuntime
 from vla_data_juicer_agents.capabilities.session.toolkit import _tool_context, get_session_tool_specs
+from vla_data_juicer_agents.navigation.agents import EXECUTOR_AGENT_INSTRUCTIONS
+from vla_data_juicer_agents.navigation.config import NavigationSettings
+from vla_data_juicer_agents.navigation.execution_tools import create_navigation_execution_tools
 from vla_data_juicer_agents.tools.vla.run_workflow import _normalize_model, _normalize_segments, run_vla_workflow
 
 
@@ -44,11 +47,26 @@ def test_session_toolkit_exposes_vla_workflow_input_schema():
     assert "response_language" in properties
 
 
+def test_navigation_execution_tools_include_calibration_confirmation_tool():
+    tools = create_navigation_execution_tools(settings=NavigationSettings(), dry_run=True)
+    names = [tool.name for tool in tools]
+
+    assert "confirm_navigation_calibration_params_tool" in names
+
+
+def test_executor_instructions_use_generic_step_to_tool_mapping_for_calibration_confirmation():
+    assert 'same name plus "_tool"' in EXECUTOR_AGENT_INSTRUCTIONS
+    assert "confirm_navigation_calibration_params_tool" not in EXECUTOR_AGENT_INSTRUCTIONS
+    assert "When executing confirm_navigation_calibration_params" in EXECUTOR_AGENT_INSTRUCTIONS
+
+
 def test_session_prompt_routes_complex_vla_requests_to_workflow():
     agent = VLASessionAgent(use_llm_router=False)
     prompt = agent.session_system_prompt()
 
     assert "call vla_run_workflow exactly once" in prompt
+    assert "Navigation planning uses sensor bindings and processing_profile" in prompt
+    assert "Fixed platform names are hints, not hard execution categories" in prompt
     assert "response_language" in prompt
     assert "Set vla_run_workflow.response_language to the user's language" in prompt
     assert "Do not use deterministic Python keyword routing" in prompt
@@ -834,10 +852,16 @@ def test_vla_run_workflow_tool_reuses_plan_and_executor_agents(tmp_path, monkeyp
     emitter = EventEmitter(CallbackEventSink(events.append))
     parent_scope = emitter.scope("session", run_id="session-run")
     cancellation = CancellationContext()
+    plan_payload = {
+        "date": "20270605",
+        "processing_profile": "parameterized_navigation_v1",
+        "platform_hint": "go2w",
+        "steps": [],
+    }
 
     plan = SimpleNamespace(
-        model_dump=lambda mode="json": {"date": "20270605", "dataset_profile": "go2w_like", "steps": []},
-        model_dump_json=lambda: json.dumps({"date": "20270605", "dataset_profile": "go2w_like", "steps": []}),
+        model_dump=lambda mode="json": plan_payload,
+        model_dump_json=lambda: json.dumps(plan_payload),
     )
 
     async def fake_run_plan_agent(
@@ -965,7 +989,12 @@ def test_vla_run_workflow_prefers_scope_emitter_over_independent_emitter(tmp_pat
     independent_emitter = EventEmitter(CallbackEventSink(independent_events.append))
     parent_scope = scope_emitter.scope("session", run_id="session-run")
     plan = SimpleNamespace(
-        model_dump=lambda mode="json": {"date": "20270605", "dataset_profile": "go2w_like", "steps": []},
+        model_dump=lambda mode="json": {
+            "date": "20270605",
+            "processing_profile": "parameterized_navigation_v1",
+            "platform_hint": "go2w",
+            "steps": [],
+        },
     )
 
     async def fake_run_plan_agent(*args, **kwargs):
@@ -1013,7 +1042,8 @@ def test_vla_run_workflow_redacts_child_events_in_callback_and_jsonl(tmp_path, m
     plan = SimpleNamespace(
         model_dump=lambda mode="json": {
             "date": "20270605",
-            "dataset_profile": "go2w_like",
+            "processing_profile": "parameterized_navigation_v1",
+            "platform_hint": "go2w",
             "steps": [],
         },
     )

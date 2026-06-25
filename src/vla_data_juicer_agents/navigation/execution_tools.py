@@ -1324,6 +1324,18 @@ def build_execution_tools(
     ]
 
 
+def create_navigation_execution_tools(
+    dry_run: bool = False,
+    cancellation: CancellationContext | None = None,
+    settings: NavigationSettings | None = None,
+) -> list[Any]:
+    return build_execution_tools(
+        dry_run=dry_run,
+        cancellation=cancellation,
+        settings=settings,
+    )
+
+
 (
     prepare_raw_data_tool,
     extract_and_sync_navigation_data_tool,

@@ -54,6 +54,8 @@ class VLASessionAgent:
             "Do not use deterministic Python keyword routing for user intent. The LLM must decide when to call tools.\n"
             "For VLA, navigation, ROS bag, db3, odom, trajectory, gridmap, gen_box.py, or annotation processing requests, "
             "call vla_run_workflow exactly once with parsed date, segments, dry_run, approve, response_language, and model when known.\n"
+            "Navigation planning uses sensor bindings and processing_profile. "
+            "Fixed platform names are hints, not hard execution categories.\n"
             "Set vla_run_workflow.response_language to the user's language, for example Chinese for Chinese requests.\n"
             "Default to dry_run=false and perform real data processing for normal user requests.\n"
             "Set dry_run=true only when the user explicitly says dry_run in the request.\n"
