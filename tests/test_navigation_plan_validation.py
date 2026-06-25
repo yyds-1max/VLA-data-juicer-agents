@@ -37,7 +37,8 @@ def _go2w_data_profile() -> NavigationDataProfile:
     return NavigationDataProfile(
         date="20270605",
         scene_mode="out",
-        processing_profile=_processing_profile(profile_hint="go2w_like"),
+        processing_profile=_processing_profile(profile_hint="go2w_like", platform_hint="go2w"),
+        platform_hint="go2w",
         localization_policy={"source": "odom", "conversion": "odom_to_ins"},
         topic_params=_topic_params("go2w_like"),
     )
@@ -47,7 +48,7 @@ def test_validate_workflow_plan_accepts_default_template():
     profile = _go2w_data_profile()
     plan = build_deterministic_plan_template(
         "20270605",
-        "go2w_like",
+        "parameterized_navigation_v1",
         None,
         scene_mode="out",
         data_profile=profile,
@@ -78,7 +79,7 @@ def test_validate_workflow_plan_rejects_unknown_variant():
     profile = _go2w_data_profile()
     plan = build_deterministic_plan_template(
         "20270605",
-        "go2w_like",
+        "parameterized_navigation_v1",
         None,
         scene_mode="out",
         data_profile=profile,
@@ -92,7 +93,7 @@ def test_validate_workflow_plan_rejects_unknown_variant():
     assert result["errors"][0]["type"] == "unknown_or_unavailable_variant"
 
 
-def test_validate_workflow_plan_checks_legacy_dataset_profile_selectors_from_processing_facts():
+def test_validate_workflow_plan_checks_platform_selectors_from_processing_facts():
     profile = _go2w_data_profile()
     plan = WorkflowPlan(
         date="20270605",
@@ -112,16 +113,16 @@ def test_validate_workflow_plan_checks_legacy_dataset_profile_selectors_from_pro
 
     assert result["ok"] is False
     assert result["errors"][0]["type"] == "variant_selector_mismatch"
-    assert result["errors"][0]["details"]["selector"] == "dataset_profile"
-    assert result["errors"][0]["details"]["actual"] == "go2w_like"
+    assert result["errors"][0]["details"]["selector"] == "platform_hint"
+    assert result["errors"][0]["details"]["actual"] == "go2w"
 
 
-def test_validate_workflow_plan_derives_legacy_dataset_profile_from_plan_only_facts():
+def test_validate_workflow_plan_accepts_legacy_processing_profile_from_plan_only_facts():
     plan = WorkflowPlan(
         date="20270605",
         scene_mode="out",
         processing_profile="go2w_like",
-        platform_hint="unknown",
+        platform_hint="go2w",
         steps=[
             WorkflowStep(
                 step_id="extract_and_sync_navigation_data",
@@ -142,15 +143,15 @@ def test_validate_workflow_plan_derives_legacy_dataset_profile_from_plan_only_fa
 
     assert result["ok"] is False
     assert result["errors"][0]["type"] == "variant_selector_mismatch"
-    assert result["errors"][0]["details"]["selector"] == "dataset_profile"
-    assert result["errors"][0]["details"]["actual"] == "u_legacy_like"
+    assert result["errors"][0]["details"]["selector"] == "platform_hint"
+    assert result["errors"][0]["details"]["actual"] == "u"
 
 
 def test_validate_workflow_plan_rejects_gridmap_before_tracking():
     profile = _go2w_data_profile()
     plan = build_deterministic_plan_template(
         "20270605",
-        "go2w_like",
+        "parameterized_navigation_v1",
         None,
         scene_mode="out",
         data_profile=profile,
@@ -168,7 +169,7 @@ def test_validate_workflow_plan_rejects_gridmap_before_tracking():
 def test_validate_workflow_plan_rejects_active_plan_with_blocking_profile():
     plan = build_deterministic_plan_template(
         "20270605",
-        "go2w_like",
+        "parameterized_navigation_v1",
         None,
         scene_mode="out",
     )
@@ -190,13 +191,14 @@ def test_validate_workflow_plan_rejects_variant_selector_mismatch():
     profile = NavigationDataProfile(
         date="20270605",
         scene_mode="out",
-        processing_profile=_processing_profile(),
+        processing_profile=_processing_profile(platform_hint="go2w"),
+        platform_hint="go2w",
         localization_policy={"source": "odom", "conversion": "odom_to_ins"},
         gridmap_source="existing_gridmap",
     )
     plan = build_deterministic_plan_template(
         "20270605",
-        "go2w_like",
+        "parameterized_navigation_v1",
         None,
         scene_mode="out",
         data_profile=profile,
@@ -221,7 +223,7 @@ def test_validate_workflow_plan_blocks_unknown_gridmap_without_issue():
     )
     plan = build_deterministic_plan_template(
         "20270605",
-        "go2w_like",
+        "parameterized_navigation_v1",
         None,
         scene_mode="out",
         data_profile=profile,

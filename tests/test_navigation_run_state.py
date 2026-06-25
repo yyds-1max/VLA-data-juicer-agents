@@ -13,7 +13,8 @@ def test_workflow_run_store_writes_request_and_plan(tmp_path):
     plan = WorkflowPlan(
         date="20270605",
         scene_mode="out",
-        dataset_profile="go2w_like",
+        processing_profile="parameterized_navigation_v1",
+        platform_hint="go2w",
         steps=[WorkflowStep(step_id="prepare", tool_name="prepare_raw_data")],
     )
 

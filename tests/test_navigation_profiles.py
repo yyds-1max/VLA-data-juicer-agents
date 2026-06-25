@@ -1,7 +1,7 @@
 from vla_data_juicer_agents.navigation.profiles import classify_topics, get_profile
 
 
-def test_classifies_20270515_topic_family():
+def test_legacy_profile_registry_classifies_20270515_topic_family():
     topics = {
         "/cam_video5/csi_cam/image_raw/compressed",
         "/lidar_points",
@@ -14,7 +14,7 @@ def test_classifies_20270515_topic_family():
     assert result.confidence == 1.0
 
 
-def test_classifies_20270605_topic_family():
+def test_legacy_profile_registry_classifies_20270605_topic_family():
     topics = {
         "/cam_video4/csi_cam/image_raw/compressed",
         "/rs32_lidar_points",
@@ -27,7 +27,7 @@ def test_classifies_20270605_topic_family():
     assert result.confidence == 1.0
 
 
-def test_profile_contains_sync_mapping():
+def test_legacy_profile_registry_contains_sync_mapping():
     profile = get_profile("go2w_like")
 
     assert profile.sync_topic_map["cam_video4"] == "fisheye_front"

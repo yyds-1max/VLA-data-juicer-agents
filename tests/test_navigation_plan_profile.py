@@ -19,8 +19,8 @@ def _complete_stage_variants(gridmap_variant: str, gridmap_reason: str, gridmap_
     return {
         "extract_and_sync_navigation_data": StageVariantDecision(
             variant="go2w_like",
-            reason="dataset classified as go2w_like",
-            evidence=["classify_navigation_dataset_tool"],
+            reason="processing profile inferred go2w platform bindings",
+            evidence=["infer_navigation_processing_profile_tool"],
         ),
         "prepare_gridmap_for_projection": StageVariantDecision(
             variant=gridmap_variant,
@@ -29,7 +29,7 @@ def _complete_stage_variants(gridmap_variant: str, gridmap_reason: str, gridmap_
         ),
         "run_projection_and_trajectory": StageVariantDecision(
             variant="cjl_0525_with_gridmap",
-            reason="go2w_like uses the 0525 projection script",
+            reason="go2w platform uses the 0525 projection script",
             evidence=["inspect_runtime_assets_tool"],
         ),
     }
@@ -442,13 +442,13 @@ def test_workflow_plan_draft_merges_data_profile_patches_across_react_rounds():
             "stage_variants": {
                 "extract_and_sync_navigation_data": {
                     "variant": "go2w_like",
-                    "reason": "classified as go2w_like",
-                    "evidence": ["classify_navigation_dataset_tool"],
+                    "reason": "processing profile inferred go2w platform bindings",
+                    "evidence": ["infer_navigation_processing_profile_tool"],
                 },
             },
         },
-        observation_id="dataset_classification",
-        used_tool="classify_navigation_dataset_tool",
+        observation_id="navigation_processing_profile",
+        used_tool="infer_navigation_processing_profile_tool",
     )
     second = state.update(
         data_profile_patch={
@@ -462,7 +462,7 @@ def test_workflow_plan_draft_merges_data_profile_patches_across_react_rounds():
                 },
                 "run_projection_and_trajectory": {
                     "variant": "cjl_0525_with_gridmap",
-                    "reason": "go2w_like uses 0525 projection",
+                    "reason": "go2w platform uses 0525 projection",
                     "evidence": ["inspect_runtime_assets_tool"],
                 },
             },
@@ -484,7 +484,10 @@ def test_workflow_plan_draft_merges_data_profile_patches_across_react_rounds():
     assert state.data_profile.processing_profile.id == "parameterized_navigation_v1"
     assert second["draft"]["ready_to_finish"] is True
     assert second["draft"]["completed_observations"] == [
-        {"observation_id": "dataset_classification", "used_tool": "classify_navigation_dataset_tool"},
+        {
+            "observation_id": "navigation_processing_profile",
+            "used_tool": "infer_navigation_processing_profile_tool",
+        },
         {"observation_id": "gridmap_artifacts", "used_tool": "inspect_gridmap_artifacts_tool"},
     ]
 
@@ -593,8 +596,8 @@ def test_plan_from_lightweight_profile_writes_variant_metadata_for_profile_drive
             stage_variants={
                 "extract_and_sync_navigation_data": StageVariantDecision(
                     variant="go2w_like",
-                    reason="dataset classified as go2w_like",
-                    evidence=["classify_navigation_dataset_tool"],
+                    reason="processing profile inferred go2w platform bindings",
+                    evidence=["infer_navigation_processing_profile_tool"],
                 ),
                 "prepare_gridmap_for_projection": StageVariantDecision(
                     variant="copy_existing_gridmap",
@@ -603,7 +606,7 @@ def test_plan_from_lightweight_profile_writes_variant_metadata_for_profile_drive
                 ),
                 "run_projection_and_trajectory": StageVariantDecision(
                     variant="cjl_0525_with_gridmap",
-                    reason="go2w_like uses the 0525 projection script",
+                    reason="go2w platform uses the 0525 projection script",
                     evidence=["inspect_runtime_assets_tool"],
                 ),
             },
@@ -614,8 +617,8 @@ def test_plan_from_lightweight_profile_writes_variant_metadata_for_profile_drive
         stage_variants={
             "extract_and_sync_navigation_data": StageVariantDecision(
                 variant="go2w_like",
-                reason="dataset classified as go2w_like",
-                evidence=["classify_navigation_dataset_tool"],
+                reason="processing profile inferred go2w platform bindings",
+                evidence=["infer_navigation_processing_profile_tool"],
             ),
             "prepare_gridmap_for_projection": StageVariantDecision(
                 variant="copy_existing_gridmap",
@@ -624,7 +627,7 @@ def test_plan_from_lightweight_profile_writes_variant_metadata_for_profile_drive
             ),
             "run_projection_and_trajectory": StageVariantDecision(
                 variant="cjl_0525_with_gridmap",
-                reason="go2w_like uses the 0525 projection script",
+                reason="go2w platform uses the 0525 projection script",
                 evidence=["inspect_runtime_assets_tool"],
             ),
         },

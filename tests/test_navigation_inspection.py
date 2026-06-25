@@ -77,14 +77,14 @@ rosbag2_bagfile_information:
     assert result.segments[0].errors
 
 
-def test_classify_navigation_dataset_rejects_missing_requested_segment():
+def test_legacy_classify_navigation_dataset_rejects_missing_requested_segment():
     settings = NavigationSettings(vladatasets_root=FIXTURE_ROOT)
 
     with pytest.raises(FileNotFoundError, match="missing"):
         classify_navigation_dataset("20270605", ["missing"], settings=settings)
 
 
-def test_classify_navigation_dataset_tool_schema_allows_omitting_segments():
+def test_legacy_classify_navigation_dataset_tool_schema_allows_omitting_segments():
     required = classify_navigation_dataset_tool.input_schema.get("required", [])
 
     assert "segments" not in required

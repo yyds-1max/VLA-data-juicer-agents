@@ -8,7 +8,7 @@ import pytest
 from agentscope.event import RequireUserConfirmEvent
 from agentscope.message import ToolCallBlock
 
-from vla_data_juicer_agents.navigation.models import NavigationRequest
+from vla_data_juicer_agents.navigation.models import NavigationDataProfile, NavigationRequest
 from vla_data_juicer_agents.navigation.plan_draft import WorkflowPlanDraftState
 from vla_data_juicer_agents.navigation.run_state import WorkflowRunStore
 from vla_data_juicer_agents.core.cancellation import CancellationContext, TurnCancelled, current_cancellation
@@ -20,7 +20,7 @@ from vla_data_juicer_agents.navigation.agents import (
     create_executor_agent,
     create_plan_agent,
 )
-from vla_data_juicer_agents.navigation.inspection import classify_navigation_dataset_tool
+from vla_data_juicer_agents.navigation.inspection import infer_navigation_processing_profile_tool
 from vla_data_juicer_agents.navigation.workflow import (
     build_deterministic_plan_template,
     run_executor_agent,
@@ -63,6 +63,27 @@ def _complete_go2w_profile_patch():
         "processing_profile": {
             "id": "parameterized_navigation_v1",
             "platform_hint": "go2w",
+            "sensor_bindings": {
+                "fisheye_front": {
+                    "role": "fisheye_front",
+                    "topic": "/cam_video4/csi_cam/image_raw/compressed",
+                    "message_type": "sensor_msgs/msg/CompressedImage",
+                    "kind": "camera",
+                },
+                "lidar": {
+                    "role": "lidar",
+                    "topic": "/rs32_lidar_points",
+                    "message_type": "sensor_msgs/msg/PointCloud2",
+                    "kind": "lidar",
+                },
+                "localization": {
+                    "role": "localization",
+                    "topic": "/sport_odom",
+                    "message_type": "nav_msgs/msg/Odometry",
+                    "kind": "odom",
+                },
+                "evidence": ["infer_navigation_sensor_bindings_tool"],
+            },
             "topic_params": _go2w_topic_params(),
             "localization_policy": {"source": "odom", "conversion": "odom_to_ins"},
             "gridmap_policy": {"source": "existing_gridmap"},
@@ -70,8 +91,33 @@ def _complete_go2w_profile_patch():
                 "mode": "hardcoded_with_user_confirmation",
                 "requires_user_confirmation": True,
             },
+            "evidence": {
+                "processing_profile": ["infer_navigation_processing_profile_tool"],
+                "sensor_bindings": ["infer_navigation_sensor_bindings_tool"],
+            },
         },
         "platform_hint": "go2w",
+        "sensor_bindings": {
+            "fisheye_front": {
+                "role": "fisheye_front",
+                "topic": "/cam_video4/csi_cam/image_raw/compressed",
+                "message_type": "sensor_msgs/msg/CompressedImage",
+                "kind": "camera",
+            },
+            "lidar": {
+                "role": "lidar",
+                "topic": "/rs32_lidar_points",
+                "message_type": "sensor_msgs/msg/PointCloud2",
+                "kind": "lidar",
+            },
+            "localization": {
+                "role": "localization",
+                "topic": "/sport_odom",
+                "message_type": "nav_msgs/msg/Odometry",
+                "kind": "odom",
+            },
+            "evidence": ["infer_navigation_sensor_bindings_tool"],
+        },
         "topic_params": _go2w_topic_params(),
         "localization_policy": {"source": "odom", "conversion": "odom_to_ins"},
         "gridmap_source": "existing_gridmap",
@@ -79,8 +125,8 @@ def _complete_go2w_profile_patch():
         "stage_variants": {
             "extract_and_sync_navigation_data": {
                 "variant": "go2w_like",
-                "reason": "dataset classified as go2w_like",
-                "evidence": ["classify_navigation_dataset_tool"],
+                "reason": "processing profile inferred go2w platform bindings",
+                "evidence": ["infer_navigation_processing_profile_tool"],
             },
             "prepare_gridmap_for_projection": {
                 "variant": "copy_existing_gridmap",
@@ -89,11 +135,55 @@ def _complete_go2w_profile_patch():
             },
             "run_projection_and_trajectory": {
                 "variant": "cjl_0525_with_gridmap",
-                "reason": "go2w_like uses the 0525 projection script",
+                "reason": "go2w platform uses the 0525 projection script",
                 "evidence": ["inspect_runtime_assets_tool"],
             },
         },
     }
+
+
+def _complete_go2w_data_profile() -> NavigationDataProfile:
+    return NavigationDataProfile.model_validate(
+        {
+            "date": "20270605",
+            "scene_mode": "out",
+            **_complete_go2w_profile_patch(),
+        }
+    )
+
+
+def _complete_go2w_workflow_plan():
+    return build_deterministic_plan_template(
+        "20270605",
+        "parameterized_navigation_v1",
+        None,
+        scene_mode="out",
+        data_profile=_complete_go2w_data_profile(),
+    )
+
+
+def _parameterized_go2w_plan_without_profile_facts():
+    plan = build_deterministic_plan_template(
+        "20270605",
+        "parameterized_navigation_v1",
+        None,
+        scene_mode="out",
+    )
+    plan.platform_hint = "go2w"
+    for step in plan.steps:
+        if "platform_hint" in step.arguments:
+            step.arguments["platform_hint"] = "go2w"
+        if step.tool_name == "extract_and_sync_navigation_data":
+            step.variant = "go2w_like"
+            step.arguments["platform_hint"] = "go2w"
+        elif step.tool_name == "run_projection_and_trajectory":
+            step.variant = "cjl_0525_with_gridmap"
+            step.arguments["platform_hint"] = "go2w"
+        elif step.tool_name == "prepare_gridmap_for_projection":
+            step.variant = None
+            step.decision_ref = None
+            step.evidence = []
+    return plan
 
 
 def _go2w_topic_params():
@@ -240,22 +330,27 @@ def test_executor_tools_check_and_bind_shared_cancellation(monkeypatch):
     assert seen == [cancellation]
 
 
-def test_plan_agent_classification_tool_accepts_empty_segments_string(tmp_path, monkeypatch):
+def test_plan_agent_processing_profile_tool_accepts_empty_segments_string(tmp_path, monkeypatch):
     fixture_root = Path(__file__).parent / "fixtures" / "navigation" / "VLADatasets"
     monkeypatch.setenv("VLA_VLADATASETS_ROOT", str(fixture_root))
 
-    result = _invoke_tool(classify_navigation_dataset_tool, {"date": "20270605", "segments": ""})
+    result = _invoke_tool(infer_navigation_processing_profile_tool, {"date": "20270605", "segments": ""})
 
-    assert result["profile_name"] == "go2w_like"
+    assert result["id"] == "parameterized_navigation_v1"
+    assert result["platform_hint"] == "go2w"
+    assert result["topic_params"]["profile_hint"] == "go2w"
+    assert result["localization_policy"] == {"source": "odom", "conversion": "odom_to_ins"}
 
 
-def test_plan_agent_classification_tool_accepts_json_segments_string(tmp_path, monkeypatch):
+def test_plan_agent_processing_profile_tool_accepts_json_segments_string(tmp_path, monkeypatch):
     fixture_root = Path(__file__).parent / "fixtures" / "navigation" / "VLADatasets"
     monkeypatch.setenv("VLA_VLADATASETS_ROOT", str(fixture_root))
 
-    result = _invoke_tool(classify_navigation_dataset_tool, {"date": "20270605", "segments": '["20260605_152856"]'})
+    result = _invoke_tool(infer_navigation_processing_profile_tool, {"date": "20270605", "segments": '["20260605_152856"]'})
 
-    assert result["profile_name"] == "go2w_like"
+    assert result["id"] == "parameterized_navigation_v1"
+    assert result["platform_hint"] == "go2w"
+    assert result["topic_params"]["profile_hint"] == "go2w"
 
 
 def test_plan_agent_draft_tools_finalize_internal_workflow_plan(monkeypatch):
@@ -263,23 +358,125 @@ def test_plan_agent_draft_tools_finalize_internal_workflow_plan(monkeypatch):
     request = NavigationRequest(date="20270605", dry_run=True, scene_mode="out")
     agent = create_plan_agent(request=request)
     tools = {tool.name: tool for tool in agent.tools}
+    complete_patch = _complete_go2w_profile_patch()
 
-    update_result = _invoke_tool(
+    sensor_update_result = _invoke_tool(
         tools["update_workflow_plan_draft_tool"],
         {
-            "data_profile_patch": _complete_go2w_profile_patch(),
-            "observation_id": "complete_profile",
+            "data_profile_patch": {"sensor_bindings": complete_patch["sensor_bindings"]},
+            "observation_id": "navigation_sensor_bindings",
+            "used_tool": "infer_navigation_sensor_bindings_tool",
+        },
+    )
+    processing_profile = dict(complete_patch["processing_profile"])
+    processing_profile.pop("sensor_bindings")
+    processing_profile["gridmap_policy"] = {"source": "generated_from_pcd"}
+    processing_profile["evidence"] = {
+        "processing_profile": ["infer_navigation_processing_profile_tool"],
+    }
+    processing_stage_variants = {
+        "extract_and_sync_navigation_data": {
+            **complete_patch["stage_variants"]["extract_and_sync_navigation_data"],
+            "evidence": ["infer_navigation_processing_profile_tool"],
+        },
+    }
+    processing_update_result = _invoke_tool(
+        tools["update_workflow_plan_draft_tool"],
+        {
+            "data_profile_patch": {
+                "processing_profile": processing_profile,
+                "platform_hint": complete_patch["platform_hint"],
+                "topic_params": complete_patch["topic_params"],
+                "localization_policy": complete_patch["localization_policy"],
+                "stage_variants": processing_stage_variants,
+            },
+            "observation_id": "navigation_processing_profile",
+            "used_tool": "infer_navigation_processing_profile_tool",
+        },
+    )
+    gridmap_update_result = _invoke_tool(
+        tools["update_workflow_plan_draft_tool"],
+        {
+            "data_profile_patch": {
+                "gridmap_source": complete_patch["gridmap_source"],
+                "pcd_gridmap_tool_available": complete_patch["pcd_gridmap_tool_available"],
+                "stage_variants": {
+                    "prepare_gridmap_for_projection": {
+                        **complete_patch["stage_variants"]["prepare_gridmap_for_projection"],
+                        "evidence": ["inspect_gridmap_artifacts_tool"],
+                    },
+                },
+            },
+            "observation_id": "gridmap_artifacts",
             "used_tool": "inspect_gridmap_artifacts_tool",
+        },
+    )
+    runtime_update_result = _invoke_tool(
+        tools["update_workflow_plan_draft_tool"],
+        {
+            "data_profile_patch": {
+                "stage_variants": {
+                    "run_projection_and_trajectory": {
+                        **complete_patch["stage_variants"]["run_projection_and_trajectory"],
+                        "evidence": ["inspect_runtime_assets_tool"],
+                    },
+                },
+            },
+            "observation_id": "runtime_assets_or_tool_capabilities",
+            "used_tool": "inspect_runtime_assets_tool",
         },
     )
     finalize_result = _invoke_tool(tools["finalize_workflow_plan_tool"], {})
 
-    assert update_result["ok"] is True
+    assert sensor_update_result["ok"] is True
+    assert processing_update_result["ok"] is True
+    assert gridmap_update_result["ok"] is True
+    assert runtime_update_result["ok"] is True
+    assert processing_update_result["draft"]["data_profile_draft"]["processing_profile"]["gridmap_policy"] == {
+        "source": "generated_from_pcd"
+    }
+    assert gridmap_update_result["draft"]["data_profile_draft"]["gridmap_source"] == "existing_gridmap"
     plan = finalize_result["workflow_plan_json"]
     assert plan["date"] == "20270605"
     assert plan["scene_mode"] == "out"
     assert plan["processing_profile"] == "parameterized_navigation_v1"
     assert plan["platform_hint"] == "go2w"
+    draft_profile = runtime_update_result["draft"]["data_profile_draft"]
+    assert draft_profile["sensor_bindings"]["localization"]["topic"] == "/sport_odom"
+    assert draft_profile["localization_policy"] == {"source": "odom", "conversion": "odom_to_ins"}
+    assert draft_profile["processing_profile"]["calibration_policy"] == {
+        "mode": "hardcoded_with_user_confirmation",
+        "requires_user_confirmation": True,
+    }
+    assert draft_profile["gridmap_source"] == "existing_gridmap"
+    assert draft_profile["pcd_gridmap_tool_available"] is True
+    assert draft_profile["stage_variants"]["extract_and_sync_navigation_data"]["evidence"] == [
+        "infer_navigation_processing_profile_tool"
+    ]
+    assert draft_profile["stage_variants"]["prepare_gridmap_for_projection"]["evidence"] == [
+        "inspect_gridmap_artifacts_tool"
+    ]
+    assert draft_profile["stage_variants"]["run_projection_and_trajectory"]["evidence"] == [
+        "inspect_runtime_assets_tool"
+    ]
+    assert runtime_update_result["draft"]["completed_observations"] == [
+        {
+            "observation_id": "navigation_sensor_bindings",
+            "used_tool": "infer_navigation_sensor_bindings_tool",
+        },
+        {
+            "observation_id": "navigation_processing_profile",
+            "used_tool": "infer_navigation_processing_profile_tool",
+        },
+        {
+            "observation_id": "gridmap_artifacts",
+            "used_tool": "inspect_gridmap_artifacts_tool",
+        },
+        {
+            "observation_id": "runtime_assets_or_tool_capabilities",
+            "used_tool": "inspect_runtime_assets_tool",
+        },
+    ]
     assert [step["tool_name"] for step in plan["steps"]] == [
         "prepare_raw_data",
         "extract_and_sync_navigation_data",
@@ -304,8 +501,8 @@ def test_plan_agent_update_tool_accepts_json_string_data_profile_patch(monkeypat
         tool,
         {
             "data_profile_patch": '{"processing_profile": {"id": "parameterized_navigation_v1", "platform_hint": "u"}}',
-            "observation_id": "dataset_classification",
-            "used_tool": "classify_navigation_dataset_tool",
+            "observation_id": "navigation_processing_profile",
+            "used_tool": "infer_navigation_processing_profile_tool",
         },
     )
 
@@ -318,7 +515,7 @@ def test_plan_agent_update_tool_accepts_json_string_data_profile_patch(monkeypat
 def test_plan_agent_draft_missing_fields_include_scene_mode():
     state = WorkflowPlanDraftState(request=NavigationRequest(date="20270605", dry_run=True))
 
-    update_result = state.update(profile="go2w_like")
+    update_result = state.update(processing_profile="parameterized_navigation_v1", platform_hint="go2w")
     snapshot = state.schema_snapshot()
 
     assert update_result["ok"] is True
@@ -333,7 +530,10 @@ def test_plan_agent_draft_finalize_requires_scene_mode(monkeypatch):
     agent = create_plan_agent(request=request)
     tools = {tool.name: tool for tool in agent.tools}
 
-    update_result = _invoke_tool(tools["update_workflow_plan_draft_tool"], {"profile": "go2w_like"})
+    update_result = _invoke_tool(
+        tools["update_workflow_plan_draft_tool"],
+        {"processing_profile": "parameterized_navigation_v1", "platform_hint": "go2w"},
+    )
 
     assert update_result["ok"] is True
     with pytest.raises(ValueError, match="NavigationDataProfile draft is incomplete.*scene_mode"):
@@ -346,7 +546,7 @@ def test_executor_agent_has_sdk_tool_for_each_plan_step(monkeypatch):
     tool_names = {tool.name for tool in agent.tools}
     plan = build_deterministic_plan_template(
         date="20270605",
-        processing_profile="go2w_like",
+        processing_profile="parameterized_navigation_v1",
         segments=None,
         scene_mode="out",
     )
@@ -367,14 +567,14 @@ def test_plan_template_requires_scene_mode():
     with pytest.raises(ValueError, match="scene_mode is required"):
         build_deterministic_plan_template(
             date="20270605",
-            processing_profile="go2w_like",
+            processing_profile="parameterized_navigation_v1",
             segments=None,
         )
 
     with pytest.raises(ValueError, match="scene_mode is required"):
         build_deterministic_plan_template(
             date="20270605",
-            processing_profile="go2w_like",
+            processing_profile="parameterized_navigation_v1",
             segments=None,
             scene_mode=None,
         )
@@ -383,7 +583,7 @@ def test_plan_template_requires_scene_mode():
 def test_plan_template_includes_human_gui_step():
     plan = build_deterministic_plan_template(
         date="20270605",
-        processing_profile="go2w_like",
+        processing_profile="parameterized_navigation_v1",
         segments=None,
         scene_mode="out",
     )
@@ -411,19 +611,19 @@ def test_plan_template_accepts_legacy_dataset_profile_keyword():
 def test_plan_template_uses_finish_data_paths_for_gui_and_validation():
     plan = build_deterministic_plan_template(
         date="20270605",
-        processing_profile="go2w_like",
+        processing_profile="parameterized_navigation_v1",
         segments=None,
         scene_mode="out",
     )
     steps = {step.tool_name: step for step in plan.steps}
 
     assert plan.scene_mode == "out"
-    assert plan.processing_profile == "go2w_like"
-    assert plan.platform_hint == "go2w"
+    assert plan.processing_profile == "parameterized_navigation_v1"
+    assert plan.platform_hint == "unknown"
     assert steps["confirm_navigation_calibration_params"].arguments == {
         "date": "20270605",
         "segments": None,
-        "platform_hint": "go2w",
+        "platform_hint": "unknown",
     }
     assert steps["confirm_navigation_calibration_params"].preconditions == [
         "extract_and_sync_navigation_data"
@@ -431,8 +631,8 @@ def test_plan_template_uses_finish_data_paths_for_gui_and_validation():
     assert steps["assemble_finish_temp"].arguments == {
         "date": "20270605",
         "segments": None,
-        "processing_profile": "go2w_like",
-        "platform_hint": "go2w",
+        "processing_profile": "parameterized_navigation_v1",
+        "platform_hint": "unknown",
     }
     assert steps["assemble_finish_temp"].preconditions == ["confirm_navigation_calibration_params"]
     assert steps["run_noobscene_preprocessing"].arguments == {
@@ -454,8 +654,8 @@ def test_plan_template_uses_finish_data_paths_for_gui_and_validation():
     assert steps["run_projection_and_trajectory"].arguments == {
         "finish_temp_path": "finish_data/20270605_temp",
         "finish_path": "finish_data/20270605",
-        "processing_profile": "go2w_like",
-        "platform_hint": "go2w",
+        "processing_profile": "parameterized_navigation_v1",
+        "platform_hint": "unknown",
     }
     assert steps["run_projection_and_trajectory"].expected_outputs == ["finish_data/20270605"]
     assert steps["validate_navigation_outputs"].arguments == {"date": "20270605"}
@@ -465,7 +665,7 @@ def test_plan_template_uses_finish_data_paths_for_gui_and_validation():
 def test_plan_template_uses_expected_step_order_without_legacy_gridmap_step():
     plan = build_deterministic_plan_template(
         date="20270605",
-        processing_profile="go2w_like",
+        processing_profile="parameterized_navigation_v1",
         segments=["20260605_152856"],
         scene_mode="in",
     )
@@ -489,7 +689,7 @@ def test_plan_template_uses_expected_step_order_without_legacy_gridmap_step():
 def test_validated_workflow_plan_rejects_missing_calibration_confirmation():
     from vla_data_juicer_agents.navigation.workflow import _validated_workflow_plan
 
-    plan = build_deterministic_plan_template("20270605", "go2w_like", None, scene_mode="out")
+    plan = _parameterized_go2w_plan_without_profile_facts()
     plan_without_confirmation = plan.model_copy(
         update={
             "steps": [
@@ -507,7 +707,7 @@ def test_validated_workflow_plan_rejects_missing_calibration_confirmation():
 def test_validated_workflow_plan_rejects_non_blocking_calibration_confirmation():
     from vla_data_juicer_agents.navigation.workflow import _validated_workflow_plan
 
-    plan = build_deterministic_plan_template("20270605", "go2w_like", None, scene_mode="out")
+    plan = _parameterized_go2w_plan_without_profile_facts()
     plan_with_non_blocking_confirmation = plan.model_copy(deep=True)
     confirmation = next(
         step
@@ -523,7 +723,7 @@ def test_validated_workflow_plan_rejects_non_blocking_calibration_confirmation()
 def test_validated_workflow_plan_accepts_calibration_confirmation_invariant():
     from vla_data_juicer_agents.navigation.workflow import _validated_workflow_plan
 
-    plan = build_deterministic_plan_template("20270605", "go2w_like", None, scene_mode="out")
+    plan = _parameterized_go2w_plan_without_profile_facts()
 
     assert _validated_workflow_plan(plan) == plan
 
@@ -593,7 +793,7 @@ def test_executor_agent_instructions_require_exact_calibration_confirmation():
 def test_parse_workflow_plan_output_accepts_json_string():
     from vla_data_juicer_agents.navigation.workflow import _parse_workflow_plan_output
 
-    payload = build_deterministic_plan_template("20270605", "go2w_like", None, scene_mode="out").model_dump(mode="json")
+    payload = build_deterministic_plan_template("20270605", "parameterized_navigation_v1", None, scene_mode="out").model_dump(mode="json")
 
     plan = _parse_workflow_plan_output(json.dumps(payload))
 
@@ -604,18 +804,18 @@ def test_parse_workflow_plan_output_accepts_json_string():
 def test_parse_workflow_plan_output_accepts_dict():
     from vla_data_juicer_agents.navigation.workflow import _parse_workflow_plan_output
 
-    payload = build_deterministic_plan_template("20270605", "go2w_like", None, scene_mode="out").model_dump(mode="json")
+    payload = build_deterministic_plan_template("20270605", "parameterized_navigation_v1", None, scene_mode="out").model_dump(mode="json")
 
     plan = _parse_workflow_plan_output(payload)
 
-    assert plan.processing_profile == "go2w_like"
-    assert plan.platform_hint == "go2w"
+    assert plan.processing_profile == "parameterized_navigation_v1"
+    assert plan.platform_hint == "unknown"
 
 
 def test_parse_workflow_plan_output_maps_legacy_dataset_profile():
     from vla_data_juicer_agents.navigation.workflow import _parse_workflow_plan_output
 
-    payload = build_deterministic_plan_template("20270605", "go2w_like", None, scene_mode="out").model_dump(mode="json")
+    payload = build_deterministic_plan_template("20270605", "parameterized_navigation_v1", None, scene_mode="out").model_dump(mode="json")
     payload.pop("processing_profile")
     payload.pop("platform_hint")
     payload["dataset_profile"] = "go2w_like"
@@ -629,7 +829,7 @@ def test_parse_workflow_plan_output_maps_legacy_dataset_profile():
 def test_parse_workflow_plan_output_accepts_fenced_json():
     from vla_data_juicer_agents.navigation.workflow import _parse_workflow_plan_output
 
-    payload = build_deterministic_plan_template("20270605", "go2w_like", None, scene_mode="out").model_dump(mode="json")
+    payload = build_deterministic_plan_template("20270605", "parameterized_navigation_v1", None, scene_mode="out").model_dump(mode="json")
     fenced = f"```json\n{json.dumps(payload)}\n```"
 
     plan = _parse_workflow_plan_output(fenced)
@@ -655,7 +855,7 @@ def test_create_qwen_model_requires_dashscope_key(monkeypatch):
 
 def test_run_plan_agent_streams_events_to_run_state(tmp_path):
     request = NavigationRequest(date="20270605", dry_run=True, scene_mode="out")
-    plan = build_deterministic_plan_template("20270605", "go2w_like", None, scene_mode="out")
+    plan = _parameterized_go2w_plan_without_profile_facts()
     plan_json = plan.model_dump_json()
     run_store = WorkflowRunStore(tmp_path / "runs")
     run_dir = run_store.create_run(request.date)
@@ -699,7 +899,7 @@ def test_run_plan_agent_streams_events_to_run_state(tmp_path):
 
 def test_run_plan_agent_auto_confirms_tool_calls(tmp_path):
     request = NavigationRequest(date="20270605", dry_run=True, scene_mode="out")
-    plan = build_deterministic_plan_template("20270605", "go2w_like", None, scene_mode="out")
+    plan = _parameterized_go2w_plan_without_profile_facts()
     run_store = WorkflowRunStore(tmp_path / "runs")
     run_dir = run_store.create_run(request.date)
     scope = EventEmitter(JsonlEventSink(run_dir / "events.jsonl")).scope("navigation.plan")
@@ -784,7 +984,7 @@ def test_agent_stream_allows_ten_tool_confirmation_rounds():
 
 def test_run_plan_agent_rejects_invalid_plan_variant(tmp_path):
     request = NavigationRequest(date="20270605", dry_run=True, scene_mode="out")
-    plan = build_deterministic_plan_template("20270605", "go2w_like", None, scene_mode="out")
+    plan = _parameterized_go2w_plan_without_profile_facts()
     gridmap = next(step for step in plan.steps if step.tool_name == "prepare_gridmap_for_projection")
     gridmap.variant = "made_up_variant"
     run_store = WorkflowRunStore(tmp_path / "runs")
@@ -801,7 +1001,7 @@ def test_run_plan_agent_rejects_invalid_plan_variant(tmp_path):
 
 def test_run_plan_agent_prompt_injects_current_profile_draft_state():
     request = NavigationRequest(date="20270605", dry_run=True, scene_mode="out")
-    plan = build_deterministic_plan_template("20270605", "go2w_like", None, scene_mode="out")
+    plan = _parameterized_go2w_plan_without_profile_facts()
 
     class FakeDraftAwareAgent:
         def __init__(self):
@@ -836,7 +1036,7 @@ def test_navigation_prompts_require_concise_action_oriented_progress():
         assert "ToolName[arguments]" in instructions
 
     request = NavigationRequest(date="20270605", dry_run=True, scene_mode="out")
-    plan = build_deterministic_plan_template("20270605", "go2w_like", None, scene_mode="out")
+    plan = _parameterized_go2w_plan_without_profile_facts()
 
     class CapturingAgent:
         def __init__(self, output):
