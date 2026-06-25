@@ -196,10 +196,22 @@ def _replace_path(source: Path, target: Path, kind: str) -> tuple[bool, str | No
     return True, None
 
 
-def _sensor_source_for_profile(settings: NavigationSettings, dataset_profile: str | None) -> Path:
-    profile_name = dataset_profile or "u_legacy_like"
-    sensor_param_dir = "20260529_go2w" if profile_name == "go2w_like" else "20260409_U"
+def _sensor_source_for_platform_hint(settings: NavigationSettings, platform_hint: str | None) -> Path:
+    hint = (platform_hint or "unknown").lower()
+    sensor_param_dir = "20260529_go2w" if hint == "go2w" else "20260409_U"
     return settings.processing_root / "NoobScenes" / "params" / sensor_param_dir / "sensors"
+
+
+def _platform_hint_for_profile(dataset_profile: str | None) -> str | None:
+    if dataset_profile == "go2w_like":
+        return "go2w"
+    if dataset_profile == "u_legacy_like":
+        return "u"
+    return None
+
+
+def _sensor_source_for_profile(settings: NavigationSettings, dataset_profile: str | None) -> Path:
+    return _sensor_source_for_platform_hint(settings, _platform_hint_for_profile(dataset_profile))
 
 
 def _transform_gridmap_payload(payload: Any) -> Any:
@@ -601,6 +613,8 @@ def assemble_finish_temp(
     settings: NavigationSettings | None = None,
     dry_run: bool = False,
     dataset_profile: str | None = None,
+    platform_hint: str | None = None,
+    processing_profile: str | None = None,
 ) -> ToolResult:
     date = _validate_date(date)
     settings = settings or NavigationSettings()
@@ -611,7 +625,8 @@ def assemble_finish_temp(
         selected = _selected_segments(clip_date_root, segments)
     finish_temp = settings.finish_data_root / f"{date}_temp"
     samples_date_root = finish_temp / "samples" / date
-    sensor_source = _sensor_source_for_profile(settings, dataset_profile)
+    effective_platform_hint = platform_hint if platform_hint is not None else _platform_hint_for_profile(dataset_profile)
+    sensor_source = _sensor_source_for_platform_hint(settings, effective_platform_hint)
     copied_clips: list[str] = []
 
     for segment in selected:
@@ -654,6 +669,54 @@ def assemble_finish_temp(
             "selected_segments": selected,
             "copied_clips": copied_clips,
             "sensor_source": str(sensor_source),
+            "platform_hint": effective_platform_hint,
+            "dataset_profile": dataset_profile,
+            "processing_profile": processing_profile,
+            "dry_run": dry_run,
+        },
+    )
+
+
+def confirm_navigation_calibration_params(
+    date: str,
+    segments: list[str] | None = None,
+    platform_hint: str | None = None,
+    user_confirmation: str | None = None,
+    settings: NavigationSettings | None = None,
+    dry_run: bool = False,
+) -> ToolResult:
+    date = _validate_date(date)
+    settings = settings or NavigationSettings()
+    sensor_source = _sensor_source_for_platform_hint(settings, platform_hint)
+    finish_temp = settings.finish_data_root / f"{date}_temp"
+    target_copy_path = finish_temp / "samples" / date / "<clip>" / "sensors"
+    confirmation_prompt = (
+        f"当前硬编码相机传感器参数路径: {sensor_source}\n"
+        f"目标复制路径: {target_copy_path}\n"
+        "请确认该路径适用于本次导航数据处理。"
+        "如确认继续，请精确回复 `确认`；如需终止，请回复 `终止`。"
+        "如果需要更换参数，请先在服务器对应参数文件或代码中修改。"
+        "我没有权利替你修改该文件。"
+    )
+    confirmed = user_confirmation == "确认"
+
+    return ToolResult(
+        ok=confirmed,
+        tool_name="confirm_navigation_calibration_params",
+        message=confirmation_prompt,
+        produced_paths=[],
+        details={
+            "date": date,
+            "segments": segments,
+            "platform_hint": platform_hint,
+            "finish_temp": str(finish_temp),
+            "sensor_source": str(sensor_source),
+            "target_copy_path": str(target_copy_path),
+            "requires_user_confirmation": True,
+            "user_confirmation": user_confirmation,
+            "confirmed": confirmed,
+            "confirmation_prompt": confirmation_prompt,
+            "error_type": None if confirmed else "calibration_params_not_confirmed",
             "dry_run": dry_run,
         },
     )
@@ -1040,6 +1103,7 @@ def _execute_with_cancellation(
 def build_execution_tools(
     dry_run: bool = False,
     cancellation: CancellationContext | None = None,
+    settings: NavigationSettings | None = None,
 ) -> list[Any]:
     def bound_prepare_raw_data_tool(date: str, segments: list[str] | str | None = None) -> dict:
         return _execute_with_cancellation(
@@ -1047,6 +1111,7 @@ def build_execution_tools(
             prepare_raw_data,
             date,
             _normalize_segments_arg(segments),
+            settings=settings,
             dry_run=dry_run,
         ).model_dump(mode="json")
 
@@ -1069,6 +1134,7 @@ def build_execution_tools(
             _normalize_string_list_arg(topic_whitelist),
             _normalize_string_dict_arg(topic_map),
             query_dir,
+            settings=settings,
             dry_run=dry_run,
         ).model_dump(mode="json")
 
@@ -1078,6 +1144,7 @@ def build_execution_tools(
             generate_gridmap_from_pcd,
             date,
             _normalize_segments_arg(segments),
+            settings=settings,
             dry_run=dry_run,
         ).model_dump(mode="json")
 
@@ -1085,13 +1152,35 @@ def build_execution_tools(
         date: str,
         segments: list[str] | str | None = None,
         dataset_profile: str | None = None,
+        platform_hint: str | None = None,
+        processing_profile: str | None = None,
     ) -> dict:
         return _execute_with_cancellation(
             cancellation,
             assemble_finish_temp,
             date,
             _normalize_segments_arg(segments),
+            settings=settings,
             dataset_profile=dataset_profile,
+            platform_hint=platform_hint,
+            processing_profile=processing_profile,
+            dry_run=dry_run,
+        ).model_dump(mode="json")
+
+    def bound_confirm_navigation_calibration_params_tool(
+        date: str,
+        segments: list[str] | str | None = None,
+        platform_hint: str | None = None,
+        user_confirmation: str | None = None,
+    ) -> dict:
+        return _execute_with_cancellation(
+            cancellation,
+            confirm_navigation_calibration_params,
+            date,
+            _normalize_segments_arg(segments),
+            platform_hint=platform_hint,
+            user_confirmation=user_confirmation,
+            settings=settings,
             dry_run=dry_run,
         ).model_dump(mode="json")
 
@@ -1100,6 +1189,7 @@ def build_execution_tools(
             cancellation,
             run_noobscene_preprocessing,
             finish_temp_path,
+            settings=settings,
             dry_run=dry_run,
         ).model_dump(mode="json")
 
@@ -1108,6 +1198,7 @@ def build_execution_tools(
             cancellation,
             run_initial_annotation_gui,
             finish_temp_path,
+            settings=settings,
             dry_run=dry_run,
         ).model_dump(mode="json")
 
@@ -1116,6 +1207,7 @@ def build_execution_tools(
             cancellation,
             run_tracking,
             finish_temp_path,
+            settings=settings,
             dry_run=dry_run,
         ).model_dump(mode="json")
 
@@ -1131,6 +1223,7 @@ def build_execution_tools(
             date,
             _normalize_segments_arg(segments),
             finish_temp_path=finish_temp_path,
+            settings=settings,
             dry_run=dry_run,
             gridmap_variant=gridmap_variant,
         ).model_dump(mode="json")
@@ -1146,6 +1239,7 @@ def build_execution_tools(
             finish_temp_path,
             finish_path,
             dataset_profile=dataset_profile,
+            settings=settings,
             dry_run=dry_run,
         ).model_dump(mode="json")
 
@@ -1160,6 +1254,7 @@ def build_execution_tools(
             finish_temp_path,
             finish_path,
             dataset_profile=dataset_profile,
+            settings=settings,
             dry_run=dry_run,
         ).model_dump(mode="json")
 
@@ -1168,6 +1263,7 @@ def build_execution_tools(
             cancellation,
             validate_navigation_outputs,
             date,
+            settings=settings,
             dry_run=dry_run,
         ).model_dump(mode="json")
 
@@ -1176,6 +1272,11 @@ def build_execution_tools(
         _make_function_tool(bound_extract_and_sync_navigation_data_tool, "extract_and_sync_navigation_data_tool", dry_run),
         _make_function_tool(bound_generate_gridmap_from_pcd_tool, "generate_gridmap_from_pcd_tool", dry_run),
         _make_function_tool(bound_assemble_finish_temp_tool, "assemble_finish_temp_tool", dry_run),
+        _make_function_tool(
+            bound_confirm_navigation_calibration_params_tool,
+            "confirm_navigation_calibration_params_tool",
+            dry_run,
+        ),
         _make_function_tool(bound_run_noobscene_preprocessing_tool, "run_noobscene_preprocessing_tool", dry_run),
         _make_function_tool(bound_run_initial_annotation_gui_tool, "run_initial_annotation_gui_tool", dry_run),
         _make_function_tool(bound_run_tracking_tool, "run_tracking_tool", dry_run),
@@ -1191,6 +1292,7 @@ def build_execution_tools(
     extract_and_sync_navigation_data_tool,
     generate_gridmap_from_pcd_tool,
     assemble_finish_temp_tool,
+    confirm_navigation_calibration_params_tool,
     run_noobscene_preprocessing_tool,
     run_initial_annotation_gui_tool,
     run_tracking_tool,

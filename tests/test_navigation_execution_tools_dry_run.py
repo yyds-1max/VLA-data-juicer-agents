@@ -11,6 +11,7 @@ from vla_data_juicer_agents.navigation.config import NavigationSettings
 from vla_data_juicer_agents.navigation.execution_tools import (
     assemble_finish_temp,
     build_execution_tools,
+    confirm_navigation_calibration_params,
     extract_and_sync_navigation_data,
     generate_gridmap_from_pcd,
     prepare_gridmap_for_projection,
@@ -225,6 +226,65 @@ def test_assemble_finish_temp_copies_only_server_finish_inputs_and_profile_senso
     assert not (dst / "grid_map").exists()
     assert not (dst / "odom").exists()
     assert result.details["sensor_source"].endswith("20260529_go2w/sensors")
+
+
+def test_confirm_navigation_calibration_params_reports_sensor_source(tmp_path):
+    processing_root = tmp_path / "processing"
+    sensor_source = processing_root / "NoobScenes" / "params" / "20260409_U" / "sensors"
+    sensor_source.mkdir(parents=True)
+    settings = NavigationSettings(
+        vladatasets_root=tmp_path / "VLADatasets",
+        processing_root=processing_root,
+    )
+
+    result = confirm_navigation_calibration_params(
+        "20270605",
+        platform_hint="u",
+        user_confirmation="确认",
+        settings=settings,
+        dry_run=False,
+    )
+
+    assert result.ok is True
+    assert result.details["sensor_source"].endswith("20260409_U/sensors")
+    assert result.details["requires_user_confirmation"] is True
+    assert result.produced_paths == []
+    assert not (settings.finish_data_root / "20270605_temp").exists()
+
+
+def test_confirm_navigation_calibration_params_rejects_unconfirmed_input(tmp_path):
+    processing_root = tmp_path / "processing"
+    sensor_source = processing_root / "NoobScenes" / "params" / "20260529_go2w" / "sensors"
+    sensor_source.mkdir(parents=True)
+    settings = NavigationSettings(
+        vladatasets_root=tmp_path / "VLADatasets",
+        processing_root=processing_root,
+    )
+
+    result = confirm_navigation_calibration_params(
+        "20270605",
+        platform_hint="go2w",
+        user_confirmation="终止",
+        settings=settings,
+        dry_run=False,
+    )
+
+    assert result.ok is False
+    assert result.details["error_type"] == "calibration_params_not_confirmed"
+    assert "我没有权利" in result.details["confirmation_prompt"]
+    assert result.produced_paths == []
+    assert not (settings.finish_data_root / "20270605_temp").exists()
+
+
+def test_build_execution_tools_exposes_calibration_confirmation(tmp_path):
+    settings = NavigationSettings(
+        vladatasets_root=tmp_path / "VLADatasets",
+        processing_root=tmp_path / "processing",
+    )
+    tools = build_execution_tools(settings=settings, dry_run=True)
+    names = {tool.name for tool in tools}
+
+    assert "confirm_navigation_calibration_params_tool" in names
 
 
 def test_prepare_gridmap_for_projection_copies_and_transforms_existing_gridmap(tmp_path):
