@@ -182,6 +182,101 @@ def test_noobscene_preprocessing_dry_run_includes_develop_generation_outputs(tmp
     assert (finish_temp / "maps" / "map.png").as_posix() in produced_paths
 
 
+def test_run_noobscene_preprocessing_runs_odom_conversion_for_odom(tmp_path):
+    settings = NavigationSettings(
+        vladatasets_root=tmp_path / "VLADatasets",
+        processing_root=tmp_path / "processing",
+    )
+    finish_temp = settings.finish_data_root / "20270605_temp"
+    finish_temp.mkdir(parents=True)
+
+    result = run_noobscene_preprocessing(
+        finish_temp,
+        localization_source="odom",
+        localization_conversion="odom_to_ins",
+        settings=settings,
+        dry_run=True,
+    )
+
+    shells = [" ".join(record.command) for record in result.commands]
+    assert any("1_odom_convert.py" in shell for shell in shells)
+    assert any("2_resize.py" in shell for shell in shells)
+
+
+def test_run_noobscene_preprocessing_preserves_old_positional_call_style(tmp_path):
+    settings = NavigationSettings(
+        vladatasets_root=tmp_path / "VLADatasets",
+        processing_root=tmp_path / "processing",
+    )
+    finish_temp = settings.finish_data_root / "20270605_temp"
+    finish_temp.mkdir(parents=True)
+
+    result = run_noobscene_preprocessing(finish_temp, settings, True)
+
+    shells = [" ".join(record.command) for record in result.commands]
+    assert result.ok is True
+    assert result.details["dry_run"] is True
+    assert any("1_odom_convert.py" in shell for shell in shells)
+    assert any("2_resize.py" in shell for shell in shells)
+
+
+def test_run_noobscene_preprocessing_skips_odom_conversion_for_native_ins(tmp_path):
+    settings = NavigationSettings(
+        vladatasets_root=tmp_path / "VLADatasets",
+        processing_root=tmp_path / "processing",
+    )
+    finish_temp = settings.finish_data_root / "20270605_temp"
+    finish_temp.mkdir(parents=True)
+
+    result = run_noobscene_preprocessing(
+        finish_temp,
+        localization_source="ins",
+        localization_conversion="none",
+        settings=settings,
+        dry_run=True,
+    )
+
+    shells = [" ".join(record.command) for record in result.commands]
+    assert any("0_creat_box.py" in shell for shell in shells)
+    assert not any("1_odom_convert.py" in shell for shell in shells)
+    assert not any("2_resize.py" in shell for shell in shells)
+    assert any("main_smart_odom.py" in shell for shell in shells)
+
+
+@pytest.mark.parametrize(
+    ("localization_source", "localization_conversion"),
+    [
+        ("ins", "odom_to_ins"),
+        ("odom", "none"),
+        ("gnss", "none"),
+    ],
+)
+def test_run_noobscene_preprocessing_rejects_unsupported_localization_policy(
+    tmp_path,
+    localization_source,
+    localization_conversion,
+):
+    settings = NavigationSettings(
+        vladatasets_root=tmp_path / "VLADatasets",
+        processing_root=tmp_path / "processing",
+    )
+    finish_temp = settings.finish_data_root / "20270605_temp"
+    finish_temp.mkdir(parents=True)
+
+    result = run_noobscene_preprocessing(
+        finish_temp,
+        localization_source=localization_source,
+        localization_conversion=localization_conversion,
+        settings=settings,
+        dry_run=True,
+    )
+
+    assert result.ok is False
+    assert result.details["error_type"] == "unsupported_localization_policy"
+    assert "unsupported localization policy" in result.message
+    assert result.commands == []
+
+
 def test_noobscene_preprocessing_dry_run_uses_data_runtime_setup(tmp_path):
     root = tmp_path / "VLADatasets"
     settings = NavigationSettings(
@@ -885,6 +980,35 @@ def test_bound_dry_run_prepare_tool_does_not_create_outputs(tmp_path, monkeypatc
     assert result["details"]["dry_run"] is True
     assert not (root / "raw_data" / "20270605_temp").exists()
     assert not (root / "clip_data" / "20270605").exists()
+
+
+def test_bound_run_noobscene_preprocessing_tool_accepts_localization_policy(tmp_path):
+    settings = NavigationSettings(
+        vladatasets_root=tmp_path / "VLADatasets",
+        processing_root=tmp_path / "processing",
+    )
+    finish_temp = settings.finish_data_root / "20270605_temp"
+    finish_temp.mkdir(parents=True)
+    tool = {
+        tool.name: tool
+        for tool in build_execution_tools(settings=settings, dry_run=True)
+    }["run_noobscene_preprocessing_tool"]
+
+    result = _invoke_tool(
+        tool,
+        {
+            "finish_temp_path": str(finish_temp),
+            "localization_source": "ins",
+            "localization_conversion": "none",
+        },
+    )
+
+    shells = [" ".join(record["command"]) for record in result["commands"]]
+    assert result["ok"] is True
+    assert result["details"]["localization_source"] == "ins"
+    assert result["details"]["localization_conversion"] == "none"
+    assert not any("1_odom_convert.py" in shell for shell in shells)
+    assert not any("2_resize.py" in shell for shell in shells)
 
 
 def test_execution_functions_validate_malformed_date(tmp_path):

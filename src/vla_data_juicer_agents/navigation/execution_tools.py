@@ -804,12 +804,35 @@ def run_noobscene_preprocessing(
     finish_temp_path: str | Path,
     settings: NavigationSettings | None = None,
     dry_run: bool = False,
+    *,
+    localization_source: str = "odom",
+    localization_conversion: str = "odom_to_ins",
 ) -> ToolResult:
     settings = settings or NavigationSettings()
     root = _resolve_data_path(finish_temp_path, settings)
     noobscene_root = settings.processing_root / "NoobScenes"
     trainval_path = root / "v1.0-trainval"
     map_path = root / "maps" / "map.png"
+    odom_policy = localization_source == "odom" and localization_conversion == "odom_to_ins"
+    native_ins_policy = localization_source == "ins" and localization_conversion == "none"
+    if not (odom_policy or native_ins_policy):
+        return ToolResult(
+            ok=False,
+            tool_name="run_noobscene_preprocessing",
+            message=(
+                "unsupported localization policy for NoobScenes preprocessing: "
+                f"source={localization_source}, conversion={localization_conversion}."
+            ),
+            produced_paths=[],
+            commands=[],
+            details={
+                "error_type": "unsupported_localization_policy",
+                "localization_source": localization_source,
+                "localization_conversion": localization_conversion,
+                "dry_run": dry_run,
+            },
+        )
+
     commands = [
         run_command(
             python_data_command(
@@ -819,23 +842,27 @@ def run_noobscene_preprocessing(
             ),
             dry_run=dry_run,
         ),
-        run_command(
-            python_data_command(
-                settings.runtime,
-                noobscene_root / "include" / "1_odom_convert.py",
-                ["--temp_path", root],
-            ),
-            dry_run=dry_run,
-        ),
-        run_command(
-            python_data_command(
-                settings.runtime,
-                noobscene_root / "include" / "2_resize.py",
-                ["--temp_path", root],
-            ),
-            dry_run=dry_run,
-        ),
     ]
+    if odom_policy:
+        commands.extend([
+            run_command(
+                python_data_command(
+                    settings.runtime,
+                    noobscene_root / "include" / "1_odom_convert.py",
+                    ["--temp_path", root],
+                ),
+                dry_run=dry_run,
+            ),
+            run_command(
+                python_data_command(
+                    settings.runtime,
+                    noobscene_root / "include" / "2_resize.py",
+                    ["--temp_path", root],
+                ),
+                dry_run=dry_run,
+            ),
+        ])
+
     if dry_run or _commands_ok(commands):
         if not dry_run:
             trainval_path.mkdir(parents=True, exist_ok=True)
@@ -881,7 +908,11 @@ def run_noobscene_preprocessing(
         ),
         produced_paths=produced_paths,
         commands=commands,
-        details={"dry_run": dry_run},
+        details={
+            "dry_run": dry_run,
+            "localization_source": localization_source,
+            "localization_conversion": localization_conversion,
+        },
     )
 
 
@@ -1184,13 +1215,19 @@ def build_execution_tools(
             dry_run=dry_run,
         ).model_dump(mode="json")
 
-    def bound_run_noobscene_preprocessing_tool(finish_temp_path: str) -> dict:
+    def bound_run_noobscene_preprocessing_tool(
+        finish_temp_path: str,
+        localization_source: str = "odom",
+        localization_conversion: str = "odom_to_ins",
+    ) -> dict:
         return _execute_with_cancellation(
             cancellation,
             run_noobscene_preprocessing,
             finish_temp_path,
             settings=settings,
             dry_run=dry_run,
+            localization_source=localization_source,
+            localization_conversion=localization_conversion,
         ).model_dump(mode="json")
 
     def bound_run_initial_annotation_gui_tool(finish_temp_path: str) -> dict:
