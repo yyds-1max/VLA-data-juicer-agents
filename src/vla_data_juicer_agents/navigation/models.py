@@ -3,7 +3,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Literal
 
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
 
 
 DATE_RE = r"^[0-9]{8}$"
@@ -85,11 +85,76 @@ class NavigationTopicParams(BaseModel):
     blocking_issues: list[PlanIssue] = Field(default_factory=list)
 
 
+class NavigationSensorBinding(BaseModel):
+    role: Literal["fisheye_front", "lidar", "odom", "ins", "localization"]
+    topic: str | None = None
+    message_type: str | None = None
+    kind: Literal["camera", "lidar", "odom", "ins", "missing"] | None = None
+    candidates: list[str] = Field(default_factory=list)
+
+
+class NavigationSensorBindings(BaseModel):
+    fisheye_front: NavigationSensorBinding | None = None
+    lidar: NavigationSensorBinding | None = None
+    odom: NavigationSensorBinding | None = None
+    ins: NavigationSensorBinding | None = None
+    localization: NavigationSensorBinding | None = None
+    warnings: list[PlanIssue] = Field(default_factory=list)
+    blocking_issues: list[PlanIssue] = Field(default_factory=list)
+    evidence: list[str] = Field(default_factory=list)
+
+    @model_validator(mode="after")
+    def validate_binding_roles(self) -> "NavigationSensorBindings":
+        for slot in ("fisheye_front", "lidar", "odom", "ins", "localization"):
+            binding = getattr(self, slot)
+            if binding is not None and binding.role != slot:
+                raise ValueError(
+                    f"sensor binding role mismatch for {slot}: expected {slot}, got {binding.role}"
+                )
+        return self
+
+
+class NavigationLocalizationPolicy(BaseModel):
+    source: Literal["odom", "ins", "unknown"]
+    conversion: Literal["odom_to_ins", "none"] = "none"
+
+
+class NavigationGridmapPolicy(BaseModel):
+    source: Literal["existing_gridmap", "generated_from_pcd", "projection_ready", "unknown"] = "unknown"
+
+
+class NavigationCalibrationPolicy(BaseModel):
+    mode: Literal[
+        "hardcoded_with_user_confirmation",
+        "selected_profile",
+        "unknown",
+    ] = "hardcoded_with_user_confirmation"
+    selected_sensor_source: str | None = None
+    requires_user_confirmation: bool = True
+
+
+class NavigationProcessingProfile(BaseModel):
+    id: str = "parameterized_navigation_v1"
+    platform_hint: str = "unknown"
+    sensor_bindings: NavigationSensorBindings | None = None
+    topic_params: NavigationTopicParams
+    localization_policy: NavigationLocalizationPolicy
+    gridmap_policy: NavigationGridmapPolicy = Field(default_factory=NavigationGridmapPolicy)
+    calibration_policy: NavigationCalibrationPolicy = Field(default_factory=NavigationCalibrationPolicy)
+    stage_variants: dict[str, StageVariantDecision] = Field(default_factory=dict)
+    warnings: list[PlanIssue] = Field(default_factory=list)
+    blocking_issues: list[PlanIssue] = Field(default_factory=list)
+    evidence: dict[str, list[str]] = Field(default_factory=dict)
+
+
 class NavigationDataProfile(BaseModel):
     date: str
     segments: list[str] | None = None
     scene_mode: Literal["in", "out"]
-    dataset_profile: Literal["u_legacy_like", "go2w_like"]
+    processing_profile: NavigationProcessingProfile | None = None
+    platform_hint: str = "unknown"
+    sensor_bindings: NavigationSensorBindings | None = None
+    localization_policy: NavigationLocalizationPolicy | None = None
     topic_params: NavigationTopicParams | None = None
     gridmap_source: Literal[
         "existing_gridmap",
@@ -128,7 +193,8 @@ class WorkflowPlan(BaseModel):
     date: str
     segments: list[str] | None = None
     scene_mode: Literal["in", "out"]
-    dataset_profile: str
+    processing_profile: str = "parameterized_navigation_v1"
+    platform_hint: str = "unknown"
     steps: list[WorkflowStep]
 
     @field_validator("date")
