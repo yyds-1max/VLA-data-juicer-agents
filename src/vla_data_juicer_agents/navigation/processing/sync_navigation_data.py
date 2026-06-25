@@ -22,7 +22,7 @@ DEFAULT_TOPIC_MAP = {
 }
 
 
-def _load_json_dict(value: str, label: str) -> dict[str, str]:
+def _load_json_dict(value, label):
     payload = json.loads(value)
     if not isinstance(payload, dict) or not all(
         isinstance(key, str) and isinstance(child, str) for key, child in payload.items()
@@ -31,7 +31,7 @@ def _load_json_dict(value: str, label: str) -> dict[str, str]:
     return payload
 
 
-def resolve_topic_map(topic_map: str | None, topic_map_file: str | os.PathLike | None) -> dict[str, str]:
+def resolve_topic_map(topic_map, topic_map_file):
     if topic_map_file is not None:
         with open(topic_map_file, "r") as f:
             return _load_json_dict(f.read(), "--topic_map_file")

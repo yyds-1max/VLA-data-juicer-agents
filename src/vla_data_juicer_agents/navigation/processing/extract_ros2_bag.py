@@ -35,14 +35,14 @@ TOPIC_WHITELIST = [
 ]
 
 
-def _load_json_list(value: str, label: str) -> list[str]:
+def _load_json_list(value, label):
     payload = json.loads(value)
     if not isinstance(payload, list) or not all(isinstance(item, str) for item in payload):
         raise ValueError(f"{label} must be a JSON list of strings")
     return payload
 
 
-def resolve_topic_whitelist(topic_whitelist: str | None, topic_whitelist_file: str | Path | None) -> list[str]:
+def resolve_topic_whitelist(topic_whitelist, topic_whitelist_file):
     if topic_whitelist_file is not None:
         return _load_json_list(Path(topic_whitelist_file).read_text(encoding="utf-8"), "--topic_whitelist_file")
     if topic_whitelist is not None:
@@ -390,7 +390,7 @@ def save_custom_msg(msg, save_dir, topic_name, bag_ts_ns=None):
         print(f"[{topic_name} 保存失败] {e}")
 
 # ==================== 主提取函数（使用 bag timestamp） ====================
-def extract_ros2_bag(bag_path: str, save_root: str, topic_whitelist=None):
+def extract_ros2_bag(bag_path, save_root, topic_whitelist=None):
     from rosbag2_py import SequentialReader, StorageOptions, ConverterOptions
     from rclpy.serialization import deserialize_message
     from rosidl_runtime_py.utilities import get_message

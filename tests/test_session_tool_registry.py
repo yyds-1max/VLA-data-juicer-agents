@@ -78,9 +78,9 @@ def test_session_prompt_guides_concise_action_oriented_progress():
     prompt = agent.session_system_prompt()
 
     assert "Progress: <one or two concise, action-oriented sentences" in prompt
-    assert "established fact and the next action" in prompt
-    assert "not hidden chain-of-thought" in prompt
-    assert "Do not reveal private reasoning" in prompt
+    assert "reasoning summary and the next action" in prompt
+    assert "not the full hidden chain-of-thought" in prompt
+    assert "Do not reveal draft notes" in prompt
 
 
 def test_session_agent_builds_real_agentscope_agent(monkeypatch):

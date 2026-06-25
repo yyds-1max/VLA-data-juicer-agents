@@ -683,10 +683,10 @@ def test_run_plan_agent_prompt_injects_current_profile_draft_state():
 def test_navigation_prompts_require_concise_action_oriented_progress():
     for instructions in (PLAN_AGENT_INSTRUCTIONS, EXECUTOR_AGENT_INSTRUCTIONS):
         assert "Progress: <one or two concise, action-oriented sentences" in instructions
-        assert "established fact" in instructions
+        assert "reasoning summary" in instructions
         assert "next action" in instructions
         assert "not the full hidden chain-of-thought" in instructions
-        assert "Do not reveal private reasoning" in instructions
+        assert "Do not reveal draft notes" in instructions
         assert "do not print textual ReAct labels" in instructions
         assert "ToolName[arguments]" in instructions
 
