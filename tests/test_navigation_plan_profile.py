@@ -3,6 +3,7 @@ from pydantic import ValidationError
 from vla_data_juicer_agents.navigation.models import (
     NavigationDataProfile,
     NavigationRequest,
+    NavigationProcessingProfile,
     NavigationTopicParams,
     PlanIssue,
     StageVariantDecision,
@@ -50,22 +51,44 @@ def _go2w_topic_params() -> NavigationTopicParams:
     )
 
 
+def _processing_profile(
+    *,
+    topic_params: NavigationTopicParams | None = None,
+    platform_hint: str = "unknown",
+    gridmap_source: str = "generated_from_pcd",
+    stage_variants: dict[str, StageVariantDecision] | None = None,
+    blocking_issues: list[PlanIssue] | None = None,
+) -> NavigationProcessingProfile:
+    return NavigationProcessingProfile(
+        id="parameterized_navigation_v1",
+        platform_hint=platform_hint,
+        topic_params=topic_params or _go2w_topic_params(),
+        localization_policy={"source": "odom", "conversion": "odom_to_ins"},
+        gridmap_policy={"source": gridmap_source},
+        stage_variants=stage_variants or {},
+        blocking_issues=blocking_issues or [],
+    )
+
+
 def test_lightweight_navigation_data_profile_keeps_only_variant_decision_facts():
+    stage_variants = {
+        "prepare_gridmap_for_projection": StageVariantDecision(
+            variant="generate_from_pcd",
+            reason="no existing grid_map artifact but PCD generator is available",
+            evidence=["inspect_gridmap_artifacts_tool"],
+        )
+    }
     profile = NavigationDataProfile(
         date="20270605",
         scene_mode="out",
-        dataset_profile="go2w_like",
+        processing_profile=_processing_profile(stage_variants=stage_variants),
+        platform_hint="unknown",
+        localization_policy={"source": "odom", "conversion": "odom_to_ins"},
         topic_params=_go2w_topic_params(),
         gridmap_source="generated_from_pcd",
         pcd_gridmap_tool_available=True,
-        stage_variants={
-            "prepare_gridmap_for_projection": StageVariantDecision(
-                variant="generate_from_pcd",
-                reason="no existing grid_map artifact but PCD generator is available",
-                evidence=["inspect_gridmap_artifacts_tool"],
-            )
-        },
-        evidence={"dataset_profile": ["classify_navigation_dataset_tool"]},
+        stage_variants=stage_variants,
+        evidence={"processing_profile": ["infer_navigation_processing_profile_tool"]},
     )
 
     assert profile.segments is None
@@ -79,7 +102,8 @@ def test_navigation_data_profile_records_blocking_issues_without_active_details(
     profile = NavigationDataProfile(
         date="20270605",
         scene_mode="out",
-        dataset_profile="go2w_like",
+        processing_profile=_processing_profile(gridmap_source="unknown"),
+        localization_policy={"source": "odom", "conversion": "odom_to_ins"},
         topic_params=_go2w_topic_params(),
         gridmap_source="unknown",
         pcd_gridmap_tool_available=False,
@@ -101,14 +125,6 @@ def test_navigation_data_profile_rejects_unknown_variant_inputs():
         NavigationDataProfile(
             date="20270605",
             scene_mode="warehouse",
-            dataset_profile="go2w_like",
-        )
-
-    with pytest_raises_validation_error():
-        NavigationDataProfile(
-            date="20270605",
-            scene_mode="out",
-            dataset_profile="unknown_profile",
         )
 
 
@@ -136,7 +152,15 @@ def test_plan_from_lightweight_profile_skips_gridmap_when_projection_input_ready
     profile = NavigationDataProfile(
         date="20270605",
         scene_mode="out",
-        dataset_profile="go2w_like",
+        processing_profile=_processing_profile(
+            gridmap_source="projection_ready",
+            stage_variants=_complete_stage_variants(
+                "skip_if_projection_ready",
+                "finish temp already contains projection grid_map inputs",
+                ["inspect_gridmap_artifacts_tool"],
+            ),
+        ),
+        localization_policy={"source": "odom", "conversion": "odom_to_ins"},
         topic_params=_go2w_topic_params(),
         gridmap_source="projection_ready",
         projection_input_ready=True,
@@ -164,24 +188,174 @@ def test_workflow_plan_draft_snapshot_exposes_react_profile_state_panel():
     snapshot = state.schema_snapshot()
 
     assert snapshot["navigation_data_profile_schema"]["title"] == "NavigationDataProfile"
-    assert snapshot["navigation_data_profile_schema"]["properties"]["dataset_profile"]["enum"] == [
-        "u_legacy_like",
-        "go2w_like",
-    ]
+    assert "processing_profile" in snapshot["navigation_data_profile_schema"]["properties"]
+    assert "dataset_profile" not in snapshot["navigation_data_profile_schema"]["properties"]
     assert "topic_params" in snapshot["navigation_data_profile_schema"]["properties"]
     assert snapshot["data_profile_draft"] == {
         "date": "20270605",
         "scene_mode": "out",
         "segments": None,
+        "platform_hint": "unknown",
     }
     assert "date" in snapshot["filled_fields"]
     assert "scene_mode" in snapshot["filled_fields"]
-    assert "dataset_profile" in snapshot["missing_fields"]
+    assert "processing_profile" in snapshot["missing_fields"]
     assert "topic_params" in snapshot["missing_fields"]
     assert "stage_variants.prepare_gridmap_for_projection" in snapshot["missing_fields"]
     assert snapshot["ready_to_finish"] is False
     assert "infer_navigation_topic_params_tool" in snapshot["next_tool_candidates"]
-    assert "classify_navigation_dataset_tool" in snapshot["next_tool_candidates"]
+
+
+def test_workflow_plan_draft_requires_processing_profile_not_dataset_profile():
+    state = WorkflowPlanDraftState(date="20270605", scene_mode="out")
+
+    snapshot = state.snapshot()
+
+    assert "processing_profile" in snapshot["navigation_data_profile_schema"]["properties"]
+    assert "dataset_profile" not in snapshot["navigation_data_profile_schema"]["properties"]
+    assert "processing_profile" in snapshot["missing_fields"]
+
+
+def test_workflow_plan_draft_update_accepts_processing_profile_dict_argument():
+    state = WorkflowPlanDraftState(date="20270605", scene_mode="out")
+
+    result = state.update(
+        processing_profile={
+            "id": "parameterized_navigation_v1",
+            "platform_hint": "custom_robot",
+            "topic_params": _go2w_topic_params().model_dump(mode="json"),
+            "localization_policy": {"source": "odom", "conversion": "odom_to_ins"},
+        }
+    )
+
+    draft = result["draft"]["data_profile_draft"]
+    assert state.processing_profile == "parameterized_navigation_v1"
+    assert state.platform_hint == "custom_robot"
+    assert draft["processing_profile"]["id"] == "parameterized_navigation_v1"
+    assert draft["processing_profile"]["platform_hint"] == "custom_robot"
+    assert result["draft"]["platform_hint"] == "custom_robot"
+    assert "processing_profile" not in result["draft"]["missing_fields"]
+
+
+def test_workflow_plan_draft_reports_blocking_issues_with_remediation_candidate():
+    state = WorkflowPlanDraftState(date="20270605", scene_mode="out")
+
+    result = state.update(
+        data_profile_patch={
+            "processing_profile": _processing_profile().model_dump(mode="json"),
+            "topic_params": _go2w_topic_params().model_dump(mode="json"),
+            "localization_policy": {"source": "odom", "conversion": "odom_to_ins"},
+            "stage_variants": _complete_stage_variants(
+                "generate_from_pcd",
+                "no existing grid_map artifact but generator is available",
+                ["inspect_gridmap_artifacts_tool"],
+            ),
+            "blocking_issues": [
+                {
+                    "type": "missing_gridmap_source_or_generator",
+                    "message": "grid_map source is unresolved",
+                }
+            ],
+        }
+    )
+
+    assert "blocking_issues" in result["draft"]["missing_fields"]
+    assert "processing_profile.blocking_issues" not in result["draft"]["missing_fields"]
+    assert "infer_navigation_processing_profile_tool" in result["draft"]["next_tool_candidates"]
+    assert state.ready_to_finish() is False
+
+
+def test_workflow_plan_draft_uses_nested_platform_hint_when_top_level_is_unknown():
+    state = WorkflowPlanDraftState(date="20270605", scene_mode="out")
+    profile = NavigationDataProfile(
+        date="20270605",
+        scene_mode="out",
+        processing_profile=_processing_profile(platform_hint="go2w"),
+        localization_policy={"source": "odom", "conversion": "odom_to_ins"},
+        topic_params=_go2w_topic_params(),
+        stage_variants=_complete_stage_variants(
+            "generate_from_pcd",
+            "no existing grid_map artifact but generator is available",
+            ["inspect_gridmap_artifacts_tool"],
+        ),
+    )
+
+    result = state.update(data_profile=profile)
+
+    assert state.platform_hint == "go2w"
+    assert result["draft"]["data_profile_draft"]["platform_hint"] == "go2w"
+    assert state.data_profile is not None
+    assert state.data_profile.platform_hint == "go2w"
+
+
+def test_plan_from_draft_accepts_complete_processing_profile():
+    state = WorkflowPlanDraftState(date="20270605", scene_mode="out")
+
+    state.update(
+        data_profile_patch={
+            "processing_profile": {
+                "id": "parameterized_navigation_v1",
+                "platform_hint": "unknown",
+                "topic_params": {
+                    "profile_hint": "mixed",
+                    "confidence": 1.0,
+                    "topic_whitelist": [
+                        "/cam_video5/csi_cam/image_raw/compressed",
+                        "/lidar_points",
+                        "/sport_odom",
+                    ],
+                    "topic_map": {
+                        "cam_video5": "fisheye_front",
+                        "lidar_points": "r32_rslidar_points",
+                        "sport_odom": "odom",
+                    },
+                    "query_dir": "lidar_points",
+                },
+                "localization_policy": {"source": "odom", "conversion": "odom_to_ins"},
+                "gridmap_policy": {"source": "generated_from_pcd"},
+                "calibration_policy": {
+                    "mode": "hardcoded_with_user_confirmation",
+                    "requires_user_confirmation": True,
+                },
+            },
+            "platform_hint": "unknown",
+            "topic_params": {
+                "topic_whitelist": [
+                    "/cam_video5/csi_cam/image_raw/compressed",
+                    "/lidar_points",
+                    "/sport_odom",
+                ],
+                "topic_map": {
+                    "cam_video5": "fisheye_front",
+                    "lidar_points": "r32_rslidar_points",
+                    "sport_odom": "odom",
+                },
+                "query_dir": "lidar_points",
+            },
+            "localization_policy": {"source": "odom", "conversion": "odom_to_ins"},
+            "stage_variants": {
+                "extract_and_sync_navigation_data": {
+                    "variant": "parameterized_ros2_bag",
+                    "reason": "topic parameters inferred from metadata",
+                    "evidence": ["infer_navigation_processing_profile_tool"],
+                },
+                "prepare_gridmap_for_projection": {
+                    "variant": "generate_from_pcd",
+                    "reason": "gridmap is generated from lidar",
+                    "evidence": ["infer_navigation_processing_profile_tool"],
+                },
+                "run_projection_and_trajectory": {
+                    "variant": "cjl_with_gridmap",
+                    "reason": "projection uses generated gridmap",
+                    "evidence": ["infer_navigation_processing_profile_tool"],
+                },
+            },
+        }
+    )
+
+    plan = build_plan_from_draft(state)
+    assert plan.processing_profile == "parameterized_navigation_v1"
+    assert plan.platform_hint == "unknown"
 
 
 def test_workflow_plan_draft_merges_data_profile_patches_across_react_rounds():
@@ -191,7 +365,8 @@ def test_workflow_plan_draft_merges_data_profile_patches_across_react_rounds():
 
     first = state.update(
         data_profile_patch={
-            "dataset_profile": "go2w_like",
+            "processing_profile": _processing_profile().model_dump(mode="json"),
+            "localization_policy": {"source": "odom", "conversion": "odom_to_ins"},
             "topic_params": _go2w_topic_params().model_dump(mode="json"),
             "stage_variants": {
                 "extract_and_sync_navigation_data": {
@@ -228,13 +403,14 @@ def test_workflow_plan_draft_merges_data_profile_patches_across_react_rounds():
     assert first["ok"] is True
     assert second["ok"] is True
     draft = second["draft"]["data_profile_draft"]
-    assert draft["dataset_profile"] == "go2w_like"
+    assert draft["processing_profile"]["id"] == "parameterized_navigation_v1"
     assert draft["topic_params"]["query_dir"] == "rs32_lidar_points"
     assert draft["gridmap_source"] == "existing_gridmap"
     assert draft["stage_variants"]["extract_and_sync_navigation_data"]["variant"] == "go2w_like"
     assert draft["stage_variants"]["prepare_gridmap_for_projection"]["variant"] == "copy_existing_gridmap"
     assert state.data_profile is not None
-    assert state.data_profile.dataset_profile == "go2w_like"
+    assert state.data_profile.processing_profile is not None
+    assert state.data_profile.processing_profile.id == "parameterized_navigation_v1"
     assert second["draft"]["ready_to_finish"] is True
     assert second["draft"]["completed_observations"] == [
         {"observation_id": "dataset_classification", "used_tool": "classify_navigation_dataset_tool"},
@@ -255,7 +431,7 @@ def test_workflow_plan_draft_keeps_incomplete_patch_as_draft_only():
 
     assert result["ok"] is True
     assert result["draft"]["data_profile_draft"]["gridmap_source"] == "existing_gridmap"
-    assert "dataset_profile" in result["draft"]["missing_fields"]
+    assert "processing_profile" in result["draft"]["missing_fields"]
     assert state.data_profile is None
 
 
@@ -264,7 +440,7 @@ def test_plan_from_draft_requires_complete_navigation_data_profile():
         request=NavigationRequest(date="20270605", scene_mode="out")
     )
 
-    state.update(data_profile_patch={"dataset_profile": "go2w_like"})
+    state.update(data_profile_patch={"processing_profile": {"id": "parameterized_navigation_v1"}})
 
     with pytest_raises_value_error("NavigationDataProfile draft is incomplete"):
         build_plan_from_draft(state)
@@ -277,7 +453,13 @@ def test_plan_from_draft_requires_topic_params_before_finalizing():
 
     state.update(
         data_profile_patch={
-            "dataset_profile": "go2w_like",
+            "processing_profile": {
+                "id": "parameterized_navigation_v1",
+                "platform_hint": "unknown",
+                "topic_params": _go2w_topic_params().model_dump(mode="json"),
+                "localization_policy": {"source": "odom", "conversion": "odom_to_ins"},
+            },
+            "localization_policy": {"source": "odom", "conversion": "odom_to_ins"},
             "gridmap_source": "existing_gridmap",
             "pcd_gridmap_tool_available": True,
             "stage_variants": _complete_stage_variants(
@@ -301,7 +483,14 @@ def test_plan_from_lightweight_profile_keeps_gridmap_generation_variant():
     profile = NavigationDataProfile(
         date="20270605",
         scene_mode="out",
-        dataset_profile="go2w_like",
+        processing_profile=_processing_profile(
+            stage_variants=_complete_stage_variants(
+                "generate_from_pcd",
+                "no existing grid_map artifact but generator is available",
+                ["inspect_gridmap_artifacts_tool", "inspect_runtime_assets_tool"],
+            ),
+        ),
+        localization_policy={"source": "odom", "conversion": "odom_to_ins"},
         topic_params=_go2w_topic_params(),
         gridmap_source="generated_from_pcd",
         stage_variants=_complete_stage_variants(
@@ -328,7 +517,27 @@ def test_plan_from_lightweight_profile_writes_variant_metadata_for_profile_drive
     profile = NavigationDataProfile(
         date="20270605",
         scene_mode="out",
-        dataset_profile="go2w_like",
+        processing_profile=_processing_profile(
+            gridmap_source="existing_gridmap",
+            stage_variants={
+                "extract_and_sync_navigation_data": StageVariantDecision(
+                    variant="go2w_like",
+                    reason="dataset classified as go2w_like",
+                    evidence=["classify_navigation_dataset_tool"],
+                ),
+                "prepare_gridmap_for_projection": StageVariantDecision(
+                    variant="copy_existing_gridmap",
+                    reason="sync data already contains grid_map",
+                    evidence=["inspect_gridmap_artifacts_tool"],
+                ),
+                "run_projection_and_trajectory": StageVariantDecision(
+                    variant="cjl_0525_with_gridmap",
+                    reason="go2w_like uses the 0525 projection script",
+                    evidence=["inspect_runtime_assets_tool"],
+                ),
+            },
+        ),
+        localization_policy={"source": "odom", "conversion": "odom_to_ins"},
         topic_params=_go2w_topic_params(),
         gridmap_source="existing_gridmap",
         stage_variants={
@@ -382,10 +591,23 @@ def test_plan_from_lightweight_profile_rejects_blocking_issues():
     profile = NavigationDataProfile(
         date="20270605",
         scene_mode="out",
-        dataset_profile="go2w_like",
+        processing_profile=_processing_profile(
+            gridmap_source="unknown",
+            stage_variants=_complete_stage_variants(
+                "generate_from_pcd",
+                "no existing grid_map artifact but generator is available",
+                ["inspect_gridmap_artifacts_tool"],
+            ),
+        ),
+        localization_policy={"source": "odom", "conversion": "odom_to_ins"},
         topic_params=_go2w_topic_params(),
         gridmap_source="unknown",
         pcd_gridmap_tool_available=False,
+        stage_variants=_complete_stage_variants(
+            "generate_from_pcd",
+            "no existing grid_map artifact but generator is available",
+            ["inspect_gridmap_artifacts_tool"],
+        ),
         blocking_issues=[
             PlanIssue(type="missing_gridmap_source_or_generator", message="grid_map required")
         ],
@@ -393,7 +615,7 @@ def test_plan_from_lightweight_profile_rejects_blocking_issues():
 
     state.update(data_profile=profile.model_dump(mode="json"))
 
-    with pytest_raises_value_error("blocking issues"):
+    with pytest_raises_value_error("blocking_issues"):
         build_plan_from_draft(state)
 
 

@@ -36,17 +36,68 @@ def _find_variant(
     return None
 
 
+def _legacy_dataset_profile_fact(facts: dict[str, str]) -> str | None:
+    processing_profile = facts.get("processing_profile")
+    platform_hint = facts.get("platform_hint")
+    topic_profile_hint = facts.get("topic_profile_hint")
+    if processing_profile in {"go2w_like", "u_legacy_like"}:
+        return processing_profile
+    if platform_hint == "go2w" or topic_profile_hint == "go2w_like":
+        return "go2w_like"
+    if platform_hint == "u" or topic_profile_hint in {"u", "u_like", "u_legacy_like"}:
+        return "u_legacy_like"
+    return None
+
+
 def _selector_facts(plan: WorkflowPlan, data_profile: NavigationDataProfile | None) -> dict[str, str]:
-    facts = {"dataset_profile": plan.dataset_profile}
+    facts = {
+        "processing_profile": plan.processing_profile,
+        "platform_hint": plan.platform_hint,
+    }
     if data_profile is not None:
         facts.update(
             {
-                "dataset_profile": data_profile.dataset_profile,
+                "platform_hint": data_profile.platform_hint,
                 "gridmap_source": data_profile.gridmap_source,
                 "pcd_gridmap_tool_available": str(data_profile.pcd_gridmap_tool_available).lower(),
                 "projection_input_ready": str(data_profile.projection_input_ready).lower(),
             }
         )
+        if data_profile.localization_policy is not None:
+            facts.update(
+                {
+                    "localization_source": data_profile.localization_policy.source,
+                    "localization_conversion": data_profile.localization_policy.conversion,
+                }
+            )
+        if data_profile.topic_params is not None:
+            if data_profile.topic_params.profile_hint is not None:
+                facts["topic_profile_hint"] = data_profile.topic_params.profile_hint
+            if data_profile.topic_params.query_dir is not None:
+                facts["query_dir"] = data_profile.topic_params.query_dir
+        if data_profile.processing_profile is not None:
+            processing_profile = data_profile.processing_profile
+            if (
+                "topic_profile_hint" not in facts
+                and processing_profile.topic_params.profile_hint is not None
+            ):
+                facts["topic_profile_hint"] = processing_profile.topic_params.profile_hint
+            facts.update(
+                {
+                    "processing_profile": processing_profile.id,
+                    "processing_profile_platform_hint": processing_profile.platform_hint,
+                    "gridmap_policy_source": processing_profile.gridmap_policy.source,
+                    "calibration_policy_mode": processing_profile.calibration_policy.mode,
+                    "calibration_requires_user_confirmation": str(
+                        processing_profile.calibration_policy.requires_user_confirmation
+                    ).lower(),
+                }
+            )
+            if facts.get("platform_hint") == "unknown" and processing_profile.platform_hint != "unknown":
+                facts["platform_hint"] = processing_profile.platform_hint
+    legacy_dataset_profile = _legacy_dataset_profile_fact(facts)
+    if legacy_dataset_profile is not None:
+        facts["dataset_profile"] = legacy_dataset_profile
     return facts
 
 
@@ -59,12 +110,12 @@ def validate_workflow_plan(
     errors: list[dict[str, Any]] = []
     warnings: list[dict[str, Any]] = []
 
-    if plan.dataset_profile not in {"u_legacy_like", "go2w_like"}:
+    if not plan.processing_profile.strip():
         errors.append(
             _issue(
-                "unknown_dataset_profile",
-                "WorkflowPlan.dataset_profile must be u_legacy_like or go2w_like",
-                dataset_profile=plan.dataset_profile,
+                "missing_processing_profile",
+                "WorkflowPlan.processing_profile must be non-empty",
+                processing_profile=plan.processing_profile,
             )
         )
 

@@ -4,20 +4,39 @@ import json
 from typing import Any
 
 from agentscope.tool import FunctionTool
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 
 from vla_data_juicer_agents.navigation.models import NavigationDataProfile, NavigationRequest, WorkflowPlan
-from vla_data_juicer_agents.navigation.profiles import get_profile
 
 
 class WorkflowPlanDraftState(BaseModel):
     request: NavigationRequest
-    dataset_profile: str | None = None
+    processing_profile: str | None = None
+    platform_hint: str = "unknown"
     data_profile_draft: dict[str, Any] = Field(default_factory=dict)
     data_profile: NavigationDataProfile | None = None
     finalized_plan: WorkflowPlan | None = None
     validation_errors: list[str] = Field(default_factory=list)
     completed_observations: list[dict[str, str]] = Field(default_factory=list)
+
+    @model_validator(mode="before")
+    @classmethod
+    def _coerce_request_fields(cls, data: Any) -> Any:
+        if not isinstance(data, dict) or "request" in data or "date" not in data:
+            return data
+        coerced = dict(data)
+        coerced["request"] = {
+            "date": coerced.get("date"),
+            "segments": coerced.get("segments"),
+            "scene_mode": coerced.get("scene_mode"),
+            "dry_run": coerced.get("dry_run", False),
+        }
+        return coerced
+
+    @property
+    def dataset_profile(self) -> str | None:
+        """Compatibility for callers that still probe the old draft attribute."""
+        return self.processing_profile
 
     @property
     def date(self) -> str:
@@ -42,9 +61,9 @@ class WorkflowPlanDraftState(BaseModel):
 
     def current_data_profile_draft(self) -> dict[str, Any]:
         draft = self._request_data_profile_seed()
+        if self.platform_hint:
+            draft["platform_hint"] = self.platform_hint
         _deep_merge(draft, self.data_profile_draft)
-        if self.dataset_profile is not None and "dataset_profile" not in draft:
-            draft["dataset_profile"] = self.dataset_profile
         return draft
 
     def filled_fields(self) -> list[str]:
@@ -55,21 +74,20 @@ class WorkflowPlanDraftState(BaseModel):
         missing: list[str] = []
         if draft.get("scene_mode") not in {"in", "out"}:
             missing.append("scene_mode")
-        if draft.get("dataset_profile") not in {"u_legacy_like", "go2w_like"}:
-            missing.append("dataset_profile")
+        processing_profile = draft.get("processing_profile")
+        if not isinstance(processing_profile, dict) or not isinstance(processing_profile.get("id"), str):
+            missing.append("processing_profile")
+        elif processing_profile.get("blocking_issues"):
+            missing.append("processing_profile.blocking_issues")
         topic_params = draft.get("topic_params")
         if not isinstance(topic_params, dict):
             missing.append("topic_params")
         elif topic_params.get("blocking_issues"):
             missing.append("topic_params.blocking_issues")
-        gridmap_source = draft.get("gridmap_source")
-        blocking_issues = draft.get("blocking_issues") or []
-        if blocking_issues:
-            return missing
-        if gridmap_source not in {"existing_gridmap", "generated_from_pcd", "projection_ready"} and not blocking_issues:
-            missing.append("gridmap_source")
-        if "pcd_gridmap_tool_available" not in draft:
-            missing.append("pcd_gridmap_tool_available")
+        if draft.get("blocking_issues"):
+            missing.append("blocking_issues")
+        if not isinstance(draft.get("localization_policy"), dict):
+            missing.append("localization_policy")
         stage_variants = draft.get("stage_variants") or {}
         for stage_name in (
             "extract_and_sync_navigation_data",
@@ -83,7 +101,10 @@ class WorkflowPlanDraftState(BaseModel):
     def ready_to_finish(self) -> bool:
         return (
             self.data_profile is not None
+            and self.data_profile.processing_profile is not None
             and self.data_profile.topic_params is not None
+            and self.data_profile.localization_policy is not None
+            and not self.data_profile.processing_profile.blocking_issues
             and not self.data_profile.topic_params.blocking_issues
             and not self.data_profile.blocking_issues
             and not self.missing_fields()
@@ -92,13 +113,18 @@ class WorkflowPlanDraftState(BaseModel):
     def next_tool_candidates(self) -> list[str]:
         missing = set(self.missing_fields())
         candidates: list[str] = []
-        if "dataset_profile" in missing:
-            candidates.append("classify_navigation_dataset_tool")
+        if (
+            "processing_profile" in missing
+            or "processing_profile.blocking_issues" in missing
+            or "blocking_issues" in missing
+            or "localization_policy" in missing
+        ):
+            candidates.append("infer_navigation_processing_profile_tool")
         if "topic_params" in missing or "topic_params.blocking_issues" in missing:
             candidates.append("infer_navigation_topic_params_tool")
-        if "gridmap_source" in missing or "stage_variants.prepare_gridmap_for_projection" in missing:
+        if "stage_variants.prepare_gridmap_for_projection" in missing:
             candidates.append("inspect_gridmap_artifacts_tool")
-        if "pcd_gridmap_tool_available" in missing or any(field.startswith("stage_variants.") for field in missing):
+        if any(field.startswith("stage_variants.") for field in missing):
             candidates.append("inspect_runtime_assets_tool")
             candidates.append("list_navigation_tool_capabilities_tool")
         if not candidates:
@@ -111,15 +137,16 @@ class WorkflowPlanDraftState(BaseModel):
             "date": data_profile_draft.get("date", self.date),
             "segments": data_profile_draft.get("segments"),
             "scene_mode": data_profile_draft.get("scene_mode") or "<in|out>",
-            "dataset_profile": data_profile_draft.get("dataset_profile") or "<u_legacy_like|go2w_like>",
+            "processing_profile": self.processing_profile or "<processing_profile.id>",
+            "platform_hint": self.platform_hint,
             "navigation_data_profile_schema": _navigation_data_profile_schema(),
             "data_profile_draft": data_profile_draft,
             "data_profile": self.data_profile.model_dump(mode="json") if self.data_profile is not None else None,
-            "steps": "<generated by finalize_workflow_plan_tool after dataset_profile is valid>",
+            "steps": "<generated by finalize_workflow_plan_tool after processing_profile is complete>",
             "filled_fields": self.filled_fields(),
             "missing_fields": self.missing_fields(),
             "required_observations": [
-                "dataset_classification",
+                "navigation_processing_profile",
                 "navigation_topic_params",
                 "gridmap_artifacts",
                 "runtime_assets_or_tool_capabilities",
@@ -128,7 +155,6 @@ class WorkflowPlanDraftState(BaseModel):
             "next_tool_candidates": self.next_tool_candidates(),
             "ready_to_finish": self.ready_to_finish(),
             "ready_to_finalize": self.ready_to_finish(),
-            "allowed_dataset_profiles": ["u_legacy_like", "go2w_like"],
             "allowed_tool_order": [
                 "prepare_raw_data",
                 "extract_and_sync_navigation_data",
@@ -142,10 +168,15 @@ class WorkflowPlanDraftState(BaseModel):
             ],
         }
 
+    def snapshot(self) -> dict[str, Any]:
+        return self.schema_snapshot()
+
     def update(
         self,
         dataset_profile: str | None = None,
         profile: str | None = None,
+        processing_profile: str | dict[str, Any] | None = None,
+        platform_hint: str | None = None,
         data_profile: dict[str, Any] | NavigationDataProfile | str | None = None,
         data_profile_patch: dict[str, Any] | str | None = None,
         observation_id: str | None = None,
@@ -165,22 +196,47 @@ class WorkflowPlanDraftState(BaseModel):
                 ),
             )
 
-        candidate_profile = dataset_profile or profile
-        if candidate_profile is not None:
-            try:
-                get_profile(candidate_profile)
-            except KeyError:
-                self.validation_errors.append(
-                    f"unsupported dataset_profile: {candidate_profile}; expected u_legacy_like or go2w_like"
-                )
+        legacy_profile_hint = dataset_profile or profile
+        if legacy_profile_hint is not None:
+            self.platform_hint = legacy_profile_hint
+            patch.setdefault("platform_hint", legacy_profile_hint)
+        if processing_profile is not None:
+            if isinstance(processing_profile, dict):
+                patch.setdefault("processing_profile", processing_profile)
+                profile_id = processing_profile.get("id")
+                if isinstance(profile_id, str):
+                    self.processing_profile = profile_id
+                nested_platform_hint = processing_profile.get("platform_hint")
+                if isinstance(nested_platform_hint, str):
+                    self.platform_hint = nested_platform_hint
+                    patch.setdefault("platform_hint", nested_platform_hint)
             else:
-                self.dataset_profile = candidate_profile
-                patch["dataset_profile"] = candidate_profile
+                self.processing_profile = processing_profile
+                patch.setdefault("processing_profile", {"id": processing_profile})
+        if platform_hint is not None:
+            self.platform_hint = platform_hint
+            patch["platform_hint"] = platform_hint
+        patch_processing_profile = patch.get("processing_profile")
+        if isinstance(patch_processing_profile, dict):
+            profile_id = patch_processing_profile.get("id")
+            if isinstance(profile_id, str):
+                self.processing_profile = profile_id
+            nested_platform_hint = patch_processing_profile.get("platform_hint")
+            if (
+                isinstance(nested_platform_hint, str)
+                and nested_platform_hint != "unknown"
+                and patch.get("platform_hint", "unknown") == "unknown"
+            ):
+                self.platform_hint = nested_platform_hint
+                patch["platform_hint"] = nested_platform_hint
+        elif isinstance(patch_processing_profile, str):
+            self.processing_profile = patch_processing_profile
+            patch["processing_profile"] = {"id": patch_processing_profile}
+        patch_platform_hint = patch.get("platform_hint")
+        if isinstance(patch_platform_hint, str):
+            self.platform_hint = patch_platform_hint
         if patch:
             _deep_merge(self.data_profile_draft, patch)
-        draft_profile = self.current_data_profile_draft().get("dataset_profile")
-        if draft_profile in {"u_legacy_like", "go2w_like"}:
-            self.dataset_profile = draft_profile
         if observation_id is not None or used_tool is not None:
             observation: dict[str, str] = {}
             if observation_id is not None:
@@ -202,7 +258,13 @@ class WorkflowPlanDraftState(BaseModel):
             self.validation_errors.append(f"invalid data_profile: {exc}")
         else:
             self.data_profile = parsed_profile
-            self.dataset_profile = parsed_profile.dataset_profile
+            if parsed_profile.processing_profile is not None:
+                self.processing_profile = parsed_profile.processing_profile.id
+                self.platform_hint = (
+                    parsed_profile.processing_profile.platform_hint
+                    if parsed_profile.platform_hint == "unknown"
+                    else parsed_profile.platform_hint
+                )
 
     def status(self) -> dict[str, Any]:
         return {
@@ -219,24 +281,36 @@ def build_plan_from_draft(state: WorkflowPlanDraftState) -> WorkflowPlan:
     if state.data_profile is None:
         missing = ", ".join(state.missing_fields()) or "invalid profile fields"
         raise ValueError(f"NavigationDataProfile draft is incomplete; missing: {missing}")
+    if state.data_profile.processing_profile is None:
+        raise ValueError("processing_profile is required before finalizing WorkflowPlan")
     if state.data_profile.topic_params is None:
         raise ValueError("topic_params is required before finalizing WorkflowPlan")
+    if state.data_profile.localization_policy is None:
+        raise ValueError("localization_policy is required before finalizing WorkflowPlan")
+    if state.data_profile.processing_profile.blocking_issues:
+        issues = ", ".join(issue.type for issue in state.data_profile.processing_profile.blocking_issues)
+        raise ValueError(f"cannot finalize WorkflowPlan with blocking processing profile: {issues}")
     if state.data_profile.topic_params.blocking_issues:
         issues = ", ".join(issue.type for issue in state.data_profile.topic_params.blocking_issues)
         raise ValueError(f"cannot finalize WorkflowPlan with blocking topic params: {issues}")
-    if state.dataset_profile is None:
-        raise ValueError("dataset_profile is required before finalizing WorkflowPlan")
     if state.data_profile.scene_mode not in {"in", "out"}:
         raise ValueError("scene_mode is required before finalizing WorkflowPlan; expected 'in' or 'out'.")
     if state.data_profile is not None and state.data_profile.blocking_issues:
         issues = ", ".join(issue.type for issue in state.data_profile.blocking_issues)
         raise ValueError(f"cannot finalize WorkflowPlan with blocking issues: {issues}")
-    return build_deterministic_plan_template(
+    plan = build_deterministic_plan_template(
         state.data_profile.date,
-        state.data_profile.dataset_profile,
+        state.data_profile.processing_profile.id,
         state.data_profile.segments,
         scene_mode=state.data_profile.scene_mode,
         data_profile=state.data_profile,
+    )
+    return plan.model_copy(
+        update={
+            "processing_profile": state.data_profile.processing_profile.id,
+            "platform_hint": state.data_profile.platform_hint
+            or state.data_profile.processing_profile.platform_hint,
+        }
     )
 
 
@@ -244,6 +318,8 @@ def build_plan_draft_tools(state: WorkflowPlanDraftState) -> list[FunctionTool]:
     def update_workflow_plan_draft_tool(
         dataset_profile: str | None = None,
         profile: str | None = None,
+        processing_profile: str | dict[str, Any] | None = None,
+        platform_hint: str | None = None,
         data_profile: dict[str, Any] | str | None = None,
         data_profile_patch: dict[str, Any] | str | None = None,
         observation_id: str | None = None,
@@ -253,6 +329,8 @@ def build_plan_draft_tools(state: WorkflowPlanDraftState) -> list[FunctionTool]:
         return state.update(
             dataset_profile=dataset_profile,
             profile=profile,
+            processing_profile=processing_profile,
+            platform_hint=platform_hint,
             data_profile=data_profile,
             data_profile_patch=data_profile_patch,
             observation_id=observation_id,
@@ -264,7 +342,7 @@ def build_plan_draft_tools(state: WorkflowPlanDraftState) -> list[FunctionTool]:
         return state.status()
 
     def finalize_workflow_plan_tool() -> dict[str, Any]:
-        """Finalize and return strict WorkflowPlan JSON after the dataset profile has been validated."""
+        """Finalize and return strict WorkflowPlan JSON after the processing profile has been validated."""
         plan = build_plan_from_draft(state)
         state.finalized_plan = plan
         return {
@@ -325,7 +403,7 @@ def _navigation_data_profile_schema() -> dict[str, Any]:
     schema = NavigationDataProfile.model_json_schema()
     properties = schema.setdefault("properties", {})
     properties.setdefault("scene_mode", {})["enum"] = ["in", "out"]
-    properties.setdefault("dataset_profile", {})["enum"] = ["u_legacy_like", "go2w_like"]
+    properties.pop("dataset_profile", None)
     properties.setdefault("gridmap_source", {})["enum"] = [
         "existing_gridmap",
         "generated_from_pcd",
