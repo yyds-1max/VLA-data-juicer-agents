@@ -1,7 +1,9 @@
 from pydantic import ValidationError
 
 from vla_data_juicer_agents.navigation.models import (
+    NavigationCalibrationPolicy,
     NavigationDataProfile,
+    NavigationLocalizationPolicy,
     NavigationRequest,
     NavigationProcessingProfile,
     NavigationTopicParams,
@@ -10,6 +12,7 @@ from vla_data_juicer_agents.navigation.models import (
     WorkflowStep,
 )
 from vla_data_juicer_agents.navigation.plan_draft import WorkflowPlanDraftState, build_plan_from_draft
+from vla_data_juicer_agents.navigation.workflow import build_deterministic_plan_template
 
 
 def _complete_stage_variants(gridmap_variant: str, gridmap_reason: str, gridmap_evidence: list[str]):
@@ -356,6 +359,74 @@ def test_plan_from_draft_accepts_complete_processing_profile():
     plan = build_plan_from_draft(state)
     assert plan.processing_profile == "parameterized_navigation_v1"
     assert plan.platform_hint == "unknown"
+
+
+def test_plan_from_processing_profile_inserts_calibration_confirmation_before_assemble():
+    data_profile = NavigationDataProfile(
+        date="20270605",
+        scene_mode="out",
+        platform_hint="unknown",
+        processing_profile=NavigationProcessingProfile(
+            id="parameterized_navigation_v1",
+            platform_hint="unknown",
+            topic_params=NavigationTopicParams(
+                topic_whitelist=[
+                    "/cam_video5/csi_cam/image_raw/compressed",
+                    "/lidar_points",
+                    "/sport_odom",
+                ],
+                topic_map={
+                    "cam_video5": "fisheye_front",
+                    "lidar_points": "r32_rslidar_points",
+                    "sport_odom": "odom",
+                },
+                query_dir="lidar_points",
+            ),
+            localization_policy=NavigationLocalizationPolicy(
+                source="odom",
+                conversion="odom_to_ins",
+            ),
+            calibration_policy=NavigationCalibrationPolicy(
+                mode="hardcoded_with_user_confirmation",
+                requires_user_confirmation=True,
+            ),
+        ),
+        topic_params=NavigationTopicParams(
+            topic_whitelist=[
+                "/cam_video5/csi_cam/image_raw/compressed",
+                "/lidar_points",
+                "/sport_odom",
+            ],
+            topic_map={
+                "cam_video5": "fisheye_front",
+                "lidar_points": "r32_rslidar_points",
+                "sport_odom": "odom",
+            },
+            query_dir="lidar_points",
+        ),
+        localization_policy=NavigationLocalizationPolicy(
+            source="odom",
+            conversion="odom_to_ins",
+        ),
+    )
+
+    plan = build_deterministic_plan_template(
+        "20270605",
+        None,
+        None,
+        scene_mode="out",
+        data_profile=data_profile,
+    )
+    step_ids = [step.step_id for step in plan.steps]
+
+    assert plan.processing_profile == "parameterized_navigation_v1"
+    assert plan.platform_hint == "unknown"
+    assert step_ids.index("confirm_navigation_calibration_params") < step_ids.index("assemble_finish_temp")
+    confirm_step = next(step for step in plan.steps if step.step_id == "confirm_navigation_calibration_params")
+    assert confirm_step.human_blocking is True
+    preprocessing = next(step for step in plan.steps if step.step_id == "run_noobscene_preprocessing")
+    assert preprocessing.arguments["localization_source"] == "odom"
+    assert preprocessing.arguments["localization_conversion"] == "odom_to_ins"
 
 
 def test_workflow_plan_draft_merges_data_profile_patches_across_react_rounds():

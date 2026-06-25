@@ -23,6 +23,11 @@ from vla_data_juicer_agents.navigation.models import NavigationDataProfile, Navi
 from vla_data_juicer_agents.navigation.plan_validation import validate_workflow_plan
 from vla_data_juicer_agents.navigation.plan_draft import build_plan_from_draft
 from vla_data_juicer_agents.navigation.run_state import WorkflowRunStore
+from vla_data_juicer_agents.navigation.catalog import (
+    ToolCapability,
+    ToolVariantCapability,
+    list_navigation_tool_capabilities,
+)
 
 
 MAX_AGENT_TOOL_CONFIRMATION_ROUNDS = 30
@@ -75,17 +80,32 @@ def _json_text_from_output(output: str) -> str:
     return text
 
 
+def _coerce_legacy_plan_payload(payload: Any) -> Any:
+    if not isinstance(payload, dict):
+        return payload
+    coerced = dict(payload)
+    legacy_dataset_profile = coerced.get("dataset_profile")
+    if isinstance(legacy_dataset_profile, str) and "processing_profile" not in coerced:
+        coerced["processing_profile"] = legacy_dataset_profile
+    if isinstance(legacy_dataset_profile, str) and "platform_hint" not in coerced:
+        if legacy_dataset_profile == "go2w_like":
+            coerced["platform_hint"] = "go2w"
+        elif legacy_dataset_profile == "u_legacy_like":
+            coerced["platform_hint"] = "u"
+    return coerced
+
+
 def _parse_workflow_plan_output(output: object) -> WorkflowPlan:
     if isinstance(output, WorkflowPlan):
         return output
 
     try:
         if isinstance(output, dict):
-            return WorkflowPlan.model_validate(output)
+            return WorkflowPlan.model_validate(_coerce_legacy_plan_payload(output))
 
         if isinstance(output, str) and output.strip():
             payload: Any = json.loads(_json_text_from_output(output))
-            return WorkflowPlan.model_validate(payload)
+            return WorkflowPlan.model_validate(_coerce_legacy_plan_payload(payload))
     except (json.JSONDecodeError, TypeError, ValidationError, ValueError) as exc:
         raise ValueError(
             f"Unable to parse WorkflowPlan output: {exc}; raw output excerpt={_raw_output_excerpt(output)!r}"
@@ -94,20 +114,125 @@ def _parse_workflow_plan_output(output: object) -> WorkflowPlan:
     raise ValueError(f"Unable to parse WorkflowPlan output: empty or unsupported output; raw output excerpt={_raw_output_excerpt(output)!r}")
 
 
+def _validation_catalog_with_planned_confirmation() -> list[ToolCapability]:
+    catalog = list_navigation_tool_capabilities()
+    if not any(capability.tool_name == "confirm_navigation_calibration_params" for capability in catalog):
+        catalog.append(
+            ToolCapability(
+                tool_name="confirm_navigation_calibration_params",
+                stage_kind="confirm_navigation_calibration_params",
+                effects="read",
+                variants=[ToolVariantCapability(id="default")],
+                supports_dry_run=True,
+                executor_agent_allowed=True,
+            )
+        )
+    return catalog
+
+
+def _calibration_confirmation_validation_errors(plan: WorkflowPlan) -> list[dict[str, Any]]:
+    errors: list[dict[str, Any]] = []
+    positions = {step.step_id: index for index, step in enumerate(plan.steps)}
+    confirmation_position = positions.get("confirm_navigation_calibration_params")
+    if confirmation_position is None:
+        return [
+            {
+                "type": "missing_calibration_confirmation",
+                "message": "WorkflowPlan must include confirm_navigation_calibration_params before assemble_finish_temp",
+                "step_id": "confirm_navigation_calibration_params",
+            }
+        ]
+
+    confirmation_step = plan.steps[confirmation_position]
+    extract_position = positions.get("extract_and_sync_navigation_data")
+    assemble_position = positions.get("assemble_finish_temp")
+    if extract_position is not None and confirmation_position <= extract_position:
+        errors.append(
+            {
+                "type": "invalid_calibration_confirmation_order",
+                "message": "confirm_navigation_calibration_params must run after extract_and_sync_navigation_data",
+                "step_id": "confirm_navigation_calibration_params",
+            }
+        )
+    if assemble_position is not None and confirmation_position >= assemble_position:
+        errors.append(
+            {
+                "type": "invalid_calibration_confirmation_order",
+                "message": "confirm_navigation_calibration_params must run before assemble_finish_temp",
+                "step_id": "confirm_navigation_calibration_params",
+            }
+        )
+    if assemble_position is not None:
+        assemble_step = plan.steps[assemble_position]
+        if "confirm_navigation_calibration_params" not in assemble_step.preconditions:
+            errors.append(
+                {
+                    "type": "missing_calibration_confirmation_precondition",
+                    "message": "assemble_finish_temp must depend on confirm_navigation_calibration_params",
+                    "step_id": "assemble_finish_temp",
+                    "precondition": "confirm_navigation_calibration_params",
+                }
+            )
+    if confirmation_step.human_blocking is not True:
+        errors.append(
+            {
+                "type": "invalid_calibration_confirmation_flags",
+                "message": "confirm_navigation_calibration_params must be human_blocking",
+                "step_id": "confirm_navigation_calibration_params",
+                "field": "human_blocking",
+            }
+        )
+    if confirmation_step.failure_behavior != "stop":
+        errors.append(
+            {
+                "type": "invalid_calibration_confirmation_flags",
+                "message": "confirm_navigation_calibration_params failure_behavior must be stop",
+                "step_id": "confirm_navigation_calibration_params",
+                "field": "failure_behavior",
+            }
+        )
+    if confirmation_step.effects != "read":
+        errors.append(
+            {
+                "type": "invalid_calibration_confirmation_flags",
+                "message": "confirm_navigation_calibration_params effects must be read",
+                "step_id": "confirm_navigation_calibration_params",
+                "field": "effects",
+            }
+        )
+    return errors
+
+
 def _validated_workflow_plan(plan: WorkflowPlan, data_profile: NavigationDataProfile | None = None) -> WorkflowPlan:
-    validation = validate_workflow_plan(plan, data_profile=data_profile)
-    if not validation["ok"]:
+    validation = validate_workflow_plan(
+        plan,
+        data_profile=data_profile,
+        catalog=_validation_catalog_with_planned_confirmation(),
+    )
+    validation["errors"].extend(_calibration_confirmation_validation_errors(plan))
+    if validation["errors"]:
         raise ValueError(f"WorkflowPlan validation failed: {validation['errors']}")
     return plan
 
 
+def _legacy_dataset_profile_from_profile(profile_id: str, platform_hint: str) -> str | None:
+    if profile_id in {"go2w_like", "u_legacy_like"}:
+        return profile_id
+    if platform_hint == "go2w":
+        return "go2w_like"
+    if platform_hint == "u":
+        return "u_legacy_like"
+    return None
+
+
 def build_deterministic_plan_template(
     date: str,
-    dataset_profile: str,
-    segments: list[str] | None,
+    processing_profile: str | None = None,
+    segments: list[str] | None = None,
     *,
     scene_mode: Literal["in", "out"] | _SceneModeMissing = _SCENE_MODE_MISSING,
     data_profile: NavigationDataProfile | None = None,
+    dataset_profile: str | None = None,
 ) -> WorkflowPlan:
     if scene_mode not in {"in", "out"}:
         raise ValueError("scene_mode is required before building WorkflowPlan; expected 'in' or 'out'.")
@@ -115,13 +240,42 @@ def build_deterministic_plan_template(
     finish_temp_path = _finish_temp_path(date)
     finish_path = _finish_path(date)
     common_arguments = {"date": date, "segments": segments}
+    profile_id = (
+        data_profile.processing_profile.id
+        if data_profile is not None and data_profile.processing_profile is not None
+        else processing_profile or dataset_profile or "parameterized_navigation_v1"
+    )
+    platform_hint = data_profile.platform_hint if data_profile is not None else "unknown"
+    if data_profile is None:
+        if profile_id == "go2w_like":
+            platform_hint = "go2w"
+        elif profile_id == "u_legacy_like":
+            platform_hint = "u"
+    legacy_dataset_profile = _legacy_dataset_profile_from_profile(profile_id, platform_hint)
+
     topic_arguments = {}
-    if data_profile is not None and data_profile.topic_params is not None:
+    topic_params = None
+    if data_profile is not None:
+        topic_params = data_profile.topic_params
+        if topic_params is None and data_profile.processing_profile is not None:
+            topic_params = data_profile.processing_profile.topic_params
+    if topic_params is not None:
         topic_arguments = {
-            "topic_whitelist": list(data_profile.topic_params.topic_whitelist),
-            "topic_map": dict(data_profile.topic_params.topic_map),
-            "query_dir": data_profile.topic_params.query_dir,
+            "topic_whitelist": list(topic_params.topic_whitelist),
+            "topic_map": dict(topic_params.topic_map),
+            "query_dir": topic_params.query_dir,
         }
+    localization_policy = None
+    if data_profile is not None:
+        localization_policy = data_profile.localization_policy
+        if localization_policy is None and data_profile.processing_profile is not None:
+            localization_policy = data_profile.processing_profile.localization_policy
+    localization_source = localization_policy.source if localization_policy is not None else "odom"
+    localization_conversion = (
+        localization_policy.conversion
+        if localization_policy is not None
+        else "odom_to_ins"
+    )
 
     gridmap_decision = (
         data_profile.stage_variants.get("prepare_gridmap_for_projection")
@@ -138,12 +292,16 @@ def build_deterministic_plan_template(
         if data_profile is not None
         else None
     )
-    extract_variant = extract_decision.variant if extract_decision is not None else dataset_profile
+    extract_variant = (
+        extract_decision.variant
+        if extract_decision is not None
+        else legacy_dataset_profile or profile_id
+    )
     projection_variant = (
         projection_decision.variant
         if projection_decision is not None
         else "cjl_0525_with_gridmap"
-        if dataset_profile == "go2w_like"
+        if legacy_dataset_profile == "go2w_like"
         else "cjl_with_gridmap"
     )
     skip_gridmap = bool(
@@ -163,7 +321,12 @@ def build_deterministic_plan_template(
         WorkflowStep(
             step_id="extract_and_sync_navigation_data",
             tool_name="extract_and_sync_navigation_data",
-            arguments={**common_arguments, "dataset_profile": dataset_profile, **topic_arguments},
+            arguments={
+                **common_arguments,
+                "processing_profile": profile_id,
+                "platform_hint": platform_hint,
+                **topic_arguments,
+            },
             preconditions=["prepare_raw_data"],
             expected_outputs=[f"clip_data/{date}"],
             variant=extract_variant,
@@ -176,16 +339,34 @@ def build_deterministic_plan_template(
             evidence=list(extract_decision.evidence) if extract_decision is not None else [],
         ),
         WorkflowStep(
+            step_id="confirm_navigation_calibration_params",
+            tool_name="confirm_navigation_calibration_params",
+            arguments={**common_arguments, "platform_hint": platform_hint},
+            preconditions=["extract_and_sync_navigation_data"],
+            expected_outputs=[],
+            human_blocking=True,
+            failure_behavior="stop",
+            effects="read",
+        ),
+        WorkflowStep(
             step_id="assemble_finish_temp",
             tool_name="assemble_finish_temp",
-            arguments={**common_arguments, "dataset_profile": dataset_profile},
-            preconditions=["extract_and_sync_navigation_data"],
+            arguments={
+                **common_arguments,
+                "processing_profile": profile_id,
+                "platform_hint": platform_hint,
+            },
+            preconditions=["confirm_navigation_calibration_params"],
             expected_outputs=[finish_temp_path],
         ),
         WorkflowStep(
             step_id="run_noobscene_preprocessing",
             tool_name="run_noobscene_preprocessing",
-            arguments={"finish_temp_path": finish_temp_path},
+            arguments={
+                "finish_temp_path": finish_temp_path,
+                "localization_source": localization_source,
+                "localization_conversion": localization_conversion,
+            },
             preconditions=["assemble_finish_temp"],
             expected_outputs=[finish_temp_path],
         ),
@@ -241,7 +422,8 @@ def build_deterministic_plan_template(
                 arguments={
                     "finish_temp_path": finish_temp_path,
                     "finish_path": finish_path,
-                    "dataset_profile": dataset_profile,
+                    "processing_profile": profile_id,
+                    "platform_hint": platform_hint,
                 },
                 preconditions=projection_preconditions,
                 expected_outputs=[finish_path],
@@ -268,7 +450,8 @@ def build_deterministic_plan_template(
         date=date,
         segments=segments,
         scene_mode=scene_mode,
-        dataset_profile=dataset_profile,
+        processing_profile=profile_id,
+        platform_hint=platform_hint,
         steps=steps,
     )
 
@@ -420,12 +603,15 @@ async def run_plan_agent(
         "already fully supported by previous tool observations. Do not write script-level steps; "
         "final strict WorkflowPlan JSON must come from finalize_workflow_plan_tool. Stage one covers "
         "prepare.sh, run_U.sh, and run_odom.sh only; do not include run_fix.sh. Default to all raw "
-        "segments when segments are not specified. Supported dataset profiles are u_legacy_like and "
-        "go2w_like. Call infer_navigation_topic_params_tool before finalizing extract_and_sync_navigation_data; "
+        "segments when segments are not specified. Use NavigationDataProfile.processing_profile and "
+        "platform_hint rather than dataset_profile; legacy hints u_legacy_like and go2w_like may only "
+        "be used as transitional inputs. Call infer_navigation_topic_params_tool before finalizing "
+        "extract_and_sync_navigation_data; "
         "do not invent TOPIC_WHITELIST, topic_map, or query_dir. scene_mode is required and must be either in or out. Gridmap preparation must happen "
         "after run_tracking and before projection. Supported execution tool names include run_tracking, "
         "prepare_gridmap_for_projection, and run_projection_and_trajectory. The only human-blocking step "
-        f"is gen_box.py via run_initial_annotation_gui. {PUBLIC_PROGRESS_PROMPT}\n\n"
+        "besides calibration confirmation is gen_box.py via run_initial_annotation_gui. "
+        f"{PUBLIC_PROGRESS_PROMPT}\n\n"
         f"{_response_language_prompt(response_language)}"
         f"NavigationRequest JSON:\n{request.model_dump_json()}"
         f"{draft_prompt}"
@@ -440,7 +626,7 @@ async def run_plan_agent(
     )
     if draft_state is not None and draft_state.finalized_plan is not None:
         return _validated_workflow_plan(draft_state.finalized_plan, data_profile=draft_state.data_profile)
-    if draft_state is not None and not output.strip() and draft_state.dataset_profile is not None:
+    if draft_state is not None and not output.strip() and draft_state.processing_profile is not None:
         return _validated_workflow_plan(build_plan_from_draft(draft_state), data_profile=draft_state.data_profile)
     return _validated_workflow_plan(_parse_workflow_plan_output(output))
 
@@ -457,7 +643,7 @@ async def run_executor_agent(
 ) -> str:
     prompt = (
         "Execute this WorkflowPlan JSON step-by-step using the matching execution tools. Stop on any "
-        "failed tool result. The gen_box.py GUI step is human-blocking via run_initial_annotation_gui; "
+        "failed tool result. The calibration confirmation and gen_box.py GUI steps are human-blocking; "
         "wait until the human finishes before continuing. scene_mode is required and must be either in "
         "or out. Prepare gridmap after run_tracking and before run_projection_and_trajectory. Supported "
         "tool names include run_tracking, prepare_gridmap_for_projection, and run_projection_and_trajectory. "
