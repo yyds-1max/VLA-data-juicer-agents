@@ -8,13 +8,23 @@ from agentscope.tool import FunctionTool
 
 from vla_data_juicer_agents.navigation.config import NavigationSettings
 from vla_data_juicer_agents.navigation.models import (
+    NavigationCalibrationPolicy,
+    NavigationGridmapPolicy,
+    NavigationLocalizationPolicy,
+    NavigationProcessingProfile,
+    NavigationSensorBinding,
+    NavigationSensorBindings,
     NavigationTopicParams,
     PlanIssue,
     RawDateInspection,
     SegmentInspection,
     TopicInfo,
 )
-from vla_data_juicer_agents.navigation.profiles import classify_topics
+from vla_data_juicer_agents.navigation.profiles import (
+    TOPIC_OUTPUT_MAP,
+    classify_topics,
+    topics_for_role,
+)
 
 
 DATE_RE = re.compile(r"^[0-9]{8}$")
@@ -232,10 +242,30 @@ def infer_navigation_topic_params(
         PlanIssue(type="raw_date_error", message=error, evidence=[str(inspection.path)])
         for error in inspection.errors
     )
+    blocking_issues = list(warnings)
 
     full_matches = [
         pattern for pattern in _TOPIC_PARAM_PATTERNS if set(pattern["topics"]).issubset(topic_names)
     ]
+    if blocking_issues:
+        known_existing = [topic for topic in _KNOWN_TOPIC_ORDER if topic in topic_names]
+        return NavigationTopicParams(
+            profile_hint=None,
+            confidence=0.0,
+            topic_whitelist=known_existing,
+            topic_map={},
+            query_dir=(
+                "lidar_points"
+                if "/lidar_points" in topic_names and "/rs32_lidar_points" not in topic_names
+                else "rs32_lidar_points"
+                if "/rs32_lidar_points" in topic_names and "/lidar_points" not in topic_names
+                else None
+            ),
+            evidence=evidence,
+            warnings=warnings,
+            blocking_issues=blocking_issues,
+        )
+
     if len(full_matches) == 1:
         match = full_matches[0]
         return NavigationTopicParams(
@@ -277,6 +307,234 @@ def infer_navigation_topic_params(
                 evidence=known_existing or evidence,
             )
         ],
+    )
+
+
+def _topic_type_map(selected_segments: list[SegmentInspection]) -> dict[str, str | None]:
+    return {
+        topic.name: topic.type
+        for segment in selected_segments
+        for topic in segment.topics
+    }
+
+
+def _unique_role_binding(
+    role: str,
+    candidates: list[str],
+    topic_types: dict[str, str | None],
+    *,
+    kind: str,
+) -> tuple[NavigationSensorBinding | None, PlanIssue | None]:
+    if len(candidates) == 1:
+        topic = candidates[0]
+        return (
+            NavigationSensorBinding(
+                role=role,
+                topic=topic,
+                message_type=topic_types.get(topic),
+                kind=kind,
+            ),
+            None,
+        )
+    if len(candidates) > 1:
+        return (
+            NavigationSensorBinding(role=role, kind=kind, candidates=candidates),
+            PlanIssue(
+                type="ambiguous_navigation_topic_role",
+                message=f"Multiple topics match navigation role {role}.",
+                evidence=candidates,
+            ),
+        )
+    return (
+        None,
+        PlanIssue(
+            type="missing_navigation_topic_role",
+            message=f"No topic found for required navigation role {role}.",
+        ),
+    )
+
+
+def infer_navigation_sensor_bindings(
+    date: str,
+    segments: list[str] | None = None,
+    settings: NavigationSettings | None = None,
+) -> NavigationSensorBindings:
+    inspection = inspect_raw_date(date, settings=settings)
+    selected_segments = _select_inspection_segments(inspection, segments)
+    topic_types = _topic_type_map(selected_segments)
+    topic_names = set(topic_types)
+    evidence = [
+        str(segment.metadata_path)
+        for segment in selected_segments
+        if segment.metadata_path is not None and segment.topics
+    ]
+    warnings = [
+        PlanIssue(
+            type="raw_metadata_error",
+            message=error,
+            evidence=[str(segment.metadata_path)] if segment.metadata_path is not None else [segment.name],
+        )
+        for segment in selected_segments
+        for error in segment.errors
+    ]
+    warnings.extend(
+        PlanIssue(type="raw_date_error", message=error, evidence=[str(inspection.path)])
+        for error in inspection.errors
+    )
+
+    blocking_issues: list[PlanIssue] = list(warnings)
+    fisheye_front, issue = _unique_role_binding(
+        "fisheye_front",
+        topics_for_role(topic_names, "fisheye_front"),
+        topic_types,
+        kind="camera",
+    )
+    if issue is not None:
+        blocking_issues.append(issue)
+
+    lidar, issue = _unique_role_binding(
+        "lidar",
+        topics_for_role(topic_names, "lidar"),
+        topic_types,
+        kind="lidar",
+    )
+    if issue is not None:
+        blocking_issues.append(issue)
+
+    odom, odom_issue = _unique_role_binding(
+        "odom",
+        topics_for_role(topic_names, "odom"),
+        topic_types,
+        kind="odom",
+    )
+    ins, ins_issue = _unique_role_binding(
+        "ins",
+        topics_for_role(topic_names, "ins"),
+        topic_types,
+        kind="ins",
+    )
+
+    localization: NavigationSensorBinding | None = None
+    if ins is not None and ins.topic is not None:
+        localization = NavigationSensorBinding(
+            role="localization",
+            topic=ins.topic,
+            message_type=ins.message_type,
+            kind="ins",
+        )
+        if odom_issue is not None and odom_issue.type == "ambiguous_navigation_topic_role":
+            warnings.append(odom_issue)
+    elif ins_issue is not None and ins_issue.type == "ambiguous_navigation_topic_role":
+        blocking_issues.append(ins_issue)
+    elif odom is not None and odom.topic is not None:
+        localization = NavigationSensorBinding(
+            role="localization",
+            topic=odom.topic,
+            message_type=odom.message_type,
+            kind="odom",
+        )
+    elif odom_issue is not None and odom_issue.type == "ambiguous_navigation_topic_role":
+        blocking_issues.append(odom_issue)
+    else:
+        blocking_issues.append(
+            PlanIssue(
+                type="missing_navigation_topic_role",
+                message="No unique odom or ins topic found for navigation localization.",
+            )
+        )
+
+    return NavigationSensorBindings(
+        fisheye_front=fisheye_front,
+        lidar=lidar,
+        odom=odom,
+        ins=ins,
+        localization=localization,
+        warnings=warnings,
+        blocking_issues=blocking_issues,
+        evidence=evidence,
+    )
+
+
+def _topic_map_entry(topic: str) -> tuple[str, str]:
+    return TOPIC_OUTPUT_MAP[topic]
+
+
+def _platform_hint_from_topics(topic_whitelist: list[str]) -> str:
+    topics = set(topic_whitelist)
+    if {
+        "/cam_video4/csi_cam/image_raw/compressed",
+        "/rs32_lidar_points",
+        "/sport_odom",
+    }.issubset(topics):
+        return "go2w"
+    if {
+        "/cam_video5/csi_cam/image_raw/compressed",
+        "/lidar_points",
+        "/utlidar/robot_odom_systime",
+    }.issubset(topics):
+        return "u"
+    if "/drivers/ins/Ins" in topics:
+        return "shanmao"
+    return "unknown"
+
+
+def infer_navigation_processing_profile(
+    date: str,
+    segments: list[str] | None = None,
+    settings: NavigationSettings | None = None,
+) -> NavigationProcessingProfile:
+    sensor_bindings = infer_navigation_sensor_bindings(date, segments=segments, settings=settings)
+    ordered_bindings = (
+        sensor_bindings.fisheye_front,
+        sensor_bindings.lidar,
+        sensor_bindings.localization,
+    )
+    topic_whitelist = [
+        binding.topic
+        for binding in ordered_bindings
+        if binding is not None and binding.topic is not None
+    ]
+    topic_map = dict(_topic_map_entry(topic) for topic in topic_whitelist)
+    # query_dir is read as tmp_dir/<query_dir> before topic_map remapping, so keep the source key.
+    lidar_query_dir = (
+        _topic_map_entry(sensor_bindings.lidar.topic)[0]
+        if sensor_bindings.lidar is not None and sensor_bindings.lidar.topic is not None
+        else None
+    )
+    platform_hint = _platform_hint_from_topics(topic_whitelist)
+    localization_source = (
+        sensor_bindings.localization.kind
+        if sensor_bindings.localization is not None and sensor_bindings.localization.kind in {"odom", "ins"}
+        else "unknown"
+    )
+    blocking_issues = list(sensor_bindings.blocking_issues)
+
+    return NavigationProcessingProfile(
+        id="parameterized_navigation_v1",
+        platform_hint=platform_hint,
+        sensor_bindings=sensor_bindings,
+        topic_params=NavigationTopicParams(
+            profile_hint=platform_hint,
+            confidence=1.0 if not blocking_issues else 0.0,
+            topic_whitelist=topic_whitelist,
+            topic_map=topic_map,
+            query_dir=lidar_query_dir,
+            evidence=list(sensor_bindings.evidence),
+            warnings=list(sensor_bindings.warnings),
+            blocking_issues=blocking_issues,
+        ),
+        localization_policy=NavigationLocalizationPolicy(
+            source=localization_source,
+            conversion="odom_to_ins" if localization_source == "odom" else "none",
+        ),
+        gridmap_policy=NavigationGridmapPolicy(source="generated_from_pcd"),
+        calibration_policy=NavigationCalibrationPolicy(
+            mode="hardcoded_with_user_confirmation",
+            requires_user_confirmation=True,
+        ),
+        warnings=list(sensor_bindings.warnings),
+        blocking_issues=blocking_issues,
+        evidence={"metadata": list(sensor_bindings.evidence)},
     )
 
 
@@ -398,6 +656,16 @@ def _infer_navigation_topic_params_tool(date: str, segments: list[str] | str | N
     return payload
 
 
+def _infer_navigation_sensor_bindings_tool(date: str, segments: list[str] | str | None = None) -> dict:
+    """Infer role-based navigation sensor bindings from raw navigation metadata topics."""
+    return infer_navigation_sensor_bindings(date, segments=_normalize_segments(segments)).model_dump(mode="json")
+
+
+def _infer_navigation_processing_profile_tool(date: str, segments: list[str] | str | None = None) -> dict:
+    """Infer a parameterized navigation processing profile from raw navigation metadata topics."""
+    return infer_navigation_processing_profile(date, segments=_normalize_segments(segments)).model_dump(mode="json")
+
+
 def _inspect_processing_state_tool(date: str, segments: list[str] | str | None = None) -> dict:
     """Inspect existing navigation intermediate outputs without modifying data."""
     return inspect_processing_state(date, segments=_normalize_segments(segments))
@@ -422,6 +690,14 @@ classify_navigation_dataset_tool = _make_function_tool(
 infer_navigation_topic_params_tool = _make_function_tool(
     _infer_navigation_topic_params_tool,
     "infer_navigation_topic_params_tool",
+)
+infer_navigation_sensor_bindings_tool = _make_function_tool(
+    _infer_navigation_sensor_bindings_tool,
+    "infer_navigation_sensor_bindings_tool",
+)
+infer_navigation_processing_profile_tool = _make_function_tool(
+    _infer_navigation_processing_profile_tool,
+    "infer_navigation_processing_profile_tool",
 )
 inspect_processing_state_tool = _make_function_tool(_inspect_processing_state_tool, "inspect_processing_state_tool")
 inspect_gridmap_artifacts_tool = _make_function_tool(_inspect_gridmap_artifacts_tool, "inspect_gridmap_artifacts_tool")
