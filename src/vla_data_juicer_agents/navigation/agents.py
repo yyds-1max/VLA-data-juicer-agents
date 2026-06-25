@@ -12,7 +12,8 @@ from vla_data_juicer_agents.navigation.execution_tools import (
     build_execution_tools,
 )
 from vla_data_juicer_agents.navigation.inspection import (
-    classify_navigation_dataset_tool,
+    infer_navigation_processing_profile_tool,
+    infer_navigation_sensor_bindings_tool,
     infer_navigation_topic_params_tool,
     inspect_gridmap_artifacts_tool,
     inspect_processing_state_tool,
@@ -42,19 +43,24 @@ Use the explicit response_language from the current workflow prompt when provide
 
 PLAN_AGENT_INSTRUCTIONS = """
 You are the ReAct Plan-Agent for a VLA multi-scenario data processing agent.
-Use only read-only tools to inspect and classify navigation datasets.
+Use only read-only tools to inspect navigation datasets.
 Read and follow docs/navigation-plan-agent-guidance.md (navigation-plan-agent-guidance).
-Build a lightweight NavigationDataProfile, not a large data inventory.
+Build a lightweight NavigationDataProfile from sensor bindings and processing_profile, not a large data inventory.
+First inspect raw metadata topics with inspect_raw_date_tool, then call infer_navigation_sensor_bindings_tool
+and infer_navigation_processing_profile_tool.
 Call infer_navigation_topic_params_tool before finalizing extract_and_sync_navigation_data parameters.
-Do not invent TOPIC_WHITELIST, topic_map, or query_dir; use the tool result.
+Do not require data to match fixed profiles such as u_legacy_like or go2w_like.
+Do not invent TOPIC_WHITELIST, topic_map, query_dir, localization policy, or calibration policy; use tool results.
+Only finalize when processing_profile has no blocking_issues.
+Always include confirm_navigation_calibration_params before assemble_finish_temp.
 Use stage_variants, and choose only the variants exposed by list_navigation_tool_capabilities_tool.
 Default to all raw segments if not specified.
 scene_mode is required and must be either "in" or "out". It represents "indoor" and "outdoor", respectively.
 Stage one covers prepare.sh, run_U.sh, and run_odom.sh only; do not include run_fix.sh.
-The only human-blocking step is gen_box.py, executed via run_initial_annotation_gui.
+Calibration confirmation and gen_box.py are the human-blocking user intervention points.
+confirm_navigation_calibration_params must run before assemble_finish_temp.
 Prepare gridmap after run_tracking and before run_projection_and_trajectory.
 Supported execution tool names include run_tracking, prepare_gridmap_for_projection, and run_projection_and_trajectory.
-Supported profiles are u_legacy_like and go2w_like.
 """.strip() + "\n" + PUBLIC_PROGRESS_INSTRUCTIONS
 
 
@@ -63,8 +69,10 @@ Maintain the internal WorkflowPlan draft with get_workflow_plan_draft_tool,
 update_workflow_plan_draft_tool, and finalize_workflow_plan_tool.
 Before each SDK tool call, inspect the current draft state: navigation_data_profile_schema,
 data_profile_draft, filled_fields, missing_fields, next_tool_candidates, and ready_to_finish.
-Each planning step must do exactly one step: call one read-only inspection/classification SDK tool,
+Each planning step must do exactly one step: call one read-only inspection SDK tool,
 then merge only the newly learned facts with update_workflow_plan_draft_tool(data_profile_patch=...).
+Use infer_navigation_sensor_bindings_tool for sensor_bindings and infer_navigation_processing_profile_tool for
+processing_profile, localization_policy, calibration_policy, platform_hint, and stage_variants.
 When topic_params is missing, call infer_navigation_topic_params_tool and merge its structured result.
 Use data_profile_patch for partial NavigationDataProfile facts; do not invent a complete profile in one shot.
 Only call finalize_workflow_plan_tool after ready_to_finish is true and missing_fields is empty.
@@ -101,13 +109,16 @@ Read WorkflowPlan JSON and execute matching tools step-by-step.
 For each WorkflowStep.tool_name, call the SDK tool with the same name plus "_tool"; for example,
 prepare_raw_data maps to prepare_raw_data_tool and run_initial_annotation_gui maps to run_initial_annotation_gui_tool.
 Stop on any failed tool result.
+When executing confirm_navigation_calibration_params, stop and wait for exact user input.
+Continue only when user_confirmation is exactly `确认`.
+If the user enters `终止` or anything else, stop workflow and report calibration_params_not_confirmed.
+run_noobscene_preprocessing receives localization_source and localization_conversion from WorkflowPlan.
 The gen_box.py GUI step is human-blocking via run_initial_annotation_gui and blocks until the human finishes.
 Stage one covers prepare.sh, run_U.sh, and run_odom.sh only; do not include run_fix.sh.
 Default all raw segments if not specified.
 scene_mode is required and must be either "in" or "out". It represents "indoor" and "outdoor", respectively.
 Prepare gridmap after run_tracking and before run_projection_and_trajectory.
 Supported execution tool names include run_tracking, prepare_gridmap_for_projection, and run_projection_and_trajectory.
-Supported profiles are u_legacy_like and go2w_like.
 """.strip() + "\n" + PUBLIC_PROGRESS_INSTRUCTIONS
 
 
@@ -145,7 +156,8 @@ def create_plan_agent(model: str | None = None, request: NavigationRequest | Non
         name="Navigation ReAct Plan-Agent",
         tools=[
             inspect_raw_date_tool,
-            classify_navigation_dataset_tool,
+            infer_navigation_sensor_bindings_tool,
+            infer_navigation_processing_profile_tool,
             infer_navigation_topic_params_tool,
             inspect_processing_state_tool,
             inspect_gridmap_artifacts_tool,

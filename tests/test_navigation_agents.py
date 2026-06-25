@@ -14,11 +14,13 @@ from vla_data_juicer_agents.navigation.run_state import WorkflowRunStore
 from vla_data_juicer_agents.core.cancellation import CancellationContext, TurnCancelled, current_cancellation
 from vla_data_juicer_agents.core.events import EventEmitter, JsonlEventSink
 from vla_data_juicer_agents.navigation.agents import (
+    DRAFT_PLAN_AGENT_INSTRUCTIONS,
     EXECUTOR_AGENT_INSTRUCTIONS,
     PLAN_AGENT_INSTRUCTIONS,
     create_executor_agent,
     create_plan_agent,
 )
+from vla_data_juicer_agents.navigation.inspection import classify_navigation_dataset_tool
 from vla_data_juicer_agents.navigation.workflow import (
     build_deterministic_plan_template,
     run_executor_agent,
@@ -146,7 +148,9 @@ def test_create_plan_agent_has_read_only_tools(monkeypatch):
     tool_names = {tool.name for tool in agent.tools}
 
     assert "inspect_raw_date_tool" in tool_names
-    assert "classify_navigation_dataset_tool" in tool_names
+    assert "classify_navigation_dataset_tool" not in tool_names
+    assert "infer_navigation_sensor_bindings_tool" in tool_names
+    assert "infer_navigation_processing_profile_tool" in tool_names
     assert "inspect_processing_state_tool" in tool_names
     assert "inspect_gridmap_artifacts_tool" in tool_names
     assert "inspect_runtime_assets_tool" in tool_names
@@ -217,7 +221,7 @@ def test_executor_tools_check_and_bind_shared_cancellation(monkeypatch):
     cancellation = CancellationContext()
     seen = []
 
-    def fake_prepare(date, segments=None, dry_run=False):
+    def fake_prepare(date, segments=None, settings=None, dry_run=False):
         seen.append(current_cancellation())
         return SimpleNamespace(model_dump=lambda mode="json": {"ok": True})
 
@@ -239,11 +243,8 @@ def test_executor_tools_check_and_bind_shared_cancellation(monkeypatch):
 def test_plan_agent_classification_tool_accepts_empty_segments_string(tmp_path, monkeypatch):
     fixture_root = Path(__file__).parent / "fixtures" / "navigation" / "VLADatasets"
     monkeypatch.setenv("VLA_VLADATASETS_ROOT", str(fixture_root))
-    monkeypatch.setenv("DASHSCOPE_API_KEY", "test-key")
-    agent = create_plan_agent()
-    tool = {tool.name: tool for tool in agent.tools}["classify_navigation_dataset_tool"]
 
-    result = _invoke_tool(tool, {"date": "20270605", "segments": ""})
+    result = _invoke_tool(classify_navigation_dataset_tool, {"date": "20270605", "segments": ""})
 
     assert result["profile_name"] == "go2w_like"
 
@@ -251,11 +252,8 @@ def test_plan_agent_classification_tool_accepts_empty_segments_string(tmp_path, 
 def test_plan_agent_classification_tool_accepts_json_segments_string(tmp_path, monkeypatch):
     fixture_root = Path(__file__).parent / "fixtures" / "navigation" / "VLADatasets"
     monkeypatch.setenv("VLA_VLADATASETS_ROOT", str(fixture_root))
-    monkeypatch.setenv("DASHSCOPE_API_KEY", "test-key")
-    agent = create_plan_agent()
-    tool = {tool.name: tool for tool in agent.tools}["classify_navigation_dataset_tool"]
 
-    result = _invoke_tool(tool, {"date": "20270605", "segments": '["20260605_152856"]'})
+    result = _invoke_tool(classify_navigation_dataset_tool, {"date": "20270605", "segments": '["20260605_152856"]'})
 
     assert result["profile_name"] == "go2w_like"
 
@@ -554,6 +552,42 @@ def test_plan_agent_instructions_reference_guidance_and_lightweight_profile(monk
     assert "lightweight NavigationDataProfile" in plan_agent.instructions
     assert "stage_variants" in plan_agent.instructions
     assert "list_navigation_tool_capabilities_tool" in plan_agent.instructions
+
+
+def test_plan_agent_instructions_use_processing_profile_not_dataset_profile():
+    instructions = PLAN_AGENT_INSTRUCTIONS
+
+    assert "infer_navigation_processing_profile_tool" in instructions
+    assert "sensor bindings" in instructions
+    assert "processing_profile" in instructions
+    assert "classify_navigation_dataset_tool" not in instructions
+    assert "Supported profiles are u_legacy_like and go2w_like" not in instructions
+    assert "The only human-blocking step is gen_box.py" not in instructions
+    assert "Calibration confirmation" in instructions
+    assert "gen_box.py" in instructions
+    assert "before assemble_finish_temp" in instructions
+
+
+def test_draft_plan_agent_instructions_use_processing_profile_flow():
+    instructions = DRAFT_PLAN_AGENT_INSTRUCTIONS
+
+    assert "processing_profile" in instructions
+    assert "sensor_bindings" in instructions
+    assert "localization_policy" in instructions
+    assert "calibration_policy" in instructions
+    assert "infer_navigation_processing_profile_tool" in instructions
+    assert "dataset_profile" not in instructions
+    assert "classification" not in instructions
+
+
+def test_executor_agent_instructions_require_exact_calibration_confirmation():
+    instructions = EXECUTOR_AGENT_INSTRUCTIONS
+
+    assert "confirm_navigation_calibration_params" in instructions
+    assert "user_confirmation is exactly `确认`" in instructions
+    assert "`终止`" in instructions
+    assert "calibration_params_not_confirmed" in instructions
+    assert "localization_source and localization_conversion from WorkflowPlan" in instructions
 
 
 def test_parse_workflow_plan_output_accepts_json_string():

@@ -25,6 +25,7 @@ class ToolCapability(BaseModel):
     supports_dry_run: bool = False
     plan_agent_allowed: bool = False
     executor_agent_allowed: bool = False
+    human_blocking: bool = False
 
 
 NAVIGATION_TOOL_CAPABILITIES: tuple[ToolCapability, ...] = (
@@ -38,6 +39,20 @@ NAVIGATION_TOOL_CAPABILITIES: tuple[ToolCapability, ...] = (
     ToolCapability(
         tool_name="classify_navigation_dataset",
         stage_kind="classify_navigation_dataset",
+        effects="read",
+        variants=[ToolVariantCapability(id="default")],
+        plan_agent_allowed=False,
+    ),
+    ToolCapability(
+        tool_name="infer_navigation_sensor_bindings",
+        stage_kind="infer_navigation_sensor_bindings",
+        effects="read",
+        variants=[ToolVariantCapability(id="default")],
+        plan_agent_allowed=True,
+    ),
+    ToolCapability(
+        tool_name="infer_navigation_processing_profile",
+        stage_kind="infer_navigation_processing_profile",
         effects="read",
         variants=[ToolVariantCapability(id="default")],
         plan_agent_allowed=True,
@@ -78,15 +93,30 @@ NAVIGATION_TOOL_CAPABILITIES: tuple[ToolCapability, ...] = (
         variants=[
             ToolVariantCapability(
                 id="u_legacy_like",
-                selectors={"dataset_profile": ["u_legacy_like"]},
+                selectors={
+                    "processing_profile": ["parameterized_navigation_v1", "u_legacy_like"],
+                    "platform_hint": ["u"],
+                },
             ),
             ToolVariantCapability(
                 id="go2w_like",
-                selectors={"dataset_profile": ["go2w_like"]},
+                selectors={
+                    "processing_profile": ["parameterized_navigation_v1", "go2w_like"],
+                    "platform_hint": ["go2w"],
+                },
             ),
         ],
         supports_dry_run=True,
         executor_agent_allowed=True,
+    ),
+    ToolCapability(
+        tool_name="confirm_navigation_calibration_params",
+        stage_kind="confirm_navigation_calibration_params",
+        effects="read",
+        variants=[ToolVariantCapability(id="default")],
+        supports_dry_run=True,
+        executor_agent_allowed=True,
+        human_blocking=True,
     ),
     ToolCapability(
         tool_name="assemble_finish_temp",
@@ -148,11 +178,17 @@ NAVIGATION_TOOL_CAPABILITIES: tuple[ToolCapability, ...] = (
         variants=[
             ToolVariantCapability(
                 id="cjl_with_gridmap",
-                selectors={"dataset_profile": ["u_legacy_like"]},
+                selectors={
+                    "processing_profile": ["parameterized_navigation_v1", "u_legacy_like"],
+                    "platform_hint": ["u"],
+                },
             ),
             ToolVariantCapability(
                 id="cjl_0525_with_gridmap",
-                selectors={"dataset_profile": ["go2w_like"]},
+                selectors={
+                    "processing_profile": ["parameterized_navigation_v1", "go2w_like"],
+                    "platform_hint": ["go2w"],
+                },
             ),
         ],
         supports_dry_run=True,
