@@ -114,6 +114,24 @@ def test_store_marks_previous_active_historical(tmp_path: Path):
     assert store.get_session(second.id).status == "active"
 
 
+def test_store_deletes_session_and_messages(tmp_path: Path):
+    store = WebSessionStore(tmp_path / "sessions.sqlite")
+    session = store.create_session(title="处理 20270605 的室外导航数据")
+    store.append_message(session.id, role="user", content="处理 20270605")
+
+    store.delete_session(session.id)
+
+    assert store.get_session(session.id) is None
+    assert store.list_sessions() == []
+
+
+def test_store_rejects_delete_for_missing_session(tmp_path: Path):
+    store = WebSessionStore(tmp_path / "sessions.sqlite")
+
+    with pytest.raises(KeyError):
+        store.delete_session("missing")
+
+
 def test_store_rejects_mark_historical_for_missing_session(tmp_path: Path):
     store = WebSessionStore(tmp_path / "sessions.sqlite")
 

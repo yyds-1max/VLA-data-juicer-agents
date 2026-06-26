@@ -167,6 +167,13 @@ class WebSessionStore:
             if cursor.rowcount == 0:
                 raise KeyError(session_id)
 
+    def delete_session(self, session_id: str) -> None:
+        with self._connect() as connection:
+            connection.execute("DELETE FROM messages WHERE session_id = ?", (session_id,))
+            cursor = connection.execute("DELETE FROM sessions WHERE id = ?", (session_id,))
+            if cursor.rowcount == 0:
+                raise KeyError(session_id)
+
     @staticmethod
     def _session_from_row(row: sqlite3.Row) -> SessionRecord:
         return SessionRecord(
