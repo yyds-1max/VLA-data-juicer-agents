@@ -143,6 +143,24 @@ def test_frontend_assets_served_when_assets_dir_exists(tmp_path: Path):
     assert response.headers["content-type"].startswith("text/javascript")
 
 
+def test_frontend_dist_without_index_leaves_root_404_and_api_available(tmp_path: Path):
+    dist = tmp_path / "dist"
+    dist.mkdir()
+    app = create_app(
+        working_dir=str(tmp_path / ".djx"),
+        db_path=tmp_path / "sessions.sqlite",
+        controller_factory=FakeController,
+        frontend_dist=dist,
+    )
+    client = TestClient(app)
+
+    root_response = client.get("/")
+    api_response = client.get("/api/sessions")
+
+    assert root_response.status_code == 404
+    assert api_response.status_code == 200
+
+
 def test_submit_turn_runtime_error_returns_409(tmp_path: Path):
     class ActiveTurnController(FakeController):
         def submit_turn(self, message):

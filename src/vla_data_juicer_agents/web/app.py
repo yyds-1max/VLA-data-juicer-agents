@@ -100,9 +100,11 @@ def create_app(
             if assets_path.exists():
                 app.mount("/assets", StaticFiles(directory=assets_path), name="frontend-assets")
 
-            @app.get("/", include_in_schema=False)
-            async def frontend_index() -> FileResponse:
-                return FileResponse(frontend_path / "index.html")
+            index_path = frontend_path / "index.html"
+            if index_path.exists():
+                @app.get("/", include_in_schema=False)
+                async def frontend_index() -> FileResponse:
+                    return FileResponse(index_path)
 
     return app
 
