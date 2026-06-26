@@ -38,6 +38,10 @@ type TestTimelineItem = ReturnType<typeof createEmptyRunState>["timeline"][numbe
   sequence: number;
 };
 
+function activeSocket(close: () => void = vi.fn()): WebSocket {
+  return { close, readyState: WebSocket.OPEN } as unknown as WebSocket;
+}
+
 beforeEach(() => {
   vi.clearAllMocks();
   apiMocks.createSession.mockResolvedValue({
@@ -58,7 +62,7 @@ beforeEach(() => {
   });
   apiMocks.submitTurn.mockResolvedValue("turn-1");
   apiMocks.interruptTurn.mockResolvedValue(true);
-  apiMocks.openSessionEvents.mockReturnValue({ close: vi.fn() } as unknown as WebSocket);
+  apiMocks.openSessionEvents.mockReturnValue(activeSocket());
 
   datapilotStore.setState({
     open: false,
@@ -190,7 +194,7 @@ test("close hides the window and restores the floating button", () => {
 
 test("closing the DataPilot window closes the active event stream", async () => {
   const close = vi.fn();
-  apiMocks.openSessionEvents.mockReturnValue({ close } as unknown as WebSocket);
+  apiMocks.openSessionEvents.mockReturnValue(activeSocket(close));
   datapilotStore.setState({
     open: true,
     mode: "active_session",
@@ -250,7 +254,7 @@ test("new session enters draft mode without creating a session", () => {
 
 test("new session closes the active event stream", async () => {
   const close = vi.fn();
-  apiMocks.openSessionEvents.mockReturnValue({ close } as unknown as WebSocket);
+  apiMocks.openSessionEvents.mockReturnValue(activeSocket(close));
   datapilotStore.setState({
     open: true,
     mode: "active_session",
@@ -299,7 +303,7 @@ test("submitting the first draft message creates a session, opens events, submit
 test("failed draft submit does not append a local user message", async () => {
   const consoleError = vi.spyOn(console, "error").mockImplementation(() => undefined);
   const close = vi.fn();
-  apiMocks.openSessionEvents.mockReturnValue({ close } as unknown as WebSocket);
+  apiMocks.openSessionEvents.mockReturnValue(activeSocket(close));
   apiMocks.submitTurn.mockRejectedValue(new Error("submit failed"));
 
   render(<App />);
@@ -356,7 +360,7 @@ test("reopening an active session opens events before submitting the turn", asyn
   const calls: string[] = [];
   apiMocks.openSessionEvents.mockImplementation((sessionId) => {
     calls.push(`open:${sessionId}`);
-    return { close: vi.fn() } as unknown as WebSocket;
+    return activeSocket();
   });
   apiMocks.submitTurn.mockImplementation(async (sessionId) => {
     calls.push(`submit:${sessionId}`);
@@ -387,7 +391,203 @@ test("reopening an active session opens events before submitting the turn", asyn
   fireEvent.click(screen.getByRole("button", { name: "Send message" }));
 
   await waitFor(() => expect(apiMocks.submitTurn).toHaveBeenCalledWith("session-1", "恢复后继续"));
-  expect(calls).toEqual(["open:session-1", "submit:session-1"]);
+  expect(calls).toEqual(["open:session-1", "open:session-1", "submit:session-1"]);
+});
+
+test("reopening an active session refreshes persisted messages from the backend", async () => {
+  apiMocks.getSession
+    .mockResolvedValueOnce({
+      id: "session-1",
+      title: "Existing session",
+      created_at: "2026-06-26T00:00:00Z",
+      updated_at: "2026-06-26T00:01:00Z",
+      status: "active",
+      messages: [
+        {
+          id: "message-1",
+          session_id: "session-1",
+          role: "user",
+          content: "清洗已有数据",
+          created_at: "2026-06-26T00:01:00Z",
+        },
+      ],
+    })
+    .mockResolvedValueOnce({
+      id: "session-1",
+      title: "Existing session",
+      created_at: "2026-06-26T00:00:00Z",
+      updated_at: "2026-06-26T00:03:00Z",
+      status: "active",
+      messages: [
+        {
+          id: "message-1",
+          session_id: "session-1",
+          role: "user",
+          content: "清洗已有数据",
+          created_at: "2026-06-26T00:01:00Z",
+        },
+        {
+          id: "message-2",
+          session_id: "session-1",
+          role: "assistant",
+          content: "后台完成后的助手回复",
+          created_at: "2026-06-26T00:03:00Z",
+        },
+      ],
+    });
+  datapilotStore.setState({
+    open: true,
+    mode: "active_session",
+    currentSessionId: "session-1",
+    previousActiveSessionId: null,
+    sessions: [
+      {
+        id: "session-1",
+        title: "Existing session",
+        created_at: "2026-06-26T00:00:00Z",
+        updated_at: "2026-06-26T00:00:00Z",
+        status: "active",
+      },
+    ],
+    messages: [
+      {
+        id: "message-1",
+        session_id: "session-1",
+        role: "user",
+        content: "清洗已有数据",
+        created_at: "2026-06-26T00:01:00Z",
+      },
+    ],
+  });
+
+  render(<App />);
+  await waitFor(() => expect(apiMocks.getSession).toHaveBeenCalledWith("session-1"));
+  fireEvent.click(screen.getByRole("button", { name: "Close DataPilot" }));
+  fireEvent.click(screen.getByRole("button", { name: "Open DataPilot" }));
+
+  await waitFor(() => expect(apiMocks.getSession).toHaveBeenCalledTimes(2));
+  expect(screen.getByText("后台完成后的助手回复")).toBeVisible();
+});
+
+test("reopening an active session reopens the event stream before another turn is submitted", async () => {
+  const close = vi.fn();
+  apiMocks.openSessionEvents.mockReturnValue(activeSocket(close));
+  apiMocks.getSession.mockResolvedValue({
+    id: "session-1",
+    title: "Existing session",
+    created_at: "2026-06-26T00:00:00Z",
+    updated_at: "2026-06-26T00:00:00Z",
+    status: "active",
+    messages: [],
+  });
+  datapilotStore.setState({
+    open: true,
+    mode: "active_session",
+    currentSessionId: "session-1",
+    previousActiveSessionId: null,
+    sessions: [
+      {
+        id: "session-1",
+        title: "Existing session",
+        created_at: "2026-06-26T00:00:00Z",
+        updated_at: "2026-06-26T00:00:00Z",
+        status: "active",
+      },
+    ],
+  });
+
+  render(<App />);
+  await waitFor(() => expect(apiMocks.openSessionEvents).toHaveBeenCalledWith("session-1", expect.any(Function)));
+  fireEvent.click(screen.getByRole("button", { name: "Close DataPilot" }));
+  await waitFor(() => expect(close).toHaveBeenCalledTimes(1));
+  fireEvent.click(screen.getByRole("button", { name: "Open DataPilot" }));
+
+  await waitFor(() => expect(apiMocks.openSessionEvents).toHaveBeenCalledTimes(2));
+  expect(apiMocks.openSessionEvents).toHaveBeenLastCalledWith("session-1", expect.any(Function));
+  expect(apiMocks.submitTurn).not.toHaveBeenCalled();
+});
+
+test("opening a history session does not reconnect the event stream", () => {
+  datapilotStore.setState({
+    open: false,
+    mode: "history_session",
+    currentSessionId: "history-1",
+    previousActiveSessionId: null,
+    sessions: [
+      {
+        id: "history-1",
+        title: "历史任务",
+        created_at: "2026-06-25T01:00:00Z",
+        updated_at: "2026-06-25T02:00:00Z",
+        status: "historical",
+      },
+    ],
+    messages: [
+      {
+        id: "history-message-1",
+        session_id: "history-1",
+        role: "assistant",
+        content: "历史助手回复",
+        created_at: "2026-06-25T01:02:00Z",
+      },
+    ],
+  });
+
+  render(<App />);
+  fireEvent.click(screen.getByRole("button", { name: "Open DataPilot" }));
+
+  expect(apiMocks.getSession).not.toHaveBeenCalled();
+  expect(apiMocks.openSessionEvents).not.toHaveBeenCalled();
+  expect(screen.getByText("历史助手回复")).toBeVisible();
+});
+
+test("stale active session refreshes do not overwrite draft mode", async () => {
+  let resolveSession: (value: Awaited<ReturnType<typeof getSession>>) => void = () => undefined;
+  apiMocks.getSession.mockReturnValue(
+    new Promise((resolve) => {
+      resolveSession = resolve;
+    }),
+  );
+  datapilotStore.setState({
+    open: true,
+    mode: "active_session",
+    currentSessionId: "session-1",
+    previousActiveSessionId: null,
+    sessions: [
+      {
+        id: "session-1",
+        title: "Existing session",
+        created_at: "2026-06-26T00:00:00Z",
+        updated_at: "2026-06-26T00:00:00Z",
+        status: "active",
+      },
+    ],
+  });
+
+  render(<App />);
+  await waitFor(() => expect(apiMocks.getSession).toHaveBeenCalledWith("session-1"));
+  fireEvent.click(screen.getByRole("button", { name: "New session" }));
+  resolveSession({
+    id: "session-1",
+    title: "Existing session",
+    created_at: "2026-06-26T00:00:00Z",
+    updated_at: "2026-06-26T00:03:00Z",
+    status: "active",
+    messages: [
+      {
+        id: "message-2",
+        session_id: "session-1",
+        role: "assistant",
+        content: "过期刷新不应出现",
+        created_at: "2026-06-26T00:03:00Z",
+      },
+    ],
+  });
+
+  await waitFor(() => expect(datapilotStore.getState().mode).toBe("draft_new_session"));
+  expect(datapilotStore.getState().currentSessionId).toBeNull();
+  expect(screen.getByText("开始一个任务")).toBeVisible();
+  expect(screen.queryByText("过期刷新不应出现")).not.toBeInTheDocument();
 });
 
 test("selecting a history session restores persisted messages and hides active controls", async () => {
@@ -441,7 +641,7 @@ test("selecting a history session restores persisted messages and hides active c
 test("selecting a history session closes the active event stream before loading details", async () => {
   const close = vi.fn(() => calls.push("close"));
   const calls: string[] = [];
-  apiMocks.openSessionEvents.mockReturnValue({ close } as unknown as WebSocket);
+  apiMocks.openSessionEvents.mockReturnValue(activeSocket(close));
   apiMocks.listSessions.mockResolvedValue([
     {
       id: "history-1",
@@ -489,7 +689,7 @@ test("selecting a history session closes the active event stream before loading 
   fireEvent.click(await screen.findByRole("button", { name: /历史任务/ }));
 
   await waitFor(() => expect(apiMocks.getSession).toHaveBeenCalledWith("history-1"));
-  expect(calls).toEqual(["close", "get:history-1"]);
+  expect(calls.slice(-2)).toEqual(["close", "get:history-1"]);
 });
 
 test("message list keeps earlier timeline output before later user messages", () => {

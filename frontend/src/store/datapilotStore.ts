@@ -23,6 +23,7 @@ export interface DataPilotStoreState {
   enterDraft: () => void;
   setSessions: (sessions: SessionRecord[]) => void;
   setActiveSession: (session: SessionRecord) => void;
+  refreshActiveSession: (session: SessionDetail) => void;
   restoreHistory: (session: SessionDetail | SessionRecord, messages?: ChatMessageRecord[]) => void;
   appendUserMessage: (message: ChatMessageRecord) => void;
   applyEvent: (event: AgentEvent) => void;
@@ -61,6 +62,19 @@ export function createDataPilotStore() {
         previousActiveSessionId: null,
         sessions: upsertSession(state.sessions, session),
       })),
+
+    refreshActiveSession: (session) =>
+      set((state) => {
+        if (state.mode !== "active_session" || state.currentSessionId !== session.id) {
+          return {};
+        }
+
+        return {
+          sessions: upsertSession(state.sessions, session),
+          messages: [...session.messages],
+          run: createEmptyRunState(),
+        };
+      }),
 
     restoreHistory: (session, messages) =>
       set((state) => ({

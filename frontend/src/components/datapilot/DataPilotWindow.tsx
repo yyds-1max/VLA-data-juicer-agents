@@ -56,6 +56,32 @@ export function DataPilotWindow() {
     [closeSocket],
   );
 
+  useEffect(() => {
+    if (!open || mode !== "active_session" || !currentSessionId) {
+      return;
+    }
+
+    let cancelled = false;
+    const sessionId = currentSessionId;
+    openEvents(sessionId);
+
+    void getSession(sessionId)
+      .then((detail) => {
+        if (!cancelled) {
+          datapilotStore.getState().refreshActiveSession(detail);
+        }
+      })
+      .catch((error) => {
+        if (!cancelled) {
+          console.error("Failed to refresh DataPilot active session", error);
+        }
+      });
+
+    return () => {
+      cancelled = true;
+    };
+  }, [currentSessionId, mode, open, openEvents]);
+
   const handleHistory = async () => {
     const nextSessions = await listSessions();
     datapilotStore.getState().setSessions(nextSessions);
