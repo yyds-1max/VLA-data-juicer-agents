@@ -588,6 +588,44 @@ def test_plan_from_lightweight_profile_keeps_gridmap_generation_variant():
     assert gridmap.evidence == ["inspect_gridmap_artifacts_tool", "inspect_runtime_assets_tool"]
 
 
+def test_plan_draft_normalizes_generated_gridmap_source_from_selected_variant():
+    state = WorkflowPlanDraftState(
+        request=NavigationRequest(date="20270605", scene_mode="out")
+    )
+    stage_variants = _complete_stage_variants(
+        "generate_from_pcd",
+        "no existing grid_map artifact but PCD generator is available",
+        ["inspect_gridmap_artifacts_tool", "inspect_runtime_assets_tool"],
+    )
+
+    state.update(
+        data_profile_patch={
+            "processing_profile": _processing_profile(
+                platform_hint="go2w",
+                gridmap_source="generated_from_pcd",
+                stage_variants=stage_variants,
+            ).model_dump(mode="json"),
+            "platform_hint": "go2w",
+            "topic_params": _go2w_topic_params().model_dump(mode="json"),
+            "localization_policy": {"source": "odom", "conversion": "odom_to_ins"},
+            "gridmap_source": "unknown",
+            "pcd_gridmap_tool_available": True,
+            "stage_variants": {
+                key: value.model_dump(mode="json")
+                for key, value in stage_variants.items()
+            },
+        },
+        observation_id="runtime_assets_or_tool_capabilities",
+        used_tool="inspect_runtime_assets_tool",
+    )
+
+    assert state.data_profile is not None
+    assert state.data_profile.gridmap_source == "generated_from_pcd"
+    plan = build_plan_from_draft(state)
+    gridmap = next(step for step in plan.steps if step.tool_name == "prepare_gridmap_for_projection")
+    assert gridmap.variant == "generate_from_pcd"
+
+
 def test_plan_from_lightweight_profile_writes_variant_metadata_for_profile_driven_steps():
     state = WorkflowPlanDraftState(
         request=NavigationRequest(date="20270605", scene_mode="out")

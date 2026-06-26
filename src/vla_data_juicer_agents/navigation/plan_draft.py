@@ -237,6 +237,7 @@ class WorkflowPlanDraftState(BaseModel):
             self.platform_hint = patch_platform_hint
         if patch:
             _deep_merge(self.data_profile_draft, patch)
+            _normalize_gridmap_generation_source(self.data_profile_draft)
         if observation_id is not None or used_tool is not None:
             observation: dict[str, str] = {}
             if observation_id is not None:
@@ -365,6 +366,22 @@ def _deep_merge(target: dict[str, Any], patch: dict[str, Any]) -> dict[str, Any]
         else:
             target[key] = value
     return target
+
+
+def _normalize_gridmap_generation_source(draft: dict[str, Any]) -> None:
+    stage_variants = draft.get("stage_variants")
+    if not isinstance(stage_variants, dict):
+        return
+    gridmap_variant = stage_variants.get("prepare_gridmap_for_projection")
+    if not isinstance(gridmap_variant, dict):
+        return
+    if gridmap_variant.get("variant") != "generate_from_pcd":
+        return
+    if draft.get("gridmap_source") != "unknown":
+        return
+    if draft.get("pcd_gridmap_tool_available") is not True:
+        return
+    draft["gridmap_source"] = "generated_from_pcd"
 
 
 def _coerce_profile_patch(
