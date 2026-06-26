@@ -1,5 +1,7 @@
 from pathlib import Path
 
+import pytest
+
 from vla_data_juicer_agents.web.schemas import (
     CreateTurnRequest,
     SessionRecord,
@@ -65,6 +67,42 @@ def test_store_persists_transcript(tmp_path: Path):
     assert [message.content for message in detail.messages] == ["处理 20270605", "好的，我开始处理。"]
 
 
+def test_store_rejects_message_for_missing_session(tmp_path: Path):
+    store = WebSessionStore(tmp_path / "sessions.sqlite")
+
+    with pytest.raises(KeyError):
+        store.append_message("missing", role="user", content="hello")
+
+    assert store.get_session("missing") is None
+
+
+def test_store_orders_messages_deterministically_when_timestamps_collide(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    monkeypatch.setattr("vla_data_juicer_agents.web.session_store._now", lambda: "2026-06-26T10:00:00.000+00:00")
+    store = WebSessionStore(tmp_path / "sessions.sqlite")
+    session = store.create_session(title="同一时间戳")
+
+    user = store.append_message(session.id, role="user", content="first")
+    assistant = store.append_message(session.id, role="assistant", content="second")
+    detail = store.get_session(session.id)
+
+    assert detail is not None
+    assert [message.id for message in detail.messages] == [user.id, assistant.id]
+
+
+def test_store_lists_recent_deterministically_when_timestamps_collide(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    monkeypatch.setattr("vla_data_juicer_agents.web.session_store._now", lambda: "2026-06-26T10:00:00.000+00:00")
+    store = WebSessionStore(tmp_path / "sessions.sqlite")
+
+    first = store.create_session(title="第一个任务")
+    second = store.create_session(title="第二个任务")
+
+    assert [session.id for session in store.list_sessions()] == [second.id, first.id]
+
+
 def test_store_marks_previous_active_historical(tmp_path: Path):
     store = WebSessionStore(tmp_path / "sessions.sqlite")
     first = store.create_session(title="第一个任务")
@@ -74,3 +112,10 @@ def test_store_marks_previous_active_historical(tmp_path: Path):
 
     assert store.get_session(first.id).status == "historical"
     assert store.get_session(second.id).status == "active"
+
+
+def test_store_rejects_mark_historical_for_missing_session(tmp_path: Path):
+    store = WebSessionStore(tmp_path / "sessions.sqlite")
+
+    with pytest.raises(KeyError):
+        store.mark_historical("missing")

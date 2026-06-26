@@ -25,6 +25,7 @@ class WebSessionStore:
 
     def _connect(self) -> sqlite3.Connection:
         connection = sqlite3.connect(self.db_path)
+        connection.execute("PRAGMA foreign_keys = ON")
         connection.row_factory = sqlite3.Row
         return connection
 
@@ -79,7 +80,7 @@ class WebSessionStore:
                 """
                 SELECT id, title, status, created_at, updated_at
                 FROM sessions
-                ORDER BY updated_at DESC
+                ORDER BY updated_at DESC, rowid DESC
                 LIMIT ?
                 """,
                 (limit,),
@@ -104,7 +105,7 @@ class WebSessionStore:
                 SELECT id, session_id, role, content, created_at
                 FROM messages
                 WHERE session_id = ?
-                ORDER BY created_at ASC
+                ORDER BY created_at ASC, rowid ASC
                 """,
                 (session_id,),
             ).fetchall()
@@ -125,6 +126,16 @@ class WebSessionStore:
             created_at=timestamp,
         )
         with self._connect() as connection:
+            exists = connection.execute(
+                """
+                SELECT 1
+                FROM sessions
+                WHERE id = ?
+                """,
+                (session_id,),
+            ).fetchone()
+            if exists is None:
+                raise KeyError(session_id)
             connection.execute(
                 """
                 INSERT INTO messages (id, session_id, role, content, created_at)
@@ -145,7 +156,7 @@ class WebSessionStore:
     def mark_historical(self, session_id: str) -> None:
         timestamp = _now()
         with self._connect() as connection:
-            connection.execute(
+            cursor = connection.execute(
                 """
                 UPDATE sessions
                 SET status = ?, updated_at = ?
@@ -153,6 +164,8 @@ class WebSessionStore:
                 """,
                 ("historical", timestamp, session_id),
             )
+            if cursor.rowcount == 0:
+                raise KeyError(session_id)
 
     @staticmethod
     def _session_from_row(row: sqlite3.Row) -> SessionRecord:
