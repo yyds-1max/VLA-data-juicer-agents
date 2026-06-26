@@ -141,14 +141,9 @@ def _final_event_text(event: dict[str, Any]) -> str | None:
     return text if isinstance(text, str) and text else None
 
 
-async def _consume_turn_result_when_idle(controller: Any, *, timeout_sec: float = 5.0) -> Any | None:
-    if hasattr(controller, "is_running"):
-        loop = asyncio.get_running_loop()
-        deadline = loop.time() + timeout_sec
-        while getattr(controller, "is_running"):
-            if loop.time() >= deadline:
-                break
-            await asyncio.sleep(0.03)
+async def _consume_turn_result_when_idle(controller: Any) -> Any | None:
+    while getattr(controller, "is_running", False):
+        await asyncio.sleep(0.03)
     return _consume_turn_result(controller)
 
 

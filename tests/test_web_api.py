@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import inspect
 import time
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
@@ -9,7 +10,7 @@ from types import SimpleNamespace
 import pytest
 from fastapi.testclient import TestClient
 
-from vla_data_juicer_agents.web.app import _drain_controller_events, create_app
+from vla_data_juicer_agents.web.app import _consume_turn_result_when_idle, _drain_controller_events, create_app
 
 
 class FakeController:
@@ -210,6 +211,40 @@ def test_failed_event_drain_consumes_result_after_controller_stops(tmp_path: Pat
     assert controller.consumed is True
     assert controller.is_running is False
     assert [message.content for message in app.state.store.get_session(session.id).messages] == []
+
+
+def test_cleanup_waits_for_idle_without_timeout_parameter():
+    assert "timeout_sec" not in inspect.signature(_consume_turn_result_when_idle).parameters
+
+    class SlowIdleController:
+        def __init__(self):
+            self.is_running = True
+            self.consume_running_states = []
+            self._result = SimpleNamespace(text="cleanup text")
+
+        def consume_turn_result(self):
+            self.consume_running_states.append(self.is_running)
+            if self.is_running:
+                raise RuntimeError("Turn is still running.")
+            return self._result
+
+    controller = SlowIdleController()
+
+    async def flip_idle_after_ticks() -> None:
+        await asyncio.sleep(0)
+        await asyncio.sleep(0)
+        controller.is_running = False
+
+    async def exercise() -> SimpleNamespace:
+        flip_task = asyncio.create_task(flip_idle_after_ticks())
+        result = await _consume_turn_result_when_idle(controller)
+        await flip_task
+        return result
+
+    result = asyncio.run(exercise())
+
+    assert result.text == "cleanup text"
+    assert controller.consume_running_states == [False]
 
 
 def test_interrupt_returns_true_for_active_session(tmp_path: Path):
