@@ -2,6 +2,7 @@ import "@testing-library/jest-dom/vitest";
 import { fireEvent, render, screen } from "@testing-library/react";
 
 import { Composer } from "../components/datapilot/Composer";
+import { createEmptyRunState } from "../store/eventReducer";
 import { datapilotStore } from "../store/datapilotStore";
 import { App } from "./App";
 
@@ -13,6 +14,7 @@ beforeEach(() => {
     previousActiveSessionId: null,
     sessions: [],
     messages: [],
+    run: createEmptyRunState(),
   });
 });
 
@@ -63,6 +65,38 @@ test("opens DataPilot draft window from the floating button", () => {
   expect(screen.queryByText("继续任务")).not.toBeInTheDocument();
   expect(screen.queryByText(/示例|标签|Example/i)).not.toBeInTheDocument();
   expect(screen.queryByText("VLA 主智能体")).not.toBeInTheDocument();
+});
+
+test("active session shell does not render draft start content before Task 12 views exist", () => {
+  datapilotStore.setState({
+    open: true,
+    mode: "active_session",
+    currentSessionId: "session-1",
+    previousActiveSessionId: null,
+    sessions: [
+      {
+        id: "session-1",
+        title: "Existing session",
+        created_at: "2026-06-26T00:00:00Z",
+        updated_at: "2026-06-26T00:00:00Z",
+        status: "active",
+      },
+    ],
+  });
+
+  render(<App />);
+
+  expect(screen.getByRole("dialog", { name: "DataPilot" })).toBeVisible();
+  expect(screen.queryByText("开始一个任务")).not.toBeInTheDocument();
+});
+
+test("DataPilot shell does not expose inactive controls as enabled actions", () => {
+  render(<App />);
+
+  fireEvent.click(screen.getByRole("button", { name: "Open DataPilot" }));
+
+  expect(screen.queryByRole("button", { name: "Add context" })).not.toBeInTheDocument();
+  expect(screen.getByRole("button", { name: "History" })).toBeDisabled();
 });
 
 test("close hides the window and restores the floating button", () => {

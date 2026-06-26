@@ -23,7 +23,7 @@ export function DataPilotWindow() {
       {mode === "draft_new_session" ? (
         <DraftNewSessionView running={running} onSubmit={() => undefined} onInterrupt={() => undefined} />
       ) : (
-        <DraftNewSessionView running={running} onSubmit={() => undefined} onInterrupt={() => undefined} />
+        <div className="flex-1 bg-console-bg" aria-hidden="true" />
       )}
     </section>
   );

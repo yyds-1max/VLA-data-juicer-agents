@@ -17,7 +17,8 @@ export function SessionHeader() {
         <button
           type="button"
           aria-label="History"
-          className="flex h-9 w-9 items-center justify-center rounded text-console-muted transition hover:bg-console-panel2 hover:text-console-text focus:outline-none focus:ring-2 focus:ring-console-cyan"
+          disabled
+          className="flex h-9 w-9 items-center justify-center rounded text-console-muted/50"
         >
           <History className="h-4 w-4" aria-hidden="true" />
         </button>

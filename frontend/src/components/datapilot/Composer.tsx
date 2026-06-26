@@ -33,13 +33,12 @@ export function Composer({ placeholder, running = false, onSubmit, onInterrupt }
       onSubmit={handleSubmit}
       className="flex min-h-12 items-center gap-2 rounded border border-console-line bg-console-bg px-2 py-2"
     >
-      <button
-        type="button"
-        aria-label="Add context"
-        className="flex h-9 w-9 shrink-0 items-center justify-center rounded text-console-muted transition hover:bg-console-panel2 hover:text-console-text focus:outline-none focus:ring-2 focus:ring-console-cyan"
+      <span
+        className="flex h-9 w-9 shrink-0 items-center justify-center rounded text-console-muted"
+        aria-hidden="true"
       >
         <Plus className="h-5 w-5" aria-hidden="true" />
-      </button>
+      </span>
       <input
         value={message}
         onChange={(event) => setMessage(event.target.value)}
