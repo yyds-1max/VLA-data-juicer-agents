@@ -577,6 +577,7 @@ def test_submit_turn_appends_user_message_and_calls_controller(tmp_path: Path):
 
     assert turn_id.startswith("turn_")
     assert manager.get_controller(session.id).submitted == ["开始处理"]
+    assert store.get_session(session.id).messages[0].role == "user"
     assert store.get_session(session.id).messages[0].content == "开始处理"
 
 
@@ -654,8 +655,8 @@ class WebSessionManager:
 
     def submit_turn(self, session_id: str, message: str) -> str:
         controller = self.get_controller(session_id)
-        self.store.append_message(session_id, role="user", content=message)
         controller.submit_turn(message)
+        self.store.append_message(session_id, role="user", content=message)
         return f"turn_{uuid4().hex}"
 
     def interrupt(self, session_id: str) -> bool:
