@@ -30,6 +30,7 @@ export interface RunState {
   timeline: TimelineItem[];
   activeAgents: Record<string, ActiveAgent>;
   activeTools: Record<string, ActiveTool>;
+  finalRunIds: Record<string, true>;
   activeText: string;
   running: boolean;
 }
@@ -39,6 +40,7 @@ export function createEmptyRunState(): RunState {
     timeline: [],
     activeAgents: {},
     activeTools: {},
+    finalRunIds: {},
     activeText: "",
     running: false,
   };
@@ -127,6 +129,13 @@ export function applyAgentEvent(state: RunState, event: AgentEvent): void {
   }
 
   if (type === "final") {
+    if (runId) {
+      if (state.finalRunIds[runId]) {
+        return;
+      }
+      state.finalRunIds[runId] = true;
+    }
+
     const text = normalizeText(payload.text);
     if (text) {
       state.timeline.push({
@@ -161,7 +170,7 @@ function refreshRunningText(state: RunState): void {
     return;
   }
 
-  const activeAgent = Object.values(state.activeAgents)[0];
+  const activeAgent = deepestActiveAgent(state.activeAgents);
   if (activeAgent) {
     state.running = true;
     state.activeText = `[${sourceLabel(activeAgent.source)}] 正在思考`;
@@ -170,6 +179,40 @@ function refreshRunningText(state: RunState): void {
 
   state.running = false;
   state.activeText = "";
+}
+
+function deepestActiveAgent(activeAgents: Record<string, ActiveAgent>): ActiveAgent | undefined {
+  const agents = Object.values(activeAgents);
+  const agentsByRunId = new Map(agents.filter((agent) => agent.runId).map((agent) => [agent.runId, agent]));
+
+  let deepest: ActiveAgent | undefined;
+  let deepestDepth = -1;
+  for (const agent of agents) {
+    const depth = activeAgentDepth(agent, agentsByRunId);
+    if (depth > deepestDepth) {
+      deepest = agent;
+      deepestDepth = depth;
+    }
+  }
+  return deepest;
+}
+
+function activeAgentDepth(agent: ActiveAgent, agentsByRunId: Map<string, ActiveAgent>): number {
+  let depth = 0;
+  let parentRunId = agent.parentRunId;
+  const seen = new Set<string>();
+
+  while (parentRunId && !seen.has(parentRunId)) {
+    seen.add(parentRunId);
+    const parent = agentsByRunId.get(parentRunId);
+    if (!parent) {
+      break;
+    }
+    depth += 1;
+    parentRunId = parent.parentRunId;
+  }
+
+  return depth;
 }
 
 function sourceLabel(source: string): string {

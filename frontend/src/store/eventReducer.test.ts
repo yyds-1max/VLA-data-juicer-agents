@@ -115,6 +115,71 @@ describe("eventReducer", () => {
       },
     ]);
   });
+
+  it("returns to the deepest active agent after a child tool ends", () => {
+    const state = createEmptyRunState();
+
+    applyAgentEvent(state, event("agent_start", "main", {}, { run_id: "main-run" }));
+    applyAgentEvent(
+      state,
+      event("agent_start", "navigation.workflow", {}, { run_id: "workflow-run", parent_run_id: "main-run" }),
+    );
+    applyAgentEvent(
+      state,
+      event("agent_start", "navigation.plan", {}, { run_id: "plan-run", parent_run_id: "workflow-run" }),
+    );
+    applyAgentEvent(
+      state,
+      event(
+        "tool_start",
+        "navigation.plan",
+        { call_id: "call-1", tool: "classify_navigation_dataset_tool" },
+        { run_id: "plan-run", parent_run_id: "workflow-run" },
+      ),
+    );
+
+    applyAgentEvent(
+      state,
+      event(
+        "tool_end",
+        "navigation.plan",
+        { call_id: "call-1", tool: "classify_navigation_dataset_tool", ok: true },
+        { run_id: "plan-run", parent_run_id: "workflow-run" },
+      ),
+    );
+
+    expect(state.running).toBe(true);
+    expect(state.activeText).toBe("[Plan] 正在思考");
+  });
+
+  it("dedupes final events by run id", () => {
+    const state = createEmptyRunState();
+
+    applyAgentEvent(state, event("final", "main", { text: "first answer" }, { run_id: "final-run" }));
+    applyAgentEvent(state, event("final", "main", { text: "duplicate answer" }, { run_id: "final-run" }));
+
+    expect(state.timeline.filter((item) => item.kind === "assistant")).toEqual([
+      {
+        kind: "assistant",
+        source: "main",
+        text: "first answer",
+        runId: "final-run",
+        parentRunId: null,
+      },
+    ]);
+  });
+
+  it("does not dedupe final events without run id", () => {
+    const state = createEmptyRunState();
+
+    applyAgentEvent(state, event("final", "main", { text: "first answer" }, { run_id: "" }));
+    applyAgentEvent(state, event("final", "main", { text: "second answer" }, { run_id: "" }));
+
+    expect(state.timeline.filter((item) => item.kind === "assistant").map((item) => item.text)).toEqual([
+      "first answer",
+      "second answer",
+    ]);
+  });
 });
 
 describe("datapilotStore", () => {
@@ -132,5 +197,14 @@ describe("datapilotStore", () => {
     expect(store.getState().currentSessionId).toBeNull();
     expect(store.getState().messages).toEqual([]);
     expect(store.getState().run).toEqual(createEmptyRunState());
+  });
+
+  it("preserves final dedupe state when cloning run state", () => {
+    const store = createDataPilotStore();
+
+    store.getState().applyEvent(event("final", "main", { text: "first answer" }, { run_id: "final-run" }));
+    store.getState().applyEvent(event("final", "main", { text: "duplicate answer" }, { run_id: "final-run" }));
+
+    expect(store.getState().run.timeline.filter((item) => item.kind === "assistant")).toHaveLength(1);
   });
 });

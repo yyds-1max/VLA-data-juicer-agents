@@ -93,6 +93,7 @@ function cloneRunState(run: RunState): RunState {
     activeTools: Object.fromEntries(
       Object.entries(run.activeTools).map(([key, tool]) => [key, { ...tool }]),
     ),
+    finalRunIds: { ...run.finalRunIds },
     activeText: run.activeText,
     running: run.running,
   };
