@@ -1,12 +1,59 @@
 import "@testing-library/jest-dom/vitest";
-import { fireEvent, render, screen } from "@testing-library/react";
+import { fireEvent, render, screen, waitFor } from "@testing-library/react";
 
+import {
+  createSession,
+  getSession,
+  interruptTurn,
+  listSessions,
+  openSessionEvents,
+  submitTurn,
+} from "../api/client";
 import { Composer } from "../components/datapilot/Composer";
 import { createEmptyRunState } from "../store/eventReducer";
 import { datapilotStore } from "../store/datapilotStore";
 import { App } from "./App";
 
+vi.mock("../api/client", () => ({
+  createSession: vi.fn(),
+  listSessions: vi.fn(),
+  getSession: vi.fn(),
+  submitTurn: vi.fn(),
+  interruptTurn: vi.fn(),
+  openSessionEvents: vi.fn(),
+}));
+
+const apiMocks = vi.mocked({
+  createSession,
+  listSessions,
+  getSession,
+  submitTurn,
+  interruptTurn,
+  openSessionEvents,
+});
+
 beforeEach(() => {
+  vi.clearAllMocks();
+  apiMocks.createSession.mockResolvedValue({
+    id: "session-created",
+    title: "Clean VLA data",
+    created_at: "2026-06-26T01:00:00Z",
+    updated_at: "2026-06-26T01:00:00Z",
+    status: "active",
+  });
+  apiMocks.listSessions.mockResolvedValue([]);
+  apiMocks.getSession.mockResolvedValue({
+    id: "history-1",
+    title: "历史任务",
+    created_at: "2026-06-25T01:00:00Z",
+    updated_at: "2026-06-25T02:00:00Z",
+    status: "historical",
+    messages: [],
+  });
+  apiMocks.submitTurn.mockResolvedValue("turn-1");
+  apiMocks.interruptTurn.mockResolvedValue(true);
+  apiMocks.openSessionEvents.mockReturnValue({ close: vi.fn() } as unknown as WebSocket);
+
   datapilotStore.setState({
     open: false,
     mode: "draft_new_session",
@@ -57,6 +104,7 @@ test("opens DataPilot draft window from the floating button", () => {
 
   fireEvent.click(screen.getByRole("button", { name: "Open DataPilot" }));
 
+  expect(apiMocks.createSession).not.toHaveBeenCalled();
   expect(screen.queryByRole("button", { name: "Open DataPilot" })).not.toBeInTheDocument();
   expect(screen.getByRole("dialog", { name: "DataPilot" })).toBeVisible();
   expect(screen.getByText("开始一个任务")).toBeVisible();
@@ -67,7 +115,7 @@ test("opens DataPilot draft window from the floating button", () => {
   expect(screen.queryByText("VLA 主智能体")).not.toBeInTheDocument();
 });
 
-test("active session shell does not render draft start content before Task 12 views exist", () => {
+test("active session renders messages and does not render draft start content", () => {
   datapilotStore.setState({
     open: true,
     mode: "active_session",
@@ -82,21 +130,46 @@ test("active session shell does not render draft start content before Task 12 vi
         status: "active",
       },
     ],
+    messages: [
+      {
+        id: "message-1",
+        session_id: "session-1",
+        role: "user",
+        content: "清洗已有数据",
+        created_at: "2026-06-26T00:01:00Z",
+      },
+    ],
   });
 
   render(<App />);
 
   expect(screen.getByRole("dialog", { name: "DataPilot" })).toBeVisible();
+  expect(screen.getByText("清洗已有数据")).toBeVisible();
+  expect(screen.getByPlaceholderText("继续描述任务…")).toBeVisible();
   expect(screen.queryByText("开始一个任务")).not.toBeInTheDocument();
 });
 
-test("DataPilot shell does not expose inactive controls as enabled actions", () => {
+test("History button lists sessions in a lightweight panel", async () => {
+  apiMocks.listSessions.mockResolvedValue([
+    {
+      id: "history-1",
+      title: "历史任务",
+      created_at: "2026-06-25T01:00:00Z",
+      updated_at: "2026-06-25T02:00:00Z",
+      status: "historical",
+    },
+  ]);
+
   render(<App />);
 
   fireEvent.click(screen.getByRole("button", { name: "Open DataPilot" }));
+  fireEvent.click(screen.getByRole("button", { name: "History" }));
 
+  expect(apiMocks.listSessions).toHaveBeenCalledTimes(1);
   expect(screen.queryByRole("button", { name: "Add context" })).not.toBeInTheDocument();
-  expect(screen.getByRole("button", { name: "History" })).toBeDisabled();
+  expect(await screen.findByRole("button", { name: /历史任务/ })).toBeVisible();
+  expect(screen.getByText("2026-06-25 02:00")).toBeVisible();
+  expect(screen.queryByText(/last message|summary|继续任务|pending/i)).not.toBeInTheDocument();
 });
 
 test("close hides the window and restores the floating button", () => {
@@ -134,7 +207,100 @@ test("new session enters draft mode without creating a session", () => {
   expect(state.currentSessionId).toBeNull();
   expect(state.previousActiveSessionId).toBe("session-1");
   expect(state.sessions).toHaveLength(1);
+  expect(apiMocks.createSession).not.toHaveBeenCalled();
   expect(screen.getByText("开始一个任务")).toBeVisible();
+});
+
+test("submitting the first draft message creates a session, opens events, submits turn, and shows the user message", async () => {
+  render(<App />);
+
+  fireEvent.click(screen.getByRole("button", { name: "Open DataPilot" }));
+  fireEvent.change(screen.getByPlaceholderText("我们要做什么？"), {
+    target: { value: "  清洗 VLA 数据  " },
+  });
+  fireEvent.click(screen.getByRole("button", { name: "Send message" }));
+
+  expect(apiMocks.createSession).toHaveBeenCalledWith("清洗 VLA 数据");
+  await waitFor(() => expect(apiMocks.submitTurn).toHaveBeenCalledWith("session-created", "清洗 VLA 数据"));
+  expect(apiMocks.openSessionEvents).toHaveBeenCalledWith("session-created", expect.any(Function));
+  expect(datapilotStore.getState().mode).toBe("active_session");
+  expect(screen.getByText("清洗 VLA 数据")).toBeVisible();
+  expect(screen.queryByText("开始一个任务")).not.toBeInTheDocument();
+});
+
+test("selecting a history session restores persisted messages and hides active controls", async () => {
+  apiMocks.listSessions.mockResolvedValue([
+    {
+      id: "history-1",
+      title: "历史任务",
+      created_at: "2026-06-25T01:00:00Z",
+      updated_at: "2026-06-25T02:00:00Z",
+      status: "historical",
+    },
+  ]);
+  apiMocks.getSession.mockResolvedValue({
+    id: "history-1",
+    title: "历史任务",
+    created_at: "2026-06-25T01:00:00Z",
+    updated_at: "2026-06-25T02:00:00Z",
+    status: "historical",
+    messages: [
+      {
+        id: "history-message-1",
+        session_id: "history-1",
+        role: "user",
+        content: "历史用户消息",
+        created_at: "2026-06-25T01:01:00Z",
+      },
+      {
+        id: "history-message-2",
+        session_id: "history-1",
+        role: "assistant",
+        content: "历史助手回复",
+        created_at: "2026-06-25T01:02:00Z",
+      },
+    ],
+  });
+
+  render(<App />);
+
+  fireEvent.click(screen.getByRole("button", { name: "Open DataPilot" }));
+  fireEvent.click(screen.getByRole("button", { name: "History" }));
+  fireEvent.click(await screen.findByRole("button", { name: /历史任务/ }));
+
+  await waitFor(() => expect(apiMocks.getSession).toHaveBeenCalledWith("history-1"));
+  expect(datapilotStore.getState().mode).toBe("history_session");
+  expect(screen.getByText("历史用户消息")).toBeVisible();
+  expect(screen.getByText("历史助手回复")).toBeVisible();
+  expect(screen.queryByPlaceholderText("继续描述任务…")).not.toBeInTheDocument();
+  expect(screen.queryByText("继续任务")).not.toBeInTheDocument();
+});
+
+test("running stop interrupts the current turn without leaving active mode", async () => {
+  datapilotStore.setState({
+    open: true,
+    mode: "active_session",
+    currentSessionId: "session-1",
+    previousActiveSessionId: null,
+    sessions: [
+      {
+        id: "session-1",
+        title: "Existing session",
+        created_at: "2026-06-26T00:00:00Z",
+        updated_at: "2026-06-26T00:00:00Z",
+        status: "active",
+      },
+    ],
+    run: { ...createEmptyRunState(), running: true, activeText: "[Main] 正在思考" },
+  });
+
+  render(<App />);
+
+  fireEvent.click(screen.getByRole("button", { name: "Stop current run" }));
+
+  await waitFor(() => expect(apiMocks.interruptTurn).toHaveBeenCalledWith("session-1"));
+  expect(datapilotStore.getState().mode).toBe("active_session");
+  expect(datapilotStore.getState().currentSessionId).toBe("session-1");
 });
 
 test("running Composer shows a square stop button", () => {

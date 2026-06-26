@@ -15,6 +15,7 @@ export interface DataPilotStoreState {
   run: RunState;
   setOpen: (open: boolean) => void;
   enterDraft: () => void;
+  setSessions: (sessions: SessionRecord[]) => void;
   setActiveSession: (session: SessionRecord) => void;
   restoreHistory: (session: SessionDetail | SessionRecord, messages?: ChatMessageRecord[]) => void;
   appendUserMessage: (message: ChatMessageRecord) => void;
@@ -34,6 +35,8 @@ export function createDataPilotStore() {
     run: createEmptyRunState(),
 
     setOpen: (open) => set({ open }),
+
+    setSessions: (sessions) => set({ sessions: [...sessions] }),
 
     enterDraft: () =>
       set((state) => ({
