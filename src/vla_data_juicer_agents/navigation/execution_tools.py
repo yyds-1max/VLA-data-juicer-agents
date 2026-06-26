@@ -25,6 +25,7 @@ from vla_data_juicer_agents.navigation.subprocess_runner import run_command
 PROCESSING_SCRIPT_ROOT = Path(__file__).resolve().parent / "processing"
 REPOSITORY_EXTRACT_SCRIPT = PROCESSING_SCRIPT_ROOT / "extract_ros2_bag.py"
 REPOSITORY_SYNC_SCRIPT = PROCESSING_SCRIPT_ROOT / "sync_navigation_data.py"
+DEFAULT_LEGACY_DATASET_PROFILE = "u_legacy_like"
 
 
 def _normalize_segments_arg(segments: list[str] | str | None) -> list[str] | None:
@@ -122,6 +123,22 @@ def _missing_topic_param_names(
     if not query_dir:
         missing.append("query_dir")
     return missing
+
+
+def _legacy_dataset_profile_from_execution_args(
+    dataset_profile: str | None = None,
+    processing_profile: str | None = None,
+    platform_hint: str | None = None,
+) -> str:
+    if dataset_profile in {"go2w_like", "u_legacy_like"}:
+        return dataset_profile
+    if processing_profile in {"go2w_like", "u_legacy_like"}:
+        return processing_profile
+    if platform_hint == "go2w":
+        return "go2w_like"
+    if platform_hint == "u":
+        return "u_legacy_like"
+    return DEFAULT_LEGACY_DATASET_PROFILE
 
 
 def _missing_outputs(produced_paths: list[Path], dry_run: bool) -> list[Path]:
@@ -456,7 +473,7 @@ def generate_gridmap_from_pcd(
 
 def extract_and_sync_navigation_data(
     date: str,
-    dataset_profile: str,
+    dataset_profile: str | None = None,
     segments: list[str] | None = None,
     processes_num: int = 4,
     topic_whitelist: list[str] | None = None,
@@ -464,10 +481,16 @@ def extract_and_sync_navigation_data(
     query_dir: str | None = None,
     settings: NavigationSettings | None = None,
     dry_run: bool = False,
+    processing_profile: str | None = None,
+    platform_hint: str | None = None,
 ) -> ToolResult:
     date = _validate_date(date)
     settings = settings or NavigationSettings()
-    profile = get_profile(dataset_profile)
+    legacy_profile = _legacy_dataset_profile_from_execution_args(
+        dataset_profile=dataset_profile,
+        processing_profile=processing_profile,
+        platform_hint=platform_hint,
+    )
     missing_topic_params = _missing_topic_param_names(topic_whitelist, topic_map, query_dir)
     if missing_topic_params:
         return ToolResult(
@@ -479,11 +502,12 @@ def extract_and_sync_navigation_data(
             ),
             produced_paths=[settings.clip_data_root / date],
             details={
-                "profile": profile.name,
+                "profile": legacy_profile,
                 "missing_topic_params": missing_topic_params,
                 "dry_run": dry_run,
             },
         )
+    profile = get_profile(legacy_profile)
     raw_temp_path = settings.raw_data_root / f"{date}_temp"
     if dry_run:
         selected = _selected_segments_for_dry_run(raw_temp_path, settings.raw_data_root / date, segments)
@@ -945,6 +969,8 @@ def run_tracking_and_projection(
     settings: NavigationSettings | None = None,
     dry_run: bool = False,
     dataset_profile: str | None = None,
+    processing_profile: str | None = None,
+    platform_hint: str | None = None,
 ) -> ToolResult:
     settings = settings or NavigationSettings()
     root = _resolve_data_path(finish_temp_path, settings)
@@ -960,6 +986,8 @@ def run_tracking_and_projection(
         root,
         finish_path,
         dataset_profile=dataset_profile,
+        processing_profile=processing_profile,
+        platform_hint=platform_hint,
         settings=settings,
         dry_run=dry_run,
     )
@@ -1008,6 +1036,8 @@ def run_projection_and_trajectory(
     finish_temp_path: str | Path,
     finish_path: str | Path,
     dataset_profile: str | None = None,
+    processing_profile: str | None = None,
+    platform_hint: str | None = None,
     settings: NavigationSettings | None = None,
     dry_run: bool = False,
 ) -> ToolResult:
@@ -1015,7 +1045,12 @@ def run_projection_and_trajectory(
     root = _resolve_data_path(finish_temp_path, settings)
     final = _resolve_data_path(finish_path, settings)
     pt_project = settings.processing_root / "2_pt_project"
-    trajectory_script = "2_othermethod_cjl_0525.py" if dataset_profile == "go2w_like" else "2_othermethod_cjl.py"
+    legacy_profile = _legacy_dataset_profile_from_execution_args(
+        dataset_profile=dataset_profile,
+        processing_profile=processing_profile,
+        platform_hint=platform_hint,
+    )
+    trajectory_script = "2_othermethod_cjl_0525.py" if legacy_profile == "go2w_like" else "2_othermethod_cjl.py"
     commands = [
         run_command(
             python_data_command(settings.runtime, "main.py", ["--data_root", root]),
@@ -1068,6 +1103,9 @@ def run_projection_and_trajectory(
         details={
             "dry_run": dry_run,
             "dataset_profile": dataset_profile,
+            "processing_profile": processing_profile,
+            "platform_hint": platform_hint,
+            "legacy_profile": legacy_profile,
             "trajectory_script": trajectory_script,
         },
     )
@@ -1148,25 +1186,29 @@ def build_execution_tools(
 
     def bound_extract_and_sync_navigation_data_tool(
         date: str,
-        dataset_profile: str,
+        dataset_profile: str | None = None,
         segments: list[str] | str | None = None,
         processes_num: int = 4,
         topic_whitelist: list[str] | str | None = None,
         topic_map: dict[str, str] | str | None = None,
         query_dir: str | None = None,
+        processing_profile: str | None = None,
+        platform_hint: str | None = None,
     ) -> dict:
         return _execute_with_cancellation(
             cancellation,
             extract_and_sync_navigation_data,
-            date,
-            dataset_profile,
-            _normalize_segments_arg(segments),
-            processes_num,
-            _normalize_string_list_arg(topic_whitelist),
-            _normalize_string_dict_arg(topic_map),
-            query_dir,
+            date=date,
+            dataset_profile=dataset_profile,
+            segments=_normalize_segments_arg(segments),
+            processes_num=processes_num,
+            topic_whitelist=_normalize_string_list_arg(topic_whitelist),
+            topic_map=_normalize_string_dict_arg(topic_map),
+            query_dir=query_dir,
             settings=settings,
             dry_run=dry_run,
+            processing_profile=processing_profile,
+            platform_hint=platform_hint,
         ).model_dump(mode="json")
 
     def bound_generate_gridmap_from_pcd_tool(date: str, segments: list[str] | str | None = None) -> dict:
@@ -1269,6 +1311,8 @@ def build_execution_tools(
         finish_temp_path: str,
         finish_path: str,
         dataset_profile: str | None = None,
+        processing_profile: str | None = None,
+        platform_hint: str | None = None,
     ) -> dict:
         return _execute_with_cancellation(
             cancellation,
@@ -1276,6 +1320,8 @@ def build_execution_tools(
             finish_temp_path,
             finish_path,
             dataset_profile=dataset_profile,
+            processing_profile=processing_profile,
+            platform_hint=platform_hint,
             settings=settings,
             dry_run=dry_run,
         ).model_dump(mode="json")
@@ -1284,6 +1330,8 @@ def build_execution_tools(
         finish_temp_path: str,
         finish_path: str,
         dataset_profile: str | None = None,
+        processing_profile: str | None = None,
+        platform_hint: str | None = None,
     ) -> dict:
         return _execute_with_cancellation(
             cancellation,
@@ -1291,6 +1339,8 @@ def build_execution_tools(
             finish_temp_path,
             finish_path,
             dataset_profile=dataset_profile,
+            processing_profile=processing_profile,
+            platform_hint=platform_hint,
             settings=settings,
             dry_run=dry_run,
         ).model_dump(mode="json")

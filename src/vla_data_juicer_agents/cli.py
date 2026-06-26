@@ -2,13 +2,12 @@ from __future__ import annotations
 
 import argparse
 import asyncio
-import json
 import sys
 
 from vla_data_juicer_agents.navigation.agents import create_executor_agent, create_plan_agent
 from vla_data_juicer_agents.navigation.config import NavigationSettings
-from vla_data_juicer_agents.navigation.inspection import classify_navigation_dataset
-from vla_data_juicer_agents.navigation.models import NavigationRequest
+from vla_data_juicer_agents.navigation.inspection import infer_navigation_processing_profile
+from vla_data_juicer_agents.navigation.models import NavigationDataProfile, NavigationRequest
 from vla_data_juicer_agents.navigation.run_state import WorkflowRunStore
 from vla_data_juicer_agents.navigation.workflow import (
     build_deterministic_plan_template,
@@ -60,20 +59,44 @@ async def async_main(argv: list[str] | None = None) -> int:
     run_store.write_json(run_dir, "request.json", request.model_dump(mode="json"))
 
     if args.no_llm:
-        classification = classify_navigation_dataset(request.date, request.segments)
-        if not classification.profile_name:
-            print(json.dumps(classification.model_dump(), indent=2, ensure_ascii=False))
+        processing_profile = infer_navigation_processing_profile(
+            request.date,
+            request.segments,
+            settings=settings,
+        )
+        if processing_profile.blocking_issues or processing_profile.topic_params.blocking_issues:
+            print(processing_profile.model_dump_json(indent=2), file=sys.stderr)
             run_store.write_json(
                 run_dir,
                 "final_report.json",
-                {"status": "failed", "ok": False, "classification": classification.model_dump(mode="json")},
+                {
+                    "status": "failed",
+                    "ok": False,
+                    "processing_profile": processing_profile.model_dump(mode="json"),
+                },
             )
             return 2
+        data_profile = NavigationDataProfile(
+            date=request.date,
+            segments=request.segments,
+            scene_mode=request.scene_mode,
+            processing_profile=processing_profile,
+            platform_hint=processing_profile.platform_hint,
+            sensor_bindings=processing_profile.sensor_bindings,
+            localization_policy=processing_profile.localization_policy,
+            topic_params=processing_profile.topic_params,
+            gridmap_source=processing_profile.gridmap_policy.source,
+            stage_variants=processing_profile.stage_variants,
+            blocking_issues=list(processing_profile.blocking_issues),
+            warnings=list(processing_profile.warnings),
+            evidence=dict(processing_profile.evidence),
+        )
         plan = build_deterministic_plan_template(
             request.date,
-            classification.profile_name,
+            processing_profile.id,
             request.segments,
             scene_mode=request.scene_mode,
+            data_profile=data_profile,
         )
     else:
         plan_agent = create_plan_agent(model=args.model, request=request)

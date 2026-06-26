@@ -70,6 +70,23 @@ def test_no_llm_plan_writes_run_state(tmp_path, monkeypatch, capsys):
     assert request["scene_mode"] == "out"
     assert plan["date"] == "20270605"
     assert plan["scene_mode"] == "out"
+    assert plan["processing_profile"] == "parameterized_navigation_v1"
+    steps = {step["tool_name"]: step for step in plan["steps"]}
+    extract_args = steps["extract_and_sync_navigation_data"]["arguments"]
+    assert extract_args["processing_profile"] == "parameterized_navigation_v1"
+    assert extract_args["platform_hint"] == "go2w"
+    assert "dataset_profile" not in extract_args
+    assert extract_args["topic_whitelist"] == [
+        "/cam_video4/csi_cam/image_raw/compressed",
+        "/rs32_lidar_points",
+        "/sport_odom",
+    ]
+    assert extract_args["topic_map"] == {
+        "cam_video4": "fisheye_front",
+        "rs32_lidar_points": "r32_rslidar_points",
+        "sport_odom": "odom",
+    }
+    assert extract_args["query_dir"] == "rs32_lidar_points"
     final_report = json.loads((run_dir / "final_report.json").read_text(encoding="utf-8"))
     assert final_report["status"] == "planned"
     assert final_report["ok"] is True

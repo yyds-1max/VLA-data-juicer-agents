@@ -129,6 +129,32 @@ def test_prepare_raw_data_tool_accepts_json_segments_string(tmp_path, monkeypatc
     assert not (root / "raw_data" / "20270605_temp").exists()
 
 
+def test_extract_and_sync_tool_accepts_processing_profile_topic_args_without_dataset_profile(tmp_path, monkeypatch):
+    root = tmp_path / "VLADatasets"
+    (root / "raw_data" / "20270605_temp" / "20260605_152856").mkdir(parents=True)
+    monkeypatch.setenv("VLA_VLADATASETS_ROOT", str(root))
+    monkeypatch.setenv("VLA_DATATOOLBOX_SRC", "/datatoolbox/src")
+    tool = {tool.name: tool for tool in build_execution_tools(dry_run=True)}["extract_and_sync_navigation_data_tool"]
+    topic_params = _go2w_topic_params()
+
+    result = _invoke_tool(
+        tool,
+        {
+            "date": "20270605",
+            "segments": ["20260605_152856"],
+            "processing_profile": "parameterized_navigation_v1",
+            "platform_hint": "go2w",
+            **topic_params,
+        },
+    )
+
+    assert result["ok"] is True
+    assert result["details"]["profile"] == "go2w_like"
+    assert result["details"]["extract_topics"] == topic_params["topic_whitelist"]
+    assert result["details"]["sync_topic_map"] == topic_params["topic_map"]
+    assert result["details"]["query_dir"] == topic_params["query_dir"]
+
+
 def test_generate_gridmap_from_pcd_dry_run_builds_command(tmp_path):
     settings = NavigationSettings(
         vladatasets_root=tmp_path / "VLADatasets",
@@ -660,6 +686,29 @@ def test_projection_and_trajectory_uses_go2w_trajectory_script(tmp_path):
     assert any("/processing/2_pt_project/2_othermethod_cjl_0525.py" in shell for shell in shells)
     assert not any("/processing/0_1th_box/img2video.py" in shell for shell in shells)
     assert not any(shell.endswith("./bin/main") for shell in shells)
+
+
+def test_projection_tool_uses_go2w_script_from_platform_hint_without_dataset_profile(tmp_path, monkeypatch):
+    root = tmp_path / "VLADatasets"
+    finish_temp = root / "finish_data" / "20270605_temp"
+    monkeypatch.setenv("VLA_VLADATASETS_ROOT", str(root))
+    monkeypatch.setenv("VLA_PROCESSING_ROOT", "/processing")
+    tool = {tool.name: tool for tool in build_execution_tools(dry_run=True)}["run_projection_and_trajectory_tool"]
+
+    result = _invoke_tool(
+        tool,
+        {
+            "finish_temp_path": str(finish_temp),
+            "finish_path": str(root / "finish_data" / "20270605"),
+            "processing_profile": "parameterized_navigation_v1",
+            "platform_hint": "go2w",
+        },
+    )
+
+    shells = [_command_text(record["command"]) for record in result["commands"]]
+    assert result["ok"] is True
+    assert result["details"]["trajectory_script"] == "2_othermethod_cjl_0525.py"
+    assert any("/processing/2_pt_project/2_othermethod_cjl_0525.py" in shell for shell in shells)
 
 
 def test_build_execution_tools_registers_split_execution_tools(monkeypatch, tmp_path):
