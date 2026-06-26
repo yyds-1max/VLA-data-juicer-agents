@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import time
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -84,6 +85,50 @@ def test_submit_turn_returns_turn_id(tmp_path: Path):
 
     assert response.status_code == 200
     assert response.json()["turn_id"].startswith("turn_")
+
+
+def test_create_app_accepts_positional_configuration(tmp_path: Path):
+    FakeController.created = []
+    app = create_app(str(tmp_path / ".djx"), "qwen-positional", tmp_path / "sessions.sqlite", FakeController)
+    client = TestClient(app)
+
+    session_id = _create_session(client)
+
+    assert FakeController.created[0].kwargs["working_dir"] == str(tmp_path / ".djx" / session_id)
+    assert FakeController.created[0].kwargs["model"] == "qwen-positional"
+
+
+def test_submit_turn_runtime_error_returns_409(tmp_path: Path):
+    class ActiveTurnController(FakeController):
+        def submit_turn(self, message):
+            raise RuntimeError("A session turn is already active.")
+
+    app = create_app(
+        working_dir=str(tmp_path / ".djx"),
+        db_path=tmp_path / "sessions.sqlite",
+        controller_factory=ActiveTurnController,
+    )
+    client = TestClient(app)
+    session_id = _create_session(client)
+
+    response = client.post(f"/api/sessions/{session_id}/turns", json={"message": "开始处理"})
+
+    assert response.status_code == 409
+    assert response.json()["detail"] == "A session turn is already active."
+
+
+def test_session_events_websocket_receives_background_turn_events(tmp_path: Path):
+    client = make_client(tmp_path)
+    session_id = _create_session(client)
+
+    with client.websocket_connect(f"/api/sessions/{session_id}/events") as websocket:
+        response = client.post(f"/api/sessions/{session_id}/turns", json={"message": "开始处理"})
+        assert response.status_code == 200
+        with ThreadPoolExecutor(max_workers=1) as executor:
+            event = executor.submit(websocket.receive_json).result(timeout=1)
+
+    assert event["type"] == "final"
+    assert event["payload"]["text"] == "完成: 开始处理"
 
 
 def test_list_sessions_returns_session_records(tmp_path: Path):

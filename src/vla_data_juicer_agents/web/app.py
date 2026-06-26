@@ -20,7 +20,6 @@ from vla_data_juicer_agents.web.session_store import WebSessionStore
 
 
 def create_app(
-    *,
     working_dir: str | None = None,
     model: str | None = None,
     db_path: str | Path | None = None,
@@ -68,6 +67,8 @@ def create_app(
             turn_id = manager.submit_turn(session_id, request.message)
         except KeyError as exc:
             raise HTTPException(status_code=404, detail="Session not found") from exc
+        except RuntimeError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
         asyncio.create_task(_drain_controller_events(session_id, manager, store, bus))
         return CreateTurnResponse(turn_id=turn_id)
 
@@ -113,17 +114,21 @@ async def _drain_controller_events(
                 store.append_message(session_id, role="assistant", content=text)
                 persisted_final_texts.add(text)
 
-    while controller.is_running:
-        await drain_once()
-        await asyncio.sleep(0.03)
+    drained_to_completion = False
+    try:
+        while controller.is_running:
+            await drain_once()
+            await asyncio.sleep(0.03)
 
-    await drain_once()
-    result = _consume_turn_result(controller)
-    if result is not None:
-        text = getattr(result, "text", None)
-        if isinstance(text, str) and text and text not in persisted_final_texts:
-            store.append_message(session_id, role="assistant", content=text)
-            persisted_final_texts.add(text)
+        await drain_once()
+        drained_to_completion = True
+    finally:
+        result = _consume_turn_result(controller)
+        if drained_to_completion and result is not None:
+            text = getattr(result, "text", None)
+            if isinstance(text, str) and text and text not in persisted_final_texts:
+                store.append_message(session_id, role="assistant", content=text)
+                persisted_final_texts.add(text)
 
 
 def _final_event_text(event: dict[str, Any]) -> str | None:
