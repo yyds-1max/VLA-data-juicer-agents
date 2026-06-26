@@ -21,9 +21,10 @@ def _ensure_default_tools() -> None:
     if _DEFAULTS_LOADED:
         return
     _DEFAULTS_LOADED = True
-    from vla_data_juicer_agents.tools.vla.run_workflow import VLA_RUN_WORKFLOW
+    from vla_data_juicer_agents.tools.vla.run_workflow import VLA_CONTINUE_WORKFLOW, VLA_RUN_WORKFLOW
 
     register_tool_spec(VLA_RUN_WORKFLOW)
+    register_tool_spec(VLA_CONTINUE_WORKFLOW)
 
 
 def list_tool_specs() -> list[ToolSpec]:
@@ -37,4 +38,3 @@ def get_tool_spec(name: str) -> ToolSpec:
         return _REGISTRY[name]
     except KeyError as exc:
         raise KeyError(f"unknown tool: {name}") from exc
-

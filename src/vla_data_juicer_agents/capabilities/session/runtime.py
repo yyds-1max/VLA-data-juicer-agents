@@ -35,6 +35,9 @@ _BEARER_PATTERN = re.compile(r"\b(Bearer)(?:\s+|-)[^\s,;]+", flags=re.IGNORECASE
 class SessionState:
     working_dir: str = "./.djx"
     history: list[dict[str, str]] = field(default_factory=list)
+    pending_workflow_run_dir: str | None = None
+    pending_workflow_status: str | None = None
+    pending_workflow_input_type: str | None = None
 
 
 @dataclass(frozen=True)
@@ -118,10 +121,17 @@ class SessionToolRuntime:
         return Path(self.state.working_dir or "./.djx").expanduser()
 
     def context_payload(self) -> dict[str, Any]:
-        return {
+        payload: dict[str, Any] = {
             "working_dir": self.state.working_dir,
             "history_length": len(self.state.history),
         }
+        if self.state.pending_workflow_run_dir:
+            payload["pending_workflow"] = {
+                "run_dir": self.state.pending_workflow_run_dir,
+                "status": self.state.pending_workflow_status,
+                "input_type": self.state.pending_workflow_input_type,
+            }
+        return payload
 
     @classmethod
     def redact_payload(cls, value: Any) -> Any:

@@ -15,7 +15,12 @@ from vla_data_juicer_agents.capabilities.session.toolkit import _tool_context, g
 from vla_data_juicer_agents.navigation.agents import EXECUTOR_AGENT_INSTRUCTIONS
 from vla_data_juicer_agents.navigation.config import NavigationSettings
 from vla_data_juicer_agents.navigation.execution_tools import create_navigation_execution_tools
-from vla_data_juicer_agents.tools.vla.run_workflow import _normalize_model, _normalize_segments, run_vla_workflow
+from vla_data_juicer_agents.tools.vla.run_workflow import (
+    _normalize_model,
+    _normalize_segments,
+    continue_vla_workflow,
+    run_vla_workflow,
+)
 
 
 def test_tool_registry_exposes_vla_workflow_tool():
@@ -23,6 +28,28 @@ def test_tool_registry_exposes_vla_workflow_tool():
 
     assert "vla_run_workflow" in names
     assert get_tool_spec("vla_run_workflow").effects == "execute"
+
+
+def test_session_runtime_exposes_pending_workflow_context():
+    state = SessionState()
+    state.pending_workflow_run_dir = "/tmp/run"
+    state.pending_workflow_status = "waiting_for_user_confirmation"
+    state.pending_workflow_input_type = "calibration_confirmation"
+    runtime = SessionToolRuntime(state=state)
+
+    assert runtime.context_payload()["pending_workflow"] == {
+        "run_dir": "/tmp/run",
+        "status": "waiting_for_user_confirmation",
+        "input_type": "calibration_confirmation",
+    }
+
+
+def test_tool_registry_exposes_continue_workflow_tool():
+    names = [spec.name for spec in list_tool_specs()]
+
+    assert "vla_run_workflow" in names
+    assert "vla_continue_workflow" in names
+    assert get_tool_spec("vla_continue_workflow").effects == "execute"
 
 
 def test_session_toolkit_prioritizes_vla_workflow_tool():
@@ -69,6 +96,10 @@ def test_session_prompt_routes_complex_vla_requests_to_workflow():
     assert "Fixed platform names are hints, not hard execution categories" in prompt
     assert "response_language" in prompt
     assert "Set vla_run_workflow.response_language to the user's language" in prompt
+    assert "If session_context.pending_workflow exists" in prompt
+    assert "vla_continue_workflow exactly once" in prompt
+    assert "do not call vla_run_workflow" in prompt
+    assert "Never scan old run directories" in prompt
     assert "Do not use deterministic Python keyword routing" in prompt
     assert "Respond in the same language as the user" in prompt
 
@@ -980,6 +1011,233 @@ def test_vla_run_workflow_tool_reuses_plan_and_executor_agents(tmp_path, monkeyp
     ]
     assert persisted == events
     assert all(set(event) == {"type", "source", "run_id", "parent_run_id", "timestamp", "payload"} for event in persisted)
+
+
+def test_vla_run_workflow_records_calibration_confirmation_checkpoint(tmp_path, monkeypatch):
+    runtime = SessionToolRuntime(state=SessionState())
+    plan_payload = {
+        "date": "20270605",
+        "segments": ["20260605_152856"],
+        "scene_mode": "out",
+        "processing_profile": "parameterized_navigation_v1",
+        "platform_hint": "go2w",
+        "steps": [],
+    }
+    plan = SimpleNamespace(
+        model_dump=lambda mode="json": plan_payload,
+        model_dump_json=lambda: json.dumps(plan_payload),
+    )
+
+    async def fake_run_plan_agent(*args, **kwargs):
+        return plan
+
+    async def fake_run_executor_agent(*args, **kwargs):
+        return "calibration_params_not_confirmed: user did not confirm"
+
+    monkeypatch.setenv("VLA_RUNS_ROOT", str(tmp_path / "runs"))
+    monkeypatch.setattr("vla_data_juicer_agents.tools.vla.run_workflow.create_plan_agent", lambda model=None, request=None: "plan-agent")
+    monkeypatch.setattr(
+        "vla_data_juicer_agents.tools.vla.run_workflow.create_executor_agent",
+        lambda model=None, dry_run=False, cancellation=None: "executor-agent",
+    )
+    monkeypatch.setattr("vla_data_juicer_agents.tools.vla.run_workflow.run_plan_agent", fake_run_plan_agent)
+    monkeypatch.setattr("vla_data_juicer_agents.tools.vla.run_workflow.run_executor_agent", fake_run_executor_agent)
+
+    ctx = ToolContext(
+        working_dir=str(tmp_path),
+        artifacts_dir=str(tmp_path / ".djx"),
+        runtime_values={"session_runtime": runtime},
+    )
+
+    payload = asyncio.run(
+        run_vla_workflow(
+            ctx,
+            {
+                "date": "20270605",
+                "segments": ["20260605_152856"],
+                "scene_mode": "out",
+                "approve": True,
+            },
+        )
+    )
+
+    assert payload["ok"] is False
+    assert payload["status"] == "waiting_for_user_confirmation"
+    assert payload["error_type"] == "calibration_params_not_confirmed"
+    assert runtime.state.pending_workflow_run_dir == payload["run_dir"]
+    assert runtime.state.pending_workflow_status == "waiting_for_user_confirmation"
+    assert runtime.state.pending_workflow_input_type == "calibration_confirmation"
+    checkpoint = json.loads((Path(payload["run_dir"]) / "checkpoint.json").read_text(encoding="utf-8"))
+    assert checkpoint["status"] == "waiting_for_user_confirmation"
+    assert checkpoint["waiting_step_id"] == "confirm_navigation_calibration_params"
+
+
+def test_continue_workflow_requires_current_session_pending_state(tmp_path):
+    ctx = ToolContext(working_dir=str(tmp_path), runtime_values={})
+
+    payload = asyncio.run(continue_vla_workflow(ctx, {"user_input": "确认"}))
+
+    assert payload["ok"] is False
+    assert payload["status"] == "needs_active_session_workflow"
+    assert payload["error_type"] == "no_pending_workflow"
+
+
+def test_continue_workflow_rejects_non_pending_run_dir(tmp_path):
+    runtime = SessionToolRuntime(state=SessionState())
+    pending_run = tmp_path / "runs" / "20270605" / "pending"
+    other_run = tmp_path / "runs" / "20270605" / "other"
+    pending_run.mkdir(parents=True)
+    other_run.mkdir(parents=True)
+    runtime.state.pending_workflow_run_dir = str(pending_run)
+    runtime.state.pending_workflow_status = "waiting_for_user_confirmation"
+    runtime.state.pending_workflow_input_type = "calibration_confirmation"
+    ctx = ToolContext(working_dir=str(tmp_path), runtime_values={"session_runtime": runtime})
+
+    payload = asyncio.run(
+        continue_vla_workflow(
+            ctx,
+            {"user_input": "确认", "run_dir": str(other_run)},
+        )
+    )
+
+    assert payload["ok"] is False
+    assert payload["status"] == "needs_active_session_workflow"
+    assert payload["error_type"] == "run_dir_not_pending"
+
+
+def test_continue_workflow_marks_paused_on_terminate(tmp_path):
+    runtime = SessionToolRuntime(state=SessionState())
+    run_dir = tmp_path / "runs" / "20270605" / "run"
+    run_dir.mkdir(parents=True)
+    (run_dir / "plan.json").write_text(
+        json.dumps(
+            {
+                "date": "20270605",
+                "segments": ["20260605_152856"],
+                "scene_mode": "out",
+                "processing_profile": "parameterized_navigation_v1",
+                "platform_hint": "go2w",
+                "steps": [],
+            }
+        ),
+        encoding="utf-8",
+    )
+    (run_dir / "checkpoint.json").write_text(
+        json.dumps(
+            {
+                "status": "waiting_for_user_confirmation",
+                "waiting_step_id": "confirm_navigation_calibration_params",
+                "pending_input_type": "calibration_confirmation",
+                "date": "20270605",
+                "segments": ["20260605_152856"],
+                "scene_mode": "out",
+            }
+        ),
+        encoding="utf-8",
+    )
+    runtime.state.pending_workflow_run_dir = str(run_dir)
+    runtime.state.pending_workflow_status = "waiting_for_user_confirmation"
+    runtime.state.pending_workflow_input_type = "calibration_confirmation"
+    ctx = ToolContext(working_dir=str(tmp_path), runtime_values={"session_runtime": runtime})
+
+    payload = asyncio.run(continue_vla_workflow(ctx, {"user_input": "终止"}))
+
+    assert payload["ok"] is False
+    assert payload["status"] == "paused_by_user"
+    assert runtime.state.pending_workflow_run_dir == str(run_dir)
+    assert runtime.state.pending_workflow_status == "paused_by_user"
+    assert runtime.state.pending_workflow_input_type == "calibration_confirmation"
+    checkpoint = json.loads((run_dir / "checkpoint.json").read_text(encoding="utf-8"))
+    assert checkpoint["status"] == "paused_by_user"
+
+
+def test_continue_workflow_confirms_and_executes_existing_plan_without_replanning(tmp_path, monkeypatch):
+    runtime = SessionToolRuntime(state=SessionState())
+    run_dir = tmp_path / "runs" / "20270605" / "run"
+    run_dir.mkdir(parents=True)
+    plan_payload = {
+        "date": "20270605",
+        "segments": ["20260605_152856"],
+        "scene_mode": "out",
+        "processing_profile": "parameterized_navigation_v1",
+        "platform_hint": "go2w",
+        "steps": [
+            {
+                "step_id": "confirm_navigation_calibration_params",
+                "tool_name": "confirm_navigation_calibration_params",
+                "arguments": {},
+                "preconditions": [],
+                "human_blocking": True,
+                "failure_behavior": "stop",
+                "effects": "read",
+            },
+            {
+                "step_id": "prepare_raw_data",
+                "tool_name": "prepare_raw_data",
+                "arguments": {"date": "20270605"},
+                "preconditions": ["confirm_navigation_calibration_params"],
+                "effects": "execute",
+            },
+        ],
+    }
+    (run_dir / "plan.json").write_text(json.dumps(plan_payload), encoding="utf-8")
+    (run_dir / "checkpoint.json").write_text(
+        json.dumps(
+            {
+                "status": "waiting_for_user_confirmation",
+                "waiting_step_id": "confirm_navigation_calibration_params",
+                "pending_input_type": "calibration_confirmation",
+                "date": "20270605",
+                "segments": ["20260605_152856"],
+                "scene_mode": "out",
+            }
+        ),
+        encoding="utf-8",
+    )
+    runtime.state.pending_workflow_run_dir = str(run_dir)
+    runtime.state.pending_workflow_status = "waiting_for_user_confirmation"
+    runtime.state.pending_workflow_input_type = "calibration_confirmation"
+    captured = {}
+
+    async def fail_replan(*args, **kwargs):
+        raise AssertionError("continue_vla_workflow must not call Plan-Agent")
+
+    async def fake_run_executor_agent(agent, workflow_plan, *args, **kwargs):
+        captured["agent"] = agent
+        captured["plan"] = workflow_plan
+        captured["run_dir"] = kwargs["run_dir"]
+        captured["response_language"] = kwargs["response_language"]
+        return "resumed"
+
+    monkeypatch.setattr("vla_data_juicer_agents.tools.vla.run_workflow.create_plan_agent", lambda *args, **kwargs: "plan-agent")
+    monkeypatch.setattr("vla_data_juicer_agents.tools.vla.run_workflow.run_plan_agent", fail_replan)
+    monkeypatch.setattr(
+        "vla_data_juicer_agents.tools.vla.run_workflow.create_executor_agent",
+        lambda model=None, dry_run=False, cancellation=None: f"executor-{model}-{dry_run}",
+    )
+    monkeypatch.setattr("vla_data_juicer_agents.tools.vla.run_workflow.run_executor_agent", fake_run_executor_agent)
+    ctx = ToolContext(working_dir=str(tmp_path), runtime_values={"session_runtime": runtime})
+
+    payload = asyncio.run(
+        continue_vla_workflow(
+            ctx,
+            {"user_input": "确认", "model": "qwen-test", "response_language": "Chinese"},
+        )
+    )
+
+    assert payload["ok"] is True
+    assert payload["status"] == "completed"
+    assert payload["final_output"] == "resumed"
+    assert runtime.state.pending_workflow_run_dir is None
+    assert runtime.state.pending_workflow_status is None
+    assert runtime.state.pending_workflow_input_type is None
+    assert captured["agent"] == "executor-qwen-test-False"
+    assert captured["run_dir"] == run_dir
+    assert captured["response_language"] == "Chinese"
+    assert [step.step_id for step in captured["plan"].steps] == ["prepare_raw_data"]
+    assert captured["plan"].steps[0].preconditions == []
+    checkpoint = json.loads((run_dir / "checkpoint.json").read_text(encoding="utf-8"))
+    assert checkpoint["status"] == "completed"
 
 
 def test_vla_run_workflow_prefers_scope_emitter_over_independent_emitter(tmp_path, monkeypatch):
