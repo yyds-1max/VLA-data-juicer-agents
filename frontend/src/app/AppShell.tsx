@@ -48,6 +48,12 @@ const metricCards = [
 
 const pipelineSteps = ["采集", "清洗", "标注", "评估", "发布"];
 
+const runningSignals = [
+  { label: "采集延迟正常", status: "正常" },
+  { label: "清洗规则更新", status: "更新" },
+  { label: "质量阈值稳定", status: "稳定" },
+];
+
 export function AppShell({ children }: AppShellProps) {
   return (
     <div className="min-h-screen bg-console-bg text-console-text">
@@ -69,39 +75,43 @@ export function AppShell({ children }: AppShellProps) {
             <div className="mb-2 px-3 text-[10px] uppercase tracking-[0.24em] text-console-muted">
               Console
             </div>
-            <div className="space-y-1">
+            <ul className="space-y-1">
               {navItems.map((item) => (
-                <button
-                  key={item.label}
-                  className={cn(
-                    "flex w-full items-center gap-3 rounded px-3 py-2.5 text-left text-sm text-console-muted transition hover:bg-console-panel2 hover:text-console-text",
-                    item.active &&
-                      "border border-console-cyan/35 bg-console-cyan/10 text-console-cyan shadow-[inset_3px_0_0_#15d1d8]",
-                  )}
-                  type="button"
-                >
-                  <item.icon className="h-4 w-4 shrink-0" aria-hidden="true" />
-                  <span className="truncate">{item.label}</span>
-                </button>
+                <li key={item.label}>
+                  <div
+                    className={cn(
+                      "flex w-full items-center gap-3 rounded px-3 py-2.5 text-left text-sm text-console-muted",
+                      item.active &&
+                        "border border-console-cyan/35 bg-console-cyan/10 text-console-cyan shadow-[inset_3px_0_0_#15d1d8]",
+                    )}
+                    aria-current={item.active ? "page" : undefined}
+                  >
+                    <item.icon className="h-4 w-4 shrink-0" aria-hidden="true" />
+                    <span className="truncate">{item.label}</span>
+                  </div>
+                </li>
               ))}
-            </div>
+            </ul>
           </nav>
         </div>
 
         <nav className="flex gap-2 overflow-x-auto border-t border-console-line py-2 md:hidden" aria-label="DataLoop mobile navigation">
-          {navItems.map((item) => (
-            <button
-              key={item.label}
-              className={cn(
-                "flex shrink-0 items-center gap-2 rounded border border-console-line px-3 py-2 text-xs text-console-muted",
-                item.active && "border-console-cyan/50 bg-console-cyan/10 text-console-cyan",
-              )}
-              type="button"
-            >
-              <item.icon className="h-4 w-4" aria-hidden="true" />
-              {item.label}
-            </button>
-          ))}
+          <ul className="flex gap-2">
+            {navItems.map((item) => (
+              <li key={item.label}>
+                <div
+                  className={cn(
+                    "flex shrink-0 items-center gap-2 rounded border border-console-line px-3 py-2 text-xs text-console-muted",
+                    item.active && "border-console-cyan/50 bg-console-cyan/10 text-console-cyan",
+                  )}
+                  aria-current={item.active ? "page" : undefined}
+                >
+                  <item.icon className="h-4 w-4" aria-hidden="true" />
+                  {item.label}
+                </div>
+              </li>
+            ))}
+          </ul>
         </nav>
       </aside>
 
@@ -175,15 +185,22 @@ export function AppShell({ children }: AppShellProps) {
             <section className="rounded border border-console-line bg-console-panel p-4">
               <h2 className="text-sm font-semibold">运行信号</h2>
               <div className="mt-4 space-y-3">
-                {["采集延迟正常", "清洗规则更新", "质量阈值稳定"].map((item, index) => (
-                  <div key={item} className="flex items-center gap-3 rounded border border-console-line bg-console-panel2 px-3 py-2">
+                {runningSignals.map((item, index) => (
+                  <div
+                    key={item.label}
+                    className="flex items-center gap-3 rounded border border-console-line bg-console-panel2 px-3 py-2"
+                  >
                     <span
                       className={cn(
                         "h-2.5 w-2.5 rounded-full",
                         index === 1 ? "bg-amber-300" : "bg-console-cyan shadow-[0_0_10px_#15d1d8]",
                       )}
+                      aria-hidden="true"
                     />
-                    <span className="min-w-0 truncate text-sm">{item}</span>
+                    <span className="min-w-0 flex-1 truncate text-sm">{item.label}</span>
+                    <span className="shrink-0 rounded border border-console-line bg-console-bg px-2 py-0.5 text-[11px] text-console-muted">
+                      {item.status}
+                    </span>
                   </div>
                 ))}
               </div>
