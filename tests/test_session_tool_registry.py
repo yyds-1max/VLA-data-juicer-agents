@@ -1075,6 +1075,71 @@ def test_vla_run_workflow_records_calibration_confirmation_checkpoint(tmp_path, 
     assert checkpoint["dry_run"] is True
 
 
+def test_vla_run_workflow_detects_calibration_pause_from_executor_event(tmp_path, monkeypatch):
+    runtime = SessionToolRuntime(state=SessionState())
+    plan_payload = {
+        "date": "20270605",
+        "segments": ["20260605_152856"],
+        "scene_mode": "out",
+        "processing_profile": "parameterized_navigation_v1",
+        "platform_hint": "go2w",
+        "steps": [],
+    }
+    plan = SimpleNamespace(
+        model_dump=lambda mode="json": plan_payload,
+        model_dump_json=lambda: json.dumps(plan_payload),
+    )
+
+    async def fake_run_plan_agent(*args, **kwargs):
+        return plan
+
+    async def fake_run_executor_agent(*args, event_scope=None, **kwargs):
+        event_scope.emit(
+            "tool_end",
+            tool="confirm_navigation_calibration_params",
+            call_id="call-1",
+            status="failed",
+            summary="calibration_params_not_confirmed",
+        )
+        return "Execution stopped before processing."
+
+    monkeypatch.setenv("VLA_RUNS_ROOT", str(tmp_path / "runs"))
+    monkeypatch.setattr("vla_data_juicer_agents.tools.vla.run_workflow.create_plan_agent", lambda model=None, request=None: "plan-agent")
+    monkeypatch.setattr(
+        "vla_data_juicer_agents.tools.vla.run_workflow.create_executor_agent",
+        lambda model=None, dry_run=False, cancellation=None: "executor-agent",
+    )
+    monkeypatch.setattr("vla_data_juicer_agents.tools.vla.run_workflow.run_plan_agent", fake_run_plan_agent)
+    monkeypatch.setattr("vla_data_juicer_agents.tools.vla.run_workflow.run_executor_agent", fake_run_executor_agent)
+
+    ctx = ToolContext(
+        working_dir=str(tmp_path),
+        artifacts_dir=str(tmp_path / ".djx"),
+        runtime_values={"session_runtime": runtime},
+    )
+
+    payload = asyncio.run(
+        run_vla_workflow(
+            ctx,
+            {
+                "date": "20270605",
+                "segments": ["20260605_152856"],
+                "scene_mode": "out",
+                "dry_run": True,
+                "approve": True,
+            },
+        )
+    )
+
+    assert payload["ok"] is False
+    assert payload["status"] == "waiting_for_user_confirmation"
+    assert payload["final_output"] == "Execution stopped before processing."
+    assert runtime.state.pending_workflow_run_dir == payload["run_dir"]
+    assert runtime.state.pending_workflow_status == "waiting_for_user_confirmation"
+    checkpoint = json.loads((Path(payload["run_dir"]) / "checkpoint.json").read_text(encoding="utf-8"))
+    assert checkpoint["status"] == "waiting_for_user_confirmation"
+
+
 def test_continue_workflow_requires_current_session_pending_state(tmp_path):
     ctx = ToolContext(working_dir=str(tmp_path), runtime_values={})
 

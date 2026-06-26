@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from collections.abc import Mapping
 from pathlib import Path
 from typing import Any, Literal
 
@@ -14,6 +15,8 @@ from vla_data_juicer_agents.navigation.config import NavigationSettings
 from vla_data_juicer_agents.navigation.models import NavigationRequest, WorkflowPlan
 from vla_data_juicer_agents.navigation.run_state import WorkflowRunStore
 from vla_data_juicer_agents.navigation.workflow import run_executor_agent, run_plan_agent
+
+_CALIBRATION_CONFIRMATION_PAUSE_TOKEN = "calibration_params_not_confirmed"
 
 
 class RunVLAWorkflowInput(BaseModel):
@@ -132,8 +135,37 @@ def _clear_pending_workflow(ctx: ToolContext) -> None:
     runtime.state.pending_workflow_input_type = None
 
 
+def _contains_calibration_confirmation_pause(value: Any) -> bool:
+    if isinstance(value, str):
+        return _CALIBRATION_CONFIRMATION_PAUSE_TOKEN in value
+    if isinstance(value, Mapping):
+        return any(
+            _contains_calibration_confirmation_pause(item)
+            for pair in value.items()
+            for item in pair
+        )
+    if isinstance(value, (list, tuple, set)):
+        return any(_contains_calibration_confirmation_pause(item) for item in value)
+    return False
+
+
 def _is_calibration_confirmation_pause(final_output: str) -> bool:
-    return "calibration_params_not_confirmed" in final_output
+    return _contains_calibration_confirmation_pause(final_output)
+
+
+class _CalibrationConfirmationPauseSink:
+    def __init__(self, source_prefix: str = "navigation.executor") -> None:
+        self.detected = False
+        self._source_prefix = source_prefix
+
+    def publish(self, event: Mapping[str, Any]) -> None:
+        source = event.get("source")
+        if not isinstance(source, str):
+            return
+        if source != self._source_prefix and not source.startswith(f"{self._source_prefix}."):
+            return
+        if _contains_calibration_confirmation_pause(event.get("payload", {})):
+            self.detected = True
 
 
 def _load_json(path: Path) -> dict[str, Any]:
@@ -191,7 +223,8 @@ async def run_vla_workflow(ctx: ToolContext, raw_args: RunVLAWorkflowInput | dic
     incoming_scope = runtime_values.get("event_scope")
     incoming_emitter = runtime_values.get("event_emitter")
     emitter = getattr(incoming_scope, "emitter", None) or incoming_emitter or EventEmitter()
-    emitter = emitter.with_sink(JsonlEventSink(run_dir / "events.jsonl"))
+    calibration_pause_sink = _CalibrationConfirmationPauseSink()
+    emitter = emitter.with_sink(JsonlEventSink(run_dir / "events.jsonl")).with_sink(calibration_pause_sink)
     workflow_scope = emitter.scope(
         "navigation.workflow",
         parent_run_id=getattr(incoming_scope, "run_id", None),
@@ -248,7 +281,7 @@ async def run_vla_workflow(ctx: ToolContext, raw_args: RunVLAWorkflowInput | dic
             cancellation=cancellation,
             response_language=args.response_language,
         )
-        if _is_calibration_confirmation_pause(final_output):
+        if calibration_pause_sink.detected or _is_calibration_confirmation_pause(final_output):
             checkpoint = WorkflowCheckpoint(
                 status="waiting_for_user_confirmation",
                 waiting_step_id="confirm_navigation_calibration_params",
