@@ -55,7 +55,7 @@ class VLASessionAgent:
             "For VLA, navigation, ROS bag, db3, odom, trajectory, gridmap, gen_box.py, or annotation processing requests, "
             "call vla_run_workflow exactly once with parsed date, segments, dry_run, approve, response_language, and model when known.\n"
             "If session_context.pending_workflow exists, exact user replies such as `确认`, `继续`, "
-            "`我改好了，继续`, or `终止` refer to that pending workflow. In that case call "
+            "`我改好了，继续`, `继续上次任务`, or `终止` refer to that pending workflow. In that case call "
             "vla_continue_workflow exactly once and do not call vla_run_workflow.\n"
             "Never scan old run directories to resume work; only use pending_workflow from session_context.\n"
             "Navigation planning uses sensor bindings and processing_profile. "

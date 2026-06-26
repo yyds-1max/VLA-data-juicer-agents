@@ -63,6 +63,7 @@ class WorkflowCheckpoint(BaseModel):
     date: str
     segments: list[str] | None = None
     scene_mode: Literal["in", "out"]
+    dry_run: bool = False
 
 
 def _normalize_segments(value: str | list[str] | None) -> list[str] | None:
@@ -255,6 +256,7 @@ async def run_vla_workflow(ctx: ToolContext, raw_args: RunVLAWorkflowInput | dic
                 date=request.date,
                 segments=request.segments,
                 scene_mode=request.scene_mode,
+                dry_run=args.dry_run,
             )
             _write_checkpoint(run_store, run_dir, checkpoint)
             _set_pending_workflow(
@@ -388,11 +390,12 @@ async def continue_vla_workflow(
 
     try:
         cancellation.raise_if_cancelled()
+        checkpoint = _load_checkpoint(run_dir)
         plan = _load_plan(run_dir)
         remaining_plan = _plan_without_completed_confirmation(plan)
         executor_agent = create_executor_agent(
             model=model,
-            dry_run=False,
+            dry_run=checkpoint.dry_run,
             cancellation=cancellation,
         )
         final_output = await run_executor_agent(
@@ -409,6 +412,7 @@ async def continue_vla_workflow(
             date=plan.date,
             segments=plan.segments,
             scene_mode=plan.scene_mode,
+            dry_run=checkpoint.dry_run,
         )
         _write_checkpoint(run_store, run_dir, checkpoint)
         payload = RunVLAWorkflowOutput(
