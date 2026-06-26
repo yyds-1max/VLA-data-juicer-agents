@@ -1,0 +1,136 @@
+import { describe, expect, it } from "vitest";
+
+import type { AgentEvent, ChatMessageRecord, SessionRecord } from "../api/types";
+import { createEmptyRunState, applyAgentEvent } from "./eventReducer";
+import { createDataPilotStore } from "./datapilotStore";
+
+function event(
+  type: string,
+  source: string,
+  payload: Record<string, unknown> = {},
+  overrides: Partial<AgentEvent> = {},
+): AgentEvent {
+  return {
+    type,
+    source,
+    run_id: "run-1",
+    parent_run_id: null,
+    timestamp: "2026-06-26T00:00:00.000Z",
+    payload,
+    ...overrides,
+  };
+}
+
+function session(overrides: Partial<SessionRecord> = {}): SessionRecord {
+  return {
+    id: "session-1",
+    title: "Active session",
+    status: "active",
+    created_at: "2026-06-26T00:00:00Z",
+    updated_at: "2026-06-26T00:00:00Z",
+    ...overrides,
+  };
+}
+
+function message(overrides: Partial<ChatMessageRecord> = {}): ChatMessageRecord {
+  return {
+    id: "message-1",
+    session_id: "session-1",
+    role: "user",
+    content: "hello",
+    created_at: "2026-06-26T00:00:00Z",
+    ...overrides,
+  };
+}
+
+describe("eventReducer", () => {
+  it("localizes main agent_start active text", () => {
+    const state = createEmptyRunState();
+
+    applyAgentEvent(state, event("agent_start", "main"));
+
+    expect(state.running).toBe(true);
+    expect(state.activeText).toBe("[Main] 正在思考");
+    expect(state.activeAgents["run-1"]).toMatchObject({
+      source: "main",
+      runId: "run-1",
+      parentRunId: null,
+    });
+  });
+
+  it("creates compact tool completion text without args JSON", () => {
+    const state = createEmptyRunState();
+
+    applyAgentEvent(
+      state,
+      event(
+        "tool_start",
+        "navigation.plan",
+        { call_id: "call-1", tool: "classify_navigation_dataset_tool", args: '{"date":"20270605"}' },
+        { timestamp: "2026-06-26T00:00:00.000Z" },
+      ),
+    );
+    applyAgentEvent(
+      state,
+      event(
+        "tool_end",
+        "navigation.plan",
+        { call_id: "call-1", tool: "classify_navigation_dataset_tool", ok: true },
+        { timestamp: "2026-06-26T00:00:01.000Z" },
+      ),
+    );
+
+    expect(state.activeTools).toEqual({});
+    expect(state.timeline).toHaveLength(1);
+    expect(state.timeline[0]).toMatchObject({
+      kind: "tool",
+      source: "navigation.plan",
+      status: "completed",
+      text: "completed classify_navigation_dataset_tool 1.0s",
+    });
+    expect(state.timeline[0].text).not.toContain("20270605");
+    expect(state.timeline[0].text).not.toContain("{");
+  });
+
+  it("preserves child source and summary for folding", () => {
+    const state = createEmptyRunState();
+
+    applyAgentEvent(
+      state,
+      event(
+        "reasoning",
+        "navigation.plan",
+        { summary: "先检查原始片段。" },
+        { run_id: "plan-run", parent_run_id: "workflow-run" },
+      ),
+    );
+
+    expect(state.timeline).toEqual([
+      {
+        kind: "reasoning",
+        source: "navigation.plan",
+        text: "先检查原始片段。",
+        runId: "plan-run",
+        parentRunId: "workflow-run",
+      },
+    ]);
+  });
+});
+
+describe("datapilotStore", () => {
+  it("enterDraft records the active session and clears messages and run", () => {
+    const store = createDataPilotStore();
+
+    store.getState().setActiveSession(session());
+    store.getState().appendUserMessage(message());
+    store.getState().applyEvent(event("agent_start", "main"));
+
+    store.getState().enterDraft();
+
+    expect(store.getState().mode).toBe("draft_new_session");
+    expect(store.getState().previousActiveSessionId).toBe("session-1");
+    expect(store.getState().currentSessionId).toBeNull();
+    expect(store.getState().messages).toEqual([]);
+    expect(store.getState().run).toEqual(createEmptyRunState());
+  });
+});

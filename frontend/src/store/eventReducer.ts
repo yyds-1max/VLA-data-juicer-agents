@@ -1,0 +1,229 @@
+import type { AgentEvent } from "../api/types";
+
+export type TimelineKind = "reasoning" | "tool" | "agent" | "assistant" | "system";
+
+export interface TimelineItem {
+  kind: TimelineKind;
+  source: string;
+  text: string;
+  status?: string;
+  runId?: string | null;
+  parentRunId?: string | null;
+}
+
+export interface ActiveAgent {
+  source: string;
+  runId: string;
+  parentRunId: string | null;
+}
+
+export interface ActiveTool {
+  source: string;
+  tool: string;
+  callId: string;
+  runId: string;
+  parentRunId: string | null;
+  startedAt: number;
+}
+
+export interface RunState {
+  timeline: TimelineItem[];
+  activeAgents: Record<string, ActiveAgent>;
+  activeTools: Record<string, ActiveTool>;
+  activeText: string;
+  running: boolean;
+}
+
+export function createEmptyRunState(): RunState {
+  return {
+    timeline: [],
+    activeAgents: {},
+    activeTools: {},
+    activeText: "",
+    running: false,
+  };
+}
+
+export function applyAgentEvent(state: RunState, event: AgentEvent): void {
+  const type = event.type.trim();
+  if (!type) {
+    return;
+  }
+
+  const source = normalizeText(event.source) || "main";
+  const runId = normalizeText(event.run_id);
+  const parentRunId = normalizeNullableText(event.parent_run_id);
+  const payload = event.payload ?? {};
+  const label = sourceLabel(source);
+
+  if (type === "agent_start") {
+    state.activeAgents[agentKey(runId, source)] = { source, runId, parentRunId };
+    state.running = true;
+    state.activeText = `[${label}] 正在思考`;
+    return;
+  }
+
+  if (type === "reasoning") {
+    const summary = normalizeText(payload.summary);
+    if (summary) {
+      state.timeline.push({
+        kind: "reasoning",
+        source,
+        text: summary,
+        runId,
+        parentRunId,
+      });
+    }
+    return;
+  }
+
+  if (type === "tool_start") {
+    const callId = normalizeText(payload.call_id) || normalizeText(payload.callId);
+    if (!callId) {
+      return;
+    }
+
+    const tool = normalizeText(payload.tool) || "unknown_tool";
+    state.activeTools[toolKey(runId, callId)] = {
+      source,
+      tool,
+      callId,
+      runId,
+      parentRunId,
+      startedAt: timestampMs(event.timestamp),
+    };
+    state.running = true;
+    state.activeText = `[${label}] 正在运行 ${tool}`;
+    return;
+  }
+
+  if (type === "tool_end") {
+    const callId = normalizeText(payload.call_id) || normalizeText(payload.callId);
+    const key = toolKey(runId, callId);
+    const active = state.activeTools[key];
+    if (active) {
+      delete state.activeTools[key];
+    }
+
+    const tool = normalizeText(payload.tool) || active?.tool || "unknown_tool";
+    const status = toolStatus(payload);
+    const elapsed = elapsedSeconds(active?.startedAt, event.timestamp);
+    state.timeline.push({
+      kind: "tool",
+      source,
+      text: `${status} ${tool} ${elapsed.toFixed(1)}s`,
+      status,
+      runId,
+      parentRunId,
+    });
+    refreshRunningText(state);
+    return;
+  }
+
+  if (type === "agent_end") {
+    delete state.activeAgents[agentKey(runId, source)];
+    refreshRunningText(state);
+    return;
+  }
+
+  if (type === "final") {
+    const text = normalizeText(payload.text);
+    if (text) {
+      state.timeline.push({
+        kind: "assistant",
+        source,
+        text,
+        runId,
+        parentRunId,
+      });
+    }
+    state.activeAgents = {};
+    state.activeTools = {};
+    state.running = false;
+    state.activeText = "";
+    return;
+  }
+
+  state.timeline.push({
+    kind: "system",
+    source,
+    text: type,
+    runId,
+    parentRunId,
+  });
+}
+
+function refreshRunningText(state: RunState): void {
+  const activeTool = Object.values(state.activeTools)[0];
+  if (activeTool) {
+    state.running = true;
+    state.activeText = `[${sourceLabel(activeTool.source)}] 正在运行 ${activeTool.tool}`;
+    return;
+  }
+
+  const activeAgent = Object.values(state.activeAgents)[0];
+  if (activeAgent) {
+    state.running = true;
+    state.activeText = `[${sourceLabel(activeAgent.source)}] 正在思考`;
+    return;
+  }
+
+  state.running = false;
+  state.activeText = "";
+}
+
+function sourceLabel(source: string): string {
+  if (!source || source === "main") {
+    return "Main";
+  }
+  if (source === "navigation.workflow" || source === "navigation.workflow.resume") {
+    return "Workflow";
+  }
+  if (source === "navigation.plan") {
+    return "Plan";
+  }
+  if (source === "navigation.executor") {
+    return "Executor";
+  }
+  return source;
+}
+
+function toolStatus(payload: Record<string, unknown>): string {
+  const status = normalizeText(payload.status);
+  if (status) {
+    return status;
+  }
+  return payload.ok === false ? "failed" : "completed";
+}
+
+function elapsedSeconds(startedAt: number | undefined, endedAt: string | null | undefined): number {
+  if (startedAt === undefined) {
+    return 0;
+  }
+  return Math.max((timestampMs(endedAt) - startedAt) / 1000, 0);
+}
+
+function timestampMs(value: string | null | undefined): number {
+  if (!value) {
+    return Date.now();
+  }
+  const parsed = Date.parse(value);
+  return Number.isNaN(parsed) ? Date.now() : parsed;
+}
+
+function agentKey(runId: string, source: string): string {
+  return runId || source || "main";
+}
+
+function toolKey(runId: string, callId: string): string {
+  return `${runId}\u0000${callId}`;
+}
+
+function normalizeNullableText(value: unknown): string | null {
+  const text = normalizeText(value);
+  return text || null;
+}
+
+function normalizeText(value: unknown): string {
+  return typeof value === "string" ? value.trim() : "";
+}
