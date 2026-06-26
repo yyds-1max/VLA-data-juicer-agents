@@ -26,10 +26,10 @@ export function DataPilotWindow() {
   const run = useStore(datapilotStore, (state) => state.run);
   const running = useStore(datapilotStore, (state) => state.run.running);
   const [historyOpen, setHistoryOpen] = useState(false);
-  const socketRef = useRef<WebSocket | null>(null);
+  const socketRef = useRef<{ sessionId: string; socket: WebSocket } | null>(null);
 
   const closeSocket = useCallback(() => {
-    socketRef.current?.close();
+    socketRef.current?.socket.close();
     socketRef.current = null;
   }, []);
 
@@ -43,8 +43,15 @@ export function DataPilotWindow() {
 
   const openEvents = useCallback(
     (sessionId: string) => {
+      if (socketRef.current?.sessionId === sessionId && isActiveSocket(socketRef.current.socket)) {
+        return;
+      }
+
       closeSocket();
-      socketRef.current = openSessionEvents(sessionId, (event) => datapilotStore.getState().applyEvent(event));
+      socketRef.current = {
+        sessionId,
+        socket: openSessionEvents(sessionId, (event) => datapilotStore.getState().applyEvent(event)),
+      };
     },
     [closeSocket],
   );
@@ -62,19 +69,26 @@ export function DataPilotWindow() {
   };
 
   const handleSelectHistory = async (session: SessionRecord) => {
-    const detail = await getSession(session.id);
     closeSocket();
+    const detail = await getSession(session.id);
     datapilotStore.getState().restoreHistory(detail, detail.messages);
     setHistoryOpen(false);
   };
 
   const handleDraftSubmit = async (message: string) => {
-    const session = await createSession(message);
-    const store = datapilotStore.getState();
-    store.setActiveSession(session);
-    store.appendUserMessage(localUserMessage(session.id, message));
-    openEvents(session.id);
-    await submitTurn(session.id, message);
+    try {
+      const session = await createSession(message);
+      const store = datapilotStore.getState();
+      store.setActiveSession(session);
+      const userMessage = localUserMessage(session.id, message);
+      openEvents(session.id);
+      await submitTurn(session.id, message);
+      datapilotStore.getState().appendUserMessage(userMessage);
+    } catch (error) {
+      closeSocket();
+      datapilotStore.getState().enterDraft();
+      console.error("Failed to submit DataPilot draft turn", error);
+    }
   };
 
   const handleActiveSubmit = async (message: string) => {
@@ -82,8 +96,14 @@ export function DataPilotWindow() {
       return;
     }
 
-    datapilotStore.getState().appendUserMessage(localUserMessage(currentSessionId, message));
-    await submitTurn(currentSessionId, message);
+    try {
+      const userMessage = localUserMessage(currentSessionId, message);
+      openEvents(currentSessionId);
+      await submitTurn(currentSessionId, message);
+      datapilotStore.getState().appendUserMessage(userMessage);
+    } catch (error) {
+      console.error("Failed to submit DataPilot active turn", error);
+    }
   };
 
   const handleInterrupt = async () => {
@@ -147,4 +167,8 @@ function createLocalId(): string {
   return typeof crypto !== "undefined" && "randomUUID" in crypto
     ? crypto.randomUUID()
     : `local-${Date.now()}-${Math.random().toString(16).slice(2)}`;
+}
+
+function isActiveSocket(socket: WebSocket): boolean {
+  return socket.readyState === WebSocket.CONNECTING || socket.readyState === WebSocket.OPEN;
 }

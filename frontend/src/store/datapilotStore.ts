@@ -4,6 +4,12 @@ import type { AgentEvent, ChatMessageRecord, SessionDetail, SessionRecord } from
 import { applyAgentEvent, createEmptyRunState, type RunState } from "./eventReducer";
 
 export type SessionMode = "draft_new_session" | "active_session" | "history_session";
+type OrderedTimelineItem = RunState["timeline"][number] & {
+  createdAt?: string;
+  sequence?: number;
+};
+
+let timelineSequence = 0;
 
 export interface DataPilotStoreState {
   open: boolean;
@@ -74,7 +80,15 @@ export function createDataPilotStore() {
     applyEvent: (event) =>
       set((state) => {
         const run = cloneRunState(state.run);
+        const timelineLength = run.timeline.length;
         applyAgentEvent(run, event);
+        const createdAt = event.timestamp || new Date().toISOString();
+        for (let index = timelineLength; index < run.timeline.length; index += 1) {
+          const item = run.timeline[index] as OrderedTimelineItem;
+          item.createdAt = createdAt;
+          item.sequence = timelineSequence;
+          timelineSequence += 1;
+        }
         return { run };
       }),
   }));
