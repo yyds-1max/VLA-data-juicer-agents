@@ -1,0 +1,2414 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>VLA DataLoop — 数据闭环平台</title>
+<script src="https://cdn.tailwindcss.com"></script>
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js"></script>
+<link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;600&family=Noto+Sans+SC:wght@300;400;500;600;700;900&display=swap" rel="stylesheet">
+<link href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.5.0/css/all.min.css" rel="stylesheet">
+<script>
+tailwind.config = {
+  theme: {
+    extend: {
+      colors: {
+        bg: '#060b14',
+        surface: '#0c1220',
+        card: '#111a2e',
+        border: '#1a2744',
+        accent: '#00e59b',
+        accent2: '#00c4ff',
+        warn: '#ffb020',
+        danger: '#ff4757',
+        muted: '#5a6d8a',
+        fg: '#e0e7f1',
+        fgdim: '#8a9bb8',
+      },
+      fontFamily: {
+        sans: ['Noto Sans SC', 'sans-serif'],
+        mono: ['JetBrains Mono', 'monospace'],
+      }
+    }
+  }
+}
+</script>
+<style>
+  :root {
+    --accent: #00e59b;
+    --accent2: #00c4ff;
+    --bg: #060b14;
+    --surface: #0c1220;
+    --card: #111a2e;
+    --border: #1a2744;
+  }
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body { background: var(--bg); color: #e0e7f1; font-family: 'Noto Sans SC', sans-serif; overflow: hidden; height: 100vh; }
+  ::-webkit-scrollbar { width: 5px; }
+  ::-webkit-scrollbar-track { background: transparent; }
+  ::-webkit-scrollbar-thumb { background: #1a2744; border-radius: 10px; }
+  ::-webkit-scrollbar-thumb:hover { background: #2a3d5e; }
+
+  .sidebar-item { transition: all 0.2s ease; position: relative; }
+  .sidebar-item::before {
+    content: ''; position: absolute; left: 0; top: 50%; transform: translateY(-50%);
+    width: 3px; height: 0; background: var(--accent); border-radius: 0 4px 4px 0; transition: height 0.25s ease;
+  }
+  .sidebar-item:hover { background: rgba(0,229,155,0.05); }
+  .sidebar-item.active { background: rgba(0,229,155,0.08); color: var(--accent); }
+  .sidebar-item.active::before { height: 60%; }
+
+  .page { display: none; height: 100%; overflow-y: auto; padding: 24px; }
+  .page.active { display: block; }
+
+  .stat-card {
+    background: linear-gradient(135deg, rgba(17,26,46,0.9), rgba(12,18,32,0.95));
+    border: 1px solid var(--border); border-radius: 12px; padding: 20px;
+    transition: all 0.3s ease; position: relative; overflow: hidden;
+  }
+  .stat-card::after {
+    content: ''; position: absolute; top: 0; right: 0; width: 80px; height: 80px;
+    background: radial-gradient(circle, rgba(0,229,155,0.06) 0%, transparent 70%);
+    pointer-events: none;
+  }
+  .stat-card:hover { border-color: rgba(0,229,155,0.3); transform: translateY(-2px); }
+
+  .glow-dot { width: 8px; height: 8px; border-radius: 50%; animation: pulse-glow 2s ease-in-out infinite; }
+  @keyframes pulse-glow {
+    0%, 100% { box-shadow: 0 0 4px currentColor; opacity: 1; }
+    50% { box-shadow: 0 0 12px currentColor; opacity: 0.7; }
+  }
+
+  .pipeline-node {
+    background: var(--card); border: 1px solid var(--border); border-radius: 10px;
+    padding: 16px; transition: all 0.3s ease; cursor: pointer; position: relative;
+  }
+  .pipeline-node:hover { border-color: var(--accent); box-shadow: 0 0 20px rgba(0,229,155,0.1); }
+  .pipeline-node.running { border-color: var(--accent2); }
+  .pipeline-node.running::after {
+    content: ''; position: absolute; inset: -1px; border-radius: 10px;
+    border: 1px solid var(--accent2); animation: border-flow 1.5s linear infinite;
+    clip-path: inset(0 0 0 0);
+  }
+  @keyframes border-flow {
+    0% { clip-path: inset(0 100% 0 0); }
+    100% { clip-path: inset(0 0 0 0); }
+  }
+
+  .data-thumb {
+    border-radius: 8px; overflow: hidden; position: relative; cursor: pointer;
+    transition: all 0.3s ease; border: 2px solid transparent;
+  }
+  .data-thumb:hover { border-color: var(--accent); transform: scale(1.03); }
+  .data-thumb img { width: 100%; height: 120px; object-fit: cover; display: block; }
+
+  .tag { font-size: 11px; padding: 2px 8px; border-radius: 20px; font-weight: 500; }
+
+  .btn-primary {
+    background: linear-gradient(135deg, #00e59b, #00c4ff);
+    color: #060b14; font-weight: 600; padding: 8px 20px; border-radius: 8px; border: none;
+    cursor: pointer; transition: all 0.2s ease; font-size: 13px;
+  }
+  .btn-primary:hover { box-shadow: 0 4px 20px rgba(0,229,155,0.3); transform: translateY(-1px); }
+
+  .btn-ghost {
+    background: transparent; color: #8a9bb8; border: 1px solid var(--border);
+    padding: 8px 16px; border-radius: 8px; cursor: pointer; transition: all 0.2s ease; font-size: 13px;
+  }
+  .btn-ghost:hover { border-color: var(--accent); color: var(--accent); }
+
+  .toast {
+    position: fixed; bottom: 24px; right: 24px; padding: 14px 24px;
+    border-radius: 10px; font-size: 13px; font-weight: 500; z-index: 9999;
+    transform: translateY(100px); opacity: 0; transition: all 0.4s cubic-bezier(0.16,1,0.3,1);
+    background: var(--card); border: 1px solid var(--border); color: var(--fg);
+    box-shadow: 0 8px 32px rgba(0,0,0,0.4);
+  }
+  .toast.show { transform: translateY(0); opacity: 1; }
+
+  .modal-overlay {
+    position: fixed; inset: 0; background: rgba(6,11,20,0.85); z-index: 1000;
+    display: none; align-items: center; justify-content: center;
+    backdrop-filter: blur(4px);
+  }
+  .modal-overlay.show { display: flex; }
+  .modal-content {
+    background: var(--card); border: 1px solid var(--border); border-radius: 16px;
+    padding: 28px; max-width: 560px; width: 90%; max-height: 80vh; overflow-y: auto;
+    animation: modal-in 0.3s ease;
+  }
+  @keyframes modal-in {
+    from { transform: scale(0.95); opacity: 0; }
+    to { transform: scale(1); opacity: 1; }
+  }
+
+  .progress-bar {
+    height: 6px; border-radius: 3px; background: rgba(26,39,68,0.8); overflow: hidden;
+  }
+  .progress-fill {
+    height: 100%; border-radius: 3px; transition: width 0.8s cubic-bezier(0.16,1,0.3,1);
+  }
+
+  .tab-btn {
+    padding: 8px 18px; border-radius: 8px; font-size: 13px; cursor: pointer;
+    transition: all 0.2s; background: transparent; border: 1px solid transparent; color: #8a9bb8;
+  }
+  .tab-btn:hover { color: #e0e7f1; }
+  .tab-btn.active { background: rgba(0,229,155,0.1); border-color: rgba(0,229,155,0.3); color: var(--accent); }
+
+  .loop-canvas { position: absolute; top: 0; left: 0; pointer-events: none; }
+
+  /* 背景粒子 */
+  #bg-particles { position: fixed; inset: 0; z-index: 0; pointer-events: none; }
+
+  .version-line { position: relative; padding-left: 32px; }
+  .version-line::before {
+    content: ''; position: absolute; left: 11px; top: 24px; bottom: 0;
+    width: 2px; background: var(--border);
+  }
+  .version-line:last-child::before { display: none; }
+  .version-dot {
+    position: absolute; left: 4px; top: 6px; width: 18px; height: 18px;
+    border-radius: 50%; border: 2px solid var(--border); background: var(--surface);
+  }
+  .version-dot.active { border-color: var(--accent); background: rgba(0,229,155,0.2); }
+  .version-dot.deployed { border-color: var(--accent2); background: rgba(0,196,255,0.2); }
+
+  .agent-node {
+    background: var(--card); border: 1px solid var(--border); border-radius: 10px;
+    padding: 12px 16px; cursor: grab; transition: all 0.2s; user-select: none;
+    min-width: 140px; text-align: center;
+  }
+  .agent-node:hover { border-color: var(--accent); }
+  .agent-node.selected { border-color: var(--accent); box-shadow: 0 0 16px rgba(0,229,155,0.15); }
+
+  @keyframes float {
+    0%, 100% { transform: translateY(0); }
+    50% { transform: translateY(-6px); }
+  }
+
+  .quality-ring {
+    width: 100px; height: 100px; position: relative;
+  }
+  .quality-ring svg { transform: rotate(-90deg); }
+</style>
+</head>
+<body class="flex">
+
+<!-- 背景粒子 -->
+<canvas id="bg-particles"></canvas>
+
+<!-- 侧边栏 -->
+<aside class="w-[220px] h-screen bg-surface border-r border-border flex flex-col relative z-10 shrink-0">
+  <div class="p-5 border-b border-border">
+    <div class="flex items-center gap-2.5">
+      <div class="w-8 h-8 rounded-lg bg-gradient-to-br from-accent to-accent2 flex items-center justify-center">
+        <i class="fas fa-rotate text-bg text-sm"></i>
+      </div>
+      <div>
+        <div class="text-sm font-bold tracking-wide text-fg">智瀚星途 DataLoop</div>
+        <div class="text-[13px] text-muted font-mono tracking-wider"> Voyager Forge</div>
+      </div>
+    </div>
+  </div>
+
+  <nav class="flex-1 py-3 px-2 space-y-0.5">
+    <div class="px-3 py-1.5 text-[10px] text-muted uppercase tracking-widest font-mono">概览</div>
+    <button class="sidebar-item active w-full text-left px-4 py-2.5 rounded-lg text-sm flex items-center gap-3" data-page="dashboard">
+      <i class="fas fa-chart-line w-4 text-center"></i> 闭环仪表盘
+    </button>
+       <div class="px-3 py-1.5 mt-3 text-[10px] text-muted uppercase tracking-widest font-mono">流程</div>
+    <button class="sidebar-item w-full text-left px-4 py-2.5 rounded-lg text-sm flex items-center gap-3" data-page="agent">
+      <i class="fas fa-project-diagram w-4 text-center"></i> Agent 工作流
+    </button>
+
+    <div class="px-3 py-1.5 mt-3 text-[10px] text-muted uppercase tracking-widest font-mono">数据</div>
+    <button class="sidebar-item w-full text-left px-4 py-2.5 rounded-lg text-sm flex items-center gap-3" data-page="data">
+      <i class="fas fa-database w-4 text-center"></i> 数据管理
+    </button>
+
+    <div class="px-3 py-1.5 mt-3 text-[10px] text-muted uppercase tracking-widest font-mono">标注</div>
+    <button class="sidebar-item w-full text-left px-4 py-2.5 rounded-lg text-sm flex items-center gap-3" data-page="annotate">
+      <i class="fas fa-tags w-4 text-center"></i> 自动标注
+    </button>
+
+    <div class="px-3 py-1.5 mt-3 text-[10px] text-muted uppercase tracking-widest font-mono">模型</div>
+    <button class="sidebar-item w-full text-left px-4 py-2.5 rounded-lg text-sm flex items-center gap-3" data-page="model">
+      <i class="fas fa-brain w-4 text-center"></i> 模型迭代
+    </button>
+        <div class="px-3 py-1.5 mt-3 text-[10px] text-muted uppercase tracking-widest font-mono">验证</div>
+    <button class="sidebar-item w-full text-left px-4 py-2.5 rounded-lg text-sm flex items-center gap-3" data-page="simulation">
+      <i class="fas fa-vial w-4 text-center"></i> 测试/仿真
+    </button>
+  </nav>
+
+  <div class="p-4 border-t border-border">
+    <div class="flex items-center gap-3">
+      <div class="w-8 h-8 rounded-full bg-card border border-border flex items-center justify-center text-xs font-mono text-accent">FY</div>
+      <div class="flex-1 min-w-0">
+        <div class="text-xs font-medium text-fg truncate">数据飞轮</div>
+        <div class="text-[10px] text-muted">Pro 版本</div>
+      </div>
+      <i class="fas fa-ellipsis text-muted text-xs cursor-pointer hover:text-fg transition-colors"></i>
+    </div>
+  </div>
+</aside>
+
+<!-- 主内容区 -->
+<main class="flex-1 h-screen flex flex-col relative z-10 overflow-hidden">
+  <!-- 顶部栏 -->
+  <header class="h-14 bg-surface/80 backdrop-blur-md border-b border-border flex items-center justify-between px-6 shrink-0">
+    <div class="flex items-center gap-3">
+      <h2 id="page-title" class="text-sm font-semibold text-fg">闭环仪表盘</h2>
+      <span class="text-[10px] font-mono text-muted bg-card px-2 py-0.5 rounded border border-border">v2.4.1</span>
+    </div>
+    <div class="flex items-center gap-4">
+      <div class="relative">
+        <input type="text" placeholder="搜索数据、模型、任务..." class="bg-card border border-border rounded-lg px-3 py-1.5 text-xs text-fg placeholder:text-muted w-64 focus:outline-none focus:border-accent/50 transition-colors">
+        <i class="fas fa-search absolute right-3 top-1/2 -translate-y-1/2 text-muted text-xs"></i>
+      </div>
+      <button class="relative p-2 text-muted hover:text-fg transition-colors">
+        <i class="fas fa-bell text-sm"></i>
+        <span class="absolute top-1 right-1 w-2 h-2 bg-danger rounded-full"></span>
+      </button>
+      <div class="flex items-center gap-1.5 text-xs text-muted">
+        <div class="glow-dot bg-accent text-accent"></div>
+        <span>系统运行中</span>
+      </div>
+    </div>
+  </header>
+
+  <!-- ==================== Dashboard 页面 ==================== -->
+  <div id="page-dashboard" class="page active">
+    <!-- 统计卡片 -->
+    <div class="grid grid-cols-4 gap-4 mb-6">
+      <div class="stat-card">
+        <div class="flex items-center justify-between mb-3">
+          <span class="text-xs text-muted">总数据量</span>
+          <div class="w-8 h-8 rounded-lg bg-accent/10 flex items-center justify-center"><i class="fas fa-cube text-accent text-xs"></i></div>
+        </div>
+        <div class="text-2xl font-bold text-fg font-mono">284,729</div>
+        <div class="flex items-center gap-1 mt-2 text-xs"><span class="text-accent"><i class="fas fa-arrow-up"></i> 12.4%</span><span class="text-muted">较上周</span></div>
+      </div>
+      <div class="stat-card">
+        <div class="flex items-center justify-between mb-3">
+          <span class="text-xs text-muted">已标注数据</span>
+          <div class="w-8 h-8 rounded-lg bg-accent2/10 flex items-center justify-center"><i class="fas fa-check-double text-accent2 text-xs"></i></div>
+        </div>
+        <div class="text-2xl font-bold text-fg font-mono">196,842</div>
+        <div class="flex items-center gap-1 mt-2 text-xs"><span class="text-accent2"><i class="fas fa-arrow-up"></i> 8.7%</span><span class="text-muted">较上周</span></div>
+      </div>
+      <div class="stat-card">
+        <div class="flex items-center justify-between mb-3">
+          <span class="text-xs text-muted">待解锁批次</span>
+          <div class="w-8 h-8 rounded-lg bg-warn/10 flex items-center justify-center"><i class="fas fa-lock text-warn text-xs"></i></div>
+        </div>
+        <div class="text-2xl font-bold text-fg font-mono">23</div>
+        <div class="flex items-center gap-1 mt-2 text-xs"><span class="text-warn"><i class="fas fa-clock"></i> 7 批次待审核</span></div>
+      </div>
+      <div class="stat-card">
+        <div class="flex items-center justify-between mb-3">
+          <span class="text-xs text-muted">模型版本</span>
+          <div class="w-8 h-8 rounded-lg bg-purple-500/10 flex items-center justify-center"><i class="fas fa-code-branch text-purple-400 text-xs"></i></div>
+        </div>
+        <div class="text-2xl font-bold text-fg font-mono">v47</div>
+        <div class="flex items-center gap-1 mt-2 text-xs"><span class="text-purple-400">Success Rate 94.2%</span></div>
+      </div>
+    </div>
+
+    <div class="grid grid-cols-3 gap-4 mb-6">
+      <!-- 数据分布 -->
+      <div class="stat-card col-span-1" style="height: 280px; overflow: hidden;">
+        <div class="text-xs font-semibold text-fg mb-4">数据类型分布</div>
+        <div style="height: 220px; position: relative;">
+          <canvas id="chart-data-dist"></canvas>
+        </div>
+      </div>
+      <!-- 闭环流程图 -->
+      <div class="stat-card col-span-2 relative" style="min-height:260px;">
+        <div class="text-xs font-semibold text-fg mb-2">数据闭环流程</div>
+        <canvas id="loop-canvas" class="loop-canvas" width="600" height="220"></canvas>
+        <div class="relative z-10 flex items-center justify-around h-[200px]">
+          <div class="text-center">
+            <div class="w-14 h-14 rounded-xl bg-accent/10 border border-accent/30 flex items-center justify-center mx-auto mb-2" style="animation: float 3s ease-in-out infinite;">
+              <i class="fas fa-robot text-accent"></i>
+            </div>
+            <div class="text-xs font-medium text-fg">数据采集</div>
+            <div class="text-[10px] text-accent font-mono mt-1">3,240/h</div>
+          </div>
+          <div class="text-center">
+            <div class="w-14 h-14 rounded-xl bg-accent2/10 border border-accent2/30 flex items-center justify-center mx-auto mb-2" style="animation: float 3s ease-in-out infinite 0.5s;">
+              <i class="fas fa-tags text-accent2"></i>
+            </div>
+            <div class="text-xs font-medium text-fg">自动标注</div>
+            <div class="text-[10px] text-accent2 font-mono mt-1">92.3% 准确率</div>
+          </div>
+          <div class="text-center">
+            <div class="w-14 h-14 rounded-xl bg-warn/10 border border-warn/30 flex items-center justify-center mx-auto mb-2" style="animation: float 3s ease-in-out infinite 1s;">
+              <i class="fas fa-filter text-warn"></i>
+            </div>
+            <div class="text-xs font-medium text-fg">质量过滤</div>
+            <div class="text-[10px] text-warn font-mono mt-1">阈值 0.85</div>
+          </div>
+          <div class="text-center">
+            <div class="w-14 h-14 rounded-xl bg-purple-500/10 border border-purple-500/30 flex items-center justify-center mx-auto mb-2" style="animation: float 3s ease-in-out infinite 1.5s;">
+              <i class="fas fa-brain text-purple-400"></i>
+            </div>
+            <div class="text-xs font-medium text-fg">模型训练</div>
+            <div class="text-[10px] text-purple-400 font-mono mt-1">v47 迭代中</div>
+          </div>
+          <div class="text-center">
+            <div class="w-14 h-14 rounded-xl bg-danger/10 border border-danger/30 flex items-center justify-center mx-auto mb-2" style="animation: float 3s ease-in-out infinite 2s;">
+              <i class="fas fa-deploydog text-danger"></i>
+            </div>
+            <div class="text-xs font-medium text-fg">部署验证</div>
+            <div class="text-[10px] text-danger font-mono mt-1">A/B 测试中</div>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <div class="grid grid-cols-3 gap-4">
+      <!-- 模型迭代曲线 -->
+      <div class="stat-card col-span-2" style="height: 280px; overflow: hidden;">
+        <div class="flex items-center justify-between mb-4">
+          <div class="text-xs font-semibold text-fg">模型迭代性能曲线</div>
+          <div class="flex gap-1">
+            <button class="tab-btn active text-xs" onclick="switchMetricChart(this,'success')">成功率</button>
+            <button class="tab-btn text-xs" onclick="switchMetricChart(this,'loss')">损失值</button>
+          </div>
+        </div>
+        <div style="height: 220px; position: relative;">
+          <canvas id="chart-model-curve"></canvas>
+        </div>
+      </div>
+      <!-- 最近活动 -->
+      <div class="stat-card" style="height: 280px; overflow: hidden;">
+        <div class="text-xs font-semibold text-fg mb-4">最近活动</div>
+        <div class="space-y-3 overflow-y-auto" style="max-height: 230px;" id="activity-feed">
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- ==================== 数据管理页面 ==================== -->
+  <div id="page-data" class="page">
+    <div class="flex items-center justify-between mb-5">
+      <div class="flex gap-1">
+        <button class="tab-btn active" onclick="switchDataTab(this,'image')">
+          <i class="fas fa-image mr-1.5"></i>图像数据
+        </button>
+        <button class="tab-btn" onclick="switchDataTab(this,'pointcloud')">
+          <i class="fas fa-cube mr-1.5"></i>点云数据
+        </button>
+        <button class="tab-btn" onclick="switchDataTab(this,'text')">
+          <i class="fas fa-align-left mr-1.5"></i>文本数据
+        </button>
+        <button class="tab-btn" onclick="switchDataTab(this,'unlock')">
+          <i class="fas fa-lock-open mr-1.5"></i>数据解锁
+        </button>
+      </div>
+      <div class="flex gap-2">
+        <button class="btn-ghost" onclick="showToast('数据导出任务已创建','accent2')"><i class="fas fa-download mr-1.5"></i>导出</button>
+        <button class="btn-primary" onclick="openUploadModal()"><i class="fas fa-upload mr-1.5"></i>上传数据</button>
+      </div>
+    </div>
+
+    <!-- 筛选栏 -->
+    <div class="flex items-center gap-3 mb-5" id="data-filter-bar">
+      <select class="bg-card border border-border rounded-lg px-3 py-2 text-xs text-fg focus:outline-none focus:border-accent/50">
+        <option>全部场景</option><option>室内导航</option><option>桌面操作</option><option>仓储物流</option>
+      </select>
+      <select class="bg-card border border-border rounded-lg px-3 py-2 text-xs text-fg focus:outline-none focus:border-accent/50">
+        <option>全部状态</option><option>已标注</option><option>待标注</option><option>已拒绝</option>
+      </select>
+      <input type="text" placeholder="按 ID 或内容搜索..." class="bg-card border border-border rounded-lg px-3 py-2 text-xs text-fg placeholder:text-muted flex-1 max-w-xs focus:outline-none focus:border-accent/50">
+      <span class="text-xs text-muted font-mono">共 128,456 条</span>
+    </div>
+
+    <!-- 图像数据视图 -->
+    <div id="data-view-image" class="data-view">
+      <div class="grid grid-cols-5 gap-3" id="image-grid">
+      </div>
+    </div>
+
+    <!-- 点云数据视图 -->
+    <div id="data-view-pointcloud" class="data-view" style="display:none;">
+      <div class="grid grid-cols-3 gap-4" id="pointcloud-grid">
+      </div>
+    </div>
+
+    <!-- 文本数据视图 -->
+    <div id="data-view-text" class="data-view" style="display:none;">
+      <div class="space-y-2" id="text-list">
+      </div>
+    </div>
+
+    <!-- 数据解锁视图 -->
+    <div id="data-view-unlock" class="data-view" style="display:none;">
+      <div class="flex items-center justify-between mb-4">
+        <div class="text-sm text-fgdim">管理数据解锁策略，确保高质量数据流入训练管线</div>
+        <button class="btn-primary" onclick="batchUnlock()"><i class="fas fa-unlock mr-1.5"></i>批量解锁选中批次</button>
+      </div>
+
+      <!-- 质量统计卡片 -->
+      <div class="grid grid-cols-4 gap-4 mb-6">
+        <div class="stat-card text-center">
+          <div class="quality-ring mx-auto mb-3">
+            <svg width="100" height="100" viewBox="0 0 100 100">
+              <circle cx="50" cy="50" r="42" fill="none" stroke="#1a2744" stroke-width="6"/>
+              <circle cx="50" cy="50" r="42" fill="none" stroke="#00e59b" stroke-width="6"
+                stroke-dasharray="264" stroke-dashoffset="34" stroke-linecap="round"/>
+            </svg>
+            <div class="absolute inset-0 flex items-center justify-center text-lg font-bold font-mono text-accent">87%</div>
+          </div>
+          <div class="text-xs text-muted">整体质量分</div>
+        </div>
+        <div class="stat-card">
+          <div class="text-xs text-muted mb-2">已解锁</div>
+          <div class="text-xl font-bold font-mono text-accent">18</div>
+          <div class="progress-bar mt-2"><div class="progress-fill bg-accent" style="width:78%"></div></div>
+          <div class="text-[10px] text-muted mt-1">78% 批次已解锁</div>
+        </div>
+        <div class="stat-card">
+          <div class="text-xs text-muted mb-2">待审核</div>
+          <div class="text-xl font-bold font-mono text-warn">7</div>
+          <div class="progress-bar mt-2"><div class="progress-fill bg-warn" style="width:30%"></div></div>
+          <div class="text-[10px] text-muted mt-1">30% 等待人工审核</div>
+        </div>
+        <div class="stat-card">
+          <div class="text-xs text-muted mb-2">已拒绝</div>
+          <div class="text-xl font-bold font-mono text-danger">3</div>
+          <div class="progress-bar mt-2"><div class="progress-fill bg-danger" style="width:13%"></div></div>
+          <div class="text-[10px] text-muted mt-1">13% 不满足质量要求</div>
+        </div>
+      </div>
+
+      <!-- 解锁规则 -->
+      <div class="stat-card mb-6">
+        <div class="flex items-center justify-between mb-4">
+          <div class="text-xs font-semibold text-fg">解锁规则配置</div>
+          <button class="btn-ghost text-xs" onclick="showToast('规则已保存','accent')"><i class="fas fa-save mr-1"></i>保存规则</button>
+        </div>
+        <div class="grid grid-cols-2 gap-4">
+          <div>
+            <label class="text-xs text-muted block mb-1.5">最低标注置信度</label>
+            <div class="flex items-center gap-3">
+              <input type="range" id="conf-threshold" min="0" max="100" value="85" class="flex-1 accent-accent" oninput="document.getElementById('conf-val').textContent=this.value+'%'">
+              <span id="conf-val" class="text-sm font-mono text-accent w-12 text-right">85%</span>
+            </div>
+          </div>
+          <div>
+            <label class="text-xs text-muted block mb-1.5">最小批次数据量</label>
+            <div class="flex items-center gap-3">
+              <input type="range" id="batch-min" min="10" max="500" value="100" class="flex-1 accent-accent" oninput="document.getElementById('batch-val').textContent=this.value">
+              <span id="batch-val" class="text-sm font-mono text-accent w-12 text-right">100</span>
+            </div>
+          </div>
+          <div>
+            <label class="text-xs text-muted block mb-1.5">图像质量阈值 (CLIP Score)</label>
+            <div class="flex items-center gap-3">
+              <input type="range" id="clip-threshold" min="0" max="100" value="78" class="flex-1 accent-accent" oninput="document.getElementById('clip-val').textContent=(this.value/100).toFixed(2)">
+              <span id="clip-val" class="text-sm font-mono text-accent w-12 text-right">0.78</span>
+            </div>
+          </div>
+          <div>
+            <label class="text-xs text-muted block mb-1.5">点云密度要求</label>
+            <div class="flex items-center gap-3">
+              <input type="range" id="pc-density" min="100" max="5000" value="1024" step="128" class="flex-1 accent-accent" oninput="document.getElementById('pc-val').textContent=this.value">
+              <span id="pc-val" class="text-sm font-mono text-accent w-12 text-right">1024</span>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <!-- 批次列表 -->
+      <div class="stat-card">
+        <div class="text-xs font-semibold text-fg mb-4">批次管理</div>
+        <div class="overflow-x-auto">
+          <table class="w-full text-xs">
+            <thead>
+              <tr class="text-muted border-b border-border">
+                <th class="text-left py-2.5 px-3"><input type="checkbox" class="accent-accent" onchange="toggleAllBatch(this)"></th>
+                <th class="text-left py-2.5">批次 ID</th>
+                <th class="text-left py-2.5">数据类型</th>
+                <th class="text-left py-2.5">数据量</th>
+                <th class="text-left py-2.5">质量分</th>
+                <th class="text-left py-2.5">场景</th>
+                <th class="text-left py-2.5">状态</th>
+                <th class="text-left py-2.5">操作</th>
+              </tr>
+            </thead>
+            <tbody id="batch-table">
+            </tbody>
+          </table>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- ==================== 数据解锁页面 ==================== -->
+  <div id="page-unlock" class="page">
+    <div class="flex items-center justify-between mb-5">
+      <div class="text-sm text-fgdim">管理数据测试/验证策略，确保高质量数据流入训练管线</div>
+      <button class="btn-primary" onclick="batchUnlock()"><i class="fas fa-unlock mr-1.5"></i>批量解锁选中批次</button>
+    </div>
+
+    <!-- 标注结果视图 -->
+    <div class="grid grid-cols-4 gap-4 mb-6">
+      <div class="stat-card text-center">
+        <div class="quality-ring mx-auto mb-3">
+          <svg width="100" height="100" viewBox="0 0 100 100">
+            <circle cx="50" cy="50" r="42" fill="none" stroke="#1a2744" stroke-width="6"/>
+            <circle cx="50" cy="50" r="42" fill="none" stroke="#00e59b" stroke-width="6"
+              stroke-dasharray="264" stroke-dashoffset="34" stroke-linecap="round"/>
+          </svg>
+          <div class="absolute inset-0 flex items-center justify-center text-lg font-bold font-mono text-accent">87%</div>
+        </div>
+        <div class="text-xs text-muted">整体质量分</div>
+      </div>
+      <div class="stat-card">
+        <div class="text-xs text-muted mb-2">已解锁</div>
+        <div class="text-xl font-bold font-mono text-accent">18</div>
+        <div class="progress-bar mt-2"><div class="progress-fill bg-accent" style="width:78%"></div></div>
+        <div class="text-[10px] text-muted mt-1">78% 批次已解锁</div>
+      </div>
+      <div class="stat-card">
+        <div class="text-xs text-muted mb-2">待审核</div>
+        <div class="text-xl font-bold font-mono text-warn">7</div>
+        <div class="progress-bar mt-2"><div class="progress-fill bg-warn" style="width:30%"></div></div>
+        <div class="text-[10px] text-muted mt-1">30% 等待人工审核</div>
+      </div>
+      <div class="stat-card">
+        <div class="text-xs text-muted mb-2">已拒绝</div>
+        <div class="text-xl font-bold font-mono text-danger">3</div>
+        <div class="progress-bar mt-2"><div class="progress-fill bg-danger" style="width:13%"></div></div>
+        <div class="text-[10px] text-muted mt-1">13% 不满足质量要求</div>
+      </div>
+    </div>
+
+    <!-- 解锁规则 -->
+    <div class="stat-card mb-6">
+      <div class="flex items-center justify-between mb-4">
+        <div class="text-xs font-semibold text-fg">解锁规则配置</div>
+        <button class="btn-ghost text-xs" onclick="showToast('规则已保存','accent')"><i class="fas fa-save mr-1"></i>保存规则</button>
+      </div>
+      <div class="grid grid-cols-2 gap-4">
+        <div>
+          <label class="text-xs text-muted block mb-1.5">最低标注置信度</label>
+          <div class="flex items-center gap-3">
+            <input type="range" id="conf-threshold" min="0" max="100" value="85" class="flex-1 accent-accent" oninput="document.getElementById('conf-val').textContent=this.value+'%'">
+            <span id="conf-val" class="text-sm font-mono text-accent w-12 text-right">85%</span>
+          </div>
+        </div>
+        <div>
+          <label class="text-xs text-muted block mb-1.5">最小批次数据量</label>
+          <div class="flex items-center gap-3">
+            <input type="range" id="batch-min" min="10" max="500" value="100" class="flex-1 accent-accent" oninput="document.getElementById('batch-val').textContent=this.value">
+            <span id="batch-val" class="text-sm font-mono text-accent w-12 text-right">100</span>
+          </div>
+        </div>
+        <div>
+          <label class="text-xs text-muted block mb-1.5">图像质量阈值 (CLIP Score)</label>
+          <div class="flex items-center gap-3">
+            <input type="range" id="clip-threshold" min="0" max="100" value="78" class="flex-1 accent-accent" oninput="document.getElementById('clip-val').textContent=(this.value/100).toFixed(2)">
+            <span id="clip-val" class="text-sm font-mono text-accent w-12 text-right">0.78</span>
+          </div>
+        </div>
+        <div>
+          <label class="text-xs text-muted block mb-1.5">点云密度要求</label>
+          <div class="flex items-center gap-3">
+            <input type="range" id="pc-density" min="100" max="5000" value="1024" step="128" class="flex-1 accent-accent" oninput="document.getElementById('pc-val').textContent=this.value">
+            <span id="pc-val" class="text-sm font-mono text-accent w-12 text-right">1024</span>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <!-- 批次列表 -->
+    <div class="stat-card">
+      <div class="text-xs font-semibold text-fg mb-4">批次管理</div>
+      <div class="overflow-x-auto">
+        <table class="w-full text-xs">
+          <thead>
+            <tr class="text-muted border-b border-border">
+              <th class="text-left py-2.5 px-3"><input type="checkbox" class="accent-accent" onchange="toggleAllBatch(this)"></th>
+              <th class="text-left py-2.5">批次 ID</th>
+              <th class="text-left py-2.5">数据类型</th>
+              <th class="text-left py-2.5">数据量</th>
+              <th class="text-left py-2.5">质量分</th>
+              <th class="text-left py-2.5">场景</th>
+              <th class="text-left py-2.5">状态</th>
+              <th class="text-left py-2.5">操作</th>
+            </tr>
+          </thead>
+          <tbody id="batch-table">
+          </tbody>
+        </table>
+      </div>
+    </div>
+  </div>
+
+  <!-- ==================== 自动标注页面 ==================== -->
+  <div id="page-annotate" class="page">
+    <div class="flex items-center justify-between mb-5">
+      <div class="flex gap-1">
+        <button class="tab-btn active" onclick="switchAnnotateTab(this,'pipeline')">标注流水线</button>
+        <button class="tab-btn" onclick="switchAnnotateTab(this,'results')">标注结果</button>
+        <button class="tab-btn" onclick="switchAnnotateTab(this,'review')">人工复核</button>
+      </div>
+      <button class="btn-primary" onclick="startPipeline()"><i class="fas fa-play mr-1.5"></i>启动标注</button>
+    </div>
+
+    <!-- 流水线视图 -->
+    <div id="annotate-view-pipeline">
+      <div class="grid grid-cols-5 gap-4 mb-6">
+        <div class="pipeline-node" id="pipe-1">
+          <div class="flex items-center gap-2 mb-3">
+            <div class="w-7 h-7 rounded-lg bg-accent/15 flex items-center justify-center"><i class="fas fa-eye text-accent text-xs"></i></div>
+            <span class="text-xs font-semibold text-fg">视觉检测</span>
+          </div>
+          <div class="text-[10px] text-muted mb-2">目标检测 + 语义分割</div>
+          <div class="progress-bar"><div class="progress-fill bg-accent" style="width:100%"></div></div>
+          <div class="text-[10px] text-accent mt-1.5 font-mono">完成 100%</div>
+        </div>
+        <div class="pipeline-node running" id="pipe-2">
+          <div class="flex items-center gap-2 mb-3">
+            <div class="w-7 h-7 rounded-lg bg-accent2/15 flex items-center justify-center"><i class="fas fa-cube text-accent2 text-xs"></i></div>
+            <span class="text-xs font-semibold text-fg">点云分割</span>
+          </div>
+          <div class="text-[10px] text-muted mb-2">实例分割 + 法线估计</div>
+          <div class="progress-bar"><div class="progress-fill bg-accent2" style="width:73%"></div></div>
+          <div class="text-[10px] text-accent2 mt-1.5 font-mono">进行中 73%</div>
+        </div>
+        <div class="pipeline-node" id="pipe-3">
+          <div class="flex items-center gap-2 mb-3">
+            <div class="w-7 h-7 rounded-lg bg-warn/15 flex items-center justify-center"><i class="fas fa-font text-warn text-xs"></i></div>
+            <span class="text-xs font-semibold text-fg">文本标注</span>
+          </div>
+          <div class="text-[10px] text-muted mb-2">指令生成 + 动作分解</div>
+          <div class="progress-bar"><div class="progress-fill bg-warn" style="width:0%"></div></div>
+          <div class="text-[10px] text-muted mt-1.5 font-mono">等待中</div>
+        </div>
+        <div class="pipeline-node" id="pipe-4">
+          <div class="flex items-center gap-2 mb-3">
+            <div class="w-7 h-7 rounded-lg bg-purple-500/15 flex items-center justify-center"><i class="fas fa-link text-purple-400 text-xs"></i></div>
+            <span class="text-xs font-semibold text-fg">多模态对齐</span>
+          </div>
+          <div class="text-[10px] text-muted mb-2">图文-点云跨模态对齐</div>
+          <div class="progress-bar"><div class="progress-fill bg-purple-500" style="width:0%"></div></div>
+          <div class="text-[10px] text-muted mt-1.5 font-mono">等待中</div>
+        </div>
+        <div class="pipeline-node" id="pipe-5">
+          <div class="flex items-center gap-2 mb-3">
+            <div class="w-7 h-7 rounded-lg bg-danger/15 flex items-center justify-center"><i class="fas fa-shield-check text-danger text-xs"></i></div>
+            <span class="text-xs font-semibold text-fg">质量验证</span>
+          </div>
+          <div class="text-[10px] text-muted mb-2">一致性检查 + 异常检测</div>
+          <div class="progress-bar"><div class="progress-fill bg-danger" style="width:0%"></div></div>
+          <div class="text-[10px] text-muted mt-1.5 font-mono">等待中</div>
+        </div>
+      </div>
+
+      <div class="grid grid-cols-2 gap-4" style="height: 260px;">
+        <div class="stat-card" style="height: 260px; overflow: hidden;">
+          <div class="text-xs font-semibold text-fg mb-4">标注置信度分布</div>
+          <div style="height: 200px; position: relative;">
+            <canvas id="chart-conf-dist"></canvas>
+          </div>
+        </div>
+        <div class="stat-card" style="height: 260px; overflow: hidden;">
+          <div class="text-xs font-semibold text-fg mb-4">标注类型统计</div>
+          <div style="height: 200px; position: relative;">
+            <canvas id="chart-annot-type"></canvas>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <!-- 训练监控 -->
+    <div id="model-view-training" style="display:none;">
+      <div class="grid grid-cols-2 gap-4 mb-4" style="height: 280px;">
+        <div class="stat-card" style="height: 280px; overflow: hidden;">
+          <div class="text-xs font-semibold text-fg mb-4">训练损失曲线</div>
+          <div style="height: 220px; position: relative;">
+            <canvas id="chart-loss"></canvas>
+          </div>
+        </div>
+        <div class="stat-card" style="height: 280px; overflow: hidden;">
+          <div class="text-xs font-semibold text-fg mb-4">学习率调度</div>
+          <div style="height: 220px; position: relative;">
+            <canvas id="chart-lr"></canvas>
+          </div>
+        </div>
+      </div>
+      <div class="stat-card" style="height: 200px; overflow: hidden;">
+        <div class="text-xs font-semibold text-fg mb-4">GPU 监控 (实时)</div>
+        <div style="height: 140px; position: relative;">
+          <canvas id="chart-gpu"></canvas>
+        </div>
+      </div>
+    </div>
+
+    <!-- 标注结果视图 -->
+    <div id="annotate-view-results" style="display:none;">
+      <div class="space-y-3" id="annotation-results">
+      </div>
+    </div>
+
+    <!-- 人工复核视图 -->
+    <div id="annotate-view-review" style="display:none;">
+      <div class="grid grid-cols-2 gap-4">
+        <div class="stat-card">
+          <div class="flex items-center justify-between mb-4">
+            <div class="text-xs font-semibold text-fg">待复核样本</div>
+            <span class="tag bg-warn/15 text-warn">12 条低置信度</span>
+          </div>
+          <div class="rounded-lg overflow-hidden border border-border mb-3">
+            <img src="https://picsum.photos/seed/review1/600/300" class="w-full h-48 object-cover">
+          </div>
+          <div class="space-y-2">
+            <div class="flex items-center justify-between text-xs">
+              <span class="text-muted">检测框数</span><span class="text-fg font-mono">5</span>
+            </div>
+            <div class="flex items-center justify-between text-xs">
+              <span class="text-muted">平均置信度</span><span class="text-warn font-mono">0.67</span>
+            </div>
+            <div class="flex items-center justify-between text-xs">
+              <span class="text-muted">生成指令</span><span class="text-fg">"抓取红色杯子放到架子上"</span>
+            </div>
+          </div>
+          <div class="flex gap-2 mt-4">
+            <button class="btn-primary flex-1 text-xs" onclick="showToast('已通过复核','accent')">通过</button>
+            <button class="btn-ghost flex-1 text-xs" onclick="showToast('已退回重新标注','warn')">退回</button>
+            <button class="btn-ghost flex-1 text-xs text-danger border-danger/30 hover:border-danger hover:text-danger" onclick="showToast('已标记为异常','danger')">废弃</button>
+          </div>
+        </div>
+        <div class="stat-card">
+          <div class="text-xs font-semibold text-fg mb-4">标注详情</div>
+          <div class="space-y-2 text-xs" id="review-details">
+            <div class="bg-surface rounded-lg p-3 border border-border">
+              <div class="flex items-center justify-between mb-1">
+                <span class="text-accent font-medium">物体 1: 红色杯子</span>
+                <span class="font-mono text-muted">0.82</span>
+              </div>
+              <div class="text-muted">BBox: [124, 89, 256, 312]</div>
+              <div class="progress-bar mt-1.5"><div class="progress-fill bg-accent" style="width:82%"></div></div>
+            </div>
+            <div class="bg-surface rounded-lg p-3 border border-border">
+              <div class="flex items-center justify-between mb-1">
+                <span class="text-warn font-medium">物体 2: 木质架子</span>
+                <span class="font-mono text-muted">0.54</span>
+              </div>
+              <div class="text-muted">BBox: [300, 45, 580, 290]</div>
+              <div class="progress-bar mt-1.5"><div class="progress-fill bg-warn" style="width:54%"></div></div>
+            </div>
+            <div class="bg-surface rounded-lg p-3 border border-border">
+              <div class="flex items-center justify-between mb-1">
+                <span class="text-accent font-medium">物体 3: 桌面</span>
+                <span class="font-mono text-muted">0.91</span>
+              </div>
+              <div class="text-muted">Segmentation: 12,847 pixels</div>
+              <div class="progress-bar mt-1.5"><div class="progress-fill bg-accent" style="width:91%"></div></div>
+            </div>
+            <div class="bg-surface rounded-lg p-3 border border-border">
+              <div class="flex items-center justify-between mb-1">
+                <span class="text-danger font-medium">物体 4: 未知物体</span>
+                <span class="font-mono text-muted">0.31</span>
+              </div>
+              <div class="text-muted">BBox: [410, 180, 460, 240]</div>
+              <div class="progress-bar mt-1.5"><div class="progress-fill bg-danger" style="width:31%"></div></div>
+            </div>
+            <div class="bg-surface rounded-lg p-3 border border-border">
+              <div class="flex items-center justify-between mb-1">
+                <span class="text-warn font-medium">物体 5: 蓝色容器</span>
+                <span class="font-mono text-muted">0.61</span>
+              </div>
+              <div class="text-muted">BBox: [45, 200, 120, 310]</div>
+              <div class="progress-bar mt-1.5"><div class="progress-fill bg-warn" style="width:61%"></div></div>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- ==================== 模型迭代页面 ==================== -->
+  <div id="page-model" class="page">
+    <div class="flex items-center justify-between mb-5">
+      <div class="flex gap-1">
+        <button class="tab-btn active" onclick="switchModelTab(this,'versions')">版本时间线</button>
+        <button class="tab-btn" onclick="switchModelTab(this,'training')">训练监控</button>
+        <button class="tab-btn" onclick="switchModelTab(this,'compare')">版本对比</button>
+      </div>
+      <button class="btn-primary" onclick="showToast('新训练任务 v48 已创建','accent')"><i class="fas fa-plus mr-1.5"></i>新建训练</button>
+    </div>
+
+    <!-- 版本时间线 -->
+    <div id="model-view-versions">
+      <div class="grid grid-cols-3 gap-4">
+        <div class="col-span-2 space-y-0" id="version-timeline">
+        </div>
+        <div class="space-y-4">
+          <div class="stat-card">
+            <div class="text-xs font-semibold text-fg mb-3">当前部署</div>
+            <div class="text-2xl font-bold font-mono text-accent mb-1">v46</div>
+            <div class="text-[10px] text-muted mb-3">部署于 2026-01-15 14:32</div>
+            <div class="space-y-2 text-xs">
+              <div class="flex justify-between"><span class="text-muted">Success Rate</span><span class="text-accent font-mono">94.2%</span></div>
+              <div class="flex justify-between"><span class="text-muted">Avg Latency</span><span class="text-fg font-mono">182ms</span></div>
+              <div class="flex justify-between"><span class="text-muted">训练数据量</span><span class="text-fg font-mono">186K</span></div>
+              <div class="flex justify-between"><span class="text-muted">训练轮次</span><span class="text-fg font-mono">24 epochs</span></div>
+            </div>
+          </div>
+          <div class="stat-card">
+            <div class="text-xs font-semibold text-fg mb-3">训练资源</div>
+            <div class="space-y-2 text-xs">
+              <div>
+                <div class="flex justify-between mb-1"><span class="text-muted">GPU 利用率</span><span class="text-accent font-mono">87%</span></div>
+                <div class="progress-bar"><div class="progress-fill bg-accent" style="width:87%"></div></div>
+              </div>
+              <div>
+                <div class="flex justify-between mb-1"><span class="text-muted">显存占用</span><span class="text-warn font-mono">68.4 GB</span></div>
+                <div class="progress-bar"><div class="progress-fill bg-warn" style="width:71%"></div></div>
+              </div>
+              <div>
+                <div class="flex justify-between mb-1"><span class="text-muted">训练进度</span><span class="text-accent2 font-mono">Epoch 18/24</span></div>
+                <div class="progress-bar"><div class="progress-fill bg-accent2" style="width:75%"></div></div>
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <!-- 训练监控 -->
+    <div id="model-view-training" style="display:none;">
+      <div class="grid grid-cols-2 gap-4 mb-4">
+        <div class="stat-card">
+          <div class="text-xs font-semibold text-fg mb-4">训练损失曲线</div>
+          <canvas id="chart-loss" height="200"></canvas>
+        </div>
+        <div class="stat-card">
+          <div class="text-xs font-semibold text-fg mb-4">学习率调度</div>
+          <canvas id="chart-lr" height="200"></canvas>
+        </div>
+      </div>
+      <div class="stat-card">
+        <div class="text-xs font-semibold text-fg mb-4">GPU 监控 (实时)</div>
+        <canvas id="chart-gpu" height="120"></canvas>
+      </div>
+    </div>
+
+    <!-- 版本对比 -->
+    <div id="model-view-compare" style="display:none;">
+      <div class="stat-card" style="height: 340px; overflow: hidden;">
+        <div class="text-xs font-semibold text-fg mb-4">版本性能对比</div>
+        <div style="height: 280px; position: relative;">
+          <canvas id="chart-compare"></canvas>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- ==================== Agent 工作流页面 ==================== -->
+  <div id="page-agent" class="page">
+    <div class="flex items-center justify-between mb-5">
+      <div class="text-sm text-fgdim">可视化编排 VLA Agent 工作流，连接数据处理、标注、训练全流程</div>
+      <div class="flex gap-2">
+        <button class="btn-ghost" onclick="showToast('流程已保存','accent')"><i class="fas fa-save mr-1.5"></i>保存流程</button>
+        <button class="btn-primary" onclick="runAgentFlow()"><i class="fas fa-play mr-1.5"></i>执行流程</button>
+      </div>
+    </div>
+    <div class="grid grid-cols-4 gap-4">
+      <!-- 节点面板 -->
+      <div class="stat-card">
+        <div class="text-xs font-semibold text-fg mb-3">节点库</div>
+        <div class="space-y-2">
+          <div class="agent-node" draggable="true" ondragstart="dragNode(event,'data-source')" style="text-align:left;">
+            <div class="flex items-center gap-2"><i class="fas fa-database text-accent text-xs"></i><span class="text-xs">数据源</span></div>
+          </div>
+          <div class="agent-node" draggable="true" ondragstart="dragNode(event,'preprocess')" style="text-align:left;">
+            <div class="flex items-center gap-2"><i class="fas fa-cogs text-accent2 text-xs"></i><span class="text-xs">数据预处理</span></div>
+          </div>
+          <div class="agent-node" draggable="true" ondragstart="dragNode(event,'annotator')" style="text-align:left;">
+            <div class="flex items-center gap-2"><i class="fas fa-tags text-warn text-xs"></i><span class="text-xs">自动标注器</span></div>
+          </div>
+          <div class="agent-node" draggable="true" ondragstart="dragNode(event,'quality')" style="text-align:left;">
+            <div class="flex items-center gap-2"><i class="fas fa-shield-check text-danger text-xs"></i><span class="text-xs">质量检查</span></div>
+          </div>
+          <div class="agent-node" draggable="true" ondragstart="dragNode(event,'trainer')" style="text-align:left;">
+            <div class="flex items-center gap-2"><i class="fas fa-brain text-purple-400 text-xs"></i><span class="text-xs">模型训练</span></div>
+          </div>
+          <div class="agent-node" draggable="true" ondragstart="dragNode(event,'evaluator')" style="text-align:left;">
+            <div class="flex items-center gap-2"><i class="fas fa-chart-bar text-accent text-xs"></i><span class="text-xs">效果评估</span></div>
+          </div>
+          <div class="agent-node" draggable="true" ondragstart="dragNode(event,'deployer')" style="text-align:left;">
+            <div class="flex items-center gap-2"><i class="fas fa-rocket text-accent2 text-xs"></i><span class="text-xs">部署发布</span></div>
+          </div>
+          <div class="agent-node" draggable="true" ondragstart="dragNode(event,'condition')" style="text-align:left;">
+            <div class="flex items-center gap-2"><i class="fas fa-code-branch text-warn text-xs"></i><span class="text-xs">条件分支</span></div>
+          </div>
+        </div>
+      </div>
+      <!-- 画布 -->
+      <div class="stat-card col-span-2 relative" style="min-height:520px; overflow:hidden;" id="agent-canvas"
+        ondragover="event.preventDefault()" ondrop="dropNode(event)">
+        <div class="text-xs text-muted absolute top-3 left-4">工作流画布</div>
+        <canvas id="agent-lines" style="position:absolute;inset:0;pointer-events:none;"></canvas>
+        <div id="agent-nodes-container" style="position:relative;z-index:2;">
+          <!-- 预设节点 -->
+          <div class="agent-node absolute" style="top:60px;left:30px;" id="an-1" onclick="selectAgentNode(this)">
+            <i class="fas fa-database text-accent text-sm mb-1"></i>
+            <div class="text-xs font-medium">数据源接入</div>
+            <div class="text-[10px] text-muted">3 路数据流</div>
+          </div>
+          <div class="agent-node absolute" style="top:60px;left:200px;" id="an-2" onclick="selectAgentNode(this)">
+            <i class="fas fa-cogs text-accent2 text-sm mb-1"></i>
+            <div class="text-xs font-medium">预处理管线</div>
+            <div class="text-[10px] text-muted">清洗/裁剪/增强</div>
+          </div>
+          <div class="agent-node absolute" style="top:60px;left:370px;" id="an-3" onclick="selectAgentNode(this)">
+            <i class="fas fa-tags text-warn text-sm mb-1"></i>
+            <div class="text-xs font-medium">自动标注</div>
+            <div class="text-[10px] text-muted">多模型集成</div>
+          </div>
+          <div class="agent-node absolute" style="top:200px;left:370px;" id="an-4" onclick="selectAgentNode(this)">
+            <i class="fas fa-shield-check text-danger text-sm mb-1"></i>
+            <div class="text-xs font-medium">质量检查</div>
+            <div class="text-[10px] text-muted">阈值 0.85</div>
+          </div>
+          <div class="agent-node absolute" style="top:200px;left:200px;" id="an-5" onclick="selectAgentNode(this)">
+            <i class="fas fa-code-branch text-warn text-sm mb-1"></i>
+            <div class="text-xs font-medium">条件分支</div>
+            <div class="text-[10px] text-muted">质量 >= 阈值?</div>
+          </div>
+          <div class="agent-node absolute" style="top:340px;left:200px;" id="an-6" onclick="selectAgentNode(this)">
+            <i class="fas fa-brain text-purple-400 text-sm mb-1"></i>
+            <div class="text-xs font-medium">模型训练</div>
+            <div class="text-[10px] text-muted">v47 迭代</div>
+          </div>
+          <div class="agent-node absolute" style="top:340px;left:370px;" id="an-7" onclick="selectAgentNode(this)">
+            <i class="fas fa-chart-bar text-accent text-sm mb-1"></i>
+            <div class="text-xs font-medium">效果评估</div>
+            <div class="text-[10px] text-muted">离线 + 在线</div>
+          </div>
+          <div class="agent-node absolute" style="top:340px;left:30px;" id="an-8" onclick="selectAgentNode(this)">
+            <i class="fas fa-rocket text-accent2 text-sm mb-1"></i>
+            <div class="text-xs font-medium">部署发布</div>
+            <div class="text-[10px] text-muted">灰度发布</div>
+          </div>
+        </div>
+      </div>
+      <!-- 属性面板 -->
+      <div class="stat-card" id="agent-props">
+        <div class="text-xs font-semibold text-fg mb-3">节点属性</div>
+        <div id="prop-content" class="text-xs text-muted">点击画布中的节点查看属性</div>
+      </div>
+    </div>
+  </div>
+
+  <!-- ==================== 测试/仿真页面 ==================== -->
+  <div id="page-simulation" class="page">
+    <div class="flex items-center justify-between mb-5">
+      <div class="flex gap-1">
+        <button class="tab-btn active" onclick="switchSimulationTab(this,'config')">仿真配置</button>
+        <button class="tab-btn" onclick="switchSimulationTab(this,'running')">运行监控</button>
+        <button class="tab-btn" onclick="switchSimulationTab(this,'results')">测试结果</button>
+      </div>
+      <button class="btn-primary" onclick="startSimulation()"><i class="fas fa-play mr-1.5"></i>启动仿真</button>
+    </div>
+
+    <!-- 仿真配置视图 -->
+    <div id="simulation-view-config">
+      <div class="grid grid-cols-3 gap-4 mb-6">
+        <div class="stat-card col-span-2">
+          <div class="text-xs font-semibold text-fg mb-4">仿真场景配置</div>
+          <div class="grid grid-cols-2 gap-4">
+            <div>
+              <label class="text-xs text-muted block mb-1.5">仿真环境</label>
+              <select class="w-full bg-surface border border-border rounded-lg px-3 py-2 text-xs text-fg focus:outline-none focus:border-accent/50">
+                <option>室内导航场景</option>
+                <option>桌面操作场景</option>
+                <option>仓储物流场景</option>
+                <option>户外复杂场景</option>
+              </select>
+            </div>
+            <div>
+              <label class="text-xs text-muted block mb-1.5">仿真模型版本</label>
+              <select class="w-full bg-surface border border-border rounded-lg px-3 py-2 text-xs text-fg focus:outline-none focus:border-accent/50">
+                <option>v47 (最新)</option>
+                <option>v46 (当前部署)</option>
+                <option>v45</option>
+                <option>v44</option>
+              </select>
+            </div>
+            <div>
+              <label class="text-xs text-muted block mb-1.5">仿真时长</label>
+              <div class="flex items-center gap-3">
+                <input type="range" min="1" max="24" value="8" class="flex-1 accent-accent" oninput="document.getElementById('sim-duration').textContent=this.value+'h'">
+                <span id="sim-duration" class="text-sm font-mono text-accent w-12 text-right">8h</span>
+              </div>
+            </div>
+            <div>
+              <label class="text-xs text-muted block mb-1.5">并发任务数</label>
+              <div class="flex items-center gap-3">
+                <input type="range" min="1" max="10" value="4" class="flex-1 accent-accent" oninput="document.getElementById('sim-concurrent').textContent=this.value">
+                <span id="sim-concurrent" class="text-sm font-mono text-accent w-12 text-right">4</span>
+              </div>
+            </div>
+          </div>
+        </div>
+        <div class="stat-card">
+          <div class="text-xs font-semibold text-fg mb-4">测试指标</div>
+          <div class="space-y-3 text-xs">
+            <div class="flex items-center justify-between">
+              <span class="text-muted">成功率 (SR)</span>
+              <input type="checkbox" checked class="accent-accent">
+            </div>
+            <div class="flex items-center justify-between">
+              <span class="text-muted">任务完成率</span>
+              <input type="checkbox" checked class="accent-accent">
+            </div>
+            <div class="flex items-center justify-between">
+              <span class="text-muted">平均延迟</span>
+              <input type="checkbox" checked class="accent-accent">
+            </div>
+            <div class="flex items-center justify-between">
+              <span class="text-muted">碰撞次数</span>
+              <input type="checkbox" checked class="accent-accent">
+            </div>
+            <div class="flex items-center justify-between">
+              <span class="text-muted">路径效率</span>
+              <input type="checkbox" class="accent-accent">
+            </div>
+            <div class="flex items-center justify-between">
+              <span class="text-muted">能耗评估</span>
+              <input type="checkbox" class="accent-accent">
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <div class="grid grid-cols-2 gap-4">
+        <div class="stat-card">
+          <div class="text-xs font-semibold text-fg mb-4">测试用例库</div>
+          <div class="space-y-2">
+            <div class="bg-surface rounded-lg p-3 border border-border cursor-pointer hover:border-accent/30 transition-colors">
+              <div class="flex items-center justify-between mb-1">
+                <span class="text-xs text-fg font-medium">TC-001: 基础导航</span>
+                <span class="tag bg-accent/15 text-accent">已启用</span>
+              </div>
+              <div class="text-[10px] text-muted">从起点A导航至终点B，避开静态障碍物</div>
+            </div>
+            <div class="bg-surface rounded-lg p-3 border border-border cursor-pointer hover:border-accent/30 transition-colors">
+              <div class="flex items-center justify-between mb-1">
+                <span class="text-xs text-fg font-medium">TC-002: 动态避障</span>
+                <span class="tag bg-accent/15 text-accent">已启用</span>
+              </div>
+              <div class="text-[10px] text-muted">在移动障碍物环境中完成导航任务</div>
+            </div>
+            <div class="bg-surface rounded-lg p-3 border border-border cursor-pointer hover:border-accent/30 transition-colors">
+              <div class="flex items-center justify-between mb-1">
+                <span class="text-xs text-fg font-medium">TC-003: 物体抓取</span>
+                <span class="tag bg-warn/15 text-warn">待配置</span>
+              </div>
+              <div class="text-[10px] text-muted">识别并抓取指定物体放置到目标位置</div>
+            </div>
+            <div class="bg-surface rounded-lg p-3 border border-border cursor-pointer hover:border-accent/30 transition-colors">
+              <div class="flex items-center justify-between mb-1">
+                <span class="text-xs text-fg font-medium">TC-004: 多步指令</span>
+                <span class="tag bg-accent/15 text-accent">已启用</span>
+              </div>
+              <div class="text-[10px] text-muted">执行包含多个步骤的复合指令任务</div>
+            </div>
+          </div>
+        </div>
+        <div class="stat-card">
+          <div class="text-xs font-semibold text-fg mb-4">仿真资源</div>
+          <div class="space-y-3 text-xs">
+            <div>
+              <div class="flex justify-between mb-1"><span class="text-muted">GPU 可用性</span><span class="text-accent font-mono">3/4</span></div>
+              <div class="progress-bar"><div class="progress-fill bg-accent" style="width:75%"></div></div>
+            </div>
+            <div>
+              <div class="flex justify-between mb-1"><span class="text-muted">内存占用</span><span class="text-warn font-mono">12.4 GB</span></div>
+              <div class="progress-bar"><div class="progress-fill bg-warn" style="width:62%"></div></div>
+            </div>
+            <div>
+              <div class="flex justify-between mb-1"><span class="text-muted">存储空间</span><span class="text-accent2 font-mono">245 GB</span></div>
+              <div class="progress-bar"><div class="progress-fill bg-accent2" style="width:49%"></div></div>
+            </div>
+            <div class="pt-3 border-t border-border">
+              <div class="flex justify-between mb-1"><span class="text-muted">预计仿真时间</span><span class="text-fg font-mono">~2.5h</span></div>
+              <div class="flex justify-between"><span class="text-muted">预计数据量</span><span class="text-fg font-mono">~850 GB</span></div>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <!-- 运行监控视图 -->
+    <div id="simulation-view-running" style="display:none;">
+      <div class="grid grid-cols-4 gap-4 mb-6">
+        <div class="stat-card">
+          <div class="text-xs text-muted mb-2">运行状态</div>
+          <div class="flex items-center gap-2">
+            <div class="glow-dot bg-accent text-accent"></div>
+            <span class="text-lg font-bold text-fg">运行中</span>
+          </div>
+          <div class="text-[10px] text-muted mt-2">已运行 1h 23m / 8h</div>
+        </div>
+        <div class="stat-card">
+          <div class="text-xs text-muted mb-2">已完成任务</div>
+          <div class="text-2xl font-bold font-mono text-accent">142</div>
+          <div class="text-[10px] text-muted mt-1">成功率 91.5%</div>
+        </div>
+        <div class="stat-card">
+          <div class="text-xs text-muted mb-2">平均延迟</div>
+          <div class="text-2xl font-bold font-mono text-accent2">186ms</div>
+          <div class="text-[10px] text-muted mt-1">较基线 -3.2%</div>
+        </div>
+        <div class="stat-card">
+          <div class="text-xs text-muted mb-2">碰撞次数</div>
+          <div class="text-2xl font-bold font-mono text-warn">3</div>
+          <div class="text-[10px] text-muted mt-1">低于阈值 (5)</div>
+        </div>
+      </div>
+
+      <div class="grid grid-cols-2 gap-4 mb-4">
+        <div class="stat-card">
+          <div class="text-xs font-semibold text-fg mb-4">任务成功率趋势</div>
+          <canvas id="chart-sim-success" height="200"></canvas>
+        </div>
+        <div class="stat-card">
+          <div class="text-xs font-semibold text-fg mb-4">延迟分布</div>
+          <canvas id="chart-sim-latency" height="200"></canvas>
+        </div>
+      </div>
+
+      <div class="stat-card">
+        <div class="text-xs font-semibold text-fg mb-4">实时任务日志</div>
+        <div class="bg-surface rounded-lg p-3 border border-border font-mono text-xs h-48 overflow-y-auto" id="sim-log">
+          <div class="text-accent">[14:23:15] Task #142 started - Navigation to waypoint (12.5, 8.3)</div>
+          <div class="text-muted">[14:23:14] Task #141 completed successfully (SR: 0.94)</div>
+          <div class="text-muted">[14:22:58] Task #140 completed successfully (SR: 0.91)</div>
+          <div class="text-warn">[14:22:42] Task #139 completed with warnings - Minor collision detected</div>
+          <div class="text-muted">[14:22:15] Task #138 completed successfully (SR: 0.96)</div>
+          <div class="text-muted">[14:21:53] Task #137 completed successfully (SR: 0.89)</div>
+          <div class="text-danger">[14:21:28] Task #136 FAILED - Obstacle avoidance timeout</div>
+          <div class="text-muted">[14:21:05] Task #135 completed successfully (SR: 0.93)</div>
+        </div>
+      </div>
+    </div>
+
+    <!-- 测试结果视图 -->
+    <div id="simulation-view-results" style="display:none;">
+      <div class="grid grid-cols-3 gap-4 mb-6">
+        <div class="stat-card text-center">
+          <div class="quality-ring mx-auto mb-3">
+            <svg width="100" height="100" viewBox="0 0 100 100">
+              <circle cx="50" cy="50" r="42" fill="none" stroke="#1a2744" stroke-width="6"/>
+              <circle cx="50" cy="50" r="42" fill="none" stroke="#00e59b" stroke-width="6"
+                stroke-dasharray="264" stroke-dashoffset="21" stroke-linecap="round"/>
+            </svg>
+            <div class="absolute inset-0 flex items-center justify-center text-lg font-bold font-mono text-accent">92%</div>
+          </div>
+          <div class="text-xs text-muted">综合评分</div>
+        </div>
+        <div class="stat-card">
+          <div class="text-xs text-muted mb-2">总任务数</div>
+          <div class="text-2xl font-bold font-mono text-fg">1,247</div>
+          <div class="flex items-center gap-2 mt-2 text-xs">
+            <span class="text-accent">成功 1,141</span>
+            <span class="text-muted">|</span>
+            <span class="text-danger">失败 106</span>
+          </div>
+        </div>
+        <div class="stat-card">
+          <div class="text-xs text-muted mb-2">关键指标</div>
+          <div class="space-y-1.5 text-xs">
+            <div class="flex justify-between"><span class="text-muted">成功率</span><span class="text-accent font-mono">91.5%</span></div>
+            <div class="flex justify-between"><span class="text-muted">平均延迟</span><span class="text-accent2 font-mono">182ms</span></div>
+            <div class="flex justify-between"><span class="text-muted">碰撞率</span><span class="text-warn font-mono">0.24%</span></div>
+            <div class="flex justify-between"><span class="text-muted">路径效率</span><span class="text-accent font-mono">94.3%</span></div>
+          </div>
+        </div>
+      </div>
+
+      <div class="grid grid-cols-2 gap-4 mb-4">
+        <div class="stat-card">
+          <div class="text-xs font-semibold text-fg mb-4">各场景性能对比</div>
+          <canvas id="chart-scene-compare" height="220"></canvas>
+        </div>
+        <div class="stat-card">
+          <div class="text-xs font-semibold text-fg mb-4">失败原因分析</div>
+          <canvas id="chart-failure-analysis" height="220"></canvas>
+        </div>
+      </div>
+
+      <div class="stat-card">
+        <div class="flex items-center justify-between mb-4">
+          <div class="text-xs font-semibold text-fg">详细测试报告</div>
+          <div class="flex gap-2">
+            <button class="btn-ghost text-xs" onclick="showToast('报告已导出','accent2')"><i class="fas fa-download mr-1"></i>导出PDF</button>
+            <button class="btn-ghost text-xs" onclick="showToast('数据已导出','accent2')"><i class="fas fa-table mr-1"></i>导出CSV</button>
+          </div>
+        </div>
+        <div class="overflow-x-auto">
+          <table class="w-full text-xs">
+            <thead>
+              <tr class="text-muted border-b border-border">
+                <th class="text-left py-2.5">测试用例</th>
+                <th class="text-left py-2.5">场景</th>
+                <th class="text-left py-2.5">执行次数</th>
+                <th class="text-left py-2.5">成功率</th>
+                <th class="text-left py-2.5">平均延迟</th>
+                <th class="text-left py-2.5">碰撞次数</th>
+                <th class="text-left py-2.5">评级</th>
+              </tr>
+            </thead>
+            <tbody id="test-report-table">
+            </tbody>
+          </table>
+        </div>
+      </div>
+    </div>
+  </div>
+</main>
+
+<!-- 上传模态框 -->
+<div class="modal-overlay" id="upload-modal">
+  <div class="modal-content">
+    <div class="flex items-center justify-between mb-5">
+      <h3 class="text-sm font-semibold text-fg">上传数据</h3>
+      <button class="text-muted hover:text-fg transition-colors" onclick="closeUploadModal()"><i class="fas fa-times"></i></button>
+    </div>
+    <div class="border-2 border-dashed border-border rounded-xl p-8 text-center mb-4 hover:border-accent/40 transition-colors cursor-pointer" id="drop-zone">
+      <i class="fas fa-cloud-upload-alt text-3xl text-muted mb-3"></i>
+      <div class="text-sm text-fg mb-1">拖拽文件到此处或点击选择</div>
+      <div class="text-xs text-muted">支持 JPG/PNG/PCD/JSON/LAS, 单文件最大 200MB</div>
+    </div>
+    <div class="space-y-3 mb-4">
+      <div>
+        <label class="text-xs text-muted block mb-1">数据类型</label>
+        <select class="w-full bg-surface border border-border rounded-lg px-3 py-2 text-xs text-fg focus:outline-none focus:border-accent/50">
+          <option>图像数据</option><option>点云数据</option><option>文本指令</option><option>多模态数据</option>
+        </select>
+      </div>
+      <div>
+        <label class="text-xs text-muted block mb-1">场景标签</label>
+        <select class="w-full bg-surface border border-border rounded-lg px-3 py-2 text-xs text-fg focus:outline-none focus:border-accent/50">
+          <option>室内导航</option><option>桌面操作</option><option>仓储物流</option><option>户外场景</option>
+        </select>
+      </div>
+      <div>
+        <label class="text-xs text-muted block mb-1">备注</label>
+        <input type="text" placeholder="可选，描述此批次数据..." class="w-full bg-surface border border-border rounded-lg px-3 py-2 text-xs text-fg placeholder:text-muted focus:outline-none focus:border-accent/50">
+      </div>
+    </div>
+    <div class="flex gap-2">
+      <button class="btn-ghost flex-1" onclick="closeUploadModal()">取消</button>
+      <button class="btn-primary flex-1" onclick="closeUploadModal(); showToast('数据上传任务已创建，后台处理中','accent')">开始上传</button>
+    </div>
+  </div>
+</div>
+
+<!-- Toast -->
+<div class="toast" id="toast-el"></div>
+
+<script>
+// ============ 模拟数据 ============
+const imageData = Array.from({length:15}, (_, i) => ({
+  id: `IMG-${String(10000+i).slice(1)}`,
+  scene: ['室内导航','桌面操作','仓储物流','户外场景'][i%4],
+  status: ['已标注','已标注','待标注','待标注','已标注','已拒绝'][i%6],
+  conf: (0.6 + Math.random()*0.38).toFixed(2),
+  seed: `vla${i}${Date.now()%100}`,
+}));
+
+const pointcloudData = Array.from({length:6}, (_, i) => ({
+  id: `PCD-${String(2000+i).slice(1)}`,
+  points: [2048,4096,1024,8192,3072,5120][i],
+  scene: ['室内导航','桌面操作','仓储物流'][i%3],
+  status: ['已标注','待标注','已标注'][i%3],
+  conf: (0.65 + Math.random()*0.33).toFixed(2),
+}));
+
+const textData = [
+  { id: 'TXT-001', instruction: '将红色杯子从桌面左侧移动到右侧的蓝色托盘上', action_type: 'pick_and_place', objects: ['红色杯子','蓝色托盘'], status: '已标注', conf: '0.94' },
+  { id: 'TXT-002', instruction: '推开障碍物，导航至目标位置 (3.2, 1.5)', action_type: 'navigation', objects: ['障碍物'], status: '已标注', conf: '0.88' },
+  { id: 'TXT-003', instruction: '抓取货架第二层的盒子并放置到传送带上', action_type: 'pick_and_place', objects: ['盒子','货架','传送带'], status: '待标注', conf: '0.72' },
+  { id: 'TXT-004', instruction: '绕过桌子，避开地上的电缆，走到门旁边', action_type: 'navigation', objects: ['桌子','电缆','门'], status: '已标注', conf: '0.91' },
+  { id: 'TXT-005', instruction: '将散落的零件按颜色分类放入对应的收纳箱', action_type: 'sorting', objects: ['零件','收纳箱'], status: '待标注', conf: '0.65' },
+  { id: 'TXT-006', instruction: '按下墙上的开关，等待灯光变绿后通过', action_type: 'interaction', objects: ['开关'], status: '已标注', conf: '0.87' },
+  { id: 'TXT-007', instruction: '将托盘上的三瓶水整齐排列在冰箱第一层', action_type: 'arrangement', objects: ['水瓶','托盘','冰箱'], status: '已拒绝', conf: '0.41' },
+  { id: 'TXT-008', instruction: '打开抽屉取出螺丝刀，递给操作员', action_type: 'handover', objects: ['抽屉','螺丝刀'], status: '已标注', conf: '0.83' },
+];
+
+const batchData = [
+  { id: 'B-2026-001', type: '多模态', count: 12400, quality: 0.94, scene: '室内导航', status: 'unlocked' },
+  { id: 'B-2026-002', type: '图像', count: 8600, quality: 0.91, scene: '桌面操作', status: 'unlocked' },
+  { id: 'B-2026-003', type: '点云', count: 3200, quality: 0.89, scene: '仓储物流', status: 'unlocked' },
+  { id: 'B-2026-004', type: '文本', count: 15800, quality: 0.87, scene: '室内导航', status: 'unlocked' },
+  { id: 'B-2026-005', type: '多模态', count: 9400, quality: 0.86, scene: '桌面操作', status: 'pending' },
+  { id: 'B-2026-006', type: '图像', count: 6200, quality: 0.84, scene: '户外场景', status: 'pending' },
+  { id: 'B-2026-007', type: '点云', count: 2800, quality: 0.82, scene: '仓储物流', status: 'pending' },
+  { id: 'B-2026-008', type: '文本', count: 11200, quality: 0.79, scene: '桌面操作', status: 'rejected' },
+  { id: 'B-2026-009', type: '多模态', count: 7600, quality: 0.76, scene: '室内导航', status: 'pending' },
+  { id: 'B-2026-010', type: '图像', count: 5100, quality: 0.72, scene: '户外场景', status: 'rejected' },
+];
+
+const versionData = [
+  { ver: 'v47', date: '2026-01-18', status: 'training', data: '192K', epochs: '24/24', success: '-', note: '加入 B-2026-001~004 解锁数据' },
+  { ver: 'v46', date: '2026-01-15', status: 'deployed', data: '186K', epochs: '24/24', success: '94.2%', note: '当前生产版本，灰度发布后全量' },
+  { ver: 'v45', date: '2026-01-12', status: 'archived', data: '178K', epochs: '20/24', success: '93.1%', note: '提前停止，过拟合趋势' },
+  { ver: 'v44', date: '2026-01-08', status: 'archived', data: '172K', epochs: '24/24', success: '92.8%', note: '增加点云数据增强策略' },
+  { ver: 'v43', date: '2026-01-04', status: 'failed', data: '165K', epochs: '8/24', success: '-', note: '数据质量异常，训练崩溃' },
+  { ver: 'v42', date: '2026-01-02', status: 'archived', data: '160K', epochs: '24/24', success: '91.5%', note: '基线版本，引入多模态对齐损失' },
+];
+
+const activities = [
+  { icon: 'fa-tags', color: 'text-accent2', text: '自动标注流水线完成 2,840 条数据', time: '3 分钟前' },
+  { icon: 'fa-lock-open', color: 'text-accent', text: '批次 B-2026-004 已自动解锁', time: '15 分钟前' },
+  { icon: 'fa-brain', color: 'text-purple-400', text: 'v47 训练进度 75% (Epoch 18/24)', time: '32 分钟前' },
+  { icon: 'fa-exclamation-triangle', color: 'text-warn', text: '批次 B-2026-007 质量分低于阈值', time: '1 小时前' },
+  { icon: 'fa-upload', color: 'text-accent', text: '新增 1,200 条桌面操作场景数据', time: '2 小时前' },
+  { icon: 'fa-check-circle', color: 'text-accent', text: 'v46 全量部署完成', time: '3 小时前' },
+  { icon: 'fa-times-circle', color: 'text-danger', text: '批次 B-2026-008 已拒绝', time: '5 小时前' },
+];
+
+// ============ 路由切换 ============
+const pageTitles = {
+  dashboard: '闭环仪表盘', data: '数据管理', 
+  annotate: '自动标注', model: '模型迭代', agent: 'Agent 工作流', simulation: '测试/仿真'
+};
+
+document.querySelectorAll('.sidebar-item').forEach(btn => {
+  btn.addEventListener('click', () => {
+    const page = btn.dataset.page;
+    document.querySelectorAll('.sidebar-item').forEach(b => b.classList.remove('active'));
+    btn.classList.add('active');
+    document.querySelectorAll('.page').forEach(p => p.classList.remove('active'));
+    document.getElementById(`page-${page}`).classList.add('active');
+    document.getElementById('page-title').textContent = pageTitles[page];
+    // 懒初始化图表
+    if (page === 'model') initModelCharts();
+    if (page === 'agent') drawAgentLines();
+  });
+});
+
+// ============ Toast ============
+function showToast(msg, color='accent') {
+  const el = document.getElementById('toast-el');
+  const colors = { accent:'#00e59b', accent2:'#00c4ff', warn:'#ffb020', danger:'#ff4757', purple:'#a78bfa' };
+  el.style.borderLeftColor = colors[color] || colors.accent;
+  el.style.borderLeft = `3px solid ${colors[color] || colors.accent}`;
+  el.innerHTML = `<i class="fas fa-${color==='danger'?'times-circle':color==='warn'?'exclamation-triangle':'check-circle'}" style="color:${colors[color]||colors.accent};margin-right:8px;"></i>${msg}`;
+  el.classList.add('show');
+  setTimeout(() => el.classList.remove('show'), 3000);
+}
+
+// ============ 上传模态框 ============
+function openUploadModal() { document.getElementById('upload-modal').classList.add('show'); }
+function closeUploadModal() { document.getElementById('upload-modal').classList.remove('show'); }
+
+// ============ Dashboard 图表 ============
+function initDashboardCharts() {
+  // 数据分布饼图
+  new Chart(document.getElementById('chart-data-dist'), {
+    type: 'doughnut',
+    data: {
+      labels: ['图像数据', '点云数据', '文本指令', '多模态数据'],
+      datasets: [{ data: [128456, 42380, 67280, 46613], backgroundColor: ['#00e59b','#00c4ff','#ffb020','#a78bfa'], borderWidth: 0 }]
+    },
+    options: {
+      responsive: true,
+      maintainAspectRatio: false,
+      cutout: '65%',
+      plugins: {
+        legend: { 
+          position: 'bottom', 
+          labels: { 
+            color: '#8a9bb8', 
+            font: { size: 10, family: 'Noto Sans SC' }, 
+            padding: 12, 
+            usePointStyle: true, 
+            pointStyleWidth: 8 
+          } 
+        },
+        tooltip: {
+          callbacks: {
+            label: function(context) {
+              const label = context.label || '';
+              const value = context.parsed || 0;
+              const total = context.dataset.data.reduce((a, b) => a + b, 0);
+              const percentage = ((value / total) * 100).toFixed(1);
+              return `${label}: ${value.toLocaleString()} (${percentage}%)`;
+            }
+          }
+        }
+      },
+      animation: {
+        animateScale: false,
+        animateRotate: true
+      },
+      events: [] // 禁用所有交互事件，防止点击放大
+    }
+  });
+
+  // 模型迭代曲线
+  initModelCurveChart('success');
+}
+
+const modelCurveData = {
+  success: {
+    labels: ['v40','v41','v42','v43','v44','v45','v46','v47*'],
+    data: [87.2, 89.1, 91.5, '-', 92.8, 93.1, 94.2, 94.8],
+    label: 'Success Rate (%)', color: '#00e59b'
+  },
+  loss: {
+    labels: ['v40','v41','v42','v43','v44','v45','v46','v47*'],
+    data: [0.42, 0.35, 0.28, '-', 0.24, 0.22, 0.19, 0.16],
+    label: 'Training Loss', color: '#ff4757'
+  }
+};
+
+let modelCurveChart = null;
+function initModelCurveChart(metric) {
+  const d = modelCurveData[metric];
+  if (modelCurveChart) modelCurveChart.destroy();
+  modelCurveChart = new Chart(document.getElementById('chart-model-curve'), {
+    type: 'line',
+    data: {
+      labels: d.labels,
+      datasets: [{
+        label: d.label, data: d.data, borderColor: d.color,
+        backgroundColor: d.color + '15', fill: true, tension: 0.4,
+        pointBackgroundColor: d.color, pointBorderColor: '#111a2e', pointBorderWidth: 2,
+        pointRadius: 5, spanGaps: false
+      }]
+    },
+    options: {
+      responsive: true, maintainAspectRatio: false,
+      plugins: {
+        legend: { position: 'bottom', labels: { color: '#8a9bb8', font: { size: 10, family: 'Noto Sans SC' }, padding: 12, usePointStyle: true, pointStyleWidth: 8 } }
+      },
+      scales: {
+        x: { ticks: { color: '#8a9bb8', font: { size: 10, family: 'Noto Sans SC' } } },
+        y: { ticks: { color: '#8a9bb8', font: { size: 10, family: 'Noto Sans SC' } } }
+      }
+    }
+  });
+}
+
+function switchMetricChart(btn, metric) {
+  btn.parentElement.querySelectorAll('.tab-btn').forEach(b => b.classList.remove('active'));
+  btn.classList.add('active');
+  initModelCurveChart(metric);
+}
+
+// 活动流
+function renderActivities() {
+  const feed = document.getElementById('activity-feed');
+  feed.innerHTML = activities.map(a => `
+    <div class="flex items-start gap-3">
+      <div class="w-6 h-6 rounded-md bg-card border border-border flex items-center justify-center shrink-0 mt-0.5">
+        <i class="fas ${a.icon} ${a.color}" style="font-size:9px;"></i>
+      </div>
+      <div class="flex-1 min-w-0">
+        <div class="text-xs text-fg leading-relaxed">${a.text}</div>
+        <div class="text-[10px] text-muted mt-0.5">${a.time}</div>
+      </div>
+    </div>
+  `).join('');
+}
+
+// ============ 数据管理页面 ============
+function renderImageData() {
+  const grid = document.getElementById('image-grid');
+  grid.innerHTML = imageData.map(d => {
+    const statusColor = { '已标注': 'bg-accent/15 text-accent', '待标注': 'bg-warn/15 text-warn', '已拒绝': 'bg-danger/15 text-danger' }[d.status];
+    return `
+      <div class="data-thumb" onclick="showToast('查看数据 ${d.id} 详情','accent2')">
+        <img src="https://picsum.photos/seed/${d.seed}/300/240" alt="${d.id}" loading="lazy">
+        <div class="absolute top-1.5 left-1.5"><span class="tag ${statusColor}">${d.status}</span></div>
+        <div class="absolute bottom-0 left-0 right-0 bg-gradient-to-t from-black/80 to-transparent p-2">
+          <div class="text-[10px] font-mono text-fg/80">${d.id}</div>
+          <div class="text-[10px] text-muted">${d.scene} · conf ${d.conf}</div>
+        </div>
+      </div>`;
+  }).join('');
+}
+
+function renderPointCloudData() {
+  const grid = document.getElementById('pointcloud-grid');
+  grid.innerHTML = pointcloudData.map(d => {
+    const statusColor = { '已标注': 'bg-accent/15 text-accent', '待标注': 'bg-warn/15 text-warn' }[d.status];
+    return `
+      <div class="stat-card cursor-pointer hover:border-accent/30" onclick="showToast('查看点云 ${d.id} 详情','accent2')">
+        <div class="rounded-lg overflow-hidden border border-border mb-3 h-40 bg-surface relative">
+          <canvas class="pointcloud-preview" data-points="${d.points}" width="400" height="160"></canvas>
+        </div>
+        <div class="flex items-center justify-between">
+          <div>
+            <div class="text-xs font-mono text-fg">${d.id}</div>
+            <div class="text-[10px] text-muted">${d.scene} · ${d.points} points</div>
+          </div>
+          <span class="tag ${statusColor}">${d.status}</span>
+        </div>
+        <div class="progress-bar mt-2"><div class="progress-fill bg-accent2" style="width:${d.conf*100}%"></div></div>
+      </div>`;
+  }).join('');
+  // 绘制点云预览
+  setTimeout(drawPointCloudPreviews, 50);
+}
+
+function drawPointCloudPreviews() {
+  document.querySelectorAll('.pointcloud-preview').forEach(canvas => {
+    const ctx = canvas.getContext('2d');
+    const n = parseInt(canvas.dataset.points) || 1024;
+    const w = canvas.width, h = canvas.height;
+    ctx.clearRect(0, 0, w, h);
+    // 伪3D点云效果
+    const cx = w/2, cy = h/2;
+    for (let i = 0; i < Math.min(n, 600); i++) {
+      const angle = Math.random() * Math.PI * 2;
+      const r = Math.random() * 140 + 20;
+      const z = (Math.random() - 0.5) * 80;
+      const x = cx + Math.cos(angle) * r + z * 0.3;
+      const y = cy + Math.sin(angle) * r * 0.5 + z * 0.2;
+      const size = Math.max(1, 3 - z * 0.02);
+      const alpha = Math.max(0.2, 0.8 - Math.abs(z) * 0.005);
+      // 根据高度着色
+      const hue = y < cy ? 160 : 30; // 低处绿，高处橙
+      ctx.fillStyle = `hsla(${hue}, 80%, 60%, ${alpha})`;
+      ctx.beginPath();
+      ctx.arc(x, y, size, 0, Math.PI * 2);
+      ctx.fill();
+    }
+  });
+}
+
+function renderTextData() {
+  const list = document.getElementById('text-list');
+  list.innerHTML = textData.map(d => {
+    const statusColor = { '已标注': 'bg-accent/15 text-accent', '待标注': 'bg-warn/15 text-warn', '已拒绝': 'bg-danger/15 text-danger' }[d.status];
+    return `
+      <div class="stat-card flex items-center gap-4 cursor-pointer hover:border-accent/30" onclick="showToast('查看文本 ${d.id} 详情','accent2')">
+        <span class="tag ${statusColor} shrink-0">${d.status}</span>
+        <div class="flex-1 min-w-0">
+          <div class="text-xs text-fg truncate">"${d.instruction}"</div>
+          <div class="flex items-center gap-3 mt-1.5 text-[10px] text-muted">
+            <span class="font-mono">${d.id}</span>
+            <span>${d.action_type}</span>
+            <span>物体: ${d.objects.join(', ')}</span>
+          </div>
+        </div>
+        <div class="text-right shrink-0">
+          <div class="text-xs font-mono ${parseFloat(d.conf)>0.8?'text-accent':parseFloat(d.conf)>0.6?'text-warn':'text-danger'}">${d.conf}</div>
+          <div class="text-[10px] text-muted">置信度</div>
+        </div>
+      </div>`;
+  }).join('');
+}
+
+function switchDataTab(btn, type) {
+  btn.parentElement.querySelectorAll('.tab-btn').forEach(b => b.classList.remove('active'));
+  btn.classList.add('active');
+  document.querySelectorAll('.data-view').forEach(v => v.style.display = 'none');
+  // 隐藏筛选栏当切换到解锁标签时
+  const filterBar = document.getElementById('data-filter-bar');
+  if (filterBar) {
+    filterBar.style.display = type === 'unlock' ? 'none' : 'flex';
+  }
+  document.getElementById(`data-view-${type}`).style.display = type === 'text' ? 'block' : 'grid';
+}
+
+// ============ 测试/仿真页面 ============
+function switchSimulationTab(btn, view) {
+  btn.parentElement.querySelectorAll('.tab-btn').forEach(b => b.classList.remove('active'));
+  btn.classList.add('active');
+  document.getElementById('simulation-view-config').style.display = view === 'config' ? 'block' : 'none';
+  document.getElementById('simulation-view-running').style.display = view === 'running' ? 'block' : 'none';
+  document.getElementById('simulation-view-results').style.display = view === 'results' ? 'block' : 'none';
+  
+  // 如果切换到运行监控或结果视图，初始化图表
+  if (view === 'running') {
+    setTimeout(initSimulationCharts, 100);
+  } else if (view === 'results') {
+    setTimeout(initResultCharts, 100);
+    renderTestReport();
+  }
+}
+
+function startSimulation() {
+  showToast('仿真任务已启动', 'accent');
+  // 切换到运行监控视图
+  const runningBtn = document.querySelector('#page-simulation .tab-btn:nth-child(2)');
+  if (runningBtn) {
+    switchSimulationTab(runningBtn, 'running');
+  }
+}
+
+function initSimulationCharts() {
+  // 成功率趋势图
+  const ctxSuccess = document.getElementById('chart-sim-success');
+  if (ctxSuccess && !ctxSuccess.chart) {
+    ctxSuccess.chart = new Chart(ctxSuccess, {
+      type: 'line',
+      data: {
+        labels: ['0h', '1h', '2h', '3h', '4h', '5h', '6h', '7h', '8h'],
+        datasets: [{
+          label: '成功率',
+          data: [92, 91, 93, 90, 92, 91, 93, 92, 91.5],
+          borderColor: '#00e59b',
+          backgroundColor: 'rgba(0, 229, 155, 0.1)',
+          tension: 0.4,
+          fill: true
+        }]
+      },
+      options: {
+        responsive: true,
+        maintainAspectRatio: false,
+        plugins: { legend: { display: false } },
+        scales: {
+          y: { beginAtZero: false, min: 85, max: 100, grid: { color: '#1a2744' }, ticks: { color: '#5a6d8a' } },
+          x: { grid: { display: false }, ticks: { color: '#5a6d8a' } }
+        }
+      }
+    });
+  }
+
+  // 延迟分布图
+  const ctxLatency = document.getElementById('chart-sim-latency');
+  if (ctxLatency && !ctxLatency.chart) {
+    ctxLatency.chart = new Chart(ctxLatency, {
+      type: 'bar',
+      data: {
+        labels: ['<100ms', '100-150ms', '150-200ms', '200-250ms', '250-300ms', '>300ms'],
+        datasets: [{
+          label: '任务数',
+          data: [23, 45, 38, 21, 10, 5],
+          backgroundColor: [
+            'rgba(0, 229, 155, 0.8)',
+            'rgba(0, 196, 255, 0.8)',
+            'rgba(0, 196, 255, 0.6)',
+            'rgba(255, 176, 32, 0.6)',
+            'rgba(255, 176, 32, 0.4)',
+            'rgba(255, 71, 87, 0.4)'
+          ]
+        }]
+      },
+      options: {
+        responsive: true,
+        maintainAspectRatio: false,
+        plugins: { legend: { display: false } },
+        scales: {
+          y: { beginAtZero: true, grid: { color: '#1a2744' }, ticks: { color: '#5a6d8a' } },
+          x: { grid: { display: false }, ticks: { color: '#5a6d8a' } }
+        }
+      }
+    });
+  }
+}
+
+function initResultCharts() {
+  // 场景性能对比图
+  const ctxScene = document.getElementById('chart-scene-compare');
+  if (ctxScene && !ctxScene.chart) {
+    ctxScene.chart = new Chart(ctxScene, {
+      type: 'radar',
+      data: {
+        labels: ['成功率', '延迟', '碰撞率', '路径效率', '能耗'],
+        datasets: [
+          {
+            label: 'v47 (当前)',
+            data: [91.5, 85, 95, 94, 88],
+            borderColor: '#00e59b',
+            backgroundColor: 'rgba(0, 229, 155, 0.2)'
+          },
+          {
+            label: 'v46 (基线)',
+            data: [89, 82, 92, 91, 85],
+            borderColor: '#00c4ff',
+            backgroundColor: 'rgba(0, 196, 255, 0.2)'
+          }
+        ]
+      },
+      options: {
+        responsive: true,
+        maintainAspectRatio: false,
+        scales: {
+          r: {
+            beginAtZero: true,
+            max: 100,
+            grid: { color: '#1a2744' },
+            pointLabels: { color: '#8a9bb8' },
+            ticks: { display: false }
+          }
+        },
+        plugins: {
+          legend: { labels: { color: '#8a9bb8' } }
+        }
+      }
+    });
+  }
+
+  // 失败原因分析图
+  const ctxFailure = document.getElementById('chart-failure-analysis');
+  if (ctxFailure && !ctxFailure.chart) {
+    ctxFailure.chart = new Chart(ctxFailure, {
+      type: 'doughnut',
+      data: {
+        labels: ['避障超时', '路径规划失败', '感知错误', '执行器故障', '其他'],
+        datasets: [{
+          data: [35, 28, 22, 10, 5],
+          backgroundColor: ['#ff4757', '#ffb020', '#00c4ff', '#00e59b', '#5a6d8a']
+        }]
+      },
+      options: {
+        responsive: true,
+        maintainAspectRatio: false,
+        plugins: {
+          legend: { position: 'right', labels: { color: '#8a9bb8', font: { size: 10 } } }
+        }
+      }
+    });
+  }
+}
+
+function renderTestReport() {
+  const tbody = document.getElementById('test-report-table');
+  if (!tbody || tbody.children.length > 0) return;
+  
+  const testData = [
+    { name: 'TC-001: 基础导航', scene: '室内导航', count: 250, sr: 95.2, latency: 165, collisions: 0, rating: 'A' },
+    { name: 'TC-002: 动态避障', scene: '室内导航', count: 180, sr: 88.3, latency: 198, collisions: 2, rating: 'B+' },
+    { name: 'TC-003: 物体抓取', scene: '桌面操作', count: 150, sr: 92.7, latency: 175, collisions: 0, rating: 'A-' },
+    { name: 'TC-004: 多步指令', scene: '仓储物流', count: 200, sr: 89.5, latency: 210, collisions: 1, rating: 'B+' },
+    { name: 'TC-005: 复杂环境', scene: '户外复杂', count: 120, sr: 85.8, latency: 235, collisions: 3, rating: 'B' },
+    { name: 'TC-006: 紧急制动', scene: '室内导航', count: 100, sr: 98.0, latency: 145, collisions: 0, rating: 'A+' },
+    { name: 'TC-007: 协同作业', scene: '仓储物流', count: 147, sr: 91.2, latency: 188, collisions: 1, rating: 'A-' }
+  ];
+  
+  tbody.innerHTML = testData.map(t => {
+    const ratingColor = t.rating.startsWith('A') ? 'text-accent' : t.rating.startsWith('B+') ? 'text-accent2' : 'text-warn';
+    return `
+      <tr class="border-b border-border/50 hover:bg-surface/50 transition-colors">
+        <td class="py-2.5 text-fg">${t.name}</td>
+        <td class="py-2.5 text-muted">${t.scene}</td>
+        <td class="py-2.5 font-mono text-fg">${t.count}</td>
+        <td class="py-2.5 font-mono ${t.sr >= 90 ? 'text-accent' : 'text-warn'}">${t.sr}%</td>
+        <td class="py-2.5 font-mono text-accent2">${t.latency}ms</td>
+        <td class="py-2.5 font-mono ${t.collisions === 0 ? 'text-accent' : t.collisions <= 2 ? 'text-warn' : 'text-danger'}">${t.collisions}</td>
+        <td class="py-2.5 font-mono ${ratingColor} font-bold">${t.rating}</td>
+      </tr>
+    `;
+  }).join('');
+}
+
+// ============ 数据解锁页面 ============
+function renderBatchTable() {
+  const tbody = document.getElementById('batch-table');
+  tbody.innerHTML = batchData.map(b => {
+    const statusMap = {
+      unlocked: { tag: 'bg-accent/15 text-accent', text: '已解锁' },
+      pending: { tag: 'bg-warn/15 text-warn', text: '待审核' },
+      rejected: { tag: 'bg-danger/15 text-danger', text: '已拒绝' }
+    };
+    const s = statusMap[b.status];
+    const qColor = b.quality >= 0.85 ? 'text-accent' : b.quality >= 0.75 ? 'text-warn' : 'text-danger';
+    return `
+      <tr class="border-b border-border/50 hover:bg-surface/50 transition-colors">
+        <td class="py-2.5 px-3"><input type="checkbox" class="accent-accent batch-cb" ${b.status==='pending'?'':'disabled'}></td>
+        <td class="py-2.5 font-mono text-fg">${b.id}</td>
+        <td class="py-2.5 text-muted">${b.type}</td>
+        <td class="py-2.5 font-mono text-fg">${b.count.toLocaleString()}</td>
+        <td class="py-2.5 font-mono ${qColor}">${b.quality.toFixed(2)}</td>
+        <td class="py-2.5 text-muted">${b.scene}</td>
+        <td class="py-2.5"><span class="tag ${s.tag}">${s.text}</span></td>
+        <td class="py-2.5">
+          ${b.status==='pending'?`<button class="text-accent hover:text-accent/80 text-xs" onclick="showToast('批次 ${b.id} 已解锁','accent')"><i class="fas fa-lock-open mr-1"></i>解锁</button>`:'<span class="text-muted text-xs">-</span>'}
+        </td>
+      </tr>`;
+  }).join('');
+}
+
+function toggleAllBatch(el) {
+  document.querySelectorAll('.batch-cb:not(:disabled)').forEach(cb => cb.checked = el.checked);
+}
+
+function batchUnlock() {
+  const checked = document.querySelectorAll('.batch-cb:checked');
+  if (checked.length === 0) { showToast('请先选择待解锁的批次','warn'); return; }
+  showToast(`已解锁 ${checked.length} 个批次，数据流入训练管线`, 'accent');
+}
+
+// ============ 自动标注页面 ============
+function renderAnnotationResults() {
+  const container = document.getElementById('annotation-results');
+  const results = [
+    { id: 'ANN-82401', type: '目标检测', model: 'DINO-v2 + SAM', input: 'IMG-0824', output: '5 个目标框', conf: 0.92, time: '128ms' },
+    { id: 'ANN-82402', type: '点云分割', model: 'PointGroup++', input: 'PCD-0042', output: '3 个实例', conf: 0.87, time: '345ms' },
+    { id: 'ANN-82403', type: '指令生成', model: 'LLaMA-3-8B', input: 'IMG-0825 + PCD-0043', output: '"抓取桌面上的蓝色瓶子..."', conf: 0.79, time: '1.2s' },
+    { id: 'ANN-82404', type: '多模态对齐', model: 'CLIP + PointCLIP', input: 'IMG-0826 + TXT-015', output: '对齐分数 0.91', conf: 0.91, time: '89ms' },
+    { id: 'ANN-82405', type: '动作分解', model: 'ActBERT-v2', input: 'TXT-016', output: '4 步动作序列', conf: 0.84, time: '420ms' },
+  ];
+  container.innerHTML = results.map(r => {
+    const confColor = r.conf >= 0.85 ? 'text-accent' : r.conf >= 0.7 ? 'text-warn' : 'text-danger';
+    return `
+      <div class="stat-card flex items-center gap-4">
+        <div class="w-8 h-8 rounded-lg bg-accent2/10 flex items-center justify-center shrink-0">
+          <i class="fas fa-${r.type.includes('检测')?'eye':r.type.includes('点云')?'cube':r.type.includes('指令')?'font':r.type.includes('对齐')?'link':'project-diagram'} text-accent2 text-xs"></i>
+        </div>
+        <div class="flex-1 min-w-0">
+          <div class="flex items-center gap-2 mb-0.5">
+            <span class="text-xs font-mono text-fg">${r.id}</span>
+            <span class="tag bg-card border border-border text-muted">${r.type}</span>
+          </div>
+          <div class="text-[10px] text-muted">模型: ${r.model} · 输入: ${r.input} · 耗时: ${r.time}</div>
+          <div class="text-[10px] text-fgdim mt-1 truncate">输出: ${r.output}</div>
+        </div>
+        <div class="text-right shrink-0">
+          <div class="text-sm font-mono ${confColor}">${r.conf.toFixed(2)}</div>
+          <div class="text-[10px] text-muted">置信度</div>
+        </div>
+      </div>`;
+  }).join('');
+}
+
+function initAnnotateCharts() {
+  // 置信度分布
+  new Chart(document.getElementById('chart-conf-dist'), {
+    type: 'bar',
+    data: {
+      labels: ['0-0.3','0.3-0.5','0.5-0.7','0.7-0.85','0.85-0.95','0.95-1.0'],
+      datasets: [{
+        label: '数据量',
+        data: [120, 340, 1280, 4560, 18920, 4620],
+        backgroundColor: ['#ff475740','#ff475760','#ffb02060','#ffb02080','#00e59b60','#00e59b80'],
+        borderColor: ['#ff4757','#ff4757','#ffb020','#ffb020','#00e59b','#00e59b'],
+        borderWidth: 1, borderRadius: 4
+      }]
+    },
+    options: {
+      responsive: true, maintainAspectRatio: false,
+      scales: {
+        x: { 
+          grid: { display: false }, 
+          ticks: { color: '#5a6d8a', font: { size: 9, family: 'JetBrains Mono' } },
+          title: {
+            display: true,
+            text: '置信度区间',
+            color: '#8a9bb8',
+            font: { size: 10, family: 'Noto Sans SC' }
+          }
+        },
+        y: { 
+          grid: { color: '#1a274420' }, 
+          ticks: { color: '#5a6d8a', font: { size: 9, family: 'JetBrains Mono' } },
+          title: {
+            display: true,
+            text: '数量',
+            color: '#8a9bb8',
+            font: { size: 10, family: 'Noto Sans SC' }
+          }
+        }
+      },
+      plugins: { 
+        legend: { display: false },
+        tooltip: {
+          callbacks: {
+            label: function(context) {
+              return '数量: ' + context.parsed.y.toLocaleString();
+            }
+          }
+        }
+      }
+    }
+  });
+
+  // 标注类型统计
+  new Chart(document.getElementById('chart-annot-type'), {
+    type: 'polarArea',
+    data: {
+      labels: ['目标检测','点云分割','指令生成','动作分解','多模态对齐','深度估计'],
+      datasets: [{ 
+        label: '标注数量',
+        data: [45200, 18200, 24800, 12600, 31400, 8900], 
+        backgroundColor: ['#00e59b40','#00c4ff40','#ffb02040','#a78bfa40','#ff475740','#34d39940'], 
+        borderWidth: 0 
+      }]
+    },
+    options: {
+      responsive: true, maintainAspectRatio: false,
+      scales: { 
+        r: { 
+          grid: { color: '#1a274440' }, 
+          ticks: { display: false },
+          pointLabels: {
+            color: '#8a9bb8',
+            font: { size: 9, family: 'Noto Sans SC' }
+          }
+        } 
+      },
+      plugins: { 
+        legend: { 
+          position: 'right', 
+          labels: { 
+            color: '#8a9bb8', 
+            font: { size: 9, family: 'Noto Sans SC' }, 
+            padding: 8, 
+            usePointStyle: true, 
+            pointStyleWidth: 6 
+          } 
+        },
+        tooltip: {
+          callbacks: {
+            label: function(context) {
+              return context.label + ': ' + context.parsed.r.toLocaleString();
+            }
+          }
+        }
+      }
+    }
+  });
+}
+
+function switchAnnotateTab(btn, view) {
+  btn.parentElement.querySelectorAll('.tab-btn').forEach(b => b.classList.remove('active'));
+  btn.classList.add('active');
+  ['pipeline','results','review'].forEach(v => {
+    document.getElementById(`annotate-view-${v}`).style.display = v === view ? 'block' : 'none';
+  });
+}
+
+function startPipeline() {
+  showToast('自动标注流水线已启动，预计处理 8,420 条数据', 'accent');
+  // 模拟进度更新
+  let progress = 73;
+  const fill = document.querySelector('#pipe-2 .progress-fill');
+  const label = document.querySelector('#pipe-2 .font-mono');
+  if (fill && label) {
+    const interval = setInterval(() => {
+      progress += Math.random() * 5;
+      if (progress >= 100) { progress = 100; clearInterval(interval); }
+      fill.style.width = progress + '%';
+      label.textContent = `进行中 ${Math.round(progress)}%`;
+    }, 500);
+  }
+}
+
+// ============ 模型迭代页面 ============
+function renderVersionTimeline() {
+  const container = document.getElementById('version-timeline');
+  container.innerHTML = versionData.map(v => {
+    const statusConfig = {
+      training: { dot: 'active', tag: 'bg-accent2/15 text-accent2', text: '训练中' },
+      deployed: { dot: 'deployed', tag: 'bg-accent/15 text-accent', text: '已部署' },
+      archived: { dot: '', tag: 'bg-card border border-border text-muted', text: '已归档' },
+      failed: { dot: '', tag: 'bg-danger/15 text-danger', text: '失败' },
+    };
+    const s = statusConfig[v.status];
+    return `
+      <div class="version-line stat-card mb-3">
+        <div class="version-dot ${s.dot}"></div>
+        <div class="flex items-center justify-between mb-2">
+          <div class="flex items-center gap-3">
+            <span class="text-base font-bold font-mono text-fg">${v.ver}</span>
+            <span class="tag ${s.tag}">${s.text}</span>
+            <span class="text-[10px] text-muted font-mono">${v.date}</span>
+          </div>
+          <div class="text-xs font-mono ${v.success==='-'?'text-muted':parseFloat(v.success)>93?'text-accent':'text-fgdim'}">${v.success==='-'?'-':'SR '+v.success}</div>
+        </div>
+        <div class="text-xs text-muted mb-1">${v.note}</div>
+        <div class="flex gap-4 text-[10px] text-muted">
+          <span>数据量: ${v.data}</span>
+          <span>训练: ${v.epochs} epochs</span>
+        </div>
+      </div>`;
+  }).join('');
+}
+
+let modelChartsInit = false;
+function initModelCharts() {
+  if (modelChartsInit) return;
+  modelChartsInit = true;
+
+  // 损失曲线
+  const lossSteps = Array.from({length:24}, (_, i) => `E${i+1}`);
+  const lossVals = [0.82,0.68,0.54,0.46,0.40,0.36,0.33,0.30,0.28,0.26,0.25,0.24,0.23,0.22,0.21,0.20,0.20,0.19,0.19,0.18,0.18,0.17,0.17,0.16];
+  new Chart(document.getElementById('chart-loss'), {
+    type: 'line',
+    data: {
+      labels: lossSteps,
+      datasets: [
+        { label: 'Train Loss', data: lossVals, borderColor: '#00e59b', backgroundColor: '#00e59b10', fill: true, tension: 0.3, pointRadius: 0, borderWidth: 2 },
+        { label: 'Val Loss', data: lossVals.map(v => v + 0.03 + Math.random()*0.02), borderColor: '#00c4ff', backgroundColor: '#00c4ff10', fill: true, tension: 0.3, pointRadius: 0, borderWidth: 2, borderDash: [4,4] }
+      ]
+    },
+    options: {
+      responsive: true, maintainAspectRatio: false,
+      scales: {
+        x: { grid: { color: '#1a274420' }, ticks: { color: '#5a6d8a', font: { size: 9, family: 'JetBrains Mono' }, maxTicksLimit: 12 } },
+        y: { grid: { color: '#1a274420' }, ticks: { color: '#5a6d8a', font: { size: 9, family: 'JetBrains Mono' } } }
+      },
+      plugins: { legend: { labels: { color: '#8a9bb8', font: { size: 10 }, usePointStyle: true, pointStyleWidth: 8 } } }
+    }
+  });
+
+  // 学习率
+  const lrVals = lossSteps.map((_, i) => {
+    const t = i / 23;
+    return t < 0.1 ? 1e-4 * (t/0.1) : t < 0.8 ? 1e-4 : 1e-4 * (1 - (t-0.8)/0.2);
+  });
+  new Chart(document.getElementById('chart-lr'), {
+    type: 'line',
+    data: {
+      labels: lossSteps,
+      datasets: [{ label: 'Learning Rate', data: lrVals, borderColor: '#ffb020', backgroundColor: '#ffb02010', fill: true, tension: 0.1, pointRadius: 0, borderWidth: 2 }]
+    },
+    options: {
+      responsive: true, maintainAspectRatio: false,
+      scales: {
+        x: { grid: { color: '#1a274420' }, ticks: { color: '#5a6d8a', font: { size: 9, family: 'JetBrains Mono' }, maxTicksLimit: 12 } },
+        y: { grid: { color: '#1a274420' }, ticks: { color: '#5a6d8a', font: { size: 9, family: 'JetBrains Mono' }, callback: v => v.toExponential(0) } }
+      },
+      plugins: { legend: { labels: { color: '#8a9bb8', font: { size: 10 }, usePointStyle: true, pointStyleWidth: 8 } } }
+    }
+  });
+
+  // GPU 监控
+  const gpuTime = Array.from({length:30}, (_, i) => `${i}s`);
+  const gpuData = Array.from({length:30}, () => 82 + Math.random()*12);
+  const memData = Array.from({length:30}, () => 65 + Math.random()*10);
+  new Chart(document.getElementById('chart-gpu'), {
+    type: 'line',
+    data: {
+      labels: gpuTime,
+      datasets: [
+        { label: 'GPU %', data: gpuData, borderColor: '#00e59b', pointRadius: 0, borderWidth: 1.5, tension: 0.3 },
+        { label: 'MEM %', data: memData, borderColor: '#00c4ff', pointRadius: 0, borderWidth: 1.5, tension: 0.3 }
+      ]
+    },
+    options: {
+      responsive: true, maintainAspectRatio: false, animation: { duration: 0 },
+      scales: {
+        x: { grid: { display: false }, ticks: { color: '#5a6d8a', font: { size: 8, family: 'JetBrains Mono' }, maxTicksLimit: 10 } },
+        y: { min: 0, max: 100, grid: { color: '#1a274420' }, ticks: { color: '#5a6d8a', font: { size: 8, family: 'JetBrains Mono' }, callback: v => v+'%' } }
+      },
+      plugins: { legend: { labels: { color: '#8a9bb8', font: { size: 9 }, usePointStyle: true, pointStyleWidth: 6 } } }
+    }
+  });
+
+  // 版本对比
+  new Chart(document.getElementById('chart-compare'), {
+    type: 'radar',
+    data: {
+      labels: ['Success Rate', '导航能力', '抓取精度', '指令理解', '泛化能力', '推理速度'],
+      datasets: [
+        { label: 'v46 (当前)', data: [94.2, 92, 91, 95, 88, 90], borderColor: '#00e59b', backgroundColor: '#00e59b15', pointBackgroundColor: '#00e59b', borderWidth: 2 },
+        { label: 'v44', data: [92.8, 90, 88, 93, 85, 92], borderColor: '#00c4ff', backgroundColor: '#00c4ff15', pointBackgroundColor: '#00c4ff', borderWidth: 2 },
+        { label: 'v42', data: [91.5, 87, 85, 91, 82, 94], borderColor: '#ffb020', backgroundColor: '#ffb02015', pointBackgroundColor: '#ffb020', borderWidth: 2 },
+      ]
+    },
+    options: {
+      responsive: true, maintainAspectRatio: false,
+      scales: { r: { min: 75, max: 100, grid: { color: '#1a274440' }, angleLines: { color: '#1a274440' }, ticks: { display: false }, pointLabels: { color: '#8a9bb8', font: { size: 10, family: 'Noto Sans SC' } } } },
+      plugins: { legend: { labels: { color: '#8a9bb8', font: { size: 10 }, usePointStyle: true, pointStyleWidth: 8, padding: 16 } } }
+    }
+  });
+}
+
+function switchModelTab(btn, view) {
+  btn.parentElement.querySelectorAll('.tab-btn').forEach(b => b.classList.remove('active'));
+  btn.classList.add('active');
+  ['versions','training','compare'].forEach(v => {
+    document.getElementById(`model-view-${v}`).style.display = v === view ? 'block' : 'none';
+  });
+  if (view === 'training' || view === 'compare') initModelCharts();
+}
+
+// ============ Agent 工作流页面 ============
+function drawAgentLines() {
+  const canvas = document.getElementById('agent-lines');
+  const container = document.getElementById('agent-canvas');
+  if (!canvas || !container) return;
+  canvas.width = container.offsetWidth;
+  canvas.height = container.offsetHeight;
+  const ctx = canvas.getContext('2d');
+  ctx.clearRect(0, 0, canvas.width, canvas.height);
+
+  const connections = [
+    ['an-1','an-2'],['an-2','an-3'],['an-3','an-4'],['an-4','an-5'],
+    ['an-5','an-6'],['an-5','an-2'],['an-6','an-7'],['an-7','an-8']
+  ];
+
+  connections.forEach(([fromId, toId]) => {
+    const from = document.getElementById(fromId);
+    const to = document.getElementById(toId);
+    if (!from || !to) return;
+    const fp = from.getBoundingClientRect();
+    const tp = to.getBoundingClientRect();
+    const cp = container.getBoundingClientRect();
+    const x1 = fp.left - cp.left + fp.width/2;
+    const y1 = fp.top - cp.top + fp.height/2;
+    const x2 = tp.left - cp.left + tp.width/2;
+    const y2 = tp.top - cp.top + tp.height/2;
+
+    // 退回连线用虚线
+    if (fromId === 'an-5' && toId === 'an-2') {
+      ctx.setLineDash([4,4]);
+      ctx.strokeStyle = '#ffb02060';
+    } else {
+      ctx.setLineDash([]);
+      ctx.strokeStyle = '#00e59b40';
+    }
+
+    ctx.lineWidth = 2;
+    ctx.beginPath();
+
+    // 简单贝塞尔曲线
+    const midX = (x1+x2)/2, midY = (y1+y2)/2;
+    if (Math.abs(y1-y2) > Math.abs(x1-x2)) {
+      ctx.moveTo(x1,y1);
+      ctx.bezierCurveTo(x1, midY, x2, midY, x2, y2);
+    } else {
+      ctx.moveTo(x1,y1);
+      ctx.bezierCurveTo(midX, y1, midX, y2, x2, y2);
+    }
+    ctx.stroke();
+    ctx.setLineDash([]);
+
+    // 箭头
+    const angle = Math.atan2(y2-y1, x2-x1);
+    const arrowLen = 8;
+    // 找到曲线末端的切线方向（简化：用终点方向）
+    const ax = x2 - Math.cos(angle) * arrowLen;
+    const ay = y2 - Math.sin(angle) * arrowLen;
+    ctx.fillStyle = ctx.strokeStyle;
+    ctx.beginPath();
+    ctx.moveTo(x2, y2);
+    ctx.lineTo(ax - Math.cos(angle - 0.4)*arrowLen, ay - Math.sin(angle - 0.4)*arrowLen);
+    ctx.lineTo(ax - Math.cos(angle + 0.4)*arrowLen, ay - Math.sin(angle + 0.4)*arrowLen);
+    ctx.fill();
+  });
+}
+
+const nodeProps = {
+  'an-1': { name: '数据源接入', desc: '从多个数据源拉取原始数据，支持图像/点云/文本三种模态', params: ['数据源: S3 / 本地 / API', '拉取频率: 实时', '格式校验: 开启'] },
+  'an-2': { name: '预处理管线', desc: '对原始数据进行清洗、裁剪、增强等预处理操作', params: ['图像增强: 随机裁剪/翻转/颜色抖动', '点云体素化: 0.02m', '文本清洗: 去重/标准化'] },
+  'an-3': { name: '自动标注', desc: '调用多模型集成进行自动标注，输出结构化标注结果', params: ['检测模型: DINO-v2 + SAM', '分割模型: PointGroup++', '文本模型: LLaMA-3-8B'] },
+  'an-4': { name: '质量检查', desc: '对标注结果进行多维度质量评估', params: ['置信度阈值: 0.85', '一致性检查: 开启', '异常检测: 开启'] },
+  'an-5': { name: '条件分支', desc: '根据质量检查结果分流数据', params: ['通过条件: quality >= 0.85', '通过 -> 模型训练', '不通过 -> 预处理管线'] },
+  'an-6': { name: '模型训练', desc: '使用高质量标注数据进行模型迭代训练', params: ['基础模型: OpenVLA-7B', '学习率: 1e-4 (cosine)', '批次大小: 64'] },
+  'an-7': { name: '效果评估', desc: '在离线测试集和在线A/B测试中评估新版本', params: ['测试集: holdout 5%', 'A/B流量: 10%', '评估指标: SR / 完成率 / 延迟'] },
+  'an-8': { name: '部署发布', desc: '通过灰度发布策略上线新版本模型', params: ['发布策略: 灰度 -> 全量', '回滚条件: SR 下降 > 1%', '监控间隔: 5min'] },
+};
+
+function selectAgentNode(el) {
+  document.querySelectorAll('.agent-node').forEach(n => n.classList.remove('selected'));
+  el.classList.add('selected');
+  const props = nodeProps[el.id];
+  const content = document.getElementById('prop-content');
+  if (props) {
+    content.innerHTML = `
+      <div class="text-sm font-semibold text-fg mb-2">${props.name}</div>
+      <div class="text-xs text-muted mb-4 leading-relaxed">${props.desc}</div>
+      <div class="text-[10px] text-muted uppercase tracking-wider mb-2 font-mono">参数配置</div>
+      <div class="space-y-2">
+        ${props.params.map(p => {
+          const [k,v] = p.split(': ');
+          return `<div class="bg-surface rounded-lg p-2.5 border border-border">
+            <div class="text-[10px] text-muted">${k}</div>
+            <div class="text-xs text-fg mt-0.5">${v}</div>
+          </div>`;
+        }).join('')}
+      </div>
+    `;
+  }
+}
+
+function dragNode(e, type) { e.dataTransfer.setData('nodeType', type); }
+function dropNode(e) {
+  e.preventDefault();
+  const type = e.dataTransfer.getData('nodeType');
+  if (!type) return;
+  const container = document.getElementById('agent-nodes-container');
+  const rect = document.getElementById('agent-canvas').getBoundingClientRect();
+  const x = e.clientX - rect.left - 70;
+  const y = e.clientY - rect.top - 30;
+  const nodeNames = {
+    'data-source': ['数据源','fas fa-database','text-accent'],
+    'preprocess': ['预处理','fas fa-cogs','text-accent2'],
+    'annotator': ['标注器','fas fa-tags','text-warn'],
+    'quality': ['质检','fas fa-shield-check','text-danger'],
+    'trainer': ['训练','fas fa-brain','text-purple-400'],
+    'evaluator': ['评估','fas fa-chart-bar','text-accent'],
+    'deployer': ['部署','fas fa-rocket','text-accent2'],
+    'condition': ['分支','fas fa-code-branch','text-warn'],
+  };
+  const [name, icon, color] = nodeNames[type] || ['节点','fas fa-cube','text-accent'];
+  const id = 'an-' + Date.now();
+  const div = document.createElement('div');
+  div.className = 'agent-node absolute';
+  div.style.cssText = `top:${Math.max(20,y)}px;left:${Math.max(10,x)}px;`;
+  div.id = id;
+  div.onclick = () => selectAgentNode(div);
+  div.innerHTML = `<i class="${icon} ${color} text-sm mb-1"></i><div class="text-xs font-medium">${name}</div><div class="text-[10px] text-muted">新节点</div>`;
+  container.appendChild(div);
+  // 添加属性
+  nodeProps[id] = { name, desc: `新添加的${name}节点`, params: ['待配置'] };
+  drawAgentLines();
+  showToast(`已添加 ${name} 节点`, 'accent');
+}
+
+function runAgentFlow() {
+  showToast('Agent 工作流已启动执行，可在日志中查看进度', 'accent2');
+  // 节点动画
+  const nodes = document.querySelectorAll('#agent-nodes-container .agent-node');
+  nodes.forEach((n, i) => {
+    setTimeout(() => {
+      n.style.borderColor = '#00e59b';
+      n.style.boxShadow = '0 0 20px rgba(0,229,155,0.2)';
+      setTimeout(() => {
+        n.style.borderColor = '';
+        n.style.boxShadow = '';
+      }, 600);
+    }, i * 400);
+  });
+}
+
+// ============ 闭环流程连线动画 ============
+function drawLoopLines() {
+  const canvas = document.getElementById('loop-canvas');
+  if (!canvas) return;
+  const parent = canvas.parentElement;
+  canvas.width = parent.offsetWidth;
+  canvas.height = parent.offsetHeight;
+  const ctx = canvas.getContext('2d');
+  const nodes = parent.querySelectorAll('.relative.z-10 > .text-center');
+  if (nodes.length < 5) return;
+
+  let t = 0;
+  function animate() {
+    ctx.clearRect(0, 0, canvas.width, canvas.height);
+    const points = Array.from(nodes).map(n => {
+      const r = n.getBoundingClientRect();
+      const pr = parent.getBoundingClientRect();
+      return { x: r.left - pr.left + r.width/2, y: r.top - pr.top + r.height/2 };
+    });
+
+    for (let i = 0; i < points.length; i++) {
+      const next = (i+1) % points.length;
+      const p1 = points[i], p2 = points[next];
+      ctx.strokeStyle = `rgba(0,229,155,${0.08 + 0.04 * Math.sin(t*0.02 + i)})`;
+      ctx.lineWidth = 1.5;
+      ctx.setLineDash([4,6]);
+      ctx.lineDashOffset = -t * 0.5;
+      ctx.beginPath();
+      if (i < points.length - 1) {
+        ctx.moveTo(p1.x, p1.y);
+        ctx.lineTo(p2.x, p2.y);
+      } else {
+        // 最后一环：从右下绕到左上
+        ctx.moveTo(p1.x, p1.y);
+        ctx.bezierCurveTo(p1.x + 30, p1.y + 40, p2.x - 30, p2.y - 40, p2.x, p2.y);
+      }
+      ctx.stroke();
+      ctx.setLineDash([]);
+
+      // 流动点
+      const progress = ((t * 0.008 + i * 0.2) % 1);
+      const px = p1.x + (p2.x - p1.x) * progress;
+      const py = p1.y + (p2.y - p1.y) * progress;
+      ctx.fillStyle = '#00e59b';
+      ctx.beginPath();
+      ctx.arc(px, py, 2.5, 0, Math.PI * 2);
+      ctx.fill();
+    }
+    t++;
+    requestAnimationFrame(animate);
+  }
+  animate();
+}
+
+// ============ 背景粒子 ============
+function initParticles() {
+  const canvas = document.getElementById('bg-particles');
+  const ctx = canvas.getContext('2d');
+  let w, h;
+  const particles = [];
+
+  function resize() {
+    w = canvas.width = window.innerWidth;
+    h = canvas.height = window.innerHeight;
+  }
+  resize();
+  window.addEventListener('resize', () => { resize(); drawAgentLines(); drawLoopLines(); });
+
+  for (let i = 0; i < 60; i++) {
+    particles.push({
+      x: Math.random() * w, y: Math.random() * h,
+      vx: (Math.random() - 0.5) * 0.3, vy: (Math.random() - 0.5) * 0.3,
+      size: Math.random() * 1.5 + 0.5,
+      alpha: Math.random() * 0.3 + 0.05
+    });
+  }
+
+  function animate() {
+    ctx.clearRect(0, 0, w, h);
+    particles.forEach(p => {
+      p.x += p.vx; p.y += p.vy;
+      if (p.x < 0) p.x = w; if (p.x > w) p.x = 0;
+      if (p.y < 0) p.y = h; if (p.y > h) p.y = 0;
+      ctx.fillStyle = `rgba(0, 229, 155, ${p.alpha})`;
+      ctx.beginPath();
+      ctx.arc(p.x, p.y, p.size, 0, Math.PI * 2);
+      ctx.fill();
+    });
+
+    // 连线
+    for (let i = 0; i < particles.length; i++) {
+      for (let j = i+1; j < particles.length; j++) {
+        const dx = particles[i].x - particles[j].x;
+        const dy = particles[i].y - particles[j].y;
+        const dist = Math.sqrt(dx*dx + dy*dy);
+        if (dist < 150) {
+          ctx.strokeStyle = `rgba(0, 229, 155, ${0.03 * (1 - dist/150)})`;
+          ctx.lineWidth = 0.5;
+          ctx.beginPath();
+          ctx.moveTo(particles[i].x, particles[i].y);
+          ctx.lineTo(particles[j].x, particles[j].y);
+          ctx.stroke();
+        }
+      }
+    }
+    requestAnimationFrame(animate);
+  }
+  animate();
+}
+
+// ============ 初始化 ============
+function init() {
+  initParticles();
+  initDashboardCharts();
+  renderActivities();
+  renderImageData();
+  renderPointCloudData();
+  renderTextData();
+  renderBatchTable();
+  renderAnnotationResults();
+  initAnnotateCharts();
+  renderVersionTimeline();
+  setTimeout(() => {
+    drawLoopLines();
+    drawAgentLines();
+  }, 100);
+}
+
+document.addEventListener('DOMContentLoaded', init);
+</script>
+</body>
+</html>

@@ -10,7 +10,7 @@ The surrounding DataLoop console can remain a concept dashboard in this iteratio
 
 The repository already has a conversational main Agent exposed by `vla-data-agent`. The Agent uses `VLASessionAgent`, `SessionController`, `SessionToolRuntime`, and a transport-neutral event system. The TUI consumes normalized events through `apply_event()` and `TuiState`, which are already tested for Main, Workflow, Plan, Executor, reasoning, tool lifecycle, and final reply events.
 
-The reference HTML, `data_loop_v1.1.html`, provides the desired dark DataLoop console style and broad platform concept. It should inform the visual language, layout density, colors, and product framing, but not define backend scope. In this iteration, the concept pages are a shell around the real chat integration.
+The reference HTML at `./data_loop_v1.1.html` provides the desired dark DataLoop console style and broad platform concept. The first frontend implementation should continue from this page rather than starting from a separate visual shell. It should inform the visual language, layout density, colors, and product framing, but not define backend scope. In this iteration, the concept pages are a shell around the real chat integration.
 
 External agent UI patterns suggest separating conversation sessions from execution runs:
 
@@ -261,7 +261,7 @@ Shown when DataPilot has no active session selected for input, including:
 The view uses the DataLoop dark visual language and contains:
 
 - a large title: `开始一个任务`;
-- a single prominent composer;
+- a single prominent composer with placeholder text `我们要做什么？`;
 - no historical messages;
 - no backend session id.
 
