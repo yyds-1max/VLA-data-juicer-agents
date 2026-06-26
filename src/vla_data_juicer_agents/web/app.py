@@ -123,7 +123,7 @@ async def _drain_controller_events(
         await drain_once()
         drained_to_completion = True
     finally:
-        result = _consume_turn_result(controller)
+        result = await _consume_turn_result_when_idle(controller)
         if drained_to_completion and result is not None:
             text = getattr(result, "text", None)
             if isinstance(text, str) and text and text not in persisted_final_texts:
@@ -139,6 +139,17 @@ def _final_event_text(event: dict[str, Any]) -> str | None:
         return None
     text = payload.get("text")
     return text if isinstance(text, str) and text else None
+
+
+async def _consume_turn_result_when_idle(controller: Any, *, timeout_sec: float = 5.0) -> Any | None:
+    if hasattr(controller, "is_running"):
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + timeout_sec
+        while getattr(controller, "is_running"):
+            if loop.time() >= deadline:
+                break
+            await asyncio.sleep(0.03)
+    return _consume_turn_result(controller)
 
 
 def _consume_turn_result(controller: Any) -> Any | None:

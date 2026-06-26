@@ -1,13 +1,15 @@
 from __future__ import annotations
 
+import asyncio
 import time
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from types import SimpleNamespace
 
+import pytest
 from fastapi.testclient import TestClient
 
-from vla_data_juicer_agents.web.app import create_app
+from vla_data_juicer_agents.web.app import _drain_controller_events, create_app
 
 
 class FakeController:
@@ -163,6 +165,51 @@ def test_get_session_returns_persisted_messages_after_turn_submission(tmp_path: 
             break
         time.sleep(0.01)
     assert [message["content"] for message in messages].count("完成: 开始处理") == 1
+
+
+def test_failed_event_drain_consumes_result_after_controller_stops(tmp_path: Path):
+    class FailingDrainController(FakeController):
+        created = []
+
+        def __init__(self, **kwargs):
+            super().__init__(**kwargs)
+            self.is_running = True
+            self.consume_called = False
+            self.consumed = False
+            self._result = SimpleNamespace(text="cleanup text")
+            FailingDrainController.created.append(self)
+
+        def drain_events(self):
+            asyncio.get_running_loop().call_later(0.01, setattr, self, "is_running", False)
+            raise RuntimeError("drain failed")
+
+        def consume_turn_result(self):
+            self.consume_called = True
+            if self.is_running:
+                raise RuntimeError("Turn is still running.")
+            self.consumed = True
+            result = self._result
+            self._result = None
+            return result
+
+    app = create_app(
+        working_dir=str(tmp_path / ".djx"),
+        db_path=tmp_path / "sessions.sqlite",
+        controller_factory=FailingDrainController,
+    )
+    session = app.state.manager.create_session("处理 20270605 的室外导航数据")
+    controller = FailingDrainController.created[0]
+
+    async def exercise() -> None:
+        with pytest.raises(RuntimeError, match="drain failed"):
+            await _drain_controller_events(session.id, app.state.manager, app.state.store, app.state.bus)
+
+    asyncio.run(exercise())
+
+    assert controller.consume_called is True
+    assert controller.consumed is True
+    assert controller.is_running is False
+    assert [message.content for message in app.state.store.get_session(session.id).messages] == []
 
 
 def test_interrupt_returns_true_for_active_session(tmp_path: Path):
