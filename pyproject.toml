@@ -10,9 +10,11 @@ readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
     "agentscope==2.0.1",
+    "fastapi>=0.115",
     "pydantic>=2.7",
     "PyYAML>=6.0",
     "rich>=13.7.0",
+    "uvicorn[standard]>=0.30",
 ]
 
 [project.optional-dependencies]
@@ -23,6 +25,7 @@ dev = [
 [project.scripts]
 vla-nav-agent = "vla_data_juicer_agents.cli:main"
 vla-data-agent = "vla_data_juicer_agents.session_cli:main"
+vla-data-agent-web = "vla_data_juicer_agents.web.cli:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]
