@@ -47,6 +47,13 @@ Out of scope:
 
 Use an event-native Web service rather than parsing CLI or TUI output.
 
+Frontend stack:
+
+- React, TypeScript, and Vite for the first Web app.
+- Tailwind CSS for the DataLoop dark console styling.
+- shadcn/ui and Radix UI for accessible, source-owned UI primitives such as dialogs, popovers, buttons, inputs, scroll areas, and tooltips.
+- Zustand for app-level state, with a pure reducer/event-handler layer for normalized Agent events.
+
 The backend adds a lightweight Web layer that reuses the current session and event infrastructure:
 
 - `SessionManager`: owns frontend sessions and maps each `session_id` to an isolated main Agent session.
@@ -87,20 +94,20 @@ The frontend must not call this endpoint merely because the page loaded, the flo
 
 Clicking `New Session` in the UI:
 
-1. Marks the current session as no longer active in the frontend.
-2. Switches the chat window to draft new-session state.
-3. Clears the visible message list.
-4. Resets active run state.
-5. Keeps global app settings such as model and working directory.
-6. Does not create a backend session until the user sends a message.
+1. Switches the chat window to draft new-session state.
+2. Keeps the current active session alive in the frontend until the draft message is actually submitted.
+3. Clears the visible draft area, but does not destroy the previous session's state.
+4. Keeps global app settings such as model and working directory.
+5. Does not create a backend session until the user sends a message.
 
 When the first message is sent from draft state:
 
-1. Call `POST /api/sessions`.
-2. Switch to the returned `session_id`.
-3. Immediately call `POST /api/sessions/{session_id}/turns` with the user's message.
-4. Generate the session title from that first user message.
-5. Add the session to recent history.
+1. Mark the previously active session as no longer active for first-version frontend purposes.
+2. Call `POST /api/sessions`.
+3. Switch to the returned `session_id`.
+4. Immediately call `POST /api/sessions/{session_id}/turns` with the user's message.
+5. Generate the session title from that first user message.
+6. Add the session to recent history.
 
 ### Session History
 
@@ -142,10 +149,12 @@ Lifecycle rules:
 
 - First page load and first floating-window open show `draft_new_session` unless a recent active session exists.
 - Browser refresh or reopening the page restores the most recent active session when the backend service still has its active Agent state.
-- Clicking `New` moves the UI to `draft_new_session`; the previous session becomes historical and should not be resumed as a live Agent state in the first version.
+- Clicking `New` moves the UI to `draft_new_session`, but the previous active session is not marked historical until the user submits the first draft message.
+- Closing the browser tab, closing the frontend page, refreshing the page, temporary network loss, or frontend crash only disconnects the frontend. It must not immediately mark the active session historical or inactive.
 - Closing the floating window only hides DataPilot; it does not end the active session.
-- Backend service restart clears in-memory active Agent state. Persisted sessions remain as historical transcripts only.
+- Backend service normal shutdown should mark the active session inactive when possible. Backend service crash or restart clears in-memory active Agent state; persisted sessions remain as historical transcripts only.
 - The first version has no explicit "end session" button. A future archive/end action can be designed separately.
+- Idle timeout after frontend disconnect is deferred. The first version should not end sessions solely because the frontend disappeared.
 
 ### Interruption
 
@@ -374,6 +383,8 @@ The state reducer should:
 9. Render the final assistant reply exactly once.
 10. Treat pending workflow state as backend context, not a visible first-version UI feature.
 
+Keep normalized event handling in framework-light pure functions wherever possible. React components should subscribe to derived Zustand state rather than parsing backend events directly. This lets the frontend reuse fake Main/Workflow/Plan/Executor event sequences from existing TUI tests for reducer unit tests.
+
 ## Data Flow
 
 1. Page boots.
@@ -403,8 +414,9 @@ Starting a new session:
 1. User clicks `New`.
 2. UI switches to `DraftNewSessionView`.
 3. No backend session is created yet.
-4. The previous active session becomes historical for first-version purposes.
-5. The first submitted draft message creates the new backend session and first turn.
+4. The previous active session remains active in memory until a draft message is submitted.
+5. The first submitted draft message marks the previous active session as historical for first-version purposes.
+6. The first submitted draft message creates the new backend session and first turn.
 
 ## Error Handling
 
@@ -443,6 +455,12 @@ Backend service restart:
 - in-memory active Agent state is gone;
 - the UI should show a draft new-session screen or a restored historical transcript, not claim that old work is still live.
 
+Frontend disconnect:
+
+- browser tab close, page refresh, frontend crash, and temporary network loss are treated as disconnects only;
+- do not mark the session inactive immediately;
+- if the backend still has active Agent state when the frontend returns, restore the most recent active session.
+
 ## Testing Strategy
 
 Backend tests:
@@ -464,11 +482,13 @@ Frontend tests:
 - header shows DataPilot;
 - first open with no recent active session shows `开始一个任务`;
 - draft new-session screen does not create a backend session until first submit;
-- New switches to draft new-session state and clears the window without creating a backend session;
+- New switches to draft new-session state without creating a backend session or marking the previous active session historical;
 - first draft submit creates a session and submits the first turn;
+- first draft submit marks the previous active session historical;
 - History shows only title and updated time;
 - selecting history restores messages without showing pending workflow controls;
 - browser refresh restores the most recent active session when the backend still has active state;
+- closing or refreshing the frontend does not immediately mark the active session historical;
 - sending a message starts a running state;
 - running state shows the stop icon instead of send;
 - stop calls the interrupt endpoint;
@@ -478,6 +498,8 @@ Frontend tests:
 - child Agent activity collapses after completion;
 - expanded child Agent details show summaries and compact tool lines;
 - tool status bullet colors match completed, failed, interrupted, waiting, and paused states.
+- reducer/event-handler unit tests consume normalized event fixtures without rendering React.
+- component tests verify Zustand-derived UI state rather than duplicating backend event parsing in components.
 
 Integration tests:
 
@@ -496,7 +518,8 @@ Manual verification:
 - verify Plan/Executor updates display during execution;
 - verify completed sub-agent work collapses;
 - expand details and inspect compact tool lines;
-- click `New` and verify no empty history session is created;
+- click `New` and verify no empty history session is created and the previous active session is not marked historical yet;
+- submit the first draft message and verify the previous active session is then treated as historical;
 - switch back through History and confirm transcript restoration without live-resume prompts;
 - start a request and use the stop icon.
 
