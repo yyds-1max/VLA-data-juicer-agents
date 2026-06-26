@@ -164,7 +164,14 @@ class _CalibrationConfirmationPauseSink:
             return
         if source != self._source_prefix and not source.startswith(f"{self._source_prefix}."):
             return
-        if _contains_calibration_confirmation_pause(event.get("payload", {})):
+        payload = event.get("payload", {})
+        if (
+            isinstance(payload, Mapping)
+            and payload.get("error_type") == _CALIBRATION_CONFIRMATION_PAUSE_TOKEN
+        ):
+            self.detected = True
+            return
+        if _contains_calibration_confirmation_pause(payload):
             self.detected = True
 
 
@@ -439,6 +446,7 @@ async def continue_vla_workflow(
             event_scope=executor_scope,
             cancellation=cancellation,
             response_language=args.response_language,
+            resume_from_checkpoint=True,
         )
         checkpoint = WorkflowCheckpoint(
             status="completed",

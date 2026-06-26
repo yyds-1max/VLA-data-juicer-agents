@@ -104,13 +104,16 @@ class AgentScopeEventAdapter:
             state = self._tools.pop(call_id, _ToolState())
             if self._emit_tool_events and state.started:
                 result_text = "".join(state.result)
-                self._scope.emit(
-                    "tool_end",
-                    tool=state.name,
-                    call_id=call_id,
-                    status=self._tool_status(getattr(event, "state", "success"), result_text),
-                    summary=summarize_progress(result_text),
-                )
+                payload = {
+                    "tool": state.name,
+                    "call_id": call_id,
+                    "status": self._tool_status(getattr(event, "state", "success"), result_text),
+                    "summary": summarize_progress(result_text),
+                }
+                error_type = _result_payload_error_type(result_text)
+                if error_type:
+                    payload["error_type"] = error_type
+                self._scope.emit("tool_end", **payload)
 
     def close_active_tools(self, status: str) -> None:
         tools = self._tools
@@ -190,3 +193,19 @@ def _result_payload_failed(result_text: str) -> bool:
     except json.JSONDecodeError:
         return False
     return isinstance(payload, dict) and payload.get("ok") is False
+
+
+def _result_payload_error_type(result_text: str) -> str:
+    text = result_text.strip()
+    if not text:
+        return ""
+    try:
+        payload = json.loads(text)
+    except json.JSONDecodeError:
+        return ""
+    if not isinstance(payload, dict):
+        return ""
+    error_type = payload.get("error_type")
+    if not error_type and isinstance(payload.get("details"), dict):
+        error_type = payload["details"].get("error_type")
+    return error_type.strip() if isinstance(error_type, str) else ""

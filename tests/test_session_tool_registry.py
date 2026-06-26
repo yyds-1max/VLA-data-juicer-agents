@@ -1140,6 +1140,86 @@ def test_vla_run_workflow_detects_calibration_pause_from_executor_event(tmp_path
     assert checkpoint["status"] == "waiting_for_user_confirmation"
 
 
+def test_vla_run_workflow_detects_calibration_pause_from_tool_error_type_after_truncated_summary(tmp_path, monkeypatch):
+    runtime = SessionToolRuntime(state=SessionState())
+    plan_payload = {
+        "date": "20270605",
+        "segments": ["20260605_152856"],
+        "scene_mode": "out",
+        "processing_profile": "parameterized_navigation_v1",
+        "platform_hint": "go2w",
+        "steps": [],
+    }
+    plan = SimpleNamespace(
+        model_dump=lambda mode="json": plan_payload,
+        model_dump_json=lambda: json.dumps(plan_payload),
+    )
+
+    async def fake_run_plan_agent(*args, **kwargs):
+        return plan
+
+    class ExecutorAgent:
+        async def reply_stream(self, _msg):
+            result = {
+                "ok": False,
+                "message": "Calibration parameters still need user confirmation.",
+                "details": {
+                    "notes": ["x" * 300],
+                    "error_type": "calibration_params_not_confirmed",
+                },
+            }
+            yield SimpleNamespace(
+                type="TOOL_RESULT_START",
+                tool_call_id="call-1",
+                tool_call_name="confirm_navigation_calibration_params",
+            )
+            yield SimpleNamespace(
+                type="TOOL_RESULT_TEXT_DELTA",
+                tool_call_id="call-1",
+                delta=json.dumps(result),
+            )
+            yield SimpleNamespace(type="TOOL_RESULT_END", tool_call_id="call-1", state="success")
+            yield SimpleNamespace(
+                type="TEXT_BLOCK_DELTA",
+                delta="Execution stopped before processing.",
+            )
+
+    monkeypatch.setenv("VLA_RUNS_ROOT", str(tmp_path / "runs"))
+    monkeypatch.setattr("vla_data_juicer_agents.tools.vla.run_workflow.create_plan_agent", lambda model=None, request=None: "plan-agent")
+    monkeypatch.setattr(
+        "vla_data_juicer_agents.tools.vla.run_workflow.create_executor_agent",
+        lambda model=None, dry_run=False, cancellation=None: ExecutorAgent(),
+    )
+    monkeypatch.setattr("vla_data_juicer_agents.tools.vla.run_workflow.run_plan_agent", fake_run_plan_agent)
+
+    ctx = ToolContext(
+        working_dir=str(tmp_path),
+        artifacts_dir=str(tmp_path / ".djx"),
+        runtime_values={"session_runtime": runtime},
+    )
+
+    payload = asyncio.run(
+        run_vla_workflow(
+            ctx,
+            {
+                "date": "20270605",
+                "segments": ["20260605_152856"],
+                "scene_mode": "out",
+                "dry_run": True,
+                "approve": True,
+            },
+        )
+    )
+
+    assert payload["ok"] is False
+    assert payload["status"] == "waiting_for_user_confirmation"
+    assert payload["final_output"] == "Execution stopped before processing."
+    assert "calibration_params_not_confirmed" not in payload["final_output"]
+    assert runtime.state.pending_workflow_status == "waiting_for_user_confirmation"
+    checkpoint = json.loads((Path(payload["run_dir"]) / "checkpoint.json").read_text(encoding="utf-8"))
+    assert checkpoint["status"] == "waiting_for_user_confirmation"
+
+
 def test_continue_workflow_requires_current_session_pending_state(tmp_path):
     ctx = ToolContext(working_dir=str(tmp_path), runtime_values={})
 
@@ -1275,6 +1355,7 @@ def test_continue_workflow_confirms_and_executes_existing_plan_without_replannin
         captured["plan"] = workflow_plan
         captured["run_dir"] = kwargs["run_dir"]
         captured["response_language"] = kwargs["response_language"]
+        captured["resume_from_checkpoint"] = kwargs["resume_from_checkpoint"]
         return "resumed"
 
     monkeypatch.setattr("vla_data_juicer_agents.tools.vla.run_workflow.create_plan_agent", lambda *args, **kwargs: "plan-agent")
@@ -1302,6 +1383,7 @@ def test_continue_workflow_confirms_and_executes_existing_plan_without_replannin
     assert captured["agent"] == "executor-qwen-test-False"
     assert captured["run_dir"] == run_dir
     assert captured["response_language"] == "Chinese"
+    assert captured["resume_from_checkpoint"] is True
     assert [step.step_id for step in captured["plan"].steps] == ["prepare_raw_data"]
     assert captured["plan"].steps[0].preconditions == []
     checkpoint = json.loads((run_dir / "checkpoint.json").read_text(encoding="utf-8"))

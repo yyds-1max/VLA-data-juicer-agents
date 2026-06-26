@@ -1,4 +1,5 @@
 import asyncio
+import json
 from types import SimpleNamespace
 
 import pytest
@@ -135,6 +136,38 @@ def test_tool_result_success_with_false_ok_payload_maps_failed():
 
     assert events[-1]["payload"]["status"] == "failed"
     assert "Tracking failed." in events[-1]["payload"]["summary"]
+
+
+def test_tool_result_end_includes_error_type_from_full_json_details():
+    scope, events = _scope_and_events()
+    adapter = AgentScopeEventAdapter(scope)
+    result = {
+        "ok": False,
+        "message": "Calibration parameters still need user confirmation.",
+        "details": {
+            "notes": ["x" * 300],
+            "error_type": "calibration_params_not_confirmed",
+        },
+    }
+
+    adapter.accept(
+        SimpleNamespace(
+            type="TOOL_RESULT_START",
+            tool_call_id="call-1",
+            tool_call_name="confirm_navigation_calibration_params",
+        )
+    )
+    adapter.accept(
+        SimpleNamespace(
+            type="TOOL_RESULT_TEXT_DELTA",
+            tool_call_id="call-1",
+            delta=json.dumps(result),
+        )
+    )
+    adapter.accept(SimpleNamespace(type="TOOL_RESULT_END", tool_call_id="call-1", state="success"))
+
+    assert "calibration_params_not_confirmed" not in events[-1]["payload"]["summary"]
+    assert events[-1]["payload"]["error_type"] == "calibration_params_not_confirmed"
 
 
 def test_emit_tool_events_false_suppresses_tool_events():

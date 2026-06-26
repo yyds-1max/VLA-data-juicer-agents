@@ -572,12 +572,25 @@ async def run_executor_agent(
     event_scope: EventScope | None = None,
     cancellation: CancellationContext | None = None,
     response_language: str | None = None,
+    resume_from_checkpoint: bool = False,
 ) -> str:
+    execution_context = (
+        "This is a resumed execution from an already-confirmed checkpoint. "
+        "confirm_navigation_calibration_params was completed in the previous turn and is intentionally omitted "
+        "from the remaining WorkflowPlan. Do not call confirm_navigation_calibration_params again, do not wait "
+        "for calibration confirmation again, and execute the supplied remaining WorkflowPlan as given. "
+        "The gen_box.py GUI step remains human-blocking; wait until the human finishes before continuing. "
+        if resume_from_checkpoint
+        else (
+            "The calibration confirmation and gen_box.py GUI steps are human-blocking; "
+            "confirm_navigation_calibration_params must be the first step before prepare_raw_data or any "
+            "processing, and wait until the human finishes before continuing. "
+        )
+    )
     prompt = (
         "Execute this WorkflowPlan JSON step-by-step using the matching execution tools. Stop on any "
-        "failed tool result. The calibration confirmation and gen_box.py GUI steps are human-blocking; "
-        "confirm_navigation_calibration_params must be the first step before prepare_raw_data or any "
-        "processing, and wait until the human finishes before continuing. scene_mode is required and must be either in "
+        f"failed tool result. {execution_context}"
+        "scene_mode is required and must be either in "
         "or out. Prepare gridmap after run_tracking and before run_projection_and_trajectory. Supported "
         "tool names include run_tracking, prepare_gridmap_for_projection, and run_projection_and_trajectory. "
         f"{PUBLIC_PROGRESS_PROMPT} Return a concise final execution summary.\n\n"
