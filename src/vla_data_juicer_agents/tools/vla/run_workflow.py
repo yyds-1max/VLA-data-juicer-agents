@@ -17,6 +17,7 @@ from vla_data_juicer_agents.navigation.run_state import WorkflowRunStore
 from vla_data_juicer_agents.navigation.workflow import run_executor_agent, run_plan_agent
 
 _CALIBRATION_CONFIRMATION_PAUSE_TOKEN = "calibration_params_not_confirmed"
+_RESUMABLE_CHECKPOINT_STATUSES = {"waiting_for_user_confirmation", "paused_by_user"}
 
 
 class RunVLAWorkflowInput(BaseModel):
@@ -383,22 +384,7 @@ async def continue_vla_workflow(
 
     run_store = WorkflowRunStore(run_dir.parent.parent)
     user_input = args.user_input.strip()
-    if user_input == "终止":
-        checkpoint = _load_checkpoint(run_dir).model_copy(update={"status": "paused_by_user"})
-        _write_checkpoint(run_store, run_dir, checkpoint)
-        runtime.state.pending_workflow_status = "paused_by_user"
-        payload = RunVLAWorkflowOutput(
-            ok=False,
-            status="paused_by_user",
-            run_dir=str(run_dir),
-            artifacts=_artifact_paths(run_dir),
-            error_type="paused_by_user",
-            message="当前工作流已按用户要求暂停；本会话内仍可继续。",
-        ).model_dump(mode="json")
-        run_store.write_json(run_dir, "final_report.json", payload)
-        return payload
-
-    if user_input not in {"确认", "继续", "我改好了，继续", "继续上次任务"}:
+    if user_input not in {"确认", "继续", "我改好了，继续", "继续上次任务", "终止"}:
         return RunVLAWorkflowOutput(
             ok=False,
             status="needs_user_input",
@@ -428,9 +414,40 @@ async def continue_vla_workflow(
             terminal_status = status
             workflow_scope.emit("agent_end", status=status)
 
+    checkpoint: WorkflowCheckpoint | None = None
     try:
         cancellation.raise_if_cancelled()
         checkpoint = _load_checkpoint(run_dir)
+        if checkpoint.status not in _RESUMABLE_CHECKPOINT_STATUSES:
+            _clear_pending_workflow(ctx)
+            payload = RunVLAWorkflowOutput(
+                ok=False,
+                status="needs_active_session_workflow",
+                run_dir=str(run_dir),
+                artifacts=_artifact_paths(run_dir),
+                error_type="workflow_not_resumable",
+                message="当前工作流已结束或失败，不能继续；请重新发起处理请求。",
+            ).model_dump(mode="json")
+            run_store.write_json(run_dir, "final_report.json", payload)
+            emit_terminal("needs_active_session_workflow")
+            return payload
+
+        if user_input == "终止":
+            checkpoint = checkpoint.model_copy(update={"status": "paused_by_user"})
+            _write_checkpoint(run_store, run_dir, checkpoint)
+            runtime.state.pending_workflow_status = "paused_by_user"
+            payload = RunVLAWorkflowOutput(
+                ok=False,
+                status="paused_by_user",
+                run_dir=str(run_dir),
+                artifacts=_artifact_paths(run_dir),
+                error_type="paused_by_user",
+                message="当前工作流已按用户要求暂停；本会话内仍可继续。",
+            ).model_dump(mode="json")
+            run_store.write_json(run_dir, "final_report.json", payload)
+            emit_terminal("paused_by_user")
+            return payload
+
         plan = _load_plan(run_dir)
         remaining_plan = _plan_without_completed_confirmation(plan)
         executor_agent = create_executor_agent(
@@ -482,8 +499,11 @@ async def continue_vla_workflow(
         emit_terminal("interrupted")
         raise
     except Exception as exc:
-        checkpoint = _load_checkpoint(run_dir).model_copy(update={"status": "failed"})
-        _write_checkpoint(run_store, run_dir, checkpoint)
+        if checkpoint is not None:
+            try:
+                _write_checkpoint(run_store, run_dir, checkpoint.model_copy(update={"status": "failed"}))
+            except Exception:
+                pass
         payload = RunVLAWorkflowOutput(
             ok=False,
             status="failed",
@@ -493,6 +513,7 @@ async def continue_vla_workflow(
             message=str(exc),
         ).model_dump(mode="json")
         run_store.write_json(run_dir, "final_report.json", payload)
+        _clear_pending_workflow(ctx)
         emit_terminal("failed")
         return payload
 
