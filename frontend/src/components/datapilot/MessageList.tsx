@@ -1,16 +1,14 @@
 import type { ChatMessageRecord } from "../../api/types";
-import type { RunState, TimelineItem } from "../../store/eventReducer";
+import type { ActiveAgent, ActiveTool, RunState, TimelineItem } from "../../store/eventReducer";
 import { cn } from "../../lib/utils";
+import { AgentRunSummary, ToolStatusDot, type AgentRunTimelineItem } from "./AgentRunSummary";
 
 type MessageListProps = {
   messages: ChatMessageRecord[];
   run: RunState;
 };
 
-type OrderedTimelineItem = TimelineItem & {
-  createdAt?: string;
-  sequence?: number;
-};
+type OrderedTimelineItem = AgentRunTimelineItem;
 
 type MessageEntry = {
   type: "message";
@@ -28,11 +26,21 @@ type TimelineEntry = {
   item: OrderedTimelineItem;
 };
 
-type RenderEntry = MessageEntry | TimelineEntry;
+type AgentRunSummaryEntry = {
+  type: "agent-run-summary";
+  key: string;
+  timestamp: number;
+  sequence: number;
+  source: string;
+  items: OrderedTimelineItem[];
+};
+
+type ChronologicalEntry = MessageEntry | TimelineEntry;
+type RenderEntry = ChronologicalEntry | AgentRunSummaryEntry;
 
 export function MessageList({ messages, run }: MessageListProps) {
   const hasContent = messages.length > 0 || run.timeline.length > 0 || Boolean(run.activeText);
-  const entries = chronologicalEntries(messages, run.timeline);
+  const entries = renderEntries(messages, run);
 
   return (
     <div className="flex min-h-0 flex-1 flex-col gap-3 overflow-y-auto px-4 py-4 sm:px-5">
@@ -41,6 +49,8 @@ export function MessageList({ messages, run }: MessageListProps) {
           {entries.map((entry) =>
             entry.type === "message" ? (
               <MessageBubble key={entry.key} message={entry.message} />
+            ) : entry.type === "agent-run-summary" ? (
+              <AgentRunSummary key={entry.key} source={entry.source} items={entry.items} />
             ) : (
               <TimelineBubble key={entry.key} item={entry.item} />
             ),
@@ -60,7 +70,57 @@ export function MessageList({ messages, run }: MessageListProps) {
   );
 }
 
-function chronologicalEntries(messages: ChatMessageRecord[], timeline: TimelineItem[]): RenderEntry[] {
+function renderEntries(messages: ChatMessageRecord[], run: RunState): RenderEntry[] {
+  const entries = chronologicalEntries(messages, run.timeline);
+  const childGroups = completedChildGroups(entries, run);
+  const emittedGroups = new Set<string>();
+
+  return entries.flatMap((entry): RenderEntry[] => {
+    if (entry.type !== "timeline" || !isChildTimelineItem(entry.item)) {
+      return [entry];
+    }
+
+    const groupKey = childRunKey(entry.item);
+    const group = childGroups.get(groupKey);
+    if (!group) {
+      return [entry];
+    }
+    if (emittedGroups.has(groupKey)) {
+      return [];
+    }
+
+    emittedGroups.add(groupKey);
+    return [
+      {
+        type: "agent-run-summary",
+        key: `agent-run-summary-${groupKey}`,
+        timestamp: entry.timestamp,
+        sequence: entry.sequence,
+        source: group[0]?.item.source ?? entry.item.source,
+        items: group.map((item) => item.item),
+      },
+    ];
+  });
+}
+
+function completedChildGroups(entries: ChronologicalEntry[], run: RunState): Map<string, TimelineEntry[]> {
+  const groups = new Map<string, TimelineEntry[]>();
+
+  for (const entry of entries) {
+    if (entry.type !== "timeline" || !isChildTimelineItem(entry.item) || isChildRunActive(entry.item, run)) {
+      continue;
+    }
+
+    const groupKey = childRunKey(entry.item);
+    const group = groups.get(groupKey) ?? [];
+    group.push(entry);
+    groups.set(groupKey, group);
+  }
+
+  return groups;
+}
+
+function chronologicalEntries(messages: ChatMessageRecord[], timeline: TimelineItem[]): ChronologicalEntry[] {
   return [
     ...messages.map((message, index) => ({
       type: "message" as const,
@@ -80,6 +140,28 @@ function chronologicalEntries(messages: ChatMessageRecord[], timeline: TimelineI
       };
     }),
   ].sort((left, right) => left.timestamp - right.timestamp || left.sequence - right.sequence);
+}
+
+function isChildTimelineItem(item: TimelineItem): boolean {
+  return item.source !== "main" && item.kind !== "assistant";
+}
+
+function isChildRunActive(item: TimelineItem, run: RunState): boolean {
+  return (
+    Object.values(run.activeAgents).some((agent) => activeMatchesItem(agent, item)) ||
+    Object.values(run.activeTools).some((tool) => activeMatchesItem(tool, item))
+  );
+}
+
+function activeMatchesItem(active: ActiveAgent | ActiveTool, item: TimelineItem): boolean {
+  if (item.runId && active.runId === item.runId) {
+    return true;
+  }
+  return active.source === item.source;
+}
+
+function childRunKey(item: TimelineItem): string {
+  return item.runId ? `run:${item.runId}` : `source:${item.source}`;
 }
 
 function timestampMs(value: string | undefined): number {
@@ -117,7 +199,14 @@ function TimelineBubble({ item }: { item: TimelineItem }) {
         <span>{item.kind === "assistant" ? "DataPilot" : item.kind}</span>
         <span className="truncate normal-case tracking-normal">{item.source}</span>
       </div>
-      <p className="whitespace-pre-wrap break-words">{item.text}</p>
+      {item.kind === "tool" ? (
+        <div className="flex min-w-0 items-center gap-2 whitespace-pre-wrap break-words">
+          <ToolStatusDot status={item.status} />
+          <span className="min-w-0 break-words">{item.text}</span>
+        </div>
+      ) : (
+        <p className="whitespace-pre-wrap break-words">{item.text}</p>
+      )}
     </article>
   );
 }

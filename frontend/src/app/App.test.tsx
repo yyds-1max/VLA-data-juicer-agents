@@ -33,6 +33,11 @@ const apiMocks = vi.mocked({
   openSessionEvents,
 });
 
+type TestTimelineItem = ReturnType<typeof createEmptyRunState>["timeline"][number] & {
+  createdAt: string;
+  sequence: number;
+};
+
 beforeEach(() => {
   vi.clearAllMocks();
   apiMocks.createSession.mockResolvedValue({
@@ -518,6 +523,171 @@ test("message list keeps earlier timeline output before later user messages", ()
 
   const text = screen.getByText("较早的助手输出").compareDocumentPosition(screen.getByText("较新的用户消息"));
   expect(text & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+});
+
+test("completed child run renders a collapsed summary row by default and expands details", () => {
+  const run = createEmptyRunState();
+  run.timeline = [
+    {
+      kind: "reasoning",
+      source: "navigation.plan",
+      text: "检查数据目录",
+      runId: "plan-run",
+      parentRunId: "main-run",
+      createdAt: "2026-06-26T00:02:00Z",
+      sequence: 1,
+    },
+    {
+      kind: "tool",
+      source: "navigation.plan",
+      text: "completed read_file 0.0s",
+      status: "completed",
+      runId: "plan-run",
+      parentRunId: "main-run",
+      createdAt: "2026-06-26T00:02:01Z",
+      sequence: 2,
+    },
+    {
+      kind: "tool",
+      source: "navigation.plan",
+      text: "completed read_file 0.0s",
+      status: "completed",
+      runId: "plan-run",
+      parentRunId: "main-run",
+      createdAt: "2026-06-26T00:02:02Z",
+      sequence: 3,
+    },
+    {
+      kind: "tool",
+      source: "navigation.plan",
+      text: "completed exec_command 0.0s",
+      status: "completed",
+      runId: "plan-run",
+      parentRunId: "main-run",
+      createdAt: "2026-06-26T00:02:03Z",
+      sequence: 4,
+    },
+  ] as TestTimelineItem[];
+
+  render(<MessageList messages={[]} run={run} />);
+
+  const summary = screen.getByRole("button", { name: /已读取 2 个文件，执行了 1 条命令/ });
+  expect(summary).toBeVisible();
+  expect(summary).toHaveAttribute("aria-expanded", "false");
+  expect(screen.queryByText("检查数据目录")).not.toBeInTheDocument();
+  expect(screen.queryByText("completed exec_command 0.0s")).not.toBeInTheDocument();
+
+  fireEvent.click(summary);
+
+  expect(summary).toHaveAttribute("aria-expanded", "true");
+  expect(screen.getByText("检查数据目录")).toBeVisible();
+  expect(screen.getByText("completed exec_command 0.0s")).toBeVisible();
+});
+
+test("active child run details remain visible and are not folded", () => {
+  const run = createEmptyRunState();
+  run.activeAgents["plan-run"] = {
+    source: "navigation.plan",
+    runId: "plan-run",
+    parentRunId: "main-run",
+  };
+  run.timeline = [
+    {
+      kind: "reasoning",
+      source: "navigation.plan",
+      text: "正在判断导航数据类型",
+      runId: "plan-run",
+      parentRunId: "main-run",
+      createdAt: "2026-06-26T00:02:00Z",
+      sequence: 1,
+    },
+    {
+      kind: "tool",
+      source: "navigation.plan",
+      text: "completed classify_navigation_dataset_tool 0.0s",
+      status: "completed",
+      runId: "plan-run",
+      parentRunId: "main-run",
+      createdAt: "2026-06-26T00:02:01Z",
+      sequence: 2,
+    },
+  ] as TestTimelineItem[];
+
+  render(<MessageList messages={[]} run={run} />);
+
+  expect(screen.getByText("正在判断导航数据类型")).toBeVisible();
+  expect(screen.getByText("completed classify_navigation_dataset_tool 0.0s")).toBeVisible();
+  expect(screen.queryByRole("button", { name: /完成了 1 个工具/ })).not.toBeInTheDocument();
+});
+
+test("completed child run summary keeps chronological position before later messages", () => {
+  const run = createEmptyRunState();
+  run.timeline = [
+    {
+      kind: "tool",
+      source: "navigation.executor",
+      text: "completed exec_command 0.0s",
+      status: "completed",
+      runId: "executor-run",
+      parentRunId: "workflow-run",
+      createdAt: "2026-06-26T00:02:00Z",
+      sequence: 1,
+    },
+  ] as TestTimelineItem[];
+
+  render(
+    <MessageList
+      messages={[
+        {
+          id: "message-1",
+          session_id: "session-1",
+          role: "user",
+          content: "稍后的用户消息",
+          created_at: "2026-06-26T00:03:00Z",
+        },
+      ]}
+      run={run}
+    />,
+  );
+
+  const position = screen
+    .getByRole("button", { name: /执行了 1 条命令/ })
+    .compareDocumentPosition(screen.getByText("稍后的用户消息"));
+  expect(position & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+});
+
+test("child run tool details expose success and failure status dot tones", () => {
+  const run = createEmptyRunState();
+  run.timeline = [
+    {
+      kind: "tool",
+      source: "navigation.executor",
+      text: "completed classify_navigation_dataset_tool 0.0s",
+      status: "completed",
+      runId: "executor-run",
+      parentRunId: "workflow-run",
+      createdAt: "2026-06-26T00:02:00Z",
+      sequence: 1,
+    },
+    {
+      kind: "tool",
+      source: "navigation.executor",
+      text: "failed validate_navigation_dataset_tool 0.1s",
+      status: "failed",
+      runId: "executor-run",
+      parentRunId: "workflow-run",
+      createdAt: "2026-06-26T00:02:01Z",
+      sequence: 2,
+    },
+  ] as TestTimelineItem[];
+
+  const { container } = render(<MessageList messages={[]} run={run} />);
+
+  fireEvent.click(screen.getByRole("button", { name: /完成了 2 个工具/ }));
+
+  expect(container.querySelector('[data-status="success"]')).toHaveClass("text-emerald-300");
+  expect(container.querySelector('[data-status="failure"]')).toHaveClass("text-rose-300");
+  expect(screen.getByText("failed validate_navigation_dataset_tool 0.1s")).toBeVisible();
 });
 
 test("running stop interrupts the current turn without leaving active mode", async () => {
