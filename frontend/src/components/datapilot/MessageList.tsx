@@ -143,7 +143,7 @@ function chronologicalEntries(messages: ChatMessageRecord[], timeline: TimelineI
 }
 
 function isChildTimelineItem(item: TimelineItem): boolean {
-  return item.source !== "main" && item.kind !== "assistant";
+  return item.source !== "main";
 }
 
 function isChildRunActive(item: TimelineItem, run: RunState): boolean {

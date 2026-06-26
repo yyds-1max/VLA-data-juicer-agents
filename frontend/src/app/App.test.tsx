@@ -656,6 +656,62 @@ test("completed child run summary keeps chronological position before later mess
   expect(position & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
 });
 
+test("completed child run folds child assistant final output into summary details", () => {
+  const run = createEmptyRunState();
+  run.timeline = [
+    {
+      kind: "reasoning",
+      source: "navigation.executor",
+      text: "整理执行结论",
+      runId: "executor-run",
+      parentRunId: "workflow-run",
+      createdAt: "2026-06-26T00:02:00Z",
+      sequence: 1,
+    },
+    {
+      kind: "assistant",
+      source: "navigation.executor",
+      text: "子任务已完成：导航数据可继续清洗。",
+      runId: "executor-run",
+      parentRunId: "workflow-run",
+      createdAt: "2026-06-26T00:02:01Z",
+      sequence: 2,
+    },
+  ] as TestTimelineItem[];
+
+  render(<MessageList messages={[]} run={run} />);
+
+  const summary = screen.getByRole("button", { name: /记录了 1 条进展/ });
+  expect(summary).toBeVisible();
+  expect(screen.queryByText("子任务已完成：导航数据可继续清洗。")).not.toBeInTheDocument();
+
+  fireEvent.click(summary);
+
+  expect(screen.getByText("整理执行结论")).toBeVisible();
+  expect(screen.getByText("子任务已完成：导航数据可继续清洗。")).toBeVisible();
+});
+
+test("main assistant output remains a DataPilot timeline bubble and is not folded", () => {
+  const run = createEmptyRunState();
+  run.timeline = [
+    {
+      kind: "assistant",
+      source: "main",
+      text: "这是 DataPilot 的最终回复。",
+      runId: "main-run",
+      parentRunId: null,
+      createdAt: "2026-06-26T00:02:00Z",
+      sequence: 1,
+    },
+  ] as TestTimelineItem[];
+
+  render(<MessageList messages={[]} run={run} />);
+
+  expect(screen.getByText("这是 DataPilot 的最终回复。")).toBeVisible();
+  expect(screen.getByText("DataPilot")).toBeVisible();
+  expect(screen.queryByRole("button")).not.toBeInTheDocument();
+});
+
 test("child run tool details expose success and failure status dot tones", () => {
   const run = createEmptyRunState();
   run.timeline = [
