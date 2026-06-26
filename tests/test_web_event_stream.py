@@ -33,6 +33,31 @@ async def _assert_event_bus_scopes_by_session():
             await asyncio.wait_for(queue.get(), timeout=0.05)
 
 
+def test_event_bus_isolates_events_between_subscribers():
+    asyncio.run(_assert_event_bus_isolates_events_between_subscribers())
+
+
+async def _assert_event_bus_isolates_events_between_subscribers():
+    bus = SessionEventBus()
+    original_event = {
+        "type": "reasoning",
+        "payload": {"steps": [{"summary": "working"}]},
+    }
+
+    async with bus.subscribe("session_1") as queue_1:
+        async with bus.subscribe("session_1") as queue_2:
+            await bus.publish("session_1", original_event)
+            event_1 = await asyncio.wait_for(queue_1.get(), timeout=1)
+            event_2 = await asyncio.wait_for(queue_2.get(), timeout=1)
+
+    assert event_1 is not event_2
+
+    event_1["payload"]["steps"][0]["summary"] = "mutated"
+
+    assert event_2["payload"]["steps"][0]["summary"] == "working"
+    assert original_event["payload"]["steps"][0]["summary"] == "working"
+
+
 def test_event_bus_unsubscribes_when_context_exits():
     asyncio.run(_assert_event_bus_unsubscribes_when_context_exits())
 
@@ -42,6 +67,8 @@ async def _assert_event_bus_unsubscribes_when_context_exits():
 
     async with bus.subscribe("session_1") as queue:
         pass
+
+    assert "session_1" not in bus._subscribers
 
     await bus.publish("session_1", {"type": "final", "payload": {"text": "done"}})
 

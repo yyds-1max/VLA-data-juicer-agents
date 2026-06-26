@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
+from copy import deepcopy
 from typing import Any
 
 
@@ -25,4 +26,4 @@ class SessionEventBus:
 
     async def publish(self, session_id: str, event: dict[str, Any]) -> None:
         for queue in list(self._subscribers.get(session_id, ())):
-            await queue.put(event)
+            await queue.put(deepcopy(event))
