@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 
-import type { AgentEvent, ChatMessageRecord, SessionRecord } from "../api/types";
+import type { AgentEvent, ChatMessageRecord, SessionDetail, SessionRecord } from "../api/types";
 import { createEmptyRunState, applyAgentEvent } from "./eventReducer";
 import { createDataPilotStore } from "./datapilotStore";
 
@@ -39,6 +39,14 @@ function message(overrides: Partial<ChatMessageRecord> = {}): ChatMessageRecord 
     role: "user",
     content: "hello",
     created_at: "2026-06-26T00:00:00Z",
+    ...overrides,
+  };
+}
+
+function sessionDetail(overrides: Partial<SessionDetail> = {}): SessionDetail {
+  return {
+    ...session(overrides),
+    messages: [],
     ...overrides,
   };
 }
@@ -206,5 +214,47 @@ describe("datapilotStore", () => {
     store.getState().applyEvent(event("final", "main", { text: "duplicate answer" }, { run_id: "final-run" }));
 
     expect(store.getState().run.timeline.filter((item) => item.kind === "assistant")).toHaveLength(1);
+  });
+
+  it("merges active session refresh messages without dropping newer local messages", () => {
+    const store = createDataPilotStore();
+
+    store.getState().setActiveSession(session());
+    store.getState().appendUserMessage(
+      message({
+        id: "local-message",
+        content: "new local turn",
+        created_at: "2026-06-26T00:02:00Z",
+      }),
+    );
+
+    store.getState().refreshActiveSession(
+      sessionDetail({
+        messages: [
+          message({
+            id: "persisted-message",
+            role: "assistant",
+            content: "persisted answer",
+            created_at: "2026-06-26T00:01:00Z",
+          }),
+        ],
+      }),
+    );
+
+    expect(store.getState().messages.map((item) => item.content)).toEqual(["persisted answer", "new local turn"]);
+  });
+
+  it("refreshing an active session keeps live run state from the event stream", () => {
+    const store = createDataPilotStore();
+
+    store.getState().setActiveSession(session());
+    store.getState().applyEvent(event("agent_start", "main"));
+    store.getState().applyEvent(event("reasoning", "main", { summary: "live reasoning" }));
+
+    store.getState().refreshActiveSession(sessionDetail({ messages: [message()] }));
+
+    expect(store.getState().run.running).toBe(true);
+    expect(store.getState().run.activeText).toBe("[Main] 正在思考");
+    expect(store.getState().run.timeline).toMatchObject([{ kind: "reasoning", text: "live reasoning" }]);
   });
 });

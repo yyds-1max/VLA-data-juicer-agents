@@ -71,8 +71,7 @@ export function createDataPilotStore() {
 
         return {
           sessions: upsertSession(state.sessions, session),
-          messages: [...session.messages],
-          run: createEmptyRunState(),
+          messages: mergeMessages(state.messages, session.messages),
         };
       }),
 
@@ -113,6 +112,46 @@ export const datapilotStore = createDataPilotStore();
 function upsertSession(sessions: SessionRecord[], session: SessionRecord): SessionRecord[] {
   const next = sessions.filter((item) => item.id !== session.id);
   return [session, ...next];
+}
+
+function mergeMessages(existing: ChatMessageRecord[], persisted: ChatMessageRecord[]): ChatMessageRecord[] {
+  const orderById = new Map<string, number>();
+  let nextOrder = 0;
+  for (const message of [...existing, ...persisted]) {
+    if (!orderById.has(message.id)) {
+      orderById.set(message.id, nextOrder);
+      nextOrder += 1;
+    }
+  }
+
+  const byId = new Map<string, ChatMessageRecord>();
+  for (const message of existing) {
+    byId.set(message.id, message);
+  }
+  for (const message of persisted) {
+    byId.set(message.id, message);
+  }
+
+  return [...byId.values()].sort((left, right) => compareMessages(left, right, orderById));
+}
+
+function compareMessages(
+  left: ChatMessageRecord,
+  right: ChatMessageRecord,
+  orderById: Map<string, number>,
+): number {
+  const leftTime = Date.parse(left.created_at);
+  const rightTime = Date.parse(right.created_at);
+  if (!Number.isNaN(leftTime) && !Number.isNaN(rightTime) && leftTime !== rightTime) {
+    return leftTime - rightTime;
+  }
+
+  const createdAtOrder = left.created_at.localeCompare(right.created_at);
+  if (createdAtOrder !== 0) {
+    return createdAtOrder;
+  }
+
+  return (orderById.get(left.id) ?? 0) - (orderById.get(right.id) ?? 0);
 }
 
 function cloneRunState(run: RunState): RunState {
