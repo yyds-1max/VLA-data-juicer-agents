@@ -1,3 +1,5 @@
+import { AppShell } from "./AppShell";
+
 export function App() {
-  return <div>DataPilot</div>;
+  return <AppShell>{null}</AppShell>;
 }
