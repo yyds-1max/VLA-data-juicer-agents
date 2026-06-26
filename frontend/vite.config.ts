@@ -1,7 +1,8 @@
 import react from "@vitejs/plugin-react";
-import { defineConfig } from "vite";
+import { defineConfig, type UserConfig } from "vite";
+import type { InlineConfig } from "vitest";
 
-export default defineConfig({
+const config: UserConfig & { test: InlineConfig } = {
   plugins: [react()],
   server: {
     proxy: {
@@ -11,4 +12,10 @@ export default defineConfig({
       },
     },
   },
-});
+  test: {
+    environment: "jsdom",
+    globals: true,
+  },
+};
+
+export default defineConfig(config);
