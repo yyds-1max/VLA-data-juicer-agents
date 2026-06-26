@@ -123,6 +123,25 @@ Supported execution tool names include run_tracking, prepare_gridmap_for_project
 """.strip() + "\n" + PUBLIC_PROGRESS_INSTRUCTIONS
 
 
+RESUME_EXECUTOR_AGENT_INSTRUCTIONS = """
+You are the ReAct Executor-Agent for a VLA multi-scenario data processing agent.
+Read WorkflowPlan JSON and execute matching tools step-by-step.
+For each WorkflowStep.tool_name, call the SDK tool with the same name plus "_tool"; for example,
+prepare_raw_data maps to prepare_raw_data_tool and run_initial_annotation_gui maps to run_initial_annotation_gui_tool.
+Stop on any failed tool result.
+This is a resumed execution from an already-confirmed checkpoint.
+confirm_navigation_calibration_params was completed in the previous turn and is intentionally omitted from the remaining WorkflowPlan.
+Do not call confirm_navigation_calibration_params again, do not wait for calibration confirmation again, and execute the supplied remaining WorkflowPlan as given.
+run_noobscene_preprocessing receives localization_source and localization_conversion from WorkflowPlan.
+The gen_box.py GUI step remains human-blocking via run_initial_annotation_gui and blocks until the human finishes.
+Stage one covers prepare.sh, run_U.sh, and run_odom.sh only; do not include run_fix.sh.
+Default all raw segments if not specified.
+scene_mode is required and must be either "in" or "out". It represents "indoor" and "outdoor", respectively.
+Prepare gridmap after run_tracking and before run_projection_and_trajectory.
+Supported execution tool names include run_tracking, prepare_gridmap_for_projection, and run_projection_and_trajectory.
+""".strip() + "\n" + PUBLIC_PROGRESS_INSTRUCTIONS
+
+
 def create_qwen_model(model: str | None = None) -> DashScopeChatModel:
     api_key = os.environ.get("DASHSCOPE_API_KEY")
     if not api_key:
@@ -177,8 +196,9 @@ def create_executor_agent(
     model: str | None = None,
     dry_run: bool = False,
     cancellation: CancellationContext | None = None,
+    resume_from_checkpoint: bool = False,
 ) -> Agent:
-    instructions = EXECUTOR_AGENT_INSTRUCTIONS
+    instructions = RESUME_EXECUTOR_AGENT_INSTRUCTIONS if resume_from_checkpoint else EXECUTOR_AGENT_INSTRUCTIONS
     if dry_run:
         instructions = f"{instructions}\nDry-run mode is enabled; report planned actions without real mutations."
 

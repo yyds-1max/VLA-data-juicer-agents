@@ -437,6 +437,7 @@ async def continue_vla_workflow(
             model=model,
             dry_run=checkpoint.dry_run,
             cancellation=cancellation,
+            resume_from_checkpoint=True,
         )
         final_output = await run_executor_agent(
             executor_agent,

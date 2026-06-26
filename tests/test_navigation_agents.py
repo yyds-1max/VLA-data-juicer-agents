@@ -277,6 +277,23 @@ def test_create_executor_agent_has_execution_tools(monkeypatch):
     assert "run_initial_annotation_gui_tool" in tool_names
 
 
+def test_create_executor_agent_resume_instructions_skip_calibration_wait(monkeypatch):
+    monkeypatch.setenv("DASHSCOPE_API_KEY", "test-key")
+
+    agent = create_executor_agent(dry_run=True, resume_from_checkpoint=True)
+    instructions = agent.instructions
+
+    assert "The first WorkflowPlan step must be confirm_navigation_calibration_params" not in instructions
+    assert "When executing confirm_navigation_calibration_params, stop and wait" not in instructions
+    assert "already-confirmed checkpoint" in instructions
+    assert "confirm_navigation_calibration_params was completed in the previous turn" in instructions
+    assert "intentionally omitted from the remaining WorkflowPlan" in instructions
+    assert "Do not call confirm_navigation_calibration_params again" in instructions
+    assert "execute the supplied remaining WorkflowPlan as given" in instructions
+    assert "gen_box.py GUI step remains human-blocking" in instructions
+    assert "Dry-run mode is enabled" in instructions
+
+
 def test_create_qwen_model_uses_agentscope_dashscope(monkeypatch):
     from agentscope.model import DashScopeChatModel
     from vla_data_juicer_agents.navigation.agents import create_qwen_model

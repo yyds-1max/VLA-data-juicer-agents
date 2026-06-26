@@ -1257,19 +1257,32 @@ def test_continue_workflow_marks_paused_on_terminate(tmp_path):
     runtime = SessionToolRuntime(state=SessionState())
     run_dir = tmp_path / "runs" / "20270605" / "run"
     run_dir.mkdir(parents=True)
-    (run_dir / "plan.json").write_text(
-        json.dumps(
+    plan_payload = {
+        "date": "20270605",
+        "segments": ["20260605_152856"],
+        "scene_mode": "out",
+        "processing_profile": "parameterized_navigation_v1",
+        "platform_hint": "go2w",
+        "steps": [
             {
-                "date": "20270605",
-                "segments": ["20260605_152856"],
-                "scene_mode": "out",
-                "processing_profile": "parameterized_navigation_v1",
-                "platform_hint": "go2w",
-                "steps": [],
-            }
-        ),
-        encoding="utf-8",
-    )
+                "step_id": "confirm_navigation_calibration_params",
+                "tool_name": "confirm_navigation_calibration_params",
+                "arguments": {},
+                "preconditions": [],
+                "human_blocking": True,
+                "failure_behavior": "stop",
+                "effects": "read",
+            },
+            {
+                "step_id": "prepare_raw_data",
+                "tool_name": "prepare_raw_data",
+                "arguments": {"date": "20270605"},
+                "preconditions": ["confirm_navigation_calibration_params"],
+                "effects": "execute",
+            },
+        ],
+    }
+    (run_dir / "plan.json").write_text(json.dumps(plan_payload), encoding="utf-8")
     (run_dir / "checkpoint.json").write_text(
         json.dumps(
             {
@@ -1297,6 +1310,87 @@ def test_continue_workflow_marks_paused_on_terminate(tmp_path):
     assert runtime.state.pending_workflow_input_type == "calibration_confirmation"
     checkpoint = json.loads((run_dir / "checkpoint.json").read_text(encoding="utf-8"))
     assert checkpoint["status"] == "paused_by_user"
+
+
+def test_continue_workflow_resumes_after_terminate_and_clears_pending(tmp_path, monkeypatch):
+    runtime = SessionToolRuntime(state=SessionState())
+    run_dir = tmp_path / "runs" / "20270605" / "run"
+    run_dir.mkdir(parents=True)
+    plan_payload = {
+        "date": "20270605",
+        "segments": ["20260605_152856"],
+        "scene_mode": "out",
+        "processing_profile": "parameterized_navigation_v1",
+        "platform_hint": "go2w",
+        "steps": [
+            {
+                "step_id": "confirm_navigation_calibration_params",
+                "tool_name": "confirm_navigation_calibration_params",
+                "arguments": {},
+                "preconditions": [],
+                "human_blocking": True,
+                "failure_behavior": "stop",
+                "effects": "read",
+            },
+            {
+                "step_id": "prepare_raw_data",
+                "tool_name": "prepare_raw_data",
+                "arguments": {"date": "20270605"},
+                "preconditions": ["confirm_navigation_calibration_params"],
+                "effects": "execute",
+            },
+        ],
+    }
+    (run_dir / "plan.json").write_text(json.dumps(plan_payload), encoding="utf-8")
+    (run_dir / "checkpoint.json").write_text(
+        json.dumps(
+            {
+                "status": "waiting_for_user_confirmation",
+                "waiting_step_id": "confirm_navigation_calibration_params",
+                "pending_input_type": "calibration_confirmation",
+                "date": "20270605",
+                "segments": ["20260605_152856"],
+                "scene_mode": "out",
+            }
+        ),
+        encoding="utf-8",
+    )
+    runtime.state.pending_workflow_run_dir = str(run_dir)
+    runtime.state.pending_workflow_status = "waiting_for_user_confirmation"
+    runtime.state.pending_workflow_input_type = "calibration_confirmation"
+    captured = {}
+
+    def fake_create_executor_agent(model=None, dry_run=False, cancellation=None, resume_from_checkpoint=False):
+        captured["resume_from_checkpoint"] = resume_from_checkpoint
+        return "executor-agent"
+
+    async def fake_run_executor_agent(agent, workflow_plan, *args, **kwargs):
+        captured["plan_step_ids"] = [step.step_id for step in workflow_plan.steps]
+        captured["run_executor_resume_from_checkpoint"] = kwargs["resume_from_checkpoint"]
+        return "resumed after pause"
+
+    monkeypatch.setattr(
+        "vla_data_juicer_agents.tools.vla.run_workflow.create_executor_agent",
+        fake_create_executor_agent,
+    )
+    monkeypatch.setattr("vla_data_juicer_agents.tools.vla.run_workflow.run_executor_agent", fake_run_executor_agent)
+    ctx = ToolContext(working_dir=str(tmp_path), runtime_values={"session_runtime": runtime})
+
+    paused = asyncio.run(continue_vla_workflow(ctx, {"user_input": "终止"}))
+    resumed = asyncio.run(continue_vla_workflow(ctx, {"user_input": "继续"}))
+
+    assert paused["status"] == "paused_by_user"
+    assert resumed["ok"] is True
+    assert resumed["status"] == "completed"
+    assert resumed["final_output"] == "resumed after pause"
+    assert captured["resume_from_checkpoint"] is True
+    assert captured["run_executor_resume_from_checkpoint"] is True
+    assert captured["plan_step_ids"] == ["prepare_raw_data"]
+    assert runtime.state.pending_workflow_run_dir is None
+    assert runtime.state.pending_workflow_status is None
+    assert runtime.state.pending_workflow_input_type is None
+    checkpoint = json.loads((run_dir / "checkpoint.json").read_text(encoding="utf-8"))
+    assert checkpoint["status"] == "completed"
 
 
 def test_continue_workflow_confirms_and_executes_existing_plan_without_replanning(tmp_path, monkeypatch):
@@ -1360,9 +1454,13 @@ def test_continue_workflow_confirms_and_executes_existing_plan_without_replannin
 
     monkeypatch.setattr("vla_data_juicer_agents.tools.vla.run_workflow.create_plan_agent", lambda *args, **kwargs: "plan-agent")
     monkeypatch.setattr("vla_data_juicer_agents.tools.vla.run_workflow.run_plan_agent", fail_replan)
+    def fake_create_executor_agent(model=None, dry_run=False, cancellation=None, resume_from_checkpoint=False):
+        captured["executor_resume_from_checkpoint"] = resume_from_checkpoint
+        return f"executor-{model}-{dry_run}"
+
     monkeypatch.setattr(
         "vla_data_juicer_agents.tools.vla.run_workflow.create_executor_agent",
-        lambda model=None, dry_run=False, cancellation=None: f"executor-{model}-{dry_run}",
+        fake_create_executor_agent,
     )
     monkeypatch.setattr("vla_data_juicer_agents.tools.vla.run_workflow.run_executor_agent", fake_run_executor_agent)
     ctx = ToolContext(working_dir=str(tmp_path), runtime_values={"session_runtime": runtime})
@@ -1381,6 +1479,7 @@ def test_continue_workflow_confirms_and_executes_existing_plan_without_replannin
     assert runtime.state.pending_workflow_status is None
     assert runtime.state.pending_workflow_input_type is None
     assert captured["agent"] == "executor-qwen-test-False"
+    assert captured["executor_resume_from_checkpoint"] is True
     assert captured["run_dir"] == run_dir
     assert captured["response_language"] == "Chinese"
     assert captured["resume_from_checkpoint"] is True
@@ -1439,8 +1538,9 @@ def test_continue_workflow_preserves_dry_run_from_checkpoint(tmp_path, monkeypat
     runtime.state.pending_workflow_input_type = "calibration_confirmation"
     captured = {}
 
-    def fake_create_executor_agent(model=None, dry_run=False, cancellation=None):
+    def fake_create_executor_agent(model=None, dry_run=False, cancellation=None, resume_from_checkpoint=False):
         captured["dry_run"] = dry_run
+        captured["resume_from_checkpoint"] = resume_from_checkpoint
         return "executor-agent"
 
     async def fake_run_executor_agent(*args, **kwargs):
@@ -1457,6 +1557,7 @@ def test_continue_workflow_preserves_dry_run_from_checkpoint(tmp_path, monkeypat
 
     assert payload["ok"] is True
     assert captured["dry_run"] is True
+    assert captured["resume_from_checkpoint"] is True
     checkpoint = json.loads((run_dir / "checkpoint.json").read_text(encoding="utf-8"))
     assert checkpoint["dry_run"] is True
 
