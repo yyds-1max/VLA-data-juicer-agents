@@ -478,9 +478,9 @@ def test_plan_agent_draft_tools_finalize_internal_workflow_plan(monkeypatch):
         },
     ]
     assert [step["tool_name"] for step in plan["steps"]] == [
+        "confirm_navigation_calibration_params",
         "prepare_raw_data",
         "extract_and_sync_navigation_data",
-        "confirm_navigation_calibration_params",
         "assemble_finish_temp",
         "run_noobscene_preprocessing",
         "run_initial_annotation_gui",
@@ -625,16 +625,15 @@ def test_plan_template_uses_finish_data_paths_for_gui_and_validation():
         "segments": None,
         "platform_hint": "unknown",
     }
-    assert steps["confirm_navigation_calibration_params"].preconditions == [
-        "extract_and_sync_navigation_data"
-    ]
+    assert steps["confirm_navigation_calibration_params"].preconditions == []
+    assert steps["prepare_raw_data"].preconditions == ["confirm_navigation_calibration_params"]
     assert steps["assemble_finish_temp"].arguments == {
         "date": "20270605",
         "segments": None,
         "processing_profile": "parameterized_navigation_v1",
         "platform_hint": "unknown",
     }
-    assert steps["assemble_finish_temp"].preconditions == ["confirm_navigation_calibration_params"]
+    assert steps["assemble_finish_temp"].preconditions == ["extract_and_sync_navigation_data"]
     assert steps["run_noobscene_preprocessing"].arguments == {
         "finish_temp_path": "finish_data/20270605_temp",
         "localization_source": "odom",
@@ -671,9 +670,9 @@ def test_plan_template_uses_expected_step_order_without_legacy_gridmap_step():
     )
 
     assert [step.tool_name for step in plan.steps] == [
+        "confirm_navigation_calibration_params",
         "prepare_raw_data",
         "extract_and_sync_navigation_data",
-        "confirm_navigation_calibration_params",
         "assemble_finish_temp",
         "run_noobscene_preprocessing",
         "run_initial_annotation_gui",
@@ -720,6 +719,59 @@ def test_validated_workflow_plan_rejects_non_blocking_calibration_confirmation()
         _validated_workflow_plan(plan_with_non_blocking_confirmation)
 
 
+def test_validated_workflow_plan_rejects_calibration_confirmation_with_wrong_tool_name():
+    from vla_data_juicer_agents.navigation.workflow import _validated_workflow_plan
+
+    plan = _parameterized_go2w_plan_without_profile_facts()
+    confirmation = next(
+        step
+        for step in plan.steps
+        if step.step_id == "confirm_navigation_calibration_params"
+    )
+    confirmation.tool_name = "prepare_raw_data"
+
+    with pytest.raises(ValueError, match="invalid_calibration_confirmation_tool"):
+        _validated_workflow_plan(plan)
+
+
+def test_validated_workflow_plan_rejects_calibration_confirmation_after_prepare():
+    from vla_data_juicer_agents.navigation.workflow import _validated_workflow_plan
+
+    plan = _parameterized_go2w_plan_without_profile_facts()
+    confirm_index = next(
+        index
+        for index, step in enumerate(plan.steps)
+        if step.step_id == "confirm_navigation_calibration_params"
+    )
+    prepare_index = next(
+        index
+        for index, step in enumerate(plan.steps)
+        if step.step_id == "prepare_raw_data"
+    )
+    plan.steps[confirm_index], plan.steps[prepare_index] = (
+        plan.steps[prepare_index],
+        plan.steps[confirm_index],
+    )
+
+    with pytest.raises(ValueError, match="before prepare_raw_data"):
+        _validated_workflow_plan(plan)
+
+
+def test_validated_workflow_plan_rejects_calibration_confirmation_not_first_step():
+    from vla_data_juicer_agents.navigation.workflow import _validated_workflow_plan
+
+    plan = _parameterized_go2w_plan_without_profile_facts()
+    confirm_index = next(
+        index
+        for index, step in enumerate(plan.steps)
+        if step.step_id == "confirm_navigation_calibration_params"
+    )
+    plan.steps.insert(1, plan.steps.pop(confirm_index))
+
+    with pytest.raises(ValueError, match="first step"):
+        _validated_workflow_plan(plan)
+
+
 def test_validated_workflow_plan_accepts_calibration_confirmation_invariant():
     from vla_data_juicer_agents.navigation.workflow import _validated_workflow_plan
 
@@ -754,6 +806,25 @@ def test_plan_agent_instructions_reference_guidance_and_lightweight_profile(monk
     assert "list_navigation_tool_capabilities_tool" in plan_agent.instructions
 
 
+def test_request_bound_plan_agent_instructions_require_calibration_before_prepare(monkeypatch):
+    monkeypatch.setenv("DASHSCOPE_API_KEY", "test-key")
+
+    plan_agent = create_plan_agent(
+        request=NavigationRequest(date="20270605", dry_run=True, scene_mode="out")
+    )
+
+    assert "Guidance excerpt:" in plan_agent.instructions
+    assert "Always include confirm_navigation_calibration_params before assemble_finish_temp" not in plan_agent.instructions
+    assert (
+        "confirm_navigation_calibration_params must be the first WorkflowPlan step before "
+        "prepare_raw_data and before any processing"
+    ) in plan_agent.instructions
+    assert (
+        "confirm_navigation_calibration_params` must run after `extract_and_sync_navigation_data`"
+        not in plan_agent.instructions
+    )
+
+
 def test_plan_agent_instructions_use_processing_profile_not_dataset_profile():
     instructions = PLAN_AGENT_INSTRUCTIONS
 
@@ -765,7 +836,8 @@ def test_plan_agent_instructions_use_processing_profile_not_dataset_profile():
     assert "The only human-blocking step is gen_box.py" not in instructions
     assert "Calibration confirmation" in instructions
     assert "gen_box.py" in instructions
-    assert "before assemble_finish_temp" in instructions
+    assert "before any processing" in instructions
+    assert "before assemble_finish_temp" not in instructions
 
 
 def test_draft_plan_agent_instructions_use_processing_profile_flow():
@@ -798,7 +870,7 @@ def test_parse_workflow_plan_output_accepts_json_string():
     plan = _parse_workflow_plan_output(json.dumps(payload))
 
     assert plan.date == "20270605"
-    assert plan.steps[0].tool_name == "prepare_raw_data"
+    assert plan.steps[0].tool_name == "confirm_navigation_calibration_params"
 
 
 def test_parse_workflow_plan_output_accepts_dict():

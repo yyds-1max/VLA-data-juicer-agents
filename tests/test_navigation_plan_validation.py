@@ -1,3 +1,5 @@
+import pytest
+
 from vla_data_juicer_agents.navigation.models import (
     NavigationDataProfile,
     NavigationProcessingProfile,
@@ -44,6 +46,22 @@ def _go2w_data_profile() -> NavigationDataProfile:
     )
 
 
+def _confirm_step(**updates):
+    values = {
+        "step_id": "confirm_navigation_calibration_params",
+        "tool_name": "confirm_navigation_calibration_params",
+        "human_blocking": True,
+        "failure_behavior": "stop",
+        "effects": "read",
+    }
+    values.update(updates)
+    return WorkflowStep(**values)
+
+
+def _error_by_type(result: dict, issue_type: str) -> dict:
+    return next(error for error in result["errors"] if error["type"] == issue_type)
+
+
 def test_validate_workflow_plan_accepts_default_template():
     profile = _go2w_data_profile()
     plan = build_deterministic_plan_template(
@@ -66,7 +84,7 @@ def test_validate_workflow_plan_rejects_unknown_tool():
         scene_mode="out",
         processing_profile="parameterized_navigation_v1",
         platform_hint="unknown",
-        steps=[WorkflowStep(step_id="bad", tool_name="invented_tool")],
+        steps=[_confirm_step(), WorkflowStep(step_id="bad", tool_name="invented_tool")],
     )
 
     result = validate_workflow_plan(plan)
@@ -93,6 +111,57 @@ def test_validate_workflow_plan_rejects_unknown_variant():
     assert result["errors"][0]["type"] == "unknown_or_unavailable_variant"
 
 
+def test_validate_workflow_plan_rejects_unknown_precondition():
+    plan = WorkflowPlan(
+        date="20270605",
+        scene_mode="out",
+        processing_profile="parameterized_navigation_v1",
+        platform_hint="unknown",
+        steps=[
+            _confirm_step(),
+            WorkflowStep(
+                step_id="prepare_raw_data",
+                tool_name="prepare_raw_data",
+                preconditions=["missing_step"],
+            )
+        ],
+    )
+
+    result = validate_workflow_plan(plan)
+
+    assert result["ok"] is False
+    assert result["errors"][0]["type"] == "unknown_precondition"
+    assert result["errors"][0]["details"]["step_id"] == "prepare_raw_data"
+    assert result["errors"][0]["details"]["precondition"] == "missing_step"
+
+
+def test_validate_workflow_plan_rejects_cyclic_precondition():
+    plan = WorkflowPlan(
+        date="20270605",
+        scene_mode="out",
+        processing_profile="parameterized_navigation_v1",
+        platform_hint="unknown",
+        steps=[
+            _confirm_step(),
+            WorkflowStep(
+                step_id="prepare_raw_data",
+                tool_name="prepare_raw_data",
+                preconditions=["extract_and_sync_navigation_data"],
+            ),
+            WorkflowStep(
+                step_id="extract_and_sync_navigation_data",
+                tool_name="extract_and_sync_navigation_data",
+                preconditions=["prepare_raw_data"],
+            ),
+        ],
+    )
+
+    result = validate_workflow_plan(plan)
+
+    assert result["ok"] is False
+    assert result["errors"][0]["type"] == "cyclic_precondition"
+
+
 def test_validate_workflow_plan_checks_platform_selectors_from_processing_facts():
     profile = _go2w_data_profile()
     plan = WorkflowPlan(
@@ -101,6 +170,7 @@ def test_validate_workflow_plan_checks_platform_selectors_from_processing_facts(
         processing_profile="parameterized_navigation_v1",
         platform_hint="unknown",
         steps=[
+            _confirm_step(),
             WorkflowStep(
                 step_id="extract_and_sync_navigation_data",
                 tool_name="extract_and_sync_navigation_data",
@@ -124,6 +194,7 @@ def test_validate_workflow_plan_accepts_legacy_processing_profile_from_plan_only
         processing_profile="go2w_like",
         platform_hint="go2w",
         steps=[
+            _confirm_step(),
             WorkflowStep(
                 step_id="extract_and_sync_navigation_data",
                 tool_name="extract_and_sync_navigation_data",
@@ -248,3 +319,176 @@ def test_validate_workflow_plan_rejects_empty_processing_profile_from_json_path(
 
     assert result["ok"] is False
     assert result["errors"][0]["type"] == "missing_processing_profile"
+
+
+def test_validate_workflow_plan_rejects_missing_calibration_confirmation_directly():
+    profile = _go2w_data_profile()
+    plan = build_deterministic_plan_template(
+        "20270605",
+        "parameterized_navigation_v1",
+        None,
+        scene_mode="out",
+        data_profile=profile,
+    )
+    plan.steps = [
+        step
+        for step in plan.steps
+        if step.step_id != "confirm_navigation_calibration_params"
+    ]
+    for step in plan.steps:
+        step.preconditions = [
+            precondition
+            for precondition in step.preconditions
+            if precondition != "confirm_navigation_calibration_params"
+        ]
+
+    result = validate_workflow_plan(plan, data_profile=profile)
+
+    assert result["ok"] is False
+    error = _error_by_type(result, "missing_calibration_confirmation")
+    assert "confirm_navigation_calibration_params" in error["message"]
+
+
+def test_validate_workflow_plan_rejects_wrong_calibration_confirmation_tool_directly():
+    profile = _go2w_data_profile()
+    plan = build_deterministic_plan_template(
+        "20270605",
+        "parameterized_navigation_v1",
+        None,
+        scene_mode="out",
+        data_profile=profile,
+    )
+    confirmation = next(
+        step
+        for step in plan.steps
+        if step.step_id == "confirm_navigation_calibration_params"
+    )
+    confirmation.tool_name = "prepare_raw_data"
+
+    result = validate_workflow_plan(plan, data_profile=profile)
+
+    assert result["ok"] is False
+    assert _error_by_type(result, "invalid_calibration_confirmation_tool")["details"] == {
+        "step_id": "confirm_navigation_calibration_params",
+        "tool_name": "prepare_raw_data",
+    }
+
+
+def test_validate_workflow_plan_rejects_calibration_confirmation_not_first_directly():
+    profile = _go2w_data_profile()
+    plan = build_deterministic_plan_template(
+        "20270605",
+        "parameterized_navigation_v1",
+        None,
+        scene_mode="out",
+        data_profile=profile,
+    )
+    plan.steps.insert(
+        0,
+        WorkflowStep(
+            step_id="inspect_runtime_assets",
+            tool_name="inspect_runtime_assets",
+            effects="read",
+        ),
+    )
+
+    result = validate_workflow_plan(plan, data_profile=profile)
+
+    assert result["ok"] is False
+    error = _error_by_type(result, "invalid_calibration_confirmation_order")
+    assert "first step" in error["message"]
+
+
+def test_validate_workflow_plan_rejects_calibration_confirmation_after_prepare_directly():
+    profile = _go2w_data_profile()
+    plan = build_deterministic_plan_template(
+        "20270605",
+        "parameterized_navigation_v1",
+        None,
+        scene_mode="out",
+        data_profile=profile,
+    )
+    confirm_index = next(
+        index
+        for index, step in enumerate(plan.steps)
+        if step.step_id == "confirm_navigation_calibration_params"
+    )
+    prepare_index = next(
+        index
+        for index, step in enumerate(plan.steps)
+        if step.step_id == "prepare_raw_data"
+    )
+    plan.steps[confirm_index], plan.steps[prepare_index] = (
+        plan.steps[prepare_index],
+        plan.steps[confirm_index],
+    )
+
+    result = validate_workflow_plan(plan, data_profile=profile)
+
+    assert result["ok"] is False
+    assert any(
+        issue["type"] == "invalid_calibration_confirmation_order"
+        and "before prepare_raw_data" in issue["message"]
+        for issue in result["errors"]
+    )
+
+
+def test_validate_workflow_plan_rejects_calibration_confirmation_after_processing_step_directly():
+    plan = WorkflowPlan(
+        date="20270605",
+        scene_mode="out",
+        processing_profile="parameterized_navigation_v1",
+        platform_hint="unknown",
+        steps=[
+            WorkflowStep(
+                step_id="assemble_finish_temp",
+                tool_name="assemble_finish_temp",
+            ),
+            _confirm_step(),
+        ],
+    )
+
+    result = validate_workflow_plan(plan)
+
+    assert result["ok"] is False
+    error = next(
+        issue
+        for issue in result["errors"]
+        if issue["type"] == "invalid_calibration_confirmation_order"
+        and issue["details"].get("processing_step_id") == "assemble_finish_temp"
+    )
+    assert "processing step assemble_finish_temp" in error["message"]
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("human_blocking", False),
+        ("failure_behavior", "continue"),
+        ("effects", "write"),
+    ],
+)
+def test_validate_workflow_plan_rejects_invalid_calibration_confirmation_flags_directly(field, value):
+    profile = _go2w_data_profile()
+    plan = build_deterministic_plan_template(
+        "20270605",
+        "parameterized_navigation_v1",
+        None,
+        scene_mode="out",
+        data_profile=profile,
+    )
+    confirmation = next(
+        step
+        for step in plan.steps
+        if step.step_id == "confirm_navigation_calibration_params"
+    )
+    setattr(confirmation, field, value)
+
+    result = validate_workflow_plan(plan, data_profile=profile)
+
+    assert result["ok"] is False
+    error = _error_by_type(result, "invalid_calibration_confirmation_flags")
+    assert error["details"] == {
+        "step_id": "confirm_navigation_calibration_params",
+        "field": field,
+    }

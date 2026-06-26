@@ -71,7 +71,17 @@ def test_no_llm_plan_writes_run_state(tmp_path, monkeypatch, capsys):
     assert plan["date"] == "20270605"
     assert plan["scene_mode"] == "out"
     assert plan["processing_profile"] == "parameterized_navigation_v1"
+    assert [step["tool_name"] for step in plan["steps"][:4]] == [
+        "confirm_navigation_calibration_params",
+        "prepare_raw_data",
+        "extract_and_sync_navigation_data",
+        "assemble_finish_temp",
+    ]
     steps = {step["tool_name"]: step for step in plan["steps"]}
+    assert steps["confirm_navigation_calibration_params"]["preconditions"] == []
+    assert steps["prepare_raw_data"]["preconditions"] == ["confirm_navigation_calibration_params"]
+    assert steps["extract_and_sync_navigation_data"]["preconditions"] == ["prepare_raw_data"]
+    assert steps["assemble_finish_temp"]["preconditions"] == ["extract_and_sync_navigation_data"]
     extract_args = steps["extract_and_sync_navigation_data"]["arguments"]
     assert extract_args["processing_profile"] == "parameterized_navigation_v1"
     assert extract_args["platform_hint"] == "go2w"

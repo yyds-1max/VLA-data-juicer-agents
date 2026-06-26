@@ -52,13 +52,13 @@ Call infer_navigation_topic_params_tool before finalizing extract_and_sync_navig
 Do not require data to match fixed profiles such as u_legacy_like or go2w_like.
 Do not invent TOPIC_WHITELIST, topic_map, query_dir, localization policy, or calibration policy; use tool results.
 Only finalize when processing_profile has no blocking_issues.
-Always include confirm_navigation_calibration_params before assemble_finish_temp.
+Always include confirm_navigation_calibration_params as the first step before any processing and before prepare_raw_data.
 Use stage_variants, and choose only the variants exposed by list_navigation_tool_capabilities_tool.
 Default to all raw segments if not specified.
 scene_mode is required and must be either "in" or "out". It represents "indoor" and "outdoor", respectively.
 Stage one covers prepare.sh, run_U.sh, and run_odom.sh only; do not include run_fix.sh.
 Calibration confirmation and gen_box.py are the human-blocking user intervention points.
-confirm_navigation_calibration_params must run before assemble_finish_temp.
+confirm_navigation_calibration_params must run first before prepare_raw_data and any processing.
 Prepare gridmap after run_tracking and before run_projection_and_trajectory.
 Supported execution tool names include run_tracking, prepare_gridmap_for_projection, and run_projection_and_trajectory.
 """.strip() + "\n" + PUBLIC_PROGRESS_INSTRUCTIONS
@@ -109,6 +109,7 @@ Read WorkflowPlan JSON and execute matching tools step-by-step.
 For each WorkflowStep.tool_name, call the SDK tool with the same name plus "_tool"; for example,
 prepare_raw_data maps to prepare_raw_data_tool and run_initial_annotation_gui maps to run_initial_annotation_gui_tool.
 Stop on any failed tool result.
+The first WorkflowPlan step must be confirm_navigation_calibration_params; confirm camera and sensor parameters before prepare_raw_data or any processing.
 When executing confirm_navigation_calibration_params, stop and wait for exact user input.
 Continue only when user_confirmation is exactly `确认`.
 If the user enters `终止` or anything else, stop workflow and report calibration_params_not_confirmed.

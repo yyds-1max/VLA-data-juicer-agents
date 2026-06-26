@@ -26,6 +26,159 @@ def _step_positions(steps: list[WorkflowStep]) -> dict[str, int]:
     return {step.tool_name: index for index, step in enumerate(steps)}
 
 
+_CALIBRATION_CONFIRMATION_STEP_ID = "confirm_navigation_calibration_params"
+_PROCESSING_STEP_IDS = {
+    "extract_and_sync_navigation_data",
+    "assemble_finish_temp",
+    "run_noobscene_preprocessing",
+    "run_initial_annotation_gui",
+    "run_tracking",
+    "prepare_gridmap_for_projection",
+    "run_projection_and_trajectory",
+    "validate_navigation_outputs",
+}
+
+
+def _calibration_confirmation_validation_errors(steps: list[WorkflowStep]) -> list[dict[str, Any]]:
+    errors: list[dict[str, Any]] = []
+    positions = {step.step_id: index for index, step in enumerate(steps)}
+    confirmation_position = positions.get(_CALIBRATION_CONFIRMATION_STEP_ID)
+    if confirmation_position is None:
+        return [
+            _issue(
+                "missing_calibration_confirmation",
+                "WorkflowPlan must include confirm_navigation_calibration_params before any processing",
+                step_id=_CALIBRATION_CONFIRMATION_STEP_ID,
+            )
+        ]
+
+    confirmation_step = steps[confirmation_position]
+    if confirmation_step.tool_name != _CALIBRATION_CONFIRMATION_STEP_ID:
+        errors.append(
+            _issue(
+                "invalid_calibration_confirmation_tool",
+                "confirm_navigation_calibration_params step must use confirm_navigation_calibration_params tool",
+                step_id=_CALIBRATION_CONFIRMATION_STEP_ID,
+                tool_name=confirmation_step.tool_name,
+            )
+        )
+
+    prepare_position = positions.get("prepare_raw_data")
+    if confirmation_position != 0:
+        errors.append(
+            _issue(
+                "invalid_calibration_confirmation_order",
+                "confirm_navigation_calibration_params must be the first step before any processing",
+                step_id=_CALIBRATION_CONFIRMATION_STEP_ID,
+            )
+        )
+    if prepare_position is not None and confirmation_position >= prepare_position:
+        errors.append(
+            _issue(
+                "invalid_calibration_confirmation_order",
+                "confirm_navigation_calibration_params must run before prepare_raw_data",
+                step_id=_CALIBRATION_CONFIRMATION_STEP_ID,
+            )
+        )
+    for step_id in _PROCESSING_STEP_IDS:
+        step_position = positions.get(step_id)
+        if step_position is not None and confirmation_position > step_position:
+            errors.append(
+                _issue(
+                    "invalid_calibration_confirmation_order",
+                    f"confirm_navigation_calibration_params must run before processing step {step_id}",
+                    step_id=_CALIBRATION_CONFIRMATION_STEP_ID,
+                    processing_step_id=step_id,
+                )
+            )
+
+    if confirmation_step.human_blocking is not True:
+        errors.append(
+            _issue(
+                "invalid_calibration_confirmation_flags",
+                "confirm_navigation_calibration_params must be human_blocking",
+                step_id=_CALIBRATION_CONFIRMATION_STEP_ID,
+                field="human_blocking",
+            )
+        )
+    if confirmation_step.failure_behavior != "stop":
+        errors.append(
+            _issue(
+                "invalid_calibration_confirmation_flags",
+                "confirm_navigation_calibration_params failure_behavior must be stop",
+                step_id=_CALIBRATION_CONFIRMATION_STEP_ID,
+                field="failure_behavior",
+            )
+        )
+    if confirmation_step.effects != "read":
+        errors.append(
+            _issue(
+                "invalid_calibration_confirmation_flags",
+                "confirm_navigation_calibration_params effects must be read",
+                step_id=_CALIBRATION_CONFIRMATION_STEP_ID,
+                field="effects",
+            )
+        )
+
+    return errors
+
+
+def _precondition_validation_errors(steps: list[WorkflowStep]) -> list[dict[str, Any]]:
+    errors: list[dict[str, Any]] = []
+    step_ids = {step.step_id for step in steps}
+    graph: dict[str, list[str]] = {step.step_id: list(step.preconditions) for step in steps}
+
+    for step in steps:
+        for precondition in step.preconditions:
+            if precondition not in step_ids:
+                errors.append(
+                    _issue(
+                        "unknown_precondition",
+                        "step precondition does not reference a known WorkflowPlan step_id",
+                        step_id=step.step_id,
+                        precondition=precondition,
+                    )
+                )
+
+    if errors:
+        return errors
+
+    visiting: set[str] = set()
+    visited: set[str] = set()
+    stack: list[str] = []
+
+    def visit(step_id: str) -> list[str] | None:
+        if step_id in visiting:
+            return stack[stack.index(step_id) :] + [step_id]
+        if step_id in visited:
+            return None
+
+        visiting.add(step_id)
+        stack.append(step_id)
+        for precondition in graph[step_id]:
+            cycle = visit(precondition)
+            if cycle is not None:
+                return cycle
+        stack.pop()
+        visiting.remove(step_id)
+        visited.add(step_id)
+        return None
+
+    for step_id in graph:
+        cycle = visit(step_id)
+        if cycle is not None:
+            errors.append(
+                _issue(
+                    "cyclic_precondition",
+                    "WorkflowPlan preconditions must form an acyclic graph",
+                    cycle=cycle,
+                )
+            )
+            break
+
+    return errors
+
+
 def _find_variant(
     capability: ToolCapability,
     variant_id: str,
@@ -178,6 +331,9 @@ def validate_workflow_plan(
                             allowed=allowed_values,
                         )
                     )
+
+    errors.extend(_precondition_validation_errors(plan.steps))
+    errors.extend(_calibration_confirmation_validation_errors(plan.steps))
 
     positions = _step_positions(plan.steps)
     gridmap_position = positions.get("prepare_gridmap_for_projection")

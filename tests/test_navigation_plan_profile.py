@@ -361,7 +361,7 @@ def test_plan_from_draft_accepts_complete_processing_profile():
     assert plan.platform_hint == "unknown"
 
 
-def test_plan_from_processing_profile_inserts_calibration_confirmation_before_assemble():
+def test_plan_from_processing_profile_inserts_calibration_confirmation_before_processing():
     data_profile = NavigationDataProfile(
         date="20270605",
         scene_mode="out",
@@ -421,9 +421,13 @@ def test_plan_from_processing_profile_inserts_calibration_confirmation_before_as
 
     assert plan.processing_profile == "parameterized_navigation_v1"
     assert plan.platform_hint == "unknown"
-    assert step_ids.index("confirm_navigation_calibration_params") < step_ids.index("assemble_finish_temp")
+    assert step_ids[0] == "confirm_navigation_calibration_params"
+    assert step_ids.index("confirm_navigation_calibration_params") < step_ids.index("prepare_raw_data")
     confirm_step = next(step for step in plan.steps if step.step_id == "confirm_navigation_calibration_params")
     assert confirm_step.human_blocking is True
+    assert confirm_step.preconditions == []
+    prepare_step = next(step for step in plan.steps if step.step_id == "prepare_raw_data")
+    assert prepare_step.preconditions == ["confirm_navigation_calibration_params"]
     preprocessing = next(step for step in plan.steps if step.step_id == "run_noobscene_preprocessing")
     assert preprocessing.arguments["localization_source"] == "odom"
     assert preprocessing.arguments["localization_conversion"] == "odom_to_ins"

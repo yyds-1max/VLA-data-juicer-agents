@@ -130,86 +130,12 @@ def _validation_catalog_with_planned_confirmation() -> list[ToolCapability]:
     return catalog
 
 
-def _calibration_confirmation_validation_errors(plan: WorkflowPlan) -> list[dict[str, Any]]:
-    errors: list[dict[str, Any]] = []
-    positions = {step.step_id: index for index, step in enumerate(plan.steps)}
-    confirmation_position = positions.get("confirm_navigation_calibration_params")
-    if confirmation_position is None:
-        return [
-            {
-                "type": "missing_calibration_confirmation",
-                "message": "WorkflowPlan must include confirm_navigation_calibration_params before assemble_finish_temp",
-                "step_id": "confirm_navigation_calibration_params",
-            }
-        ]
-
-    confirmation_step = plan.steps[confirmation_position]
-    extract_position = positions.get("extract_and_sync_navigation_data")
-    assemble_position = positions.get("assemble_finish_temp")
-    if extract_position is not None and confirmation_position <= extract_position:
-        errors.append(
-            {
-                "type": "invalid_calibration_confirmation_order",
-                "message": "confirm_navigation_calibration_params must run after extract_and_sync_navigation_data",
-                "step_id": "confirm_navigation_calibration_params",
-            }
-        )
-    if assemble_position is not None and confirmation_position >= assemble_position:
-        errors.append(
-            {
-                "type": "invalid_calibration_confirmation_order",
-                "message": "confirm_navigation_calibration_params must run before assemble_finish_temp",
-                "step_id": "confirm_navigation_calibration_params",
-            }
-        )
-    if assemble_position is not None:
-        assemble_step = plan.steps[assemble_position]
-        if "confirm_navigation_calibration_params" not in assemble_step.preconditions:
-            errors.append(
-                {
-                    "type": "missing_calibration_confirmation_precondition",
-                    "message": "assemble_finish_temp must depend on confirm_navigation_calibration_params",
-                    "step_id": "assemble_finish_temp",
-                    "precondition": "confirm_navigation_calibration_params",
-                }
-            )
-    if confirmation_step.human_blocking is not True:
-        errors.append(
-            {
-                "type": "invalid_calibration_confirmation_flags",
-                "message": "confirm_navigation_calibration_params must be human_blocking",
-                "step_id": "confirm_navigation_calibration_params",
-                "field": "human_blocking",
-            }
-        )
-    if confirmation_step.failure_behavior != "stop":
-        errors.append(
-            {
-                "type": "invalid_calibration_confirmation_flags",
-                "message": "confirm_navigation_calibration_params failure_behavior must be stop",
-                "step_id": "confirm_navigation_calibration_params",
-                "field": "failure_behavior",
-            }
-        )
-    if confirmation_step.effects != "read":
-        errors.append(
-            {
-                "type": "invalid_calibration_confirmation_flags",
-                "message": "confirm_navigation_calibration_params effects must be read",
-                "step_id": "confirm_navigation_calibration_params",
-                "field": "effects",
-            }
-        )
-    return errors
-
-
 def _validated_workflow_plan(plan: WorkflowPlan, data_profile: NavigationDataProfile | None = None) -> WorkflowPlan:
     validation = validate_workflow_plan(
         plan,
         data_profile=data_profile,
         catalog=_validation_catalog_with_planned_confirmation(),
     )
-    validation["errors"].extend(_calibration_confirmation_validation_errors(plan))
     if validation["errors"]:
         raise ValueError(f"WorkflowPlan validation failed: {validation['errors']}")
     return plan
@@ -313,9 +239,20 @@ def build_deterministic_plan_template(
 
     steps = [
         WorkflowStep(
+            step_id="confirm_navigation_calibration_params",
+            tool_name="confirm_navigation_calibration_params",
+            arguments={**common_arguments, "platform_hint": platform_hint},
+            preconditions=[],
+            expected_outputs=[],
+            human_blocking=True,
+            failure_behavior="stop",
+            effects="read",
+        ),
+        WorkflowStep(
             step_id="prepare_raw_data",
             tool_name="prepare_raw_data",
             arguments=common_arguments,
+            preconditions=["confirm_navigation_calibration_params"],
             expected_outputs=[f"raw_data/{date}_temp"],
         ),
         WorkflowStep(
@@ -339,16 +276,6 @@ def build_deterministic_plan_template(
             evidence=list(extract_decision.evidence) if extract_decision is not None else [],
         ),
         WorkflowStep(
-            step_id="confirm_navigation_calibration_params",
-            tool_name="confirm_navigation_calibration_params",
-            arguments={**common_arguments, "platform_hint": platform_hint},
-            preconditions=["extract_and_sync_navigation_data"],
-            expected_outputs=[],
-            human_blocking=True,
-            failure_behavior="stop",
-            effects="read",
-        ),
-        WorkflowStep(
             step_id="assemble_finish_temp",
             tool_name="assemble_finish_temp",
             arguments={
@@ -356,7 +283,7 @@ def build_deterministic_plan_template(
                 "processing_profile": profile_id,
                 "platform_hint": platform_hint,
             },
-            preconditions=["confirm_navigation_calibration_params"],
+            preconditions=["extract_and_sync_navigation_data"],
             expected_outputs=[finish_temp_path],
         ),
         WorkflowStep(
@@ -610,7 +537,8 @@ async def run_plan_agent(
         "infer_navigation_topic_params_tool before finalizing extract_and_sync_navigation_data; "
         "do not invent TOPIC_WHITELIST, topic_map, query_dir, localization policy, or calibration "
         "policy. Only finalize when processing_profile has no blocking_issues. Always include "
-        "confirm_navigation_calibration_params before assemble_finish_temp. scene_mode is required "
+        "confirm_navigation_calibration_params as the first step before any processing and before "
+        "prepare_raw_data. scene_mode is required "
         "and must be either in or out. Gridmap preparation must happen "
         "after run_tracking and before projection. Supported execution tool names include run_tracking, "
         "prepare_gridmap_for_projection, and run_projection_and_trajectory. The only human-blocking step "
@@ -648,7 +576,8 @@ async def run_executor_agent(
     prompt = (
         "Execute this WorkflowPlan JSON step-by-step using the matching execution tools. Stop on any "
         "failed tool result. The calibration confirmation and gen_box.py GUI steps are human-blocking; "
-        "wait until the human finishes before continuing. scene_mode is required and must be either in "
+        "confirm_navigation_calibration_params must be the first step before prepare_raw_data or any "
+        "processing, and wait until the human finishes before continuing. scene_mode is required and must be either in "
         "or out. Prepare gridmap after run_tracking and before run_projection_and_trajectory. Supported "
         "tool names include run_tracking, prepare_gridmap_for_projection, and run_projection_and_trajectory. "
         f"{PUBLIC_PROGRESS_PROMPT} Return a concise final execution summary.\n\n"
