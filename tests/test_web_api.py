@@ -101,6 +101,48 @@ def test_create_app_accepts_positional_configuration(tmp_path: Path):
     assert FakeController.created[0].kwargs["model"] == "qwen-positional"
 
 
+def test_frontend_index_served_when_dist_provided(tmp_path: Path):
+    dist = tmp_path / "dist"
+    dist.mkdir()
+    (dist / "index.html").write_text("<!doctype html><main>DataPilot</main>", encoding="utf-8")
+    app = create_app(
+        working_dir=str(tmp_path / ".djx"),
+        db_path=tmp_path / "sessions.sqlite",
+        controller_factory=FakeController,
+        frontend_dist=dist,
+    )
+    client = TestClient(app)
+
+    response = client.get("/")
+    api_response = client.get("/api/sessions")
+
+    assert response.status_code == 200
+    assert response.text == "<!doctype html><main>DataPilot</main>"
+    assert response.headers["content-type"].startswith("text/html")
+    assert api_response.status_code == 200
+
+
+def test_frontend_assets_served_when_assets_dir_exists(tmp_path: Path):
+    dist = tmp_path / "dist"
+    assets = dist / "assets"
+    assets.mkdir(parents=True)
+    (dist / "index.html").write_text("<!doctype html>", encoding="utf-8")
+    (assets / "app.js").write_text("console.log('datapilot');", encoding="utf-8")
+    app = create_app(
+        working_dir=str(tmp_path / ".djx"),
+        db_path=tmp_path / "sessions.sqlite",
+        controller_factory=FakeController,
+        frontend_dist=dist,
+    )
+    client = TestClient(app)
+
+    response = client.get("/assets/app.js")
+
+    assert response.status_code == 200
+    assert response.text == "console.log('datapilot');"
+    assert response.headers["content-type"].startswith("text/javascript")
+
+
 def test_submit_turn_runtime_error_returns_409(tmp_path: Path):
     class ActiveTurnController(FakeController):
         def submit_turn(self, message):

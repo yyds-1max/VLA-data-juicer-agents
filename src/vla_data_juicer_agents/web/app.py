@@ -6,6 +6,8 @@ from pathlib import Path
 from typing import Any
 
 from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
+from fastapi.responses import FileResponse
+from fastapi.staticfiles import StaticFiles
 
 from vla_data_juicer_agents.tui.controller import SessionController
 from vla_data_juicer_agents.web.event_stream import SessionEventBus
@@ -24,6 +26,7 @@ def create_app(
     model: str | None = None,
     db_path: str | Path | None = None,
     controller_factory: ControllerFactory = SessionController,
+    frontend_dist: str | Path | None = None,
 ) -> FastAPI:
     if working_dir is None:
         working_dir = os.environ.get("VLA_DATA_AGENT_WEB_WORKING_DIR", "./.djx")
@@ -89,6 +92,17 @@ def create_app(
                     await websocket.send_json(await queue.get())
         except WebSocketDisconnect:
             return
+
+    if frontend_dist is not None:
+        frontend_path = Path(frontend_dist)
+        if frontend_path.exists():
+            assets_path = frontend_path / "assets"
+            if assets_path.exists():
+                app.mount("/assets", StaticFiles(directory=assets_path), name="frontend-assets")
+
+            @app.get("/", include_in_schema=False)
+            async def frontend_index() -> FileResponse:
+                return FileResponse(frontend_path / "index.html")
 
     return app
 
