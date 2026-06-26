@@ -86,6 +86,29 @@ The transcript shows grouped Main, Workflow, Plan, and Executor progress summari
 
 The conversational Agent requires normal LLM settings such as `DASHSCOPE_API_KEY`; it does not provide a deterministic `--no-llm` router path.
 
+## DataPilot web UI
+
+Run the backend API from the repository root:
+
+```bash
+vla-data-agent-web --host 127.0.0.1 --port 8765 --working-dir ./.djx
+```
+
+Run the frontend dev server from `frontend`:
+
+```bash
+npm run dev
+```
+
+Frontend verification commands:
+
+```bash
+cd frontend
+npm test
+npm run build
+npm run e2e
+```
+
 ## Runtime isolation
 
 See `docs/navigation-runtime-isolation.md` for the Agent/legacy runtime split, required environment variables, server preflight checks, wrapper behavior, dry-run verification, and operational boundaries.
