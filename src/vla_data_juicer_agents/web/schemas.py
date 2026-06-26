@@ -10,24 +10,8 @@ MessageRole = Literal["user", "assistant", "system"]
 
 
 def generate_session_title(message: str, *, limit: int = 30) -> str:
-    title = " ".join(message.split())
-    if not title:
-        return "未命名任务"
-    if len(title) <= limit:
-        return title
-
-    truncated = title[:limit]
-    while (
-        limit < len(title)
-        and truncated
-        and truncated[-1].isascii()
-        and truncated[-1].isalnum()
-        and title[limit].isascii()
-        and title[limit].isalnum()
-    ):
-        truncated += title[limit]
-        limit += 1
-    return truncated
+    normalized = " ".join(str(message).split())
+    return normalized[:limit] if normalized else "未命名任务"
 
 
 class SessionRecord(BaseModel):

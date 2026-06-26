@@ -8,7 +8,14 @@ from vla_data_juicer_agents.web.schemas import (
 def test_generate_session_title_uses_first_30_chars():
     title = generate_session_title("处理 20270605 的室外导航数据，并进行 dry-run 验证")
 
-    assert title == "处理 20270605 的室外导航数据，并进行 dry-run"
+    assert title == "处理 20270605 的室外导航数据，并进行 dry-ru"
+
+
+def test_generate_session_title_bounds_long_ascii_token():
+    title = generate_session_title("a" * 5000)
+
+    assert len(title) == 30
+    assert title == "a" * 30
 
 
 def test_turn_request_rejects_empty_message():
