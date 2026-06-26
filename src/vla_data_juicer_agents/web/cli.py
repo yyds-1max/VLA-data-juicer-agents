@@ -1,15 +1,27 @@
 from __future__ import annotations
 
 import argparse
+import os
 
 
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(prog="vla-data-agent-web")
-    parser.add_argument("--host", default="127.0.0.1")
-    parser.add_argument("--port", type=int, default=8765)
-    parser.add_argument("--working-dir", default="./.djx")
-    parser.add_argument("--model", default=None)
-    parser.add_argument("--reload", action="store_true")
+    parser = argparse.ArgumentParser(
+        prog="vla-data-agent-web",
+        description="Run the DataPilot web server.",
+    )
+    parser.add_argument("--host", default="127.0.0.1", help="Host interface for the web server.")
+    parser.add_argument("--port", type=int, default=8765, help="Port for the web server.")
+    parser.add_argument(
+        "--working-dir",
+        default="./.djx",
+        help="Working directory exposed to the web app through VLA_DATA_AGENT_WEB_WORKING_DIR.",
+    )
+    parser.add_argument(
+        "--model",
+        default=None,
+        help="Optional model id exposed to the web app through VLA_DATA_AGENT_WEB_MODEL.",
+    )
+    parser.add_argument("--reload", action="store_true", help="Enable uvicorn auto-reload.")
     return parser
 
 
@@ -18,6 +30,11 @@ def main(argv: list[str] | None = None) -> int:
 
     parser = build_parser()
     args = parser.parse_args(argv)
+    os.environ["VLA_DATA_AGENT_WEB_WORKING_DIR"] = args.working_dir
+    if args.model is None:
+        os.environ.pop("VLA_DATA_AGENT_WEB_MODEL", None)
+    else:
+        os.environ["VLA_DATA_AGENT_WEB_MODEL"] = args.model
     uvicorn.run(
         "vla_data_juicer_agents.web.app:create_app",
         factory=True,
