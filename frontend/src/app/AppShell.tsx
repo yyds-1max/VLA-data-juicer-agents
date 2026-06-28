@@ -5,10 +5,12 @@ import { ConsoleHeader } from "../components/console/ConsoleHeader";
 import { ConsoleSidebar } from "../components/console/ConsoleSidebar";
 import { ConsoleToast } from "../components/console/ConsoleToast";
 import type { ConsolePageId, StatusTone } from "../features/console/consoleTypes";
+import { AgentWorkflowPage } from "../features/console/pages/AgentWorkflowPage";
 import { AnnotationPage } from "../features/console/pages/AnnotationPage";
 import { DataManagementPage } from "../features/console/pages/DataManagementPage";
 import { DashboardPage } from "../features/console/pages/DashboardPage";
 import { ModelIterationPage } from "../features/console/pages/ModelIterationPage";
+import { SimulationPage } from "../features/console/pages/SimulationPage";
 import { BackgroundParticles } from "../features/console/visuals/BackgroundParticles";
 
 type AppShellProps = {
@@ -105,12 +107,16 @@ export function AppShell({ children }: AppShellProps) {
     switch (activePage) {
       case "dashboard":
         return <DashboardPage />;
+      case "agent":
+        return <AgentWorkflowPage onPlaceholderAction={showPlaceholderToast} />;
       case "data":
         return <DataManagementPage onPlaceholderAction={showPlaceholderToast} />;
       case "annotate":
         return <AnnotationPage onPlaceholderAction={showPlaceholderToast} />;
       case "model":
         return <ModelIterationPage onPlaceholderAction={showPlaceholderToast} />;
+      case "simulation":
+        return <SimulationPage onPlaceholderAction={showPlaceholderToast} />;
       default:
         return <PagePlaceholder pageId={activePage} onRequestToast={() => showPlaceholderToast()} />;
     }

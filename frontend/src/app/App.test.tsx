@@ -169,6 +169,33 @@ test("model iteration page renders versions training and compare tabs", () => {
   expect(screen.getByText("版本性能对比")).toBeVisible();
 });
 
+test("agent workflow page selects nodes and keeps execute action placeholder-only", () => {
+  render(<App />);
+
+  fireEvent.click(screen.getByRole("button", { name: "Agent 工作流" }));
+  expect(screen.getByText("节点库")).toBeVisible();
+  expect(screen.getByText("工作流画布")).toBeVisible();
+
+  fireEvent.click(screen.getByRole("button", { name: "数据源接入" }));
+  expect(screen.getByText("从多个数据源拉取原始数据")).toBeVisible();
+
+  fireEvent.click(screen.getByRole("button", { name: "执行流程" }));
+  expect(screen.queryByRole("dialog", { name: "DataPilot" })).not.toBeInTheDocument();
+});
+
+test("simulation page switches config running and results views", () => {
+  render(<App />);
+
+  fireEvent.click(screen.getByRole("button", { name: "测试/仿真" }));
+  expect(screen.getByText("仿真场景配置")).toBeVisible();
+
+  fireEvent.click(screen.getByRole("tab", { name: "运行监控" }));
+  expect(screen.getByText("实时任务日志")).toBeVisible();
+
+  fireEvent.click(screen.getByRole("tab", { name: "测试结果" }));
+  expect(screen.getByText("详细测试报告")).toBeVisible();
+});
+
 test("opens DataPilot draft window from the floating button", () => {
   render(<App />);
 
