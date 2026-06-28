@@ -113,6 +113,47 @@ test("sidebar navigation switches console pages", () => {
   expect(screen.getByRole("heading", { name: "测试/仿真" })).toBeVisible();
 });
 
+test("data management tabs render image pointcloud text and unlock panels", () => {
+  render(<App />);
+
+  fireEvent.click(screen.getByRole("button", { name: "数据管理" }));
+  expect(screen.getByText("IMG-000")).toBeVisible();
+
+  fireEvent.click(screen.getByRole("tab", { name: "点云数据" }));
+  expect(screen.getByText("PCD-000")).toBeVisible();
+
+  fireEvent.click(screen.getByRole("tab", { name: "文本数据" }));
+  expect(screen.getByText(/将红色杯子/)).toBeVisible();
+
+  fireEvent.click(screen.getByRole("tab", { name: "数据解锁" }));
+  expect(screen.getByText("解锁规则配置")).toBeVisible();
+  expect(screen.getByText("批次管理")).toBeVisible();
+});
+
+test("console shared tabs switch visible panels without remounting DataPilot", () => {
+  render(<App />);
+
+  fireEvent.click(screen.getByRole("button", { name: "数据管理" }));
+  fireEvent.click(screen.getByRole("tab", { name: "点云数据" }));
+
+  expect(screen.getByText("PCD-000")).toBeVisible();
+  expect(screen.queryByText("IMG-000")).not.toBeVisible();
+  expect(screen.getByRole("button", { name: "Open DataPilot" })).toBeVisible();
+});
+
+test("annotation page switches pipeline results and review views", () => {
+  render(<App />);
+
+  fireEvent.click(screen.getByRole("button", { name: "自动标注" }));
+  expect(screen.getByText("视觉检测")).toBeVisible();
+
+  fireEvent.click(screen.getByRole("tab", { name: "标注结果" }));
+  expect(screen.getByText("ANN-82401")).toBeVisible();
+
+  fireEvent.click(screen.getByRole("tab", { name: "人工复核" }));
+  expect(screen.getByText("待复核样本")).toBeVisible();
+});
+
 test("opens DataPilot draft window from the floating button", () => {
   render(<App />);
 

@@ -5,6 +5,8 @@ import { ConsoleHeader } from "../components/console/ConsoleHeader";
 import { ConsoleSidebar } from "../components/console/ConsoleSidebar";
 import { ConsoleToast } from "../components/console/ConsoleToast";
 import type { ConsolePageId, StatusTone } from "../features/console/consoleTypes";
+import { AnnotationPage } from "../features/console/pages/AnnotationPage";
+import { DataManagementPage } from "../features/console/pages/DataManagementPage";
 import { DashboardPage } from "../features/console/pages/DashboardPage";
 import { BackgroundParticles } from "../features/console/visuals/BackgroundParticles";
 
@@ -98,6 +100,19 @@ export function AppShell({ children }: AppShellProps) {
 
   const activeTitle = pageCopy[activePage].title;
 
+  const renderActivePage = () => {
+    switch (activePage) {
+      case "dashboard":
+        return <DashboardPage />;
+      case "data":
+        return <DataManagementPage onPlaceholderAction={showPlaceholderToast} />;
+      case "annotate":
+        return <AnnotationPage onPlaceholderAction={showPlaceholderToast} />;
+      default:
+        return <PagePlaceholder pageId={activePage} onRequestToast={() => showPlaceholderToast()} />;
+    }
+  };
+
   return (
     <div className="min-h-screen bg-console-bg text-console-text">
       <BackgroundParticles />
@@ -105,7 +120,7 @@ export function AppShell({ children }: AppShellProps) {
 
       <main className="relative z-10 pt-28 md:ml-64 md:pt-0">
         <ConsoleHeader title={activeTitle} />
-        {activePage === "dashboard" ? <DashboardPage /> : <PagePlaceholder pageId={activePage} onRequestToast={() => showPlaceholderToast()} />}
+        {renderActivePage()}
       </main>
 
       {children}
