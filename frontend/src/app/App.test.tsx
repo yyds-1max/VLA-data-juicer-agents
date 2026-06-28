@@ -175,8 +175,16 @@ test("agent workflow page selects nodes and keeps execute action placeholder-onl
   fireEvent.click(screen.getByRole("button", { name: "Agent 工作流" }));
   expect(screen.getByText("节点库")).toBeVisible();
   expect(screen.getByText("工作流画布")).toBeVisible();
+  expect(screen.getByRole("button", { name: "数据源接入" })).toHaveAttribute("aria-pressed", "true");
+  expect(screen.getByRole("button", { name: "画布节点 数据源接入" })).toHaveAttribute("aria-pressed", "true");
+
+  fireEvent.click(screen.getByRole("button", { name: "预处理管线" }));
+  expect(screen.getByRole("button", { name: "预处理管线" })).toHaveAttribute("aria-pressed", "true");
+  expect(screen.getByRole("button", { name: "画布节点 预处理管线" })).toHaveAttribute("aria-pressed", "true");
+  expect(screen.getByRole("heading", { name: "预处理管线" })).toBeVisible();
 
   fireEvent.click(screen.getByRole("button", { name: "数据源接入" }));
+  expect(screen.getByRole("button", { name: "数据源接入" })).toHaveAttribute("aria-pressed", "true");
   expect(screen.getByText("从多个数据源拉取原始数据")).toBeVisible();
 
   fireEvent.click(screen.getByRole("button", { name: "执行流程" }));

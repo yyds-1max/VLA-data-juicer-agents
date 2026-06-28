@@ -61,25 +61,30 @@ export function AgentWorkflowPage({ onPlaceholderAction }: AgentWorkflowPageProp
           </div>
 
           <div className="space-y-2">
-            {agentNodes.map((node) => (
-              <button
-                key={node.id}
-                type="button"
-                aria-label={node.name}
-                className={cn(
-                  "group w-full cursor-grab rounded border border-console-line bg-console-panel2/80 p-3 text-left transition focus:outline-none focus:ring-2 focus:ring-console-cyan",
-                  selectedNodeId === node.id && "border-console-cyan/50 bg-console-cyan/10",
-                  selectedNodeId !== node.id && "hover:border-console-cyan/35 hover:bg-console-panel2",
-                )}
-                onClick={() => setSelectedNodeId(node.id)}
-              >
-                <div className="flex items-center justify-between gap-2">
-                  <span className="text-sm font-semibold text-console-text">{node.name}</span>
-                  <StatusTag tone={categoryTone[node.category] ?? "neutral"}>{node.category}</StatusTag>
-                </div>
-                <p className="mt-2 line-clamp-2 text-xs leading-5 text-console-muted">{node.desc}</p>
-              </button>
-            ))}
+            {agentNodes.map((node) => {
+              const active = selectedNodeId === node.id;
+
+              return (
+                <button
+                  key={node.id}
+                  type="button"
+                  aria-label={node.name}
+                  aria-pressed={active}
+                  className={cn(
+                    "group w-full cursor-grab rounded border border-console-line bg-console-panel2/80 p-3 text-left transition focus:outline-none focus:ring-2 focus:ring-console-cyan",
+                    active && "border-console-cyan/50 bg-console-cyan/10 shadow-[inset_3px_0_0_#15d1d8]",
+                    !active && "hover:border-console-cyan/35 hover:bg-console-panel2",
+                  )}
+                  onClick={() => setSelectedNodeId(node.id)}
+                >
+                  <div className="flex items-center justify-between gap-2">
+                    <span className="text-sm font-semibold text-console-text">{node.name}</span>
+                    <StatusTag tone={categoryTone[node.category] ?? "neutral"}>{node.category}</StatusTag>
+                  </div>
+                  <p className="mt-2 line-clamp-2 text-xs leading-5 text-console-muted">{node.desc}</p>
+                </button>
+              );
+            })}
           </div>
         </ConsoleCard>
 
@@ -101,33 +106,36 @@ export function AgentWorkflowPage({ onPlaceholderAction }: AgentWorkflowPageProp
             </div>
           </div>
 
-          <div className="relative min-h-[31rem] overflow-hidden rounded border border-console-line bg-console-bg/80">
-            <div className="absolute inset-0 bg-[linear-gradient(rgba(148,163,184,0.08)_1px,transparent_1px),linear-gradient(90deg,rgba(148,163,184,0.08)_1px,transparent_1px)] bg-[size:32px_32px]" />
-            <AgentConnectionCanvas nodes={workflowCoordinates} connections={agentConnections} className="absolute inset-0 h-full w-full" />
-            {positionedNodes.map(({ node, x, y }) => {
-              if (!node) {
-                return null;
-              }
+          <div className="overflow-x-auto rounded border border-console-line bg-console-bg/80">
+            <div className="relative min-h-[31rem] min-w-[620px]">
+              <div className="absolute inset-0 bg-[linear-gradient(rgba(148,163,184,0.08)_1px,transparent_1px),linear-gradient(90deg,rgba(148,163,184,0.08)_1px,transparent_1px)] bg-[size:32px_32px]" />
+              <AgentConnectionCanvas nodes={workflowCoordinates} connections={agentConnections} className="absolute inset-0 h-full w-full" />
+              {positionedNodes.map(({ node, x, y }) => {
+                if (!node) {
+                  return null;
+                }
 
-              const active = selectedNodeId === node.id;
+                const active = selectedNodeId === node.id;
 
-              return (
-                <button
-                  key={node.id}
-                  type="button"
-                  aria-label={`画布节点 ${node.name}`}
-                  className={cn(
-                    "absolute w-36 -translate-x-1/2 -translate-y-1/2 rounded border bg-console-panel/95 p-3 text-left shadow-[0_12px_30px_rgba(0,0,0,0.24)] transition focus:outline-none focus:ring-2 focus:ring-console-cyan",
-                    active ? "border-console-cyan text-console-cyan" : "border-console-line text-console-text hover:border-console-cyan/45",
-                  )}
-                  style={{ left: `${x}%`, top: `${y}%` }}
-                  onClick={() => setSelectedNodeId(node.id)}
-                >
-                  <span className="block truncate text-sm font-semibold">{node.name}</span>
-                  <span className="mt-1 block text-xs text-console-muted">{node.category}</span>
-                </button>
-              );
-            })}
+                return (
+                  <button
+                    key={node.id}
+                    type="button"
+                    aria-label={`画布节点 ${node.name}`}
+                    aria-pressed={active}
+                    className={cn(
+                      "absolute w-36 -translate-x-1/2 -translate-y-1/2 rounded border bg-console-panel/95 p-3 text-left shadow-[0_12px_30px_rgba(0,0,0,0.24)] transition focus:outline-none focus:ring-2 focus:ring-console-cyan",
+                      active ? "border-console-cyan text-console-cyan ring-2 ring-console-cyan/35" : "border-console-line text-console-text hover:border-console-cyan/45",
+                    )}
+                    style={{ left: `${x}%`, top: `${y}%` }}
+                    onClick={() => setSelectedNodeId(node.id)}
+                  >
+                    <span className="block truncate text-sm font-semibold">{node.name}</span>
+                    <span className="mt-1 block text-xs text-console-muted">{node.category}</span>
+                  </button>
+                );
+              })}
+            </div>
           </div>
         </ConsoleCard>
 
