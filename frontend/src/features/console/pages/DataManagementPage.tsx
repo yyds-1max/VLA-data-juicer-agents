@@ -25,6 +25,16 @@ const dataTabs = [
   { id: "unlock", label: "数据解锁" },
 ] satisfies Array<TabItem<DataTab>>;
 
+const dataTabIdPrefix = "data-management";
+
+function dataTabId(tab: DataTab) {
+  return `${dataTabIdPrefix}-tab-${tab}`;
+}
+
+function dataPanelId(tab: DataTab) {
+  return `${dataTabIdPrefix}-panel-${tab}`;
+}
+
 const imageGradients = [
   "from-cyan-300/45 via-slate-700/45 to-emerald-300/20",
   "from-violet-300/35 via-slate-700/50 to-cyan-300/25",
@@ -213,7 +223,7 @@ export function DataManagementPage({ onPlaceholderAction }: DataManagementPagePr
   return (
     <section className="mx-auto max-w-7xl space-y-4 px-4 py-6 md:px-6">
       <div className="flex flex-col gap-3 lg:flex-row lg:items-center lg:justify-between">
-        <SegmentedTabs value={activeTab} tabs={dataTabs} onChange={setActiveTab} aria-label="数据管理视图" />
+        <SegmentedTabs idPrefix={dataTabIdPrefix} value={activeTab} tabs={dataTabs} onChange={setActiveTab} aria-label="数据管理视图" />
         <div className="flex flex-wrap gap-2">
           <ConsoleButton onClick={() => onPlaceholderAction?.("上传数据尚未接入后端")}>
             <Upload aria-hidden="true" className="h-4 w-4" />
@@ -254,16 +264,22 @@ export function DataManagementPage({ onPlaceholderAction }: DataManagementPagePr
         </ConsoleCard>
       </div>
 
-      <div className={panelClass("images")} hidden={activeTab !== "images"}>
+      <div role="tabpanel" id={dataPanelId("images")} aria-labelledby={dataTabId("images")} className={panelClass("images")} hidden={activeTab !== "images"}>
         <ImageDataPanel />
       </div>
-      <div className={panelClass("pointcloud")} hidden={activeTab !== "pointcloud"}>
+      <div
+        role="tabpanel"
+        id={dataPanelId("pointcloud")}
+        aria-labelledby={dataTabId("pointcloud")}
+        className={panelClass("pointcloud")}
+        hidden={activeTab !== "pointcloud"}
+      >
         <PointCloudPanel />
       </div>
-      <div className={panelClass("text")} hidden={activeTab !== "text"}>
+      <div role="tabpanel" id={dataPanelId("text")} aria-labelledby={dataTabId("text")} className={panelClass("text")} hidden={activeTab !== "text"}>
         <TextDataPanel />
       </div>
-      <div className={panelClass("unlock")} hidden={activeTab !== "unlock"}>
+      <div role="tabpanel" id={dataPanelId("unlock")} aria-labelledby={dataTabId("unlock")} className={panelClass("unlock")} hidden={activeTab !== "unlock"}>
         <UnlockPanel onPlaceholderAction={onPlaceholderAction} />
       </div>
     </section>

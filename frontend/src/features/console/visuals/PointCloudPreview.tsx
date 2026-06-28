@@ -27,7 +27,7 @@ function createPrng(seed: string) {
   };
 }
 
-function drawPointCloud(canvas: HTMLCanvasElement, id: string) {
+function drawPointCloud(canvas: HTMLCanvasElement, id: string, size?: { width: number; height: number }) {
   if (typeof navigator !== "undefined" && navigator.userAgent.includes("jsdom")) {
     return;
   }
@@ -38,7 +38,7 @@ function drawPointCloud(canvas: HTMLCanvasElement, id: string) {
     return;
   }
 
-  const rect = canvas.getBoundingClientRect();
+  const rect = size ?? canvas.getBoundingClientRect();
   const width = Math.max(1, Math.floor(rect.width || canvas.clientWidth || 320));
   const height = Math.max(1, Math.floor(rect.height || canvas.clientHeight || 180));
   const pixelRatio = window.devicePixelRatio || 1;
@@ -98,20 +98,46 @@ function drawPointCloud(canvas: HTMLCanvasElement, id: string) {
 }
 
 export function PointCloudPreview({ id, className }: PointCloudPreviewProps) {
+  const containerRef = useRef<HTMLDivElement | null>(null);
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
 
   useEffect(() => {
+    const container = containerRef.current;
     const canvas = canvasRef.current;
 
-    if (!canvas) {
+    if (!container || !canvas) {
       return undefined;
     }
 
     const redraw = () => {
-      drawPointCloud(canvas, id);
+      const rect = container.getBoundingClientRect();
+      drawPointCloud(canvas, id, { width: rect.width, height: rect.height });
     };
 
     redraw();
+
+    const ResizeObserverCtor = window.ResizeObserver;
+
+    if (typeof ResizeObserverCtor === "function") {
+      const resizeObserver = new ResizeObserverCtor((entries) => {
+        const entry = entries[0];
+
+        if (!entry) {
+          redraw();
+          return;
+        }
+
+        const { width, height } = entry.contentRect;
+        drawPointCloud(canvas, id, { width, height });
+      });
+
+      resizeObserver.observe(container);
+
+      return () => {
+        resizeObserver.disconnect();
+      };
+    }
+
     window.addEventListener("resize", redraw);
 
     return () => {
@@ -119,5 +145,9 @@ export function PointCloudPreview({ id, className }: PointCloudPreviewProps) {
     };
   }, [id]);
 
-  return <canvas ref={canvasRef} aria-hidden="true" className={className} />;
+  return (
+    <div ref={containerRef} className={className}>
+      <canvas ref={canvasRef} aria-hidden="true" className="block h-full w-full" />
+    </div>
+  );
 }

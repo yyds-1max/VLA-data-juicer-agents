@@ -68,6 +68,25 @@ describe("console primitives", () => {
     expect(onChange).toHaveBeenCalledWith("pointcloud");
   });
 
+  test("SegmentedTabs links tabs to panels when an id prefix is provided", () => {
+    render(
+      <SegmentedTabs
+        idPrefix="data-management"
+        value="image"
+        tabs={[
+          { id: "image", label: "图像数据" },
+          { id: "pointcloud", label: "点云数据" },
+        ]}
+        onChange={vi.fn()}
+      />,
+    );
+
+    expect(screen.getByRole("tab", { name: "图像数据" })).toHaveAttribute("id", "data-management-tab-image");
+    expect(screen.getByRole("tab", { name: "图像数据" })).toHaveAttribute("aria-controls", "data-management-panel-image");
+    expect(screen.getByRole("tab", { name: "点云数据" })).toHaveAttribute("id", "data-management-tab-pointcloud");
+    expect(screen.getByRole("tab", { name: "点云数据" })).toHaveAttribute("aria-controls", "data-management-panel-pointcloud");
+  });
+
   test("StatusTag and ProgressBar render readable status details", () => {
     render(
       <>

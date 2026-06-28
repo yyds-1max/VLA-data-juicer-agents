@@ -23,6 +23,16 @@ const annotationTabs = [
   { id: "review", label: "人工复核" },
 ] satisfies Array<TabItem<AnnotationTab>>;
 
+const annotationTabIdPrefix = "annotation";
+
+function annotationTabId(tab: AnnotationTab) {
+  return `${annotationTabIdPrefix}-tab-${tab}`;
+}
+
+function annotationPanelId(tab: AnnotationTab) {
+  return `${annotationTabIdPrefix}-panel-${tab}`;
+}
+
 const pipelineNodes = [
   { name: "数据接入", icon: CircleDot, tone: "info", detail: "图像/点云/文本批次" },
   { name: "视觉检测", icon: ScanSearch, tone: "success", detail: "目标框与可交互区域" },
@@ -191,20 +201,38 @@ export function AnnotationPage({ onPlaceholderAction }: AnnotationPageProps) {
   return (
     <section className="mx-auto max-w-7xl space-y-4 px-4 py-6 md:px-6">
       <div className="flex flex-col gap-3 lg:flex-row lg:items-center lg:justify-between">
-        <SegmentedTabs value={activeTab} tabs={annotationTabs} onChange={setActiveTab} aria-label="自动标注视图" />
+        <SegmentedTabs idPrefix={annotationTabIdPrefix} value={activeTab} tabs={annotationTabs} onChange={setActiveTab} aria-label="自动标注视图" />
         <div className="flex flex-wrap gap-2">
           <StatusTag tone="success">流水线在线</StatusTag>
           <StatusTag tone="warning">人工队列 24</StatusTag>
         </div>
       </div>
 
-      <div className={panelClass("pipeline")} hidden={activeTab !== "pipeline"}>
+      <div
+        role="tabpanel"
+        id={annotationPanelId("pipeline")}
+        aria-labelledby={annotationTabId("pipeline")}
+        className={panelClass("pipeline")}
+        hidden={activeTab !== "pipeline"}
+      >
         <PipelinePanel onPlaceholderAction={onPlaceholderAction} />
       </div>
-      <div className={panelClass("results")} hidden={activeTab !== "results"}>
+      <div
+        role="tabpanel"
+        id={annotationPanelId("results")}
+        aria-labelledby={annotationTabId("results")}
+        className={panelClass("results")}
+        hidden={activeTab !== "results"}
+      >
         <ResultsPanel />
       </div>
-      <div className={panelClass("review")} hidden={activeTab !== "review"}>
+      <div
+        role="tabpanel"
+        id={annotationPanelId("review")}
+        aria-labelledby={annotationTabId("review")}
+        className={panelClass("review")}
+        hidden={activeTab !== "review"}
+      >
         <ReviewPanel onPlaceholderAction={onPlaceholderAction} />
       </div>
     </section>
