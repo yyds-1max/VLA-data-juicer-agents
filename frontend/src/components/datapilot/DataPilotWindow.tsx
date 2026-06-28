@@ -148,7 +148,7 @@ export function DataPilotWindow() {
     <section
       role="dialog"
       aria-label="DataPilot"
-      className="fixed bottom-3 right-3 z-40 flex h-[min(640px,calc(100vh-1.5rem))] w-[calc(100vw-1.5rem)] max-w-[460px] flex-col overflow-hidden rounded border border-console-line bg-console-panel shadow-[0_22px_70px_rgba(0,0,0,0.42)] sm:bottom-5 sm:right-5 sm:h-[min(680px,calc(100vh-2.5rem))] sm:w-[min(460px,calc(100vw-2.5rem))]"
+      className="fixed bottom-3 right-3 z-[80] flex h-[min(640px,calc(100vh-1.5rem))] w-[calc(100vw-1.5rem)] max-w-[460px] flex-col overflow-hidden rounded border border-console-line bg-console-panel shadow-[0_22px_70px_rgba(0,0,0,0.42)] sm:bottom-5 sm:right-5 sm:h-[min(680px,calc(100vh-2.5rem))] sm:w-[min(460px,calc(100vw-2.5rem))]"
     >
       <SessionHeader onHistory={handleHistory} onNewSession={handleNewSession} />
       {historyOpen ? (

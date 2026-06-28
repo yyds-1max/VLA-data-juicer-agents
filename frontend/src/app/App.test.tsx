@@ -204,6 +204,27 @@ test("simulation page switches config running and results views", () => {
   expect(screen.getByText("详细测试报告")).toBeVisible();
 });
 
+test("DataPilot opens only from the floating button after console migration", () => {
+  render(<App />);
+
+  fireEvent.click(screen.getByRole("button", { name: "测试/仿真" }));
+  fireEvent.click(screen.getByRole("button", { name: "启动仿真" }));
+  expect(screen.queryByRole("dialog", { name: "DataPilot" })).not.toBeInTheDocument();
+
+  fireEvent.click(screen.getByRole("button", { name: "Open DataPilot" }));
+  expect(screen.getByRole("dialog", { name: "DataPilot" })).toBeVisible();
+});
+
+test("DataPilot window remains above the console content", () => {
+  render(<App />);
+
+  fireEvent.click(screen.getByRole("button", { name: "Open DataPilot" }));
+
+  const dialog = screen.getByRole("dialog", { name: "DataPilot" });
+  expect(dialog.className).toContain("fixed");
+  expect(dialog.className).toContain("z-[80]");
+});
+
 test("opens DataPilot draft window from the floating button", () => {
   render(<App />);
 
