@@ -77,31 +77,62 @@ Do not modify backend Web API files for this migration unless tests reveal a dir
 - Create: `frontend/src/components/console/SegmentedTabs.tsx`
 - Create: `frontend/src/components/console/MetricCard.tsx`
 - Modify: `frontend/src/styles/globals.css`
-- Test: `frontend/src/app/App.test.tsx`
+- Test: `frontend/src/components/console/consolePrimitives.test.tsx`
 
 - [ ] **Step 1: Write failing shared primitive tests**
 
-Add tests to `frontend/src/app/App.test.tsx`:
+Create `frontend/src/components/console/consolePrimitives.test.tsx`:
 
 ```tsx
-test("console placeholder actions do not open DataPilot", () => {
-  render(<App />);
+import { fireEvent, render, screen } from "@testing-library/react";
+import { describe, expect, test, vi } from "vitest";
 
-  fireEvent.click(screen.getByRole("button", { name: "启动标注" }));
+import { ConsoleButton } from "./ConsoleButton";
+import { ProgressBar } from "./ProgressBar";
+import { SegmentedTabs } from "./SegmentedTabs";
+import { StatusTag } from "./StatusTag";
 
-  expect(screen.queryByRole("dialog", { name: "DataPilot" })).not.toBeInTheDocument();
-  expect(screen.getByRole("button", { name: "Open DataPilot" })).toBeVisible();
-});
+describe("console primitives", () => {
+  test("ConsoleButton renders a real button and delegates clicks to the caller", () => {
+    const onClick = vi.fn();
 
-test("console shared tabs switch visible panels without remounting DataPilot", () => {
-  render(<App />);
+    render(<ConsoleButton onClick={onClick}>启动标注</ConsoleButton>);
+    fireEvent.click(screen.getByRole("button", { name: "启动标注" }));
 
-  fireEvent.click(screen.getByRole("button", { name: "数据管理" }));
-  fireEvent.click(screen.getByRole("tab", { name: "点云数据" }));
+    expect(onClick).toHaveBeenCalledTimes(1);
+  });
 
-  expect(screen.getByText("PCD-000")).toBeVisible();
-  expect(screen.queryByText("IMG-000")).not.toBeVisible();
-  expect(screen.getByRole("button", { name: "Open DataPilot" })).toBeVisible();
+  test("SegmentedTabs exposes accessible tabs", () => {
+    const onChange = vi.fn();
+
+    render(
+      <SegmentedTabs
+        value="image"
+        tabs={[
+          { id: "image", label: "图像数据" },
+          { id: "pointcloud", label: "点云数据" },
+        ]}
+        onChange={onChange}
+      />,
+    );
+
+    fireEvent.click(screen.getByRole("tab", { name: "点云数据" }));
+
+    expect(screen.getByRole("tab", { name: "点云数据" })).toHaveAttribute("aria-selected", "true");
+    expect(onChange).toHaveBeenCalledWith("pointcloud");
+  });
+
+  test("StatusTag and ProgressBar render readable status details", () => {
+    render(
+      <>
+        <StatusTag tone="success">已解锁</StatusTag>
+        <ProgressBar value={73} tone="info" label="进行中 73%" />
+      </>,
+    );
+
+    expect(screen.getByText("已解锁")).toBeVisible();
+    expect(screen.getByText("进行中 73%")).toBeVisible();
+  });
 });
 ```
 
@@ -109,10 +140,10 @@ Run:
 
 ```bash
 cd frontend
-npm test -- src/app/App.test.tsx
+npm test -- src/components/console/consolePrimitives.test.tsx
 ```
 
-Expected: FAIL because the new console pages and placeholder controls do not exist yet.
+Expected: FAIL because the console primitives do not exist yet.
 
 - [ ] **Step 2: Create shared console types**
 
@@ -220,15 +251,15 @@ Run:
 
 ```bash
 cd frontend
-npm test -- src/app/App.test.tsx
+npm test -- src/components/console/consolePrimitives.test.tsx
 ```
 
-Expected: tests still fail until shell/pages are wired, but TypeScript should compile the newly imported components once tasks 2 and 3 reference them.
+Expected: primitive tests pass.
 
 - [ ] **Step 7: Commit shared foundation**
 
 ```bash
-git add frontend/src/components/console frontend/src/features/console/consoleTypes.ts frontend/src/features/console/consoleFixtures.ts frontend/src/styles/globals.css frontend/src/app/App.test.tsx
+git add frontend/src/components/console frontend/src/features/console/consoleTypes.ts frontend/src/features/console/consoleFixtures.ts frontend/src/styles/globals.css
 git commit -m "feat: add DataLoop console primitives"
 ```
 
@@ -488,6 +519,17 @@ test("data management tabs render image pointcloud text and unlock panels", () =
   fireEvent.click(screen.getByRole("tab", { name: "数据解锁" }));
   expect(screen.getByText("解锁规则配置")).toBeVisible();
   expect(screen.getByText("批次管理")).toBeVisible();
+});
+
+test("console shared tabs switch visible panels without remounting DataPilot", () => {
+  render(<App />);
+
+  fireEvent.click(screen.getByRole("button", { name: "数据管理" }));
+  fireEvent.click(screen.getByRole("tab", { name: "点云数据" }));
+
+  expect(screen.getByText("PCD-000")).toBeVisible();
+  expect(screen.queryByText("IMG-000")).not.toBeVisible();
+  expect(screen.getByRole("button", { name: "Open DataPilot" })).toBeVisible();
 });
 
 test("annotation page switches pipeline results and review views", () => {
