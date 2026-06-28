@@ -188,6 +188,35 @@ describe("eventReducer", () => {
       "second answer",
     ]);
   });
+
+  it("streams assistant delta into one final assistant item", () => {
+    const state = createEmptyRunState();
+
+    applyAgentEvent(state, event("assistant_delta", "main", { delta: "你好，" }, { run_id: "stream-run" }));
+    applyAgentEvent(state, event("assistant_delta", "main", { delta: "我是 DataPilot" }, { run_id: "stream-run" }));
+
+    expect(state.timeline.filter((item) => item.kind === "assistant")).toEqual([
+      {
+        kind: "assistant",
+        source: "main",
+        text: "你好，我是 DataPilot",
+        runId: "stream-run",
+        parentRunId: null,
+      },
+    ]);
+
+    applyAgentEvent(state, event("final", "main", { text: "你好，我是 DataPilot。" }, { run_id: "stream-run" }));
+
+    expect(state.timeline.filter((item) => item.kind === "assistant")).toEqual([
+      {
+        kind: "assistant",
+        source: "main",
+        text: "你好，我是 DataPilot。",
+        runId: "stream-run",
+        parentRunId: null,
+      },
+    ]);
+  });
 });
 
 describe("datapilotStore", () => {
@@ -242,6 +271,39 @@ describe("datapilotStore", () => {
     );
 
     expect(store.getState().messages.map((item) => item.content)).toEqual(["persisted answer", "new local turn"]);
+  });
+
+  it("replaces a matching local user echo with the persisted user message", () => {
+    const store = createDataPilotStore();
+
+    store.getState().setActiveSession(session());
+    store.getState().appendUserMessage(
+      message({
+        id: "local-user-message",
+        content: "你好，你是谁？",
+        created_at: "2026-06-26T00:01:01Z",
+      }),
+    );
+
+    store.getState().refreshActiveSession(
+      sessionDetail({
+        messages: [
+          message({
+            id: "persisted-user-message",
+            content: "你好，你是谁？",
+            created_at: "2026-06-26T00:01:00Z",
+          }),
+        ],
+      }),
+    );
+
+    expect(store.getState().messages).toEqual([
+      message({
+        id: "persisted-user-message",
+        content: "你好，你是谁？",
+        created_at: "2026-06-26T00:01:00Z",
+      }),
+    ]);
   });
 
   it("refreshing an active session keeps live run state from the event stream", () => {

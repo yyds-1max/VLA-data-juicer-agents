@@ -190,9 +190,11 @@ function localUserMessage(sessionId: string, content: string) {
 }
 
 function createLocalId(): string {
-  return typeof crypto !== "undefined" && "randomUUID" in crypto
-    ? crypto.randomUUID()
-    : `local-${Date.now()}-${Math.random().toString(16).slice(2)}`;
+  const suffix =
+    typeof crypto !== "undefined" && "randomUUID" in crypto
+      ? crypto.randomUUID()
+      : `${Date.now()}-${Math.random().toString(16).slice(2)}`;
+  return `local-${suffix}`;
 }
 
 function isActiveSocket(socket: WebSocket): boolean {

@@ -117,7 +117,11 @@ function upsertSession(sessions: SessionRecord[], session: SessionRecord): Sessi
 function mergeMessages(existing: ChatMessageRecord[], persisted: ChatMessageRecord[]): ChatMessageRecord[] {
   const orderById = new Map<string, number>();
   let nextOrder = 0;
-  for (const message of [...existing, ...persisted]) {
+  const existingWithoutPersistedEchoes = existing.filter(
+    (message) => !isLocalUserEchoOfPersistedMessage(message, persisted),
+  );
+
+  for (const message of [...existingWithoutPersistedEchoes, ...persisted]) {
     if (!orderById.has(message.id)) {
       orderById.set(message.id, nextOrder);
       nextOrder += 1;
@@ -125,7 +129,7 @@ function mergeMessages(existing: ChatMessageRecord[], persisted: ChatMessageReco
   }
 
   const byId = new Map<string, ChatMessageRecord>();
-  for (const message of existing) {
+  for (const message of existingWithoutPersistedEchoes) {
     byId.set(message.id, message);
   }
   for (const message of persisted) {
@@ -133,6 +137,25 @@ function mergeMessages(existing: ChatMessageRecord[], persisted: ChatMessageReco
   }
 
   return [...byId.values()].sort((left, right) => compareMessages(left, right, orderById));
+}
+
+function isLocalUserEchoOfPersistedMessage(
+  message: ChatMessageRecord,
+  persisted: ChatMessageRecord[],
+): boolean {
+  if (!isLocalMessageId(message.id) || message.role !== "user") {
+    return false;
+  }
+  return persisted.some(
+    (candidate) =>
+      candidate.role === message.role &&
+      candidate.session_id === message.session_id &&
+      candidate.content === message.content,
+  );
+}
+
+function isLocalMessageId(messageId: string): boolean {
+  return messageId.startsWith("local-");
 }
 
 function compareMessages(

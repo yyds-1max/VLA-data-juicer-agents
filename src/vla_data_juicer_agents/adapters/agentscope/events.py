@@ -157,6 +157,9 @@ class ProgressSummaryFilter:
             rendered = self._consume_line(line)
             if rendered is not None:
                 output.append(rendered + "\n")
+        if self._buffer and not self._could_be_progress_line(self._buffer):
+            output.append(self._buffer)
+            self._buffer = ""
         return "".join(output)
 
     def flush_progress_only(self) -> None:
@@ -182,6 +185,15 @@ class ProgressSummaryFilter:
     @staticmethod
     def _is_progress_line(line: str) -> bool:
         return bool(_PROGRESS_MARKER_RE.match(line))
+
+    @staticmethod
+    def _could_be_progress_line(line: str) -> bool:
+        stripped = line.lstrip()
+        if not stripped:
+            return True
+        markers = ("progress:", "progress：", "进度:", "进度：", "思考摘要:", "思考摘要：", "思考:", "思考：")
+        normalized = stripped.lower()
+        return any(marker.startswith(normalized) or normalized.startswith(marker) for marker in markers)
 
 
 def _result_payload_failed(result_text: str) -> bool:

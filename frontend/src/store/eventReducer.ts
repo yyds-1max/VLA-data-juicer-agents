@@ -122,6 +122,28 @@ export function applyAgentEvent(state: RunState, event: AgentEvent): void {
     return;
   }
 
+  if (type === "assistant_delta") {
+    const delta = normalizeText(payload.delta);
+    if (!delta) {
+      return;
+    }
+    const existing = findAssistantItem(state, source, runId);
+    if (existing) {
+      existing.text += delta;
+    } else {
+      state.timeline.push({
+        kind: "assistant",
+        source,
+        text: delta,
+        runId,
+        parentRunId,
+      });
+    }
+    state.running = true;
+    state.activeText = `[${label}] 正在思考`;
+    return;
+  }
+
   if (type === "agent_end") {
     delete state.activeAgents[agentKey(runId, source)];
     refreshRunningText(state);
@@ -138,13 +160,18 @@ export function applyAgentEvent(state: RunState, event: AgentEvent): void {
 
     const text = normalizeText(payload.text);
     if (text) {
-      state.timeline.push({
-        kind: "assistant",
-        source,
-        text,
-        runId,
-        parentRunId,
-      });
+      const existing = runId ? findAssistantItem(state, source, runId) : undefined;
+      if (existing) {
+        existing.text = text;
+      } else {
+        state.timeline.push({
+          kind: "assistant",
+          source,
+          text,
+          runId,
+          parentRunId,
+        });
+      }
     }
     state.activeAgents = {};
     state.activeTools = {};
@@ -160,6 +187,25 @@ export function applyAgentEvent(state: RunState, event: AgentEvent): void {
     runId,
     parentRunId,
   });
+}
+
+function findAssistantItem(state: RunState, source: string, runId: string): TimelineItem | undefined {
+  for (let index = state.timeline.length - 1; index >= 0; index -= 1) {
+    const item = state.timeline[index];
+    if (item.kind !== "assistant" || item.source !== source) {
+      continue;
+    }
+    if (runId) {
+      if (item.runId === runId) {
+        return item;
+      }
+      continue;
+    }
+    if (!item.runId) {
+      return item;
+    }
+  }
+  return undefined;
 }
 
 function refreshRunningText(state: RunState): void {

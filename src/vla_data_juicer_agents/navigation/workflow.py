@@ -455,7 +455,10 @@ async def _run_agent_stream(
                     if event_type != "TEXT_BLOCK_DELTA":
                         progress_filter.flush_progress_only()
                     adapter.accept(event)
-                    output_chunks.append(progress_filter.consume_text_delta(_event_text_delta(event)))
+                    rendered_delta = progress_filter.consume_text_delta(_event_text_delta(event))
+                    if rendered_delta:
+                        scope.emit("assistant_delta", delta=rendered_delta)
+                    output_chunks.append(rendered_delta)
                     tool_output_chunks.append(_event_tool_result_delta(event))
                     if event_type == "REQUIRE_USER_CONFIRM":
                         reply_id = getattr(event, "reply_id", None)
@@ -464,8 +467,11 @@ async def _run_agent_stream(
                     active_cancellation.raise_if_cancelled()
                 if not confirm_results:
                     adapter.close_active_tools("completed")
+                    flushed_delta = progress_filter.flush()
+                    if flushed_delta:
+                        scope.emit("assistant_delta", delta=flushed_delta)
+                    output_chunks.append(flushed_delta)
                     scope.emit("agent_end", status="completed")
-                    output_chunks.append(progress_filter.flush())
                     return "".join(output_chunks) or "".join(tool_output_chunks)
                 if reply_id is None:
                     raise RuntimeError("AgentScope requested tool confirmation without a reply id.")

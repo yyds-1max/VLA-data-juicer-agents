@@ -54,6 +54,26 @@ def test_progress_marker_text_becomes_reasoning_and_is_removed_from_output():
     assert [(event["type"], event["payload"]) for event in events] == [
         ("agent_start", {}),
         ("reasoning", {"summary": "Raw data exists; next I will inspect the profile."}),
+        ("assistant_delta", {"delta": "final answer"}),
+        ("agent_end", {"status": "completed"}),
+    ]
+
+
+def test_plain_text_delta_emits_assistant_delta_for_streaming_ui():
+    scope, events = _scope_and_events()
+
+    class StreamingAgent:
+        async def reply_stream(self, _message):
+            yield SimpleNamespace(type="TEXT_BLOCK_DELTA", delta="你好，")
+            yield SimpleNamespace(type="TEXT_BLOCK_DELTA", delta="我是 DataPilot。")
+
+    output = asyncio.run(_run_agent_stream(StreamingAgent(), "prompt", event_scope=scope))
+
+    assert output == "你好，我是 DataPilot。"
+    assert [(event["type"], event["payload"]) for event in events] == [
+        ("agent_start", {}),
+        ("assistant_delta", {"delta": "你好，"}),
+        ("assistant_delta", {"delta": "我是 DataPilot。"}),
         ("agent_end", {"status": "completed"}),
     ]
 
@@ -84,6 +104,7 @@ def test_progress_marker_without_newline_flushes_before_tool_event():
         ("reasoning", "Need the raw segment metadata; next I will inspect the date."),
         ("tool_start", None),
         ("tool_end", "done"),
+        ("assistant_delta", None),
         ("agent_end", None),
     ]
 
@@ -217,6 +238,7 @@ def test_agent_lifecycle_is_emitted_once_across_confirmation_rounds():
     assert output == "finished"
     assert [(event["type"], event["payload"]) for event in events] == [
         ("agent_start", {}),
+        ("assistant_delta", {"delta": "finished"}),
         ("agent_end", {"status": "completed"}),
     ]
 

@@ -140,6 +140,9 @@ def apply_event(state: TuiState, event: dict[str, Any]) -> None:
         )
         return
 
+    if event_type == "assistant_delta":
+        return
+
     if event_type == "final":
         if run_id in state._final_runs:
             return

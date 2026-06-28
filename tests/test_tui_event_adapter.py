@@ -278,6 +278,14 @@ def test_final_appends_one_assistant_message_and_records_stop():
     assert state.timeline[0].text == "Session ended."
 
 
+def test_assistant_delta_is_ignored_by_tui_timeline():
+    state = TuiState()
+
+    apply_event(state, event("assistant_delta", "main", delta="partial"))
+
+    assert state.timeline == []
+
+
 def test_failed_tool_without_start_is_still_displayed():
     state = TuiState()
 
