@@ -980,8 +980,10 @@ def test_run_plan_agent_streams_events_to_run_state(tmp_path):
     assert parsed_plan == plan
     assert [(event["type"], event["source"], event["run_id"], event["parent_run_id"]) for event in events] == [
         ("agent_start", "navigation.plan", "plan-run", "workflow-run"),
+        ("assistant_delta", "navigation.plan", "plan-run", "workflow-run"),
         ("agent_end", "navigation.plan", "plan-run", "workflow-run"),
     ]
+    assert events[1]["payload"] == {"delta": plan_json}
     assert events[-1]["payload"] == {"status": "completed"}
     assert all("event_type" not in event for event in events)
 
@@ -1035,6 +1037,7 @@ def test_run_plan_agent_auto_confirms_tool_calls(tmp_path):
     assert agent.inputs[1].confirm_results[0].confirmed is True
     assert [(event["type"], event["payload"]) for event in events] == [
         ("agent_start", {}),
+        ("assistant_delta", {"delta": plan.model_dump_json()}),
         ("agent_end", {"status": "completed"}),
     ]
 
