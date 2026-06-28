@@ -192,9 +192,12 @@ describe("eventReducer", () => {
   it("streams assistant delta into one final assistant item", () => {
     const state = createEmptyRunState();
 
+    applyAgentEvent(state, event("agent_start", "main", {}, { run_id: "stream-run" }));
     applyAgentEvent(state, event("assistant_delta", "main", { delta: "你好，" }, { run_id: "stream-run" }));
     applyAgentEvent(state, event("assistant_delta", "main", { delta: "我是 DataPilot" }, { run_id: "stream-run" }));
 
+    expect(state.running).toBe(true);
+    expect(state.activeText).toBe("");
     expect(state.timeline.filter((item) => item.kind === "assistant")).toEqual([
       {
         kind: "assistant",

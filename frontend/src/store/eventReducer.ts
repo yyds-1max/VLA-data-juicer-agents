@@ -140,7 +140,7 @@ export function applyAgentEvent(state: RunState, event: AgentEvent): void {
       });
     }
     state.running = true;
-    state.activeText = `[${label}] 正在思考`;
+    state.activeText = "";
     return;
   }
 
