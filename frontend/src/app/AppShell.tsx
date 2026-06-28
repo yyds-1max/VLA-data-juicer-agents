@@ -5,6 +5,7 @@ import { ConsoleHeader } from "../components/console/ConsoleHeader";
 import { ConsoleSidebar } from "../components/console/ConsoleSidebar";
 import { ConsoleToast } from "../components/console/ConsoleToast";
 import type { ConsolePageId, StatusTone } from "../features/console/consoleTypes";
+import { DashboardPage } from "../features/console/pages/DashboardPage";
 import { BackgroundParticles } from "../features/console/visuals/BackgroundParticles";
 
 type AppShellProps = {
@@ -104,7 +105,7 @@ export function AppShell({ children }: AppShellProps) {
 
       <main className="relative z-10 pt-28 md:ml-64 md:pt-0">
         <ConsoleHeader title={activeTitle} />
-        <PagePlaceholder pageId={activePage} onRequestToast={() => showPlaceholderToast()} />
+        {activePage === "dashboard" ? <DashboardPage /> : <PagePlaceholder pageId={activePage} onRequestToast={() => showPlaceholderToast()} />}
       </main>
 
       {children}

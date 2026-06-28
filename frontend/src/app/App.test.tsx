@@ -85,6 +85,24 @@ test("renders the full DataLoop console shell by default", () => {
   expect(screen.getByRole("button", { name: "Open DataPilot" })).toBeVisible();
 });
 
+test("dashboard preserves reference metric and activity content", () => {
+  render(<App />);
+
+  expect(screen.getByText("总数据量")).toBeVisible();
+  expect(screen.getByText("284,729")).toBeVisible();
+  expect(screen.getByText("数据类型分布")).toBeVisible();
+  expect(screen.getByText("数据闭环流程")).toBeVisible();
+  expect(screen.getByText("最近活动")).toBeVisible();
+});
+
+test("dashboard metric chart tabs switch between success and loss", () => {
+  render(<App />);
+
+  expect(screen.getByText("Success Rate (%)")).toBeVisible();
+  fireEvent.click(screen.getByRole("tab", { name: "损失值" }));
+  expect(screen.getByText("Training Loss")).toBeVisible();
+});
+
 test("sidebar navigation switches console pages", () => {
   render(<App />);
 
