@@ -22,6 +22,7 @@ export function ConsoleHeader({ title }: ConsoleHeaderProps) {
             <Search className="pointer-events-none absolute left-3 top-1/2 h-4 w-4 -translate-y-1/2 text-console-muted" aria-hidden="true" />
             <input
               type="search"
+              aria-label="搜索数据、模型、任务"
               placeholder="搜索数据、模型、任务..."
               className="h-10 w-full rounded border border-console-line bg-console-panel2 py-2 pl-9 pr-3 text-sm text-console-text placeholder:text-console-muted focus:border-console-cyan/60 focus:outline-none focus:ring-2 focus:ring-console-cyan/30"
             />
