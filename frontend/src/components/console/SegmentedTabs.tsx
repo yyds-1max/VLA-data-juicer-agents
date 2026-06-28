@@ -1,5 +1,3 @@
-import { useEffect, useState } from "react";
-
 import type { TabItem } from "../../features/console/consoleTypes";
 import { cn } from "../../lib/utils";
 
@@ -12,16 +10,10 @@ type SegmentedTabsProps<T extends string> = {
 };
 
 export function SegmentedTabs<T extends string>({ value, tabs, onChange, className, "aria-label": ariaLabel = "Console tabs" }: SegmentedTabsProps<T>) {
-  const [selected, setSelected] = useState(value);
-
-  useEffect(() => {
-    setSelected(value);
-  }, [value]);
-
   return (
     <div className={cn("inline-flex rounded border border-console-line bg-console-panel2 p-1", className)} role="tablist" aria-label={ariaLabel}>
       {tabs.map((tab) => {
-        const active = tab.id === selected;
+        const active = tab.id === value;
 
         return (
           <button
@@ -35,7 +27,6 @@ export function SegmentedTabs<T extends string>({ value, tabs, onChange, classNa
               !active && "hover:bg-console-panel hover:text-console-text",
             )}
             onClick={() => {
-              setSelected(tab.id);
               onChange(tab.id);
             }}
           >

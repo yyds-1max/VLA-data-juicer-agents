@@ -85,6 +85,7 @@ Create `frontend/src/components/console/consolePrimitives.test.tsx`:
 
 ```tsx
 import { fireEvent, render, screen } from "@testing-library/react";
+import { useState } from "react";
 import { describe, expect, test, vi } from "vitest";
 
 import { ConsoleButton } from "./ConsoleButton";
@@ -105,16 +106,25 @@ describe("console primitives", () => {
   test("SegmentedTabs exposes accessible tabs", () => {
     const onChange = vi.fn();
 
-    render(
-      <SegmentedTabs
-        value="image"
-        tabs={[
-          { id: "image", label: "图像数据" },
-          { id: "pointcloud", label: "点云数据" },
-        ]}
-        onChange={onChange}
-      />,
-    );
+    function ControlledTabs() {
+      const [value, setValue] = useState("image");
+
+      return (
+        <SegmentedTabs
+          value={value}
+          tabs={[
+            { id: "image", label: "图像数据" },
+            { id: "pointcloud", label: "点云数据" },
+          ]}
+          onChange={(nextValue) => {
+            onChange(nextValue);
+            setValue(nextValue);
+          }}
+        />
+      );
+    }
+
+    render(<ControlledTabs />);
 
     fireEvent.click(screen.getByRole("tab", { name: "点云数据" }));
 
@@ -221,6 +231,8 @@ export function ConsoleButton({ variant = "ghost", className, ...props }: Consol
 `ConsoleButton` must not contain DataPilot logic. Placeholder behavior belongs to the page that uses it.
 
 Implement `StatusTag`, `ProgressBar`, `QualityRing`, `SegmentedTabs`, and `MetricCard` as presentational components using existing `cn` from `frontend/src/lib/utils.ts`.
+
+`SegmentedTabs` must be controlled: use the `value` prop to determine `aria-selected` and visual active state, and have tab clicks call only `onChange(tab.id)`. Do not keep internal selected-tab state in the component.
 
 - [ ] **Step 5: Add animation and utility CSS**
 

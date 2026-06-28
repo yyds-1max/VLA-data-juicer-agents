@@ -1,5 +1,6 @@
 import "@testing-library/jest-dom/vitest";
 import { fireEvent, render, screen } from "@testing-library/react";
+import { useState } from "react";
 import { describe, expect, test, vi } from "vitest";
 
 import { ConsoleButton } from "./ConsoleButton";
@@ -20,6 +21,35 @@ describe("console primitives", () => {
   test("SegmentedTabs exposes accessible tabs", () => {
     const onChange = vi.fn();
 
+    function ControlledTabs() {
+      const [value, setValue] = useState("image");
+
+      return (
+        <SegmentedTabs
+          value={value}
+          tabs={[
+            { id: "image", label: "图像数据" },
+            { id: "pointcloud", label: "点云数据" },
+          ]}
+          onChange={(nextValue) => {
+            onChange(nextValue);
+            setValue(nextValue);
+          }}
+        />
+      );
+    }
+
+    render(<ControlledTabs />);
+
+    fireEvent.click(screen.getByRole("tab", { name: "点云数据" }));
+
+    expect(screen.getByRole("tab", { name: "点云数据" })).toHaveAttribute("aria-selected", "true");
+    expect(onChange).toHaveBeenCalledWith("pointcloud");
+  });
+
+  test("SegmentedTabs selection is controlled by the value prop", () => {
+    const onChange = vi.fn();
+
     render(
       <SegmentedTabs
         value="image"
@@ -33,7 +63,8 @@ describe("console primitives", () => {
 
     fireEvent.click(screen.getByRole("tab", { name: "点云数据" }));
 
-    expect(screen.getByRole("tab", { name: "点云数据" })).toHaveAttribute("aria-selected", "true");
+    expect(screen.getByRole("tab", { name: "图像数据" })).toHaveAttribute("aria-selected", "true");
+    expect(screen.getByRole("tab", { name: "点云数据" })).toHaveAttribute("aria-selected", "false");
     expect(onChange).toHaveBeenCalledWith("pointcloud");
   });
 
