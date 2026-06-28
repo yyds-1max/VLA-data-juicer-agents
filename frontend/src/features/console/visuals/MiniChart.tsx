@@ -34,7 +34,14 @@ type BarChartProps = {
   className?: string;
 };
 
-type MiniChartProps = DonutChartProps | LineChartProps | BarChartProps;
+type RadarChartProps = {
+  type: "radar";
+  title: string;
+  data: SeriesChart;
+  className?: string;
+};
+
+type MiniChartProps = DonutChartProps | LineChartProps | BarChartProps | RadarChartProps;
 
 const SVG_WIDTH = 320;
 const SVG_HEIGHT = 180;
@@ -213,6 +220,61 @@ function BarChart({ title, data, className }: BarChartProps) {
   );
 }
 
+function polygonPoints(points: Array<{ x: number; y: number }>) {
+  return points.map((point) => `${point.x.toFixed(1)},${point.y.toFixed(1)}`).join(" ");
+}
+
+function RadarChart({ title, data, className }: RadarChartProps) {
+  const centerX = SVG_WIDTH / 2;
+  const centerY = SVG_HEIGHT / 2 + 4;
+  const radius = 58;
+  const axisCount = Math.max(data.labels.length, 3);
+  const axisLabels = data.labels.slice(0, axisCount);
+
+  const pointsForRadius = (scale: number) =>
+    axisLabels.map((_, index) => {
+      const angle = (360 / axisCount) * index;
+
+      return polarToCartesian(centerX, centerY, radius * scale, angle);
+    });
+
+  const valuePoints = axisLabels.map((_, index) => {
+    const value = data.data[index] ?? 0;
+    const normalized = Math.min(1, Math.max(0, value / 100));
+    const angle = (360 / axisCount) * index;
+
+    return polarToCartesian(centerX, centerY, radius * normalized, angle);
+  });
+
+  return (
+    <div className={cn("space-y-3", className)}>
+      <p className="text-sm font-medium text-console-text">{data.label}</p>
+      <svg role="img" aria-label={title} viewBox={`0 0 ${SVG_WIDTH} ${SVG_HEIGHT}`} className="h-48 w-full overflow-visible">
+        {[0.25, 0.5, 0.75, 1].map((scale) => (
+          <polygon key={scale} points={polygonPoints(pointsForRadius(scale))} fill="none" stroke="rgba(148,163,184,0.16)" />
+        ))}
+        {axisLabels.map((label, index) => {
+          const outer = pointsForRadius(1)[index];
+          const labelPoint = polarToCartesian(centerX, centerY, radius + 18, (360 / axisCount) * index);
+
+          return (
+            <g key={label}>
+              <line x1={centerX} y1={centerY} x2={outer.x} y2={outer.y} stroke="rgba(148,163,184,0.18)" />
+              <text x={labelPoint.x} y={labelPoint.y} textAnchor="middle" dominantBaseline="middle" className="fill-console-muted text-[9px]">
+                {label}
+              </text>
+            </g>
+          );
+        })}
+        <polygon data-testid="radar-polygon" points={polygonPoints(valuePoints)} fill={data.color} fillOpacity="0.22" stroke={data.color} strokeWidth="2.5" />
+        {valuePoints.map((point, index) => (
+          <circle key={`${axisLabels[index]}-${data.data[index] ?? 0}`} cx={point.x} cy={point.y} r="3" fill={data.color} stroke="#08111f" strokeWidth="1.5" />
+        ))}
+      </svg>
+    </div>
+  );
+}
+
 export function MiniChart(props: MiniChartProps) {
   if (props.type === "donut") {
     return <DonutChart {...props} />;
@@ -220,6 +282,10 @@ export function MiniChart(props: MiniChartProps) {
 
   if (props.type === "line") {
     return <LineChart {...props} />;
+  }
+
+  if (props.type === "radar") {
+    return <RadarChart {...props} />;
   }
 
   return <BarChart {...props} />;

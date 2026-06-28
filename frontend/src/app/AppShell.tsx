@@ -8,6 +8,7 @@ import type { ConsolePageId, StatusTone } from "../features/console/consoleTypes
 import { AnnotationPage } from "../features/console/pages/AnnotationPage";
 import { DataManagementPage } from "../features/console/pages/DataManagementPage";
 import { DashboardPage } from "../features/console/pages/DashboardPage";
+import { ModelIterationPage } from "../features/console/pages/ModelIterationPage";
 import { BackgroundParticles } from "../features/console/visuals/BackgroundParticles";
 
 type AppShellProps = {
@@ -108,6 +109,8 @@ export function AppShell({ children }: AppShellProps) {
         return <DataManagementPage onPlaceholderAction={showPlaceholderToast} />;
       case "annotate":
         return <AnnotationPage onPlaceholderAction={showPlaceholderToast} />;
+      case "model":
+        return <ModelIterationPage onPlaceholderAction={showPlaceholderToast} />;
       default:
         return <PagePlaceholder pageId={activePage} onRequestToast={() => showPlaceholderToast()} />;
     }

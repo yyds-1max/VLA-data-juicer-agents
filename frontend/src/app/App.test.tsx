@@ -154,6 +154,21 @@ test("annotation page switches pipeline results and review views", () => {
   expect(screen.getByText("待复核样本")).toBeVisible();
 });
 
+test("model iteration page renders versions training and compare tabs", () => {
+  render(<App />);
+
+  fireEvent.click(screen.getByRole("button", { name: "模型迭代" }));
+  expect(screen.getByText("v47")).toBeVisible();
+  expect(screen.getByText("当前部署")).toBeVisible();
+
+  fireEvent.click(screen.getByRole("tab", { name: "训练监控" }));
+  expect(screen.getByText("训练损失曲线")).toBeVisible();
+  expect(screen.getByText("GPU 监控 (实时)")).toBeVisible();
+
+  fireEvent.click(screen.getByRole("tab", { name: "版本对比" }));
+  expect(screen.getByText("版本性能对比")).toBeVisible();
+});
+
 test("opens DataPilot draft window from the floating button", () => {
   render(<App />);
 

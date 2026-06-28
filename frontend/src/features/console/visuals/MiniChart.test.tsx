@@ -49,3 +49,27 @@ test("donut chart renders a full slice as a visible circle instead of a coincide
   expect(svg.innerHTML).not.toContain("NaN");
   expect(svg.innerHTML).not.toContain("Infinity");
 });
+
+test("radar chart renders rings axes labels and value polygon", () => {
+  render(
+    <MiniChart
+      type="radar"
+      title="版本性能对比"
+      data={{
+        labels: ["成功率", "稳定性", "泛化", "延迟"],
+        data: [94, 89, 86, 78],
+        label: "v47 候选",
+        color: "#15d1d8",
+      }}
+    />,
+  );
+
+  const svg = screen.getByRole("img", { name: "版本性能对比" });
+
+  expect(svg).toBeVisible();
+  expect(within(svg).getByText("成功率")).toBeVisible();
+  expect(within(svg).getByText("稳定性")).toBeVisible();
+  expect(within(svg).getByTestId("radar-polygon")).toHaveAttribute("fill", "#15d1d8");
+  expect(svg.innerHTML).not.toContain("NaN");
+  expect(svg.innerHTML).not.toContain("Infinity");
+});
