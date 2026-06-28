@@ -1,215 +1,114 @@
 import type { ReactNode } from "react";
-import { Activity, Database, FlaskConical, Route, Settings } from "lucide-react";
+import { useCallback, useEffect, useRef, useState } from "react";
 
-import { cn } from "../lib/utils";
+import { ConsoleHeader } from "../components/console/ConsoleHeader";
+import { ConsoleSidebar } from "../components/console/ConsoleSidebar";
+import { ConsoleToast } from "../components/console/ConsoleToast";
+import type { ConsolePageId, StatusTone } from "../features/console/consoleTypes";
+import { BackgroundParticles } from "../features/console/visuals/BackgroundParticles";
 
 type AppShellProps = {
   children?: ReactNode;
 };
 
-const navItems = [
-  { label: "闭环仪表盘", icon: Activity, active: true },
-  { label: "数据管理", icon: Database },
-  { label: "实验验证", icon: FlaskConical },
-  { label: "工作流", icon: Route },
-  { label: "系统设置", icon: Settings },
-];
+type ToastState = { message: string; tone: StatusTone } | null;
 
-const metricCards = [
-  {
-    title: "数据接入",
-    value: "24.8K",
-    detail: "今日新增轨迹",
-    accent: "from-console-cyan/25 to-emerald-400/10",
-    meta: "12 路数据源在线",
+const pageCopy: Record<ConsolePageId, { title: string; text: string }> = {
+  dashboard: {
+    title: "闭环仪表盘",
+    text: "汇总数据闭环、Agent 协作、模型迭代与仿真验证的核心状态。完整仪表盘将在后续任务接入。",
   },
-  {
-    title: "处理任务",
-    value: "18",
-    detail: "队列运行中",
-    accent: "from-blue-400/25 to-console-cyan/10",
-    meta: "平均等待 03m 12s",
+  agent: {
+    title: "Agent 工作流",
+    text: "编排数据源、预处理、自动标注、质量检查、训练和评估节点。当前为迁移壳层占位。",
   },
-  {
-    title: "质量检查",
-    value: "97.4%",
-    detail: "有效样本率",
-    accent: "from-emerald-400/25 to-console-cyan/10",
-    meta: "3 项规则需复核",
+  data: {
+    title: "数据管理",
+    text: "管理多模态数据批次、质量门禁和解锁状态。完整数据页面将在后续任务替换。",
   },
-  {
-    title: "Agent 状态",
-    value: "6/7",
-    detail: "协作节点在线",
-    accent: "from-violet-400/25 to-console-cyan/10",
-    meta: "评估 Agent 待命",
+  annotate: {
+    title: "自动标注",
+    text: "承载自动标注任务、模型输出和人工复核入口。当前仅保留页面占位。",
   },
-];
+  model: {
+    title: "模型迭代",
+    text: "跟踪训练版本、部署状态和指标曲线。后续任务会接入真实模型迭代内容。",
+  },
+  simulation: {
+    title: "测试/仿真",
+    text: "展示测试用例、仿真报告和发布前验证结果。当前为最小可导航占位。",
+  },
+};
 
-const pipelineSteps = ["采集", "清洗", "标注", "评估", "发布"];
+function PagePlaceholder({ pageId, onRequestToast }: { pageId: ConsolePageId; onRequestToast: () => void }) {
+  const page = pageCopy[pageId];
 
-const runningSignals = [
-  { label: "采集延迟正常", status: "正常" },
-  { label: "清洗规则更新", status: "更新" },
-  { label: "质量阈值稳定", status: "稳定" },
-];
-
-export function AppShell({ children }: AppShellProps) {
   return (
-    <div className="min-h-screen bg-console-bg text-console-text">
-      <aside className="fixed inset-x-0 top-0 z-20 border-b border-console-line bg-console-panel/95 px-4 backdrop-blur md:inset-y-0 md:left-0 md:right-auto md:w-60 md:border-b-0 md:border-r md:px-0">
-        <div className="flex h-16 items-center justify-between md:h-auto md:flex-col md:items-stretch">
-          <div className="flex items-center gap-3 md:border-b md:border-console-line md:p-5">
-            <div className="flex h-9 w-9 shrink-0 items-center justify-center rounded bg-console-cyan text-console-bg">
-              <Route className="h-5 w-5" aria-hidden="true" />
-            </div>
-            <div className="min-w-0">
-              <div className="truncate text-sm font-semibold tracking-wide">DataLoop</div>
-              <div className="truncate text-[11px] uppercase tracking-[0.16em] text-console-muted">
-                Voyager Forge
-              </div>
-            </div>
-          </div>
-
-          <nav className="hidden flex-1 px-3 py-4 md:block" aria-label="DataLoop navigation">
-            <div className="mb-2 px-3 text-[10px] uppercase tracking-[0.24em] text-console-muted">
-              Console
-            </div>
-            <ul className="space-y-1">
-              {navItems.map((item) => (
-                <li key={item.label}>
-                  <div
-                    className={cn(
-                      "flex w-full items-center gap-3 rounded px-3 py-2.5 text-left text-sm text-console-muted",
-                      item.active &&
-                        "border border-console-cyan/35 bg-console-cyan/10 text-console-cyan shadow-[inset_3px_0_0_#15d1d8]",
-                    )}
-                    aria-current={item.active ? "page" : undefined}
-                  >
-                    <item.icon className="h-4 w-4 shrink-0" aria-hidden="true" />
-                    <span className="truncate">{item.label}</span>
-                  </div>
-                </li>
-              ))}
-            </ul>
-          </nav>
+    <section className="mx-auto max-w-7xl px-4 py-6 md:px-6">
+      <div className="grid min-h-[calc(100vh-13rem)] gap-4 lg:grid-cols-[1fr_20rem]">
+        <div className="rounded border border-console-line bg-console-panel/88 p-5 shadow-[0_18px_48px_rgba(0,0,0,0.2)]">
+          <div className="mb-4 h-1.5 w-28 rounded-full bg-console-cyan/70" />
+          <p className="text-xs uppercase tracking-[0.18em] text-console-muted">Console route</p>
+          <p className="mt-3 max-w-3xl text-sm leading-6 text-console-muted">{page.text}</p>
+          <button
+            type="button"
+            className="mt-5 rounded border border-console-line bg-console-panel2 px-3 py-2 text-sm text-console-text transition hover:border-console-cyan/45 hover:text-console-cyan focus:outline-none focus:ring-2 focus:ring-console-cyan"
+            onClick={onRequestToast}
+          >
+            查看接入状态
+          </button>
         </div>
 
-        <nav className="flex gap-2 overflow-x-auto border-t border-console-line py-2 md:hidden" aria-label="DataLoop mobile navigation">
-          <ul className="flex gap-2">
-            {navItems.map((item) => (
-              <li key={item.label}>
-                <div
-                  className={cn(
-                    "flex shrink-0 items-center gap-2 rounded border border-console-line px-3 py-2 text-xs text-console-muted",
-                    item.active && "border-console-cyan/50 bg-console-cyan/10 text-console-cyan",
-                  )}
-                  aria-current={item.active ? "page" : undefined}
-                >
-                  <item.icon className="h-4 w-4" aria-hidden="true" />
-                  {item.label}
-                </div>
-              </li>
-            ))}
-          </ul>
-        </nav>
-      </aside>
+        <aside className="rounded border border-console-line bg-console-panel/88 p-4">
+          <h2 className="text-sm font-semibold">迁移状态</h2>
+          <p className="mt-3 text-sm leading-6 text-console-muted">
+            壳层导航、顶部栏、背景视觉和浮层入口已在 React 中就位。页面主体保持轻量占位，等待后续任务迁入完整内容。
+          </p>
+        </aside>
+      </div>
+    </section>
+  );
+}
 
-      <main className="px-4 pb-8 pt-32 md:ml-60 md:px-6 md:pt-0">
-        <header className="hidden h-16 items-center justify-between border-b border-console-line md:flex">
-          <div>
-            <p className="text-xs uppercase tracking-[0.22em] text-console-muted">Operational Console</p>
-            <h1 className="mt-1 text-lg font-semibold">闭环仪表盘</h1>
-          </div>
-          <div className="flex items-center gap-2 rounded border border-console-line bg-console-panel px-3 py-2 text-xs text-console-muted">
-            <span className="h-2 w-2 rounded-full bg-console-cyan shadow-[0_0_12px_#15d1d8]" />
-            Cluster stable
-          </div>
-        </header>
+export function AppShell({ children }: AppShellProps) {
+  const [activePage, setActivePage] = useState<ConsolePageId>("dashboard");
+  const [toast, setToast] = useState<ToastState>(null);
+  const toastTimeoutRef = useRef<number | null>(null);
 
-        <section className="mx-auto max-w-7xl py-5">
-          <div className="mb-5 md:hidden">
-            <p className="text-xs uppercase tracking-[0.22em] text-console-muted">Operational Console</p>
-            <h1 className="mt-1 text-lg font-semibold">闭环仪表盘</h1>
-          </div>
+  const showPlaceholderToast = useCallback((message = "该功能暂未接入后端") => {
+    if (toastTimeoutRef.current !== null) {
+      window.clearTimeout(toastTimeoutRef.current);
+    }
 
-          <div className="grid gap-3 sm:grid-cols-2 xl:grid-cols-4">
-            {metricCards.map((card) => (
-              <article
-                key={card.title}
-                className="min-h-36 rounded border border-console-line bg-console-panel p-4 shadow-[0_16px_40px_rgba(0,0,0,0.22)]"
-              >
-                <div className={cn("mb-4 h-1.5 rounded-full bg-gradient-to-r", card.accent)} />
-                <div className="flex items-start justify-between gap-3">
-                  <div className="min-w-0">
-                    <h2 className="truncate text-sm font-medium text-console-muted">{card.title}</h2>
-                    <p className="mt-2 text-2xl font-semibold tracking-normal text-console-text">{card.value}</p>
-                  </div>
-                  <span className="rounded border border-console-cyan/30 bg-console-cyan/10 px-2 py-1 text-[11px] text-console-cyan">
-                    Live
-                  </span>
-                </div>
-                <p className="mt-2 text-sm text-console-text">{card.detail}</p>
-                <p className="mt-4 truncate text-xs text-console-muted">{card.meta}</p>
-              </article>
-            ))}
-          </div>
+    setToast({ message, tone: "neutral" });
+    toastTimeoutRef.current = window.setTimeout(() => {
+      setToast(null);
+      toastTimeoutRef.current = null;
+    }, 2400);
+  }, []);
 
-          <div className="mt-4 grid gap-4 lg:grid-cols-[1.35fr_0.65fr]">
-            <section className="rounded border border-console-line bg-console-panel p-4">
-              <div className="mb-4 flex flex-col gap-2 sm:flex-row sm:items-center sm:justify-between">
-                <div>
-                  <h2 className="text-sm font-semibold">数据闭环流水线</h2>
-                  <p className="mt-1 text-xs text-console-muted">最近 24 小时批处理吞吐与节点健康</p>
-                </div>
-                <span className="w-fit rounded border border-console-line bg-console-panel2 px-3 py-1 text-xs text-console-muted">
-                  Batch DL-0626
-                </span>
-              </div>
-              <div className="grid gap-3 md:grid-cols-5">
-                {pipelineSteps.map((step, index) => (
-                  <div key={step} className="rounded border border-console-line bg-console-panel2 p-3">
-                    <div className="mb-3 flex items-center justify-between gap-2">
-                      <span className="text-sm font-medium">{step}</span>
-                      <span className="text-xs text-console-cyan">0{index + 1}</span>
-                    </div>
-                    <div className="h-2 overflow-hidden rounded bg-console-bg">
-                      <div className="h-full rounded bg-console-cyan" style={{ width: `${92 - index * 7}%` }} />
-                    </div>
-                    <p className="mt-3 text-xs text-console-muted">{92 - index * 7}% ready</p>
-                  </div>
-                ))}
-              </div>
-            </section>
+  useEffect(() => {
+    return () => {
+      if (toastTimeoutRef.current !== null) {
+        window.clearTimeout(toastTimeoutRef.current);
+      }
+    };
+  }, []);
 
-            <section className="rounded border border-console-line bg-console-panel p-4">
-              <h2 className="text-sm font-semibold">运行信号</h2>
-              <div className="mt-4 space-y-3">
-                {runningSignals.map((item, index) => (
-                  <div
-                    key={item.label}
-                    className="flex items-center gap-3 rounded border border-console-line bg-console-panel2 px-3 py-2"
-                  >
-                    <span
-                      className={cn(
-                        "h-2.5 w-2.5 rounded-full",
-                        index === 1 ? "bg-amber-300" : "bg-console-cyan shadow-[0_0_10px_#15d1d8]",
-                      )}
-                      aria-hidden="true"
-                    />
-                    <span className="min-w-0 flex-1 truncate text-sm">{item.label}</span>
-                    <span className="shrink-0 rounded border border-console-line bg-console-bg px-2 py-0.5 text-[11px] text-console-muted">
-                      {item.status}
-                    </span>
-                  </div>
-                ))}
-              </div>
-            </section>
-          </div>
+  const activeTitle = pageCopy[activePage].title;
 
-          {children}
-        </section>
+  return (
+    <div className="min-h-screen bg-console-bg text-console-text">
+      <BackgroundParticles />
+      <ConsoleSidebar activePage={activePage} onChange={setActivePage} />
+
+      <main className="relative z-10 pt-28 md:ml-64 md:pt-0">
+        <ConsoleHeader title={activeTitle} />
+        <PagePlaceholder pageId={activePage} onRequestToast={() => showPlaceholderToast()} />
       </main>
+
+      {children}
+      <ConsoleToast toast={toast} />
     </div>
   );
 }
