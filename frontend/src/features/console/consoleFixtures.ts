@@ -1,3 +1,35 @@
+import type { StatusTone } from "./consoleTypes";
+
+export type ActivityItem = {
+  id: string;
+  text: string;
+  time: string;
+  tone: StatusTone;
+};
+
+export type BatchStatus = "unlocked" | "pending" | "rejected";
+
+export type BatchRow = {
+  id: string;
+  type: "多模态" | "图像" | "点云" | "文本";
+  count: number;
+  quality: number;
+  scene: string;
+  status: BatchStatus;
+};
+
+export type ModelVersionStatus = "training" | "deployed" | "archived" | "failed";
+
+export type ModelVersion = {
+  ver: string;
+  date: string;
+  status: ModelVersionStatus;
+  data: string;
+  epochs: string;
+  success: string;
+  note: string;
+};
+
 export const dashboardMetrics = [
   { id: "total-data", label: "总数据量", value: "248K", delta: "+12.4%", detail: "今日新增 12,847 条" },
   { id: "annotated-data", label: "已标注数据", value: "186K", delta: "75%", detail: "自动标注覆盖率 84%" },
@@ -26,7 +58,7 @@ export const modelCurveLoss = {
   color: "#ff4757",
 };
 
-export const activityFeed = [
+export const activityFeed: ActivityItem[] = [
   { id: "act-001", text: "自动标注流水线完成 2,840 条数据", time: "3 分钟前", tone: "info" },
   { id: "act-002", text: "批次 B-2026-004 已自动解锁", time: "15 分钟前", tone: "success" },
   { id: "act-003", text: "v47 训练进度 75% (Epoch 18/24)", time: "32 分钟前", tone: "purple" },
@@ -65,7 +97,7 @@ export const textInstructionData = [
   { id: "TXT-008", instruction: "打开抽屉取出螺丝刀，递给操作员", action_type: "handover", objects: ["抽屉", "螺丝刀"], status: "已标注", conf: "0.83" },
 ];
 
-export const batchData = [
+export const batchData: BatchRow[] = [
   { id: "B-2026-001", type: "多模态", count: 12400, quality: 0.94, scene: "室内导航", status: "unlocked" },
   { id: "B-2026-002", type: "图像", count: 8600, quality: 0.91, scene: "桌面操作", status: "unlocked" },
   { id: "B-2026-003", type: "点云", count: 3200, quality: 0.89, scene: "仓储物流", status: "unlocked" },
@@ -86,7 +118,7 @@ export const annotationResults = [
   { id: "ANN-82405", type: "动作分解", model: "ActBERT-v2", input: "TXT-002", output: "4 步动作序列", conf: 0.84, time: "420ms" },
 ];
 
-export const modelVersions = [
+export const modelVersions: ModelVersion[] = [
   { ver: "v47", date: "2026-01-18", status: "training", data: "192K", epochs: "24/24", success: "-", note: "加入 B-2026-001~004 解锁数据" },
   { ver: "v46", date: "2026-01-15", status: "deployed", data: "186K", epochs: "24/24", success: "94.2%", note: "当前生产版本，灰度发布后全量" },
   { ver: "v45", date: "2026-01-12", status: "archived", data: "178K", epochs: "20/24", success: "93.1%", note: "提前停止，过拟合趋势" },
