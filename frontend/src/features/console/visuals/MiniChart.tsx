@@ -57,6 +57,10 @@ function describeArc(cx: number, cy: number, radius: number, startAngle: number,
   return ["M", start.x, start.y, "A", radius, radius, 0, largeArcFlag, 0, end.x, end.y].join(" ");
 }
 
+function formatDonutTotal(total: number) {
+  return Number.isInteger(total) ? `${total}%` : `${total.toFixed(1)}%`;
+}
+
 function chartScale(values: Array<number | null>) {
   const validValues = values.filter((value): value is number => value !== null);
   const min = Math.min(...validValues);
@@ -86,32 +90,52 @@ function toLinePath(data: SeriesChart) {
 }
 
 function DonutChart({ title, data, className }: DonutChartProps) {
-  const total = data.reduce((sum, item) => sum + item.value, 0);
+  const visibleSegments = data.filter((item) => item.value > 0);
+  const total = visibleSegments.reduce((sum, item) => sum + item.value, 0);
   let cursor = 0;
 
   return (
     <div className={cn("grid gap-4 sm:grid-cols-[12rem_1fr] sm:items-center", className)}>
       <svg role="img" aria-label={title} viewBox="0 0 180 180" className="mx-auto h-44 w-44">
         <circle cx="90" cy="90" r="58" fill="none" stroke="rgba(148,163,184,0.16)" strokeWidth="24" />
-        {data.map((item) => {
-          const start = cursor;
-          const angle = (item.value / total) * 360;
-          const end = start + angle;
-          cursor = end;
+        {total > 0
+          ? visibleSegments.map((item) => {
+              const start = cursor;
+              const angle = (item.value / total) * 360;
+              const end = start + angle;
+              cursor = end;
 
-          return (
-            <path
-              key={item.label}
-              d={describeArc(90, 90, 58, start, end)}
-              fill="none"
-              stroke={item.color}
-              strokeLinecap="round"
-              strokeWidth="24"
-            />
-          );
-        })}
+              if (angle >= 360) {
+                return (
+                  <circle
+                    key={item.label}
+                    data-testid="donut-segment"
+                    cx="90"
+                    cy="90"
+                    r="58"
+                    fill="none"
+                    stroke={item.color}
+                    strokeLinecap="round"
+                    strokeWidth="24"
+                  />
+                );
+              }
+
+              return (
+                <path
+                  key={item.label}
+                  data-testid="donut-segment"
+                  d={describeArc(90, 90, 58, start, end)}
+                  fill="none"
+                  stroke={item.color}
+                  strokeLinecap="round"
+                  strokeWidth="24"
+                />
+              );
+            })
+          : null}
         <text x="90" y="84" textAnchor="middle" className="fill-console-text text-lg font-semibold">
-          {total}%
+          {formatDonutTotal(total)}
         </text>
         <text x="90" y="105" textAnchor="middle" className="fill-console-muted text-[10px]">
           distribution
