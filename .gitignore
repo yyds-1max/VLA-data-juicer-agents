@@ -62,6 +62,7 @@ tmp/
 runs/
 uv.lock
 .djx/
+frontend/.vite/
 
 # Codex
 .superpowers

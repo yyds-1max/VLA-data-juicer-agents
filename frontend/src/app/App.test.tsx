@@ -909,6 +909,52 @@ test("selecting a history session restores persisted messages and hides active c
   expect(screen.queryByText("继续任务")).not.toBeInTheDocument();
 });
 
+test("selecting an active session from history restores active controls and can submit another turn", async () => {
+  apiMocks.listSessions.mockResolvedValue([
+    {
+      id: "active-1",
+      title: "活跃任务",
+      created_at: "2026-06-25T01:00:00Z",
+      updated_at: "2026-06-25T02:00:00Z",
+      status: "active",
+    },
+  ]);
+  apiMocks.getSession.mockResolvedValue({
+    id: "active-1",
+    title: "活跃任务",
+    created_at: "2026-06-25T01:00:00Z",
+    updated_at: "2026-06-25T02:00:00Z",
+    status: "active",
+    messages: [
+      {
+        id: "active-message-1",
+        session_id: "active-1",
+        role: "user",
+        content: "上一轮用户消息",
+        created_at: "2026-06-25T01:01:00Z",
+      },
+    ],
+  });
+
+  render(<App />);
+
+  fireEvent.click(screen.getByRole("button", { name: "Open DataPilot" }));
+  fireEvent.click(screen.getByRole("button", { name: "History" }));
+  fireEvent.click(await screen.findByRole("button", { name: /活跃任务/ }));
+
+  await waitFor(() => expect(apiMocks.getSession).toHaveBeenCalledWith("active-1"));
+  expect(datapilotStore.getState().mode).toBe("active_session");
+  expect(screen.getByText("上一轮用户消息")).toBeVisible();
+
+  fireEvent.change(screen.getByPlaceholderText("继续描述任务…"), {
+    target: { value: "继续上一轮任务" },
+  });
+  fireEvent.click(screen.getByRole("button", { name: "Send message" }));
+
+  await waitFor(() => expect(apiMocks.submitTurn).toHaveBeenCalledWith("active-1", "继续上一轮任务"));
+  expect(screen.getByText("继续上一轮任务")).toBeVisible();
+});
+
 test("selecting a history session closes the active event stream before loading details", async () => {
   const close = vi.fn(() => calls.push("close"));
   const calls: string[] = [];

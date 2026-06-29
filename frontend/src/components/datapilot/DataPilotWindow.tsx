@@ -152,7 +152,11 @@ export function DataPilotWindow() {
   const handleSelectHistory = async (session: SessionRecord) => {
     closeSocket();
     const detail = await getSession(session.id);
-    datapilotStore.getState().restoreHistory(detail, detail.messages);
+    if (detail.status === "active") {
+      datapilotStore.getState().restoreActiveSession(detail, detail.messages);
+    } else {
+      datapilotStore.getState().restoreHistory(detail, detail.messages);
+    }
     setHistoryOpen(false);
   };
 
