@@ -19,7 +19,9 @@ export interface DataPilotStoreState {
   sessions: SessionRecord[];
   messages: ChatMessageRecord[];
   run: RunState;
+  floatingOffset: { x: number; y: number };
   setOpen: (open: boolean) => void;
+  setFloatingOffset: (offset: { x: number; y: number }) => void;
   enterDraft: () => void;
   setSessions: (sessions: SessionRecord[]) => void;
   setActiveSession: (session: SessionRecord) => void;
@@ -40,8 +42,11 @@ export function createDataPilotStore() {
     sessions: [],
     messages: [],
     run: createEmptyRunState(),
+    floatingOffset: { x: 0, y: 0 },
 
     setOpen: (open) => set({ open }),
+
+    setFloatingOffset: (floatingOffset) => set({ floatingOffset }),
 
     setSessions: (sessions) => set({ sessions: [...sessions] }),
 

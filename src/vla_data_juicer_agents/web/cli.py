@@ -21,6 +21,11 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         help="Optional model id exposed to the web app through VLA_DATA_AGENT_WEB_MODEL.",
     )
+    parser.add_argument(
+        "--frontend-dist",
+        default=None,
+        help="Optional built frontend dist directory served by the web app.",
+    )
     parser.add_argument("--reload", action="store_true", help="Enable uvicorn auto-reload.")
     return parser
 
@@ -35,6 +40,10 @@ def main(argv: list[str] | None = None) -> int:
         os.environ.pop("VLA_DATA_AGENT_WEB_MODEL", None)
     else:
         os.environ["VLA_DATA_AGENT_WEB_MODEL"] = args.model
+    if args.frontend_dist is None:
+        os.environ.pop("VLA_DATA_AGENT_WEB_FRONTEND_DIST", None)
+    else:
+        os.environ["VLA_DATA_AGENT_WEB_FRONTEND_DIST"] = args.frontend_dist
     uvicorn.run(
         "vla_data_juicer_agents.web.app:create_app",
         factory=True,

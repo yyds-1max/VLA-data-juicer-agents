@@ -44,6 +44,8 @@ function activeSocket(close: () => void = vi.fn()): WebSocket {
 
 beforeEach(() => {
   vi.clearAllMocks();
+  Object.defineProperty(window, "innerWidth", { configurable: true, writable: true, value: 1280 });
+  Object.defineProperty(window, "innerHeight", { configurable: true, writable: true, value: 900 });
   apiMocks.createSession.mockResolvedValue({
     id: "session-created",
     title: "Clean VLA data",
@@ -72,6 +74,7 @@ beforeEach(() => {
     sessions: [],
     messages: [],
     run: createEmptyRunState(),
+    floatingOffset: { x: 0, y: 0 },
   });
 });
 
@@ -80,6 +83,9 @@ test("renders the full DataLoop console shell by default", () => {
 
   expect(screen.getByText("智瀚星途 DataLoop")).toBeVisible();
   expect(screen.getByText("Voyager Forge")).toBeVisible();
+  expect(screen.getByText("智瀚星途数据处理系统")).toBeVisible();
+  expect(screen.queryByText("Mock workspace")).not.toBeInTheDocument();
+  expect(screen.queryByText("frontend only")).not.toBeInTheDocument();
   expect(screen.getByRole("heading", { name: "闭环仪表盘" })).toBeVisible();
   expect(screen.getByPlaceholderText("搜索数据、模型、任务...")).toBeVisible();
   expect(screen.getByRole("button", { name: "Open DataPilot" })).toBeVisible();
@@ -225,6 +231,153 @@ test("DataPilot window remains above the console content", () => {
   expect(dialog.className).toContain("z-[80]");
 });
 
+test("DataPilot window can be dragged from its title bar", () => {
+  render(<App />);
+
+  fireEvent.click(screen.getByRole("button", { name: "Open DataPilot" }));
+
+  const dialog = screen.getByRole("dialog", { name: "DataPilot" });
+  const handle = screen.getByLabelText("Drag DataPilot window");
+
+  fireEvent.pointerDown(handle, { pointerId: 1, clientX: 900, clientY: 620 });
+  fireEvent.pointerMove(window, { pointerId: 1, clientX: 760, clientY: 500 });
+  fireEvent.pointerUp(window, { pointerId: 1, clientX: 760, clientY: 500 });
+
+  expect(dialog).toHaveStyle({ left: "auto" });
+  expect(dialog.style.transform).toContain("translate3d(-140px, -120px, 0)");
+});
+
+test("DataPilot floating button can be dragged without opening the window", () => {
+  render(<App />);
+
+  const button = screen.getByRole("button", { name: "Open DataPilot" });
+
+  fireEvent.pointerDown(button, { pointerId: 1, clientX: 1180, clientY: 760 });
+  fireEvent.pointerMove(window, { pointerId: 1, clientX: 1060, clientY: 680 });
+  fireEvent.pointerUp(window, { pointerId: 1, clientX: 1060, clientY: 680 });
+  fireEvent.click(button);
+
+  expect(button.style.transform).toContain("translate3d(-120px, -80px, 0)");
+  expect(button.className).not.toContain("transform]");
+  expect(screen.queryByRole("dialog", { name: "DataPilot" })).not.toBeInTheDocument();
+});
+
+test("DataPilot floating button stays inside the viewport while dragged", () => {
+  render(<App />);
+
+  const button = screen.getByRole("button", { name: "Open DataPilot" });
+
+  fireEvent.pointerDown(button, { pointerId: 1, clientX: 1180, clientY: 760 });
+  fireEvent.pointerMove(window, { pointerId: 1, clientX: 1480, clientY: 1160 });
+  fireEvent.pointerUp(window, { pointerId: 1, clientX: 1480, clientY: 1160 });
+
+  expect(button.style.transform).toContain("translate3d(4px, 4px, 0)");
+});
+
+test("DataPilot window opens and closes at the dragged floating button position", () => {
+  render(<App />);
+
+  const button = screen.getByRole("button", { name: "Open DataPilot" });
+  fireEvent.pointerDown(button, { pointerId: 1, clientX: 1180, clientY: 760 });
+  fireEvent.pointerMove(window, { pointerId: 1, clientX: 1060, clientY: 680 });
+  fireEvent.pointerUp(window, { pointerId: 1, clientX: 1060, clientY: 680 });
+  fireEvent.click(button);
+  fireEvent.click(button);
+
+  const dialog = screen.getByRole("dialog", { name: "DataPilot" });
+  expect(dialog.style.transform).toContain("translate3d(-120px, -80px, 0)");
+  expect(dialog.style.getPropertyValue("--datapilot-x")).toBe("-120px");
+  expect(dialog.style.getPropertyValue("--datapilot-y")).toBe("-80px");
+
+  fireEvent.click(screen.getByRole("button", { name: "Close DataPilot" }));
+
+  const reopenedButton = screen.getByRole("button", { name: "Open DataPilot" });
+  expect(reopenedButton.style.transform).toContain("translate3d(-120px, -80px, 0)");
+});
+
+test("DataPilot window keeps itself inside the viewport when opened from a high floating button", () => {
+  Object.defineProperty(window, "innerWidth", { configurable: true, writable: true, value: 1280 });
+  Object.defineProperty(window, "innerHeight", { configurable: true, writable: true, value: 720 });
+  render(<App />);
+
+  const button = screen.getByRole("button", { name: "Open DataPilot" });
+  fireEvent.pointerDown(button, { pointerId: 1, clientX: 1180, clientY: 760 });
+  fireEvent.pointerMove(window, { pointerId: 1, clientX: 1060, clientY: 240 });
+  fireEvent.pointerUp(window, { pointerId: 1, clientX: 1060, clientY: 240 });
+  fireEvent.click(button);
+  fireEvent.click(button);
+
+  const dialog = screen.getByRole("dialog", { name: "DataPilot" });
+  expect(button.style.transform).toContain("translate3d(-120px, -520px, 0)");
+  expect(dialog.style.transform).toContain("translate3d(-120px, -4px, 0)");
+  expect(dialog.style.getPropertyValue("--datapilot-anchor-x")).toBe("-120px");
+  expect(dialog.style.getPropertyValue("--datapilot-anchor-y")).toBe("-520px");
+});
+
+test("DataPilot header icon buttons do not start window dragging", async () => {
+  render(<App />);
+
+  fireEvent.click(screen.getByRole("button", { name: "Open DataPilot" }));
+
+  const dialog = screen.getByRole("dialog", { name: "DataPilot" });
+  const historyButton = screen.getByRole("button", { name: "History" });
+  const historyIcon = historyButton.querySelector("svg");
+  expect(historyIcon).not.toBeNull();
+
+  fireEvent.pointerDown(historyIcon as SVGSVGElement, { pointerId: 1, clientX: 1460, clientY: 80 });
+  fireEvent.pointerMove(window, { pointerId: 1, clientX: 1360, clientY: 140 });
+  fireEvent.pointerUp(window, { pointerId: 1, clientX: 1360, clientY: 140 });
+  fireEvent.click(historyButton);
+
+  expect(dialog.style.transform).toContain("translate3d(0px, 0px, 0)");
+  expect(await screen.findByText("历史会话")).toBeVisible();
+});
+
+test("DataPilot window keeps wheel scrolling inside the dialog", () => {
+  datapilotStore.setState({
+    open: true,
+    mode: "active_session",
+    currentSessionId: "session-1",
+    previousActiveSessionId: null,
+    sessions: [
+      {
+        id: "session-1",
+        title: "Existing session",
+        created_at: "2026-06-26T00:00:00Z",
+        updated_at: "2026-06-26T00:00:00Z",
+        status: "active",
+      },
+    ],
+    messages: Array.from({ length: 12 }, (_, index) => ({
+      id: `message-${index}`,
+      session_id: "session-1",
+      role: index % 2 === 0 ? ("user" as const) : ("assistant" as const),
+      content: `消息 ${index}`,
+      created_at: `2026-06-26T00:${String(index).padStart(2, "0")}:00Z`,
+    })),
+  });
+  render(<App />);
+
+  const dialog = screen.getByRole("dialog", { name: "DataPilot" });
+  const header = screen.getByLabelText("Drag DataPilot window");
+  const scrollArea = dialog.querySelector<HTMLElement>("[data-datapilot-scroll-area='true']");
+  expect(scrollArea).not.toBeNull();
+  Object.defineProperty(scrollArea, "scrollHeight", { configurable: true, value: 1200 });
+  Object.defineProperty(scrollArea, "clientHeight", { configurable: true, value: 300 });
+  const preventDefault = vi.spyOn(Event.prototype, "preventDefault");
+
+  fireEvent.wheel(header, { deltaY: 120 });
+  expect(preventDefault).toHaveBeenCalled();
+  expect(scrollArea?.scrollTop).toBe(120);
+
+  preventDefault.mockClear();
+  scrollArea!.scrollTop = 900;
+  fireEvent.wheel(scrollArea!, { deltaY: 80 });
+  expect(preventDefault).toHaveBeenCalled();
+  expect(scrollArea?.scrollTop).toBe(900);
+  preventDefault.mockRestore();
+});
+
 test("opens DataPilot draft window from the floating button", () => {
   render(<App />);
 
@@ -234,8 +387,10 @@ test("opens DataPilot draft window from the floating button", () => {
   expect(screen.queryByRole("button", { name: "Open DataPilot" })).not.toBeInTheDocument();
   expect(screen.getByRole("dialog", { name: "DataPilot" })).toBeVisible();
   expect(screen.getByText("开始一个任务")).toBeVisible();
-  expect(screen.getByText("描述你的 VLA 数据处理目标，DataPilot 会接入主智能体执行。")).toBeVisible();
+  expect(screen.getByText("描述你的目标，DataPilot会帮你完成。")).toBeVisible();
   expect(screen.getByPlaceholderText("我们要做什么？")).toBeVisible();
+  expect(screen.queryByText("新任务草稿")).not.toBeInTheDocument();
+  expect(screen.queryByText("ready")).not.toBeInTheDocument();
   expect(screen.queryByText("继续任务")).not.toBeInTheDocument();
   expect(screen.queryByText(/示例|标签|Example/i)).not.toBeInTheDocument();
   expect(screen.queryByText("VLA 主智能体")).not.toBeInTheDocument();
@@ -298,14 +453,14 @@ test("History button lists sessions in a lightweight panel", async () => {
   expect(screen.queryByText(/last message|summary|继续任务|pending/i)).not.toBeInTheDocument();
 });
 
-test("close hides the window and restores the floating button", () => {
+test("close hides the window and restores the floating button", async () => {
   render(<App />);
 
   fireEvent.click(screen.getByRole("button", { name: "Open DataPilot" }));
   fireEvent.click(screen.getByRole("button", { name: "Close DataPilot" }));
 
-  expect(screen.queryByRole("dialog", { name: "DataPilot" })).not.toBeInTheDocument();
   expect(screen.getByRole("button", { name: "Open DataPilot" })).toBeVisible();
+  await waitFor(() => expect(screen.queryByRole("dialog", { name: "DataPilot" })).not.toBeInTheDocument());
 });
 
 test("closing the DataPilot window closes the active event stream", async () => {
@@ -1065,8 +1220,8 @@ test("child run tool details expose success and failure status dot tones", () =>
 
   fireEvent.click(screen.getByRole("button", { name: /完成了 2 个工具/ }));
 
-  expect(container.querySelector('[data-status="success"]')).toHaveClass("text-emerald-300");
-  expect(container.querySelector('[data-status="failure"]')).toHaveClass("text-rose-300");
+  expect(container.querySelector('[data-status="success"]')).toHaveClass("text-emerald-600");
+  expect(container.querySelector('[data-status="failure"]')).toHaveClass("text-rose-600");
   expect(screen.getByText("failed validate_navigation_dataset_tool 0.1s")).toBeVisible();
 });
 

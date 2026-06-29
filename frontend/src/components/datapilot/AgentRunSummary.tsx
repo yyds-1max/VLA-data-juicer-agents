@@ -81,9 +81,9 @@ function StatusDot({ tone }: { tone: StatusTone }) {
       data-status={tone}
       className={cn(
         "shrink-0 text-xs leading-none",
-        tone === "success" && "text-emerald-300",
-        tone === "failure" && "text-rose-300",
-        tone === "interrupted" && "text-amber-300",
+        tone === "success" && "text-emerald-600",
+        tone === "failure" && "text-rose-600",
+        tone === "interrupted" && "text-amber-600",
         tone === "pending" && "text-console-muted",
       )}
     >

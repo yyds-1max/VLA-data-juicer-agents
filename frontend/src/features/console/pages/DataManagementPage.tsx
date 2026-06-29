@@ -36,10 +36,10 @@ function dataPanelId(tab: DataTab) {
 }
 
 const imageGradients = [
-  "from-cyan-300/45 via-slate-700/45 to-emerald-300/20",
-  "from-violet-300/35 via-slate-700/50 to-cyan-300/25",
-  "from-amber-300/35 via-slate-700/55 to-emerald-300/25",
-  "from-sky-300/35 via-slate-700/45 to-rose-300/20",
+  "from-blue-50 via-slate-100 to-emerald-50",
+  "from-violet-50 via-slate-100 to-blue-50",
+  "from-amber-50 via-slate-100 to-emerald-50",
+  "from-sky-50 via-slate-100 to-rose-50",
 ];
 
 function toneForStatus(status: string): StatusTone {
@@ -63,11 +63,11 @@ function ImageDataPanel() {
     <div className="grid gap-4 md:grid-cols-2 xl:grid-cols-3">
       {imageData.map((item, index) => (
         <ConsoleCard key={item.id} className="space-y-3">
-          <div className={`relative h-36 overflow-hidden rounded border border-console-line bg-gradient-to-br ${imageGradients[index % imageGradients.length]}`}>
-            <div className="absolute inset-4 rounded border border-white/10 bg-console-bg/20" />
-            <div className="absolute left-5 top-5 h-10 w-16 rounded bg-console-cyan/25 shadow-[0_0_24px_rgba(21,209,216,0.22)]" />
-            <div className="absolute bottom-5 right-5 h-12 w-12 rounded-full bg-amber-300/35" />
-            <div className="absolute bottom-6 left-6 h-1 w-24 rounded-full bg-white/35" />
+          <div className={`relative h-36 overflow-hidden rounded-lg border border-console-line bg-gradient-to-br ${imageGradients[index % imageGradients.length]}`}>
+            <div className="absolute inset-4 rounded-lg border border-white/70 bg-white/35" />
+            <div className="absolute left-5 top-5 h-10 w-16 rounded-lg border border-blue-100 bg-blue-100/80" />
+            <div className="absolute bottom-5 right-5 h-12 w-12 rounded-full border border-amber-100 bg-amber-100/80" />
+            <div className="absolute bottom-6 left-6 h-1 w-24 rounded-full bg-slate-300/70" />
           </div>
           <div className="flex items-start justify-between gap-3">
             <div>
@@ -146,15 +146,15 @@ function UnlockPanel({ onPlaceholderAction }: DataManagementPageProps) {
           <div className="space-y-5">
             <label className="block space-y-2">
               <span className="text-sm text-console-muted">质量阈值 0.85</span>
-              <input className="w-full accent-cyan-300" type="range" min="0" max="100" value="85" readOnly aria-label="质量阈值" />
+              <input className="w-full accent-console-cyan" type="range" min="0" max="100" value="85" readOnly aria-label="质量阈值" />
             </label>
             <label className="block space-y-2">
               <span className="text-sm text-console-muted">自动标注置信度 0.80</span>
-              <input className="w-full accent-emerald-300" type="range" min="0" max="100" value="80" readOnly aria-label="自动标注置信度" />
+              <input className="w-full accent-emerald-600" type="range" min="0" max="100" value="80" readOnly aria-label="自动标注置信度" />
             </label>
             <label className="block space-y-2">
               <span className="text-sm text-console-muted">复核抽检比例 12%</span>
-              <input className="w-full accent-amber-300" type="range" min="0" max="100" value="12" readOnly aria-label="复核抽检比例" />
+              <input className="w-full accent-amber-500" type="range" min="0" max="100" value="12" readOnly aria-label="复核抽检比例" />
             </label>
             <ConsoleButton variant="primary" onClick={() => onPlaceholderAction?.("解锁规则尚未接入后端")}>
               保存规则
@@ -242,21 +242,21 @@ export function DataManagementPage({ onPlaceholderAction }: DataManagementPagePr
           </div>
         </ConsoleCard>
         <ConsoleCard className="flex items-center gap-3">
-          <Cloud aria-hidden="true" className="h-5 w-5 text-emerald-300" />
+          <Cloud aria-hidden="true" className="h-5 w-5 text-emerald-700" />
           <div>
             <p className="text-xs text-console-muted">点云批次</p>
             <p className="text-lg font-semibold">{pointCloudData.length.toLocaleString()}</p>
           </div>
         </ConsoleCard>
         <ConsoleCard className="flex items-center gap-3">
-          <FileText aria-hidden="true" className="h-5 w-5 text-amber-300" />
+          <FileText aria-hidden="true" className="h-5 w-5 text-amber-700" />
           <div>
             <p className="text-xs text-console-muted">文本指令</p>
             <p className="text-lg font-semibold">{textInstructionData.length.toLocaleString()}</p>
           </div>
         </ConsoleCard>
         <ConsoleCard className="flex items-center gap-3">
-          <LockKeyhole aria-hidden="true" className="h-5 w-5 text-violet-300" />
+          <LockKeyhole aria-hidden="true" className="h-5 w-5 text-violet-700" />
           <div>
             <p className="text-xs text-console-muted">待解锁批次</p>
             <p className="text-lg font-semibold">{batchData.filter((item) => item.status === "pending").length}</p>

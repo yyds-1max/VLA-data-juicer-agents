@@ -47,7 +47,10 @@ export function MessageList({ messages, run }: MessageListProps) {
   const activeText = formatActiveText(run.activeText, run.activeStartedAt, now);
 
   return (
-    <div className="flex min-h-0 flex-1 flex-col gap-3 overflow-y-auto px-4 py-4 sm:px-5">
+    <div
+      data-datapilot-scroll-area="true"
+      className="flex min-h-0 flex-1 flex-col gap-3 overflow-y-auto overscroll-contain bg-console-panel2/45 px-4 py-4 sm:px-5"
+    >
       {hasContent ? (
         <>
           {entries.map((entry) =>
@@ -60,13 +63,13 @@ export function MessageList({ messages, run }: MessageListProps) {
             ),
           )}
           {activeText ? (
-            <div className="rounded border border-console-cyan/30 bg-console-cyan/10 px-3 py-2 text-xs text-console-cyan">
+            <div className="rounded-lg border border-console-cyan/20 bg-blue-50 px-3 py-2 text-xs text-console-cyan">
               {activeText}
             </div>
           ) : null}
         </>
       ) : (
-        <div className="mt-auto rounded border border-console-line bg-console-bg px-3 py-3 text-sm text-console-muted">
+        <div className="mt-auto rounded-lg border border-console-line bg-console-panel px-3 py-3 text-sm text-console-muted shadow-sm">
           这个会话还没有消息。
         </div>
       )}
@@ -208,13 +211,13 @@ function MessageBubble({ message }: { message: ChatMessageRecord }) {
   return (
     <article
       className={cn(
-        "max-w-[88%] rounded border px-3 py-2 text-sm leading-6",
+        "max-w-[88%] rounded-lg border px-3 py-2 text-sm leading-6 shadow-sm",
         isUser
-          ? "ml-auto border-console-cyan/40 bg-console-cyan/10 text-console-text"
-          : "mr-auto border-console-line bg-console-bg text-console-text",
+          ? "ml-auto border-console-cyan/25 bg-blue-50 text-console-text"
+          : "mr-auto border-console-line bg-console-panel text-console-text",
       )}
     >
-      <div className="mb-1 text-[11px] uppercase tracking-[0.16em] text-console-muted">
+      <div className="mb-1 text-[11px] font-medium text-console-muted">
         {isUser ? "You" : message.role === "assistant" ? "DataPilot" : "System"}
       </div>
       <p className="whitespace-pre-wrap break-words">{message.content}</p>
@@ -224,10 +227,10 @@ function MessageBubble({ message }: { message: ChatMessageRecord }) {
 
 function TimelineBubble({ item }: { item: TimelineItem }) {
   return (
-    <article className="mr-auto max-w-[92%] rounded border border-console-line bg-console-bg px-3 py-2 text-sm leading-6 text-console-text">
-      <div className="mb-1 flex items-center gap-2 text-[11px] uppercase tracking-[0.16em] text-console-muted">
+    <article className="mr-auto max-w-[92%] rounded-lg border border-console-line bg-console-panel px-3 py-2 text-sm leading-6 text-console-text shadow-sm">
+      <div className="mb-1 flex items-center gap-2 text-[11px] font-medium text-console-muted">
         <span>{item.kind === "assistant" ? "DataPilot" : item.kind}</span>
-        <span className="truncate normal-case tracking-normal">{item.source}</span>
+        <span className="truncate font-normal">{item.source}</span>
       </div>
       {item.kind === "tool" ? (
         <div className="flex min-w-0 items-center gap-2 whitespace-pre-wrap break-words">

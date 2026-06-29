@@ -38,24 +38,24 @@ export const dashboardMetrics = [
 ];
 
 export const dataDistribution = [
-  { label: "图像数据", value: 42, color: "#15d1d8" },
-  { label: "点云数据", value: 28, color: "#34d399" },
-  { label: "文本指令", value: 18, color: "#fbbf24" },
-  { label: "多模态数据", value: 12, color: "#a78bfa" },
+  { label: "图像数据", value: 42, color: "#2d6cdf" },
+  { label: "点云数据", value: 28, color: "#16845b" },
+  { label: "文本指令", value: 18, color: "#b7791f" },
+  { label: "多模态数据", value: 12, color: "#6d5bd0" },
 ];
 
 export const modelCurveSuccess = {
   labels: ["v40", "v41", "v42", "v43", "v44", "v45", "v46", "v47*"],
   data: [87.2, 89.1, 91.5, null, 92.8, 93.1, 94.2, 94.8],
   label: "Success Rate (%)",
-  color: "#00e59b",
+  color: "#16845b",
 };
 
 export const modelCurveLoss = {
   labels: ["v40", "v41", "v42", "v43", "v44", "v45", "v46", "v47*"],
   data: [0.42, 0.35, 0.28, null, 0.24, 0.22, 0.19, 0.16],
   label: "Training Loss",
-  color: "#ff4757",
+  color: "#c2410c",
 };
 
 export const activityFeed: ActivityItem[] = [

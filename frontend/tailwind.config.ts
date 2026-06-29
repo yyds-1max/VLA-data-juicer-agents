@@ -7,13 +7,13 @@ export default {
     extend: {
       colors: {
         console: {
-          bg: "#08111f",
-          panel: "#0d1829",
-          panel2: "#101f35",
-          line: "#1e3a5f",
-          text: "#eaf2ff",
-          muted: "#8ca2c4",
-          cyan: "#15d1d8",
+          bg: "#f5f7fb",
+          panel: "#ffffff",
+          panel2: "#f8fafc",
+          line: "#d9e1eb",
+          text: "#17202e",
+          muted: "#637083",
+          cyan: "#2d6cdf",
         },
       },
     },

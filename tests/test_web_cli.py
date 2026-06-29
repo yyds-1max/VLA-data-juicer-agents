@@ -13,6 +13,7 @@ def test_main_sets_env_and_delegates_to_uvicorn(monkeypatch):
     monkeypatch.setitem(sys.modules, "uvicorn", fake_uvicorn)
     monkeypatch.delenv("VLA_DATA_AGENT_WEB_WORKING_DIR", raising=False)
     monkeypatch.delenv("VLA_DATA_AGENT_WEB_MODEL", raising=False)
+    monkeypatch.delenv("VLA_DATA_AGENT_WEB_FRONTEND_DIST", raising=False)
 
     result = main(
         [
@@ -24,6 +25,8 @@ def test_main_sets_env_and_delegates_to_uvicorn(monkeypatch):
             "/tmp/djx",
             "--model",
             "qwen-test",
+            "--frontend-dist",
+            "frontend/dist",
             "--reload",
         ]
     )
@@ -44,6 +47,7 @@ def test_main_sets_env_and_delegates_to_uvicorn(monkeypatch):
     ]
     assert os.environ["VLA_DATA_AGENT_WEB_WORKING_DIR"] == "/tmp/djx"
     assert os.environ["VLA_DATA_AGENT_WEB_MODEL"] == "qwen-test"
+    assert os.environ["VLA_DATA_AGENT_WEB_FRONTEND_DIST"] == "frontend/dist"
 
 
 def test_main_clears_stale_model_env_when_model_not_passed(monkeypatch):
@@ -52,6 +56,7 @@ def test_main_clears_stale_model_env_when_model_not_passed(monkeypatch):
     monkeypatch.setitem(sys.modules, "uvicorn", fake_uvicorn)
     monkeypatch.delenv("VLA_DATA_AGENT_WEB_WORKING_DIR", raising=False)
     monkeypatch.setenv("VLA_DATA_AGENT_WEB_MODEL", "stale-model")
+    monkeypatch.setenv("VLA_DATA_AGENT_WEB_FRONTEND_DIST", "stale-dist")
 
     result = main([])
 
@@ -59,3 +64,4 @@ def test_main_clears_stale_model_env_when_model_not_passed(monkeypatch):
     assert calls
     assert os.environ["VLA_DATA_AGENT_WEB_WORKING_DIR"] == "./.djx"
     assert "VLA_DATA_AGENT_WEB_MODEL" not in os.environ
+    assert "VLA_DATA_AGENT_WEB_FRONTEND_DIST" not in os.environ

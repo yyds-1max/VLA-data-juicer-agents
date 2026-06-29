@@ -29,21 +29,21 @@ const learningRateChart = {
   labels: ["E01", "E04", "E08", "E12", "E16", "E20", "E24"],
   data: [0.0012, 0.001, 0.00082, 0.00054, 0.00031, 0.00018, 0.00008],
   label: "Cosine decay",
-  color: "#fbbf24",
+  color: "#b7791f",
 };
 
 const gpuChart = {
   labels: ["00", "05", "10", "15", "20", "25"],
   data: [72, 78, 83, 86, 81, 88],
   label: "GPU Utilization (%)",
-  color: "#a78bfa",
+  color: "#6d5bd0",
 };
 
 const radarChart = {
   labels: ["成功率", "稳定性", "泛化", "延迟", "数据效率", "部署风险"],
   data: [94, 90, 87, 82, 88, 76],
   label: "v47 候选 / v46 基线",
-  color: "#15d1d8",
+  color: "#2d6cdf",
 };
 
 const statusMeta: Record<ModelVersionStatus, { label: string; tone: StatusTone }> = {
@@ -160,7 +160,7 @@ function TrainingPanel() {
       <ConsoleCard>
         <div className="mb-3 flex items-center justify-between gap-3">
           <h2 className="text-base font-semibold text-console-text">GPU 监控 (实时)</h2>
-          <Cpu aria-hidden="true" className="h-5 w-5 text-violet-300" />
+          <Cpu aria-hidden="true" className="h-5 w-5 text-violet-700" />
         </div>
         <MiniChart type="bar" title="GPU 监控 (实时)" data={gpuChart} />
         <div className="mt-3 space-y-2">

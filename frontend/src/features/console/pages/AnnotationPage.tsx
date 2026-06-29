@@ -45,14 +45,14 @@ const throughputChart = {
   labels: ["08:00", "10:00", "12:00", "14:00", "16:00", "18:00"],
   data: [420, 510, 680, 620, 750, 810],
   label: "自动标注吞吐",
-  color: "#15d1d8",
+  color: "#2d6cdf",
 };
 
 const confidenceChart = {
   labels: ["检测", "分割", "生成", "对齐", "质检"],
   data: [92, 87, 79, 91, 84],
   label: "模块置信度",
-  color: "#34d399",
+  color: "#16845b",
 };
 
 function PipelinePanel({ onPlaceholderAction }: AnnotationPageProps) {
@@ -174,7 +174,7 @@ function ReviewPanel({ onPlaceholderAction }: AnnotationPageProps) {
             </div>
             <div className="rounded border border-console-line bg-console-bg/55 p-3">
               <p className="text-xs text-console-muted">风险</p>
-              <p className="mt-2 text-sm font-medium text-amber-300">需核对终点</p>
+              <p className="mt-2 text-sm font-medium text-amber-700">需核对终点</p>
             </div>
           </div>
         </div>

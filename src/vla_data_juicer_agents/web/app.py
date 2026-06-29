@@ -32,6 +32,8 @@ def create_app(
         working_dir = os.environ.get("VLA_DATA_AGENT_WEB_WORKING_DIR", "./.djx")
     if model is None:
         model = os.environ.get("VLA_DATA_AGENT_WEB_MODEL") or None
+    if frontend_dist is None:
+        frontend_dist = os.environ.get("VLA_DATA_AGENT_WEB_FRONTEND_DIST") or None
 
     database_path = Path(db_path) if db_path is not None else Path(working_dir) / "sessions.sqlite"
     store = WebSessionStore(database_path)

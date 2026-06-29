@@ -122,6 +122,24 @@ def test_frontend_index_served_when_dist_provided(tmp_path: Path):
     assert api_response.status_code == 200
 
 
+def test_frontend_index_served_from_env_dist(monkeypatch, tmp_path: Path):
+    dist = tmp_path / "dist"
+    dist.mkdir()
+    (dist / "index.html").write_text("<!doctype html><main>DataPilot env</main>", encoding="utf-8")
+    monkeypatch.setenv("VLA_DATA_AGENT_WEB_FRONTEND_DIST", str(dist))
+    app = create_app(
+        working_dir=str(tmp_path / ".djx"),
+        db_path=tmp_path / "sessions.sqlite",
+        controller_factory=FakeController,
+    )
+    client = TestClient(app)
+
+    response = client.get("/")
+
+    assert response.status_code == 200
+    assert response.text == "<!doctype html><main>DataPilot env</main>"
+
+
 def test_frontend_assets_served_when_assets_dir_exists(tmp_path: Path):
     dist = tmp_path / "dist"
     assets = dist / "assets"

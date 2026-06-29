@@ -9,11 +9,11 @@ type ProgressBarProps = {
 };
 
 const fillClasses: Record<NonNullable<ProgressBarProps["tone"]>, string> = {
-  success: "bg-console-cyan",
-  info: "bg-sky-300",
-  warning: "bg-amber-300",
-  danger: "bg-rose-400",
-  purple: "bg-violet-400",
+  success: "bg-emerald-600",
+  info: "bg-console-cyan",
+  warning: "bg-amber-500",
+  danger: "bg-rose-600",
+  purple: "bg-violet-600",
   neutral: "bg-console-muted",
 };
 
@@ -24,7 +24,7 @@ export function ProgressBar({ value, tone = "success", label, className }: Progr
     <div className={cn("space-y-1.5", className)}>
       {label ? <div className="text-xs text-console-muted">{label}</div> : null}
       <div
-        className="h-2 overflow-hidden rounded-full bg-console-bg"
+        className="h-2 overflow-hidden rounded-full bg-slate-100"
         role="progressbar"
         aria-valuenow={normalizedValue}
         aria-valuemin={0}

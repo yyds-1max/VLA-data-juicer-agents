@@ -187,7 +187,7 @@ function LineChart({ title, data, className }: LineChartProps) {
           const x = PADDING + index * step;
           const y = SVG_HEIGHT - PADDING - ((value - min) / span) * (SVG_HEIGHT - PADDING * 2);
 
-          return <circle key={`${data.labels[index]}-${value}`} cx={x} cy={y} r="3.5" fill={data.color} stroke="#08111f" strokeWidth="2" />;
+          return <circle key={`${data.labels[index]}-${value}`} cx={x} cy={y} r="3.5" fill={data.color} stroke="#ffffff" strokeWidth="2" />;
         })}
         {data.labels.map((label, index) => (
           <text key={label} x={PADDING + index * step} y={SVG_HEIGHT - 6} textAnchor="middle" className="fill-console-muted text-[9px]">
@@ -268,7 +268,7 @@ function RadarChart({ title, data, className }: RadarChartProps) {
         })}
         <polygon data-testid="radar-polygon" points={polygonPoints(valuePoints)} fill={data.color} fillOpacity="0.22" stroke={data.color} strokeWidth="2.5" />
         {valuePoints.map((point, index) => (
-          <circle key={`${axisLabels[index]}-${data.data[index] ?? 0}`} cx={point.x} cy={point.y} r="3" fill={data.color} stroke="#08111f" strokeWidth="1.5" />
+          <circle key={`${axisLabels[index]}-${data.data[index] ?? 0}`} cx={point.x} cy={point.y} r="3" fill={data.color} stroke="#ffffff" strokeWidth="1.5" />
         ))}
       </svg>
     </div>

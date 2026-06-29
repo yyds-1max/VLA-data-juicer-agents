@@ -16,8 +16,7 @@ type MetricCardProps = {
 
 export function MetricCard({ title, value, detail, meta, tone = "success", tag, className }: MetricCardProps) {
   return (
-    <article className={cn("min-h-36 rounded border border-console-line bg-console-panel p-4 shadow-[0_16px_40px_rgba(0,0,0,0.2)]", className)}>
-      <div className="mb-4 h-1.5 rounded-full bg-console-cyan/40" />
+    <article className={cn("min-h-36 rounded-lg border border-console-line bg-console-panel p-4 shadow-sm", className)}>
       <div className="flex items-start justify-between gap-3">
         <div className="min-w-0">
           <h2 className="truncate text-sm font-medium text-console-muted">{title}</h2>

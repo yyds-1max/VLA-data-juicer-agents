@@ -9,12 +9,12 @@ type QualityRingProps = {
 };
 
 const strokeClasses: Record<StatusTone, string> = {
-  success: "stroke-console-cyan text-console-cyan",
-  info: "stroke-sky-300 text-sky-300",
-  warning: "stroke-amber-300 text-amber-300",
-  danger: "stroke-rose-400 text-rose-400",
+  success: "stroke-emerald-600 text-emerald-700",
+  info: "stroke-console-cyan text-console-cyan",
+  warning: "stroke-amber-500 text-amber-700",
+  danger: "stroke-rose-600 text-rose-700",
   neutral: "stroke-console-muted text-console-muted",
-  purple: "stroke-violet-400 text-violet-400",
+  purple: "stroke-violet-600 text-violet-700",
 };
 
 export function QualityRing({ value, label, tone = "success", className }: QualityRingProps) {
@@ -27,7 +27,7 @@ export function QualityRing({ value, label, tone = "success", className }: Quali
     <div className={cn("inline-flex items-center gap-3", className)}>
       <div className="relative h-16 w-16" aria-label={label} role="img">
         <svg className="h-16 w-16 -rotate-90" viewBox="0 0 72 72" aria-hidden="true">
-          <circle cx="36" cy="36" r={radius} className="fill-none stroke-console-bg" strokeWidth="7" />
+          <circle cx="36" cy="36" r={radius} className="fill-none stroke-slate-100" strokeWidth="7" />
           <circle
             cx="36"
             cy="36"

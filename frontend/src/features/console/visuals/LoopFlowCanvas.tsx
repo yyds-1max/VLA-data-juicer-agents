@@ -12,7 +12,7 @@ const flowNodes = [
 function drawLoop(context: CanvasRenderingContext2D, width: number, height: number, progress: number) {
   context.clearRect(0, 0, width, height);
   context.lineWidth = 1.4;
-  context.strokeStyle = "rgba(21, 209, 216, 0.42)";
+  context.strokeStyle = "rgba(45, 108, 223, 0.34)";
   context.setLineDash([8, 8]);
   context.lineDashOffset = -progress * 28;
 
@@ -40,9 +40,8 @@ function drawLoop(context: CanvasRenderingContext2D, width: number, height: numb
     const dotY = point.y + (next.y - point.y) * local;
 
     context.beginPath();
-    context.fillStyle = "rgba(0, 229, 155, 0.95)";
-    context.shadowColor = "rgba(0, 229, 155, 0.55)";
-    context.shadowBlur = 12;
+    context.fillStyle = "rgba(22, 132, 91, 0.95)";
+    context.shadowBlur = 0;
     context.arc(dotX, dotY, 3.5, 0, Math.PI * 2);
     context.fill();
     context.shadowBlur = 0;
@@ -102,19 +101,18 @@ export function LoopFlowCanvas() {
   }, []);
 
   return (
-    <div className="relative min-h-[20rem] overflow-hidden rounded border border-console-line bg-console-panel2/70">
+    <div className="relative min-h-[20rem] overflow-hidden rounded-lg border border-console-line bg-console-panel2/70">
       <canvas ref={canvasRef} aria-hidden="true" className="absolute inset-0 h-full w-full" />
-      <div className="absolute inset-0 bg-[radial-gradient(circle_at_center,rgba(21,209,216,0.12),transparent_56%)]" />
       {flowNodes.map((node) => {
         const Icon = node.icon;
 
         return (
           <div
             key={node.label}
-            className="absolute flex w-28 -translate-x-1/2 -translate-y-1/2 flex-col items-center gap-2 rounded border border-console-cyan/30 bg-console-panel/92 px-3 py-3 text-center shadow-[0_14px_36px_rgba(0,0,0,0.24)]"
+            className="absolute flex w-28 -translate-x-1/2 -translate-y-1/2 flex-col items-center gap-2 rounded-lg border border-console-line bg-console-panel px-3 py-3 text-center shadow-sm"
             style={{ left: `${node.x}%`, top: `${node.y}%` }}
           >
-            <span className="flex h-9 w-9 items-center justify-center rounded border border-console-cyan/35 bg-console-cyan/10 text-console-cyan">
+            <span className="flex h-9 w-9 items-center justify-center rounded-lg border border-console-line bg-console-panel2 text-console-cyan">
               <Icon aria-hidden="true" className="h-4 w-4" />
             </span>
             <span className="text-xs font-medium text-console-text">{node.label}</span>

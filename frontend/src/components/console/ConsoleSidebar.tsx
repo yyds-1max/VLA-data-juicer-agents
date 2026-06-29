@@ -19,34 +19,34 @@ const navItems: NavItem[] = [
 
 export function ConsoleSidebar({ activePage, onChange }: ConsoleSidebarProps) {
   return (
-    <aside className="fixed inset-x-0 top-0 z-20 border-b border-console-line bg-console-panel/95 px-4 backdrop-blur md:inset-y-0 md:left-0 md:right-auto md:w-64 md:border-b-0 md:border-r md:px-0">
+    <aside className="fixed inset-x-0 top-0 z-20 border-b border-console-line bg-console-panel/95 px-4 shadow-sm backdrop-blur md:inset-y-0 md:left-0 md:right-auto md:w-64 md:border-b-0 md:border-r md:px-0 md:shadow-none">
       <div className="flex h-full flex-col">
         <div className="flex h-16 items-center gap-3 md:h-auto md:border-b md:border-console-line md:p-5">
-          <div className="flex h-10 w-10 shrink-0 items-center justify-center rounded border border-console-cyan/40 bg-console-cyan/10 text-console-cyan shadow-[0_0_24px_rgba(21,209,216,0.16)]">
+          <div className="flex h-10 w-10 shrink-0 items-center justify-center rounded-lg border border-console-line bg-console-text text-white shadow-sm">
             <Route className="h-5 w-5" aria-hidden="true" />
           </div>
           <div className="min-w-0">
-            <div className="truncate text-sm font-semibold">智瀚星途 DataLoop</div>
-            <div className="truncate text-[11px] uppercase text-console-muted">Voyager Forge</div>
+            <div className="truncate text-sm font-semibold text-console-text">智瀚星途 DataLoop</div>
+            <div className="truncate text-[11px] text-console-muted">Voyager Forge</div>
           </div>
         </div>
 
         <nav className="min-w-0 flex-1 overflow-x-auto border-t border-console-line py-2 md:overflow-y-auto md:border-t-0 md:px-3 md:py-4" aria-label="DataLoop console navigation">
-          <ul className="flex gap-2 md:block md:space-y-3">
+          <ul className="flex gap-2 md:block md:space-y-2">
             {navItems.map((item) => (
               <li key={item.id} className="md:space-y-1">
-                <div className="hidden px-3 text-[10px] uppercase tracking-[0.18em] text-console-muted md:block">{item.group}</div>
+                <div className="hidden px-3 text-[10px] font-medium uppercase tracking-[0.12em] text-console-muted md:block">{item.group}</div>
                 <button
                   type="button"
                   aria-current={activePage === item.id ? "page" : undefined}
                   className={cn(
-                    "flex h-10 w-max min-w-32 shrink-0 items-center gap-2 rounded border border-console-line bg-console-panel2 px-3 text-left text-sm text-console-muted transition hover:border-console-cyan/40 hover:text-console-cyan focus:outline-none focus:ring-2 focus:ring-console-cyan md:w-full",
+                    "flex h-10 w-max min-w-32 shrink-0 items-center gap-2 rounded-lg border border-transparent bg-transparent px-3 text-left text-sm text-console-muted transition hover:bg-console-panel2 hover:text-console-text focus:outline-none focus:ring-2 focus:ring-console-cyan md:w-full",
                     activePage === item.id &&
-                      "border-console-cyan/45 bg-console-cyan/10 text-console-cyan shadow-[inset_3px_0_0_#15d1d8]",
+                      "border-console-line bg-console-panel2 text-console-text shadow-[inset_3px_0_0_#2d6cdf]",
                   )}
                   onClick={() => onChange(item.id)}
                 >
-                  <item.icon className="h-4 w-4 shrink-0" aria-hidden="true" />
+                  <item.icon className={cn("h-4 w-4 shrink-0", activePage === item.id && "text-console-cyan")} aria-hidden="true" />
                   <span className="truncate">{item.label}</span>
                 </button>
               </li>
@@ -55,10 +55,7 @@ export function ConsoleSidebar({ activePage, onChange }: ConsoleSidebarProps) {
         </nav>
 
         <div className="hidden border-t border-console-line p-4 md:block">
-          <div className="rounded border border-console-line bg-console-panel2 px-3 py-2">
-            <div className="text-sm font-medium">数据飞轮</div>
-            <div className="mt-1 text-xs text-console-muted">Pro 版本</div>
-          </div>
+          <div className="px-3 py-2 text-sm font-medium leading-5 text-console-text">智瀚星途数据处理系统</div>
         </div>
       </div>
     </aside>

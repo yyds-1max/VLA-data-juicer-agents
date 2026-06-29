@@ -29,21 +29,21 @@ const successChart = {
   labels: simulationReportRows.map((row) => row.name.slice(0, 6)),
   data: simulationReportRows.map((row) => row.sr),
   label: "Success Rate (%)",
-  color: "#15d1d8",
+  color: "#2d6cdf",
 };
 
 const latencyChart = {
   labels: simulationReportRows.map((row) => row.name.slice(0, 6)),
   data: simulationReportRows.map((row) => row.latency),
   label: "Latency (ms)",
-  color: "#fbbf24",
+  color: "#b7791f",
 };
 
 const stabilityChart = {
   labels: ["导航", "避障", "抓取", "指令", "复杂", "制动"],
   data: [96, 88, 92, 90, 86, 98],
   label: "综合稳定性",
-  color: "#a78bfa",
+  color: "#6d5bd0",
 };
 
 const runningLogs = [
@@ -96,11 +96,11 @@ function ConfigPanel({ onPlaceholderAction }: SimulationPageProps) {
             </label>
             <label className="block space-y-2">
               <span className="text-sm text-console-muted">并发 worker 12</span>
-              <input className="w-full accent-cyan-300" type="range" min="1" max="24" defaultValue="12" aria-label="并发 worker" />
+              <input className="w-full accent-console-cyan" type="range" min="1" max="24" defaultValue="12" aria-label="并发 worker" />
             </label>
             <label className="block space-y-2">
               <span className="text-sm text-console-muted">超时阈值 240ms</span>
-              <input className="w-full accent-amber-300" type="range" min="80" max="500" defaultValue="240" aria-label="超时阈值" />
+              <input className="w-full accent-amber-500" type="range" min="80" max="500" defaultValue="240" aria-label="超时阈值" />
             </label>
           </div>
         </ConsoleCard>
@@ -110,7 +110,7 @@ function ConfigPanel({ onPlaceholderAction }: SimulationPageProps) {
           <div className="mt-4 grid gap-3 sm:grid-cols-2 lg:grid-cols-4">
             {["成功率", "平均延迟", "碰撞次数", "轨迹稳定性"].map((metric) => (
               <label key={metric} className="flex items-center gap-3 rounded border border-console-line bg-console-panel2/70 p-3 text-sm text-console-text">
-                <input type="checkbox" defaultChecked className="h-4 w-4 accent-cyan-300" />
+                <input type="checkbox" defaultChecked className="h-4 w-4 accent-console-cyan" />
                 {metric}
               </label>
             ))}

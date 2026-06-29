@@ -71,8 +71,8 @@ export function AgentWorkflowPage({ onPlaceholderAction }: AgentWorkflowPageProp
                   aria-label={node.name}
                   aria-pressed={active}
                   className={cn(
-                    "group w-full cursor-grab rounded border border-console-line bg-console-panel2/80 p-3 text-left transition focus:outline-none focus:ring-2 focus:ring-console-cyan",
-                    active && "border-console-cyan/50 bg-console-cyan/10 shadow-[inset_3px_0_0_#15d1d8]",
+                    "group w-full cursor-grab rounded-lg border border-console-line bg-console-panel2/80 p-3 text-left transition focus:outline-none focus:ring-2 focus:ring-console-cyan",
+                    active && "border-console-cyan/45 bg-console-panel shadow-[inset_3px_0_0_#2d6cdf]",
                     !active && "hover:border-console-cyan/35 hover:bg-console-panel2",
                   )}
                   onClick={() => setSelectedNodeId(node.id)}
@@ -106,9 +106,9 @@ export function AgentWorkflowPage({ onPlaceholderAction }: AgentWorkflowPageProp
             </div>
           </div>
 
-          <div className="overflow-x-auto rounded border border-console-line bg-console-bg/80">
+          <div className="overflow-x-auto rounded-lg border border-console-line bg-console-panel2/70">
             <div className="relative min-h-[31rem] min-w-[620px]">
-              <div className="absolute inset-0 bg-[linear-gradient(rgba(148,163,184,0.08)_1px,transparent_1px),linear-gradient(90deg,rgba(148,163,184,0.08)_1px,transparent_1px)] bg-[size:32px_32px]" />
+              <div className="absolute inset-0 bg-[linear-gradient(rgba(100,116,139,0.12)_1px,transparent_1px),linear-gradient(90deg,rgba(100,116,139,0.12)_1px,transparent_1px)] bg-[size:32px_32px]" />
               <AgentConnectionCanvas nodes={workflowCoordinates} connections={agentConnections} className="absolute inset-0 h-full w-full" />
               {positionedNodes.map(({ node, x, y }) => {
                 if (!node) {
@@ -124,8 +124,8 @@ export function AgentWorkflowPage({ onPlaceholderAction }: AgentWorkflowPageProp
                     aria-label={`画布节点 ${node.name}`}
                     aria-pressed={active}
                     className={cn(
-                      "absolute w-36 -translate-x-1/2 -translate-y-1/2 rounded border bg-console-panel/95 p-3 text-left shadow-[0_12px_30px_rgba(0,0,0,0.24)] transition focus:outline-none focus:ring-2 focus:ring-console-cyan",
-                      active ? "border-console-cyan text-console-cyan ring-2 ring-console-cyan/35" : "border-console-line text-console-text hover:border-console-cyan/45",
+                      "absolute w-36 -translate-x-1/2 -translate-y-1/2 rounded-lg border bg-console-panel p-3 text-left shadow-sm transition focus:outline-none focus:ring-2 focus:ring-console-cyan",
+                      active ? "border-console-cyan text-console-cyan ring-2 ring-console-cyan/20" : "border-console-line text-console-text hover:border-console-cyan/45",
                     )}
                     style={{ left: `${x}%`, top: `${y}%` }}
                     onClick={() => setSelectedNodeId(node.id)}

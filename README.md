@@ -88,16 +88,25 @@ The conversational Agent requires normal LLM settings such as `DASHSCOPE_API_KEY
 
 ## DataPilot web UI
 
-Run the backend API from the repository root:
+For local development, run the backend API from the repository root:
 
 ```bash
 vla-data-agent-web --host 127.0.0.1 --port 8765 --working-dir ./.djx
 ```
 
-Run the frontend dev server from `frontend`:
+Then run the frontend dev server from `frontend`. Vite proxies `/api` and WebSocket traffic to the backend:
 
 ```bash
 npm run dev
+```
+
+For an integrated demo/server, build the frontend first and let the backend serve it:
+
+```bash
+cd frontend
+npm run build
+cd ..
+vla-data-agent-web --host 127.0.0.1 --port 8765 --working-dir ./.djx --frontend-dist frontend/dist
 ```
 
 Frontend verification commands:
