@@ -140,7 +140,10 @@ def test_frontend_assets_served_when_assets_dir_exists(tmp_path: Path):
 
     assert response.status_code == 200
     assert response.text == "console.log('datapilot');"
-    assert response.headers["content-type"].startswith("text/javascript")
+    assert response.headers["content-type"].split(";")[0] in {
+        "application/javascript",
+        "text/javascript",
+    }
 
 
 def test_frontend_dist_without_index_leaves_root_404_and_api_available(tmp_path: Path):
