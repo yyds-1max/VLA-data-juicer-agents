@@ -61,6 +61,7 @@ tmp/
 # 运行日志
 runs/
 uv.lock
+.djx/
 
 # Codex
 .superpowers
