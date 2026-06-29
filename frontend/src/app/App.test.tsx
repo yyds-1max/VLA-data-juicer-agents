@@ -996,6 +996,82 @@ test("message list keeps earlier timeline output before later user messages", ()
   expect(text & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
 });
 
+test("message list follows new content when the user is already at the bottom", () => {
+  const firstMessages = [
+    {
+      id: "message-1",
+      session_id: "session-1",
+      role: "user" as const,
+      content: "第一条消息",
+      created_at: "2026-06-26T00:01:00Z",
+    },
+  ];
+  const { container, rerender } = render(<MessageList messages={firstMessages} run={createEmptyRunState()} />);
+  const scrollArea = container.querySelector<HTMLElement>("[data-datapilot-scroll-area='true']");
+  expect(scrollArea).not.toBeNull();
+  Object.defineProperty(scrollArea, "scrollHeight", { configurable: true, value: 900 });
+  Object.defineProperty(scrollArea, "clientHeight", { configurable: true, value: 300 });
+  scrollArea!.scrollTop = 600;
+  fireEvent.scroll(scrollArea!);
+
+  Object.defineProperty(scrollArea, "scrollHeight", { configurable: true, value: 1100 });
+  rerender(
+    <MessageList
+      messages={[
+        ...firstMessages,
+        {
+          id: "message-2",
+          session_id: "session-1",
+          role: "assistant" as const,
+          content: "新的助手回复",
+          created_at: "2026-06-26T00:02:00Z",
+        },
+      ]}
+      run={createEmptyRunState()}
+    />,
+  );
+
+  expect(scrollArea?.scrollTop).toBe(1100);
+});
+
+test("message list does not jump down when the user is reading older content", () => {
+  const firstMessages = [
+    {
+      id: "message-1",
+      session_id: "session-1",
+      role: "user" as const,
+      content: "第一条消息",
+      created_at: "2026-06-26T00:01:00Z",
+    },
+  ];
+  const { container, rerender } = render(<MessageList messages={firstMessages} run={createEmptyRunState()} />);
+  const scrollArea = container.querySelector<HTMLElement>("[data-datapilot-scroll-area='true']");
+  expect(scrollArea).not.toBeNull();
+  Object.defineProperty(scrollArea, "scrollHeight", { configurable: true, value: 900 });
+  Object.defineProperty(scrollArea, "clientHeight", { configurable: true, value: 300 });
+  scrollArea!.scrollTop = 200;
+  fireEvent.scroll(scrollArea!);
+
+  Object.defineProperty(scrollArea, "scrollHeight", { configurable: true, value: 1100 });
+  rerender(
+    <MessageList
+      messages={[
+        ...firstMessages,
+        {
+          id: "message-2",
+          session_id: "session-1",
+          role: "assistant" as const,
+          content: "新的助手回复",
+          created_at: "2026-06-26T00:02:00Z",
+        },
+      ]}
+      run={createEmptyRunState()}
+    />,
+  );
+
+  expect(scrollArea?.scrollTop).toBe(200);
+});
+
 test("completed child run renders a collapsed summary row by default and expands details", () => {
   const run = createEmptyRunState();
   run.timeline = [

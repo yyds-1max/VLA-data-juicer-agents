@@ -231,6 +231,7 @@ export function DataPilotWindow() {
 
     if (!scrollArea.contains(target)) {
       scrollArea.scrollTop = clampScroll(scrollArea.scrollTop + event.deltaY, maxScrollTop);
+      scrollArea.dispatchEvent(new Event("scroll"));
       blockWheel(event);
       return;
     }

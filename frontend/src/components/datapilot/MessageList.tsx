@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useCallback, useEffect, useLayoutEffect, useRef, useState } from "react";
 
 import type { ChatMessageRecord } from "../../api/types";
 import type { ActiveAgent, ActiveTool, RunState, TimelineItem } from "../../store/eventReducer";
@@ -9,6 +9,8 @@ type MessageListProps = {
   messages: ChatMessageRecord[];
   run: RunState;
 };
+
+const STICKY_BOTTOM_THRESHOLD = 24;
 
 type OrderedTimelineItem = AgentRunTimelineItem;
 
@@ -45,11 +47,31 @@ export function MessageList({ messages, run }: MessageListProps) {
   const entries = renderEntries(messages, run);
   const now = useActiveNow(run.activeText ? run.activeStartedAt : null);
   const activeText = formatActiveText(run.activeText, run.activeStartedAt, now);
+  const scrollAreaRef = useRef<HTMLDivElement | null>(null);
+  const shouldStickToBottomRef = useRef(true);
+
+  const handleScroll = useCallback(() => {
+    const scrollArea = scrollAreaRef.current;
+    if (!scrollArea) {
+      return;
+    }
+    shouldStickToBottomRef.current = isScrolledNearBottom(scrollArea);
+  }, []);
+
+  useLayoutEffect(() => {
+    const scrollArea = scrollAreaRef.current;
+    if (!scrollArea || !shouldStickToBottomRef.current) {
+      return;
+    }
+    scrollArea.scrollTop = scrollArea.scrollHeight;
+  });
 
   return (
     <div
+      ref={scrollAreaRef}
       data-datapilot-scroll-area="true"
       className="flex min-h-0 flex-1 flex-col gap-3 overflow-y-auto overscroll-contain bg-console-panel2/45 px-4 py-4 sm:px-5"
+      onScroll={handleScroll}
     >
       {hasContent ? (
         <>
@@ -75,6 +97,11 @@ export function MessageList({ messages, run }: MessageListProps) {
       )}
     </div>
   );
+}
+
+function isScrolledNearBottom(element: HTMLElement) {
+  const distanceToBottom = element.scrollHeight - element.scrollTop - element.clientHeight;
+  return distanceToBottom <= STICKY_BOTTOM_THRESHOLD;
 }
 
 export function formatActiveText(activeText: string, startedAt: number | null, now: number): string {
