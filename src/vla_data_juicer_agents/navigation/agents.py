@@ -111,6 +111,7 @@ prepare_raw_data maps to prepare_raw_data_tool and run_initial_annotation_gui ma
 Stop on any failed tool result.
 The first WorkflowPlan step must be confirm_navigation_calibration_params; confirm camera and sensor parameters before prepare_raw_data or any processing.
 When executing confirm_navigation_calibration_params, stop and wait for exact user input.
+Do not provide user_confirmation yourself during the initial workflow turn; call the tool without user_confirmation, show the confirmation prompt, and stop.
 Continue only when user_confirmation is exactly `确认`.
 If the user enters `终止` or anything else, stop workflow and report calibration_params_not_confirmed.
 run_noobscene_preprocessing receives localization_source and localization_conversion from WorkflowPlan.

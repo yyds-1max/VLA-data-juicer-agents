@@ -188,6 +188,7 @@ function cloneRunState(run: RunState): RunState {
     ),
     finalRunIds: { ...run.finalRunIds },
     activeText: run.activeText,
+    activeStartedAt: run.activeStartedAt,
     running: run.running,
   };
 }

@@ -10,7 +10,7 @@ import {
   submitTurn,
 } from "../api/client";
 import { Composer } from "../components/datapilot/Composer";
-import { MessageList } from "../components/datapilot/MessageList";
+import { formatActiveText, MessageList } from "../components/datapilot/MessageList";
 import { createEmptyRunState } from "../store/eventReducer";
 import { datapilotStore } from "../store/datapilotStore";
 import { App } from "./App";
@@ -906,6 +906,7 @@ test("active child run details remain visible and are not folded", () => {
     source: "navigation.plan",
     runId: "plan-run",
     parentRunId: "main-run",
+    startedAt: Date.parse("2026-06-26T00:02:00Z"),
   };
   run.timeline = [
     {
@@ -934,6 +935,13 @@ test("active child run details remain visible and are not folded", () => {
   expect(screen.getByText("正在判断导航数据类型")).toBeVisible();
   expect(screen.getByText("completed classify_navigation_dataset_tool 0.0s")).toBeVisible();
   expect(screen.queryByRole("button", { name: /完成了 1 个工具/ })).not.toBeInTheDocument();
+});
+
+test("active run text includes elapsed seconds while waiting", () => {
+  expect(formatActiveText("[Executor] 正在运行 extract_and_sync_navigation_data_tool", 1_000, 6_200)).toBe(
+    "[Executor] 正在运行 extract_and_sync_navigation_data_tool +5s",
+  );
+  expect(formatActiveText("", 1_000, 6_200)).toBe("");
 });
 
 test("completed child run summary keeps chronological position before later messages", () => {

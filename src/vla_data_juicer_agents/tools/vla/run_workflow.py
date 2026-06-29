@@ -18,6 +18,7 @@ from vla_data_juicer_agents.navigation.workflow import run_executor_agent, run_p
 
 _CALIBRATION_CONFIRMATION_PAUSE_TOKEN = "calibration_params_not_confirmed"
 _RESUMABLE_CHECKPOINT_STATUSES = {"waiting_for_user_confirmation", "paused_by_user"}
+_CJK_LANGUAGE_RE = r"[\u3400-\u4dbf\u4e00-\u9fff]"
 
 
 class RunVLAWorkflowInput(BaseModel):
@@ -97,6 +98,36 @@ def _normalize_model(value: str | None) -> str | None:
     if not model or model.lower() in {"none", "null"}:
         return None
     return model
+
+
+def _latest_user_message(ctx: ToolContext) -> str:
+    runtime = ctx.runtime_values.get("session_runtime")
+    history = getattr(getattr(runtime, "state", None), "history", None)
+    if not isinstance(history, list):
+        return ""
+    for item in reversed(history):
+        if isinstance(item, Mapping) and item.get("role") == "user":
+            content = item.get("content")
+            return content if isinstance(content, str) else ""
+    return ""
+
+
+def _infer_response_language(text: str) -> str | None:
+    if not text:
+        return None
+    import re
+
+    return "Chinese" if re.search(_CJK_LANGUAGE_RE, text) else None
+
+
+def _resolve_response_language(ctx: ToolContext, explicit: str | None) -> str | None:
+    inferred = _infer_response_language(_latest_user_message(ctx))
+    if inferred:
+        return inferred
+    language = str(explicit or "").strip()
+    if language:
+        return language
+    return None
 
 
 def _artifact_paths(run_dir) -> dict[str, str]:
@@ -217,6 +248,7 @@ async def run_vla_workflow(ctx: ToolContext, raw_args: RunVLAWorkflowInput | dic
         ).model_dump(mode="json")
 
     model = _normalize_model(args.model)
+    response_language = _resolve_response_language(ctx, args.response_language)
     request = NavigationRequest(
         date=args.date,
         segments=_normalize_segments(args.segments),
@@ -259,7 +291,7 @@ async def run_vla_workflow(ctx: ToolContext, raw_args: RunVLAWorkflowInput | dic
             run_dir=run_dir,
             event_scope=plan_scope,
             cancellation=cancellation,
-            response_language=args.response_language,
+            response_language=response_language,
         )
         run_store.write_json(run_dir, "plan.json", plan.model_dump(mode="json"))
 
@@ -287,7 +319,7 @@ async def run_vla_workflow(ctx: ToolContext, raw_args: RunVLAWorkflowInput | dic
             run_dir=run_dir,
             event_scope=executor_scope,
             cancellation=cancellation,
-            response_language=args.response_language,
+            response_language=response_language,
         )
         if calibration_pause_sink.detected or _is_calibration_confirmation_pause(final_output):
             checkpoint = WorkflowCheckpoint(
@@ -395,6 +427,7 @@ async def continue_vla_workflow(
         ).model_dump(mode="json")
 
     model = _normalize_model(args.model)
+    response_language = _resolve_response_language(ctx, args.response_language)
     cancellation = ctx.runtime_values.get("cancellation") or CancellationContext()
     incoming_scope = ctx.runtime_values.get("event_scope")
     incoming_emitter = ctx.runtime_values.get("event_emitter")
@@ -463,7 +496,7 @@ async def continue_vla_workflow(
             run_dir=run_dir,
             event_scope=executor_scope,
             cancellation=cancellation,
-            response_language=args.response_language,
+            response_language=response_language,
             resume_from_checkpoint=True,
         )
         checkpoint = WorkflowCheckpoint(

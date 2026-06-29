@@ -63,7 +63,9 @@ describe("eventReducer", () => {
       source: "main",
       runId: "run-1",
       parentRunId: null,
+      startedAt: Date.parse("2026-06-26T00:00:00.000Z"),
     });
+    expect(state.activeStartedAt).toBe(Date.parse("2026-06-26T00:00:00.000Z"));
   });
 
   it("creates compact tool completion text without args JSON", () => {
@@ -158,6 +160,7 @@ describe("eventReducer", () => {
 
     expect(state.running).toBe(true);
     expect(state.activeText).toBe("[Plan] 正在思考");
+    expect(state.activeStartedAt).toBe(Date.parse("2026-06-26T00:00:00.000Z"));
   });
 
   it("dedupes final events by run id", () => {
@@ -198,6 +201,7 @@ describe("eventReducer", () => {
 
     expect(state.running).toBe(true);
     expect(state.activeText).toBe("");
+    expect(state.activeStartedAt).toBeNull();
     expect(state.timeline.filter((item) => item.kind === "assistant")).toEqual([
       {
         kind: "assistant",

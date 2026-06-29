@@ -15,6 +15,7 @@ export interface ActiveAgent {
   source: string;
   runId: string;
   parentRunId: string | null;
+  startedAt: number;
 }
 
 export interface ActiveTool {
@@ -32,6 +33,7 @@ export interface RunState {
   activeTools: Record<string, ActiveTool>;
   finalRunIds: Record<string, true>;
   activeText: string;
+  activeStartedAt: number | null;
   running: boolean;
 }
 
@@ -42,6 +44,7 @@ export function createEmptyRunState(): RunState {
     activeTools: {},
     finalRunIds: {},
     activeText: "",
+    activeStartedAt: null,
     running: false,
   };
 }
@@ -59,9 +62,11 @@ export function applyAgentEvent(state: RunState, event: AgentEvent): void {
   const label = sourceLabel(source);
 
   if (type === "agent_start") {
-    state.activeAgents[agentKey(runId, source)] = { source, runId, parentRunId };
+    const startedAt = timestampMs(event.timestamp);
+    state.activeAgents[agentKey(runId, source)] = { source, runId, parentRunId, startedAt };
     state.running = true;
     state.activeText = `[${label}] 正在思考`;
+    state.activeStartedAt = startedAt;
     return;
   }
 
@@ -96,6 +101,7 @@ export function applyAgentEvent(state: RunState, event: AgentEvent): void {
     };
     state.running = true;
     state.activeText = `[${label}] 正在运行 ${tool}`;
+    state.activeStartedAt = state.activeTools[toolKey(runId, callId)].startedAt;
     return;
   }
 
@@ -141,6 +147,7 @@ export function applyAgentEvent(state: RunState, event: AgentEvent): void {
     }
     state.running = true;
     state.activeText = "";
+    state.activeStartedAt = null;
     return;
   }
 
@@ -177,6 +184,7 @@ export function applyAgentEvent(state: RunState, event: AgentEvent): void {
     state.activeTools = {};
     state.running = false;
     state.activeText = "";
+    state.activeStartedAt = null;
     return;
   }
 
@@ -213,6 +221,7 @@ function refreshRunningText(state: RunState): void {
   if (activeTool) {
     state.running = true;
     state.activeText = `[${sourceLabel(activeTool.source)}] 正在运行 ${activeTool.tool}`;
+    state.activeStartedAt = activeTool.startedAt;
     return;
   }
 
@@ -220,11 +229,13 @@ function refreshRunningText(state: RunState): void {
   if (activeAgent) {
     state.running = true;
     state.activeText = `[${sourceLabel(activeAgent.source)}] 正在思考`;
+    state.activeStartedAt = activeAgent.startedAt;
     return;
   }
 
   state.running = false;
   state.activeText = "";
+  state.activeStartedAt = null;
 }
 
 function deepestActiveAgent(activeAgents: Record<string, ActiveAgent>): ActiveAgent | undefined {

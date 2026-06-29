@@ -1014,6 +1014,59 @@ def test_vla_run_workflow_tool_reuses_plan_and_executor_agents(tmp_path, monkeyp
     assert all(set(event) == {"type", "source", "run_id", "parent_run_id", "timestamp", "payload"} for event in persisted)
 
 
+def test_vla_run_workflow_infers_chinese_response_language_from_session_history(tmp_path, monkeypatch):
+    runtime = SessionToolRuntime(state=SessionState())
+    runtime.state.history.append({"role": "user", "content": "请处理 20270605 的室外导航数据"})
+    captured = []
+    plan_payload = {
+        "date": "20270605",
+        "segments": ["20260605_152856"],
+        "scene_mode": "out",
+        "processing_profile": "parameterized_navigation_v1",
+        "platform_hint": "go2w",
+        "steps": [],
+    }
+    plan = SimpleNamespace(
+        model_dump=lambda mode="json": plan_payload,
+        model_dump_json=lambda: json.dumps(plan_payload),
+    )
+
+    async def fake_run_plan_agent(*args, **kwargs):
+        captured.append(("plan", kwargs["response_language"]))
+        return plan
+
+    async def fake_run_executor_agent(*args, **kwargs):
+        captured.append(("executor", kwargs["response_language"]))
+        return "执行完成"
+
+    monkeypatch.setenv("VLA_RUNS_ROOT", str(tmp_path / "runs"))
+    monkeypatch.setattr("vla_data_juicer_agents.tools.vla.run_workflow.create_plan_agent", lambda model=None, request=None: "plan-agent")
+    monkeypatch.setattr(
+        "vla_data_juicer_agents.tools.vla.run_workflow.create_executor_agent",
+        lambda model=None, dry_run=False, cancellation=None: "executor-agent",
+    )
+    monkeypatch.setattr("vla_data_juicer_agents.tools.vla.run_workflow.run_plan_agent", fake_run_plan_agent)
+    monkeypatch.setattr("vla_data_juicer_agents.tools.vla.run_workflow.run_executor_agent", fake_run_executor_agent)
+    ctx = ToolContext(working_dir=str(tmp_path), runtime_values={"session_runtime": runtime})
+
+    payload = asyncio.run(
+        run_vla_workflow(
+            ctx,
+            {
+                "date": "20270605",
+                "segments": ["20260605_152856"],
+                "scene_mode": "out",
+                "dry_run": True,
+                "approve": True,
+                "response_language": "English",
+            },
+        )
+    )
+
+    assert payload["ok"] is True
+    assert captured == [("plan", "Chinese"), ("executor", "Chinese")]
+
+
 def test_vla_run_workflow_records_calibration_confirmation_checkpoint(tmp_path, monkeypatch):
     runtime = SessionToolRuntime(state=SessionState())
     plan_payload = {

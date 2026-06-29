@@ -1246,13 +1246,15 @@ def build_execution_tools(
         platform_hint: str | None = None,
         user_confirmation: str | None = None,
     ) -> dict:
+        # The executor model must not be allowed to confirm on the user's behalf.
+        del user_confirmation
         return _execute_with_cancellation(
             cancellation,
             confirm_navigation_calibration_params,
             date,
             _normalize_segments_arg(segments),
             platform_hint=platform_hint,
-            user_confirmation=user_confirmation,
+            user_confirmation=None,
             settings=settings,
             dry_run=dry_run,
         ).model_dump(mode="json")

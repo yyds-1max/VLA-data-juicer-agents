@@ -1,3 +1,5 @@
+import { useEffect, useState } from "react";
+
 import type { ChatMessageRecord } from "../../api/types";
 import type { ActiveAgent, ActiveTool, RunState, TimelineItem } from "../../store/eventReducer";
 import { cn } from "../../lib/utils";
@@ -41,6 +43,8 @@ type RenderEntry = ChronologicalEntry | AgentRunSummaryEntry;
 export function MessageList({ messages, run }: MessageListProps) {
   const hasContent = messages.length > 0 || run.timeline.length > 0 || Boolean(run.activeText);
   const entries = renderEntries(messages, run);
+  const now = useActiveNow(run.activeText ? run.activeStartedAt : null);
+  const activeText = formatActiveText(run.activeText, run.activeStartedAt, now);
 
   return (
     <div className="flex min-h-0 flex-1 flex-col gap-3 overflow-y-auto px-4 py-4 sm:px-5">
@@ -55,9 +59,9 @@ export function MessageList({ messages, run }: MessageListProps) {
               <TimelineBubble key={entry.key} item={entry.item} />
             ),
           )}
-          {run.activeText ? (
+          {activeText ? (
             <div className="rounded border border-console-cyan/30 bg-console-cyan/10 px-3 py-2 text-xs text-console-cyan">
-              {run.activeText}
+              {activeText}
             </div>
           ) : null}
         </>
@@ -68,6 +72,32 @@ export function MessageList({ messages, run }: MessageListProps) {
       )}
     </div>
   );
+}
+
+export function formatActiveText(activeText: string, startedAt: number | null, now: number): string {
+  if (!activeText) {
+    return "";
+  }
+  if (startedAt === null) {
+    return activeText;
+  }
+  const elapsed = Math.max(Math.floor((now - startedAt) / 1000), 0);
+  return `${activeText} +${elapsed}s`;
+}
+
+function useActiveNow(startedAt: number | null): number {
+  const [now, setNow] = useState(() => Date.now());
+
+  useEffect(() => {
+    if (startedAt === null) {
+      return undefined;
+    }
+    setNow(Date.now());
+    const timer = window.setInterval(() => setNow(Date.now()), 1000);
+    return () => window.clearInterval(timer);
+  }, [startedAt]);
+
+  return now;
 }
 
 function renderEntries(messages: ChatMessageRecord[], run: RunState): RenderEntry[] {
