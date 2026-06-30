@@ -7,6 +7,8 @@ from typing import Any
 from agentscope.permission import PermissionBehavior, PermissionDecision
 from agentscope.tool import ToolBase
 
+from vla_data_juicer_agents.navigation.execution_tools import create_navigation_execution_tools
+
 
 class HumanDecisionTool(ToolBase):
     """External tool that pauses navigation for a durable human decision."""
@@ -43,3 +45,7 @@ class HumanDecisionTool(ToolBase):
             behavior=PermissionBehavior.ALLOW,
             message="Human decision requests are allowed.",
         )
+
+
+def build_navigation_agent_tools(*, dry_run: bool = False) -> list[Any]:
+    return [HumanDecisionTool(), *create_navigation_execution_tools(dry_run=dry_run)]

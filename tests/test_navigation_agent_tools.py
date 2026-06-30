@@ -2,7 +2,10 @@ import asyncio
 
 from agentscope.permission import PermissionBehavior, PermissionDecision
 
-from vla_data_juicer_agents.navigation.agent_tools import HumanDecisionTool
+from vla_data_juicer_agents.navigation.agent_tools import (
+    HumanDecisionTool,
+    build_navigation_agent_tools,
+)
 
 
 def test_human_decision_tool_declares_external_read_only_schema():
@@ -30,3 +33,22 @@ def test_human_decision_tool_allows_permissions():
 
     assert isinstance(decision, PermissionDecision)
     assert decision.behavior is PermissionBehavior.ALLOW
+
+
+def test_build_navigation_agent_tools_includes_human_decision_and_existing_processing_tools():
+    names = {tool.name for tool in build_navigation_agent_tools(dry_run=True)}
+
+    assert {
+        "request_human_decision",
+        "prepare_raw_data_tool",
+        "extract_and_sync_navigation_data_tool",
+        "run_initial_annotation_gui_tool",
+        "run_tracking_tool",
+    }.issubset(names)
+
+
+def test_build_navigation_agent_tools_does_not_register_old_workflow_control_tools():
+    names = {tool.name for tool in build_navigation_agent_tools(dry_run=True)}
+
+    assert "vla_run_workflow" not in names
+    assert "vla_continue_workflow" not in names
