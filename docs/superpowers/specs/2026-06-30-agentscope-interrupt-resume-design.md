@@ -19,6 +19,7 @@ The selected direction is to reuse AgentScope's App/Service runtime and Redis-ba
 - Stop exposing navigation data processing as a normal tool to the main agent.
 - Preserve the current frontend integration surface in the first phase so the backend agent architecture can stabilize before a full frontend migration.
 - Make user confirmations happen through frontend session-window dialogs instead of requiring typed confirmation text.
+- The implementation plan for this task must cover Phase 1 and Phase 2 of the migration plan: durable AgentScope backend integration and removal of old workflow patching.
 
 ## Non-Goals
 
@@ -26,6 +27,7 @@ The selected direction is to reuse AgentScope's App/Service runtime and Redis-ba
 - Do not fully migrate the frontend to AgentScope's native chat/session/SSE APIs in this phase.
 - Do not make deterministic backend code execute the entire navigation workflow plan step by step.
 - Do not add broad unrelated refactors outside the agent runtime, routing, confirmation, and navigation workflow boundaries.
+- Do not include Phase 3 frontend-native migration in the immediate implementation plan.
 
 ## Current Problems
 
@@ -206,6 +208,8 @@ Expected handling:
 
 ## Migration Plan
 
+The immediate implementation scope for this task is Phase 1 plus Phase 2. Phase 3 is recorded as a future migration direction only.
+
 Phase 1: Durable backend kernel with compatibility frontend
 
 - Add AgentScope App mounting and Redis-backed storage/message bus configuration.
@@ -228,6 +232,8 @@ Phase 3: Frontend native migration
 
 - Move the frontend to AgentScope-native sessions/chat/SSE once backend behavior is stable.
 - Remove the WebSession compatibility layer after the frontend no longer depends on it.
+
+Phase 3 must not be included in the implementation plan for this task.
 
 ## Testing Strategy
 
@@ -261,3 +267,4 @@ Manual integration tests should cover:
 - The existing frontend can still create sessions, send messages, receive agent events, and handle confirmation dialogs.
 - Redis is required for durable server runtime state.
 - The implementation path does not require a full frontend rewrite in the first phase.
+- The completed implementation removes or disables the old workflow patching path covered by Phase 2, not only the new AgentScope compatibility path from Phase 1.
