@@ -21,6 +21,18 @@ class FakeAgentScopeRuntime:
         return self.turn_id
 
 
+class EventingAgentScopeRuntime(FakeAgentScopeRuntime):
+    def __init__(self, events: list[dict]) -> None:
+        super().__init__()
+        self.events = events
+        self.subscriptions: list[str] = []
+
+    async def subscribe_web_session_events(self, *, web_session_id: str):
+        self.subscriptions.append(web_session_id)
+        for event in self.events:
+            yield event
+
+
 class RejectingAgentScopeRuntime(FakeAgentScopeRuntime):
     async def submit_user_message(self, *, web_session_id: str, message: str) -> str:
         self.submissions.append({"web_session_id": web_session_id, "message": message})
@@ -315,6 +327,50 @@ async def test_submit_turn_appends_user_message_calls_runtime_and_returns_turn_i
     detail = store.get_session(session.id)
     assert detail is not None
     assert [(message.role, message.content) for message in detail.messages] == [("user", "开始处理")]
+
+
+@pytest.mark.asyncio
+async def test_forward_events_until_idle_publishes_runtime_events(tmp_path: Path) -> None:
+    event = {
+        "type": "assistant_delta",
+        "source": "NavigationDataAgent",
+        "payload": {"delta": "处理中"},
+    }
+    published = []
+    store = WebSessionStore(tmp_path / "sessions.sqlite")
+    runtime = EventingAgentScopeRuntime([event])
+    manager = AgentScopeWebSessionManager(
+        store=store,
+        runtime=runtime,
+        event_callback=lambda session_id, event: published.append((session_id, event)),
+    )
+    session = await manager.create_session("处理 20270605")
+
+    await manager.forward_events_until_idle(session.id)
+
+    assert runtime.subscriptions == [session.id]
+    assert published == [(session.id, event)]
+
+
+@pytest.mark.asyncio
+async def test_forward_events_until_idle_persists_final_assistant_text(tmp_path: Path) -> None:
+    final_event = {
+        "type": "final",
+        "source": "NavigationDataAgent",
+        "payload": {"text": "处理完成"},
+    }
+    store = WebSessionStore(tmp_path / "sessions.sqlite")
+    runtime = EventingAgentScopeRuntime([final_event])
+    manager = AgentScopeWebSessionManager(store=store, runtime=runtime)
+    session = await manager.create_session("处理 20270605")
+
+    await manager.forward_events_until_idle(session.id)
+
+    detail = store.get_session(session.id)
+    assert detail is not None
+    assert [(message.role, message.content) for message in detail.messages] == [
+        ("assistant", "处理完成")
+    ]
 
 
 @pytest.mark.asyncio

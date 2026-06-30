@@ -47,6 +47,7 @@ def create_app(
 
     database_path = Path(db_path) if db_path is not None else Path(working_dir) / "sessions.sqlite"
     store = WebSessionStore(database_path)
+    bus = SessionEventBus()
     if agentscope_runtime is None:
         manager = WebSessionManager(
             store=store,
@@ -55,8 +56,13 @@ def create_app(
             controller_factory=controller_factory,
         )
     else:
-        manager = AgentScopeWebSessionManager(store=store, runtime=agentscope_runtime)
-    bus = SessionEventBus()
+        manager = AgentScopeWebSessionManager(
+            store=store,
+            runtime=agentscope_runtime,
+            event_callback=lambda session_id, event: asyncio.create_task(
+                bus.publish(session_id, event)
+            ),
+        )
 
     @asynccontextmanager
     async def lifespan(_parent_app: FastAPI):
@@ -130,6 +136,8 @@ def create_app(
             raise HTTPException(status_code=409, detail=str(exc)) from exc
         if agentscope_runtime is None:
             asyncio.create_task(_drain_controller_events(session_id, manager, store, bus))
+        else:
+            asyncio.create_task(manager.forward_events_until_idle(session_id))
         return CreateTurnResponse(turn_id=turn_id)
 
     @app.post("/api/sessions/{session_id}/interrupt", response_model=InterruptResponse)

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 from dataclasses import dataclass, field
+from types import SimpleNamespace
 from typing import Any
 from uuid import uuid4
 
@@ -11,6 +12,8 @@ from agentscope.app.storage import ChatModelConfig, RedisStorage, SessionConfig
 from agentscope.app.workspace_manager import LocalWorkspaceManager
 from agentscope.message import UserMsg
 
+from vla_data_juicer_agents.adapters.agentscope import AgentScopeEventAdapter
+from vla_data_juicer_agents.core.events import CallbackEventSink, EventEmitter
 from vla_data_juicer_agents.navigation.routing import is_high_confidence_navigation_request
 from vla_data_juicer_agents.runtime.agentscope_bootstrap import bootstrap_agentscope_records
 from vla_data_juicer_agents.runtime.agentscope_config import AgentScopeRuntimeConfig
@@ -95,6 +98,36 @@ class AgentScopeRuntime:
             run_coroutine.close()
             raise
         return f"turn_{uuid4()}"
+
+    async def subscribe_web_session_events(self, *, web_session_id: str):
+        mapped = self.web_sessions.get(web_session_id)
+        if mapped is None:
+            return
+
+        _agent_id, agentscope_session_id = mapped
+        queue: asyncio.Queue[dict[str, Any]] = asyncio.Queue()
+        scope = EventEmitter(CallbackEventSink(queue.put_nowait)).scope(
+            "agentscope",
+            run_id=agentscope_session_id,
+        )
+        adapter = AgentScopeEventAdapter(scope)
+
+        async for raw_event in self.message_bus.session_subscribe_events(
+            agentscope_session_id,
+        ):
+            adapter.accept(_to_attribute_event(raw_event))
+            while not queue.empty():
+                yield queue.get_nowait()
+
+
+def _to_attribute_event(value: Any) -> Any:
+    if isinstance(value, dict):
+        return SimpleNamespace(
+            **{key: _to_attribute_event(item) for key, item in value.items()}
+        )
+    if isinstance(value, list):
+        return [_to_attribute_event(item) for item in value]
+    return value
 
 
 def create_agentscope_runtime(config: AgentScopeRuntimeConfig) -> AgentScopeRuntime:
