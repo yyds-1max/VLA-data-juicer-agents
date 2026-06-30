@@ -3,7 +3,7 @@ import json
 from types import SimpleNamespace
 
 import pytest
-from agentscope.event import RequireUserConfirmEvent
+from agentscope.event import RequireExternalExecutionEvent, RequireUserConfirmEvent
 from agentscope.message import ToolCallBlock
 
 from vla_data_juicer_agents.adapters.agentscope.events import (
@@ -124,6 +124,48 @@ def test_tool_result_emits_paired_start_and_end_with_result_state():
     assert [(event["type"], event["payload"]) for event in events] == [
         ("tool_start", {"tool": "inspect", "call_id": "call-1", "args": '{"date": "20270605"}'}),
         ("tool_end", {"tool": "inspect", "call_id": "call-1", "status": "completed", "summary": "Found navigation data. Ready."}),
+    ]
+
+
+def test_require_external_execution_emits_human_decision_required():
+    scope, events = _scope_and_events()
+    adapter = AgentScopeEventAdapter(scope)
+    tool_input = {
+        "decision_type": "camera_params",
+        "request_id": "req-1",
+        "summary": "Confirm fisheye camera parameters.",
+    }
+
+    adapter.accept(
+        RequireExternalExecutionEvent(
+            reply_id="reply-1",
+            tool_calls=[
+                ToolCallBlock(
+                    id="decision-1",
+                    name="request_human_decision",
+                    input=json.dumps(tool_input),
+                )
+            ],
+        )
+    )
+
+    assert len(events) == 1
+    timestamp = events[0]["timestamp"]
+    assert events == [
+        {
+            "type": "human_decision_required",
+            "source": "plan-agent",
+            "run_id": "run-1",
+            "parent_run_id": None,
+            "timestamp": timestamp,
+            "payload": {
+                "reply_id": "reply-1",
+                "tool_call_id": "decision-1",
+                "decision_type": "camera_params",
+                "request_id": "req-1",
+                "summary": "Confirm fisheye camera parameters.",
+            },
+        }
     ]
 
 

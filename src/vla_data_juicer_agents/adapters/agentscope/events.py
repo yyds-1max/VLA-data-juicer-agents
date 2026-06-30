@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import re
 from dataclasses import dataclass, field
+from typing import Any
 
 from vla_data_juicer_agents.core.events import EventScope
 
@@ -114,6 +115,8 @@ class AgentScopeEventAdapter:
                 if error_type:
                     payload["error_type"] = error_type
                 self._scope.emit("tool_end", **payload)
+        elif event_type == "REQUIRE_EXTERNAL_EXECUTION":
+            self._handle_require_external_execution(event)
 
     def close_active_tools(self, status: str) -> None:
         tools = self._tools
@@ -140,6 +143,21 @@ class AgentScopeEventAdapter:
         if normalized in {"success", "completed"} and not _result_payload_failed(result_text):
             return "completed"
         return "failed"
+
+    def _handle_require_external_execution(self, event: object) -> None:
+        reply_id = _text(getattr(event, "reply_id", ""))
+        for tool_call in getattr(event, "tool_calls", []) or []:
+            if _text(getattr(tool_call, "name", "")) != "request_human_decision":
+                continue
+            tool_input = _external_tool_input(getattr(tool_call, "input", {}))
+            self._scope.emit(
+                "human_decision_required",
+                reply_id=reply_id,
+                tool_call_id=_text(getattr(tool_call, "id", "")),
+                decision_type=_text(tool_input.get("decision_type")) or "other",
+                request_id=_text(tool_input.get("request_id")),
+                summary=_text(tool_input.get("summary")),
+            )
 
 
 class ProgressSummaryFilter:
@@ -221,3 +239,15 @@ def _result_payload_error_type(result_text: str) -> str:
     if not error_type and isinstance(payload.get("details"), dict):
         error_type = payload["details"].get("error_type")
     return error_type.strip() if isinstance(error_type, str) else ""
+
+
+def _external_tool_input(value: object) -> dict[str, Any]:
+    if isinstance(value, dict):
+        return value
+    if isinstance(value, str):
+        try:
+            payload = json.loads(value)
+        except json.JSONDecodeError:
+            return {}
+        return payload if isinstance(payload, dict) else {}
+    return {}
