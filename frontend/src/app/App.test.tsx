@@ -217,7 +217,7 @@ beforeEach(() => {
 test("renders the full DataLoop console shell by default", async () => {
   await renderAppWithDashboardSettled();
 
-  expect(screen.getByRole("img", { name: "智瀚星途 logo" })).toHaveAttribute("src", "/brand/wise-explore-favicon.ico");
+  expect(screen.getByRole("img", { name: "智瀚星途 logo" })).toHaveAttribute("src", "/brand/wise-explore-favicon.png");
   expect(screen.getByText("智瀚星途")).toBeVisible();
   expect(screen.getByText("WISEXPLORE")).toBeVisible();
   expect(screen.queryByText("智瀚星途 DataLoop")).not.toBeInTheDocument();

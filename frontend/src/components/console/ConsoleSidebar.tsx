@@ -24,7 +24,7 @@ export function ConsoleSidebar({ activePage, onChange }: ConsoleSidebarProps) {
         <div className="flex h-16 items-center gap-3 md:h-auto md:border-b md:border-console-line md:p-5">
           <div className="flex h-10 w-10 shrink-0 items-center justify-center rounded-lg border border-console-line bg-white p-1.5 shadow-sm">
             <img
-              src="/brand/wise-explore-favicon.ico"
+              src="/brand/wise-explore-favicon.png"
               alt="智瀚星途 logo"
               className="max-h-full max-w-full object-contain"
             />
