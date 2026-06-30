@@ -13,7 +13,7 @@ The selected direction is to reuse AgentScope's App/Service runtime and Redis-ba
 ## Goals
 
 - Use an existing durable agent runtime instead of building a custom workflow engine.
-- Support interrupt/resume as a first-class capability for user confirmations and external execution waits.
+- Support interrupt/resume as a first-class capability for human decisions, user confirmations, and external execution waits.
 - Keep all agents connected to real LLM models. No mock agent may be used in the production execution chain.
 - Replace the two-agent navigation workflow with one dedicated navigation agent using a plan-and-execute plus ReAct working style.
 - Stop exposing navigation data processing as a normal tool to the main agent.
@@ -58,7 +58,7 @@ The service will have three layers:
 3. Domain agents and tools
    - `MainRouterAgent`: a real LLM agent responsible for conversational routing and high-level user intent handling.
    - `NavigationDataAgent`: a real LLM agent dedicated to navigation data processing.
-   - Navigation tools: data inspection, plan management, calibration confirmation request, annotation GUI execution, processing commands, output checks, overwrite/delete confirmation request, and final reporting.
+   - Navigation tools: data inspection, plan management, human decision requests, annotation GUI execution, processing commands, output checks, and final reporting.
 
 ## Routing Design
 
@@ -97,14 +97,21 @@ AgentScope task tools may be used to maintain visible plan/task state, but the L
 
 Interrupt/resume is implemented with AgentScope continuation events rather than custom workflow checkpoint branching.
 
-User confirmation:
+Human decisions:
 
-- Tools that require approval emit AgentScope `RequireUserConfirmEvent`.
-- The related tool call remains persisted in an asking state.
-- The compatibility layer converts the event into a frontend confirmation event.
-- The frontend shows a session-window dialog with clear confirm/cancel actions.
-- The user's choice is sent back to the backend.
-- The backend resumes the same AgentScope session by calling `ChatService.run(...)` with `UserConfirmResultEvent`.
+- Domain-level decisions, such as confirming camera parameters or deciding whether to overwrite outputs, should be modeled as a human-decision tool rather than as raw tool permission approval.
+- The human-decision tool emits an AgentScope durable wait event, preferably through external execution semantics so the frontend can return structured decision data as a tool result.
+- The related tool call remains persisted in a waiting state.
+- Before emitting the decision request, `NavigationDataAgent` must explain the relevant decision context in the conversation, including details such as camera parameters, target output paths, or overwrite/delete impact.
+- The compatibility layer converts the wait event into a frontend confirmation event.
+- The frontend shows a session-window dialog with three controls: confirm, stop, and a text input for guidance.
+- The user's choice or guidance text is sent back to the backend as structured data.
+- The backend resumes the same AgentScope session by calling `ChatService.run(...)` with `ExternalExecutionResultEvent`, allowing the agent to read the decision as a normal tool result and continue reasoning.
+
+Tool permission approval:
+
+- AgentScope `RequireUserConfirmEvent` and `UserConfirmResultEvent` may still be used for simple allow/deny permission checks when no free-form guidance is needed.
+- Production navigation user decisions should use the human-decision tool path so `NavigationDataAgent` can see user guidance in context.
 
 External execution:
 
@@ -129,7 +136,19 @@ The user-confirmed policy is:
 - Failure retry does not require user confirmation.
 - The annotation GUI can be invoked directly and may block until the user finishes annotation.
 
-Confirmation dialogs should include enough context for a safe decision, such as camera parameter values, target output paths, or the list of files/directories to overwrite or delete.
+The confirmation dialog itself should stay generic. It does not need to render domain-specific forms or detailed business data. The decision context should be produced by `NavigationDataAgent` as normal conversation content before the dialog appears.
+
+The dialog supports three user actions:
+
+- Confirm: approve the pending action and resume the agent.
+- Stop: reject the pending action and let the agent stop, summarize, or replan according to the current context.
+- Guidance text: send user-written instructions back as the human-decision tool result so the agent can adjust the plan or ask a more specific follow-up.
+
+The human-decision tool result should use a stable structured shape:
+
+- `action`: one of `confirm`, `stop`, or `guide`.
+- `text`: optional user guidance text. It is required when `action` is `guide`.
+- `request_id`: the frontend/backend correlation ID for the pending decision.
 
 ## LLM and Credential Initialization
 
@@ -154,8 +173,9 @@ The compatibility layer should:
 - Preserve the existing session creation and message submission API shape where practical.
 - Preserve the existing WebSocket/event stream used by the frontend.
 - Translate AgentScope message and tool events into existing frontend event types.
-- Introduce a confirmation-request event that the frontend can render as a modal dialog in the chat window.
-- Accept the confirmation result and resume AgentScope with the matching continuation event.
+- Introduce a confirmation-request event that the frontend can render as a generic modal dialog in the chat window.
+- The modal should expose confirm, stop, and guidance-text submission. Domain-specific context remains in the surrounding conversation messages produced by the agent.
+- Accept the confirmation result or guidance text and resume AgentScope with the matching continuation event. For navigation domain decisions, this should usually be `ExternalExecutionResultEvent` containing a structured decision result.
 - Avoid exposing AgentScope internal IDs unnecessarily, while keeping enough correlation data to resume the correct waiting tool call.
 
 This layer is temporary architecture, but it should still be robust. It prevents frontend migration from blocking the durable agent runtime work.
@@ -191,9 +211,9 @@ Phase 1: Durable backend kernel with compatibility frontend
 - Add AgentScope App mounting and Redis-backed storage/message bus configuration.
 - Add startup bootstrap for real LLM credentials, model configs, and the two core agents.
 - Implement backend routing from compatible web sessions to AgentScope sessions.
-- Convert user messages, agent replies, tool events, confirmation requests, and confirmation results between the current frontend protocol and AgentScope.
+- Convert user messages, agent replies, tool events, human-decision requests, and decision results between the current frontend protocol and AgentScope.
 - Implement `NavigationDataAgent` with plan-and-execute plus ReAct prompting and navigation tools.
-- Replace typed confirmation with AgentScope user confirmation events and frontend dialogs.
+- Replace typed confirmation with AgentScope durable human-decision events and frontend dialogs.
 - Keep existing frontend APIs mostly stable.
 
 Phase 2: Remove old workflow patching
@@ -215,9 +235,10 @@ Backend tests should cover:
 
 - Routing to `NavigationDataAgent` for clear navigation requests.
 - Non-navigation requests staying with `MainRouterAgent`.
-- Camera parameter confirmation creates a pending confirmation event before processing starts.
+- Camera parameter confirmation creates a pending human-decision event before processing starts.
 - Confirming camera parameters resumes the same AgentScope session.
 - Canceling camera parameters stops or replans without starting processing.
+- Supplying guidance text from the confirmation dialog resumes the same pending decision and lets the agent respond or replan.
 - Overwrite/delete confirmation is required before destructive output changes.
 - Tool failure retry can happen without user confirmation.
 - Service restart simulation preserves a pending confirmation through Redis-backed state.
@@ -227,7 +248,7 @@ Backend tests should cover:
 Manual integration tests should cover:
 
 - Start navigation data processing from the existing web UI.
-- See the camera-parameter confirmation dialog.
+- See the agent explain the camera parameters in the conversation, then see the generic confirmation dialog.
 - Confirm and observe processing continue.
 - Trigger annotation GUI and verify the system waits for completion.
 - Reconnect or restart around a pending confirmation and verify the pending state is still recoverable.
@@ -235,7 +256,7 @@ Manual integration tests should cover:
 ## Acceptance Criteria
 
 - Navigation processing no longer depends on custom `pending_workflow` / `continue_workflow` resume logic.
-- A user confirmation pauses the same AgentScope session and resumes through `UserConfirmResultEvent`.
+- A human decision pauses the same AgentScope session and resumes through an AgentScope continuation event, normally `ExternalExecutionResultEvent` for navigation-domain decisions.
 - MainRouterAgent and NavigationDataAgent both use real configured LLM models.
 - The existing frontend can still create sessions, send messages, receive agent events, and handle confirmation dialogs.
 - Redis is required for durable server runtime state.
