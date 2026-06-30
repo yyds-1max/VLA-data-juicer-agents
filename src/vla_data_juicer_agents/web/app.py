@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import inspect
+import logging
 import os
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -29,6 +30,8 @@ from vla_data_juicer_agents.web.agent_session import AgentScopeWebSessionManager
 from vla_data_juicer_agents.web.session_manager import ControllerFactory, WebSessionManager
 from vla_data_juicer_agents.web.session_store import WebSessionStore
 
+logger = logging.getLogger(__name__)
+
 
 def create_app(
     working_dir: str | None = None,
@@ -48,6 +51,10 @@ def create_app(
     database_path = Path(db_path) if db_path is not None else Path(working_dir) / "sessions.sqlite"
     store = WebSessionStore(database_path)
     bus = SessionEventBus()
+
+    async def publish_session_event(session_id: str, event: dict[str, Any]) -> None:
+        await bus.publish(session_id, event)
+
     if agentscope_runtime is None:
         manager = WebSessionManager(
             store=store,
@@ -59,9 +66,7 @@ def create_app(
         manager = AgentScopeWebSessionManager(
             store=store,
             runtime=agentscope_runtime,
-            event_callback=lambda session_id, event: asyncio.create_task(
-                bus.publish(session_id, event)
-            ),
+            event_callback=publish_session_event,
         )
 
     @asynccontextmanager
@@ -135,9 +140,15 @@ def create_app(
         except RuntimeError as exc:
             raise HTTPException(status_code=409, detail=str(exc)) from exc
         if agentscope_runtime is None:
-            asyncio.create_task(_drain_controller_events(session_id, manager, store, bus))
+            _create_logged_task(
+                _drain_controller_events(session_id, manager, store, bus),
+                name=f"controller-events:{session_id}",
+            )
         else:
-            asyncio.create_task(manager.forward_events_until_idle(session_id))
+            _create_logged_task(
+                manager.forward_events_until_idle(session_id),
+                name=f"agentscope-events:{session_id}",
+            )
         return CreateTurnResponse(turn_id=turn_id)
 
     @app.post("/api/sessions/{session_id}/interrupt", response_model=InterruptResponse)
@@ -182,6 +193,21 @@ async def _maybe_await(value: Any) -> Any:
     if inspect.isawaitable(value):
         return await value
     return value
+
+
+def _create_logged_task(coroutine: Any, *, name: str) -> asyncio.Task:
+    task = asyncio.create_task(coroutine, name=name)
+    task.add_done_callback(_log_background_task_failure)
+    return task
+
+
+def _log_background_task_failure(task: asyncio.Task) -> None:
+    try:
+        task.result()
+    except asyncio.CancelledError:
+        return
+    except Exception:
+        logger.exception("Background task failed: %s", task.get_name())
 
 
 def _raise_navigation_http_error(exc: ValueError | FileNotFoundError) -> None:

@@ -1,3 +1,4 @@
+import asyncio
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -64,11 +65,23 @@ class FakeAgentScopeMessageBus:
         self.live_events = live_events or []
         self.running_states = running_states or []
         self.read_sessions: list[str] = []
+        self.read_since: list[str | None] = []
         self.subscribe_keys: list[str] = []
 
-    async def session_read_events(self, session_id: str):
+    async def session_read_events(self, session_id: str, since=None):
         self.read_sessions.append(session_id)
-        return self.replay_events
+        self.read_since.append(since)
+        if since is None:
+            return self.replay_events
+        try:
+            cursor_index = next(
+                index
+                for index, (entry_id, _event) in enumerate(self.replay_events)
+                if entry_id == since
+            )
+        except StopIteration:
+            return self.replay_events
+        return self.replay_events[cursor_index + 1:]
 
     async def subscribe(self, key: str, *, on_ready=None):
         self.subscribe_keys.append(key)
@@ -332,6 +345,28 @@ async def test_runtime_submit_user_message_duplicate_active_run_raises() -> None
 
 
 @pytest.mark.asyncio
+async def test_runtime_submit_user_message_advances_event_cursor_before_spawn() -> None:
+    message_bus = FakeAgentScopeMessageBus(
+        replay_events=[
+            ("1-0", {"type": "TEXT_BLOCK_DELTA", "delta": "旧"}),
+            ("2-0", {"type": "REPLY_END"}),
+        ],
+    )
+    chat_run_registry = FakeChatRunRegistry()
+    runtime = _runtime(chat_run_registry=chat_run_registry, message_bus=message_bus)
+
+    await runtime.submit_user_message(web_session_id="web-1", message="你好")
+
+    assert message_bus.read_sessions == ["web-1__main-router-agent"]
+    assert message_bus.read_since == [None]
+    assert runtime.event_cursors == {"web-1__main-router-agent": "2-0"}
+    assert [spawn["session_id"] for spawn in chat_run_registry.spawns] == [
+        "web-1__main-router-agent"
+    ]
+    await chat_run_registry.drain()
+
+
+@pytest.mark.asyncio
 async def test_runtime_subscribe_web_session_events_replays_dedupes_and_finishes() -> None:
     text_event = {"type": "TEXT_BLOCK_DELTA", "delta": "处理"}
     final_event = {"type": "REPLY_END"}
@@ -358,6 +393,48 @@ async def test_runtime_subscribe_web_session_events_replays_dedupes_and_finishes
     assert [(event["type"], event["payload"]) for event in events] == [
         ("assistant_delta", {"delta": "处理"}),
         ("final", {"text": "处理"}),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_runtime_event_cursor_skips_previous_turn_replay_for_same_agentscope_session() -> None:
+    old_text = {"type": "TEXT_BLOCK_DELTA", "delta": "旧"}
+    old_final = {"type": "REPLY_END"}
+    new_text = {"type": "TEXT_BLOCK_DELTA", "delta": "新"}
+    new_final = {"type": "REPLY_END"}
+    message_bus = FakeAgentScopeMessageBus(
+        replay_events=[
+            ("1-0", old_text),
+            ("2-0", old_final),
+        ],
+        running_states=[False, False],
+    )
+    runtime = _runtime(message_bus=message_bus)
+    runtime.web_sessions["web-1"] = ("navigation-data-agent", "as-session-1")
+
+    first_events = [
+        event
+        async for event in runtime.subscribe_web_session_events(web_session_id="web-1")
+    ]
+    message_bus.replay_events = [
+        ("1-0", old_text),
+        ("2-0", old_final),
+        ("3-0", new_text),
+        ("4-0", new_final),
+    ]
+    second_events = [
+        event
+        async for event in runtime.subscribe_web_session_events(web_session_id="web-1")
+    ]
+
+    assert message_bus.read_since == [None, "2-0"]
+    assert [(event["type"], event["payload"]) for event in first_events] == [
+        ("assistant_delta", {"delta": "旧"}),
+        ("final", {"text": "旧"}),
+    ]
+    assert [(event["type"], event["payload"]) for event in second_events] == [
+        ("assistant_delta", {"delta": "新"}),
+        ("final", {"text": "新"}),
     ]
 
 
@@ -413,6 +490,33 @@ async def test_forward_events_until_idle_publishes_runtime_events(tmp_path: Path
     await manager.forward_events_until_idle(session.id)
 
     assert runtime.subscriptions == [session.id]
+    assert published == [(session.id, event)]
+
+
+@pytest.mark.asyncio
+async def test_forward_events_until_idle_awaits_async_event_callback(tmp_path: Path) -> None:
+    event = {
+        "type": "assistant_delta",
+        "source": "NavigationDataAgent",
+        "payload": {"delta": "处理中"},
+    }
+    published = []
+
+    async def publish(session_id: str, event: dict) -> None:
+        await asyncio.sleep(0)
+        published.append((session_id, event))
+
+    store = WebSessionStore(tmp_path / "sessions.sqlite")
+    runtime = EventingAgentScopeRuntime([event])
+    manager = AgentScopeWebSessionManager(
+        store=store,
+        runtime=runtime,
+        event_callback=publish,
+    )
+    session = await manager.create_session("处理 20270605")
+
+    await manager.forward_events_until_idle(session.id)
+
     assert published == [(session.id, event)]
 
 

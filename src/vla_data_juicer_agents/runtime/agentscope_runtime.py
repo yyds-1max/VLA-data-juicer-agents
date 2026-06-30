@@ -31,6 +31,7 @@ class AgentScopeRuntime:
     workspace_manager: Any
     app: Any
     web_sessions: dict[str, tuple[str, str]] = field(default_factory=dict)
+    event_cursors: dict[str, str | None] = field(default_factory=dict)
     bootstrapped: bool = False
 
     def __post_init__(self) -> None:
@@ -90,6 +91,7 @@ class AgentScopeRuntime:
             agent_id=agent_id,
             model=model,
         )
+        await self._advance_event_cursor_to_log_tail(session_id)
         run_coroutine = chat_service.run(
             user_id=self.config.user_id,
             session_id=session_id,
@@ -102,6 +104,17 @@ class AgentScopeRuntime:
             run_coroutine.close()
             raise
         return f"turn_{uuid4()}"
+
+    async def _advance_event_cursor_to_log_tail(self, agentscope_session_id: str) -> None:
+        read_events = getattr(self.message_bus, "session_read_events", None)
+        if read_events is None:
+            return
+        entries = await read_events(
+            agentscope_session_id,
+            since=self.event_cursors.get(agentscope_session_id),
+        )
+        if entries:
+            self._remember_event_cursor(agentscope_session_id, entries[-1][0])
 
     async def subscribe_web_session_events(self, *, web_session_id: str):
         mapped = self.web_sessions.get(web_session_id)
@@ -154,10 +167,15 @@ class AgentScopeRuntime:
             with suppress(TimeoutError):
                 await asyncio.wait_for(live_ready.wait(), timeout=_EVENT_STARTUP_GRACE_SECS)
 
+            cursor = self.event_cursors.get(agentscope_session_id)
             for entry_id, raw_event in await self.message_bus.session_read_events(
                 agentscope_session_id,
+                since=cursor,
             ):
+                if not self._is_new_event(agentscope_session_id, entry_id):
+                    continue
                 seen_entry_ids.add(entry_id)
+                self._remember_event_cursor(agentscope_session_id, entry_id)
                 saw_event = True
                 if _raw_event_type(raw_event) == "REPLY_END":
                     saw_reply_end = True
@@ -182,7 +200,10 @@ class AgentScopeRuntime:
                     if entry_id and entry_id in seen_entry_ids:
                         continue
                     if entry_id:
+                        if not self._is_new_event(agentscope_session_id, entry_id):
+                            continue
                         seen_entry_ids.add(entry_id)
+                        self._remember_event_cursor(agentscope_session_id, entry_id)
                     saw_event = True
                     if _raw_event_type(raw_event) == "REPLY_END":
                         saw_reply_end = True
@@ -203,6 +224,14 @@ class AgentScopeRuntime:
             feeder_task.cancel()
             with suppress(asyncio.CancelledError):
                 await feeder_task
+
+    def _is_new_event(self, agentscope_session_id: str, entry_id: str) -> bool:
+        cursor = self.event_cursors.get(agentscope_session_id)
+        return cursor is None or _stream_id_is_newer(entry_id, cursor)
+
+    def _remember_event_cursor(self, agentscope_session_id: str, entry_id: str) -> None:
+        if self._is_new_event(agentscope_session_id, entry_id):
+            self.event_cursors[agentscope_session_id] = entry_id
 
 
 def _to_attribute_event(value: Any) -> Any:
@@ -236,6 +265,22 @@ def _raw_event_entry_id(event: dict[str, Any]) -> str | None:
 def _raw_event_type(event: dict[str, Any]) -> str:
     event_type = event.get("type")
     return str(event_type) if event_type is not None else ""
+
+
+def _stream_id_is_newer(entry_id: str, cursor: str) -> bool:
+    entry_parts = _stream_id_parts(entry_id)
+    cursor_parts = _stream_id_parts(cursor)
+    if entry_parts is None or cursor_parts is None:
+        return entry_id > cursor
+    return entry_parts > cursor_parts
+
+
+def _stream_id_parts(entry_id: str) -> tuple[int, int] | None:
+    try:
+        first, second = entry_id.split("-", 1)
+        return int(first), int(second)
+    except ValueError:
+        return None
 
 
 def create_agentscope_runtime(config: AgentScopeRuntimeConfig) -> AgentScopeRuntime:

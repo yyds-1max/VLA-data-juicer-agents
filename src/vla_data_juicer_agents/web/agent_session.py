@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import inspect
 from collections.abc import Callable
 from typing import Any
 from uuid import uuid4
@@ -7,7 +8,7 @@ from uuid import uuid4
 from vla_data_juicer_agents.web.schemas import SessionRecord, generate_session_title
 from vla_data_juicer_agents.web.session_store import WebSessionStore
 
-EventCallback = Callable[[str, dict[str, Any]], None]
+EventCallback = Callable[[str, dict[str, Any]], Any]
 
 
 class AgentScopeWebSessionManager:
@@ -52,7 +53,9 @@ class AgentScopeWebSessionManager:
         persisted_final_texts: set[str] = set()
         async for event in subscribe_events(web_session_id=session_id):
             if self._event_callback is not None:
-                self._event_callback(session_id, event)
+                callback_result = self._event_callback(session_id, event)
+                if inspect.isawaitable(callback_result):
+                    await callback_result
             text = _final_event_text(event)
             if text is not None and text not in persisted_final_texts:
                 self._store.append_message(session_id, role="assistant", content=text)
