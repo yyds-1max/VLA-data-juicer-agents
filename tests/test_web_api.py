@@ -164,6 +164,27 @@ def test_frontend_assets_served_when_assets_dir_exists(tmp_path: Path):
     }
 
 
+def test_frontend_brand_assets_served_when_brand_dir_exists(tmp_path: Path):
+    dist = tmp_path / "dist"
+    brand = dist / "brand"
+    brand.mkdir(parents=True)
+    (dist / "index.html").write_text("<!doctype html>", encoding="utf-8")
+    (brand / "logo.png").write_bytes(b"fake-png")
+    app = create_app(
+        working_dir=str(tmp_path / ".djx"),
+        db_path=tmp_path / "sessions.sqlite",
+        controller_factory=FakeController,
+        frontend_dist=dist,
+    )
+    client = TestClient(app)
+
+    response = client.get("/brand/logo.png")
+
+    assert response.status_code == 200
+    assert response.content == b"fake-png"
+    assert response.headers["content-type"].split(";")[0] == "image/png"
+
+
 def test_frontend_dist_without_index_leaves_root_404_and_api_available(tmp_path: Path):
     dist = tmp_path / "dist"
     dist.mkdir()

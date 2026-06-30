@@ -136,6 +136,10 @@ def create_app(
             if assets_path.exists():
                 app.mount("/assets", StaticFiles(directory=assets_path), name="frontend-assets")
 
+            brand_path = frontend_path / "brand"
+            if brand_path.exists():
+                app.mount("/brand", StaticFiles(directory=brand_path), name="frontend-brand")
+
             index_path = frontend_path / "index.html"
             if index_path.exists():
                 @app.get("/", include_in_schema=False)
