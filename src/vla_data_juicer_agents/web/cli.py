@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import os
+import sys
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -30,6 +31,26 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def _agentscope_runtime_from_env(working_dir: str):
+    enabled = os.environ.get("VLA_AGENT_ENABLE_AGENTSCOPE")
+    if enabled is not None and enabled.strip().lower() in {"0", "false"}:
+        return None
+
+    from vla_data_juicer_agents.runtime.agentscope_config import AgentScopeRuntimeConfig
+    from vla_data_juicer_agents.runtime.agentscope_runtime import create_agentscope_runtime
+
+    config = AgentScopeRuntimeConfig.from_env(workspace_root=working_dir)
+    return create_agentscope_runtime(config)
+
+
+def create_cli_app():
+    from vla_data_juicer_agents.web.app import create_app
+
+    working_dir = os.environ.get("VLA_DATA_AGENT_WEB_WORKING_DIR", "./.djx")
+    runtime = _agentscope_runtime_from_env(working_dir)
+    return create_app(agentscope_runtime=runtime)
+
+
 def main(argv: list[str] | None = None) -> int:
     import uvicorn
 
@@ -44,8 +65,15 @@ def main(argv: list[str] | None = None) -> int:
         os.environ.pop("VLA_DATA_AGENT_WEB_FRONTEND_DIST", None)
     else:
         os.environ["VLA_DATA_AGENT_WEB_FRONTEND_DIST"] = args.frontend_dist
+
+    try:
+        _agentscope_runtime_from_env(args.working_dir)
+    except RuntimeError as exc:
+        print(f"AgentScope runtime configuration failed: {exc}", file=sys.stderr)
+        return 2
+
     uvicorn.run(
-        "vla_data_juicer_agents.web.app:create_app",
+        "vla_data_juicer_agents.web.cli:create_cli_app",
         factory=True,
         host=args.host,
         port=args.port,

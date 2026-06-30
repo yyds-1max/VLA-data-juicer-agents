@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import inspect
 import time
+from contextlib import asynccontextmanager
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from types import SimpleNamespace
@@ -117,6 +118,65 @@ def test_create_app_mounts_agentscope_when_runtime_factory_provided(tmp_path: Pa
 
     assert "/api/agentscope" in [route.path for route in app.routes]
     assert app.state.agentscope_runtime is fake_runtime
+
+
+def test_create_app_enters_agentscope_sub_app_lifespan(tmp_path: Path):
+    events = []
+
+    @asynccontextmanager
+    async def lifespan(sub_app: FastAPI):
+        events.append("startup")
+        sub_app.state.ready = True
+        yield
+        events.append("shutdown")
+
+    sub_app = FastAPI(lifespan=lifespan)
+    runtime = SimpleNamespace(
+        app=sub_app,
+        config=SimpleNamespace(agentscope_mount_path="/api/agentscope"),
+    )
+    app = create_app(
+        working_dir=str(tmp_path / ".djx"),
+        db_path=tmp_path / "sessions.sqlite",
+        controller_factory=FakeController,
+        agentscope_runtime=runtime,
+    )
+
+    with TestClient(app):
+        assert sub_app.state.ready is True
+        assert events == ["startup"]
+
+    assert events == ["startup", "shutdown"]
+
+
+def test_create_app_uses_agentscope_session_manager_when_runtime_present(tmp_path: Path):
+    class FakeRuntime:
+        def __init__(self) -> None:
+            self.app = FastAPI()
+            self.config = SimpleNamespace(agentscope_mount_path="/api/agentscope")
+            self.submitted = []
+
+        async def submit_user_message(self, *, web_session_id: str, message: str) -> str:
+            self.submitted.append((web_session_id, message))
+            return "turn-agent-1"
+
+    runtime = FakeRuntime()
+    FakeController.created = []
+    app = create_app(
+        working_dir=str(tmp_path / ".djx"),
+        db_path=tmp_path / "sessions.sqlite",
+        controller_factory=FakeController,
+        agentscope_runtime=runtime,
+    )
+    client = TestClient(app)
+
+    session_id = _create_session(client)
+    response = client.post(f"/api/sessions/{session_id}/turns", json={"message": "开始处理"})
+
+    assert response.status_code == 200
+    assert response.json()["turn_id"] == "turn-agent-1"
+    assert FakeController.created == []
+    assert runtime.submitted == [(session_id, "开始处理")]
 
 
 def test_create_app_keeps_legacy_controller_when_agentscope_runtime_missing(tmp_path: Path):

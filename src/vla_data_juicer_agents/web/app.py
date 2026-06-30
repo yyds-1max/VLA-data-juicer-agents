@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import asyncio
+import inspect
 import os
+from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any
 
@@ -23,6 +25,7 @@ from vla_data_juicer_agents.web.schemas import (
     CreateTurnResponse,
     InterruptResponse,
 )
+from vla_data_juicer_agents.web.agent_session import AgentScopeWebSessionManager
 from vla_data_juicer_agents.web.session_manager import ControllerFactory, WebSessionManager
 from vla_data_juicer_agents.web.session_store import WebSessionStore
 
@@ -44,15 +47,27 @@ def create_app(
 
     database_path = Path(db_path) if db_path is not None else Path(working_dir) / "sessions.sqlite"
     store = WebSessionStore(database_path)
-    manager = WebSessionManager(
-        store=store,
-        working_dir=working_dir,
-        model=model,
-        controller_factory=controller_factory,
-    )
+    if agentscope_runtime is None:
+        manager = WebSessionManager(
+            store=store,
+            working_dir=working_dir,
+            model=model,
+            controller_factory=controller_factory,
+        )
+    else:
+        manager = AgentScopeWebSessionManager(store=store, runtime=agentscope_runtime)
     bus = SessionEventBus()
 
-    app = FastAPI(title="DataPilot Web API")
+    @asynccontextmanager
+    async def lifespan(_parent_app: FastAPI):
+        if agentscope_runtime is None:
+            yield
+            return
+
+        async with agentscope_runtime.app.router.lifespan_context(agentscope_runtime.app):
+            yield
+
+    app = FastAPI(title="DataPilot Web API", lifespan=lifespan)
     app.state.store = store
     app.state.manager = manager
     app.state.bus = bus
@@ -63,7 +78,7 @@ def create_app(
 
     @app.post("/api/sessions", response_model=CreateSessionResponse)
     async def create_session(request: CreateTurnRequest) -> CreateSessionResponse:
-        session = manager.create_session(request.message)
+        session = await _maybe_await(manager.create_session(request.message))
         return CreateSessionResponse(session=session)
 
     @app.get("/api/sessions")
@@ -108,18 +123,19 @@ def create_app(
     @app.post("/api/sessions/{session_id}/turns", response_model=CreateTurnResponse)
     async def submit_turn(session_id: str, request: CreateTurnRequest) -> CreateTurnResponse:
         try:
-            turn_id = manager.submit_turn(session_id, request.message)
+            turn_id = await _maybe_await(manager.submit_turn(session_id, request.message))
         except KeyError as exc:
             raise HTTPException(status_code=404, detail="Session not found") from exc
         except RuntimeError as exc:
             raise HTTPException(status_code=409, detail=str(exc)) from exc
-        asyncio.create_task(_drain_controller_events(session_id, manager, store, bus))
+        if agentscope_runtime is None:
+            asyncio.create_task(_drain_controller_events(session_id, manager, store, bus))
         return CreateTurnResponse(turn_id=turn_id)
 
     @app.post("/api/sessions/{session_id}/interrupt", response_model=InterruptResponse)
     async def interrupt(session_id: str) -> InterruptResponse:
         try:
-            interrupted = manager.interrupt(session_id)
+            interrupted = await _maybe_await(manager.interrupt(session_id))
         except KeyError as exc:
             raise HTTPException(status_code=404, detail="Session not found") from exc
         return InterruptResponse(interrupted=interrupted)
@@ -152,6 +168,12 @@ def create_app(
                     return FileResponse(index_path)
 
     return app
+
+
+async def _maybe_await(value: Any) -> Any:
+    if inspect.isawaitable(value):
+        return await value
+    return value
 
 
 def _raise_navigation_http_error(exc: ValueError | FileNotFoundError) -> None:
