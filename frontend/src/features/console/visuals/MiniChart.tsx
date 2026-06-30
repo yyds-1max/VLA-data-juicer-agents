@@ -18,6 +18,7 @@ type DonutChartProps = {
   title: string;
   data: DonutDatum[];
   className?: string;
+  progress?: number;
 };
 
 type LineChartProps = {
@@ -64,8 +65,30 @@ function describeArc(cx: number, cy: number, radius: number, startAngle: number,
   return ["M", start.x, start.y, "A", radius, radius, 0, largeArcFlag, 0, end.x, end.y].join(" ");
 }
 
-function formatDonutTotal(total: number) {
-  return Number.isInteger(total) ? `${total}%` : `${total.toFixed(1)}%`;
+function formatDonutValue(value: number) {
+  return value.toLocaleString("en-US", { maximumFractionDigits: Number.isInteger(value) ? 0 : 1 });
+}
+
+function clampProgress(progress: number | undefined) {
+  if (progress === undefined || !Number.isFinite(progress)) {
+    return 1;
+  }
+
+  return Math.min(1, Math.max(0, progress));
+}
+
+function animateDonutValue(value: number, progress: number) {
+  const roundedValue = Math.max(0, Math.round(value));
+
+  if (roundedValue === 0) {
+    return 0;
+  }
+
+  if (progress >= 1) {
+    return roundedValue;
+  }
+
+  return Math.min(roundedValue, Math.max(1, Math.round(roundedValue * progress)));
 }
 
 function chartScale(values: Array<number | null>) {
@@ -96,21 +119,27 @@ function toLinePath(data: SeriesChart) {
     .join(" ");
 }
 
-function DonutChart({ title, data, className }: DonutChartProps) {
+function DonutChart({ title, data, className, progress: rawProgress }: DonutChartProps) {
+  const progress = clampProgress(rawProgress);
   const visibleSegments = data.filter((item) => item.value > 0);
   const total = visibleSegments.reduce((sum, item) => sum + item.value, 0);
+  const displayedTotal = animateDonutValue(total, progress);
   let cursor = 0;
 
   return (
     <div className={cn("grid gap-4 sm:grid-cols-[12rem_1fr] sm:items-center", className)}>
       <svg role="img" aria-label={title} viewBox="0 0 180 180" className="mx-auto h-44 w-44">
         <circle cx="90" cy="90" r="58" fill="none" stroke="rgba(148,163,184,0.16)" strokeWidth="24" />
-        {total > 0
+        {total > 0 && progress > 0
           ? visibleSegments.map((item) => {
               const start = cursor;
-              const angle = (item.value / total) * 360;
+              const angle = (item.value / total) * 360 * progress;
               const end = start + angle;
               cursor = end;
+
+              if (angle <= 0) {
+                return null;
+              }
 
               if (angle >= 360) {
                 return (
@@ -142,10 +171,10 @@ function DonutChart({ title, data, className }: DonutChartProps) {
             })
           : null}
         <text x="90" y="84" textAnchor="middle" className="fill-console-text text-lg font-semibold">
-          {formatDonutTotal(total)}
+          {formatDonutValue(displayedTotal)}
         </text>
         <text x="90" y="105" textAnchor="middle" className="fill-console-muted text-[10px]">
-          distribution
+          总数
         </text>
       </svg>
 
@@ -156,7 +185,7 @@ function DonutChart({ title, data, className }: DonutChartProps) {
               <span className="h-2.5 w-2.5 shrink-0 rounded-full" style={{ backgroundColor: item.color }} />
               <span className="truncate">{item.label}</span>
             </span>
-            <span className="font-medium text-console-text">{item.value}%</span>
+            <span className="font-medium text-console-text">{formatDonutValue(animateDonutValue(item.value, progress))}</span>
           </div>
         ))}
       </div>

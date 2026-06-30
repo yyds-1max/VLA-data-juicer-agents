@@ -62,6 +62,27 @@ function deferred<T>() {
   return { promise, resolve, reject };
 }
 
+function mockScrollableElement(element: HTMLElement) {
+  Object.defineProperty(element, "clientHeight", { configurable: true, value: 100 });
+  Object.defineProperty(element, "scrollHeight", { configurable: true, value: 220 });
+  Object.defineProperty(element, "clientWidth", { configurable: true, value: 100 });
+  Object.defineProperty(element, "scrollWidth", { configurable: true, value: 220 });
+  element.getBoundingClientRect = vi.fn(
+    () =>
+      ({
+        bottom: 100,
+        height: 100,
+        left: 0,
+        right: 100,
+        toJSON: () => ({}),
+        top: 0,
+        width: 100,
+        x: 0,
+        y: 0,
+      }) as DOMRect,
+  );
+}
+
 async function renderAppWithDashboardSettled() {
   const result = render(<App />);
 
@@ -196,8 +217,11 @@ beforeEach(() => {
 test("renders the full DataLoop console shell by default", async () => {
   await renderAppWithDashboardSettled();
 
-  expect(screen.getByText("智瀚星途 DataLoop")).toBeVisible();
-  expect(screen.getByText("Voyager Forge")).toBeVisible();
+  expect(screen.getByRole("img", { name: "智瀚星途 logo" })).toHaveAttribute("src", "/brand/wise-explore-favicon.ico");
+  expect(screen.getByText("智瀚星途")).toBeVisible();
+  expect(screen.getByText("WISEXPLORE")).toBeVisible();
+  expect(screen.queryByText("智瀚星途 DataLoop")).not.toBeInTheDocument();
+  expect(screen.queryByText("Voyager Forge")).not.toBeInTheDocument();
   expect(screen.getByText("智瀚星途数据处理系统")).toBeVisible();
   expect(screen.queryByText("Mock workspace")).not.toBeInTheDocument();
   expect(screen.queryByText("frontend only")).not.toBeInTheDocument();
@@ -215,6 +239,9 @@ test("dashboard renders navigation dataset summary metrics and distribution", as
   expect(screen.getByText("数据类型分布")).toBeVisible();
   expect(screen.getByText("同步图像帧")).toBeVisible();
   expect(screen.getByText("同步点云帧")).toBeVisible();
+  expect(screen.getByText("总数")).toBeVisible();
+  expect(screen.getByText("3")).toBeVisible();
+  expect(screen.queryByText("3%")).not.toBeInTheDocument();
   expect(screen.getByText("数据闭环流程")).toBeVisible();
   expect(screen.getByText("最近活动")).toBeVisible();
 });
@@ -246,9 +273,42 @@ test("data management renders navigation dataset date and clip details", async (
   expect(screen.getByText("日期批次")).toBeVisible();
   expect(screen.getByText("原始 clip")).toBeVisible();
   expect(screen.getByText("已同步 clip")).toBeVisible();
+  expect(screen.getByTestId("navigation-summary-strip")).toHaveClass("bg-transparent");
+  expect(screen.getByTestId("navigation-summary-strip")).not.toHaveClass("rounded-lg", "border", "shadow-sm");
+  expect(screen.getByTestId("navigation-summary-strip")).toHaveTextContent("总采集时长3.5 秒");
+  expect(screen.getByTestId("navigation-summary-strip")).toHaveTextContent("同步图像帧3");
+  expect(screen.getByTestId("navigation-process-overview")).toHaveTextContent("raw_data");
+  expect(screen.getByTestId("navigation-process-overview")).toHaveTextContent("sync_data");
+  expect(screen.getByTestId("navigation-process-overview").innerHTML).not.toContain("bg-console-panel2/70 p-3");
+  expect(screen.getByTestId("navigation-process-stepper")).toBeVisible();
+  expect(screen.getAllByTestId("navigation-process-step")).toHaveLength(3);
+  expect(screen.getByRole("columnheader", { name: "clip 数" })).toBeVisible();
+  expect(screen.getByRole("columnheader", { name: "raw 消息" })).toBeVisible();
+  expect(screen.getByTestId("navigation-dataset-scroll")).toHaveClass("console-soft-scrollbar", "max-h-[62vh]", "overflow-auto", "pb-3");
+  const datasetScroll = screen.getByTestId("navigation-dataset-scroll");
+  mockScrollableElement(datasetScroll);
+
+  fireEvent.pointerMove(datasetScroll, { clientX: 40, clientY: 40 });
+  expect(datasetScroll).not.toHaveClass("is-scrollbar-vertical-near");
+  expect(datasetScroll).not.toHaveClass("is-scrollbar-horizontal-near");
+
+  fireEvent.pointerMove(datasetScroll, { clientX: 96, clientY: 40 });
+  expect(datasetScroll).toHaveClass("is-scrollbar-vertical-near");
+  expect(datasetScroll).not.toHaveClass("is-scrollbar-horizontal-near");
+
+  fireEvent.pointerLeave(datasetScroll);
+  expect(datasetScroll).not.toHaveClass("is-scrollbar-vertical-near");
+  expect(datasetScroll).not.toHaveClass("is-scrollbar-horizontal-near");
+
+  fireEvent.pointerMove(datasetScroll, { clientX: 40, clientY: 96 });
+  expect(datasetScroll).not.toHaveClass("is-scrollbar-vertical-near");
+  expect(datasetScroll).toHaveClass("is-scrollbar-horizontal-near");
 
   fireEvent.click(screen.getByRole("button", { name: "展开 20270515" }));
 
+  expect(screen.getByRole("columnheader", { name: "clip 名称" })).toBeVisible();
+  expect(screen.getByRole("columnheader", { name: "topic 摘要" })).toBeVisible();
+  expect(screen.getByTestId("navigation-clip-scroll")).toHaveClass("console-soft-scrollbar", "max-h-80", "overflow-auto");
   expect(screen.getByText("clip_a")).toBeVisible();
   expect(screen.getAllByText("已同步").length).toBeGreaterThan(0);
   expect(screen.getByRole("button", { name: "查看 clip_a 同步图像" })).toBeEnabled();
@@ -351,6 +411,25 @@ test("data management filters navigation dates by status", async () => {
   expect(screen.queryByText("20270515")).not.toBeInTheDocument();
 });
 
+test("data management filter menus close when clicking outside", async () => {
+  await renderAppWithDashboardSettled();
+
+  fireEvent.click(screen.getByRole("button", { name: "数据管理" }));
+  await screen.findByRole("tab", { name: "导航数据" });
+
+  fireEvent.click(screen.getByRole("button", { name: "全部场景" }));
+  expect(screen.getByRole("option", { name: "室外导航" })).toBeVisible();
+
+  fireEvent.pointerDown(screen.getByPlaceholderText("按日期或 clip 搜索"));
+  expect(screen.queryByRole("option", { name: "室外导航" })).not.toBeInTheDocument();
+
+  fireEvent.click(screen.getByRole("button", { name: "全部状态" }));
+  expect(screen.getByRole("option", { name: "待处理" })).toBeVisible();
+
+  fireEvent.pointerDown(screen.getByRole("heading", { name: "数据管理" }));
+  expect(screen.queryByRole("option", { name: "待处理" })).not.toBeInTheDocument();
+});
+
 test("data management search suggests dates and expands matching clips", async () => {
   apiMocks.getNavigationDatasetSummary.mockResolvedValue({
     totals: {
@@ -403,8 +482,10 @@ test("data management search suggests dates and expands matching clips", async (
 
   expect(searchInput).toHaveValue("20260515_102948");
   expect(screen.getByText("20270515")).toBeVisible();
+  expect(screen.getByRole("columnheader", { name: "clip 名称" })).toBeVisible();
   expect(screen.getByText("20260515_102948")).toBeVisible();
-  expect(screen.getByText("匹配")).toBeVisible();
+  expect(screen.getByText("20260515_102948").closest("tr")).toHaveClass("bg-console-cyan/10");
+  expect(screen.queryByText("匹配")).not.toBeInTheDocument();
 });
 
 test("navigation dataset summary is reused while switching console pages", async () => {

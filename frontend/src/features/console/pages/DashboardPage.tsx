@@ -6,6 +6,14 @@ import { ConsoleCard } from "../../../components/console/ConsoleCard";
 import { MetricCard } from "../../../components/console/MetricCard";
 import { SegmentedTabs } from "../../../components/console/SegmentedTabs";
 import { StatusTag } from "../../../components/console/StatusTag";
+import {
+  animateInteger,
+  formatAnimatedCompactNumber,
+  formatAnimatedDuration,
+  formatAnimatedTotalDataDetail,
+  formatAnimatedVersion,
+  useAnimatedProgress,
+} from "../dashboardAnimation";
 import { useNavigationDatasetSummary } from "../navigationDatasetSummaryCache";
 import {
   activityFeed,
@@ -28,27 +36,6 @@ const chartTabs = [
 
 const syncDistributionColors = ["#2d6cdf", "#16845b", "#b7791f", "#6d5bd0"];
 
-function formatDuration(totalDurationNs: number) {
-  const seconds = totalDurationNs / 1_000_000_000;
-
-  if (seconds < 60) {
-    return `${seconds.toFixed(1)} 秒`;
-  }
-
-  const minutes = seconds / 60;
-  if (minutes < 60) {
-    return `${minutes.toFixed(1)} 分钟`;
-  }
-
-  return `${(minutes / 60).toFixed(1)} 小时`;
-}
-
-function totalDataDetail(summary: NavigationDatasetSummary) {
-  const { date_count: dateCount, clip_count: clipCount, raw_message_count: rawMessageCount } = summary.totals;
-
-  return `${dateCount} 个日期 / ${clipCount} 个 clip / ${rawMessageCount} 条 ROS 消息`;
-}
-
 function syncDistributionData(summary: NavigationDatasetSummary | null) {
   if (!summary) {
     return dataDistribution;
@@ -66,6 +53,10 @@ export function DashboardPage() {
   const [metricTab, setMetricTab] = useState<MetricCurveTab>("success");
   const { summary: datasetSummary, loading: summaryLoading, error: summaryError } = useNavigationDatasetSummary();
   const activeCurve = metricTab === "success" ? modelCurveSuccess : modelCurveLoss;
+  const animationKey = datasetSummary
+    ? `${datasetSummary.totals.date_count}-${datasetSummary.totals.clip_count}-${datasetSummary.totals.raw_message_count}`
+    : "dashboard-fixture";
+  const animationProgress = useAnimatedProgress(animationKey);
 
   const displayedMetrics = useMemo(
     () =>
@@ -76,20 +67,35 @@ export function DashboardPage() {
             ? summaryLoading
               ? "加载中"
               : datasetSummary
-                ? formatDuration(datasetSummary.totals.total_duration_ns)
+                ? formatAnimatedDuration(datasetSummary.totals.total_duration_ns, animationProgress)
                 : "不可用"
-            : metric.value,
+            : metric.id === "annotated-data"
+              ? formatAnimatedCompactNumber(186, "K", animationProgress)
+              : metric.id === "pending-batches"
+                ? String(animateInteger(23, animationProgress))
+                : metric.id === "model-versions"
+                  ? formatAnimatedVersion(47, animationProgress)
+                  : metric.value,
         detail:
           metric.id === "total-data"
             ? summaryLoading
               ? "正在扫描导航数据"
               : datasetSummary
-                ? totalDataDetail(datasetSummary)
+                ? formatAnimatedTotalDataDetail(datasetSummary, animationProgress)
                 : summaryError
+            : metric.id === "annotated-data"
+              ? `自动标注覆盖率 ${animateInteger(84, animationProgress)}%`
             : metric.detail,
-        delta: metric.id === "total-data" ? undefined : metric.delta,
+        delta:
+          metric.id === "total-data"
+            ? undefined
+            : metric.id === "annotated-data"
+              ? `${animateInteger(75, animationProgress)}%`
+              : metric.id === "pending-batches"
+                ? `${animateInteger(7, animationProgress)} 批次待审核`
+                : metric.delta,
       })),
-    [datasetSummary, summaryError, summaryLoading],
+    [animationProgress, datasetSummary, summaryError, summaryLoading],
   );
   const displayedDistribution = useMemo(() => syncDistributionData(datasetSummary), [datasetSummary]);
 
@@ -131,7 +137,7 @@ export function DashboardPage() {
               {summaryLoading ? "扫描中" : datasetSummary ? "本次加载" : "不可用"}
             </StatusTag>
           </div>
-          <MiniChart type="donut" title="数据类型分布" data={displayedDistribution} />
+          <MiniChart type="donut" title="数据类型分布" data={displayedDistribution} progress={animationProgress} />
         </ConsoleCard>
 
         <ConsoleCard>

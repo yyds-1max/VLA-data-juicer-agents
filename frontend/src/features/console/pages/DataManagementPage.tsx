@@ -15,7 +15,7 @@ import {
   X,
   type LucideIcon,
 } from "lucide-react";
-import { type MouseEvent, type KeyboardEvent, useEffect, useMemo, useRef, useState } from "react";
+import { Fragment, type MouseEvent, type KeyboardEvent, type PointerEvent as ReactPointerEvent, useEffect, useMemo, useRef, useState } from "react";
 
 import { getSyncImages, getSyncImageUrl } from "../../../api/client";
 import type {
@@ -99,45 +99,67 @@ function formatTopics(topics: NavigationClipSummary["topics"]) {
     .join(" / ");
 }
 
-function MetricCard({ icon: Icon, label, value }: { icon: LucideIcon; label: string; value: string }) {
+function SummaryStat({ icon: Icon, label, value }: { icon: LucideIcon; label: string; value: string }) {
   return (
-    <ConsoleCard className="flex items-center gap-3">
-      <div className="flex h-10 w-10 shrink-0 items-center justify-center rounded-lg border border-console-line bg-console-panel2">
-        <Icon aria-hidden="true" className="h-5 w-5 text-console-cyan" />
+    <div className="flex min-w-0 items-center gap-2 py-1 pr-4 text-sm sm:border-r sm:border-console-line/70 sm:last:border-r-0">
+      <Icon aria-hidden="true" className="h-4 w-4 shrink-0 text-console-cyan" />
+      <div className="flex min-w-0 items-baseline gap-2">
+        <span className="shrink-0 text-xs text-console-muted">{label}</span>
+        <span className="truncate text-sm font-semibold text-console-text">{value}</span>
       </div>
-      <div className="min-w-0">
-        <p className="text-xs text-console-muted">{label}</p>
-        <p className="truncate text-lg font-semibold text-console-text">{value}</p>
-      </div>
-    </ConsoleCard>
+    </div>
   );
 }
 
 function ProcessOverview() {
   const steps = [
-    { name: "raw_data", state: "已采集" },
-    { name: "tmp_dir", state: "已拆解" },
-    { name: "sync_data", state: "已同步" },
+    { name: "raw_data", state: "已采集", icon: Database },
+    { name: "tmp_dir", state: "已拆解", icon: Files },
+    { name: "sync_data", state: "已同步", icon: CheckCircle2 },
   ];
 
   return (
     <ConsoleCard>
-      <div className="mb-4">
-        <h2 className="text-base font-semibold text-console-text">流程概览</h2>
-        <p className="mt-1 text-sm text-console-muted">raw_data 已采集 {"->"} tmp_dir 已拆解 {"->"} sync_data 已同步</p>
-      </div>
-      <div className="grid gap-3 md:grid-cols-3">
-        {steps.map((step, index) => (
-          <div key={step.name} className="flex items-center gap-3 rounded-lg border border-console-line bg-console-panel2/70 p-3">
-            <div className="flex h-8 w-8 shrink-0 items-center justify-center rounded-lg border border-console-line bg-console-panel text-sm font-semibold text-console-muted">
-              {index + 1}
-            </div>
-            <div className="min-w-0">
-              <p className="truncate text-sm font-semibold text-console-text">{step.name}</p>
-              <p className="text-xs text-console-muted">{step.state}</p>
-            </div>
+      <div data-testid="navigation-process-overview">
+        <div className="mb-4 flex flex-col gap-2 sm:flex-row sm:items-end sm:justify-between">
+          <div>
+            <h2 className="text-base font-semibold text-console-text">流程概览</h2>
+            <p className="mt-1 text-sm text-console-muted">raw_data 已采集 {"->"} tmp_dir 已拆解 {"->"} sync_data 已同步</p>
           </div>
-        ))}
+          <span className="w-fit rounded-md border border-emerald-200 bg-emerald-50 px-2 py-1 text-xs font-medium text-emerald-700">主流程</span>
+        </div>
+        <ol
+          aria-label="导航数据处理流程"
+          className="relative grid gap-3 md:grid-cols-3 md:gap-6"
+          data-testid="navigation-process-stepper"
+        >
+          <div
+            aria-hidden="true"
+            className="pointer-events-none absolute left-[16%] right-[16%] top-5 hidden h-px bg-gradient-to-r from-console-cyan/30 via-console-line to-emerald-300/60 md:block"
+          />
+          {steps.map((step, index) => {
+            const Icon = step.icon;
+
+            return (
+              <li
+                key={step.name}
+                className="relative flex min-w-0 items-center gap-3 py-1 md:flex-col md:items-center md:text-center"
+                data-testid="navigation-process-step"
+              >
+                <div className="z-10 flex h-10 w-10 shrink-0 items-center justify-center rounded-full border border-console-cyan/30 bg-console-panel text-console-cyan shadow-sm">
+                  <Icon aria-hidden="true" className="h-4 w-4" />
+                </div>
+                <div className="min-w-0">
+                  <div className="flex items-center gap-2 md:justify-center">
+                    <span className="text-xs font-semibold text-console-cyan">{index + 1}</span>
+                    <p className="truncate text-sm font-semibold text-console-text">{step.name}</p>
+                  </div>
+                  <p className="mt-0.5 text-xs text-console-muted">{step.state}</p>
+                </div>
+              </li>
+            );
+          })}
+        </ol>
       </div>
     </ConsoleCard>
   );
@@ -147,7 +169,65 @@ function StatusCell({ status }: { status: NavigationDatasetStatus }) {
   return <StatusTag tone={statusTones[status]}>{statusLabels[status]}</StatusTag>;
 }
 
-function ClipList({
+function getScrollbarProximity(element: HTMLElement, clientX: number, clientY: number) {
+  const rect = element.getBoundingClientRect();
+  const proximityPx = 28;
+  const hasVerticalScrollbar = element.scrollHeight > element.clientHeight;
+  const hasHorizontalScrollbar = element.scrollWidth > element.clientWidth;
+  const isNearVertical = hasVerticalScrollbar && clientX >= rect.right - proximityPx;
+  const isNearHorizontal = hasHorizontalScrollbar && clientY >= rect.bottom - proximityPx;
+
+  return { horizontal: isNearHorizontal, vertical: isNearVertical };
+}
+
+function useScrollbarProximity() {
+  const [scrollbarProximity, setScrollbarProximity] = useState({ horizontal: false, vertical: false });
+  const [activeScrollbarProximity, setActiveScrollbarProximity] = useState({ horizontal: false, vertical: false });
+  const isScrollbarActive = activeScrollbarProximity.horizontal || activeScrollbarProximity.vertical;
+
+  useEffect(() => {
+    if (!isScrollbarActive) {
+      return;
+    }
+
+    function handlePointerUp() {
+      setActiveScrollbarProximity({ horizontal: false, vertical: false });
+      setScrollbarProximity({ horizontal: false, vertical: false });
+    }
+
+    document.addEventListener("pointerup", handlePointerUp);
+
+    return () => {
+      document.removeEventListener("pointerup", handlePointerUp);
+    };
+  }, [isScrollbarActive]);
+
+  function handlePointerMove(event: ReactPointerEvent<HTMLElement>) {
+    setScrollbarProximity(getScrollbarProximity(event.currentTarget, event.clientX, event.clientY));
+  }
+
+  function handlePointerDown(event: ReactPointerEvent<HTMLElement>) {
+    const nextProximity = getScrollbarProximity(event.currentTarget, event.clientX, event.clientY);
+    setScrollbarProximity(nextProximity);
+    setActiveScrollbarProximity(nextProximity);
+  }
+
+  function handlePointerLeave() {
+    if (!isScrollbarActive) {
+      setScrollbarProximity({ horizontal: false, vertical: false });
+    }
+  }
+
+  return {
+    isHorizontalScrollbarNear: scrollbarProximity.horizontal || activeScrollbarProximity.horizontal,
+    isVerticalScrollbarNear: scrollbarProximity.vertical || activeScrollbarProximity.vertical,
+    onPointerDown: handlePointerDown,
+    onPointerLeave: handlePointerLeave,
+    onPointerMove: handlePointerMove,
+  };
+}
+
+function ClipRows({
   clips,
   highlightedClip,
   onViewSyncImages,
@@ -156,59 +236,86 @@ function ClipList({
   highlightedClip: string | null;
   onViewSyncImages: (clip: NavigationClipSummary, opener: HTMLElement) => void;
 }) {
-  if (clips.length === 0) {
-    return <div className="rounded-lg border border-console-line bg-console-panel px-4 py-5 text-sm text-console-muted">该日期暂无 clip 明细。</div>;
-  }
+  const clipScrollbar = useScrollbarProximity();
 
   return (
-    <div className="grid gap-3">
-      {clips.map((clip) => {
-        const highlightedQuery = highlightedClip?.toLowerCase() ?? "";
-        const isHighlighted = highlightedQuery.length > 0 && clip.clip.toLowerCase().includes(highlightedQuery);
-
-        return (
+    <tr>
+      <td colSpan={9} className="bg-console-panel2/50 px-4 py-4">
+        {clips.length === 0 ? (
+          <div className="rounded-lg border border-console-line bg-console-panel px-4 py-5 text-sm text-console-muted">该日期暂无 clip 明细。</div>
+        ) : (
           <div
-            key={`${clip.date}-${clip.clip}`}
-            className={`rounded-lg border bg-console-panel p-3 transition ${
-              isHighlighted ? "border-console-cyan shadow-[0_0_0_2px_rgba(45,108,223,0.12)]" : "border-console-line"
-            }`}
+            className={`console-soft-scrollbar max-h-80 overflow-auto rounded-lg border border-console-line bg-console-panel ${
+              clipScrollbar.isVerticalScrollbarNear ? "is-scrollbar-vertical-near" : ""
+            } ${clipScrollbar.isHorizontalScrollbarNear ? "is-scrollbar-horizontal-near" : ""}`}
+            data-testid="navigation-clip-scroll"
+            onPointerDown={clipScrollbar.onPointerDown}
+            onPointerLeave={clipScrollbar.onPointerLeave}
+            onPointerMove={clipScrollbar.onPointerMove}
           >
-            <div className="flex flex-col gap-3 lg:flex-row lg:items-start lg:justify-between">
-              <div className="min-w-0 space-y-2">
-                <div className="flex flex-wrap items-center gap-2">
-                  <h3 className="text-sm font-semibold text-console-text">{clip.clip}</h3>
-                  <StatusCell status={clip.status} />
-                  {isHighlighted ? <StatusTag tone="info">匹配</StatusTag> : null}
-                </div>
-                <p className="max-w-3xl truncate text-xs text-console-muted" title={formatTopics(clip.topics)}>
-                  {formatTopics(clip.topics)}
-                </p>
-              </div>
-              <ConsoleButton
-                className="h-8 w-fit px-2 text-xs"
-                disabled={clip.sync_frame_counts.image === 0}
-                aria-label={`查看 ${clip.clip} 同步图像`}
-                onClick={(event: MouseEvent<HTMLButtonElement>) => onViewSyncImages(clip, event.currentTarget)}
-              >
-                查看同步图像
-              </ConsoleButton>
-            </div>
-            <div className="mt-3 grid gap-2 text-xs text-console-muted sm:grid-cols-2 lg:grid-cols-6">
-              <span>时长 {formatDuration(clip.duration_ns)}</span>
-              <span>raw {formatCount(clip.raw_message_count)}</span>
-              <span>tmp_dir {clip.has_tmp_dir ? "已存在" : "缺失"}</span>
-              <span>sync_data {clip.has_sync_data ? "已存在" : "缺失"}</span>
-              <span>图像 {formatCount(clip.sync_frame_counts.image)}</span>
-              <span>点云 {formatCount(clip.sync_frame_counts.pointcloud)}</span>
-            </div>
+            <table className="w-full min-w-[980px] text-left text-sm">
+              <thead className="text-xs text-console-muted">
+                <tr className="border-b border-console-line bg-console-panel2/70">
+                  <th className="py-2 pl-3 pr-3 font-medium">clip 名称</th>
+                  <th className="py-2 pr-3 font-medium">时长</th>
+                  <th className="py-2 pr-3 font-medium">topic 摘要</th>
+                  <th className="py-2 pr-3 font-medium">raw 消息</th>
+                  <th className="py-2 pr-3 font-medium">tmp_dir</th>
+                  <th className="py-2 pr-3 font-medium">sync_data</th>
+                  <th className="py-2 pr-3 font-medium">同步图像帧</th>
+                  <th className="py-2 pr-3 font-medium">状态</th>
+                  <th className="py-2 pr-3 font-medium">操作</th>
+                </tr>
+              </thead>
+              <tbody>
+                {clips.map((clip) => {
+                  const highlightedQuery = highlightedClip?.toLowerCase() ?? "";
+                  const isHighlighted = highlightedQuery.length > 0 && clip.clip.toLowerCase().includes(highlightedQuery);
+
+                  return (
+                    <tr
+                      key={`${clip.date}-${clip.clip}`}
+                      className={`border-b border-console-line/70 last:border-b-0 ${
+                        isHighlighted ? "bg-console-cyan/10 ring-1 ring-inset ring-console-cyan/25" : ""
+                      }`}
+                    >
+                      <td className="py-3 pl-3 pr-3 font-medium text-console-text">
+                        {clip.clip}
+                      </td>
+                      <td className="py-3 pr-3 text-console-muted">{formatDuration(clip.duration_ns)}</td>
+                      <td className="max-w-[18rem] truncate py-3 pr-3 text-console-muted" title={formatTopics(clip.topics)}>
+                        {formatTopics(clip.topics)}
+                      </td>
+                      <td className="py-3 pr-3 text-console-muted">{formatCount(clip.raw_message_count)}</td>
+                      <td className="py-3 pr-3 text-console-muted">{clip.has_tmp_dir ? "已存在" : "缺失"}</td>
+                      <td className="py-3 pr-3 text-console-muted">{clip.has_sync_data ? "已存在" : "缺失"}</td>
+                      <td className="py-3 pr-3 text-console-muted">{formatCount(clip.sync_frame_counts.image)}</td>
+                      <td className="py-3 pr-3">
+                        <StatusCell status={clip.status} />
+                      </td>
+                      <td className="py-3 pr-3">
+                        <ConsoleButton
+                          className="h-8 px-2 text-xs"
+                          disabled={clip.sync_frame_counts.image === 0}
+                          aria-label={`查看 ${clip.clip} 同步图像`}
+                          onClick={(event: MouseEvent<HTMLButtonElement>) => onViewSyncImages(clip, event.currentTarget)}
+                        >
+                          查看同步图像
+                        </ConsoleButton>
+                      </td>
+                    </tr>
+                  );
+                })}
+              </tbody>
+            </table>
           </div>
-        );
-      })}
-    </div>
+        )}
+      </td>
+    </tr>
   );
 }
 
-function DatasetList({
+function DatasetTable({
   dates,
   expandedDate,
   highlightedClip,
@@ -221,6 +328,8 @@ function DatasetList({
   onToggleDate: (date: string) => void;
   onViewSyncImages: (clip: NavigationClipSummary, opener: HTMLElement) => void;
 }) {
+  const datasetScrollbar = useScrollbarProximity();
+
   return (
     <ConsoleCard>
       <div className="mb-4 flex items-start justify-between gap-3">
@@ -230,39 +339,60 @@ function DatasetList({
         </div>
         <StatusTag tone="info">{formatCount(dates.length)} 个日期</StatusTag>
       </div>
-      <div className="space-y-3">
-        {dates.map((date) => {
-          const isExpanded = expandedDate === date.date;
-          const ExpandIcon = isExpanded ? ChevronDown : ChevronRight;
+      <div
+        className={`console-soft-scrollbar max-h-[62vh] overflow-auto pb-3 ${
+          datasetScrollbar.isVerticalScrollbarNear ? "is-scrollbar-vertical-near" : ""
+        } ${datasetScrollbar.isHorizontalScrollbarNear ? "is-scrollbar-horizontal-near" : ""}`}
+        data-testid="navigation-dataset-scroll"
+        onPointerDown={datasetScrollbar.onPointerDown}
+        onPointerLeave={datasetScrollbar.onPointerLeave}
+        onPointerMove={datasetScrollbar.onPointerMove}
+      >
+        <table className="w-full min-w-[1040px] text-left text-sm">
+          <thead className="text-xs text-console-muted">
+            <tr className="border-b border-console-line">
+              <th className="py-2 pr-3 font-medium">日期</th>
+              <th className="py-2 pr-3 font-medium">clip 数</th>
+              <th className="py-2 pr-3 font-medium">总时长</th>
+              <th className="py-2 pr-3 font-medium">raw 消息</th>
+              <th className="py-2 pr-3 font-medium">已拆解 clip</th>
+              <th className="py-2 pr-3 font-medium">同步 clip 数</th>
+              <th className="py-2 pr-3 font-medium">同步图像帧</th>
+              <th className="py-2 pr-3 font-medium">状态</th>
+              <th className="py-2 pr-3 font-medium">展开</th>
+            </tr>
+          </thead>
+          <tbody>
+            {dates.map((date) => {
+              const isExpanded = expandedDate === date.date;
+              const ExpandIcon = isExpanded ? ChevronDown : ChevronRight;
 
-          return (
-            <div key={date.date} className="rounded-lg border border-console-line bg-console-panel2/50 p-4">
-              <div className="flex flex-col gap-3 xl:flex-row xl:items-center xl:justify-between">
-                <div className="flex flex-wrap items-center gap-3">
-                  <h3 className="text-lg font-semibold text-console-text">{date.date}</h3>
-                  <StatusCell status={date.status} />
-                </div>
-                <div className="grid flex-1 gap-2 text-xs text-console-muted sm:grid-cols-3 xl:max-w-3xl xl:grid-cols-6">
-                  <span>clip {formatCount(date.clip_count)}</span>
-                  <span>总时长 {formatDuration(date.total_duration_ns)}</span>
-                  <span>raw {formatCount(date.raw_message_count)}</span>
-                  <span>已拆解 {formatCount(date.extracted_clip_count)}</span>
-                  <span>已同步 {formatCount(date.synced_clip_count)}</span>
-                  <span>图像 {formatCount(date.sync_frame_counts.image)}</span>
-                </div>
-                <ConsoleButton className="h-8 w-fit px-2 text-xs" aria-label={`${isExpanded ? "收起" : "展开"} ${date.date}`} onClick={() => onToggleDate(date.date)}>
-                  <ExpandIcon aria-hidden="true" className="h-4 w-4" />
-                  {isExpanded ? "收起" : "展开"}
-                </ConsoleButton>
-              </div>
-              {isExpanded ? (
-                <div className="mt-4 border-t border-console-line pt-4">
-                  <ClipList clips={date.clips ?? []} highlightedClip={highlightedClip} onViewSyncImages={onViewSyncImages} />
-                </div>
-              ) : null}
-            </div>
-          );
-        })}
+              return (
+                <Fragment key={date.date}>
+                  <tr className="border-b border-console-line/70">
+                    <td className="py-3 pr-3 font-medium text-console-text">{date.date}</td>
+                    <td className="py-3 pr-3 text-console-muted">{formatCount(date.clip_count)}</td>
+                    <td className="py-3 pr-3 text-console-muted">{formatDuration(date.total_duration_ns)}</td>
+                    <td className="py-3 pr-3 text-console-muted">{formatCount(date.raw_message_count)}</td>
+                    <td className="py-3 pr-3 text-console-muted">{formatCount(date.extracted_clip_count)}</td>
+                    <td className="py-3 pr-3 text-console-muted">{formatCount(date.synced_clip_count)}</td>
+                    <td className="py-3 pr-3 text-console-muted">{formatCount(date.sync_frame_counts.image)}</td>
+                    <td className="py-3 pr-3">
+                      <StatusCell status={date.status} />
+                    </td>
+                    <td className="py-3 pr-3">
+                      <ConsoleButton className="h-8 px-2 text-xs" aria-label={`${isExpanded ? "收起" : "展开"} ${date.date}`} onClick={() => onToggleDate(date.date)}>
+                        <ExpandIcon aria-hidden="true" className="h-4 w-4" />
+                        {isExpanded ? "收起" : "展开"}
+                      </ConsoleButton>
+                    </td>
+                  </tr>
+                  {isExpanded ? <ClipRows clips={date.clips ?? []} highlightedClip={highlightedClip} onViewSyncImages={onViewSyncImages} /> : null}
+                </Fragment>
+              );
+            })}
+          </tbody>
+        </table>
       </div>
     </ConsoleCard>
   );
@@ -280,10 +410,37 @@ function SelectMenu<T extends string>({
   onChange: (value: T) => void;
 }) {
   const [open, setOpen] = useState(false);
+  const menuRef = useRef<HTMLDivElement | null>(null);
   const activeLabel = options.find((option) => option.value === value)?.label ?? label;
 
+  useEffect(() => {
+    if (!open) {
+      return;
+    }
+
+    function handlePointerDown(event: PointerEvent) {
+      if (event.target instanceof Node && !menuRef.current?.contains(event.target)) {
+        setOpen(false);
+      }
+    }
+
+    function handleKeyDown(event: globalThis.KeyboardEvent) {
+      if (event.key === "Escape") {
+        setOpen(false);
+      }
+    }
+
+    document.addEventListener("pointerdown", handlePointerDown);
+    document.addEventListener("keydown", handleKeyDown);
+
+    return () => {
+      document.removeEventListener("pointerdown", handlePointerDown);
+      document.removeEventListener("keydown", handleKeyDown);
+    };
+  }, [open]);
+
   return (
-    <div className="relative">
+    <div className="relative" ref={menuRef}>
       <ConsoleButton aria-expanded={open} aria-haspopup="listbox" onClick={() => setOpen((current) => !current)}>
         <Filter aria-hidden="true" className="h-4 w-4" />
         {activeLabel}
@@ -651,15 +808,25 @@ export function DataManagementPage({ onPlaceholderAction }: DataManagementPagePr
 
   const totals = datasetSummary?.totals;
   const dates = datasetSummary?.dates ?? [];
+  const matchingClipDate = useMemo(() => {
+    const query = searchQuery.trim().toLowerCase();
+
+    if (highlightedClip) {
+      return highlightedClip;
+    }
+
+    if (query.length <= 8) {
+      return null;
+    }
+
+    return (
+      dates
+        .flatMap((date) => (date.clips ?? []).map((clip) => ({ date: date.date, clip: clip.clip })))
+        .find((match) => match.clip.toLowerCase().includes(query)) ?? null
+    );
+  }, [dates, highlightedClip, searchQuery]);
   const visibleDates = useMemo(() => {
     const query = searchQuery.trim().toLowerCase();
-    const matchingClipDate =
-      highlightedClip ??
-      (query.length > 8
-        ? dates
-            .flatMap((date) => (date.clips ?? []).map((clip) => ({ date: date.date, clip: clip.clip })))
-            .find((match) => match.clip.toLowerCase().includes(query)) ?? null
-        : null);
 
     return dates.filter((date) => {
       if (statusFilter !== "all" && date.status !== statusFilter) {
@@ -680,8 +847,8 @@ export function DataManagementPage({ onPlaceholderAction }: DataManagementPagePr
 
       return (date.clips ?? []).some((clip) => clip.clip.toLowerCase().includes(query));
     });
-  }, [dates, highlightedClip, searchQuery, statusFilter]);
-  const effectiveExpandedDate = highlightedClip?.date ?? expandedDate;
+  }, [dates, matchingClipDate, searchQuery, statusFilter]);
+  const effectiveExpandedDate = matchingClipDate?.date ?? expandedDate;
 
   function handleToggleDate(date: string) {
     setExpandedDate((currentDate) => (currentDate === date ? null : date));
@@ -715,7 +882,7 @@ export function DataManagementPage({ onPlaceholderAction }: DataManagementPagePr
 
   return (
     <section className="mx-auto max-w-7xl space-y-4 px-4 py-6 md:px-6">
-      <ConsoleCard className="space-y-4">
+      <div className="space-y-4">
         <DataSurfaceTabs activeSurface={activeSurface} onChange={setActiveSurface} />
         <div className="flex flex-col gap-3 lg:flex-row lg:items-center">
           <div className="flex flex-wrap gap-2">
@@ -762,16 +929,19 @@ export function DataManagementPage({ onPlaceholderAction }: DataManagementPagePr
             />
           </div>
         </div>
-      </ConsoleCard>
+      </div>
 
       {activeSurface === "navigation" ? (
         <>
-          <div className="grid gap-4 sm:grid-cols-2 xl:grid-cols-5">
-            <MetricCard icon={Database} label="日期批次" value={formatCount(totals?.date_count ?? 0)} />
-            <MetricCard icon={Files} label="原始 clip" value={formatCount(totals?.clip_count ?? 0)} />
-            <MetricCard icon={Clock3} label="总采集时长" value={formatDuration(totals?.total_duration_ns ?? 0)} />
-            <MetricCard icon={CheckCircle2} label="已同步 clip" value={formatCount(totals?.synced_clip_count ?? 0)} />
-            <MetricCard icon={Images} label="同步图像帧" value={formatCount(datasetSummary?.sync_distribution.image ?? 0)} />
+          <div
+            className="flex flex-wrap items-center gap-x-4 gap-y-2 bg-transparent text-console-muted"
+            data-testid="navigation-summary-strip"
+          >
+            <SummaryStat icon={Database} label="日期批次" value={formatCount(totals?.date_count ?? 0)} />
+            <SummaryStat icon={Files} label="原始 clip" value={formatCount(totals?.clip_count ?? 0)} />
+            <SummaryStat icon={Clock3} label="总采集时长" value={formatDuration(totals?.total_duration_ns ?? 0)} />
+            <SummaryStat icon={CheckCircle2} label="已同步 clip" value={formatCount(totals?.synced_clip_count ?? 0)} />
+            <SummaryStat icon={Images} label="同步图像帧" value={formatCount(datasetSummary?.sync_distribution.image ?? 0)} />
           </div>
 
           <ProcessOverview />
@@ -786,7 +956,7 @@ export function DataManagementPage({ onPlaceholderAction }: DataManagementPagePr
               暂无匹配的导航数据集。
             </ConsoleCard>
           ) : (
-            <DatasetList
+            <DatasetTable
               dates={visibleDates}
               expandedDate={effectiveExpandedDate}
               highlightedClip={highlightedClip?.clip ?? (searchQuery.trim().length > 8 ? searchQuery.trim() : null)}
