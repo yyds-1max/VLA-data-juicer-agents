@@ -37,6 +37,25 @@ class EventingAgentScopeRuntime(FakeAgentScopeRuntime):
             yield event
 
 
+class ConcurrentEventingAgentScopeRuntime(EventingAgentScopeRuntime):
+    def __init__(self, events: list[dict]) -> None:
+        super().__init__(events)
+        self.active = 0
+        self.max_active = 0
+
+    async def subscribe_web_session_events(self, *, web_session_id: str):
+        self.subscriptions.append(web_session_id)
+        self.active += 1
+        self.max_active = max(self.max_active, self.active)
+        try:
+            await asyncio.sleep(0)
+            for event in self.events:
+                yield event
+                await asyncio.sleep(0)
+        finally:
+            self.active -= 1
+
+
 class RejectingAgentScopeRuntime(FakeAgentScopeRuntime):
     async def submit_user_message(self, *, web_session_id: str, message: str) -> str:
         self.submissions.append({"web_session_id": web_session_id, "message": message})
@@ -502,6 +521,40 @@ async def test_runtime_submit_human_decision_returns_false_without_matching_pend
 
 
 @pytest.mark.asyncio
+async def test_runtime_submit_human_decision_claim_rejects_active_duplicate_until_run_finishes() -> None:
+    chat_run_registry = FakeChatRunRegistry()
+    storage = FakeAgentScopeStorage()
+    storage.session_records[("alice", "navigation-data-agent", "as-session-1")] = (
+        _agentscope_session_record()
+    )
+    runtime = _runtime(storage=storage, chat_run_registry=chat_run_registry)
+    runtime.web_sessions["web-1"] = ("navigation-data-agent", "as-session-1")
+    decision = {
+        "action": "confirm",
+        "request_id": "request-1",
+        "tool_call_id": "tool-call-1",
+        "reply_id": "reply-1",
+    }
+
+    first = await runtime.submit_human_decision(web_session_id="web-1", decision=decision)
+    duplicate = await runtime.submit_human_decision(web_session_id="web-1", decision=decision)
+
+    assert first is True
+    assert duplicate is False
+    assert len(chat_run_registry.spawns) == 1
+    await chat_run_registry.drain()
+
+    retry_after_release = await runtime.submit_human_decision(
+        web_session_id="web-1",
+        decision=decision,
+    )
+
+    assert retry_after_release is True
+    assert len(chat_run_registry.spawns) == 1
+    await chat_run_registry.drain()
+
+
+@pytest.mark.asyncio
 async def test_runtime_submit_human_decision_returns_false_for_unmapped_web_session() -> None:
     chat_run_registry = FakeChatRunRegistry()
     runtime = _runtime(chat_run_registry=chat_run_registry)
@@ -767,6 +820,27 @@ async def test_forward_events_until_idle_persists_same_final_text_across_forward
         ("assistant", "处理完成"),
         ("assistant", "处理完成"),
     ]
+
+
+@pytest.mark.asyncio
+async def test_forward_events_until_idle_serializes_same_session_subscriptions(tmp_path: Path) -> None:
+    final_event = {
+        "type": "final",
+        "source": "NavigationDataAgent",
+        "payload": {"text": "处理完成"},
+    }
+    store = WebSessionStore(tmp_path / "sessions.sqlite")
+    runtime = ConcurrentEventingAgentScopeRuntime([final_event])
+    manager = AgentScopeWebSessionManager(store=store, runtime=runtime)
+    session = await manager.create_session("处理 20270605")
+
+    await asyncio.gather(
+        manager.forward_events_until_idle(session.id),
+        manager.forward_events_until_idle(session.id),
+    )
+
+    assert runtime.subscriptions == [session.id, session.id]
+    assert runtime.max_active == 1
 
 
 @pytest.mark.asyncio

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import inspect
 from collections.abc import Callable
 from typing import Any
@@ -22,6 +23,7 @@ class AgentScopeWebSessionManager:
         self._store = store
         self._runtime = runtime
         self._event_callback = event_callback
+        self._forward_locks: dict[str, asyncio.Lock] = {}
 
     async def create_session(self, first_message: str) -> SessionRecord:
         return self._store.create_session(title=generate_session_title(first_message))
@@ -55,6 +57,17 @@ class AgentScopeWebSessionManager:
         return bool(await submit_decision(web_session_id=session_id, decision=decision))
 
     async def forward_events_until_idle(self, session_id: str) -> None:
+        async with self._forward_lock(session_id):
+            await self._forward_events_until_idle_unlocked(session_id)
+
+    def _forward_lock(self, session_id: str) -> asyncio.Lock:
+        lock = self._forward_locks.get(session_id)
+        if lock is None:
+            lock = asyncio.Lock()
+            self._forward_locks[session_id] = lock
+        return lock
+
+    async def _forward_events_until_idle_unlocked(self, session_id: str) -> None:
         subscribe_events = getattr(self._runtime, "subscribe_web_session_events", None)
         if subscribe_events is None:
             return

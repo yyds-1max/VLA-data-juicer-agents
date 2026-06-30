@@ -34,6 +34,7 @@ class AgentScopeRuntime:
     app: Any
     web_sessions: dict[str, tuple[str, str]] = field(default_factory=dict)
     event_cursors: dict[str, str | None] = field(default_factory=dict)
+    _active_human_decision_claims: set[str] = field(default_factory=set)
     bootstrapped: bool = False
 
     def __post_init__(self) -> None:
@@ -108,37 +109,56 @@ class AgentScopeRuntime:
             return False
 
         agent_id, agentscope_session_id = mapped
-        if not await self._has_pending_human_decision(
-            agent_id=agent_id,
-            agentscope_session_id=agentscope_session_id,
-            decision=decision,
-        ):
+        claim_key = _human_decision_claim_key(agentscope_session_id, decision)
+        claim = await self._try_acquire_human_decision_claim(claim_key)
+        if claim is None:
             return False
 
-        result = ToolResultBlock(
-            id=decision["tool_call_id"],
-            name="request_human_decision",
-            output=json.dumps(
-                {
-                    "action": decision["action"],
-                    "text": decision.get("text"),
-                    "request_id": decision["request_id"],
-                },
-                ensure_ascii=False,
-            ),
-            state=ToolResultState.SUCCESS,
-        )
-        run_coroutine = self.app.state.chat_service.run(
-            user_id=self.config.user_id,
-            session_id=agentscope_session_id,
-            agent_id=agent_id,
-            input_msg=ExternalExecutionResultEvent(
+        claim_handoff = False
+        try:
+            if not await self._has_pending_human_decision(
+                agent_id=agent_id,
+                agentscope_session_id=agentscope_session_id,
+                decision=decision,
+            ):
+                return False
+
+            result = ToolResultBlock(
+                id=decision["tool_call_id"],
+                name="request_human_decision",
+                output=json.dumps(
+                    {
+                        "action": decision["action"],
+                        "text": decision.get("text"),
+                        "request_id": decision["request_id"],
+                    },
+                    ensure_ascii=False,
+                ),
+                state=ToolResultState.SUCCESS,
+            )
+            input_msg = ExternalExecutionResultEvent(
                 reply_id=decision["reply_id"],
                 execution_results=[result],
-            ),
-        )
-        self._spawn_chat_run(run_coroutine, session_id=agentscope_session_id)
-        return True
+            )
+
+            async def run_with_claim() -> None:
+                try:
+                    await self.app.state.chat_service.run(
+                        user_id=self.config.user_id,
+                        session_id=agentscope_session_id,
+                        agent_id=agent_id,
+                        input_msg=input_msg,
+                    )
+                finally:
+                    await claim.release()
+
+            run_coroutine = run_with_claim()
+            self._spawn_chat_run(run_coroutine, session_id=agentscope_session_id)
+            claim_handoff = True
+            return True
+        finally:
+            if not claim_handoff:
+                await claim.release()
 
     async def _has_pending_human_decision(
         self,
@@ -169,6 +189,32 @@ class AgentScopeRuntime:
                 ):
                     return True
         return False
+
+    async def _try_acquire_human_decision_claim(
+        self,
+        claim_key: str,
+    ) -> "_HumanDecisionClaim | None":
+        acquire_lock = getattr(self.message_bus, "acquire_lock", None)
+        if callable(acquire_lock):
+            lock_cm = acquire_lock(claim_key, ttl_secs=600)
+            try:
+                await asyncio.wait_for(lock_cm.__aenter__(), timeout=0.1)
+            except TimeoutError:
+                return None
+
+            async def release_distributed() -> None:
+                await lock_cm.__aexit__(None, None, None)
+
+            return _HumanDecisionClaim(release_distributed)
+
+        if claim_key in self._active_human_decision_claims:
+            return None
+        self._active_human_decision_claims.add(claim_key)
+
+        async def release_local() -> None:
+            self._active_human_decision_claims.discard(claim_key)
+
+        return _HumanDecisionClaim(release_local)
 
     def _spawn_chat_run(self, run_coroutine: Any, *, session_id: str) -> None:
         chat_run_registry = getattr(self.app.state, "chat_run_registry", None)
@@ -321,6 +367,18 @@ def _to_attribute_event(value: Any) -> Any:
     return value
 
 
+class _HumanDecisionClaim:
+    def __init__(self, release_callback: Any) -> None:
+        self._release_callback = release_callback
+        self._released = False
+
+    async def release(self) -> None:
+        if self._released:
+            return
+        self._released = True
+        await self._release_callback()
+
+
 def _tool_call_blocks(message: Any) -> list[Any]:
     get_content_blocks = getattr(message, "get_content_blocks", None)
     if callable(get_content_blocks):
@@ -335,6 +393,13 @@ def _tool_call_blocks(message: Any) -> list[Any]:
 def _state_value(value: Any) -> str:
     raw_value = getattr(value, "value", value)
     return str(raw_value)
+
+
+def _human_decision_claim_key(agentscope_session_id: str, decision: dict[str, Any]) -> str:
+    return (
+        "vla:human-decision:"
+        f"{agentscope_session_id}:{decision['reply_id']}:{decision['tool_call_id']}"
+    )
 
 
 def _session_events_key(message_bus: Any, session_id: str) -> str:
