@@ -88,7 +88,50 @@ The conversational Agent requires normal LLM settings such as `DASHSCOPE_API_KEY
 
 ## DataPilot web UI
 
-For local development, run the backend API from the repository root:
+For server use, run the bundled web script from the repository root. It builds the frontend, starts
+the backend with `frontend/dist` mounted, and records a PID/log under `.djx`:
+
+```bash
+./scripts/run_web.sh start
+```
+
+The default server URL is:
+
+```text
+http://<server-ip>:8765
+```
+
+Useful service commands:
+
+```bash
+./scripts/run_web.sh status
+./scripts/run_web.sh logs
+./scripts/run_web.sh stop
+./scripts/run_web.sh restart
+```
+
+`logs` follows the log output; press Ctrl+C to leave log viewing. Use `stop` to shut down
+the background service. For one-off foreground debugging, run:
+
+```bash
+./scripts/run_web.sh foreground
+```
+
+Then press Ctrl+C in that terminal to stop the service.
+
+The script defaults to the company dataset root:
+
+```text
+/media/heying/hy_data1/VLADatasets
+```
+
+Override settings with environment variables when needed:
+
+```bash
+HOST=0.0.0.0 PORT=8765 VLA_VLADATASETS_ROOT=/media/heying/hy_data1/VLADatasets ./scripts/run_web.sh start
+```
+
+For local frontend development, run the backend API from the repository root:
 
 ```bash
 vla-data-agent-web --host 127.0.0.1 --port 8765 --working-dir ./.djx

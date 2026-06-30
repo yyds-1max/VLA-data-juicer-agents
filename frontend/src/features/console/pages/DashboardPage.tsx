@@ -1,12 +1,12 @@
 import { Activity, CircleDot, Database, GitBranch, Layers3 } from "lucide-react";
-import { useEffect, useMemo, useState } from "react";
+import { useMemo, useState } from "react";
 
-import { getNavigationDatasetSummary } from "../../../api/client";
 import type { NavigationDatasetSummary } from "../../../api/types";
 import { ConsoleCard } from "../../../components/console/ConsoleCard";
 import { MetricCard } from "../../../components/console/MetricCard";
 import { SegmentedTabs } from "../../../components/console/SegmentedTabs";
 import { StatusTag } from "../../../components/console/StatusTag";
+import { useNavigationDatasetSummary } from "../navigationDatasetSummaryCache";
 import {
   activityFeed,
   dashboardMetrics,
@@ -64,41 +64,8 @@ function syncDistributionData(summary: NavigationDatasetSummary | null) {
 
 export function DashboardPage() {
   const [metricTab, setMetricTab] = useState<MetricCurveTab>("success");
-  const [datasetSummary, setDatasetSummary] = useState<NavigationDatasetSummary | null>(null);
-  const [summaryLoading, setSummaryLoading] = useState(true);
-  const [summaryError, setSummaryError] = useState<string | null>(null);
+  const { summary: datasetSummary, loading: summaryLoading, error: summaryError } = useNavigationDatasetSummary();
   const activeCurve = metricTab === "success" ? modelCurveSuccess : modelCurveLoss;
-
-  useEffect(() => {
-    let ignore = false;
-
-    async function loadDatasetSummary() {
-      setSummaryLoading(true);
-      setSummaryError(null);
-
-      try {
-        const summary = await getNavigationDatasetSummary();
-        if (!ignore) {
-          setDatasetSummary(summary);
-        }
-      } catch (error) {
-        if (!ignore) {
-          setDatasetSummary(null);
-          setSummaryError(error instanceof Error ? error.message : "导航数据汇总加载失败");
-        }
-      } finally {
-        if (!ignore) {
-          setSummaryLoading(false);
-        }
-      }
-    }
-
-    void loadDatasetSummary();
-
-    return () => {
-      ignore = true;
-    };
-  }, []);
 
   const displayedMetrics = useMemo(
     () =>
@@ -160,7 +127,9 @@ export function DashboardPage() {
               <h2 className="text-base font-semibold text-console-text">数据类型分布</h2>
               <p className="mt-1 text-sm text-console-muted">多模态训练样本构成</p>
             </div>
-            <StatusTag tone="info">实时</StatusTag>
+            <StatusTag tone={summaryLoading ? "neutral" : datasetSummary ? "info" : "danger"}>
+              {summaryLoading ? "扫描中" : datasetSummary ? "本次加载" : "不可用"}
+            </StatusTag>
           </div>
           <MiniChart type="donut" title="数据类型分布" data={displayedDistribution} />
         </ConsoleCard>

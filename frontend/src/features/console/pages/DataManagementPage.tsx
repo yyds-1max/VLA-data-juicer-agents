@@ -1,11 +1,10 @@
 import { CheckCircle2, ChevronDown, ChevronLeft, ChevronRight, Clock3, Database, Files, Images, Layers3, X, type LucideIcon } from "lucide-react";
 import { Fragment, type MouseEvent, type KeyboardEvent, useEffect, useRef, useState } from "react";
 
-import { getNavigationDatasetSummary, getSyncImages, getSyncImageUrl } from "../../../api/client";
+import { getSyncImages, getSyncImageUrl } from "../../../api/client";
 import type {
   NavigationClipSummary,
   NavigationDatasetStatus,
-  NavigationDatasetSummary,
   NavigationDateSummary,
   NavigationSyncImageListing,
 } from "../../../api/types";
@@ -13,6 +12,7 @@ import { ConsoleButton } from "../../../components/console/ConsoleButton";
 import { ConsoleCard } from "../../../components/console/ConsoleCard";
 import { StatusTag } from "../../../components/console/StatusTag";
 import type { StatusTone } from "../consoleTypes";
+import { useNavigationDatasetSummary } from "../navigationDatasetSummaryCache";
 
 type DataManagementPageProps = {
   onPlaceholderAction?: (message?: string) => void;
@@ -456,42 +456,10 @@ function SyncImageDrawer({
 }
 
 export function DataManagementPage({ onPlaceholderAction }: DataManagementPageProps) {
-  const [datasetSummary, setDatasetSummary] = useState<NavigationDatasetSummary | null>(null);
   const [expandedDate, setExpandedDate] = useState<string | null>(null);
   const [syncImageClip, setSyncImageClip] = useState<NavigationClipSummary | null>(null);
-  const [loading, setLoading] = useState(true);
-  const [error, setError] = useState<string | null>(null);
+  const { summary: datasetSummary, loading, error } = useNavigationDatasetSummary();
   const syncImageOpenerRef = useRef<HTMLElement | null>(null);
-
-  useEffect(() => {
-    let isMounted = true;
-
-    async function loadDatasetSummary() {
-      setLoading(true);
-      setError(null);
-
-      try {
-        const summary = await getNavigationDatasetSummary();
-        if (isMounted) {
-          setDatasetSummary(summary);
-        }
-      } catch {
-        if (isMounted) {
-          setError("导航数据集摘要加载失败");
-        }
-      } finally {
-        if (isMounted) {
-          setLoading(false);
-        }
-      }
-    }
-
-    void loadDatasetSummary();
-
-    return () => {
-      isMounted = false;
-    };
-  }, []);
 
   const totals = datasetSummary?.totals;
   const dates = datasetSummary?.dates ?? [];

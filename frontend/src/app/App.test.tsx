@@ -14,6 +14,7 @@ import {
 } from "../api/client";
 import { Composer } from "../components/datapilot/Composer";
 import { formatActiveText, MessageList } from "../components/datapilot/MessageList";
+import { resetNavigationDatasetSummaryCache } from "../features/console/navigationDatasetSummaryCache";
 import { createEmptyRunState } from "../store/eventReducer";
 import { datapilotStore } from "../store/datapilotStore";
 import { App } from "./App";
@@ -72,6 +73,7 @@ async function renderAppWithDashboardSettled() {
 
 beforeEach(() => {
   vi.clearAllMocks();
+  resetNavigationDatasetSummaryCache();
   Object.defineProperty(window, "innerWidth", { configurable: true, writable: true, value: 1280 });
   Object.defineProperty(window, "innerHeight", { configurable: true, writable: true, value: 900 });
   apiMocks.createSession.mockResolvedValue({
@@ -251,6 +253,22 @@ test("data management renders navigation dataset date and clip details", async (
   expect(screen.getAllByText("已同步").length).toBeGreaterThan(0);
   expect(screen.getByRole("button", { name: "查看 clip_a 同步图像" })).toBeEnabled();
   expect(screen.getByRole("button", { name: "Open DataPilot" })).toBeVisible();
+});
+
+test("navigation dataset summary is reused while switching console pages", async () => {
+  await renderAppWithDashboardSettled();
+  expect(apiMocks.getNavigationDatasetSummary).toHaveBeenCalledTimes(1);
+
+  fireEvent.click(screen.getByRole("button", { name: "自动标注" }));
+  expect(screen.getByText("视觉检测")).toBeVisible();
+
+  fireEvent.click(screen.getByRole("button", { name: "闭环仪表盘" }));
+  expect(await screen.findByText("3.5 秒")).toBeVisible();
+  expect(apiMocks.getNavigationDatasetSummary).toHaveBeenCalledTimes(1);
+
+  fireEvent.click(screen.getByRole("button", { name: "数据管理" }));
+  expect(await screen.findByText("20270515")).toBeVisible();
+  expect(apiMocks.getNavigationDatasetSummary).toHaveBeenCalledTimes(1);
 });
 
 test("data management opens synchronized image drawer and browses sequences", async () => {
