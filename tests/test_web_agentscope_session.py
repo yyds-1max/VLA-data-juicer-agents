@@ -50,6 +50,39 @@ class InterruptingAgentScopeRuntime(FakeAgentScopeRuntime):
         return self.interrupted
 
 
+class FakeAgentScopeMessageBus:
+    _SESSION_EVENTS_KEY = "agentscope:session:events:{sid}"
+
+    def __init__(
+        self,
+        *,
+        replay_events: list[tuple[str, dict]] | None = None,
+        live_events: list[dict] | None = None,
+        running_states: list[bool] | None = None,
+    ) -> None:
+        self.replay_events = replay_events or []
+        self.live_events = live_events or []
+        self.running_states = running_states or []
+        self.read_sessions: list[str] = []
+        self.subscribe_keys: list[str] = []
+
+    async def session_read_events(self, session_id: str):
+        self.read_sessions.append(session_id)
+        return self.replay_events
+
+    async def subscribe(self, key: str, *, on_ready=None):
+        self.subscribe_keys.append(key)
+        if on_ready is not None:
+            on_ready()
+        for event in self.live_events:
+            yield event
+
+    async def session_is_running(self, session_id: str) -> bool:
+        if self.running_states:
+            return self.running_states.pop(0)
+        return False
+
+
 class FakeAgentScopeStorage:
     def __init__(self) -> None:
         self.sessions = []
@@ -125,6 +158,7 @@ def _runtime(
     *,
     storage: FakeAgentScopeStorage | None = None,
     chat_run_registry: FakeChatRunRegistry | None = None,
+    message_bus=None,
 ) -> AgentScopeRuntime:
     storage = storage or FakeAgentScopeStorage()
     chat_service = FakeChatService()
@@ -134,7 +168,7 @@ def _runtime(
     return AgentScopeRuntime(
         config=_agentscope_config(),
         storage=storage,
-        message_bus=object(),
+        message_bus=message_bus or object(),
         workspace_manager=object(),
         app=SimpleNamespace(state=state),
     )
@@ -298,6 +332,36 @@ async def test_runtime_submit_user_message_duplicate_active_run_raises() -> None
 
 
 @pytest.mark.asyncio
+async def test_runtime_subscribe_web_session_events_replays_dedupes_and_finishes() -> None:
+    text_event = {"type": "TEXT_BLOCK_DELTA", "delta": "处理"}
+    final_event = {"type": "REPLY_END"}
+    message_bus = FakeAgentScopeMessageBus(
+        replay_events=[
+            ("1-0", text_event),
+        ],
+        live_events=[
+            {**text_event, "_entry_id": "1-0"},
+            {**final_event, "_entry_id": "2-0"},
+        ],
+        running_states=[False],
+    )
+    runtime = _runtime(message_bus=message_bus)
+    runtime.web_sessions["web-1"] = ("navigation-data-agent", "as-session-1")
+
+    events = [
+        event
+        async for event in runtime.subscribe_web_session_events(web_session_id="web-1")
+    ]
+
+    assert message_bus.read_sessions == ["as-session-1"]
+    assert message_bus.subscribe_keys == ["agentscope:session:events:as-session-1"]
+    assert [(event["type"], event["payload"]) for event in events] == [
+        ("assistant_delta", {"delta": "处理"}),
+        ("final", {"text": "处理"}),
+    ]
+
+
+@pytest.mark.asyncio
 async def test_create_session_creates_compatible_record_and_persists(tmp_path: Path) -> None:
     store = WebSessionStore(tmp_path / "sessions.sqlite")
     manager = AgentScopeWebSessionManager(store=store, runtime=FakeAgentScopeRuntime())
@@ -364,6 +428,28 @@ async def test_forward_events_until_idle_persists_final_assistant_text(tmp_path:
     manager = AgentScopeWebSessionManager(store=store, runtime=runtime)
     session = await manager.create_session("处理 20270605")
 
+    await manager.forward_events_until_idle(session.id)
+
+    detail = store.get_session(session.id)
+    assert detail is not None
+    assert [(message.role, message.content) for message in detail.messages] == [
+        ("assistant", "处理完成")
+    ]
+
+
+@pytest.mark.asyncio
+async def test_forward_events_until_idle_does_not_duplicate_same_final_text(tmp_path: Path) -> None:
+    final_event = {
+        "type": "final",
+        "source": "NavigationDataAgent",
+        "payload": {"text": "处理完成"},
+    }
+    store = WebSessionStore(tmp_path / "sessions.sqlite")
+    runtime = EventingAgentScopeRuntime([final_event])
+    manager = AgentScopeWebSessionManager(store=store, runtime=runtime)
+    session = await manager.create_session("处理 20270605")
+
+    await manager.forward_events_until_idle(session.id)
     await manager.forward_events_until_idle(session.id)
 
     detail = store.get_session(session.id)

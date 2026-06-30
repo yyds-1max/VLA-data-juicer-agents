@@ -78,6 +78,27 @@ def test_plain_text_delta_emits_assistant_delta_for_streaming_ui():
     ]
 
 
+def test_adapter_can_emit_text_delta_and_final_from_raw_agentscope_events():
+    scope, events = _scope_and_events()
+    adapter = AgentScopeEventAdapter(
+        scope,
+        emit_text_events=True,
+        emit_final_events=True,
+    )
+
+    adapter.accept(SimpleNamespace(type="TEXT_BLOCK_DELTA", delta="Progress: Inspecting data.\n"))
+    adapter.accept(SimpleNamespace(type="TEXT_BLOCK_DELTA", delta="处理"))
+    adapter.accept(SimpleNamespace(type="TEXT_BLOCK_DELTA", delta="完成"))
+    adapter.accept(SimpleNamespace(type="REPLY_END"))
+
+    assert [(event["type"], event["payload"]) for event in events] == [
+        ("reasoning", {"summary": "Inspecting data."}),
+        ("assistant_delta", {"delta": "处理"}),
+        ("assistant_delta", {"delta": "完成"}),
+        ("final", {"text": "处理完成"}),
+    ]
+
+
 def test_progress_marker_without_newline_flushes_before_tool_event():
     scope, events = _scope_and_events()
 

@@ -62,11 +62,21 @@ class _ToolState:
 class AgentScopeEventAdapter:
     """Translate AgentScope stream events into transport-neutral events."""
 
-    def __init__(self, scope: EventScope, emit_tool_events: bool = True) -> None:
+    def __init__(
+        self,
+        scope: EventScope,
+        emit_tool_events: bool = True,
+        emit_text_events: bool = False,
+        emit_final_events: bool = False,
+    ) -> None:
         self._scope = scope
         self._emit_tool_events = emit_tool_events
+        self._emit_text_events = emit_text_events
+        self._emit_final_events = emit_final_events
         self._thinking: dict[str, list[str]] = {}
         self._tools: dict[str, _ToolState] = {}
+        self._progress_filter = ProgressSummaryFilter(scope)
+        self._reply_text: list[str] = []
 
     def accept(self, event: object) -> None:
         event_type = _event_type(event)
@@ -79,6 +89,10 @@ class AgentScopeEventAdapter:
             summary = summarize_progress("".join(self._thinking.pop(block_id, [])))
             if summary:
                 self._scope.emit("reasoning", summary=summary)
+        elif event_type == "TEXT_BLOCK_DELTA":
+            self._handle_text_delta(getattr(event, "delta", ""))
+        elif event_type == "REPLY_END":
+            self._handle_reply_end()
         elif event_type == "TOOL_CALL_START":
             state = self._tools.setdefault(call_id, _ToolState())
             state.name = _text(getattr(event, "tool_call_name", "")) or state.name
@@ -133,6 +147,28 @@ class AgentScopeEventAdapter:
                     status=status,
                     summary=summarize_progress("".join(state.result)),
                 )
+
+    def _handle_text_delta(self, delta: object) -> None:
+        if not self._emit_text_events and not self._emit_final_events:
+            return
+        rendered = self._progress_filter.consume_text_delta(delta)
+        if not rendered:
+            return
+        if self._emit_text_events:
+            self._scope.emit("assistant_delta", delta=rendered)
+        self._reply_text.append(rendered)
+
+    def _handle_reply_end(self) -> None:
+        if not self._emit_text_events and not self._emit_final_events:
+            return
+        rendered = self._progress_filter.flush()
+        if rendered:
+            if self._emit_text_events:
+                self._scope.emit("assistant_delta", delta=rendered)
+            self._reply_text.append(rendered)
+        if self._emit_final_events:
+            self._scope.emit("final", text="".join(self._reply_text))
+        self._reply_text.clear()
 
     @staticmethod
     def _tool_status(state: object, result_text: str = "") -> str:

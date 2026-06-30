@@ -49,12 +49,14 @@ class AgentScopeWebSessionManager:
         if subscribe_events is None:
             return
 
+        persisted_final_texts = _persisted_assistant_texts(self._store, session_id)
         async for event in subscribe_events(web_session_id=session_id):
             if self._event_callback is not None:
                 self._event_callback(session_id, event)
             text = _final_event_text(event)
-            if text is not None:
+            if text is not None and text not in persisted_final_texts:
                 self._store.append_message(session_id, role="assistant", content=text)
+                persisted_final_texts.add(text)
 
 
 def _final_event_text(event: dict[str, Any]) -> str | None:
@@ -65,3 +67,14 @@ def _final_event_text(event: dict[str, Any]) -> str | None:
         return None
     text = payload.get("text")
     return text if isinstance(text, str) and text else None
+
+
+def _persisted_assistant_texts(store: WebSessionStore, session_id: str) -> set[str]:
+    session = store.get_session(session_id)
+    if session is None:
+        return set()
+    return {
+        message.content
+        for message in session.messages
+        if message.role == "assistant" and isinstance(message.content, str)
+    }
