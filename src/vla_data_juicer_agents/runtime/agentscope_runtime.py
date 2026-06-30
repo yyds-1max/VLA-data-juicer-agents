@@ -13,7 +13,7 @@ from agentscope.app.message_bus import RedisMessageBus
 from agentscope.app.storage import ChatModelConfig, RedisStorage, SessionConfig
 from agentscope.app.workspace_manager import LocalWorkspaceManager
 from agentscope.event import ExternalExecutionResultEvent
-from agentscope.message import ToolResultBlock, ToolResultState, UserMsg
+from agentscope.message import ToolCallState, ToolResultBlock, ToolResultState, UserMsg
 
 from vla_data_juicer_agents.adapters.agentscope import AgentScopeEventAdapter
 from vla_data_juicer_agents.core.events import CallbackEventSink, EventEmitter
@@ -108,6 +108,13 @@ class AgentScopeRuntime:
             return False
 
         agent_id, agentscope_session_id = mapped
+        if not await self._has_pending_human_decision(
+            agent_id=agent_id,
+            agentscope_session_id=agentscope_session_id,
+            decision=decision,
+        ):
+            return False
+
         result = ToolResultBlock(
             id=decision["tool_call_id"],
             name="request_human_decision",
@@ -132,6 +139,36 @@ class AgentScopeRuntime:
         )
         self._spawn_chat_run(run_coroutine, session_id=agentscope_session_id)
         return True
+
+    async def _has_pending_human_decision(
+        self,
+        *,
+        agent_id: str,
+        agentscope_session_id: str,
+        decision: dict[str, Any],
+    ) -> bool:
+        get_session = getattr(self.storage, "get_session", None)
+        if get_session is None:
+            return False
+
+        record = await get_session(self.config.user_id, agent_id, agentscope_session_id)
+        if record is None:
+            return False
+
+        state = getattr(record, "state", None)
+        if getattr(state, "reply_id", None) != decision["reply_id"]:
+            return False
+
+        for message in getattr(state, "context", []) or []:
+            for tool_call in _tool_call_blocks(message):
+                if (
+                    getattr(tool_call, "id", None) == decision["tool_call_id"]
+                    and getattr(tool_call, "name", None) == "request_human_decision"
+                    and _state_value(getattr(tool_call, "state", None))
+                    == ToolCallState.SUBMITTED.value
+                ):
+                    return True
+        return False
 
     def _spawn_chat_run(self, run_coroutine: Any, *, session_id: str) -> None:
         chat_run_registry = getattr(self.app.state, "chat_run_registry", None)
@@ -282,6 +319,22 @@ def _to_attribute_event(value: Any) -> Any:
     if isinstance(value, list):
         return [_to_attribute_event(item) for item in value]
     return value
+
+
+def _tool_call_blocks(message: Any) -> list[Any]:
+    get_content_blocks = getattr(message, "get_content_blocks", None)
+    if callable(get_content_blocks):
+        return list(get_content_blocks("tool_call"))
+    return [
+        block
+        for block in getattr(message, "content", []) or []
+        if getattr(block, "type", None) == "tool_call"
+    ]
+
+
+def _state_value(value: Any) -> str:
+    raw_value = getattr(value, "value", value)
+    return str(raw_value)
 
 
 def _session_events_key(message_bus: Any, session_id: str) -> str:

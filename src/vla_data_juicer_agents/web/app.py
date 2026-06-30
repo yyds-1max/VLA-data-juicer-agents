@@ -179,6 +179,11 @@ def create_app(
             raise HTTPException(status_code=409, detail=str(exc)) from exc
         if not accepted:
             raise HTTPException(status_code=409, detail="Human decision was not accepted")
+        if agentscope_runtime is not None:
+            _create_logged_task(
+                manager.forward_events_until_idle(session_id),
+                name=f"agentscope-events:{session_id}",
+            )
         return HumanDecisionResponse(accepted=True)
 
     @app.websocket("/api/sessions/{session_id}/events")

@@ -5,7 +5,7 @@ from types import SimpleNamespace
 
 import pytest
 from agentscope.event import ExternalExecutionResultEvent
-from agentscope.message import ToolResultState
+from agentscope.message import Msg, ToolCallBlock, ToolCallState, ToolResultState
 
 from vla_data_juicer_agents.navigation.routing import is_high_confidence_navigation_request
 from vla_data_juicer_agents.runtime.agentscope_config import AgentScopeRuntimeConfig
@@ -113,6 +113,7 @@ class FakeAgentScopeMessageBus:
 class FakeAgentScopeStorage:
     def __init__(self) -> None:
         self.sessions = []
+        self.session_records = {}
 
     async def upsert_credential(self, user_id, credential_data):
         return credential_data.id
@@ -130,6 +131,9 @@ class FakeAgentScopeStorage:
             }
         )
         return SimpleNamespace(id=session_id)
+
+    async def get_session(self, user_id, agent_id, session_id):
+        return self.session_records.get((user_id, agent_id, session_id))
 
 
 class FakeChatService:
@@ -203,6 +207,34 @@ def _runtime(
 
 def _message_text(message) -> str:
     return message.content[0].text
+
+
+def _agentscope_session_record(
+    *,
+    reply_id: str = "reply-1",
+    tool_call_id: str = "tool-call-1",
+    tool_name: str = "request_human_decision",
+    tool_state=ToolCallState.SUBMITTED,
+):
+    return SimpleNamespace(
+        state=SimpleNamespace(
+            reply_id=reply_id,
+            context=[
+                Msg(
+                    name="assistant",
+                    role="assistant",
+                    content=[
+                        ToolCallBlock(
+                            id=tool_call_id,
+                            name=tool_name,
+                            input="{}",
+                            state=tool_state,
+                        )
+                    ],
+                )
+            ],
+        )
+    )
 
 
 def test_navigation_rule_fallback_is_narrow_and_explicit() -> None:
@@ -381,9 +413,16 @@ async def test_runtime_submit_user_message_advances_event_cursor_before_spawn() 
 
 
 @pytest.mark.asyncio
-async def test_runtime_submit_human_decision_spawns_external_execution_result_event() -> None:
+@pytest.mark.parametrize("tool_state", [ToolCallState.SUBMITTED, "submitted"])
+async def test_runtime_submit_human_decision_spawns_external_execution_result_event(
+    tool_state,
+) -> None:
     chat_run_registry = FakeChatRunRegistry()
-    runtime = _runtime(chat_run_registry=chat_run_registry)
+    storage = FakeAgentScopeStorage()
+    storage.session_records[("alice", "navigation-data-agent", "as-session-1")] = (
+        _agentscope_session_record(tool_state=tool_state)
+    )
+    runtime = _runtime(storage=storage, chat_run_registry=chat_run_registry)
     runtime.web_sessions["web-1"] = ("navigation-data-agent", "as-session-1")
 
     accepted = await runtime.submit_human_decision(
@@ -418,6 +457,48 @@ async def test_runtime_submit_human_decision_spawns_external_execution_result_ev
         "text": "先 dry-run",
         "request_id": "request-1",
     }
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "session_record,decision_overrides",
+    [
+        (None, {}),
+        (_agentscope_session_record(tool_call_id="other-tool-call"), {}),
+        (_agentscope_session_record(reply_id="other-reply"), {}),
+        (_agentscope_session_record(tool_state=ToolCallState.FINISHED), {}),
+        (_agentscope_session_record(tool_name="other_tool"), {}),
+        (_agentscope_session_record(tool_state="finished"), {}),
+    ],
+)
+async def test_runtime_submit_human_decision_returns_false_without_matching_pending_tool_call(
+    session_record,
+    decision_overrides,
+) -> None:
+    chat_run_registry = FakeChatRunRegistry()
+    storage = FakeAgentScopeStorage()
+    if session_record is not None:
+        storage.session_records[("alice", "navigation-data-agent", "as-session-1")] = (
+            session_record
+        )
+    runtime = _runtime(storage=storage, chat_run_registry=chat_run_registry)
+    runtime.web_sessions["web-1"] = ("navigation-data-agent", "as-session-1")
+    decision = {
+        "action": "confirm",
+        "request_id": "request-1",
+        "tool_call_id": "tool-call-1",
+        "reply_id": "reply-1",
+        **decision_overrides,
+    }
+
+    accepted = await runtime.submit_human_decision(
+        web_session_id="web-1",
+        decision=decision,
+    )
+
+    assert accepted is False
+    assert chat_run_registry.spawns == []
+    assert runtime.app.state.chat_service.runs == []
 
 
 @pytest.mark.asyncio

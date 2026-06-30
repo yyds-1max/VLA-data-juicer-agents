@@ -15,6 +15,8 @@ class FakeAgentScopeRuntime:
         self.accept_decision = accept_decision
         self.messages: list[tuple[str, str]] = []
         self.decisions: list[tuple[str, dict]] = []
+        self.events: list[dict] = []
+        self.subscriptions: list[str] = []
 
     async def submit_user_message(self, *, web_session_id: str, message: str) -> str:
         self.messages.append((web_session_id, message))
@@ -23,6 +25,11 @@ class FakeAgentScopeRuntime:
     async def submit_human_decision(self, *, web_session_id: str, decision: dict) -> bool:
         self.decisions.append((web_session_id, decision))
         return self.accept_decision
+
+    async def subscribe_web_session_events(self, *, web_session_id: str):
+        self.subscriptions.append(web_session_id)
+        for event in self.events:
+            yield event
 
 
 def _client(tmp_path, runtime: FakeAgentScopeRuntime) -> TestClient:
@@ -56,6 +63,36 @@ def test_human_decision_confirm_is_accepted_and_forwarded(tmp_path) -> None:
     assert response.status_code == 200
     assert response.json() == {"accepted": True}
     assert runtime.decisions == [(session_id, payload)]
+
+
+def test_human_decision_confirm_drains_agentscope_events(tmp_path) -> None:
+    runtime = FakeAgentScopeRuntime()
+    runtime.events = [
+        {
+            "type": "final",
+            "source": "NavigationDataAgent",
+            "payload": {"text": "继续处理完成"},
+        }
+    ]
+    client = _client(tmp_path, runtime)
+    session_id = _create_session(client)
+
+    response = client.post(
+        f"/api/sessions/{session_id}/human-decisions",
+        json={
+            "action": "confirm",
+            "request_id": "request-1",
+            "tool_call_id": "tool-call-1",
+            "reply_id": "reply-1",
+        },
+    )
+
+    assert response.status_code == 200
+    assert runtime.subscriptions == [session_id]
+    detail = client.get(f"/api/sessions/{session_id}").json()["session"]
+    assert [(message["role"], message["content"]) for message in detail["messages"]] == [
+        ("assistant", "继续处理完成")
+    ]
 
 
 def test_human_decision_guide_requires_text(tmp_path) -> None:
