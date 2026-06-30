@@ -63,15 +63,15 @@ Modify:
 - `src/vla_data_juicer_agents/capabilities/session/orchestrator.py`
   - Remove navigation workflow tool routing semantics and pending workflow prompt from the web path.
 - `src/vla_data_juicer_agents/capabilities/session/runtime.py`
-  - Remove `pending_workflow_*` state or leave it only for legacy TUI tests behind an explicit legacy path.
+  - Remove `pending_workflow_*` state from the active web/session runtime.
 - `src/vla_data_juicer_agents/capabilities/session/toolkit.py`
   - Stop registering `vla_run_workflow` / `vla_continue_workflow` for the web AgentScope path.
 - `src/vla_data_juicer_agents/core/tool/registry.py`
-  - Stop default-loading old VLA workflow control tools for the web path; keep legacy registration only if tests still require the old TUI path.
+  - Stop default-loading old VLA workflow control tools; expose them only through an explicit legacy registration function.
 - `src/vla_data_juicer_agents/navigation/workflow.py`
   - Stop auto-confirming AgentScope confirmation events; retire it from web navigation processing.
 - `src/vla_data_juicer_agents/tools/vla/run_workflow.py`
-  - Disable or mark old workflow-control tools as legacy; preserve reusable internals if needed.
+  - Disable old workflow-control tools while preserving reusable business-processing internals behind new wrappers.
 - `frontend/src/api/types.ts`
   - Add human-decision event and API types.
 - `frontend/src/api/client.ts`
@@ -128,6 +128,12 @@ def test_config_reads_required_environment(monkeypatch):
     assert config.navigation_model == "qwen-plus"
     assert config.main_router_agent_id == "main-router-agent"
     assert config.navigation_agent_id == "navigation-data-agent"
+    assert config.redis_connection_kwargs() == {
+        "host": "redis",
+        "port": 6379,
+        "db": 2,
+        "password": None,
+    }
 
 
 def test_config_supports_separate_router_and_navigation_models(monkeypatch):
@@ -188,13 +194,46 @@ dependencies = [
 ]
 ```
 
+Modify `pyproject.toml` dev dependencies:
+
+```toml
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.2",
+    "pytest-asyncio>=0.23",
+]
+```
+
 Rationale:
 
 - AgentScope App imports scheduler components that require `apscheduler`.
 - AgentScope Redis backends require `redis.asyncio`.
 - DashScope model implementation calls the OpenAI-compatible client through `openai`.
+- New backend tests use `pytest.mark.asyncio`, so `pytest-asyncio` must be available in fresh environments.
 
-- [ ] **Step 4: Implement runtime config**
+- [ ] **Step 4: Install updated dependencies in the virtual environment**
+
+Run:
+
+```bash
+.venv/bin/python -m pip install -e ".[dev]"
+```
+
+Expected: `apscheduler`, `redis`, and `openai` are installed into `.venv`.
+
+If this command fails with a network or package-index error, rerun it with the required sandbox/network approval. Do not continue to Task 2 until `agentscope.app` can be imported:
+
+```bash
+.venv/bin/python -c "import agentscope.app; print('agentscope-app-ok')"
+```
+
+Expected:
+
+```text
+agentscope-app-ok
+```
+
+- [ ] **Step 5: Implement runtime config**
 
 Create `src/vla_data_juicer_agents/runtime/__init__.py`:
 
@@ -210,6 +249,7 @@ from __future__ import annotations
 import os
 from dataclasses import dataclass
 from pathlib import Path
+from urllib.parse import unquote, urlparse
 
 
 @dataclass(frozen=True)
@@ -226,6 +266,18 @@ class AgentScopeRuntimeConfig:
     main_router_agent_id: str = "main-router-agent"
     navigation_agent_id: str = "navigation-data-agent"
     agentscope_mount_path: str = "/api/agentscope"
+
+    def redis_connection_kwargs(self) -> dict[str, object]:
+        parsed = urlparse(self.redis_url)
+        if parsed.scheme != "redis":
+            raise RuntimeError("VLA_AGENT_REDIS_URL must use the redis:// scheme.")
+        db_text = parsed.path.lstrip("/") or "0"
+        return {
+            "host": parsed.hostname or "localhost",
+            "port": parsed.port or 6379,
+            "db": int(db_text),
+            "password": unquote(parsed.password) if parsed.password else None,
+        }
 
     @classmethod
     def from_env(cls, *, workspace_root: str | Path | None = None) -> "AgentScopeRuntimeConfig":
@@ -275,7 +327,7 @@ def _required_env(name: str) -> str:
     return value
 ```
 
-- [ ] **Step 5: Run tests**
+- [ ] **Step 6: Run tests**
 
 Run:
 
@@ -285,7 +337,7 @@ Run:
 
 Expected: all tests pass.
 
-- [ ] **Step 6: Commit**
+- [ ] **Step 7: Commit**
 
 Run:
 
@@ -587,6 +639,7 @@ Create `src/vla_data_juicer_agents/runtime/agentscope_runtime.py`:
 ```python
 from __future__ import annotations
 
+import asyncio
 from dataclasses import dataclass
 
 from agentscope.app import create_app as create_agentscope_app
@@ -606,12 +659,29 @@ class AgentScopeRuntime:
     message_bus: RedisMessageBus
     workspace_manager: LocalWorkspaceManager
     app: FastAPI
+    web_sessions: dict[str, tuple[str, str]]
+    bootstrapped: bool = False
+
+    def __post_init__(self) -> None:
+        self._bootstrap_lock = asyncio.Lock()
+
+    async def ensure_bootstrapped(self) -> None:
+        if self.bootstrapped:
+            return
+        async with self._bootstrap_lock:
+            if self.bootstrapped:
+                return
+            await bootstrap_agentscope_records(self.storage, self.config)
+            self.bootstrapped = True
 
 
 def create_agentscope_runtime(config: AgentScopeRuntimeConfig) -> AgentScopeRuntime:
-    storage = RedisStorage(redis_url=config.redis_url)
-    message_bus = RedisMessageBus(redis_url=config.redis_url)
-    workspace_manager = LocalWorkspaceManager(root_dir=str(config.workspace_root / "agentscope-workspaces"))
+    redis_kwargs = config.redis_connection_kwargs()
+    storage = RedisStorage(**redis_kwargs)
+    message_bus = RedisMessageBus(**redis_kwargs)
+    workspace_manager = LocalWorkspaceManager(
+        basedir=str(config.workspace_root / "agentscope-workspaces")
+    )
     app = create_agentscope_app(
         storage=storage,
         message_bus=message_bus,
@@ -620,20 +690,17 @@ def create_agentscope_runtime(config: AgentScopeRuntimeConfig) -> AgentScopeRunt
         title="DataPilot AgentScope Runtime",
     )
 
-    @app.on_event("startup")
-    async def _bootstrap_agents() -> None:
-        await bootstrap_agentscope_records(storage, config)
-
     return AgentScopeRuntime(
         config=config,
         storage=storage,
         message_bus=message_bus,
         workspace_manager=workspace_manager,
         app=app,
+        web_sessions={},
     )
 ```
 
-If AgentScope's `LocalWorkspaceManager` constructor does not accept `root_dir`, inspect `.venv/lib/python3.12/site-packages/agentscope/app/workspace_manager/_local_workspace_manager.py` and adjust only this constructor call. Add a focused test for the actual constructor if needed.
+Bootstrap is intentionally lazy in `ensure_bootstrapped()`. AgentScope's app owns the storage/message-bus lifecycle through its lifespan, so bootstrapping records from `submit_user_message(...)` avoids relying on FastAPI `on_event` hooks on a mounted sub-application that already has a custom lifespan.
 
 - [ ] **Step 4: Modify `create_app` signature and mount runtime**
 
@@ -698,6 +765,7 @@ Create `tests/test_navigation_agent_tools.py`:
 ```python
 from __future__ import annotations
 
+import pytest
 from agentscope.permission import PermissionBehavior
 
 from vla_data_juicer_agents.navigation.agent_tools import HumanDecisionTool
@@ -713,6 +781,7 @@ def test_human_decision_tool_is_external_and_schema_is_stable():
     assert tool.input_schema["required"] == ["decision_type", "request_id", "summary"]
 
 
+@pytest.mark.asyncio
 async def test_human_decision_tool_permission_is_allowed():
     tool = HumanDecisionTool()
 
@@ -1196,14 +1265,6 @@ from agentscope.message import UserMsg
 from vla_data_juicer_agents.navigation.routing import is_high_confidence_navigation_request
 ```
 
-Add fields to `AgentScopeRuntime`:
-
-```python
-    web_sessions: dict[str, tuple[str, str]]
-```
-
-When constructing, pass `web_sessions={}`.
-
 Add methods:
 
 ```python
@@ -1229,6 +1290,7 @@ Add methods:
         return session.id
 
     async def submit_user_message(self, *, web_session_id: str, message: str) -> str:
+        await self.ensure_bootstrapped()
         agent_id = (
             self.config.navigation_agent_id
             if is_high_confidence_navigation_request(message)
@@ -1245,12 +1307,10 @@ Add methods:
             self.config.user_id,
             session_id,
             agent_id,
-            UserMsg(content=message),
+            UserMsg(name="user", content=message),
         )
         return f"turn_{uuid4().hex}"
 ```
-
-If `UserMsg` requires a `name` argument in this installed AgentScope version, adjust to `UserMsg(name="user", content=message)` and add a regression test using the actual constructor.
 
 - [ ] **Step 5: Run focused tests**
 
@@ -1260,7 +1320,7 @@ Run:
 .venv/bin/python -m pytest tests/test_web_agentscope_session.py -q
 ```
 
-Expected: tests pass with fakes; full runtime method may need a small fake `chat_service` test if constructor signatures differ.
+Expected: tests pass with fakes.
 
 - [ ] **Step 6: Commit**
 
@@ -1434,7 +1494,7 @@ Append to `tests/test_web_agentscope_session.py`:
 ```python
 @pytest.mark.asyncio
 async def test_agentscope_web_session_manager_forwards_agent_events(tmp_path: Path):
-    events = []
+    published = []
 
     class RuntimeWithEvents(FakeAgentScopeRuntime):
         async def subscribe_web_session_events(self, *, web_session_id):
@@ -1446,17 +1506,24 @@ async def test_agentscope_web_session_manager_forwards_agent_events(tmp_path: Pa
 
     store = WebSessionStore(tmp_path / "sessions.sqlite")
     runtime = RuntimeWithEvents(config=FakeConfig())
-    manager = AgentScopeWebSessionManager(store=store, runtime=runtime, event_callback=events.append)
+    manager = AgentScopeWebSessionManager(
+        store=store,
+        runtime=runtime,
+        event_callback=lambda session_id, event: published.append((session_id, event)),
+    )
     session = await manager.create_session("创建会话")
 
     await manager.forward_events_until_idle(session.id)
 
-    assert events == [
-        {
-            "type": "assistant_delta",
-            "source": "NavigationDataAgent",
-            "payload": {"delta": "处理中"},
-        }
+    assert published == [
+        (
+            session.id,
+            {
+                "type": "assistant_delta",
+                "source": "NavigationDataAgent",
+                "payload": {"delta": "处理中"},
+            },
+        )
     ]
 ```
 
@@ -1490,7 +1557,7 @@ Add:
             return
         async for event in subscribe(web_session_id=session_id):
             if self._event_callback is not None:
-                self._event_callback(event)
+                self._event_callback(session_id, event)
             if event.get("type") == "final":
                 payload = event.get("payload", {})
                 text = payload.get("text") if isinstance(payload, dict) else None
@@ -1503,10 +1570,10 @@ Add:
 When constructing `AgentScopeWebSessionManager` in `web/app.py`, pass:
 
 ```python
-event_callback=lambda event: asyncio.create_task(bus.publish(event["session_id"], event))
+event_callback=lambda session_id, event: asyncio.create_task(bus.publish(session_id, event))
 ```
 
-If event payload does not include `session_id`, wrap the callback in `agent_session.py` so `forward_events_until_idle(session_id)` adds it before publishing. Prefer keeping public WebSocket event shape unchanged, so do not leak internal AgentScope session IDs in payload.
+Do not add `session_id` to the event payload. The callback receives the compatible web session id separately, keeping the public WebSocket event shape unchanged.
 
 In `submit_turn`, if `agentscope_runtime is not None`, schedule:
 
@@ -1516,7 +1583,16 @@ asyncio.create_task(manager.forward_events_until_idle(session_id))
 
 - [ ] **Step 5: Implement AgentScope runtime subscription**
 
-In `AgentScopeRuntime`, add:
+In `src/vla_data_juicer_agents/runtime/agentscope_runtime.py`, add imports:
+
+```python
+from typing import Any
+
+from vla_data_juicer_agents.adapters.agentscope.events import AgentScopeEventAdapter
+from vla_data_juicer_agents.core.events import CallbackEventSink, EventEmitter
+```
+
+Then add the subscription method to `AgentScopeRuntime`:
 
 ```python
     async def subscribe_web_session_events(self, *, web_session_id: str):
@@ -1525,19 +1601,19 @@ In `AgentScopeRuntime`, add:
             return
         _agent_id, agentscope_session_id = mapped
         async for event in self.message_bus.session_subscribe_events(agentscope_session_id):
-            yield event.model_dump(mode="json") if hasattr(event, "model_dump") else event
+            raw_event = event.model_dump(mode="json") if hasattr(event, "model_dump") else event
+            queue: asyncio.Queue[dict[str, Any]] = asyncio.Queue()
+            scope = EventEmitter(CallbackEventSink(queue.put_nowait)).scope(
+                "agentscope",
+                run_id=agentscope_session_id,
+            )
+            adapter = AgentScopeEventAdapter(scope)
+            adapter.accept(raw_event)
+            while not queue.empty():
+                yield await queue.get()
 ```
 
-Pass each raw event through `AgentScopeEventAdapter` before emitting to the compatibility bus. Create an `EventEmitter` with a callback that yields translated events. If this is awkward as an async generator, implement a small queue bridge:
-
-```python
-queue: asyncio.Queue[dict[str, Any]] = asyncio.Queue()
-scope = EventEmitter(CallbackEventSink(queue.put_nowait)).scope("agentscope", run_id=agentscope_session_id)
-adapter = AgentScopeEventAdapter(scope)
-adapter.accept(raw_event)
-while not queue.empty():
-    yield await queue.get()
-```
+This method always passes raw AgentScope events through `AgentScopeEventAdapter` before emitting to the compatibility bus.
 
 - [ ] **Step 6: Run tests**
 
@@ -1725,7 +1801,7 @@ Add:
         return True
 ```
 
-If `ToolResultBlock` field names differ in AgentScope 2.0.1, inspect `.venv/lib/python3.12/site-packages/agentscope/message/_base.py` and update this block plus tests together.
+AgentScope 2.0.1 defines `ToolResultBlock(id, name, output, state)` and `ToolResultState.SUCCESS`, so do not use alternate field names here.
 
 - [ ] **Step 5: Add FastAPI endpoint**
 
@@ -1821,7 +1897,7 @@ def _ensure_default_tools() -> None:
     _DEFAULTS_LOADED = True
 ```
 
-If TUI tests still need `vla_run_workflow`, add a separate explicit function:
+Add a separate explicit legacy registration function for non-web legacy callers:
 
 ```python
 def register_legacy_vla_workflow_tools() -> None:
@@ -1832,7 +1908,7 @@ def register_legacy_vla_workflow_tools() -> None:
             register_tool_spec(spec)
 ```
 
-Only call this function from legacy CLI/TUI paths that still need the old behavior. Do not call it from the web AgentScope path.
+Do not call `register_legacy_vla_workflow_tools()` from the web AgentScope path or from `get_session_tool_specs()`. Legacy CLI/TUI entry points that still intentionally exercise the old command can call this function explicitly in their setup.
 
 - [ ] **Step 4: Remove pending workflow fields from active web runtime**
 
@@ -1848,7 +1924,7 @@ Remove from `SessionState`:
 
 Remove pending workflow serialization in `context_payload`.
 
-If existing TUI tests require these fields, keep a separate `LegacySessionState` only in the legacy module and update tests to assert web runtime no longer exposes `pending_workflow`.
+Do not keep these fields on `SessionState`. Update tests to assert the active web/session runtime no longer exposes `pending_workflow`. If a legacy-only test needs historical checkpoint fixtures, keep that fixture data local to the test or legacy module, not in `SessionState`.
 
 - [ ] **Step 5: Simplify old orchestrator prompt**
 
@@ -1856,7 +1932,7 @@ Modify `src/vla_data_juicer_agents/capabilities/session/orchestrator.py`:
 
 - Remove instructions telling the agent to call `vla_run_workflow`.
 - Remove instructions telling the agent to call `vla_continue_workflow`.
-- Add a short legacy warning if this class is still used outside web:
+- Add a short legacy warning:
 
 ```python
 "Navigation data processing is handled by the dedicated web NavigationDataAgent. "
@@ -1958,7 +2034,7 @@ return RunVLAWorkflowOutput(
 ```
 
 - Change `VLA_CONTINUE_WORKFLOW.description` to say it is legacy-disabled.
-- If `run_vla_workflow(...)` is still needed by legacy CLI tests, keep it but remove all `_set_pending_workflow(...)` calls and make calibration pause return `status="disabled"` or `status="failed"` with the same `legacy_workflow_resume_disabled` error. The web path must not use this tool.
+- Keep `run_vla_workflow(...)` importable for legacy callers, but remove all `_set_pending_workflow(...)` calls. If it reaches the old calibration pause branch, return `status="disabled"` with `error_type="legacy_workflow_resume_disabled"`. The web path must not use this tool.
 
 - [ ] **Step 5: Run tests**
 
