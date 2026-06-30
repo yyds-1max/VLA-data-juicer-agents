@@ -28,6 +28,7 @@ The selected direction is to reuse AgentScope's App/Service runtime and Redis-ba
 - Do not make deterministic backend code execute the entire navigation workflow plan step by step.
 - Do not add broad unrelated refactors outside the agent runtime, routing, confirmation, and navigation workflow boundaries.
 - Do not include Phase 3 frontend-native migration in the immediate implementation plan.
+- Do not rewrite the existing business tools that already perform real navigation data processing unless a tool is tightly coupled to the old workflow-control patch and cannot be safely adapted.
 
 ## Current Problems
 
@@ -94,6 +95,30 @@ The agent uses a plan-and-execute plus ReAct pattern:
 9. Produce a final summary with generated outputs, skipped steps, failures, and any next actions.
 
 AgentScope task tools may be used to maintain visible plan/task state, but the LLM agent remains responsible for reasoning and choosing tool calls. The backend must not become a deterministic workflow interpreter for the whole navigation process.
+
+## Tool Reuse And Adaptation
+
+Existing tools and scripts that already perform real navigation data processing should be reused. This includes data inspection, output generation, annotation GUI invocation, and processing command execution when their current behavior is correct. The migration should not turn into a full rewrite of business processing logic.
+
+The work in this task is to adapt tool boundaries and protocols for durable agent execution:
+
+- Remove TUI-style typed confirmation requirements from tools.
+- Remove responsibility for workflow pause/resume from business tools.
+- Return structured results instead of sentinel strings or implicit status encoded in logs.
+- Report paths, generated outputs, detected existing outputs, recoverable errors, and retry hints explicitly.
+- Keep destructive actions separated from checks so the agent can request user confirmation before overwrite/delete execution.
+- Make wrappers idempotent where practical so failure retry can be safe.
+- Keep the annotation GUI invocation as a real blocking operation when that is the correct business behavior, but expose its start, completion, and failure result clearly to the agent.
+
+New or adjusted tools should be limited to AgentScope/runtime adaptation:
+
+- A human-decision tool for camera parameter confirmation, overwrite confirmation, and delete confirmation.
+- Thin wrapper tools around existing navigation scripts/functions to normalize schemas and results.
+- Output existence and destructive-action risk check tools.
+- Dataset investigation and summary tools for the navigation agent's planning step, if the existing tools do not already expose that information cleanly.
+- Optional plan/task status helpers, preferably reusing AgentScope task tools.
+
+Old workflow-control tools and paths, such as `run_vla_workflow`, `continue_vla_workflow`, and `pending_workflow`-based resume behavior, belong to Phase 2 removal or disabling. Their business processing internals may be reused behind new wrappers, but their workflow-control semantics should not survive the migration.
 
 ## Interrupt/Resume Semantics
 
@@ -217,6 +242,7 @@ Phase 1: Durable backend kernel with compatibility frontend
 - Implement backend routing from compatible web sessions to AgentScope sessions.
 - Convert user messages, agent replies, tool events, human-decision requests, and decision results between the current frontend protocol and AgentScope.
 - Implement `NavigationDataAgent` with plan-and-execute plus ReAct prompting and navigation tools.
+- Adapt existing navigation processing tools through thin wrappers and structured schemas rather than rewriting the business processing logic.
 - Replace typed confirmation with AgentScope durable human-decision events and frontend dialogs.
 - Keep existing frontend APIs mostly stable.
 
@@ -226,6 +252,7 @@ Phase 2: Remove old workflow patching
 - Remove special `continue_vla_workflow` routing.
 - Stop auto-confirming AgentScope confirmation events in navigation workflow streaming.
 - Retire the Plan-Agent / Executor-Agent split for navigation processing.
+- Remove old workflow-control semantics while reusing any valid business processing internals behind the new navigation tools.
 - Keep old code only behind temporary compatibility flags if needed for controlled rollout.
 
 Phase 3: Frontend native migration
@@ -268,3 +295,4 @@ Manual integration tests should cover:
 - Redis is required for durable server runtime state.
 - The implementation path does not require a full frontend rewrite in the first phase.
 - The completed implementation removes or disables the old workflow patching path covered by Phase 2, not only the new AgentScope compatibility path from Phase 1.
+- Existing real navigation processing capabilities are reused behind adapted tool interfaces instead of being rewritten wholesale.
