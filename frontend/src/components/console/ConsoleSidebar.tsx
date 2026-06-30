@@ -1,4 +1,4 @@
-import { Bot, ChartNoAxesCombined, Database, FlaskConical, GitBranch, PenTool, Route } from "lucide-react";
+import { Bot, ChartNoAxesCombined, Database, FlaskConical, GitBranch, PenTool } from "lucide-react";
 
 import type { ConsolePageId, NavItem } from "../../features/console/consoleTypes";
 import { cn } from "../../lib/utils";
@@ -22,12 +22,16 @@ export function ConsoleSidebar({ activePage, onChange }: ConsoleSidebarProps) {
     <aside className="fixed inset-x-0 top-0 z-20 border-b border-console-line bg-console-panel/95 px-4 shadow-sm backdrop-blur md:inset-y-0 md:left-0 md:right-auto md:w-64 md:border-b-0 md:border-r md:px-0 md:shadow-none">
       <div className="flex h-full flex-col">
         <div className="flex h-16 items-center gap-3 md:h-auto md:border-b md:border-console-line md:p-5">
-          <div className="flex h-10 w-10 shrink-0 items-center justify-center rounded-lg border border-console-line bg-console-text text-white shadow-sm">
-            <Route className="h-5 w-5" aria-hidden="true" />
+          <div className="flex h-10 w-10 shrink-0 items-center justify-center rounded-lg border border-console-line bg-white p-1.5 shadow-sm">
+            <img
+              src="/brand/wise-explore-favicon.png"
+              alt="智瀚星途 logo"
+              className="max-h-full max-w-full object-contain"
+            />
           </div>
           <div className="min-w-0">
-            <div className="truncate text-sm font-semibold text-console-text">智瀚星途 DataLoop</div>
-            <div className="truncate text-[11px] text-console-muted">Voyager Forge</div>
+            <div className="truncate text-base font-semibold tracking-normal text-console-text">智瀚星途</div>
+            <div className="truncate text-[10px] font-medium uppercase tracking-[0.34em] text-console-muted">WISEXPLORE</div>
           </div>
         </div>
 

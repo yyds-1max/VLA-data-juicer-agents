@@ -3,12 +3,22 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import {
   createSession,
   getSession,
+  getNavigationDatasetDate,
+  getNavigationDatasetSummary,
+  getSyncImageUrl,
+  getSyncImages,
   interruptTurn,
   listSessions,
   openSessionEvents,
   submitTurn,
 } from "./client";
-import type { AgentEvent, SessionDetail, SessionRecord } from "./types";
+import type {
+  AgentEvent,
+  NavigationDatasetSummary,
+  NavigationSyncImageListing,
+  SessionDetail,
+  SessionRecord,
+} from "./types";
 
 function session(overrides: Partial<SessionRecord> = {}): SessionRecord {
   return {
@@ -137,5 +147,77 @@ describe("api client", () => {
     onMessage(new MessageEvent("message", { data: JSON.stringify(event) }));
 
     expect(onEvent).toHaveBeenCalledWith(event);
+  });
+
+  it("gets the navigation dataset summary", async () => {
+    const summary: NavigationDatasetSummary = {
+      totals: {
+        date_count: 1,
+        clip_count: 2,
+        total_duration_ns: 1000,
+        raw_message_count: 50,
+        extracted_clip_count: 1,
+        synced_clip_count: 1,
+      },
+      sync_distribution: {
+        image: 10,
+        pointcloud: 8,
+        odom: 7,
+        grid_map: 6,
+      },
+      dates: [],
+    };
+    const fetchMock = mockFetchJson(summary);
+
+    await expect(getNavigationDatasetSummary()).resolves.toEqual(summary);
+    expect(fetchMock).toHaveBeenCalledWith("/api/navigation/datasets/summary", {
+      headers: { "content-type": "application/json" },
+    });
+  });
+
+  it("encodes the date when getting navigation dataset date detail", async () => {
+    const detail = {
+      date: "2026/06 29",
+      clip_count: 1,
+      total_duration_ns: 1000,
+      raw_message_count: 50,
+      extracted_clip_count: 1,
+      synced_clip_count: 1,
+      sync_frame_counts: {
+        image: 10,
+        pointcloud: 8,
+        odom: 7,
+        grid_map: 6,
+      },
+      status: "synced",
+      clips: [],
+    };
+    const fetchMock = mockFetchJson(detail);
+
+    await expect(getNavigationDatasetDate("2026/06 29")).resolves.toEqual(detail);
+    expect(fetchMock).toHaveBeenCalledWith("/api/navigation/datasets/2026%2F06%2029", {
+      headers: { "content-type": "application/json" },
+    });
+  });
+
+  it("encodes the clip when listing sync images", async () => {
+    const listing: NavigationSyncImageListing = {
+      date: "2026-06-29",
+      clip: "clip/with space",
+      sequences: [{ sequence: "seq-1", images: ["000001.jpg"] }],
+    };
+    const fetchMock = mockFetchJson(listing);
+
+    await expect(getSyncImages("2026-06-29", "clip/with space")).resolves.toEqual(listing);
+    expect(fetchMock).toHaveBeenCalledWith(
+      "/api/navigation/datasets/2026-06-29/clips/clip%2Fwith%20space/sync-images",
+      { headers: { "content-type": "application/json" } },
+    );
+  });
+
+  it("encodes date, clip, sequence, and filename when building a sync image URL", () => {
+    expect(getSyncImageUrl("2026/06 29", "clip/1", "seq 1/left", "frame 1.png")).toBe(
+      "/api/navigation/datasets/2026%2F06%2029/clips/clip%2F1/sync-images/seq%201%2Fleft/frame%201.png",
+    );
   });
 });

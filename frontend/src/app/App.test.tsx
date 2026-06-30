@@ -3,7 +3,10 @@ import { fireEvent, render, screen, waitFor } from "@testing-library/react";
 
 import {
   createSession,
+  getNavigationDatasetSummary,
   getSession,
+  getSyncImages,
+  getSyncImageUrl,
   interruptTurn,
   listSessions,
   openSessionEvents,
@@ -11,12 +14,16 @@ import {
 } from "../api/client";
 import { Composer } from "../components/datapilot/Composer";
 import { formatActiveText, MessageList } from "../components/datapilot/MessageList";
+import { resetNavigationDatasetSummaryCache } from "../features/console/navigationDatasetSummaryCache";
 import { createEmptyRunState } from "../store/eventReducer";
 import { datapilotStore } from "../store/datapilotStore";
 import { App } from "./App";
 
 vi.mock("../api/client", () => ({
   createSession: vi.fn(),
+  getNavigationDatasetSummary: vi.fn(),
+  getSyncImages: vi.fn(),
+  getSyncImageUrl: vi.fn(),
   listSessions: vi.fn(),
   getSession: vi.fn(),
   submitTurn: vi.fn(),
@@ -26,6 +33,9 @@ vi.mock("../api/client", () => ({
 
 const apiMocks = vi.mocked({
   createSession,
+  getNavigationDatasetSummary,
+  getSyncImages,
+  getSyncImageUrl,
   listSessions,
   getSession,
   submitTurn,
@@ -42,8 +52,49 @@ function activeSocket(close: () => void = vi.fn()): WebSocket {
   return { close, readyState: WebSocket.OPEN } as unknown as WebSocket;
 }
 
+function deferred<T>() {
+  let resolve!: (value: T) => void;
+  let reject!: (reason?: unknown) => void;
+  const promise = new Promise<T>((promiseResolve, promiseReject) => {
+    resolve = promiseResolve;
+    reject = promiseReject;
+  });
+  return { promise, resolve, reject };
+}
+
+function mockScrollableElement(element: HTMLElement) {
+  Object.defineProperty(element, "clientHeight", { configurable: true, value: 100 });
+  Object.defineProperty(element, "scrollHeight", { configurable: true, value: 220 });
+  Object.defineProperty(element, "clientWidth", { configurable: true, value: 100 });
+  Object.defineProperty(element, "scrollWidth", { configurable: true, value: 220 });
+  element.getBoundingClientRect = vi.fn(
+    () =>
+      ({
+        bottom: 100,
+        height: 100,
+        left: 0,
+        right: 100,
+        toJSON: () => ({}),
+        top: 0,
+        width: 100,
+        x: 0,
+        y: 0,
+      }) as DOMRect,
+  );
+}
+
+async function renderAppWithDashboardSettled() {
+  const result = render(<App />);
+
+  await waitFor(() => expect(apiMocks.getNavigationDatasetSummary).toHaveBeenCalled());
+  await waitFor(() => expect(screen.getByText("3.5 秒")).toBeInTheDocument());
+
+  return result;
+}
+
 beforeEach(() => {
   vi.clearAllMocks();
+  resetNavigationDatasetSummaryCache();
   Object.defineProperty(window, "innerWidth", { configurable: true, writable: true, value: 1280 });
   Object.defineProperty(window, "innerHeight", { configurable: true, writable: true, value: 900 });
   apiMocks.createSession.mockResolvedValue({
@@ -65,6 +116,91 @@ beforeEach(() => {
   apiMocks.submitTurn.mockResolvedValue("turn-1");
   apiMocks.interruptTurn.mockResolvedValue(true);
   apiMocks.openSessionEvents.mockReturnValue(activeSocket());
+  apiMocks.getNavigationDatasetSummary.mockResolvedValue({
+    totals: {
+      date_count: 1,
+      clip_count: 2,
+      total_duration_ns: 3_500_000_000,
+      raw_message_count: 40,
+      extracted_clip_count: 1,
+      synced_clip_count: 1,
+    },
+    sync_distribution: {
+      image: 3,
+      pointcloud: 2,
+      odom: 2,
+      grid_map: 1,
+    },
+    dates: [
+      {
+        date: "20270515",
+        clip_count: 2,
+        total_duration_ns: 3_500_000_000,
+        raw_message_count: 40,
+        extracted_clip_count: 1,
+        synced_clip_count: 1,
+        sync_frame_counts: {
+          image: 3,
+          pointcloud: 2,
+          odom: 2,
+          grid_map: 1,
+        },
+        status: "synced",
+        clips: [
+          {
+            date: "20270515",
+            clip: "clip_a",
+            duration_ns: 1_500_000_000,
+            raw_message_count: 18,
+            topics: [
+              { name: "/camera/front/image_raw", type: "sensor_msgs/msg/Image", message_count: 12 },
+              { name: "/odom", type: "nav_msgs/msg/Odometry", message_count: 6 },
+            ],
+            has_tmp_dir: true,
+            has_sync_data: true,
+            sequences: [],
+            sync_frame_counts: {
+              image: 2,
+              pointcloud: 0,
+              odom: 0,
+              grid_map: 0,
+            },
+            status: "synced",
+            errors: [],
+          },
+          {
+            date: "20270515",
+            clip: "clip_b",
+            duration_ns: 2_000_000_000,
+            raw_message_count: 22,
+            topics: [{ name: "/camera/front/image_raw", type: "sensor_msgs/msg/Image", message_count: 22 }],
+            has_tmp_dir: true,
+            has_sync_data: false,
+            sequences: [],
+            sync_frame_counts: {
+              image: 3,
+              pointcloud: 2,
+              odom: 2,
+              grid_map: 1,
+            },
+            status: "extracted",
+            errors: [],
+          },
+        ],
+      },
+    ],
+  });
+  apiMocks.getSyncImages.mockResolvedValue({
+    date: "20270515",
+    clip: "clip_a",
+    sequences: [
+      { sequence: "seq_a", images: ["001.jpg", "002.jpg"] },
+      { sequence: "seq_b", images: ["010.jpg"] },
+    ],
+  });
+  apiMocks.getSyncImageUrl.mockImplementation(
+    (date, clip, sequence, filename) => `/sync-images/${date}/${clip}/${sequence}/${filename}`,
+  );
 
   datapilotStore.setState({
     open: false,
@@ -78,11 +214,14 @@ beforeEach(() => {
   });
 });
 
-test("renders the full DataLoop console shell by default", () => {
-  render(<App />);
+test("renders the full DataLoop console shell by default", async () => {
+  await renderAppWithDashboardSettled();
 
-  expect(screen.getByText("智瀚星途 DataLoop")).toBeVisible();
-  expect(screen.getByText("Voyager Forge")).toBeVisible();
+  expect(screen.getByRole("img", { name: "智瀚星途 logo" })).toHaveAttribute("src", "/brand/wise-explore-favicon.png");
+  expect(screen.getByText("智瀚星途")).toBeVisible();
+  expect(screen.getByText("WISEXPLORE")).toBeVisible();
+  expect(screen.queryByText("智瀚星途 DataLoop")).not.toBeInTheDocument();
+  expect(screen.queryByText("Voyager Forge")).not.toBeInTheDocument();
   expect(screen.getByText("智瀚星途数据处理系统")).toBeVisible();
   expect(screen.queryByText("Mock workspace")).not.toBeInTheDocument();
   expect(screen.queryByText("frontend only")).not.toBeInTheDocument();
@@ -91,26 +230,32 @@ test("renders the full DataLoop console shell by default", () => {
   expect(screen.getByRole("button", { name: "Open DataPilot" })).toBeVisible();
 });
 
-test("dashboard preserves reference metric and activity content", () => {
-  render(<App />);
+test("dashboard renders navigation dataset summary metrics and distribution", async () => {
+  await renderAppWithDashboardSettled();
 
   expect(screen.getByText("总数据量")).toBeVisible();
-  expect(screen.getByText("284,729")).toBeVisible();
+  expect(await screen.findByText("3.5 秒")).toBeVisible();
+  expect(screen.getByText("1 个日期 / 2 个 clip / 40 条 ROS 消息")).toBeVisible();
   expect(screen.getByText("数据类型分布")).toBeVisible();
+  expect(screen.getByText("同步图像帧")).toBeVisible();
+  expect(screen.getByText("同步点云帧")).toBeVisible();
+  expect(screen.getByText("总数")).toBeVisible();
+  expect(screen.getByText("3")).toBeVisible();
+  expect(screen.queryByText("3%")).not.toBeInTheDocument();
   expect(screen.getByText("数据闭环流程")).toBeVisible();
   expect(screen.getByText("最近活动")).toBeVisible();
 });
 
-test("dashboard metric chart tabs switch between success and loss", () => {
-  render(<App />);
+test("dashboard metric chart tabs switch between success and loss", async () => {
+  await renderAppWithDashboardSettled();
 
   expect(screen.getByText("Success Rate (%)")).toBeVisible();
   fireEvent.click(screen.getByRole("tab", { name: "损失值" }));
   expect(screen.getByText("Training Loss")).toBeVisible();
 });
 
-test("sidebar navigation switches console pages", () => {
-  render(<App />);
+test("sidebar navigation switches console pages", async () => {
+  await renderAppWithDashboardSettled();
 
   fireEvent.click(screen.getByRole("button", { name: "Agent 工作流" }));
   expect(screen.getByRole("heading", { name: "Agent 工作流" })).toBeVisible();
@@ -119,36 +264,349 @@ test("sidebar navigation switches console pages", () => {
   expect(screen.getByRole("heading", { name: "测试/仿真" })).toBeVisible();
 });
 
-test("data management tabs render image pointcloud text and unlock panels", () => {
-  render(<App />);
+test("data management renders navigation dataset date and clip details", async () => {
+  await renderAppWithDashboardSettled();
 
   fireEvent.click(screen.getByRole("button", { name: "数据管理" }));
-  expect(screen.getByText("IMG-000")).toBeVisible();
 
-  fireEvent.click(screen.getByRole("tab", { name: "点云数据" }));
-  expect(screen.getByText("PCD-000")).toBeVisible();
+  expect(await screen.findByText("20270515")).toBeVisible();
+  expect(screen.getByText("日期批次")).toBeVisible();
+  expect(screen.getByText("原始 clip")).toBeVisible();
+  expect(screen.getByText("已同步 clip")).toBeVisible();
+  expect(screen.getByTestId("navigation-summary-strip")).toHaveClass("bg-transparent");
+  expect(screen.getByTestId("navigation-summary-strip")).not.toHaveClass("rounded-lg", "border", "shadow-sm");
+  expect(screen.getByTestId("navigation-summary-strip")).toHaveTextContent("总采集时长3.5 秒");
+  expect(screen.getByTestId("navigation-summary-strip")).toHaveTextContent("同步图像帧3");
+  expect(screen.getByTestId("navigation-process-overview")).toHaveTextContent("raw_data");
+  expect(screen.getByTestId("navigation-process-overview")).toHaveTextContent("sync_data");
+  expect(screen.getByTestId("navigation-process-overview").innerHTML).not.toContain("bg-console-panel2/70 p-3");
+  expect(screen.getByTestId("navigation-process-stepper")).toBeVisible();
+  expect(screen.getAllByTestId("navigation-process-step")).toHaveLength(3);
+  expect(screen.getByRole("columnheader", { name: "clip 数" })).toBeVisible();
+  expect(screen.getByRole("columnheader", { name: "raw 消息" })).toBeVisible();
+  expect(screen.getByTestId("navigation-dataset-scroll")).toHaveClass("console-soft-scrollbar", "max-h-[62vh]", "overflow-auto", "pb-3");
+  const datasetScroll = screen.getByTestId("navigation-dataset-scroll");
+  mockScrollableElement(datasetScroll);
 
-  fireEvent.click(screen.getByRole("tab", { name: "文本数据" }));
-  expect(screen.getByText(/将红色杯子/)).toBeVisible();
+  fireEvent.pointerMove(datasetScroll, { clientX: 40, clientY: 40 });
+  expect(datasetScroll).not.toHaveClass("is-scrollbar-vertical-near");
+  expect(datasetScroll).not.toHaveClass("is-scrollbar-horizontal-near");
 
-  fireEvent.click(screen.getByRole("tab", { name: "数据解锁" }));
-  expect(screen.getByText("解锁规则配置")).toBeVisible();
-  expect(screen.getByText("批次管理")).toBeVisible();
-});
+  fireEvent.pointerMove(datasetScroll, { clientX: 96, clientY: 40 });
+  expect(datasetScroll).toHaveClass("is-scrollbar-vertical-near");
+  expect(datasetScroll).not.toHaveClass("is-scrollbar-horizontal-near");
 
-test("console shared tabs switch visible panels without remounting DataPilot", () => {
-  render(<App />);
+  fireEvent.pointerLeave(datasetScroll);
+  expect(datasetScroll).not.toHaveClass("is-scrollbar-vertical-near");
+  expect(datasetScroll).not.toHaveClass("is-scrollbar-horizontal-near");
 
-  fireEvent.click(screen.getByRole("button", { name: "数据管理" }));
-  fireEvent.click(screen.getByRole("tab", { name: "点云数据" }));
+  fireEvent.pointerMove(datasetScroll, { clientX: 40, clientY: 96 });
+  expect(datasetScroll).not.toHaveClass("is-scrollbar-vertical-near");
+  expect(datasetScroll).toHaveClass("is-scrollbar-horizontal-near");
 
-  expect(screen.getByText("PCD-000")).toBeVisible();
-  expect(screen.queryByText("IMG-000")).not.toBeVisible();
+  fireEvent.click(screen.getByRole("button", { name: "展开 20270515" }));
+
+  expect(screen.getByRole("columnheader", { name: "clip 名称" })).toBeVisible();
+  expect(screen.getByRole("columnheader", { name: "topic 摘要" })).toBeVisible();
+  expect(screen.getByTestId("navigation-clip-scroll")).toHaveClass("console-soft-scrollbar", "max-h-80", "overflow-auto");
+  expect(screen.getByText("clip_a")).toBeVisible();
+  expect(screen.getAllByText("已同步").length).toBeGreaterThan(0);
+  expect(screen.getByRole("button", { name: "查看 clip_a 同步图像" })).toBeEnabled();
   expect(screen.getByRole("button", { name: "Open DataPilot" })).toBeVisible();
 });
 
-test("annotation page switches pipeline results and review views", () => {
-  render(<App />);
+test("data management switches between navigation and robotic arm data surfaces", async () => {
+  await renderAppWithDashboardSettled();
+
+  fireEvent.click(screen.getByRole("button", { name: "数据管理" }));
+
+  expect(await screen.findByRole("tab", { name: "导航数据" })).toBeVisible();
+  expect(screen.getByRole("tab", { name: "机械臂数据" })).toBeVisible();
+  expect(screen.getByRole("button", { name: "全部场景" })).toBeVisible();
+  expect(screen.getByRole("button", { name: "全部状态" })).toBeVisible();
+  expect(screen.getByPlaceholderText("按日期或 clip 搜索")).toBeVisible();
+
+  fireEvent.click(screen.getByRole("tab", { name: "机械臂数据" }));
+
+  expect(screen.getByText("机械臂数据接入中")).toBeVisible();
+  expect(screen.getByRole("button", { name: "全部场景" })).toBeVisible();
+  expect(screen.getByRole("button", { name: "全部状态" })).toBeVisible();
+  expect(screen.getByPlaceholderText("按日期或 clip 搜索")).toBeVisible();
+});
+
+test("data management filters navigation dates by status", async () => {
+  apiMocks.getNavigationDatasetSummary.mockResolvedValue({
+    totals: {
+      date_count: 2,
+      clip_count: 3,
+      total_duration_ns: 3_500_000_000,
+      raw_message_count: 90,
+      extracted_clip_count: 1,
+      synced_clip_count: 1,
+    },
+    sync_distribution: { image: 2, pointcloud: 1, odom: 1, grid_map: 1 },
+    dates: [
+      {
+        date: "20270515",
+        clip_count: 2,
+        total_duration_ns: 2_000_000_000,
+        raw_message_count: 40,
+        extracted_clip_count: 1,
+        synced_clip_count: 1,
+        sync_frame_counts: { image: 2, pointcloud: 1, odom: 1, grid_map: 1 },
+        status: "synced",
+        clips: [
+          {
+            date: "20270515",
+            clip: "20260515_102948",
+            duration_ns: 1_500_000_000,
+            raw_message_count: 18,
+            topics: [{ name: "/camera/front/image_raw", type: "sensor_msgs/msg/Image", message_count: 12 }],
+            has_tmp_dir: true,
+            has_sync_data: true,
+            sequences: [],
+            sync_frame_counts: { image: 2, pointcloud: 1, odom: 1, grid_map: 1 },
+            status: "synced",
+            errors: [],
+          },
+        ],
+      },
+      {
+        date: "20270601",
+        clip_count: 1,
+        total_duration_ns: 1_500_000_000,
+        raw_message_count: 50,
+        extracted_clip_count: 0,
+        synced_clip_count: 0,
+        sync_frame_counts: { image: 0, pointcloud: 0, odom: 0, grid_map: 0 },
+        status: "raw_only",
+        clips: [
+          {
+            date: "20270601",
+            clip: "20260601_083000",
+            duration_ns: 1_500_000_000,
+            raw_message_count: 50,
+            topics: [{ name: "/odom", type: "nav_msgs/msg/Odometry", message_count: 50 }],
+            has_tmp_dir: false,
+            has_sync_data: false,
+            sequences: [],
+            sync_frame_counts: { image: 0, pointcloud: 0, odom: 0, grid_map: 0 },
+            status: "raw_only",
+            errors: [],
+          },
+        ],
+      },
+    ],
+  });
+  await renderAppWithDashboardSettled();
+
+  fireEvent.click(screen.getByRole("button", { name: "数据管理" }));
+  expect(await screen.findByText("20270515")).toBeVisible();
+  expect(screen.getByText("20270601")).toBeVisible();
+
+  fireEvent.click(screen.getByRole("button", { name: "全部状态" }));
+  fireEvent.click(screen.getByRole("option", { name: "待处理" }));
+
+  expect(screen.getByText("20270601")).toBeVisible();
+  expect(screen.queryByText("20270515")).not.toBeInTheDocument();
+});
+
+test("data management filter menus close when clicking outside", async () => {
+  await renderAppWithDashboardSettled();
+
+  fireEvent.click(screen.getByRole("button", { name: "数据管理" }));
+  await screen.findByRole("tab", { name: "导航数据" });
+
+  fireEvent.click(screen.getByRole("button", { name: "全部场景" }));
+  expect(screen.getByRole("option", { name: "室外导航" })).toBeVisible();
+
+  fireEvent.pointerDown(screen.getByPlaceholderText("按日期或 clip 搜索"));
+  expect(screen.queryByRole("option", { name: "室外导航" })).not.toBeInTheDocument();
+
+  fireEvent.click(screen.getByRole("button", { name: "全部状态" }));
+  expect(screen.getByRole("option", { name: "待处理" })).toBeVisible();
+
+  fireEvent.pointerDown(screen.getByRole("heading", { name: "数据管理" }));
+  expect(screen.queryByRole("option", { name: "待处理" })).not.toBeInTheDocument();
+});
+
+test("data management search suggests dates and expands matching clips", async () => {
+  apiMocks.getNavigationDatasetSummary.mockResolvedValue({
+    totals: {
+      date_count: 1,
+      clip_count: 1,
+      total_duration_ns: 3_500_000_000,
+      raw_message_count: 40,
+      extracted_clip_count: 1,
+      synced_clip_count: 1,
+    },
+    sync_distribution: { image: 2, pointcloud: 1, odom: 1, grid_map: 1 },
+    dates: [
+      {
+        date: "20270515",
+        clip_count: 1,
+        total_duration_ns: 3_500_000_000,
+        raw_message_count: 40,
+        extracted_clip_count: 1,
+        synced_clip_count: 1,
+        sync_frame_counts: { image: 2, pointcloud: 1, odom: 1, grid_map: 1 },
+        status: "synced",
+        clips: [
+          {
+            date: "20270515",
+            clip: "20260515_102948",
+            duration_ns: 3_500_000_000,
+            raw_message_count: 40,
+            topics: [{ name: "/camera/front/image_raw", type: "sensor_msgs/msg/Image", message_count: 40 }],
+            has_tmp_dir: true,
+            has_sync_data: true,
+            sequences: [],
+            sync_frame_counts: { image: 2, pointcloud: 1, odom: 1, grid_map: 1 },
+            status: "synced",
+            errors: [],
+          },
+        ],
+      },
+    ],
+  });
+  await renderAppWithDashboardSettled();
+
+  fireEvent.click(screen.getByRole("button", { name: "数据管理" }));
+  const searchInput = await screen.findByPlaceholderText("按日期或 clip 搜索");
+
+  fireEvent.change(searchInput, { target: { value: "2027" } });
+  expect(screen.getByRole("option", { name: "20270515" })).toBeVisible();
+
+  fireEvent.change(searchInput, { target: { value: "20260515_" } });
+  fireEvent.click(screen.getByRole("option", { name: "20260515_102948" }));
+
+  expect(searchInput).toHaveValue("20260515_102948");
+  expect(screen.getByText("20270515")).toBeVisible();
+  expect(screen.getByRole("columnheader", { name: "clip 名称" })).toBeVisible();
+  expect(screen.getByText("20260515_102948")).toBeVisible();
+  expect(screen.getByText("20260515_102948").closest("tr")).toHaveClass("bg-console-cyan/10");
+  expect(screen.queryByText("匹配")).not.toBeInTheDocument();
+});
+
+test("navigation dataset summary is reused while switching console pages", async () => {
+  await renderAppWithDashboardSettled();
+  expect(apiMocks.getNavigationDatasetSummary).toHaveBeenCalledTimes(1);
+
+  fireEvent.click(screen.getByRole("button", { name: "自动标注" }));
+  expect(screen.getByText("视觉检测")).toBeVisible();
+
+  fireEvent.click(screen.getByRole("button", { name: "闭环仪表盘" }));
+  expect(await screen.findByText("3.5 秒")).toBeVisible();
+  expect(apiMocks.getNavigationDatasetSummary).toHaveBeenCalledTimes(1);
+
+  fireEvent.click(screen.getByRole("button", { name: "数据管理" }));
+  expect(await screen.findByText("20270515")).toBeVisible();
+  expect(apiMocks.getNavigationDatasetSummary).toHaveBeenCalledTimes(1);
+});
+
+test("data management opens synchronized image drawer and browses sequences", async () => {
+  await renderAppWithDashboardSettled();
+
+  fireEvent.click(screen.getByRole("button", { name: "数据管理" }));
+  fireEvent.click(await screen.findByRole("button", { name: "展开 20270515" }));
+  fireEvent.click(screen.getByRole("button", { name: "查看 clip_a 同步图像" }));
+
+  expect(await screen.findByRole("dialog", { name: "同步图像浏览" })).toBeVisible();
+  expect(apiMocks.getSyncImages).toHaveBeenCalledWith("20270515", "clip_a");
+  expect(screen.getByRole("button", { name: "001.jpg" })).toBeVisible();
+  expect(screen.getByRole("button", { name: "002.jpg" })).toBeVisible();
+  expect(screen.getByText("1 / 2")).toBeVisible();
+  expect(screen.queryByRole("button", { name: "上一张" })).not.toBeInTheDocument();
+  expect(screen.getByRole("button", { name: "下一张" })).toBeVisible();
+
+  fireEvent.click(screen.getByRole("button", { name: "下一张" }));
+  expect(screen.getByText("2 / 2")).toBeVisible();
+  expect(screen.getByRole("button", { name: "上一张" })).toBeVisible();
+  expect(screen.queryByRole("button", { name: "下一张" })).not.toBeInTheDocument();
+
+  fireEvent.click(screen.getByRole("button", { name: "001.jpg" }));
+  expect(screen.getByText("1 / 2")).toBeVisible();
+
+  fireEvent.click(screen.getByRole("tab", { name: "seq_b" }));
+  expect(screen.getByRole("button", { name: "010.jpg" })).toBeVisible();
+  expect(screen.getByText("1 / 1")).toBeVisible();
+});
+
+test("data management does not show stale image listing when switching clips", async () => {
+  const clipBListing = deferred<Awaited<ReturnType<typeof getSyncImages>>>();
+  apiMocks.getSyncImages.mockImplementation((date, clip) => {
+    if (clip === "clip_b") {
+      return clipBListing.promise;
+    }
+    return Promise.resolve({
+      date,
+      clip,
+      sequences: [{ sequence: "seq_a", images: ["001.jpg", "002.jpg"] }],
+    });
+  });
+  await renderAppWithDashboardSettled();
+
+  fireEvent.click(screen.getByRole("button", { name: "数据管理" }));
+  fireEvent.click(await screen.findByRole("button", { name: "展开 20270515" }));
+  fireEvent.click(screen.getByRole("button", { name: "查看 clip_a 同步图像" }));
+
+  expect(await screen.findByRole("button", { name: "001.jpg" })).toBeVisible();
+  fireEvent.click(screen.getByRole("button", { name: "关闭同步图像浏览" }));
+  fireEvent.click(screen.getByRole("button", { name: "查看 clip_b 同步图像" }));
+
+  expect(await screen.findByRole("dialog", { name: "同步图像浏览" })).toHaveTextContent("20270515 / clip_b");
+  expect(screen.queryByRole("button", { name: "001.jpg" })).not.toBeInTheDocument();
+  expect(screen.queryByRole("button", { name: "002.jpg" })).not.toBeInTheDocument();
+
+  clipBListing.resolve({
+    date: "20270515",
+    clip: "clip_b",
+    sequences: [{ sequence: "seq_b", images: ["101.jpg"] }],
+  });
+
+  expect(await screen.findByRole("button", { name: "101.jpg" })).toBeVisible();
+  expect(screen.queryByRole("button", { name: "001.jpg" })).not.toBeInTheDocument();
+});
+
+test("data management image drawer moves focus inside and closes on Escape", async () => {
+  await renderAppWithDashboardSettled();
+
+  fireEvent.click(screen.getByRole("button", { name: "数据管理" }));
+  fireEvent.click(await screen.findByRole("button", { name: "展开 20270515" }));
+  fireEvent.click(screen.getByRole("button", { name: "查看 clip_a 同步图像" }));
+
+  const dialog = await screen.findByRole("dialog", { name: "同步图像浏览" });
+  const closeButton = screen.getByRole("button", { name: "关闭同步图像浏览" });
+  await waitFor(() => expect(closeButton).toHaveFocus());
+
+  fireEvent.keyDown(dialog, { key: "Escape" });
+  expect(screen.queryByRole("dialog", { name: "同步图像浏览" })).not.toBeInTheDocument();
+});
+
+test("data management image drawer ignores listing that resolves after close", async () => {
+  const pendingListing = deferred<Awaited<ReturnType<typeof getSyncImages>>>();
+  apiMocks.getSyncImages.mockReturnValue(pendingListing.promise);
+  await renderAppWithDashboardSettled();
+
+  fireEvent.click(screen.getByRole("button", { name: "数据管理" }));
+  fireEvent.click(await screen.findByRole("button", { name: "展开 20270515" }));
+  fireEvent.click(screen.getByRole("button", { name: "查看 clip_a 同步图像" }));
+
+  expect(await screen.findByRole("dialog", { name: "同步图像浏览" })).toBeVisible();
+  fireEvent.click(screen.getByRole("button", { name: "关闭同步图像浏览" }));
+
+  pendingListing.resolve({
+    date: "20270515",
+    clip: "clip_a",
+    sequences: [{ sequence: "seq_a", images: ["late.jpg"] }],
+  });
+
+  await waitFor(() => expect(screen.queryByRole("dialog", { name: "同步图像浏览" })).not.toBeInTheDocument());
+  expect(screen.queryByText("late.jpg")).not.toBeInTheDocument();
+});
+
+test("annotation page switches pipeline results and review views", async () => {
+  await renderAppWithDashboardSettled();
 
   fireEvent.click(screen.getByRole("button", { name: "自动标注" }));
   expect(screen.getByText("视觉检测")).toBeVisible();
@@ -160,8 +618,8 @@ test("annotation page switches pipeline results and review views", () => {
   expect(screen.getByText("待复核样本")).toBeVisible();
 });
 
-test("model iteration page renders versions training and compare tabs", () => {
-  render(<App />);
+test("model iteration page renders versions training and compare tabs", async () => {
+  await renderAppWithDashboardSettled();
 
   fireEvent.click(screen.getByRole("button", { name: "模型迭代" }));
   expect(screen.getByText("v47")).toBeVisible();
@@ -175,8 +633,8 @@ test("model iteration page renders versions training and compare tabs", () => {
   expect(screen.getByText("版本性能对比")).toBeVisible();
 });
 
-test("agent workflow page selects nodes and keeps execute action placeholder-only", () => {
-  render(<App />);
+test("agent workflow page selects nodes and keeps execute action placeholder-only", async () => {
+  await renderAppWithDashboardSettled();
 
   fireEvent.click(screen.getByRole("button", { name: "Agent 工作流" }));
   expect(screen.getByText("节点库")).toBeVisible();
@@ -197,8 +655,8 @@ test("agent workflow page selects nodes and keeps execute action placeholder-onl
   expect(screen.queryByRole("dialog", { name: "DataPilot" })).not.toBeInTheDocument();
 });
 
-test("simulation page switches config running and results views", () => {
-  render(<App />);
+test("simulation page switches config running and results views", async () => {
+  await renderAppWithDashboardSettled();
 
   fireEvent.click(screen.getByRole("button", { name: "测试/仿真" }));
   expect(screen.getByText("仿真场景配置")).toBeVisible();
@@ -210,8 +668,8 @@ test("simulation page switches config running and results views", () => {
   expect(screen.getByText("详细测试报告")).toBeVisible();
 });
 
-test("DataPilot opens only from the floating button after console migration", () => {
-  render(<App />);
+test("DataPilot opens only from the floating button after console migration", async () => {
+  await renderAppWithDashboardSettled();
 
   fireEvent.click(screen.getByRole("button", { name: "测试/仿真" }));
   fireEvent.click(screen.getByRole("button", { name: "启动仿真" }));
@@ -221,8 +679,8 @@ test("DataPilot opens only from the floating button after console migration", ()
   expect(screen.getByRole("dialog", { name: "DataPilot" })).toBeVisible();
 });
 
-test("DataPilot window remains above the console content", () => {
-  render(<App />);
+test("DataPilot window remains above the console content", async () => {
+  await renderAppWithDashboardSettled();
 
   fireEvent.click(screen.getByRole("button", { name: "Open DataPilot" }));
 
@@ -231,8 +689,8 @@ test("DataPilot window remains above the console content", () => {
   expect(dialog.className).toContain("z-[80]");
 });
 
-test("DataPilot window can be dragged from its title bar", () => {
-  render(<App />);
+test("DataPilot window can be dragged from its title bar", async () => {
+  await renderAppWithDashboardSettled();
 
   fireEvent.click(screen.getByRole("button", { name: "Open DataPilot" }));
 
@@ -247,8 +705,8 @@ test("DataPilot window can be dragged from its title bar", () => {
   expect(dialog.style.transform).toContain("translate3d(-140px, -120px, 0)");
 });
 
-test("DataPilot floating button can be dragged without opening the window", () => {
-  render(<App />);
+test("DataPilot floating button can be dragged without opening the window", async () => {
+  await renderAppWithDashboardSettled();
 
   const button = screen.getByRole("button", { name: "Open DataPilot" });
 
@@ -262,8 +720,8 @@ test("DataPilot floating button can be dragged without opening the window", () =
   expect(screen.queryByRole("dialog", { name: "DataPilot" })).not.toBeInTheDocument();
 });
 
-test("DataPilot floating button stays inside the viewport while dragged", () => {
-  render(<App />);
+test("DataPilot floating button stays inside the viewport while dragged", async () => {
+  await renderAppWithDashboardSettled();
 
   const button = screen.getByRole("button", { name: "Open DataPilot" });
 
@@ -274,8 +732,8 @@ test("DataPilot floating button stays inside the viewport while dragged", () => 
   expect(button.style.transform).toContain("translate3d(4px, 4px, 0)");
 });
 
-test("DataPilot window opens and closes at the dragged floating button position", () => {
-  render(<App />);
+test("DataPilot window opens and closes at the dragged floating button position", async () => {
+  await renderAppWithDashboardSettled();
 
   const button = screen.getByRole("button", { name: "Open DataPilot" });
   fireEvent.pointerDown(button, { pointerId: 1, clientX: 1180, clientY: 760 });
@@ -295,10 +753,10 @@ test("DataPilot window opens and closes at the dragged floating button position"
   expect(reopenedButton.style.transform).toContain("translate3d(-120px, -80px, 0)");
 });
 
-test("DataPilot window keeps itself inside the viewport when opened from a high floating button", () => {
+test("DataPilot window keeps itself inside the viewport when opened from a high floating button", async () => {
   Object.defineProperty(window, "innerWidth", { configurable: true, writable: true, value: 1280 });
   Object.defineProperty(window, "innerHeight", { configurable: true, writable: true, value: 720 });
-  render(<App />);
+  await renderAppWithDashboardSettled();
 
   const button = screen.getByRole("button", { name: "Open DataPilot" });
   fireEvent.pointerDown(button, { pointerId: 1, clientX: 1180, clientY: 760 });
@@ -315,7 +773,7 @@ test("DataPilot window keeps itself inside the viewport when opened from a high 
 });
 
 test("DataPilot header icon buttons do not start window dragging", async () => {
-  render(<App />);
+  await renderAppWithDashboardSettled();
 
   fireEvent.click(screen.getByRole("button", { name: "Open DataPilot" }));
 
@@ -333,7 +791,7 @@ test("DataPilot header icon buttons do not start window dragging", async () => {
   expect(await screen.findByText("历史会话")).toBeVisible();
 });
 
-test("DataPilot window keeps wheel scrolling inside the dialog", () => {
+test("DataPilot window keeps wheel scrolling inside the dialog", async () => {
   datapilotStore.setState({
     open: true,
     mode: "active_session",
@@ -356,7 +814,7 @@ test("DataPilot window keeps wheel scrolling inside the dialog", () => {
       created_at: `2026-06-26T00:${String(index).padStart(2, "0")}:00Z`,
     })),
   });
-  render(<App />);
+  await renderAppWithDashboardSettled();
 
   const dialog = screen.getByRole("dialog", { name: "DataPilot" });
   const header = screen.getByLabelText("Drag DataPilot window");
@@ -378,8 +836,8 @@ test("DataPilot window keeps wheel scrolling inside the dialog", () => {
   preventDefault.mockRestore();
 });
 
-test("opens DataPilot draft window from the floating button", () => {
-  render(<App />);
+test("opens DataPilot draft window from the floating button", async () => {
+  await renderAppWithDashboardSettled();
 
   fireEvent.click(screen.getByRole("button", { name: "Open DataPilot" }));
 
@@ -396,7 +854,7 @@ test("opens DataPilot draft window from the floating button", () => {
   expect(screen.queryByText("VLA 主智能体")).not.toBeInTheDocument();
 });
 
-test("active session renders messages and does not render draft start content", () => {
+test("active session renders messages and does not render draft start content", async () => {
   datapilotStore.setState({
     open: true,
     mode: "active_session",
@@ -422,7 +880,7 @@ test("active session renders messages and does not render draft start content", 
     ],
   });
 
-  render(<App />);
+  await renderAppWithDashboardSettled();
 
   expect(screen.getByRole("dialog", { name: "DataPilot" })).toBeVisible();
   expect(screen.getByText("清洗已有数据")).toBeVisible();
@@ -441,7 +899,7 @@ test("History button lists sessions in a lightweight panel", async () => {
     },
   ]);
 
-  render(<App />);
+  await renderAppWithDashboardSettled();
 
   fireEvent.click(screen.getByRole("button", { name: "Open DataPilot" }));
   fireEvent.click(screen.getByRole("button", { name: "History" }));
@@ -454,7 +912,7 @@ test("History button lists sessions in a lightweight panel", async () => {
 });
 
 test("close hides the window and restores the floating button", async () => {
-  render(<App />);
+  await renderAppWithDashboardSettled();
 
   fireEvent.click(screen.getByRole("button", { name: "Open DataPilot" }));
   fireEvent.click(screen.getByRole("button", { name: "Close DataPilot" }));
@@ -482,7 +940,7 @@ test("closing the DataPilot window closes the active event stream", async () => 
     ],
   });
 
-  render(<App />);
+  await renderAppWithDashboardSettled();
   fireEvent.change(screen.getByPlaceholderText("继续描述任务…"), {
     target: { value: "继续清洗" },
   });
@@ -494,7 +952,7 @@ test("closing the DataPilot window closes the active event stream", async () => 
   await waitFor(() => expect(close).toHaveBeenCalledTimes(1));
 });
 
-test("new session enters draft mode without creating a session", () => {
+test("new session enters draft mode without creating a session", async () => {
   datapilotStore.setState({
     open: true,
     mode: "active_session",
@@ -511,7 +969,7 @@ test("new session enters draft mode without creating a session", () => {
     ],
   });
 
-  render(<App />);
+  await renderAppWithDashboardSettled();
   fireEvent.click(screen.getByRole("button", { name: "New session" }));
 
   const state = datapilotStore.getState();
@@ -542,7 +1000,7 @@ test("new session closes the active event stream", async () => {
     ],
   });
 
-  render(<App />);
+  await renderAppWithDashboardSettled();
   fireEvent.change(screen.getByPlaceholderText("继续描述任务…"), {
     target: { value: "继续清洗" },
   });
@@ -555,7 +1013,7 @@ test("new session closes the active event stream", async () => {
 });
 
 test("submitting the first draft message creates a session, opens events, submits turn, and shows the user message", async () => {
-  render(<App />);
+  await renderAppWithDashboardSettled();
 
   fireEvent.click(screen.getByRole("button", { name: "Open DataPilot" }));
   fireEvent.change(screen.getByPlaceholderText("我们要做什么？"), {
@@ -577,7 +1035,7 @@ test("failed draft submit does not append a local user message", async () => {
   apiMocks.openSessionEvents.mockReturnValue(activeSocket(close));
   apiMocks.submitTurn.mockRejectedValue(new Error("submit failed"));
 
-  render(<App />);
+  await renderAppWithDashboardSettled();
 
   fireEvent.click(screen.getByRole("button", { name: "Open DataPilot" }));
   fireEvent.change(screen.getByPlaceholderText("我们要做什么？"), {
@@ -614,7 +1072,7 @@ test("failed active submit does not append a local user message", async () => {
     messages: [],
   });
 
-  render(<App />);
+  await renderAppWithDashboardSettled();
   fireEvent.change(screen.getByPlaceholderText("继续描述任务…"), {
     target: { value: "会失败的继续任务" },
   });
@@ -653,7 +1111,7 @@ test("reopening an active session opens events before submitting the turn", asyn
     ],
   });
 
-  render(<App />);
+  await renderAppWithDashboardSettled();
   fireEvent.click(screen.getByRole("button", { name: "Close DataPilot" }));
   fireEvent.click(screen.getByRole("button", { name: "Open DataPilot" }));
   fireEvent.change(screen.getByPlaceholderText("继续描述任务…"), {
@@ -731,7 +1189,7 @@ test("reopening an active session refreshes persisted messages from the backend"
     ],
   });
 
-  render(<App />);
+  await renderAppWithDashboardSettled();
   await waitFor(() => expect(apiMocks.getSession).toHaveBeenCalledWith("session-1"));
   fireEvent.click(screen.getByRole("button", { name: "Close DataPilot" }));
   fireEvent.click(screen.getByRole("button", { name: "Open DataPilot" }));
@@ -767,7 +1225,7 @@ test("reopening an active session reopens the event stream before another turn i
     ],
   });
 
-  render(<App />);
+  await renderAppWithDashboardSettled();
   await waitFor(() => expect(apiMocks.openSessionEvents).toHaveBeenCalledWith("session-1", expect.any(Function)));
   fireEvent.click(screen.getByRole("button", { name: "Close DataPilot" }));
   await waitFor(() => expect(close).toHaveBeenCalledTimes(1));
@@ -778,7 +1236,7 @@ test("reopening an active session reopens the event stream before another turn i
   expect(apiMocks.submitTurn).not.toHaveBeenCalled();
 });
 
-test("opening a history session does not reconnect the event stream", () => {
+test("opening a history session does not reconnect the event stream", async () => {
   datapilotStore.setState({
     open: false,
     mode: "history_session",
@@ -804,7 +1262,7 @@ test("opening a history session does not reconnect the event stream", () => {
     ],
   });
 
-  render(<App />);
+  await renderAppWithDashboardSettled();
   fireEvent.click(screen.getByRole("button", { name: "Open DataPilot" }));
 
   expect(apiMocks.getSession).not.toHaveBeenCalled();
@@ -835,7 +1293,7 @@ test("stale active session refreshes do not overwrite draft mode", async () => {
     ],
   });
 
-  render(<App />);
+  await renderAppWithDashboardSettled();
   await waitFor(() => expect(apiMocks.getSession).toHaveBeenCalledWith("session-1"));
   fireEvent.click(screen.getByRole("button", { name: "New session" }));
   resolveSession({
@@ -895,7 +1353,7 @@ test("selecting a history session restores persisted messages and hides active c
     ],
   });
 
-  render(<App />);
+  await renderAppWithDashboardSettled();
 
   fireEvent.click(screen.getByRole("button", { name: "Open DataPilot" }));
   fireEvent.click(screen.getByRole("button", { name: "History" }));
@@ -936,7 +1394,7 @@ test("selecting an active session from history restores active controls and can 
     ],
   });
 
-  render(<App />);
+  await renderAppWithDashboardSettled();
 
   fireEvent.click(screen.getByRole("button", { name: "Open DataPilot" }));
   fireEvent.click(screen.getByRole("button", { name: "History" }));
@@ -995,7 +1453,7 @@ test("selecting a history session closes the active event stream before loading 
     ],
   });
 
-  render(<App />);
+  await renderAppWithDashboardSettled();
   fireEvent.change(screen.getByPlaceholderText("继续描述任务…"), {
     target: { value: "先打开流" },
   });
@@ -1365,7 +1823,7 @@ test("running stop interrupts the current turn without leaving active mode", asy
     run: { ...createEmptyRunState(), running: true, activeText: "[Main] 正在思考" },
   });
 
-  render(<App />);
+  await renderAppWithDashboardSettled();
 
   fireEvent.click(screen.getByRole("button", { name: "Stop current run" }));
 
