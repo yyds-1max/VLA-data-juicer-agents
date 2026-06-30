@@ -8,6 +8,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
+from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
 from vla_data_juicer_agents.web.app import _consume_turn_result_when_idle, _drain_controller_events, create_app
@@ -99,6 +100,38 @@ def test_create_app_accepts_positional_configuration(tmp_path: Path):
 
     assert FakeController.created[0].kwargs["working_dir"] == str(tmp_path / ".djx" / session_id)
     assert FakeController.created[0].kwargs["model"] == "qwen-positional"
+
+
+def test_create_app_mounts_agentscope_when_runtime_factory_provided(tmp_path: Path):
+    fake_runtime = SimpleNamespace(
+        app=FastAPI(),
+        config=SimpleNamespace(agentscope_mount_path="/api/agentscope"),
+    )
+
+    app = create_app(
+        working_dir=str(tmp_path / ".djx"),
+        db_path=tmp_path / "sessions.sqlite",
+        controller_factory=FakeController,
+        agentscope_runtime=fake_runtime,
+    )
+
+    assert "/api/agentscope" in [route.path for route in app.routes]
+    assert app.state.agentscope_runtime is fake_runtime
+
+
+def test_create_app_keeps_legacy_controller_when_agentscope_runtime_missing(tmp_path: Path):
+    FakeController.created = []
+    app = create_app(
+        working_dir=str(tmp_path / ".djx"),
+        db_path=tmp_path / "sessions.sqlite",
+        controller_factory=FakeController,
+    )
+    client = TestClient(app)
+
+    session_id = _create_session(client)
+
+    assert session_id.startswith("session_")
+    assert FakeController.created[0].started is True
 
 
 def test_frontend_index_served_when_dist_provided(tmp_path: Path):

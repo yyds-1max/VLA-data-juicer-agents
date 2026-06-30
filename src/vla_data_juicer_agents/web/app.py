@@ -33,6 +33,7 @@ def create_app(
     db_path: str | Path | None = None,
     controller_factory: ControllerFactory = SessionController,
     frontend_dist: str | Path | None = None,
+    agentscope_runtime: Any | None = None,
 ) -> FastAPI:
     if working_dir is None:
         working_dir = os.environ.get("VLA_DATA_AGENT_WEB_WORKING_DIR", "./.djx")
@@ -55,6 +56,10 @@ def create_app(
     app.state.store = store
     app.state.manager = manager
     app.state.bus = bus
+    app.state.agentscope_runtime = agentscope_runtime
+
+    if agentscope_runtime is not None:
+        app.mount(agentscope_runtime.config.agentscope_mount_path, agentscope_runtime.app)
 
     @app.post("/api/sessions", response_model=CreateSessionResponse)
     async def create_session(request: CreateTurnRequest) -> CreateSessionResponse:
