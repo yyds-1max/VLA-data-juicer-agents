@@ -1,6 +1,8 @@
 import { Activity, CircleDot, Database, GitBranch, Layers3 } from "lucide-react";
-import { useMemo, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 
+import { getNavigationDatasetSummary } from "../../../api/client";
+import type { NavigationDatasetSummary } from "../../../api/types";
 import { ConsoleCard } from "../../../components/console/ConsoleCard";
 import { MetricCard } from "../../../components/console/MetricCard";
 import { SegmentedTabs } from "../../../components/console/SegmentedTabs";
@@ -24,21 +26,105 @@ const chartTabs = [
   { id: "loss", label: "损失值" },
 ] satisfies Array<{ id: MetricCurveTab; label: string }>;
 
-const referenceMetricValues: Record<string, string> = {
-  "total-data": "284,729",
-};
+const syncDistributionColors = ["#2d6cdf", "#16845b", "#b7791f", "#6d5bd0"];
+
+function formatDuration(totalDurationNs: number) {
+  const seconds = totalDurationNs / 1_000_000_000;
+
+  if (seconds < 60) {
+    return `${seconds.toFixed(1)} 秒`;
+  }
+
+  const minutes = seconds / 60;
+  if (minutes < 60) {
+    return `${minutes.toFixed(1)} 分钟`;
+  }
+
+  return `${(minutes / 60).toFixed(1)} 小时`;
+}
+
+function totalDataDetail(summary: NavigationDatasetSummary) {
+  const { date_count: dateCount, clip_count: clipCount, raw_message_count: rawMessageCount } = summary.totals;
+
+  return `${dateCount} 个日期 / ${clipCount} 个 clip / ${rawMessageCount} 条 ROS 消息`;
+}
+
+function syncDistributionData(summary: NavigationDatasetSummary | null) {
+  if (!summary) {
+    return dataDistribution;
+  }
+
+  return [
+    { label: "同步图像帧", value: summary.sync_distribution.image, color: syncDistributionColors[0] },
+    { label: "同步点云帧", value: summary.sync_distribution.pointcloud, color: syncDistributionColors[1] },
+    { label: "同步里程计帧", value: summary.sync_distribution.odom, color: syncDistributionColors[2] },
+    { label: "同步栅格图", value: summary.sync_distribution.grid_map, color: syncDistributionColors[3] },
+  ];
+}
 
 export function DashboardPage() {
   const [metricTab, setMetricTab] = useState<MetricCurveTab>("success");
+  const [datasetSummary, setDatasetSummary] = useState<NavigationDatasetSummary | null>(null);
+  const [summaryLoading, setSummaryLoading] = useState(true);
+  const [summaryError, setSummaryError] = useState<string | null>(null);
   const activeCurve = metricTab === "success" ? modelCurveSuccess : modelCurveLoss;
+
+  useEffect(() => {
+    let ignore = false;
+
+    async function loadDatasetSummary() {
+      setSummaryLoading(true);
+      setSummaryError(null);
+
+      try {
+        const summary = await getNavigationDatasetSummary();
+        if (!ignore) {
+          setDatasetSummary(summary);
+        }
+      } catch (error) {
+        if (!ignore) {
+          setDatasetSummary(null);
+          setSummaryError(error instanceof Error ? error.message : "导航数据汇总加载失败");
+        }
+      } finally {
+        if (!ignore) {
+          setSummaryLoading(false);
+        }
+      }
+    }
+
+    void loadDatasetSummary();
+
+    return () => {
+      ignore = true;
+    };
+  }, []);
+
   const displayedMetrics = useMemo(
     () =>
       dashboardMetrics.map((metric) => ({
         ...metric,
-        value: referenceMetricValues[metric.id] ?? metric.value,
+        value:
+          metric.id === "total-data"
+            ? summaryLoading
+              ? "加载中"
+              : datasetSummary
+                ? formatDuration(datasetSummary.totals.total_duration_ns)
+                : "不可用"
+            : metric.value,
+        detail:
+          metric.id === "total-data"
+            ? summaryLoading
+              ? "正在扫描导航数据"
+              : datasetSummary
+                ? totalDataDetail(datasetSummary)
+                : summaryError
+            : metric.detail,
+        delta: metric.id === "total-data" ? undefined : metric.delta,
       })),
-    [],
+    [datasetSummary, summaryError, summaryLoading],
   );
+  const displayedDistribution = useMemo(() => syncDistributionData(datasetSummary), [datasetSummary]);
 
   return (
     <section className="mx-auto max-w-7xl space-y-4 px-4 py-6 md:px-6">
@@ -55,10 +141,12 @@ export function DashboardPage() {
               meta={metric.delta}
               tone={metric.id === "pending-batches" ? "warning" : "success"}
               tag={
-                <span className="inline-flex items-center gap-1">
-                  <Icon aria-hidden="true" className="h-3 w-3" />
-                  {metric.delta}
-                </span>
+                metric.delta ? (
+                  <span className="inline-flex items-center gap-1">
+                    <Icon aria-hidden="true" className="h-3 w-3" />
+                    {metric.delta}
+                  </span>
+                ) : null
               }
             />
           );
@@ -74,7 +162,7 @@ export function DashboardPage() {
             </div>
             <StatusTag tone="info">实时</StatusTag>
           </div>
-          <MiniChart type="donut" title="数据类型分布" data={dataDistribution} />
+          <MiniChart type="donut" title="数据类型分布" data={displayedDistribution} />
         </ConsoleCard>
 
         <ConsoleCard>

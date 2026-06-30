@@ -1,7 +1,22 @@
-import type { AgentEvent, SessionDetail, SessionRecord } from "./types";
+import type {
+  AgentEvent,
+  NavigationDatasetSummary,
+  NavigationDateSummary,
+  NavigationSyncImageListing,
+  SessionDetail,
+  SessionRecord,
+} from "./types";
 
 function sessionPath(sessionId: string): string {
   return `/api/sessions/${encodeURIComponent(sessionId)}`;
+}
+
+function navigationDatasetPath(date: string): string {
+  return `/api/navigation/datasets/${encodeURIComponent(date)}`;
+}
+
+function navigationClipPath(date: string, clip: string): string {
+  return `${navigationDatasetPath(date)}/clips/${encodeURIComponent(clip)}`;
 }
 
 async function responseErrorMessage(response: Response): Promise<string> {
@@ -73,4 +88,28 @@ export function openSessionEvents(sessionId: string, onEvent: (event: AgentEvent
   const socket = new WebSocket(`${protocol}//${window.location.host}${sessionPath(sessionId)}/events`);
   socket.addEventListener("message", (message) => onEvent(JSON.parse(message.data) as AgentEvent));
   return socket;
+}
+
+export async function getNavigationDatasetSummary(): Promise<NavigationDatasetSummary> {
+  return requestJson<NavigationDatasetSummary>("/api/navigation/datasets/summary");
+}
+
+export async function getNavigationDatasetDate(date: string): Promise<NavigationDateSummary> {
+  return requestJson<NavigationDateSummary>(navigationDatasetPath(date));
+}
+
+export async function getSyncImages(
+  date: string,
+  clip: string,
+): Promise<NavigationSyncImageListing> {
+  return requestJson<NavigationSyncImageListing>(`${navigationClipPath(date, clip)}/sync-images`);
+}
+
+export function getSyncImageUrl(
+  date: string,
+  clip: string,
+  sequence: string,
+  filename: string,
+): string {
+  return `${navigationClipPath(date, clip)}/sync-images/${encodeURIComponent(sequence)}/${encodeURIComponent(filename)}`;
 }

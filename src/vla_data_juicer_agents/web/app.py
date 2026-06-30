@@ -9,6 +9,12 @@ from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 
+from vla_data_juicer_agents.navigation.dataset_catalog import (
+    list_sync_images,
+    resolve_sync_image_path,
+    scan_navigation_dataset,
+    scan_navigation_date,
+)
 from vla_data_juicer_agents.tui.controller import SessionController
 from vla_data_juicer_agents.web.event_stream import SessionEventBus
 from vla_data_juicer_agents.web.schemas import (
@@ -66,6 +72,34 @@ def create_app(
             raise HTTPException(status_code=404, detail="Session not found")
         return {"session": session.model_dump()}
 
+    @app.get("/api/navigation/datasets/summary")
+    async def navigation_dataset_summary() -> dict[str, Any]:
+        try:
+            return scan_navigation_dataset().model_dump(mode="json")
+        except (ValueError, FileNotFoundError) as exc:
+            _raise_navigation_http_error(exc)
+
+    @app.get("/api/navigation/datasets/{date}")
+    async def navigation_date_summary(date: str) -> dict[str, Any]:
+        try:
+            return scan_navigation_date(date).model_dump(mode="json")
+        except (ValueError, FileNotFoundError) as exc:
+            _raise_navigation_http_error(exc)
+
+    @app.get("/api/navigation/datasets/{date}/clips/{clip}/sync-images")
+    async def navigation_sync_images(date: str, clip: str) -> dict[str, Any]:
+        try:
+            return list_sync_images(date, clip).model_dump(mode="json")
+        except (ValueError, FileNotFoundError) as exc:
+            _raise_navigation_http_error(exc)
+
+    @app.get("/api/navigation/datasets/{date}/clips/{clip}/sync-images/{sequence}/{filename}")
+    async def navigation_sync_image_file(date: str, clip: str, sequence: str, filename: str) -> FileResponse:
+        try:
+            return FileResponse(resolve_sync_image_path(date, clip, sequence, filename))
+        except (ValueError, FileNotFoundError) as exc:
+            _raise_navigation_http_error(exc)
+
     @app.post("/api/sessions/{session_id}/turns", response_model=CreateTurnResponse)
     async def submit_turn(session_id: str, request: CreateTurnRequest) -> CreateTurnResponse:
         try:
@@ -109,6 +143,12 @@ def create_app(
                     return FileResponse(index_path)
 
     return app
+
+
+def _raise_navigation_http_error(exc: ValueError | FileNotFoundError) -> None:
+    if isinstance(exc, ValueError):
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    raise HTTPException(status_code=404, detail=str(exc)) from exc
 
 
 async def _drain_controller_events(

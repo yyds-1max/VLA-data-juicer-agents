@@ -1,127 +1,102 @@
-import { Cloud, FileText, Image, LockKeyhole, SlidersHorizontal, Upload } from "lucide-react";
-import { useState } from "react";
+import { CheckCircle2, ChevronDown, ChevronLeft, ChevronRight, Clock3, Database, Files, Images, Layers3, X, type LucideIcon } from "lucide-react";
+import { Fragment, type MouseEvent, type KeyboardEvent, useEffect, useRef, useState } from "react";
 
+import { getNavigationDatasetSummary, getSyncImages, getSyncImageUrl } from "../../../api/client";
+import type {
+  NavigationClipSummary,
+  NavigationDatasetStatus,
+  NavigationDatasetSummary,
+  NavigationDateSummary,
+  NavigationSyncImageListing,
+} from "../../../api/types";
 import { ConsoleButton } from "../../../components/console/ConsoleButton";
 import { ConsoleCard } from "../../../components/console/ConsoleCard";
-import { ProgressBar } from "../../../components/console/ProgressBar";
-import { QualityRing } from "../../../components/console/QualityRing";
-import { SegmentedTabs } from "../../../components/console/SegmentedTabs";
 import { StatusTag } from "../../../components/console/StatusTag";
-import { cn } from "../../../lib/utils";
-import type { StatusTone, TabItem } from "../consoleTypes";
-import { batchData, imageData, pointCloudData, textInstructionData } from "../consoleFixtures";
-import { PointCloudPreview } from "../visuals/PointCloudPreview";
-
-type DataTab = "images" | "pointcloud" | "text" | "unlock";
+import type { StatusTone } from "../consoleTypes";
 
 type DataManagementPageProps = {
   onPlaceholderAction?: (message?: string) => void;
 };
 
-const dataTabs = [
-  { id: "images", label: "图像数据" },
-  { id: "pointcloud", label: "点云数据" },
-  { id: "text", label: "文本数据" },
-  { id: "unlock", label: "数据解锁" },
-] satisfies Array<TabItem<DataTab>>;
+const statusLabels: Record<NavigationDatasetStatus, string> = {
+  raw_only: "待处理",
+  extracted: "已拆解",
+  synced: "已同步",
+  error: "异常",
+};
 
-const dataTabIdPrefix = "data-management";
+const statusTones: Record<NavigationDatasetStatus, StatusTone> = {
+  raw_only: "neutral",
+  extracted: "warning",
+  synced: "success",
+  error: "danger",
+};
 
-function dataTabId(tab: DataTab) {
-  return `${dataTabIdPrefix}-tab-${tab}`;
+function formatCount(value: number) {
+  return value.toLocaleString();
 }
 
-function dataPanelId(tab: DataTab) {
-  return `${dataTabIdPrefix}-panel-${tab}`;
+function formatDuration(durationNs: number) {
+  const seconds = durationNs / 1_000_000_000;
+
+  if (seconds < 60) {
+    return `${seconds.toLocaleString(undefined, { maximumFractionDigits: 1 })} 秒`;
+  }
+
+  const minutes = Math.floor(seconds / 60);
+  const remainingSeconds = Math.round(seconds % 60);
+
+  return `${minutes} 分 ${remainingSeconds} 秒`;
 }
 
-const imageGradients = [
-  "from-blue-50 via-slate-100 to-emerald-50",
-  "from-violet-50 via-slate-100 to-blue-50",
-  "from-amber-50 via-slate-100 to-emerald-50",
-  "from-sky-50 via-slate-100 to-rose-50",
-];
-
-function toneForStatus(status: string): StatusTone {
-  if (status === "已标注" || status === "unlocked") {
-    return "success";
+function formatTopics(topics: NavigationClipSummary["topics"]) {
+  if (topics.length === 0) {
+    return "无 topic";
   }
 
-  if (status === "待标注" || status === "pending") {
-    return "warning";
-  }
-
-  if (status === "rejected" || status === "已拒绝") {
-    return "danger";
-  }
-
-  return "neutral";
+  return topics
+    .slice(0, 2)
+    .map((topic) => `${topic.name} (${formatCount(topic.message_count)})`)
+    .join(" / ");
 }
 
-function ImageDataPanel() {
+function MetricCard({ icon: Icon, label, value }: { icon: LucideIcon; label: string; value: string }) {
   return (
-    <div className="grid gap-4 md:grid-cols-2 xl:grid-cols-3">
-      {imageData.map((item, index) => (
-        <ConsoleCard key={item.id} className="space-y-3">
-          <div className={`relative h-36 overflow-hidden rounded-lg border border-console-line bg-gradient-to-br ${imageGradients[index % imageGradients.length]}`}>
-            <div className="absolute inset-4 rounded-lg border border-white/70 bg-white/35" />
-            <div className="absolute left-5 top-5 h-10 w-16 rounded-lg border border-blue-100 bg-blue-100/80" />
-            <div className="absolute bottom-5 right-5 h-12 w-12 rounded-full border border-amber-100 bg-amber-100/80" />
-            <div className="absolute bottom-6 left-6 h-1 w-24 rounded-full bg-slate-300/70" />
-          </div>
-          <div className="flex items-start justify-between gap-3">
-            <div>
-              <h2 className="text-sm font-semibold text-console-text">{item.id}</h2>
-              <p className="mt-1 text-xs text-console-muted">{item.scene}</p>
-            </div>
-            <StatusTag tone={toneForStatus(item.status)}>{item.status}</StatusTag>
-          </div>
-          <ProgressBar value={Number(item.conf) * 100} tone={toneForStatus(item.status)} label={`置信度 ${item.conf}`} />
-        </ConsoleCard>
-      ))}
-    </div>
+    <ConsoleCard className="flex items-center gap-3">
+      <div className="flex h-10 w-10 shrink-0 items-center justify-center rounded-lg border border-console-line bg-console-panel2">
+        <Icon aria-hidden="true" className="h-5 w-5 text-console-cyan" />
+      </div>
+      <div className="min-w-0">
+        <p className="text-xs text-console-muted">{label}</p>
+        <p className="truncate text-lg font-semibold text-console-text">{value}</p>
+      </div>
+    </ConsoleCard>
   );
 }
 
-function PointCloudPanel() {
-  return (
-    <div className="grid gap-4 md:grid-cols-2 xl:grid-cols-3">
-      {pointCloudData.map((item) => (
-        <ConsoleCard key={item.id} className="space-y-3">
-          <PointCloudPreview id={item.id} className="h-36 w-full rounded border border-console-line bg-console-bg" />
-          <div className="flex items-start justify-between gap-3">
-            <div>
-              <h2 className="text-sm font-semibold text-console-text">{item.id}</h2>
-              <p className="mt-1 text-xs text-console-muted">
-                {item.scene} / {item.points.toLocaleString()} points
-              </p>
-            </div>
-            <StatusTag tone={toneForStatus(item.status)}>{item.status}</StatusTag>
-          </div>
-          <ProgressBar value={Number(item.conf) * 100} tone={toneForStatus(item.status)} label={`点云质量 ${item.conf}`} />
-        </ConsoleCard>
-      ))}
-    </div>
-  );
-}
+function ProcessOverview() {
+  const steps = [
+    { name: "raw_data", state: "已采集" },
+    { name: "tmp_dir", state: "已拆解" },
+    { name: "sync_data", state: "已同步" },
+  ];
 
-function TextDataPanel() {
   return (
     <ConsoleCard>
-      <div className="mb-4 flex items-center justify-between gap-3">
-        <div>
-          <h2 className="text-base font-semibold text-console-text">文本指令样本</h2>
-          <p className="mt-1 text-sm text-console-muted">紧凑查看动作、对象与标注状态</p>
-        </div>
-        <StatusTag tone="info">{textInstructionData.length} 条</StatusTag>
+      <div className="mb-4">
+        <h2 className="text-base font-semibold text-console-text">流程概览</h2>
+        <p className="mt-1 text-sm text-console-muted">raw_data 已采集 {"->"} tmp_dir 已拆解 {"->"} sync_data 已同步</p>
       </div>
-      <div className="space-y-2">
-        {textInstructionData.map((item) => (
-          <div key={item.id} className="grid gap-3 rounded border border-console-line bg-console-panel2/70 p-3 md:grid-cols-[5rem_1fr_8rem_6rem] md:items-center">
-            <span className="text-xs font-semibold text-console-cyan">{item.id}</span>
-            <p className="min-w-0 text-sm leading-5 text-console-text">{item.instruction}</p>
-            <span className="text-xs text-console-muted">{item.action_type}</span>
-            <StatusTag tone={toneForStatus(item.status)}>{item.status}</StatusTag>
+      <div className="grid gap-3 md:grid-cols-3">
+        {steps.map((step, index) => (
+          <div key={step.name} className="flex items-center gap-3 rounded-lg border border-console-line bg-console-panel2/70 p-3">
+            <div className="flex h-8 w-8 shrink-0 items-center justify-center rounded-lg border border-console-line bg-console-panel text-sm font-semibold text-console-muted">
+              {index + 1}
+            </div>
+            <div className="min-w-0">
+              <p className="truncate text-sm font-semibold text-console-text">{step.name}</p>
+              <p className="text-xs text-console-muted">{step.state}</p>
+            </div>
           </div>
         ))}
       </div>
@@ -129,159 +104,440 @@ function TextDataPanel() {
   );
 }
 
-function UnlockPanel({ onPlaceholderAction }: DataManagementPageProps) {
-  const pendingBatches = batchData.filter((item) => item.status === "pending");
+function StatusCell({ status }: { status: NavigationDatasetStatus }) {
+  return <StatusTag tone={statusTones[status]}>{statusLabels[status]}</StatusTag>;
+}
+
+function ClipRows({
+  clips,
+  onViewSyncImages,
+}: {
+  clips: NavigationClipSummary[];
+  onViewSyncImages: (clip: NavigationClipSummary, opener: HTMLElement) => void;
+}) {
+  return (
+    <tr>
+      <td colSpan={9} className="bg-console-panel2/50 px-4 py-4">
+        {clips.length === 0 ? (
+          <div className="rounded-lg border border-console-line bg-console-panel px-4 py-5 text-sm text-console-muted">该日期暂无 clip 明细。</div>
+        ) : (
+          <div className="overflow-x-auto rounded-lg border border-console-line bg-console-panel">
+            <table className="w-full min-w-[980px] text-left text-sm">
+              <thead className="text-xs text-console-muted">
+                <tr className="border-b border-console-line bg-console-panel2/70">
+                  <th className="py-2 pl-3 pr-3 font-medium">clip 名称</th>
+                  <th className="py-2 pr-3 font-medium">时长</th>
+                  <th className="py-2 pr-3 font-medium">topic 摘要</th>
+                  <th className="py-2 pr-3 font-medium">raw 消息</th>
+                  <th className="py-2 pr-3 font-medium">tmp_dir</th>
+                  <th className="py-2 pr-3 font-medium">sync_data</th>
+                  <th className="py-2 pr-3 font-medium">同步图像帧</th>
+                  <th className="py-2 pr-3 font-medium">状态</th>
+                  <th className="py-2 pr-3 font-medium">操作</th>
+                </tr>
+              </thead>
+              <tbody>
+                {clips.map((clip) => (
+                  <tr key={`${clip.date}-${clip.clip}`} className="border-b border-console-line/70 last:border-b-0">
+                    <td className="py-3 pl-3 pr-3 font-medium text-console-text">{clip.clip}</td>
+                    <td className="py-3 pr-3 text-console-muted">{formatDuration(clip.duration_ns)}</td>
+                    <td className="max-w-[18rem] truncate py-3 pr-3 text-console-muted" title={formatTopics(clip.topics)}>
+                      {formatTopics(clip.topics)}
+                    </td>
+                    <td className="py-3 pr-3 text-console-muted">{formatCount(clip.raw_message_count)}</td>
+                    <td className="py-3 pr-3 text-console-muted">{clip.has_tmp_dir ? "已存在" : "缺失"}</td>
+                    <td className="py-3 pr-3 text-console-muted">{clip.has_sync_data ? "已存在" : "缺失"}</td>
+                    <td className="py-3 pr-3 text-console-muted">{formatCount(clip.sync_frame_counts.image)}</td>
+                    <td className="py-3 pr-3">
+                      <StatusCell status={clip.status} />
+                    </td>
+                    <td className="py-3 pr-3">
+                      <ConsoleButton
+                        className="h-8 px-2 text-xs"
+                        disabled={clip.sync_frame_counts.image === 0}
+                        aria-label={`查看 ${clip.clip} 同步图像`}
+                        onClick={(event: MouseEvent<HTMLButtonElement>) => onViewSyncImages(clip, event.currentTarget)}
+                      >
+                        查看同步图像
+                      </ConsoleButton>
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        )}
+      </td>
+    </tr>
+  );
+}
+
+function DatasetTable({
+  dates,
+  expandedDate,
+  onToggleDate,
+  onViewSyncImages,
+}: {
+  dates: NavigationDateSummary[];
+  expandedDate: string | null;
+  onToggleDate: (date: string) => void;
+  onViewSyncImages: (clip: NavigationClipSummary, opener: HTMLElement) => void;
+}) {
+  return (
+    <ConsoleCard>
+      <div className="mb-4 flex items-start justify-between gap-3">
+        <div>
+          <h2 className="text-base font-semibold text-console-text">导航数据集</h2>
+          <p className="mt-1 text-sm text-console-muted">按日期查看 raw_data、tmp_dir 与 sync_data 处理状态</p>
+        </div>
+        <StatusTag tone="info">{formatCount(dates.length)} 个日期</StatusTag>
+      </div>
+      <div className="overflow-x-auto">
+        <table className="w-full min-w-[1040px] text-left text-sm">
+          <thead className="text-xs text-console-muted">
+            <tr className="border-b border-console-line">
+              <th className="py-2 pr-3 font-medium">日期</th>
+              <th className="py-2 pr-3 font-medium">clip 数</th>
+              <th className="py-2 pr-3 font-medium">总时长</th>
+              <th className="py-2 pr-3 font-medium">raw 消息</th>
+              <th className="py-2 pr-3 font-medium">已拆解 clip</th>
+              <th className="py-2 pr-3 font-medium">同步 clip 数</th>
+              <th className="py-2 pr-3 font-medium">同步图像帧</th>
+              <th className="py-2 pr-3 font-medium">状态</th>
+              <th className="py-2 pr-3 font-medium">展开</th>
+            </tr>
+          </thead>
+          <tbody>
+            {dates.map((date) => {
+              const isExpanded = expandedDate === date.date;
+              const ExpandIcon = isExpanded ? ChevronDown : ChevronRight;
+
+              return (
+                <Fragment key={date.date}>
+                  <tr className="border-b border-console-line/70">
+                    <td className="py-3 pr-3 font-medium text-console-text">{date.date}</td>
+                    <td className="py-3 pr-3 text-console-muted">{formatCount(date.clip_count)}</td>
+                    <td className="py-3 pr-3 text-console-muted">{formatDuration(date.total_duration_ns)}</td>
+                    <td className="py-3 pr-3 text-console-muted">{formatCount(date.raw_message_count)}</td>
+                    <td className="py-3 pr-3 text-console-muted">{formatCount(date.extracted_clip_count)}</td>
+                    <td className="py-3 pr-3 text-console-muted">{formatCount(date.synced_clip_count)}</td>
+                    <td className="py-3 pr-3 text-console-muted">{formatCount(date.sync_frame_counts.image)}</td>
+                    <td className="py-3 pr-3">
+                      <StatusCell status={date.status} />
+                    </td>
+                    <td className="py-3 pr-3">
+                      <ConsoleButton className="h-8 px-2 text-xs" aria-label={`${isExpanded ? "收起" : "展开"} ${date.date}`} onClick={() => onToggleDate(date.date)}>
+                        <ExpandIcon aria-hidden="true" className="h-4 w-4" />
+                        {isExpanded ? "收起" : "展开"}
+                      </ConsoleButton>
+                    </td>
+                  </tr>
+                  {isExpanded ? <ClipRows clips={date.clips ?? []} onViewSyncImages={onViewSyncImages} /> : null}
+                </Fragment>
+              );
+            })}
+          </tbody>
+        </table>
+      </div>
+    </ConsoleCard>
+  );
+}
+
+function SyncImageDrawer({
+  clip,
+  onClose,
+}: {
+  clip: NavigationClipSummary | null;
+  onClose: () => void;
+}) {
+  const [listing, setListing] = useState<NavigationSyncImageListing | null>(null);
+  const [activeSequence, setActiveSequence] = useState<string | null>(null);
+  const [selectedImageIndex, setSelectedImageIndex] = useState(0);
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const closeButtonRef = useRef<HTMLButtonElement | null>(null);
+
+  useEffect(() => {
+    if (!clip) {
+      return;
+    }
+
+    const openedClip = clip;
+    let isMounted = true;
+    setLoading(true);
+    setError(null);
+    setListing(null);
+    setActiveSequence(null);
+    setSelectedImageIndex(0);
+
+    async function loadSyncImages() {
+      try {
+        const nextListing = await getSyncImages(openedClip.date, openedClip.clip);
+        if (isMounted) {
+          setListing(nextListing);
+          setActiveSequence(nextListing.sequences[0]?.sequence ?? null);
+          setSelectedImageIndex(0);
+        }
+      } catch {
+        if (isMounted) {
+          setError("同步图像加载失败");
+        }
+      } finally {
+        if (isMounted) {
+          setLoading(false);
+        }
+      }
+    }
+
+    void loadSyncImages();
+
+    return () => {
+      isMounted = false;
+    };
+  }, [clip]);
+
+  useEffect(() => {
+    if (clip) {
+      closeButtonRef.current?.focus();
+    }
+  }, [clip]);
+
+  if (!clip) {
+    return null;
+  }
+
+  const activeListing = listing && listing.date === clip.date && listing.clip === clip.clip ? listing : null;
+  const sequences = activeListing?.sequences ?? [];
+  const currentSequence = sequences.find((sequence) => sequence.sequence === activeSequence) ?? sequences[0];
+  const images = currentSequence?.images ?? [];
+  const selectedImage = images[selectedImageIndex] ?? null;
+  const totalImages = images.length;
+  const previewUrl =
+    currentSequence && selectedImage ? getSyncImageUrl(clip.date, clip.clip, currentSequence.sequence, selectedImage) : null;
+
+  function handleSelectSequence(sequence: string) {
+    setActiveSequence(sequence);
+    setSelectedImageIndex(0);
+  }
+
+  function handleKeyDown(event: KeyboardEvent<HTMLElement>) {
+    if (event.key === "Escape") {
+      event.stopPropagation();
+      onClose();
+    }
+  }
 
   return (
-    <div className="space-y-4">
-      <div className="grid gap-4 lg:grid-cols-[0.95fr_1.3fr]">
-        <ConsoleCard>
-          <div className="mb-4 flex items-start justify-between gap-3">
-            <div>
-              <h2 className="text-base font-semibold text-console-text">解锁规则配置</h2>
-              <p className="mt-1 text-sm text-console-muted">质量门禁与批次放行条件</p>
+    <div className="fixed inset-0 z-50 bg-slate-950/20" role="presentation">
+      <aside
+        aria-labelledby="sync-image-drawer-title"
+        aria-modal="true"
+        className="ml-auto flex h-full w-full max-w-5xl flex-col border-l border-console-line bg-console-panel shadow-2xl md:w-[76vw]"
+        onKeyDown={handleKeyDown}
+        role="dialog"
+      >
+        <div className="flex items-start justify-between gap-3 border-b border-console-line px-5 py-4">
+          <div className="min-w-0">
+            <h2 id="sync-image-drawer-title" className="text-base font-semibold text-console-text">
+              同步图像浏览
+            </h2>
+            <p className="mt-1 truncate text-sm text-console-muted">
+              {clip.date} / {clip.clip}
+            </p>
+          </div>
+          <button
+            aria-label="关闭同步图像浏览"
+            className="inline-flex h-8 items-center justify-center gap-2 rounded-lg border border-console-line bg-console-panel px-2 text-sm font-medium text-console-text shadow-sm transition hover:border-console-cyan/40 hover:bg-console-panel2 focus:outline-none focus:ring-2 focus:ring-console-cyan"
+            onClick={onClose}
+            ref={closeButtonRef}
+            type="button"
+          >
+            <X aria-hidden="true" className="h-4 w-4" />
+          </button>
+        </div>
+
+        <div className="min-h-0 flex-1 overflow-y-auto p-5">
+          {loading || (listing !== null && activeListing === null) ? (
+            <div className="rounded-lg border border-console-line bg-console-panel2/70 px-4 py-5 text-sm text-console-muted">正在加载同步图像...</div>
+          ) : error ? (
+            <div className="rounded-lg border border-rose-200 bg-rose-50/70 px-4 py-5 text-sm text-rose-700">{error}</div>
+          ) : sequences.length === 0 || totalImages === 0 ? (
+            <div className="rounded-lg border border-console-line bg-console-panel2/70 px-4 py-5 text-sm text-console-muted">暂无同步图像。</div>
+          ) : (
+            <div className="flex min-h-0 flex-col gap-4">
+              {sequences.length > 1 ? (
+                <div className="flex flex-wrap gap-2" role="tablist" aria-label="同步图像序列">
+                  {sequences.map((sequence) => {
+                    const isActive = sequence.sequence === currentSequence?.sequence;
+                    return (
+                      <button
+                        aria-selected={isActive}
+                        className={`rounded-lg border px-3 py-1.5 text-sm transition focus:outline-none focus:ring-2 focus:ring-console-cyan ${
+                          isActive
+                            ? "border-console-cyan bg-console-cyan/10 text-console-text"
+                            : "border-console-line bg-console-panel2 text-console-muted hover:text-console-text"
+                        }`}
+                        key={sequence.sequence}
+                        onClick={() => handleSelectSequence(sequence.sequence)}
+                        role="tab"
+                        type="button"
+                      >
+                        {sequence.sequence}
+                      </button>
+                    );
+                  })}
+                </div>
+              ) : null}
+
+              <div className="grid min-h-0 gap-4 lg:grid-cols-[16rem_1fr]">
+                <div className="rounded-lg border border-console-line bg-console-panel2/60 p-3">
+                  <div className="mb-2 text-xs font-medium text-console-muted">图像文件</div>
+                  <div className="max-h-[34rem] space-y-1 overflow-y-auto">
+                    {images.map((image, index) => {
+                      const isActive = index === selectedImageIndex;
+                      return (
+                        <button
+                          aria-pressed={isActive}
+                          className={`block w-full truncate rounded-md border px-2 py-1.5 text-left text-sm transition focus:outline-none focus:ring-2 focus:ring-console-cyan ${
+                            isActive
+                              ? "border-console-cyan bg-white text-console-text shadow-sm"
+                              : "border-transparent bg-transparent text-console-muted hover:bg-white hover:text-console-text"
+                          }`}
+                          key={image}
+                          onClick={() => setSelectedImageIndex(index)}
+                          title={image}
+                          type="button"
+                        >
+                          {image}
+                        </button>
+                      );
+                    })}
+                  </div>
+                </div>
+
+                <div className="min-w-0 rounded-lg border border-console-line bg-white p-4 shadow-sm">
+                  <div className="mb-3 flex flex-wrap items-center justify-between gap-2">
+                    <div className="min-w-0">
+                      <p className="truncate text-sm font-semibold text-console-text">{selectedImage}</p>
+                      <p className="text-xs text-console-muted">
+                        {selectedImageIndex + 1} / {totalImages}
+                      </p>
+                    </div>
+                    <div className="flex gap-2">
+                      {selectedImageIndex > 0 ? (
+                        <ConsoleButton aria-label="上一张" className="h-8 px-2" onClick={() => setSelectedImageIndex((index) => Math.max(index - 1, 0))}>
+                          <ChevronLeft aria-hidden="true" className="h-4 w-4" />
+                          上一张
+                        </ConsoleButton>
+                      ) : null}
+                      {selectedImageIndex < totalImages - 1 ? (
+                        <ConsoleButton
+                          aria-label="下一张"
+                          className="h-8 px-2"
+                          onClick={() => setSelectedImageIndex((index) => Math.min(index + 1, totalImages - 1))}
+                        >
+                          下一张
+                          <ChevronRight aria-hidden="true" className="h-4 w-4" />
+                        </ConsoleButton>
+                      ) : null}
+                    </div>
+                  </div>
+                  {previewUrl ? (
+                    <img alt={selectedImage ?? "同步图像"} className="max-h-[62vh] w-full rounded-lg border border-console-line object-contain" src={previewUrl} />
+                  ) : null}
+                </div>
+              </div>
             </div>
-            <SlidersHorizontal aria-hidden="true" className="h-5 w-5 text-console-cyan" />
-          </div>
-          <div className="space-y-5">
-            <label className="block space-y-2">
-              <span className="text-sm text-console-muted">质量阈值 0.85</span>
-              <input className="w-full accent-console-cyan" type="range" min="0" max="100" value="85" readOnly aria-label="质量阈值" />
-            </label>
-            <label className="block space-y-2">
-              <span className="text-sm text-console-muted">自动标注置信度 0.80</span>
-              <input className="w-full accent-emerald-600" type="range" min="0" max="100" value="80" readOnly aria-label="自动标注置信度" />
-            </label>
-            <label className="block space-y-2">
-              <span className="text-sm text-console-muted">复核抽检比例 12%</span>
-              <input className="w-full accent-amber-500" type="range" min="0" max="100" value="12" readOnly aria-label="复核抽检比例" />
-            </label>
-            <ConsoleButton variant="primary" onClick={() => onPlaceholderAction?.("解锁规则尚未接入后端")}>
-              保存规则
-            </ConsoleButton>
-          </div>
-        </ConsoleCard>
-
-        <div className="grid gap-4 sm:grid-cols-3">
-          <ConsoleCard className="flex items-center justify-between gap-3">
-            <QualityRing value={92} label="图像质量" tone="success" />
-          </ConsoleCard>
-          <ConsoleCard className="flex items-center justify-between gap-3">
-            <QualityRing value={87} label="点云质量" tone="info" />
-          </ConsoleCard>
-          <ConsoleCard className="flex items-center justify-between gap-3">
-            <QualityRing value={79} label="文本一致性" tone="warning" />
-          </ConsoleCard>
+          )}
         </div>
-      </div>
-
-      <ConsoleCard>
-        <div className="mb-4 flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
-          <div>
-            <h2 className="text-base font-semibold text-console-text">批次管理</h2>
-            <p className="mt-1 text-sm text-console-muted">{pendingBatches.length} 个批次等待解锁决策</p>
-          </div>
-          <ConsoleButton onClick={() => onPlaceholderAction?.("批量解锁尚未接入后端")}>批量解锁选中批次</ConsoleButton>
-        </div>
-        <div className="overflow-x-auto">
-          <table className="w-full min-w-[720px] text-left text-sm">
-            <thead className="text-xs uppercase text-console-muted">
-              <tr className="border-b border-console-line">
-                <th className="py-2 pr-3 font-medium">批次</th>
-                <th className="py-2 pr-3 font-medium">类型</th>
-                <th className="py-2 pr-3 font-medium">场景</th>
-                <th className="py-2 pr-3 font-medium">数量</th>
-                <th className="py-2 pr-3 font-medium">质量</th>
-                <th className="py-2 pr-3 font-medium">状态</th>
-              </tr>
-            </thead>
-            <tbody>
-              {batchData.map((item) => (
-                <tr key={item.id} className="border-b border-console-line/70">
-                  <td className="py-3 pr-3 font-medium text-console-text">{item.id}</td>
-                  <td className="py-3 pr-3 text-console-muted">{item.type}</td>
-                  <td className="py-3 pr-3 text-console-muted">{item.scene}</td>
-                  <td className="py-3 pr-3 text-console-muted">{item.count.toLocaleString()}</td>
-                  <td className="py-3 pr-3 text-console-muted">{item.quality.toFixed(2)}</td>
-                  <td className="py-3 pr-3">
-                    <StatusTag tone={toneForStatus(item.status)}>{item.status}</StatusTag>
-                  </td>
-                </tr>
-              ))}
-            </tbody>
-          </table>
-        </div>
-      </ConsoleCard>
+      </aside>
     </div>
   );
 }
 
 export function DataManagementPage({ onPlaceholderAction }: DataManagementPageProps) {
-  const [activeTab, setActiveTab] = useState<DataTab>("images");
-  const panelClass = (tab: DataTab) => cn(activeTab !== tab && "hidden");
+  const [datasetSummary, setDatasetSummary] = useState<NavigationDatasetSummary | null>(null);
+  const [expandedDate, setExpandedDate] = useState<string | null>(null);
+  const [syncImageClip, setSyncImageClip] = useState<NavigationClipSummary | null>(null);
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState<string | null>(null);
+  const syncImageOpenerRef = useRef<HTMLElement | null>(null);
+
+  useEffect(() => {
+    let isMounted = true;
+
+    async function loadDatasetSummary() {
+      setLoading(true);
+      setError(null);
+
+      try {
+        const summary = await getNavigationDatasetSummary();
+        if (isMounted) {
+          setDatasetSummary(summary);
+        }
+      } catch {
+        if (isMounted) {
+          setError("导航数据集摘要加载失败");
+        }
+      } finally {
+        if (isMounted) {
+          setLoading(false);
+        }
+      }
+    }
+
+    void loadDatasetSummary();
+
+    return () => {
+      isMounted = false;
+    };
+  }, []);
+
+  const totals = datasetSummary?.totals;
+  const dates = datasetSummary?.dates ?? [];
+
+  function handleToggleDate(date: string) {
+    setExpandedDate((currentDate) => (currentDate === date ? null : date));
+  }
+
+  function handleViewSyncImages(clip: NavigationClipSummary, opener: HTMLElement) {
+    syncImageOpenerRef.current = opener;
+    setSyncImageClip(clip);
+  }
+
+  function handleCloseSyncImages() {
+    setSyncImageClip(null);
+    window.setTimeout(() => {
+      syncImageOpenerRef.current?.focus();
+    }, 0);
+  }
 
   return (
     <section className="mx-auto max-w-7xl space-y-4 px-4 py-6 md:px-6">
-      <div className="flex flex-col gap-3 lg:flex-row lg:items-center lg:justify-between">
-        <SegmentedTabs idPrefix={dataTabIdPrefix} value={activeTab} tabs={dataTabs} onChange={setActiveTab} aria-label="数据管理视图" />
-        <div className="flex flex-wrap gap-2">
-          <ConsoleButton onClick={() => onPlaceholderAction?.("上传数据尚未接入后端")}>
-            <Upload aria-hidden="true" className="h-4 w-4" />
-            上传数据
-          </ConsoleButton>
-          <ConsoleButton onClick={() => onPlaceholderAction?.("导出尚未接入后端")}>导出</ConsoleButton>
-        </div>
+      <div className="grid gap-4 sm:grid-cols-2 xl:grid-cols-5">
+        <MetricCard icon={Database} label="日期批次" value={formatCount(totals?.date_count ?? 0)} />
+        <MetricCard icon={Files} label="原始 clip" value={formatCount(totals?.clip_count ?? 0)} />
+        <MetricCard icon={Clock3} label="总采集时长" value={formatDuration(totals?.total_duration_ns ?? 0)} />
+        <MetricCard icon={CheckCircle2} label="已同步 clip" value={formatCount(totals?.synced_clip_count ?? 0)} />
+        <MetricCard icon={Images} label="同步图像帧" value={formatCount(datasetSummary?.sync_distribution.image ?? 0)} />
       </div>
 
-      <div className="grid gap-4 sm:grid-cols-2 xl:grid-cols-4">
-        <ConsoleCard className="flex items-center gap-3">
-          <Image aria-hidden="true" className="h-5 w-5 text-console-cyan" />
-          <div>
-            <p className="text-xs text-console-muted">图像样本</p>
-            <p className="text-lg font-semibold">{imageData.length.toLocaleString()}</p>
-          </div>
-        </ConsoleCard>
-        <ConsoleCard className="flex items-center gap-3">
-          <Cloud aria-hidden="true" className="h-5 w-5 text-emerald-700" />
-          <div>
-            <p className="text-xs text-console-muted">点云批次</p>
-            <p className="text-lg font-semibold">{pointCloudData.length.toLocaleString()}</p>
-          </div>
-        </ConsoleCard>
-        <ConsoleCard className="flex items-center gap-3">
-          <FileText aria-hidden="true" className="h-5 w-5 text-amber-700" />
-          <div>
-            <p className="text-xs text-console-muted">文本指令</p>
-            <p className="text-lg font-semibold">{textInstructionData.length.toLocaleString()}</p>
-          </div>
-        </ConsoleCard>
-        <ConsoleCard className="flex items-center gap-3">
-          <LockKeyhole aria-hidden="true" className="h-5 w-5 text-violet-700" />
-          <div>
-            <p className="text-xs text-console-muted">待解锁批次</p>
-            <p className="text-lg font-semibold">{batchData.filter((item) => item.status === "pending").length}</p>
-          </div>
-        </ConsoleCard>
-      </div>
+      <ProcessOverview />
 
-      <div role="tabpanel" id={dataPanelId("images")} aria-labelledby={dataTabId("images")} className={panelClass("images")} hidden={activeTab !== "images"}>
-        <ImageDataPanel />
-      </div>
-      <div
-        role="tabpanel"
-        id={dataPanelId("pointcloud")}
-        aria-labelledby={dataTabId("pointcloud")}
-        className={panelClass("pointcloud")}
-        hidden={activeTab !== "pointcloud"}
-      >
-        <PointCloudPanel />
-      </div>
-      <div role="tabpanel" id={dataPanelId("text")} aria-labelledby={dataTabId("text")} className={panelClass("text")} hidden={activeTab !== "text"}>
-        <TextDataPanel />
-      </div>
-      <div role="tabpanel" id={dataPanelId("unlock")} aria-labelledby={dataTabId("unlock")} className={panelClass("unlock")} hidden={activeTab !== "unlock"}>
-        <UnlockPanel onPlaceholderAction={onPlaceholderAction} />
-      </div>
+      {loading ? (
+        <ConsoleCard className="py-8 text-center text-sm text-console-muted">正在加载导航数据集...</ConsoleCard>
+      ) : error ? (
+        <ConsoleCard className="border-rose-200 bg-rose-50/60 py-8 text-center text-sm text-rose-700">{error}</ConsoleCard>
+      ) : dates.length === 0 ? (
+        <ConsoleCard className="py-8 text-center text-sm text-console-muted">
+          <Layers3 aria-hidden="true" className="mx-auto mb-3 h-6 w-6 text-console-muted" />
+          暂无导航数据集。
+        </ConsoleCard>
+      ) : (
+        <DatasetTable dates={dates} expandedDate={expandedDate} onToggleDate={handleToggleDate} onViewSyncImages={handleViewSyncImages} />
+      )}
+
+      <SyncImageDrawer clip={syncImageClip} onClose={handleCloseSyncImages} />
     </section>
   );
 }

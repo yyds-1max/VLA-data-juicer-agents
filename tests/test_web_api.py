@@ -381,6 +381,118 @@ def test_create_app_treats_empty_model_env_as_none(tmp_path: Path, monkeypatch):
     assert FakeController.created[0].kwargs["model"] is None
 
 
+def test_navigation_dataset_summary_returns_scanned_totals_and_sync_distribution(tmp_path: Path, monkeypatch):
+    root = tmp_path / "VLADatasets"
+    _write_dataset_metadata(root / "raw_data" / "20270605" / "clip_a")
+    _write_dataset_metadata(root / "raw_data" / "20270605" / "clip_b")
+    _write_sync_file(root, "20270605", "clip_a", "0001", "front.jpg", b"jpg-bytes")
+    _write_sync_file(root, "20270605", "clip_a", "0001", "front.png", b"png-bytes")
+    monkeypatch.setenv("VLA_VLADATASETS_ROOT", str(root))
+    client = make_client(tmp_path)
+
+    response = client.get("/api/navigation/datasets/summary")
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["totals"]["date_count"] == 1
+    assert body["totals"]["clip_count"] == 2
+    assert body["totals"]["total_duration_ns"] == 6_000_000_000
+    assert body["totals"]["raw_message_count"] == 40
+    assert body["sync_distribution"]["image"] == 2
+
+
+def test_navigation_date_returns_clip_detail_and_raw_only_status(tmp_path: Path, monkeypatch):
+    root = tmp_path / "VLADatasets"
+    _write_dataset_metadata(root / "raw_data" / "20270605" / "raw_clip")
+    _write_dataset_metadata(root / "raw_data" / "20270605" / "synced_clip")
+    _write_sync_file(root, "20270605", "synced_clip", "0001", "front.jpg", b"jpg-bytes")
+    monkeypatch.setenv("VLA_VLADATASETS_ROOT", str(root))
+    client = make_client(tmp_path)
+
+    response = client.get("/api/navigation/datasets/20270605")
+
+    assert response.status_code == 200
+    body = response.json()
+    clips = {clip["clip"]: clip for clip in body["clips"]}
+    assert body["date"] == "20270605"
+    assert body["clip_count"] == 2
+    assert clips["raw_clip"]["status"] == "raw_only"
+    assert clips["raw_clip"]["has_tmp_dir"] is False
+    assert clips["raw_clip"]["sync_frame_counts"]["image"] == 0
+    assert clips["synced_clip"]["status"] == "synced"
+
+
+def test_navigation_sync_images_listing_and_file_route_serves_bytes(tmp_path: Path, monkeypatch):
+    root = tmp_path / "VLADatasets"
+    _write_dataset_metadata(root / "raw_data" / "20270605" / "clip_a")
+    _write_sync_file(root, "20270605", "clip_a", "0002", "b.png", b"png-bytes")
+    _write_sync_file(root, "20270605", "clip_a", "0002", "a.jpeg", b"jpeg-bytes")
+    _write_sync_file(root, "20270605", "clip_a", "0001", "c.jpg", b"jpg-bytes")
+    monkeypatch.setenv("VLA_VLADATASETS_ROOT", str(root))
+    client = make_client(tmp_path)
+
+    listing_response = client.get("/api/navigation/datasets/20270605/clips/clip_a/sync-images")
+    file_response = client.get("/api/navigation/datasets/20270605/clips/clip_a/sync-images/0002/a.jpeg")
+
+    assert listing_response.status_code == 200
+    assert listing_response.json()["sequences"] == [
+        {"sequence": "0001", "images": ["c.jpg"]},
+        {"sequence": "0002", "images": ["a.jpeg", "b.png"]},
+    ]
+    assert file_response.status_code == 200
+    assert file_response.content == b"jpeg-bytes"
+
+
+def test_navigation_sync_image_route_rejects_unsafe_sequence(tmp_path: Path, monkeypatch):
+    root = tmp_path / "VLADatasets"
+    _write_dataset_metadata(root / "raw_data" / "20270605" / "clip_a")
+    _write_sync_file(root, "20270605", "clip_a", "0002", "a.jpeg", b"jpeg-bytes")
+    monkeypatch.setenv("VLA_VLADATASETS_ROOT", str(root))
+    client = make_client(tmp_path)
+
+    response = client.get("/api/navigation/datasets/20270605/clips/clip_a/sync-images/%2E%2E/a.jpeg")
+
+    assert response.status_code in {400, 404}
+
+
 def _create_session(client: TestClient) -> str:
     response = client.post("/api/sessions", json={"message": "处理 20270605 的室外导航数据"})
     return response.json()["session"]["id"]
+
+
+def _write_dataset_metadata(clip_dir: Path) -> None:
+    clip_dir.mkdir(parents=True)
+    (clip_dir / "metadata.yaml").write_text(
+        """
+rosbag2_bagfile_information:
+  version: 4
+  storage_identifier: sqlite3
+  relative_file_paths:
+    - sample_0.db3
+  duration:
+    nanoseconds: 3000000000
+  starting_time:
+    nanoseconds_since_epoch: 1778812189469693651
+  message_count: 20
+  topics_with_message_count:
+    - topic_metadata:
+        name: /cam_video5/csi_cam/image_raw/compressed
+        type: sensor_msgs/msg/CompressedImage
+        serialization_format: cdr
+      message_count: 10
+    - topic_metadata:
+        name: /lidar_points
+        type: sensor_msgs/msg/PointCloud2
+        serialization_format: cdr
+      message_count: 10
+  compression_format: ""
+  compression_mode: ""
+""".lstrip(),
+        encoding="utf-8",
+    )
+
+
+def _write_sync_file(root: Path, date: str, clip: str, sequence: str, filename: str, content: bytes) -> None:
+    image_dir = root / "clip_data" / date / clip / "sync_data" / sequence / "fisheye_front"
+    image_dir.mkdir(parents=True, exist_ok=True)
+    (image_dir / filename).write_bytes(content)
