@@ -24,6 +24,8 @@ from vla_data_juicer_agents.web.schemas import (
     CreateSessionResponse,
     CreateTurnRequest,
     CreateTurnResponse,
+    HumanDecisionRequest,
+    HumanDecisionResponse,
     InterruptResponse,
 )
 from vla_data_juicer_agents.web.agent_session import AgentScopeWebSessionManager
@@ -158,6 +160,26 @@ def create_app(
         except KeyError as exc:
             raise HTTPException(status_code=404, detail="Session not found") from exc
         return InterruptResponse(interrupted=interrupted)
+
+    @app.post("/api/sessions/{session_id}/human-decisions", response_model=HumanDecisionResponse)
+    async def submit_human_decision(
+        session_id: str,
+        request: HumanDecisionRequest,
+    ) -> HumanDecisionResponse:
+        submit_decision = getattr(manager, "submit_human_decision", None)
+        if submit_decision is None:
+            raise HTTPException(status_code=409, detail="Human decisions are not supported")
+        try:
+            accepted = await _maybe_await(
+                submit_decision(session_id, request.model_dump(exclude_none=True))
+            )
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail="Session not found") from exc
+        except RuntimeError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        if not accepted:
+            raise HTTPException(status_code=409, detail="Human decision was not accepted")
+        return HumanDecisionResponse(accepted=True)
 
     @app.websocket("/api/sessions/{session_id}/events")
     async def session_events(websocket: WebSocket, session_id: str) -> None:

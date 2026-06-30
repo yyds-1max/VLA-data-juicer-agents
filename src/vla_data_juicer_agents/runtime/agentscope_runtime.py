@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 from contextlib import suppress
 from dataclasses import dataclass, field
 from types import SimpleNamespace
@@ -11,7 +12,8 @@ import agentscope.app
 from agentscope.app.message_bus import RedisMessageBus
 from agentscope.app.storage import ChatModelConfig, RedisStorage, SessionConfig
 from agentscope.app.workspace_manager import LocalWorkspaceManager
-from agentscope.message import UserMsg
+from agentscope.event import ExternalExecutionResultEvent
+from agentscope.message import ToolResultBlock, ToolResultState, UserMsg
 
 from vla_data_juicer_agents.adapters.agentscope import AgentScopeEventAdapter
 from vla_data_juicer_agents.core.events import CallbackEventSink, EventEmitter
@@ -75,9 +77,6 @@ class AgentScopeRuntime:
         await self.ensure_bootstrapped()
 
         chat_service = self.app.state.chat_service
-        chat_run_registry = getattr(self.app.state, "chat_run_registry", None)
-        if chat_run_registry is None:
-            raise RuntimeError("AgentScope chat_run_registry is not initialized")
 
         if is_high_confidence_navigation_request(message):
             agent_id = self.config.navigation_agent_id
@@ -98,14 +97,52 @@ class AgentScopeRuntime:
             agent_id=agent_id,
             input_msg=UserMsg(name="user", content=message),
         )
+        self._spawn_chat_run(run_coroutine, session_id=session_id)
+        if tail_cursor is not None:
+            self._remember_event_cursor(session_id, tail_cursor)
+        return f"turn_{uuid4()}"
+
+    async def submit_human_decision(self, *, web_session_id: str, decision: dict[str, Any]) -> bool:
+        mapped = self.web_sessions.get(web_session_id)
+        if mapped is None:
+            return False
+
+        agent_id, agentscope_session_id = mapped
+        result = ToolResultBlock(
+            id=decision["tool_call_id"],
+            name="request_human_decision",
+            output=json.dumps(
+                {
+                    "action": decision["action"],
+                    "text": decision.get("text"),
+                    "request_id": decision["request_id"],
+                },
+                ensure_ascii=False,
+            ),
+            state=ToolResultState.SUCCESS,
+        )
+        run_coroutine = self.app.state.chat_service.run(
+            user_id=self.config.user_id,
+            session_id=agentscope_session_id,
+            agent_id=agent_id,
+            input_msg=ExternalExecutionResultEvent(
+                reply_id=decision["reply_id"],
+                execution_results=[result],
+            ),
+        )
+        self._spawn_chat_run(run_coroutine, session_id=agentscope_session_id)
+        return True
+
+    def _spawn_chat_run(self, run_coroutine: Any, *, session_id: str) -> None:
+        chat_run_registry = getattr(self.app.state, "chat_run_registry", None)
+        if chat_run_registry is None:
+            run_coroutine.close()
+            raise RuntimeError("AgentScope chat_run_registry is not initialized")
         try:
             chat_run_registry.spawn(run_coroutine, session_id=session_id)
         except Exception:
             run_coroutine.close()
             raise
-        if tail_cursor is not None:
-            self._remember_event_cursor(session_id, tail_cursor)
-        return f"turn_{uuid4()}"
 
     async def _event_log_tail_cursor(self, agentscope_session_id: str) -> str | None:
         read_events = getattr(self.message_bus, "session_read_events", None)

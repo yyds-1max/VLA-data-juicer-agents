@@ -1,8 +1,11 @@
 import asyncio
+import json
 from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
+from agentscope.event import ExternalExecutionResultEvent
+from agentscope.message import ToolResultState
 
 from vla_data_juicer_agents.navigation.routing import is_high_confidence_navigation_request
 from vla_data_juicer_agents.runtime.agentscope_config import AgentScopeRuntimeConfig
@@ -49,6 +52,17 @@ class InterruptingAgentScopeRuntime(FakeAgentScopeRuntime):
     async def interrupt_web_session(self, *, web_session_id: str) -> bool:
         self.interrupts.append(web_session_id)
         return self.interrupted
+
+
+class HumanDecisionAgentScopeRuntime(FakeAgentScopeRuntime):
+    def __init__(self, *, accepted: bool = True) -> None:
+        super().__init__()
+        self.accepted = accepted
+        self.decisions: list[tuple[str, dict]] = []
+
+    async def submit_human_decision(self, *, web_session_id: str, decision: dict) -> bool:
+        self.decisions.append((web_session_id, decision))
+        return self.accepted
 
 
 class FakeAgentScopeMessageBus:
@@ -367,6 +381,66 @@ async def test_runtime_submit_user_message_advances_event_cursor_before_spawn() 
 
 
 @pytest.mark.asyncio
+async def test_runtime_submit_human_decision_spawns_external_execution_result_event() -> None:
+    chat_run_registry = FakeChatRunRegistry()
+    runtime = _runtime(chat_run_registry=chat_run_registry)
+    runtime.web_sessions["web-1"] = ("navigation-data-agent", "as-session-1")
+
+    accepted = await runtime.submit_human_decision(
+        web_session_id="web-1",
+        decision={
+            "action": "guide",
+            "text": "先 dry-run",
+            "request_id": "request-1",
+            "tool_call_id": "tool-call-1",
+            "reply_id": "reply-1",
+        },
+    )
+
+    assert accepted is True
+    assert runtime.app.state.chat_service.runs == []
+    assert [spawn["session_id"] for spawn in chat_run_registry.spawns] == ["as-session-1"]
+    await chat_run_registry.drain()
+    run = runtime.app.state.chat_service.runs[0]
+    assert run["user_id"] == "alice"
+    assert run["session_id"] == "as-session-1"
+    assert run["agent_id"] == "navigation-data-agent"
+    event = run["message"]
+    assert isinstance(event, ExternalExecutionResultEvent)
+    assert event.reply_id == "reply-1"
+    assert len(event.execution_results) == 1
+    result = event.execution_results[0]
+    assert result.id == "tool-call-1"
+    assert result.name == "request_human_decision"
+    assert result.state == ToolResultState.SUCCESS
+    assert json.loads(result.output) == {
+        "action": "guide",
+        "text": "先 dry-run",
+        "request_id": "request-1",
+    }
+
+
+@pytest.mark.asyncio
+async def test_runtime_submit_human_decision_returns_false_for_unmapped_web_session() -> None:
+    chat_run_registry = FakeChatRunRegistry()
+    runtime = _runtime(chat_run_registry=chat_run_registry)
+
+    accepted = await runtime.submit_human_decision(
+        web_session_id="missing",
+        decision={
+            "action": "confirm",
+            "request_id": "request-1",
+            "tool_call_id": "tool-call-1",
+            "reply_id": "reply-1",
+        },
+    )
+
+    assert accepted is False
+    assert chat_run_registry.spawns == []
+    assert runtime.app.state.chat_service.runs == []
+
+
+@pytest.mark.asyncio
 async def test_runtime_submit_user_message_does_not_advance_event_cursor_when_spawn_fails() -> None:
     message_bus = FakeAgentScopeMessageBus(
         replay_events=[
@@ -670,6 +744,43 @@ async def test_interrupt_delegates_to_runtime_interrupt(tmp_path: Path) -> None:
 
     assert await manager.interrupt(session.id) is True
     assert runtime.interrupts == [session.id]
+
+
+@pytest.mark.asyncio
+async def test_submit_human_decision_rejects_unknown_session(tmp_path: Path) -> None:
+    manager = AgentScopeWebSessionManager(
+        store=WebSessionStore(tmp_path / "sessions.sqlite"),
+        runtime=HumanDecisionAgentScopeRuntime(),
+    )
+
+    with pytest.raises(KeyError):
+        await manager.submit_human_decision("missing", {"action": "confirm"})
+
+
+@pytest.mark.asyncio
+async def test_submit_human_decision_returns_false_without_runtime_support(tmp_path: Path) -> None:
+    store = WebSessionStore(tmp_path / "sessions.sqlite")
+    manager = AgentScopeWebSessionManager(store=store, runtime=FakeAgentScopeRuntime())
+    session = await manager.create_session("处理 20270605")
+
+    assert await manager.submit_human_decision(session.id, {"action": "confirm"}) is False
+
+
+@pytest.mark.asyncio
+async def test_submit_human_decision_delegates_to_runtime(tmp_path: Path) -> None:
+    store = WebSessionStore(tmp_path / "sessions.sqlite")
+    runtime = HumanDecisionAgentScopeRuntime(accepted=True)
+    manager = AgentScopeWebSessionManager(store=store, runtime=runtime)
+    session = await manager.create_session("处理 20270605")
+    decision = {
+        "action": "confirm",
+        "request_id": "request-1",
+        "tool_call_id": "tool-call-1",
+        "reply_id": "reply-1",
+    }
+
+    assert await manager.submit_human_decision(session.id, decision) is True
+    assert runtime.decisions == [(session.id, decision)]
 
 
 @pytest.mark.parametrize("text", [None, "   "])

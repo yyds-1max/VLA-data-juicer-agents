@@ -45,6 +45,15 @@ class AgentScopeWebSessionManager:
             return False
         return bool(await interrupt_web_session(web_session_id=session_id))
 
+    async def submit_human_decision(self, session_id: str, decision: dict[str, Any]) -> bool:
+        if self._store.get_session(session_id) is None:
+            raise KeyError(session_id)
+
+        submit_decision = getattr(self._runtime, "submit_human_decision", None)
+        if submit_decision is None:
+            return False
+        return bool(await submit_decision(web_session_id=session_id, decision=decision))
+
     async def forward_events_until_idle(self, session_id: str) -> None:
         subscribe_events = getattr(self._runtime, "subscribe_web_session_events", None)
         if subscribe_events is None:
