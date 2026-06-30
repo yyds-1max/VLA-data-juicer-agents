@@ -1,5 +1,21 @@
-import { CheckCircle2, ChevronDown, ChevronLeft, ChevronRight, Clock3, Database, Files, Images, Layers3, X, type LucideIcon } from "lucide-react";
-import { Fragment, type MouseEvent, type KeyboardEvent, useEffect, useRef, useState } from "react";
+import {
+  Bot,
+  CheckCircle2,
+  ChevronDown,
+  ChevronLeft,
+  ChevronRight,
+  Clock3,
+  Database,
+  Files,
+  Filter,
+  Images,
+  Layers3,
+  Route,
+  Search,
+  X,
+  type LucideIcon,
+} from "lucide-react";
+import { type MouseEvent, type KeyboardEvent, useEffect, useMemo, useRef, useState } from "react";
 
 import { getSyncImages, getSyncImageUrl } from "../../../api/client";
 import type {
@@ -31,6 +47,29 @@ const statusTones: Record<NavigationDatasetStatus, StatusTone> = {
   synced: "success",
   error: "danger",
 };
+
+type DataSurface = "navigation" | "robotic_arm";
+type SceneFilter = "all" | "outdoor" | "indoor";
+type StatusFilter = "all" | NavigationDatasetStatus;
+
+const dataSurfaces = [
+  { id: "navigation", label: "导航数据", icon: Route },
+  { id: "robotic_arm", label: "机械臂数据", icon: Bot },
+] satisfies Array<{ id: DataSurface; label: string; icon: LucideIcon }>;
+
+const sceneOptions = [
+  { value: "all", label: "全部场景" },
+  { value: "outdoor", label: "室外导航" },
+  { value: "indoor", label: "室内导航" },
+] satisfies Array<{ value: SceneFilter; label: string }>;
+
+const statusOptions = [
+  { value: "all", label: "全部状态" },
+  { value: "raw_only", label: "待处理" },
+  { value: "extracted", label: "已拆解" },
+  { value: "synced", label: "已同步" },
+  { value: "error", label: "异常" },
+] satisfies Array<{ value: StatusFilter; label: string }>;
 
 function formatCount(value: number) {
   return value.toLocaleString();
@@ -108,78 +147,77 @@ function StatusCell({ status }: { status: NavigationDatasetStatus }) {
   return <StatusTag tone={statusTones[status]}>{statusLabels[status]}</StatusTag>;
 }
 
-function ClipRows({
+function ClipList({
   clips,
+  highlightedClip,
   onViewSyncImages,
 }: {
   clips: NavigationClipSummary[];
+  highlightedClip: string | null;
   onViewSyncImages: (clip: NavigationClipSummary, opener: HTMLElement) => void;
 }) {
+  if (clips.length === 0) {
+    return <div className="rounded-lg border border-console-line bg-console-panel px-4 py-5 text-sm text-console-muted">该日期暂无 clip 明细。</div>;
+  }
+
   return (
-    <tr>
-      <td colSpan={9} className="bg-console-panel2/50 px-4 py-4">
-        {clips.length === 0 ? (
-          <div className="rounded-lg border border-console-line bg-console-panel px-4 py-5 text-sm text-console-muted">该日期暂无 clip 明细。</div>
-        ) : (
-          <div className="overflow-x-auto rounded-lg border border-console-line bg-console-panel">
-            <table className="w-full min-w-[980px] text-left text-sm">
-              <thead className="text-xs text-console-muted">
-                <tr className="border-b border-console-line bg-console-panel2/70">
-                  <th className="py-2 pl-3 pr-3 font-medium">clip 名称</th>
-                  <th className="py-2 pr-3 font-medium">时长</th>
-                  <th className="py-2 pr-3 font-medium">topic 摘要</th>
-                  <th className="py-2 pr-3 font-medium">raw 消息</th>
-                  <th className="py-2 pr-3 font-medium">tmp_dir</th>
-                  <th className="py-2 pr-3 font-medium">sync_data</th>
-                  <th className="py-2 pr-3 font-medium">同步图像帧</th>
-                  <th className="py-2 pr-3 font-medium">状态</th>
-                  <th className="py-2 pr-3 font-medium">操作</th>
-                </tr>
-              </thead>
-              <tbody>
-                {clips.map((clip) => (
-                  <tr key={`${clip.date}-${clip.clip}`} className="border-b border-console-line/70 last:border-b-0">
-                    <td className="py-3 pl-3 pr-3 font-medium text-console-text">{clip.clip}</td>
-                    <td className="py-3 pr-3 text-console-muted">{formatDuration(clip.duration_ns)}</td>
-                    <td className="max-w-[18rem] truncate py-3 pr-3 text-console-muted" title={formatTopics(clip.topics)}>
-                      {formatTopics(clip.topics)}
-                    </td>
-                    <td className="py-3 pr-3 text-console-muted">{formatCount(clip.raw_message_count)}</td>
-                    <td className="py-3 pr-3 text-console-muted">{clip.has_tmp_dir ? "已存在" : "缺失"}</td>
-                    <td className="py-3 pr-3 text-console-muted">{clip.has_sync_data ? "已存在" : "缺失"}</td>
-                    <td className="py-3 pr-3 text-console-muted">{formatCount(clip.sync_frame_counts.image)}</td>
-                    <td className="py-3 pr-3">
-                      <StatusCell status={clip.status} />
-                    </td>
-                    <td className="py-3 pr-3">
-                      <ConsoleButton
-                        className="h-8 px-2 text-xs"
-                        disabled={clip.sync_frame_counts.image === 0}
-                        aria-label={`查看 ${clip.clip} 同步图像`}
-                        onClick={(event: MouseEvent<HTMLButtonElement>) => onViewSyncImages(clip, event.currentTarget)}
-                      >
-                        查看同步图像
-                      </ConsoleButton>
-                    </td>
-                  </tr>
-                ))}
-              </tbody>
-            </table>
+    <div className="grid gap-3">
+      {clips.map((clip) => {
+        const highlightedQuery = highlightedClip?.toLowerCase() ?? "";
+        const isHighlighted = highlightedQuery.length > 0 && clip.clip.toLowerCase().includes(highlightedQuery);
+
+        return (
+          <div
+            key={`${clip.date}-${clip.clip}`}
+            className={`rounded-lg border bg-console-panel p-3 transition ${
+              isHighlighted ? "border-console-cyan shadow-[0_0_0_2px_rgba(45,108,223,0.12)]" : "border-console-line"
+            }`}
+          >
+            <div className="flex flex-col gap-3 lg:flex-row lg:items-start lg:justify-between">
+              <div className="min-w-0 space-y-2">
+                <div className="flex flex-wrap items-center gap-2">
+                  <h3 className="text-sm font-semibold text-console-text">{clip.clip}</h3>
+                  <StatusCell status={clip.status} />
+                  {isHighlighted ? <StatusTag tone="info">匹配</StatusTag> : null}
+                </div>
+                <p className="max-w-3xl truncate text-xs text-console-muted" title={formatTopics(clip.topics)}>
+                  {formatTopics(clip.topics)}
+                </p>
+              </div>
+              <ConsoleButton
+                className="h-8 w-fit px-2 text-xs"
+                disabled={clip.sync_frame_counts.image === 0}
+                aria-label={`查看 ${clip.clip} 同步图像`}
+                onClick={(event: MouseEvent<HTMLButtonElement>) => onViewSyncImages(clip, event.currentTarget)}
+              >
+                查看同步图像
+              </ConsoleButton>
+            </div>
+            <div className="mt-3 grid gap-2 text-xs text-console-muted sm:grid-cols-2 lg:grid-cols-6">
+              <span>时长 {formatDuration(clip.duration_ns)}</span>
+              <span>raw {formatCount(clip.raw_message_count)}</span>
+              <span>tmp_dir {clip.has_tmp_dir ? "已存在" : "缺失"}</span>
+              <span>sync_data {clip.has_sync_data ? "已存在" : "缺失"}</span>
+              <span>图像 {formatCount(clip.sync_frame_counts.image)}</span>
+              <span>点云 {formatCount(clip.sync_frame_counts.pointcloud)}</span>
+            </div>
           </div>
-        )}
-      </td>
-    </tr>
+        );
+      })}
+    </div>
   );
 }
 
-function DatasetTable({
+function DatasetList({
   dates,
   expandedDate,
+  highlightedClip,
   onToggleDate,
   onViewSyncImages,
 }: {
   dates: NavigationDateSummary[];
   expandedDate: string | null;
+  highlightedClip: string | null;
   onToggleDate: (date: string) => void;
   onViewSyncImages: (clip: NavigationClipSummary, opener: HTMLElement) => void;
 }) {
@@ -192,52 +230,195 @@ function DatasetTable({
         </div>
         <StatusTag tone="info">{formatCount(dates.length)} 个日期</StatusTag>
       </div>
-      <div className="overflow-x-auto">
-        <table className="w-full min-w-[1040px] text-left text-sm">
-          <thead className="text-xs text-console-muted">
-            <tr className="border-b border-console-line">
-              <th className="py-2 pr-3 font-medium">日期</th>
-              <th className="py-2 pr-3 font-medium">clip 数</th>
-              <th className="py-2 pr-3 font-medium">总时长</th>
-              <th className="py-2 pr-3 font-medium">raw 消息</th>
-              <th className="py-2 pr-3 font-medium">已拆解 clip</th>
-              <th className="py-2 pr-3 font-medium">同步 clip 数</th>
-              <th className="py-2 pr-3 font-medium">同步图像帧</th>
-              <th className="py-2 pr-3 font-medium">状态</th>
-              <th className="py-2 pr-3 font-medium">展开</th>
-            </tr>
-          </thead>
-          <tbody>
-            {dates.map((date) => {
-              const isExpanded = expandedDate === date.date;
-              const ExpandIcon = isExpanded ? ChevronDown : ChevronRight;
+      <div className="space-y-3">
+        {dates.map((date) => {
+          const isExpanded = expandedDate === date.date;
+          const ExpandIcon = isExpanded ? ChevronDown : ChevronRight;
 
-              return (
-                <Fragment key={date.date}>
-                  <tr className="border-b border-console-line/70">
-                    <td className="py-3 pr-3 font-medium text-console-text">{date.date}</td>
-                    <td className="py-3 pr-3 text-console-muted">{formatCount(date.clip_count)}</td>
-                    <td className="py-3 pr-3 text-console-muted">{formatDuration(date.total_duration_ns)}</td>
-                    <td className="py-3 pr-3 text-console-muted">{formatCount(date.raw_message_count)}</td>
-                    <td className="py-3 pr-3 text-console-muted">{formatCount(date.extracted_clip_count)}</td>
-                    <td className="py-3 pr-3 text-console-muted">{formatCount(date.synced_clip_count)}</td>
-                    <td className="py-3 pr-3 text-console-muted">{formatCount(date.sync_frame_counts.image)}</td>
-                    <td className="py-3 pr-3">
-                      <StatusCell status={date.status} />
-                    </td>
-                    <td className="py-3 pr-3">
-                      <ConsoleButton className="h-8 px-2 text-xs" aria-label={`${isExpanded ? "收起" : "展开"} ${date.date}`} onClick={() => onToggleDate(date.date)}>
-                        <ExpandIcon aria-hidden="true" className="h-4 w-4" />
-                        {isExpanded ? "收起" : "展开"}
-                      </ConsoleButton>
-                    </td>
-                  </tr>
-                  {isExpanded ? <ClipRows clips={date.clips ?? []} onViewSyncImages={onViewSyncImages} /> : null}
-                </Fragment>
-              );
-            })}
-          </tbody>
-        </table>
+          return (
+            <div key={date.date} className="rounded-lg border border-console-line bg-console-panel2/50 p-4">
+              <div className="flex flex-col gap-3 xl:flex-row xl:items-center xl:justify-between">
+                <div className="flex flex-wrap items-center gap-3">
+                  <h3 className="text-lg font-semibold text-console-text">{date.date}</h3>
+                  <StatusCell status={date.status} />
+                </div>
+                <div className="grid flex-1 gap-2 text-xs text-console-muted sm:grid-cols-3 xl:max-w-3xl xl:grid-cols-6">
+                  <span>clip {formatCount(date.clip_count)}</span>
+                  <span>总时长 {formatDuration(date.total_duration_ns)}</span>
+                  <span>raw {formatCount(date.raw_message_count)}</span>
+                  <span>已拆解 {formatCount(date.extracted_clip_count)}</span>
+                  <span>已同步 {formatCount(date.synced_clip_count)}</span>
+                  <span>图像 {formatCount(date.sync_frame_counts.image)}</span>
+                </div>
+                <ConsoleButton className="h-8 w-fit px-2 text-xs" aria-label={`${isExpanded ? "收起" : "展开"} ${date.date}`} onClick={() => onToggleDate(date.date)}>
+                  <ExpandIcon aria-hidden="true" className="h-4 w-4" />
+                  {isExpanded ? "收起" : "展开"}
+                </ConsoleButton>
+              </div>
+              {isExpanded ? (
+                <div className="mt-4 border-t border-console-line pt-4">
+                  <ClipList clips={date.clips ?? []} highlightedClip={highlightedClip} onViewSyncImages={onViewSyncImages} />
+                </div>
+              ) : null}
+            </div>
+          );
+        })}
+      </div>
+    </ConsoleCard>
+  );
+}
+
+function SelectMenu<T extends string>({
+  label,
+  options,
+  value,
+  onChange,
+}: {
+  label: string;
+  options: Array<{ value: T; label: string }>;
+  value: T;
+  onChange: (value: T) => void;
+}) {
+  const [open, setOpen] = useState(false);
+  const activeLabel = options.find((option) => option.value === value)?.label ?? label;
+
+  return (
+    <div className="relative">
+      <ConsoleButton aria-expanded={open} aria-haspopup="listbox" onClick={() => setOpen((current) => !current)}>
+        <Filter aria-hidden="true" className="h-4 w-4" />
+        {activeLabel}
+        <ChevronDown aria-hidden="true" className="h-4 w-4" />
+      </ConsoleButton>
+      {open ? (
+        <div className="absolute left-0 top-11 z-20 min-w-36 rounded-lg border border-console-line bg-console-panel p-1 shadow-lg" role="listbox" aria-label={label}>
+          {options.map((option) => (
+            <button
+              key={option.value}
+              type="button"
+              role="option"
+              aria-selected={option.value === value}
+              className={`block w-full rounded-md px-3 py-2 text-left text-sm transition ${
+                option.value === value ? "bg-console-panel2 font-semibold text-console-text" : "text-console-muted hover:bg-console-panel2 hover:text-console-text"
+              }`}
+              onClick={() => {
+                onChange(option.value);
+                setOpen(false);
+              }}
+            >
+              {option.label}
+            </button>
+          ))}
+        </div>
+      ) : null}
+    </div>
+  );
+}
+
+function DataSurfaceTabs({
+  activeSurface,
+  onChange,
+}: {
+  activeSurface: DataSurface;
+  onChange: (surface: DataSurface) => void;
+}) {
+  return (
+    <div className="flex flex-wrap gap-2" role="tablist" aria-label="数据类型">
+      {dataSurfaces.map((surface) => {
+        const Icon = surface.icon;
+        const active = activeSurface === surface.id;
+
+        return (
+          <button
+            key={surface.id}
+            type="button"
+            role="tab"
+            aria-selected={active}
+            className={`inline-flex h-10 items-center gap-2 rounded-lg border px-4 text-sm font-semibold transition focus:outline-none focus:ring-2 focus:ring-console-cyan ${
+              active
+                ? "border-console-cyan bg-blue-50 text-console-cyan shadow-sm"
+                : "border-console-line bg-console-panel text-console-muted hover:border-console-cyan/40 hover:bg-console-panel2 hover:text-console-text"
+            }`}
+            onClick={() => onChange(surface.id)}
+          >
+            <Icon aria-hidden="true" className="h-4 w-4" />
+            {surface.label}
+          </button>
+        );
+      })}
+    </div>
+  );
+}
+
+function SearchSuggestions({
+  query,
+  dates,
+  visible,
+  onSelectDate,
+  onSelectClip,
+}: {
+  query: string;
+  dates: NavigationDateSummary[];
+  visible: boolean;
+  onSelectDate: (date: string) => void;
+  onSelectClip: (date: string, clip: string) => void;
+}) {
+  const trimmedQuery = query.trim();
+  if (!visible || !trimmedQuery) {
+    return null;
+  }
+
+  const suggestions =
+    trimmedQuery.length <= 8
+      ? dates
+          .filter((date) => date.date.includes(trimmedQuery))
+          .slice(0, 8)
+          .map((date) => ({ type: "date" as const, date: date.date, label: date.date }))
+      : dates
+          .flatMap((date) =>
+            (date.clips ?? [])
+              .filter((clip) => clip.clip.toLowerCase().includes(trimmedQuery.toLowerCase()))
+              .map((clip) => ({ type: "clip" as const, date: date.date, clip: clip.clip, label: clip.clip })),
+          )
+          .slice(0, 8);
+
+  if (!suggestions.length) {
+    return null;
+  }
+
+  return (
+    <div className="absolute left-0 right-0 top-11 z-20 rounded-lg border border-console-line bg-console-panel p-1 shadow-lg" role="listbox" aria-label="搜索建议">
+      {suggestions.map((suggestion) => (
+        <button
+          key={`${suggestion.type}-${suggestion.label}`}
+          type="button"
+          role="option"
+          className="block w-full rounded-md px-3 py-2 text-left text-sm text-console-muted transition hover:bg-console-panel2 hover:text-console-text"
+          onClick={() => {
+            if (suggestion.type === "date") {
+              onSelectDate(suggestion.date);
+            } else {
+              onSelectClip(suggestion.date, suggestion.clip);
+            }
+          }}
+        >
+          {suggestion.label}
+        </button>
+      ))}
+    </div>
+  );
+}
+
+function RoboticArmPlaceholder() {
+  return (
+    <ConsoleCard className="py-10">
+      <div className="mx-auto max-w-2xl text-center">
+        <div className="mx-auto mb-4 flex h-12 w-12 items-center justify-center rounded-xl border border-console-line bg-console-panel2">
+          <Bot aria-hidden="true" className="h-6 w-6 text-console-cyan" />
+        </div>
+        <h2 className="text-lg font-semibold text-console-text">机械臂数据接入中</h2>
+        <p className="mt-2 text-sm leading-6 text-console-muted">
+          这里会用于展示机械臂采集、拆解、同步和标注前的数据资产。当前版本先保留入口，后续接入真实机械臂数据扫描后启用。
+        </p>
       </div>
     </ConsoleCard>
   );
@@ -456,6 +637,13 @@ function SyncImageDrawer({
 }
 
 export function DataManagementPage({ onPlaceholderAction }: DataManagementPageProps) {
+  void onPlaceholderAction;
+  const [activeSurface, setActiveSurface] = useState<DataSurface>("navigation");
+  const [sceneFilter, setSceneFilter] = useState<SceneFilter>("all");
+  const [statusFilter, setStatusFilter] = useState<StatusFilter>("all");
+  const [searchQuery, setSearchQuery] = useState("");
+  const [showSearchSuggestions, setShowSearchSuggestions] = useState(false);
+  const [highlightedClip, setHighlightedClip] = useState<{ date: string; clip: string } | null>(null);
   const [expandedDate, setExpandedDate] = useState<string | null>(null);
   const [syncImageClip, setSyncImageClip] = useState<NavigationClipSummary | null>(null);
   const { summary: datasetSummary, loading, error } = useNavigationDatasetSummary();
@@ -463,6 +651,37 @@ export function DataManagementPage({ onPlaceholderAction }: DataManagementPagePr
 
   const totals = datasetSummary?.totals;
   const dates = datasetSummary?.dates ?? [];
+  const visibleDates = useMemo(() => {
+    const query = searchQuery.trim().toLowerCase();
+    const matchingClipDate =
+      highlightedClip ??
+      (query.length > 8
+        ? dates
+            .flatMap((date) => (date.clips ?? []).map((clip) => ({ date: date.date, clip: clip.clip })))
+            .find((match) => match.clip.toLowerCase().includes(query)) ?? null
+        : null);
+
+    return dates.filter((date) => {
+      if (statusFilter !== "all" && date.status !== statusFilter) {
+        return false;
+      }
+
+      if (!query) {
+        return true;
+      }
+
+      if (matchingClipDate) {
+        return date.date === matchingClipDate.date;
+      }
+
+      if (query.length <= 8) {
+        return date.date.includes(query);
+      }
+
+      return (date.clips ?? []).some((clip) => clip.clip.toLowerCase().includes(query));
+    });
+  }, [dates, highlightedClip, searchQuery, statusFilter]);
+  const effectiveExpandedDate = highlightedClip?.date ?? expandedDate;
 
   function handleToggleDate(date: string) {
     setExpandedDate((currentDate) => (currentDate === date ? null : date));
@@ -480,29 +699,104 @@ export function DataManagementPage({ onPlaceholderAction }: DataManagementPagePr
     }, 0);
   }
 
+  function handleSelectSearchDate(date: string) {
+    setSearchQuery(date);
+    setShowSearchSuggestions(false);
+    setHighlightedClip(null);
+    setExpandedDate(null);
+  }
+
+  function handleSelectSearchClip(date: string, clip: string) {
+    setSearchQuery(clip);
+    setShowSearchSuggestions(false);
+    setHighlightedClip({ date, clip });
+    setExpandedDate(date);
+  }
+
   return (
     <section className="mx-auto max-w-7xl space-y-4 px-4 py-6 md:px-6">
-      <div className="grid gap-4 sm:grid-cols-2 xl:grid-cols-5">
-        <MetricCard icon={Database} label="日期批次" value={formatCount(totals?.date_count ?? 0)} />
-        <MetricCard icon={Files} label="原始 clip" value={formatCount(totals?.clip_count ?? 0)} />
-        <MetricCard icon={Clock3} label="总采集时长" value={formatDuration(totals?.total_duration_ns ?? 0)} />
-        <MetricCard icon={CheckCircle2} label="已同步 clip" value={formatCount(totals?.synced_clip_count ?? 0)} />
-        <MetricCard icon={Images} label="同步图像帧" value={formatCount(datasetSummary?.sync_distribution.image ?? 0)} />
-      </div>
+      <ConsoleCard className="space-y-4">
+        <DataSurfaceTabs activeSurface={activeSurface} onChange={setActiveSurface} />
+        <div className="flex flex-col gap-3 lg:flex-row lg:items-center">
+          <div className="flex flex-wrap gap-2">
+            <SelectMenu label="全部场景" options={sceneOptions} value={sceneFilter} onChange={setSceneFilter} />
+            <SelectMenu label="全部状态" options={statusOptions} value={statusFilter} onChange={setStatusFilter} />
+          </div>
+          <div className="relative min-w-0 flex-1">
+            <Search aria-hidden="true" className="pointer-events-none absolute left-3 top-1/2 h-4 w-4 -translate-y-1/2 text-console-muted" />
+            <input
+              className="h-10 w-full rounded-lg border border-console-line bg-console-panel px-9 text-sm text-console-text shadow-sm outline-none transition placeholder:text-console-muted focus:border-console-cyan focus:ring-2 focus:ring-console-cyan/20"
+              placeholder="按日期或 clip 搜索"
+              value={searchQuery}
+              onChange={(event) => {
+                setSearchQuery(event.target.value);
+                setShowSearchSuggestions(true);
+                setHighlightedClip(null);
+              }}
+              onFocus={() => {
+                if (searchQuery.trim()) {
+                  setShowSearchSuggestions(true);
+                }
+              }}
+            />
+            {searchQuery ? (
+              <button
+                type="button"
+                aria-label="清空搜索"
+                className="absolute right-2 top-1/2 flex h-6 w-6 -translate-y-1/2 items-center justify-center rounded-md text-console-muted hover:bg-console-panel2 hover:text-console-text"
+                onClick={() => {
+                  setSearchQuery("");
+                  setShowSearchSuggestions(false);
+                  setHighlightedClip(null);
+                }}
+              >
+                <X aria-hidden="true" className="h-4 w-4" />
+              </button>
+            ) : null}
+            <SearchSuggestions
+              query={searchQuery}
+              dates={dates}
+              visible={showSearchSuggestions}
+              onSelectDate={handleSelectSearchDate}
+              onSelectClip={handleSelectSearchClip}
+            />
+          </div>
+        </div>
+      </ConsoleCard>
 
-      <ProcessOverview />
+      {activeSurface === "navigation" ? (
+        <>
+          <div className="grid gap-4 sm:grid-cols-2 xl:grid-cols-5">
+            <MetricCard icon={Database} label="日期批次" value={formatCount(totals?.date_count ?? 0)} />
+            <MetricCard icon={Files} label="原始 clip" value={formatCount(totals?.clip_count ?? 0)} />
+            <MetricCard icon={Clock3} label="总采集时长" value={formatDuration(totals?.total_duration_ns ?? 0)} />
+            <MetricCard icon={CheckCircle2} label="已同步 clip" value={formatCount(totals?.synced_clip_count ?? 0)} />
+            <MetricCard icon={Images} label="同步图像帧" value={formatCount(datasetSummary?.sync_distribution.image ?? 0)} />
+          </div>
 
-      {loading ? (
-        <ConsoleCard className="py-8 text-center text-sm text-console-muted">正在加载导航数据集...</ConsoleCard>
-      ) : error ? (
-        <ConsoleCard className="border-rose-200 bg-rose-50/60 py-8 text-center text-sm text-rose-700">{error}</ConsoleCard>
-      ) : dates.length === 0 ? (
-        <ConsoleCard className="py-8 text-center text-sm text-console-muted">
-          <Layers3 aria-hidden="true" className="mx-auto mb-3 h-6 w-6 text-console-muted" />
-          暂无导航数据集。
-        </ConsoleCard>
+          <ProcessOverview />
+
+          {loading ? (
+            <ConsoleCard className="py-8 text-center text-sm text-console-muted">正在加载导航数据集...</ConsoleCard>
+          ) : error ? (
+            <ConsoleCard className="border-rose-200 bg-rose-50/60 py-8 text-center text-sm text-rose-700">{error}</ConsoleCard>
+          ) : visibleDates.length === 0 ? (
+            <ConsoleCard className="py-8 text-center text-sm text-console-muted">
+              <Layers3 aria-hidden="true" className="mx-auto mb-3 h-6 w-6 text-console-muted" />
+              暂无匹配的导航数据集。
+            </ConsoleCard>
+          ) : (
+            <DatasetList
+              dates={visibleDates}
+              expandedDate={effectiveExpandedDate}
+              highlightedClip={highlightedClip?.clip ?? (searchQuery.trim().length > 8 ? searchQuery.trim() : null)}
+              onToggleDate={handleToggleDate}
+              onViewSyncImages={handleViewSyncImages}
+            />
+          )}
+        </>
       ) : (
-        <DatasetTable dates={dates} expandedDate={expandedDate} onToggleDate={handleToggleDate} onViewSyncImages={handleViewSyncImages} />
+        <RoboticArmPlaceholder />
       )}
 
       <SyncImageDrawer clip={syncImageClip} onClose={handleCloseSyncImages} />

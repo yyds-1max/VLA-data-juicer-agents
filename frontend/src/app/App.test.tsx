@@ -255,6 +255,158 @@ test("data management renders navigation dataset date and clip details", async (
   expect(screen.getByRole("button", { name: "Open DataPilot" })).toBeVisible();
 });
 
+test("data management switches between navigation and robotic arm data surfaces", async () => {
+  await renderAppWithDashboardSettled();
+
+  fireEvent.click(screen.getByRole("button", { name: "数据管理" }));
+
+  expect(await screen.findByRole("tab", { name: "导航数据" })).toBeVisible();
+  expect(screen.getByRole("tab", { name: "机械臂数据" })).toBeVisible();
+  expect(screen.getByRole("button", { name: "全部场景" })).toBeVisible();
+  expect(screen.getByRole("button", { name: "全部状态" })).toBeVisible();
+  expect(screen.getByPlaceholderText("按日期或 clip 搜索")).toBeVisible();
+
+  fireEvent.click(screen.getByRole("tab", { name: "机械臂数据" }));
+
+  expect(screen.getByText("机械臂数据接入中")).toBeVisible();
+  expect(screen.getByRole("button", { name: "全部场景" })).toBeVisible();
+  expect(screen.getByRole("button", { name: "全部状态" })).toBeVisible();
+  expect(screen.getByPlaceholderText("按日期或 clip 搜索")).toBeVisible();
+});
+
+test("data management filters navigation dates by status", async () => {
+  apiMocks.getNavigationDatasetSummary.mockResolvedValue({
+    totals: {
+      date_count: 2,
+      clip_count: 3,
+      total_duration_ns: 3_500_000_000,
+      raw_message_count: 90,
+      extracted_clip_count: 1,
+      synced_clip_count: 1,
+    },
+    sync_distribution: { image: 2, pointcloud: 1, odom: 1, grid_map: 1 },
+    dates: [
+      {
+        date: "20270515",
+        clip_count: 2,
+        total_duration_ns: 2_000_000_000,
+        raw_message_count: 40,
+        extracted_clip_count: 1,
+        synced_clip_count: 1,
+        sync_frame_counts: { image: 2, pointcloud: 1, odom: 1, grid_map: 1 },
+        status: "synced",
+        clips: [
+          {
+            date: "20270515",
+            clip: "20260515_102948",
+            duration_ns: 1_500_000_000,
+            raw_message_count: 18,
+            topics: [{ name: "/camera/front/image_raw", type: "sensor_msgs/msg/Image", message_count: 12 }],
+            has_tmp_dir: true,
+            has_sync_data: true,
+            sequences: [],
+            sync_frame_counts: { image: 2, pointcloud: 1, odom: 1, grid_map: 1 },
+            status: "synced",
+            errors: [],
+          },
+        ],
+      },
+      {
+        date: "20270601",
+        clip_count: 1,
+        total_duration_ns: 1_500_000_000,
+        raw_message_count: 50,
+        extracted_clip_count: 0,
+        synced_clip_count: 0,
+        sync_frame_counts: { image: 0, pointcloud: 0, odom: 0, grid_map: 0 },
+        status: "raw_only",
+        clips: [
+          {
+            date: "20270601",
+            clip: "20260601_083000",
+            duration_ns: 1_500_000_000,
+            raw_message_count: 50,
+            topics: [{ name: "/odom", type: "nav_msgs/msg/Odometry", message_count: 50 }],
+            has_tmp_dir: false,
+            has_sync_data: false,
+            sequences: [],
+            sync_frame_counts: { image: 0, pointcloud: 0, odom: 0, grid_map: 0 },
+            status: "raw_only",
+            errors: [],
+          },
+        ],
+      },
+    ],
+  });
+  await renderAppWithDashboardSettled();
+
+  fireEvent.click(screen.getByRole("button", { name: "数据管理" }));
+  expect(await screen.findByText("20270515")).toBeVisible();
+  expect(screen.getByText("20270601")).toBeVisible();
+
+  fireEvent.click(screen.getByRole("button", { name: "全部状态" }));
+  fireEvent.click(screen.getByRole("option", { name: "待处理" }));
+
+  expect(screen.getByText("20270601")).toBeVisible();
+  expect(screen.queryByText("20270515")).not.toBeInTheDocument();
+});
+
+test("data management search suggests dates and expands matching clips", async () => {
+  apiMocks.getNavigationDatasetSummary.mockResolvedValue({
+    totals: {
+      date_count: 1,
+      clip_count: 1,
+      total_duration_ns: 3_500_000_000,
+      raw_message_count: 40,
+      extracted_clip_count: 1,
+      synced_clip_count: 1,
+    },
+    sync_distribution: { image: 2, pointcloud: 1, odom: 1, grid_map: 1 },
+    dates: [
+      {
+        date: "20270515",
+        clip_count: 1,
+        total_duration_ns: 3_500_000_000,
+        raw_message_count: 40,
+        extracted_clip_count: 1,
+        synced_clip_count: 1,
+        sync_frame_counts: { image: 2, pointcloud: 1, odom: 1, grid_map: 1 },
+        status: "synced",
+        clips: [
+          {
+            date: "20270515",
+            clip: "20260515_102948",
+            duration_ns: 3_500_000_000,
+            raw_message_count: 40,
+            topics: [{ name: "/camera/front/image_raw", type: "sensor_msgs/msg/Image", message_count: 40 }],
+            has_tmp_dir: true,
+            has_sync_data: true,
+            sequences: [],
+            sync_frame_counts: { image: 2, pointcloud: 1, odom: 1, grid_map: 1 },
+            status: "synced",
+            errors: [],
+          },
+        ],
+      },
+    ],
+  });
+  await renderAppWithDashboardSettled();
+
+  fireEvent.click(screen.getByRole("button", { name: "数据管理" }));
+  const searchInput = await screen.findByPlaceholderText("按日期或 clip 搜索");
+
+  fireEvent.change(searchInput, { target: { value: "2027" } });
+  expect(screen.getByRole("option", { name: "20270515" })).toBeVisible();
+
+  fireEvent.change(searchInput, { target: { value: "20260515_" } });
+  fireEvent.click(screen.getByRole("option", { name: "20260515_102948" }));
+
+  expect(searchInput).toHaveValue("20260515_102948");
+  expect(screen.getByText("20270515")).toBeVisible();
+  expect(screen.getByText("20260515_102948")).toBeVisible();
+  expect(screen.getByText("匹配")).toBeVisible();
+});
+
 test("navigation dataset summary is reused while switching console pages", async () => {
   await renderAppWithDashboardSettled();
   expect(apiMocks.getNavigationDatasetSummary).toHaveBeenCalledTimes(1);
