@@ -1,7 +1,11 @@
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
+from vla_data_juicer_agents.navigation.routing import is_high_confidence_navigation_request
+from vla_data_juicer_agents.runtime.agentscope_config import AgentScopeRuntimeConfig
+from vla_data_juicer_agents.runtime.agentscope_runtime import AgentScopeRuntime
 from vla_data_juicer_agents.web.agent_session import AgentScopeWebSessionManager
 from vla_data_juicer_agents.web.schemas import HumanDecisionRequest, SessionRecord
 from vla_data_juicer_agents.web.session_store import WebSessionStore
@@ -32,6 +36,253 @@ class InterruptingAgentScopeRuntime(FakeAgentScopeRuntime):
     async def interrupt_web_session(self, *, web_session_id: str) -> bool:
         self.interrupts.append(web_session_id)
         return self.interrupted
+
+
+class FakeAgentScopeStorage:
+    def __init__(self) -> None:
+        self.sessions = []
+
+    async def upsert_credential(self, user_id, credential_data):
+        return credential_data.id
+
+    async def upsert_agent(self, user_id, agent_record):
+        return agent_record.id
+
+    async def upsert_session(self, user_id, agent_id, config, *, session_id=None):
+        self.sessions.append(
+            {
+                "user_id": user_id,
+                "agent_id": agent_id,
+                "config": config,
+                "id": session_id,
+            }
+        )
+        return SimpleNamespace(id=session_id)
+
+
+class FakeChatService:
+    def __init__(self) -> None:
+        self.runs = []
+
+    async def run(self, *, user_id, session_id, agent_id, input_msg):
+        self.runs.append(
+            {
+                "user_id": user_id,
+                "session_id": session_id,
+                "agent_id": agent_id,
+                "message": input_msg,
+            }
+        )
+
+
+class FakeChatRunRegistry:
+    def __init__(self, *, reject_duplicate_active: bool = False) -> None:
+        self.reject_duplicate_active = reject_duplicate_active
+        self.active_session_ids: set[str] = set()
+        self.spawns = []
+
+    def spawn(self, coroutine, *, session_id):
+        if self.reject_duplicate_active and session_id in self.active_session_ids:
+            raise RuntimeError(f"chat run already active for session {session_id}")
+        self.active_session_ids.add(session_id)
+        self.spawns.append({"coroutine": coroutine, "session_id": session_id})
+
+    async def drain(self) -> None:
+        while self.spawns:
+            spawn = self.spawns.pop(0)
+            await spawn["coroutine"]
+            self.active_session_ids.discard(spawn["session_id"])
+
+
+def _agentscope_config(**overrides) -> AgentScopeRuntimeConfig:
+    values = {
+        "user_id": "alice",
+        "redis_url": "redis://localhost:6379/0",
+        "workspace_root": Path("/tmp/vla-agent-workspace"),
+        "dashscope_api_key": "test-key",
+        "dashscope_base_url": None,
+        "default_model": "qwen-default",
+        "router_model": "qwen-router",
+        "navigation_model": "qwen-navigation",
+    }
+    values.update(overrides)
+    return AgentScopeRuntimeConfig(**values)
+
+
+def _runtime(
+    *,
+    storage: FakeAgentScopeStorage | None = None,
+    chat_run_registry: FakeChatRunRegistry | None = None,
+) -> AgentScopeRuntime:
+    storage = storage or FakeAgentScopeStorage()
+    chat_service = FakeChatService()
+    state = SimpleNamespace(chat_service=chat_service)
+    if chat_run_registry is not None:
+        state.chat_run_registry = chat_run_registry
+    return AgentScopeRuntime(
+        config=_agentscope_config(),
+        storage=storage,
+        message_bus=object(),
+        workspace_manager=object(),
+        app=SimpleNamespace(state=state),
+    )
+
+
+def _message_text(message) -> str:
+    return message.content[0].text
+
+
+def test_navigation_rule_fallback_is_narrow_and_explicit() -> None:
+    assert is_high_confidence_navigation_request("请处理 20270605 的室外导航数据并生成标注")
+    assert is_high_confidence_navigation_request("同步 rosbag db3 odom 和 gridmap 数据")
+    assert is_high_confidence_navigation_request("导航 trajectory tracking projection annotation")
+    assert is_high_confidence_navigation_request("20270605 tracking projection annotation for nav data")
+    assert not is_high_confidence_navigation_request("你好，今天怎么样")
+    assert not is_high_confidence_navigation_request("继续")
+    assert not is_high_confidence_navigation_request("bug tracking")
+    assert not is_high_confidence_navigation_request("database projection")
+    assert not is_high_confidence_navigation_request("annotate this chart")
+
+
+@pytest.mark.asyncio
+async def test_runtime_submit_user_message_routes_navigation_request_to_navigation_agent() -> None:
+    chat_run_registry = FakeChatRunRegistry()
+    runtime = _runtime(chat_run_registry=chat_run_registry)
+
+    turn_id = await runtime.submit_user_message(
+        web_session_id="web-1",
+        message="同步 rosbag db3 odom 和 gridmap 数据",
+    )
+
+    assert turn_id.startswith("turn_")
+    assert runtime.web_sessions == {"web-1": ("navigation-data-agent", "web-1__navigation-data-agent")}
+    session = runtime.storage.sessions[0]
+    assert session["user_id"] == "alice"
+    assert session["agent_id"] == "navigation-data-agent"
+    assert session["id"] == "web-1__navigation-data-agent"
+    assert session["config"].workspace_id == "workspace-web-1"
+    assert session["config"].name == "web-1"
+    assert session["config"].chat_model_config.type == "dashscope_chat"
+    assert session["config"].chat_model_config.credential_id == "dashscope-env"
+    assert session["config"].chat_model_config.model == "qwen-navigation"
+    assert session["config"].chat_model_config.parameters == {"parallel_tool_calls": False}
+    assert runtime.app.state.chat_service.runs == []
+    assert [spawn["session_id"] for spawn in chat_run_registry.spawns] == [
+        "web-1__navigation-data-agent"
+    ]
+    await chat_run_registry.drain()
+    assert len(runtime.app.state.chat_service.runs) == 1
+    run = runtime.app.state.chat_service.runs[0]
+    assert run["user_id"] == "alice"
+    assert run["session_id"] == "web-1__navigation-data-agent"
+    assert run["agent_id"] == "navigation-data-agent"
+    assert run["message"].name == "user"
+    assert _message_text(run["message"]) == "同步 rosbag db3 odom 和 gridmap 数据"
+
+
+@pytest.mark.asyncio
+async def test_runtime_submit_user_message_routes_ordinary_request_to_main_router() -> None:
+    chat_run_registry = FakeChatRunRegistry()
+    runtime = _runtime(chat_run_registry=chat_run_registry)
+
+    await runtime.submit_user_message(web_session_id="web-1", message="你好")
+
+    assert runtime.web_sessions == {"web-1": ("main-router-agent", "web-1__main-router-agent")}
+    session = runtime.storage.sessions[0]
+    assert session["agent_id"] == "main-router-agent"
+    assert session["id"] == "web-1__main-router-agent"
+    assert session["config"].chat_model_config.model == "qwen-router"
+    assert runtime.app.state.chat_service.runs == []
+    await chat_run_registry.drain()
+    run = runtime.app.state.chat_service.runs[0]
+    assert run["session_id"] == "web-1__main-router-agent"
+    assert run["agent_id"] == "main-router-agent"
+    assert run["message"].name == "user"
+    assert _message_text(run["message"]) == "你好"
+
+
+@pytest.mark.asyncio
+async def test_runtime_submit_user_message_reuses_session_for_same_agent() -> None:
+    chat_run_registry = FakeChatRunRegistry()
+    runtime = _runtime(chat_run_registry=chat_run_registry)
+
+    await runtime.submit_user_message(web_session_id="web-1", message="你好")
+    await chat_run_registry.drain()
+    await runtime.submit_user_message(web_session_id="web-1", message="再聊一下")
+    await chat_run_registry.drain()
+
+    assert len(runtime.storage.sessions) == 1
+    assert [run["session_id"] for run in runtime.app.state.chat_service.runs] == [
+        "web-1__main-router-agent",
+        "web-1__main-router-agent",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_runtime_submit_user_message_recreates_session_when_agent_changes() -> None:
+    chat_run_registry = FakeChatRunRegistry()
+    runtime = _runtime(chat_run_registry=chat_run_registry)
+
+    await runtime.submit_user_message(web_session_id="web-1", message="你好")
+    await chat_run_registry.drain()
+    await runtime.submit_user_message(web_session_id="web-1", message="处理导航数据")
+    await chat_run_registry.drain()
+
+    assert len(runtime.storage.sessions) == 2
+    assert runtime.web_sessions == {"web-1": ("navigation-data-agent", "web-1__navigation-data-agent")}
+    assert [session["agent_id"] for session in runtime.storage.sessions] == [
+        "main-router-agent",
+        "navigation-data-agent",
+    ]
+    assert [session["id"] for session in runtime.storage.sessions] == [
+        "web-1__main-router-agent",
+        "web-1__navigation-data-agent",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_runtime_submit_user_message_reuses_deterministic_session_id_after_restart() -> None:
+    storage = FakeAgentScopeStorage()
+    first_registry = FakeChatRunRegistry()
+    first_runtime = _runtime(storage=storage, chat_run_registry=first_registry)
+    second_registry = FakeChatRunRegistry()
+    second_runtime = _runtime(storage=storage, chat_run_registry=second_registry)
+
+    await first_runtime.submit_user_message(web_session_id="web-1", message="你好")
+    await first_registry.drain()
+    await second_runtime.submit_user_message(web_session_id="web-1", message="你好 again")
+    await second_registry.drain()
+
+    assert [session["id"] for session in storage.sessions] == [
+        "web-1__main-router-agent",
+        "web-1__main-router-agent",
+    ]
+    assert second_runtime.web_sessions == {"web-1": ("main-router-agent", "web-1__main-router-agent")}
+
+
+@pytest.mark.asyncio
+async def test_runtime_submit_user_message_requires_chat_run_registry() -> None:
+    runtime = _runtime(chat_run_registry=None)
+
+    with pytest.raises(RuntimeError, match="chat_run_registry"):
+        await runtime.submit_user_message(web_session_id="web-1", message="你好")
+
+    assert runtime.app.state.chat_service.runs == []
+
+
+@pytest.mark.asyncio
+async def test_runtime_submit_user_message_duplicate_active_run_raises() -> None:
+    chat_run_registry = FakeChatRunRegistry(reject_duplicate_active=True)
+    runtime = _runtime(chat_run_registry=chat_run_registry)
+
+    await runtime.submit_user_message(web_session_id="web-1", message="你好")
+    with pytest.raises(RuntimeError, match="already active"):
+        await runtime.submit_user_message(web_session_id="web-1", message="第二条")
+
+    assert len(runtime.storage.sessions) == 1
+    assert len(chat_run_registry.spawns) == 1
+    assert runtime.app.state.chat_service.runs == []
+    await chat_run_registry.drain()
 
 
 @pytest.mark.asyncio
