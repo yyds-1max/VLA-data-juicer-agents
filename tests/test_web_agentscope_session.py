@@ -438,7 +438,28 @@ async def test_forward_events_until_idle_persists_final_assistant_text(tmp_path:
 
 
 @pytest.mark.asyncio
-async def test_forward_events_until_idle_does_not_duplicate_same_final_text(tmp_path: Path) -> None:
+async def test_forward_events_until_idle_dedupes_same_final_text_within_one_forward(tmp_path: Path) -> None:
+    final_event = {
+        "type": "final",
+        "source": "NavigationDataAgent",
+        "payload": {"text": "处理完成"},
+    }
+    store = WebSessionStore(tmp_path / "sessions.sqlite")
+    runtime = EventingAgentScopeRuntime([final_event, final_event])
+    manager = AgentScopeWebSessionManager(store=store, runtime=runtime)
+    session = await manager.create_session("处理 20270605")
+
+    await manager.forward_events_until_idle(session.id)
+
+    detail = store.get_session(session.id)
+    assert detail is not None
+    assert [(message.role, message.content) for message in detail.messages] == [
+        ("assistant", "处理完成")
+    ]
+
+
+@pytest.mark.asyncio
+async def test_forward_events_until_idle_persists_same_final_text_across_forwards(tmp_path: Path) -> None:
     final_event = {
         "type": "final",
         "source": "NavigationDataAgent",
@@ -455,7 +476,8 @@ async def test_forward_events_until_idle_does_not_duplicate_same_final_text(tmp_
     detail = store.get_session(session.id)
     assert detail is not None
     assert [(message.role, message.content) for message in detail.messages] == [
-        ("assistant", "处理完成")
+        ("assistant", "处理完成"),
+        ("assistant", "处理完成"),
     ]
 
 
