@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import inspect
+import logging
 import time
 from contextlib import asynccontextmanager
 from concurrent.futures import ThreadPoolExecutor
@@ -12,7 +13,12 @@ import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
-from vla_data_juicer_agents.web.app import _consume_turn_result_when_idle, _drain_controller_events, create_app
+from vla_data_juicer_agents.web.app import (
+    _consume_turn_result_when_idle,
+    _create_logged_task,
+    _drain_controller_events,
+    create_app,
+)
 
 
 class FakeController:
@@ -440,6 +446,22 @@ def test_cleanup_waits_for_idle_without_timeout_parameter():
 
     assert result.text == "cleanup text"
     assert controller.consume_running_states == [False]
+
+
+def test_create_logged_task_logs_background_failure(caplog):
+    async def failing_task() -> None:
+        raise RuntimeError("background exploded")
+
+    async def exercise() -> None:
+        task = _create_logged_task(failing_task(), name="failing-test-task")
+        with pytest.raises(RuntimeError, match="background exploded"):
+            await task
+        await asyncio.sleep(0)
+
+    with caplog.at_level(logging.ERROR, logger="vla_data_juicer_agents.web.app"):
+        asyncio.run(exercise())
+
+    assert "Background task failed: failing-test-task" in caplog.text
 
 
 def test_interrupt_returns_true_for_active_session(tmp_path: Path):

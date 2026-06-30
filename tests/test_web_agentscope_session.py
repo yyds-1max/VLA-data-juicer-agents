@@ -367,6 +367,35 @@ async def test_runtime_submit_user_message_advances_event_cursor_before_spawn() 
 
 
 @pytest.mark.asyncio
+async def test_runtime_submit_user_message_does_not_advance_event_cursor_when_spawn_fails() -> None:
+    message_bus = FakeAgentScopeMessageBus(
+        replay_events=[
+            ("1-0", {"type": "TEXT_BLOCK_DELTA", "delta": "旧"}),
+            ("2-0", {"type": "REPLY_END"}),
+        ],
+    )
+    chat_run_registry = FakeChatRunRegistry(reject_duplicate_active=True)
+    runtime = _runtime(chat_run_registry=chat_run_registry, message_bus=message_bus)
+
+    await runtime.submit_user_message(web_session_id="web-1", message="你好")
+    message_bus.replay_events = [
+        ("1-0", {"type": "TEXT_BLOCK_DELTA", "delta": "旧"}),
+        ("2-0", {"type": "REPLY_END"}),
+        ("3-0", {"type": "TEXT_BLOCK_DELTA", "delta": "运行中"}),
+    ]
+    with pytest.raises(RuntimeError, match="already active"):
+        await runtime.submit_user_message(web_session_id="web-1", message="第二条")
+
+    assert message_bus.read_sessions == [
+        "web-1__main-router-agent",
+        "web-1__main-router-agent",
+    ]
+    assert message_bus.read_since == [None, "2-0"]
+    assert runtime.event_cursors == {"web-1__main-router-agent": "2-0"}
+    await chat_run_registry.drain()
+
+
+@pytest.mark.asyncio
 async def test_runtime_subscribe_web_session_events_replays_dedupes_and_finishes() -> None:
     text_event = {"type": "TEXT_BLOCK_DELTA", "delta": "处理"}
     final_event = {"type": "REPLY_END"}

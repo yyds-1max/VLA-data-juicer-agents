@@ -91,7 +91,7 @@ class AgentScopeRuntime:
             agent_id=agent_id,
             model=model,
         )
-        await self._advance_event_cursor_to_log_tail(session_id)
+        tail_cursor = await self._event_log_tail_cursor(session_id)
         run_coroutine = chat_service.run(
             user_id=self.config.user_id,
             session_id=session_id,
@@ -103,18 +103,21 @@ class AgentScopeRuntime:
         except Exception:
             run_coroutine.close()
             raise
+        if tail_cursor is not None:
+            self._remember_event_cursor(session_id, tail_cursor)
         return f"turn_{uuid4()}"
 
-    async def _advance_event_cursor_to_log_tail(self, agentscope_session_id: str) -> None:
+    async def _event_log_tail_cursor(self, agentscope_session_id: str) -> str | None:
         read_events = getattr(self.message_bus, "session_read_events", None)
         if read_events is None:
-            return
+            return None
         entries = await read_events(
             agentscope_session_id,
             since=self.event_cursors.get(agentscope_session_id),
         )
-        if entries:
-            self._remember_event_cursor(agentscope_session_id, entries[-1][0])
+        if not entries:
+            return None
+        return entries[-1][0]
 
     async def subscribe_web_session_events(self, *, web_session_id: str):
         mapped = self.web_sessions.get(web_session_id)
