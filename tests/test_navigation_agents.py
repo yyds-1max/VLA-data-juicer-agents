@@ -988,9 +988,8 @@ def test_run_plan_agent_streams_events_to_run_state(tmp_path):
     assert all("event_type" not in event for event in events)
 
 
-def test_run_plan_agent_auto_confirms_tool_calls(tmp_path):
+def test_run_plan_agent_rejects_user_confirmation_events(tmp_path):
     request = NavigationRequest(date="20270605", dry_run=True, scene_mode="out")
-    plan = _parameterized_go2w_plan_without_profile_facts()
     run_store = WorkflowRunStore(tmp_path / "runs")
     run_dir = run_store.create_run(request.date)
     scope = EventEmitter(JsonlEventSink(run_dir / "events.jsonl")).scope("navigation.plan")
@@ -1013,36 +1012,33 @@ def test_run_plan_agent_auto_confirms_tool_calls(tmp_path):
                     ],
                 )
                 return
-            yield SimpleNamespace(type="TEXT_BLOCK_DELTA", delta=plan.model_dump_json())
-            yield SimpleNamespace(type="REPLY_END", reply_id="reply_1")
+            raise AssertionError("run_plan_agent must not auto-confirm user confirmation events")
 
     agent = FakeConfirmingAgent()
 
-    parsed_plan = asyncio.run(
-        run_plan_agent(
-            agent,
-            request,
-            run_store=run_store,
-            run_dir=run_dir,
-            event_scope=scope,
+    with pytest.raises(RuntimeError, match="requires user confirmation"):
+        asyncio.run(
+            run_plan_agent(
+                agent,
+                request,
+                run_store=run_store,
+                run_dir=run_dir,
+                event_scope=scope,
+            )
         )
-    )
 
     events = [
         json.loads(line)
         for line in (run_dir / "events.jsonl").read_text(encoding="utf-8").splitlines()
     ]
-    assert parsed_plan == plan
-    assert len(agent.inputs) == 2
-    assert agent.inputs[1].confirm_results[0].confirmed is True
+    assert len(agent.inputs) == 1
     assert [(event["type"], event["payload"]) for event in events] == [
         ("agent_start", {}),
-        ("assistant_delta", {"delta": plan.model_dump_json()}),
-        ("agent_end", {"status": "completed"}),
+        ("agent_end", {"status": "failed"}),
     ]
 
 
-def test_agent_stream_allows_ten_tool_confirmation_rounds():
+def test_agent_stream_rejects_repeated_tool_confirmation_events():
     from vla_data_juicer_agents.navigation.workflow import _run_agent_stream
 
     class FakeTenToolAgent:
@@ -1063,15 +1059,14 @@ def test_agent_stream_allows_ten_tool_confirmation_rounds():
                     ],
                 )
                 return
-            yield SimpleNamespace(type="TEXT_BLOCK_DELTA", delta="finished")
-            yield SimpleNamespace(type="REPLY_END", reply_id="reply_final")
+            raise AssertionError("_run_agent_stream must not auto-confirm user confirmation events")
 
     agent = FakeTenToolAgent()
 
-    output = asyncio.run(_run_agent_stream(agent, "prompt"))
+    with pytest.raises(RuntimeError, match="requires user confirmation"):
+        asyncio.run(_run_agent_stream(agent, "prompt"))
 
-    assert output == "finished"
-    assert len(agent.inputs) == 11
+    assert len(agent.inputs) == 1
 
 
 def test_run_plan_agent_rejects_invalid_plan_variant(tmp_path):
