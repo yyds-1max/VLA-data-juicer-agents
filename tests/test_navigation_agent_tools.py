@@ -2,6 +2,7 @@ import asyncio
 from types import SimpleNamespace
 
 from agentscope.permission import PermissionBehavior, PermissionDecision
+from agentscope.message import ToolResultState
 
 from vla_data_juicer_agents.core.cancellation import CancellationContext
 from vla_data_juicer_agents.navigation import agent_tools as agent_tools_module
@@ -12,9 +13,27 @@ from vla_data_juicer_agents.navigation.agent_tools import (
 from vla_data_juicer_agents.runtime import agentscope_runtime as runtime_module
 from vla_data_juicer_agents.runtime.agentscope_config import AgentScopeRuntimeConfig
 from vla_data_juicer_agents.runtime.agentscope_runtime import (
+    NavigationHandoffTool,
     build_extra_agent_tools_factory,
     create_agentscope_runtime,
 )
+
+
+class FakeNavigationHandoffRuntime:
+    def __init__(self) -> None:
+        self.started: list[dict[str, str]] = []
+        self.records: list[dict] = []
+
+    async def start_navigation_agent_task(self, *, web_session_id: str, message: str) -> str:
+        self.started.append({"web_session_id": web_session_id, "message": message})
+        return "navigation-session"
+
+    def record_navigation_handoff(self, payload: dict) -> None:
+        self.records.append(payload)
+
+
+def _text(chunk) -> str:
+    return chunk.content[0].text
 
 
 def test_human_decision_tool_declares_external_read_only_schema():
@@ -161,6 +180,134 @@ def test_extra_agent_tools_factory_registers_router_handoff_when_runtime_availab
     router_tools = asyncio.run(factory("alice", config.main_router_agent_id, "web-1__main-router-agent"))
 
     assert {tool.name for tool in router_tools} == {"start_navigation_data_task"}
+
+
+def test_navigation_handoff_tool_declares_structured_schema():
+    tool = NavigationHandoffTool(
+        runtime=FakeNavigationHandoffRuntime(),
+        web_session_id="web-1",
+    )
+
+    assert set(tool.input_schema["properties"]) == {
+        "request",
+        "target",
+        "scene_mode",
+        "clips",
+        "reason",
+        "missing_fields",
+        "confidence",
+    }
+    assert tool.input_schema["required"] == [
+        "request",
+        "target",
+        "scene_mode",
+        "reason",
+        "missing_fields",
+        "confidence",
+    ]
+    assert tool.input_schema["properties"]["scene_mode"]["enum"] == ["indoor", "outdoor"]
+    assert tool.input_schema["properties"]["confidence"]["enum"] == ["low", "medium", "high"]
+
+
+def test_navigation_handoff_tool_rejects_missing_fields_without_starting_navigation():
+    runtime = FakeNavigationHandoffRuntime()
+    tool = NavigationHandoffTool(runtime=runtime, web_session_id="web-1")
+
+    result = asyncio.run(
+        tool(
+            request="处理导航数据",
+            target="20270605",
+            scene_mode="",
+            reason="用户想处理导航数据",
+            missing_fields=["scene_mode"],
+            confidence="high",
+        )
+    )
+
+    assert result.state is ToolResultState.ERROR
+    assert "missing_fields" in _text(result)
+    assert runtime.started == []
+    assert runtime.records[-1]["started"] is False
+    assert runtime.records[-1]["missing_fields"] == ["scene_mode"]
+
+
+def test_navigation_handoff_tool_rejects_low_confidence_without_starting_navigation():
+    runtime = FakeNavigationHandoffRuntime()
+    tool = NavigationHandoffTool(runtime=runtime, web_session_id="web-1")
+
+    result = asyncio.run(
+        tool(
+            request="你能处理导航数据吗",
+            target="",
+            scene_mode="",
+            reason="用户只是询问能力",
+            missing_fields=[],
+            confidence="low",
+        )
+    )
+
+    assert result.state is ToolResultState.ERROR
+    assert "confidence" in _text(result)
+    assert runtime.started == []
+    assert runtime.records[-1]["started"] is False
+    assert runtime.records[-1]["confidence"] == "low"
+
+
+def test_navigation_handoff_tool_starts_navigation_with_structured_context():
+    runtime = FakeNavigationHandoffRuntime()
+    tool = NavigationHandoffTool(runtime=runtime, web_session_id="web-1")
+
+    result = asyncio.run(
+        tool(
+            request="处理 20270605 的室外导航数据",
+            target="20270605",
+            scene_mode="outdoor",
+            clips=[],
+            reason="用户给出了日期和室外场景并要求处理导航数据",
+            missing_fields=[],
+            confidence="high",
+        )
+    )
+
+    assert result.state is ToolResultState.SUCCESS
+    assert runtime.started[0]["web_session_id"] == "web-1"
+    message = runtime.started[0]["message"]
+    assert "request: 处理 20270605 的室外导航数据" in message
+    assert "target: 20270605" in message
+    assert "scene_mode: outdoor" in message
+    assert "clips: all" in message
+    assert "reason: 用户给出了日期和室外场景并要求处理导航数据" in message
+
+
+def test_navigation_handoff_tool_records_observability_payload():
+    runtime = FakeNavigationHandoffRuntime()
+    tool = NavigationHandoffTool(runtime=runtime, web_session_id="web-1")
+
+    asyncio.run(
+        tool(
+            request="处理 20270605 clip_001 的室内导航数据",
+            target="20270605",
+            scene_mode="indoor",
+            clips=["clip_001"],
+            reason="用户明确指定日期、clip 和室内场景",
+            missing_fields=[],
+            confidence="medium",
+        )
+    )
+
+    assert runtime.records == [
+        {
+            "web_session_id": "web-1",
+            "request": "处理 20270605 clip_001 的室内导航数据",
+            "target": "20270605",
+            "scene_mode": "indoor",
+            "clips": ["clip_001"],
+            "reason": "用户明确指定日期、clip 和室内场景",
+            "missing_fields": [],
+            "confidence": "medium",
+            "started": True,
+        }
+    ]
 
 
 def test_create_agentscope_runtime_wires_navigation_tools_factory(monkeypatch, tmp_path):

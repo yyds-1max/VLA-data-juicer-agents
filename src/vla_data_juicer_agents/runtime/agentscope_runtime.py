@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 from contextlib import suppress
 from dataclasses import dataclass, field
 from types import SimpleNamespace
@@ -26,6 +27,7 @@ from vla_data_juicer_agents.runtime.agentscope_config import AgentScopeRuntimeCo
 
 _EVENT_STARTUP_GRACE_SECS = 1.0
 _EVENT_IDLE_POLL_SECS = 0.03
+_logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -194,6 +196,9 @@ class AgentScopeRuntime:
     ) -> None:
         if self._run_cancellations.get(agentscope_session_id) is cancellation:
             self._run_cancellations.pop(agentscope_session_id, None)
+
+    def record_navigation_handoff(self, payload: dict[str, Any]) -> None:
+        _logger.info("Navigation handoff: %s", payload)
 
     async def submit_human_decision(self, *, web_session_id: str, decision: dict[str, Any]) -> bool:
         mapped = self._web_session_mapping(web_session_id)
@@ -738,6 +743,35 @@ def _web_session_id_from_agentscope_session(session_id: str, *, agent_id: str) -
     return session_id
 
 
+def _handoff_error(message: str, payload: dict[str, Any]) -> ToolChunk:
+    return ToolChunk(
+        content=[TextBlock(text=message)],
+        state=ToolResultState.ERROR,
+        metadata=payload,
+    )
+
+
+def _navigation_handoff_message(
+    *,
+    request: str,
+    target: str,
+    scene_mode: str,
+    clips: list[str],
+    reason: str,
+) -> str:
+    clip_text = ", ".join(clips) if clips else "all"
+    return "\n".join(
+        [
+            "Navigation data processing request:",
+            f"- request: {request}",
+            f"- target: {target}",
+            f"- scene_mode: {scene_mode}",
+            f"- clips: {clip_text}",
+            f"- reason: {reason}",
+        ]
+    )
+
+
 class NavigationHandoffTool(ToolBase):
     name = "start_navigation_data_task"
     description = (
@@ -753,8 +787,46 @@ class NavigationHandoffTool(ToolBase):
                 "type": "string",
                 "description": "The user's concrete navigation task request with relevant context.",
             },
+            "target": {
+                "type": "string",
+                "description": "The concrete date, path, or dataset target to process.",
+            },
+            "scene_mode": {
+                "type": "string",
+                "enum": ["indoor", "outdoor"],
+                "description": "Whether the navigation data is indoor or outdoor.",
+            },
+            "clips": {
+                "type": "array",
+                "items": {"type": "string"},
+                "description": "Specific clips to process. Use an empty array when the user did not specify clips.",
+            },
+            "reason": {
+                "type": "string",
+                "description": "Brief reason why this should be handed off to the navigation data agent.",
+            },
+            "missing_fields": {
+                "type": "array",
+                "items": {
+                    "type": "string",
+                    "enum": ["request", "target", "scene_mode", "clips", "other"],
+                },
+                "description": "Fields that are still missing. Must be empty before starting processing.",
+            },
+            "confidence": {
+                "type": "string",
+                "enum": ["low", "medium", "high"],
+                "description": "Confidence that this is a concrete navigation data processing task.",
+            },
         },
-        "required": ["request"],
+        "required": [
+            "request",
+            "target",
+            "scene_mode",
+            "reason",
+            "missing_fields",
+            "confidence",
+        ],
         "additionalProperties": False,
     }
     is_concurrency_safe = False
@@ -775,11 +847,61 @@ class NavigationHandoffTool(ToolBase):
             message="Navigation handoff is allowed.",
         )
 
-    async def __call__(self, request: str) -> ToolChunk:
+    async def __call__(
+        self,
+        request: str,
+        target: str,
+        scene_mode: str,
+        reason: str,
+        missing_fields: list[str],
+        confidence: str,
+        clips: list[str] | None = None,
+    ) -> ToolChunk:
+        normalized_clips = list(clips or [])
+        payload = {
+            "web_session_id": self._web_session_id,
+            "request": request,
+            "target": target,
+            "scene_mode": scene_mode,
+            "clips": normalized_clips,
+            "reason": reason,
+            "missing_fields": list(missing_fields),
+            "confidence": confidence,
+            "started": False,
+        }
+
+        if confidence == "low":
+            self._record_handoff(payload)
+            return _handoff_error("Navigation handoff rejected because confidence is low.", payload)
+        if missing_fields:
+            self._record_handoff(payload)
+            return _handoff_error(
+                "Navigation handoff rejected because missing_fields is not empty.",
+                payload,
+            )
+        if not target.strip():
+            self._record_handoff(payload)
+            return _handoff_error("Navigation handoff rejected because target is missing.", payload)
+        if scene_mode not in {"indoor", "outdoor"}:
+            self._record_handoff(payload)
+            return _handoff_error(
+                "Navigation handoff rejected because scene_mode must be indoor or outdoor.",
+                payload,
+            )
+
+        navigation_request = _navigation_handoff_message(
+            request=request,
+            target=target,
+            scene_mode=scene_mode,
+            clips=normalized_clips,
+            reason=reason,
+        )
         await self._runtime.start_navigation_agent_task(
             web_session_id=self._web_session_id,
-            message=request,
+            message=navigation_request,
         )
+        payload["started"] = True
+        self._record_handoff(payload)
         return ToolChunk(
             content=[
                 TextBlock(
@@ -787,7 +909,13 @@ class NavigationHandoffTool(ToolBase):
                 ),
             ],
             state=ToolResultState.SUCCESS,
+            metadata=payload,
         )
+
+    def _record_handoff(self, payload: dict[str, Any]) -> None:
+        record = getattr(self._runtime, "record_navigation_handoff", None)
+        if callable(record):
+            record(payload)
 
 
 def build_extra_agent_tools_factory(

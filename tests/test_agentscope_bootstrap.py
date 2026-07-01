@@ -57,6 +57,11 @@ def test_main_router_prompt_presents_datapilot_and_sets_task_readiness_rules():
     assert "If a specified clip does not exist" in prompt
     assert "start_navigation_data_task" in prompt
     assert "call start_navigation_data_task" in prompt
+    assert "target" in prompt
+    assert "scene_mode" in prompt
+    assert "missing_fields" in prompt
+    assert "confidence" in prompt
+    assert "Do not call start_navigation_data_task with non-empty missing_fields" in prompt
     assert "vla_run_workflow" in prompt
     assert "vla_continue_workflow" in prompt
     assert "user's language" in prompt
@@ -94,6 +99,10 @@ def test_navigation_agent_prompt_requires_plan_execute_react_and_human_decisions
         "Capability questions",
         "do not inspect data",
         "scene mode is missing",
+        "structured handoff",
+        "target",
+        "scene_mode",
+        "clips",
         "indoor or outdoor",
         "If no clip is specified",
         "If a specified clip does not exist",
