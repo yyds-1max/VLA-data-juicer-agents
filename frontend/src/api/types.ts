@@ -30,6 +30,24 @@ export interface AgentEvent {
   payload: Record<string, unknown>;
 }
 
+export type HumanDecisionAction = "confirm" | "stop" | "guide";
+
+export interface PendingHumanDecision {
+  replyId: string;
+  toolCallId: string;
+  requestId: string;
+  decisionType: string;
+  summary: string;
+}
+
+export interface HumanDecisionPayload {
+  action: HumanDecisionAction;
+  request_id: string;
+  tool_call_id: string;
+  reply_id: string;
+  text?: string;
+}
+
 export type NavigationDatasetStatus = "raw_only" | "extracted" | "synced" | "error";
 
 export interface NavigationTopicSummary {

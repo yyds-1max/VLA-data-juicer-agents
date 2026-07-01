@@ -52,6 +52,75 @@ function sessionDetail(overrides: Partial<SessionDetail> = {}): SessionDetail {
 }
 
 describe("eventReducer", () => {
+  it("captures a pending human decision and pauses active run text", () => {
+    const state = createEmptyRunState();
+
+    applyAgentEvent(state, event("agent_start", "main"));
+    applyAgentEvent(
+      state,
+      event("human_decision_required", "navigation.workflow", {
+        reply_id: "reply-1",
+        tool_call_id: "tool-call-1",
+        request_id: "request-1",
+        decision_type: "confirmation",
+        summary: "发现潜在风险，需要人工确认。",
+      }),
+    );
+
+    expect(state.pendingHumanDecision).toEqual({
+      replyId: "reply-1",
+      toolCallId: "tool-call-1",
+      requestId: "request-1",
+      decisionType: "confirmation",
+      summary: "发现潜在风险，需要人工确认。",
+    });
+    expect(state.running).toBe(false);
+    expect(state.activeText).toBe("");
+    expect(state.activeStartedAt).toBeNull();
+  });
+
+  it("defaults missing decision type to other", () => {
+    const state = createEmptyRunState();
+
+    applyAgentEvent(
+      state,
+      event("human_decision_required", "navigation.workflow", {
+        reply_id: "reply-2",
+        tool_call_id: "tool-call-2",
+        request_id: "request-2",
+        summary: "请确认下一步。",
+      }),
+    );
+
+    expect(state.pendingHumanDecision).toMatchObject({
+      decisionType: "other",
+    });
+  });
+
+  it("keeps pending human decision after assistant output arrives", () => {
+    const state = createEmptyRunState();
+
+    applyAgentEvent(
+      state,
+      event("human_decision_required", "navigation.workflow", {
+        reply_id: "reply-1",
+        tool_call_id: "tool-call-1",
+        request_id: "request-1",
+        summary: "请确认下一步。",
+      }),
+    );
+    applyAgentEvent(state, event("assistant_delta", "main", { delta: "收到。" }));
+    applyAgentEvent(state, event("final", "main", { text: "收到，请确认。" }, { run_id: "final-run" }));
+
+    expect(state.pendingHumanDecision).toEqual({
+      replyId: "reply-1",
+      toolCallId: "tool-call-1",
+      requestId: "request-1",
+      decisionType: "other",
+      summary: "请确认下一步。",
+    });
+  });
+
   it("localizes main agent_start active text", () => {
     const state = createEmptyRunState();
 
@@ -227,6 +296,23 @@ describe("eventReducer", () => {
 });
 
 describe("datapilotStore", () => {
+  it("clearPendingHumanDecision clears a pending human decision from the current run", () => {
+    const store = createDataPilotStore();
+
+    store.getState().applyEvent(
+      event("human_decision_required", "navigation.workflow", {
+        reply_id: "reply-1",
+        tool_call_id: "tool-call-1",
+        request_id: "request-1",
+        summary: "请确认下一步。",
+      }),
+    );
+
+    store.getState().clearPendingHumanDecision();
+
+    expect(store.getState().run.pendingHumanDecision).toBeNull();
+  });
+
   it("enterDraft records the active session and clears messages and run", () => {
     const store = createDataPilotStore();
 

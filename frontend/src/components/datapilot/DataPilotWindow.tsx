@@ -8,12 +8,14 @@ import {
   interruptTurn,
   listSessions,
   openSessionEvents,
+  submitHumanDecision,
   submitTurn,
 } from "../../api/client";
 import type { SessionRecord } from "../../api/types";
 import { datapilotStore } from "../../store/datapilotStore";
 import { Composer } from "./Composer";
 import { DraftNewSessionView } from "./DraftNewSessionView";
+import { HumanDecisionDialog } from "./HumanDecisionDialog";
 import { MessageList } from "./MessageList";
 import { SessionHeader } from "./SessionHeader";
 import { SessionHistoryPanel } from "./SessionHistoryPanel";
@@ -35,6 +37,7 @@ export function DataPilotWindow() {
   const messages = useStore(datapilotStore, (state) => state.messages);
   const run = useStore(datapilotStore, (state) => state.run);
   const running = useStore(datapilotStore, (state) => state.run.running);
+  const pendingHumanDecision = useStore(datapilotStore, (state) => state.run.pendingHumanDecision);
   const floatingOffset = useStore(datapilotStore, (state) => state.floatingOffset);
   const setFloatingOffset = useStore(datapilotStore, (state) => state.setFloatingOffset);
   const [historyOpen, setHistoryOpen] = useState(false);
@@ -199,6 +202,30 @@ export function DataPilotWindow() {
     await interruptTurn(currentSessionId);
   };
 
+  const handleHumanDecision = useCallback(
+    async (action: "confirm" | "stop" | "guide", text?: string) => {
+      if (!currentSessionId || !pendingHumanDecision) {
+        return;
+      }
+
+      try {
+        const accepted = await submitHumanDecision(currentSessionId, {
+          action,
+          request_id: pendingHumanDecision.requestId,
+          tool_call_id: pendingHumanDecision.toolCallId,
+          reply_id: pendingHumanDecision.replyId,
+          ...(text ? { text } : {}),
+        });
+        if (accepted) {
+          datapilotStore.getState().clearPendingHumanDecision();
+        }
+      } catch (error) {
+        console.error("Failed to submit human decision", error);
+      }
+    },
+    [currentSessionId, pendingHumanDecision],
+  );
+
   const handleDragStart = useCallback((event: PointerEvent<HTMLElement>) => {
     const target = event.target;
     if (target instanceof Element && target.closest("button")) {
@@ -326,14 +353,22 @@ export function DataPilotWindow() {
       ) : mode === "active_session" ? (
         <div className="flex min-h-0 flex-1 flex-col bg-console-panel">
           <MessageList messages={messages} run={run} />
-          <div className="border-t border-console-line p-3 sm:p-4">
-            <Composer
-              placeholder="继续描述任务…"
-              running={running}
-              onSubmit={handleActiveSubmit}
-              onInterrupt={handleInterrupt}
-            />
-          </div>
+          <HumanDecisionDialog
+            decision={pendingHumanDecision}
+            onConfirm={() => handleHumanDecision("confirm")}
+            onStop={() => handleHumanDecision("stop")}
+            onGuide={(text) => handleHumanDecision("guide", text)}
+          />
+          {pendingHumanDecision ? null : (
+            <div className="border-t border-console-line p-3 sm:p-4">
+              <Composer
+                placeholder="继续描述任务…"
+                running={running}
+                onSubmit={handleActiveSubmit}
+                onInterrupt={handleInterrupt}
+              />
+            </div>
+          )}
         </div>
       ) : (
         <MessageList messages={messages} run={run} />

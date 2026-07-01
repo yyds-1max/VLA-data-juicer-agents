@@ -1,4 +1,4 @@
-import type { AgentEvent } from "../api/types";
+import type { AgentEvent, PendingHumanDecision } from "../api/types";
 
 export type TimelineKind = "reasoning" | "tool" | "agent" | "assistant" | "system";
 
@@ -32,6 +32,7 @@ export interface RunState {
   activeAgents: Record<string, ActiveAgent>;
   activeTools: Record<string, ActiveTool>;
   finalRunIds: Record<string, true>;
+  pendingHumanDecision: PendingHumanDecision | null;
   activeText: string;
   activeStartedAt: number | null;
   running: boolean;
@@ -43,6 +44,7 @@ export function createEmptyRunState(): RunState {
     activeAgents: {},
     activeTools: {},
     finalRunIds: {},
+    pendingHumanDecision: null,
     activeText: "",
     activeStartedAt: null,
     running: false,
@@ -125,6 +127,20 @@ export function applyAgentEvent(state: RunState, event: AgentEvent): void {
       parentRunId,
     });
     refreshRunningText(state);
+    return;
+  }
+
+  if (type === "human_decision_required") {
+    state.pendingHumanDecision = {
+      replyId: normalizeText(payload.reply_id) || normalizeText(payload.replyId),
+      toolCallId: normalizeText(payload.tool_call_id) || normalizeText(payload.toolCallId),
+      requestId: normalizeText(payload.request_id) || normalizeText(payload.requestId),
+      decisionType: normalizeText(payload.decision_type) || normalizeText(payload.decisionType) || "other",
+      summary: normalizeText(payload.summary),
+    };
+    state.running = false;
+    state.activeText = "";
+    state.activeStartedAt = null;
     return;
   }
 

@@ -1,5 +1,6 @@
 import type {
   AgentEvent,
+  HumanDecisionPayload,
   NavigationDatasetSummary,
   NavigationDateSummary,
   NavigationSyncImageListing,
@@ -81,6 +82,17 @@ export async function interruptTurn(sessionId: string): Promise<boolean> {
     method: "POST",
   });
   return data.interrupted;
+}
+
+export async function submitHumanDecision(
+  sessionId: string,
+  payload: HumanDecisionPayload,
+): Promise<boolean> {
+  const data = await requestJson<{ accepted: boolean }>(`${sessionPath(sessionId)}/human-decisions`, {
+    method: "POST",
+    body: JSON.stringify(payload),
+  });
+  return data.accepted;
 }
 
 export function openSessionEvents(sessionId: string, onEvent: (event: AgentEvent) => void): WebSocket {

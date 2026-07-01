@@ -10,6 +10,7 @@ import {
   interruptTurn,
   listSessions,
   openSessionEvents,
+  submitHumanDecision,
   submitTurn,
 } from "../api/client";
 import { Composer } from "../components/datapilot/Composer";
@@ -28,6 +29,7 @@ vi.mock("../api/client", () => ({
   getSession: vi.fn(),
   submitTurn: vi.fn(),
   interruptTurn: vi.fn(),
+  submitHumanDecision: vi.fn(),
   openSessionEvents: vi.fn(),
 }));
 
@@ -40,6 +42,7 @@ const apiMocks = vi.mocked({
   getSession,
   submitTurn,
   interruptTurn,
+  submitHumanDecision,
   openSessionEvents,
 });
 
@@ -115,6 +118,7 @@ beforeEach(() => {
   });
   apiMocks.submitTurn.mockResolvedValue("turn-1");
   apiMocks.interruptTurn.mockResolvedValue(true);
+  apiMocks.submitHumanDecision.mockResolvedValue(true);
   apiMocks.openSessionEvents.mockReturnValue(activeSocket());
   apiMocks.getNavigationDatasetSummary.mockResolvedValue({
     totals: {

@@ -30,6 +30,7 @@ export interface DataPilotStoreState {
   restoreHistory: (session: SessionDetail | SessionRecord, messages?: ChatMessageRecord[]) => void;
   appendUserMessage: (message: ChatMessageRecord) => void;
   applyEvent: (event: AgentEvent) => void;
+  clearPendingHumanDecision: () => void;
 }
 
 export type DataPilotStore = ReturnType<typeof createDataPilotStore>;
@@ -120,6 +121,16 @@ export function createDataPilotStore() {
         }
         return { run };
       }),
+
+    clearPendingHumanDecision: () =>
+      set((state) => {
+        if (!state.run.pendingHumanDecision) {
+          return {};
+        }
+        const run = cloneRunState(state.run);
+        run.pendingHumanDecision = null;
+        return { run };
+      }),
   }));
 }
 
@@ -203,6 +214,7 @@ function cloneRunState(run: RunState): RunState {
       Object.entries(run.activeTools).map(([key, tool]) => [key, { ...tool }]),
     ),
     finalRunIds: { ...run.finalRunIds },
+    pendingHumanDecision: run.pendingHumanDecision ? { ...run.pendingHumanDecision } : null,
     activeText: run.activeText,
     activeStartedAt: run.activeStartedAt,
     running: run.running,
