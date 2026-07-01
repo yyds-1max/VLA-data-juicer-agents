@@ -793,8 +793,11 @@ class NavigationHandoffTool(ToolBase):
             },
             "scene_mode": {
                 "type": "string",
-                "enum": ["indoor", "outdoor"],
-                "description": "Whether the navigation data is indoor or outdoor.",
+                "enum": ["indoor", "outdoor", "unknown"],
+                "description": (
+                    "Whether the navigation data is indoor or outdoor. Use unknown only "
+                    "with missing_fields when scene mode is not available."
+                ),
             },
             "clips": {
                 "type": "array",
@@ -870,9 +873,12 @@ class NavigationHandoffTool(ToolBase):
             "started": False,
         }
 
-        if confidence == "low":
+        if confidence not in {"medium", "high"}:
             self._record_handoff(payload)
-            return _handoff_error("Navigation handoff rejected because confidence is low.", payload)
+            return _handoff_error(
+                "Navigation handoff rejected because confidence must be medium or high.",
+                payload,
+            )
         if missing_fields:
             self._record_handoff(payload)
             return _handoff_error(

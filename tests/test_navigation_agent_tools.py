@@ -205,7 +205,7 @@ def test_navigation_handoff_tool_declares_structured_schema():
         "missing_fields",
         "confidence",
     ]
-    assert tool.input_schema["properties"]["scene_mode"]["enum"] == ["indoor", "outdoor"]
+    assert tool.input_schema["properties"]["scene_mode"]["enum"] == ["indoor", "outdoor", "unknown"]
     assert tool.input_schema["properties"]["confidence"]["enum"] == ["low", "medium", "high"]
 
 
@@ -217,7 +217,7 @@ def test_navigation_handoff_tool_rejects_missing_fields_without_starting_navigat
         tool(
             request="处理导航数据",
             target="20270605",
-            scene_mode="",
+            scene_mode="unknown",
             reason="用户想处理导航数据",
             missing_fields=["scene_mode"],
             confidence="high",
@@ -251,6 +251,28 @@ def test_navigation_handoff_tool_rejects_low_confidence_without_starting_navigat
     assert runtime.started == []
     assert runtime.records[-1]["started"] is False
     assert runtime.records[-1]["confidence"] == "low"
+
+
+def test_navigation_handoff_tool_rejects_unsupported_confidence_without_starting_navigation():
+    runtime = FakeNavigationHandoffRuntime()
+    tool = NavigationHandoffTool(runtime=runtime, web_session_id="web-1")
+
+    result = asyncio.run(
+        tool(
+            request="处理 20270605 的室外导航数据",
+            target="20270605",
+            scene_mode="outdoor",
+            reason="用户看起来想处理导航数据",
+            missing_fields=[],
+            confidence="unknown",
+        )
+    )
+
+    assert result.state is ToolResultState.ERROR
+    assert "confidence" in _text(result)
+    assert runtime.started == []
+    assert runtime.records[-1]["started"] is False
+    assert runtime.records[-1]["confidence"] == "unknown"
 
 
 def test_navigation_handoff_tool_starts_navigation_with_structured_context():
