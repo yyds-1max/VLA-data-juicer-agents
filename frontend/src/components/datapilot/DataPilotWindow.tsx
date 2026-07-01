@@ -208,16 +208,18 @@ export function DataPilotWindow() {
         return;
       }
 
+      const decision = pendingHumanDecision;
+
       try {
         const accepted = await submitHumanDecision(currentSessionId, {
           action,
-          request_id: pendingHumanDecision.requestId,
-          tool_call_id: pendingHumanDecision.toolCallId,
-          reply_id: pendingHumanDecision.replyId,
+          request_id: decision.requestId,
+          tool_call_id: decision.toolCallId,
+          reply_id: decision.replyId,
           ...(text ? { text } : {}),
         });
         if (accepted) {
-          datapilotStore.getState().clearPendingHumanDecision();
+          datapilotStore.getState().clearPendingHumanDecision(decision);
         }
       } catch (error) {
         console.error("Failed to submit human decision", error);

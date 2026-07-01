@@ -51,6 +51,17 @@ function sessionDetail(overrides: Partial<SessionDetail> = {}): SessionDetail {
   };
 }
 
+function pendingDecision(overrides: Record<string, unknown> = {}) {
+  return {
+    replyId: "reply-1",
+    toolCallId: "tool-call-1",
+    requestId: "request-1",
+    decisionType: "other",
+    summary: "请确认下一步。",
+    ...overrides,
+  };
+}
+
 describe("eventReducer", () => {
   it("captures a pending human decision and pauses active run text", () => {
     const state = createEmptyRunState();
@@ -296,7 +307,7 @@ describe("eventReducer", () => {
 });
 
 describe("datapilotStore", () => {
-  it("clearPendingHumanDecision clears a pending human decision from the current run", () => {
+  it("clearPendingHumanDecision clears the matching pending human decision from the current run", () => {
     const store = createDataPilotStore();
 
     store.getState().applyEvent(
@@ -308,9 +319,32 @@ describe("datapilotStore", () => {
       }),
     );
 
-    store.getState().clearPendingHumanDecision();
+    store.getState().clearPendingHumanDecision(pendingDecision());
 
     expect(store.getState().run.pendingHumanDecision).toBeNull();
+  });
+
+  it("clearPendingHumanDecision keeps a newer pending human decision when identities differ", () => {
+    const store = createDataPilotStore();
+
+    store.getState().applyEvent(
+      event("human_decision_required", "navigation.workflow", {
+        reply_id: "reply-2",
+        tool_call_id: "tool-call-2",
+        request_id: "request-2",
+        summary: "需要确认第二步。",
+      }),
+    );
+
+    store.getState().clearPendingHumanDecision(pendingDecision());
+
+    expect(store.getState().run.pendingHumanDecision).toEqual({
+      replyId: "reply-2",
+      toolCallId: "tool-call-2",
+      requestId: "request-2",
+      decisionType: "other",
+      summary: "需要确认第二步。",
+    });
   });
 
   it("enterDraft records the active session and clears messages and run", () => {

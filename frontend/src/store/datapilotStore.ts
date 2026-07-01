@@ -1,6 +1,12 @@
 import { createStore } from "zustand/vanilla";
 
-import type { AgentEvent, ChatMessageRecord, SessionDetail, SessionRecord } from "../api/types";
+import type {
+  AgentEvent,
+  ChatMessageRecord,
+  PendingHumanDecision,
+  SessionDetail,
+  SessionRecord,
+} from "../api/types";
 import { applyAgentEvent, createEmptyRunState, type RunState } from "./eventReducer";
 
 export type SessionMode = "draft_new_session" | "active_session" | "history_session";
@@ -30,7 +36,7 @@ export interface DataPilotStoreState {
   restoreHistory: (session: SessionDetail | SessionRecord, messages?: ChatMessageRecord[]) => void;
   appendUserMessage: (message: ChatMessageRecord) => void;
   applyEvent: (event: AgentEvent) => void;
-  clearPendingHumanDecision: () => void;
+  clearPendingHumanDecision: (expectedDecision: PendingHumanDecision) => void;
 }
 
 export type DataPilotStore = ReturnType<typeof createDataPilotStore>;
@@ -122,9 +128,9 @@ export function createDataPilotStore() {
         return { run };
       }),
 
-    clearPendingHumanDecision: () =>
+    clearPendingHumanDecision: (expectedDecision) =>
       set((state) => {
-        if (!state.run.pendingHumanDecision) {
+        if (!samePendingHumanDecision(state.run.pendingHumanDecision, expectedDecision)) {
           return {};
         }
         const run = cloneRunState(state.run);
@@ -219,4 +225,19 @@ function cloneRunState(run: RunState): RunState {
     activeStartedAt: run.activeStartedAt,
     running: run.running,
   };
+}
+
+function samePendingHumanDecision(
+  left: PendingHumanDecision | null,
+  right: PendingHumanDecision | null,
+): boolean {
+  if (!left || !right) {
+    return false;
+  }
+
+  return (
+    left.replyId === right.replyId &&
+    left.toolCallId === right.toolCallId &&
+    left.requestId === right.requestId
+  );
 }

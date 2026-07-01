@@ -1,5 +1,5 @@
 import "@testing-library/jest-dom/vitest";
-import { fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { act, fireEvent, render, screen, waitFor } from "@testing-library/react";
 
 import {
   createSession,
@@ -13,6 +13,7 @@ import {
   submitHumanDecision,
   submitTurn,
 } from "../api/client";
+import type { PendingHumanDecision } from "../api/types";
 import { Composer } from "../components/datapilot/Composer";
 import { formatActiveText, MessageList } from "../components/datapilot/MessageList";
 import { resetNavigationDatasetSummaryCache } from "../features/console/navigationDatasetSummaryCache";
@@ -63,6 +64,48 @@ function deferred<T>() {
     reject = promiseReject;
   });
   return { promise, resolve, reject };
+}
+
+function pendingDecision(overrides: Partial<PendingHumanDecision> = {}): PendingHumanDecision {
+  return {
+    replyId: "reply-1",
+    toolCallId: "tool-call-1",
+    requestId: "request-1",
+    decisionType: "confirmation",
+    summary: "发现潜在风险，需要确认。",
+    ...overrides,
+  };
+}
+
+function setOpenActiveSessionWithPendingDecision(decision: PendingHumanDecision) {
+  datapilotStore.setState({
+    open: true,
+    mode: "active_session",
+    currentSessionId: "session-1",
+    previousActiveSessionId: null,
+    sessions: [
+      {
+        id: "session-1",
+        title: "Existing session",
+        created_at: "2026-06-26T00:00:00Z",
+        updated_at: "2026-06-26T00:00:00Z",
+        status: "active",
+      },
+    ],
+    messages: [
+      {
+        id: "message-1",
+        session_id: "session-1",
+        role: "assistant",
+        content: "准备继续。",
+        created_at: "2026-06-26T00:01:00Z",
+      },
+    ],
+    run: {
+      ...createEmptyRunState(),
+      pendingHumanDecision: decision,
+    },
+  });
 }
 
 function mockScrollableElement(element: HTMLElement) {
@@ -890,6 +933,128 @@ test("active session renders messages and does not render draft start content", 
   expect(screen.getByText("清洗已有数据")).toBeVisible();
   expect(screen.getByPlaceholderText("继续描述任务…")).toBeVisible();
   expect(screen.queryByText("开始一个任务")).not.toBeInTheDocument();
+});
+
+test("pending human decision shows dialog, hides Composer, submits confirm payload, and clears only after success", async () => {
+  const submitDecision = deferred<boolean>();
+  apiMocks.submitHumanDecision.mockReturnValue(submitDecision.promise);
+  setOpenActiveSessionWithPendingDecision(pendingDecision());
+
+  await renderAppWithDashboardSettled();
+
+  expect(screen.getByRole("dialog", { name: "需要确认" })).toBeVisible();
+  expect(screen.getByText("发现潜在风险，需要确认。")).toBeVisible();
+  expect(screen.queryByPlaceholderText("继续描述任务…")).not.toBeInTheDocument();
+
+  fireEvent.click(screen.getByRole("button", { name: "确认" }));
+
+  expect(apiMocks.submitHumanDecision).toHaveBeenCalledWith("session-1", {
+    action: "confirm",
+    request_id: "request-1",
+    tool_call_id: "tool-call-1",
+    reply_id: "reply-1",
+  });
+  expect(datapilotStore.getState().run.pendingHumanDecision).toEqual(pendingDecision());
+
+  submitDecision.resolve(true);
+
+  await waitFor(() => expect(datapilotStore.getState().run.pendingHumanDecision).toBeNull());
+  expect(screen.queryByRole("dialog", { name: "需要确认" })).not.toBeInTheDocument();
+  expect(screen.getByPlaceholderText("继续描述任务…")).toBeVisible();
+});
+
+test("guide submission includes text in the human decision payload", async () => {
+  setOpenActiveSessionWithPendingDecision(pendingDecision());
+
+  await renderAppWithDashboardSettled();
+
+  fireEvent.change(screen.getByLabelText("引导文本"), {
+    target: { value: "  先汇总风险再继续  " },
+  });
+  fireEvent.click(screen.getByRole("button", { name: "发送" }));
+
+  await waitFor(() =>
+    expect(apiMocks.submitHumanDecision).toHaveBeenCalledWith("session-1", {
+      action: "guide",
+      request_id: "request-1",
+      tool_call_id: "tool-call-1",
+      reply_id: "reply-1",
+      text: "先汇总风险再继续",
+    }),
+  );
+});
+
+test("pending human decision remains when submitHumanDecision is rejected or not accepted", async () => {
+  apiMocks.submitHumanDecision.mockResolvedValueOnce(false).mockRejectedValueOnce(new Error("network failed"));
+  const consoleError = vi.spyOn(console, "error").mockImplementation(() => undefined);
+  setOpenActiveSessionWithPendingDecision(pendingDecision());
+
+  await renderAppWithDashboardSettled();
+
+  fireEvent.click(screen.getByRole("button", { name: "确认" }));
+
+  await waitFor(() => expect(apiMocks.submitHumanDecision).toHaveBeenCalledTimes(1));
+  expect(datapilotStore.getState().run.pendingHumanDecision).toEqual(pendingDecision());
+  expect(screen.getByRole("dialog", { name: "需要确认" })).toBeVisible();
+
+  fireEvent.click(screen.getByRole("button", { name: "停止" }));
+
+  await waitFor(() => expect(apiMocks.submitHumanDecision).toHaveBeenCalledTimes(2));
+  expect(datapilotStore.getState().run.pendingHumanDecision).toEqual(pendingDecision());
+  expect(consoleError).toHaveBeenCalledWith("Failed to submit human decision", expect.any(Error));
+  consoleError.mockRestore();
+});
+
+test("resolving an older human decision submission does not clear a newer pending decision", async () => {
+  const submitDecision = deferred<boolean>();
+  apiMocks.submitHumanDecision.mockReturnValue(submitDecision.promise);
+  setOpenActiveSessionWithPendingDecision(pendingDecision());
+
+  await renderAppWithDashboardSettled();
+
+  fireEvent.click(screen.getByRole("button", { name: "确认" }));
+
+  await act(async () => {
+    datapilotStore.getState().applyEvent({
+      type: "human_decision_required",
+      source: "navigation.workflow",
+      run_id: "run-2",
+      parent_run_id: null,
+      timestamp: "2026-06-26T00:02:00.000Z",
+      payload: {
+        reply_id: "reply-2",
+        tool_call_id: "tool-call-2",
+        request_id: "request-2",
+        summary: "第二个确认请求。",
+      },
+    });
+  });
+
+  await waitFor(() => expect(screen.getByText("第二个确认请求。")).toBeVisible());
+  expect(datapilotStore.getState().run.pendingHumanDecision).toEqual({
+    replyId: "reply-2",
+    toolCallId: "tool-call-2",
+    requestId: "request-2",
+    decisionType: "other",
+    summary: "第二个确认请求。",
+  });
+
+  await act(async () => {
+    submitDecision.resolve(true);
+    await submitDecision.promise;
+  });
+
+  await waitFor(() =>
+    expect(datapilotStore.getState().run.pendingHumanDecision).toEqual({
+      replyId: "reply-2",
+      toolCallId: "tool-call-2",
+      requestId: "request-2",
+      decisionType: "other",
+      summary: "第二个确认请求。",
+    }),
+  );
+  expect(screen.getByRole("dialog", { name: "需要确认" })).toBeVisible();
+  expect(screen.queryByPlaceholderText("继续描述任务…")).not.toBeInTheDocument();
 });
 
 test("History button lists sessions in a lightweight panel", async () => {
