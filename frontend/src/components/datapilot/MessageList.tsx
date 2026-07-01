@@ -43,8 +43,9 @@ type ChronologicalEntry = MessageEntry | TimelineEntry;
 type RenderEntry = ChronologicalEntry | AgentRunSummaryEntry;
 
 export function MessageList({ messages, run }: MessageListProps) {
-  const hasContent = messages.length > 0 || run.timeline.length > 0 || Boolean(run.activeText);
-  const entries = renderEntries(messages, run);
+  const visibleMessages = filterMessagesCoveredByTimeline(messages, run);
+  const hasContent = visibleMessages.length > 0 || run.timeline.length > 0 || Boolean(run.activeText);
+  const entries = renderEntries(visibleMessages, run);
   const now = useActiveNow(run.activeText ? run.activeStartedAt : null);
   const activeText = formatActiveText(run.activeText, run.activeStartedAt, now);
   const scrollAreaRef = useRef<HTMLDivElement | null>(null);
@@ -80,12 +81,14 @@ export function MessageList({ messages, run }: MessageListProps) {
               <MessageBubble key={entry.key} message={entry.message} />
             ) : entry.type === "agent-run-summary" ? (
               <AgentRunSummary key={entry.key} source={entry.source} items={entry.items} />
+            ) : entry.item.kind === "tool" ? (
+              <ToolLine key={entry.key} item={entry.item} />
             ) : (
               <TimelineBubble key={entry.key} item={entry.item} />
             ),
           )}
           {activeText ? (
-            <div className="rounded-lg border border-console-cyan/20 bg-blue-50 px-3 py-2 text-xs text-console-cyan">
+            <div className="mr-auto flex max-w-[92%] items-center gap-2 px-2 py-1 text-xs text-console-muted">
               {activeText}
             </div>
           ) : null}
@@ -97,6 +100,31 @@ export function MessageList({ messages, run }: MessageListProps) {
       )}
     </div>
   );
+}
+
+function filterMessagesCoveredByTimeline(messages: ChatMessageRecord[], run: RunState): ChatMessageRecord[] {
+  const assistantTextCounts = new Map<string, number>();
+  for (const item of run.timeline) {
+    if (item.kind !== "assistant") {
+      continue;
+    }
+    assistantTextCounts.set(item.text, (assistantTextCounts.get(item.text) ?? 0) + 1);
+  }
+  if (assistantTextCounts.size === 0) {
+    return messages;
+  }
+
+  return messages.filter((message) => {
+    if (message.role !== "assistant") {
+      return true;
+    }
+    const count = assistantTextCounts.get(message.content) ?? 0;
+    if (count <= 0) {
+      return true;
+    }
+    assistantTextCounts.set(message.content, count - 1);
+    return false;
+  });
 }
 
 function isScrolledNearBottom(element: HTMLElement) {
@@ -139,6 +167,9 @@ function renderEntries(messages: ChatMessageRecord[], run: RunState): RenderEntr
     if (entry.type !== "timeline" || !isChildTimelineItem(entry.item)) {
       return [entry];
     }
+    if (entry.item.kind === "tool") {
+      return [entry];
+    }
 
     const groupKey = childRunKey(entry.item);
     const group = childGroups.get(groupKey);
@@ -167,7 +198,12 @@ function completedChildGroups(entries: ChronologicalEntry[], run: RunState): Map
   const groups = new Map<string, TimelineEntry[]>();
 
   for (const entry of entries) {
-    if (entry.type !== "timeline" || !isChildTimelineItem(entry.item) || isChildRunActive(entry.item, run)) {
+    if (
+      entry.type !== "timeline" ||
+      !isChildTimelineItem(entry.item) ||
+      entry.item.kind === "tool" ||
+      isChildRunActive(entry.item, run)
+    ) {
       continue;
     }
 
@@ -270,6 +306,15 @@ function TimelineBubble({ item }: { item: TimelineItem }) {
         <p className="whitespace-pre-wrap break-words">{item.text}</p>
       )}
     </article>
+  );
+}
+
+function ToolLine({ item }: { item: TimelineItem }) {
+  return (
+    <div className="mr-auto flex max-w-[92%] items-center gap-2 px-2 py-1 text-xs text-console-muted">
+      <ToolStatusDot status={item.status} />
+      <span className="min-w-0 break-words">{item.text}</span>
+    </div>
   );
 }
 

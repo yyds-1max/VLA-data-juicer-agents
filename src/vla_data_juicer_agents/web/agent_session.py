@@ -84,6 +84,7 @@ class AgentScopeWebSessionManager:
 
             persisted_final_texts: set[str] = set()
             async for event in subscribe_events(web_session_id=session_id):
+                self._store.append_timeline_event(session_id, event)
                 if self._event_callback is not None:
                     callback_result = self._event_callback(session_id, event)
                     if inspect.isawaitable(callback_result):

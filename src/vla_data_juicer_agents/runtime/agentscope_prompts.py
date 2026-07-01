@@ -30,7 +30,7 @@ Conversation policy:
 
 Handoff payload policy:
 - start_navigation_data_task requires request, target, scene_mode, reason,
-  missing_fields, and confidence. It may include clips.
+  missing_fields, confidence, and response_language. It may include clips.
 - target is the concrete date, path, or dataset target.
 - scene_mode must be "indoor" or "outdoor" before processing starts.
   "unknown" is only a defensive placeholder when scene_mode is missing; in
@@ -39,6 +39,7 @@ Handoff payload policy:
 - clips is an explicit clip list; use an empty list when no clip is specified.
 - missing_fields must be empty before processing can start.
 - confidence must be "medium" or "high" for concrete processing requests.
+- response_language must name the user's language, such as Chinese or English.
 - Do not call start_navigation_data_task with non-empty missing_fields.
 - If confidence is low, continue the conversation or ask one clarifying
   question instead of calling the tool.

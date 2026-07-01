@@ -17,8 +17,16 @@ export interface ChatMessageRecord {
   created_at: string;
 }
 
+export interface TimelineEventRecord extends AgentEvent {
+  id: string;
+  session_id: string;
+  seq: number;
+  created_at: string;
+}
+
 export interface SessionDetail extends SessionRecord {
   messages: ChatMessageRecord[];
+  events?: TimelineEventRecord[];
 }
 
 export interface AgentEvent {

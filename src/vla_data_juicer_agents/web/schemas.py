@@ -31,8 +31,22 @@ class ChatMessageRecord(BaseModel):
     created_at: str
 
 
+class TimelineEventRecord(BaseModel):
+    id: str
+    session_id: str
+    seq: int
+    type: str
+    source: str | None = None
+    run_id: str | None = None
+    parent_run_id: str | None = None
+    timestamp: str | None = None
+    payload: dict[str, Any] = Field(default_factory=dict)
+    created_at: str
+
+
 class SessionDetail(SessionRecord):
     messages: list[ChatMessageRecord] = Field(default_factory=list)
+    events: list[TimelineEventRecord] = Field(default_factory=list)
 
 
 class CreateSessionResponse(BaseModel):

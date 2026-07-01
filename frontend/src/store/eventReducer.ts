@@ -36,6 +36,8 @@ export interface RunState {
   activeText: string;
   activeStartedAt: number | null;
   running: boolean;
+  interrupting: boolean;
+  appliedEventKeys: Record<string, true>;
 }
 
 export function createEmptyRunState(): RunState {
@@ -48,6 +50,8 @@ export function createEmptyRunState(): RunState {
     activeText: "",
     activeStartedAt: null,
     running: false,
+    interrupting: false,
+    appliedEventKeys: {},
   };
 }
 
@@ -105,7 +109,7 @@ export function applyAgentEvent(state: RunState, event: AgentEvent): void {
       startedAt: timestampMs(event.timestamp),
     };
     state.running = true;
-    state.activeText = `[${label}] 正在运行 ${tool}`;
+    state.activeText = `正在调用工具 ${tool}`;
     state.activeStartedAt = state.activeTools[toolKey(runId, callId)].startedAt;
     return;
   }
@@ -124,7 +128,7 @@ export function applyAgentEvent(state: RunState, event: AgentEvent): void {
     state.timeline.push({
       kind: "tool",
       source,
-      text: `${status} ${tool} ${elapsed.toFixed(1)}s`,
+      text: toolCompletionText(status, tool, elapsed),
       status,
       runId,
       parentRunId,
@@ -142,6 +146,7 @@ export function applyAgentEvent(state: RunState, event: AgentEvent): void {
       summary: normalizeText(payload.summary),
     };
     state.running = false;
+    state.interrupting = false;
     state.activeText = "";
     state.activeStartedAt = null;
     return;
@@ -169,6 +174,7 @@ export function applyAgentEvent(state: RunState, event: AgentEvent): void {
       });
     }
     state.running = true;
+    state.interrupting = false;
     state.activeText = "";
     state.activeStartedAt = null;
     return;
@@ -203,11 +209,14 @@ export function applyAgentEvent(state: RunState, event: AgentEvent): void {
         });
       }
     }
-    state.activeAgents = {};
-    state.activeTools = {};
-    state.running = false;
-    state.activeText = "";
-    state.activeStartedAt = null;
+    clearMatchingActiveRun(state, runId, source);
+    refreshRunningText(state);
+    return;
+  }
+
+  if (type === "interrupt_requested") {
+    state.interrupting = true;
+    state.running = true;
     return;
   }
 
@@ -243,7 +252,7 @@ function refreshRunningText(state: RunState): void {
   const activeTool = Object.values(state.activeTools)[0];
   if (activeTool) {
     state.running = true;
-    state.activeText = `[${sourceLabel(activeTool.source)}] 正在运行 ${activeTool.tool}`;
+    state.activeText = `正在调用工具 ${activeTool.tool}`;
     state.activeStartedAt = activeTool.startedAt;
     return;
   }
@@ -257,8 +266,29 @@ function refreshRunningText(state: RunState): void {
   }
 
   state.running = false;
+  state.interrupting = false;
   state.activeText = "";
   state.activeStartedAt = null;
+}
+
+function clearMatchingActiveRun(state: RunState, runId: string, source: string): void {
+  if (!runId) {
+    state.activeAgents = {};
+    state.activeTools = {};
+    return;
+  }
+
+  for (const [key, agent] of Object.entries(state.activeAgents)) {
+    if (agent.runId === runId || (!agent.runId && agent.source === source)) {
+      delete state.activeAgents[key];
+    }
+  }
+
+  for (const [key, tool] of Object.entries(state.activeTools)) {
+    if (tool.runId === runId || (!tool.runId && tool.source === source)) {
+      delete state.activeTools[key];
+    }
+  }
 }
 
 function deepestActiveAgent(activeAgents: Record<string, ActiveAgent>): ActiveAgent | undefined {
@@ -332,6 +362,17 @@ function toolStatus(payload: Record<string, unknown>): string {
     return status;
   }
   return payload.ok === false ? "failed" : "completed";
+}
+
+function toolCompletionText(status: string, tool: string, elapsed: number): string {
+  const elapsedText = `${elapsed.toFixed(1)}s`;
+  if (status === "completed") {
+    return `已调用工具 ${tool} ${elapsedText}`;
+  }
+  if (status === "interrupted") {
+    return `工具 ${tool} 已中断 ${elapsedText}`;
+  }
+  return `工具 ${tool} 调用失败 ${elapsedText}`;
 }
 
 function elapsedSeconds(startedAt: number | undefined, endedAt: string | null | undefined): number {

@@ -37,6 +37,7 @@ export function DataPilotWindow() {
   const messages = useStore(datapilotStore, (state) => state.messages);
   const run = useStore(datapilotStore, (state) => state.run);
   const running = useStore(datapilotStore, (state) => state.run.running);
+  const interrupting = useStore(datapilotStore, (state) => state.run.interrupting);
   const pendingHumanDecision = useStore(datapilotStore, (state) => state.run.pendingHumanDecision);
   const floatingOffset = useStore(datapilotStore, (state) => state.floatingOffset);
   const setFloatingOffset = useStore(datapilotStore, (state) => state.setFloatingOffset);
@@ -48,13 +49,33 @@ export function DataPilotWindow() {
     height: typeof window === "undefined" ? 900 : window.innerHeight,
   }));
   const socketRef = useRef<{ sessionId: string; socket: WebSocket } | null>(null);
+  const reconnectTimerRef = useRef<number | null>(null);
   const dragRef = useRef<DragState | null>(null);
   const windowOffset = useMemo(() => visibleWindowOffset(floatingOffset, viewport), [floatingOffset, viewport]);
 
-  const closeSocket = useCallback(() => {
-    socketRef.current?.socket.close();
-    socketRef.current = null;
+  const clearReconnectTimer = useCallback(() => {
+    if (reconnectTimerRef.current === null) {
+      return;
+    }
+    window.clearTimeout(reconnectTimerRef.current);
+    reconnectTimerRef.current = null;
   }, []);
+
+  const refreshSessionSnapshot = useCallback(async (sessionId: string) => {
+    try {
+      const detail = await getSession(sessionId);
+      datapilotStore.getState().refreshActiveSession(detail);
+    } catch (error) {
+      console.error("Failed to refresh DataPilot active session", error);
+    }
+  }, []);
+
+  const closeSocket = useCallback(() => {
+    clearReconnectTimer();
+    const socket = socketRef.current?.socket;
+    socketRef.current = null;
+    socket?.close();
+  }, [clearReconnectTimer]);
 
   useEffect(() => {
     if (!open || mode !== "active_session") {
@@ -71,12 +92,31 @@ export function DataPilotWindow() {
       }
 
       closeSocket();
+      clearReconnectTimer();
+      const socket = openSessionEvents(sessionId, (event) => datapilotStore.getState().applyEvent(event));
       socketRef.current = {
         sessionId,
-        socket: openSessionEvents(sessionId, (event) => datapilotStore.getState().applyEvent(event)),
+        socket,
       };
+
+      const handleDisconnect = () => {
+        if (socketRef.current?.socket !== socket) {
+          return;
+        }
+        socketRef.current = null;
+        void refreshSessionSnapshot(sessionId);
+        reconnectTimerRef.current = window.setTimeout(() => {
+          reconnectTimerRef.current = null;
+          const state = datapilotStore.getState();
+          if (state.open && state.mode === "active_session" && state.currentSessionId === sessionId) {
+            openEvents(sessionId);
+          }
+        }, 100);
+      };
+      socket.addEventListener("close", handleDisconnect);
+      socket.addEventListener("error", handleDisconnect);
     },
-    [closeSocket],
+    [clearReconnectTimer, closeSocket, refreshSessionSnapshot],
   );
 
   useEffect(() => {
@@ -199,7 +239,17 @@ export function DataPilotWindow() {
       return;
     }
 
-    await interruptTurn(currentSessionId);
+    const interrupted = await interruptTurn(currentSessionId);
+    if (interrupted) {
+      datapilotStore.getState().applyEvent({
+        type: "interrupt_requested",
+        source: "main",
+        run_id: currentSessionId,
+        parent_run_id: null,
+        timestamp: new Date().toISOString(),
+        payload: {},
+      });
+    }
   };
 
   const handleHumanDecision = useCallback(
@@ -367,6 +417,7 @@ export function DataPilotWindow() {
               <Composer
                 placeholder="继续描述任务…"
                 running={running}
+                interrupting={interrupting}
                 onSubmit={handleActiveSubmit}
                 onInterrupt={handleInterrupt}
               />

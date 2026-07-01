@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import sqlite3
+import json
 from datetime import UTC, datetime
 from dataclasses import dataclass
 from pathlib import Path
@@ -11,6 +12,7 @@ from vla_data_juicer_agents.web.schemas import (
     MessageRole,
     SessionDetail,
     SessionRecord,
+    TimelineEventRecord,
 )
 
 
@@ -61,6 +63,29 @@ class WebSessionStore:
                     created_at TEXT NOT NULL,
                     FOREIGN KEY (session_id) REFERENCES sessions(id)
                 )
+                """
+            )
+            connection.execute(
+                """
+                CREATE TABLE IF NOT EXISTS timeline_events (
+                    id TEXT PRIMARY KEY,
+                    session_id TEXT NOT NULL,
+                    seq INTEGER NOT NULL,
+                    type TEXT NOT NULL,
+                    source TEXT,
+                    run_id TEXT,
+                    parent_run_id TEXT,
+                    timestamp TEXT,
+                    payload_json TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    FOREIGN KEY (session_id) REFERENCES sessions(id)
+                )
+                """
+            )
+            connection.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_timeline_events_session_seq
+                ON timeline_events (session_id, seq)
                 """
             )
             connection.execute(
@@ -177,11 +202,22 @@ class WebSessionStore:
                 """,
                 (session_id,),
             ).fetchall()
+            event_rows = connection.execute(
+                """
+                SELECT id, session_id, seq, type, source, run_id, parent_run_id,
+                       timestamp, payload_json, created_at
+                FROM timeline_events
+                WHERE session_id = ?
+                ORDER BY seq ASC, rowid ASC
+                """,
+                (session_id,),
+            ).fetchall()
 
         session = self._session_from_row(session_row)
         return SessionDetail(
             **session.model_dump(),
             messages=[self._message_from_row(row) for row in message_rows],
+            events=[self._timeline_event_from_row(row) for row in event_rows],
         )
 
     def append_message(self, session_id: str, *, role: MessageRole, content: str) -> ChatMessageRecord:
@@ -221,6 +257,83 @@ class WebSessionStore:
             )
         return record
 
+    def append_timeline_event(self, session_id: str, event: dict) -> TimelineEventRecord:
+        timestamp = _now()
+        payload = event.get("payload")
+        safe_payload = payload if isinstance(payload, dict) else {}
+        record_id = f"event_{uuid4().hex}"
+        with self._connect() as connection:
+            exists = connection.execute(
+                """
+                SELECT 1
+                FROM sessions
+                WHERE id = ?
+                """,
+                (session_id,),
+            ).fetchone()
+            if exists is None:
+                raise KeyError(session_id)
+            seq = int(
+                connection.execute(
+                    """
+                    SELECT COALESCE(MAX(seq), 0) + 1
+                    FROM timeline_events
+                    WHERE session_id = ?
+                    """,
+                    (session_id,),
+                ).fetchone()[0]
+            )
+            connection.execute(
+                """
+                INSERT INTO timeline_events (
+                    id,
+                    session_id,
+                    seq,
+                    type,
+                    source,
+                    run_id,
+                    parent_run_id,
+                    timestamp,
+                    payload_json,
+                    created_at
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    record_id,
+                    session_id,
+                    seq,
+                    str(event.get("type", "")),
+                    _optional_text(event.get("source")),
+                    _optional_text(event.get("run_id")),
+                    _optional_text(event.get("parent_run_id")),
+                    _optional_text(event.get("timestamp")),
+                    json.dumps(safe_payload, ensure_ascii=False),
+                    timestamp,
+                ),
+            )
+            connection.execute(
+                """
+                UPDATE sessions
+                SET updated_at = ?
+                WHERE id = ?
+                """,
+                (timestamp, session_id),
+            )
+
+        return TimelineEventRecord(
+            id=record_id,
+            session_id=session_id,
+            seq=seq,
+            type=str(event.get("type", "")),
+            source=_optional_text(event.get("source")),
+            run_id=_optional_text(event.get("run_id")),
+            parent_run_id=_optional_text(event.get("parent_run_id")),
+            timestamp=_optional_text(event.get("timestamp")),
+            payload=safe_payload,
+            created_at=timestamp,
+        )
+
     def mark_historical(self, session_id: str) -> None:
         timestamp = _now()
         with self._connect() as connection:
@@ -238,6 +351,7 @@ class WebSessionStore:
     def delete_session(self, session_id: str) -> None:
         with self._connect() as connection:
             connection.execute("DELETE FROM messages WHERE session_id = ?", (session_id,))
+            connection.execute("DELETE FROM timeline_events WHERE session_id = ?", (session_id,))
             connection.execute("DELETE FROM agentscope_sessions WHERE web_session_id = ?", (session_id,))
             cursor = connection.execute("DELETE FROM sessions WHERE id = ?", (session_id,))
             if cursor.rowcount == 0:
@@ -378,6 +492,25 @@ class WebSessionStore:
         )
 
     @staticmethod
+    def _timeline_event_from_row(row: sqlite3.Row) -> TimelineEventRecord:
+        try:
+            payload = json.loads(row["payload_json"])
+        except (TypeError, json.JSONDecodeError):
+            payload = {}
+        return TimelineEventRecord(
+            id=row["id"],
+            session_id=row["session_id"],
+            seq=int(row["seq"]),
+            type=row["type"],
+            source=row["source"],
+            run_id=row["run_id"],
+            parent_run_id=row["parent_run_id"],
+            timestamp=row["timestamp"],
+            payload=payload if isinstance(payload, dict) else {},
+            created_at=row["created_at"],
+        )
+
+    @staticmethod
     def _agentscope_mapping_from_row(row: sqlite3.Row) -> AgentScopeSessionMapping:
         return AgentScopeSessionMapping(
             web_session_id=row["web_session_id"],
@@ -385,3 +518,7 @@ class WebSessionStore:
             agentscope_session_id=row["agentscope_session_id"],
             event_cursor=row["event_cursor"],
         )
+
+
+def _optional_text(value: object) -> str | None:
+    return value if isinstance(value, str) and value else None

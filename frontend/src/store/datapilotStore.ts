@@ -6,6 +6,7 @@ import type {
   PendingHumanDecision,
   SessionDetail,
   SessionRecord,
+  TimelineEventRecord,
 } from "../api/types";
 import { applyAgentEvent, createEmptyRunState, type RunState } from "./eventReducer";
 
@@ -88,6 +89,7 @@ export function createDataPilotStore() {
         return {
           sessions: upsertSession(state.sessions, session),
           messages: mergeMessages(state.messages, session.messages),
+          ...(session.events?.length ? { run: mergeRunFromEvents(state.run, session.events) } : {}),
         };
       }),
 
@@ -98,7 +100,7 @@ export function createDataPilotStore() {
         previousActiveSessionId: null,
         sessions: upsertSession(state.sessions, session),
         messages: [...(messages ?? ("messages" in session ? session.messages : []))],
-        run: createEmptyRunState(),
+        run: runFromEvents("events" in session ? (session.events ?? []) : []),
       })),
 
     restoreHistory: (session, messages) =>
@@ -108,7 +110,7 @@ export function createDataPilotStore() {
         previousActiveSessionId: null,
         sessions: upsertSession(state.sessions, session),
         messages: [...(messages ?? ("messages" in session ? session.messages : []))],
-        run: createEmptyRunState(),
+        run: runFromEvents("events" in session ? (session.events ?? []) : []),
       })),
 
     appendUserMessage: (message) =>
@@ -119,15 +121,7 @@ export function createDataPilotStore() {
     applyEvent: (event) =>
       set((state) => {
         const run = cloneRunState(state.run);
-        const timelineLength = run.timeline.length;
-        applyAgentEvent(run, event);
-        const createdAt = event.timestamp || new Date().toISOString();
-        for (let index = timelineLength; index < run.timeline.length; index += 1) {
-          const item = run.timeline[index] as OrderedTimelineItem;
-          item.createdAt = createdAt;
-          item.sequence = timelineSequence;
-          timelineSequence += 1;
-        }
+        applyLiveEvent(run, event);
         return { run };
       }),
 
@@ -230,7 +224,105 @@ function cloneRunState(run: RunState): RunState {
     activeText: run.activeText,
     activeStartedAt: run.activeStartedAt,
     running: run.running,
+    interrupting: run.interrupting,
+    appliedEventKeys: { ...run.appliedEventKeys },
   };
+}
+
+function runFromEvents(events: TimelineEventRecord[]): RunState {
+  const run = createEmptyRunState();
+  for (const record of events) {
+    applyEventIfNew(run, record);
+  }
+  return run;
+}
+
+function mergeRunFromEvents(run: RunState, events: TimelineEventRecord[]): RunState {
+  const next = cloneRunState(run);
+  for (const record of events) {
+    applyEventIfNew(next, record);
+  }
+  return next;
+}
+
+function applyEventIfNew(run: RunState, event: AgentEvent | TimelineEventRecord): void {
+  const record = event as Partial<TimelineEventRecord>;
+  const persistedKey = persistedEventKey(record);
+  if (persistedKey && run.appliedEventKeys[persistedKey]) {
+    return;
+  }
+  const liveKey = liveEventKey(event);
+  if (run.appliedEventKeys[liveKey]) {
+    if (persistedKey) {
+      run.appliedEventKeys[persistedKey] = true;
+    }
+    return;
+  }
+  applyEventAndMark(run, event, persistedKey ?? liveKey);
+}
+
+function applyLiveEvent(run: RunState, event: AgentEvent): void {
+  applyEventAndMark(run, event, liveEventKey(event));
+}
+
+function applyEventAndMark(run: RunState, event: AgentEvent | TimelineEventRecord, key: string): void {
+  const timelineLength = run.timeline.length;
+  applyAgentEvent(run, event);
+  run.appliedEventKeys[key] = true;
+  stampNewTimelineItems(run, event, timelineLength);
+}
+
+function stampNewTimelineItems(
+  run: RunState,
+  event: AgentEvent | TimelineEventRecord,
+  timelineLength: number,
+): void {
+  const record = event as Partial<TimelineEventRecord>;
+  const createdAt = event.timestamp || record.created_at || new Date().toISOString();
+  const sequence = typeof record.seq === "number" ? record.seq : timelineSequence;
+  for (let index = timelineLength; index < run.timeline.length; index += 1) {
+    const item = run.timeline[index] as OrderedTimelineItem;
+    item.createdAt = createdAt;
+    item.sequence = sequence;
+    if (typeof record.seq !== "number") {
+      timelineSequence += 1;
+    }
+  }
+}
+
+function liveEventKey(event: AgentEvent | TimelineEventRecord): string {
+  return `live:${[
+    event.type,
+    event.source ?? "",
+    event.run_id ?? "",
+    event.parent_run_id ?? "",
+    event.timestamp ?? "",
+    stableStringify(event.payload ?? {}),
+  ].join("\u0001")}`;
+}
+
+function persistedEventKey(event: Partial<TimelineEventRecord>): string | null {
+  if (event.id) {
+    return `persisted:${event.id}`;
+  }
+  if (event.session_id && typeof event.seq === "number") {
+    return `persisted:${event.session_id}:${event.seq}`;
+  }
+  return null;
+}
+
+function stableStringify(value: unknown): string {
+  if (value === null || typeof value !== "object") {
+    return JSON.stringify(value);
+  }
+  if (Array.isArray(value)) {
+    return `[${value.map((item) => stableStringify(item)).join(",")}]`;
+  }
+  const record = value as Record<string, unknown>;
+  return `{${Object.keys(record)
+    .sort()
+    .map((key) => `${JSON.stringify(key)}:${stableStringify(record[key])}`)
+    .join(",")}}`;
 }
 
 function samePendingHumanDecision(

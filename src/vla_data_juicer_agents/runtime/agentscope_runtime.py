@@ -758,8 +758,23 @@ def _navigation_handoff_message(
     scene_mode: str,
     clips: list[str],
     reason: str,
+    response_language: str | None,
 ) -> str:
     clip_text = ", ".join(clips) if clips else "all"
+    language = _resolve_response_language(response_language, request)
+    if language == "Chinese":
+        return "\n".join(
+            [
+                "导航数据处理请求：",
+                f"- 用户原始请求: {request}",
+                f"- 处理目标: {target}",
+                f"- 场景模式: {scene_mode}",
+                f"- clips: {clip_text}",
+                f"- 转交原因: {reason}",
+                f"- 回复语言: {language}",
+                "请始终使用中文回复用户。",
+            ]
+        )
     return "\n".join(
         [
             "Navigation data processing request:",
@@ -768,8 +783,24 @@ def _navigation_handoff_message(
             f"- scene_mode: {scene_mode}",
             f"- clips: {clip_text}",
             f"- reason: {reason}",
+            f"- response_language: {language}",
+            f"Always respond to the user in {language}.",
         ]
     )
+
+
+def _resolve_response_language(explicit: str | None, request: str) -> str:
+    language = str(explicit or "").strip()
+    if language:
+        lowered = language.lower()
+        if lowered in {"zh", "zh-cn", "chinese", "中文", "汉语"}:
+            return "Chinese"
+        if lowered in {"en", "en-us", "english", "英文", "英语"}:
+            return "English"
+        return language
+    if any("\u4e00" <= char <= "\u9fff" for char in request):
+        return "Chinese"
+    return "English"
 
 
 class NavigationHandoffTool(ToolBase):
@@ -821,6 +852,10 @@ class NavigationHandoffTool(ToolBase):
                 "enum": ["low", "medium", "high"],
                 "description": "Confidence that this is a concrete navigation data processing task.",
             },
+            "response_language": {
+                "type": "string",
+                "description": "The language the user is using and expects for responses, such as Chinese or English.",
+            },
         },
         "required": [
             "request",
@@ -829,6 +864,7 @@ class NavigationHandoffTool(ToolBase):
             "reason",
             "missing_fields",
             "confidence",
+            "response_language",
         ],
         "additionalProperties": False,
     }
@@ -858,9 +894,11 @@ class NavigationHandoffTool(ToolBase):
         reason: str,
         missing_fields: list[str],
         confidence: str,
+        response_language: str | None = None,
         clips: list[str] | None = None,
     ) -> ToolChunk:
         normalized_clips = list(clips or [])
+        normalized_language = _resolve_response_language(response_language, request)
         payload = {
             "web_session_id": self._web_session_id,
             "request": request,
@@ -870,6 +908,7 @@ class NavigationHandoffTool(ToolBase):
             "reason": reason,
             "missing_fields": list(missing_fields),
             "confidence": confidence,
+            "response_language": normalized_language,
             "started": False,
         }
 
@@ -901,6 +940,7 @@ class NavigationHandoffTool(ToolBase):
             scene_mode=scene_mode,
             clips=normalized_clips,
             reason=reason,
+            response_language=normalized_language,
         )
         await self._runtime.start_navigation_agent_task(
             web_session_id=self._web_session_id,

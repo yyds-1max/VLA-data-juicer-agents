@@ -196,6 +196,7 @@ def test_navigation_handoff_tool_declares_structured_schema():
         "reason",
         "missing_fields",
         "confidence",
+        "response_language",
     }
     assert tool.input_schema["required"] == [
         "request",
@@ -204,6 +205,7 @@ def test_navigation_handoff_tool_declares_structured_schema():
         "reason",
         "missing_fields",
         "confidence",
+        "response_language",
     ]
     assert tool.input_schema["properties"]["scene_mode"]["enum"] == ["indoor", "outdoor", "unknown"]
     assert tool.input_schema["properties"]["confidence"]["enum"] == ["low", "medium", "high"]
@@ -221,6 +223,7 @@ def test_navigation_handoff_tool_rejects_missing_fields_without_starting_navigat
             reason="用户想处理导航数据",
             missing_fields=["scene_mode"],
             confidence="high",
+            response_language="Chinese",
         )
     )
 
@@ -243,6 +246,7 @@ def test_navigation_handoff_tool_rejects_low_confidence_without_starting_navigat
             reason="用户只是询问能力",
             missing_fields=[],
             confidence="low",
+            response_language="Chinese",
         )
     )
 
@@ -265,6 +269,7 @@ def test_navigation_handoff_tool_rejects_unsupported_confidence_without_starting
             reason="用户看起来想处理导航数据",
             missing_fields=[],
             confidence="unknown",
+            response_language="Chinese",
         )
     )
 
@@ -288,17 +293,21 @@ def test_navigation_handoff_tool_starts_navigation_with_structured_context():
             reason="用户给出了日期和室外场景并要求处理导航数据",
             missing_fields=[],
             confidence="high",
+            response_language="Chinese",
         )
     )
 
     assert result.state is ToolResultState.SUCCESS
     assert runtime.started[0]["web_session_id"] == "web-1"
     message = runtime.started[0]["message"]
-    assert "request: 处理 20270605 的室外导航数据" in message
-    assert "target: 20270605" in message
-    assert "scene_mode: outdoor" in message
+    assert "导航数据处理请求：" in message
+    assert "用户原始请求: 处理 20270605 的室外导航数据" in message
+    assert "处理目标: 20270605" in message
+    assert "场景模式: outdoor" in message
     assert "clips: all" in message
-    assert "reason: 用户给出了日期和室外场景并要求处理导航数据" in message
+    assert "转交原因: 用户给出了日期和室外场景并要求处理导航数据" in message
+    assert "回复语言: Chinese" in message
+    assert "请始终使用中文回复用户。" in message
 
 
 def test_navigation_handoff_tool_records_observability_payload():
@@ -314,6 +323,7 @@ def test_navigation_handoff_tool_records_observability_payload():
             reason="用户明确指定日期、clip 和室内场景",
             missing_fields=[],
             confidence="medium",
+            response_language="Chinese",
         )
     )
 
@@ -327,6 +337,7 @@ def test_navigation_handoff_tool_records_observability_payload():
             "reason": "用户明确指定日期、clip 和室内场景",
             "missing_fields": [],
             "confidence": "medium",
+            "response_language": "Chinese",
             "started": True,
         }
     ]

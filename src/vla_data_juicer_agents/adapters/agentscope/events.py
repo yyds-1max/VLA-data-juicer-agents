@@ -129,6 +129,7 @@ class AgentScopeEventAdapter:
     def _emit_tool_start(self, call_id: str, state: _ToolState) -> None:
         if state.started:
             return
+        self._flush_reply_segment()
         state.started = True
         if self._emit_tool_events:
             self._scope.emit(
@@ -167,12 +168,17 @@ class AgentScopeEventAdapter:
     def _handle_reply_end(self) -> None:
         if not self._emit_text_events and not self._emit_final_events:
             return
+        self._flush_reply_segment()
+
+    def _flush_reply_segment(self) -> None:
+        if not self._emit_text_events and not self._emit_final_events:
+            return
         rendered = self._progress_filter.flush()
         if rendered:
             if self._emit_text_events:
                 self._scope.emit("assistant_delta", delta=rendered)
             self._reply_text.append(rendered)
-        if self._emit_final_events:
+        if self._emit_final_events and self._reply_text:
             self._scope.emit("final", text="".join(self._reply_text))
         self._reply_text.clear()
 

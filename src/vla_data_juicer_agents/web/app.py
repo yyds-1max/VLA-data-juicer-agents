@@ -258,6 +258,7 @@ async def _drain_controller_events(
 
     async def drain_once() -> None:
         for event in controller.drain_events():
+            store.append_timeline_event(session_id, event)
             await bus.publish(session_id, event)
             text = _final_event_text(event)
             if text is not None and text not in persisted_final_texts:

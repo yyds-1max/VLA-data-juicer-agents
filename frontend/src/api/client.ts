@@ -98,7 +98,13 @@ export async function submitHumanDecision(
 export function openSessionEvents(sessionId: string, onEvent: (event: AgentEvent) => void): WebSocket {
   const protocol = window.location.protocol === "https:" ? "wss:" : "ws:";
   const socket = new WebSocket(`${protocol}//${window.location.host}${sessionPath(sessionId)}/events`);
-  socket.addEventListener("message", (message) => onEvent(JSON.parse(message.data) as AgentEvent));
+  socket.addEventListener("message", (message) => {
+    try {
+      onEvent(JSON.parse(message.data) as AgentEvent);
+    } catch (error) {
+      console.error("Failed to parse DataPilot event", error);
+    }
+  });
   return socket;
 }
 

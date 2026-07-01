@@ -47,6 +47,7 @@ function sessionDetail(overrides: Partial<SessionDetail> = {}): SessionDetail {
   return {
     ...session(overrides),
     messages: [],
+    events: [],
     ...overrides,
   };
 }
@@ -185,7 +186,7 @@ describe("eventReducer", () => {
       kind: "tool",
       source: "navigation.plan",
       status: "completed",
-      text: "completed classify_navigation_dataset_tool 1.0s",
+      text: "已调用工具 classify_navigation_dataset_tool 1.0s",
     });
     expect(state.timeline[0].text).not.toContain("20270605");
     expect(state.timeline[0].text).not.toContain("{");
@@ -250,6 +251,33 @@ describe("eventReducer", () => {
     expect(state.running).toBe(true);
     expect(state.activeText).toBe("[Plan] 正在思考");
     expect(state.activeStartedAt).toBe(Date.parse("2026-06-26T00:00:00.000Z"));
+  });
+
+  it("final only clears the matching run and keeps child tools active", () => {
+    const state = createEmptyRunState();
+
+    applyAgentEvent(state, event("agent_start", "main", {}, { run_id: "main-run" }));
+    applyAgentEvent(
+      state,
+      event("agent_start", "navigation.workflow", {}, { run_id: "workflow-run", parent_run_id: "main-run" }),
+    );
+    applyAgentEvent(
+      state,
+      event(
+        "tool_start",
+        "navigation.workflow",
+        { call_id: "call-1", tool: "prepare_raw_data" },
+        { run_id: "workflow-run", parent_run_id: "main-run" },
+      ),
+    );
+
+    applyAgentEvent(state, event("final", "main", { text: "已启动导航任务。" }, { run_id: "main-run" }));
+
+    expect(state.running).toBe(true);
+    expect(state.activeText).toBe("正在调用工具 prepare_raw_data");
+    expect(Object.values(state.activeTools)).toMatchObject([{ runId: "workflow-run", tool: "prepare_raw_data" }]);
+    expect(state.activeAgents["workflow-run"]).toMatchObject({ runId: "workflow-run" });
+    expect(state.activeAgents["main-run"]).toBeUndefined();
   });
 
   it("dedupes final events by run id", () => {
@@ -428,6 +456,23 @@ describe("datapilotStore", () => {
     expect(store.getState().run.timeline.filter((item) => item.kind === "assistant")).toHaveLength(1);
   });
 
+  it("does not drop repeated live stream events that have no persisted sequence", () => {
+    const store = createDataPilotStore();
+    const liveEvent = {
+      type: "assistant_delta",
+      source: "agentscope",
+      run_id: "as-session",
+      parent_run_id: null,
+      timestamp: null,
+      payload: { delta: "哈" },
+    };
+
+    store.getState().applyEvent(liveEvent);
+    store.getState().applyEvent(liveEvent);
+
+    expect(store.getState().run.timeline).toMatchObject([{ kind: "assistant", text: "哈哈" }]);
+  });
+
   it("merges active session refresh messages without dropping newer local messages", () => {
     const store = createDataPilotStore();
 
@@ -501,5 +546,134 @@ describe("datapilotStore", () => {
     expect(store.getState().run.running).toBe(true);
     expect(store.getState().run.activeText).toBe("[Main] 正在思考");
     expect(store.getState().run.timeline).toMatchObject([{ kind: "reasoning", text: "live reasoning" }]);
+  });
+
+  it("refreshing an idle active session restores persisted timeline events", () => {
+    const store = createDataPilotStore();
+
+    store.getState().setActiveSession(session());
+    store.getState().refreshActiveSession(
+      sessionDetail({
+        events: [
+          {
+            id: "event-1",
+            session_id: "session-1",
+            seq: 1,
+            type: "assistant_delta",
+            source: "navigation-data-agent",
+            run_id: "as-session",
+            parent_run_id: null,
+            timestamp: "2026-06-26T00:01:00Z",
+            payload: { delta: "开始检查。" },
+            created_at: "2026-06-26T00:01:00Z",
+          },
+          {
+            id: "event-2",
+            session_id: "session-1",
+            seq: 2,
+            type: "tool_start",
+            source: "navigation-data-agent",
+            run_id: "as-session",
+            parent_run_id: null,
+            timestamp: "2026-06-26T00:01:01Z",
+            payload: { tool: "prepare_raw_data", call_id: "call-1" },
+            created_at: "2026-06-26T00:01:01Z",
+          },
+        ],
+      }),
+    );
+
+    expect(store.getState().run.timeline).toMatchObject([{ kind: "assistant", text: "开始检查。" }]);
+    expect(store.getState().run.running).toBe(true);
+    expect(store.getState().run.activeText).toBe("正在调用工具 prepare_raw_data");
+  });
+
+  it("restores repeated persisted deltas even when their content is identical", () => {
+    const store = createDataPilotStore();
+
+    store.getState().setActiveSession(session());
+    store.getState().refreshActiveSession(
+      sessionDetail({
+        events: [
+          {
+            id: "event-1",
+            session_id: "session-1",
+            seq: 1,
+            type: "assistant_delta",
+            source: "agentscope",
+            run_id: "as-session",
+            parent_run_id: null,
+            timestamp: null,
+            payload: { delta: "哈" },
+            created_at: "2026-06-26T00:01:00Z",
+          },
+          {
+            id: "event-2",
+            session_id: "session-1",
+            seq: 2,
+            type: "assistant_delta",
+            source: "agentscope",
+            run_id: "as-session",
+            parent_run_id: null,
+            timestamp: null,
+            payload: { delta: "哈" },
+            created_at: "2026-06-26T00:01:01Z",
+          },
+        ],
+      }),
+    );
+
+    expect(store.getState().run.timeline).toMatchObject([{ kind: "assistant", text: "哈哈" }]);
+  });
+
+  it("refreshing an active session applies persisted events missing from the live stream without duplicating live events", () => {
+    const store = createDataPilotStore();
+
+    store.getState().setActiveSession(session());
+    store.getState().applyEvent({
+      type: "assistant_delta",
+      source: "navigation-data-agent",
+      run_id: "as-session",
+      parent_run_id: null,
+      timestamp: "2026-06-26T00:01:00Z",
+      payload: { delta: "开始检查。" },
+    });
+
+    store.getState().refreshActiveSession(
+      sessionDetail({
+        events: [
+          {
+            id: "event-1",
+            session_id: "session-1",
+            seq: 1,
+            type: "assistant_delta",
+            source: "navigation-data-agent",
+            run_id: "as-session",
+            parent_run_id: null,
+            timestamp: "2026-06-26T00:01:00Z",
+            payload: { delta: "开始检查。" },
+            created_at: "2026-06-26T00:01:00Z",
+          },
+          {
+            id: "event-2",
+            session_id: "session-1",
+            seq: 2,
+            type: "tool_start",
+            source: "navigation-data-agent",
+            run_id: "as-session",
+            parent_run_id: null,
+            timestamp: "2026-06-26T00:01:01Z",
+            payload: { tool: "prepare_raw_data", call_id: "call-1" },
+            created_at: "2026-06-26T00:01:01Z",
+          },
+        ],
+      }),
+    );
+
+    expect(store.getState().run.timeline.filter((item) => item.kind === "assistant")).toMatchObject([
+      { text: "开始检查。" },
+    ]);
+    expect(store.getState().run.running).toBe(true);
+    expect(store.getState().run.activeText).toBe("正在调用工具 prepare_raw_data");
   });
 });

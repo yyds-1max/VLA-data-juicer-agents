@@ -99,6 +99,30 @@ def test_adapter_can_emit_text_delta_and_final_from_raw_agentscope_events():
     ]
 
 
+def test_adapter_closes_assistant_segment_before_tool_call():
+    scope, events = _scope_and_events()
+    adapter = AgentScopeEventAdapter(
+        scope,
+        emit_text_events=True,
+        emit_final_events=True,
+    )
+
+    adapter.accept(SimpleNamespace(type="TEXT_BLOCK_DELTA", delta="先检查数据。"))
+    adapter.accept(SimpleNamespace(type="TOOL_CALL_START", tool_call_id="call-1", tool_call_name="prepare_raw_data"))
+    adapter.accept(SimpleNamespace(type="TOOL_RESULT_END", tool_call_id="call-1", state="success"))
+    adapter.accept(SimpleNamespace(type="TEXT_BLOCK_DELTA", delta="检查完成。"))
+    adapter.accept(SimpleNamespace(type="REPLY_END"))
+
+    assert [(event["type"], event["payload"]) for event in events] == [
+        ("assistant_delta", {"delta": "先检查数据。"}),
+        ("final", {"text": "先检查数据。"}),
+        ("tool_start", {"tool": "prepare_raw_data", "call_id": "call-1", "args": ""}),
+        ("tool_end", {"tool": "prepare_raw_data", "call_id": "call-1", "status": "completed", "summary": ""}),
+        ("assistant_delta", {"delta": "检查完成。"}),
+        ("final", {"text": "检查完成。"}),
+    ]
+
+
 def test_progress_marker_without_newline_flushes_before_tool_event():
     scope, events = _scope_and_events()
 

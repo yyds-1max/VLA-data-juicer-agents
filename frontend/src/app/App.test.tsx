@@ -53,7 +53,7 @@ type TestTimelineItem = ReturnType<typeof createEmptyRunState>["timeline"][numbe
 };
 
 function activeSocket(close: () => void = vi.fn()): WebSocket {
-  return { close, readyState: WebSocket.OPEN } as unknown as WebSocket;
+  return { close, addEventListener: vi.fn(), readyState: WebSocket.OPEN } as unknown as WebSocket;
 }
 
 function deferred<T>() {
@@ -1453,6 +1453,63 @@ test("reopening an active session reopens the event stream before another turn i
   expect(apiMocks.submitTurn).not.toHaveBeenCalled();
 });
 
+test("event stream close refreshes the active session and reconnects", async () => {
+  let closeHandler: (() => void) | undefined;
+  const addEventListener = vi.fn((type: string, handler: () => void) => {
+    if (type === "close") {
+      closeHandler = handler;
+    }
+  });
+  apiMocks.openSessionEvents.mockReturnValue({
+    close: vi.fn(),
+    addEventListener,
+    readyState: WebSocket.OPEN,
+  } as unknown as WebSocket);
+  apiMocks.getSession.mockResolvedValue({
+    id: "session-1",
+    title: "Existing session",
+    created_at: "2026-06-26T00:00:00Z",
+    updated_at: "2026-06-26T00:00:00Z",
+    status: "active",
+    messages: [
+      {
+        id: "message-1",
+        session_id: "session-1",
+        role: "assistant",
+        content: "断线期间完成的回复",
+        created_at: "2026-06-26T00:01:00Z",
+      },
+    ],
+    events: [],
+  });
+  datapilotStore.setState({
+    open: true,
+    mode: "active_session",
+    currentSessionId: "session-1",
+    previousActiveSessionId: null,
+    sessions: [
+      {
+        id: "session-1",
+        title: "Existing session",
+        created_at: "2026-06-26T00:00:00Z",
+        updated_at: "2026-06-26T00:00:00Z",
+        status: "active",
+      },
+    ],
+  });
+
+  await renderAppWithDashboardSettled();
+  await waitFor(() => expect(apiMocks.openSessionEvents).toHaveBeenCalledTimes(1));
+  await waitFor(() => expect(closeHandler).toBeDefined());
+
+  await act(async () => {
+    closeHandler?.();
+  });
+
+  await waitFor(() => expect(screen.getByText("断线期间完成的回复")).toBeVisible());
+  await waitFor(() => expect(apiMocks.openSessionEvents).toHaveBeenCalledTimes(2));
+});
+
 test("opening a history session does not reconnect the event stream", async () => {
   datapilotStore.setState({
     open: false,
@@ -1793,7 +1850,40 @@ test("message list does not jump down when the user is reading older content", (
   expect(scrollArea?.scrollTop).toBe(200);
 });
 
-test("completed child run renders a collapsed summary row by default and expands details", () => {
+test("timeline assistant output does not hide unmatched persisted assistant messages", () => {
+  const run = createEmptyRunState();
+  run.timeline = [
+    {
+      kind: "assistant",
+      source: "agentscope",
+      text: "实时流式回复",
+      runId: "run-1",
+      parentRunId: null,
+      createdAt: "2026-06-26T00:02:00Z",
+      sequence: 1,
+    },
+  ] as TestTimelineItem[];
+
+  render(
+    <MessageList
+      messages={[
+        {
+          id: "message-1",
+          session_id: "session-1",
+          role: "assistant",
+          content: "只存在于持久化消息里的旧回复",
+          created_at: "2026-06-26T00:01:00Z",
+        },
+      ]}
+      run={run}
+    />,
+  );
+
+  expect(screen.getByText("只存在于持久化消息里的旧回复")).toBeVisible();
+  expect(screen.getByText("实时流式回复")).toBeVisible();
+});
+
+test("completed child run renders tool calls as compact rows while folding reasoning", () => {
   const run = createEmptyRunState();
   run.timeline = [
     {
@@ -1808,7 +1898,7 @@ test("completed child run renders a collapsed summary row by default and expands
     {
       kind: "tool",
       source: "navigation.plan",
-      text: "completed read_file 0.0s",
+      text: "已调用工具 read_file 0.0s",
       status: "completed",
       runId: "plan-run",
       parentRunId: "main-run",
@@ -1818,7 +1908,7 @@ test("completed child run renders a collapsed summary row by default and expands
     {
       kind: "tool",
       source: "navigation.plan",
-      text: "completed read_file 0.0s",
+      text: "已调用工具 read_file 0.0s",
       status: "completed",
       runId: "plan-run",
       parentRunId: "main-run",
@@ -1828,7 +1918,7 @@ test("completed child run renders a collapsed summary row by default and expands
     {
       kind: "tool",
       source: "navigation.plan",
-      text: "completed exec_command 0.0s",
+      text: "已调用工具 exec_command 0.0s",
       status: "completed",
       runId: "plan-run",
       parentRunId: "main-run",
@@ -1839,17 +1929,17 @@ test("completed child run renders a collapsed summary row by default and expands
 
   render(<MessageList messages={[]} run={run} />);
 
-  const summary = screen.getByRole("button", { name: /已读取 2 个文件，执行了 1 条命令/ });
+  const summary = screen.getByRole("button", { name: /记录了 1 条进展/ });
   expect(summary).toBeVisible();
   expect(summary).toHaveAttribute("aria-expanded", "false");
   expect(screen.queryByText("检查数据目录")).not.toBeInTheDocument();
-  expect(screen.queryByText("completed exec_command 0.0s")).not.toBeInTheDocument();
+  expect(screen.getByText("已调用工具 exec_command 0.0s")).toBeVisible();
+  expect(screen.getAllByText("已调用工具 read_file 0.0s")).toHaveLength(2);
 
   fireEvent.click(summary);
 
   expect(summary).toHaveAttribute("aria-expanded", "true");
   expect(screen.getByText("检查数据目录")).toBeVisible();
-  expect(screen.getByText("completed exec_command 0.0s")).toBeVisible();
 });
 
 test("active child run details remain visible and are not folded", () => {
@@ -1873,7 +1963,7 @@ test("active child run details remain visible and are not folded", () => {
     {
       kind: "tool",
       source: "navigation.plan",
-      text: "completed classify_navigation_dataset_tool 0.0s",
+      text: "已调用工具 classify_navigation_dataset_tool 0.0s",
       status: "completed",
       runId: "plan-run",
       parentRunId: "main-run",
@@ -1885,7 +1975,7 @@ test("active child run details remain visible and are not folded", () => {
   render(<MessageList messages={[]} run={run} />);
 
   expect(screen.getByText("正在判断导航数据类型")).toBeVisible();
-  expect(screen.getByText("completed classify_navigation_dataset_tool 0.0s")).toBeVisible();
+  expect(screen.getByText("已调用工具 classify_navigation_dataset_tool 0.0s")).toBeVisible();
   expect(screen.queryByRole("button", { name: /完成了 1 个工具/ })).not.toBeInTheDocument();
 });
 
@@ -1896,13 +1986,13 @@ test("active run text includes elapsed seconds while waiting", () => {
   expect(formatActiveText("", 1_000, 6_200)).toBe("");
 });
 
-test("completed child run summary keeps chronological position before later messages", () => {
+test("completed tool row keeps chronological position before later messages", () => {
   const run = createEmptyRunState();
   run.timeline = [
     {
       kind: "tool",
       source: "navigation.executor",
-      text: "completed exec_command 0.0s",
+      text: "已调用工具 exec_command 0.0s",
       status: "completed",
       runId: "executor-run",
       parentRunId: "workflow-run",
@@ -1927,7 +2017,7 @@ test("completed child run summary keeps chronological position before later mess
   );
 
   const position = screen
-    .getByRole("button", { name: /执行了 1 条命令/ })
+    .getByText("已调用工具 exec_command 0.0s")
     .compareDocumentPosition(screen.getByText("稍后的用户消息"));
   expect(position & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
 });
@@ -2009,38 +2099,26 @@ test("agentscope router assistant output remains a DataPilot timeline bubble and
   expect(screen.queryByRole("button", { name: /完成了子任务/ })).not.toBeInTheDocument();
 });
 
-test("child run tool details expose success and failure status dot tones", () => {
+test("tool calls render as compact timeline text instead of collapsible cards", () => {
   const run = createEmptyRunState();
   run.timeline = [
     {
       kind: "tool",
       source: "navigation.executor",
-      text: "completed classify_navigation_dataset_tool 0.0s",
+      text: "已调用工具 prepare_raw_data 2.0s",
       status: "completed",
       runId: "executor-run",
       parentRunId: "workflow-run",
       createdAt: "2026-06-26T00:02:00Z",
       sequence: 1,
     },
-    {
-      kind: "tool",
-      source: "navigation.executor",
-      text: "failed validate_navigation_dataset_tool 0.1s",
-      status: "failed",
-      runId: "executor-run",
-      parentRunId: "workflow-run",
-      createdAt: "2026-06-26T00:02:01Z",
-      sequence: 2,
-    },
   ] as TestTimelineItem[];
 
   const { container } = render(<MessageList messages={[]} run={run} />);
 
-  fireEvent.click(screen.getByRole("button", { name: /完成了 2 个工具/ }));
-
+  expect(screen.getByText("已调用工具 prepare_raw_data 2.0s")).toBeVisible();
+  expect(screen.queryByRole("button", { name: /工具|tool|完成/ })).not.toBeInTheDocument();
   expect(container.querySelector('[data-status="success"]')).toHaveClass("text-emerald-600");
-  expect(container.querySelector('[data-status="failure"]')).toHaveClass("text-rose-600");
-  expect(screen.getByText("failed validate_navigation_dataset_tool 0.1s")).toBeVisible();
 });
 
 test("running stop interrupts the current turn without leaving active mode", async () => {
@@ -2081,6 +2159,27 @@ test("running Composer shows a square stop button", () => {
 
   fireEvent.click(stopButton);
   expect(onInterrupt).toHaveBeenCalledTimes(1);
+});
+
+test("interrupting Composer shows a spinning circle button without visible text", () => {
+  const onInterrupt = vi.fn();
+
+  render(
+    <Composer
+      placeholder="我们要做什么？"
+      running
+      interrupting
+      onSubmit={vi.fn()}
+      onInterrupt={onInterrupt}
+    />,
+  );
+
+  const stopButton = screen.getByRole("button", { name: "Interrupt requested" });
+  expect(stopButton.querySelector("svg")).toHaveClass("animate-spin");
+  expect(screen.queryByText(/中断中|Interrupt requested/)).not.toBeInTheDocument();
+
+  fireEvent.click(stopButton);
+  expect(onInterrupt).not.toHaveBeenCalled();
 });
 
 test("Composer trims messages, clears after submit, and ignores empty input", () => {

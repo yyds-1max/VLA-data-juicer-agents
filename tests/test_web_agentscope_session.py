@@ -1070,8 +1070,9 @@ async def test_create_session_creates_compatible_record_and_persists(tmp_path: P
     assert session.title == "处理 20270605 的室外导航数据，并进行 dry-ru"
     detail = store.get_session(session.id)
     assert detail is not None
-    assert detail.model_dump(exclude={"messages"}) == session.model_dump()
+    assert detail.model_dump(exclude={"messages", "events"}) == session.model_dump()
     assert detail.messages == []
+    assert detail.events == []
 
 
 def test_agentscope_web_session_manager_attaches_store_to_runtime(tmp_path: Path) -> None:
