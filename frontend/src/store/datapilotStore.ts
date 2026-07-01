@@ -36,7 +36,10 @@ export interface DataPilotStoreState {
   restoreHistory: (session: SessionDetail | SessionRecord, messages?: ChatMessageRecord[]) => void;
   appendUserMessage: (message: ChatMessageRecord) => void;
   applyEvent: (event: AgentEvent) => void;
-  clearPendingHumanDecision: (expectedDecision: PendingHumanDecision) => void;
+  clearPendingHumanDecision: (
+    expectedDecision: PendingHumanDecision,
+    expectedSessionId: string | null,
+  ) => void;
 }
 
 export type DataPilotStore = ReturnType<typeof createDataPilotStore>;
@@ -128,9 +131,12 @@ export function createDataPilotStore() {
         return { run };
       }),
 
-    clearPendingHumanDecision: (expectedDecision) =>
+    clearPendingHumanDecision: (expectedDecision, expectedSessionId) =>
       set((state) => {
-        if (!samePendingHumanDecision(state.run.pendingHumanDecision, expectedDecision)) {
+        if (
+          state.currentSessionId !== expectedSessionId ||
+          !samePendingHumanDecision(state.run.pendingHumanDecision, expectedDecision)
+        ) {
           return {};
         }
         const run = cloneRunState(state.run);

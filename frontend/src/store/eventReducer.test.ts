@@ -310,6 +310,7 @@ describe("datapilotStore", () => {
   it("clearPendingHumanDecision clears the matching pending human decision from the current run", () => {
     const store = createDataPilotStore();
 
+    store.getState().setActiveSession(session());
     store.getState().applyEvent(
       event("human_decision_required", "navigation.workflow", {
         reply_id: "reply-1",
@@ -319,7 +320,7 @@ describe("datapilotStore", () => {
       }),
     );
 
-    store.getState().clearPendingHumanDecision(pendingDecision());
+    store.getState().clearPendingHumanDecision(pendingDecision(), "session-1");
 
     expect(store.getState().run.pendingHumanDecision).toBeNull();
   });
@@ -336,7 +337,7 @@ describe("datapilotStore", () => {
       }),
     );
 
-    store.getState().clearPendingHumanDecision(pendingDecision());
+    store.getState().clearPendingHumanDecision(pendingDecision(), "session-1");
 
     expect(store.getState().run.pendingHumanDecision).toEqual({
       replyId: "reply-2",
@@ -344,6 +345,31 @@ describe("datapilotStore", () => {
       requestId: "request-2",
       decisionType: "other",
       summary: "需要确认第二步。",
+    });
+  });
+
+  it("clearPendingHumanDecision keeps pending when the current session does not match", () => {
+    const store = createDataPilotStore();
+
+    store.getState().setActiveSession(session({ id: "session-b" }));
+    store.getState().applyEvent(
+      event("human_decision_required", "navigation.workflow", {
+        reply_id: "reply-1",
+        tool_call_id: "tool-call-1",
+        request_id: "request-1",
+        summary: "B 会话里的确认。",
+      }),
+    );
+
+    store.getState().clearPendingHumanDecision(pendingDecision(), "session-a");
+
+    expect(store.getState().currentSessionId).toBe("session-b");
+    expect(store.getState().run.pendingHumanDecision).toEqual({
+      replyId: "reply-1",
+      toolCallId: "tool-call-1",
+      requestId: "request-1",
+      decisionType: "other",
+      summary: "B 会话里的确认。",
     });
   });
 

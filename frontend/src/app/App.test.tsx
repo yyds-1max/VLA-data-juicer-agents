@@ -77,16 +77,21 @@ function pendingDecision(overrides: Partial<PendingHumanDecision> = {}): Pending
   };
 }
 
-function setOpenActiveSessionWithPendingDecision(decision: PendingHumanDecision) {
+function setOpenActiveSessionWithPendingDecision(
+  decision: PendingHumanDecision,
+  options: { sessionId?: string; title?: string } = {},
+) {
+  const sessionId = options.sessionId ?? "session-1";
+  const title = options.title ?? "Existing session";
   datapilotStore.setState({
     open: true,
     mode: "active_session",
-    currentSessionId: "session-1",
+    currentSessionId: sessionId,
     previousActiveSessionId: null,
     sessions: [
       {
-        id: "session-1",
-        title: "Existing session",
+        id: sessionId,
+        title,
         created_at: "2026-06-26T00:00:00Z",
         updated_at: "2026-06-26T00:00:00Z",
         status: "active",
@@ -95,7 +100,7 @@ function setOpenActiveSessionWithPendingDecision(decision: PendingHumanDecision)
     messages: [
       {
         id: "message-1",
-        session_id: "session-1",
+        session_id: sessionId,
         role: "assistant",
         content: "准备继续。",
         created_at: "2026-06-26T00:01:00Z",
@@ -1052,6 +1057,49 @@ test("resolving an older human decision submission does not clear a newer pendin
       decisionType: "other",
       summary: "第二个确认请求。",
     }),
+  );
+  expect(screen.getByRole("dialog", { name: "需要确认" })).toBeVisible();
+  expect(screen.queryByPlaceholderText("继续描述任务…")).not.toBeInTheDocument();
+});
+
+test("resolving a human decision from session A does not clear same-id pending in session B", async () => {
+  const submitDecision = deferred<boolean>();
+  apiMocks.submitHumanDecision.mockReturnValue(submitDecision.promise);
+  setOpenActiveSessionWithPendingDecision(pendingDecision(), { sessionId: "session-a", title: "Session A" });
+
+  await renderAppWithDashboardSettled();
+
+  fireEvent.click(screen.getByRole("button", { name: "确认" }));
+
+  expect(apiMocks.submitHumanDecision).toHaveBeenCalledWith("session-a", {
+    action: "confirm",
+    request_id: "request-1",
+    tool_call_id: "tool-call-1",
+    reply_id: "reply-1",
+  });
+
+  await act(async () => {
+    setOpenActiveSessionWithPendingDecision(
+      pendingDecision({ summary: "Session B 里的确认。" }),
+      { sessionId: "session-b", title: "Session B" },
+    );
+  });
+
+  await waitFor(() => expect(screen.getByText("Session B 里的确认。")).toBeVisible());
+  expect(datapilotStore.getState().currentSessionId).toBe("session-b");
+  expect(datapilotStore.getState().run.pendingHumanDecision).toEqual(
+    pendingDecision({ summary: "Session B 里的确认。" }),
+  );
+
+  await act(async () => {
+    submitDecision.resolve(true);
+    await submitDecision.promise;
+  });
+
+  await waitFor(() =>
+    expect(datapilotStore.getState().run.pendingHumanDecision).toEqual(
+      pendingDecision({ summary: "Session B 里的确认。" }),
+    ),
   );
   expect(screen.getByRole("dialog", { name: "需要确认" })).toBeVisible();
   expect(screen.queryByPlaceholderText("继续描述任务…")).not.toBeInTheDocument();

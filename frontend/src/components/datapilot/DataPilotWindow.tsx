@@ -208,10 +208,11 @@ export function DataPilotWindow() {
         return;
       }
 
+      const sessionId = currentSessionId;
       const decision = pendingHumanDecision;
 
       try {
-        const accepted = await submitHumanDecision(currentSessionId, {
+        const accepted = await submitHumanDecision(sessionId, {
           action,
           request_id: decision.requestId,
           tool_call_id: decision.toolCallId,
@@ -219,7 +220,7 @@ export function DataPilotWindow() {
           ...(text ? { text } : {}),
         });
         if (accepted) {
-          datapilotStore.getState().clearPendingHumanDecision(decision);
+          datapilotStore.getState().clearPendingHumanDecision(decision, sessionId);
         }
       } catch (error) {
         console.error("Failed to submit human decision", error);
