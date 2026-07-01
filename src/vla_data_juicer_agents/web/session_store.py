@@ -66,21 +66,62 @@ class WebSessionStore:
             connection.execute(
                 """
                 CREATE TABLE IF NOT EXISTS agentscope_sessions (
-                    web_session_id TEXT PRIMARY KEY,
+                    web_session_id TEXT NOT NULL,
                     agent_id TEXT NOT NULL,
                     agentscope_session_id TEXT NOT NULL,
                     event_cursor TEXT,
+                    active INTEGER NOT NULL DEFAULT 1,
                     updated_at TEXT NOT NULL,
+                    PRIMARY KEY (web_session_id, agent_id),
                     FOREIGN KEY (web_session_id) REFERENCES sessions(id)
                 )
                 """
             )
+            self._migrate_agentscope_sessions_schema(connection)
             connection.execute(
                 """
                 CREATE INDEX IF NOT EXISTS idx_agentscope_sessions_agentscope_id
                 ON agentscope_sessions (agentscope_session_id)
                 """
             )
+
+    def _migrate_agentscope_sessions_schema(self, connection: sqlite3.Connection) -> None:
+        columns = connection.execute("PRAGMA table_info(agentscope_sessions)").fetchall()
+        if not columns:
+            return
+        primary_key_columns = [row["name"] for row in columns if row["pk"]]
+        if primary_key_columns != ["web_session_id"]:
+            return
+        connection.execute("ALTER TABLE agentscope_sessions RENAME TO agentscope_sessions_legacy")
+        connection.execute(
+            """
+            CREATE TABLE agentscope_sessions (
+                web_session_id TEXT NOT NULL,
+                agent_id TEXT NOT NULL,
+                agentscope_session_id TEXT NOT NULL,
+                event_cursor TEXT,
+                active INTEGER NOT NULL DEFAULT 1,
+                updated_at TEXT NOT NULL,
+                PRIMARY KEY (web_session_id, agent_id),
+                FOREIGN KEY (web_session_id) REFERENCES sessions(id)
+            )
+            """
+        )
+        connection.execute(
+            """
+            INSERT INTO agentscope_sessions (
+                web_session_id,
+                agent_id,
+                agentscope_session_id,
+                event_cursor,
+                active,
+                updated_at
+            )
+            SELECT web_session_id, agent_id, agentscope_session_id, event_cursor, 1, updated_at
+            FROM agentscope_sessions_legacy
+            """
+        )
+        connection.execute("DROP TABLE agentscope_sessions_legacy")
 
     def create_session(self, title: str) -> SessionRecord:
         timestamp = _now()
@@ -223,15 +264,24 @@ class WebSessionStore:
                 raise KeyError(web_session_id)
             connection.execute(
                 """
+                UPDATE agentscope_sessions
+                SET active = 0
+                WHERE web_session_id = ?
+                """,
+                (web_session_id,),
+            )
+            connection.execute(
+                """
                 INSERT INTO agentscope_sessions (
                     web_session_id,
                     agent_id,
                     agentscope_session_id,
                     event_cursor,
+                    active,
                     updated_at
                 )
-                VALUES (?, ?, ?, NULL, ?)
-                ON CONFLICT(web_session_id) DO UPDATE SET
+                VALUES (?, ?, ?, NULL, 1, ?)
+                ON CONFLICT(web_session_id, agent_id) DO UPDATE SET
                     agent_id = excluded.agent_id,
                     agentscope_session_id = excluded.agentscope_session_id,
                     event_cursor = CASE
@@ -239,6 +289,7 @@ class WebSessionStore:
                         THEN agentscope_sessions.event_cursor
                         ELSE NULL
                     END,
+                    active = 1,
                     updated_at = excluded.updated_at
                 """,
                 (web_session_id, agent_id, agentscope_session_id, timestamp),
@@ -254,8 +305,26 @@ class WebSessionStore:
                 SELECT web_session_id, agent_id, agentscope_session_id, event_cursor
                 FROM agentscope_sessions
                 WHERE web_session_id = ?
+                ORDER BY active DESC, updated_at DESC
+                LIMIT 1
                 """,
                 (web_session_id,),
+            ).fetchone()
+        return self._agentscope_mapping_from_row(row) if row is not None else None
+
+    def get_agentscope_session_mapping_for_agent(
+        self,
+        web_session_id: str,
+        agent_id: str,
+    ) -> AgentScopeSessionMapping | None:
+        with self._connect() as connection:
+            row = connection.execute(
+                """
+                SELECT web_session_id, agent_id, agentscope_session_id, event_cursor
+                FROM agentscope_sessions
+                WHERE web_session_id = ? AND agent_id = ?
+                """,
+                (web_session_id, agent_id),
             ).fetchone()
         return self._agentscope_mapping_from_row(row) if row is not None else None
 
@@ -274,19 +343,19 @@ class WebSessionStore:
             ).fetchone()
         return self._agentscope_mapping_from_row(row) if row is not None else None
 
-    def save_agentscope_event_cursor(self, web_session_id: str, cursor: str) -> None:
+    def save_agentscope_event_cursor(self, agentscope_session_id: str, cursor: str) -> None:
         timestamp = _now()
         with self._connect() as connection:
             result = connection.execute(
                 """
                 UPDATE agentscope_sessions
                 SET event_cursor = ?, updated_at = ?
-                WHERE web_session_id = ?
+                WHERE agentscope_session_id = ?
                 """,
-                (cursor, timestamp, web_session_id),
+                (cursor, timestamp, agentscope_session_id),
             )
             if result.rowcount == 0:
-                raise KeyError(web_session_id)
+                raise KeyError(agentscope_session_id)
 
     @staticmethod
     def _session_from_row(row: sqlite3.Row) -> SessionRecord:

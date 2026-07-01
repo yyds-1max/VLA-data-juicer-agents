@@ -426,6 +426,42 @@ async def test_runtime_persists_web_to_agentscope_session_mapping(tmp_path: Path
 
 
 @pytest.mark.asyncio
+async def test_runtime_preserves_per_agent_mapping_cursor_when_active_agent_changes(tmp_path: Path) -> None:
+    store = WebSessionStore(tmp_path / "sessions.sqlite")
+    web_session = store.create_session("混合会话")
+    store.save_agentscope_session_mapping(
+        web_session.id,
+        agent_id="main-router-agent",
+        agentscope_session_id="as-main",
+    )
+    store.save_agentscope_event_cursor("as-main", "2-0")
+    store.save_agentscope_session_mapping(
+        web_session.id,
+        agent_id="navigation-data-agent",
+        agentscope_session_id="as-nav",
+    )
+
+    assert store.get_agentscope_session_mapping(web_session.id).agent_id == "navigation-data-agent"
+    main_mapping = store.get_agentscope_session_mapping_for_agent(web_session.id, "main-router-agent")
+    assert main_mapping is not None
+    assert main_mapping.agentscope_session_id == "as-main"
+    assert main_mapping.event_cursor == "2-0"
+
+    runtime = _runtime(chat_run_registry=FakeChatRunRegistry())
+    runtime.set_web_session_store(store)
+
+    session_id = await runtime.ensure_web_session(
+        web_session.id,
+        agent_id="main-router-agent",
+        model="qwen-router",
+    )
+
+    assert session_id == "as-main"
+    assert runtime._event_cursor("as-main") == "2-0"
+    assert store.get_agentscope_session_mapping(web_session.id).agent_id == "main-router-agent"
+
+
+@pytest.mark.asyncio
 async def test_runtime_submit_user_message_requires_chat_run_registry() -> None:
     runtime = _runtime(chat_run_registry=None)
 

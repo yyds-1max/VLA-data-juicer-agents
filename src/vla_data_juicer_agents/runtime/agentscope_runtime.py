@@ -60,9 +60,10 @@ class AgentScopeRuntime:
         if existing and existing[0] == agent_id:
             return existing[1]
 
-        persisted = self._load_web_session_mapping(web_session_id)
+        persisted = self._load_web_session_mapping(web_session_id, agent_id=agent_id)
         if persisted and persisted[0] == agent_id:
             self.web_sessions[web_session_id] = persisted
+            self._save_web_session_mapping(web_session_id, agent_id, persisted[1])
             return persisted[1]
 
         session_id = f"{web_session_id}__{agent_id}"
@@ -324,7 +325,6 @@ class AgentScopeRuntime:
                 self._remember_event_cursor(
                     agentscope_session_id,
                     entry_id,
-                    web_session_id=web_session_id,
                 )
 
             while True:
@@ -357,7 +357,6 @@ class AgentScopeRuntime:
                         self._remember_event_cursor(
                             agentscope_session_id,
                             entry_id,
-                            web_session_id=web_session_id,
                         )
                     continue
 
@@ -383,13 +382,10 @@ class AgentScopeRuntime:
         self,
         agentscope_session_id: str,
         entry_id: str,
-        *,
-        web_session_id: str | None = None,
     ) -> None:
         if self._is_new_event(agentscope_session_id, entry_id):
             self.event_cursors[agentscope_session_id] = entry_id
-            if web_session_id is not None:
-                self._save_web_session_event_cursor(web_session_id, entry_id)
+            self._save_web_session_event_cursor(agentscope_session_id, entry_id)
 
     def _event_cursor(self, agentscope_session_id: str) -> str | None:
         cursor = self.event_cursors.get(agentscope_session_id)
@@ -412,9 +408,25 @@ class AgentScopeRuntime:
             self.web_sessions[web_session_id] = persisted
         return persisted
 
-    def _load_web_session_mapping(self, web_session_id: str) -> tuple[str, str] | None:
+    def _load_web_session_mapping(
+        self,
+        web_session_id: str,
+        *,
+        agent_id: str | None = None,
+    ) -> tuple[str, str] | None:
         if self.web_session_store is None:
             return None
+        if agent_id is not None:
+            get_mapping = getattr(
+                self.web_session_store,
+                "get_agentscope_session_mapping_for_agent",
+                None,
+            )
+            if callable(get_mapping):
+                mapping = get_mapping(web_session_id, agent_id)
+                if mapping is None:
+                    return None
+                return mapping.agent_id, mapping.agentscope_session_id
         get_mapping = getattr(self.web_session_store, "get_agentscope_session_mapping", None)
         if not callable(get_mapping):
             return None
@@ -453,12 +465,12 @@ class AgentScopeRuntime:
         if callable(save_mapping):
             save_mapping(web_session_id, agent_id=agent_id, agentscope_session_id=agentscope_session_id)
 
-    def _save_web_session_event_cursor(self, web_session_id: str, cursor: str) -> None:
+    def _save_web_session_event_cursor(self, agentscope_session_id: str, cursor: str) -> None:
         if self.web_session_store is None:
             return
         save_cursor = getattr(self.web_session_store, "save_agentscope_event_cursor", None)
         if callable(save_cursor):
-            save_cursor(web_session_id, cursor)
+            save_cursor(agentscope_session_id, cursor)
 
     async def _pending_human_decision_event(
         self,
