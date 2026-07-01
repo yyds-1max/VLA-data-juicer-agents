@@ -24,6 +24,9 @@ class AgentScopeWebSessionManager:
         self._runtime = runtime
         self._event_callback = event_callback
         self._forward_locks: dict[str, asyncio.Lock] = {}
+        set_store = getattr(self._runtime, "set_web_session_store", None)
+        if callable(set_store):
+            set_store(self._store)
 
     async def create_session(self, first_message: str) -> SessionRecord:
         return self._store.create_session(title=generate_session_title(first_message))

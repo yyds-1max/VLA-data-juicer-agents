@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import sqlite3
 from datetime import UTC, datetime
+from dataclasses import dataclass
 from pathlib import Path
 from uuid import uuid4
 
@@ -15,6 +16,14 @@ from vla_data_juicer_agents.web.schemas import (
 
 def _now() -> str:
     return datetime.now(UTC).isoformat(timespec="milliseconds")
+
+
+@dataclass(frozen=True)
+class AgentScopeSessionMapping:
+    web_session_id: str
+    agent_id: str
+    agentscope_session_id: str
+    event_cursor: str | None = None
 
 
 class WebSessionStore:
@@ -52,6 +61,24 @@ class WebSessionStore:
                     created_at TEXT NOT NULL,
                     FOREIGN KEY (session_id) REFERENCES sessions(id)
                 )
+                """
+            )
+            connection.execute(
+                """
+                CREATE TABLE IF NOT EXISTS agentscope_sessions (
+                    web_session_id TEXT PRIMARY KEY,
+                    agent_id TEXT NOT NULL,
+                    agentscope_session_id TEXT NOT NULL,
+                    event_cursor TEXT,
+                    updated_at TEXT NOT NULL,
+                    FOREIGN KEY (web_session_id) REFERENCES sessions(id)
+                )
+                """
+            )
+            connection.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_agentscope_sessions_agentscope_id
+                ON agentscope_sessions (agentscope_session_id)
                 """
             )
 
@@ -170,9 +197,96 @@ class WebSessionStore:
     def delete_session(self, session_id: str) -> None:
         with self._connect() as connection:
             connection.execute("DELETE FROM messages WHERE session_id = ?", (session_id,))
+            connection.execute("DELETE FROM agentscope_sessions WHERE web_session_id = ?", (session_id,))
             cursor = connection.execute("DELETE FROM sessions WHERE id = ?", (session_id,))
             if cursor.rowcount == 0:
                 raise KeyError(session_id)
+
+    def save_agentscope_session_mapping(
+        self,
+        web_session_id: str,
+        *,
+        agent_id: str,
+        agentscope_session_id: str,
+    ) -> None:
+        timestamp = _now()
+        with self._connect() as connection:
+            exists = connection.execute(
+                """
+                SELECT 1
+                FROM sessions
+                WHERE id = ?
+                """,
+                (web_session_id,),
+            ).fetchone()
+            if exists is None:
+                raise KeyError(web_session_id)
+            connection.execute(
+                """
+                INSERT INTO agentscope_sessions (
+                    web_session_id,
+                    agent_id,
+                    agentscope_session_id,
+                    event_cursor,
+                    updated_at
+                )
+                VALUES (?, ?, ?, NULL, ?)
+                ON CONFLICT(web_session_id) DO UPDATE SET
+                    agent_id = excluded.agent_id,
+                    agentscope_session_id = excluded.agentscope_session_id,
+                    event_cursor = CASE
+                        WHEN agentscope_sessions.agentscope_session_id = excluded.agentscope_session_id
+                        THEN agentscope_sessions.event_cursor
+                        ELSE NULL
+                    END,
+                    updated_at = excluded.updated_at
+                """,
+                (web_session_id, agent_id, agentscope_session_id, timestamp),
+            )
+
+    def get_agentscope_session_mapping(
+        self,
+        web_session_id: str,
+    ) -> AgentScopeSessionMapping | None:
+        with self._connect() as connection:
+            row = connection.execute(
+                """
+                SELECT web_session_id, agent_id, agentscope_session_id, event_cursor
+                FROM agentscope_sessions
+                WHERE web_session_id = ?
+                """,
+                (web_session_id,),
+            ).fetchone()
+        return self._agentscope_mapping_from_row(row) if row is not None else None
+
+    def get_agentscope_session_mapping_by_agentscope_session(
+        self,
+        agentscope_session_id: str,
+    ) -> AgentScopeSessionMapping | None:
+        with self._connect() as connection:
+            row = connection.execute(
+                """
+                SELECT web_session_id, agent_id, agentscope_session_id, event_cursor
+                FROM agentscope_sessions
+                WHERE agentscope_session_id = ?
+                """,
+                (agentscope_session_id,),
+            ).fetchone()
+        return self._agentscope_mapping_from_row(row) if row is not None else None
+
+    def save_agentscope_event_cursor(self, web_session_id: str, cursor: str) -> None:
+        timestamp = _now()
+        with self._connect() as connection:
+            result = connection.execute(
+                """
+                UPDATE agentscope_sessions
+                SET event_cursor = ?, updated_at = ?
+                WHERE web_session_id = ?
+                """,
+                (cursor, timestamp, web_session_id),
+            )
+            if result.rowcount == 0:
+                raise KeyError(web_session_id)
 
     @staticmethod
     def _session_from_row(row: sqlite3.Row) -> SessionRecord:
@@ -192,4 +306,13 @@ class WebSessionStore:
             role=row["role"],
             content=row["content"],
             created_at=row["created_at"],
+        )
+
+    @staticmethod
+    def _agentscope_mapping_from_row(row: sqlite3.Row) -> AgentScopeSessionMapping:
+        return AgentScopeSessionMapping(
+            web_session_id=row["web_session_id"],
+            agent_id=row["agent_id"],
+            agentscope_session_id=row["agentscope_session_id"],
+            event_cursor=row["event_cursor"],
         )

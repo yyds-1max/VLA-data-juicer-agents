@@ -1,10 +1,17 @@
 import asyncio
+from types import SimpleNamespace
 
 from agentscope.permission import PermissionBehavior, PermissionDecision
 
 from vla_data_juicer_agents.navigation.agent_tools import (
     HumanDecisionTool,
     build_navigation_agent_tools,
+)
+from vla_data_juicer_agents.runtime import agentscope_runtime as runtime_module
+from vla_data_juicer_agents.runtime.agentscope_config import AgentScopeRuntimeConfig
+from vla_data_juicer_agents.runtime.agentscope_runtime import (
+    build_extra_agent_tools_factory,
+    create_agentscope_runtime,
 )
 
 
@@ -52,3 +59,58 @@ def test_build_navigation_agent_tools_does_not_register_old_workflow_control_too
 
     assert "vla_run_workflow" not in names
     assert "vla_continue_workflow" not in names
+
+
+def test_extra_agent_tools_factory_registers_navigation_tools_only_for_navigation_agent(tmp_path):
+    config = AgentScopeRuntimeConfig(
+        user_id="alice",
+        redis_url="redis://localhost:6379/0",
+        workspace_root=tmp_path,
+        dashscope_api_key="test-key",
+        dashscope_base_url=None,
+        default_model="qwen-default",
+        router_model="qwen-router",
+        navigation_model="qwen-navigation",
+    )
+    factory = build_extra_agent_tools_factory(config)
+
+    navigation_tools = asyncio.run(factory("alice", config.navigation_agent_id, "session-1"))
+    router_tools = asyncio.run(factory("alice", config.main_router_agent_id, "session-1"))
+
+    navigation_names = {tool.name for tool in navigation_tools}
+    assert "request_human_decision" in navigation_names
+    assert "extract_and_sync_navigation_data_tool" in navigation_names
+    assert "vla_run_workflow" not in navigation_names
+    assert "vla_continue_workflow" not in navigation_names
+    assert router_tools == []
+
+
+def test_create_agentscope_runtime_wires_navigation_tools_factory(monkeypatch, tmp_path):
+    captured = {}
+
+    def fake_create_app(**kwargs):
+        captured.update(kwargs)
+        return SimpleNamespace(state=SimpleNamespace())
+
+    monkeypatch.setattr(runtime_module.agentscope.app, "create_app", fake_create_app)
+    config = AgentScopeRuntimeConfig(
+        user_id="alice",
+        redis_url="redis://localhost:6379/0",
+        workspace_root=tmp_path,
+        dashscope_api_key="test-key",
+        dashscope_base_url=None,
+        default_model="qwen-default",
+        router_model="qwen-router",
+        navigation_model="qwen-navigation",
+    )
+
+    create_agentscope_runtime(config)
+
+    factory = captured["extra_agent_tools"]
+    assert factory is not None
+    tool_names = {
+        tool.name
+        for tool in asyncio.run(factory("alice", config.navigation_agent_id, "session-1"))
+    }
+    assert "request_human_decision" in tool_names
+    assert "extract_and_sync_navigation_data_tool" in tool_names

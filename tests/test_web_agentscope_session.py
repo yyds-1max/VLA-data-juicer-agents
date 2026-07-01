@@ -25,6 +25,15 @@ class FakeAgentScopeRuntime:
         return self.turn_id
 
 
+class StoreAwareAgentScopeRuntime(FakeAgentScopeRuntime):
+    def __init__(self) -> None:
+        super().__init__()
+        self.web_session_store = None
+
+    def set_web_session_store(self, store) -> None:
+        self.web_session_store = store
+
+
 class EventingAgentScopeRuntime(FakeAgentScopeRuntime):
     def __init__(self, events: list[dict]) -> None:
         super().__init__()
@@ -234,7 +243,10 @@ def _agentscope_session_record(
     tool_call_id: str = "tool-call-1",
     tool_name: str = "request_human_decision",
     tool_state=ToolCallState.SUBMITTED,
+    tool_input: str | dict = "{}",
 ):
+    if isinstance(tool_input, dict):
+        tool_input = json.dumps(tool_input, ensure_ascii=False)
     return SimpleNamespace(
         state=SimpleNamespace(
             reply_id=reply_id,
@@ -246,7 +258,7 @@ def _agentscope_session_record(
                         ToolCallBlock(
                             id=tool_call_id,
                             name=tool_name,
-                            input="{}",
+                            input=tool_input,
                             state=tool_state,
                         )
                     ],
@@ -385,6 +397,35 @@ async def test_runtime_submit_user_message_reuses_deterministic_session_id_after
 
 
 @pytest.mark.asyncio
+async def test_runtime_persists_web_to_agentscope_session_mapping(tmp_path: Path) -> None:
+    store = WebSessionStore(tmp_path / "sessions.sqlite")
+    web_session = store.create_session("处理导航数据")
+    storage = FakeAgentScopeStorage()
+    first_runtime = _runtime(storage=storage, chat_run_registry=FakeChatRunRegistry())
+    first_runtime.set_web_session_store(store)
+
+    agentscope_session_id = await first_runtime.ensure_web_session(
+        web_session.id,
+        agent_id="navigation-data-agent",
+        model="qwen-navigation",
+    )
+
+    assert agentscope_session_id == f"{web_session.id}__navigation-data-agent"
+    mapping = store.get_agentscope_session_mapping(web_session.id)
+    assert mapping is not None
+    assert mapping.agent_id == "navigation-data-agent"
+    assert mapping.agentscope_session_id == agentscope_session_id
+
+    second_runtime = _runtime(storage=storage, chat_run_registry=FakeChatRunRegistry())
+    second_runtime.set_web_session_store(store)
+
+    assert second_runtime._web_session_mapping(web_session.id) == (
+        "navigation-data-agent",
+        agentscope_session_id,
+    )
+
+
+@pytest.mark.asyncio
 async def test_runtime_submit_user_message_requires_chat_run_registry() -> None:
     runtime = _runtime(chat_run_registry=None)
 
@@ -483,6 +524,41 @@ async def test_runtime_submit_human_decision_spawns_external_execution_result_ev
 
 
 @pytest.mark.asyncio
+async def test_runtime_submit_human_decision_recovers_mapping_after_restart(tmp_path: Path) -> None:
+    store = WebSessionStore(tmp_path / "sessions.sqlite")
+    web_session = store.create_session("处理导航数据")
+    store.save_agentscope_session_mapping(
+        web_session.id,
+        agent_id="navigation-data-agent",
+        agentscope_session_id="as-session-1",
+    )
+    storage = FakeAgentScopeStorage()
+    storage.session_records[("alice", "navigation-data-agent", "as-session-1")] = (
+        _agentscope_session_record(reply_id="reply-1", tool_call_id="tool-1")
+    )
+    chat_run_registry = FakeChatRunRegistry()
+    runtime = _runtime(storage=storage, chat_run_registry=chat_run_registry)
+    runtime.set_web_session_store(store)
+
+    accepted = await runtime.submit_human_decision(
+        web_session_id=web_session.id,
+        decision={
+            "action": "confirm",
+            "request_id": "camera-1",
+            "tool_call_id": "tool-1",
+            "reply_id": "reply-1",
+        },
+    )
+
+    assert accepted is True
+    assert runtime.web_sessions == {
+        web_session.id: ("navigation-data-agent", "as-session-1")
+    }
+    assert [spawn["session_id"] for spawn in chat_run_registry.spawns] == ["as-session-1"]
+    await chat_run_registry.drain()
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize(
     "session_record,decision_overrides",
     [
@@ -576,6 +652,55 @@ async def test_runtime_submit_human_decision_returns_false_for_unmapped_web_sess
     assert accepted is False
     assert chat_run_registry.spawns == []
     assert runtime.app.state.chat_service.runs == []
+
+
+@pytest.mark.asyncio
+async def test_runtime_subscribe_hydrates_pending_human_decision_after_restart(tmp_path: Path) -> None:
+    store = WebSessionStore(tmp_path / "sessions.sqlite")
+    web_session = store.create_session("处理导航数据")
+    store.save_agentscope_session_mapping(
+        web_session.id,
+        agent_id="navigation-data-agent",
+        agentscope_session_id="as-session-1",
+    )
+    storage = FakeAgentScopeStorage()
+    storage.session_records[("alice", "navigation-data-agent", "as-session-1")] = (
+        _agentscope_session_record(
+            reply_id="reply-1",
+            tool_call_id="tool-1",
+            tool_input={
+                "decision_type": "camera_params",
+                "request_id": "camera-1",
+                "summary": "请确认相机参数。",
+            },
+        )
+    )
+    runtime = _runtime(
+        storage=storage,
+        chat_run_registry=FakeChatRunRegistry(),
+        message_bus=FakeAgentScopeMessageBus(),
+    )
+    runtime.set_web_session_store(store)
+
+    events = [
+        event async for event in runtime.subscribe_web_session_events(web_session_id=web_session.id)
+    ]
+
+    assert events == [
+        {
+            "type": "human_decision_required",
+            "source": "NavigationDataAgent",
+            "run_id": "as-session-1",
+            "parent_run_id": None,
+            "payload": {
+                "decision_type": "camera_params",
+                "request_id": "camera-1",
+                "summary": "请确认相机参数。",
+                "reply_id": "reply-1",
+                "tool_call_id": "tool-1",
+            },
+        }
+    ]
 
 
 @pytest.mark.asyncio
@@ -680,6 +805,60 @@ async def test_runtime_event_cursor_skips_previous_turn_replay_for_same_agentsco
 
 
 @pytest.mark.asyncio
+async def test_runtime_event_cursor_persists_across_runtime_restart(tmp_path: Path) -> None:
+    store = WebSessionStore(tmp_path / "sessions.sqlite")
+    web_session = store.create_session("处理导航数据")
+    store.save_agentscope_session_mapping(
+        web_session.id,
+        agent_id="navigation-data-agent",
+        agentscope_session_id="as-session-1",
+    )
+    old_text = {"type": "TEXT_BLOCK_DELTA", "delta": "旧"}
+    old_final = {"type": "REPLY_END"}
+    new_text = {"type": "TEXT_BLOCK_DELTA", "delta": "新"}
+    new_final = {"type": "REPLY_END"}
+    message_bus = FakeAgentScopeMessageBus(
+        replay_events=[
+            ("1-0", old_text),
+            ("2-0", old_final),
+        ],
+        running_states=[False, False],
+    )
+    first_runtime = _runtime(message_bus=message_bus)
+    first_runtime.set_web_session_store(store)
+
+    first_events = [
+        event
+        async for event in first_runtime.subscribe_web_session_events(web_session_id=web_session.id)
+    ]
+
+    assert [(event["type"], event["payload"]) for event in first_events] == [
+        ("assistant_delta", {"delta": "旧"}),
+        ("final", {"text": "旧"}),
+    ]
+    assert store.get_agentscope_session_mapping(web_session.id).event_cursor == "2-0"
+
+    message_bus.replay_events = [
+        ("1-0", old_text),
+        ("2-0", old_final),
+        ("3-0", new_text),
+        ("4-0", new_final),
+    ]
+    second_runtime = _runtime(message_bus=message_bus)
+    second_runtime.set_web_session_store(store)
+    second_events = [
+        event
+        async for event in second_runtime.subscribe_web_session_events(web_session_id=web_session.id)
+    ]
+
+    assert message_bus.read_since == [None, "2-0"]
+    assert [(event["type"], event["payload"]) for event in second_events] == [
+        ("assistant_delta", {"delta": "新"}),
+        ("final", {"text": "新"}),
+    ]
+
+
+@pytest.mark.asyncio
 async def test_create_session_creates_compatible_record_and_persists(tmp_path: Path) -> None:
     store = WebSessionStore(tmp_path / "sessions.sqlite")
     manager = AgentScopeWebSessionManager(store=store, runtime=FakeAgentScopeRuntime())
@@ -693,6 +872,15 @@ async def test_create_session_creates_compatible_record_and_persists(tmp_path: P
     assert detail is not None
     assert detail.model_dump(exclude={"messages"}) == session.model_dump()
     assert detail.messages == []
+
+
+def test_agentscope_web_session_manager_attaches_store_to_runtime(tmp_path: Path) -> None:
+    store = WebSessionStore(tmp_path / "sessions.sqlite")
+    runtime = StoreAwareAgentScopeRuntime()
+
+    AgentScopeWebSessionManager(store=store, runtime=runtime)
+
+    assert runtime.web_session_store is store
 
 
 @pytest.mark.asyncio

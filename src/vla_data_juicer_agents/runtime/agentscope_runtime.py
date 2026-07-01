@@ -17,6 +17,7 @@ from agentscope.message import ToolCallState, ToolResultBlock, ToolResultState, 
 
 from vla_data_juicer_agents.adapters.agentscope import AgentScopeEventAdapter
 from vla_data_juicer_agents.core.events import CallbackEventSink, EventEmitter
+from vla_data_juicer_agents.navigation.agent_tools import build_navigation_agent_tools
 from vla_data_juicer_agents.navigation.routing import is_high_confidence_navigation_request
 from vla_data_juicer_agents.runtime.agentscope_bootstrap import bootstrap_agentscope_records
 from vla_data_juicer_agents.runtime.agentscope_config import AgentScopeRuntimeConfig
@@ -34,6 +35,7 @@ class AgentScopeRuntime:
     app: Any
     web_sessions: dict[str, tuple[str, str]] = field(default_factory=dict)
     event_cursors: dict[str, str | None] = field(default_factory=dict)
+    web_session_store: Any | None = None
     _active_human_decision_claims: set[str] = field(default_factory=set)
     bootstrapped: bool = False
 
@@ -50,10 +52,18 @@ class AgentScopeRuntime:
             await bootstrap_agentscope_records(self.storage, self.config)
             self.bootstrapped = True
 
+    def set_web_session_store(self, store: Any) -> None:
+        self.web_session_store = store
+
     async def ensure_web_session(self, web_session_id: str, *, agent_id: str, model: str) -> str:
         existing = self.web_sessions.get(web_session_id)
         if existing and existing[0] == agent_id:
             return existing[1]
+
+        persisted = self._load_web_session_mapping(web_session_id)
+        if persisted and persisted[0] == agent_id:
+            self.web_sessions[web_session_id] = persisted
+            return persisted[1]
 
         session_id = f"{web_session_id}__{agent_id}"
         session = await self.storage.upsert_session(
@@ -72,6 +82,7 @@ class AgentScopeRuntime:
             session_id=session_id,
         )
         self.web_sessions[web_session_id] = (agent_id, session.id)
+        self._save_web_session_mapping(web_session_id, agent_id, session.id)
         return session.id
 
     async def submit_user_message(self, *, web_session_id: str, message: str) -> str:
@@ -104,7 +115,7 @@ class AgentScopeRuntime:
         return f"turn_{uuid4()}"
 
     async def submit_human_decision(self, *, web_session_id: str, decision: dict[str, Any]) -> bool:
-        mapped = self.web_sessions.get(web_session_id)
+        mapped = self._web_session_mapping(web_session_id)
         if mapped is None:
             return False
 
@@ -233,18 +244,18 @@ class AgentScopeRuntime:
             return None
         entries = await read_events(
             agentscope_session_id,
-            since=self.event_cursors.get(agentscope_session_id),
+            since=self._event_cursor(agentscope_session_id),
         )
         if not entries:
             return None
         return entries[-1][0]
 
     async def subscribe_web_session_events(self, *, web_session_id: str):
-        mapped = self.web_sessions.get(web_session_id)
+        mapped = self._web_session_mapping(web_session_id)
         if mapped is None:
             return
 
-        _agent_id, agentscope_session_id = mapped
+        agent_id, agentscope_session_id = mapped
         translated_events: asyncio.Queue[dict[str, Any]] = asyncio.Queue()
         live_events: asyncio.Queue[dict[str, Any] | None] = asyncio.Queue()
         live_ready = asyncio.Event()
@@ -290,7 +301,14 @@ class AgentScopeRuntime:
             with suppress(TimeoutError):
                 await asyncio.wait_for(live_ready.wait(), timeout=_EVENT_STARTUP_GRACE_SECS)
 
-            cursor = self.event_cursors.get(agentscope_session_id)
+            pending_event = await self._pending_human_decision_event(
+                agent_id=agent_id,
+                agentscope_session_id=agentscope_session_id,
+            )
+            if pending_event is not None:
+                yield pending_event
+
+            cursor = self._event_cursor(agentscope_session_id)
             for entry_id, raw_event in await self.message_bus.session_read_events(
                 agentscope_session_id,
                 since=cursor,
@@ -298,12 +316,16 @@ class AgentScopeRuntime:
                 if not self._is_new_event(agentscope_session_id, entry_id):
                     continue
                 seen_entry_ids.add(entry_id)
-                self._remember_event_cursor(agentscope_session_id, entry_id)
                 saw_event = True
                 if _raw_event_type(raw_event) == "REPLY_END":
                     saw_reply_end = True
                 for event in accept_raw_event(raw_event):
                     yield event
+                self._remember_event_cursor(
+                    agentscope_session_id,
+                    entry_id,
+                    web_session_id=web_session_id,
+                )
 
             while True:
                 running = bool(await self.message_bus.session_is_running(agentscope_session_id))
@@ -326,12 +348,17 @@ class AgentScopeRuntime:
                         if not self._is_new_event(agentscope_session_id, entry_id):
                             continue
                         seen_entry_ids.add(entry_id)
-                        self._remember_event_cursor(agentscope_session_id, entry_id)
                     saw_event = True
                     if _raw_event_type(raw_event) == "REPLY_END":
                         saw_reply_end = True
                     for event in accept_raw_event(raw_event):
                         yield event
+                    if entry_id:
+                        self._remember_event_cursor(
+                            agentscope_session_id,
+                            entry_id,
+                            web_session_id=web_session_id,
+                        )
                     continue
 
                 now = asyncio.get_running_loop().time()
@@ -349,12 +376,143 @@ class AgentScopeRuntime:
                 await feeder_task
 
     def _is_new_event(self, agentscope_session_id: str, entry_id: str) -> bool:
-        cursor = self.event_cursors.get(agentscope_session_id)
+        cursor = self._event_cursor(agentscope_session_id)
         return cursor is None or _stream_id_is_newer(entry_id, cursor)
 
-    def _remember_event_cursor(self, agentscope_session_id: str, entry_id: str) -> None:
+    def _remember_event_cursor(
+        self,
+        agentscope_session_id: str,
+        entry_id: str,
+        *,
+        web_session_id: str | None = None,
+    ) -> None:
         if self._is_new_event(agentscope_session_id, entry_id):
             self.event_cursors[agentscope_session_id] = entry_id
+            if web_session_id is not None:
+                self._save_web_session_event_cursor(web_session_id, entry_id)
+
+    def _event_cursor(self, agentscope_session_id: str) -> str | None:
+        cursor = self.event_cursors.get(agentscope_session_id)
+        if cursor is not None:
+            return cursor
+        mapping = self._web_session_mapping_for_agentscope_session(agentscope_session_id)
+        if mapping is None:
+            return None
+        _agent_id, _session_id, persisted_cursor = mapping
+        if persisted_cursor:
+            self.event_cursors[agentscope_session_id] = persisted_cursor
+        return persisted_cursor
+
+    def _web_session_mapping(self, web_session_id: str) -> tuple[str, str] | None:
+        mapped = self.web_sessions.get(web_session_id)
+        if mapped is not None:
+            return mapped
+        persisted = self._load_web_session_mapping(web_session_id)
+        if persisted is not None:
+            self.web_sessions[web_session_id] = persisted
+        return persisted
+
+    def _load_web_session_mapping(self, web_session_id: str) -> tuple[str, str] | None:
+        if self.web_session_store is None:
+            return None
+        get_mapping = getattr(self.web_session_store, "get_agentscope_session_mapping", None)
+        if not callable(get_mapping):
+            return None
+        mapping = get_mapping(web_session_id)
+        if mapping is None:
+            return None
+        return mapping.agent_id, mapping.agentscope_session_id
+
+    def _web_session_mapping_for_agentscope_session(
+        self,
+        agentscope_session_id: str,
+    ) -> tuple[str, str, str | None] | None:
+        if self.web_session_store is None:
+            return None
+        get_mapping = getattr(
+            self.web_session_store,
+            "get_agentscope_session_mapping_by_agentscope_session",
+            None,
+        )
+        if not callable(get_mapping):
+            return None
+        mapping = get_mapping(agentscope_session_id)
+        if mapping is None:
+            return None
+        return mapping.agent_id, mapping.agentscope_session_id, mapping.event_cursor
+
+    def _save_web_session_mapping(
+        self,
+        web_session_id: str,
+        agent_id: str,
+        agentscope_session_id: str,
+    ) -> None:
+        if self.web_session_store is None:
+            return
+        save_mapping = getattr(self.web_session_store, "save_agentscope_session_mapping", None)
+        if callable(save_mapping):
+            save_mapping(web_session_id, agent_id=agent_id, agentscope_session_id=agentscope_session_id)
+
+    def _save_web_session_event_cursor(self, web_session_id: str, cursor: str) -> None:
+        if self.web_session_store is None:
+            return
+        save_cursor = getattr(self.web_session_store, "save_agentscope_event_cursor", None)
+        if callable(save_cursor):
+            save_cursor(web_session_id, cursor)
+
+    async def _pending_human_decision_event(
+        self,
+        *,
+        agent_id: str,
+        agentscope_session_id: str,
+    ) -> dict[str, Any] | None:
+        get_session = getattr(self.storage, "get_session", None)
+        if get_session is None:
+            return None
+        record = await get_session(self.config.user_id, agent_id, agentscope_session_id)
+        if record is None:
+            return None
+        state = getattr(record, "state", None)
+        reply_id = getattr(state, "reply_id", None)
+        if not reply_id:
+            return None
+        for message in getattr(state, "context", []) or []:
+            for tool_call in _tool_call_blocks(message):
+                if (
+                    getattr(tool_call, "name", None) == "request_human_decision"
+                    and _state_value(getattr(tool_call, "state", None))
+                    == ToolCallState.SUBMITTED.value
+                ):
+                    payload = _human_decision_payload_from_tool_call(tool_call)
+                    if payload is None:
+                        continue
+                    claim_key = _human_decision_claim_key(
+                        agentscope_session_id,
+                        {
+                            "reply_id": reply_id,
+                            "tool_call_id": getattr(tool_call, "id", ""),
+                        },
+                    )
+                    if await self._is_human_decision_claim_active(claim_key):
+                        continue
+                    payload["reply_id"] = reply_id
+                    payload["tool_call_id"] = getattr(tool_call, "id", "")
+                    return {
+                        "type": "human_decision_required",
+                        "source": "NavigationDataAgent",
+                        "run_id": agentscope_session_id,
+                        "parent_run_id": None,
+                        "payload": payload,
+                    }
+        return None
+
+    async def _is_human_decision_claim_active(self, claim_key: str) -> bool:
+        if claim_key in self._active_human_decision_claims:
+            return True
+        is_locked = getattr(self.message_bus, "is_locked", None)
+        if callable(is_locked):
+            return bool(await is_locked(claim_key))
+        return False
 
 
 def _to_attribute_event(value: Any) -> Any:
@@ -402,6 +560,30 @@ def _human_decision_claim_key(agentscope_session_id: str, decision: dict[str, An
     )
 
 
+def _human_decision_payload_from_tool_call(tool_call: Any) -> dict[str, Any] | None:
+    tool_input = getattr(tool_call, "input", None)
+    if isinstance(tool_input, str):
+        try:
+            tool_input = json.loads(tool_input)
+        except json.JSONDecodeError:
+            return None
+    if not isinstance(tool_input, dict):
+        return None
+
+    request_id = tool_input.get("request_id")
+    summary = tool_input.get("summary")
+    if not isinstance(request_id, str) or not isinstance(summary, str):
+        return None
+    decision_type = tool_input.get("decision_type")
+    if not isinstance(decision_type, str) or not decision_type:
+        decision_type = "other"
+    return {
+        "request_id": request_id,
+        "decision_type": decision_type,
+        "summary": summary,
+    }
+
+
 def _session_events_key(message_bus: Any, session_id: str) -> str:
     template = getattr(
         message_bus,
@@ -441,6 +623,15 @@ def _stream_id_parts(entry_id: str) -> tuple[int, int] | None:
         return None
 
 
+def build_extra_agent_tools_factory(config: AgentScopeRuntimeConfig):
+    async def extra_agent_tools(_user_id: str, agent_id: str, _session_id: str) -> list[Any]:
+        if agent_id != config.navigation_agent_id:
+            return []
+        return build_navigation_agent_tools(dry_run=False)
+
+    return extra_agent_tools
+
+
 def create_agentscope_runtime(config: AgentScopeRuntimeConfig) -> AgentScopeRuntime:
     redis_kwargs = config.redis_connection_kwargs()
     storage = RedisStorage(**redis_kwargs)
@@ -452,7 +643,7 @@ def create_agentscope_runtime(config: AgentScopeRuntimeConfig) -> AgentScopeRunt
         storage=storage,
         message_bus=message_bus,
         workspace_manager=workspace_manager,
-        extra_agent_tools=None,
+        extra_agent_tools=build_extra_agent_tools_factory(config),
         title="DataPilot AgentScope Runtime",
     )
 
