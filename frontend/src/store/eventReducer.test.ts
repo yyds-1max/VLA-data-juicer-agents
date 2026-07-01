@@ -313,6 +313,27 @@ describe("eventReducer", () => {
       },
     ]);
   });
+
+  it("starts a new assistant item when a reused run id streams after final", () => {
+    const state = createEmptyRunState();
+
+    applyAgentEvent(state, event("assistant_delta", "agentscope", { delta: "第一轮" }, { run_id: "session-run" }));
+    applyAgentEvent(state, event("final", "agentscope", { text: "第一轮" }, { run_id: "session-run" }));
+    applyAgentEvent(state, event("assistant_delta", "agentscope", { delta: "第二轮" }, { run_id: "session-run" }));
+
+    expect(state.timeline.filter((item) => item.kind === "assistant").map((item) => item.text)).toEqual([
+      "第一轮",
+      "第二轮",
+    ]);
+
+    applyAgentEvent(state, event("final", "agentscope", { text: "第二轮完成" }, { run_id: "session-run" }));
+
+    expect(state.running).toBe(false);
+    expect(state.timeline.filter((item) => item.kind === "assistant").map((item) => item.text)).toEqual([
+      "第一轮",
+      "第二轮完成",
+    ]);
+  });
 });
 
 describe("datapilotStore", () => {

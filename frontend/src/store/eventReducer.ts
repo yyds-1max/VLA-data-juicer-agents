@@ -65,6 +65,9 @@ export function applyAgentEvent(state: RunState, event: AgentEvent): void {
 
   if (type === "agent_start") {
     const startedAt = timestampMs(event.timestamp);
+    if (runId) {
+      delete state.finalRunIds[runId];
+    }
     state.activeAgents[agentKey(runId, source)] = { source, runId, parentRunId, startedAt };
     state.running = true;
     state.activeText = thinkingText(source, label);
@@ -149,7 +152,11 @@ export function applyAgentEvent(state: RunState, event: AgentEvent): void {
     if (!delta) {
       return;
     }
-    const existing = findAssistantItem(state, source, runId);
+    const startsNewReply = Boolean(runId && state.finalRunIds[runId]);
+    if (startsNewReply) {
+      delete state.finalRunIds[runId];
+    }
+    const existing = startsNewReply ? undefined : findAssistantItem(state, source, runId);
     if (existing) {
       existing.text += delta;
     } else {
