@@ -39,19 +39,27 @@ def _config(**overrides) -> AgentScopeRuntimeConfig:
     return AgentScopeRuntimeConfig(**values)
 
 
-def test_main_router_prompt_routes_navigation_and_rejects_old_workflow_tools():
+def test_main_router_prompt_presents_datapilot_and_sets_task_readiness_rules():
     prompt = main_router_prompt()
 
-    assert "MainRouterAgent" in prompt
-    assert "Clear navigation requests" in prompt
-    assert "Ordinary or non-navigation conversation" in prompt
-    assert "answer normally" in prompt
-    assert "must not route to NavigationDataAgent" in prompt
+    assert prompt.startswith("You are DataPilot")
+    assert "我是 DataPilot，一个 VLA 数据处理助手" in prompt
+    assert "Do not reveal internal agent names" in prompt
+    assert "Ordinary conversation" in prompt
+    assert "Capability questions" in prompt
+    assert "do not inspect the workspace" in prompt
+    assert "date, path, or" in prompt
+    assert "dataset target" in prompt
+    assert "ask for the data date or path" in prompt
+    assert "indoor or outdoor" in prompt
+    assert "combine it with the pending task context" in prompt
+    assert "If no clip is specified, process all clips" in prompt
+    assert "If a specified clip does not exist" in prompt
     assert "vla_run_workflow" in prompt
     assert "vla_continue_workflow" in prompt
-    assert "Do not call" in prompt
-    assert "one short clarifying question" in prompt
     assert "user's language" in prompt
+    assert "You are MainRouterAgent" not in prompt
+    assert "route to NavigationDataAgent" not in prompt
 
     for term in [
         "VLA navigation data",
@@ -77,10 +85,17 @@ def test_navigation_agent_prompt_requires_plan_execute_react_and_human_decisions
     prompt = navigation_agent_prompt()
 
     for expected in [
-        "NavigationDataAgent",
+        "DataPilot's navigation data specialist",
         "plan-and-execute",
         "ReAct",
         "WorkflowPlan",
+        "Capability questions",
+        "do not inspect data",
+        "scene mode is missing",
+        "indoor or outdoor",
+        "If no clip is specified",
+        "If a specified clip does not exist",
+        "concise progress updates",
         "request_human_decision",
         "Do not ask the user to type",
         "confirm/stop/guidance",
@@ -89,6 +104,7 @@ def test_navigation_agent_prompt_requires_plan_execute_react_and_human_decisions
     ]:
         assert expected in prompt
 
+    assert "You are NavigationDataAgent" not in prompt
     assert "mock" not in prompt.lower()
 
 
