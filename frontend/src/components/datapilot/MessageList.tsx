@@ -203,7 +203,7 @@ function chronologicalEntries(messages: ChatMessageRecord[], timeline: TimelineI
 }
 
 function isChildTimelineItem(item: TimelineItem): boolean {
-  return item.source !== "main";
+  return !isPrimaryConversationSource(item.source);
 }
 
 function isChildRunActive(item: TimelineItem, run: RunState): boolean {
@@ -253,11 +253,13 @@ function MessageBubble({ message }: { message: ChatMessageRecord }) {
 }
 
 function TimelineBubble({ item }: { item: TimelineItem }) {
+  const showSource = !isPrimaryConversationSource(item.source);
+
   return (
     <article className="mr-auto max-w-[92%] rounded-lg border border-console-line bg-console-panel px-3 py-2 text-sm leading-6 text-console-text shadow-sm">
       <div className="mb-1 flex items-center gap-2 text-[11px] font-medium text-console-muted">
         <span>{item.kind === "assistant" ? "DataPilot" : item.kind}</span>
-        <span className="truncate font-normal">{item.source}</span>
+        {showSource ? <span className="truncate font-normal">{item.source}</span> : null}
       </div>
       {item.kind === "tool" ? (
         <div className="flex min-w-0 items-center gap-2 whitespace-pre-wrap break-words">
@@ -268,5 +270,16 @@ function TimelineBubble({ item }: { item: TimelineItem }) {
         <p className="whitespace-pre-wrap break-words">{item.text}</p>
       )}
     </article>
+  );
+}
+
+function isPrimaryConversationSource(source: string): boolean {
+  const normalized = source.trim().toLowerCase();
+  return (
+    normalized === "" ||
+    normalized === "main" ||
+    normalized === "agentscope" ||
+    normalized === "main-router-agent" ||
+    normalized === "mainrouteragent"
   );
 }

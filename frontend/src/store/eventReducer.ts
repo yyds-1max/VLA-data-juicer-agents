@@ -67,7 +67,7 @@ export function applyAgentEvent(state: RunState, event: AgentEvent): void {
     const startedAt = timestampMs(event.timestamp);
     state.activeAgents[agentKey(runId, source)] = { source, runId, parentRunId, startedAt };
     state.running = true;
-    state.activeText = `[${label}] 正在思考`;
+    state.activeText = thinkingText(source, label);
     state.activeStartedAt = startedAt;
     return;
   }
@@ -244,7 +244,7 @@ function refreshRunningText(state: RunState): void {
   const activeAgent = deepestActiveAgent(state.activeAgents);
   if (activeAgent) {
     state.running = true;
-    state.activeText = `[${sourceLabel(activeAgent.source)}] 正在思考`;
+    state.activeText = thinkingText(activeAgent.source, sourceLabel(activeAgent.source));
     state.activeStartedAt = activeAgent.startedAt;
     return;
   }
@@ -292,6 +292,9 @@ function sourceLabel(source: string): string {
   if (!source || source === "main") {
     return "Main";
   }
+  if (isAgentScopeRouterSource(source)) {
+    return "DataPilot";
+  }
   if (source === "navigation.workflow" || source === "navigation.workflow.resume") {
     return "Workflow";
   }
@@ -302,6 +305,18 @@ function sourceLabel(source: string): string {
     return "Executor";
   }
   return source;
+}
+
+function thinkingText(source: string, label: string): string {
+  if (isAgentScopeRouterSource(source)) {
+    return "正在思考";
+  }
+  return `[${label}] 正在思考`;
+}
+
+function isAgentScopeRouterSource(source: string): boolean {
+  const normalized = source.trim().toLowerCase();
+  return normalized === "agentscope" || normalized === "main-router-agent" || normalized === "mainrouteragent";
 }
 
 function toolStatus(payload: Record<string, unknown>): string {

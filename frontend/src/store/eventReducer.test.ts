@@ -148,6 +148,15 @@ describe("eventReducer", () => {
     expect(state.activeStartedAt).toBe(Date.parse("2026-06-26T00:00:00.000Z"));
   });
 
+  it("uses generic thinking placeholder for AgentScope router startup", () => {
+    const state = createEmptyRunState();
+
+    applyAgentEvent(state, event("agent_start", "agentscope"));
+
+    expect(state.running).toBe(true);
+    expect(state.activeText).toBe("正在思考");
+  });
+
   it("creates compact tool completion text without args JSON", () => {
     const state = createEmptyRunState();
 

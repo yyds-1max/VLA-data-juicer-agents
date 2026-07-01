@@ -1988,6 +1988,27 @@ test("main assistant output remains a DataPilot timeline bubble and is not folde
   expect(screen.queryByRole("button")).not.toBeInTheDocument();
 });
 
+test("agentscope router assistant output remains a DataPilot timeline bubble and is not folded", () => {
+  const run = createEmptyRunState();
+  run.timeline = [
+    {
+      kind: "assistant",
+      source: "agentscope",
+      text: "你好！我是 MainRouterAgent，VLA 数据 juicer 会话的主路由代理。",
+      runId: "router-run",
+      parentRunId: null,
+      createdAt: "2026-06-26T00:02:00Z",
+      sequence: 1,
+    },
+  ] as TestTimelineItem[];
+
+  render(<MessageList messages={[]} run={run} />);
+
+  expect(screen.getByText("你好！我是 MainRouterAgent，VLA 数据 juicer 会话的主路由代理。")).toBeVisible();
+  expect(screen.getByText("DataPilot")).toBeVisible();
+  expect(screen.queryByRole("button", { name: /完成了子任务/ })).not.toBeInTheDocument();
+});
+
 test("child run tool details expose success and failure status dot tones", () => {
   const run = createEmptyRunState();
   run.timeline = [
