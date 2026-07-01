@@ -957,7 +957,11 @@ def test_run_plan_agent_streams_events_to_run_state(tmp_path):
     class FakeStreamAgent:
         async def reply_stream(self, _msg):
             yield SimpleNamespace(type="MODEL_CALL_START", model="qwen-plus")
-            yield SimpleNamespace(type="TOOL_CALL_START", name="inspect_raw_date_tool")
+            yield SimpleNamespace(
+                type="TOOL_CALL_START",
+                tool_call_id="call_1",
+                tool_call_name="inspect_raw_date_tool",
+            )
             yield SimpleNamespace(type="TOOL_RESULT_END", tool_call_id="call_1")
             yield SimpleNamespace(type="TEXT_BLOCK_DELTA", delta=plan_json)
             yield SimpleNamespace(type="REPLY_END", reply_id="reply_1")
@@ -980,10 +984,23 @@ def test_run_plan_agent_streams_events_to_run_state(tmp_path):
     assert parsed_plan == plan
     assert [(event["type"], event["source"], event["run_id"], event["parent_run_id"]) for event in events] == [
         ("agent_start", "navigation.plan", "plan-run", "workflow-run"),
+        ("tool_start", "navigation.plan", "plan-run", "workflow-run"),
+        ("tool_end", "navigation.plan", "plan-run", "workflow-run"),
         ("assistant_delta", "navigation.plan", "plan-run", "workflow-run"),
         ("agent_end", "navigation.plan", "plan-run", "workflow-run"),
     ]
-    assert events[1]["payload"] == {"delta": plan_json}
+    assert events[1]["payload"] == {
+        "tool": "inspect_raw_date_tool",
+        "call_id": "call_1",
+        "args": "",
+    }
+    assert events[2]["payload"] == {
+        "tool": "inspect_raw_date_tool",
+        "call_id": "call_1",
+        "status": "completed",
+        "summary": "",
+    }
+    assert events[3]["payload"] == {"delta": plan_json}
     assert events[-1]["payload"] == {"status": "completed"}
     assert all("event_type" not in event for event in events)
 

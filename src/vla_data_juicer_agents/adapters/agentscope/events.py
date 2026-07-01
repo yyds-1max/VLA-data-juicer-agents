@@ -96,6 +96,7 @@ class AgentScopeEventAdapter:
         elif event_type == "TOOL_CALL_START":
             state = self._tools.setdefault(call_id, _ToolState())
             state.name = _text(getattr(event, "tool_call_name", "")) or state.name
+            self._emit_tool_start(call_id, state)
         elif event_type == "TOOL_CALL_DELTA":
             self._tools.setdefault(call_id, _ToolState()).arguments.append(
                 _text(getattr(event, "delta", ""))
@@ -103,14 +104,7 @@ class AgentScopeEventAdapter:
         elif event_type == "TOOL_RESULT_START":
             state = self._tools.setdefault(call_id, _ToolState())
             state.name = _text(getattr(event, "tool_call_name", "")) or state.name
-            state.started = True
-            if self._emit_tool_events:
-                self._scope.emit(
-                    "tool_start",
-                    tool=state.name,
-                    call_id=call_id,
-                    args="".join(state.arguments),
-                )
+            self._emit_tool_start(call_id, state)
         elif event_type == "TOOL_RESULT_TEXT_DELTA":
             self._tools.setdefault(call_id, _ToolState()).result.append(
                 _text(getattr(event, "delta", ""))
@@ -131,6 +125,18 @@ class AgentScopeEventAdapter:
                 self._scope.emit("tool_end", **payload)
         elif event_type == "REQUIRE_EXTERNAL_EXECUTION":
             self._handle_require_external_execution(event)
+
+    def _emit_tool_start(self, call_id: str, state: _ToolState) -> None:
+        if state.started:
+            return
+        state.started = True
+        if self._emit_tool_events:
+            self._scope.emit(
+                "tool_start",
+                tool=state.name,
+                call_id=call_id,
+                args="".join(state.arguments),
+            )
 
     def close_active_tools(self, status: str) -> None:
         tools = self._tools

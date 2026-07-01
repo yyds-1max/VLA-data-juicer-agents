@@ -135,6 +135,10 @@ def test_tool_result_emits_paired_start_and_end_with_result_state():
     adapter = AgentScopeEventAdapter(scope)
 
     adapter.accept(SimpleNamespace(type="TOOL_CALL_START", tool_call_id="call-1", tool_call_name="inspect"))
+    assert [(event["type"], event["payload"]) for event in events] == [
+        ("tool_start", {"tool": "inspect", "call_id": "call-1", "args": ""}),
+    ]
+
     adapter.accept(SimpleNamespace(type="TOOL_CALL_DELTA", tool_call_id="call-1", delta='{"date":'))
     adapter.accept(SimpleNamespace(type="TOOL_CALL_DELTA", tool_call_id="call-1", delta=' "20270605"}'))
     adapter.accept(SimpleNamespace(type="TOOL_RESULT_START", tool_call_id="call-1", tool_call_name="inspect"))
@@ -143,7 +147,7 @@ def test_tool_result_emits_paired_start_and_end_with_result_state():
     adapter.accept(SimpleNamespace(type="TOOL_RESULT_END", tool_call_id="call-1", state="success"))
 
     assert [(event["type"], event["payload"]) for event in events] == [
-        ("tool_start", {"tool": "inspect", "call_id": "call-1", "args": '{"date": "20270605"}'}),
+        ("tool_start", {"tool": "inspect", "call_id": "call-1", "args": ""}),
         ("tool_end", {"tool": "inspect", "call_id": "call-1", "status": "completed", "summary": "Found navigation data. Ready."}),
     ]
 
