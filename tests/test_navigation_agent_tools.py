@@ -85,6 +85,25 @@ def test_extra_agent_tools_factory_registers_navigation_tools_only_for_navigatio
     assert router_tools == []
 
 
+def test_extra_agent_tools_factory_registers_router_handoff_when_runtime_available(tmp_path):
+    config = AgentScopeRuntimeConfig(
+        user_id="alice",
+        redis_url="redis://localhost:6379/0",
+        workspace_root=tmp_path,
+        dashscope_api_key="test-key",
+        dashscope_base_url=None,
+        default_model="qwen-default",
+        router_model="qwen-router",
+        navigation_model="qwen-navigation",
+    )
+    runtime = SimpleNamespace()
+    factory = build_extra_agent_tools_factory(config, runtime=runtime)
+
+    router_tools = asyncio.run(factory("alice", config.main_router_agent_id, "web-1__main-router-agent"))
+
+    assert {tool.name for tool in router_tools} == {"start_navigation_data_task"}
+
+
 def test_create_agentscope_runtime_wires_navigation_tools_factory(monkeypatch, tmp_path):
     captured = {}
 

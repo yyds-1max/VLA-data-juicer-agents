@@ -55,6 +55,8 @@ def test_main_router_prompt_presents_datapilot_and_sets_task_readiness_rules():
     assert "combine it with the pending task context" in prompt
     assert "If no clip is specified, process all clips" in prompt
     assert "If a specified clip does not exist" in prompt
+    assert "start_navigation_data_task" in prompt
+    assert "call start_navigation_data_task" in prompt
     assert "vla_run_workflow" in prompt
     assert "vla_continue_workflow" in prompt
     assert "user's language" in prompt

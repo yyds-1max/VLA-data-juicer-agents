@@ -65,6 +65,33 @@ class ConcurrentEventingAgentScopeRuntime(EventingAgentScopeRuntime):
             self.active -= 1
 
 
+class SwitchingEventingAgentScopeRuntime(FakeAgentScopeRuntime):
+    def __init__(self) -> None:
+        super().__init__()
+        self.subscription_key = ("main-router-agent", "main-session")
+        self.subscriptions: list[tuple[str, tuple[str, str]]] = []
+
+    def web_session_subscription_key(self, *, web_session_id: str):
+        return self.subscription_key
+
+    async def subscribe_web_session_events(self, *, web_session_id: str):
+        current_key = self.subscription_key
+        self.subscriptions.append((web_session_id, current_key))
+        if current_key[0] == "main-router-agent":
+            yield {
+                "type": "final",
+                "source": "DataPilot",
+                "payload": {"text": "我来交给导航处理"},
+            }
+            self.subscription_key = ("navigation-data-agent", "navigation-session")
+        else:
+            yield {
+                "type": "final",
+                "source": "NavigationDataAgent",
+                "payload": {"text": "开始检查导航数据"},
+            }
+
+
 class RejectingAgentScopeRuntime(FakeAgentScopeRuntime):
     async def submit_user_message(self, *, web_session_id: str, message: str) -> str:
         self.submissions.append({"web_session_id": web_session_id, "message": message})
@@ -281,7 +308,7 @@ def test_navigation_rule_fallback_is_narrow_and_explicit() -> None:
 
 
 @pytest.mark.asyncio
-async def test_runtime_submit_user_message_routes_navigation_request_to_navigation_agent() -> None:
+async def test_runtime_submit_user_message_starts_navigation_requests_with_main_router() -> None:
     chat_run_registry = FakeChatRunRegistry()
     runtime = _runtime(chat_run_registry=chat_run_registry)
 
@@ -291,27 +318,27 @@ async def test_runtime_submit_user_message_routes_navigation_request_to_navigati
     )
 
     assert turn_id.startswith("turn_")
-    assert runtime.web_sessions == {"web-1": ("navigation-data-agent", "web-1__navigation-data-agent")}
+    assert runtime.web_sessions == {"web-1": ("main-router-agent", "web-1__main-router-agent")}
     session = runtime.storage.sessions[0]
     assert session["user_id"] == "alice"
-    assert session["agent_id"] == "navigation-data-agent"
-    assert session["id"] == "web-1__navigation-data-agent"
+    assert session["agent_id"] == "main-router-agent"
+    assert session["id"] == "web-1__main-router-agent"
     assert session["config"].workspace_id == "workspace-web-1"
     assert session["config"].name == "web-1"
     assert session["config"].chat_model_config.type == "dashscope_chat"
     assert session["config"].chat_model_config.credential_id == "dashscope-env"
-    assert session["config"].chat_model_config.model == "qwen-navigation"
+    assert session["config"].chat_model_config.model == "qwen-router"
     assert session["config"].chat_model_config.parameters == {"parallel_tool_calls": False}
     assert runtime.app.state.chat_service.runs == []
     assert [spawn["session_id"] for spawn in chat_run_registry.spawns] == [
-        "web-1__navigation-data-agent"
+        "web-1__main-router-agent"
     ]
     await chat_run_registry.drain()
     assert len(runtime.app.state.chat_service.runs) == 1
     run = runtime.app.state.chat_service.runs[0]
     assert run["user_id"] == "alice"
-    assert run["session_id"] == "web-1__navigation-data-agent"
-    assert run["agent_id"] == "navigation-data-agent"
+    assert run["session_id"] == "web-1__main-router-agent"
+    assert run["agent_id"] == "main-router-agent"
     assert run["message"].name == "user"
     assert _message_text(run["message"]) == "同步 rosbag db3 odom 和 gridmap 数据"
 
@@ -355,7 +382,7 @@ async def test_runtime_submit_user_message_reuses_session_for_same_agent() -> No
 
 
 @pytest.mark.asyncio
-async def test_runtime_submit_user_message_recreates_session_when_agent_changes() -> None:
+async def test_runtime_submit_user_message_keeps_main_router_session_for_navigation_followup() -> None:
     chat_run_registry = FakeChatRunRegistry()
     runtime = _runtime(chat_run_registry=chat_run_registry)
 
@@ -364,16 +391,43 @@ async def test_runtime_submit_user_message_recreates_session_when_agent_changes(
     await runtime.submit_user_message(web_session_id="web-1", message="处理导航数据")
     await chat_run_registry.drain()
 
-    assert len(runtime.storage.sessions) == 2
+    assert len(runtime.storage.sessions) == 1
+    assert runtime.web_sessions == {"web-1": ("main-router-agent", "web-1__main-router-agent")}
+    assert [session["agent_id"] for session in runtime.storage.sessions] == [
+        "main-router-agent",
+    ]
+    assert [session["id"] for session in runtime.storage.sessions] == [
+        "web-1__main-router-agent",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_runtime_start_navigation_agent_task_switches_mapping_and_spawns_navigation_run() -> None:
+    chat_run_registry = FakeChatRunRegistry()
+    runtime = _runtime(chat_run_registry=chat_run_registry)
+
+    await runtime.submit_user_message(web_session_id="web-1", message="处理 20270605 的室外数据")
+    await chat_run_registry.drain()
+    session_id = await runtime.start_navigation_agent_task(
+        web_session_id="web-1",
+        message="处理 20270605 的室外数据",
+    )
+
+    assert session_id == "web-1__navigation-data-agent"
     assert runtime.web_sessions == {"web-1": ("navigation-data-agent", "web-1__navigation-data-agent")}
     assert [session["agent_id"] for session in runtime.storage.sessions] == [
         "main-router-agent",
         "navigation-data-agent",
     ]
-    assert [session["id"] for session in runtime.storage.sessions] == [
-        "web-1__main-router-agent",
-        "web-1__navigation-data-agent",
+    assert runtime.storage.sessions[1]["config"].chat_model_config.model == "qwen-navigation"
+    assert [spawn["session_id"] for spawn in chat_run_registry.spawns] == [
+        "web-1__navigation-data-agent"
     ]
+    await chat_run_registry.drain()
+    run = runtime.app.state.chat_service.runs[-1]
+    assert run["session_id"] == "web-1__navigation-data-agent"
+    assert run["agent_id"] == "navigation-data-agent"
+    assert _message_text(run["message"]) == "处理 20270605 的室外数据"
 
 
 @pytest.mark.asyncio
@@ -1047,6 +1101,27 @@ async def test_forward_events_until_idle_persists_same_final_text_across_forward
     assert [(message.role, message.content) for message in detail.messages] == [
         ("assistant", "处理完成"),
         ("assistant", "处理完成"),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_forward_events_until_idle_continues_after_active_agentscope_session_switch(tmp_path: Path) -> None:
+    store = WebSessionStore(tmp_path / "sessions.sqlite")
+    runtime = SwitchingEventingAgentScopeRuntime()
+    manager = AgentScopeWebSessionManager(store=store, runtime=runtime)
+    session = await manager.create_session("处理 20270605")
+
+    await manager.forward_events_until_idle(session.id)
+
+    assert runtime.subscriptions == [
+        (session.id, ("main-router-agent", "main-session")),
+        (session.id, ("navigation-data-agent", "navigation-session")),
+    ]
+    detail = store.get_session(session.id)
+    assert detail is not None
+    assert [(message.role, message.content) for message in detail.messages] == [
+        ("assistant", "我来交给导航处理"),
+        ("assistant", "开始检查导航数据"),
     ]
 
 

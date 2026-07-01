@@ -75,16 +75,33 @@ class AgentScopeWebSessionManager:
         if subscribe_events is None:
             return
 
-        persisted_final_texts: set[str] = set()
-        async for event in subscribe_events(web_session_id=session_id):
-            if self._event_callback is not None:
-                callback_result = self._event_callback(session_id, event)
-                if inspect.isawaitable(callback_result):
-                    await callback_result
-            text = _final_event_text(event)
-            if text is not None and text not in persisted_final_texts:
-                self._store.append_message(session_id, role="assistant", content=text)
-                persisted_final_texts.add(text)
+        seen_subscription_keys: set[object] = set()
+        while True:
+            before_key = self._runtime_subscription_key(session_id)
+            if before_key in seen_subscription_keys:
+                return
+            seen_subscription_keys.add(before_key)
+
+            persisted_final_texts: set[str] = set()
+            async for event in subscribe_events(web_session_id=session_id):
+                if self._event_callback is not None:
+                    callback_result = self._event_callback(session_id, event)
+                    if inspect.isawaitable(callback_result):
+                        await callback_result
+                text = _final_event_text(event)
+                if text is not None and text not in persisted_final_texts:
+                    self._store.append_message(session_id, role="assistant", content=text)
+                    persisted_final_texts.add(text)
+
+            after_key = self._runtime_subscription_key(session_id)
+            if after_key == before_key:
+                return
+
+    def _runtime_subscription_key(self, session_id: str) -> object:
+        subscription_key = getattr(self._runtime, "web_session_subscription_key", None)
+        if not callable(subscription_key):
+            return None
+        return subscription_key(web_session_id=session_id)
 
 
 def _final_event_text(event: dict[str, Any]) -> str | None:

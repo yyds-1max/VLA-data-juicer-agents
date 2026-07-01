@@ -13,12 +13,13 @@ from agentscope.app.message_bus import RedisMessageBus
 from agentscope.app.storage import ChatModelConfig, RedisStorage, SessionConfig
 from agentscope.app.workspace_manager import LocalWorkspaceManager
 from agentscope.event import ExternalExecutionResultEvent
-from agentscope.message import ToolCallState, ToolResultBlock, ToolResultState, UserMsg
+from agentscope.message import TextBlock, ToolCallState, ToolResultBlock, ToolResultState, UserMsg
+from agentscope.permission import PermissionBehavior, PermissionDecision
+from agentscope.tool import ToolBase, ToolChunk
 
 from vla_data_juicer_agents.adapters.agentscope import AgentScopeEventAdapter
 from vla_data_juicer_agents.core.events import CallbackEventSink, EventEmitter
 from vla_data_juicer_agents.navigation.agent_tools import build_navigation_agent_tools
-from vla_data_juicer_agents.navigation.routing import is_high_confidence_navigation_request
 from vla_data_juicer_agents.runtime.agentscope_bootstrap import bootstrap_agentscope_records
 from vla_data_juicer_agents.runtime.agentscope_config import AgentScopeRuntimeConfig
 
@@ -55,6 +56,9 @@ class AgentScopeRuntime:
     def set_web_session_store(self, store: Any) -> None:
         self.web_session_store = store
 
+    def web_session_subscription_key(self, *, web_session_id: str) -> tuple[str, str] | None:
+        return self._web_session_mapping(web_session_id)
+
     async def ensure_web_session(self, web_session_id: str, *, agent_id: str, model: str) -> str:
         existing = self.web_sessions.get(web_session_id)
         if existing and existing[0] == agent_id:
@@ -89,15 +93,36 @@ class AgentScopeRuntime:
     async def submit_user_message(self, *, web_session_id: str, message: str) -> str:
         await self.ensure_bootstrapped()
 
+        agent_id = self.config.main_router_agent_id
+        model = self.config.router_model
+        await self._start_agent_run(
+            web_session_id=web_session_id,
+            agent_id=agent_id,
+            model=model,
+            message=message,
+        )
+        return f"turn_{uuid4()}"
+
+    async def start_navigation_agent_task(self, *, web_session_id: str, message: str) -> str:
+        await self.ensure_bootstrapped()
+
+        session_id = await self._start_agent_run(
+            web_session_id=web_session_id,
+            agent_id=self.config.navigation_agent_id,
+            model=self.config.navigation_model,
+            message=message,
+        )
+        return session_id
+
+    async def _start_agent_run(
+        self,
+        *,
+        web_session_id: str,
+        agent_id: str,
+        model: str,
+        message: str,
+    ) -> str:
         chat_service = self.app.state.chat_service
-
-        if is_high_confidence_navigation_request(message):
-            agent_id = self.config.navigation_agent_id
-            model = self.config.navigation_model
-        else:
-            agent_id = self.config.main_router_agent_id
-            model = self.config.router_model
-
         session_id = await self.ensure_web_session(
             web_session_id,
             agent_id=agent_id,
@@ -113,7 +138,7 @@ class AgentScopeRuntime:
         self._spawn_chat_run(run_coroutine, session_id=session_id)
         if tail_cursor is not None:
             self._remember_event_cursor(session_id, tail_cursor)
-        return f"turn_{uuid4()}"
+        return session_id
 
     async def submit_human_decision(self, *, web_session_id: str, decision: dict[str, Any]) -> bool:
         mapped = self._web_session_mapping(web_session_id)
@@ -635,11 +660,85 @@ def _stream_id_parts(entry_id: str) -> tuple[int, int] | None:
         return None
 
 
-def build_extra_agent_tools_factory(config: AgentScopeRuntimeConfig):
+def _web_session_id_from_agentscope_session(session_id: str, *, agent_id: str) -> str:
+    suffix = f"__{agent_id}"
+    if session_id.endswith(suffix):
+        return session_id[: -len(suffix)]
+    return session_id
+
+
+class NavigationHandoffTool(ToolBase):
+    name = "start_navigation_data_task"
+    description = (
+        "Start the dedicated VLA navigation data processing agent after you "
+        "have determined that the user wants to begin a concrete navigation "
+        "data task. Do not use this for capability questions or ordinary "
+        "conversation."
+    )
+    input_schema = {
+        "type": "object",
+        "properties": {
+            "request": {
+                "type": "string",
+                "description": "The user's concrete navigation task request with relevant context.",
+            },
+        },
+        "required": ["request"],
+        "additionalProperties": False,
+    }
+    is_concurrency_safe = False
+    is_read_only = False
+    is_external_tool = False
+
+    def __init__(self, *, runtime: AgentScopeRuntime, web_session_id: str) -> None:
+        self._runtime = runtime
+        self._web_session_id = web_session_id
+
+    async def check_permissions(
+        self,
+        tool_input: dict[str, Any],
+        context: object,
+    ) -> PermissionDecision:
+        return PermissionDecision(
+            behavior=PermissionBehavior.ALLOW,
+            message="Navigation handoff is allowed.",
+        )
+
+    async def __call__(self, request: str) -> ToolChunk:
+        await self._runtime.start_navigation_agent_task(
+            web_session_id=self._web_session_id,
+            message=request,
+        )
+        return ToolChunk(
+            content=[
+                TextBlock(
+                    text="Navigation data task started.",
+                ),
+            ],
+            state=ToolResultState.SUCCESS,
+        )
+
+
+def build_extra_agent_tools_factory(
+    config: AgentScopeRuntimeConfig,
+    *,
+    runtime: AgentScopeRuntime | None = None,
+):
     async def extra_agent_tools(_user_id: str, agent_id: str, _session_id: str) -> list[Any]:
-        if agent_id != config.navigation_agent_id:
-            return []
-        return build_navigation_agent_tools(dry_run=False)
+        if agent_id == config.navigation_agent_id:
+            return build_navigation_agent_tools(dry_run=False)
+        if agent_id == config.main_router_agent_id and runtime is not None:
+            web_session_id = _web_session_id_from_agentscope_session(
+                _session_id,
+                agent_id=config.main_router_agent_id,
+            )
+            return [
+                NavigationHandoffTool(
+                    runtime=runtime,
+                    web_session_id=web_session_id,
+                )
+            ]
+        return []
 
     return extra_agent_tools
 
@@ -651,18 +750,30 @@ def create_agentscope_runtime(config: AgentScopeRuntimeConfig) -> AgentScopeRunt
     workspace_manager = LocalWorkspaceManager(
         basedir=str(config.workspace_root / "agentscope-workspaces"),
     )
+    runtime_holder: dict[str, AgentScopeRuntime] = {}
+
+    async def extra_agent_tools(user_id: str, agent_id: str, session_id: str) -> list[Any]:
+        runtime = runtime_holder.get("runtime")
+        return await build_extra_agent_tools_factory(config, runtime=runtime)(
+            user_id,
+            agent_id,
+            session_id,
+        )
+
     app = agentscope.app.create_app(
         storage=storage,
         message_bus=message_bus,
         workspace_manager=workspace_manager,
-        extra_agent_tools=build_extra_agent_tools_factory(config),
+        extra_agent_tools=extra_agent_tools,
         title="DataPilot AgentScope Runtime",
     )
 
-    return AgentScopeRuntime(
+    runtime = AgentScopeRuntime(
         config=config,
         storage=storage,
         message_bus=message_bus,
         workspace_manager=workspace_manager,
         app=app,
     )
+    runtime_holder["runtime"] = runtime
+    return runtime
