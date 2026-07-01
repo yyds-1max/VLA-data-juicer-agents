@@ -9,6 +9,7 @@ import pytest
 from vla_data_juicer_agents.core.cancellation import CancellationContext, TurnCancelled
 from vla_data_juicer_agents.core.events import CallbackEventSink, EventEmitter
 from vla_data_juicer_agents.core.tool import ToolContext, get_tool_spec, list_tool_specs
+from vla_data_juicer_agents.core.tool.registry import register_legacy_vla_workflow_tools
 from vla_data_juicer_agents.capabilities.session.orchestrator import VLASessionAgent
 from vla_data_juicer_agents.capabilities.session.runtime import SessionState, SessionToolRuntime
 from vla_data_juicer_agents.capabilities.session.toolkit import _tool_context, get_session_tool_specs
@@ -23,55 +24,32 @@ from vla_data_juicer_agents.tools.vla.run_workflow import (
 )
 
 
-def test_tool_registry_exposes_vla_workflow_tool():
+def test_legacy_tool_registry_explicitly_exposes_vla_workflow_tools():
+    register_legacy_vla_workflow_tools()
+    register_legacy_vla_workflow_tools()
     names = [spec.name for spec in list_tool_specs()]
 
     assert "vla_run_workflow" in names
     assert get_tool_spec("vla_run_workflow").effects == "execute"
-
-
-def test_session_runtime_exposes_pending_workflow_context():
-    state = SessionState()
-    state.pending_workflow_run_dir = "/tmp/run"
-    state.pending_workflow_status = "waiting_for_user_confirmation"
-    state.pending_workflow_input_type = "calibration_confirmation"
-    runtime = SessionToolRuntime(state=state)
-
-    assert runtime.context_payload()["pending_workflow"] == {
-        "run_dir": "/tmp/run",
-        "status": "waiting_for_user_confirmation",
-        "input_type": "calibration_confirmation",
-    }
-
-
-def test_tool_registry_exposes_continue_workflow_tool():
-    names = [spec.name for spec in list_tool_specs()]
-
-    assert "vla_run_workflow" in names
     assert "vla_continue_workflow" in names
     assert get_tool_spec("vla_continue_workflow").effects == "execute"
 
 
-def test_session_toolkit_prioritizes_vla_workflow_tool():
+def test_session_runtime_omits_pending_workflow_context():
+    state = SessionState()
+    runtime = SessionToolRuntime(state=state)
+
+    assert not hasattr(state, "pending_workflow_run_dir")
+    assert "pending_workflow" not in runtime.context_payload()
+
+
+def test_web_session_toolkit_excludes_old_vla_workflow_control_tools():
+    register_legacy_vla_workflow_tools()
     specs = get_session_tool_specs()
     names = [spec.name for spec in specs]
 
-    assert names[0] == "vla_run_workflow"
-
-
-def test_session_toolkit_exposes_vla_workflow_input_schema():
-    agent = VLASessionAgent(use_llm_router=False)
-    toolkit = agent._build_toolkit()
-
-    schemas = asyncio.run(toolkit.get_tool_schemas())
-    workflow_schema = next(schema for schema in schemas if schema["function"]["name"] == "vla_run_workflow")
-    properties = workflow_schema["function"]["parameters"]["properties"]
-
-    assert "date" in properties
-    assert "segments" in properties
-    assert "dry_run" in properties
-    assert "approve" in properties
-    assert "response_language" in properties
+    assert "vla_run_workflow" not in names
+    assert "vla_continue_workflow" not in names
 
 
 def test_navigation_execution_tools_include_calibration_confirmation_tool():
@@ -87,20 +65,19 @@ def test_executor_instructions_use_generic_step_to_tool_mapping_for_calibration_
     assert "When executing confirm_navigation_calibration_params" in EXECUTOR_AGENT_INSTRUCTIONS
 
 
-def test_session_prompt_routes_complex_vla_requests_to_workflow():
+def test_session_prompt_warns_against_legacy_workflow_control_tools():
     agent = VLASessionAgent(use_llm_router=False)
     prompt = agent.session_system_prompt()
 
-    assert "call vla_run_workflow exactly once" in prompt
     assert "Navigation planning uses sensor bindings and processing_profile" in prompt
     assert "Fixed platform names are hints, not hard execution categories" in prompt
-    assert "response_language" in prompt
-    assert "Set vla_run_workflow.response_language to the user's language" in prompt
-    assert "If session_context.pending_workflow exists" in prompt
-    assert "继续上次任务" in prompt
-    assert "vla_continue_workflow exactly once" in prompt
-    assert "do not call vla_run_workflow" in prompt
-    assert "Never scan old run directories" in prompt
+    assert (
+        "Navigation data processing is handled by the dedicated web NavigationDataAgent. "
+        "Do not call legacy workflow-control tools from this session agent."
+    ) in prompt
+    assert "vla_run_workflow" not in prompt
+    assert "vla_continue_workflow" not in prompt
+    assert "pending_workflow" not in prompt
     assert "Do not use deterministic Python keyword routing" in prompt
     assert "Respond in the same language as the user" in prompt
 
@@ -152,9 +129,9 @@ def test_session_agent_builds_real_agentscope_agent(monkeypatch):
 
     assert isinstance(built, FakeAgent)
     assert seen["name"] == "VLASessionAgent"
-    assert "vla_run_workflow" in seen["system_prompt"]
+    assert "Do not call legacy workflow-control tools" in seen["system_prompt"]
     assert seen["model"].__class__ is FakeModel
-    assert asyncio.run(seen["toolkit"].get_tool("vla_run_workflow")) is not None
+    assert asyncio.run(seen["toolkit"].get_tool("vla_run_workflow")) is None
 
 
 def test_session_handle_message_uses_llm_agent_not_keyword_router(monkeypatch):

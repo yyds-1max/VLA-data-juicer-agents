@@ -14,6 +14,7 @@ _GROUP_PRIORITY = {
     "vla": 10,
     "workflow": 20,
 }
+_WEB_SESSION_EXCLUDED_TOOL_NAMES = {"vla_run_workflow", "vla_continue_workflow"}
 
 
 def _tool_context(runtime: SessionToolRuntime) -> ToolContext:
@@ -33,14 +34,14 @@ def _tool_context(runtime: SessionToolRuntime) -> ToolContext:
     )
 
 
-def _sort_key(spec: ToolSpec) -> tuple[int, int, str]:
+def _sort_key(spec: ToolSpec) -> tuple[int, str]:
     priority = min((_GROUP_PRIORITY.get(tag, 999) for tag in spec.tags), default=999)
-    name_priority = 0 if spec.name == "vla_run_workflow" else 1
-    return priority, name_priority, spec.name
+    return priority, spec.name
 
 
 def get_session_tool_specs() -> list[ToolSpec]:
-    return sorted(list_tool_specs(), key=_sort_key)
+    specs = [spec for spec in list_tool_specs() if spec.name not in _WEB_SESSION_EXCLUDED_TOOL_NAMES]
+    return sorted(specs, key=_sort_key)
 
 
 def build_session_toolkit(runtime: SessionToolRuntime) -> Toolkit:

@@ -21,10 +21,14 @@ def _ensure_default_tools() -> None:
     if _DEFAULTS_LOADED:
         return
     _DEFAULTS_LOADED = True
+
+
+def register_legacy_vla_workflow_tools() -> None:
     from vla_data_juicer_agents.tools.vla.run_workflow import VLA_CONTINUE_WORKFLOW, VLA_RUN_WORKFLOW
 
-    register_tool_spec(VLA_RUN_WORKFLOW)
-    register_tool_spec(VLA_CONTINUE_WORKFLOW)
+    for spec in (VLA_RUN_WORKFLOW, VLA_CONTINUE_WORKFLOW):
+        if spec.name not in _REGISTRY:
+            register_tool_spec(spec)
 
 
 def list_tool_specs() -> list[ToolSpec]:
