@@ -95,6 +95,34 @@ def test_human_decision_confirm_drains_agentscope_events(tmp_path) -> None:
     ]
 
 
+def test_human_decision_guide_preserves_structured_text_payload(tmp_path) -> None:
+    runtime = FakeAgentScopeRuntime()
+    client = _client(tmp_path, runtime)
+    session_id = _create_session(client)
+
+    response = client.post(
+        f"/api/sessions/{session_id}/human-decisions",
+        json={
+            "action": "guide",
+            "request_id": "camera-1",
+            "tool_call_id": "tool-1",
+            "reply_id": "reply-1",
+            "text": "请改用另一组外参",
+        },
+    )
+
+    assert response.status_code == 200
+    assert response.json() == {"accepted": True}
+    assert runtime.decisions[0][0] == session_id
+    assert runtime.decisions[0][1] == {
+        "action": "guide",
+        "request_id": "camera-1",
+        "tool_call_id": "tool-1",
+        "reply_id": "reply-1",
+        "text": "请改用另一组外参",
+    }
+
+
 def test_human_decision_guide_requires_text(tmp_path) -> None:
     runtime = FakeAgentScopeRuntime()
     client = _client(tmp_path, runtime)
