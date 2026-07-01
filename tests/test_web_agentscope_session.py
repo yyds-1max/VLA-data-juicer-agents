@@ -7,6 +7,7 @@ import pytest
 from agentscope.event import ExternalExecutionResultEvent
 from agentscope.message import Msg, ToolCallBlock, ToolCallState, ToolResultState
 
+from vla_data_juicer_agents.core.cancellation import CancellationContext, current_cancellation
 from vla_data_juicer_agents.navigation.routing import is_high_confidence_navigation_request
 from vla_data_juicer_agents.runtime.agentscope_config import AgentScopeRuntimeConfig
 from vla_data_juicer_agents.runtime.agentscope_runtime import AgentScopeRuntime
@@ -136,6 +137,7 @@ class FakeAgentScopeMessageBus:
         self.read_sessions: list[str] = []
         self.read_since: list[str | None] = []
         self.subscribe_keys: list[str] = []
+        self.cancelled_sessions: list[str] = []
 
     async def session_read_events(self, session_id: str, since=None):
         self.read_sessions.append(session_id)
@@ -163,6 +165,9 @@ class FakeAgentScopeMessageBus:
         if self.running_states:
             return self.running_states.pop(0)
         return False
+
+    async def session_publish_cancel(self, session_id: str) -> None:
+        self.cancelled_sessions.append(session_id)
 
 
 class FakeAgentScopeStorage:
@@ -194,8 +199,10 @@ class FakeAgentScopeStorage:
 class FakeChatService:
     def __init__(self) -> None:
         self.runs = []
+        self.seen_cancellations = []
 
     async def run(self, *, user_id, session_id, agent_id, input_msg):
+        self.seen_cancellations.append(current_cancellation())
         self.runs.append(
             {
                 "user_id": user_id,
@@ -526,6 +533,63 @@ async def test_runtime_submit_user_message_requires_chat_run_registry() -> None:
 
 
 @pytest.mark.asyncio
+async def test_runtime_interrupt_web_session_returns_false_without_mapping() -> None:
+    message_bus = FakeAgentScopeMessageBus()
+    runtime = _runtime(chat_run_registry=FakeChatRunRegistry(), message_bus=message_bus)
+
+    interrupted = await runtime.interrupt_web_session(web_session_id="web-1")
+
+    assert interrupted is False
+    assert message_bus.cancelled_sessions == []
+
+
+@pytest.mark.asyncio
+async def test_runtime_interrupt_web_session_publishes_agentscope_cancel() -> None:
+    message_bus = FakeAgentScopeMessageBus()
+    runtime = _runtime(chat_run_registry=FakeChatRunRegistry(), message_bus=message_bus)
+    runtime.web_sessions["web-1"] = ("main-router-agent", "as-session-1")
+
+    interrupted = await runtime.interrupt_web_session(web_session_id="web-1")
+
+    assert interrupted is True
+    assert message_bus.cancelled_sessions == ["as-session-1"]
+    assert runtime.web_sessions["web-1"] == ("main-router-agent", "as-session-1")
+
+
+@pytest.mark.asyncio
+async def test_runtime_interrupt_web_session_cancels_registered_context() -> None:
+    message_bus = FakeAgentScopeMessageBus()
+    runtime = _runtime(chat_run_registry=FakeChatRunRegistry(), message_bus=message_bus)
+    cancellation = CancellationContext()
+    runtime.web_sessions["web-1"] = ("navigation-data-agent", "as-session-1")
+    runtime.register_run_cancellation("as-session-1", cancellation)
+
+    interrupted = await runtime.interrupt_web_session(web_session_id="web-1")
+
+    assert interrupted is True
+    assert cancellation.cancelled is True
+    assert message_bus.cancelled_sessions == ["as-session-1"]
+    assert runtime.web_sessions["web-1"] == ("navigation-data-agent", "as-session-1")
+
+
+@pytest.mark.asyncio
+async def test_runtime_start_agent_run_registers_binds_and_cleans_cancellation() -> None:
+    chat_run_registry = FakeChatRunRegistry()
+    runtime = _runtime(chat_run_registry=chat_run_registry, message_bus=FakeAgentScopeMessageBus())
+
+    await runtime.submit_user_message(web_session_id="web-1", message="你好")
+
+    session_id = "web-1__main-router-agent"
+    cancellation = runtime.run_cancellation(session_id)
+    assert isinstance(cancellation, CancellationContext)
+
+    await chat_run_registry.drain()
+
+    assert runtime.run_cancellation(session_id) is None
+    assert runtime.app.state.chat_service.seen_cancellations == [cancellation]
+
+
+@pytest.mark.asyncio
 async def test_runtime_submit_user_message_duplicate_active_run_raises() -> None:
     chat_run_registry = FakeChatRunRegistry(reject_duplicate_active=True)
     runtime = _runtime(chat_run_registry=chat_run_registry)
@@ -537,6 +601,22 @@ async def test_runtime_submit_user_message_duplicate_active_run_raises() -> None
     assert len(runtime.storage.sessions) == 1
     assert len(chat_run_registry.spawns) == 1
     assert runtime.app.state.chat_service.runs == []
+    await chat_run_registry.drain()
+
+
+@pytest.mark.asyncio
+async def test_runtime_submit_user_message_duplicate_active_run_preserves_cancellation() -> None:
+    chat_run_registry = FakeChatRunRegistry(reject_duplicate_active=True)
+    runtime = _runtime(chat_run_registry=chat_run_registry, message_bus=FakeAgentScopeMessageBus())
+
+    await runtime.submit_user_message(web_session_id="web-1", message="你好")
+    session_id = "web-1__main-router-agent"
+    active_cancellation = runtime.run_cancellation(session_id)
+
+    with pytest.raises(RuntimeError, match="already active"):
+        await runtime.submit_user_message(web_session_id="web-1", message="第二条")
+
+    assert runtime.run_cancellation(session_id) is active_cancellation
     await chat_run_registry.drain()
 
 
@@ -611,6 +691,36 @@ async def test_runtime_submit_human_decision_spawns_external_execution_result_ev
         "text": "请改用另一组外参",
         "request_id": "camera-1",
     }
+
+
+@pytest.mark.asyncio
+async def test_runtime_submit_human_decision_registers_binds_and_cleans_cancellation() -> None:
+    chat_run_registry = FakeChatRunRegistry()
+    storage = FakeAgentScopeStorage()
+    storage.session_records[("alice", "navigation-data-agent", "as-session-1")] = (
+        _agentscope_session_record()
+    )
+    runtime = _runtime(storage=storage, chat_run_registry=chat_run_registry)
+    runtime.web_sessions["web-1"] = ("navigation-data-agent", "as-session-1")
+
+    accepted = await runtime.submit_human_decision(
+        web_session_id="web-1",
+        decision={
+            "action": "confirm",
+            "request_id": "request-1",
+            "tool_call_id": "tool-call-1",
+            "reply_id": "reply-1",
+        },
+    )
+
+    cancellation = runtime.run_cancellation("as-session-1")
+    assert accepted is True
+    assert isinstance(cancellation, CancellationContext)
+
+    await chat_run_registry.drain()
+
+    assert runtime.run_cancellation("as-session-1") is None
+    assert runtime.app.state.chat_service.seen_cancellations == [cancellation]
 
 
 @pytest.mark.asyncio

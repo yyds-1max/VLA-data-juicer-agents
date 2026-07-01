@@ -7,6 +7,7 @@ from typing import Any
 from agentscope.permission import PermissionBehavior, PermissionDecision
 from agentscope.tool import ToolBase
 
+from vla_data_juicer_agents.core.cancellation import CancellationContext
 from vla_data_juicer_agents.navigation.execution_tools import create_navigation_execution_tools
 
 
@@ -47,5 +48,15 @@ class HumanDecisionTool(ToolBase):
         )
 
 
-def build_navigation_agent_tools(*, dry_run: bool = False) -> list[Any]:
-    return [HumanDecisionTool(), *create_navigation_execution_tools(dry_run=dry_run)]
+def build_navigation_agent_tools(
+    *,
+    dry_run: bool = False,
+    cancellation: CancellationContext | None = None,
+) -> list[Any]:
+    return [
+        HumanDecisionTool(),
+        *create_navigation_execution_tools(
+            dry_run=dry_run,
+            cancellation=cancellation,
+        ),
+    ]

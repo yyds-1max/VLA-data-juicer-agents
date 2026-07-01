@@ -3,6 +3,8 @@ from types import SimpleNamespace
 
 from agentscope.permission import PermissionBehavior, PermissionDecision
 
+from vla_data_juicer_agents.core.cancellation import CancellationContext
+from vla_data_juicer_agents.navigation import agent_tools as agent_tools_module
 from vla_data_juicer_agents.navigation.agent_tools import (
     HumanDecisionTool,
     build_navigation_agent_tools,
@@ -61,6 +63,27 @@ def test_build_navigation_agent_tools_does_not_register_old_workflow_control_too
     assert "vla_continue_workflow" not in names
 
 
+def test_build_navigation_agent_tools_passes_cancellation_to_execution_tools(monkeypatch):
+    cancellation = CancellationContext()
+    captured = {}
+
+    def fake_create_navigation_execution_tools(*, dry_run, cancellation=None):
+        captured["dry_run"] = dry_run
+        captured["cancellation"] = cancellation
+        return []
+
+    monkeypatch.setattr(
+        agent_tools_module,
+        "create_navigation_execution_tools",
+        fake_create_navigation_execution_tools,
+    )
+
+    tools = build_navigation_agent_tools(dry_run=True, cancellation=cancellation)
+
+    assert {tool.name for tool in tools} == {"request_human_decision"}
+    assert captured == {"dry_run": True, "cancellation": cancellation}
+
+
 def test_extra_agent_tools_factory_registers_navigation_tools_only_for_navigation_agent(tmp_path):
     config = AgentScopeRuntimeConfig(
         user_id="alice",
@@ -83,6 +106,42 @@ def test_extra_agent_tools_factory_registers_navigation_tools_only_for_navigatio
     assert "vla_run_workflow" not in navigation_names
     assert "vla_continue_workflow" not in navigation_names
     assert router_tools == []
+
+
+def test_extra_agent_tools_factory_passes_runtime_cancellation_to_navigation_tools(
+    monkeypatch,
+    tmp_path,
+):
+    config = AgentScopeRuntimeConfig(
+        user_id="alice",
+        redis_url="redis://localhost:6379/0",
+        workspace_root=tmp_path,
+        dashscope_api_key="test-key",
+        dashscope_base_url=None,
+        default_model="qwen-default",
+        router_model="qwen-router",
+        navigation_model="qwen-navigation",
+    )
+    cancellation = CancellationContext()
+    captured = {}
+
+    def fake_build_navigation_agent_tools(*, dry_run, cancellation=None):
+        captured["dry_run"] = dry_run
+        captured["cancellation"] = cancellation
+        return [SimpleNamespace(name="navigation_tool")]
+
+    monkeypatch.setattr(
+        runtime_module,
+        "build_navigation_agent_tools",
+        fake_build_navigation_agent_tools,
+    )
+    runtime = SimpleNamespace(run_cancellation=lambda session_id: cancellation)
+    factory = build_extra_agent_tools_factory(config, runtime=runtime)
+
+    tools = asyncio.run(factory("alice", config.navigation_agent_id, "as-session-1"))
+
+    assert [tool.name for tool in tools] == ["navigation_tool"]
+    assert captured == {"dry_run": False, "cancellation": cancellation}
 
 
 def test_extra_agent_tools_factory_registers_router_handoff_when_runtime_available(tmp_path):

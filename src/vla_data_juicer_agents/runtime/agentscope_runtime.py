@@ -18,6 +18,7 @@ from agentscope.permission import PermissionBehavior, PermissionDecision
 from agentscope.tool import ToolBase, ToolChunk
 
 from vla_data_juicer_agents.adapters.agentscope import AgentScopeEventAdapter
+from vla_data_juicer_agents.core.cancellation import CancellationContext, bind_cancellation
 from vla_data_juicer_agents.core.events import CallbackEventSink, EventEmitter
 from vla_data_juicer_agents.navigation.agent_tools import build_navigation_agent_tools
 from vla_data_juicer_agents.runtime.agentscope_bootstrap import bootstrap_agentscope_records
@@ -38,6 +39,7 @@ class AgentScopeRuntime:
     event_cursors: dict[str, str | None] = field(default_factory=dict)
     web_session_store: Any | None = None
     _active_human_decision_claims: set[str] = field(default_factory=set)
+    _run_cancellations: dict[str, CancellationContext] = field(default_factory=dict)
     bootstrapped: bool = False
 
     def __post_init__(self) -> None:
@@ -129,16 +131,69 @@ class AgentScopeRuntime:
             model=model,
         )
         tail_cursor = await self._event_log_tail_cursor(session_id)
-        run_coroutine = chat_service.run(
-            user_id=self.config.user_id,
-            session_id=session_id,
-            agent_id=agent_id,
-            input_msg=UserMsg(name="user", content=message),
-        )
-        self._spawn_chat_run(run_coroutine, session_id=session_id)
+        cancellation = CancellationContext()
+        previous_cancellation = self.run_cancellation(session_id)
+        self.register_run_cancellation(session_id, cancellation)
+
+        async def run_with_cancellation() -> None:
+            try:
+                async with cancellation.track_agent(session_id):
+                    with bind_cancellation(cancellation):
+                        await chat_service.run(
+                            user_id=self.config.user_id,
+                            session_id=session_id,
+                            agent_id=agent_id,
+                            input_msg=UserMsg(name="user", content=message),
+                        )
+            finally:
+                self.clear_run_cancellation(session_id, cancellation)
+
+        try:
+            self._spawn_chat_run(run_with_cancellation(), session_id=session_id)
+        except Exception:
+            if previous_cancellation is not None:
+                self.register_run_cancellation(session_id, previous_cancellation)
+            else:
+                self.clear_run_cancellation(session_id, cancellation)
+            raise
         if tail_cursor is not None:
             self._remember_event_cursor(session_id, tail_cursor)
         return session_id
+
+    async def interrupt_web_session(self, *, web_session_id: str) -> bool:
+        mapped = self._web_session_mapping(web_session_id)
+        if mapped is None:
+            return False
+
+        _agent_id, agentscope_session_id = mapped
+        interrupted = False
+        cancellation = self.run_cancellation(agentscope_session_id)
+        if cancellation is not None:
+            interrupted = cancellation.cancel() or interrupted
+
+        publish_cancel = getattr(self.message_bus, "session_publish_cancel", None)
+        if callable(publish_cancel):
+            await publish_cancel(agentscope_session_id)
+            interrupted = True
+        return interrupted
+
+    def register_run_cancellation(
+        self,
+        agentscope_session_id: str,
+        cancellation: CancellationContext,
+    ) -> None:
+        self._run_cancellations[agentscope_session_id] = cancellation
+
+    def run_cancellation(self, agentscope_session_id: str) -> CancellationContext | None:
+        return self._run_cancellations.get(agentscope_session_id)
+
+    def clear_run_cancellation(
+        self,
+        agentscope_session_id: str,
+        cancellation: CancellationContext,
+    ) -> None:
+        if self._run_cancellations.get(agentscope_session_id) is cancellation:
+            self._run_cancellations.pop(agentscope_session_id, None)
 
     async def submit_human_decision(self, *, web_session_id: str, decision: dict[str, Any]) -> bool:
         mapped = self._web_session_mapping(web_session_id)
@@ -177,20 +232,36 @@ class AgentScopeRuntime:
                 reply_id=decision["reply_id"],
                 execution_results=[result],
             )
+            cancellation = CancellationContext()
+            previous_cancellation = self.run_cancellation(agentscope_session_id)
+            self.register_run_cancellation(agentscope_session_id, cancellation)
 
             async def run_with_claim() -> None:
                 try:
-                    await self.app.state.chat_service.run(
-                        user_id=self.config.user_id,
-                        session_id=agentscope_session_id,
-                        agent_id=agent_id,
-                        input_msg=input_msg,
-                    )
+                    async with cancellation.track_agent(agentscope_session_id):
+                        with bind_cancellation(cancellation):
+                            await self.app.state.chat_service.run(
+                                user_id=self.config.user_id,
+                                session_id=agentscope_session_id,
+                                agent_id=agent_id,
+                                input_msg=input_msg,
+                            )
                 finally:
+                    self.clear_run_cancellation(agentscope_session_id, cancellation)
                     await claim.release()
 
             run_coroutine = run_with_claim()
-            self._spawn_chat_run(run_coroutine, session_id=agentscope_session_id)
+            try:
+                self._spawn_chat_run(run_coroutine, session_id=agentscope_session_id)
+            except Exception:
+                if previous_cancellation is not None:
+                    self.register_run_cancellation(
+                        agentscope_session_id,
+                        previous_cancellation,
+                    )
+                else:
+                    self.clear_run_cancellation(agentscope_session_id, cancellation)
+                raise
             claim_handoff = True
             return True
         finally:
@@ -726,7 +797,15 @@ def build_extra_agent_tools_factory(
 ):
     async def extra_agent_tools(_user_id: str, agent_id: str, _session_id: str) -> list[Any]:
         if agent_id == config.navigation_agent_id:
-            return build_navigation_agent_tools(dry_run=False)
+            cancellation = (
+                runtime.run_cancellation(_session_id)
+                if runtime is not None and hasattr(runtime, "run_cancellation")
+                else None
+            )
+            return build_navigation_agent_tools(
+                dry_run=False,
+                cancellation=cancellation,
+            )
         if agent_id == config.main_router_agent_id and runtime is not None:
             web_session_id = _web_session_id_from_agentscope_session(
                 _session_id,
