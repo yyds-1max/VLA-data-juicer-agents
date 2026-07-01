@@ -279,30 +279,22 @@ def test_close_active_tools_is_idempotent():
     ]
 
 
-def test_agent_lifecycle_is_emitted_once_across_confirmation_rounds():
+def test_run_agent_stream_does_not_auto_confirm_user_confirmation_events():
     scope, events = _scope_and_events()
 
     class ConfirmingAgent:
-        def __init__(self):
-            self.calls = 0
-
         async def reply_stream(self, _message):
-            self.calls += 1
-            if self.calls == 1:
-                yield RequireUserConfirmEvent(
-                    reply_id="reply-1",
-                    tool_calls=[ToolCallBlock(id="call-1", name="inspect", input="{}")],
-                )
-                return
-            yield SimpleNamespace(type="TEXT_BLOCK_DELTA", delta="finished")
+            yield RequireUserConfirmEvent(
+                reply_id="reply-1",
+                tool_calls=[ToolCallBlock(id="call-1", name="inspect", input="{}")],
+            )
 
-    output = asyncio.run(_run_agent_stream(ConfirmingAgent(), "prompt", event_scope=scope))
+    with pytest.raises(RuntimeError, match="requires user confirmation"):
+        asyncio.run(_run_agent_stream(ConfirmingAgent(), "prompt", event_scope=scope))
 
-    assert output == "finished"
     assert [(event["type"], event["payload"]) for event in events] == [
         ("agent_start", {}),
-        ("assistant_delta", {"delta": "finished"}),
-        ("agent_end", {"status": "completed"}),
+        ("agent_end", {"status": "failed"}),
     ]
 
 

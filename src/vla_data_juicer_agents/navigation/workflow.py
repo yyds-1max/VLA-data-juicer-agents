@@ -5,7 +5,6 @@ from contextlib import AsyncExitStack
 from pathlib import Path
 from typing import Any, Literal
 
-from agentscope.event import ConfirmResult, UserConfirmResultEvent
 from agentscope.message import UserMsg
 from pydantic import ValidationError
 
@@ -30,7 +29,6 @@ from vla_data_juicer_agents.navigation.catalog import (
 )
 
 
-MAX_AGENT_TOOL_CONFIRMATION_ROUNDS = 30
 PUBLIC_PROGRESS_PROMPT = (
     "Before each tool call, emit exactly one public progress update line in this format: "
     "Progress: <one or two concise, action-oriented sentences stating an established fact and the next action>. "
@@ -414,15 +412,6 @@ def _event_tool_result_delta(event: object) -> str:
     return delta if isinstance(delta, str) else str(delta)
 
 
-def _confirmation_results(event: object) -> list[ConfirmResult]:
-    if _event_type(event) != "REQUIRE_USER_CONFIRM":
-        return []
-    return [
-        ConfirmResult(confirmed=True, tool_call=tool_call)
-        for tool_call in getattr(event, "tool_calls", [])
-    ]
-
-
 async def _run_agent_stream(
     agent,
     prompt: str,
@@ -445,41 +434,33 @@ async def _run_agent_stream(
         async with AsyncExitStack() as stack:
             if active_cancellation is not None:
                 await stack.enter_async_context(active_cancellation.track_agent(agent))
-            for _ in range(MAX_AGENT_TOOL_CONFIRMATION_ROUNDS):
-                if active_cancellation is not None:
-                    active_cancellation.raise_if_cancelled()
-                confirm_results: list[ConfirmResult] = []
-                reply_id: str | None = None
-                async for event in agent.reply_stream(next_input):
-                    event_type = _event_type(event)
-                    if event_type != "TEXT_BLOCK_DELTA":
-                        progress_filter.flush_progress_only()
-                    adapter.accept(event)
-                    rendered_delta = progress_filter.consume_text_delta(_event_text_delta(event))
-                    if rendered_delta:
-                        scope.emit("assistant_delta", delta=rendered_delta)
-                    output_chunks.append(rendered_delta)
-                    tool_output_chunks.append(_event_tool_result_delta(event))
-                    if event_type == "REQUIRE_USER_CONFIRM":
-                        reply_id = getattr(event, "reply_id", None)
-                        confirm_results.extend(_confirmation_results(event))
-                if active_cancellation is not None:
-                    active_cancellation.raise_if_cancelled()
-                if not confirm_results:
-                    adapter.close_active_tools("completed")
-                    flushed_delta = progress_filter.flush()
-                    if flushed_delta:
-                        scope.emit("assistant_delta", delta=flushed_delta)
-                    output_chunks.append(flushed_delta)
-                    scope.emit("agent_end", status="completed")
-                    return "".join(output_chunks) or "".join(tool_output_chunks)
-                if reply_id is None:
-                    raise RuntimeError("AgentScope requested tool confirmation without a reply id.")
-                next_input = UserConfirmResultEvent(reply_id=reply_id, confirm_results=confirm_results)
-        raise RuntimeError(
-            "AgentScope tool confirmation loop exceeded "
-            f"{MAX_AGENT_TOOL_CONFIRMATION_ROUNDS} iterations."
-        )
+            if active_cancellation is not None:
+                active_cancellation.raise_if_cancelled()
+            async for event in agent.reply_stream(next_input):
+                event_type = _event_type(event)
+                if event_type != "TEXT_BLOCK_DELTA":
+                    progress_filter.flush_progress_only()
+                adapter.accept(event)
+                rendered_delta = progress_filter.consume_text_delta(_event_text_delta(event))
+                if rendered_delta:
+                    scope.emit("assistant_delta", delta=rendered_delta)
+                output_chunks.append(rendered_delta)
+                tool_output_chunks.append(_event_tool_result_delta(event))
+                if event_type == "REQUIRE_USER_CONFIRM":
+                    adapter.close_active_tools("failed")
+                    raise RuntimeError(
+                        "AgentScope tool call requires user confirmation; "
+                        "web navigation must use durable human-decision events."
+                    )
+            if active_cancellation is not None:
+                active_cancellation.raise_if_cancelled()
+            adapter.close_active_tools("completed")
+            flushed_delta = progress_filter.flush()
+            if flushed_delta:
+                scope.emit("assistant_delta", delta=flushed_delta)
+            output_chunks.append(flushed_delta)
+            scope.emit("agent_end", status="completed")
+            return "".join(output_chunks) or "".join(tool_output_chunks)
     except TurnCancelled:
         adapter.close_active_tools("interrupted")
         scope.emit("agent_end", status="interrupted")
