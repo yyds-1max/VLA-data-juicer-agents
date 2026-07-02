@@ -11,7 +11,10 @@ from vla_data_juicer_agents.navigation.agent_tools import (
     HumanDecisionTool,
     build_navigation_agent_tools,
 )
-from vla_data_juicer_agents.navigation.plan_draft_store import InMemoryNavigationPlanDraftStore
+from vla_data_juicer_agents.navigation.plan_draft_store import (
+    InMemoryNavigationPlanDraftStore,
+    JsonNavigationPlanDraftStore,
+)
 from vla_data_juicer_agents.runtime import agentscope_runtime as runtime_module
 from vla_data_juicer_agents.runtime.agentscope_config import AgentScopeRuntimeConfig
 from vla_data_juicer_agents.runtime.agentscope_runtime import (
@@ -266,6 +269,144 @@ def test_extra_agent_tools_factory_passes_session_bound_draft_store(tmp_path):
     assert result["ok"] is True
     assert result["draft"]["date"] == "20270605"
     assert (tmp_path / "navigation-plan-drafts").exists()
+
+
+def test_navigation_agent_tools_can_resume_finalized_plan_from_store(tmp_path):
+    config = AgentScopeRuntimeConfig(
+        user_id="alice",
+        redis_url="redis://localhost:6379/0",
+        workspace_root=tmp_path,
+        dashscope_api_key="test-key",
+        dashscope_base_url=None,
+        default_model="qwen-default",
+        router_model="qwen-router",
+        navigation_model="qwen-navigation",
+    )
+    factory = build_extra_agent_tools_factory(config)
+
+    first_tools = {
+        tool.name: tool
+        for tool in asyncio.run(factory("alice", config.navigation_agent_id, "session-1"))
+    }
+    _decode_tool_payload(
+        asyncio.run(
+            first_tools["get_workflow_plan_draft_tool"](
+                date="20270605",
+                scene_mode="out",
+            )
+        )
+    )
+    patch = {
+        "processing_profile": {
+            "id": "parameterized_navigation_v1",
+            "platform_hint": "go2w",
+            "topic_params": {
+                "profile_hint": "go2w",
+                "confidence": 1.0,
+                "topic_whitelist": [
+                    "/cam_video4/csi_cam/image_raw/compressed",
+                    "/rs32_lidar_points",
+                    "/sport_odom",
+                ],
+                "topic_map": {
+                    "cam_video4": "fisheye_front",
+                    "rs32_lidar_points": "r32_rslidar_points",
+                    "sport_odom": "odom",
+                },
+                "query_dir": "rs32_lidar_points",
+                "evidence": ["infer_navigation_topic_params_tool"],
+                "warnings": [],
+                "blocking_issues": [],
+            },
+            "localization_policy": {"source": "odom", "conversion": "odom_to_ins"},
+            "gridmap_policy": {"source": "existing_gridmap"},
+            "calibration_policy": {
+                "mode": "hardcoded_with_user_confirmation",
+                "requires_user_confirmation": True,
+            },
+            "warnings": [],
+            "blocking_issues": [],
+            "evidence": {"processing_profile": ["infer_navigation_processing_profile_tool"]},
+        },
+        "platform_hint": "go2w",
+        "topic_params": {
+            "profile_hint": "go2w",
+            "confidence": 1.0,
+            "topic_whitelist": [
+                "/cam_video4/csi_cam/image_raw/compressed",
+                "/rs32_lidar_points",
+                "/sport_odom",
+            ],
+            "topic_map": {
+                "cam_video4": "fisheye_front",
+                "rs32_lidar_points": "r32_rslidar_points",
+                "sport_odom": "odom",
+            },
+            "query_dir": "rs32_lidar_points",
+            "evidence": ["infer_navigation_topic_params_tool"],
+            "warnings": [],
+            "blocking_issues": [],
+        },
+        "localization_policy": {"source": "odom", "conversion": "odom_to_ins"},
+        "gridmap_source": "existing_gridmap",
+        "pcd_gridmap_tool_available": True,
+        "stage_variants": {
+            "extract_and_sync_navigation_data": {
+                "variant": "go2w_like",
+                "reason": "processing profile inferred go2w platform bindings",
+                "evidence": ["infer_navigation_processing_profile_tool"],
+            },
+            "prepare_gridmap_for_projection": {
+                "variant": "copy_existing_gridmap",
+                "reason": "grid_map artifacts already exist",
+                "evidence": ["inspect_gridmap_artifacts_tool"],
+            },
+            "run_projection_and_trajectory": {
+                "variant": "cjl_0525_with_gridmap",
+                "reason": "go2w platform uses the 0525 projection script",
+                "evidence": ["inspect_runtime_assets_tool"],
+            },
+        },
+    }
+    _decode_tool_payload(
+        asyncio.run(
+            first_tools["update_workflow_plan_draft_tool"](
+                data_profile_patch=patch,
+                observation_id="navigation_processing_profile",
+                used_tool="infer_navigation_processing_profile_tool",
+            )
+        )
+    )
+    finalized = _decode_tool_payload(
+        asyncio.run(first_tools["finalize_workflow_plan_tool"]())
+    )
+    second_tools = {
+        tool.name: tool
+        for tool in asyncio.run(factory("alice", config.navigation_agent_id, "session-1"))
+    }
+    resumed = _decode_tool_payload(
+        asyncio.run(second_tools["get_workflow_plan_draft_tool"]())
+    )
+    persisted_state = JsonNavigationPlanDraftStore(
+        tmp_path / "navigation-plan-drafts"
+    ).load("session-1")
+
+    assert finalized["ok"] is True
+    assert finalized["workflow_plan_json"]["date"] == "20270605"
+    assert resumed["draft"]["ready_to_finish"] is True
+    assert resumed["draft"]["data_profile_draft"]["localization_policy"] == {
+        "source": "odom",
+        "conversion": "odom_to_ins",
+    }
+    assert resumed["draft"]["data_profile"] is not None
+    assert resumed["draft"]["data_profile"]["date"] == "20270605"
+    assert persisted_state is not None
+    assert persisted_state.finalized_plan is not None
+    assert persisted_state.finalized_plan.date == "20270605"
+    assert (
+        persisted_state.finalized_plan.steps[0].step_id
+        == "confirm_navigation_calibration_params"
+    )
 
 
 def test_extra_agent_tools_factory_registers_router_handoff_when_runtime_available(tmp_path):
