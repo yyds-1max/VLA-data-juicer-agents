@@ -10,6 +10,7 @@ from vla_data_juicer_agents.navigation.agent_tools import (
     HumanDecisionTool,
     build_navigation_agent_tools,
 )
+from vla_data_juicer_agents.navigation.plan_draft_store import InMemoryNavigationPlanDraftStore
 from vla_data_juicer_agents.runtime import agentscope_runtime as runtime_module
 from vla_data_juicer_agents.runtime.agentscope_config import AgentScopeRuntimeConfig
 from vla_data_juicer_agents.runtime.agentscope_runtime import (
@@ -63,16 +64,46 @@ def test_human_decision_tool_allows_permissions():
     assert decision.behavior is PermissionBehavior.ALLOW
 
 
-def test_build_navigation_agent_tools_includes_human_decision_and_existing_processing_tools():
-    names = {tool.name for tool in build_navigation_agent_tools(dry_run=True)}
+def test_build_navigation_agent_tools_includes_planning_human_decision_and_processing_tools():
+    names = {
+        tool.name
+        for tool in build_navigation_agent_tools(
+            dry_run=True,
+            session_id="agent-session-1",
+            draft_store=InMemoryNavigationPlanDraftStore(),
+        )
+    }
 
     assert {
         "request_human_decision",
+        "inspect_raw_date_tool",
+        "infer_navigation_sensor_bindings_tool",
+        "infer_navigation_processing_profile_tool",
+        "infer_navigation_topic_params_tool",
+        "inspect_processing_state_tool",
+        "inspect_gridmap_artifacts_tool",
+        "inspect_runtime_assets_tool",
+        "list_navigation_tool_capabilities_tool",
+        "get_workflow_plan_draft_tool",
+        "update_workflow_plan_draft_tool",
+        "finalize_workflow_plan_tool",
         "prepare_raw_data_tool",
         "extract_and_sync_navigation_data_tool",
+        "run_noobscene_preprocessing_tool",
         "run_initial_annotation_gui_tool",
         "run_tracking_tool",
     }.issubset(names)
+
+
+def test_build_navigation_agent_tools_omits_draft_tools_without_session_store():
+    names = {tool.name for tool in build_navigation_agent_tools(dry_run=True)}
+
+    assert "request_human_decision" in names
+    assert "prepare_raw_data_tool" in names
+    assert "inspect_raw_date_tool" in names
+    assert "infer_navigation_processing_profile_tool" in names
+    assert "get_workflow_plan_draft_tool" not in names
+    assert "finalize_workflow_plan_tool" not in names
 
 
 def test_build_navigation_agent_tools_does_not_register_old_workflow_control_tools():
@@ -99,7 +130,17 @@ def test_build_navigation_agent_tools_passes_cancellation_to_execution_tools(mon
 
     tools = build_navigation_agent_tools(dry_run=True, cancellation=cancellation)
 
-    assert {tool.name for tool in tools} == {"request_human_decision"}
+    assert {tool.name for tool in tools} == {
+        "request_human_decision",
+        "inspect_raw_date_tool",
+        "infer_navigation_sensor_bindings_tool",
+        "infer_navigation_processing_profile_tool",
+        "infer_navigation_topic_params_tool",
+        "inspect_processing_state_tool",
+        "inspect_gridmap_artifacts_tool",
+        "inspect_runtime_assets_tool",
+        "list_navigation_tool_capabilities_tool",
+    }
     assert captured == {"dry_run": True, "cancellation": cancellation}
 
 
