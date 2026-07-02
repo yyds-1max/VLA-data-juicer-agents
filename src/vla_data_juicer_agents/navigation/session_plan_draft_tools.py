@@ -87,7 +87,7 @@ def build_session_plan_draft_tools(
         FunctionTool(
             get_workflow_plan_draft_tool,
             name="get_workflow_plan_draft_tool",
-            is_read_only=True,
+            is_read_only=False,
         ),
         FunctionTool(
             update_workflow_plan_draft_tool,
@@ -97,7 +97,7 @@ def build_session_plan_draft_tools(
         FunctionTool(
             finalize_workflow_plan_tool,
             name="finalize_workflow_plan_tool",
-            is_read_only=True,
+            is_read_only=False,
         ),
     ]
 

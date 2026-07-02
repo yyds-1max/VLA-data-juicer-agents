@@ -34,6 +34,89 @@ def _tools(store, session_id="agent-session-1"):
     }
 
 
+def _complete_profile_patch():
+    topic_params = {
+        "profile_hint": "go2w_like",
+        "confidence": 1.0,
+        "topic_whitelist": [
+            "/cam_video4/csi_cam/image_raw/compressed",
+            "/rs32_lidar_points",
+            "/sport_odom",
+        ],
+        "topic_map": {
+            "cam_video4": "fisheye_front",
+            "rs32_lidar_points": "r32_rslidar_points",
+            "sport_odom": "odom",
+        },
+        "query_dir": "rs32_lidar_points",
+        "evidence": ["infer_navigation_topic_params_tool"],
+        "warnings": [],
+        "blocking_issues": [],
+    }
+    localization_policy = {"source": "odom", "conversion": "odom_to_ins"}
+    gridmap_policy = {"source": "existing_gridmap"}
+    calibration_policy = {
+        "mode": "hardcoded_with_user_confirmation",
+        "requires_user_confirmation": True,
+    }
+    stage_variants = {
+        "extract_and_sync_navigation_data": {
+            "variant": "go2w_like",
+            "reason": "processing profile inferred go2w platform bindings",
+            "evidence": ["infer_navigation_processing_profile_tool"],
+        },
+        "prepare_gridmap_for_projection": {
+            "variant": "copy_existing_gridmap",
+            "reason": "grid_map artifacts already exist",
+            "evidence": ["inspect_gridmap_artifacts_tool"],
+        },
+        "run_projection_and_trajectory": {
+            "variant": "cjl_0525_with_gridmap",
+            "reason": "go2w platform uses the 0525 projection script",
+            "evidence": ["inspect_runtime_assets_tool"],
+        },
+    }
+    return {
+        "processing_profile": {
+            "id": "parameterized_navigation_v1",
+            "platform_hint": "go2w",
+            "topic_params": topic_params,
+            "localization_policy": localization_policy,
+            "gridmap_policy": gridmap_policy,
+            "calibration_policy": calibration_policy,
+            "warnings": [],
+            "blocking_issues": [],
+            "evidence": {
+                "processing_profile": ["infer_navigation_processing_profile_tool"],
+                "topic_params": ["infer_navigation_topic_params_tool"],
+            },
+        },
+        "platform_hint": "go2w",
+        "topic_params": topic_params,
+        "localization_policy": localization_policy,
+        "gridmap_source": "existing_gridmap",
+        "pcd_gridmap_tool_available": True,
+        "stage_variants": stage_variants,
+        "warnings": [],
+        "blocking_issues": [],
+        "evidence": {
+            "processing_profile": ["infer_navigation_processing_profile_tool"],
+            "topic_params": ["infer_navigation_topic_params_tool"],
+            "gridmap_artifacts": ["inspect_gridmap_artifacts_tool"],
+            "runtime_assets_or_tool_capabilities": ["inspect_runtime_assets_tool"],
+        },
+    }
+
+
+def test_session_draft_tools_are_marked_mutating():
+    store = InMemoryNavigationPlanDraftStore()
+    tools = _tools(store)
+
+    assert tools["get_workflow_plan_draft_tool"].is_read_only is False
+    assert tools["update_workflow_plan_draft_tool"].is_read_only is False
+    assert tools["finalize_workflow_plan_tool"].is_read_only is False
+
+
 def test_get_draft_initializes_and_persists_request():
     store = InMemoryNavigationPlanDraftStore()
     tools = _tools(store)
@@ -105,3 +188,28 @@ def test_finalize_returns_structured_error_when_draft_is_incomplete():
     assert result["error_type"] == "workflow_plan_draft_incomplete"
     assert "processing_profile" in result["missing_fields"]
     assert "next_tool_candidates" in result
+
+
+def test_finalize_success_persists_finalized_plan_for_same_session():
+    store = InMemoryNavigationPlanDraftStore()
+    tools = _tools(store)
+    _invoke_tool(
+        tools["get_workflow_plan_draft_tool"],
+        {"date": "20270605", "scene_mode": "out", "segments": ["clip-a"]},
+    )
+    _invoke_tool(
+        tools["update_workflow_plan_draft_tool"],
+        {
+            "data_profile_patch": _complete_profile_patch(),
+            "observation_id": "navigation_processing_profile",
+            "used_tool": "infer_navigation_processing_profile_tool",
+        },
+    )
+
+    result = _invoke_tool(tools["finalize_workflow_plan_tool"], {})
+    persisted_state = store.load("agent-session-1")
+
+    assert result["ok"] is True
+    assert "workflow_plan_json" in result
+    assert persisted_state.finalized_plan is not None
+    assert persisted_state.finalized_plan.steps[0].step_id == "confirm_navigation_calibration_params"
