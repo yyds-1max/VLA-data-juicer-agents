@@ -432,7 +432,8 @@ class AgentScopeRuntime:
 
             while True:
                 running = bool(await self.message_bus.session_is_running(agentscope_session_id))
-                saw_running = saw_running or running
+                local_running = self._is_local_agent_run_active(agentscope_session_id)
+                saw_running = saw_running or running or local_running
 
                 try:
                     raw_event = await asyncio.wait_for(
@@ -464,7 +465,7 @@ class AgentScopeRuntime:
                     continue
 
                 now = asyncio.get_running_loop().time()
-                if running:
+                if running or local_running:
                     continue
                 if saw_reply_end:
                     break
@@ -476,6 +477,16 @@ class AgentScopeRuntime:
             feeder_task.cancel()
             with suppress(asyncio.CancelledError):
                 await feeder_task
+
+    def _is_local_agent_run_active(self, agentscope_session_id: str) -> bool:
+        if self.run_cancellation(agentscope_session_id) is not None:
+            return True
+        registry = getattr(self.app.state, "chat_run_registry", None)
+        get_task = getattr(registry, "get", None)
+        if not callable(get_task):
+            return False
+        task = get_task(agentscope_session_id)
+        return bool(task is not None and not task.done())
 
     def _is_new_event(self, agentscope_session_id: str, entry_id: str) -> bool:
         cursor = self._event_cursor(agentscope_session_id)

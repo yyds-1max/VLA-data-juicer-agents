@@ -6,10 +6,14 @@ from types import SimpleNamespace
 import pytest
 from agentscope.event import ExternalExecutionResultEvent
 from agentscope.message import Msg, ToolCallBlock, ToolCallState, ToolResultState
+from agentscope.permission import PermissionBehavior, PermissionContext
 
 from vla_data_juicer_agents.core.cancellation import CancellationContext, current_cancellation
+from vla_data_juicer_agents.navigation.agent_tools import build_navigation_agent_tools
+from vla_data_juicer_agents.navigation.plan_draft_store import JsonNavigationPlanDraftStore
 from vla_data_juicer_agents.navigation.routing import is_high_confidence_navigation_request
 from vla_data_juicer_agents.runtime.agentscope_config import AgentScopeRuntimeConfig
+import vla_data_juicer_agents.runtime.agentscope_runtime as agentscope_runtime_module
 from vla_data_juicer_agents.runtime.agentscope_runtime import AgentScopeRuntime
 from vla_data_juicer_agents.web.agent_session import AgentScopeWebSessionManager
 from vla_data_juicer_agents.web.schemas import HumanDecisionRequest, SessionRecord
@@ -170,6 +174,25 @@ class FakeAgentScopeMessageBus:
         self.cancelled_sessions.append(session_id)
 
 
+class DelayedLiveEventMessageBus(FakeAgentScopeMessageBus):
+    def __init__(
+        self,
+        *,
+        live_delay: float,
+        running_states: list[bool] | None = None,
+    ) -> None:
+        super().__init__(running_states=running_states)
+        self.live_delay = live_delay
+
+    async def subscribe(self, key: str, *, on_ready=None):
+        self.subscribe_keys.append(key)
+        if on_ready is not None:
+            on_ready()
+        await asyncio.sleep(self.live_delay)
+        yield {"type": "TEXT_BLOCK_DELTA", "delta": "迟到事件", "_entry_id": "1-0"}
+        yield {"type": "REPLY_END", "_entry_id": "2-0"}
+
+
 class FakeAgentScopeStorage:
     def __init__(self) -> None:
         self.sessions = []
@@ -312,6 +335,24 @@ def test_navigation_rule_fallback_is_narrow_and_explicit() -> None:
     assert not is_high_confidence_navigation_request("bug tracking")
     assert not is_high_confidence_navigation_request("database projection")
     assert not is_high_confidence_navigation_request("annotate this chart")
+
+
+@pytest.mark.asyncio
+async def test_navigation_agent_internal_tools_are_auto_allowed(tmp_path: Path) -> None:
+    tools = build_navigation_agent_tools(
+        dry_run=True,
+        session_id="as-session-1",
+        draft_store=JsonNavigationPlanDraftStore(tmp_path / "drafts"),
+    )
+
+    for tool in tools:
+        if tool.name == "request_human_decision":
+            assert tool.is_external_tool is True
+            continue
+
+        decision = await tool.check_permissions({}, PermissionContext())
+
+        assert decision.behavior == PermissionBehavior.ALLOW, tool.name
 
 
 @pytest.mark.asyncio
@@ -959,6 +1000,31 @@ async def test_runtime_subscribe_web_session_events_replays_dedupes_and_finishes
     assert [(event["type"], event["payload"]) for event in events] == [
         ("assistant_delta", {"delta": "处理"}),
         ("final", {"text": "处理"}),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_runtime_subscribe_web_session_events_waits_for_delayed_first_event(
+    monkeypatch,
+) -> None:
+    monkeypatch.setattr(agentscope_runtime_module, "_EVENT_STARTUP_GRACE_SECS", 0.01)
+    message_bus = DelayedLiveEventMessageBus(
+        live_delay=0.03,
+        running_states=[False, False, False, False],
+    )
+    runtime = _runtime(message_bus=message_bus)
+    runtime.web_sessions["web-1"] = ("navigation-data-agent", "as-session-1")
+    cancellation = CancellationContext()
+    runtime.register_run_cancellation("as-session-1", cancellation)
+
+    events = [
+        event
+        async for event in runtime.subscribe_web_session_events(web_session_id="web-1")
+    ]
+
+    assert [(event["type"], event["payload"]) for event in events] == [
+        ("assistant_delta", {"delta": "迟到事件"}),
+        ("final", {"text": "迟到事件"}),
     ]
 
 

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import inspect
 from typing import Any
 
 from agentscope.permission import PermissionBehavior, PermissionDecision
@@ -62,6 +63,56 @@ class HumanDecisionTool(ToolBase):
         )
 
 
+class _TrustedNavigationTool(ToolBase):
+    """Allow project-owned navigation tools to run without AgentScope prompts."""
+
+    def __init__(self, tool: Any) -> None:
+        self._tool = tool
+        self.name = tool.name
+        self.description = tool.description
+        self.input_schema = tool.input_schema
+        self.is_concurrency_safe = tool.is_concurrency_safe
+        self.is_read_only = tool.is_read_only
+        self.is_external_tool = tool.is_external_tool
+        self.is_state_injected = getattr(tool, "is_state_injected", False)
+        self.is_mcp = getattr(tool, "is_mcp", False)
+        self.mcp_name = getattr(tool, "mcp_name", None)
+
+    async def check_permissions(
+        self,
+        tool_input: dict[str, Any],
+        context: object,
+    ) -> PermissionDecision:
+        return PermissionDecision(
+            behavior=PermissionBehavior.ALLOW,
+            message=f"Navigation internal tool {self.name} is allowed.",
+        )
+
+    async def check_read_only(self, tool_input: dict[str, Any]) -> bool:
+        return bool(await self._tool.check_read_only(tool_input))
+
+    def match_rule(self, rule_content: str | None, tool_input: dict[str, Any]) -> bool:
+        return bool(self._tool.match_rule(rule_content, tool_input))
+
+    def generate_suggestions(self, tool_input: dict[str, Any]):
+        return self._tool.generate_suggestions(tool_input)
+
+    async def __call__(self, *args: Any, **kwargs: Any):
+        result = self._tool(*args, **kwargs)
+        if inspect.isawaitable(result):
+            return await result
+        return result
+
+
+def _trust_internal_navigation_tools(tools: list[Any]) -> list[Any]:
+    return [
+        tool
+        if getattr(tool, "is_external_tool", False)
+        else _TrustedNavigationTool(tool)
+        for tool in tools
+    ]
+
+
 def build_navigation_agent_tools(
     *,
     dry_run: bool = False,
@@ -85,7 +136,7 @@ def build_navigation_agent_tools(
             store=draft_store,
             session_id=session_id,
         )
-    return [
+    return _trust_internal_navigation_tools([
         HumanDecisionTool(),
         *planning_tools,
         *draft_tools,
@@ -93,4 +144,4 @@ def build_navigation_agent_tools(
             dry_run=dry_run,
             cancellation=cancellation,
         ),
-    ]
+    ])
