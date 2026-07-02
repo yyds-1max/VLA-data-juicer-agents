@@ -93,6 +93,153 @@ class NavigationPlanDraftStore:
 
 The production implementation must serialize through Pydantic `model_dump(mode="json")` and restore through `WorkflowPlanDraftState.model_validate(...)` so schema drift fails loudly in tests.
 
+## Business Planning Chain To Preserve
+
+The old Plan-Agent business value is the structured planning chain, not the fact that it was a separate agent. `NavigationDataAgent` must preserve the same chain inside the new single-agent AgentScope session.
+
+### Required Planning Facts
+
+The session draft must collect these facts before finalization:
+
+1. Request facts
+   - `date`
+   - `segments`
+   - `scene_mode`
+   - `dry_run`
+
+2. Raw metadata facts
+   - selected raw segments
+   - `metadata.yaml` paths
+   - topic names
+   - message types
+   - message counts
+   - metadata parse errors
+
+   The current `main` implementation exposes this capability as `inspect_raw_date_tool`. The earlier processing-profile redesign spec called the same role `inspect_navigation_topics_tool`. The implementation may keep the current tool name, add a thin alias, or document the alias, but the capability must remain present.
+
+3. Topic parameter facts
+   - `topic_whitelist`
+   - `topic_map`
+   - `query_dir`
+   - `profile_hint`
+   - topic-parameter confidence
+   - blocking issues when the topic set is missing, ambiguous, or unreadable
+
+   These values must come from metadata-derived tool results, not from model invention or hardcoded date-specific rules. `query_dir` must remain the source directory name used before topic remapping.
+
+4. Sensor binding facts
+   - `fisheye_front`
+   - `lidar`
+   - `odom`
+   - `ins`
+   - `localization`
+   - message type for each bound topic
+   - missing or ambiguous role blocking issues
+
+5. Processing profile facts
+   - `processing_profile.id`
+   - `platform_hint`
+   - nested `topic_params`
+   - `localization_policy`
+   - `gridmap_policy`
+   - `calibration_policy`
+   - warnings
+   - blocking issues
+   - evidence
+
+   `platform_hint` is only a hint for defaults and variant selectors. It must not bring back `dataset_profile` as the primary planning path.
+
+6. Existing output and gridmap facts
+   - raw temp state
+   - clip `sync_data` state
+   - finish temp state
+   - final output state
+   - existing gridmap paths
+   - whether projection input is already ready
+   - `gridmap_source`, one of `existing_gridmap`, `generated_from_pcd`, `projection_ready`, or `unknown`
+
+7. Runtime capability facts
+   - whether the PCD gridmap generator exists
+   - whether the manual annotation GUI exists
+   - available projection script variants
+   - navigation tool capability catalog
+
+8. Stage variant facts
+   - `extract_and_sync_navigation_data`
+   - `prepare_gridmap_for_projection`
+   - `run_projection_and_trajectory`
+
+   Each stage variant must include a selected variant, a reason, and evidence. Variants must be selected from the capability catalog and must match `NavigationDataProfile` selector facts.
+
+### Required Draft Update Loop
+
+The agent must not build a complete plan in one model step. It should follow the old ReAct planning loop:
+
+1. Read `get_workflow_plan_draft_tool`.
+2. Inspect one missing fact with one read-only tool.
+3. Merge only newly observed facts with `update_workflow_plan_draft_tool`.
+4. Include `observation_id` and `used_tool` in each update.
+5. Re-read the draft status and continue from `missing_fields` and `next_tool_candidates`.
+
+The historical observation sequence to preserve is:
+
+1. `navigation_sensor_bindings`
+2. `navigation_processing_profile`
+3. `navigation_topic_params` when topic params are not already complete in the processing profile
+4. `gridmap_artifacts`
+5. `runtime_assets_or_tool_capabilities`
+
+The exact tool names can evolve, but the observation categories and draft fields must remain covered.
+
+### Draft Completion Gates
+
+The draft cannot finalize until all of these are true:
+
+- `scene_mode` is `in` or `out`
+- `processing_profile.id` is present
+- `processing_profile.blocking_issues` is empty
+- top-level `topic_params` is present
+- `topic_params.blocking_issues` is empty
+- `localization_policy` is present
+- top-level `blocking_issues` is empty
+- stage variants exist for:
+  - `extract_and_sync_navigation_data`
+  - `prepare_gridmap_for_projection`
+  - `run_projection_and_trajectory`
+
+If any gate fails, `finalize_workflow_plan_tool` must return a structured error with missing fields and next tool candidates, and the agent must not call execution tools.
+
+### Final Plan Shape
+
+Finalization must use the existing deterministic plan construction and validation path. The resulting plan must preserve the old mature execution chain:
+
+1. `confirm_navigation_calibration_params`
+2. `prepare_raw_data`
+3. `extract_and_sync_navigation_data`
+4. `assemble_finish_temp`
+5. `run_noobscene_preprocessing`
+6. `run_initial_annotation_gui`
+7. `run_tracking`
+8. `prepare_gridmap_for_projection`, unless the data profile says projection input is already ready and the selected variant is `skip_if_projection_ready`
+9. `run_projection_and_trajectory`
+10. `validate_navigation_outputs`
+
+The plan must carry important inferred arguments:
+
+- `extract_and_sync_navigation_data` receives `topic_whitelist`, `topic_map`, `query_dir`, `processing_profile`, and `platform_hint`.
+- `run_noobscene_preprocessing` receives `localization_source` and `localization_conversion`.
+- `prepare_gridmap_for_projection` receives the chosen gridmap variant when a gridmap step is needed.
+- projection receives the chosen projection variant through the `WorkflowStep.variant` field.
+
+The finalized plan must pass `validate_workflow_plan`, including:
+
+- all tool names exist in the capability catalog,
+- selected variants are available,
+- variant selectors match data profile facts,
+- preconditions form an acyclic graph,
+- calibration confirmation is the first step before any processing,
+- gridmap preparation runs after tracking and before projection.
+
 ## Planning Flow
 
 1. `NavigationDataAgent` receives a structured handoff containing request, target, scene mode, clips, and language.
@@ -194,11 +341,13 @@ Add focused tests before implementation:
    - `update_workflow_plan_draft_tool` persists partial `NavigationDataProfile` patches.
    - Completed observations and used tools are preserved.
    - Missing fields and next tool candidates update as expected.
+   - Raw metadata, topic params, sensor bindings, processing profile, gridmap facts, runtime capabilities, and stage variants can be merged in separate observations without losing previous draft fields.
 
 4. Finalization gates
    - Finalization fails while `missing_fields` is non-empty.
    - Finalization fails when `processing_profile.blocking_issues` or `topic_params.blocking_issues` are present.
    - Finalization succeeds for a complete profile and returns a `WorkflowPlan` that passes `validate_workflow_plan`.
+   - The finalized plan includes inferred `topic_whitelist`, `topic_map`, `query_dir`, localization arguments, gridmap variant, projection variant, and the expected mature execution step order.
 
 5. Resume behavior
    - A simulated interrupted planning session resumes by reading the existing draft.
@@ -221,4 +370,3 @@ Add focused tests before implementation:
 - Human decisions and interrupt/resume continue to use AgentScope external execution events.
 - Legacy workflow resume remains disabled.
 - Tests cover planning persistence and finalization behavior directly, not only prompt strings.
-
