@@ -832,10 +832,8 @@ def test_request_bound_plan_agent_instructions_require_calibration_before_prepar
 
     assert "Guidance excerpt:" in plan_agent.instructions
     assert "Always include confirm_navigation_calibration_params before assemble_finish_temp" not in plan_agent.instructions
-    assert (
-        "confirm_navigation_calibration_params must be the first WorkflowPlan step before "
-        "prepare_raw_data and before any processing"
-    ) in plan_agent.instructions
+    assert "calibration confirmation gate is the first finalized WorkflowPlan step" in plan_agent.instructions
+    assert "before `prepare_raw_data` and before any processing step" in plan_agent.instructions
     assert (
         "confirm_navigation_calibration_params` must run after `extract_and_sync_navigation_data`"
         not in plan_agent.instructions
