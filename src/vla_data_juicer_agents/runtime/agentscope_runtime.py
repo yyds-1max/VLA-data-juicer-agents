@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import re
 from contextlib import suppress
 from dataclasses import dataclass, field
 from types import SimpleNamespace
@@ -22,6 +23,7 @@ from vla_data_juicer_agents.adapters.agentscope import AgentScopeEventAdapter
 from vla_data_juicer_agents.core.cancellation import CancellationContext, bind_cancellation
 from vla_data_juicer_agents.core.events import CallbackEventSink, EventEmitter
 from vla_data_juicer_agents.navigation.agent_tools import build_navigation_agent_tools
+from vla_data_juicer_agents.navigation.plan_draft_store import JsonNavigationPlanDraftStore
 from vla_data_juicer_agents.runtime.agentscope_bootstrap import bootstrap_agentscope_records
 from vla_data_juicer_agents.runtime.agentscope_config import AgentScopeRuntimeConfig
 
@@ -751,6 +753,20 @@ def _handoff_error(message: str, payload: dict[str, Any]) -> ToolChunk:
     )
 
 
+def _navigation_scene_mode_for_request(scene_mode: str) -> str | None:
+    return {"indoor": "in", "outdoor": "out"}.get(scene_mode)
+
+
+def _date_from_navigation_target(target: str) -> str | None:
+    stripped = target.strip()
+    if re.fullmatch(r"[0-9]{8}", stripped):
+        return stripped
+    match = re.search(r"(?<![0-9])([0-9]{8})(?![0-9])", stripped)
+    if match is None:
+        return None
+    return match.group(1)
+
+
 def _navigation_handoff_message(
     *,
     request: str,
@@ -762,6 +778,20 @@ def _navigation_handoff_message(
 ) -> str:
     clip_text = ", ".join(clips) if clips else "all"
     language = _resolve_response_language(response_language, request)
+    payload = {
+        "request": request,
+        "target": target,
+        "date": _date_from_navigation_target(target),
+        "scene_mode": _navigation_scene_mode_for_request(scene_mode),
+        "clips": clips,
+        "segments": clips or None,
+        "reason": reason,
+        "response_language": language,
+    }
+    structured_lines = [
+        "Structured handoff JSON:",
+        json.dumps(payload, ensure_ascii=False),
+    ]
     if language == "Chinese":
         return "\n".join(
             [
@@ -773,6 +803,7 @@ def _navigation_handoff_message(
                 f"- 转交原因: {reason}",
                 f"- 回复语言: {language}",
                 "请始终使用中文回复用户。",
+                *structured_lines,
             ]
         )
     return "\n".join(
@@ -785,6 +816,7 @@ def _navigation_handoff_message(
             f"- reason: {reason}",
             f"- response_language: {language}",
             f"Always respond to the user in {language}.",
+            *structured_lines,
         ]
     )
 
@@ -969,6 +1001,8 @@ def build_extra_agent_tools_factory(
     *,
     runtime: AgentScopeRuntime | None = None,
 ):
+    draft_store = JsonNavigationPlanDraftStore(config.workspace_root / "navigation-plan-drafts")
+
     async def extra_agent_tools(_user_id: str, agent_id: str, _session_id: str) -> list[Any]:
         if agent_id == config.navigation_agent_id:
             cancellation = (
@@ -979,6 +1013,8 @@ def build_extra_agent_tools_factory(
             return build_navigation_agent_tools(
                 dry_run=False,
                 cancellation=cancellation,
+                session_id=_session_id,
+                draft_store=draft_store,
             )
         if agent_id == config.main_router_agent_id and runtime is not None:
             web_session_id = _web_session_id_from_agentscope_session(

@@ -1,4 +1,5 @@
 import asyncio
+import json
 from types import SimpleNamespace
 
 from agentscope.permission import PermissionBehavior, PermissionDecision
@@ -35,6 +36,26 @@ class FakeNavigationHandoffRuntime:
 
 def _text(chunk) -> str:
     return chunk.content[0].text
+
+
+def _decode_tool_payload(payload):
+    if isinstance(payload, dict):
+        return payload
+    if isinstance(payload, str):
+        return json.loads(payload)
+    if hasattr(payload, "content"):
+        return _decode_tool_payload(payload.content)
+    if hasattr(payload, "model_dump"):
+        return payload.model_dump(mode="json")
+    if isinstance(payload, (list, tuple)):
+        texts = [
+            block.text
+            for block in payload
+            if hasattr(block, "text") and isinstance(block.text, str)
+        ]
+        if texts:
+            return _decode_tool_payload("".join(texts))
+    return payload
 
 
 def test_human_decision_tool_declares_external_read_only_schema():
@@ -185,9 +206,17 @@ def test_extra_agent_tools_factory_passes_runtime_cancellation_to_navigation_too
     cancellation = CancellationContext()
     captured = {}
 
-    def fake_build_navigation_agent_tools(*, dry_run, cancellation=None):
+    def fake_build_navigation_agent_tools(
+        *,
+        dry_run,
+        cancellation=None,
+        session_id=None,
+        draft_store=None,
+    ):
         captured["dry_run"] = dry_run
         captured["cancellation"] = cancellation
+        captured["session_id"] = session_id
+        captured["draft_store"] = draft_store
         return [SimpleNamespace(name="navigation_tool")]
 
     monkeypatch.setattr(
@@ -201,7 +230,42 @@ def test_extra_agent_tools_factory_passes_runtime_cancellation_to_navigation_too
     tools = asyncio.run(factory("alice", config.navigation_agent_id, "as-session-1"))
 
     assert [tool.name for tool in tools] == ["navigation_tool"]
-    assert captured == {"dry_run": False, "cancellation": cancellation}
+    assert captured["dry_run"] is False
+    assert captured["cancellation"] is cancellation
+    assert captured["session_id"] == "as-session-1"
+    assert captured["draft_store"].root == tmp_path / "navigation-plan-drafts"
+
+
+def test_extra_agent_tools_factory_passes_session_bound_draft_store(tmp_path):
+    config = AgentScopeRuntimeConfig(
+        user_id="alice",
+        redis_url="redis://localhost:6379/0",
+        workspace_root=tmp_path,
+        dashscope_api_key="test-key",
+        dashscope_base_url=None,
+        default_model="qwen-default",
+        router_model="qwen-router",
+        navigation_model="qwen-navigation",
+    )
+    factory = build_extra_agent_tools_factory(config)
+
+    tools = {
+        tool.name: tool
+        for tool in asyncio.run(factory("alice", config.navigation_agent_id, "session-1"))
+    }
+
+    assert "get_workflow_plan_draft_tool" in tools
+    result = _decode_tool_payload(
+        asyncio.run(
+            tools["get_workflow_plan_draft_tool"](
+                date="20270605",
+                scene_mode="out",
+            )
+        )
+    )
+    assert result["ok"] is True
+    assert result["draft"]["date"] == "20270605"
+    assert (tmp_path / "navigation-plan-drafts").exists()
 
 
 def test_extra_agent_tools_factory_registers_router_handoff_when_runtime_available(tmp_path):
@@ -349,6 +413,31 @@ def test_navigation_handoff_tool_starts_navigation_with_structured_context():
     assert "转交原因: 用户给出了日期和室外场景并要求处理导航数据" in message
     assert "回复语言: Chinese" in message
     assert "请始终使用中文回复用户。" in message
+
+
+def test_navigation_handoff_message_includes_structured_json_for_draft_initialization():
+    message = runtime_module._navigation_handoff_message(
+        request="处理 20270605 的导航数据",
+        target="20270605",
+        scene_mode="outdoor",
+        clips=["20260605_152856"],
+        reason="用户要处理导航数据",
+        response_language="Chinese",
+    )
+
+    json_text = message.split("Structured handoff JSON:", 1)[1].strip()
+    payload = json.loads(json_text)
+
+    assert payload == {
+        "request": "处理 20270605 的导航数据",
+        "target": "20270605",
+        "date": "20270605",
+        "scene_mode": "out",
+        "clips": ["20260605_152856"],
+        "segments": ["20260605_152856"],
+        "reason": "用户要处理导航数据",
+        "response_language": "Chinese",
+    }
 
 
 def test_navigation_handoff_tool_records_observability_payload():
