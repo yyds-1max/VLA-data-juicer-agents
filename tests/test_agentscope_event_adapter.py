@@ -218,6 +218,39 @@ def test_require_external_execution_emits_human_decision_required():
     ]
 
 
+def test_confirm_calibration_external_execution_emits_human_decision_required():
+    scope, events = _scope_and_events()
+    adapter = AgentScopeEventAdapter(scope)
+
+    adapter.accept(
+        RequireExternalExecutionEvent(
+            reply_id="reply-1",
+            tool_calls=[
+                ToolCallBlock(
+                    id="confirm-1",
+                    name="confirm_navigation_calibration_params_tool",
+                    input=json.dumps(
+                        {
+                            "date": "20270605",
+                            "segments": ["20260605_152856"],
+                            "platform_hint": "go2w",
+                        }
+                    ),
+                )
+            ],
+        )
+    )
+
+    assert len(events) == 1
+    payload = events[0]["payload"]
+    assert payload["reply_id"] == "reply-1"
+    assert payload["tool_call_id"] == "confirm-1"
+    assert payload["decision_type"] == "camera_params"
+    assert payload["request_id"] == "confirm_navigation_calibration_params:20270605"
+    assert "20270605" in payload["summary"]
+    assert "go2w" in payload["summary"]
+
+
 @pytest.mark.parametrize(
     ("state", "status"),
     [("error", "failed"), ("denied", "failed"), ("interrupted", "interrupted")],

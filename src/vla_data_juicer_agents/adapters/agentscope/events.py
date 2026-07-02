@@ -15,6 +15,10 @@ _PROGRESS_MARKER_RE = re.compile(
     r"^\s*(?:Progress|进度|思考摘要|思考)\s*[:：]\s*(?P<summary>.+?)\s*$",
     flags=re.IGNORECASE | re.DOTALL,
 )
+_HUMAN_DECISION_TOOL_NAMES = {
+    "request_human_decision",
+    "confirm_navigation_calibration_params_tool",
+}
 
 
 def _event_type(event: object) -> str:
@@ -195,16 +199,18 @@ class AgentScopeEventAdapter:
     def _handle_require_external_execution(self, event: object) -> None:
         reply_id = _text(getattr(event, "reply_id", ""))
         for tool_call in getattr(event, "tool_calls", []) or []:
-            if _text(getattr(tool_call, "name", "")) != "request_human_decision":
+            tool_name = _text(getattr(tool_call, "name", ""))
+            if tool_name not in _HUMAN_DECISION_TOOL_NAMES:
                 continue
             tool_input = _external_tool_input(getattr(tool_call, "input", {}))
+            payload = _human_decision_payload(tool_name, tool_input)
             self._scope.emit(
                 "human_decision_required",
                 reply_id=reply_id,
                 tool_call_id=_text(getattr(tool_call, "id", "")),
-                decision_type=_text(tool_input.get("decision_type")) or "other",
-                request_id=_text(tool_input.get("request_id")),
-                summary=_text(tool_input.get("summary")),
+                decision_type=payload["decision_type"],
+                request_id=payload["request_id"],
+                summary=payload["summary"],
             )
 
 
@@ -299,3 +305,40 @@ def _external_tool_input(value: object) -> dict[str, Any]:
             return {}
         return payload if isinstance(payload, dict) else {}
     return {}
+
+
+def _human_decision_payload(tool_name: str, tool_input: dict[str, Any]) -> dict[str, str]:
+    if tool_name == "confirm_navigation_calibration_params_tool":
+        return _calibration_confirmation_payload(tool_input)
+    decision_type = tool_input.get("decision_type")
+    if not isinstance(decision_type, str) or not decision_type:
+        decision_type = "other"
+    request_id = tool_input.get("request_id")
+    summary = tool_input.get("summary")
+    return {
+        "decision_type": decision_type,
+        "request_id": request_id if isinstance(request_id, str) else "",
+        "summary": summary if isinstance(summary, str) else "",
+    }
+
+
+def _calibration_confirmation_payload(tool_input: dict[str, Any]) -> dict[str, str]:
+    date = tool_input.get("date")
+    date_text = date if isinstance(date, str) and date else "unknown"
+    platform_hint = tool_input.get("platform_hint")
+    platform_text = platform_hint if isinstance(platform_hint, str) and platform_hint else "unknown"
+    segments = tool_input.get("segments")
+    if isinstance(segments, list) and segments:
+        segment_text = ", ".join(str(item) for item in segments)
+    elif isinstance(segments, str) and segments:
+        segment_text = segments
+    else:
+        segment_text = "all clips"
+    return {
+        "decision_type": "camera_params",
+        "request_id": f"confirm_navigation_calibration_params:{date_text}",
+        "summary": (
+            "Confirm navigation camera calibration and sensor parameters for "
+            f"{date_text} ({segment_text}); platform_hint={platform_text}."
+        ),
+    }

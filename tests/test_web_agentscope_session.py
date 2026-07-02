@@ -735,6 +735,52 @@ async def test_runtime_submit_human_decision_spawns_external_execution_result_ev
 
 
 @pytest.mark.asyncio
+async def test_runtime_submit_human_decision_resumes_external_calibration_tool() -> None:
+    chat_run_registry = FakeChatRunRegistry()
+    storage = FakeAgentScopeStorage()
+    storage.session_records[("alice", "navigation-data-agent", "as-session-1")] = (
+        _agentscope_session_record(
+            reply_id="reply-1",
+            tool_call_id="confirm-1",
+            tool_name="confirm_navigation_calibration_params_tool",
+            tool_input={
+                "date": "20270605",
+                "segments": ["20260605_152856"],
+                "platform_hint": "go2w",
+            },
+        )
+    )
+    runtime = _runtime(storage=storage, chat_run_registry=chat_run_registry)
+    runtime.web_sessions["web-1"] = ("navigation-data-agent", "as-session-1")
+
+    accepted = await runtime.submit_human_decision(
+        web_session_id="web-1",
+        decision={
+            "action": "confirm",
+            "request_id": "confirm_navigation_calibration_params:20270605",
+            "tool_call_id": "confirm-1",
+            "reply_id": "reply-1",
+        },
+    )
+
+    assert accepted is True
+    await chat_run_registry.drain()
+    event = runtime.app.state.chat_service.runs[0]["message"]
+    result = event.execution_results[0]
+    assert result.id == "confirm-1"
+    assert result.name == "confirm_navigation_calibration_params_tool"
+    assert result.state == ToolResultState.SUCCESS
+    assert json.loads(result.output) == {
+        "action": "confirm",
+        "text": None,
+        "request_id": "confirm_navigation_calibration_params:20270605",
+        "ok": True,
+        "tool_name": "confirm_navigation_calibration_params",
+        "message": "Camera parameters confirmed by user.",
+    }
+
+
+@pytest.mark.asyncio
 async def test_runtime_submit_human_decision_registers_binds_and_cleans_cancellation() -> None:
     chat_run_registry = FakeChatRunRegistry()
     storage = FakeAgentScopeStorage()

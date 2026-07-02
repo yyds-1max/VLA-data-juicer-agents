@@ -29,6 +29,10 @@ from vla_data_juicer_agents.runtime.agentscope_config import AgentScopeRuntimeCo
 
 _EVENT_STARTUP_GRACE_SECS = 1.0
 _EVENT_IDLE_POLL_SECS = 0.03
+_HUMAN_DECISION_TOOL_NAMES = {
+    "request_human_decision",
+    "confirm_navigation_calibration_params_tool",
+}
 _logger = logging.getLogger(__name__)
 
 
@@ -215,24 +219,18 @@ class AgentScopeRuntime:
 
         claim_handoff = False
         try:
-            if not await self._has_pending_human_decision(
+            pending_tool_name = await self._pending_human_decision_tool_name(
                 agent_id=agent_id,
                 agentscope_session_id=agentscope_session_id,
                 decision=decision,
-            ):
+            )
+            if pending_tool_name is None:
                 return False
 
             result = ToolResultBlock(
                 id=decision["tool_call_id"],
-                name="request_human_decision",
-                output=json.dumps(
-                    {
-                        "action": decision["action"],
-                        "text": decision.get("text"),
-                        "request_id": decision["request_id"],
-                    },
-                    ensure_ascii=False,
-                ),
+                name=pending_tool_name,
+                output=json.dumps(_human_decision_tool_output(pending_tool_name, decision), ensure_ascii=False),
                 state=ToolResultState.SUCCESS,
             )
             input_msg = ExternalExecutionResultEvent(
@@ -275,35 +273,36 @@ class AgentScopeRuntime:
             if not claim_handoff:
                 await claim.release()
 
-    async def _has_pending_human_decision(
+    async def _pending_human_decision_tool_name(
         self,
         *,
         agent_id: str,
         agentscope_session_id: str,
         decision: dict[str, Any],
-    ) -> bool:
+    ) -> str | None:
         get_session = getattr(self.storage, "get_session", None)
         if get_session is None:
-            return False
+            return None
 
         record = await get_session(self.config.user_id, agent_id, agentscope_session_id)
         if record is None:
-            return False
+            return None
 
         state = getattr(record, "state", None)
         if getattr(state, "reply_id", None) != decision["reply_id"]:
-            return False
+            return None
 
         for message in getattr(state, "context", []) or []:
             for tool_call in _tool_call_blocks(message):
+                tool_name = getattr(tool_call, "name", None)
                 if (
                     getattr(tool_call, "id", None) == decision["tool_call_id"]
-                    and getattr(tool_call, "name", None) == "request_human_decision"
+                    and tool_name in _HUMAN_DECISION_TOOL_NAMES
                     and _state_value(getattr(tool_call, "state", None))
                     == ToolCallState.SUBMITTED.value
                 ):
-                    return True
-        return False
+                    return str(tool_name)
+        return None
 
     async def _try_acquire_human_decision_claim(
         self,
@@ -605,7 +604,7 @@ class AgentScopeRuntime:
         for message in getattr(state, "context", []) or []:
             for tool_call in _tool_call_blocks(message):
                 if (
-                    getattr(tool_call, "name", None) == "request_human_decision"
+                    getattr(tool_call, "name", None) in _HUMAN_DECISION_TOOL_NAMES
                     and _state_value(getattr(tool_call, "state", None))
                     == ToolCallState.SUBMITTED.value
                 ):
@@ -687,6 +686,7 @@ def _human_decision_claim_key(agentscope_session_id: str, decision: dict[str, An
 
 
 def _human_decision_payload_from_tool_call(tool_call: Any) -> dict[str, Any] | None:
+    tool_name = getattr(tool_call, "name", None)
     tool_input = getattr(tool_call, "input", None)
     if isinstance(tool_input, str):
         try:
@@ -695,6 +695,9 @@ def _human_decision_payload_from_tool_call(tool_call: Any) -> dict[str, Any] | N
             return None
     if not isinstance(tool_input, dict):
         return None
+
+    if tool_name == "confirm_navigation_calibration_params_tool":
+        return _calibration_confirmation_payload(tool_input)
 
     request_id = tool_input.get("request_id")
     summary = tool_input.get("summary")
@@ -708,6 +711,66 @@ def _human_decision_payload_from_tool_call(tool_call: Any) -> dict[str, Any] | N
         "decision_type": decision_type,
         "summary": summary,
     }
+
+
+def _calibration_confirmation_payload(tool_input: dict[str, Any]) -> dict[str, Any]:
+    date = tool_input.get("date")
+    date_text = date if isinstance(date, str) and date else "unknown"
+    platform_hint = tool_input.get("platform_hint")
+    platform_text = platform_hint if isinstance(platform_hint, str) and platform_hint else "unknown"
+    segments = tool_input.get("segments")
+    if isinstance(segments, list) and segments:
+        segment_text = ", ".join(str(item) for item in segments)
+    elif isinstance(segments, str) and segments:
+        segment_text = segments
+    else:
+        segment_text = "all clips"
+    return {
+        "request_id": f"confirm_navigation_calibration_params:{date_text}",
+        "decision_type": "camera_params",
+        "summary": (
+            "Confirm navigation camera calibration and sensor parameters for "
+            f"{date_text} ({segment_text}); platform_hint={platform_text}."
+        ),
+    }
+
+
+def _human_decision_tool_output(tool_name: str, decision: dict[str, Any]) -> dict[str, Any]:
+    output = {
+        "action": decision["action"],
+        "text": decision.get("text"),
+        "request_id": decision["request_id"],
+    }
+    if tool_name != "confirm_navigation_calibration_params_tool":
+        return output
+    action = decision["action"]
+    if action == "confirm":
+        output.update(
+            {
+                "ok": True,
+                "tool_name": "confirm_navigation_calibration_params",
+                "message": "Camera parameters confirmed by user.",
+            }
+        )
+    elif action == "stop":
+        output.update(
+            {
+                "ok": False,
+                "tool_name": "confirm_navigation_calibration_params",
+                "message": "Navigation processing stopped by user before calibration confirmation.",
+                "error_type": "calibration_params_not_confirmed",
+            }
+        )
+    else:
+        output.update(
+            {
+                "ok": False,
+                "tool_name": "confirm_navigation_calibration_params",
+                "message": "User provided guidance before calibration confirmation.",
+                "error_type": "human_guidance_required",
+            }
+        )
+    return output
 
 
 def _session_events_key(message_bus: Any, session_id: str) -> str:

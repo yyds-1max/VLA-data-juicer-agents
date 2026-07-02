@@ -21,6 +21,12 @@ def build_session_plan_draft_tools(
         segments: list[str] | None = None,
         dry_run: bool | None = None,
     ) -> dict[str, Any]:
+        """Create or read the session WorkflowPlan draft.
+
+        First call for a session must provide date and scene_mode where
+        scene_mode is "in" or "out". segments must be an array of clip names,
+        or omitted/null for all clips.
+        """
         state = store.load(session_id)
         if state is None:
             state = _initial_state(
@@ -49,24 +55,21 @@ def build_session_plan_draft_tools(
         return state.status()
 
     def update_workflow_plan_draft_tool(
-        dataset_profile: str | None = None,
-        profile: str | None = None,
-        processing_profile: str | dict[str, Any] | None = None,
-        platform_hint: str | None = None,
-        data_profile: dict[str, Any] | str | None = None,
         data_profile_patch: dict[str, Any] | str | None = None,
         observation_id: str | None = None,
         used_tool: str | None = None,
     ) -> dict[str, Any]:
+        """Merge only newly observed NavigationDataProfile facts.
+
+        Use data_profile_patch for partial profile facts learned from exactly
+        one inspection tool, plus observation_id and used_tool for traceability.
+        Do not pass legacy profile, dataset_profile, processing_profile, or
+        platform_hint arguments.
+        """
         state = store.load(session_id)
         if state is None:
             return _missing_initial_request()
         result = state.update(
-            dataset_profile=dataset_profile,
-            profile=profile,
-            processing_profile=processing_profile,
-            platform_hint=platform_hint,
-            data_profile=data_profile,
             data_profile_patch=data_profile_patch,
             observation_id=observation_id,
             used_tool=used_tool,
@@ -75,6 +78,7 @@ def build_session_plan_draft_tools(
         return result
 
     def finalize_workflow_plan_tool() -> dict[str, Any]:
+        """Finalize and return WorkflowPlan JSON only after the draft is complete."""
         state = store.load(session_id)
         if state is None:
             return _missing_initial_request()

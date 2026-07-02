@@ -117,6 +117,23 @@ def test_session_draft_tools_are_marked_mutating():
     assert tools["finalize_workflow_plan_tool"].is_read_only is False
 
 
+def test_session_update_draft_tool_exposes_only_new_patch_contract():
+    store = InMemoryNavigationPlanDraftStore()
+    tools = _tools(store)
+    schema = tools["update_workflow_plan_draft_tool"].input_schema
+
+    assert set(schema["properties"]) == {
+        "data_profile_patch",
+        "observation_id",
+        "used_tool",
+    }
+    assert "processing_profile" not in schema["properties"]
+    assert "dataset_profile" not in schema["properties"]
+    assert "profile" not in schema["properties"]
+    assert "platform_hint" not in schema["properties"]
+    assert "data_profile" not in schema["properties"]
+
+
 def test_get_draft_initializes_and_persists_request():
     store = InMemoryNavigationPlanDraftStore()
     tools = _tools(store)

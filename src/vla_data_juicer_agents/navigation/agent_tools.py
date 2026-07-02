@@ -63,6 +63,53 @@ class HumanDecisionTool(ToolBase):
         )
 
 
+class CalibrationConfirmationTool(ToolBase):
+    """External calibration confirmation gate for finalized navigation plans."""
+
+    name = "confirm_navigation_calibration_params_tool"
+    description = (
+        "Pause before executing navigation processing and ask the frontend to "
+        "confirm camera calibration and sensor parameter assumptions. This is "
+        "an external human decision step; do not ask the user to type a magic "
+        "confirmation message."
+    )
+    input_schema = {
+        "type": "object",
+        "properties": {
+            "date": {
+                "type": "string",
+                "description": "Navigation data date in YYYYMMDD format.",
+            },
+            "segments": {
+                "anyOf": [
+                    {"type": "array", "items": {"type": "string"}},
+                    {"type": "null"},
+                ],
+                "description": "Clip names to process, or null/omitted for all clips.",
+            },
+            "platform_hint": {
+                "anyOf": [{"type": "string"}, {"type": "null"}],
+                "description": "Observed platform hint such as go2w or u_like.",
+            },
+        },
+        "required": ["date"],
+        "additionalProperties": False,
+    }
+    is_concurrency_safe = False
+    is_read_only = True
+    is_external_tool = True
+
+    async def check_permissions(
+        self,
+        tool_input: dict[str, Any],
+        context: object,
+    ) -> PermissionDecision:
+        return PermissionDecision(
+            behavior=PermissionBehavior.ALLOW,
+            message="Navigation calibration confirmation requests are allowed.",
+        )
+
+
 class _TrustedNavigationTool(ToolBase):
     """Allow project-owned navigation tools to run without AgentScope prompts."""
 
@@ -113,6 +160,21 @@ def _trust_internal_navigation_tools(tools: list[Any]) -> list[Any]:
     ]
 
 
+def _execution_tools_for_navigation_agent(
+    *,
+    dry_run: bool,
+    cancellation: CancellationContext | None,
+) -> list[Any]:
+    return [
+        tool
+        for tool in create_navigation_execution_tools(
+            dry_run=dry_run,
+            cancellation=cancellation,
+        )
+        if tool.name != "confirm_navigation_calibration_params_tool"
+    ]
+
+
 def build_navigation_agent_tools(
     *,
     dry_run: bool = False,
@@ -138,9 +200,10 @@ def build_navigation_agent_tools(
         )
     return _trust_internal_navigation_tools([
         HumanDecisionTool(),
+        CalibrationConfirmationTool(),
         *planning_tools,
         *draft_tools,
-        *create_navigation_execution_tools(
+        *_execution_tools_for_navigation_agent(
             dry_run=dry_run,
             cancellation=cancellation,
         ),

@@ -126,6 +126,8 @@ def test_navigation_agent_prompt_requires_plan_execute_react_and_human_decisions
         "If a specified clip does not exist",
         "concise progress updates",
         "request_human_decision",
+        "confirm_navigation_calibration_params_tool",
+        "external confirmation dialog",
         "Do not ask the user to type",
         "confirm/stop/guidance",
         "GUI can block",

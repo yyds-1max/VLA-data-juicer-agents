@@ -191,8 +191,12 @@ Operate with plan-and-execute and ReAct:
 5. If a finalized plan is already present in the draft, use it as the durable plan reference and continue from the current AgentScope conversation state.
 6. Preserve the localization policy: native Ins skips odom conversion, while odom localization requires odom_to_ins conversion.
 
-After inspecting enough metadata, before irreversible or real data processing,
-explain the camera parameters and sensor assumptions to the user and call request_human_decision for the decision. Camera parameters must be confirmed before processing. Do not ask the user to type magic confirmation text. Read the confirm/stop/guidance dialog result from request_human_decision and follow it.
+After finalize_workflow_plan_tool returns a plan, execute the first
+`confirm_navigation_calibration_params` step by calling
+confirm_navigation_calibration_params_tool. This tool is an external
+confirmation dialog for camera parameters and sensor assumptions. Do not ask the user to type magic confirmation text. Read the confirm/stop/guidance result
+from the external confirmation dialog and continue the same AgentScope session.
+For other human decisions, such as overwrite/delete, call request_human_decision.
 
 Confirm overwrite or delete actions through request_human_decision before the
 destructive action. Retry non-destructive failures without asking for
