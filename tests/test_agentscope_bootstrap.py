@@ -4,6 +4,7 @@ import pytest
 
 from vla_data_juicer_agents.runtime.agentscope_bootstrap import bootstrap_agentscope_records
 from vla_data_juicer_agents.runtime.agentscope_config import AgentScopeRuntimeConfig
+from vla_data_juicer_agents.runtime import agentscope_prompts
 from vla_data_juicer_agents.runtime.agentscope_prompts import (
     main_router_prompt,
     navigation_agent_prompt,
@@ -96,6 +97,23 @@ def test_navigation_agent_prompt_requires_plan_execute_react_and_human_decisions
         "plan-and-execute",
         "ReAct",
         "WorkflowPlan",
+        "navigation-data-agent-planning-guidance",
+        "Structured handoff JSON",
+        "get_workflow_plan_draft_tool",
+        "update_workflow_plan_draft_tool",
+        "finalize_workflow_plan_tool",
+        "do not hand-write final WorkflowPlan JSON",
+        "read-only inspection tools before execution",
+        "inspect_raw_date_tool",
+        "infer_navigation_sensor_bindings_tool",
+        "infer_navigation_processing_profile_tool",
+        "infer_navigation_topic_params_tool",
+        "inspect_processing_state_tool",
+        "inspect_gridmap_artifacts_tool",
+        "inspect_runtime_assets_tool",
+        "list_navigation_tool_capabilities_tool",
+        "native Ins",
+        "odom_to_ins",
         "Capability questions",
         "do not inspect data",
         "scene mode is missing",
@@ -115,8 +133,47 @@ def test_navigation_agent_prompt_requires_plan_execute_react_and_human_decisions
     ]:
         assert expected in prompt
 
+    assert "Plan-Agent workflow" not in prompt
+    assert "user_confirmation" not in prompt
+    assert "exactly `确认`" not in prompt
     assert "You are NavigationDataAgent" not in prompt
     assert "mock" not in prompt.lower()
+
+
+def test_navigation_agent_prompt_uses_fallback_guidance_when_docs_file_is_missing(monkeypatch):
+    def raise_missing_guidance(*args, **kwargs):
+        raise OSError("missing guidance")
+
+    monkeypatch.setattr(agentscope_prompts.Path, "read_text", raise_missing_guidance)
+
+    prompt = navigation_agent_prompt()
+
+    for expected in [
+        "navigation-data-agent-planning-guidance",
+        "get_workflow_plan_draft_tool",
+        "finalize_workflow_plan_tool",
+        "do not hand-write final WorkflowPlan JSON",
+        "inspect_raw_date_tool",
+        "list_navigation_tool_capabilities_tool",
+        "native Ins",
+        "odom_to_ins",
+        "do not invent `TOPIC_WHITELIST`, `topic_map`, or `query_dir`",
+        "copy them from `infer_navigation_topic_params_tool`",
+        "do not invent localization policy or calibration policy",
+        "copy them from `infer_navigation_processing_profile_tool`",
+        "blocking_issues",
+        "do not produce an executable plan",
+        "copy_existing_gridmap",
+        "generate_from_pcd",
+        "skip_if_projection_ready",
+        "Do not require data to fit fixed `u_legacy_like` or `go2w_like` classifications",
+        "calibration confirmation gate is the first finalized WorkflowPlan step",
+        "User confirmation, stop, and guidance decisions use `request_human_decision`",
+        "If a unique Ins topic is present",
+        "NoobScenes preprocessing skips odom conversion and resize preprocessing",
+        "NoobScenes preprocessing runs odom conversion and resize preprocessing",
+    ]:
+        assert expected in prompt
 
 
 @pytest.mark.asyncio
