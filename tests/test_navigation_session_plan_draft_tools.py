@@ -174,6 +174,35 @@ def test_update_persists_partial_patch_for_same_session():
     ]
 
 
+def test_get_draft_rejects_request_mismatch_for_existing_session():
+    store = InMemoryNavigationPlanDraftStore()
+    tools = _tools(store)
+    _invoke_tool(
+        tools["get_workflow_plan_draft_tool"],
+        {"date": "20270605", "scene_mode": "out", "segments": ["clip-a"]},
+    )
+
+    result = _invoke_tool(
+        tools["get_workflow_plan_draft_tool"],
+        {"date": "20270606", "scene_mode": "in", "segments": ["clip-b"]},
+    )
+
+    assert result["ok"] is False
+    assert result["error_type"] == "workflow_plan_draft_request_mismatch"
+    assert result["existing_request"] == {
+        "date": "20270605",
+        "segments": ["clip-a"],
+        "scene_mode": "out",
+        "dry_run": False,
+    }
+    assert result["requested_request"] == {
+        "date": "20270606",
+        "segments": ["clip-b"],
+        "scene_mode": "in",
+    }
+    assert store.load("agent-session-1").date == "20270605"
+
+
 def test_finalize_returns_structured_error_when_draft_is_incomplete():
     store = InMemoryNavigationPlanDraftStore()
     tools = _tools(store)
@@ -211,5 +240,7 @@ def test_finalize_success_persists_finalized_plan_for_same_session():
 
     assert result["ok"] is True
     assert "workflow_plan_json" in result
+    assert result["draft"]["finalized_plan"] is not None
+    assert result["draft"]["finalized_plan"]["date"] == "20270605"
     assert persisted_state.finalized_plan is not None
     assert persisted_state.finalized_plan.steps[0].step_id == "confirm_navigation_calibration_params"
