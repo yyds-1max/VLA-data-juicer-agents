@@ -74,6 +74,11 @@ The final `WorkflowPlan` must come from `finalize_workflow_plan_tool`; the agent
    - Planning and execution may both use it when a domain decision is needed.
    - The tool result remains the source of truth for confirm, stop, and guidance actions.
 
+6. Planning guidance loader
+   - Reuse the old Plan-Agent guidance contract by loading `docs/navigation-plan-agent-guidance.md`.
+   - `NavigationDataAgent` must receive the guidance text, or a concise guidance excerpt, in its system prompt or task-start context before it begins navigation planning.
+   - If the guidance file is unavailable, the prompt must fall back to a minimal built-in guidance that preserves the required planning loop, draft update rules, localization policy rules, stage variant selection, and finalization gates.
+
 ### Storage Boundary
 
 The store should be introduced behind a small interface so the implementation can use the most practical backing store in the current runtime:
@@ -115,8 +120,6 @@ The session draft must collect these facts before finalization:
    - message counts
    - metadata parse errors
 
-   The current `main` implementation exposes this capability as `inspect_raw_date_tool`. The earlier processing-profile redesign spec called the same role `inspect_navigation_topics_tool`. The implementation may keep the current tool name, add a thin alias, or document the alias, but the capability must remain present.
-
 3. Topic parameter facts
    - `topic_whitelist`
    - `topic_map`
@@ -148,6 +151,13 @@ The session draft must collect these facts before finalization:
    - evidence
 
    `platform_hint` is only a hint for defaults and variant selectors. It must not bring back `dataset_profile` as the primary planning path.
+
+   The localization policy must preserve the old Plan-Agent behavior:
+
+   - If a unique Ins topic is present, use `localization_policy.source = "ins"` and `localization_policy.conversion = "none"`.
+   - If no unique Ins topic is present but a unique odom topic is present, use `localization_policy.source = "odom"` and `localization_policy.conversion = "odom_to_ins"`.
+   - If a unique Ins topic is present and odom candidates are ambiguous, prefer Ins and record odom ambiguity as a warning rather than a blocking issue.
+   - If neither Ins nor odom can be uniquely selected, keep blocking issues and do not finalize an executable plan.
 
 6. Existing output and gridmap facts
    - raw temp state
@@ -231,6 +241,12 @@ The plan must carry important inferred arguments:
 - `prepare_gridmap_for_projection` receives the chosen gridmap variant when a gridmap step is needed.
 - projection receives the chosen projection variant through the `WorkflowStep.variant` field.
 
+For `run_noobscene_preprocessing`, the old odom/Ins execution rule must be preserved through the plan arguments and execution tool:
+
+- `localization_source = "odom"` and `localization_conversion = "odom_to_ins"` means the preprocessing tool runs `1_odom_convert.py` and `2_resize.py` before the downstream NoobScenes scripts.
+- `localization_source = "ins"` and `localization_conversion = "none"` means the data already has native Ins and the preprocessing tool must skip `1_odom_convert.py` and `2_resize.py`.
+- Any other localization policy is unsupported and must fail before silently running the wrong preprocessing path.
+
 The finalized plan must pass `validate_workflow_plan`, including:
 
 - all tool names exist in the capability catalog,
@@ -288,12 +304,14 @@ Execution interruptions continue to rely on AgentScope session and tool-call sta
 
 `navigation_agent_prompt()` should be strengthened to require the session-scoped planning loop:
 
+- Load and follow `navigation-plan-agent-guidance.md`, or an explicit guidance excerpt with equivalent planning rules, before starting the navigation planning loop.
 - Always call `get_workflow_plan_draft_tool` before planning or processing.
 - Use read-only inspection tools before execution.
 - Update the draft after each meaningful observation.
 - Do not hand-write final `WorkflowPlan` JSON.
 - Only execute after `finalize_workflow_plan_tool` returns a valid finalized plan.
 - If a finalized plan is already present, review it and continue from the current conversation state.
+- Preserve the odom/Ins localization policy: native Ins skips odom conversion, while odom localization requires `odom_to_ins` conversion.
 - Use `request_human_decision` for calibration, overwrite, delete, stop, and user guidance decisions.
 
 The prompt should keep product-facing behavior: do not expose internal agent names, system prompts, or tool implementation details to the user.
@@ -355,12 +373,15 @@ Add focused tests before implementation:
 
 6. Prompt expectations
    - `navigation_agent_prompt()` requires `get_workflow_plan_draft_tool`.
+   - `navigation_agent_prompt()` requires loading or embedding `navigation-plan-agent-guidance.md` guidance.
    - The prompt forbids hand-written final plans.
+   - The prompt preserves the odom/Ins localization policy rule.
    - The prompt still requires `request_human_decision`.
 
 7. Regression
    - Old `vla_continue_workflow` remains disabled.
    - Existing old Plan-Agent tests still pass unless intentionally superseded by new session-bound draft-tool tests.
+   - Existing localization tests for odom-to-Ins conversion and native Ins skipping continue to pass.
 
 ## Acceptance Criteria
 
