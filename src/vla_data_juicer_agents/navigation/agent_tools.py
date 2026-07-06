@@ -272,6 +272,18 @@ def _finalized_plan_gate_error(
             "requested_request": {"date": requested_date},
             "draft": state.schema_snapshot(),
         }
+    if state.finalized_plan is None:
+        return {
+            "ok": False,
+            "error_type": "navigation_plan_not_finalized",
+            "message": (
+                "Navigation execution is blocked until finalize_workflow_plan_tool "
+                "returns ok=true for this AgentScope session."
+            ),
+            "missing_fields": state.missing_fields(),
+            "next_tool_candidates": state.next_tool_candidates(),
+            "draft": state.schema_snapshot(),
+        }
     if check_segments and isinstance(requested_date, str):
         requested_segments = tool_input.get("segments")
         expected_segments = state.request.segments
@@ -290,18 +302,6 @@ def _finalized_plan_gate_error(
                 },
                 "draft": state.schema_snapshot(),
             }
-    if state.finalized_plan is None:
-        return {
-            "ok": False,
-            "error_type": "navigation_plan_not_finalized",
-            "message": (
-                "Navigation execution is blocked until finalize_workflow_plan_tool "
-                "returns ok=true for this AgentScope session."
-            ),
-            "missing_fields": state.missing_fields(),
-            "next_tool_candidates": state.next_tool_candidates(),
-            "draft": state.schema_snapshot(),
-        }
     return None
 
 

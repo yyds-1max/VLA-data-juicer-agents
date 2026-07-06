@@ -382,6 +382,54 @@ def test_navigation_execution_tool_rejects_segment_mismatch_after_session_plan_i
     }
 
 
+def test_navigation_execution_tool_reports_not_finalized_before_segment_mismatch(monkeypatch):
+    store = InMemoryNavigationPlanDraftStore()
+
+    def fake_prepare_raw_data_tool(date: str, segments: list[str] | None = None) -> dict:
+        return {
+            "ok": True,
+            "tool_name": "prepare_raw_data",
+            "date": date,
+            "segments": segments,
+        }
+
+    monkeypatch.setattr(
+        agent_tools_module,
+        "create_navigation_execution_tools",
+        lambda **_: [
+            FunctionTool(
+                fake_prepare_raw_data_tool,
+                name="prepare_raw_data_tool",
+                is_read_only=False,
+            )
+        ],
+    )
+    state = WorkflowPlanDraftState(
+        request=NavigationRequest(
+            date="20270605",
+            scene_mode="out",
+            segments=["20260605_152856"],
+        )
+    )
+    store.save("agent-session-1", state)
+    tools = {
+        tool.name: tool
+        for tool in build_navigation_agent_tools(
+            dry_run=True,
+            session_id="agent-session-1",
+            draft_store=store,
+        )
+    }
+
+    result = _decode_tool_payload(
+        asyncio.run(tools["prepare_raw_data_tool"](date="20270605"))
+    )
+
+    assert result["ok"] is False
+    assert result["error_type"] == "navigation_plan_not_finalized"
+    assert result["missing_fields"] == state.missing_fields()
+
+
 def test_extra_agent_tools_factory_registers_navigation_tools_only_for_navigation_agent(tmp_path):
     config = AgentScopeRuntimeConfig(
         user_id="alice",

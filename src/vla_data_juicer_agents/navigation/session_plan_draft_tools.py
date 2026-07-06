@@ -49,25 +49,36 @@ def build_session_plan_draft_tools(
         return state.status()
 
     def update_workflow_plan_draft_tool(
-        data_profile_patch: dict[str, Any] | None = None,
-        observation_id: str | None = None,
-        used_tool: str | None = None,
+        data_profile_patch: dict[str, Any],
+        observation_id: str,
+        used_tool: str,
     ) -> dict[str, Any]:
         """Merge only newly observed NavigationDataProfile facts.
 
         Use data_profile_patch for partial profile facts learned from exactly
         one inspection tool, plus observation_id and used_tool for traceability.
+        data_profile_patch must be a non-empty JSON object, not a JSON string.
         Do not pass legacy profile, dataset_profile, processing_profile, or
         platform_hint arguments.
         """
         state = store.load(session_id)
         if state is None:
             return _missing_initial_request()
-        if data_profile_patch is not None and not isinstance(data_profile_patch, dict):
+        if not isinstance(data_profile_patch, dict):
             return {
                 "ok": False,
                 "error_type": "invalid_data_profile_patch",
                 "message": "data_profile_patch must be a JSON object, not a string or scalar.",
+                "draft": state.schema_snapshot(),
+            }
+        if not data_profile_patch:
+            return {
+                "ok": False,
+                "error_type": "empty_data_profile_patch",
+                "message": (
+                    "data_profile_patch must contain newly observed facts from "
+                    "the completed read-only investigation tool."
+                ),
                 "draft": state.schema_snapshot(),
             }
         result = state.update(

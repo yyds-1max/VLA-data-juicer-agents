@@ -133,6 +133,11 @@ def test_session_update_draft_tool_exposes_only_new_patch_contract():
     assert "profile" not in schema["properties"]
     assert "platform_hint" not in schema["properties"]
     assert "data_profile" not in schema["properties"]
+    assert schema["required"] == [
+        "data_profile_patch",
+        "observation_id",
+        "used_tool",
+    ]
     patch_schema = schema["properties"]["data_profile_patch"]
     schema_options = patch_schema.get("anyOf", [patch_schema])
     assert {"type": "string"} not in schema_options
@@ -158,6 +163,30 @@ def test_session_update_draft_tool_rejects_string_patch_payload():
     assert result["ok"] is False
     assert result["error_type"] == "invalid_data_profile_patch"
     assert store.load("agent-session-1").data_profile_draft == {}
+
+
+def test_session_update_draft_tool_rejects_empty_patch_without_advancing_observation():
+    store = InMemoryNavigationPlanDraftStore()
+    tools = _tools(store)
+    _invoke_tool(
+        tools["get_workflow_plan_draft_tool"],
+        {"date": "20270605", "scene_mode": "out"},
+    )
+
+    result = _invoke_tool(
+        tools["update_workflow_plan_draft_tool"],
+        {
+            "data_profile_patch": {},
+            "observation_id": "raw_metadata",
+            "used_tool": "inspect_raw_date_tool",
+        },
+    )
+
+    state = store.load("agent-session-1")
+    assert result["ok"] is False
+    assert result["error_type"] == "empty_data_profile_patch"
+    assert state.completed_observations == []
+    assert state.next_tool_candidates() == ["inspect_raw_date_tool"]
 
 
 def test_get_draft_tool_exposes_no_legacy_segments_or_dry_run_args():

@@ -285,6 +285,16 @@ class WorkflowPlanDraftState(BaseModel):
         if platform_hint is not None:
             self.platform_hint = platform_hint
             patch["platform_hint"] = platform_hint
+        records_observation = observation_id is not None or used_tool is not None
+        if records_observation and not patch:
+            self.validation_errors.append(
+                "empty data_profile_patch cannot complete an observation"
+            )
+            self._refresh_data_profile_from_draft()
+            return self.status()
+        if self.validation_errors:
+            self._refresh_data_profile_from_draft()
+            return self.status()
         patch_processing_profile = patch.get("processing_profile")
         if isinstance(patch_processing_profile, dict):
             profile_id = patch_processing_profile.get("id")
@@ -307,7 +317,7 @@ class WorkflowPlanDraftState(BaseModel):
         if patch:
             _deep_merge(self.data_profile_draft, patch)
             _normalize_gridmap_generation_source(self.data_profile_draft)
-        if observation_id is not None or used_tool is not None:
+        if records_observation:
             observation: dict[str, str] = {}
             if observation_id is not None:
                 observation["observation_id"] = observation_id

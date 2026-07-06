@@ -216,15 +216,25 @@ def test_workflow_plan_draft_next_tool_candidates_follow_investigation_order():
 
     assert state.next_tool_candidates() == ["inspect_raw_date_tool"]
 
-    state.update(
+    empty_update = state.update(
         data_profile_patch={},
+        observation_id="raw_metadata",
+        used_tool="inspect_raw_date_tool",
+    )
+    assert empty_update["ok"] is False
+    assert "empty data_profile_patch" in empty_update["validation_errors"][0]
+    assert state.completed_observations == []
+    assert state.next_tool_candidates() == ["inspect_raw_date_tool"]
+
+    state.update(
+        data_profile_patch={"evidence": {"raw_metadata": ["metadata inspected"]}},
         observation_id="raw_metadata",
         used_tool="inspect_raw_date_tool",
     )
     assert state.next_tool_candidates() == ["infer_navigation_sensor_bindings_tool"]
 
     state.update(
-        data_profile_patch={},
+        data_profile_patch={"evidence": {"sensor_bindings": ["bindings inferred"]}},
         observation_id="sensor_bindings",
         used_tool="infer_navigation_sensor_bindings_tool",
     )
@@ -286,8 +296,13 @@ def test_workflow_plan_draft_suggests_finalize_after_ordered_observations_and_co
     ]
 
     for observation_id, used_tool in ordered_observations:
+        patch = (
+            profile.model_dump(mode="json")
+            if observation_id == "tool_capabilities"
+            else {"evidence": {observation_id: [used_tool]}}
+        )
         state.update(
-            data_profile_patch=profile.model_dump(mode="json") if observation_id == "tool_capabilities" else {},
+            data_profile_patch=patch,
             observation_id=observation_id,
             used_tool=used_tool,
         )
@@ -339,7 +354,11 @@ def test_workflow_plan_draft_reports_blocking_issues_with_remediation_candidate(
         ("gridmap_artifacts", "inspect_gridmap_artifacts_tool"),
         ("runtime_assets", "inspect_runtime_assets_tool"),
     ]:
-        state.update(data_profile_patch={}, observation_id=observation_id, used_tool=used_tool)
+        state.update(
+            data_profile_patch={"evidence": {observation_id: [used_tool]}},
+            observation_id=observation_id,
+            used_tool=used_tool,
+        )
 
     result = state.update(
         data_profile_patch={
