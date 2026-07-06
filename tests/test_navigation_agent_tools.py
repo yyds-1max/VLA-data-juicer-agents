@@ -166,7 +166,6 @@ def test_build_navigation_agent_tools_includes_planning_human_decision_and_proce
 
     assert {
         "request_human_decision",
-        "confirm_navigation_calibration_params_tool",
         "inspect_raw_date_tool",
         "infer_navigation_sensor_bindings_tool",
         "infer_navigation_processing_profile_tool",
@@ -184,8 +183,7 @@ def test_build_navigation_agent_tools_includes_planning_human_decision_and_proce
         "run_initial_annotation_gui_tool",
         "run_tracking_tool",
     }.issubset(names)
-    assert tools["confirm_navigation_calibration_params_tool"].is_external_tool is True
-    assert tools["confirm_navigation_calibration_params_tool"].is_read_only is True
+    assert "confirm_navigation_calibration_params_tool" not in names
 
 
 def test_build_navigation_agent_tools_omits_draft_tools_without_session_store():
@@ -193,7 +191,7 @@ def test_build_navigation_agent_tools_omits_draft_tools_without_session_store():
     names = set(tools)
 
     assert "request_human_decision" in names
-    assert tools["confirm_navigation_calibration_params_tool"].is_external_tool is True
+    assert "confirm_navigation_calibration_params_tool" not in names
     assert "prepare_raw_data_tool" in names
     assert "inspect_raw_date_tool" in names
     assert "infer_navigation_processing_profile_tool" in names
@@ -206,6 +204,7 @@ def test_build_navigation_agent_tools_does_not_register_old_workflow_control_too
 
     assert "vla_run_workflow" not in names
     assert "vla_continue_workflow" not in names
+    assert "confirm_navigation_calibration_params_tool" not in names
 
 
 def test_build_navigation_agent_tools_passes_cancellation_to_execution_tools(monkeypatch):
@@ -227,7 +226,6 @@ def test_build_navigation_agent_tools_passes_cancellation_to_execution_tools(mon
 
     assert {tool.name for tool in tools} == {
         "request_human_decision",
-        "confirm_navigation_calibration_params_tool",
         "inspect_raw_date_tool",
         "infer_navigation_sensor_bindings_tool",
         "infer_navigation_processing_profile_tool",

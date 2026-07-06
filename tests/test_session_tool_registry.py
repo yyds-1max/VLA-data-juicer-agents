@@ -52,11 +52,11 @@ def test_web_session_toolkit_excludes_old_vla_workflow_control_tools():
     assert "vla_continue_workflow" not in names
 
 
-def test_navigation_execution_tools_include_calibration_confirmation_tool():
+def test_navigation_execution_tools_do_not_register_calibration_confirmation_tool():
     tools = create_navigation_execution_tools(settings=NavigationSettings(), dry_run=True)
     names = [tool.name for tool in tools]
 
-    assert "confirm_navigation_calibration_params_tool" in names
+    assert "confirm_navigation_calibration_params_tool" not in names
 
 
 def test_executor_instructions_use_generic_step_to_tool_mapping_for_calibration_confirmation():

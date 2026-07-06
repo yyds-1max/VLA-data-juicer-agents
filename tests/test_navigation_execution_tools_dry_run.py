@@ -397,35 +397,7 @@ def test_confirm_navigation_calibration_params_rejects_unconfirmed_input(tmp_pat
     assert not (settings.finish_data_root / "20270605_temp").exists()
 
 
-def test_bound_confirm_calibration_tool_rejects_model_supplied_confirmation(tmp_path):
-    processing_root = tmp_path / "processing"
-    sensor_source = processing_root / "NoobScenes" / "params" / "20260529_go2w" / "sensors"
-    sensor_source.mkdir(parents=True)
-    settings = NavigationSettings(
-        vladatasets_root=tmp_path / "VLADatasets",
-        processing_root=processing_root,
-    )
-    tool = {
-        tool.name: tool
-        for tool in build_execution_tools(settings=settings, dry_run=False)
-    }["confirm_navigation_calibration_params_tool"]
-
-    result = _invoke_tool(
-        tool,
-        {
-            "date": "20270605",
-            "platform_hint": "go2w",
-            "user_confirmation": "确认",
-        },
-    )
-
-    assert result["ok"] is False
-    assert result["details"]["user_confirmation"] is None
-    assert result["details"]["error_type"] == "calibration_params_not_confirmed"
-    assert "请精确回复 `确认`" in result["details"]["confirmation_prompt"]
-
-
-def test_build_execution_tools_exposes_calibration_confirmation(tmp_path):
+def test_build_execution_tools_does_not_expose_calibration_confirmation_tool(tmp_path):
     settings = NavigationSettings(
         vladatasets_root=tmp_path / "VLADatasets",
         processing_root=tmp_path / "processing",
@@ -433,7 +405,7 @@ def test_build_execution_tools_exposes_calibration_confirmation(tmp_path):
     tools = build_execution_tools(settings=settings, dry_run=True)
     names = {tool.name for tool in tools}
 
-    assert "confirm_navigation_calibration_params_tool" in names
+    assert "confirm_navigation_calibration_params_tool" not in names
 
 
 def test_prepare_gridmap_for_projection_copies_and_transforms_existing_gridmap(tmp_path):

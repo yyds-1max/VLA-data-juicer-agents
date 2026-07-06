@@ -1238,25 +1238,6 @@ def build_execution_tools(
             dry_run=dry_run,
         ).model_dump(mode="json")
 
-    def bound_confirm_navigation_calibration_params_tool(
-        date: str,
-        segments: list[str] | None = None,
-        platform_hint: str | None = None,
-        user_confirmation: str | None = None,
-    ) -> dict:
-        # The executor model must not be allowed to confirm on the user's behalf.
-        del user_confirmation
-        return _execute_with_cancellation(
-            cancellation,
-            confirm_navigation_calibration_params,
-            date,
-            segments,
-            platform_hint=platform_hint,
-            user_confirmation=None,
-            settings=settings,
-            dry_run=dry_run,
-        ).model_dump(mode="json")
-
     def bound_run_noobscene_preprocessing_tool(
         finish_temp_path: str,
         localization_source: str = "odom",
@@ -1357,11 +1338,6 @@ def build_execution_tools(
         _make_function_tool(bound_extract_and_sync_navigation_data_tool, "extract_and_sync_navigation_data_tool", dry_run),
         _make_function_tool(bound_generate_gridmap_from_pcd_tool, "generate_gridmap_from_pcd_tool", dry_run),
         _make_function_tool(bound_assemble_finish_temp_tool, "assemble_finish_temp_tool", dry_run),
-        _make_function_tool(
-            bound_confirm_navigation_calibration_params_tool,
-            "confirm_navigation_calibration_params_tool",
-            dry_run,
-        ),
         _make_function_tool(bound_run_noobscene_preprocessing_tool, "run_noobscene_preprocessing_tool", dry_run),
         _make_function_tool(bound_run_initial_annotation_gui_tool, "run_initial_annotation_gui_tool", dry_run),
         _make_function_tool(bound_run_tracking_tool, "run_tracking_tool", dry_run),
@@ -1389,7 +1365,6 @@ def create_navigation_execution_tools(
     extract_and_sync_navigation_data_tool,
     generate_gridmap_from_pcd_tool,
     assemble_finish_temp_tool,
-    confirm_navigation_calibration_params_tool,
     run_noobscene_preprocessing_tool,
     run_initial_annotation_gui_tool,
     run_tracking_tool,

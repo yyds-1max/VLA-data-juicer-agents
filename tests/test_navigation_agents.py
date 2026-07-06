@@ -568,7 +568,7 @@ def test_executor_agent_has_sdk_tool_for_each_plan_step(monkeypatch):
         scene_mode="out",
     )
 
-    planned_tools = {"confirm_navigation_calibration_params_tool"}
+    planned_tools = {f"{plan.steps[0].tool_name}_tool"}
     missing_tools = [
         f"{step.tool_name}_tool"
         for step in plan.steps

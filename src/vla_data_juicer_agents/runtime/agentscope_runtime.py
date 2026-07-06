@@ -33,7 +33,6 @@ _EVENT_STARTUP_GRACE_SECS = 1.0
 _EVENT_IDLE_POLL_SECS = 0.03
 _HUMAN_DECISION_TOOL_NAMES = {
     "request_human_decision",
-    "confirm_navigation_calibration_params_tool",
 }
 _logger = logging.getLogger(__name__)
 
@@ -421,6 +420,7 @@ class AgentScopeRuntime:
             emit_final_events=True,
         )
         seen_entry_ids: set[str] = set()
+        seen_pending_decision_keys: set[str] = set()
         saw_event = False
         saw_reply_end = False
         saw_running = False
@@ -457,7 +457,9 @@ class AgentScopeRuntime:
                 agent_id=agent_id,
                 agentscope_session_id=agentscope_session_id,
             )
-            if pending_event is not None:
+            pending_key = _human_decision_event_key(pending_event)
+            if pending_event is not None and pending_key not in seen_pending_decision_keys:
+                seen_pending_decision_keys.add(pending_key)
                 yield pending_event
 
             cursor = self._event_cursor(agentscope_session_id)
@@ -483,6 +485,7 @@ class AgentScopeRuntime:
                 local_running = self._is_local_agent_run_active(agentscope_session_id)
                 saw_running = saw_running or running or local_running
 
+                live_feed_finished = False
                 try:
                     raw_event = await asyncio.wait_for(
                         live_events.get(),
@@ -492,25 +495,39 @@ class AgentScopeRuntime:
                     raw_event = None
                 else:
                     if raw_event is None:
-                        break
-                    entry_id = _raw_event_entry_id(raw_event)
-                    if entry_id and entry_id in seen_entry_ids:
-                        continue
-                    if entry_id:
-                        if not self._is_new_event(agentscope_session_id, entry_id):
+                        live_feed_finished = True
+                    else:
+                        entry_id = _raw_event_entry_id(raw_event)
+                        if entry_id and entry_id in seen_entry_ids:
                             continue
-                        seen_entry_ids.add(entry_id)
+                        if entry_id:
+                            if not self._is_new_event(agentscope_session_id, entry_id):
+                                continue
+                            seen_entry_ids.add(entry_id)
+                        saw_event = True
+                        if _raw_event_type(raw_event) == "REPLY_END":
+                            saw_reply_end = True
+                        for event in accept_raw_event(raw_event):
+                            yield event
+                        if entry_id:
+                            self._remember_event_cursor(
+                                agentscope_session_id,
+                                entry_id,
+                            )
+                        continue
+
+                pending_event = await self._pending_human_decision_event(
+                    agent_id=agent_id,
+                    agentscope_session_id=agentscope_session_id,
+                )
+                pending_key = _human_decision_event_key(pending_event)
+                if pending_event is not None and pending_key not in seen_pending_decision_keys:
+                    seen_pending_decision_keys.add(pending_key)
                     saw_event = True
-                    if _raw_event_type(raw_event) == "REPLY_END":
-                        saw_reply_end = True
-                    for event in accept_raw_event(raw_event):
-                        yield event
-                    if entry_id:
-                        self._remember_event_cursor(
-                            agentscope_session_id,
-                            entry_id,
-                        )
+                    yield pending_event
                     continue
+                if live_feed_finished:
+                    break
 
                 now = asyncio.get_running_loop().time()
                 if running or local_running:
@@ -745,9 +762,6 @@ def _human_decision_payload_from_tool_call(tool_call: Any) -> dict[str, Any] | N
     if not isinstance(tool_input, dict):
         return None
 
-    if tool_name == "confirm_navigation_calibration_params_tool":
-        return _calibration_confirmation_payload(tool_input)
-
     request_id = tool_input.get("request_id")
     summary = tool_input.get("summary")
     if not isinstance(request_id, str) or not isinstance(summary, str):
@@ -762,36 +776,15 @@ def _human_decision_payload_from_tool_call(tool_call: Any) -> dict[str, Any] | N
     }
 
 
-def _calibration_confirmation_payload(tool_input: dict[str, Any]) -> dict[str, Any]:
-    date = tool_input.get("date")
-    date_text = date if isinstance(date, str) and date else "unknown"
-    platform_hint = tool_input.get("platform_hint")
-    platform_text = platform_hint if isinstance(platform_hint, str) and platform_hint else "unknown"
-    segments = tool_input.get("segments")
-    if isinstance(segments, list) and segments:
-        segment_text = ", ".join(str(item) for item in segments)
-    elif isinstance(segments, str) and segments:
-        segment_text = segments
-    else:
-        segment_text = "all clips"
-    return {
-        "request_id": f"confirm_navigation_calibration_params:{date_text}",
-        "decision_type": "camera_params",
-        "summary": (
-            "Confirm navigation camera calibration and sensor parameters for "
-            f"{date_text} ({segment_text}); platform_hint={platform_text}."
-        ),
-    }
-
-
 def _human_decision_tool_output(tool_name: str, decision: dict[str, Any]) -> dict[str, Any]:
     output = {
         "action": decision["action"],
         "text": decision.get("text"),
         "request_id": decision["request_id"],
     }
-    if tool_name != "confirm_navigation_calibration_params_tool":
+    if not _is_calibration_confirmation_decision(decision):
         return output
+    output["decision_type"] = "camera_params"
     action = decision["action"]
     if action == "confirm":
         output.update(
@@ -820,6 +813,23 @@ def _human_decision_tool_output(tool_name: str, decision: dict[str, Any]) -> dic
             }
         )
     return output
+
+
+def _is_calibration_confirmation_decision(decision: dict[str, Any]) -> bool:
+    request_id = decision.get("request_id")
+    return (
+        isinstance(request_id, str)
+        and request_id.startswith("confirm_navigation_calibration_params:")
+    )
+
+
+def _human_decision_event_key(event: dict[str, Any] | None) -> str:
+    if event is None:
+        return ""
+    payload = event.get("payload")
+    if not isinstance(payload, dict):
+        return ""
+    return f"{payload.get('reply_id', '')}:{payload.get('tool_call_id', '')}"
 
 
 def _session_events_key(message_bus: Any, session_id: str) -> str:

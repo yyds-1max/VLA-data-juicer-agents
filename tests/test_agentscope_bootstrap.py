@@ -131,8 +131,6 @@ def test_navigation_agent_prompt_requires_plan_execute_react_and_human_decisions
         "If a specified clip does not exist",
         "concise progress updates",
         "request_human_decision",
-        "confirm_navigation_calibration_params_tool",
-        "external confirmation dialog",
         "Do not ask the user to type",
         "confirm/stop/guidance",
         "GUI can block",
@@ -141,6 +139,7 @@ def test_navigation_agent_prompt_requires_plan_execute_react_and_human_decisions
         assert expected in prompt
 
     assert "structured handoff context containing request, target, date" in prompt
+    assert "confirm_navigation_calibration_params_tool" not in prompt
     assert "Plan-Agent workflow" not in prompt
     assert "user_confirmation" not in prompt
     assert "exactly `确认`" not in prompt

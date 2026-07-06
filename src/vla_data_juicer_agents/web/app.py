@@ -189,6 +189,11 @@ def create_app(
     @app.websocket("/api/sessions/{session_id}/events")
     async def session_events(websocket: WebSocket, session_id: str) -> None:
         await websocket.accept()
+        if agentscope_runtime is not None:
+            _create_logged_task(
+                manager.forward_events_until_idle(session_id),
+                name=f"agentscope-events-ws:{session_id}",
+            )
         try:
             async with bus.subscribe(session_id) as queue:
                 while True:

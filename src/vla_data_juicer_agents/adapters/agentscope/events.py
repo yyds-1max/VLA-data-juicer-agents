@@ -17,7 +17,6 @@ _PROGRESS_MARKER_RE = re.compile(
 )
 _HUMAN_DECISION_TOOL_NAMES = {
     "request_human_decision",
-    "confirm_navigation_calibration_params_tool",
 }
 
 
@@ -308,8 +307,6 @@ def _external_tool_input(value: object) -> dict[str, Any]:
 
 
 def _human_decision_payload(tool_name: str, tool_input: dict[str, Any]) -> dict[str, str]:
-    if tool_name == "confirm_navigation_calibration_params_tool":
-        return _calibration_confirmation_payload(tool_input)
     decision_type = tool_input.get("decision_type")
     if not isinstance(decision_type, str) or not decision_type:
         decision_type = "other"
@@ -319,26 +316,4 @@ def _human_decision_payload(tool_name: str, tool_input: dict[str, Any]) -> dict[
         "decision_type": decision_type,
         "request_id": request_id if isinstance(request_id, str) else "",
         "summary": summary if isinstance(summary, str) else "",
-    }
-
-
-def _calibration_confirmation_payload(tool_input: dict[str, Any]) -> dict[str, str]:
-    date = tool_input.get("date")
-    date_text = date if isinstance(date, str) and date else "unknown"
-    platform_hint = tool_input.get("platform_hint")
-    platform_text = platform_hint if isinstance(platform_hint, str) and platform_hint else "unknown"
-    segments = tool_input.get("segments")
-    if isinstance(segments, list) and segments:
-        segment_text = ", ".join(str(item) for item in segments)
-    elif isinstance(segments, str) and segments:
-        segment_text = segments
-    else:
-        segment_text = "all clips"
-    return {
-        "decision_type": "camera_params",
-        "request_id": f"confirm_navigation_calibration_params:{date_text}",
-        "summary": (
-            "Confirm navigation camera calibration and sensor parameters for "
-            f"{date_text} ({segment_text}); platform_hint={platform_text}."
-        ),
     }

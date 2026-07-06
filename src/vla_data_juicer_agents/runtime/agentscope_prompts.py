@@ -64,8 +64,11 @@ Variant rules:
 - `prepare_gridmap_for_projection` uses `generate_from_pcd` when no grid_map exists and the PCD gridmap tool is available.
 - `prepare_gridmap_for_projection` uses `skip_if_projection_ready` when finish temp already contains projection-ready grid_map.
 - `run_projection_and_trajectory` uses platform_hint and catalog selectors to choose the projection variant.
-- The calibration confirmation gate is the first finalized WorkflowPlan step, before
-  `prepare_raw_data` and before any processing step.
+- The calibration confirmation gate is the first finalized WorkflowPlan step,
+  before `prepare_raw_data` and before any processing step. Execute that gate
+  by calling `request_human_decision` with decision_type=`camera_params`,
+  request_id=`confirm_navigation_calibration_params:<date>`, and a concise
+  summary of the camera calibration and sensor assumptions.
 - User confirmation, stop, and guidance decisions use `request_human_decision`.
 
 Blocking issues:
@@ -204,11 +207,13 @@ Operate with plan-and-execute and ReAct:
 7. Preserve the localization policy: native Ins skips odom conversion, while odom localization requires odom_to_ins conversion.
 
 After finalize_workflow_plan_tool returns a plan, execute the first
-`confirm_navigation_calibration_params` step by calling
-confirm_navigation_calibration_params_tool. This tool is an external
-confirmation dialog for camera parameters and sensor assumptions. Do not ask the user to type magic confirmation text. Read the confirm/stop/guidance result
-from the external confirmation dialog and continue the same AgentScope session.
-For other human decisions, such as overwrite/delete, call request_human_decision.
+`confirm_navigation_calibration_params` step by calling request_human_decision
+with decision_type=`camera_params`,
+request_id=`confirm_navigation_calibration_params:<date>`, and a concise
+summary of the camera calibration and sensor assumptions. Do not ask the user to type magic confirmation text. Read the confirm/stop/guidance result from
+the external confirmation dialog and continue the same AgentScope session.
+Use request_human_decision for all other human decisions too, such as
+overwrite/delete approval.
 
 Confirm overwrite or delete actions through request_human_decision before the
 destructive action. Retry non-destructive failures without asking for

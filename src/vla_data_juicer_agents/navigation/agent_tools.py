@@ -32,8 +32,10 @@ class HumanDecisionTool(ToolBase):
     name = "request_human_decision"
     description = (
         "Pause navigation workflow execution and ask the frontend to show a "
-        "human decision dialog. The dialog lets the user confirm the action, "
-        "stop the workflow, or provide guidance before the agent continues."
+        "human decision dialog for calibration confirmation, overwrite/delete "
+        "approval, stop, or user guidance. The dialog lets the user confirm "
+        "the action, stop the workflow, or provide guidance before the agent "
+        "continues."
     )
     input_schema = {
         "type": "object",
@@ -60,74 +62,6 @@ class HumanDecisionTool(ToolBase):
         return PermissionDecision(
             behavior=PermissionBehavior.ALLOW,
             message="Human decision requests are allowed.",
-        )
-
-
-class CalibrationConfirmationTool(ToolBase):
-    """External calibration confirmation gate for finalized navigation plans."""
-
-    name = "confirm_navigation_calibration_params_tool"
-    description = (
-        "Pause before executing navigation processing and ask the frontend to "
-        "confirm camera calibration and sensor parameter assumptions. This is "
-        "an external human decision step; do not ask the user to type a magic "
-        "confirmation message."
-    )
-    input_schema = {
-        "type": "object",
-        "properties": {
-            "date": {
-                "type": "string",
-                "description": "Navigation data date in YYYYMMDD format.",
-            },
-            "segments": {
-                "anyOf": [
-                    {"type": "array", "items": {"type": "string"}},
-                    {"type": "null"},
-                ],
-                "description": "Clip names to process, or null/omitted for all clips.",
-            },
-            "platform_hint": {
-                "anyOf": [{"type": "string"}, {"type": "null"}],
-                "description": "Observed platform hint such as go2w or u_like.",
-            },
-        },
-        "required": ["date"],
-        "additionalProperties": False,
-    }
-    is_concurrency_safe = False
-    is_read_only = True
-    is_external_tool = True
-
-    def __init__(
-        self,
-        *,
-        session_id: str | None = None,
-        draft_store: NavigationPlanDraftStore | None = None,
-    ) -> None:
-        self._session_id = session_id
-        self._draft_store = draft_store
-
-    async def check_permissions(
-        self,
-        tool_input: dict[str, Any],
-        context: object,
-    ) -> PermissionDecision:
-        if self._session_id is not None and self._draft_store is not None:
-            gate_error = _finalized_plan_gate_error(
-                session_id=self._session_id,
-                draft_store=self._draft_store,
-                tool_input=tool_input,
-                check_segments=_tool_accepts_segments(self),
-            )
-            if gate_error is not None:
-                return PermissionDecision(
-                    behavior=PermissionBehavior.DENY,
-                    message=gate_error["message"],
-                )
-        return PermissionDecision(
-            behavior=PermissionBehavior.ALLOW,
-            message="Navigation calibration confirmation requests are allowed.",
         )
 
 
@@ -329,14 +263,10 @@ def _execution_tools_for_navigation_agent(
     session_id: str | None,
     draft_store: NavigationPlanDraftStore | None,
 ) -> list[Any]:
-    tools = [
-        tool
-        for tool in create_navigation_execution_tools(
-            dry_run=dry_run,
-            cancellation=cancellation,
-        )
-        if tool.name != "confirm_navigation_calibration_params_tool"
-    ]
+    tools = create_navigation_execution_tools(
+        dry_run=dry_run,
+        cancellation=cancellation,
+    )
     if session_id is None or draft_store is None:
         return tools
     return [
@@ -374,10 +304,6 @@ def build_navigation_agent_tools(
         )
     return _trust_internal_navigation_tools([
         HumanDecisionTool(),
-        CalibrationConfirmationTool(
-            session_id=session_id,
-            draft_store=draft_store,
-        ),
         *planning_tools,
         *draft_tools,
         *_execution_tools_for_navigation_agent(

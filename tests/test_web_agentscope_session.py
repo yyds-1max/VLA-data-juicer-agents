@@ -219,6 +219,19 @@ class FakeAgentScopeStorage:
         return self.session_records.get((user_id, agent_id, session_id))
 
 
+class DelayedPendingDecisionStorage(FakeAgentScopeStorage):
+    def __init__(self, *, pending_record) -> None:
+        super().__init__()
+        self.pending_record = pending_record
+        self.get_session_calls = 0
+
+    async def get_session(self, user_id, agent_id, session_id):
+        self.get_session_calls += 1
+        if self.get_session_calls == 1:
+            return SimpleNamespace(state=SimpleNamespace(reply_id=None, context=[]))
+        return self.pending_record
+
+
 class FakeChatService:
     def __init__(self) -> None:
         self.runs = []
@@ -345,7 +358,6 @@ async def test_navigation_agent_internal_tools_are_auto_allowed(tmp_path: Path) 
         draft_store=JsonNavigationPlanDraftStore(tmp_path / "drafts"),
     )
     gated_tool_names = {
-        "confirm_navigation_calibration_params_tool",
         "prepare_raw_data_tool",
         "extract_and_sync_navigation_data_tool",
         "generate_gridmap_from_pcd_tool",
@@ -796,18 +808,18 @@ async def test_runtime_submit_human_decision_spawns_external_execution_result_ev
 
 
 @pytest.mark.asyncio
-async def test_runtime_submit_human_decision_resumes_external_calibration_tool() -> None:
+async def test_runtime_submit_human_decision_resumes_calibration_request_human_decision() -> None:
     chat_run_registry = FakeChatRunRegistry()
     storage = FakeAgentScopeStorage()
     storage.session_records[("alice", "navigation-data-agent", "as-session-1")] = (
         _agentscope_session_record(
             reply_id="reply-1",
             tool_call_id="confirm-1",
-            tool_name="confirm_navigation_calibration_params_tool",
+            tool_name="request_human_decision",
             tool_input={
-                "date": "20270605",
-                "segments": ["20260605_152856"],
-                "platform_hint": "go2w",
+                "decision_type": "camera_params",
+                "request_id": "confirm_navigation_calibration_params:20270605",
+                "summary": "Confirm navigation camera calibration.",
             },
         )
     )
@@ -829,12 +841,13 @@ async def test_runtime_submit_human_decision_resumes_external_calibration_tool()
     event = runtime.app.state.chat_service.runs[0]["message"]
     result = event.execution_results[0]
     assert result.id == "confirm-1"
-    assert result.name == "confirm_navigation_calibration_params_tool"
+    assert result.name == "request_human_decision"
     assert result.state == ToolResultState.SUCCESS
     assert json.loads(result.output) == {
         "action": "confirm",
         "text": None,
         "request_id": "confirm_navigation_calibration_params:20270605",
+        "decision_type": "camera_params",
         "ok": True,
         "tool_name": "confirm_navigation_calibration_params",
         "message": "Camera parameters confirmed by user.",
@@ -1043,6 +1056,47 @@ async def test_runtime_subscribe_hydrates_pending_human_decision_after_restart(t
             "payload": {
                 "decision_type": "camera_params",
                 "request_id": "camera-1",
+                "summary": "请确认相机参数。",
+                "reply_id": "reply-1",
+                "tool_call_id": "tool-1",
+            },
+        }
+    ]
+
+
+@pytest.mark.asyncio
+async def test_runtime_subscribe_polls_pending_human_decision_before_idle_exit() -> None:
+    storage = DelayedPendingDecisionStorage(
+        pending_record=_agentscope_session_record(
+            reply_id="reply-1",
+            tool_call_id="tool-1",
+            tool_input={
+                "decision_type": "camera_params",
+                "request_id": "confirm_navigation_calibration_params:20270605",
+                "summary": "请确认相机参数。",
+            },
+        )
+    )
+    runtime = _runtime(
+        storage=storage,
+        chat_run_registry=FakeChatRunRegistry(),
+        message_bus=FakeAgentScopeMessageBus(running_states=[False]),
+    )
+    runtime.web_sessions["web-1"] = ("navigation-data-agent", "as-session-1")
+
+    events = [
+        event async for event in runtime.subscribe_web_session_events(web_session_id="web-1")
+    ]
+
+    assert events == [
+        {
+            "type": "human_decision_required",
+            "source": "NavigationDataAgent",
+            "run_id": "as-session-1",
+            "parent_run_id": None,
+            "payload": {
+                "decision_type": "camera_params",
+                "request_id": "confirm_navigation_calibration_params:20270605",
                 "summary": "请确认相机参数。",
                 "reply_id": "reply-1",
                 "tool_call_id": "tool-1",

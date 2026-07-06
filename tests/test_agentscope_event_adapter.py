@@ -218,7 +218,7 @@ def test_require_external_execution_emits_human_decision_required():
     ]
 
 
-def test_confirm_calibration_external_execution_emits_human_decision_required():
+def test_removed_calibration_external_tool_is_ignored():
     scope, events = _scope_and_events()
     adapter = AgentScopeEventAdapter(scope)
 
@@ -241,14 +241,7 @@ def test_confirm_calibration_external_execution_emits_human_decision_required():
         )
     )
 
-    assert len(events) == 1
-    payload = events[0]["payload"]
-    assert payload["reply_id"] == "reply-1"
-    assert payload["tool_call_id"] == "confirm-1"
-    assert payload["decision_type"] == "camera_params"
-    assert payload["request_id"] == "confirm_navigation_calibration_params:20270605"
-    assert "20270605" in payload["summary"]
-    assert "go2w" in payload["summary"]
+    assert events == []
 
 
 @pytest.mark.parametrize(
