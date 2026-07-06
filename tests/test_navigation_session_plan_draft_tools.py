@@ -133,21 +133,56 @@ def test_session_update_draft_tool_exposes_only_new_patch_contract():
     assert "profile" not in schema["properties"]
     assert "platform_hint" not in schema["properties"]
     assert "data_profile" not in schema["properties"]
+    patch_schema = schema["properties"]["data_profile_patch"]
+    schema_options = patch_schema.get("anyOf", [patch_schema])
+    assert {"type": "string"} not in schema_options
 
 
-def test_get_draft_initializes_and_persists_request():
+def test_session_update_draft_tool_rejects_string_patch_payload():
+    store = InMemoryNavigationPlanDraftStore()
+    tools = _tools(store)
+    _invoke_tool(
+        tools["get_workflow_plan_draft_tool"],
+        {"date": "20270605", "scene_mode": "out"},
+    )
+
+    result = _invoke_tool(
+        tools["update_workflow_plan_draft_tool"],
+        {
+            "data_profile_patch": '{"platform_hint":"go2w"}',
+            "observation_id": "sensor_bindings",
+            "used_tool": "infer_navigation_sensor_bindings_tool",
+        },
+    )
+
+    assert result["ok"] is False
+    assert result["error_type"] == "invalid_data_profile_patch"
+    assert store.load("agent-session-1").data_profile_draft == {}
+
+
+def test_get_draft_tool_exposes_no_legacy_segments_or_dry_run_args():
+    store = InMemoryNavigationPlanDraftStore()
+    tools = _tools(store)
+    schema = tools["get_workflow_plan_draft_tool"].input_schema
+
+    assert set(schema["properties"]) == {"date", "scene_mode"}
+    assert "segments" not in schema["properties"]
+    assert "dry_run" not in schema["properties"]
+
+
+def test_get_draft_initializes_and_persists_request_without_segments():
     store = InMemoryNavigationPlanDraftStore()
     tools = _tools(store)
 
     result = _invoke_tool(
         tools["get_workflow_plan_draft_tool"],
-        {"date": "20270605", "scene_mode": "out", "segments": ["clip-a"]},
+        {"date": "20270605", "scene_mode": "out"},
     )
 
     assert result["ok"] is True
     assert result["draft"]["date"] == "20270605"
     assert result["draft"]["scene_mode"] == "out"
-    assert result["draft"]["segments"] == ["clip-a"]
+    assert result["draft"]["segments"] is None
     assert store.load("agent-session-1").date == "20270605"
 
 
@@ -197,25 +232,24 @@ def test_get_draft_rejects_request_mismatch_for_existing_session():
     tools = _tools(store)
     _invoke_tool(
         tools["get_workflow_plan_draft_tool"],
-        {"date": "20270605", "scene_mode": "out", "segments": ["clip-a"]},
+        {"date": "20270605", "scene_mode": "out"},
     )
 
     result = _invoke_tool(
         tools["get_workflow_plan_draft_tool"],
-        {"date": "20270606", "scene_mode": "in", "segments": ["clip-b"]},
+        {"date": "20270606", "scene_mode": "in"},
     )
 
     assert result["ok"] is False
     assert result["error_type"] == "workflow_plan_draft_request_mismatch"
     assert result["existing_request"] == {
         "date": "20270605",
-        "segments": ["clip-a"],
+        "segments": None,
         "scene_mode": "out",
         "dry_run": False,
     }
     assert result["requested_request"] == {
         "date": "20270606",
-        "segments": ["clip-b"],
         "scene_mode": "in",
     }
     assert store.load("agent-session-1").date == "20270605"
@@ -242,7 +276,7 @@ def test_finalize_success_persists_finalized_plan_for_same_session():
     tools = _tools(store)
     _invoke_tool(
         tools["get_workflow_plan_draft_tool"],
-        {"date": "20270605", "scene_mode": "out", "segments": ["clip-a"]},
+        {"date": "20270605", "scene_mode": "out"},
     )
     _invoke_tool(
         tools["update_workflow_plan_draft_tool"],
@@ -269,7 +303,7 @@ def test_finalize_rejects_plan_when_workflow_validation_fails(monkeypatch):
     tools = _tools(store)
     _invoke_tool(
         tools["get_workflow_plan_draft_tool"],
-        {"date": "20270605", "scene_mode": "out", "segments": ["clip-a"]},
+        {"date": "20270605", "scene_mode": "out"},
     )
     _invoke_tool(
         tools["update_workflow_plan_draft_tool"],

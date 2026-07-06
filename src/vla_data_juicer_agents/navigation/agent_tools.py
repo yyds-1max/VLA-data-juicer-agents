@@ -118,6 +118,7 @@ class CalibrationConfirmationTool(ToolBase):
                 session_id=self._session_id,
                 draft_store=self._draft_store,
                 tool_input=tool_input,
+                check_segments=_tool_accepts_segments(self),
             )
             if gate_error is not None:
                 return PermissionDecision(
@@ -206,6 +207,7 @@ class _FinalizedPlanRequiredTool(ToolBase):
             session_id=self._session_id,
             draft_store=self._draft_store,
             tool_input=tool_input,
+            check_segments=_tool_accepts_segments(self),
         )
         if gate_error is not None:
             return PermissionDecision(
@@ -228,6 +230,7 @@ class _FinalizedPlanRequiredTool(ToolBase):
             session_id=self._session_id,
             draft_store=self._draft_store,
             tool_input=kwargs,
+            check_segments=_tool_accepts_segments(self),
         )
         if gate_error is not None:
             return gate_error
@@ -242,6 +245,7 @@ def _finalized_plan_gate_error(
     session_id: str,
     draft_store: NavigationPlanDraftStore,
     tool_input: dict[str, Any],
+    check_segments: bool = True,
 ) -> dict[str, Any] | None:
     state = draft_store.load(session_id)
     if state is None:
@@ -268,6 +272,24 @@ def _finalized_plan_gate_error(
             "requested_request": {"date": requested_date},
             "draft": state.schema_snapshot(),
         }
+    if check_segments and isinstance(requested_date, str):
+        requested_segments = tool_input.get("segments")
+        expected_segments = state.request.segments
+        if requested_segments != expected_segments:
+            return {
+                "ok": False,
+                "error_type": "navigation_plan_request_mismatch",
+                "message": (
+                    "Navigation execution segments do not match the finalized "
+                    "workflow plan draft for this AgentScope session."
+                ),
+                "existing_request": state.request.model_dump(mode="json"),
+                "requested_request": {
+                    "date": requested_date,
+                    "segments": requested_segments,
+                },
+                "draft": state.schema_snapshot(),
+            }
     if state.finalized_plan is None:
         return {
             "ok": False,
@@ -281,6 +303,14 @@ def _finalized_plan_gate_error(
             "draft": state.schema_snapshot(),
         }
     return None
+
+
+def _tool_accepts_segments(tool: Any) -> bool:
+    schema = getattr(tool, "input_schema", None)
+    if not isinstance(schema, dict):
+        return False
+    properties = schema.get("properties")
+    return isinstance(properties, dict) and "segments" in properties
 
 
 def _trust_internal_navigation_tools(tools: list[Any]) -> list[Any]:

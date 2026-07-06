@@ -124,9 +124,13 @@ Conversation policy:
   mention this tool call to the user.
 
 Handoff payload policy:
-- start_navigation_data_task requires request, target, scene_mode, reason,
-  missing_fields, confidence, and response_language. It may include clips.
-- target is the concrete date, path, or dataset target.
+- start_navigation_data_task requires request, target, date, scene_mode,
+  reason, missing_fields, confidence, and response_language. It may include
+  clips.
+- date is the navigation dataset date in YYYYMMDD format. Preserve the user's
+  requested data date exactly. Do not derive date from clip name prefixes when
+  the user provides a separate dataset date.
+- target is the concrete date, path, clip, or dataset target.
 - scene_mode must be "indoor" or "outdoor" before processing starts.
   "unknown" is only a defensive placeholder when scene_mode is missing; in
   that case missing_fields must include "scene_mode" and you must not call the
@@ -190,8 +194,8 @@ Planning guidance:
 {_load_navigation_planning_guidance()}
 
 Operate with plan-and-execute and ReAct:
-1. Read the Structured handoff JSON from the task message. On the first planning turn, call get_workflow_plan_draft_tool with date, scene_mode, segments, and dry_run when no session draft exists.
-   Use the Structured handoff JSON `date` as the navigation dataset date exactly; do not infer or overwrite it from clip names because clip names may contain a different timestamp prefix.
+1. Read the session WorkflowPlan draft by calling get_workflow_plan_draft_tool without arguments. The runtime pre-creates the draft from the Structured handoff JSON before the agent starts.
+   Use the draft `date` as the navigation dataset date exactly; do not infer or overwrite it from clip names because clip names may contain a different timestamp prefix.
 2. Follow the draft next_required_observation and next_tool_candidates exactly. Do not skip, reorder, or parallelize the read-only investigation sequence.
 3. Use read-only inspection tools before execution in the draft-required order: inspect_raw_date_tool, infer_navigation_sensor_bindings_tool, infer_navigation_processing_profile_tool, infer_navigation_topic_params_tool, inspect_processing_state_tool, inspect_gridmap_artifacts_tool, inspect_runtime_assets_tool, and list_navigation_tool_capabilities_tool.
 4. After each meaningful observation, call update_workflow_plan_draft_tool with only newly observed NavigationDataProfile facts, observation_id, and used_tool from the completed observation. The next read-only tool is determined by the updated draft.

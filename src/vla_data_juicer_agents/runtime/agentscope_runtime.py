@@ -916,6 +916,7 @@ def _navigation_handoff_message(
     *,
     request: str,
     target: str,
+    date: str,
     scene_mode: str,
     clips: list[str],
     reason: str,
@@ -926,7 +927,7 @@ def _navigation_handoff_message(
     payload = {
         "request": request,
         "target": target,
-        "date": _navigation_handoff_date(request=request, target=target, clips=clips),
+        "date": date,
         "scene_mode": _navigation_scene_mode_for_request(scene_mode),
         "clips": clips,
         "segments": clips or None,
@@ -1014,6 +1015,15 @@ class NavigationHandoffTool(ToolBase):
                 "type": "string",
                 "description": "The concrete date, path, or dataset target to process.",
             },
+            "date": {
+                "type": "string",
+                "description": (
+                    "The navigation dataset date in YYYYMMDD format. This is the "
+                    "directory date under raw_data/clip_data/finish_data. Do not "
+                    "derive it from clip name prefixes when the user's requested "
+                    "dataset date is different."
+                ),
+            },
             "scene_mode": {
                 "type": "string",
                 "enum": ["indoor", "outdoor", "unknown"],
@@ -1052,6 +1062,7 @@ class NavigationHandoffTool(ToolBase):
         "required": [
             "request",
             "target",
+            "date",
             "scene_mode",
             "reason",
             "missing_fields",
@@ -1082,6 +1093,7 @@ class NavigationHandoffTool(ToolBase):
         self,
         request: str,
         target: str,
+        date: str,
         scene_mode: str,
         reason: str,
         missing_fields: list[str],
@@ -1095,6 +1107,7 @@ class NavigationHandoffTool(ToolBase):
             "web_session_id": self._web_session_id,
             "request": request,
             "target": target,
+            "date": date,
             "scene_mode": scene_mode,
             "clips": normalized_clips,
             "reason": reason,
@@ -1119,6 +1132,12 @@ class NavigationHandoffTool(ToolBase):
         if not target.strip():
             self._record_handoff(payload)
             return _handoff_error("Navigation handoff rejected because target is missing.", payload)
+        if not re.fullmatch(r"[0-9]{8}", date.strip()):
+            self._record_handoff(payload)
+            return _handoff_error(
+                "Navigation handoff rejected because date must be a YYYYMMDD dataset date.",
+                payload,
+            )
         if scene_mode not in {"indoor", "outdoor"}:
             self._record_handoff(payload)
             return _handoff_error(
@@ -1129,6 +1148,7 @@ class NavigationHandoffTool(ToolBase):
         navigation_request = _navigation_handoff_message(
             request=request,
             target=target,
+            date=date.strip(),
             scene_mode=scene_mode,
             clips=normalized_clips,
             reason=reason,

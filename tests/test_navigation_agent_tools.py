@@ -315,6 +315,73 @@ def test_navigation_execution_tool_is_allowed_after_session_plan_is_finalized(mo
     assert result["tool_name"] == "prepare_raw_data"
 
 
+def test_navigation_execution_tool_rejects_segment_mismatch_after_session_plan_is_finalized(monkeypatch):
+    store = InMemoryNavigationPlanDraftStore()
+
+    def fake_prepare_raw_data_tool(date: str, segments: list[str] | None = None) -> dict:
+        return {
+            "ok": True,
+            "tool_name": "prepare_raw_data",
+            "date": date,
+            "segments": segments,
+        }
+
+    monkeypatch.setattr(
+        agent_tools_module,
+        "create_navigation_execution_tools",
+        lambda **_: [
+            FunctionTool(
+                fake_prepare_raw_data_tool,
+                name="prepare_raw_data_tool",
+                is_read_only=False,
+            )
+        ],
+    )
+    state = WorkflowPlanDraftState(
+        request=NavigationRequest(
+            date="20270605",
+            scene_mode="out",
+            segments=["20260605_152856"],
+        )
+    )
+    state.update(data_profile_patch=_complete_profile_patch())
+    state.finalized_plan = build_plan_from_draft(state)
+    store.save("agent-session-1", state)
+    tools = {
+        tool.name: tool
+        for tool in build_navigation_agent_tools(
+            dry_run=True,
+            session_id="agent-session-1",
+            draft_store=store,
+        )
+    }
+
+    wrong_segments = _decode_tool_payload(
+        asyncio.run(
+            tools["prepare_raw_data_tool"](
+                date="20270605",
+                segments=["20260605_152930"],
+            )
+        )
+    )
+    missing_segments = _decode_tool_payload(
+        asyncio.run(tools["prepare_raw_data_tool"](date="20270605"))
+    )
+
+    assert wrong_segments["ok"] is False
+    assert wrong_segments["error_type"] == "navigation_plan_request_mismatch"
+    assert wrong_segments["requested_request"] == {
+        "date": "20270605",
+        "segments": ["20260605_152930"],
+    }
+    assert missing_segments["ok"] is False
+    assert missing_segments["error_type"] == "navigation_plan_request_mismatch"
+    assert missing_segments["requested_request"] == {
+        "date": "20270605",
+        "segments": None,
+    }
+
+
 def test_extra_agent_tools_factory_registers_navigation_tools_only_for_navigation_agent(tmp_path):
     config = AgentScopeRuntimeConfig(
         user_id="alice",
@@ -584,6 +651,7 @@ def test_navigation_handoff_tool_declares_structured_schema():
     assert set(tool.input_schema["properties"]) == {
         "request",
         "target",
+        "date",
         "scene_mode",
         "clips",
         "reason",
@@ -594,6 +662,7 @@ def test_navigation_handoff_tool_declares_structured_schema():
     assert tool.input_schema["required"] == [
         "request",
         "target",
+        "date",
         "scene_mode",
         "reason",
         "missing_fields",
@@ -612,6 +681,7 @@ def test_navigation_handoff_tool_rejects_missing_fields_without_starting_navigat
         tool(
             request="处理导航数据",
             target="20270605",
+            date="20270605",
             scene_mode="unknown",
             reason="用户想处理导航数据",
             missing_fields=["scene_mode"],
@@ -635,6 +705,7 @@ def test_navigation_handoff_tool_rejects_low_confidence_without_starting_navigat
         tool(
             request="你能处理导航数据吗",
             target="",
+            date="",
             scene_mode="",
             reason="用户只是询问能力",
             missing_fields=[],
@@ -658,6 +729,7 @@ def test_navigation_handoff_tool_rejects_unsupported_confidence_without_starting
         tool(
             request="处理 20270605 的室外导航数据",
             target="20270605",
+            date="20270605",
             scene_mode="outdoor",
             reason="用户看起来想处理导航数据",
             missing_fields=[],
@@ -681,6 +753,7 @@ def test_navigation_handoff_tool_starts_navigation_with_structured_context():
         tool(
             request="处理 20270605 的室外导航数据",
             target="20270605",
+            date="20270605",
             scene_mode="outdoor",
             clips=[],
             reason="用户给出了日期和室外场景并要求处理导航数据",
@@ -703,10 +776,38 @@ def test_navigation_handoff_tool_starts_navigation_with_structured_context():
     assert "请始终使用中文回复用户。" in message
 
 
+def test_navigation_handoff_tool_uses_explicit_date_not_clip_prefix_for_draft_initialization():
+    runtime = FakeNavigationHandoffRuntime()
+    tool = NavigationHandoffTool(runtime=runtime, web_session_id="web-1")
+
+    asyncio.run(
+        tool(
+            request="处理导航数据，指定 clip 为 20260605_152856",
+            target="20260605_152856",
+            date="20270605",
+            scene_mode="outdoor",
+            clips=["20260605_152856"],
+            reason="用户给出了数据日期、室外场景和指定 clip",
+            missing_fields=[],
+            confidence="high",
+            response_language="Chinese",
+        )
+    )
+
+    message = runtime.started[0]["message"]
+    json_text = message.split("Structured handoff JSON:", 1)[1].strip()
+    payload = json.loads(json_text)
+
+    assert payload["date"] == "20270605"
+    assert payload["target"] == "20260605_152856"
+    assert payload["segments"] == ["20260605_152856"]
+
+
 def test_navigation_handoff_message_includes_structured_json_for_draft_initialization():
     message = runtime_module._navigation_handoff_message(
         request="处理 20270605 的导航数据",
         target="20270605",
+        date="20270605",
         scene_mode="outdoor",
         clips=["20260605_152856"],
         reason="用户要处理导航数据",
@@ -732,6 +833,7 @@ def test_navigation_handoff_message_prefers_task_date_over_clip_prefix_date():
     message = runtime_module._navigation_handoff_message(
         request="请帮我处理一下20270605的导航数据，室外数据。只处理20260605_152856就可以。",
         target="20260605_152856",
+        date="20270605",
         scene_mode="outdoor",
         clips=["20260605_152856"],
         reason="用户给出了日期、室外场景和指定 clip",
@@ -754,6 +856,7 @@ def test_navigation_handoff_tool_records_observability_payload():
         tool(
             request="处理 20270605 clip_001 的室内导航数据",
             target="20270605",
+            date="20270605",
             scene_mode="indoor",
             clips=["clip_001"],
             reason="用户明确指定日期、clip 和室内场景",
@@ -768,6 +871,7 @@ def test_navigation_handoff_tool_records_observability_payload():
             "web_session_id": "web-1",
             "request": "处理 20270605 clip_001 的室内导航数据",
             "target": "20270605",
+            "date": "20270605",
             "scene_mode": "indoor",
             "clips": ["clip_001"],
             "reason": "用户明确指定日期、clip 和室内场景",

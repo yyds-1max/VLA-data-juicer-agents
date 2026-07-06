@@ -516,6 +516,7 @@ async def test_runtime_start_navigation_agent_task_precreates_session_draft_from
     message = agentscope_runtime_module._navigation_handoff_message(
         request="请帮我处理一下20270605的导航数据，室外数据。只处理20260605_152856就可以。",
         target="20260605_152856",
+        date="20270605",
         scene_mode="outdoor",
         clips=["20260605_152856"],
         reason="用户给出了日期、室外场景和指定 clip",

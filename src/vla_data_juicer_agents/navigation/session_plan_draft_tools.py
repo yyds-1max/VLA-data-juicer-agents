@@ -19,22 +19,19 @@ def build_session_plan_draft_tools(
     def get_workflow_plan_draft_tool(
         date: str | None = None,
         scene_mode: str | None = None,
-        segments: list[str] | None = None,
-        dry_run: bool | None = None,
     ) -> dict[str, Any]:
         """Create or read the session WorkflowPlan draft.
 
-        First call for a session must provide date and scene_mode where
-        scene_mode is "in" or "out". segments must be an array of clip names,
-        or omitted/null for all clips.
+        The normal AgentScope web path pre-creates the draft from the
+        structured handoff payload, so this tool usually reads the current
+        session draft without arguments. date and scene_mode are a fallback for
+        non-web callers that need to initialize an all-clips draft.
         """
         state = store.load(session_id)
         if state is None:
             state = _initial_state(
                 date=date,
                 scene_mode=scene_mode,
-                segments=segments,
-                dry_run=dry_run,
             )
             if state is None:
                 return _missing_initial_request()
@@ -43,20 +40,16 @@ def build_session_plan_draft_tools(
             state,
             date=date,
             scene_mode=scene_mode,
-            segments=segments,
-            dry_run=dry_run,
         ):
             return _request_mismatch_error(
                 state,
                 date=date,
                 scene_mode=scene_mode,
-                segments=segments,
-                dry_run=dry_run,
             )
         return state.status()
 
     def update_workflow_plan_draft_tool(
-        data_profile_patch: dict[str, Any] | str | None = None,
+        data_profile_patch: dict[str, Any] | None = None,
         observation_id: str | None = None,
         used_tool: str | None = None,
     ) -> dict[str, Any]:
@@ -70,6 +63,13 @@ def build_session_plan_draft_tools(
         state = store.load(session_id)
         if state is None:
             return _missing_initial_request()
+        if data_profile_patch is not None and not isinstance(data_profile_patch, dict):
+            return {
+                "ok": False,
+                "error_type": "invalid_data_profile_patch",
+                "message": "data_profile_patch must be a JSON object, not a string or scalar.",
+                "draft": state.schema_snapshot(),
+            }
         result = state.update(
             data_profile_patch=data_profile_patch,
             observation_id=observation_id,
@@ -135,8 +135,6 @@ def _initial_state(
     *,
     date: str | None,
     scene_mode: str | None,
-    segments: list[str] | None,
-    dry_run: bool | None,
 ) -> WorkflowPlanDraftState | None:
     if not date or scene_mode not in {"in", "out"}:
         return None
@@ -144,8 +142,6 @@ def _initial_state(
         request=NavigationRequest(
             date=date,
             scene_mode=scene_mode,
-            segments=segments,
-            dry_run=bool(dry_run),
         )
     )
 
@@ -168,16 +164,12 @@ def _request_mismatch(
     *,
     date: str | None,
     scene_mode: str | None,
-    segments: list[str] | None,
-    dry_run: bool | None,
 ) -> bool:
     if date is not None and date != state.request.date:
         return True
     if scene_mode is not None and scene_mode != state.request.scene_mode:
         return True
-    if segments is not None and segments != state.request.segments:
-        return True
-    return dry_run is not None and dry_run != state.request.dry_run
+    return False
 
 
 def _request_mismatch_error(
@@ -185,18 +177,12 @@ def _request_mismatch_error(
     *,
     date: str | None,
     scene_mode: str | None,
-    segments: list[str] | None,
-    dry_run: bool | None,
 ) -> dict[str, Any]:
     requested_request: dict[str, Any] = {}
     if date is not None:
         requested_request["date"] = date
-    if segments is not None:
-        requested_request["segments"] = segments
     if scene_mode is not None:
         requested_request["scene_mode"] = scene_mode
-    if dry_run is not None:
-        requested_request["dry_run"] = dry_run
     return {
         "ok": False,
         "error_type": "workflow_plan_draft_request_mismatch",

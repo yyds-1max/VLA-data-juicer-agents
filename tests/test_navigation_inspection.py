@@ -90,6 +90,22 @@ def test_legacy_classify_navigation_dataset_tool_schema_allows_omitting_segments
     assert "segments" not in required
 
 
+def test_navigation_investigation_tools_expose_structured_segments_only():
+    tools = [
+        classify_navigation_dataset_tool,
+        infer_navigation_topic_params_tool,
+        infer_navigation_sensor_bindings_tool,
+        infer_navigation_processing_profile_tool,
+        inspect_processing_state_tool,
+        inspect_gridmap_artifacts_tool,
+    ]
+
+    for tool in tools:
+        segments_schema = tool.input_schema["properties"]["segments"]
+        schema_options = segments_schema.get("anyOf", [segments_schema])
+        assert {"type": "string"} not in schema_options
+
+
 def test_infer_navigation_topic_params_detects_u_like_fixture():
     settings = NavigationSettings(vladatasets_root=FIXTURE_ROOT)
 
