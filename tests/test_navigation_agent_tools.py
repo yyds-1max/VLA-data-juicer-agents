@@ -380,6 +380,60 @@ def test_navigation_execution_tool_rejects_segment_mismatch_after_session_plan_i
     }
 
 
+def test_navigation_execution_gate_accepts_json_encoded_segments_from_model(monkeypatch):
+    store = InMemoryNavigationPlanDraftStore()
+
+    def fake_prepare_raw_data_tool(date: str, segments: list[str] | str | None = None) -> dict:
+        return {
+            "ok": True,
+            "tool_name": "prepare_raw_data",
+            "date": date,
+            "segments": segments,
+        }
+
+    monkeypatch.setattr(
+        agent_tools_module,
+        "create_navigation_execution_tools",
+        lambda **_: [
+            FunctionTool(
+                fake_prepare_raw_data_tool,
+                name="prepare_raw_data_tool",
+                is_read_only=False,
+            )
+        ],
+    )
+    state = WorkflowPlanDraftState(
+        request=NavigationRequest(
+            date="20270605",
+            scene_mode="out",
+            segments=["20260605_152856"],
+        )
+    )
+    state.update(data_profile_patch=_complete_profile_patch())
+    state.finalized_plan = build_plan_from_draft(state)
+    store.save("agent-session-1", state)
+    tools = {
+        tool.name: tool
+        for tool in build_navigation_agent_tools(
+            dry_run=True,
+            session_id="agent-session-1",
+            draft_store=store,
+        )
+    }
+
+    result = _decode_tool_payload(
+        asyncio.run(
+            tools["prepare_raw_data_tool"](
+                date="20270605",
+                segments='["20260605_152856"]',
+            )
+        )
+    )
+
+    assert result["ok"] is True
+    assert result["segments"] == '["20260605_152856"]'
+
+
 def test_navigation_execution_tool_reports_not_finalized_before_segment_mismatch(monkeypatch):
     store = InMemoryNavigationPlanDraftStore()
 

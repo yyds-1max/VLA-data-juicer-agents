@@ -1174,22 +1174,22 @@ def build_execution_tools(
     cancellation: CancellationContext | None = None,
     settings: NavigationSettings | None = None,
 ) -> list[Any]:
-    def bound_prepare_raw_data_tool(date: str, segments: list[str] | None = None) -> dict:
+    def bound_prepare_raw_data_tool(date: str, segments: list[str] | str | None = None) -> dict:
         return _execute_with_cancellation(
             cancellation,
             prepare_raw_data,
             date,
-            segments,
+            _normalize_segments_arg(segments),
             settings=settings,
             dry_run=dry_run,
         ).model_dump(mode="json")
 
     def bound_extract_and_sync_navigation_data_tool(
         date: str,
-        segments: list[str] | None = None,
+        segments: list[str] | str | None = None,
         processes_num: int = 4,
-        topic_whitelist: list[str] | None = None,
-        topic_map: dict[str, str] | None = None,
+        topic_whitelist: list[str] | str | None = None,
+        topic_map: dict[str, str] | str | None = None,
         query_dir: str | None = None,
         processing_profile: str | None = None,
         platform_hint: str | None = None,
@@ -1199,10 +1199,10 @@ def build_execution_tools(
             extract_and_sync_navigation_data,
             date=date,
             dataset_profile=None,
-            segments=segments,
+            segments=_normalize_segments_arg(segments),
             processes_num=processes_num,
-            topic_whitelist=topic_whitelist,
-            topic_map=topic_map,
+            topic_whitelist=_normalize_string_list_arg(topic_whitelist),
+            topic_map=_normalize_string_dict_arg(topic_map),
             query_dir=query_dir,
             settings=settings,
             dry_run=dry_run,
@@ -1210,19 +1210,19 @@ def build_execution_tools(
             platform_hint=platform_hint,
         ).model_dump(mode="json")
 
-    def bound_generate_gridmap_from_pcd_tool(date: str, segments: list[str] | None = None) -> dict:
+    def bound_generate_gridmap_from_pcd_tool(date: str, segments: list[str] | str | None = None) -> dict:
         return _execute_with_cancellation(
             cancellation,
             generate_gridmap_from_pcd,
             date,
-            segments,
+            _normalize_segments_arg(segments),
             settings=settings,
             dry_run=dry_run,
         ).model_dump(mode="json")
 
     def bound_assemble_finish_temp_tool(
         date: str,
-        segments: list[str] | None = None,
+        segments: list[str] | str | None = None,
         platform_hint: str | None = None,
         processing_profile: str | None = None,
     ) -> dict:
@@ -1230,7 +1230,7 @@ def build_execution_tools(
             cancellation,
             assemble_finish_temp,
             date,
-            segments,
+            _normalize_segments_arg(segments),
             settings=settings,
             dataset_profile=None,
             platform_hint=platform_hint,
@@ -1273,7 +1273,7 @@ def build_execution_tools(
 
     def bound_prepare_gridmap_for_projection_tool(
         date: str,
-        segments: list[str] | None = None,
+        segments: list[str] | str | None = None,
         finish_temp_path: str | None = None,
         gridmap_variant: str | None = None,
     ) -> dict:
@@ -1281,7 +1281,7 @@ def build_execution_tools(
             cancellation,
             prepare_gridmap_for_projection,
             date,
-            segments,
+            _normalize_segments_arg(segments),
             finish_temp_path=finish_temp_path,
             settings=settings,
             dry_run=dry_run,

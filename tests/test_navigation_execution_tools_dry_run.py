@@ -129,6 +129,20 @@ def test_prepare_raw_data_tool_accepts_structured_segments_array(tmp_path, monke
     assert not (root / "raw_data" / "20270605_temp").exists()
 
 
+def test_prepare_raw_data_tool_accepts_json_segments_string(tmp_path, monkeypatch):
+    root = tmp_path / "VLADatasets"
+    raw_date = root / "raw_data" / "20270605"
+    (raw_date / "20260605_152856").mkdir(parents=True)
+    monkeypatch.setenv("VLA_VLADATASETS_ROOT", str(root))
+    tool = {tool.name: tool for tool in build_execution_tools(dry_run=True)}["prepare_raw_data_tool"]
+
+    result = _invoke_tool(tool, {"date": "20270605", "segments": '["20260605_152856"]'})
+
+    assert result["ok"] is True
+    assert result["details"]["selected_segments"] == ["20260605_152856"]
+    assert not (root / "raw_data" / "20270605_temp").exists()
+
+
 def test_extract_and_sync_tool_accepts_processing_profile_topic_args_without_dataset_profile(tmp_path, monkeypatch):
     root = tmp_path / "VLADatasets"
     (root / "raw_data" / "20270605_temp" / "20260605_152856").mkdir(parents=True)
@@ -150,6 +164,34 @@ def test_extract_and_sync_tool_accepts_processing_profile_topic_args_without_dat
 
     assert result["ok"] is True
     assert result["details"]["profile"] == "go2w_like"
+    assert result["details"]["extract_topics"] == topic_params["topic_whitelist"]
+    assert result["details"]["sync_topic_map"] == topic_params["topic_map"]
+    assert result["details"]["query_dir"] == topic_params["query_dir"]
+
+
+def test_extract_and_sync_tool_accepts_json_encoded_list_and_dict_args(tmp_path, monkeypatch):
+    root = tmp_path / "VLADatasets"
+    (root / "raw_data" / "20270605_temp" / "20260605_152856").mkdir(parents=True)
+    monkeypatch.setenv("VLA_VLADATASETS_ROOT", str(root))
+    monkeypatch.setenv("VLA_DATATOOLBOX_SRC", "/datatoolbox/src")
+    tool = {tool.name: tool for tool in build_execution_tools(dry_run=True)}["extract_and_sync_navigation_data_tool"]
+    topic_params = _go2w_topic_params()
+
+    result = _invoke_tool(
+        tool,
+        {
+            "date": "20270605",
+            "segments": json.dumps(["20260605_152856"]),
+            "processing_profile": "parameterized_navigation_v1",
+            "platform_hint": "go2w",
+            "topic_whitelist": json.dumps(topic_params["topic_whitelist"]),
+            "topic_map": json.dumps(topic_params["topic_map"]),
+            "query_dir": topic_params["query_dir"],
+        },
+    )
+
+    assert result["ok"] is True
+    assert result["details"]["selected_segments"] == ["20260605_152856"]
     assert result["details"]["extract_topics"] == topic_params["topic_whitelist"]
     assert result["details"]["sync_topic_map"] == topic_params["topic_map"]
     assert result["details"]["query_dir"] == topic_params["query_dir"]
@@ -769,27 +811,18 @@ def test_prepare_gridmap_copy_existing_variant_does_not_generate_when_missing(tm
     assert result.details["source_mode"] == "missing_existing_gridmap"
 
 
-def test_navigation_execution_tools_schema_requires_structured_arguments():
+def test_navigation_execution_tools_schema_allows_structured_or_json_encoded_arguments():
     tools = {tool.name: tool for tool in build_execution_tools(dry_run=False)}
 
     prepare_schema = tools["prepare_raw_data_tool"].input_schema
     assert prepare_schema["properties"]["segments"]["anyOf"][0]["type"] == "array"
-    assert all(
-        option.get("type") != "string"
-        for option in prepare_schema["properties"]["segments"]["anyOf"]
-    )
+    assert {"type": "string"} in prepare_schema["properties"]["segments"]["anyOf"]
 
     extract_schema = tools["extract_and_sync_navigation_data_tool"].input_schema
     assert extract_schema["properties"]["topic_whitelist"]["anyOf"][0]["type"] == "array"
     assert extract_schema["properties"]["topic_map"]["anyOf"][0]["type"] == "object"
-    assert all(
-        option.get("type") != "string"
-        for option in extract_schema["properties"]["topic_whitelist"]["anyOf"]
-    )
-    assert all(
-        option.get("type") != "string"
-        for option in extract_schema["properties"]["topic_map"]["anyOf"]
-    )
+    assert {"type": "string"} in extract_schema["properties"]["topic_whitelist"]["anyOf"]
+    assert {"type": "string"} in extract_schema["properties"]["topic_map"]["anyOf"]
 
 
 def test_prepare_gridmap_generate_variant_runs_pcd_generator_when_missing(tmp_path, monkeypatch):

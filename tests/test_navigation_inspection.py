@@ -90,7 +90,7 @@ def test_legacy_classify_navigation_dataset_tool_schema_allows_omitting_segments
     assert "segments" not in required
 
 
-def test_navigation_investigation_tools_expose_structured_segments_only():
+def test_navigation_investigation_tools_allow_structured_or_json_encoded_segments():
     tools = [
         classify_navigation_dataset_tool,
         infer_navigation_topic_params_tool,
@@ -103,7 +103,7 @@ def test_navigation_investigation_tools_expose_structured_segments_only():
     for tool in tools:
         segments_schema = tool.input_schema["properties"]["segments"]
         schema_options = segments_schema.get("anyOf", [segments_schema])
-        assert {"type": "string"} not in schema_options
+        assert {"type": "string"} in schema_options
 
 
 def test_infer_navigation_topic_params_detects_u_like_fixture():

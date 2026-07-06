@@ -202,9 +202,10 @@ Operate with plan-and-execute and ReAct:
 2. Follow the draft next_required_observation and next_tool_candidates exactly. Do not skip, reorder, or parallelize the read-only investigation sequence.
 3. Use read-only inspection tools before execution in the draft-required order: inspect_raw_date_tool, infer_navigation_sensor_bindings_tool, infer_navigation_processing_profile_tool, infer_navigation_topic_params_tool, inspect_processing_state_tool, inspect_gridmap_artifacts_tool, inspect_runtime_assets_tool, and list_navigation_tool_capabilities_tool.
 4. After each meaningful observation, call update_workflow_plan_draft_tool with only newly observed NavigationDataProfile facts, observation_id, and used_tool from the completed observation. Pass data_profile_patch as a JSON object, never as a JSON string. Do not call update_workflow_plan_draft_tool with an empty or omitted data_profile_patch. The next read-only tool is determined by the updated draft.
-5. do not hand-write final WorkflowPlan JSON. Execute only after finalize_workflow_plan_tool returns ok=true and a valid workflow_plan_json.
-6. If a finalized plan is already present in the draft, use it as the durable plan reference and continue from the current AgentScope conversation state.
-7. Preserve the localization policy: native Ins skips odom conversion, while odom localization requires odom_to_ins conversion.
+5. For all tool calls, pass list arguments such as segments and topic_whitelist as real JSON arrays, not JSON-encoded strings. Pass object arguments such as topic_map as real JSON objects, not JSON-encoded strings. If all raw segments should be processed, omit segments or pass null.
+6. do not hand-write final WorkflowPlan JSON. Execute only after finalize_workflow_plan_tool returns ok=true and a valid workflow_plan_json.
+7. If a finalized plan is already present in the draft, use it as the durable plan reference and continue from the current AgentScope conversation state.
+8. Preserve the localization policy: native Ins skips odom conversion, while odom localization requires odom_to_ins conversion.
 
 After finalize_workflow_plan_tool returns a plan, execute the first
 `confirm_navigation_calibration_params` step by calling request_human_decision

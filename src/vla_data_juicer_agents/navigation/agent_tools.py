@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import inspect
+import json
 from typing import Any
 
 from agentscope.permission import PermissionBehavior, PermissionDecision
@@ -219,7 +220,7 @@ def _finalized_plan_gate_error(
             "draft": state.schema_snapshot(),
         }
     if check_segments and isinstance(requested_date, str):
-        requested_segments = tool_input.get("segments")
+        requested_segments = _normalize_optional_string_list(tool_input.get("segments"))
         expected_segments = state.request.segments
         if requested_segments != expected_segments:
             return {
@@ -245,6 +246,24 @@ def _tool_accepts_segments(tool: Any) -> bool:
         return False
     properties = schema.get("properties")
     return isinstance(properties, dict) and "segments" in properties
+
+
+def _normalize_optional_string_list(value: Any) -> Any:
+    if value is None:
+        return None
+    if isinstance(value, str):
+        stripped = value.strip()
+        if not stripped:
+            return None
+        if stripped.startswith("["):
+            try:
+                payload = json.loads(stripped)
+            except json.JSONDecodeError:
+                return value
+            if isinstance(payload, list) and all(isinstance(item, str) for item in payload):
+                return payload
+        return [stripped]
+    return value
 
 
 def _trust_internal_navigation_tools(tools: list[Any]) -> list[Any]:

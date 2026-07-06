@@ -651,12 +651,12 @@ def _inspect_raw_date_tool(date: str) -> dict:
     return inspect_raw_date(date).model_dump(mode="json")
 
 
-def _classify_navigation_dataset_tool(date: str, segments: list[str] | None = None) -> dict:
+def _classify_navigation_dataset_tool(date: str, segments: list[str] | str | None = None) -> dict:
     """Classify a raw navigation date using all segments, or a selected segment list when provided."""
     return classify_navigation_dataset(date, segments=_normalize_segments(segments)).model_dump(mode="json")
 
 
-def _infer_navigation_topic_params_tool(date: str, segments: list[str] | None = None) -> dict:
+def _infer_navigation_topic_params_tool(date: str, segments: list[str] | str | None = None) -> dict:
     """Infer TOPIC_WHITELIST, topic_map, and query_dir from raw navigation metadata topics."""
     params = infer_navigation_topic_params(date, segments=_normalize_segments(segments))
     payload = params.model_dump(mode="json")
@@ -664,22 +664,22 @@ def _infer_navigation_topic_params_tool(date: str, segments: list[str] | None = 
     return payload
 
 
-def _infer_navigation_sensor_bindings_tool(date: str, segments: list[str] | None = None) -> dict:
+def _infer_navigation_sensor_bindings_tool(date: str, segments: list[str] | str | None = None) -> dict:
     """Infer role-based navigation sensor bindings from raw navigation metadata topics."""
     return infer_navigation_sensor_bindings(date, segments=_normalize_segments(segments)).model_dump(mode="json")
 
 
-def _infer_navigation_processing_profile_tool(date: str, segments: list[str] | None = None) -> dict:
+def _infer_navigation_processing_profile_tool(date: str, segments: list[str] | str | None = None) -> dict:
     """Infer a parameterized navigation processing profile from raw navigation metadata topics."""
     return infer_navigation_processing_profile(date, segments=_normalize_segments(segments)).model_dump(mode="json")
 
 
-def _inspect_processing_state_tool(date: str, segments: list[str] | None = None) -> dict:
+def _inspect_processing_state_tool(date: str, segments: list[str] | str | None = None) -> dict:
     """Inspect existing navigation intermediate outputs without modifying data."""
     return inspect_processing_state(date, segments=_normalize_segments(segments))
 
 
-def _inspect_gridmap_artifacts_tool(date: str, segments: list[str] | None = None) -> dict:
+def _inspect_gridmap_artifacts_tool(date: str, segments: list[str] | str | None = None) -> dict:
     """Inspect existing grid_map artifacts that can drive gridmap workflow variant selection."""
     return inspect_gridmap_artifacts(date, segments=_normalize_segments(segments))
 
