@@ -206,7 +206,94 @@ def test_workflow_plan_draft_snapshot_exposes_react_profile_state_panel():
     assert "topic_params" in snapshot["missing_fields"]
     assert "stage_variants.prepare_gridmap_for_projection" in snapshot["missing_fields"]
     assert snapshot["ready_to_finish"] is False
-    assert "infer_navigation_topic_params_tool" in snapshot["next_tool_candidates"]
+    assert snapshot["next_tool_candidates"] == ["inspect_raw_date_tool"]
+
+
+def test_workflow_plan_draft_next_tool_candidates_follow_investigation_order():
+    state = WorkflowPlanDraftState(
+        request=NavigationRequest(date="20270605", scene_mode="out")
+    )
+
+    assert state.next_tool_candidates() == ["inspect_raw_date_tool"]
+
+    state.update(
+        data_profile_patch={},
+        observation_id="raw_metadata",
+        used_tool="inspect_raw_date_tool",
+    )
+    assert state.next_tool_candidates() == ["infer_navigation_sensor_bindings_tool"]
+
+    state.update(
+        data_profile_patch={},
+        observation_id="sensor_bindings",
+        used_tool="infer_navigation_sensor_bindings_tool",
+    )
+    assert state.next_tool_candidates() == ["infer_navigation_processing_profile_tool"]
+
+
+def test_workflow_plan_draft_does_not_advance_when_later_observation_is_recorded_first():
+    state = WorkflowPlanDraftState(
+        request=NavigationRequest(date="20270605", scene_mode="out")
+    )
+
+    state.update(
+        data_profile_patch={
+            "gridmap_source": "unknown",
+            "pcd_gridmap_tool_available": True,
+        },
+        observation_id="gridmap_artifacts",
+        used_tool="inspect_gridmap_artifacts_tool",
+    )
+
+    assert state.next_tool_candidates() == ["inspect_raw_date_tool"]
+
+
+def test_workflow_plan_draft_suggests_finalize_after_ordered_observations_and_complete_profile():
+    state = WorkflowPlanDraftState(
+        request=NavigationRequest(date="20270605", scene_mode="out")
+    )
+    profile = NavigationDataProfile(
+        date="20270605",
+        scene_mode="out",
+        processing_profile=_processing_profile(
+            platform_hint="go2w",
+            stage_variants=_complete_stage_variants(
+                "generate_from_pcd",
+                "no existing grid_map artifact but PCD generator is available",
+                ["inspect_gridmap_artifacts_tool", "inspect_runtime_assets_tool"],
+            ),
+        ),
+        platform_hint="go2w",
+        localization_policy={"source": "odom", "conversion": "odom_to_ins"},
+        topic_params=_go2w_topic_params(),
+        gridmap_source="generated_from_pcd",
+        pcd_gridmap_tool_available=True,
+        stage_variants=_complete_stage_variants(
+            "generate_from_pcd",
+            "no existing grid_map artifact but PCD generator is available",
+            ["inspect_gridmap_artifacts_tool", "inspect_runtime_assets_tool"],
+        ),
+    )
+    ordered_observations = [
+        ("raw_metadata", "inspect_raw_date_tool"),
+        ("sensor_bindings", "infer_navigation_sensor_bindings_tool"),
+        ("navigation_processing_profile", "infer_navigation_processing_profile_tool"),
+        ("navigation_topic_params", "infer_navigation_topic_params_tool"),
+        ("processing_state", "inspect_processing_state_tool"),
+        ("gridmap_artifacts", "inspect_gridmap_artifacts_tool"),
+        ("runtime_assets", "inspect_runtime_assets_tool"),
+        ("tool_capabilities", "list_navigation_tool_capabilities_tool"),
+    ]
+
+    for observation_id, used_tool in ordered_observations:
+        state.update(
+            data_profile_patch=profile.model_dump(mode="json") if observation_id == "tool_capabilities" else {},
+            observation_id=observation_id,
+            used_tool=used_tool,
+        )
+
+    assert state.ready_to_finish() is True
+    assert state.next_tool_candidates() == ["finalize_workflow_plan_tool"]
 
 
 def test_workflow_plan_draft_requires_processing_profile_not_dataset_profile():
@@ -243,6 +330,17 @@ def test_workflow_plan_draft_update_accepts_processing_profile_dict_argument():
 def test_workflow_plan_draft_reports_blocking_issues_with_remediation_candidate():
     state = WorkflowPlanDraftState(date="20270605", scene_mode="out")
 
+    for observation_id, used_tool in [
+        ("raw_metadata", "inspect_raw_date_tool"),
+        ("sensor_bindings", "infer_navigation_sensor_bindings_tool"),
+        ("navigation_processing_profile", "infer_navigation_processing_profile_tool"),
+        ("navigation_topic_params", "infer_navigation_topic_params_tool"),
+        ("processing_state", "inspect_processing_state_tool"),
+        ("gridmap_artifacts", "inspect_gridmap_artifacts_tool"),
+        ("runtime_assets", "inspect_runtime_assets_tool"),
+    ]:
+        state.update(data_profile_patch={}, observation_id=observation_id, used_tool=used_tool)
+
     result = state.update(
         data_profile_patch={
             "processing_profile": _processing_profile().model_dump(mode="json"),
@@ -259,7 +357,9 @@ def test_workflow_plan_draft_reports_blocking_issues_with_remediation_candidate(
                     "message": "grid_map source is unresolved",
                 }
             ],
-        }
+        },
+        observation_id="tool_capabilities",
+        used_tool="list_navigation_tool_capabilities_tool",
     )
 
     assert "blocking_issues" in result["draft"]["missing_fields"]

@@ -3,6 +3,7 @@ import inspect
 import json
 
 from vla_data_juicer_agents.navigation.plan_draft_store import InMemoryNavigationPlanDraftStore
+from vla_data_juicer_agents.navigation import session_plan_draft_tools as session_tools_module
 from vla_data_juicer_agents.navigation.session_plan_draft_tools import (
     build_session_plan_draft_tools,
 )
@@ -261,3 +262,47 @@ def test_finalize_success_persists_finalized_plan_for_same_session():
     assert result["draft"]["finalized_plan"]["date"] == "20270605"
     assert persisted_state.finalized_plan is not None
     assert persisted_state.finalized_plan.steps[0].step_id == "confirm_navigation_calibration_params"
+
+
+def test_finalize_rejects_plan_when_workflow_validation_fails(monkeypatch):
+    store = InMemoryNavigationPlanDraftStore()
+    tools = _tools(store)
+    _invoke_tool(
+        tools["get_workflow_plan_draft_tool"],
+        {"date": "20270605", "scene_mode": "out", "segments": ["clip-a"]},
+    )
+    _invoke_tool(
+        tools["update_workflow_plan_draft_tool"],
+        {
+            "data_profile_patch": _complete_profile_patch(),
+            "observation_id": "navigation_processing_profile",
+            "used_tool": "infer_navigation_processing_profile_tool",
+        },
+    )
+
+    def fail_validation(*_args, **_kwargs):
+        return {
+            "ok": False,
+            "errors": [
+                {
+                    "type": "invalid_gridmap_stage_order",
+                    "message": "gridmap must be prepared after tracking",
+                }
+            ],
+            "warnings": [],
+        }
+
+    monkeypatch.setattr(
+        session_tools_module,
+        "validate_workflow_plan",
+        fail_validation,
+        raising=False,
+    )
+
+    result = _invoke_tool(tools["finalize_workflow_plan_tool"], {})
+    persisted_state = store.load("agent-session-1")
+
+    assert result["ok"] is False
+    assert result["error_type"] == "workflow_plan_validation_failed"
+    assert result["validation_errors"][0]["type"] == "invalid_gridmap_stage_order"
+    assert persisted_state.finalized_plan is None

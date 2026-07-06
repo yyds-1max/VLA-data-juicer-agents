@@ -68,7 +68,11 @@ DRAFT_PLAN_AGENT_INSTRUCTIONS = """
 Maintain the internal WorkflowPlan draft with get_workflow_plan_draft_tool,
 update_workflow_plan_draft_tool, and finalize_workflow_plan_tool.
 Before each SDK tool call, inspect the current draft state: navigation_data_profile_schema,
-data_profile_draft, filled_fields, missing_fields, next_tool_candidates, and ready_to_finish.
+data_profile_draft, filled_fields, missing_fields, next_required_observation, next_tool_candidates, and ready_to_finish.
+Follow next_required_observation and next_tool_candidates exactly. Do not skip, reorder, or parallelize
+the read-only investigation sequence: inspect_raw_date_tool, infer_navigation_sensor_bindings_tool,
+infer_navigation_processing_profile_tool, infer_navigation_topic_params_tool, inspect_processing_state_tool,
+inspect_gridmap_artifacts_tool, inspect_runtime_assets_tool, then list_navigation_tool_capabilities_tool.
 Each planning step must do exactly one step: call one read-only inspection SDK tool,
 then merge only the newly learned facts with update_workflow_plan_draft_tool(data_profile_patch=...).
 Use infer_navigation_sensor_bindings_tool for sensor_bindings and infer_navigation_processing_profile_tool for

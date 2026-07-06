@@ -4,12 +4,18 @@ from types import SimpleNamespace
 
 from agentscope.permission import PermissionBehavior, PermissionDecision
 from agentscope.message import ToolResultState
+from agentscope.tool import FunctionTool
 
 from vla_data_juicer_agents.core.cancellation import CancellationContext
 from vla_data_juicer_agents.navigation import agent_tools as agent_tools_module
 from vla_data_juicer_agents.navigation.agent_tools import (
     HumanDecisionTool,
     build_navigation_agent_tools,
+)
+from vla_data_juicer_agents.navigation.models import NavigationRequest
+from vla_data_juicer_agents.navigation.plan_draft import (
+    WorkflowPlanDraftState,
+    build_plan_from_draft,
 )
 from vla_data_juicer_agents.navigation.plan_draft_store import (
     InMemoryNavigationPlanDraftStore,
@@ -59,6 +65,65 @@ def _decode_tool_payload(payload):
         if texts:
             return _decode_tool_payload("".join(texts))
     return payload
+
+
+def _complete_profile_patch():
+    topic_params = {
+        "profile_hint": "go2w",
+        "confidence": 1.0,
+        "topic_whitelist": [
+            "/cam_video4/csi_cam/image_raw/compressed",
+            "/rs32_lidar_points",
+            "/sport_odom",
+        ],
+        "topic_map": {
+            "cam_video4": "fisheye_front",
+            "rs32_lidar_points": "r32_rslidar_points",
+            "sport_odom": "odom",
+        },
+        "query_dir": "rs32_lidar_points",
+        "evidence": ["infer_navigation_topic_params_tool"],
+        "warnings": [],
+        "blocking_issues": [],
+    }
+    return {
+        "processing_profile": {
+            "id": "parameterized_navigation_v1",
+            "platform_hint": "go2w",
+            "topic_params": topic_params,
+            "localization_policy": {"source": "odom", "conversion": "odom_to_ins"},
+            "gridmap_policy": {"source": "existing_gridmap"},
+            "calibration_policy": {
+                "mode": "hardcoded_with_user_confirmation",
+                "requires_user_confirmation": True,
+            },
+            "warnings": [],
+            "blocking_issues": [],
+            "evidence": {"processing_profile": ["infer_navigation_processing_profile_tool"]},
+        },
+        "platform_hint": "go2w",
+        "topic_params": topic_params,
+        "localization_policy": {"source": "odom", "conversion": "odom_to_ins"},
+        "gridmap_source": "existing_gridmap",
+        "pcd_gridmap_tool_available": True,
+        "stage_variants": {
+            "extract_and_sync_navigation_data": {
+                "variant": "go2w_like",
+                "reason": "processing profile inferred go2w platform bindings",
+                "evidence": ["infer_navigation_processing_profile_tool"],
+            },
+            "prepare_gridmap_for_projection": {
+                "variant": "copy_existing_gridmap",
+                "reason": "grid_map artifacts already exist",
+                "evidence": ["inspect_gridmap_artifacts_tool"],
+            },
+            "run_projection_and_trajectory": {
+                "variant": "cjl_0525_with_gridmap",
+                "reason": "go2w platform uses the 0525 projection script",
+                "evidence": ["inspect_runtime_assets_tool"],
+            },
+        },
+    }
 
 
 def test_human_decision_tool_declares_external_read_only_schema():
@@ -173,6 +238,81 @@ def test_build_navigation_agent_tools_passes_cancellation_to_execution_tools(mon
         "list_navigation_tool_capabilities_tool",
     }
     assert captured == {"dry_run": True, "cancellation": cancellation}
+
+
+def test_navigation_execution_tool_is_blocked_before_session_plan_is_finalized(monkeypatch):
+    store = InMemoryNavigationPlanDraftStore()
+
+    def fake_prepare_raw_data_tool(date: str) -> dict:
+        return {"ok": True, "tool_name": "prepare_raw_data", "date": date}
+
+    monkeypatch.setattr(
+        agent_tools_module,
+        "create_navigation_execution_tools",
+        lambda **_: [
+            FunctionTool(
+                fake_prepare_raw_data_tool,
+                name="prepare_raw_data_tool",
+                is_read_only=False,
+            )
+        ],
+    )
+    tools = {
+        tool.name: tool
+        for tool in build_navigation_agent_tools(
+            dry_run=True,
+            session_id="agent-session-1",
+            draft_store=store,
+        )
+    }
+
+    result = _decode_tool_payload(
+        asyncio.run(tools["prepare_raw_data_tool"](date="20270605"))
+    )
+
+    assert result["ok"] is False
+    assert result["error_type"] == "navigation_plan_not_finalized"
+    assert result["next_tool_candidates"] == ["get_workflow_plan_draft_tool"]
+
+
+def test_navigation_execution_tool_is_allowed_after_session_plan_is_finalized(monkeypatch):
+    store = InMemoryNavigationPlanDraftStore()
+
+    def fake_prepare_raw_data_tool(date: str) -> dict:
+        return {"ok": True, "tool_name": "prepare_raw_data", "date": date}
+
+    monkeypatch.setattr(
+        agent_tools_module,
+        "create_navigation_execution_tools",
+        lambda **_: [
+            FunctionTool(
+                fake_prepare_raw_data_tool,
+                name="prepare_raw_data_tool",
+                is_read_only=False,
+            )
+        ],
+    )
+    state = WorkflowPlanDraftState(
+        request=NavigationRequest(date="20270605", scene_mode="out")
+    )
+    state.update(data_profile_patch=_complete_profile_patch())
+    state.finalized_plan = build_plan_from_draft(state)
+    store.save("agent-session-1", state)
+    tools = {
+        tool.name: tool
+        for tool in build_navigation_agent_tools(
+            dry_run=True,
+            session_id="agent-session-1",
+            draft_store=store,
+        )
+    }
+
+    result = _decode_tool_payload(
+        asyncio.run(tools["prepare_raw_data_tool"](date="20270605"))
+    )
+
+    assert result["ok"] is True
+    assert result["tool_name"] == "prepare_raw_data"
 
 
 def test_extra_agent_tools_factory_registers_navigation_tools_only_for_navigation_agent(tmp_path):
@@ -586,6 +726,24 @@ def test_navigation_handoff_message_includes_structured_json_for_draft_initializ
         "reason": "用户要处理导航数据",
         "response_language": "Chinese",
     }
+
+
+def test_navigation_handoff_message_prefers_task_date_over_clip_prefix_date():
+    message = runtime_module._navigation_handoff_message(
+        request="请帮我处理一下20270605的导航数据，室外数据。只处理20260605_152856就可以。",
+        target="20260605_152856",
+        scene_mode="outdoor",
+        clips=["20260605_152856"],
+        reason="用户给出了日期、室外场景和指定 clip",
+        response_language="Chinese",
+    )
+
+    json_text = message.split("Structured handoff JSON:", 1)[1].strip()
+    payload = json.loads(json_text)
+
+    assert payload["date"] == "20270605"
+    assert payload["target"] == "20260605_152856"
+    assert payload["segments"] == ["20260605_152856"]
 
 
 def test_navigation_handoff_tool_records_observability_payload():

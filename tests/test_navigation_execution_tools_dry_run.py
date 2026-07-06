@@ -115,14 +115,14 @@ def test_prepare_raw_data_dry_run_defaults_to_all_segments(tmp_path):
     assert "20260605_152930" in result.details["selected_segments"]
 
 
-def test_prepare_raw_data_tool_accepts_json_segments_string(tmp_path, monkeypatch):
+def test_prepare_raw_data_tool_accepts_structured_segments_array(tmp_path, monkeypatch):
     root = tmp_path / "VLADatasets"
     raw_date = root / "raw_data" / "20270605"
     (raw_date / "20260605_152856").mkdir(parents=True)
     monkeypatch.setenv("VLA_VLADATASETS_ROOT", str(root))
     tool = {tool.name: tool for tool in build_execution_tools(dry_run=True)}["prepare_raw_data_tool"]
 
-    result = _invoke_tool(tool, {"date": "20270605", "segments": '["20260605_152856"]'})
+    result = _invoke_tool(tool, {"date": "20270605", "segments": ["20260605_152856"]})
 
     assert result["ok"] is True
     assert result["details"]["selected_segments"] == ["20260605_152856"]
@@ -795,6 +795,29 @@ def test_prepare_gridmap_copy_existing_variant_does_not_generate_when_missing(tm
 
     assert result.ok is False
     assert result.details["source_mode"] == "missing_existing_gridmap"
+
+
+def test_navigation_execution_tools_schema_requires_structured_arguments():
+    tools = {tool.name: tool for tool in build_execution_tools(dry_run=False)}
+
+    prepare_schema = tools["prepare_raw_data_tool"].input_schema
+    assert prepare_schema["properties"]["segments"]["anyOf"][0]["type"] == "array"
+    assert all(
+        option.get("type") != "string"
+        for option in prepare_schema["properties"]["segments"]["anyOf"]
+    )
+
+    extract_schema = tools["extract_and_sync_navigation_data_tool"].input_schema
+    assert extract_schema["properties"]["topic_whitelist"]["anyOf"][0]["type"] == "array"
+    assert extract_schema["properties"]["topic_map"]["anyOf"][0]["type"] == "object"
+    assert all(
+        option.get("type") != "string"
+        for option in extract_schema["properties"]["topic_whitelist"]["anyOf"]
+    )
+    assert all(
+        option.get("type") != "string"
+        for option in extract_schema["properties"]["topic_map"]["anyOf"]
+    )
 
 
 def test_prepare_gridmap_generate_variant_runs_pcd_generator_when_missing(tmp_path, monkeypatch):

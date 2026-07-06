@@ -587,7 +587,11 @@ def inspect_gridmap_artifacts(
 ) -> dict:
     settings = settings or NavigationSettings()
     finish_temp_samples = settings.finish_data_root / f"{date}_temp" / "samples" / date
-    projection_ready_paths = sorted(path for path in finish_temp_samples.glob("*/grid_map") if path.is_dir())
+    projection_ready_paths = sorted(
+        path
+        for path in finish_temp_samples.glob("*/grid_map")
+        if _has_gridmap_json(path)
+    )
     if projection_ready_paths:
         return {
             "date": date,
@@ -605,7 +609,7 @@ def inspect_gridmap_artifacts(
         for root in search_roots
         if root.exists()
         for path in root.glob("*/grid_map")
-        if path.is_dir()
+        if _has_gridmap_json(path)
     )
     return {
         "date": date,
@@ -614,6 +618,10 @@ def inspect_gridmap_artifacts(
         "projection_input_ready": False,
         "available_gridmap_paths": [str(path) for path in gridmap_paths],
     }
+
+
+def _has_gridmap_json(path: Path) -> bool:
+    return path.is_dir() and any(child.is_file() for child in path.glob("*.json"))
 
 
 def inspect_runtime_assets(settings: NavigationSettings | None = None) -> dict:

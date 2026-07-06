@@ -277,7 +277,7 @@ def _discover_gridmap_dirs(
         if not sync_root.exists():
             continue
         for grid_map_dir in sorted(sync_root.glob("*/grid_map")):
-            if grid_map_dir.is_dir():
+            if grid_map_dir.is_dir() and any(path.is_file() for path in grid_map_dir.glob("*.json")):
                 discovered.append((grid_map_dir, grid_map_dir.parent.name))
     return discovered
 
@@ -1174,23 +1174,22 @@ def build_execution_tools(
     cancellation: CancellationContext | None = None,
     settings: NavigationSettings | None = None,
 ) -> list[Any]:
-    def bound_prepare_raw_data_tool(date: str, segments: list[str] | str | None = None) -> dict:
+    def bound_prepare_raw_data_tool(date: str, segments: list[str] | None = None) -> dict:
         return _execute_with_cancellation(
             cancellation,
             prepare_raw_data,
             date,
-            _normalize_segments_arg(segments),
+            segments,
             settings=settings,
             dry_run=dry_run,
         ).model_dump(mode="json")
 
     def bound_extract_and_sync_navigation_data_tool(
         date: str,
-        dataset_profile: str | None = None,
-        segments: list[str] | str | None = None,
+        segments: list[str] | None = None,
         processes_num: int = 4,
-        topic_whitelist: list[str] | str | None = None,
-        topic_map: dict[str, str] | str | None = None,
+        topic_whitelist: list[str] | None = None,
+        topic_map: dict[str, str] | None = None,
         query_dir: str | None = None,
         processing_profile: str | None = None,
         platform_hint: str | None = None,
@@ -1199,11 +1198,11 @@ def build_execution_tools(
             cancellation,
             extract_and_sync_navigation_data,
             date=date,
-            dataset_profile=dataset_profile,
-            segments=_normalize_segments_arg(segments),
+            dataset_profile=None,
+            segments=segments,
             processes_num=processes_num,
-            topic_whitelist=_normalize_string_list_arg(topic_whitelist),
-            topic_map=_normalize_string_dict_arg(topic_map),
+            topic_whitelist=topic_whitelist,
+            topic_map=topic_map,
             query_dir=query_dir,
             settings=settings,
             dry_run=dry_run,
@@ -1211,20 +1210,19 @@ def build_execution_tools(
             platform_hint=platform_hint,
         ).model_dump(mode="json")
 
-    def bound_generate_gridmap_from_pcd_tool(date: str, segments: list[str] | str | None = None) -> dict:
+    def bound_generate_gridmap_from_pcd_tool(date: str, segments: list[str] | None = None) -> dict:
         return _execute_with_cancellation(
             cancellation,
             generate_gridmap_from_pcd,
             date,
-            _normalize_segments_arg(segments),
+            segments,
             settings=settings,
             dry_run=dry_run,
         ).model_dump(mode="json")
 
     def bound_assemble_finish_temp_tool(
         date: str,
-        segments: list[str] | str | None = None,
-        dataset_profile: str | None = None,
+        segments: list[str] | None = None,
         platform_hint: str | None = None,
         processing_profile: str | None = None,
     ) -> dict:
@@ -1232,9 +1230,9 @@ def build_execution_tools(
             cancellation,
             assemble_finish_temp,
             date,
-            _normalize_segments_arg(segments),
+            segments,
             settings=settings,
-            dataset_profile=dataset_profile,
+            dataset_profile=None,
             platform_hint=platform_hint,
             processing_profile=processing_profile,
             dry_run=dry_run,
@@ -1242,7 +1240,7 @@ def build_execution_tools(
 
     def bound_confirm_navigation_calibration_params_tool(
         date: str,
-        segments: list[str] | str | None = None,
+        segments: list[str] | None = None,
         platform_hint: str | None = None,
         user_confirmation: str | None = None,
     ) -> dict:
@@ -1252,7 +1250,7 @@ def build_execution_tools(
             cancellation,
             confirm_navigation_calibration_params,
             date,
-            _normalize_segments_arg(segments),
+            segments,
             platform_hint=platform_hint,
             user_confirmation=None,
             settings=settings,
@@ -1294,7 +1292,7 @@ def build_execution_tools(
 
     def bound_prepare_gridmap_for_projection_tool(
         date: str,
-        segments: list[str] | str | None = None,
+        segments: list[str] | None = None,
         finish_temp_path: str | None = None,
         gridmap_variant: str | None = None,
     ) -> dict:
@@ -1302,7 +1300,7 @@ def build_execution_tools(
             cancellation,
             prepare_gridmap_for_projection,
             date,
-            _normalize_segments_arg(segments),
+            segments,
             finish_temp_path=finish_temp_path,
             settings=settings,
             dry_run=dry_run,
@@ -1312,7 +1310,6 @@ def build_execution_tools(
     def bound_run_projection_and_trajectory_tool(
         finish_temp_path: str,
         finish_path: str,
-        dataset_profile: str | None = None,
         processing_profile: str | None = None,
         platform_hint: str | None = None,
     ) -> dict:
@@ -1321,7 +1318,7 @@ def build_execution_tools(
             run_projection_and_trajectory,
             finish_temp_path,
             finish_path,
-            dataset_profile=dataset_profile,
+            dataset_profile=None,
             processing_profile=processing_profile,
             platform_hint=platform_hint,
             settings=settings,
@@ -1331,7 +1328,6 @@ def build_execution_tools(
     def bound_run_tracking_and_projection_tool(
         finish_temp_path: str,
         finish_path: str,
-        dataset_profile: str | None = None,
         processing_profile: str | None = None,
         platform_hint: str | None = None,
     ) -> dict:
@@ -1340,7 +1336,7 @@ def build_execution_tools(
             run_tracking_and_projection,
             finish_temp_path,
             finish_path,
-            dataset_profile=dataset_profile,
+            dataset_profile=None,
             processing_profile=processing_profile,
             platform_hint=platform_hint,
             settings=settings,

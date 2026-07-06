@@ -23,6 +23,8 @@ from vla_data_juicer_agents.adapters.agentscope import AgentScopeEventAdapter
 from vla_data_juicer_agents.core.cancellation import CancellationContext, bind_cancellation
 from vla_data_juicer_agents.core.events import CallbackEventSink, EventEmitter
 from vla_data_juicer_agents.navigation.agent_tools import build_navigation_agent_tools
+from vla_data_juicer_agents.navigation.models import NavigationRequest
+from vla_data_juicer_agents.navigation.plan_draft import WorkflowPlanDraftState
 from vla_data_juicer_agents.navigation.plan_draft_store import JsonNavigationPlanDraftStore
 from vla_data_juicer_agents.runtime.agentscope_bootstrap import bootstrap_agentscope_records
 from vla_data_juicer_agents.runtime.agentscope_config import AgentScopeRuntimeConfig
@@ -116,6 +118,15 @@ class AgentScopeRuntime:
     async def start_navigation_agent_task(self, *, web_session_id: str, message: str) -> str:
         await self.ensure_bootstrapped()
 
+        session_id = await self.ensure_web_session(
+            web_session_id,
+            agent_id=self.config.navigation_agent_id,
+            model=self.config.navigation_model,
+        )
+        self._precreate_navigation_plan_draft(
+            agentscope_session_id=session_id,
+            message=message,
+        )
         session_id = await self._start_agent_run(
             web_session_id=web_session_id,
             agent_id=self.config.navigation_agent_id,
@@ -205,6 +216,44 @@ class AgentScopeRuntime:
 
     def record_navigation_handoff(self, payload: dict[str, Any]) -> None:
         _logger.info("Navigation handoff: %s", payload)
+
+    def _precreate_navigation_plan_draft(
+        self,
+        *,
+        agentscope_session_id: str,
+        message: str,
+    ) -> None:
+        payload = _structured_handoff_payload_from_message(message)
+        if payload is None:
+            return
+        date = payload.get("date")
+        scene_mode = payload.get("scene_mode")
+        segments = payload.get("segments")
+        if not isinstance(date, str) or scene_mode not in {"in", "out"}:
+            return
+        if segments is not None and not isinstance(segments, list):
+            return
+        normalized_segments = (
+            [str(segment) for segment in segments]
+            if isinstance(segments, list)
+            else None
+        )
+        draft_store = JsonNavigationPlanDraftStore(
+            self.config.workspace_root / "navigation-plan-drafts"
+        )
+        if draft_store.load(agentscope_session_id) is not None:
+            return
+        draft_store.save(
+            agentscope_session_id,
+            WorkflowPlanDraftState(
+                request=NavigationRequest(
+                    date=date,
+                    scene_mode=scene_mode,
+                    segments=normalized_segments,
+                    dry_run=bool(payload.get("dry_run", False)),
+                )
+            ),
+        )
 
     async def submit_human_decision(self, *, web_session_id: str, decision: dict[str, Any]) -> bool:
         mapped = self._web_session_mapping(web_session_id)
@@ -841,6 +890,28 @@ def _date_from_navigation_target(target: str) -> str | None:
     return match.group(1)
 
 
+def _dates_from_text(text: str) -> list[str]:
+    return re.findall(r"(?<![0-9])([0-9]{8})(?![0-9])", text)
+
+
+def _clip_prefix_dates(clips: list[str]) -> set[str]:
+    return {
+        match.group(1)
+        for clip in clips
+        if (match := re.match(r"^([0-9]{8})[_-]", clip.strip()))
+    }
+
+
+def _navigation_handoff_date(*, request: str, target: str, clips: list[str]) -> str | None:
+    target_date = _date_from_navigation_target(target)
+    request_dates = _dates_from_text(request)
+    clip_dates = _clip_prefix_dates(clips)
+    non_clip_request_dates = [date for date in request_dates if date not in clip_dates]
+    if non_clip_request_dates:
+        return non_clip_request_dates[0]
+    return target_date or (request_dates[0] if request_dates else None)
+
+
 def _navigation_handoff_message(
     *,
     request: str,
@@ -855,7 +926,7 @@ def _navigation_handoff_message(
     payload = {
         "request": request,
         "target": target,
-        "date": _date_from_navigation_target(target),
+        "date": _navigation_handoff_date(request=request, target=target, clips=clips),
         "scene_mode": _navigation_scene_mode_for_request(scene_mode),
         "clips": clips,
         "segments": clips or None,
@@ -893,6 +964,21 @@ def _navigation_handoff_message(
             *structured_lines,
         ]
     )
+
+
+def _structured_handoff_payload_from_message(message: str) -> dict[str, Any] | None:
+    marker = "Structured handoff JSON:"
+    if marker not in message:
+        return None
+    lines = message.split(marker, 1)[1].strip().splitlines()
+    if not lines:
+        return None
+    json_text = lines[0]
+    try:
+        payload = json.loads(json_text)
+    except json.JSONDecodeError:
+        return None
+    return payload if isinstance(payload, dict) else None
 
 
 def _resolve_response_language(explicit: str | None, request: str) -> str:

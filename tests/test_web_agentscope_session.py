@@ -344,6 +344,20 @@ async def test_navigation_agent_internal_tools_are_auto_allowed(tmp_path: Path) 
         session_id="as-session-1",
         draft_store=JsonNavigationPlanDraftStore(tmp_path / "drafts"),
     )
+    gated_tool_names = {
+        "confirm_navigation_calibration_params_tool",
+        "prepare_raw_data_tool",
+        "extract_and_sync_navigation_data_tool",
+        "generate_gridmap_from_pcd_tool",
+        "assemble_finish_temp_tool",
+        "run_noobscene_preprocessing_tool",
+        "run_initial_annotation_gui_tool",
+        "run_tracking_tool",
+        "prepare_gridmap_for_projection_tool",
+        "run_projection_and_trajectory_tool",
+        "run_tracking_and_projection_tool",
+        "validate_navigation_outputs_tool",
+    }
 
     for tool in tools:
         if tool.name == "request_human_decision":
@@ -352,7 +366,10 @@ async def test_navigation_agent_internal_tools_are_auto_allowed(tmp_path: Path) 
 
         decision = await tool.check_permissions({}, PermissionContext())
 
-        assert decision.behavior == PermissionBehavior.ALLOW, tool.name
+        if tool.name in gated_tool_names:
+            assert decision.behavior == PermissionBehavior.DENY, tool.name
+        else:
+            assert decision.behavior == PermissionBehavior.ALLOW, tool.name
 
 
 @pytest.mark.asyncio
@@ -476,6 +493,49 @@ async def test_runtime_start_navigation_agent_task_switches_mapping_and_spawns_n
     assert run["session_id"] == "web-1__navigation-data-agent"
     assert run["agent_id"] == "navigation-data-agent"
     assert _message_text(run["message"]) == "处理 20270605 的室外数据"
+
+
+@pytest.mark.asyncio
+async def test_runtime_start_navigation_agent_task_precreates_session_draft_from_handoff(
+    tmp_path: Path,
+) -> None:
+    chat_run_registry = FakeChatRunRegistry()
+    chat_service = FakeChatService()
+    runtime = AgentScopeRuntime(
+        config=_agentscope_config(workspace_root=tmp_path),
+        storage=FakeAgentScopeStorage(),
+        message_bus=object(),
+        workspace_manager=object(),
+        app=SimpleNamespace(
+            state=SimpleNamespace(
+                chat_service=chat_service,
+                chat_run_registry=chat_run_registry,
+            )
+        ),
+    )
+    message = agentscope_runtime_module._navigation_handoff_message(
+        request="请帮我处理一下20270605的导航数据，室外数据。只处理20260605_152856就可以。",
+        target="20260605_152856",
+        scene_mode="outdoor",
+        clips=["20260605_152856"],
+        reason="用户给出了日期、室外场景和指定 clip",
+        response_language="Chinese",
+    )
+
+    session_id = await runtime.start_navigation_agent_task(
+        web_session_id="web-1",
+        message=message,
+    )
+    state = JsonNavigationPlanDraftStore(
+        tmp_path / "navigation-plan-drafts"
+    ).load(session_id)
+
+    assert session_id == "web-1__navigation-data-agent"
+    assert state is not None
+    assert state.request.date == "20270605"
+    assert state.request.scene_mode == "out"
+    assert state.request.segments == ["20260605_152856"]
+    await chat_run_registry.drain()
 
 
 @pytest.mark.asyncio

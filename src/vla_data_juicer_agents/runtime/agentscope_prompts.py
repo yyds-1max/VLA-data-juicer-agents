@@ -12,14 +12,20 @@ from date-specific rules.
 Planning workflow:
 
 1. Load the session-scoped workflow plan draft.
-2. Inspect raw metadata topics.
-3. Infer sensor bindings.
-4. Infer processing_profile.
-5. Merge processing_profile, platform_hint, topic_params, localization_policy,
+2. Follow the draft `next_required_observation` / `next_tool_candidates` exactly.
+3. Inspect raw metadata topics.
+4. Infer sensor bindings.
+5. Infer processing_profile.
+6. Infer topic_params.
+7. Inspect processing state, gridmap artifacts, runtime assets, and tool capabilities.
+8. Merge processing_profile, platform_hint, topic_params, localization_policy,
    calibration_policy, and stage_variants into the draft.
-6. If processing_profile.blocking_issues is non-empty, stop planning and report the issues.
-7. Finalize only after topic parameters and localization policy are explicit.
-8. Execute only the finalized WorkflowPlan.
+9. If processing_profile.blocking_issues is non-empty, stop planning and report the issues.
+10. Finalize only after topic parameters and localization policy are explicit.
+11. Execute only the finalized WorkflowPlan.
+
+Use the structured handoff `date` as the dataset date. Do not derive the dataset date
+from clip names, because clip names may contain an older capture timestamp prefix.
 
 Call `list_navigation_tool_capabilities_tool` before choosing variants.
 Call `update_workflow_plan_draft_tool` with the lightweight NavigationDataProfile.
@@ -185,11 +191,13 @@ Planning guidance:
 
 Operate with plan-and-execute and ReAct:
 1. Read the Structured handoff JSON from the task message. On the first planning turn, call get_workflow_plan_draft_tool with date, scene_mode, segments, and dry_run when no session draft exists.
-2. Use read-only inspection tools before execution: inspect_raw_date_tool, infer_navigation_sensor_bindings_tool, infer_navigation_processing_profile_tool, infer_navigation_topic_params_tool, inspect_processing_state_tool, inspect_gridmap_artifacts_tool, inspect_runtime_assets_tool, and list_navigation_tool_capabilities_tool.
-3. After each meaningful observation, call update_workflow_plan_draft_tool with only newly observed NavigationDataProfile facts, observation_id, and used_tool.
-4. do not hand-write final WorkflowPlan JSON. Execute only after finalize_workflow_plan_tool returns ok=true and a valid workflow_plan_json.
-5. If a finalized plan is already present in the draft, use it as the durable plan reference and continue from the current AgentScope conversation state.
-6. Preserve the localization policy: native Ins skips odom conversion, while odom localization requires odom_to_ins conversion.
+   Use the Structured handoff JSON `date` as the navigation dataset date exactly; do not infer or overwrite it from clip names because clip names may contain a different timestamp prefix.
+2. Follow the draft next_required_observation and next_tool_candidates exactly. Do not skip, reorder, or parallelize the read-only investigation sequence.
+3. Use read-only inspection tools before execution in the draft-required order: inspect_raw_date_tool, infer_navigation_sensor_bindings_tool, infer_navigation_processing_profile_tool, infer_navigation_topic_params_tool, inspect_processing_state_tool, inspect_gridmap_artifacts_tool, inspect_runtime_assets_tool, and list_navigation_tool_capabilities_tool.
+4. After each meaningful observation, call update_workflow_plan_draft_tool with only newly observed NavigationDataProfile facts, observation_id, and used_tool from the completed observation. The next read-only tool is determined by the updated draft.
+5. do not hand-write final WorkflowPlan JSON. Execute only after finalize_workflow_plan_tool returns ok=true and a valid workflow_plan_json.
+6. If a finalized plan is already present in the draft, use it as the durable plan reference and continue from the current AgentScope conversation state.
+7. Preserve the localization policy: native Ins skips odom conversion, while odom localization requires odom_to_ins conversion.
 
 After finalize_workflow_plan_tool returns a plan, execute the first
 `confirm_navigation_calibration_params` step by calling

@@ -8,6 +8,7 @@ from agentscope.tool import FunctionTool
 from vla_data_juicer_agents.navigation.models import NavigationRequest
 from vla_data_juicer_agents.navigation.plan_draft import WorkflowPlanDraftState, build_plan_from_draft
 from vla_data_juicer_agents.navigation.plan_draft_store import NavigationPlanDraftStore
+from vla_data_juicer_agents.navigation.plan_validation import validate_workflow_plan
 
 
 def build_session_plan_draft_tools(
@@ -91,6 +92,16 @@ def build_session_plan_draft_tools(
                 "message": str(exc),
                 "missing_fields": state.missing_fields(),
                 "next_tool_candidates": state.next_tool_candidates(),
+                "draft": state.schema_snapshot(),
+            }
+        validation = validate_workflow_plan(plan, data_profile=state.data_profile)
+        if validation["errors"]:
+            return {
+                "ok": False,
+                "error_type": "workflow_plan_validation_failed",
+                "message": "WorkflowPlan validation failed before finalization.",
+                "validation_errors": validation["errors"],
+                "validation_warnings": validation.get("warnings", []),
                 "draft": state.schema_snapshot(),
             }
         state.finalized_plan = plan

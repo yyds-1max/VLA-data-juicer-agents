@@ -499,7 +499,9 @@ def test_inspect_processing_state_summarizes_existing_intermediate_outputs(tmp_p
 
 def test_inspect_gridmap_artifacts_reports_projection_ready_before_generation(tmp_path):
     root = tmp_path / "VLADatasets"
-    (root / "finish_data" / "20270605_temp" / "samples" / "20270605" / "clip_a" / "grid_map").mkdir(parents=True)
+    gridmap_dir = root / "finish_data" / "20270605_temp" / "samples" / "20270605" / "clip_a" / "grid_map"
+    gridmap_dir.mkdir(parents=True)
+    (gridmap_dir / "grid_map.json").write_text("{}", encoding="utf-8")
     settings = NavigationSettings(vladatasets_root=root)
 
     result = inspect_gridmap_artifacts("20270605", ["segment_a"], settings=settings)
@@ -521,6 +523,18 @@ def test_inspect_gridmap_artifacts_reports_existing_clip_gridmap(tmp_path):
     assert result["gridmap_source"] == "existing_gridmap"
     assert result["projection_input_ready"] is False
     assert str(gridmap_dir) in result["available_gridmap_paths"]
+
+
+def test_inspect_gridmap_artifacts_ignores_empty_gridmap_dirs(tmp_path):
+    root = tmp_path / "VLADatasets"
+    empty_gridmap_dir = root / "clip_data" / "20270605" / "segment_a" / "sync_data" / "clip_a" / "grid_map"
+    empty_gridmap_dir.mkdir(parents=True)
+    settings = NavigationSettings(vladatasets_root=root)
+
+    result = inspect_gridmap_artifacts("20270605", ["segment_a"], settings=settings)
+
+    assert result["gridmap_source"] == "unknown"
+    assert result["available_gridmap_paths"] == []
 
 
 def test_inspect_runtime_assets_reports_variant_supporting_scripts(tmp_path):
