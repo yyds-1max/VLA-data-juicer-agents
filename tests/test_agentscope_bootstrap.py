@@ -59,6 +59,7 @@ def test_main_router_prompt_presents_datapilot_and_sets_task_readiness_rules():
     assert "start_navigation_data_task" in prompt
     assert "call start_navigation_data_task" in prompt
     assert "target" in prompt
+    assert "date" in prompt
     assert "scene_mode" in prompt
     assert "missing_fields" in prompt
     assert "confidence" in prompt
@@ -119,6 +120,7 @@ def test_navigation_agent_prompt_requires_plan_execute_react_and_human_decisions
         "scene mode is missing",
         "structured handoff",
         "target",
+        "date",
         "scene_mode",
         "clips",
         "indoor or outdoor",
@@ -135,6 +137,7 @@ def test_navigation_agent_prompt_requires_plan_execute_react_and_human_decisions
     ]:
         assert expected in prompt
 
+    assert "structured handoff context containing request, target, date" in prompt
     assert "Plan-Agent workflow" not in prompt
     assert "user_confirmation" not in prompt
     assert "exactly `确认`" not in prompt

@@ -664,6 +664,7 @@ def test_navigation_handoff_tool_declares_structured_schema():
         "target",
         "date",
         "scene_mode",
+        "clips",
         "reason",
         "missing_fields",
         "confidence",
@@ -671,6 +672,14 @@ def test_navigation_handoff_tool_declares_structured_schema():
     ]
     assert tool.input_schema["properties"]["scene_mode"]["enum"] == ["indoor", "outdoor", "unknown"]
     assert tool.input_schema["properties"]["confidence"]["enum"] == ["low", "medium", "high"]
+    assert tool.input_schema["properties"]["missing_fields"]["items"]["enum"] == [
+        "request",
+        "target",
+        "date",
+        "scene_mode",
+        "clips",
+        "other",
+    ]
 
 
 def test_navigation_handoff_tool_rejects_missing_fields_without_starting_navigation():

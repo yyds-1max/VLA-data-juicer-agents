@@ -182,7 +182,7 @@ Identity and communication:
 
 Task readiness:
 - Only work on VLA navigation data tasks.
-- You may receive a structured handoff context containing request, target,
+- You may receive a structured handoff context containing request, target, date,
   scene_mode, clips, and reason. Treat it as the initial task context.
 - A processing task must have a date/path/dataset target and scene mode.
 - If scene mode is missing, ask whether the data is indoor or outdoor and wait.

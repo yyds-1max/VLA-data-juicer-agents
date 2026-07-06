@@ -1045,7 +1045,7 @@ class NavigationHandoffTool(ToolBase):
                 "type": "array",
                 "items": {
                     "type": "string",
-                    "enum": ["request", "target", "scene_mode", "clips", "other"],
+                    "enum": ["request", "target", "date", "scene_mode", "clips", "other"],
                 },
                 "description": "Fields that are still missing. Must be empty before starting processing.",
             },
@@ -1064,6 +1064,7 @@ class NavigationHandoffTool(ToolBase):
             "target",
             "date",
             "scene_mode",
+            "clips",
             "reason",
             "missing_fields",
             "confidence",
