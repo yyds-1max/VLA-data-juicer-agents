@@ -54,14 +54,6 @@ class RawDateInspection(BaseModel):
         return _validate_date(value)
 
 
-class ProfileClassification(BaseModel):
-    profile_name: str | None
-    confidence: float
-    matched_topics: list[str] = Field(default_factory=list)
-    missing_topics: list[str] = Field(default_factory=list)
-    notes: list[str] = Field(default_factory=list)
-
-
 class StageVariantDecision(BaseModel):
     variant: str
     reason: str = ""

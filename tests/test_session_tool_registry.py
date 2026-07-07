@@ -1276,10 +1276,10 @@ def test_continue_workflow_is_disabled_even_with_legacy_pending_state(tmp_path, 
     runtime.state.pending_workflow_input_type = "calibration_confirmation"
 
     async def fail_plan(*args, **kwargs):
-        raise AssertionError("disabled continue must not call Plan-Agent")
+        raise AssertionError("disabled continue must not call NavigationDataAgent planner")
 
     async def fail_executor(*args, **kwargs):
-        raise AssertionError("disabled continue must not call Executor-Agent")
+        raise AssertionError("disabled continue must not call NavigationDataAgent executor")
 
     monkeypatch.setattr("vla_data_juicer_agents.tools.vla.run_workflow.run_plan_agent", fail_plan)
     monkeypatch.setattr("vla_data_juicer_agents.tools.vla.run_workflow.run_executor_agent", fail_executor)

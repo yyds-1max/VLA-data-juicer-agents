@@ -13,7 +13,7 @@ _INVESTIGATION_OBSERVATION_STEPS: tuple[dict[str, str], ...] = (
     {
         "observation_id": "raw_metadata",
         "used_tool": "inspect_raw_date_tool",
-        "description": "Inspect raw ROS bag/db3 metadata topics before inferring platform or sensor roles.",
+        "description": "Inspect raw ROS bag/db3 metadata topics before inferring sensor roles.",
     },
     {
         "observation_id": "sensor_bindings",
@@ -23,12 +23,12 @@ _INVESTIGATION_OBSERVATION_STEPS: tuple[dict[str, str], ...] = (
     {
         "observation_id": "navigation_processing_profile",
         "used_tool": "infer_navigation_processing_profile_tool",
-        "description": "Infer processing profile, platform hint, localization, calibration, and initial variants.",
+        "description": "Infer processing profile, platform hint, localization policy, and calibration policy.",
     },
     {
         "observation_id": "navigation_topic_params",
         "used_tool": "infer_navigation_topic_params_tool",
-        "description": "Infer TOPIC_WHITELIST, topic_map, and query_dir after sensor roles are known.",
+        "description": "Infer explicit topic_whitelist, topic_map, and query_dir after sensor roles are known.",
     },
     {
         "observation_id": "processing_state",
@@ -43,12 +43,12 @@ _INVESTIGATION_OBSERVATION_STEPS: tuple[dict[str, str], ...] = (
     {
         "observation_id": "runtime_assets",
         "used_tool": "inspect_runtime_assets_tool",
-        "description": "Inspect available scripts for gridmap generation, annotation, and projection variants.",
+        "description": "Inspect available scripts before selecting gridmap and projection variants.",
     },
     {
         "observation_id": "tool_capabilities",
         "used_tool": "list_navigation_tool_capabilities_tool",
-        "description": "Confirm selected variants are exposed by the navigation capability catalog.",
+        "description": "Confirm selected strategy variants are exposed by the navigation capability catalog.",
     },
 )
 
@@ -76,11 +76,6 @@ class WorkflowPlanDraftState(BaseModel):
             "dry_run": coerced.get("dry_run", False),
         }
         return coerced
-
-    @property
-    def dataset_profile(self) -> str | None:
-        """Compatibility for callers that still probe the old draft attribute."""
-        return self.processing_profile
 
     @property
     def date(self) -> str:
@@ -242,10 +237,6 @@ class WorkflowPlanDraftState(BaseModel):
 
     def update(
         self,
-        dataset_profile: str | None = None,
-        profile: str | None = None,
-        processing_profile: str | dict[str, Any] | None = None,
-        platform_hint: str | None = None,
         data_profile: dict[str, Any] | NavigationDataProfile | str | None = None,
         data_profile_patch: dict[str, Any] | str | None = None,
         observation_id: str | None = None,
@@ -265,26 +256,6 @@ class WorkflowPlanDraftState(BaseModel):
                 ),
             )
 
-        legacy_profile_hint = dataset_profile or profile
-        if legacy_profile_hint is not None:
-            self.platform_hint = legacy_profile_hint
-            patch.setdefault("platform_hint", legacy_profile_hint)
-        if processing_profile is not None:
-            if isinstance(processing_profile, dict):
-                patch.setdefault("processing_profile", processing_profile)
-                profile_id = processing_profile.get("id")
-                if isinstance(profile_id, str):
-                    self.processing_profile = profile_id
-                nested_platform_hint = processing_profile.get("platform_hint")
-                if isinstance(nested_platform_hint, str):
-                    self.platform_hint = nested_platform_hint
-                    patch.setdefault("platform_hint", nested_platform_hint)
-            else:
-                self.processing_profile = processing_profile
-                patch.setdefault("processing_profile", {"id": processing_profile})
-        if platform_hint is not None:
-            self.platform_hint = platform_hint
-            patch["platform_hint"] = platform_hint
         records_observation = observation_id is not None or used_tool is not None
         if records_observation and not patch:
             self.validation_errors.append(
@@ -396,21 +367,13 @@ def build_plan_from_draft(state: WorkflowPlanDraftState) -> WorkflowPlan:
 
 def build_plan_draft_tools(state: WorkflowPlanDraftState) -> list[FunctionTool]:
     def update_workflow_plan_draft_tool(
-        dataset_profile: str | None = None,
-        profile: str | None = None,
-        processing_profile: str | dict[str, Any] | None = None,
-        platform_hint: str | None = None,
         data_profile: dict[str, Any] | str | None = None,
         data_profile_patch: dict[str, Any] | str | None = None,
         observation_id: str | None = None,
         used_tool: str | None = None,
     ) -> dict[str, Any]:
-        """Merge one ReAct-round NavigationDataProfile patch into the internal draft."""
+        """Merge one observed NavigationDataProfile patch into the internal draft."""
         return state.update(
-            dataset_profile=dataset_profile,
-            profile=profile,
-            processing_profile=processing_profile,
-            platform_hint=platform_hint,
             data_profile=data_profile,
             data_profile_patch=data_profile_patch,
             observation_id=observation_id,
@@ -422,7 +385,7 @@ def build_plan_draft_tools(state: WorkflowPlanDraftState) -> list[FunctionTool]:
         return state.status()
 
     def finalize_workflow_plan_tool() -> dict[str, Any]:
-        """Finalize and return strict WorkflowPlan JSON after the processing profile has been validated."""
+        """Finalize and return strict WorkflowPlan JSON after the NavigationDataProfile draft is complete."""
         plan = build_plan_from_draft(state)
         state.finalized_plan = plan
         return {
@@ -499,7 +462,6 @@ def _navigation_data_profile_schema() -> dict[str, Any]:
     schema = NavigationDataProfile.model_json_schema()
     properties = schema.setdefault("properties", {})
     properties.setdefault("scene_mode", {})["enum"] = ["in", "out"]
-    properties.pop("dataset_profile", None)
     properties.setdefault("gridmap_source", {})["enum"] = [
         "existing_gridmap",
         "generated_from_pcd",

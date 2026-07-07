@@ -108,8 +108,8 @@ def _complete_profile_patch():
         "pcd_gridmap_tool_available": True,
         "stage_variants": {
             "extract_and_sync_navigation_data": {
-                "variant": "go2w_like",
-                "reason": "processing profile inferred go2w platform bindings",
+                "variant": "explicit_topic_params",
+                "reason": "topic parameters were inferred from sensor role bindings",
                 "evidence": ["infer_navigation_processing_profile_tool"],
             },
             "prepare_gridmap_for_projection": {
@@ -119,7 +119,7 @@ def _complete_profile_patch():
             },
             "run_projection_and_trajectory": {
                 "variant": "cjl_0525_with_gridmap",
-                "reason": "go2w platform uses the 0525 projection script",
+                "reason": "runtime assets support the 0525 projection script",
                 "evidence": ["inspect_runtime_assets_tool"],
             },
         },
@@ -666,8 +666,8 @@ def test_navigation_agent_tools_can_resume_finalized_plan_from_store(tmp_path):
         "pcd_gridmap_tool_available": True,
         "stage_variants": {
             "extract_and_sync_navigation_data": {
-                "variant": "go2w_like",
-                "reason": "processing profile inferred go2w platform bindings",
+                "variant": "explicit_topic_params",
+                "reason": "topic parameters were inferred from sensor role bindings",
                 "evidence": ["infer_navigation_processing_profile_tool"],
             },
             "prepare_gridmap_for_projection": {
@@ -677,7 +677,7 @@ def test_navigation_agent_tools_can_resume_finalized_plan_from_store(tmp_path):
             },
             "run_projection_and_trajectory": {
                 "variant": "cjl_0525_with_gridmap",
-                "reason": "go2w platform uses the 0525 projection script",
+                "reason": "runtime assets support the 0525 projection script",
                 "evidence": ["inspect_runtime_assets_tool"],
             },
         },

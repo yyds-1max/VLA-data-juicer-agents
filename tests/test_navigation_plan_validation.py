@@ -162,8 +162,15 @@ def test_validate_workflow_plan_rejects_cyclic_precondition():
     assert result["errors"][0]["type"] == "cyclic_precondition"
 
 
-def test_validate_workflow_plan_checks_platform_selectors_from_processing_facts():
-    profile = _go2w_data_profile()
+def test_validate_workflow_plan_accepts_mixed_topic_strategy_variants():
+    profile = NavigationDataProfile(
+        date="20270605",
+        scene_mode="out",
+        processing_profile=_processing_profile(profile_hint="hybrid", platform_hint="unknown"),
+        platform_hint="unknown",
+        localization_policy={"source": "odom", "conversion": "odom_to_ins"},
+        topic_params=_topic_params("hybrid"),
+    )
     plan = WorkflowPlan(
         date="20270605",
         scene_mode="out",
@@ -174,24 +181,29 @@ def test_validate_workflow_plan_checks_platform_selectors_from_processing_facts(
             WorkflowStep(
                 step_id="extract_and_sync_navigation_data",
                 tool_name="extract_and_sync_navigation_data",
-                variant="u_legacy_like",
-            )
+                variant="explicit_topic_params",
+            ),
+            WorkflowStep(
+                step_id="run_projection_and_trajectory",
+                tool_name="run_projection_and_trajectory",
+                variant="cjl_0525_with_gridmap",
+                arguments={"projection_variant": "cjl_0525_with_gridmap"},
+                preconditions=["extract_and_sync_navigation_data"],
+            ),
         ],
     )
 
     result = validate_workflow_plan(plan, data_profile=profile)
 
-    assert result["ok"] is False
-    assert result["errors"][0]["type"] == "variant_selector_mismatch"
-    assert result["errors"][0]["details"]["selector"] == "platform_hint"
-    assert result["errors"][0]["details"]["actual"] == "go2w"
+    assert result["ok"] is True
+    assert result["errors"] == []
 
 
-def test_validate_workflow_plan_accepts_legacy_processing_profile_from_plan_only_facts():
+def test_validate_workflow_plan_rejects_removed_platform_bucket_variants():
     plan = WorkflowPlan(
         date="20270605",
         scene_mode="out",
-        processing_profile="go2w_like",
+        processing_profile="parameterized_navigation_v1",
         platform_hint="go2w",
         steps=[
             _confirm_step(),
@@ -205,17 +217,8 @@ def test_validate_workflow_plan_accepts_legacy_processing_profile_from_plan_only
 
     result = validate_workflow_plan(plan)
 
-    assert result["ok"] is True
-    assert result["errors"] == []
-
-    plan.processing_profile = "parameterized_navigation_v1"
-    plan.platform_hint = "u"
-    result = validate_workflow_plan(plan)
-
     assert result["ok"] is False
-    assert result["errors"][0]["type"] == "variant_selector_mismatch"
-    assert result["errors"][0]["details"]["selector"] == "platform_hint"
-    assert result["errors"][0]["details"]["actual"] == "u"
+    assert result["errors"][0]["type"] == "unknown_or_unavailable_variant"
 
 
 def test_validate_workflow_plan_rejects_gridmap_before_tracking():

@@ -16,12 +16,12 @@ Planning workflow:
 3. Inspect raw metadata topics.
 4. Infer sensor bindings.
 5. Infer processing_profile.
-6. Infer topic_params.
+6. Infer topic_params from the role bindings.
 7. Inspect processing state, gridmap artifacts, runtime assets, and tool capabilities.
 8. Merge processing_profile, platform_hint, topic_params, localization_policy,
-   calibration_policy, and stage_variants into the draft.
-9. If processing_profile.blocking_issues is non-empty, stop planning and report the issues.
-10. Finalize only after topic parameters and localization policy are explicit.
+   calibration_policy, gridmap facts, and stage_variants into the draft.
+9. If any blocking_issues are non-empty, stop planning and report the issues.
+10. Finalize only after topic parameters, localization policy, and stage variants are explicit.
 11. Execute only the finalized WorkflowPlan.
 
 Use the structured handoff `date` as the dataset date. Do not derive the dataset date
@@ -54,16 +54,19 @@ do not include full raw topic lists, calibration trees, directory inventories, o
 artifact manifests in the data_profile. Keep large facts in observations.
 do not invent `TOPIC_WHITELIST`, `topic_map`, or `query_dir`; copy them from `infer_navigation_topic_params_tool`.
 do not invent localization policy or calibration policy; copy them from `infer_navigation_processing_profile_tool`.
+`platform_hint` is only a diagnostic hint. Do not use it as a hard selector for topic parameters, extraction variants, or projection variants.
 Do not require data to fit fixed `u_legacy_like` or `go2w_like` classifications as the
 primary planning path.
 
 Variant rules:
 
-- `extract_and_sync_navigation_data` uses topic_params topic_whitelist, topic_map, and query_dir.
+- `extract_and_sync_navigation_data` always uses the `explicit_topic_params` variant once topic_params is complete. Pass topic_params topic_whitelist, topic_map, and query_dir exactly as returned by `infer_navigation_topic_params_tool`.
 - `prepare_gridmap_for_projection` uses `copy_existing_gridmap` when clip/sync grid_map exists.
 - `prepare_gridmap_for_projection` uses `generate_from_pcd` when no grid_map exists and the PCD gridmap tool is available.
 - `prepare_gridmap_for_projection` uses `skip_if_projection_ready` when finish temp already contains projection-ready grid_map.
-- `run_projection_and_trajectory` uses platform_hint and catalog selectors to choose the projection variant.
+- `run_projection_and_trajectory` uses the explicit `projection_variant` argument from
+  `stage_variants.run_projection_and_trajectory`. Write the same value into the WorkflowStep variant and the tool arguments.
+- Choose `run_projection_and_trajectory` variants from observed runtime/tool capability evidence. Do not choose `cjl_0525_with_gridmap` merely because `platform_hint` is `go2w`; if no observed evidence distinguishes the projection script, use `cjl_with_gridmap`.
 - The calibration confirmation gate is the first finalized WorkflowPlan step,
   before `prepare_raw_data` and before any processing step. Execute that gate
   by calling `request_human_decision` with decision_type=`camera_params`,

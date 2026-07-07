@@ -18,8 +18,8 @@ from vla_data_juicer_agents.navigation.workflow import build_deterministic_plan_
 def _complete_stage_variants(gridmap_variant: str, gridmap_reason: str, gridmap_evidence: list[str]):
     return {
         "extract_and_sync_navigation_data": StageVariantDecision(
-            variant="go2w_like",
-            reason="processing profile inferred go2w platform bindings",
+            variant="explicit_topic_params",
+            reason="topic parameters were inferred from sensor role bindings",
             evidence=["infer_navigation_processing_profile_tool"],
         ),
         "prepare_gridmap_for_projection": StageVariantDecision(
@@ -29,7 +29,7 @@ def _complete_stage_variants(gridmap_variant: str, gridmap_reason: str, gridmap_
         ),
         "run_projection_and_trajectory": StageVariantDecision(
             variant="cjl_0525_with_gridmap",
-            reason="go2w platform uses the 0525 projection script",
+            reason="runtime assets support the 0525 projection script",
             evidence=["inspect_runtime_assets_tool"],
         ),
     }
@@ -321,15 +321,18 @@ def test_workflow_plan_draft_requires_processing_profile_not_dataset_profile():
     assert "processing_profile" in snapshot["missing_fields"]
 
 
-def test_workflow_plan_draft_update_accepts_processing_profile_dict_argument():
+def test_workflow_plan_draft_update_accepts_processing_profile_patch():
     state = WorkflowPlanDraftState(date="20270605", scene_mode="out")
 
     result = state.update(
-        processing_profile={
-            "id": "parameterized_navigation_v1",
+        data_profile_patch={
             "platform_hint": "custom_robot",
-            "topic_params": _go2w_topic_params().model_dump(mode="json"),
-            "localization_policy": {"source": "odom", "conversion": "odom_to_ins"},
+            "processing_profile": {
+                "id": "parameterized_navigation_v1",
+                "platform_hint": "custom_robot",
+                "topic_params": _go2w_topic_params().model_dump(mode="json"),
+                "localization_policy": {"source": "odom", "conversion": "odom_to_ins"},
+            },
         }
     )
 
@@ -564,8 +567,8 @@ def test_workflow_plan_draft_merges_data_profile_patches_across_react_rounds():
             "topic_params": _go2w_topic_params().model_dump(mode="json"),
             "stage_variants": {
                 "extract_and_sync_navigation_data": {
-                    "variant": "go2w_like",
-                    "reason": "processing profile inferred go2w platform bindings",
+                    "variant": "explicit_topic_params",
+                    "reason": "topic parameters were inferred from sensor role bindings",
                     "evidence": ["infer_navigation_processing_profile_tool"],
                 },
             },
@@ -585,7 +588,7 @@ def test_workflow_plan_draft_merges_data_profile_patches_across_react_rounds():
                 },
                 "run_projection_and_trajectory": {
                     "variant": "cjl_0525_with_gridmap",
-                    "reason": "go2w platform uses 0525 projection",
+                    "reason": "runtime assets support the 0525 projection script",
                     "evidence": ["inspect_runtime_assets_tool"],
                 },
             },
@@ -600,7 +603,7 @@ def test_workflow_plan_draft_merges_data_profile_patches_across_react_rounds():
     assert draft["processing_profile"]["id"] == "parameterized_navigation_v1"
     assert draft["topic_params"]["query_dir"] == "rs32_lidar_points"
     assert draft["gridmap_source"] == "existing_gridmap"
-    assert draft["stage_variants"]["extract_and_sync_navigation_data"]["variant"] == "go2w_like"
+    assert draft["stage_variants"]["extract_and_sync_navigation_data"]["variant"] == "explicit_topic_params"
     assert draft["stage_variants"]["prepare_gridmap_for_projection"]["variant"] == "copy_existing_gridmap"
     assert state.data_profile is not None
     assert state.data_profile.processing_profile is not None
@@ -756,8 +759,8 @@ def test_plan_from_lightweight_profile_writes_variant_metadata_for_profile_drive
             gridmap_source="existing_gridmap",
             stage_variants={
                 "extract_and_sync_navigation_data": StageVariantDecision(
-                    variant="go2w_like",
-                    reason="processing profile inferred go2w platform bindings",
+                    variant="explicit_topic_params",
+                    reason="topic parameters were inferred from sensor role bindings",
                     evidence=["infer_navigation_processing_profile_tool"],
                 ),
                 "prepare_gridmap_for_projection": StageVariantDecision(
@@ -767,7 +770,7 @@ def test_plan_from_lightweight_profile_writes_variant_metadata_for_profile_drive
                 ),
                 "run_projection_and_trajectory": StageVariantDecision(
                     variant="cjl_0525_with_gridmap",
-                    reason="go2w platform uses the 0525 projection script",
+                    reason="runtime assets support the 0525 projection script",
                     evidence=["inspect_runtime_assets_tool"],
                 ),
             },
@@ -777,8 +780,8 @@ def test_plan_from_lightweight_profile_writes_variant_metadata_for_profile_drive
         gridmap_source="existing_gridmap",
         stage_variants={
             "extract_and_sync_navigation_data": StageVariantDecision(
-                variant="go2w_like",
-                reason="processing profile inferred go2w platform bindings",
+                variant="explicit_topic_params",
+                reason="topic parameters were inferred from sensor role bindings",
                 evidence=["infer_navigation_processing_profile_tool"],
             ),
             "prepare_gridmap_for_projection": StageVariantDecision(
@@ -788,7 +791,7 @@ def test_plan_from_lightweight_profile_writes_variant_metadata_for_profile_drive
             ),
             "run_projection_and_trajectory": StageVariantDecision(
                 variant="cjl_0525_with_gridmap",
-                reason="go2w platform uses the 0525 projection script",
+                reason="runtime assets support the 0525 projection script",
                 evidence=["inspect_runtime_assets_tool"],
             ),
         },
@@ -798,7 +801,7 @@ def test_plan_from_lightweight_profile_writes_variant_metadata_for_profile_drive
     plan = build_plan_from_draft(state)
     steps = {step.tool_name: step for step in plan.steps}
 
-    assert steps["extract_and_sync_navigation_data"].variant == "go2w_like"
+    assert steps["extract_and_sync_navigation_data"].variant == "explicit_topic_params"
     assert steps["extract_and_sync_navigation_data"].arguments["topic_whitelist"] == [
         "/cam_video4/csi_cam/image_raw/compressed",
         "/rs32_lidar_points",
@@ -814,6 +817,7 @@ def test_plan_from_lightweight_profile_writes_variant_metadata_for_profile_drive
         "data_profile.stage_variants.extract_and_sync_navigation_data"
     )
     assert steps["run_projection_and_trajectory"].variant == "cjl_0525_with_gridmap"
+    assert steps["run_projection_and_trajectory"].arguments["projection_variant"] == "cjl_0525_with_gridmap"
     assert steps["run_projection_and_trajectory"].decision_ref == (
         "data_profile.stage_variants.run_projection_and_trajectory"
     )

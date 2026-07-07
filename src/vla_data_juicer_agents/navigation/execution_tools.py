@@ -13,7 +13,6 @@ from vla_data_juicer_agents.core.cancellation import (
 )
 from vla_data_juicer_agents.navigation.config import NavigationSettings
 from vla_data_juicer_agents.navigation.models import DATE_RE, ToolResult
-from vla_data_juicer_agents.navigation.profiles import get_profile
 from vla_data_juicer_agents.navigation.runtime import (
     data_runtime_command,
     python_data_command,
@@ -25,7 +24,6 @@ from vla_data_juicer_agents.navigation.subprocess_runner import run_command
 PROCESSING_SCRIPT_ROOT = Path(__file__).resolve().parent / "processing"
 REPOSITORY_EXTRACT_SCRIPT = PROCESSING_SCRIPT_ROOT / "extract_ros2_bag.py"
 REPOSITORY_SYNC_SCRIPT = PROCESSING_SCRIPT_ROOT / "sync_navigation_data.py"
-DEFAULT_LEGACY_DATASET_PROFILE = "u_legacy_like"
 
 
 def _normalize_segments_arg(segments: list[str] | str | None) -> list[str] | None:
@@ -125,22 +123,6 @@ def _missing_topic_param_names(
     return missing
 
 
-def _legacy_dataset_profile_from_execution_args(
-    dataset_profile: str | None = None,
-    processing_profile: str | None = None,
-    platform_hint: str | None = None,
-) -> str:
-    if dataset_profile in {"go2w_like", "u_legacy_like"}:
-        return dataset_profile
-    if processing_profile in {"go2w_like", "u_legacy_like"}:
-        return processing_profile
-    if platform_hint == "go2w":
-        return "go2w_like"
-    if platform_hint == "u":
-        return "u_legacy_like"
-    return DEFAULT_LEGACY_DATASET_PROFILE
-
-
 def _missing_outputs(produced_paths: list[Path], dry_run: bool) -> list[Path]:
     if dry_run:
         return []
@@ -217,18 +199,6 @@ def _sensor_source_for_platform_hint(settings: NavigationSettings, platform_hint
     hint = (platform_hint or "unknown").lower()
     sensor_param_dir = "20260529_go2w" if hint == "go2w" else "20260409_U"
     return settings.processing_root / "NoobScenes" / "params" / sensor_param_dir / "sensors"
-
-
-def _platform_hint_for_profile(dataset_profile: str | None) -> str | None:
-    if dataset_profile == "go2w_like":
-        return "go2w"
-    if dataset_profile == "u_legacy_like":
-        return "u"
-    return None
-
-
-def _sensor_source_for_profile(settings: NavigationSettings, dataset_profile: str | None) -> Path:
-    return _sensor_source_for_platform_hint(settings, _platform_hint_for_profile(dataset_profile))
 
 
 def _transform_gridmap_payload(payload: Any) -> Any:
@@ -473,7 +443,6 @@ def generate_gridmap_from_pcd(
 
 def extract_and_sync_navigation_data(
     date: str,
-    dataset_profile: str | None = None,
     segments: list[str] | None = None,
     processes_num: int = 4,
     topic_whitelist: list[str] | None = None,
@@ -486,11 +455,6 @@ def extract_and_sync_navigation_data(
 ) -> ToolResult:
     date = _validate_date(date)
     settings = settings or NavigationSettings()
-    legacy_profile = _legacy_dataset_profile_from_execution_args(
-        dataset_profile=dataset_profile,
-        processing_profile=processing_profile,
-        platform_hint=platform_hint,
-    )
     missing_topic_params = _missing_topic_param_names(topic_whitelist, topic_map, query_dir)
     if missing_topic_params:
         return ToolResult(
@@ -502,12 +466,12 @@ def extract_and_sync_navigation_data(
             ),
             produced_paths=[settings.clip_data_root / date],
             details={
-                "profile": legacy_profile,
+                "processing_profile": processing_profile,
+                "platform_hint": platform_hint,
                 "missing_topic_params": missing_topic_params,
                 "dry_run": dry_run,
             },
         )
-    profile = get_profile(legacy_profile)
     raw_temp_path = settings.raw_data_root / f"{date}_temp"
     if dry_run:
         selected = _selected_segments_for_dry_run(raw_temp_path, settings.raw_data_root / date, segments)
@@ -524,7 +488,8 @@ def extract_and_sync_navigation_data(
             message="No selected segments for extract/sync.",
             produced_paths=[settings.clip_data_root / date],
             details={
-                "profile": profile.name,
+                "processing_profile": processing_profile,
+                "platform_hint": platform_hint,
                 "selected_segments": selected,
                 "extract_topics": effective_topic_whitelist,
                 "sync_topic_map": effective_topic_map,
@@ -618,7 +583,8 @@ def extract_and_sync_navigation_data(
         produced_paths=[settings.clip_data_root / date],
         commands=commands,
         details={
-            "profile": profile.name,
+            "processing_profile": processing_profile,
+            "platform_hint": platform_hint,
             "selected_segments": selected,
             "extract_topics": effective_topic_whitelist,
             "sync_topic_map": effective_topic_map,
@@ -636,7 +602,6 @@ def assemble_finish_temp(
     segments: list[str] | None = None,
     settings: NavigationSettings | None = None,
     dry_run: bool = False,
-    dataset_profile: str | None = None,
     platform_hint: str | None = None,
     processing_profile: str | None = None,
 ) -> ToolResult:
@@ -649,8 +614,7 @@ def assemble_finish_temp(
         selected = _selected_segments(clip_date_root, segments)
     finish_temp = settings.finish_data_root / f"{date}_temp"
     samples_date_root = finish_temp / "samples" / date
-    effective_platform_hint = platform_hint if platform_hint is not None else _platform_hint_for_profile(dataset_profile)
-    sensor_source = _sensor_source_for_platform_hint(settings, effective_platform_hint)
+    sensor_source = _sensor_source_for_platform_hint(settings, platform_hint)
     copied_clips: list[str] = []
 
     for segment in selected:
@@ -693,8 +657,7 @@ def assemble_finish_temp(
             "selected_segments": selected,
             "copied_clips": copied_clips,
             "sensor_source": str(sensor_source),
-            "platform_hint": effective_platform_hint,
-            "dataset_profile": dataset_profile,
+            "platform_hint": platform_hint,
             "processing_profile": processing_profile,
             "dry_run": dry_run,
         },
@@ -968,9 +931,9 @@ def run_tracking_and_projection(
     finish_path: str | Path,
     settings: NavigationSettings | None = None,
     dry_run: bool = False,
-    dataset_profile: str | None = None,
     processing_profile: str | None = None,
     platform_hint: str | None = None,
+    projection_variant: str | None = None,
 ) -> ToolResult:
     settings = settings or NavigationSettings()
     root = _resolve_data_path(finish_temp_path, settings)
@@ -985,9 +948,9 @@ def run_tracking_and_projection(
     projection_result = run_projection_and_trajectory(
         root,
         finish_path,
-        dataset_profile=dataset_profile,
         processing_profile=processing_profile,
         platform_hint=platform_hint,
+        projection_variant=projection_variant,
         settings=settings,
         dry_run=dry_run,
     )
@@ -1032,12 +995,31 @@ def run_tracking(
     )
 
 
+def _projection_variant_from_execution_args(
+    *,
+    projection_variant: str | None,
+) -> str:
+    if projection_variant not in {None, ""}:
+        return projection_variant
+    return "cjl_with_gridmap"
+
+
+def _trajectory_script_for_projection_variant(projection_variant: str) -> tuple[str, str]:
+    if projection_variant == "cjl_with_gridmap":
+        return "2_othermethod_cjl.py", "cjl_with_gridmap"
+    if projection_variant == "cjl_0525_with_gridmap":
+        return "2_othermethod_cjl_0525.py", "cjl_0525_with_gridmap"
+    raise ValueError(
+        "projection_variant must be one of: cjl_with_gridmap, cjl_0525_with_gridmap"
+    )
+
+
 def run_projection_and_trajectory(
     finish_temp_path: str | Path,
     finish_path: str | Path,
-    dataset_profile: str | None = None,
     processing_profile: str | None = None,
     platform_hint: str | None = None,
+    projection_variant: str | None = None,
     settings: NavigationSettings | None = None,
     dry_run: bool = False,
 ) -> ToolResult:
@@ -1045,12 +1027,12 @@ def run_projection_and_trajectory(
     root = _resolve_data_path(finish_temp_path, settings)
     final = _resolve_data_path(finish_path, settings)
     pt_project = settings.processing_root / "2_pt_project"
-    legacy_profile = _legacy_dataset_profile_from_execution_args(
-        dataset_profile=dataset_profile,
-        processing_profile=processing_profile,
-        platform_hint=platform_hint,
+    selected_projection_variant = _projection_variant_from_execution_args(
+        projection_variant=projection_variant,
     )
-    trajectory_script = "2_othermethod_cjl_0525.py" if legacy_profile == "go2w_like" else "2_othermethod_cjl.py"
+    trajectory_script, effective_projection_variant = _trajectory_script_for_projection_variant(
+        selected_projection_variant
+    )
     commands = [
         run_command(
             python_data_command(settings.runtime, "main.py", ["--data_root", root]),
@@ -1102,10 +1084,9 @@ def run_projection_and_trajectory(
         commands=commands,
         details={
             "dry_run": dry_run,
-            "dataset_profile": dataset_profile,
             "processing_profile": processing_profile,
             "platform_hint": platform_hint,
-            "legacy_profile": legacy_profile,
+            "projection_variant": effective_projection_variant,
             "trajectory_script": trajectory_script,
         },
     )
@@ -1194,11 +1175,11 @@ def build_execution_tools(
         processing_profile: str | None = None,
         platform_hint: str | None = None,
     ) -> dict:
+        """Extract and sync raw navigation data using explicit topic_whitelist, topic_map, and query_dir."""
         return _execute_with_cancellation(
             cancellation,
             extract_and_sync_navigation_data,
             date=date,
-            dataset_profile=None,
             segments=_normalize_segments_arg(segments),
             processes_num=processes_num,
             topic_whitelist=_normalize_string_list_arg(topic_whitelist),
@@ -1232,7 +1213,6 @@ def build_execution_tools(
             date,
             _normalize_segments_arg(segments),
             settings=settings,
-            dataset_profile=None,
             platform_hint=platform_hint,
             processing_profile=processing_profile,
             dry_run=dry_run,
@@ -1277,6 +1257,7 @@ def build_execution_tools(
         finish_temp_path: str | None = None,
         gridmap_variant: str | None = None,
     ) -> dict:
+        """Prepare projection grid_map inputs using an explicit gridmap strategy variant."""
         return _execute_with_cancellation(
             cancellation,
             prepare_gridmap_for_projection,
@@ -1293,15 +1274,17 @@ def build_execution_tools(
         finish_path: str,
         processing_profile: str | None = None,
         platform_hint: str | None = None,
+        projection_variant: str | None = None,
     ) -> dict:
+        """Run projection and trajectory scripts using explicit projection_variant."""
         return _execute_with_cancellation(
             cancellation,
             run_projection_and_trajectory,
             finish_temp_path,
             finish_path,
-            dataset_profile=None,
             processing_profile=processing_profile,
             platform_hint=platform_hint,
+            projection_variant=projection_variant,
             settings=settings,
             dry_run=dry_run,
         ).model_dump(mode="json")
@@ -1311,15 +1294,17 @@ def build_execution_tools(
         finish_path: str,
         processing_profile: str | None = None,
         platform_hint: str | None = None,
+        projection_variant: str | None = None,
     ) -> dict:
+        """Run tracking, gridmap preparation, projection, and trajectory with explicit projection_variant."""
         return _execute_with_cancellation(
             cancellation,
             run_tracking_and_projection,
             finish_temp_path,
             finish_path,
-            dataset_profile=None,
             processing_profile=processing_profile,
             platform_hint=platform_hint,
+            projection_variant=projection_variant,
             settings=settings,
             dry_run=dry_run,
         ).model_dump(mode="json")

@@ -4,8 +4,6 @@ import pytest
 
 from vla_data_juicer_agents.navigation.config import NavigationSettings
 from vla_data_juicer_agents.navigation.inspection import (
-    classify_navigation_dataset,
-    classify_navigation_dataset_tool,
     infer_navigation_processing_profile,
     infer_navigation_processing_profile_tool,
     infer_navigation_sensor_bindings,
@@ -77,22 +75,8 @@ rosbag2_bagfile_information:
     assert result.segments[0].errors
 
 
-def test_legacy_classify_navigation_dataset_rejects_missing_requested_segment():
-    settings = NavigationSettings(vladatasets_root=FIXTURE_ROOT)
-
-    with pytest.raises(FileNotFoundError, match="missing"):
-        classify_navigation_dataset("20270605", ["missing"], settings=settings)
-
-
-def test_legacy_classify_navigation_dataset_tool_schema_allows_omitting_segments():
-    required = classify_navigation_dataset_tool.input_schema.get("required", [])
-
-    assert "segments" not in required
-
-
 def test_navigation_investigation_tools_allow_structured_or_json_encoded_segments():
     tools = [
-        classify_navigation_dataset_tool,
         infer_navigation_topic_params_tool,
         infer_navigation_sensor_bindings_tool,
         infer_navigation_processing_profile_tool,
@@ -184,6 +168,112 @@ rosbag2_bagfile_information:
         "sport_odom": "odom",
     }
     assert result.query_dir == "lidar_points"
+    assert result.blocking_issues == []
+
+
+@pytest.mark.parametrize(
+    ("camera_topic", "lidar_topic", "localization_topic", "expected_topic_map", "expected_query_dir"),
+    [
+        (
+            "/cam_video4/csi_cam/image_raw/compressed",
+            "/lidar_points",
+            "/utlidar/robot_odom_systime",
+            {
+                "cam_video4": "fisheye_front",
+                "lidar_points": "r32_rslidar_points",
+                "utlidar": "odom",
+            },
+            "lidar_points",
+        ),
+        (
+            "/cam_video4/csi_cam/image_raw/compressed",
+            "/lidar_points",
+            "/sport_odom",
+            {
+                "cam_video4": "fisheye_front",
+                "lidar_points": "r32_rslidar_points",
+                "sport_odom": "odom",
+            },
+            "lidar_points",
+        ),
+        (
+            "/cam_video5/csi_cam/image_raw/compressed",
+            "/rs32_lidar_points",
+            "/utlidar/robot_odom_systime",
+            {
+                "cam_video5": "fisheye_front",
+                "rs32_lidar_points": "r32_rslidar_points",
+                "utlidar": "odom",
+            },
+            "rs32_lidar_points",
+        ),
+        (
+            "/cam_video5/csi_cam/image_raw/compressed",
+            "/rs32_lidar_points",
+            "/sport_odom",
+            {
+                "cam_video5": "fisheye_front",
+                "rs32_lidar_points": "r32_rslidar_points",
+                "sport_odom": "odom",
+            },
+            "rs32_lidar_points",
+        ),
+        (
+            "/cam_video5/csi_cam/image_raw/compressed",
+            "/r32_rslidar_points",
+            "/drivers/ins/Ins",
+            {
+                "cam_video5": "fisheye_front",
+                "r32_rslidar_points": "r32_rslidar_points",
+                "Ins": "ins",
+            },
+            "r32_rslidar_points",
+        ),
+    ],
+)
+def test_infer_navigation_topic_params_supports_role_based_mixed_topics(
+    tmp_path,
+    camera_topic,
+    lidar_topic,
+    localization_topic,
+    expected_topic_map,
+    expected_query_dir,
+):
+    metadata_path = tmp_path / "VLADatasets" / "raw_data" / "20270608" / "segment_a" / "metadata.yaml"
+    metadata_path.parent.mkdir(parents=True)
+    localization_type = (
+        "custom_msgs/msg/Ins"
+        if localization_topic == "/drivers/ins/Ins"
+        else "nav_msgs/msg/Odometry"
+    )
+    metadata_path.write_text(
+        f"""
+rosbag2_bagfile_information:
+  topics_with_message_count:
+    - topic_metadata:
+        name: {camera_topic}
+        type: sensor_msgs/msg/CompressedImage
+      message_count: 10
+    - topic_metadata:
+        name: {lidar_topic}
+        type: sensor_msgs/msg/PointCloud2
+      message_count: 10
+    - topic_metadata:
+        name: {localization_topic}
+        type: {localization_type}
+      message_count: 10
+""",
+        encoding="utf-8",
+    )
+    settings = NavigationSettings(vladatasets_root=tmp_path / "VLADatasets")
+
+    result = infer_navigation_topic_params("20270608", settings=settings)
+
+    assert result.profile_hint == "hybrid"
+    assert result.confidence == 1.0
+    assert result.topic_whitelist == [camera_topic, lidar_topic, localization_topic]
+    assert result.topic_map == expected_topic_map
+    assert result.query_dir == expected_query_dir
     assert result.blocking_issues == []
 
 
@@ -355,7 +445,7 @@ rosbag2_bagfile_information:
     assert result.topic_params.topic_map == {
         "cam_video5": "fisheye_front",
         "r32_rslidar_points": "r32_rslidar_points",
-        "drivers": "ins",
+        "Ins": "ins",
     }
     assert result.topic_params.query_dir == "r32_rslidar_points"
     assert result.localization_policy.source == "ins"

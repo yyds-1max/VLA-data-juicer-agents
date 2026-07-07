@@ -189,19 +189,6 @@ def _find_variant(
     return None
 
 
-def _legacy_dataset_profile_fact(facts: dict[str, str]) -> str | None:
-    processing_profile = facts.get("processing_profile")
-    platform_hint = facts.get("platform_hint")
-    topic_profile_hint = facts.get("topic_profile_hint")
-    if processing_profile in {"go2w_like", "u_legacy_like"}:
-        return processing_profile
-    if platform_hint == "go2w" or topic_profile_hint == "go2w_like":
-        return "go2w_like"
-    if platform_hint == "u" or topic_profile_hint in {"u", "u_like", "u_legacy_like"}:
-        return "u_legacy_like"
-    return None
-
-
 def _selector_facts(plan: WorkflowPlan, data_profile: NavigationDataProfile | None) -> dict[str, str]:
     facts = {
         "processing_profile": plan.processing_profile,
@@ -248,9 +235,6 @@ def _selector_facts(plan: WorkflowPlan, data_profile: NavigationDataProfile | No
             )
             if facts.get("platform_hint") == "unknown" and processing_profile.platform_hint != "unknown":
                 facts["platform_hint"] = processing_profile.platform_hint
-    legacy_dataset_profile = _legacy_dataset_profile_fact(facts)
-    if legacy_dataset_profile is not None:
-        facts["dataset_profile"] = legacy_dataset_profile
     return facts
 
 

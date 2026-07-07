@@ -57,9 +57,10 @@ def build_session_plan_draft_tools(
 
         Use data_profile_patch for partial profile facts learned from exactly
         one inspection tool, plus observation_id and used_tool for traceability.
+        Put processing_profile, platform_hint, topic_params, and stage_variants
+        inside data_profile_patch rather than as separate tool arguments.
         data_profile_patch must be a non-empty JSON object, not a JSON string.
-        Do not pass legacy profile, dataset_profile, processing_profile, or
-        platform_hint arguments.
+        Do not pass observed profile facts as separate tool arguments.
         """
         state = store.load(session_id)
         if state is None:
@@ -90,7 +91,7 @@ def build_session_plan_draft_tools(
         return result
 
     def finalize_workflow_plan_tool() -> dict[str, Any]:
-        """Finalize and return WorkflowPlan JSON only after the draft is complete."""
+        """Finalize and return WorkflowPlan JSON only after all required profile facts and variants are complete."""
         state = store.load(session_id)
         if state is None:
             return _missing_initial_request()

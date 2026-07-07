@@ -10,7 +10,6 @@ from vla_data_juicer_agents.navigation.models import (
     NavigationSensorBinding,
     NavigationSensorBindings,
     NavigationTopicParams,
-    ProfileClassification,
     WorkflowPlan,
     WorkflowStep,
 )
@@ -54,12 +53,6 @@ def test_navigation_settings_derives_processing_scripts(tmp_path):
 
     assert settings.pcd_to_grid_script == tmp_path / "processing" / "other_code" / "pcd_to_grid.py"
     assert settings.gen_box_script == tmp_path / "processing" / "0_1th_box" / "gen_box.py"
-
-
-def test_profile_classification_accepts_missing_profile():
-    classification = ProfileClassification(profile_name=None, confidence=0.0)
-
-    assert classification.profile_name is None
 
 
 def test_navigation_processing_profile_accepts_mixed_topic_bindings():

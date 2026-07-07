@@ -1,35 +1,24 @@
-from vla_data_juicer_agents.navigation.profiles import classify_topics, get_profile
+from vla_data_juicer_agents.navigation.profiles import TOPIC_OUTPUT_MAP, topics_for_role
 
 
-def test_legacy_profile_registry_classifies_20270515_topic_family():
-    topics = {
-        "/cam_video5/csi_cam/image_raw/compressed",
-        "/lidar_points",
-        "/utlidar/robot_odom_systime",
-    }
-
-    result = classify_topics(topics)
-
-    assert result.profile_name == "u_legacy_like"
-    assert result.confidence == 1.0
-
-
-def test_legacy_profile_registry_classifies_20270605_topic_family():
+def test_topics_for_role_returns_known_aliases_in_priority_order():
     topics = {
         "/cam_video4/csi_cam/image_raw/compressed",
-        "/rs32_lidar_points",
+        "/cam_video5/csi_cam/image_raw/compressed",
         "/sport_odom",
     }
 
-    result = classify_topics(topics)
+    assert topics_for_role(topics, "fisheye_front") == [
+        "/cam_video4/csi_cam/image_raw/compressed",
+        "/cam_video5/csi_cam/image_raw/compressed",
+    ]
+    assert topics_for_role(topics, "odom") == ["/sport_odom"]
 
-    assert result.profile_name == "go2w_like"
-    assert result.confidence == 1.0
 
-
-def test_legacy_profile_registry_contains_sync_mapping():
-    profile = get_profile("go2w_like")
-
-    assert profile.sync_topic_map["cam_video4"] == "fisheye_front"
-    assert profile.sync_topic_map["rs32_lidar_points"] == "r32_rslidar_points"
-    assert profile.sync_topic_map["sport_odom"] == "odom"
+def test_topic_output_map_contains_mixed_platform_sources():
+    assert TOPIC_OUTPUT_MAP["/cam_video4/csi_cam/image_raw/compressed"] == (
+        "cam_video4",
+        "fisheye_front",
+    )
+    assert TOPIC_OUTPUT_MAP["/lidar_points"] == ("lidar_points", "r32_rslidar_points")
+    assert TOPIC_OUTPUT_MAP["/drivers/ins/Ins"] == ("Ins", "ins")

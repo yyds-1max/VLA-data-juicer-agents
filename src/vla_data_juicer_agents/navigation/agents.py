@@ -42,7 +42,7 @@ Use the explicit response_language from the current workflow prompt when provide
 
 
 PLAN_AGENT_INSTRUCTIONS = """
-You are the ReAct Plan-Agent for a VLA multi-scenario data processing agent.
+You are NavigationDataAgent planning a VLA navigation data workflow.
 Use only read-only tools to inspect navigation datasets.
 Read and follow docs/navigation-plan-agent-guidance.md (navigation-plan-agent-guidance).
 Build a lightweight NavigationDataProfile from sensor bindings and processing_profile, not a large data inventory.
@@ -51,9 +51,10 @@ and infer_navigation_processing_profile_tool.
 Call infer_navigation_topic_params_tool before finalizing extract_and_sync_navigation_data parameters.
 Do not require data to match fixed profiles such as u_legacy_like or go2w_like.
 Do not invent TOPIC_WHITELIST, topic_map, query_dir, localization policy, or calibration policy; use tool results.
-Only finalize when processing_profile has no blocking_issues.
+Treat platform_hint as a diagnostic hint only; do not use it as a hard selector for topic parameters or projection variants.
+Only finalize when processing_profile, topic_params, and data_profile all have no blocking_issues.
 Always include confirm_navigation_calibration_params as the first step before any processing and before prepare_raw_data.
-Use stage_variants, and choose only the variants exposed by list_navigation_tool_capabilities_tool.
+Use stage_variants for execution strategy: extract_and_sync_navigation_data uses explicit_topic_params, gridmap uses observed grid_map facts, and projection uses an explicit projection_variant. Choose only variants exposed by list_navigation_tool_capabilities_tool.
 Default to all raw segments if not specified.
 scene_mode is required and must be either "in" or "out". It represents "indoor" and "outdoor", respectively.
 Stage one covers prepare.sh, run_U.sh, and run_odom.sh only; do not include run_fix.sh.
@@ -76,8 +77,9 @@ inspect_gridmap_artifacts_tool, inspect_runtime_assets_tool, then list_navigatio
 Each planning step must do exactly one step: call one read-only inspection SDK tool,
 then merge only the newly learned facts with update_workflow_plan_draft_tool(data_profile_patch=...).
 Use infer_navigation_sensor_bindings_tool for sensor_bindings and infer_navigation_processing_profile_tool for
-processing_profile, localization_policy, calibration_policy, platform_hint, and stage_variants.
+processing_profile, localization_policy, calibration_policy, and platform_hint.
 When topic_params is missing, call infer_navigation_topic_params_tool and merge its structured result.
+Set stage_variants from observed facts: explicit_topic_params after topic_params are complete, gridmap variants from inspect_gridmap_artifacts_tool, and projection variants from inspect_runtime_assets_tool plus list_navigation_tool_capabilities_tool. Do not choose projection variants from platform_hint alone.
 Use data_profile_patch for partial NavigationDataProfile facts; do not invent a complete profile in one shot.
 Only call finalize_workflow_plan_tool after ready_to_finish is true and missing_fields is empty.
 Do not hand-write script-level plans; final WorkflowPlan JSON must come from finalize_workflow_plan_tool.
@@ -108,7 +110,7 @@ def _plan_agent_instructions(*, include_draft_tools: bool) -> str:
 
 
 EXECUTOR_AGENT_INSTRUCTIONS = """
-You are the ReAct Executor-Agent for a VLA multi-scenario data processing agent.
+You are NavigationDataAgent executing a finalized VLA navigation WorkflowPlan.
 Read WorkflowPlan JSON and execute matching tools step-by-step.
 For each WorkflowStep.tool_name, call the SDK tool with the same name plus "_tool"; for example,
 prepare_raw_data maps to prepare_raw_data_tool and run_initial_annotation_gui maps to run_initial_annotation_gui_tool.
@@ -129,7 +131,7 @@ Supported execution tool names include run_tracking, prepare_gridmap_for_project
 
 
 RESUME_EXECUTOR_AGENT_INSTRUCTIONS = """
-You are the ReAct Executor-Agent for a VLA multi-scenario data processing agent.
+You are NavigationDataAgent resuming execution of a finalized VLA navigation WorkflowPlan.
 Read WorkflowPlan JSON and execute matching tools step-by-step.
 For each WorkflowStep.tool_name, call the SDK tool with the same name plus "_tool"; for example,
 prepare_raw_data maps to prepare_raw_data_tool and run_initial_annotation_gui maps to run_initial_annotation_gui_tool.
@@ -178,7 +180,7 @@ def create_plan_agent(model: str | None = None, request: NavigationRequest | Non
     draft_state = WorkflowPlanDraftState(request=request) if request is not None else None
     draft_tools = build_plan_draft_tools(draft_state) if draft_state is not None else []
     agent = _create_navigation_agent(
-        name="Navigation ReAct Plan-Agent",
+        name="NavigationDataAgent",
         tools=[
             inspect_raw_date_tool,
             infer_navigation_sensor_bindings_tool,
@@ -208,7 +210,7 @@ def create_executor_agent(
         instructions = f"{instructions}\nDry-run mode is enabled; report planned actions without real mutations."
 
     return _create_navigation_agent(
-        name="Navigation ReAct Executor-Agent",
+        name="NavigationDataAgent",
         instructions=instructions,
         tools=build_execution_tools(dry_run=dry_run, cancellation=cancellation),
         model=model,

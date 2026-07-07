@@ -163,7 +163,8 @@ def test_extract_and_sync_tool_accepts_processing_profile_topic_args_without_dat
     )
 
     assert result["ok"] is True
-    assert result["details"]["profile"] == "go2w_like"
+    assert result["details"]["processing_profile"] == "parameterized_navigation_v1"
+    assert result["details"]["platform_hint"] == "go2w"
     assert result["details"]["extract_topics"] == topic_params["topic_whitelist"]
     assert result["details"]["sync_topic_map"] == topic_params["topic_map"]
     assert result["details"]["query_dir"] == topic_params["query_dir"]
@@ -366,7 +367,7 @@ def test_noobscene_preprocessing_dry_run_uses_data_runtime_setup(tmp_path):
     assert any("/processing/0_1th_box/img2video.py" in shell for shell in shells)
 
 
-def test_assemble_finish_temp_copies_only_server_finish_inputs_and_profile_sensors(tmp_path):
+def test_assemble_finish_temp_copies_only_server_finish_inputs_and_platform_sensors(tmp_path):
     root = tmp_path / "VLADatasets"
     processing_root = tmp_path / "processing"
     clip = root / "clip_data" / "20270605" / "20260605_152856" / "sync_data" / "clip_a"
@@ -379,7 +380,7 @@ def test_assemble_finish_temp_copies_only_server_finish_inputs_and_profile_senso
     (sensor_source / "calib.json").write_text("{}", encoding="utf-8")
     settings = NavigationSettings(vladatasets_root=root, processing_root=processing_root)
 
-    result = assemble_finish_temp("20270605", dataset_profile="go2w_like", settings=settings, dry_run=False)
+    result = assemble_finish_temp("20270605", platform_hint="go2w", settings=settings, dry_run=False)
 
     dst = root / "finish_data" / "20270605_temp" / "samples" / "20270605" / "clip_a"
     assert result.ok is True
@@ -593,7 +594,7 @@ def test_extract_and_sync_requires_explicit_topic_params(tmp_path):
     (root / "raw_data" / "20270605_temp" / "20260605_152856").mkdir(parents=True)
     settings = NavigationSettings(vladatasets_root=root, datatoolbox_src=Path("/datatoolbox/src"))
 
-    result = extract_and_sync_navigation_data("20270605", "u_legacy_like", settings=settings, dry_run=True)
+    result = extract_and_sync_navigation_data("20270605", settings=settings, dry_run=True)
 
     assert result.ok is False
     assert "Missing required explicit navigation topic parameter" in result.message
@@ -618,7 +619,6 @@ def test_extract_and_sync_dry_run_accepts_explicit_topic_params(tmp_path):
 
     result = extract_and_sync_navigation_data(
         "20270605",
-        "u_legacy_like",
         topic_whitelist=topic_whitelist,
         topic_map=topic_map,
         query_dir="lidar_points",
@@ -666,7 +666,6 @@ def test_extract_and_sync_dry_run_uses_u_runtime_setup_with_repository_scripts(t
 
     result = extract_and_sync_navigation_data(
         "20270605",
-        "u_legacy_like",
         topic_whitelist=topic_whitelist,
         topic_map=topic_map,
         query_dir="lidar_points",
@@ -711,7 +710,7 @@ def test_projection_python_steps_dry_run_use_data_runtime_setup(tmp_path):
             assert "source /env/setup_data_runtime.sh" in shell
 
 
-def test_projection_and_trajectory_uses_go2w_trajectory_script(tmp_path):
+def test_projection_and_trajectory_uses_explicit_0525_projection_variant(tmp_path):
     root = tmp_path / "VLADatasets"
     finish_temp = root / "finish_data" / "20270605_temp"
     settings = NavigationSettings(vladatasets_root=root, processing_root=Path("/processing"))
@@ -719,18 +718,37 @@ def test_projection_and_trajectory_uses_go2w_trajectory_script(tmp_path):
     result = run_projection_and_trajectory(
         finish_temp,
         root / "finish_data" / "20270605",
-        dataset_profile="go2w_like",
+        projection_variant="cjl_0525_with_gridmap",
         settings=settings,
         dry_run=True,
     )
 
     shells = [_command_text(record.command) for record in result.commands]
+    assert result.details["projection_variant"] == "cjl_0525_with_gridmap"
     assert any("/processing/2_pt_project/2_othermethod_cjl_0525.py" in shell for shell in shells)
     assert not any("/processing/0_1th_box/img2video.py" in shell for shell in shells)
     assert not any(shell.endswith("./bin/main") for shell in shells)
 
 
-def test_projection_tool_uses_go2w_script_from_platform_hint_without_dataset_profile(tmp_path, monkeypatch):
+def test_projection_and_trajectory_uses_explicit_projection_variant_script_choice(tmp_path):
+    root = tmp_path / "VLADatasets"
+    finish_temp = root / "finish_data" / "20270605_temp"
+    settings = NavigationSettings(vladatasets_root=root, processing_root=Path("/processing"))
+
+    result = run_projection_and_trajectory(
+        finish_temp,
+        root / "finish_data" / "20270605",
+        projection_variant="cjl_0525_with_gridmap",
+        settings=settings,
+        dry_run=True,
+    )
+
+    shells = [_command_text(record.command) for record in result.commands]
+    assert result.details["projection_variant"] == "cjl_0525_with_gridmap"
+    assert any("/processing/2_pt_project/2_othermethod_cjl_0525.py" in shell for shell in shells)
+
+
+def test_projection_tool_uses_projection_variant_without_platform_bucket(tmp_path, monkeypatch):
     root = tmp_path / "VLADatasets"
     finish_temp = root / "finish_data" / "20270605_temp"
     monkeypatch.setenv("VLA_VLADATASETS_ROOT", str(root))
@@ -743,12 +761,14 @@ def test_projection_tool_uses_go2w_script_from_platform_hint_without_dataset_pro
             "finish_temp_path": str(finish_temp),
             "finish_path": str(root / "finish_data" / "20270605"),
             "processing_profile": "parameterized_navigation_v1",
-            "platform_hint": "go2w",
+            "platform_hint": "unknown",
+            "projection_variant": "cjl_0525_with_gridmap",
         },
     )
 
     shells = [_command_text(record["command"]) for record in result["commands"]]
     assert result["ok"] is True
+    assert result["details"]["projection_variant"] == "cjl_0525_with_gridmap"
     assert result["details"]["trajectory_script"] == "2_othermethod_cjl_0525.py"
     assert any("/processing/2_pt_project/2_othermethod_cjl_0525.py" in shell for shell in shells)
 
@@ -865,8 +885,14 @@ def test_extract_and_sync_without_topic_params_does_not_use_profile_specific_scr
     (root / "raw_data" / "20270605_temp" / "20260605_152856").mkdir(parents=True)
     settings = NavigationSettings(vladatasets_root=root, datatoolbox_src=Path("/datatoolbox/src"))
 
-    u_result = extract_and_sync_navigation_data("20270605", "u_legacy_like", settings=settings, dry_run=True)
-    go2w_result = extract_and_sync_navigation_data("20270605", "go2w_like", settings=settings, dry_run=True)
+    u_result = extract_and_sync_navigation_data("20270605", settings=settings, dry_run=True)
+    go2w_result = extract_and_sync_navigation_data(
+        "20270605",
+        processing_profile="parameterized_navigation_v1",
+        platform_hint="go2w",
+        settings=settings,
+        dry_run=True,
+    )
 
     assert u_result.ok is False
     assert go2w_result.ok is False
@@ -1152,7 +1178,6 @@ def test_dry_run_execution_steps_are_composable_without_prior_outputs(tmp_path):
     prepare_result = prepare_raw_data("20270605", settings=settings, dry_run=True)
     extract_result = extract_and_sync_navigation_data(
         "20270605",
-        "go2w_like",
         **_go2w_topic_params(),
         settings=settings,
         dry_run=True,
@@ -1175,7 +1200,6 @@ def test_dry_run_chain_from_raw_fixtures_only_does_not_create_intermediate_dirs(
     prepare_result = prepare_raw_data("20270605", settings=settings, dry_run=True)
     extract_result = extract_and_sync_navigation_data(
         "20270605",
-        "go2w_like",
         **_go2w_topic_params(),
         settings=settings,
         dry_run=True,
@@ -1215,7 +1239,6 @@ def test_extract_and_sync_reports_missing_sync_data_after_successful_commands(tm
 
     result = extract_and_sync_navigation_data(
         "20270605",
-        "go2w_like",
         topic_whitelist=topic_whitelist,
         topic_map=topic_map,
         query_dir="rs32_lidar_points",
@@ -1261,7 +1284,6 @@ def test_extract_and_sync_empty_segment_root_is_not_successful(tmp_path):
 
     result = extract_and_sync_navigation_data(
         "20270605",
-        "go2w_like",
         topic_whitelist=topic_whitelist,
         topic_map=topic_map,
         query_dir="rs32_lidar_points",

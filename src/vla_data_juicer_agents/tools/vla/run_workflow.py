@@ -334,7 +334,7 @@ VLA_RUN_WORKFLOW = ToolSpec(
     description=(
         "Run the structured navigation VLA data workflow. Prefer this tool for complex VLA, "
         "navigation, ROS bag, db3, odom, trajectory, or manual annotation processing requests. "
-        "It invokes the Plan-Agent and then the Executor-Agent; do not replace it with deterministic routing."
+        "It delegates planning and execution to NavigationDataAgent; do not replace it with deterministic routing."
     ),
     input_model=RunVLAWorkflowInput,
     executor=run_vla_workflow,
