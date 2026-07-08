@@ -47,6 +47,27 @@ def test_task_store_updates_existing_date_and_segments(tmp_path: Path):
     assert store.find_latest_by_date("20270623").task_id == first.task_id
 
 
+def test_create_or_update_task_preserves_latest_web_session_when_omitted(tmp_path: Path):
+    store = SqliteNavigationTaskStore(tmp_path / "navigation_tasks.sqlite")
+    first = store.create_or_update_task(
+        date="20270623",
+        segments=["20260623_101010"],
+        scene_mode=None,
+        web_session_id="web-1",
+    )
+
+    second = store.create_or_update_task(
+        date="20270623",
+        segments=["20260623_101010"],
+        scene_mode=None,
+        web_session_id=None,
+    )
+
+    assert second.task_id == first.task_id
+    assert second.latest_web_session_id == "web-1"
+    assert store.get_task(first.task_id).latest_web_session_id == "web-1"
+
+
 def test_task_store_lists_resumable_tasks(tmp_path: Path):
     store = SqliteNavigationTaskStore(tmp_path / "navigation_tasks.sqlite")
     waiting = store.create_or_update_task(date="20270623", segments=None, scene_mode=None)

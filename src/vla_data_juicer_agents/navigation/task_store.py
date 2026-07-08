@@ -155,7 +155,9 @@ class SqliteNavigationTaskStore:
             with self._connect() as connection:
                 self._insert_task(connection, task)
             return task
-        changes: dict[str, Any] = {"latest_web_session_id": web_session_id}
+        changes: dict[str, Any] = {}
+        if web_session_id is not None:
+            changes["latest_web_session_id"] = web_session_id
         if scene_mode in {"in", "out"}:
             changes["scene_mode"] = scene_mode
         if agentscope_session_id is not None:
