@@ -26,6 +26,7 @@ from vla_data_juicer_agents.navigation.plan_draft_store import NavigationPlanDra
 from vla_data_juicer_agents.navigation.session_plan_draft_tools import (
     build_session_plan_draft_tools,
 )
+from vla_data_juicer_agents.navigation.task_reconciliation import reconcile_navigation_task
 from vla_data_juicer_agents.navigation.task_store import SqliteNavigationTaskStore
 from vla_data_juicer_agents.navigation.task_tools import build_navigation_task_tools
 
@@ -136,10 +137,14 @@ class _FinalizedPlanRequiredTool(ToolBase):
         *,
         session_id: str,
         draft_store: NavigationPlanDraftStore,
+        task_store: SqliteNavigationTaskStore | None = None,
+        settings: NavigationSettings | None = None,
     ) -> None:
         self._tool = tool
         self._session_id = session_id
         self._draft_store = draft_store
+        self._task_store = task_store
+        self._settings = settings
         self.name = tool.name
         self.description = tool.description
         self.input_schema = tool.input_schema
@@ -161,6 +166,8 @@ class _FinalizedPlanRequiredTool(ToolBase):
             tool_name=self.name,
             tool_input=tool_input,
             check_segments=_tool_accepts_segments(self),
+            task_store=self._task_store,
+            settings=self._settings,
         )
         if gate_error is not None:
             return PermissionDecision(
@@ -185,6 +192,8 @@ class _FinalizedPlanRequiredTool(ToolBase):
             tool_name=self.name,
             tool_input=kwargs,
             check_segments=_tool_accepts_segments(self),
+            task_store=self._task_store,
+            settings=self._settings,
         )
         if gate_error is not None:
             return gate_error
@@ -205,6 +214,8 @@ def _phase_plan_gate_error(
     tool_name: str,
     tool_input: dict[str, Any],
     check_segments: bool = True,
+    task_store: SqliteNavigationTaskStore | None = None,
+    settings: NavigationSettings | None = None,
 ) -> dict[str, Any] | None:
     state = draft_store.load(session_id)
     if state is None:
@@ -229,7 +240,14 @@ def _phase_plan_gate_error(
     if base_name in EXTRACT_SYNC_TOOLS and plan_phase in {"extract_sync", "full"}:
         return _request_match_error_if_any(state, tool_input, check_segments)
     if base_name in FINISH_PROCESSING_TOOLS and plan_phase in {"finish_processing", "full"}:
-        return _request_match_error_if_any(state, tool_input, check_segments)
+        request_error = _request_match_error_if_any(state, tool_input, check_segments)
+        if request_error is not None:
+            return request_error
+        return _finish_processing_task_gate_error(
+            state=state,
+            task_store=task_store,
+            settings=settings,
+        )
     return {
         "ok": False,
         "error_type": "navigation_phase_plan_required",
@@ -283,6 +301,69 @@ def _request_match_error_if_any(
     return None
 
 
+def _finish_processing_task_gate_error(
+    *,
+    state: Any,
+    task_store: SqliteNavigationTaskStore | None,
+    settings: NavigationSettings | None = None,
+) -> dict[str, Any] | None:
+    if task_store is None:
+        return None
+    task = task_store.find_latest_by_date(state.request.date, state.request.segments)
+    if task is None:
+        return {
+            "ok": False,
+            "error_type": "navigation_task_reconcile_required",
+            "message": (
+                "Finish-processing is blocked until a durable navigation task "
+                "exists and has been reconciled. Call get_or_create_navigation_task_tool "
+                "then reconcile_navigation_task_tool."
+            ),
+            "next_tool_candidates": [
+                "get_or_create_navigation_task_tool",
+                "reconcile_navigation_task_tool",
+            ],
+        }
+    live_task = reconcile_navigation_task(task, settings=settings)
+    snapshot = live_task.artifact_snapshot
+    sync_complete = bool(snapshot is not None and snapshot.sync_data_exists)
+    if (
+        live_task.phase != "finish_processing"
+        or live_task.scene_mode not in {"in", "out"}
+        or live_task.status in {"needs_reconcile", "needs_rerun", "failed"}
+        or not sync_complete
+    ):
+        missing: list[str] = []
+        if live_task.phase != "finish_processing":
+            missing.append("task.phase=finish_processing")
+        if live_task.scene_mode not in {"in", "out"}:
+            missing.append("scene_mode")
+        if snapshot is None:
+            missing.append("artifact_snapshot")
+        elif not snapshot.sync_data_exists:
+            missing.append("complete sync_data for selected segments")
+        if live_task.status in {"needs_reconcile", "needs_rerun", "failed"}:
+            missing.append(f"task.status={live_task.status}")
+        return {
+            "ok": False,
+            "error_type": "navigation_task_reconcile_required",
+            "message": (
+                "Finish-processing is blocked until the matching navigation task "
+                "has scene_mode, a reconciled snapshot, and complete selected "
+                "sync_data artifacts. Use reconcile_navigation_task_tool, rerun extract_sync "
+                "if sync_data is missing, or set scene_mode before continuing."
+            ),
+            "missing_fields": missing,
+            "task": live_task.model_dump(mode="json"),
+            "next_tool_candidates": [
+                "reconcile_navigation_task_tool",
+                "update_navigation_task_scene_mode_tool",
+                "finalize_extract_sync_plan_tool",
+            ],
+        }
+    return None
+
+
 def _tool_accepts_segments(tool: Any) -> bool:
     schema = getattr(tool, "input_schema", None)
     if not isinstance(schema, dict):
@@ -324,6 +405,8 @@ def _execution_tools_for_navigation_agent(
     cancellation: CancellationContext | None,
     session_id: str | None,
     draft_store: NavigationPlanDraftStore | None,
+    task_store: SqliteNavigationTaskStore | None = None,
+    settings: NavigationSettings | None = None,
 ) -> list[Any]:
     tools = create_navigation_execution_tools(
         dry_run=dry_run,
@@ -336,6 +419,8 @@ def _execution_tools_for_navigation_agent(
             tool,
             session_id=session_id,
             draft_store=draft_store,
+            task_store=task_store,
+            settings=settings,
         )
         for tool in tools
     ]
@@ -358,6 +443,7 @@ def build_navigation_agent_tools(
             session_id=session_id,
             web_session_id=web_session_id,
             settings=settings,
+            draft_store=draft_store,
         )
     planning_tools: list[Any] = [
         inspect_raw_date_tool,
@@ -385,5 +471,7 @@ def build_navigation_agent_tools(
             cancellation=cancellation,
             session_id=session_id,
             draft_store=draft_store,
+            task_store=task_store,
+            settings=settings,
         ),
     ])

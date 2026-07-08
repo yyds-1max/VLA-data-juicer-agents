@@ -30,6 +30,12 @@ def _json_load(value: str | None) -> Any:
     return json.loads(value)
 
 
+def _segments_key(segments: list[str] | None) -> str:
+    if segments is None:
+        return "__all__"
+    return json.dumps(sorted(segments), ensure_ascii=False, separators=(",", ":"))
+
+
 class NavigationTaskStore(Protocol):
     def create_or_update_task(
         self,
@@ -85,6 +91,7 @@ class SqliteNavigationTaskStore:
                     task_id TEXT PRIMARY KEY,
                     date TEXT NOT NULL,
                     segments_json TEXT,
+                    segments_key TEXT,
                     scene_mode TEXT,
                     phase TEXT NOT NULL,
                     status TEXT NOT NULL,
@@ -104,10 +111,18 @@ class SqliteNavigationTaskStore:
                 )
                 """
             )
+            self._migrate_segments_key(connection)
             connection.execute(
                 """
                 CREATE INDEX IF NOT EXISTS idx_navigation_tasks_date_updated
                 ON navigation_tasks (date, updated_at)
+                """
+            )
+            connection.execute(
+                """
+                CREATE UNIQUE INDEX IF NOT EXISTS idx_navigation_tasks_active_date_segments_key
+                ON navigation_tasks (date, segments_key)
+                WHERE status != 'superseded'
                 """
             )
             connection.execute(
@@ -129,6 +144,48 @@ class SqliteNavigationTaskStore:
                 """
             )
 
+    def _migrate_segments_key(self, connection: sqlite3.Connection) -> None:
+        columns = {
+            row["name"]
+            for row in connection.execute("PRAGMA table_info(navigation_tasks)").fetchall()
+        }
+        if "segments_key" not in columns:
+            connection.execute("ALTER TABLE navigation_tasks ADD COLUMN segments_key TEXT")
+        rows = connection.execute(
+            "SELECT rowid, segments_json FROM navigation_tasks"
+        ).fetchall()
+        for row in rows:
+            segments = _json_load(row["segments_json"])
+            connection.execute(
+                "UPDATE navigation_tasks SET segments_key = ? WHERE rowid = ?",
+                (_segments_key(segments), row["rowid"]),
+            )
+        duplicate_rows = connection.execute(
+            """
+            SELECT rowid FROM (
+                SELECT
+                    rowid,
+                    ROW_NUMBER() OVER (
+                        PARTITION BY date, segments_key
+                        ORDER BY updated_at DESC, rowid DESC
+                    ) AS duplicate_rank
+                FROM navigation_tasks
+                WHERE status != ?
+            )
+            WHERE duplicate_rank > 1
+            """,
+            (NavigationTaskStatus.SUPERSEDED.value,),
+        ).fetchall()
+        for row in duplicate_rows:
+            connection.execute(
+                """
+                UPDATE navigation_tasks
+                SET status = ?, updated_at = ?
+                WHERE rowid = ?
+                """,
+                (NavigationTaskStatus.SUPERSEDED.value, utc_now(), row["rowid"]),
+            )
+
     def create_or_update_task(
         self,
         *,
@@ -138,31 +195,33 @@ class SqliteNavigationTaskStore:
         web_session_id: str | None = None,
         agentscope_session_id: str | None = None,
     ) -> NavigationTask:
-        existing = self.find_latest_by_date(date, segments)
         timestamp = utc_now()
-        if existing is None:
-            task = NavigationTask(
-                task_id=f"nav_{uuid4().hex}",
-                date=date,
-                segments=segments,
-                scene_mode=scene_mode if scene_mode in {"in", "out"} else None,
-                created_by_web_session_id=web_session_id,
-                latest_web_session_id=web_session_id,
-                agentscope_session_id=agentscope_session_id,
-                created_at=timestamp,
-                updated_at=timestamp,
-            )
-            with self._connect() as connection:
-                self._insert_task(connection, task)
-            return task
-        changes: dict[str, Any] = {}
-        if web_session_id is not None:
-            changes["latest_web_session_id"] = web_session_id
-        if scene_mode in {"in", "out"}:
-            changes["scene_mode"] = scene_mode
-        if agentscope_session_id is not None:
-            changes["agentscope_session_id"] = agentscope_session_id
-        return self.update_task(existing.task_id, **changes)
+        task = NavigationTask(
+            task_id=f"nav_{uuid4().hex}",
+            date=date,
+            segments=segments,
+            scene_mode=scene_mode if scene_mode in {"in", "out"} else None,
+            created_by_web_session_id=web_session_id,
+            latest_web_session_id=web_session_id,
+            agentscope_session_id=agentscope_session_id,
+            created_at=timestamp,
+            updated_at=timestamp,
+        )
+        key = _segments_key(segments)
+        with self._connect() as connection:
+            self._upsert_task(connection, task)
+            row = connection.execute(
+                """
+                SELECT * FROM navigation_tasks
+                WHERE date = ? AND segments_key = ? AND status != ?
+                ORDER BY updated_at DESC, rowid DESC
+                LIMIT 1
+                """,
+                (date, key, NavigationTaskStatus.SUPERSEDED.value),
+            ).fetchone()
+        if row is None:
+            raise RuntimeError("navigation task upsert did not return a task row")
+        return self._task_from_row(row)
 
     def get_task(self, task_id: str) -> NavigationTask | None:
         with self._connect() as connection:
@@ -174,20 +233,16 @@ class SqliteNavigationTaskStore:
 
     def find_latest_by_date(self, date: str, segments: list[str] | None = None) -> NavigationTask | None:
         with self._connect() as connection:
-            rows = connection.execute(
+            row = connection.execute(
                 """
                 SELECT * FROM navigation_tasks
-                WHERE date = ?
+                WHERE date = ? AND segments_key = ? AND status != ?
                 ORDER BY updated_at DESC, rowid DESC
+                LIMIT 1
                 """,
-                (date,),
-            ).fetchall()
-        normalized = segments or None
-        for row in rows:
-            task = self._task_from_row(row)
-            if task.segments == normalized:
-                return task
-        return None
+                (date, _segments_key(segments), NavigationTaskStatus.SUPERSEDED.value),
+            ).fetchone()
+        return self._task_from_row(row) if row is not None else None
 
     def list_resumable(self, date: str | None = None) -> list[NavigationTask]:
         params: tuple[Any, ...]
@@ -292,15 +347,41 @@ class SqliteNavigationTaskStore:
         connection.execute(
             """
             INSERT INTO navigation_tasks (
-                task_id, date, segments_json, scene_mode, phase, status,
+                task_id, date, segments_json, segments_key, scene_mode, phase, status,
                 waiting_reason, next_required_input, created_by_web_session_id,
                 latest_web_session_id, agentscope_session_id, latest_run_id,
                 last_completed_step, data_profile_json, artifact_snapshot_json,
                 drift_json, schema_version, created_at, updated_at
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             self._task_values(task),
+        )
+
+    def _upsert_task(
+        self,
+        connection: sqlite3.Connection,
+        task: NavigationTask,
+    ) -> None:
+        values = self._task_values(task)
+        connection.execute(
+            """
+            INSERT INTO navigation_tasks (
+                task_id, date, segments_json, segments_key, scene_mode, phase, status,
+                waiting_reason, next_required_input, created_by_web_session_id,
+                latest_web_session_id, agentscope_session_id, latest_run_id,
+                last_completed_step, data_profile_json, artifact_snapshot_json,
+                drift_json, schema_version, created_at, updated_at
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(date, segments_key) WHERE status != 'superseded'
+            DO UPDATE SET
+                scene_mode = COALESCE(excluded.scene_mode, navigation_tasks.scene_mode),
+                latest_web_session_id = COALESCE(excluded.latest_web_session_id, navigation_tasks.latest_web_session_id),
+                agentscope_session_id = COALESCE(excluded.agentscope_session_id, navigation_tasks.agentscope_session_id),
+                updated_at = excluded.updated_at
+            """,
+            values,
         )
 
     def _update_task(self, connection: sqlite3.Connection, task: NavigationTask) -> None:
@@ -310,6 +391,7 @@ class SqliteNavigationTaskStore:
             UPDATE navigation_tasks SET
                 date = ?,
                 segments_json = ?,
+                segments_key = ?,
                 scene_mode = ?,
                 phase = ?,
                 status = ?,
@@ -336,6 +418,7 @@ class SqliteNavigationTaskStore:
             task.task_id,
             task.date,
             _json_dump(task.segments),
+            _segments_key(task.segments),
             task.scene_mode,
             task.phase.value,
             task.status.value,

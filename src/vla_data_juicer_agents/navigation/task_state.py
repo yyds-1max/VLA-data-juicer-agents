@@ -52,6 +52,7 @@ class NavigationArtifactSnapshot(BaseModel):
     raw_input_exists: bool = False
     raw_temp_exists: bool = False
     sync_data_exists: bool = False
+    sync_data_by_segment: dict[str, bool] = Field(default_factory=dict)
     finish_temp_samples_exists: bool = False
     final_outputs_exist: bool = False
     final_grid_map_exists: bool = False

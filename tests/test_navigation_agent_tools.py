@@ -26,6 +26,11 @@ from vla_data_juicer_agents.navigation.plan_draft_store import (
     JsonNavigationPlanDraftStore,
 )
 from vla_data_juicer_agents.navigation.task_store import SqliteNavigationTaskStore
+from vla_data_juicer_agents.navigation.task_state import (
+    NavigationArtifactSnapshot,
+    NavigationTaskPhase,
+    NavigationTaskStatus,
+)
 from vla_data_juicer_agents.runtime import agentscope_runtime as runtime_module
 from vla_data_juicer_agents.runtime.agentscope_config import AgentScopeRuntimeConfig
 from vla_data_juicer_agents.runtime.agentscope_runtime import (
@@ -488,6 +493,310 @@ def test_phase_gate_blocks_finish_processing_tool_with_extract_sync_plan(
 
     assert result["ok"] is False
     assert result["error_type"] == "navigation_phase_plan_required"
+
+
+def test_finish_processing_gate_blocks_when_task_snapshot_is_not_reconciled(
+    monkeypatch,
+    tmp_path,
+):
+    store = InMemoryNavigationPlanDraftStore()
+    task_store = SqliteNavigationTaskStore(tmp_path / "tasks.sqlite")
+    task_store.create_or_update_task(
+        date="20270623",
+        segments=["segment_a"],
+        scene_mode="out",
+        web_session_id="web-session",
+        agentscope_session_id="agent-session",
+    )
+
+    def fake_assemble_finish_temp_tool(date: str, segments: list[str] | None = None) -> dict:
+        return {"ok": True, "tool_name": "assemble_finish_temp", "date": date, "segments": segments}
+
+    monkeypatch.setattr(
+        agent_tools_module,
+        "create_navigation_execution_tools",
+        lambda **_: [
+            FunctionTool(
+                fake_assemble_finish_temp_tool,
+                name="assemble_finish_temp_tool",
+                is_read_only=False,
+            )
+        ],
+    )
+    state = WorkflowPlanDraftState(
+        request=NavigationRequest(
+            date="20270623",
+            scene_mode="out",
+            segments=["segment_a"],
+        )
+    )
+    state.finalized_plan = WorkflowPlan(date="20270623", phase="finish_processing", steps=[])
+    store.save("agent-session", state)
+    tools = {
+        tool.name: tool
+        for tool in build_navigation_agent_tools(
+            session_id="agent-session",
+            draft_store=store,
+            task_store=task_store,
+            web_session_id="web-session",
+            dry_run=True,
+        )
+    }
+
+    result = _decode_tool_payload(
+        asyncio.run(
+            tools["assemble_finish_temp_tool"](
+                date="20270623",
+                segments=["segment_a"],
+            )
+        )
+    )
+
+    assert result["ok"] is False
+    assert result["error_type"] == "navigation_task_reconcile_required"
+    assert "reconcile_navigation_task_tool" in result["next_tool_candidates"]
+
+
+def test_finish_processing_gate_blocks_when_reconciled_sync_artifacts_are_missing(
+    monkeypatch,
+    tmp_path,
+):
+    store = InMemoryNavigationPlanDraftStore()
+    task_store = SqliteNavigationTaskStore(tmp_path / "tasks.sqlite")
+    task = task_store.create_or_update_task(
+        date="20270623",
+        segments=["segment_a"],
+        scene_mode="out",
+        web_session_id="web-session",
+        agentscope_session_id="agent-session",
+    )
+    task_store.update_task(
+        task.task_id,
+        phase=NavigationTaskPhase.FINISH_PROCESSING,
+        status=NavigationTaskStatus.NEEDS_RECONCILE,
+        artifact_snapshot=NavigationArtifactSnapshot(
+            date="20270623",
+            segments=["segment_a"],
+            sync_data_exists=False,
+            sync_data_by_segment={"segment_a": False},
+        ).model_dump(mode="json"),
+    )
+
+    def fake_assemble_finish_temp_tool(date: str, segments: list[str] | None = None) -> dict:
+        return {"ok": True, "tool_name": "assemble_finish_temp", "date": date, "segments": segments}
+
+    monkeypatch.setattr(
+        agent_tools_module,
+        "create_navigation_execution_tools",
+        lambda **_: [
+            FunctionTool(
+                fake_assemble_finish_temp_tool,
+                name="assemble_finish_temp_tool",
+                is_read_only=False,
+            )
+        ],
+    )
+    state = WorkflowPlanDraftState(
+        request=NavigationRequest(
+            date="20270623",
+            scene_mode="out",
+            segments=["segment_a"],
+        )
+    )
+    state.finalized_plan = WorkflowPlan(date="20270623", phase="finish_processing", steps=[])
+    store.save("agent-session", state)
+    tools = {
+        tool.name: tool
+        for tool in build_navigation_agent_tools(
+            session_id="agent-session",
+            draft_store=store,
+            task_store=task_store,
+            web_session_id="web-session",
+            dry_run=True,
+        )
+    }
+
+    result = _decode_tool_payload(
+        asyncio.run(
+            tools["assemble_finish_temp_tool"](
+                date="20270623",
+                segments=["segment_a"],
+            )
+        )
+    )
+
+    assert result["ok"] is False
+    assert result["error_type"] == "navigation_task_reconcile_required"
+    assert "rerun extract_sync" in result["message"]
+
+
+def test_finish_processing_gate_blocks_when_sync_data_deleted_after_snapshot(
+    monkeypatch,
+    tmp_path,
+):
+    root = tmp_path / "VLADatasets"
+    store = InMemoryNavigationPlanDraftStore()
+    task_store = SqliteNavigationTaskStore(tmp_path / "tasks.sqlite")
+    task = task_store.create_or_update_task(
+        date="20270623",
+        segments=["segment_a"],
+        scene_mode="out",
+        web_session_id="web-session",
+        agentscope_session_id="agent-session",
+    )
+    task_store.update_task(
+        task.task_id,
+        phase=NavigationTaskPhase.FINISH_PROCESSING,
+        status=NavigationTaskStatus.PENDING,
+        artifact_snapshot=NavigationArtifactSnapshot(
+            date="20270623",
+            segments=["segment_a"],
+            sync_data_exists=True,
+            sync_data_by_segment={"segment_a": True},
+        ).model_dump(mode="json"),
+    )
+
+    def fake_assemble_finish_temp_tool(date: str, segments: list[str] | None = None) -> dict:
+        return {"ok": True, "tool_name": "assemble_finish_temp", "date": date, "segments": segments}
+
+    monkeypatch.setattr(
+        agent_tools_module,
+        "create_navigation_execution_tools",
+        lambda **_: [
+            FunctionTool(
+                fake_assemble_finish_temp_tool,
+                name="assemble_finish_temp_tool",
+                is_read_only=False,
+            )
+        ],
+    )
+    state = WorkflowPlanDraftState(
+        request=NavigationRequest(
+            date="20270623",
+            scene_mode="out",
+            segments=["segment_a"],
+        )
+    )
+    state.finalized_plan = WorkflowPlan(date="20270623", phase="finish_processing", steps=[])
+    store.save("agent-session", state)
+    tools = {
+        tool.name: tool
+        for tool in build_navigation_agent_tools(
+            session_id="agent-session",
+            draft_store=store,
+            task_store=task_store,
+            web_session_id="web-session",
+            settings=agent_tools_module.NavigationSettings(vladatasets_root=root),
+            dry_run=True,
+        )
+    }
+
+    result = _decode_tool_payload(
+        asyncio.run(
+            tools["assemble_finish_temp_tool"](
+                date="20270623",
+                segments=["segment_a"],
+            )
+        )
+    )
+
+    assert result["ok"] is False
+    assert result["error_type"] == "navigation_task_reconcile_required"
+    assert "complete sync_data for selected segments" in result["missing_fields"]
+
+
+def test_resume_finish_gate_rejects_extract_tools_and_allows_finish_tools(
+    monkeypatch,
+    tmp_path,
+):
+    root = tmp_path / "VLADatasets"
+    (root / "clip_data" / "20270623" / "segment_a" / "sync_data" / "clip_0").mkdir(
+        parents=True
+    )
+    store = InMemoryNavigationPlanDraftStore()
+    task_store = SqliteNavigationTaskStore(tmp_path / "tasks.sqlite")
+    task = task_store.create_or_update_task(
+        date="20270623",
+        segments=["segment_a"],
+        scene_mode="out",
+        web_session_id="web-session",
+        agentscope_session_id="agent-session",
+    )
+    task_store.update_task(
+        task.task_id,
+        phase=NavigationTaskPhase.FINISH_PROCESSING,
+        status=NavigationTaskStatus.PENDING,
+        artifact_snapshot=NavigationArtifactSnapshot(
+            date="20270623",
+            segments=["segment_a"],
+            sync_data_exists=True,
+            sync_data_by_segment={"segment_a": True},
+        ).model_dump(mode="json"),
+    )
+
+    def fake_extract_and_sync_navigation_data_tool(date: str, segments: list[str] | None = None) -> dict:
+        return {"ok": True, "tool_name": "extract_and_sync_navigation_data", "date": date}
+
+    def fake_assemble_finish_temp_tool(date: str, segments: list[str] | None = None) -> dict:
+        return {"ok": True, "tool_name": "assemble_finish_temp", "date": date, "segments": segments}
+
+    monkeypatch.setattr(
+        agent_tools_module,
+        "create_navigation_execution_tools",
+        lambda **_: [
+            FunctionTool(
+                fake_extract_and_sync_navigation_data_tool,
+                name="extract_and_sync_navigation_data_tool",
+                is_read_only=False,
+            ),
+            FunctionTool(
+                fake_assemble_finish_temp_tool,
+                name="assemble_finish_temp_tool",
+                is_read_only=False,
+            ),
+        ],
+    )
+    state = WorkflowPlanDraftState(
+        request=NavigationRequest(
+            date="20270623",
+            scene_mode="out",
+            segments=["segment_a"],
+        )
+    )
+    state.finalized_plan = WorkflowPlan(date="20270623", phase="finish_processing", steps=[])
+    store.save("agent-session", state)
+    tools = {
+        tool.name: tool
+        for tool in build_navigation_agent_tools(
+            session_id="agent-session",
+            draft_store=store,
+            task_store=task_store,
+            web_session_id="web-session",
+            settings=agent_tools_module.NavigationSettings(vladatasets_root=root),
+            dry_run=True,
+        )
+    }
+
+    extract = _decode_tool_payload(
+        asyncio.run(
+            tools["extract_and_sync_navigation_data_tool"](
+                date="20270623",
+                segments=["segment_a"],
+            )
+        )
+    )
+    finish = _decode_tool_payload(
+        asyncio.run(
+            tools["assemble_finish_temp_tool"](
+                date="20270623",
+                segments=["segment_a"],
+            )
+        )
+    )
+
+    assert extract["ok"] is False
+    assert extract["error_type"] == "navigation_phase_plan_required"
+    assert finish["ok"] is True
 
 
 def test_navigation_execution_tool_is_blocked_before_session_plan_is_finalized(monkeypatch):
@@ -1012,6 +1321,7 @@ def test_navigation_handoff_tool_declares_structured_schema():
         "missing_fields",
         "confidence",
         "response_language",
+        "dry_run",
     }
     assert tool.input_schema["required"] == [
         "request",
@@ -1186,6 +1496,7 @@ def test_navigation_handoff_message_includes_structured_json_for_draft_initializ
         "segments": ["20260605_152856"],
         "reason": "用户要处理导航数据",
         "response_language": "Chinese",
+        "dry_run": False,
     }
 
 
@@ -1238,6 +1549,7 @@ def test_navigation_handoff_tool_records_observability_payload():
             "missing_fields": [],
             "confidence": "medium",
             "response_language": "Chinese",
+            "dry_run": False,
             "started": True,
         }
     ]

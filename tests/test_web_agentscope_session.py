@@ -578,6 +578,36 @@ async def test_runtime_start_navigation_agent_task_precreates_session_draft_from
 
 
 @pytest.mark.asyncio
+async def test_runtime_start_navigation_agent_task_preserves_dry_run_from_handoff(
+    tmp_path: Path,
+) -> None:
+    chat_run_registry = FakeChatRunRegistry()
+    runtime = _runtime(chat_run_registry=chat_run_registry, workspace_root=tmp_path)
+    message = agentscope_runtime_module._navigation_handoff_message(
+        request="请帮我 dry run 处理 20270605 的导航数据",
+        target="20270605",
+        date="20270605",
+        scene_mode=None,
+        clips=[],
+        reason="用户要求 dry run",
+        response_language="Chinese",
+        dry_run=True,
+    )
+
+    session_id = await runtime.start_navigation_agent_task(
+        web_session_id="web-1",
+        message=message,
+    )
+    state = JsonNavigationPlanDraftStore(
+        tmp_path / "navigation-plan-drafts"
+    ).load(session_id)
+
+    assert state is not None
+    assert state.request.dry_run is True
+    await chat_run_registry.drain()
+
+
+@pytest.mark.asyncio
 async def test_runtime_registers_navigation_task_tools_for_navigation_agent(tmp_path):
     runtime = _runtime(workspace_root=tmp_path)
     await runtime.ensure_bootstrapped()
@@ -595,6 +625,48 @@ async def test_runtime_registers_navigation_task_tools_for_navigation_agent(tmp_
 
     assert "get_or_create_navigation_task_tool" in names
     assert "reconcile_navigation_task_tool" in names
+
+
+@pytest.mark.asyncio
+async def test_runtime_navigation_tools_use_session_draft_dry_run(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    captured = {}
+
+    def fake_build_navigation_agent_tools(**kwargs):
+        captured.update(kwargs)
+        return []
+
+    monkeypatch.setattr(
+        agentscope_runtime_module,
+        "build_navigation_agent_tools",
+        fake_build_navigation_agent_tools,
+    )
+    runtime = _runtime(workspace_root=tmp_path)
+    await runtime.ensure_bootstrapped()
+    session_id = await runtime.ensure_web_session(
+        "web-1",
+        agent_id=runtime.config.navigation_agent_id,
+        model=runtime.config.navigation_model,
+    )
+    JsonNavigationPlanDraftStore(tmp_path / "navigation-plan-drafts").save(
+        session_id,
+        agentscope_runtime_module.WorkflowPlanDraftState(
+            request=agentscope_runtime_module.NavigationRequest(
+                date="20270605",
+                dry_run=True,
+            )
+        ),
+    )
+
+    tools = runtime._navigation_tools_for_session(
+        web_session_id="web-1",
+        agentscope_session_id=session_id,
+    )
+
+    assert tools == []
+    assert captured["dry_run"] is True
 
 
 @pytest.mark.asyncio
@@ -628,6 +700,37 @@ async def test_navigation_handoff_tool_allows_unknown_scene_mode() -> None:
     assert payload["scene_mode"] is None
     assert payload["segments"] is None
     assert runtime.handoffs[-1]["started"] is True
+
+
+@pytest.mark.asyncio
+async def test_navigation_handoff_tool_preserves_dry_run_payload() -> None:
+    runtime = CapturingNavigationTaskRuntime()
+    tool = agentscope_runtime_module.NavigationHandoffTool(
+        runtime=runtime,
+        web_session_id="web-1",
+    )
+
+    assert "dry_run" in tool.input_schema["properties"]
+    assert "dry_run" not in tool.input_schema["required"]
+
+    result = await tool(
+        request="请 dry run 处理 20270605 的导航数据",
+        target="20270605",
+        date="20270605",
+        scene_mode="unknown",
+        dry_run=True,
+        reason="用户要求 dry run",
+        missing_fields=[],
+        confidence="high",
+        response_language="Chinese",
+    )
+    payload = agentscope_runtime_module._structured_handoff_payload_from_message(
+        runtime.started_tasks[0]["message"]
+    )
+
+    assert result.state == ToolResultState.SUCCESS
+    assert payload["dry_run"] is True
+    assert runtime.handoffs[-1]["dry_run"] is True
 
 
 @pytest.mark.asyncio

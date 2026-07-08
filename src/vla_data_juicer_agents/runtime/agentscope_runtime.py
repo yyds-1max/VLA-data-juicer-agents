@@ -273,13 +273,25 @@ class AgentScopeRuntime:
             self.config.workspace_root / "navigation-plan-drafts"
         )
         return build_navigation_agent_tools(
-            dry_run=False,
+            dry_run=self._navigation_session_dry_run(
+                agentscope_session_id=agentscope_session_id,
+                draft_store=draft_store,
+            ),
             cancellation=self.run_cancellation(agentscope_session_id),
             session_id=agentscope_session_id,
             draft_store=draft_store,
             task_store=self._navigation_task_store(),
             web_session_id=web_session_id,
         )
+
+    def _navigation_session_dry_run(
+        self,
+        *,
+        agentscope_session_id: str,
+        draft_store: JsonNavigationPlanDraftStore,
+    ) -> bool:
+        state = draft_store.load(agentscope_session_id)
+        return bool(state.request.dry_run) if state is not None else False
 
     async def submit_human_decision(self, *, web_session_id: str, decision: dict[str, Any]) -> bool:
         mapped = self._web_session_mapping(web_session_id)
@@ -965,6 +977,7 @@ def _navigation_handoff_message(
     clips: list[str],
     reason: str,
     response_language: str | None,
+    dry_run: bool = False,
 ) -> str:
     clip_text = ", ".join(clips) if clips else "all"
     language = _resolve_response_language(response_language, request)
@@ -978,6 +991,7 @@ def _navigation_handoff_message(
         "segments": clips or None,
         "reason": reason,
         "response_language": language,
+        "dry_run": bool(dry_run),
     }
     structured_lines = [
         "Structured handoff JSON:",
@@ -1110,6 +1124,10 @@ class NavigationHandoffTool(ToolBase):
                 "type": "string",
                 "description": "The language the user is using and expects for responses, such as Chinese or English.",
             },
+            "dry_run": {
+                "type": "boolean",
+                "description": "Whether the navigation task should execute in dry-run mode.",
+            },
         },
         "required": [
             "request",
@@ -1151,6 +1169,7 @@ class NavigationHandoffTool(ToolBase):
         response_language: str | None = None,
         clips: list[str] | None = None,
         scene_mode: str | None = None,
+        dry_run: bool = False,
     ) -> ToolChunk:
         normalized_clips = list(clips or [])
         normalized_language = _resolve_response_language(response_language, request)
@@ -1166,6 +1185,7 @@ class NavigationHandoffTool(ToolBase):
             "missing_fields": list(missing_fields),
             "confidence": confidence,
             "response_language": normalized_language,
+            "dry_run": bool(dry_run),
             "started": False,
         }
 
@@ -1199,6 +1219,7 @@ class NavigationHandoffTool(ToolBase):
             clips=normalized_clips,
             reason=reason,
             response_language=normalized_language,
+            dry_run=dry_run,
         )
         await self._runtime.start_navigation_agent_task(
             web_session_id=self._web_session_id,
@@ -1244,13 +1265,19 @@ def build_extra_agent_tools_factory(
                     )
                 run_cancellation = getattr(runtime, "run_cancellation", None)
                 return build_navigation_agent_tools(
-                    dry_run=False,
+                    dry_run=_navigation_dry_run_for_session(
+                        draft_store=draft_store,
+                        session_id=_session_id,
+                    ),
                     cancellation=run_cancellation(_session_id) if callable(run_cancellation) else None,
                     session_id=_session_id,
                     draft_store=draft_store,
                 )
             return build_navigation_agent_tools(
-                dry_run=False,
+                dry_run=_navigation_dry_run_for_session(
+                    draft_store=draft_store,
+                    session_id=_session_id,
+                ),
                 session_id=_session_id,
                 draft_store=draft_store,
                 task_store=SqliteNavigationTaskStore(
@@ -1272,6 +1299,15 @@ def build_extra_agent_tools_factory(
         return []
 
     return extra_agent_tools
+
+
+def _navigation_dry_run_for_session(
+    *,
+    draft_store: JsonNavigationPlanDraftStore,
+    session_id: str,
+) -> bool:
+    state = draft_store.load(session_id)
+    return bool(state.request.dry_run) if state is not None else False
 
 
 def create_agentscope_runtime(config: AgentScopeRuntimeConfig) -> AgentScopeRuntime:
