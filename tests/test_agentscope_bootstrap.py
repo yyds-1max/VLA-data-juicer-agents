@@ -52,7 +52,7 @@ def test_main_router_prompt_presents_datapilot_and_sets_task_readiness_rules():
     assert "date, path, or" in prompt
     assert "dataset target" in prompt
     assert "ask for the data date or path" in prompt
-    assert "indoor or outdoor" in prompt
+    assert "Do not ask indoor/outdoor before extract/sync" in prompt
     assert "combine it with the pending task context" in prompt
     assert "If no clip is specified, process all clips" in prompt
     assert "If a specified clip does not exist" in prompt
@@ -108,6 +108,8 @@ def test_navigation_agent_prompt_requires_plan_execute_react_and_human_decisions
         "topic_map as real JSON objects",
         "If all raw segments should be processed",
         "Do not call update_workflow_plan_draft_tool with an empty",
+        "finalize_extract_sync_plan_tool",
+        "finalize_finish_processing_plan_tool",
         "finalize_workflow_plan_tool",
         "do not hand-write final WorkflowPlan JSON",
         "read-only inspection tools before execution",

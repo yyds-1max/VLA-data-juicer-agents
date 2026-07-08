@@ -2,6 +2,8 @@ import asyncio
 import inspect
 import json
 
+import pytest
+
 from vla_data_juicer_agents.navigation.plan_draft_store import InMemoryNavigationPlanDraftStore
 from vla_data_juicer_agents.navigation import session_plan_draft_tools as session_tools_module
 from vla_data_juicer_agents.navigation.session_plan_draft_tools import (
@@ -109,12 +111,59 @@ def _complete_profile_patch():
     }
 
 
+@pytest.fixture
+def complete_extract_sync_draft_payload():
+    return {
+        "processing_profile": {
+            "id": "parameterized_navigation_v1",
+            "platform_hint": "go2w",
+            "topic_params": {
+                "topic_whitelist": [
+                    "/cam_video4/csi_cam/image_raw/compressed",
+                    "/rs32_lidar_points",
+                    "/sport_odom",
+                ],
+                "topic_map": {
+                    "cam_video4": "fisheye_front",
+                    "rs32_lidar_points": "r32_rslidar_points",
+                    "sport_odom": "odom",
+                },
+                "query_dir": "rs32_lidar_points",
+            },
+            "localization_policy": {"source": "odom", "conversion": "odom_to_ins"},
+        },
+        "topic_params": {
+            "topic_whitelist": [
+                "/cam_video4/csi_cam/image_raw/compressed",
+                "/rs32_lidar_points",
+                "/sport_odom",
+            ],
+            "topic_map": {
+                "cam_video4": "fisheye_front",
+                "rs32_lidar_points": "r32_rslidar_points",
+                "sport_odom": "odom",
+            },
+            "query_dir": "rs32_lidar_points",
+        },
+        "localization_policy": {"source": "odom", "conversion": "odom_to_ins"},
+        "stage_variants": {
+            "extract_and_sync_navigation_data": {
+                "variant": "explicit_topic_params",
+                "reason": "topic params inferred from metadata",
+                "evidence": ["metadata.yaml"],
+            }
+        },
+    }
+
+
 def test_session_draft_tools_are_marked_mutating():
     store = InMemoryNavigationPlanDraftStore()
     tools = _tools(store)
 
     assert tools["get_workflow_plan_draft_tool"].is_read_only is False
     assert tools["update_workflow_plan_draft_tool"].is_read_only is False
+    assert tools["finalize_extract_sync_plan_tool"].is_read_only is False
+    assert tools["finalize_finish_processing_plan_tool"].is_read_only is False
     assert tools["finalize_workflow_plan_tool"].is_read_only is False
 
 
@@ -231,6 +280,90 @@ def test_get_workflow_plan_draft_allows_date_without_scene_mode_for_extract_sync
     assert result["draft"]["date"] == "20270623"
     assert result["draft"]["scene_mode"] is None
     assert "scene_mode" not in result["draft"]["missing_fields"]
+
+
+def test_extract_sync_plan_finalizes_without_scene_mode(complete_extract_sync_draft_payload):
+    store = InMemoryNavigationPlanDraftStore()
+    tools = {
+        tool.name: tool
+        for tool in build_session_plan_draft_tools(store=store, session_id="session-a")
+    }
+    _invoke_tool(tools["get_workflow_plan_draft_tool"], {"date": "20270623"})
+    for observation_id, used_tool in [
+        ("raw_metadata", "inspect_raw_date_tool"),
+        ("sensor_bindings", "infer_navigation_sensor_bindings_tool"),
+        ("navigation_processing_profile", "infer_navigation_processing_profile_tool"),
+    ]:
+        _invoke_tool(
+            tools["update_workflow_plan_draft_tool"],
+            {
+                "data_profile_patch": {"evidence": {observation_id: [used_tool]}},
+                "observation_id": observation_id,
+                "used_tool": used_tool,
+            },
+        )
+    _invoke_tool(
+        tools["update_workflow_plan_draft_tool"],
+        {
+            "data_profile_patch": complete_extract_sync_draft_payload,
+            "observation_id": "navigation_topic_params",
+            "used_tool": "infer_navigation_topic_params_tool",
+        },
+    )
+
+    result = _invoke_tool(tools["finalize_extract_sync_plan_tool"], {})
+
+    assert result["ok"] is True
+    assert result["workflow_plan_json"]["phase"] == "extract_sync"
+    assert result["workflow_plan_json"]["scene_mode"] is None
+    assert [step["tool_name"] for step in result["workflow_plan_json"]["steps"]] == [
+        "prepare_raw_data",
+        "extract_and_sync_navigation_data",
+    ]
+
+
+def test_get_workflow_plan_draft_advances_to_finish_processing_when_scene_mode_arrives_later(
+    complete_extract_sync_draft_payload,
+):
+    store = InMemoryNavigationPlanDraftStore()
+    tools = {
+        tool.name: tool
+        for tool in build_session_plan_draft_tools(store=store, session_id="session-a")
+    }
+    _invoke_tool(tools["get_workflow_plan_draft_tool"], {"date": "20270623"})
+    for observation_id, used_tool in [
+        ("raw_metadata", "inspect_raw_date_tool"),
+        ("sensor_bindings", "infer_navigation_sensor_bindings_tool"),
+        ("navigation_processing_profile", "infer_navigation_processing_profile_tool"),
+    ]:
+        _invoke_tool(
+            tools["update_workflow_plan_draft_tool"],
+            {
+                "data_profile_patch": {"evidence": {observation_id: [used_tool]}},
+                "observation_id": observation_id,
+                "used_tool": used_tool,
+            },
+        )
+    _invoke_tool(
+        tools["update_workflow_plan_draft_tool"],
+        {
+            "data_profile_patch": complete_extract_sync_draft_payload,
+            "observation_id": "navigation_topic_params",
+            "used_tool": "infer_navigation_topic_params_tool",
+        },
+    )
+    _invoke_tool(tools["finalize_extract_sync_plan_tool"], {})
+
+    resumed = _invoke_tool(
+        tools["get_workflow_plan_draft_tool"],
+        {"date": "20270623", "scene_mode": "out"},
+    )
+
+    assert resumed["ok"] is True
+    assert resumed["draft"]["scene_mode"] == "out"
+    assert resumed["draft"]["plan_phase"] == "finish_processing"
+    assert resumed["draft"]["next_required_observation"]["observation_id"] == "processing_state"
+    assert resumed["draft"]["next_tool_candidates"] == ["inspect_processing_state_tool"]
 
 
 def test_get_draft_without_existing_state_requires_initial_request():

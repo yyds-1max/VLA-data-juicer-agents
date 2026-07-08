@@ -29,7 +29,7 @@ from clip names, because clip names may contain an older capture timestamp prefi
 
 Call `list_navigation_tool_capabilities_tool` before choosing variants.
 Call `update_workflow_plan_draft_tool` with the lightweight NavigationDataProfile.
-Call `finalize_workflow_plan_tool`; do not hand-write final WorkflowPlan JSON.
+Call `finalize_extract_sync_plan_tool` for extract/sync, then `finalize_finish_processing_plan_tool` once scene_mode and finish-processing facts are ready. `finalize_workflow_plan_tool` remains the compatibility full-plan alias. Do not hand-write final WorkflowPlan JSON.
 If a finalized plan already exists in the session draft, use it as the durable plan reference
 and continue from the current AgentScope session state.
 
@@ -213,13 +213,14 @@ Operate with plan-and-execute and ReAct:
 3. Use read-only inspection tools before execution in the draft-required order: inspect_raw_date_tool, infer_navigation_sensor_bindings_tool, infer_navigation_processing_profile_tool, infer_navigation_topic_params_tool, inspect_processing_state_tool, inspect_gridmap_artifacts_tool, inspect_runtime_assets_tool, and list_navigation_tool_capabilities_tool.
 4. After each meaningful observation, call update_workflow_plan_draft_tool with only newly observed NavigationDataProfile facts, observation_id, and used_tool from the completed observation. Pass data_profile_patch as a JSON object, never as a JSON string. Do not call update_workflow_plan_draft_tool with an empty or omitted data_profile_patch. The next read-only tool is determined by the updated draft.
 5. For all tool calls, pass list arguments such as segments and topic_whitelist as real JSON arrays, not JSON-encoded strings. Pass object arguments such as topic_map as real JSON objects, not JSON-encoded strings. If all raw segments should be processed, omit segments or pass null.
-6. do not hand-write final WorkflowPlan JSON. Execute only after finalize_workflow_plan_tool returns ok=true and a valid workflow_plan_json.
+6. do not hand-write final WorkflowPlan JSON. Use finalize_extract_sync_plan_tool for the extract/sync phase, then finalize_finish_processing_plan_tool for the later finish-processing phase after scene_mode is known. finalize_workflow_plan_tool remains the compatibility full-plan alias. Execute only after the phase-appropriate finalize tool returns ok=true and a valid workflow_plan_json.
 7. If a finalized plan is already present in the draft, use it as the durable plan reference and continue from the current AgentScope conversation state.
 8. Preserve the localization policy: native Ins skips odom conversion, while odom localization requires odom_to_ins conversion.
 
-After finalize_workflow_plan_tool returns a plan, execute the first
-`confirm_navigation_calibration_params` step by calling request_human_decision
-with decision_type=`camera_params`,
+After a finalize_* tool returns a plan, execute the returned WorkflowPlan from
+its first step. If the finalized phase is `finish_processing` or `full`, the
+first step must be `confirm_navigation_calibration_params`; execute that step
+by calling request_human_decision with decision_type=`camera_params`,
 request_id=`confirm_navigation_calibration_params:<date>`, and a concise
 summary of the camera calibration and sensor assumptions. Do not ask the user to type magic confirmation text. Read the confirm/stop/guidance result from
 the external confirmation dialog and continue the same AgentScope session.

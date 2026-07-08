@@ -132,6 +132,7 @@ def test_workflow_plan_uses_processing_profile_instead_of_dataset_profile():
     payload = plan.model_dump(mode="json")
     assert payload["processing_profile"] == "parameterized_navigation_v1"
     assert payload["platform_hint"] == "unknown"
+    assert payload["phase"] == "full"
     assert "dataset_profile" not in payload
 
 
@@ -155,18 +156,14 @@ def test_workflow_plan_keeps_ordered_steps():
     assert plan.scene_mode == "out"
 
 
-def test_workflow_plan_rejects_missing_scene_mode():
-    with pytest.raises(ValueError):
-        WorkflowPlan(
-            date="20270605",
-            scene_mode=None,
-            processing_profile="parameterized_navigation_v1",
-            steps=[WorkflowStep(step_id="prepare", tool_name="prepare_raw_data")],
-        )
+def test_workflow_plan_allows_extract_sync_without_scene_mode():
+    plan = WorkflowPlan(
+        date="20270605",
+        phase="extract_sync",
+        scene_mode=None,
+        processing_profile="parameterized_navigation_v1",
+        steps=[WorkflowStep(step_id="prepare", tool_name="prepare_raw_data")],
+    )
 
-    with pytest.raises(ValueError):
-        WorkflowPlan(
-            date="20270605",
-            processing_profile="parameterized_navigation_v1",
-            steps=[WorkflowStep(step_id="prepare", tool_name="prepare_raw_data")],
-        )
+    assert plan.scene_mode is None
+    assert plan.phase == "extract_sync"

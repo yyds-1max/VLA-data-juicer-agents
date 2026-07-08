@@ -350,6 +350,64 @@ def build_deterministic_plan_template(
     )
 
 
+def build_extract_sync_plan_template(
+    date: str,
+    processing_profile: str | None = None,
+    segments: list[str] | None = None,
+    *,
+    data_profile_draft: dict[str, Any] | None = None,
+) -> WorkflowPlan:
+    draft = data_profile_draft or {}
+    topic_params = draft.get("topic_params") or {}
+    topic_arguments = {
+        "topic_whitelist": list(topic_params.get("topic_whitelist") or []),
+        "topic_map": dict(topic_params.get("topic_map") or {}),
+        "query_dir": topic_params.get("query_dir"),
+    }
+    draft_processing_profile = draft.get("processing_profile")
+    profile_id = processing_profile or (
+        draft_processing_profile.get("id")
+        if isinstance(draft_processing_profile, dict)
+        else None
+    ) or "parameterized_navigation_v1"
+    platform_hint = draft.get("platform_hint") or (
+        draft_processing_profile.get("platform_hint")
+        if isinstance(draft_processing_profile, dict)
+        else "unknown"
+    )
+    common_arguments = {"date": date, "segments": segments}
+    return WorkflowPlan(
+        date=date,
+        segments=segments,
+        scene_mode=None,
+        phase="extract_sync",
+        processing_profile=profile_id,
+        platform_hint=platform_hint or "unknown",
+        steps=[
+            WorkflowStep(
+                step_id="prepare_raw_data",
+                tool_name="prepare_raw_data",
+                arguments=common_arguments,
+                expected_outputs=[f"raw_data/{date}_temp"],
+            ),
+            WorkflowStep(
+                step_id="extract_and_sync_navigation_data",
+                tool_name="extract_and_sync_navigation_data",
+                arguments={
+                    **common_arguments,
+                    "processing_profile": profile_id,
+                    "platform_hint": platform_hint or "unknown",
+                    **topic_arguments,
+                },
+                preconditions=["prepare_raw_data"],
+                expected_outputs=[f"clip_data/{date}"],
+                variant="explicit_topic_params",
+                effects="execute",
+            ),
+        ],
+    )
+
+
 def _event_type(event: object) -> str:
     event_type = getattr(event, "type", None)
     if hasattr(event_type, "value"):
@@ -482,13 +540,13 @@ async def run_plan_agent(
         "After the tool result, emit a Progress line, then call update_workflow_plan_draft_tool with "
         "data_profile_patch containing only newly learned NavigationDataProfile facts, plus observation_id "
         "and used_tool.\n"
-        "- Finish by emitting a Progress line, then calling finalize_workflow_plan_tool, but only when "
-        "ready_to_finish is true and missing_fields is empty.\n"
+        "- Finish by emitting a Progress line, then calling the phase-appropriate finalize_* plan tool named "
+        "in next_tool_candidates, but only when ready_to_finish is true and missing_fields is empty.\n"
         "Do not output textual Thought: or Action: lines. Do not write ToolName[arguments] strings.\n\n"
         "The NavigationDataProfile schema is authoritative. data_profile_patch must be JSON-compatible and "
         "must use only schema fields and valid enum values. Do not output a complete data_profile unless it is "
         "already fully supported by previous tool observations. Do not write script-level steps; "
-        "final strict WorkflowPlan JSON must come from finalize_workflow_plan_tool. Stage one covers "
+        "final strict WorkflowPlan JSON must come from the phase-appropriate finalize_* tool. Stage one covers "
         "prepare.sh, run_U.sh, and run_odom.sh only; do not include run_fix.sh. Default to all raw "
         "segments when segments are not specified. Use NavigationDataProfile.processing_profile and "
         "platform_hint for diagnostic context; infer sensor bindings and processing_profile from "
@@ -498,10 +556,11 @@ async def run_plan_agent(
         "do not invent TOPIC_WHITELIST, topic_map, query_dir, localization policy, or calibration "
         "policy. Use explicit_topic_params for extract_and_sync_navigation_data after topic_params are complete. "
         "Set run_projection_and_trajectory.projection_variant explicitly from observed runtime/tool capability evidence. "
-        "Only finalize when processing_profile, topic_params, and data_profile have no blocking_issues. Always include "
-        "confirm_navigation_calibration_params as the first step before any processing and before "
-        "prepare_raw_data. scene_mode is required "
-        "and must be either in or out. Gridmap preparation must happen "
+        "Only finalize when processing_profile, topic_params, and data_profile have no blocking_issues. "
+        "scene_mode is optional during extract/sync and required before finish-processing finalization. "
+        "Extract/sync finalization should stop after prepare_raw_data and extract_and_sync_navigation_data. "
+        "Finish-processing/full finalization must place confirm_navigation_calibration_params as the first step before "
+        "finish processing. Gridmap preparation must happen "
         "after run_tracking and before projection. Supported execution tool names include run_tracking, "
         "prepare_gridmap_for_projection, and run_projection_and_trajectory. The only human-blocking step "
         "besides calibration confirmation is gen_box.py via run_initial_annotation_gui. "

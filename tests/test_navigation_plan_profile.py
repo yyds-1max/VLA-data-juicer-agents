@@ -12,7 +12,11 @@ from vla_data_juicer_agents.navigation.models import (
     WorkflowStep,
 )
 from vla_data_juicer_agents.navigation.plan_draft import WorkflowPlanDraftState, build_plan_from_draft
-from vla_data_juicer_agents.navigation.workflow import build_deterministic_plan_template
+from vla_data_juicer_agents.navigation.plan_validation import validate_workflow_plan
+from vla_data_juicer_agents.navigation.workflow import (
+    build_deterministic_plan_template,
+    build_extract_sync_plan_template,
+)
 
 
 def _complete_stage_variants(gridmap_variant: str, gridmap_reason: str, gridmap_evidence: list[str]):
@@ -200,11 +204,13 @@ def test_workflow_plan_draft_snapshot_exposes_react_profile_state_panel():
         "segments": None,
         "platform_hint": "unknown",
     }
+    assert snapshot["plan_phase"] == "extract_sync"
     assert "date" in snapshot["filled_fields"]
     assert "scene_mode" in snapshot["filled_fields"]
     assert "processing_profile" in snapshot["missing_fields"]
     assert "topic_params" in snapshot["missing_fields"]
-    assert "stage_variants.prepare_gridmap_for_projection" in snapshot["missing_fields"]
+    assert "stage_variants.extract_and_sync_navigation_data" in snapshot["missing_fields"]
+    assert "stage_variants.prepare_gridmap_for_projection" not in snapshot["missing_fields"]
     assert snapshot["ready_to_finish"] is False
     assert snapshot["next_tool_candidates"] == ["inspect_raw_date_tool"]
 
@@ -258,7 +264,7 @@ def test_workflow_plan_draft_does_not_advance_when_later_observation_is_recorded
     assert state.next_tool_candidates() == ["inspect_raw_date_tool"]
 
 
-def test_workflow_plan_draft_suggests_finalize_after_ordered_observations_and_complete_profile():
+def test_workflow_plan_draft_suggests_extract_sync_finalize_after_extract_sync_observations():
     state = WorkflowPlanDraftState(
         request=NavigationRequest(date="20270605", scene_mode="out")
     )
@@ -289,16 +295,12 @@ def test_workflow_plan_draft_suggests_finalize_after_ordered_observations_and_co
         ("sensor_bindings", "infer_navigation_sensor_bindings_tool"),
         ("navigation_processing_profile", "infer_navigation_processing_profile_tool"),
         ("navigation_topic_params", "infer_navigation_topic_params_tool"),
-        ("processing_state", "inspect_processing_state_tool"),
-        ("gridmap_artifacts", "inspect_gridmap_artifacts_tool"),
-        ("runtime_assets", "inspect_runtime_assets_tool"),
-        ("tool_capabilities", "list_navigation_tool_capabilities_tool"),
     ]
 
     for observation_id, used_tool in ordered_observations:
         patch = (
             profile.model_dump(mode="json")
-            if observation_id == "tool_capabilities"
+            if observation_id == "navigation_topic_params"
             else {"evidence": {observation_id: [used_tool]}}
         )
         state.update(
@@ -308,7 +310,25 @@ def test_workflow_plan_draft_suggests_finalize_after_ordered_observations_and_co
         )
 
     assert state.ready_to_finish() is True
-    assert state.next_tool_candidates() == ["finalize_workflow_plan_tool"]
+    assert state.next_required_observation() is None
+    assert state.next_tool_candidates() == ["finalize_extract_sync_plan_tool"]
+
+
+def test_extract_sync_plan_validation_skips_finish_processing_requirements():
+    plan = build_extract_sync_plan_template(
+        "20270605",
+        "parameterized_navigation_v1",
+        None,
+        data_profile_draft={
+            "processing_profile": {"id": "parameterized_navigation_v1", "platform_hint": "go2w"},
+            "topic_params": _go2w_topic_params().model_dump(mode="json"),
+        },
+    )
+
+    validation = validate_workflow_plan(plan)
+
+    assert validation["ok"] is True
+    assert validation["errors"] == []
 
 
 def test_workflow_plan_draft_requires_processing_profile_not_dataset_profile():

@@ -6,7 +6,11 @@ from typing import Any
 from agentscope.tool import FunctionTool
 
 from vla_data_juicer_agents.navigation.models import NavigationRequest
-from vla_data_juicer_agents.navigation.plan_draft import WorkflowPlanDraftState, build_plan_from_draft
+from vla_data_juicer_agents.navigation.plan_draft import (
+    WorkflowPlanDraftState,
+    build_extract_sync_plan_from_draft,
+    build_plan_from_draft,
+)
 from vla_data_juicer_agents.navigation.plan_draft_store import NavigationPlanDraftStore
 from vla_data_juicer_agents.navigation.plan_validation import validate_workflow_plan
 
@@ -46,6 +50,22 @@ def build_session_plan_draft_tools(
                 date=date,
                 scene_mode=scene_mode,
             )
+        else:
+            updated = False
+            normalized_scene_mode = scene_mode if scene_mode in {"in", "out"} else None
+            if normalized_scene_mode is not None and state.request.scene_mode != normalized_scene_mode:
+                state.set_scene_mode(normalized_scene_mode)
+                updated = True
+            if (
+                normalized_scene_mode in {"in", "out"}
+                and state.plan_phase == "extract_sync"
+                and state.finalized_plan is not None
+                and state.finalized_plan.phase == "extract_sync"
+            ):
+                state.advance_to_finish_processing(scene_mode=normalized_scene_mode)
+                updated = True
+            if updated:
+                store.save(session_id, state)
         return state.status()
 
     def update_workflow_plan_draft_tool(
@@ -124,6 +144,63 @@ def build_session_plan_draft_tools(
             "draft": state.schema_snapshot(),
         }
 
+    def finalize_extract_sync_plan_tool() -> dict[str, Any]:
+        """Finalize and return extract-sync WorkflowPlan JSON before scene_mode is known."""
+        state = store.load(session_id)
+        if state is None:
+            return _missing_initial_request()
+        try:
+            plan = build_extract_sync_plan_from_draft(state)
+        except ValueError as exc:
+            return {
+                "ok": False,
+                "error_type": "extract_sync_plan_draft_incomplete",
+                "message": str(exc),
+                "missing_fields": state.missing_fields(phase="extract_sync"),
+                "draft": state.schema_snapshot(),
+            }
+        state.finalized_plan = plan
+        store.save(session_id, state)
+        return {
+            "ok": True,
+            "workflow_plan_json": json.loads(plan.model_dump_json()),
+            "draft": state.schema_snapshot(),
+        }
+
+    def finalize_finish_processing_plan_tool() -> dict[str, Any]:
+        """Finalize and return finish-processing WorkflowPlan JSON after scene_mode is known."""
+        state = store.load(session_id)
+        if state is None:
+            return _missing_initial_request()
+        try:
+            plan = build_plan_from_draft(state).model_copy(update={"phase": "finish_processing"})
+        except ValueError as exc:
+            return {
+                "ok": False,
+                "error_type": "workflow_plan_draft_incomplete",
+                "message": str(exc),
+                "missing_fields": state.missing_fields(phase="finish_processing"),
+                "next_tool_candidates": state.next_tool_candidates(),
+                "draft": state.schema_snapshot(),
+            }
+        validation = validate_workflow_plan(plan, data_profile=state.data_profile)
+        if validation["errors"]:
+            return {
+                "ok": False,
+                "error_type": "workflow_plan_validation_failed",
+                "message": "WorkflowPlan validation failed before finalization.",
+                "validation_errors": validation["errors"],
+                "validation_warnings": validation.get("warnings", []),
+                "draft": state.schema_snapshot(),
+            }
+        state.finalized_plan = plan
+        store.save(session_id, state)
+        return {
+            "ok": True,
+            "workflow_plan_json": json.loads(plan.model_dump_json()),
+            "draft": state.schema_snapshot(),
+        }
+
     return [
         FunctionTool(
             get_workflow_plan_draft_tool,
@@ -133,6 +210,16 @@ def build_session_plan_draft_tools(
         FunctionTool(
             update_workflow_plan_draft_tool,
             name="update_workflow_plan_draft_tool",
+            is_read_only=False,
+        ),
+        FunctionTool(
+            finalize_extract_sync_plan_tool,
+            name="finalize_extract_sync_plan_tool",
+            is_read_only=False,
+        ),
+        FunctionTool(
+            finalize_finish_processing_plan_tool,
+            name="finalize_finish_processing_plan_tool",
             is_read_only=False,
         ),
         FunctionTool(
@@ -181,7 +268,7 @@ def _request_mismatch(
 ) -> bool:
     if date is not None and date != state.request.date:
         return True
-    if scene_mode is not None and scene_mode != state.request.scene_mode:
+    if scene_mode in {"in", "out"} and state.request.scene_mode not in {None, scene_mode}:
         return True
     return False
 

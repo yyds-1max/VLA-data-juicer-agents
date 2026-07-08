@@ -246,6 +246,7 @@ def validate_workflow_plan(
 ) -> dict[str, Any]:
     errors: list[dict[str, Any]] = []
     warnings: list[dict[str, Any]] = []
+    is_extract_sync = plan.phase == "extract_sync"
 
     if not plan.processing_profile.strip():
         errors.append(
@@ -256,7 +257,7 @@ def validate_workflow_plan(
             )
         )
 
-    if data_profile is not None and data_profile.blocking_issues and plan.steps:
+    if data_profile is not None and data_profile.blocking_issues and plan.steps and not is_extract_sync:
         errors.append(
             _issue(
                 "blocking_profile_has_active_plan",
@@ -268,6 +269,7 @@ def validate_workflow_plan(
         data_profile is not None
         and data_profile.gridmap_source == "unknown"
         and not data_profile.pcd_gridmap_tool_available
+        and not is_extract_sync
     ):
         errors.append(
             _issue(
@@ -317,26 +319,28 @@ def validate_workflow_plan(
                     )
 
     errors.extend(_precondition_validation_errors(plan.steps))
-    errors.extend(_calibration_confirmation_validation_errors(plan.steps))
+    if not is_extract_sync:
+        errors.extend(_calibration_confirmation_validation_errors(plan.steps))
 
-    positions = _step_positions(plan.steps)
-    gridmap_position = positions.get("prepare_gridmap_for_projection")
-    if gridmap_position is not None:
-        tracking_position = positions.get("run_tracking")
-        projection_position = positions.get("run_projection_and_trajectory")
-        if tracking_position is not None and gridmap_position <= tracking_position:
-            errors.append(
-                _issue(
-                    "invalid_gridmap_stage_order",
-                    "prepare_gridmap_for_projection must run after run_tracking",
+    if not is_extract_sync:
+        positions = _step_positions(plan.steps)
+        gridmap_position = positions.get("prepare_gridmap_for_projection")
+        if gridmap_position is not None:
+            tracking_position = positions.get("run_tracking")
+            projection_position = positions.get("run_projection_and_trajectory")
+            if tracking_position is not None and gridmap_position <= tracking_position:
+                errors.append(
+                    _issue(
+                        "invalid_gridmap_stage_order",
+                        "prepare_gridmap_for_projection must run after run_tracking",
+                    )
                 )
-            )
-        if projection_position is not None and gridmap_position >= projection_position:
-            errors.append(
-                _issue(
-                    "invalid_gridmap_stage_order",
-                    "prepare_gridmap_for_projection must run before run_projection_and_trajectory",
+            if projection_position is not None and gridmap_position >= projection_position:
+                errors.append(
+                    _issue(
+                        "invalid_gridmap_stage_order",
+                        "prepare_gridmap_for_projection must run before run_projection_and_trajectory",
+                    )
                 )
-            )
 
     return {"ok": not errors, "errors": errors, "warnings": warnings}

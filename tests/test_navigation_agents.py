@@ -257,7 +257,20 @@ def test_create_plan_agent_with_request_has_draft_tools(monkeypatch):
 
     assert "update_workflow_plan_draft_tool" in tool_names
     assert "get_workflow_plan_draft_tool" in tool_names
+    assert "finalize_extract_sync_plan_tool" in tool_names
+    assert "finalize_finish_processing_plan_tool" in tool_names
     assert "finalize_workflow_plan_tool" in tool_names
+
+
+def test_create_plan_agent_marks_finalize_draft_tools_as_mutating(monkeypatch):
+    monkeypatch.setenv("DASHSCOPE_API_KEY", "test-key")
+    request = NavigationRequest(date="20270605", dry_run=True, scene_mode="out")
+    agent = create_plan_agent(request=request)
+    tools = {tool.name: tool for tool in agent.tools}
+
+    assert tools["finalize_extract_sync_plan_tool"].is_read_only is False
+    assert tools["finalize_finish_processing_plan_tool"].is_read_only is False
+    assert tools["finalize_workflow_plan_tool"].is_read_only is False
 
 
 def test_create_plan_agent_without_request_does_not_prompt_for_missing_draft_tools(monkeypatch):
@@ -560,10 +573,47 @@ def test_plan_agent_draft_finalize_requires_scene_mode(monkeypatch):
         },
     )
 
-    assert update_result["ok"] is False
-    assert any("scene_mode" in error for error in update_result["validation_errors"])
-    with pytest.raises(ValueError, match="invalid profile fields"):
+    assert update_result["ok"] is True
+    assert update_result["validation_errors"] == []
+    with pytest.raises(ValueError, match="scene_mode"):
         _invoke_tool(tools["finalize_workflow_plan_tool"], {})
+
+
+def test_plan_agent_draft_extract_sync_finalize_returns_phase_plan_without_scene_mode(monkeypatch):
+    monkeypatch.setenv("DASHSCOPE_API_KEY", "test-key")
+    request = NavigationRequest(date="20270605", dry_run=True)
+    agent = create_plan_agent(request=request)
+    tools = {tool.name: tool for tool in agent.tools}
+
+    update_result = _invoke_tool(
+        tools["update_workflow_plan_draft_tool"],
+        {
+            "data_profile_patch": {
+                "processing_profile": {
+                    "id": "parameterized_navigation_v1",
+                    "platform_hint": "go2w",
+                },
+                "platform_hint": "go2w",
+                "topic_params": _go2w_topic_params(),
+                "localization_policy": {"source": "odom", "conversion": "odom_to_ins"},
+                "stage_variants": {
+                    "extract_and_sync_navigation_data": {
+                        "variant": "explicit_topic_params",
+                        "reason": "topic parameters were inferred from sensor role bindings",
+                        "evidence": ["infer_navigation_topic_params_tool"],
+                    }
+                },
+            },
+            "observation_id": "navigation_topic_params",
+            "used_tool": "infer_navigation_topic_params_tool",
+        },
+    )
+    finalize_result = _invoke_tool(tools["finalize_extract_sync_plan_tool"], {})
+
+    assert update_result["ok"] is True
+    assert finalize_result["ok"] is True
+    assert finalize_result["workflow_plan_json"]["phase"] == "extract_sync"
+    assert finalize_result["workflow_plan_json"]["scene_mode"] is None
 
 
 def test_executor_agent_has_sdk_tool_for_each_plan_step(monkeypatch):

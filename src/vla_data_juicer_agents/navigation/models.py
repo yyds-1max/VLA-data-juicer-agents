@@ -184,7 +184,8 @@ class WorkflowStep(BaseModel):
 class WorkflowPlan(BaseModel):
     date: str
     segments: list[str] | None = None
-    scene_mode: Literal["in", "out"]
+    scene_mode: Literal["in", "out"] | None = None
+    phase: Literal["extract_sync", "finish_processing", "full"] = "full"
     processing_profile: str = "parameterized_navigation_v1"
     platform_hint: str = "unknown"
     steps: list[WorkflowStep]

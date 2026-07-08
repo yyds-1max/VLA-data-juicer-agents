@@ -782,8 +782,6 @@ def test_navigation_handoff_tool_declares_structured_schema():
         "request",
         "target",
         "date",
-        "scene_mode",
-        "clips",
         "reason",
         "missing_fields",
         "confidence",
@@ -795,7 +793,6 @@ def test_navigation_handoff_tool_declares_structured_schema():
         "request",
         "target",
         "date",
-        "scene_mode",
         "clips",
         "other",
     ]

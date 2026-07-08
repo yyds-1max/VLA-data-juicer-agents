@@ -53,13 +53,13 @@ Do not require data to match fixed profiles such as u_legacy_like or go2w_like.
 Do not invent TOPIC_WHITELIST, topic_map, query_dir, localization policy, or calibration policy; use tool results.
 Treat platform_hint as a diagnostic hint only; do not use it as a hard selector for topic parameters or projection variants.
 Only finalize when processing_profile, topic_params, and data_profile all have no blocking_issues.
-Always include confirm_navigation_calibration_params as the first step before any processing and before prepare_raw_data.
+scene_mode is optional during extract/sync planning and required only before finish-processing finalization.
+The extract/sync phase plan contains prepare_raw_data and extract_and_sync_navigation_data only.
+Finish-processing/full plans include confirm_navigation_calibration_params as the first step before any processing in that phase.
 Use stage_variants for execution strategy: extract_and_sync_navigation_data uses explicit_topic_params, gridmap uses observed grid_map facts, and projection uses an explicit projection_variant. Choose only variants exposed by list_navigation_tool_capabilities_tool.
 Default to all raw segments if not specified.
-scene_mode is required and must be either "in" or "out". It represents "indoor" and "outdoor", respectively.
 Stage one covers prepare.sh, run_U.sh, and run_odom.sh only; do not include run_fix.sh.
 Calibration confirmation and gen_box.py are the human-blocking user intervention points.
-confirm_navigation_calibration_params must run first before prepare_raw_data and any processing.
 Prepare gridmap after run_tracking and before run_projection_and_trajectory.
 Supported execution tool names include run_tracking, prepare_gridmap_for_projection, and run_projection_and_trajectory.
 """.strip() + "\n" + PUBLIC_PROGRESS_INSTRUCTIONS
@@ -67,7 +67,8 @@ Supported execution tool names include run_tracking, prepare_gridmap_for_project
 
 DRAFT_PLAN_AGENT_INSTRUCTIONS = """
 Maintain the internal WorkflowPlan draft with get_workflow_plan_draft_tool,
-update_workflow_plan_draft_tool, and finalize_workflow_plan_tool.
+update_workflow_plan_draft_tool, finalize_extract_sync_plan_tool,
+finalize_finish_processing_plan_tool, and finalize_workflow_plan_tool.
 Before each SDK tool call, inspect the current draft state: navigation_data_profile_schema,
 data_profile_draft, filled_fields, missing_fields, next_required_observation, next_tool_candidates, and ready_to_finish.
 Follow next_required_observation and next_tool_candidates exactly. Do not skip, reorder, or parallelize
@@ -81,8 +82,10 @@ processing_profile, localization_policy, calibration_policy, and platform_hint.
 When topic_params is missing, call infer_navigation_topic_params_tool and merge its structured result.
 Set stage_variants from observed facts: explicit_topic_params after topic_params are complete, gridmap variants from inspect_gridmap_artifacts_tool, and projection variants from inspect_runtime_assets_tool plus list_navigation_tool_capabilities_tool. Do not choose projection variants from platform_hint alone.
 Use data_profile_patch for partial NavigationDataProfile facts; do not invent a complete profile in one shot.
-Only call finalize_workflow_plan_tool after ready_to_finish is true and missing_fields is empty.
-Do not hand-write script-level plans; final WorkflowPlan JSON must come from finalize_workflow_plan_tool.
+During extract/sync, stop after the topic-parameter observations and call finalize_extract_sync_plan_tool when next_tool_candidates points to it.
+After extract/sync is finalized and scene_mode is available, continue with finish-processing observations and call finalize_finish_processing_plan_tool when next_tool_candidates points to it.
+finalize_workflow_plan_tool remains the compatibility full-plan finalizer when the draft is already in a full/finish-ready phase.
+Do not hand-write script-level plans; final WorkflowPlan JSON must come from the phase-appropriate finalize_* tool.
 Do not output textual Action: lines or ToolName[arguments] strings.
 """.strip()
 
