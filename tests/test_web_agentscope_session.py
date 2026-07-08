@@ -301,6 +301,7 @@ def _runtime(
     storage: FakeAgentScopeStorage | None = None,
     chat_run_registry: FakeChatRunRegistry | None = None,
     message_bus=None,
+    workspace_root: Path | None = None,
 ) -> AgentScopeRuntime:
     storage = storage or FakeAgentScopeStorage()
     chat_service = FakeChatService()
@@ -308,7 +309,9 @@ def _runtime(
     if chat_run_registry is not None:
         state.chat_run_registry = chat_run_registry
     return AgentScopeRuntime(
-        config=_agentscope_config(),
+        config=_agentscope_config(
+            workspace_root=workspace_root or Path("/tmp/vla-agent-workspace"),
+        ),
         storage=storage,
         message_bus=message_bus or object(),
         workspace_manager=object(),
@@ -562,6 +565,26 @@ async def test_runtime_start_navigation_agent_task_precreates_session_draft_from
     assert state.request.scene_mode == "out"
     assert state.request.segments == ["20260605_152856"]
     await chat_run_registry.drain()
+
+
+@pytest.mark.asyncio
+async def test_runtime_registers_navigation_task_tools_for_navigation_agent(tmp_path):
+    runtime = _runtime(workspace_root=tmp_path)
+    await runtime.ensure_bootstrapped()
+
+    session_id = await runtime.ensure_web_session(
+        "web-1",
+        agent_id=runtime.config.navigation_agent_id,
+        model=runtime.config.navigation_model,
+    )
+    tools = runtime._navigation_tools_for_session(
+        web_session_id="web-1",
+        agentscope_session_id=session_id,
+    )
+    names = {tool.name for tool in tools}
+
+    assert "get_or_create_navigation_task_tool" in names
+    assert "reconcile_navigation_task_tool" in names
 
 
 @pytest.mark.asyncio

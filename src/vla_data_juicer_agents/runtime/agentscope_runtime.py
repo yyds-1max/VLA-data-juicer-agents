@@ -26,6 +26,7 @@ from vla_data_juicer_agents.navigation.agent_tools import build_navigation_agent
 from vla_data_juicer_agents.navigation.models import NavigationRequest
 from vla_data_juicer_agents.navigation.plan_draft import WorkflowPlanDraftState
 from vla_data_juicer_agents.navigation.plan_draft_store import JsonNavigationPlanDraftStore
+from vla_data_juicer_agents.navigation.task_store import SqliteNavigationTaskStore
 from vla_data_juicer_agents.runtime.agentscope_bootstrap import bootstrap_agentscope_records
 from vla_data_juicer_agents.runtime.agentscope_config import AgentScopeRuntimeConfig
 
@@ -257,6 +258,27 @@ class AgentScopeRuntime:
                     dry_run=bool(payload.get("dry_run", False)),
                 )
             ),
+        )
+
+    def _navigation_task_store(self) -> SqliteNavigationTaskStore:
+        return SqliteNavigationTaskStore(self.config.workspace_root / "navigation-tasks.sqlite")
+
+    def _navigation_tools_for_session(
+        self,
+        *,
+        web_session_id: str,
+        agentscope_session_id: str,
+    ) -> list[Any]:
+        draft_store = JsonNavigationPlanDraftStore(
+            self.config.workspace_root / "navigation-plan-drafts"
+        )
+        return build_navigation_agent_tools(
+            dry_run=False,
+            cancellation=self.run_cancellation(agentscope_session_id),
+            session_id=agentscope_session_id,
+            draft_store=draft_store,
+            task_store=self._navigation_task_store(),
+            web_session_id=web_session_id,
         )
 
     async def submit_human_decision(self, *, web_session_id: str, decision: dict[str, Any]) -> bool:
@@ -1209,16 +1231,23 @@ def build_extra_agent_tools_factory(
 
     async def extra_agent_tools(_user_id: str, agent_id: str, _session_id: str) -> list[Any]:
         if agent_id == config.navigation_agent_id:
-            cancellation = (
-                runtime.run_cancellation(_session_id)
-                if runtime is not None and hasattr(runtime, "run_cancellation")
-                else None
+            web_session_id = _web_session_id_from_agentscope_session(
+                _session_id,
+                agent_id=config.navigation_agent_id,
             )
+            if runtime is not None:
+                return runtime._navigation_tools_for_session(
+                    web_session_id=web_session_id,
+                    agentscope_session_id=_session_id,
+                )
             return build_navigation_agent_tools(
                 dry_run=False,
-                cancellation=cancellation,
                 session_id=_session_id,
                 draft_store=draft_store,
+                task_store=SqliteNavigationTaskStore(
+                    config.workspace_root / "navigation-tasks.sqlite"
+                ),
+                web_session_id=web_session_id,
             )
         if agent_id == config.main_router_agent_id and runtime is not None:
             web_session_id = _web_session_id_from_agentscope_session(

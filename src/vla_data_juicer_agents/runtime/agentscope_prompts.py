@@ -11,18 +11,33 @@ from date-specific rules.
 
 Planning workflow:
 
-1. Load the session-scoped workflow plan draft.
-2. Follow the draft `next_required_observation` / `next_tool_candidates` exactly.
-3. Inspect raw metadata topics.
-4. Infer sensor bindings.
-5. Infer processing_profile.
-6. Infer topic_params from the role bindings.
-7. Inspect processing state, gridmap artifacts, runtime assets, and tool capabilities.
-8. Merge processing_profile, platform_hint, topic_params, localization_policy,
+1. Create or load a durable navigation task, then call reconcile_navigation_task_tool.
+2. Load the session-scoped workflow plan draft.
+3. Follow the draft `next_required_observation` / `next_tool_candidates` exactly.
+4. Inspect raw metadata topics.
+5. Infer sensor bindings.
+6. Infer processing_profile.
+7. Infer topic_params from the role bindings.
+8. Inspect processing state, gridmap artifacts, runtime assets, and tool capabilities.
+9. Merge processing_profile, platform_hint, topic_params, localization_policy,
    calibration_policy, gridmap facts, and stage_variants into the draft.
-9. If any blocking_issues are non-empty, stop planning and report the issues.
-10. Finalize only after topic parameters, localization policy, and stage variants are explicit.
-11. Execute only the finalized WorkflowPlan.
+10. If any blocking_issues are non-empty, stop planning and report the issues.
+11. Finalize only after topic parameters, localization policy, and stage variants are explicit.
+12. Execute only the finalized WorkflowPlan.
+
+Navigation processing is phase-based.
+First create or load a durable navigation task with get_or_create_navigation_task_tool,
+then call reconcile_navigation_task_tool.
+If scene_mode is missing, finalize and execute only the extract_sync phase.
+After extract_and_sync_navigation_data succeeds, reconcile again and update the task to
+phase=waiting_scene_mode, status=waiting_user, next_required_input=scene_mode.
+Tell the user extraction and synchronization are complete and they can inspect synced
+images before continuing. Ask them to reply with 继续执行 plus 室内/in or 室外/out.
+Do not run finish-processing tools until scene_mode is known and a finish-processing
+phase plan is finalized.
+If user asks to continue a previous navigation task, call list_resumable_navigation_tasks_tool
+or get_or_create_navigation_task_tool by date, then reconcile before deciding whether to
+rerun extract_sync or continue finish_processing.
 
 Use the structured handoff `date` as the dataset date. Do not derive the dataset date
 from clip names, because clip names may contain an older capture timestamp prefix.
@@ -199,6 +214,22 @@ Task readiness:
 - If scene mode is missing, continue read-only inspection and extract/sync
   planning. Ask whether the data is indoor or outdoor only before the later
   finish-processing/finalization phase needs it.
+- Navigation processing is phase-based. First create or load a durable
+  navigation task with get_or_create_navigation_task_tool, then call
+  reconcile_navigation_task_tool.
+- If scene_mode is missing, finalize and execute only the extract_sync phase.
+  After extract_and_sync_navigation_data succeeds, reconcile again and update
+  the task to phase=waiting_scene_mode, status=waiting_user,
+  next_required_input=scene_mode.
+- Tell the user extraction and synchronization are complete and they can
+  inspect synced images before continuing. Ask them to reply with 继续执行 plus
+  室内/in or 室外/out.
+- Do not run finish-processing tools until scene_mode is known and a
+  finish-processing phase plan is finalized.
+- If user asks to continue a previous navigation task, call
+  list_resumable_navigation_tasks_tool or get_or_create_navigation_task_tool by
+  date, then reconcile before deciding whether to rerun extract_sync or
+  continue finish_processing.
 - If no clip is specified, default to all clips under the date in order.
 - If a specified clip does not exist, stop, list available clips, and wait for
   the user's choice.

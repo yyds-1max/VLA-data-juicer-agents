@@ -262,6 +262,17 @@ def test_create_plan_agent_with_request_has_draft_tools(monkeypatch):
     assert "finalize_workflow_plan_tool" in tool_names
 
 
+def test_navigation_agent_prompt_describes_two_phase_task_state_flow(monkeypatch):
+    monkeypatch.setenv("DASHSCOPE_API_KEY", "test-key")
+    agent = create_plan_agent(model="test-model")
+
+    assert "get_or_create_navigation_task_tool" in agent.instructions
+    assert "reconcile_navigation_task_tool" in agent.instructions
+    assert "extract_sync" in agent.instructions
+    assert "waiting_scene_mode" in agent.instructions
+    assert "Do not run finish-processing tools until scene_mode is known" in agent.instructions
+
+
 def test_create_plan_agent_marks_finalize_draft_tools_as_mutating(monkeypatch):
     monkeypatch.setenv("DASHSCOPE_API_KEY", "test-key")
     request = NavigationRequest(date="20270605", dry_run=True, scene_mode="out")
