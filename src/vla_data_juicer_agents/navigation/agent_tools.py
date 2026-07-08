@@ -207,13 +207,22 @@ def _phase_plan_gate_error(
     check_segments: bool = True,
 ) -> dict[str, Any] | None:
     state = draft_store.load(session_id)
-    if state is None or state.finalized_plan is None:
+    if state is None:
         return {
             "ok": False,
             "error_type": "navigation_plan_not_finalized",
             "message": "Navigation execution is blocked until a phase workflow plan has been finalized.",
             "missing_fields": ["workflow_plan_draft"],
             "next_tool_candidates": ["get_workflow_plan_draft_tool"],
+        }
+    if state.finalized_plan is None:
+        return {
+            "ok": False,
+            "error_type": "navigation_plan_not_finalized",
+            "message": "Navigation execution is blocked until a phase workflow plan has been finalized.",
+            "missing_fields": state.missing_fields(),
+            "next_tool_candidates": state.next_tool_candidates(),
+            "draft": state.schema_snapshot(),
         }
     base_name = _base_tool_name(tool_name)
     plan_phase = state.finalized_plan.phase

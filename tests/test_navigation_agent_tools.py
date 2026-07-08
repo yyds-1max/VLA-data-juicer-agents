@@ -271,6 +271,13 @@ def test_phase_gate_allows_extract_sync_tools_with_extract_sync_plan(
     def fake_prepare_raw_data_tool(date: str) -> dict:
         return {"ok": True, "tool_name": "prepare_raw_data", "date": date}
 
+    def fake_extract_and_sync_navigation_data_tool(date: str) -> dict:
+        return {
+            "ok": True,
+            "tool_name": "extract_and_sync_navigation_data",
+            "date": date,
+        }
+
     def fake_assemble_finish_temp_tool(date: str) -> dict:
         return {"ok": True, "tool_name": "assemble_finish_temp", "date": date}
 
@@ -281,6 +288,11 @@ def test_phase_gate_allows_extract_sync_tools_with_extract_sync_plan(
             FunctionTool(
                 fake_prepare_raw_data_tool,
                 name="prepare_raw_data_tool",
+                is_read_only=False,
+            ),
+            FunctionTool(
+                fake_extract_and_sync_navigation_data_tool,
+                name="extract_and_sync_navigation_data_tool",
                 is_read_only=False,
             ),
             FunctionTool(
@@ -335,6 +347,90 @@ def test_phase_gate_allows_extract_sync_tools_with_extract_sync_plan(
 
     result = _decode_tool_payload(
         asyncio.run(tools["prepare_raw_data_tool"](date="20270623"))
+    )
+    sync_result = _decode_tool_payload(
+        asyncio.run(
+            tools["extract_and_sync_navigation_data_tool"](date="20270623")
+        )
+    )
+
+    assert result["ok"] is True
+    assert sync_result["ok"] is True
+
+
+def test_phase_gate_allows_finish_processing_tool_with_finish_processing_plan(
+    monkeypatch,
+):
+    store = InMemoryNavigationPlanDraftStore()
+
+    def fake_assemble_finish_temp_tool(date: str) -> dict:
+        return {"ok": True, "tool_name": "assemble_finish_temp", "date": date}
+
+    monkeypatch.setattr(
+        agent_tools_module,
+        "create_navigation_execution_tools",
+        lambda **_: [
+            FunctionTool(
+                fake_assemble_finish_temp_tool,
+                name="assemble_finish_temp_tool",
+                is_read_only=False,
+            )
+        ],
+    )
+    state = WorkflowPlanDraftState(request=NavigationRequest(date="20270623"))
+    state.finalized_plan = WorkflowPlan(
+        date="20270623",
+        phase="finish_processing",
+        steps=[],
+    )
+    store.save("agent-session", state)
+    tools = {
+        tool.name: tool
+        for tool in build_navigation_agent_tools(
+            session_id="agent-session",
+            draft_store=store,
+            dry_run=True,
+        )
+    }
+
+    result = _decode_tool_payload(
+        asyncio.run(tools["assemble_finish_temp_tool"](date="20270623"))
+    )
+
+    assert result["ok"] is True
+
+
+def test_phase_gate_allows_finish_processing_tool_with_full_plan(monkeypatch):
+    store = InMemoryNavigationPlanDraftStore()
+
+    def fake_assemble_finish_temp_tool(date: str) -> dict:
+        return {"ok": True, "tool_name": "assemble_finish_temp", "date": date}
+
+    monkeypatch.setattr(
+        agent_tools_module,
+        "create_navigation_execution_tools",
+        lambda **_: [
+            FunctionTool(
+                fake_assemble_finish_temp_tool,
+                name="assemble_finish_temp_tool",
+                is_read_only=False,
+            )
+        ],
+    )
+    state = WorkflowPlanDraftState(request=NavigationRequest(date="20270623"))
+    state.finalized_plan = WorkflowPlan(date="20270623", phase="full", steps=[])
+    store.save("agent-session", state)
+    tools = {
+        tool.name: tool
+        for tool in build_navigation_agent_tools(
+            session_id="agent-session",
+            draft_store=store,
+            dry_run=True,
+        )
+    }
+
+    result = _decode_tool_payload(
+        asyncio.run(tools["assemble_finish_temp_tool"](date="20270623"))
     )
 
     assert result["ok"] is True
@@ -635,7 +731,9 @@ def test_navigation_execution_tool_reports_not_finalized_before_segment_mismatch
 
     assert result["ok"] is False
     assert result["error_type"] == "navigation_plan_not_finalized"
-    assert result["missing_fields"] == ["workflow_plan_draft"]
+    assert result["missing_fields"] == state.missing_fields()
+    assert result["next_tool_candidates"] == state.next_tool_candidates()
+    assert result["draft"] == state.schema_snapshot()
 
 
 def test_extra_agent_tools_factory_registers_navigation_tools_only_for_navigation_agent(tmp_path):
