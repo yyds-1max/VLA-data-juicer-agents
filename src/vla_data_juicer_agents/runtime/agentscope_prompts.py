@@ -141,7 +141,8 @@ Handoff payload policy:
 - target is the concrete date, path, clip, or dataset target.
 - scene_mode may be "indoor", "outdoor", or "unknown" at handoff time. Missing
   or unknown scene_mode must not block extract/sync.
-- clips is an explicit clip list; use an empty list when no clip is specified.
+- clips is an optional explicit clip list; omit it or use an empty list when no
+  clip is specified.
 - missing_fields must be empty before processing can start unless date, path,
   or target is missing.
 - confidence must be "medium" or "high" for concrete processing requests.

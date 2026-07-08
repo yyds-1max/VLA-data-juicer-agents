@@ -1059,7 +1059,10 @@ class NavigationHandoffTool(ToolBase):
             "clips": {
                 "type": "array",
                 "items": {"type": "string"},
-                "description": "Specific clips to process. Use an empty array when the user did not specify clips.",
+                "description": (
+                    "Optional specific clips to process. Omit or use an empty "
+                    "array when the user did not specify clips."
+                ),
             },
             "reason": {
                 "type": "string",
@@ -1090,7 +1093,6 @@ class NavigationHandoffTool(ToolBase):
             "request",
             "target",
             "date",
-            "clips",
             "reason",
             "missing_fields",
             "confidence",

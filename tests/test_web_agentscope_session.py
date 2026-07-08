@@ -573,13 +573,13 @@ async def test_navigation_handoff_tool_allows_unknown_scene_mode() -> None:
     )
 
     assert "scene_mode" not in tool.input_schema["required"]
+    assert "clips" not in tool.input_schema["required"]
 
     result = await tool(
         request="请处理 20270605 的导航数据",
         target="20270605",
         date="20270605",
         scene_mode="unknown",
-        clips=[],
         reason="用户给出了日期但未说明室内室外",
         missing_fields=[],
         confidence="high",
