@@ -21,6 +21,7 @@ from vla_data_juicer_agents.navigation.plan_draft_store import (
     InMemoryNavigationPlanDraftStore,
     JsonNavigationPlanDraftStore,
 )
+from vla_data_juicer_agents.navigation.task_store import SqliteNavigationTaskStore
 from vla_data_juicer_agents.runtime import agentscope_runtime as runtime_module
 from vla_data_juicer_agents.runtime.agentscope_config import AgentScopeRuntimeConfig
 from vla_data_juicer_agents.runtime.agentscope_runtime import (
@@ -205,6 +206,24 @@ def test_build_navigation_agent_tools_does_not_register_old_workflow_control_too
     assert "vla_run_workflow" not in names
     assert "vla_continue_workflow" not in names
     assert "confirm_navigation_calibration_params_tool" not in names
+
+
+def test_navigation_agent_tools_include_task_state_tools(tmp_path):
+    store = InMemoryNavigationPlanDraftStore()
+    task_store = SqliteNavigationTaskStore(tmp_path / "tasks.sqlite")
+
+    tools = build_navigation_agent_tools(
+        session_id="agent-session",
+        draft_store=store,
+        task_store=task_store,
+        web_session_id="web-session",
+    )
+    names = {tool.name for tool in tools}
+
+    assert "get_or_create_navigation_task_tool" in names
+    assert "reconcile_navigation_task_tool" in names
+    assert "list_resumable_navigation_tasks_tool" in names
+    assert "update_navigation_task_scene_mode_tool" in names
 
 
 def test_build_navigation_agent_tools_passes_cancellation_to_execution_tools(monkeypatch):

@@ -11,6 +11,7 @@ from agentscope.tool import ToolBase
 
 from vla_data_juicer_agents.core.cancellation import CancellationContext
 from vla_data_juicer_agents.navigation.catalog import list_navigation_tool_capabilities_tool
+from vla_data_juicer_agents.navigation.config import NavigationSettings
 from vla_data_juicer_agents.navigation.execution_tools import create_navigation_execution_tools
 from vla_data_juicer_agents.navigation.inspection import (
     infer_navigation_processing_profile_tool,
@@ -25,6 +26,8 @@ from vla_data_juicer_agents.navigation.plan_draft_store import NavigationPlanDra
 from vla_data_juicer_agents.navigation.session_plan_draft_tools import (
     build_session_plan_draft_tools,
 )
+from vla_data_juicer_agents.navigation.task_store import SqliteNavigationTaskStore
+from vla_data_juicer_agents.navigation.task_tools import build_navigation_task_tools
 
 
 class HumanDecisionTool(ToolBase):
@@ -304,7 +307,18 @@ def build_navigation_agent_tools(
     cancellation: CancellationContext | None = None,
     session_id: str | None = None,
     draft_store: NavigationPlanDraftStore | None = None,
+    task_store: SqliteNavigationTaskStore | None = None,
+    web_session_id: str | None = None,
+    settings: NavigationSettings | None = None,
 ) -> list[Any]:
+    task_tools: list[Any] = []
+    if task_store is not None and session_id is not None:
+        task_tools = build_navigation_task_tools(
+            store=task_store,
+            session_id=session_id,
+            web_session_id=web_session_id,
+            settings=settings,
+        )
     planning_tools: list[Any] = [
         inspect_raw_date_tool,
         infer_navigation_sensor_bindings_tool,
@@ -322,6 +336,7 @@ def build_navigation_agent_tools(
             session_id=session_id,
         )
     return _trust_internal_navigation_tools([
+        *task_tools,
         HumanDecisionTool(),
         *planning_tools,
         *draft_tools,
