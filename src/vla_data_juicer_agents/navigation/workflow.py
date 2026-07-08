@@ -5,7 +5,6 @@ from contextlib import AsyncExitStack
 from pathlib import Path
 from typing import Any, Literal
 
-from agentscope.event import ConfirmResult, UserConfirmResultEvent
 from agentscope.message import UserMsg
 from pydantic import ValidationError
 
@@ -30,7 +29,6 @@ from vla_data_juicer_agents.navigation.catalog import (
 )
 
 
-MAX_AGENT_TOOL_CONFIRMATION_ROUNDS = 30
 PUBLIC_PROGRESS_PROMPT = (
     "Before each tool call, emit exactly one public progress update line in this format: "
     "Progress: <one or two concise, action-oriented sentences stating an established fact and the next action>. "
@@ -80,32 +78,17 @@ def _json_text_from_output(output: str) -> str:
     return text
 
 
-def _coerce_legacy_plan_payload(payload: Any) -> Any:
-    if not isinstance(payload, dict):
-        return payload
-    coerced = dict(payload)
-    legacy_dataset_profile = coerced.get("dataset_profile")
-    if isinstance(legacy_dataset_profile, str) and "processing_profile" not in coerced:
-        coerced["processing_profile"] = legacy_dataset_profile
-    if isinstance(legacy_dataset_profile, str) and "platform_hint" not in coerced:
-        if legacy_dataset_profile == "go2w_like":
-            coerced["platform_hint"] = "go2w"
-        elif legacy_dataset_profile == "u_legacy_like":
-            coerced["platform_hint"] = "u"
-    return coerced
-
-
 def _parse_workflow_plan_output(output: object) -> WorkflowPlan:
     if isinstance(output, WorkflowPlan):
         return output
 
     try:
         if isinstance(output, dict):
-            return WorkflowPlan.model_validate(_coerce_legacy_plan_payload(output))
+            return WorkflowPlan.model_validate(output)
 
         if isinstance(output, str) and output.strip():
             payload: Any = json.loads(_json_text_from_output(output))
-            return WorkflowPlan.model_validate(_coerce_legacy_plan_payload(payload))
+            return WorkflowPlan.model_validate(payload)
     except (json.JSONDecodeError, TypeError, ValidationError, ValueError) as exc:
         raise ValueError(
             f"Unable to parse WorkflowPlan output: {exc}; raw output excerpt={_raw_output_excerpt(output)!r}"
@@ -141,14 +124,10 @@ def _validated_workflow_plan(plan: WorkflowPlan, data_profile: NavigationDataPro
     return plan
 
 
-def _legacy_dataset_profile_from_profile(profile_id: str, platform_hint: str) -> str | None:
-    if profile_id in {"go2w_like", "u_legacy_like"}:
-        return profile_id
-    if platform_hint == "go2w":
-        return "go2w_like"
-    if platform_hint == "u":
-        return "u_legacy_like"
-    return None
+def _projection_variant_from_decision(projection_decision) -> str:
+    if projection_decision is not None:
+        return projection_decision.variant
+    return "cjl_with_gridmap"
 
 
 def build_deterministic_plan_template(
@@ -158,7 +137,6 @@ def build_deterministic_plan_template(
     *,
     scene_mode: Literal["in", "out"] | _SceneModeMissing = _SCENE_MODE_MISSING,
     data_profile: NavigationDataProfile | None = None,
-    dataset_profile: str | None = None,
 ) -> WorkflowPlan:
     if scene_mode not in {"in", "out"}:
         raise ValueError("scene_mode is required before building WorkflowPlan; expected 'in' or 'out'.")
@@ -169,15 +147,9 @@ def build_deterministic_plan_template(
     profile_id = (
         data_profile.processing_profile.id
         if data_profile is not None and data_profile.processing_profile is not None
-        else processing_profile or dataset_profile or "parameterized_navigation_v1"
+        else processing_profile or "parameterized_navigation_v1"
     )
     platform_hint = data_profile.platform_hint if data_profile is not None else "unknown"
-    if data_profile is None:
-        if profile_id == "go2w_like":
-            platform_hint = "go2w"
-        elif profile_id == "u_legacy_like":
-            platform_hint = "u"
-    legacy_dataset_profile = _legacy_dataset_profile_from_profile(profile_id, platform_hint)
 
     topic_arguments = {}
     topic_params = None
@@ -221,15 +193,9 @@ def build_deterministic_plan_template(
     extract_variant = (
         extract_decision.variant
         if extract_decision is not None
-        else legacy_dataset_profile or profile_id
+        else "explicit_topic_params"
     )
-    projection_variant = (
-        projection_decision.variant
-        if projection_decision is not None
-        else "cjl_0525_with_gridmap"
-        if legacy_dataset_profile == "go2w_like"
-        else "cjl_with_gridmap"
-    )
+    projection_variant = _projection_variant_from_decision(projection_decision)
     skip_gridmap = bool(
         data_profile is not None
         and data_profile.projection_input_ready
@@ -351,6 +317,7 @@ def build_deterministic_plan_template(
                     "finish_path": finish_path,
                     "processing_profile": profile_id,
                     "platform_hint": platform_hint,
+                    "projection_variant": projection_variant,
                 },
                 preconditions=projection_preconditions,
                 expected_outputs=[finish_path],
@@ -414,15 +381,6 @@ def _event_tool_result_delta(event: object) -> str:
     return delta if isinstance(delta, str) else str(delta)
 
 
-def _confirmation_results(event: object) -> list[ConfirmResult]:
-    if _event_type(event) != "REQUIRE_USER_CONFIRM":
-        return []
-    return [
-        ConfirmResult(confirmed=True, tool_call=tool_call)
-        for tool_call in getattr(event, "tool_calls", [])
-    ]
-
-
 async def _run_agent_stream(
     agent,
     prompt: str,
@@ -445,41 +403,33 @@ async def _run_agent_stream(
         async with AsyncExitStack() as stack:
             if active_cancellation is not None:
                 await stack.enter_async_context(active_cancellation.track_agent(agent))
-            for _ in range(MAX_AGENT_TOOL_CONFIRMATION_ROUNDS):
-                if active_cancellation is not None:
-                    active_cancellation.raise_if_cancelled()
-                confirm_results: list[ConfirmResult] = []
-                reply_id: str | None = None
-                async for event in agent.reply_stream(next_input):
-                    event_type = _event_type(event)
-                    if event_type != "TEXT_BLOCK_DELTA":
-                        progress_filter.flush_progress_only()
-                    adapter.accept(event)
-                    rendered_delta = progress_filter.consume_text_delta(_event_text_delta(event))
-                    if rendered_delta:
-                        scope.emit("assistant_delta", delta=rendered_delta)
-                    output_chunks.append(rendered_delta)
-                    tool_output_chunks.append(_event_tool_result_delta(event))
-                    if event_type == "REQUIRE_USER_CONFIRM":
-                        reply_id = getattr(event, "reply_id", None)
-                        confirm_results.extend(_confirmation_results(event))
-                if active_cancellation is not None:
-                    active_cancellation.raise_if_cancelled()
-                if not confirm_results:
-                    adapter.close_active_tools("completed")
-                    flushed_delta = progress_filter.flush()
-                    if flushed_delta:
-                        scope.emit("assistant_delta", delta=flushed_delta)
-                    output_chunks.append(flushed_delta)
-                    scope.emit("agent_end", status="completed")
-                    return "".join(output_chunks) or "".join(tool_output_chunks)
-                if reply_id is None:
-                    raise RuntimeError("AgentScope requested tool confirmation without a reply id.")
-                next_input = UserConfirmResultEvent(reply_id=reply_id, confirm_results=confirm_results)
-        raise RuntimeError(
-            "AgentScope tool confirmation loop exceeded "
-            f"{MAX_AGENT_TOOL_CONFIRMATION_ROUNDS} iterations."
-        )
+            if active_cancellation is not None:
+                active_cancellation.raise_if_cancelled()
+            async for event in agent.reply_stream(next_input):
+                event_type = _event_type(event)
+                if event_type != "TEXT_BLOCK_DELTA":
+                    progress_filter.flush_progress_only()
+                adapter.accept(event)
+                rendered_delta = progress_filter.consume_text_delta(_event_text_delta(event))
+                if rendered_delta:
+                    scope.emit("assistant_delta", delta=rendered_delta)
+                output_chunks.append(rendered_delta)
+                tool_output_chunks.append(_event_tool_result_delta(event))
+                if event_type == "REQUIRE_USER_CONFIRM":
+                    adapter.close_active_tools("failed")
+                    raise RuntimeError(
+                        "AgentScope tool call requires user confirmation; "
+                        "web navigation must use durable human-decision events."
+                    )
+            if active_cancellation is not None:
+                active_cancellation.raise_if_cancelled()
+            adapter.close_active_tools("completed")
+            flushed_delta = progress_filter.flush()
+            if flushed_delta:
+                scope.emit("assistant_delta", delta=flushed_delta)
+            output_chunks.append(flushed_delta)
+            scope.emit("agent_end", status="completed")
+            return "".join(output_chunks) or "".join(tool_output_chunks)
     except TurnCancelled:
         adapter.close_active_tools("interrupted")
         scope.emit("agent_end", status="interrupted")
@@ -516,7 +466,7 @@ async def run_plan_agent(
             f"{json.dumps(draft_state.schema_snapshot(), ensure_ascii=False)}"
         )
     prompt = (
-        "You are a Navigation ReAct Plan-Agent. Use the inspect_raw_date_tool, "
+        "You are NavigationDataAgent planning a VLA navigation data workflow. Use the inspect_raw_date_tool, "
         "infer_navigation_sensor_bindings_tool, infer_navigation_processing_profile_tool, "
         "infer_navigation_topic_params_tool, inspect_processing_state_tool, "
         "inspect_gridmap_artifacts_tool, inspect_runtime_assets_tool, and list_navigation_tool_capabilities_tool "
@@ -524,7 +474,10 @@ async def run_plan_agent(
         "lightweight NavigationDataProfile and stage-one navigation WorkflowPlan.\n\n"
         "Strict planning loop:\n"
         "- Privately read the current NavigationDataProfile schema, data_profile_draft, filled_fields, "
-        "missing_fields, validation_errors, and next_tool_candidates; decide exactly one next SDK tool call.\n"
+        "missing_fields, validation_errors, next_required_observation, and next_tool_candidates; decide exactly "
+        "one next SDK tool call.\n"
+        "- Follow next_required_observation and next_tool_candidates exactly. Do not skip, reorder, or parallelize "
+        "the read-only investigation sequence.\n"
         "- To inspect one missing fact, emit a Progress line, then call one read-only registered SDK tool. "
         "After the tool result, emit a Progress line, then call update_workflow_plan_draft_tool with "
         "data_profile_patch containing only newly learned NavigationDataProfile facts, plus observation_id "
@@ -538,11 +491,14 @@ async def run_plan_agent(
         "final strict WorkflowPlan JSON must come from finalize_workflow_plan_tool. Stage one covers "
         "prepare.sh, run_U.sh, and run_odom.sh only; do not include run_fix.sh. Default to all raw "
         "segments when segments are not specified. Use NavigationDataProfile.processing_profile and "
-        "platform_hint rather than dataset_profile; infer sensor bindings and processing_profile from "
-        "tool results, and do not require fixed u_legacy_like/go2w_like classification. Call "
+        "platform_hint for diagnostic context; infer sensor bindings and processing_profile from "
+        "tool results, and do not require fixed u_legacy_like/go2w_like classification. Treat "
+        "platform_hint as a diagnostic hint, not as a hard selector for topic parameters or projection variants. Call "
         "infer_navigation_topic_params_tool before finalizing extract_and_sync_navigation_data; "
         "do not invent TOPIC_WHITELIST, topic_map, query_dir, localization policy, or calibration "
-        "policy. Only finalize when processing_profile has no blocking_issues. Always include "
+        "policy. Use explicit_topic_params for extract_and_sync_navigation_data after topic_params are complete. "
+        "Set run_projection_and_trajectory.projection_variant explicitly from observed runtime/tool capability evidence. "
+        "Only finalize when processing_profile, topic_params, and data_profile have no blocking_issues. Always include "
         "confirm_navigation_calibration_params as the first step before any processing and before "
         "prepare_raw_data. scene_mode is required "
         "and must be either in or out. Gridmap preparation must happen "

@@ -7,6 +7,7 @@ from pydantic import BaseModel, Field, field_validator
 
 SessionStatus = Literal["draft", "active", "historical"]
 MessageRole = Literal["user", "assistant", "system"]
+HumanDecisionAction = Literal["confirm", "stop", "guide"]
 
 
 def generate_session_title(message: str, *, limit: int = 30) -> str:
@@ -30,8 +31,22 @@ class ChatMessageRecord(BaseModel):
     created_at: str
 
 
+class TimelineEventRecord(BaseModel):
+    id: str
+    session_id: str
+    seq: int
+    type: str
+    source: str | None = None
+    run_id: str | None = None
+    parent_run_id: str | None = None
+    timestamp: str | None = None
+    payload: dict[str, Any] = Field(default_factory=dict)
+    created_at: str
+
+
 class SessionDetail(SessionRecord):
     messages: list[ChatMessageRecord] = Field(default_factory=list)
+    events: list[TimelineEventRecord] = Field(default_factory=list)
 
 
 class CreateSessionResponse(BaseModel):
@@ -56,6 +71,25 @@ class CreateTurnResponse(BaseModel):
 
 class InterruptResponse(BaseModel):
     interrupted: bool
+
+
+class HumanDecisionRequest(BaseModel):
+    action: HumanDecisionAction
+    request_id: str
+    tool_call_id: str
+    reply_id: str
+    text: str | None = Field(default=None, validate_default=True)
+
+    @field_validator("text")
+    @classmethod
+    def guide_text_must_not_be_empty(cls, value: str | None, info: Any) -> str | None:
+        if info.data.get("action") == "guide" and (value is None or not value.strip()):
+            raise ValueError("text must not be empty when action is guide")
+        return value
+
+
+class HumanDecisionResponse(BaseModel):
+    accepted: bool
 
 
 class AgentEvent(BaseModel):

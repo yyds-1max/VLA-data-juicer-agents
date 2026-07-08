@@ -10,10 +10,12 @@ import {
   interruptTurn,
   listSessions,
   openSessionEvents,
+  submitHumanDecision,
   submitTurn,
 } from "./client";
 import type {
   AgentEvent,
+  HumanDecisionPayload,
   NavigationDatasetSummary,
   NavigationSyncImageListing,
   SessionDetail,
@@ -105,6 +107,24 @@ describe("api client", () => {
     await expect(interruptTurn("session/with space")).resolves.toBe(true);
     expect(fetchMock).toHaveBeenCalledWith("/api/sessions/session%2Fwith%20space/interrupt", {
       method: "POST",
+      headers: { "content-type": "application/json" },
+    });
+  });
+
+  it("encodes the session id and posts a human decision payload", async () => {
+    const fetchMock = mockFetchJson({ accepted: true });
+    const payload: HumanDecisionPayload = {
+      action: "guide",
+      request_id: "request-1",
+      tool_call_id: "tool-call-1",
+      reply_id: "reply-1",
+      text: "请先汇总风险再继续。",
+    };
+
+    await expect(submitHumanDecision("session/with space", payload)).resolves.toBe(true);
+    expect(fetchMock).toHaveBeenCalledWith("/api/sessions/session%2Fwith%20space/human-decisions", {
+      method: "POST",
+      body: JSON.stringify(payload),
       headers: { "content-type": "application/json" },
     });
   });

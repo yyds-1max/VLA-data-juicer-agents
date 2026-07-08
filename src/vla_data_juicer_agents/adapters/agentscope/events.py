@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import re
 from dataclasses import dataclass, field
+from typing import Any
 
 from vla_data_juicer_agents.core.events import EventScope
 
@@ -14,6 +15,9 @@ _PROGRESS_MARKER_RE = re.compile(
     r"^\s*(?:Progress|进度|思考摘要|思考)\s*[:：]\s*(?P<summary>.+?)\s*$",
     flags=re.IGNORECASE | re.DOTALL,
 )
+_HUMAN_DECISION_TOOL_NAMES = {
+    "request_human_decision",
+}
 
 
 def _event_type(event: object) -> str:
@@ -61,11 +65,21 @@ class _ToolState:
 class AgentScopeEventAdapter:
     """Translate AgentScope stream events into transport-neutral events."""
 
-    def __init__(self, scope: EventScope, emit_tool_events: bool = True) -> None:
+    def __init__(
+        self,
+        scope: EventScope,
+        emit_tool_events: bool = True,
+        emit_text_events: bool = False,
+        emit_final_events: bool = False,
+    ) -> None:
         self._scope = scope
         self._emit_tool_events = emit_tool_events
+        self._emit_text_events = emit_text_events
+        self._emit_final_events = emit_final_events
         self._thinking: dict[str, list[str]] = {}
         self._tools: dict[str, _ToolState] = {}
+        self._progress_filter = ProgressSummaryFilter(scope)
+        self._reply_text: list[str] = []
 
     def accept(self, event: object) -> None:
         event_type = _event_type(event)
@@ -78,9 +92,14 @@ class AgentScopeEventAdapter:
             summary = summarize_progress("".join(self._thinking.pop(block_id, [])))
             if summary:
                 self._scope.emit("reasoning", summary=summary)
+        elif event_type == "TEXT_BLOCK_DELTA":
+            self._handle_text_delta(getattr(event, "delta", ""))
+        elif event_type == "REPLY_END":
+            self._handle_reply_end()
         elif event_type == "TOOL_CALL_START":
             state = self._tools.setdefault(call_id, _ToolState())
             state.name = _text(getattr(event, "tool_call_name", "")) or state.name
+            self._emit_tool_start(call_id, state)
         elif event_type == "TOOL_CALL_DELTA":
             self._tools.setdefault(call_id, _ToolState()).arguments.append(
                 _text(getattr(event, "delta", ""))
@@ -88,14 +107,7 @@ class AgentScopeEventAdapter:
         elif event_type == "TOOL_RESULT_START":
             state = self._tools.setdefault(call_id, _ToolState())
             state.name = _text(getattr(event, "tool_call_name", "")) or state.name
-            state.started = True
-            if self._emit_tool_events:
-                self._scope.emit(
-                    "tool_start",
-                    tool=state.name,
-                    call_id=call_id,
-                    args="".join(state.arguments),
-                )
+            self._emit_tool_start(call_id, state)
         elif event_type == "TOOL_RESULT_TEXT_DELTA":
             self._tools.setdefault(call_id, _ToolState()).result.append(
                 _text(getattr(event, "delta", ""))
@@ -114,6 +126,21 @@ class AgentScopeEventAdapter:
                 if error_type:
                     payload["error_type"] = error_type
                 self._scope.emit("tool_end", **payload)
+        elif event_type == "REQUIRE_EXTERNAL_EXECUTION":
+            self._handle_require_external_execution(event)
+
+    def _emit_tool_start(self, call_id: str, state: _ToolState) -> None:
+        if state.started:
+            return
+        self._flush_reply_segment()
+        state.started = True
+        if self._emit_tool_events:
+            self._scope.emit(
+                "tool_start",
+                tool=state.name,
+                call_id=call_id,
+                args="".join(state.arguments),
+            )
 
     def close_active_tools(self, status: str) -> None:
         tools = self._tools
@@ -131,6 +158,33 @@ class AgentScopeEventAdapter:
                     summary=summarize_progress("".join(state.result)),
                 )
 
+    def _handle_text_delta(self, delta: object) -> None:
+        if not self._emit_text_events and not self._emit_final_events:
+            return
+        rendered = self._progress_filter.consume_text_delta(delta)
+        if not rendered:
+            return
+        if self._emit_text_events:
+            self._scope.emit("assistant_delta", delta=rendered)
+        self._reply_text.append(rendered)
+
+    def _handle_reply_end(self) -> None:
+        if not self._emit_text_events and not self._emit_final_events:
+            return
+        self._flush_reply_segment()
+
+    def _flush_reply_segment(self) -> None:
+        if not self._emit_text_events and not self._emit_final_events:
+            return
+        rendered = self._progress_filter.flush()
+        if rendered:
+            if self._emit_text_events:
+                self._scope.emit("assistant_delta", delta=rendered)
+            self._reply_text.append(rendered)
+        if self._emit_final_events and self._reply_text:
+            self._scope.emit("final", text="".join(self._reply_text))
+        self._reply_text.clear()
+
     @staticmethod
     def _tool_status(state: object, result_text: str = "") -> str:
         value = getattr(state, "value", state)
@@ -140,6 +194,23 @@ class AgentScopeEventAdapter:
         if normalized in {"success", "completed"} and not _result_payload_failed(result_text):
             return "completed"
         return "failed"
+
+    def _handle_require_external_execution(self, event: object) -> None:
+        reply_id = _text(getattr(event, "reply_id", ""))
+        for tool_call in getattr(event, "tool_calls", []) or []:
+            tool_name = _text(getattr(tool_call, "name", ""))
+            if tool_name not in _HUMAN_DECISION_TOOL_NAMES:
+                continue
+            tool_input = _external_tool_input(getattr(tool_call, "input", {}))
+            payload = _human_decision_payload(tool_name, tool_input)
+            self._scope.emit(
+                "human_decision_required",
+                reply_id=reply_id,
+                tool_call_id=_text(getattr(tool_call, "id", "")),
+                decision_type=payload["decision_type"],
+                request_id=payload["request_id"],
+                summary=payload["summary"],
+            )
 
 
 class ProgressSummaryFilter:
@@ -221,3 +292,28 @@ def _result_payload_error_type(result_text: str) -> str:
     if not error_type and isinstance(payload.get("details"), dict):
         error_type = payload["details"].get("error_type")
     return error_type.strip() if isinstance(error_type, str) else ""
+
+
+def _external_tool_input(value: object) -> dict[str, Any]:
+    if isinstance(value, dict):
+        return value
+    if isinstance(value, str):
+        try:
+            payload = json.loads(value)
+        except json.JSONDecodeError:
+            return {}
+        return payload if isinstance(payload, dict) else {}
+    return {}
+
+
+def _human_decision_payload(tool_name: str, tool_input: dict[str, Any]) -> dict[str, str]:
+    decision_type = tool_input.get("decision_type")
+    if not isinstance(decision_type, str) or not decision_type:
+        decision_type = "other"
+    request_id = tool_input.get("request_id")
+    summary = tool_input.get("summary")
+    return {
+        "decision_type": decision_type,
+        "request_id": request_id if isinstance(request_id, str) else "",
+        "summary": summary if isinstance(summary, str) else "",
+    }

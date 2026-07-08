@@ -65,6 +65,43 @@ def test_store_persists_transcript(tmp_path: Path):
     assert detail is not None
     assert [message.id for message in detail.messages] == [user.id, assistant.id]
     assert [message.content for message in detail.messages] == ["处理 20270605", "好的，我开始处理。"]
+    assert detail.events == []
+
+
+def test_store_persists_timeline_events(tmp_path: Path):
+    store = WebSessionStore(tmp_path / "sessions.sqlite")
+    session = store.create_session(title="处理 20270605 的室外导航数据")
+
+    first = store.append_timeline_event(
+        session.id,
+        {
+            "type": "assistant_delta",
+            "source": "navigation-data-agent",
+            "run_id": "as-session",
+            "parent_run_id": None,
+            "timestamp": "2026-06-26T10:00:00.000+00:00",
+            "payload": {"delta": "开始检查"},
+        },
+    )
+    second = store.append_timeline_event(
+        session.id,
+        {
+            "type": "tool_end",
+            "source": "navigation-data-agent",
+            "run_id": "as-session",
+            "parent_run_id": None,
+            "timestamp": "2026-06-26T10:00:01.000+00:00",
+            "payload": {"tool": "prepare_raw_data", "call_id": "call-1", "status": "completed"},
+        },
+    )
+
+    detail = store.get_session(session.id)
+
+    assert detail is not None
+    assert [event.id for event in detail.events] == [first.id, second.id]
+    assert [event.seq for event in detail.events] == [1, 2]
+    assert detail.events[0].payload == {"delta": "开始检查"}
+    assert detail.events[1].type == "tool_end"
 
 
 def test_store_rejects_message_for_missing_session(tmp_path: Path):

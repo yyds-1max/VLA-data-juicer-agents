@@ -1,4 +1,4 @@
-import type { AgentEvent } from "../api/types";
+import type { AgentEvent, PendingHumanDecision } from "../api/types";
 
 export type TimelineKind = "reasoning" | "tool" | "agent" | "assistant" | "system";
 
@@ -32,9 +32,12 @@ export interface RunState {
   activeAgents: Record<string, ActiveAgent>;
   activeTools: Record<string, ActiveTool>;
   finalRunIds: Record<string, true>;
+  pendingHumanDecision: PendingHumanDecision | null;
   activeText: string;
   activeStartedAt: number | null;
   running: boolean;
+  interrupting: boolean;
+  appliedEventKeys: Record<string, true>;
 }
 
 export function createEmptyRunState(): RunState {
@@ -43,9 +46,12 @@ export function createEmptyRunState(): RunState {
     activeAgents: {},
     activeTools: {},
     finalRunIds: {},
+    pendingHumanDecision: null,
     activeText: "",
     activeStartedAt: null,
     running: false,
+    interrupting: false,
+    appliedEventKeys: {},
   };
 }
 
@@ -63,9 +69,12 @@ export function applyAgentEvent(state: RunState, event: AgentEvent): void {
 
   if (type === "agent_start") {
     const startedAt = timestampMs(event.timestamp);
+    if (runId) {
+      delete state.finalRunIds[runId];
+    }
     state.activeAgents[agentKey(runId, source)] = { source, runId, parentRunId, startedAt };
     state.running = true;
-    state.activeText = `[${label}] 正在思考`;
+    state.activeText = thinkingText(source, label);
     state.activeStartedAt = startedAt;
     return;
   }
@@ -100,7 +109,7 @@ export function applyAgentEvent(state: RunState, event: AgentEvent): void {
       startedAt: timestampMs(event.timestamp),
     };
     state.running = true;
-    state.activeText = `[${label}] 正在运行 ${tool}`;
+    state.activeText = `正在调用工具 ${tool}`;
     state.activeStartedAt = state.activeTools[toolKey(runId, callId)].startedAt;
     return;
   }
@@ -119,7 +128,7 @@ export function applyAgentEvent(state: RunState, event: AgentEvent): void {
     state.timeline.push({
       kind: "tool",
       source,
-      text: `${status} ${tool} ${elapsed.toFixed(1)}s`,
+      text: toolCompletionText(status, tool, elapsed),
       status,
       runId,
       parentRunId,
@@ -128,12 +137,31 @@ export function applyAgentEvent(state: RunState, event: AgentEvent): void {
     return;
   }
 
+  if (type === "human_decision_required") {
+    state.pendingHumanDecision = {
+      replyId: normalizeText(payload.reply_id) || normalizeText(payload.replyId),
+      toolCallId: normalizeText(payload.tool_call_id) || normalizeText(payload.toolCallId),
+      requestId: normalizeText(payload.request_id) || normalizeText(payload.requestId),
+      decisionType: normalizeText(payload.decision_type) || normalizeText(payload.decisionType) || "other",
+      summary: normalizeText(payload.summary),
+    };
+    state.running = false;
+    state.interrupting = false;
+    state.activeText = "";
+    state.activeStartedAt = null;
+    return;
+  }
+
   if (type === "assistant_delta") {
     const delta = normalizeText(payload.delta);
     if (!delta) {
       return;
     }
-    const existing = findAssistantItem(state, source, runId);
+    const startsNewReply = Boolean(runId && state.finalRunIds[runId]);
+    if (startsNewReply) {
+      delete state.finalRunIds[runId];
+    }
+    const existing = startsNewReply ? undefined : findAssistantItem(state, source, runId);
     if (existing) {
       existing.text += delta;
     } else {
@@ -146,6 +174,7 @@ export function applyAgentEvent(state: RunState, event: AgentEvent): void {
       });
     }
     state.running = true;
+    state.interrupting = false;
     state.activeText = "";
     state.activeStartedAt = null;
     return;
@@ -180,11 +209,14 @@ export function applyAgentEvent(state: RunState, event: AgentEvent): void {
         });
       }
     }
-    state.activeAgents = {};
-    state.activeTools = {};
-    state.running = false;
-    state.activeText = "";
-    state.activeStartedAt = null;
+    clearMatchingActiveRun(state, runId, source);
+    refreshRunningText(state);
+    return;
+  }
+
+  if (type === "interrupt_requested") {
+    state.interrupting = true;
+    state.running = true;
     return;
   }
 
@@ -220,7 +252,7 @@ function refreshRunningText(state: RunState): void {
   const activeTool = Object.values(state.activeTools)[0];
   if (activeTool) {
     state.running = true;
-    state.activeText = `[${sourceLabel(activeTool.source)}] 正在运行 ${activeTool.tool}`;
+    state.activeText = `正在调用工具 ${activeTool.tool}`;
     state.activeStartedAt = activeTool.startedAt;
     return;
   }
@@ -228,14 +260,35 @@ function refreshRunningText(state: RunState): void {
   const activeAgent = deepestActiveAgent(state.activeAgents);
   if (activeAgent) {
     state.running = true;
-    state.activeText = `[${sourceLabel(activeAgent.source)}] 正在思考`;
+    state.activeText = thinkingText(activeAgent.source, sourceLabel(activeAgent.source));
     state.activeStartedAt = activeAgent.startedAt;
     return;
   }
 
   state.running = false;
+  state.interrupting = false;
   state.activeText = "";
   state.activeStartedAt = null;
+}
+
+function clearMatchingActiveRun(state: RunState, runId: string, source: string): void {
+  if (!runId) {
+    state.activeAgents = {};
+    state.activeTools = {};
+    return;
+  }
+
+  for (const [key, agent] of Object.entries(state.activeAgents)) {
+    if (agent.runId === runId || (!agent.runId && agent.source === source)) {
+      delete state.activeAgents[key];
+    }
+  }
+
+  for (const [key, tool] of Object.entries(state.activeTools)) {
+    if (tool.runId === runId || (!tool.runId && tool.source === source)) {
+      delete state.activeTools[key];
+    }
+  }
 }
 
 function deepestActiveAgent(activeAgents: Record<string, ActiveAgent>): ActiveAgent | undefined {
@@ -276,6 +329,9 @@ function sourceLabel(source: string): string {
   if (!source || source === "main") {
     return "Main";
   }
+  if (isAgentScopeRouterSource(source)) {
+    return "DataPilot";
+  }
   if (source === "navigation.workflow" || source === "navigation.workflow.resume") {
     return "Workflow";
   }
@@ -288,12 +344,35 @@ function sourceLabel(source: string): string {
   return source;
 }
 
+function thinkingText(source: string, label: string): string {
+  if (isAgentScopeRouterSource(source)) {
+    return "正在思考";
+  }
+  return `[${label}] 正在思考`;
+}
+
+function isAgentScopeRouterSource(source: string): boolean {
+  const normalized = source.trim().toLowerCase();
+  return normalized === "agentscope" || normalized === "main-router-agent" || normalized === "mainrouteragent";
+}
+
 function toolStatus(payload: Record<string, unknown>): string {
   const status = normalizeText(payload.status);
   if (status) {
     return status;
   }
   return payload.ok === false ? "failed" : "completed";
+}
+
+function toolCompletionText(status: string, tool: string, elapsed: number): string {
+  const elapsedText = `${elapsed.toFixed(1)}s`;
+  if (status === "completed") {
+    return `已调用工具 ${tool} ${elapsedText}`;
+  }
+  if (status === "interrupted") {
+    return `工具 ${tool} 已中断 ${elapsedText}`;
+  }
+  return `工具 ${tool} 调用失败 ${elapsedText}`;
 }
 
 function elapsedSeconds(startedAt: number | undefined, endedAt: string | null | undefined): number {

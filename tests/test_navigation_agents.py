@@ -124,8 +124,8 @@ def _complete_go2w_profile_patch():
         "pcd_gridmap_tool_available": True,
         "stage_variants": {
             "extract_and_sync_navigation_data": {
-                "variant": "go2w_like",
-                "reason": "processing profile inferred go2w platform bindings",
+                "variant": "explicit_topic_params",
+                "reason": "topic parameters were inferred from sensor role bindings",
                 "evidence": ["infer_navigation_processing_profile_tool"],
             },
             "prepare_gridmap_for_projection": {
@@ -135,7 +135,7 @@ def _complete_go2w_profile_patch():
             },
             "run_projection_and_trajectory": {
                 "variant": "cjl_0525_with_gridmap",
-                "reason": "go2w platform uses the 0525 projection script",
+                "reason": "runtime assets support the 0525 projection script",
                 "evidence": ["inspect_runtime_assets_tool"],
             },
         },
@@ -174,11 +174,12 @@ def _parameterized_go2w_plan_without_profile_facts():
         if "platform_hint" in step.arguments:
             step.arguments["platform_hint"] = "go2w"
         if step.tool_name == "extract_and_sync_navigation_data":
-            step.variant = "go2w_like"
+            step.variant = "explicit_topic_params"
             step.arguments["platform_hint"] = "go2w"
         elif step.tool_name == "run_projection_and_trajectory":
             step.variant = "cjl_0525_with_gridmap"
             step.arguments["platform_hint"] = "go2w"
+            step.arguments["projection_variant"] = "cjl_0525_with_gridmap"
         elif step.tool_name == "prepare_gridmap_for_projection":
             step.variant = None
             step.decision_ref = None
@@ -532,7 +533,12 @@ def test_plan_agent_update_tool_accepts_json_string_data_profile_patch(monkeypat
 def test_plan_agent_draft_missing_fields_include_scene_mode():
     state = WorkflowPlanDraftState(request=NavigationRequest(date="20270605", dry_run=True))
 
-    update_result = state.update(processing_profile="parameterized_navigation_v1", platform_hint="go2w")
+    update_result = state.update(
+        data_profile_patch={
+            "processing_profile": {"id": "parameterized_navigation_v1", "platform_hint": "go2w"},
+            "platform_hint": "go2w",
+        }
+    )
     snapshot = state.schema_snapshot()
 
     assert update_result["ok"] is True
@@ -549,7 +555,12 @@ def test_plan_agent_draft_finalize_requires_scene_mode(monkeypatch):
 
     update_result = _invoke_tool(
         tools["update_workflow_plan_draft_tool"],
-        {"processing_profile": "parameterized_navigation_v1", "platform_hint": "go2w"},
+        {
+            "data_profile_patch": {
+                "processing_profile": {"id": "parameterized_navigation_v1", "platform_hint": "go2w"},
+                "platform_hint": "go2w",
+            }
+        },
     )
 
     assert update_result["ok"] is True
@@ -568,7 +579,7 @@ def test_executor_agent_has_sdk_tool_for_each_plan_step(monkeypatch):
         scene_mode="out",
     )
 
-    planned_tools = {"confirm_navigation_calibration_params_tool"}
+    planned_tools = {f"{plan.steps[0].tool_name}_tool"}
     missing_tools = [
         f"{step.tool_name}_tool"
         for step in plan.steps
@@ -608,21 +619,6 @@ def test_plan_template_includes_human_gui_step():
     gui_steps = [step for step in plan.steps if step.tool_name == "run_initial_annotation_gui"]
     assert len(gui_steps) == 1
     assert gui_steps[0].human_blocking is True
-
-
-def test_plan_template_accepts_legacy_dataset_profile_keyword():
-    plan = build_deterministic_plan_template(
-        "20270605",
-        None,
-        None,
-        scene_mode="out",
-        dataset_profile="go2w_like",
-    )
-    step_ids = [step.step_id for step in plan.steps]
-
-    assert plan.processing_profile == "go2w_like"
-    assert plan.platform_hint == "go2w"
-    assert "confirm_navigation_calibration_params" in step_ids
 
 
 def test_plan_template_uses_finish_data_paths_for_gui_and_validation():
@@ -672,6 +668,7 @@ def test_plan_template_uses_finish_data_paths_for_gui_and_validation():
         "finish_path": "finish_data/20270605",
         "processing_profile": "parameterized_navigation_v1",
         "platform_hint": "unknown",
+        "projection_variant": "cjl_with_gridmap",
     }
     assert steps["run_projection_and_trajectory"].expected_outputs == ["finish_data/20270605"]
     assert steps["validate_navigation_outputs"].arguments == {"date": "20270605"}
@@ -832,10 +829,8 @@ def test_request_bound_plan_agent_instructions_require_calibration_before_prepar
 
     assert "Guidance excerpt:" in plan_agent.instructions
     assert "Always include confirm_navigation_calibration_params before assemble_finish_temp" not in plan_agent.instructions
-    assert (
-        "confirm_navigation_calibration_params must be the first WorkflowPlan step before "
-        "prepare_raw_data and before any processing"
-    ) in plan_agent.instructions
+    assert "calibration confirmation gate is the first finalized WorkflowPlan step" in plan_agent.instructions
+    assert "before `prepare_raw_data` and before any processing step" in plan_agent.instructions
     assert (
         "confirm_navigation_calibration_params` must run after `extract_and_sync_navigation_data`"
         not in plan_agent.instructions
@@ -848,6 +843,9 @@ def test_plan_agent_instructions_use_processing_profile_not_dataset_profile():
     assert "infer_navigation_processing_profile_tool" in instructions
     assert "sensor bindings" in instructions
     assert "processing_profile" in instructions
+    assert "platform_hint as a diagnostic hint" in instructions
+    assert "explicit_topic_params" in instructions
+    assert "projection_variant" in instructions
     assert "classify_navigation_dataset_tool" not in instructions
     assert "Supported profiles are u_legacy_like and go2w_like" not in instructions
     assert "The only human-blocking step is gen_box.py" not in instructions
@@ -865,6 +863,9 @@ def test_draft_plan_agent_instructions_use_processing_profile_flow():
     assert "localization_policy" in instructions
     assert "calibration_policy" in instructions
     assert "infer_navigation_processing_profile_tool" in instructions
+    assert "platform_hint, and stage_variants" not in instructions
+    assert "Set stage_variants from observed facts" in instructions
+    assert "Do not choose projection variants from platform_hint alone" in instructions
     assert "dataset_profile" not in instructions
     assert "classification" not in instructions
 
@@ -899,20 +900,6 @@ def test_parse_workflow_plan_output_accepts_dict():
 
     assert plan.processing_profile == "parameterized_navigation_v1"
     assert plan.platform_hint == "unknown"
-
-
-def test_parse_workflow_plan_output_maps_legacy_dataset_profile():
-    from vla_data_juicer_agents.navigation.workflow import _parse_workflow_plan_output
-
-    payload = build_deterministic_plan_template("20270605", "parameterized_navigation_v1", None, scene_mode="out").model_dump(mode="json")
-    payload.pop("processing_profile")
-    payload.pop("platform_hint")
-    payload["dataset_profile"] = "go2w_like"
-
-    plan = _parse_workflow_plan_output(payload)
-
-    assert plan.processing_profile == "go2w_like"
-    assert plan.platform_hint == "go2w"
 
 
 def test_parse_workflow_plan_output_accepts_fenced_json():
@@ -957,7 +944,11 @@ def test_run_plan_agent_streams_events_to_run_state(tmp_path):
     class FakeStreamAgent:
         async def reply_stream(self, _msg):
             yield SimpleNamespace(type="MODEL_CALL_START", model="qwen-plus")
-            yield SimpleNamespace(type="TOOL_CALL_START", name="inspect_raw_date_tool")
+            yield SimpleNamespace(
+                type="TOOL_CALL_START",
+                tool_call_id="call_1",
+                tool_call_name="inspect_raw_date_tool",
+            )
             yield SimpleNamespace(type="TOOL_RESULT_END", tool_call_id="call_1")
             yield SimpleNamespace(type="TEXT_BLOCK_DELTA", delta=plan_json)
             yield SimpleNamespace(type="REPLY_END", reply_id="reply_1")
@@ -980,17 +971,29 @@ def test_run_plan_agent_streams_events_to_run_state(tmp_path):
     assert parsed_plan == plan
     assert [(event["type"], event["source"], event["run_id"], event["parent_run_id"]) for event in events] == [
         ("agent_start", "navigation.plan", "plan-run", "workflow-run"),
+        ("tool_start", "navigation.plan", "plan-run", "workflow-run"),
+        ("tool_end", "navigation.plan", "plan-run", "workflow-run"),
         ("assistant_delta", "navigation.plan", "plan-run", "workflow-run"),
         ("agent_end", "navigation.plan", "plan-run", "workflow-run"),
     ]
-    assert events[1]["payload"] == {"delta": plan_json}
+    assert events[1]["payload"] == {
+        "tool": "inspect_raw_date_tool",
+        "call_id": "call_1",
+        "args": "",
+    }
+    assert events[2]["payload"] == {
+        "tool": "inspect_raw_date_tool",
+        "call_id": "call_1",
+        "status": "completed",
+        "summary": "",
+    }
+    assert events[3]["payload"] == {"delta": plan_json}
     assert events[-1]["payload"] == {"status": "completed"}
     assert all("event_type" not in event for event in events)
 
 
-def test_run_plan_agent_auto_confirms_tool_calls(tmp_path):
+def test_run_plan_agent_rejects_user_confirmation_events(tmp_path):
     request = NavigationRequest(date="20270605", dry_run=True, scene_mode="out")
-    plan = _parameterized_go2w_plan_without_profile_facts()
     run_store = WorkflowRunStore(tmp_path / "runs")
     run_dir = run_store.create_run(request.date)
     scope = EventEmitter(JsonlEventSink(run_dir / "events.jsonl")).scope("navigation.plan")
@@ -1013,36 +1016,33 @@ def test_run_plan_agent_auto_confirms_tool_calls(tmp_path):
                     ],
                 )
                 return
-            yield SimpleNamespace(type="TEXT_BLOCK_DELTA", delta=plan.model_dump_json())
-            yield SimpleNamespace(type="REPLY_END", reply_id="reply_1")
+            raise AssertionError("run_plan_agent must not auto-confirm user confirmation events")
 
     agent = FakeConfirmingAgent()
 
-    parsed_plan = asyncio.run(
-        run_plan_agent(
-            agent,
-            request,
-            run_store=run_store,
-            run_dir=run_dir,
-            event_scope=scope,
+    with pytest.raises(RuntimeError, match="requires user confirmation"):
+        asyncio.run(
+            run_plan_agent(
+                agent,
+                request,
+                run_store=run_store,
+                run_dir=run_dir,
+                event_scope=scope,
+            )
         )
-    )
 
     events = [
         json.loads(line)
         for line in (run_dir / "events.jsonl").read_text(encoding="utf-8").splitlines()
     ]
-    assert parsed_plan == plan
-    assert len(agent.inputs) == 2
-    assert agent.inputs[1].confirm_results[0].confirmed is True
+    assert len(agent.inputs) == 1
     assert [(event["type"], event["payload"]) for event in events] == [
         ("agent_start", {}),
-        ("assistant_delta", {"delta": plan.model_dump_json()}),
-        ("agent_end", {"status": "completed"}),
+        ("agent_end", {"status": "failed"}),
     ]
 
 
-def test_agent_stream_allows_ten_tool_confirmation_rounds():
+def test_agent_stream_rejects_repeated_tool_confirmation_events():
     from vla_data_juicer_agents.navigation.workflow import _run_agent_stream
 
     class FakeTenToolAgent:
@@ -1063,15 +1063,14 @@ def test_agent_stream_allows_ten_tool_confirmation_rounds():
                     ],
                 )
                 return
-            yield SimpleNamespace(type="TEXT_BLOCK_DELTA", delta="finished")
-            yield SimpleNamespace(type="REPLY_END", reply_id="reply_final")
+            raise AssertionError("_run_agent_stream must not auto-confirm user confirmation events")
 
     agent = FakeTenToolAgent()
 
-    output = asyncio.run(_run_agent_stream(agent, "prompt"))
+    with pytest.raises(RuntimeError, match="requires user confirmation"):
+        asyncio.run(_run_agent_stream(agent, "prompt"))
 
-    assert output == "finished"
-    assert len(agent.inputs) == 11
+    assert len(agent.inputs) == 1
 
 
 def test_run_plan_agent_rejects_invalid_plan_variant(tmp_path):

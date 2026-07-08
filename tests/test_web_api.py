@@ -2,15 +2,23 @@ from __future__ import annotations
 
 import asyncio
 import inspect
+import logging
 import time
+from contextlib import asynccontextmanager
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
+from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
-from vla_data_juicer_agents.web.app import _consume_turn_result_when_idle, _drain_controller_events, create_app
+from vla_data_juicer_agents.web.app import (
+    _consume_turn_result_when_idle,
+    _create_logged_task,
+    _drain_controller_events,
+    create_app,
+)
 
 
 class FakeController:
@@ -99,6 +107,97 @@ def test_create_app_accepts_positional_configuration(tmp_path: Path):
 
     assert FakeController.created[0].kwargs["working_dir"] == str(tmp_path / ".djx" / session_id)
     assert FakeController.created[0].kwargs["model"] == "qwen-positional"
+
+
+def test_create_app_mounts_agentscope_when_runtime_factory_provided(tmp_path: Path):
+    fake_runtime = SimpleNamespace(
+        app=FastAPI(),
+        config=SimpleNamespace(agentscope_mount_path="/api/agentscope"),
+    )
+
+    app = create_app(
+        working_dir=str(tmp_path / ".djx"),
+        db_path=tmp_path / "sessions.sqlite",
+        controller_factory=FakeController,
+        agentscope_runtime=fake_runtime,
+    )
+
+    assert "/api/agentscope" in [route.path for route in app.routes]
+    assert app.state.agentscope_runtime is fake_runtime
+
+
+def test_create_app_enters_agentscope_sub_app_lifespan(tmp_path: Path):
+    events = []
+
+    @asynccontextmanager
+    async def lifespan(sub_app: FastAPI):
+        events.append("startup")
+        sub_app.state.ready = True
+        yield
+        events.append("shutdown")
+
+    sub_app = FastAPI(lifespan=lifespan)
+    runtime = SimpleNamespace(
+        app=sub_app,
+        config=SimpleNamespace(agentscope_mount_path="/api/agentscope"),
+    )
+    app = create_app(
+        working_dir=str(tmp_path / ".djx"),
+        db_path=tmp_path / "sessions.sqlite",
+        controller_factory=FakeController,
+        agentscope_runtime=runtime,
+    )
+
+    with TestClient(app):
+        assert sub_app.state.ready is True
+        assert events == ["startup"]
+
+    assert events == ["startup", "shutdown"]
+
+
+def test_create_app_uses_agentscope_session_manager_when_runtime_present(tmp_path: Path):
+    class FakeRuntime:
+        def __init__(self) -> None:
+            self.app = FastAPI()
+            self.config = SimpleNamespace(agentscope_mount_path="/api/agentscope")
+            self.submitted = []
+
+        async def submit_user_message(self, *, web_session_id: str, message: str) -> str:
+            self.submitted.append((web_session_id, message))
+            return "turn-agent-1"
+
+    runtime = FakeRuntime()
+    FakeController.created = []
+    app = create_app(
+        working_dir=str(tmp_path / ".djx"),
+        db_path=tmp_path / "sessions.sqlite",
+        controller_factory=FakeController,
+        agentscope_runtime=runtime,
+    )
+    client = TestClient(app)
+
+    session_id = _create_session(client)
+    response = client.post(f"/api/sessions/{session_id}/turns", json={"message": "开始处理"})
+
+    assert response.status_code == 200
+    assert response.json()["turn_id"] == "turn-agent-1"
+    assert FakeController.created == []
+    assert runtime.submitted == [(session_id, "开始处理")]
+
+
+def test_create_app_keeps_legacy_controller_when_agentscope_runtime_missing(tmp_path: Path):
+    FakeController.created = []
+    app = create_app(
+        working_dir=str(tmp_path / ".djx"),
+        db_path=tmp_path / "sessions.sqlite",
+        controller_factory=FakeController,
+    )
+    client = TestClient(app)
+
+    session_id = _create_session(client)
+
+    assert session_id.startswith("session_")
+    assert FakeController.created[0].started is True
 
 
 def test_frontend_index_served_when_dist_provided(tmp_path: Path):
@@ -347,6 +446,22 @@ def test_cleanup_waits_for_idle_without_timeout_parameter():
 
     assert result.text == "cleanup text"
     assert controller.consume_running_states == [False]
+
+
+def test_create_logged_task_logs_background_failure(caplog):
+    async def failing_task() -> None:
+        raise RuntimeError("background exploded")
+
+    async def exercise() -> None:
+        task = _create_logged_task(failing_task(), name="failing-test-task")
+        with pytest.raises(RuntimeError, match="background exploded"):
+            await task
+        await asyncio.sleep(0)
+
+    with caplog.at_level(logging.ERROR, logger="vla_data_juicer_agents.web.app"):
+        asyncio.run(exercise())
+
+    assert "Background task failed: failing-test-task" in caplog.text
 
 
 def test_interrupt_returns_true_for_active_session(tmp_path: Path):

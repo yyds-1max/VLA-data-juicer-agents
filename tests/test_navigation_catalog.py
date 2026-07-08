@@ -14,8 +14,7 @@ def test_catalog_exposes_known_stage_variants_for_plan_agent():
 
     assert capabilities["extract_and_sync_navigation_data"].tool_name == "extract_and_sync_navigation_data"
     assert {variant.id for variant in capabilities["extract_and_sync_navigation_data"].variants} == {
-        "u_legacy_like",
-        "go2w_like",
+        "explicit_topic_params",
     }
     assert {variant.id for variant in capabilities["prepare_gridmap_for_projection"].variants} == {
         "copy_existing_gridmap",
@@ -33,8 +32,7 @@ def test_catalog_marks_effects_and_plan_agent_visibility():
 
     assert capabilities["inspect_raw_date"].effects == "read"
     assert capabilities["inspect_raw_date"].plan_agent_allowed is True
-    assert capabilities["classify_navigation_dataset"].effects == "read"
-    assert capabilities["classify_navigation_dataset"].plan_agent_allowed is False
+    assert "classify_navigation_dataset" not in capabilities
     assert capabilities["infer_navigation_sensor_bindings"].effects == "read"
     assert capabilities["infer_navigation_sensor_bindings"].plan_agent_allowed is True
     assert capabilities["infer_navigation_processing_profile"].effects == "read"
@@ -55,7 +53,7 @@ def test_catalog_exposes_calibration_confirmation_capability():
     assert capability.executor_agent_allowed is True
 
 
-def test_parameterized_navigation_selectors_do_not_use_dataset_profile():
+def test_parameterized_navigation_variants_are_not_platform_buckets():
     capabilities = _capability_by_stage()
     selector_keys = {
         selector_key
@@ -65,8 +63,8 @@ def test_parameterized_navigation_selectors_do_not_use_dataset_profile():
     }
 
     assert "dataset_profile" not in selector_keys
-    assert "processing_profile" in selector_keys
-    assert "platform_hint" in selector_keys
+    assert "processing_profile" not in selector_keys
+    assert "platform_hint" not in selector_keys
 
 
 def test_catalog_tool_returns_json_serializable_payload():

@@ -1,5 +1,6 @@
 import type {
   AgentEvent,
+  HumanDecisionPayload,
   NavigationDatasetSummary,
   NavigationDateSummary,
   NavigationSyncImageListing,
@@ -83,10 +84,27 @@ export async function interruptTurn(sessionId: string): Promise<boolean> {
   return data.interrupted;
 }
 
+export async function submitHumanDecision(
+  sessionId: string,
+  payload: HumanDecisionPayload,
+): Promise<boolean> {
+  const data = await requestJson<{ accepted: boolean }>(`${sessionPath(sessionId)}/human-decisions`, {
+    method: "POST",
+    body: JSON.stringify(payload),
+  });
+  return data.accepted;
+}
+
 export function openSessionEvents(sessionId: string, onEvent: (event: AgentEvent) => void): WebSocket {
   const protocol = window.location.protocol === "https:" ? "wss:" : "ws:";
   const socket = new WebSocket(`${protocol}//${window.location.host}${sessionPath(sessionId)}/events`);
-  socket.addEventListener("message", (message) => onEvent(JSON.parse(message.data) as AgentEvent));
+  socket.addEventListener("message", (message) => {
+    try {
+      onEvent(JSON.parse(message.data) as AgentEvent);
+    } catch (error) {
+      console.error("Failed to parse DataPilot event", error);
+    }
+  });
   return socket;
 }
 

@@ -37,13 +37,6 @@ NAVIGATION_TOOL_CAPABILITIES: tuple[ToolCapability, ...] = (
         plan_agent_allowed=True,
     ),
     ToolCapability(
-        tool_name="classify_navigation_dataset",
-        stage_kind="classify_navigation_dataset",
-        effects="read",
-        variants=[ToolVariantCapability(id="default")],
-        plan_agent_allowed=False,
-    ),
-    ToolCapability(
         tool_name="infer_navigation_sensor_bindings",
         stage_kind="infer_navigation_sensor_bindings",
         effects="read",
@@ -92,18 +85,11 @@ NAVIGATION_TOOL_CAPABILITIES: tuple[ToolCapability, ...] = (
         effects="execute",
         variants=[
             ToolVariantCapability(
-                id="u_legacy_like",
-                selectors={
-                    "processing_profile": ["parameterized_navigation_v1", "u_legacy_like"],
-                    "platform_hint": ["u"],
-                },
-            ),
-            ToolVariantCapability(
-                id="go2w_like",
-                selectors={
-                    "processing_profile": ["parameterized_navigation_v1", "go2w_like"],
-                    "platform_hint": ["go2w"],
-                },
+                id="explicit_topic_params",
+                notes=(
+                    "Use topic_whitelist, topic_map, and query_dir inferred from sensor-role bindings. "
+                    "Do not select this variant from platform_hint."
+                ),
             ),
         ],
         supports_dry_run=True,
@@ -178,17 +164,11 @@ NAVIGATION_TOOL_CAPABILITIES: tuple[ToolCapability, ...] = (
         variants=[
             ToolVariantCapability(
                 id="cjl_with_gridmap",
-                selectors={
-                    "processing_profile": ["parameterized_navigation_v1", "u_legacy_like"],
-                    "platform_hint": ["u"],
-                },
+                notes="Run the standard CJL projection script with gridmap inputs; use as the default projection strategy when no evidence selects another script.",
             ),
             ToolVariantCapability(
                 id="cjl_0525_with_gridmap",
-                selectors={
-                    "processing_profile": ["parameterized_navigation_v1", "go2w_like"],
-                    "platform_hint": ["go2w"],
-                },
+                notes="Run the CJL 0525 projection script with gridmap inputs when observed evidence explicitly selects it.",
             ),
         ],
         supports_dry_run=True,

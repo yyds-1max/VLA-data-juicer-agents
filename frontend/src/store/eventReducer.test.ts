@@ -47,11 +47,92 @@ function sessionDetail(overrides: Partial<SessionDetail> = {}): SessionDetail {
   return {
     ...session(overrides),
     messages: [],
+    events: [],
+    ...overrides,
+  };
+}
+
+function pendingDecision(overrides: Record<string, unknown> = {}) {
+  return {
+    replyId: "reply-1",
+    toolCallId: "tool-call-1",
+    requestId: "request-1",
+    decisionType: "other",
+    summary: "请确认下一步。",
     ...overrides,
   };
 }
 
 describe("eventReducer", () => {
+  it("captures a pending human decision and pauses active run text", () => {
+    const state = createEmptyRunState();
+
+    applyAgentEvent(state, event("agent_start", "main"));
+    applyAgentEvent(
+      state,
+      event("human_decision_required", "navigation.workflow", {
+        reply_id: "reply-1",
+        tool_call_id: "tool-call-1",
+        request_id: "request-1",
+        decision_type: "confirmation",
+        summary: "发现潜在风险，需要人工确认。",
+      }),
+    );
+
+    expect(state.pendingHumanDecision).toEqual({
+      replyId: "reply-1",
+      toolCallId: "tool-call-1",
+      requestId: "request-1",
+      decisionType: "confirmation",
+      summary: "发现潜在风险，需要人工确认。",
+    });
+    expect(state.running).toBe(false);
+    expect(state.activeText).toBe("");
+    expect(state.activeStartedAt).toBeNull();
+  });
+
+  it("defaults missing decision type to other", () => {
+    const state = createEmptyRunState();
+
+    applyAgentEvent(
+      state,
+      event("human_decision_required", "navigation.workflow", {
+        reply_id: "reply-2",
+        tool_call_id: "tool-call-2",
+        request_id: "request-2",
+        summary: "请确认下一步。",
+      }),
+    );
+
+    expect(state.pendingHumanDecision).toMatchObject({
+      decisionType: "other",
+    });
+  });
+
+  it("keeps pending human decision after assistant output arrives", () => {
+    const state = createEmptyRunState();
+
+    applyAgentEvent(
+      state,
+      event("human_decision_required", "navigation.workflow", {
+        reply_id: "reply-1",
+        tool_call_id: "tool-call-1",
+        request_id: "request-1",
+        summary: "请确认下一步。",
+      }),
+    );
+    applyAgentEvent(state, event("assistant_delta", "main", { delta: "收到。" }));
+    applyAgentEvent(state, event("final", "main", { text: "收到，请确认。" }, { run_id: "final-run" }));
+
+    expect(state.pendingHumanDecision).toEqual({
+      replyId: "reply-1",
+      toolCallId: "tool-call-1",
+      requestId: "request-1",
+      decisionType: "other",
+      summary: "请确认下一步。",
+    });
+  });
+
   it("localizes main agent_start active text", () => {
     const state = createEmptyRunState();
 
@@ -66,6 +147,15 @@ describe("eventReducer", () => {
       startedAt: Date.parse("2026-06-26T00:00:00.000Z"),
     });
     expect(state.activeStartedAt).toBe(Date.parse("2026-06-26T00:00:00.000Z"));
+  });
+
+  it("uses generic thinking placeholder for AgentScope router startup", () => {
+    const state = createEmptyRunState();
+
+    applyAgentEvent(state, event("agent_start", "agentscope"));
+
+    expect(state.running).toBe(true);
+    expect(state.activeText).toBe("正在思考");
   });
 
   it("creates compact tool completion text without args JSON", () => {
@@ -96,7 +186,7 @@ describe("eventReducer", () => {
       kind: "tool",
       source: "navigation.plan",
       status: "completed",
-      text: "completed classify_navigation_dataset_tool 1.0s",
+      text: "已调用工具 classify_navigation_dataset_tool 1.0s",
     });
     expect(state.timeline[0].text).not.toContain("20270605");
     expect(state.timeline[0].text).not.toContain("{");
@@ -163,6 +253,33 @@ describe("eventReducer", () => {
     expect(state.activeStartedAt).toBe(Date.parse("2026-06-26T00:00:00.000Z"));
   });
 
+  it("final only clears the matching run and keeps child tools active", () => {
+    const state = createEmptyRunState();
+
+    applyAgentEvent(state, event("agent_start", "main", {}, { run_id: "main-run" }));
+    applyAgentEvent(
+      state,
+      event("agent_start", "navigation.workflow", {}, { run_id: "workflow-run", parent_run_id: "main-run" }),
+    );
+    applyAgentEvent(
+      state,
+      event(
+        "tool_start",
+        "navigation.workflow",
+        { call_id: "call-1", tool: "prepare_raw_data" },
+        { run_id: "workflow-run", parent_run_id: "main-run" },
+      ),
+    );
+
+    applyAgentEvent(state, event("final", "main", { text: "已启动导航任务。" }, { run_id: "main-run" }));
+
+    expect(state.running).toBe(true);
+    expect(state.activeText).toBe("正在调用工具 prepare_raw_data");
+    expect(Object.values(state.activeTools)).toMatchObject([{ runId: "workflow-run", tool: "prepare_raw_data" }]);
+    expect(state.activeAgents["workflow-run"]).toMatchObject({ runId: "workflow-run" });
+    expect(state.activeAgents["main-run"]).toBeUndefined();
+  });
+
   it("dedupes final events by run id", () => {
     const state = createEmptyRunState();
 
@@ -224,9 +341,96 @@ describe("eventReducer", () => {
       },
     ]);
   });
+
+  it("starts a new assistant item when a reused run id streams after final", () => {
+    const state = createEmptyRunState();
+
+    applyAgentEvent(state, event("assistant_delta", "agentscope", { delta: "第一轮" }, { run_id: "session-run" }));
+    applyAgentEvent(state, event("final", "agentscope", { text: "第一轮" }, { run_id: "session-run" }));
+    applyAgentEvent(state, event("assistant_delta", "agentscope", { delta: "第二轮" }, { run_id: "session-run" }));
+
+    expect(state.timeline.filter((item) => item.kind === "assistant").map((item) => item.text)).toEqual([
+      "第一轮",
+      "第二轮",
+    ]);
+
+    applyAgentEvent(state, event("final", "agentscope", { text: "第二轮完成" }, { run_id: "session-run" }));
+
+    expect(state.running).toBe(false);
+    expect(state.timeline.filter((item) => item.kind === "assistant").map((item) => item.text)).toEqual([
+      "第一轮",
+      "第二轮完成",
+    ]);
+  });
 });
 
 describe("datapilotStore", () => {
+  it("clearPendingHumanDecision clears the matching pending human decision from the current run", () => {
+    const store = createDataPilotStore();
+
+    store.getState().setActiveSession(session());
+    store.getState().applyEvent(
+      event("human_decision_required", "navigation.workflow", {
+        reply_id: "reply-1",
+        tool_call_id: "tool-call-1",
+        request_id: "request-1",
+        summary: "请确认下一步。",
+      }),
+    );
+
+    store.getState().clearPendingHumanDecision(pendingDecision(), "session-1");
+
+    expect(store.getState().run.pendingHumanDecision).toBeNull();
+  });
+
+  it("clearPendingHumanDecision keeps a newer pending human decision when identities differ", () => {
+    const store = createDataPilotStore();
+
+    store.getState().applyEvent(
+      event("human_decision_required", "navigation.workflow", {
+        reply_id: "reply-2",
+        tool_call_id: "tool-call-2",
+        request_id: "request-2",
+        summary: "需要确认第二步。",
+      }),
+    );
+
+    store.getState().clearPendingHumanDecision(pendingDecision(), "session-1");
+
+    expect(store.getState().run.pendingHumanDecision).toEqual({
+      replyId: "reply-2",
+      toolCallId: "tool-call-2",
+      requestId: "request-2",
+      decisionType: "other",
+      summary: "需要确认第二步。",
+    });
+  });
+
+  it("clearPendingHumanDecision keeps pending when the current session does not match", () => {
+    const store = createDataPilotStore();
+
+    store.getState().setActiveSession(session({ id: "session-b" }));
+    store.getState().applyEvent(
+      event("human_decision_required", "navigation.workflow", {
+        reply_id: "reply-1",
+        tool_call_id: "tool-call-1",
+        request_id: "request-1",
+        summary: "B 会话里的确认。",
+      }),
+    );
+
+    store.getState().clearPendingHumanDecision(pendingDecision(), "session-a");
+
+    expect(store.getState().currentSessionId).toBe("session-b");
+    expect(store.getState().run.pendingHumanDecision).toEqual({
+      replyId: "reply-1",
+      toolCallId: "tool-call-1",
+      requestId: "request-1",
+      decisionType: "other",
+      summary: "B 会话里的确认。",
+    });
+  });
+
   it("enterDraft records the active session and clears messages and run", () => {
     const store = createDataPilotStore();
 
@@ -250,6 +454,23 @@ describe("datapilotStore", () => {
     store.getState().applyEvent(event("final", "main", { text: "duplicate answer" }, { run_id: "final-run" }));
 
     expect(store.getState().run.timeline.filter((item) => item.kind === "assistant")).toHaveLength(1);
+  });
+
+  it("does not drop repeated live stream events that have no persisted sequence", () => {
+    const store = createDataPilotStore();
+    const liveEvent = {
+      type: "assistant_delta",
+      source: "agentscope",
+      run_id: "as-session",
+      parent_run_id: null,
+      timestamp: null,
+      payload: { delta: "哈" },
+    };
+
+    store.getState().applyEvent(liveEvent);
+    store.getState().applyEvent(liveEvent);
+
+    expect(store.getState().run.timeline).toMatchObject([{ kind: "assistant", text: "哈哈" }]);
   });
 
   it("merges active session refresh messages without dropping newer local messages", () => {
@@ -325,5 +546,134 @@ describe("datapilotStore", () => {
     expect(store.getState().run.running).toBe(true);
     expect(store.getState().run.activeText).toBe("[Main] 正在思考");
     expect(store.getState().run.timeline).toMatchObject([{ kind: "reasoning", text: "live reasoning" }]);
+  });
+
+  it("refreshing an idle active session restores persisted timeline events", () => {
+    const store = createDataPilotStore();
+
+    store.getState().setActiveSession(session());
+    store.getState().refreshActiveSession(
+      sessionDetail({
+        events: [
+          {
+            id: "event-1",
+            session_id: "session-1",
+            seq: 1,
+            type: "assistant_delta",
+            source: "navigation-data-agent",
+            run_id: "as-session",
+            parent_run_id: null,
+            timestamp: "2026-06-26T00:01:00Z",
+            payload: { delta: "开始检查。" },
+            created_at: "2026-06-26T00:01:00Z",
+          },
+          {
+            id: "event-2",
+            session_id: "session-1",
+            seq: 2,
+            type: "tool_start",
+            source: "navigation-data-agent",
+            run_id: "as-session",
+            parent_run_id: null,
+            timestamp: "2026-06-26T00:01:01Z",
+            payload: { tool: "prepare_raw_data", call_id: "call-1" },
+            created_at: "2026-06-26T00:01:01Z",
+          },
+        ],
+      }),
+    );
+
+    expect(store.getState().run.timeline).toMatchObject([{ kind: "assistant", text: "开始检查。" }]);
+    expect(store.getState().run.running).toBe(true);
+    expect(store.getState().run.activeText).toBe("正在调用工具 prepare_raw_data");
+  });
+
+  it("restores repeated persisted deltas even when their content is identical", () => {
+    const store = createDataPilotStore();
+
+    store.getState().setActiveSession(session());
+    store.getState().refreshActiveSession(
+      sessionDetail({
+        events: [
+          {
+            id: "event-1",
+            session_id: "session-1",
+            seq: 1,
+            type: "assistant_delta",
+            source: "agentscope",
+            run_id: "as-session",
+            parent_run_id: null,
+            timestamp: null,
+            payload: { delta: "哈" },
+            created_at: "2026-06-26T00:01:00Z",
+          },
+          {
+            id: "event-2",
+            session_id: "session-1",
+            seq: 2,
+            type: "assistant_delta",
+            source: "agentscope",
+            run_id: "as-session",
+            parent_run_id: null,
+            timestamp: null,
+            payload: { delta: "哈" },
+            created_at: "2026-06-26T00:01:01Z",
+          },
+        ],
+      }),
+    );
+
+    expect(store.getState().run.timeline).toMatchObject([{ kind: "assistant", text: "哈哈" }]);
+  });
+
+  it("refreshing an active session applies persisted events missing from the live stream without duplicating live events", () => {
+    const store = createDataPilotStore();
+
+    store.getState().setActiveSession(session());
+    store.getState().applyEvent({
+      type: "assistant_delta",
+      source: "navigation-data-agent",
+      run_id: "as-session",
+      parent_run_id: null,
+      timestamp: "2026-06-26T00:01:00Z",
+      payload: { delta: "开始检查。" },
+    });
+
+    store.getState().refreshActiveSession(
+      sessionDetail({
+        events: [
+          {
+            id: "event-1",
+            session_id: "session-1",
+            seq: 1,
+            type: "assistant_delta",
+            source: "navigation-data-agent",
+            run_id: "as-session",
+            parent_run_id: null,
+            timestamp: "2026-06-26T00:01:00Z",
+            payload: { delta: "开始检查。" },
+            created_at: "2026-06-26T00:01:00Z",
+          },
+          {
+            id: "event-2",
+            session_id: "session-1",
+            seq: 2,
+            type: "tool_start",
+            source: "navigation-data-agent",
+            run_id: "as-session",
+            parent_run_id: null,
+            timestamp: "2026-06-26T00:01:01Z",
+            payload: { tool: "prepare_raw_data", call_id: "call-1" },
+            created_at: "2026-06-26T00:01:01Z",
+          },
+        ],
+      }),
+    );
+
+    expect(store.getState().run.timeline.filter((item) => item.kind === "assistant")).toMatchObject([
+      { text: "开始检查。" },
+    ]);
+    expect(store.getState().run.running).toBe(true);
+    expect(store.getState().run.activeText).toBe("正在调用工具 prepare_raw_data");
   });
 });

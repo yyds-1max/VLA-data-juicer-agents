@@ -8,12 +8,14 @@ import {
   interruptTurn,
   listSessions,
   openSessionEvents,
+  submitHumanDecision,
   submitTurn,
 } from "../../api/client";
 import type { SessionRecord } from "../../api/types";
 import { datapilotStore } from "../../store/datapilotStore";
 import { Composer } from "./Composer";
 import { DraftNewSessionView } from "./DraftNewSessionView";
+import { HumanDecisionDialog } from "./HumanDecisionDialog";
 import { MessageList } from "./MessageList";
 import { SessionHeader } from "./SessionHeader";
 import { SessionHistoryPanel } from "./SessionHistoryPanel";
@@ -35,6 +37,8 @@ export function DataPilotWindow() {
   const messages = useStore(datapilotStore, (state) => state.messages);
   const run = useStore(datapilotStore, (state) => state.run);
   const running = useStore(datapilotStore, (state) => state.run.running);
+  const interrupting = useStore(datapilotStore, (state) => state.run.interrupting);
+  const pendingHumanDecision = useStore(datapilotStore, (state) => state.run.pendingHumanDecision);
   const floatingOffset = useStore(datapilotStore, (state) => state.floatingOffset);
   const setFloatingOffset = useStore(datapilotStore, (state) => state.setFloatingOffset);
   const [historyOpen, setHistoryOpen] = useState(false);
@@ -45,13 +49,33 @@ export function DataPilotWindow() {
     height: typeof window === "undefined" ? 900 : window.innerHeight,
   }));
   const socketRef = useRef<{ sessionId: string; socket: WebSocket } | null>(null);
+  const reconnectTimerRef = useRef<number | null>(null);
   const dragRef = useRef<DragState | null>(null);
   const windowOffset = useMemo(() => visibleWindowOffset(floatingOffset, viewport), [floatingOffset, viewport]);
 
-  const closeSocket = useCallback(() => {
-    socketRef.current?.socket.close();
-    socketRef.current = null;
+  const clearReconnectTimer = useCallback(() => {
+    if (reconnectTimerRef.current === null) {
+      return;
+    }
+    window.clearTimeout(reconnectTimerRef.current);
+    reconnectTimerRef.current = null;
   }, []);
+
+  const refreshSessionSnapshot = useCallback(async (sessionId: string) => {
+    try {
+      const detail = await getSession(sessionId);
+      datapilotStore.getState().refreshActiveSession(detail);
+    } catch (error) {
+      console.error("Failed to refresh DataPilot active session", error);
+    }
+  }, []);
+
+  const closeSocket = useCallback(() => {
+    clearReconnectTimer();
+    const socket = socketRef.current?.socket;
+    socketRef.current = null;
+    socket?.close();
+  }, [clearReconnectTimer]);
 
   useEffect(() => {
     if (!open || mode !== "active_session") {
@@ -68,12 +92,31 @@ export function DataPilotWindow() {
       }
 
       closeSocket();
+      clearReconnectTimer();
+      const socket = openSessionEvents(sessionId, (event) => datapilotStore.getState().applyEvent(event));
       socketRef.current = {
         sessionId,
-        socket: openSessionEvents(sessionId, (event) => datapilotStore.getState().applyEvent(event)),
+        socket,
       };
+
+      const handleDisconnect = () => {
+        if (socketRef.current?.socket !== socket) {
+          return;
+        }
+        socketRef.current = null;
+        void refreshSessionSnapshot(sessionId);
+        reconnectTimerRef.current = window.setTimeout(() => {
+          reconnectTimerRef.current = null;
+          const state = datapilotStore.getState();
+          if (state.open && state.mode === "active_session" && state.currentSessionId === sessionId) {
+            openEvents(sessionId);
+          }
+        }, 100);
+      };
+      socket.addEventListener("close", handleDisconnect);
+      socket.addEventListener("error", handleDisconnect);
     },
-    [closeSocket],
+    [clearReconnectTimer, closeSocket, refreshSessionSnapshot],
   );
 
   useEffect(() => {
@@ -196,8 +239,45 @@ export function DataPilotWindow() {
       return;
     }
 
-    await interruptTurn(currentSessionId);
+    const interrupted = await interruptTurn(currentSessionId);
+    if (interrupted) {
+      datapilotStore.getState().applyEvent({
+        type: "interrupt_requested",
+        source: "main",
+        run_id: currentSessionId,
+        parent_run_id: null,
+        timestamp: new Date().toISOString(),
+        payload: {},
+      });
+    }
   };
+
+  const handleHumanDecision = useCallback(
+    async (action: "confirm" | "stop" | "guide", text?: string) => {
+      if (!currentSessionId || !pendingHumanDecision) {
+        return;
+      }
+
+      const sessionId = currentSessionId;
+      const decision = pendingHumanDecision;
+
+      try {
+        const accepted = await submitHumanDecision(sessionId, {
+          action,
+          request_id: decision.requestId,
+          tool_call_id: decision.toolCallId,
+          reply_id: decision.replyId,
+          ...(text ? { text } : {}),
+        });
+        if (accepted) {
+          datapilotStore.getState().clearPendingHumanDecision(decision, sessionId);
+        }
+      } catch (error) {
+        console.error("Failed to submit human decision", error);
+      }
+    },
+    [currentSessionId, pendingHumanDecision],
+  );
 
   const handleDragStart = useCallback((event: PointerEvent<HTMLElement>) => {
     const target = event.target;
@@ -326,14 +406,23 @@ export function DataPilotWindow() {
       ) : mode === "active_session" ? (
         <div className="flex min-h-0 flex-1 flex-col bg-console-panel">
           <MessageList messages={messages} run={run} />
-          <div className="border-t border-console-line p-3 sm:p-4">
-            <Composer
-              placeholder="继续描述任务…"
-              running={running}
-              onSubmit={handleActiveSubmit}
-              onInterrupt={handleInterrupt}
-            />
-          </div>
+          <HumanDecisionDialog
+            decision={pendingHumanDecision}
+            onConfirm={() => handleHumanDecision("confirm")}
+            onStop={() => handleHumanDecision("stop")}
+            onGuide={(text) => handleHumanDecision("guide", text)}
+          />
+          {pendingHumanDecision ? null : (
+            <div className="border-t border-console-line p-3 sm:p-4">
+              <Composer
+                placeholder="继续描述任务…"
+                running={running}
+                interrupting={interrupting}
+                onSubmit={handleActiveSubmit}
+                onInterrupt={handleInterrupt}
+              />
+            </div>
+          )}
         </div>
       ) : (
         <MessageList messages={messages} run={run} />

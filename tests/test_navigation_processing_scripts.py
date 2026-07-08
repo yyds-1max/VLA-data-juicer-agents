@@ -144,7 +144,6 @@ def test_extract_and_sync_non_dry_run_writes_topic_config_files(tmp_path, monkey
 
     result = extract_and_sync_navigation_data(
         "20270605",
-        "u_legacy_like",
         topic_whitelist=topic_whitelist,
         topic_map=topic_map,
         query_dir="lidar_points",

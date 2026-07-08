@@ -18,8 +18,8 @@ from vla_data_juicer_agents.navigation.workflow import build_deterministic_plan_
 def _complete_stage_variants(gridmap_variant: str, gridmap_reason: str, gridmap_evidence: list[str]):
     return {
         "extract_and_sync_navigation_data": StageVariantDecision(
-            variant="go2w_like",
-            reason="processing profile inferred go2w platform bindings",
+            variant="explicit_topic_params",
+            reason="topic parameters were inferred from sensor role bindings",
             evidence=["infer_navigation_processing_profile_tool"],
         ),
         "prepare_gridmap_for_projection": StageVariantDecision(
@@ -29,7 +29,7 @@ def _complete_stage_variants(gridmap_variant: str, gridmap_reason: str, gridmap_
         ),
         "run_projection_and_trajectory": StageVariantDecision(
             variant="cjl_0525_with_gridmap",
-            reason="go2w platform uses the 0525 projection script",
+            reason="runtime assets support the 0525 projection script",
             evidence=["inspect_runtime_assets_tool"],
         ),
     }
@@ -206,7 +206,109 @@ def test_workflow_plan_draft_snapshot_exposes_react_profile_state_panel():
     assert "topic_params" in snapshot["missing_fields"]
     assert "stage_variants.prepare_gridmap_for_projection" in snapshot["missing_fields"]
     assert snapshot["ready_to_finish"] is False
-    assert "infer_navigation_topic_params_tool" in snapshot["next_tool_candidates"]
+    assert snapshot["next_tool_candidates"] == ["inspect_raw_date_tool"]
+
+
+def test_workflow_plan_draft_next_tool_candidates_follow_investigation_order():
+    state = WorkflowPlanDraftState(
+        request=NavigationRequest(date="20270605", scene_mode="out")
+    )
+
+    assert state.next_tool_candidates() == ["inspect_raw_date_tool"]
+
+    empty_update = state.update(
+        data_profile_patch={},
+        observation_id="raw_metadata",
+        used_tool="inspect_raw_date_tool",
+    )
+    assert empty_update["ok"] is False
+    assert "empty data_profile_patch" in empty_update["validation_errors"][0]
+    assert state.completed_observations == []
+    assert state.next_tool_candidates() == ["inspect_raw_date_tool"]
+
+    state.update(
+        data_profile_patch={"evidence": {"raw_metadata": ["metadata inspected"]}},
+        observation_id="raw_metadata",
+        used_tool="inspect_raw_date_tool",
+    )
+    assert state.next_tool_candidates() == ["infer_navigation_sensor_bindings_tool"]
+
+    state.update(
+        data_profile_patch={"evidence": {"sensor_bindings": ["bindings inferred"]}},
+        observation_id="sensor_bindings",
+        used_tool="infer_navigation_sensor_bindings_tool",
+    )
+    assert state.next_tool_candidates() == ["infer_navigation_processing_profile_tool"]
+
+
+def test_workflow_plan_draft_does_not_advance_when_later_observation_is_recorded_first():
+    state = WorkflowPlanDraftState(
+        request=NavigationRequest(date="20270605", scene_mode="out")
+    )
+
+    state.update(
+        data_profile_patch={
+            "gridmap_source": "unknown",
+            "pcd_gridmap_tool_available": True,
+        },
+        observation_id="gridmap_artifacts",
+        used_tool="inspect_gridmap_artifacts_tool",
+    )
+
+    assert state.next_tool_candidates() == ["inspect_raw_date_tool"]
+
+
+def test_workflow_plan_draft_suggests_finalize_after_ordered_observations_and_complete_profile():
+    state = WorkflowPlanDraftState(
+        request=NavigationRequest(date="20270605", scene_mode="out")
+    )
+    profile = NavigationDataProfile(
+        date="20270605",
+        scene_mode="out",
+        processing_profile=_processing_profile(
+            platform_hint="go2w",
+            stage_variants=_complete_stage_variants(
+                "generate_from_pcd",
+                "no existing grid_map artifact but PCD generator is available",
+                ["inspect_gridmap_artifacts_tool", "inspect_runtime_assets_tool"],
+            ),
+        ),
+        platform_hint="go2w",
+        localization_policy={"source": "odom", "conversion": "odom_to_ins"},
+        topic_params=_go2w_topic_params(),
+        gridmap_source="generated_from_pcd",
+        pcd_gridmap_tool_available=True,
+        stage_variants=_complete_stage_variants(
+            "generate_from_pcd",
+            "no existing grid_map artifact but PCD generator is available",
+            ["inspect_gridmap_artifacts_tool", "inspect_runtime_assets_tool"],
+        ),
+    )
+    ordered_observations = [
+        ("raw_metadata", "inspect_raw_date_tool"),
+        ("sensor_bindings", "infer_navigation_sensor_bindings_tool"),
+        ("navigation_processing_profile", "infer_navigation_processing_profile_tool"),
+        ("navigation_topic_params", "infer_navigation_topic_params_tool"),
+        ("processing_state", "inspect_processing_state_tool"),
+        ("gridmap_artifacts", "inspect_gridmap_artifacts_tool"),
+        ("runtime_assets", "inspect_runtime_assets_tool"),
+        ("tool_capabilities", "list_navigation_tool_capabilities_tool"),
+    ]
+
+    for observation_id, used_tool in ordered_observations:
+        patch = (
+            profile.model_dump(mode="json")
+            if observation_id == "tool_capabilities"
+            else {"evidence": {observation_id: [used_tool]}}
+        )
+        state.update(
+            data_profile_patch=patch,
+            observation_id=observation_id,
+            used_tool=used_tool,
+        )
+
+    assert state.ready_to_finish() is True
+    assert state.next_tool_candidates() == ["finalize_workflow_plan_tool"]
 
 
 def test_workflow_plan_draft_requires_processing_profile_not_dataset_profile():
@@ -219,15 +321,18 @@ def test_workflow_plan_draft_requires_processing_profile_not_dataset_profile():
     assert "processing_profile" in snapshot["missing_fields"]
 
 
-def test_workflow_plan_draft_update_accepts_processing_profile_dict_argument():
+def test_workflow_plan_draft_update_accepts_processing_profile_patch():
     state = WorkflowPlanDraftState(date="20270605", scene_mode="out")
 
     result = state.update(
-        processing_profile={
-            "id": "parameterized_navigation_v1",
+        data_profile_patch={
             "platform_hint": "custom_robot",
-            "topic_params": _go2w_topic_params().model_dump(mode="json"),
-            "localization_policy": {"source": "odom", "conversion": "odom_to_ins"},
+            "processing_profile": {
+                "id": "parameterized_navigation_v1",
+                "platform_hint": "custom_robot",
+                "topic_params": _go2w_topic_params().model_dump(mode="json"),
+                "localization_policy": {"source": "odom", "conversion": "odom_to_ins"},
+            },
         }
     )
 
@@ -242,6 +347,21 @@ def test_workflow_plan_draft_update_accepts_processing_profile_dict_argument():
 
 def test_workflow_plan_draft_reports_blocking_issues_with_remediation_candidate():
     state = WorkflowPlanDraftState(date="20270605", scene_mode="out")
+
+    for observation_id, used_tool in [
+        ("raw_metadata", "inspect_raw_date_tool"),
+        ("sensor_bindings", "infer_navigation_sensor_bindings_tool"),
+        ("navigation_processing_profile", "infer_navigation_processing_profile_tool"),
+        ("navigation_topic_params", "infer_navigation_topic_params_tool"),
+        ("processing_state", "inspect_processing_state_tool"),
+        ("gridmap_artifacts", "inspect_gridmap_artifacts_tool"),
+        ("runtime_assets", "inspect_runtime_assets_tool"),
+    ]:
+        state.update(
+            data_profile_patch={"evidence": {observation_id: [used_tool]}},
+            observation_id=observation_id,
+            used_tool=used_tool,
+        )
 
     result = state.update(
         data_profile_patch={
@@ -259,7 +379,9 @@ def test_workflow_plan_draft_reports_blocking_issues_with_remediation_candidate(
                     "message": "grid_map source is unresolved",
                 }
             ],
-        }
+        },
+        observation_id="tool_capabilities",
+        used_tool="list_navigation_tool_capabilities_tool",
     )
 
     assert "blocking_issues" in result["draft"]["missing_fields"]
@@ -445,8 +567,8 @@ def test_workflow_plan_draft_merges_data_profile_patches_across_react_rounds():
             "topic_params": _go2w_topic_params().model_dump(mode="json"),
             "stage_variants": {
                 "extract_and_sync_navigation_data": {
-                    "variant": "go2w_like",
-                    "reason": "processing profile inferred go2w platform bindings",
+                    "variant": "explicit_topic_params",
+                    "reason": "topic parameters were inferred from sensor role bindings",
                     "evidence": ["infer_navigation_processing_profile_tool"],
                 },
             },
@@ -466,7 +588,7 @@ def test_workflow_plan_draft_merges_data_profile_patches_across_react_rounds():
                 },
                 "run_projection_and_trajectory": {
                     "variant": "cjl_0525_with_gridmap",
-                    "reason": "go2w platform uses 0525 projection",
+                    "reason": "runtime assets support the 0525 projection script",
                     "evidence": ["inspect_runtime_assets_tool"],
                 },
             },
@@ -481,7 +603,7 @@ def test_workflow_plan_draft_merges_data_profile_patches_across_react_rounds():
     assert draft["processing_profile"]["id"] == "parameterized_navigation_v1"
     assert draft["topic_params"]["query_dir"] == "rs32_lidar_points"
     assert draft["gridmap_source"] == "existing_gridmap"
-    assert draft["stage_variants"]["extract_and_sync_navigation_data"]["variant"] == "go2w_like"
+    assert draft["stage_variants"]["extract_and_sync_navigation_data"]["variant"] == "explicit_topic_params"
     assert draft["stage_variants"]["prepare_gridmap_for_projection"]["variant"] == "copy_existing_gridmap"
     assert state.data_profile is not None
     assert state.data_profile.processing_profile is not None
@@ -637,8 +759,8 @@ def test_plan_from_lightweight_profile_writes_variant_metadata_for_profile_drive
             gridmap_source="existing_gridmap",
             stage_variants={
                 "extract_and_sync_navigation_data": StageVariantDecision(
-                    variant="go2w_like",
-                    reason="processing profile inferred go2w platform bindings",
+                    variant="explicit_topic_params",
+                    reason="topic parameters were inferred from sensor role bindings",
                     evidence=["infer_navigation_processing_profile_tool"],
                 ),
                 "prepare_gridmap_for_projection": StageVariantDecision(
@@ -648,7 +770,7 @@ def test_plan_from_lightweight_profile_writes_variant_metadata_for_profile_drive
                 ),
                 "run_projection_and_trajectory": StageVariantDecision(
                     variant="cjl_0525_with_gridmap",
-                    reason="go2w platform uses the 0525 projection script",
+                    reason="runtime assets support the 0525 projection script",
                     evidence=["inspect_runtime_assets_tool"],
                 ),
             },
@@ -658,8 +780,8 @@ def test_plan_from_lightweight_profile_writes_variant_metadata_for_profile_drive
         gridmap_source="existing_gridmap",
         stage_variants={
             "extract_and_sync_navigation_data": StageVariantDecision(
-                variant="go2w_like",
-                reason="processing profile inferred go2w platform bindings",
+                variant="explicit_topic_params",
+                reason="topic parameters were inferred from sensor role bindings",
                 evidence=["infer_navigation_processing_profile_tool"],
             ),
             "prepare_gridmap_for_projection": StageVariantDecision(
@@ -669,7 +791,7 @@ def test_plan_from_lightweight_profile_writes_variant_metadata_for_profile_drive
             ),
             "run_projection_and_trajectory": StageVariantDecision(
                 variant="cjl_0525_with_gridmap",
-                reason="go2w platform uses the 0525 projection script",
+                reason="runtime assets support the 0525 projection script",
                 evidence=["inspect_runtime_assets_tool"],
             ),
         },
@@ -679,7 +801,7 @@ def test_plan_from_lightweight_profile_writes_variant_metadata_for_profile_drive
     plan = build_plan_from_draft(state)
     steps = {step.tool_name: step for step in plan.steps}
 
-    assert steps["extract_and_sync_navigation_data"].variant == "go2w_like"
+    assert steps["extract_and_sync_navigation_data"].variant == "explicit_topic_params"
     assert steps["extract_and_sync_navigation_data"].arguments["topic_whitelist"] == [
         "/cam_video4/csi_cam/image_raw/compressed",
         "/rs32_lidar_points",
@@ -695,6 +817,7 @@ def test_plan_from_lightweight_profile_writes_variant_metadata_for_profile_drive
         "data_profile.stage_variants.extract_and_sync_navigation_data"
     )
     assert steps["run_projection_and_trajectory"].variant == "cjl_0525_with_gridmap"
+    assert steps["run_projection_and_trajectory"].arguments["projection_variant"] == "cjl_0525_with_gridmap"
     assert steps["run_projection_and_trajectory"].decision_ref == (
         "data_profile.stage_variants.run_projection_and_trajectory"
     )

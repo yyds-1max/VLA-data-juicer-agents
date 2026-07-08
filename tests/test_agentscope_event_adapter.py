@@ -3,7 +3,7 @@ import json
 from types import SimpleNamespace
 
 import pytest
-from agentscope.event import RequireUserConfirmEvent
+from agentscope.event import RequireExternalExecutionEvent, RequireUserConfirmEvent
 from agentscope.message import ToolCallBlock
 
 from vla_data_juicer_agents.adapters.agentscope.events import (
@@ -78,6 +78,51 @@ def test_plain_text_delta_emits_assistant_delta_for_streaming_ui():
     ]
 
 
+def test_adapter_can_emit_text_delta_and_final_from_raw_agentscope_events():
+    scope, events = _scope_and_events()
+    adapter = AgentScopeEventAdapter(
+        scope,
+        emit_text_events=True,
+        emit_final_events=True,
+    )
+
+    adapter.accept(SimpleNamespace(type="TEXT_BLOCK_DELTA", delta="Progress: Inspecting data.\n"))
+    adapter.accept(SimpleNamespace(type="TEXT_BLOCK_DELTA", delta="处理"))
+    adapter.accept(SimpleNamespace(type="TEXT_BLOCK_DELTA", delta="完成"))
+    adapter.accept(SimpleNamespace(type="REPLY_END"))
+
+    assert [(event["type"], event["payload"]) for event in events] == [
+        ("reasoning", {"summary": "Inspecting data."}),
+        ("assistant_delta", {"delta": "处理"}),
+        ("assistant_delta", {"delta": "完成"}),
+        ("final", {"text": "处理完成"}),
+    ]
+
+
+def test_adapter_closes_assistant_segment_before_tool_call():
+    scope, events = _scope_and_events()
+    adapter = AgentScopeEventAdapter(
+        scope,
+        emit_text_events=True,
+        emit_final_events=True,
+    )
+
+    adapter.accept(SimpleNamespace(type="TEXT_BLOCK_DELTA", delta="先检查数据。"))
+    adapter.accept(SimpleNamespace(type="TOOL_CALL_START", tool_call_id="call-1", tool_call_name="prepare_raw_data"))
+    adapter.accept(SimpleNamespace(type="TOOL_RESULT_END", tool_call_id="call-1", state="success"))
+    adapter.accept(SimpleNamespace(type="TEXT_BLOCK_DELTA", delta="检查完成。"))
+    adapter.accept(SimpleNamespace(type="REPLY_END"))
+
+    assert [(event["type"], event["payload"]) for event in events] == [
+        ("assistant_delta", {"delta": "先检查数据。"}),
+        ("final", {"text": "先检查数据。"}),
+        ("tool_start", {"tool": "prepare_raw_data", "call_id": "call-1", "args": ""}),
+        ("tool_end", {"tool": "prepare_raw_data", "call_id": "call-1", "status": "completed", "summary": ""}),
+        ("assistant_delta", {"delta": "检查完成。"}),
+        ("final", {"text": "检查完成。"}),
+    ]
+
+
 def test_progress_marker_without_newline_flushes_before_tool_event():
     scope, events = _scope_and_events()
 
@@ -114,6 +159,10 @@ def test_tool_result_emits_paired_start_and_end_with_result_state():
     adapter = AgentScopeEventAdapter(scope)
 
     adapter.accept(SimpleNamespace(type="TOOL_CALL_START", tool_call_id="call-1", tool_call_name="inspect"))
+    assert [(event["type"], event["payload"]) for event in events] == [
+        ("tool_start", {"tool": "inspect", "call_id": "call-1", "args": ""}),
+    ]
+
     adapter.accept(SimpleNamespace(type="TOOL_CALL_DELTA", tool_call_id="call-1", delta='{"date":'))
     adapter.accept(SimpleNamespace(type="TOOL_CALL_DELTA", tool_call_id="call-1", delta=' "20270605"}'))
     adapter.accept(SimpleNamespace(type="TOOL_RESULT_START", tool_call_id="call-1", tool_call_name="inspect"))
@@ -122,9 +171,77 @@ def test_tool_result_emits_paired_start_and_end_with_result_state():
     adapter.accept(SimpleNamespace(type="TOOL_RESULT_END", tool_call_id="call-1", state="success"))
 
     assert [(event["type"], event["payload"]) for event in events] == [
-        ("tool_start", {"tool": "inspect", "call_id": "call-1", "args": '{"date": "20270605"}'}),
+        ("tool_start", {"tool": "inspect", "call_id": "call-1", "args": ""}),
         ("tool_end", {"tool": "inspect", "call_id": "call-1", "status": "completed", "summary": "Found navigation data. Ready."}),
     ]
+
+
+def test_require_external_execution_emits_human_decision_required():
+    scope, events = _scope_and_events()
+    adapter = AgentScopeEventAdapter(scope)
+    tool_input = {
+        "decision_type": "camera_params",
+        "request_id": "req-1",
+        "summary": "Confirm fisheye camera parameters.",
+    }
+
+    adapter.accept(
+        RequireExternalExecutionEvent(
+            reply_id="reply-1",
+            tool_calls=[
+                ToolCallBlock(
+                    id="decision-1",
+                    name="request_human_decision",
+                    input=json.dumps(tool_input),
+                )
+            ],
+        )
+    )
+
+    assert len(events) == 1
+    timestamp = events[0]["timestamp"]
+    assert events == [
+        {
+            "type": "human_decision_required",
+            "source": "plan-agent",
+            "run_id": "run-1",
+            "parent_run_id": None,
+            "timestamp": timestamp,
+            "payload": {
+                "reply_id": "reply-1",
+                "tool_call_id": "decision-1",
+                "decision_type": "camera_params",
+                "request_id": "req-1",
+                "summary": "Confirm fisheye camera parameters.",
+            },
+        }
+    ]
+
+
+def test_removed_calibration_external_tool_is_ignored():
+    scope, events = _scope_and_events()
+    adapter = AgentScopeEventAdapter(scope)
+
+    adapter.accept(
+        RequireExternalExecutionEvent(
+            reply_id="reply-1",
+            tool_calls=[
+                ToolCallBlock(
+                    id="confirm-1",
+                    name="confirm_navigation_calibration_params_tool",
+                    input=json.dumps(
+                        {
+                            "date": "20270605",
+                            "segments": ["20260605_152856"],
+                            "platform_hint": "go2w",
+                        }
+                    ),
+                )
+            ],
+        )
+    )
+
+    assert events == []
 
 
 @pytest.mark.parametrize(
@@ -216,30 +333,22 @@ def test_close_active_tools_is_idempotent():
     ]
 
 
-def test_agent_lifecycle_is_emitted_once_across_confirmation_rounds():
+def test_run_agent_stream_does_not_auto_confirm_user_confirmation_events():
     scope, events = _scope_and_events()
 
     class ConfirmingAgent:
-        def __init__(self):
-            self.calls = 0
-
         async def reply_stream(self, _message):
-            self.calls += 1
-            if self.calls == 1:
-                yield RequireUserConfirmEvent(
-                    reply_id="reply-1",
-                    tool_calls=[ToolCallBlock(id="call-1", name="inspect", input="{}")],
-                )
-                return
-            yield SimpleNamespace(type="TEXT_BLOCK_DELTA", delta="finished")
+            yield RequireUserConfirmEvent(
+                reply_id="reply-1",
+                tool_calls=[ToolCallBlock(id="call-1", name="inspect", input="{}")],
+            )
 
-    output = asyncio.run(_run_agent_stream(ConfirmingAgent(), "prompt", event_scope=scope))
+    with pytest.raises(RuntimeError, match="requires user confirmation"):
+        asyncio.run(_run_agent_stream(ConfirmingAgent(), "prompt", event_scope=scope))
 
-    assert output == "finished"
     assert [(event["type"], event["payload"]) for event in events] == [
         ("agent_start", {}),
-        ("assistant_delta", {"delta": "finished"}),
-        ("agent_end", {"status": "completed"}),
+        ("agent_end", {"status": "failed"}),
     ]
 
 
