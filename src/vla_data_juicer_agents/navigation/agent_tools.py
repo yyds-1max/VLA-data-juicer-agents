@@ -30,6 +30,20 @@ from vla_data_juicer_agents.navigation.task_store import SqliteNavigationTaskSto
 from vla_data_juicer_agents.navigation.task_tools import build_navigation_task_tools
 
 
+EXTRACT_SYNC_TOOLS = {"prepare_raw_data", "extract_and_sync_navigation_data"}
+FINISH_PROCESSING_TOOLS = {
+    "generate_gridmap_from_pcd",
+    "assemble_finish_temp",
+    "run_noobscene_preprocessing",
+    "run_initial_annotation_gui",
+    "run_tracking",
+    "prepare_gridmap_for_projection",
+    "run_projection_and_trajectory",
+    "run_tracking_and_projection",
+    "validate_navigation_outputs",
+}
+
+
 class HumanDecisionTool(ToolBase):
     """External tool that pauses navigation for a durable human decision."""
 
@@ -141,9 +155,10 @@ class _FinalizedPlanRequiredTool(ToolBase):
         tool_input: dict[str, Any],
         context: object,
     ) -> PermissionDecision:
-        gate_error = _finalized_plan_gate_error(
+        gate_error = _phase_plan_gate_error(
             session_id=self._session_id,
             draft_store=self._draft_store,
+            tool_name=self.name,
             tool_input=tool_input,
             check_segments=_tool_accepts_segments(self),
         )
@@ -164,9 +179,10 @@ class _FinalizedPlanRequiredTool(ToolBase):
         return self._tool.generate_suggestions(tool_input)
 
     async def __call__(self, *args: Any, **kwargs: Any):
-        gate_error = _finalized_plan_gate_error(
+        gate_error = _phase_plan_gate_error(
             session_id=self._session_id,
             draft_store=self._draft_store,
+            tool_name=self.name,
             tool_input=kwargs,
             check_segments=_tool_accepts_segments(self),
         )
@@ -178,25 +194,52 @@ class _FinalizedPlanRequiredTool(ToolBase):
         return result
 
 
-def _finalized_plan_gate_error(
+def _base_tool_name(tool_name: str) -> str:
+    return tool_name[:-5] if tool_name.endswith("_tool") else tool_name
+
+
+def _phase_plan_gate_error(
     *,
     session_id: str,
     draft_store: NavigationPlanDraftStore,
+    tool_name: str,
     tool_input: dict[str, Any],
     check_segments: bool = True,
 ) -> dict[str, Any] | None:
     state = draft_store.load(session_id)
-    if state is None:
+    if state is None or state.finalized_plan is None:
         return {
             "ok": False,
             "error_type": "navigation_plan_not_finalized",
-            "message": (
-                "Navigation execution is blocked until a session workflow plan "
-                "draft exists and has been finalized."
-            ),
+            "message": "Navigation execution is blocked until a phase workflow plan has been finalized.",
             "missing_fields": ["workflow_plan_draft"],
             "next_tool_candidates": ["get_workflow_plan_draft_tool"],
         }
+    base_name = _base_tool_name(tool_name)
+    plan_phase = state.finalized_plan.phase
+    if base_name in EXTRACT_SYNC_TOOLS and plan_phase in {"extract_sync", "full"}:
+        return _request_match_error_if_any(state, tool_input, check_segments)
+    if base_name in FINISH_PROCESSING_TOOLS and plan_phase in {"finish_processing", "full"}:
+        return _request_match_error_if_any(state, tool_input, check_segments)
+    return {
+        "ok": False,
+        "error_type": "navigation_phase_plan_required",
+        "message": f"Tool {base_name} is not allowed by finalized navigation plan phase {plan_phase}.",
+        "finalized_phase": plan_phase,
+        "tool_name": base_name,
+        "next_tool_candidates": [
+            "finalize_extract_sync_plan_tool",
+            "finalize_finish_processing_plan_tool",
+            "finalize_workflow_plan_tool",
+        ],
+    }
+
+
+def _request_match_error_if_any(
+    state: Any,
+    tool_input: dict[str, Any],
+    check_segments: bool = True,
+) -> dict[str, Any] | None:
     requested_date = tool_input.get("date")
     if isinstance(requested_date, str) and requested_date != state.request.date:
         return {
@@ -208,18 +251,6 @@ def _finalized_plan_gate_error(
             ),
             "existing_request": state.request.model_dump(mode="json"),
             "requested_request": {"date": requested_date},
-            "draft": state.schema_snapshot(),
-        }
-    if state.finalized_plan is None:
-        return {
-            "ok": False,
-            "error_type": "navigation_plan_not_finalized",
-            "message": (
-                "Navigation execution is blocked until finalize_workflow_plan_tool "
-                "returns ok=true for this AgentScope session."
-            ),
-            "missing_fields": state.missing_fields(),
-            "next_tool_candidates": state.next_tool_candidates(),
             "draft": state.schema_snapshot(),
         }
     if check_segments and isinstance(requested_date, str):

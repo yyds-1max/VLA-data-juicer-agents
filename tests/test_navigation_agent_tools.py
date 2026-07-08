@@ -12,7 +12,11 @@ from vla_data_juicer_agents.navigation.agent_tools import (
     HumanDecisionTool,
     build_navigation_agent_tools,
 )
-from vla_data_juicer_agents.navigation.models import NavigationRequest
+from vla_data_juicer_agents.navigation.models import (
+    NavigationRequest,
+    WorkflowPlan,
+    WorkflowStep,
+)
 from vla_data_juicer_agents.navigation.plan_draft import (
     WorkflowPlanDraftState,
     build_plan_from_draft,
@@ -257,6 +261,139 @@ def test_build_navigation_agent_tools_passes_cancellation_to_execution_tools(mon
     assert captured == {"dry_run": True, "cancellation": cancellation}
 
 
+def test_phase_gate_allows_extract_sync_tools_with_extract_sync_plan(
+    monkeypatch,
+    tmp_path,
+):
+    store = InMemoryNavigationPlanDraftStore()
+    task_store = SqliteNavigationTaskStore(tmp_path / "tasks.sqlite")
+
+    def fake_prepare_raw_data_tool(date: str) -> dict:
+        return {"ok": True, "tool_name": "prepare_raw_data", "date": date}
+
+    def fake_assemble_finish_temp_tool(date: str) -> dict:
+        return {"ok": True, "tool_name": "assemble_finish_temp", "date": date}
+
+    monkeypatch.setattr(
+        agent_tools_module,
+        "create_navigation_execution_tools",
+        lambda **_: [
+            FunctionTool(
+                fake_prepare_raw_data_tool,
+                name="prepare_raw_data_tool",
+                is_read_only=False,
+            ),
+            FunctionTool(
+                fake_assemble_finish_temp_tool,
+                name="assemble_finish_temp_tool",
+                is_read_only=False,
+            ),
+        ],
+    )
+    state = WorkflowPlanDraftState(request=NavigationRequest(date="20270623"))
+    state.finalized_plan = WorkflowPlan(
+        date="20270623",
+        phase="extract_sync",
+        scene_mode=None,
+        steps=[
+            WorkflowStep(
+                step_id="prepare_raw_data",
+                tool_name="prepare_raw_data",
+                arguments={"date": "20270623"},
+            ),
+            WorkflowStep(
+                step_id="extract_and_sync_navigation_data",
+                tool_name="extract_and_sync_navigation_data",
+                arguments={
+                    "date": "20270623",
+                    "topic_whitelist": [
+                        "/cam_video4/csi_cam/image_raw/compressed",
+                        "/rs32_lidar_points",
+                        "/sport_odom",
+                    ],
+                    "topic_map": {
+                        "cam_video4": "fisheye_front",
+                        "rs32_lidar_points": "r32_rslidar_points",
+                        "sport_odom": "odom",
+                    },
+                    "query_dir": "rs32_lidar_points",
+                },
+            ),
+        ],
+    )
+    store.save("agent-session", state)
+
+    tools = {
+        tool.name: tool
+        for tool in build_navigation_agent_tools(
+            session_id="agent-session",
+            draft_store=store,
+            task_store=task_store,
+            dry_run=True,
+        )
+    }
+
+    result = _decode_tool_payload(
+        asyncio.run(tools["prepare_raw_data_tool"](date="20270623"))
+    )
+
+    assert result["ok"] is True
+
+
+def test_phase_gate_blocks_finish_processing_tool_with_extract_sync_plan(
+    monkeypatch,
+    tmp_path,
+):
+    store = InMemoryNavigationPlanDraftStore()
+    task_store = SqliteNavigationTaskStore(tmp_path / "tasks.sqlite")
+
+    def fake_prepare_raw_data_tool(date: str) -> dict:
+        return {"ok": True, "tool_name": "prepare_raw_data", "date": date}
+
+    def fake_assemble_finish_temp_tool(date: str) -> dict:
+        return {"ok": True, "tool_name": "assemble_finish_temp", "date": date}
+
+    monkeypatch.setattr(
+        agent_tools_module,
+        "create_navigation_execution_tools",
+        lambda **_: [
+            FunctionTool(
+                fake_prepare_raw_data_tool,
+                name="prepare_raw_data_tool",
+                is_read_only=False,
+            ),
+            FunctionTool(
+                fake_assemble_finish_temp_tool,
+                name="assemble_finish_temp_tool",
+                is_read_only=False,
+            ),
+        ],
+    )
+    state = WorkflowPlanDraftState(request=NavigationRequest(date="20270623"))
+    state.finalized_plan = WorkflowPlan(
+        date="20270623",
+        phase="extract_sync",
+        steps=[],
+    )
+    store.save("agent-session", state)
+    tools = {
+        tool.name: tool
+        for tool in build_navigation_agent_tools(
+            session_id="agent-session",
+            draft_store=store,
+            task_store=task_store,
+            dry_run=True,
+        )
+    }
+
+    result = _decode_tool_payload(
+        asyncio.run(tools["assemble_finish_temp_tool"](date="20270623"))
+    )
+
+    assert result["ok"] is False
+    assert result["error_type"] == "navigation_phase_plan_required"
+
+
 def test_navigation_execution_tool_is_blocked_before_session_plan_is_finalized(monkeypatch):
     store = InMemoryNavigationPlanDraftStore()
 
@@ -498,7 +635,7 @@ def test_navigation_execution_tool_reports_not_finalized_before_segment_mismatch
 
     assert result["ok"] is False
     assert result["error_type"] == "navigation_plan_not_finalized"
-    assert result["missing_fields"] == state.missing_fields()
+    assert result["missing_fields"] == ["workflow_plan_draft"]
 
 
 def test_extra_agent_tools_factory_registers_navigation_tools_only_for_navigation_agent(tmp_path):
