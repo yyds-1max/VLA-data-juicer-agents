@@ -314,6 +314,35 @@ def test_workflow_plan_draft_suggests_extract_sync_finalize_after_extract_sync_o
     assert state.next_tool_candidates() == ["finalize_extract_sync_plan_tool"]
 
 
+def test_extract_sync_missing_extract_variant_stays_on_extract_sync_candidates():
+    state = WorkflowPlanDraftState(
+        request=NavigationRequest(date="20270605", scene_mode="out")
+    )
+    for observation_id, used_tool in [
+        ("raw_metadata", "inspect_raw_date_tool"),
+        ("sensor_bindings", "infer_navigation_sensor_bindings_tool"),
+        ("navigation_processing_profile", "infer_navigation_processing_profile_tool"),
+        ("navigation_topic_params", "infer_navigation_topic_params_tool"),
+    ]:
+        state.update(
+            data_profile_patch={"evidence": {observation_id: [used_tool]}},
+            observation_id=observation_id,
+            used_tool=used_tool,
+        )
+
+    state.update(
+        data_profile_patch={
+            "processing_profile": _processing_profile().model_dump(mode="json"),
+            "topic_params": _go2w_topic_params().model_dump(mode="json"),
+            "localization_policy": {"source": "odom", "conversion": "odom_to_ins"},
+        }
+    )
+
+    assert state.missing_fields() == ["stage_variants.extract_and_sync_navigation_data"]
+    assert state.next_required_observation() is None
+    assert state.next_tool_candidates() == ["infer_navigation_topic_params_tool"]
+
+
 def test_extract_sync_plan_validation_skips_finish_processing_requirements():
     plan = build_extract_sync_plan_template(
         "20270605",

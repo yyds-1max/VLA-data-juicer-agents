@@ -201,6 +201,8 @@ class WorkflowPlanDraftState(BaseModel):
     def _missing_field_tool_candidates(self) -> list[str]:
         missing = set(self.missing_fields())
         candidates: list[str] = []
+        if "stage_variants.extract_and_sync_navigation_data" in missing:
+            candidates.append("infer_navigation_topic_params_tool")
         if (
             "processing_profile" in missing
             or "processing_profile.blocking_issues" in missing
@@ -212,7 +214,11 @@ class WorkflowPlanDraftState(BaseModel):
             candidates.append("infer_navigation_topic_params_tool")
         if "stage_variants.prepare_gridmap_for_projection" in missing:
             candidates.append("inspect_gridmap_artifacts_tool")
-        if any(field.startswith("stage_variants.") for field in missing):
+        if any(
+            field.startswith("stage_variants.")
+            and field != "stage_variants.extract_and_sync_navigation_data"
+            for field in missing
+        ):
             candidates.append("inspect_runtime_assets_tool")
             candidates.append("list_navigation_tool_capabilities_tool")
         if not candidates:
@@ -352,9 +358,7 @@ class WorkflowPlanDraftState(BaseModel):
         }
 
 
-def build_plan_from_draft(state: WorkflowPlanDraftState) -> WorkflowPlan:
-    from vla_data_juicer_agents.navigation.workflow import build_deterministic_plan_template
-
+def _finish_processing_data_profile_from_draft(state: WorkflowPlanDraftState) -> NavigationDataProfile:
     state._refresh_data_profile_from_draft(phase="finish_processing")
     if state.data_profile is None:
         missing = ", ".join(state.missing_fields(phase="finish_processing")) or "invalid profile fields"
@@ -376,18 +380,45 @@ def build_plan_from_draft(state: WorkflowPlanDraftState) -> WorkflowPlan:
     if state.data_profile is not None and state.data_profile.blocking_issues:
         issues = ", ".join(issue.type for issue in state.data_profile.blocking_issues)
         raise ValueError(f"cannot finalize WorkflowPlan with blocking issues: {issues}")
+    return state.data_profile
+
+
+def build_plan_from_draft(state: WorkflowPlanDraftState) -> WorkflowPlan:
+    from vla_data_juicer_agents.navigation.workflow import build_deterministic_plan_template
+
+    data_profile = _finish_processing_data_profile_from_draft(state)
     plan = build_deterministic_plan_template(
-        state.data_profile.date,
-        state.data_profile.processing_profile.id,
-        state.data_profile.segments,
-        scene_mode=state.data_profile.scene_mode,
-        data_profile=state.data_profile,
+        data_profile.date,
+        data_profile.processing_profile.id,
+        data_profile.segments,
+        scene_mode=data_profile.scene_mode,
+        data_profile=data_profile,
     )
     return plan.model_copy(
         update={
-            "processing_profile": state.data_profile.processing_profile.id,
-            "platform_hint": state.data_profile.platform_hint
-            or state.data_profile.processing_profile.platform_hint,
+            "processing_profile": data_profile.processing_profile.id,
+            "platform_hint": data_profile.platform_hint
+            or data_profile.processing_profile.platform_hint,
+        }
+    )
+
+
+def build_finish_processing_plan_from_draft(state: WorkflowPlanDraftState) -> WorkflowPlan:
+    from vla_data_juicer_agents.navigation.workflow import build_finish_processing_plan_template
+
+    data_profile = _finish_processing_data_profile_from_draft(state)
+    plan = build_finish_processing_plan_template(
+        data_profile.date,
+        data_profile.processing_profile.id,
+        data_profile.segments,
+        scene_mode=data_profile.scene_mode,
+        data_profile=data_profile,
+    )
+    return plan.model_copy(
+        update={
+            "processing_profile": data_profile.processing_profile.id,
+            "platform_hint": data_profile.platform_hint
+            or data_profile.processing_profile.platform_hint,
         }
     )
 
@@ -447,7 +478,7 @@ def build_plan_draft_tools(state: WorkflowPlanDraftState) -> list[FunctionTool]:
 
     def finalize_finish_processing_plan_tool() -> dict[str, Any]:
         """Finalize and return a finish-processing WorkflowPlan after scene_mode is known."""
-        plan = build_plan_from_draft(state).model_copy(update={"phase": "finish_processing"})
+        plan = build_finish_processing_plan_from_draft(state)
         state.finalized_plan = plan
         return {
             "ok": True,

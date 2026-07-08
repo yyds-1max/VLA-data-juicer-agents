@@ -9,6 +9,7 @@ from vla_data_juicer_agents.navigation.models import NavigationRequest
 from vla_data_juicer_agents.navigation.plan_draft import (
     WorkflowPlanDraftState,
     build_extract_sync_plan_from_draft,
+    build_finish_processing_plan_from_draft,
     build_plan_from_draft,
 )
 from vla_data_juicer_agents.navigation.plan_draft_store import NavigationPlanDraftStore
@@ -57,12 +58,12 @@ def build_session_plan_draft_tools(
                 state.set_scene_mode(normalized_scene_mode)
                 updated = True
             if (
-                normalized_scene_mode in {"in", "out"}
+                state.request.scene_mode in {"in", "out"}
                 and state.plan_phase == "extract_sync"
                 and state.finalized_plan is not None
                 and state.finalized_plan.phase == "extract_sync"
             ):
-                state.advance_to_finish_processing(scene_mode=normalized_scene_mode)
+                state.advance_to_finish_processing(scene_mode=state.request.scene_mode)
                 updated = True
             if updated:
                 store.save(session_id, state)
@@ -173,7 +174,7 @@ def build_session_plan_draft_tools(
         if state is None:
             return _missing_initial_request()
         try:
-            plan = build_plan_from_draft(state).model_copy(update={"phase": "finish_processing"})
+            plan = build_finish_processing_plan_from_draft(state)
         except ValueError as exc:
             return {
                 "ok": False,

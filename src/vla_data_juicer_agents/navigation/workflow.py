@@ -408,6 +408,39 @@ def build_extract_sync_plan_template(
     )
 
 
+def build_finish_processing_plan_template(
+    date: str,
+    processing_profile: str | None = None,
+    segments: list[str] | None = None,
+    *,
+    scene_mode: Literal["in", "out"] | _SceneModeMissing = _SCENE_MODE_MISSING,
+    data_profile: NavigationDataProfile | None = None,
+) -> WorkflowPlan:
+    full_plan = build_deterministic_plan_template(
+        date,
+        processing_profile,
+        segments,
+        scene_mode=scene_mode,
+        data_profile=data_profile,
+    )
+    omitted_step_ids = {"prepare_raw_data", "extract_and_sync_navigation_data"}
+    steps: list[WorkflowStep] = []
+    for step in full_plan.steps:
+        if step.step_id in omitted_step_ids:
+            continue
+        preconditions = [
+            precondition
+            for precondition in step.preconditions
+            if precondition not in omitted_step_ids
+        ]
+        if step.step_id == "assemble_finish_temp" and not preconditions:
+            preconditions = ["confirm_navigation_calibration_params"]
+        if preconditions != step.preconditions:
+            step = step.model_copy(update={"preconditions": preconditions})
+        steps.append(step)
+    return full_plan.model_copy(update={"phase": "finish_processing", "steps": steps})
+
+
 def _event_type(event: object) -> str:
     event_type = getattr(event, "type", None)
     if hasattr(event_type, "value"):

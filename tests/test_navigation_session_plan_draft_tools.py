@@ -366,6 +366,50 @@ def test_get_workflow_plan_draft_advances_to_finish_processing_when_scene_mode_a
     assert resumed["draft"]["next_tool_candidates"] == ["inspect_processing_state_tool"]
 
 
+def test_get_workflow_plan_draft_advances_with_initial_scene_mode_after_extract_sync_finalization(
+    complete_extract_sync_draft_payload,
+):
+    store = InMemoryNavigationPlanDraftStore()
+    tools = {
+        tool.name: tool
+        for tool in build_session_plan_draft_tools(store=store, session_id="session-a")
+    }
+    _invoke_tool(
+        tools["get_workflow_plan_draft_tool"],
+        {"date": "20270623", "scene_mode": "out"},
+    )
+    for observation_id, used_tool in [
+        ("raw_metadata", "inspect_raw_date_tool"),
+        ("sensor_bindings", "infer_navigation_sensor_bindings_tool"),
+        ("navigation_processing_profile", "infer_navigation_processing_profile_tool"),
+    ]:
+        _invoke_tool(
+            tools["update_workflow_plan_draft_tool"],
+            {
+                "data_profile_patch": {"evidence": {observation_id: [used_tool]}},
+                "observation_id": observation_id,
+                "used_tool": used_tool,
+            },
+        )
+    _invoke_tool(
+        tools["update_workflow_plan_draft_tool"],
+        {
+            "data_profile_patch": complete_extract_sync_draft_payload,
+            "observation_id": "navigation_topic_params",
+            "used_tool": "infer_navigation_topic_params_tool",
+        },
+    )
+    _invoke_tool(tools["finalize_extract_sync_plan_tool"], {})
+
+    resumed = _invoke_tool(tools["get_workflow_plan_draft_tool"], {})
+
+    assert resumed["ok"] is True
+    assert resumed["draft"]["scene_mode"] == "out"
+    assert resumed["draft"]["plan_phase"] == "finish_processing"
+    assert resumed["draft"]["next_required_observation"]["observation_id"] == "processing_state"
+    assert resumed["draft"]["next_tool_candidates"] == ["inspect_processing_state_tool"]
+
+
 def test_get_draft_without_existing_state_requires_initial_request():
     store = InMemoryNavigationPlanDraftStore()
     tools = _tools(store)
@@ -476,6 +520,35 @@ def test_finalize_success_persists_finalized_plan_for_same_session():
     assert result["draft"]["finalized_plan"]["date"] == "20270605"
     assert persisted_state.finalized_plan is not None
     assert persisted_state.finalized_plan.steps[0].step_id == "confirm_navigation_calibration_params"
+
+
+def test_finalize_finish_processing_plan_omits_extract_sync_steps():
+    store = InMemoryNavigationPlanDraftStore()
+    tools = _tools(store)
+    _invoke_tool(
+        tools["get_workflow_plan_draft_tool"],
+        {"date": "20270605", "scene_mode": "out"},
+    )
+    _invoke_tool(
+        tools["update_workflow_plan_draft_tool"],
+        {
+            "data_profile_patch": _complete_profile_patch(),
+            "observation_id": "navigation_processing_profile",
+            "used_tool": "infer_navigation_processing_profile_tool",
+        },
+    )
+
+    result = _invoke_tool(tools["finalize_finish_processing_plan_tool"], {})
+
+    assert result["ok"] is True
+    plan = result["workflow_plan_json"]
+    step_ids = [step["step_id"] for step in plan["steps"]]
+    assert plan["phase"] == "finish_processing"
+    assert "prepare_raw_data" not in step_ids
+    assert "extract_and_sync_navigation_data" not in step_ids
+    assert step_ids[0] == "confirm_navigation_calibration_params"
+    assert plan["steps"][1]["step_id"] == "assemble_finish_temp"
+    assert plan["steps"][1]["preconditions"] == ["confirm_navigation_calibration_params"]
 
 
 def test_finalize_rejects_plan_when_workflow_validation_fails(monkeypatch):
