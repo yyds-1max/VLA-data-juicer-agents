@@ -83,6 +83,8 @@ def build_navigation_task_tools(
             status=NavigationTaskStatus.PENDING,
             waiting_reason=None,
             next_required_input=None,
+            latest_web_session_id=web_session_id,
+            agentscope_session_id=session_id,
         )
         return {"ok": True, "task": _task_payload(task)}
 

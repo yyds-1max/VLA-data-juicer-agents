@@ -117,3 +117,41 @@ def test_update_navigation_task_scene_mode_tool_sets_finish_processing(
     assert result["task"]["scene_mode"] == "in"
     assert result["task"]["phase"] == NavigationTaskPhase.FINISH_PROCESSING.value
     assert result["task"]["status"] == NavigationTaskStatus.PENDING.value
+
+
+def test_resumable_task_can_be_claimed_from_new_web_session(tmp_path: Path):
+    root, store, first_tools = _tools(tmp_path)
+    created = _call(
+        first_tools["get_or_create_navigation_task_tool"],
+        date="20270623",
+        segments=None,
+        scene_mode=None,
+    )
+    _call(
+        first_tools["update_navigation_task_state_tool"],
+        task_id=created["task"]["task_id"],
+        phase="waiting_scene_mode",
+        status="waiting_user",
+        waiting_reason="scene_mode_required_after_extract_sync",
+        next_required_input="scene_mode",
+    )
+    second_tools = {
+        tool.name: tool
+        for tool in build_navigation_task_tools(
+            store=store,
+            session_id="agent-session-2",
+            web_session_id="web-session-2",
+            settings=NavigationSettings(vladatasets_root=root),
+        )
+    }
+
+    listed = _call(second_tools["list_resumable_navigation_tasks_tool"], date="20270623")
+    updated = _call(
+        second_tools["update_navigation_task_scene_mode_tool"],
+        task_id=listed["tasks"][0]["task_id"],
+        scene_mode="out",
+    )
+
+    assert updated["task"]["latest_web_session_id"] == "web-session-2"
+    assert updated["task"]["agentscope_session_id"] == "agent-session-2"
+    assert updated["task"]["scene_mode"] == "out"

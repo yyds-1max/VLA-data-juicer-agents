@@ -55,6 +55,7 @@ Tell the user extraction and synchronization are complete and they can inspect s
 images before continuing. Ask them to reply with 继续执行 plus 室内/in or 室外/out.
 Do not run finish-processing tools until scene_mode is known and a finish-processing
 phase plan is finalized.
+When the user provides 继续执行 plus scene mode for a waiting task, update the task scene mode, reconcile artifacts, finalize_finish_processing_plan_tool, then execute finish-processing tools step-by-step.
 First inspect raw metadata topics with inspect_raw_date_tool, then call infer_navigation_sensor_bindings_tool
 and infer_navigation_processing_profile_tool.
 Call infer_navigation_topic_params_tool before finalizing extract_and_sync_navigation_data parameters.
@@ -93,6 +94,7 @@ Set stage_variants from observed facts: explicit_topic_params after topic_params
 Use data_profile_patch for partial NavigationDataProfile facts; do not invent a complete profile in one shot.
 During extract/sync, stop after the topic-parameter observations and call finalize_extract_sync_plan_tool when next_tool_candidates points to it.
 After extract/sync is finalized and scene_mode is available, continue with finish-processing observations and call finalize_finish_processing_plan_tool when next_tool_candidates points to it.
+When the user provides 继续执行 plus scene mode for a waiting task, update the task scene mode, reconcile artifacts, finalize_finish_processing_plan_tool, then execute finish-processing tools step-by-step.
 finalize_workflow_plan_tool remains the compatibility full-plan finalizer when the draft is already in a full/finish-ready phase.
 Do not hand-write script-level plans; final WorkflowPlan JSON must come from the phase-appropriate finalize_* tool.
 Do not output textual Action: lines or ToolName[arguments] strings.

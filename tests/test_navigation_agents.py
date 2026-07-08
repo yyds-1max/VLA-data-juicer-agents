@@ -271,6 +271,9 @@ def test_navigation_agent_prompt_describes_two_phase_task_state_flow(monkeypatch
     assert "extract_sync" in agent.instructions
     assert "waiting_scene_mode" in agent.instructions
     assert "Do not run finish-processing tools until scene_mode is known" in agent.instructions
+    assert "When the user provides 继续执行 plus scene mode for a waiting task" in agent.instructions
+    assert "update the task scene mode, reconcile artifacts" in agent.instructions
+    assert "finalize_finish_processing_plan_tool" in agent.instructions
 
 
 def test_create_plan_agent_marks_finalize_draft_tools_as_mutating(monkeypatch):

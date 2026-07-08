@@ -1236,9 +1236,18 @@ def build_extra_agent_tools_factory(
                 agent_id=config.navigation_agent_id,
             )
             if runtime is not None:
-                return runtime._navigation_tools_for_session(
-                    web_session_id=web_session_id,
-                    agentscope_session_id=_session_id,
+                session_tools = getattr(runtime, "_navigation_tools_for_session", None)
+                if callable(session_tools):
+                    return session_tools(
+                        web_session_id=web_session_id,
+                        agentscope_session_id=_session_id,
+                    )
+                run_cancellation = getattr(runtime, "run_cancellation", None)
+                return build_navigation_agent_tools(
+                    dry_run=False,
+                    cancellation=run_cancellation(_session_id) if callable(run_cancellation) else None,
+                    session_id=_session_id,
+                    draft_store=draft_store,
                 )
             return build_navigation_agent_tools(
                 dry_run=False,

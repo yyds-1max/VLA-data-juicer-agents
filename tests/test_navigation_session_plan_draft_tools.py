@@ -322,6 +322,29 @@ def test_extract_sync_plan_finalizes_without_scene_mode(complete_extract_sync_dr
     ]
 
 
+def test_finish_processing_plan_requires_scene_mode(complete_extract_sync_draft_payload):
+    store = InMemoryNavigationPlanDraftStore()
+    tools = {
+        tool.name: tool
+        for tool in build_session_plan_draft_tools(store=store, session_id="session-a")
+    }
+    _invoke_tool(tools["get_workflow_plan_draft_tool"], {"date": "20270623"})
+    _invoke_tool(
+        tools["update_workflow_plan_draft_tool"],
+        {
+            "data_profile_patch": complete_extract_sync_draft_payload,
+            "observation_id": "navigation_topic_params",
+            "used_tool": "infer_navigation_topic_params_tool",
+        },
+    )
+
+    result = _invoke_tool(tools["finalize_finish_processing_plan_tool"], {})
+
+    assert result["ok"] is False
+    assert result["error_type"] == "finish_processing_plan_draft_incomplete"
+    assert "scene_mode" in result["missing_fields"]
+
+
 def test_get_workflow_plan_draft_advances_to_finish_processing_when_scene_mode_arrives_later(
     complete_extract_sync_draft_payload,
 ):

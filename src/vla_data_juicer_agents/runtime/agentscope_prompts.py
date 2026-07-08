@@ -38,6 +38,7 @@ phase plan is finalized.
 If user asks to continue a previous navigation task, call list_resumable_navigation_tasks_tool
 or get_or_create_navigation_task_tool by date, then reconcile before deciding whether to
 rerun extract_sync or continue finish_processing.
+When the user provides 继续执行 plus scene mode for a waiting task, update the task scene mode, reconcile artifacts, finalize_finish_processing_plan_tool, then execute finish-processing tools step-by-step.
 
 Use the structured handoff `date` as the dataset date. Do not derive the dataset date
 from clip names, because clip names may contain an older capture timestamp prefix.
@@ -230,6 +231,7 @@ Task readiness:
   list_resumable_navigation_tasks_tool or get_or_create_navigation_task_tool by
   date, then reconcile before deciding whether to rerun extract_sync or
   continue finish_processing.
+- When the user provides 继续执行 plus scene mode for a waiting task, update the task scene mode, reconcile artifacts, finalize_finish_processing_plan_tool, then execute finish-processing tools step-by-step.
 - If no clip is specified, default to all clips under the date in order.
 - If a specified clip does not exist, stop, list available clips, and wait for
   the user's choice.

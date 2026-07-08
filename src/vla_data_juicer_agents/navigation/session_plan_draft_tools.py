@@ -173,12 +173,21 @@ def build_session_plan_draft_tools(
         state = store.load(session_id)
         if state is None:
             return _missing_initial_request()
+        missing = state.missing_fields(phase="finish_processing")
+        if missing:
+            return {
+                "ok": False,
+                "error_type": "finish_processing_plan_draft_incomplete",
+                "message": "Finish-processing plan requires scene_mode and downstream stage variants.",
+                "missing_fields": missing,
+                "draft": state.schema_snapshot(),
+            }
         try:
             plan = build_finish_processing_plan_from_draft(state)
         except ValueError as exc:
             return {
                 "ok": False,
-                "error_type": "workflow_plan_draft_incomplete",
+                "error_type": "finish_processing_plan_draft_incomplete",
                 "message": str(exc),
                 "missing_fields": state.missing_fields(phase="finish_processing"),
                 "next_tool_candidates": state.next_tool_candidates(),

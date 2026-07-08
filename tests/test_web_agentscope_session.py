@@ -15,6 +15,7 @@ from vla_data_juicer_agents.navigation.routing import is_high_confidence_navigat
 from vla_data_juicer_agents.runtime.agentscope_config import AgentScopeRuntimeConfig
 import vla_data_juicer_agents.runtime.agentscope_runtime as agentscope_runtime_module
 from vla_data_juicer_agents.runtime.agentscope_runtime import AgentScopeRuntime
+from vla_data_juicer_agents.runtime.agentscope_prompts import navigation_agent_prompt
 from vla_data_juicer_agents.web.agent_session import AgentScopeWebSessionManager
 from vla_data_juicer_agents.web.schemas import HumanDecisionRequest, SessionRecord
 from vla_data_juicer_agents.web.session_store import WebSessionStore
@@ -364,6 +365,15 @@ def test_navigation_rule_fallback_is_narrow_and_explicit() -> None:
     assert not is_high_confidence_navigation_request("bug tracking")
     assert not is_high_confidence_navigation_request("database projection")
     assert not is_high_confidence_navigation_request("annotate this chart")
+
+
+def test_web_navigation_prompt_describes_cross_session_resume_gate() -> None:
+    prompt = navigation_agent_prompt()
+
+    assert "When the user provides 继续执行 plus scene mode for a waiting task" in prompt
+    assert "update the task scene mode, reconcile artifacts" in prompt
+    assert "finalize_finish_processing_plan_tool" in prompt
+    assert "finish-processing tools step-by-step" in prompt
 
 
 @pytest.mark.asyncio
