@@ -218,11 +218,11 @@ class SqliteNavigationTaskStore:
         if current is None:
             raise KeyError(task_id)
         payload = current.model_dump(mode="json")
-        payload.update({key: value for key, value in changes.items() if value is not None})
+        payload.update(changes)
         payload["updated_at"] = utc_now()
         task = NavigationTask.model_validate(payload)
         with self._connect() as connection:
-            self._replace_task(connection, task)
+            self._update_task(connection, task)
         return task
 
     def record_step(
@@ -301,9 +301,33 @@ class SqliteNavigationTaskStore:
             self._task_values(task),
         )
 
-    def _replace_task(self, connection: sqlite3.Connection, task: NavigationTask) -> None:
-        connection.execute("DELETE FROM navigation_tasks WHERE task_id = ?", (task.task_id,))
-        self._insert_task(connection, task)
+    def _update_task(self, connection: sqlite3.Connection, task: NavigationTask) -> None:
+        values = self._task_values(task)
+        connection.execute(
+            """
+            UPDATE navigation_tasks SET
+                date = ?,
+                segments_json = ?,
+                scene_mode = ?,
+                phase = ?,
+                status = ?,
+                waiting_reason = ?,
+                next_required_input = ?,
+                created_by_web_session_id = ?,
+                latest_web_session_id = ?,
+                agentscope_session_id = ?,
+                latest_run_id = ?,
+                last_completed_step = ?,
+                data_profile_json = ?,
+                artifact_snapshot_json = ?,
+                drift_json = ?,
+                schema_version = ?,
+                created_at = ?,
+                updated_at = ?
+            WHERE task_id = ?
+            """,
+            values[1:] + (values[0],),
+        )
 
     def _task_values(self, task: NavigationTask) -> tuple[Any, ...]:
         return (

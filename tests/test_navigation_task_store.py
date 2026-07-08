@@ -68,6 +68,49 @@ def test_task_store_lists_resumable_tasks(tmp_path: Path):
     assert [task.task_id for task in resumable] == [waiting.task_id]
 
 
+def test_task_store_can_update_task_after_recording_step(tmp_path: Path):
+    store = SqliteNavigationTaskStore(tmp_path / "navigation_tasks.sqlite")
+    task = store.create_or_update_task(date="20270623", segments=None, scene_mode=None)
+    store.record_step(
+        task_id=task.task_id,
+        phase=NavigationTaskPhase.EXTRACT_SYNC,
+        step_id="extract_and_sync_navigation_data",
+        tool_name="extract_and_sync_navigation_data",
+        status=NavigationTaskStatus.COMPLETED,
+    )
+
+    updated = store.update_task(
+        task.task_id,
+        status=NavigationTaskStatus.RUNNING,
+        latest_run_id="run-1",
+    )
+
+    assert updated.status == NavigationTaskStatus.RUNNING
+    assert updated.latest_run_id == "run-1"
+    assert [step.step_id for step in store.list_steps(task.task_id)] == [
+        "extract_and_sync_navigation_data"
+    ]
+
+
+def test_task_store_update_task_can_clear_optional_fields(tmp_path: Path):
+    store = SqliteNavigationTaskStore(tmp_path / "navigation_tasks.sqlite")
+    task = store.create_or_update_task(date="20270623", segments=None, scene_mode=None)
+    store.update_task(
+        task.task_id,
+        waiting_reason="awaiting scene mode",
+        next_required_input="scene_mode",
+    )
+
+    cleared = store.update_task(
+        task.task_id,
+        waiting_reason=None,
+        next_required_input=None,
+    )
+
+    assert cleared.waiting_reason is None
+    assert cleared.next_required_input is None
+
+
 def test_task_store_records_step_with_result_json(tmp_path: Path):
     store = SqliteNavigationTaskStore(tmp_path / "navigation_tasks.sqlite")
     task = store.create_or_update_task(date="20270623", segments=None, scene_mode=None)
