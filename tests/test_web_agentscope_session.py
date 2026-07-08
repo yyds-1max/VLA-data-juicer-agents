@@ -125,6 +125,19 @@ class HumanDecisionAgentScopeRuntime(FakeAgentScopeRuntime):
         return self.accepted
 
 
+class CapturingNavigationTaskRuntime:
+    def __init__(self) -> None:
+        self.started_tasks: list[dict[str, str]] = []
+        self.handoffs: list[dict] = []
+
+    async def start_navigation_agent_task(self, *, web_session_id: str, message: str) -> str:
+        self.started_tasks.append({"web_session_id": web_session_id, "message": message})
+        return "navigation-session-1"
+
+    def record_navigation_handoff(self, payload: dict) -> None:
+        self.handoffs.append(payload)
+
+
 class FakeAgentScopeMessageBus:
     _SESSION_EVENTS_KEY = "agentscope:session:events:{sid}"
 
@@ -549,6 +562,39 @@ async def test_runtime_start_navigation_agent_task_precreates_session_draft_from
     assert state.request.scene_mode == "out"
     assert state.request.segments == ["20260605_152856"]
     await chat_run_registry.drain()
+
+
+@pytest.mark.asyncio
+async def test_navigation_handoff_tool_allows_unknown_scene_mode() -> None:
+    runtime = CapturingNavigationTaskRuntime()
+    tool = agentscope_runtime_module.NavigationHandoffTool(
+        runtime=runtime,
+        web_session_id="web-1",
+    )
+
+    assert "scene_mode" not in tool.input_schema["required"]
+
+    result = await tool(
+        request="请处理 20270605 的导航数据",
+        target="20270605",
+        date="20270605",
+        scene_mode="unknown",
+        clips=[],
+        reason="用户给出了日期但未说明室内室外",
+        missing_fields=[],
+        confidence="high",
+        response_language="Chinese",
+    )
+    payload = agentscope_runtime_module._structured_handoff_payload_from_message(
+        runtime.started_tasks[0]["message"]
+    )
+
+    assert result.state == ToolResultState.SUCCESS
+    assert runtime.started_tasks[0]["web_session_id"] == "web-1"
+    assert payload["date"] == "20270605"
+    assert payload["scene_mode"] is None
+    assert payload["segments"] is None
+    assert runtime.handoffs[-1]["started"] is True
 
 
 @pytest.mark.asyncio

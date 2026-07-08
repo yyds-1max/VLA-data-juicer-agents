@@ -215,6 +215,24 @@ def test_get_draft_initializes_and_persists_request_without_segments():
     assert store.load("agent-session-1").date == "20270605"
 
 
+def test_get_workflow_plan_draft_allows_date_without_scene_mode_for_extract_sync():
+    store = InMemoryNavigationPlanDraftStore()
+    tools = {
+        tool.name: tool
+        for tool in build_session_plan_draft_tools(store=store, session_id="session-a")
+    }
+
+    result = _invoke_tool(
+        tools["get_workflow_plan_draft_tool"],
+        {"date": "20270623"},
+    )
+
+    assert result["ok"] is True
+    assert result["draft"]["date"] == "20270623"
+    assert result["draft"]["scene_mode"] is None
+    assert "scene_mode" not in result["draft"]["missing_fields"]
+
+
 def test_get_draft_without_existing_state_requires_initial_request():
     store = InMemoryNavigationPlanDraftStore()
     tools = _tools(store)
@@ -224,7 +242,7 @@ def test_get_draft_without_existing_state_requires_initial_request():
     assert result["ok"] is False
     assert result["error_type"] == "missing_initial_navigation_request"
     assert "date" in result["missing_fields"]
-    assert "scene_mode" in result["missing_fields"]
+    assert "scene_mode" not in result["missing_fields"]
 
 
 def test_update_persists_partial_patch_for_same_session():

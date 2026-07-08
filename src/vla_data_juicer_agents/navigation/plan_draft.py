@@ -111,8 +111,6 @@ class WorkflowPlanDraftState(BaseModel):
     def missing_fields(self) -> list[str]:
         draft = self.current_data_profile_draft()
         missing: list[str] = []
-        if draft.get("scene_mode") not in {"in", "out"}:
-            missing.append("scene_mode")
         processing_profile = draft.get("processing_profile")
         if not isinstance(processing_profile, dict) or not isinstance(processing_profile.get("id"), str):
             missing.append("processing_profile")
@@ -202,7 +200,7 @@ class WorkflowPlanDraftState(BaseModel):
         return {
             "date": data_profile_draft.get("date", self.date),
             "segments": data_profile_draft.get("segments"),
-            "scene_mode": data_profile_draft.get("scene_mode") or "<in|out>",
+            "scene_mode": data_profile_draft.get("scene_mode"),
             "processing_profile": self.processing_profile or "<processing_profile.id>",
             "platform_hint": self.platform_hint,
             "navigation_data_profile_schema": _navigation_data_profile_schema(),

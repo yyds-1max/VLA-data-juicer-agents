@@ -530,7 +530,7 @@ def test_plan_agent_update_tool_accepts_json_string_data_profile_patch(monkeypat
     assert "topic_params" in result["draft"]["missing_fields"]
 
 
-def test_plan_agent_draft_missing_fields_include_scene_mode():
+def test_plan_agent_draft_missing_fields_do_not_include_initial_scene_mode():
     state = WorkflowPlanDraftState(request=NavigationRequest(date="20270605", dry_run=True))
 
     update_result = state.update(
@@ -542,9 +542,9 @@ def test_plan_agent_draft_missing_fields_include_scene_mode():
     snapshot = state.schema_snapshot()
 
     assert update_result["ok"] is True
-    assert snapshot["scene_mode"] == "<in|out>"
-    assert "scene_mode" in state.missing_fields()
-    assert "scene_mode" in snapshot["missing_fields"]
+    assert snapshot["scene_mode"] is None
+    assert "scene_mode" not in state.missing_fields()
+    assert "scene_mode" not in snapshot["missing_fields"]
 
 
 def test_plan_agent_draft_finalize_requires_scene_mode(monkeypatch):
@@ -556,15 +556,13 @@ def test_plan_agent_draft_finalize_requires_scene_mode(monkeypatch):
     update_result = _invoke_tool(
         tools["update_workflow_plan_draft_tool"],
         {
-            "data_profile_patch": {
-                "processing_profile": {"id": "parameterized_navigation_v1", "platform_hint": "go2w"},
-                "platform_hint": "go2w",
-            }
+            "data_profile_patch": _complete_go2w_profile_patch()
         },
     )
 
-    assert update_result["ok"] is True
-    with pytest.raises(ValueError, match="NavigationDataProfile draft is incomplete.*scene_mode"):
+    assert update_result["ok"] is False
+    assert any("scene_mode" in error for error in update_result["validation_errors"])
+    with pytest.raises(ValueError, match="invalid profile fields"):
         _invoke_tool(tools["finalize_workflow_plan_tool"], {})
 
 

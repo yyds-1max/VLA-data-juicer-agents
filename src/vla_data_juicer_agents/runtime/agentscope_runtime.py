@@ -228,8 +228,13 @@ class AgentScopeRuntime:
         date = payload.get("date")
         scene_mode = payload.get("scene_mode")
         segments = payload.get("segments")
-        if not isinstance(date, str) or scene_mode not in {"in", "out"}:
+        if not isinstance(date, str):
             return
+        normalized_scene_mode = (
+            "in" if scene_mode in {"in", "indoor", "室内"}
+            else "out" if scene_mode in {"out", "outdoor", "室外"}
+            else None
+        )
         if segments is not None and not isinstance(segments, list):
             return
         normalized_segments = (
@@ -247,7 +252,7 @@ class AgentScopeRuntime:
             WorkflowPlanDraftState(
                 request=NavigationRequest(
                     date=date,
-                    scene_mode=scene_mode,
+                    scene_mode=normalized_scene_mode,
                     segments=normalized_segments,
                     dry_run=bool(payload.get("dry_run", False)),
                 )
@@ -886,8 +891,15 @@ def _handoff_error(message: str, payload: dict[str, Any]) -> ToolChunk:
     )
 
 
-def _navigation_scene_mode_for_request(scene_mode: str) -> str | None:
-    return {"indoor": "in", "outdoor": "out"}.get(scene_mode)
+def _navigation_scene_mode_for_request(scene_mode: str | None) -> str | None:
+    return {
+        "indoor": "in",
+        "in": "in",
+        "室内": "in",
+        "outdoor": "out",
+        "out": "out",
+        "室外": "out",
+    }.get(scene_mode or "")
 
 
 def _date_from_navigation_target(target: str) -> str | None:
@@ -927,13 +939,14 @@ def _navigation_handoff_message(
     request: str,
     target: str,
     date: str,
-    scene_mode: str,
+    scene_mode: str | None,
     clips: list[str],
     reason: str,
     response_language: str | None,
 ) -> str:
     clip_text = ", ".join(clips) if clips else "all"
     language = _resolve_response_language(response_language, request)
+    scene_mode_text = scene_mode or "unknown"
     payload = {
         "request": request,
         "target": target,
@@ -954,7 +967,7 @@ def _navigation_handoff_message(
                 "导航数据处理请求：",
                 f"- 用户原始请求: {request}",
                 f"- 处理目标: {target}",
-                f"- 场景模式: {scene_mode}",
+                f"- 场景模式: {scene_mode_text}",
                 f"- clips: {clip_text}",
                 f"- 转交原因: {reason}",
                 f"- 回复语言: {language}",
@@ -967,7 +980,7 @@ def _navigation_handoff_message(
             "Navigation data processing request:",
             f"- request: {request}",
             f"- target: {target}",
-            f"- scene_mode: {scene_mode}",
+            f"- scene_mode: {scene_mode_text}",
             f"- clips: {clip_text}",
             f"- reason: {reason}",
             f"- response_language: {language}",
@@ -1038,8 +1051,9 @@ class NavigationHandoffTool(ToolBase):
                 "type": "string",
                 "enum": ["indoor", "outdoor", "unknown"],
                 "description": (
-                    "Whether the navigation data is indoor or outdoor. Use unknown only "
-                    "with missing_fields when scene mode is not available."
+                    "Optional indoor/outdoor context. Use unknown or omit the field "
+                    "when scene mode is not available; missing or unknown scene mode "
+                    "must not block extract/sync."
                 ),
             },
             "clips": {
@@ -1055,9 +1069,12 @@ class NavigationHandoffTool(ToolBase):
                 "type": "array",
                 "items": {
                     "type": "string",
-                    "enum": ["request", "target", "date", "scene_mode", "clips", "other"],
+                    "enum": ["request", "target", "date", "clips", "other"],
                 },
-                "description": "Fields that are still missing. Must be empty before starting processing.",
+                "description": (
+                    "Fields that are still missing. Do not include scene_mode; only "
+                    "date/path/target style gaps should block handoff."
+                ),
             },
             "confidence": {
                 "type": "string",
@@ -1073,7 +1090,6 @@ class NavigationHandoffTool(ToolBase):
             "request",
             "target",
             "date",
-            "scene_mode",
             "clips",
             "reason",
             "missing_fields",
@@ -1105,21 +1121,22 @@ class NavigationHandoffTool(ToolBase):
         request: str,
         target: str,
         date: str,
-        scene_mode: str,
         reason: str,
         missing_fields: list[str],
         confidence: str,
         response_language: str | None = None,
         clips: list[str] | None = None,
+        scene_mode: str | None = None,
     ) -> ToolChunk:
         normalized_clips = list(clips or [])
         normalized_language = _resolve_response_language(response_language, request)
+        normalized_scene_mode = scene_mode if scene_mode in {"indoor", "outdoor"} else "unknown"
         payload = {
             "web_session_id": self._web_session_id,
             "request": request,
             "target": target,
             "date": date,
-            "scene_mode": scene_mode,
+            "scene_mode": normalized_scene_mode,
             "clips": normalized_clips,
             "reason": reason,
             "missing_fields": list(missing_fields),
@@ -1149,18 +1166,12 @@ class NavigationHandoffTool(ToolBase):
                 "Navigation handoff rejected because date must be a YYYYMMDD dataset date.",
                 payload,
             )
-        if scene_mode not in {"indoor", "outdoor"}:
-            self._record_handoff(payload)
-            return _handoff_error(
-                "Navigation handoff rejected because scene_mode must be indoor or outdoor.",
-                payload,
-            )
 
         navigation_request = _navigation_handoff_message(
             request=request,
             target=target,
             date=date.strip(),
-            scene_mode=scene_mode,
+            scene_mode=normalized_scene_mode,
             clips=normalized_clips,
             reason=reason,
             response_language=normalized_language,

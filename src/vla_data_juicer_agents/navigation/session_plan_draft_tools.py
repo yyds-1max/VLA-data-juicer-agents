@@ -148,12 +148,13 @@ def _initial_state(
     date: str | None,
     scene_mode: str | None,
 ) -> WorkflowPlanDraftState | None:
-    if not date or scene_mode not in {"in", "out"}:
+    if not date:
         return None
+    normalized_scene_mode = scene_mode if scene_mode in {"in", "out"} else None
     return WorkflowPlanDraftState(
         request=NavigationRequest(
             date=date,
-            scene_mode=scene_mode,
+            scene_mode=normalized_scene_mode,
         )
     )
 
@@ -164,9 +165,10 @@ def _missing_initial_request() -> dict[str, Any]:
         "error_type": "missing_initial_navigation_request",
         "message": (
             "No workflow plan draft exists for this AgentScope session. "
-            "Call get_workflow_plan_draft_tool with date and scene_mode first."
+            "Call get_workflow_plan_draft_tool with date first. "
+            "scene_mode is optional for extract-sync."
         ),
-        "missing_fields": ["date", "scene_mode"],
+        "missing_fields": ["date"],
         "next_tool_candidates": ["get_workflow_plan_draft_tool"],
     }
 
