@@ -118,8 +118,12 @@ class AgentScopeRuntime:
     async def submit_user_message(self, *, web_session_id: str, message: str) -> str:
         await self.ensure_bootstrapped()
 
-        agent_id = self.config.main_router_agent_id
-        model = self.config.router_model
+        agent_id = self._agent_id_for_user_message(web_session_id=web_session_id)
+        model = (
+            self.config.navigation_model
+            if agent_id == self.config.navigation_agent_id
+            else self.config.router_model
+        )
         await self._start_agent_run(
             web_session_id=web_session_id,
             agent_id=agent_id,
@@ -127,6 +131,12 @@ class AgentScopeRuntime:
             message=message,
         )
         return f"turn_{uuid4()}"
+
+    def _agent_id_for_user_message(self, *, web_session_id: str) -> str:
+        mapped = self._web_session_mapping(web_session_id)
+        if mapped is not None and mapped[0] == self.config.navigation_agent_id:
+            return self.config.navigation_agent_id
+        return self.config.main_router_agent_id
 
     async def start_navigation_agent_task(self, *, web_session_id: str, message: str) -> str:
         await self.ensure_bootstrapped()

@@ -448,7 +448,7 @@ def infer_navigation_processing_profile(
         platform_hint=platform_hint,
         sensor_bindings=sensor_bindings,
         topic_params=NavigationTopicParams(
-            profile_hint=platform_hint,
+            profile_hint=_topic_params_profile_hint(topic_whitelist),
             confidence=1.0 if not blocking_issues else 0.0,
             topic_whitelist=topic_whitelist,
             topic_map=topic_map,

@@ -381,6 +381,7 @@ rosbag2_bagfile_information:
     result = infer_navigation_processing_profile("20270606", settings=settings)
 
     assert result.platform_hint == "unknown"
+    assert result.topic_params.profile_hint == "hybrid"
     assert result.topic_params.topic_whitelist == [
         "/cam_video5/csi_cam/image_raw/compressed",
         "/lidar_points",

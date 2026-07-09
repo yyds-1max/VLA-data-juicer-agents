@@ -383,7 +383,7 @@ def test_plan_agent_processing_profile_tool_accepts_empty_segments_string(tmp_pa
 
     assert result["id"] == "parameterized_navigation_v1"
     assert result["platform_hint"] == "go2w"
-    assert result["topic_params"]["profile_hint"] == "go2w"
+    assert result["topic_params"]["profile_hint"] == "go2w_like"
     assert result["localization_policy"] == {"source": "odom", "conversion": "odom_to_ins"}
 
 
@@ -395,7 +395,7 @@ def test_plan_agent_processing_profile_tool_accepts_json_segments_string(tmp_pat
 
     assert result["id"] == "parameterized_navigation_v1"
     assert result["platform_hint"] == "go2w"
-    assert result["topic_params"]["profile_hint"] == "go2w"
+    assert result["topic_params"]["profile_hint"] == "go2w_like"
 
 
 def test_plan_agent_draft_tools_finalize_internal_workflow_plan(monkeypatch):

@@ -563,6 +563,30 @@ async def test_runtime_start_navigation_agent_task_switches_mapping_and_spawns_n
 
 
 @pytest.mark.asyncio
+async def test_runtime_submit_user_message_routes_to_active_navigation_agent_after_handoff() -> None:
+    chat_run_registry = FakeChatRunRegistry()
+    runtime = _runtime(chat_run_registry=chat_run_registry)
+
+    await runtime.submit_user_message(web_session_id="web-1", message="处理 20270623 的导航数据")
+    await chat_run_registry.drain()
+    await runtime.start_navigation_agent_task(
+        web_session_id="web-1",
+        message="处理 20270623 的导航数据",
+    )
+    await chat_run_registry.drain()
+
+    await runtime.submit_user_message(web_session_id="web-1", message="继续执行 室内")
+
+    assert runtime.web_sessions == {"web-1": ("navigation-data-agent", "web-1__navigation-data-agent")}
+    assert [spawn["session_id"] for spawn in chat_run_registry.spawns][-1] == "web-1__navigation-data-agent"
+    await chat_run_registry.drain()
+    run = runtime.app.state.chat_service.runs[-1]
+    assert run["session_id"] == "web-1__navigation-data-agent"
+    assert run["agent_id"] == "navigation-data-agent"
+    assert _message_text(run["message"]) == "继续执行 室内"
+
+
+@pytest.mark.asyncio
 async def test_runtime_start_navigation_agent_task_precreates_session_draft_from_handoff(
     tmp_path: Path,
 ) -> None:
