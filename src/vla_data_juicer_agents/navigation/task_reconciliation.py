@@ -216,6 +216,17 @@ def reconcile_navigation_task(
         )
         return NavigationTask.model_validate(payload)
 
+    if (
+        task.phase == NavigationTaskPhase.FINISH_PROCESSING
+        and _has_partial_final_artifacts(snapshot)
+        and task.status in {
+            NavigationTaskStatus.PENDING,
+            NavigationTaskStatus.RUNNING,
+        }
+    ):
+        payload["drift"] = None
+        return NavigationTask.model_validate(payload)
+
     if task.phase == NavigationTaskPhase.FINISH_PROCESSING and _has_partial_final_artifacts(snapshot):
         payload.update(
             {

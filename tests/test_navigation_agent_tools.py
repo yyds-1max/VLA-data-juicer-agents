@@ -705,6 +705,90 @@ def test_finish_processing_gate_blocks_when_sync_data_deleted_after_snapshot(
     assert "complete sync_data for selected segments" in result["missing_fields"]
 
 
+def test_finish_processing_gate_allows_running_task_with_finish_temp_partial_artifacts(
+    monkeypatch,
+    tmp_path,
+):
+    root = tmp_path / "VLADatasets"
+    (
+        root
+        / "clip_data"
+        / "20270623"
+        / "segment_a"
+        / "sync_data"
+        / "clip_0"
+        / "fisheye_front"
+    ).mkdir(parents=True)
+    (root / "finish_data" / "20270623_temp" / "samples" / "20270623").mkdir(parents=True)
+    (root / "finish_data" / "20270623_temp" / "samples" / "20270623" / "sample.jpg").write_bytes(b"jpg")
+    store = InMemoryNavigationPlanDraftStore()
+    task_store = SqliteNavigationTaskStore(tmp_path / "tasks.sqlite")
+    task = task_store.create_or_update_task(
+        date="20270623",
+        segments=["segment_a"],
+        scene_mode="in",
+        web_session_id="web-session",
+        agentscope_session_id="agent-session",
+    )
+    task_store.update_task(
+        task.task_id,
+        phase=NavigationTaskPhase.FINISH_PROCESSING,
+        status=NavigationTaskStatus.RUNNING,
+        artifact_snapshot=NavigationArtifactSnapshot(
+            date="20270623",
+            segments=["segment_a"],
+            sync_data_exists=True,
+            sync_data_by_segment={"segment_a": True},
+        ).model_dump(mode="json"),
+    )
+
+    def fake_run_noobscene_preprocessing_tool(date: str, segments: list[str] | None = None) -> dict:
+        return {"ok": True, "tool_name": "run_noobscene_preprocessing", "date": date, "segments": segments}
+
+    monkeypatch.setattr(
+        agent_tools_module,
+        "create_navigation_execution_tools",
+        lambda **_: [
+            FunctionTool(
+                fake_run_noobscene_preprocessing_tool,
+                name="run_noobscene_preprocessing_tool",
+                is_read_only=False,
+            )
+        ],
+    )
+    state = WorkflowPlanDraftState(
+        request=NavigationRequest(
+            date="20270623",
+            scene_mode="in",
+            segments=["segment_a"],
+        )
+    )
+    state.finalized_plan = WorkflowPlan(date="20270623", phase="finish_processing", steps=[])
+    store.save("agent-session", state)
+    tools = {
+        tool.name: tool
+        for tool in build_navigation_agent_tools(
+            session_id="agent-session",
+            draft_store=store,
+            task_store=task_store,
+            web_session_id="web-session",
+            settings=agent_tools_module.NavigationSettings(vladatasets_root=root),
+            dry_run=True,
+        )
+    }
+
+    result = _decode_tool_payload(
+        asyncio.run(
+            tools["run_noobscene_preprocessing_tool"](
+                date="20270623",
+                segments=["segment_a"],
+            )
+        )
+    )
+
+    assert result["ok"] is True
+
+
 def test_resume_finish_gate_rejects_extract_tools_and_allows_finish_tools(
     monkeypatch,
     tmp_path,

@@ -151,7 +151,7 @@ def test_reconcile_completed_missing_final_outputs_marks_needs_reconcile(tmp_pat
     assert reconciled.drift.type == "missing_expected_artifact"
 
 
-def test_reconcile_finish_processing_partial_final_artifacts_marks_needs_reconcile(
+def test_reconcile_running_finish_processing_keeps_partial_final_artifacts_non_blocking(
     tmp_path: Path,
 ):
     root = tmp_path / "VLADatasets"
@@ -167,6 +167,28 @@ def test_reconcile_finish_processing_partial_final_artifacts_marks_needs_reconci
     reconciled = reconcile_navigation_task(task, settings=settings)
 
     assert reconciled.phase == NavigationTaskPhase.FINISH_PROCESSING
+    assert reconciled.status == NavigationTaskStatus.RUNNING
+    assert reconciled.drift is None
+    assert reconciled.artifact_snapshot.final_outputs_exist is True
+    assert reconciled.artifact_snapshot.final_grid_map_exists is False
+
+
+def test_reconcile_completed_partial_final_artifacts_marks_needs_reconcile(
+    tmp_path: Path,
+):
+    root = tmp_path / "VLADatasets"
+    (root / "finish_data" / "20270623" / "segment_a" / "clip_a").mkdir(parents=True)
+    settings = NavigationSettings(vladatasets_root=root)
+    task = NavigationTask(
+        task_id="nav-1",
+        date="20270623",
+        phase=NavigationTaskPhase.COMPLETED,
+        status=NavigationTaskStatus.COMPLETED,
+    )
+
+    reconciled = reconcile_navigation_task(task, settings=settings)
+
+    assert reconciled.phase == NavigationTaskPhase.COMPLETED
     assert reconciled.status == NavigationTaskStatus.NEEDS_RECONCILE
     assert reconciled.drift is not None
     assert reconciled.drift.type == "partial_artifact"
