@@ -4,7 +4,7 @@ import asyncio
 import inspect
 import logging
 import os
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, suppress
 from pathlib import Path
 from typing import Any
 
@@ -78,7 +78,22 @@ def create_app(
             return
 
         async with agentscope_runtime.app.router.lifespan_context(agentscope_runtime.app):
-            yield
+            recovery_loop = getattr(agentscope_runtime, "run_agent_wakeup_recovery_loop", None)
+            recovery_task = (
+                asyncio.create_task(
+                    recovery_loop(),
+                    name="agentscope-wakeup-recovery",
+                )
+                if callable(recovery_loop)
+                else None
+            )
+            try:
+                yield
+            finally:
+                if recovery_task is not None:
+                    recovery_task.cancel()
+                    with suppress(asyncio.CancelledError):
+                        await recovery_task
 
     app = FastAPI(title="DataPilot Web API", lifespan=lifespan)
     app.state.store = store

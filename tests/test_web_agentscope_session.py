@@ -148,14 +148,23 @@ class FakeAgentScopeMessageBus:
         replay_events: list[tuple[str, dict]] | None = None,
         live_events: list[dict] | None = None,
         running_states: list[bool] | None = None,
+        wakeups: list[dict] | None = None,
+        dequeue_failures: int = 0,
+        inbox_session_ids: list[str] | None = None,
+        inbox_residual_count: int | None = None,
     ) -> None:
         self.replay_events = replay_events or []
         self.live_events = live_events or []
         self.running_states = running_states or []
+        self.wakeups = wakeups or []
+        self.dequeue_failures = dequeue_failures
+        self.inbox_session_ids = inbox_session_ids or []
+        self._inbox_residual_count = inbox_residual_count
         self.read_sessions: list[str] = []
         self.read_since: list[str | None] = []
         self.subscribe_keys: list[str] = []
         self.cancelled_sessions: list[str] = []
+        self.dequeue_calls = 0
 
     async def session_read_events(self, session_id: str, since=None):
         self.read_sessions.append(session_id)
@@ -186,6 +195,26 @@ class FakeAgentScopeMessageBus:
 
     async def session_publish_cancel(self, session_id: str) -> None:
         self.cancelled_sessions.append(session_id)
+
+    async def dequeue_wakeups(self, max_count: int = 64):
+        self.dequeue_calls += 1
+        if self.dequeue_failures > 0:
+            self.dequeue_failures -= 1
+            raise TimeoutError("redis timeout")
+        batch = self.wakeups[:max_count]
+        self.wakeups = self.wakeups[max_count:]
+        return batch
+
+    async def list_inbox_session_ids(self):
+        return list(self.inbox_session_ids)
+
+    async def wakeup_queue_length(self):
+        return len(self.wakeups)
+
+    async def inbox_residual_count(self):
+        if self._inbox_residual_count is not None:
+            return self._inbox_residual_count
+        return len(self.inbox_session_ids)
 
 
 class DelayedLiveEventMessageBus(FakeAgentScopeMessageBus):
@@ -1099,6 +1128,101 @@ async def test_runtime_submit_human_decision_recovers_mapping_after_restart(tmp_
     }
     assert [spawn["session_id"] for spawn in chat_run_registry.spawns] == ["as-session-1"]
     await chat_run_registry.drain()
+
+
+@pytest.mark.asyncio
+async def test_runtime_recovers_wakeup_after_transient_dequeue_timeout() -> None:
+    storage = FakeAgentScopeStorage()
+    storage.session_records[("alice", "navigation-data-agent", "as-session-1")] = (
+        _agentscope_session_record()
+    )
+    message_bus = FakeAgentScopeMessageBus(
+        wakeups=[
+            {
+                "user_id": "alice",
+                "agent_id": "navigation-data-agent",
+                "session_id": "as-session-1",
+            }
+        ],
+        dequeue_failures=1,
+    )
+    chat_run_registry = FakeChatRunRegistry()
+    runtime = _runtime(
+        storage=storage,
+        chat_run_registry=chat_run_registry,
+        message_bus=message_bus,
+    )
+
+    recovered = await runtime.recover_pending_agent_wakeups_once(retry_delays=(0,))
+
+    assert recovered == 1
+    assert message_bus.dequeue_calls == 2
+    assert [spawn["session_id"] for spawn in chat_run_registry.spawns] == ["as-session-1"]
+    await chat_run_registry.drain()
+    assert runtime.app.state.chat_service.runs == [
+        {
+            "user_id": "alice",
+            "session_id": "as-session-1",
+            "agent_id": "navigation-data-agent",
+            "message": None,
+        }
+    ]
+    assert runtime.recovery_metrics.redis_timeout_count == 1
+
+
+@pytest.mark.asyncio
+async def test_runtime_recovers_orphan_inbox_for_idle_mapped_session(tmp_path: Path) -> None:
+    store = WebSessionStore(tmp_path / "sessions.sqlite")
+    web_session = store.create_session("处理导航数据")
+    store.save_agentscope_session_mapping(
+        web_session.id,
+        agent_id="navigation-data-agent",
+        agentscope_session_id="as-session-1",
+    )
+    storage = FakeAgentScopeStorage()
+    storage.session_records[("alice", "navigation-data-agent", "as-session-1")] = (
+        _agentscope_session_record()
+    )
+    message_bus = FakeAgentScopeMessageBus(inbox_session_ids=["as-session-1"])
+    chat_run_registry = FakeChatRunRegistry()
+    runtime = _runtime(
+        storage=storage,
+        chat_run_registry=chat_run_registry,
+        message_bus=message_bus,
+    )
+    runtime.set_web_session_store(store)
+
+    recovered = await runtime.recover_orphan_agent_inboxes_once()
+
+    assert recovered == 1
+    assert runtime.web_sessions == {
+        web_session.id: ("navigation-data-agent", "as-session-1")
+    }
+    assert [spawn["session_id"] for spawn in chat_run_registry.spawns] == ["as-session-1"]
+    await chat_run_registry.drain()
+    assert runtime.app.state.chat_service.runs[0]["message"] is None
+
+
+@pytest.mark.asyncio
+async def test_runtime_records_wakeup_recovery_diagnostics() -> None:
+    message_bus = FakeAgentScopeMessageBus(
+        wakeups=[
+            {"user_id": "alice", "agent_id": "navigation-data-agent", "session_id": "as-1"},
+            {"user_id": "alice", "agent_id": "navigation-data-agent", "session_id": "as-2"},
+        ],
+        inbox_session_ids=["as-1", "as-2", "as-3"],
+        inbox_residual_count=7,
+    )
+    runtime = _runtime(
+        chat_run_registry=FakeChatRunRegistry(),
+        message_bus=message_bus,
+    )
+
+    await runtime.record_recovery_diagnostics_once(event_loop_lag_seconds=0.125)
+
+    assert runtime.recovery_metrics.wakeup_queue_length == 2
+    assert runtime.recovery_metrics.inbox_residual_count == 7
+    assert runtime.recovery_metrics.event_loop_lag_seconds == 0.125
 
 
 @pytest.mark.asyncio

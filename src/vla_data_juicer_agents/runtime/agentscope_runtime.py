@@ -32,10 +32,22 @@ from vla_data_juicer_agents.runtime.agentscope_config import AgentScopeRuntimeCo
 
 _EVENT_STARTUP_GRACE_SECS = 1.0
 _EVENT_IDLE_POLL_SECS = 0.03
+_WAKEUP_RECOVERY_INTERVAL_SECS = 5.0
+_WAKEUP_RECOVERY_RETRY_DELAYS = (0.2, 1.0)
 _HUMAN_DECISION_TOOL_NAMES = {
     "request_human_decision",
 }
 _logger = logging.getLogger(__name__)
+
+
+@dataclass
+class AgentScopeRecoveryMetrics:
+    redis_timeout_count: int = 0
+    wakeup_queue_length: int | None = None
+    inbox_residual_count: int | None = None
+    event_loop_lag_seconds: float | None = None
+    recovered_wakeup_runs: int = 0
+    recovered_orphan_inbox_runs: int = 0
 
 
 @dataclass
@@ -50,6 +62,7 @@ class AgentScopeRuntime:
     web_session_store: Any | None = None
     _active_human_decision_claims: set[str] = field(default_factory=set)
     _run_cancellations: dict[str, CancellationContext] = field(default_factory=dict)
+    recovery_metrics: AgentScopeRecoveryMetrics = field(default_factory=AgentScopeRecoveryMetrics)
     bootstrapped: bool = False
 
     def __post_init__(self) -> None:
@@ -427,6 +440,258 @@ class AgentScopeRuntime:
         except Exception:
             run_coroutine.close()
             raise
+
+    async def recover_pending_agent_wakeups_once(
+        self,
+        *,
+        max_count: int = 64,
+        retry_delays: tuple[float, ...] = _WAKEUP_RECOVERY_RETRY_DELAYS,
+    ) -> int:
+        """Drain AgentScope wakeups with short retry and wake idle sessions."""
+        dequeue_wakeups = getattr(self.message_bus, "dequeue_wakeups", None)
+        if not callable(dequeue_wakeups):
+            return 0
+        try:
+            wakeups = await _retry_async(
+                lambda: dequeue_wakeups(max_count=max_count),
+                retry_delays=retry_delays,
+                operation="dequeue AgentScope wakeups",
+                on_retry=self._record_redis_retry,
+            )
+        except Exception:
+            _logger.exception("AgentScope wakeup recovery: dequeue failed after retries.")
+            return 0
+
+        recovered = 0
+        for payload in wakeups:
+            if not isinstance(payload, dict):
+                continue
+            user_id = payload.get("user_id")
+            session_id = payload.get("session_id")
+            agent_id = payload.get("agent_id")
+            if not (
+                isinstance(user_id, str)
+                and isinstance(session_id, str)
+                and isinstance(agent_id, str)
+            ):
+                continue
+            if await self._spawn_idle_agent_run(
+                user_id=user_id,
+                session_id=session_id,
+                agent_id=agent_id,
+                source="wakeup_recovery",
+            ):
+                recovered += 1
+        self.recovery_metrics.recovered_wakeup_runs += recovered
+        return recovered
+
+    async def recover_orphan_agent_inboxes_once(self) -> int:
+        """Wake idle mapped AgentScope sessions that still have inbox entries."""
+        session_ids = await self._pending_inbox_session_ids()
+        recovered = 0
+        for session_id in session_ids:
+            agent_id = self._agent_id_for_agentscope_session(session_id)
+            if agent_id is None:
+                continue
+            if await self._spawn_idle_agent_run(
+                user_id=self.config.user_id,
+                session_id=session_id,
+                agent_id=agent_id,
+                source="orphan_inbox_recovery",
+            ):
+                recovered += 1
+        self.recovery_metrics.recovered_orphan_inbox_runs += recovered
+        return recovered
+
+    async def record_recovery_diagnostics_once(
+        self,
+        *,
+        event_loop_lag_seconds: float,
+    ) -> AgentScopeRecoveryMetrics:
+        wakeup_queue_length = await self._wakeup_queue_length()
+        inbox_residual_count = await self._inbox_residual_count()
+        self.recovery_metrics.wakeup_queue_length = wakeup_queue_length
+        self.recovery_metrics.inbox_residual_count = inbox_residual_count
+        self.recovery_metrics.event_loop_lag_seconds = event_loop_lag_seconds
+        _logger.info(
+            "AgentScope recovery diagnostics: redis_timeouts=%d "
+            "wakeup_queue_length=%s inbox_residual_count=%s "
+            "event_loop_lag_seconds=%.3f recovered_wakeup_runs=%d "
+            "recovered_orphan_inbox_runs=%d",
+            self.recovery_metrics.redis_timeout_count,
+            wakeup_queue_length,
+            inbox_residual_count,
+            event_loop_lag_seconds,
+            self.recovery_metrics.recovered_wakeup_runs,
+            self.recovery_metrics.recovered_orphan_inbox_runs,
+        )
+        return self.recovery_metrics
+
+    async def run_agent_wakeup_recovery_loop(
+        self,
+        *,
+        interval_secs: float = _WAKEUP_RECOVERY_INTERVAL_SECS,
+    ) -> None:
+        """Periodically recover stranded AgentScope wakeups and inbox entries."""
+        loop = asyncio.get_running_loop()
+        expected_wakeup = loop.time()
+        while True:
+            now = loop.time()
+            event_loop_lag_seconds = max(0.0, now - expected_wakeup)
+            try:
+                await self.record_recovery_diagnostics_once(
+                    event_loop_lag_seconds=event_loop_lag_seconds,
+                )
+                await self.recover_pending_agent_wakeups_once()
+                await self.recover_orphan_agent_inboxes_once()
+            except Exception:
+                _logger.exception("AgentScope wakeup recovery loop failed.")
+            expected_wakeup = loop.time() + interval_secs
+            await asyncio.sleep(interval_secs)
+
+    def _record_redis_retry(self, exc: BaseException, _attempt: int) -> None:
+        if _looks_like_timeout_error(exc):
+            self.recovery_metrics.redis_timeout_count += 1
+
+    async def _spawn_idle_agent_run(
+        self,
+        *,
+        user_id: str,
+        session_id: str,
+        agent_id: str,
+        source: str,
+    ) -> bool:
+        if await self.message_bus.session_is_running(session_id):
+            return False
+        if self._is_local_agent_run_active(session_id):
+            return False
+
+        get_session = getattr(self.storage, "get_session", None)
+        if callable(get_session):
+            record = await get_session(user_id, agent_id, session_id)
+            if record is None:
+                return False
+
+        try:
+            self._spawn_chat_run(
+                self.app.state.chat_service.run(
+                    user_id=user_id,
+                    session_id=session_id,
+                    agent_id=agent_id,
+                    input_msg=None,
+                ),
+                session_id=session_id,
+            )
+        except RuntimeError:
+            _logger.debug(
+                "AgentScope wakeup recovery skipped duplicate run: "
+                "session_id=%s source=%s",
+                session_id,
+                source,
+            )
+            return False
+        _logger.info(
+            "AgentScope wakeup recovery spawned idle session run: "
+            "session_id=%s agent_id=%s source=%s",
+            session_id,
+            agent_id,
+            source,
+        )
+        return True
+
+    async def _pending_inbox_session_ids(self) -> list[str]:
+        list_inbox_session_ids = getattr(self.message_bus, "list_inbox_session_ids", None)
+        if callable(list_inbox_session_ids):
+            return [
+                session_id
+                for session_id in await list_inbox_session_ids()
+                if isinstance(session_id, str) and session_id
+            ]
+
+        get_client = getattr(self.message_bus, "get_client", None)
+        if not callable(get_client):
+            return []
+        client = get_client()
+        if client is None:
+            return []
+        template = str(getattr(self.message_bus, "_INBOX_KEY", "agentscope:inbox:{sid}"))
+        try:
+            match_key = template.format(sid="*")
+        except KeyError:
+            return []
+
+        session_ids: list[str] = []
+        async for raw_key in client.scan_iter(match=match_key, count=100):
+            key = raw_key.decode() if isinstance(raw_key, bytes) else str(raw_key)
+            try:
+                pending = int(await client.xlen(key))
+            except Exception:
+                _logger.exception("AgentScope orphan inbox recovery: XLEN failed for %s.", key)
+                continue
+            if pending <= 0:
+                continue
+            session_id = _session_id_from_inbox_key(key, template)
+            if session_id is not None:
+                session_ids.append(session_id)
+        return session_ids
+
+    async def _wakeup_queue_length(self) -> int | None:
+        queue_length = getattr(self.message_bus, "wakeup_queue_length", None)
+        if callable(queue_length):
+            return int(await queue_length())
+        get_client = getattr(self.message_bus, "get_client", None)
+        if not callable(get_client):
+            return None
+        client = get_client()
+        if client is None:
+            return None
+        key = str(getattr(self.message_bus, "_WAKEUP_QUEUE_KEY", "agentscope:wakeups"))
+        return int(await client.xlen(key))
+
+    async def _inbox_residual_count(self) -> int | None:
+        residual_count = getattr(self.message_bus, "inbox_residual_count", None)
+        if callable(residual_count):
+            return int(await residual_count())
+        get_client = getattr(self.message_bus, "get_client", None)
+        if not callable(get_client):
+            return None
+        client = get_client()
+        if client is None:
+            return None
+        template = str(getattr(self.message_bus, "_INBOX_KEY", "agentscope:inbox:{sid}"))
+        try:
+            match_key = template.format(sid="*")
+        except KeyError:
+            return None
+        total = 0
+        async for raw_key in client.scan_iter(match=match_key, count=100):
+            key = raw_key.decode() if isinstance(raw_key, bytes) else str(raw_key)
+            total += int(await client.xlen(key))
+        return total
+
+    def _agent_id_for_agentscope_session(self, agentscope_session_id: str) -> str | None:
+        if self.web_session_store is not None:
+            get_mapping = getattr(
+                self.web_session_store,
+                "get_agentscope_session_mapping_by_agentscope_session",
+                None,
+            )
+            if callable(get_mapping):
+                mapping = get_mapping(agentscope_session_id)
+                if mapping is not None:
+                    self.web_sessions[mapping.web_session_id] = (
+                        mapping.agent_id,
+                        mapping.agentscope_session_id,
+                    )
+                    return mapping.agent_id
+
+        for agent_id in (
+            self.config.navigation_agent_id,
+            self.config.main_router_agent_id,
+        ):
+            if agentscope_session_id.endswith(f"__{agent_id}"):
+                return agent_id
+        return None
 
     async def _event_log_tail_cursor(self, agentscope_session_id: str) -> str | None:
         read_events = getattr(self.message_bus, "session_read_events", None)
@@ -878,6 +1143,52 @@ def _session_events_key(message_bus: Any, session_id: str) -> str:
         "agentscope:session:events:{sid}",
     )
     return str(template).format(sid=session_id)
+
+
+async def _retry_async(
+    operation_factory: Any,
+    *,
+    retry_delays: tuple[float, ...],
+    operation: str,
+    on_retry: Any | None = None,
+) -> Any:
+    for attempt in range(len(retry_delays) + 1):
+        try:
+            return await operation_factory()
+        except Exception as exc:
+            if attempt >= len(retry_delays):
+                raise
+            delay = retry_delays[attempt]
+            if callable(on_retry):
+                on_retry(exc, attempt + 1)
+            _logger.warning(
+                "Retrying %s after transient failure: attempt=%d delay=%.2fs",
+                operation,
+                attempt + 1,
+                delay,
+                exc_info=True,
+            )
+            if delay > 0:
+                await asyncio.sleep(delay)
+    raise RuntimeError("unreachable retry state")
+
+
+def _looks_like_timeout_error(exc: BaseException) -> bool:
+    return isinstance(exc, TimeoutError) or "Timeout" in type(exc).__name__
+
+
+def _session_id_from_inbox_key(key: str, template: str) -> str | None:
+    marker = "{sid}"
+    if marker not in template:
+        return None
+    prefix, suffix = template.split(marker, 1)
+    if not key.startswith(prefix):
+        return None
+    if suffix and not key.endswith(suffix):
+        return None
+    end = len(key) - len(suffix) if suffix else len(key)
+    session_id = key[len(prefix):end]
+    return session_id or None
 
 
 def _strip_internal_event_fields(event: dict[str, Any]) -> dict[str, Any]:
