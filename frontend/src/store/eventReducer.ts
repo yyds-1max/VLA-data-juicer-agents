@@ -138,12 +138,18 @@ export function applyAgentEvent(state: RunState, event: AgentEvent): void {
   }
 
   if (type === "human_decision_required") {
-    state.pendingHumanDecision = {
+    const nextDecision = {
       replyId: normalizeText(payload.reply_id) || normalizeText(payload.replyId),
       toolCallId: normalizeText(payload.tool_call_id) || normalizeText(payload.toolCallId),
       requestId: normalizeText(payload.request_id) || normalizeText(payload.requestId),
       decisionType: normalizeText(payload.decision_type) || normalizeText(payload.decisionType) || "other",
       summary: normalizeText(payload.summary),
+    };
+    if (samePendingHumanDecision(state.pendingHumanDecision, nextDecision)) {
+      return;
+    }
+    state.pendingHumanDecision = {
+      ...nextDecision,
     };
     state.running = false;
     state.interrupting = false;
@@ -405,4 +411,18 @@ function normalizeNullableText(value: unknown): string | null {
 
 function normalizeText(value: unknown): string {
   return typeof value === "string" ? value.trim() : "";
+}
+
+function samePendingHumanDecision(
+  left: RunState["pendingHumanDecision"],
+  right: RunState["pendingHumanDecision"],
+): boolean {
+  if (!left || !right) {
+    return false;
+  }
+  return (
+    left.replyId === right.replyId &&
+    left.toolCallId === right.toolCallId &&
+    left.requestId === right.requestId
+  );
 }

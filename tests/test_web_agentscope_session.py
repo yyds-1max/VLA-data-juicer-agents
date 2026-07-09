@@ -1090,6 +1090,58 @@ async def test_runtime_submit_human_decision_resumes_calibration_request_human_d
 
 
 @pytest.mark.asyncio
+async def test_runtime_does_not_rehydrate_consumed_human_decision_after_claim_releases(
+    tmp_path: Path,
+) -> None:
+    store = WebSessionStore(tmp_path / "sessions.sqlite")
+    web_session = store.create_session("处理导航数据")
+    store.save_agentscope_session_mapping(
+        web_session.id,
+        agent_id="navigation-data-agent",
+        agentscope_session_id="as-session-1",
+    )
+    chat_run_registry = FakeChatRunRegistry()
+    storage = FakeAgentScopeStorage()
+    storage.session_records[("alice", "navigation-data-agent", "as-session-1")] = (
+        _agentscope_session_record(
+            reply_id="reply-1",
+            tool_call_id="confirm-1",
+            tool_name="request_human_decision",
+            tool_state=ToolCallState.SUBMITTED,
+            tool_input={
+                "decision_type": "camera_params",
+                "request_id": "confirm_navigation_calibration_params:20270605",
+                "summary": "请确认相机参数。",
+            },
+        )
+    )
+    runtime = _runtime(
+        storage=storage,
+        chat_run_registry=chat_run_registry,
+        message_bus=FakeAgentScopeMessageBus(running_states=[False]),
+    )
+    runtime.set_web_session_store(store)
+
+    accepted = await runtime.submit_human_decision(
+        web_session_id=web_session.id,
+        decision={
+            "action": "confirm",
+            "request_id": "confirm_navigation_calibration_params:20270605",
+            "tool_call_id": "confirm-1",
+            "reply_id": "reply-1",
+        },
+    )
+    await chat_run_registry.drain()
+    events = [
+        event
+        async for event in runtime.subscribe_web_session_events(web_session_id=web_session.id)
+    ]
+
+    assert accepted is True
+    assert events == []
+
+
+@pytest.mark.asyncio
 async def test_runtime_submit_human_decision_registers_binds_and_cleans_cancellation() -> None:
     chat_run_registry = FakeChatRunRegistry()
     storage = FakeAgentScopeStorage()

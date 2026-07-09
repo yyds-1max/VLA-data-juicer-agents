@@ -102,6 +102,19 @@ class WebSessionStore:
                 )
                 """
             )
+            connection.execute(
+                """
+                CREATE TABLE IF NOT EXISTS human_decision_consumptions (
+                    agentscope_session_id TEXT NOT NULL,
+                    reply_id TEXT NOT NULL,
+                    tool_call_id TEXT NOT NULL,
+                    action TEXT NOT NULL,
+                    request_id TEXT,
+                    consumed_at TEXT NOT NULL,
+                    PRIMARY KEY (agentscope_session_id, reply_id, tool_call_id)
+                )
+                """
+            )
             self._migrate_agentscope_sessions_schema(connection)
             connection.execute(
                 """
@@ -273,6 +286,14 @@ class WebSessionStore:
             ).fetchone()
             if exists is None:
                 raise KeyError(session_id)
+            duplicate = self._duplicate_human_decision_event(
+                connection,
+                session_id=session_id,
+                event=event,
+                payload=safe_payload,
+            )
+            if duplicate is not None:
+                return duplicate
             seq = int(
                 connection.execute(
                     """
@@ -333,6 +354,64 @@ class WebSessionStore:
             payload=safe_payload,
             created_at=timestamp,
         )
+
+    def mark_human_decision_consumed(
+        self,
+        *,
+        agentscope_session_id: str,
+        reply_id: str,
+        tool_call_id: str,
+        action: str,
+        request_id: str | None = None,
+    ) -> None:
+        timestamp = _now()
+        with self._connect() as connection:
+            connection.execute(
+                """
+                INSERT INTO human_decision_consumptions (
+                    agentscope_session_id,
+                    reply_id,
+                    tool_call_id,
+                    action,
+                    request_id,
+                    consumed_at
+                )
+                VALUES (?, ?, ?, ?, ?, ?)
+                ON CONFLICT(agentscope_session_id, reply_id, tool_call_id)
+                DO UPDATE SET
+                    action = excluded.action,
+                    request_id = excluded.request_id,
+                    consumed_at = excluded.consumed_at
+                """,
+                (
+                    agentscope_session_id,
+                    reply_id,
+                    tool_call_id,
+                    action,
+                    request_id,
+                    timestamp,
+                ),
+            )
+
+    def is_human_decision_consumed(
+        self,
+        *,
+        agentscope_session_id: str,
+        reply_id: str,
+        tool_call_id: str,
+    ) -> bool:
+        with self._connect() as connection:
+            row = connection.execute(
+                """
+                SELECT 1
+                FROM human_decision_consumptions
+                WHERE agentscope_session_id = ?
+                  AND reply_id = ?
+                  AND tool_call_id = ?
+                """,
+                (agentscope_session_id, reply_id, tool_call_id),
+            ).fetchone()
+        return row is not None
 
     def mark_historical(self, session_id: str) -> None:
         timestamp = _now()
@@ -470,6 +549,45 @@ class WebSessionStore:
             )
             if result.rowcount == 0:
                 raise KeyError(agentscope_session_id)
+
+    def _duplicate_human_decision_event(
+        self,
+        connection: sqlite3.Connection,
+        *,
+        session_id: str,
+        event: dict,
+        payload: dict,
+    ) -> TimelineEventRecord | None:
+        if event.get("type") != "human_decision_required":
+            return None
+        reply_id = payload.get("reply_id")
+        tool_call_id = payload.get("tool_call_id")
+        if not isinstance(reply_id, str) or not isinstance(tool_call_id, str):
+            return None
+        rows = connection.execute(
+            """
+            SELECT id, session_id, seq, type, source, run_id, parent_run_id,
+                   timestamp, payload_json, created_at
+            FROM timeline_events
+            WHERE session_id = ?
+              AND type = ?
+              AND run_id IS ?
+            ORDER BY seq ASC
+            """,
+            (
+                session_id,
+                "human_decision_required",
+                _optional_text(event.get("run_id")),
+            ),
+        ).fetchall()
+        for row in rows:
+            existing = self._timeline_event_from_row(row)
+            if (
+                existing.payload.get("reply_id") == reply_id
+                and existing.payload.get("tool_call_id") == tool_call_id
+            ):
+                return existing
+        return None
 
     @staticmethod
     def _session_from_row(row: sqlite3.Row) -> SessionRecord:

@@ -109,6 +109,39 @@ describe("eventReducer", () => {
     });
   });
 
+  it("ignores duplicate pending human decision events with the same identity", () => {
+    const state = createEmptyRunState();
+
+    applyAgentEvent(
+      state,
+      event("human_decision_required", "navigation.workflow", {
+        reply_id: "reply-1",
+        tool_call_id: "tool-call-1",
+        request_id: "request-1",
+        summary: "请确认下一步。",
+      }),
+    );
+    const firstDecision = state.pendingHumanDecision;
+
+    applyAgentEvent(
+      state,
+      event(
+        "human_decision_required",
+        "navigation.workflow",
+        {
+          reply_id: "reply-1",
+          tool_call_id: "tool-call-1",
+          request_id: "request-1",
+          summary: "重复确认不应刷新弹窗。",
+        },
+        { timestamp: "2026-06-26T00:00:01.000Z" },
+      ),
+    );
+
+    expect(state.pendingHumanDecision).toBe(firstDecision);
+    expect(state.pendingHumanDecision?.summary).toBe("请确认下一步。");
+  });
+
   it("keeps pending human decision after assistant output arrives", () => {
     const state = createEmptyRunState();
 

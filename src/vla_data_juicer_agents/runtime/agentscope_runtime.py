@@ -377,6 +377,10 @@ class AgentScopeRuntime:
                 else:
                     self.clear_run_cancellation(agentscope_session_id, cancellation)
                 raise
+            self._mark_human_decision_consumed(
+                agentscope_session_id=agentscope_session_id,
+                decision=decision,
+            )
             claim_handoff = True
             return True
         finally:
@@ -998,6 +1002,12 @@ class AgentScopeRuntime:
                             "tool_call_id": getattr(tool_call, "id", ""),
                         },
                     )
+                    if self._is_human_decision_consumed(
+                        agentscope_session_id=agentscope_session_id,
+                        reply_id=reply_id,
+                        tool_call_id=getattr(tool_call, "id", ""),
+                    ):
+                        continue
                     if await self._is_human_decision_claim_active(claim_key):
                         continue
                     payload["reply_id"] = reply_id
@@ -1018,6 +1028,45 @@ class AgentScopeRuntime:
         if callable(is_locked):
             return bool(await is_locked(claim_key))
         return False
+
+    def _mark_human_decision_consumed(
+        self,
+        *,
+        agentscope_session_id: str,
+        decision: dict[str, Any],
+    ) -> None:
+        if self.web_session_store is None:
+            return
+        mark_consumed = getattr(self.web_session_store, "mark_human_decision_consumed", None)
+        if not callable(mark_consumed):
+            return
+        mark_consumed(
+            agentscope_session_id=agentscope_session_id,
+            reply_id=decision["reply_id"],
+            tool_call_id=decision["tool_call_id"],
+            action=decision["action"],
+            request_id=decision.get("request_id"),
+        )
+
+    def _is_human_decision_consumed(
+        self,
+        *,
+        agentscope_session_id: str,
+        reply_id: str,
+        tool_call_id: Any,
+    ) -> bool:
+        if self.web_session_store is None:
+            return False
+        is_consumed = getattr(self.web_session_store, "is_human_decision_consumed", None)
+        if not callable(is_consumed):
+            return False
+        return bool(
+            is_consumed(
+                agentscope_session_id=agentscope_session_id,
+                reply_id=reply_id,
+                tool_call_id=str(tool_call_id),
+            )
+        )
 
 
 def _to_attribute_event(value: Any) -> Any:

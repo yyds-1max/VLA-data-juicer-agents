@@ -104,6 +104,77 @@ def test_store_persists_timeline_events(tmp_path: Path):
     assert detail.events[1].type == "tool_end"
 
 
+def test_store_deduplicates_human_decision_required_events(tmp_path: Path):
+    store = WebSessionStore(tmp_path / "sessions.sqlite")
+    session = store.create_session(title="处理 20270605 的室外导航数据")
+    event = {
+        "type": "human_decision_required",
+        "source": "NavigationDataAgent",
+        "run_id": "as-session",
+        "parent_run_id": None,
+        "timestamp": "2026-06-26T10:00:00.000+00:00",
+        "payload": {
+            "reply_id": "reply-1",
+            "tool_call_id": "tool-call-1",
+            "request_id": "confirm_navigation_calibration_params:20270605",
+            "summary": "请确认相机参数。",
+        },
+    }
+
+    first = store.append_timeline_event(session.id, event)
+    second = store.append_timeline_event(
+        session.id,
+        {
+            **event,
+            "timestamp": "2026-06-26T10:00:01.000+00:00",
+        },
+    )
+
+    detail = store.get_session(session.id)
+
+    assert detail is not None
+    assert first.id == second.id
+    assert [item.seq for item in detail.events] == [1]
+    assert detail.events[0].payload["tool_call_id"] == "tool-call-1"
+
+
+def test_store_marks_human_decision_consumed_idempotently(tmp_path: Path):
+    store = WebSessionStore(tmp_path / "sessions.sqlite")
+
+    assert (
+        store.is_human_decision_consumed(
+            agentscope_session_id="as-session",
+            reply_id="reply-1",
+            tool_call_id="tool-call-1",
+        )
+        is False
+    )
+
+    store.mark_human_decision_consumed(
+        agentscope_session_id="as-session",
+        reply_id="reply-1",
+        tool_call_id="tool-call-1",
+        action="confirm",
+        request_id="confirm_navigation_calibration_params:20270605",
+    )
+    store.mark_human_decision_consumed(
+        agentscope_session_id="as-session",
+        reply_id="reply-1",
+        tool_call_id="tool-call-1",
+        action="confirm",
+        request_id="confirm_navigation_calibration_params:20270605",
+    )
+
+    assert (
+        store.is_human_decision_consumed(
+            agentscope_session_id="as-session",
+            reply_id="reply-1",
+            tool_call_id="tool-call-1",
+        )
+        is True
+    )
+
+
 def test_store_rejects_message_for_missing_session(tmp_path: Path):
     store = WebSessionStore(tmp_path / "sessions.sqlite")
 
