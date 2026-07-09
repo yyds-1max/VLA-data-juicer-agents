@@ -173,6 +173,181 @@ def test_task_store_migrates_legacy_duplicate_active_segments(tmp_path: Path):
     assert old_status == NavigationTaskStatus.SUPERSEDED.value
 
 
+def test_task_store_migrates_json_encoded_segment_entry(tmp_path: Path):
+    db_path = tmp_path / "navigation_tasks.sqlite"
+    with sqlite3.connect(db_path) as connection:
+        connection.execute(
+            """
+            CREATE TABLE navigation_tasks (
+                task_id TEXT PRIMARY KEY,
+                date TEXT NOT NULL,
+                segments_json TEXT,
+                segments_key TEXT,
+                scene_mode TEXT,
+                phase TEXT NOT NULL,
+                status TEXT NOT NULL,
+                waiting_reason TEXT,
+                next_required_input TEXT,
+                created_by_web_session_id TEXT,
+                latest_web_session_id TEXT,
+                agentscope_session_id TEXT,
+                latest_run_id TEXT,
+                last_completed_step TEXT,
+                data_profile_json TEXT,
+                artifact_snapshot_json TEXT,
+                drift_json TEXT,
+                schema_version INTEGER NOT NULL,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            )
+            """
+        )
+        connection.execute(
+            """
+            INSERT INTO navigation_tasks (
+                task_id, date, segments_json, segments_key, scene_mode, phase, status,
+                waiting_reason, next_required_input, created_by_web_session_id,
+                latest_web_session_id, agentscope_session_id, latest_run_id,
+                last_completed_step, data_profile_json, artifact_snapshot_json,
+                drift_json, schema_version, created_at, updated_at
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                "nav_bad_segments",
+                "20270623",
+                json.dumps(['["20260623_145550"]']),
+                json.dumps(['["20260623_145550"]'], separators=(",", ":")),
+                None,
+                "intake",
+                "pending",
+                None,
+                None,
+                "web-1",
+                "web-1",
+                "agent-1",
+                None,
+                None,
+                None,
+                None,
+                None,
+                1,
+                "2026-07-08T00:00:00.000+00:00",
+                "2026-07-08T00:00:00.000+00:00",
+            ),
+        )
+
+    store = SqliteNavigationTaskStore(db_path)
+    task = store.get_task("nav_bad_segments")
+
+    assert task.segments == ["20260623_145550"]
+    assert store.find_latest_by_date("20270623", ["20260623_145550"]).task_id == task.task_id
+
+    with sqlite3.connect(db_path) as connection:
+        row = connection.execute(
+            "SELECT segments_json, segments_key FROM navigation_tasks WHERE task_id = ?",
+            ("nav_bad_segments",),
+        ).fetchone()
+
+    assert json.loads(row[0]) == ["20260623_145550"]
+    assert row[1] == '["20260623_145550"]'
+
+
+def test_task_store_migrates_json_encoded_segment_entry_with_existing_unique_index(
+    tmp_path: Path,
+):
+    db_path = tmp_path / "navigation_tasks.sqlite"
+    with sqlite3.connect(db_path) as connection:
+        connection.execute(
+            """
+            CREATE TABLE navigation_tasks (
+                task_id TEXT PRIMARY KEY,
+                date TEXT NOT NULL,
+                segments_json TEXT,
+                segments_key TEXT,
+                scene_mode TEXT,
+                phase TEXT NOT NULL,
+                status TEXT NOT NULL,
+                waiting_reason TEXT,
+                next_required_input TEXT,
+                created_by_web_session_id TEXT,
+                latest_web_session_id TEXT,
+                agentscope_session_id TEXT,
+                latest_run_id TEXT,
+                last_completed_step TEXT,
+                data_profile_json TEXT,
+                artifact_snapshot_json TEXT,
+                drift_json TEXT,
+                schema_version INTEGER NOT NULL,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            )
+            """
+        )
+        connection.execute(
+            """
+            CREATE UNIQUE INDEX idx_navigation_tasks_active_date_segments_key
+            ON navigation_tasks (date, segments_key)
+            WHERE status != 'superseded'
+            """
+        )
+        for task_id, segments, key, updated_at in [
+            (
+                "nav_good",
+                ["20260623_145550"],
+                '["20260623_145550"]',
+                "2026-07-08T00:00:01.000+00:00",
+            ),
+            (
+                "nav_bad",
+                ['["20260623_145550"]'],
+                '["[\\"20260623_145550\\"]"]',
+                "2026-07-08T00:00:00.000+00:00",
+            ),
+        ]:
+            connection.execute(
+                """
+                INSERT INTO navigation_tasks (
+                    task_id, date, segments_json, segments_key, scene_mode, phase, status,
+                    waiting_reason, next_required_input, created_by_web_session_id,
+                    latest_web_session_id, agentscope_session_id, latest_run_id,
+                    last_completed_step, data_profile_json, artifact_snapshot_json,
+                    drift_json, schema_version, created_at, updated_at
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    task_id,
+                    "20270623",
+                    json.dumps(segments),
+                    key,
+                    None,
+                    "intake",
+                    "pending",
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    1,
+                    "2026-07-08T00:00:00.000+00:00",
+                    updated_at,
+                ),
+            )
+
+    store = SqliteNavigationTaskStore(db_path)
+    active = store.find_latest_by_date("20270623", ["20260623_145550"])
+
+    assert active.task_id == "nav_good"
+    assert active.segments == ["20260623_145550"]
+    assert store.get_task("nav_bad").status == NavigationTaskStatus.SUPERSEDED
+
+
 def test_create_or_update_task_preserves_latest_web_session_when_omitted(tmp_path: Path):
     store = SqliteNavigationTaskStore(tmp_path / "navigation_tasks.sqlite")
     first = store.create_or_update_task(

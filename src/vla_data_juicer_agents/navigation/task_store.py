@@ -30,7 +30,49 @@ def _json_load(value: str | None) -> Any:
     return json.loads(value)
 
 
+def normalize_segments(value: list[str] | str | None) -> list[str] | None:
+    if value is None:
+        return None
+    if isinstance(value, str):
+        stripped = value.strip()
+        if not stripped:
+            return None
+        decoded = _decode_json_string_list(stripped)
+        if decoded is not None:
+            return normalize_segments(decoded)
+        return [stripped]
+
+    normalized: list[str] = []
+    for item in value:
+        if not isinstance(item, str):
+            item = str(item)
+        stripped = item.strip()
+        if not stripped:
+            continue
+        decoded = _decode_json_string_list(stripped)
+        if decoded is not None:
+            nested = normalize_segments(decoded)
+            if nested:
+                normalized.extend(nested)
+            continue
+        normalized.append(stripped)
+    return normalized or None
+
+
+def _decode_json_string_list(value: str) -> list[str] | None:
+    if not value.startswith("["):
+        return None
+    try:
+        decoded = json.loads(value)
+    except json.JSONDecodeError:
+        return None
+    if isinstance(decoded, list) and all(isinstance(item, str) for item in decoded):
+        return decoded
+    return None
+
+
 def _segments_key(segments: list[str] | None) -> str:
+    segments = normalize_segments(segments)
     if segments is None:
         return "__all__"
     return json.dumps(sorted(segments), ensure_ascii=False, separators=(",", ":"))
@@ -145,6 +187,7 @@ class SqliteNavigationTaskStore:
             )
 
     def _migrate_segments_key(self, connection: sqlite3.Connection) -> None:
+        connection.execute("DROP INDEX IF EXISTS idx_navigation_tasks_active_date_segments_key")
         columns = {
             row["name"]
             for row in connection.execute("PRAGMA table_info(navigation_tasks)").fetchall()
@@ -155,10 +198,14 @@ class SqliteNavigationTaskStore:
             "SELECT rowid, segments_json FROM navigation_tasks"
         ).fetchall()
         for row in rows:
-            segments = _json_load(row["segments_json"])
+            segments = normalize_segments(_json_load(row["segments_json"]))
             connection.execute(
-                "UPDATE navigation_tasks SET segments_key = ? WHERE rowid = ?",
-                (_segments_key(segments), row["rowid"]),
+                """
+                UPDATE navigation_tasks
+                SET segments_json = ?, segments_key = ?
+                WHERE rowid = ?
+                """,
+                (_json_dump(segments), _segments_key(segments), row["rowid"]),
             )
         duplicate_rows = connection.execute(
             """
@@ -195,6 +242,7 @@ class SqliteNavigationTaskStore:
         web_session_id: str | None = None,
         agentscope_session_id: str | None = None,
     ) -> NavigationTask:
+        segments = normalize_segments(segments)
         timestamp = utc_now()
         task = NavigationTask(
             task_id=f"nav_{uuid4().hex}",
@@ -276,6 +324,8 @@ class SqliteNavigationTaskStore:
             raise KeyError(task_id)
         payload = current.model_dump(mode="json")
         payload.update(changes)
+        if "segments" in payload:
+            payload["segments"] = normalize_segments(payload["segments"])
         payload["updated_at"] = utc_now()
         task = NavigationTask.model_validate(payload)
         with self._connect() as connection:
@@ -443,7 +493,7 @@ class SqliteNavigationTaskStore:
         return NavigationTask(
             task_id=row["task_id"],
             date=row["date"],
-            segments=_json_load(row["segments_json"]),
+            segments=normalize_segments(_json_load(row["segments_json"])),
             scene_mode=row["scene_mode"],
             phase=row["phase"],
             status=row["status"],

@@ -89,6 +89,23 @@ def test_get_or_create_navigation_task_tool_creates_date_only_task(tmp_path: Pat
     assert store.get_task(result["task"]["task_id"]) is not None
 
 
+def test_get_or_create_navigation_task_tool_normalizes_json_segments_string(
+    tmp_path: Path,
+):
+    _root, store, tools = _tools(tmp_path)
+
+    result = _call(
+        tools["get_or_create_navigation_task_tool"],
+        date="20270623",
+        segments='["20260623_145550"]',
+        scene_mode=None,
+    )
+
+    assert result["ok"] is True
+    assert result["task"]["segments"] == ["20260623_145550"]
+    assert store.find_latest_by_date("20270623", ["20260623_145550"]) is not None
+
+
 def test_reconcile_navigation_task_tool_updates_missing_sync_to_needs_rerun(
     tmp_path: Path,
 ):

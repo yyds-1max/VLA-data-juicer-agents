@@ -13,7 +13,10 @@ from vla_data_juicer_agents.navigation.task_state import (
     NavigationTaskPhase,
     NavigationTaskStatus,
 )
-from vla_data_juicer_agents.navigation.task_store import SqliteNavigationTaskStore
+from vla_data_juicer_agents.navigation.task_store import (
+    SqliteNavigationTaskStore,
+    normalize_segments,
+)
 
 
 def _task_payload(task: Any) -> dict[str, Any]:
@@ -210,12 +213,7 @@ def build_navigation_task_tools(
 
 
 def _normalize_segments(value: list[str] | str | None) -> list[str] | None:
-    if value is None:
-        return None
-    if isinstance(value, str):
-        stripped = value.strip()
-        return [stripped] if stripped else None
-    return value
+    return normalize_segments(value)
 
 
 def _sync_finish_processing_draft(
