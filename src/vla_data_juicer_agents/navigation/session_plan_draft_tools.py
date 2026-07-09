@@ -74,7 +74,7 @@ def build_session_plan_draft_tools(
         observation_id: str,
         used_tool: str,
     ) -> dict[str, Any]:
-        """Merge only newly observed NavigationDataProfile facts.
+        """Merge only newly observed phase-profile facts.
 
         Use data_profile_patch for partial profile facts learned from exactly
         one inspection tool, plus observation_id and used_tool for traceability.
@@ -123,11 +123,11 @@ def build_session_plan_draft_tools(
                 "ok": False,
                 "error_type": "workflow_plan_draft_incomplete",
                 "message": str(exc),
-                "missing_fields": state.missing_fields(),
+                "missing_fields": state.missing_fields(phase="finish_processing"),
                 "next_tool_candidates": state.next_tool_candidates(),
                 "draft": state.schema_snapshot(),
             }
-        validation = validate_workflow_plan(plan, data_profile=state.data_profile)
+        validation = validate_workflow_plan(plan, phase_profile=state.finish_processing_profile)
         if validation["errors"]:
             return {
                 "ok": False,
@@ -193,7 +193,7 @@ def build_session_plan_draft_tools(
                 "next_tool_candidates": state.next_tool_candidates(),
                 "draft": state.schema_snapshot(),
             }
-        validation = validate_workflow_plan(plan, data_profile=state.data_profile)
+        validation = validate_workflow_plan(plan, phase_profile=state.finish_processing_profile)
         if validation["errors"]:
             return {
                 "ok": False,

@@ -56,6 +56,8 @@ def test_main_router_prompt_presents_datapilot_and_sets_task_readiness_rules():
     assert "combine it with the pending task context" in prompt
     assert "If no clip is specified, process all clips" in prompt
     assert "If a specified clip does not exist" in prompt
+    assert "Camera and sensor parameter confirmation belongs to finish-processing" in prompt
+    assert "Before real processing, camera parameters must be confirmed" not in prompt
     assert "start_navigation_data_task" in prompt
     assert "call start_navigation_data_task" in prompt
     assert "target" in prompt
@@ -126,6 +128,7 @@ def test_navigation_agent_prompt_requires_plan_execute_react_and_human_decisions
         "Capability questions",
         "do not inspect data",
         "scene mode is missing",
+        "reply when ready and include whether the scene is indoor or outdoor",
         "structured handoff",
         "target",
         "date",
@@ -148,6 +151,7 @@ def test_navigation_agent_prompt_requires_plan_execute_react_and_human_decisions
     assert "Plan-Agent workflow" not in prompt
     assert "user_confirmation" not in prompt
     assert "exactly `确认`" not in prompt
+    assert "继续执行 plus" not in prompt
     assert "You are NavigationDataAgent" not in prompt
     assert "mock" not in prompt.lower()
 
@@ -179,7 +183,7 @@ def test_navigation_agent_prompt_uses_fallback_guidance_when_docs_file_is_missin
         "generate_from_pcd",
         "skip_if_projection_ready",
         "Do not require data to fit fixed `u_legacy_like` or `go2w_like` classifications",
-        "calibration confirmation gate is the first finalized WorkflowPlan step",
+        "calibration confirmation gate belongs to finish-processing",
         "User confirmation, stop, and guidance decisions use `request_human_decision`",
         "If a unique Ins topic is present",
         "NoobScenes preprocessing skips odom conversion and resize preprocessing",

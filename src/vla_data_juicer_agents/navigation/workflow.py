@@ -18,7 +18,13 @@ from vla_data_juicer_agents.core.cancellation import (
     current_cancellation,
 )
 from vla_data_juicer_agents.core.events import EventEmitter, EventScope
-from vla_data_juicer_agents.navigation.models import NavigationDataProfile, NavigationRequest, WorkflowPlan, WorkflowStep
+from vla_data_juicer_agents.navigation.models import (
+    NavigationExtractSyncProfile,
+    NavigationFinishProcessingProfile,
+    NavigationRequest,
+    WorkflowPlan,
+    WorkflowStep,
+)
 from vla_data_juicer_agents.navigation.plan_validation import validate_workflow_plan
 from vla_data_juicer_agents.navigation.plan_draft import build_plan_from_draft
 from vla_data_juicer_agents.navigation.run_state import WorkflowRunStore
@@ -113,10 +119,13 @@ def _validation_catalog_with_planned_confirmation() -> list[ToolCapability]:
     return catalog
 
 
-def _validated_workflow_plan(plan: WorkflowPlan, data_profile: NavigationDataProfile | None = None) -> WorkflowPlan:
+def _validated_workflow_plan(
+    plan: WorkflowPlan,
+    phase_profile: NavigationExtractSyncProfile | NavigationFinishProcessingProfile | None = None,
+) -> WorkflowPlan:
     validation = validate_workflow_plan(
         plan,
-        data_profile=data_profile,
+        phase_profile=phase_profile,
         catalog=_validation_catalog_with_planned_confirmation(),
     )
     if validation["errors"]:
@@ -136,7 +145,7 @@ def build_deterministic_plan_template(
     segments: list[str] | None = None,
     *,
     scene_mode: Literal["in", "out"] | _SceneModeMissing = _SCENE_MODE_MISSING,
-    data_profile: NavigationDataProfile | None = None,
+    phase_profile: NavigationFinishProcessingProfile | None = None,
 ) -> WorkflowPlan:
     if scene_mode not in {"in", "out"}:
         raise ValueError("scene_mode is required before building WorkflowPlan; expected 'in' or 'out'.")
@@ -145,18 +154,16 @@ def build_deterministic_plan_template(
     finish_path = _finish_path(date)
     common_arguments = {"date": date, "segments": segments}
     profile_id = (
-        data_profile.processing_profile.id
-        if data_profile is not None and data_profile.processing_profile is not None
+        phase_profile.processing_profile.id
+        if phase_profile is not None
         else processing_profile or "parameterized_navigation_v1"
     )
-    platform_hint = data_profile.platform_hint if data_profile is not None else "unknown"
+    platform_hint = phase_profile.platform_hint if phase_profile is not None else "unknown"
 
     topic_arguments = {}
     topic_params = None
-    if data_profile is not None:
-        topic_params = data_profile.topic_params
-        if topic_params is None and data_profile.processing_profile is not None:
-            topic_params = data_profile.processing_profile.topic_params
+    if phase_profile is not None:
+        topic_params = phase_profile.topic_params
     if topic_params is not None:
         topic_arguments = {
             "topic_whitelist": list(topic_params.topic_whitelist),
@@ -164,10 +171,8 @@ def build_deterministic_plan_template(
             "query_dir": topic_params.query_dir,
         }
     localization_policy = None
-    if data_profile is not None:
-        localization_policy = data_profile.localization_policy
-        if localization_policy is None and data_profile.processing_profile is not None:
-            localization_policy = data_profile.processing_profile.localization_policy
+    if phase_profile is not None:
+        localization_policy = phase_profile.localization_policy
     localization_source = localization_policy.source if localization_policy is not None else "odom"
     localization_conversion = (
         localization_policy.conversion
@@ -176,18 +181,18 @@ def build_deterministic_plan_template(
     )
 
     gridmap_decision = (
-        data_profile.stage_variants.get("prepare_gridmap_for_projection")
-        if data_profile is not None
+        phase_profile.stage_variants.get("prepare_gridmap_for_projection")
+        if phase_profile is not None
         else None
     )
     extract_decision = (
-        data_profile.stage_variants.get("extract_and_sync_navigation_data")
-        if data_profile is not None
+        phase_profile.stage_variants.get("extract_and_sync_navigation_data")
+        if phase_profile is not None
         else None
     )
     projection_decision = (
-        data_profile.stage_variants.get("run_projection_and_trajectory")
-        if data_profile is not None
+        phase_profile.stage_variants.get("run_projection_and_trajectory")
+        if phase_profile is not None
         else None
     )
     extract_variant = (
@@ -197,8 +202,8 @@ def build_deterministic_plan_template(
     )
     projection_variant = _projection_variant_from_decision(projection_decision)
     skip_gridmap = bool(
-        data_profile is not None
-        and data_profile.projection_input_ready
+        phase_profile is not None
+        and phase_profile.projection_input_ready
         and gridmap_decision is not None
         and gridmap_decision.variant == "skip_if_projection_ready"
     )
@@ -235,7 +240,7 @@ def build_deterministic_plan_template(
             variant=extract_variant,
             effects="execute",
             decision_ref=(
-                "data_profile.stage_variants.extract_and_sync_navigation_data"
+                "finish_processing_profile.stage_variants.extract_and_sync_navigation_data"
                 if extract_decision is not None
                 else None
             ),
@@ -299,7 +304,7 @@ def build_deterministic_plan_template(
                 variant=gridmap_decision.variant if gridmap_decision is not None else None,
                 effects="execute" if gridmap_decision is not None else None,
                 decision_ref=(
-                    "data_profile.stage_variants.prepare_gridmap_for_projection"
+                    "finish_processing_profile.stage_variants.prepare_gridmap_for_projection"
                     if gridmap_decision is not None
                     else None
                 ),
@@ -324,7 +329,7 @@ def build_deterministic_plan_template(
                 variant=projection_variant,
                 effects="execute",
                 decision_ref=(
-                    "data_profile.stage_variants.run_projection_and_trajectory"
+                    "finish_processing_profile.stage_variants.run_projection_and_trajectory"
                     if projection_decision is not None
                     else None
                 ),
@@ -355,9 +360,14 @@ def build_extract_sync_plan_template(
     processing_profile: str | None = None,
     segments: list[str] | None = None,
     *,
+    phase_profile: NavigationExtractSyncProfile | None = None,
     data_profile_draft: dict[str, Any] | None = None,
 ) -> WorkflowPlan:
-    draft = data_profile_draft or {}
+    draft = (
+        phase_profile.model_dump(mode="json")
+        if phase_profile is not None
+        else data_profile_draft or {}
+    )
     topic_params = draft.get("topic_params") or {}
     topic_arguments = {
         "topic_whitelist": list(topic_params.get("topic_whitelist") or []),
@@ -376,6 +386,26 @@ def build_extract_sync_plan_template(
         else "unknown"
     )
     common_arguments = {"date": date, "segments": segments}
+    extract_decision = None
+    if phase_profile is not None:
+        extract_decision = phase_profile.stage_variants.get("extract_and_sync_navigation_data")
+    else:
+        extract_decision_payload = (draft.get("stage_variants") or {}).get("extract_and_sync_navigation_data")
+        extract_decision = extract_decision_payload if isinstance(extract_decision_payload, dict) else None
+    extract_variant = (
+        extract_decision.variant
+        if hasattr(extract_decision, "variant")
+        else extract_decision.get("variant")
+        if isinstance(extract_decision, dict)
+        else "explicit_topic_params"
+    )
+    extract_evidence = (
+        list(extract_decision.evidence)
+        if hasattr(extract_decision, "evidence")
+        else list(extract_decision.get("evidence") or [])
+        if isinstance(extract_decision, dict)
+        else []
+    )
     return WorkflowPlan(
         date=date,
         segments=segments,
@@ -401,8 +431,14 @@ def build_extract_sync_plan_template(
                 },
                 preconditions=["prepare_raw_data"],
                 expected_outputs=[f"clip_data/{date}"],
-                variant="explicit_topic_params",
+                variant=extract_variant,
                 effects="execute",
+                decision_ref=(
+                    "extract_sync_profile.stage_variants.extract_and_sync_navigation_data"
+                    if extract_decision is not None
+                    else None
+                ),
+                evidence=extract_evidence,
             ),
         ],
     )
@@ -414,14 +450,14 @@ def build_finish_processing_plan_template(
     segments: list[str] | None = None,
     *,
     scene_mode: Literal["in", "out"] | _SceneModeMissing = _SCENE_MODE_MISSING,
-    data_profile: NavigationDataProfile | None = None,
+    phase_profile: NavigationFinishProcessingProfile | None = None,
 ) -> WorkflowPlan:
     full_plan = build_deterministic_plan_template(
         date,
         processing_profile,
         segments,
         scene_mode=scene_mode,
-        data_profile=data_profile,
+        phase_profile=phase_profile,
     )
     omitted_step_ids = {"prepare_raw_data", "extract_and_sync_navigation_data"}
     steps: list[WorkflowStep] = []
@@ -551,7 +587,7 @@ async def run_plan_agent(
     draft_prompt = ""
     if draft_state is not None:
         draft_prompt = (
-            "\n\nCurrent internal ReAct planning state panel. It includes the NavigationDataProfile schema, "
+            "\n\nCurrent internal ReAct planning state panel. It includes the current phase profile schema, "
             "the current data_profile_draft, filled_fields, missing_fields, next_tool_candidates, and "
             "ready_to_finish:\n"
             f"{json.dumps(draft_state.schema_snapshot(), ensure_ascii=False)}"
@@ -562,34 +598,34 @@ async def run_plan_agent(
         "infer_navigation_topic_params_tool, inspect_processing_state_tool, "
         "inspect_gridmap_artifacts_tool, inspect_runtime_assets_tool, and list_navigation_tool_capabilities_tool "
         "read-only tools to build a "
-        "lightweight NavigationDataProfile and stage-one navigation WorkflowPlan.\n\n"
+        "phase-scoped navigation profile and stage-one navigation WorkflowPlan.\n\n"
         "Strict planning loop:\n"
-        "- Privately read the current NavigationDataProfile schema, data_profile_draft, filled_fields, "
+        "- Privately read the current phase_profile_schema, data_profile_draft, filled_fields, "
         "missing_fields, validation_errors, next_required_observation, and next_tool_candidates; decide exactly "
         "one next SDK tool call.\n"
         "- Follow next_required_observation and next_tool_candidates exactly. Do not skip, reorder, or parallelize "
         "the read-only investigation sequence.\n"
         "- To inspect one missing fact, emit a Progress line, then call one read-only registered SDK tool. "
         "After the tool result, emit a Progress line, then call update_workflow_plan_draft_tool with "
-        "data_profile_patch containing only newly learned NavigationDataProfile facts, plus observation_id "
+        "data_profile_patch containing only newly learned phase-profile facts, plus observation_id "
         "and used_tool.\n"
         "- Finish by emitting a Progress line, then calling the phase-appropriate finalize_* plan tool named "
         "in next_tool_candidates, but only when ready_to_finish is true and missing_fields is empty.\n"
         "Do not output textual Thought: or Action: lines. Do not write ToolName[arguments] strings.\n\n"
-        "The NavigationDataProfile schema is authoritative. data_profile_patch must be JSON-compatible and "
+        "The current phase_profile_schema is authoritative. data_profile_patch must be JSON-compatible and "
         "must use only schema fields and valid enum values. Do not output a complete data_profile unless it is "
         "already fully supported by previous tool observations. Do not write script-level steps; "
         "final strict WorkflowPlan JSON must come from the phase-appropriate finalize_* tool. Stage one covers "
         "prepare.sh, run_U.sh, and run_odom.sh only; do not include run_fix.sh. Default to all raw "
-        "segments when segments are not specified. Use NavigationDataProfile.processing_profile and "
-        "platform_hint for diagnostic context; infer sensor bindings and processing_profile from "
+        "segments when segments are not specified. During extract/sync, infer sensor bindings and topic_params only. "
+        "During finish-processing, use processing_profile and platform_hint for diagnostic context and infer them from "
         "tool results, and do not require fixed u_legacy_like/go2w_like classification. Treat "
         "platform_hint as a diagnostic hint, not as a hard selector for topic parameters or projection variants. Call "
         "infer_navigation_topic_params_tool before finalizing extract_and_sync_navigation_data; "
         "do not invent TOPIC_WHITELIST, topic_map, query_dir, localization policy, or calibration "
         "policy. Use explicit_topic_params for extract_and_sync_navigation_data after topic_params are complete. "
         "Set run_projection_and_trajectory.projection_variant explicitly from observed runtime/tool capability evidence. "
-        "Only finalize when processing_profile, topic_params, and data_profile have no blocking_issues. "
+        "Only finalize when the current phase profile has no blocking_issues. "
         "scene_mode is optional during extract/sync and required before finish-processing finalization. "
         "Extract/sync finalization should stop after prepare_raw_data and extract_and_sync_navigation_data. "
         "Finish-processing/full finalization must place confirm_navigation_calibration_params as the first step before "
@@ -611,9 +647,17 @@ async def run_plan_agent(
         cancellation=cancellation,
     )
     if draft_state is not None and draft_state.finalized_plan is not None:
-        return _validated_workflow_plan(draft_state.finalized_plan, data_profile=draft_state.data_profile)
-    if draft_state is not None and not output.strip() and draft_state.processing_profile is not None:
-        return _validated_workflow_plan(build_plan_from_draft(draft_state), data_profile=draft_state.data_profile)
+        phase_profile = (
+            draft_state.extract_sync_profile
+            if draft_state.finalized_plan.phase == "extract_sync"
+            else draft_state.finish_processing_profile
+        )
+        return _validated_workflow_plan(draft_state.finalized_plan, phase_profile=phase_profile)
+    if draft_state is not None and not output.strip() and draft_state.finish_processing_profile is not None:
+        return _validated_workflow_plan(
+            build_plan_from_draft(draft_state),
+            phase_profile=draft_state.finish_processing_profile,
+        )
     return _validated_workflow_plan(_parse_workflow_plan_output(output))
 
 

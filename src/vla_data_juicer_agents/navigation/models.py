@@ -139,15 +139,32 @@ class NavigationProcessingProfile(BaseModel):
     evidence: dict[str, list[str]] = Field(default_factory=dict)
 
 
-class NavigationDataProfile(BaseModel):
+class NavigationExtractSyncProfile(BaseModel):
+    date: str
+    segments: list[str] | None = None
+    platform_hint: str = "unknown"
+    sensor_bindings: NavigationSensorBindings | None = None
+    topic_params: NavigationTopicParams
+    stage_variants: dict[str, StageVariantDecision] = Field(default_factory=dict)
+    blocking_issues: list[PlanIssue] = Field(default_factory=list)
+    warnings: list[PlanIssue] = Field(default_factory=list)
+    evidence: dict[str, list[str]] = Field(default_factory=dict)
+
+    @field_validator("date")
+    @classmethod
+    def validate_date(cls, value: str) -> str:
+        return _validate_date(value)
+
+
+class NavigationFinishProcessingProfile(BaseModel):
     date: str
     segments: list[str] | None = None
     scene_mode: Literal["in", "out"]
-    processing_profile: NavigationProcessingProfile | None = None
+    processing_profile: NavigationProcessingProfile
     platform_hint: str = "unknown"
     sensor_bindings: NavigationSensorBindings | None = None
-    localization_policy: NavigationLocalizationPolicy | None = None
-    topic_params: NavigationTopicParams | None = None
+    localization_policy: NavigationLocalizationPolicy
+    topic_params: NavigationTopicParams
     gridmap_source: Literal[
         "existing_gridmap",
         "generated_from_pcd",

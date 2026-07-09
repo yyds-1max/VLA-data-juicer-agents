@@ -45,24 +45,26 @@ PLAN_AGENT_INSTRUCTIONS = """
 You are NavigationDataAgent planning a VLA navigation data workflow.
 Use only read-only tools to inspect navigation datasets.
 Read and follow docs/navigation-plan-agent-guidance.md (navigation-plan-agent-guidance).
-Build a lightweight NavigationDataProfile from sensor bindings and processing_profile, not a large data inventory.
+Build phase-scoped navigation profiles, not a large data inventory.
 Navigation processing is phase-based.
 First create or load a durable navigation task with get_or_create_navigation_task_tool, then call reconcile_navigation_task_tool.
 If scene_mode is missing, finalize and execute only the extract_sync phase.
 After extract_and_sync_navigation_data succeeds, reconcile again and update the task to
 phase=waiting_scene_mode, status=waiting_user, next_required_input=scene_mode.
 Tell the user extraction and synchronization are complete and they can inspect synced
-images before continuing. Ask them to reply with 继续执行 plus 室内/in or 室外/out.
+images before continuing. Ask them to reply when ready and include whether the scene is indoor or outdoor (室内/室外, in/out).
+Treat brief replies such as 继续执行、室内 or continue out as continuation intent.
 Do not run finish-processing tools until scene_mode is known and a finish-processing
 phase plan is finalized.
-When the user provides 继续执行 plus scene mode for a waiting task, update the task scene mode, reconcile artifacts, finalize_finish_processing_plan_tool, then execute finish-processing tools step-by-step.
-First inspect raw metadata topics with inspect_raw_date_tool, then call infer_navigation_sensor_bindings_tool
-and infer_navigation_processing_profile_tool.
+When the user indicates they are ready to continue and provides scene mode for a waiting task, update the task scene mode, reconcile artifacts, finalize_finish_processing_plan_tool, then execute finish-processing tools step-by-step.
+For extract/sync planning, inspect raw metadata topics with inspect_raw_date_tool, then call
+infer_navigation_sensor_bindings_tool and infer_navigation_topic_params_tool.
+Defer infer_navigation_processing_profile_tool until finish-processing planning after scene_mode is known.
 Call infer_navigation_topic_params_tool before finalizing extract_and_sync_navigation_data parameters.
 Do not require data to match fixed profiles such as u_legacy_like or go2w_like.
 Do not invent TOPIC_WHITELIST, topic_map, query_dir, localization policy, or calibration policy; use tool results.
 Treat platform_hint as a diagnostic hint only; do not use it as a hard selector for topic parameters or projection variants.
-Only finalize when processing_profile, topic_params, and data_profile all have no blocking_issues.
+Only finalize when the current phase profile has no blocking_issues.
 scene_mode is optional during extract/sync planning and required only before finish-processing finalization.
 The extract/sync phase plan contains prepare_raw_data and extract_and_sync_navigation_data only.
 Finish-processing/full plans include confirm_navigation_calibration_params as the first step before any processing in that phase.
@@ -79,11 +81,12 @@ DRAFT_PLAN_AGENT_INSTRUCTIONS = """
 Maintain the internal WorkflowPlan draft with get_workflow_plan_draft_tool,
 update_workflow_plan_draft_tool, finalize_extract_sync_plan_tool,
 finalize_finish_processing_plan_tool, and finalize_workflow_plan_tool.
-Before each SDK tool call, inspect the current draft state: navigation_data_profile_schema,
+Before each SDK tool call, inspect the current draft state: phase_profile_schema,
 data_profile_draft, filled_fields, missing_fields, next_required_observation, next_tool_candidates, and ready_to_finish.
 Follow next_required_observation and next_tool_candidates exactly. Do not skip, reorder, or parallelize
-the read-only investigation sequence: inspect_raw_date_tool, infer_navigation_sensor_bindings_tool,
-infer_navigation_processing_profile_tool, infer_navigation_topic_params_tool, inspect_processing_state_tool,
+the read-only investigation sequence for the current phase. Extract/sync uses inspect_raw_date_tool,
+infer_navigation_sensor_bindings_tool, then infer_navigation_topic_params_tool. Finish-processing uses
+infer_navigation_processing_profile_tool, inspect_processing_state_tool,
 inspect_gridmap_artifacts_tool, inspect_runtime_assets_tool, then list_navigation_tool_capabilities_tool.
 Each planning step must do exactly one step: call one read-only inspection SDK tool,
 then merge only the newly learned facts with update_workflow_plan_draft_tool(data_profile_patch=...).
@@ -91,10 +94,10 @@ Use infer_navigation_sensor_bindings_tool for sensor_bindings and infer_navigati
 processing_profile, localization_policy, calibration_policy, and platform_hint.
 When topic_params is missing, call infer_navigation_topic_params_tool and merge its structured result.
 Set stage_variants from observed facts: explicit_topic_params after topic_params are complete, gridmap variants from inspect_gridmap_artifacts_tool, and projection variants from inspect_runtime_assets_tool plus list_navigation_tool_capabilities_tool. Do not choose projection variants from platform_hint alone.
-Use data_profile_patch for partial NavigationDataProfile facts; do not invent a complete profile in one shot.
+Use data_profile_patch for partial phase-profile facts; do not invent a complete profile in one shot.
 During extract/sync, stop after the topic-parameter observations and call finalize_extract_sync_plan_tool when next_tool_candidates points to it.
 After extract/sync is finalized and scene_mode is available, continue with finish-processing observations and call finalize_finish_processing_plan_tool when next_tool_candidates points to it.
-When the user provides 继续执行 plus scene mode for a waiting task, update the task scene mode, reconcile artifacts, finalize_finish_processing_plan_tool, then execute finish-processing tools step-by-step.
+When the user indicates they are ready to continue and provides scene mode for a waiting task, update the task scene mode, reconcile artifacts, finalize_finish_processing_plan_tool, then execute finish-processing tools step-by-step.
 finalize_workflow_plan_tool remains the compatibility full-plan finalizer when the draft is already in a full/finish-ready phase.
 Do not hand-write script-level plans; final WorkflowPlan JSON must come from the phase-appropriate finalize_* tool.
 Do not output textual Action: lines or ToolName[arguments] strings.
@@ -106,7 +109,7 @@ def _load_plan_agent_guidance() -> str:
     try:
         return guidance_path.read_text(encoding="utf-8").strip()
     except OSError:
-        return "navigation-plan-agent-guidance: use lightweight NavigationDataProfile and stage_variants."
+        return "navigation-plan-agent-guidance: use phase-scoped profiles and stage_variants."
 
 
 def _plan_agent_instructions(*, include_draft_tools: bool) -> str:
@@ -117,7 +120,7 @@ def _plan_agent_instructions(*, include_draft_tools: bool) -> str:
     else:
         parts.append(
             "No request-bound draft tools are registered; return strict WorkflowPlan JSON if asked to plan directly. "
-            "Guidance reference: navigation-plan-agent-guidance; use lightweight NavigationDataProfile, "
+            "Guidance reference: navigation-plan-agent-guidance; use phase-scoped profiles, "
             "stage_variants, and list_navigation_tool_capabilities_tool."
         )
     return "\n\n".join(parts)
@@ -129,11 +132,9 @@ Read WorkflowPlan JSON and execute matching tools step-by-step.
 For each WorkflowStep.tool_name, call the SDK tool with the same name plus "_tool"; for example,
 prepare_raw_data maps to prepare_raw_data_tool and run_initial_annotation_gui maps to run_initial_annotation_gui_tool.
 Stop on any failed tool result.
-The first WorkflowPlan step must be confirm_navigation_calibration_params; confirm camera and sensor parameters before prepare_raw_data or any processing.
-When executing confirm_navigation_calibration_params, stop and wait for exact user input.
-Do not provide user_confirmation yourself during the initial workflow turn; call the tool without user_confirmation, show the confirmation prompt, and stop.
-Continue only when user_confirmation is exactly `确认`.
-If the user enters `终止` or anything else, stop workflow and report calibration_params_not_confirmed.
+The first finish-processing WorkflowPlan step must be confirm_navigation_calibration_params.
+When executing confirm_navigation_calibration_params, use the external confirmation result for camera and sensor parameters. Do not ask the user to type magic confirmation text.
+Continue only when the external confirmation result confirms the parameters. Stop if the result is stop or guidance.
 run_noobscene_preprocessing receives localization_source and localization_conversion from WorkflowPlan.
 The gen_box.py GUI step is human-blocking via run_initial_annotation_gui and blocks until the human finishes.
 Stage one covers prepare.sh, run_U.sh, and run_odom.sh only; do not include run_fix.sh.

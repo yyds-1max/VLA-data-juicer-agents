@@ -15,51 +15,47 @@ Planning workflow:
 1. Load the session-scoped workflow plan draft.
 2. Create or load the durable navigation task and reconcile it with current
    artifacts before deciding whether to rerun extract/sync or continue.
-3. Inspect raw metadata topics.
+3. For `extract_sync`, inspect raw metadata topics.
 4. Infer sensor bindings.
-5. Infer processing_profile.
-6. Infer topic_params from the role bindings.
-7. For `extract_sync`, merge processing_profile, platform_hint, topic_params,
-   localization_policy, calibration_policy, and the
-   `extract_and_sync_navigation_data` stage variant into the draft.
-8. If `scene_mode` is missing, finalize and execute only the `extract_sync`
+5. Infer topic_params from the role bindings.
+6. Merge only extract/sync facts into the draft: sensor_bindings,
+   topic_params, and the `extract_and_sync_navigation_data` stage variant.
+7. If `scene_mode` is missing, finalize and execute only the `extract_sync`
    phase. Stop after sync completes, reconcile again, and set the task to
-   `waiting_scene_mode` with `next_required_input=scene_mode`.
-9. For `finish_processing`, require `scene_mode`, reconcile first, inspect
+   `waiting_scene_mode` with `next_required_input=scene_mode`. Tell the user
+   they can inspect synced images, then ask them to reply when ready and
+   include whether the scene is indoor or outdoor (`室内`/`室外`, `in`/`out`).
+8. For `finish_processing`, require `scene_mode`, reconcile first, infer
+   processing_profile, localization_policy, and calibration_policy, inspect
    existing processing state and grid_map artifacts, inspect runtime assets,
    list tool capabilities, and merge downstream stage variants into the draft.
-10. If any blocking_issues are non-empty, stop planning and report the issues.
-11. Execute only the phase-appropriate finalized WorkflowPlan.
+9. If any blocking_issues are non-empty, stop planning and report the issues.
+10. Execute only the phase-appropriate finalized WorkflowPlan.
 
 Use the structured handoff `date` as the dataset date. Do not derive the dataset date
 from clip names, because clip names may contain an older capture timestamp prefix.
 
 Call `list_navigation_tool_capabilities_tool` before choosing finish-processing variants.
-Call `update_workflow_plan_draft_tool` with the lightweight data profile.
+Call `update_workflow_plan_draft_tool` with current phase-profile facts.
 Call `finalize_extract_sync_plan_tool` for phase 1, then
 `finalize_finish_processing_plan_tool` for phase 2 after `scene_mode` is known.
 `finalize_workflow_plan_tool` remains only the compatibility full-plan alias.
 Do not hand-write final WorkflowPlan JSON.
 If a finalized plan already exists in the session draft, use it as the durable plan reference and continue from the current AgentScope session state.
 
-The lightweight NavigationDataProfile should summarize:
+The phase profiles should summarize:
 
-- date, segments, optional scene_mode
-- processing_profile
-- platform_hint
-- sensor_bindings
-- topic_params
-- localization_policy
-- calibration_policy
-- gridmap_source
-- projection_input_ready
-- pcd_gridmap_tool_available
-- stage_variants
-- blocking_issues
-- warnings
-- evidence
+- `NavigationExtractSyncProfile`: date, segments, platform_hint,
+  sensor_bindings, topic_params,
+  stage_variants.extract_and_sync_navigation_data, blocking_issues, warnings,
+  and evidence.
+- `NavigationFinishProcessingProfile`: date, segments, scene_mode,
+  processing_profile, platform_hint, sensor_bindings, topic_params,
+  localization_policy, calibration_policy facts via processing_profile,
+  gridmap_source, projection_input_ready, pcd_gridmap_tool_available,
+  downstream stage_variants, blocking_issues, warnings, and evidence.
 
-Do not include full raw topic lists, calibration trees, directory inventories, or large artifact manifests in the data profile. Keep large facts in observations.
+Do not include full raw topic lists, calibration trees, directory inventories, or large artifact manifests in the phase profile. Keep large facts in observations.
 Do not invent `TOPIC_WHITELIST`, `topic_map`, or `query_dir`; copy them from `infer_navigation_topic_params_tool`.
 Do not invent localization policy or calibration policy; copy them from `infer_navigation_processing_profile_tool`.
 `platform_hint` is only a diagnostic hint. Do not use it as a hard selector for topic parameters, extraction variants, or projection variants.
@@ -90,8 +86,8 @@ Localization rules:
 Blocking issues:
 
 - missing scene_mode during `finish_processing`
-- missing or blocking processing_profile
 - missing or blocking topic_params
+- missing or blocking processing_profile during `finish_processing`
 - missing localization_policy
 - missing gridmap source and no PCD gridmap tool
 - capability catalog does not expose the selected tool variant as available

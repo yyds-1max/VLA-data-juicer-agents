@@ -8,7 +8,7 @@ import pytest
 from agentscope.event import RequireUserConfirmEvent
 from agentscope.message import ToolCallBlock
 
-from vla_data_juicer_agents.navigation.models import NavigationDataProfile, NavigationRequest
+from vla_data_juicer_agents.navigation.models import NavigationFinishProcessingProfile, NavigationRequest
 from vla_data_juicer_agents.navigation.plan_draft import WorkflowPlanDraftState
 from vla_data_juicer_agents.navigation.run_state import WorkflowRunStore
 from vla_data_juicer_agents.core.cancellation import CancellationContext, TurnCancelled, current_cancellation
@@ -142,8 +142,8 @@ def _complete_go2w_profile_patch():
     }
 
 
-def _complete_go2w_data_profile() -> NavigationDataProfile:
-    return NavigationDataProfile.model_validate(
+def _complete_go2w_data_profile() -> NavigationFinishProcessingProfile:
+    return NavigationFinishProcessingProfile.model_validate(
         {
             "date": "20270605",
             "scene_mode": "out",
@@ -158,7 +158,7 @@ def _complete_go2w_workflow_plan():
         "parameterized_navigation_v1",
         None,
         scene_mode="out",
-        data_profile=_complete_go2w_data_profile(),
+        phase_profile=_complete_go2w_data_profile(),
     )
 
 
@@ -271,7 +271,7 @@ def test_navigation_agent_prompt_describes_two_phase_task_state_flow(monkeypatch
     assert "extract_sync" in agent.instructions
     assert "waiting_scene_mode" in agent.instructions
     assert "Do not run finish-processing tools until scene_mode is known" in agent.instructions
-    assert "When the user provides 继续执行 plus scene mode for a waiting task" in agent.instructions
+    assert "When the user indicates they are ready to continue and provides scene mode for a waiting task" in agent.instructions
     assert "update the task scene mode, reconcile artifacts" in agent.instructions
     assert "finalize_finish_processing_plan_tool" in agent.instructions
 
@@ -877,9 +877,11 @@ def test_plan_agent_instructions_reference_guidance_and_lightweight_profile(monk
     plan_agent = create_plan_agent()
 
     assert "navigation-plan-agent-guidance" in plan_agent.instructions
-    assert "lightweight NavigationDataProfile" in plan_agent.instructions
+    assert "phase-scoped profiles" in plan_agent.instructions
     assert "stage_variants" in plan_agent.instructions
     assert "list_navigation_tool_capabilities_tool" in plan_agent.instructions
+    assert "reply when ready and include whether the scene is indoor or outdoor" in plan_agent.instructions
+    assert "继续执行 plus" not in plan_agent.instructions
 
 
 def test_request_bound_plan_agent_instructions_require_calibration_before_prepare(monkeypatch):
@@ -904,7 +906,7 @@ def test_plan_agent_instructions_use_processing_profile_not_dataset_profile():
     instructions = PLAN_AGENT_INSTRUCTIONS
 
     assert "infer_navigation_processing_profile_tool" in instructions
-    assert "sensor bindings" in instructions
+    assert "sensor_bindings" in instructions or "sensor bindings" in instructions
     assert "processing_profile" in instructions
     assert "platform_hint as a diagnostic hint" in instructions
     assert "explicit_topic_params" in instructions
@@ -933,13 +935,14 @@ def test_draft_plan_agent_instructions_use_processing_profile_flow():
     assert "classification" not in instructions
 
 
-def test_executor_agent_instructions_require_exact_calibration_confirmation():
+def test_executor_agent_instructions_use_external_calibration_confirmation():
     instructions = EXECUTOR_AGENT_INSTRUCTIONS
 
     assert "confirm_navigation_calibration_params" in instructions
-    assert "user_confirmation is exactly `确认`" in instructions
-    assert "`终止`" in instructions
-    assert "calibration_params_not_confirmed" in instructions
+    assert "external confirmation result" in instructions
+    assert "Do not ask the user to type" in instructions
+    assert "user_confirmation is exactly `确认`" not in instructions
+    assert "`终止`" not in instructions
     assert "localization_source and localization_conversion from WorkflowPlan" in instructions
 
 
@@ -1172,7 +1175,7 @@ def test_run_plan_agent_prompt_injects_current_profile_draft_state():
     asyncio.run(run_plan_agent(agent, request))
 
     prompt = agent.prompts[0]
-    assert "NavigationDataProfile schema" in prompt
+    assert "phase profile schema" in prompt
     assert "data_profile_draft" in prompt
     assert "missing_fields" in prompt
     assert "ready_to_finish" in prompt

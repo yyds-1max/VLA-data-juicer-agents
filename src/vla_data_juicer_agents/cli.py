@@ -7,7 +7,7 @@ import sys
 from vla_data_juicer_agents.navigation.agents import create_executor_agent, create_plan_agent
 from vla_data_juicer_agents.navigation.config import NavigationSettings
 from vla_data_juicer_agents.navigation.inspection import infer_navigation_processing_profile
-from vla_data_juicer_agents.navigation.models import NavigationDataProfile, NavigationRequest
+from vla_data_juicer_agents.navigation.models import NavigationFinishProcessingProfile, NavigationRequest
 from vla_data_juicer_agents.navigation.run_state import WorkflowRunStore
 from vla_data_juicer_agents.navigation.workflow import (
     build_deterministic_plan_template,
@@ -76,7 +76,7 @@ async def async_main(argv: list[str] | None = None) -> int:
                 },
             )
             return 2
-        data_profile = NavigationDataProfile(
+        phase_profile = NavigationFinishProcessingProfile(
             date=request.date,
             segments=request.segments,
             scene_mode=request.scene_mode,
@@ -96,7 +96,7 @@ async def async_main(argv: list[str] | None = None) -> int:
             processing_profile.id,
             request.segments,
             scene_mode=request.scene_mode,
-            data_profile=data_profile,
+            phase_profile=phase_profile,
         )
     else:
         plan_agent = create_plan_agent(model=args.model, request=request)

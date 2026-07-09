@@ -1,7 +1,7 @@
 import pytest
 
 from vla_data_juicer_agents.navigation.models import (
-    NavigationDataProfile,
+    NavigationFinishProcessingProfile,
     NavigationProcessingProfile,
     NavigationTopicParams,
     PlanIssue,
@@ -35,8 +35,8 @@ def _processing_profile(
     )
 
 
-def _go2w_data_profile() -> NavigationDataProfile:
-    return NavigationDataProfile(
+def _go2w_data_profile() -> NavigationFinishProcessingProfile:
+    return NavigationFinishProcessingProfile(
         date="20270605",
         scene_mode="out",
         processing_profile=_processing_profile(profile_hint="go2w_like", platform_hint="go2w"),
@@ -69,10 +69,10 @@ def test_validate_workflow_plan_accepts_default_template():
         "parameterized_navigation_v1",
         None,
         scene_mode="out",
-        data_profile=profile,
+        phase_profile=profile,
     )
 
-    result = validate_workflow_plan(plan, data_profile=profile)
+    result = validate_workflow_plan(plan, phase_profile=profile)
 
     assert result["ok"] is True
     assert result["errors"] == []
@@ -100,12 +100,12 @@ def test_validate_workflow_plan_rejects_unknown_variant():
         "parameterized_navigation_v1",
         None,
         scene_mode="out",
-        data_profile=profile,
+        phase_profile=profile,
     )
     gridmap = next(step for step in plan.steps if step.tool_name == "prepare_gridmap_for_projection")
     gridmap.variant = "made_up_variant"
 
-    result = validate_workflow_plan(plan, data_profile=profile)
+    result = validate_workflow_plan(plan, phase_profile=profile)
 
     assert result["ok"] is False
     assert result["errors"][0]["type"] == "unknown_or_unavailable_variant"
@@ -163,7 +163,7 @@ def test_validate_workflow_plan_rejects_cyclic_precondition():
 
 
 def test_validate_workflow_plan_accepts_mixed_topic_strategy_variants():
-    profile = NavigationDataProfile(
+    profile = NavigationFinishProcessingProfile(
         date="20270605",
         scene_mode="out",
         processing_profile=_processing_profile(profile_hint="hybrid", platform_hint="unknown"),
@@ -193,7 +193,7 @@ def test_validate_workflow_plan_accepts_mixed_topic_strategy_variants():
         ],
     )
 
-    result = validate_workflow_plan(plan, data_profile=profile)
+    result = validate_workflow_plan(plan, phase_profile=profile)
 
     assert result["ok"] is True
     assert result["errors"] == []
@@ -228,13 +228,13 @@ def test_validate_workflow_plan_rejects_gridmap_before_tracking():
         "parameterized_navigation_v1",
         None,
         scene_mode="out",
-        data_profile=profile,
+        phase_profile=profile,
     )
     gridmap_index = next(index for index, step in enumerate(plan.steps) if step.tool_name == "prepare_gridmap_for_projection")
     tracking_index = next(index for index, step in enumerate(plan.steps) if step.tool_name == "run_tracking")
     plan.steps[gridmap_index], plan.steps[tracking_index] = plan.steps[tracking_index], plan.steps[gridmap_index]
 
-    result = validate_workflow_plan(plan, data_profile=profile)
+    result = validate_workflow_plan(plan, phase_profile=profile)
 
     assert result["ok"] is False
     assert result["errors"][0]["type"] == "invalid_gridmap_stage_order"
@@ -247,27 +247,29 @@ def test_validate_workflow_plan_rejects_active_plan_with_blocking_profile():
         None,
         scene_mode="out",
     )
-    profile = NavigationDataProfile(
+    profile = NavigationFinishProcessingProfile(
         date="20270605",
         scene_mode="out",
         processing_profile=_processing_profile(),
         localization_policy={"source": "odom", "conversion": "odom_to_ins"},
+        topic_params=_topic_params(),
         blocking_issues=[PlanIssue(type="missing_gridmap_source_or_generator")],
     )
 
-    result = validate_workflow_plan(plan, data_profile=profile)
+    result = validate_workflow_plan(plan, phase_profile=profile)
 
     assert result["ok"] is False
     assert result["errors"][0]["type"] == "blocking_profile_has_active_plan"
 
 
 def test_validate_workflow_plan_rejects_variant_selector_mismatch():
-    profile = NavigationDataProfile(
+    profile = NavigationFinishProcessingProfile(
         date="20270605",
         scene_mode="out",
         processing_profile=_processing_profile(platform_hint="go2w"),
         platform_hint="go2w",
         localization_policy={"source": "odom", "conversion": "odom_to_ins"},
+        topic_params=_topic_params(),
         gridmap_source="existing_gridmap",
     )
     plan = build_deterministic_plan_template(
@@ -275,23 +277,24 @@ def test_validate_workflow_plan_rejects_variant_selector_mismatch():
         "parameterized_navigation_v1",
         None,
         scene_mode="out",
-        data_profile=profile,
+        phase_profile=profile,
     )
     gridmap = next(step for step in plan.steps if step.tool_name == "prepare_gridmap_for_projection")
     gridmap.variant = "generate_from_pcd"
 
-    result = validate_workflow_plan(plan, data_profile=profile)
+    result = validate_workflow_plan(plan, phase_profile=profile)
 
     assert result["ok"] is False
     assert result["errors"][0]["type"] == "variant_selector_mismatch"
 
 
 def test_validate_workflow_plan_blocks_unknown_gridmap_without_issue():
-    profile = NavigationDataProfile(
+    profile = NavigationFinishProcessingProfile(
         date="20270605",
         scene_mode="out",
         processing_profile=_processing_profile(),
         localization_policy={"source": "odom", "conversion": "odom_to_ins"},
+        topic_params=_topic_params(),
         gridmap_source="unknown",
         pcd_gridmap_tool_available=False,
     )
@@ -300,10 +303,10 @@ def test_validate_workflow_plan_blocks_unknown_gridmap_without_issue():
         "parameterized_navigation_v1",
         None,
         scene_mode="out",
-        data_profile=profile,
+        phase_profile=profile,
     )
 
-    result = validate_workflow_plan(plan, data_profile=profile)
+    result = validate_workflow_plan(plan, phase_profile=profile)
 
     assert result["ok"] is False
     assert result["errors"][0]["type"] == "missing_gridmap_source_or_generator"
@@ -331,7 +334,7 @@ def test_validate_workflow_plan_rejects_missing_calibration_confirmation_directl
         "parameterized_navigation_v1",
         None,
         scene_mode="out",
-        data_profile=profile,
+        phase_profile=profile,
     )
     plan.steps = [
         step
@@ -345,7 +348,7 @@ def test_validate_workflow_plan_rejects_missing_calibration_confirmation_directl
             if precondition != "confirm_navigation_calibration_params"
         ]
 
-    result = validate_workflow_plan(plan, data_profile=profile)
+    result = validate_workflow_plan(plan, phase_profile=profile)
 
     assert result["ok"] is False
     error = _error_by_type(result, "missing_calibration_confirmation")
@@ -359,7 +362,7 @@ def test_validate_workflow_plan_rejects_wrong_calibration_confirmation_tool_dire
         "parameterized_navigation_v1",
         None,
         scene_mode="out",
-        data_profile=profile,
+        phase_profile=profile,
     )
     confirmation = next(
         step
@@ -368,7 +371,7 @@ def test_validate_workflow_plan_rejects_wrong_calibration_confirmation_tool_dire
     )
     confirmation.tool_name = "prepare_raw_data"
 
-    result = validate_workflow_plan(plan, data_profile=profile)
+    result = validate_workflow_plan(plan, phase_profile=profile)
 
     assert result["ok"] is False
     assert _error_by_type(result, "invalid_calibration_confirmation_tool")["details"] == {
@@ -384,7 +387,7 @@ def test_validate_workflow_plan_rejects_calibration_confirmation_not_first_direc
         "parameterized_navigation_v1",
         None,
         scene_mode="out",
-        data_profile=profile,
+        phase_profile=profile,
     )
     plan.steps.insert(
         0,
@@ -395,7 +398,7 @@ def test_validate_workflow_plan_rejects_calibration_confirmation_not_first_direc
         ),
     )
 
-    result = validate_workflow_plan(plan, data_profile=profile)
+    result = validate_workflow_plan(plan, phase_profile=profile)
 
     assert result["ok"] is False
     error = _error_by_type(result, "invalid_calibration_confirmation_order")
@@ -409,7 +412,7 @@ def test_validate_workflow_plan_rejects_calibration_confirmation_after_prepare_d
         "parameterized_navigation_v1",
         None,
         scene_mode="out",
-        data_profile=profile,
+        phase_profile=profile,
     )
     confirm_index = next(
         index
@@ -426,7 +429,7 @@ def test_validate_workflow_plan_rejects_calibration_confirmation_after_prepare_d
         plan.steps[confirm_index],
     )
 
-    result = validate_workflow_plan(plan, data_profile=profile)
+    result = validate_workflow_plan(plan, phase_profile=profile)
 
     assert result["ok"] is False
     assert any(
@@ -478,7 +481,7 @@ def test_validate_workflow_plan_rejects_invalid_calibration_confirmation_flags_d
         "parameterized_navigation_v1",
         None,
         scene_mode="out",
-        data_profile=profile,
+        phase_profile=profile,
     )
     confirmation = next(
         step
@@ -487,7 +490,7 @@ def test_validate_workflow_plan_rejects_invalid_calibration_confirmation_flags_d
     )
     setattr(confirmation, field, value)
 
-    result = validate_workflow_plan(plan, data_profile=profile)
+    result = validate_workflow_plan(plan, phase_profile=profile)
 
     assert result["ok"] is False
     error = _error_by_type(result, "invalid_calibration_confirmation_flags")

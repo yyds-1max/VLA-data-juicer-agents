@@ -89,3 +89,80 @@ def test_json_store_rejects_stale_unknown_fields(tmp_path: Path):
 
     with pytest.raises(ValidationError):
         JsonNavigationPlanDraftStore(tmp_path).load(session_id)
+
+
+def test_json_store_migrates_legacy_data_profile_field(tmp_path: Path):
+    session_id = "session-with-legacy-profile"
+    digest = hashlib.sha256(session_id.encode("utf-8")).hexdigest()
+    path = tmp_path / f"{digest}.json"
+    payload = {
+        "request": {
+            "date": "20270605",
+            "segments": None,
+            "scene_mode": "out",
+            "dry_run": False,
+        },
+        "plan_phase": "finish_processing",
+        "processing_profile": "parameterized_navigation_v1",
+        "platform_hint": "go2w",
+        "data_profile_draft": {},
+        "data_profile": {
+            "date": "20270605",
+            "segments": None,
+            "scene_mode": "out",
+            "processing_profile": {
+                "id": "parameterized_navigation_v1",
+                "platform_hint": "go2w",
+                "topic_params": {
+                    "topic_whitelist": ["/cam", "/lidar_points", "/sport_odom"],
+                    "topic_map": {
+                        "cam": "fisheye_front",
+                        "lidar_points": "r32_rslidar_points",
+                        "sport_odom": "odom",
+                    },
+                    "query_dir": "lidar_points",
+                },
+                "localization_policy": {"source": "odom", "conversion": "odom_to_ins"},
+            },
+            "platform_hint": "go2w",
+            "localization_policy": {"source": "odom", "conversion": "odom_to_ins"},
+            "topic_params": {
+                "topic_whitelist": ["/cam", "/lidar_points", "/sport_odom"],
+                "topic_map": {
+                    "cam": "fisheye_front",
+                    "lidar_points": "r32_rslidar_points",
+                    "sport_odom": "odom",
+                },
+                "query_dir": "lidar_points",
+            },
+            "stage_variants": {
+                "extract_and_sync_navigation_data": {
+                    "variant": "explicit_topic_params",
+                    "reason": "legacy draft",
+                    "evidence": ["infer_navigation_topic_params_tool"],
+                },
+                "prepare_gridmap_for_projection": {
+                    "variant": "copy_existing_gridmap",
+                    "reason": "legacy draft",
+                    "evidence": ["inspect_gridmap_artifacts_tool"],
+                },
+                "run_projection_and_trajectory": {
+                    "variant": "cjl_with_gridmap",
+                    "reason": "legacy draft",
+                    "evidence": ["inspect_runtime_assets_tool"],
+                },
+            },
+        },
+        "finalized_plan": None,
+        "validation_errors": [],
+        "completed_observations": [],
+    }
+    tmp_path.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(payload), encoding="utf-8")
+
+    restored = JsonNavigationPlanDraftStore(tmp_path).load(session_id)
+
+    assert restored is not None
+    assert restored.finish_processing_profile is not None
+    assert restored.finish_processing_profile.date == "20270605"
+    assert restored.finish_processing_profile.processing_profile.id == "parameterized_navigation_v1"

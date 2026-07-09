@@ -399,7 +399,7 @@ def test_navigation_rule_fallback_is_narrow_and_explicit() -> None:
 def test_web_navigation_prompt_describes_cross_session_resume_gate() -> None:
     prompt = navigation_agent_prompt()
 
-    assert "When the user provides 继续执行 plus scene mode for a waiting task" in prompt
+    assert "When the user indicates they are ready to continue and provides scene mode for a waiting task" in prompt
     assert "update the task scene mode, reconcile artifacts" in prompt
     assert "finalize_finish_processing_plan_tool" in prompt
     assert "finish-processing tools step-by-step" in prompt

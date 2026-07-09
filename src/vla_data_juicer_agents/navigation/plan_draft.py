@@ -6,7 +6,12 @@ from typing import Any
 from agentscope.tool import FunctionTool
 from pydantic import BaseModel, Field, model_validator
 
-from vla_data_juicer_agents.navigation.models import NavigationDataProfile, NavigationRequest, WorkflowPlan
+from vla_data_juicer_agents.navigation.models import (
+    NavigationExtractSyncProfile,
+    NavigationFinishProcessingProfile,
+    NavigationRequest,
+    WorkflowPlan,
+)
 
 
 _INVESTIGATION_OBSERVATION_STEPS: tuple[dict[str, str], ...] = (
@@ -21,14 +26,14 @@ _INVESTIGATION_OBSERVATION_STEPS: tuple[dict[str, str], ...] = (
         "description": "Infer role-based camera, lidar, odom, and Ins bindings from raw topics.",
     },
     {
-        "observation_id": "navigation_processing_profile",
-        "used_tool": "infer_navigation_processing_profile_tool",
-        "description": "Infer processing profile, platform hint, localization policy, and calibration policy.",
-    },
-    {
         "observation_id": "navigation_topic_params",
         "used_tool": "infer_navigation_topic_params_tool",
         "description": "Infer explicit topic_whitelist, topic_map, and query_dir after sensor roles are known.",
+    },
+    {
+        "observation_id": "navigation_processing_profile",
+        "used_tool": "infer_navigation_processing_profile_tool",
+        "description": "Infer processing profile, platform hint, localization policy, and calibration policy.",
     },
     {
         "observation_id": "processing_state",
@@ -55,7 +60,7 @@ _INVESTIGATION_OBSERVATION_STEPS: tuple[dict[str, str], ...] = (
 
 def _observation_steps_for_phase(phase: str) -> tuple[dict[str, str], ...]:
     if phase == "extract_sync":
-        return _INVESTIGATION_OBSERVATION_STEPS[:4]
+        return _INVESTIGATION_OBSERVATION_STEPS[:3]
     return _INVESTIGATION_OBSERVATION_STEPS
 
 
@@ -65,7 +70,8 @@ class WorkflowPlanDraftState(BaseModel):
     processing_profile: str | None = None
     platform_hint: str = "unknown"
     data_profile_draft: dict[str, Any] = Field(default_factory=dict)
-    data_profile: NavigationDataProfile | None = None
+    extract_sync_profile: NavigationExtractSyncProfile | None = None
+    finish_processing_profile: NavigationFinishProcessingProfile | None = None
     finalized_plan: WorkflowPlan | None = None
     validation_errors: list[str] = Field(default_factory=list)
     completed_observations: list[dict[str, str]] = Field(default_factory=list)
@@ -103,13 +109,13 @@ class WorkflowPlanDraftState(BaseModel):
         if scene_mode not in {"in", "out"}:
             raise ValueError("scene_mode must be 'in' or 'out'")
         self.request = self.request.model_copy(update={"scene_mode": scene_mode})
-        self._refresh_data_profile_from_draft()
+        self._refresh_phase_profiles_from_draft()
 
     def advance_to_finish_processing(self, *, scene_mode: str | None = None) -> None:
         if scene_mode in {"in", "out"}:
             self.request = self.request.model_copy(update={"scene_mode": scene_mode})
         self.plan_phase = "finish_processing"
-        self._refresh_data_profile_from_draft(phase="finish_processing")
+        self._refresh_phase_profiles_from_draft(phase="finish_processing")
 
     def _request_data_profile_seed(self) -> dict[str, Any]:
         seed: dict[str, Any] = {
@@ -136,11 +142,6 @@ class WorkflowPlanDraftState(BaseModel):
         missing: list[str] = []
         if effective_phase in {"finish_processing", "full"} and draft.get("scene_mode") not in {"in", "out"}:
             missing.append("scene_mode")
-        processing_profile = draft.get("processing_profile")
-        if not isinstance(processing_profile, dict) or not isinstance(processing_profile.get("id"), str):
-            missing.append("processing_profile")
-        elif processing_profile.get("blocking_issues"):
-            missing.append("processing_profile.blocking_issues")
         topic_params = draft.get("topic_params")
         if not isinstance(topic_params, dict):
             missing.append("topic_params")
@@ -148,8 +149,14 @@ class WorkflowPlanDraftState(BaseModel):
             missing.append("topic_params.blocking_issues")
         if draft.get("blocking_issues"):
             missing.append("blocking_issues")
-        if not isinstance(draft.get("localization_policy"), dict):
-            missing.append("localization_policy")
+        if effective_phase in {"finish_processing", "full"}:
+            processing_profile = draft.get("processing_profile")
+            if not isinstance(processing_profile, dict) or not isinstance(processing_profile.get("id"), str):
+                missing.append("processing_profile")
+            elif processing_profile.get("blocking_issues"):
+                missing.append("processing_profile.blocking_issues")
+            if not isinstance(draft.get("localization_policy"), dict):
+                missing.append("localization_policy")
         stage_variants = draft.get("stage_variants") or {}
         stage_names = ["extract_and_sync_navigation_data"]
         if effective_phase in {"finish_processing", "full"}:
@@ -162,8 +169,7 @@ class WorkflowPlanDraftState(BaseModel):
     def ready_to_finish(self, *, phase: str | None = None) -> bool:
         effective_phase = phase or self.plan_phase
         return (
-            self.processing_profile is not None
-            and not self.missing_fields(phase=effective_phase)
+            not self.missing_fields(phase=effective_phase)
             and not self.validation_errors
         )
 
@@ -234,11 +240,22 @@ class WorkflowPlanDraftState(BaseModel):
             "plan_phase": self.plan_phase,
             "processing_profile": self.processing_profile or "<processing_profile.id>",
             "platform_hint": self.platform_hint,
-            "navigation_data_profile_schema": _navigation_data_profile_schema(),
+            "phase_profile_schema": _phase_profile_schema(self.plan_phase),
+            "extract_sync_profile_schema": _extract_sync_profile_schema(),
+            "finish_processing_profile_schema": _finish_processing_profile_schema(),
             "data_profile_draft": data_profile_draft,
-            "data_profile": self.data_profile.model_dump(mode="json") if self.data_profile is not None else None,
+            "extract_sync_profile": (
+                self.extract_sync_profile.model_dump(mode="json")
+                if self.extract_sync_profile is not None
+                else None
+            ),
+            "finish_processing_profile": (
+                self.finish_processing_profile.model_dump(mode="json")
+                if self.finish_processing_profile is not None
+                else None
+            ),
             "finalized_plan": self.finalized_plan.model_dump(mode="json") if self.finalized_plan is not None else None,
-            "steps": "<generated by phase-aware finalize_* plan tools after processing_profile is complete>",
+            "steps": "<generated by phase-aware finalize_* plan tools after the current phase profile is complete>",
             "filled_fields": self.filled_fields(),
             "missing_fields": self.missing_fields(),
             "required_observations": [step["observation_id"] for step in self.required_observation_steps()],
@@ -266,15 +283,19 @@ class WorkflowPlanDraftState(BaseModel):
 
     def update(
         self,
-        data_profile: dict[str, Any] | NavigationDataProfile | str | None = None,
+        phase_profile: dict[str, Any] | NavigationExtractSyncProfile | NavigationFinishProcessingProfile | str | None = None,
         data_profile_patch: dict[str, Any] | str | None = None,
         observation_id: str | None = None,
         used_tool: str | None = None,
     ) -> dict[str, Any]:
         self.validation_errors.clear()
         patch: dict[str, Any] = {}
-        if data_profile is not None:
-            patch = _coerce_profile_patch(data_profile, field_name="data_profile", errors=self.validation_errors)
+        if phase_profile is not None:
+            patch = _coerce_profile_patch(
+                phase_profile,
+                field_name="phase_profile",
+                errors=self.validation_errors,
+            )
         if data_profile_patch is not None:
             _deep_merge(
                 patch,
@@ -290,10 +311,10 @@ class WorkflowPlanDraftState(BaseModel):
             self.validation_errors.append(
                 "empty data_profile_patch cannot complete an observation"
             )
-            self._refresh_data_profile_from_draft()
+            self._refresh_phase_profiles_from_draft()
             return self.status()
         if self.validation_errors:
-            self._refresh_data_profile_from_draft()
+            self._refresh_phase_profiles_from_draft()
             return self.status()
         patch_processing_profile = patch.get("processing_profile")
         if isinstance(patch_processing_profile, dict):
@@ -324,25 +345,37 @@ class WorkflowPlanDraftState(BaseModel):
             if used_tool is not None:
                 observation["used_tool"] = used_tool
             self.completed_observations.append(observation)
-        self._refresh_data_profile_from_draft()
+        self._refresh_phase_profiles_from_draft()
+        if self.missing_fields(phase="finish_processing") == []:
+            self._refresh_phase_profiles_from_draft(phase="finish_processing")
         return self.status()
 
-    def _refresh_data_profile_from_draft(self, *, phase: str | None = None) -> None:
+    def _refresh_phase_profiles_from_draft(self, *, phase: str | None = None) -> None:
         effective_phase = phase or self.plan_phase
         if self.missing_fields(phase=effective_phase):
-            self.data_profile = None
+            if effective_phase == "extract_sync":
+                self.extract_sync_profile = None
+            else:
+                self.finish_processing_profile = None
             return
-        if effective_phase == "extract_sync" and self.missing_fields(phase="finish_processing"):
-            self.data_profile = None
-            return
+        profile_model = (
+            NavigationExtractSyncProfile
+            if effective_phase == "extract_sync"
+            else NavigationFinishProcessingProfile
+        )
         try:
-            parsed_profile = NavigationDataProfile.model_validate(self.current_data_profile_draft())
+            parsed_profile = profile_model.model_validate(self.current_data_profile_draft())
         except Exception as exc:
-            self.data_profile = None
-            self.validation_errors.append(f"invalid data_profile: {exc}")
+            if effective_phase == "extract_sync":
+                self.extract_sync_profile = None
+            else:
+                self.finish_processing_profile = None
+            self.validation_errors.append(f"invalid phase_profile: {exc}")
         else:
-            self.data_profile = parsed_profile
-            if parsed_profile.processing_profile is not None:
+            if isinstance(parsed_profile, NavigationExtractSyncProfile):
+                self.extract_sync_profile = parsed_profile
+            else:
+                self.finish_processing_profile = parsed_profile
                 self.processing_profile = parsed_profile.processing_profile.id
                 self.platform_hint = (
                     parsed_profile.processing_profile.platform_hint
@@ -358,41 +391,36 @@ class WorkflowPlanDraftState(BaseModel):
         }
 
 
-def _finish_processing_data_profile_from_draft(state: WorkflowPlanDraftState) -> NavigationDataProfile:
-    state._refresh_data_profile_from_draft(phase="finish_processing")
-    if state.data_profile is None:
+def _finish_processing_profile_from_draft(state: WorkflowPlanDraftState) -> NavigationFinishProcessingProfile:
+    state._refresh_phase_profiles_from_draft(phase="finish_processing")
+    if state.finish_processing_profile is None:
         missing = ", ".join(state.missing_fields(phase="finish_processing")) or "invalid profile fields"
-        raise ValueError(f"NavigationDataProfile draft is incomplete; missing: {missing}")
-    if state.data_profile.processing_profile is None:
-        raise ValueError("processing_profile is required before finalizing WorkflowPlan")
-    if state.data_profile.topic_params is None:
-        raise ValueError("topic_params is required before finalizing WorkflowPlan")
-    if state.data_profile.localization_policy is None:
-        raise ValueError("localization_policy is required before finalizing WorkflowPlan")
-    if state.data_profile.processing_profile.blocking_issues:
-        issues = ", ".join(issue.type for issue in state.data_profile.processing_profile.blocking_issues)
+        raise ValueError(f"finish-processing profile draft is incomplete; missing: {missing}")
+    profile = state.finish_processing_profile
+    if profile.processing_profile.blocking_issues:
+        issues = ", ".join(issue.type for issue in profile.processing_profile.blocking_issues)
         raise ValueError(f"cannot finalize WorkflowPlan with blocking processing profile: {issues}")
-    if state.data_profile.topic_params.blocking_issues:
-        issues = ", ".join(issue.type for issue in state.data_profile.topic_params.blocking_issues)
+    if profile.topic_params.blocking_issues:
+        issues = ", ".join(issue.type for issue in profile.topic_params.blocking_issues)
         raise ValueError(f"cannot finalize WorkflowPlan with blocking topic params: {issues}")
-    if state.data_profile.scene_mode not in {"in", "out"}:
+    if profile.scene_mode not in {"in", "out"}:
         raise ValueError("scene_mode is required before finalizing WorkflowPlan; expected 'in' or 'out'.")
-    if state.data_profile is not None and state.data_profile.blocking_issues:
-        issues = ", ".join(issue.type for issue in state.data_profile.blocking_issues)
+    if profile.blocking_issues:
+        issues = ", ".join(issue.type for issue in profile.blocking_issues)
         raise ValueError(f"cannot finalize WorkflowPlan with blocking issues: {issues}")
-    return state.data_profile
+    return profile
 
 
 def build_plan_from_draft(state: WorkflowPlanDraftState) -> WorkflowPlan:
     from vla_data_juicer_agents.navigation.workflow import build_deterministic_plan_template
 
-    data_profile = _finish_processing_data_profile_from_draft(state)
+    data_profile = _finish_processing_profile_from_draft(state)
     plan = build_deterministic_plan_template(
         data_profile.date,
         data_profile.processing_profile.id,
         data_profile.segments,
         scene_mode=data_profile.scene_mode,
-        data_profile=data_profile,
+        phase_profile=data_profile,
     )
     return plan.model_copy(
         update={
@@ -406,13 +434,13 @@ def build_plan_from_draft(state: WorkflowPlanDraftState) -> WorkflowPlan:
 def build_finish_processing_plan_from_draft(state: WorkflowPlanDraftState) -> WorkflowPlan:
     from vla_data_juicer_agents.navigation.workflow import build_finish_processing_plan_template
 
-    data_profile = _finish_processing_data_profile_from_draft(state)
+    data_profile = _finish_processing_profile_from_draft(state)
     plan = build_finish_processing_plan_template(
         data_profile.date,
         data_profile.processing_profile.id,
         data_profile.segments,
         scene_mode=data_profile.scene_mode,
-        data_profile=data_profile,
+        phase_profile=data_profile,
     )
     return plan.model_copy(
         update={
@@ -429,24 +457,25 @@ def build_extract_sync_plan_from_draft(state: WorkflowPlanDraftState) -> Workflo
     missing = state.missing_fields(phase="extract_sync")
     if missing:
         raise ValueError(f"extract-sync draft is incomplete; missing: {', '.join(missing)}")
+    state._refresh_phase_profiles_from_draft(phase="extract_sync")
+    if state.extract_sync_profile is None:
+        raise ValueError("extract-sync profile draft is incomplete; missing: invalid profile fields")
     return build_extract_sync_plan_template(
         state.date,
         state.processing_profile,
         state.segments,
-        data_profile_draft=state.current_data_profile_draft(),
+        phase_profile=state.extract_sync_profile,
     )
 
 
 def build_plan_draft_tools(state: WorkflowPlanDraftState) -> list[FunctionTool]:
     def update_workflow_plan_draft_tool(
-        data_profile: dict[str, Any] | str | None = None,
         data_profile_patch: dict[str, Any] | str | None = None,
         observation_id: str | None = None,
         used_tool: str | None = None,
     ) -> dict[str, Any]:
-        """Merge one observed NavigationDataProfile patch into the internal draft."""
+        """Merge one observed phase-profile patch into the internal draft."""
         return state.update(
-            data_profile=data_profile,
             data_profile_patch=data_profile_patch,
             observation_id=observation_id,
             used_tool=used_tool,
@@ -457,7 +486,7 @@ def build_plan_draft_tools(state: WorkflowPlanDraftState) -> list[FunctionTool]:
         return state.status()
 
     def finalize_workflow_plan_tool() -> dict[str, Any]:
-        """Finalize and return strict WorkflowPlan JSON after the NavigationDataProfile draft is complete."""
+        """Finalize and return strict WorkflowPlan JSON after the phase profile draft is complete."""
         plan = build_plan_from_draft(state)
         state.finalized_plan = plan
         return {
@@ -525,12 +554,12 @@ def _normalize_gridmap_generation_source(draft: dict[str, Any]) -> None:
 
 
 def _coerce_profile_patch(
-    value: dict[str, Any] | NavigationDataProfile | str,
+    value: dict[str, Any] | NavigationExtractSyncProfile | NavigationFinishProcessingProfile | str,
     *,
     field_name: str,
     errors: list[str],
 ) -> dict[str, Any]:
-    if isinstance(value, NavigationDataProfile):
+    if isinstance(value, (NavigationExtractSyncProfile, NavigationFinishProcessingProfile)):
         return value.model_dump(mode="json")
     if isinstance(value, dict):
         return value
@@ -556,8 +585,12 @@ def _filled_paths(value: Any, prefix: str = "") -> set[str]:
     return paths
 
 
-def _navigation_data_profile_schema() -> dict[str, Any]:
-    schema = NavigationDataProfile.model_json_schema()
+def _extract_sync_profile_schema() -> dict[str, Any]:
+    return NavigationExtractSyncProfile.model_json_schema()
+
+
+def _finish_processing_profile_schema() -> dict[str, Any]:
+    schema = NavigationFinishProcessingProfile.model_json_schema()
     properties = schema.setdefault("properties", {})
     properties.setdefault("scene_mode", {})["enum"] = ["in", "out"]
     properties.setdefault("gridmap_source", {})["enum"] = [
@@ -567,3 +600,9 @@ def _navigation_data_profile_schema() -> dict[str, Any]:
         "unknown",
     ]
     return schema
+
+
+def _phase_profile_schema(phase: str) -> dict[str, Any]:
+    if phase == "extract_sync":
+        return _extract_sync_profile_schema()
+    return _finish_processing_profile_schema()

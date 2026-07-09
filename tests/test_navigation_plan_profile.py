@@ -2,7 +2,7 @@ from pydantic import ValidationError
 
 from vla_data_juicer_agents.navigation.models import (
     NavigationCalibrationPolicy,
-    NavigationDataProfile,
+    NavigationFinishProcessingProfile,
     NavigationLocalizationPolicy,
     NavigationRequest,
     NavigationProcessingProfile,
@@ -85,7 +85,7 @@ def test_lightweight_navigation_data_profile_keeps_only_variant_decision_facts()
             evidence=["inspect_gridmap_artifacts_tool"],
         )
     }
-    profile = NavigationDataProfile(
+    profile = NavigationFinishProcessingProfile(
         date="20270605",
         scene_mode="out",
         processing_profile=_processing_profile(stage_variants=stage_variants),
@@ -101,12 +101,12 @@ def test_lightweight_navigation_data_profile_keeps_only_variant_decision_facts()
     assert profile.segments is None
     assert profile.projection_input_ready is False
     assert profile.stage_variants["prepare_gridmap_for_projection"].variant == "generate_from_pcd"
-    assert "raw_topics" not in NavigationDataProfile.model_fields
-    assert "calibration" not in NavigationDataProfile.model_fields
+    assert "raw_topics" not in NavigationFinishProcessingProfile.model_fields
+    assert "calibration" not in NavigationFinishProcessingProfile.model_fields
 
 
 def test_navigation_data_profile_records_blocking_issues_without_active_details():
-    profile = NavigationDataProfile(
+    profile = NavigationFinishProcessingProfile(
         date="20270605",
         scene_mode="out",
         processing_profile=_processing_profile(gridmap_source="unknown"),
@@ -129,7 +129,7 @@ def test_navigation_data_profile_records_blocking_issues_without_active_details(
 
 def test_navigation_data_profile_rejects_unknown_variant_inputs():
     with pytest_raises_validation_error():
-        NavigationDataProfile(
+        NavigationFinishProcessingProfile(
             date="20270605",
             scene_mode="warehouse",
         )
@@ -142,13 +142,13 @@ def test_workflow_step_accepts_optional_variant_metadata():
         arguments={"date": "20270605"},
         variant="generate_from_pcd",
         effects="execute",
-        decision_ref="data_profile.stage_variants.prepare_gridmap_for_projection",
+        decision_ref="finish_processing_profile.stage_variants.prepare_gridmap_for_projection",
         evidence=["inspect_gridmap_artifacts_tool"],
     )
 
     assert step.variant == "generate_from_pcd"
     assert step.effects == "execute"
-    assert step.decision_ref == "data_profile.stage_variants.prepare_gridmap_for_projection"
+    assert step.decision_ref == "finish_processing_profile.stage_variants.prepare_gridmap_for_projection"
     assert step.evidence == ["inspect_gridmap_artifacts_tool"]
 
 
@@ -156,7 +156,7 @@ def test_plan_from_lightweight_profile_skips_gridmap_when_projection_input_ready
     state = WorkflowPlanDraftState(
         request=NavigationRequest(date="20270605", scene_mode="out")
     )
-    profile = NavigationDataProfile(
+    profile = NavigationFinishProcessingProfile(
         date="20270605",
         scene_mode="out",
         processing_profile=_processing_profile(
@@ -178,7 +178,7 @@ def test_plan_from_lightweight_profile_skips_gridmap_when_projection_input_ready
         ),
     )
 
-    state.update(data_profile=profile.model_dump(mode="json"))
+    state.update(phase_profile=profile.model_dump(mode="json"))
     plan = build_plan_from_draft(state)
 
     step_names = [step.tool_name for step in plan.steps]
@@ -194,10 +194,11 @@ def test_workflow_plan_draft_snapshot_exposes_react_profile_state_panel():
 
     snapshot = state.schema_snapshot()
 
-    assert snapshot["navigation_data_profile_schema"]["title"] == "NavigationDataProfile"
-    assert "processing_profile" in snapshot["navigation_data_profile_schema"]["properties"]
-    assert "dataset_profile" not in snapshot["navigation_data_profile_schema"]["properties"]
-    assert "topic_params" in snapshot["navigation_data_profile_schema"]["properties"]
+    assert snapshot["phase_profile_schema"]["title"] == "NavigationExtractSyncProfile"
+    assert "processing_profile" not in snapshot["phase_profile_schema"]["properties"]
+    assert "localization_policy" not in snapshot["phase_profile_schema"]["properties"]
+    assert "dataset_profile" not in snapshot["phase_profile_schema"]["properties"]
+    assert "topic_params" in snapshot["phase_profile_schema"]["properties"]
     assert snapshot["data_profile_draft"] == {
         "date": "20270605",
         "scene_mode": "out",
@@ -207,7 +208,6 @@ def test_workflow_plan_draft_snapshot_exposes_react_profile_state_panel():
     assert snapshot["plan_phase"] == "extract_sync"
     assert "date" in snapshot["filled_fields"]
     assert "scene_mode" in snapshot["filled_fields"]
-    assert "processing_profile" in snapshot["missing_fields"]
     assert "topic_params" in snapshot["missing_fields"]
     assert "stage_variants.extract_and_sync_navigation_data" in snapshot["missing_fields"]
     assert "stage_variants.prepare_gridmap_for_projection" not in snapshot["missing_fields"]
@@ -244,7 +244,7 @@ def test_workflow_plan_draft_next_tool_candidates_follow_investigation_order():
         observation_id="sensor_bindings",
         used_tool="infer_navigation_sensor_bindings_tool",
     )
-    assert state.next_tool_candidates() == ["infer_navigation_processing_profile_tool"]
+    assert state.next_tool_candidates() == ["infer_navigation_topic_params_tool"]
 
 
 def test_workflow_plan_draft_does_not_advance_when_later_observation_is_recorded_first():
@@ -268,7 +268,7 @@ def test_workflow_plan_draft_suggests_extract_sync_finalize_after_extract_sync_o
     state = WorkflowPlanDraftState(
         request=NavigationRequest(date="20270605", scene_mode="out")
     )
-    profile = NavigationDataProfile(
+    profile = NavigationFinishProcessingProfile(
         date="20270605",
         scene_mode="out",
         processing_profile=_processing_profile(
@@ -365,9 +365,9 @@ def test_workflow_plan_draft_requires_processing_profile_not_dataset_profile():
 
     snapshot = state.snapshot()
 
-    assert "processing_profile" in snapshot["navigation_data_profile_schema"]["properties"]
-    assert "dataset_profile" not in snapshot["navigation_data_profile_schema"]["properties"]
-    assert "processing_profile" in snapshot["missing_fields"]
+    assert "processing_profile" not in snapshot["phase_profile_schema"]["properties"]
+    assert "dataset_profile" not in snapshot["phase_profile_schema"]["properties"]
+    assert "processing_profile" not in snapshot["missing_fields"]
 
 
 def test_workflow_plan_draft_update_accepts_processing_profile_patch():
@@ -441,7 +441,7 @@ def test_workflow_plan_draft_reports_blocking_issues_with_remediation_candidate(
 
 def test_workflow_plan_draft_uses_nested_platform_hint_when_top_level_is_unknown():
     state = WorkflowPlanDraftState(date="20270605", scene_mode="out")
-    profile = NavigationDataProfile(
+    profile = NavigationFinishProcessingProfile(
         date="20270605",
         scene_mode="out",
         processing_profile=_processing_profile(platform_hint="go2w"),
@@ -454,12 +454,12 @@ def test_workflow_plan_draft_uses_nested_platform_hint_when_top_level_is_unknown
         ),
     )
 
-    result = state.update(data_profile=profile)
+    result = state.update(phase_profile=profile)
 
     assert state.platform_hint == "go2w"
     assert result["draft"]["data_profile_draft"]["platform_hint"] == "go2w"
-    assert state.data_profile is not None
-    assert state.data_profile.platform_hint == "go2w"
+    assert state.finish_processing_profile is not None
+    assert state.finish_processing_profile.platform_hint == "go2w"
 
 
 def test_plan_from_draft_accepts_complete_processing_profile():
@@ -533,7 +533,7 @@ def test_plan_from_draft_accepts_complete_processing_profile():
 
 
 def test_plan_from_processing_profile_inserts_calibration_confirmation_before_processing():
-    data_profile = NavigationDataProfile(
+    data_profile = NavigationFinishProcessingProfile(
         date="20270605",
         scene_mode="out",
         platform_hint="unknown",
@@ -586,7 +586,7 @@ def test_plan_from_processing_profile_inserts_calibration_confirmation_before_pr
         None,
         None,
         scene_mode="out",
-        data_profile=data_profile,
+        phase_profile=data_profile,
     )
     step_ids = [step.step_id for step in plan.steps]
 
@@ -654,9 +654,8 @@ def test_workflow_plan_draft_merges_data_profile_patches_across_react_rounds():
     assert draft["gridmap_source"] == "existing_gridmap"
     assert draft["stage_variants"]["extract_and_sync_navigation_data"]["variant"] == "explicit_topic_params"
     assert draft["stage_variants"]["prepare_gridmap_for_projection"]["variant"] == "copy_existing_gridmap"
-    assert state.data_profile is not None
-    assert state.data_profile.processing_profile is not None
-    assert state.data_profile.processing_profile.id == "parameterized_navigation_v1"
+    assert state.finish_processing_profile is not None
+    assert state.finish_processing_profile.processing_profile.id == "parameterized_navigation_v1"
     assert second["draft"]["ready_to_finish"] is True
     assert second["draft"]["completed_observations"] == [
         {
@@ -680,8 +679,9 @@ def test_workflow_plan_draft_keeps_incomplete_patch_as_draft_only():
 
     assert result["ok"] is True
     assert result["draft"]["data_profile_draft"]["gridmap_source"] == "existing_gridmap"
-    assert "processing_profile" in result["draft"]["missing_fields"]
-    assert state.data_profile is None
+    assert "topic_params" in result["draft"]["missing_fields"]
+    assert state.extract_sync_profile is None
+    assert state.finish_processing_profile is None
 
 
 def test_plan_from_draft_requires_complete_navigation_data_profile():
@@ -691,7 +691,7 @@ def test_plan_from_draft_requires_complete_navigation_data_profile():
 
     state.update(data_profile_patch={"processing_profile": {"id": "parameterized_navigation_v1"}})
 
-    with pytest_raises_value_error("NavigationDataProfile draft is incomplete"):
+    with pytest_raises_value_error("finish-processing profile draft is incomplete"):
         build_plan_from_draft(state)
 
 
@@ -729,7 +729,7 @@ def test_plan_from_lightweight_profile_keeps_gridmap_generation_variant():
     state = WorkflowPlanDraftState(
         request=NavigationRequest(date="20270605", scene_mode="out")
     )
-    profile = NavigationDataProfile(
+    profile = NavigationFinishProcessingProfile(
         date="20270605",
         scene_mode="out",
         processing_profile=_processing_profile(
@@ -749,13 +749,13 @@ def test_plan_from_lightweight_profile_keeps_gridmap_generation_variant():
         ),
     )
 
-    state.update(data_profile=profile.model_dump(mode="json"))
+    state.update(phase_profile=profile.model_dump(mode="json"))
     plan = build_plan_from_draft(state)
     gridmap = next(step for step in plan.steps if step.tool_name == "prepare_gridmap_for_projection")
 
     assert gridmap.variant == "generate_from_pcd"
     assert gridmap.effects == "execute"
-    assert gridmap.decision_ref == "data_profile.stage_variants.prepare_gridmap_for_projection"
+    assert gridmap.decision_ref == "finish_processing_profile.stage_variants.prepare_gridmap_for_projection"
     assert gridmap.evidence == ["inspect_gridmap_artifacts_tool", "inspect_runtime_assets_tool"]
 
 
@@ -790,8 +790,8 @@ def test_plan_draft_normalizes_generated_gridmap_source_from_selected_variant():
         used_tool="inspect_runtime_assets_tool",
     )
 
-    assert state.data_profile is not None
-    assert state.data_profile.gridmap_source == "generated_from_pcd"
+    assert state.finish_processing_profile is not None
+    assert state.finish_processing_profile.gridmap_source == "generated_from_pcd"
     plan = build_plan_from_draft(state)
     gridmap = next(step for step in plan.steps if step.tool_name == "prepare_gridmap_for_projection")
     assert gridmap.variant == "generate_from_pcd"
@@ -801,7 +801,7 @@ def test_plan_from_lightweight_profile_writes_variant_metadata_for_profile_drive
     state = WorkflowPlanDraftState(
         request=NavigationRequest(date="20270605", scene_mode="out")
     )
-    profile = NavigationDataProfile(
+    profile = NavigationFinishProcessingProfile(
         date="20270605",
         scene_mode="out",
         processing_profile=_processing_profile(
@@ -846,7 +846,7 @@ def test_plan_from_lightweight_profile_writes_variant_metadata_for_profile_drive
         },
     )
 
-    state.update(data_profile=profile.model_dump(mode="json"))
+    state.update(phase_profile=profile.model_dump(mode="json"))
     plan = build_plan_from_draft(state)
     steps = {step.tool_name: step for step in plan.steps}
 
@@ -863,12 +863,12 @@ def test_plan_from_lightweight_profile_writes_variant_metadata_for_profile_drive
     }
     assert steps["extract_and_sync_navigation_data"].arguments["query_dir"] == "rs32_lidar_points"
     assert steps["extract_and_sync_navigation_data"].decision_ref == (
-        "data_profile.stage_variants.extract_and_sync_navigation_data"
+            "finish_processing_profile.stage_variants.extract_and_sync_navigation_data"
     )
     assert steps["run_projection_and_trajectory"].variant == "cjl_0525_with_gridmap"
     assert steps["run_projection_and_trajectory"].arguments["projection_variant"] == "cjl_0525_with_gridmap"
     assert steps["run_projection_and_trajectory"].decision_ref == (
-        "data_profile.stage_variants.run_projection_and_trajectory"
+        "finish_processing_profile.stage_variants.run_projection_and_trajectory"
     )
 
 
@@ -876,7 +876,7 @@ def test_plan_from_lightweight_profile_rejects_blocking_issues():
     state = WorkflowPlanDraftState(
         request=NavigationRequest(date="20270605", scene_mode="out")
     )
-    profile = NavigationDataProfile(
+    profile = NavigationFinishProcessingProfile(
         date="20270605",
         scene_mode="out",
         processing_profile=_processing_profile(
@@ -901,7 +901,7 @@ def test_plan_from_lightweight_profile_rejects_blocking_issues():
         ],
     )
 
-    state.update(data_profile=profile.model_dump(mode="json"))
+    state.update(phase_profile=profile.model_dump(mode="json"))
 
     with pytest_raises_value_error("blocking_issues"):
         build_plan_from_draft(state)

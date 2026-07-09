@@ -1359,8 +1359,8 @@ def test_navigation_agent_tools_can_resume_finalized_plan_from_store(tmp_path):
         "source": "odom",
         "conversion": "odom_to_ins",
     }
-    assert resumed["draft"]["data_profile"] is not None
-    assert resumed["draft"]["data_profile"]["date"] == "20270605"
+    assert resumed["draft"]["finish_processing_profile"] is not None
+    assert resumed["draft"]["finish_processing_profile"]["date"] == "20270605"
     assert persisted_state is not None
     assert persisted_state.finalized_plan is not None
     assert persisted_state.finalized_plan.date == "20270605"

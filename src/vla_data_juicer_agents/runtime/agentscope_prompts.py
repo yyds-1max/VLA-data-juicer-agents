@@ -16,8 +16,8 @@ Planning workflow:
 3. Follow the draft `next_required_observation` / `next_tool_candidates` exactly.
 4. Inspect raw metadata topics.
 5. Infer sensor bindings.
-6. Infer processing_profile.
-7. Infer topic_params from the role bindings.
+6. Infer topic_params from the role bindings for extract/sync.
+7. After scene_mode is known, infer processing_profile.
 8. Inspect processing state, gridmap artifacts, runtime assets, and tool capabilities.
 9. Merge processing_profile, platform_hint, topic_params, localization_policy,
    calibration_policy, gridmap facts, and stage_variants into the draft.
@@ -32,42 +32,47 @@ If scene_mode is missing, finalize and execute only the extract_sync phase.
 After extract_and_sync_navigation_data succeeds, reconcile again and update the task to
 phase=waiting_scene_mode, status=waiting_user, next_required_input=scene_mode.
 Tell the user extraction and synchronization are complete and they can inspect synced
-images before continuing. Ask them to reply with 继续执行 plus 室内/in or 室外/out.
+images before continuing. Ask them to reply when ready and include whether the scene is indoor or outdoor (室内/室外, in/out).
+Treat brief replies such as 继续执行、室内 or continue out as continuation intent.
 Do not run finish-processing tools until scene_mode is known and a finish-processing
 phase plan is finalized.
 If user asks to continue a previous navigation task, call list_resumable_navigation_tasks_tool
 or get_or_create_navigation_task_tool by date, then reconcile before deciding whether to
 rerun extract_sync or continue finish_processing.
-When the user provides 继续执行 plus scene mode for a waiting task, update the task scene mode, reconcile artifacts, finalize_finish_processing_plan_tool, then execute finish-processing tools step-by-step.
+When the user indicates they are ready to continue and provides scene mode for a waiting task, update the task scene mode, reconcile artifacts, finalize_finish_processing_plan_tool, then execute finish-processing tools step-by-step.
 
 Use the structured handoff `date` as the dataset date. Do not derive the dataset date
 from clip names, because clip names may contain an older capture timestamp prefix.
 
 Call `list_navigation_tool_capabilities_tool` before choosing variants.
-Call `update_workflow_plan_draft_tool` with the lightweight NavigationDataProfile.
+Call `update_workflow_plan_draft_tool` with the current phase-profile facts.
 Call `finalize_extract_sync_plan_tool` for extract/sync, then `finalize_finish_processing_plan_tool` once scene_mode and finish-processing facts are ready. `finalize_workflow_plan_tool` remains the compatibility full-plan alias. Do not hand-write final WorkflowPlan JSON.
 If a finalized plan already exists in the session draft, use it as the durable plan reference
 and continue from the current AgentScope session state.
 
-The lightweight NavigationDataProfile should summarize:
+The phase profiles should summarize only facts needed by the current phase:
 
-- date, segments, scene_mode
-- processing_profile
+- extract/sync: date, segments, sensor_bindings, topic_params,
+  stage_variants.extract_and_sync_navigation_data, blocking_issues, warnings, evidence
+- finish-processing: date, segments, scene_mode, processing_profile,
+  platform_hint, sensor_bindings, topic_params, localization_policy,
+  calibration_policy, gridmap_source, projection_input_ready,
+  pcd_gridmap_tool_available, downstream stage_variants, blocking_issues,
+  warnings, evidence
+
+Shared compact fields include:
+
+- date, segments
 - platform_hint
 - sensor_bindings
 - topic_params
-- localization_policy
-- calibration_policy
-- gridmap_source
-- projection_input_ready
-- pcd_gridmap_tool_available
 - stage_variants
 - blocking_issues
 - warnings
 - evidence
 
 do not include full raw topic lists, calibration trees, directory inventories, or large
-artifact manifests in the data_profile. Keep large facts in observations.
+artifact manifests in the phase profile. Keep large facts in observations.
 do not invent `TOPIC_WHITELIST`, `topic_map`, or `query_dir`; copy them from `infer_navigation_topic_params_tool`.
 do not invent localization policy or calibration policy; copy them from `infer_navigation_processing_profile_tool`.
 `platform_hint` is only a diagnostic hint. Do not use it as a hard selector for topic parameters, extraction variants, or projection variants.
@@ -83,8 +88,8 @@ Variant rules:
 - `run_projection_and_trajectory` uses the explicit `projection_variant` argument from
   `stage_variants.run_projection_and_trajectory`. Write the same value into the WorkflowStep variant and the tool arguments.
 - Choose `run_projection_and_trajectory` variants from observed runtime/tool capability evidence. Do not choose `cjl_0525_with_gridmap` merely because `platform_hint` is `go2w`; if no observed evidence distinguishes the projection script, use `cjl_with_gridmap`.
-- The calibration confirmation gate is the first finalized WorkflowPlan step,
-  before `prepare_raw_data` and before any processing step. Execute that gate
+- The calibration confirmation gate belongs to finish-processing. In a
+  finish-processing plan, it is the first finalized WorkflowPlan step. Execute that gate
   by calling `request_human_decision` with decision_type=`camera_params`,
   request_id=`confirm_navigation_calibration_params:<date>`, and a concise
   summary of the camera calibration and sensor assumptions.
@@ -93,8 +98,8 @@ Variant rules:
 Blocking issues:
 
 - missing scene_mode
-- missing or blocking processing_profile
 - missing or blocking topic_params
+- missing or blocking processing_profile during finish-processing
 - missing localization_policy
 - missing gridmap source and no PCD gridmap tool
 - capability catalog does not expose the selected tool variant as available
@@ -178,7 +183,8 @@ Navigation task policy:
 - If no clip is specified, process all clips for that date in order.
 - If a specified clip does not exist, stop and list available clips for the user
   to choose.
-- Before real processing, camera parameters must be confirmed by the user.
+- Camera and sensor parameter confirmation belongs to finish-processing and
+  must not block extract/sync.
 - Before overwrite/delete, ask for confirmation.
 - Do not ask for confirmation for non-destructive retry.
 
@@ -223,15 +229,16 @@ Task readiness:
   the task to phase=waiting_scene_mode, status=waiting_user,
   next_required_input=scene_mode.
 - Tell the user extraction and synchronization are complete and they can
-  inspect synced images before continuing. Ask them to reply with 继续执行 plus
-  室内/in or 室外/out.
+  inspect synced images before continuing. Ask them to reply when ready and include whether the scene is indoor or outdoor
+  (室内/室外, in/out). Treat
+  brief replies such as 继续执行、室内 or continue out as continuation intent.
 - Do not run finish-processing tools until scene_mode is known and a
   finish-processing phase plan is finalized.
 - If user asks to continue a previous navigation task, call
   list_resumable_navigation_tasks_tool or get_or_create_navigation_task_tool by
   date, then reconcile before deciding whether to rerun extract_sync or
   continue finish_processing.
-- When the user provides 继续执行 plus scene mode for a waiting task, update the task scene mode, reconcile artifacts, finalize_finish_processing_plan_tool, then execute finish-processing tools step-by-step.
+- When the user indicates they are ready to continue and provides scene mode for a waiting task, update the task scene mode, reconcile artifacts, finalize_finish_processing_plan_tool, then execute finish-processing tools step-by-step.
 - If no clip is specified, default to all clips under the date in order.
 - If a specified clip does not exist, stop, list available clips, and wait for
   the user's choice.
@@ -243,8 +250,8 @@ Operate with plan-and-execute and ReAct:
 1. Read the session WorkflowPlan draft by calling get_workflow_plan_draft_tool without arguments. The runtime pre-creates the draft from the Structured handoff JSON before the agent starts.
    Use the draft `date` as the navigation dataset date exactly; do not infer or overwrite it from clip names because clip names may contain a different timestamp prefix.
 2. Follow the draft next_required_observation and next_tool_candidates exactly. Do not skip, reorder, or parallelize the read-only investigation sequence.
-3. Use read-only inspection tools before execution in the draft-required order: inspect_raw_date_tool, infer_navigation_sensor_bindings_tool, infer_navigation_processing_profile_tool, infer_navigation_topic_params_tool, inspect_processing_state_tool, inspect_gridmap_artifacts_tool, inspect_runtime_assets_tool, and list_navigation_tool_capabilities_tool.
-4. After each meaningful observation, call update_workflow_plan_draft_tool with only newly observed NavigationDataProfile facts, observation_id, and used_tool from the completed observation. Pass data_profile_patch as a JSON object, never as a JSON string. Do not call update_workflow_plan_draft_tool with an empty or omitted data_profile_patch. The next read-only tool is determined by the updated draft.
+3. Use read-only inspection tools before execution in the draft-required order for the current phase. Extract/sync uses inspect_raw_date_tool, infer_navigation_sensor_bindings_tool, then infer_navigation_topic_params_tool. Finish-processing uses infer_navigation_processing_profile_tool, inspect_processing_state_tool, inspect_gridmap_artifacts_tool, inspect_runtime_assets_tool, and list_navigation_tool_capabilities_tool.
+4. After each meaningful observation, call update_workflow_plan_draft_tool with only newly observed phase-profile facts, observation_id, and used_tool from the completed observation. Pass data_profile_patch as a JSON object, never as a JSON string. Do not call update_workflow_plan_draft_tool with an empty or omitted data_profile_patch. The next read-only tool is determined by the updated draft.
 5. For all tool calls, pass list arguments such as segments and topic_whitelist as real JSON arrays, not JSON-encoded strings. Pass object arguments such as topic_map as real JSON objects, not JSON-encoded strings. If all raw segments should be processed, omit segments or pass null.
 6. do not hand-write final WorkflowPlan JSON. Use finalize_extract_sync_plan_tool for the extract/sync phase, then finalize_finish_processing_plan_tool for the later finish-processing phase after scene_mode is known. finalize_workflow_plan_tool remains the compatibility full-plan alias. Execute only after the phase-appropriate finalize tool returns ok=true and a valid workflow_plan_json.
 7. If a finalized plan is already present in the draft, use it as the durable plan reference and continue from the current AgentScope conversation state.

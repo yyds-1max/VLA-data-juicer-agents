@@ -9,7 +9,39 @@ from vla_data_juicer_agents.navigation.plan_draft import WorkflowPlanDraftState
 
 
 def _validate_draft_state(payload: object) -> WorkflowPlanDraftState:
+    payload = _migrate_legacy_draft_state(payload)
     return WorkflowPlanDraftState.model_validate(payload, extra="forbid")
+
+
+def _migrate_legacy_draft_state(payload: object) -> object:
+    if not isinstance(payload, dict) or "data_profile" not in payload:
+        return payload
+    migrated = dict(payload)
+    legacy_profile = migrated.pop("data_profile")
+    if not isinstance(legacy_profile, dict):
+        return migrated
+    if _looks_like_finish_processing_profile(legacy_profile):
+        migrated.setdefault("finish_processing_profile", legacy_profile)
+    elif _looks_like_extract_sync_profile(legacy_profile):
+        migrated.setdefault("extract_sync_profile", legacy_profile)
+    return migrated
+
+
+def _looks_like_extract_sync_profile(value: dict) -> bool:
+    return (
+        isinstance(value.get("date"), str)
+        and isinstance(value.get("topic_params"), dict)
+        and isinstance(value.get("stage_variants"), dict)
+    )
+
+
+def _looks_like_finish_processing_profile(value: dict) -> bool:
+    return (
+        _looks_like_extract_sync_profile(value)
+        and value.get("scene_mode") in {"in", "out"}
+        and isinstance(value.get("processing_profile"), dict)
+        and isinstance(value.get("localization_policy"), dict)
+    )
 
 
 class NavigationPlanDraftStore(Protocol):

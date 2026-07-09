@@ -263,7 +263,7 @@ def test_scene_mode_claim_syncs_new_session_draft_to_finish_processing(tmp_path:
     assert draft.request.scene_mode == "out"
     assert draft.plan_phase == "finish_processing"
     assert draft.finalized_plan is None
-    assert draft.next_required_observation()["observation_id"] == "processing_state"
+    assert draft.next_required_observation()["observation_id"] == "navigation_processing_profile"
 
     plan_tools = {
         tool.name: tool
