@@ -442,8 +442,11 @@ toolkit refresh.
 - Investigation: task tools, relevant inspection tools, and read-only cognitive
   tools.
 - Planning: read-only cognitive tools and the one active-phase plan submission tool.
-- Execution: execution overview/current-step tools, the current step's processing
-  tool, and required human-decision tools.
+- Execution: execution overview/current-step tools, the small set of plan-bound
+  processing tools referenced by remaining steps, and required human-decision tools.
+  Each wrapper accepts only `plan_id`/`step_id` and authorizes only the current
+  executable step, so exposing the remaining action names does not permit skipping
+  or reordering steps within one AgentScope ReAct turn.
 
 Inactive-phase plan schemas and unrelated processing tool schemas are not exposed.
 Execution wrappers remain a hard authorization boundary even if a stale client tries

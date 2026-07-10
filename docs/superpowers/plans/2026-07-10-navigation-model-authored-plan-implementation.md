@@ -18,6 +18,7 @@
 - Keep `ContextConfig(tool_result_limit=6000)` unchanged. Do not modify AgentScope compression and do not rotate sub-sessions.
 - Enforce response maxima from the design: planning context/evidence at most 5,500 characters, validation failure at most 3,000, all other routine tool summaries at most 4,000.
 - Do not retain compatibility aliases, deprecated wrappers, commented legacy code, or unused legacy tests after the new path is connected.
+- During Tasks 1–8, unchanged legacy consumers may keep using their existing symbols so every intermediate commit keeps the full suite green; new runtime code must not depend on those symbols, and Task 9 deletes them all.
 - Preserve current cancellation, human-decision, dry-run, task reconciliation, Web/AgentScope handoff, and user-language behavior.
 - Use TDD for every task and make one focused commit after its focused tests pass.
 
@@ -468,7 +469,7 @@ class PlanExecutionOverview(StrictModel):
 
 - [ ] **Step 6: Version and enrich the capability catalog**
 
-Set `CAPABILITY_CATALOG_REVISION = "navigation-capabilities-v2"`. Add `phase`, `argument_model`, and `declared_output_kinds` to `ToolCapability`. Replace semantic `infer_*` catalog entries with `inspect_navigation_sensor_candidates` and `inspect_navigation_topic_candidates`. Remove `run_tracking_and_projection` from the planning catalog so the model uses explicit tracking, gridmap, and projection steps.
+Set `CAPABILITY_CATALOG_REVISION = "navigation-capabilities-v2"`. Add `phase`, `argument_model`, and `declared_output_kinds` to `ToolCapability`. Add factual `inspect_navigation_sensor_candidates` and `inspect_navigation_topic_candidates` entries for the new path. Keep existing semantic entries only while unchanged legacy consumers still require them; Task 9 removes them. Exclude `run_tracking_and_projection` from the v2 planning view so the model uses explicit tracking, gridmap, and projection steps.
 
 - [ ] **Step 7: Run focused tests**
 
@@ -666,14 +667,14 @@ Expected: the factual inspection names and tool builder are missing.
 
 - [ ] **Step 4: Refactor inspection functions**
 
-Rename/refactor:
+Add/refactor the new factual functions:
 
 ```python
-infer_navigation_sensor_bindings -> inspect_navigation_sensor_candidates
-infer_navigation_topic_params -> inspect_navigation_topic_candidates
+inspect_navigation_sensor_candidates
+inspect_navigation_topic_candidates
 ```
 
-Return `SensorCandidatesObservation` and `TopicCandidatesObservation`. Delete policy/profile synthesis from `infer_navigation_processing_profile`; move its measurable platform-topic, calibration-file, localization-source, and runtime-asset facts into raw metadata, runtime assets, or artifact observation payloads. Keep no observation field that declares which candidate should be chosen.
+Return `SensorCandidatesObservation` and `TopicCandidatesObservation`. Extract measurable platform-topic, calibration-file, localization-source, and runtime-asset facts into raw metadata, runtime assets, or artifact observation payloads. Keep the old `infer_*` functions unchanged only for legacy callers until Task 9 deletes them; no new tool builder or runtime path may expose them.
 
 - [ ] **Step 5: Implement observation tool adapters**
 
@@ -791,7 +792,7 @@ def prepare_navigation_task_entry(
     return saved
 ```
 
-When the handoff contains non-empty user guidance, increment `guidance_revision`, write it as `UserGuidanceObservation`, and include its evidence ref in the same entry sequence. Call the helper synchronously in `start_navigation_agent_task` before `_start_agent_run`. Remove `_precreate_navigation_plan_draft` and all draft-store dry-run lookup.
+When the handoff contains non-empty user guidance, increment `guidance_revision`, write it as `UserGuidanceObservation`, and include its evidence ref in the same entry sequence. Call the helper synchronously in `start_navigation_agent_task` before `_start_agent_run`. Keep draft precreation temporarily for unchanged legacy consumers; Task 8 removes Web/AgentScope draft wiring and Task 9 removes the remaining direct-workflow draft code.
 
 - [ ] **Step 6: Make task tools compact and reconciliation-first**
 
@@ -1036,7 +1037,7 @@ Map action to arguments without model re-copying:
 - gridmap/projection steps supply their selected variants;
 - code derives finish temp/final paths under `NavigationSettings`.
 
-Remove `processing_profile` and `platform_hint` from underlying execution signatures where they only carried the old profile. Change calibration/assembly to accept the validated selected sensor source rather than infer it from platform hint.
+Add the new canonical execution arguments and change the v2 calibration/assembly path to accept the validated selected sensor source rather than infer it from platform hint. Keep legacy optional `processing_profile`/`platform_hint` parameters only until unchanged direct workflows migrate in Task 9; remove them in Task 9.
 
 Reject a calibration source unless it exactly matches a `CalibrationInventoryObservation` entry for the plan's observation revision and resolves under the configured processing root. Never accept an arbitrary model-supplied filesystem path.
 
