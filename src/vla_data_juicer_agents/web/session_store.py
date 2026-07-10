@@ -488,6 +488,34 @@ class WebSessionStore:
                 (web_session_id, agent_id, agentscope_session_id, timestamp),
             )
 
+    def restore_agentscope_session_mapping(
+        self,
+        web_session_id: str,
+        *,
+        agent_id: str | None,
+        agentscope_session_id: str | None,
+    ) -> None:
+        timestamp = _now()
+        with self._connect() as connection:
+            connection.execute(
+                "UPDATE agentscope_sessions SET active = 0 WHERE web_session_id = ?",
+                (web_session_id,),
+            )
+            if agent_id is None or agentscope_session_id is None:
+                return
+            cursor = connection.execute(
+                """
+                UPDATE agentscope_sessions
+                SET active = 1, updated_at = ?
+                WHERE web_session_id = ?
+                  AND agent_id = ?
+                  AND agentscope_session_id = ?
+                """,
+                (timestamp, web_session_id, agent_id, agentscope_session_id),
+            )
+            if cursor.rowcount == 0:
+                raise KeyError((web_session_id, agent_id, agentscope_session_id))
+
     def get_agentscope_session_mapping(
         self,
         web_session_id: str,
@@ -497,7 +525,7 @@ class WebSessionStore:
                 """
                 SELECT web_session_id, agent_id, agentscope_session_id, event_cursor
                 FROM agentscope_sessions
-                WHERE web_session_id = ?
+                WHERE web_session_id = ? AND active = 1
                 ORDER BY active DESC, updated_at DESC
                 LIMIT 1
                 """,

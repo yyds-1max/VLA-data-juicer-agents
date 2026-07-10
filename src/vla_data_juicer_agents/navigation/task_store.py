@@ -100,6 +100,8 @@ class NavigationTaskStore(Protocol):
 
     def update_task(self, task_id: str, **changes: Any) -> NavigationTask: ...
 
+    def delete_task(self, task_id: str) -> None: ...
+
     def record_step(
         self,
         *,
@@ -368,6 +370,19 @@ class SqliteNavigationTaskStore:
         with self._connect() as connection:
             self._update_task(connection, task)
         return task
+
+    def delete_task(self, task_id: str) -> None:
+        with self._connect() as connection:
+            connection.execute(
+                "DELETE FROM navigation_task_steps WHERE task_id = ?",
+                (task_id,),
+            )
+            cursor = connection.execute(
+                "DELETE FROM navigation_tasks WHERE task_id = ?",
+                (task_id,),
+            )
+            if cursor.rowcount == 0:
+                raise KeyError(task_id)
 
     def record_step(
         self,

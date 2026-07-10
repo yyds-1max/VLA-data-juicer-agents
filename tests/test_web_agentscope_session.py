@@ -696,6 +696,81 @@ async def test_runtime_start_navigation_agent_task_preserves_dry_run_from_handof
 
 
 @pytest.mark.asyncio
+async def test_runtime_failed_navigation_entry_restores_absent_mapping_and_does_not_run(
+    tmp_path: Path,
+) -> None:
+    store = WebSessionStore(tmp_path / "sessions.sqlite")
+    web_session = store.create_session("处理导航数据")
+    chat_run_registry = FakeChatRunRegistry()
+    runtime = _runtime(
+        chat_run_registry=chat_run_registry,
+        workspace_root=tmp_path,
+    )
+    runtime.set_web_session_store(store)
+
+    with pytest.raises(ValueError, match="structured handoff"):
+        await runtime.start_navigation_agent_task(
+            web_session_id=web_session.id,
+            message="invalid handoff",
+        )
+
+    assert runtime.web_sessions == {}
+    assert store.get_agentscope_session_mapping(web_session.id) is None
+    assert chat_run_registry.spawns == []
+
+
+@pytest.mark.asyncio
+async def test_runtime_failed_navigation_entry_restores_non_navigation_mapping_and_does_not_run(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    store = WebSessionStore(tmp_path / "sessions.sqlite")
+    web_session = store.create_session("混合会话")
+    store.save_agentscope_session_mapping(
+        web_session.id,
+        agent_id="main-router-agent",
+        agentscope_session_id="as-main",
+    )
+    chat_run_registry = FakeChatRunRegistry()
+    runtime = _runtime(
+        chat_run_registry=chat_run_registry,
+        workspace_root=tmp_path,
+    )
+    runtime.set_web_session_store(store)
+
+    def fail_entry(**kwargs):
+        raise RuntimeError("evidence append failed")
+
+    monkeypatch.setattr(
+        agentscope_runtime_module,
+        "prepare_navigation_task_entry",
+        fail_entry,
+    )
+    message = agentscope_runtime_module._navigation_handoff_message(
+        request="处理 20270623 的导航数据",
+        target="20270623",
+        date="20270623",
+        scene_mode=None,
+        clips=[],
+        reason="用户请求导航处理",
+        response_language="Chinese",
+    )
+
+    with pytest.raises(RuntimeError, match="evidence append failed"):
+        await runtime.start_navigation_agent_task(
+            web_session_id=web_session.id,
+            message=message,
+        )
+
+    assert runtime.web_sessions == {web_session.id: ("main-router-agent", "as-main")}
+    mapping = store.get_agentscope_session_mapping(web_session.id)
+    assert mapping is not None
+    assert mapping.agent_id == "main-router-agent"
+    assert mapping.agentscope_session_id == "as-main"
+    assert chat_run_registry.spawns == []
+
+
+@pytest.mark.asyncio
 async def test_runtime_registers_navigation_task_tools_for_navigation_agent(tmp_path):
     runtime = _runtime(workspace_root=tmp_path)
     await runtime.ensure_bootstrapped()

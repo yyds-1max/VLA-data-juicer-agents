@@ -151,20 +151,31 @@ class AgentScopeRuntime:
     async def start_navigation_agent_task(self, *, web_session_id: str, message: str) -> str:
         await self.ensure_bootstrapped()
 
-        session_id = await self.ensure_web_session(
-            web_session_id,
-            agent_id=self.config.navigation_agent_id,
-            model=self.config.navigation_model,
-        )
-        prepare_navigation_task_entry(
-            task_store=self._navigation_task_store(),
-            observation_store=self._navigation_observation_store(),
-            evidence_store=self._navigation_evidence_store(),
-            message=message,
-            web_session_id=web_session_id,
-            agentscope_session_id=session_id,
-            settings=NavigationSettings(),
-        )
+        previous_mapping = self._web_session_mapping(web_session_id)
+        try:
+            session_id = await self.ensure_web_session(
+                web_session_id,
+                agent_id=self.config.navigation_agent_id,
+                model=self.config.navigation_model,
+            )
+            prepare_navigation_task_entry(
+                task_store=self._navigation_task_store(),
+                observation_store=self._navigation_observation_store(),
+                evidence_store=self._navigation_evidence_store(),
+                message=message,
+                web_session_id=web_session_id,
+                agentscope_session_id=session_id,
+                settings=NavigationSettings(),
+            )
+        except Exception as entry_error:
+            try:
+                self._restore_web_session_mapping(web_session_id, previous_mapping)
+            except Exception as compensation_error:
+                entry_error.add_note(
+                    "navigation entry session-mapping compensation failed: "
+                    f"{compensation_error!r}"
+                )
+            raise
         self._precreate_navigation_plan_draft(
             agentscope_session_id=session_id,
             message=message,
@@ -988,6 +999,38 @@ class AgentScopeRuntime:
         save_mapping = getattr(self.web_session_store, "save_agentscope_session_mapping", None)
         if callable(save_mapping):
             save_mapping(web_session_id, agent_id=agent_id, agentscope_session_id=agentscope_session_id)
+
+    def _restore_web_session_mapping(
+        self,
+        web_session_id: str,
+        previous_mapping: tuple[str, str] | None,
+    ) -> None:
+        if previous_mapping is None:
+            self.web_sessions.pop(web_session_id, None)
+            agent_id = None
+            agentscope_session_id = None
+        else:
+            self.web_sessions[web_session_id] = previous_mapping
+            agent_id, agentscope_session_id = previous_mapping
+        if self.web_session_store is None:
+            return
+        restore_mapping = getattr(
+            self.web_session_store,
+            "restore_agentscope_session_mapping",
+            None,
+        )
+        if callable(restore_mapping):
+            restore_mapping(
+                web_session_id,
+                agent_id=agent_id,
+                agentscope_session_id=agentscope_session_id,
+            )
+        elif previous_mapping is not None:
+            self._save_web_session_mapping(
+                web_session_id,
+                agent_id,
+                agentscope_session_id,
+            )
 
     def _save_web_session_event_cursor(self, agentscope_session_id: str, cursor: str) -> None:
         if self.web_session_store is None:

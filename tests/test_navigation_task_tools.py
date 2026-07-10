@@ -139,6 +139,83 @@ def test_reconcile_navigation_task_tool_updates_missing_sync_to_needs_rerun(
     assert set(result["task"]) == {"task_id", "phase", "status"}
 
 
+def test_state_update_cannot_mark_completed_without_selected_final_markers(tmp_path: Path):
+    root, store, tools = _tools(tmp_path)
+    (root / "raw_data" / "20270623" / "segment_a").mkdir(parents=True)
+    (root / "finish_data" / "20270623" / "segment_b" / "clip_b" / "grid_map").mkdir(
+        parents=True
+    )
+    task = store.create_or_update_task(
+        date="20270623",
+        segments=["segment_a"],
+        scene_mode="out",
+    )
+
+    result = _call(
+        tools["update_navigation_task_state_tool"],
+        task_id=task.task_id,
+        phase="completed",
+        status="completed",
+    )
+
+    assert result["ok"] is False
+    assert result["error_type"] == "navigation_task_reconcile_required"
+    persisted = store.get_task(task.task_id)
+    assert persisted is not None
+    assert persisted.phase == NavigationTaskPhase.EXTRACT_SYNC
+    assert persisted.status == NavigationTaskStatus.NEEDS_RERUN
+    assert persisted.artifact_snapshot is not None
+
+
+def test_state_update_rejects_phase_not_selected_by_live_reconciliation(tmp_path: Path):
+    root, store, tools = _tools(tmp_path)
+    (root / "raw_data" / "20270623" / "segment_a").mkdir(parents=True)
+    task = store.create_or_update_task(
+        date="20270623",
+        segments=["segment_a"],
+        scene_mode="out",
+        dry_run=True,
+    )
+
+    result = _call(
+        tools["update_navigation_task_state_tool"],
+        task_id=task.task_id,
+        phase="finish_processing",
+        status="running",
+    )
+
+    assert result["ok"] is False
+    assert result["error_type"] == "navigation_task_reconcile_required"
+    persisted = store.get_task(task.task_id)
+    assert persisted is not None
+    assert persisted.phase == NavigationTaskPhase.EXTRACT_SYNC
+    assert persisted.status == NavigationTaskStatus.NEEDS_RERUN
+    assert persisted.dry_run is True
+
+
+def test_state_update_allows_execution_status_for_reconciled_phase(tmp_path: Path):
+    root, store, tools = _tools(tmp_path)
+    (root / "raw_data" / "20270623" / "segment_a").mkdir(parents=True)
+    task = store.create_or_update_task(
+        date="20270623",
+        segments=["segment_a"],
+        scene_mode=None,
+        dry_run=True,
+    )
+
+    result = _call(
+        tools["update_navigation_task_state_tool"],
+        task_id=task.task_id,
+        phase="extract_sync",
+        status="running",
+    )
+
+    assert result["ok"] is True
+    assert result["task"]["phase"] == NavigationTaskPhase.EXTRACT_SYNC.value
+    assert result["task"]["status"] == NavigationTaskStatus.RUNNING.value
+    assert result["task"]["dry_run"] is True
+
+
 def test_update_navigation_task_scene_mode_tool_sets_finish_processing(
     tmp_path: Path,
 ):

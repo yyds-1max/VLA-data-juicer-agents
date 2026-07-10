@@ -710,6 +710,7 @@ def test_finish_processing_gate_allows_running_task_with_finish_temp_partial_art
     tmp_path,
 ):
     root = tmp_path / "VLADatasets"
+    (root / "raw_data" / "20270623" / "segment_a").mkdir(parents=True)
     (
         root
         / "clip_data"
@@ -794,6 +795,7 @@ def test_resume_finish_gate_rejects_extract_tools_and_allows_finish_tools(
     tmp_path,
 ):
     root = tmp_path / "VLADatasets"
+    (root / "raw_data" / "20270623" / "segment_a").mkdir(parents=True)
     (root / "clip_data" / "20270623" / "segment_a" / "sync_data" / "clip_0").mkdir(
         parents=True
     )

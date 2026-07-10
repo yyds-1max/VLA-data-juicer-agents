@@ -37,6 +37,21 @@ def _selected_segments(root: Path, segments: list[str] | None) -> list[str]:
     return sorted(path.name for path in root.iterdir() if path.is_dir())
 
 
+def _has_segment_directories(root: Path) -> bool:
+    return root.exists() and any(path.is_dir() for path in root.iterdir())
+
+
+def _all_selected_segments_exist(root: Path, segments: list[str]) -> bool:
+    return bool(segments) and all((root / segment).is_dir() for segment in segments)
+
+
+def _all_selected_segments_have_grid_map(root: Path, segments: list[str]) -> bool:
+    return bool(segments) and all(
+        any(path.is_dir() for path in (root / segment).glob("*/grid_map"))
+        for segment in segments
+    )
+
+
 def build_navigation_artifact_snapshot(
     date: str,
     segments: list[str] | None,
@@ -49,7 +64,11 @@ def build_navigation_artifact_snapshot(
     finish_temp_samples = settings.finish_data_root / f"{date}_temp" / "samples" / date
     final_root = settings.finish_data_root / date
     selection_root = next(
-        (root for root in (raw_date, raw_temp, clip_date) if root.exists()),
+        (
+            root
+            for root in (raw_date, raw_temp, clip_date, final_root)
+            if _has_segment_directories(root)
+        ),
         raw_date,
     )
     selected = _selected_segments(selection_root, segments)
@@ -71,16 +90,19 @@ def build_navigation_artifact_snapshot(
         if sample_images:
             break
 
-    final_grid_map_exists = any(final_root.glob("*/*/grid_map")) if final_root.exists() else False
+    raw_input_exists = _all_selected_segments_exist(raw_date, selected)
+    raw_temp_exists = _all_selected_segments_exist(raw_temp, selected)
+    final_outputs_exist = _all_selected_segments_exist(final_root, selected)
+    final_grid_map_exists = _all_selected_segments_have_grid_map(final_root, selected)
     return NavigationArtifactSnapshot(
         date=date,
         segments=selected or segments,
-        raw_input_exists=raw_date.exists(),
-        raw_temp_exists=raw_temp.exists(),
+        raw_input_exists=raw_input_exists,
+        raw_temp_exists=raw_temp_exists,
         sync_data_exists=sync_exists,
         sync_data_by_segment=sync_data_by_segment,
         finish_temp_samples_exists=finish_temp_samples.exists() and any(finish_temp_samples.iterdir()),
-        final_outputs_exist=final_root.exists(),
+        final_outputs_exist=final_outputs_exist,
         final_grid_map_exists=final_grid_map_exists,
         sync_image_samples=sample_images,
     )
@@ -173,55 +195,79 @@ def prepare_navigation_task_entry(
     guidance_value = handoff.get("request")
     guidance = guidance_value.strip() if isinstance(guidance_value, str) else ""
 
+    normalized_segments = (
+        [str(segment) for segment in segments] if segments is not None else None
+    )
+    previous_task = task_store.find_latest_by_date(
+        handoff["date"],
+        normalized_segments,
+    )
+
     task = task_store.create_or_update_task(
         date=handoff["date"],
-        segments=[str(segment) for segment in segments] if segments is not None else None,
+        segments=normalized_segments,
         scene_mode=_navigation_scene_mode_for_request(handoff.get("scene_mode")),
         dry_run=bool(handoff.get("dry_run", False)),
         web_session_id=web_session_id,
         agentscope_session_id=agentscope_session_id,
     )
-    reconciled = reconcile_navigation_task(task, settings=settings)
-    changes = _task_changes(reconciled)
-    if guidance:
-        changes["guidance_revision"] = task.guidance_revision + 1
-    saved = task_store.update_task(task.task_id, **changes)
-    if saved.artifact_snapshot is None:
-        raise RuntimeError("task entry reconciliation did not create an artifact snapshot")
+    try:
+        reconciled = reconcile_navigation_task(task, settings=settings)
+        changes = _task_changes(reconciled)
+        if guidance:
+            changes["guidance_revision"] = task.guidance_revision + 1
+        saved = task_store.update_task(task.task_id, **changes)
+        if saved.artifact_snapshot is None:
+            raise RuntimeError("task entry reconciliation did not create an artifact snapshot")
 
-    artifact_observation = ArtifactStateObservation(snapshot=saved.artifact_snapshot)
-    payloads: list[Any] = [artifact_observation]
-    evidence_writes = [
-        EvidenceWrite(
-            kind="artifact_state",
-            source_tool="task_entry_reconciliation",
-            payload=saved.artifact_snapshot.model_dump(mode="json"),
-            summary="task-entry artifact snapshot",
-        )
-    ]
-    if guidance:
-        guidance_observation = UserGuidanceObservation(
-            guidance_revision=saved.guidance_revision,
-            text=guidance,
-        )
-        payloads.append(guidance_observation)
-        evidence_writes.append(
+        artifact_observation = ArtifactStateObservation(snapshot=saved.artifact_snapshot)
+        payloads: list[Any] = [artifact_observation]
+        evidence_writes = [
             EvidenceWrite(
-                kind="user_guidance",
+                kind="artifact_state",
                 source_tool="task_entry_reconciliation",
-                payload=guidance_observation.model_dump(mode="json"),
-                summary=f"task-entry user guidance revision {saved.guidance_revision}",
+                payload=saved.artifact_snapshot.model_dump(mode="json"),
+                summary="task-entry artifact snapshot",
             )
+        ]
+        if guidance:
+            guidance_observation = UserGuidanceObservation(
+                guidance_revision=saved.guidance_revision,
+                text=guidance,
+            )
+            payloads.append(guidance_observation)
+            evidence_writes.append(
+                EvidenceWrite(
+                    kind="user_guidance",
+                    source_tool="task_entry_reconciliation",
+                    payload=guidance_observation.model_dump(mode="json"),
+                    summary=f"task-entry user guidance revision {saved.guidance_revision}",
+                )
+            )
+        observation_store.append(
+            saved.task_id,
+            saved.phase,
+            "artifact_state",
+            payloads,
+            evidence_writes,
+            evidence_store,
         )
-    observation_store.append(
-        saved.task_id,
-        saved.phase,
-        "artifact_state",
-        payloads,
-        evidence_writes,
-        evidence_store,
-    )
-    return saved
+        return saved
+    except Exception as entry_error:
+        try:
+            if previous_task is None:
+                task_store.delete_task(task.task_id)
+            else:
+                task_store.update_task(
+                    previous_task.task_id,
+                    **_task_changes(previous_task),
+                )
+        except Exception as compensation_error:
+            entry_error.add_note(
+                "navigation task entry compensation failed: "
+                f"{compensation_error!r}"
+            )
+        raise
 
 
 def reconcile_navigation_task(
@@ -241,6 +287,25 @@ def reconcile_navigation_task(
                 "waiting_reason": None,
                 "next_required_input": None,
                 "drift": None,
+            }
+        )
+        return NavigationTask.model_validate(payload)
+
+    if not snapshot.raw_input_exists and not snapshot.raw_temp_exists:
+        payload.update(
+            {
+                "phase": NavigationTaskPhase.INTAKE.value,
+                "status": NavigationTaskStatus.NEEDS_RECONCILE.value,
+                "waiting_reason": None,
+                "next_required_input": None,
+                "drift": NavigationTaskDrift(
+                    type="missing_expected_artifact",
+                    message="Raw navigation input is missing; task phase cannot advance.",
+                    evidence=[
+                        f"raw_data/{snapshot.date}",
+                        f"raw_data/{snapshot.date}_temp",
+                    ],
+                ).model_dump(mode="json"),
             }
         )
         return NavigationTask.model_validate(payload)
@@ -281,25 +346,6 @@ def reconcile_navigation_task(
                 "waiting_reason": None,
                 "next_required_input": None,
                 "drift": _sync_drift(snapshot).model_dump(mode="json"),
-            }
-        )
-        return NavigationTask.model_validate(payload)
-
-    if not snapshot.raw_input_exists and not snapshot.raw_temp_exists:
-        payload.update(
-            {
-                "phase": NavigationTaskPhase.INTAKE.value,
-                "status": NavigationTaskStatus.NEEDS_RECONCILE.value,
-                "waiting_reason": None,
-                "next_required_input": None,
-                "drift": NavigationTaskDrift(
-                    type="missing_expected_artifact",
-                    message="Raw navigation input is missing; task phase cannot advance.",
-                    evidence=[
-                        f"raw_data/{snapshot.date}",
-                        f"raw_data/{snapshot.date}_temp",
-                    ],
-                ).model_dump(mode="json"),
             }
         )
         return NavigationTask.model_validate(payload)

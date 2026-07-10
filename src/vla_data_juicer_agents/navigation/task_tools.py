@@ -150,10 +150,46 @@ def build_navigation_task_tools(
         last_completed_step: str | None = None,
     ) -> dict[str, Any]:
         """Update task phase/status after planning or execution progress."""
+        existing = store.get_task(task_id)
+        if existing is None:
+            return {
+                "ok": False,
+                "error_type": "navigation_task_not_found",
+                "task_id": task_id,
+            }
+        requested_phase = NavigationTaskPhase(phase)
+        requested_status = NavigationTaskStatus(status)
+        reconciled = reconcile_and_save_navigation_task(
+            existing,
+            task_store=store,
+            settings=settings,
+        )
+        completion_request_is_valid = (
+            requested_phase == NavigationTaskPhase.COMPLETED
+            and requested_status == NavigationTaskStatus.COMPLETED
+            and reconciled.phase == NavigationTaskPhase.COMPLETED
+            and reconciled.status == NavigationTaskStatus.COMPLETED
+        )
+        requests_completion = (
+            requested_phase == NavigationTaskPhase.COMPLETED
+            or requested_status == NavigationTaskStatus.COMPLETED
+        )
+        if requested_phase != reconciled.phase or (
+            requests_completion and not completion_request_is_valid
+        ):
+            return {
+                "ok": False,
+                "error_type": "navigation_task_reconcile_required",
+                "message": (
+                    "Requested task state is not supported by the live artifact "
+                    "snapshot. Continue from the reconciled phase."
+                ),
+                "task": _task_payload(reconciled),
+            }
         task = store.update_task(
             task_id,
-            phase=NavigationTaskPhase(phase),
-            status=NavigationTaskStatus(status),
+            phase=requested_phase,
+            status=requested_status,
             waiting_reason=waiting_reason,
             next_required_input=next_required_input,
             last_completed_step=last_completed_step,
