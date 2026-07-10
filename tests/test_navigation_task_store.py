@@ -7,6 +7,30 @@ from vla_data_juicer_agents.navigation.task_state import NavigationTaskPhase, Na
 from vla_data_juicer_agents.navigation.task_store import SqliteNavigationTaskStore
 
 
+def test_task_store_idempotently_migrates_plan_ledger_columns(tmp_path: Path):
+    db_path = tmp_path / "navigation_tasks.sqlite"
+
+    SqliteNavigationTaskStore(db_path)
+    SqliteNavigationTaskStore(db_path)
+
+    with sqlite3.connect(db_path) as connection:
+        columns = {
+            row[1]: row for row in connection.execute(
+                "PRAGMA table_info(navigation_task_steps)"
+            ).fetchall()
+        }
+    assert {
+        "plan_id",
+        "plan_revision",
+        "sequence",
+        "result_summary_json",
+        "result_ref",
+        "retry_count",
+    } <= columns.keys()
+    assert columns["retry_count"][3] == 1
+    assert columns["retry_count"][4] == "0"
+
+
 def test_task_store_creates_and_loads_navigation_task(tmp_path: Path):
     store = SqliteNavigationTaskStore(tmp_path / "navigation_tasks.sqlite")
 

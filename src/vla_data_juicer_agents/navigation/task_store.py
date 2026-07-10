@@ -78,6 +78,45 @@ def _segments_key(segments: list[str] | None) -> str:
     return json.dumps(sorted(segments), ensure_ascii=False, separators=(",", ":"))
 
 
+def ensure_navigation_task_step_ledger_columns(connection: sqlite3.Connection) -> None:
+    columns = {
+        row["name"]
+        for row in connection.execute("PRAGMA table_info(navigation_task_steps)").fetchall()
+    }
+    migrations = {
+        "plan_id": "ALTER TABLE navigation_task_steps ADD COLUMN plan_id TEXT",
+        "plan_revision": (
+            "ALTER TABLE navigation_task_steps ADD COLUMN plan_revision INTEGER"
+        ),
+        "sequence": "ALTER TABLE navigation_task_steps ADD COLUMN sequence INTEGER",
+        "result_summary_json": (
+            "ALTER TABLE navigation_task_steps ADD COLUMN result_summary_json TEXT"
+        ),
+        "result_ref": "ALTER TABLE navigation_task_steps ADD COLUMN result_ref TEXT",
+        "retry_count": (
+            "ALTER TABLE navigation_task_steps "
+            "ADD COLUMN retry_count INTEGER NOT NULL DEFAULT 0"
+        ),
+    }
+    for name, statement in migrations.items():
+        if name not in columns:
+            connection.execute(statement)
+    connection.execute(
+        """
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_navigation_task_steps_plan_sequence
+        ON navigation_task_steps (plan_id, sequence)
+        WHERE plan_id IS NOT NULL
+        """
+    )
+    connection.execute(
+        """
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_navigation_task_steps_plan_step_id
+        ON navigation_task_steps (plan_id, step_id)
+        WHERE plan_id IS NOT NULL
+        """
+    )
+
+
 class NavigationTaskStore(Protocol):
     def create_or_update_task(
         self,
@@ -191,10 +230,17 @@ class SqliteNavigationTaskStore:
                     produced_paths_json TEXT,
                     started_at TEXT,
                     finished_at TEXT,
+                    plan_id TEXT,
+                    plan_revision INTEGER,
+                    sequence INTEGER,
+                    result_summary_json TEXT,
+                    result_ref TEXT,
+                    retry_count INTEGER NOT NULL DEFAULT 0,
                     FOREIGN KEY (task_id) REFERENCES navigation_tasks(task_id)
                 )
                 """
             )
+            ensure_navigation_task_step_ledger_columns(connection)
 
     def _migrate_task_entry_fields(self, connection: sqlite3.Connection) -> None:
         columns = {
