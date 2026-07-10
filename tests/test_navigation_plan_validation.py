@@ -59,6 +59,7 @@ def descriptor(
     *,
     task_id: str = "nav-plan-1",
     kind: str = "measured_fact",
+    created_at: str = "2026-07-10T00:00:00+00:00",
 ) -> EvidenceDescriptor:
     return EvidenceDescriptor(
         ref=ref,
@@ -68,7 +69,7 @@ def descriptor(
         summary=f"Evidence for {ref}",
         byte_size=10,
         source_tool="inspect_navigation_test_tool",
-        created_at="2026-07-10T00:00:00+00:00",
+        created_at=created_at,
     )
 
 
@@ -913,3 +914,131 @@ def test_constructed_invalid_gridmap_source_returns_report_instead_of_raising():
             "projection_ready",
         ],
     ) in report.errors
+
+
+def test_large_inventory_pointer_selects_latest_revision_then_created_at_then_ref():
+    available_topics = [f"/topic/{index:03d}" for index in range(40)]
+    observation = extract_observation().model_copy(
+        update={
+            "payloads": [
+                item.model_copy(
+                    update={"available_topics": [*item.available_topics, *available_topics]}
+                )
+                if isinstance(item, TopicCandidatesObservation)
+                else item
+                for item in extract_observation().payloads
+            ]
+        }
+    )
+    payload = valid_extract_plan_payload()
+    payload["decisions"]["topic_selection"]["topic_whitelist"] = ["/missing"]
+    evidence = [
+        *extract_evidence(),
+        descriptor(
+            "zzzz-old-revision",
+            3,
+            kind="topic_candidates",
+            created_at="2099-01-01T00:00:00+00:00",
+        ),
+        descriptor(
+            "aaaa-current-older-created",
+            4,
+            kind="topic_candidates",
+            created_at="2026-07-10T00:01:00+00:00",
+        ),
+        descriptor(
+            "bbbb-current-latest-created",
+            4,
+            kind="topic_candidates",
+            created_at="2026-07-10T00:02:00+00:00",
+        ),
+        descriptor(
+            "cccc-current-latest-created",
+            4,
+            kind="topic_candidates",
+            created_at="2026-07-10T00:02:00+00:00",
+        ),
+    ]
+
+    report = validate_extract(payload, observation=observation, evidence=evidence)
+
+    issue = next(issue for issue in report.errors if issue.code == "unobserved_topic")
+    assert issue.allowed_values == [
+        "evidence_ref:cccc-current-latest-created"
+    ]
+
+
+def test_mixed_topic_inventory_pointer_selects_the_payload_kind_that_carries_values():
+    raw_topics = [f"/raw-only/{index:03d}" for index in range(40)]
+    observation = extract_observation().model_copy(
+        update={
+            "payloads": [
+                item.model_copy(
+                    update={
+                        "topics": [
+                            *item.topics,
+                            *[
+                                TopicMeasurement(topic=topic, message_count=1)
+                                for topic in raw_topics
+                            ],
+                        ]
+                    }
+                )
+                if isinstance(item, RawMetadataObservation)
+                else item
+                for item in extract_observation().payloads
+            ]
+        }
+    )
+    payload = valid_extract_plan_payload()
+    payload["decisions"]["topic_selection"]["topic_whitelist"] = ["/missing"]
+    evidence = [
+        *extract_evidence(),
+        descriptor(
+            "raw-inventory-current",
+            4,
+            kind="raw_metadata",
+            created_at="2026-07-10T00:03:00+00:00",
+        ),
+        descriptor(
+            "topic-inventory-current",
+            4,
+            kind="topic_candidates",
+            created_at="2026-07-10T00:04:00+00:00",
+        ),
+    ]
+
+    report = validate_extract(payload, observation=observation, evidence=evidence)
+
+    issue = next(issue for issue in report.errors if issue.code == "unobserved_topic")
+    assert issue.allowed_values == ["evidence_ref:raw-inventory-current"]
+
+
+def test_large_inventory_without_matching_descriptor_uses_observation_path_pointer():
+    sources = [f"sensor_{index:03d}" for index in range(40)]
+    observation = finish_observation().model_copy(
+        update={
+            "payloads": [
+                item.model_copy(update={"sensor_sources": sources})
+                if isinstance(item, CalibrationInventoryObservation)
+                else item
+                for item in finish_observation().payloads
+            ]
+        }
+    )
+    payload = valid_finish_plan_payload()
+    payload["decisions"]["calibration"]["selected_sensor_source"] = "missing"
+    evidence = [
+        item.model_copy(update={"kind": "decision_support"})
+        if item.ref == "evidence:calibration"
+        else item
+        for item in finish_evidence()
+    ]
+
+    report = validate_finish(payload, observation=observation, evidence=evidence)
+
+    issue = next(issue for issue in report.errors if issue.code == "unobserved_calibration_source")
+    assert issue.allowed_values == [
+        "observation.payloads[kind=calibration_inventory]"
+    ]
+    assert not any(source in issue.allowed_values for source in sources[:20])

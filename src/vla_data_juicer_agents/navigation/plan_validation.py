@@ -428,28 +428,52 @@ def _bounded_allowed_values(
     if len(normalized) <= MAX_PUBLIC_ALLOWED_VALUES:
         return normalized
     overflow = sorted({str(value) for value in overflow_values})
-    return (overflow or normalized)[:MAX_PUBLIC_ALLOWED_VALUES]
+    return overflow[:MAX_PUBLIC_ALLOWED_VALUES]
 
 
-def _evidence_ref_pointer(
+def _observation_inventory_pointer(
     *,
     observation: NavigationObservationRevision,
     evidence: Sequence[EvidenceDescriptor],
-    kinds: Sequence[str],
+    kind: str,
 ) -> list[str]:
-    for kind in kinds:
-        refs = sorted(
-            {
-                descriptor.ref
-                for descriptor in evidence
-                if descriptor.task_id == observation.task_id
-                and descriptor.observation_revision <= observation.revision
-                and descriptor.kind == kind
-            }
+    matching = [
+        descriptor
+        for descriptor in evidence
+        if descriptor.task_id == observation.task_id
+        and descriptor.observation_revision <= observation.revision
+        and descriptor.kind == kind
+    ]
+    if matching:
+        current = max(
+            matching,
+            key=lambda descriptor: (
+                descriptor.observation_revision,
+                descriptor.created_at,
+                descriptor.ref,
+            ),
         )
-        if refs:
-            return [f"evidence_ref:{refs[0]}"]
-    return []
+        return [f"evidence_ref:{current.ref}"]
+    return [f"observation.payloads[kind={kind}]"]
+
+
+def _topic_inventory_kinds(
+    *,
+    raw_topics: set[str],
+    candidate_topics: set[str],
+) -> list[str]:
+    if raw_topics and raw_topics <= candidate_topics:
+        return ["topic_candidates"]
+    if candidate_topics and candidate_topics <= raw_topics:
+        return ["raw_metadata"]
+    return [
+        kind
+        for kind, values in (
+            ("raw_metadata", raw_topics),
+            ("topic_candidates", candidate_topics),
+        )
+        if values
+    ]
 
 
 def _report(
@@ -554,17 +578,27 @@ def _validate_extract_references(
     raw = _payload_of_type(observation, RawMetadataObservation)
     topics = _payload_of_type(observation, TopicCandidatesObservation)
     sensors = _payload_of_type(observation, SensorCandidatesObservation)
-    available_topics: set[str] = set()
-    if raw is not None:
-        available_topics.update(measurement.topic for measurement in raw.topics)
-    if topics is not None:
-        available_topics.update(topics.available_topics)
+    raw_topics = (
+        {measurement.topic for measurement in raw.topics}
+        if raw is not None
+        else set()
+    )
+    candidate_topics = set(topics.available_topics) if topics is not None else set()
+    available_topics = raw_topics | candidate_topics
+    inventory_kinds = _topic_inventory_kinds(
+        raw_topics=raw_topics,
+        candidate_topics=candidate_topics,
+    )
     allowed_topics = _bounded_allowed_values(
         available_topics,
-        overflow_values=_evidence_ref_pointer(
-            observation=observation,
-            evidence=evidence,
-            kinds=["topic_candidates", "raw_metadata"],
+        overflow_values=(
+            pointer
+            for kind in inventory_kinds
+            for pointer in _observation_inventory_pointer(
+                observation=observation,
+                evidence=evidence,
+                kind=kind,
+            )
         ),
     )
 
@@ -592,10 +626,10 @@ def _validate_extract_references(
                     "Sensor binding was not present in observed candidates",
                     _bounded_allowed_values(
                         observed_bindings.get(role, set()),
-                        overflow_values=_evidence_ref_pointer(
+                        overflow_values=_observation_inventory_pointer(
                             observation=observation,
                             evidence=evidence,
-                            kinds=["sensor_candidates"],
+                            kind="sensor_candidates",
                         ),
                     ),
                 )
@@ -746,10 +780,10 @@ def _validate_finish_references(
                 "Calibration sensor source was not observed",
                 _bounded_allowed_values(
                     calibration.sensor_sources,
-                    overflow_values=_evidence_ref_pointer(
+                    overflow_values=_observation_inventory_pointer(
                         observation=observation,
                         evidence=evidence,
-                        kinds=["calibration_inventory"],
+                        kind="calibration_inventory",
                     ),
                 ),
             )
@@ -778,10 +812,10 @@ def _validate_finish_references(
                     f"plan.steps.{index}.action",
                     "runtime_action_unavailable",
                     "Manual annotation GUI is unavailable in observed runtime assets",
-                    _evidence_ref_pointer(
+                    _observation_inventory_pointer(
                         observation=observation,
                         evidence=evidence,
-                        kinds=["runtime_assets"],
+                        kind="runtime_assets",
                     ),
                 )
             )
@@ -812,10 +846,10 @@ def _validate_finish_references(
                             for name, available in runtime.projection_variants.items()
                             if available
                         ),
-                        overflow_values=_evidence_ref_pointer(
+                        overflow_values=_observation_inventory_pointer(
                             observation=observation,
                             evidence=evidence,
-                            kinds=["runtime_assets"],
+                            kind="runtime_assets",
                         ),
                     ),
                 )
