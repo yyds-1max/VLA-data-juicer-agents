@@ -2,6 +2,7 @@ import json
 import sqlite3
 from pathlib import Path
 
+import vla_data_juicer_agents.navigation.task_store as task_store_module
 from vla_data_juicer_agents.navigation.task_state import NavigationTaskPhase, NavigationTaskStatus
 from vla_data_juicer_agents.navigation.task_store import SqliteNavigationTaskStore
 
@@ -47,6 +48,69 @@ def test_task_store_updates_existing_date_and_segments(tmp_path: Path):
     assert second.scene_mode == "out"
     assert second.latest_web_session_id == "web-2"
     assert store.find_latest_by_date("20270623").task_id == first.task_id
+
+
+def test_task_store_exact_restore_preserves_entire_persisted_model(
+    monkeypatch,
+    tmp_path: Path,
+):
+    tick = 0
+
+    def advancing_utc_now() -> str:
+        nonlocal tick
+        tick += 1
+        return f"2026-07-10T00:00:00.{tick:03d}+00:00"
+
+    monkeypatch.setattr(task_store_module, "utc_now", advancing_utc_now)
+    store = SqliteNavigationTaskStore(tmp_path / "navigation_tasks.sqlite")
+    original = store.create_or_update_task(
+        date="20270623",
+        segments=["segment_a"],
+        scene_mode=None,
+        web_session_id="web-old",
+        agentscope_session_id="as-old",
+    )
+    original = store.update_task(
+        original.task_id,
+        guidance_revision=4,
+        status=NavigationTaskStatus.NEEDS_RECONCILE,
+    )
+    store.update_task(
+        original.task_id,
+        guidance_revision=5,
+        phase=NavigationTaskPhase.EXTRACT_SYNC,
+        status=NavigationTaskStatus.RUNNING,
+        latest_web_session_id="web-new",
+        agentscope_session_id="as-new",
+    )
+
+    store.restore_task_exact(original)
+
+    assert store.get_task(original.task_id) == original
+
+
+def test_task_store_update_task_ignores_caller_timestamps(monkeypatch, tmp_path: Path):
+    monkeypatch.setattr(
+        task_store_module,
+        "utc_now",
+        lambda: "2026-07-10T00:00:01.000+00:00",
+    )
+    store = SqliteNavigationTaskStore(tmp_path / "navigation_tasks.sqlite")
+    task = store.create_or_update_task(
+        date="20270623",
+        segments=["segment_a"],
+        scene_mode=None,
+    )
+
+    updated = store.update_task(
+        task.task_id,
+        status=NavigationTaskStatus.NEEDS_RECONCILE,
+        created_at="2000-01-01T00:00:00.000+00:00",
+        updated_at="2000-01-01T00:00:00.000+00:00",
+    )
+
+    assert updated.created_at == task.created_at
+    assert updated.updated_at == "2026-07-10T00:00:01.000+00:00"
 
 
 def test_task_store_keeps_one_active_task_per_date_and_segments_key(tmp_path: Path):

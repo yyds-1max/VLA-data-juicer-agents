@@ -2,6 +2,7 @@ from pathlib import Path
 
 import pytest
 import vla_data_juicer_agents.navigation.task_reconciliation as task_reconciliation_module
+import vla_data_juicer_agents.navigation.task_store as task_store_module
 from vla_data_juicer_agents.navigation.config import NavigationSettings
 from vla_data_juicer_agents.navigation.evidence_store import FileNavigationEvidenceStore
 from vla_data_juicer_agents.navigation.observation_store import (
@@ -434,8 +435,17 @@ class _FailingEvidenceStore:
 
 
 def test_prepare_task_entry_restores_existing_task_when_evidence_append_fails(
+    monkeypatch,
     tmp_path: Path,
 ):
+    tick = 0
+
+    def advancing_utc_now() -> str:
+        nonlocal tick
+        tick += 1
+        return f"2026-07-10T00:00:00.{tick:03d}+00:00"
+
+    monkeypatch.setattr(task_store_module, "utc_now", advancing_utc_now)
     root = tmp_path / "VLADatasets"
     (root / "raw_data" / "20270623" / "segment_a").mkdir(parents=True)
     task_store = SqliteNavigationTaskStore(tmp_path / "navigation.sqlite")
@@ -450,9 +460,27 @@ def test_prepare_task_entry_restores_existing_task_when_evidence_append_fails(
     original = task_store.update_task(
         original.task_id,
         guidance_revision=7,
-        phase=NavigationTaskPhase.COMPLETED,
-        status=NavigationTaskStatus.COMPLETED,
+        phase=NavigationTaskPhase.INTAKE,
+        status=NavigationTaskStatus.NEEDS_RECONCILE,
+        waiting_reason="raw_input_required",
     )
+    later = task_store.create_or_update_task(
+        date="20270624",
+        segments=["segment_b"],
+        scene_mode=None,
+        web_session_id="web-later",
+        agentscope_session_id="as-old",
+    )
+    later = task_store.update_task(
+        later.task_id,
+        phase=NavigationTaskPhase.EXTRACT_SYNC,
+        status=NavigationTaskStatus.NEEDS_RERUN,
+    )
+    latest_before = task_store.find_latest_by_agentscope_session("as-old")
+    resumable_before = [task.task_id for task in task_store.list_resumable()]
+    assert latest_before is not None
+    assert latest_before.task_id == later.task_id
+    assert resumable_before == [later.task_id, original.task_id]
     message = "\n".join(
         [
             "Structured handoff JSON:",
@@ -473,13 +501,16 @@ def test_prepare_task_entry_restores_existing_task_when_evidence_append_fails(
         )
 
     restored = task_store.get_task(original.task_id)
+    latest_after = task_store.find_latest_by_agentscope_session("as-old")
+    resumable_after = [task.task_id for task in task_store.list_resumable()]
+
+    assert restored == original
     assert restored is not None
-    assert restored.guidance_revision == 7
-    assert restored.phase == NavigationTaskPhase.COMPLETED
-    assert restored.status == NavigationTaskStatus.COMPLETED
-    assert restored.artifact_snapshot is None
-    assert restored.latest_web_session_id == "web-old"
-    assert restored.agentscope_session_id == "as-old"
+    assert restored.created_at == original.created_at
+    assert restored.updated_at == original.updated_at
+    assert latest_after is not None
+    assert latest_after.task_id == latest_before.task_id
+    assert resumable_after == resumable_before
     assert observation_store.latest(original.task_id) is None
 
 

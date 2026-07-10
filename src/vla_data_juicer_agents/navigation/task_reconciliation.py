@@ -258,10 +258,7 @@ def prepare_navigation_task_entry(
             if previous_task is None:
                 task_store.delete_task(task.task_id)
             else:
-                task_store.update_task(
-                    previous_task.task_id,
-                    **_task_changes(previous_task),
-                )
+                task_store.restore_task_exact(previous_task)
         except Exception as compensation_error:
             entry_error.add_note(
                 "navigation task entry compensation failed: "

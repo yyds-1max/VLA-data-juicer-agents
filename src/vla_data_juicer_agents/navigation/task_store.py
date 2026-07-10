@@ -100,6 +100,8 @@ class NavigationTaskStore(Protocol):
 
     def update_task(self, task_id: str, **changes: Any) -> NavigationTask: ...
 
+    def restore_task_exact(self, task: NavigationTask) -> NavigationTask: ...
+
     def delete_task(self, task_id: str) -> None: ...
 
     def record_step(
@@ -365,11 +367,25 @@ class SqliteNavigationTaskStore:
         payload.update(changes)
         if "segments" in payload:
             payload["segments"] = normalize_segments(payload["segments"])
+        payload["created_at"] = current.created_at
         payload["updated_at"] = utc_now()
         task = NavigationTask.model_validate(payload)
         with self._connect() as connection:
             self._update_task(connection, task)
         return task
+
+    def restore_task_exact(self, task: NavigationTask) -> NavigationTask:
+        with self._connect() as connection:
+            cursor = self._update_task(connection, task)
+            if cursor.rowcount == 0:
+                raise KeyError(task.task_id)
+            row = connection.execute(
+                "SELECT * FROM navigation_tasks WHERE task_id = ?",
+                (task.task_id,),
+            ).fetchone()
+        if row is None:
+            raise KeyError(task.task_id)
+        return self._task_from_row(row)
 
     def delete_task(self, task_id: str) -> None:
         with self._connect() as connection:
@@ -491,9 +507,13 @@ class SqliteNavigationTaskStore:
             values + (int(dry_run) if dry_run is not None else None,),
         )
 
-    def _update_task(self, connection: sqlite3.Connection, task: NavigationTask) -> None:
+    def _update_task(
+        self,
+        connection: sqlite3.Connection,
+        task: NavigationTask,
+    ) -> sqlite3.Cursor:
         values = self._task_values(task)
-        connection.execute(
+        return connection.execute(
             """
             UPDATE navigation_tasks SET
                 date = ?,
@@ -543,7 +563,7 @@ class SqliteNavigationTaskStore:
             _json_dump(task.data_profile),
             _json_dump(task.artifact_snapshot.model_dump(mode="json") if task.artifact_snapshot else None),
             _json_dump(task.drift.model_dump(mode="json") if task.drift else None),
-            TASK_SCHEMA_VERSION,
+            task.schema_version,
             task.created_at,
             task.updated_at,
         )
