@@ -20,6 +20,13 @@ from vla_data_juicer_agents.navigation.models import (
     SegmentInspection,
     TopicInfo,
 )
+from vla_data_juicer_agents.navigation.observation_models import (
+    CalibrationInventoryObservation,
+    LocalizationSourcesObservation,
+    SensorCandidatesObservation,
+    SensorRoleCandidate,
+    TopicCandidatesObservation,
+)
 from vla_data_juicer_agents.navigation.profiles import (
     TOPIC_OUTPUT_MAP,
     topics_for_role,
@@ -174,6 +181,111 @@ def _select_inspection_segments(
         missing_text = ", ".join(missing_names)
         raise FileNotFoundError(f"requested raw segment(s) not found for {inspection.date}: {missing_text}")
     return [segment for segment in inspection.segments if segment.name in selected_names]
+
+
+def inspect_navigation_sensor_candidates(
+    date: str,
+    segments: list[str] | None = None,
+    settings: NavigationSettings | None = None,
+) -> SensorCandidatesObservation:
+    inspection = inspect_raw_date(date, settings=settings)
+    selected_segments = _select_inspection_segments(inspection, segments)
+    topic_types = _topic_type_map(selected_segments)
+    topic_names = set(topic_types)
+    candidates: list[SensorRoleCandidate] = []
+    role_topics: dict[str, list[str]] = {}
+    for role in ("fisheye_front", "lidar", "odom", "ins"):
+        matches = sorted(topics_for_role(topic_names, role))
+        role_topics[role] = matches
+        candidates.extend(
+            SensorRoleCandidate(
+                role=role,
+                topic=topic,
+                message_type=topic_types.get(topic),
+                confidence=1.0,
+            )
+            for topic in matches
+        )
+    candidates.extend(
+        SensorRoleCandidate(
+            role="localization",
+            topic=topic,
+            message_type=topic_types.get(topic),
+            confidence=1.0,
+        )
+        for topic in sorted({*role_topics["odom"], *role_topics["ins"]})
+    )
+    return SensorCandidatesObservation(candidates=candidates)
+
+
+def inspect_navigation_topic_candidates(
+    date: str,
+    segments: list[str] | None = None,
+    settings: NavigationSettings | None = None,
+) -> TopicCandidatesObservation:
+    inspection = inspect_raw_date(date, settings=settings)
+    selected_segments = _select_inspection_segments(inspection, segments)
+    topic_names = {
+        topic.name
+        for segment in selected_segments
+        for topic in segment.topics
+    }
+    suggested_role_names = {
+        role: sorted(topics_for_role(topic_names, role))
+        for role in ("fisheye_front", "lidar", "odom", "ins")
+    }
+    suggested_role_names["localization"] = sorted(
+        {
+            *suggested_role_names["odom"],
+            *suggested_role_names["ins"],
+        }
+    )
+    return TopicCandidatesObservation(
+        available_topics=sorted(topic_names),
+        suggested_role_names=suggested_role_names,
+    )
+
+
+def inspect_navigation_calibration_inventory(
+    settings: NavigationSettings | None = None,
+) -> CalibrationInventoryObservation:
+    settings = settings or NavigationSettings()
+    params_root = settings.processing_root / "NoobScenes" / "params"
+    sources = sorted(
+        path.relative_to(settings.processing_root).as_posix()
+        for path in params_root.glob("*/sensors")
+        if path.is_dir()
+    )
+    return CalibrationInventoryObservation(sensor_sources=sources)
+
+
+def inspect_navigation_localization_sources(
+    date: str,
+    segments: list[str] | None = None,
+    settings: NavigationSettings | None = None,
+) -> LocalizationSourcesObservation:
+    settings = settings or NavigationSettings()
+    candidates = inspect_navigation_sensor_candidates(
+        date,
+        segments=segments,
+        settings=settings,
+    )
+    available_sources = sorted(
+        {
+            candidate.role
+            for candidate in candidates.candidates
+            if candidate.role in {"odom", "ins"}
+        }
+    )
+    return LocalizationSourcesObservation(
+        available_sources=available_sources,
+        conversion_available=(
+            settings.processing_root
+            / "NoobScenes"
+            / "include"
+            / "1_odom_convert.py"
+        ).is_file(),
+    )
 
 
 def infer_navigation_topic_params(
@@ -520,6 +632,16 @@ def inspect_gridmap_artifacts(
     settings: NavigationSettings | None = None,
 ) -> dict:
     settings = settings or NavigationSettings()
+    clip_date_root = settings.clip_data_root / date
+    selected = _selected_segment_names(clip_date_root, segments)
+    search_roots = [clip_date_root / segment / "sync_data" for segment in selected] if selected else []
+    pcd_sources = sorted(
+        str(path)
+        for root in search_roots
+        if root.exists()
+        for path in root.glob("**/*.pcd")
+        if path.is_file()
+    )
     finish_temp_samples = settings.finish_data_root / f"{date}_temp" / "samples" / date
     projection_ready_paths = sorted(
         path
@@ -533,11 +655,9 @@ def inspect_gridmap_artifacts(
             "gridmap_source": "projection_ready",
             "projection_input_ready": True,
             "available_gridmap_paths": [str(path) for path in projection_ready_paths],
+            "pcd_sources": pcd_sources,
         }
 
-    clip_date_root = settings.clip_data_root / date
-    selected = _selected_segment_names(clip_date_root, segments)
-    search_roots = [clip_date_root / segment / "sync_data" for segment in selected] if selected else []
     gridmap_paths = sorted(
         path
         for root in search_roots
@@ -551,6 +671,7 @@ def inspect_gridmap_artifacts(
         "gridmap_source": "existing_gridmap" if gridmap_paths else "unknown",
         "projection_input_ready": False,
         "available_gridmap_paths": [str(path) for path in gridmap_paths],
+        "pcd_sources": pcd_sources,
     }
 
 

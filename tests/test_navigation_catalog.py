@@ -86,6 +86,21 @@ def test_v2_catalog_exposes_factual_observation_capabilities():
     assert capabilities["inspect_navigation_sensor_candidates"].declared_output_kinds == ["sensor_candidates"]
     assert capabilities["inspect_navigation_topic_candidates"].phase == "extract_sync"
     assert capabilities["inspect_navigation_topic_candidates"].declared_output_kinds == ["topic_candidates"]
+    assert capabilities["inspect_navigation_raw_metadata"].phase == "extract_sync"
+    assert capabilities["inspect_navigation_raw_metadata"].declared_output_kinds == ["raw_metadata"]
+    assert capabilities["inspect_navigation_artifact_state"].declared_output_kinds == ["artifact_state"]
+    assert capabilities["inspect_navigation_gridmap_artifacts"].phase == "finish_processing"
+    assert capabilities["inspect_navigation_gridmap_artifacts"].declared_output_kinds == ["gridmap_artifacts"]
+    assert capabilities["inspect_navigation_runtime_assets"].phase == "finish_processing"
+    assert capabilities["inspect_navigation_runtime_assets"].declared_output_kinds == ["runtime_assets"]
+    assert capabilities["inspect_navigation_calibration_inventory"].phase == "finish_processing"
+    assert capabilities["inspect_navigation_calibration_inventory"].declared_output_kinds == [
+        "calibration_inventory"
+    ]
+    assert capabilities["inspect_navigation_localization_sources"].phase == "finish_processing"
+    assert capabilities["inspect_navigation_localization_sources"].declared_output_kinds == [
+        "localization_sources"
+    ]
 
 
 def test_v2_catalog_declares_argument_models_and_omits_combined_execution_tool():

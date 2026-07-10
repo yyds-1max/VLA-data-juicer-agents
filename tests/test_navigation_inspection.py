@@ -12,6 +12,8 @@ from vla_data_juicer_agents.navigation.inspection import (
     infer_navigation_topic_params_tool,
     inspect_gridmap_artifacts,
     inspect_gridmap_artifacts_tool,
+    inspect_navigation_sensor_candidates,
+    inspect_navigation_topic_candidates,
     inspect_processing_state,
     inspect_processing_state_tool,
     inspect_raw_date,
@@ -22,6 +24,34 @@ from vla_data_juicer_agents.navigation.inspection import (
 
 
 FIXTURE_ROOT = Path(__file__).parent / "fixtures" / "navigation" / "VLADatasets"
+
+
+def test_sensor_candidate_inspection_does_not_select_binding():
+    settings = NavigationSettings(vladatasets_root=FIXTURE_ROOT)
+
+    result = inspect_navigation_sensor_candidates("20270605", settings=settings)
+
+    assert result.candidates
+    assert {candidate.role for candidate in result.candidates} >= {
+        "fisheye_front",
+        "lidar",
+        "odom",
+        "localization",
+    }
+    assert not hasattr(result, "sensor_bindings")
+
+
+def test_topic_candidate_inspection_does_not_select_final_params():
+    settings = NavigationSettings(vladatasets_root=FIXTURE_ROOT)
+
+    result = inspect_navigation_topic_candidates("20270605", settings=settings)
+
+    payload = result.model_dump(mode="json")
+    assert "/rs32_lidar_points" in result.available_topics
+    assert result.suggested_role_names["lidar"] == ["/rs32_lidar_points"]
+    assert "topic_whitelist" not in payload
+    assert "topic_map" not in payload
+    assert "query_dir" not in payload
 
 
 def test_list_navigation_dates_finds_raw_dates():
@@ -642,6 +672,27 @@ def test_inspect_gridmap_artifacts_ignores_empty_gridmap_dirs(tmp_path):
 
     assert result["gridmap_source"] == "unknown"
     assert result["available_gridmap_paths"] == []
+
+
+def test_inspect_gridmap_artifacts_reports_pcd_sources(tmp_path):
+    root = tmp_path / "VLADatasets"
+    pcd_path = (
+        root
+        / "clip_data"
+        / "20270605"
+        / "segment_a"
+        / "sync_data"
+        / "clip_a"
+        / "r32_rslidar_points"
+        / "000001.pcd"
+    )
+    pcd_path.parent.mkdir(parents=True)
+    pcd_path.write_text("pcd", encoding="utf-8")
+    settings = NavigationSettings(vladatasets_root=root)
+
+    result = inspect_gridmap_artifacts("20270605", ["segment_a"], settings=settings)
+
+    assert result["pcd_sources"] == [str(pcd_path)]
 
 
 def test_inspect_runtime_assets_reports_variant_supporting_scripts(tmp_path):
