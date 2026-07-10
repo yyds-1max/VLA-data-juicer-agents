@@ -10,7 +10,10 @@ from vla_data_juicer_agents.navigation.catalog import (
     list_navigation_tool_capabilities,
 )
 from vla_data_juicer_agents.navigation.config import NavigationSettings
-from vla_data_juicer_agents.navigation.context_budget import ensure_payload_within_limit
+from vla_data_juicer_agents.navigation.context_budget import (
+    ensure_payload_within_limit,
+    serialized_chars,
+)
 from vla_data_juicer_agents.navigation.evidence_store import FileNavigationEvidenceStore
 from vla_data_juicer_agents.navigation.inspection import (
     inspect_gridmap_artifacts,
@@ -31,6 +34,9 @@ from vla_data_juicer_agents.navigation.observation_models import (
     RuntimeAssetsObservation,
     TopicMeasurement,
 )
+from vla_data_juicer_agents.navigation.observation_projection import (
+    compact_observation_payload,
+)
 from vla_data_juicer_agents.navigation.observation_store import (
     SqliteNavigationObservationStore,
 )
@@ -45,6 +51,7 @@ from vla_data_juicer_agents.navigation.task_state import NavigationTask
 
 
 INSPECTION_RESULT_MAX_CHARS = 4_000
+OBSERVATION_DELTA_MAX_CHARS = 2_000
 COGNITIVE_RESULT_MAX_CHARS = 5_500
 
 
@@ -111,6 +118,21 @@ def build_navigation_observation_tools(
         source_tool: str,
         summary: str,
     ) -> dict[str, Any]:
+        compact_delta = compact_observation_payload(
+            payload,
+            max_chars=OBSERVATION_DELTA_MAX_CHARS,
+        )
+        ensure_payload_within_limit(
+            {
+                "ok": True,
+                "observation_delta": compact_delta,
+                "evidence_refs": ["x" * (2 * len(task.task_id) + 512)],
+                "observation_revision": 10**30,
+                "remaining_missing_observations": list(required),
+            },
+            max_chars=INSPECTION_RESULT_MAX_CHARS,
+            label=f"{source_tool}_preflight",
+        )
         revision = observation_store.append(
             task.task_id,
             task.phase,
@@ -133,7 +155,7 @@ def build_navigation_observation_tools(
         ]
         result = {
             "ok": True,
-            "observation_delta": payload.model_dump(mode="json"),
+            "observation_delta": compact_delta,
             "evidence_refs": revision.evidence_refs,
             "observation_revision": revision.revision,
             "remaining_missing_observations": missing,
@@ -278,7 +300,7 @@ def build_navigation_observation_tools(
             raise ValueError("no observations recorded for the active task")
         evidence = observation_store.list_evidence(
             task.task_id,
-            limit=100,
+            limit=101,
         )
         return build_phase_planning_context(
             task=task,
@@ -303,14 +325,28 @@ def build_navigation_observation_tools(
             cursor=cursor,
             limit=limit + 1,
         )
-        has_more = len(descriptors) > limit
         result = {
-            "evidence": [
-                descriptor.model_dump(mode="json")
-                for descriptor in descriptors[:limit]
-            ],
-            "next_cursor": cursor + limit if has_more else None,
+            "evidence": [],
+            "next_cursor": cursor if descriptors else None,
         }
+        for descriptor in descriptors[:limit]:
+            evidence = [
+                *result["evidence"],
+                descriptor.model_dump(mode="json"),
+            ]
+            candidate = {
+                "evidence": evidence,
+                "next_cursor": (
+                    cursor + len(evidence)
+                    if len(descriptors) > len(evidence)
+                    else None
+                ),
+            }
+            if serialized_chars(candidate) > COGNITIVE_RESULT_MAX_CHARS:
+                break
+            result = candidate
+        if descriptors and not result["evidence"]:
+            raise ValueError("first evidence descriptor exceeds response character budget")
         return ensure_payload_within_limit(
             result,
             max_chars=COGNITIVE_RESULT_MAX_CHARS,

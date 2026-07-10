@@ -9,12 +9,19 @@ from vla_data_juicer_agents.navigation.catalog import (
     CAPABILITY_CATALOG_REVISION,
     ToolCapability,
 )
-from vla_data_juicer_agents.navigation.context_budget import ensure_payload_within_limit
+from vla_data_juicer_agents.navigation.context_budget import (
+    ensure_payload_within_limit,
+    serialized_chars,
+)
 from vla_data_juicer_agents.navigation.observation_models import (
     EvidenceDescriptor,
     NavigationObservationRevision,
     ObservationKind,
     StrictModel,
+)
+from vla_data_juicer_agents.navigation.observation_projection import (
+    compact_observation_payload,
+    preview_string,
 )
 from vla_data_juicer_agents.navigation.task_state import NavigationTask
 
@@ -37,6 +44,7 @@ class PhasePlanningContext(StrictModel):
     fact_summary: dict[str, Any]
     available_action_ids: list[str]
     evidence_catalog: list[EvidenceDescriptor]
+    evidence_next_cursor: int | None = None
 
 
 PHASE_REQUIRED_OBSERVATIONS: dict[str, tuple[ObservationKind, ...]] = {
@@ -122,13 +130,29 @@ def build_phase_planning_context(
         ),
         fact_summary=_project_fact_summary(task, observation, required),
         available_action_ids=_available_action_ids(capability_items, phase),
-        evidence_catalog=descriptors,
+        evidence_catalog=[],
+        evidence_next_cursor=0 if descriptors else None,
     )
     ensure_payload_within_limit(
         context.model_dump(mode="json"),
         max_chars=PLANNING_CONTEXT_MAX_CHARS,
         label="planning_context",
     )
+    prefix: list[EvidenceDescriptor] = []
+    for index, descriptor in enumerate(descriptors):
+        candidate_prefix = [*prefix, descriptor]
+        candidate = context.model_copy(
+            update={
+                "evidence_catalog": candidate_prefix,
+                "evidence_next_cursor": (
+                    index + 1 if index + 1 < len(descriptors) else None
+                ),
+            }
+        )
+        if serialized_chars(candidate.model_dump(mode="json")) > PLANNING_CONTEXT_MAX_CHARS:
+            break
+        prefix = candidate_prefix
+        context = candidate
     return context
 
 
@@ -139,18 +163,26 @@ def _project_fact_summary(
 ) -> dict[str, Any]:
     facts: dict[str, Any] = {
         "date": task.date,
-        "segments": task.segments,
+        "segment_count": len(task.segments) if task.segments is not None else None,
+        "segments": (
+            [preview_string(segment) for segment in task.segments[:5]]
+            if task.segments is not None
+            else None
+        ),
+        "segments_truncated": bool(task.segments and len(task.segments) > 5),
         "scene_mode": task.scene_mode,
     }
     allowed = {*required, "user_guidance"}
     for payload in observation.payloads:
         if payload.kind not in allowed:
             continue
-        facts[payload.kind] = payload.model_dump(
-            mode="json",
-            exclude={"kind"},
-            exclude_none=True,
+        compact = compact_observation_payload(
+            payload,
+            preview_items=3,
+            max_chars=1_800,
         )
+        compact.pop("kind", None)
+        facts[payload.kind] = compact
     return facts
 
 

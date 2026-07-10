@@ -121,6 +121,71 @@ def test_inspection_tool_returns_only_compact_delta_and_external_evidence(tmp_pa
     assert evidence["data"]["segments"][0]["metadata_path"].endswith("metadata.yaml")
 
 
+def test_large_topic_inventory_is_compacted_before_single_persisted_revision(tmp_path):
+    root = tmp_path / "VLADatasets"
+    metadata_path = root / "raw_data" / "20270605" / "segment_a" / "metadata.yaml"
+    metadata_path.parent.mkdir(parents=True)
+    topics = [
+        (f"/diagnostics/very_long_topic_name_{index:04d}_" + "x" * 80, "std_msgs/msg/String")
+        for index in range(250)
+    ] + [
+        ("/cam_video4/csi_cam/image_raw/compressed", "sensor_msgs/msg/CompressedImage"),
+        ("/rs32_lidar_points", "sensor_msgs/msg/PointCloud2"),
+        ("/sport_odom", "nav_msgs/msg/Odometry"),
+    ]
+    entries = "\n".join(
+        "    - topic_metadata:\n"
+        f"        name: {name}\n"
+        f"        type: {message_type}\n"
+        "      message_count: 1"
+        for name, message_type in topics
+    )
+    metadata_path.write_text(
+        "rosbag2_bagfile_information:\n"
+        "  topics_with_message_count:\n"
+        f"{entries}\n",
+        encoding="utf-8",
+    )
+    task = NavigationTask(
+        task_id="nav-large-inventory",
+        date="20270605",
+        segments=["segment_a"],
+        phase=NavigationTaskPhase.EXTRACT_SYNC,
+    )
+    tools, observation_store, evidence_store = _tools(
+        tmp_path,
+        task=task,
+        settings=NavigationSettings(vladatasets_root=root),
+    )
+
+    result = _invoke_tool(tools["inspect_navigation_topic_candidates_tool"], {})
+
+    compact = result["observation_delta"]
+    assert compact["kind"] == "topic_candidates"
+    assert compact["available_topic_count"] == len(topics)
+    assert "available_topics" not in compact
+    assert len(json.dumps(compact, ensure_ascii=False, separators=(",", ":"))) <= 2_000
+    assert len(json.dumps(result, ensure_ascii=False, separators=(",", ":"))) <= 4_000
+    revision = observation_store.latest(task.task_id)
+    assert revision is not None
+    assert revision.revision == 1
+    topic_observation = next(payload for payload in revision.payloads if payload.kind == "topic_candidates")
+    assert len(topic_observation.available_topics) == len(topics)
+    collected = []
+    cursor = 0
+    while cursor is not None:
+        page = evidence_store.read(
+            task.task_id,
+            result["evidence_refs"][0],
+            fields=["available_topics"],
+            cursor=cursor,
+            limit=20,
+        )
+        collected.extend(page["data"]["available_topics"])
+        cursor = page["next_cursor"]
+    assert collected == sorted(name for name, _ in topics)
+
+
 def test_extract_observation_tools_complete_phase_without_selecting_params(tmp_path):
     tools, observation_store, _ = _tools(tmp_path)
 
@@ -171,11 +236,13 @@ def test_finish_inventory_tools_report_only_measured_candidates(tmp_path):
 
     assert calibration["observation_delta"] == {
         "kind": "calibration_inventory",
-        "sensor_sources": ["NoobScenes/params/20260529_go2w/sensors"],
+        "sensor_source_count": 1,
+        "sensor_sources_preview": ["NoobScenes/params/20260529_go2w/sensors"],
     }
     assert localization["observation_delta"] == {
         "kind": "localization_sources",
-        "available_sources": ["odom"],
+        "available_source_count": 1,
+        "available_sources_preview": ["odom"],
         "conversion_available": True,
     }
 
@@ -210,3 +277,26 @@ def test_cognitive_tools_bind_task_paginate_evidence_and_describe_active_action(
     assert described["tool_name"] == "prepare_raw_data"
     assert described["phase"] == "extract_sync"
     assert described["executor_agent_allowed"] is True
+
+
+def test_repeated_inspections_paginate_evidence_and_context_by_character_budget(tmp_path):
+    tools, _, _ = _tools(tmp_path)
+    for _ in range(30):
+        _invoke_tool(tools["inspect_navigation_artifact_state_tool"], {})
+
+    first = _invoke_tool(tools["list_observation_evidence_tool"], {})
+
+    assert 0 < len(first["evidence"]) < 20
+    assert first["next_cursor"] == len(first["evidence"])
+    assert len(json.dumps(first, ensure_ascii=False, separators=(",", ":"))) <= 5_500
+    second = _invoke_tool(
+        tools["list_observation_evidence_tool"],
+        {"cursor": first["next_cursor"]},
+    )
+    assert second["evidence"][0]["observation_revision"] == first["next_cursor"] + 1
+    assert len(json.dumps(second, ensure_ascii=False, separators=(",", ":"))) <= 5_500
+
+    context = _invoke_tool(tools["get_phase_planning_context_tool"], {})
+    assert len(json.dumps(context, ensure_ascii=False, separators=(",", ":"))) <= 5_500
+    assert context["evidence_next_cursor"] == len(context["evidence_catalog"])
+    assert context["evidence_next_cursor"] < 30

@@ -12,6 +12,7 @@ from vla_data_juicer_agents.navigation.observation_models import (
     NavigationObservationRevision,
     RawMetadataObservation,
     RuntimeAssetsObservation,
+    TopicCandidatesObservation,
     TopicMeasurement,
     UserGuidanceObservation,
 )
@@ -205,3 +206,74 @@ def test_planning_context_excludes_executor_capability_without_available_variant
     )
 
     assert context.available_action_ids == []
+
+
+def test_planning_context_summarizes_large_fact_lists():
+    topic_names = [f"/diagnostics/topic_{index:04d}_" + "x" * 160 for index in range(300)]
+    revision = NavigationObservationRevision(
+        task_id="nav-1",
+        revision=4,
+        phase=NavigationTaskPhase.EXTRACT_SYNC,
+        completed_kinds=["raw_metadata", "topic_candidates"],
+        payloads=[
+            RawMetadataObservation(
+                segments=["20260710_120000"],
+                topics=[TopicMeasurement(topic=name, message_count=1) for name in topic_names],
+            ),
+            TopicCandidatesObservation(
+                available_topics=topic_names,
+                suggested_role_names={"diagnostics": topic_names},
+            ),
+        ],
+    )
+
+    context = build_phase_planning_context(
+        task=_task(),
+        observation=revision,
+        capabilities=_caps(),
+    )
+
+    serialized = json.dumps(context.model_dump(mode="json"), ensure_ascii=False, separators=(",", ":"))
+    assert len(serialized) <= 5_500
+    assert context.fact_summary["raw_metadata"]["topic_count"] == 300
+    assert "topics" not in context.fact_summary["raw_metadata"]
+    assert context.fact_summary["topic_candidates"]["available_topic_count"] == 300
+    assert "available_topics" not in context.fact_summary["topic_candidates"]
+
+
+def test_planning_context_uses_largest_descriptor_prefix_with_continuation_cursor():
+    descriptors = [
+        EvidenceDescriptor(
+            ref=f"evidence-{index:03d}-" + "r" * 220,
+            task_id="nav-1",
+            observation_revision=2,
+            kind="raw_metadata",
+            summary=f"descriptor {index:03d} " + "s" * 400,
+            byte_size=12,
+            source_tool="inspect_navigation_raw_metadata_tool",
+            created_at="2026-07-10T00:00:00+00:00",
+        )
+        for index in range(30)
+    ]
+
+    context = build_phase_planning_context(
+        task=_task(),
+        observation=_revision(),
+        evidence=descriptors,
+        capabilities=_caps(),
+    )
+
+    payload = context.model_dump(mode="json")
+    assert len(json.dumps(payload, ensure_ascii=False, separators=(",", ":"))) <= 5_500
+    assert 0 < len(context.evidence_catalog) < len(descriptors)
+    assert context.evidence_next_cursor == len(context.evidence_catalog)
+    next_descriptor = descriptors[context.evidence_next_cursor]
+    oversized = {
+        **payload,
+        "evidence_catalog": [
+            *payload["evidence_catalog"],
+            next_descriptor.model_dump(mode="json"),
+        ],
+        "evidence_next_cursor": context.evidence_next_cursor + 1,
+    }
+    assert len(json.dumps(oversized, ensure_ascii=False, separators=(",", ":"))) > 5_500
