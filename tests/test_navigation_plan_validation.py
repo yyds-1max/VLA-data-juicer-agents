@@ -1,500 +1,638 @@
+from __future__ import annotations
+
 import pytest
 
-from vla_data_juicer_agents.navigation.models import (
-    NavigationFinishProcessingProfile,
-    NavigationProcessingProfile,
-    NavigationTopicParams,
-    PlanIssue,
-    WorkflowPlan,
-    WorkflowStep,
+from vla_data_juicer_agents.navigation.catalog import list_navigation_tool_capabilities
+from vla_data_juicer_agents.navigation.observation_models import (
+    ArtifactStateObservation,
+    CalibrationInventoryObservation,
+    EvidenceDescriptor,
+    GridmapArtifactsObservation,
+    LocalizationSourcesObservation,
+    NavigationObservationRevision,
+    RawMetadataObservation,
+    RuntimeAssetsObservation,
+    SensorCandidatesObservation,
+    SensorRoleCandidate,
+    TopicCandidatesObservation,
+    TopicMeasurement,
 )
-from vla_data_juicer_agents.navigation.plan_validation import validate_workflow_plan
-from vla_data_juicer_agents.navigation.workflow import build_deterministic_plan_template
+from vla_data_juicer_agents.navigation.plan_models import (
+    ExtractSyncPlanInput,
+    FinishProcessingPlanInput,
+    PlanValidationIssue,
+)
+from vla_data_juicer_agents.navigation.plan_validation import validate_navigation_plan
+from vla_data_juicer_agents.navigation.task_state import (
+    NavigationArtifactSnapshot,
+    NavigationTask,
+    NavigationTaskPhase,
+)
 
 
-def _topic_params(profile_hint: str = "mixed") -> NavigationTopicParams:
-    return NavigationTopicParams(
-        profile_hint=profile_hint,
-        confidence=1.0,
-        topic_whitelist=["/cam", "/lidar_points", "/sport_odom"],
-        topic_map={"cam": "fisheye_front", "lidar_points": "r32_rslidar_points", "sport_odom": "odom"},
-        query_dir="lidar_points",
+def extract_task() -> NavigationTask:
+    return NavigationTask(
+        task_id="nav-plan-1",
+        date="20260710",
+        segments=["20260710_120000"],
+        phase=NavigationTaskPhase.EXTRACT_SYNC,
     )
 
 
-def _processing_profile(
+def finish_task() -> NavigationTask:
+    return NavigationTask(
+        task_id="nav-plan-1",
+        date="20260710",
+        segments=["20260710_120000"],
+        scene_mode="out",
+        phase=NavigationTaskPhase.FINISH_PROCESSING,
+    )
+
+
+def descriptor(ref: str, revision: int, *, task_id: str = "nav-plan-1") -> EvidenceDescriptor:
+    return EvidenceDescriptor(
+        ref=ref,
+        task_id=task_id,
+        observation_revision=revision,
+        kind="measured_fact",
+        summary=f"Evidence for {ref}",
+        byte_size=10,
+        source_tool="inspect_navigation_test_tool",
+        created_at="2026-07-10T00:00:00+00:00",
+    )
+
+
+def extract_observation() -> NavigationObservationRevision:
+    topics = ["/camera/front/image", "/lidar/points", "/localization/odom"]
+    return NavigationObservationRevision(
+        task_id="nav-plan-1",
+        revision=4,
+        phase=NavigationTaskPhase.EXTRACT_SYNC,
+        completed_kinds=[
+            "artifact_state",
+            "raw_metadata",
+            "sensor_candidates",
+            "topic_candidates",
+        ],
+        payloads=[
+            ArtifactStateObservation(
+                snapshot=NavigationArtifactSnapshot(
+                    date="20260710",
+                    segments=["20260710_120000"],
+                    raw_input_exists=True,
+                )
+            ),
+            RawMetadataObservation(
+                segments=["20260710_120000"],
+                topics=[TopicMeasurement(topic=topic, message_count=100) for topic in topics],
+            ),
+            SensorCandidatesObservation(
+                candidates=[
+                    SensorRoleCandidate(
+                        role="fisheye_front",
+                        topic="/camera/front/image",
+                        confidence=0.99,
+                    ),
+                    SensorRoleCandidate(
+                        role="lidar", topic="/lidar/points", confidence=0.99
+                    ),
+                    SensorRoleCandidate(
+                        role="odom", topic="/localization/odom", confidence=0.99
+                    ),
+                ]
+            ),
+            TopicCandidatesObservation(
+                available_topics=topics,
+                suggested_role_names={
+                    "fisheye_front": ["/camera/front/image"],
+                    "lidar": ["/lidar/points"],
+                    "odom": ["/localization/odom"],
+                },
+            ),
+        ],
+    )
+
+
+def finish_observation(
     *,
-    profile_hint: str = "mixed",
-    platform_hint: str = "unknown",
-) -> NavigationProcessingProfile:
-    return NavigationProcessingProfile(
-        id="parameterized_navigation_v1",
-        platform_hint=platform_hint,
-        topic_params=_topic_params(profile_hint),
-        localization_policy={"source": "odom", "conversion": "odom_to_ins"},
-    )
-
-
-def _go2w_data_profile() -> NavigationFinishProcessingProfile:
-    return NavigationFinishProcessingProfile(
-        date="20270605",
-        scene_mode="out",
-        processing_profile=_processing_profile(profile_hint="go2w_like", platform_hint="go2w"),
-        platform_hint="go2w",
-        localization_policy={"source": "odom", "conversion": "odom_to_ins"},
-        topic_params=_topic_params("go2w_like"),
-    )
-
-
-def _confirm_step(**updates):
-    values = {
-        "step_id": "confirm_navigation_calibration_params",
-        "tool_name": "confirm_navigation_calibration_params",
-        "human_blocking": True,
-        "failure_behavior": "stop",
-        "effects": "read",
-    }
-    values.update(updates)
-    return WorkflowStep(**values)
-
-
-def _error_by_type(result: dict, issue_type: str) -> dict:
-    return next(error for error in result["errors"] if error["type"] == issue_type)
-
-
-def test_validate_workflow_plan_accepts_default_template():
-    profile = _go2w_data_profile()
-    plan = build_deterministic_plan_template(
-        "20270605",
-        "parameterized_navigation_v1",
-        None,
-        scene_mode="out",
-        phase_profile=profile,
-    )
-
-    result = validate_workflow_plan(plan, phase_profile=profile)
-
-    assert result["ok"] is True
-    assert result["errors"] == []
-
-
-def test_validate_workflow_plan_rejects_unknown_tool():
-    plan = WorkflowPlan(
-        date="20270605",
-        scene_mode="out",
-        processing_profile="parameterized_navigation_v1",
-        platform_hint="unknown",
-        steps=[_confirm_step(), WorkflowStep(step_id="bad", tool_name="invented_tool")],
-    )
-
-    result = validate_workflow_plan(plan)
-
-    assert result["ok"] is False
-    assert result["errors"][0]["type"] == "unknown_tool"
-
-
-def test_validate_workflow_plan_rejects_unknown_variant():
-    profile = _go2w_data_profile()
-    plan = build_deterministic_plan_template(
-        "20270605",
-        "parameterized_navigation_v1",
-        None,
-        scene_mode="out",
-        phase_profile=profile,
-    )
-    gridmap = next(step for step in plan.steps if step.tool_name == "prepare_gridmap_for_projection")
-    gridmap.variant = "made_up_variant"
-
-    result = validate_workflow_plan(plan, phase_profile=profile)
-
-    assert result["ok"] is False
-    assert result["errors"][0]["type"] == "unknown_or_unavailable_variant"
-
-
-def test_validate_workflow_plan_rejects_unknown_precondition():
-    plan = WorkflowPlan(
-        date="20270605",
-        scene_mode="out",
-        processing_profile="parameterized_navigation_v1",
-        platform_hint="unknown",
-        steps=[
-            _confirm_step(),
-            WorkflowStep(
-                step_id="prepare_raw_data",
-                tool_name="prepare_raw_data",
-                preconditions=["missing_step"],
-            )
+    pcd_tool_available: bool = True,
+    conversion_available: bool = True,
+) -> NavigationObservationRevision:
+    return NavigationObservationRevision(
+        task_id="nav-plan-1",
+        revision=5,
+        phase=NavigationTaskPhase.FINISH_PROCESSING,
+        completed_kinds=[
+            "artifact_state",
+            "gridmap_artifacts",
+            "runtime_assets",
+            "calibration_inventory",
+            "localization_sources",
         ],
-    )
-
-    result = validate_workflow_plan(plan)
-
-    assert result["ok"] is False
-    assert result["errors"][0]["type"] == "unknown_precondition"
-    assert result["errors"][0]["details"]["step_id"] == "prepare_raw_data"
-    assert result["errors"][0]["details"]["precondition"] == "missing_step"
-
-
-def test_validate_workflow_plan_rejects_cyclic_precondition():
-    plan = WorkflowPlan(
-        date="20270605",
-        scene_mode="out",
-        processing_profile="parameterized_navigation_v1",
-        platform_hint="unknown",
-        steps=[
-            _confirm_step(),
-            WorkflowStep(
-                step_id="prepare_raw_data",
-                tool_name="prepare_raw_data",
-                preconditions=["extract_and_sync_navigation_data"],
+        payloads=[
+            ArtifactStateObservation(
+                snapshot=NavigationArtifactSnapshot(
+                    date="20260710",
+                    segments=["20260710_120000"],
+                    sync_data_exists=True,
+                )
             ),
-            WorkflowStep(
-                step_id="extract_and_sync_navigation_data",
-                tool_name="extract_and_sync_navigation_data",
-                preconditions=["prepare_raw_data"],
+            GridmapArtifactsObservation(
+                existing_gridmap_paths=["/data/grid_map.pcd"],
+                pcd_sources=["/data/source.pcd"],
+                projection_ready=False,
+            ),
+            RuntimeAssetsObservation(
+                pcd_gridmap_tool_available=pcd_tool_available,
+                manual_annotation_gui_available=True,
+                projection_variants={
+                    "cjl_with_gridmap": True,
+                    "cjl_0525_with_gridmap": False,
+                },
+            ),
+            CalibrationInventoryObservation(sensor_sources=["fisheye_front"]),
+            LocalizationSourcesObservation(
+                available_sources=["odom"],
+                conversion_available=conversion_available,
             ),
         ],
     )
 
-    result = validate_workflow_plan(plan)
 
-    assert result["ok"] is False
-    assert result["errors"][0]["type"] == "cyclic_precondition"
-
-
-def test_validate_workflow_plan_accepts_mixed_topic_strategy_variants():
-    profile = NavigationFinishProcessingProfile(
-        date="20270605",
-        scene_mode="out",
-        processing_profile=_processing_profile(profile_hint="hybrid", platform_hint="unknown"),
-        platform_hint="unknown",
-        localization_policy={"source": "odom", "conversion": "odom_to_ins"},
-        topic_params=_topic_params("hybrid"),
-    )
-    plan = WorkflowPlan(
-        date="20270605",
-        scene_mode="out",
-        processing_profile="parameterized_navigation_v1",
-        platform_hint="unknown",
-        steps=[
-            _confirm_step(),
-            WorkflowStep(
-                step_id="extract_and_sync_navigation_data",
-                tool_name="extract_and_sync_navigation_data",
-                variant="explicit_topic_params",
-            ),
-            WorkflowStep(
-                step_id="run_projection_and_trajectory",
-                tool_name="run_projection_and_trajectory",
-                variant="cjl_0525_with_gridmap",
-                arguments={"projection_variant": "cjl_0525_with_gridmap"},
-                preconditions=["extract_and_sync_navigation_data"],
-            ),
-        ],
-    )
-
-    result = validate_workflow_plan(plan, phase_profile=profile)
-
-    assert result["ok"] is True
-    assert result["errors"] == []
-
-
-def test_validate_workflow_plan_rejects_removed_platform_bucket_variants():
-    plan = WorkflowPlan(
-        date="20270605",
-        scene_mode="out",
-        processing_profile="parameterized_navigation_v1",
-        platform_hint="go2w",
-        steps=[
-            _confirm_step(),
-            WorkflowStep(
-                step_id="extract_and_sync_navigation_data",
-                tool_name="extract_and_sync_navigation_data",
-                variant="go2w_like",
-            )
-        ],
-    )
-
-    result = validate_workflow_plan(plan)
-
-    assert result["ok"] is False
-    assert result["errors"][0]["type"] == "unknown_or_unavailable_variant"
-
-
-def test_validate_workflow_plan_rejects_gridmap_before_tracking():
-    profile = _go2w_data_profile()
-    plan = build_deterministic_plan_template(
-        "20270605",
-        "parameterized_navigation_v1",
-        None,
-        scene_mode="out",
-        phase_profile=profile,
-    )
-    gridmap_index = next(index for index, step in enumerate(plan.steps) if step.tool_name == "prepare_gridmap_for_projection")
-    tracking_index = next(index for index, step in enumerate(plan.steps) if step.tool_name == "run_tracking")
-    plan.steps[gridmap_index], plan.steps[tracking_index] = plan.steps[tracking_index], plan.steps[gridmap_index]
-
-    result = validate_workflow_plan(plan, phase_profile=profile)
-
-    assert result["ok"] is False
-    assert result["errors"][0]["type"] == "invalid_gridmap_stage_order"
-
-
-def test_validate_workflow_plan_rejects_active_plan_with_blocking_profile():
-    plan = build_deterministic_plan_template(
-        "20270605",
-        "parameterized_navigation_v1",
-        None,
-        scene_mode="out",
-    )
-    profile = NavigationFinishProcessingProfile(
-        date="20270605",
-        scene_mode="out",
-        processing_profile=_processing_profile(),
-        localization_policy={"source": "odom", "conversion": "odom_to_ins"},
-        topic_params=_topic_params(),
-        blocking_issues=[PlanIssue(type="missing_gridmap_source_or_generator")],
-    )
-
-    result = validate_workflow_plan(plan, phase_profile=profile)
-
-    assert result["ok"] is False
-    assert result["errors"][0]["type"] == "blocking_profile_has_active_plan"
-
-
-def test_validate_workflow_plan_rejects_variant_selector_mismatch():
-    profile = NavigationFinishProcessingProfile(
-        date="20270605",
-        scene_mode="out",
-        processing_profile=_processing_profile(platform_hint="go2w"),
-        platform_hint="go2w",
-        localization_policy={"source": "odom", "conversion": "odom_to_ins"},
-        topic_params=_topic_params(),
-        gridmap_source="existing_gridmap",
-    )
-    plan = build_deterministic_plan_template(
-        "20270605",
-        "parameterized_navigation_v1",
-        None,
-        scene_mode="out",
-        phase_profile=profile,
-    )
-    gridmap = next(step for step in plan.steps if step.tool_name == "prepare_gridmap_for_projection")
-    gridmap.variant = "generate_from_pcd"
-
-    result = validate_workflow_plan(plan, phase_profile=profile)
-
-    assert result["ok"] is False
-    assert result["errors"][0]["type"] == "variant_selector_mismatch"
-
-
-def test_validate_workflow_plan_blocks_unknown_gridmap_without_issue():
-    profile = NavigationFinishProcessingProfile(
-        date="20270605",
-        scene_mode="out",
-        processing_profile=_processing_profile(),
-        localization_policy={"source": "odom", "conversion": "odom_to_ins"},
-        topic_params=_topic_params(),
-        gridmap_source="unknown",
-        pcd_gridmap_tool_available=False,
-    )
-    plan = build_deterministic_plan_template(
-        "20270605",
-        "parameterized_navigation_v1",
-        None,
-        scene_mode="out",
-        phase_profile=profile,
-    )
-
-    result = validate_workflow_plan(plan, phase_profile=profile)
-
-    assert result["ok"] is False
-    assert result["errors"][0]["type"] == "missing_gridmap_source_or_generator"
-
-
-def test_validate_workflow_plan_rejects_empty_processing_profile_from_json_path():
-    plan = WorkflowPlan(
-        date="20270605",
-        scene_mode="out",
-        processing_profile="",
-        platform_hint="unknown",
-        steps=[],
-    )
-
-    result = validate_workflow_plan(plan)
-
-    assert result["ok"] is False
-    assert result["errors"][0]["type"] == "missing_processing_profile"
-
-
-def test_validate_workflow_plan_rejects_missing_calibration_confirmation_directly():
-    profile = _go2w_data_profile()
-    plan = build_deterministic_plan_template(
-        "20270605",
-        "parameterized_navigation_v1",
-        None,
-        scene_mode="out",
-        phase_profile=profile,
-    )
-    plan.steps = [
-        step
-        for step in plan.steps
-        if step.step_id != "confirm_navigation_calibration_params"
+def extract_evidence() -> list[EvidenceDescriptor]:
+    return [
+        descriptor("evidence:sensors", 2),
+        descriptor("evidence:topics", 3),
+        descriptor("evidence:timing", 4),
     ]
-    for step in plan.steps:
-        step.preconditions = [
-            precondition
-            for precondition in step.preconditions
-            if precondition != "confirm_navigation_calibration_params"
-        ]
-
-    result = validate_workflow_plan(plan, phase_profile=profile)
-
-    assert result["ok"] is False
-    error = _error_by_type(result, "missing_calibration_confirmation")
-    assert "confirm_navigation_calibration_params" in error["message"]
 
 
-def test_validate_workflow_plan_rejects_wrong_calibration_confirmation_tool_directly():
-    profile = _go2w_data_profile()
-    plan = build_deterministic_plan_template(
-        "20270605",
-        "parameterized_navigation_v1",
-        None,
-        scene_mode="out",
-        phase_profile=profile,
-    )
-    confirmation = next(
-        step
-        for step in plan.steps
-        if step.step_id == "confirm_navigation_calibration_params"
-    )
-    confirmation.tool_name = "prepare_raw_data"
+def finish_evidence() -> list[EvidenceDescriptor]:
+    return [
+        descriptor("evidence:localization", 3),
+        descriptor("evidence:gridmap", 4),
+        descriptor("evidence:calibration", 5),
+    ]
 
-    result = validate_workflow_plan(plan, phase_profile=profile)
 
-    assert result["ok"] is False
-    assert _error_by_type(result, "invalid_calibration_confirmation_tool")["details"] == {
-        "step_id": "confirm_navigation_calibration_params",
-        "tool_name": "prepare_raw_data",
+def valid_extract_plan_payload() -> dict:
+    return {
+        "decisions": {
+            "sensor_bindings": {
+                "bindings": {
+                    "fisheye_front": "/camera/front/image",
+                    "lidar": "/lidar/points",
+                    "odom": "/localization/odom",
+                },
+                "reason": "Observed matching message types and rates.",
+                "evidence_refs": ["evidence:sensors"],
+            },
+            "topic_selection": {
+                "topic_whitelist": [
+                    "/camera/front/image",
+                    "/lidar/points",
+                    "/localization/odom",
+                ],
+                "topic_map": {
+                    "/camera/front/image": "fisheye_front",
+                    "/lidar/points": "lidar",
+                    "/localization/odom": "odom",
+                },
+                "query_dir": "/data/query",
+                "reason": "All selected topics were observed.",
+                "evidence_refs": ["evidence:topics"],
+            },
+            "time_sync": {
+                "reference_sensor": "lidar",
+                "method": "nearest_timestamp",
+                "tolerance_ms": 50,
+                "reason": "Lidar timestamps cover the selected streams.",
+                "evidence_refs": ["evidence:timing"],
+            },
+        },
+        "steps": [
+            {
+                "step_id": "prepare_raw",
+                "action": "prepare_raw_data",
+                "variant": "default",
+                "arguments": {},
+                "depends_on": [],
+                "failure_policy": "stop",
+                "decision_refs": [],
+            },
+            {
+                "step_id": "extract_sync",
+                "action": "extract_and_sync_navigation_data",
+                "variant": "explicit_topic_params",
+                "arguments": {"processes_num": 8},
+                "depends_on": ["prepare_raw"],
+                "failure_policy": "stop",
+                "decision_refs": ["sensor_bindings", "topic_selection", "time_sync"],
+            },
+        ],
     }
 
 
-def test_validate_workflow_plan_rejects_calibration_confirmation_not_first_directly():
-    profile = _go2w_data_profile()
-    plan = build_deterministic_plan_template(
-        "20270605",
-        "parameterized_navigation_v1",
-        None,
-        scene_mode="out",
-        phase_profile=profile,
-    )
-    plan.steps.insert(
-        0,
-        WorkflowStep(
-            step_id="inspect_runtime_assets",
-            tool_name="inspect_runtime_assets",
-            effects="read",
-        ),
-    )
-
-    result = validate_workflow_plan(plan, phase_profile=profile)
-
-    assert result["ok"] is False
-    error = _error_by_type(result, "invalid_calibration_confirmation_order")
-    assert "first step" in error["message"]
-
-
-def test_validate_workflow_plan_rejects_calibration_confirmation_after_prepare_directly():
-    profile = _go2w_data_profile()
-    plan = build_deterministic_plan_template(
-        "20270605",
-        "parameterized_navigation_v1",
-        None,
-        scene_mode="out",
-        phase_profile=profile,
-    )
-    confirm_index = next(
-        index
-        for index, step in enumerate(plan.steps)
-        if step.step_id == "confirm_navigation_calibration_params"
-    )
-    prepare_index = next(
-        index
-        for index, step in enumerate(plan.steps)
-        if step.step_id == "prepare_raw_data"
-    )
-    plan.steps[confirm_index], plan.steps[prepare_index] = (
-        plan.steps[prepare_index],
-        plan.steps[confirm_index],
-    )
-
-    result = validate_workflow_plan(plan, phase_profile=profile)
-
-    assert result["ok"] is False
-    assert any(
-        issue["type"] == "invalid_calibration_confirmation_order"
-        and "before prepare_raw_data" in issue["message"]
-        for issue in result["errors"]
-    )
-
-
-def test_validate_workflow_plan_rejects_calibration_confirmation_after_processing_step_directly():
-    plan = WorkflowPlan(
-        date="20270605",
-        scene_mode="out",
-        processing_profile="parameterized_navigation_v1",
-        platform_hint="unknown",
-        steps=[
-            WorkflowStep(
-                step_id="assemble_finish_temp",
-                tool_name="assemble_finish_temp",
-            ),
-            _confirm_step(),
+def valid_finish_plan_payload() -> dict:
+    return {
+        "decisions": {
+            "localization": {
+                "source": "odom",
+                "conversion": "odom_to_ins",
+                "reason": "Odom and its converter were observed.",
+                "evidence_refs": ["evidence:localization"],
+            },
+            "gridmap": {
+                "source": "existing_gridmap",
+                "reason": "A complete gridmap already exists.",
+                "evidence_refs": ["evidence:gridmap"],
+            },
+            "calibration": {
+                "mode": "hardcoded_with_user_confirmation",
+                "selected_sensor_source": "fisheye_front",
+                "requires_user_confirmation": True,
+                "reason": "The selected calibration inventory needs confirmation.",
+                "evidence_refs": ["evidence:calibration"],
+            },
+        },
+        "steps": [
+            {
+                "step_id": "confirm_calibration",
+                "action": "confirm_navigation_calibration_params",
+                "variant": "default",
+                "arguments": {},
+                "depends_on": [],
+                "failure_policy": "stop",
+                "decision_refs": ["calibration"],
+            },
+            {
+                "step_id": "tracking",
+                "action": "run_tracking",
+                "variant": "default",
+                "arguments": {},
+                "depends_on": ["confirm_calibration"],
+                "failure_policy": "stop",
+                "decision_refs": ["localization"],
+            },
+            {
+                "step_id": "prepare_gridmap",
+                "action": "prepare_gridmap_for_projection",
+                "variant": "copy_existing_gridmap",
+                "arguments": {},
+                "depends_on": ["tracking"],
+                "failure_policy": "stop",
+                "decision_refs": ["gridmap"],
+            },
+            {
+                "step_id": "projection",
+                "action": "run_projection_and_trajectory",
+                "variant": "cjl_with_gridmap",
+                "arguments": {},
+                "depends_on": ["prepare_gridmap"],
+                "failure_policy": "stop",
+                "decision_refs": ["localization", "gridmap"],
+            },
+            {
+                "step_id": "validate_outputs",
+                "action": "validate_navigation_outputs",
+                "variant": "expect_gridmap",
+                "arguments": {},
+                "depends_on": ["projection"],
+                "failure_policy": "stop",
+                "decision_refs": ["gridmap"],
+            },
         ],
+    }
+
+
+def validate_extract(
+    payload: dict | None = None,
+    *,
+    observation: NavigationObservationRevision | None = None,
+    evidence: list[EvidenceDescriptor] | None = None,
+):
+    plan = ExtractSyncPlanInput.model_validate(payload or valid_extract_plan_payload())
+    return validate_navigation_plan(
+        task=extract_task(),
+        observation=observation or extract_observation(),
+        plan=plan,
+        evidence=extract_evidence() if evidence is None else evidence,
+        capabilities=list_navigation_tool_capabilities(),
     )
 
-    result = validate_workflow_plan(plan)
 
-    assert result["ok"] is False
-    error = next(
-        issue
-        for issue in result["errors"]
-        if issue["type"] == "invalid_calibration_confirmation_order"
-        and issue["details"].get("processing_step_id") == "assemble_finish_temp"
+def validate_finish(
+    payload: dict | None = None,
+    *,
+    observation: NavigationObservationRevision | None = None,
+    evidence: list[EvidenceDescriptor] | None = None,
+):
+    plan = FinishProcessingPlanInput.model_validate(payload or valid_finish_plan_payload())
+    return validate_navigation_plan(
+        task=finish_task(),
+        observation=observation or finish_observation(),
+        plan=plan,
+        evidence=finish_evidence() if evidence is None else evidence,
+        capabilities=list_navigation_tool_capabilities(),
     )
-    assert "processing step assemble_finish_temp" in error["message"]
+
+
+def issue_codes(report) -> set[str]:
+    return {issue.code for issue in report.errors}
+
+
+def test_valid_complete_plans_accept_evidence_from_current_or_earlier_revisions():
+    assert validate_extract().model_dump(mode="json") == {
+        "ok": True,
+        "errors": [],
+        "warnings": [],
+    }
+    assert validate_finish().ok is True
+
+
+def test_time_sync_reference_must_name_an_observed_bound_sensor_role():
+    payload = valid_extract_plan_payload()
+    payload["decisions"]["time_sync"]["reference_sensor"] = "gps"
+
+    report = validate_extract(payload)
+
+    assert report.errors[0] == PlanValidationIssue(
+        path="plan.decisions.time_sync.reference_sensor",
+        code="unknown_sensor_role",
+        message="Referenced sensor role does not exist",
+        allowed_values=["fisheye_front", "lidar", "odom"],
+    )
+
+
+def test_unknown_evidence_ref_is_rejected_at_its_decision_path():
+    payload = valid_extract_plan_payload()
+    payload["decisions"]["time_sync"]["evidence_refs"] = ["evidence:missing"]
+
+    report = validate_extract(payload)
+
+    assert report.errors[0].path == "plan.decisions.time_sync.evidence_refs.0"
+    assert report.errors[0].code == "unknown_evidence_ref"
 
 
 @pytest.mark.parametrize(
-    ("field", "value"),
+    ("replacement", "code"),
     [
-        ("human_blocking", False),
-        ("failure_behavior", "continue"),
-        ("effects", "write"),
+        (descriptor("evidence:timing", 4, task_id="nav-other"), "evidence_task_mismatch"),
+        (descriptor("evidence:timing", 5), "evidence_revision_mismatch"),
     ],
 )
-def test_validate_workflow_plan_rejects_invalid_calibration_confirmation_flags_directly(field, value):
-    profile = _go2w_data_profile()
-    plan = build_deterministic_plan_template(
-        "20270605",
-        "parameterized_navigation_v1",
-        None,
-        scene_mode="out",
-        phase_profile=profile,
-    )
-    confirmation = next(
-        step
-        for step in plan.steps
-        if step.step_id == "confirm_navigation_calibration_params"
-    )
-    setattr(confirmation, field, value)
+def test_evidence_ref_must_be_owned_by_task_and_not_from_a_future_revision(
+    replacement: EvidenceDescriptor,
+    code: str,
+):
+    evidence = [*extract_evidence()[:-1], replacement]
 
-    result = validate_workflow_plan(plan, phase_profile=profile)
+    report = validate_extract(evidence=evidence)
 
-    assert result["ok"] is False
-    error = _error_by_type(result, "invalid_calibration_confirmation_flags")
-    assert error["details"] == {
-        "step_id": "confirm_navigation_calibration_params",
-        "field": field,
+    assert report.errors[0].path == "plan.decisions.time_sync.evidence_refs.0"
+    assert report.errors[0].code == code
+
+
+def test_selected_topics_must_exist_in_measured_observations():
+    payload = valid_extract_plan_payload()
+    payload["decisions"]["topic_selection"]["topic_whitelist"][1] = "/invented"
+
+    report = validate_extract(payload)
+
+    assert PlanValidationIssue(
+        path="plan.decisions.topic_selection.topic_whitelist.1",
+        code="unobserved_topic",
+        message="Selected topic was not observed",
+        allowed_values=[
+            "/camera/front/image",
+            "/lidar/points",
+            "/localization/odom",
+        ],
+    ) in report.errors
+
+
+@pytest.mark.parametrize(
+    ("source", "conversion"),
+    [("odom", "none"), ("ins", "odom_to_ins")],
+)
+def test_localization_source_and_conversion_pair_must_be_valid(source: str, conversion: str):
+    payload = valid_finish_plan_payload()
+    payload["decisions"]["localization"].update(
+        {"source": source, "conversion": conversion}
+    )
+    observation = finish_observation().model_copy(
+        update={
+            "payloads": [
+                payload_item.model_copy(update={"available_sources": [source]})
+                if isinstance(payload_item, LocalizationSourcesObservation)
+                else payload_item
+                for payload_item in finish_observation().payloads
+            ]
+        }
+    )
+
+    report = validate_finish(payload, observation=observation)
+
+    assert "invalid_localization_conversion" in issue_codes(report)
+
+
+def test_odom_conversion_requires_observed_converter_capability():
+    report = validate_finish(observation=finish_observation(conversion_available=False))
+
+    assert "localization_conversion_unavailable" in issue_codes(report)
+
+
+@pytest.mark.parametrize(
+    ("source", "variant", "observation", "code"),
+    [
+        (
+            "projection_ready",
+            "skip_if_projection_ready",
+            finish_observation(),
+            "unobserved_gridmap_source",
+        ),
+        (
+            "generated_from_pcd",
+            "generate_from_pcd",
+            finish_observation(pcd_tool_available=False),
+            "gridmap_capability_unavailable",
+        ),
+        (
+            "existing_gridmap",
+            "generate_from_pcd",
+            finish_observation(),
+            "variant_decision_mismatch",
+        ),
+    ],
+)
+def test_gridmap_source_must_match_observations_capability_and_selected_variant(
+    source: str,
+    variant: str,
+    observation: NavigationObservationRevision,
+    code: str,
+):
+    payload = valid_finish_plan_payload()
+    payload["decisions"]["gridmap"]["source"] = source
+    payload["steps"][2]["variant"] = variant
+
+    report = validate_finish(payload, observation=observation)
+
+    assert code in issue_codes(report)
+
+
+@pytest.mark.parametrize(
+    ("field", "value", "code"),
+    [
+        ("action", "invented_action", "unknown_action"),
+        ("variant", "invented_variant", "unknown_variant"),
+        ("arguments", {"processes_num": 0}, "invalid_arguments"),
+    ],
+)
+def test_action_variant_and_argument_contracts_are_validated_even_for_constructed_models(
+    field: str,
+    value: object,
+    code: str,
+):
+    plan = ExtractSyncPlanInput.model_validate(valid_extract_plan_payload())
+    plan.steps[1] = plan.steps[1].model_copy(update={field: value})
+
+    report = validate_navigation_plan(
+        task=extract_task(),
+        observation=extract_observation(),
+        plan=plan,
+        evidence=extract_evidence(),
+        capabilities=list_navigation_tool_capabilities(),
+    )
+
+    assert code in issue_codes(report)
+
+
+def test_duplicate_step_ids_are_rejected_without_collapsing_the_graph():
+    payload = valid_extract_plan_payload()
+    payload["steps"][1]["step_id"] = "prepare_raw"
+
+    report = validate_extract(payload)
+
+    assert report.errors[0].path == "plan.steps.1.step_id"
+    assert report.errors[0].code == "duplicate_step_id"
+
+
+def test_unknown_dependencies_are_rejected_at_dependency_index():
+    payload = valid_extract_plan_payload()
+    payload["steps"][1]["depends_on"] = ["missing"]
+
+    report = validate_extract(payload)
+
+    assert report.errors[0].path == "plan.steps.1.depends_on.0"
+    assert report.errors[0].code == "unknown_dependency"
+
+
+def test_dependency_cycles_are_rejected():
+    payload = valid_extract_plan_payload()
+    payload["steps"][0]["depends_on"] = ["extract_sync"]
+
+    report = validate_extract(payload)
+
+    assert "dependency_cycle" in issue_codes(report)
+
+
+def test_required_calibration_confirmation_step_cannot_be_omitted():
+    payload = valid_finish_plan_payload()
+    payload["steps"] = payload["steps"][1:]
+    payload["steps"][0]["depends_on"] = []
+
+    report = validate_finish(payload)
+
+    assert "missing_calibration_confirmation" in issue_codes(report)
+
+
+@pytest.mark.parametrize(
+    ("first_action", "second_action", "code"),
+    [
+        ("prepare_gridmap_for_projection", "run_tracking", "gridmap_before_tracking"),
+        ("run_projection_and_trajectory", "prepare_gridmap_for_projection", "projection_before_gridmap"),
+    ],
+)
+def test_finish_business_stages_have_stable_order(
+    first_action: str,
+    second_action: str,
+    code: str,
+):
+    payload = valid_finish_plan_payload()
+    first = next(i for i, step in enumerate(payload["steps"]) if step["action"] == first_action)
+    second = next(i for i, step in enumerate(payload["steps"]) if step["action"] == second_action)
+    payload["steps"][first], payload["steps"][second] = (
+        payload["steps"][second],
+        payload["steps"][first],
+    )
+
+    report = validate_finish(payload)
+
+    assert code in issue_codes(report)
+
+
+def test_output_validation_must_be_the_last_step():
+    payload = valid_finish_plan_payload()
+    payload["steps"][-1], payload["steps"][-2] = payload["steps"][-2], payload["steps"][-1]
+
+    report = validate_finish(payload)
+
+    assert "validation_not_last" in issue_codes(report)
+
+
+def test_observation_must_match_bound_task_phase_and_complete_required_kinds():
+    observation = extract_observation().model_copy(
+        update={
+            "task_id": "nav-other",
+            "phase": NavigationTaskPhase.FINISH_PROCESSING,
+            "completed_kinds": ["raw_metadata"],
+        }
+    )
+
+    report = validate_extract(observation=observation)
+
+    assert issue_codes(report) == {
+        "observation_task_mismatch",
+        "observation_phase_mismatch",
+        "missing_required_observation",
     }
+
+
+def test_plan_type_must_match_the_bound_task_phase():
+    task = extract_task().model_copy(
+        update={"phase": NavigationTaskPhase.FINISH_PROCESSING}
+    )
+    plan = ExtractSyncPlanInput.model_validate(valid_extract_plan_payload())
+
+    report = validate_navigation_plan(
+        task=task,
+        observation=extract_observation(),
+        plan=plan,
+        evidence=extract_evidence(),
+        capabilities=list_navigation_tool_capabilities(),
+    )
+
+    assert report.errors == [
+        PlanValidationIssue(
+            path="task.phase",
+            code="task_phase_mismatch",
+            message="Plan type does not match the active task phase",
+            allowed_values=["finish_processing"],
+        )
+    ]
+
+
+def test_errors_are_deduplicated_sorted_and_capped_at_eight_public_issues():
+    payload = valid_extract_plan_payload()
+    payload["decisions"]["topic_selection"]["topic_whitelist"] = [
+        f"/invented/{index}" for index in range(12)
+    ]
+    payload["decisions"]["topic_selection"]["topic_map"] = {
+        "/invented/shared": "lidar"
+    }
+
+    report = validate_extract(payload)
+
+    keys = [(issue.path, issue.code) for issue in report.errors]
+    assert len(keys) == 8
+    assert keys == sorted(set(keys))[:8]

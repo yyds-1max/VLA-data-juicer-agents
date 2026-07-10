@@ -971,7 +971,7 @@ def submit_finish_processing_plan_tool(
     )
 ```
 
-Implement `_submit_complete_plan` once. It validates the bound task/current context, calls `validate_navigation_plan`, records a submission attempt, returns `ok`/`error_type`/compact `errors`/`retry` on failure with the 3,000-character limit, or calls `plan_store.activate` and returns only `plan_id`, `plan_revision`, `step_count`, `status`, and `next_action` on success.
+Implement `_submit_complete_plan` once. It validates the bound task/current context, calls `validate_navigation_plan`, records a submission attempt, returns `ok`/`error_type`/compact `errors`/`retry` on failure with the 3,000-character limit, or calls `plan_store.activate` and returns only `ok: true`, `plan_id`, `plan_revision`, `step_count`, `status`, and `next_action` on success.
 
 - [ ] **Step 6: Run focused tests**
 

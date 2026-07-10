@@ -401,8 +401,9 @@ ref rather than embedding the set.
 After an invalid submission, the model must resubmit a complete corrected plan. No
 patch endpoint exists.
 
-A successful response returns only `plan_id`, revision, step count, status, and next
-action. It does not echo the plan the model just submitted.
+A successful response returns only `ok: true`, `plan_id`, revision, step count,
+status, and next action. It does not echo the plan the model just submitted. Both
+success and failure responses therefore expose the same top-level `ok` discriminator.
 
 ## Plan-Bound Execution
 
