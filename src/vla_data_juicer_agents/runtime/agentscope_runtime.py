@@ -23,9 +23,19 @@ from vla_data_juicer_agents.adapters.agentscope import AgentScopeEventAdapter
 from vla_data_juicer_agents.core.cancellation import CancellationContext, bind_cancellation
 from vla_data_juicer_agents.core.events import CallbackEventSink, EventEmitter
 from vla_data_juicer_agents.navigation.agent_tools import build_navigation_agent_tools
+from vla_data_juicer_agents.navigation.config import NavigationSettings
+from vla_data_juicer_agents.navigation.evidence_store import FileNavigationEvidenceStore
 from vla_data_juicer_agents.navigation.models import NavigationRequest
+from vla_data_juicer_agents.navigation.observation_store import (
+    SqliteNavigationObservationStore,
+)
 from vla_data_juicer_agents.navigation.plan_draft import WorkflowPlanDraftState
 from vla_data_juicer_agents.navigation.plan_draft_store import JsonNavigationPlanDraftStore
+from vla_data_juicer_agents.navigation.task_reconciliation import (
+    _navigation_scene_mode_for_request,
+    _structured_handoff_payload_from_message,
+    prepare_navigation_task_entry,
+)
 from vla_data_juicer_agents.navigation.task_store import SqliteNavigationTaskStore
 from vla_data_juicer_agents.runtime.agentscope_bootstrap import bootstrap_agentscope_records
 from vla_data_juicer_agents.runtime.agentscope_config import AgentScopeRuntimeConfig
@@ -145,6 +155,15 @@ class AgentScopeRuntime:
             web_session_id,
             agent_id=self.config.navigation_agent_id,
             model=self.config.navigation_model,
+        )
+        prepare_navigation_task_entry(
+            task_store=self._navigation_task_store(),
+            observation_store=self._navigation_observation_store(),
+            evidence_store=self._navigation_evidence_store(),
+            message=message,
+            web_session_id=web_session_id,
+            agentscope_session_id=session_id,
+            settings=NavigationSettings(),
         )
         self._precreate_navigation_plan_draft(
             agentscope_session_id=session_id,
@@ -285,6 +304,14 @@ class AgentScopeRuntime:
 
     def _navigation_task_store(self) -> SqliteNavigationTaskStore:
         return SqliteNavigationTaskStore(self.config.workspace_root / "navigation-tasks.sqlite")
+
+    def _navigation_observation_store(self) -> SqliteNavigationObservationStore:
+        return SqliteNavigationObservationStore(
+            self.config.workspace_root / "navigation-observations.sqlite"
+        )
+
+    def _navigation_evidence_store(self) -> FileNavigationEvidenceStore:
+        return FileNavigationEvidenceStore(self.config.workspace_root / "navigation-evidence")
 
     def _navigation_tools_for_session(
         self,
@@ -1295,17 +1322,6 @@ def _handoff_error(message: str, payload: dict[str, Any]) -> ToolChunk:
     )
 
 
-def _navigation_scene_mode_for_request(scene_mode: str | None) -> str | None:
-    return {
-        "indoor": "in",
-        "in": "in",
-        "室内": "in",
-        "outdoor": "out",
-        "out": "out",
-        "室外": "out",
-    }.get(scene_mode or "")
-
-
 def _date_from_navigation_target(target: str) -> str | None:
     stripped = target.strip()
     if re.fullmatch(r"[0-9]{8}", stripped):
@@ -1394,21 +1410,6 @@ def _navigation_handoff_message(
             *structured_lines,
         ]
     )
-
-
-def _structured_handoff_payload_from_message(message: str) -> dict[str, Any] | None:
-    marker = "Structured handoff JSON:"
-    if marker not in message:
-        return None
-    lines = message.split(marker, 1)[1].strip().splitlines()
-    if not lines:
-        return None
-    json_text = lines[0]
-    try:
-        payload = json.loads(json_text)
-    except json.JSONDecodeError:
-        return None
-    return payload if isinstance(payload, dict) else None
 
 
 def _resolve_response_language(explicit: str | None, request: str) -> str:

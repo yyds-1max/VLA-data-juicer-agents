@@ -384,10 +384,67 @@ def test_task_store_lists_resumable_tasks(tmp_path: Path):
         phase=NavigationTaskPhase.COMPLETED,
         status=NavigationTaskStatus.COMPLETED,
     )
+    needs_replan = store.create_or_update_task(date="20270625", segments=None, scene_mode="out")
+    store.update_task(needs_replan.task_id, status=NavigationTaskStatus.NEEDS_REPLAN)
 
     resumable = store.list_resumable()
 
-    assert [task.task_id for task in resumable] == [waiting.task_id]
+    assert [task.task_id for task in resumable] == [needs_replan.task_id, waiting.task_id]
+
+
+def test_task_store_round_trips_entry_fields_and_finds_latest_agentscope_session(
+    tmp_path: Path,
+):
+    store = SqliteNavigationTaskStore(tmp_path / "navigation_tasks.sqlite")
+
+    task = store.create_or_update_task(
+        date="20270623",
+        segments=["segment_a"],
+        scene_mode=None,
+        dry_run=True,
+        agentscope_session_id="agent-1",
+    )
+    updated = store.update_task(
+        task.task_id,
+        guidance_revision=3,
+        status=NavigationTaskStatus.NEEDS_REPLAN,
+    )
+
+    loaded = store.get_task(task.task_id)
+    by_session = store.find_latest_by_agentscope_session("agent-1")
+
+    assert loaded is not None
+    assert loaded.dry_run is True
+    assert loaded.guidance_revision == 3
+    assert loaded.status == NavigationTaskStatus.NEEDS_REPLAN
+    assert by_session is not None
+    assert by_session.task_id == updated.task_id
+
+
+def test_task_store_preserves_dry_run_when_upsert_omits_it(tmp_path: Path):
+    store = SqliteNavigationTaskStore(tmp_path / "navigation_tasks.sqlite")
+    first = store.create_or_update_task(
+        date="20270623",
+        segments=["segment_a"],
+        scene_mode=None,
+        dry_run=True,
+    )
+
+    preserved = store.create_or_update_task(
+        date="20270623",
+        segments=["segment_a"],
+        scene_mode=None,
+    )
+    explicitly_disabled = store.create_or_update_task(
+        date="20270623",
+        segments=["segment_a"],
+        scene_mode=None,
+        dry_run=False,
+    )
+
+    assert preserved.task_id == first.task_id
+    assert preserved.dry_run is True
+    assert explicitly_disabled.dry_run is False
 
 
 def test_task_store_can_update_task_after_recording_step(tmp_path: Path):

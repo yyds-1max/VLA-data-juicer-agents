@@ -5,10 +5,10 @@ from typing import Any
 from agentscope.tool import FunctionTool
 
 from vla_data_juicer_agents.navigation.config import NavigationSettings
-from vla_data_juicer_agents.navigation.models import NavigationRequest
-from vla_data_juicer_agents.navigation.plan_draft import WorkflowPlanDraftState
-from vla_data_juicer_agents.navigation.plan_draft_store import NavigationPlanDraftStore
-from vla_data_juicer_agents.navigation.task_reconciliation import reconcile_navigation_task
+from vla_data_juicer_agents.navigation.task_reconciliation import (
+    reconcile_and_save_navigation_task,
+    reconcile_navigation_task,
+)
 from vla_data_juicer_agents.navigation.task_state import (
     NavigationTaskPhase,
     NavigationTaskStatus,
@@ -23,13 +23,21 @@ def _task_payload(task: Any) -> dict[str, Any]:
     return task.model_dump(mode="json")
 
 
+def _task_anchor(task: Any) -> dict[str, Any]:
+    return {
+        "task_id": task.task_id,
+        "phase": task.phase.value,
+        "status": task.status.value,
+    }
+
+
 def build_navigation_task_tools(
     *,
     store: SqliteNavigationTaskStore,
     session_id: str,
     web_session_id: str | None,
     settings: NavigationSettings | None = None,
-    draft_store: NavigationPlanDraftStore | None = None,
+    draft_store: Any | None = None,
 ) -> list[FunctionTool]:
     settings = settings or NavigationSettings()
 
@@ -46,7 +54,12 @@ def build_navigation_task_tools(
             web_session_id=web_session_id,
             agentscope_session_id=session_id,
         )
-        return {"ok": True, "task": _task_payload(task)}
+        saved = reconcile_and_save_navigation_task(
+            task,
+            task_store=store,
+            settings=settings,
+        )
+        return {"ok": True, "task": _task_anchor(saved)}
 
     def reconcile_navigation_task_tool(task_id: str) -> dict[str, Any]:
         """Reconcile persisted navigation task state with current filesystem artifacts."""
@@ -57,11 +70,12 @@ def build_navigation_task_tools(
                 "error_type": "navigation_task_not_found",
                 "task_id": task_id,
             }
-        reconciled = reconcile_navigation_task(task, settings=settings)
-        changes = reconciled.model_dump(mode="json")
-        changes.pop("task_id", None)
-        saved = store.update_task(task_id, **changes)
-        return {"ok": True, "task": _task_payload(saved)}
+        saved = reconcile_and_save_navigation_task(
+            task,
+            task_store=store,
+            settings=settings,
+        )
+        return {"ok": True, "task": _task_anchor(saved)}
 
     def list_resumable_navigation_tasks_tool(
         date: str | None = None,
@@ -91,10 +105,7 @@ def build_navigation_task_tools(
                 "task_id": task_id,
             }
         reconciled = reconcile_navigation_task(existing, settings=settings)
-        if (
-            existing.phase == NavigationTaskPhase.WAITING_SCENE_MODE
-            and not reconciled.artifact_snapshot.sync_data_exists
-        ):
+        if not reconciled.artifact_snapshot.sync_data_exists:
             changes = reconciled.model_dump(mode="json")
             changes.pop("task_id", None)
             saved = store.update_task(task_id, **changes)
@@ -127,12 +138,6 @@ def build_navigation_task_tools(
                 else None
             ),
             drift=None,
-        )
-        _sync_finish_processing_draft(
-            draft_store=draft_store,
-            session_id=session_id,
-            task=task,
-            scene_mode=scene_mode,
         )
         return {"ok": True, "task": _task_payload(task)}
 
@@ -214,50 +219,3 @@ def build_navigation_task_tools(
 
 def _normalize_segments(value: list[str] | str | None) -> list[str] | None:
     return normalize_segments(value)
-
-
-def _sync_finish_processing_draft(
-    *,
-    draft_store: NavigationPlanDraftStore | None,
-    session_id: str,
-    task: Any,
-    scene_mode: str,
-) -> None:
-    if draft_store is None:
-        return
-    state = draft_store.load(session_id)
-    if state is None:
-        state = WorkflowPlanDraftState(
-            request=NavigationRequest(
-                date=task.date,
-                segments=task.segments,
-                scene_mode=scene_mode,
-            )
-        )
-    else:
-        if state.request.date != task.date or state.request.segments != task.segments:
-            state = WorkflowPlanDraftState(
-                request=NavigationRequest(
-                    date=task.date,
-                    segments=task.segments,
-                    scene_mode=scene_mode,
-                    dry_run=state.request.dry_run,
-                )
-            )
-        else:
-            state.set_scene_mode(scene_mode)
-    for step in state.required_observation_steps(phase="extract_sync"):
-        if not _has_observation(state.completed_observations, step):
-            state.completed_observations.append(dict(step))
-    state.advance_to_finish_processing(scene_mode=scene_mode)
-    if state.finalized_plan is not None and state.finalized_plan.phase != "finish_processing":
-        state.finalized_plan = None
-    draft_store.save(session_id, state)
-
-
-def _has_observation(observations: list[dict[str, str]], step: dict[str, str]) -> bool:
-    return any(
-        observation.get("observation_id") == step.get("observation_id")
-        or observation.get("used_tool") == step.get("used_tool")
-        for observation in observations
-    )

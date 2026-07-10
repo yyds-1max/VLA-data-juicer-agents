@@ -6,7 +6,6 @@ from vla_data_juicer_agents.navigation.config import NavigationSettings
 from vla_data_juicer_agents.navigation.plan_draft import WorkflowPlanDraftState
 from vla_data_juicer_agents.navigation.plan_draft_store import InMemoryNavigationPlanDraftStore
 from vla_data_juicer_agents.navigation.models import NavigationRequest, WorkflowPlan, WorkflowStep
-from vla_data_juicer_agents.navigation.session_plan_draft_tools import build_session_plan_draft_tools
 from vla_data_juicer_agents.navigation.task_state import (
     NavigationTaskPhase,
     NavigationTaskStatus,
@@ -73,19 +72,23 @@ def _call(tool, **kwargs):
     return _decode_tool_payload(asyncio.run(tool(**kwargs)))
 
 
-def test_get_or_create_navigation_task_tool_creates_date_only_task(tmp_path: Path):
-    _root, store, tools = _tools(tmp_path)
+def test_get_or_create_navigation_task_tool_reconciles_raw_only_task(tmp_path: Path):
+    root, store, tools = _tools(tmp_path)
+    (root / "raw_data" / "20270623" / "segment_a").mkdir(parents=True)
 
     result = _call(
         tools["get_or_create_navigation_task_tool"],
         date="20270623",
-        segments=None,
+        segments=["segment_a"],
         scene_mode=None,
     )
 
     assert result["ok"] is True
-    assert result["task"]["date"] == "20270623"
-    assert result["task"]["scene_mode"] is None
+    assert result["task"] == {
+        "task_id": result["task"]["task_id"],
+        "phase": "extract_sync",
+        "status": "needs_rerun",
+    }
     assert store.get_task(result["task"]["task_id"]) is not None
 
 
@@ -102,7 +105,8 @@ def test_get_or_create_navigation_task_tool_normalizes_json_segments_string(
     )
 
     assert result["ok"] is True
-    assert result["task"]["segments"] == ["20260623_145550"]
+    assert result["task"]["phase"] == "intake"
+    assert result["task"]["status"] == "needs_reconcile"
     assert store.find_latest_by_date("20270623", ["20260623_145550"]) is not None
 
 
@@ -132,17 +136,21 @@ def test_reconcile_navigation_task_tool_updates_missing_sync_to_needs_rerun(
     assert result["ok"] is True
     assert result["task"]["phase"] == "extract_sync"
     assert result["task"]["status"] == "needs_rerun"
-    assert result["task"]["drift"]["type"] == "missing_expected_artifact"
+    assert set(result["task"]) == {"task_id", "phase", "status"}
 
 
 def test_update_navigation_task_scene_mode_tool_sets_finish_processing(
     tmp_path: Path,
 ):
-    _root, _store, tools = _tools(tmp_path)
+    root, _store, tools = _tools(tmp_path)
+    (root / "raw_data" / "20270623" / "segment_a").mkdir(parents=True)
+    (root / "clip_data" / "20270623" / "segment_a" / "sync_data").mkdir(
+        parents=True
+    )
     created = _call(
         tools["get_or_create_navigation_task_tool"],
         date="20270623",
-        segments=None,
+        segments=["segment_a"],
         scene_mode=None,
     )
 
@@ -156,6 +164,27 @@ def test_update_navigation_task_scene_mode_tool_sets_finish_processing(
     assert result["task"]["scene_mode"] == "in"
     assert result["task"]["phase"] == NavigationTaskPhase.FINISH_PROCESSING.value
     assert result["task"]["status"] == NavigationTaskStatus.PENDING.value
+
+
+def test_scene_mode_update_cannot_bypass_missing_sync_from_intake(tmp_path: Path):
+    root, store, tools = _tools(tmp_path)
+    (root / "raw_data" / "20270623" / "segment_a").mkdir(parents=True)
+    task = store.create_or_update_task(
+        date="20270623",
+        segments=["segment_a"],
+        scene_mode=None,
+    )
+
+    result = _call(
+        tools["update_navigation_task_scene_mode_tool"],
+        task_id=task.task_id,
+        scene_mode="in",
+    )
+
+    assert result["ok"] is False
+    assert result["error_type"] == "navigation_task_reconcile_required"
+    assert result["task"]["phase"] == NavigationTaskPhase.EXTRACT_SYNC.value
+    assert result["task"]["status"] == NavigationTaskStatus.NEEDS_RERUN.value
 
 
 def test_resumable_task_can_be_claimed_from_new_web_session(tmp_path: Path):
@@ -200,7 +229,7 @@ def test_resumable_task_can_be_claimed_from_new_web_session(tmp_path: Path):
     assert updated["task"]["scene_mode"] == "out"
 
 
-def test_scene_mode_claim_syncs_new_session_draft_to_finish_processing(tmp_path: Path):
+def test_scene_mode_claim_does_not_mutate_legacy_session_draft(tmp_path: Path):
     root, store, draft_store, first_tools = _tools_with_draft_store(
         tmp_path,
         session_id="agent-session-a",
@@ -260,67 +289,6 @@ def test_scene_mode_claim_syncs_new_session_draft_to_finish_processing(tmp_path:
     assert result["ok"] is True
     assert result["task"]["phase"] == NavigationTaskPhase.FINISH_PROCESSING.value
     assert draft is not None
-    assert draft.request.scene_mode == "out"
-    assert draft.plan_phase == "finish_processing"
-    assert draft.finalized_plan is None
-    assert draft.next_required_observation()["observation_id"] == "navigation_processing_profile"
-
-    plan_tools = {
-        tool.name: tool
-        for tool in build_session_plan_draft_tools(
-            store=draft_store,
-            session_id="agent-session-b",
-        )
-    }
-    _call(
-        plan_tools["update_workflow_plan_draft_tool"],
-        data_profile_patch={
-            "processing_profile": {
-                "id": "parameterized_navigation_v1",
-                "platform_hint": "go2w",
-                "topic_params": {
-                    "profile_hint": "go2w",
-                    "confidence": 1.0,
-                    "topic_whitelist": ["/cam"],
-                    "topic_map": {"cam": "fisheye_front"},
-                    "query_dir": "cam",
-                    "evidence": [],
-                    "warnings": [],
-                    "blocking_issues": [],
-                },
-                "localization_policy": {"source": "odom", "conversion": "odom_to_ins"},
-                "gridmap_policy": {"source": "existing_gridmap"},
-                "calibration_policy": {
-                    "mode": "hardcoded_with_user_confirmation",
-                    "requires_user_confirmation": True,
-                },
-                "warnings": [],
-                "blocking_issues": [],
-                "evidence": {},
-            },
-            "platform_hint": "go2w",
-            "topic_params": {
-                "profile_hint": "go2w",
-                "confidence": 1.0,
-                "topic_whitelist": ["/cam"],
-                "topic_map": {"cam": "fisheye_front"},
-                "query_dir": "cam",
-                "evidence": [],
-                "warnings": [],
-                "blocking_issues": [],
-            },
-            "localization_policy": {"source": "odom", "conversion": "odom_to_ins"},
-            "gridmap_source": "existing_gridmap",
-            "stage_variants": {
-                "extract_and_sync_navigation_data": {"variant": "explicit_topic_params"},
-                "prepare_gridmap_for_projection": {"variant": "copy_existing_gridmap"},
-                "run_projection_and_trajectory": {"variant": "cjl_with_gridmap"},
-            },
-        },
-        observation_id="processing_state",
-        used_tool="inspect_processing_state_tool",
-    )
-    finalized = _call(plan_tools["finalize_finish_processing_plan_tool"])
-
-    assert finalized["ok"] is True
-    assert finalized["workflow_plan_json"]["phase"] == "finish_processing"
+    assert draft.request.scene_mode is None
+    assert draft.plan_phase == "extract_sync"
+    assert draft.finalized_plan is not None

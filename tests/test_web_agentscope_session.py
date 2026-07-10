@@ -11,7 +11,12 @@ from agentscope.permission import PermissionBehavior, PermissionContext
 from vla_data_juicer_agents.core.cancellation import CancellationContext, current_cancellation
 from vla_data_juicer_agents.navigation.agent_tools import build_navigation_agent_tools
 from vla_data_juicer_agents.navigation.plan_draft_store import JsonNavigationPlanDraftStore
+from vla_data_juicer_agents.navigation.observation_store import SqliteNavigationObservationStore
 from vla_data_juicer_agents.navigation.routing import is_high_confidence_navigation_request
+from vla_data_juicer_agents.navigation.task_state import (
+    NavigationTaskPhase,
+    NavigationTaskStatus,
+)
 from vla_data_juicer_agents.runtime.agentscope_config import AgentScopeRuntimeConfig
 import vla_data_juicer_agents.runtime.agentscope_runtime as agentscope_runtime_module
 from vla_data_juicer_agents.runtime.agentscope_runtime import AgentScopeRuntime
@@ -537,12 +542,21 @@ async def test_runtime_submit_user_message_keeps_main_router_session_for_navigat
 async def test_runtime_start_navigation_agent_task_switches_mapping_and_spawns_navigation_run() -> None:
     chat_run_registry = FakeChatRunRegistry()
     runtime = _runtime(chat_run_registry=chat_run_registry)
+    handoff_message = agentscope_runtime_module._navigation_handoff_message(
+        request="处理 20270605 的室外数据",
+        target="20270605",
+        date="20270605",
+        scene_mode="out",
+        clips=[],
+        reason="用户请求导航处理",
+        response_language="Chinese",
+    )
 
     await runtime.submit_user_message(web_session_id="web-1", message="处理 20270605 的室外数据")
     await chat_run_registry.drain()
     session_id = await runtime.start_navigation_agent_task(
         web_session_id="web-1",
-        message="处理 20270605 的室外数据",
+        message=handoff_message,
     )
 
     assert session_id == "web-1__navigation-data-agent"
@@ -559,7 +573,7 @@ async def test_runtime_start_navigation_agent_task_switches_mapping_and_spawns_n
     run = runtime.app.state.chat_service.runs[-1]
     assert run["session_id"] == "web-1__navigation-data-agent"
     assert run["agent_id"] == "navigation-data-agent"
-    assert _message_text(run["message"]) == "处理 20270605 的室外数据"
+    assert _message_text(run["message"]) == handoff_message
 
 
 @pytest.mark.asyncio
@@ -571,7 +585,15 @@ async def test_runtime_submit_user_message_routes_to_active_navigation_agent_aft
     await chat_run_registry.drain()
     await runtime.start_navigation_agent_task(
         web_session_id="web-1",
-        message="处理 20270623 的导航数据",
+        message=agentscope_runtime_module._navigation_handoff_message(
+            request="处理 20270623 的导航数据",
+            target="20270623",
+            date="20270623",
+            scene_mode=None,
+            clips=[],
+            reason="用户请求导航处理",
+            response_language="Chinese",
+        ),
     )
     await chat_run_registry.drain()
 
@@ -621,12 +643,25 @@ async def test_runtime_start_navigation_agent_task_precreates_session_draft_from
     state = JsonNavigationPlanDraftStore(
         tmp_path / "navigation-plan-drafts"
     ).load(session_id)
+    task = runtime._navigation_task_store().find_latest_by_agentscope_session(session_id)
 
     assert session_id == "web-1__navigation-data-agent"
     assert state is not None
     assert state.request.date == "20270605"
     assert state.request.scene_mode == "out"
     assert state.request.segments == ["20260605_152856"]
+    assert task is not None
+    assert task.phase == NavigationTaskPhase.INTAKE
+    assert task.status == NavigationTaskStatus.NEEDS_RECONCILE
+    assert task.guidance_revision == 1
+    revision = SqliteNavigationObservationStore(
+        tmp_path / "navigation-observations.sqlite"
+    ).latest(task.task_id)
+    assert revision is not None
+    assert {payload.kind for payload in revision.payloads} == {
+        "artifact_state",
+        "user_guidance",
+    }
     await chat_run_registry.drain()
 
 

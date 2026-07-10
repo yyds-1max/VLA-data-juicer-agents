@@ -1,8 +1,15 @@
 from __future__ import annotations
 
+import json
 from pathlib import Path
+from typing import Any
 
 from vla_data_juicer_agents.navigation.config import NavigationSettings
+from vla_data_juicer_agents.navigation.observation_models import (
+    ArtifactStateObservation,
+    EvidenceWrite,
+    UserGuidanceObservation,
+)
 from vla_data_juicer_agents.navigation.task_state import (
     NavigationArtifactSnapshot,
     NavigationTask,
@@ -41,7 +48,11 @@ def build_navigation_artifact_snapshot(
     clip_date = settings.clip_data_root / date
     finish_temp_samples = settings.finish_data_root / f"{date}_temp" / "samples" / date
     final_root = settings.finish_data_root / date
-    selected = _selected_segments(raw_date if raw_date.exists() else raw_temp, segments)
+    selection_root = next(
+        (root for root in (raw_date, raw_temp, clip_date) if root.exists()),
+        raw_date,
+    )
+    selected = _selected_segments(selection_root, segments)
 
     sync_roots = {segment: clip_date / segment / "sync_data" for segment in selected}
     sync_data_by_segment = {
@@ -102,38 +113,115 @@ def _sync_drift(snapshot: NavigationArtifactSnapshot) -> NavigationTaskDrift:
     )
 
 
-def _has_partial_final_artifacts(snapshot: NavigationArtifactSnapshot) -> bool:
-    return (
-        snapshot.finish_temp_samples_exists
-        or snapshot.final_outputs_exist
-        or snapshot.final_grid_map_exists
-    ) and not (
-        snapshot.final_outputs_exist and snapshot.final_grid_map_exists
+def _navigation_scene_mode_for_request(scene_mode: str | None) -> str | None:
+    return {
+        "indoor": "in",
+        "in": "in",
+        "室内": "in",
+        "outdoor": "out",
+        "out": "out",
+        "室外": "out",
+    }.get(scene_mode or "")
+
+
+def _structured_handoff_payload_from_message(message: str) -> dict[str, Any] | None:
+    marker = "Structured handoff JSON:"
+    if marker not in message:
+        return None
+    lines = message.split(marker, 1)[1].strip().splitlines()
+    if not lines:
+        return None
+    try:
+        payload = json.loads(lines[0])
+    except json.JSONDecodeError:
+        return None
+    return payload if isinstance(payload, dict) else None
+
+
+def _task_changes(task: NavigationTask) -> dict[str, Any]:
+    changes = task.model_dump(mode="json")
+    changes.pop("task_id", None)
+    return changes
+
+
+def reconcile_and_save_navigation_task(
+    task: NavigationTask,
+    *,
+    task_store: Any,
+    settings: NavigationSettings | None = None,
+) -> NavigationTask:
+    reconciled = reconcile_navigation_task(task, settings=settings)
+    return task_store.update_task(task.task_id, **_task_changes(reconciled))
+
+
+def prepare_navigation_task_entry(
+    *,
+    task_store: Any,
+    observation_store: Any,
+    evidence_store: Any,
+    message: str,
+    web_session_id: str | None,
+    agentscope_session_id: str,
+    settings: NavigationSettings,
+) -> NavigationTask:
+    handoff = _structured_handoff_payload_from_message(message)
+    if handoff is None or not isinstance(handoff.get("date"), str):
+        raise ValueError("navigation task entry requires a structured handoff with date")
+    segments = handoff.get("segments")
+    if segments is not None and not isinstance(segments, list):
+        raise ValueError("structured navigation handoff segments must be a list or null")
+    guidance_value = handoff.get("request")
+    guidance = guidance_value.strip() if isinstance(guidance_value, str) else ""
+
+    task = task_store.create_or_update_task(
+        date=handoff["date"],
+        segments=[str(segment) for segment in segments] if segments is not None else None,
+        scene_mode=_navigation_scene_mode_for_request(handoff.get("scene_mode")),
+        dry_run=bool(handoff.get("dry_run", False)),
+        web_session_id=web_session_id,
+        agentscope_session_id=agentscope_session_id,
     )
+    reconciled = reconcile_navigation_task(task, settings=settings)
+    changes = _task_changes(reconciled)
+    if guidance:
+        changes["guidance_revision"] = task.guidance_revision + 1
+    saved = task_store.update_task(task.task_id, **changes)
+    if saved.artifact_snapshot is None:
+        raise RuntimeError("task entry reconciliation did not create an artifact snapshot")
 
-
-def _final_drift(snapshot: NavigationArtifactSnapshot) -> NavigationTaskDrift:
-    if _has_partial_final_artifacts(snapshot):
-        evidence: list[str] = []
-        if snapshot.finish_temp_samples_exists:
-            evidence.append(f"finish_data/{snapshot.date}_temp")
-        if snapshot.final_outputs_exist:
-            evidence.append(f"finish_data/{snapshot.date}")
-        if not snapshot.final_grid_map_exists:
-            evidence.append(f"finish_data/{snapshot.date}/<segment>/<clip>/grid_map")
-        return NavigationTaskDrift(
-            type="partial_artifact",
-            message=(
-                "Finish-processing artifacts are partially present. Reconcile "
-                "or rerun the incomplete finish-processing steps before marking complete."
-            ),
-            evidence=evidence,
+    artifact_observation = ArtifactStateObservation(snapshot=saved.artifact_snapshot)
+    payloads: list[Any] = [artifact_observation]
+    evidence_writes = [
+        EvidenceWrite(
+            kind="artifact_state",
+            source_tool="task_entry_reconciliation",
+            payload=saved.artifact_snapshot.model_dump(mode="json"),
+            summary="task-entry artifact snapshot",
         )
-    return NavigationTaskDrift(
-        type="missing_expected_artifact",
-        message="Stored task is completed, but final outputs or final grid_map artifacts are missing.",
-        evidence=[f"finish_data/{snapshot.date}", f"finish_data/{snapshot.date}/<segment>/<clip>/grid_map"],
+    ]
+    if guidance:
+        guidance_observation = UserGuidanceObservation(
+            guidance_revision=saved.guidance_revision,
+            text=guidance,
+        )
+        payloads.append(guidance_observation)
+        evidence_writes.append(
+            EvidenceWrite(
+                kind="user_guidance",
+                source_tool="task_entry_reconciliation",
+                payload=guidance_observation.model_dump(mode="json"),
+                summary=f"task-entry user guidance revision {saved.guidance_revision}",
+            )
+        )
+    observation_store.append(
+        saved.task_id,
+        saved.phase,
+        "artifact_state",
+        payloads,
+        evidence_writes,
+        evidence_store,
     )
+    return saved
 
 
 def reconcile_navigation_task(
@@ -145,20 +233,51 @@ def reconcile_navigation_task(
     payload["artifact_snapshot"] = snapshot.model_dump(mode="json")
     payload["updated_at"] = utc_now()
 
-    if task.phase == NavigationTaskPhase.WAITING_SCENE_MODE and _has_partial_sync(snapshot):
+    if snapshot.final_outputs_exist and snapshot.final_grid_map_exists:
         payload.update(
             {
-                "status": NavigationTaskStatus.NEEDS_RECONCILE.value,
-                "drift": _sync_drift(snapshot).model_dump(mode="json"),
+                "phase": NavigationTaskPhase.COMPLETED.value,
+                "status": NavigationTaskStatus.COMPLETED.value,
+                "waiting_reason": None,
+                "next_required_input": None,
+                "drift": None,
             }
         )
         return NavigationTask.model_validate(payload)
 
-    if task.phase == NavigationTaskPhase.WAITING_SCENE_MODE and not snapshot.sync_data_exists:
+    if snapshot.sync_data_exists:
+        if task.scene_mode is None:
+            payload.update(
+                {
+                    "phase": NavigationTaskPhase.WAITING_SCENE_MODE.value,
+                    "status": NavigationTaskStatus.WAITING_USER.value,
+                    "waiting_reason": "scene_mode_required_after_extract_sync",
+                    "next_required_input": "scene_mode",
+                    "drift": NavigationTaskDrift(
+                        type="unexpected_existing_artifact",
+                        message="Selected sync_data already exists and scene mode is required.",
+                        evidence=snapshot.sync_image_samples
+                        or ["clip_data/<date>/<segment>/sync_data"],
+                    ).model_dump(mode="json"),
+                }
+            )
+        else:
+            payload.update(
+                {
+                    "phase": NavigationTaskPhase.FINISH_PROCESSING.value,
+                    "status": NavigationTaskStatus.PENDING.value,
+                    "waiting_reason": None,
+                    "next_required_input": None,
+                    "drift": None,
+                }
+            )
+        return NavigationTask.model_validate(payload)
+
+    if _has_partial_sync(snapshot):
         payload.update(
             {
                 "phase": NavigationTaskPhase.EXTRACT_SYNC.value,
-                "status": NavigationTaskStatus.NEEDS_RERUN.value,
+                "status": NavigationTaskStatus.NEEDS_RECONCILE.value,
                 "waiting_reason": None,
                 "next_required_input": None,
                 "drift": _sync_drift(snapshot).model_dump(mode="json"),
@@ -166,86 +285,32 @@ def reconcile_navigation_task(
         )
         return NavigationTask.model_validate(payload)
 
-    if task.phase == NavigationTaskPhase.INTAKE and snapshot.sync_data_exists:
+    if not snapshot.raw_input_exists and not snapshot.raw_temp_exists:
         payload.update(
             {
-                "phase": NavigationTaskPhase.WAITING_SCENE_MODE.value,
-                "status": NavigationTaskStatus.WAITING_USER.value,
-                "waiting_reason": "scene_mode_required_after_extract_sync",
-                "next_required_input": "scene_mode",
+                "phase": NavigationTaskPhase.INTAKE.value,
+                "status": NavigationTaskStatus.NEEDS_RECONCILE.value,
+                "waiting_reason": None,
+                "next_required_input": None,
                 "drift": NavigationTaskDrift(
-                    type="unexpected_existing_artifact",
-                    message="No completed task state was recorded, but sync_data already exists.",
-                    evidence=snapshot.sync_image_samples
-                    or ["clip_data/<date>/<segment>/sync_data"],
+                    type="missing_expected_artifact",
+                    message="Raw navigation input is missing; task phase cannot advance.",
+                    evidence=[
+                        f"raw_data/{snapshot.date}",
+                        f"raw_data/{snapshot.date}_temp",
+                    ],
                 ).model_dump(mode="json"),
             }
         )
         return NavigationTask.model_validate(payload)
 
-    if task.phase == NavigationTaskPhase.FINISH_PROCESSING and _has_partial_sync(snapshot):
-        payload.update(
-            {
-                "status": NavigationTaskStatus.NEEDS_RECONCILE.value,
-                "drift": _sync_drift(snapshot).model_dump(mode="json"),
-            }
-        )
-        return NavigationTask.model_validate(payload)
-
-    if task.phase == NavigationTaskPhase.FINISH_PROCESSING and snapshot.sync_data_by_segment and not snapshot.sync_data_exists:
-        payload.update(
-            {
-                "phase": NavigationTaskPhase.EXTRACT_SYNC.value,
-                "status": NavigationTaskStatus.NEEDS_RERUN.value,
-                "drift": _sync_drift(snapshot).model_dump(mode="json"),
-            }
-        )
-        return NavigationTask.model_validate(payload)
-
-    if (
-        task.phase == NavigationTaskPhase.FINISH_PROCESSING
-        and snapshot.final_outputs_exist
-        and snapshot.final_grid_map_exists
-    ):
-        payload.update(
-            {
-                "phase": NavigationTaskPhase.COMPLETED.value,
-                "status": NavigationTaskStatus.COMPLETED.value,
-                "drift": None,
-            }
-        )
-        return NavigationTask.model_validate(payload)
-
-    if (
-        task.phase == NavigationTaskPhase.FINISH_PROCESSING
-        and _has_partial_final_artifacts(snapshot)
-        and task.status in {
-            NavigationTaskStatus.PENDING,
-            NavigationTaskStatus.RUNNING,
+    payload.update(
+        {
+            "phase": NavigationTaskPhase.EXTRACT_SYNC.value,
+            "status": NavigationTaskStatus.NEEDS_RERUN.value,
+            "waiting_reason": None,
+            "next_required_input": None,
+            "drift": _sync_drift(snapshot).model_dump(mode="json"),
         }
-    ):
-        payload["drift"] = None
-        return NavigationTask.model_validate(payload)
-
-    if task.phase == NavigationTaskPhase.FINISH_PROCESSING and _has_partial_final_artifacts(snapshot):
-        payload.update(
-            {
-                "status": NavigationTaskStatus.NEEDS_RECONCILE.value,
-                "drift": _final_drift(snapshot).model_dump(mode="json"),
-            }
-        )
-        return NavigationTask.model_validate(payload)
-
-    if task.phase == NavigationTaskPhase.COMPLETED and not (
-        snapshot.final_outputs_exist and snapshot.final_grid_map_exists
-    ):
-        payload.update(
-            {
-                "status": NavigationTaskStatus.NEEDS_RECONCILE.value,
-                "drift": _final_drift(snapshot).model_dump(mode="json"),
-            }
-        )
-        return NavigationTask.model_validate(payload)
-
-    payload["drift"] = task.drift.model_dump(mode="json") if task.drift else None
+    )
     return NavigationTask.model_validate(payload)
