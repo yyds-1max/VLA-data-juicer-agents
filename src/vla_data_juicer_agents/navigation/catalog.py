@@ -8,6 +8,8 @@ from pydantic import BaseModel, Field
 
 CapabilityStatus = Literal["available", "planned", "placeholder", "deprecated"]
 ToolEffect = Literal["read", "write", "execute", "external"]
+CapabilityPhase = Literal["extract_sync", "finish_processing"]
+CAPABILITY_CATALOG_REVISION = "navigation-capabilities-v2"
 
 
 class ToolVariantCapability(BaseModel):
@@ -26,6 +28,9 @@ class ToolCapability(BaseModel):
     plan_agent_allowed: bool = False
     executor_agent_allowed: bool = False
     human_blocking: bool = False
+    phase: CapabilityPhase | None = None
+    argument_model: str | None = None
+    declared_output_kinds: list[str] = Field(default_factory=list)
 
 
 NAVIGATION_TOOL_CAPABILITIES: tuple[ToolCapability, ...] = (
@@ -35,6 +40,24 @@ NAVIGATION_TOOL_CAPABILITIES: tuple[ToolCapability, ...] = (
         effects="read",
         variants=[ToolVariantCapability(id="default")],
         plan_agent_allowed=True,
+    ),
+    ToolCapability(
+        tool_name="inspect_navigation_sensor_candidates",
+        stage_kind="inspect_navigation_sensor_candidates",
+        effects="read",
+        variants=[ToolVariantCapability(id="default")],
+        plan_agent_allowed=True,
+        phase="extract_sync",
+        declared_output_kinds=["sensor_candidates"],
+    ),
+    ToolCapability(
+        tool_name="inspect_navigation_topic_candidates",
+        stage_kind="inspect_navigation_topic_candidates",
+        effects="read",
+        variants=[ToolVariantCapability(id="default")],
+        plan_agent_allowed=True,
+        phase="extract_sync",
+        declared_output_kinds=["topic_candidates"],
     ),
     ToolCapability(
         tool_name="infer_navigation_sensor_bindings",
@@ -78,6 +101,9 @@ NAVIGATION_TOOL_CAPABILITIES: tuple[ToolCapability, ...] = (
         variants=[ToolVariantCapability(id="default")],
         supports_dry_run=True,
         executor_agent_allowed=True,
+        phase="extract_sync",
+        argument_model="EmptyArguments",
+        declared_output_kinds=["raw_temp", "clip_root"],
     ),
     ToolCapability(
         tool_name="extract_and_sync_navigation_data",
@@ -94,6 +120,9 @@ NAVIGATION_TOOL_CAPABILITIES: tuple[ToolCapability, ...] = (
         ],
         supports_dry_run=True,
         executor_agent_allowed=True,
+        phase="extract_sync",
+        argument_model="ExtractSyncArguments",
+        declared_output_kinds=["sync_data"],
     ),
     ToolCapability(
         tool_name="confirm_navigation_calibration_params",
@@ -103,6 +132,9 @@ NAVIGATION_TOOL_CAPABILITIES: tuple[ToolCapability, ...] = (
         supports_dry_run=True,
         executor_agent_allowed=True,
         human_blocking=True,
+        phase="finish_processing",
+        argument_model="EmptyArguments",
+        declared_output_kinds=["calibration_confirmation"],
     ),
     ToolCapability(
         tool_name="assemble_finish_temp",
@@ -111,6 +143,9 @@ NAVIGATION_TOOL_CAPABILITIES: tuple[ToolCapability, ...] = (
         variants=[ToolVariantCapability(id="default")],
         supports_dry_run=True,
         executor_agent_allowed=True,
+        phase="finish_processing",
+        argument_model="EmptyArguments",
+        declared_output_kinds=["finish_temp"],
     ),
     ToolCapability(
         tool_name="run_noobscene_preprocessing",
@@ -119,6 +154,9 @@ NAVIGATION_TOOL_CAPABILITIES: tuple[ToolCapability, ...] = (
         variants=[ToolVariantCapability(id="default")],
         supports_dry_run=True,
         executor_agent_allowed=True,
+        phase="finish_processing",
+        argument_model="EmptyArguments",
+        declared_output_kinds=["noobscene_metadata"],
     ),
     ToolCapability(
         tool_name="run_initial_annotation_gui",
@@ -127,6 +165,9 @@ NAVIGATION_TOOL_CAPABILITIES: tuple[ToolCapability, ...] = (
         variants=[ToolVariantCapability(id="human_gui")],
         supports_dry_run=True,
         executor_agent_allowed=True,
+        phase="finish_processing",
+        argument_model="EmptyArguments",
+        declared_output_kinds=["annotation_yaml"],
     ),
     ToolCapability(
         tool_name="run_tracking",
@@ -135,6 +176,9 @@ NAVIGATION_TOOL_CAPABILITIES: tuple[ToolCapability, ...] = (
         variants=[ToolVariantCapability(id="default")],
         supports_dry_run=True,
         executor_agent_allowed=True,
+        phase="finish_processing",
+        argument_model="EmptyArguments",
+        declared_output_kinds=["tracking_outputs"],
     ),
     ToolCapability(
         tool_name="prepare_gridmap_for_projection",
@@ -156,6 +200,9 @@ NAVIGATION_TOOL_CAPABILITIES: tuple[ToolCapability, ...] = (
         ],
         supports_dry_run=True,
         executor_agent_allowed=True,
+        phase="finish_processing",
+        argument_model="EmptyArguments",
+        declared_output_kinds=["projection_gridmap"],
     ),
     ToolCapability(
         tool_name="run_projection_and_trajectory",
@@ -173,6 +220,9 @@ NAVIGATION_TOOL_CAPABILITIES: tuple[ToolCapability, ...] = (
         ],
         supports_dry_run=True,
         executor_agent_allowed=True,
+        phase="finish_processing",
+        argument_model="EmptyArguments",
+        declared_output_kinds=["finish_data", "trajectory"],
     ),
     ToolCapability(
         tool_name="validate_navigation_outputs",
@@ -182,6 +232,9 @@ NAVIGATION_TOOL_CAPABILITIES: tuple[ToolCapability, ...] = (
         supports_dry_run=True,
         plan_agent_allowed=True,
         executor_agent_allowed=True,
+        phase="finish_processing",
+        argument_model="EmptyArguments",
+        declared_output_kinds=["validated_navigation_outputs"],
     ),
 )
 
@@ -193,6 +246,7 @@ def list_navigation_tool_capabilities() -> list[ToolCapability]:
 def navigation_tool_capabilities_payload() -> dict:
     return {
         "scenario": "navigation_vla",
+        "revision": CAPABILITY_CATALOG_REVISION,
         "capabilities": [
             capability.model_dump(mode="json")
             for capability in list_navigation_tool_capabilities()

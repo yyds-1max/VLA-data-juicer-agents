@@ -32,6 +32,7 @@ class NavigationTaskStatus(StrEnum):
     FAILED = "failed"
     NEEDS_RECONCILE = "needs_reconcile"
     NEEDS_RERUN = "needs_rerun"
+    NEEDS_REPLAN = "needs_replan"
     SUPERSEDED = "superseded"
 
 
@@ -69,6 +70,8 @@ class NavigationTask(BaseModel):
     date: str
     segments: list[str] | None = None
     scene_mode: Literal["in", "out"] | None = None
+    dry_run: bool = False
+    guidance_revision: int = 0
     phase: NavigationTaskPhase = NavigationTaskPhase.INTAKE
     status: NavigationTaskStatus = NavigationTaskStatus.PENDING
     waiting_reason: str | None = None

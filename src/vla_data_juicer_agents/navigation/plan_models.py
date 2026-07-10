@@ -1,0 +1,217 @@
+from __future__ import annotations
+
+from typing import Annotated, Any, Literal
+
+from pydantic import BaseModel, ConfigDict, Field
+
+
+class StrictModel(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+
+class DecisionBase(StrictModel):
+    reason: str = Field(min_length=1, max_length=500)
+    evidence_refs: list[str] = Field(min_length=1)
+
+
+class SensorBindingDecision(DecisionBase):
+    bindings: dict[Literal["fisheye_front", "lidar", "odom", "ins", "localization"], str]
+
+
+class TopicSelectionDecision(DecisionBase):
+    topic_whitelist: list[str] = Field(min_length=1)
+    topic_map: dict[str, str] = Field(min_length=1)
+    query_dir: str
+
+
+class TimeSyncDecision(DecisionBase):
+    reference_sensor: str
+    method: Literal["nearest_timestamp"]
+    tolerance_ms: int = Field(gt=0, le=1000)
+
+
+class LocalizationDecision(DecisionBase):
+    source: Literal["odom", "ins"]
+    conversion: Literal["odom_to_ins", "none"]
+
+
+class GridmapDecision(DecisionBase):
+    source: Literal["existing_gridmap", "generated_from_pcd", "projection_ready"]
+
+
+class CalibrationDecision(DecisionBase):
+    mode: Literal["hardcoded_with_user_confirmation", "selected_profile"]
+    selected_sensor_source: str
+    requires_user_confirmation: bool
+
+
+class EmptyArguments(StrictModel):
+    pass
+
+
+class ExtractSyncArguments(StrictModel):
+    processes_num: int = Field(default=4, ge=1, le=64)
+
+
+class StepBase(StrictModel):
+    step_id: str = Field(pattern=r"^[a-z][a-z0-9_]*$")
+    depends_on: list[str] = Field(default_factory=list)
+    failure_policy: Literal["stop"] = "stop"
+    decision_refs: list[str] = Field(default_factory=list)
+
+
+class PrepareRawStep(StepBase):
+    action: Literal["prepare_raw_data"] = "prepare_raw_data"
+    variant: Literal["default"] = "default"
+    arguments: EmptyArguments = Field(default_factory=EmptyArguments)
+
+
+class ExtractSyncStep(StepBase):
+    action: Literal["extract_and_sync_navigation_data"] = "extract_and_sync_navigation_data"
+    variant: Literal["explicit_topic_params"] = "explicit_topic_params"
+    arguments: ExtractSyncArguments = Field(default_factory=ExtractSyncArguments)
+
+
+class ConfirmCalibrationStep(StepBase):
+    action: Literal["confirm_navigation_calibration_params"] = "confirm_navigation_calibration_params"
+    variant: Literal["default"] = "default"
+    arguments: EmptyArguments = Field(default_factory=EmptyArguments)
+
+
+class AssembleFinishTempStep(StepBase):
+    action: Literal["assemble_finish_temp"] = "assemble_finish_temp"
+    variant: Literal["default"] = "default"
+    arguments: EmptyArguments = Field(default_factory=EmptyArguments)
+
+
+class NoobscenePreprocessingStep(StepBase):
+    action: Literal["run_noobscene_preprocessing"] = "run_noobscene_preprocessing"
+    variant: Literal["default"] = "default"
+    arguments: EmptyArguments = Field(default_factory=EmptyArguments)
+
+
+class InitialAnnotationStep(StepBase):
+    action: Literal["run_initial_annotation_gui"] = "run_initial_annotation_gui"
+    variant: Literal["human_gui"] = "human_gui"
+    arguments: EmptyArguments = Field(default_factory=EmptyArguments)
+
+
+class TrackingStep(StepBase):
+    action: Literal["run_tracking"] = "run_tracking"
+    variant: Literal["default"] = "default"
+    arguments: EmptyArguments = Field(default_factory=EmptyArguments)
+
+
+class PrepareGridmapStep(StepBase):
+    action: Literal["prepare_gridmap_for_projection"] = "prepare_gridmap_for_projection"
+    variant: Literal["copy_existing_gridmap", "generate_from_pcd", "skip_if_projection_ready"]
+    arguments: EmptyArguments = Field(default_factory=EmptyArguments)
+
+
+class ProjectionStep(StepBase):
+    action: Literal["run_projection_and_trajectory"] = "run_projection_and_trajectory"
+    variant: Literal["cjl_with_gridmap", "cjl_0525_with_gridmap"]
+    arguments: EmptyArguments = Field(default_factory=EmptyArguments)
+
+
+class ValidateOutputsStep(StepBase):
+    action: Literal["validate_navigation_outputs"] = "validate_navigation_outputs"
+    variant: Literal["expect_gridmap"] = "expect_gridmap"
+    arguments: EmptyArguments = Field(default_factory=EmptyArguments)
+
+
+ExtractSyncStepInput = Annotated[
+    PrepareRawStep | ExtractSyncStep,
+    Field(discriminator="action"),
+]
+FinishProcessingStepInput = Annotated[
+    ConfirmCalibrationStep
+    | AssembleFinishTempStep
+    | NoobscenePreprocessingStep
+    | InitialAnnotationStep
+    | TrackingStep
+    | PrepareGridmapStep
+    | ProjectionStep
+    | ValidateOutputsStep,
+    Field(discriminator="action"),
+]
+
+
+class ExtractSyncDecisions(StrictModel):
+    sensor_bindings: SensorBindingDecision
+    topic_selection: TopicSelectionDecision
+    time_sync: TimeSyncDecision
+
+
+class FinishProcessingDecisions(StrictModel):
+    localization: LocalizationDecision
+    gridmap: GridmapDecision
+    calibration: CalibrationDecision
+
+
+class ExtractSyncPlanInput(StrictModel):
+    decisions: ExtractSyncDecisions
+    steps: list[ExtractSyncStepInput] = Field(min_length=1)
+
+
+class FinishProcessingPlanInput(StrictModel):
+    decisions: FinishProcessingDecisions
+    steps: list[FinishProcessingStepInput] = Field(min_length=1)
+
+
+class PlanValidationIssue(StrictModel):
+    path: str
+    code: str
+    message: str
+    allowed_values: list[str] = Field(default_factory=list)
+
+
+class PlanValidationReport(StrictModel):
+    ok: bool
+    errors: list[PlanValidationIssue] = Field(default_factory=list)
+    warnings: list[PlanValidationIssue] = Field(default_factory=list)
+
+
+class NavigationPlanRecord(StrictModel):
+    plan_id: str
+    task_id: str
+    phase: Literal["extract_sync", "finish_processing"]
+    plan_revision: int
+    contract_version: str
+    observation_revision: int
+    status: Literal["active", "superseded", "completed", "invalidated"]
+    plan: ExtractSyncPlanInput | FinishProcessingPlanInput
+    created_at: str
+
+
+class PlanSubmissionAttempt(StrictModel):
+    attempt_id: str
+    task_id: str
+    phase: Literal["extract_sync", "finish_processing"]
+    planning_context_revision: str
+    candidate: dict[str, Any]
+    validation: PlanValidationReport
+    created_at: str
+
+
+class ExecutionStepRecord(StrictModel):
+    id: str
+    plan_id: str
+    plan_revision: int
+    sequence: int
+    step_id: str
+    action: str
+    status: Literal["pending", "running", "waiting_user", "completed", "failed", "needs_replan"]
+    result_summary: dict[str, Any] | None = None
+    result_ref: str | None = None
+    retry_count: int = 0
+
+
+class PlanExecutionOverview(StrictModel):
+    plan_id: str
+    plan_revision: int
+    status: str
+    total_steps: int
+    completed_steps: int
+    current_step_id: str | None
+    steps: list[ExecutionStepRecord]

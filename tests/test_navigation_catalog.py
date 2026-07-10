@@ -1,4 +1,5 @@
 from vla_data_juicer_agents.navigation.catalog import (
+    CAPABILITY_CATALOG_REVISION,
     list_navigation_tool_capabilities,
     list_navigation_tool_capabilities_tool,
     navigation_tool_capabilities_payload,
@@ -75,3 +76,26 @@ def test_catalog_tool_returns_json_serializable_payload():
     gridmap = next(item for item in payload["capabilities"] if item["stage_kind"] == "prepare_gridmap_for_projection")
     assert gridmap["variants"][0]["status"] == "available"
     assert list_navigation_tool_capabilities_tool.name == "list_navigation_tool_capabilities_tool"
+
+
+def test_v2_catalog_exposes_factual_observation_capabilities():
+    capabilities = _capability_by_stage()
+
+    assert CAPABILITY_CATALOG_REVISION == "navigation-capabilities-v2"
+    assert capabilities["inspect_navigation_sensor_candidates"].phase == "extract_sync"
+    assert capabilities["inspect_navigation_sensor_candidates"].declared_output_kinds == ["sensor_candidates"]
+    assert capabilities["inspect_navigation_topic_candidates"].phase == "extract_sync"
+    assert capabilities["inspect_navigation_topic_candidates"].declared_output_kinds == ["topic_candidates"]
+
+
+def test_v2_catalog_declares_argument_models_and_omits_combined_execution_tool():
+    capabilities = list_navigation_tool_capabilities()
+
+    by_stage = {capability.stage_kind: capability for capability in capabilities}
+    assert by_stage["prepare_raw_data"].argument_model == "EmptyArguments"
+    assert by_stage["extract_and_sync_navigation_data"].argument_model == "ExtractSyncArguments"
+    assert by_stage["run_tracking"].argument_model == "EmptyArguments"
+    assert "run_tracking_and_projection" not in {capability.tool_name for capability in capabilities}
+
+    payload = navigation_tool_capabilities_payload()
+    assert payload["revision"] == CAPABILITY_CATALOG_REVISION
