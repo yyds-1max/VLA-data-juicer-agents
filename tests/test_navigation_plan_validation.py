@@ -2,7 +2,11 @@ from __future__ import annotations
 
 import pytest
 
-from vla_data_juicer_agents.navigation.catalog import list_navigation_tool_capabilities
+from vla_data_juicer_agents.navigation.catalog import (
+    ToolCapability,
+    ToolVariantCapability,
+    list_navigation_tool_capabilities,
+)
 from vla_data_juicer_agents.navigation.observation_models import (
     ArtifactStateObservation,
     CalibrationInventoryObservation,
@@ -49,12 +53,18 @@ def finish_task() -> NavigationTask:
     )
 
 
-def descriptor(ref: str, revision: int, *, task_id: str = "nav-plan-1") -> EvidenceDescriptor:
+def descriptor(
+    ref: str,
+    revision: int,
+    *,
+    task_id: str = "nav-plan-1",
+    kind: str = "measured_fact",
+) -> EvidenceDescriptor:
     return EvidenceDescriptor(
         ref=ref,
         task_id=task_id,
         observation_revision=revision,
-        kind="measured_fact",
+        kind=kind,
         summary=f"Evidence for {ref}",
         byte_size=10,
         source_tool="inspect_navigation_test_tool",
@@ -161,17 +171,18 @@ def finish_observation(
 
 def extract_evidence() -> list[EvidenceDescriptor]:
     return [
-        descriptor("evidence:sensors", 2),
-        descriptor("evidence:topics", 3),
-        descriptor("evidence:timing", 4),
+        descriptor("evidence:sensors", 2, kind="sensor_candidates"),
+        descriptor("evidence:topics", 3, kind="topic_candidates"),
+        descriptor("evidence:timing", 4, kind="raw_metadata"),
     ]
 
 
 def finish_evidence() -> list[EvidenceDescriptor]:
     return [
-        descriptor("evidence:localization", 3),
-        descriptor("evidence:gridmap", 4),
-        descriptor("evidence:calibration", 5),
+        descriptor("evidence:localization", 3, kind="localization_sources"),
+        descriptor("evidence:gridmap", 4, kind="gridmap_artifacts"),
+        descriptor("evidence:calibration", 5, kind="calibration_inventory"),
+        descriptor("evidence:runtime", 5, kind="runtime_assets"),
     ]
 
 
@@ -636,3 +647,269 @@ def test_errors_are_deduplicated_sorted_and_capped_at_eight_public_issues():
     keys = [(issue.path, issue.code) for issue in report.errors]
     assert len(keys) == 8
     assert keys == sorted(set(keys))[:8]
+
+
+def test_completed_markers_without_required_typed_payloads_are_incomplete():
+    observation = finish_observation().model_copy(
+        update={
+            "payloads": [
+                payload
+                for payload in finish_observation().payloads
+                if not isinstance(
+                    payload,
+                    (
+                        CalibrationInventoryObservation,
+                        LocalizationSourcesObservation,
+                        RuntimeAssetsObservation,
+                    ),
+                )
+            ]
+        }
+    )
+
+    report = validate_finish(observation=observation)
+
+    assert [
+        (issue.path, issue.code)
+        for issue in report.errors
+        if issue.code == "missing_required_observation_payload"
+    ] == [
+        (
+            "observation.payloads.calibration_inventory",
+            "missing_required_observation_payload",
+        ),
+        (
+            "observation.payloads.localization_sources",
+            "missing_required_observation_payload",
+        ),
+        (
+            "observation.payloads.runtime_assets",
+            "missing_required_observation_payload",
+        ),
+    ]
+
+
+def test_manual_annotation_action_requires_observed_gui_runtime_asset():
+    payload = valid_finish_plan_payload()
+    payload["steps"].insert(
+        1,
+        {
+            "step_id": "initial_annotation",
+            "action": "run_initial_annotation_gui",
+            "variant": "human_gui",
+            "arguments": {},
+            "depends_on": ["confirm_calibration"],
+            "failure_policy": "stop",
+            "decision_refs": ["calibration"],
+        },
+    )
+    observation = finish_observation().model_copy(
+        update={
+            "payloads": [
+                item.model_copy(update={"manual_annotation_gui_available": False})
+                if isinstance(item, RuntimeAssetsObservation)
+                else item
+                for item in finish_observation().payloads
+            ]
+        }
+    )
+
+    report = validate_finish(payload, observation=observation)
+
+    assert PlanValidationIssue(
+        path="plan.steps.1.action",
+        code="runtime_action_unavailable",
+        message="Manual annotation GUI is unavailable in observed runtime assets",
+        allowed_values=["evidence_ref:evidence:runtime"],
+    ) in report.errors
+
+
+def test_manual_annotation_action_is_valid_when_gui_runtime_asset_is_available():
+    payload = valid_finish_plan_payload()
+    payload["steps"].insert(
+        1,
+        {
+            "step_id": "initial_annotation",
+            "action": "run_initial_annotation_gui",
+            "variant": "human_gui",
+            "arguments": {},
+            "depends_on": ["confirm_calibration"],
+            "failure_policy": "stop",
+            "decision_refs": ["calibration"],
+        },
+    )
+
+    assert validate_finish(payload).ok is True
+
+
+def test_large_observed_inventory_uses_concrete_evidence_pointer():
+    available_topics = [f"/topic/{index:03d}" for index in reversed(range(40))]
+    observation = extract_observation().model_copy(
+        update={
+            "payloads": [
+                item.model_copy(
+                    update={
+                        "available_topics": [
+                            *item.available_topics,
+                            *available_topics,
+                            *available_topics,
+                        ]
+                    }
+                )
+                if isinstance(item, TopicCandidatesObservation)
+                else item
+                for item in extract_observation().payloads
+            ]
+        }
+    )
+    payload = valid_extract_plan_payload()
+    payload["decisions"]["topic_selection"]["topic_whitelist"] = ["/not-observed"]
+
+    report = validate_extract(payload, observation=observation)
+
+    issue = next(issue for issue in report.errors if issue.code == "unobserved_topic")
+    assert issue.allowed_values == ["evidence_ref:evidence:topics"]
+    assert "see_observation_evidence" not in issue.allowed_values
+
+
+def test_large_calibration_inventory_is_sorted_deduplicated_and_uses_evidence_pointer():
+    sources = [f"sensor_{index:03d}" for index in reversed(range(40))]
+    observation = finish_observation().model_copy(
+        update={
+            "payloads": [
+                item.model_copy(update={"sensor_sources": [*sources, *sources]})
+                if isinstance(item, CalibrationInventoryObservation)
+                else item
+                for item in finish_observation().payloads
+            ]
+        }
+    )
+    payload = valid_finish_plan_payload()
+    payload["decisions"]["calibration"]["selected_sensor_source"] = "missing"
+
+    report = validate_finish(payload, observation=observation)
+
+    issue = next(issue for issue in report.errors if issue.code == "unobserved_calibration_source")
+    assert issue.allowed_values == ["evidence_ref:evidence:calibration"]
+
+
+def test_large_action_and_variant_sets_use_action_contract_pointers():
+    capabilities = list_navigation_tool_capabilities()
+    capabilities.extend(
+        ToolCapability(
+            tool_name=f"extra_action_{index:03d}",
+            stage_kind="test",
+            effects="execute",
+            variants=[ToolVariantCapability(id="default")],
+            executor_agent_allowed=True,
+            phase="extract_sync",
+            argument_model="EmptyArguments",
+        )
+        for index in reversed(range(40))
+    )
+    plan = ExtractSyncPlanInput.model_validate(valid_extract_plan_payload())
+    plan.steps[1] = plan.steps[1].model_copy(update={"action": "invented_action"})
+
+    action_report = validate_navigation_plan(
+        task=extract_task(),
+        observation=extract_observation(),
+        plan=plan,
+        evidence=extract_evidence(),
+        capabilities=capabilities,
+    )
+    action_issue = next(issue for issue in action_report.errors if issue.code == "unknown_action")
+    assert action_issue.allowed_values == sorted(set(action_issue.allowed_values))
+    assert len(action_issue.allowed_values) <= 20
+    assert all(value.startswith("action_contract:") for value in action_issue.allowed_values)
+
+    capabilities = [
+        capability.model_copy(
+            update={
+                "variants": [
+                    ToolVariantCapability(id=f"variant_{index:03d}")
+                    for index in reversed(range(40))
+                ]
+            }
+        )
+        if capability.tool_name == "extract_and_sync_navigation_data"
+        else capability
+        for capability in list_navigation_tool_capabilities()
+    ]
+    plan = ExtractSyncPlanInput.model_validate(valid_extract_plan_payload())
+    variant_report = validate_navigation_plan(
+        task=extract_task(),
+        observation=extract_observation(),
+        plan=plan,
+        evidence=extract_evidence(),
+        capabilities=capabilities,
+    )
+    variant_issue = next(issue for issue in variant_report.errors if issue.code == "unknown_variant")
+    assert variant_issue.allowed_values == [
+        "action_contract:extract_and_sync_navigation_data"
+    ]
+
+
+def test_invalid_arguments_point_to_the_selected_action_contract():
+    plan = ExtractSyncPlanInput.model_validate(valid_extract_plan_payload())
+    plan.steps[1] = plan.steps[1].model_copy(
+        update={"arguments": {"processes_num": 0}}
+    )
+
+    report = validate_navigation_plan(
+        task=extract_task(),
+        observation=extract_observation(),
+        plan=plan,
+        evidence=extract_evidence(),
+        capabilities=list_navigation_tool_capabilities(),
+    )
+
+    issue = next(issue for issue in report.errors if issue.code == "invalid_arguments")
+    assert issue.allowed_values == [
+        "action_contract:extract_and_sync_navigation_data"
+    ]
+
+
+def test_large_dependency_id_set_uses_plan_step_pointer_instead_of_echoing_ids():
+    payload = valid_extract_plan_payload()
+    prepare = payload["steps"][0]
+    payload["steps"] = [
+        {**prepare, "step_id": f"prepare_{index:03d}"}
+        for index in reversed(range(40))
+    ]
+    payload["steps"].append(
+        {
+            **valid_extract_plan_payload()["steps"][1],
+            "depends_on": ["missing_dependency"],
+        }
+    )
+
+    report = validate_extract(payload)
+
+    issue = next(issue for issue in report.errors if issue.code == "unknown_dependency")
+    assert issue.allowed_values == ["plan.steps[*].step_id"]
+
+
+def test_constructed_invalid_gridmap_source_returns_report_instead_of_raising():
+    plan = FinishProcessingPlanInput.model_validate(valid_finish_plan_payload())
+    plan.decisions.gridmap = plan.decisions.gridmap.model_copy(
+        update={"source": "invented_source"}
+    )
+
+    report = validate_navigation_plan(
+        task=finish_task(),
+        observation=finish_observation(),
+        plan=plan,
+        evidence=finish_evidence(),
+        capabilities=list_navigation_tool_capabilities(),
+    )
+
+    assert PlanValidationIssue(
+        path="plan.decisions.gridmap.source",
+        code="invalid_gridmap_source",
+        message="Gridmap source is not supported",
+        allowed_values=[
+            "existing_gridmap",
+            "generated_from_pcd",
+            "projection_ready",
+        ],
+    ) in report.errors

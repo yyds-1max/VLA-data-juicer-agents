@@ -17,6 +17,7 @@ from vla_data_juicer_agents.navigation.models import (
     WorkflowStep,
 )
 from vla_data_juicer_agents.navigation.observation_models import (
+    ArtifactStateObservation,
     CalibrationInventoryObservation,
     EvidenceDescriptor,
     GridmapArtifactsObservation,
@@ -379,6 +380,7 @@ def validate_workflow_plan(
 # the legacy profile/draft validator above; both paths coexist only until the
 # later legacy-removal task lands.
 MAX_PUBLIC_PLAN_VALIDATION_ISSUES = 8
+MAX_PUBLIC_ALLOWED_VALUES = 20
 _ARGUMENT_MODELS: dict[str, type[BaseModel]] = {
     "EmptyArguments": EmptyArguments,
     "ExtractSyncArguments": ExtractSyncArguments,
@@ -388,6 +390,16 @@ _GRIDMAP_VARIANT_BY_SOURCE = {
     "generated_from_pcd": "generate_from_pcd",
     "projection_ready": "skip_if_projection_ready",
 }
+_REQUIRED_PAYLOAD_TYPES: dict[str, type[BaseModel]] = {
+    "artifact_state": ArtifactStateObservation,
+    "raw_metadata": RawMetadataObservation,
+    "sensor_candidates": SensorCandidatesObservation,
+    "topic_candidates": TopicCandidatesObservation,
+    "gridmap_artifacts": GridmapArtifactsObservation,
+    "runtime_assets": RuntimeAssetsObservation,
+    "calibration_inventory": CalibrationInventoryObservation,
+    "localization_sources": LocalizationSourcesObservation,
+}
 
 
 def _plan_issue(
@@ -396,19 +408,48 @@ def _plan_issue(
     message: str,
     allowed_values: Sequence[str] = (),
 ) -> PlanValidationIssue:
+    normalized_allowed_values = sorted({str(value) for value in allowed_values})[
+        :MAX_PUBLIC_ALLOWED_VALUES
+    ]
     return PlanValidationIssue(
         path=path,
         code=code,
         message=message,
-        allowed_values=list(allowed_values),
+        allowed_values=normalized_allowed_values,
     )
 
 
-def _bounded_allowed_values(values: Iterable[str]) -> list[str]:
-    normalized = sorted(set(values))
-    if len(normalized) <= 20:
+def _bounded_allowed_values(
+    values: Iterable[str],
+    *,
+    overflow_values: Iterable[str] = (),
+) -> list[str]:
+    normalized = sorted({str(value) for value in values})
+    if len(normalized) <= MAX_PUBLIC_ALLOWED_VALUES:
         return normalized
-    return ["see_observation_evidence"]
+    overflow = sorted({str(value) for value in overflow_values})
+    return (overflow or normalized)[:MAX_PUBLIC_ALLOWED_VALUES]
+
+
+def _evidence_ref_pointer(
+    *,
+    observation: NavigationObservationRevision,
+    evidence: Sequence[EvidenceDescriptor],
+    kinds: Sequence[str],
+) -> list[str]:
+    for kind in kinds:
+        refs = sorted(
+            {
+                descriptor.ref
+                for descriptor in evidence
+                if descriptor.task_id == observation.task_id
+                and descriptor.observation_revision <= observation.revision
+                and descriptor.kind == kind
+            }
+        )
+        if refs:
+            return [f"evidence_ref:{refs[0]}"]
+    return []
 
 
 def _report(
@@ -507,6 +548,7 @@ def _validate_evidence_refs(
 def _validate_extract_references(
     observation: NavigationObservationRevision,
     plan: ExtractSyncPlanInput,
+    evidence: Sequence[EvidenceDescriptor],
 ) -> list[PlanValidationIssue]:
     errors: list[PlanValidationIssue] = []
     raw = _payload_of_type(observation, RawMetadataObservation)
@@ -517,7 +559,14 @@ def _validate_extract_references(
         available_topics.update(measurement.topic for measurement in raw.topics)
     if topics is not None:
         available_topics.update(topics.available_topics)
-    allowed_topics = _bounded_allowed_values(available_topics)
+    allowed_topics = _bounded_allowed_values(
+        available_topics,
+        overflow_values=_evidence_ref_pointer(
+            observation=observation,
+            evidence=evidence,
+            kinds=["topic_candidates", "raw_metadata"],
+        ),
+    )
 
     observed_bindings: dict[str, set[str]] = {}
     if sensors is not None:
@@ -541,7 +590,14 @@ def _validate_extract_references(
                     path,
                     "unobserved_sensor_binding",
                     "Sensor binding was not present in observed candidates",
-                    _bounded_allowed_values(observed_bindings.get(role, set())),
+                    _bounded_allowed_values(
+                        observed_bindings.get(role, set()),
+                        overflow_values=_evidence_ref_pointer(
+                            observation=observation,
+                            evidence=evidence,
+                            kinds=["sensor_candidates"],
+                        ),
+                    ),
                 )
             )
 
@@ -594,6 +650,7 @@ def _validate_extract_references(
 def _validate_finish_references(
     observation: NavigationObservationRevision,
     plan: FinishProcessingPlanInput,
+    evidence: Sequence[EvidenceDescriptor],
 ) -> list[PlanValidationIssue]:
     errors: list[PlanValidationIssue] = []
     localization = _payload_of_type(observation, LocalizationSourcesObservation)
@@ -645,7 +702,17 @@ def _validate_finish_references(
         "generated_from_pcd": bool(gridmap and gridmap.pcd_sources),
         "projection_ready": bool(gridmap and gridmap.projection_ready),
     }
-    if not source_observed[gridmap_decision.source]:
+    gridmap_source = str(gridmap_decision.source)
+    if gridmap_source not in source_observed:
+        errors.append(
+            _plan_issue(
+                "plan.decisions.gridmap.source",
+                "invalid_gridmap_source",
+                "Gridmap source is not supported",
+                source_observed,
+            )
+        )
+    elif not source_observed[gridmap_source]:
         errors.append(
             _plan_issue(
                 "plan.decisions.gridmap.source",
@@ -655,7 +722,7 @@ def _validate_finish_references(
             )
         )
     if (
-        gridmap_decision.source == "generated_from_pcd"
+        gridmap_source == "generated_from_pcd"
         and runtime is not None
         and not runtime.pcd_gridmap_tool_available
     ):
@@ -677,7 +744,14 @@ def _validate_finish_references(
                 "plan.decisions.calibration.selected_sensor_source",
                 "unobserved_calibration_source",
                 "Calibration sensor source was not observed",
-                calibration.sensor_sources,
+                _bounded_allowed_values(
+                    calibration.sensor_sources,
+                    overflow_values=_evidence_ref_pointer(
+                        observation=observation,
+                        evidence=evidence,
+                        kinds=["calibration_inventory"],
+                    ),
+                ),
             )
         )
     if (
@@ -694,9 +768,26 @@ def _validate_finish_references(
         )
 
     for index, step in enumerate(plan.steps):
+        if (
+            step.action == "run_initial_annotation_gui"
+            and runtime is not None
+            and not runtime.manual_annotation_gui_available
+        ):
+            errors.append(
+                _plan_issue(
+                    f"plan.steps.{index}.action",
+                    "runtime_action_unavailable",
+                    "Manual annotation GUI is unavailable in observed runtime assets",
+                    _evidence_ref_pointer(
+                        observation=observation,
+                        evidence=evidence,
+                        kinds=["runtime_assets"],
+                    ),
+                )
+            )
         if step.action == "prepare_gridmap_for_projection":
-            expected_variant = _GRIDMAP_VARIANT_BY_SOURCE[gridmap_decision.source]
-            if step.variant != expected_variant:
+            expected_variant = _GRIDMAP_VARIANT_BY_SOURCE.get(gridmap_source)
+            if expected_variant is not None and step.variant != expected_variant:
                 errors.append(
                     _plan_issue(
                         f"plan.steps.{index}.variant",
@@ -715,7 +806,18 @@ def _validate_finish_references(
                     f"plan.steps.{index}.variant",
                     "projection_variant_unavailable",
                     "Projection variant is unavailable in observed runtime assets",
-                    [name for name, available in runtime.projection_variants.items() if available],
+                    _bounded_allowed_values(
+                        (
+                            name
+                            for name, available in runtime.projection_variants.items()
+                            if available
+                        ),
+                        overflow_values=_evidence_ref_pointer(
+                            observation=observation,
+                            evidence=evidence,
+                            kinds=["runtime_assets"],
+                        ),
+                    ),
                 )
             )
     return errors
@@ -747,7 +849,13 @@ def _validate_capability_contracts(
                     f"plan.steps.{index}.action",
                     "unknown_action",
                     "Action is not available in the active phase",
-                    allowed_actions,
+                    _bounded_allowed_values(
+                        allowed_actions,
+                        overflow_values=(
+                            f"action_contract:{action}"
+                            for action in allowed_actions
+                        ),
+                    ),
                 )
             )
             continue
@@ -762,7 +870,10 @@ def _validate_capability_contracts(
                     f"plan.steps.{index}.variant",
                     "unknown_variant",
                     "Variant is not available for the selected action",
-                    allowed_variants,
+                    _bounded_allowed_values(
+                        allowed_variants,
+                        overflow_values=[f"action_contract:{step.action}"],
+                    ),
                 )
             )
         argument_model = _ARGUMENT_MODELS.get(capability.argument_model or "")
@@ -777,6 +888,7 @@ def _validate_capability_contracts(
                     f"plan.steps.{index}.arguments",
                     "unknown_argument_contract",
                     "Action argument contract is not registered",
+                    [f"action_contract:{step.action}"],
                 )
             )
         else:
@@ -788,6 +900,7 @@ def _validate_capability_contracts(
                         f"plan.steps.{index}.arguments",
                         "invalid_arguments",
                         "Arguments do not satisfy the selected action contract",
+                        [f"action_contract:{step.action}"],
                     )
                 )
         for ref_index, ref in enumerate(step.decision_refs):
@@ -831,7 +944,10 @@ def _validate_dependencies(
                         path,
                         "unknown_dependency",
                         "Dependency does not reference a plan step",
-                        positions,
+                        _bounded_allowed_values(
+                            positions,
+                            overflow_values=["plan.steps[*].step_id"],
+                        ),
                     )
                 )
             elif positions[dependency] >= index:
@@ -994,6 +1110,16 @@ def validate_navigation_plan(
                 missing,
             )
         )
+    for kind in required:
+        payload_type = _REQUIRED_PAYLOAD_TYPES[kind]
+        if not any(isinstance(payload, payload_type) for payload in observation.payloads):
+            errors.append(
+                _plan_issue(
+                    f"observation.payloads.{kind}",
+                    "missing_required_observation_payload",
+                    "Required typed observation payload is missing",
+                )
+            )
 
     # Stage 2: decision evidence ownership and snapshot revision.
     errors.extend(
@@ -1007,9 +1133,9 @@ def validate_navigation_plan(
 
     # Stage 3: references selected by the model must exist in observed facts.
     if isinstance(plan, ExtractSyncPlanInput):
-        errors.extend(_validate_extract_references(observation, plan))
+        errors.extend(_validate_extract_references(observation, plan, evidence))
     else:
-        errors.extend(_validate_finish_references(observation, plan))
+        errors.extend(_validate_finish_references(observation, plan, evidence))
 
     # Stage 4: selected actions, variants, arguments, and decision links.
     errors.extend(

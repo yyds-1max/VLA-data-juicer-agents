@@ -28,6 +28,7 @@ from vla_data_juicer_agents.navigation.observation_models import (
 from vla_data_juicer_agents.navigation.observation_store import (
     SqliteNavigationObservationStore,
 )
+from vla_data_juicer_agents.navigation.plan_models import PlanValidationIssue
 from vla_data_juicer_agents.navigation.plan_store import SqliteNavigationPlanRepository
 from vla_data_juicer_agents.navigation.plan_submission_tools import (
     build_navigation_plan_submission_tools,
@@ -530,8 +531,37 @@ def test_invalid_replacement_preserves_existing_active_plan_and_ledger(tmp_path)
     assert _ledger_count(services) == 2
 
 
-def test_failure_response_is_compact_and_never_returns_candidate_schema_or_history(tmp_path):
+def test_failure_response_is_compact_and_uses_concrete_evidence_pointer(
+    tmp_path,
+    monkeypatch,
+):
     services = build_services(tmp_path, "extract_sync")
+    latest = services.observation_store.latest(services.task.task_id)
+    assert latest is not None
+    large_topics = [f"/measured/{index:03d}" for index in reversed(range(50))]
+    large_observation = latest.model_copy(
+        update={
+            "payloads": [
+                item.model_copy(
+                    update={
+                        "available_topics": [
+                            *item.available_topics,
+                            *large_topics,
+                            *large_topics,
+                        ]
+                    }
+                )
+                if isinstance(item, TopicCandidatesObservation)
+                else item
+                for item in latest.payloads
+            ]
+        }
+    )
+    monkeypatch.setattr(
+        services.observation_store,
+        "latest",
+        lambda _task_id: large_observation,
+    )
     payload = valid_extract_plan_payload(services)
     payload["decisions"]["topic_selection"]["topic_whitelist"] = [
         "/invented/" + ("x" * 200) + str(index) for index in range(40)
@@ -543,6 +573,134 @@ def test_failure_response_is_compact_and_never_returns_candidate_schema_or_histo
     serialized = json.dumps(result, ensure_ascii=False, separators=(",", ":"))
     assert len(serialized) <= 3_000
     assert all(word not in serialized for word in ("draft", "schema", "history", "candidate"))
+    topic_issues = [
+        issue for issue in result["errors"] if issue["code"] == "unobserved_topic"
+    ]
+    assert topic_issues
+    assert all(
+        issue["allowed_values"]
+        == [f"evidence_ref:{services.evidence_refs['topic_candidates']}"]
+        for issue in topic_issues
+    )
+
+
+def test_completed_markers_without_required_payloads_are_audited_and_never_activate(
+    tmp_path,
+    monkeypatch,
+):
+    services = build_services(tmp_path, "finish_processing")
+    latest = services.observation_store.latest(services.task.task_id)
+    assert latest is not None
+    incomplete = latest.model_copy(
+        update={
+            "payloads": [
+                payload
+                for payload in latest.payloads
+                if not isinstance(
+                    payload,
+                    (
+                        CalibrationInventoryObservation,
+                        LocalizationSourcesObservation,
+                        RuntimeAssetsObservation,
+                    ),
+                )
+            ]
+        }
+    )
+    monkeypatch.setattr(
+        services.observation_store,
+        "latest",
+        lambda _task_id: incomplete,
+    )
+
+    result = call_submit_finish(services, valid_finish_plan_payload(services))
+
+    assert result["ok"] is False
+    assert {
+        issue["path"]
+        for issue in result["errors"]
+        if issue["code"] == "missing_required_observation_payload"
+    } == {
+        "observation.payloads.calibration_inventory",
+        "observation.payloads.localization_sources",
+        "observation.payloads.runtime_assets",
+    }
+    assert services.plan_store.get_active(
+        services.task.task_id,
+        "finish_processing",
+    ) is None
+    assert _ledger_count(services) == 0
+    assert len(_audit_rows(services)) == 1
+
+
+def test_gui_runtime_unavailable_blocks_submission_but_available_runtime_succeeds(
+    tmp_path,
+    monkeypatch,
+):
+    services = build_services(tmp_path, "finish_processing")
+    payload = valid_finish_plan_payload(services)
+    payload["steps"].insert(
+        1,
+        {
+            "step_id": "initial_annotation",
+            "action": "run_initial_annotation_gui",
+            "variant": "human_gui",
+            "arguments": {},
+            "depends_on": ["confirm_calibration"],
+            "failure_policy": "stop",
+            "decision_refs": ["calibration"],
+        },
+    )
+    available = services.observation_store.latest(services.task.task_id)
+    assert available is not None
+    unavailable = available.model_copy(
+        update={
+            "payloads": [
+                item.model_copy(update={"manual_annotation_gui_available": False})
+                if isinstance(item, RuntimeAssetsObservation)
+                else item
+                for item in available.payloads
+            ]
+        }
+    )
+    monkeypatch.setattr(
+        services.observation_store,
+        "latest",
+        lambda _task_id: unavailable,
+    )
+
+    blocked = call_submit_finish(services, payload)
+
+    assert blocked["ok"] is False
+    assert PlanValidationIssue.model_validate(
+        next(
+            issue
+            for issue in blocked["errors"]
+            if issue["code"] == "runtime_action_unavailable"
+        )
+    ) == PlanValidationIssue(
+        path="plan.steps.1.action",
+        code="runtime_action_unavailable",
+        message="Manual annotation GUI is unavailable in observed runtime assets",
+        allowed_values=[
+            f"evidence_ref:{services.evidence_refs['runtime_assets']}"
+        ],
+    )
+    assert services.plan_store.get_active(
+        services.task.task_id,
+        "finish_processing",
+    ) is None
+    assert _ledger_count(services) == 0
+
+    monkeypatch.setattr(
+        services.observation_store,
+        "latest",
+        lambda _task_id: available,
+    )
+    accepted = call_submit_finish(services, payload)
+
+    assert accepted["ok"] is True
+    assert accepted["step_count"] == 6
 
 
 def test_audit_failure_prevents_activation_and_returns_stable_internal_failure(
