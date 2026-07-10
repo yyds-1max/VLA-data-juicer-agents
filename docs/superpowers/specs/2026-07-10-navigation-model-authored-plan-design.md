@@ -87,6 +87,40 @@ and tolerance are supported.
 
 ## Architecture
 
+### Entry Reconciliation and Phase Selection
+
+Every navigation processing entry follows the same ordering, including the first
+request for a date, a continuation in the same session, a cross-session resume, and
+a request made after test artifacts were manually deleted:
+
+1. create or load the durable task for the selected date and segments
+2. inspect current raw, intermediate, and final artifacts
+3. reconcile persisted task state with that artifact snapshot
+4. select the earliest incomplete processing phase or step
+5. only then build the phase observation checklist and enter investigation/planning
+
+Artifact reconciliation is therefore an unconditional entry gate, not a special
+rerun workflow. The initial snapshot includes at least raw input, prepared raw temp,
+per-segment `sync_data`, finish-temp samples, final outputs, final grid maps, and
+available validation markers.
+
+Phase selection follows artifact dependencies:
+
+- selected raw data exists but selected `sync_data` is incomplete: enter
+  `extract_sync`
+- selected `sync_data` is complete but finish-processing outputs are incomplete:
+  enter `finish_processing` at the earliest step whose required output is absent or
+  invalid
+- required final outputs and validation markers are complete: reconcile the task as
+  `completed`
+- artifacts are partially present or internally inconsistent: record the exact
+  artifact facts and enter `needs_reconcile` before planning the affected work
+
+Observed artifacts override stale persisted phase/status. This phase derivation is
+not semantic plan generation: code determines only which prerequisite outputs exist
+and which dependency boundary is incomplete. The model still decides the plan,
+steps, variants, and parameters for the selected phase.
+
 ### Observation Store
 
 Add a task-scoped `NavigationObservationStore`. Observations belong to the durable
@@ -463,7 +497,7 @@ sub-session rotation can be reconsidered as a separate design.
 
 ## Persistence and Recovery
 
-On every continuation, the runtime reconstructs state from:
+On every processing entry, the runtime reconstructs state from:
 
 - `NavigationTaskStore`
 - `NavigationObservationStore`
@@ -555,6 +589,12 @@ tasks remain completed if artifact reconciliation confirms their outputs.
 
 ### Integration Tests
 
+- raw-only artifact state selects `extract_sync` before any plan is requested
+- complete selected `sync_data` with missing downstream outputs selects
+  `finish_processing` without rerunning extract-sync
+- complete validated final artifacts reconcile directly to `completed`
+- deleting test artifacts after a completed run causes the next ordinary task entry
+  to select the earliest incomplete phase from the new snapshot
 - complete extract-sync investigation, model-authored plan, and dry-run execution
 - scene-mode update followed by complete finish-processing planning and execution
 - model selection of sync reference, localization, gridmap, calibration, steps, and
@@ -604,6 +644,9 @@ tasks remain completed if artifact reconciliation confirms their outputs.
 10. AgentScope compression and phase-boundary session handling are unchanged.
 11. The old draft/finalize/profile-generation implementation and all dead references
     are deleted in the same optimization change.
+12. Every processing request reconciles current intermediate/final artifacts before
+    choosing a planning phase, so stale task state cannot force the wrong starting
+    point.
 
 ## Implementation Sequence
 
