@@ -175,7 +175,7 @@ def _available_action_ids(capabilities: list[ToolCapability], phase: str) -> lis
     for capability in capabilities:
         if capability.phase != phase or not capability.executor_agent_allowed:
             continue
-        if capability.variants and not any(
+        if not any(
             variant.status == "available" for variant in capability.variants
         ):
             continue

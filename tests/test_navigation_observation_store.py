@@ -10,7 +10,10 @@ from vla_data_juicer_agents.navigation.observation_models import (
     SensorRoleCandidate,
     TopicMeasurement,
 )
-from vla_data_juicer_agents.navigation.observation_store import SqliteNavigationObservationStore
+from vla_data_juicer_agents.navigation.observation_store import (
+    ObservationRollbackCleanupError,
+    SqliteNavigationObservationStore,
+)
 
 
 def _raw_observation() -> RawMetadataObservation:
@@ -121,4 +124,62 @@ def test_append_rolls_back_database_and_written_evidence_on_failure(tmp_path):
     assert store.latest("nav-1") is None
     assert list(root.rglob("*.json")) == []
     with sqlite3.connect(tmp_path / "state.sqlite") as connection:
+        assert connection.execute("SELECT count(*) FROM navigation_evidence").fetchone()[0] == 0
+
+
+def test_append_surfaces_all_evidence_cleanup_failures_after_database_rollback(tmp_path):
+    underlying = FileNavigationEvidenceStore(tmp_path / "evidence")
+
+    class CleanupFailingEvidenceStore:
+        def __init__(self):
+            self.write_count = 0
+            self.delete_attempts = []
+
+        def write(self, *args, **kwargs):
+            self.write_count += 1
+            if self.write_count == 3:
+                raise RuntimeError("third write failed")
+            return underlying.write(*args, **kwargs)
+
+        def delete(self, task_id, ref):
+            self.delete_attempts.append((task_id, ref))
+            raise OSError(f"cannot delete {ref}")
+
+    evidence = CleanupFailingEvidenceStore()
+    store = SqliteNavigationObservationStore(tmp_path / "state.sqlite")
+    writes = [
+        EvidenceWrite(
+            kind=str(index),
+            source_tool="inspect",
+            payload={"index": index},
+            summary=str(index),
+        )
+        for index in range(3)
+    ]
+
+    with pytest.raises(ObservationRollbackCleanupError) as captured:
+        store.append(
+            "nav-1",
+            "extract_sync",
+            "raw_metadata",
+            [_raw_observation()],
+            writes,
+            evidence,
+        )
+
+    error = captured.value
+    assert isinstance(error.original_error, RuntimeError)
+    assert str(error.original_error) == "third write failed"
+    assert len(error.cleanup_errors) == 2
+    assert all(isinstance(cleanup_error, OSError) for cleanup_error in error.cleanup_errors)
+    assert error.__cause__ is error.original_error
+    assert len(evidence.delete_attempts) == 2
+    assert store.latest("nav-1") is None
+    with sqlite3.connect(tmp_path / "state.sqlite") as connection:
+        assert (
+            connection.execute(
+                "SELECT count(*) FROM navigation_observation_revisions"
+            ).fetchone()[0]
+            == 0
+        )
         assert connection.execute("SELECT count(*) FROM navigation_evidence").fetchone()[0] == 0

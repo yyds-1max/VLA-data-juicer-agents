@@ -20,6 +20,20 @@ from vla_data_juicer_agents.navigation.task_state import NavigationTaskPhase
 _OBSERVATION_PAYLOAD_ADAPTER = TypeAdapter(ObservationPayload)
 
 
+class ObservationRollbackCleanupError(RuntimeError):
+    def __init__(
+        self,
+        original_error: Exception,
+        cleanup_errors: list[Exception],
+    ) -> None:
+        self.original_error = original_error
+        self.cleanup_errors = tuple(cleanup_errors)
+        super().__init__(
+            "observation append failed and evidence rollback cleanup failed: "
+            f"{len(cleanup_errors)} cleanup error(s)"
+        )
+
+
 class NavigationEvidenceWriter(Protocol):
     def write(
         self,
@@ -179,13 +193,19 @@ class SqliteNavigationObservationStore:
                 )
             connection.commit()
             return revision
-        except Exception:
+        except Exception as append_error:
             connection.rollback()
+            cleanup_errors: list[Exception] = []
             for descriptor in reversed(written_descriptors):
                 try:
                     evidence_store.delete(task_id, descriptor.ref)
-                except Exception:
-                    pass
+                except Exception as cleanup_error:
+                    cleanup_errors.append(cleanup_error)
+            if cleanup_errors:
+                raise ObservationRollbackCleanupError(
+                    append_error,
+                    cleanup_errors,
+                ) from append_error
             raise
         finally:
             connection.close()

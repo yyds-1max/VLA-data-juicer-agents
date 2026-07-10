@@ -167,3 +167,41 @@ def test_planning_context_rejects_cross_task_observation():
             observation=_revision().model_copy(update={"task_id": "nav-2"}),
             capabilities=_caps(),
         )
+
+
+def test_planning_context_excludes_executor_capability_without_variants():
+    capability = ToolCapability(
+        tool_name="variantless_action",
+        stage_kind="variantless_action",
+        effects="execute",
+        variants=[],
+        executor_agent_allowed=True,
+        phase="extract_sync",
+    )
+
+    context = build_phase_planning_context(
+        task=_task(), observation=_revision(), capabilities=[capability]
+    )
+
+    assert context.available_action_ids == []
+
+
+def test_planning_context_excludes_executor_capability_without_available_variant():
+    capability = ToolCapability(
+        tool_name="unavailable_action",
+        stage_kind="unavailable_action",
+        effects="execute",
+        variants=[
+            ToolVariantCapability(id="planned", status="planned"),
+            ToolVariantCapability(id="placeholder", status="placeholder"),
+            ToolVariantCapability(id="deprecated", status="deprecated"),
+        ],
+        executor_agent_allowed=True,
+        phase="extract_sync",
+    )
+
+    context = build_phase_planning_context(
+        task=_task(), observation=_revision(), capabilities=[capability]
+    )
+
+    assert context.available_action_ids == []
