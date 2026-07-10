@@ -207,9 +207,7 @@ class AgentScopeEventAdapter:
                 "human_decision_required",
                 reply_id=reply_id,
                 tool_call_id=_text(getattr(tool_call, "id", "")),
-                decision_type=payload["decision_type"],
-                request_id=payload["request_id"],
-                summary=payload["summary"],
+                **payload,
             )
 
 
@@ -312,8 +310,14 @@ def _human_decision_payload(tool_name: str, tool_input: dict[str, Any]) -> dict[
         decision_type = "other"
     request_id = tool_input.get("request_id")
     summary = tool_input.get("summary")
-    return {
+    payload = {
         "decision_type": decision_type,
         "request_id": request_id if isinstance(request_id, str) else "",
         "summary": summary if isinstance(summary, str) else "",
     }
+    plan_id = tool_input.get("plan_id")
+    step_id = tool_input.get("step_id")
+    if isinstance(plan_id, str) and isinstance(step_id, str):
+        payload["plan_id"] = plan_id
+        payload["step_id"] = step_id
+    return payload

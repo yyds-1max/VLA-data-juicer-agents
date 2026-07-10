@@ -31,6 +31,8 @@ from vla_data_juicer_agents.navigation.observation_store import (
 )
 from vla_data_juicer_agents.navigation.plan_draft import WorkflowPlanDraftState
 from vla_data_juicer_agents.navigation.plan_draft_store import JsonNavigationPlanDraftStore
+from vla_data_juicer_agents.navigation.plan_execution import submit_plan_human_decision
+from vla_data_juicer_agents.navigation.plan_store import SqliteNavigationPlanRepository
 from vla_data_juicer_agents.navigation.task_reconciliation import (
     _navigation_scene_mode_for_request,
     _structured_handoff_payload_from_message,
@@ -324,6 +326,11 @@ class AgentScopeRuntime:
     def _navigation_evidence_store(self) -> FileNavigationEvidenceStore:
         return FileNavigationEvidenceStore(self.config.workspace_root / "navigation-evidence")
 
+    def _navigation_plan_store(self) -> SqliteNavigationPlanRepository:
+        return SqliteNavigationPlanRepository(
+            self.config.workspace_root / "navigation-tasks.sqlite"
+        )
+
     def _navigation_tools_for_session(
         self,
         *,
@@ -374,6 +381,19 @@ class AgentScopeRuntime:
             )
             if pending_tool_name is None:
                 return False
+
+            plan_id = decision.get("plan_id")
+            step_id = decision.get("step_id")
+            if isinstance(plan_id, str) and isinstance(step_id, str):
+                transitioned = submit_plan_human_decision(
+                    plan_store=self._navigation_plan_store(),
+                    evidence_store=self._navigation_evidence_store(),
+                    plan_id=plan_id,
+                    step_id=step_id,
+                    decision=decision,
+                )
+                if not transitioned:
+                    return False
 
             result = ToolResultBlock(
                 id=decision["tool_call_id"],
@@ -453,6 +473,25 @@ class AgentScopeRuntime:
                     and _state_value(getattr(tool_call, "state", None))
                     == ToolCallState.SUBMITTED.value
                 ):
+                    raw_input = getattr(tool_call, "input", None)
+                    if isinstance(raw_input, str):
+                        try:
+                            raw_input = json.loads(raw_input)
+                        except json.JSONDecodeError:
+                            return None
+                    is_plan_bound = isinstance(raw_input, dict) and (
+                        "plan_id" in raw_input or "step_id" in raw_input
+                    )
+                    if is_plan_bound:
+                        payload = _human_decision_payload_from_tool_call(
+                            tool_call,
+                            plan_store=self._navigation_plan_store(),
+                        )
+                        if payload is None:
+                            return None
+                        for field in ("plan_id", "step_id"):
+                            if decision.get(field) != payload.get(field):
+                                return None
                     return str(tool_name)
         return None
 
@@ -802,7 +841,19 @@ class AgentScopeRuntime:
             adapter.accept(_to_attribute_event(_strip_internal_event_fields(raw_event)))
             events = []
             while not translated_events.empty():
-                events.append(translated_events.get_nowait())
+                event = translated_events.get_nowait()
+                payload = event.get("payload")
+                if (
+                    event.get("type") == "human_decision_required"
+                    and isinstance(payload, dict)
+                    and isinstance(payload.get("plan_id"), str)
+                    and isinstance(payload.get("step_id"), str)
+                ):
+                    event = _enrich_plan_human_decision_event(
+                        event,
+                        plan_store=self._navigation_plan_store(),
+                    )
+                events.append(event)
             return events
 
         try:
@@ -830,6 +881,15 @@ class AgentScopeRuntime:
                 if _raw_event_type(raw_event) == "REPLY_END":
                     saw_reply_end = True
                 for event in accept_raw_event(raw_event):
+                    decision_key = (
+                        _human_decision_event_key(event)
+                        if event.get("type") == "human_decision_required"
+                        else ""
+                    )
+                    if decision_key:
+                        if decision_key in seen_pending_decision_keys:
+                            continue
+                        seen_pending_decision_keys.add(decision_key)
                     yield event
                 self._remember_event_cursor(
                     agentscope_session_id,
@@ -864,6 +924,15 @@ class AgentScopeRuntime:
                         if _raw_event_type(raw_event) == "REPLY_END":
                             saw_reply_end = True
                         for event in accept_raw_event(raw_event):
+                            decision_key = (
+                                _human_decision_event_key(event)
+                                if event.get("type") == "human_decision_required"
+                                else ""
+                            )
+                            if decision_key:
+                                if decision_key in seen_pending_decision_keys:
+                                    continue
+                                seen_pending_decision_keys.add(decision_key)
                             yield event
                         if entry_id:
                             self._remember_event_cursor(
@@ -1062,7 +1131,10 @@ class AgentScopeRuntime:
                     and _state_value(getattr(tool_call, "state", None))
                     == ToolCallState.SUBMITTED.value
                 ):
-                    payload = _human_decision_payload_from_tool_call(tool_call)
+                    payload = _human_decision_payload_from_tool_call(
+                        tool_call,
+                        plan_store=self._navigation_plan_store(),
+                    )
                     if payload is None:
                         continue
                     claim_key = _human_decision_claim_key(
@@ -1184,7 +1256,11 @@ def _human_decision_claim_key(agentscope_session_id: str, decision: dict[str, An
     )
 
 
-def _human_decision_payload_from_tool_call(tool_call: Any) -> dict[str, Any] | None:
+def _human_decision_payload_from_tool_call(
+    tool_call: Any,
+    *,
+    plan_store: SqliteNavigationPlanRepository | None = None,
+) -> dict[str, Any] | None:
     tool_name = getattr(tool_call, "name", None)
     tool_input = getattr(tool_call, "input", None)
     if isinstance(tool_input, str):
@@ -1194,6 +1270,36 @@ def _human_decision_payload_from_tool_call(tool_call: Any) -> dict[str, Any] | N
             return None
     if not isinstance(tool_input, dict):
         return None
+
+    plan_id = tool_input.get("plan_id")
+    step_id = tool_input.get("step_id")
+    if isinstance(plan_id, str) and isinstance(step_id, str):
+        if plan_store is None:
+            return None
+        plan = plan_store.get(plan_id)
+        current = plan_store.get_current_step(plan_id) if plan is not None else None
+        if (
+            plan is None
+            or plan.status != "active"
+            or current is None
+            or current["step"]["step_id"] != step_id
+            or current["step"]["action"] != "confirm_navigation_calibration_params"
+        ):
+            return None
+        calibration = getattr(getattr(plan.plan, "decisions", None), "calibration", None)
+        selected_source = getattr(calibration, "selected_sensor_source", None)
+        if not isinstance(selected_source, str):
+            return None
+        return {
+            "request_id": f"{plan_id}:{step_id}",
+            "decision_type": "camera_params",
+            "summary": (
+                "请确认本计划选定的相机标定参数："
+                f"{selected_source[:1000]}。确认后将继续执行下一计划步骤。"
+            ),
+            "plan_id": plan_id,
+            "step_id": step_id,
+        }
 
     request_id = tool_input.get("request_id")
     summary = tool_input.get("summary")
@@ -1209,12 +1315,45 @@ def _human_decision_payload_from_tool_call(tool_call: Any) -> dict[str, Any] | N
     }
 
 
+def _enrich_plan_human_decision_event(
+    event: dict[str, Any],
+    *,
+    plan_store: SqliteNavigationPlanRepository,
+) -> dict[str, Any]:
+    payload = event.get("payload")
+    if not isinstance(payload, dict):
+        return event
+    plan_id = payload.get("plan_id")
+    step_id = payload.get("step_id")
+    if not isinstance(plan_id, str) or not isinstance(step_id, str):
+        return event
+    metadata = _human_decision_payload_from_tool_call(
+        SimpleNamespace(
+            name="request_human_decision",
+            input={"plan_id": plan_id, "step_id": step_id},
+        ),
+        plan_store=plan_store,
+    )
+    if metadata is None:
+        return event
+    enriched = dict(event)
+    enriched["payload"] = {
+        **metadata,
+        "reply_id": payload.get("reply_id", ""),
+        "tool_call_id": payload.get("tool_call_id", ""),
+    }
+    return enriched
+
+
 def _human_decision_tool_output(tool_name: str, decision: dict[str, Any]) -> dict[str, Any]:
     output = {
         "action": decision["action"],
         "text": decision.get("text"),
         "request_id": decision["request_id"],
     }
+    if isinstance(decision.get("plan_id"), str) and isinstance(decision.get("step_id"), str):
+        output["plan_id"] = decision["plan_id"]
+        output["step_id"] = decision["step_id"]
     if not _is_calibration_confirmation_decision(decision):
         return output
     output["decision_type"] = "camera_params"
@@ -1251,8 +1390,14 @@ def _human_decision_tool_output(tool_name: str, decision: dict[str, Any]) -> dic
 def _is_calibration_confirmation_decision(decision: dict[str, Any]) -> bool:
     request_id = decision.get("request_id")
     return (
-        isinstance(request_id, str)
-        and request_id.startswith("confirm_navigation_calibration_params:")
+        (
+            isinstance(decision.get("plan_id"), str)
+            and isinstance(decision.get("step_id"), str)
+        )
+        or (
+            isinstance(request_id, str)
+            and request_id.startswith("confirm_navigation_calibration_params:")
+        )
     )
 
 

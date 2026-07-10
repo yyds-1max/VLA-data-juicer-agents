@@ -50,34 +50,42 @@ class HumanDecisionTool(ToolBase):
 
     name = "request_human_decision"
     description = (
-        "Pause navigation workflow execution and ask the frontend to show a "
-        "human decision dialog for calibration confirmation, overwrite/delete "
-        "approval, stop, or user guidance. The dialog lets the user confirm "
-        "the action, stop the workflow, or provide guidance before the agent "
-        "continues."
+        "Pause the current immutable navigation-plan step and ask the frontend "
+        "for its stored human decision. The server derives all dialog metadata "
+        "from the plan; callers provide only plan_id and step_id."
     )
     input_schema = {
         "type": "object",
         "properties": {
-            "decision_type": {
-                "type": "string",
-                "enum": ["camera_params", "overwrite", "delete", "other"],
-            },
-            "request_id": {"type": "string"},
-            "summary": {"type": "string"},
+            "plan_id": {"type": "string"},
+            "step_id": {"type": "string"},
         },
-        "required": ["decision_type", "request_id", "summary"],
+        "required": ["plan_id", "step_id"],
         "additionalProperties": False,
     }
     is_concurrency_safe = False
     is_read_only = True
     is_external_tool = True
 
+    def __init__(
+        self,
+        *,
+        gate: Any | None = None,
+    ) -> None:
+        self._gate = gate
+
     async def check_permissions(
         self,
         tool_input: dict[str, Any],
         context: object,
     ) -> PermissionDecision:
+        if self._gate is not None:
+            gate_error = self._gate(tool_input)
+            if gate_error is not None:
+                return PermissionDecision(
+                    behavior=PermissionBehavior.DENY,
+                    message=gate_error["message"],
+                )
         return PermissionDecision(
             behavior=PermissionBehavior.ALLOW,
             message="Human decision requests are allowed.",

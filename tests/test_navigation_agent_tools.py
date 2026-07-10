@@ -142,16 +142,9 @@ def test_human_decision_tool_declares_external_read_only_schema():
     assert tool.name == "request_human_decision"
     assert tool.is_external_tool is True
     assert tool.is_read_only is True
-    assert set(tool.input_schema["properties"]) == {
-        "decision_type",
-        "request_id",
-        "summary",
-    }
-    assert tool.input_schema["required"] == [
-        "decision_type",
-        "request_id",
-        "summary",
-    ]
+    assert set(tool.input_schema["properties"]) == {"plan_id", "step_id"}
+    assert tool.input_schema["required"] == ["plan_id", "step_id"]
+    assert tool.input_schema["additionalProperties"] is False
 
 
 def test_human_decision_tool_allows_permissions():

@@ -349,6 +349,173 @@ class SqliteNavigationPlanRepository:
         self._ensure_within_limit(payload, label="current step")
         return payload
 
+    def claim_step(self, plan_id: str, step_id: str, action: str) -> bool:
+        """Atomically claim one pending ledger step for exactly-once invocation."""
+        with self._connect() as connection:
+            cursor = connection.execute(
+                """
+                UPDATE navigation_task_steps
+                SET status = 'running', started_at = ?
+                WHERE plan_id = ? AND step_id = ? AND tool_name = ?
+                  AND status = 'pending'
+                  AND EXISTS (
+                      SELECT 1 FROM navigation_plans
+                      WHERE navigation_plans.plan_id = navigation_task_steps.plan_id
+                        AND navigation_plans.status = 'active'
+                  )
+                """,
+                (utc_now(), plan_id, step_id, action),
+            )
+        return cursor.rowcount == 1
+
+    def mark_waiting_user(self, plan_id: str, step_id: str, action: str) -> bool:
+        """Atomically expose one pending external step as waiting for the user."""
+        with self._connect() as connection:
+            cursor = connection.execute(
+                """
+                UPDATE navigation_task_steps
+                SET status = 'waiting_user', started_at = COALESCE(started_at, ?)
+                WHERE plan_id = ? AND step_id = ? AND tool_name = ?
+                  AND status = 'pending'
+                  AND EXISTS (
+                      SELECT 1 FROM navigation_plans
+                      WHERE navigation_plans.plan_id = navigation_task_steps.plan_id
+                        AND navigation_plans.status = 'active'
+                  )
+                """,
+                (utc_now(), plan_id, step_id, action),
+            )
+        return cursor.rowcount == 1
+
+    def finish_step(
+        self,
+        plan_id: str,
+        step_id: str,
+        *,
+        status: Literal["completed", "failed"],
+        result_summary: dict[str, Any],
+        result_ref: str,
+        expected_statuses: tuple[ExecutionStatus, ...] = ("running",),
+    ) -> bool:
+        """Finish a claimed step once and complete the plan when all steps succeed."""
+        self._ensure_within_limit(result_summary, label="execution result summary")
+        placeholders = ",".join("?" for _ in expected_statuses)
+        connection = self._connect()
+        try:
+            connection.execute("BEGIN IMMEDIATE")
+            cursor = connection.execute(
+                f"""
+                UPDATE navigation_task_steps
+                SET status = ?, result_summary_json = ?, result_ref = ?, finished_at = ?
+                WHERE plan_id = ? AND step_id = ? AND status IN ({placeholders})
+                  AND EXISTS (
+                      SELECT 1 FROM navigation_plans
+                      WHERE navigation_plans.plan_id = navigation_task_steps.plan_id
+                        AND navigation_plans.status = 'active'
+                  )
+                """,
+                (
+                    status,
+                    self._canonical_json(result_summary),
+                    result_ref,
+                    utc_now(),
+                    plan_id,
+                    step_id,
+                    *expected_statuses,
+                ),
+            )
+            if cursor.rowcount != 1:
+                connection.rollback()
+                return False
+            if status == "completed":
+                remaining = connection.execute(
+                    """
+                    SELECT 1 FROM navigation_task_steps
+                    WHERE plan_id = ? AND status != 'completed'
+                    LIMIT 1
+                    """,
+                    (plan_id,),
+                ).fetchone()
+                if remaining is None:
+                    connection.execute(
+                        """
+                        UPDATE navigation_plans
+                        SET status = 'completed', updated_at = ?
+                        WHERE plan_id = ? AND status = 'active'
+                        """,
+                        (utc_now(), plan_id),
+                    )
+            connection.commit()
+            return True
+        except Exception:
+            connection.rollback()
+            raise
+        finally:
+            connection.close()
+
+    def mark_needs_replan(self, plan_id: str, reason: str) -> bool:
+        """Invalidate one active plan and its unfinished ledger in one transaction."""
+        connection = self._connect()
+        try:
+            connection.execute("BEGIN IMMEDIATE")
+            row = connection.execute(
+                "SELECT task_id FROM navigation_plans WHERE plan_id = ? AND status = 'active'",
+                (plan_id,),
+            ).fetchone()
+            if row is None:
+                connection.rollback()
+                return False
+            timestamp = utc_now()
+            connection.execute(
+                """
+                UPDATE navigation_plans
+                SET status = 'invalidated', invalidation_reason = ?, updated_at = ?
+                WHERE plan_id = ? AND status = 'active'
+                """,
+                (reason, timestamp, plan_id),
+            )
+            connection.execute(
+                """
+                UPDATE navigation_task_steps
+                SET status = 'needs_replan', finished_at = ?
+                WHERE plan_id = ? AND status != 'completed'
+                """,
+                (timestamp, plan_id),
+            )
+            connection.execute(
+                """
+                UPDATE navigation_tasks
+                SET status = 'needs_replan', updated_at = ?
+                WHERE task_id = ?
+                """,
+                (timestamp, row["task_id"]),
+            )
+            connection.commit()
+            return True
+        except Exception:
+            connection.rollback()
+            raise
+        finally:
+            connection.close()
+
+    def dependency_statuses(
+        self,
+        plan_id: str,
+        step_ids: list[str],
+    ) -> dict[str, ExecutionStatus]:
+        if not step_ids:
+            return {}
+        placeholders = ",".join("?" for _ in step_ids)
+        with self._connect() as connection:
+            rows = connection.execute(
+                f"""
+                SELECT step_id, status FROM navigation_task_steps
+                WHERE plan_id = ? AND step_id IN ({placeholders})
+                """,
+                (plan_id, *step_ids),
+            ).fetchall()
+        return {row["step_id"]: cast(ExecutionStatus, row["status"]) for row in rows}
+
     def _insert_ledger_rows(
         self,
         connection: sqlite3.Connection,

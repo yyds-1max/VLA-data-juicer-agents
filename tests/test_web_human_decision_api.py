@@ -65,6 +65,25 @@ def test_human_decision_confirm_is_accepted_and_forwarded(tmp_path) -> None:
     assert runtime.decisions == [(session_id, payload)]
 
 
+def test_plan_bound_human_decision_ids_are_forwarded_to_runtime(tmp_path) -> None:
+    runtime = FakeAgentScopeRuntime()
+    client = _client(tmp_path, runtime)
+    session_id = _create_session(client)
+    payload = {
+        "action": "confirm",
+        "request_id": "nav-plan-1:confirm",
+        "plan_id": "nav-plan-1",
+        "step_id": "confirm",
+        "tool_call_id": "tool-call-1",
+        "reply_id": "reply-1",
+    }
+
+    response = client.post(f"/api/sessions/{session_id}/human-decisions", json=payload)
+
+    assert response.status_code == 200
+    assert runtime.decisions == [(session_id, payload)]
+
+
 def test_human_decision_confirm_drains_agentscope_events(tmp_path) -> None:
     runtime = FakeAgentScopeRuntime()
     runtime.events = [

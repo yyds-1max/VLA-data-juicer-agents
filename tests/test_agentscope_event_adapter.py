@@ -218,6 +218,34 @@ def test_require_external_execution_emits_human_decision_required():
     ]
 
 
+def test_plan_bound_external_decision_preserves_only_plan_and_step_metadata():
+    scope, events = _scope_and_events()
+    adapter = AgentScopeEventAdapter(scope)
+
+    adapter.accept(
+        RequireExternalExecutionEvent(
+            reply_id="reply-1",
+            tool_calls=[
+                ToolCallBlock(
+                    id="decision-1",
+                    name="request_human_decision",
+                    input=json.dumps({"plan_id": "plan-1", "step_id": "confirm"}),
+                )
+            ],
+        )
+    )
+
+    assert events[0]["payload"] == {
+        "reply_id": "reply-1",
+        "tool_call_id": "decision-1",
+        "decision_type": "other",
+        "request_id": "",
+        "summary": "",
+        "plan_id": "plan-1",
+        "step_id": "confirm",
+    }
+
+
 def test_removed_calibration_external_tool_is_ignored():
     scope, events = _scope_and_events()
     adapter = AgentScopeEventAdapter(scope)

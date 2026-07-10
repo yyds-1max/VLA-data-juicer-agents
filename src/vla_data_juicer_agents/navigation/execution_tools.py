@@ -201,6 +201,23 @@ def _sensor_source_for_platform_hint(settings: NavigationSettings, platform_hint
     return settings.processing_root / "NoobScenes" / "params" / sensor_param_dir / "sensors"
 
 
+def _validated_sensor_source(
+    settings: NavigationSettings,
+    selected_sensor_source: str | Path | None,
+    platform_hint: str | None,
+) -> Path:
+    if selected_sensor_source is None:
+        return _sensor_source_for_platform_hint(settings, platform_hint)
+    source = Path(selected_sensor_source)
+    if not source.is_absolute():
+        source = settings.processing_root / source
+    source = source.resolve(strict=False)
+    processing_root = settings.processing_root.resolve(strict=False)
+    if not source.is_relative_to(processing_root):
+        raise ValueError("selected_sensor_source must resolve under processing_root")
+    return source
+
+
 def _transform_gridmap_payload(payload: Any) -> Any:
     if not isinstance(payload, dict):
         return payload
@@ -604,6 +621,7 @@ def assemble_finish_temp(
     dry_run: bool = False,
     platform_hint: str | None = None,
     processing_profile: str | None = None,
+    selected_sensor_source: str | Path | None = None,
 ) -> ToolResult:
     date = _validate_date(date)
     settings = settings or NavigationSettings()
@@ -614,7 +632,11 @@ def assemble_finish_temp(
         selected = _selected_segments(clip_date_root, segments)
     finish_temp = settings.finish_data_root / f"{date}_temp"
     samples_date_root = finish_temp / "samples" / date
-    sensor_source = _sensor_source_for_platform_hint(settings, platform_hint)
+    sensor_source = _validated_sensor_source(
+        settings,
+        selected_sensor_source,
+        platform_hint,
+    )
     copied_clips: list[str] = []
 
     for segment in selected:
@@ -671,10 +693,15 @@ def confirm_navigation_calibration_params(
     user_confirmation: str | None = None,
     settings: NavigationSettings | None = None,
     dry_run: bool = False,
+    selected_sensor_source: str | Path | None = None,
 ) -> ToolResult:
     date = _validate_date(date)
     settings = settings or NavigationSettings()
-    sensor_source = _sensor_source_for_platform_hint(settings, platform_hint)
+    sensor_source = _validated_sensor_source(
+        settings,
+        selected_sensor_source,
+        platform_hint,
+    )
     finish_temp = settings.finish_data_root / f"{date}_temp"
     target_copy_path = finish_temp / "samples" / date / "<clip>" / "sensors"
     confirmation_prompt = (

@@ -392,6 +392,38 @@ def test_assemble_finish_temp_copies_only_server_finish_inputs_and_platform_sens
     assert result.details["sensor_source"].endswith("20260529_go2w/sensors")
 
 
+def test_assemble_finish_temp_uses_validated_selected_sensor_source(tmp_path):
+    root = tmp_path / "VLADatasets"
+    processing_root = tmp_path / "processing"
+    clip = root / "clip_data" / "20270605" / "segment-a" / "sync_data" / "clip-a"
+    (clip / "fisheye_front").mkdir(parents=True)
+    selected = processing_root / "NoobScenes" / "params" / "selected" / "sensors"
+    selected.mkdir(parents=True)
+    (selected / "calib.json").write_text('{"selected": true}', encoding="utf-8")
+    settings = NavigationSettings(vladatasets_root=root, processing_root=processing_root)
+
+    result = assemble_finish_temp(
+        "20270605",
+        settings=settings,
+        dry_run=False,
+        platform_hint="go2w",
+        selected_sensor_source=selected,
+    )
+
+    copied = (
+        settings.finish_data_root
+        / "20270605_temp"
+        / "samples"
+        / "20270605"
+        / "clip-a"
+        / "sensors"
+        / "calib.json"
+    )
+    assert result.ok is True
+    assert copied.read_text(encoding="utf-8") == '{"selected": true}'
+    assert result.details["sensor_source"] == str(selected.resolve(strict=False))
+
+
 def test_confirm_navigation_calibration_params_reports_sensor_source(tmp_path):
     processing_root = tmp_path / "processing"
     sensor_source = processing_root / "NoobScenes" / "params" / "20260409_U" / "sensors"

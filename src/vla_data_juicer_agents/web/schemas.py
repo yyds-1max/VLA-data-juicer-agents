@@ -76,6 +76,8 @@ class InterruptResponse(BaseModel):
 class HumanDecisionRequest(BaseModel):
     action: HumanDecisionAction
     request_id: str
+    plan_id: str | None = None
+    step_id: str | None = None
     tool_call_id: str
     reply_id: str
     text: str | None = Field(default=None, validate_default=True)
