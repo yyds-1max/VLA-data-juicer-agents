@@ -50,12 +50,17 @@ def valid_extract_plan_payload() -> dict:
                 "step_id": "prepare_raw",
                 "action": "prepare_raw_data",
                 "variant": "default",
+                "arguments": {},
+                "depends_on": [],
+                "failure_policy": "stop",
+                "decision_refs": [],
             },
             {
                 "step_id": "extract_sync",
                 "action": "extract_and_sync_navigation_data",
                 "variant": "explicit_topic_params",
                 "depends_on": ["prepare_raw"],
+                "failure_policy": "stop",
                 "decision_refs": ["sensor_bindings", "topic_selection", "time_sync"],
                 "arguments": {"processes_num": 8},
             },
@@ -90,19 +95,28 @@ def valid_finish_plan_payload() -> dict:
                 "step_id": "confirm_calibration",
                 "action": "confirm_navigation_calibration_params",
                 "variant": "default",
+                "arguments": {},
+                "depends_on": [],
+                "failure_policy": "stop",
+                "decision_refs": ["calibration"],
             },
             {
                 "step_id": "prepare_gridmap",
                 "action": "prepare_gridmap_for_projection",
                 "variant": "copy_existing_gridmap",
+                "arguments": {},
                 "depends_on": ["confirm_calibration"],
+                "failure_policy": "stop",
                 "decision_refs": ["gridmap"],
             },
             {
                 "step_id": "projection",
                 "action": "run_projection_and_trajectory",
                 "variant": "cjl_with_gridmap",
+                "arguments": {},
                 "depends_on": ["prepare_gridmap"],
+                "failure_policy": "stop",
+                "decision_refs": ["localization", "gridmap"],
             },
         ],
     }
@@ -120,6 +134,26 @@ def test_extract_plan_has_one_source_for_topic_and_sync_decisions():
 def test_nested_plan_models_forbid_extra_fields():
     payload = valid_extract_plan_payload()
     payload["decisions"]["time_sync"]["invented"] = True
+
+    with pytest.raises(ValidationError):
+        ExtractSyncPlanInput.model_validate(payload)
+
+
+@pytest.mark.parametrize(
+    "field",
+    ["action", "variant", "arguments", "depends_on", "failure_policy", "decision_refs"],
+)
+def test_extract_step_rejects_omitted_model_owned_field(field):
+    step = valid_extract_plan_payload()["steps"][1]
+    step.pop(field)
+
+    with pytest.raises(ValidationError):
+        ExtractSyncStep.model_validate(step)
+
+
+def test_extract_step_rejects_omitted_processes_num():
+    payload = valid_extract_plan_payload()
+    payload["steps"][1]["arguments"].pop("processes_num")
 
     with pytest.raises(ValidationError):
         ExtractSyncPlanInput.model_validate(payload)

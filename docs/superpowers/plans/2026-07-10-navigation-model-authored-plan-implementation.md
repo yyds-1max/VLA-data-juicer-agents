@@ -297,74 +297,74 @@ class EmptyArguments(StrictModel):
 
 
 class ExtractSyncArguments(StrictModel):
-    processes_num: int = Field(default=4, ge=1, le=64)
+    processes_num: int = Field(ge=1, le=64)
 
 
 class StepBase(StrictModel):
     step_id: str = Field(pattern=r"^[a-z][a-z0-9_]*$")
-    depends_on: list[str] = Field(default_factory=list)
-    failure_policy: Literal["stop"] = "stop"
-    decision_refs: list[str] = Field(default_factory=list)
+    depends_on: list[str]
+    failure_policy: Literal["stop"]
+    decision_refs: list[str]
 
 
 class PrepareRawStep(StepBase):
-    action: Literal["prepare_raw_data"] = "prepare_raw_data"
-    variant: Literal["default"] = "default"
-    arguments: EmptyArguments = Field(default_factory=EmptyArguments)
+    action: Literal["prepare_raw_data"]
+    variant: Literal["default"]
+    arguments: EmptyArguments
 
 
 class ExtractSyncStep(StepBase):
-    action: Literal["extract_and_sync_navigation_data"] = "extract_and_sync_navigation_data"
-    variant: Literal["explicit_topic_params"] = "explicit_topic_params"
-    arguments: ExtractSyncArguments = Field(default_factory=ExtractSyncArguments)
+    action: Literal["extract_and_sync_navigation_data"]
+    variant: Literal["explicit_topic_params"]
+    arguments: ExtractSyncArguments
 
 
 class ConfirmCalibrationStep(StepBase):
-    action: Literal["confirm_navigation_calibration_params"] = "confirm_navigation_calibration_params"
-    variant: Literal["default"] = "default"
-    arguments: EmptyArguments = Field(default_factory=EmptyArguments)
+    action: Literal["confirm_navigation_calibration_params"]
+    variant: Literal["default"]
+    arguments: EmptyArguments
 
 
 class AssembleFinishTempStep(StepBase):
-    action: Literal["assemble_finish_temp"] = "assemble_finish_temp"
-    variant: Literal["default"] = "default"
-    arguments: EmptyArguments = Field(default_factory=EmptyArguments)
+    action: Literal["assemble_finish_temp"]
+    variant: Literal["default"]
+    arguments: EmptyArguments
 
 
 class NoobscenePreprocessingStep(StepBase):
-    action: Literal["run_noobscene_preprocessing"] = "run_noobscene_preprocessing"
-    variant: Literal["default"] = "default"
-    arguments: EmptyArguments = Field(default_factory=EmptyArguments)
+    action: Literal["run_noobscene_preprocessing"]
+    variant: Literal["default"]
+    arguments: EmptyArguments
 
 
 class InitialAnnotationStep(StepBase):
-    action: Literal["run_initial_annotation_gui"] = "run_initial_annotation_gui"
-    variant: Literal["human_gui"] = "human_gui"
-    arguments: EmptyArguments = Field(default_factory=EmptyArguments)
+    action: Literal["run_initial_annotation_gui"]
+    variant: Literal["human_gui"]
+    arguments: EmptyArguments
 
 
 class TrackingStep(StepBase):
-    action: Literal["run_tracking"] = "run_tracking"
-    variant: Literal["default"] = "default"
-    arguments: EmptyArguments = Field(default_factory=EmptyArguments)
+    action: Literal["run_tracking"]
+    variant: Literal["default"]
+    arguments: EmptyArguments
 
 
 class PrepareGridmapStep(StepBase):
-    action: Literal["prepare_gridmap_for_projection"] = "prepare_gridmap_for_projection"
+    action: Literal["prepare_gridmap_for_projection"]
     variant: Literal["copy_existing_gridmap", "generate_from_pcd", "skip_if_projection_ready"]
-    arguments: EmptyArguments = Field(default_factory=EmptyArguments)
+    arguments: EmptyArguments
 
 
 class ProjectionStep(StepBase):
-    action: Literal["run_projection_and_trajectory"] = "run_projection_and_trajectory"
+    action: Literal["run_projection_and_trajectory"]
     variant: Literal["cjl_with_gridmap", "cjl_0525_with_gridmap"]
-    arguments: EmptyArguments = Field(default_factory=EmptyArguments)
+    arguments: EmptyArguments
 
 
 class ValidateOutputsStep(StepBase):
-    action: Literal["validate_navigation_outputs"] = "validate_navigation_outputs"
-    variant: Literal["expect_gridmap"] = "expect_gridmap"
-    arguments: EmptyArguments = Field(default_factory=EmptyArguments)
+    action: Literal["validate_navigation_outputs"]
+    variant: Literal["expect_gridmap"]
+    arguments: EmptyArguments
 
 
 ExtractSyncStepInput = Annotated[
@@ -378,6 +378,11 @@ FinishProcessingStepInput = Annotated[
     Field(discriminator="action"),
 ]
 ```
+
+Every model-owned step field shown above is required in submitted JSON, including
+single-value `action`, `variant`, and `failure_policy` literals, empty `arguments`
+objects, and empty `depends_on` or `decision_refs` lists. `processes_num` is also
+required for `extract_and_sync_navigation_data`.
 
 Define the phase inputs exactly once, without request metadata or legacy profile copies:
 
