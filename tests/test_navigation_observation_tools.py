@@ -279,6 +279,37 @@ def test_cognitive_tools_bind_task_paginate_evidence_and_describe_active_action(
     assert described["executor_agent_allowed"] is True
 
 
+def test_read_observation_evidence_default_ref_pages_by_character_budget(tmp_path):
+    tools, _, evidence_store = _tools(tmp_path)
+    rows = [f"row-{index:03d}-" + "x" * 300 for index in range(80)]
+    descriptor = evidence_store.write(
+        "nav-observe-1",
+        1,
+        "large_rows",
+        "inspect_large_rows_tool",
+        {"rows": rows, "source": "measured"},
+        "large rows",
+    )
+
+    first = _invoke_tool(
+        tools["read_observation_evidence_tool"],
+        {"ref": descriptor.ref},
+    )
+
+    first_rows = first["data"]["rows"]
+    assert first["data"]["source"] == "measured"
+    assert 0 < len(first_rows) < 50
+    assert first["next_cursor"] == len(first_rows)
+    assert len(json.dumps(first, ensure_ascii=False, separators=(",", ":"))) <= 5_500
+    second = _invoke_tool(
+        tools["read_observation_evidence_tool"],
+        {"ref": descriptor.ref, "cursor": first["next_cursor"]},
+    )
+    assert second["data"]["rows"][0] == rows[first["next_cursor"]]
+    assert second["next_cursor"] == first["next_cursor"] + len(second["data"]["rows"])
+    assert len(json.dumps(second, ensure_ascii=False, separators=(",", ":"))) <= 5_500
+
+
 def test_repeated_inspections_paginate_evidence_and_context_by_character_budget(tmp_path):
     tools, _, _ = _tools(tmp_path)
     for _ in range(30):

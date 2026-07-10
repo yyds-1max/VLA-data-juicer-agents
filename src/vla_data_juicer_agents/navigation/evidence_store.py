@@ -10,7 +10,10 @@ from pathlib import Path
 from typing import Any
 from uuid import uuid4
 
-from vla_data_juicer_agents.navigation.context_budget import ensure_payload_within_limit
+from vla_data_juicer_agents.navigation.context_budget import (
+    ensure_payload_within_limit,
+    serialized_chars,
+)
 from vla_data_juicer_agents.navigation.observation_models import EvidenceDescriptor
 
 
@@ -100,21 +103,59 @@ class FileNavigationEvidenceStore:
 
     @staticmethod
     def _paginate(payload: Any, *, cursor: int, limit: int) -> tuple[Any, int | None]:
-        end = cursor + limit
-        if isinstance(payload, list):
-            return payload[cursor:end], end if end < len(payload) else None
-        if not isinstance(payload, dict):
+        list_extent = FileNavigationEvidenceStore._list_extent(payload)
+        if list_extent is None:
+            response = {"data": payload, "next_cursor": None}
+            ensure_payload_within_limit(
+                response,
+                max_chars=EVIDENCE_READ_MAX_CHARS,
+                label="evidence_read",
+            )
             return payload, None
 
-        page: dict[str, Any] = {}
-        has_more = False
-        for field, value in payload.items():
-            if isinstance(value, list):
-                page[field] = value[cursor:end]
-                has_more = has_more or end < len(value)
-            else:
-                page[field] = value
-        return page, end if has_more else None
+        if cursor >= list_extent:
+            data = FileNavigationEvidenceStore._slice_page(payload, cursor, cursor)
+            response = {"data": data, "next_cursor": None}
+            ensure_payload_within_limit(
+                response,
+                max_chars=EVIDENCE_READ_MAX_CHARS,
+                label="evidence_read",
+            )
+            return data, None
+
+        max_count = min(limit, list_extent - cursor)
+        best: tuple[Any, int | None] | None = None
+        for count in range(1, max_count + 1):
+            end = cursor + count
+            data = FileNavigationEvidenceStore._slice_page(payload, cursor, end)
+            next_cursor = end if end < list_extent else None
+            response = {"data": data, "next_cursor": next_cursor}
+            if serialized_chars(response) <= EVIDENCE_READ_MAX_CHARS:
+                best = (data, next_cursor)
+        if best is None:
+            raise ValueError(
+                f"evidence item at cursor {cursor} exceeds "
+                f"{EVIDENCE_READ_MAX_CHARS}-character response budget"
+            )
+        return best
+
+    @staticmethod
+    def _list_extent(payload: Any) -> int | None:
+        if isinstance(payload, list):
+            return len(payload)
+        if not isinstance(payload, dict):
+            return None
+        lengths = [len(value) for value in payload.values() if isinstance(value, list)]
+        return max(lengths) if lengths else None
+
+    @staticmethod
+    def _slice_page(payload: Any, start: int, end: int) -> Any:
+        if isinstance(payload, list):
+            return payload[start:end]
+        return {
+            field: value[start:end] if isinstance(value, list) else value
+            for field, value in payload.items()
+        }
 
     @staticmethod
     def _atomic_write(destination: Path, encoded: bytes) -> None:

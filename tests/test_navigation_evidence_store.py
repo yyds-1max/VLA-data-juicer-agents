@@ -71,6 +71,24 @@ def test_evidence_read_enforces_public_response_budget(tmp_path):
         store.read("nav-1", descriptor.ref)
 
 
+def test_evidence_read_rejects_single_oversized_page_item_without_repeating_cursor(tmp_path):
+    store = FileNavigationEvidenceStore(tmp_path / "evidence")
+    descriptor = store.write(
+        "nav-1",
+        1,
+        "large_item",
+        "inspect",
+        {"rows": ["x" * 5_600]},
+        "one oversized row",
+    )
+
+    with pytest.raises(
+        ValueError,
+        match=r"evidence item at cursor 0 exceeds 5500-character response budget",
+    ):
+        store.read("nav-1", descriptor.ref)
+
+
 def test_context_budget_counts_compact_unicode_json():
     payload = {"value": "导航"}
 
