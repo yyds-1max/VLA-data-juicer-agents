@@ -10,6 +10,7 @@ from vla_data_juicer_agents.core.cancellation import CancellationContext
 from vla_data_juicer_agents.navigation import agent_tools as agent_tools_module
 from vla_data_juicer_agents.navigation.agent_tools import (
     HumanDecisionTool,
+    PlanBoundHumanDecisionTool,
     build_navigation_agent_tools,
 )
 from vla_data_juicer_agents.navigation.models import (
@@ -142,6 +143,23 @@ def test_human_decision_tool_declares_external_read_only_schema():
     assert tool.name == "request_human_decision"
     assert tool.is_external_tool is True
     assert tool.is_read_only is True
+    assert set(tool.input_schema["properties"]) == {
+        "decision_type",
+        "request_id",
+        "summary",
+    }
+    assert tool.input_schema["required"] == [
+        "decision_type",
+        "request_id",
+        "summary",
+    ]
+    assert tool.input_schema["additionalProperties"] is False
+
+
+def test_plan_bound_human_decision_tool_exposes_only_plan_and_step_ids():
+    tool = PlanBoundHumanDecisionTool()
+
+    assert tool.name == "request_human_decision"
     assert set(tool.input_schema["properties"]) == {"plan_id", "step_id"}
     assert tool.input_schema["required"] == ["plan_id", "step_id"]
     assert tool.input_schema["additionalProperties"] is False

@@ -12,11 +12,14 @@ from vla_data_juicer_agents.core.cancellation import CancellationContext, curren
 from vla_data_juicer_agents.navigation.agent_tools import build_navigation_agent_tools
 from vla_data_juicer_agents.navigation.plan_draft_store import JsonNavigationPlanDraftStore
 from vla_data_juicer_agents.navigation.observation_store import SqliteNavigationObservationStore
+from vla_data_juicer_agents.navigation.plan_models import FinishProcessingPlanInput
+from vla_data_juicer_agents.navigation.plan_store import SqliteNavigationPlanRepository
 from vla_data_juicer_agents.navigation.routing import is_high_confidence_navigation_request
 from vla_data_juicer_agents.navigation.task_state import (
     NavigationTaskPhase,
     NavigationTaskStatus,
 )
+from vla_data_juicer_agents.navigation.task_store import SqliteNavigationTaskStore
 from vla_data_juicer_agents.runtime.agentscope_config import AgentScopeRuntimeConfig
 import vla_data_juicer_agents.runtime.agentscope_runtime as agentscope_runtime_module
 from vla_data_juicer_agents.runtime.agentscope_runtime import AgentScopeRuntime
@@ -352,6 +355,84 @@ def _runtime(
         workspace_manager=object(),
         app=SimpleNamespace(state=state),
     )
+
+
+def _plan_bound_human_runtime(tmp_path: Path, chat_run_registry: FakeChatRunRegistry):
+    workspace_root = tmp_path / "workspace"
+    db_path = workspace_root / "navigation-tasks.sqlite"
+    task_store = SqliteNavigationTaskStore(db_path)
+    task = task_store.create_or_update_task(
+        date="20260710",
+        segments=["segment-a"],
+        scene_mode="out",
+        agentscope_session_id="as-session-1",
+    )
+    task = task_store.update_task(task.task_id, phase="finish_processing", status="pending")
+    plan_store = SqliteNavigationPlanRepository(db_path)
+    plan = plan_store.activate(
+        task,
+        "finish_processing",
+        1,
+        FinishProcessingPlanInput.model_validate(
+            {
+                "decisions": {
+                    "localization": {
+                        "source": "odom",
+                        "conversion": "odom_to_ins",
+                        "reason": "observed",
+                        "evidence_refs": ["evidence:localization"],
+                    },
+                    "gridmap": {
+                        "source": "existing_gridmap",
+                        "reason": "observed",
+                        "evidence_refs": ["evidence:gridmap"],
+                    },
+                    "calibration": {
+                        "mode": "hardcoded_with_user_confirmation",
+                        "selected_sensor_source": "NoobScenes/params/selected/sensors",
+                        "requires_user_confirmation": True,
+                        "reason": "observed",
+                        "evidence_refs": ["evidence:calibration"],
+                    },
+                },
+                "steps": [
+                    {
+                        "step_id": "confirm",
+                        "action": "confirm_navigation_calibration_params",
+                        "variant": "default",
+                        "arguments": {},
+                        "depends_on": [],
+                        "failure_policy": "stop",
+                        "decision_refs": ["calibration"],
+                    }
+                ],
+            }
+        ),
+    )
+    storage = FakeAgentScopeStorage()
+    storage.session_records[("alice", "navigation-data-agent", "as-session-1")] = (
+        _agentscope_session_record(
+            reply_id="reply-1",
+            tool_call_id="confirm-1",
+            tool_name="request_human_decision",
+            tool_input={"plan_id": plan.plan_id, "step_id": "confirm"},
+        )
+    )
+    runtime = _runtime(
+        storage=storage,
+        chat_run_registry=chat_run_registry,
+        workspace_root=workspace_root,
+    )
+    runtime.web_sessions["web-1"] = ("navigation-data-agent", "as-session-1")
+    decision = {
+        "action": "confirm",
+        "request_id": f"{plan.plan_id}:confirm",
+        "plan_id": plan.plan_id,
+        "step_id": "confirm",
+        "tool_call_id": "confirm-1",
+        "reply_id": "reply-1",
+    }
+    return runtime, plan_store, plan, decision
 
 
 def _message_text(message) -> str:
@@ -1200,6 +1281,78 @@ async def test_runtime_submit_human_decision_resumes_calibration_request_human_d
 
 
 @pytest.mark.asyncio
+async def test_plan_bound_human_decision_recovers_after_synchronous_spawn_failure(
+    tmp_path: Path,
+) -> None:
+    registry = FakeChatRunRegistry(reject_duplicate_active=True)
+    runtime, plan_store, plan, decision = _plan_bound_human_runtime(tmp_path, registry)
+    registry.active_session_ids.add("as-session-1")
+
+    with pytest.raises(RuntimeError, match="already active"):
+        await runtime.submit_human_decision(web_session_id="web-1", decision=decision)
+
+    assert plan_store.get_human_decision_handoff(plan.plan_id, "confirm") is not None
+    assert plan_store.get_current_step(plan.plan_id) is None
+    conflicting = {**decision, "action": "stop"}
+    assert (
+        await runtime.submit_human_decision(
+            web_session_id="web-1",
+            decision=conflicting,
+        )
+        is False
+    )
+
+    registry.active_session_ids.clear()
+    accepted = await runtime.submit_human_decision(
+        web_session_id="web-1",
+        decision=decision,
+    )
+    assert accepted is True
+    await registry.drain()
+    assert len(runtime.app.state.chat_service.runs) == 1
+    assert plan_store.get_human_decision_handoff(plan.plan_id, "confirm") is None
+
+
+@pytest.mark.asyncio
+async def test_plan_bound_human_decision_recovers_after_async_run_failure(
+    tmp_path: Path,
+) -> None:
+    registry = FakeChatRunRegistry()
+    runtime, plan_store, plan, decision = _plan_bound_human_runtime(tmp_path, registry)
+
+    class FailOnceChatService(FakeChatService):
+        def __init__(self) -> None:
+            super().__init__()
+            self.attempts = 0
+
+        async def run(self, **kwargs):
+            self.attempts += 1
+            if self.attempts == 1:
+                raise RuntimeError("async AgentScope failure")
+            await super().run(**kwargs)
+
+    runtime.app.state.chat_service = FailOnceChatService()
+
+    assert await runtime.submit_human_decision(web_session_id="web-1", decision=decision)
+    with pytest.raises(RuntimeError, match="async AgentScope failure"):
+        await registry.drain()
+    registry.active_session_ids.discard("as-session-1")
+    assert plan_store.get_human_decision_handoff(plan.plan_id, "confirm") is not None
+
+    assert await runtime.submit_human_decision(web_session_id="web-1", decision=decision)
+    duplicate_while_running = await runtime.submit_human_decision(
+        web_session_id="web-1",
+        decision=decision,
+    )
+    assert duplicate_while_running is False
+    await registry.drain()
+
+    assert runtime.app.state.chat_service.attempts == 2
+    assert len(runtime.app.state.chat_service.runs) == 1
+    assert plan_store.get_human_decision_handoff(plan.plan_id, "confirm") is None
+
+
+@pytest.mark.asyncio
 async def test_runtime_does_not_rehydrate_consumed_human_decision_after_claim_releases(
     tmp_path: Path,
 ) -> None:
@@ -1595,6 +1748,48 @@ async def test_runtime_subscribe_polls_pending_human_decision_before_idle_exit()
             },
         }
     ]
+
+
+@pytest.mark.asyncio
+async def test_plan_bound_human_decision_live_and_pending_paths_are_deduplicated(
+    tmp_path: Path,
+) -> None:
+    registry = FakeChatRunRegistry()
+    runtime, _plan_store, plan, _decision = _plan_bound_human_runtime(
+        tmp_path,
+        registry,
+    )
+    runtime.message_bus = FakeAgentScopeMessageBus(
+        replay_events=[
+            (
+                "1-0",
+                {
+                    "type": "REQUIRE_EXTERNAL_EXECUTION",
+                    "reply_id": "reply-1",
+                    "tool_calls": [
+                        {
+                            "id": "confirm-1",
+                            "name": "request_human_decision",
+                            "input": json.dumps(
+                                {"plan_id": plan.plan_id, "step_id": "confirm"}
+                            ),
+                        }
+                    ],
+                },
+            )
+        ],
+        running_states=[False],
+    )
+
+    events = [
+        event
+        async for event in runtime.subscribe_web_session_events(web_session_id="web-1")
+    ]
+
+    decisions = [event for event in events if event["type"] == "human_decision_required"]
+    assert len(decisions) == 1
+    assert decisions[0]["payload"]["plan_id"] == plan.plan_id
+    assert decisions[0]["payload"]["step_id"] == "confirm"
 
 
 @pytest.mark.asyncio

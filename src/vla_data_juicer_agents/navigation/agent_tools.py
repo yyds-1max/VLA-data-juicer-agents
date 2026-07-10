@@ -50,9 +50,45 @@ class HumanDecisionTool(ToolBase):
 
     name = "request_human_decision"
     description = (
-        "Pause the current immutable navigation-plan step and ask the frontend "
-        "for its stored human decision. The server derives all dialog metadata "
-        "from the plan; callers provide only plan_id and step_id."
+        "Pause navigation workflow execution and ask the frontend to show a "
+        "human decision dialog for calibration confirmation, overwrite/delete "
+        "approval, stop, or user guidance."
+    )
+    input_schema = {
+        "type": "object",
+        "properties": {
+            "decision_type": {
+                "type": "string",
+                "enum": ["camera_params", "overwrite", "delete", "other"],
+            },
+            "request_id": {"type": "string"},
+            "summary": {"type": "string"},
+        },
+        "required": ["decision_type", "request_id", "summary"],
+        "additionalProperties": False,
+    }
+    is_concurrency_safe = False
+    is_read_only = True
+    is_external_tool = True
+
+    async def check_permissions(
+        self,
+        tool_input: dict[str, Any],
+        context: object,
+    ) -> PermissionDecision:
+        return PermissionDecision(
+            behavior=PermissionBehavior.ALLOW,
+            message="Human decision requests are allowed.",
+        )
+
+
+class PlanBoundHumanDecisionTool(ToolBase):
+    """External decision tool scoped to one stored plan ledger step."""
+
+    name = "request_human_decision"
+    description = (
+        "Pause the current immutable navigation-plan step. The server derives "
+        "dialog metadata from the stored plan; provide only plan_id and step_id."
     )
     input_schema = {
         "type": "object",
@@ -67,11 +103,7 @@ class HumanDecisionTool(ToolBase):
     is_read_only = True
     is_external_tool = True
 
-    def __init__(
-        self,
-        *,
-        gate: Any | None = None,
-    ) -> None:
+    def __init__(self, *, gate: Any | None = None) -> None:
         self._gate = gate
 
     async def check_permissions(
@@ -88,7 +120,7 @@ class HumanDecisionTool(ToolBase):
                 )
         return PermissionDecision(
             behavior=PermissionBehavior.ALLOW,
-            message="Human decision requests are allowed.",
+            message="Plan-bound human decision requests are allowed.",
         )
 
 

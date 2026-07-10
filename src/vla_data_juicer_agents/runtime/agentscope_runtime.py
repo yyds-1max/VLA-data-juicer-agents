@@ -384,7 +384,8 @@ class AgentScopeRuntime:
 
             plan_id = decision.get("plan_id")
             step_id = decision.get("step_id")
-            if isinstance(plan_id, str) and isinstance(step_id, str):
+            plan_bound_handoff = isinstance(plan_id, str) and isinstance(step_id, str)
+            if plan_bound_handoff:
                 transitioned = submit_plan_human_decision(
                     plan_store=self._navigation_plan_store(),
                     evidence_store=self._navigation_evidence_store(),
@@ -419,6 +420,24 @@ class AgentScopeRuntime:
                                 agent_id=agent_id,
                                 input_msg=input_msg,
                             )
+                    if plan_bound_handoff:
+                        plan_store = self._navigation_plan_store()
+                        handoff = plan_store.get_human_decision_handoff(
+                            plan_id,
+                            step_id,
+                        )
+                        if handoff is None or not plan_store.acknowledge_human_decision_handoff(
+                            plan_id,
+                            step_id,
+                            handoff.decision_key,
+                        ):
+                            raise RuntimeError(
+                                "plan-bound human decision handoff acknowledgement failed"
+                            )
+                        self._mark_human_decision_consumed(
+                            agentscope_session_id=agentscope_session_id,
+                            decision=decision,
+                        )
                 finally:
                     self.clear_run_cancellation(agentscope_session_id, cancellation)
                     await claim.release()
@@ -435,10 +454,11 @@ class AgentScopeRuntime:
                 else:
                     self.clear_run_cancellation(agentscope_session_id, cancellation)
                 raise
-            self._mark_human_decision_consumed(
-                agentscope_session_id=agentscope_session_id,
-                decision=decision,
-            )
+            if not plan_bound_handoff:
+                self._mark_human_decision_consumed(
+                    agentscope_session_id=agentscope_session_id,
+                    decision=decision,
+                )
             claim_handoff = True
             return True
         finally:
@@ -1278,12 +1298,19 @@ def _human_decision_payload_from_tool_call(
             return None
         plan = plan_store.get(plan_id)
         current = plan_store.get_current_step(plan_id) if plan is not None else None
+        handoff = plan_store.get_human_decision_handoff(plan_id, step_id)
         if (
             plan is None
-            or plan.status != "active"
-            or current is None
-            or current["step"]["step_id"] != step_id
-            or current["step"]["action"] != "confirm_navigation_calibration_params"
+            or (
+                handoff is None
+                and (
+                    plan.status != "active"
+                    or current is None
+                    or current["step"]["step_id"] != step_id
+                    or current["step"]["action"]
+                    != "confirm_navigation_calibration_params"
+                )
+            )
         ):
             return None
         calibration = getattr(getattr(plan.plan, "decisions", None), "calibration", None)

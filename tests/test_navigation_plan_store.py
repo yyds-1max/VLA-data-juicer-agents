@@ -10,6 +10,7 @@ from vla_data_juicer_agents.navigation.plan_models import (
     PlanSubmissionAttempt,
 )
 from vla_data_juicer_agents.navigation.plan_store import SqliteNavigationPlanRepository
+from vla_data_juicer_agents.navigation.plan_store import ActivePlanExecutionConflict
 from vla_data_juicer_agents.navigation.task_state import NavigationTask
 from vla_data_juicer_agents.navigation.task_store import SqliteNavigationTaskStore
 
@@ -176,6 +177,45 @@ def test_activation_creates_immutable_revisions_and_supersedes_previous(tmp_path
     assert repo.get(first.plan_id).plan.model_dump_json() == first_json
     assert repo.get(second.plan_id).status == "active"
     assert repo.get_active(task.task_id, "extract_sync").plan_id == second.plan_id
+
+
+@pytest.mark.parametrize("in_flight_status", ["running", "waiting_user"])
+def test_activation_rejects_supersede_while_active_step_is_in_flight(
+    tmp_path: Path,
+    in_flight_status: str,
+):
+    repo, task = stores_with_task(tmp_path)
+    first = repo.activate(task, "extract_sync", 1, valid_extract_plan())
+    transition = (
+        repo.claim_step(first.plan_id, "prepare", "prepare_raw_data")
+        if in_flight_status == "running"
+        else repo.mark_waiting_user(first.plan_id, "prepare", "prepare_raw_data")
+    )
+    assert transition is True
+
+    with pytest.raises(ActivePlanExecutionConflict):
+        repo.activate(task, "extract_sync", 2, valid_extract_plan())
+
+    assert repo.get_active(task.task_id, "extract_sync").plan_id == first.plan_id
+    assert repo.get_current_step(first.plan_id)["step"]["status"] == in_flight_status
+
+
+def test_activation_rejects_supersede_while_result_outbox_exists(tmp_path: Path):
+    repo, task = stores_with_task(tmp_path)
+    first = repo.activate(task, "extract_sync", 1, valid_extract_plan())
+    assert repo.claim_step(first.plan_id, "prepare", "prepare_raw_data")
+    repo.stage_step_result(
+        first.plan_id,
+        "prepare",
+        target_status="completed",
+        full_result={"ok": True, "tool_name": "prepare_raw_data", "message": "done"},
+        result_summary={"ok": True, "tool_name": "prepare_raw_data", "message": "done"},
+    )
+
+    with pytest.raises(ActivePlanExecutionConflict):
+        repo.activate(task, "extract_sync", 2, valid_extract_plan())
+
+    assert repo.get_staged_step_result(first.plan_id, "prepare") is not None
 
 
 def test_invalidate_removes_plan_from_active_lookup_without_mutating_plan(tmp_path: Path):

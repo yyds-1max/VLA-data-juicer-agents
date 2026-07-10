@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import hashlib
 from pathlib import Path
 from typing import Any, Callable
 
@@ -210,6 +211,15 @@ def _reconcile_execution_entry(
     live = task_store.update_task(stored.task_id, **_task_changes(live))
     invalid_plans: list[NavigationPlanRecord] = []
     for active_plan in active_plans:
+        current = plan_store.get_current_step(active_plan.plan_id)
+        current_step_id = (current or {}).get("step", {}).get("step_id")
+        has_active_staged_result = (
+            isinstance(current_step_id, str)
+            and plan_store.get_staged_step_result(active_plan.plan_id, current_step_id)
+            is not None
+        )
+        if has_active_staged_result:
+            continue
         phase_compatible = live.phase.value == active_plan.phase
         if (
             active_plan.phase == "finish_processing"
@@ -380,11 +390,92 @@ def _terminal_error(
     plan_store: SqliteNavigationPlanRepository,
     plan_id: str,
 ) -> dict[str, Any]:
+    current = plan_store.get_current_step(plan_id)
+    status = (current or {}).get("step", {}).get("status")
+    next_action = (
+        "submit_complete_plan"
+        if status in {"failed", "needs_replan"}
+        else "manual_recovery"
+        if status == "running"
+        else _next_action(plan_store, plan_id)
+    )
     return _compact_error(
         "step_already_terminal",
         "The ledger step was already claimed or finished; the processing function was not invoked again.",
-        next_action=_next_action(plan_store, plan_id),
+        next_action=next_action,
     )
+
+
+def _result_finalize_retry_error() -> dict[str, Any]:
+    return _compact_error(
+        "result_finalize_retry_required",
+        "The processing result is durably staged but evidence or ledger finalization is temporarily incomplete. Retry the same plan_id and step_id; the underlying action will not run again.",
+        next_action="retry_same_plan_step",
+    )
+
+
+def _finalize_staged_result(
+    *,
+    task: NavigationTask,
+    plan: NavigationPlanRecord,
+    step: Any,
+    plan_store: SqliteNavigationPlanRepository,
+    evidence_store: FileNavigationEvidenceStore,
+) -> dict[str, Any]:
+    staged = plan_store.get_staged_step_result(plan.plan_id, step.step_id)
+    if staged is None:
+        return _compact_error(
+            "step_recovery_requires_replan",
+            "The running step has no durable staged result. Replan or perform manual recovery; the underlying action will not be rerun automatically.",
+            next_action="submit_complete_plan",
+        )
+    result_ref = staged.result_ref
+    if result_ref is None:
+        try:
+            descriptor = evidence_store.write(
+                task.task_id,
+                plan.observation_revision,
+                "execution_result",
+                step.action,
+                staged.full_result,
+                f"Execution result for {step.step_id}",
+            )
+            result_ref = descriptor.ref
+            if not plan_store.attach_staged_result_evidence(
+                plan.plan_id,
+                step.step_id,
+                result_ref,
+            ):
+                evidence_store.delete(task.task_id, result_ref)
+                return _result_finalize_retry_error()
+        except Exception:
+            if result_ref is not None:
+                try:
+                    evidence_store.delete(task.task_id, result_ref)
+                except Exception:
+                    pass
+            return _result_finalize_retry_error()
+    try:
+        finalized = plan_store.finalize_staged_step(plan.plan_id, step.step_id)
+    except Exception:
+        return _result_finalize_retry_error()
+    if not finalized:
+        return _result_finalize_retry_error()
+    response = {
+        **staged.result_summary,
+        "plan_id": plan.plan_id,
+        "step_id": step.step_id,
+        "status": staged.target_status,
+        "result_ref": result_ref,
+        "next_action": (
+            _next_action(plan_store, plan.plan_id)
+            if staged.target_status == "completed"
+            else "submit_complete_plan"
+        ),
+    }
+    if len(_canonical_json(response)) > MAX_EXECUTION_READ_CHARS:
+        raise ValueError("plan execution response exceeds 4000 characters")
+    return response
 
 
 def _invoke_plan_step(
@@ -413,6 +504,30 @@ def _invoke_plan_step(
     if gate_error is not None:
         return gate_error
     assert task is not None and plan is not None and step is not None
+    staged = plan_store.get_staged_step_result(plan.plan_id, step.step_id)
+    if staged is not None:
+        return _finalize_staged_result(
+            task=task,
+            plan=plan,
+            step=step,
+            plan_store=plan_store,
+            evidence_store=evidence_store,
+        )
+    current = plan_store.get_current_step(plan.plan_id)
+    current_status = (current or {}).get("step", {}).get("status")
+    if current_status == "running":
+        recovered = plan_store.recover_running_step_without_result(
+            plan.plan_id,
+            step.step_id,
+            "running step has no staged result after process interruption",
+        )
+        if recovered:
+            return _compact_error(
+                "step_recovery_requires_replan",
+                "The running step has no durable staged result. It was moved to needs_replan and will not be rerun automatically.",
+                next_action="submit_complete_plan",
+            )
+        return _terminal_error(plan_store, plan.plan_id)
     if not plan_store.claim_step(plan.plan_id, step.step_id, step.action):
         return _terminal_error(plan_store, plan.plan_id)
 
@@ -434,21 +549,36 @@ def _invoke_plan_step(
             "message": "The current turn was interrupted.",
             "details": {"error_type": "turn_cancelled"},
         }
-        descriptor = evidence_store.write(
-            task.task_id,
-            plan.observation_revision,
-            "execution_result",
-            action,
-            payload,
-            f"Cancelled result for {step.step_id}",
-        )
-        plan_store.finish_step(
-            plan.plan_id,
-            step.step_id,
-            status="failed",
-            result_summary=_result_summary(payload),
-            result_ref=descriptor.ref,
-        )
+        try:
+            plan_store.stage_step_result(
+                plan.plan_id,
+                step.step_id,
+                target_status="failed",
+                full_result=payload,
+                result_summary=_result_summary(payload),
+            )
+            transition = _finalize_staged_result(
+                task=task,
+                plan=plan,
+                step=step,
+                plan_store=plan_store,
+                evidence_store=evidence_store,
+            )
+            if transition.get("error_type") == "result_finalize_retry_required":
+                error = TurnCancelled("The current turn was interrupted.")
+                error.add_note("Cancellation result is staged and requires finalization retry.")
+                raise error
+        except TurnCancelled:
+            raise
+        except Exception as stage_error:
+            plan_store.recover_running_step_without_result(
+                plan.plan_id,
+                step.step_id,
+                "cancellation result could not be staged",
+            )
+            error = TurnCancelled("The current turn was interrupted.")
+            error.add_note(f"Cancellation recovery requires replan: {stage_error!r}")
+            raise error from stage_error
         raise
     except Exception as error:
         payload = {
@@ -458,36 +588,34 @@ def _invoke_plan_step(
             "details": {"error_type": "processing_exception"},
         }
 
-    descriptor = evidence_store.write(
-        task.task_id,
-        plan.observation_revision,
-        "execution_result",
-        action,
-        payload,
-        f"Execution result for {step.step_id}",
-    )
     summary = _result_summary(payload)
     terminal_status = "completed" if summary["ok"] else "failed"
-    if not plan_store.finish_step(
-        plan.plan_id,
-        step.step_id,
-        status=terminal_status,
-        result_summary=summary,
-        result_ref=descriptor.ref,
-    ):
-        evidence_store.delete(task.task_id, descriptor.ref)
-        return _terminal_error(plan_store, plan.plan_id)
-    response = {
-        **summary,
-        "plan_id": plan.plan_id,
-        "step_id": step.step_id,
-        "status": terminal_status,
-        "result_ref": descriptor.ref,
-        "next_action": _next_action(plan_store, plan.plan_id),
-    }
-    if len(_canonical_json(response)) > MAX_EXECUTION_READ_CHARS:
-        raise ValueError("plan execution response exceeds 4000 characters")
-    return response
+    try:
+        plan_store.stage_step_result(
+            plan.plan_id,
+            step.step_id,
+            target_status=terminal_status,
+            full_result=payload,
+            result_summary=summary,
+        )
+    except Exception:
+        plan_store.recover_running_step_without_result(
+            plan.plan_id,
+            step.step_id,
+            "processing result could not be staged after underlying execution",
+        )
+        return _compact_error(
+            "step_recovery_requires_replan",
+            "The underlying action finished but its result could not be staged. The step was moved to needs_replan and will not be rerun automatically.",
+            next_action="submit_complete_plan",
+        )
+    return _finalize_staged_result(
+        task=task,
+        plan=plan,
+        step=step,
+        plan_store=plan_store,
+        evidence_store=evidence_store,
+    )
 
 
 def prepare_plan_human_decision(
@@ -526,20 +654,10 @@ def submit_plan_human_decision(
     decision: dict[str, Any],
 ) -> bool:
     plan = plan_store.get(plan_id)
-    if plan is None or plan.status != "active":
+    if plan is None:
         return False
     step = _plan_step(plan, step_id)
     if step is None or step.action != _EXTERNAL_ACTION:
-        return False
-    current = plan_store.get_current_step(plan_id)
-    if (
-        current is None
-        or current["step"]["step_id"] != step_id
-        or current["step"]["status"] not in {"pending", "waiting_user"}
-    ):
-        return False
-    dependencies = plan_store.dependency_statuses(plan_id, list(step.depends_on))
-    if any(dependencies.get(dependency) != "completed" for dependency in step.depends_on):
         return False
     action = decision.get("action")
     error_type = (
@@ -565,25 +683,56 @@ def submit_plan_human_decision(
             "error_type": error_type,
         },
     }
-    descriptor = evidence_store.write(
-        plan.task_id,
-        plan.observation_revision,
-        "human_decision_result",
-        "request_human_decision",
-        payload,
-        f"Human decision for {step_id}",
-    )
-    updated = plan_store.finish_step(
+    normalized_decision = {
+        "action": action,
+        "text": decision.get("text"),
+        "request_id": decision.get("request_id"),
+        "plan_id": plan_id,
+        "step_id": step_id,
+    }
+    decision_key = human_decision_key(normalized_decision)
+    existing_handoff = plan_store.get_human_decision_handoff(plan_id, step_id)
+    if existing_handoff is None:
+        if plan.status != "active":
+            return False
+        current = plan_store.get_current_step(plan_id)
+        if (
+            current is None
+            or current["step"]["step_id"] != step_id
+            or current["step"]["status"] not in {"pending", "waiting_user"}
+        ):
+            return False
+        dependencies = plan_store.dependency_statuses(plan_id, list(step.depends_on))
+        if any(dependencies.get(dependency) != "completed" for dependency in step.depends_on):
+            return False
+    outcome = plan_store.stage_human_decision_handoff(
         plan_id,
         step_id,
-        status="completed" if payload["ok"] else "failed",
+        decision_key=decision_key,
+        decision=normalized_decision,
+        target_status="completed" if payload["ok"] else "failed",
+        full_result=payload,
         result_summary=_result_summary(payload),
-        result_ref=descriptor.ref,
-        expected_statuses=("pending", "waiting_user"),
     )
-    if not updated:
-        evidence_store.delete(plan.task_id, descriptor.ref)
-    return updated
+    if outcome == "conflict":
+        return False
+    if plan_store.get_staged_step_result(plan_id, step_id) is None:
+        return True
+    task = SqliteNavigationTaskStore(plan_store.db_path).get_task(plan.task_id)
+    if task is None:
+        return False
+    result = _finalize_staged_result(
+        task=task,
+        plan=plan,
+        step=step,
+        plan_store=plan_store,
+        evidence_store=evidence_store,
+    )
+    return result.get("status") in {"completed", "failed"}
+
+
+def human_decision_key(decision: dict[str, Any]) -> str:
+    return hashlib.sha256(_canonical_json(decision).encode("utf-8")).hexdigest()
 
 
 def build_plan_bound_execution_tools(
@@ -634,10 +783,12 @@ def build_plan_bound_execution_tools(
 
     for action in remaining_actions:
         if action == _EXTERNAL_ACTION:
-            from vla_data_juicer_agents.navigation.agent_tools import HumanDecisionTool
+            from vla_data_juicer_agents.navigation.agent_tools import (
+                PlanBoundHumanDecisionTool,
+            )
 
             tools.append(
-                HumanDecisionTool(
+                PlanBoundHumanDecisionTool(
                     gate=lambda tool_input: prepare_plan_human_decision(
                         task=task,
                         plan_store=plan_store,

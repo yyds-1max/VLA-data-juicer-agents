@@ -38,6 +38,31 @@ class _StrictReadModel(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
 
+class ActivePlanExecutionConflict(RuntimeError):
+    """Raised when a replacement would orphan in-flight active-plan work."""
+
+
+class StagedStepResult(_StrictReadModel):
+    plan_id: str
+    step_id: str
+    task_id: str
+    plan_revision: int
+    target_status: Literal["completed", "failed"]
+    expected_statuses: list[ExecutionStatus]
+    full_result: dict[str, Any]
+    result_summary: dict[str, Any]
+    result_ref: str | None = None
+
+
+class HumanDecisionHandoff(_StrictReadModel):
+    plan_id: str
+    step_id: str
+    task_id: str
+    decision_key: str
+    decision: dict[str, Any]
+    status: Literal["pending"] = "pending"
+
+
 class CompactExecutionStep(_StrictReadModel):
     step_id: str
     action: str
@@ -87,6 +112,47 @@ class SqliteNavigationPlanRepository:
                     created_at TEXT NOT NULL,
                     updated_at TEXT NOT NULL,
                     UNIQUE (task_id, phase, plan_revision),
+                    FOREIGN KEY (task_id) REFERENCES navigation_tasks(task_id)
+                        ON DELETE CASCADE
+                )
+                """
+            )
+            connection.execute(
+                """
+                CREATE TABLE IF NOT EXISTS navigation_step_result_outbox (
+                    plan_id TEXT NOT NULL,
+                    step_id TEXT NOT NULL,
+                    task_id TEXT NOT NULL,
+                    plan_revision INTEGER NOT NULL,
+                    target_status TEXT NOT NULL CHECK (target_status IN ('completed', 'failed')),
+                    expected_statuses_json TEXT NOT NULL,
+                    full_result_json TEXT NOT NULL,
+                    result_summary_json TEXT NOT NULL,
+                    result_ref TEXT,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    PRIMARY KEY (plan_id, step_id),
+                    FOREIGN KEY (plan_id) REFERENCES navigation_plans(plan_id)
+                        ON DELETE CASCADE,
+                    FOREIGN KEY (task_id) REFERENCES navigation_tasks(task_id)
+                        ON DELETE CASCADE
+                )
+                """
+            )
+            connection.execute(
+                """
+                CREATE TABLE IF NOT EXISTS navigation_human_decision_handoffs (
+                    plan_id TEXT NOT NULL,
+                    step_id TEXT NOT NULL,
+                    task_id TEXT NOT NULL,
+                    decision_key TEXT NOT NULL,
+                    decision_json TEXT NOT NULL,
+                    status TEXT NOT NULL CHECK (status = 'pending'),
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    PRIMARY KEY (plan_id, step_id),
+                    FOREIGN KEY (plan_id) REFERENCES navigation_plans(plan_id)
+                        ON DELETE CASCADE,
                     FOREIGN KEY (task_id) REFERENCES navigation_tasks(task_id)
                         ON DELETE CASCADE
                 )
@@ -171,6 +237,21 @@ class SqliteNavigationPlanRepository:
             ).fetchone()
             plan_revision = int(revision_row["latest_revision"]) + 1
             timestamp = utc_now()
+            active_row = connection.execute(
+                """
+                SELECT plan_id FROM navigation_plans
+                WHERE task_id = ? AND phase = ? AND status = 'active'
+                """,
+                (task.task_id, phase_value),
+            ).fetchone()
+            if active_row is not None and self._active_plan_has_in_flight_work(
+                connection,
+                active_row["plan_id"],
+            ):
+                raise ActivePlanExecutionConflict(
+                    "cannot supersede an active navigation plan with running, "
+                    "waiting-user, or staged outbox work"
+                )
             connection.execute(
                 """
                 UPDATE navigation_plans
@@ -220,6 +301,39 @@ class SqliteNavigationPlanRepository:
             raise
         finally:
             connection.close()
+
+    @staticmethod
+    def _active_plan_has_in_flight_work(
+        connection: sqlite3.Connection,
+        plan_id: str,
+    ) -> bool:
+        step = connection.execute(
+            """
+            SELECT 1 FROM navigation_task_steps
+            WHERE plan_id = ? AND status IN ('running', 'waiting_user')
+            LIMIT 1
+            """,
+            (plan_id,),
+        ).fetchone()
+        if step is not None:
+            return True
+        outbox = connection.execute(
+            """
+            SELECT 1 FROM navigation_step_result_outbox
+            WHERE plan_id = ? LIMIT 1
+            """,
+            (plan_id,),
+        ).fetchone()
+        if outbox is not None:
+            return True
+        handoff = connection.execute(
+            """
+            SELECT 1 FROM navigation_human_decision_handoffs
+            WHERE plan_id = ? LIMIT 1
+            """,
+            (plan_id,),
+        ).fetchone()
+        return handoff is not None
 
     def get_active(
         self,
@@ -387,27 +501,167 @@ class SqliteNavigationPlanRepository:
             )
         return cursor.rowcount == 1
 
-    def finish_step(
+    def stage_step_result(
         self,
         plan_id: str,
         step_id: str,
         *,
-        status: Literal["completed", "failed"],
+        target_status: Literal["completed", "failed"],
+        full_result: dict[str, Any],
         result_summary: dict[str, Any],
-        result_ref: str,
         expected_statuses: tuple[ExecutionStatus, ...] = ("running",),
-    ) -> bool:
-        """Finish a claimed step once and complete the plan when all steps succeed."""
+    ) -> StagedStepResult:
+        """Durably stage a post-side-effect result before crossing to file evidence."""
         self._ensure_within_limit(result_summary, label="execution result summary")
-        placeholders = ",".join("?" for _ in expected_statuses)
+        if not expected_statuses:
+            raise ValueError("expected_statuses must not be empty")
+        canonical_full = self._canonical_json(full_result)
+        canonical_summary = self._canonical_json(result_summary)
+        canonical_expected = self._canonical_json(list(expected_statuses))
         connection = self._connect()
         try:
             connection.execute("BEGIN IMMEDIATE")
+            existing = connection.execute(
+                """
+                SELECT * FROM navigation_step_result_outbox
+                WHERE plan_id = ? AND step_id = ?
+                """,
+                (plan_id, step_id),
+            ).fetchone()
+            if existing is not None:
+                staged = self._staged_result_from_row(existing)
+                if (
+                    staged.target_status != target_status
+                    or staged.full_result != full_result
+                    or staged.result_summary != result_summary
+                    or staged.expected_statuses != list(expected_statuses)
+                ):
+                    raise RuntimeError("conflicting staged result for navigation step")
+                connection.commit()
+                return staged
+            placeholders = ",".join("?" for _ in expected_statuses)
+            step = connection.execute(
+                f"""
+                SELECT steps.task_id, steps.plan_revision
+                FROM navigation_task_steps AS steps
+                JOIN navigation_plans AS plans ON plans.plan_id = steps.plan_id
+                WHERE steps.plan_id = ? AND steps.step_id = ?
+                  AND steps.status IN ({placeholders})
+                  AND plans.status = 'active'
+                """,
+                (plan_id, step_id, *expected_statuses),
+            ).fetchone()
+            if step is None:
+                raise RuntimeError("navigation step is not claimable for result staging")
+            timestamp = utc_now()
+            connection.execute(
+                """
+                INSERT INTO navigation_step_result_outbox (
+                    plan_id, step_id, task_id, plan_revision, target_status,
+                    expected_statuses_json, full_result_json, result_summary_json,
+                    result_ref, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, ?)
+                """,
+                (
+                    plan_id,
+                    step_id,
+                    step["task_id"],
+                    step["plan_revision"],
+                    target_status,
+                    canonical_expected,
+                    canonical_full,
+                    canonical_summary,
+                    timestamp,
+                    timestamp,
+                ),
+            )
+            connection.commit()
+        except Exception:
+            connection.rollback()
+            raise
+        finally:
+            connection.close()
+        staged = self.get_staged_step_result(plan_id, step_id)
+        if staged is None:
+            raise RuntimeError("staged navigation result was not persisted")
+        return staged
+
+    def get_staged_step_result(
+        self,
+        plan_id: str,
+        step_id: str,
+    ) -> StagedStepResult | None:
+        with self._connect() as connection:
+            row = connection.execute(
+                """
+                SELECT * FROM navigation_step_result_outbox
+                WHERE plan_id = ? AND step_id = ?
+                """,
+                (plan_id, step_id),
+            ).fetchone()
+        return self._staged_result_from_row(row) if row is not None else None
+
+    def attach_staged_result_evidence(
+        self,
+        plan_id: str,
+        step_id: str,
+        result_ref: str,
+    ) -> bool:
+        """Attach task-scoped evidence to a staged result without finishing it."""
+        connection = self._connect()
+        try:
+            connection.execute("BEGIN IMMEDIATE")
+            row = connection.execute(
+                """
+                SELECT result_ref FROM navigation_step_result_outbox
+                WHERE plan_id = ? AND step_id = ?
+                """,
+                (plan_id, step_id),
+            ).fetchone()
+            if row is None:
+                connection.rollback()
+                return False
+            if row["result_ref"] not in {None, result_ref}:
+                raise RuntimeError("staged result already references different evidence")
+            connection.execute(
+                """
+                UPDATE navigation_step_result_outbox
+                SET result_ref = ?, updated_at = ?
+                WHERE plan_id = ? AND step_id = ?
+                """,
+                (result_ref, utc_now(), plan_id, step_id),
+            )
+            connection.commit()
+            return True
+        except Exception:
+            connection.rollback()
+            raise
+        finally:
+            connection.close()
+
+    def finalize_staged_step(self, plan_id: str, step_id: str) -> bool:
+        """Atomically finish one staged ledger step and clear its result outbox."""
+        connection = self._connect()
+        try:
+            connection.execute("BEGIN IMMEDIATE")
+            row = connection.execute(
+                """
+                SELECT * FROM navigation_step_result_outbox
+                WHERE plan_id = ? AND step_id = ?
+                """,
+                (plan_id, step_id),
+            ).fetchone()
+            if row is None or row["result_ref"] is None:
+                connection.rollback()
+                return False
+            staged = self._staged_result_from_row(row)
+            placeholders = ",".join("?" for _ in staged.expected_statuses)
             cursor = connection.execute(
                 f"""
                 UPDATE navigation_task_steps
                 SET status = ?, result_summary_json = ?, result_ref = ?, finished_at = ?
-                WHERE plan_id = ? AND step_id = ? AND status IN ({placeholders})
+                WHERE plan_id = ? AND step_id = ?
+                  AND status IN ({placeholders})
                   AND EXISTS (
                       SELECT 1 FROM navigation_plans
                       WHERE navigation_plans.plan_id = navigation_task_steps.plan_id
@@ -415,19 +669,19 @@ class SqliteNavigationPlanRepository:
                   )
                 """,
                 (
-                    status,
-                    self._canonical_json(result_summary),
-                    result_ref,
+                    staged.target_status,
+                    self._canonical_json(staged.result_summary),
+                    staged.result_ref,
                     utc_now(),
                     plan_id,
                     step_id,
-                    *expected_statuses,
+                    *staged.expected_statuses,
                 ),
             )
             if cursor.rowcount != 1:
                 connection.rollback()
                 return False
-            if status == "completed":
+            if staged.target_status == "completed":
                 remaining = connection.execute(
                     """
                     SELECT 1 FROM navigation_task_steps
@@ -445,6 +699,13 @@ class SqliteNavigationPlanRepository:
                         """,
                         (utc_now(), plan_id),
                     )
+            connection.execute(
+                """
+                DELETE FROM navigation_step_result_outbox
+                WHERE plan_id = ? AND step_id = ?
+                """,
+                (plan_id, step_id),
+            )
             connection.commit()
             return True
         except Exception:
@@ -452,6 +713,203 @@ class SqliteNavigationPlanRepository:
             raise
         finally:
             connection.close()
+
+    def recover_running_step_without_result(
+        self,
+        plan_id: str,
+        step_id: str,
+        reason: str,
+    ) -> bool:
+        """Conservatively invalidate an unrecoverable running step without rerunning it."""
+        connection = self._connect()
+        try:
+            connection.execute("BEGIN IMMEDIATE")
+            row = connection.execute(
+                """
+                SELECT plans.task_id
+                FROM navigation_task_steps AS steps
+                JOIN navigation_plans AS plans ON plans.plan_id = steps.plan_id
+                WHERE steps.plan_id = ? AND steps.step_id = ?
+                  AND steps.status = 'running' AND plans.status = 'active'
+                  AND NOT EXISTS (
+                      SELECT 1 FROM navigation_step_result_outbox AS outbox
+                      WHERE outbox.plan_id = steps.plan_id
+                        AND outbox.step_id = steps.step_id
+                  )
+                """,
+                (plan_id, step_id),
+            ).fetchone()
+            if row is None:
+                connection.rollback()
+                return False
+            timestamp = utc_now()
+            connection.execute(
+                """
+                UPDATE navigation_plans
+                SET status = 'invalidated', invalidation_reason = ?, updated_at = ?
+                WHERE plan_id = ? AND status = 'active'
+                """,
+                (reason, timestamp, plan_id),
+            )
+            connection.execute(
+                """
+                UPDATE navigation_task_steps
+                SET status = 'needs_replan', finished_at = ?
+                WHERE plan_id = ? AND status != 'completed'
+                """,
+                (timestamp, plan_id),
+            )
+            connection.execute(
+                """
+                UPDATE navigation_tasks
+                SET status = 'needs_replan', updated_at = ?
+                WHERE task_id = ?
+                """,
+                (timestamp, row["task_id"]),
+            )
+            connection.commit()
+            return True
+        except Exception:
+            connection.rollback()
+            raise
+        finally:
+            connection.close()
+
+    def stage_human_decision_handoff(
+        self,
+        plan_id: str,
+        step_id: str,
+        *,
+        decision_key: str,
+        decision: dict[str, Any],
+        target_status: Literal["completed", "failed"],
+        full_result: dict[str, Any],
+        result_summary: dict[str, Any],
+    ) -> Literal["created", "existing", "conflict"]:
+        """Persist a decision handoff and its terminal result outbox atomically."""
+        self._ensure_within_limit(result_summary, label="human decision result summary")
+        canonical_decision = self._canonical_json(decision)
+        connection = self._connect()
+        try:
+            connection.execute("BEGIN IMMEDIATE")
+            existing = connection.execute(
+                """
+                SELECT decision_key, decision_json
+                FROM navigation_human_decision_handoffs
+                WHERE plan_id = ? AND step_id = ?
+                """,
+                (plan_id, step_id),
+            ).fetchone()
+            if existing is not None:
+                outcome: Literal["existing", "conflict"] = (
+                    "existing"
+                    if existing["decision_key"] == decision_key
+                    and existing["decision_json"] == canonical_decision
+                    else "conflict"
+                )
+                connection.commit()
+                return outcome
+            row = connection.execute(
+                """
+                SELECT steps.task_id, steps.plan_revision
+                FROM navigation_task_steps AS steps
+                JOIN navigation_plans AS plans ON plans.plan_id = steps.plan_id
+                WHERE steps.plan_id = ? AND steps.step_id = ?
+                  AND steps.tool_name = 'confirm_navigation_calibration_params'
+                  AND steps.status IN ('pending', 'waiting_user')
+                  AND plans.status = 'active'
+                """,
+                (plan_id, step_id),
+            ).fetchone()
+            if row is None:
+                connection.rollback()
+                return "conflict"
+            timestamp = utc_now()
+            connection.execute(
+                """
+                INSERT INTO navigation_human_decision_handoffs (
+                    plan_id, step_id, task_id, decision_key, decision_json,
+                    status, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, 'pending', ?, ?)
+                """,
+                (
+                    plan_id,
+                    step_id,
+                    row["task_id"],
+                    decision_key,
+                    canonical_decision,
+                    timestamp,
+                    timestamp,
+                ),
+            )
+            connection.execute(
+                """
+                INSERT INTO navigation_step_result_outbox (
+                    plan_id, step_id, task_id, plan_revision, target_status,
+                    expected_statuses_json, full_result_json, result_summary_json,
+                    result_ref, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, ?)
+                """,
+                (
+                    plan_id,
+                    step_id,
+                    row["task_id"],
+                    row["plan_revision"],
+                    target_status,
+                    self._canonical_json(["pending", "waiting_user"]),
+                    self._canonical_json(full_result),
+                    self._canonical_json(result_summary),
+                    timestamp,
+                    timestamp,
+                ),
+            )
+            connection.commit()
+            return "created"
+        except Exception:
+            connection.rollback()
+            raise
+        finally:
+            connection.close()
+
+    def get_human_decision_handoff(
+        self,
+        plan_id: str,
+        step_id: str,
+    ) -> HumanDecisionHandoff | None:
+        with self._connect() as connection:
+            row = connection.execute(
+                """
+                SELECT * FROM navigation_human_decision_handoffs
+                WHERE plan_id = ? AND step_id = ?
+                """,
+                (plan_id, step_id),
+            ).fetchone()
+        if row is None:
+            return None
+        return HumanDecisionHandoff(
+            plan_id=row["plan_id"],
+            step_id=row["step_id"],
+            task_id=row["task_id"],
+            decision_key=row["decision_key"],
+            decision=json.loads(row["decision_json"]),
+            status=row["status"],
+        )
+
+    def acknowledge_human_decision_handoff(
+        self,
+        plan_id: str,
+        step_id: str,
+        decision_key: str,
+    ) -> bool:
+        with self._connect() as connection:
+            cursor = connection.execute(
+                """
+                DELETE FROM navigation_human_decision_handoffs
+                WHERE plan_id = ? AND step_id = ? AND decision_key = ?
+                """,
+                (plan_id, step_id, decision_key),
+            )
+        return cursor.rowcount == 1
 
     def mark_needs_replan(self, plan_id: str, reason: str) -> bool:
         """Invalidate one active plan and its unfinished ledger in one transaction."""
@@ -596,4 +1054,18 @@ class SqliteNavigationPlanRepository:
             status=row["status"],
             plan=plan_model.model_validate_json(row["plan_json"]),
             created_at=row["created_at"],
+        )
+
+    @staticmethod
+    def _staged_result_from_row(row: sqlite3.Row) -> StagedStepResult:
+        return StagedStepResult(
+            plan_id=row["plan_id"],
+            step_id=row["step_id"],
+            task_id=row["task_id"],
+            plan_revision=row["plan_revision"],
+            target_status=row["target_status"],
+            expected_statuses=json.loads(row["expected_statuses_json"]),
+            full_result=json.loads(row["full_result_json"]),
+            result_summary=json.loads(row["result_summary_json"]),
+            result_ref=row["result_ref"],
         )

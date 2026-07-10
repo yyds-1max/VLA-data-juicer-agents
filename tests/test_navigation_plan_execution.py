@@ -27,6 +27,7 @@ from vla_data_juicer_agents.navigation.plan_models import (
     FinishProcessingPlanInput,
 )
 from vla_data_juicer_agents.navigation.plan_store import SqliteNavigationPlanRepository
+from vla_data_juicer_agents.navigation.plan_store import ActivePlanExecutionConflict
 from vla_data_juicer_agents.navigation.task_state import NavigationTask
 from vla_data_juicer_agents.navigation.task_store import SqliteNavigationTaskStore
 from vla_data_juicer_agents.runtime.agentscope_runtime import (
@@ -580,6 +581,223 @@ def test_success_persists_full_task_scoped_evidence_but_compact_ledger_and_respo
     assert full["data"]["details"]["full_blob"] == "x" * 4_500
 
 
+def test_activate_rejects_supersede_after_step_claim_without_losing_execution(
+    monkeypatch,
+    tmp_path,
+):
+    services = build_services(tmp_path)
+    invoked = []
+
+    def action(**kwargs):
+        invoked.append(kwargs)
+        with pytest.raises(ActivePlanExecutionConflict):
+            services.plan_store.activate(
+                services.task,
+                "extract_sync",
+                1,
+                extract_plan(),
+            )
+        return ok_result("extract_and_sync_navigation_data")
+
+    monkeypatch.setattr(plan_execution, "extract_and_sync_navigation_data", action)
+
+    result = call_tool(
+        services.tools()["extract_and_sync_navigation_data_tool"],
+        plan_id=services.plan.plan_id,
+        step_id="sync",
+    )
+
+    assert result["ok"] is True
+    assert len(invoked) == 1
+    assert services.plan_store.get(services.plan.plan_id).status == "completed"
+    assert services.plan_store.get_execution_overview(services.plan.plan_id).completed_steps == 1
+
+
+def test_evidence_write_failure_recovers_from_durable_result_without_reinvoking(
+    monkeypatch,
+    tmp_path,
+):
+    services = build_services(tmp_path)
+    invoked = []
+    monkeypatch.setattr(
+        plan_execution,
+        "extract_and_sync_navigation_data",
+        lambda **kwargs: invoked.append(kwargs)
+        or ok_result("extract_and_sync_navigation_data"),
+    )
+    original_write = services.evidence_store.write
+    writes = 0
+
+    def flaky_write(*args, **kwargs):
+        nonlocal writes
+        writes += 1
+        if writes == 1:
+            raise OSError("temporary evidence outage")
+        return original_write(*args, **kwargs)
+
+    monkeypatch.setattr(services.evidence_store, "write", flaky_write)
+    tool = services.tools()["extract_and_sync_navigation_data_tool"]
+
+    first = call_tool(tool, plan_id=services.plan.plan_id, step_id="sync")
+    second = call_tool(tool, plan_id=services.plan.plan_id, step_id="sync")
+
+    assert first["error_type"] == "result_finalize_retry_required"
+    assert second["ok"] is True
+    assert len(invoked) == 1
+    assert services.plan_store.get_staged_step_result(services.plan.plan_id, "sync") is None
+
+
+def test_staged_result_finalizes_before_expected_artifact_phase_advance_invalidates_plan(
+    monkeypatch,
+    tmp_path,
+):
+    services = build_services(tmp_path)
+    invoked = []
+
+    def action(**kwargs):
+        invoked.append(kwargs)
+        segment = services.task.segments[0]
+        (services.settings.clip_data_root / services.task.date / segment / "sync_data").mkdir(
+            parents=True
+        )
+        return ok_result("extract_and_sync_navigation_data")
+
+    monkeypatch.setattr(plan_execution, "extract_and_sync_navigation_data", action)
+    original_write = services.evidence_store.write
+    writes = 0
+
+    def flaky_write(*args, **kwargs):
+        nonlocal writes
+        writes += 1
+        if writes == 1:
+            raise OSError("temporary evidence outage")
+        return original_write(*args, **kwargs)
+
+    monkeypatch.setattr(services.evidence_store, "write", flaky_write)
+    tool = services.tools()["extract_and_sync_navigation_data_tool"]
+
+    first = call_tool(tool, plan_id=services.plan.plan_id, step_id="sync")
+    second = call_tool(tool, plan_id=services.plan.plan_id, step_id="sync")
+
+    assert first["error_type"] == "result_finalize_retry_required"
+    assert second["ok"] is True
+    assert len(invoked) == 1
+    assert services.plan_store.get(services.plan.plan_id).status == "completed"
+
+
+@pytest.mark.parametrize(
+    "method_name",
+    ["attach_staged_result_evidence", "finalize_staged_step"],
+)
+def test_sql_finalize_failure_recovers_without_reinvoking(
+    monkeypatch,
+    tmp_path,
+    method_name,
+):
+    services = build_services(tmp_path)
+    invoked = []
+    evidence_writes = []
+    monkeypatch.setattr(
+        plan_execution,
+        "extract_and_sync_navigation_data",
+        lambda **kwargs: invoked.append(kwargs)
+        or ok_result("extract_and_sync_navigation_data"),
+    )
+    original_write = services.evidence_store.write
+
+    def recording_write(*args, **kwargs):
+        descriptor = original_write(*args, **kwargs)
+        evidence_writes.append(descriptor.ref)
+        return descriptor
+
+    monkeypatch.setattr(services.evidence_store, "write", recording_write)
+    original_method = getattr(services.plan_store, method_name)
+    attempts = 0
+
+    def flaky_method(*args, **kwargs):
+        nonlocal attempts
+        attempts += 1
+        if attempts == 1:
+            raise sqlite3.OperationalError("temporary sqlite failure")
+        return original_method(*args, **kwargs)
+
+    monkeypatch.setattr(services.plan_store, method_name, flaky_method)
+    tool = services.tools()["extract_and_sync_navigation_data_tool"]
+
+    first = call_tool(tool, plan_id=services.plan.plan_id, step_id="sync")
+    second = call_tool(tool, plan_id=services.plan.plan_id, step_id="sync")
+
+    assert first["error_type"] == "result_finalize_retry_required"
+    assert second["ok"] is True
+    assert len(invoked) == 1
+    assert services.plan_store.get_staged_step_result(services.plan.plan_id, "sync") is None
+    if method_name == "finalize_staged_step":
+        assert len(evidence_writes) == 1
+
+
+def test_underlying_exception_stages_failure_and_retry_only_finalizes(
+    monkeypatch,
+    tmp_path,
+):
+    services = build_services(tmp_path)
+    invoked = []
+
+    def explode(**kwargs):
+        invoked.append(kwargs)
+        raise RuntimeError("processor exploded")
+
+    monkeypatch.setattr(plan_execution, "extract_and_sync_navigation_data", explode)
+    original_finalize = services.plan_store.finalize_staged_step
+    attempts = 0
+
+    def flaky_finalize(*args, **kwargs):
+        nonlocal attempts
+        attempts += 1
+        if attempts == 1:
+            raise sqlite3.OperationalError("temporary finalize failure")
+        return original_finalize(*args, **kwargs)
+
+    monkeypatch.setattr(services.plan_store, "finalize_staged_step", flaky_finalize)
+    tool = services.tools()["extract_and_sync_navigation_data_tool"]
+
+    first = call_tool(tool, plan_id=services.plan.plan_id, step_id="sync")
+    second = call_tool(tool, plan_id=services.plan.plan_id, step_id="sync")
+
+    assert first["error_type"] == "result_finalize_retry_required"
+    assert second["ok"] is False
+    assert second["error_type"] == "processing_exception"
+    assert second["next_action"] == "submit_complete_plan"
+    assert len(invoked) == 1
+
+
+def test_running_step_without_staged_result_transitions_to_needs_replan(
+    monkeypatch,
+    tmp_path,
+):
+    services = build_services(tmp_path)
+    invoked = []
+    monkeypatch.setattr(
+        plan_execution,
+        "extract_and_sync_navigation_data",
+        lambda **kwargs: invoked.append(kwargs)
+        or ok_result("extract_and_sync_navigation_data"),
+    )
+    tool = services.tools()["extract_and_sync_navigation_data_tool"]
+    assert services.plan_store.claim_step(
+        services.plan.plan_id,
+        "sync",
+        "extract_and_sync_navigation_data",
+    )
+
+    result = call_tool(tool, plan_id=services.plan.plan_id, step_id="sync")
+
+    assert result["error_type"] == "step_recovery_requires_replan"
+    assert result["next_action"] == "submit_complete_plan"
+    assert invoked == []
+    assert services.plan_store.get(services.plan.plan_id).status == "invalidated"
+    assert services.plan_store.get_current_step(services.plan.plan_id)["step"]["status"] == "needs_replan"
+
+
 def test_failed_step_is_recorded_exactly_once_and_duplicate_does_not_reinvoke(
     monkeypatch,
     tmp_path,
@@ -598,7 +816,9 @@ def test_failed_step_is_recorded_exactly_once_and_duplicate_does_not_reinvoke(
     second = call_tool(tool, plan_id=services.plan.plan_id, step_id="sync")
 
     assert first["ok"] is False
+    assert first["next_action"] == "submit_complete_plan"
     assert second["error_type"] == "step_already_terminal"
+    assert second["next_action"] == "submit_complete_plan"
     assert len(invoked) == 1
     assert services.plan_store.get_current_step(services.plan.plan_id)["step"]["status"] == "failed"
 
@@ -624,6 +844,57 @@ def test_cancelled_execution_never_marks_running_or_invokes(monkeypatch, tmp_pat
 
     assert invoked == []
     assert services.plan_store.get_current_step(services.plan.plan_id)["step"]["status"] == "pending"
+
+
+def test_cancelled_result_finalize_failure_is_recoverable_without_reinvoking(
+    monkeypatch,
+    tmp_path,
+):
+    services = build_services(tmp_path)
+    cancellation = CancellationContext()
+    invoked = []
+
+    def cancel_during_action(**kwargs):
+        invoked.append(kwargs)
+        cancellation.cancel()
+        cancellation.raise_if_cancelled()
+
+    monkeypatch.setattr(
+        plan_execution,
+        "extract_and_sync_navigation_data",
+        cancel_during_action,
+    )
+    original_finalize = services.plan_store.finalize_staged_step
+    attempts = 0
+
+    def flaky_finalize(*args, **kwargs):
+        nonlocal attempts
+        attempts += 1
+        if attempts == 1:
+            raise sqlite3.OperationalError("temporary cancellation finalize failure")
+        return original_finalize(*args, **kwargs)
+
+    monkeypatch.setattr(services.plan_store, "finalize_staged_step", flaky_finalize)
+    tool = services.tools(cancellation=cancellation)["extract_and_sync_navigation_data_tool"]
+
+    with pytest.raises(TurnCancelled):
+        call_tool(tool, plan_id=services.plan.plan_id, step_id="sync")
+
+    staged = services.plan_store.get_staged_step_result(services.plan.plan_id, "sync")
+    assert staged is not None
+    assert staged.target_status == "failed"
+
+    recovery_tool = services.tools()["extract_and_sync_navigation_data_tool"]
+    recovered = call_tool(
+        recovery_tool,
+        plan_id=services.plan.plan_id,
+        step_id="sync",
+    )
+
+    assert recovered["status"] == "failed"
+    assert recovered["error_type"] == "turn_cancelled"
+    assert recovered["next_action"] == "submit_complete_plan"
+    assert len(invoked) == 1
 
 
 def test_resolve_finish_arguments_are_derived_from_task_decisions_and_settings(tmp_path):
@@ -893,7 +1164,8 @@ def test_plan_bound_human_decision_waits_and_transitions_ledger_exactly_once(
         "tool_call_id": "call-1",
     }
     assert first is True
-    assert duplicate is False
+    assert duplicate is True
+    assert plan_store.get_human_decision_handoff(plan.plan_id, "confirm") is not None
     current = plan_store.get_current_step(plan.plan_id)
     assert current["step"]["step_id"] == expected_current
     with sqlite3.connect(db_path) as connection:
