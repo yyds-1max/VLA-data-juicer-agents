@@ -31,7 +31,10 @@ from vla_data_juicer_agents.navigation.observation_store import (
 )
 from vla_data_juicer_agents.navigation.plan_draft import WorkflowPlanDraftState
 from vla_data_juicer_agents.navigation.plan_draft_store import JsonNavigationPlanDraftStore
-from vla_data_juicer_agents.navigation.plan_execution import submit_plan_human_decision
+from vla_data_juicer_agents.navigation.plan_execution import (
+    human_decision_key,
+    submit_plan_human_decision,
+)
 from vla_data_juicer_agents.navigation.plan_store import SqliteNavigationPlanRepository
 from vla_data_juicer_agents.navigation.task_reconciliation import (
     _navigation_scene_mode_for_request,
@@ -374,6 +377,30 @@ class AgentScopeRuntime:
 
         claim_handoff = False
         try:
+            plan_id = decision.get("plan_id")
+            step_id = decision.get("step_id")
+            plan_bound_handoff = isinstance(plan_id, str) and isinstance(step_id, str)
+            plan_store = self._navigation_plan_store() if plan_bound_handoff else None
+            decision_key = (
+                human_decision_key(_durable_plan_decision(decision))
+                if plan_bound_handoff
+                else None
+            )
+            if plan_store is not None:
+                existing = plan_store.get_human_decision_handoff(plan_id, step_id)
+                if existing is not None and existing.delivery_status == "delivered":
+                    if existing.decision_key != decision_key:
+                        return False
+                    if not plan_store.acknowledge_human_decision_handoff(
+                        plan_id, step_id, decision_key
+                    ):
+                        return False
+                    self._mark_human_decision_consumed(
+                        agentscope_session_id=agentscope_session_id,
+                        decision=decision,
+                    )
+                    return True
+
             pending_tool_name = await self._pending_human_decision_tool_name(
                 agent_id=agent_id,
                 agentscope_session_id=agentscope_session_id,
@@ -382,9 +409,6 @@ class AgentScopeRuntime:
             if pending_tool_name is None:
                 return False
 
-            plan_id = decision.get("plan_id")
-            step_id = decision.get("step_id")
-            plan_bound_handoff = isinstance(plan_id, str) and isinstance(step_id, str)
             if plan_bound_handoff:
                 transitioned = submit_plan_human_decision(
                     plan_store=self._navigation_plan_store(),
@@ -394,6 +418,21 @@ class AgentScopeRuntime:
                     decision=decision,
                 )
                 if not transitioned:
+                    return False
+                delivery = plan_store.claim_human_decision_delivery(
+                    plan_id, step_id, decision_key
+                )
+                if delivery == "delivered":
+                    if not plan_store.acknowledge_human_decision_handoff(
+                        plan_id, step_id, decision_key
+                    ):
+                        return False
+                    self._mark_human_decision_consumed(
+                        agentscope_session_id=agentscope_session_id,
+                        decision=decision,
+                    )
+                    return True
+                if delivery != "claimed":
                     return False
 
             result = ToolResultBlock(
@@ -412,16 +451,28 @@ class AgentScopeRuntime:
 
             async def run_with_claim() -> None:
                 try:
-                    async with cancellation.track_agent(agentscope_session_id):
-                        with bind_cancellation(cancellation):
-                            await self.app.state.chat_service.run(
-                                user_id=self.config.user_id,
-                                session_id=agentscope_session_id,
-                                agent_id=agent_id,
-                                input_msg=input_msg,
+                    try:
+                        async with cancellation.track_agent(agentscope_session_id):
+                            with bind_cancellation(cancellation):
+                                await self.app.state.chat_service.run(
+                                    user_id=self.config.user_id,
+                                    session_id=agentscope_session_id,
+                                    agent_id=agent_id,
+                                    input_msg=input_msg,
+                                )
+                    except Exception:
+                        if plan_bound_handoff:
+                            plan_store.finish_human_decision_delivery(
+                                plan_id, step_id, decision_key, delivered=False
                             )
+                        raise
                     if plan_bound_handoff:
-                        plan_store = self._navigation_plan_store()
+                        if not plan_store.finish_human_decision_delivery(
+                            plan_id, step_id, decision_key, delivered=True
+                        ):
+                            raise RuntimeError(
+                                "plan-bound human decision delivery completion failed"
+                            )
                         handoff = plan_store.get_human_decision_handoff(
                             plan_id,
                             step_id,
@@ -446,6 +497,10 @@ class AgentScopeRuntime:
             try:
                 self._spawn_chat_run(run_coroutine, session_id=agentscope_session_id)
             except Exception:
+                if plan_bound_handoff:
+                    plan_store.finish_human_decision_delivery(
+                        plan_id, step_id, decision_key, delivered=False
+                    )
                 if previous_cancellation is not None:
                     self.register_run_cancellation(
                         agentscope_session_id,
@@ -1274,6 +1329,16 @@ def _human_decision_claim_key(agentscope_session_id: str, decision: dict[str, An
         "vla:human-decision:"
         f"{agentscope_session_id}:{decision['reply_id']}:{decision['tool_call_id']}"
     )
+
+
+def _durable_plan_decision(decision: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "action": decision.get("action"),
+        "text": decision.get("text"),
+        "request_id": decision.get("request_id"),
+        "plan_id": decision.get("plan_id"),
+        "step_id": decision.get("step_id"),
+    }
 
 
 def _human_decision_payload_from_tool_call(

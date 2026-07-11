@@ -13,7 +13,10 @@ from vla_data_juicer_agents.navigation.agent_tools import build_navigation_agent
 from vla_data_juicer_agents.navigation.plan_draft_store import JsonNavigationPlanDraftStore
 from vla_data_juicer_agents.navigation.observation_store import SqliteNavigationObservationStore
 from vla_data_juicer_agents.navigation.plan_models import FinishProcessingPlanInput
-from vla_data_juicer_agents.navigation.plan_store import SqliteNavigationPlanRepository
+from vla_data_juicer_agents.navigation.plan_store import (
+    ActivePlanExecutionConflict,
+    SqliteNavigationPlanRepository,
+)
 from vla_data_juicer_agents.navigation.routing import is_high_confidence_navigation_request
 from vla_data_juicer_agents.navigation.task_state import (
     NavigationTaskPhase,
@@ -1353,6 +1356,61 @@ async def test_plan_bound_human_decision_recovers_after_async_run_failure(
 
 
 @pytest.mark.asyncio
+async def test_plan_bound_human_decision_success_then_ack_failure_is_ack_only_after_restart(
+    monkeypatch, tmp_path: Path
+) -> None:
+    registry = FakeChatRunRegistry()
+    runtime, plan_store, plan, decision = _plan_bound_human_runtime(tmp_path, registry)
+    original_ack = SqliteNavigationPlanRepository.acknowledge_human_decision_handoff
+    attempts = 0
+
+    def fail_ack_once(self, *args, **kwargs):
+        nonlocal attempts
+        attempts += 1
+        if attempts == 1:
+            return False
+        return original_ack(self, *args, **kwargs)
+
+    monkeypatch.setattr(
+        SqliteNavigationPlanRepository,
+        "acknowledge_human_decision_handoff",
+        fail_ack_once,
+    )
+    assert await runtime.submit_human_decision(web_session_id="web-1", decision=decision)
+    with pytest.raises(RuntimeError, match="acknowledgement failed"):
+        await registry.drain()
+    handoff = plan_store.get_human_decision_handoff(plan.plan_id, "confirm")
+    assert handoff is not None and handoff.delivery_status == "delivered"
+    assert len(runtime.app.state.chat_service.runs) == 1
+
+    fresh_registry = FakeChatRunRegistry()
+    fresh = _runtime(
+        storage=runtime.storage,
+        chat_run_registry=fresh_registry,
+        workspace_root=tmp_path / "workspace",
+    )
+    fresh.web_sessions["web-1"] = ("navigation-data-agent", "as-session-1")
+
+    assert await fresh.submit_human_decision(web_session_id="web-1", decision=decision)
+    assert fresh_registry.spawns == []
+    assert fresh.app.state.chat_service.runs == []
+    assert plan_store.get_human_decision_handoff(plan.plan_id, "confirm") is None
+
+
+@pytest.mark.asyncio
+async def test_completed_final_human_handoff_blocks_same_phase_activation(tmp_path: Path) -> None:
+    registry = FakeChatRunRegistry()
+    runtime, plan_store, plan, decision = _plan_bound_human_runtime(tmp_path, registry)
+
+    assert await runtime.submit_human_decision(web_session_id="web-1", decision=decision)
+    assert plan_store.get(plan.plan_id).status == "completed"
+    task = SqliteNavigationTaskStore(plan_store.db_path).get_task(plan.task_id)
+    with pytest.raises(ActivePlanExecutionConflict):
+        plan_store.activate(task, "finish_processing", 2, plan.plan)
+    await registry.drain()
+
+
+@pytest.mark.asyncio
 async def test_runtime_does_not_rehydrate_consumed_human_decision_after_claim_releases(
     tmp_path: Path,
 ) -> None:
@@ -2301,3 +2359,27 @@ def test_human_decision_request_allows_non_guidance_without_text(action: str, te
 
     assert request.action == action
     assert request.text == text
+
+
+@pytest.mark.parametrize(
+    "field,value",
+    [
+        ("request_id", "x" * 513),
+        ("plan_id", "x" * 513),
+        ("step_id", "x" * 513),
+        ("tool_call_id", "x" * 513),
+        ("reply_id", "x" * 513),
+        ("text", "x" * 4001),
+    ],
+)
+def test_human_decision_request_enforces_string_capacity(field: str, value: str) -> None:
+    payload = {
+        "action": "guide" if field == "text" else "confirm",
+        "request_id": "request-1",
+        "tool_call_id": "tool-1",
+        "reply_id": "reply-1",
+        "text": "ok" if field == "text" else None,
+        field: value,
+    }
+    with pytest.raises(ValueError, match="at most"):
+        HumanDecisionRequest(**payload)

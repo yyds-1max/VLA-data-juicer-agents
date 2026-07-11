@@ -54,6 +54,55 @@ def test_evidence_write_is_canonical_and_survives_store_restart(tmp_path):
     }
 
 
+def test_supplied_deterministic_ref_is_idempotent_and_rejects_different_payload(tmp_path):
+    root = tmp_path / "evidence"
+    store = FileNavigationEvidenceStore(root)
+    ref = store.deterministic_ref("nav-1", 4, "plan-1:step-1:result-digest")
+
+    first = store.write_with_ref(
+        "nav-1",
+        4,
+        "execution_result",
+        "step-1",
+        {"ok": True, "nested": {"value": 1}},
+        "result",
+        ref=ref,
+    )
+    restarted = FileNavigationEvidenceStore(root)
+    duplicate = restarted.write_with_ref(
+        "nav-1",
+        4,
+        "execution_result",
+        "step-1",
+        {"nested": {"value": 1}, "ok": True},
+        "result",
+        ref=ref,
+    )
+
+    assert duplicate.ref == first.ref == ref
+    assert len(list((root / "nav-1" / "4").glob("*.json"))) == 1
+    with pytest.raises(ValueError, match="different payload"):
+        restarted.write_with_ref(
+            "nav-1",
+            4,
+            "execution_result",
+            "step-1",
+            {"ok": False},
+            "result",
+            ref=ref,
+        )
+    with pytest.raises(PermissionError):
+        restarted.write_with_ref(
+            "nav-2",
+            4,
+            "execution_result",
+            "step-1",
+            {"ok": True, "nested": {"value": 1}},
+            "result",
+            ref=ref,
+        )
+
+
 def test_evidence_read_paginates_top_level_lists(tmp_path):
     store = FileNavigationEvidenceStore(tmp_path / "evidence")
     descriptor = store.write("nav-1", 1, "rows", "inspect", list(range(6)), "six rows")

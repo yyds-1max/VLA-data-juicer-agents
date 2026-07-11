@@ -38,7 +38,9 @@ from vla_data_juicer_agents.navigation.plan_models import (
     NavigationPlanRecord,
 )
 from vla_data_juicer_agents.navigation.plan_store import (
+    ActivePlanExecutionConflict,
     MAX_EXECUTION_READ_CHARS,
+    MAX_RESULT_OUTBOX_CHARS,
     SqliteNavigationPlanRepository,
 )
 from vla_data_juicer_agents.navigation.task_reconciliation import (
@@ -60,6 +62,9 @@ _PROCESSING_ACTIONS = {
     "validate_navigation_outputs",
 }
 _EXTERNAL_ACTION = "confirm_navigation_calibration_params"
+_SENSITIVE_KEYS = {
+    "password", "token", "secret", "authorization", "api_key", "cookie"
+}
 
 
 def _canonical_json(payload: Any) -> str:
@@ -70,6 +75,37 @@ def _canonical_json(payload: Any) -> str:
         separators=(",", ":"),
         default=str,
     )
+
+
+def _redact_sensitive(payload: Any) -> Any:
+    if isinstance(payload, dict):
+        return {
+            key: "[REDACTED]" if str(key).lower() in _SENSITIVE_KEYS else _redact_sensitive(value)
+            for key, value in payload.items()
+        }
+    if isinstance(payload, list):
+        return [_redact_sensitive(value) for value in payload]
+    if isinstance(payload, tuple):
+        return [_redact_sensitive(value) for value in payload]
+    return payload
+
+
+def _bounded_result_payload(payload: dict[str, Any], *, action: str) -> tuple[dict[str, Any], bool]:
+    redacted = _redact_sensitive(payload)
+    canonical = _canonical_json(redacted)
+    if len(canonical.encode("utf-8")) <= MAX_RESULT_OUTBOX_CHARS:
+        return redacted, False
+    return {
+        "ok": False,
+        "tool_name": action[:200],
+        "message": "Processing returned an oversized result; the bounded digest is retained and replanning is required.",
+        "details": {
+            "error_type": "processing_result_oversized",
+            "sha256": hashlib.sha256(canonical.encode("utf-8")).hexdigest(),
+            "original_bytes": len(canonical.encode("utf-8")),
+            "limit_bytes": MAX_RESULT_OUTBOX_CHARS,
+        },
+    }, True
 
 
 def _compact_error(error_type: str, message: str, **details: Any) -> dict[str, Any]:
@@ -208,7 +244,6 @@ def _reconcile_execution_entry(
         if (active := plan_store.get_active(stored.task_id, phase)) is not None
     ]
     live = reconcile_navigation_task(stored, settings=settings)
-    live = task_store.update_task(stored.task_id, **_task_changes(live))
     invalid_plans: list[NavigationPlanRecord] = []
     for active_plan in active_plans:
         current = plan_store.get_current_step(active_plan.plan_id)
@@ -233,16 +268,32 @@ def _reconcile_execution_entry(
     if invalid_plans:
         for active_plan in invalid_plans:
             if active_plan.status == "active":
-                plan_store.mark_needs_replan(
-                    active_plan.plan_id,
-                    "artifact reconciliation invalidated the stored execution plan",
-                )
+                try:
+                    plan_store.mark_needs_replan(
+                        active_plan.plan_id,
+                        "artifact reconciliation invalidated the stored execution plan",
+                    )
+                except ActivePlanExecutionConflict:
+                    return stored, _compact_error(
+                        "plan_mutation_blocked_by_execution",
+                        "Artifact reconciliation cannot invalidate a plan while its result or handoff is in flight. Retry the current step recovery first.",
+                        next_action="retry_same_plan_step",
+                    )
         return live, _compact_error(
             "plan_invalidated_by_artifacts",
             "Artifact reconciliation produced facts incompatible with the active plan; replan before execution.",
             next_action="submit_complete_plan",
         )
-    return live, None
+    has_any_staged_result = any(
+        plan_store.get_staged_step_result(
+            active_plan.plan_id,
+            ((plan_store.get_current_step(active_plan.plan_id) or {}).get("step") or {}).get("step_id", ""),
+        ) is not None
+        for active_plan in active_plans
+    )
+    if has_any_staged_result:
+        return stored, None
+    return task_store.update_task(stored.task_id, **_task_changes(live)), None
 
 
 def _plan_step(plan: NavigationPlanRecord, step_id: str) -> Any | None:
@@ -421,6 +472,7 @@ def _finalize_staged_result(
     step: Any,
     plan_store: SqliteNavigationPlanRepository,
     evidence_store: FileNavigationEvidenceStore,
+    settings: NavigationSettings | None,
 ) -> dict[str, Any]:
     staged = plan_store.get_staged_step_result(plan.plan_id, step.step_id)
     if staged is None:
@@ -431,36 +483,40 @@ def _finalize_staged_result(
         )
     result_ref = staged.result_ref
     if result_ref is None:
-        try:
-            descriptor = evidence_store.write(
+        return _result_finalize_retry_error()
+    try:
+        if not evidence_store.exists(task.task_id, result_ref):
+            evidence_store.write(
                 task.task_id,
                 plan.observation_revision,
                 "execution_result",
                 step.action,
                 staged.full_result,
                 f"Execution result for {step.step_id}",
+                ref=result_ref,
             )
-            result_ref = descriptor.ref
-            if not plan_store.attach_staged_result_evidence(
-                plan.plan_id,
-                step.step_id,
-                result_ref,
-            ):
-                evidence_store.delete(task.task_id, result_ref)
-                return _result_finalize_retry_error()
-        except Exception:
-            if result_ref is not None:
-                try:
-                    evidence_store.delete(task.task_id, result_ref)
-                except Exception:
-                    pass
+        if not plan_store.attach_staged_result_evidence(
+            plan.plan_id, step.step_id, result_ref
+        ):
             return _result_finalize_retry_error()
+    except Exception:
+        return _result_finalize_retry_error()
     try:
         finalized = plan_store.finalize_staged_step(plan.plan_id, step.step_id)
     except Exception:
         return _result_finalize_retry_error()
     if not finalized:
         return _result_finalize_retry_error()
+    stored_task = SqliteNavigationTaskStore(plan_store.db_path).get_task(task.task_id)
+    if stored_task is not None and settings is not None:
+        try:
+            reconciled = reconcile_navigation_task(stored_task, settings=settings)
+            SqliteNavigationTaskStore(plan_store.db_path).update_task(
+                stored_task.task_id,
+                **_task_changes(reconciled),
+            )
+        except Exception:
+            pass
     response = {
         **staged.result_summary,
         "plan_id": plan.plan_id,
@@ -512,6 +568,7 @@ def _invoke_plan_step(
             step=step,
             plan_store=plan_store,
             evidence_store=evidence_store,
+            settings=settings,
         )
     current = plan_store.get_current_step(plan.plan_id)
     current_status = (current or {}).get("step", {}).get("status")
@@ -563,6 +620,7 @@ def _invoke_plan_step(
                 step=step,
                 plan_store=plan_store,
                 evidence_store=evidence_store,
+                settings=settings,
             )
             if transition.get("error_type") == "result_finalize_retry_required":
                 error = TurnCancelled("The current turn was interrupted.")
@@ -588,6 +646,7 @@ def _invoke_plan_step(
             "details": {"error_type": "processing_exception"},
         }
 
+    payload, oversized = _bounded_result_payload(payload, action=action)
     summary = _result_summary(payload)
     terminal_status = "completed" if summary["ok"] else "failed"
     try:
@@ -609,13 +668,22 @@ def _invoke_plan_step(
             "The underlying action finished but its result could not be staged. The step was moved to needs_replan and will not be rerun automatically.",
             next_action="submit_complete_plan",
         )
-    return _finalize_staged_result(
+    response = _finalize_staged_result(
         task=task,
         plan=plan,
         step=step,
         plan_store=plan_store,
         evidence_store=evidence_store,
+        settings=settings,
     )
+    if oversized and response.get("error_type") != "result_finalize_retry_required":
+        plan_store.mark_needs_replan(
+            plan.plan_id,
+            "processing result exceeded the durable outbox payload policy",
+        )
+        response["status"] = "needs_replan"
+        response["next_action"] = "submit_complete_plan"
+    return response
 
 
 def prepare_plan_human_decision(
@@ -683,13 +751,13 @@ def submit_plan_human_decision(
             "error_type": error_type,
         },
     }
-    normalized_decision = {
+    normalized_decision = _redact_sensitive({
         "action": action,
         "text": decision.get("text"),
         "request_id": decision.get("request_id"),
         "plan_id": plan_id,
         "step_id": step_id,
-    }
+    })
     decision_key = human_decision_key(normalized_decision)
     existing_handoff = plan_store.get_human_decision_handoff(plan_id, step_id)
     if existing_handoff is None:
@@ -727,6 +795,7 @@ def submit_plan_human_decision(
         step=step,
         plan_store=plan_store,
         evidence_store=evidence_store,
+        settings=None,
     )
     return result.get("status") in {"completed", "failed"}
 

@@ -75,12 +75,12 @@ class InterruptResponse(BaseModel):
 
 class HumanDecisionRequest(BaseModel):
     action: HumanDecisionAction
-    request_id: str
-    plan_id: str | None = None
-    step_id: str | None = None
-    tool_call_id: str
-    reply_id: str
-    text: str | None = Field(default=None, validate_default=True)
+    request_id: str = Field(max_length=512)
+    plan_id: str | None = Field(default=None, max_length=512)
+    step_id: str | None = Field(default=None, max_length=512)
+    tool_call_id: str = Field(max_length=512)
+    reply_id: str = Field(max_length=512)
+    text: str | None = Field(default=None, max_length=4000, validate_default=True)
 
     @field_validator("text")
     @classmethod

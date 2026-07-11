@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import hashlib
 import sqlite3
 from pathlib import Path
 from typing import Any, Literal, cast
@@ -23,6 +24,8 @@ from vla_data_juicer_agents.navigation.task_store import (
 
 PLAN_CONTRACT_VERSION = "navigation-plan-v2"
 MAX_EXECUTION_READ_CHARS = 4000
+MAX_RESULT_OUTBOX_CHARS = 262_144
+MAX_HUMAN_DECISION_CHARS = 16_384
 PlanPhase = Literal["extract_sync", "finish_processing"]
 ExecutionStatus = Literal[
     "pending",
@@ -61,6 +64,7 @@ class HumanDecisionHandoff(_StrictReadModel):
     decision_key: str
     decision: dict[str, Any]
     status: Literal["pending"] = "pending"
+    delivery_status: Literal["pending", "delivering", "delivered"] = "pending"
 
 
 class CompactExecutionStep(_StrictReadModel):
@@ -148,6 +152,9 @@ class SqliteNavigationPlanRepository:
                     decision_key TEXT NOT NULL,
                     decision_json TEXT NOT NULL,
                     status TEXT NOT NULL CHECK (status = 'pending'),
+                    delivery_status TEXT NOT NULL DEFAULT 'pending' CHECK (
+                        delivery_status IN ('pending', 'delivering', 'delivered')
+                    ),
                     created_at TEXT NOT NULL,
                     updated_at TEXT NOT NULL,
                     PRIMARY KEY (plan_id, step_id),
@@ -165,6 +172,17 @@ class SqliteNavigationPlanRepository:
                 WHERE status = 'active'
                 """
             )
+            handoff_columns = {
+                row["name"]
+                for row in connection.execute(
+                    "PRAGMA table_info(navigation_human_decision_handoffs)"
+                ).fetchall()
+            }
+            if "delivery_status" not in handoff_columns:
+                connection.execute(
+                    """ALTER TABLE navigation_human_decision_handoffs
+                       ADD COLUMN delivery_status TEXT NOT NULL DEFAULT 'pending'"""
+                )
             connection.execute(
                 """
                 CREATE TABLE IF NOT EXISTS navigation_plan_submission_attempts (
@@ -244,9 +262,10 @@ class SqliteNavigationPlanRepository:
                 """,
                 (task.task_id, phase_value),
             ).fetchone()
-            if active_row is not None and self._active_plan_has_in_flight_work(
+            if self._task_phase_has_in_flight_work(
                 connection,
-                active_row["plan_id"],
+                task.task_id,
+                phase_value,
             ):
                 raise ActivePlanExecutionConflict(
                     "cannot supersede an active navigation plan with running, "
@@ -335,6 +354,34 @@ class SqliteNavigationPlanRepository:
         ).fetchone()
         return handoff is not None
 
+    @staticmethod
+    def _task_phase_has_in_flight_work(
+        connection: sqlite3.Connection,
+        task_id: str,
+        phase: str,
+    ) -> bool:
+        row = connection.execute(
+            """
+            SELECT 1
+            FROM navigation_plans AS plans
+            LEFT JOIN navigation_task_steps AS steps
+              ON steps.plan_id = plans.plan_id
+            LEFT JOIN navigation_step_result_outbox AS outbox
+              ON outbox.plan_id = plans.plan_id
+            LEFT JOIN navigation_human_decision_handoffs AS handoffs
+              ON handoffs.plan_id = plans.plan_id
+            WHERE plans.task_id = ? AND plans.phase = ?
+              AND (
+                steps.status IN ('running', 'waiting_user')
+                OR outbox.plan_id IS NOT NULL
+                OR handoffs.plan_id IS NOT NULL
+              )
+            LIMIT 1
+            """,
+            (task_id, phase),
+        ).fetchone()
+        return row is not None
+
     def get_active(
         self,
         task_id: str,
@@ -360,8 +407,20 @@ class SqliteNavigationPlanRepository:
         return self._record_from_row(row) if row is not None else None
 
     def invalidate(self, plan_id: str, reason: str) -> NavigationPlanRecord:
-        with self._connect() as connection:
-            cursor = connection.execute(
+        connection = self._connect()
+        try:
+            connection.execute("BEGIN IMMEDIATE")
+            row = connection.execute(
+                "SELECT task_id, phase FROM navigation_plans WHERE plan_id = ?",
+                (plan_id,),
+            ).fetchone()
+            if row is None:
+                raise KeyError(plan_id)
+            if self._active_plan_has_in_flight_work(connection, plan_id):
+                raise ActivePlanExecutionConflict(
+                    "cannot invalidate a navigation plan with in-flight work"
+                )
+            connection.execute(
                 """
                 UPDATE navigation_plans
                 SET status = 'invalidated', invalidation_reason = ?, updated_at = ?
@@ -369,8 +428,12 @@ class SqliteNavigationPlanRepository:
                 """,
                 (reason, utc_now(), plan_id),
             )
-            if cursor.rowcount == 0:
-                raise KeyError(plan_id)
+            connection.commit()
+        except Exception:
+            connection.rollback()
+            raise
+        finally:
+            connection.close()
         record = self.get(plan_id)
         if record is None:
             raise KeyError(plan_id)
@@ -516,6 +579,10 @@ class SqliteNavigationPlanRepository:
         if not expected_statuses:
             raise ValueError("expected_statuses must not be empty")
         canonical_full = self._canonical_json(full_result)
+        if len(canonical_full.encode("utf-8")) > MAX_RESULT_OUTBOX_CHARS:
+            raise ValueError(
+                f"execution result exceeds {MAX_RESULT_OUTBOX_CHARS} byte outbox limit"
+            )
         canonical_summary = self._canonical_json(result_summary)
         canonical_expected = self._canonical_json(list(expected_statuses))
         connection = self._connect()
@@ -542,7 +609,7 @@ class SqliteNavigationPlanRepository:
             placeholders = ",".join("?" for _ in expected_statuses)
             step = connection.execute(
                 f"""
-                SELECT steps.task_id, steps.plan_revision
+                SELECT steps.task_id, steps.plan_revision, plans.observation_revision
                 FROM navigation_task_steps AS steps
                 JOIN navigation_plans AS plans ON plans.plan_id = steps.plan_id
                 WHERE steps.plan_id = ? AND steps.step_id = ?
@@ -560,7 +627,7 @@ class SqliteNavigationPlanRepository:
                     plan_id, step_id, task_id, plan_revision, target_status,
                     expected_statuses_json, full_result_json, result_summary_json,
                     result_ref, created_at, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, ?)
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     plan_id,
@@ -571,6 +638,13 @@ class SqliteNavigationPlanRepository:
                     canonical_expected,
                     canonical_full,
                     canonical_summary,
+                    self._intended_result_ref(
+                        step["task_id"],
+                        int(step["observation_revision"]),
+                        plan_id,
+                        step_id,
+                        canonical_full,
+                    ),
                     timestamp,
                     timestamp,
                 ),
@@ -789,6 +863,15 @@ class SqliteNavigationPlanRepository:
         """Persist a decision handoff and its terminal result outbox atomically."""
         self._ensure_within_limit(result_summary, label="human decision result summary")
         canonical_decision = self._canonical_json(decision)
+        canonical_full = self._canonical_json(full_result)
+        if len(canonical_decision.encode("utf-8")) > MAX_HUMAN_DECISION_CHARS:
+            raise ValueError(
+                f"human decision exceeds {MAX_HUMAN_DECISION_CHARS} byte limit"
+            )
+        if len(canonical_full.encode("utf-8")) > MAX_RESULT_OUTBOX_CHARS:
+            raise ValueError(
+                f"human result exceeds {MAX_RESULT_OUTBOX_CHARS} byte outbox limit"
+            )
         connection = self._connect()
         try:
             connection.execute("BEGIN IMMEDIATE")
@@ -811,7 +894,7 @@ class SqliteNavigationPlanRepository:
                 return outcome
             row = connection.execute(
                 """
-                SELECT steps.task_id, steps.plan_revision
+                SELECT steps.task_id, steps.plan_revision, plans.observation_revision
                 FROM navigation_task_steps AS steps
                 JOIN navigation_plans AS plans ON plans.plan_id = steps.plan_id
                 WHERE steps.plan_id = ? AND steps.step_id = ?
@@ -848,7 +931,7 @@ class SqliteNavigationPlanRepository:
                     plan_id, step_id, task_id, plan_revision, target_status,
                     expected_statuses_json, full_result_json, result_summary_json,
                     result_ref, created_at, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, ?)
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     plan_id,
@@ -857,8 +940,15 @@ class SqliteNavigationPlanRepository:
                     row["plan_revision"],
                     target_status,
                     self._canonical_json(["pending", "waiting_user"]),
-                    self._canonical_json(full_result),
+                    canonical_full,
                     self._canonical_json(result_summary),
+                    self._intended_result_ref(
+                        row["task_id"],
+                        int(row["observation_revision"]),
+                        plan_id,
+                        step_id,
+                        canonical_full,
+                    ),
                     timestamp,
                     timestamp,
                 ),
@@ -893,6 +983,7 @@ class SqliteNavigationPlanRepository:
             decision_key=row["decision_key"],
             decision=json.loads(row["decision_json"]),
             status=row["status"],
+            delivery_status=row["delivery_status"],
         )
 
     def acknowledge_human_decision_handoff(
@@ -911,6 +1002,56 @@ class SqliteNavigationPlanRepository:
             )
         return cursor.rowcount == 1
 
+    def claim_human_decision_delivery(
+        self, plan_id: str, step_id: str, decision_key: str
+    ) -> Literal["claimed", "busy", "delivered", "missing"]:
+        connection = self._connect()
+        try:
+            connection.execute("BEGIN IMMEDIATE")
+            row = connection.execute(
+                """SELECT delivery_status, decision_key FROM navigation_human_decision_handoffs
+                   WHERE plan_id = ? AND step_id = ?""",
+                (plan_id, step_id),
+            ).fetchone()
+            if row is None or row["decision_key"] != decision_key:
+                connection.rollback()
+                return "missing"
+            if row["delivery_status"] == "delivered":
+                connection.commit()
+                return "delivered"
+            if row["delivery_status"] == "delivering":
+                connection.commit()
+                return "busy"
+            connection.execute(
+                """UPDATE navigation_human_decision_handoffs
+                   SET delivery_status = 'delivering', updated_at = ?
+                   WHERE plan_id = ? AND step_id = ? AND decision_key = ?""",
+                (utc_now(), plan_id, step_id, decision_key),
+            )
+            connection.commit()
+            return "claimed"
+        except Exception:
+            connection.rollback()
+            raise
+        finally:
+            connection.close()
+
+    def finish_human_decision_delivery(
+        self, plan_id: str, step_id: str, decision_key: str, *, delivered: bool
+    ) -> bool:
+        with self._connect() as connection:
+            cursor = connection.execute(
+                """UPDATE navigation_human_decision_handoffs
+                   SET delivery_status = ?, updated_at = ?
+                   WHERE plan_id = ? AND step_id = ? AND decision_key = ?
+                     AND delivery_status = 'delivering'""",
+                (
+                    "delivered" if delivered else "pending",
+                    utc_now(), plan_id, step_id, decision_key,
+                ),
+            )
+        return cursor.rowcount == 1
+
     def mark_needs_replan(self, plan_id: str, reason: str) -> bool:
         """Invalidate one active plan and its unfinished ledger in one transaction."""
         connection = self._connect()
@@ -923,6 +1064,10 @@ class SqliteNavigationPlanRepository:
             if row is None:
                 connection.rollback()
                 return False
+            if self._active_plan_has_in_flight_work(connection, plan_id):
+                raise ActivePlanExecutionConflict(
+                    "cannot mark a navigation plan needs-replan with in-flight work"
+                )
             timestamp = utc_now()
             connection.execute(
                 """
@@ -1030,6 +1175,25 @@ class SqliteNavigationPlanRepository:
             ensure_ascii=False,
             sort_keys=True,
             separators=(",", ":"),
+        )
+
+    @staticmethod
+    def _intended_result_ref(
+        task_id: str,
+        observation_revision: int,
+        plan_id: str,
+        step_id: str,
+        canonical_full: str,
+    ) -> str:
+        from vla_data_juicer_agents.navigation.evidence_store import (
+            FileNavigationEvidenceStore,
+        )
+
+        digest = hashlib.sha256(canonical_full.encode("utf-8")).hexdigest()
+        return FileNavigationEvidenceStore(Path(".")).deterministic_ref(
+            task_id,
+            observation_revision,
+            f"{plan_id}:{step_id}:{digest}",
         )
 
     @classmethod

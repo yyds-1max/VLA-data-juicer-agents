@@ -86,6 +86,32 @@ def stores_with_task(tmp_path: Path):
     return SqliteNavigationPlanRepository(db_path), task
 
 
+def test_repository_migrates_legacy_pending_only_handoff_schema(tmp_path: Path):
+    db_path = tmp_path / "navigation_tasks.sqlite"
+    SqliteNavigationTaskStore(db_path)
+    with sqlite3.connect(db_path) as connection:
+        connection.execute(
+            """CREATE TABLE navigation_human_decision_handoffs (
+                plan_id TEXT NOT NULL, step_id TEXT NOT NULL, task_id TEXT NOT NULL,
+                decision_key TEXT NOT NULL, decision_json TEXT NOT NULL,
+                status TEXT NOT NULL CHECK (status = 'pending'),
+                created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
+                PRIMARY KEY (plan_id, step_id)
+            )"""
+        )
+
+    SqliteNavigationPlanRepository(db_path)
+
+    with sqlite3.connect(db_path) as connection:
+        columns = {
+            row[1]
+            for row in connection.execute(
+                "PRAGMA table_info(navigation_human_decision_handoffs)"
+            )
+        }
+    assert "delivery_status" in columns
+
+
 def test_activate_plan_and_ledger_is_atomic(tmp_path: Path):
     repo, task = stores_with_task(tmp_path)
 
@@ -234,6 +260,29 @@ def test_invalidate_removes_plan_from_active_lookup_without_mutating_plan(tmp_pa
             (record.plan_id,),
         ).fetchone()[0]
     assert reason == "artifact drift"
+
+
+@pytest.mark.parametrize("mutation", ["invalidate", "mark_needs_replan"])
+def test_plan_mutations_reject_claimed_execution_in_same_transaction(
+    tmp_path: Path, mutation: str
+):
+    repo, task = stores_with_task(tmp_path)
+    record = repo.activate(task, "extract_sync", 1, valid_extract_plan())
+    assert repo.claim_step(record.plan_id, "prepare", "prepare_raw_data")
+
+    with pytest.raises(ActivePlanExecutionConflict):
+        getattr(repo, mutation)(record.plan_id, "artifact drift")
+
+    assert repo.get(record.plan_id).status == "active"
+    assert repo.get_current_step(record.plan_id)["step"]["status"] == "running"
+
+
+def test_invalidation_wins_before_claim_and_prevents_execution_claim(tmp_path: Path):
+    repo, task = stores_with_task(tmp_path)
+    record = repo.activate(task, "extract_sync", 1, valid_extract_plan())
+
+    assert repo.invalidate(record.plan_id, "artifact drift").status == "invalidated"
+    assert repo.claim_step(record.plan_id, "prepare", "prepare_raw_data") is False
 
 
 def test_compact_reads_expose_execution_status_and_no_legacy_payloads(tmp_path: Path):

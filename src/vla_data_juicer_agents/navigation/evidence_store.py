@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import base64
+import hashlib
 import json
 import os
 import re
@@ -35,12 +36,54 @@ class FileNavigationEvidenceStore:
         source_tool: str,
         payload: dict[str, Any] | list[Any],
         summary: str,
+        *,
+        ref: str | None = None,
+    ) -> EvidenceDescriptor:
+        if ref is None:
+            ref = self._encode_ref(task_id, observation_revision, uuid4().hex)
+        return self.write_with_ref(
+            task_id,
+            observation_revision,
+            kind,
+            source_tool,
+            payload,
+            summary,
+            ref=ref,
+        )
+
+    def deterministic_ref(
+        self,
+        task_id: str,
+        observation_revision: int,
+        identity: str,
+    ) -> str:
+        self._validate_task_id(task_id)
+        if observation_revision < 1:
+            raise ValueError("observation_revision must be at least 1")
+        if not isinstance(identity, str) or not identity:
+            raise ValueError("identity must be a non-empty string")
+        evidence_id = hashlib.sha256(identity.encode("utf-8")).hexdigest()[:32]
+        return self._encode_ref(task_id, observation_revision, evidence_id)
+
+    def write_with_ref(
+        self,
+        task_id: str,
+        observation_revision: int,
+        kind: str,
+        source_tool: str,
+        payload: dict[str, Any] | list[Any],
+        summary: str,
+        *,
+        ref: str,
     ) -> EvidenceDescriptor:
         self._validate_task_id(task_id)
         if observation_revision < 1:
             raise ValueError("observation_revision must be at least 1")
-
-        evidence_id = uuid4().hex
+        indexed_task, indexed_revision, evidence_id = self._decode_ref(ref)
+        if indexed_task != task_id:
+            raise PermissionError("evidence ref belongs to another task")
+        if indexed_revision != observation_revision:
+            raise PermissionError("evidence ref belongs to another observation revision")
         destination = self.root / task_id / str(observation_revision) / f"{evidence_id}.json"
         destination.parent.mkdir(parents=True, exist_ok=True)
         encoded = json.dumps(
@@ -49,10 +92,14 @@ class FileNavigationEvidenceStore:
             sort_keys=True,
             separators=(",", ":"),
         ).encode("utf-8")
-        self._atomic_write(destination, encoded)
+        if destination.exists():
+            if destination.read_bytes() != encoded:
+                raise ValueError("evidence ref already contains a different payload")
+        else:
+            self._atomic_write(destination, encoded)
         created_at = datetime.now(UTC).isoformat()
         return EvidenceDescriptor(
-            ref=self._encode_ref(task_id, observation_revision, evidence_id),
+            ref=ref,
             task_id=task_id,
             observation_revision=observation_revision,
             kind=kind,
@@ -92,6 +139,9 @@ class FileNavigationEvidenceStore:
     def delete(self, task_id: str, ref: str) -> None:
         path = self._path_for_owned_ref(task_id, ref)
         path.unlink(missing_ok=True)
+
+    def exists(self, task_id: str, ref: str) -> bool:
+        return self._path_for_owned_ref(task_id, ref).is_file()
 
     @staticmethod
     def _select_fields(payload: Any, fields: list[str] | None) -> Any:

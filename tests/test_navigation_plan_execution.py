@@ -639,7 +639,24 @@ def test_evidence_write_failure_recovers_from_durable_result_without_reinvoking(
     tool = services.tools()["extract_and_sync_navigation_data_tool"]
 
     first = call_tool(tool, plan_id=services.plan.plan_id, step_id="sync")
-    second = call_tool(tool, plan_id=services.plan.plan_id, step_id="sync")
+    persisted_before_recovery = services.task_store.get_task(services.task.task_id)
+    assert persisted_before_recovery.phase.value == "extract_sync"
+    fresh_tools = {
+        candidate.name: candidate
+        for candidate in plan_execution.build_plan_bound_execution_tools(
+            task=persisted_before_recovery,
+            plan_store=services.plan_store,
+            evidence_store=services.evidence_store,
+            settings=services.settings,
+            dry_run=True,
+            cancellation=None,
+        )
+    }
+    second = call_tool(
+        fresh_tools["extract_and_sync_navigation_data_tool"],
+        plan_id=services.plan.plan_id,
+        step_id="sync",
+    )
 
     assert first["error_type"] == "result_finalize_retry_required"
     assert second["ok"] is True
@@ -683,6 +700,9 @@ def test_staged_result_finalizes_before_expected_artifact_phase_advance_invalida
     assert second["ok"] is True
     assert len(invoked) == 1
     assert services.plan_store.get(services.plan.plan_id).status == "completed"
+    assert services.task_store.get_task(services.task.task_id).phase.value == (
+        "waiting_scene_mode"
+    )
 
 
 @pytest.mark.parametrize(
@@ -768,6 +788,66 @@ def test_underlying_exception_stages_failure_and_retry_only_finalizes(
     assert second["error_type"] == "processing_exception"
     assert second["next_action"] == "submit_complete_plan"
     assert len(invoked) == 1
+
+
+def test_processing_result_recursively_redacts_secrets_before_outbox_and_evidence(
+    monkeypatch, tmp_path
+):
+    services = build_services(tmp_path)
+    monkeypatch.setattr(
+        plan_execution,
+        "extract_and_sync_navigation_data",
+        lambda **kwargs: {
+            "ok": True,
+            "tool_name": "extract_and_sync_navigation_data",
+            "message": "done",
+            "details": {
+                "password": "p",
+                "nested": {"api_key": "k", "safe": "visible"},
+                "items": [{"authorization": "Bearer x", "cookie": "c"}],
+            },
+        },
+    )
+
+    result = call_tool(
+        services.tools()["extract_and_sync_navigation_data_tool"],
+        plan_id=services.plan.plan_id,
+        step_id="sync",
+    )
+    payload = services.evidence_store.read(
+        services.task.task_id, result["result_ref"]
+    )["data"]
+
+    assert payload["details"] == {
+        "password": "[REDACTED]",
+        "nested": {"api_key": "[REDACTED]", "safe": "visible"},
+        "items": [{"authorization": "[REDACTED]", "cookie": "[REDACTED]"}],
+    }
+
+
+def test_oversized_processing_result_is_bounded_and_moves_to_needs_replan(
+    monkeypatch, tmp_path
+):
+    services = build_services(tmp_path)
+    monkeypatch.setattr(
+        plan_execution,
+        "extract_and_sync_navigation_data",
+        lambda **kwargs: ok_result(
+            "extract_and_sync_navigation_data", blob="x" * 300_000
+        ),
+    )
+
+    result = call_tool(
+        services.tools()["extract_and_sync_navigation_data_tool"],
+        plan_id=services.plan.plan_id,
+        step_id="sync",
+    )
+
+    assert result["error_type"] == "processing_result_oversized"
+    assert result["status"] == "needs_replan"
+    assert len(json.dumps(result)) <= 4000
+    assert services.plan_store.get(services.plan.plan_id).status == "invalidated"
+    assert services.plan_store.get_current_step(services.plan.plan_id)["step"]["status"] == "needs_replan"
 
 
 def test_running_step_without_staged_result_transitions_to_needs_replan(
