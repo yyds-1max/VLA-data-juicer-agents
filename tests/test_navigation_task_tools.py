@@ -331,8 +331,10 @@ def test_foreign_scene_mode_claim_does_not_mutate_legacy_session_draft(tmp_path:
         segments=["segment_a"],
         scene_mode=None,
     )
-    store.update_task(
+    store.update_task_for_session(
         created["task"]["task_id"],
+        web_session_id="web-agent-session-a",
+        agentscope_session_id="agent-session-a",
         phase=NavigationTaskPhase.WAITING_SCENE_MODE,
         status=NavigationTaskStatus.WAITING_USER,
         waiting_reason="scene_mode_required_after_extract_sync",

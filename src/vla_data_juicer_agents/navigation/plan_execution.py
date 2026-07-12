@@ -326,6 +326,8 @@ def _reconcile_execution_entry(
                     plan_store.mark_needs_replan(
                         active_plan.plan_id,
                         "artifact reconciliation invalidated the stored execution plan",
+                        expected_web_session_id=expected_web_session_id,
+                        expected_agentscope_session_id=expected_agentscope_session_id,
                     )
                 except ActivePlanExecutionConflict:
                     return stored, _compact_error(
@@ -569,13 +571,19 @@ def _finalize_staged_result(
                 ref=result_ref,
             )
         if not plan_store.attach_staged_result_evidence(
-            plan.plan_id, step.step_id, result_ref
+            plan.plan_id, step.step_id, result_ref,
+            expected_web_session_id=task.latest_web_session_id,
+            expected_agentscope_session_id=task.agentscope_session_id,
         ):
             return _result_finalize_retry_error()
     except Exception:
         return _result_finalize_retry_error()
     try:
-        finalized = plan_store.finalize_staged_step(plan.plan_id, step.step_id)
+        finalized = plan_store.finalize_staged_step(
+            plan.plan_id, step.step_id,
+            expected_web_session_id=task.latest_web_session_id,
+            expected_agentscope_session_id=task.agentscope_session_id,
+        )
     except Exception:
         return _result_finalize_retry_error()
     if not finalized:
@@ -586,16 +594,22 @@ def _finalize_staged_result(
             task_store = SqliteNavigationTaskStore(plan_store.db_path)
             if staged.target_status == "completed":
                 reconciled = reconcile_navigation_task(stored_task, settings=settings)
-                task_store.update_task(
+                task_store.update_task_for_session(
                     stored_task.task_id,
+                    web_session_id=task.latest_web_session_id,
+                    agentscope_session_id=task.agentscope_session_id,
+                    expected_state_revision=stored_task.state_revision,
                     **_task_changes(reconciled),
                 )
             else:
                 snapshot = build_navigation_artifact_snapshot(
                     stored_task.date, stored_task.segments, settings=settings
                 )
-                task_store.update_task(
+                task_store.update_task_for_session(
                     stored_task.task_id,
+                    web_session_id=task.latest_web_session_id,
+                    agentscope_session_id=task.agentscope_session_id,
+                    expected_state_revision=stored_task.state_revision,
                     artifact_snapshot=snapshot.model_dump(mode="json"),
                     status="failed",
                 )
@@ -666,6 +680,8 @@ def _invoke_plan_step(
                 plan.plan_id,
                 step.step_id,
                 "running step has no staged result after process interruption",
+                expected_web_session_id=expected_web_session_id,
+                expected_agentscope_session_id=expected_agentscope_session_id,
             )
         except ActivePlanExecutionConflict:
             return _compact_error(
@@ -714,6 +730,8 @@ def _invoke_plan_step(
                 target_status="failed",
                 full_result=payload,
                 result_summary=_result_summary(payload),
+                expected_web_session_id=expected_web_session_id,
+                expected_agentscope_session_id=expected_agentscope_session_id,
             )
             transition = _finalize_staged_result(
                 task=task,
@@ -734,6 +752,8 @@ def _invoke_plan_step(
                 plan.plan_id,
                 step.step_id,
                 "cancellation result could not be staged",
+                expected_web_session_id=expected_web_session_id,
+                expected_agentscope_session_id=expected_agentscope_session_id,
             )
             error = TurnCancelled("The current turn was interrupted.")
             error.add_note(f"Cancellation recovery requires replan: {stage_error!r}")
@@ -757,12 +777,16 @@ def _invoke_plan_step(
             target_status=terminal_status,
             full_result=payload,
             result_summary=summary,
+            expected_web_session_id=expected_web_session_id,
+            expected_agentscope_session_id=expected_agentscope_session_id,
         )
     except Exception:
         plan_store.recover_running_step_without_result(
             plan.plan_id,
             step.step_id,
             "processing result could not be staged after underlying execution",
+            expected_web_session_id=expected_web_session_id,
+            expected_agentscope_session_id=expected_agentscope_session_id,
         )
         return _compact_error(
             "step_recovery_requires_replan",
@@ -781,6 +805,8 @@ def _invoke_plan_step(
         plan_store.mark_needs_replan(
             plan.plan_id,
             "processing result exceeded the durable outbox payload policy",
+            expected_web_session_id=expected_web_session_id,
+            expected_agentscope_session_id=expected_agentscope_session_id,
         )
         response["status"] = "needs_replan"
         response["next_action"] = "submit_complete_plan"
@@ -831,6 +857,8 @@ def submit_plan_human_decision(
     plan_id: str,
     step_id: str,
     decision: dict[str, Any],
+    expected_web_session_id: str | None = None,
+    expected_agentscope_session_id: str | None = None,
 ) -> bool:
     plan = plan_store.get(plan_id)
     if plan is None:
@@ -892,6 +920,8 @@ def submit_plan_human_decision(
         target_status="completed" if payload["ok"] else "failed",
         full_result=payload,
         result_summary=_result_summary(payload),
+        expected_web_session_id=expected_web_session_id,
+        expected_agentscope_session_id=expected_agentscope_session_id,
     )
     if outcome == "conflict":
         return False

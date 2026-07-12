@@ -14,6 +14,7 @@ from vla_data_juicer_agents.navigation.task_state import (
 )
 from vla_data_juicer_agents.navigation.task_store import (
     NavigationTaskOwnershipError,
+    NavigationTaskStateRevisionError,
     SqliteNavigationTaskStore,
     normalize_segments,
 )
@@ -66,15 +67,27 @@ def build_navigation_task_tools(
 
     def save_task(task_id: str, **changes: Any) -> tuple[Any | None, dict[str, Any] | None]:
         try:
-            if bound_task is None:
-                return store.update_task(task_id, **changes), None
+            current = store.get_task(task_id)
+            if current is None:
+                raise KeyError(task_id)
+            for field in (
+                "task_id",
+                "created_by_web_session_id",
+                "latest_web_session_id",
+                "agentscope_session_id",
+                "created_at",
+                "updated_at",
+                "state_revision",
+            ):
+                changes.pop(field, None)
             return store.update_task_for_session(
                 task_id,
                 web_session_id=web_session_id,
                 agentscope_session_id=session_id,
+                expected_state_revision=current.state_revision,
                 **changes,
             ), None
-        except NavigationTaskOwnershipError:
+        except (NavigationTaskOwnershipError, NavigationTaskStateRevisionError):
             return None, {
                 "ok": False,
                 "error_type": "navigation_task_session_mismatch",
@@ -89,6 +102,9 @@ def build_navigation_task_tools(
             "created_by_web_session_id",
             "latest_web_session_id",
             "agentscope_session_id",
+            "created_at",
+            "updated_at",
+            "state_revision",
         ):
             changes.pop(field, None)
         return save_task(task.task_id, **changes)

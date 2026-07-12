@@ -83,6 +83,10 @@ def _segments_key(segments: list[str] | None) -> str:
 
 
 def ensure_navigation_task_step_ledger_columns(connection: sqlite3.Connection) -> None:
+    if connection.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name='navigation_task_steps'"
+    ).fetchone() is None:
+        return
     columns = {
         row["name"]
         for row in connection.execute("PRAGMA table_info(navigation_task_steps)").fetchall()
@@ -137,6 +141,43 @@ class NavigationTaskOwnershipError(PermissionError):
 
 class NavigationTaskStateRevisionError(RuntimeError):
     pass
+
+
+def authorize_navigation_task_write(
+    connection: sqlite3.Connection,
+    task_id: str,
+    *,
+    expected_web_session_id: str | None,
+    expected_agentscope_session_id: str | None,
+) -> None:
+    """Reject writes to an owned task unless the exact durable session is supplied."""
+    if connection.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name='navigation_tasks'"
+    ).fetchone() is None:
+        return
+    row = connection.execute(
+        """SELECT created_by_web_session_id, latest_web_session_id,
+                  agentscope_session_id
+           FROM navigation_tasks WHERE task_id = ?""",
+        (task_id,),
+    ).fetchone()
+    if row is None:
+        return
+    durable = (
+        row["created_by_web_session_id"],
+        row["latest_web_session_id"],
+        row["agentscope_session_id"],
+    )
+    if durable == (None, None, None):
+        if expected_web_session_id is None and expected_agentscope_session_id is None:
+            return
+    elif durable == (
+        expected_web_session_id,
+        expected_web_session_id,
+        expected_agentscope_session_id,
+    ):
+        return
+    raise PermissionError("navigation task session mismatch")
 
 
 class NavigationTaskStore(Protocol):
@@ -490,6 +531,12 @@ class SqliteNavigationTaskStore:
             ).fetchone()
             if row is None:
                 raise KeyError(task_id)
+            authorize_navigation_task_write(
+                connection,
+                task_id,
+                expected_web_session_id=None,
+                expected_agentscope_session_id=None,
+            )
             current = self._task_from_row(row)
             task = self._merged_task(current, changes)
             self._update_task(connection, task)
@@ -528,11 +575,14 @@ class SqliteNavigationTaskStore:
             if row is None:
                 raise KeyError(task_id)
             current = self._task_from_row(row)
-            if agentscope_session_id is not None and (
-                current.created_by_web_session_id != web_session_id
-                or current.latest_web_session_id != web_session_id
-                or current.agentscope_session_id != agentscope_session_id
-            ):
+            try:
+                authorize_navigation_task_write(
+                    connection,
+                    task_id,
+                    expected_web_session_id=web_session_id,
+                    expected_agentscope_session_id=agentscope_session_id,
+                )
+            except PermissionError:
                 raise NavigationTaskOwnershipError(
                     task_id,
                     expected_web_session_id=current.created_by_web_session_id or "",

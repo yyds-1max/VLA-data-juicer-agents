@@ -225,19 +225,22 @@ def test_task_store_exact_restore_preserves_entire_persisted_model(
         web_session_id="web-old",
         agentscope_session_id="as-old",
     )
-    original = store.update_task(
+    original = store.update_task_for_session(
         original.task_id,
+        web_session_id="web-old",
+        agentscope_session_id="as-old",
         guidance_revision=4,
         status=NavigationTaskStatus.NEEDS_RECONCILE,
     )
-    store.update_task(
-        original.task_id,
-        guidance_revision=5,
-        phase=NavigationTaskPhase.EXTRACT_SYNC,
-        status=NavigationTaskStatus.RUNNING,
-        latest_web_session_id="web-new",
-        agentscope_session_id="as-new",
-    )
+    with sqlite3.connect(store.db_path) as connection:
+        connection.execute(
+            """UPDATE navigation_tasks
+               SET guidance_revision = 5, phase = 'extract_sync', status = 'running',
+                   latest_web_session_id = 'web-new', agentscope_session_id = 'as-new',
+                   state_revision = state_revision + 1
+               WHERE task_id = ?""",
+            (original.task_id,),
+        )
 
     restored = store.restore_task_exact(original)
 
@@ -658,8 +661,10 @@ def test_task_store_round_trips_entry_fields_and_finds_latest_agentscope_session
         dry_run=True,
         agentscope_session_id="agent-1",
     )
-    updated = store.update_task(
+    updated = store.update_task_for_session(
         task.task_id,
+        web_session_id=None,
+        agentscope_session_id="agent-1",
         guidance_revision=3,
         status=NavigationTaskStatus.NEEDS_REPLAN,
     )

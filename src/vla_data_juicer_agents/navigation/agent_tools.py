@@ -47,7 +47,10 @@ from vla_data_juicer_agents.navigation.session_plan_draft_tools import (
     build_session_plan_draft_tools,
 )
 from vla_data_juicer_agents.navigation.task_reconciliation import reconcile_navigation_task
-from vla_data_juicer_agents.navigation.task_store import SqliteNavigationTaskStore
+from vla_data_juicer_agents.navigation.task_store import (
+    NavigationTaskStateRevisionError,
+    SqliteNavigationTaskStore,
+)
 from vla_data_juicer_agents.navigation.task_tools import build_navigation_task_tools
 
 
@@ -712,20 +715,20 @@ def resolve_navigation_agent_tools(
         "created_by_web_session_id",
         "latest_web_session_id",
         "agentscope_session_id",
+        "created_at",
+        "updated_at",
+        "state_revision",
     ):
         changes.pop(field, None)
     try:
-        task = (
-            services.task_store.update_task_for_session(
-                task.task_id,
-                web_session_id=web_session_id,
-                agentscope_session_id=agentscope_session_id,
-                **changes,
-            )
-            if web_session_id is not None
-            else services.task_store.update_task(task.task_id, **changes)
+        task = services.task_store.update_task_for_session(
+            task.task_id,
+            web_session_id=web_session_id,
+            agentscope_session_id=agentscope_session_id,
+            expected_state_revision=task.state_revision,
+            **changes,
         )
-    except PermissionError:
+    except (PermissionError, NavigationTaskStateRevisionError):
         return []
 
     if task.phase.value == "completed" or task.status.value == "completed":

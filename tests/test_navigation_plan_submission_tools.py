@@ -824,3 +824,54 @@ def test_rebind_after_serialized_attempt_keeps_audit_but_rejects_activation(tmp_
     assert result["error_type"] == "plan_activation_failed"
     assert len(_audit_rows(services)) == 1
     assert services.plan_store.get_active(bound.task_id, "extract_sync") is None
+
+
+def test_observation_advance_after_audit_cannot_activate_stale_complete_plan(
+    tmp_path, monkeypatch
+):
+    services = build_services(tmp_path, "extract_sync")
+    task_store = SqliteNavigationTaskStore(services.plan_store.db_path)
+    bound = task_store.update_task(
+        services.task.task_id,
+        created_by_web_session_id="web-owner",
+        latest_web_session_id="web-owner",
+        agentscope_session_id="as-owner",
+    )
+    original_record = services.plan_store.record_attempt
+
+    def record_then_observe(attempt, **kwargs):
+        stored = original_record(attempt, **kwargs)
+        latest = services.observation_store.latest(bound.task_id)
+        assert latest is not None
+        services.observation_store.append(
+            bound.task_id,
+            bound.phase,
+            "artifact_state",
+            [_artifact(bound.date)],
+            [],
+            services.evidence_store,
+            expected_web_session_id="web-owner",
+            expected_agentscope_session_id="as-owner",
+        )
+        return stored
+
+    monkeypatch.setattr(services.plan_store, "record_attempt", record_then_observe)
+    tool = build_navigation_plan_submission_tools(
+        task=bound,
+        observation_store=services.observation_store,
+        evidence_store=services.evidence_store,
+        plan_store=services.plan_store,
+        capabilities=list_navigation_tool_capabilities(),
+        expected_web_session_id="web-owner",
+        expected_agentscope_session_id="as-owner",
+    )[0]
+
+    result = _invoke_tool(tool, {
+        "planning_context_revision": services.planning_context_revision,
+        "plan": valid_extract_plan_payload(services),
+    })
+
+    assert result["ok"] is False
+    assert result["error_type"] == "plan_activation_failed"
+    assert len(_audit_rows(services)) == 1
+    assert services.plan_store.get_active(bound.task_id, "extract_sync") is None

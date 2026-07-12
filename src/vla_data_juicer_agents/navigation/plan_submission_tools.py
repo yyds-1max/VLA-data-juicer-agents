@@ -295,6 +295,8 @@ def build_navigation_plan_submission_tools(
                 canonical_plan,
                 expected_web_session_id=expected_web_session_id,
                 expected_agentscope_session_id=expected_agentscope_session_id,
+                expected_planning_context_revision=planning_context_revision,
+                capability_revision=capability_revision,
             )
         except Exception:
             return _internal_failure(

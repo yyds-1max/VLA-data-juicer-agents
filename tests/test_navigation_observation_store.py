@@ -143,6 +143,31 @@ def test_task_initializer_installs_triggers_for_preexisting_observation_tables(t
     assert task_store.get_task(task.task_id).state_revision == task.state_revision + 1
 
 
+def test_owned_task_observation_append_rejects_omitted_session(tmp_path):
+    db_path = tmp_path / "state.sqlite"
+    task_store = SqliteNavigationTaskStore(db_path)
+    task = task_store.create_or_update_task(
+        date="20260710",
+        segments=["20260710_120000"],
+        scene_mode=None,
+        web_session_id="web-owner",
+        agentscope_session_id="as-owner",
+    )
+    store = SqliteNavigationObservationStore(db_path)
+
+    with pytest.raises(PermissionError, match="session mismatch"):
+        store.append(
+            task.task_id,
+            "extract_sync",
+            "raw_metadata",
+            [_raw_observation()],
+            [],
+            FileNavigationEvidenceStore(tmp_path / "evidence"),
+        )
+
+    assert store.latest(task.task_id) is None
+
+
 def test_append_rolls_back_database_and_written_evidence_on_failure(tmp_path):
     root = tmp_path / "evidence"
     underlying = FileNavigationEvidenceStore(root)

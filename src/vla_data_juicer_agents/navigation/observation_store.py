@@ -19,6 +19,7 @@ from vla_data_juicer_agents.navigation.observation_models import (
     ObservationPayload,
 )
 from vla_data_juicer_agents.navigation.task_state import NavigationTaskPhase
+from vla_data_juicer_agents.navigation.task_store import authorize_navigation_task_write
 
 
 _OBSERVATION_PAYLOAD_ADAPTER = TypeAdapter(ObservationPayload)
@@ -122,16 +123,12 @@ class SqliteNavigationObservationStore:
         written_descriptors: list[EvidenceDescriptor] = []
         try:
             connection.execute("BEGIN IMMEDIATE")
-            if expected_agentscope_session_id is not None:
-                owner = connection.execute(
-                    """SELECT 1 FROM navigation_tasks WHERE task_id=?
-                    AND created_by_web_session_id IS ? AND latest_web_session_id IS ?
-                    AND agentscope_session_id IS ?""",
-                    (task_id, expected_web_session_id, expected_web_session_id,
-                     expected_agentscope_session_id),
-                ).fetchone()
-                if owner is None:
-                    raise PermissionError("navigation task session mismatch")
+            authorize_navigation_task_write(
+                connection,
+                task_id,
+                expected_web_session_id=expected_web_session_id,
+                expected_agentscope_session_id=expected_agentscope_session_id,
+            )
             row = connection.execute(
                 """
                 SELECT revision_json

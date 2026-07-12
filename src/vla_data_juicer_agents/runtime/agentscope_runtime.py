@@ -39,6 +39,9 @@ from vla_data_juicer_agents.navigation.task_reconciliation import (
     prepare_navigation_task_entry,
     reconcile_navigation_task,
 )
+from vla_data_juicer_agents.navigation.task_store import (
+    NavigationTaskStateRevisionError,
+)
 from vla_data_juicer_agents.runtime.agentscope_bootstrap import bootstrap_agentscope_records
 from vla_data_juicer_agents.runtime.agentscope_config import AgentScopeRuntimeConfig
 
@@ -319,6 +322,9 @@ class AgentScopeRuntime:
             "created_by_web_session_id",
             "latest_web_session_id",
             "agentscope_session_id",
+            "created_at",
+            "updated_at",
+            "state_revision",
         ):
             changes.pop(field, None)
         try:
@@ -326,9 +332,10 @@ class AgentScopeRuntime:
                 task.task_id,
                 web_session_id=web_session_id,
                 agentscope_session_id=agentscope_session_id,
+                expected_state_revision=task.state_revision,
                 **changes,
             )
-        except PermissionError:
+        except (PermissionError, NavigationTaskStateRevisionError):
             return {
                 "task_id": None,
                 "phase": None,
@@ -380,6 +387,7 @@ class AgentScopeRuntime:
             if plan_bound_handoff
             else None
         )
+        durable_agentscope_session_id: str | None = None
         if plan_store is not None:
             plan = plan_store.get(plan_id)
             if plan is not None:
@@ -392,6 +400,7 @@ class AgentScopeRuntime:
                         "human decision handoff does not belong to the requested "
                         "Web session"
                     )
+                durable_agentscope_session_id = task.agentscope_session_id
         mapped = self._web_session_mapping(web_session_id)
         if mapped is None:
             if (
@@ -403,6 +412,7 @@ class AgentScopeRuntime:
                     plan_id,
                     step_id,
                     web_session_id=web_session_id,
+                    agentscope_session_id=durable_agentscope_session_id,
                     reason_code="missing_web_mapping",
                 )
             return False
@@ -426,7 +436,11 @@ class AgentScopeRuntime:
                     if existing.decision_key != decision_key:
                         return False
                     if not plan_store.acknowledge_human_decision_handoff(
-                        plan_id, step_id, decision_key
+                        plan_id,
+                        step_id,
+                        decision_key,
+                        expected_web_session_id=web_session_id,
+                        expected_agentscope_session_id=agentscope_session_id,
                     ):
                         return False
                     self._mark_human_decision_consumed(
@@ -442,10 +456,18 @@ class AgentScopeRuntime:
                     )
                     if external_state == "consumed":
                         plan_store.mark_consumed_human_decision_delivery(
-                            plan_id, step_id, decision_key
+                            plan_id,
+                            step_id,
+                            decision_key,
+                            expected_web_session_id=web_session_id,
+                            expected_agentscope_session_id=agentscope_session_id,
                         )
                         if not plan_store.acknowledge_human_decision_handoff(
-                            plan_id, step_id, decision_key
+                            plan_id,
+                            step_id,
+                            decision_key,
+                            expected_web_session_id=web_session_id,
+                            expected_agentscope_session_id=agentscope_session_id,
                         ):
                             return False
                         self._mark_human_decision_consumed(
@@ -459,6 +481,7 @@ class AgentScopeRuntime:
                             plan_id,
                             step_id,
                             web_session_id=web_session_id,
+                            agentscope_session_id=agentscope_session_id,
                             reason_code=external_state,
                         )
 
@@ -474,6 +497,7 @@ class AgentScopeRuntime:
                         plan_id,
                         step_id,
                         web_session_id=web_session_id,
+                        agentscope_session_id=agentscope_session_id,
                         reason_code="missing_pending_tool_call",
                     )
                 return False
@@ -485,6 +509,8 @@ class AgentScopeRuntime:
                     plan_id=plan_id,
                     step_id=step_id,
                     decision=decision,
+                    expected_web_session_id=web_session_id,
+                    expected_agentscope_session_id=agentscope_session_id,
                 )
                 if not transitioned:
                     return False
@@ -493,10 +519,16 @@ class AgentScopeRuntime:
                     step_id,
                     decision_key,
                     owner=agentscope_session_id,
+                    expected_web_session_id=web_session_id,
+                    expected_agentscope_session_id=agentscope_session_id,
                 )
                 if delivery == "delivered":
                     if not plan_store.acknowledge_human_decision_handoff(
-                        plan_id, step_id, decision_key
+                        plan_id,
+                        step_id,
+                        decision_key,
+                        expected_web_session_id=web_session_id,
+                        expected_agentscope_session_id=agentscope_session_id,
                     ):
                         return False
                     self._mark_human_decision_consumed(
@@ -572,10 +604,16 @@ class AgentScopeRuntime:
                                 decision_key,
                                 token=delivery_token,
                                 delivered=True,
+                                expected_web_session_id=web_session_id,
+                                expected_agentscope_session_id=agentscope_session_id,
                             )
                             if not completed:
                                 completed = plan_store.mark_consumed_human_decision_delivery(
-                                    plan_id, step_id, decision_key
+                                    plan_id,
+                                    step_id,
+                                    decision_key,
+                                    expected_web_session_id=web_session_id,
+                                    expected_agentscope_session_id=agentscope_session_id,
                                 )
                         elif external_state == "submitted":
                             plan_store.finish_human_decision_delivery(
@@ -584,6 +622,8 @@ class AgentScopeRuntime:
                                 decision_key,
                                 token=delivery_token,
                                 delivered=False,
+                                expected_web_session_id=web_session_id,
+                                expected_agentscope_session_id=agentscope_session_id,
                             )
                             completed = False
                         else:
@@ -591,6 +631,8 @@ class AgentScopeRuntime:
                                 plan_id,
                                 step_id,
                                 reason_code=external_state,
+                                expected_web_session_id=web_session_id,
+                                expected_agentscope_session_id=agentscope_session_id,
                             )
                             completed = False
                         if external_state != "consumed":
@@ -616,6 +658,8 @@ class AgentScopeRuntime:
                             plan_id,
                             step_id,
                             handoff.decision_key,
+                            expected_web_session_id=web_session_id,
+                            expected_agentscope_session_id=agentscope_session_id,
                         ):
                             raise RuntimeError(
                                 "plan-bound human decision handoff acknowledgement failed"
@@ -641,6 +685,8 @@ class AgentScopeRuntime:
                         decision_key,
                         token=delivery_token,
                         delivered=False,
+                        expected_web_session_id=web_session_id,
+                        expected_agentscope_session_id=agentscope_session_id,
                     )
                 if previous_cancellation is not None:
                     self.register_run_cancellation(
@@ -682,12 +728,15 @@ class AgentScopeRuntime:
         step_id: str,
         *,
         web_session_id: str,
+        agentscope_session_id: str | None,
         reason_code: str,
     ) -> None:
         plan_store.mark_human_decision_recovery_required(
             plan_id,
             step_id,
             reason_code=reason_code,
+            expected_web_session_id=web_session_id,
+            expected_agentscope_session_id=agentscope_session_id,
         )
         raise RuntimeError(
             self._human_handoff_recovery_message(

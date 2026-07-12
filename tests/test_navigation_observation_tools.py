@@ -110,7 +110,12 @@ def test_stale_inspection_toolkit_cannot_write_revision_or_evidence_after_rebind
         web_session_id="web-owner",
         agentscope_session_id="as-old",
     )
-    task = task_store.update_task(task.task_id, phase="extract_sync")
+    task = task_store.update_task_for_session(
+        task.task_id,
+        web_session_id="web-owner",
+        agentscope_session_id="as-old",
+        phase="extract_sync",
+    )
     observation_store = SqliteNavigationObservationStore(db_path)
     evidence_store = FileNavigationEvidenceStore(tmp_path / "evidence")
     tools = {

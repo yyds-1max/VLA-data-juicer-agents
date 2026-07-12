@@ -24,7 +24,12 @@ from vla_data_juicer_agents.navigation.plan_models import (
 )
 from vla_data_juicer_agents.navigation.task_state import NavigationTask, utc_now
 from vla_data_juicer_agents.navigation.task_store import (
+    SqliteNavigationTaskStore,
+    authorize_navigation_task_write,
     ensure_navigation_task_step_ledger_columns,
+)
+from vla_data_juicer_agents.navigation.planning_context import (
+    compute_planning_context_revision,
 )
 
 
@@ -120,7 +125,27 @@ class SqliteNavigationPlanRepository:
         connection.execute("PRAGMA foreign_keys = ON")
         return connection
 
+    @staticmethod
+    def _authorize_plan_write(
+        connection: sqlite3.Connection,
+        plan_id: str,
+        *,
+        expected_web_session_id: str | None,
+        expected_agentscope_session_id: str | None,
+    ) -> None:
+        row = connection.execute(
+            "SELECT task_id FROM navigation_plans WHERE plan_id = ?", (plan_id,)
+        ).fetchone()
+        if row is not None:
+            authorize_navigation_task_write(
+                connection,
+                row["task_id"],
+                expected_web_session_id=expected_web_session_id,
+                expected_agentscope_session_id=expected_agentscope_session_id,
+            )
+
     def _init_schema(self) -> None:
+        SqliteNavigationTaskStore(self.db_path)
         with self._connect() as connection:
             ensure_navigation_task_step_ledger_columns(connection)
             connection.execute(
@@ -345,14 +370,12 @@ class SqliteNavigationPlanRepository:
         connection = self._connect()
         try:
             connection.execute("BEGIN IMMEDIATE")
-            if expected_agentscope_session_id is not None and connection.execute(
-                """SELECT 1 FROM navigation_tasks WHERE task_id=?
-                AND created_by_web_session_id IS ? AND latest_web_session_id IS ?
-                AND agentscope_session_id IS ?""",
-                (stored.task_id, expected_web_session_id, expected_web_session_id,
-                 expected_agentscope_session_id),
-            ).fetchone() is None:
-                raise PermissionError("navigation task session mismatch")
+            authorize_navigation_task_write(
+                connection,
+                stored.task_id,
+                expected_web_session_id=expected_web_session_id,
+                expected_agentscope_session_id=expected_agentscope_session_id,
+            )
             connection.execute(
                 """
                 INSERT INTO navigation_plan_submission_attempts (
@@ -386,6 +409,8 @@ class SqliteNavigationPlanRepository:
         plan: ExtractSyncPlanInput | FinishProcessingPlanInput | dict[str, Any],
         *, expected_web_session_id: str | None = None,
         expected_agentscope_session_id: str | None = None,
+        expected_planning_context_revision: str | None = None,
+        capability_revision: str | None = None,
     ) -> NavigationPlanRecord:
         phase_value = self._normalize_phase(phase)
         canonical_plan = self._validate_plan_for_phase(phase_value, plan)
@@ -393,14 +418,40 @@ class SqliteNavigationPlanRepository:
         try:
             connection.execute("BEGIN IMMEDIATE")
             task_row = connection.execute(
-                """SELECT 1 FROM navigation_tasks WHERE task_id=? AND (? IS NULL OR (
-                created_by_web_session_id IS ? AND latest_web_session_id IS ?
-                AND agentscope_session_id IS ?))""",
-                (task.task_id, expected_agentscope_session_id, expected_web_session_id,
-                 expected_web_session_id, expected_agentscope_session_id),
+                "SELECT * FROM navigation_tasks WHERE task_id=?", (task.task_id,)
             ).fetchone()
             if task_row is None:
                 raise KeyError(task.task_id)
+            authorize_navigation_task_write(
+                connection,
+                task.task_id,
+                expected_web_session_id=expected_web_session_id,
+                expected_agentscope_session_id=expected_agentscope_session_id,
+            )
+            if expected_planning_context_revision is not None:
+                if capability_revision is None:
+                    raise ValueError("capability revision is required for context fencing")
+                latest_observation = connection.execute(
+                    """SELECT MAX(revision) AS revision
+                       FROM navigation_observation_revisions WHERE task_id = ?""",
+                    (task.task_id,),
+                ).fetchone()
+                if (
+                    latest_observation is None
+                    or latest_observation["revision"] is None
+                    or int(latest_observation["revision"]) != observation_revision
+                ):
+                    raise RuntimeError("navigation planning context observation changed")
+                durable_task = SqliteNavigationTaskStore(
+                    self.db_path, initialize=False
+                )._task_from_row(task_row)
+                durable_revision = compute_planning_context_revision(
+                    task=durable_task,
+                    observation_revision=observation_revision,
+                    capability_revision=capability_revision,
+                )
+                if durable_revision != expected_planning_context_revision:
+                    raise RuntimeError("navigation planning context changed")
             revision_row = connection.execute(
                 """
                 SELECT COALESCE(MAX(plan_revision), 0) AS latest_revision
@@ -693,6 +744,12 @@ class SqliteNavigationPlanRepository:
     ) -> bool:
         """Atomically claim one pending ledger step for exactly-once invocation."""
         with self._connect() as connection:
+            self._authorize_plan_write(
+                connection,
+                plan_id,
+                expected_web_session_id=expected_web_session_id,
+                expected_agentscope_session_id=expected_agentscope_session_id,
+            )
             cursor = connection.execute(
                 """
                 UPDATE navigation_task_steps
@@ -705,16 +762,13 @@ class SqliteNavigationPlanRepository:
                         ON navigation_tasks.task_id = navigation_plans.task_id
                       WHERE navigation_plans.plan_id = navigation_task_steps.plan_id
                         AND navigation_plans.status = 'active'
-                        AND (? IS NULL OR (
-                            navigation_tasks.created_by_web_session_id = ?
-                            AND navigation_tasks.latest_web_session_id = ?
-                            AND navigation_tasks.agentscope_session_id = ?
-                        ))
+                        AND navigation_tasks.created_by_web_session_id IS ?
+                        AND navigation_tasks.latest_web_session_id IS ?
+                        AND navigation_tasks.agentscope_session_id IS ?
                   )
                 """,
                 (
                     utc_now(), plan_id, step_id, action,
-                    expected_agentscope_session_id,
                     expected_web_session_id,
                     expected_web_session_id,
                     expected_agentscope_session_id,
@@ -733,6 +787,12 @@ class SqliteNavigationPlanRepository:
     ) -> bool:
         """Atomically expose one pending external step as waiting for the user."""
         with self._connect() as connection:
+            self._authorize_plan_write(
+                connection,
+                plan_id,
+                expected_web_session_id=expected_web_session_id,
+                expected_agentscope_session_id=expected_agentscope_session_id,
+            )
             cursor = connection.execute(
                 """
                 UPDATE navigation_task_steps
@@ -745,16 +805,13 @@ class SqliteNavigationPlanRepository:
                         ON navigation_tasks.task_id = navigation_plans.task_id
                       WHERE navigation_plans.plan_id = navigation_task_steps.plan_id
                         AND navigation_plans.status = 'active'
-                        AND (? IS NULL OR (
-                            navigation_tasks.created_by_web_session_id = ?
-                            AND navigation_tasks.latest_web_session_id = ?
-                            AND navigation_tasks.agentscope_session_id = ?
-                        ))
+                        AND navigation_tasks.created_by_web_session_id IS ?
+                        AND navigation_tasks.latest_web_session_id IS ?
+                        AND navigation_tasks.agentscope_session_id IS ?
                   )
                 """,
                 (
                     utc_now(), plan_id, step_id, action,
-                    expected_agentscope_session_id,
                     expected_web_session_id,
                     expected_web_session_id,
                     expected_agentscope_session_id,
@@ -771,6 +828,8 @@ class SqliteNavigationPlanRepository:
         full_result: dict[str, Any],
         result_summary: dict[str, Any],
         expected_statuses: tuple[ExecutionStatus, ...] = ("running",),
+        expected_web_session_id: str | None = None,
+        expected_agentscope_session_id: str | None = None,
     ) -> StagedStepResult:
         """Durably stage a post-side-effect result before crossing to file evidence."""
         self._ensure_within_limit(result_summary, label="execution result summary")
@@ -786,6 +845,12 @@ class SqliteNavigationPlanRepository:
         connection = self._connect()
         try:
             connection.execute("BEGIN IMMEDIATE")
+            self._authorize_plan_write(
+                connection,
+                plan_id,
+                expected_web_session_id=expected_web_session_id,
+                expected_agentscope_session_id=expected_agentscope_session_id,
+            )
             existing = connection.execute(
                 """
                 SELECT * FROM navigation_step_result_outbox
@@ -881,11 +946,16 @@ class SqliteNavigationPlanRepository:
         plan_id: str,
         step_id: str,
         result_ref: str,
+        *, expected_web_session_id: str | None = None,
+        expected_agentscope_session_id: str | None = None,
     ) -> bool:
         """Attach task-scoped evidence to a staged result without finishing it."""
         connection = self._connect()
         try:
             connection.execute("BEGIN IMMEDIATE")
+            self._authorize_plan_write(connection, plan_id,
+                expected_web_session_id=expected_web_session_id,
+                expected_agentscope_session_id=expected_agentscope_session_id)
             row = connection.execute(
                 """
                 SELECT result_ref FROM navigation_step_result_outbox
@@ -914,11 +984,18 @@ class SqliteNavigationPlanRepository:
         finally:
             connection.close()
 
-    def finalize_staged_step(self, plan_id: str, step_id: str) -> bool:
+    def finalize_staged_step(
+        self, plan_id: str, step_id: str, *,
+        expected_web_session_id: str | None = None,
+        expected_agentscope_session_id: str | None = None,
+    ) -> bool:
         """Atomically finish one staged ledger step and clear its result outbox."""
         connection = self._connect()
         try:
             connection.execute("BEGIN IMMEDIATE")
+            self._authorize_plan_write(connection, plan_id,
+                expected_web_session_id=expected_web_session_id,
+                expected_agentscope_session_id=expected_agentscope_session_id)
             row = connection.execute(
                 """
                 SELECT * FROM navigation_step_result_outbox
@@ -1001,11 +1078,16 @@ class SqliteNavigationPlanRepository:
         plan_id: str,
         step_id: str,
         reason: str,
+        *, expected_web_session_id: str | None = None,
+        expected_agentscope_session_id: str | None = None,
     ) -> bool:
         """Conservatively invalidate an unrecoverable running step without rerunning it."""
         connection = self._connect()
         try:
             connection.execute("BEGIN IMMEDIATE")
+            self._authorize_plan_write(connection, plan_id,
+                expected_web_session_id=expected_web_session_id,
+                expected_agentscope_session_id=expected_agentscope_session_id)
             row = connection.execute(
                 """
                 SELECT plans.task_id
@@ -1086,6 +1168,8 @@ class SqliteNavigationPlanRepository:
         target_status: Literal["completed", "failed"],
         full_result: dict[str, Any],
         result_summary: dict[str, Any],
+        expected_web_session_id: str | None = None,
+        expected_agentscope_session_id: str | None = None,
     ) -> Literal["created", "existing", "conflict"]:
         """Persist a decision handoff and its terminal result outbox atomically."""
         self._ensure_within_limit(result_summary, label="human decision result summary")
@@ -1102,6 +1186,12 @@ class SqliteNavigationPlanRepository:
         connection = self._connect()
         try:
             connection.execute("BEGIN IMMEDIATE")
+            self._authorize_plan_write(
+                connection,
+                plan_id,
+                expected_web_session_id=expected_web_session_id,
+                expected_agentscope_session_id=expected_agentscope_session_id,
+            )
             existing = connection.execute(
                 """
                 SELECT decision_key, decision_json
@@ -1225,8 +1315,14 @@ class SqliteNavigationPlanRepository:
         plan_id: str,
         step_id: str,
         decision_key: str,
+        *, expected_web_session_id: str | None = None,
+        expected_agentscope_session_id: str | None = None,
     ) -> bool:
         with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            self._authorize_plan_write(connection, plan_id,
+                expected_web_session_id=expected_web_session_id,
+                expected_agentscope_session_id=expected_agentscope_session_id)
             cursor = connection.execute(
                 """
                 DELETE FROM navigation_human_decision_handoffs
@@ -1238,7 +1334,9 @@ class SqliteNavigationPlanRepository:
         return cursor.rowcount == 1
 
     def claim_human_decision_delivery(
-        self, plan_id: str, step_id: str, decision_key: str, *, owner: str
+        self, plan_id: str, step_id: str, decision_key: str, *, owner: str,
+        expected_web_session_id: str | None = None,
+        expected_agentscope_session_id: str | None = None,
     ) -> tuple[
         Literal["claimed", "busy", "delivered", "missing", "recovery_required"],
         str | None,
@@ -1246,6 +1344,9 @@ class SqliteNavigationPlanRepository:
         connection = self._connect()
         try:
             connection.execute("BEGIN IMMEDIATE")
+            self._authorize_plan_write(connection, plan_id,
+                expected_web_session_id=expected_web_session_id,
+                expected_agentscope_session_id=expected_agentscope_session_id)
             row = connection.execute(
                 """SELECT status, delivery_status, decision_key, expires_at
                    FROM navigation_human_decision_handoffs
@@ -1320,6 +1421,8 @@ class SqliteNavigationPlanRepository:
         step_id: str,
         *,
         reason_code: str,
+        expected_web_session_id: str | None = None,
+        expected_agentscope_session_id: str | None = None,
     ) -> bool:
         safe_code = re.sub(r"[^a-z0-9_:-]", "_", str(reason_code).lower())[:128]
         if not safe_code:
@@ -1327,6 +1430,9 @@ class SqliteNavigationPlanRepository:
         connection = self._connect()
         try:
             connection.execute("BEGIN IMMEDIATE")
+            self._authorize_plan_write(connection, plan_id,
+                expected_web_session_id=expected_web_session_id,
+                expected_agentscope_session_id=expected_agentscope_session_id)
             row = connection.execute(
                 """SELECT status, delivery_status
                    FROM navigation_human_decision_handoffs
@@ -1461,8 +1567,14 @@ class SqliteNavigationPlanRepository:
         *,
         token: str,
         delivered: bool,
+        expected_web_session_id: str | None = None,
+        expected_agentscope_session_id: str | None = None,
     ) -> bool:
         with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            self._authorize_plan_write(connection, plan_id,
+                expected_web_session_id=expected_web_session_id,
+                expected_agentscope_session_id=expected_agentscope_session_id)
             cursor = connection.execute(
                 """UPDATE navigation_human_decision_handoffs
                    SET delivery_status = ?, delivery_owner = NULL,
@@ -1478,10 +1590,16 @@ class SqliteNavigationPlanRepository:
         return cursor.rowcount == 1
 
     def mark_consumed_human_decision_delivery(
-        self, plan_id: str, step_id: str, decision_key: str
+        self, plan_id: str, step_id: str, decision_key: str, *,
+        expected_web_session_id: str | None = None,
+        expected_agentscope_session_id: str | None = None,
     ) -> bool:
         """Record durable AgentScope consumption observed outside our lease state."""
         with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            self._authorize_plan_write(connection, plan_id,
+                expected_web_session_id=expected_web_session_id,
+                expected_agentscope_session_id=expected_agentscope_session_id)
             cursor = connection.execute(
                 """UPDATE navigation_human_decision_handoffs
                    SET status = 'pending', delivery_status = 'delivered', delivery_owner = NULL,
@@ -1494,11 +1612,18 @@ class SqliteNavigationPlanRepository:
             )
         return cursor.rowcount == 1
 
-    def mark_needs_replan(self, plan_id: str, reason: str) -> bool:
+    def mark_needs_replan(
+        self, plan_id: str, reason: str, *,
+        expected_web_session_id: str | None = None,
+        expected_agentscope_session_id: str | None = None,
+    ) -> bool:
         """Invalidate one active plan and its unfinished ledger in one transaction."""
         connection = self._connect()
         try:
             connection.execute("BEGIN IMMEDIATE")
+            self._authorize_plan_write(connection, plan_id,
+                expected_web_session_id=expected_web_session_id,
+                expected_agentscope_session_id=expected_agentscope_session_id)
             row = connection.execute(
                 "SELECT task_id FROM navigation_plans WHERE plan_id = ? AND status = 'active'",
                 (plan_id,),

@@ -607,8 +607,10 @@ def test_finish_processing_gate_blocks_when_reconciled_sync_artifacts_are_missin
         web_session_id="web-session",
         agentscope_session_id="agent-session",
     )
-    task_store.update_task(
+    task_store.update_task_for_session(
         task.task_id,
+        web_session_id="web-session",
+        agentscope_session_id="agent-session",
         phase=NavigationTaskPhase.FINISH_PROCESSING,
         status=NavigationTaskStatus.NEEDS_RECONCILE,
         artifact_snapshot=NavigationArtifactSnapshot(
@@ -681,8 +683,10 @@ def test_finish_processing_gate_blocks_when_sync_data_deleted_after_snapshot(
         web_session_id="web-session",
         agentscope_session_id="agent-session",
     )
-    task_store.update_task(
+    task_store.update_task_for_session(
         task.task_id,
+        web_session_id="web-session",
+        agentscope_session_id="agent-session",
         phase=NavigationTaskPhase.FINISH_PROCESSING,
         status=NavigationTaskStatus.PENDING,
         artifact_snapshot=NavigationArtifactSnapshot(
@@ -768,8 +772,10 @@ def test_finish_processing_gate_allows_running_task_with_finish_temp_partial_art
         web_session_id="web-session",
         agentscope_session_id="agent-session",
     )
-    task_store.update_task(
+    task_store.update_task_for_session(
         task.task_id,
+        web_session_id="web-session",
+        agentscope_session_id="agent-session",
         phase=NavigationTaskPhase.FINISH_PROCESSING,
         status=NavigationTaskStatus.RUNNING,
         artifact_snapshot=NavigationArtifactSnapshot(
@@ -845,8 +851,10 @@ def test_resume_finish_gate_rejects_extract_tools_and_allows_finish_tools(
         web_session_id="web-session",
         agentscope_session_id="agent-session",
     )
-    task_store.update_task(
+    task_store.update_task_for_session(
         task.task_id,
+        web_session_id="web-session",
+        agentscope_session_id="agent-session",
         phase=NavigationTaskPhase.FINISH_PROCESSING,
         status=NavigationTaskStatus.PENDING,
         artifact_snapshot=NavigationArtifactSnapshot(
@@ -2080,7 +2088,12 @@ def test_phase_resolver_exposes_missing_inspections_without_submission_or_execut
         scene_mode=None,
         agentscope_session_id="as-session-1",
     )
-    services.task_store.update_task(created.task_id, phase="extract_sync")
+    services.task_store.update_task_for_session(
+        created.task_id,
+        web_session_id=None,
+        agentscope_session_id="as-session-1",
+        phase="extract_sync",
+    )
 
     names = {
         tool.name
@@ -2108,7 +2121,14 @@ def test_phase_resolver_exposes_missing_inspections_without_submission_or_execut
 def test_phase_resolver_recovers_active_plan_and_only_remaining_actions(tmp_path):
     services, task, built = _resolver_services_from_complete(tmp_path)
     plan = ExtractSyncPlanInput.model_validate(valid_extract_plan_payload(built))
-    active = services.plan_store.activate(task, "extract_sync", 4, plan)
+    active = services.plan_store.activate(
+        task,
+        "extract_sync",
+        4,
+        plan,
+        expected_web_session_id=None,
+        expected_agentscope_session_id="as-session-1",
+    )
 
     names = {
         tool.name
@@ -2129,6 +2149,110 @@ def test_phase_resolver_recovers_active_plan_and_only_remaining_actions(tmp_path
     assert "request_human_decision" not in names
 
 
+def test_phase_resolver_fails_closed_when_child_commit_advances_read_revision(
+    tmp_path, monkeypatch
+):
+    services, task, built = _resolver_services_from_complete(tmp_path)
+    original_reconcile = agent_tools_module.reconcile_navigation_task
+
+    def reconcile_then_advance(stale_task, *, settings):
+        reconciled = original_reconcile(stale_task, settings=settings)
+        services.observation_store.append(
+            task.task_id,
+            task.phase,
+            "artifact_state",
+            [
+                ArtifactStateObservation(
+                    snapshot=NavigationArtifactSnapshot(
+                        date=task.date,
+                        segments=task.segments,
+                        raw_input_exists=True,
+                    )
+                )
+            ],
+            [],
+            services.evidence_store,
+            expected_web_session_id="web-owner",
+            expected_agentscope_session_id="web-owner__as",
+        )
+        return reconciled
+
+    with sqlite3.connect(services.task_store.db_path) as connection:
+        connection.execute(
+            """UPDATE navigation_tasks
+               SET created_by_web_session_id = ?, latest_web_session_id = ?,
+                   agentscope_session_id = ?
+               WHERE task_id = ?""",
+            ("web-owner", "web-owner", "web-owner__as", task.task_id),
+        )
+    bound = services.task_store.get_task(task.task_id)
+    assert bound is not None
+    assert bound.agentscope_session_id == "web-owner__as"
+    monkeypatch.setattr(agent_tools_module, "reconcile_navigation_task", reconcile_then_advance)
+    original_update = services.task_store.update_task_for_session
+    captured = {}
+
+    def capture_update(*args, **kwargs):
+        captured.update(kwargs)
+        return original_update(*args, **kwargs)
+
+    monkeypatch.setattr(services.task_store, "update_task_for_session", capture_update)
+
+    tools = resolve_navigation_agent_tools(
+        services=services,
+        agentscope_session_id="web-owner__as",
+        web_session_id="web-owner",
+        cancellation=None,
+    )
+
+    assert captured["expected_state_revision"] == bound.state_revision
+    assert tools == []
+
+
+def test_runtime_anchor_fails_closed_when_child_commit_advances_read_revision(
+    tmp_path, monkeypatch
+):
+    services, task, _built = _resolver_services_from_complete(tmp_path)
+    with sqlite3.connect(services.task_store.db_path) as connection:
+        connection.execute(
+            """UPDATE navigation_tasks
+               SET created_by_web_session_id = ?, latest_web_session_id = ?,
+                   agentscope_session_id = ?
+               WHERE task_id = ?""",
+            ("web-owner", "web-owner", "web-owner__as", task.task_id),
+        )
+    bound = services.task_store.get_task(task.task_id)
+    assert bound is not None
+    original_reconcile = runtime_module.reconcile_navigation_task
+
+    def reconcile_then_advance(stale_task, *, settings):
+        result = original_reconcile(stale_task, settings=settings)
+        services.observation_store.append(
+            task.task_id,
+            task.phase,
+            "artifact_state",
+            [ArtifactStateObservation(snapshot=NavigationArtifactSnapshot(
+                date=task.date, segments=task.segments, raw_input_exists=True,
+            ))],
+            [],
+            services.evidence_store,
+            expected_web_session_id="web-owner",
+            expected_agentscope_session_id="web-owner__as",
+        )
+        return result
+
+    monkeypatch.setattr(runtime_module, "reconcile_navigation_task", reconcile_then_advance)
+    runtime = object.__new__(runtime_module.AgentScopeRuntime)
+    runtime.config = SimpleNamespace(workspace_root=tmp_path)
+    runtime._navigation_services = lambda: services
+
+    anchor = runtime._navigation_durable_state_anchor(
+        "web-owner__as", web_session_id="web-owner"
+    )
+
+    assert anchor["task_id"] is None
+
+
 def test_phase_resolver_completed_state_has_only_compact_state_and_evidence(tmp_path):
     services, task, _built = _resolver_services_from_complete(tmp_path)
     final_grid = (
@@ -2139,7 +2263,10 @@ def test_phase_resolver_completed_state_has_only_compact_state_and_evidence(tmp_
         / "grid_map"
     )
     final_grid.mkdir(parents=True)
-    services.task_store.update_task(task.task_id, phase="completed", status="completed")
+    services.task_store.update_task_for_session(
+        task.task_id, web_session_id=None, agentscope_session_id="as-session-1",
+        phase="completed", status="completed",
+    )
 
     names = {
         tool.name
@@ -2167,7 +2294,10 @@ def test_completed_evidence_list_is_explicitly_bounded_to_4000_chars(monkeypatch
         / "grid_map"
     )
     final_grid.mkdir(parents=True)
-    services.task_store.update_task(task.task_id, phase="completed", status="completed")
+    services.task_store.update_task_for_session(
+        task.task_id, web_session_id=None, agentscope_session_id="as-session-1",
+        phase="completed", status="completed",
+    )
     rows = [
         SimpleNamespace(
             model_dump=lambda index=index, **_: {
@@ -2202,6 +2332,8 @@ def test_resolved_execution_reads_are_explicitly_bounded_to_4000_chars(tmp_path)
         "extract_sync",
         4,
         ExtractSyncPlanInput.model_validate(valid_extract_plan_payload(built)),
+        expected_web_session_id=None,
+        expected_agentscope_session_id="as-session-1",
     )
     tools = {
         tool.name: tool

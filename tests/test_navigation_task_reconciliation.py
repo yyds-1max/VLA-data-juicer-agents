@@ -457,8 +457,10 @@ def test_prepare_task_entry_restores_existing_task_when_evidence_append_fails(
         web_session_id="web-old",
         agentscope_session_id="as-old",
     )
-    original = task_store.update_task(
+    original = task_store.update_task_for_session(
         original.task_id,
+        web_session_id="web-old",
+        agentscope_session_id="as-old",
         guidance_revision=7,
         phase=NavigationTaskPhase.INTAKE,
         status=NavigationTaskStatus.NEEDS_RECONCILE,
@@ -471,8 +473,10 @@ def test_prepare_task_entry_restores_existing_task_when_evidence_append_fails(
         web_session_id="web-later",
         agentscope_session_id="as-old",
     )
-    later = task_store.update_task(
+    later = task_store.update_task_for_session(
         later.task_id,
+        web_session_id="web-later",
+        agentscope_session_id="as-old",
         phase=NavigationTaskPhase.EXTRACT_SYNC,
         status=NavigationTaskStatus.NEEDS_RERUN,
     )

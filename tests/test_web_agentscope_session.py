@@ -379,7 +379,13 @@ def _plan_bound_human_runtime(tmp_path: Path, chat_run_registry: FakeChatRunRegi
         web_session_id="web-1",
         agentscope_session_id="as-session-1",
     )
-    task = task_store.update_task(task.task_id, phase="finish_processing", status="pending")
+    task = task_store.update_task_for_session(
+        task.task_id,
+        web_session_id="web-1",
+        agentscope_session_id="as-session-1",
+        phase="finish_processing",
+        status="pending",
+    )
     plan_store = SqliteNavigationPlanRepository(db_path)
     plan = plan_store.activate(
         task,
@@ -420,6 +426,8 @@ def _plan_bound_human_runtime(tmp_path: Path, chat_run_registry: FakeChatRunRegi
                 ],
             }
         ),
+        expected_web_session_id="web-1",
+        expected_agentscope_session_id="as-session-1",
     )
     storage = FakeAgentScopeStorage()
     storage.session_records[("alice", "navigation-data-agent", "as-session-1")] = (
@@ -1393,11 +1401,15 @@ async def test_expired_delivering_handoff_with_submitted_call_fails_closed(
         plan_id=plan.plan_id,
         step_id="confirm",
         decision=decision,
+        expected_web_session_id="web-1",
+        expected_agentscope_session_id="as-session-1",
     )
     status, token = plan_store.claim_human_decision_delivery(
         plan.plan_id, "confirm", agentscope_runtime_module.human_decision_key(
             agentscope_runtime_module._durable_plan_decision(decision)
-        ), owner="dead-worker"
+        ), owner="dead-worker",
+        expected_web_session_id="web-1",
+        expected_agentscope_session_id="as-session-1",
     )
     assert status == "claimed" and token
     with sqlite3.connect(plan_store.db_path) as connection:
@@ -1428,6 +1440,8 @@ async def test_missing_agentscope_session_marks_existing_handoff_recovery_requir
         plan_id=plan.plan_id,
         step_id="confirm",
         decision=decision,
+        expected_web_session_id="web-1",
+        expected_agentscope_session_id="as-session-1",
     )
     runtime.storage.session_records.clear()
 
@@ -1451,6 +1465,8 @@ async def test_cross_session_submit_cannot_mutate_or_deliver_foreign_handoff(
         plan_id=plan.plan_id,
         step_id="confirm",
         decision=decision,
+        expected_web_session_id="web-1",
+        expected_agentscope_session_id="as-session-1",
     )
     runtime.web_sessions["attacker-web"] = (
         "navigation-data-agent",
@@ -1493,6 +1509,8 @@ async def test_missing_handoff_identity_fails_closed(
         plan_id=plan.plan_id,
         step_id="confirm",
         decision=decision,
+        expected_web_session_id="web-1",
+        expected_agentscope_session_id="as-session-1",
     )
     record = runtime.storage.session_records[
         ("alice", "navigation-data-agent", "as-session-1")
@@ -1525,9 +1543,15 @@ async def test_runtime_controlled_handoff_recovery_delegates_with_web_ownership(
         plan_id=plan.plan_id,
         step_id="confirm",
         decision=decision,
+        expected_web_session_id="web-1",
+        expected_agentscope_session_id="as-session-1",
     )
     plan_store.mark_human_decision_recovery_required(
-        plan.plan_id, "confirm", reason_code="missing_agentscope_session"
+        plan.plan_id,
+        "confirm",
+        reason_code="missing_agentscope_session",
+        expected_web_session_id="web-1",
+        expected_agentscope_session_id="as-session-1",
     )
 
     recovered = await runtime.recover_human_decision_handoff(
@@ -1561,9 +1585,15 @@ async def test_recovery_required_pending_event_points_only_to_controlled_recover
         plan_id=plan.plan_id,
         step_id="confirm",
         decision=decision,
+        expected_web_session_id="web-1",
+        expected_agentscope_session_id="as-session-1",
     )
     plan_store.mark_human_decision_recovery_required(
-        plan.plan_id, "confirm", reason_code="missing_agentscope_session"
+        plan.plan_id,
+        "confirm",
+        reason_code="missing_agentscope_session",
+        expected_web_session_id="web-1",
+        expected_agentscope_session_id="as-session-1",
     )
 
     event = await runtime._pending_human_decision_event(
@@ -1597,21 +1627,28 @@ async def test_quarantined_pending_event_is_suppressed_and_marked_consumed(
     web_session = store.create_session("recover")
     runtime.set_web_session_store(store)
     runtime.web_sessions[web_session.id] = ("navigation-data-agent", "as-session-1")
-    task_store = SqliteNavigationTaskStore(plan_store.db_path)
-    task_store.update_task(
-        plan.task_id,
-        created_by_web_session_id=web_session.id,
-        latest_web_session_id=web_session.id,
-    )
+    with sqlite3.connect(plan_store.db_path) as connection:
+        connection.execute(
+            """UPDATE navigation_tasks
+               SET created_by_web_session_id = ?, latest_web_session_id = ?
+               WHERE task_id = ?""",
+            (web_session.id, web_session.id, plan.task_id),
+        )
     assert agentscope_runtime_module.submit_plan_human_decision(
         plan_store=plan_store,
         evidence_store=runtime._navigation_evidence_store(),
         plan_id=plan.plan_id,
         step_id="confirm",
         decision=decision,
+        expected_web_session_id=web_session.id,
+        expected_agentscope_session_id="as-session-1",
     )
     plan_store.mark_human_decision_recovery_required(
-        plan.plan_id, "confirm", reason_code="missing_agentscope_session"
+        plan.plan_id,
+        "confirm",
+        reason_code="missing_agentscope_session",
+        expected_web_session_id=web_session.id,
+        expected_agentscope_session_id="as-session-1",
     )
     plan_store.quarantine_human_decision_handoff(
         plan.plan_id,
@@ -1646,12 +1683,19 @@ async def test_expired_delivering_handoff_with_completed_external_call_is_ack_on
         plan_id=plan.plan_id,
         step_id="confirm",
         decision=decision,
+        expected_web_session_id="web-1",
+        expected_agentscope_session_id="as-session-1",
     )
     key = agentscope_runtime_module.human_decision_key(
         agentscope_runtime_module._durable_plan_decision(decision)
     )
     assert plan_store.claim_human_decision_delivery(
-        plan.plan_id, "confirm", key, owner="dead-worker"
+        plan.plan_id,
+        "confirm",
+        key,
+        owner="dead-worker",
+        expected_web_session_id="web-1",
+        expected_agentscope_session_id="as-session-1",
     )[0] == "claimed"
     with sqlite3.connect(plan_store.db_path) as connection:
         connection.execute(
@@ -1740,7 +1784,14 @@ async def test_completed_final_human_handoff_blocks_same_phase_activation(tmp_pa
     assert plan_store.get(plan.plan_id).status == "completed"
     task = SqliteNavigationTaskStore(plan_store.db_path).get_task(plan.task_id)
     with pytest.raises(ActivePlanExecutionConflict):
-        plan_store.activate(task, "finish_processing", 2, plan.plan)
+            plan_store.activate(
+                task,
+                "finish_processing",
+                2,
+                plan.plan,
+                expected_web_session_id="web-1",
+                expected_agentscope_session_id="as-session-1",
+            )
     await registry.drain()
 
 

@@ -12,6 +12,9 @@ from vla_data_juicer_agents.navigation.plan_models import (
 )
 from vla_data_juicer_agents.navigation.plan_store import SqliteNavigationPlanRepository
 from vla_data_juicer_agents.navigation.plan_store import ActivePlanExecutionConflict
+from vla_data_juicer_agents.navigation.observation_store import (
+    SqliteNavigationObservationStore,
+)
 from vla_data_juicer_agents.navigation.task_state import NavigationTask
 from vla_data_juicer_agents.navigation.task_store import SqliteNavigationTaskStore
 
@@ -172,7 +175,10 @@ def test_controlled_handoff_recovery_preserves_audit_and_unblocks_replacement(tm
         created_by_web_session_id="web-owner",
         latest_web_session_id="web-owner",
     )
-    plan = repo.activate(task, "extract_sync", 1, valid_extract_plan())
+    plan = repo.activate(
+        task, "extract_sync", 1, valid_extract_plan(),
+        expected_web_session_id="web-owner", expected_agentscope_session_id=None,
+    )
     timestamp = datetime.now(UTC).isoformat()
     with sqlite3.connect(repo.db_path) as connection:
         connection.execute(
@@ -185,10 +191,18 @@ def test_controlled_handoff_recovery_preserves_audit_and_unblocks_replacement(tm
         )
 
     assert repo.mark_human_decision_recovery_required(
-        plan.plan_id, "prepare", reason_code="missing_agentscope_session"
+        plan.plan_id,
+        "prepare",
+        reason_code="missing_agentscope_session",
+        expected_web_session_id="web-owner",
+        expected_agentscope_session_id=None,
     )
     assert repo.mark_human_decision_recovery_required(
-        plan.plan_id, "prepare", reason_code="missing_agentscope_session"
+        plan.plan_id,
+        "prepare",
+        reason_code="missing_agentscope_session",
+        expected_web_session_id="web-owner",
+        expected_agentscope_session_id=None,
     )
     with pytest.raises(ActivePlanExecutionConflict, match="Web session"):
         repo.quarantine_human_decision_handoff(
@@ -225,9 +239,15 @@ def test_controlled_handoff_recovery_preserves_audit_and_unblocks_replacement(tm
     assert repo.get_current_step(plan.plan_id)["step"]["status"] == "needs_replan"
     task = SqliteNavigationTaskStore(repo.db_path).get_task(task.task_id)
     assert task.status.value == "needs_replan"
-    replacement = repo.activate(task, "extract_sync", 2, valid_extract_plan())
+    replacement = repo.activate(
+        task, "extract_sync", 2, valid_extract_plan(),
+        expected_web_session_id="web-owner", expected_agentscope_session_id=None,
+    )
     assert replacement.status == "active"
-    assert not repo.claim_step(plan.plan_id, "prepare", "prepare_raw_data")
+    assert not repo.claim_step(
+        plan.plan_id, "prepare", "prepare_raw_data",
+        expected_web_session_id="web-owner", expected_agentscope_session_id=None,
+    )
 
 
 @pytest.mark.parametrize("delivery_status", ["pending", "delivering", "delivered", "quarantined"])
@@ -240,7 +260,10 @@ def test_controlled_handoff_recovery_rejects_non_recovery_states(
         created_by_web_session_id="web-owner",
         latest_web_session_id="web-owner",
     )
-    plan = repo.activate(task, "extract_sync", 1, valid_extract_plan())
+    plan = repo.activate(
+        task, "extract_sync", 1, valid_extract_plan(),
+        expected_web_session_id="web-owner", expected_agentscope_session_id=None,
+    )
     timestamp = datetime.now(UTC).isoformat()
     status = "quarantined" if delivery_status == "quarantined" else "pending"
     with sqlite3.connect(repo.db_path) as connection:
@@ -323,6 +346,116 @@ def test_step_ledger_transitions_increment_task_state_revision(tmp_path: Path):
     )
     after_waiting = SqliteNavigationTaskStore(repo.db_path).get_task(task.task_id)
     assert after_waiting.state_revision == after_finalize.state_revision + 1
+
+
+def test_plan_repository_can_initialize_before_task_store(tmp_path: Path):
+    db_path = tmp_path / "plan-first.sqlite"
+
+    SqliteNavigationPlanRepository(db_path)
+    SqliteNavigationTaskStore(db_path)
+    SqliteNavigationObservationStore(db_path)
+    SqliteNavigationPlanRepository(db_path)
+
+    with sqlite3.connect(db_path) as connection:
+        tables = {
+            row[0]
+            for row in connection.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'table'"
+            )
+        }
+    assert {
+        "navigation_tasks",
+        "navigation_task_steps",
+        "navigation_plans",
+        "navigation_observation_revisions",
+    } <= tables
+
+
+def test_owned_task_plan_writes_reject_omitted_session(tmp_path: Path):
+    db_path = tmp_path / "owned.sqlite"
+    task_store = SqliteNavigationTaskStore(db_path)
+    task = task_store.create_or_update_task(
+        date="20260710", segments=["clip"], scene_mode=None
+    )
+    repository = SqliteNavigationPlanRepository(db_path)
+    plan = repository.activate(task, "extract_sync", 1, valid_extract_plan())
+    owned = task_store.update_task(
+        task.task_id,
+        created_by_web_session_id="web-owner",
+        latest_web_session_id="web-owner",
+        agentscope_session_id="as-owner",
+    )
+    attempt = PlanSubmissionAttempt(
+        attempt_id="attempt-owned",
+        task_id=owned.task_id,
+        phase="extract_sync",
+        planning_context_revision="context",
+        candidate={},
+        validation={"ok": False, "errors": [], "warnings": []},
+        created_at=owned.updated_at,
+    )
+
+    with pytest.raises(PermissionError, match="session mismatch"):
+        repository.record_attempt(attempt)
+    with pytest.raises(PermissionError, match="session mismatch"):
+        repository.activate(owned, "extract_sync", 1, valid_extract_plan())
+    with pytest.raises(PermissionError, match="session mismatch"):
+        repository.claim_step(plan.plan_id, "prepare", "prepare_raw_data")
+    with pytest.raises(PermissionError, match="session mismatch"):
+        repository.stage_step_result(
+            plan.plan_id,
+            "prepare",
+            target_status="completed",
+            full_result={"ok": True},
+            result_summary={"ok": True},
+            expected_statuses=("pending",),
+        )
+    with pytest.raises(PermissionError, match="session mismatch"):
+        repository.stage_human_decision_handoff(
+            plan.plan_id,
+            "prepare",
+            decision_key="decision",
+            decision={"action": "confirm"},
+            target_status="completed",
+            full_result={"ok": True},
+            result_summary={"ok": True},
+        )
+
+
+@pytest.mark.parametrize("transition", ["claim_step", "mark_waiting_user"])
+def test_step_transition_fails_closed_when_web_owner_rebinds_after_authorization(
+    tmp_path: Path, monkeypatch, transition: str
+):
+    repo, task = stores_with_task(tmp_path)
+    plan = repo.activate(task, "extract_sync", 1, valid_extract_plan())
+    task_store = SqliteNavigationTaskStore(repo.db_path)
+    task_store.update_task(
+        task.task_id,
+        created_by_web_session_id="web-one",
+        latest_web_session_id="web-one",
+    )
+    original_authorize = repo._authorize_plan_write
+
+    def authorize_then_rebind(connection, plan_id, **kwargs):
+        original_authorize(connection, plan_id, **kwargs)
+        with sqlite3.connect(repo.db_path) as rebind:
+            rebind.execute(
+                "UPDATE navigation_tasks SET latest_web_session_id = ? WHERE task_id = ?",
+                ("web-two", task.task_id),
+            )
+
+    monkeypatch.setattr(repo, "_authorize_plan_write", authorize_then_rebind)
+
+    transitioned = getattr(repo, transition)(
+        plan.plan_id,
+        "prepare",
+        "prepare_raw_data",
+        expected_web_session_id="web-one",
+        expected_agentscope_session_id=None,
+    )
+
+    assert transitioned is False
+    assert repo.get_current_step(plan.plan_id)["step"]["status"] == "pending"
 
 
 def test_activate_plan_and_ledger_is_atomic(tmp_path: Path):
