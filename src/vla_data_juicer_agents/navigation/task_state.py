@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from datetime import UTC, datetime
 from enum import StrEnum
-from typing import Any, Literal
+from typing import Literal
 
 from pydantic import BaseModel, Field, field_validator
 
@@ -92,17 +92,3 @@ class NavigationTask(BaseModel):
     @classmethod
     def validate_date(cls, value: str) -> str:
         return _validate_date(value)
-
-
-class NavigationTaskStep(BaseModel):
-    id: str
-    task_id: str
-    phase: NavigationTaskPhase
-    step_id: str
-    tool_name: str
-    status: NavigationTaskStatus
-    arguments: dict[str, Any] | None = None
-    result: dict[str, Any] | None = None
-    produced_paths: list[str] = Field(default_factory=list)
-    started_at: str | None = None
-    finished_at: str | None = None

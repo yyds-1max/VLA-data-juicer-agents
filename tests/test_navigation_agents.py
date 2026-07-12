@@ -10,8 +10,15 @@ from vla_data_juicer_agents.navigation.agents import (
     create_plan_agent,
 )
 from vla_data_juicer_agents.navigation.models import NavigationRequest
-from vla_data_juicer_agents.navigation.workflow import run_executor_agent, run_plan_agent
-from vla_data_juicer_agents.navigation.workflow import run_direct_plan_until_submitted
+from vla_data_juicer_agents.navigation.config import NavigationSettings
+from vla_data_juicer_agents.navigation.workflow import (
+    direct_completed_entry_state,
+    direct_execution_terminal_state,
+    prepare_direct_navigation_entry,
+    run_direct_plan_until_submitted,
+    run_executor_agent,
+    run_plan_agent,
+)
 
 
 class _SilentAgent:
@@ -177,6 +184,115 @@ def test_direct_planning_stops_after_one_round_without_durable_progress(monkeypa
         )
 
     assert resolutions == 1
+
+
+def test_direct_planning_uses_post_resolver_revision_as_round_boundary(tmp_path, monkeypatch):
+    raw_segment = tmp_path / "data" / "raw_data" / "20270605" / "segment-1"
+    raw_segment.mkdir(parents=True)
+    settings = NavigationSettings(
+        vladatasets_root=tmp_path / "data",
+        runs_root=tmp_path / "runs",
+    )
+    request = NavigationRequest(date="20270605", segments=["segment-1"], dry_run=True)
+    services, task = prepare_direct_navigation_entry(
+        run_dir=tmp_path / "run",
+        request=request,
+        settings=settings,
+        agentscope_session_id="direct-session",
+    )
+    rounds = 0
+
+    def silent_agent(**_kwargs):
+        nonlocal rounds
+        rounds += 1
+        return _SilentAgent()
+
+    monkeypatch.setattr(
+        "vla_data_juicer_agents.navigation.workflow.create_plan_agent",
+        silent_agent,
+    )
+
+    with pytest.raises(RuntimeError, match="did not submit a valid complete plan"):
+        asyncio.run(
+            run_direct_plan_until_submitted(
+                services=services,
+                task=task,
+                request=request,
+                agentscope_session_id="direct-session",
+            )
+        )
+
+    assert rounds == 1
+
+
+@pytest.mark.parametrize(
+    ("task_status", "phase", "current_step", "expected_status", "ok"),
+    [
+        ("failed", "extract_sync", "step-1", "failed", False),
+        ("needs_replan", "extract_sync", "step-1", "needs_replan", False),
+        ("waiting_user", "finish_processing", "confirm", "waiting_user", False),
+        ("running", "extract_sync", "step-1", "incomplete", False),
+        ("completed", "completed", None, "completed", True),
+    ],
+)
+def test_direct_terminal_state_is_derived_from_durable_ledger(
+    task_status, phase, current_step, expected_status, ok
+):
+    task = SimpleNamespace(
+        task_id="task-1",
+        status=SimpleNamespace(value=task_status),
+        phase=SimpleNamespace(value=phase),
+    )
+    overview = SimpleNamespace(
+        model_dump=lambda mode="json": {
+            "plan_id": "plan-1",
+            "status": "active",
+            "current_step_id": current_step,
+        }
+    )
+    services = SimpleNamespace(
+        task_store=SimpleNamespace(get_task=lambda _task_id: task),
+        plan_store=SimpleNamespace(
+            get=lambda _plan_id: SimpleNamespace(
+                plan_id="plan-1",
+                status="completed" if task_status == "completed" else "active",
+            ),
+            get_execution_overview=lambda _plan_id: overview,
+            get_current_step=lambda _plan_id: None if current_step is None else {"step": {"step_id": current_step}},
+        ),
+    )
+
+    result = direct_execution_terminal_state(
+        services=services,
+        task_id="task-1",
+        plan_id="plan-1",
+    )
+
+    assert result["status"] == expected_status
+    assert result["ok"] is ok
+
+
+def test_completed_entry_skips_planning_and_reports_reconciled_artifacts():
+    snapshot = SimpleNamespace(
+        model_dump=lambda mode="json": {"final_outputs_exist": True, "final_grid_map_exists": True}
+    )
+    task = SimpleNamespace(
+        task_id="task-1",
+        phase=SimpleNamespace(value="completed"),
+        status=SimpleNamespace(value="completed"),
+        artifact_snapshot=snapshot,
+    )
+
+    result = direct_completed_entry_state(task)
+
+    assert result == {
+        "ok": True,
+        "status": "completed",
+        "task_id": "task-1",
+        "task_phase": "completed",
+        "task_status": "completed",
+        "artifacts": {"final_outputs_exist": True, "final_grid_map_exists": True},
+    }
 
 
 def test_executor_prompt_contains_only_plan_identity_and_compact_state(monkeypatch):

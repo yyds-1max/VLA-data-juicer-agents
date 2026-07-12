@@ -15,7 +15,6 @@ from vla_data_juicer_agents.capabilities.session.runtime import SessionState, Se
 from vla_data_juicer_agents.capabilities.session.toolkit import _tool_context, get_session_tool_specs
 from vla_data_juicer_agents.navigation.agents import EXECUTOR_AGENT_INSTRUCTIONS
 from vla_data_juicer_agents.navigation.config import NavigationSettings
-from vla_data_juicer_agents.navigation.execution_tools import create_navigation_execution_tools
 from vla_data_juicer_agents.tools.vla.run_workflow import (
     _normalize_model,
     _normalize_segments,
@@ -52,13 +51,6 @@ def test_web_session_toolkit_excludes_old_vla_workflow_control_tools():
     assert "vla_continue_workflow" not in names
 
 
-def test_navigation_execution_tools_do_not_register_calibration_confirmation_tool():
-    tools = create_navigation_execution_tools(settings=NavigationSettings(), dry_run=True)
-    names = [tool.name for tool in tools]
-
-    assert "confirm_navigation_calibration_params_tool" not in names
-
-
 def test_executor_instructions_use_generic_step_to_tool_mapping_for_calibration_confirmation():
     assert "plan_id and step_id" in EXECUTOR_AGENT_INSTRUCTIONS
     assert "Canonical arguments are loaded by code" in EXECUTOR_AGENT_INSTRUCTIONS
@@ -68,7 +60,7 @@ def test_session_prompt_warns_against_legacy_workflow_control_tools():
     agent = VLASessionAgent(use_llm_router=False)
     prompt = agent.session_system_prompt()
 
-    assert "Navigation planning uses sensor bindings and processing_profile" in prompt
+    assert "factual observations and one complete model-authored JSON plan" in prompt
     assert "Fixed platform names are hints, not hard execution categories" in prompt
     assert (
         "Navigation data processing is handled by the dedicated web NavigationDataAgent. "
@@ -854,18 +846,42 @@ def test_session_outer_tool_events_are_normalized_without_stream_duplicates():
     assert tool_events[1]["payload"]["status"] == "completed"
 
 
-def _direct_workflow_fakes(monkeypatch, *, executor_output="done"):
+def _direct_workflow_fakes(
+    monkeypatch,
+    *,
+    executor_output="done",
+    terminal_status="completed",
+):
     plan = SimpleNamespace(
         plan_id="plan-1",
         plan_revision=1,
         model_dump=lambda mode="json": {"plan_id": "plan-1", "status": "active"},
     )
+    complete = terminal_status == "completed"
     plan_store = SimpleNamespace(
         get_execution_overview=lambda _plan_id: SimpleNamespace(
-            model_dump=lambda mode="json": {"plan_id": "plan-1", "current_step_id": "step-1"}
-        )
+            model_dump=lambda mode="json": {
+                "plan_id": "plan-1",
+                "current_step_id": None if complete else "step-1",
+            }
+        ),
+        get=lambda _plan_id: SimpleNamespace(
+            plan_id="plan-1",
+            status="completed" if complete else "active",
+        ),
+        get_current_step=lambda _plan_id: (
+            None if complete else {"step": {"step_id": "step-1"}}
+        ),
     )
-    services = SimpleNamespace(plan_store=plan_store)
+    completed_task = SimpleNamespace(
+        task_id="task-1",
+        phase=SimpleNamespace(value="completed" if complete else "extract_sync"),
+        status=SimpleNamespace(value=terminal_status),
+    )
+    services = SimpleNamespace(
+        plan_store=plan_store,
+        task_store=SimpleNamespace(get_task=lambda _task_id: completed_task),
+    )
     task = SimpleNamespace(task_id="task-1", phase=SimpleNamespace(value="extract_sync"))
     monkeypatch.setattr(
         "vla_data_juicer_agents.tools.vla.run_workflow.prepare_direct_navigation_entry",
@@ -938,6 +954,50 @@ def test_vla_run_workflow_preserves_approval_pause(tmp_path, monkeypatch):
     )
     assert payload["ok"] is True
     assert payload["status"] == "awaiting_confirmation"
+
+
+@pytest.mark.parametrize(
+    ("durable_status", "expected_status"),
+    [
+        ("failed", "failed"),
+        ("needs_replan", "needs_replan"),
+        ("waiting_user", "waiting_user"),
+        ("running", "incomplete"),
+    ],
+)
+def test_vla_run_workflow_uses_durable_terminal_state_not_assistant_text(
+    tmp_path,
+    monkeypatch,
+    durable_status,
+    expected_status,
+):
+    plan = _direct_workflow_fakes(monkeypatch, terminal_status=durable_status)
+
+    async def fake_plan(*_args, **_kwargs):
+        return plan
+
+    async def fake_executor(*_args, **_kwargs):
+        return "assistant says everything completed"
+
+    monkeypatch.setenv("VLA_RUNS_ROOT", str(tmp_path / "runs"))
+    monkeypatch.setattr(
+        "vla_data_juicer_agents.tools.vla.run_workflow.run_direct_plan_until_submitted",
+        fake_plan,
+    )
+    monkeypatch.setattr(
+        "vla_data_juicer_agents.tools.vla.run_workflow.run_executor_agent",
+        fake_executor,
+    )
+
+    payload = asyncio.run(
+        run_vla_workflow(
+            ToolContext(working_dir=str(tmp_path)),
+            {"date": "20270605", "scene_mode": "out", "dry_run": True},
+        )
+    )
+
+    assert payload["ok"] is False
+    assert payload["status"] == expected_status
 
 
 def test_vla_run_workflow_reraises_cancellation_after_interrupted_report(tmp_path, monkeypatch):

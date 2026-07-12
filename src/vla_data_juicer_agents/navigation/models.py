@@ -3,7 +3,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Literal
 
-from pydantic import BaseModel, Field, field_validator, model_validator
+from pydantic import BaseModel, Field, field_validator
 
 
 DATE_RE = r"^[0-9]{8}$"
@@ -52,71 +52,6 @@ class RawDateInspection(BaseModel):
     @classmethod
     def validate_date(cls, value: str) -> str:
         return _validate_date(value)
-
-
-class PlanIssue(BaseModel):
-    type: str
-    message: str = ""
-    evidence: list[str] = Field(default_factory=list)
-
-
-class NavigationTopicParams(BaseModel):
-    profile_hint: str | None = None
-    confidence: float = 0.0
-    topic_whitelist: list[str] = Field(default_factory=list)
-    topic_map: dict[str, str] = Field(default_factory=dict)
-    query_dir: str | None = None
-    evidence: list[str] = Field(default_factory=list)
-    warnings: list[PlanIssue] = Field(default_factory=list)
-    blocking_issues: list[PlanIssue] = Field(default_factory=list)
-
-
-class NavigationSensorBinding(BaseModel):
-    role: Literal["fisheye_front", "lidar", "odom", "ins", "localization"]
-    topic: str | None = None
-    message_type: str | None = None
-    kind: Literal["camera", "lidar", "odom", "ins", "missing"] | None = None
-    candidates: list[str] = Field(default_factory=list)
-
-
-class NavigationSensorBindings(BaseModel):
-    fisheye_front: NavigationSensorBinding | None = None
-    lidar: NavigationSensorBinding | None = None
-    odom: NavigationSensorBinding | None = None
-    ins: NavigationSensorBinding | None = None
-    localization: NavigationSensorBinding | None = None
-    warnings: list[PlanIssue] = Field(default_factory=list)
-    blocking_issues: list[PlanIssue] = Field(default_factory=list)
-    evidence: list[str] = Field(default_factory=list)
-
-    @model_validator(mode="after")
-    def validate_binding_roles(self) -> "NavigationSensorBindings":
-        for slot in ("fisheye_front", "lidar", "odom", "ins", "localization"):
-            binding = getattr(self, slot)
-            if binding is not None and binding.role != slot:
-                raise ValueError(
-                    f"sensor binding role mismatch for {slot}: expected {slot}, got {binding.role}"
-                )
-        return self
-
-
-class NavigationLocalizationPolicy(BaseModel):
-    source: Literal["odom", "ins", "unknown"]
-    conversion: Literal["odom_to_ins", "none"] = "none"
-
-
-class NavigationGridmapPolicy(BaseModel):
-    source: Literal["existing_gridmap", "generated_from_pcd", "projection_ready", "unknown"] = "unknown"
-
-
-class NavigationCalibrationPolicy(BaseModel):
-    mode: Literal[
-        "hardcoded_with_user_confirmation",
-        "selected_profile",
-        "unknown",
-    ] = "hardcoded_with_user_confirmation"
-    selected_sensor_source: str | None = None
-    requires_user_confirmation: bool = True
 
 
 class CommandRecord(BaseModel):

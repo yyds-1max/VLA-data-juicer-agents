@@ -16,12 +16,13 @@ from vla_data_juicer_agents.navigation.config import NavigationSettings
 from vla_data_juicer_agents.navigation.models import NavigationRequest
 from vla_data_juicer_agents.navigation.run_state import WorkflowRunStore
 from vla_data_juicer_agents.navigation.workflow import (
+    direct_completed_entry_state,
+    direct_execution_terminal_state,
     prepare_direct_navigation_entry,
     run_direct_plan_until_submitted,
     run_executor_agent,
 )
 
-_CALIBRATION_CONFIRMATION_PAUSE_TOKEN = "calibration_params_not_confirmed"
 _CJK_LANGUAGE_RE = r"[\u3400-\u4dbf\u4e00-\u9fff]"
 _LEGACY_WORKFLOW_RESUME_DISABLED_ERROR_TYPE = "legacy_workflow_resume_disabled"
 _LEGACY_WORKFLOW_RESUME_DISABLED_MESSAGE = (
@@ -154,46 +155,6 @@ def _legacy_workflow_resume_disabled_output(
     )
 
 
-def _contains_calibration_confirmation_pause(value: Any) -> bool:
-    if isinstance(value, str):
-        return _CALIBRATION_CONFIRMATION_PAUSE_TOKEN in value
-    if isinstance(value, Mapping):
-        return any(
-            _contains_calibration_confirmation_pause(item)
-            for pair in value.items()
-            for item in pair
-        )
-    if isinstance(value, (list, tuple, set)):
-        return any(_contains_calibration_confirmation_pause(item) for item in value)
-    return False
-
-
-def _is_calibration_confirmation_pause(final_output: str) -> bool:
-    return _contains_calibration_confirmation_pause(final_output)
-
-
-class _CalibrationConfirmationPauseSink:
-    def __init__(self, source_prefix: str = "navigation.executor") -> None:
-        self.detected = False
-        self._source_prefix = source_prefix
-
-    def publish(self, event: Mapping[str, Any]) -> None:
-        source = event.get("source")
-        if not isinstance(source, str):
-            return
-        if source != self._source_prefix and not source.startswith(f"{self._source_prefix}."):
-            return
-        payload = event.get("payload", {})
-        if (
-            isinstance(payload, Mapping)
-            and payload.get("error_type") == _CALIBRATION_CONFIRMATION_PAUSE_TOKEN
-        ):
-            self.detected = True
-            return
-        if _contains_calibration_confirmation_pause(payload):
-            self.detected = True
-
-
 async def run_vla_workflow(ctx: ToolContext, raw_args: RunVLAWorkflowInput | dict[str, Any]) -> dict[str, Any]:
     args = raw_args if isinstance(raw_args, RunVLAWorkflowInput) else RunVLAWorkflowInput.model_validate(raw_args)
     if args.scene_mode is None:
@@ -223,8 +184,7 @@ async def run_vla_workflow(ctx: ToolContext, raw_args: RunVLAWorkflowInput | dic
     incoming_scope = runtime_values.get("event_scope")
     incoming_emitter = runtime_values.get("event_emitter")
     emitter = getattr(incoming_scope, "emitter", None) or incoming_emitter or EventEmitter()
-    calibration_pause_sink = _CalibrationConfirmationPauseSink()
-    emitter = emitter.with_sink(JsonlEventSink(run_dir / "events.jsonl")).with_sink(calibration_pause_sink)
+    emitter = emitter.with_sink(JsonlEventSink(run_dir / "events.jsonl"))
     workflow_scope = emitter.scope(
         "navigation.workflow",
         parent_run_id=getattr(incoming_scope, "run_id", None),
@@ -251,6 +211,18 @@ async def run_vla_workflow(ctx: ToolContext, raw_args: RunVLAWorkflowInput | dic
             agentscope_session_id=session_id,
             user_request=_latest_user_message(ctx),
         )
+        completed_entry = direct_completed_entry_state(task)
+        if completed_entry is not None:
+            payload = RunVLAWorkflowOutput(
+                ok=True,
+                status="completed",
+                run_dir=str(run_dir),
+                artifacts=_artifact_paths(run_dir),
+                message=json.dumps(completed_entry, ensure_ascii=False),
+            ).model_dump(mode="json")
+            run_store.write_json(run_dir, "final_report.json", payload)
+            emit_terminal("completed")
+            return payload
         if task.phase.value not in {"extract_sync", "finish_processing"}:
             raise RuntimeError(f"navigation task is not ready for planning: {task.phase.value}")
         plan = await run_direct_plan_until_submitted(
@@ -301,25 +273,22 @@ async def run_vla_workflow(ctx: ToolContext, raw_args: RunVLAWorkflowInput | dic
             cancellation=cancellation,
             response_language=response_language,
         )
-        if calibration_pause_sink.detected or _is_calibration_confirmation_pause(final_output):
-            payload = _legacy_workflow_resume_disabled_output(
-                run_dir=run_dir,
-                artifacts=_artifact_paths(run_dir),
-                final_output=final_output,
-            ).model_dump(mode="json")
-            run_store.write_json(run_dir, "final_report.json", payload)
-            emit_terminal("disabled")
-            return payload
+        terminal = direct_execution_terminal_state(
+            services=services,
+            task_id=task.task_id,
+            plan_id=plan.plan_id,
+        )
         payload = RunVLAWorkflowOutput(
-            ok=True,
-            status="completed",
+            ok=terminal["ok"],
+            status=terminal["status"],
             run_dir=str(run_dir),
             artifacts=_artifact_paths(run_dir),
             final_output=final_output,
+            error_type=(None if terminal["ok"] else terminal["status"]),
             message=final_output,
         ).model_dump(mode="json")
         run_store.write_json(run_dir, "final_report.json", payload)
-        emit_terminal("completed")
+        emit_terminal("completed" if terminal["ok"] else terminal["status"])
         return payload
     except TurnCancelled as exc:
         payload = RunVLAWorkflowOutput(

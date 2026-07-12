@@ -261,7 +261,7 @@ def test_removed_calibration_external_tool_is_ignored():
                         {
                             "date": "20270605",
                             "segments": ["20260605_152856"],
-                            "platform_hint": "go2w",
+                            "runtime_variant": "cjl_0525_with_gridmap",
                         }
                     ),
                 )

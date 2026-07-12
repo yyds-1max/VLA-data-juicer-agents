@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import json
 import sys
 
 from vla_data_juicer_agents.navigation.agent_tools import resolve_navigation_agent_tools
@@ -10,6 +11,8 @@ from vla_data_juicer_agents.navigation.config import NavigationSettings
 from vla_data_juicer_agents.navigation.models import NavigationRequest
 from vla_data_juicer_agents.navigation.run_state import WorkflowRunStore
 from vla_data_juicer_agents.navigation.workflow import (
+    direct_completed_entry_state,
+    direct_execution_terminal_state,
     prepare_direct_navigation_entry,
     run_direct_plan_until_submitted,
     run_executor_agent,
@@ -50,6 +53,11 @@ async def async_main(argv: list[str] | None = None) -> int:
             agentscope_session_id=session_id,
             user_request="CLI navigation workflow",
         )
+        completed_entry = direct_completed_entry_state(task)
+        if completed_entry is not None:
+            run_store.write_json(run_dir, "final_report.json", completed_entry)
+            print(json.dumps(completed_entry, ensure_ascii=False, indent=2))
+            return 0
         if task.phase.value not in {"extract_sync", "finish_processing"}:
             raise RuntimeError(f"navigation task is not ready for planning: {task.phase.value}")
         plan = await run_direct_plan_until_submitted(
@@ -80,13 +88,19 @@ async def async_main(argv: list[str] | None = None) -> int:
             run_store=run_store,
             run_dir=run_dir,
         )
+        terminal = direct_execution_terminal_state(
+            services=services,
+            task_id=task.task_id,
+            plan_id=plan.plan_id,
+        )
+        terminal["final_output"] = final_output
         run_store.write_json(
             run_dir,
             "final_report.json",
-            {"status": "completed", "ok": True, "final_output": final_output},
+            terminal,
         )
         print(final_output)
-        return 0
+        return 0 if terminal["ok"] else 2
     except Exception as exc:
         run_store.write_json(
             run_dir,

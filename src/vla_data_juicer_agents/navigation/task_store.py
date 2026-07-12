@@ -7,6 +7,7 @@ from typing import Any, Protocol
 from uuid import uuid4
 
 from vla_data_juicer_agents.navigation.aggregate_revision import (
+    NAVIGATION_AGGREGATE_REVISION_TRIGGER_NAMES,
     ensure_navigation_aggregate_revision_triggers,
 )
 
@@ -307,15 +308,11 @@ class SqliteNavigationTaskStore:
 
         connection.commit()
         connection.execute("PRAGMA foreign_keys = OFF")
+        connection.execute("PRAGMA legacy_alter_table = ON")
         try:
             connection.execute("BEGIN IMMEDIATE")
-            trigger_rows = connection.execute(
-                """SELECT name FROM sqlite_master
-                WHERE type = 'trigger' AND sql LIKE '%navigation_tasks%'"""
-            ).fetchall()
-            for trigger_row in trigger_rows:
-                trigger_name = str(trigger_row["name"]).replace('"', '""')
-                connection.execute(f'DROP TRIGGER "{trigger_name}"')
+            for trigger_name in NAVIGATION_AGGREGATE_REVISION_TRIGGER_NAMES:
+                connection.execute(f'DROP TRIGGER IF EXISTS "{trigger_name}"')
             connection.execute("DROP TABLE IF EXISTS navigation_tasks_new")
             connection.execute(
                 """
@@ -388,6 +385,7 @@ class SqliteNavigationTaskStore:
             connection.rollback()
             raise
         finally:
+            connection.execute("PRAGMA legacy_alter_table = OFF")
             connection.execute("PRAGMA foreign_keys = ON")
         violations = connection.execute("PRAGMA foreign_key_check").fetchall()
         if violations:

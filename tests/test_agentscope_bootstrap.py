@@ -107,9 +107,6 @@ def test_navigation_agent_prompt_requires_plan_execute_react_and_human_decisions
         "phase_profile_schema",
         "data_profile_draft",
         "data_profile_patch",
-        "infer_navigation_sensor_bindings_tool",
-        "infer_navigation_processing_profile_tool",
-        "infer_navigation_topic_params_tool",
     ]:
         assert legacy_concept not in prompt
 

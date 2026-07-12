@@ -164,6 +164,7 @@ async def run_plan_agent(
     plan_store: Any,
     task_id: str,
     phase: Literal["extract_sync", "finish_processing"],
+    task_store: Any | None = None,
     run_store: WorkflowRunStore | None = None,
     run_dir: Path | None = None,
     event_scope: EventScope | None = None,
@@ -185,7 +186,13 @@ async def run_plan_agent(
         event_scope=event_scope,
         cancellation=cancellation,
     )
-    plan = plan_store.get_active(task_id, phase)
+    current = task_store.get_task(task_id) if task_store is not None else None
+    durable_phase = getattr(getattr(current, "phase", None), "value", phase)
+    if durable_phase not in {"extract_sync", "finish_processing"}:
+        raise RuntimeError(
+            f"Navigation task changed to non-planning phase {durable_phase} before plan lookup."
+        )
+    plan = plan_store.get_active(task_id, durable_phase)
     if plan is None:
         raise RuntimeError(
             f"Navigation planning agent did not submit a valid complete plan for task {task_id} phase {phase}."
@@ -211,7 +218,6 @@ async def run_direct_plan_until_submitted(
     if max_rounds < 1:
         raise ValueError("max_rounds must be positive")
     current = services.task_store.get_task(task.task_id) or task
-    last_revision = current.state_revision
     last_error: RuntimeError | None = None
     for _ in range(max_rounds):
         tools = resolve_navigation_agent_tools(
@@ -219,14 +225,23 @@ async def run_direct_plan_until_submitted(
             agentscope_session_id=agentscope_session_id,
             cancellation=cancellation,
         )
+        round_start = services.task_store.get_task(current.task_id)
+        if round_start is None:
+            raise RuntimeError(f"Navigation task disappeared before planning round: {current.task_id}")
+        if round_start.phase.value not in {"extract_sync", "finish_processing"}:
+            raise RuntimeError(
+                f"Navigation task changed to non-planning phase {round_start.phase.value}."
+            )
+        round_start_revision = round_start.state_revision
         agent = create_plan_agent(model=model, tools=tools)
         try:
             return await run_plan_agent(
                 agent,
                 request,
                 plan_store=services.plan_store,
-                task_id=current.task_id,
-                phase=current.phase.value,
+                task_id=round_start.task_id,
+                phase=round_start.phase.value,
+                task_store=services.task_store,
                 run_store=run_store,
                 run_dir=run_dir,
                 event_scope=event_scope,
@@ -237,13 +252,81 @@ async def run_direct_plan_until_submitted(
             if "did not submit a valid complete plan" not in str(exc):
                 raise
             last_error = exc
-        refreshed = services.task_store.get_task(current.task_id)
-        if refreshed is None or refreshed.state_revision == last_revision:
+        refreshed = services.task_store.get_task(round_start.task_id)
+        if refreshed is None or refreshed.state_revision == round_start_revision:
             raise last_error
         current = refreshed
-        last_revision = refreshed.state_revision
     assert last_error is not None
     raise last_error
+
+
+def direct_execution_terminal_state(
+    *,
+    services: NavigationServices | Any,
+    task_id: str,
+    plan_id: str,
+) -> dict[str, Any]:
+    """Return compact terminal truth from the durable task, plan, and ledger."""
+    task = services.task_store.get_task(task_id)
+    plan = services.plan_store.get(plan_id)
+    if task is None or plan is None:
+        return {
+            "ok": False,
+            "status": "failed",
+            "error_type": "durable_navigation_state_missing",
+            "task_id": task_id,
+            "plan_id": plan_id,
+        }
+    overview = services.plan_store.get_execution_overview(plan_id).model_dump(mode="json")
+    current = services.plan_store.get_current_step(plan_id)
+    task_status = task.status.value
+    task_phase = task.phase.value
+    plan_status = getattr(plan.status, "value", plan.status)
+    complete = (
+        task_status == "completed"
+        and task_phase == "completed"
+        and plan_status == "completed"
+        and current is None
+        and overview.get("current_step_id") is None
+    )
+    if complete:
+        status = "completed"
+    elif task_status in {
+        "failed", "needs_replan", "needs_reconcile", "needs_rerun", "waiting_user"
+    }:
+        status = task_status
+    else:
+        status = "incomplete"
+    return {
+        "ok": complete,
+        "status": status,
+        "task_id": task.task_id,
+        "task_phase": task_phase,
+        "task_status": task_status,
+        "plan_id": plan_id,
+        "plan_status": plan_status,
+        "current_step": current,
+        "execution_overview": overview,
+    }
+
+
+def direct_completed_entry_state(task: Any) -> dict[str, Any] | None:
+    """Return a compact success when entry reconciliation proves work is complete."""
+    if task.phase.value != "completed" or task.status.value != "completed":
+        return None
+    snapshot = task.artifact_snapshot
+    return {
+        "ok": True,
+        "status": "completed",
+        "task_id": task.task_id,
+        "task_phase": task.phase.value,
+        "task_status": task.status.value,
+        "artifacts": (
+            snapshot.model_dump(mode="json")
+            if snapshot is not None
+            else None
+        ),
+    }
 
 
 async def run_executor_agent(

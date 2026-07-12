@@ -4,13 +4,6 @@ import json
 from pathlib import Path
 from typing import Any
 
-from agentscope.tool import FunctionTool
-
-from vla_data_juicer_agents.core.cancellation import (
-    CancellationContext,
-    bind_cancellation,
-    current_cancellation,
-)
 from vla_data_juicer_agents.navigation.config import NavigationSettings
 from vla_data_juicer_agents.navigation.models import DATE_RE, ToolResult
 from vla_data_juicer_agents.navigation.runtime import (
@@ -24,36 +17,6 @@ from vla_data_juicer_agents.navigation.subprocess_runner import run_command
 PROCESSING_SCRIPT_ROOT = Path(__file__).resolve().parent / "processing"
 REPOSITORY_EXTRACT_SCRIPT = PROCESSING_SCRIPT_ROOT / "extract_ros2_bag.py"
 REPOSITORY_SYNC_SCRIPT = PROCESSING_SCRIPT_ROOT / "sync_navigation_data.py"
-
-
-def _normalize_segments_arg(segments: list[str] | str | None) -> list[str] | None:
-    if segments is None:
-        return None
-    if isinstance(segments, str):
-        stripped = segments.strip()
-        if stripped.startswith("["):
-            payload = json.loads(stripped)
-            if isinstance(payload, list) and all(isinstance(item, str) for item in payload):
-                return payload
-        return [stripped] if stripped else None
-    return segments
-
-
-def _normalize_string_list_arg(value: list[str] | str | None) -> list[str] | None:
-    return _normalize_segments_arg(value)
-
-
-def _normalize_string_dict_arg(value: dict[str, str] | str | None) -> dict[str, str] | None:
-    if value is None:
-        return None
-    if isinstance(value, str):
-        payload = json.loads(value)
-        if not isinstance(payload, dict) or not all(
-            isinstance(key, str) and isinstance(child, str) for key, child in payload.items()
-        ):
-            raise ValueError("expected a JSON object with string keys and values")
-        return payload
-    return value
 
 
 def _validate_date(date: str) -> str:
@@ -458,8 +421,6 @@ def extract_and_sync_navigation_data(
     query_dir: str | None = None,
     settings: NavigationSettings | None = None,
     dry_run: bool = False,
-    processing_profile: str | None = None,
-    platform_hint: str | None = None,
 ) -> ToolResult:
     date = _validate_date(date)
     settings = settings or NavigationSettings()
@@ -474,8 +435,6 @@ def extract_and_sync_navigation_data(
             ),
             produced_paths=[settings.clip_data_root / date],
             details={
-                "processing_profile": processing_profile,
-                "platform_hint": platform_hint,
                 "missing_topic_params": missing_topic_params,
                 "dry_run": dry_run,
             },
@@ -496,8 +455,6 @@ def extract_and_sync_navigation_data(
             message="No selected segments for extract/sync.",
             produced_paths=[settings.clip_data_root / date],
             details={
-                "processing_profile": processing_profile,
-                "platform_hint": platform_hint,
                 "selected_segments": selected,
                 "extract_topics": effective_topic_whitelist,
                 "sync_topic_map": effective_topic_map,
@@ -591,8 +548,6 @@ def extract_and_sync_navigation_data(
         produced_paths=[settings.clip_data_root / date],
         commands=commands,
         details={
-            "processing_profile": processing_profile,
-            "platform_hint": platform_hint,
             "selected_segments": selected,
             "extract_topics": effective_topic_whitelist,
             "sync_topic_map": effective_topic_map,
@@ -936,51 +891,6 @@ def run_initial_annotation_gui(
     )
 
 
-def run_tracking_and_projection(
-    finish_temp_path: str | Path,
-    finish_path: str | Path,
-    settings: NavigationSettings | None = None,
-    dry_run: bool = False,
-    processing_profile: str | None = None,
-    platform_hint: str | None = None,
-    projection_variant: str | None = None,
-) -> ToolResult:
-    settings = settings or NavigationSettings()
-    root = _resolve_data_path(finish_temp_path, settings)
-    date = root.name.removesuffix("_temp")
-    tracking_result = run_tracking(root, settings=settings, dry_run=dry_run)
-    gridmap_result = prepare_gridmap_for_projection(
-        date,
-        finish_temp_path=root,
-        settings=settings,
-        dry_run=dry_run,
-    )
-    projection_result = run_projection_and_trajectory(
-        root,
-        finish_path,
-        processing_profile=processing_profile,
-        platform_hint=platform_hint,
-        projection_variant=projection_variant,
-        settings=settings,
-        dry_run=dry_run,
-    )
-    commands = [*tracking_result.commands, *gridmap_result.commands, *projection_result.commands]
-    ok = tracking_result.ok and gridmap_result.ok and projection_result.ok
-    return ToolResult(
-        ok=ok,
-        tool_name="run_tracking_and_projection",
-        message="Ran tracking and projection." if ok else "Tracking/projection failed.",
-        produced_paths=projection_result.produced_paths,
-        commands=commands,
-        details={
-            **tracking_result.details,
-            "gridmap": gridmap_result.details,
-            "projection": projection_result.details,
-            "dry_run": dry_run,
-        },
-    )
-
-
 def run_tracking(
     finish_temp_path: str | Path,
     settings: NavigationSettings | None = None,
@@ -1027,8 +937,6 @@ def _trajectory_script_for_projection_variant(projection_variant: str) -> tuple[
 def run_projection_and_trajectory(
     finish_temp_path: str | Path,
     finish_path: str | Path,
-    processing_profile: str | None = None,
-    platform_hint: str | None = None,
     projection_variant: str | None = None,
     settings: NavigationSettings | None = None,
     dry_run: bool = False,
@@ -1094,8 +1002,6 @@ def run_projection_and_trajectory(
         commands=commands,
         details={
             "dry_run": dry_run,
-            "processing_profile": processing_profile,
-            "platform_hint": platform_hint,
             "projection_variant": effective_projection_variant,
             "trajectory_script": trajectory_script,
         },
@@ -1136,235 +1042,3 @@ def validate_navigation_outputs(
             "dry_run": dry_run,
         },
     )
-
-
-def _make_function_tool(func, name: str, dry_run: bool):
-    return FunctionTool(
-        func,
-        name=name,
-        is_concurrency_safe=False,
-        is_read_only=dry_run,
-    )
-
-
-def _execute_with_cancellation(
-    cancellation: CancellationContext | None,
-    function,
-    *args,
-    **kwargs,
-):
-    active_cancellation = cancellation or current_cancellation()
-    if active_cancellation is not None:
-        active_cancellation.raise_if_cancelled()
-    with bind_cancellation(active_cancellation):
-        return function(*args, **kwargs)
-
-
-def build_execution_tools(
-    dry_run: bool = False,
-    cancellation: CancellationContext | None = None,
-    settings: NavigationSettings | None = None,
-) -> list[Any]:
-    def bound_prepare_raw_data_tool(date: str, segments: list[str] | str | None = None) -> dict:
-        return _execute_with_cancellation(
-            cancellation,
-            prepare_raw_data,
-            date,
-            _normalize_segments_arg(segments),
-            settings=settings,
-            dry_run=dry_run,
-        ).model_dump(mode="json")
-
-    def bound_extract_and_sync_navigation_data_tool(
-        date: str,
-        segments: list[str] | str | None = None,
-        processes_num: int = 4,
-        topic_whitelist: list[str] | str | None = None,
-        topic_map: dict[str, str] | str | None = None,
-        query_dir: str | None = None,
-        processing_profile: str | None = None,
-        platform_hint: str | None = None,
-    ) -> dict:
-        """Extract and sync raw navigation data using explicit topic_whitelist, topic_map, and query_dir."""
-        return _execute_with_cancellation(
-            cancellation,
-            extract_and_sync_navigation_data,
-            date=date,
-            segments=_normalize_segments_arg(segments),
-            processes_num=processes_num,
-            topic_whitelist=_normalize_string_list_arg(topic_whitelist),
-            topic_map=_normalize_string_dict_arg(topic_map),
-            query_dir=query_dir,
-            settings=settings,
-            dry_run=dry_run,
-            processing_profile=processing_profile,
-            platform_hint=platform_hint,
-        ).model_dump(mode="json")
-
-    def bound_generate_gridmap_from_pcd_tool(date: str, segments: list[str] | str | None = None) -> dict:
-        return _execute_with_cancellation(
-            cancellation,
-            generate_gridmap_from_pcd,
-            date,
-            _normalize_segments_arg(segments),
-            settings=settings,
-            dry_run=dry_run,
-        ).model_dump(mode="json")
-
-    def bound_assemble_finish_temp_tool(
-        date: str,
-        segments: list[str] | str | None = None,
-        platform_hint: str | None = None,
-        processing_profile: str | None = None,
-    ) -> dict:
-        return _execute_with_cancellation(
-            cancellation,
-            assemble_finish_temp,
-            date,
-            _normalize_segments_arg(segments),
-            settings=settings,
-            platform_hint=platform_hint,
-            processing_profile=processing_profile,
-            dry_run=dry_run,
-        ).model_dump(mode="json")
-
-    def bound_run_noobscene_preprocessing_tool(
-        finish_temp_path: str,
-        localization_source: str = "odom",
-        localization_conversion: str = "odom_to_ins",
-    ) -> dict:
-        return _execute_with_cancellation(
-            cancellation,
-            run_noobscene_preprocessing,
-            finish_temp_path,
-            settings=settings,
-            dry_run=dry_run,
-            localization_source=localization_source,
-            localization_conversion=localization_conversion,
-        ).model_dump(mode="json")
-
-    def bound_run_initial_annotation_gui_tool(finish_temp_path: str) -> dict:
-        return _execute_with_cancellation(
-            cancellation,
-            run_initial_annotation_gui,
-            finish_temp_path,
-            settings=settings,
-            dry_run=dry_run,
-        ).model_dump(mode="json")
-
-    def bound_run_tracking_tool(finish_temp_path: str) -> dict:
-        return _execute_with_cancellation(
-            cancellation,
-            run_tracking,
-            finish_temp_path,
-            settings=settings,
-            dry_run=dry_run,
-        ).model_dump(mode="json")
-
-    def bound_prepare_gridmap_for_projection_tool(
-        date: str,
-        segments: list[str] | str | None = None,
-        finish_temp_path: str | None = None,
-        gridmap_variant: str | None = None,
-    ) -> dict:
-        """Prepare projection grid_map inputs using an explicit gridmap strategy variant."""
-        return _execute_with_cancellation(
-            cancellation,
-            prepare_gridmap_for_projection,
-            date,
-            _normalize_segments_arg(segments),
-            finish_temp_path=finish_temp_path,
-            settings=settings,
-            dry_run=dry_run,
-            gridmap_variant=gridmap_variant,
-        ).model_dump(mode="json")
-
-    def bound_run_projection_and_trajectory_tool(
-        finish_temp_path: str,
-        finish_path: str,
-        processing_profile: str | None = None,
-        platform_hint: str | None = None,
-        projection_variant: str | None = None,
-    ) -> dict:
-        """Run projection and trajectory scripts using explicit projection_variant."""
-        return _execute_with_cancellation(
-            cancellation,
-            run_projection_and_trajectory,
-            finish_temp_path,
-            finish_path,
-            processing_profile=processing_profile,
-            platform_hint=platform_hint,
-            projection_variant=projection_variant,
-            settings=settings,
-            dry_run=dry_run,
-        ).model_dump(mode="json")
-
-    def bound_run_tracking_and_projection_tool(
-        finish_temp_path: str,
-        finish_path: str,
-        processing_profile: str | None = None,
-        platform_hint: str | None = None,
-        projection_variant: str | None = None,
-    ) -> dict:
-        """Run tracking, gridmap preparation, projection, and trajectory with explicit projection_variant."""
-        return _execute_with_cancellation(
-            cancellation,
-            run_tracking_and_projection,
-            finish_temp_path,
-            finish_path,
-            processing_profile=processing_profile,
-            platform_hint=platform_hint,
-            projection_variant=projection_variant,
-            settings=settings,
-            dry_run=dry_run,
-        ).model_dump(mode="json")
-
-    def bound_validate_navigation_outputs_tool(date: str) -> dict:
-        return _execute_with_cancellation(
-            cancellation,
-            validate_navigation_outputs,
-            date,
-            settings=settings,
-            dry_run=dry_run,
-        ).model_dump(mode="json")
-
-    return [
-        _make_function_tool(bound_prepare_raw_data_tool, "prepare_raw_data_tool", dry_run),
-        _make_function_tool(bound_extract_and_sync_navigation_data_tool, "extract_and_sync_navigation_data_tool", dry_run),
-        _make_function_tool(bound_generate_gridmap_from_pcd_tool, "generate_gridmap_from_pcd_tool", dry_run),
-        _make_function_tool(bound_assemble_finish_temp_tool, "assemble_finish_temp_tool", dry_run),
-        _make_function_tool(bound_run_noobscene_preprocessing_tool, "run_noobscene_preprocessing_tool", dry_run),
-        _make_function_tool(bound_run_initial_annotation_gui_tool, "run_initial_annotation_gui_tool", dry_run),
-        _make_function_tool(bound_run_tracking_tool, "run_tracking_tool", dry_run),
-        _make_function_tool(bound_prepare_gridmap_for_projection_tool, "prepare_gridmap_for_projection_tool", dry_run),
-        _make_function_tool(bound_run_projection_and_trajectory_tool, "run_projection_and_trajectory_tool", dry_run),
-        _make_function_tool(bound_run_tracking_and_projection_tool, "run_tracking_and_projection_tool", dry_run),
-        _make_function_tool(bound_validate_navigation_outputs_tool, "validate_navigation_outputs_tool", dry_run),
-    ]
-
-
-def create_navigation_execution_tools(
-    dry_run: bool = False,
-    cancellation: CancellationContext | None = None,
-    settings: NavigationSettings | None = None,
-) -> list[Any]:
-    return build_execution_tools(
-        dry_run=dry_run,
-        cancellation=cancellation,
-        settings=settings,
-    )
-
-
-(
-    prepare_raw_data_tool,
-    extract_and_sync_navigation_data_tool,
-    generate_gridmap_from_pcd_tool,
-    assemble_finish_temp_tool,
-    run_noobscene_preprocessing_tool,
-    run_initial_annotation_gui_tool,
-    run_tracking_tool,
-    prepare_gridmap_for_projection_tool,
-    run_projection_and_trajectory_tool,
-    run_tracking_and_projection_tool,
-    validate_navigation_outputs_tool,
-) = build_execution_tools(dry_run=False)

@@ -98,7 +98,7 @@ class FakeMainAgent:
                 parent_run_id=workflow_run,
                 timestamp=base + timedelta(milliseconds=5),
                 call_id=f"profile_{turn}",
-                tool="infer_navigation_processing_profile_tool",
+                tool="inspect_navigation_sensor_candidates_tool",
             ),
             _event(
                 "tool_end",
@@ -107,7 +107,7 @@ class FakeMainAgent:
                 parent_run_id=workflow_run,
                 timestamp=base + timedelta(milliseconds=6),
                 call_id=f"profile_{turn}",
-                tool="infer_navigation_processing_profile_tool",
+                tool="inspect_navigation_sensor_candidates_tool",
                 status="completed",
                 summary="inferred parameterized_navigation_v1 profile for go2w",
             ),

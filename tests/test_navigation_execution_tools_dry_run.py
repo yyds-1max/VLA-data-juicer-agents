@@ -1,16 +1,12 @@
-import asyncio
-import inspect
 import json
 import shutil
 from pathlib import Path
-from types import SimpleNamespace
 
 import pytest
 
 from vla_data_juicer_agents.navigation.config import NavigationSettings
 from vla_data_juicer_agents.navigation.execution_tools import (
     assemble_finish_temp,
-    build_execution_tools,
     confirm_navigation_calibration_params,
     extract_and_sync_navigation_data,
     generate_gridmap_from_pcd,
@@ -20,53 +16,10 @@ from vla_data_juicer_agents.navigation.execution_tools import (
     run_noobscene_preprocessing,
     run_projection_and_trajectory,
     run_tracking,
-    run_tracking_and_projection,
     validate_navigation_outputs,
 )
 from vla_data_juicer_agents.navigation.models import CommandRecord, ToolResult
 
-
-def _invoke_tool(tool, arguments):
-    async def _call():
-        payload = tool(**arguments)
-        if inspect.isawaitable(payload):
-            payload = await payload
-        return _decode_tool_payload(payload)
-
-    return asyncio.run(_call())
-
-
-def _decode_tool_payload(payload):
-    if isinstance(payload, dict):
-        return payload
-    if isinstance(payload, str):
-        return json.loads(payload)
-    if hasattr(payload, "content"):
-        return _decode_tool_payload(payload.content)
-    if hasattr(payload, "model_dump"):
-        return payload.model_dump(mode="json")
-    if isinstance(payload, (list, tuple)):
-        texts = [
-            block.text
-            for block in payload
-            if hasattr(block, "text") and isinstance(block.text, str)
-        ]
-        if texts:
-            return _decode_tool_payload("".join(texts))
-    return payload
-
-
-def test_invoke_tool_helper_uses_agentscope_call_protocol():
-    class FakeAgentScopeTool:
-        name = "fake_tool"
-
-        async def __call__(self, value: str):
-            return SimpleNamespace(content=[SimpleNamespace(text=json.dumps({"value": value}))])
-
-        def on_invoke_tool(self, *_args, **_kwargs):
-            raise AssertionError("OpenAI on_invoke_tool must not be used")
-
-    assert _invoke_tool(FakeAgentScopeTool(), {"value": "ok"}) == {"value": "ok"}
 
 
 def _command_text(command: list[str]) -> str:
@@ -113,89 +66,6 @@ def test_prepare_raw_data_dry_run_defaults_to_all_segments(tmp_path):
     assert result.ok is True
     assert "20260605_152856" in result.details["selected_segments"]
     assert "20260605_152930" in result.details["selected_segments"]
-
-
-def test_prepare_raw_data_tool_accepts_structured_segments_array(tmp_path, monkeypatch):
-    root = tmp_path / "VLADatasets"
-    raw_date = root / "raw_data" / "20270605"
-    (raw_date / "20260605_152856").mkdir(parents=True)
-    monkeypatch.setenv("VLA_VLADATASETS_ROOT", str(root))
-    tool = {tool.name: tool for tool in build_execution_tools(dry_run=True)}["prepare_raw_data_tool"]
-
-    result = _invoke_tool(tool, {"date": "20270605", "segments": ["20260605_152856"]})
-
-    assert result["ok"] is True
-    assert result["details"]["selected_segments"] == ["20260605_152856"]
-    assert not (root / "raw_data" / "20270605_temp").exists()
-
-
-def test_prepare_raw_data_tool_accepts_json_segments_string(tmp_path, monkeypatch):
-    root = tmp_path / "VLADatasets"
-    raw_date = root / "raw_data" / "20270605"
-    (raw_date / "20260605_152856").mkdir(parents=True)
-    monkeypatch.setenv("VLA_VLADATASETS_ROOT", str(root))
-    tool = {tool.name: tool for tool in build_execution_tools(dry_run=True)}["prepare_raw_data_tool"]
-
-    result = _invoke_tool(tool, {"date": "20270605", "segments": '["20260605_152856"]'})
-
-    assert result["ok"] is True
-    assert result["details"]["selected_segments"] == ["20260605_152856"]
-    assert not (root / "raw_data" / "20270605_temp").exists()
-
-
-def test_extract_and_sync_tool_accepts_processing_profile_topic_args_without_dataset_profile(tmp_path, monkeypatch):
-    root = tmp_path / "VLADatasets"
-    (root / "raw_data" / "20270605_temp" / "20260605_152856").mkdir(parents=True)
-    monkeypatch.setenv("VLA_VLADATASETS_ROOT", str(root))
-    monkeypatch.setenv("VLA_DATATOOLBOX_SRC", "/datatoolbox/src")
-    tool = {tool.name: tool for tool in build_execution_tools(dry_run=True)}["extract_and_sync_navigation_data_tool"]
-    topic_params = _go2w_topic_params()
-
-    result = _invoke_tool(
-        tool,
-        {
-            "date": "20270605",
-            "segments": ["20260605_152856"],
-            "processing_profile": "parameterized_navigation_v1",
-            "platform_hint": "go2w",
-            **topic_params,
-        },
-    )
-
-    assert result["ok"] is True
-    assert result["details"]["processing_profile"] == "parameterized_navigation_v1"
-    assert result["details"]["platform_hint"] == "go2w"
-    assert result["details"]["extract_topics"] == topic_params["topic_whitelist"]
-    assert result["details"]["sync_topic_map"] == topic_params["topic_map"]
-    assert result["details"]["query_dir"] == topic_params["query_dir"]
-
-
-def test_extract_and_sync_tool_accepts_json_encoded_list_and_dict_args(tmp_path, monkeypatch):
-    root = tmp_path / "VLADatasets"
-    (root / "raw_data" / "20270605_temp" / "20260605_152856").mkdir(parents=True)
-    monkeypatch.setenv("VLA_VLADATASETS_ROOT", str(root))
-    monkeypatch.setenv("VLA_DATATOOLBOX_SRC", "/datatoolbox/src")
-    tool = {tool.name: tool for tool in build_execution_tools(dry_run=True)}["extract_and_sync_navigation_data_tool"]
-    topic_params = _go2w_topic_params()
-
-    result = _invoke_tool(
-        tool,
-        {
-            "date": "20270605",
-            "segments": json.dumps(["20260605_152856"]),
-            "processing_profile": "parameterized_navigation_v1",
-            "platform_hint": "go2w",
-            "topic_whitelist": json.dumps(topic_params["topic_whitelist"]),
-            "topic_map": json.dumps(topic_params["topic_map"]),
-            "query_dir": topic_params["query_dir"],
-        },
-    )
-
-    assert result["ok"] is True
-    assert result["details"]["selected_segments"] == ["20260605_152856"]
-    assert result["details"]["extract_topics"] == topic_params["topic_whitelist"]
-    assert result["details"]["sync_topic_map"] == topic_params["topic_map"]
-    assert result["details"]["query_dir"] == topic_params["query_dir"]
 
 
 def test_generate_gridmap_from_pcd_dry_run_builds_command(tmp_path):
@@ -476,17 +346,6 @@ def test_confirm_navigation_calibration_params_rejects_unconfirmed_input(tmp_pat
     assert not (settings.finish_data_root / "20270605_temp").exists()
 
 
-def test_build_execution_tools_does_not_expose_calibration_confirmation_tool(tmp_path):
-    settings = NavigationSettings(
-        vladatasets_root=tmp_path / "VLADatasets",
-        processing_root=tmp_path / "processing",
-    )
-    tools = build_execution_tools(settings=settings, dry_run=True)
-    names = {tool.name for tool in tools}
-
-    assert "confirm_navigation_calibration_params_tool" not in names
-
-
 def test_prepare_gridmap_for_projection_copies_and_transforms_existing_gridmap(tmp_path):
     root = tmp_path / "VLADatasets"
     source = root / "clip_data" / "20270605" / "20260605_152856" / "sync_data" / "clip_a" / "grid_map"
@@ -551,20 +410,6 @@ def test_initial_annotation_gui_dry_run_uses_data_runtime_setup(tmp_path):
     assert 'exec "$AGENT_DATA_PYTHON" /processing/0_1th_box/gen_box.py' in shell
 
 
-def test_tracking_and_projection_dry_run_runs_tracking_for_matching_yaml(tmp_path):
-    root = tmp_path / "VLADatasets"
-    finish_temp = root / "finish_data" / "20270605_temp"
-    clip = finish_temp / "samples" / "20270605" / "20260605_152856"
-    clip.mkdir(parents=True)
-    (clip / "master_color_color_color.yaml").write_text("{}", encoding="utf-8")
-    settings = NavigationSettings(vladatasets_root=root, processing_root=Path("/processing"))
-
-    result = run_tracking(finish_temp, settings=settings, dry_run=True)
-
-    assert any(_command_text(record.command).endswith("./bin/main") for record in result.commands)
-    assert result.details["tracking_yaml_count"] == 1
-
-
 def test_run_tracking_dry_run_only_runs_tracking_loop(tmp_path):
     root = tmp_path / "VLADatasets"
     finish_temp = root / "finish_data" / "20270605_temp"
@@ -594,9 +439,8 @@ def test_tracking_binary_dry_run_uses_data_runtime_setup(tmp_path):
         data_env_setup=Path("/env/setup_data_runtime.sh"),
     )
 
-    result = run_tracking_and_projection(
+    result = run_tracking(
         finish_temp,
-        root / "finish_data" / "20270605",
         settings=settings,
         dry_run=True,
     )
@@ -784,42 +628,6 @@ def test_projection_and_trajectory_uses_explicit_projection_variant_script_choic
     assert any("/processing/2_pt_project/2_othermethod_cjl_0525.py" in shell for shell in shells)
 
 
-def test_projection_tool_uses_projection_variant_without_platform_bucket(tmp_path, monkeypatch):
-    root = tmp_path / "VLADatasets"
-    finish_temp = root / "finish_data" / "20270605_temp"
-    monkeypatch.setenv("VLA_VLADATASETS_ROOT", str(root))
-    monkeypatch.setenv("VLA_PROCESSING_ROOT", "/processing")
-    tool = {tool.name: tool for tool in build_execution_tools(dry_run=True)}["run_projection_and_trajectory_tool"]
-
-    result = _invoke_tool(
-        tool,
-        {
-            "finish_temp_path": str(finish_temp),
-            "finish_path": str(root / "finish_data" / "20270605"),
-            "processing_profile": "parameterized_navigation_v1",
-            "platform_hint": "unknown",
-            "projection_variant": "cjl_0525_with_gridmap",
-        },
-    )
-
-    shells = [_command_text(record["command"]) for record in result["commands"]]
-    assert result["ok"] is True
-    assert result["details"]["projection_variant"] == "cjl_0525_with_gridmap"
-    assert result["details"]["trajectory_script"] == "2_othermethod_cjl_0525.py"
-    assert any("/processing/2_pt_project/2_othermethod_cjl_0525.py" in shell for shell in shells)
-
-
-def test_build_execution_tools_registers_split_execution_tools(monkeypatch, tmp_path):
-    monkeypatch.setenv("VLA_VLADATASETS_ROOT", str(tmp_path / "VLADatasets"))
-
-    names = {tool.name for tool in build_execution_tools(dry_run=True)}
-
-    assert "run_tracking_tool" in names
-    assert "prepare_gridmap_for_projection_tool" in names
-    assert "run_projection_and_trajectory_tool" in names
-    assert "run_tracking_and_projection_tool" in names
-
-
 def test_validate_navigation_outputs_checks_grid_map(tmp_path):
     root = tmp_path / "VLADatasets"
     final = root / "finish_data" / "20270605"
@@ -867,20 +675,6 @@ def test_prepare_gridmap_copy_existing_variant_does_not_generate_when_missing(tm
     assert result.details["source_mode"] == "missing_existing_gridmap"
 
 
-def test_navigation_execution_tools_schema_allows_structured_or_json_encoded_arguments():
-    tools = {tool.name: tool for tool in build_execution_tools(dry_run=False)}
-
-    prepare_schema = tools["prepare_raw_data_tool"].input_schema
-    assert prepare_schema["properties"]["segments"]["anyOf"][0]["type"] == "array"
-    assert {"type": "string"} in prepare_schema["properties"]["segments"]["anyOf"]
-
-    extract_schema = tools["extract_and_sync_navigation_data_tool"].input_schema
-    assert extract_schema["properties"]["topic_whitelist"]["anyOf"][0]["type"] == "array"
-    assert extract_schema["properties"]["topic_map"]["anyOf"][0]["type"] == "object"
-    assert {"type": "string"} in extract_schema["properties"]["topic_whitelist"]["anyOf"]
-    assert {"type": "string"} in extract_schema["properties"]["topic_map"]["anyOf"]
-
-
 def test_prepare_gridmap_generate_variant_runs_pcd_generator_when_missing(tmp_path, monkeypatch):
     settings = NavigationSettings(vladatasets_root=tmp_path / "VLADatasets")
     calls = []
@@ -916,26 +710,15 @@ def test_prepare_gridmap_generate_variant_runs_pcd_generator_when_missing(tmp_pa
     assert "grid_map" in result.message or "Missing final output" in result.message
 
 
-def test_extract_and_sync_without_topic_params_does_not_use_profile_specific_script_paths(tmp_path):
+def test_extract_and_sync_without_topic_params_fails_without_running_scripts(tmp_path):
     root = tmp_path / "VLADatasets"
     (root / "raw_data" / "20270605_temp" / "20260605_152856").mkdir(parents=True)
     settings = NavigationSettings(vladatasets_root=root, datatoolbox_src=Path("/datatoolbox/src"))
 
     u_result = extract_and_sync_navigation_data("20270605", settings=settings, dry_run=True)
-    go2w_result = extract_and_sync_navigation_data(
-        "20270605",
-        processing_profile="parameterized_navigation_v1",
-        platform_hint="go2w",
-        settings=settings,
-        dry_run=True,
-    )
-
     assert u_result.ok is False
-    assert go2w_result.ok is False
     assert u_result.commands == []
-    assert go2w_result.commands == []
     assert u_result.details["missing_topic_params"] == ["topic_whitelist", "topic_map", "query_dir"]
-    assert go2w_result.details["missing_topic_params"] == ["topic_whitelist", "topic_map", "query_dir"]
 
 
 def test_tracking_moves_original_data_outputs_to_clip_dir(tmp_path, monkeypatch):
@@ -1132,50 +915,6 @@ def test_generate_gridmap_requires_grid_json_under_requested_segment(tmp_path, m
 
     assert result.ok is False
     assert requested_segment in result.message
-
-
-def test_bound_dry_run_prepare_tool_does_not_create_outputs(tmp_path, monkeypatch):
-    root = tmp_path / "VLADatasets"
-    raw_date = root / "raw_data" / "20270605"
-    (raw_date / "20260605_152856").mkdir(parents=True)
-    monkeypatch.setenv("VLA_VLADATASETS_ROOT", str(root))
-    tool = {tool.name: tool for tool in build_execution_tools(dry_run=True)}["prepare_raw_data_tool"]
-
-    result = _invoke_tool(tool, {"date": "20270605"})
-
-    assert result["ok"] is True
-    assert result["details"]["dry_run"] is True
-    assert not (root / "raw_data" / "20270605_temp").exists()
-    assert not (root / "clip_data" / "20270605").exists()
-
-
-def test_bound_run_noobscene_preprocessing_tool_accepts_localization_policy(tmp_path):
-    settings = NavigationSettings(
-        vladatasets_root=tmp_path / "VLADatasets",
-        processing_root=tmp_path / "processing",
-    )
-    finish_temp = settings.finish_data_root / "20270605_temp"
-    finish_temp.mkdir(parents=True)
-    tool = {
-        tool.name: tool
-        for tool in build_execution_tools(settings=settings, dry_run=True)
-    }["run_noobscene_preprocessing_tool"]
-
-    result = _invoke_tool(
-        tool,
-        {
-            "finish_temp_path": str(finish_temp),
-            "localization_source": "ins",
-            "localization_conversion": "none",
-        },
-    )
-
-    shells = [" ".join(record["command"]) for record in result["commands"]]
-    assert result["ok"] is True
-    assert result["details"]["localization_source"] == "ins"
-    assert result["details"]["localization_conversion"] == "none"
-    assert not any("1_odom_convert.py" in shell for shell in shells)
-    assert not any("2_resize.py" in shell for shell in shells)
 
 
 def test_execution_functions_validate_malformed_date(tmp_path):

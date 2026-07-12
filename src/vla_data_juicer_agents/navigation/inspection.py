@@ -4,18 +4,9 @@ from pathlib import Path
 from typing import Literal
 
 import yaml
-from agentscope.tool import FunctionTool
 
 from vla_data_juicer_agents.navigation.config import NavigationSettings
-from vla_data_juicer_agents.navigation.models import (
-    NavigationSensorBinding,
-    NavigationSensorBindings,
-    NavigationTopicParams,
-    PlanIssue,
-    RawDateInspection,
-    SegmentInspection,
-    TopicInfo,
-)
+from vla_data_juicer_agents.navigation.models import RawDateInspection, SegmentInspection, TopicInfo
 from vla_data_juicer_agents.navigation.observation_models import (
     CalibrationInventoryObservation,
     LocalizationSourcesObservation,
@@ -23,50 +14,11 @@ from vla_data_juicer_agents.navigation.observation_models import (
     SensorRoleCandidate,
     TopicCandidatesObservation,
 )
-from vla_data_juicer_agents.navigation.profiles import (
-    TOPIC_OUTPUT_MAP,
-    topics_for_role,
-)
+from vla_data_juicer_agents.navigation.profiles import topics_for_role
 
 
 DATE_RE = re.compile(r"^[0-9]{8}$")
 RootKind = Literal["raw_data", "clip_data", "finish_data"]
-
-_KNOWN_TOPIC_PARAM_LABELS = {
-    frozenset(
-        [
-            "/cam_video5/csi_cam/image_raw/compressed",
-            "/lidar_points",
-            "/utlidar/robot_odom_systime",
-        ]
-    ): "u_like",
-    frozenset(
-        [
-            "/cam_video4/csi_cam/image_raw/compressed",
-            "/rs32_lidar_points",
-            "/sport_odom",
-        ]
-    ): "go2w_like",
-    frozenset(
-        [
-            "/cam_video5/csi_cam/image_raw/compressed",
-            "/lidar_points",
-            "/sport_odom",
-        ]
-    ): "hybrid",
-}
-
-_KNOWN_TOPIC_ORDER = [
-    "/cam_video5/csi_cam/image_raw/compressed",
-    "/cam_video4/csi_cam/image_raw/compressed",
-    "/lidar_points",
-    "/rs32_lidar_points",
-    "/r32_rslidar_points",
-    "/utlidar/robot_odom_systime",
-    "/sport_odom",
-    "/drivers/ins/Ins",
-]
-
 
 def _normalize_segments(segments: list[str] | str | None) -> list[str] | None:
     if segments is None:
@@ -179,6 +131,14 @@ def _select_inspection_segments(
     return [segment for segment in inspection.segments if segment.name in selected_names]
 
 
+def _topic_type_map(selected_segments: list[SegmentInspection]) -> dict[str, str | None]:
+    return {
+        topic.name: topic.type
+        for segment in selected_segments
+        for topic in segment.topics
+    }
+
+
 def inspect_navigation_sensor_candidates(
     date: str,
     segments: list[str] | None = None,
@@ -282,242 +242,6 @@ def inspect_navigation_localization_sources(
             / "1_odom_convert.py"
         ).is_file(),
     )
-
-
-def infer_navigation_topic_params(
-    date: str,
-    segments: list[str] | None = None,
-    settings: NavigationSettings | None = None,
-) -> NavigationTopicParams:
-    inspection = inspect_raw_date(date, settings=settings)
-    selected_segments = _select_inspection_segments(inspection, segments)
-    topic_names = {topic.name for segment in selected_segments for topic in segment.topics}
-    sensor_bindings = infer_navigation_sensor_bindings(date, segments=segments, settings=settings)
-    ordered_bindings = (
-        sensor_bindings.fisheye_front,
-        sensor_bindings.lidar,
-        sensor_bindings.localization,
-    )
-    topic_whitelist = [
-        binding.topic
-        for binding in ordered_bindings
-        if binding is not None and binding.topic is not None
-    ]
-    topic_map = dict(_topic_map_entry(topic) for topic in topic_whitelist)
-    query_dir = (
-        _topic_map_entry(sensor_bindings.lidar.topic)[0]
-        if sensor_bindings.lidar is not None and sensor_bindings.lidar.topic is not None
-        else None
-    )
-    warnings = list(sensor_bindings.warnings)
-    blocking_issues = list(sensor_bindings.blocking_issues)
-    if blocking_issues:
-        if not any(issue.type == "missing_navigation_topic_params" for issue in blocking_issues):
-            blocking_issues.append(
-                PlanIssue(
-                    type="missing_navigation_topic_params",
-                    message="Could not infer complete camera/lidar/localization topic parameters from raw metadata.",
-                    evidence=topic_whitelist or [topic for topic in _KNOWN_TOPIC_ORDER if topic in topic_names],
-                )
-            )
-        return NavigationTopicParams(
-            profile_hint=None,
-            confidence=0.0,
-            topic_whitelist=topic_whitelist or [topic for topic in _KNOWN_TOPIC_ORDER if topic in topic_names],
-            topic_map=topic_map,
-            query_dir=query_dir,
-            evidence=list(sensor_bindings.evidence),
-            warnings=warnings,
-            blocking_issues=blocking_issues,
-        )
-
-    return NavigationTopicParams(
-        profile_hint=_topic_params_profile_hint(topic_whitelist),
-        confidence=1.0,
-        topic_whitelist=topic_whitelist,
-        topic_map=topic_map,
-        query_dir=query_dir,
-        evidence=list(sensor_bindings.evidence),
-        warnings=warnings,
-    )
-
-
-def _topic_type_map(selected_segments: list[SegmentInspection]) -> dict[str, str | None]:
-    return {
-        topic.name: topic.type
-        for segment in selected_segments
-        for topic in segment.topics
-    }
-
-
-def _unique_role_binding(
-    role: str,
-    candidates: list[str],
-    topic_types: dict[str, str | None],
-    *,
-    kind: str,
-) -> tuple[NavigationSensorBinding | None, PlanIssue | None]:
-    if len(candidates) == 1:
-        topic = candidates[0]
-        return (
-            NavigationSensorBinding(
-                role=role,
-                topic=topic,
-                message_type=topic_types.get(topic),
-                kind=kind,
-            ),
-            None,
-        )
-    if len(candidates) > 1:
-        return (
-            NavigationSensorBinding(role=role, kind=kind, candidates=candidates),
-            PlanIssue(
-                type="ambiguous_navigation_topic_role",
-                message=f"Multiple topics match navigation role {role}.",
-                evidence=candidates,
-            ),
-        )
-    return (
-        None,
-        PlanIssue(
-            type="missing_navigation_topic_role",
-            message=f"No topic found for required navigation role {role}.",
-        ),
-    )
-
-
-def infer_navigation_sensor_bindings(
-    date: str,
-    segments: list[str] | None = None,
-    settings: NavigationSettings | None = None,
-) -> NavigationSensorBindings:
-    inspection = inspect_raw_date(date, settings=settings)
-    selected_segments = _select_inspection_segments(inspection, segments)
-    topic_types = _topic_type_map(selected_segments)
-    topic_names = set(topic_types)
-    evidence = [
-        str(segment.metadata_path)
-        for segment in selected_segments
-        if segment.metadata_path is not None and segment.topics
-    ]
-    warnings = [
-        PlanIssue(
-            type="raw_metadata_error",
-            message=error,
-            evidence=[str(segment.metadata_path)] if segment.metadata_path is not None else [segment.name],
-        )
-        for segment in selected_segments
-        for error in segment.errors
-    ]
-    warnings.extend(
-        PlanIssue(type="raw_date_error", message=error, evidence=[str(inspection.path)])
-        for error in inspection.errors
-    )
-
-    blocking_issues: list[PlanIssue] = list(warnings)
-    fisheye_front, issue = _unique_role_binding(
-        "fisheye_front",
-        topics_for_role(topic_names, "fisheye_front"),
-        topic_types,
-        kind="camera",
-    )
-    if issue is not None:
-        blocking_issues.append(issue)
-
-    lidar, issue = _unique_role_binding(
-        "lidar",
-        topics_for_role(topic_names, "lidar"),
-        topic_types,
-        kind="lidar",
-    )
-    if issue is not None:
-        blocking_issues.append(issue)
-
-    odom, odom_issue = _unique_role_binding(
-        "odom",
-        topics_for_role(topic_names, "odom"),
-        topic_types,
-        kind="odom",
-    )
-    ins, ins_issue = _unique_role_binding(
-        "ins",
-        topics_for_role(topic_names, "ins"),
-        topic_types,
-        kind="ins",
-    )
-
-    localization: NavigationSensorBinding | None = None
-    if ins is not None and ins.topic is not None:
-        localization = NavigationSensorBinding(
-            role="localization",
-            topic=ins.topic,
-            message_type=ins.message_type,
-            kind="ins",
-        )
-        if odom_issue is not None and odom_issue.type == "ambiguous_navigation_topic_role":
-            warnings.append(odom_issue)
-    elif ins_issue is not None and ins_issue.type == "ambiguous_navigation_topic_role":
-        blocking_issues.append(ins_issue)
-    elif odom is not None and odom.topic is not None:
-        localization = NavigationSensorBinding(
-            role="localization",
-            topic=odom.topic,
-            message_type=odom.message_type,
-            kind="odom",
-        )
-    elif odom_issue is not None and odom_issue.type == "ambiguous_navigation_topic_role":
-        blocking_issues.append(odom_issue)
-    else:
-        blocking_issues.append(
-            PlanIssue(
-                type="missing_navigation_topic_role",
-                message="No unique odom or ins topic found for navigation localization.",
-            )
-        )
-
-    return NavigationSensorBindings(
-        fisheye_front=fisheye_front,
-        lidar=lidar,
-        odom=odom,
-        ins=ins,
-        localization=localization,
-        warnings=warnings,
-        blocking_issues=blocking_issues,
-        evidence=evidence,
-    )
-
-
-def _topic_map_entry(topic: str) -> tuple[str, str]:
-    return TOPIC_OUTPUT_MAP[topic]
-
-
-def _topic_params_profile_hint(topic_whitelist: list[str]) -> str:
-    topics = set(topic_whitelist)
-    full_matches = [
-        label for pattern_topics, label in _KNOWN_TOPIC_PARAM_LABELS.items() if pattern_topics.issubset(topics)
-    ]
-    if len(full_matches) == 1:
-        return full_matches[0]
-    return "hybrid"
-
-
-def _platform_hint_from_topics(topic_whitelist: list[str]) -> str:
-    topics = set(topic_whitelist)
-    if {
-        "/cam_video4/csi_cam/image_raw/compressed",
-        "/rs32_lidar_points",
-        "/sport_odom",
-    }.issubset(topics):
-        return "go2w"
-    if {
-        "/cam_video5/csi_cam/image_raw/compressed",
-        "/lidar_points",
-        "/utlidar/robot_odom_systime",
-    }.issubset(topics):
-        return "u"
-    if "/drivers/ins/Ins" in topics:
-        return "shanmao"
-    return "unknown"
 
 
 def _selected_segment_names(date_root: Path, segments: list[str] | None) -> list[str]:
@@ -626,60 +350,3 @@ def inspect_runtime_assets(settings: NavigationSettings | None = None) -> dict:
             "cjl_0525_with_gridmap": (pt_project / "2_othermethod_cjl_0525.py").exists(),
         },
     }
-
-
-def _make_function_tool(func, name: str):
-    return FunctionTool(func, name=name, is_read_only=True)
-
-
-def _list_navigation_dates_tool(root_kind: RootKind) -> dict:
-    """List available navigation dataset dates under a VLADatasets root kind."""
-    return {"dates": list_navigation_dates(root_kind)}
-
-
-def _inspect_raw_date_tool(date: str) -> dict:
-    """Inspect raw navigation metadata for one date and report segment topics or errors."""
-    return inspect_raw_date(date).model_dump(mode="json")
-
-
-def _infer_navigation_topic_params_tool(date: str, segments: list[str] | str | None = None) -> dict:
-    """Infer explicit extraction/sync topic parameters from role-bound raw metadata topics."""
-    params = infer_navigation_topic_params(date, segments=_normalize_segments(segments))
-    payload = params.model_dump(mode="json")
-    payload["ok"] = not params.blocking_issues
-    return payload
-
-
-def _infer_navigation_sensor_bindings_tool(date: str, segments: list[str] | str | None = None) -> dict:
-    """Infer role-based navigation sensor bindings from raw navigation metadata topics."""
-    return infer_navigation_sensor_bindings(date, segments=_normalize_segments(segments)).model_dump(mode="json")
-
-
-def _inspect_processing_state_tool(date: str, segments: list[str] | str | None = None) -> dict:
-    """Inspect existing navigation intermediate outputs without modifying data."""
-    return inspect_processing_state(date, segments=_normalize_segments(segments))
-
-
-def _inspect_gridmap_artifacts_tool(date: str, segments: list[str] | str | None = None) -> dict:
-    """Inspect existing grid_map artifacts that can drive gridmap workflow variant selection."""
-    return inspect_gridmap_artifacts(date, segments=_normalize_segments(segments))
-
-
-def _inspect_runtime_assets_tool() -> dict:
-    """Inspect script assets that constrain available gridmap and projection strategy variants."""
-    return inspect_runtime_assets()
-
-
-list_navigation_dates_tool = _make_function_tool(_list_navigation_dates_tool, "list_navigation_dates_tool")
-inspect_raw_date_tool = _make_function_tool(_inspect_raw_date_tool, "inspect_raw_date_tool")
-infer_navigation_topic_params_tool = _make_function_tool(
-    _infer_navigation_topic_params_tool,
-    "infer_navigation_topic_params_tool",
-)
-infer_navigation_sensor_bindings_tool = _make_function_tool(
-    _infer_navigation_sensor_bindings_tool,
-    "infer_navigation_sensor_bindings_tool",
-)
-inspect_processing_state_tool = _make_function_tool(_inspect_processing_state_tool, "inspect_processing_state_tool")
-inspect_gridmap_artifacts_tool = _make_function_tool(_inspect_gridmap_artifacts_tool, "inspect_gridmap_artifacts_tool")
-inspect_runtime_assets_tool = _make_function_tool(_inspect_runtime_assets_tool, "inspect_runtime_assets_tool")

@@ -56,7 +56,7 @@ class VLASessionAgent:
             "Do not call legacy workflow-control tools from this session agent.\n"
             "For VLA, navigation, ROS bag, db3, odom, trajectory, gridmap, gen_box.py, or annotation processing requests, "
             "explain that the request should be handled by the dedicated navigation data-processing path.\n"
-            "Navigation planning uses sensor bindings and processing_profile. "
+            "Navigation planning uses factual observations and one complete model-authored JSON plan. "
             "Fixed platform names are hints, not hard execution categories.\n"
             "Default to dry_run=false and perform real data processing for normal user requests.\n"
             "Set dry_run=true only when the user explicitly says dry_run in the request.\n"

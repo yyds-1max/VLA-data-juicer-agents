@@ -34,8 +34,6 @@ def test_catalog_marks_effects_and_plan_agent_visibility():
     assert capabilities["inspect_raw_date"].effects == "read"
     assert capabilities["inspect_raw_date"].plan_agent_allowed is True
     assert "classify_navigation_dataset" not in capabilities
-    assert capabilities["infer_navigation_sensor_bindings"].effects == "read"
-    assert capabilities["infer_navigation_sensor_bindings"].plan_agent_allowed is True
     assert capabilities["run_tracking"].effects == "execute"
     assert capabilities["run_tracking"].executor_agent_allowed is True
 
@@ -108,7 +106,6 @@ def test_v2_catalog_declares_argument_models_and_omits_combined_execution_tool()
     assert by_stage["prepare_raw_data"].argument_model == "EmptyArguments"
     assert by_stage["extract_and_sync_navigation_data"].argument_model == "ExtractSyncArguments"
     assert by_stage["run_tracking"].argument_model == "EmptyArguments"
-    assert "run_tracking_and_projection" not in {capability.tool_name for capability in capabilities}
 
     payload = navigation_tool_capabilities_payload()
     assert payload["revision"] == CAPABILITY_CATALOG_REVISION

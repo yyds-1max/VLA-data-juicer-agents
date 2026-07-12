@@ -113,34 +113,6 @@ NAVIGATION_TOOL_CAPABILITIES: tuple[ToolCapability, ...] = (
         declared_output_kinds=["localization_sources"],
     ),
     ToolCapability(
-        tool_name="infer_navigation_sensor_bindings",
-        stage_kind="infer_navigation_sensor_bindings",
-        effects="read",
-        variants=[ToolVariantCapability(id="default")],
-        plan_agent_allowed=True,
-    ),
-    ToolCapability(
-        tool_name="inspect_processing_state",
-        stage_kind="inspect_processing_state",
-        effects="read",
-        variants=[ToolVariantCapability(id="default")],
-        plan_agent_allowed=True,
-    ),
-    ToolCapability(
-        tool_name="inspect_gridmap_artifacts",
-        stage_kind="inspect_gridmap_artifacts",
-        effects="read",
-        variants=[ToolVariantCapability(id="default")],
-        plan_agent_allowed=True,
-    ),
-    ToolCapability(
-        tool_name="inspect_runtime_assets",
-        stage_kind="inspect_runtime_assets",
-        effects="read",
-        variants=[ToolVariantCapability(id="default")],
-        plan_agent_allowed=True,
-    ),
-    ToolCapability(
         tool_name="prepare_raw_data",
         stage_kind="prepare_raw_data",
         effects="write",
@@ -160,7 +132,7 @@ NAVIGATION_TOOL_CAPABILITIES: tuple[ToolCapability, ...] = (
                 id="explicit_topic_params",
                 notes=(
                     "Use topic_whitelist, topic_map, and query_dir inferred from sensor-role bindings. "
-                    "Do not select this variant from platform_hint."
+                    "Select this variant only from observed runtime capability evidence."
                 ),
             ),
         ],

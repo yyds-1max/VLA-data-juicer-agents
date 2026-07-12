@@ -471,6 +471,49 @@ def test_task_store_rebuilds_legacy_profile_table_without_profile_column(tmp_pat
         assert connection.execute("PRAGMA foreign_key_check").fetchall() == []
 
 
+def test_task_table_migration_preserves_deployment_owned_trigger(tmp_path: Path):
+    db_path = tmp_path / "navigation_tasks.sqlite"
+    with sqlite3.connect(db_path) as connection:
+        connection.executescript(
+            """
+            CREATE TABLE navigation_tasks (
+                task_id TEXT PRIMARY KEY, date TEXT NOT NULL, segments_json TEXT,
+                segments_key TEXT, scene_mode TEXT, phase TEXT NOT NULL,
+                status TEXT NOT NULL, waiting_reason TEXT, next_required_input TEXT,
+                created_by_web_session_id TEXT, latest_web_session_id TEXT,
+                agentscope_session_id TEXT, latest_run_id TEXT,
+                last_completed_step TEXT, data_profile_json TEXT,
+                artifact_snapshot_json TEXT, drift_json TEXT,
+                schema_version INTEGER NOT NULL, created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            );
+            INSERT INTO navigation_tasks VALUES (
+                'legacy', '20270623', NULL, '__all__', NULL, 'intake', 'pending',
+                NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, 1,
+                '2026-07-08T00:00:00.000+00:00', '2026-07-08T00:00:00.000+00:00'
+            );
+            CREATE TABLE deployment_events (task_id TEXT);
+            CREATE TABLE deployment_audit (task_id TEXT);
+            CREATE TRIGGER trg_deployment_owned_aggregate_revision_after_insert
+            AFTER INSERT ON deployment_events
+            BEGIN
+              INSERT INTO deployment_audit(task_id)
+              SELECT task_id FROM navigation_tasks WHERE task_id = NEW.task_id;
+            END;
+            """
+        )
+
+    SqliteNavigationTaskStore(db_path)
+
+    with sqlite3.connect(db_path) as connection:
+        assert connection.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='trigger' AND name=?",
+            ("trg_deployment_owned_aggregate_revision_after_insert",),
+        ).fetchone() == (1,)
+        connection.execute("INSERT INTO deployment_events VALUES ('legacy')")
+        assert connection.execute("SELECT task_id FROM deployment_audit").fetchall() == [("legacy",)]
+
+
 def test_task_store_migrates_json_encoded_segment_entry(tmp_path: Path):
     db_path = tmp_path / "navigation_tasks.sqlite"
     with sqlite3.connect(db_path) as connection:

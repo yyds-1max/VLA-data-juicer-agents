@@ -12,6 +12,11 @@ _CHILD_TASK_ID_COLUMNS = {
     "navigation_step_result_outbox": "task_id",
     "navigation_human_decision_handoffs": "task_id",
 }
+NAVIGATION_AGGREGATE_REVISION_TRIGGER_NAMES = frozenset(
+    f"trg_{table}_aggregate_revision_after_{operation}"
+    for table in _CHILD_TASK_ID_COLUMNS
+    for operation in ("insert", "update", "delete")
+)
 
 
 def ensure_navigation_aggregate_revision_triggers(
