@@ -46,6 +46,11 @@ export interface PendingHumanDecision {
   requestId: string;
   decisionType: string;
   summary: string;
+  planId?: string;
+  stepId?: string;
+  recoveryRequired?: boolean;
+  submissionDisabled?: boolean;
+  recoveryEndpoint?: string;
 }
 
 export interface HumanDecisionPayload {
@@ -53,7 +58,25 @@ export interface HumanDecisionPayload {
   request_id: string;
   tool_call_id: string;
   reply_id: string;
+  plan_id?: string;
+  step_id?: string;
   text?: string;
+}
+
+export interface HumanDecisionRecoveryRequest {
+  action: "quarantine_and_replan";
+  plan_id: string;
+  step_id: string;
+  reason: string;
+}
+
+export interface HumanDecisionRecoveryResponse {
+  recovered: true;
+  plan_id: string;
+  step_id: string;
+  handoff_status: "quarantined";
+  task_status: "needs_replan";
+  next_action: "submit_complete_plan";
 }
 
 export type NavigationDatasetStatus = "raw_only" | "extracted" | "synced" | "error";

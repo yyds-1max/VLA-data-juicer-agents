@@ -8,10 +8,11 @@ import {
   interruptTurn,
   listSessions,
   openSessionEvents,
+  recoverHumanDecision,
   submitHumanDecision,
   submitTurn,
 } from "../../api/client";
-import type { SessionRecord } from "../../api/types";
+import type { PendingHumanDecision, SessionRecord } from "../../api/types";
 import { datapilotStore } from "../../store/datapilotStore";
 import { Composer } from "./Composer";
 import { DraftNewSessionView } from "./DraftNewSessionView";
@@ -44,12 +45,15 @@ export function DataPilotWindow() {
   const [historyOpen, setHistoryOpen] = useState(false);
   const [rendered, setRendered] = useState(open);
   const [closing, setClosing] = useState(false);
+  const [recoveringHumanDecision, setRecoveringHumanDecision] = useState(false);
+  const [humanDecisionRecoveryError, setHumanDecisionRecoveryError] = useState("");
   const [viewport, setViewport] = useState(() => ({
     width: typeof window === "undefined" ? 1280 : window.innerWidth,
     height: typeof window === "undefined" ? 900 : window.innerHeight,
   }));
   const socketRef = useRef<{ sessionId: string; socket: WebSocket } | null>(null);
   const reconnectTimerRef = useRef<number | null>(null);
+  const humanDecisionRecoveryRequestRef = useRef(0);
   const dragRef = useRef<DragState | null>(null);
   const windowOffset = useMemo(() => visibleWindowOffset(floatingOffset, viewport), [floatingOffset, viewport]);
 
@@ -260,6 +264,9 @@ export function DataPilotWindow() {
 
       const sessionId = currentSessionId;
       const decision = pendingHumanDecision;
+      if (decision.recoveryRequired || decision.submissionDisabled) {
+        return;
+      }
 
       try {
         const accepted = await submitHumanDecision(sessionId, {
@@ -267,6 +274,8 @@ export function DataPilotWindow() {
           request_id: decision.requestId,
           tool_call_id: decision.toolCallId,
           reply_id: decision.replyId,
+          ...(decision.planId ? { plan_id: decision.planId } : {}),
+          ...(decision.stepId ? { step_id: decision.stepId } : {}),
           ...(text ? { text } : {}),
         });
         if (accepted) {
@@ -274,6 +283,70 @@ export function DataPilotWindow() {
         }
       } catch (error) {
         console.error("Failed to submit human decision", error);
+      }
+    },
+    [currentSessionId, pendingHumanDecision],
+  );
+
+  useEffect(() => {
+    humanDecisionRecoveryRequestRef.current += 1;
+    setRecoveringHumanDecision(false);
+    setHumanDecisionRecoveryError("");
+  }, [
+    currentSessionId,
+    pendingHumanDecision?.replyId,
+    pendingHumanDecision?.toolCallId,
+    pendingHumanDecision?.recoveryRequired,
+  ]);
+
+  const handleHumanDecisionRecovery = useCallback(
+    async (reason: string) => {
+      const planId = pendingHumanDecision?.planId;
+      const stepId = pendingHumanDecision?.stepId;
+      if (
+        !currentSessionId ||
+        !pendingHumanDecision?.recoveryRequired ||
+        !planId ||
+        !stepId ||
+        !reason.trim()
+      ) {
+        return;
+      }
+      const sessionId = currentSessionId;
+      const decision = pendingHumanDecision;
+      const requestToken = humanDecisionRecoveryRequestRef.current + 1;
+      humanDecisionRecoveryRequestRef.current = requestToken;
+      const isCurrentRequest = () => {
+        const state = datapilotStore.getState();
+        return (
+          humanDecisionRecoveryRequestRef.current === requestToken &&
+          state.currentSessionId === sessionId &&
+          samePendingHumanDecision(state.run.pendingHumanDecision, decision)
+        );
+      };
+      setRecoveringHumanDecision(true);
+      setHumanDecisionRecoveryError("");
+      try {
+        const result = await recoverHumanDecision(sessionId, {
+          action: "quarantine_and_replan",
+          plan_id: planId,
+          step_id: stepId,
+          reason: reason.trim(),
+        });
+        if (result.recovered) {
+          datapilotStore.getState().clearPendingHumanDecision(decision, sessionId);
+        }
+      } catch (error) {
+        if (isCurrentRequest()) {
+          setHumanDecisionRecoveryError(
+            error instanceof Error ? error.message : "受控恢复失败，请重试。",
+          );
+        }
+        console.error("Failed to recover human decision", error);
+      } finally {
+        if (isCurrentRequest()) {
+          setRecoveringHumanDecision(false);
+        }
       }
     },
     [currentSessionId, pendingHumanDecision],
@@ -407,10 +480,14 @@ export function DataPilotWindow() {
         <div className="flex min-h-0 flex-1 flex-col bg-console-panel">
           <MessageList messages={messages} run={run} />
           <HumanDecisionDialog
+            key={`${currentSessionId ?? ""}:${pendingHumanDecision?.replyId ?? ""}:${pendingHumanDecision?.toolCallId ?? ""}`}
             decision={pendingHumanDecision}
             onConfirm={() => handleHumanDecision("confirm")}
             onStop={() => handleHumanDecision("stop")}
             onGuide={(text) => handleHumanDecision("guide", text)}
+            onRecover={handleHumanDecisionRecovery}
+            recovering={recoveringHumanDecision}
+            recoveryError={humanDecisionRecoveryError || undefined}
           />
           {pendingHumanDecision ? null : (
             <div className="border-t border-console-line p-3 sm:p-4">
@@ -428,6 +505,23 @@ export function DataPilotWindow() {
         <MessageList messages={messages} run={run} />
       )}
     </section>
+  );
+}
+
+function samePendingHumanDecision(
+  left: PendingHumanDecision | null,
+  right: PendingHumanDecision,
+): boolean {
+  return Boolean(
+    left &&
+      left.replyId === right.replyId &&
+      left.toolCallId === right.toolCallId &&
+      left.requestId === right.requestId &&
+      left.planId === right.planId &&
+      left.stepId === right.stepId &&
+      left.recoveryRequired === right.recoveryRequired &&
+      left.submissionDisabled === right.submissionDisabled &&
+      left.recoveryEndpoint === right.recoveryEndpoint,
   );
 }
 

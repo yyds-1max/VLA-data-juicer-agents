@@ -10,6 +10,7 @@ import {
   interruptTurn,
   listSessions,
   openSessionEvents,
+  recoverHumanDecision,
   submitHumanDecision,
   submitTurn,
 } from "../api/client";
@@ -31,6 +32,7 @@ vi.mock("../api/client", () => ({
   submitTurn: vi.fn(),
   interruptTurn: vi.fn(),
   submitHumanDecision: vi.fn(),
+  recoverHumanDecision: vi.fn(),
   openSessionEvents: vi.fn(),
 }));
 
@@ -44,6 +46,7 @@ const apiMocks = vi.mocked({
   submitTurn,
   interruptTurn,
   submitHumanDecision,
+  recoverHumanDecision,
   openSessionEvents,
 });
 
@@ -167,6 +170,14 @@ beforeEach(() => {
   apiMocks.submitTurn.mockResolvedValue("turn-1");
   apiMocks.interruptTurn.mockResolvedValue(true);
   apiMocks.submitHumanDecision.mockResolvedValue(true);
+  apiMocks.recoverHumanDecision.mockResolvedValue({
+    recovered: true,
+    plan_id: "plan-1",
+    step_id: "confirm",
+    handoff_status: "quarantined",
+    task_status: "needs_replan",
+    next_action: "submit_complete_plan",
+  });
   apiMocks.openSessionEvents.mockReturnValue(activeSocket());
   apiMocks.getNavigationDatasetSummary.mockResolvedValue({
     totals: {
@@ -987,6 +998,184 @@ test("guide submission includes text in the human decision payload", async () =>
       text: "先汇总风险再继续",
     }),
   );
+});
+
+test("plan-bound normal decision includes plan and step ids", async () => {
+  setOpenActiveSessionWithPendingDecision(
+    pendingDecision({ planId: "plan-1", stepId: "confirm" }),
+  );
+  await renderAppWithDashboardSettled();
+
+  fireEvent.click(screen.getByRole("button", { name: "确认" }));
+
+  await waitFor(() =>
+    expect(apiMocks.submitHumanDecision).toHaveBeenCalledWith("session-1", {
+      action: "confirm",
+      request_id: "request-1",
+      tool_call_id: "tool-call-1",
+      reply_id: "reply-1",
+      plan_id: "plan-1",
+      step_id: "confirm",
+    }),
+  );
+});
+
+test("controlled recovery never submits normally and clears only after success", async () => {
+  const recovery = deferred<Awaited<ReturnType<typeof recoverHumanDecision>>>();
+  apiMocks.recoverHumanDecision.mockReturnValue(recovery.promise);
+  setOpenActiveSessionWithPendingDecision(
+    pendingDecision({
+      planId: "plan-1",
+      stepId: "confirm",
+      recoveryRequired: true,
+      submissionDisabled: true,
+      recoveryEndpoint: "/api/sessions/session-1/human-decisions/recovery",
+    }),
+  );
+  await renderAppWithDashboardSettled();
+
+  fireEvent.change(screen.getByLabelText("恢复原因"), {
+    target: { value: "operator confirmed abandoned delivery" },
+  });
+  fireEvent.click(screen.getByRole("button", { name: "隔离并重新规划" }));
+
+  expect(apiMocks.submitHumanDecision).not.toHaveBeenCalled();
+  expect(apiMocks.recoverHumanDecision).toHaveBeenCalledWith("session-1", {
+    action: "quarantine_and_replan",
+    plan_id: "plan-1",
+    step_id: "confirm",
+    reason: "operator confirmed abandoned delivery",
+  });
+  expect(datapilotStore.getState().run.pendingHumanDecision).not.toBeNull();
+
+  recovery.resolve({
+    recovered: true,
+    plan_id: "plan-1",
+    step_id: "confirm",
+    handoff_status: "quarantined",
+    task_status: "needs_replan",
+    next_action: "submit_complete_plan",
+  });
+  await waitFor(() => expect(datapilotStore.getState().run.pendingHumanDecision).toBeNull());
+});
+
+test("controlled recovery failure retains the dialog and surfaces backend detail", async () => {
+  apiMocks.recoverHumanDecision.mockRejectedValue(
+    new Error("only a recovery_required human handoff may be quarantined"),
+  );
+  vi.spyOn(console, "error").mockImplementation(() => undefined);
+  setOpenActiveSessionWithPendingDecision(
+    pendingDecision({
+      planId: "plan-1",
+      stepId: "confirm",
+      recoveryRequired: true,
+      submissionDisabled: true,
+    }),
+  );
+  await renderAppWithDashboardSettled();
+
+  fireEvent.change(screen.getByLabelText("恢复原因"), { target: { value: "recover" } });
+  fireEvent.click(screen.getByRole("button", { name: "隔离并重新规划" }));
+
+  expect(await screen.findByRole("alert")).toHaveTextContent("only a recovery_required");
+  expect(datapilotStore.getState().run.pendingHumanDecision).not.toBeNull();
+  expect(screen.getByRole("button", { name: "隔离并重新规划" })).toBeVisible();
+});
+
+test("recovery completion from session A cannot clear session B", async () => {
+  const recovery = deferred<Awaited<ReturnType<typeof recoverHumanDecision>>>();
+  apiMocks.recoverHumanDecision.mockReturnValue(recovery.promise);
+  const decision = pendingDecision({
+    planId: "plan-1",
+    stepId: "confirm",
+    recoveryRequired: true,
+    submissionDisabled: true,
+  });
+  setOpenActiveSessionWithPendingDecision(decision, { sessionId: "session-a" });
+  await renderAppWithDashboardSettled();
+  fireEvent.change(screen.getByLabelText("恢复原因"), { target: { value: "recover A" } });
+  fireEvent.click(screen.getByRole("button", { name: "隔离并重新规划" }));
+
+  await act(async () => {
+    setOpenActiveSessionWithPendingDecision(
+      pendingDecision({ ...decision, summary: "Session B recovery" }),
+      { sessionId: "session-b" },
+    );
+  });
+  expect(screen.getByLabelText("恢复原因")).toHaveValue("");
+  recovery.resolve({
+    recovered: true,
+    plan_id: "plan-1",
+    step_id: "confirm",
+    handoff_status: "quarantined",
+    task_status: "needs_replan",
+    next_action: "submit_complete_plan",
+  });
+
+  await waitFor(() => expect(screen.getByText("Session B recovery")).toBeVisible());
+  expect(datapilotStore.getState().currentSessionId).toBe("session-b");
+  expect(datapilotStore.getState().run.pendingHumanDecision?.summary).toBe("Session B recovery");
+});
+
+test("stale recovery A cannot inject errors or re-enable in-flight B in the same session", async () => {
+  const recoveryA = deferred<Awaited<ReturnType<typeof recoverHumanDecision>>>();
+  const recoveryB = deferred<Awaited<ReturnType<typeof recoverHumanDecision>>>();
+  apiMocks.recoverHumanDecision
+    .mockReturnValueOnce(recoveryA.promise)
+    .mockReturnValueOnce(recoveryB.promise);
+  vi.spyOn(console, "error").mockImplementation(() => undefined);
+  setOpenActiveSessionWithPendingDecision(
+    pendingDecision({
+      planId: "plan-a",
+      stepId: "confirm-a",
+      recoveryRequired: true,
+      submissionDisabled: true,
+    }),
+  );
+  await renderAppWithDashboardSettled();
+  fireEvent.change(screen.getByLabelText("恢复原因"), { target: { value: "recover A" } });
+  fireEvent.click(screen.getByRole("button", { name: "隔离并重新规划" }));
+
+  await act(async () => {
+    datapilotStore.getState().applyEvent({
+      type: "human_decision_required",
+      source: "NavigationDataAgent",
+      run_id: "as-session",
+      payload: {
+        reply_id: "reply-b",
+        tool_call_id: "tool-b",
+        request_id: "plan-b:confirm-b",
+        plan_id: "plan-b",
+        step_id: "confirm-b",
+        summary: "Recovery B",
+        recovery_required: true,
+        submission_disabled: true,
+      },
+    });
+  });
+  fireEvent.change(screen.getByLabelText("恢复原因"), { target: { value: "recover B" } });
+  fireEvent.click(screen.getByRole("button", { name: "隔离并重新规划" }));
+  expect(screen.getByRole("button", { name: "隔离并重新规划" })).toBeDisabled();
+
+  await act(async () => {
+    recoveryA.reject(new Error("stale A failure"));
+    try {
+      await recoveryA.promise;
+    } catch {
+      // Expected stale failure.
+    }
+  });
+
+  expect(screen.queryByRole("alert")).not.toBeInTheDocument();
+  expect(screen.getByRole("button", { name: "隔离并重新规划" })).toBeDisabled();
+  recoveryB.resolve({
+    recovered: true,
+    plan_id: "plan-b",
+    step_id: "confirm-b",
+    handoff_status: "quarantined",
+    task_status: "needs_replan",
+    next_action: "submit_complete_plan",
+  });
 });
 
 test("pending human decision remains when submitHumanDecision is rejected or not accepted", async () => {

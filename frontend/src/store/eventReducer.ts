@@ -138,14 +138,34 @@ export function applyAgentEvent(state: RunState, event: AgentEvent): void {
   }
 
   if (type === "human_decision_required") {
+    const planId = normalizeText(payload.plan_id) || normalizeText(payload.planId);
+    const stepId = normalizeText(payload.step_id) || normalizeText(payload.stepId);
+    const recoveryEndpoint =
+      normalizeText(payload.recovery_endpoint) || normalizeText(payload.recoveryEndpoint);
+    const recoveryRequired =
+      payload.recovery_required === true || payload.recoveryRequired === true;
+    const submissionDisabled =
+      payload.submission_disabled === true || payload.submissionDisabled === true;
     const nextDecision = {
       replyId: normalizeText(payload.reply_id) || normalizeText(payload.replyId),
       toolCallId: normalizeText(payload.tool_call_id) || normalizeText(payload.toolCallId),
       requestId: normalizeText(payload.request_id) || normalizeText(payload.requestId),
       decisionType: normalizeText(payload.decision_type) || normalizeText(payload.decisionType) || "other",
       summary: normalizeText(payload.summary),
+      ...(planId ? { planId } : {}),
+      ...(stepId ? { stepId } : {}),
+      ...(recoveryRequired ? { recoveryRequired: true } : {}),
+      ...(submissionDisabled ? { submissionDisabled: true } : {}),
+      ...(recoveryEndpoint ? { recoveryEndpoint } : {}),
     };
-    if (samePendingHumanDecision(state.pendingHumanDecision, nextDecision)) {
+    if (
+      samePendingHumanDecisionIdentity(state.pendingHumanDecision, nextDecision) &&
+      (
+        state.pendingHumanDecision?.recoveryRequired === true ||
+        (!nextDecision.recoveryRequired &&
+          equivalentPendingHumanDecision(state.pendingHumanDecision, nextDecision))
+      )
+    ) {
       return;
     }
     state.pendingHumanDecision = {
@@ -413,7 +433,7 @@ function normalizeText(value: unknown): string {
   return typeof value === "string" ? value.trim() : "";
 }
 
-function samePendingHumanDecision(
+function samePendingHumanDecisionIdentity(
   left: RunState["pendingHumanDecision"],
   right: RunState["pendingHumanDecision"],
 ): boolean {
@@ -422,7 +442,26 @@ function samePendingHumanDecision(
   }
   return (
     left.replyId === right.replyId &&
-    left.toolCallId === right.toolCallId &&
-    left.requestId === right.requestId
+    left.toolCallId === right.toolCallId
+  );
+}
+
+function equivalentPendingHumanDecision(
+  left: RunState["pendingHumanDecision"],
+  right: RunState["pendingHumanDecision"],
+): boolean {
+  return Boolean(
+    left &&
+      right &&
+      left.replyId === right.replyId &&
+      left.toolCallId === right.toolCallId &&
+      left.requestId === right.requestId &&
+      left.decisionType === right.decisionType &&
+      left.summary === right.summary &&
+      left.planId === right.planId &&
+      left.stepId === right.stepId &&
+      left.recoveryRequired === right.recoveryRequired &&
+      left.submissionDisabled === right.submissionDisabled &&
+      left.recoveryEndpoint === right.recoveryEndpoint,
   );
 }

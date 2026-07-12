@@ -10,12 +10,15 @@ import {
   interruptTurn,
   listSessions,
   openSessionEvents,
+  recoverHumanDecision,
   submitHumanDecision,
   submitTurn,
 } from "./client";
 import type {
   AgentEvent,
   HumanDecisionPayload,
+  HumanDecisionRecoveryRequest,
+  HumanDecisionRecoveryResponse,
   NavigationDatasetSummary,
   NavigationSyncImageListing,
   SessionDetail,
@@ -127,6 +130,46 @@ describe("api client", () => {
       body: JSON.stringify(payload),
       headers: { "content-type": "application/json" },
     });
+  });
+
+  it("posts the exact controlled recovery payload and returns its anchor", async () => {
+    const recovered: HumanDecisionRecoveryResponse = {
+      recovered: true,
+      plan_id: "plan-1",
+      step_id: "confirm",
+      handoff_status: "quarantined",
+      task_status: "needs_replan",
+      next_action: "submit_complete_plan",
+    };
+    const fetchMock = mockFetchJson(recovered);
+    const payload: HumanDecisionRecoveryRequest = {
+      action: "quarantine_and_replan",
+      plan_id: "plan-1",
+      step_id: "confirm",
+      reason: "operator confirmed abandoned delivery",
+    };
+
+    await expect(recoverHumanDecision("session/with space", payload)).resolves.toEqual(recovered);
+    expect(fetchMock).toHaveBeenCalledWith(
+      "/api/sessions/session%2Fwith%20space/human-decisions/recovery",
+      {
+        method: "POST",
+        body: JSON.stringify(payload),
+        headers: { "content-type": "application/json" },
+      },
+    );
+  });
+
+  it("surfaces controlled recovery conflict detail", async () => {
+    mockFetchJson({ detail: "handoff is not recovery_required" }, false);
+    await expect(
+      recoverHumanDecision("session-1", {
+        action: "quarantine_and_replan",
+        plan_id: "plan-1",
+        step_id: "confirm",
+        reason: "recover",
+      }),
+    ).rejects.toMatchObject({ message: "handoff is not recovery_required" });
   });
 
   it("throws useful detail from non-ok JSON error responses", async () => {

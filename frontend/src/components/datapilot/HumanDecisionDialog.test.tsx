@@ -24,6 +24,7 @@ describe("HumanDecisionDialog", () => {
         onConfirm={vi.fn()}
         onStop={vi.fn()}
         onGuide={vi.fn()}
+        onRecover={vi.fn()}
       />,
     );
 
@@ -38,6 +39,7 @@ describe("HumanDecisionDialog", () => {
         onConfirm={vi.fn()}
         onStop={vi.fn()}
         onGuide={vi.fn()}
+        onRecover={vi.fn()}
       />,
     );
 
@@ -50,6 +52,7 @@ describe("HumanDecisionDialog", () => {
         onConfirm={vi.fn()}
         onStop={vi.fn()}
         onGuide={vi.fn()}
+        onRecover={vi.fn()}
       />,
     );
 
@@ -66,6 +69,7 @@ describe("HumanDecisionDialog", () => {
         onConfirm={onConfirm}
         onStop={onStop}
         onGuide={vi.fn()}
+        onRecover={vi.fn()}
       />,
     );
 
@@ -85,6 +89,7 @@ describe("HumanDecisionDialog", () => {
         onConfirm={vi.fn()}
         onStop={vi.fn()}
         onGuide={onGuide}
+        onRecover={vi.fn()}
       />,
     );
 
@@ -101,5 +106,51 @@ describe("HumanDecisionDialog", () => {
     fireEvent.click(send);
 
     expect(onGuide).toHaveBeenCalledWith("先汇总风险再继续");
+  });
+
+  it("shows only an accessible bounded recovery control for recovery-required work", () => {
+    const onRecover = vi.fn();
+    render(
+      <HumanDecisionDialog
+        decision={decision({
+          planId: "plan-1",
+          stepId: "confirm",
+          recoveryRequired: true,
+          submissionDisabled: true,
+          recoveryEndpoint: "/api/sessions/session-1/human-decisions/recovery",
+        })}
+        onConfirm={vi.fn()}
+        onStop={vi.fn()}
+        onGuide={vi.fn()}
+        onRecover={onRecover}
+      />,
+    );
+
+    expect(screen.queryByRole("button", { name: "确认" })).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "停止" })).not.toBeInTheDocument();
+    expect(screen.queryByLabelText("引导文本")).not.toBeInTheDocument();
+    const reason = screen.getByLabelText("恢复原因");
+    expect(reason).toHaveAttribute("maxLength", "4000");
+    const recover = screen.getByRole("button", { name: "隔离并重新规划" });
+    expect(recover).toBeDisabled();
+    fireEvent.change(reason, { target: { value: "  operator confirmed abandoned delivery  " } });
+    expect(recover).toBeEnabled();
+    fireEvent.click(recover);
+    expect(onRecover).toHaveBeenCalledWith("operator confirmed abandoned delivery");
+  });
+
+  it("retains recovery controls and exposes backend failure text", () => {
+    render(
+      <HumanDecisionDialog
+        decision={decision({ recoveryRequired: true, submissionDisabled: true })}
+        onConfirm={vi.fn()}
+        onStop={vi.fn()}
+        onGuide={vi.fn()}
+        onRecover={vi.fn()}
+        recoveryError="handoff is not recovery_required"
+      />,
+    );
+    expect(screen.getByRole("alert")).toHaveTextContent("handoff is not recovery_required");
+    expect(screen.getByRole("button", { name: "隔离并重新规划" })).toBeVisible();
   });
 });

@@ -2167,6 +2167,70 @@ async def test_plan_bound_human_decision_live_and_pending_paths_are_deduplicated
 
 
 @pytest.mark.asyncio
+async def test_same_subscription_emits_normal_to_recovery_required_upgrade() -> None:
+    runtime = _runtime(
+        chat_run_registry=FakeChatRunRegistry(),
+        message_bus=FakeAgentScopeMessageBus(running_states=[False, False, False]),
+    )
+    runtime.web_sessions["web-1"] = ("navigation-data-agent", "as-session-1")
+    calls = 0
+
+    async def pending_event(**_kwargs):
+        nonlocal calls
+        calls += 1
+        recovery_required = calls >= 2
+        return {
+            "type": "human_decision_required",
+            "source": "NavigationDataAgent",
+            "run_id": "as-session-1",
+            "parent_run_id": None,
+            "payload": {
+                "request_id": "plan-1:confirm",
+                "decision_type": "camera_params",
+                "summary": "请确认。",
+                "plan_id": "plan-1",
+                "step_id": "confirm",
+                "reply_id": "reply-1",
+                "tool_call_id": "tool-1",
+                **(
+                    {
+                        "recovery_required": True,
+                        "submission_disabled": True,
+                        "recovery_endpoint": (
+                            "/api/sessions/web-1/human-decisions/recovery"
+                        ),
+                    }
+                    if recovery_required
+                    else {}
+                ),
+            },
+        }
+
+    runtime._pending_human_decision_event = pending_event
+
+    events = [
+        event
+        async for event in runtime.subscribe_web_session_events(web_session_id="web-1")
+    ]
+    decisions = [event for event in events if event["type"] == "human_decision_required"]
+
+    assert len(decisions) == 2
+    assert decisions[0]["payload"].get("recovery_required") is None
+    assert decisions[1]["payload"]["recovery_required"] is True
+
+
+def test_human_decision_event_identity_requires_nonempty_ids_and_is_collision_free() -> None:
+    assert agentscope_runtime_module._human_decision_event_key(
+        {"payload": {"reply_id": "", "tool_call_id": ""}}
+    ) is None
+    assert agentscope_runtime_module._human_decision_event_key(
+        {"payload": {"reply_id": "a:b", "tool_call_id": "c"}}
+    ) != agentscope_runtime_module._human_decision_event_key(
+        {"payload": {"reply_id": "a", "tool_call_id": "b:c"}}
+    )
+
+
+@pytest.mark.asyncio
 async def test_runtime_submit_user_message_does_not_advance_event_cursor_when_spawn_fails() -> None:
     message_bus = FakeAgentScopeMessageBus(
         replay_events=[

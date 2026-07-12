@@ -132,7 +132,7 @@ describe("eventReducer", () => {
           reply_id: "reply-1",
           tool_call_id: "tool-call-1",
           request_id: "request-1",
-          summary: "重复确认不应刷新弹窗。",
+          summary: "请确认下一步。",
         },
         { timestamp: "2026-06-26T00:00:01.000Z" },
       ),
@@ -140,6 +140,98 @@ describe("eventReducer", () => {
 
     expect(state.pendingHumanDecision).toBe(firstDecision);
     expect(state.pendingHumanDecision?.summary).toBe("请确认下一步。");
+  });
+
+  it("replaces a non-equivalent normal event that fills plan ownership fields", () => {
+    const state = createEmptyRunState();
+    applyAgentEvent(
+      state,
+      event("human_decision_required", "navigation.workflow", {
+        reply_id: "reply-1",
+        tool_call_id: "tool-call-1",
+        request_id: "request-1",
+        summary: "请确认。",
+      }),
+    );
+    const first = state.pendingHumanDecision;
+
+    applyAgentEvent(
+      state,
+      event("human_decision_required", "navigation.workflow", {
+        reply_id: "reply-1",
+        tool_call_id: "tool-call-1",
+        request_id: "request-1",
+        plan_id: "plan-1",
+        step_id: "confirm",
+        summary: "请确认。",
+      }),
+    );
+
+    expect(state.pendingHumanDecision).not.toBe(first);
+    expect(state.pendingHumanDecision).toMatchObject({
+      planId: "plan-1",
+      stepId: "confirm",
+    });
+  });
+
+  it("preserves plan-bound recovery fields from snake and camel case events", () => {
+    const state = createEmptyRunState();
+
+    applyAgentEvent(
+      state,
+      event("human_decision_required", "navigation.workflow", {
+        reply_id: "reply-1",
+        toolCallId: "tool-call-1",
+        request_id: "request-1",
+        plan_id: "plan-1",
+        stepId: "confirm",
+        recovery_required: true,
+        submissionDisabled: true,
+        recovery_endpoint: "/api/sessions/session-1/human-decisions/recovery",
+        summary: "交付状态不明确，需要受控恢复。",
+      }),
+    );
+
+    expect(state.pendingHumanDecision).toEqual({
+      replyId: "reply-1",
+      toolCallId: "tool-call-1",
+      requestId: "request-1",
+      decisionType: "other",
+      summary: "交付状态不明确，需要受控恢复。",
+      planId: "plan-1",
+      stepId: "confirm",
+      recoveryRequired: true,
+      submissionDisabled: true,
+      recoveryEndpoint: "/api/sessions/session-1/human-decisions/recovery",
+    });
+  });
+
+  it("upgrades the same decision identity once and keeps exact duplicates stable", () => {
+    const state = createEmptyRunState();
+    const normal = event("human_decision_required", "navigation.workflow", {
+      reply_id: "reply-1",
+      tool_call_id: "tool-call-1",
+      request_id: "request-1",
+      plan_id: "plan-1",
+      step_id: "confirm",
+      summary: "请确认。",
+    });
+    const recovery = event("human_decision_required", "navigation.workflow", {
+      ...normal.payload,
+      recovery_required: true,
+      submission_disabled: true,
+      recovery_endpoint: "/api/sessions/session-1/human-decisions/recovery",
+    });
+
+    applyAgentEvent(state, normal);
+    const first = state.pendingHumanDecision;
+    applyAgentEvent(state, recovery);
+    const upgraded = state.pendingHumanDecision;
+
+    expect(upgraded).not.toBe(first);
+    expect(upgraded?.recoveryRequired).toBe(true);
+    applyAgentEvent(state, recovery);
+    expect(state.pendingHumanDecision).toBe(upgraded);
   });
 
   it("keeps pending human decision after assistant output arrives", () => {
@@ -398,6 +490,49 @@ describe("eventReducer", () => {
 });
 
 describe("datapilotStore", () => {
+  it("applies a persisted recovery upgrade even when timeline identity is unchanged", () => {
+    const store = createDataPilotStore();
+    store.getState().setActiveSession(session());
+    const baseEvent = {
+      id: "event-1",
+      session_id: "session-1",
+      seq: 1,
+      type: "human_decision_required",
+      source: "NavigationDataAgent",
+      run_id: "as-session",
+      parent_run_id: null,
+      timestamp: null,
+      payload: {
+        reply_id: "reply-1",
+        tool_call_id: "tool-call-1",
+        request_id: "plan-1:confirm",
+        plan_id: "plan-1",
+        step_id: "confirm",
+        summary: "请确认。",
+      },
+      created_at: "2026-06-26T00:01:00Z",
+    };
+    store.getState().refreshActiveSession(sessionDetail({ events: [baseEvent] }));
+
+    store.getState().refreshActiveSession(
+      sessionDetail({
+        events: [
+          {
+            ...baseEvent,
+            payload: {
+              ...baseEvent.payload,
+              recovery_required: true,
+              submission_disabled: true,
+              recovery_endpoint: "/api/sessions/session-1/human-decisions/recovery",
+            },
+          },
+        ],
+      }),
+    );
+
+    expect(store.getState().run.pendingHumanDecision?.recoveryRequired).toBe(true);
+  });
+
   it("clearPendingHumanDecision clears the matching pending human decision from the current run", () => {
     const store = createDataPilotStore();
 

@@ -1,6 +1,8 @@
 import type {
   AgentEvent,
   HumanDecisionPayload,
+  HumanDecisionRecoveryRequest,
+  HumanDecisionRecoveryResponse,
   NavigationDatasetSummary,
   NavigationDateSummary,
   NavigationSyncImageListing,
@@ -93,6 +95,19 @@ export async function submitHumanDecision(
     body: JSON.stringify(payload),
   });
   return data.accepted;
+}
+
+export async function recoverHumanDecision(
+  sessionId: string,
+  payload: HumanDecisionRecoveryRequest,
+): Promise<HumanDecisionRecoveryResponse> {
+  return requestJson<HumanDecisionRecoveryResponse>(
+    `${sessionPath(sessionId)}/human-decisions/recovery`,
+    {
+      method: "POST",
+      body: JSON.stringify(payload),
+    },
+  );
 }
 
 export function openSessionEvents(sessionId: string, onEvent: (event: AgentEvent) => void): WebSocket {

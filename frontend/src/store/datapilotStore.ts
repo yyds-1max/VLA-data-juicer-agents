@@ -248,17 +248,39 @@ function mergeRunFromEvents(run: RunState, events: TimelineEventRecord[]): RunSt
 function applyEventIfNew(run: RunState, event: AgentEvent | TimelineEventRecord): void {
   const record = event as Partial<TimelineEventRecord>;
   const persistedKey = persistedEventKey(record);
-  if (persistedKey && run.appliedEventKeys[persistedKey]) {
+  const recoveryUpgrade = isPendingHumanDecisionRecoveryUpgrade(run, event);
+  if (persistedKey && run.appliedEventKeys[persistedKey] && !recoveryUpgrade) {
     return;
   }
   const liveKey = liveEventKey(event);
-  if (run.appliedEventKeys[liveKey]) {
+  if (run.appliedEventKeys[liveKey] && !recoveryUpgrade) {
     if (persistedKey) {
       run.appliedEventKeys[persistedKey] = true;
     }
     return;
   }
   applyEventAndMark(run, event, persistedKey ?? liveKey);
+}
+
+function isPendingHumanDecisionRecoveryUpgrade(
+  run: RunState,
+  event: AgentEvent | TimelineEventRecord,
+): boolean {
+  const current = run.pendingHumanDecision;
+  if (!current || current.recoveryRequired || event.type !== "human_decision_required") {
+    return false;
+  }
+  const payload = event.payload ?? {};
+  if (!(payload.recovery_required === true || payload.recoveryRequired === true)) {
+    return false;
+  }
+  const replyId = stringField(payload.reply_id) || stringField(payload.replyId);
+  const toolCallId = stringField(payload.tool_call_id) || stringField(payload.toolCallId);
+  return current.replyId === replyId && current.toolCallId === toolCallId;
+}
+
+function stringField(value: unknown): string {
+  return typeof value === "string" ? value.trim() : "";
 }
 
 function applyLiveEvent(run: RunState, event: AgentEvent): void {
@@ -336,6 +358,13 @@ function samePendingHumanDecision(
   return (
     left.replyId === right.replyId &&
     left.toolCallId === right.toolCallId &&
-    left.requestId === right.requestId
+    left.requestId === right.requestId &&
+    left.decisionType === right.decisionType &&
+    left.summary === right.summary &&
+    left.planId === right.planId &&
+    left.stepId === right.stepId &&
+    left.recoveryRequired === right.recoveryRequired &&
+    left.submissionDisabled === right.submissionDisabled &&
+    left.recoveryEndpoint === right.recoveryEndpoint
   );
 }

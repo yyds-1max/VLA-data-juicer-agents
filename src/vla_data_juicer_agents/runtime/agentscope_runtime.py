@@ -1153,7 +1153,7 @@ class AgentScopeRuntime:
             emit_final_events=True,
         )
         seen_entry_ids: set[str] = set()
-        seen_pending_decision_keys: set[str] = set()
+        seen_pending_decision_states: dict[tuple[str, str], str] = {}
         saw_event = False
         saw_reply_end = False
         saw_running = False
@@ -1205,6 +1205,24 @@ class AgentScopeRuntime:
                 events.append(event)
             return events
 
+        def should_emit_human_decision(event: dict[str, Any] | None) -> bool:
+            identity = _human_decision_event_key(event)
+            if not identity:
+                return event is not None
+            payload = event.get("payload") if event is not None else None
+            state = (
+                "recovery_required"
+                if isinstance(payload, dict) and payload.get("recovery_required") is True
+                else "normal"
+            )
+            previous = seen_pending_decision_states.get(identity)
+            if previous == state or (
+                previous == "recovery_required" and state == "normal"
+            ):
+                return False
+            seen_pending_decision_states[identity] = state
+            return True
+
         try:
             with suppress(TimeoutError):
                 await asyncio.wait_for(live_ready.wait(), timeout=_EVENT_STARTUP_GRACE_SECS)
@@ -1214,9 +1232,7 @@ class AgentScopeRuntime:
                 agent_id=agent_id,
                 agentscope_session_id=agentscope_session_id,
             )
-            pending_key = _human_decision_event_key(pending_event)
-            if pending_event is not None and pending_key not in seen_pending_decision_keys:
-                seen_pending_decision_keys.add(pending_key)
+            if pending_event is not None and should_emit_human_decision(pending_event):
                 yield pending_event
 
             cursor = self._event_cursor(agentscope_session_id)
@@ -1237,9 +1253,8 @@ class AgentScopeRuntime:
                         else ""
                     )
                     if decision_key:
-                        if decision_key in seen_pending_decision_keys:
+                        if not should_emit_human_decision(event):
                             continue
-                        seen_pending_decision_keys.add(decision_key)
                     yield event
                 self._remember_event_cursor(
                     agentscope_session_id,
@@ -1280,9 +1295,8 @@ class AgentScopeRuntime:
                                 else ""
                             )
                             if decision_key:
-                                if decision_key in seen_pending_decision_keys:
+                                if not should_emit_human_decision(event):
                                     continue
-                                seen_pending_decision_keys.add(decision_key)
                             yield event
                         if entry_id:
                             self._remember_event_cursor(
@@ -1296,9 +1310,7 @@ class AgentScopeRuntime:
                     agent_id=agent_id,
                     agentscope_session_id=agentscope_session_id,
                 )
-                pending_key = _human_decision_event_key(pending_event)
-                if pending_event is not None and pending_key not in seen_pending_decision_keys:
-                    seen_pending_decision_keys.add(pending_key)
+                if pending_event is not None and should_emit_human_decision(pending_event):
                     saw_event = True
                     yield pending_event
                     continue
@@ -1815,13 +1827,21 @@ def _is_calibration_confirmation_decision(decision: dict[str, Any]) -> bool:
     )
 
 
-def _human_decision_event_key(event: dict[str, Any] | None) -> str:
+def _human_decision_event_key(
+    event: dict[str, Any] | None,
+) -> tuple[str, str] | None:
     if event is None:
-        return ""
+        return None
     payload = event.get("payload")
     if not isinstance(payload, dict):
-        return ""
-    return f"{payload.get('reply_id', '')}:{payload.get('tool_call_id', '')}"
+        return None
+    reply_id = payload.get("reply_id")
+    tool_call_id = payload.get("tool_call_id")
+    if not isinstance(reply_id, str) or not reply_id:
+        return None
+    if not isinstance(tool_call_id, str) or not tool_call_id:
+        return None
+    return reply_id, tool_call_id
 
 
 def _session_events_key(message_bus: Any, session_id: str) -> str:
