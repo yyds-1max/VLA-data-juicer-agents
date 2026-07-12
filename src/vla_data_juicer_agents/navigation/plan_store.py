@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import hashlib
 import sqlite3
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any, Literal, cast
 from uuid import uuid4
@@ -26,6 +27,15 @@ PLAN_CONTRACT_VERSION = "navigation-plan-v2"
 MAX_EXECUTION_READ_CHARS = 4000
 MAX_RESULT_OUTBOX_CHARS = 262_144
 MAX_HUMAN_DECISION_CHARS = 16_384
+HUMAN_DECISION_DELIVERY_LEASE_SECONDS = 60
+_SENSITIVE_KEYS = {
+    "password",
+    "token",
+    "secret",
+    "authorization",
+    "api_key",
+    "cookie",
+}
 PlanPhase = Literal["extract_sync", "finish_processing"]
 ExecutionStatus = Literal[
     "pending",
@@ -65,6 +75,10 @@ class HumanDecisionHandoff(_StrictReadModel):
     decision: dict[str, Any]
     status: Literal["pending"] = "pending"
     delivery_status: Literal["pending", "delivering", "delivered"] = "pending"
+    delivery_owner: str | None = None
+    delivery_token: str | None = None
+    leased_at: str | None = None
+    expires_at: str | None = None
 
 
 class CompactExecutionStep(_StrictReadModel):
@@ -155,6 +169,10 @@ class SqliteNavigationPlanRepository:
                     delivery_status TEXT NOT NULL DEFAULT 'pending' CHECK (
                         delivery_status IN ('pending', 'delivering', 'delivered')
                     ),
+                    delivery_owner TEXT,
+                    delivery_token TEXT,
+                    leased_at TEXT,
+                    expires_at TEXT,
                     created_at TEXT NOT NULL,
                     updated_at TEXT NOT NULL,
                     PRIMARY KEY (plan_id, step_id),
@@ -183,6 +201,17 @@ class SqliteNavigationPlanRepository:
                     """ALTER TABLE navigation_human_decision_handoffs
                        ADD COLUMN delivery_status TEXT NOT NULL DEFAULT 'pending'"""
                 )
+            for name in (
+                "delivery_owner",
+                "delivery_token",
+                "leased_at",
+                "expires_at",
+            ):
+                if name not in handoff_columns:
+                    connection.execute(
+                        f"ALTER TABLE navigation_human_decision_handoffs ADD COLUMN {name} TEXT"
+                    )
+            self._backfill_null_result_refs(connection)
             connection.execute(
                 """
                 CREATE TABLE IF NOT EXISTS navigation_plan_submission_attempts (
@@ -666,6 +695,9 @@ class SqliteNavigationPlanRepository:
         step_id: str,
     ) -> StagedStepResult | None:
         with self._connect() as connection:
+            self._backfill_null_result_refs(
+                connection, plan_id=plan_id, step_id=step_id
+            )
             row = connection.execute(
                 """
                 SELECT * FROM navigation_step_result_outbox
@@ -773,6 +805,13 @@ class SqliteNavigationPlanRepository:
                         """,
                         (utc_now(), plan_id),
                     )
+            else:
+                connection.execute(
+                    """UPDATE navigation_tasks
+                       SET status = 'failed', updated_at = ?
+                       WHERE task_id = ?""",
+                    (utc_now(), staged.task_id),
+                )
             connection.execute(
                 """
                 DELETE FROM navigation_step_result_outbox
@@ -816,6 +855,24 @@ class SqliteNavigationPlanRepository:
             if row is None:
                 connection.rollback()
                 return False
+            handoff = connection.execute(
+                """SELECT handoffs.plan_id, handoffs.step_id
+                   FROM navigation_human_decision_handoffs AS handoffs
+                   JOIN navigation_plans AS handoff_plans
+                     ON handoff_plans.plan_id = handoffs.plan_id
+                   JOIN navigation_plans AS target_plan
+                     ON target_plan.task_id = handoff_plans.task_id
+                    AND target_plan.phase = handoff_plans.phase
+                   WHERE target_plan.plan_id = ?
+                   LIMIT 1""",
+                (plan_id,),
+            ).fetchone()
+            if handoff is not None:
+                raise ActivePlanExecutionConflict(
+                    "running-step force recovery is blocked by an unacknowledged "
+                    f"human handoff ({handoff['plan_id']}/{handoff['step_id']}); "
+                    "recover or acknowledge the human handoff first"
+                )
             timestamp = utc_now()
             connection.execute(
                 """
@@ -984,6 +1041,10 @@ class SqliteNavigationPlanRepository:
             decision=json.loads(row["decision_json"]),
             status=row["status"],
             delivery_status=row["delivery_status"],
+            delivery_owner=row["delivery_owner"],
+            delivery_token=row["delivery_token"],
+            leased_at=row["leased_at"],
+            expires_at=row["expires_at"],
         )
 
     def acknowledge_human_decision_handoff(
@@ -1003,33 +1064,54 @@ class SqliteNavigationPlanRepository:
         return cursor.rowcount == 1
 
     def claim_human_decision_delivery(
-        self, plan_id: str, step_id: str, decision_key: str
-    ) -> Literal["claimed", "busy", "delivered", "missing"]:
+        self, plan_id: str, step_id: str, decision_key: str, *, owner: str
+    ) -> tuple[Literal["claimed", "busy", "delivered", "missing"], str | None]:
         connection = self._connect()
         try:
             connection.execute("BEGIN IMMEDIATE")
             row = connection.execute(
-                """SELECT delivery_status, decision_key FROM navigation_human_decision_handoffs
+                """SELECT delivery_status, decision_key, expires_at
+                   FROM navigation_human_decision_handoffs
                    WHERE plan_id = ? AND step_id = ?""",
                 (plan_id, step_id),
             ).fetchone()
             if row is None or row["decision_key"] != decision_key:
                 connection.rollback()
-                return "missing"
+                return "missing", None
             if row["delivery_status"] == "delivered":
                 connection.commit()
-                return "delivered"
-            if row["delivery_status"] == "delivering":
+                return "delivered", None
+            now = datetime.now(UTC)
+            if (
+                row["delivery_status"] == "delivering"
+                and row["expires_at"] is not None
+                and datetime.fromisoformat(row["expires_at"]) > now
+            ):
                 connection.commit()
-                return "busy"
+                return "busy", None
+            token = uuid4().hex
+            leased_at = now.isoformat(timespec="milliseconds")
+            expires_at = (
+                now + timedelta(seconds=HUMAN_DECISION_DELIVERY_LEASE_SECONDS)
+            ).isoformat(timespec="milliseconds")
             connection.execute(
                 """UPDATE navigation_human_decision_handoffs
-                   SET delivery_status = 'delivering', updated_at = ?
+                   SET delivery_status = 'delivering', delivery_owner = ?,
+                       delivery_token = ?, leased_at = ?, expires_at = ?, updated_at = ?
                    WHERE plan_id = ? AND step_id = ? AND decision_key = ?""",
-                (utc_now(), plan_id, step_id, decision_key),
+                (
+                    owner,
+                    token,
+                    leased_at,
+                    expires_at,
+                    utc_now(),
+                    plan_id,
+                    step_id,
+                    decision_key,
+                ),
             )
             connection.commit()
-            return "claimed"
+            return "claimed", token
         except Exception:
             connection.rollback()
             raise
@@ -1037,18 +1119,42 @@ class SqliteNavigationPlanRepository:
             connection.close()
 
     def finish_human_decision_delivery(
-        self, plan_id: str, step_id: str, decision_key: str, *, delivered: bool
+        self,
+        plan_id: str,
+        step_id: str,
+        decision_key: str,
+        *,
+        token: str,
+        delivered: bool,
     ) -> bool:
         with self._connect() as connection:
             cursor = connection.execute(
                 """UPDATE navigation_human_decision_handoffs
-                   SET delivery_status = ?, updated_at = ?
+                   SET delivery_status = ?, delivery_owner = NULL,
+                       delivery_token = NULL, leased_at = NULL, expires_at = NULL,
+                       updated_at = ?
                    WHERE plan_id = ? AND step_id = ? AND decision_key = ?
-                     AND delivery_status = 'delivering'""",
+                     AND delivery_status = 'delivering' AND delivery_token = ?""",
                 (
                     "delivered" if delivered else "pending",
-                    utc_now(), plan_id, step_id, decision_key,
+                    utc_now(), plan_id, step_id, decision_key, token,
                 ),
+            )
+        return cursor.rowcount == 1
+
+    def mark_consumed_human_decision_delivery(
+        self, plan_id: str, step_id: str, decision_key: str
+    ) -> bool:
+        """Record durable AgentScope consumption observed outside our lease state."""
+        with self._connect() as connection:
+            cursor = connection.execute(
+                """UPDATE navigation_human_decision_handoffs
+                   SET delivery_status = 'delivered', delivery_owner = NULL,
+                       delivery_token = NULL, leased_at = NULL, expires_at = NULL,
+                       updated_at = ?
+                   WHERE plan_id = ? AND step_id = ? AND decision_key = ?
+                     AND delivery_status != 'delivered'""",
+                (utc_now(), plan_id, step_id, decision_key),
             )
         return cursor.rowcount == 1
 
@@ -1195,6 +1301,68 @@ class SqliteNavigationPlanRepository:
             observation_revision,
             f"{plan_id}:{step_id}:{digest}",
         )
+
+    def _backfill_null_result_refs(
+        self,
+        connection: sqlite3.Connection,
+        *,
+        plan_id: str | None = None,
+        step_id: str | None = None,
+    ) -> None:
+        where = "WHERE outbox.result_ref IS NULL"
+        params: list[Any] = []
+        if plan_id is not None:
+            where += " AND outbox.plan_id = ?"
+            params.append(plan_id)
+        if step_id is not None:
+            where += " AND outbox.step_id = ?"
+            params.append(step_id)
+        rows = connection.execute(
+            f"""SELECT outbox.plan_id, outbox.step_id, outbox.task_id,
+                       outbox.full_result_json, plans.observation_revision
+                FROM navigation_step_result_outbox AS outbox
+                JOIN navigation_plans AS plans ON plans.plan_id = outbox.plan_id
+                {where}""",
+            params,
+        ).fetchall()
+        for row in rows:
+            canonical_full = self._canonical_json(
+                self._redact_sensitive(json.loads(row["full_result_json"]))
+            )
+            result_ref = self._intended_result_ref(
+                row["task_id"],
+                int(row["observation_revision"]),
+                row["plan_id"],
+                row["step_id"],
+                canonical_full,
+            )
+            connection.execute(
+                """UPDATE navigation_step_result_outbox
+                   SET full_result_json = ?, result_ref = ?, updated_at = ?
+                   WHERE plan_id = ? AND step_id = ? AND result_ref IS NULL""",
+                (
+                    canonical_full,
+                    result_ref,
+                    utc_now(),
+                    row["plan_id"],
+                    row["step_id"],
+                ),
+            )
+
+    @classmethod
+    def _redact_sensitive(cls, payload: Any) -> Any:
+        if isinstance(payload, dict):
+            return {
+                key: (
+                    "[REDACTED]"
+                    if str(key).lower() in _SENSITIVE_KEYS
+                    else cls._redact_sensitive(value)
+                )
+                for key, value in payload.items()
+            }
+        if isinstance(payload, list):
+            return [cls._redact_sensitive(value) for value in payload]
+        return payload
 
     @classmethod
     def _ensure_within_limit(cls, payload: Any, *, label: str) -> None:

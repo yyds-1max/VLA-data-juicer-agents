@@ -1,5 +1,6 @@
 import asyncio
 import json
+import sqlite3
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -287,9 +288,10 @@ class DelayedPendingDecisionStorage(FakeAgentScopeStorage):
 
 
 class FakeChatService:
-    def __init__(self) -> None:
+    def __init__(self, storage=None) -> None:
         self.runs = []
         self.seen_cancellations = []
+        self.storage = storage
 
     async def run(self, *, user_id, session_id, agent_id, input_msg):
         self.seen_cancellations.append(current_cancellation())
@@ -301,6 +303,12 @@ class FakeChatService:
                 "message": input_msg,
             }
         )
+        if isinstance(input_msg, ExternalExecutionResultEvent) and self.storage is not None:
+            record = self.storage.session_records[(user_id, agent_id, session_id)]
+            for message in record.state.context:
+                for block in message.get_content_blocks("tool_call"):
+                    if block.id == input_msg.execution_results[0].id:
+                        block.state = ToolCallState.FINISHED
 
 
 class FakeChatRunRegistry:
@@ -345,7 +353,7 @@ def _runtime(
     workspace_root: Path | None = None,
 ) -> AgentScopeRuntime:
     storage = storage or FakeAgentScopeStorage()
-    chat_service = FakeChatService()
+    chat_service = FakeChatService(storage)
     state = SimpleNamespace(chat_service=chat_service)
     if chat_run_registry is not None:
         state.chat_run_registry = chat_run_registry
@@ -1325,7 +1333,7 @@ async def test_plan_bound_human_decision_recovers_after_async_run_failure(
 
     class FailOnceChatService(FakeChatService):
         def __init__(self) -> None:
-            super().__init__()
+            super().__init__(runtime.storage)
             self.attempts = 0
 
         async def run(self, **kwargs):
@@ -1353,6 +1361,94 @@ async def test_plan_bound_human_decision_recovers_after_async_run_failure(
     assert runtime.app.state.chat_service.attempts == 2
     assert len(runtime.app.state.chat_service.runs) == 1
     assert plan_store.get_human_decision_handoff(plan.plan_id, "confirm") is None
+
+
+@pytest.mark.asyncio
+async def test_expired_delivering_handoff_retries_only_while_external_call_is_submitted(
+    tmp_path: Path,
+) -> None:
+    registry = FakeChatRunRegistry()
+    runtime, plan_store, plan, decision = _plan_bound_human_runtime(tmp_path, registry)
+    assert agentscope_runtime_module.submit_plan_human_decision(
+        plan_store=plan_store,
+        evidence_store=runtime._navigation_evidence_store(),
+        plan_id=plan.plan_id,
+        step_id="confirm",
+        decision=decision,
+    )
+    status, token = plan_store.claim_human_decision_delivery(
+        plan.plan_id, "confirm", agentscope_runtime_module.human_decision_key(
+            agentscope_runtime_module._durable_plan_decision(decision)
+        ), owner="dead-worker"
+    )
+    assert status == "claimed" and token
+    with sqlite3.connect(plan_store.db_path) as connection:
+        connection.execute(
+            "UPDATE navigation_human_decision_handoffs SET expires_at = '2000-01-01T00:00:00+00:00'"
+        )
+
+    assert await runtime.submit_human_decision(web_session_id="web-1", decision=decision)
+    await registry.drain()
+    assert len(runtime.app.state.chat_service.runs) == 1
+    event = runtime.app.state.chat_service.runs[0]["message"]
+    assert event.metadata["idempotency_key"].endswith(
+        f":{plan.plan_id}:confirm:{agentscope_runtime_module.human_decision_key(agentscope_runtime_module._durable_plan_decision(decision))}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_expired_delivering_handoff_with_completed_external_call_is_ack_only(
+    tmp_path: Path,
+) -> None:
+    registry = FakeChatRunRegistry()
+    runtime, plan_store, plan, decision = _plan_bound_human_runtime(tmp_path, registry)
+    assert agentscope_runtime_module.submit_plan_human_decision(
+        plan_store=plan_store,
+        evidence_store=runtime._navigation_evidence_store(),
+        plan_id=plan.plan_id,
+        step_id="confirm",
+        decision=decision,
+    )
+    key = agentscope_runtime_module.human_decision_key(
+        agentscope_runtime_module._durable_plan_decision(decision)
+    )
+    assert plan_store.claim_human_decision_delivery(
+        plan.plan_id, "confirm", key, owner="dead-worker"
+    )[0] == "claimed"
+    with sqlite3.connect(plan_store.db_path) as connection:
+        connection.execute(
+            "UPDATE navigation_human_decision_handoffs SET expires_at = '2000-01-01T00:00:00+00:00'"
+        )
+    record = runtime.storage.session_records[("alice", "navigation-data-agent", "as-session-1")]
+    record.state.context[0].get_content_blocks("tool_call")[0].state = ToolCallState.FINISHED
+
+    assert await runtime.submit_human_decision(web_session_id="web-1", decision=decision)
+    assert registry.spawns == []
+    assert runtime.app.state.chat_service.runs == []
+    assert plan_store.get_human_decision_handoff(plan.plan_id, "confirm") is None
+
+
+@pytest.mark.asyncio
+async def test_run_that_consumes_external_result_then_raises_is_not_retried(
+    tmp_path: Path,
+) -> None:
+    registry = FakeChatRunRegistry()
+    runtime, plan_store, plan, decision = _plan_bound_human_runtime(tmp_path, registry)
+
+    class ConsumeThenRaise(FakeChatService):
+        async def run(self, **kwargs):
+            await super().run(**kwargs)
+            raise RuntimeError("failed after durable consumption")
+
+    runtime.app.state.chat_service = ConsumeThenRaise(runtime.storage)
+    assert await runtime.submit_human_decision(web_session_id="web-1", decision=decision)
+    with pytest.raises(RuntimeError, match="durable consumption"):
+        await registry.drain()
+    registry.active_session_ids.clear()
+    assert plan_store.get_human_decision_handoff(plan.plan_id, "confirm") is None
+
+    assert not await runtime.submit_human_decision(web_session_id="web-1", decision=decision)
+    assert len(runtime.app.state.chat_service.runs) == 1
 
 
 @pytest.mark.asyncio
@@ -1693,9 +1789,8 @@ async def test_runtime_submit_human_decision_claim_rejects_active_duplicate_unti
         decision=decision,
     )
 
-    assert retry_after_release is True
-    assert len(chat_run_registry.spawns) == 1
-    await chat_run_registry.drain()
+    assert retry_after_release is False
+    assert len(chat_run_registry.spawns) == 0
 
 
 @pytest.mark.asyncio

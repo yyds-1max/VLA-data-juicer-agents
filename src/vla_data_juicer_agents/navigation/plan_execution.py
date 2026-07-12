@@ -44,6 +44,7 @@ from vla_data_juicer_agents.navigation.plan_store import (
     SqliteNavigationPlanRepository,
 )
 from vla_data_juicer_agents.navigation.task_reconciliation import (
+    build_navigation_artifact_snapshot,
     reconcile_navigation_task,
 )
 from vla_data_juicer_agents.navigation.task_state import NavigationTask
@@ -243,6 +244,22 @@ def _reconcile_execution_entry(
         for phase in ("extract_sync", "finish_processing")
         if (active := plan_store.get_active(stored.task_id, phase)) is not None
     ]
+    terminal_recovery = any(
+        (
+            (plan_store.get_current_step(active_plan.plan_id) or {}).get("step")
+            or {}
+        ).get("status")
+        in {"failed", "needs_replan"}
+        for active_plan in active_plans
+    )
+    if terminal_recovery:
+        snapshot = build_navigation_artifact_snapshot(
+            stored.date, stored.segments, settings=settings
+        )
+        return task_store.update_task(
+            stored.task_id,
+            artifact_snapshot=snapshot.model_dump(mode="json"),
+        ), None
     live = reconcile_navigation_task(stored, settings=settings)
     invalid_plans: list[NavigationPlanRecord] = []
     for active_plan in active_plans:
@@ -510,11 +527,22 @@ def _finalize_staged_result(
     stored_task = SqliteNavigationTaskStore(plan_store.db_path).get_task(task.task_id)
     if stored_task is not None and settings is not None:
         try:
-            reconciled = reconcile_navigation_task(stored_task, settings=settings)
-            SqliteNavigationTaskStore(plan_store.db_path).update_task(
-                stored_task.task_id,
-                **_task_changes(reconciled),
-            )
+            task_store = SqliteNavigationTaskStore(plan_store.db_path)
+            if staged.target_status == "completed":
+                reconciled = reconcile_navigation_task(stored_task, settings=settings)
+                task_store.update_task(
+                    stored_task.task_id,
+                    **_task_changes(reconciled),
+                )
+            else:
+                snapshot = build_navigation_artifact_snapshot(
+                    stored_task.date, stored_task.segments, settings=settings
+                )
+                task_store.update_task(
+                    stored_task.task_id,
+                    artifact_snapshot=snapshot.model_dump(mode="json"),
+                    status="failed",
+                )
         except Exception:
             pass
     response = {
@@ -573,11 +601,18 @@ def _invoke_plan_step(
     current = plan_store.get_current_step(plan.plan_id)
     current_status = (current or {}).get("step", {}).get("status")
     if current_status == "running":
-        recovered = plan_store.recover_running_step_without_result(
-            plan.plan_id,
-            step.step_id,
-            "running step has no staged result after process interruption",
-        )
+        try:
+            recovered = plan_store.recover_running_step_without_result(
+                plan.plan_id,
+                step.step_id,
+                "running step has no staged result after process interruption",
+            )
+        except ActivePlanExecutionConflict:
+            return _compact_error(
+                "human_handoff_recovery_required",
+                "Force recovery is blocked by an unacknowledged human-decision handoff for this task and phase. Recover or acknowledge that handoff before invalidating the running step.",
+                next_action="retry_human_decision_handoff",
+            )
         if recovered:
             return _compact_error(
                 "step_recovery_requires_replan",

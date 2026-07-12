@@ -1,5 +1,6 @@
 import json
 import sqlite3
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import pytest
@@ -109,7 +110,90 @@ def test_repository_migrates_legacy_pending_only_handoff_schema(tmp_path: Path):
                 "PRAGMA table_info(navigation_human_decision_handoffs)"
             )
         }
-    assert "delivery_status" in columns
+    assert {
+        "delivery_status",
+        "delivery_owner",
+        "delivery_token",
+        "leased_at",
+        "expires_at",
+    } <= columns
+
+
+def test_repository_migrates_delivery_lease_and_reclaims_only_after_expiry(tmp_path: Path):
+    repo, task = stores_with_task(tmp_path)
+    plan = repo.activate(task, "extract_sync", 1, valid_extract_plan())
+    with sqlite3.connect(repo.db_path) as connection:
+        connection.execute(
+            """INSERT INTO navigation_human_decision_handoffs (
+                   plan_id, step_id, task_id, decision_key, decision_json,
+                   status, delivery_status, created_at, updated_at
+               ) VALUES (?, 'prepare', ?, 'decision', '{}', 'pending',
+                         'delivering', ?, ?)""",
+            (plan.plan_id, task.task_id, datetime.now(UTC).isoformat(), datetime.now(UTC).isoformat()),
+        )
+        connection.execute(
+            """UPDATE navigation_human_decision_handoffs
+               SET delivery_owner = 'old-owner', delivery_token = 'old-token',
+                   leased_at = ?, expires_at = ?
+               WHERE plan_id = ? AND step_id = 'prepare'""",
+            (
+                datetime.now(UTC).isoformat(),
+                (datetime.now(UTC) + timedelta(minutes=1)).isoformat(),
+                plan.plan_id,
+            ),
+        )
+
+    assert repo.claim_human_decision_delivery(
+        plan.plan_id, "prepare", "decision", owner="new-owner"
+    ) == ("busy", None)
+    with sqlite3.connect(repo.db_path) as connection:
+        connection.execute(
+            "UPDATE navigation_human_decision_handoffs SET expires_at = ? WHERE plan_id = ?",
+            ((datetime.now(UTC) - timedelta(seconds=1)).isoformat(), plan.plan_id),
+        )
+    status, token = repo.claim_human_decision_delivery(
+        plan.plan_id, "prepare", "decision", owner="new-owner"
+    )
+    assert status == "claimed" and token and token != "old-token"
+    assert repo.finish_human_decision_delivery(
+        plan.plan_id, "prepare", "decision", token=token, delivered=False
+    )
+
+
+def test_repository_backfills_legacy_null_result_ref_and_lazy_recovers(tmp_path: Path):
+    repo, task = stores_with_task(tmp_path)
+    plan = repo.activate(task, "extract_sync", 1, valid_extract_plan())
+    assert repo.claim_step(plan.plan_id, "prepare", "prepare_raw_data")
+    staged = repo.stage_step_result(
+        plan.plan_id,
+        "prepare",
+        target_status="completed",
+        full_result={"message": "done", "ok": True, "tool_name": "prepare_raw_data"},
+        result_summary={"message": "done", "ok": True, "tool_name": "prepare_raw_data"},
+    )
+    with sqlite3.connect(repo.db_path) as connection:
+        connection.execute(
+            "UPDATE navigation_step_result_outbox SET result_ref = NULL WHERE plan_id = ?",
+            (plan.plan_id,),
+        )
+
+    reopened = SqliteNavigationPlanRepository(repo.db_path)
+    migrated = reopened.get_staged_step_result(plan.plan_id, "prepare")
+    assert migrated is not None
+    assert migrated.result_ref == staged.result_ref
+    with sqlite3.connect(repo.db_path) as connection:
+        connection.execute(
+            "UPDATE navigation_step_result_outbox SET result_ref = NULL WHERE plan_id = ?",
+            (plan.plan_id,),
+        )
+    assert reopened.get_staged_step_result(plan.plan_id, "prepare").result_ref == staged.result_ref
+    assert reopened.finalize_staged_step(plan.plan_id, "prepare") is True
+    with sqlite3.connect(repo.db_path) as connection:
+        status = connection.execute(
+            "SELECT status FROM navigation_task_steps WHERE plan_id = ? AND step_id = 'prepare'",
+            (plan.plan_id,),
+        ).fetchone()[0]
+    assert status == "completed"
 
 
 def test_activate_plan_and_ledger_is_atomic(tmp_path: Path):

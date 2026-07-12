@@ -903,6 +903,174 @@ def test_failed_step_is_recorded_exactly_once_and_duplicate_does_not_reinvoke(
     assert services.plan_store.get_current_step(services.plan.plan_id)["step"]["status"] == "failed"
 
 
+def test_failed_step_with_produced_sync_artifacts_stays_failed_for_fresh_resolver(
+    monkeypatch, tmp_path
+):
+    services = build_services(tmp_path)
+
+    def fail_after_writing_artifacts(**kwargs):
+        segment = services.task.segments[0]
+        (services.settings.clip_data_root / services.task.date / segment / "sync_data").mkdir(
+            parents=True
+        )
+        return failed_result("extract_and_sync_navigation_data")
+
+    monkeypatch.setattr(
+        plan_execution,
+        "extract_and_sync_navigation_data",
+        fail_after_writing_artifacts,
+    )
+    result = call_tool(
+        services.tools()["extract_and_sync_navigation_data_tool"],
+        plan_id=services.plan.plan_id,
+        step_id="sync",
+    )
+    stored = services.task_store.get_task(services.task.task_id)
+    fresh = {
+        tool.name: tool
+        for tool in plan_execution.build_plan_bound_execution_tools(
+            task=stored,
+            plan_store=SqliteNavigationPlanRepository(services.plan_store.db_path),
+            evidence_store=FileNavigationEvidenceStore(services.evidence_store.root),
+            settings=services.settings,
+            dry_run=True,
+            cancellation=None,
+        )
+    }
+    duplicate = call_tool(
+        fresh["extract_and_sync_navigation_data_tool"],
+        plan_id=services.plan.plan_id,
+        step_id="sync",
+    )
+
+    assert result["status"] == "failed"
+    assert stored.phase.value == "extract_sync"
+    assert stored.status.value == "failed"
+    assert stored.artifact_snapshot.sync_data_exists is True
+    assert duplicate["error_type"] == "step_already_terminal"
+    assert duplicate["next_action"] == "submit_complete_plan"
+
+
+def test_failed_validation_with_final_artifacts_does_not_complete_fresh_task(
+    monkeypatch, tmp_path
+):
+    settings = NavigationSettings(
+        vladatasets_root=tmp_path / "datasets",
+        processing_root=tmp_path / "processing",
+    )
+    date, segment = "20260710", "segment-a"
+    source = "NoobScenes/params/observed/sensors"
+    (settings.processing_root / source).mkdir(parents=True)
+    (settings.raw_data_root / date / segment).mkdir(parents=True)
+    (settings.clip_data_root / date / segment / "sync_data").mkdir(parents=True)
+    db_path = tmp_path / "navigation.sqlite"
+    task_store = SqliteNavigationTaskStore(db_path)
+    task = task_store.create_or_update_task(
+        date=date, segments=[segment], scene_mode="out", dry_run=True
+    )
+    task = task_store.update_task(
+        task.task_id, phase="finish_processing", status="pending"
+    )
+    evidence_store = FileNavigationEvidenceStore(tmp_path / "evidence")
+    observation = SqliteNavigationObservationStore(db_path).append(
+        task.task_id,
+        task.phase,
+        "calibration_inventory",
+        [CalibrationInventoryObservation(sensor_sources=[source])],
+        [],
+        evidence_store,
+    )
+    plan_store = SqliteNavigationPlanRepository(db_path)
+    plan = plan_store.activate(
+        task, "finish_processing", observation.revision, finish_plan(source)
+    )
+    with sqlite3.connect(db_path) as connection:
+        connection.execute(
+            "UPDATE navigation_task_steps SET status = 'completed' "
+            "WHERE plan_id = ? AND step_id != 'validate'",
+            (plan.plan_id,),
+        )
+
+    def fail_after_final_artifacts(**kwargs):
+        (settings.finish_data_root / date / segment / "scene" / "grid_map").mkdir(
+            parents=True
+        )
+        return failed_result("validate_navigation_outputs")
+
+    monkeypatch.setattr(
+        plan_execution, "validate_navigation_outputs", fail_after_final_artifacts
+    )
+    tools = {
+        tool.name: tool
+        for tool in plan_execution.build_plan_bound_execution_tools(
+            task=task,
+            plan_store=plan_store,
+            evidence_store=evidence_store,
+            settings=settings,
+            dry_run=True,
+            cancellation=None,
+        )
+    }
+    result = call_tool(
+        tools["validate_navigation_outputs_tool"],
+        plan_id=plan.plan_id,
+        step_id="validate",
+    )
+    stored = task_store.get_task(task.task_id)
+    fresh_tools = {
+        tool.name: tool
+        for tool in plan_execution.build_plan_bound_execution_tools(
+            task=stored,
+            plan_store=SqliteNavigationPlanRepository(db_path),
+            evidence_store=FileNavigationEvidenceStore(tmp_path / "evidence"),
+            settings=settings,
+            dry_run=True,
+            cancellation=None,
+        )
+    }
+    duplicate = call_tool(
+        fresh_tools["validate_navigation_outputs_tool"],
+        plan_id=plan.plan_id,
+        step_id="validate",
+    )
+
+    assert result["status"] == "failed"
+    assert stored.phase.value == "finish_processing"
+    assert stored.status.value == "failed"
+    assert stored.artifact_snapshot.final_outputs_exist is True
+    assert stored.artifact_snapshot.final_grid_map_exists is True
+    assert duplicate["error_type"] == "step_already_terminal"
+    assert duplicate["next_action"] == "submit_complete_plan"
+
+
+def test_force_running_recovery_refuses_to_orphan_task_phase_handoff(tmp_path):
+    services = build_services(tmp_path)
+    assert services.plan_store.claim_step(
+        services.plan.plan_id, "sync", "extract_and_sync_navigation_data"
+    )
+    with sqlite3.connect(services.plan_store.db_path) as connection:
+        now = "2026-07-12T00:00:00+00:00"
+        connection.execute(
+            """INSERT INTO navigation_human_decision_handoffs (
+                   plan_id, step_id, task_id, decision_key, decision_json,
+                   status, delivery_status, created_at, updated_at
+               ) VALUES (?, 'reviewer-handoff', ?, 'decision', '{}', 'pending',
+                         'delivered', ?, ?)""",
+            (services.plan.plan_id, services.task.task_id, now, now),
+        )
+
+    result = call_tool(
+        services.tools()["extract_and_sync_navigation_data_tool"],
+        plan_id=services.plan.plan_id,
+        step_id="sync",
+    )
+
+    assert result["error_type"] == "human_handoff_recovery_required"
+    assert result["next_action"] == "retry_human_decision_handoff"
+    assert services.plan_store.get(services.plan.plan_id).status == "active"
+    assert services.plan_store.get_current_step(services.plan.plan_id)["step"]["status"] == "running"
+
+
 def test_cancelled_execution_never_marks_running_or_invokes(monkeypatch, tmp_path):
     services = build_services(tmp_path)
     cancellation = CancellationContext()

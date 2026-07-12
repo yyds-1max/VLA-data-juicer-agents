@@ -400,6 +400,25 @@ class AgentScopeRuntime:
                         decision=decision,
                     )
                     return True
+                if existing is not None:
+                    external_state = await self._human_decision_external_call_state(
+                        agent_id=agent_id,
+                        agentscope_session_id=agentscope_session_id,
+                        decision=decision,
+                    )
+                    if external_state == "consumed":
+                        plan_store.mark_consumed_human_decision_delivery(
+                            plan_id, step_id, decision_key
+                        )
+                        if not plan_store.acknowledge_human_decision_handoff(
+                            plan_id, step_id, decision_key
+                        ):
+                            return False
+                        self._mark_human_decision_consumed(
+                            agentscope_session_id=agentscope_session_id,
+                            decision=decision,
+                        )
+                        return True
 
             pending_tool_name = await self._pending_human_decision_tool_name(
                 agent_id=agent_id,
@@ -419,8 +438,11 @@ class AgentScopeRuntime:
                 )
                 if not transitioned:
                     return False
-                delivery = plan_store.claim_human_decision_delivery(
-                    plan_id, step_id, decision_key
+                delivery, delivery_token = plan_store.claim_human_decision_delivery(
+                    plan_id,
+                    step_id,
+                    decision_key,
+                    owner=agentscope_session_id,
                 )
                 if delivery == "delivered":
                     if not plan_store.acknowledge_human_decision_handoff(
@@ -434,6 +456,7 @@ class AgentScopeRuntime:
                     return True
                 if delivery != "claimed":
                     return False
+                assert delivery_token is not None
 
             result = ToolResultBlock(
                 id=decision["tool_call_id"],
@@ -442,6 +465,20 @@ class AgentScopeRuntime:
                 state=ToolResultState.SUCCESS,
             )
             input_msg = ExternalExecutionResultEvent(
+                id=(
+                    f"navigation-human-handoff:{plan_id}:{step_id}:{decision_key}"
+                    if plan_bound_handoff
+                    else uuid4().hex
+                ),
+                metadata=(
+                    {
+                        "idempotency_key": (
+                            f"navigation-human-handoff:{plan_id}:{step_id}:{decision_key}"
+                        )
+                    }
+                    if plan_bound_handoff
+                    else {}
+                ),
                 reply_id=decision["reply_id"],
                 execution_results=[result],
             )
@@ -450,6 +487,7 @@ class AgentScopeRuntime:
             self.register_run_cancellation(agentscope_session_id, cancellation)
 
             async def run_with_claim() -> None:
+                run_error: Exception | None = None
                 try:
                     try:
                         async with cancellation.track_agent(agentscope_session_id):
@@ -460,16 +498,44 @@ class AgentScopeRuntime:
                                     agent_id=agent_id,
                                     input_msg=input_msg,
                                 )
-                    except Exception:
-                        if plan_bound_handoff:
-                            plan_store.finish_human_decision_delivery(
-                                plan_id, step_id, decision_key, delivered=False
-                            )
-                        raise
+                    except Exception as error:
+                        run_error = error
                     if plan_bound_handoff:
-                        if not plan_store.finish_human_decision_delivery(
-                            plan_id, step_id, decision_key, delivered=True
-                        ):
+                        external_state = await self._human_decision_external_call_state(
+                            agent_id=agent_id,
+                            agentscope_session_id=agentscope_session_id,
+                            decision=decision,
+                        )
+                        if external_state == "consumed":
+                            completed = plan_store.finish_human_decision_delivery(
+                                plan_id,
+                                step_id,
+                                decision_key,
+                                token=delivery_token,
+                                delivered=True,
+                            )
+                            if not completed:
+                                completed = plan_store.mark_consumed_human_decision_delivery(
+                                    plan_id, step_id, decision_key
+                                )
+                        elif external_state == "submitted":
+                            plan_store.finish_human_decision_delivery(
+                                plan_id,
+                                step_id,
+                                decision_key,
+                                token=delivery_token,
+                                delivered=False,
+                            )
+                            completed = False
+                        else:
+                            completed = False
+                        if external_state != "consumed":
+                            if run_error is not None:
+                                raise run_error
+                            raise RuntimeError(
+                                "plan-bound human decision was not durably consumed"
+                            )
+                        if not completed:
                             raise RuntimeError(
                                 "plan-bound human decision delivery completion failed"
                             )
@@ -489,6 +555,8 @@ class AgentScopeRuntime:
                             agentscope_session_id=agentscope_session_id,
                             decision=decision,
                         )
+                    if run_error is not None:
+                        raise run_error
                 finally:
                     self.clear_run_cancellation(agentscope_session_id, cancellation)
                     await claim.release()
@@ -499,7 +567,11 @@ class AgentScopeRuntime:
             except Exception:
                 if plan_bound_handoff:
                     plan_store.finish_human_decision_delivery(
-                        plan_id, step_id, decision_key, delivered=False
+                        plan_id,
+                        step_id,
+                        decision_key,
+                        token=delivery_token,
+                        delivered=False,
                     )
                 if previous_cancellation is not None:
                     self.register_run_cancellation(
@@ -569,6 +641,37 @@ class AgentScopeRuntime:
                                 return None
                     return str(tool_name)
         return None
+
+    async def _human_decision_external_call_state(
+        self,
+        *,
+        agent_id: str,
+        agentscope_session_id: str,
+        decision: dict[str, Any],
+    ) -> str:
+        """Read AgentScope's durable external-call state as the consumption oracle."""
+        get_session = getattr(self.storage, "get_session", None)
+        if get_session is None:
+            return "missing"
+        record = await get_session(self.config.user_id, agent_id, agentscope_session_id)
+        if record is None:
+            return "missing"
+        state = getattr(record, "state", None)
+        if getattr(state, "reply_id", None) != decision.get("reply_id"):
+            return "missing"
+        for message in getattr(state, "context", []) or []:
+            for tool_call in _tool_call_blocks(message):
+                if getattr(tool_call, "id", None) != decision.get("tool_call_id"):
+                    continue
+                if getattr(tool_call, "name", None) not in _HUMAN_DECISION_TOOL_NAMES:
+                    return "missing"
+                return (
+                    "submitted"
+                    if _state_value(getattr(tool_call, "state", None))
+                    == ToolCallState.SUBMITTED.value
+                    else "consumed"
+                )
+        return "missing"
 
     async def _try_acquire_human_decision_claim(
         self,
