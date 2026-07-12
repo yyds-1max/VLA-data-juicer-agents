@@ -775,6 +775,8 @@ def resolve_navigation_agent_tools(
             settings=services.settings,
             dry_run=task.dry_run,
             cancellation=cancellation,
+            web_session_id=web_session_id,
+            agentscope_session_id=agentscope_session_id,
         )
         current = services.plan_store.get_current_step(active_plan.plan_id)
         current_step = (current or {}).get("step") or {}

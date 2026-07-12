@@ -96,6 +96,24 @@ def _migrate_legacy_observations(
                     "legacy observation revision columns do not match its payload"
                 )
             revisions[(revision.task_id, revision.revision)] = revision
+            target_row = connection.execute(
+                """
+                SELECT task_id, revision, phase, revision_json, created_at
+                FROM navigation_observation_revisions
+                WHERE task_id = ? AND revision = ?
+                """,
+                (revision.task_id, revision.revision),
+            ).fetchone()
+            if target_row is not None and dict(target_row) != {
+                "task_id": row["task_id"],
+                "revision": row["revision"],
+                "phase": row["phase"],
+                "revision_json": row["revision_json"],
+                "created_at": row["created_at"],
+            }:
+                raise LegacyObservationMigrationError(
+                    "legacy observation revision conflicts with unified state"
+                )
         evidence_rows = connection.execute(
             "SELECT * FROM legacy_observations.navigation_evidence"
         ).fetchall()
@@ -115,6 +133,17 @@ def _migrate_legacy_observations(
             ):
                 raise LegacyObservationMigrationError(
                     "legacy evidence ref ownership does not match its metadata"
+                )
+            target_evidence = connection.execute(
+                "SELECT * FROM navigation_evidence WHERE ref = ?",
+                (descriptor.ref,),
+            ).fetchone()
+            if (
+                target_evidence is not None
+                and EvidenceDescriptor.model_validate(dict(target_evidence)) != descriptor
+            ):
+                raise LegacyObservationMigrationError(
+                    "legacy evidence metadata conflicts with unified state"
                 )
         connection.execute(
             """

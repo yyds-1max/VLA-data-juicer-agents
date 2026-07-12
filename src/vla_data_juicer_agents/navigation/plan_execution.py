@@ -231,6 +231,8 @@ def _reconcile_execution_entry(
     settings: NavigationSettings,
     requested_plan_id: str,
     expected_action: str,
+    expected_web_session_id: str | None = None,
+    expected_agentscope_session_id: str | None = None,
 ) -> tuple[NavigationTask, dict[str, Any] | None]:
     task_store = SqliteNavigationTaskStore(plan_store.db_path)
     stored = task_store.get_task(task.task_id)
@@ -238,6 +240,15 @@ def _reconcile_execution_entry(
         return task, _compact_error(
             "task_not_found",
             "The plan-bound navigation task no longer exists.",
+        )
+    if expected_agentscope_session_id is not None and (
+        stored.created_by_web_session_id != expected_web_session_id
+        or stored.latest_web_session_id != expected_web_session_id
+        or stored.agentscope_session_id != expected_agentscope_session_id
+    ):
+        return stored, _compact_error(
+            "navigation_task_session_mismatch",
+            "The plan-bound task is no longer owned by this AgentScope session.",
         )
     active_plans = [
         active
@@ -360,6 +371,8 @@ def _gate_step(
     expected_action: str,
     plan_store: SqliteNavigationPlanRepository,
     settings: NavigationSettings,
+    expected_web_session_id: str | None = None,
+    expected_agentscope_session_id: str | None = None,
 ) -> tuple[NavigationTask | None, NavigationPlanRecord | None, Any | None, dict[str, Any] | None]:
     task, reconcile_error = _reconcile_execution_entry(
         task=bound_task,
@@ -367,6 +380,8 @@ def _gate_step(
         settings=settings,
         requested_plan_id=requested_plan_id,
         expected_action=expected_action,
+        expected_web_session_id=expected_web_session_id,
+        expected_agentscope_session_id=expected_agentscope_session_id,
     )
     if reconcile_error is not None:
         return task, None, None, reconcile_error
@@ -573,6 +588,8 @@ def _invoke_plan_step(
     evidence_store: FileNavigationEvidenceStore,
     settings: NavigationSettings,
     cancellation: CancellationContext | None,
+    expected_web_session_id: str | None = None,
+    expected_agentscope_session_id: str | None = None,
 ) -> dict[str, Any]:
     active_cancellation = cancellation or current_cancellation()
     if active_cancellation is not None:
@@ -584,6 +601,8 @@ def _invoke_plan_step(
         expected_action=action,
         plan_store=plan_store,
         settings=settings,
+        expected_web_session_id=expected_web_session_id,
+        expected_agentscope_session_id=expected_agentscope_session_id,
     )
     if gate_error is not None:
         return gate_error
@@ -620,7 +639,13 @@ def _invoke_plan_step(
                 next_action="submit_complete_plan",
             )
         return _terminal_error(plan_store, plan.plan_id)
-    if not plan_store.claim_step(plan.plan_id, step.step_id, step.action):
+    if not plan_store.claim_step(
+        plan.plan_id,
+        step.step_id,
+        step.action,
+        expected_web_session_id=expected_web_session_id,
+        expected_agentscope_session_id=expected_agentscope_session_id,
+    ):
         return _terminal_error(plan_store, plan.plan_id)
 
     try:
@@ -728,6 +753,8 @@ def prepare_plan_human_decision(
     settings: NavigationSettings,
     plan_id: str,
     step_id: str,
+    expected_web_session_id: str | None = None,
+    expected_agentscope_session_id: str | None = None,
 ) -> dict[str, Any] | None:
     _task, plan, step, gate_error = _gate_step(
         bound_task=task,
@@ -736,6 +763,8 @@ def prepare_plan_human_decision(
         expected_action=_EXTERNAL_ACTION,
         plan_store=plan_store,
         settings=settings,
+        expected_web_session_id=expected_web_session_id,
+        expected_agentscope_session_id=expected_agentscope_session_id,
     )
     if gate_error is not None:
         return gate_error
@@ -743,7 +772,13 @@ def prepare_plan_human_decision(
     current = plan_store.get_current_step(plan.plan_id)
     if current is not None and current["step"]["status"] == "waiting_user":
         return None
-    if not plan_store.mark_waiting_user(plan.plan_id, step.step_id, step.action):
+    if not plan_store.mark_waiting_user(
+        plan.plan_id,
+        step.step_id,
+        step.action,
+        expected_web_session_id=expected_web_session_id,
+        expected_agentscope_session_id=expected_agentscope_session_id,
+    ):
         return _terminal_error(plan_store, plan.plan_id)
     return None
 
@@ -847,6 +882,8 @@ def build_plan_bound_execution_tools(
     settings: NavigationSettings,
     dry_run: bool,
     cancellation: CancellationContext | None,
+    web_session_id: str | None = None,
+    agentscope_session_id: str | None = None,
 ) -> list[ToolBase]:
     """Expose only distinct actions remaining in the task's active immutable plan."""
     _ = dry_run  # The durable task is the canonical dry-run authority.
@@ -877,6 +914,8 @@ def build_plan_bound_execution_tools(
                 evidence_store=evidence_store,
                 settings=settings,
                 cancellation=cancellation,
+                expected_web_session_id=web_session_id,
+                expected_agentscope_session_id=agentscope_session_id,
             )
 
         invoke.__name__ = f"{action}_tool"
@@ -899,6 +938,8 @@ def build_plan_bound_execution_tools(
                         settings=settings,
                         plan_id=tool_input.get("plan_id", ""),
                         step_id=tool_input.get("step_id", ""),
+                        expected_web_session_id=web_session_id,
+                        expected_agentscope_session_id=agentscope_session_id,
                     )
                 )
             )

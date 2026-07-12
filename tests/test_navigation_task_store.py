@@ -135,6 +135,27 @@ def test_concurrent_task_claim_has_one_creator_and_never_rebinds_loser(tmp_path:
     assert stored.agentscope_session_id == f"as-{winner}"
 
 
+def test_owned_update_rejects_identity_field_changes_without_mutation(tmp_path: Path):
+    store = SqliteNavigationTaskStore(tmp_path / "navigation_tasks.sqlite")
+    owned = store.create_or_update_task(
+        date="20270623",
+        segments=None,
+        scene_mode=None,
+        web_session_id="web-owner",
+        agentscope_session_id="as-owner",
+    )
+
+    with pytest.raises(ValueError, match="identity fields"):
+        store.update_task_for_session(
+            owned.task_id,
+            web_session_id="web-owner",
+            agentscope_session_id="as-owner",
+            created_by_web_session_id="web-foreign",
+        )
+
+    assert store.get_task(owned.task_id) == owned
+
+
 def test_task_store_exact_restore_preserves_entire_persisted_model(
     monkeypatch,
     tmp_path: Path,

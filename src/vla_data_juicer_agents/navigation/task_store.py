@@ -484,6 +484,13 @@ class SqliteNavigationTaskStore:
         **changes: Any,
     ) -> NavigationTask:
         """Atomically authorize the current session pair and update one task."""
+        identity_fields = {
+            "created_by_web_session_id",
+            "latest_web_session_id",
+            "agentscope_session_id",
+        }
+        if identity_fields.intersection(changes):
+            raise ValueError("session identity fields cannot be changed by owned update")
         connection = self._connect()
         try:
             connection.execute("BEGIN IMMEDIATE")

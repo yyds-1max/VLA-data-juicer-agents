@@ -1930,6 +1930,32 @@ def test_navigation_services_reject_corrupt_legacy_db_without_partial_import(
     assert count == 0
 
 
+def test_navigation_services_reject_conflicting_legacy_revision_before_marker(tmp_path):
+    unified = build_navigation_services(tmp_path)
+    evidence = unified.evidence_store
+    target_payload = ArtifactStateObservation(
+        snapshot=NavigationArtifactSnapshot(date="20260710", raw_input_exists=True)
+    )
+    unified.observation_store.append(
+        "nav-conflict", "extract_sync", "artifact_state", [target_payload], [], evidence
+    )
+    legacy = SqliteNavigationObservationStore(tmp_path / "navigation-observations.sqlite")
+    legacy_payload = ArtifactStateObservation(
+        snapshot=NavigationArtifactSnapshot(date="20260711", raw_input_exists=True)
+    )
+    legacy.append(
+        "nav-conflict", "extract_sync", "artifact_state", [legacy_payload], [], evidence
+    )
+
+    with pytest.raises(
+        navigation_services_module.LegacyObservationMigrationError,
+        match="conflicts with unified state",
+    ):
+        build_navigation_services(tmp_path)
+
+    assert unified.observation_store.latest("nav-conflict").payloads == [target_payload]
+
+
 def test_phase_resolver_exposes_missing_inspections_without_submission_or_execution(tmp_path):
     data_root = tmp_path / "vla-data"
     (data_root / "raw_data" / "20260710" / "20260710_120000").mkdir(parents=True)

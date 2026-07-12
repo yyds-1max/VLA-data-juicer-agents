@@ -509,6 +509,53 @@ def test_finish_plan_invalidates_when_reconciliation_falls_back_to_extract_sync(
     assert task_store.get_task(task.task_id).status == "needs_replan"
 
 
+def test_stale_agentscope_session_cannot_claim_plan_bound_step(monkeypatch, tmp_path):
+    services = build_services(tmp_path)
+    bound = services.task_store.update_task(
+        services.task.task_id,
+        created_by_web_session_id="web-owner",
+        latest_web_session_id="web-owner",
+        agentscope_session_id="as-old",
+    )
+    invoked = []
+    monkeypatch.setattr(
+        plan_execution,
+        "extract_and_sync_navigation_data",
+        lambda **kwargs: invoked.append(kwargs) or ok_result("extract_and_sync_navigation_data"),
+    )
+    tools = {
+        tool.name: tool
+        for tool in plan_execution.build_plan_bound_execution_tools(
+            task=bound,
+            plan_store=services.plan_store,
+            evidence_store=services.evidence_store,
+            settings=services.settings,
+            dry_run=True,
+            cancellation=None,
+            web_session_id="web-owner",
+            agentscope_session_id="as-old",
+        )
+    }
+    services.task_store.create_or_update_task(
+        date=bound.date,
+        segments=bound.segments,
+        scene_mode=bound.scene_mode,
+        dry_run=bound.dry_run,
+        web_session_id="web-owner",
+        agentscope_session_id="as-new",
+    )
+
+    result = call_tool(
+        tools["extract_and_sync_navigation_data_tool"],
+        plan_id=services.plan.plan_id,
+        step_id="sync",
+    )
+
+    assert result["error_type"] == "navigation_task_session_mismatch"
+    assert invoked == []
+    assert services.plan_store.get_current_step(services.plan.plan_id)["step"]["status"] == "pending"
+
+
 def test_superseded_plan_cannot_claim_pending_step(tmp_path):
     services = build_services(tmp_path)
     old_plan = services.plan

@@ -653,7 +653,15 @@ class SqliteNavigationPlanRepository:
         self._ensure_within_limit(payload, label="current step")
         return payload
 
-    def claim_step(self, plan_id: str, step_id: str, action: str) -> bool:
+    def claim_step(
+        self,
+        plan_id: str,
+        step_id: str,
+        action: str,
+        *,
+        expected_web_session_id: str | None = None,
+        expected_agentscope_session_id: str | None = None,
+    ) -> bool:
         """Atomically claim one pending ledger step for exactly-once invocation."""
         with self._connect() as connection:
             cursor = connection.execute(
@@ -664,15 +672,36 @@ class SqliteNavigationPlanRepository:
                   AND status = 'pending'
                   AND EXISTS (
                       SELECT 1 FROM navigation_plans
+                      JOIN navigation_tasks
+                        ON navigation_tasks.task_id = navigation_plans.task_id
                       WHERE navigation_plans.plan_id = navigation_task_steps.plan_id
                         AND navigation_plans.status = 'active'
+                        AND (? IS NULL OR (
+                            navigation_tasks.created_by_web_session_id = ?
+                            AND navigation_tasks.latest_web_session_id = ?
+                            AND navigation_tasks.agentscope_session_id = ?
+                        ))
                   )
                 """,
-                (utc_now(), plan_id, step_id, action),
+                (
+                    utc_now(), plan_id, step_id, action,
+                    expected_agentscope_session_id,
+                    expected_web_session_id,
+                    expected_web_session_id,
+                    expected_agentscope_session_id,
+                ),
             )
         return cursor.rowcount == 1
 
-    def mark_waiting_user(self, plan_id: str, step_id: str, action: str) -> bool:
+    def mark_waiting_user(
+        self,
+        plan_id: str,
+        step_id: str,
+        action: str,
+        *,
+        expected_web_session_id: str | None = None,
+        expected_agentscope_session_id: str | None = None,
+    ) -> bool:
         """Atomically expose one pending external step as waiting for the user."""
         with self._connect() as connection:
             cursor = connection.execute(
@@ -683,11 +712,24 @@ class SqliteNavigationPlanRepository:
                   AND status = 'pending'
                   AND EXISTS (
                       SELECT 1 FROM navigation_plans
+                      JOIN navigation_tasks
+                        ON navigation_tasks.task_id = navigation_plans.task_id
                       WHERE navigation_plans.plan_id = navigation_task_steps.plan_id
                         AND navigation_plans.status = 'active'
+                        AND (? IS NULL OR (
+                            navigation_tasks.created_by_web_session_id = ?
+                            AND navigation_tasks.latest_web_session_id = ?
+                            AND navigation_tasks.agentscope_session_id = ?
+                        ))
                   )
                 """,
-                (utc_now(), plan_id, step_id, action),
+                (
+                    utc_now(), plan_id, step_id, action,
+                    expected_agentscope_session_id,
+                    expected_web_session_id,
+                    expected_web_session_id,
+                    expected_agentscope_session_id,
+                ),
             )
         return cursor.rowcount == 1
 
