@@ -548,6 +548,8 @@ def _finalize_staged_result(
     plan_store: SqliteNavigationPlanRepository,
     evidence_store: FileNavigationEvidenceStore,
     settings: NavigationSettings | None,
+    expected_web_session_id: str | None,
+    expected_agentscope_session_id: str | None,
 ) -> dict[str, Any]:
     staged = plan_store.get_staged_step_result(plan.plan_id, step.step_id)
     if staged is None:
@@ -572,8 +574,8 @@ def _finalize_staged_result(
             )
         if not plan_store.attach_staged_result_evidence(
             plan.plan_id, step.step_id, result_ref,
-            expected_web_session_id=task.latest_web_session_id,
-            expected_agentscope_session_id=task.agentscope_session_id,
+            expected_web_session_id=expected_web_session_id,
+            expected_agentscope_session_id=expected_agentscope_session_id,
         ):
             return _result_finalize_retry_error()
     except Exception:
@@ -581,8 +583,8 @@ def _finalize_staged_result(
     try:
         finalized = plan_store.finalize_staged_step(
             plan.plan_id, step.step_id,
-            expected_web_session_id=task.latest_web_session_id,
-            expected_agentscope_session_id=task.agentscope_session_id,
+            expected_web_session_id=expected_web_session_id,
+            expected_agentscope_session_id=expected_agentscope_session_id,
         )
     except Exception:
         return _result_finalize_retry_error()
@@ -596,8 +598,8 @@ def _finalize_staged_result(
                 reconciled = reconcile_navigation_task(stored_task, settings=settings)
                 task_store.update_task_for_session(
                     stored_task.task_id,
-                    web_session_id=task.latest_web_session_id,
-                    agentscope_session_id=task.agentscope_session_id,
+                    web_session_id=expected_web_session_id,
+                    agentscope_session_id=expected_agentscope_session_id,
                     expected_state_revision=stored_task.state_revision,
                     **_task_changes(reconciled),
                 )
@@ -607,8 +609,8 @@ def _finalize_staged_result(
                 )
                 task_store.update_task_for_session(
                     stored_task.task_id,
-                    web_session_id=task.latest_web_session_id,
-                    agentscope_session_id=task.agentscope_session_id,
+                    web_session_id=expected_web_session_id,
+                    agentscope_session_id=expected_agentscope_session_id,
                     expected_state_revision=stored_task.state_revision,
                     artifact_snapshot=snapshot.model_dump(mode="json"),
                     status="failed",
@@ -671,6 +673,8 @@ def _invoke_plan_step(
             plan_store=plan_store,
             evidence_store=evidence_store,
             settings=settings,
+            expected_web_session_id=expected_web_session_id,
+            expected_agentscope_session_id=expected_agentscope_session_id,
         )
     current = plan_store.get_current_step(plan.plan_id)
     current_status = (current or {}).get("step", {}).get("status")
@@ -740,6 +744,8 @@ def _invoke_plan_step(
                 plan_store=plan_store,
                 evidence_store=evidence_store,
                 settings=settings,
+                expected_web_session_id=expected_web_session_id,
+                expected_agentscope_session_id=expected_agentscope_session_id,
             )
             if transition.get("error_type") == "result_finalize_retry_required":
                 error = TurnCancelled("The current turn was interrupted.")
@@ -800,6 +806,8 @@ def _invoke_plan_step(
         plan_store=plan_store,
         evidence_store=evidence_store,
         settings=settings,
+        expected_web_session_id=expected_web_session_id,
+        expected_agentscope_session_id=expected_agentscope_session_id,
     )
     if oversized and response.get("error_type") != "result_finalize_retry_required":
         plan_store.mark_needs_replan(
@@ -937,6 +945,8 @@ def submit_plan_human_decision(
         plan_store=plan_store,
         evidence_store=evidence_store,
         settings=None,
+        expected_web_session_id=expected_web_session_id,
+        expected_agentscope_session_id=expected_agentscope_session_id,
     )
     return result.get("status") in {"completed", "failed"}
 

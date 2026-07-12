@@ -1526,3 +1526,93 @@ def test_plan_bound_human_decision_waits_and_transitions_ledger_exactly_once(
             (plan.plan_id,),
         ).fetchone()[0]
     assert status == expected_status
+
+
+def test_human_decision_finalize_does_not_borrow_rebound_session_authority(
+    monkeypatch,
+    tmp_path,
+):
+    settings = NavigationSettings(
+        vladatasets_root=tmp_path / "datasets",
+        processing_root=tmp_path / "processing",
+    )
+    source = "NoobScenes/params/observed/sensors"
+    (settings.processing_root / source).mkdir(parents=True)
+    date = "20260710"
+    segment = "segment-a"
+    (settings.raw_data_root / date / segment).mkdir(parents=True)
+    (settings.clip_data_root / date / segment / "sync_data").mkdir(parents=True)
+    db_path = tmp_path / "navigation.sqlite"
+    task_store = SqliteNavigationTaskStore(db_path)
+    task = task_store.create_or_update_task(
+        date=date,
+        segments=[segment],
+        scene_mode="out",
+        dry_run=True,
+    )
+    task = task_store.update_task(
+        task.task_id,
+        phase="finish_processing",
+        status="pending",
+    )
+    observation_store = SqliteNavigationObservationStore(db_path)
+    evidence_store = FileNavigationEvidenceStore(tmp_path / "evidence")
+    observation = observation_store.append(
+        task.task_id,
+        task.phase,
+        "calibration_inventory",
+        [CalibrationInventoryObservation(sensor_sources=[source])],
+        [],
+        evidence_store,
+    )
+    task = task_store.update_task(
+        task.task_id,
+        created_by_web_session_id="web-old",
+        latest_web_session_id="web-old",
+        agentscope_session_id="agentscope-old",
+    )
+    plan_store = SqliteNavigationPlanRepository(db_path)
+    plan = plan_store.activate(
+        task,
+        "finish_processing",
+        observation.revision,
+        finish_plan(source),
+        expected_web_session_id="web-old",
+        expected_agentscope_session_id="agentscope-old",
+    )
+    original_stage = plan_store.stage_human_decision_handoff
+
+    def stage_then_rebind(*args, **kwargs):
+        outcome = original_stage(*args, **kwargs)
+        with sqlite3.connect(db_path) as connection:
+            connection.execute(
+                """UPDATE navigation_tasks
+                   SET created_by_web_session_id = 'web-new',
+                       latest_web_session_id = 'web-new',
+                       agentscope_session_id = 'agentscope-new'
+                   WHERE task_id = ?""",
+                (task.task_id,),
+            )
+        return outcome
+
+    monkeypatch.setattr(
+        plan_store,
+        "stage_human_decision_handoff",
+        stage_then_rebind,
+    )
+
+    accepted = plan_execution.submit_plan_human_decision(
+        plan_store=plan_store,
+        evidence_store=evidence_store,
+        plan_id=plan.plan_id,
+        step_id="confirm",
+        decision={"action": "confirm"},
+        expected_web_session_id="web-old",
+        expected_agentscope_session_id="agentscope-old",
+    )
+
+    assert accepted is False
+    assert plan_store.get_human_decision_handoff(plan.plan_id, "confirm") is not None
+    assert plan_store.get_staged_step_result(plan.plan_id, "confirm") is not None
+    assert plan_store.get_current_step(plan.plan_id)["step"]["status"] == "pending"
+    assert plan_store.get(plan.plan_id).status == "active"

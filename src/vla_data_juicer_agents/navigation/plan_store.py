@@ -613,7 +613,14 @@ class SqliteNavigationPlanRepository:
             ).fetchone()
         return self._record_from_row(row) if row is not None else None
 
-    def invalidate(self, plan_id: str, reason: str) -> NavigationPlanRecord:
+    def invalidate(
+        self,
+        plan_id: str,
+        reason: str,
+        *,
+        expected_web_session_id: str | None = None,
+        expected_agentscope_session_id: str | None = None,
+    ) -> NavigationPlanRecord:
         connection = self._connect()
         try:
             connection.execute("BEGIN IMMEDIATE")
@@ -623,6 +630,12 @@ class SqliteNavigationPlanRepository:
             ).fetchone()
             if row is None:
                 raise KeyError(plan_id)
+            self._authorize_plan_write(
+                connection,
+                plan_id,
+                expected_web_session_id=expected_web_session_id,
+                expected_agentscope_session_id=expected_agentscope_session_id,
+            )
             if self._active_plan_has_in_flight_work(connection, plan_id):
                 raise ActivePlanExecutionConflict(
                     "cannot invalidate a navigation plan with in-flight work"

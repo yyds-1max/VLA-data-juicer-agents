@@ -615,6 +615,50 @@ def test_invalidate_removes_plan_from_active_lookup_without_mutating_plan(tmp_pa
     assert reason == "artifact drift"
 
 
+def test_invalidate_requires_exact_session_for_owned_task_and_allows_legacy_task(
+    tmp_path: Path,
+):
+    repo, task = stores_with_task(tmp_path)
+    owned_plan = repo.activate(task, "extract_sync", 1, valid_extract_plan())
+    SqliteNavigationTaskStore(repo.db_path).update_task(
+        task.task_id,
+        created_by_web_session_id="web-owner",
+        latest_web_session_id="web-owner",
+        agentscope_session_id="agentscope-owner",
+    )
+
+    with pytest.raises(PermissionError, match="session mismatch"):
+        repo.invalidate(owned_plan.plan_id, "artifact drift")
+    with pytest.raises(PermissionError, match="session mismatch"):
+        repo.invalidate(
+            owned_plan.plan_id,
+            "artifact drift",
+            expected_web_session_id="web-other",
+            expected_agentscope_session_id="agentscope-owner",
+        )
+    assert repo.get(owned_plan.plan_id).status == "active"
+
+    invalidated = repo.invalidate(
+        owned_plan.plan_id,
+        "artifact drift",
+        expected_web_session_id="web-owner",
+        expected_agentscope_session_id="agentscope-owner",
+    )
+    assert invalidated.status == "invalidated"
+
+    legacy_task = SqliteNavigationTaskStore(repo.db_path).create_or_update_task(
+        date="20270624",
+        segments=["20260624_101010"],
+        scene_mode=None,
+    )
+    legacy_plan = repo.activate(
+        legacy_task, "extract_sync", 1, valid_extract_plan()
+    )
+    assert repo.invalidate(legacy_plan.plan_id, "legacy artifact drift").status == (
+        "invalidated"
+    )
+
+
 @pytest.mark.parametrize("mutation", ["invalidate", "mark_needs_replan"])
 def test_plan_mutations_reject_claimed_execution_in_same_transaction(
     tmp_path: Path, mutation: str
