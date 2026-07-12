@@ -857,7 +857,13 @@ def _direct_workflow_fakes(
         plan_revision=1,
         model_dump=lambda mode="json": {"plan_id": "plan-1", "status": "active"},
     )
-    complete = terminal_status == "completed"
+    dry_run_complete = terminal_status == "dry_run_completed"
+    complete = terminal_status in {"completed", "dry_run_completed"}
+    ledger_status = (
+        terminal_status
+        if terminal_status in {"waiting_user", "failed", "needs_replan"}
+        else "pending"
+    )
     plan_store = SimpleNamespace(
         get_execution_overview=lambda _plan_id: SimpleNamespace(
             model_dump=lambda mode="json": {
@@ -870,13 +876,26 @@ def _direct_workflow_fakes(
             status="completed" if complete else "active",
         ),
         get_current_step=lambda _plan_id: (
-            None if complete else {"step": {"step_id": "step-1"}}
+            None
+            if complete
+            else {"step": {"step_id": "step-1", "status": ledger_status}}
         ),
     )
     completed_task = SimpleNamespace(
         task_id="task-1",
-        phase=SimpleNamespace(value="completed" if complete else "extract_sync"),
-        status=SimpleNamespace(value=terminal_status),
+        phase=SimpleNamespace(
+            value="completed" if complete and not dry_run_complete else "extract_sync"
+        ),
+        status=SimpleNamespace(
+            value=(
+                "needs_rerun"
+                if dry_run_complete
+                else "pending"
+                if terminal_status == "waiting_user"
+                else terminal_status
+            )
+        ),
+        dry_run=dry_run_complete,
     )
     services = SimpleNamespace(
         plan_store=plan_store,
@@ -998,6 +1017,67 @@ def test_vla_run_workflow_uses_durable_terminal_state_not_assistant_text(
 
     assert payload["ok"] is False
     assert payload["status"] == expected_status
+
+
+def test_vla_executor_exception_reports_durable_waiting_user(tmp_path, monkeypatch):
+    plan = _direct_workflow_fakes(monkeypatch, terminal_status="waiting_user")
+
+    async def fake_plan(*_args, **_kwargs):
+        return plan
+
+    async def rejected_by_durable_gate(*_args, **_kwargs):
+        raise RuntimeError("AgentScope confirmation event reached durable human gate")
+
+    monkeypatch.setenv("VLA_RUNS_ROOT", str(tmp_path / "runs"))
+    monkeypatch.setattr(
+        "vla_data_juicer_agents.tools.vla.run_workflow.run_direct_plan_until_submitted",
+        fake_plan,
+    )
+    monkeypatch.setattr(
+        "vla_data_juicer_agents.tools.vla.run_workflow.run_executor_agent",
+        rejected_by_durable_gate,
+    )
+
+    payload = asyncio.run(
+        run_vla_workflow(
+            ToolContext(working_dir=str(tmp_path)),
+            {"date": "20270605", "scene_mode": "out", "dry_run": False},
+        )
+    )
+
+    assert payload["ok"] is False
+    assert payload["status"] == "waiting_user"
+    assert payload["error_type"] == "RuntimeError"
+
+
+def test_vla_dry_run_reports_completed_from_completed_ledger(tmp_path, monkeypatch):
+    plan = _direct_workflow_fakes(monkeypatch, terminal_status="dry_run_completed")
+
+    async def fake_plan(*_args, **_kwargs):
+        return plan
+
+    async def fake_executor(*_args, **_kwargs):
+        return "dry run summary"
+
+    monkeypatch.setenv("VLA_RUNS_ROOT", str(tmp_path / "runs"))
+    monkeypatch.setattr(
+        "vla_data_juicer_agents.tools.vla.run_workflow.run_direct_plan_until_submitted",
+        fake_plan,
+    )
+    monkeypatch.setattr(
+        "vla_data_juicer_agents.tools.vla.run_workflow.run_executor_agent",
+        fake_executor,
+    )
+
+    payload = asyncio.run(
+        run_vla_workflow(
+            ToolContext(working_dir=str(tmp_path)),
+            {"date": "20270605", "scene_mode": "out", "dry_run": True},
+        )
+    )
+
+    assert payload["ok"] is True
+    assert payload["status"] == "completed"
 
 
 def test_vla_run_workflow_reraises_cancellation_after_interrupted_report(tmp_path, monkeypatch):

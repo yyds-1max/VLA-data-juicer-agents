@@ -282,14 +282,34 @@ def direct_execution_terminal_state(
     task_status = task.status.value
     task_phase = task.phase.value
     plan_status = getattr(plan.status, "value", plan.status)
-    complete = (
-        task_status == "completed"
-        and task_phase == "completed"
-        and plan_status == "completed"
+    current_step_status = (
+        (current.get("step") or {}).get("status")
+        if isinstance(current, dict)
+        else None
+    )
+    ledger_complete = (
+        plan_status == "completed"
         and current is None
         and overview.get("current_step_id") is None
     )
-    if complete:
+    actual_complete = (
+        task_status == "completed"
+        and task_phase == "completed"
+        and ledger_complete
+    )
+    task_dry_run = bool(getattr(task, "dry_run", False))
+    dry_run_complete = bool(task_dry_run and ledger_complete)
+    complete = actual_complete or dry_run_complete
+    if current_step_status in {"waiting_user", "failed", "needs_replan"}:
+        status = current_step_status
+        complete = False
+    elif task_status in {"failed", "needs_replan"}:
+        status = task_status
+        complete = False
+    elif plan_status == "invalidated":
+        status = "needs_replan"
+        complete = False
+    elif complete:
         status = "completed"
     elif task_status in {
         "failed", "needs_replan", "needs_reconcile", "needs_rerun", "waiting_user"
@@ -305,6 +325,7 @@ def direct_execution_terminal_state(
         "task_status": task_status,
         "plan_id": plan_id,
         "plan_status": plan_status,
+        "dry_run": task_dry_run,
         "current_step": current,
         "execution_overview": overview,
     }

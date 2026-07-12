@@ -194,6 +194,9 @@ async def run_vla_workflow(ctx: ToolContext, raw_args: RunVLAWorkflowInput | dic
     cancellation = runtime_values.get("cancellation") or CancellationContext()
     workflow_scope.emit("agent_start")
     terminal_status: str | None = None
+    services = None
+    task = None
+    plan = None
 
     def emit_terminal(status: str) -> None:
         nonlocal terminal_status
@@ -303,6 +306,26 @@ async def run_vla_workflow(ctx: ToolContext, raw_args: RunVLAWorkflowInput | dic
         emit_terminal("interrupted")
         raise
     except Exception as exc:
+        if services is not None and task is not None and plan is not None:
+            terminal = direct_execution_terminal_state(
+                services=services,
+                task_id=task.task_id,
+                plan_id=plan.plan_id,
+            )
+            if terminal["ok"] or terminal["status"] in {
+                "waiting_user", "failed", "needs_replan"
+            }:
+                payload = RunVLAWorkflowOutput(
+                    ok=terminal["ok"],
+                    status=terminal["status"],
+                    run_dir=str(run_dir),
+                    artifacts=_artifact_paths(run_dir),
+                    error_type=type(exc).__name__,
+                    message=str(exc),
+                ).model_dump(mode="json")
+                run_store.write_json(run_dir, "final_report.json", payload)
+                emit_terminal("completed" if terminal["ok"] else terminal["status"])
+                return payload
         payload = RunVLAWorkflowOutput(
             ok=False,
             status="failed",

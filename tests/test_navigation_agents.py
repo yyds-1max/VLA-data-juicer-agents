@@ -10,6 +10,13 @@ from vla_data_juicer_agents.navigation.agents import (
     create_plan_agent,
 )
 from vla_data_juicer_agents.navigation.models import NavigationRequest
+from vla_data_juicer_agents.navigation.plan_models import ExtractSyncPlanInput
+from vla_data_juicer_agents.navigation.plan_store import SqliteNavigationPlanRepository
+from vla_data_juicer_agents.navigation.services import NavigationServices
+from vla_data_juicer_agents.navigation.evidence_store import FileNavigationEvidenceStore
+from vla_data_juicer_agents.navigation.observation_store import SqliteNavigationObservationStore
+from vla_data_juicer_agents.navigation.task_state import NavigationTaskStatus
+from vla_data_juicer_agents.navigation.task_store import SqliteNavigationTaskStore
 from vla_data_juicer_agents.navigation.config import NavigationSettings
 from vla_data_juicer_agents.navigation.workflow import (
     direct_completed_entry_state,
@@ -35,6 +42,67 @@ class _PlanStore:
     def get_active(self, task_id, phase):
         self.calls.append((task_id, phase))
         return self.plan
+
+
+def _stored_extract_plan() -> ExtractSyncPlanInput:
+    return ExtractSyncPlanInput.model_validate(
+        {
+            "decisions": {
+                "sensor_bindings": {
+                    "bindings": {"fisheye_front": "/camera", "lidar": "/lidar", "odom": "/odom"},
+                    "reason": "observed",
+                    "evidence_refs": ["evidence:sensors"],
+                },
+                "topic_selection": {
+                    "topic_whitelist": ["/camera", "/lidar", "/odom"],
+                    "topic_map": {"/camera": "fisheye_front", "/lidar": "lidar", "/odom": "odom"},
+                    "query_dir": "/query",
+                    "reason": "observed",
+                    "evidence_refs": ["evidence:topics"],
+                },
+                "time_sync": {
+                    "reference_sensor": "lidar",
+                    "method": "nearest_timestamp",
+                    "tolerance_ms": 50,
+                    "reason": "observed",
+                    "evidence_refs": ["evidence:timing"],
+                },
+            },
+            "steps": [
+                {
+                    "step_id": "prepare",
+                    "action": "prepare_raw_data",
+                    "variant": "default",
+                    "arguments": {},
+                    "depends_on": [],
+                    "failure_policy": "stop",
+                    "decision_refs": [],
+                }
+            ],
+        }
+    )
+
+
+def _real_terminal_services(tmp_path, *, dry_run: bool):
+    settings = NavigationSettings(vladatasets_root=tmp_path / "data")
+    db_path = tmp_path / "navigation.sqlite"
+    task_store = SqliteNavigationTaskStore(db_path)
+    task = task_store.create_or_update_task(
+        date="20270605",
+        segments=["segment-1"],
+        scene_mode=None,
+        dry_run=dry_run,
+    )
+    plan_store = SqliteNavigationPlanRepository(db_path)
+    plan = plan_store.activate(task, "extract_sync", 1, _stored_extract_plan())
+    services = NavigationServices(
+        settings=settings,
+        task_store=task_store,
+        observation_store=SqliteNavigationObservationStore(db_path),
+        evidence_store=FileNavigationEvidenceStore(tmp_path / "evidence"),
+        plan_store=plan_store,
+    )
+    return services, task, plan
 
 
 def test_create_plan_agent_uses_only_resolved_tools(monkeypatch):
@@ -293,6 +361,44 @@ def test_completed_entry_skips_planning_and_reports_reconciled_artifacts():
         "task_status": "completed",
         "artifacts": {"final_outputs_exist": True, "final_grid_map_exists": True},
     }
+
+
+def test_direct_terminal_treats_completed_dry_run_ledger_as_success(tmp_path):
+    services, task, plan = _real_terminal_services(tmp_path, dry_run=True)
+    assert services.plan_store.claim_step(plan.plan_id, "prepare", "prepare_raw_data")
+    services.plan_store.stage_step_result(
+        plan.plan_id,
+        "prepare",
+        target_status="completed",
+        full_result={"ok": True, "tool_name": "prepare_raw_data", "message": "dry run"},
+        result_summary={"ok": True, "tool_name": "prepare_raw_data", "message": "dry run"},
+    )
+    assert services.plan_store.finalize_staged_step(plan.plan_id, "prepare")
+    services.task_store.update_task(task.task_id, status=NavigationTaskStatus.NEEDS_RERUN)
+
+    result = direct_execution_terminal_state(
+        services=services,
+        task_id=task.task_id,
+        plan_id=plan.plan_id,
+    )
+
+    assert result["ok"] is True
+    assert result["status"] == "completed"
+    assert result["dry_run"] is True
+
+
+def test_direct_terminal_prefers_real_waiting_ledger_over_pending_task(tmp_path):
+    services, task, plan = _real_terminal_services(tmp_path, dry_run=False)
+    assert services.plan_store.mark_waiting_user(plan.plan_id, "prepare", "prepare_raw_data")
+
+    result = direct_execution_terminal_state(
+        services=services,
+        task_id=task.task_id,
+        plan_id=plan.plan_id,
+    )
+
+    assert result["ok"] is False
+    assert result["status"] == "waiting_user"
 
 
 def test_executor_prompt_contains_only_plan_identity_and_compact_state(monkeypatch):

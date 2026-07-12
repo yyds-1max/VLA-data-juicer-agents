@@ -45,6 +45,9 @@ async def async_main(argv: list[str] | None = None) -> int:
     run_dir = run_store.create_run(request.date)
     run_store.write_json(run_dir, "request.json", request.model_dump(mode="json"))
     session_id = f"direct__{run_dir.name}"
+    services = None
+    task = None
+    plan = None
     try:
         services, task = prepare_direct_navigation_entry(
             run_dir=run_dir,
@@ -102,6 +105,20 @@ async def async_main(argv: list[str] | None = None) -> int:
         print(final_output)
         return 0 if terminal["ok"] else 2
     except Exception as exc:
+        if services is not None and task is not None and plan is not None:
+            terminal = direct_execution_terminal_state(
+                services=services,
+                task_id=task.task_id,
+                plan_id=plan.plan_id,
+            )
+            if terminal["ok"] or terminal["status"] in {
+                "waiting_user", "failed", "needs_replan"
+            }:
+                terminal["error_type"] = type(exc).__name__
+                terminal["message"] = str(exc)
+                run_store.write_json(run_dir, "final_report.json", terminal)
+                print(str(exc), file=sys.stderr)
+                return 0 if terminal["ok"] else 2
         run_store.write_json(
             run_dir,
             "final_report.json",

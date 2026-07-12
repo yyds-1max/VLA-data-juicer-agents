@@ -33,13 +33,38 @@ def test_parse_segments_requires_at_least_one_value():
         parse_args(["plan", "--date", "20270605", "--segments"])
 
 
-def test_cli_uses_durable_failed_state_not_executor_text(tmp_path, monkeypatch):
+@pytest.mark.parametrize(
+    ("ledger_status", "executor_raises", "expected_status", "expected_exit"),
+    [
+        ("failed", False, "failed", 2),
+        ("waiting_user", True, "waiting_user", 2),
+        ("dry_run_completed", False, "completed", 0),
+    ],
+)
+def test_cli_uses_durable_terminal_state_not_executor_text(
+    tmp_path,
+    monkeypatch,
+    ledger_status,
+    executor_raises,
+    expected_status,
+    expected_exit,
+):
     settings = NavigationSettings(runs_root=tmp_path / "runs", vladatasets_root=tmp_path / "data")
     task = SimpleNamespace(task_id="task-1", phase=SimpleNamespace(value="extract_sync"))
-    failed_task = SimpleNamespace(
+    ledger_complete = ledger_status == "dry_run_completed"
+    terminal_task = SimpleNamespace(
         task_id="task-1",
         phase=SimpleNamespace(value="extract_sync"),
-        status=SimpleNamespace(value="failed"),
+        status=SimpleNamespace(
+            value=(
+                "needs_rerun"
+                if ledger_complete
+                else "pending"
+                if ledger_status == "waiting_user"
+                else ledger_status
+            )
+        ),
+        dry_run=ledger_complete,
     )
     plan = SimpleNamespace(
         plan_id="plan-1",
@@ -47,14 +72,22 @@ def test_cli_uses_durable_failed_state_not_executor_text(tmp_path, monkeypatch):
         model_dump=lambda mode="json": {"plan_id": "plan-1"},
     )
     plan_store = SimpleNamespace(
-        get=lambda _plan_id: SimpleNamespace(status="active"),
-        get_execution_overview=lambda _plan_id: SimpleNamespace(
-            model_dump=lambda mode="json": {"current_step_id": "step-1"}
+        get=lambda _plan_id: SimpleNamespace(
+            status="completed" if ledger_complete else "active"
         ),
-        get_current_step=lambda _plan_id: {"step": {"step_id": "step-1"}},
+        get_execution_overview=lambda _plan_id: SimpleNamespace(
+            model_dump=lambda mode="json": {
+                "current_step_id": None if ledger_complete else "step-1"
+            }
+        ),
+        get_current_step=lambda _plan_id: (
+            None
+            if ledger_complete
+            else {"step": {"step_id": "step-1", "status": ledger_status}}
+        ),
     )
     services = SimpleNamespace(
-        task_store=SimpleNamespace(get_task=lambda _task_id: failed_task),
+        task_store=SimpleNamespace(get_task=lambda _task_id: terminal_task),
         plan_store=plan_store,
     )
     monkeypatch.setattr("vla_data_juicer_agents.cli.NavigationSettings", lambda: settings)
@@ -67,6 +100,8 @@ def test_cli_uses_durable_failed_state_not_executor_text(tmp_path, monkeypatch):
         return plan
 
     async def fake_executor(*_args, **_kwargs):
+        if executor_raises:
+            raise RuntimeError("durable human gate")
         return "assistant says completed"
 
     monkeypatch.setattr("vla_data_juicer_agents.cli.run_direct_plan_until_submitted", fake_plan)
@@ -76,11 +111,11 @@ def test_cli_uses_durable_failed_state_not_executor_text(tmp_path, monkeypatch):
 
     exit_code = asyncio.run(async_main(["run", "--date", "20270605", "--dry-run"]))
 
-    assert exit_code == 2
+    assert exit_code == expected_exit
     report_path = next((tmp_path / "runs" / "20270605").glob("*/final_report.json"))
     report = json.loads(report_path.read_text(encoding="utf-8"))
-    assert report["ok"] is False
-    assert report["status"] == "failed"
+    assert report["ok"] is (expected_exit == 0)
+    assert report["status"] == expected_status
 
 
 def test_cli_completed_entry_skips_plan_and_execution(tmp_path, monkeypatch):
