@@ -27,3 +27,27 @@ phase, active plan, and current step from the durable state tools.
 Older deployments may still contain a `navigation-plan-drafts/` directory. Current code
 does not read or write it. Operations may remove that directory only after rollout
 verification; application code intentionally does not delete deployed state.
+
+## Server acceptance runbook
+
+Server acceptance is a post-deployment operation and is not completed by the local
+test suite. Before running it, synchronize the server checkout to the exact reviewed
+revision and record both local and server `git rev-parse HEAD`; stop if they differ.
+
+Start with read-only checks for one known test date: service logs, the reconciled task
+and artifact snapshot, observation revisions/evidence descriptors, active plan and
+submission attempts, execution ledger/outbox rows, and the tool names resolved for the
+durable phase. Record per-turn model input tokens, every tool-result character count,
+compact events, plan revision, current step, and ledger transitions.
+
+After the read-only state matches the synchronized revision, run the normal task in
+dry-run mode. Confirm artifact reconciliation precedes planning, one valid complete
+plan activates without any draft/finalize loop, peak input remains below 83,885 tokens,
+and no standard-run compact event occurs. A forced-compaction check must recover phase,
+active plan, and current step from SQLite rather than conversation text.
+
+Only after dry-run evidence is reviewed may an operator run the separately authorized
+real-data test. Deleting test outputs for a subsequent ordinary entry should select the
+earliest incomplete phase. Do not change AgentScope compression or add phase sub-session
+rotation during this acceptance; if the synchronized real run still exceeds the target,
+preserve the transcript metrics and open a separate design task.
