@@ -1056,6 +1056,22 @@ Expose wrappers for distinct actions remaining in the active plan so a single Ag
 
 Replace the free-form summary input with a plan-bound request. Include `plan_id` and `step_id` in external tool metadata and use them in `submit_human_decision` to transition the current ledger step before AgentScope resumes.
 
+Human-decision delivery is fail-closed. A persisted AgentScope tool call that is no
+longer `SUBMITTED` permits ack-only recovery. An expired `delivering` lease whose
+tool call remains `SUBMITTED`, or a handoff whose Web/AgentScope identity is
+missing, transitions to `recovery_required` and must not be automatically
+re-delivered. Add a separate controlled Web recovery request that is not exposed as
+an agent tool. It may quarantine only `recovery_required` handoffs, records a
+bounded reason and recovery audit, invalidates the affected plan, and moves the
+task to `needs_replan` so a replacement complete plan can be submitted. Preserve
+the handoff/decision audit rather than deleting it. Fully automatic lease reclaim
+would require AgentScope session-transaction fencing and is outside this plan.
+
+Add regressions for expired-but-`SUBMITTED` fail-closed behavior, consumed ack-only
+behavior, missing session/mapping recovery-required behavior, rejection of recovery
+for live work, controlled quarantine audit, plan/task transition, replacement-plan
+unblocking, and stale-wrapper rejection.
+
 - [ ] **Step 8: Run focused tests**
 
 Run: `pytest tests/test_navigation_plan_execution.py tests/test_navigation_execution_tools_dry_run.py tests/test_navigation_agent_tools.py tests/test_web_human_decision_api.py -q`

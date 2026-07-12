@@ -435,6 +435,38 @@ observation revision, marks the ledger and task `needs_replan`, invalidates the 
 plan without modifying it, and returns to planning. The model then submits a new
 complete plan based on the new context revision.
 
+### Fail-Closed Human-Decision Delivery Recovery
+
+Plan-bound human decisions use a durable handoff record, but lease expiry is not
+proof that the previous AgentScope worker stopped. The runtime therefore never
+automatically re-delivers a handoff merely because its `delivering` lease expired.
+
+Delivery recovery follows these rules:
+
+- if the persisted AgentScope tool call is no longer `SUBMITTED`, the decision was
+  consumed; recovery only acknowledges the durable handoff and never starts a
+  second AgentScope continuation;
+- if the tool call remains `SUBMITTED` after the delivery lease expires, the
+  handoff becomes `recovery_required`; automatic re-delivery is forbidden;
+- if the Web mapping or AgentScope session needed to inspect the tool call is
+  missing, the handoff also becomes `recovery_required`;
+- `recovery_required` handoffs continue to block plan replacement and processing
+  recovery until an explicit controlled recovery request is made;
+- controlled recovery quarantines the handoff with an operator/user reason,
+  preserves its decision and delivery audit, invalidates the affected plan, and
+  moves the task to `needs_replan`; it never pretends that the decision was
+  delivered;
+- only a handoff already marked `recovery_required` may be quarantined. Live
+  `pending` or unexpired `delivering` work cannot be force-recovered through this
+  path.
+
+The controlled recovery endpoint is an operational safety valve, not a model-facing
+planning or processing tool. A stale worker that later resumes remains fenced from
+processing by the invalidated plan and current-step ledger gates. Fully automatic
+lease reclamation requires a future AgentScope session-transaction fencing token
+and is explicitly outside this iteration. AgentScope context compression remains
+unchanged.
+
 ## Tool Exposure by Phase
 
 The active tool set is resolved from durable task state for each agent turn or
