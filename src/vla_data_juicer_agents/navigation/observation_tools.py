@@ -105,6 +105,8 @@ def build_navigation_observation_tools(
     observation_store: SqliteNavigationObservationStore,
     evidence_store: FileNavigationEvidenceStore,
     settings: NavigationSettings,
+    expected_web_session_id: str | None = None,
+    expected_agentscope_session_id: str | None = None,
 ) -> list[FunctionTool]:
     required = PHASE_REQUIRED_OBSERVATIONS.get(task.phase.value)
     if required is None:
@@ -147,6 +149,8 @@ def build_navigation_observation_tools(
                 )
             ],
             evidence_store,
+            expected_web_session_id=expected_web_session_id,
+            expected_agentscope_session_id=expected_agentscope_session_id,
         )
         missing = [
             item

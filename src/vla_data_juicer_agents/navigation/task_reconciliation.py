@@ -204,6 +204,7 @@ def prepare_navigation_task_entry(
     )
 
     task = None
+    saved = None
     try:
         task = task_store.create_or_update_task(
             date=handoff["date"],
@@ -215,9 +216,14 @@ def prepare_navigation_task_entry(
         )
         reconciled = reconcile_navigation_task(task, settings=settings)
         changes = _task_changes(reconciled)
+        for field in ("created_by_web_session_id", "latest_web_session_id", "agentscope_session_id"):
+            changes.pop(field, None)
         if guidance:
             changes["guidance_revision"] = task.guidance_revision + 1
-        saved = task_store.update_task(task.task_id, **changes)
+        saved = task_store.update_task_for_session(
+            task.task_id, web_session_id=web_session_id,
+            agentscope_session_id=agentscope_session_id, **changes,
+        )
         if saved.artifact_snapshot is None:
             raise RuntimeError("task entry reconciliation did not create an artifact snapshot")
 
@@ -245,6 +251,15 @@ def prepare_navigation_task_entry(
                     summary=f"task-entry user guidance revision {saved.guidance_revision}",
                 )
             )
+        observation_fence = (
+            {
+                "expected_web_session_id": web_session_id,
+                "expected_agentscope_session_id": agentscope_session_id,
+            }
+            if getattr(observation_store, "db_path", None)
+            == getattr(task_store, "db_path", object())
+            else {}
+        )
         observation_store.append(
             saved.task_id,
             saved.phase,
@@ -252,6 +267,7 @@ def prepare_navigation_task_entry(
             payloads,
             evidence_writes,
             evidence_store,
+            **observation_fence,
         )
         return saved
     except Exception as entry_error:
@@ -259,9 +275,21 @@ def prepare_navigation_task_entry(
             if task is None:
                 pass
             elif previous_task is None:
-                task_store.delete_task(task.task_id)
+                current = saved or task
+                if not task_store.delete_task_if_current(
+                    task.task_id, expected_updated_at=current.updated_at,
+                    expected_web_session_id=web_session_id,
+                    expected_agentscope_session_id=agentscope_session_id,
+                ):
+                    entry_error.add_note("navigation task entry compensation skipped: task changed")
             else:
-                task_store.restore_task_exact(previous_task)
+                current = saved or task
+                if not task_store.restore_task_exact_if_current(
+                    previous_task, expected_updated_at=current.updated_at,
+                    expected_web_session_id=web_session_id,
+                    expected_agentscope_session_id=agentscope_session_id,
+                ):
+                    entry_error.add_note("navigation task entry compensation skipped: task changed")
         except Exception as compensation_error:
             entry_error.add_note(
                 "navigation task entry compensation failed: "

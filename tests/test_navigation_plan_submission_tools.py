@@ -741,3 +741,86 @@ def test_activation_failure_keeps_audited_candidate_but_never_exposes_it_as_acti
     assert json.loads(_audit_rows(services)[0][1])["ok"] is True
     assert services.plan_store.get_active(services.task.task_id, "extract_sync") is None
     assert _ledger_count(services) == 0
+
+
+def test_stale_planning_toolkit_cannot_audit_or_activate_after_session_rebind(tmp_path):
+    services = build_services(tmp_path, "extract_sync")
+    task_store = SqliteNavigationTaskStore(services.plan_store.db_path)
+    bound = task_store.update_task(
+        services.task.task_id,
+        created_by_web_session_id="web-owner",
+        latest_web_session_id="web-owner",
+        agentscope_session_id="as-old",
+    )
+    tools = {
+        tool.name: tool
+        for tool in build_navigation_plan_submission_tools(
+            task=bound,
+            observation_store=services.observation_store,
+            evidence_store=services.evidence_store,
+            plan_store=services.plan_store,
+            capabilities=list_navigation_tool_capabilities(),
+            expected_web_session_id="web-owner",
+            expected_agentscope_session_id="as-old",
+        )
+    }
+    task_store.create_or_update_task(
+        date=bound.date,
+        segments=bound.segments,
+        scene_mode=bound.scene_mode,
+        web_session_id="web-owner",
+        agentscope_session_id="as-new",
+    )
+
+    result = _invoke_tool(
+        tools["submit_extract_sync_plan_tool"],
+        {
+            "planning_context_revision": services.planning_context_revision,
+            "plan": valid_extract_plan_payload(services),
+        },
+    )
+
+    assert result["ok"] is False
+    assert services.plan_store.get_active(bound.task_id, "extract_sync") is None
+    with sqlite3.connect(services.plan_store.db_path) as connection:
+        assert connection.execute(
+            "SELECT COUNT(*) FROM navigation_plan_submission_attempts WHERE task_id = ?",
+            (bound.task_id,),
+        ).fetchone()[0] == 0
+
+
+def test_rebind_after_serialized_attempt_keeps_audit_but_rejects_activation(tmp_path, monkeypatch):
+    services = build_services(tmp_path, "extract_sync")
+    task_store = SqliteNavigationTaskStore(services.plan_store.db_path)
+    bound = task_store.update_task(
+        services.task.task_id,
+        created_by_web_session_id="web-owner",
+        latest_web_session_id="web-owner",
+        agentscope_session_id="as-old",
+    )
+    original_record = services.plan_store.record_attempt
+
+    def record_then_rebind(attempt, **kwargs):
+        result = original_record(attempt, **kwargs)
+        task_store.create_or_update_task(
+            date=bound.date, segments=bound.segments, scene_mode=bound.scene_mode,
+            web_session_id="web-owner", agentscope_session_id="as-new",
+        )
+        return result
+
+    monkeypatch.setattr(services.plan_store, "record_attempt", record_then_rebind)
+    tool = build_navigation_plan_submission_tools(
+        task=bound, observation_store=services.observation_store,
+        evidence_store=services.evidence_store, plan_store=services.plan_store,
+        capabilities=list_navigation_tool_capabilities(),
+        expected_web_session_id="web-owner", expected_agentscope_session_id="as-old",
+    )[0]
+
+    result = _invoke_tool(tool, {
+        "planning_context_revision": services.planning_context_revision,
+        "plan": valid_extract_plan_payload(services),
+    })
+
+    assert result["error_type"] == "plan_activation_failed"
+    assert len(_audit_rows(services)) == 1
+    assert services.plan_store.get_active(bound.task_id, "extract_sync") is None

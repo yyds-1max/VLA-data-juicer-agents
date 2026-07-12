@@ -174,10 +174,11 @@ class NavigationTaskStore(Protocol):
 
 
 class SqliteNavigationTaskStore:
-    def __init__(self, db_path: str | Path) -> None:
+    def __init__(self, db_path: str | Path, *, initialize: bool = True) -> None:
         self.db_path = Path(db_path)
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
-        self._init_schema()
+        if initialize:
+            self._init_schema()
 
     def _connect(self) -> sqlite3.Connection:
         connection = sqlite3.connect(self.db_path)
@@ -539,6 +540,43 @@ class SqliteNavigationTaskStore:
         if row is None:
             raise KeyError(task.task_id)
         return self._task_from_row(row)
+
+    def restore_task_exact_if_current(
+        self, task: NavigationTask, *, expected_updated_at: str,
+        expected_web_session_id: str | None, expected_agentscope_session_id: str | None,
+    ) -> bool:
+        values = self._task_values(task)
+        with self._connect() as connection:
+            cursor = connection.execute(
+                """UPDATE navigation_tasks SET date=?, segments_json=?, segments_key=?,
+                scene_mode=?, dry_run=?, guidance_revision=?, phase=?, status=?,
+                waiting_reason=?, next_required_input=?, created_by_web_session_id=?,
+                latest_web_session_id=?, agentscope_session_id=?, latest_run_id=?,
+                last_completed_step=?, data_profile_json=?, artifact_snapshot_json=?,
+                drift_json=?, schema_version=?, created_at=?, updated_at=?
+                WHERE task_id=? AND updated_at=? AND latest_web_session_id IS ?
+                  AND agentscope_session_id IS ?""",
+                values[1:] + (values[0], expected_updated_at,
+                              expected_web_session_id, expected_agentscope_session_id),
+            )
+        return cursor.rowcount == 1
+
+    def delete_task_if_current(
+        self, task_id: str, *, expected_updated_at: str,
+        expected_web_session_id: str | None, expected_agentscope_session_id: str | None,
+    ) -> bool:
+        with self._connect() as connection:
+            row = connection.execute(
+                """SELECT 1 FROM navigation_tasks WHERE task_id=? AND updated_at=?
+                AND latest_web_session_id IS ? AND agentscope_session_id IS ?""",
+                (task_id, expected_updated_at, expected_web_session_id,
+                 expected_agentscope_session_id),
+            ).fetchone()
+            if row is None:
+                return False
+            connection.execute("DELETE FROM navigation_task_steps WHERE task_id=?", (task_id,))
+            connection.execute("DELETE FROM navigation_tasks WHERE task_id=?", (task_id,))
+        return True
 
     def delete_task(self, task_id: str) -> None:
         with self._connect() as connection:

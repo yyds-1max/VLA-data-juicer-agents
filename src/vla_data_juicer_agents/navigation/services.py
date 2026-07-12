@@ -34,11 +34,30 @@ class LegacyObservationMigrationError(RuntimeError):
 _LEGACY_OBSERVATION_MIGRATION = "legacy_observations_to_unified_v1"
 
 
+def _legacy_migration_complete(target: Path) -> bool:
+    if not target.is_file():
+        return False
+    connection = sqlite3.connect(f"file:{target}?mode=ro", uri=True, timeout=0.1)
+    try:
+        if connection.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='navigation_service_migrations'"
+        ).fetchone() is None:
+            return False
+        return connection.execute(
+            "SELECT 1 FROM navigation_service_migrations WHERE name=?",
+            (_LEGACY_OBSERVATION_MIGRATION,),
+        ).fetchone() is not None
+    finally:
+        connection.close()
+
+
 def _migrate_legacy_observations(
     legacy_db_path: Path,
     target_db_path: Path,
 ) -> None:
     """Copy deployed observation rows once without overwriting unified state."""
+    if _legacy_migration_complete(target_db_path):
+        return
     if not legacy_db_path.is_file() or legacy_db_path == target_db_path:
         return
     connection = sqlite3.connect(target_db_path, timeout=30)
@@ -117,8 +136,12 @@ def _migrate_legacy_observations(
         evidence_rows = connection.execute(
             "SELECT * FROM legacy_observations.navigation_evidence"
         ).fetchall()
+        evidence_by_ref = {}
         for row in evidence_rows:
             descriptor = EvidenceDescriptor.model_validate(dict(row))
+            if descriptor.ref in evidence_by_ref:
+                raise LegacyObservationMigrationError("legacy evidence metadata contains duplicate ref")
+            evidence_by_ref[descriptor.ref] = descriptor
             revision_key = (descriptor.task_id, descriptor.observation_revision)
             if revision_key not in revisions:
                 raise LegacyObservationMigrationError(
@@ -145,6 +168,16 @@ def _migrate_legacy_observations(
                 raise LegacyObservationMigrationError(
                     "legacy evidence metadata conflicts with unified state"
                 )
+        for key, revision in revisions.items():
+            if len(revision.evidence_refs) != len(set(revision.evidence_refs)):
+                raise LegacyObservationMigrationError("legacy revision contains duplicate evidence refs")
+            for ref in revision.evidence_refs:
+                descriptor = evidence_by_ref.get(ref)
+                if descriptor is None or (descriptor.task_id, descriptor.observation_revision) != key:
+                    raise LegacyObservationMigrationError("legacy observation evidence refs do not match metadata")
+        for ref, descriptor in evidence_by_ref.items():
+            if ref not in revisions[(descriptor.task_id, descriptor.observation_revision)].evidence_refs:
+                raise LegacyObservationMigrationError("legacy evidence metadata is not referenced by revision")
         connection.execute(
             """
             INSERT OR IGNORE INTO navigation_observation_revisions (
@@ -198,16 +231,15 @@ def build_navigation_services(
     """Build one coherent durable service bundle for a navigation workspace."""
     resolved_settings = settings or NavigationSettings()
     db_path = workspace_root / "navigation-tasks.sqlite"
-    task_store = SqliteNavigationTaskStore(db_path)
-    observation_store = SqliteNavigationObservationStore(db_path)
-    _migrate_legacy_observations(
-        workspace_root / "navigation-observations.sqlite",
-        db_path,
-    )
+    migrated = _legacy_migration_complete(db_path)
+    task_store = SqliteNavigationTaskStore(db_path, initialize=not migrated)
+    observation_store = SqliteNavigationObservationStore(db_path, initialize=not migrated)
+    if not migrated:
+        _migrate_legacy_observations(workspace_root / "navigation-observations.sqlite", db_path)
     return NavigationServices(
         settings=resolved_settings,
         task_store=task_store,
         observation_store=observation_store,
         evidence_store=FileNavigationEvidenceStore(workspace_root / "navigation-evidence"),
-        plan_store=SqliteNavigationPlanRepository(db_path),
+        plan_store=SqliteNavigationPlanRepository(db_path, initialize=not migrated),
     )

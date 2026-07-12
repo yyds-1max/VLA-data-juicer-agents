@@ -3,6 +3,8 @@ import inspect
 import json
 from pathlib import Path
 
+import pytest
+
 from vla_data_juicer_agents.navigation.config import NavigationSettings
 from vla_data_juicer_agents.navigation.evidence_store import FileNavigationEvidenceStore
 from vla_data_juicer_agents.navigation.observation_store import SqliteNavigationObservationStore
@@ -11,6 +13,7 @@ from vla_data_juicer_agents.navigation.task_state import (
     NavigationTask,
     NavigationTaskPhase,
 )
+from vla_data_juicer_agents.navigation.task_store import SqliteNavigationTaskStore
 
 
 FIXTURE_ROOT = Path(__file__).parent / "fixtures" / "navigation" / "VLADatasets"
@@ -95,6 +98,45 @@ def test_builder_exposes_factual_and_cognitive_tools_without_semantic_inference(
     assert not any("infer_" in name or "profile" in name for name in tools)
     assert all(tool.is_read_only for tool in tools.values())
     assert all("task_id" not in tool.input_schema.get("properties", {}) for tool in tools.values())
+
+
+def test_stale_inspection_toolkit_cannot_write_revision_or_evidence_after_rebind(tmp_path):
+    db_path = tmp_path / "state.sqlite"
+    task_store = SqliteNavigationTaskStore(db_path)
+    task = task_store.create_or_update_task(
+        date="20270605",
+        segments=["20260605_152856"],
+        scene_mode=None,
+        web_session_id="web-owner",
+        agentscope_session_id="as-old",
+    )
+    task = task_store.update_task(task.task_id, phase="extract_sync")
+    observation_store = SqliteNavigationObservationStore(db_path)
+    evidence_store = FileNavigationEvidenceStore(tmp_path / "evidence")
+    tools = {
+        tool.name: tool
+        for tool in build_navigation_observation_tools(
+            task=task,
+            observation_store=observation_store,
+            evidence_store=evidence_store,
+            settings=NavigationSettings(vladatasets_root=FIXTURE_ROOT),
+            expected_web_session_id="web-owner",
+            expected_agentscope_session_id="as-old",
+        )
+    }
+    task_store.create_or_update_task(
+        date=task.date,
+        segments=task.segments,
+        scene_mode=None,
+        web_session_id="web-owner",
+        agentscope_session_id="as-new",
+    )
+
+    with pytest.raises(PermissionError, match="session mismatch"):
+        _invoke_tool(tools["inspect_navigation_raw_metadata_tool"], {})
+
+    assert observation_store.latest(task.task_id) is None
+    assert not (tmp_path / "evidence" / task.task_id).exists()
 
 
 def test_inspection_tool_returns_only_compact_delta_and_external_evidence(tmp_path):

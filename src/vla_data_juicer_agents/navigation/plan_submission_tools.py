@@ -204,6 +204,8 @@ def build_navigation_plan_submission_tools(
     evidence_store: FileNavigationEvidenceStore,
     plan_store: SqliteNavigationPlanRepository,
     capabilities: Sequence[ToolCapability] | dict[str, Any],
+    expected_web_session_id: str | None = None,
+    expected_agentscope_session_id: str | None = None,
 ) -> list[FunctionTool]:
     """Build the single complete-plan submission tool for the bound task phase."""
     phase_value = task.phase.value
@@ -271,7 +273,10 @@ def build_navigation_plan_submission_tools(
             created_at=utc_now(),
         )
         try:
-            plan_store.record_attempt(attempt)
+            plan_store.record_attempt(
+                attempt, expected_web_session_id=expected_web_session_id,
+                expected_agentscope_session_id=expected_agentscope_session_id,
+            )
         except Exception:
             return _internal_failure(
                 "submission_audit_failed",
@@ -288,6 +293,8 @@ def build_navigation_plan_submission_tools(
                 phase,
                 observation.revision,
                 canonical_plan,
+                expected_web_session_id=expected_web_session_id,
+                expected_agentscope_session_id=expected_agentscope_session_id,
             )
         except Exception:
             return _internal_failure(

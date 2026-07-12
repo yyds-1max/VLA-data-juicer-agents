@@ -514,6 +514,51 @@ def test_prepare_task_entry_restores_existing_task_when_evidence_append_fails(
     assert observation_store.latest(original.task_id) is None
 
 
+def test_task_entry_compensation_never_overwrites_newer_same_owner_session(
+    tmp_path: Path,
+):
+    root = tmp_path / "VLADatasets"
+    (root / "raw_data" / "20270623" / "segment_a").mkdir(parents=True)
+    store = SqliteNavigationTaskStore(tmp_path / "navigation.sqlite")
+    original = store.create_or_update_task(
+        date="20270623",
+        segments=["segment_a"],
+        scene_mode=None,
+        web_session_id="web-owner",
+        agentscope_session_id="as-old",
+    )
+
+    class RebindingObservationStore:
+        def append(self, *args, **kwargs):
+            store.create_or_update_task(
+                date=original.date,
+                segments=original.segments,
+                scene_mode=None,
+                web_session_id="web-owner",
+                agentscope_session_id="as-new",
+            )
+            raise RuntimeError("append failed after rebind")
+
+    message = "\n".join([
+        "Structured handoff JSON:",
+        '{"date":"20270623","segments":["segment_a"],"request":"go"}',
+    ])
+    with pytest.raises(RuntimeError, match="append failed after rebind") as error:
+        task_reconciliation_module.prepare_navigation_task_entry(
+            task_store=store,
+            observation_store=RebindingObservationStore(),
+            evidence_store=_FailingEvidenceStore(),
+            message=message,
+            web_session_id="web-owner",
+            agentscope_session_id="as-old",
+            settings=NavigationSettings(vladatasets_root=root),
+        )
+
+    current = store.get_task(original.task_id)
+    assert current.agentscope_session_id == "as-new"
+    assert any("compensation skipped" in note for note in error.value.__notes__)
+
+
 def test_prepare_task_entry_removes_new_task_when_evidence_append_fails(tmp_path: Path):
     root = tmp_path / "VLADatasets"
     (root / "raw_data" / "20270623" / "segment_a").mkdir(parents=True)

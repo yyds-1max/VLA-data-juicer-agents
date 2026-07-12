@@ -1,6 +1,7 @@
 import asyncio
 import json
 import sqlite3
+from concurrent.futures import ThreadPoolExecutor
 from types import SimpleNamespace
 
 import pytest
@@ -1889,6 +1890,85 @@ def test_navigation_services_migrate_legacy_observations_transactionally_once(tm
     assert first.observation_store.latest("nav-legacy") == revision
     assert second.observation_store.latest("nav-legacy") == revision
     assert len(second.observation_store.list_evidence("nav-legacy")) == 1
+
+
+def _write_legacy_observation_fixture(tmp_path):
+    legacy = SqliteNavigationObservationStore(tmp_path / "navigation-observations.sqlite")
+    evidence = FileNavigationEvidenceStore(tmp_path / "navigation-evidence")
+    payload = ArtifactStateObservation(
+        snapshot=NavigationArtifactSnapshot(date="20260710", raw_input_exists=True)
+    )
+    revision = legacy.append(
+        "nav-legacy-integrity", "extract_sync", "artifact_state", [payload],
+        [EvidenceWrite(
+            kind="artifact_state", source_tool="legacy", payload={"ok": True},
+            summary="legacy",
+        )],
+        evidence,
+    )
+    return revision, evidence
+
+
+@pytest.mark.parametrize("corruption", ["missing", "extra", "wrong_revision", "duplicate"])
+def test_legacy_migration_requires_bidirectional_evidence_integrity(tmp_path, corruption):
+    revision, evidence = _write_legacy_observation_fixture(tmp_path)
+    legacy_path = tmp_path / "navigation-observations.sqlite"
+    with sqlite3.connect(legacy_path) as connection:
+        if corruption == "missing":
+            connection.execute("DELETE FROM navigation_evidence")
+        elif corruption == "wrong_revision":
+            connection.execute("UPDATE navigation_evidence SET observation_revision = 99")
+        elif corruption == "extra":
+            descriptor = evidence.write(
+                revision.task_id, revision.revision, "extra", "legacy", {"x": 1}, "extra"
+            )
+            connection.execute(
+                "INSERT INTO navigation_evidence VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                tuple(descriptor.model_dump(mode="json").values()),
+            )
+        else:
+            connection.execute("ALTER TABLE navigation_evidence RENAME TO evidence_old")
+            connection.execute(
+                """CREATE TABLE navigation_evidence (
+                    ref TEXT, task_id TEXT, observation_revision INTEGER, kind TEXT,
+                    summary TEXT, byte_size INTEGER, source_tool TEXT, created_at TEXT)"""
+            )
+            connection.execute("INSERT INTO navigation_evidence SELECT * FROM evidence_old")
+            connection.execute("INSERT INTO navigation_evidence SELECT * FROM evidence_old")
+            connection.execute("DROP TABLE evidence_old")
+
+    with pytest.raises(navigation_services_module.LegacyObservationMigrationError):
+        build_navigation_services(tmp_path)
+
+
+def test_completed_legacy_marker_fast_path_needs_no_target_write_lock(tmp_path):
+    _write_legacy_observation_fixture(tmp_path)
+    first = build_navigation_services(tmp_path)
+    connection = sqlite3.connect(first.task_store.db_path, timeout=0.1)
+    connection.execute("BEGIN IMMEDIATE")
+    try:
+        resumed = build_navigation_services(tmp_path)
+    finally:
+        connection.rollback()
+        connection.close()
+
+    assert resumed.observation_store.latest("nav-legacy-integrity") is not None
+
+
+def test_concurrent_navigation_service_builders_migrate_once(tmp_path):
+    _write_legacy_observation_fixture(tmp_path)
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        services = list(executor.map(lambda _: build_navigation_services(tmp_path), range(2)))
+
+    assert all(
+        item.observation_store.latest("nav-legacy-integrity") is not None
+        for item in services
+    )
+    with sqlite3.connect(tmp_path / "navigation-tasks.sqlite") as connection:
+        assert connection.execute(
+            "SELECT COUNT(*) FROM navigation_service_migrations"
+        ).fetchone()[0] == 1
 
 
 @pytest.mark.parametrize("failure", ["invalid_json", "partial_schema"])

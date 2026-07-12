@@ -49,10 +49,11 @@ class NavigationEvidenceWriter(Protocol):
 
 
 class SqliteNavigationObservationStore:
-    def __init__(self, db_path: str | Path) -> None:
+    def __init__(self, db_path: str | Path, *, initialize: bool = True) -> None:
         self.db_path = Path(db_path)
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
-        self._init_schema()
+        if initialize:
+            self._init_schema()
 
     def _connect(self) -> sqlite3.Connection:
         connection = sqlite3.connect(self.db_path, timeout=30)
@@ -105,6 +106,8 @@ class SqliteNavigationObservationStore:
         payloads: list[ObservationPayload],
         evidence_writes: list[EvidenceWrite],
         evidence_store: NavigationEvidenceWriter,
+        *, expected_web_session_id: str | None = None,
+        expected_agentscope_session_id: str | None = None,
     ) -> NavigationObservationRevision:
         incoming_payloads = [
             _OBSERVATION_PAYLOAD_ADAPTER.validate_python(payload) for payload in payloads
@@ -114,6 +117,16 @@ class SqliteNavigationObservationStore:
         written_descriptors: list[EvidenceDescriptor] = []
         try:
             connection.execute("BEGIN IMMEDIATE")
+            if expected_agentscope_session_id is not None:
+                owner = connection.execute(
+                    """SELECT 1 FROM navigation_tasks WHERE task_id=?
+                    AND created_by_web_session_id IS ? AND latest_web_session_id IS ?
+                    AND agentscope_session_id IS ?""",
+                    (task_id, expected_web_session_id, expected_web_session_id,
+                     expected_agentscope_session_id),
+                ).fetchone()
+                if owner is None:
+                    raise PermissionError("navigation task session mismatch")
             row = connection.execute(
                 """
                 SELECT revision_json

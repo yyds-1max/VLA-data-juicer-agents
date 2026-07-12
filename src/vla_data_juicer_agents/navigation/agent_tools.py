@@ -763,6 +763,8 @@ def resolve_navigation_agent_tools(
         observation_store=services.observation_store,
         evidence_store=services.evidence_store,
         settings=services.settings,
+        expected_web_session_id=web_session_id,
+        expected_agentscope_session_id=agentscope_session_id,
     )
     cognitive = [tool for tool in observation_tools if tool.name in _COGNITIVE_TOOL_NAMES]
 
@@ -812,5 +814,7 @@ def resolve_navigation_agent_tools(
         evidence_store=services.evidence_store,
         plan_store=services.plan_store,
         capabilities=list_navigation_tool_capabilities(),
+        expected_web_session_id=web_session_id,
+        expected_agentscope_session_id=agentscope_session_id,
     )
     return _trust_internal_navigation_tools([*cognitive, *submission])
