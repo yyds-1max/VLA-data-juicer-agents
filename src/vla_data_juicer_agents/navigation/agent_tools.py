@@ -632,6 +632,7 @@ def _durable_state_tools(
             fields=fields,
             cursor=cursor,
             limit=limit,
+            max_chars=4_000,
         )
         return ensure_payload_within_limit(
             result,
@@ -706,8 +707,26 @@ def resolve_navigation_agent_tools(
 
     reconciled = reconcile_navigation_task(task, settings=services.settings)
     changes = reconciled.model_dump(mode="json")
-    changes.pop("task_id", None)
-    task = services.task_store.update_task(task.task_id, **changes)
+    for field in (
+        "task_id",
+        "created_by_web_session_id",
+        "latest_web_session_id",
+        "agentscope_session_id",
+    ):
+        changes.pop(field, None)
+    try:
+        task = (
+            services.task_store.update_task_for_session(
+                task.task_id,
+                web_session_id=web_session_id,
+                agentscope_session_id=agentscope_session_id,
+                **changes,
+            )
+            if web_session_id is not None
+            else services.task_store.update_task(task.task_id, **changes)
+        )
+    except PermissionError:
+        return []
 
     if task.phase.value == "completed" or task.status.value == "completed":
         return _trust_internal_navigation_tools(
@@ -718,8 +737,9 @@ def resolve_navigation_agent_tools(
         task_tools = build_navigation_task_tools(
             store=services.task_store,
             session_id=agentscope_session_id,
-            web_session_id=task.latest_web_session_id,
+            web_session_id=web_session_id,
             settings=services.settings,
+            bound_task=task,
         )
         allowed = {
             "get_or_create_navigation_task_tool",

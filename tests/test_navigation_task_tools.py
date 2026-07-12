@@ -149,6 +149,8 @@ def test_state_update_cannot_mark_completed_without_selected_final_markers(tmp_p
         date="20270623",
         segments=["segment_a"],
         scene_mode="out",
+        web_session_id="web-session",
+        agentscope_session_id="agent-session",
     )
 
     result = _call(
@@ -175,6 +177,8 @@ def test_state_update_rejects_phase_not_selected_by_live_reconciliation(tmp_path
         segments=["segment_a"],
         scene_mode="out",
         dry_run=True,
+        web_session_id="web-session",
+        agentscope_session_id="agent-session",
     )
 
     result = _call(
@@ -201,6 +205,8 @@ def test_state_update_allows_execution_status_for_reconciled_phase(tmp_path: Pat
         segments=["segment_a"],
         scene_mode=None,
         dry_run=True,
+        web_session_id="web-session",
+        agentscope_session_id="agent-session",
     )
 
     result = _call(
@@ -250,6 +256,8 @@ def test_scene_mode_update_cannot_bypass_missing_sync_from_intake(tmp_path: Path
         date="20270623",
         segments=["segment_a"],
         scene_mode=None,
+        web_session_id="web-session",
+        agentscope_session_id="agent-session",
     )
 
     result = _call(
@@ -264,7 +272,7 @@ def test_scene_mode_update_cannot_bypass_missing_sync_from_intake(tmp_path: Path
     assert result["task"]["status"] == NavigationTaskStatus.NEEDS_RERUN.value
 
 
-def test_resumable_task_can_be_claimed_from_new_web_session(tmp_path: Path):
+def test_resumable_task_cannot_be_claimed_from_new_web_session(tmp_path: Path):
     root, store, first_tools = _tools(tmp_path)
     (root / "raw_data" / "20270623" / "segment_a").mkdir(parents=True)
     (root / "clip_data" / "20270623" / "segment_a" / "sync_data" / "clip_0").mkdir(
@@ -301,12 +309,14 @@ def test_resumable_task_can_be_claimed_from_new_web_session(tmp_path: Path):
         scene_mode="out",
     )
 
-    assert updated["task"]["latest_web_session_id"] == "web-session-2"
-    assert updated["task"]["agentscope_session_id"] == "agent-session-2"
-    assert updated["task"]["scene_mode"] == "out"
+    assert updated["ok"] is False
+    assert updated["error_type"] == "navigation_task_session_mismatch"
+    stored = store.get_task(created["task"]["task_id"])
+    assert stored.latest_web_session_id == "web-session"
+    assert stored.agentscope_session_id == "agent-session"
 
 
-def test_scene_mode_claim_does_not_mutate_legacy_session_draft(tmp_path: Path):
+def test_foreign_scene_mode_claim_does_not_mutate_legacy_session_draft(tmp_path: Path):
     root, store, draft_store, first_tools = _tools_with_draft_store(
         tmp_path,
         session_id="agent-session-a",
@@ -363,8 +373,8 @@ def test_scene_mode_claim_does_not_mutate_legacy_session_draft(tmp_path: Path):
     )
     draft = draft_store.load("agent-session-b")
 
-    assert result["ok"] is True
-    assert result["task"]["phase"] == NavigationTaskPhase.FINISH_PROCESSING.value
+    assert result["ok"] is False
+    assert result["error_type"] == "navigation_task_session_mismatch"
     assert draft is not None
     assert draft.request.scene_mode is None
     assert draft.plan_phase == "extract_sync"

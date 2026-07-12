@@ -783,6 +783,38 @@ async def test_runtime_start_navigation_agent_task_preserves_dry_run_from_handof
 
 
 @pytest.mark.asyncio
+async def test_runtime_same_date_cross_web_handoff_cannot_rebind_owner(tmp_path: Path) -> None:
+    chat_run_registry = FakeChatRunRegistry()
+    runtime = _runtime(chat_run_registry=chat_run_registry, workspace_root=tmp_path)
+    message = agentscope_runtime_module._navigation_handoff_message(
+        request="处理 20270605 的导航数据",
+        target="20270605",
+        date="20270605",
+        scene_mode=None,
+        clips=[],
+        reason="owner test",
+        response_language="Chinese",
+    )
+    owner_session = await runtime.start_navigation_agent_task(
+        web_session_id="web-owner",
+        message=message,
+    )
+    owned = runtime._navigation_task_store().find_latest_by_agentscope_session(
+        owner_session
+    )
+
+    with pytest.raises(PermissionError, match="another Web session"):
+        await runtime.start_navigation_agent_task(
+            web_session_id="web-foreign",
+            message=message,
+        )
+
+    assert runtime._navigation_task_store().get_task(owned.task_id) == owned
+    assert "web-foreign" not in runtime.web_sessions
+    await chat_run_registry.drain()
+
+
+@pytest.mark.asyncio
 async def test_runtime_failed_navigation_entry_restores_absent_mapping_and_does_not_run(
     tmp_path: Path,
 ) -> None:

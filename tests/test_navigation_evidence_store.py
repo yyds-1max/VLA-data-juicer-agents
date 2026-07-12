@@ -138,6 +138,34 @@ def test_evidence_read_rejects_single_oversized_page_item_without_repeating_curs
         store.read("nav-1", descriptor.ref)
 
 
+def test_evidence_read_uses_caller_budget_to_shrink_page_and_advance_cursor(tmp_path):
+    store = FileNavigationEvidenceStore(tmp_path / "evidence")
+    descriptor = store.write(
+        "nav-1",
+        1,
+        "rows",
+        "inspect",
+        {"rows": [f"{index}:" + "x" * 900 for index in range(8)]},
+        "large rows",
+    )
+
+    page = store.read("nav-1", descriptor.ref, limit=8, max_chars=4_000)
+
+    assert serialized_chars(page) <= 4_000
+    assert 0 < len(page["data"]["rows"]) < 8
+    assert page["next_cursor"] == len(page["data"]["rows"])
+
+
+def test_evidence_read_reports_terminal_item_error_at_caller_budget(tmp_path):
+    store = FileNavigationEvidenceStore(tmp_path / "evidence")
+    descriptor = store.write(
+        "nav-1", 1, "rows", "inspect", {"rows": ["x" * 4_100]}, "oversized"
+    )
+
+    with pytest.raises(ValueError, match="exceeds 4000-character response budget"):
+        store.read("nav-1", descriptor.ref, max_chars=4_000)
+
+
 def test_context_budget_counts_compact_unicode_json():
     payload = {"value": "导航"}
 

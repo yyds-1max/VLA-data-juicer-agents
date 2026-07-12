@@ -203,15 +203,16 @@ def prepare_navigation_task_entry(
         normalized_segments,
     )
 
-    task = task_store.create_or_update_task(
-        date=handoff["date"],
-        segments=normalized_segments,
-        scene_mode=_navigation_scene_mode_for_request(handoff.get("scene_mode")),
-        dry_run=bool(handoff.get("dry_run", False)),
-        web_session_id=web_session_id,
-        agentscope_session_id=agentscope_session_id,
-    )
+    task = None
     try:
+        task = task_store.create_or_update_task(
+            date=handoff["date"],
+            segments=normalized_segments,
+            scene_mode=_navigation_scene_mode_for_request(handoff.get("scene_mode")),
+            dry_run=bool(handoff.get("dry_run", False)),
+            web_session_id=web_session_id,
+            agentscope_session_id=agentscope_session_id,
+        )
         reconciled = reconcile_navigation_task(task, settings=settings)
         changes = _task_changes(reconciled)
         if guidance:
@@ -255,7 +256,9 @@ def prepare_navigation_task_entry(
         return saved
     except Exception as entry_error:
         try:
-            if previous_task is None:
+            if task is None:
+                pass
+            elif previous_task is None:
                 task_store.delete_task(task.task_id)
             else:
                 task_store.restore_task_exact(previous_task)

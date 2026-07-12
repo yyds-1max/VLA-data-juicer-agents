@@ -1,6 +1,10 @@
 import json
 import sqlite3
+from concurrent.futures import ThreadPoolExecutor
+from threading import Barrier
 from pathlib import Path
+
+import pytest
 
 import vla_data_juicer_agents.navigation.task_store as task_store_module
 from vla_data_juicer_agents.navigation.task_state import NavigationTaskPhase, NavigationTaskStatus
@@ -65,13 +69,70 @@ def test_task_store_updates_existing_date_and_segments(tmp_path: Path):
         date="20270623",
         segments=None,
         scene_mode="out",
-        web_session_id="web-2",
+        web_session_id="web-1",
     )
 
     assert second.task_id == first.task_id
     assert second.scene_mode == "out"
-    assert second.latest_web_session_id == "web-2"
+    assert second.latest_web_session_id == "web-1"
     assert store.find_latest_by_date("20270623").task_id == first.task_id
+
+
+def test_task_claim_rejects_cross_web_owner_without_any_mutation(tmp_path: Path):
+    store = SqliteNavigationTaskStore(tmp_path / "navigation_tasks.sqlite")
+    owned = store.create_or_update_task(
+        date="20270623",
+        segments=None,
+        scene_mode=None,
+        dry_run=False,
+        web_session_id="web-owner",
+        agentscope_session_id="as-owner",
+    )
+
+    with pytest.raises(task_store_module.NavigationTaskOwnershipError):
+        store.create_or_update_task(
+            date="20270623",
+            segments=None,
+            scene_mode="out",
+            dry_run=True,
+            web_session_id="web-foreign",
+            agentscope_session_id="as-foreign",
+        )
+
+    assert store.get_task(owned.task_id) == owned
+
+
+def test_concurrent_task_claim_has_one_creator_and_never_rebinds_loser(tmp_path: Path):
+    db_path = tmp_path / "navigation_tasks.sqlite"
+    SqliteNavigationTaskStore(db_path)
+    barrier = Barrier(2)
+
+    def claim(web_session_id: str):
+        store = SqliteNavigationTaskStore(db_path)
+        barrier.wait()
+        try:
+            task = store.create_or_update_task(
+                date="20270623",
+                segments=["segment-a"],
+                scene_mode=None,
+                web_session_id=web_session_id,
+                agentscope_session_id=f"as-{web_session_id}",
+            )
+            return ("won", task.created_by_web_session_id)
+        except task_store_module.NavigationTaskOwnershipError:
+            return ("lost", web_session_id)
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        results = list(executor.map(claim, ["web-a", "web-b"]))
+
+    assert sorted(status for status, _ in results) == ["lost", "won"]
+    stored = SqliteNavigationTaskStore(db_path).find_latest_by_date(
+        "20270623", ["segment-a"]
+    )
+    winner = next(owner for status, owner in results if status == "won")
+    assert stored.created_by_web_session_id == winner
+    assert stored.latest_web_session_id == winner
+    assert stored.agentscope_session_id == f"as-{winner}"
 
 
 def test_task_store_exact_restore_preserves_entire_persisted_model(
@@ -150,7 +211,7 @@ def test_task_store_keeps_one_active_task_per_date_and_segments_key(tmp_path: Pa
         date="20270623",
         segments=["segment_a", "segment_b"],
         scene_mode="out",
-        web_session_id="web-2",
+        web_session_id="web-1",
     )
     different = store.create_or_update_task(
         date="20270623",
@@ -445,15 +506,15 @@ def test_create_or_update_task_preserves_latest_web_session_when_omitted(tmp_pat
         web_session_id="web-1",
     )
 
-    second = store.create_or_update_task(
-        date="20270623",
-        segments=["20260623_101010"],
-        scene_mode=None,
-        web_session_id=None,
-    )
+    with pytest.raises(task_store_module.NavigationTaskOwnershipError):
+        store.create_or_update_task(
+            date="20270623",
+            segments=["20260623_101010"],
+            scene_mode=None,
+            web_session_id=None,
+        )
 
-    assert second.task_id == first.task_id
-    assert second.latest_web_session_id == "web-1"
+    assert store.get_task(first.task_id) == first
     assert store.get_task(first.task_id).latest_web_session_id == "web-1"
 
 

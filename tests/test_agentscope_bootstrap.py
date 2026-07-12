@@ -4,7 +4,6 @@ import pytest
 
 from vla_data_juicer_agents.runtime.agentscope_bootstrap import bootstrap_agentscope_records
 from vla_data_juicer_agents.runtime.agentscope_config import AgentScopeRuntimeConfig
-from vla_data_juicer_agents.runtime import agentscope_prompts
 from vla_data_juicer_agents.runtime.agentscope_prompts import (
     main_router_prompt,
     navigation_agent_prompt,
@@ -131,60 +130,6 @@ def test_navigation_agent_prompt_requires_plan_execute_react_and_human_decisions
         "Reconcile raw, intermediate, and final artifacts",
     ]:
         assert retained_contract in prompt
-    return
-
-    for expected in [
-        "DataPilot's navigation data specialist",
-        "plan-and-execute",
-        "ReAct",
-        "WorkflowPlan",
-        "navigation-data-agent-planning-guidance",
-        "Structured handoff JSON",
-        "get_workflow_plan_draft_tool",
-        "update_workflow_plan_draft_tool",
-        "data_profile_patch as a JSON object",
-        "never as a JSON string",
-        "segments and topic_whitelist as real JSON arrays",
-        "topic_map as real JSON objects",
-        "If all raw segments should be processed",
-        "Do not call update_workflow_plan_draft_tool with an empty",
-        "finalize_extract_sync_plan_tool",
-        "finalize_finish_processing_plan_tool",
-        "finalize_workflow_plan_tool",
-        "do not hand-write final WorkflowPlan JSON",
-        "read-only inspection tools before execution",
-        "inspect_raw_date_tool",
-        "infer_navigation_sensor_bindings_tool",
-        "infer_navigation_processing_profile_tool",
-        "infer_navigation_topic_params_tool",
-        "inspect_processing_state_tool",
-        "inspect_gridmap_artifacts_tool",
-        "inspect_runtime_assets_tool",
-        "list_navigation_tool_capabilities_tool",
-        "native Ins",
-        "odom_to_ins",
-        "Capability questions",
-        "do not inspect data",
-        "scene mode is missing",
-        "reply when ready and include whether the scene is indoor or outdoor",
-        "structured handoff",
-        "target",
-        "date",
-        "scene_mode",
-        "clips",
-        "indoor or outdoor",
-        "If no clip is specified",
-        "If a specified clip does not exist",
-        "concise progress updates",
-        "request_human_decision",
-        "Do not ask the user to type",
-        "confirm/stop/guidance",
-        "GUI can block",
-        "final summaries in the user's language",
-    ]:
-        assert expected in prompt
-
-    assert "structured handoff context containing request, target, date" in prompt
     assert "confirm_navigation_calibration_params_tool" not in prompt
     assert "Plan-Agent workflow" not in prompt
     assert "user_confirmation" not in prompt
@@ -194,45 +139,12 @@ def test_navigation_agent_prompt_requires_plan_execute_react_and_human_decisions
     assert "mock" not in prompt.lower()
 
 
-def test_navigation_agent_prompt_uses_fallback_guidance_when_docs_file_is_missing(monkeypatch):
-    def raise_missing_guidance(*args, **kwargs):
-        raise OSError("missing guidance")
-
-    monkeypatch.setattr(agentscope_prompts.Path, "read_text", raise_missing_guidance)
-
+def test_navigation_agent_prompt_has_no_legacy_guidance_loader_contract():
     prompt = navigation_agent_prompt()
 
     assert "durable state is authoritative" in prompt
     assert "navigation-data-agent-planning-guidance" not in prompt
     assert "data_profile_patch" not in prompt
-    return
-
-    for expected in [
-        "navigation-data-agent-planning-guidance",
-        "get_workflow_plan_draft_tool",
-        "finalize_workflow_plan_tool",
-        "do not hand-write final WorkflowPlan JSON",
-        "inspect_raw_date_tool",
-        "list_navigation_tool_capabilities_tool",
-        "native Ins",
-        "odom_to_ins",
-        "do not invent `TOPIC_WHITELIST`, `topic_map`, or `query_dir`",
-        "copy them from `infer_navigation_topic_params_tool`",
-        "do not invent localization policy or calibration policy",
-        "copy them from `infer_navigation_processing_profile_tool`",
-        "blocking_issues",
-        "do not produce an executable plan",
-        "copy_existing_gridmap",
-        "generate_from_pcd",
-        "skip_if_projection_ready",
-        "Do not require data to fit fixed `u_legacy_like` or `go2w_like` classifications",
-        "calibration confirmation gate belongs to finish-processing",
-        "User confirmation, stop, and guidance decisions use `request_human_decision`",
-        "If a unique Ins topic is present",
-        "NoobScenes preprocessing skips odom conversion and resize preprocessing",
-        "NoobScenes preprocessing runs odom conversion and resize preprocessing",
-    ]:
-        assert expected in prompt
 
 
 @pytest.mark.asyncio

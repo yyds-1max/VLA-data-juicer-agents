@@ -6,7 +6,6 @@ from agentscope.tool import FunctionTool
 
 from vla_data_juicer_agents.navigation.config import NavigationSettings
 from vla_data_juicer_agents.navigation.task_reconciliation import (
-    reconcile_and_save_navigation_task,
     reconcile_navigation_task,
 )
 from vla_data_juicer_agents.navigation.task_state import (
@@ -14,6 +13,7 @@ from vla_data_juicer_agents.navigation.task_state import (
     NavigationTaskStatus,
 )
 from vla_data_juicer_agents.navigation.task_store import (
+    NavigationTaskOwnershipError,
     SqliteNavigationTaskStore,
     normalize_segments,
 )
@@ -38,8 +38,60 @@ def build_navigation_task_tools(
     web_session_id: str | None,
     settings: NavigationSettings | None = None,
     draft_store: Any | None = None,
+    bound_task: Any | None = None,
 ) -> list[FunctionTool]:
     settings = settings or NavigationSettings()
+
+    def ownership_error(task_id: str) -> dict[str, Any] | None:
+        live = store.get_task(task_id)
+        valid = (
+            live is not None
+            and (bound_task is None or task_id == bound_task.task_id)
+            and (
+                bound_task is None
+                or live.created_by_web_session_id
+                == bound_task.created_by_web_session_id
+            )
+            and live.created_by_web_session_id == web_session_id
+            and live.latest_web_session_id == web_session_id
+            and live.agentscope_session_id == session_id
+        )
+        if valid:
+            return None
+        return {
+            "ok": False,
+            "error_type": "navigation_task_session_mismatch",
+            "message": "The task is not bound to the current durable session.",
+        }
+
+    def save_task(task_id: str, **changes: Any) -> tuple[Any | None, dict[str, Any] | None]:
+        try:
+            if bound_task is None:
+                return store.update_task(task_id, **changes), None
+            return store.update_task_for_session(
+                task_id,
+                web_session_id=web_session_id,
+                agentscope_session_id=session_id,
+                **changes,
+            ), None
+        except NavigationTaskOwnershipError:
+            return None, {
+                "ok": False,
+                "error_type": "navigation_task_session_mismatch",
+                "message": "The task session changed before the update committed.",
+            }
+
+    def reconcile_and_save(task: Any) -> tuple[Any | None, dict[str, Any] | None]:
+        reconciled = reconcile_navigation_task(task, settings=settings)
+        changes = reconciled.model_dump(mode="json")
+        for field in (
+            "task_id",
+            "created_by_web_session_id",
+            "latest_web_session_id",
+            "agentscope_session_id",
+        ):
+            changes.pop(field, None)
+        return save_task(task.task_id, **changes)
 
     def get_or_create_navigation_task_tool(
         date: str,
@@ -48,33 +100,38 @@ def build_navigation_task_tools(
     ) -> dict[str, Any]:
         """Create or load a durable navigation task for date/segments."""
         normalized_segments = _normalize_segments(segments)
-        existing = store.find_latest_by_date(date, normalized_segments)
-        if (
-            existing is not None
-            and existing.created_by_web_session_id is not None
-            and existing.created_by_web_session_id != web_session_id
+        if bound_task is not None and (
+            date != bound_task.date
+            or normalized_segments != normalize_segments(bound_task.segments)
         ):
+            return {
+                "ok": False,
+                "error_type": "navigation_task_session_mismatch",
+                "message": "The request does not match the bound durable task.",
+            }
+        try:
+            task = store.create_or_update_task(
+                date=date,
+                segments=normalized_segments,
+                scene_mode=scene_mode,
+                web_session_id=web_session_id,
+                agentscope_session_id=session_id,
+            )
+        except NavigationTaskOwnershipError:
             return {
                 "ok": False,
                 "error_type": "navigation_task_session_mismatch",
                 "message": "The durable navigation task belongs to another Web session.",
             }
-        task = store.create_or_update_task(
-            date=date,
-            segments=normalized_segments,
-            scene_mode=scene_mode,
-            web_session_id=web_session_id,
-            agentscope_session_id=session_id,
-        )
-        saved = reconcile_and_save_navigation_task(
-            task,
-            task_store=store,
-            settings=settings,
-        )
+        saved, error = reconcile_and_save(task)
+        if error is not None:
+            return error
         return {"ok": True, "task": _task_anchor(saved)}
 
     def reconcile_navigation_task_tool(task_id: str) -> dict[str, Any]:
         """Reconcile persisted navigation task state with current filesystem artifacts."""
+        if error := ownership_error(task_id):
+            return error
         task = store.get_task(task_id)
         if task is None:
             return {
@@ -82,11 +139,9 @@ def build_navigation_task_tools(
                 "error_type": "navigation_task_not_found",
                 "task_id": task_id,
             }
-        saved = reconcile_and_save_navigation_task(
-            task,
-            task_store=store,
-            settings=settings,
-        )
+        saved, error = reconcile_and_save(task)
+        if error is not None:
+            return error
         return {"ok": True, "task": _task_anchor(saved)}
 
     def list_resumable_navigation_tasks_tool(
@@ -103,6 +158,8 @@ def build_navigation_task_tools(
         scene_mode: str,
     ) -> dict[str, Any]:
         """Set scene mode and move a waiting task into finish-processing planning."""
+        if error := ownership_error(task_id):
+            return error
         if scene_mode not in {"in", "out"}:
             return {
                 "ok": False,
@@ -120,7 +177,9 @@ def build_navigation_task_tools(
         if not reconciled.artifact_snapshot.sync_data_exists:
             changes = reconciled.model_dump(mode="json")
             changes.pop("task_id", None)
-            saved = store.update_task(task_id, **changes)
+            saved, error = save_task(task_id, **changes)
+            if error is not None:
+                return error
             return {
                 "ok": False,
                 "error_type": "navigation_task_reconcile_required",
@@ -135,15 +194,13 @@ def build_navigation_task_tools(
                     "finalize_extract_sync_plan_tool",
                 ],
             }
-        task = store.update_task(
+        task, error = save_task(
             task_id,
             scene_mode=scene_mode,
             phase=NavigationTaskPhase.FINISH_PROCESSING,
             status=NavigationTaskStatus.PENDING,
             waiting_reason=None,
             next_required_input=None,
-            latest_web_session_id=web_session_id,
-            agentscope_session_id=session_id,
             artifact_snapshot=(
                 reconciled.artifact_snapshot.model_dump(mode="json")
                 if reconciled.artifact_snapshot is not None
@@ -151,6 +208,8 @@ def build_navigation_task_tools(
             ),
             drift=None,
         )
+        if error is not None:
+            return error
         return {"ok": True, "task": _task_payload(task)}
 
     def update_navigation_task_state_tool(
@@ -162,6 +221,8 @@ def build_navigation_task_tools(
         last_completed_step: str | None = None,
     ) -> dict[str, Any]:
         """Update task phase/status after planning or execution progress."""
+        if error := ownership_error(task_id):
+            return error
         existing = store.get_task(task_id)
         if existing is None:
             return {
@@ -171,11 +232,9 @@ def build_navigation_task_tools(
             }
         requested_phase = NavigationTaskPhase(phase)
         requested_status = NavigationTaskStatus(status)
-        reconciled = reconcile_and_save_navigation_task(
-            existing,
-            task_store=store,
-            settings=settings,
-        )
+        reconciled, error = reconcile_and_save(existing)
+        if error is not None:
+            return error
         completion_request_is_valid = (
             requested_phase == NavigationTaskPhase.COMPLETED
             and requested_status == NavigationTaskStatus.COMPLETED
@@ -198,7 +257,7 @@ def build_navigation_task_tools(
                 ),
                 "task": _task_payload(reconciled),
             }
-        task = store.update_task(
+        task, error = save_task(
             task_id,
             phase=requested_phase,
             status=requested_status,
@@ -206,6 +265,8 @@ def build_navigation_task_tools(
             next_required_input=next_required_input,
             last_completed_step=last_completed_step,
         )
+        if error is not None:
+            return error
         return {"ok": True, "task": _task_payload(task)}
 
     def record_navigation_task_step_tool(
@@ -219,16 +280,34 @@ def build_navigation_task_tools(
         produced_paths: list[str] | None = None,
     ) -> dict[str, Any]:
         """Record one navigation execution step result in the durable task ledger."""
-        step = store.record_step(
-            task_id=task_id,
-            phase=NavigationTaskPhase(phase),
-            step_id=step_id,
-            tool_name=tool_name,
-            status=NavigationTaskStatus(status),
-            arguments=arguments,
-            result=result,
-            produced_paths=produced_paths,
-        )
+        if error := ownership_error(task_id):
+            return error
+        try:
+            fields = {
+                "task_id": task_id,
+                "phase": NavigationTaskPhase(phase),
+                "step_id": step_id,
+                "tool_name": tool_name,
+                "status": NavigationTaskStatus(status),
+                "arguments": arguments,
+                "result": result,
+                "produced_paths": produced_paths,
+            }
+            step = (
+                store.record_step_for_session(
+                    web_session_id=web_session_id,
+                    agentscope_session_id=session_id,
+                    **fields,
+                )
+                if bound_task is not None
+                else store.record_step(**fields)
+            )
+        except NavigationTaskOwnershipError:
+            return {
+                "ok": False,
+                "error_type": "navigation_task_session_mismatch",
+                "message": "The task session changed before the step was recorded.",
+            }
         return {"ok": True, "step": step.model_dump(mode="json")}
 
     return [

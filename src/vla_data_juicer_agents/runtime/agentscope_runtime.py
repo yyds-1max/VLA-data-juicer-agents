@@ -207,7 +207,10 @@ class AgentScopeRuntime:
         self.register_run_cancellation(session_id, cancellation)
 
         if agent_id == self.config.navigation_agent_id:
-            anchor = self._navigation_durable_state_anchor(session_id)
+            anchor = self._navigation_durable_state_anchor(
+                session_id,
+                web_session_id=web_session_id,
+            )
             message = (
                 f"{message}\n\nDurable navigation state anchor (authoritative): "
                 f"{json.dumps(anchor, ensure_ascii=False, sort_keys=True)}"
@@ -294,6 +297,8 @@ class AgentScopeRuntime:
     def _navigation_durable_state_anchor(
         self,
         agentscope_session_id: str,
+        *,
+        web_session_id: str,
     ) -> dict[str, Any]:
         services = self._navigation_services()
         task = services.task_store.find_latest_by_agentscope_session(agentscope_session_id)
@@ -309,8 +314,30 @@ class AgentScopeRuntime:
             }
         reconciled = reconcile_navigation_task(task, settings=services.settings)
         changes = reconciled.model_dump(mode="json")
-        changes.pop("task_id", None)
-        task = services.task_store.update_task(task.task_id, **changes)
+        for field in (
+            "task_id",
+            "created_by_web_session_id",
+            "latest_web_session_id",
+            "agentscope_session_id",
+        ):
+            changes.pop(field, None)
+        try:
+            task = services.task_store.update_task_for_session(
+                task.task_id,
+                web_session_id=web_session_id,
+                agentscope_session_id=agentscope_session_id,
+                **changes,
+            )
+        except PermissionError:
+            return {
+                "task_id": None,
+                "phase": None,
+                "task_status": None,
+                "observation_revision": None,
+                "active_plan_id": None,
+                "active_plan_revision": None,
+                "current_step_id": None,
+            }
         observation = services.observation_store.latest(task.task_id)
         plan = (
             services.plan_store.get_active(task.task_id, task.phase.value)

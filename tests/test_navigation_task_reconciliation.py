@@ -495,7 +495,7 @@ def test_prepare_task_entry_restores_existing_task_when_evidence_append_fails(
             observation_store=observation_store,
             evidence_store=_FailingEvidenceStore(),
             message=message,
-            web_session_id="web-new",
+            web_session_id="web-old",
             agentscope_session_id="as-new",
             settings=NavigationSettings(vladatasets_root=root),
         )

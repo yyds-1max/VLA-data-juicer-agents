@@ -117,6 +117,7 @@ class FileNavigationEvidenceStore:
         fields: list[str] | None = None,
         cursor: int = 0,
         limit: int = 50,
+        max_chars: int = EVIDENCE_READ_MAX_CHARS,
     ) -> dict[str, Any]:
         path = self._path_for_owned_ref(task_id, ref)
         if cursor < 0:
@@ -128,11 +129,16 @@ class FileNavigationEvidenceStore:
 
         payload = json.loads(path.read_text(encoding="utf-8"))
         selected = self._select_fields(payload, fields)
-        data, next_cursor = self._paginate(selected, cursor=cursor, limit=limit)
+        data, next_cursor = self._paginate(
+            selected,
+            cursor=cursor,
+            limit=limit,
+            max_chars=max_chars,
+        )
         response = {"data": data, "next_cursor": next_cursor}
         return ensure_payload_within_limit(
             response,
-            max_chars=EVIDENCE_READ_MAX_CHARS,
+            max_chars=max_chars,
             label="evidence_read",
         )
 
@@ -152,13 +158,19 @@ class FileNavigationEvidenceStore:
         return {field: payload[field] for field in fields if field in payload}
 
     @staticmethod
-    def _paginate(payload: Any, *, cursor: int, limit: int) -> tuple[Any, int | None]:
+    def _paginate(
+        payload: Any,
+        *,
+        cursor: int,
+        limit: int,
+        max_chars: int,
+    ) -> tuple[Any, int | None]:
         list_extent = FileNavigationEvidenceStore._list_extent(payload)
         if list_extent is None:
             response = {"data": payload, "next_cursor": None}
             ensure_payload_within_limit(
                 response,
-                max_chars=EVIDENCE_READ_MAX_CHARS,
+                max_chars=max_chars,
                 label="evidence_read",
             )
             return payload, None
@@ -168,7 +180,7 @@ class FileNavigationEvidenceStore:
             response = {"data": data, "next_cursor": None}
             ensure_payload_within_limit(
                 response,
-                max_chars=EVIDENCE_READ_MAX_CHARS,
+                max_chars=max_chars,
                 label="evidence_read",
             )
             return data, None
@@ -180,12 +192,12 @@ class FileNavigationEvidenceStore:
             data = FileNavigationEvidenceStore._slice_page(payload, cursor, end)
             next_cursor = end if end < list_extent else None
             response = {"data": data, "next_cursor": next_cursor}
-            if serialized_chars(response) <= EVIDENCE_READ_MAX_CHARS:
+            if serialized_chars(response) <= max_chars:
                 best = (data, next_cursor)
         if best is None:
             raise ValueError(
                 f"evidence item at cursor {cursor} exceeds "
-                f"{EVIDENCE_READ_MAX_CHARS}-character response budget"
+                f"{max_chars}-character response budget"
             )
         return best
 

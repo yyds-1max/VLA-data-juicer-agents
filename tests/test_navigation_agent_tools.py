@@ -1,6 +1,9 @@
 import asyncio
 import json
+import sqlite3
 from types import SimpleNamespace
+
+import pytest
 
 from agentscope.permission import PermissionBehavior, PermissionDecision
 from agentscope.message import ToolResultState
@@ -28,10 +31,12 @@ from vla_data_juicer_agents.navigation.plan_draft_store import (
     JsonNavigationPlanDraftStore,
 )
 from vla_data_juicer_agents.navigation.task_store import SqliteNavigationTaskStore
+from vla_data_juicer_agents.navigation.task_tools import build_navigation_task_tools
 from vla_data_juicer_agents.navigation.services import (
     NavigationServices,
     build_navigation_services,
 )
+from vla_data_juicer_agents.navigation import services as navigation_services_module
 from vla_data_juicer_agents.navigation.plan_models import ExtractSyncPlanInput
 from vla_data_juicer_agents.navigation.evidence_store import FileNavigationEvidenceStore
 from vla_data_juicer_agents.navigation.observation_models import (
@@ -1794,6 +1799,60 @@ def test_cross_web_session_entry_cannot_rebind_existing_task_by_date(tmp_path):
     assert services.task_store.find_latest_by_date("20260710").created_by_web_session_id == "web-a"
 
 
+def test_bound_task_tools_reject_foreign_task_and_stale_session_without_mutation(tmp_path):
+    services = build_navigation_services(tmp_path)
+    bound = services.task_store.create_or_update_task(
+        date="20260710",
+        segments=None,
+        scene_mode=None,
+        web_session_id="web-a",
+        agentscope_session_id="as-a",
+    )
+    foreign = services.task_store.create_or_update_task(
+        date="20260711",
+        segments=None,
+        scene_mode=None,
+        web_session_id="web-b",
+        agentscope_session_id="as-b",
+    )
+    before = services.task_store.get_task(foreign.task_id)
+    tools = {
+        tool.name: tool
+        for tool in build_navigation_task_tools(
+            store=services.task_store,
+            session_id="as-a",
+            web_session_id="web-a",
+            settings=services.settings,
+            bound_task=bound,
+        )
+    }
+
+    foreign_result = _decode_tool_payload(
+        asyncio.run(tools["reconcile_navigation_task_tool"](task_id=foreign.task_id))
+    )
+    stale_tools = {
+        tool.name: tool
+        for tool in build_navigation_task_tools(
+            store=services.task_store,
+            session_id="as-stale",
+            web_session_id="web-a",
+            settings=services.settings,
+            bound_task=bound,
+        )
+    }
+    stale_result = _decode_tool_payload(
+        asyncio.run(stale_tools["update_navigation_task_state_tool"](
+            task_id=bound.task_id,
+            phase="intake",
+            status="pending",
+        ))
+    )
+
+    assert foreign_result["error_type"] == "navigation_task_session_mismatch"
+    assert stale_result["error_type"] == "navigation_task_session_mismatch"
+    assert services.task_store.get_task(foreign.task_id) == before
+
+
 def test_navigation_services_migrate_legacy_observations_transactionally_once(tmp_path):
     legacy = SqliteNavigationObservationStore(tmp_path / "navigation-observations.sqlite")
     evidence = FileNavigationEvidenceStore(tmp_path / "navigation-evidence")
@@ -1821,11 +1880,54 @@ def test_navigation_services_migrate_legacy_observations_transactionally_once(tm
     )
 
     first = build_navigation_services(tmp_path)
+    with sqlite3.connect(tmp_path / "navigation-observations.sqlite") as connection:
+        connection.execute(
+            "UPDATE navigation_observation_revisions SET revision_json = '{poisoned'"
+        )
     second = build_navigation_services(tmp_path)
 
     assert first.observation_store.latest("nav-legacy") == revision
     assert second.observation_store.latest("nav-legacy") == revision
     assert len(second.observation_store.list_evidence("nav-legacy")) == 1
+
+
+@pytest.mark.parametrize("failure", ["invalid_json", "partial_schema"])
+def test_navigation_services_reject_corrupt_legacy_db_without_partial_import(
+    tmp_path, failure
+):
+    legacy_path = tmp_path / "navigation-observations.sqlite"
+    with sqlite3.connect(legacy_path) as connection:
+        connection.execute(
+            """
+            CREATE TABLE navigation_observation_revisions (
+                task_id TEXT, revision INTEGER, phase TEXT,
+                revision_json TEXT, created_at TEXT
+            )
+            """
+        )
+        if failure == "invalid_json":
+            connection.execute(
+                """
+                CREATE TABLE navigation_evidence (
+                    ref TEXT, task_id TEXT, observation_revision INTEGER,
+                    kind TEXT, summary TEXT, byte_size INTEGER,
+                    source_tool TEXT, created_at TEXT
+                )
+                """
+            )
+            connection.execute(
+                "INSERT INTO navigation_observation_revisions VALUES (?, ?, ?, ?, ?)",
+                ("nav-corrupt", 1, "extract_sync", "{bad-json", "now"),
+            )
+
+    with pytest.raises(navigation_services_module.LegacyObservationMigrationError):
+        build_navigation_services(tmp_path)
+
+    with sqlite3.connect(tmp_path / "navigation-tasks.sqlite") as connection:
+        count = connection.execute(
+            "SELECT COUNT(*) FROM navigation_observation_revisions"
+        ).fetchone()[0]
+    assert count == 0
 
 
 def test_phase_resolver_exposes_missing_inspections_without_submission_or_execution(tmp_path):
