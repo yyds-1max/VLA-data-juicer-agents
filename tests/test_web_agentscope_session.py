@@ -376,6 +376,7 @@ def _plan_bound_human_runtime(tmp_path: Path, chat_run_registry: FakeChatRunRegi
         date="20260710",
         segments=["segment-a"],
         scene_mode="out",
+        web_session_id="web-1",
         agentscope_session_id="as-session-1",
     )
     task = task_store.update_task(task.task_id, phase="finish_processing", status="pending")
@@ -1364,7 +1365,7 @@ async def test_plan_bound_human_decision_recovers_after_async_run_failure(
 
 
 @pytest.mark.asyncio
-async def test_expired_delivering_handoff_retries_only_while_external_call_is_submitted(
+async def test_expired_delivering_handoff_with_submitted_call_fails_closed(
     tmp_path: Path,
 ) -> None:
     registry = FakeChatRunRegistry()
@@ -1387,12 +1388,232 @@ async def test_expired_delivering_handoff_retries_only_while_external_call_is_su
             "UPDATE navigation_human_decision_handoffs SET expires_at = '2000-01-01T00:00:00+00:00'"
         )
 
-    assert await runtime.submit_human_decision(web_session_id="web-1", decision=decision)
-    await registry.drain()
-    assert len(runtime.app.state.chat_service.runs) == 1
-    event = runtime.app.state.chat_service.runs[0]["message"]
-    assert event.metadata["idempotency_key"].endswith(
-        f":{plan.plan_id}:confirm:{agentscope_runtime_module.human_decision_key(agentscope_runtime_module._durable_plan_decision(decision))}"
+    with pytest.raises(RuntimeError, match="human-decisions/recovery"):
+        await runtime.submit_human_decision(web_session_id="web-1", decision=decision)
+    assert registry.spawns == []
+    assert runtime.app.state.chat_service.runs == []
+    handoff = plan_store.get_human_decision_handoff(plan.plan_id, "confirm")
+    assert handoff is not None
+    assert handoff.status == "recovery_required"
+    assert handoff.delivery_status == "recovery_required"
+    assert handoff.delivery_token == token
+
+
+@pytest.mark.asyncio
+async def test_missing_agentscope_session_marks_existing_handoff_recovery_required(
+    tmp_path: Path,
+) -> None:
+    registry = FakeChatRunRegistry()
+    runtime, plan_store, plan, decision = _plan_bound_human_runtime(tmp_path, registry)
+    assert agentscope_runtime_module.submit_plan_human_decision(
+        plan_store=plan_store,
+        evidence_store=runtime._navigation_evidence_store(),
+        plan_id=plan.plan_id,
+        step_id="confirm",
+        decision=decision,
+    )
+    runtime.storage.session_records.clear()
+
+    with pytest.raises(RuntimeError, match="missing_agentscope_session.*human-decisions/recovery"):
+        await runtime.submit_human_decision(web_session_id="web-1", decision=decision)
+
+    handoff = plan_store.get_human_decision_handoff(plan.plan_id, "confirm")
+    assert handoff is not None and handoff.status == "recovery_required"
+    assert registry.spawns == []
+
+
+@pytest.mark.asyncio
+async def test_cross_session_submit_cannot_mutate_or_deliver_foreign_handoff(
+    tmp_path: Path,
+) -> None:
+    registry = FakeChatRunRegistry()
+    runtime, plan_store, plan, decision = _plan_bound_human_runtime(tmp_path, registry)
+    assert agentscope_runtime_module.submit_plan_human_decision(
+        plan_store=plan_store,
+        evidence_store=runtime._navigation_evidence_store(),
+        plan_id=plan.plan_id,
+        step_id="confirm",
+        decision=decision,
+    )
+    runtime.web_sessions["attacker-web"] = (
+        "navigation-data-agent",
+        "as-session-1",
+    )
+
+    with pytest.raises(RuntimeError, match="does not belong"):
+        await runtime.submit_human_decision(
+            web_session_id="attacker-web",
+            decision=decision,
+        )
+
+    handoff = plan_store.get_human_decision_handoff(plan.plan_id, "confirm")
+    assert handoff is not None
+    assert handoff.status == "pending"
+    assert handoff.delivery_status == "pending"
+    assert registry.spawns == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("mutation", "reason_code"),
+    [
+        ("missing_mapping", "missing_web_mapping"),
+        ("missing_reply", "missing_agentscope_reply"),
+        ("missing_tool_call", "missing_agentscope_tool_call"),
+    ],
+)
+async def test_missing_handoff_identity_fails_closed(
+    tmp_path: Path,
+    mutation: str,
+    reason_code: str,
+) -> None:
+    runtime, plan_store, plan, decision = _plan_bound_human_runtime(
+        tmp_path, FakeChatRunRegistry()
+    )
+    assert agentscope_runtime_module.submit_plan_human_decision(
+        plan_store=plan_store,
+        evidence_store=runtime._navigation_evidence_store(),
+        plan_id=plan.plan_id,
+        step_id="confirm",
+        decision=decision,
+    )
+    record = runtime.storage.session_records[
+        ("alice", "navigation-data-agent", "as-session-1")
+    ]
+    if mutation == "missing_mapping":
+        runtime.web_sessions.clear()
+    elif mutation == "missing_reply":
+        record.state.reply_id = "different-reply"
+    else:
+        record.state.context = []
+
+    with pytest.raises(RuntimeError, match=reason_code):
+        await runtime.submit_human_decision(web_session_id="web-1", decision=decision)
+
+    handoff = plan_store.get_human_decision_handoff(plan.plan_id, "confirm")
+    assert handoff is not None
+    assert handoff.status == "recovery_required"
+    assert handoff.recovery_reason_code == reason_code
+
+
+@pytest.mark.asyncio
+async def test_runtime_controlled_handoff_recovery_delegates_with_web_ownership(
+    tmp_path: Path,
+) -> None:
+    registry = FakeChatRunRegistry()
+    runtime, plan_store, plan, decision = _plan_bound_human_runtime(tmp_path, registry)
+    assert agentscope_runtime_module.submit_plan_human_decision(
+        plan_store=plan_store,
+        evidence_store=runtime._navigation_evidence_store(),
+        plan_id=plan.plan_id,
+        step_id="confirm",
+        decision=decision,
+    )
+    plan_store.mark_human_decision_recovery_required(
+        plan.plan_id, "confirm", reason_code="missing_agentscope_session"
+    )
+
+    recovered = await runtime.recover_human_decision_handoff(
+        web_session_id="web-1",
+        recovery={
+            "action": "quarantine_and_replan",
+            "plan_id": plan.plan_id,
+            "step_id": "confirm",
+            "reason": "operator confirmed abandoned worker",
+        },
+    )
+
+    assert recovered["handoff_status"] == "quarantined"
+    assert recovered["task_status"] == "needs_replan"
+    assert plan_store.get_human_decision_handoff(plan.plan_id, "confirm") is not None
+    with pytest.raises(RuntimeError, match="quarantined.*submit_complete_plan"):
+        await runtime.submit_human_decision(web_session_id="web-1", decision=decision)
+    assert registry.spawns == []
+
+
+@pytest.mark.asyncio
+async def test_recovery_required_pending_event_points_only_to_controlled_recovery(
+    tmp_path: Path,
+) -> None:
+    runtime, plan_store, plan, decision = _plan_bound_human_runtime(
+        tmp_path, FakeChatRunRegistry()
+    )
+    assert agentscope_runtime_module.submit_plan_human_decision(
+        plan_store=plan_store,
+        evidence_store=runtime._navigation_evidence_store(),
+        plan_id=plan.plan_id,
+        step_id="confirm",
+        decision=decision,
+    )
+    plan_store.mark_human_decision_recovery_required(
+        plan.plan_id, "confirm", reason_code="missing_agentscope_session"
+    )
+
+    event = await runtime._pending_human_decision_event(
+        web_session_id="web-1",
+        agent_id="navigation-data-agent",
+        agentscope_session_id="as-session-1",
+    )
+
+    assert event is not None
+    payload = event["payload"]
+    assert payload["recovery_required"] is True
+    assert payload["submission_disabled"] is True
+    assert payload["recovery_endpoint"] == (
+        "/api/sessions/web-1/human-decisions/recovery"
+    )
+    assert payload["recovery"] == {
+        "action": "quarantine_and_replan",
+        "plan_id": plan.plan_id,
+        "step_id": "confirm",
+    }
+
+
+@pytest.mark.asyncio
+async def test_quarantined_pending_event_is_suppressed_and_marked_consumed(
+    tmp_path: Path,
+) -> None:
+    runtime, plan_store, plan, decision = _plan_bound_human_runtime(
+        tmp_path, FakeChatRunRegistry()
+    )
+    store = WebSessionStore(tmp_path / "web.sqlite")
+    web_session = store.create_session("recover")
+    runtime.set_web_session_store(store)
+    runtime.web_sessions[web_session.id] = ("navigation-data-agent", "as-session-1")
+    task_store = SqliteNavigationTaskStore(plan_store.db_path)
+    task_store.update_task(
+        plan.task_id,
+        created_by_web_session_id=web_session.id,
+        latest_web_session_id=web_session.id,
+    )
+    assert agentscope_runtime_module.submit_plan_human_decision(
+        plan_store=plan_store,
+        evidence_store=runtime._navigation_evidence_store(),
+        plan_id=plan.plan_id,
+        step_id="confirm",
+        decision=decision,
+    )
+    plan_store.mark_human_decision_recovery_required(
+        plan.plan_id, "confirm", reason_code="missing_agentscope_session"
+    )
+    plan_store.quarantine_human_decision_handoff(
+        plan.plan_id,
+        "confirm",
+        expected_web_session_id=web_session.id,
+        reason="operator recovery",
+    )
+
+    event = await runtime._pending_human_decision_event(
+        web_session_id=web_session.id,
+        agent_id="navigation-data-agent",
+        agentscope_session_id="as-session-1",
+    )
+
+    assert event is None
+    assert store.is_human_decision_consumed(
+        agentscope_session_id="as-session-1",
+        reply_id="reply-1",
+        tool_call_id="confirm-1",
     )
 
 

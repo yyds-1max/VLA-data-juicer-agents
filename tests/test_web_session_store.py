@@ -138,6 +138,46 @@ def test_store_deduplicates_human_decision_required_events(tmp_path: Path):
     assert detail.events[0].payload["tool_call_id"] == "tool-call-1"
 
 
+def test_store_refreshes_duplicate_human_decision_with_recovery_metadata(tmp_path: Path):
+    store = WebSessionStore(tmp_path / "sessions.sqlite")
+    session = store.create_session(title="recover handoff")
+    base = {
+        "type": "human_decision_required",
+        "source": "NavigationDataAgent",
+        "run_id": "as-session",
+        "payload": {
+            "reply_id": "reply-1",
+            "tool_call_id": "tool-call-1",
+            "plan_id": "plan-1",
+            "step_id": "confirm",
+            "summary": "confirm",
+        },
+    }
+    first = store.append_timeline_event(session.id, base)
+
+    second = store.append_timeline_event(
+        session.id,
+        {
+            **base,
+            "payload": {
+                **base["payload"],
+                "recovery_required": True,
+                "submission_disabled": True,
+                "recovery_endpoint": (
+                    f"/api/sessions/{session.id}/human-decisions/recovery"
+                ),
+            },
+        },
+    )
+
+    detail = store.get_session(session.id)
+    assert detail is not None
+    assert first.id == second.id
+    assert len(detail.events) == 1
+    assert detail.events[0].payload["recovery_required"] is True
+    assert detail.events[0].payload["submission_disabled"] is True
+
+
 def test_store_marks_human_decision_consumed_idempotently(tmp_path: Path):
     store = WebSessionStore(tmp_path / "sessions.sqlite")
 

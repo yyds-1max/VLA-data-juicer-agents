@@ -116,10 +116,13 @@ def test_repository_migrates_legacy_pending_only_handoff_schema(tmp_path: Path):
         "delivery_token",
         "leased_at",
         "expires_at",
+        "recovery_reason_code",
+        "recovery_reason",
+        "recovered_at",
     } <= columns
 
 
-def test_repository_migrates_delivery_lease_and_reclaims_only_after_expiry(tmp_path: Path):
+def test_repository_migrates_delivery_lease_and_fails_closed_after_expiry(tmp_path: Path):
     repo, task = stores_with_task(tmp_path)
     plan = repo.activate(task, "extract_sync", 1, valid_extract_plan())
     with sqlite3.connect(repo.db_path) as connection:
@@ -154,10 +157,107 @@ def test_repository_migrates_delivery_lease_and_reclaims_only_after_expiry(tmp_p
     status, token = repo.claim_human_decision_delivery(
         plan.plan_id, "prepare", "decision", owner="new-owner"
     )
-    assert status == "claimed" and token and token != "old-token"
-    assert repo.finish_human_decision_delivery(
-        plan.plan_id, "prepare", "decision", token=token, delivered=False
+    assert status == "recovery_required" and token is None
+    handoff = repo.get_human_decision_handoff(plan.plan_id, "prepare")
+    assert handoff is not None
+    assert handoff.status == "recovery_required"
+    assert handoff.delivery_status == "recovery_required"
+    assert handoff.delivery_token == "old-token"
+
+
+def test_controlled_handoff_recovery_preserves_audit_and_unblocks_replacement(tmp_path: Path):
+    repo, task = stores_with_task(tmp_path)
+    task = SqliteNavigationTaskStore(repo.db_path).update_task(
+        task.task_id,
+        created_by_web_session_id="web-owner",
+        latest_web_session_id="web-owner",
     )
+    plan = repo.activate(task, "extract_sync", 1, valid_extract_plan())
+    timestamp = datetime.now(UTC).isoformat()
+    with sqlite3.connect(repo.db_path) as connection:
+        connection.execute(
+            """INSERT INTO navigation_human_decision_handoffs (
+                   plan_id, step_id, task_id, decision_key, decision_json,
+                   status, delivery_status, created_at, updated_at
+               ) VALUES (?, 'prepare', ?, 'decision', '{"action":"confirm"}',
+                         'pending', 'pending', ?, ?)""",
+            (plan.plan_id, task.task_id, timestamp, timestamp),
+        )
+
+    assert repo.mark_human_decision_recovery_required(
+        plan.plan_id, "prepare", reason_code="missing_agentscope_session"
+    )
+    assert repo.mark_human_decision_recovery_required(
+        plan.plan_id, "prepare", reason_code="missing_agentscope_session"
+    )
+    with pytest.raises(ActivePlanExecutionConflict, match="Web session"):
+        repo.quarantine_human_decision_handoff(
+            plan.plan_id,
+            "prepare",
+            expected_web_session_id="wrong-owner",
+            reason="operator requested recovery",
+        )
+
+    recovered = repo.quarantine_human_decision_handoff(
+        plan.plan_id,
+        "prepare",
+        expected_web_session_id="web-owner",
+        reason="operator requested recovery token=do-not-store",
+    )
+
+    assert recovered == {
+        "recovered": True,
+        "plan_id": plan.plan_id,
+        "step_id": "prepare",
+        "handoff_status": "quarantined",
+        "task_status": "needs_replan",
+        "next_action": "submit_complete_plan",
+    }
+    handoff = repo.get_human_decision_handoff(plan.plan_id, "prepare")
+    assert handoff is not None
+    assert handoff.status == "quarantined"
+    assert handoff.delivery_status == "quarantined"
+    assert handoff.decision == {"action": "confirm"}
+    assert handoff.recovered_at is not None
+    assert "do-not-store" not in (handoff.recovery_reason or "")
+    assert "[REDACTED]" in (handoff.recovery_reason or "")
+    assert repo.get(plan.plan_id).status == "invalidated"
+    assert repo.get_current_step(plan.plan_id)["step"]["status"] == "needs_replan"
+    task = SqliteNavigationTaskStore(repo.db_path).get_task(task.task_id)
+    assert task.status.value == "needs_replan"
+    replacement = repo.activate(task, "extract_sync", 2, valid_extract_plan())
+    assert replacement.status == "active"
+    assert not repo.claim_step(plan.plan_id, "prepare", "prepare_raw_data")
+
+
+@pytest.mark.parametrize("delivery_status", ["pending", "delivering", "delivered", "quarantined"])
+def test_controlled_handoff_recovery_rejects_non_recovery_states(
+    tmp_path: Path, delivery_status: str
+):
+    repo, task = stores_with_task(tmp_path)
+    task = SqliteNavigationTaskStore(repo.db_path).update_task(
+        task.task_id,
+        created_by_web_session_id="web-owner",
+        latest_web_session_id="web-owner",
+    )
+    plan = repo.activate(task, "extract_sync", 1, valid_extract_plan())
+    timestamp = datetime.now(UTC).isoformat()
+    status = "quarantined" if delivery_status == "quarantined" else "pending"
+    with sqlite3.connect(repo.db_path) as connection:
+        connection.execute(
+            """INSERT INTO navigation_human_decision_handoffs (
+                   plan_id, step_id, task_id, decision_key, decision_json,
+                   status, delivery_status, created_at, updated_at
+               ) VALUES (?, 'prepare', ?, 'decision', '{}', ?, ?, ?, ?)""",
+            (plan.plan_id, task.task_id, status, delivery_status, timestamp, timestamp),
+        )
+    with pytest.raises(ActivePlanExecutionConflict, match="recovery_required"):
+        repo.quarantine_human_decision_handoff(
+            plan.plan_id,
+            "prepare",
+            expected_web_session_id="web-owner",
+            reason="operator requested recovery",
+        )
 
 
 def test_repository_backfills_legacy_null_result_ref_and_lazy_recovers(tmp_path: Path):

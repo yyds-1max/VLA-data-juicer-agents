@@ -25,6 +25,8 @@ from vla_data_juicer_agents.web.schemas import (
     CreateTurnRequest,
     CreateTurnResponse,
     HumanDecisionRequest,
+    HumanDecisionRecoveryRequest,
+    HumanDecisionRecoveryResponse,
     HumanDecisionResponse,
     InterruptResponse,
 )
@@ -200,6 +202,30 @@ def create_app(
                 name=f"agentscope-events:{session_id}",
             )
         return HumanDecisionResponse(accepted=True)
+
+    @app.post(
+        "/api/sessions/{session_id}/human-decisions/recovery",
+        response_model=HumanDecisionRecoveryResponse,
+    )
+    async def recover_human_decision_handoff(
+        session_id: str,
+        request: HumanDecisionRecoveryRequest,
+    ) -> HumanDecisionRecoveryResponse:
+        recover = getattr(manager, "recover_human_decision_handoff", None)
+        if recover is None:
+            raise HTTPException(
+                status_code=409,
+                detail="Human decision recovery is not supported",
+            )
+        try:
+            result = await _maybe_await(
+                recover(session_id, request.model_dump(mode="json"))
+            )
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail="Session not found") from exc
+        except (RuntimeError, ValueError) as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        return HumanDecisionRecoveryResponse.model_validate(result)
 
     @app.websocket("/api/sessions/{session_id}/events")
     async def session_events(websocket: WebSocket, session_id: str) -> None:

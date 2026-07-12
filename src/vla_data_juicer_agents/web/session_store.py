@@ -614,6 +614,15 @@ class WebSessionStore:
                 existing.payload.get("reply_id") == reply_id
                 and existing.payload.get("tool_call_id") == tool_call_id
             ):
+                if (
+                    payload.get("recovery_required") is True
+                    and existing.payload.get("recovery_required") is not True
+                ):
+                    connection.execute(
+                        "UPDATE timeline_events SET payload_json = ? WHERE id = ?",
+                        (json.dumps(payload, ensure_ascii=False), existing.id),
+                    )
+                    return existing.model_copy(update={"payload": payload})
                 return existing
         return None
 

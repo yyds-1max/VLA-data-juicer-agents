@@ -94,6 +94,22 @@ class HumanDecisionResponse(BaseModel):
     accepted: bool
 
 
+class HumanDecisionRecoveryRequest(BaseModel):
+    action: Literal["quarantine_and_replan"]
+    plan_id: str = Field(max_length=512)
+    step_id: str = Field(max_length=512)
+    reason: str = Field(min_length=1, max_length=4000)
+
+
+class HumanDecisionRecoveryResponse(BaseModel):
+    recovered: Literal[True]
+    plan_id: str
+    step_id: str
+    handoff_status: Literal["quarantined"]
+    task_status: Literal["needs_replan"]
+    next_action: Literal["submit_complete_plan"]
+
+
 class AgentEvent(BaseModel):
     type: str
     source: str | None = None

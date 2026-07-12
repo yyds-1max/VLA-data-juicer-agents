@@ -59,6 +59,19 @@ class AgentScopeWebSessionManager:
             return False
         return bool(await submit_decision(web_session_id=session_id, decision=decision))
 
+    async def recover_human_decision_handoff(
+        self,
+        session_id: str,
+        recovery: dict[str, Any],
+    ) -> dict[str, Any]:
+        if self._store.get_session(session_id) is None:
+            raise KeyError(session_id)
+        recover = getattr(self._runtime, "recover_human_decision_handoff", None)
+        if recover is None:
+            raise RuntimeError("Human decision recovery is not supported")
+        result = await recover(web_session_id=session_id, recovery=recovery)
+        return dict(result)
+
     async def forward_events_until_idle(self, session_id: str) -> None:
         async with self._forward_lock(session_id):
             await self._forward_events_until_idle_unlocked(session_id)

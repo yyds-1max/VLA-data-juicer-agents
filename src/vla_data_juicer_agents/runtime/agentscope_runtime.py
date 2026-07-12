@@ -365,8 +365,40 @@ class AgentScopeRuntime:
         return bool(state.request.dry_run) if state is not None else False
 
     async def submit_human_decision(self, *, web_session_id: str, decision: dict[str, Any]) -> bool:
+        plan_id = decision.get("plan_id")
+        step_id = decision.get("step_id")
+        plan_bound_handoff = isinstance(plan_id, str) and isinstance(step_id, str)
+        plan_store = self._navigation_plan_store() if plan_bound_handoff else None
+        decision_key = (
+            human_decision_key(_durable_plan_decision(decision))
+            if plan_bound_handoff
+            else None
+        )
+        if plan_store is not None:
+            plan = plan_store.get(plan_id)
+            if plan is not None:
+                task = self._navigation_task_store().get_task(plan.task_id)
+                if (
+                    task is None
+                    or task.created_by_web_session_id != web_session_id
+                ):
+                    raise RuntimeError(
+                        "human decision handoff does not belong to the requested "
+                        "Web session"
+                    )
         mapped = self._web_session_mapping(web_session_id)
         if mapped is None:
+            if (
+                plan_store is not None
+                and plan_store.get_human_decision_handoff(plan_id, step_id) is not None
+            ):
+                self._raise_human_handoff_recovery_required(
+                    plan_store,
+                    plan_id,
+                    step_id,
+                    web_session_id=web_session_id,
+                    reason_code="missing_web_mapping",
+                )
             return False
 
         agent_id, agentscope_session_id = mapped
@@ -377,17 +409,13 @@ class AgentScopeRuntime:
 
         claim_handoff = False
         try:
-            plan_id = decision.get("plan_id")
-            step_id = decision.get("step_id")
-            plan_bound_handoff = isinstance(plan_id, str) and isinstance(step_id, str)
-            plan_store = self._navigation_plan_store() if plan_bound_handoff else None
-            decision_key = (
-                human_decision_key(_durable_plan_decision(decision))
-                if plan_bound_handoff
-                else None
-            )
             if plan_store is not None:
                 existing = plan_store.get_human_decision_handoff(plan_id, step_id)
+                if existing is not None and existing.status == "quarantined":
+                    raise RuntimeError(
+                        f"human decision handoff {plan_id}/{step_id} is quarantined; "
+                        "submit_complete_plan instead of resubmitting the stale decision"
+                    )
                 if existing is not None and existing.delivery_status == "delivered":
                     if existing.decision_key != decision_key:
                         return False
@@ -419,6 +447,14 @@ class AgentScopeRuntime:
                             decision=decision,
                         )
                         return True
+                    if external_state not in {"submitted", "consumed"}:
+                        self._raise_human_handoff_recovery_required(
+                            plan_store,
+                            plan_id,
+                            step_id,
+                            web_session_id=web_session_id,
+                            reason_code=external_state,
+                        )
 
             pending_tool_name = await self._pending_human_decision_tool_name(
                 agent_id=agent_id,
@@ -426,6 +462,14 @@ class AgentScopeRuntime:
                 decision=decision,
             )
             if pending_tool_name is None:
+                if plan_store is not None and existing is not None:
+                    self._raise_human_handoff_recovery_required(
+                        plan_store,
+                        plan_id,
+                        step_id,
+                        web_session_id=web_session_id,
+                        reason_code="missing_pending_tool_call",
+                    )
                 return False
 
             if plan_bound_handoff:
@@ -454,6 +498,15 @@ class AgentScopeRuntime:
                         decision=decision,
                     )
                     return True
+                if delivery == "recovery_required":
+                    raise RuntimeError(
+                        self._human_handoff_recovery_message(
+                            plan_id,
+                            step_id,
+                            "ambiguous_delivery_state",
+                            web_session_id=web_session_id,
+                        )
+                    )
                 if delivery != "claimed":
                     return False
                 assert delivery_token is not None
@@ -528,12 +581,22 @@ class AgentScopeRuntime:
                             )
                             completed = False
                         else:
+                            plan_store.mark_human_decision_recovery_required(
+                                plan_id,
+                                step_id,
+                                reason_code=external_state,
+                            )
                             completed = False
                         if external_state != "consumed":
                             if run_error is not None:
                                 raise run_error
                             raise RuntimeError(
-                                "plan-bound human decision was not durably consumed"
+                                self._human_handoff_recovery_message(
+                                    plan_id,
+                                    step_id,
+                                    external_state,
+                                    web_session_id=web_session_id,
+                                )
                             )
                         if not completed:
                             raise RuntimeError(
@@ -591,6 +654,103 @@ class AgentScopeRuntime:
         finally:
             if not claim_handoff:
                 await claim.release()
+
+    @staticmethod
+    def _human_handoff_recovery_message(
+        plan_id: str,
+        step_id: str,
+        reason_code: str,
+        *,
+        web_session_id: str,
+    ) -> str:
+        return (
+            f"{reason_code}: human decision handoff {plan_id}/{step_id} requires "
+            "controlled recovery via POST "
+            f"/api/sessions/{web_session_id}/human-decisions/recovery"
+        )
+
+    def _raise_human_handoff_recovery_required(
+        self,
+        plan_store: SqliteNavigationPlanRepository,
+        plan_id: str,
+        step_id: str,
+        *,
+        web_session_id: str,
+        reason_code: str,
+    ) -> None:
+        plan_store.mark_human_decision_recovery_required(
+            plan_id,
+            step_id,
+            reason_code=reason_code,
+        )
+        raise RuntimeError(
+            self._human_handoff_recovery_message(
+                plan_id,
+                step_id,
+                reason_code,
+                web_session_id=web_session_id,
+            )
+        )
+
+    async def recover_human_decision_handoff(
+        self,
+        web_session_id: str,
+        recovery: Any,
+    ) -> dict[str, Any]:
+        payload = (
+            recovery.model_dump(mode="json")
+            if hasattr(recovery, "model_dump")
+            else dict(recovery)
+        )
+        if payload.get("action") != "quarantine_and_replan":
+            raise ValueError("unsupported human decision recovery action")
+        result = self._navigation_plan_store().quarantine_human_decision_handoff(
+            str(payload.get("plan_id", "")),
+            str(payload.get("step_id", "")),
+            expected_web_session_id=web_session_id,
+            reason=str(payload.get("reason", "")),
+        )
+        await self._mark_quarantined_human_decision_consumed(
+            web_session_id=web_session_id,
+            plan_id=result["plan_id"],
+            step_id=result["step_id"],
+        )
+        return result
+
+    async def _mark_quarantined_human_decision_consumed(
+        self,
+        *,
+        web_session_id: str,
+        plan_id: str,
+        step_id: str,
+    ) -> None:
+        mapped = self._web_session_mapping(web_session_id)
+        if mapped is None:
+            return
+        agent_id, agentscope_session_id = mapped
+        get_session = getattr(self.storage, "get_session", None)
+        if not callable(get_session):
+            return
+        record = await get_session(self.config.user_id, agent_id, agentscope_session_id)
+        state = getattr(record, "state", None)
+        reply_id = getattr(state, "reply_id", None)
+        if not isinstance(reply_id, str):
+            return
+        for message in getattr(state, "context", []) or []:
+            for tool_call in _tool_call_blocks(message):
+                tool_input = _tool_call_input(tool_call)
+                if tool_input.get("plan_id") != plan_id or tool_input.get("step_id") != step_id:
+                    continue
+                self._mark_human_decision_consumed(
+                    agentscope_session_id=agentscope_session_id,
+                    decision={
+                        "reply_id": reply_id,
+                        "tool_call_id": str(getattr(tool_call, "id", "")),
+                        "action": "quarantined",
+                        "request_id": f"{plan_id}:{step_id}",
+                    },
+                )
+                return
 
     async def _pending_human_decision_tool_name(
         self,
@@ -652,26 +812,26 @@ class AgentScopeRuntime:
         """Read AgentScope's durable external-call state as the consumption oracle."""
         get_session = getattr(self.storage, "get_session", None)
         if get_session is None:
-            return "missing"
+            return "missing_agentscope_storage"
         record = await get_session(self.config.user_id, agent_id, agentscope_session_id)
         if record is None:
-            return "missing"
+            return "missing_agentscope_session"
         state = getattr(record, "state", None)
         if getattr(state, "reply_id", None) != decision.get("reply_id"):
-            return "missing"
+            return "missing_agentscope_reply"
         for message in getattr(state, "context", []) or []:
             for tool_call in _tool_call_blocks(message):
                 if getattr(tool_call, "id", None) != decision.get("tool_call_id"):
                     continue
                 if getattr(tool_call, "name", None) not in _HUMAN_DECISION_TOOL_NAMES:
-                    return "missing"
+                    return "missing_agentscope_tool_call"
                 return (
                     "submitted"
                     if _state_value(getattr(tool_call, "state", None))
                     == ToolCallState.SUBMITTED.value
                     else "consumed"
                 )
-        return "missing"
+        return "missing_agentscope_tool_call"
 
     async def _try_acquire_human_decision_claim(
         self,
@@ -1031,6 +1191,17 @@ class AgentScopeRuntime:
                         event,
                         plan_store=self._navigation_plan_store(),
                     )
+                    if event is None:
+                        continue
+                    enriched_payload = event.get("payload")
+                    if (
+                        isinstance(enriched_payload, dict)
+                        and enriched_payload.get("recovery_required") is True
+                    ):
+                        enriched_payload["submission_disabled"] = True
+                        enriched_payload["recovery_endpoint"] = (
+                            f"/api/sessions/{web_session_id}/human-decisions/recovery"
+                        )
                 events.append(event)
             return events
 
@@ -1039,6 +1210,7 @@ class AgentScopeRuntime:
                 await asyncio.wait_for(live_ready.wait(), timeout=_EVENT_STARTUP_GRACE_SECS)
 
             pending_event = await self._pending_human_decision_event(
+                web_session_id=web_session_id,
                 agent_id=agent_id,
                 agentscope_session_id=agentscope_session_id,
             )
@@ -1120,6 +1292,7 @@ class AgentScopeRuntime:
                         continue
 
                 pending_event = await self._pending_human_decision_event(
+                    web_session_id=web_session_id,
                     agent_id=agent_id,
                     agentscope_session_id=agentscope_session_id,
                 )
@@ -1289,6 +1462,7 @@ class AgentScopeRuntime:
     async def _pending_human_decision_event(
         self,
         *,
+        web_session_id: str,
         agent_id: str,
         agentscope_session_id: str,
     ) -> dict[str, Any] | None:
@@ -1314,6 +1488,23 @@ class AgentScopeRuntime:
                         plan_store=self._navigation_plan_store(),
                     )
                     if payload is None:
+                        tool_input = _tool_call_input(tool_call)
+                        plan_id = tool_input.get("plan_id")
+                        step_id = tool_input.get("step_id")
+                        if isinstance(plan_id, str) and isinstance(step_id, str):
+                            handoff = self._navigation_plan_store().get_human_decision_handoff(
+                                plan_id, step_id
+                            )
+                            if handoff is not None and handoff.status == "quarantined":
+                                self._mark_human_decision_consumed(
+                                    agentscope_session_id=agentscope_session_id,
+                                    decision={
+                                        "reply_id": reply_id,
+                                        "tool_call_id": str(getattr(tool_call, "id", "")),
+                                        "action": "quarantined",
+                                        "request_id": f"{plan_id}:{step_id}",
+                                    },
+                                )
                         continue
                     claim_key = _human_decision_claim_key(
                         agentscope_session_id,
@@ -1332,6 +1523,11 @@ class AgentScopeRuntime:
                         continue
                     payload["reply_id"] = reply_id
                     payload["tool_call_id"] = getattr(tool_call, "id", "")
+                    if payload.get("recovery_required") is True:
+                        payload["submission_disabled"] = True
+                        payload["recovery_endpoint"] = (
+                            f"/api/sessions/{web_session_id}/human-decisions/recovery"
+                        )
                     return {
                         "type": "human_decision_required",
                         "source": "NavigationDataAgent",
@@ -1422,6 +1618,16 @@ def _tool_call_blocks(message: Any) -> list[Any]:
     ]
 
 
+def _tool_call_input(tool_call: Any) -> dict[str, Any]:
+    payload = getattr(tool_call, "input", None)
+    if isinstance(payload, str):
+        try:
+            payload = json.loads(payload)
+        except json.JSONDecodeError:
+            return {}
+    return payload if isinstance(payload, dict) else {}
+
+
 def _state_value(value: Any) -> str:
     raw_value = getattr(value, "value", value)
     return str(raw_value)
@@ -1467,6 +1673,8 @@ def _human_decision_payload_from_tool_call(
         plan = plan_store.get(plan_id)
         current = plan_store.get_current_step(plan_id) if plan is not None else None
         handoff = plan_store.get_human_decision_handoff(plan_id, step_id)
+        if handoff is not None and handoff.status == "quarantined":
+            return None
         if (
             plan is None
             or (
@@ -1485,7 +1693,7 @@ def _human_decision_payload_from_tool_call(
         selected_source = getattr(calibration, "selected_sensor_source", None)
         if not isinstance(selected_source, str):
             return None
-        return {
+        payload = {
             "request_id": f"{plan_id}:{step_id}",
             "decision_type": "camera_params",
             "summary": (
@@ -1495,6 +1703,14 @@ def _human_decision_payload_from_tool_call(
             "plan_id": plan_id,
             "step_id": step_id,
         }
+        if handoff is not None and handoff.status == "recovery_required":
+            payload["recovery_required"] = True
+            payload["recovery"] = {
+                "action": "quarantine_and_replan",
+                "plan_id": plan_id,
+                "step_id": step_id,
+            }
+        return payload
 
     request_id = tool_input.get("request_id")
     summary = tool_input.get("summary")
@@ -1514,7 +1730,7 @@ def _enrich_plan_human_decision_event(
     event: dict[str, Any],
     *,
     plan_store: SqliteNavigationPlanRepository,
-) -> dict[str, Any]:
+) -> dict[str, Any] | None:
     payload = event.get("payload")
     if not isinstance(payload, dict):
         return event
@@ -1522,6 +1738,9 @@ def _enrich_plan_human_decision_event(
     step_id = payload.get("step_id")
     if not isinstance(plan_id, str) or not isinstance(step_id, str):
         return event
+    handoff = plan_store.get_human_decision_handoff(plan_id, step_id)
+    if handoff is not None and handoff.status == "quarantined":
+        return None
     metadata = _human_decision_payload_from_tool_call(
         SimpleNamespace(
             name="request_human_decision",

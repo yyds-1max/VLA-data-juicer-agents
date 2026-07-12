@@ -15,6 +15,7 @@ class FakeAgentScopeRuntime:
         self.accept_decision = accept_decision
         self.messages: list[tuple[str, str]] = []
         self.decisions: list[tuple[str, dict]] = []
+        self.recoveries: list[tuple[str, dict]] = []
         self.events: list[dict] = []
         self.subscriptions: list[str] = []
 
@@ -25,6 +26,19 @@ class FakeAgentScopeRuntime:
     async def submit_human_decision(self, *, web_session_id: str, decision: dict) -> bool:
         self.decisions.append((web_session_id, decision))
         return self.accept_decision
+
+    async def recover_human_decision_handoff(self, *, web_session_id: str, recovery: dict):
+        self.recoveries.append((web_session_id, recovery))
+        if recovery["reason"] == "illegal":
+            raise RuntimeError("handoff is not recovery_required")
+        return {
+            "recovered": True,
+            "plan_id": recovery["plan_id"],
+            "step_id": recovery["step_id"],
+            "handoff_status": "quarantined",
+            "task_status": "needs_replan",
+            "next_action": "submit_complete_plan",
+        }
 
     async def subscribe_web_session_events(self, *, web_session_id: str):
         self.subscriptions.append(web_session_id)
@@ -197,3 +211,59 @@ def test_human_decision_unknown_session_returns_404(tmp_path) -> None:
 
     assert response.status_code == 404
     assert response.json()["detail"] == "Session not found"
+
+
+def test_human_decision_recovery_contract_and_forwarding(tmp_path) -> None:
+    runtime = FakeAgentScopeRuntime()
+    client = _client(tmp_path, runtime)
+    session_id = _create_session(client)
+    payload = {
+        "action": "quarantine_and_replan",
+        "plan_id": "plan-1",
+        "step_id": "confirm",
+        "reason": "operator confirmed abandoned worker",
+    }
+
+    response = client.post(
+        f"/api/sessions/{session_id}/human-decisions/recovery", json=payload
+    )
+
+    assert response.status_code == 200
+    assert response.json() == {
+        "recovered": True,
+        "plan_id": "plan-1",
+        "step_id": "confirm",
+        "handoff_status": "quarantined",
+        "task_status": "needs_replan",
+        "next_action": "submit_complete_plan",
+    }
+    assert runtime.recoveries == [(session_id, payload)]
+
+
+def test_human_decision_recovery_validation_ownership_and_state_errors(tmp_path) -> None:
+    runtime = FakeAgentScopeRuntime()
+    client = _client(tmp_path, runtime)
+    session_id = _create_session(client)
+    path = f"/api/sessions/{session_id}/human-decisions/recovery"
+
+    assert client.post(path, json={}).status_code == 422
+    assert client.post(
+        "/api/sessions/missing/human-decisions/recovery",
+        json={
+            "action": "quarantine_and_replan",
+            "plan_id": "plan-1",
+            "step_id": "confirm",
+            "reason": "operator recovery",
+        },
+    ).status_code == 404
+    conflict = client.post(
+        path,
+        json={
+            "action": "quarantine_and_replan",
+            "plan_id": "plan-1",
+            "step_id": "confirm",
+            "reason": "illegal",
+        },
+    )
+    assert conflict.status_code == 409
+    assert "recovery_required" in conflict.json()["detail"]

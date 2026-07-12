@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import hashlib
+import re
 import sqlite3
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -73,12 +74,17 @@ class HumanDecisionHandoff(_StrictReadModel):
     task_id: str
     decision_key: str
     decision: dict[str, Any]
-    status: Literal["pending"] = "pending"
-    delivery_status: Literal["pending", "delivering", "delivered"] = "pending"
+    status: Literal["pending", "recovery_required", "quarantined"] = "pending"
+    delivery_status: Literal[
+        "pending", "delivering", "delivered", "recovery_required", "quarantined"
+    ] = "pending"
     delivery_owner: str | None = None
     delivery_token: str | None = None
     leased_at: str | None = None
     expires_at: str | None = None
+    recovery_reason_code: str | None = None
+    recovery_reason: str | None = None
+    recovered_at: str | None = None
 
 
 class CompactExecutionStep(_StrictReadModel):
@@ -165,14 +171,22 @@ class SqliteNavigationPlanRepository:
                     task_id TEXT NOT NULL,
                     decision_key TEXT NOT NULL,
                     decision_json TEXT NOT NULL,
-                    status TEXT NOT NULL CHECK (status = 'pending'),
+                    status TEXT NOT NULL CHECK (
+                        status IN ('pending', 'recovery_required', 'quarantined')
+                    ),
                     delivery_status TEXT NOT NULL DEFAULT 'pending' CHECK (
-                        delivery_status IN ('pending', 'delivering', 'delivered')
+                        delivery_status IN (
+                            'pending', 'delivering', 'delivered',
+                            'recovery_required', 'quarantined'
+                        )
                     ),
                     delivery_owner TEXT,
                     delivery_token TEXT,
                     leased_at TEXT,
                     expires_at TEXT,
+                    recovery_reason_code TEXT,
+                    recovery_reason TEXT,
+                    recovered_at TEXT,
                     created_at TEXT NOT NULL,
                     updated_at TEXT NOT NULL,
                     PRIMARY KEY (plan_id, step_id),
@@ -183,6 +197,7 @@ class SqliteNavigationPlanRepository:
                 )
                 """
             )
+            self._ensure_handoff_recovery_schema(connection)
             connection.execute(
                 """
                 CREATE UNIQUE INDEX IF NOT EXISTS idx_navigation_plans_active_task_phase
@@ -206,6 +221,9 @@ class SqliteNavigationPlanRepository:
                 "delivery_token",
                 "leased_at",
                 "expires_at",
+                "recovery_reason_code",
+                "recovery_reason",
+                "recovered_at",
             ):
                 if name not in handoff_columns:
                     connection.execute(
@@ -233,6 +251,86 @@ class SqliteNavigationPlanRepository:
                 ON navigation_plan_submission_attempts (task_id, phase, created_at)
                 """
             )
+
+    @staticmethod
+    def _ensure_handoff_recovery_schema(connection: sqlite3.Connection) -> None:
+        row = connection.execute(
+            "SELECT sql FROM sqlite_master WHERE type = 'table' "
+            "AND name = 'navigation_human_decision_handoffs'"
+        ).fetchone()
+        if row is None or "recovery_required" in str(row["sql"]):
+            return
+        connection.execute(
+            """CREATE TABLE navigation_human_decision_handoffs_recovery (
+                plan_id TEXT NOT NULL,
+                step_id TEXT NOT NULL,
+                task_id TEXT NOT NULL,
+                decision_key TEXT NOT NULL,
+                decision_json TEXT NOT NULL,
+                status TEXT NOT NULL CHECK (
+                    status IN ('pending', 'recovery_required', 'quarantined')
+                ),
+                delivery_status TEXT NOT NULL DEFAULT 'pending' CHECK (
+                    delivery_status IN (
+                        'pending', 'delivering', 'delivered',
+                        'recovery_required', 'quarantined'
+                    )
+                ),
+                delivery_owner TEXT,
+                delivery_token TEXT,
+                leased_at TEXT,
+                expires_at TEXT,
+                recovery_reason_code TEXT,
+                recovery_reason TEXT,
+                recovered_at TEXT,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                PRIMARY KEY (plan_id, step_id),
+                FOREIGN KEY (plan_id) REFERENCES navigation_plans(plan_id)
+                    ON DELETE CASCADE,
+                FOREIGN KEY (task_id) REFERENCES navigation_tasks(task_id)
+                    ON DELETE CASCADE
+            )"""
+        )
+        old_columns = {
+            item["name"]
+            for item in connection.execute(
+                "PRAGMA table_info(navigation_human_decision_handoffs)"
+            ).fetchall()
+        }
+        expressions = {
+            name: name if name in old_columns else "NULL"
+            for name in (
+                "delivery_owner",
+                "delivery_token",
+                "leased_at",
+                "expires_at",
+            )
+        }
+        delivery_status = (
+            "COALESCE(delivery_status, 'pending')"
+            if "delivery_status" in old_columns
+            else "'pending'"
+        )
+        connection.execute(
+            f"""INSERT INTO navigation_human_decision_handoffs_recovery (
+                    plan_id, step_id, task_id, decision_key, decision_json,
+                    status, delivery_status, delivery_owner, delivery_token,
+                    leased_at, expires_at, recovery_reason_code, recovery_reason,
+                    recovered_at, created_at, updated_at
+                )
+                SELECT plan_id, step_id, task_id, decision_key, decision_json,
+                       status, {delivery_status}, {expressions['delivery_owner']},
+                       {expressions['delivery_token']}, {expressions['leased_at']},
+                       {expressions['expires_at']}, NULL, NULL, NULL,
+                       created_at, updated_at
+                FROM navigation_human_decision_handoffs"""
+        )
+        connection.execute("DROP TABLE navigation_human_decision_handoffs")
+        connection.execute(
+            "ALTER TABLE navigation_human_decision_handoffs_recovery "
+            "RENAME TO navigation_human_decision_handoffs"
+        )
 
     def record_attempt(self, attempt: PlanSubmissionAttempt) -> PlanSubmissionAttempt:
         stored = PlanSubmissionAttempt.model_validate(attempt)
@@ -377,7 +475,7 @@ class SqliteNavigationPlanRepository:
         handoff = connection.execute(
             """
             SELECT 1 FROM navigation_human_decision_handoffs
-            WHERE plan_id = ? LIMIT 1
+            WHERE plan_id = ? AND status != 'quarantined' LIMIT 1
             """,
             (plan_id,),
         ).fetchone()
@@ -403,7 +501,7 @@ class SqliteNavigationPlanRepository:
               AND (
                 steps.status IN ('running', 'waiting_user')
                 OR outbox.plan_id IS NOT NULL
-                OR handoffs.plan_id IS NOT NULL
+                OR (handoffs.plan_id IS NOT NULL AND handoffs.status != 'quarantined')
               )
             LIMIT 1
             """,
@@ -864,6 +962,7 @@ class SqliteNavigationPlanRepository:
                      ON target_plan.task_id = handoff_plans.task_id
                     AND target_plan.phase = handoff_plans.phase
                    WHERE target_plan.plan_id = ?
+                     AND handoffs.status != 'quarantined'
                    LIMIT 1""",
                 (plan_id,),
             ).fetchone()
@@ -1045,6 +1144,9 @@ class SqliteNavigationPlanRepository:
             delivery_token=row["delivery_token"],
             leased_at=row["leased_at"],
             expires_at=row["expires_at"],
+            recovery_reason_code=row["recovery_reason_code"],
+            recovery_reason=row["recovery_reason"],
+            recovered_at=row["recovered_at"],
         )
 
     def acknowledge_human_decision_handoff(
@@ -1058,6 +1160,7 @@ class SqliteNavigationPlanRepository:
                 """
                 DELETE FROM navigation_human_decision_handoffs
                 WHERE plan_id = ? AND step_id = ? AND decision_key = ?
+                  AND status = 'pending'
                 """,
                 (plan_id, step_id, decision_key),
             )
@@ -1065,12 +1168,15 @@ class SqliteNavigationPlanRepository:
 
     def claim_human_decision_delivery(
         self, plan_id: str, step_id: str, decision_key: str, *, owner: str
-    ) -> tuple[Literal["claimed", "busy", "delivered", "missing"], str | None]:
+    ) -> tuple[
+        Literal["claimed", "busy", "delivered", "missing", "recovery_required"],
+        str | None,
+    ]:
         connection = self._connect()
         try:
             connection.execute("BEGIN IMMEDIATE")
             row = connection.execute(
-                """SELECT delivery_status, decision_key, expires_at
+                """SELECT status, delivery_status, decision_key, expires_at
                    FROM navigation_human_decision_handoffs
                    WHERE plan_id = ? AND step_id = ?""",
                 (plan_id, step_id),
@@ -1078,6 +1184,12 @@ class SqliteNavigationPlanRepository:
             if row is None or row["decision_key"] != decision_key:
                 connection.rollback()
                 return "missing", None
+            if row["status"] == "quarantined":
+                connection.commit()
+                return "missing", None
+            if row["status"] == "recovery_required":
+                connection.commit()
+                return "recovery_required", None
             if row["delivery_status"] == "delivered":
                 connection.commit()
                 return "delivered", None
@@ -1089,6 +1201,19 @@ class SqliteNavigationPlanRepository:
             ):
                 connection.commit()
                 return "busy", None
+            if row["delivery_status"] == "delivering":
+                connection.execute(
+                    """UPDATE navigation_human_decision_handoffs
+                       SET status = 'recovery_required',
+                           delivery_status = 'recovery_required',
+                           recovery_reason_code = 'delivery_lease_expired',
+                           updated_at = ?
+                       WHERE plan_id = ? AND step_id = ? AND decision_key = ?
+                         AND status = 'pending' AND delivery_status = 'delivering'""",
+                    (utc_now(), plan_id, step_id, decision_key),
+                )
+                connection.commit()
+                return "recovery_required", None
             token = uuid4().hex
             leased_at = now.isoformat(timespec="milliseconds")
             expires_at = (
@@ -1117,6 +1242,144 @@ class SqliteNavigationPlanRepository:
             raise
         finally:
             connection.close()
+
+    def mark_human_decision_recovery_required(
+        self,
+        plan_id: str,
+        step_id: str,
+        *,
+        reason_code: str,
+    ) -> bool:
+        safe_code = re.sub(r"[^a-z0-9_:-]", "_", str(reason_code).lower())[:128]
+        if not safe_code:
+            safe_code = "ambiguous_delivery_state"
+        connection = self._connect()
+        try:
+            connection.execute("BEGIN IMMEDIATE")
+            row = connection.execute(
+                """SELECT status, delivery_status
+                   FROM navigation_human_decision_handoffs
+                   WHERE plan_id = ? AND step_id = ?""",
+                (plan_id, step_id),
+            ).fetchone()
+            if row is None or row["status"] == "quarantined":
+                connection.rollback()
+                return False
+            if row["status"] == "recovery_required":
+                connection.commit()
+                return True
+            if row["delivery_status"] == "delivered":
+                connection.rollback()
+                return False
+            cursor = connection.execute(
+                """UPDATE navigation_human_decision_handoffs
+                   SET status = 'recovery_required',
+                       delivery_status = 'recovery_required',
+                       recovery_reason_code = ?, updated_at = ?
+                   WHERE plan_id = ? AND step_id = ? AND status = 'pending'
+                     AND delivery_status IN ('pending', 'delivering')""",
+                (safe_code, utc_now(), plan_id, step_id),
+            )
+            connection.commit()
+            return cursor.rowcount == 1
+        except Exception:
+            connection.rollback()
+            raise
+        finally:
+            connection.close()
+
+    def quarantine_human_decision_handoff(
+        self,
+        plan_id: str,
+        step_id: str,
+        *,
+        expected_web_session_id: str,
+        reason: str,
+    ) -> dict[str, Any]:
+        safe_reason = self._sanitize_recovery_reason(reason)
+        connection = self._connect()
+        try:
+            connection.execute("BEGIN IMMEDIATE")
+            row = connection.execute(
+                """SELECT handoffs.status, handoffs.delivery_status,
+                          handoffs.task_id, tasks.created_by_web_session_id
+                   FROM navigation_human_decision_handoffs AS handoffs
+                   JOIN navigation_tasks AS tasks ON tasks.task_id = handoffs.task_id
+                   WHERE handoffs.plan_id = ? AND handoffs.step_id = ?""",
+                (plan_id, step_id),
+            ).fetchone()
+            if row is None:
+                raise ActivePlanExecutionConflict("human handoff was not found")
+            if row["created_by_web_session_id"] != expected_web_session_id:
+                raise ActivePlanExecutionConflict(
+                    "human handoff does not belong to the requested Web session"
+                )
+            if (
+                row["status"] != "recovery_required"
+                or row["delivery_status"] != "recovery_required"
+            ):
+                raise ActivePlanExecutionConflict(
+                    "only a recovery_required human handoff may be quarantined"
+                )
+            timestamp = utc_now()
+            connection.execute(
+                """UPDATE navigation_human_decision_handoffs
+                   SET status = 'quarantined', delivery_status = 'quarantined',
+                       recovery_reason = ?, recovered_at = ?, updated_at = ?
+                   WHERE plan_id = ? AND step_id = ?
+                     AND status = 'recovery_required'
+                     AND delivery_status = 'recovery_required'""",
+                (safe_reason, timestamp, timestamp, plan_id, step_id),
+            )
+            connection.execute(
+                "DELETE FROM navigation_step_result_outbox WHERE plan_id = ? AND step_id = ?",
+                (plan_id, step_id),
+            )
+            connection.execute(
+                """UPDATE navigation_plans
+                   SET status = 'invalidated',
+                       invalidation_reason = 'human_handoff_quarantined', updated_at = ?
+                   WHERE plan_id = ?""",
+                (timestamp, plan_id),
+            )
+            connection.execute(
+                """UPDATE navigation_task_steps
+                   SET status = 'needs_replan', finished_at = ?
+                   WHERE plan_id = ? AND status != 'completed'""",
+                (timestamp, plan_id),
+            )
+            connection.execute(
+                """UPDATE navigation_tasks SET status = 'needs_replan', updated_at = ?
+                   WHERE task_id = ?""",
+                (timestamp, row["task_id"]),
+            )
+            connection.commit()
+        except Exception:
+            connection.rollback()
+            raise
+        finally:
+            connection.close()
+        return {
+            "recovered": True,
+            "plan_id": plan_id,
+            "step_id": step_id,
+            "handoff_status": "quarantined",
+            "task_status": "needs_replan",
+            "next_action": "submit_complete_plan",
+        }
+
+    @staticmethod
+    def _sanitize_recovery_reason(reason: str) -> str:
+        value = str(reason).strip()
+        if not value:
+            raise ValueError("recovery reason must not be empty")
+        value = re.sub(
+            r"(?i)\b(password|token|secret|authorization|api_key|cookie)\b"
+            r"\s*[:=]\s*[^\s,;]+",
+            lambda match: f"{match.group(1)}=[REDACTED]",
+            value,
+        )
+        return value[:4000]
 
     def finish_human_decision_delivery(
         self,
@@ -1149,10 +1412,11 @@ class SqliteNavigationPlanRepository:
         with self._connect() as connection:
             cursor = connection.execute(
                 """UPDATE navigation_human_decision_handoffs
-                   SET delivery_status = 'delivered', delivery_owner = NULL,
+                   SET status = 'pending', delivery_status = 'delivered', delivery_owner = NULL,
                        delivery_token = NULL, leased_at = NULL, expires_at = NULL,
                        updated_at = ?
                    WHERE plan_id = ? AND step_id = ? AND decision_key = ?
+                     AND status IN ('pending', 'recovery_required')
                      AND delivery_status != 'delivered'""",
                 (utc_now(), plan_id, step_id, decision_key),
             )
