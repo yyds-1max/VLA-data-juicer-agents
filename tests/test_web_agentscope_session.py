@@ -497,10 +497,9 @@ def test_navigation_rule_fallback_is_narrow_and_explicit() -> None:
 def test_web_navigation_prompt_describes_cross_session_resume_gate() -> None:
     prompt = navigation_agent_prompt()
 
-    assert "When the user indicates they are ready to continue and provides scene mode for a waiting task" in prompt
-    assert "update the task scene mode, reconcile artifacts" in prompt
-    assert "finalize_finish_processing_plan_tool" in prompt
-    assert "finish-processing tools step-by-step" in prompt
+    assert "When the user supplies scene mode for a waiting task" in prompt
+    assert "update durable task state, reconcile artifacts" in prompt
+    assert "runtime-selected phase tools" in prompt
 
 
 @pytest.mark.asyncio
@@ -666,7 +665,8 @@ async def test_runtime_start_navigation_agent_task_switches_mapping_and_spawns_n
     run = runtime.app.state.chat_service.runs[-1]
     assert run["session_id"] == "web-1__navigation-data-agent"
     assert run["agent_id"] == "navigation-data-agent"
-    assert _message_text(run["message"]) == handoff_message
+    assert _message_text(run["message"]).startswith(handoff_message)
+    assert "Durable navigation state anchor (authoritative):" in _message_text(run["message"])
 
 
 @pytest.mark.asyncio
@@ -698,11 +698,12 @@ async def test_runtime_submit_user_message_routes_to_active_navigation_agent_aft
     run = runtime.app.state.chat_service.runs[-1]
     assert run["session_id"] == "web-1__navigation-data-agent"
     assert run["agent_id"] == "navigation-data-agent"
-    assert _message_text(run["message"]) == "继续执行 室内"
+    assert _message_text(run["message"]).startswith("继续执行 室内")
+    assert "Durable navigation state anchor (authoritative):" in _message_text(run["message"])
 
 
 @pytest.mark.asyncio
-async def test_runtime_start_navigation_agent_task_precreates_session_draft_from_handoff(
+async def test_runtime_start_navigation_agent_task_creates_durable_task_without_draft(
     tmp_path: Path,
 ) -> None:
     chat_run_registry = FakeChatRunRegistry()
@@ -733,22 +734,16 @@ async def test_runtime_start_navigation_agent_task_precreates_session_draft_from
         web_session_id="web-1",
         message=message,
     )
-    state = JsonNavigationPlanDraftStore(
-        tmp_path / "navigation-plan-drafts"
-    ).load(session_id)
     task = runtime._navigation_task_store().find_latest_by_agentscope_session(session_id)
 
     assert session_id == "web-1__navigation-data-agent"
-    assert state is not None
-    assert state.request.date == "20270605"
-    assert state.request.scene_mode == "out"
-    assert state.request.segments == ["20260605_152856"]
+    assert not (tmp_path / "navigation-plan-drafts").exists()
     assert task is not None
     assert task.phase == NavigationTaskPhase.INTAKE
     assert task.status == NavigationTaskStatus.NEEDS_RECONCILE
     assert task.guidance_revision == 1
     revision = SqliteNavigationObservationStore(
-        tmp_path / "navigation-observations.sqlite"
+        tmp_path / "navigation-tasks.sqlite"
     ).latest(task.task_id)
     assert revision is not None
     assert {payload.kind for payload in revision.payloads} == {
@@ -779,12 +774,11 @@ async def test_runtime_start_navigation_agent_task_preserves_dry_run_from_handof
         web_session_id="web-1",
         message=message,
     )
-    state = JsonNavigationPlanDraftStore(
-        tmp_path / "navigation-plan-drafts"
-    ).load(session_id)
+    task = runtime._navigation_task_store().find_latest_by_agentscope_session(session_id)
 
-    assert state is not None
-    assert state.request.dry_run is True
+    assert task is not None
+    assert task.dry_run is True
+    assert not (tmp_path / "navigation-plan-drafts").exists()
     await chat_run_registry.drain()
 
 
@@ -880,24 +874,24 @@ async def test_runtime_registers_navigation_task_tools_for_navigation_agent(tmp_
     names = {tool.name for tool in tools}
 
     assert "get_or_create_navigation_task_tool" in names
-    assert "reconcile_navigation_task_tool" in names
+    assert names == {"get_or_create_navigation_task_tool"}
 
 
 @pytest.mark.asyncio
-async def test_runtime_navigation_tools_use_session_draft_dry_run(
+async def test_runtime_navigation_tools_resolve_from_durable_services_each_turn(
     monkeypatch,
     tmp_path: Path,
 ) -> None:
     captured = {}
 
-    def fake_build_navigation_agent_tools(**kwargs):
+    def fake_resolve_navigation_agent_tools(**kwargs):
         captured.update(kwargs)
         return []
 
     monkeypatch.setattr(
         agentscope_runtime_module,
-        "build_navigation_agent_tools",
-        fake_build_navigation_agent_tools,
+        "resolve_navigation_agent_tools",
+        fake_resolve_navigation_agent_tools,
     )
     runtime = _runtime(workspace_root=tmp_path)
     await runtime.ensure_bootstrapped()
@@ -906,23 +900,14 @@ async def test_runtime_navigation_tools_use_session_draft_dry_run(
         agent_id=runtime.config.navigation_agent_id,
         model=runtime.config.navigation_model,
     )
-    JsonNavigationPlanDraftStore(tmp_path / "navigation-plan-drafts").save(
-        session_id,
-        agentscope_runtime_module.WorkflowPlanDraftState(
-            request=agentscope_runtime_module.NavigationRequest(
-                date="20270605",
-                dry_run=True,
-            )
-        ),
-    )
-
     tools = runtime._navigation_tools_for_session(
         web_session_id="web-1",
         agentscope_session_id=session_id,
     )
 
     assert tools == []
-    assert captured["dry_run"] is True
+    assert captured["agentscope_session_id"] == session_id
+    assert captured["services"].task_store.db_path == tmp_path / "navigation-tasks.sqlite"
 
 
 @pytest.mark.asyncio

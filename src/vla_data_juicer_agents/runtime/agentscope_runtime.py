@@ -22,26 +22,23 @@ from agentscope.tool import ToolBase, ToolChunk
 from vla_data_juicer_agents.adapters.agentscope import AgentScopeEventAdapter
 from vla_data_juicer_agents.core.cancellation import CancellationContext, bind_cancellation
 from vla_data_juicer_agents.core.events import CallbackEventSink, EventEmitter
-from vla_data_juicer_agents.navigation.agent_tools import build_navigation_agent_tools
+from vla_data_juicer_agents.navigation.agent_tools import resolve_navigation_agent_tools
 from vla_data_juicer_agents.navigation.config import NavigationSettings
-from vla_data_juicer_agents.navigation.evidence_store import FileNavigationEvidenceStore
-from vla_data_juicer_agents.navigation.models import NavigationRequest
-from vla_data_juicer_agents.navigation.observation_store import (
-    SqliteNavigationObservationStore,
-)
-from vla_data_juicer_agents.navigation.plan_draft import WorkflowPlanDraftState
-from vla_data_juicer_agents.navigation.plan_draft_store import JsonNavigationPlanDraftStore
 from vla_data_juicer_agents.navigation.plan_execution import (
     human_decision_key,
     submit_plan_human_decision,
 )
 from vla_data_juicer_agents.navigation.plan_store import SqliteNavigationPlanRepository
+from vla_data_juicer_agents.navigation.services import (
+    NavigationServices,
+    build_navigation_services,
+)
 from vla_data_juicer_agents.navigation.task_reconciliation import (
     _navigation_scene_mode_for_request,
     _structured_handoff_payload_from_message,
     prepare_navigation_task_entry,
+    reconcile_navigation_task,
 )
-from vla_data_juicer_agents.navigation.task_store import SqliteNavigationTaskStore
 from vla_data_juicer_agents.runtime.agentscope_bootstrap import bootstrap_agentscope_records
 from vla_data_juicer_agents.runtime.agentscope_config import AgentScopeRuntimeConfig
 
@@ -163,14 +160,15 @@ class AgentScopeRuntime:
                 agent_id=self.config.navigation_agent_id,
                 model=self.config.navigation_model,
             )
+            services = self._navigation_services()
             prepare_navigation_task_entry(
-                task_store=self._navigation_task_store(),
-                observation_store=self._navigation_observation_store(),
-                evidence_store=self._navigation_evidence_store(),
+                task_store=services.task_store,
+                observation_store=services.observation_store,
+                evidence_store=services.evidence_store,
                 message=message,
                 web_session_id=web_session_id,
                 agentscope_session_id=session_id,
-                settings=NavigationSettings(),
+                settings=services.settings,
             )
         except Exception as entry_error:
             try:
@@ -181,10 +179,6 @@ class AgentScopeRuntime:
                     f"{compensation_error!r}"
                 )
             raise
-        self._precreate_navigation_plan_draft(
-            agentscope_session_id=session_id,
-            message=message,
-        )
         session_id = await self._start_agent_run(
             web_session_id=web_session_id,
             agent_id=self.config.navigation_agent_id,
@@ -211,6 +205,13 @@ class AgentScopeRuntime:
         cancellation = CancellationContext()
         previous_cancellation = self.run_cancellation(session_id)
         self.register_run_cancellation(session_id, cancellation)
+
+        if agent_id == self.config.navigation_agent_id:
+            anchor = self._navigation_durable_state_anchor(session_id)
+            message = (
+                f"{message}\n\nDurable navigation state anchor (authoritative): "
+                f"{json.dumps(anchor, ensure_ascii=False, sort_keys=True)}"
+            )
 
         async def run_with_cancellation() -> None:
             try:
@@ -275,64 +276,59 @@ class AgentScopeRuntime:
     def record_navigation_handoff(self, payload: dict[str, Any]) -> None:
         _logger.info("Navigation handoff: %s", payload)
 
-    def _precreate_navigation_plan_draft(
+    def _navigation_services(self) -> NavigationServices:
+        return build_navigation_services(self.config.workspace_root)
+
+    def _navigation_task_store(self):
+        return self._navigation_services().task_store
+
+    def _navigation_observation_store(self):
+        return self._navigation_services().observation_store
+
+    def _navigation_evidence_store(self):
+        return self._navigation_services().evidence_store
+
+    def _navigation_plan_store(self):
+        return self._navigation_services().plan_store
+
+    def _navigation_durable_state_anchor(
         self,
-        *,
         agentscope_session_id: str,
-        message: str,
-    ) -> None:
-        payload = _structured_handoff_payload_from_message(message)
-        if payload is None:
-            return
-        date = payload.get("date")
-        scene_mode = payload.get("scene_mode")
-        segments = payload.get("segments")
-        if not isinstance(date, str):
-            return
-        normalized_scene_mode = (
-            "in" if scene_mode in {"in", "indoor", "室内"}
-            else "out" if scene_mode in {"out", "outdoor", "室外"}
+    ) -> dict[str, Any]:
+        services = self._navigation_services()
+        task = services.task_store.find_latest_by_agentscope_session(agentscope_session_id)
+        if task is None:
+            return {
+                "task_id": None,
+                "phase": None,
+                "task_status": None,
+                "observation_revision": None,
+                "active_plan_id": None,
+                "active_plan_revision": None,
+                "current_step_id": None,
+            }
+        reconciled = reconcile_navigation_task(task, settings=services.settings)
+        changes = reconciled.model_dump(mode="json")
+        changes.pop("task_id", None)
+        task = services.task_store.update_task(task.task_id, **changes)
+        observation = services.observation_store.latest(task.task_id)
+        plan = (
+            services.plan_store.get_active(task.task_id, task.phase.value)
+            if task.phase.value in {"extract_sync", "finish_processing"}
             else None
         )
-        if segments is not None and not isinstance(segments, list):
-            return
-        normalized_segments = (
-            [str(segment) for segment in segments]
-            if isinstance(segments, list)
-            else None
-        )
-        draft_store = JsonNavigationPlanDraftStore(
-            self.config.workspace_root / "navigation-plan-drafts"
-        )
-        if draft_store.load(agentscope_session_id) is not None:
-            return
-        draft_store.save(
-            agentscope_session_id,
-            WorkflowPlanDraftState(
-                request=NavigationRequest(
-                    date=date,
-                    scene_mode=normalized_scene_mode,
-                    segments=normalized_segments,
-                    dry_run=bool(payload.get("dry_run", False)),
-                )
+        current = services.plan_store.get_current_step(plan.plan_id) if plan is not None else None
+        return {
+            "task_id": task.task_id,
+            "phase": task.phase.value,
+            "task_status": task.status.value,
+            "observation_revision": observation.revision if observation is not None else None,
+            "active_plan_id": plan.plan_id if plan is not None else None,
+            "active_plan_revision": plan.plan_revision if plan is not None else None,
+            "current_step_id": (
+                current["step"]["step_id"] if current is not None else None
             ),
-        )
-
-    def _navigation_task_store(self) -> SqliteNavigationTaskStore:
-        return SqliteNavigationTaskStore(self.config.workspace_root / "navigation-tasks.sqlite")
-
-    def _navigation_observation_store(self) -> SqliteNavigationObservationStore:
-        return SqliteNavigationObservationStore(
-            self.config.workspace_root / "navigation-observations.sqlite"
-        )
-
-    def _navigation_evidence_store(self) -> FileNavigationEvidenceStore:
-        return FileNavigationEvidenceStore(self.config.workspace_root / "navigation-evidence")
-
-    def _navigation_plan_store(self) -> SqliteNavigationPlanRepository:
-        return SqliteNavigationPlanRepository(
-            self.config.workspace_root / "navigation-tasks.sqlite"
-        )
+        }
 
     def _navigation_tools_for_session(
         self,
@@ -340,29 +336,12 @@ class AgentScopeRuntime:
         web_session_id: str,
         agentscope_session_id: str,
     ) -> list[Any]:
-        draft_store = JsonNavigationPlanDraftStore(
-            self.config.workspace_root / "navigation-plan-drafts"
-        )
-        return build_navigation_agent_tools(
-            dry_run=self._navigation_session_dry_run(
-                agentscope_session_id=agentscope_session_id,
-                draft_store=draft_store,
-            ),
+        return resolve_navigation_agent_tools(
+            services=self._navigation_services(),
             cancellation=self.run_cancellation(agentscope_session_id),
-            session_id=agentscope_session_id,
-            draft_store=draft_store,
-            task_store=self._navigation_task_store(),
+            agentscope_session_id=agentscope_session_id,
             web_session_id=web_session_id,
         )
-
-    def _navigation_session_dry_run(
-        self,
-        *,
-        agentscope_session_id: str,
-        draft_store: JsonNavigationPlanDraftStore,
-    ) -> bool:
-        state = draft_store.load(agentscope_session_id)
-        return bool(state.request.dry_run) if state is not None else False
 
     async def submit_human_decision(self, *, web_session_id: str, decision: dict[str, Any]) -> bool:
         plan_id = decision.get("plan_id")
@@ -2241,8 +2220,6 @@ def build_extra_agent_tools_factory(
     *,
     runtime: AgentScopeRuntime | None = None,
 ):
-    draft_store = JsonNavigationPlanDraftStore(config.workspace_root / "navigation-plan-drafts")
-
     async def extra_agent_tools(_user_id: str, agent_id: str, _session_id: str) -> list[Any]:
         if agent_id == config.navigation_agent_id:
             web_session_id = _web_session_id_from_agentscope_session(
@@ -2257,25 +2234,16 @@ def build_extra_agent_tools_factory(
                         agentscope_session_id=_session_id,
                     )
                 run_cancellation = getattr(runtime, "run_cancellation", None)
-                return build_navigation_agent_tools(
-                    dry_run=_navigation_dry_run_for_session(
-                        draft_store=draft_store,
-                        session_id=_session_id,
-                    ),
+                return resolve_navigation_agent_tools(
+                    services=build_navigation_services(config.workspace_root),
                     cancellation=run_cancellation(_session_id) if callable(run_cancellation) else None,
-                    session_id=_session_id,
-                    draft_store=draft_store,
+                    agentscope_session_id=_session_id,
+                    web_session_id=web_session_id,
                 )
-            return build_navigation_agent_tools(
-                dry_run=_navigation_dry_run_for_session(
-                    draft_store=draft_store,
-                    session_id=_session_id,
-                ),
-                session_id=_session_id,
-                draft_store=draft_store,
-                task_store=SqliteNavigationTaskStore(
-                    config.workspace_root / "navigation-tasks.sqlite"
-                ),
+            return resolve_navigation_agent_tools(
+                services=build_navigation_services(config.workspace_root),
+                agentscope_session_id=_session_id,
+                cancellation=None,
                 web_session_id=web_session_id,
             )
         if agent_id == config.main_router_agent_id and runtime is not None:
@@ -2292,15 +2260,6 @@ def build_extra_agent_tools_factory(
         return []
 
     return extra_agent_tools
-
-
-def _navigation_dry_run_for_session(
-    *,
-    draft_store: JsonNavigationPlanDraftStore,
-    session_id: str,
-) -> bool:
-    state = draft_store.load(session_id)
-    return bool(state.request.dry_run) if state is not None else False
 
 
 def create_agentscope_runtime(config: AgentScopeRuntimeConfig) -> AgentScopeRuntime:

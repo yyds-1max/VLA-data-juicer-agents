@@ -47,9 +47,21 @@ def build_navigation_task_tools(
         scene_mode: str | None = None,
     ) -> dict[str, Any]:
         """Create or load a durable navigation task for date/segments."""
+        normalized_segments = _normalize_segments(segments)
+        existing = store.find_latest_by_date(date, normalized_segments)
+        if (
+            existing is not None
+            and existing.created_by_web_session_id is not None
+            and existing.created_by_web_session_id != web_session_id
+        ):
+            return {
+                "ok": False,
+                "error_type": "navigation_task_session_mismatch",
+                "message": "The durable navigation task belongs to another Web session.",
+            }
         task = store.create_or_update_task(
             date=date,
-            segments=_normalize_segments(segments),
+            segments=normalized_segments,
             scene_mode=scene_mode,
             web_session_id=web_session_id,
             agentscope_session_id=session_id,

@@ -7,11 +7,18 @@ import json
 from typing import Any
 
 from agentscope.permission import PermissionBehavior, PermissionDecision
-from agentscope.tool import ToolBase
+from agentscope.tool import FunctionTool, ToolBase
 
 from vla_data_juicer_agents.core.cancellation import CancellationContext
-from vla_data_juicer_agents.navigation.catalog import list_navigation_tool_capabilities_tool
+from vla_data_juicer_agents.navigation.catalog import (
+    list_navigation_tool_capabilities,
+    list_navigation_tool_capabilities_tool,
+)
 from vla_data_juicer_agents.navigation.config import NavigationSettings
+from vla_data_juicer_agents.navigation.context_budget import (
+    ensure_payload_within_limit,
+    serialized_chars,
+)
 from vla_data_juicer_agents.navigation.execution_tools import create_navigation_execution_tools
 from vla_data_juicer_agents.navigation.inspection import (
     infer_navigation_processing_profile_tool,
@@ -23,6 +30,19 @@ from vla_data_juicer_agents.navigation.inspection import (
     inspect_runtime_assets_tool,
 )
 from vla_data_juicer_agents.navigation.plan_draft_store import NavigationPlanDraftStore
+from vla_data_juicer_agents.navigation.observation_tools import (
+    build_navigation_observation_tools,
+)
+from vla_data_juicer_agents.navigation.plan_execution import (
+    build_plan_bound_execution_tools,
+)
+from vla_data_juicer_agents.navigation.plan_submission_tools import (
+    build_navigation_plan_submission_tools,
+)
+from vla_data_juicer_agents.navigation.planning_context import (
+    PHASE_REQUIRED_OBSERVATIONS,
+)
+from vla_data_juicer_agents.navigation.services import NavigationServices
 from vla_data_juicer_agents.navigation.session_plan_draft_tools import (
     build_session_plan_draft_tools,
 )
@@ -515,3 +535,260 @@ def build_navigation_agent_tools(
             settings=settings,
         ),
     ])
+
+
+_INSPECTION_TOOL_BY_KIND = {
+    "raw_metadata": "inspect_navigation_raw_metadata_tool",
+    "sensor_candidates": "inspect_navigation_sensor_candidates_tool",
+    "topic_candidates": "inspect_navigation_topic_candidates_tool",
+    "artifact_state": "inspect_navigation_artifact_state_tool",
+    "gridmap_artifacts": "inspect_navigation_gridmap_artifacts_tool",
+    "runtime_assets": "inspect_navigation_runtime_assets_tool",
+    "calibration_inventory": "inspect_navigation_calibration_inventory_tool",
+    "localization_sources": "inspect_navigation_localization_sources_tool",
+}
+_COGNITIVE_TOOL_NAMES = {
+    "get_phase_planning_context_tool",
+    "list_observation_evidence_tool",
+    "read_observation_evidence_tool",
+    "describe_processing_action_tool",
+}
+
+
+def _compact_task_tools(
+    *,
+    services: NavigationServices,
+    agentscope_session_id: str,
+    web_session_id: str | None,
+) -> list[ToolBase]:
+    tools = build_navigation_task_tools(
+        store=services.task_store,
+        session_id=agentscope_session_id,
+        web_session_id=web_session_id,
+        settings=services.settings,
+    )
+    return [tool for tool in tools if tool.name == "get_or_create_navigation_task_tool"]
+
+
+def _durable_state_tools(
+    *,
+    services: NavigationServices,
+    task: Any,
+) -> list[ToolBase]:
+    def get_navigation_task_state_tool() -> dict[str, Any]:
+        """Return the compact authoritative state of the bound navigation task."""
+        current = services.task_store.get_task(task.task_id)
+        if current is None:
+            return {"ok": False, "error_type": "navigation_task_not_found"}
+        return {
+            "ok": True,
+            "task_id": current.task_id,
+            "phase": current.phase.value,
+            "status": current.status.value,
+        }
+
+    def list_navigation_task_evidence_tool(
+        cursor: int = 0,
+        limit: int = 20,
+    ) -> dict[str, Any]:
+        """List compact evidence descriptors owned by the bound completed task."""
+        if limit < 1 or limit > 50:
+            raise ValueError("limit must be between 1 and 50")
+        rows = services.observation_store.list_evidence(
+            task.task_id,
+            cursor=cursor,
+            limit=limit + 1,
+        )
+        result: dict[str, Any] = {"evidence": [], "next_cursor": None}
+        for row in rows[:limit]:
+            evidence = [*result["evidence"], row.model_dump(mode="json")]
+            candidate = {
+                "evidence": evidence,
+                "next_cursor": (
+                    cursor + len(evidence) if len(rows) > len(evidence) else None
+                ),
+            }
+            if serialized_chars(candidate) > 4_000:
+                break
+            result = candidate
+        if rows and not result["evidence"]:
+            raise ValueError("first evidence descriptor exceeds response character budget")
+        return ensure_payload_within_limit(
+            result,
+            max_chars=4_000,
+            label="completed_navigation_evidence_list",
+        )
+
+    def read_navigation_task_evidence_tool(
+        ref: str,
+        fields: list[str] | None = None,
+        cursor: int = 0,
+        limit: int = 50,
+    ) -> dict[str, Any]:
+        """Read bounded evidence owned by the bound completed task."""
+        result = services.evidence_store.read(
+            task.task_id,
+            ref,
+            fields=fields,
+            cursor=cursor,
+            limit=limit,
+        )
+        return ensure_payload_within_limit(
+            result,
+            max_chars=4_000,
+            label="completed_navigation_evidence_read",
+        )
+
+    return [
+        FunctionTool(get_navigation_task_state_tool, is_read_only=True),
+        FunctionTool(list_navigation_task_evidence_tool, is_read_only=True),
+        FunctionTool(read_navigation_task_evidence_tool, is_read_only=True),
+    ]
+
+
+def _execution_state_tools(
+    *,
+    services: NavigationServices,
+    task: Any,
+    plan: Any,
+) -> list[ToolBase]:
+    def get_plan_execution_overview_tool(plan_id: str) -> dict[str, Any]:
+        """Read the compact execution overview for the bound active plan."""
+        if plan_id != plan.plan_id:
+            return {"ok": False, "error_type": "inactive_navigation_plan"}
+        return ensure_payload_within_limit(
+            services.plan_store.get_execution_overview(plan_id).model_dump(mode="json"),
+            max_chars=4_000,
+            label="resolved_execution_overview",
+        )
+
+    def get_current_plan_step_tool(plan_id: str) -> dict[str, Any] | None:
+        """Read the current step and concise decision refs for the bound active plan."""
+        if plan_id != plan.plan_id:
+            return {"ok": False, "error_type": "inactive_navigation_plan"}
+        current = services.plan_store.get_current_step(plan_id)
+        if current is None:
+            return None
+        return ensure_payload_within_limit(
+            current,
+            max_chars=4_000,
+            label="resolved_current_plan_step",
+        )
+
+    return [
+        FunctionTool(get_plan_execution_overview_tool, is_read_only=True),
+        FunctionTool(get_current_plan_step_tool, is_read_only=True),
+    ]
+
+
+def resolve_navigation_agent_tools(
+    *,
+    services: NavigationServices,
+    agentscope_session_id: str,
+    cancellation: CancellationContext | None,
+    web_session_id: str | None = None,
+) -> list[ToolBase]:
+    """Resolve the minimal AgentScope toolkit from authoritative durable state."""
+    if web_session_id is not None and not (
+        agentscope_session_id == web_session_id
+        or agentscope_session_id.startswith(f"{web_session_id}__")
+    ):
+        return []
+    task = services.task_store.find_latest_by_agentscope_session(agentscope_session_id)
+    if task is None:
+        return _trust_internal_navigation_tools(
+            _compact_task_tools(
+                services=services,
+                agentscope_session_id=agentscope_session_id,
+                web_session_id=web_session_id,
+            )
+        )
+
+    reconciled = reconcile_navigation_task(task, settings=services.settings)
+    changes = reconciled.model_dump(mode="json")
+    changes.pop("task_id", None)
+    task = services.task_store.update_task(task.task_id, **changes)
+
+    if task.phase.value == "completed" or task.status.value == "completed":
+        return _trust_internal_navigation_tools(
+            _durable_state_tools(services=services, task=task)
+        )
+
+    if task.phase.value not in PHASE_REQUIRED_OBSERVATIONS:
+        task_tools = build_navigation_task_tools(
+            store=services.task_store,
+            session_id=agentscope_session_id,
+            web_session_id=task.latest_web_session_id,
+            settings=services.settings,
+        )
+        allowed = {
+            "get_or_create_navigation_task_tool",
+            "reconcile_navigation_task_tool",
+            "update_navigation_task_scene_mode_tool",
+        }
+        return _trust_internal_navigation_tools(
+            [tool for tool in task_tools if tool.name in allowed]
+        )
+
+    observation = services.observation_store.latest(task.task_id)
+    completed = (
+        set(observation.completed_kinds)
+        if observation is not None and observation.phase.value == task.phase.value
+        else set()
+    )
+    required = PHASE_REQUIRED_OBSERVATIONS[task.phase.value]
+    missing = [kind for kind in required if kind not in completed]
+    observation_tools = build_navigation_observation_tools(
+        task=task,
+        observation_store=services.observation_store,
+        evidence_store=services.evidence_store,
+        settings=services.settings,
+    )
+    cognitive = [tool for tool in observation_tools if tool.name in _COGNITIVE_TOOL_NAMES]
+
+    active_plan = services.plan_store.get_active(task.task_id, task.phase.value)
+    if active_plan is not None:
+        execution_tools = build_plan_bound_execution_tools(
+            task=task,
+            plan_store=services.plan_store,
+            evidence_store=services.evidence_store,
+            settings=services.settings,
+            dry_run=task.dry_run,
+            cancellation=cancellation,
+        )
+        current = services.plan_store.get_current_step(active_plan.plan_id)
+        current_step = (current or {}).get("step") or {}
+        if current_step.get("action") == "confirm_navigation_calibration_params":
+            handoff = services.plan_store.get_human_decision_handoff(
+                active_plan.plan_id,
+                current_step.get("step_id", ""),
+            )
+            if handoff is not None and handoff.status == "recovery_required":
+                execution_tools = [
+                    tool
+                    for tool in execution_tools
+                    if tool.name != "request_human_decision"
+                ]
+        tools = [
+            *_execution_state_tools(
+                services=services,
+                task=task,
+                plan=active_plan,
+            ),
+            *execution_tools,
+        ]
+        return _trust_internal_navigation_tools(tools)
+
+    if missing:
+        missing_names = {_INSPECTION_TOOL_BY_KIND[kind] for kind in missing}
+        inspections = [tool for tool in observation_tools if tool.name in missing_names]
+        return _trust_internal_navigation_tools([*inspections, *cognitive])
+
+    submission = build_navigation_plan_submission_tools(
+        task=task,
+        observation_store=services.observation_store,
+        evidence_store=services.evidence_store,
+        plan_store=services.plan_store,
+        capabilities=list_navigation_tool_capabilities(),
+    )
+    return _trust_internal_navigation_tools([*cognitive, *submission])

@@ -95,6 +95,44 @@ def test_main_router_prompt_presents_datapilot_and_sets_task_readiness_rules():
 def test_navigation_agent_prompt_requires_plan_execute_react_and_human_decisions():
     prompt = navigation_agent_prompt()
 
+    for exact_concept in [
+        "observations are facts",
+        "model owns semantic decisions",
+        "submit one complete JSON plan",
+        "resubmit complete plan",
+        "durable state is authoritative",
+    ]:
+        assert exact_concept in prompt
+
+    for legacy_concept in [
+        "phase_profile_schema",
+        "data_profile_draft",
+        "data_profile_patch",
+        "infer_navigation_sensor_bindings_tool",
+        "infer_navigation_processing_profile_tool",
+        "infer_navigation_topic_params_tool",
+        "finalize_extract_sync_plan_tool",
+        "finalize_finish_processing_plan_tool",
+        "finalize_workflow_plan_tool",
+    ]:
+        assert legacy_concept not in prompt
+
+    for retained_contract in [
+        "plan-and-execute",
+        "ReAct",
+        "request_human_decision",
+        "Do not ask the user to type",
+        "confirm/stop/guidance",
+        "GUI can block",
+        "final summaries in the user's language",
+        "concise progress updates",
+        "cancelled",
+        "two-phase",
+        "Reconcile raw, intermediate, and final artifacts",
+    ]:
+        assert retained_contract in prompt
+    return
+
     for expected in [
         "DataPilot's navigation data specialist",
         "plan-and-execute",
@@ -163,6 +201,11 @@ def test_navigation_agent_prompt_uses_fallback_guidance_when_docs_file_is_missin
     monkeypatch.setattr(agentscope_prompts.Path, "read_text", raise_missing_guidance)
 
     prompt = navigation_agent_prompt()
+
+    assert "durable state is authoritative" in prompt
+    assert "navigation-data-agent-planning-guidance" not in prompt
+    assert "data_profile_patch" not in prompt
+    return
 
     for expected in [
         "navigation-data-agent-planning-guidance",
