@@ -7,6 +7,10 @@ from typing import Any, Protocol
 
 from pydantic import TypeAdapter
 
+from vla_data_juicer_agents.navigation.aggregate_revision import (
+    ensure_navigation_aggregate_revision_triggers,
+)
+
 from vla_data_juicer_agents.navigation.observation_models import (
     EvidenceDescriptor,
     EvidenceWrite,
@@ -97,6 +101,7 @@ class SqliteNavigationObservationStore:
                 ON navigation_evidence (task_id, observation_revision, kind)
                 """
             )
+            ensure_navigation_aggregate_revision_triggers(connection)
 
     def append(
         self,

@@ -269,7 +269,7 @@ def prepare_navigation_task_entry(
             evidence_store,
             **observation_fence,
         )
-        return saved
+        return task_store.get_task(saved.task_id) or saved
     except Exception as entry_error:
         try:
             if task is None:

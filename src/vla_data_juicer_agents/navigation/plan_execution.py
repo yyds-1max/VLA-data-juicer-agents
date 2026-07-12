@@ -48,7 +48,11 @@ from vla_data_juicer_agents.navigation.task_reconciliation import (
     reconcile_navigation_task,
 )
 from vla_data_juicer_agents.navigation.task_state import NavigationTask
-from vla_data_juicer_agents.navigation.task_store import SqliteNavigationTaskStore
+from vla_data_juicer_agents.navigation.task_store import (
+    NavigationTaskOwnershipError,
+    NavigationTaskStateRevisionError,
+    SqliteNavigationTaskStore,
+)
 
 
 _PROCESSING_ACTIONS = {
@@ -220,7 +224,16 @@ def resolve_step_arguments(
 
 def _task_changes(task: NavigationTask) -> dict[str, Any]:
     changes = task.model_dump(mode="json")
-    changes.pop("task_id", None)
+    for field in {
+        "task_id",
+        "created_by_web_session_id",
+        "latest_web_session_id",
+        "agentscope_session_id",
+        "created_at",
+        "updated_at",
+        "state_revision",
+    }:
+        changes.pop(field, None)
     return changes
 
 
@@ -267,10 +280,23 @@ def _reconcile_execution_entry(
         snapshot = build_navigation_artifact_snapshot(
             stored.date, stored.segments, settings=settings
         )
-        return task_store.update_task(
-            stored.task_id,
-            artifact_snapshot=snapshot.model_dump(mode="json"),
-        ), None
+        changes = {"artifact_snapshot": snapshot.model_dump(mode="json")}
+        try:
+            updated = task_store.update_task_for_session(
+                stored.task_id,
+                web_session_id=expected_web_session_id,
+                agentscope_session_id=expected_agentscope_session_id,
+                expected_state_revision=stored.state_revision,
+                **changes,
+            )
+        except (NavigationTaskOwnershipError, NavigationTaskStateRevisionError):
+            current = task_store.get_task(stored.task_id) or stored
+            return current, _compact_error(
+                "navigation_task_state_stale",
+                "The task changed while execution artifacts were reconciled.",
+                next_action="reload_active_plan",
+            )
+        return updated, None
     live = reconcile_navigation_task(stored, settings=settings)
     invalid_plans: list[NavigationPlanRecord] = []
     for active_plan in active_plans:
@@ -321,7 +347,22 @@ def _reconcile_execution_entry(
     )
     if has_any_staged_result:
         return stored, None
-    return task_store.update_task(stored.task_id, **_task_changes(live)), None
+    try:
+        updated = task_store.update_task_for_session(
+            stored.task_id,
+            web_session_id=expected_web_session_id,
+            agentscope_session_id=expected_agentscope_session_id,
+            expected_state_revision=stored.state_revision,
+            **_task_changes(live),
+        )
+    except (NavigationTaskOwnershipError, NavigationTaskStateRevisionError):
+        current = task_store.get_task(stored.task_id) or stored
+        return current, _compact_error(
+            "navigation_task_state_stale",
+            "The task changed while execution artifacts were reconciled.",
+            next_action="reload_active_plan",
+        )
+    return updated, None
 
 
 def _plan_step(plan: NavigationPlanRecord, step_id: str) -> Any | None:

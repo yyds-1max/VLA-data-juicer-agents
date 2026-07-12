@@ -6,6 +6,10 @@ from pathlib import Path
 from typing import Any, Protocol
 from uuid import uuid4
 
+from vla_data_juicer_agents.navigation.aggregate_revision import (
+    ensure_navigation_aggregate_revision_triggers,
+)
+
 from vla_data_juicer_agents.navigation.task_state import (
     TASK_SCHEMA_VERSION,
     NavigationArtifactSnapshot,
@@ -129,6 +133,10 @@ class NavigationTaskOwnershipError(PermissionError):
         self.expected_web_session_id = expected_web_session_id
         self.requested_web_session_id = requested_web_session_id
         super().__init__("navigation task belongs to another Web session")
+
+
+class NavigationTaskStateRevisionError(RuntimeError):
+    pass
 
 
 class NavigationTaskStore(Protocol):
@@ -257,6 +265,7 @@ class SqliteNavigationTaskStore:
                 """
             )
             ensure_navigation_task_step_ledger_columns(connection)
+            ensure_navigation_aggregate_revision_triggers(connection)
 
     def _migrate_task_entry_fields(self, connection: sqlite3.Connection) -> None:
         columns = {
@@ -473,27 +482,32 @@ class SqliteNavigationTaskStore:
         return [self._task_from_row(row) for row in rows]
 
     def update_task(self, task_id: str, **changes: Any) -> NavigationTask:
-        current = self.get_task(task_id)
-        if current is None:
-            raise KeyError(task_id)
-        payload = current.model_dump(mode="json")
-        payload.update(changes)
-        if "segments" in payload:
-            payload["segments"] = normalize_segments(payload["segments"])
-        payload["created_at"] = current.created_at
-        payload["updated_at"] = utc_now()
-        payload["state_revision"] = current.state_revision + 1
-        task = NavigationTask.model_validate(payload)
-        with self._connect() as connection:
+        connection = self._connect()
+        try:
+            connection.execute("BEGIN IMMEDIATE")
+            row = connection.execute(
+                "SELECT * FROM navigation_tasks WHERE task_id = ?", (task_id,)
+            ).fetchone()
+            if row is None:
+                raise KeyError(task_id)
+            current = self._task_from_row(row)
+            task = self._merged_task(current, changes)
             self._update_task(connection, task)
-        return task
+            connection.commit()
+            return task
+        except Exception:
+            connection.rollback()
+            raise
+        finally:
+            connection.close()
 
     def update_task_for_session(
         self,
         task_id: str,
         *,
         web_session_id: str | None,
-        agentscope_session_id: str,
+        agentscope_session_id: str | None,
+        expected_state_revision: int | None = None,
         **changes: Any,
     ) -> NavigationTask:
         """Atomically authorize the current session pair and update one task."""
@@ -514,7 +528,7 @@ class SqliteNavigationTaskStore:
             if row is None:
                 raise KeyError(task_id)
             current = self._task_from_row(row)
-            if (
+            if agentscope_session_id is not None and (
                 current.created_by_web_session_id != web_session_id
                 or current.latest_web_session_id != web_session_id
                 or current.agentscope_session_id != agentscope_session_id
@@ -524,14 +538,14 @@ class SqliteNavigationTaskStore:
                     expected_web_session_id=current.created_by_web_session_id or "",
                     requested_web_session_id=web_session_id,
                 )
-            payload = current.model_dump(mode="json")
-            payload.update(changes)
-            if "segments" in payload:
-                payload["segments"] = normalize_segments(payload["segments"])
-            payload["created_at"] = current.created_at
-            payload["updated_at"] = utc_now()
-            payload["state_revision"] = current.state_revision + 1
-            task = NavigationTask.model_validate(payload)
+            if (
+                expected_state_revision is not None
+                and current.state_revision != expected_state_revision
+            ):
+                raise NavigationTaskStateRevisionError(
+                    "navigation task state revision changed"
+                )
+            task = self._merged_task(current, changes)
             self._update_task(connection, task)
             connection.commit()
             return task
@@ -540,6 +554,17 @@ class SqliteNavigationTaskStore:
             raise
         finally:
             connection.close()
+
+    @staticmethod
+    def _merged_task(current: NavigationTask, changes: dict[str, Any]) -> NavigationTask:
+        payload = current.model_dump(mode="json")
+        payload.update(changes)
+        if "segments" in payload:
+            payload["segments"] = normalize_segments(payload["segments"])
+        payload["created_at"] = current.created_at
+        payload["updated_at"] = utc_now()
+        payload["state_revision"] = current.state_revision + 1
+        return NavigationTask.model_validate(payload)
 
     def restore_task_exact(self, task: NavigationTask) -> NavigationTask:
         current = self.get_task(task.task_id)
@@ -656,12 +681,6 @@ class SqliteNavigationTaskStore:
                     step.finished_at,
                 ),
             )
-            connection.execute(
-                """UPDATE navigation_tasks
-                   SET state_revision = state_revision + 1
-                   WHERE task_id = ?""",
-                (task_id,),
-            )
         return step
 
     def record_step_for_session(
@@ -718,12 +737,6 @@ class SqliteNavigationTaskStore:
                     step.started_at,
                     step.finished_at,
                 ),
-            )
-            connection.execute(
-                """UPDATE navigation_tasks
-                   SET state_revision = state_revision + 1
-                   WHERE task_id = ?""",
-                (step.task_id,),
             )
             connection.commit()
             return step

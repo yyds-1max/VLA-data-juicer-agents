@@ -299,10 +299,11 @@ def test_repository_backfills_legacy_null_result_ref_and_lazy_recovers(tmp_path:
 def test_step_ledger_transitions_increment_task_state_revision(tmp_path: Path):
     repo, task = stores_with_task(tmp_path)
     plan = repo.activate(task, "extract_sync", 1, valid_extract_plan())
+    after_activation = SqliteNavigationTaskStore(repo.db_path).get_task(task.task_id)
 
     assert repo.claim_step(plan.plan_id, "prepare", "prepare_raw_data")
     after_claim = SqliteNavigationTaskStore(repo.db_path).get_task(task.task_id)
-    assert after_claim.state_revision == task.state_revision + 1
+    assert after_claim.state_revision == after_activation.state_revision + 1
 
     repo.stage_step_result(
         plan.plan_id,
@@ -311,9 +312,11 @@ def test_step_ledger_transitions_increment_task_state_revision(tmp_path: Path):
         full_result={"message": "done", "ok": True, "tool_name": "prepare_raw_data"},
         result_summary={"message": "done", "ok": True, "tool_name": "prepare_raw_data"},
     )
+    after_stage = SqliteNavigationTaskStore(repo.db_path).get_task(task.task_id)
+    assert after_stage.state_revision == after_claim.state_revision + 1
     assert repo.finalize_staged_step(plan.plan_id, "prepare")
     after_finalize = SqliteNavigationTaskStore(repo.db_path).get_task(task.task_id)
-    assert after_finalize.state_revision == after_claim.state_revision + 1
+    assert after_finalize.state_revision == after_stage.state_revision + 2
 
     assert repo.mark_waiting_user(
         plan.plan_id, "sync", "extract_and_sync_navigation_data"
@@ -387,7 +390,10 @@ def test_record_attempt_is_audit_only_and_preserves_full_failure(tmp_path: Path)
         created_at="2026-07-10T12:00:00.000+00:00",
     )
 
+    before_attempt = SqliteNavigationTaskStore(repo.db_path).get_task(task.task_id)
     assert repo.record_attempt(attempt) == attempt
+    after_attempt = SqliteNavigationTaskStore(repo.db_path).get_task(task.task_id)
+    assert after_attempt.state_revision == before_attempt.state_revision + 1
 
     with sqlite3.connect(repo.db_path) as connection:
         row = connection.execute(
@@ -406,13 +412,17 @@ def test_activation_creates_immutable_revisions_and_supersedes_previous(tmp_path
     first_plan = valid_extract_plan()
     first = repo.activate(task, "extract_sync", 1, first_plan)
     first_json = first.plan.model_dump_json()
+    after_first = SqliteNavigationTaskStore(repo.db_path).get_task(task.task_id)
     second = repo.activate(task, "extract_sync", 2, valid_extract_plan())
+    after_second = SqliteNavigationTaskStore(repo.db_path).get_task(task.task_id)
 
     assert (first.plan_revision, second.plan_revision) == (1, 2)
     assert repo.get(first.plan_id).status == "superseded"
     assert repo.get(first.plan_id).plan.model_dump_json() == first_json
     assert repo.get(second.plan_id).status == "active"
     assert repo.get_active(task.task_id, "extract_sync").plan_id == second.plan_id
+    assert after_first.state_revision > task.state_revision
+    assert after_second.state_revision > after_first.state_revision
 
 
 @pytest.mark.parametrize("in_flight_status", ["running", "waiting_user"])

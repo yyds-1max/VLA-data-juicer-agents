@@ -585,3 +585,53 @@ def test_prepare_task_entry_removes_new_task_when_evidence_append_fails(tmp_path
         )
 
     assert task_store.find_latest_by_date("20270623", ["segment_a"]) is None
+
+
+def test_task_entry_post_commit_append_error_keeps_aggregate_and_retry_recovers(
+    tmp_path: Path,
+):
+    root = tmp_path / "VLADatasets"
+    (root / "raw_data" / "20270623" / "segment_a").mkdir(parents=True)
+    db_path = tmp_path / "navigation.sqlite"
+    task_store = SqliteNavigationTaskStore(db_path)
+    observation_store = SqliteNavigationObservationStore(db_path)
+    evidence_store = FileNavigationEvidenceStore(tmp_path / "evidence")
+
+    class PostCommitErrorObservationStore:
+        db_path = observation_store.db_path
+
+        def append(self, *args, **kwargs):
+            observation_store.append(*args, **kwargs)
+            raise RuntimeError("post-commit transport failure")
+
+    message = "\n".join([
+        "Structured handoff JSON:",
+        '{"date":"20270623","segments":["segment_a"],"request":"go"}',
+    ])
+    with pytest.raises(RuntimeError, match="post-commit transport failure") as error:
+        task_reconciliation_module.prepare_navigation_task_entry(
+            task_store=task_store,
+            observation_store=PostCommitErrorObservationStore(),
+            evidence_store=evidence_store,
+            message=message,
+            web_session_id="web-owner",
+            agentscope_session_id="as-owner",
+            settings=NavigationSettings(vladatasets_root=root),
+        )
+
+    task = task_store.find_latest_by_date("20270623", ["segment_a"])
+    assert task is not None
+    assert observation_store.latest(task.task_id) is not None
+    assert any("compensation skipped" in note for note in error.value.__notes__)
+
+    retried = task_reconciliation_module.prepare_navigation_task_entry(
+        task_store=task_store,
+        observation_store=observation_store,
+        evidence_store=evidence_store,
+        message=message,
+        web_session_id="web-owner",
+        agentscope_session_id="as-owner",
+        settings=NavigationSettings(vladatasets_root=root),
+    )
+    assert retried.state_revision == task_store.get_task(task.task_id).state_revision
+    assert observation_store.latest(task.task_id).revision == 2

@@ -14,6 +14,7 @@ from vla_data_juicer_agents.navigation.observation_store import (
     ObservationRollbackCleanupError,
     SqliteNavigationObservationStore,
 )
+from vla_data_juicer_agents.navigation.task_store import SqliteNavigationTaskStore
 
 
 def _raw_observation() -> RawMetadataObservation:
@@ -93,6 +94,53 @@ def test_append_persists_evidence_metadata_and_filters_by_task_kind_and_revision
     assert [item.ref for item in revision_one_metadata] == first.evidence_refs
     assert store.list_evidence("nav-2") == []
     assert evidence.read("nav-1", first.evidence_refs[0])["data"] == {"rows": [1, 2, 3]}
+
+
+def test_observation_and_evidence_commits_advance_task_aggregate_revision(tmp_path):
+    db_path = tmp_path / "state.sqlite"
+    task_store = SqliteNavigationTaskStore(db_path)
+    task = task_store.create_or_update_task(
+        date="20260710", segments=["20260710_120000"], scene_mode=None,
+    )
+    store = SqliteNavigationObservationStore(db_path)
+    evidence = FileNavigationEvidenceStore(tmp_path / "evidence")
+
+    store.append(
+        task.task_id,
+        "extract_sync",
+        "raw_metadata",
+        [_raw_observation()],
+        [EvidenceWrite(
+            kind="raw_metadata",
+            source_tool="inspect_raw_date_tool",
+            payload={"rows": [1]},
+            summary="one raw row",
+        )],
+        evidence,
+    )
+
+    current = task_store.get_task(task.task_id)
+    assert current.state_revision == task.state_revision + 2
+
+
+def test_task_initializer_installs_triggers_for_preexisting_observation_tables(tmp_path):
+    db_path = tmp_path / "state.sqlite"
+    store = SqliteNavigationObservationStore(db_path)
+    task_store = SqliteNavigationTaskStore(db_path)
+    task = task_store.create_or_update_task(
+        date="20260710", segments=["20260710_120000"], scene_mode=None,
+    )
+
+    store.append(
+        task.task_id,
+        "extract_sync",
+        "raw_metadata",
+        [_raw_observation()],
+        [],
+        FileNavigationEvidenceStore(tmp_path / "evidence"),
+    )
+
+    assert task_store.get_task(task.task_id).state_revision == task.state_revision + 1
 
 
 def test_append_rolls_back_database_and_written_evidence_on_failure(tmp_path):

@@ -270,6 +270,39 @@ def test_task_store_update_task_ignores_caller_timestamps(monkeypatch, tmp_path:
     assert updated.updated_at == "2026-07-10T00:00:01.000+00:00"
 
 
+def test_update_task_serializes_same_timestamp_read_merge_write(monkeypatch, tmp_path: Path):
+    monkeypatch.setattr(task_store_module, "utc_now", lambda: "2026-07-10T00:00:00+00:00")
+    store = SqliteNavigationTaskStore(tmp_path / "navigation_tasks.sqlite")
+    original = store.create_or_update_task(
+        date="20270623", segments=None, scene_mode=None,
+    )
+    barrier = Barrier(2)
+    original_get_task = store.get_task
+
+    def synchronized_get_task(task_id: str):
+        task = original_get_task(task_id)
+        barrier.wait()
+        return task
+
+    monkeypatch.setattr(store, "get_task", synchronized_get_task)
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        futures = [
+            executor.submit(store.update_task, original.task_id, scene_mode="in"),
+            executor.submit(
+                store.update_task,
+                original.task_id,
+                guidance_revision=7,
+            ),
+        ]
+        revisions = sorted(future.result().state_revision for future in futures)
+
+    current = original_get_task(original.task_id)
+    assert revisions == [original.state_revision + 1, original.state_revision + 2]
+    assert current.state_revision == original.state_revision + 2
+    assert current.scene_mode == "in"
+    assert current.guidance_revision == 7
+
+
 def test_task_store_keeps_one_active_task_per_date_and_segments_key(tmp_path: Path):
     store = SqliteNavigationTaskStore(tmp_path / "navigation_tasks.sqlite")
 

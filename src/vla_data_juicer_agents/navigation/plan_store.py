@@ -11,6 +11,10 @@ from uuid import uuid4
 
 from pydantic import BaseModel, ConfigDict
 
+from vla_data_juicer_agents.navigation.aggregate_revision import (
+    ensure_navigation_aggregate_revision_triggers,
+)
+
 from vla_data_juicer_agents.navigation.plan_models import (
     ExecutionStepRecord,
     ExtractSyncPlanInput,
@@ -252,6 +256,7 @@ class SqliteNavigationPlanRepository:
                 ON navigation_plan_submission_attempts (task_id, phase, created_at)
                 """
             )
+            ensure_navigation_aggregate_revision_triggers(connection)
 
     @staticmethod
     def _ensure_handoff_recovery_schema(connection: sqlite3.Connection) -> None:
@@ -715,15 +720,6 @@ class SqliteNavigationPlanRepository:
                     expected_agentscope_session_id,
                 ),
             )
-            if cursor.rowcount == 1:
-                connection.execute(
-                    """UPDATE navigation_tasks
-                       SET state_revision = state_revision + 1
-                       WHERE task_id = (
-                           SELECT task_id FROM navigation_plans WHERE plan_id = ?
-                       )""",
-                    (plan_id,),
-                )
         return cursor.rowcount == 1
 
     def mark_waiting_user(
@@ -764,15 +760,6 @@ class SqliteNavigationPlanRepository:
                     expected_agentscope_session_id,
                 ),
             )
-            if cursor.rowcount == 1:
-                connection.execute(
-                    """UPDATE navigation_tasks
-                       SET state_revision = state_revision + 1
-                       WHERE task_id = (
-                           SELECT task_id FROM navigation_plans WHERE plan_id = ?
-                       )""",
-                    (plan_id,),
-                )
         return cursor.rowcount == 1
 
     def stage_step_result(
@@ -969,12 +956,6 @@ class SqliteNavigationPlanRepository:
             if cursor.rowcount != 1:
                 connection.rollback()
                 return False
-            connection.execute(
-                """UPDATE navigation_tasks
-                   SET state_revision = state_revision + 1
-                   WHERE task_id = ?""",
-                (staged.task_id,),
-            )
             if staged.target_status == "completed":
                 remaining = connection.execute(
                     """

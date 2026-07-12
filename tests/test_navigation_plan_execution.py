@@ -556,6 +556,63 @@ def test_stale_agentscope_session_cannot_claim_plan_bound_step(monkeypatch, tmp_
     assert services.plan_store.get_current_step(services.plan.plan_id)["step"]["status"] == "pending"
 
 
+def test_execution_reconcile_cannot_overwrite_same_owner_rebind(monkeypatch, tmp_path):
+    services = build_services(tmp_path)
+    bound = services.task_store.update_task(
+        services.task.task_id,
+        created_by_web_session_id="web-owner",
+        latest_web_session_id="web-owner",
+        agentscope_session_id="as-old",
+    )
+    invoked = []
+
+    def reconcile_after_rebind(task, *, settings):
+        services.task_store.create_or_update_task(
+            date=task.date,
+            segments=task.segments,
+            scene_mode=task.scene_mode,
+            dry_run=task.dry_run,
+            web_session_id="web-owner",
+            agentscope_session_id="as-new",
+        )
+        return task
+
+    monkeypatch.setattr(plan_execution, "reconcile_navigation_task", reconcile_after_rebind)
+    monkeypatch.setattr(
+        plan_execution,
+        "extract_and_sync_navigation_data",
+        lambda **kwargs: invoked.append(kwargs) or ok_result("extract_and_sync_navigation_data"),
+    )
+    tools = {
+        tool.name: tool
+        for tool in plan_execution.build_plan_bound_execution_tools(
+            task=bound,
+            plan_store=services.plan_store,
+            evidence_store=services.evidence_store,
+            settings=services.settings,
+            dry_run=True,
+            cancellation=None,
+            web_session_id="web-owner",
+            agentscope_session_id="as-old",
+        )
+    }
+
+    result = call_tool(
+        tools["extract_and_sync_navigation_data_tool"],
+        plan_id=services.plan.plan_id,
+        step_id="sync",
+    )
+
+    assert result["error_type"] in {
+        "navigation_task_session_mismatch",
+        "navigation_task_state_stale",
+    }
+    assert invoked == []
+    current = services.task_store.get_task(bound.task_id)
+    assert current.agentscope_session_id == "as-new"
+    assert services.plan_store.get_current_step(services.plan.plan_id)["step"]["status"] == "pending"
+
+
 def test_superseded_plan_cannot_claim_pending_step(tmp_path):
     services = build_services(tmp_path)
     old_plan = services.plan
