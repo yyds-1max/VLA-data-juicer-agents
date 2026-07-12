@@ -2,7 +2,7 @@ import asyncio
 
 import pytest
 
-from vla_data_juicer_agents.navigation.models import NavigationRequest, WorkflowPlan, WorkflowStep
+from vla_data_juicer_agents.navigation.models import NavigationRequest
 from vla_data_juicer_agents.navigation.run_state import WorkflowRunStore
 from vla_data_juicer_agents.tools.vla.run_workflow import RunVLAWorkflowInput, run_vla_workflow
 
@@ -10,17 +10,11 @@ from vla_data_juicer_agents.tools.vla.run_workflow import RunVLAWorkflowInput, r
 def test_workflow_run_store_writes_request_and_plan(tmp_path):
     store = WorkflowRunStore(root=tmp_path)
     request = NavigationRequest(date="20270605", scene_mode="out")
-    plan = WorkflowPlan(
-        date="20270605",
-        scene_mode="out",
-        processing_profile="parameterized_navigation_v1",
-        platform_hint="go2w",
-        steps=[WorkflowStep(step_id="prepare", tool_name="prepare_raw_data")],
-    )
+    plan = {"plan_id": "plan-1", "phase": "extract_sync", "status": "active"}
 
     run_dir = store.create_run("20270605")
     store.write_json(run_dir, "request.json", request.model_dump(mode="json"))
-    store.write_json(run_dir, "plan.json", plan.model_dump(mode="json"))
+    store.write_json(run_dir, "plan.json", plan)
 
     assert (run_dir / "request.json").exists()
     assert (run_dir / "plan.json").exists()

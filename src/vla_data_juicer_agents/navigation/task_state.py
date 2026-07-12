@@ -9,7 +9,7 @@ from pydantic import BaseModel, Field, field_validator
 from vla_data_juicer_agents.navigation.models import _validate_date
 
 
-TASK_SCHEMA_VERSION = 1
+TASK_SCHEMA_VERSION = 2
 
 
 def utc_now() -> str:
@@ -82,7 +82,6 @@ class NavigationTask(BaseModel):
     agentscope_session_id: str | None = None
     latest_run_id: str | None = None
     last_completed_step: str | None = None
-    data_profile: dict[str, Any] | None = None
     artifact_snapshot: NavigationArtifactSnapshot | None = None
     drift: NavigationTaskDrift | None = None
     schema_version: int = TASK_SCHEMA_VERSION

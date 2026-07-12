@@ -10,11 +10,16 @@ from pydantic import BaseModel, Field
 from vla_data_juicer_agents.core.cancellation import CancellationContext, TurnCancelled
 from vla_data_juicer_agents.core.events import EventEmitter, JsonlEventSink
 from vla_data_juicer_agents.core.tool import ToolContext, ToolSpec
-from vla_data_juicer_agents.navigation.agents import create_executor_agent, create_plan_agent
+from vla_data_juicer_agents.navigation.agents import create_executor_agent
+from vla_data_juicer_agents.navigation.agent_tools import resolve_navigation_agent_tools
 from vla_data_juicer_agents.navigation.config import NavigationSettings
 from vla_data_juicer_agents.navigation.models import NavigationRequest
 from vla_data_juicer_agents.navigation.run_state import WorkflowRunStore
-from vla_data_juicer_agents.navigation.workflow import run_executor_agent, run_plan_agent
+from vla_data_juicer_agents.navigation.workflow import (
+    prepare_direct_navigation_entry,
+    run_direct_plan_until_submitted,
+    run_executor_agent,
+)
 
 _CALIBRATION_CONFIRMATION_PAUSE_TOKEN = "calibration_params_not_confirmed"
 _CJK_LANGUAGE_RE = r"[\u3400-\u4dbf\u4e00-\u9fff]"
@@ -238,10 +243,22 @@ async def run_vla_workflow(ctx: ToolContext, raw_args: RunVLAWorkflowInput | dic
 
     try:
         cancellation.raise_if_cancelled()
-        plan_agent = create_plan_agent(model=model, request=request)
-        plan = await run_plan_agent(
-            plan_agent,
-            request,
+        session_id = f"direct__{run_dir.name}"
+        services, task = prepare_direct_navigation_entry(
+            run_dir=run_dir,
+            request=request,
+            settings=settings,
+            agentscope_session_id=session_id,
+            user_request=_latest_user_message(ctx),
+        )
+        if task.phase.value not in {"extract_sync", "finish_processing"}:
+            raise RuntimeError(f"navigation task is not ready for planning: {task.phase.value}")
+        plan = await run_direct_plan_until_submitted(
+            services=services,
+            task=task,
+            request=request,
+            agentscope_session_id=session_id,
+            model=model,
             run_store=run_store,
             run_dir=run_dir,
             event_scope=plan_scope,
@@ -266,10 +283,18 @@ async def run_vla_workflow(ctx: ToolContext, raw_args: RunVLAWorkflowInput | dic
             model=model,
             dry_run=args.dry_run,
             cancellation=cancellation,
+            tools=resolve_navigation_agent_tools(
+                services=services,
+                agentscope_session_id=session_id,
+                cancellation=cancellation,
+            ),
         )
         final_output = await run_executor_agent(
             executor_agent,
             plan,
+            execution_overview=services.plan_store.get_execution_overview(
+                plan.plan_id
+            ).model_dump(mode="json"),
             run_store=run_store,
             run_dir=run_dir,
             event_scope=executor_scope,

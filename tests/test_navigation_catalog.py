@@ -36,8 +36,6 @@ def test_catalog_marks_effects_and_plan_agent_visibility():
     assert "classify_navigation_dataset" not in capabilities
     assert capabilities["infer_navigation_sensor_bindings"].effects == "read"
     assert capabilities["infer_navigation_sensor_bindings"].plan_agent_allowed is True
-    assert capabilities["infer_navigation_processing_profile"].effects == "read"
-    assert capabilities["infer_navigation_processing_profile"].plan_agent_allowed is True
     assert capabilities["run_tracking"].effects == "execute"
     assert capabilities["run_tracking"].executor_agent_allowed is True
 

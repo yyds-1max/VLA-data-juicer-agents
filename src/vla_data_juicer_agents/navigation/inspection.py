@@ -8,10 +8,6 @@ from agentscope.tool import FunctionTool
 
 from vla_data_juicer_agents.navigation.config import NavigationSettings
 from vla_data_juicer_agents.navigation.models import (
-    NavigationCalibrationPolicy,
-    NavigationGridmapPolicy,
-    NavigationLocalizationPolicy,
-    NavigationProcessingProfile,
     NavigationSensorBinding,
     NavigationSensorBindings,
     NavigationTopicParams,
@@ -524,66 +520,6 @@ def _platform_hint_from_topics(topic_whitelist: list[str]) -> str:
     return "unknown"
 
 
-def infer_navigation_processing_profile(
-    date: str,
-    segments: list[str] | None = None,
-    settings: NavigationSettings | None = None,
-) -> NavigationProcessingProfile:
-    sensor_bindings = infer_navigation_sensor_bindings(date, segments=segments, settings=settings)
-    ordered_bindings = (
-        sensor_bindings.fisheye_front,
-        sensor_bindings.lidar,
-        sensor_bindings.localization,
-    )
-    topic_whitelist = [
-        binding.topic
-        for binding in ordered_bindings
-        if binding is not None and binding.topic is not None
-    ]
-    topic_map = dict(_topic_map_entry(topic) for topic in topic_whitelist)
-    # query_dir is read as tmp_dir/<query_dir> before topic_map remapping, so keep the source key.
-    lidar_query_dir = (
-        _topic_map_entry(sensor_bindings.lidar.topic)[0]
-        if sensor_bindings.lidar is not None and sensor_bindings.lidar.topic is not None
-        else None
-    )
-    platform_hint = _platform_hint_from_topics(topic_whitelist)
-    localization_source = (
-        sensor_bindings.localization.kind
-        if sensor_bindings.localization is not None and sensor_bindings.localization.kind in {"odom", "ins"}
-        else "unknown"
-    )
-    blocking_issues = list(sensor_bindings.blocking_issues)
-
-    return NavigationProcessingProfile(
-        id="parameterized_navigation_v1",
-        platform_hint=platform_hint,
-        sensor_bindings=sensor_bindings,
-        topic_params=NavigationTopicParams(
-            profile_hint=_topic_params_profile_hint(topic_whitelist),
-            confidence=1.0 if not blocking_issues else 0.0,
-            topic_whitelist=topic_whitelist,
-            topic_map=topic_map,
-            query_dir=lidar_query_dir,
-            evidence=list(sensor_bindings.evidence),
-            warnings=list(sensor_bindings.warnings),
-            blocking_issues=blocking_issues,
-        ),
-        localization_policy=NavigationLocalizationPolicy(
-            source=localization_source,
-            conversion="odom_to_ins" if localization_source == "odom" else "none",
-        ),
-        gridmap_policy=NavigationGridmapPolicy(source="generated_from_pcd"),
-        calibration_policy=NavigationCalibrationPolicy(
-            mode="hardcoded_with_user_confirmation",
-            requires_user_confirmation=True,
-        ),
-        warnings=list(sensor_bindings.warnings),
-        blocking_issues=blocking_issues,
-        evidence={"metadata": list(sensor_bindings.evidence)},
-    )
-
-
 def _selected_segment_names(date_root: Path, segments: list[str] | None) -> list[str]:
     if segments is not None:
         return segments
@@ -719,11 +655,6 @@ def _infer_navigation_sensor_bindings_tool(date: str, segments: list[str] | str 
     return infer_navigation_sensor_bindings(date, segments=_normalize_segments(segments)).model_dump(mode="json")
 
 
-def _infer_navigation_processing_profile_tool(date: str, segments: list[str] | str | None = None) -> dict:
-    """Infer processing, localization, calibration, and platform-hint facts from raw metadata topics."""
-    return infer_navigation_processing_profile(date, segments=_normalize_segments(segments)).model_dump(mode="json")
-
-
 def _inspect_processing_state_tool(date: str, segments: list[str] | str | None = None) -> dict:
     """Inspect existing navigation intermediate outputs without modifying data."""
     return inspect_processing_state(date, segments=_normalize_segments(segments))
@@ -748,10 +679,6 @@ infer_navigation_topic_params_tool = _make_function_tool(
 infer_navigation_sensor_bindings_tool = _make_function_tool(
     _infer_navigation_sensor_bindings_tool,
     "infer_navigation_sensor_bindings_tool",
-)
-infer_navigation_processing_profile_tool = _make_function_tool(
-    _infer_navigation_processing_profile_tool,
-    "infer_navigation_processing_profile_tool",
 )
 inspect_processing_state_tool = _make_function_tool(_inspect_processing_state_tool, "inspect_processing_state_tool")
 inspect_gridmap_artifacts_tool = _make_function_tool(_inspect_gridmap_artifacts_tool, "inspect_gridmap_artifacts_tool")

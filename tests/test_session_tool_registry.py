@@ -60,9 +60,8 @@ def test_navigation_execution_tools_do_not_register_calibration_confirmation_too
 
 
 def test_executor_instructions_use_generic_step_to_tool_mapping_for_calibration_confirmation():
-    assert 'same name plus "_tool"' in EXECUTOR_AGENT_INSTRUCTIONS
-    assert "confirm_navigation_calibration_params_tool" not in EXECUTOR_AGENT_INSTRUCTIONS
-    assert "When executing confirm_navigation_calibration_params" in EXECUTOR_AGENT_INSTRUCTIONS
+    assert "plan_id and step_id" in EXECUTOR_AGENT_INSTRUCTIONS
+    assert "Canonical arguments are loaded by code" in EXECUTOR_AGENT_INSTRUCTIONS
 
 
 def test_session_prompt_warns_against_legacy_workflow_control_tools():
@@ -855,593 +854,110 @@ def test_session_outer_tool_events_are_normalized_without_stream_duplicates():
     assert tool_events[1]["payload"]["status"] == "completed"
 
 
-def test_vla_run_workflow_tool_reuses_plan_and_executor_agents(tmp_path, monkeypatch):
-    calls = []
-    events = []
-    emitter = EventEmitter(CallbackEventSink(events.append))
-    parent_scope = emitter.scope("session", run_id="session-run")
-    cancellation = CancellationContext()
-    plan_payload = {
-        "date": "20270605",
-        "processing_profile": "parameterized_navigation_v1",
-        "platform_hint": "go2w",
-        "steps": [],
-    }
-
+def _direct_workflow_fakes(monkeypatch, *, executor_output="done"):
     plan = SimpleNamespace(
-        model_dump=lambda mode="json": plan_payload,
-        model_dump_json=lambda: json.dumps(plan_payload),
+        plan_id="plan-1",
+        plan_revision=1,
+        model_dump=lambda mode="json": {"plan_id": "plan-1", "status": "active"},
     )
-
-    async def fake_run_plan_agent(
-        agent,
-        request,
-        run_store=None,
-        run_dir=None,
-        *,
-        event_scope=None,
-        cancellation=None,
-        response_language=None,
-    ):
-        calls.append(
-            (
-                "plan",
-                agent,
-                request.date,
-                request.segments,
-                request.scene_mode,
-                request.dry_run,
-                bool(run_store),
-                bool(run_dir),
-                event_scope,
-                cancellation,
-                response_language,
-            )
+    plan_store = SimpleNamespace(
+        get_execution_overview=lambda _plan_id: SimpleNamespace(
+            model_dump=lambda mode="json": {"plan_id": "plan-1", "current_step_id": "step-1"}
         )
-        return plan
-
-    async def fake_run_executor_agent(
-        agent,
-        workflow_plan,
-        run_store=None,
-        run_dir=None,
-        *,
-        event_scope=None,
-        cancellation=None,
-        response_language=None,
-    ):
-        calls.append(
-            (
-                "execute",
-                agent,
-                workflow_plan,
-                bool(run_store),
-                bool(run_dir),
-                event_scope,
-                cancellation,
-                response_language,
-            )
-        )
-        return "execution summary"
-
-    monkeypatch.setenv("VLA_RUNS_ROOT", str(tmp_path / "runs"))
-    monkeypatch.setattr("vla_data_juicer_agents.tools.vla.run_workflow.create_plan_agent", lambda model=None, request=None: "plan-agent")
+    )
+    services = SimpleNamespace(plan_store=plan_store)
+    task = SimpleNamespace(task_id="task-1", phase=SimpleNamespace(value="extract_sync"))
+    monkeypatch.setattr(
+        "vla_data_juicer_agents.tools.vla.run_workflow.prepare_direct_navigation_entry",
+        lambda **_kwargs: (services, task),
+    )
+    monkeypatch.setattr(
+        "vla_data_juicer_agents.tools.vla.run_workflow.resolve_navigation_agent_tools",
+        lambda **_kwargs: [],
+    )
     monkeypatch.setattr(
         "vla_data_juicer_agents.tools.vla.run_workflow.create_executor_agent",
-        lambda model=None, dry_run=False, cancellation=None: f"executor-dry-{dry_run}",
+        lambda **_kwargs: executor_output,
     )
-    monkeypatch.setattr("vla_data_juicer_agents.tools.vla.run_workflow.run_plan_agent", fake_run_plan_agent)
-    monkeypatch.setattr("vla_data_juicer_agents.tools.vla.run_workflow.run_executor_agent", fake_run_executor_agent)
-
-    ctx = ToolContext(
-        working_dir=str(tmp_path),
-        artifacts_dir=str(tmp_path / ".djx"),
-        runtime_values={
-            "event_emitter": emitter,
-            "event_scope": parent_scope,
-            "cancellation": cancellation,
-        },
-    )
-    payload = asyncio.run(
-        run_vla_workflow(
-            ctx,
-            {
-                "date": "20270605",
-                "segments": ["20260605_152856"],
-                "scene_mode": "out",
-                "dry_run": True,
-                "approve": True,
-                "response_language": "Chinese",
-            },
-        )
-    )
-
-    assert payload["ok"] is True
-    assert payload["status"] == "completed"
-    assert payload["final_output"] == "execution summary"
-    assert Path(payload["run_dir"]).is_dir()
-    assert calls[0][:8] == (
-        "plan",
-        "plan-agent",
-        "20270605",
-        ["20260605_152856"],
-        "out",
-        True,
-        True,
-        True,
-    )
-    assert calls[0][8].source == "navigation.plan"
-    assert calls[0][8].parent_run_id == events[0]["run_id"]
-    assert calls[0][9] is cancellation
-    assert calls[0][10] == "Chinese"
-    assert calls[1][:5] == ("execute", "executor-dry-True", plan, True, True)
-    assert calls[1][5].source == "navigation.executor"
-    assert calls[1][5].parent_run_id == events[0]["run_id"]
-    assert calls[1][6] is cancellation
-    assert calls[1][7] == "Chinese"
-    assert [(event["type"], event["source"], event["parent_run_id"], event["payload"]) for event in events] == [
-        ("agent_start", "navigation.workflow", "session-run", {}),
-        ("agent_end", "navigation.workflow", "session-run", {"status": "completed"}),
-    ]
-    persisted = [
-        json.loads(line)
-        for line in (Path(payload["run_dir"]) / "events.jsonl").read_text(encoding="utf-8").splitlines()
-    ]
-    assert persisted == events
-    assert all(set(event) == {"type", "source", "run_id", "parent_run_id", "timestamp", "payload"} for event in persisted)
+    return plan
 
 
-def test_vla_run_workflow_infers_chinese_response_language_from_session_history(tmp_path, monkeypatch):
-    runtime = SessionToolRuntime(state=SessionState())
-    runtime.state.history.append({"role": "user", "content": "请处理 20270605 的室外导航数据"})
+def test_vla_run_workflow_preserves_language_dry_run_and_events(tmp_path, monkeypatch):
     captured = []
-    plan_payload = {
-        "date": "20270605",
-        "segments": ["20260605_152856"],
-        "scene_mode": "out",
-        "processing_profile": "parameterized_navigation_v1",
-        "platform_hint": "go2w",
-        "steps": [],
-    }
-    plan = SimpleNamespace(
-        model_dump=lambda mode="json": plan_payload,
-        model_dump_json=lambda: json.dumps(plan_payload),
-    )
+    plan = _direct_workflow_fakes(monkeypatch)
 
-    async def fake_run_plan_agent(*args, **kwargs):
-        captured.append(("plan", kwargs["response_language"]))
+    async def fake_plan(*_args, event_scope=None, response_language=None, **_kwargs):
+        captured.append(("plan", response_language))
+        event_scope.emit("reasoning", summary="bounded")
         return plan
 
-    async def fake_run_executor_agent(*args, **kwargs):
-        captured.append(("executor", kwargs["response_language"]))
+    async def fake_executor(*_args, response_language=None, **_kwargs):
+        captured.append(("executor", response_language))
         return "执行完成"
 
     monkeypatch.setenv("VLA_RUNS_ROOT", str(tmp_path / "runs"))
-    monkeypatch.setattr("vla_data_juicer_agents.tools.vla.run_workflow.create_plan_agent", lambda model=None, request=None: "plan-agent")
     monkeypatch.setattr(
-        "vla_data_juicer_agents.tools.vla.run_workflow.create_executor_agent",
-        lambda model=None, dry_run=False, cancellation=None: "executor-agent",
+        "vla_data_juicer_agents.tools.vla.run_workflow.run_direct_plan_until_submitted",
+        fake_plan,
     )
-    monkeypatch.setattr("vla_data_juicer_agents.tools.vla.run_workflow.run_plan_agent", fake_run_plan_agent)
-    monkeypatch.setattr("vla_data_juicer_agents.tools.vla.run_workflow.run_executor_agent", fake_run_executor_agent)
-    ctx = ToolContext(working_dir=str(tmp_path), runtime_values={"session_runtime": runtime})
-
+    monkeypatch.setattr("vla_data_juicer_agents.tools.vla.run_workflow.run_executor_agent", fake_executor)
+    runtime = SessionToolRuntime(state=SessionState())
+    runtime.state.history.append({"role": "user", "content": "请处理导航数据"})
+    events = []
+    emitter = EventEmitter(CallbackEventSink(events.append))
     payload = asyncio.run(
         run_vla_workflow(
-            ctx,
-            {
-                "date": "20270605",
-                "segments": ["20260605_152856"],
-                "scene_mode": "out",
-                "dry_run": True,
-                "approve": True,
-                "response_language": "English",
-            },
+            ToolContext(
+                working_dir=str(tmp_path),
+                runtime_values={"session_runtime": runtime, "event_emitter": emitter},
+            ),
+            {"date": "20270605", "scene_mode": "out", "dry_run": True, "response_language": "English"},
         )
     )
-
     assert payload["ok"] is True
     assert captured == [("plan", "Chinese"), ("executor", "Chinese")]
+    assert any(event["type"] == "reasoning" for event in events)
 
 
-def test_vla_run_workflow_disables_legacy_resume_on_calibration_pause(tmp_path, monkeypatch):
-    runtime = SessionToolRuntime(state=SessionState())
-    plan_payload = {
-        "date": "20270605",
-        "segments": ["20260605_152856"],
-        "scene_mode": "out",
-        "processing_profile": "parameterized_navigation_v1",
-        "platform_hint": "go2w",
-        "steps": [],
-    }
-    plan = SimpleNamespace(
-        model_dump=lambda mode="json": plan_payload,
-        model_dump_json=lambda: json.dumps(plan_payload),
-    )
+def test_vla_run_workflow_preserves_approval_pause(tmp_path, monkeypatch):
+    plan = _direct_workflow_fakes(monkeypatch)
 
-    async def fake_run_plan_agent(*args, **kwargs):
-        return plan
-
-    async def fake_run_executor_agent(*args, **kwargs):
-        return "calibration_params_not_confirmed: user did not confirm"
-
-    monkeypatch.setenv("VLA_RUNS_ROOT", str(tmp_path / "runs"))
-    monkeypatch.setattr("vla_data_juicer_agents.tools.vla.run_workflow.create_plan_agent", lambda model=None, request=None: "plan-agent")
-    monkeypatch.setattr(
-        "vla_data_juicer_agents.tools.vla.run_workflow.create_executor_agent",
-        lambda model=None, dry_run=False, cancellation=None: "executor-agent",
-    )
-    monkeypatch.setattr("vla_data_juicer_agents.tools.vla.run_workflow.run_plan_agent", fake_run_plan_agent)
-    monkeypatch.setattr("vla_data_juicer_agents.tools.vla.run_workflow.run_executor_agent", fake_run_executor_agent)
-
-    ctx = ToolContext(
-        working_dir=str(tmp_path),
-        artifacts_dir=str(tmp_path / ".djx"),
-        runtime_values={"session_runtime": runtime},
-    )
-
-    payload = asyncio.run(
-        run_vla_workflow(
-            ctx,
-            {
-                "date": "20270605",
-                "segments": ["20260605_152856"],
-                "scene_mode": "out",
-                "dry_run": True,
-                "approve": True,
-            },
-        )
-    )
-
-    assert payload["ok"] is False
-    assert payload["status"] == "disabled"
-    assert payload["error_type"] == "legacy_workflow_resume_disabled"
-    assert payload["message"] == (
-        "Legacy VLA workflow resume is disabled. Use the AgentScope NavigationDataAgent session instead."
-    )
-    assert not hasattr(runtime.state, "pending_workflow_run_dir")
-    assert not (Path(payload["run_dir"]) / "checkpoint.json").exists()
-
-
-def test_vla_run_workflow_detects_calibration_pause_from_executor_event(tmp_path, monkeypatch):
-    runtime = SessionToolRuntime(state=SessionState())
-    plan_payload = {
-        "date": "20270605",
-        "segments": ["20260605_152856"],
-        "scene_mode": "out",
-        "processing_profile": "parameterized_navigation_v1",
-        "platform_hint": "go2w",
-        "steps": [],
-    }
-    plan = SimpleNamespace(
-        model_dump=lambda mode="json": plan_payload,
-        model_dump_json=lambda: json.dumps(plan_payload),
-    )
-
-    async def fake_run_plan_agent(*args, **kwargs):
-        return plan
-
-    async def fake_run_executor_agent(*args, event_scope=None, **kwargs):
-        event_scope.emit(
-            "tool_end",
-            tool="confirm_navigation_calibration_params",
-            call_id="call-1",
-            status="failed",
-            summary="calibration_params_not_confirmed",
-        )
-        return "Execution stopped before processing."
-
-    monkeypatch.setenv("VLA_RUNS_ROOT", str(tmp_path / "runs"))
-    monkeypatch.setattr("vla_data_juicer_agents.tools.vla.run_workflow.create_plan_agent", lambda model=None, request=None: "plan-agent")
-    monkeypatch.setattr(
-        "vla_data_juicer_agents.tools.vla.run_workflow.create_executor_agent",
-        lambda model=None, dry_run=False, cancellation=None: "executor-agent",
-    )
-    monkeypatch.setattr("vla_data_juicer_agents.tools.vla.run_workflow.run_plan_agent", fake_run_plan_agent)
-    monkeypatch.setattr("vla_data_juicer_agents.tools.vla.run_workflow.run_executor_agent", fake_run_executor_agent)
-
-    ctx = ToolContext(
-        working_dir=str(tmp_path),
-        artifacts_dir=str(tmp_path / ".djx"),
-        runtime_values={"session_runtime": runtime},
-    )
-
-    payload = asyncio.run(
-        run_vla_workflow(
-            ctx,
-            {
-                "date": "20270605",
-                "segments": ["20260605_152856"],
-                "scene_mode": "out",
-                "dry_run": True,
-                "approve": True,
-            },
-        )
-    )
-
-    assert payload["ok"] is False
-    assert payload["status"] == "disabled"
-    assert payload["error_type"] == "legacy_workflow_resume_disabled"
-    assert payload["final_output"] == "Execution stopped before processing."
-    assert not hasattr(runtime.state, "pending_workflow_run_dir")
-    assert not (Path(payload["run_dir"]) / "checkpoint.json").exists()
-
-
-def test_vla_run_workflow_detects_calibration_pause_from_tool_error_type_after_truncated_summary(tmp_path, monkeypatch):
-    runtime = SessionToolRuntime(state=SessionState())
-    plan_payload = {
-        "date": "20270605",
-        "segments": ["20260605_152856"],
-        "scene_mode": "out",
-        "processing_profile": "parameterized_navigation_v1",
-        "platform_hint": "go2w",
-        "steps": [],
-    }
-    plan = SimpleNamespace(
-        model_dump=lambda mode="json": plan_payload,
-        model_dump_json=lambda: json.dumps(plan_payload),
-    )
-
-    async def fake_run_plan_agent(*args, **kwargs):
-        return plan
-
-    class ExecutorAgent:
-        async def reply_stream(self, _msg):
-            result = {
-                "ok": False,
-                "message": "Calibration parameters still need user confirmation.",
-                "details": {
-                    "notes": ["x" * 300],
-                    "error_type": "calibration_params_not_confirmed",
-                },
-            }
-            yield SimpleNamespace(
-                type="TOOL_RESULT_START",
-                tool_call_id="call-1",
-                tool_call_name="confirm_navigation_calibration_params",
-            )
-            yield SimpleNamespace(
-                type="TOOL_RESULT_TEXT_DELTA",
-                tool_call_id="call-1",
-                delta=json.dumps(result),
-            )
-            yield SimpleNamespace(type="TOOL_RESULT_END", tool_call_id="call-1", state="success")
-            yield SimpleNamespace(
-                type="TEXT_BLOCK_DELTA",
-                delta="Execution stopped before processing.",
-            )
-
-    monkeypatch.setenv("VLA_RUNS_ROOT", str(tmp_path / "runs"))
-    monkeypatch.setattr("vla_data_juicer_agents.tools.vla.run_workflow.create_plan_agent", lambda model=None, request=None: "plan-agent")
-    monkeypatch.setattr(
-        "vla_data_juicer_agents.tools.vla.run_workflow.create_executor_agent",
-        lambda model=None, dry_run=False, cancellation=None: ExecutorAgent(),
-    )
-    monkeypatch.setattr("vla_data_juicer_agents.tools.vla.run_workflow.run_plan_agent", fake_run_plan_agent)
-
-    ctx = ToolContext(
-        working_dir=str(tmp_path),
-        artifacts_dir=str(tmp_path / ".djx"),
-        runtime_values={"session_runtime": runtime},
-    )
-
-    payload = asyncio.run(
-        run_vla_workflow(
-            ctx,
-            {
-                "date": "20270605",
-                "segments": ["20260605_152856"],
-                "scene_mode": "out",
-                "dry_run": True,
-                "approve": True,
-            },
-        )
-    )
-
-    assert payload["ok"] is False
-    assert payload["status"] == "disabled"
-    assert payload["error_type"] == "legacy_workflow_resume_disabled"
-    assert payload["final_output"] == "Execution stopped before processing."
-    assert "calibration_params_not_confirmed" not in payload["final_output"]
-    assert not hasattr(runtime.state, "pending_workflow_status")
-    assert not (Path(payload["run_dir"]) / "checkpoint.json").exists()
-
-
-def _assert_legacy_continue_disabled(payload):
-    assert payload == {
-        "ok": False,
-        "status": "disabled",
-        "run_dir": None,
-        "artifacts": {},
-        "final_output": "",
-        "error_type": "legacy_workflow_resume_disabled",
-        "message": "Legacy VLA workflow resume is disabled. Use the AgentScope NavigationDataAgent session instead.",
-    }
-
-
-def test_continue_workflow_is_disabled_without_session_state(tmp_path):
-    ctx = ToolContext(working_dir=str(tmp_path), runtime_values={})
-
-    payload = asyncio.run(continue_vla_workflow(ctx, {"user_input": "确认"}))
-
-    _assert_legacy_continue_disabled(payload)
-
-
-def test_continue_workflow_is_disabled_even_with_legacy_pending_state(tmp_path, monkeypatch):
-    runtime = SessionToolRuntime(state=SessionState())
-    pending_run = tmp_path / "runs" / "20270605" / "pending"
-    pending_run.mkdir(parents=True)
-    runtime.state.pending_workflow_run_dir = str(pending_run)
-    runtime.state.pending_workflow_status = "waiting_for_user_confirmation"
-    runtime.state.pending_workflow_input_type = "calibration_confirmation"
-
-    async def fail_plan(*args, **kwargs):
-        raise AssertionError("disabled continue must not call NavigationDataAgent planner")
-
-    async def fail_executor(*args, **kwargs):
-        raise AssertionError("disabled continue must not call NavigationDataAgent executor")
-
-    monkeypatch.setattr("vla_data_juicer_agents.tools.vla.run_workflow.run_plan_agent", fail_plan)
-    monkeypatch.setattr("vla_data_juicer_agents.tools.vla.run_workflow.run_executor_agent", fail_executor)
-    ctx = ToolContext(working_dir=str(tmp_path), runtime_values={"session_runtime": runtime})
-
-    payload = asyncio.run(
-        continue_vla_workflow(
-            ctx,
-            {"user_input": "继续", "run_dir": str(pending_run), "model": "qwen-test"},
-        )
-    )
-
-    _assert_legacy_continue_disabled(payload)
-    assert runtime.state.pending_workflow_run_dir == str(pending_run)
-    assert runtime.state.pending_workflow_status == "waiting_for_user_confirmation"
-    assert runtime.state.pending_workflow_input_type == "calibration_confirmation"
-
-
-def test_vla_run_workflow_prefers_scope_emitter_over_independent_emitter(tmp_path, monkeypatch):
-    scope_events = []
-    independent_events = []
-    scope_emitter = EventEmitter(CallbackEventSink(scope_events.append))
-    independent_emitter = EventEmitter(CallbackEventSink(independent_events.append))
-    parent_scope = scope_emitter.scope("session", run_id="session-run")
-    plan = SimpleNamespace(
-        model_dump=lambda mode="json": {
-            "date": "20270605",
-            "processing_profile": "parameterized_navigation_v1",
-            "platform_hint": "go2w",
-            "steps": [],
-        },
-    )
-
-    async def fake_run_plan_agent(*args, **kwargs):
-        return plan
-
-    monkeypatch.setenv("VLA_RUNS_ROOT", str(tmp_path / "runs"))
-    monkeypatch.setattr("vla_data_juicer_agents.tools.vla.run_workflow.create_plan_agent", lambda **kwargs: object())
-    monkeypatch.setattr("vla_data_juicer_agents.tools.vla.run_workflow.run_plan_agent", fake_run_plan_agent)
-    ctx = ToolContext(
-        working_dir=str(tmp_path),
-        runtime_values={
-            "event_scope": parent_scope,
-            "event_emitter": independent_emitter,
-        },
-    )
-
-    payload = asyncio.run(
-        run_vla_workflow(
-            ctx,
-            {
-                "date": "20270605",
-                "scene_mode": "out",
-                "dry_run": True,
-                "approve": False,
-            },
-        )
-    )
-
-    assert [(event["type"], event["parent_run_id"]) for event in scope_events] == [
-        ("agent_start", "session-run"),
-        ("agent_end", "session-run"),
-    ]
-    assert independent_events == []
-    persisted = [
-        json.loads(line)
-        for line in (Path(payload["run_dir"]) / "events.jsonl").read_text(encoding="utf-8").splitlines()
-    ]
-    assert persisted == scope_events
-
-
-def test_vla_run_workflow_redacts_child_events_in_callback_and_jsonl(tmp_path, monkeypatch):
-    events = []
-    runtime = SessionToolRuntime(state=SessionState(), event_callback=events.append)
-    parent_scope = runtime.event_emitter.scope("main", run_id="session-run")
-    plan = SimpleNamespace(
-        model_dump=lambda mode="json": {
-            "date": "20270605",
-            "processing_profile": "parameterized_navigation_v1",
-            "platform_hint": "go2w",
-            "steps": [],
-        },
-    )
-
-    async def fake_run_plan_agent(*args, event_scope=None, **kwargs):
-        event_scope.emit("reasoning", summary="password=hunter2")
+    async def fake_plan(*_args, **_kwargs):
         return plan
 
     monkeypatch.setenv("VLA_RUNS_ROOT", str(tmp_path / "runs"))
     monkeypatch.setattr(
-        "vla_data_juicer_agents.tools.vla.run_workflow.create_plan_agent",
-        lambda **kwargs: object(),
+        "vla_data_juicer_agents.tools.vla.run_workflow.run_direct_plan_until_submitted",
+        fake_plan,
     )
-    monkeypatch.setattr(
-        "vla_data_juicer_agents.tools.vla.run_workflow.run_plan_agent",
-        fake_run_plan_agent,
-    )
-    ctx = ToolContext(
-        working_dir=str(tmp_path),
-        runtime_values={
-            "event_scope": parent_scope,
-            "event_emitter": runtime.event_emitter,
-        },
-    )
-
     payload = asyncio.run(
         run_vla_workflow(
-            ctx,
-            {
-                "date": "20270605",
-                "scene_mode": "out",
-                "dry_run": True,
-                "approve": False,
-            },
+            ToolContext(working_dir=str(tmp_path)),
+            {"date": "20270605", "scene_mode": "out", "dry_run": True, "approve": False},
         )
     )
-
-    persisted_text = (Path(payload["run_dir"]) / "events.jsonl").read_text(
-        encoding="utf-8"
-    )
-    assert "hunter2" not in json.dumps(events)
-    assert "hunter2" not in persisted_text
-    assert next(event for event in events if event["type"] == "reasoning")[
-        "payload"
-    ] == {"summary": "password=[REDACTED]"}
-    assert json.loads(persisted_text.splitlines()[1])["payload"] == {
-        "summary": "password=[REDACTED]"
-    }
+    assert payload["ok"] is True
+    assert payload["status"] == "awaiting_confirmation"
 
 
 def test_vla_run_workflow_reraises_cancellation_after_interrupted_report(tmp_path, monkeypatch):
-    events = []
-    cancellation = CancellationContext()
-    emitter = EventEmitter(CallbackEventSink(events.append))
+    _direct_workflow_fakes(monkeypatch)
 
-    async def cancelled_plan(*args, **kwargs):
+    async def cancelled_plan(*_args, **_kwargs):
         raise TurnCancelled("stop")
 
     monkeypatch.setenv("VLA_RUNS_ROOT", str(tmp_path / "runs"))
-    monkeypatch.setattr("vla_data_juicer_agents.tools.vla.run_workflow.create_plan_agent", lambda **kwargs: object())
-    monkeypatch.setattr("vla_data_juicer_agents.tools.vla.run_workflow.run_plan_agent", cancelled_plan)
-    ctx = ToolContext(
-        working_dir=str(tmp_path),
-        runtime_values={"event_emitter": emitter, "cancellation": cancellation},
+    monkeypatch.setattr(
+        "vla_data_juicer_agents.tools.vla.run_workflow.run_direct_plan_until_submitted",
+        cancelled_plan,
     )
-
     with pytest.raises(TurnCancelled, match="stop"):
         asyncio.run(
             run_vla_workflow(
-                ctx,
+                ToolContext(working_dir=str(tmp_path), runtime_values={"cancellation": CancellationContext()}),
                 {"date": "20270605", "scene_mode": "out", "dry_run": True},
             )
         )
-
-    run_dir = next((tmp_path / "runs" / "20270605").iterdir())
-    report = json.loads((run_dir / "final_report.json").read_text(encoding="utf-8"))
-    assert report["status"] == "interrupted"
-    assert report["ok"] is False
-    assert [(event["type"], event["payload"]) for event in events] == [
-        ("agent_start", {}),
-        ("agent_end", {"status": "interrupted"}),
-    ]
 
 
 def test_vla_run_workflow_tool_requires_scene_mode(tmp_path):

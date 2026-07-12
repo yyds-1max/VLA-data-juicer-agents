@@ -15,9 +15,7 @@ from vla_data_juicer_agents.navigation.task_state import (
     NavigationArtifactSnapshot,
     NavigationTask,
     NavigationTaskDrift,
-    NavigationTaskPhase,
     NavigationTaskStatus,
-    NavigationTaskStep,
     utc_now,
 )
 
@@ -206,22 +204,6 @@ class NavigationTaskStore(Protocol):
 
     def delete_task(self, task_id: str) -> None: ...
 
-    def record_step(
-        self,
-        *,
-        task_id: str,
-        phase: NavigationTaskPhase,
-        step_id: str,
-        tool_name: str,
-        status: NavigationTaskStatus,
-        arguments: dict[str, Any] | None = None,
-        result: dict[str, Any] | None = None,
-        produced_paths: list[str] | None = None,
-        started_at: str | None = None,
-        finished_at: str | None = None,
-    ) -> NavigationTaskStep: ...
-
-
 class SqliteNavigationTaskStore:
     def __init__(self, db_path: str | Path, *, initialize: bool = True) -> None:
         self.db_path = Path(db_path)
@@ -257,7 +239,6 @@ class SqliteNavigationTaskStore:
                     agentscope_session_id TEXT,
                     latest_run_id TEXT,
                     last_completed_step TEXT,
-                    data_profile_json TEXT,
                     artifact_snapshot_json TEXT,
                     drift_json TEXT,
                     schema_version INTEGER NOT NULL,
@@ -268,6 +249,7 @@ class SqliteNavigationTaskStore:
             )
             self._migrate_task_entry_fields(connection)
             self._migrate_segments_key(connection)
+            self._rebuild_task_table_without_legacy_profile(connection)
             connection.execute(
                 """
                 CREATE INDEX IF NOT EXISTS idx_navigation_tasks_date_updated
@@ -307,6 +289,111 @@ class SqliteNavigationTaskStore:
             )
             ensure_navigation_task_step_ledger_columns(connection)
             ensure_navigation_aggregate_revision_triggers(connection)
+
+    def _rebuild_task_table_without_legacy_profile(
+        self,
+        connection: sqlite3.Connection,
+    ) -> None:
+        columns = {
+            row["name"]
+            for row in connection.execute("PRAGMA table_info(navigation_tasks)").fetchall()
+        }
+        if "data_profile_json" not in columns:
+            connection.execute(
+                "UPDATE navigation_tasks SET schema_version = ? WHERE schema_version != ?",
+                (TASK_SCHEMA_VERSION, TASK_SCHEMA_VERSION),
+            )
+            return
+
+        connection.commit()
+        connection.execute("PRAGMA foreign_keys = OFF")
+        try:
+            connection.execute("BEGIN IMMEDIATE")
+            trigger_rows = connection.execute(
+                """SELECT name FROM sqlite_master
+                WHERE type = 'trigger' AND sql LIKE '%navigation_tasks%'"""
+            ).fetchall()
+            for trigger_row in trigger_rows:
+                trigger_name = str(trigger_row["name"]).replace('"', '""')
+                connection.execute(f'DROP TRIGGER "{trigger_name}"')
+            connection.execute("DROP TABLE IF EXISTS navigation_tasks_new")
+            connection.execute(
+                """
+                CREATE TABLE navigation_tasks_new (
+                    task_id TEXT PRIMARY KEY,
+                    date TEXT NOT NULL,
+                    segments_json TEXT,
+                    segments_key TEXT,
+                    scene_mode TEXT,
+                    dry_run INTEGER NOT NULL DEFAULT 0,
+                    guidance_revision INTEGER NOT NULL DEFAULT 0,
+                    state_revision INTEGER NOT NULL DEFAULT 0,
+                    phase TEXT NOT NULL,
+                    status TEXT NOT NULL,
+                    waiting_reason TEXT,
+                    next_required_input TEXT,
+                    created_by_web_session_id TEXT,
+                    latest_web_session_id TEXT,
+                    agentscope_session_id TEXT,
+                    latest_run_id TEXT,
+                    last_completed_step TEXT,
+                    artifact_snapshot_json TEXT,
+                    drift_json TEXT,
+                    schema_version INTEGER NOT NULL,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                )
+                """
+            )
+            connection.execute(
+                """
+                INSERT INTO navigation_tasks_new (
+                    task_id, date, segments_json, segments_key, scene_mode,
+                    dry_run, guidance_revision, state_revision, phase, status,
+                    waiting_reason, next_required_input, created_by_web_session_id,
+                    latest_web_session_id, agentscope_session_id, latest_run_id,
+                    last_completed_step, artifact_snapshot_json, drift_json,
+                    schema_version, created_at, updated_at
+                )
+                SELECT
+                    task_id, date, segments_json, segments_key, scene_mode,
+                    dry_run, guidance_revision, state_revision, phase,
+                    CASE
+                      WHEN data_profile_json IS NOT NULL
+                       AND trim(data_profile_json) NOT IN ('', 'null', '{}')
+                       AND status NOT IN ('completed', 'superseded')
+                      THEN 'needs_replan'
+                      ELSE status
+                    END,
+                    waiting_reason, next_required_input, created_by_web_session_id,
+                    latest_web_session_id, agentscope_session_id, latest_run_id,
+                    last_completed_step, artifact_snapshot_json, drift_json,
+                    ?, created_at, updated_at
+                FROM navigation_tasks
+                """,
+                (TASK_SCHEMA_VERSION,),
+            )
+            connection.execute("DROP TABLE navigation_tasks")
+            connection.execute("ALTER TABLE navigation_tasks_new RENAME TO navigation_tasks")
+            connection.execute(
+                "CREATE INDEX idx_navigation_tasks_date_updated ON navigation_tasks (date, updated_at)"
+            )
+            connection.execute(
+                """CREATE UNIQUE INDEX idx_navigation_tasks_active_date_segments_key
+                ON navigation_tasks (date, segments_key) WHERE status != 'superseded'"""
+            )
+            ensure_navigation_aggregate_revision_triggers(connection)
+            connection.commit()
+        except Exception:
+            connection.rollback()
+            raise
+        finally:
+            connection.execute("PRAGMA foreign_keys = ON")
+        violations = connection.execute("PRAGMA foreign_key_check").fetchall()
+        if violations:
+            raise sqlite3.IntegrityError(
+                f"navigation task v2 migration left foreign-key violations: {violations!r}"
+            )
 
     def _migrate_task_entry_fields(self, connection: sqlite3.Connection) -> None:
         columns = {
@@ -645,7 +732,7 @@ class SqliteNavigationTaskStore:
                 scene_mode=?, dry_run=?, guidance_revision=?, state_revision=?, phase=?, status=?,
                 waiting_reason=?, next_required_input=?, created_by_web_session_id=?,
                 latest_web_session_id=?, agentscope_session_id=?, latest_run_id=?,
-                last_completed_step=?, data_profile_json=?, artifact_snapshot_json=?,
+                last_completed_step=?, artifact_snapshot_json=?,
                 drift_json=?, schema_version=?, created_at=?, updated_at=?
                 WHERE task_id=? AND state_revision=? AND latest_web_session_id IS ?
                   AND agentscope_session_id IS ?""",
@@ -680,130 +767,6 @@ class SqliteNavigationTaskStore:
             if cursor.rowcount == 0:
                 raise KeyError(task_id)
 
-    def record_step(
-        self,
-        *,
-        task_id: str,
-        phase: NavigationTaskPhase,
-        step_id: str,
-        tool_name: str,
-        status: NavigationTaskStatus,
-        arguments: dict[str, Any] | None = None,
-        result: dict[str, Any] | None = None,
-        produced_paths: list[str] | None = None,
-        started_at: str | None = None,
-        finished_at: str | None = None,
-    ) -> NavigationTaskStep:
-        step = NavigationTaskStep(
-            id=f"nav_step_{uuid4().hex}",
-            task_id=task_id,
-            phase=phase,
-            step_id=step_id,
-            tool_name=tool_name,
-            status=status,
-            arguments=arguments,
-            result=result,
-            produced_paths=produced_paths or [],
-            started_at=started_at,
-            finished_at=finished_at,
-        )
-        with self._connect() as connection:
-            connection.execute(
-                """
-                INSERT INTO navigation_task_steps (
-                    id, task_id, phase, step_id, tool_name, status,
-                    arguments_json, result_json, produced_paths_json,
-                    started_at, finished_at
-                )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """,
-                (
-                    step.id,
-                    step.task_id,
-                    step.phase.value,
-                    step.step_id,
-                    step.tool_name,
-                    step.status.value,
-                    _json_dump(step.arguments),
-                    _json_dump(step.result),
-                    _json_dump(step.produced_paths),
-                    step.started_at,
-                    step.finished_at,
-                ),
-            )
-        return step
-
-    def record_step_for_session(
-        self,
-        *,
-        web_session_id: str | None,
-        agentscope_session_id: str,
-        **step_fields: Any,
-    ) -> NavigationTaskStep:
-        """Atomically authorize the current session pair and append one legacy step."""
-        step = NavigationTaskStep(
-            id=f"nav_step_{uuid4().hex}",
-            produced_paths=step_fields.pop("produced_paths", None) or [],
-            **step_fields,
-        )
-        connection = self._connect()
-        try:
-            connection.execute("BEGIN IMMEDIATE")
-            row = connection.execute(
-                "SELECT * FROM navigation_tasks WHERE task_id = ?",
-                (step.task_id,),
-            ).fetchone()
-            if row is None:
-                raise KeyError(step.task_id)
-            current = self._task_from_row(row)
-            if (
-                current.created_by_web_session_id != web_session_id
-                or current.latest_web_session_id != web_session_id
-                or current.agentscope_session_id != agentscope_session_id
-            ):
-                raise NavigationTaskOwnershipError(
-                    step.task_id,
-                    expected_web_session_id=current.created_by_web_session_id or "",
-                    requested_web_session_id=web_session_id,
-                )
-            connection.execute(
-                """
-                INSERT INTO navigation_task_steps (
-                    id, task_id, phase, step_id, tool_name, status,
-                    arguments_json, result_json, produced_paths_json,
-                    started_at, finished_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """,
-                (
-                    step.id,
-                    step.task_id,
-                    step.phase.value,
-                    step.step_id,
-                    step.tool_name,
-                    step.status.value,
-                    _json_dump(step.arguments),
-                    _json_dump(step.result),
-                    _json_dump(step.produced_paths),
-                    step.started_at,
-                    step.finished_at,
-                ),
-            )
-            connection.commit()
-            return step
-        except Exception:
-            connection.rollback()
-            raise
-        finally:
-            connection.close()
-
-    def list_steps(self, task_id: str) -> list[NavigationTaskStep]:
-        with self._connect() as connection:
-            rows = connection.execute(
-                "SELECT * FROM navigation_task_steps WHERE task_id = ? ORDER BY rowid ASC",
-                (task_id,),
-            ).fetchall()
-        return [self._step_from_row(row) for row in rows]
-
     def _insert_task(self, connection: sqlite3.Connection, task: NavigationTask) -> None:
         connection.execute(
             """
@@ -812,10 +775,10 @@ class SqliteNavigationTaskStore:
                 dry_run, guidance_revision, state_revision, phase, status,
                 waiting_reason, next_required_input, created_by_web_session_id,
                 latest_web_session_id, agentscope_session_id, latest_run_id,
-                last_completed_step, data_profile_json, artifact_snapshot_json,
+                last_completed_step, artifact_snapshot_json,
                 drift_json, schema_version, created_at, updated_at
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             self._task_values(task),
         )
@@ -845,7 +808,6 @@ class SqliteNavigationTaskStore:
                 agentscope_session_id = ?,
                 latest_run_id = ?,
                 last_completed_step = ?,
-                data_profile_json = ?,
                 artifact_snapshot_json = ?,
                 drift_json = ?,
                 schema_version = ?,
@@ -875,7 +837,6 @@ class SqliteNavigationTaskStore:
             task.agentscope_session_id,
             task.latest_run_id,
             task.last_completed_step,
-            _json_dump(task.data_profile),
             _json_dump(task.artifact_snapshot.model_dump(mode="json") if task.artifact_snapshot else None),
             _json_dump(task.drift.model_dump(mode="json") if task.drift else None),
             task.schema_version,
@@ -903,25 +864,9 @@ class SqliteNavigationTaskStore:
             agentscope_session_id=row["agentscope_session_id"],
             latest_run_id=row["latest_run_id"],
             last_completed_step=row["last_completed_step"],
-            data_profile=_json_load(row["data_profile_json"]),
             artifact_snapshot=NavigationArtifactSnapshot.model_validate(snapshot) if snapshot else None,
             drift=NavigationTaskDrift.model_validate(drift) if drift else None,
             schema_version=row["schema_version"],
             created_at=row["created_at"],
             updated_at=row["updated_at"],
-        )
-
-    def _step_from_row(self, row: sqlite3.Row) -> NavigationTaskStep:
-        return NavigationTaskStep(
-            id=row["id"],
-            task_id=row["task_id"],
-            phase=row["phase"],
-            step_id=row["step_id"],
-            tool_name=row["tool_name"],
-            status=row["status"],
-            arguments=_json_load(row["arguments_json"]),
-            result=_json_load(row["result_json"]),
-            produced_paths=_json_load(row["produced_paths_json"]) or [],
-            started_at=row["started_at"],
-            finished_at=row["finished_at"],
         )

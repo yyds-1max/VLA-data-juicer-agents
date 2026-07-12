@@ -195,19 +195,10 @@ def _replace_path(source: Path, target: Path, kind: str) -> tuple[bool, str | No
     return True, None
 
 
-def _sensor_source_for_platform_hint(settings: NavigationSettings, platform_hint: str | None) -> Path:
-    hint = (platform_hint or "unknown").lower()
-    sensor_param_dir = "20260529_go2w" if hint == "go2w" else "20260409_U"
-    return settings.processing_root / "NoobScenes" / "params" / sensor_param_dir / "sensors"
-
-
 def _validated_sensor_source(
     settings: NavigationSettings,
-    selected_sensor_source: str | Path | None,
-    platform_hint: str | None,
+    selected_sensor_source: str | Path,
 ) -> Path:
-    if selected_sensor_source is None:
-        return _sensor_source_for_platform_hint(settings, platform_hint)
     source = Path(selected_sensor_source)
     if not source.is_absolute():
         source = settings.processing_root / source
@@ -619,9 +610,7 @@ def assemble_finish_temp(
     segments: list[str] | None = None,
     settings: NavigationSettings | None = None,
     dry_run: bool = False,
-    platform_hint: str | None = None,
-    processing_profile: str | None = None,
-    selected_sensor_source: str | Path | None = None,
+    selected_sensor_source: str | Path = "",
 ) -> ToolResult:
     date = _validate_date(date)
     settings = settings or NavigationSettings()
@@ -635,7 +624,6 @@ def assemble_finish_temp(
     sensor_source = _validated_sensor_source(
         settings,
         selected_sensor_source,
-        platform_hint,
     )
     copied_clips: list[str] = []
 
@@ -679,8 +667,6 @@ def assemble_finish_temp(
             "selected_segments": selected,
             "copied_clips": copied_clips,
             "sensor_source": str(sensor_source),
-            "platform_hint": platform_hint,
-            "processing_profile": processing_profile,
             "dry_run": dry_run,
         },
     )
@@ -689,18 +675,16 @@ def assemble_finish_temp(
 def confirm_navigation_calibration_params(
     date: str,
     segments: list[str] | None = None,
-    platform_hint: str | None = None,
     user_confirmation: str | None = None,
     settings: NavigationSettings | None = None,
     dry_run: bool = False,
-    selected_sensor_source: str | Path | None = None,
+    selected_sensor_source: str | Path = "",
 ) -> ToolResult:
     date = _validate_date(date)
     settings = settings or NavigationSettings()
     sensor_source = _validated_sensor_source(
         settings,
         selected_sensor_source,
-        platform_hint,
     )
     finish_temp = settings.finish_data_root / f"{date}_temp"
     target_copy_path = finish_temp / "samples" / date / "<clip>" / "sensors"
@@ -722,7 +706,6 @@ def confirm_navigation_calibration_params(
         details={
             "date": date,
             "segments": segments,
-            "platform_hint": platform_hint,
             "finish_temp": str(finish_temp),
             "sensor_source": str(sensor_source),
             "target_copy_path": str(target_copy_path),

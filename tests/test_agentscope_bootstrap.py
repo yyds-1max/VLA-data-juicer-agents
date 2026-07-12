@@ -110,9 +110,6 @@ def test_navigation_agent_prompt_requires_plan_execute_react_and_human_decisions
         "infer_navigation_sensor_bindings_tool",
         "infer_navigation_processing_profile_tool",
         "infer_navigation_topic_params_tool",
-        "finalize_extract_sync_plan_tool",
-        "finalize_finish_processing_plan_tool",
-        "finalize_workflow_plan_tool",
     ]:
         assert legacy_concept not in prompt
 

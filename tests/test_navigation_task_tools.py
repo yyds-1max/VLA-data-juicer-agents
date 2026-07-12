@@ -3,9 +3,6 @@ import json
 from pathlib import Path
 
 from vla_data_juicer_agents.navigation.config import NavigationSettings
-from vla_data_juicer_agents.navigation.plan_draft import WorkflowPlanDraftState
-from vla_data_juicer_agents.navigation.plan_draft_store import InMemoryNavigationPlanDraftStore
-from vla_data_juicer_agents.navigation.models import NavigationRequest, WorkflowPlan, WorkflowStep
 from vla_data_juicer_agents.navigation.task_state import (
     NavigationTaskPhase,
     NavigationTaskStatus,
@@ -28,24 +25,6 @@ def _tools(tmp_path: Path):
         )
     }
     return root, store, tools
-
-
-def _tools_with_draft_store(tmp_path: Path, *, session_id: str):
-    root = tmp_path / "VLADatasets"
-    store = SqliteNavigationTaskStore(tmp_path / "tasks.sqlite")
-    draft_store = InMemoryNavigationPlanDraftStore()
-    settings = NavigationSettings(vladatasets_root=root)
-    tools = {
-        tool.name: tool
-        for tool in build_navigation_task_tools(
-            store=store,
-            session_id=session_id,
-            web_session_id=f"web-{session_id}",
-            settings=settings,
-            draft_store=draft_store,
-        )
-    }
-    return root, store, draft_store, tools
 
 
 def _decode_tool_payload(payload):
@@ -113,7 +92,7 @@ def test_get_or_create_navigation_task_tool_normalizes_json_segments_string(
 def test_reconcile_navigation_task_tool_updates_missing_sync_to_needs_rerun(
     tmp_path: Path,
 ):
-    root, _store, tools = _tools(tmp_path)
+    root, store, tools = _tools(tmp_path)
     (root / "raw_data" / "20270623" / "segment_a").mkdir(parents=True)
     created = _call(
         tools["get_or_create_navigation_task_tool"],
@@ -122,9 +101,10 @@ def test_reconcile_navigation_task_tool_updates_missing_sync_to_needs_rerun(
         scene_mode=None,
     )
     task_id = created["task"]["task_id"]
-    _call(
-        tools["update_navigation_task_state_tool"],
-        task_id=task_id,
+    store.update_task_for_session(
+        task_id,
+        web_session_id="web-session",
+        agentscope_session_id="agent-session",
         phase="waiting_scene_mode",
         status="waiting_user",
         waiting_reason="scene_mode_required_after_extract_sync",
@@ -137,89 +117,6 @@ def test_reconcile_navigation_task_tool_updates_missing_sync_to_needs_rerun(
     assert result["task"]["phase"] == "extract_sync"
     assert result["task"]["status"] == "needs_rerun"
     assert set(result["task"]) == {"task_id", "phase", "status"}
-
-
-def test_state_update_cannot_mark_completed_without_selected_final_markers(tmp_path: Path):
-    root, store, tools = _tools(tmp_path)
-    (root / "raw_data" / "20270623" / "segment_a").mkdir(parents=True)
-    (root / "finish_data" / "20270623" / "segment_b" / "clip_b" / "grid_map").mkdir(
-        parents=True
-    )
-    task = store.create_or_update_task(
-        date="20270623",
-        segments=["segment_a"],
-        scene_mode="out",
-        web_session_id="web-session",
-        agentscope_session_id="agent-session",
-    )
-
-    result = _call(
-        tools["update_navigation_task_state_tool"],
-        task_id=task.task_id,
-        phase="completed",
-        status="completed",
-    )
-
-    assert result["ok"] is False
-    assert result["error_type"] == "navigation_task_reconcile_required"
-    persisted = store.get_task(task.task_id)
-    assert persisted is not None
-    assert persisted.phase == NavigationTaskPhase.EXTRACT_SYNC
-    assert persisted.status == NavigationTaskStatus.NEEDS_RERUN
-    assert persisted.artifact_snapshot is not None
-
-
-def test_state_update_rejects_phase_not_selected_by_live_reconciliation(tmp_path: Path):
-    root, store, tools = _tools(tmp_path)
-    (root / "raw_data" / "20270623" / "segment_a").mkdir(parents=True)
-    task = store.create_or_update_task(
-        date="20270623",
-        segments=["segment_a"],
-        scene_mode="out",
-        dry_run=True,
-        web_session_id="web-session",
-        agentscope_session_id="agent-session",
-    )
-
-    result = _call(
-        tools["update_navigation_task_state_tool"],
-        task_id=task.task_id,
-        phase="finish_processing",
-        status="running",
-    )
-
-    assert result["ok"] is False
-    assert result["error_type"] == "navigation_task_reconcile_required"
-    persisted = store.get_task(task.task_id)
-    assert persisted is not None
-    assert persisted.phase == NavigationTaskPhase.EXTRACT_SYNC
-    assert persisted.status == NavigationTaskStatus.NEEDS_RERUN
-    assert persisted.dry_run is True
-
-
-def test_state_update_allows_execution_status_for_reconciled_phase(tmp_path: Path):
-    root, store, tools = _tools(tmp_path)
-    (root / "raw_data" / "20270623" / "segment_a").mkdir(parents=True)
-    task = store.create_or_update_task(
-        date="20270623",
-        segments=["segment_a"],
-        scene_mode=None,
-        dry_run=True,
-        web_session_id="web-session",
-        agentscope_session_id="agent-session",
-    )
-
-    result = _call(
-        tools["update_navigation_task_state_tool"],
-        task_id=task.task_id,
-        phase="extract_sync",
-        status="running",
-    )
-
-    assert result["ok"] is True
-    assert result["task"]["phase"] == NavigationTaskPhase.EXTRACT_SYNC.value
-    assert result["task"]["status"] == NavigationTaskStatus.RUNNING.value
-    assert result["task"]["dry_run"] is True
 
 
 def test_update_navigation_task_scene_mode_tool_sets_finish_processing(
@@ -284,9 +181,10 @@ def test_resumable_task_cannot_be_claimed_from_new_web_session(tmp_path: Path):
         segments=["segment_a"],
         scene_mode=None,
     )
-    _call(
-        first_tools["update_navigation_task_state_tool"],
-        task_id=created["task"]["task_id"],
+    store.update_task_for_session(
+        created["task"]["task_id"],
+        web_session_id="web-session",
+        agentscope_session_id="agent-session",
         phase="waiting_scene_mode",
         status="waiting_user",
         waiting_reason="scene_mode_required_after_extract_sync",
@@ -314,70 +212,3 @@ def test_resumable_task_cannot_be_claimed_from_new_web_session(tmp_path: Path):
     stored = store.get_task(created["task"]["task_id"])
     assert stored.latest_web_session_id == "web-session"
     assert stored.agentscope_session_id == "agent-session"
-
-
-def test_foreign_scene_mode_claim_does_not_mutate_legacy_session_draft(tmp_path: Path):
-    root, store, draft_store, first_tools = _tools_with_draft_store(
-        tmp_path,
-        session_id="agent-session-a",
-    )
-    (root / "raw_data" / "20270623" / "segment_a").mkdir(parents=True)
-    (root / "clip_data" / "20270623" / "segment_a" / "sync_data" / "clip_0").mkdir(
-        parents=True
-    )
-    created = _call(
-        first_tools["get_or_create_navigation_task_tool"],
-        date="20270623",
-        segments=["segment_a"],
-        scene_mode=None,
-    )
-    store.update_task_for_session(
-        created["task"]["task_id"],
-        web_session_id="web-agent-session-a",
-        agentscope_session_id="agent-session-a",
-        phase=NavigationTaskPhase.WAITING_SCENE_MODE,
-        status=NavigationTaskStatus.WAITING_USER,
-        waiting_reason="scene_mode_required_after_extract_sync",
-        next_required_input="scene_mode",
-    )
-    draft_store.save(
-        "agent-session-b",
-        WorkflowPlanDraftState(
-            request=NavigationRequest(date="20270623", segments=["segment_a"]),
-            finalized_plan=WorkflowPlan(
-                date="20270623",
-                phase="extract_sync",
-                scene_mode=None,
-                steps=[
-                    WorkflowStep(
-                        step_id="extract_and_sync_navigation_data",
-                        tool_name="extract_and_sync_navigation_data",
-                    )
-                ],
-            ),
-        ),
-    )
-    second_tools = {
-        tool.name: tool
-        for tool in build_navigation_task_tools(
-            store=store,
-            session_id="agent-session-b",
-            web_session_id="web-session-b",
-            settings=NavigationSettings(vladatasets_root=root),
-            draft_store=draft_store,
-        )
-    }
-
-    result = _call(
-        second_tools["update_navigation_task_scene_mode_tool"],
-        task_id=created["task"]["task_id"],
-        scene_mode="out",
-    )
-    draft = draft_store.load("agent-session-b")
-
-    assert result["ok"] is False
-    assert result["error_type"] == "navigation_task_session_mismatch"
-    assert draft is not None
-    assert draft.request.scene_mode is None
-    assert draft.plan_phase == "extract_sync"
-    assert draft.finalized_plan is not None

@@ -54,12 +54,6 @@ class RawDateInspection(BaseModel):
         return _validate_date(value)
 
 
-class StageVariantDecision(BaseModel):
-    variant: str
-    reason: str = ""
-    evidence: list[str] = Field(default_factory=list)
-
-
 class PlanIssue(BaseModel):
     type: str
     message: str = ""
@@ -123,94 +117,6 @@ class NavigationCalibrationPolicy(BaseModel):
     ] = "hardcoded_with_user_confirmation"
     selected_sensor_source: str | None = None
     requires_user_confirmation: bool = True
-
-
-class NavigationProcessingProfile(BaseModel):
-    id: str = "parameterized_navigation_v1"
-    platform_hint: str = "unknown"
-    sensor_bindings: NavigationSensorBindings | None = None
-    topic_params: NavigationTopicParams
-    localization_policy: NavigationLocalizationPolicy
-    gridmap_policy: NavigationGridmapPolicy = Field(default_factory=NavigationGridmapPolicy)
-    calibration_policy: NavigationCalibrationPolicy = Field(default_factory=NavigationCalibrationPolicy)
-    stage_variants: dict[str, StageVariantDecision] = Field(default_factory=dict)
-    warnings: list[PlanIssue] = Field(default_factory=list)
-    blocking_issues: list[PlanIssue] = Field(default_factory=list)
-    evidence: dict[str, list[str]] = Field(default_factory=dict)
-
-
-class NavigationExtractSyncProfile(BaseModel):
-    date: str
-    segments: list[str] | None = None
-    platform_hint: str = "unknown"
-    sensor_bindings: NavigationSensorBindings | None = None
-    topic_params: NavigationTopicParams
-    stage_variants: dict[str, StageVariantDecision] = Field(default_factory=dict)
-    blocking_issues: list[PlanIssue] = Field(default_factory=list)
-    warnings: list[PlanIssue] = Field(default_factory=list)
-    evidence: dict[str, list[str]] = Field(default_factory=dict)
-
-    @field_validator("date")
-    @classmethod
-    def validate_date(cls, value: str) -> str:
-        return _validate_date(value)
-
-
-class NavigationFinishProcessingProfile(BaseModel):
-    date: str
-    segments: list[str] | None = None
-    scene_mode: Literal["in", "out"]
-    processing_profile: NavigationProcessingProfile
-    platform_hint: str = "unknown"
-    sensor_bindings: NavigationSensorBindings | None = None
-    localization_policy: NavigationLocalizationPolicy
-    topic_params: NavigationTopicParams
-    gridmap_source: Literal[
-        "existing_gridmap",
-        "generated_from_pcd",
-        "projection_ready",
-        "unknown",
-    ] = "unknown"
-    projection_input_ready: bool = False
-    pcd_gridmap_tool_available: bool = True
-    stage_variants: dict[str, StageVariantDecision] = Field(default_factory=dict)
-    blocking_issues: list[PlanIssue] = Field(default_factory=list)
-    warnings: list[PlanIssue] = Field(default_factory=list)
-    evidence: dict[str, list[str]] = Field(default_factory=dict)
-
-    @field_validator("date")
-    @classmethod
-    def validate_date(cls, value: str) -> str:
-        return _validate_date(value)
-
-
-class WorkflowStep(BaseModel):
-    step_id: str
-    tool_name: str
-    arguments: dict[str, Any] = Field(default_factory=dict)
-    preconditions: list[str] = Field(default_factory=list)
-    expected_outputs: list[str] = Field(default_factory=list)
-    human_blocking: bool = False
-    failure_behavior: str = "stop"
-    variant: str | None = None
-    effects: Literal["read", "write", "execute", "external"] | None = None
-    decision_ref: str | None = None
-    evidence: list[str] = Field(default_factory=list)
-
-
-class WorkflowPlan(BaseModel):
-    date: str
-    segments: list[str] | None = None
-    scene_mode: Literal["in", "out"] | None = None
-    phase: Literal["extract_sync", "finish_processing", "full"] = "full"
-    processing_profile: str = "parameterized_navigation_v1"
-    platform_hint: str = "unknown"
-    steps: list[WorkflowStep]
-
-    @field_validator("date")
-    @classmethod
-    def validate_date(cls, value: str) -> str:
-        return _validate_date(value)
 
 
 class CommandRecord(BaseModel):

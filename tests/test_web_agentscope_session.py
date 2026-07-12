@@ -10,8 +10,6 @@ from agentscope.message import Msg, ToolCallBlock, ToolCallState, ToolResultStat
 from agentscope.permission import PermissionBehavior, PermissionContext
 
 from vla_data_juicer_agents.core.cancellation import CancellationContext, current_cancellation
-from vla_data_juicer_agents.navigation.agent_tools import build_navigation_agent_tools
-from vla_data_juicer_agents.navigation.plan_draft_store import JsonNavigationPlanDraftStore
 from vla_data_juicer_agents.navigation.observation_store import SqliteNavigationObservationStore
 from vla_data_juicer_agents.navigation.plan_models import FinishProcessingPlanInput
 from vla_data_juicer_agents.navigation.plan_store import (
@@ -508,41 +506,6 @@ def test_web_navigation_prompt_describes_cross_session_resume_gate() -> None:
     assert "When the user supplies scene mode for a waiting task" in prompt
     assert "update durable task state, reconcile artifacts" in prompt
     assert "runtime-selected phase tools" in prompt
-
-
-@pytest.mark.asyncio
-async def test_navigation_agent_internal_tools_are_auto_allowed(tmp_path: Path) -> None:
-    tools = build_navigation_agent_tools(
-        dry_run=True,
-        session_id="as-session-1",
-        draft_store=JsonNavigationPlanDraftStore(tmp_path / "drafts"),
-    )
-    gated_tool_names = {
-        "prepare_raw_data_tool",
-        "extract_and_sync_navigation_data_tool",
-        "generate_gridmap_from_pcd_tool",
-        "assemble_finish_temp_tool",
-        "run_noobscene_preprocessing_tool",
-        "run_initial_annotation_gui_tool",
-        "run_tracking_tool",
-        "prepare_gridmap_for_projection_tool",
-        "run_projection_and_trajectory_tool",
-        "run_tracking_and_projection_tool",
-        "validate_navigation_outputs_tool",
-    }
-
-    for tool in tools:
-        if tool.name == "request_human_decision":
-            assert tool.is_external_tool is True
-            continue
-
-        decision = await tool.check_permissions({}, PermissionContext())
-
-        if tool.name in gated_tool_names:
-            assert decision.behavior == PermissionBehavior.DENY, tool.name
-        else:
-            assert decision.behavior == PermissionBehavior.ALLOW, tool.name
-
 
 @pytest.mark.asyncio
 async def test_runtime_submit_user_message_starts_navigation_requests_with_main_router() -> None:

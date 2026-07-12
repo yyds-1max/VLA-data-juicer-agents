@@ -120,13 +120,6 @@ NAVIGATION_TOOL_CAPABILITIES: tuple[ToolCapability, ...] = (
         plan_agent_allowed=True,
     ),
     ToolCapability(
-        tool_name="infer_navigation_processing_profile",
-        stage_kind="infer_navigation_processing_profile",
-        effects="read",
-        variants=[ToolVariantCapability(id="default")],
-        plan_agent_allowed=True,
-    ),
-    ToolCapability(
         tool_name="inspect_processing_state",
         stage_kind="inspect_processing_state",
         effects="read",

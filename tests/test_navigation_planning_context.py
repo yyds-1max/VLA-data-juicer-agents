@@ -30,7 +30,6 @@ def _task() -> NavigationTask:
         segments=["20260710_120000"],
         phase=NavigationTaskPhase.EXTRACT_SYNC,
         guidance_revision=2,
-        data_profile={"phase_profile_schema": "must not leak", "data_profile_draft": "must not leak"},
     )
 
 
@@ -89,8 +88,6 @@ def test_planning_context_excludes_raw_evidence_schema_and_inactive_phase_facts(
     payload = context.model_dump(mode="json")
     text = json.dumps(payload, ensure_ascii=False)
 
-    assert "phase_profile_schema" not in text
-    assert "data_profile_draft" not in text
     assert "raw_payload" not in text
     assert "runtime_assets" not in text
     assert len(text) <= 5_500

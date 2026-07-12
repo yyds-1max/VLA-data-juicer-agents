@@ -367,7 +367,7 @@ def test_noobscene_preprocessing_dry_run_uses_data_runtime_setup(tmp_path):
     assert any("/processing/0_1th_box/img2video.py" in shell for shell in shells)
 
 
-def test_assemble_finish_temp_copies_only_server_finish_inputs_and_platform_sensors(tmp_path):
+def test_assemble_finish_temp_copies_only_server_finish_inputs_and_selected_sensors(tmp_path):
     root = tmp_path / "VLADatasets"
     processing_root = tmp_path / "processing"
     clip = root / "clip_data" / "20270605" / "20260605_152856" / "sync_data" / "clip_a"
@@ -380,7 +380,12 @@ def test_assemble_finish_temp_copies_only_server_finish_inputs_and_platform_sens
     (sensor_source / "calib.json").write_text("{}", encoding="utf-8")
     settings = NavigationSettings(vladatasets_root=root, processing_root=processing_root)
 
-    result = assemble_finish_temp("20270605", platform_hint="go2w", settings=settings, dry_run=False)
+    result = assemble_finish_temp(
+        "20270605",
+        settings=settings,
+        dry_run=False,
+        selected_sensor_source=sensor_source,
+    )
 
     dst = root / "finish_data" / "20270605_temp" / "samples" / "20270605" / "clip_a"
     assert result.ok is True
@@ -406,7 +411,6 @@ def test_assemble_finish_temp_uses_validated_selected_sensor_source(tmp_path):
         "20270605",
         settings=settings,
         dry_run=False,
-        platform_hint="go2w",
         selected_sensor_source=selected,
     )
 
@@ -435,10 +439,10 @@ def test_confirm_navigation_calibration_params_reports_sensor_source(tmp_path):
 
     result = confirm_navigation_calibration_params(
         "20270605",
-        platform_hint="u",
         user_confirmation="确认",
         settings=settings,
         dry_run=False,
+        selected_sensor_source=sensor_source,
     )
 
     assert result.ok is True
@@ -459,10 +463,10 @@ def test_confirm_navigation_calibration_params_rejects_unconfirmed_input(tmp_pat
 
     result = confirm_navigation_calibration_params(
         "20270605",
-        platform_hint="go2w",
         user_confirmation="终止",
         settings=settings,
         dry_run=False,
+        selected_sensor_source=sensor_source,
     )
 
     assert result.ok is False

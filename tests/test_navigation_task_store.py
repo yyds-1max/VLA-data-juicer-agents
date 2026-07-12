@@ -7,7 +7,11 @@ from pathlib import Path
 import pytest
 
 import vla_data_juicer_agents.navigation.task_store as task_store_module
-from vla_data_juicer_agents.navigation.task_state import NavigationTaskPhase, NavigationTaskStatus
+from vla_data_juicer_agents.navigation.task_state import (
+    TASK_SCHEMA_VERSION,
+    NavigationTaskPhase,
+    NavigationTaskStatus,
+)
 from vla_data_juicer_agents.navigation.task_store import SqliteNavigationTaskStore
 
 
@@ -58,7 +62,7 @@ def test_task_store_creates_and_loads_navigation_task(tmp_path: Path):
     assert loaded.created_by_web_session_id == "web-1"
     assert loaded.latest_web_session_id == "web-1"
     assert loaded.agentscope_session_id == "agent-1"
-    assert loaded.schema_version == 1
+    assert loaded.schema_version == TASK_SCHEMA_VERSION
 
 
 def test_task_store_updates_existing_date_and_segments(tmp_path: Path):
@@ -430,6 +434,43 @@ def test_task_store_migrates_legacy_duplicate_active_segments(tmp_path: Path):
     assert old_status == NavigationTaskStatus.SUPERSEDED.value
 
 
+def test_task_store_rebuilds_legacy_profile_table_without_profile_column(tmp_path: Path):
+    db_path = tmp_path / "navigation_tasks.sqlite"
+    with sqlite3.connect(db_path) as connection:
+        connection.execute(
+            """
+            CREATE TABLE navigation_tasks (
+                task_id TEXT PRIMARY KEY, date TEXT NOT NULL, segments_json TEXT,
+                segments_key TEXT, scene_mode TEXT, phase TEXT NOT NULL,
+                status TEXT NOT NULL, waiting_reason TEXT, next_required_input TEXT,
+                created_by_web_session_id TEXT, latest_web_session_id TEXT,
+                agentscope_session_id TEXT, latest_run_id TEXT,
+                last_completed_step TEXT, data_profile_json TEXT,
+                artifact_snapshot_json TEXT, drift_json TEXT,
+                schema_version INTEGER NOT NULL, created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            )
+            """
+        )
+        connection.execute(
+            """INSERT INTO navigation_tasks VALUES
+            ('legacy', '20270623', NULL, '__all__', NULL, 'finish_processing',
+             'running', NULL, NULL, NULL, NULL, NULL, NULL, NULL,
+             '{"legacy":true}', NULL, NULL, 1,
+             '2026-07-08T00:00:00.000+00:00', '2026-07-08T00:00:00.000+00:00')"""
+        )
+
+    store = SqliteNavigationTaskStore(db_path)
+    task = store.get_task("legacy")
+
+    assert task.status == NavigationTaskStatus.NEEDS_REPLAN
+    assert task.schema_version == TASK_SCHEMA_VERSION
+    with sqlite3.connect(db_path) as connection:
+        columns = {row[1] for row in connection.execute("PRAGMA table_info(navigation_tasks)")}
+        assert "data_profile_json" not in columns
+        assert connection.execute("PRAGMA foreign_key_check").fetchall() == []
+
+
 def test_task_store_migrates_json_encoded_segment_entry(tmp_path: Path):
     db_path = tmp_path / "navigation_tasks.sqlite"
     with sqlite3.connect(db_path) as connection:
@@ -706,30 +747,6 @@ def test_task_store_preserves_dry_run_when_upsert_omits_it(tmp_path: Path):
     assert explicitly_disabled.dry_run is False
 
 
-def test_task_store_can_update_task_after_recording_step(tmp_path: Path):
-    store = SqliteNavigationTaskStore(tmp_path / "navigation_tasks.sqlite")
-    task = store.create_or_update_task(date="20270623", segments=None, scene_mode=None)
-    store.record_step(
-        task_id=task.task_id,
-        phase=NavigationTaskPhase.EXTRACT_SYNC,
-        step_id="extract_and_sync_navigation_data",
-        tool_name="extract_and_sync_navigation_data",
-        status=NavigationTaskStatus.COMPLETED,
-    )
-
-    updated = store.update_task(
-        task.task_id,
-        status=NavigationTaskStatus.RUNNING,
-        latest_run_id="run-1",
-    )
-
-    assert updated.status == NavigationTaskStatus.RUNNING
-    assert updated.latest_run_id == "run-1"
-    assert [step.step_id for step in store.list_steps(task.task_id)] == [
-        "extract_and_sync_navigation_data"
-    ]
-
-
 def test_task_store_update_task_can_clear_optional_fields(tmp_path: Path):
     store = SqliteNavigationTaskStore(tmp_path / "navigation_tasks.sqlite")
     task = store.create_or_update_task(date="20270623", segments=None, scene_mode=None)
@@ -747,25 +764,3 @@ def test_task_store_update_task_can_clear_optional_fields(tmp_path: Path):
 
     assert cleared.waiting_reason is None
     assert cleared.next_required_input is None
-
-
-def test_task_store_records_step_with_result_json(tmp_path: Path):
-    store = SqliteNavigationTaskStore(tmp_path / "navigation_tasks.sqlite")
-    task = store.create_or_update_task(date="20270623", segments=None, scene_mode=None)
-
-    step = store.record_step(
-        task_id=task.task_id,
-        phase=NavigationTaskPhase.EXTRACT_SYNC,
-        step_id="extract_and_sync_navigation_data",
-        tool_name="extract_and_sync_navigation_data",
-        status=NavigationTaskStatus.COMPLETED,
-        arguments={"date": "20270623"},
-        result={"ok": True},
-        produced_paths=["clip_data/20270623"],
-    )
-
-    assert step.task_id == task.task_id
-    assert step.result == {"ok": True}
-    assert step.produced_paths == ["clip_data/20270623"]
-    assert store.list_steps(task.task_id)[0].step_id == "extract_and_sync_navigation_data"
-    assert store.get_task(task.task_id).state_revision == task.state_revision + 1

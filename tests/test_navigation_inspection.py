@@ -4,8 +4,6 @@ import pytest
 
 from vla_data_juicer_agents.navigation.config import NavigationSettings
 from vla_data_juicer_agents.navigation.inspection import (
-    infer_navigation_processing_profile,
-    infer_navigation_processing_profile_tool,
     infer_navigation_sensor_bindings,
     infer_navigation_sensor_bindings_tool,
     infer_navigation_topic_params,
@@ -109,7 +107,6 @@ def test_navigation_investigation_tools_allow_structured_or_json_encoded_segment
     tools = [
         infer_navigation_topic_params_tool,
         infer_navigation_sensor_bindings_tool,
-        infer_navigation_processing_profile_tool,
         inspect_processing_state_tool,
         inspect_gridmap_artifacts_tool,
     ]
@@ -384,105 +381,6 @@ def test_infer_navigation_topic_params_tool_is_read_only():
     assert infer_navigation_topic_params_tool.is_read_only is True
 
 
-def test_infer_navigation_processing_profile_detects_mixed_odom_fixture(tmp_path):
-    metadata_path = tmp_path / "VLADatasets" / "raw_data" / "20270606" / "segment_a" / "metadata.yaml"
-    metadata_path.parent.mkdir(parents=True)
-    metadata_path.write_text(
-        """
-rosbag2_bagfile_information:
-  topics_with_message_count:
-    - topic_metadata:
-        name: /cam_video5/csi_cam/image_raw/compressed
-        type: sensor_msgs/msg/CompressedImage
-      message_count: 10
-    - topic_metadata:
-        name: /lidar_points
-        type: sensor_msgs/msg/PointCloud2
-      message_count: 10
-    - topic_metadata:
-        name: /sport_odom
-        type: nav_msgs/msg/Odometry
-      message_count: 10
-""",
-        encoding="utf-8",
-    )
-    settings = NavigationSettings(vladatasets_root=tmp_path / "VLADatasets")
-
-    result = infer_navigation_processing_profile("20270606", settings=settings)
-
-    assert result.platform_hint == "unknown"
-    assert result.topic_params.profile_hint == "hybrid"
-    assert result.topic_params.topic_whitelist == [
-        "/cam_video5/csi_cam/image_raw/compressed",
-        "/lidar_points",
-        "/sport_odom",
-    ]
-    assert result.topic_params.topic_map == {
-        "cam_video5": "fisheye_front",
-        "lidar_points": "r32_rslidar_points",
-        "sport_odom": "odom",
-    }
-    assert result.topic_params.query_dir == "lidar_points"
-    assert result.localization_policy.source == "odom"
-    assert result.localization_policy.conversion == "odom_to_ins"
-    assert result.blocking_issues == []
-
-
-def test_infer_navigation_processing_profile_keeps_go2w_query_dir_as_source_dir():
-    settings = NavigationSettings(vladatasets_root=FIXTURE_ROOT)
-
-    result = infer_navigation_processing_profile("20270605", settings=settings)
-
-    assert result.topic_params.topic_whitelist == [
-        "/cam_video4/csi_cam/image_raw/compressed",
-        "/rs32_lidar_points",
-        "/sport_odom",
-    ]
-    assert result.topic_params.topic_map["rs32_lidar_points"] == "r32_rslidar_points"
-    assert result.topic_params.query_dir == "rs32_lidar_points"
-
-
-def test_infer_navigation_processing_profile_uses_native_ins_without_odom_conversion(tmp_path):
-    metadata_path = tmp_path / "VLADatasets" / "raw_data" / "20270607" / "segment_a" / "metadata.yaml"
-    metadata_path.parent.mkdir(parents=True)
-    metadata_path.write_text(
-        """
-rosbag2_bagfile_information:
-  topics_with_message_count:
-    - topic_metadata:
-        name: /cam_video5/csi_cam/image_raw/compressed
-        type: sensor_msgs/msg/CompressedImage
-      message_count: 10
-    - topic_metadata:
-        name: /r32_rslidar_points
-        type: sensor_msgs/msg/PointCloud2
-      message_count: 10
-    - topic_metadata:
-        name: /drivers/ins/Ins
-        type: custom_msgs/msg/Ins
-      message_count: 10
-""",
-        encoding="utf-8",
-    )
-    settings = NavigationSettings(vladatasets_root=tmp_path / "VLADatasets")
-
-    result = infer_navigation_processing_profile("20270607", settings=settings)
-
-    assert result.topic_params.topic_whitelist == [
-        "/cam_video5/csi_cam/image_raw/compressed",
-        "/r32_rslidar_points",
-        "/drivers/ins/Ins",
-    ]
-    assert result.topic_params.topic_map == {
-        "cam_video5": "fisheye_front",
-        "r32_rslidar_points": "r32_rslidar_points",
-        "Ins": "ins",
-    }
-    assert result.topic_params.query_dir == "r32_rslidar_points"
-    assert result.localization_policy.source == "ins"
-    assert result.localization_policy.conversion == "none"
-
-
 def test_infer_navigation_sensor_bindings_prefers_unique_ins_over_ambiguous_odom(tmp_path):
     metadata_path = tmp_path / "VLADatasets" / "raw_data" / "20270608" / "segment_a" / "metadata.yaml"
     metadata_path.parent.mkdir(parents=True)
@@ -528,46 +426,6 @@ rosbag2_bagfile_information:
     )
 
 
-def test_infer_navigation_processing_profile_blocks_unreadable_selected_metadata(tmp_path):
-    valid_metadata_path = tmp_path / "VLADatasets" / "raw_data" / "20270609" / "segment_a" / "metadata.yaml"
-    valid_metadata_path.parent.mkdir(parents=True)
-    valid_metadata_path.write_text(
-        """
-rosbag2_bagfile_information:
-  topics_with_message_count:
-    - topic_metadata:
-        name: /cam_video5/csi_cam/image_raw/compressed
-        type: sensor_msgs/msg/CompressedImage
-      message_count: 10
-    - topic_metadata:
-        name: /lidar_points
-        type: sensor_msgs/msg/PointCloud2
-      message_count: 10
-    - topic_metadata:
-        name: /sport_odom
-        type: nav_msgs/msg/Odometry
-      message_count: 10
-""",
-        encoding="utf-8",
-    )
-    bad_segment = tmp_path / "VLADatasets" / "raw_data" / "20270609" / "segment_b"
-    bad_segment.mkdir(parents=True)
-    settings = NavigationSettings(vladatasets_root=tmp_path / "VLADatasets")
-
-    result = infer_navigation_processing_profile(
-        "20270609",
-        segments=["segment_a", "segment_b"],
-        settings=settings,
-    )
-
-    assert result.blocking_issues
-    assert result.topic_params.confidence == 0.0
-    assert any(
-        issue.type == "raw_metadata_error" and "segment_b" in " ".join(issue.evidence)
-        for issue in result.blocking_issues
-    )
-
-
 def test_infer_navigation_sensor_bindings_blocks_ambiguous_camera_role(tmp_path):
     metadata_path = tmp_path / "VLADatasets" / "raw_data" / "20270608" / "segment_a" / "metadata.yaml"
     metadata_path.parent.mkdir(parents=True)
@@ -604,13 +462,6 @@ rosbag2_bagfile_information:
         "/cam_video5/csi_cam/image_raw/compressed",
     ]
     assert any(issue.type == "ambiguous_navigation_topic_role" for issue in result.blocking_issues)
-
-
-def test_infer_navigation_processing_profile_tools_are_read_only():
-    assert infer_navigation_sensor_bindings_tool.name == "infer_navigation_sensor_bindings_tool"
-    assert infer_navigation_processing_profile_tool.name == "infer_navigation_processing_profile_tool"
-    assert infer_navigation_sensor_bindings_tool.is_read_only is True
-    assert infer_navigation_processing_profile_tool.is_read_only is True
 
 
 def test_inspect_processing_state_summarizes_existing_intermediate_outputs(tmp_path):
