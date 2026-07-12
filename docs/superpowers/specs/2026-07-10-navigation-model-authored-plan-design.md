@@ -460,12 +460,23 @@ Delivery recovery follows these rules:
   `pending` or unexpired `delivering` work cannot be force-recovered through this
   path.
 
-The controlled recovery endpoint is an operational safety valve, not a model-facing
-planning or processing tool. A stale worker that later resumes remains fenced from
-processing by the invalidated plan and current-step ledger gates. Fully automatic
-lease reclamation requires a future AgentScope session-transaction fencing token
-and is explicitly outside this iteration. AgentScope context compression remains
-unchanged.
+The controlled recovery endpoint is
+`POST /api/sessions/{session_id}/human-decisions/recovery`. Its request contains
+only `action: "quarantine_and_replan"`, `plan_id`, `step_id`, and a bounded
+non-empty `reason`. It is an operational safety valve, not a model-facing planning
+or processing tool. The repository verifies that the affected task belongs to the
+Web session in the URL and that the handoff is already `recovery_required`.
+
+A successful recovery changes the handoff to the terminal audited state
+`quarantined`, preserves the original decision, records the reason and recovery
+timestamp, invalidates the affected plan, changes unfinished ledger steps and the
+task to `needs_replan`, and returns a compact recovery anchor. Quarantined handoffs
+do not block a replacement plan. A stale worker that later resumes remains fenced
+from processing by the invalidated plan and current-step ledger gates.
+
+Fully automatic lease reclamation requires a future AgentScope session-transaction
+fencing token and is explicitly outside this iteration. AgentScope context
+compression remains unchanged.
 
 ## Tool Exposure by Phase
 

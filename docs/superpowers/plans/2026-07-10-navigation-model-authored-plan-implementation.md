@@ -992,13 +992,18 @@ git commit -m "feat: submit complete navigation plans atomically"
 
 **Files:**
 - Create: `src/vla_data_juicer_agents/navigation/plan_execution.py`
+- Modify: `src/vla_data_juicer_agents/navigation/plan_store.py`
 - Modify: `src/vla_data_juicer_agents/navigation/execution_tools.py:346-1390`
 - Modify: `src/vla_data_juicer_agents/navigation/agent_tools.py:48-425`
 - Modify: `src/vla_data_juicer_agents/runtime/agentscope_runtime.py:300-430`
+- Modify: `src/vla_data_juicer_agents/web/agent_session.py`
+- Modify: `src/vla_data_juicer_agents/web/app.py`
+- Modify: `src/vla_data_juicer_agents/web/schemas.py`
 - Create: `tests/test_navigation_plan_execution.py`
 - Modify: `tests/test_navigation_execution_tools_dry_run.py`
 - Modify: `tests/test_navigation_agent_tools.py`
 - Modify: `tests/test_web_human_decision_api.py`
+- Modify: `tests/test_web_agentscope_session.py`
 
 **Interfaces:**
 - Produces: `resolve_step_arguments(*, task, plan, step, settings) -> dict[str, Any]`, `build_plan_bound_execution_tools(*, task, plan_store, evidence_store, settings, dry_run, cancellation) -> list[ToolBase]`, and ledger transition methods.
@@ -1071,6 +1076,44 @@ Add regressions for expired-but-`SUBMITTED` fail-closed behavior, consumed ack-o
 behavior, missing session/mapping recovery-required behavior, rejection of recovery
 for live work, controlled quarantine audit, plan/task transition, replacement-plan
 unblocking, and stale-wrapper rejection.
+
+Use these exact Web contracts:
+
+```python
+class HumanDecisionRecoveryRequest(BaseModel):
+    action: Literal["quarantine_and_replan"]
+    plan_id: str = Field(max_length=512)
+    step_id: str = Field(max_length=512)
+    reason: str = Field(min_length=1, max_length=4000)
+
+
+class HumanDecisionRecoveryResponse(BaseModel):
+    recovered: Literal[True]
+    plan_id: str
+    step_id: str
+    handoff_status: Literal["quarantined"]
+    task_status: Literal["needs_replan"]
+    next_action: Literal["submit_complete_plan"]
+```
+
+Expose `POST /api/sessions/{session_id}/human-decisions/recovery`. The Web manager
+delegates to
+`NavigationAgentScopeRuntime.recover_human_decision_handoff(web_session_id,
+recovery)`. The repository methods are
+`mark_human_decision_recovery_required(plan_id, step_id, *, reason_code)` and
+`quarantine_human_decision_handoff(plan_id, step_id, *, expected_web_session_id,
+reason)`. The first method is idempotent for the same unresolved handoff. The
+second uses `BEGIN IMMEDIATE`, accepts only `recovery_required`, preserves the row
+and decision as `quarantined`, records `recovery_reason`/`recovered_at`, invalidates
+the plan, transitions unfinished steps and the task to `needs_replan`, and returns
+the compact fields used by `HumanDecisionRecoveryResponse`.
+
+`claim_human_decision_delivery` returns `recovery_required` instead of reclaiming
+an expired `delivering` row. Runtime paths that cannot find the Web mapping,
+AgentScope session, reply, or tool call mark the handoff recovery-required and
+return a compact actionable conflict. Consumed calls still use ack-only recovery.
+Pending events expose recovery-required metadata, while quarantined handoffs are
+suppressed/marked consumed so the UI cannot resubmit the stale decision.
 
 - [ ] **Step 8: Run focused tests**
 
