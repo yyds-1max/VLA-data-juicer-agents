@@ -5,6 +5,7 @@ import asyncio
 import json
 import sys
 
+from vla_data_juicer_agents.core.cancellation import TurnCancelled
 from vla_data_juicer_agents.navigation.agent_tools import resolve_navigation_agent_tools
 from vla_data_juicer_agents.navigation.agents import create_executor_agent
 from vla_data_juicer_agents.navigation.config import NavigationSettings
@@ -104,6 +105,14 @@ async def async_main(argv: list[str] | None = None) -> int:
         )
         print(final_output)
         return 0 if terminal["ok"] else 2
+    except TurnCancelled as exc:
+        run_store.write_json(
+            run_dir,
+            "final_report.json",
+            {"status": "failed", "ok": False, "error_type": type(exc).__name__, "message": str(exc)},
+        )
+        print(str(exc), file=sys.stderr)
+        return 2
     except Exception as exc:
         if services is not None and task is not None and plan is not None:
             terminal = direct_execution_terminal_state(

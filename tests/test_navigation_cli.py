@@ -5,6 +5,7 @@ from types import SimpleNamespace
 import pytest
 
 from vla_data_juicer_agents.cli import async_main, parse_args
+from vla_data_juicer_agents.core.cancellation import TurnCancelled
 from vla_data_juicer_agents.navigation.config import NavigationSettings
 
 
@@ -34,18 +35,20 @@ def test_parse_segments_requires_at_least_one_value():
 
 
 @pytest.mark.parametrize(
-    ("ledger_status", "executor_raises", "expected_status", "expected_exit"),
+    ("ledger_status", "executor_error", "expected_status", "expected_exit"),
     [
-        ("failed", False, "failed", 2),
-        ("waiting_user", True, "waiting_user", 2),
-        ("dry_run_completed", False, "completed", 0),
+        ("failed", None, "failed", 2),
+        ("waiting_user", RuntimeError, "waiting_user", 2),
+        ("dry_run_completed", None, "completed", 0),
+        ("waiting_user", TurnCancelled, "failed", 2),
+        ("dry_run_completed", TurnCancelled, "failed", 2),
     ],
 )
 def test_cli_uses_durable_terminal_state_not_executor_text(
     tmp_path,
     monkeypatch,
     ledger_status,
-    executor_raises,
+    executor_error,
     expected_status,
     expected_exit,
 ):
@@ -100,8 +103,8 @@ def test_cli_uses_durable_terminal_state_not_executor_text(
         return plan
 
     async def fake_executor(*_args, **_kwargs):
-        if executor_raises:
-            raise RuntimeError("durable human gate")
+        if executor_error is not None:
+            raise executor_error("executor stopped")
         return "assistant says completed"
 
     monkeypatch.setattr("vla_data_juicer_agents.cli.run_direct_plan_until_submitted", fake_plan)
@@ -116,6 +119,8 @@ def test_cli_uses_durable_terminal_state_not_executor_text(
     report = json.loads(report_path.read_text(encoding="utf-8"))
     assert report["ok"] is (expected_exit == 0)
     assert report["status"] == expected_status
+    if executor_error is TurnCancelled:
+        assert report["error_type"] == "TurnCancelled"
 
 
 def test_cli_completed_entry_skips_plan_and_execution(tmp_path, monkeypatch):
