@@ -504,7 +504,8 @@ def test_prepare_task_entry_restores_existing_task_when_evidence_append_fails(
     latest_after = task_store.find_latest_by_agentscope_session("as-old")
     resumable_after = [task.task_id for task in task_store.list_resumable()]
 
-    assert restored == original
+    assert restored.model_copy(update={"state_revision": original.state_revision}) == original
+    assert restored.state_revision > original.state_revision
     assert restored is not None
     assert restored.created_at == original.created_at
     assert restored.updated_at == original.updated_at

@@ -72,6 +72,7 @@ class NavigationTask(BaseModel):
     scene_mode: Literal["in", "out"] | None = None
     dry_run: bool = False
     guidance_revision: int = 0
+    state_revision: int = Field(default=0, ge=0)
     phase: NavigationTaskPhase = NavigationTaskPhase.INTAKE
     status: NavigationTaskStatus = NavigationTaskStatus.PENDING
     waiting_reason: str | None = None

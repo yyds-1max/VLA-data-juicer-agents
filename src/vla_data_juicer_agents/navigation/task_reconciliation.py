@@ -277,7 +277,7 @@ def prepare_navigation_task_entry(
             elif previous_task is None:
                 current = saved or task
                 if not task_store.delete_task_if_current(
-                    task.task_id, expected_updated_at=current.updated_at,
+                    task.task_id, expected_state_revision=current.state_revision,
                     expected_web_session_id=web_session_id,
                     expected_agentscope_session_id=agentscope_session_id,
                 ):
@@ -285,7 +285,7 @@ def prepare_navigation_task_entry(
             else:
                 current = saved or task
                 if not task_store.restore_task_exact_if_current(
-                    previous_task, expected_updated_at=current.updated_at,
+                    previous_task, expected_state_revision=current.state_revision,
                     expected_web_session_id=web_session_id,
                     expected_agentscope_session_id=agentscope_session_id,
                 ):

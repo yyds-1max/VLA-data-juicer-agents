@@ -296,6 +296,32 @@ def test_repository_backfills_legacy_null_result_ref_and_lazy_recovers(tmp_path:
     assert status == "completed"
 
 
+def test_step_ledger_transitions_increment_task_state_revision(tmp_path: Path):
+    repo, task = stores_with_task(tmp_path)
+    plan = repo.activate(task, "extract_sync", 1, valid_extract_plan())
+
+    assert repo.claim_step(plan.plan_id, "prepare", "prepare_raw_data")
+    after_claim = SqliteNavigationTaskStore(repo.db_path).get_task(task.task_id)
+    assert after_claim.state_revision == task.state_revision + 1
+
+    repo.stage_step_result(
+        plan.plan_id,
+        "prepare",
+        target_status="completed",
+        full_result={"message": "done", "ok": True, "tool_name": "prepare_raw_data"},
+        result_summary={"message": "done", "ok": True, "tool_name": "prepare_raw_data"},
+    )
+    assert repo.finalize_staged_step(plan.plan_id, "prepare")
+    after_finalize = SqliteNavigationTaskStore(repo.db_path).get_task(task.task_id)
+    assert after_finalize.state_revision == after_claim.state_revision + 1
+
+    assert repo.mark_waiting_user(
+        plan.plan_id, "sync", "extract_and_sync_navigation_data"
+    )
+    after_waiting = SqliteNavigationTaskStore(repo.db_path).get_task(task.task_id)
+    assert after_waiting.state_revision == after_finalize.state_revision + 1
+
+
 def test_activate_plan_and_ledger_is_atomic(tmp_path: Path):
     repo, task = stores_with_task(tmp_path)
 

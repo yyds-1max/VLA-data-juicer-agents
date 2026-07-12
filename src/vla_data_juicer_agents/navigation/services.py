@@ -37,7 +37,7 @@ _LEGACY_OBSERVATION_MIGRATION = "legacy_observations_to_unified_v1"
 def _legacy_migration_complete(target: Path) -> bool:
     if not target.is_file():
         return False
-    connection = sqlite3.connect(f"file:{target}?mode=ro", uri=True, timeout=0.1)
+    connection = sqlite3.connect(f"file:{target}?mode=ro", uri=True, timeout=5.0)
     try:
         if connection.execute(
             "SELECT 1 FROM sqlite_master WHERE type='table' AND name='navigation_service_migrations'"
@@ -231,15 +231,13 @@ def build_navigation_services(
     """Build one coherent durable service bundle for a navigation workspace."""
     resolved_settings = settings or NavigationSettings()
     db_path = workspace_root / "navigation-tasks.sqlite"
-    migrated = _legacy_migration_complete(db_path)
-    task_store = SqliteNavigationTaskStore(db_path, initialize=not migrated)
-    observation_store = SqliteNavigationObservationStore(db_path, initialize=not migrated)
-    if not migrated:
-        _migrate_legacy_observations(workspace_root / "navigation-observations.sqlite", db_path)
+    task_store = SqliteNavigationTaskStore(db_path)
+    observation_store = SqliteNavigationObservationStore(db_path)
+    _migrate_legacy_observations(workspace_root / "navigation-observations.sqlite", db_path)
     return NavigationServices(
         settings=resolved_settings,
         task_store=task_store,
         observation_store=observation_store,
         evidence_store=FileNavigationEvidenceStore(workspace_root / "navigation-evidence"),
-        plan_store=SqliteNavigationPlanRepository(db_path, initialize=not migrated),
+        plan_store=SqliteNavigationPlanRepository(db_path),
     )

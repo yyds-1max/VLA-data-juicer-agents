@@ -156,6 +156,55 @@ def test_owned_update_rejects_identity_field_changes_without_mutation(tmp_path: 
     assert store.get_task(owned.task_id) == owned
 
 
+def test_same_timestamp_state_revision_prevents_restore_aba(monkeypatch, tmp_path: Path):
+    monkeypatch.setattr(task_store_module, "utc_now", lambda: "2026-07-10T00:00:00+00:00")
+    store = SqliteNavigationTaskStore(tmp_path / "tasks.sqlite")
+    original = store.create_or_update_task(
+        date="20270623", segments=None, scene_mode=None,
+        web_session_id="web-owner", agentscope_session_id="as-old",
+    )
+    claimed = store.update_task_for_session(
+        original.task_id, web_session_id="web-owner",
+        agentscope_session_id="as-old", scene_mode="in",
+    )
+    concurrent = store.create_or_update_task(
+        date=original.date, segments=original.segments, scene_mode="out",
+        web_session_id="web-owner", agentscope_session_id="as-new",
+    )
+
+    restored = store.restore_task_exact_if_current(
+        original, expected_state_revision=claimed.state_revision,
+        expected_web_session_id="web-owner", expected_agentscope_session_id="as-old",
+    )
+
+    assert restored is False
+    current = store.get_task(original.task_id)
+    assert current.scene_mode == "out"
+    assert current.agentscope_session_id == "as-new"
+    assert current.state_revision > claimed.state_revision
+
+
+def test_new_task_cleanup_delete_is_state_revision_cas(monkeypatch, tmp_path: Path):
+    monkeypatch.setattr(task_store_module, "utc_now", lambda: "2026-07-10T00:00:00+00:00")
+    store = SqliteNavigationTaskStore(tmp_path / "tasks.sqlite")
+    created = store.create_or_update_task(
+        date="20270623", segments=None, scene_mode=None,
+        web_session_id="web-owner", agentscope_session_id="as-old",
+    )
+    updated = store.create_or_update_task(
+        date=created.date, segments=created.segments, scene_mode="out",
+        web_session_id="web-owner", agentscope_session_id="as-new",
+    )
+
+    deleted = store.delete_task_if_current(
+        created.task_id, expected_state_revision=created.state_revision,
+        expected_web_session_id="web-owner", expected_agentscope_session_id="as-old",
+    )
+
+    assert deleted is False
+    assert store.get_task(created.task_id) == updated
+
+
 def test_task_store_exact_restore_preserves_entire_persisted_model(
     monkeypatch,
     tmp_path: Path,
@@ -190,9 +239,11 @@ def test_task_store_exact_restore_preserves_entire_persisted_model(
         agentscope_session_id="as-new",
     )
 
-    store.restore_task_exact(original)
+    restored = store.restore_task_exact(original)
 
-    assert store.get_task(original.task_id) == original
+    assert restored.model_copy(update={"state_revision": original.state_revision}) == original
+    assert restored.state_revision > original.state_revision
+    assert store.get_task(original.task_id) == restored
 
 
 def test_task_store_update_task_ignores_caller_timestamps(monkeypatch, tmp_path: Path):
@@ -679,3 +730,4 @@ def test_task_store_records_step_with_result_json(tmp_path: Path):
     assert step.result == {"ok": True}
     assert step.produced_paths == ["clip_data/20270623"]
     assert store.list_steps(task.task_id)[0].step_id == "extract_and_sync_navigation_data"
+    assert store.get_task(task.task_id).state_revision == task.state_revision + 1

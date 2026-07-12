@@ -715,6 +715,15 @@ class SqliteNavigationPlanRepository:
                     expected_agentscope_session_id,
                 ),
             )
+            if cursor.rowcount == 1:
+                connection.execute(
+                    """UPDATE navigation_tasks
+                       SET state_revision = state_revision + 1
+                       WHERE task_id = (
+                           SELECT task_id FROM navigation_plans WHERE plan_id = ?
+                       )""",
+                    (plan_id,),
+                )
         return cursor.rowcount == 1
 
     def mark_waiting_user(
@@ -755,6 +764,15 @@ class SqliteNavigationPlanRepository:
                     expected_agentscope_session_id,
                 ),
             )
+            if cursor.rowcount == 1:
+                connection.execute(
+                    """UPDATE navigation_tasks
+                       SET state_revision = state_revision + 1
+                       WHERE task_id = (
+                           SELECT task_id FROM navigation_plans WHERE plan_id = ?
+                       )""",
+                    (plan_id,),
+                )
         return cursor.rowcount == 1
 
     def stage_step_result(
@@ -951,6 +969,12 @@ class SqliteNavigationPlanRepository:
             if cursor.rowcount != 1:
                 connection.rollback()
                 return False
+            connection.execute(
+                """UPDATE navigation_tasks
+                   SET state_revision = state_revision + 1
+                   WHERE task_id = ?""",
+                (staged.task_id,),
+            )
             if staged.target_status == "completed":
                 remaining = connection.execute(
                     """
@@ -972,7 +996,7 @@ class SqliteNavigationPlanRepository:
             else:
                 connection.execute(
                     """UPDATE navigation_tasks
-                       SET status = 'failed', updated_at = ?
+                       SET status = 'failed', updated_at = ?, state_revision = state_revision + 1
                        WHERE task_id = ?""",
                     (utc_now(), staged.task_id),
                 )
@@ -1058,7 +1082,7 @@ class SqliteNavigationPlanRepository:
             connection.execute(
                 """
                 UPDATE navigation_tasks
-                SET status = 'needs_replan', updated_at = ?
+                SET status = 'needs_replan', updated_at = ?, state_revision = state_revision + 1
                 WHERE task_id = ?
                 """,
                 (timestamp, row["task_id"]),
@@ -1415,7 +1439,8 @@ class SqliteNavigationPlanRepository:
                 (timestamp, plan_id),
             )
             connection.execute(
-                """UPDATE navigation_tasks SET status = 'needs_replan', updated_at = ?
+                """UPDATE navigation_tasks SET status = 'needs_replan', updated_at = ?,
+                   state_revision = state_revision + 1
                    WHERE task_id = ?""",
                 (timestamp, row["task_id"]),
             )
@@ -1524,7 +1549,7 @@ class SqliteNavigationPlanRepository:
             connection.execute(
                 """
                 UPDATE navigation_tasks
-                SET status = 'needs_replan', updated_at = ?
+                SET status = 'needs_replan', updated_at = ?, state_revision = state_revision + 1
                 WHERE task_id = ?
                 """,
                 (timestamp, row["task_id"]),

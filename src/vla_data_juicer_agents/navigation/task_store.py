@@ -198,6 +198,7 @@ class SqliteNavigationTaskStore:
                     scene_mode TEXT,
                     dry_run INTEGER NOT NULL DEFAULT 0,
                     guidance_revision INTEGER NOT NULL DEFAULT 0,
+                    state_revision INTEGER NOT NULL DEFAULT 0,
                     phase TEXT NOT NULL,
                     status TEXT NOT NULL,
                     waiting_reason TEXT,
@@ -216,8 +217,8 @@ class SqliteNavigationTaskStore:
                 )
                 """
             )
-            self._migrate_segments_key(connection)
             self._migrate_task_entry_fields(connection)
+            self._migrate_segments_key(connection)
             connection.execute(
                 """
                 CREATE INDEX IF NOT EXISTS idx_navigation_tasks_date_updated
@@ -271,6 +272,10 @@ class SqliteNavigationTaskStore:
                 "ALTER TABLE navigation_tasks "
                 "ADD COLUMN guidance_revision INTEGER NOT NULL DEFAULT 0"
             )
+        if "state_revision" not in columns:
+            connection.execute(
+                "ALTER TABLE navigation_tasks ADD COLUMN state_revision INTEGER NOT NULL DEFAULT 0"
+            )
 
     def _migrate_segments_key(self, connection: sqlite3.Connection) -> None:
         connection.execute("DROP INDEX IF EXISTS idx_navigation_tasks_active_date_segments_key")
@@ -281,17 +286,21 @@ class SqliteNavigationTaskStore:
         if "segments_key" not in columns:
             connection.execute("ALTER TABLE navigation_tasks ADD COLUMN segments_key TEXT")
         rows = connection.execute(
-            "SELECT rowid, segments_json FROM navigation_tasks"
+            "SELECT rowid, segments_json, segments_key FROM navigation_tasks"
         ).fetchall()
         for row in rows:
             segments = normalize_segments(_json_load(row["segments_json"]))
+            canonical_json = _json_dump(segments)
+            canonical_key = _segments_key(segments)
+            if row["segments_json"] == canonical_json and row["segments_key"] == canonical_key:
+                continue
             connection.execute(
                 """
                 UPDATE navigation_tasks
-                SET segments_json = ?, segments_key = ?
+                SET segments_json = ?, segments_key = ?, state_revision = state_revision + 1
                 WHERE rowid = ?
                 """,
-                (_json_dump(segments), _segments_key(segments), row["rowid"]),
+                (canonical_json, canonical_key, row["rowid"]),
             )
         duplicate_rows = connection.execute(
             """
@@ -313,7 +322,7 @@ class SqliteNavigationTaskStore:
             connection.execute(
                 """
                 UPDATE navigation_tasks
-                SET status = ?, updated_at = ?
+                SET status = ?, updated_at = ?, state_revision = state_revision + 1
                 WHERE rowid = ?
                 """,
                 (NavigationTaskStatus.SUPERSEDED.value, utc_now(), row["rowid"]),
@@ -351,6 +360,7 @@ class SqliteNavigationTaskStore:
                     segments=segments,
                     scene_mode=scene_mode if scene_mode in {"in", "out"} else None,
                     dry_run=bool(dry_run),
+                    state_revision=1,
                     created_by_web_session_id=web_session_id,
                     latest_web_session_id=web_session_id,
                     agentscope_session_id=agentscope_session_id,
@@ -388,6 +398,7 @@ class SqliteNavigationTaskStore:
                             else existing.agentscope_session_id
                         ),
                         "updated_at": timestamp,
+                        "state_revision": existing.state_revision + 1,
                     }
                 )
                 task = NavigationTask.model_validate(payload)
@@ -471,6 +482,7 @@ class SqliteNavigationTaskStore:
             payload["segments"] = normalize_segments(payload["segments"])
         payload["created_at"] = current.created_at
         payload["updated_at"] = utc_now()
+        payload["state_revision"] = current.state_revision + 1
         task = NavigationTask.model_validate(payload)
         with self._connect() as connection:
             self._update_task(connection, task)
@@ -518,6 +530,7 @@ class SqliteNavigationTaskStore:
                 payload["segments"] = normalize_segments(payload["segments"])
             payload["created_at"] = current.created_at
             payload["updated_at"] = utc_now()
+            payload["state_revision"] = current.state_revision + 1
             task = NavigationTask.model_validate(payload)
             self._update_task(connection, task)
             connection.commit()
@@ -529,6 +542,10 @@ class SqliteNavigationTaskStore:
             connection.close()
 
     def restore_task_exact(self, task: NavigationTask) -> NavigationTask:
+        current = self.get_task(task.task_id)
+        if current is None:
+            raise KeyError(task.task_id)
+        task = task.model_copy(update={"state_revision": current.state_revision + 1})
         with self._connect() as connection:
             cursor = self._update_task(connection, task)
             if cursor.rowcount == 0:
@@ -542,41 +559,38 @@ class SqliteNavigationTaskStore:
         return self._task_from_row(row)
 
     def restore_task_exact_if_current(
-        self, task: NavigationTask, *, expected_updated_at: str,
+        self, task: NavigationTask, *, expected_state_revision: int,
         expected_web_session_id: str | None, expected_agentscope_session_id: str | None,
     ) -> bool:
+        task = task.model_copy(update={"state_revision": expected_state_revision + 1})
         values = self._task_values(task)
         with self._connect() as connection:
             cursor = connection.execute(
                 """UPDATE navigation_tasks SET date=?, segments_json=?, segments_key=?,
-                scene_mode=?, dry_run=?, guidance_revision=?, phase=?, status=?,
+                scene_mode=?, dry_run=?, guidance_revision=?, state_revision=?, phase=?, status=?,
                 waiting_reason=?, next_required_input=?, created_by_web_session_id=?,
                 latest_web_session_id=?, agentscope_session_id=?, latest_run_id=?,
                 last_completed_step=?, data_profile_json=?, artifact_snapshot_json=?,
                 drift_json=?, schema_version=?, created_at=?, updated_at=?
-                WHERE task_id=? AND updated_at=? AND latest_web_session_id IS ?
+                WHERE task_id=? AND state_revision=? AND latest_web_session_id IS ?
                   AND agentscope_session_id IS ?""",
-                values[1:] + (values[0], expected_updated_at,
+                values[1:] + (values[0], expected_state_revision,
                               expected_web_session_id, expected_agentscope_session_id),
             )
         return cursor.rowcount == 1
 
     def delete_task_if_current(
-        self, task_id: str, *, expected_updated_at: str,
+        self, task_id: str, *, expected_state_revision: int,
         expected_web_session_id: str | None, expected_agentscope_session_id: str | None,
     ) -> bool:
         with self._connect() as connection:
-            row = connection.execute(
-                """SELECT 1 FROM navigation_tasks WHERE task_id=? AND updated_at=?
+            cursor = connection.execute(
+                """DELETE FROM navigation_tasks WHERE task_id=? AND state_revision=?
                 AND latest_web_session_id IS ? AND agentscope_session_id IS ?""",
-                (task_id, expected_updated_at, expected_web_session_id,
+                (task_id, expected_state_revision, expected_web_session_id,
                  expected_agentscope_session_id),
-            ).fetchone()
-            if row is None:
-                return False
-            connection.execute("DELETE FROM navigation_task_steps WHERE task_id=?", (task_id,))
-            connection.execute("DELETE FROM navigation_tasks WHERE task_id=?", (task_id,))
-        return True
+            )
+        return cursor.rowcount == 1
 
     def delete_task(self, task_id: str) -> None:
         with self._connect() as connection:
@@ -642,6 +656,12 @@ class SqliteNavigationTaskStore:
                     step.finished_at,
                 ),
             )
+            connection.execute(
+                """UPDATE navigation_tasks
+                   SET state_revision = state_revision + 1
+                   WHERE task_id = ?""",
+                (task_id,),
+            )
         return step
 
     def record_step_for_session(
@@ -699,6 +719,12 @@ class SqliteNavigationTaskStore:
                     step.finished_at,
                 ),
             )
+            connection.execute(
+                """UPDATE navigation_tasks
+                   SET state_revision = state_revision + 1
+                   WHERE task_id = ?""",
+                (step.task_id,),
+            )
             connection.commit()
             return step
         except Exception:
@@ -720,13 +746,13 @@ class SqliteNavigationTaskStore:
             """
             INSERT INTO navigation_tasks (
                 task_id, date, segments_json, segments_key, scene_mode,
-                dry_run, guidance_revision, phase, status,
+                dry_run, guidance_revision, state_revision, phase, status,
                 waiting_reason, next_required_input, created_by_web_session_id,
                 latest_web_session_id, agentscope_session_id, latest_run_id,
                 last_completed_step, data_profile_json, artifact_snapshot_json,
                 drift_json, schema_version, created_at, updated_at
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             self._task_values(task),
         )
@@ -746,6 +772,7 @@ class SqliteNavigationTaskStore:
                 scene_mode = ?,
                 dry_run = ?,
                 guidance_revision = ?,
+                state_revision = ?,
                 phase = ?,
                 status = ?,
                 waiting_reason = ?,
@@ -775,6 +802,7 @@ class SqliteNavigationTaskStore:
             task.scene_mode,
             int(task.dry_run),
             task.guidance_revision,
+            task.state_revision,
             task.phase.value,
             task.status.value,
             task.waiting_reason,
@@ -802,6 +830,7 @@ class SqliteNavigationTaskStore:
             scene_mode=row["scene_mode"],
             dry_run=bool(row["dry_run"]),
             guidance_revision=row["guidance_revision"],
+            state_revision=row["state_revision"],
             phase=row["phase"],
             status=row["status"],
             waiting_reason=row["waiting_reason"],

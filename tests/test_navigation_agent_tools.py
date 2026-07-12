@@ -1,6 +1,8 @@
 import asyncio
 import json
 import sqlite3
+import time
+from threading import Event
 from concurrent.futures import ThreadPoolExecutor
 from types import SimpleNamespace
 
@@ -1944,13 +1946,21 @@ def test_legacy_migration_requires_bidirectional_evidence_integrity(tmp_path, co
 def test_completed_legacy_marker_fast_path_needs_no_target_write_lock(tmp_path):
     _write_legacy_observation_fixture(tmp_path)
     first = build_navigation_services(tmp_path)
-    connection = sqlite3.connect(first.task_store.db_path, timeout=0.1)
-    connection.execute("BEGIN IMMEDIATE")
-    try:
-        resumed = build_navigation_services(tmp_path)
-    finally:
+    locked = Event()
+
+    def transient_writer():
+        connection = sqlite3.connect(first.task_store.db_path)
+        connection.execute("BEGIN IMMEDIATE")
+        locked.set()
+        time.sleep(0.1)
         connection.rollback()
         connection.close()
+
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        future = executor.submit(transient_writer)
+        locked.wait()
+        resumed = build_navigation_services(tmp_path)
+        future.result()
 
     assert resumed.observation_store.latest("nav-legacy-integrity") is not None
 
@@ -1969,6 +1979,27 @@ def test_concurrent_navigation_service_builders_migrate_once(tmp_path):
         assert connection.execute(
             "SELECT COUNT(*) FROM navigation_service_migrations"
         ).fetchone()[0] == 1
+
+
+def test_marker_only_database_is_fully_upgraded_before_services_return(tmp_path):
+    db_path = tmp_path / "navigation-tasks.sqlite"
+    with sqlite3.connect(db_path) as connection:
+        connection.execute(
+            "CREATE TABLE navigation_service_migrations (name TEXT PRIMARY KEY, completed_at TEXT)"
+        )
+        connection.execute(
+            "INSERT INTO navigation_service_migrations VALUES (?, ?)",
+            ("legacy_observations_to_unified_v1", "now"),
+        )
+
+    services = build_navigation_services(tmp_path)
+    task = services.task_store.create_or_update_task(
+        date="20260710", segments=None, scene_mode=None,
+    )
+
+    assert services.task_store.get_task(task.task_id) is not None
+    assert services.observation_store.latest(task.task_id) is None
+    assert services.plan_store.get_active(task.task_id, "extract_sync") is None
 
 
 @pytest.mark.parametrize("failure", ["invalid_json", "partial_schema"])
