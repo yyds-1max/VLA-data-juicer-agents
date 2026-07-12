@@ -474,6 +474,14 @@ task to `needs_replan`, and returns a compact recovery anchor. Quarantined hando
 do not block a replacement plan. A stale worker that later resumes remains fenced
 from processing by the invalidated plan and current-step ledger gates.
 
+The Web event and UI preserve `plan_id`, `step_id`, `recovery_required`,
+`submission_disabled`, and `recovery_endpoint`. A recovery-required update for an
+already displayed reply/tool-call identity replaces the prior normal decision
+state instead of being dropped as a duplicate. The UI disables confirm, stop, and
+guide submission, displays a bounded recovery-reason input, and calls only the
+controlled recovery endpoint. Normal plan-bound submissions include `plan_id` and
+`step_id`; legacy decisions may omit them until the legacy path is removed.
+
 Fully automatic lease reclamation requires a future AgentScope session-transaction
 fencing token and is explicitly outside this iteration. AgentScope context
 compression remains unchanged.

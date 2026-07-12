@@ -1004,6 +1004,15 @@ git commit -m "feat: submit complete navigation plans atomically"
 - Modify: `tests/test_navigation_agent_tools.py`
 - Modify: `tests/test_web_human_decision_api.py`
 - Modify: `tests/test_web_agentscope_session.py`
+- Modify: `frontend/src/api/types.ts`
+- Modify: `frontend/src/api/client.ts`
+- Modify: `frontend/src/api/client.test.ts`
+- Modify: `frontend/src/store/eventReducer.ts`
+- Modify: `frontend/src/store/eventReducer.test.ts`
+- Modify: `frontend/src/components/datapilot/DataPilotWindow.tsx`
+- Modify: `frontend/src/components/datapilot/HumanDecisionDialog.tsx`
+- Modify: `frontend/src/components/datapilot/HumanDecisionDialog.test.tsx`
+- Modify: `frontend/src/app/App.test.tsx`
 
 **Interfaces:**
 - Produces: `resolve_step_arguments(*, task, plan, step, settings) -> dict[str, Any]`, `build_plan_bound_execution_tools(*, task, plan_store, evidence_store, settings, dry_run, cancellation) -> list[ToolBase]`, and ledger transition methods.
@@ -1114,6 +1123,21 @@ AgentScope session, reply, or tool call mark the handoff recovery-required and
 return a compact actionable conflict. Consumed calls still use ack-only recovery.
 Pending events expose recovery-required metadata, while quarantined handoffs are
 suppressed/marked consumed so the UI cannot resubmit the stale decision.
+
+The frontend `PendingHumanDecision` retains optional `planId`/`stepId` and recovery
+control fields. Normal submission includes `plan_id`/`step_id` whenever present.
+Add `recoverHumanDecision(sessionId, payload)` for the exact recovery endpoint and
+response. For the same reply/tool-call identity, reducers ignore equivalent
+duplicates but replace a normal decision with a later recovery-required update.
+While recovery is required, the dialog disables confirm/stop/guide, shows a
+non-empty reason input (maximum 4,000 characters), and exposes one
+`quarantine_and_replan` action. Clear the pending decision only after the recovery
+request succeeds; retain it after HTTP/network failure.
+
+Runtime streaming deduplication is state-aware: it may suppress repeated normal or
+repeated recovery-required events, but it must emit the first transition for an
+existing identity from normal submission to recovery-required so the timeline
+store and connected UI receive the upgrade.
 
 - [ ] **Step 8: Run focused tests**
 
