@@ -54,7 +54,7 @@ GREEN added or updated focused tests for:
 - atomic accepted-phase/Plan/ledger activation and rollback;
 - cross-phase active Plan replacement and in-flight-work protection;
 - activity-driven planning/execution tool exposure and exact session fencing;
-- guidance observation recording and ordinary append-failure compensation;
+- atomic guidance/observation recording and append-failure rollback;
 - stage-neutral action descriptions and durable execution authorization.
 
 During full-suite verification, an existing model-flow test looped because it
@@ -71,11 +71,11 @@ restored.
 Final commands and results:
 
 ```text
-.venv/bin/python -m pytest tests/test_navigation_agent_tools.py tests/test_navigation_task_tools.py tests/test_session_tool_registry.py tests/test_navigation_plan_submission_tools.py tests/test_navigation_plan_validation.py tests/test_navigation_plan_store.py tests/test_navigation_plan_contracts.py tests/test_navigation_plan_execution.py tests/test_navigation_observation_tools.py tests/test_navigation_observation_store.py -q
-247 passed in 8.47s
+.venv/bin/python -m pytest tests/test_navigation_agent_tools.py tests/test_navigation_task_tools.py tests/test_session_tool_registry.py tests/test_navigation_plan_submission_tools.py tests/test_navigation_plan_validation.py tests/test_navigation_plan_store.py tests/test_navigation_plan_contracts.py tests/test_navigation_plan_execution.py tests/test_navigation_observation_tools.py tests/test_navigation_observation_store.py tests/test_navigation_context_budget.py tests/test_navigation_model_authored_flow.py tests/test_web_agentscope_session.py -q
+370 passed in 12.84s
 
 .venv/bin/python -m pytest -q
-736 passed, 1 warning in 24.86s
+744 passed, 1 warning in 17.22s
 
 .venv/bin/python -m compileall -q src tests
 success
@@ -99,6 +99,25 @@ guidance no longer relies on cross-transaction compensation, and resolver
 authority now uses exact Web/AgentScope lookup plus the durable accepted-Plan join.
 The reviewer noted only a non-blocking opportunity to extract shared private
 observation assembly code in a later cleanup.
+
+An external independent follow-up review found three additional Important
+authorization/snapshot issues. They were fixed with explicit RED-to-GREEN
+regressions:
+
+- A toolkit captured from a superseded Plan now returns bounded
+  `plan_not_active` before any artifact inspection or durable mutation. The old
+  execution-time artifact reconciliation and live-phase derivation path was
+  removed completely.
+- `read_execution_snapshot` now reads the exact Web/AgentScope task, durable
+  accepted active Plan, overview/current ledger state, dependency statuses,
+  staged outbox result, and human handoff in one SQLite read transaction.
+  Resolver and execution-tool construction consume that same snapshot.
+- Overview/current-step tools reauthorize from a fresh exact snapshot at call
+  time. Superseded Plans, session rebinds, and accepted-phase changes fail closed
+  with bounded `inactive_navigation_plan` results.
+
+The follow-up implementation review found no remaining Critical or Important
+issues.
 
 Task 7 remains responsible for final deletion of any dead compatibility code not
 reachable through the Task 4 model-facing resolver.

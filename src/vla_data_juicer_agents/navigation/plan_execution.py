@@ -14,9 +14,6 @@ from vla_data_juicer_agents.core.cancellation import (
     current_cancellation,
 )
 from vla_data_juicer_agents.navigation.config import NavigationSettings
-from vla_data_juicer_agents.navigation.artifact_inspection import (
-    build_navigation_artifact_snapshot,
-)
 from vla_data_juicer_agents.navigation.evidence_store import FileNavigationEvidenceStore
 from vla_data_juicer_agents.navigation.execution_tools import (
     assemble_finish_temp,
@@ -44,15 +41,11 @@ from vla_data_juicer_agents.navigation.plan_store import (
     ActivePlanExecutionConflict,
     MAX_EXECUTION_READ_CHARS,
     MAX_RESULT_OUTBOX_CHARS,
+    NavigationExecutionSnapshot,
     SqliteNavigationPlanRepository,
 )
-from vla_data_juicer_agents.navigation.task_reconciliation import reconcile_navigation_task
 from vla_data_juicer_agents.navigation.task_state import NavigationTask
-from vla_data_juicer_agents.navigation.task_store import (
-    NavigationTaskOwnershipError,
-    NavigationTaskStateRevisionError,
-    SqliteNavigationTaskStore,
-)
+from vla_data_juicer_agents.navigation.task_store import SqliteNavigationTaskStore
 
 
 _PROCESSING_ACTIONS = {
@@ -222,151 +215,6 @@ def resolve_step_arguments(
     raise ValueError(f"unsupported navigation plan action: {action}")
 
 
-def _task_changes(task: NavigationTask) -> dict[str, Any]:
-    changes = task.model_dump(mode="json")
-    for field in {
-        "task_id",
-        "created_by_web_session_id",
-        "latest_web_session_id",
-        "agentscope_session_id",
-        "created_at",
-        "updated_at",
-        "state_revision",
-    }:
-        changes.pop(field, None)
-    return changes
-
-
-def _reconcile_execution_entry(
-    *,
-    task: NavigationTask,
-    plan_store: SqliteNavigationPlanRepository,
-    settings: NavigationSettings,
-    requested_plan_id: str,
-    expected_action: str,
-    expected_web_session_id: str | None = None,
-    expected_agentscope_session_id: str | None = None,
-) -> tuple[NavigationTask, dict[str, Any] | None]:
-    task_store = SqliteNavigationTaskStore(plan_store.db_path)
-    stored = task_store.get_task(task.task_id)
-    if stored is None:
-        return task, _compact_error(
-            "task_not_found",
-            "The plan-bound navigation task no longer exists.",
-        )
-    if expected_agentscope_session_id is not None and (
-        stored.created_by_web_session_id != expected_web_session_id
-        or stored.latest_web_session_id != expected_web_session_id
-        or stored.agentscope_session_id != expected_agentscope_session_id
-    ):
-        return stored, _compact_error(
-            "navigation_task_session_mismatch",
-            "The plan-bound task is no longer owned by this AgentScope session.",
-        )
-    active_plans = [
-        active
-        for phase in ("extract_sync", "finish_processing")
-        if (active := plan_store.get_active(stored.task_id, phase)) is not None
-    ]
-    terminal_recovery = any(
-        (
-            (plan_store.get_current_step(active_plan.plan_id) or {}).get("step")
-            or {}
-        ).get("status")
-        in {"failed", "needs_replan"}
-        for active_plan in active_plans
-    )
-    if terminal_recovery:
-        snapshot = build_navigation_artifact_snapshot(
-            stored.date, stored.segments, settings=settings
-        )
-        changes = {"artifact_snapshot": snapshot.model_dump(mode="json")}
-        try:
-            updated = task_store.update_task_for_session(
-                stored.task_id,
-                web_session_id=expected_web_session_id,
-                agentscope_session_id=expected_agentscope_session_id,
-                expected_state_revision=stored.state_revision,
-                **changes,
-            )
-        except (NavigationTaskOwnershipError, NavigationTaskStateRevisionError):
-            current = task_store.get_task(stored.task_id) or stored
-            return current, _compact_error(
-                "navigation_task_state_stale",
-                "The task changed while execution artifacts were reconciled.",
-                next_action="reload_active_plan",
-            )
-        return updated, None
-    live = reconcile_navigation_task(stored, settings=settings)
-    invalid_plans: list[NavigationPlanRecord] = []
-    for active_plan in active_plans:
-        current = plan_store.get_current_step(active_plan.plan_id)
-        current_step_id = (current or {}).get("step", {}).get("step_id")
-        has_active_staged_result = (
-            isinstance(current_step_id, str)
-            and plan_store.get_staged_step_result(active_plan.plan_id, current_step_id)
-            is not None
-        )
-        if has_active_staged_result:
-            continue
-        phase_compatible = live.phase.value == active_plan.phase
-        if (
-            active_plan.phase == "finish_processing"
-            and live.phase.value == "completed"
-            and active_plan.plan_id == requested_plan_id
-            and expected_action == "validate_navigation_outputs"
-        ):
-            phase_compatible = True
-        if live.status.value == "needs_reconcile" or not phase_compatible:
-            invalid_plans.append(active_plan)
-    if invalid_plans:
-        for active_plan in invalid_plans:
-            if active_plan.status == "active":
-                try:
-                    plan_store.mark_needs_replan(
-                        active_plan.plan_id,
-                        "artifact reconciliation invalidated the stored execution plan",
-                        expected_web_session_id=expected_web_session_id,
-                        expected_agentscope_session_id=expected_agentscope_session_id,
-                    )
-                except ActivePlanExecutionConflict:
-                    return stored, _compact_error(
-                        "plan_mutation_blocked_by_execution",
-                        "Artifact reconciliation cannot invalidate a plan while its result or handoff is in flight. Retry the current step recovery first.",
-                        next_action="retry_same_plan_step",
-                    )
-        return live, _compact_error(
-            "plan_invalidated_by_artifacts",
-            "Artifact reconciliation produced facts incompatible with the active plan; replan before execution.",
-            next_action="submit_complete_plan",
-        )
-    has_any_staged_result = any(
-        plan_store.get_staged_step_result(
-            active_plan.plan_id,
-            ((plan_store.get_current_step(active_plan.plan_id) or {}).get("step") or {}).get("step_id", ""),
-        ) is not None
-        for active_plan in active_plans
-    )
-    if has_any_staged_result:
-        return stored, None
-    try:
-        updated = task_store.update_task_for_session(
-            stored.task_id,
-            web_session_id=expected_web_session_id,
-            agentscope_session_id=expected_agentscope_session_id,
-            expected_state_revision=stored.state_revision,
-            **_task_changes(live),
-        )
-    except (NavigationTaskOwnershipError, NavigationTaskStateRevisionError):
-        current = task_store.get_task(stored.task_id) or stored
-        return current, _compact_error(
-            "navigation_task_state_stale",
-            "The task changed while execution artifacts were reconciled.",
-            next_action="reload_active_plan",
-        )
-    return updated, None
-
-
 def _plan_step(plan: NavigationPlanRecord, step_id: str) -> Any | None:
     return next((step for step in plan.plan.steps if step.step_id == step_id), None)
 
@@ -416,60 +264,64 @@ def _gate_step(
     settings: NavigationSettings,
     expected_web_session_id: str | None = None,
     expected_agentscope_session_id: str | None = None,
-) -> tuple[NavigationTask | None, NavigationPlanRecord | None, Any | None, dict[str, Any] | None]:
-    task, reconcile_error = _reconcile_execution_entry(
-        task=bound_task,
-        plan_store=plan_store,
-        settings=settings,
-        requested_plan_id=requested_plan_id,
-        expected_action=expected_action,
-        expected_web_session_id=expected_web_session_id,
-        expected_agentscope_session_id=expected_agentscope_session_id,
+) -> tuple[
+    NavigationTask | None,
+    NavigationPlanRecord | None,
+    Any | None,
+    NavigationExecutionSnapshot | None,
+    dict[str, Any] | None,
+]:
+    snapshot = plan_store.read_execution_snapshot(
+        web_session_id=expected_web_session_id,
+        agentscope_session_id=expected_agentscope_session_id,
+        task_id=bound_task.task_id,
     )
-    if reconcile_error is not None:
-        return task, None, None, reconcile_error
-    plan = plan_store.get(requested_plan_id)
-    active = plan_store.get_active(task.task_id, plan.phase) if plan is not None else None
+    if snapshot is None:
+        return bound_task, None, None, None, _compact_error(
+            "navigation_task_session_mismatch",
+            "The plan-bound task is no longer owned by this AgentScope session.",
+        )
+    task = snapshot.task
+    plan = snapshot.active_plan
     if (
         plan is None
+        or plan.plan_id != requested_plan_id
         or plan.task_id != task.task_id
         or plan.status != "active"
-        or active is None
-        or active.plan_id != plan.plan_id
     ):
-        return task, plan, None, _compact_error(
+        return task, plan, None, snapshot, _compact_error(
             "plan_not_active",
             "The requested plan is missing, inactive, or superseded.",
             next_action="load_active_plan",
         )
     step = _plan_step(plan, requested_step_id)
     if step is None:
-        return task, plan, None, _compact_error(
+        return task, plan, None, snapshot, _compact_error(
             "step_not_found",
             "The requested step is not part of the immutable plan.",
             next_action="get_current_step",
         )
     if step.action != expected_action:
-        return task, plan, step, _compact_error(
+        return task, plan, step, snapshot, _compact_error(
             "step_action_mismatch",
             "The requested wrapper does not match the stored step action.",
             next_action=step.action,
         )
-    current = plan_store.get_current_step(plan.plan_id)
+    current = snapshot.current
     if current is None or current["step"]["step_id"] != step.step_id:
-        return task, plan, step, _compact_error(
+        return task, plan, step, snapshot, _compact_error(
             "step_not_current",
             "Only the current executable ledger step may run.",
             next_action=(current or {}).get("step", {}).get("action"),
         )
-    dependencies = plan_store.dependency_statuses(plan.plan_id, list(step.depends_on))
+    dependencies = snapshot.dependency_statuses
     unmet = [
         dependency
         for dependency in step.depends_on
         if dependencies.get(dependency) != "completed"
     ]
     if unmet:
-        return task, plan, step, _compact_error(
+        return task, plan, step, snapshot, _compact_error(
             "step_dependencies_unmet",
             "The current step has unfinished plan dependencies.",
             unmet_dependencies=unmet,
@@ -483,8 +335,8 @@ def _gate_step(
             plan_store=plan_store,
         )
         if calibration_error is not None:
-            return task, plan, step, calibration_error
-    return task, plan, step, None
+            return task, plan, step, snapshot, calibration_error
+    return task, plan, step, snapshot, None
 
 
 def _result_payload(result: Any) -> dict[str, Any]:
@@ -590,33 +442,6 @@ def _finalize_staged_result(
         return _result_finalize_retry_error()
     if not finalized:
         return _result_finalize_retry_error()
-    stored_task = SqliteNavigationTaskStore(plan_store.db_path).get_task(task.task_id)
-    if stored_task is not None and settings is not None:
-        try:
-            task_store = SqliteNavigationTaskStore(plan_store.db_path)
-            if staged.target_status == "completed":
-                reconciled = reconcile_navigation_task(stored_task, settings=settings)
-                task_store.update_task_for_session(
-                    stored_task.task_id,
-                    web_session_id=expected_web_session_id,
-                    agentscope_session_id=expected_agentscope_session_id,
-                    expected_state_revision=stored_task.state_revision,
-                    **_task_changes(reconciled),
-                )
-            else:
-                snapshot = build_navigation_artifact_snapshot(
-                    stored_task.date, stored_task.segments, settings=settings
-                )
-                task_store.update_task_for_session(
-                    stored_task.task_id,
-                    web_session_id=expected_web_session_id,
-                    agentscope_session_id=expected_agentscope_session_id,
-                    expected_state_revision=stored_task.state_revision,
-                    artifact_snapshot=snapshot.model_dump(mode="json"),
-                    status="failed",
-                )
-        except Exception:
-            pass
     response = {
         **staged.result_summary,
         "plan_id": plan.plan_id,
@@ -651,7 +476,7 @@ def _invoke_plan_step(
     active_cancellation = cancellation or current_cancellation()
     if active_cancellation is not None:
         active_cancellation.raise_if_cancelled()
-    task, plan, step, gate_error = _gate_step(
+    task, plan, step, snapshot, gate_error = _gate_step(
         bound_task=bound_task,
         requested_plan_id=plan_id,
         requested_step_id=step_id,
@@ -664,7 +489,8 @@ def _invoke_plan_step(
     if gate_error is not None:
         return gate_error
     assert task is not None and plan is not None and step is not None
-    staged = plan_store.get_staged_step_result(plan.plan_id, step.step_id)
+    assert snapshot is not None
+    staged = snapshot.staged_result
     if staged is not None:
         return _finalize_staged_result(
             task=task,
@@ -676,7 +502,7 @@ def _invoke_plan_step(
             expected_web_session_id=expected_web_session_id,
             expected_agentscope_session_id=expected_agentscope_session_id,
         )
-    current = plan_store.get_current_step(plan.plan_id)
+    current = snapshot.current
     current_status = (current or {}).get("step", {}).get("status")
     if current_status == "running":
         try:
@@ -831,7 +657,7 @@ def prepare_plan_human_decision(
     expected_web_session_id: str | None = None,
     expected_agentscope_session_id: str | None = None,
 ) -> dict[str, Any] | None:
-    _task, plan, step, gate_error = _gate_step(
+    _task, plan, step, snapshot, gate_error = _gate_step(
         bound_task=task,
         requested_plan_id=plan_id,
         requested_step_id=step_id,
@@ -844,7 +670,8 @@ def prepare_plan_human_decision(
     if gate_error is not None:
         return gate_error
     assert plan is not None and step is not None
-    current = plan_store.get_current_step(plan.plan_id)
+    assert snapshot is not None
+    current = snapshot.current
     if current is not None and current["step"]["status"] == "waiting_user":
         return None
     if not plan_store.mark_waiting_user(
@@ -958,6 +785,7 @@ def human_decision_key(decision: dict[str, Any]) -> str:
 def build_plan_bound_execution_tools(
     *,
     task: NavigationTask,
+    snapshot: NavigationExecutionSnapshot | None = None,
     plan_store: SqliteNavigationPlanRepository,
     evidence_store: FileNavigationEvidenceStore,
     settings: NavigationSettings,
@@ -968,10 +796,20 @@ def build_plan_bound_execution_tools(
 ) -> list[ToolBase]:
     """Expose only distinct actions remaining in the task's active immutable plan."""
     _ = dry_run  # The durable task is the canonical dry-run authority.
-    active = plan_store.get_active_for_task(task.task_id)
-    if active is None:
+    snapshot = snapshot or plan_store.read_execution_snapshot(
+        web_session_id=web_session_id,
+        agentscope_session_id=agentscope_session_id,
+        task_id=task.task_id,
+    )
+    if (
+        snapshot is None
+        or snapshot.active_plan is None
+        or snapshot.overview is None
+        or snapshot.activity != "execution"
+    ):
         return []
-    overview = plan_store.get_execution_overview(active.plan_id)
+    task = snapshot.task
+    overview = snapshot.overview
     remaining_actions: list[str] = []
     for ledger_step in overview.steps:
         if ledger_step.status == "completed" or ledger_step.action in remaining_actions:

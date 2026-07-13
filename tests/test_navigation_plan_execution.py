@@ -416,7 +416,7 @@ def test_execution_gate_rejects_unmet_dependency_without_invoking(monkeypatch, t
     assert invoked == []
 
 
-def test_artifact_reconciliation_invalidates_plan_and_ledger_before_invocation(
+def test_execution_does_not_reconcile_artifacts_or_invalidate_plan_before_invocation(
     monkeypatch,
     tmp_path,
 ):
@@ -439,17 +439,13 @@ def test_artifact_reconciliation_invalidates_plan_and_ledger_before_invocation(
         step_id="sync",
     )
 
-    assert result["error_type"] == "plan_invalidated_by_artifacts"
-    assert invoked == []
-    assert services.plan_store.get(services.plan.plan_id).status == "invalidated"
-    assert services.plan_store.get_current_step(services.plan.plan_id)["step"]["status"] == "needs_replan"
-    assert services.task_store.get_task(services.task.task_id).status == "needs_replan"
+    assert result["ok"] is True
+    assert len(invoked) == 1
+    assert services.plan_store.get(services.plan.plan_id).status == "completed"
+    assert services.task_store.get_task(services.task.task_id).phase.value == "extract_sync"
 
 
-def test_finish_plan_invalidates_when_reconciliation_falls_back_to_extract_sync(
-    monkeypatch,
-    tmp_path,
-):
+def test_finish_plan_execution_permission_does_not_infer_phase_from_artifacts(tmp_path):
     settings = NavigationSettings(
         vladatasets_root=tmp_path / "datasets",
         processing_root=tmp_path / "processing",
@@ -505,9 +501,9 @@ def test_finish_plan_invalidates_when_reconciliation_falls_back_to_extract_sync(
         )
     )
 
-    assert permission.behavior.value == "deny"
-    assert plan_store.get(plan.plan_id).status == "invalidated"
-    assert task_store.get_task(task.task_id).status == "needs_replan"
+    assert permission.behavior.value == "allow"
+    assert plan_store.get(plan.plan_id).status == "active"
+    assert task_store.get_task(task.task_id).status.value == "pending"
 
 
 def test_stale_agentscope_session_cannot_claim_plan_bound_step(monkeypatch, tmp_path):
@@ -557,7 +553,7 @@ def test_stale_agentscope_session_cannot_claim_plan_bound_step(monkeypatch, tmp_
     assert services.plan_store.get_current_step(services.plan.plan_id)["step"]["status"] == "pending"
 
 
-def test_execution_reconcile_cannot_overwrite_same_owner_rebind(monkeypatch, tmp_path):
+def test_execution_snapshot_cannot_overwrite_same_owner_rebind(monkeypatch, tmp_path):
     services = build_services(tmp_path)
     bound = services.task_store.update_task(
         services.task.task_id,
@@ -567,18 +563,6 @@ def test_execution_reconcile_cannot_overwrite_same_owner_rebind(monkeypatch, tmp
     )
     invoked = []
 
-    def reconcile_after_rebind(task, *, settings):
-        services.task_store.create_or_update_task(
-            date=task.date,
-            segments=task.segments,
-            scene_mode=task.scene_mode,
-            dry_run=task.dry_run,
-            web_session_id="web-owner",
-            agentscope_session_id="as-new",
-        )
-        return task
-
-    monkeypatch.setattr(plan_execution, "reconcile_navigation_task", reconcile_after_rebind)
     monkeypatch.setattr(
         plan_execution,
         "extract_and_sync_navigation_data",
@@ -597,6 +581,14 @@ def test_execution_reconcile_cannot_overwrite_same_owner_rebind(monkeypatch, tmp
             agentscope_session_id="as-old",
         )
     }
+    services.task_store.create_or_update_task(
+        date=bound.date,
+        segments=bound.segments,
+        scene_mode=bound.scene_mode,
+        dry_run=bound.dry_run,
+        web_session_id="web-owner",
+        agentscope_session_id="as-new",
+    )
 
     result = call_tool(
         tools["extract_and_sync_navigation_data_tool"],
@@ -604,10 +596,7 @@ def test_execution_reconcile_cannot_overwrite_same_owner_rebind(monkeypatch, tmp
         step_id="sync",
     )
 
-    assert result["error_type"] in {
-        "navigation_task_session_mismatch",
-        "navigation_task_state_stale",
-    }
+    assert result["error_type"] == "navigation_task_session_mismatch"
     assert invoked == []
     current = services.task_store.get_task(bound.task_id)
     assert current.agentscope_session_id == "as-new"
@@ -632,6 +621,39 @@ def test_superseded_plan_cannot_claim_pending_step(tmp_path):
 
     assert claimed is False
     assert services.plan_store.get_current_step(old_plan.plan_id)["step"]["status"] == "pending"
+
+
+def test_stale_execution_toolkit_rejects_before_artifact_or_durable_state_mutation(
+    tmp_path,
+):
+    services = build_services(tmp_path)
+    stale_tool = services.tools()["extract_and_sync_navigation_data_tool"]
+    old_plan = services.plan
+    replacement = services.plan_store.activate(
+        services.task,
+        "extract_sync",
+        2,
+        extract_plan(),
+    )
+    task_before = services.task_store.get_task(services.task.task_id)
+    replacement_before = services.plan_store.get(replacement.plan_id)
+    ledger_before = services.plan_store.get_execution_overview(replacement.plan_id)
+    raw_root = services.settings.raw_data_root / services.task.date
+    for child in raw_root.iterdir():
+        child.rmdir()
+    raw_root.rmdir()
+
+    result = call_tool(
+        stale_tool,
+        plan_id=old_plan.plan_id,
+        step_id="sync",
+    )
+
+    assert result["ok"] is False
+    assert result["error_type"] == "plan_not_active"
+    assert services.task_store.get_task(services.task.task_id) == task_before
+    assert services.plan_store.get(replacement.plan_id) == replacement_before
+    assert services.plan_store.get_execution_overview(replacement.plan_id) == ledger_before
 
 
 def test_success_persists_full_task_scoped_evidence_but_compact_ledger_and_response(
@@ -769,7 +791,7 @@ def test_evidence_write_failure_recovers_from_durable_result_without_reinvoking(
     assert services.plan_store.get_staged_step_result(services.plan.plan_id, "sync") is None
 
 
-def test_staged_result_finalizes_before_expected_artifact_phase_advance_invalidates_plan(
+def test_staged_result_finalizes_without_execution_time_phase_inference(
     monkeypatch,
     tmp_path,
 ):
@@ -805,9 +827,7 @@ def test_staged_result_finalizes_before_expected_artifact_phase_advance_invalida
     assert second["ok"] is True
     assert len(invoked) == 1
     assert services.plan_store.get(services.plan.plan_id).status == "completed"
-    assert services.task_store.get_task(services.task.task_id).phase.value == (
-        "waiting_scene_mode"
-    )
+    assert services.task_store.get_task(services.task.task_id).phase.value == "extract_sync"
 
 
 @pytest.mark.parametrize(
@@ -1008,7 +1028,7 @@ def test_failed_step_is_recorded_exactly_once_and_duplicate_does_not_reinvoke(
     assert services.plan_store.get_current_step(services.plan.plan_id)["step"]["status"] == "failed"
 
 
-def test_failed_step_with_produced_sync_artifacts_stays_failed_for_fresh_resolver(
+def test_failed_step_does_not_infer_artifact_state_and_exposes_no_fresh_execution_tools(
     monkeypatch, tmp_path
 ):
     services = build_services(tmp_path)
@@ -1042,21 +1062,14 @@ def test_failed_step_with_produced_sync_artifacts_stays_failed_for_fresh_resolve
             cancellation=None,
         )
     }
-    duplicate = call_tool(
-        fresh["extract_and_sync_navigation_data_tool"],
-        plan_id=services.plan.plan_id,
-        step_id="sync",
-    )
-
     assert result["status"] == "failed"
     assert stored.phase.value == "extract_sync"
     assert stored.status.value == "failed"
-    assert stored.artifact_snapshot.sync_data_exists is True
-    assert duplicate["error_type"] == "step_already_terminal"
-    assert duplicate["next_action"] == "submit_complete_plan"
+    assert stored.artifact_snapshot is None
+    assert fresh == {}
 
 
-def test_failed_validation_with_final_artifacts_does_not_complete_fresh_task(
+def test_failed_validation_does_not_infer_final_artifacts_or_expose_execution_tools(
     monkeypatch, tmp_path
 ):
     settings = NavigationSettings(
@@ -1134,19 +1147,11 @@ def test_failed_validation_with_final_artifacts_does_not_complete_fresh_task(
             cancellation=None,
         )
     }
-    duplicate = call_tool(
-        fresh_tools["validate_navigation_outputs_tool"],
-        plan_id=plan.plan_id,
-        step_id="validate",
-    )
-
     assert result["status"] == "failed"
     assert stored.phase.value == "finish_processing"
     assert stored.status.value == "failed"
-    assert stored.artifact_snapshot.final_outputs_exist is True
-    assert stored.artifact_snapshot.final_grid_map_exists is True
-    assert duplicate["error_type"] == "step_already_terminal"
-    assert duplicate["next_action"] == "submit_complete_plan"
+    assert stored.artifact_snapshot is None
+    assert fresh_tools == {}
 
 
 def test_force_running_recovery_refuses_to_orphan_task_phase_handoff(tmp_path):

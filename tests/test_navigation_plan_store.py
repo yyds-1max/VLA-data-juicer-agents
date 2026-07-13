@@ -634,6 +634,53 @@ def test_cross_phase_activation_replaces_the_whole_active_plan_atomically(tmp_pa
     assert stored.accepted_plan_phase.value == "finish_processing"
 
 
+@pytest.mark.parametrize(
+    ("current_status", "expected_activity"),
+    [("pending", "execution"), ("failed", "planning"), ("needs_replan", "planning")],
+)
+def test_execution_snapshot_reads_task_plan_and_ledger_in_one_state(
+    tmp_path: Path,
+    current_status: str,
+    expected_activity: str,
+):
+    repo, task = stores_with_task(tmp_path)
+    task_store = SqliteNavigationTaskStore(repo.db_path)
+    task = task_store.update_task(
+        task.task_id,
+        created_by_web_session_id="web-owner",
+        latest_web_session_id="web-owner",
+        agentscope_session_id="web-owner__agent",
+    )
+    plan = repo.activate(
+        task,
+        "extract_sync",
+        1,
+        valid_extract_plan(),
+        expected_web_session_id="web-owner",
+        expected_agentscope_session_id="web-owner__agent",
+    )
+    if current_status != "pending":
+        with sqlite3.connect(repo.db_path) as connection:
+            connection.execute(
+                """UPDATE navigation_task_steps SET status = ?
+                   WHERE plan_id = ? AND sequence = 0""",
+                (current_status, plan.plan_id),
+            )
+
+    snapshot = repo.read_execution_snapshot(
+        web_session_id="web-owner",
+        agentscope_session_id="web-owner__agent",
+        task_id=task.task_id,
+    )
+
+    assert snapshot is not None
+    assert snapshot.task.task_id == task.task_id
+    assert snapshot.active_plan.plan_id == plan.plan_id
+    assert snapshot.current["step"]["status"] == current_status
+    assert snapshot.overview.current_step_id == "prepare"
+    assert snapshot.activity == expected_activity
+
+
 @pytest.mark.parametrize("in_flight_status", ["running", "waiting_user"])
 def test_activation_rejects_supersede_while_active_step_is_in_flight(
     tmp_path: Path,

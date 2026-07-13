@@ -719,6 +719,129 @@ def test_phase_resolver_recovers_active_plan_and_only_remaining_actions(tmp_path
     assert "request_human_decision" not in names
 
 
+def test_resolver_and_execution_builder_consume_one_repository_snapshot(
+    tmp_path,
+    monkeypatch,
+):
+    services, task, built = _resolver_services_from_complete(tmp_path)
+    active = services.plan_store.activate(
+        task,
+        "extract_sync",
+        4,
+        ExtractSyncPlanInput.model_validate(valid_extract_plan_payload(built)),
+        expected_web_session_id="as-session-1",
+        expected_agentscope_session_id="as-session-1",
+    )
+    overview = services.plan_store.get_execution_overview(active.plan_id)
+    current = services.plan_store.get_current_step(active.plan_id)
+    snapshot = SimpleNamespace(
+        task=services.task_store.get_task(task.task_id),
+        active_plan=active,
+        overview=overview,
+        current=current,
+        handoff=None,
+        staged_result=None,
+        dependency_statuses={},
+        activity="execution",
+    )
+    monkeypatch.setattr(
+        services.plan_store,
+        "read_execution_snapshot",
+        lambda **_kwargs: snapshot,
+        raising=False,
+    )
+    monkeypatch.setattr(
+        services.task_store,
+        "find_by_session",
+        lambda **_kwargs: (_ for _ in ()).throw(
+            AssertionError("resolver must not split the snapshot read")
+        ),
+    )
+    monkeypatch.setattr(
+        services.plan_store,
+        "get_active_for_task",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("builder must consume the resolver snapshot")
+        ),
+    )
+
+    names = {
+        tool.name
+        for tool in resolve_navigation_agent_tools(
+            services=services,
+            agentscope_session_id="as-session-1",
+            web_session_id="as-session-1",
+            cancellation=None,
+        )
+    }
+
+    assert names == {
+        "get_plan_execution_overview_tool",
+        "get_current_plan_step_tool",
+        "prepare_raw_data_tool",
+        "extract_and_sync_navigation_data_tool",
+    }
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    ["superseded", "session_mismatch", "accepted_phase_changed"],
+)
+def test_stale_execution_read_tools_reauthorize_at_call_time(tmp_path, mutation):
+    services, task, built = _resolver_services_from_complete(tmp_path)
+    active = services.plan_store.activate(
+        task,
+        "extract_sync",
+        4,
+        ExtractSyncPlanInput.model_validate(valid_extract_plan_payload(built)),
+        expected_web_session_id="as-session-1",
+        expected_agentscope_session_id="as-session-1",
+    )
+    tools = {
+        tool.name: tool
+        for tool in resolve_navigation_agent_tools(
+            services=services,
+            agentscope_session_id="as-session-1",
+            web_session_id="as-session-1",
+            cancellation=None,
+        )
+    }
+    if mutation == "superseded":
+        services.plan_store.activate(
+            task,
+            "extract_sync",
+            5,
+            ExtractSyncPlanInput.model_validate(valid_extract_plan_payload(built)),
+            expected_web_session_id="as-session-1",
+            expected_agentscope_session_id="as-session-1",
+        )
+    elif mutation == "session_mismatch":
+        with sqlite3.connect(services.plan_store.db_path) as connection:
+            connection.execute(
+                """UPDATE navigation_tasks
+                   SET latest_web_session_id = ?, agentscope_session_id = ?
+                   WHERE task_id = ?""",
+                ("other-web", "other-agent", task.task_id),
+            )
+    else:
+        with sqlite3.connect(services.plan_store.db_path) as connection:
+            connection.execute(
+                """UPDATE navigation_tasks SET accepted_plan_phase = 'finish_processing'
+                   WHERE task_id = ?""",
+                (task.task_id,),
+            )
+
+    overview = _decode_tool_payload(
+        asyncio.run(tools["get_plan_execution_overview_tool"](plan_id=active.plan_id))
+    )
+    current = _decode_tool_payload(
+        asyncio.run(tools["get_current_plan_step_tool"](plan_id=active.plan_id))
+    )
+
+    assert overview == {"ok": False, "error_type": "inactive_navigation_plan"}
+    assert current == {"ok": False, "error_type": "inactive_navigation_plan"}
+
+
 def test_activity_resolver_returns_failed_active_ledger_to_planning(tmp_path):
     services, task, built = _resolver_services_from_complete(tmp_path)
     active = services.plan_store.activate(

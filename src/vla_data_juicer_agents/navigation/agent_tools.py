@@ -84,21 +84,46 @@ def _trust(tools: list[Any]) -> list[Any]:
     return [tool if getattr(tool, "is_external_tool", False) else _TrustedNavigationTool(tool) for tool in tools]
 
 
-def _execution_state_tools(*, services: NavigationServices, plan: Any) -> list[ToolBase]:
+def _execution_state_tools(
+    *,
+    services: NavigationServices,
+    snapshot: Any,
+    web_session_id: str,
+    agentscope_session_id: str,
+) -> list[ToolBase]:
+    plan = snapshot.active_plan
+
+    def authorized_snapshot(plan_id: str) -> Any | None:
+        if plan is None or plan_id != plan.plan_id:
+            return None
+        current = services.plan_store.read_execution_snapshot(
+            web_session_id=web_session_id,
+            agentscope_session_id=agentscope_session_id,
+            task_id=snapshot.task.task_id,
+        )
+        if (
+            current is None
+            or current.active_plan is None
+            or current.active_plan.plan_id != plan_id
+        ):
+            return None
+        return current
+
     def get_plan_execution_overview_tool(plan_id: str) -> dict[str, Any]:
-        if plan_id != plan.plan_id:
+        current = authorized_snapshot(plan_id)
+        if current is None or current.overview is None:
             return {"ok": False, "error_type": "inactive_navigation_plan"}
         return ensure_payload_within_limit(
-            services.plan_store.get_execution_overview(plan_id).model_dump(mode="json"),
+            current.overview.model_dump(mode="json"),
             max_chars=4_000,
             label="resolved_execution_overview",
         )
 
     def get_current_plan_step_tool(plan_id: str) -> dict[str, Any] | None:
-        if plan_id != plan.plan_id:
+        current = authorized_snapshot(plan_id)
+        if current is None:
             return {"ok": False, "error_type": "inactive_navigation_plan"}
-        current = services.plan_store.get_current_step(plan_id)
-        return None if current is None else ensure_payload_within_limit(current, max_chars=4_000, label="resolved_current_plan_step")
+        return None if current.current is None else ensure_payload_within_limit(current.current, max_chars=4_000, label="resolved_current_plan_step")
 
     return [FunctionTool(get_plan_execution_overview_tool, is_read_only=True), FunctionTool(get_current_plan_step_tool, is_read_only=True)]
 
@@ -114,18 +139,13 @@ def resolve_navigation_agent_tools(
         agentscope_session_id == web_session_id or agentscope_session_id.startswith(f"{web_session_id}__")
     ):
         return []
-    task = services.task_store.find_by_session(
+    snapshot = services.plan_store.read_execution_snapshot(
         web_session_id=web_session_id,
         agentscope_session_id=agentscope_session_id,
     )
-    if task is None:
+    if snapshot is None:
         return []
-    if (
-        task.created_by_web_session_id != web_session_id
-        or task.latest_web_session_id != web_session_id
-        or task.agentscope_session_id != agentscope_session_id
-    ):
-        return []
+    task = snapshot.task
 
     observation_tools = build_navigation_observation_tools(
         task=task,
@@ -135,21 +155,21 @@ def resolve_navigation_agent_tools(
         expected_web_session_id=web_session_id,
         expected_agentscope_session_id=agentscope_session_id,
     )
-    active_plan = services.plan_store.get_active_for_task(task.task_id)
-    current = (
-        services.plan_store.get_current_step(active_plan.plan_id)
-        if active_plan is not None
-        else None
-    )
-    current_status = ((current or {}).get("step") or {}).get("status")
-    if active_plan is not None and current_status in {
-        "pending",
-        "running",
-        "waiting_user",
+    active_plan = snapshot.active_plan
+    current = snapshot.current
+    if active_plan is not None and snapshot.activity in {
+        "execution",
+        "recovery_required",
     }:
-        execution_state = _execution_state_tools(services=services, plan=active_plan)
+        execution_state = _execution_state_tools(
+            services=services,
+            snapshot=snapshot,
+            web_session_id=web_session_id,
+            agentscope_session_id=agentscope_session_id,
+        )
         execution = build_plan_bound_execution_tools(
             task=task,
+            snapshot=snapshot,
             plan_store=services.plan_store,
             evidence_store=services.evidence_store,
             settings=services.settings,
@@ -158,11 +178,8 @@ def resolve_navigation_agent_tools(
             web_session_id=web_session_id,
             agentscope_session_id=agentscope_session_id,
         )
-        step = (current or {}).get("step") or {}
-        if step.get("action") == "confirm_navigation_calibration_params":
-            handoff = services.plan_store.get_human_decision_handoff(active_plan.plan_id, step.get("step_id", ""))
-            if handoff is not None and handoff.status == "recovery_required":
-                return _trust(execution_state)
+        if snapshot.activity == "recovery_required":
+            return _trust(execution_state)
         return _trust([*execution_state, *execution])
 
     guidance = build_navigation_task_tools(

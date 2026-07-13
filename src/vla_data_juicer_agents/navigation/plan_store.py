@@ -4,6 +4,7 @@ import json
 import hashlib
 import re
 import sqlite3
+from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any, Literal, cast
@@ -109,6 +110,18 @@ class CompactExecutionOverview(_StrictReadModel):
     completed_steps: int
     current_step_id: str | None
     steps: list[CompactExecutionStep]
+
+
+@dataclass(frozen=True)
+class NavigationExecutionSnapshot:
+    task: NavigationTask
+    active_plan: NavigationPlanRecord | None
+    overview: CompactExecutionOverview | None
+    current: dict[str, Any] | None
+    dependency_statuses: dict[str, ExecutionStatus]
+    staged_result: StagedStepResult | None
+    handoff: HumanDecisionHandoff | None
+    activity: Literal["planning", "execution", "recovery_required"]
 
 
 class SqliteNavigationPlanRepository:
@@ -616,6 +629,204 @@ class SqliteNavigationPlanRepository:
                 (task_id,),
             ).fetchone()
         return self._record_from_row(row) if row is not None else None
+
+    def read_execution_snapshot(
+        self,
+        *,
+        web_session_id: str | None,
+        agentscope_session_id: str | None,
+        task_id: str | None = None,
+    ) -> NavigationExecutionSnapshot | None:
+        """Read exact attempt ownership and its accepted execution state once."""
+        connection = self._connect()
+        try:
+            connection.execute("BEGIN")
+            task_clause = "AND task_id = ?" if task_id is not None else ""
+            params: tuple[Any, ...] = (
+                web_session_id,
+                web_session_id,
+                agentscope_session_id,
+                *((task_id,) if task_id is not None else ()),
+            )
+            task_row = connection.execute(
+                f"""SELECT * FROM navigation_tasks
+                    WHERE created_by_web_session_id IS ?
+                      AND latest_web_session_id IS ?
+                      AND agentscope_session_id IS ?
+                      {task_clause}
+                    ORDER BY created_at DESC, rowid DESC
+                    LIMIT 1""",
+                params,
+            ).fetchone()
+            if task_row is None:
+                connection.commit()
+                return None
+            task = SqliteNavigationTaskStore(
+                self.db_path,
+                initialize=False,
+            )._task_from_row(task_row)
+            plan_row = connection.execute(
+                """SELECT plans.*
+                   FROM navigation_plans AS plans
+                   WHERE plans.task_id = ?
+                     AND plans.phase = ?
+                     AND plans.status = 'active'
+                   LIMIT 1""",
+                (
+                    task.task_id,
+                    task.accepted_plan_phase.value
+                    if task.accepted_plan_phase is not None
+                    else None,
+                ),
+            ).fetchone()
+            if plan_row is None:
+                connection.commit()
+                return NavigationExecutionSnapshot(
+                    task=task,
+                    active_plan=None,
+                    overview=None,
+                    current=None,
+                    dependency_statuses={},
+                    staged_result=None,
+                    handoff=None,
+                    activity="planning",
+                )
+            plan = self._record_from_row(plan_row)
+            step_rows = connection.execute(
+                """SELECT id, plan_id, plan_revision, sequence, step_id,
+                          tool_name, status, result_summary_json, result_ref,
+                          retry_count
+                   FROM navigation_task_steps
+                   WHERE plan_id = ? AND plan_revision = ?
+                   ORDER BY sequence ASC""",
+                (plan.plan_id, plan.plan_revision),
+            ).fetchall()
+            compact_steps = [
+                CompactExecutionStep(
+                    step_id=row["step_id"],
+                    action=row["tool_name"],
+                    status=row["status"],
+                )
+                for row in step_rows
+            ]
+            overview = CompactExecutionOverview(
+                plan_id=plan.plan_id,
+                plan_revision=plan.plan_revision,
+                status=plan.status,
+                total_steps=len(compact_steps),
+                completed_steps=sum(
+                    step.status == "completed" for step in compact_steps
+                ),
+                current_step_id=next(
+                    (
+                        step.step_id
+                        for step in compact_steps
+                        if step.status != "completed"
+                    ),
+                    None,
+                ),
+                steps=compact_steps,
+            )
+            current_row = next(
+                (row for row in step_rows if row["status"] != "completed"),
+                None,
+            )
+            current: dict[str, Any] | None = None
+            dependencies: dict[str, ExecutionStatus] = {}
+            staged: StagedStepResult | None = None
+            handoff: HumanDecisionHandoff | None = None
+            if current_row is not None:
+                step_record = ExecutionStepRecord(
+                    id=current_row["id"],
+                    plan_id=current_row["plan_id"],
+                    plan_revision=current_row["plan_revision"],
+                    sequence=current_row["sequence"],
+                    step_id=current_row["step_id"],
+                    action=current_row["tool_name"],
+                    status=current_row["status"],
+                    result_summary=(
+                        json.loads(current_row["result_summary_json"])
+                        if current_row["result_summary_json"] is not None
+                        else None
+                    ),
+                    result_ref=current_row["result_ref"],
+                    retry_count=current_row["retry_count"],
+                )
+                plan_step = next(
+                    (
+                        item
+                        for item in plan.plan.steps
+                        if item.step_id == step_record.step_id
+                    ),
+                    None,
+                )
+                decision_refs = (
+                    list(plan_step.decision_refs) if plan_step is not None else []
+                )
+                current = {
+                    "plan_id": plan.plan_id,
+                    "plan_revision": plan.plan_revision,
+                    "step": step_record.model_dump(mode="json"),
+                    "decision_refs": decision_refs,
+                }
+                dependency_ids = (
+                    list(plan_step.depends_on) if plan_step is not None else []
+                )
+                if dependency_ids:
+                    placeholders = ",".join("?" for _ in dependency_ids)
+                    dependency_rows = connection.execute(
+                        f"""SELECT step_id, status FROM navigation_task_steps
+                            WHERE plan_id = ? AND step_id IN ({placeholders})""",
+                        (plan.plan_id, *dependency_ids),
+                    ).fetchall()
+                    dependencies = {
+                        row["step_id"]: cast(ExecutionStatus, row["status"])
+                        for row in dependency_rows
+                    }
+                staged_row = connection.execute(
+                    """SELECT * FROM navigation_step_result_outbox
+                       WHERE plan_id = ? AND step_id = ?""",
+                    (plan.plan_id, step_record.step_id),
+                ).fetchone()
+                if staged_row is not None:
+                    staged = self._staged_result_from_row(staged_row)
+                handoff_row = connection.execute(
+                    """SELECT * FROM navigation_human_decision_handoffs
+                       WHERE plan_id = ? AND step_id = ?""",
+                    (plan.plan_id, step_record.step_id),
+                ).fetchone()
+                if handoff_row is not None:
+                    handoff = self._handoff_from_row(handoff_row)
+            current_status = ((current or {}).get("step") or {}).get("status")
+            activity: Literal["planning", "execution", "recovery_required"]
+            if handoff is not None and handoff.status == "recovery_required":
+                activity = "recovery_required"
+            elif current_status in {"pending", "running", "waiting_user"}:
+                activity = "execution"
+            else:
+                activity = "planning"
+            self._ensure_within_limit(
+                overview.model_dump(mode="json"),
+                label="execution overview",
+            )
+            if current is not None:
+                self._ensure_within_limit(current, label="current step")
+            connection.commit()
+            return NavigationExecutionSnapshot(
+                task=task,
+                active_plan=plan,
+                overview=overview,
+                current=current,
+                dependency_statuses=dependencies,
+                staged_result=staged,
+                handoff=handoff,
+                activity=activity,
+            )
+        except Exception:
+            connection.rollback()
+            raise
+        finally:
+            connection.close()
 
     def get(self, plan_id: str) -> NavigationPlanRecord | None:
         with self._connect() as connection:
@@ -1318,6 +1529,10 @@ class SqliteNavigationPlanRepository:
             ).fetchone()
         if row is None:
             return None
+        return self._handoff_from_row(row)
+
+    @staticmethod
+    def _handoff_from_row(row: sqlite3.Row) -> HumanDecisionHandoff:
         return HumanDecisionHandoff(
             plan_id=row["plan_id"],
             step_id=row["step_id"],
