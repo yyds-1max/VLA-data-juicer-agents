@@ -30,15 +30,25 @@ def _sensor_observation() -> SensorCandidatesObservation:
     )
 
 
-def _append(store, task_id, kind, payloads, writes, evidence):
+def _append(
+    store,
+    task_id,
+    kind,
+    payloads,
+    writes,
+    evidence,
+    *,
+    web_session_id=None,
+    agentscope_session_id=None,
+):
     return store.append(
         task_id,
         kind,
         payloads,
         writes,
         evidence,
-        expected_web_session_id=None,
-        expected_agentscope_session_id=None,
+        expected_web_session_id=web_session_id,
+        expected_agentscope_session_id=agentscope_session_id,
     )
 
 
@@ -134,9 +144,11 @@ def test_append_persists_evidence_metadata_and_filters_by_task_kind_and_revision
 def test_observation_and_evidence_commits_advance_task_aggregate_revision(tmp_path):
     db_path = tmp_path / "state.sqlite"
     task_store = SqliteNavigationTaskStore(db_path)
-    task = task_store.create_or_update_task(
+    task = task_store.create_task_attempt(
+        request="Process navigation data", target="20260710",
         date="20260710", segments=["20260710_120000"], scene_mode=None,
-    )
+        dry_run=False, web_session_id="web-owner", agentscope_session_id="as-owner",
+    ).task
     store = SqliteNavigationObservationStore(db_path)
     evidence = FileNavigationEvidenceStore(tmp_path / "evidence")
 
@@ -152,6 +164,8 @@ def test_observation_and_evidence_commits_advance_task_aggregate_revision(tmp_pa
             summary="one raw row",
         )],
         evidence,
+        web_session_id="web-owner",
+        agentscope_session_id="as-owner",
     )
 
     current = task_store.get_task(task.task_id)
@@ -161,9 +175,11 @@ def test_observation_and_evidence_commits_advance_task_aggregate_revision(tmp_pa
 def test_task_first_initialization_installs_observation_triggers(tmp_path):
     db_path = tmp_path / "state.sqlite"
     task_store = SqliteNavigationTaskStore(db_path)
-    task = task_store.create_or_update_task(
+    task = task_store.create_task_attempt(
+        request="Process navigation data", target="20260710",
         date="20260710", segments=["20260710_120000"], scene_mode=None,
-    )
+        dry_run=False, web_session_id="web-owner", agentscope_session_id="as-owner",
+    ).task
     store = SqliteNavigationObservationStore(db_path)
 
     _append(
@@ -173,6 +189,8 @@ def test_task_first_initialization_installs_observation_triggers(tmp_path):
         [_raw_observation()],
         [],
         FileNavigationEvidenceStore(tmp_path / "evidence"),
+        web_session_id="web-owner",
+        agentscope_session_id="as-owner",
     )
 
     assert task_store.get_task(task.task_id).state_revision == task.state_revision + 1
@@ -181,13 +199,16 @@ def test_task_first_initialization_installs_observation_triggers(tmp_path):
 def test_owned_task_observation_append_rejects_omitted_session(tmp_path):
     db_path = tmp_path / "state.sqlite"
     task_store = SqliteNavigationTaskStore(db_path)
-    task = task_store.create_or_update_task(
+    task = task_store.create_task_attempt(
+        request="Process navigation data",
+        target="20260710",
         date="20260710",
         segments=["20260710_120000"],
         scene_mode=None,
+        dry_run=False,
         web_session_id="web-owner",
         agentscope_session_id="as-owner",
-    )
+    ).task
     store = SqliteNavigationObservationStore(db_path)
 
     with pytest.raises(PermissionError, match="session mismatch"):

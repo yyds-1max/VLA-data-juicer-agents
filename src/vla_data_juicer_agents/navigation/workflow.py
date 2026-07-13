@@ -2,7 +2,7 @@ import asyncio
 import json
 from contextlib import AsyncExitStack
 from pathlib import Path
-from typing import Any, Literal
+from typing import Any
 
 from agentscope.message import UserMsg
 
@@ -15,7 +15,6 @@ from vla_data_juicer_agents.navigation.models import NavigationRequest
 from vla_data_juicer_agents.navigation.plan_models import NavigationPlanRecord
 from vla_data_juicer_agents.navigation.run_state import WorkflowRunStore
 from vla_data_juicer_agents.navigation.services import NavigationServices, build_navigation_services
-from vla_data_juicer_agents.navigation.task_reconciliation import prepare_navigation_task_entry
 
 
 PUBLIC_PROGRESS_PROMPT = (
@@ -42,25 +41,20 @@ def prepare_direct_navigation_entry(
     agentscope_session_id: str,
     user_request: str = "",
 ) -> tuple[NavigationServices, Any]:
-    """Build run-scoped durable services and perform the unconditional entry gate."""
+    """Build run-scoped services and create one explicit direct task attempt."""
     services = build_navigation_services(run_dir, settings=settings)
-    handoff = {
-        "date": request.date,
-        "segments": request.segments,
-        "scene_mode": request.scene_mode,
-        "dry_run": request.dry_run,
-        "request": user_request,
-    }
-    task = prepare_navigation_task_entry(
-        task_store=services.task_store,
-        observation_store=services.observation_store,
-        evidence_store=services.evidence_store,
-        message=f"Structured handoff JSON: {json.dumps(handoff, ensure_ascii=False)}",
-        web_session_id=None,
+    run_id = run_dir.name
+    creation = services.task_store.create_task_attempt(
+        request=user_request or "Direct navigation workflow",
+        target=request.date,
+        date=request.date,
+        segments=request.segments,
+        scene_mode=request.scene_mode,
+        dry_run=request.dry_run,
+        web_session_id=f"direct:{run_id}",
         agentscope_session_id=agentscope_session_id,
-        settings=services.settings,
     )
-    return services, task
+    return services, creation.task
 
 
 def _event_type(event: object) -> str:
@@ -163,7 +157,6 @@ async def run_plan_agent(
     *,
     plan_store: Any,
     task_id: str,
-    phase: Literal["extract_sync", "finish_processing"],
     task_store: Any | None = None,
     run_store: WorkflowRunStore | None = None,
     run_dir: Path | None = None,
@@ -172,11 +165,11 @@ async def run_plan_agent(
     response_language: str | None = None,
 ) -> NavigationPlanRecord:
     prompt = (
-        "Investigate the active durable navigation phase with the resolved tools. "
-        "When the factual checklist is complete, submit one complete strict JSON plan. "
+        "Investigate current navigation products with factual tools, choose the needed stage, "
+        "and submit one complete strict JSON plan with the matching stage tool. "
         "Do not return plan JSON in assistant text.\n\n"
         f"{PUBLIC_PROGRESS_PROMPT}\n\n{_response_language_prompt(response_language)}"
-        f"Task identity: {json.dumps({'task_id': task_id, 'phase': phase, 'date': request.date}, ensure_ascii=False)}"
+        f"Task identity: {json.dumps({'task_id': task_id, 'date': request.date}, ensure_ascii=False)}"
     )
     await _run_agent_stream(
         agent,
@@ -186,16 +179,12 @@ async def run_plan_agent(
         event_scope=event_scope,
         cancellation=cancellation,
     )
-    current = task_store.get_task(task_id) if task_store is not None else None
-    durable_phase = getattr(getattr(current, "phase", None), "value", phase)
-    if durable_phase not in {"extract_sync", "finish_processing"}:
-        raise RuntimeError(
-            f"Navigation task changed to non-planning phase {durable_phase} before plan lookup."
-        )
-    plan = plan_store.get_active(task_id, durable_phase)
+    if task_store is not None and task_store.get_task(task_id) is None:
+        raise RuntimeError(f"Navigation task disappeared before plan lookup: {task_id}")
+    plan = plan_store.get_active_for_task(task_id)
     if plan is None:
         raise RuntimeError(
-            f"Navigation planning agent did not submit a valid complete plan for task {task_id} phase {phase}."
+            f"Navigation planning agent did not submit a valid complete plan for task {task_id}."
         )
     return plan
 
@@ -214,7 +203,7 @@ async def run_direct_plan_until_submitted(
     response_language: str | None = None,
     max_rounds: int = 10,
 ) -> NavigationPlanRecord:
-    """Refresh phase tools between durable investigation and submission rounds."""
+    """Refresh activity-driven tools between investigation and submission rounds."""
     if max_rounds < 1:
         raise ValueError("max_rounds must be positive")
     current = services.task_store.get_task(task.task_id) or task
@@ -228,10 +217,6 @@ async def run_direct_plan_until_submitted(
         round_start = services.task_store.get_task(current.task_id)
         if round_start is None:
             raise RuntimeError(f"Navigation task disappeared before planning round: {current.task_id}")
-        if round_start.phase.value not in {"extract_sync", "finish_processing"}:
-            raise RuntimeError(
-                f"Navigation task changed to non-planning phase {round_start.phase.value}."
-            )
         round_start_revision = round_start.state_revision
         agent = create_plan_agent(model=model, tools=tools)
         try:
@@ -240,7 +225,6 @@ async def run_direct_plan_until_submitted(
                 request,
                 plan_store=services.plan_store,
                 task_id=round_start.task_id,
-                phase=round_start.phase.value,
                 task_store=services.task_store,
                 run_store=run_store,
                 run_dir=run_dir,
@@ -280,7 +264,6 @@ def direct_execution_terminal_state(
     overview = services.plan_store.get_execution_overview(plan_id).model_dump(mode="json")
     current = services.plan_store.get_current_step(plan_id)
     task_status = task.status.value
-    task_phase = task.phase.value
     plan_status = getattr(plan.status, "value", plan.status)
     current_step_status = (
         (current.get("step") or {}).get("status")
@@ -292,11 +275,7 @@ def direct_execution_terminal_state(
         and current is None
         and overview.get("current_step_id") is None
     )
-    actual_complete = (
-        task_status == "completed"
-        and task_phase == "completed"
-        and ledger_complete
-    )
+    actual_complete = task_status == "completed" and ledger_complete
     task_dry_run = bool(getattr(task, "dry_run", False))
     dry_run_complete = bool(task_dry_run and ledger_complete)
     complete = actual_complete or dry_run_complete
@@ -311,9 +290,7 @@ def direct_execution_terminal_state(
         complete = False
     elif complete:
         status = "completed"
-    elif task_status in {
-        "failed", "needs_replan", "needs_reconcile", "needs_rerun", "waiting_user"
-    }:
+    elif task_status in {"failed", "needs_replan", "waiting_user"}:
         status = task_status
     else:
         status = "incomplete"
@@ -321,7 +298,6 @@ def direct_execution_terminal_state(
         "ok": complete,
         "status": status,
         "task_id": task.task_id,
-        "task_phase": task_phase,
         "task_status": task_status,
         "plan_id": plan_id,
         "plan_status": plan_status,
@@ -329,26 +305,6 @@ def direct_execution_terminal_state(
         "current_step": current,
         "execution_overview": overview,
     }
-
-
-def direct_completed_entry_state(task: Any) -> dict[str, Any] | None:
-    """Return a compact success when entry reconciliation proves work is complete."""
-    if task.phase.value != "completed" or task.status.value != "completed":
-        return None
-    snapshot = task.artifact_snapshot
-    return {
-        "ok": True,
-        "status": "completed",
-        "task_id": task.task_id,
-        "task_phase": task.phase.value,
-        "task_status": task.status.value,
-        "artifacts": (
-            snapshot.model_dump(mode="json")
-            if snapshot is not None
-            else None
-        ),
-    }
-
 
 async def run_executor_agent(
     agent,

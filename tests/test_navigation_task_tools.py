@@ -107,7 +107,7 @@ def test_bound_task_tool_records_guidance_without_lifecycle_or_phase_selection(
     assert stored is not None and observation is not None
     assert stored.scene_mode == "in"
     assert stored.guidance_revision == 1
-    assert stored.phase.value == "intake"
+    assert stored.status.value == "active"
     assert stored.accepted_plan_phase is None
     assert observation.completed_kinds == ["user_guidance"]
 
@@ -149,14 +149,6 @@ def test_guidance_observation_failure_restores_logical_task_state(
         "write",
         lambda *_args, **_kwargs: (_ for _ in ()).throw(OSError("unavailable")),
     )
-    monkeypatch.setattr(
-        services.task_store,
-        "restore_task_exact_if_current",
-        lambda *_args, **_kwargs: (_ for _ in ()).throw(
-            AssertionError("atomic guidance must not require compensation")
-        ),
-    )
-
     result = _call(
         tools["record_navigation_user_guidance_tool"],
         text="do not partially persist this",
@@ -169,6 +161,6 @@ def test_guidance_observation_failure_restores_logical_task_state(
     assert before is not None and after is not None
     assert after.guidance_revision == before.guidance_revision
     assert after.scene_mode == before.scene_mode
-    assert after.phase == before.phase
+    assert after.status == before.status
     assert after.accepted_plan_phase == before.accepted_plan_phase
     assert services.observation_store.latest(task.task_id) is None

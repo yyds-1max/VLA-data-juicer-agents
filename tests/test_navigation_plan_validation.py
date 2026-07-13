@@ -30,7 +30,6 @@ from vla_data_juicer_agents.navigation.plan_validation import validate_navigatio
 from vla_data_juicer_agents.navigation.task_state import (
     NavigationArtifactSnapshot,
     NavigationTask,
-    NavigationTaskPhase,
 )
 
 
@@ -39,7 +38,6 @@ def extract_task() -> NavigationTask:
         task_id="nav-plan-1",
         date="20260710",
         segments=["20260710_120000"],
-        phase=NavigationTaskPhase.EXTRACT_SYNC,
     )
 
 
@@ -49,7 +47,6 @@ def finish_task() -> NavigationTask:
         date="20260710",
         segments=["20260710_120000"],
         scene_mode="out",
-        phase=NavigationTaskPhase.FINISH_PROCESSING,
     )
 
 
@@ -607,9 +604,7 @@ def test_observation_must_match_bound_task_and_complete_required_kinds():
 
 
 def test_submitted_plan_type_selects_stage_without_bound_task_phase():
-    task = extract_task().model_copy(
-        update={"phase": NavigationTaskPhase.FINISH_PROCESSING}
-    )
+    task = extract_task()
     plan = ExtractSyncPlanInput.model_validate(valid_extract_plan_payload())
 
     report = validate_navigation_plan(

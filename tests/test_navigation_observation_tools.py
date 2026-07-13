@@ -28,9 +28,7 @@ from vla_data_juicer_agents.navigation.planning_context import NavigationTaskCon
 from vla_data_juicer_agents.navigation.task_state import (
     NavigationArtifactSnapshot,
     NavigationTask,
-    NavigationTaskPhase,
 )
-from vla_data_juicer_agents.navigation.task_store import SqliteNavigationTaskStore
 
 
 FIXTURE_ROOT = Path(__file__).parent / "fixtures" / "navigation" / "VLADatasets"
@@ -73,13 +71,12 @@ def _decode_tool_payload(payload):
     raise TypeError(f"unsupported tool payload: {type(payload)!r}")
 
 
-def _task(phase=NavigationTaskPhase.EXTRACT_SYNC):
+def _task(*, scene_mode=None):
     return NavigationTask(
         task_id="nav-observe-1",
         date="20270605",
         segments=["20260605_152856"],
-        scene_mode="out" if phase == NavigationTaskPhase.FINISH_PROCESSING else None,
-        phase=phase,
+        scene_mode=scene_mode,
     )
 
 
@@ -115,53 +112,6 @@ def test_builder_exposes_factual_and_cognitive_tools_without_semantic_inference(
     assert not any("infer_" in name or "profile" in name for name in tools)
     assert all(tool.is_read_only for tool in tools.values())
     assert all("task_id" not in tool.input_schema.get("properties", {}) for tool in tools.values())
-
-
-def test_stale_inspection_toolkit_cannot_write_revision_or_evidence_after_rebind(tmp_path):
-    db_path = tmp_path / "state.sqlite"
-    task_store = SqliteNavigationTaskStore(db_path)
-    task = task_store.create_or_update_task(
-        date="20270605",
-        segments=["20260605_152856"],
-        scene_mode=None,
-        web_session_id="web-owner",
-        agentscope_session_id="as-old",
-    )
-    task = task_store.update_task_for_session(
-        task.task_id,
-        web_session_id="web-owner",
-        agentscope_session_id="as-old",
-        phase="extract_sync",
-    )
-    observation_store = SqliteNavigationObservationStore(db_path)
-    evidence_store = FileNavigationEvidenceStore(tmp_path / "evidence")
-    tools = {
-        tool.name: tool
-        for tool in build_navigation_observation_tools(
-            task=task,
-            observation_store=observation_store,
-            evidence_store=evidence_store,
-            settings=NavigationSettings(vladatasets_root=FIXTURE_ROOT),
-            expected_web_session_id="web-owner",
-            expected_agentscope_session_id="as-old",
-        )
-    }
-    task_store.create_or_update_task(
-        date=task.date,
-        segments=task.segments,
-        scene_mode=None,
-        web_session_id="web-owner",
-        agentscope_session_id="as-new",
-    )
-
-    result = _invoke_tool(tools["inspect_navigation_raw_metadata_tool"], {})
-
-    assert set(result) == {"ok", "error_type", "message"}
-    assert result["ok"] is False
-    assert result["error_type"] == "permission_error"
-    assert "session mismatch" in result["message"]
-    assert observation_store.latest(task.task_id) is None
-    assert not (tmp_path / "evidence" / task.task_id).exists()
 
 
 def test_inspection_tool_returns_only_compact_delta_and_external_evidence(tmp_path):
@@ -213,7 +163,6 @@ def test_large_topic_inventory_is_compacted_before_single_persisted_revision(tmp
         task_id="nav-large-inventory",
         date="20270605",
         segments=["segment_a"],
-        phase=NavigationTaskPhase.EXTRACT_SYNC,
     )
     tools, observation_store, evidence_store = _tools(
         tmp_path,
@@ -296,7 +245,7 @@ def test_finish_inventory_tools_report_only_measured_candidates(tmp_path):
     settings = NavigationSettings(vladatasets_root=FIXTURE_ROOT, processing_root=processing_root)
     tools, _, _ = _tools(
         tmp_path,
-        task=_task(NavigationTaskPhase.FINISH_PROCESSING),
+        task=_task(scene_mode="out"),
         settings=settings,
     )
 

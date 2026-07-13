@@ -91,6 +91,28 @@ def failed_result(tool_name: str) -> ToolResult:
     )
 
 
+def _create_task(
+    store: SqliteNavigationTaskStore,
+    *,
+    date: str,
+    segments: list[str] | None,
+    scene_mode: str | None,
+    dry_run: bool = False,
+    web_session_id: str | None = None,
+    agentscope_session_id: str | None = None,
+) -> NavigationTask:
+    return store.create_task_attempt(
+        request="Process navigation data",
+        target=date,
+        date=date,
+        segments=segments,
+        scene_mode=scene_mode,
+        dry_run=dry_run,
+        web_session_id=web_session_id,
+        agentscope_session_id=agentscope_session_id,
+    ).task
+
+
 def extract_plan(*, two_steps: bool = False) -> ExtractSyncPlanInput:
     steps = []
     if two_steps:
@@ -283,13 +305,13 @@ def build_services(tmp_path: Path, *, two_steps: bool = False) -> Services:
     (settings.raw_data_root / "20260710" / segment).mkdir(parents=True)
     db_path = tmp_path / "navigation.sqlite"
     task_store = SqliteNavigationTaskStore(db_path)
-    task = task_store.create_or_update_task(
+    task = _create_task(
+        task_store,
         date="20260710",
         segments=[segment],
         scene_mode=None,
         dry_run=True,
     )
-    task = task_store.update_task(task.task_id, phase="extract_sync", status="pending")
     observation_store = SqliteNavigationObservationStore(db_path)
     evidence_store = FileNavigationEvidenceStore(tmp_path / "evidence")
     plan_store = SqliteNavigationPlanRepository(db_path)
@@ -427,8 +449,6 @@ def test_changed_input_precondition_records_evidence_without_artifact_reconcilia
     monkeypatch,
     tmp_path,
 ):
-    from vla_data_juicer_agents.navigation import artifact_inspection, task_reconciliation
-
     services = build_services(tmp_path)
     invoked = []
     monkeypatch.setattr(
@@ -436,28 +456,6 @@ def test_changed_input_precondition_records_evidence_without_artifact_reconcilia
         "extract_and_sync_navigation_data",
         lambda **kwargs: invoked.append(kwargs)
         or ok_result("extract_and_sync_navigation_data"),
-    )
-    monkeypatch.setattr(
-        artifact_inspection,
-        "build_navigation_artifact_snapshot",
-        lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("artifact snapshot called")),
-    )
-    monkeypatch.setattr(
-        plan_execution,
-        "build_navigation_artifact_snapshot",
-        artifact_inspection.build_navigation_artifact_snapshot,
-        raising=False,
-    )
-    monkeypatch.setattr(
-        task_reconciliation,
-        "reconcile_navigation_task",
-        lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("task reconcile called")),
-    )
-    monkeypatch.setattr(
-        plan_execution,
-        "reconcile_navigation_task",
-        task_reconciliation.reconcile_navigation_task,
-        raising=False,
     )
     raw_root = services.settings.raw_data_root / services.task.date
     for child in raw_root.iterdir():
@@ -516,16 +514,12 @@ def test_gridmap_step_rejects_drift_in_exact_observed_inputs(
 
     db_path = tmp_path / "navigation.sqlite"
     task_store = SqliteNavigationTaskStore(db_path)
-    task = task_store.create_or_update_task(
+    task = _create_task(
+        task_store,
         date=date,
         segments=[segment],
         scene_mode="out",
         dry_run=True,
-    )
-    task = task_store.update_task(
-        task.task_id,
-        phase="finish_processing",
-        status="pending",
     )
     evidence_store = FileNavigationEvidenceStore(tmp_path / "evidence")
     observation_store = SqliteNavigationObservationStore(db_path)
@@ -705,13 +699,13 @@ def test_finish_plan_execution_permission_does_not_infer_phase_from_artifacts(tm
     (settings.raw_data_root / date / segment).mkdir(parents=True)
     db_path = tmp_path / "navigation.sqlite"
     task_store = SqliteNavigationTaskStore(db_path)
-    task = task_store.create_or_update_task(
+    task = _create_task(
+        task_store,
         date=date,
         segments=[segment],
         scene_mode="out",
         dry_run=True,
     )
-    task = task_store.update_task(task.task_id, phase="finish_processing", status="pending")
     observation_store = SqliteNavigationObservationStore(db_path)
     evidence_store = FileNavigationEvidenceStore(tmp_path / "evidence")
     observation = observation_store.append(
@@ -751,7 +745,7 @@ def test_finish_plan_execution_permission_does_not_infer_phase_from_artifacts(tm
 
     assert permission.behavior.value == "allow"
     assert plan_store.get(plan.plan_id).status == "active"
-    assert task_store.get_task(task.task_id).status.value == "pending"
+    assert task_store.get_task(task.task_id).status.value == "active"
 
 
 def test_human_decision_permission_fails_closed_when_sensor_input_disappears(tmp_path):
@@ -766,13 +760,13 @@ def test_human_decision_permission_fails_closed_when_sensor_input_disappears(tmp
     (settings.raw_data_root / date / segment).mkdir(parents=True)
     db_path = tmp_path / "navigation.sqlite"
     task_store = SqliteNavigationTaskStore(db_path)
-    task = task_store.create_or_update_task(
+    task = _create_task(
+        task_store,
         date=date,
         segments=[segment],
         scene_mode="out",
         dry_run=True,
     )
-    task = task_store.update_task(task.task_id, phase="finish_processing", status="pending")
     observation_store = SqliteNavigationObservationStore(db_path)
     evidence_store = FileNavigationEvidenceStore(tmp_path / "evidence")
     observation = observation_store.append(
@@ -832,16 +826,12 @@ def test_waiting_human_decision_retry_enters_audited_recovery_when_input_drifts(
     date, segment = "20260710", "segment-a"
     db_path = tmp_path / "navigation.sqlite"
     task_store = SqliteNavigationTaskStore(db_path)
-    task = task_store.create_or_update_task(
+    task = _create_task(
+        task_store,
         date=date,
         segments=[segment],
         scene_mode="out",
         dry_run=True,
-    )
-    task = task_store.update_task(
-        task.task_id,
-        phase="finish_processing",
-        status="pending",
     )
     evidence_store = FileNavigationEvidenceStore(tmp_path / "evidence")
     observation = SqliteNavigationObservationStore(db_path).append(
@@ -854,12 +844,15 @@ def test_waiting_human_decision_retry_enters_audited_recovery_when_input_drifts(
         expected_agentscope_session_id=None,
     )
     owner, agent = "web-owner", "web-owner-agent"
-    task = task_store.update_task(
-        task.task_id,
-        created_by_web_session_id=owner,
-        latest_web_session_id=owner,
-        agentscope_session_id=agent,
-    )
+    with sqlite3.connect(db_path) as connection:
+        connection.execute(
+            """UPDATE navigation_tasks
+               SET created_by_web_session_id = ?, agentscope_session_id = ?
+               WHERE task_id = ?""",
+            (owner, agent, task.task_id),
+        )
+    task = task_store.get_task(task.task_id)
+    assert task is not None
     plan_store = SqliteNavigationPlanRepository(db_path)
     plan = plan_store.activate(
         task,
@@ -954,16 +947,12 @@ def test_waiting_human_decision_retry_without_drift_remains_allowed(tmp_path):
     (settings.processing_root / source).mkdir(parents=True)
     db_path = tmp_path / "navigation.sqlite"
     task_store = SqliteNavigationTaskStore(db_path)
-    task = task_store.create_or_update_task(
+    task = _create_task(
+        task_store,
         date="20260710",
         segments=["segment-a"],
         scene_mode="out",
         dry_run=True,
-    )
-    task = task_store.update_task(
-        task.task_id,
-        phase="finish_processing",
-        status="pending",
     )
     evidence_store = FileNavigationEvidenceStore(tmp_path / "evidence")
     observation = SqliteNavigationObservationStore(db_path).append(
@@ -1009,16 +998,12 @@ def test_captured_human_decision_tool_denies_existing_recovery_without_mutation(
     (settings.processing_root / source).mkdir(parents=True)
     db_path = tmp_path / "navigation.sqlite"
     task_store = SqliteNavigationTaskStore(db_path)
-    task = task_store.create_or_update_task(
+    task = _create_task(
+        task_store,
         date="20260710",
         segments=["segment-a"],
         scene_mode="out",
         dry_run=True,
-    )
-    task = task_store.update_task(
-        task.task_id,
-        phase="finish_processing",
-        status="pending",
     )
     evidence_store = FileNavigationEvidenceStore(tmp_path / "evidence")
     observation = SqliteNavigationObservationStore(db_path).append(
@@ -1117,52 +1102,6 @@ def test_captured_human_decision_tool_denies_existing_recovery_without_mutation(
     } == evidence_before
 
 
-def test_stale_agentscope_session_cannot_claim_plan_bound_step(monkeypatch, tmp_path):
-    services = build_services(tmp_path)
-    bound = services.task_store.update_task(
-        services.task.task_id,
-        created_by_web_session_id="web-owner",
-        latest_web_session_id="web-owner",
-        agentscope_session_id="as-old",
-    )
-    invoked = []
-    monkeypatch.setattr(
-        plan_execution,
-        "extract_and_sync_navigation_data",
-        lambda **kwargs: invoked.append(kwargs) or ok_result("extract_and_sync_navigation_data"),
-    )
-    tools = {
-        tool.name: tool
-        for tool in plan_execution.build_plan_bound_execution_tools(
-            task=bound,
-            plan_store=services.plan_store,
-            evidence_store=services.evidence_store,
-            settings=services.settings,
-            dry_run=True,
-            cancellation=None,
-            web_session_id="web-owner",
-            agentscope_session_id="as-old",
-        )
-    }
-    services.task_store.create_or_update_task(
-        date=bound.date,
-        segments=bound.segments,
-        scene_mode=bound.scene_mode,
-        dry_run=bound.dry_run,
-        web_session_id="web-owner",
-        agentscope_session_id="as-new",
-    )
-
-    result = call_tool(
-        tools["extract_and_sync_navigation_data_tool"],
-        plan_id=services.plan.plan_id,
-        step_id="sync",
-    )
-
-    assert result["error_type"] == "navigation_task_session_mismatch"
-    assert invoked == []
-
-
 def test_old_wrapper_cannot_claim_after_same_session_creates_new_current_attempt(
     monkeypatch,
     tmp_path,
@@ -1255,56 +1194,6 @@ def test_old_wrapper_cannot_claim_after_same_session_creates_new_current_attempt
     assert result["error_type"] == "navigation_task_session_mismatch"
     assert invoked == []
     assert plan_store.get_current_step(plan.plan_id)["step"]["status"] == "pending"
-
-
-def test_execution_snapshot_cannot_overwrite_same_owner_rebind(monkeypatch, tmp_path):
-    services = build_services(tmp_path)
-    bound = services.task_store.update_task(
-        services.task.task_id,
-        created_by_web_session_id="web-owner",
-        latest_web_session_id="web-owner",
-        agentscope_session_id="as-old",
-    )
-    invoked = []
-
-    monkeypatch.setattr(
-        plan_execution,
-        "extract_and_sync_navigation_data",
-        lambda **kwargs: invoked.append(kwargs) or ok_result("extract_and_sync_navigation_data"),
-    )
-    tools = {
-        tool.name: tool
-        for tool in plan_execution.build_plan_bound_execution_tools(
-            task=bound,
-            plan_store=services.plan_store,
-            evidence_store=services.evidence_store,
-            settings=services.settings,
-            dry_run=True,
-            cancellation=None,
-            web_session_id="web-owner",
-            agentscope_session_id="as-old",
-        )
-    }
-    services.task_store.create_or_update_task(
-        date=bound.date,
-        segments=bound.segments,
-        scene_mode=bound.scene_mode,
-        dry_run=bound.dry_run,
-        web_session_id="web-owner",
-        agentscope_session_id="as-new",
-    )
-
-    result = call_tool(
-        tools["extract_and_sync_navigation_data_tool"],
-        plan_id=services.plan.plan_id,
-        step_id="sync",
-    )
-
-    assert result["error_type"] == "navigation_task_session_mismatch"
-    assert invoked == []
-    current = services.task_store.get_task(bound.task_id)
-    assert current.agentscope_session_id == "as-new"
-    assert services.plan_store.get_current_step(services.plan.plan_id)["step"]["status"] == "pending"
 
 
 def test_superseded_plan_cannot_claim_pending_step(tmp_path):
@@ -1471,7 +1360,7 @@ def test_evidence_write_failure_recovers_from_durable_result_without_reinvoking(
 
     first = call_tool(tool, plan_id=services.plan.plan_id, step_id="sync")
     persisted_before_recovery = services.task_store.get_task(services.task.task_id)
-    assert persisted_before_recovery.phase.value == "extract_sync"
+    assert persisted_before_recovery.accepted_plan_phase == "extract_sync"
     fresh_tools = {
         candidate.name: candidate
         for candidate in plan_execution.build_plan_bound_execution_tools(
@@ -1531,7 +1420,10 @@ def test_staged_result_finalizes_without_execution_time_phase_inference(
     assert second["ok"] is True
     assert len(invoked) == 1
     assert services.plan_store.get(services.plan.plan_id).status == "completed"
-    assert services.task_store.get_task(services.task.task_id).phase.value == "extract_sync"
+    assert (
+        services.task_store.get_task(services.task.task_id).accepted_plan_phase
+        == "extract_sync"
+    )
 
 
 @pytest.mark.parametrize(
@@ -1767,9 +1659,8 @@ def test_failed_step_does_not_infer_artifact_state_and_exposes_no_fresh_executio
         )
     }
     assert result["status"] == "failed"
-    assert stored.phase.value == "extract_sync"
+    assert stored.accepted_plan_phase == "extract_sync"
     assert stored.status.value == "failed"
-    assert stored.artifact_snapshot is None
     assert fresh == {}
 
 
@@ -1787,11 +1678,9 @@ def test_failed_validation_does_not_infer_final_artifacts_or_expose_execution_to
     (settings.clip_data_root / date / segment / "sync_data").mkdir(parents=True)
     db_path = tmp_path / "navigation.sqlite"
     task_store = SqliteNavigationTaskStore(db_path)
-    task = task_store.create_or_update_task(
+    task = _create_task(
+        task_store,
         date=date, segments=[segment], scene_mode="out", dry_run=True
-    )
-    task = task_store.update_task(
-        task.task_id, phase="finish_processing", status="pending"
     )
     evidence_store = FileNavigationEvidenceStore(tmp_path / "evidence")
     observation = SqliteNavigationObservationStore(db_path).append(
@@ -1852,9 +1741,8 @@ def test_failed_validation_does_not_infer_final_artifacts_or_expose_execution_to
         )
     }
     assert result["status"] == "failed"
-    assert stored.phase.value == "finish_processing"
+    assert stored.accepted_plan_phase == "finish_processing"
     assert stored.status.value == "failed"
-    assert stored.artifact_snapshot is None
     assert fresh_tools == {}
 
 
@@ -2030,13 +1918,13 @@ def test_calibration_source_must_match_plan_revision_inventory_and_processing_ro
     (settings.clip_data_root / date / segment / "sync_data").mkdir(parents=True)
     db_path = tmp_path / "navigation.sqlite"
     task_store = SqliteNavigationTaskStore(db_path)
-    task = task_store.create_or_update_task(
+    task = _create_task(
+        task_store,
         date=date,
         segments=[segment],
         scene_mode="out",
         dry_run=True,
     )
-    task = task_store.update_task(task.task_id, phase="finish_processing", status="pending")
     observation_store = SqliteNavigationObservationStore(db_path)
     evidence_store = FileNavigationEvidenceStore(tmp_path / "evidence")
     observation = observation_store.append(
@@ -2121,13 +2009,13 @@ def test_plan_bound_human_decision_waits_and_transitions_ledger_exactly_once(
     (settings.clip_data_root / date / segment / "sync_data").mkdir(parents=True)
     db_path = tmp_path / "navigation.sqlite"
     task_store = SqliteNavigationTaskStore(db_path)
-    task = task_store.create_or_update_task(
+    task = _create_task(
+        task_store,
         date=date,
         segments=[segment],
         scene_mode="out",
         dry_run=True,
     )
-    task = task_store.update_task(task.task_id, phase="finish_processing", status="pending")
     observation_store = SqliteNavigationObservationStore(db_path)
     evidence_store = FileNavigationEvidenceStore(tmp_path / "evidence")
     observation = observation_store.append(
@@ -2239,94 +2127,3 @@ def test_plan_bound_human_decision_waits_and_transitions_ledger_exactly_once(
             (plan.plan_id,),
         ).fetchone()[0]
     assert status == expected_status
-
-
-def test_human_decision_finalize_does_not_borrow_rebound_session_authority(
-    monkeypatch,
-    tmp_path,
-):
-    settings = NavigationSettings(
-        vladatasets_root=tmp_path / "datasets",
-        processing_root=tmp_path / "processing",
-    )
-    source = "NoobScenes/params/observed/sensors"
-    (settings.processing_root / source).mkdir(parents=True)
-    date = "20260710"
-    segment = "segment-a"
-    (settings.raw_data_root / date / segment).mkdir(parents=True)
-    (settings.clip_data_root / date / segment / "sync_data").mkdir(parents=True)
-    db_path = tmp_path / "navigation.sqlite"
-    task_store = SqliteNavigationTaskStore(db_path)
-    task = task_store.create_or_update_task(
-        date=date,
-        segments=[segment],
-        scene_mode="out",
-        dry_run=True,
-    )
-    task = task_store.update_task(
-        task.task_id,
-        phase="finish_processing",
-        status="pending",
-    )
-    observation_store = SqliteNavigationObservationStore(db_path)
-    evidence_store = FileNavigationEvidenceStore(tmp_path / "evidence")
-    observation = observation_store.append(
-        task.task_id,
-        "calibration_inventory",
-        [CalibrationInventoryObservation(sensor_sources=[source])],
-        [],
-        evidence_store,
-        expected_web_session_id=None,
-        expected_agentscope_session_id=None,
-    )
-    task = task_store.update_task(
-        task.task_id,
-        created_by_web_session_id="web-old",
-        latest_web_session_id="web-old",
-        agentscope_session_id="agentscope-old",
-    )
-    plan_store = SqliteNavigationPlanRepository(db_path)
-    plan = plan_store.activate(
-        task,
-        "finish_processing",
-        observation.revision,
-        finish_plan(source),
-        expected_web_session_id="web-old",
-        expected_agentscope_session_id="agentscope-old",
-    )
-    original_stage = plan_store.stage_human_decision_handoff
-
-    def stage_then_rebind(*args, **kwargs):
-        outcome = original_stage(*args, **kwargs)
-        with sqlite3.connect(db_path) as connection:
-            connection.execute(
-                """UPDATE navigation_tasks
-                   SET created_by_web_session_id = 'web-new',
-                       latest_web_session_id = 'web-new',
-                       agentscope_session_id = 'agentscope-new'
-                   WHERE task_id = ?""",
-                (task.task_id,),
-            )
-        return outcome
-
-    monkeypatch.setattr(
-        plan_store,
-        "stage_human_decision_handoff",
-        stage_then_rebind,
-    )
-
-    accepted = plan_execution.submit_plan_human_decision(
-        plan_store=plan_store,
-        evidence_store=evidence_store,
-        plan_id=plan.plan_id,
-        step_id="confirm",
-        decision={"action": "confirm"},
-        expected_web_session_id="web-old",
-        expected_agentscope_session_id="agentscope-old",
-    )
-
-    assert accepted is False
-    assert plan_store.get_human_decision_handoff(plan.plan_id, "confirm") is not None
-    assert plan_store.get_staged_step_result(plan.plan_id, "confirm") is not None
-    assert plan_store.get_current_step(plan.plan_id)["step"]["status"] == "pending"
-    assert plan_store.get(plan.plan_id).status == "active"

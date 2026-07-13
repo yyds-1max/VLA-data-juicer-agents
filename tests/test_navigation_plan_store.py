@@ -123,14 +123,24 @@ def valid_finish_plan() -> FinishProcessingPlanInput:
     )
 
 
-def stores_with_task(tmp_path: Path):
+def stores_with_task(
+    tmp_path: Path,
+    *,
+    web_session_id: str | None = None,
+    agentscope_session_id: str | None = None,
+):
     db_path = tmp_path / "navigation_tasks.sqlite"
     task_store = SqliteNavigationTaskStore(db_path)
-    task = task_store.create_or_update_task(
+    task = task_store.create_task_attempt(
+        request="Process navigation data",
+        target="20270623",
         date="20270623",
         segments=["20260623_101010"],
         scene_mode=None,
-    )
+        dry_run=False,
+        web_session_id=web_session_id,
+        agentscope_session_id=agentscope_session_id,
+    ).task
     return SqliteNavigationPlanRepository(db_path), task
 
 
@@ -489,7 +499,7 @@ def test_completed_extract_plan_leaves_attempt_active(tmp_path: Path):
     stored = SqliteNavigationTaskStore(repo.db_path).get_task(task.task_id)
     assert stored is not None
     assert stored.status.value == "active"
-    assert stored.accepted_plan_phase.value == "extract_sync"
+    assert stored.accepted_plan_phase == "extract_sync"
 
 
 def test_finish_plan_completes_attempt_only_after_terminal_validation(tmp_path: Path):
@@ -665,12 +675,7 @@ def test_repository_migrates_delivery_lease_and_fails_closed_after_expiry(tmp_pa
 
 
 def test_controlled_handoff_recovery_preserves_audit_and_unblocks_replacement(tmp_path: Path):
-    repo, task = stores_with_task(tmp_path)
-    task = SqliteNavigationTaskStore(repo.db_path).update_task(
-        task.task_id,
-        created_by_web_session_id="web-owner",
-        latest_web_session_id="web-owner",
-    )
+    repo, task = stores_with_task(tmp_path, web_session_id="web-owner")
     plan = repo.activate(
         task, "extract_sync", 1, valid_extract_plan(),
         expected_web_session_id="web-owner", expected_agentscope_session_id=None,
@@ -750,12 +755,7 @@ def test_controlled_handoff_recovery_preserves_audit_and_unblocks_replacement(tm
 def test_controlled_handoff_recovery_rejects_non_recovery_states(
     tmp_path: Path, delivery_status: str
 ):
-    repo, task = stores_with_task(tmp_path)
-    task = SqliteNavigationTaskStore(repo.db_path).update_task(
-        task.task_id,
-        created_by_web_session_id="web-owner",
-        latest_web_session_id="web-owner",
-    )
+    repo, task = stores_with_task(tmp_path, web_session_id="web-owner")
     plan = repo.activate(
         task, "extract_sync", 1, valid_extract_plan(),
         expected_web_session_id="web-owner", expected_agentscope_session_id=None,
@@ -870,16 +870,16 @@ def test_plan_repository_can_initialize_before_task_store(tmp_path: Path):
 def test_owned_task_plan_writes_reject_omitted_session(tmp_path: Path):
     db_path = tmp_path / "owned.sqlite"
     task_store = SqliteNavigationTaskStore(db_path)
-    task = task_store.create_or_update_task(
-        date="20260710", segments=["clip"], scene_mode=None
-    )
+    owned = task_store.create_task_attempt(
+        request="Process navigation data", target="20260710",
+        date="20260710", segments=["clip"], scene_mode=None, dry_run=False,
+        web_session_id="web-owner", agentscope_session_id="as-owner",
+    ).task
     repository = SqliteNavigationPlanRepository(db_path)
-    plan = repository.activate(task, "extract_sync", 1, valid_extract_plan())
-    owned = task_store.update_task(
-        task.task_id,
-        created_by_web_session_id="web-owner",
-        latest_web_session_id="web-owner",
-        agentscope_session_id="as-owner",
+    plan = repository.activate(
+        owned, "extract_sync", 1, valid_extract_plan(),
+        expected_web_session_id="web-owner",
+        expected_agentscope_session_id="as-owner",
     )
     attempt = PlanSubmissionAttempt(
         attempt_id="attempt-owned",
@@ -918,45 +918,6 @@ def test_owned_task_plan_writes_reject_omitted_session(tmp_path: Path):
         )
 
 
-@pytest.mark.parametrize("transition", ["claim_step", "mark_waiting_user"])
-def test_step_transition_fails_closed_when_web_owner_rebinds_after_authorization(
-    tmp_path: Path, monkeypatch, transition: str
-):
-    repo, task = stores_with_task(tmp_path)
-    plan = repo.activate(task, "extract_sync", 1, valid_extract_plan())
-    task_store = SqliteNavigationTaskStore(repo.db_path)
-    task_store.update_task(
-        task.task_id,
-        created_by_web_session_id="web-one",
-        latest_web_session_id="web-one",
-    )
-    original_authorize = repo._authorize_plan_write
-
-    def authorize_then_rebind(connection, plan_id, **kwargs):
-        original_authorize(connection, plan_id, **kwargs)
-        with sqlite3.connect(repo.db_path, timeout=0) as rebind:
-            rebind.execute(
-                "UPDATE navigation_tasks SET latest_web_session_id = ? WHERE task_id = ?",
-                ("web-two", task.task_id),
-            )
-
-    monkeypatch.setattr(repo, "_authorize_plan_write", authorize_then_rebind)
-
-    transition_call = lambda: getattr(repo, transition)(
-        plan.plan_id,
-        "prepare",
-        "prepare_raw_data",
-        expected_web_session_id="web-one",
-        expected_agentscope_session_id=None,
-    )
-    if transition == "claim_step":
-        with pytest.raises(sqlite3.OperationalError, match="locked"):
-            transition_call()
-    else:
-        assert transition_call() is False
-    assert repo.get_current_step(plan.plan_id)["step"]["status"] == "pending"
-
-
 def test_activate_plan_and_ledger_is_atomic(tmp_path: Path):
     repo, task = stores_with_task(tmp_path)
     before = SqliteNavigationTaskStore(repo.db_path).get_task(task.task_id)
@@ -969,7 +930,7 @@ def test_activate_plan_and_ledger_is_atomic(tmp_path: Path):
     ] == ["prepare", "sync"]
     after = SqliteNavigationTaskStore(repo.db_path).get_task(task.task_id)
     assert before is not None and after is not None
-    assert after.accepted_plan_phase.value == "extract_sync"
+    assert after.accepted_plan_phase == "extract_sync"
     assert after.state_revision > before.state_revision
 
 
@@ -1091,7 +1052,7 @@ def test_cross_phase_activation_replaces_the_whole_active_plan_atomically(tmp_pa
     assert repo.get_active_for_task(task.task_id).plan_id == finish.plan_id
     stored = SqliteNavigationTaskStore(repo.db_path).get_task(task.task_id)
     assert stored is not None
-    assert stored.accepted_plan_phase.value == "finish_processing"
+    assert stored.accepted_plan_phase == "finish_processing"
 
 
 @pytest.mark.parametrize(
@@ -1103,12 +1064,9 @@ def test_execution_snapshot_reads_task_plan_and_ledger_in_one_state(
     current_status: str,
     expected_activity: str,
 ):
-    repo, task = stores_with_task(tmp_path)
-    task_store = SqliteNavigationTaskStore(repo.db_path)
-    task = task_store.update_task(
-        task.task_id,
-        created_by_web_session_id="web-owner",
-        latest_web_session_id="web-owner",
+    repo, task = stores_with_task(
+        tmp_path,
+        web_session_id="web-owner",
         agentscope_session_id="web-owner__agent",
     )
     plan = repo.activate(
@@ -1201,16 +1159,18 @@ def test_invalidate_removes_plan_from_active_lookup_without_mutating_plan(tmp_pa
     assert reason == "artifact drift"
 
 
-def test_invalidate_requires_exact_session_for_owned_task_and_allows_legacy_task(
+def test_invalidate_requires_exact_session_for_owned_task(
     tmp_path: Path,
 ):
-    repo, task = stores_with_task(tmp_path)
-    owned_plan = repo.activate(task, "extract_sync", 1, valid_extract_plan())
-    SqliteNavigationTaskStore(repo.db_path).update_task(
-        task.task_id,
-        created_by_web_session_id="web-owner",
-        latest_web_session_id="web-owner",
+    repo, task = stores_with_task(
+        tmp_path,
+        web_session_id="web-owner",
         agentscope_session_id="agentscope-owner",
+    )
+    owned_plan = repo.activate(
+        task, "extract_sync", 1, valid_extract_plan(),
+        expected_web_session_id="web-owner",
+        expected_agentscope_session_id="agentscope-owner",
     )
 
     with pytest.raises(PermissionError, match="session mismatch"):
@@ -1231,18 +1191,6 @@ def test_invalidate_requires_exact_session_for_owned_task_and_allows_legacy_task
         expected_agentscope_session_id="agentscope-owner",
     )
     assert invalidated.status == "invalidated"
-
-    legacy_task = SqliteNavigationTaskStore(repo.db_path).create_or_update_task(
-        date="20270624",
-        segments=["20260624_101010"],
-        scene_mode=None,
-    )
-    legacy_plan = repo.activate(
-        legacy_task, "extract_sync", 1, valid_extract_plan()
-    )
-    assert repo.invalidate(legacy_plan.plan_id, "legacy artifact drift").status == (
-        "invalidated"
-    )
 
 
 @pytest.mark.parametrize("mutation", ["invalidate", "mark_needs_replan"])

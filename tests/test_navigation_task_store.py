@@ -13,7 +13,6 @@ from vla_data_juicer_agents.navigation.plan_store import (
 )
 from vla_data_juicer_agents.navigation.task_state import (
     TASK_SCHEMA_VERSION,
-    NavigationTaskPhase,
     NavigationTaskStatus,
 )
 from vla_data_juicer_agents.navigation.task_store import (
@@ -119,13 +118,15 @@ def _insert_plan_ledger_step(
     return plan_id, step_id
 
 
-def test_task_store_exposes_only_cas_compensation_mutators(tmp_path: Path):
+def test_task_store_exposes_only_attempt_scoped_mutators(tmp_path: Path):
     store = SqliteNavigationTaskStore(tmp_path / "navigation_tasks.sqlite")
 
-    assert not hasattr(store, "restore_task" + "_exact")
-    assert not hasattr(store, "delete" + "_task")
-    assert hasattr(store, "restore_task_exact_if_current")
+    assert not hasattr(store, "create_or_" + "update_task")
+    assert not hasattr(store, "find_latest_" + "by_date")
+    assert not hasattr(store, "restore_task_" + "exact_if_current")
+    assert not hasattr(store, "update_" + "task")
     assert hasattr(store, "delete_task_if_current")
+    assert hasattr(store, "update_task_for_session")
 
 
 def test_task_store_idempotently_creates_supported_schema_generation(tmp_path: Path):
@@ -152,17 +153,26 @@ def test_task_store_idempotently_creates_supported_schema_generation(tmp_path: P
             row[1]: bool(row[2])
             for row in connection.execute("PRAGMA index_list(navigation_tasks)")
         }
-    assert generation == "navigation-attempts-transitional-v1"
-    assert {
+    assert generation == "navigation-attempts-final-v2"
+    assert task_columns == {
+        "task_id",
         "request",
         "target",
+        "date",
+        "segments_json",
+        "segments_key",
+        "scene_mode",
+        "dry_run",
+        "guidance_revision",
+        "state_revision",
+        "status",
         "accepted_plan_phase",
-        "phase",
-        "latest_web_session_id",
-        "artifact_snapshot_json",
-        "drift_json",
-    } <= task_columns
-    assert "data_profile_json" not in task_columns
+        "created_by_web_session_id",
+        "agentscope_session_id",
+        "schema_version",
+        "created_at",
+        "updated_at",
+    }
     assert {
         "plan_id",
         "plan_revision",
@@ -180,13 +190,17 @@ def test_task_store_idempotently_creates_supported_schema_generation(tmp_path: P
 def test_task_store_creates_and_loads_navigation_task(tmp_path: Path):
     store = SqliteNavigationTaskStore(tmp_path / "navigation_tasks.sqlite")
 
-    task = store.create_or_update_task(
+    creation = store.create_task_attempt(
+        request="Process the requested navigation data.",
+        target="20270623",
         date="20270623",
         segments=["20260623_101010"],
         scene_mode=None,
+        dry_run=False,
         web_session_id="web-1",
         agentscope_session_id="agent-1",
     )
+    task = creation.task
 
     loaded = store.get_task(task.task_id)
 
@@ -195,10 +209,8 @@ def test_task_store_creates_and_loads_navigation_task(tmp_path: Path):
     assert loaded.date == "20270623"
     assert loaded.segments == ["20260623_101010"]
     assert loaded.scene_mode is None
-    assert loaded.phase == NavigationTaskPhase.INTAKE
-    assert loaded.status == NavigationTaskStatus.PENDING
+    assert loaded.status == NavigationTaskStatus.ACTIVE
     assert loaded.created_by_web_session_id == "web-1"
-    assert loaded.latest_web_session_id == "web-1"
     assert loaded.agentscope_session_id == "agent-1"
     assert loaded.schema_version == TASK_SCHEMA_VERSION
 
@@ -465,13 +477,16 @@ def test_running_target_writer_ignores_non_writers(
 
 def test_owned_update_rejects_identity_field_changes_without_mutation(tmp_path: Path):
     store = SqliteNavigationTaskStore(tmp_path / "navigation_tasks.sqlite")
-    owned = store.create_or_update_task(
+    owned = store.create_task_attempt(
+        request="Process navigation data",
+        target="20270623",
         date="20270623",
         segments=None,
         scene_mode=None,
+        dry_run=False,
         web_session_id="web-owner",
         agentscope_session_id="as-owner",
-    )
+    ).task
 
     with pytest.raises(ValueError, match="identity fields"):
         store.update_task_for_session(
@@ -484,110 +499,28 @@ def test_owned_update_rejects_identity_field_changes_without_mutation(tmp_path: 
     assert store.get_task(owned.task_id) == owned
 
 
-def test_same_timestamp_state_revision_prevents_restore_aba(monkeypatch, tmp_path: Path):
-    monkeypatch.setattr(task_store_module, "utc_now", lambda: "2026-07-10T00:00:00+00:00")
-    store = SqliteNavigationTaskStore(tmp_path / "tasks.sqlite")
-    original = store.create_or_update_task(
-        date="20270623", segments=None, scene_mode=None,
-        web_session_id="web-owner", agentscope_session_id="as-old",
-    )
-    claimed = store.update_task_for_session(
-        original.task_id, web_session_id="web-owner",
-        agentscope_session_id="as-old", scene_mode="in",
-    )
-    concurrent = store.create_or_update_task(
-        date=original.date, segments=original.segments, scene_mode="out",
-        web_session_id="web-owner", agentscope_session_id="as-new",
-    )
-
-    restored = store.restore_task_exact_if_current(
-        original, expected_state_revision=claimed.state_revision,
-        expected_web_session_id="web-owner", expected_agentscope_session_id="as-old",
-    )
-
-    assert restored is False
-    current = store.get_task(original.task_id)
-    assert current.scene_mode == "out"
-    assert current.agentscope_session_id == "as-new"
-    assert current.state_revision > claimed.state_revision
-
-
 def test_new_task_cleanup_delete_is_state_revision_cas(monkeypatch, tmp_path: Path):
     monkeypatch.setattr(task_store_module, "utc_now", lambda: "2026-07-10T00:00:00+00:00")
     store = SqliteNavigationTaskStore(tmp_path / "tasks.sqlite")
-    created = store.create_or_update_task(
-        date="20270623", segments=None, scene_mode=None,
-        web_session_id="web-owner", agentscope_session_id="as-old",
-    )
-    updated = store.create_or_update_task(
-        date=created.date, segments=created.segments, scene_mode="out",
-        web_session_id="web-owner", agentscope_session_id="as-new",
+    created = store.create_task_attempt(
+        request="Process navigation data", target="20270623",
+        date="20270623", segments=None, scene_mode=None, dry_run=False,
+        web_session_id="web-owner", agentscope_session_id="as-owner",
+    ).task
+    updated = store.update_task_for_session(
+        created.task_id,
+        web_session_id="web-owner",
+        agentscope_session_id="as-owner",
+        guidance_revision=1,
     )
 
     deleted = store.delete_task_if_current(
         created.task_id, expected_state_revision=created.state_revision,
-        expected_web_session_id="web-owner", expected_agentscope_session_id="as-old",
+        expected_web_session_id="web-owner", expected_agentscope_session_id="as-owner",
     )
 
     assert deleted is False
     assert store.get_task(created.task_id) == updated
-
-
-def test_task_store_update_task_ignores_caller_timestamps(monkeypatch, tmp_path: Path):
-    monkeypatch.setattr(
-        task_store_module,
-        "utc_now",
-        lambda: "2026-07-10T00:00:01.000+00:00",
-    )
-    store = SqliteNavigationTaskStore(tmp_path / "navigation_tasks.sqlite")
-    task = store.create_or_update_task(
-        date="20270623",
-        segments=["segment_a"],
-        scene_mode=None,
-    )
-
-    updated = store.update_task(
-        task.task_id,
-        status=NavigationTaskStatus.NEEDS_RECONCILE,
-        created_at="2000-01-01T00:00:00.000+00:00",
-        updated_at="2000-01-01T00:00:00.000+00:00",
-    )
-
-    assert updated.created_at == task.created_at
-    assert updated.updated_at == "2026-07-10T00:00:01.000+00:00"
-
-
-def test_update_task_serializes_same_timestamp_read_merge_write(monkeypatch, tmp_path: Path):
-    monkeypatch.setattr(task_store_module, "utc_now", lambda: "2026-07-10T00:00:00+00:00")
-    store = SqliteNavigationTaskStore(tmp_path / "navigation_tasks.sqlite")
-    original = store.create_or_update_task(
-        date="20270623", segments=None, scene_mode=None,
-    )
-    barrier = Barrier(2)
-    original_get_task = store.get_task
-
-    def synchronized_get_task(task_id: str):
-        task = original_get_task(task_id)
-        barrier.wait()
-        return task
-
-    monkeypatch.setattr(store, "get_task", synchronized_get_task)
-    with ThreadPoolExecutor(max_workers=2) as executor:
-        futures = [
-            executor.submit(store.update_task, original.task_id, scene_mode="in"),
-            executor.submit(
-                store.update_task,
-                original.task_id,
-                guidance_revision=7,
-            ),
-        ]
-        revisions = sorted(future.result().state_revision for future in futures)
-
-    current = original_get_task(original.task_id)
-    assert revisions == [original.state_revision + 1, original.state_revision + 2]
-    assert current.state_revision == original.state_revision + 2
-    assert current.scene_mode == "in"
-    assert current.guidance_revision == 7
 
 
 def test_incompatible_navigation_schema_requires_reset_without_mutation(
@@ -659,10 +592,10 @@ def test_incompatible_navigation_schema_requires_reset_without_mutation(
     assert len(str(caught)) <= 1000
 
 
-def test_supported_generation_with_broken_contract_requires_reset_without_repair(
+def test_task1_transitional_generation_requires_reset_without_mutation(
     tmp_path: Path,
 ):
-    db_path = tmp_path / "broken-navigation.sqlite"
+    db_path = tmp_path / "task1-transitional-navigation.sqlite"
     SqliteNavigationTaskStore(db_path)
     with sqlite3.connect(db_path) as connection:
         connection.execute(
@@ -676,7 +609,6 @@ def test_supported_generation_with_broken_contract_requires_reset_without_repair
                (singleton, generation) VALUES (1, ?)""",
             ("navigation-attempts-transitional-v1",),
         )
-        connection.execute("DROP INDEX idx_navigation_tasks_attempt_replay")
         before_schema = connection.execute(
             "SELECT type, name, sql FROM sqlite_master ORDER BY type, name"
         ).fetchall()
@@ -817,72 +749,33 @@ def test_corrupt_navigation_database_requires_reset_without_mutation(tmp_path: P
     assert len(str(caught.value)) <= 1000
 
 
-def test_create_or_update_task_preserves_latest_web_session_when_omitted(tmp_path: Path):
-    store = SqliteNavigationTaskStore(tmp_path / "navigation_tasks.sqlite")
-    first = store.create_or_update_task(
-        date="20270623",
-        segments=["20260623_101010"],
-        scene_mode=None,
-        web_session_id="web-1",
-    )
-
-    with pytest.raises(task_store_module.NavigationTaskOwnershipError):
-        store.create_or_update_task(
-            date="20270623",
-            segments=["20260623_101010"],
-            scene_mode=None,
-            web_session_id=None,
-        )
-
-    assert store.get_task(first.task_id) == first
-    assert store.get_task(first.task_id).latest_web_session_id == "web-1"
-
-
-def test_task_store_lists_resumable_tasks(tmp_path: Path):
-    store = SqliteNavigationTaskStore(tmp_path / "navigation_tasks.sqlite")
-    waiting = store.create_or_update_task(date="20270623", segments=None, scene_mode=None)
-    store.update_task(
-        waiting.task_id,
-        phase=NavigationTaskPhase.WAITING_SCENE_MODE,
-        status=NavigationTaskStatus.WAITING_USER,
-        next_required_input="scene_mode",
-    )
-    completed = store.create_or_update_task(date="20270624", segments=None, scene_mode="in")
-    store.update_task(
-        completed.task_id,
-        phase=NavigationTaskPhase.COMPLETED,
-        status=NavigationTaskStatus.COMPLETED,
-    )
-    needs_replan = store.create_or_update_task(date="20270625", segments=None, scene_mode="out")
-    store.update_task(needs_replan.task_id, status=NavigationTaskStatus.NEEDS_REPLAN)
-
-    resumable = store.list_resumable()
-
-    assert [task.task_id for task in resumable] == [needs_replan.task_id, waiting.task_id]
-
-
-def test_task_store_round_trips_entry_fields_and_finds_latest_agentscope_session(
+def test_task_store_round_trips_attempt_fields_and_finds_exact_session(
     tmp_path: Path,
 ):
     store = SqliteNavigationTaskStore(tmp_path / "navigation_tasks.sqlite")
 
-    task = store.create_or_update_task(
+    task = store.create_task_attempt(
+        request="Process navigation data",
+        target="20270623",
         date="20270623",
         segments=["segment_a"],
         scene_mode=None,
         dry_run=True,
+        web_session_id="web-1",
         agentscope_session_id="agent-1",
-    )
+    ).task
     updated = store.update_task_for_session(
         task.task_id,
-        web_session_id=None,
+        web_session_id="web-1",
         agentscope_session_id="agent-1",
         guidance_revision=3,
         status=NavigationTaskStatus.NEEDS_REPLAN,
     )
 
     loaded = store.get_task(task.task_id)
-    by_session = store.find_latest_by_agentscope_session("agent-1")
+    by_session = store.find_by_session(
+        web_session_id="web-1", agentscope_session_id="agent-1"
+    )
 
     assert loaded is not None
     assert loaded.dry_run is True
@@ -890,48 +783,3 @@ def test_task_store_round_trips_entry_fields_and_finds_latest_agentscope_session
     assert loaded.status == NavigationTaskStatus.NEEDS_REPLAN
     assert by_session is not None
     assert by_session.task_id == updated.task_id
-
-
-def test_task_store_preserves_dry_run_when_upsert_omits_it(tmp_path: Path):
-    store = SqliteNavigationTaskStore(tmp_path / "navigation_tasks.sqlite")
-    first = store.create_or_update_task(
-        date="20270623",
-        segments=["segment_a"],
-        scene_mode=None,
-        dry_run=True,
-    )
-
-    preserved = store.create_or_update_task(
-        date="20270623",
-        segments=["segment_a"],
-        scene_mode=None,
-    )
-    explicitly_disabled = store.create_or_update_task(
-        date="20270623",
-        segments=["segment_a"],
-        scene_mode=None,
-        dry_run=False,
-    )
-
-    assert preserved.task_id == first.task_id
-    assert preserved.dry_run is True
-    assert explicitly_disabled.dry_run is False
-
-
-def test_task_store_update_task_can_clear_optional_fields(tmp_path: Path):
-    store = SqliteNavigationTaskStore(tmp_path / "navigation_tasks.sqlite")
-    task = store.create_or_update_task(date="20270623", segments=None, scene_mode=None)
-    store.update_task(
-        task.task_id,
-        waiting_reason="awaiting scene mode",
-        next_required_input="scene_mode",
-    )
-
-    cleared = store.update_task(
-        task.task_id,
-        waiting_reason=None,
-        next_required_input=None,
-    )
-
-    assert cleared.waiting_reason is None
-    assert cleared.next_required_input is None

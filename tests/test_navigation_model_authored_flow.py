@@ -1,4 +1,3 @@
-import json
 import shutil
 from types import SimpleNamespace
 
@@ -9,7 +8,6 @@ from test_navigation_context_budget import (
 )
 from vla_data_juicer_agents.navigation.config import NavigationSettings
 from vla_data_juicer_agents.navigation.services import build_navigation_services
-from vla_data_juicer_agents.navigation.task_reconciliation import prepare_navigation_task_entry
 from vla_data_juicer_agents.runtime.agentscope_runtime import AgentScopeRuntime
 
 
@@ -26,24 +24,16 @@ def _entry(
     dry_run=True,
 ):
     web_session_id = web_session_id or session_id
-    return prepare_navigation_task_entry(
-        task_store=services.task_store,
-        observation_store=services.observation_store,
-        evidence_store=services.evidence_store,
-        message="Structured handoff JSON: "
-        + json.dumps(
-            {
-                "date": DATE,
-                "segments": [SEGMENT],
-                "scene_mode": scene_mode,
-                "dry_run": dry_run,
-                "request": "process the selected navigation data",
-            }
-        ),
+    return services.task_store.create_task_attempt(
+        request="process the selected navigation data",
+        target=DATE,
+        date=DATE,
+        segments=[SEGMENT],
+        scene_mode=scene_mode,
+        dry_run=dry_run,
         web_session_id=web_session_id,
         agentscope_session_id=session_id,
-        settings=services.settings,
-    )
+    ).task
 
 
 def _tools(services, session_id, web_session_id=None):
@@ -175,7 +165,7 @@ def test_raw_only_entry_submits_model_plan_and_executes_all_steps_in_dry_run(tmp
     services = build_navigation_services(tmp_path, settings)
     task = _entry(services)
 
-    assert task.phase.value == "extract_sync"
+    assert services.observation_store.latest(task.task_id) is None
     submitted = _activate_extract_plan(services, task, "direct-flow")
     while services.plan_store.get(submitted["plan_id"]).status == "active":
         tools = _tools(services, "direct-flow")
@@ -212,7 +202,7 @@ def test_existing_sync_and_scene_mode_select_finish_plan_without_extract_tools(t
     services = build_navigation_services(tmp_path, settings)
     task = _entry(services, scene_mode="out")
 
-    assert task.phase.value == "finish_processing"
+    assert task.accepted_plan_phase is None
     tools = _complete_required_inspections(services, "direct-flow")
     assert "submit_extract_sync_plan_tool" in tools
     assert "submit_finish_processing_plan_tool" in tools
@@ -227,26 +217,27 @@ def test_existing_sync_and_scene_mode_select_finish_plan_without_extract_tools(t
     assert services.plan_store.get(result["plan_id"]).phase == "finish_processing"
 
 
-def test_completed_outputs_expose_no_processing_tools_and_deletion_reselects_finish(tmp_path):
+def test_existing_outputs_are_not_entry_facts_and_new_session_reinspects(tmp_path):
     settings = _settings(tmp_path)
     _write_raw_metadata(settings.vladatasets_root, DATE, SEGMENT)
     (settings.clip_data_root / DATE / SEGMENT / "sync_data").mkdir(parents=True)
     final_grid = settings.finish_data_root / DATE / SEGMENT / "clip-1" / "grid_map"
     final_grid.mkdir(parents=True)
     services = build_navigation_services(tmp_path, settings)
-    completed = _entry(services, scene_mode="out")
+    first = _entry(services, session_id="first", scene_mode="out")
 
-    assert completed.phase.value == "completed"
-    names = set(_tools(services, "direct-flow"))
+    assert services.observation_store.latest(first.task_id) is None
+    names = set(_tools(services, "first"))
     assert "inspect_navigation_artifact_state_tool" in names
     assert "submit_extract_sync_plan_tool" in names
     assert "submit_finish_processing_plan_tool" in names
     assert not any(name.endswith("_data_tool") for name in names)
 
     shutil.rmtree(settings.finish_data_root / DATE)
-    resumed = _entry(services, scene_mode="out")
-    assert resumed.phase.value == "finish_processing"
-    planning = _complete_required_inspections(services, "direct-flow")
+    second = _entry(services, session_id="second", scene_mode="out")
+    assert second.task_id != first.task_id
+    assert services.observation_store.latest(second.task_id) is None
+    planning = _complete_required_inspections(services, "second")
     assert "submit_extract_sync_plan_tool" in planning
     assert "submit_finish_processing_plan_tool" in planning
 

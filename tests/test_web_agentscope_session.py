@@ -18,7 +18,6 @@ from vla_data_juicer_agents.navigation.plan_store import (
 )
 from vla_data_juicer_agents.navigation.routing import is_high_confidence_navigation_request
 from vla_data_juicer_agents.navigation.task_state import (
-    NavigationTaskPhase,
     NavigationTaskStatus,
 )
 from vla_data_juicer_agents.navigation.task_store import SqliteNavigationTaskStore
@@ -373,20 +372,16 @@ def _plan_bound_human_runtime(tmp_path: Path, chat_run_registry: FakeChatRunRegi
     workspace_root = tmp_path / "workspace"
     db_path = workspace_root / "navigation-tasks.sqlite"
     task_store = SqliteNavigationTaskStore(db_path)
-    task = task_store.create_or_update_task(
+    task = task_store.create_task_attempt(
+        request="Process navigation data",
+        target="20260710",
         date="20260710",
         segments=["segment-a"],
         scene_mode="out",
+        dry_run=False,
         web_session_id="web-1",
         agentscope_session_id="as-session-1",
-    )
-    task = task_store.update_task_for_session(
-        task.task_id,
-        web_session_id="web-1",
-        agentscope_session_id="as-session-1",
-        phase="finish_processing",
-        status="pending",
-    )
+    ).task
     plan_store = SqliteNavigationPlanRepository(db_path)
     plan = plan_store.activate(
         task,
@@ -1935,9 +1930,9 @@ async def test_quarantined_pending_event_is_suppressed_and_marked_consumed(
     with sqlite3.connect(plan_store.db_path) as connection:
         connection.execute(
             """UPDATE navigation_tasks
-               SET created_by_web_session_id = ?, latest_web_session_id = ?
+               SET created_by_web_session_id = ?
                WHERE task_id = ?""",
-            (web_session.id, web_session.id, plan.task_id),
+            (web_session.id, plan.task_id),
         )
     assert agentscope_runtime_module.submit_plan_human_decision(
         plan_store=plan_store,

@@ -392,7 +392,7 @@ class AgentScopeRuntime:
         observation = services.observation_store.latest(task.task_id)
         phase_hint = task.accepted_plan_phase
         plan = (
-            services.plan_store.get_active(task.task_id, phase_hint.value)
+            services.plan_store.get_active(task.task_id, phase_hint)
             if phase_hint is not None
             else None
         )

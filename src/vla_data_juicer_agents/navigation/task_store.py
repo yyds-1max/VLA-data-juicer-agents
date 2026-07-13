@@ -17,18 +17,15 @@ from vla_data_juicer_agents.navigation.catalog import (
 
 from vla_data_juicer_agents.navigation.task_state import (
     TASK_SCHEMA_VERSION,
-    NavigationArtifactSnapshot,
     NavigationRunningWriter,
     NavigationTask,
-    NavigationTaskDrift,
     NavigationTaskStatus,
     TaskAttemptCreation,
     utc_now,
 )
 
 
-TRANSITIONAL_ENTRY_REQUEST = "Navigation task created by the transitional entry path."
-NAVIGATION_STATE_SCHEMA_GENERATION = "navigation-attempts-transitional-v1"
+NAVIGATION_STATE_SCHEMA_GENERATION = "navigation-attempts-final-v2"
 _RESET_MESSAGE_MAX_CHARS = 1000
 _SUPPORTED_TABLE_SQL = {
     "navigation_state_schema": """CREATE TABLE navigation_state_schema (
@@ -46,18 +43,10 @@ _SUPPORTED_TABLE_SQL = {
            dry_run INTEGER NOT NULL DEFAULT 0,
            guidance_revision INTEGER NOT NULL DEFAULT 0,
            state_revision INTEGER NOT NULL DEFAULT 0,
-           phase TEXT NOT NULL,
            status TEXT NOT NULL,
            accepted_plan_phase TEXT,
-           waiting_reason TEXT,
-           next_required_input TEXT,
            created_by_web_session_id TEXT,
-           latest_web_session_id TEXT,
            agentscope_session_id TEXT,
-           latest_run_id TEXT,
-           last_completed_step TEXT,
-           artifact_snapshot_json TEXT,
-           drift_json TEXT,
            schema_version INTEGER NOT NULL,
            created_at TEXT NOT NULL,
            updated_at TEXT NOT NULL
@@ -530,7 +519,6 @@ class SqliteNavigationTaskStore:
                 state_revision=1,
                 status=NavigationTaskStatus.ACTIVE,
                 created_by_web_session_id=web_session_id,
-                latest_web_session_id=web_session_id,
                 agentscope_session_id=agentscope_session_id,
                 created_at=timestamp,
                 updated_at=timestamp,
@@ -621,91 +609,6 @@ class SqliteNavigationTaskStore:
             )
         return None
 
-    def create_or_update_task(
-        self,
-        *,
-        date: str,
-        segments: list[str] | None,
-        scene_mode: str | None,
-        dry_run: bool | None = None,
-        web_session_id: str | None = None,
-        agentscope_session_id: str | None = None,
-    ) -> NavigationTask:
-        segments = normalize_segments(segments)
-        timestamp = utc_now()
-        key = _segments_key(segments)
-        connection = self._connect()
-        try:
-            connection.execute("BEGIN IMMEDIATE")
-            row = connection.execute(
-                """
-                SELECT * FROM navigation_tasks
-                WHERE date = ? AND segments_key = ? AND status != ?
-                ORDER BY updated_at DESC, rowid DESC
-                LIMIT 1
-                """,
-                (date, key, NavigationTaskStatus.SUPERSEDED.value),
-            ).fetchone()
-            if row is None:
-                task = NavigationTask(
-                    task_id=f"nav_{uuid4().hex}",
-                    request=TRANSITIONAL_ENTRY_REQUEST,
-                    target=date,
-                    date=date,
-                    segments=segments,
-                    scene_mode=scene_mode if scene_mode in {"in", "out"} else None,
-                    dry_run=bool(dry_run),
-                    state_revision=1,
-                    created_by_web_session_id=web_session_id,
-                    latest_web_session_id=web_session_id,
-                    agentscope_session_id=agentscope_session_id,
-                    created_at=timestamp,
-                    updated_at=timestamp,
-                )
-                self._insert_task(connection, task)
-            else:
-                existing = self._task_from_row(row)
-                creator = existing.created_by_web_session_id
-                if creator is not None and creator != web_session_id:
-                    raise NavigationTaskOwnershipError(
-                        existing.task_id,
-                        expected_web_session_id=creator,
-                        requested_web_session_id=web_session_id,
-                    )
-                payload = existing.model_dump(mode="json")
-                payload.update(
-                    {
-                        "scene_mode": (
-                            scene_mode
-                            if scene_mode in {"in", "out"}
-                            else existing.scene_mode
-                        ),
-                        "dry_run": existing.dry_run if dry_run is None else bool(dry_run),
-                        "created_by_web_session_id": creator or web_session_id,
-                        "latest_web_session_id": (
-                            web_session_id
-                            if web_session_id is not None
-                            else existing.latest_web_session_id
-                        ),
-                        "agentscope_session_id": (
-                            agentscope_session_id
-                            if agentscope_session_id is not None
-                            else existing.agentscope_session_id
-                        ),
-                        "updated_at": timestamp,
-                        "state_revision": existing.state_revision + 1,
-                    }
-                )
-                task = NavigationTask.model_validate(payload)
-                self._update_task(connection, task)
-            connection.commit()
-            return task
-        except Exception:
-            connection.rollback()
-            raise
-        finally:
-            connection.close()
-
     def get_task(self, task_id: str) -> NavigationTask | None:
         with self._connect() as connection:
             row = connection.execute(
@@ -713,85 +616,6 @@ class SqliteNavigationTaskStore:
                 (task_id,),
             ).fetchone()
         return self._task_from_row(row) if row is not None else None
-
-    def find_latest_by_date(self, date: str, segments: list[str] | None = None) -> NavigationTask | None:
-        with self._connect() as connection:
-            row = connection.execute(
-                """
-                SELECT * FROM navigation_tasks
-                WHERE date = ? AND segments_key = ? AND status != ?
-                ORDER BY updated_at DESC, rowid DESC
-                LIMIT 1
-                """,
-                (date, _segments_key(segments), NavigationTaskStatus.SUPERSEDED.value),
-            ).fetchone()
-        return self._task_from_row(row) if row is not None else None
-
-    def find_latest_by_agentscope_session(self, session_id: str) -> NavigationTask | None:
-        with self._connect() as connection:
-            row = connection.execute(
-                """
-                SELECT * FROM navigation_tasks
-                WHERE agentscope_session_id = ? AND status != ?
-                ORDER BY updated_at DESC, rowid DESC
-                LIMIT 1
-                """,
-                (session_id, NavigationTaskStatus.SUPERSEDED.value),
-            ).fetchone()
-        return self._task_from_row(row) if row is not None else None
-
-    def list_resumable(self, date: str | None = None) -> list[NavigationTask]:
-        params: tuple[Any, ...]
-        date_filter = ""
-        if date is None:
-            params = ()
-        else:
-            date_filter = "AND date = ?"
-            params = (date,)
-        with self._connect() as connection:
-            rows = connection.execute(
-                f"""
-                SELECT * FROM navigation_tasks
-                WHERE status IN (?, ?, ?, ?, ?)
-                {date_filter}
-                ORDER BY updated_at DESC, rowid DESC
-                """,
-                (
-                    NavigationTaskStatus.WAITING_USER.value,
-                    NavigationTaskStatus.NEEDS_RECONCILE.value,
-                    NavigationTaskStatus.NEEDS_RERUN.value,
-                    NavigationTaskStatus.NEEDS_REPLAN.value,
-                    NavigationTaskStatus.FAILED.value,
-                    *params,
-                ),
-            ).fetchall()
-        return [self._task_from_row(row) for row in rows]
-
-    def update_task(self, task_id: str, **changes: Any) -> NavigationTask:
-        connection = self._connect()
-        try:
-            connection.execute("BEGIN IMMEDIATE")
-            row = connection.execute(
-                "SELECT * FROM navigation_tasks WHERE task_id = ?", (task_id,)
-            ).fetchone()
-            if row is None:
-                raise KeyError(task_id)
-            authorize_navigation_task_write(
-                connection,
-                task_id,
-                expected_web_session_id=None,
-                expected_agentscope_session_id=None,
-            )
-            current = self._task_from_row(row)
-            task = self._merged_task(current, changes)
-            self._update_task(connection, task)
-            connection.commit()
-            return task
-        except Exception:
-            connection.rollback()
-            raise
-        finally:
-            connection.close()
 
     def update_task_for_session(
         self,
@@ -805,7 +629,6 @@ class SqliteNavigationTaskStore:
         """Atomically authorize the current session pair and update one task."""
         identity_fields = {
             "created_by_web_session_id",
-            "latest_web_session_id",
             "agentscope_session_id",
         }
         if identity_fields.intersection(changes):
@@ -861,28 +684,6 @@ class SqliteNavigationTaskStore:
         payload["state_revision"] = current.state_revision + 1
         return NavigationTask.model_validate(payload)
 
-    def restore_task_exact_if_current(
-        self, task: NavigationTask, *, expected_state_revision: int,
-        expected_web_session_id: str | None, expected_agentscope_session_id: str | None,
-    ) -> bool:
-        task = task.model_copy(update={"state_revision": expected_state_revision + 1})
-        values = self._task_values(task)
-        with self._connect() as connection:
-            cursor = connection.execute(
-                """UPDATE navigation_tasks SET date=?, segments_json=?, segments_key=?,
-                scene_mode=?, dry_run=?, guidance_revision=?, state_revision=?, phase=?, status=?,
-                waiting_reason=?, next_required_input=?, created_by_web_session_id=?,
-                latest_web_session_id=?, agentscope_session_id=?, latest_run_id=?,
-                last_completed_step=?, artifact_snapshot_json=?,
-                drift_json=?, schema_version=?, created_at=?, updated_at=?,
-                request=?, target=?, accepted_plan_phase=?
-                WHERE task_id=? AND state_revision=? AND latest_web_session_id IS ?
-                  AND agentscope_session_id IS ?""",
-                values[1:] + (values[0], expected_state_revision,
-                              expected_web_session_id, expected_agentscope_session_id),
-            )
-        return cursor.rowcount == 1
-
     def delete_task_if_current(
         self, task_id: str, *, expected_state_revision: int,
         expected_web_session_id: str | None, expected_agentscope_session_id: str | None,
@@ -890,7 +691,7 @@ class SqliteNavigationTaskStore:
         with self._connect() as connection:
             cursor = connection.execute(
                 """DELETE FROM navigation_tasks WHERE task_id=? AND state_revision=?
-                AND latest_web_session_id IS ? AND agentscope_session_id IS ?""",
+                AND created_by_web_session_id IS ? AND agentscope_session_id IS ?""",
                 (task_id, expected_state_revision, expected_web_session_id,
                  expected_agentscope_session_id),
             )
@@ -901,14 +702,12 @@ class SqliteNavigationTaskStore:
             """
             INSERT INTO navigation_tasks (
                 task_id, date, segments_json, segments_key, scene_mode,
-                dry_run, guidance_revision, state_revision, phase, status,
-                waiting_reason, next_required_input, created_by_web_session_id,
-                latest_web_session_id, agentscope_session_id, latest_run_id,
-                last_completed_step, artifact_snapshot_json,
-                drift_json, schema_version, created_at, updated_at,
+                dry_run, guidance_revision, state_revision, status,
+                created_by_web_session_id, agentscope_session_id,
+                schema_version, created_at, updated_at,
                 request, target, accepted_plan_phase
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             self._task_values(task),
         )
@@ -929,17 +728,9 @@ class SqliteNavigationTaskStore:
                 dry_run = ?,
                 guidance_revision = ?,
                 state_revision = ?,
-                phase = ?,
                 status = ?,
-                waiting_reason = ?,
-                next_required_input = ?,
                 created_by_web_session_id = ?,
-                latest_web_session_id = ?,
                 agentscope_session_id = ?,
-                latest_run_id = ?,
-                last_completed_step = ?,
-                artifact_snapshot_json = ?,
-                drift_json = ?,
                 schema_version = ?,
                 created_at = ?,
                 updated_at = ?,
@@ -961,32 +752,20 @@ class SqliteNavigationTaskStore:
             int(task.dry_run),
             task.guidance_revision,
             task.state_revision,
-            task.phase.value,
             task.status.value,
-            task.waiting_reason,
-            task.next_required_input,
             task.created_by_web_session_id,
-            task.latest_web_session_id,
             task.agentscope_session_id,
-            task.latest_run_id,
-            task.last_completed_step,
-            _json_dump(task.artifact_snapshot.model_dump(mode="json") if task.artifact_snapshot else None),
-            _json_dump(task.drift.model_dump(mode="json") if task.drift else None),
             task.schema_version,
             task.created_at,
             task.updated_at,
             task.request,
             task.target,
             (
-                task.accepted_plan_phase.value
-                if task.accepted_plan_phase is not None
-                else None
+                task.accepted_plan_phase
             ),
         )
 
     def _task_from_row(self, row: sqlite3.Row) -> NavigationTask:
-        snapshot = _json_load(row["artifact_snapshot_json"])
-        drift = _json_load(row["drift_json"])
         return NavigationTask(
             task_id=row["task_id"],
             request=row["request"],
@@ -997,18 +776,10 @@ class SqliteNavigationTaskStore:
             dry_run=bool(row["dry_run"]),
             guidance_revision=row["guidance_revision"],
             state_revision=row["state_revision"],
-            phase=row["phase"],
             status=row["status"],
             accepted_plan_phase=row["accepted_plan_phase"],
-            waiting_reason=row["waiting_reason"],
-            next_required_input=row["next_required_input"],
             created_by_web_session_id=row["created_by_web_session_id"],
-            latest_web_session_id=row["latest_web_session_id"],
             agentscope_session_id=row["agentscope_session_id"],
-            latest_run_id=row["latest_run_id"],
-            last_completed_step=row["last_completed_step"],
-            artifact_snapshot=NavigationArtifactSnapshot.model_validate(snapshot) if snapshot else None,
-            drift=NavigationTaskDrift.model_validate(drift) if drift else None,
             schema_version=row["schema_version"],
             created_at=row["created_at"],
             updated_at=row["updated_at"],

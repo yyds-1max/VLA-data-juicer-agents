@@ -16,7 +16,6 @@ from vla_data_juicer_agents.navigation.config import NavigationSettings
 from vla_data_juicer_agents.navigation.models import NavigationRequest
 from vla_data_juicer_agents.navigation.run_state import WorkflowRunStore
 from vla_data_juicer_agents.navigation.workflow import (
-    direct_completed_entry_state,
     direct_execution_terminal_state,
     prepare_direct_navigation_entry,
     run_direct_plan_until_submitted,
@@ -214,20 +213,6 @@ async def run_vla_workflow(ctx: ToolContext, raw_args: RunVLAWorkflowInput | dic
             agentscope_session_id=session_id,
             user_request=_latest_user_message(ctx),
         )
-        completed_entry = direct_completed_entry_state(task)
-        if completed_entry is not None:
-            payload = RunVLAWorkflowOutput(
-                ok=True,
-                status="completed",
-                run_dir=str(run_dir),
-                artifacts=_artifact_paths(run_dir),
-                message=json.dumps(completed_entry, ensure_ascii=False),
-            ).model_dump(mode="json")
-            run_store.write_json(run_dir, "final_report.json", payload)
-            emit_terminal("completed")
-            return payload
-        if task.phase.value not in {"extract_sync", "finish_processing"}:
-            raise RuntimeError(f"navigation task is not ready for planning: {task.phase.value}")
         plan = await run_direct_plan_until_submitted(
             services=services,
             task=task,

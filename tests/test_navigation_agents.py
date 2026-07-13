@@ -15,11 +15,9 @@ from vla_data_juicer_agents.navigation.plan_store import SqliteNavigationPlanRep
 from vla_data_juicer_agents.navigation.services import NavigationServices
 from vla_data_juicer_agents.navigation.evidence_store import FileNavigationEvidenceStore
 from vla_data_juicer_agents.navigation.observation_store import SqliteNavigationObservationStore
-from vla_data_juicer_agents.navigation.task_state import NavigationTaskStatus
 from vla_data_juicer_agents.navigation.task_store import SqliteNavigationTaskStore
 from vla_data_juicer_agents.navigation.config import NavigationSettings
 from vla_data_juicer_agents.navigation.workflow import (
-    direct_completed_entry_state,
     direct_execution_terminal_state,
     prepare_direct_navigation_entry,
     run_direct_plan_until_submitted,
@@ -39,8 +37,8 @@ class _PlanStore:
         self.plan = plan
         self.calls = []
 
-    def get_active(self, task_id, phase):
-        self.calls.append((task_id, phase))
+    def get_active_for_task(self, task_id):
+        self.calls.append(task_id)
         return self.plan
 
 
@@ -87,14 +85,22 @@ def _real_terminal_services(tmp_path, *, dry_run: bool):
     settings = NavigationSettings(vladatasets_root=tmp_path / "data")
     db_path = tmp_path / "navigation.sqlite"
     task_store = SqliteNavigationTaskStore(db_path)
-    task = task_store.create_or_update_task(
+    task = task_store.create_task_attempt(
+        request="Direct navigation workflow",
+        target="20270605",
         date="20270605",
         segments=["segment-1"],
         scene_mode=None,
         dry_run=dry_run,
-    )
+        web_session_id="direct:test-run",
+        agentscope_session_id="direct-session",
+    ).task
     plan_store = SqliteNavigationPlanRepository(db_path)
-    plan = plan_store.activate(task, "extract_sync", 1, _stored_extract_plan())
+    plan = plan_store.activate(
+        task, "extract_sync", 1, _stored_extract_plan(),
+        expected_web_session_id="direct:test-run",
+        expected_agentscope_session_id="direct-session",
+    )
     services = NavigationServices(
         settings=settings,
         task_store=task_store,
@@ -157,12 +163,11 @@ def test_run_plan_agent_loads_active_plan_from_repository(monkeypatch):
             NavigationRequest(date="20270605"),
             plan_store=store,
             task_id="task-1",
-            phase="extract_sync",
         )
     )
 
     assert plan is stored
-    assert store.calls == [("task-1", "extract_sync")]
+    assert store.calls == ["task-1"]
 
 
 def test_run_plan_agent_rejects_assistant_text_without_stored_plan():
@@ -173,12 +178,11 @@ def test_run_plan_agent_rejects_assistant_text_without_stored_plan():
                 NavigationRequest(date="20270605"),
                 plan_store=_PlanStore(),
                 task_id="task-1",
-                phase="extract_sync",
             )
         )
 
 
-def test_direct_planning_refreshes_phase_tools_after_durable_observation_progress(
+def test_direct_planning_refreshes_activity_tools_after_durable_observation_progress(
     monkeypatch,
 ):
     stored = SimpleNamespace(
@@ -189,7 +193,6 @@ def test_direct_planning_refreshes_phase_tools_after_durable_observation_progres
     )
     task = SimpleNamespace(
         task_id="task-1",
-        phase=SimpleNamespace(value="extract_sync"),
         state_revision=1,
     )
     store = _PlanStore()
@@ -238,7 +241,6 @@ def test_direct_planning_refreshes_phase_tools_after_durable_observation_progres
 def test_direct_planning_stops_after_one_round_without_durable_progress(monkeypatch):
     task = SimpleNamespace(
         task_id="task-1",
-        phase=SimpleNamespace(value="extract_sync"),
         state_revision=1,
     )
     services = SimpleNamespace(
@@ -288,6 +290,8 @@ def test_direct_planning_uses_post_resolver_revision_as_round_boundary(tmp_path,
         settings=settings,
         agentscope_session_id="direct-session",
     )
+    assert task.created_by_web_session_id == "direct:run"
+    assert task.agentscope_session_id == "direct-session"
     rounds = 0
 
     def silent_agent(**_kwargs):
@@ -314,22 +318,21 @@ def test_direct_planning_uses_post_resolver_revision_as_round_boundary(tmp_path,
 
 
 @pytest.mark.parametrize(
-    ("task_status", "phase", "current_step", "expected_status", "ok"),
+    ("task_status", "current_step", "expected_status", "ok"),
     [
-        ("failed", "extract_sync", "step-1", "failed", False),
-        ("needs_replan", "extract_sync", "step-1", "needs_replan", False),
-        ("waiting_user", "finish_processing", "confirm", "waiting_user", False),
-        ("running", "extract_sync", "step-1", "incomplete", False),
-        ("completed", "completed", None, "completed", True),
+        ("failed", "step-1", "failed", False),
+        ("needs_replan", "step-1", "needs_replan", False),
+        ("waiting_user", "confirm", "waiting_user", False),
+        ("active", "step-1", "incomplete", False),
+        ("completed", None, "completed", True),
     ],
 )
 def test_direct_terminal_state_is_derived_from_durable_ledger(
-    task_status, phase, current_step, expected_status, ok
+    task_status, current_step, expected_status, ok
 ):
     task = SimpleNamespace(
         task_id="task-1",
         status=SimpleNamespace(value=task_status),
-        phase=SimpleNamespace(value=phase),
     )
     overview = SimpleNamespace(
         model_dump=lambda mode="json": {
@@ -360,41 +363,27 @@ def test_direct_terminal_state_is_derived_from_durable_ledger(
     assert result["ok"] is ok
 
 
-def test_completed_entry_skips_planning_and_reports_reconciled_artifacts():
-    snapshot = SimpleNamespace(
-        model_dump=lambda mode="json": {"final_outputs_exist": True, "final_grid_map_exists": True}
-    )
-    task = SimpleNamespace(
-        task_id="task-1",
-        phase=SimpleNamespace(value="completed"),
-        status=SimpleNamespace(value="completed"),
-        artifact_snapshot=snapshot,
-    )
-
-    result = direct_completed_entry_state(task)
-
-    assert result == {
-        "ok": True,
-        "status": "completed",
-        "task_id": "task-1",
-        "task_phase": "completed",
-        "task_status": "completed",
-        "artifacts": {"final_outputs_exist": True, "final_grid_map_exists": True},
-    }
-
-
 def test_direct_terminal_treats_completed_dry_run_ledger_as_success(tmp_path):
     services, task, plan = _real_terminal_services(tmp_path, dry_run=True)
-    assert services.plan_store.claim_step(plan.plan_id, "prepare", "prepare_raw_data")
+    assert services.plan_store.claim_step(
+        plan.plan_id, "prepare", "prepare_raw_data",
+        expected_web_session_id="direct:test-run",
+        expected_agentscope_session_id="direct-session",
+    )
     services.plan_store.stage_step_result(
         plan.plan_id,
         "prepare",
         target_status="completed",
         full_result={"ok": True, "tool_name": "prepare_raw_data", "message": "dry run"},
         result_summary={"ok": True, "tool_name": "prepare_raw_data", "message": "dry run"},
+        expected_web_session_id="direct:test-run",
+        expected_agentscope_session_id="direct-session",
     )
-    assert services.plan_store.finalize_staged_step(plan.plan_id, "prepare")
-    services.task_store.update_task(task.task_id, status=NavigationTaskStatus.NEEDS_RERUN)
+    assert services.plan_store.finalize_staged_step(
+        plan.plan_id, "prepare",
+        expected_web_session_id="direct:test-run",
+        expected_agentscope_session_id="direct-session",
+    )
 
     result = direct_execution_terminal_state(
         services=services,
@@ -409,7 +398,11 @@ def test_direct_terminal_treats_completed_dry_run_ledger_as_success(tmp_path):
 
 def test_direct_terminal_prefers_real_waiting_ledger_over_pending_task(tmp_path):
     services, task, plan = _real_terminal_services(tmp_path, dry_run=False)
-    assert services.plan_store.mark_waiting_user(plan.plan_id, "prepare", "prepare_raw_data")
+    assert services.plan_store.mark_waiting_user(
+        plan.plan_id, "prepare", "prepare_raw_data",
+        expected_web_session_id="direct:test-run",
+        expected_agentscope_session_id="direct-session",
+    )
 
     result = direct_execution_terminal_state(
         services=services,

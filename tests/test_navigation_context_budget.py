@@ -324,18 +324,12 @@ def test_representative_model_authored_transcript_stays_bounded_without_compacti
     current_schema_chars = 0
 
     def current_anchor():
-        task = services.task_store.find_latest_by_agentscope_session(session_id)
-        observation = services.observation_store.latest(task.task_id) if task else None
-        plan = (
-            services.plan_store.get_active(
-                task.task_id,
-                task.accepted_plan_phase.value,
-            )
-            if task
-            and task.accepted_plan_phase is not None
-            and task.accepted_plan_phase.value in {"extract_sync", "finish_processing"}
-            else None
+        task = services.task_store.find_by_session(
+            web_session_id=session_id,
+            agentscope_session_id=session_id,
         )
+        observation = services.observation_store.latest(task.task_id) if task else None
+        plan = services.plan_store.get_active_for_task(task.task_id) if task else None
         current = services.plan_store.get_current_step(plan.plan_id) if plan else None
         return {
             "task_attempt_id": task.task_id if task else None,

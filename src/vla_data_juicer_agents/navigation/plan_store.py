@@ -656,15 +656,10 @@ class SqliteNavigationPlanRepository:
         connection = self._connect()
         try:
             connection.execute("BEGIN")
-            params: tuple[Any, ...] = (
-                web_session_id,
-                web_session_id,
-                agentscope_session_id,
-            )
+            params: tuple[Any, ...] = (web_session_id, agentscope_session_id)
             task_row = connection.execute(
                 """SELECT * FROM navigation_tasks
                     WHERE created_by_web_session_id IS ?
-                      AND latest_web_session_id IS ?
                       AND agentscope_session_id IS ?
                     ORDER BY created_at DESC, rowid DESC
                     LIMIT 1""",
@@ -688,9 +683,7 @@ class SqliteNavigationPlanRepository:
                    LIMIT 1""",
                 (
                     task.task_id,
-                    task.accepted_plan_phase.value
-                    if task.accepted_plan_phase is not None
-                    else None,
+                    task.accepted_plan_phase,
                 ),
             ).fetchone()
             if plan_row is None:
@@ -1032,12 +1025,10 @@ class SqliteNavigationPlanRepository:
                     """SELECT task_id
                        FROM navigation_tasks
                        WHERE created_by_web_session_id IS ?
-                         AND latest_web_session_id IS ?
                          AND agentscope_session_id IS ?
                        ORDER BY created_at DESC, rowid DESC
                        LIMIT 1""",
                     (
-                        expected_web_session_id,
                         expected_web_session_id,
                         expected_agentscope_session_id,
                     ),
@@ -1112,13 +1103,11 @@ class SqliteNavigationPlanRepository:
                       WHERE navigation_plans.plan_id = navigation_task_steps.plan_id
                         AND navigation_plans.status = 'active'
                         AND navigation_tasks.created_by_web_session_id IS ?
-                        AND navigation_tasks.latest_web_session_id IS ?
                         AND navigation_tasks.agentscope_session_id IS ?
                   )
                 """,
                 (
                     utc_now(), plan_id, step_id, action,
-                    expected_web_session_id,
                     expected_web_session_id,
                     expected_agentscope_session_id,
                 ),
@@ -1164,13 +1153,11 @@ class SqliteNavigationPlanRepository:
                       WHERE navigation_plans.plan_id = navigation_task_steps.plan_id
                         AND navigation_plans.status = 'active'
                         AND navigation_tasks.created_by_web_session_id IS ?
-                        AND navigation_tasks.latest_web_session_id IS ?
                         AND navigation_tasks.agentscope_session_id IS ?
                   )
                 """,
                 (
                     utc_now(), plan_id, step_id, action,
-                    expected_web_session_id,
                     expected_web_session_id,
                     expected_agentscope_session_id,
                 ),

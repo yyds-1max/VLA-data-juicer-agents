@@ -21,7 +21,7 @@ from vla_data_juicer_agents.navigation.planning_context import (
     build_navigation_task_context,
     compute_planning_context_revision,
 )
-from vla_data_juicer_agents.navigation.task_state import NavigationTask, NavigationTaskPhase
+from vla_data_juicer_agents.navigation.task_state import NavigationTask
 
 
 def _task() -> NavigationTask:
@@ -31,7 +31,6 @@ def _task() -> NavigationTask:
         target="20260710/20260710_120000",
         date="20260710",
         segments=["20260710_120000"],
-        phase=NavigationTaskPhase.EXTRACT_SYNC,
         guidance_revision=2,
     )
 
@@ -168,16 +167,11 @@ def test_planning_context_includes_only_owned_evidence_up_to_current_revision():
         )
 
 
-def test_planning_context_revision_is_phase_independent_and_changes_with_facts():
+def test_planning_context_revision_changes_with_facts():
     task = _task()
 
     first = compute_planning_context_revision(
         task=task,
-        observation_revision=3,
-        capability_revision=CAPABILITY_CATALOG_REVISION,
-    )
-    different_phase = compute_planning_context_revision(
-        task=task.model_copy(update={"phase": NavigationTaskPhase.FINISH_PROCESSING}),
         observation_revision=3,
         capability_revision=CAPABILITY_CATALOG_REVISION,
     )
@@ -188,7 +182,6 @@ def test_planning_context_revision_is_phase_independent_and_changes_with_facts()
     )
 
     assert len(first) == 64
-    assert first == different_phase
     assert first != changed
 
 

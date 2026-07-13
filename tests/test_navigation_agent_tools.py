@@ -36,7 +36,6 @@ from test_navigation_plan_submission_tools import (
 )
 from vla_data_juicer_agents.navigation.task_state import (
     NavigationArtifactSnapshot,
-    NavigationTaskPhase,
     NavigationTaskStatus,
 )
 from vla_data_juicer_agents.runtime import agentscope_runtime as runtime_module
@@ -479,18 +478,18 @@ def test_create_agentscope_runtime_wires_navigation_tools_factory(monkeypatch, t
 
 
 def _resolver_services_from_complete(tmp_path, session_id="as-session-1"):
-    built = build_complete_plan_services(tmp_path, "extract_sync")
+    built = build_complete_plan_services(
+        tmp_path,
+        "extract_sync",
+        web_session_id=session_id,
+        agentscope_session_id=session_id,
+    )
     data_root = tmp_path / "vla-data"
     (data_root / "raw_data" / built.task.date / built.task.segments[0]).mkdir(
         parents=True
     )
     task_store = SqliteNavigationTaskStore(built.plan_store.db_path)
-    task = task_store.update_task(
-        built.task.task_id,
-        created_by_web_session_id=session_id,
-        latest_web_session_id=session_id,
-        agentscope_session_id=session_id,
-    )
+    task = built.task
     services = NavigationServices(
         settings=NavigationSettings(vladatasets_root=data_root),
         task_store=task_store,
@@ -553,13 +552,16 @@ def test_no_task_entry_requires_verified_web_agentscope_session_pair(tmp_path):
 
 def test_cross_web_session_without_bound_attempt_exposes_no_task_mutation(tmp_path):
     services = build_navigation_services(tmp_path)
-    services.task_store.create_or_update_task(
+    existing = services.task_store.create_task_attempt(
+        request="Process navigation data",
+        target="20260710",
         date="20260710",
         segments=None,
         scene_mode=None,
+        dry_run=False,
         web_session_id="web-a",
         agentscope_session_id="web-a__navigation-data-agent",
-    )
+    ).task
     tools = {
         tool.name: tool
         for tool in resolve_navigation_agent_tools(
@@ -571,7 +573,7 @@ def test_cross_web_session_without_bound_attempt_exposes_no_task_mutation(tmp_pa
     }
 
     assert tools == {}
-    assert services.task_store.find_latest_by_date("20260710").created_by_web_session_id == "web-a"
+    assert services.task_store.get_task(existing.task_id) == existing
 
 
 def test_navigation_services_initialize_phase_neutral_observation_schema_repeatedly(tmp_path):
@@ -659,19 +661,16 @@ def test_activity_resolver_exposes_all_planning_tools_before_facts_are_complete(
         tmp_path,
         NavigationSettings(vladatasets_root=data_root),
     )
-    created = services.task_store.create_or_update_task(
+    created = services.task_store.create_task_attempt(
+        request="Process navigation data",
+        target="20260710",
         date="20260710",
         segments=["20260710_120000"],
         scene_mode=None,
+        dry_run=False,
         web_session_id="as-session-1",
         agentscope_session_id="as-session-1",
-    )
-    services.task_store.update_task_for_session(
-        created.task_id,
-        web_session_id="as-session-1",
-        agentscope_session_id="as-session-1",
-        phase="extract_sync",
-    )
+    ).task
 
     names = {
         tool.name
@@ -687,7 +686,7 @@ def test_activity_resolver_exposes_all_planning_tools_before_facts_are_complete(
     assert not any(name in {"prepare_raw_data_tool", "extract_and_sync_navigation_data_tool"} for name in names)
 
 
-def test_phase_resolver_recovers_active_plan_and_only_remaining_actions(tmp_path):
+def test_activity_resolver_recovers_active_plan_and_only_remaining_actions(tmp_path):
     services, task, built = _resolver_services_from_complete(tmp_path)
     plan = ExtractSyncPlanInput.model_validate(valid_extract_plan_payload(built))
     active = services.plan_store.activate(
@@ -819,7 +818,7 @@ def test_stale_execution_read_tools_reauthorize_at_call_time(tmp_path, mutation)
         with sqlite3.connect(services.plan_store.db_path) as connection:
             connection.execute(
                 """UPDATE navigation_tasks
-                   SET latest_web_session_id = ?, agentscope_session_id = ?
+                   SET created_by_web_session_id = ?, agentscope_session_id = ?
                    WHERE task_id = ?""",
                 ("other-web", "other-agent", task.task_id),
             )
@@ -996,23 +995,13 @@ def test_runtime_anchor_does_not_reconcile_or_append_observation(tmp_path, monke
     with sqlite3.connect(services.task_store.db_path) as connection:
         connection.execute(
             """UPDATE navigation_tasks
-               SET created_by_web_session_id = ?, latest_web_session_id = ?,
-                   agentscope_session_id = ?
+               SET created_by_web_session_id = ?, agentscope_session_id = ?
                WHERE task_id = ?""",
-            ("web-owner", "web-owner", "web-owner__as", task.task_id),
+            ("web-owner", "web-owner__as", task.task_id),
         )
     bound = services.task_store.get_task(task.task_id)
     assert bound is not None
     before = services.observation_store.latest(task.task_id)
-    from vla_data_juicer_agents.navigation import task_reconciliation
-
-    monkeypatch.setattr(
-        task_reconciliation,
-        "build_navigation_artifact_snapshot",
-        lambda *_args, **_kwargs: (_ for _ in ()).throw(
-            AssertionError("runtime anchor must not inspect artifacts")
-        ),
-    )
     runtime = object.__new__(runtime_module.AgentScopeRuntime)
     runtime.config = SimpleNamespace(workspace_root=tmp_path)
     runtime._navigation_services = lambda: services
@@ -1038,10 +1027,9 @@ def test_runtime_anchor_exposes_accepted_plan_without_phase_routing(tmp_path):
     with sqlite3.connect(services.task_store.db_path) as connection:
         connection.execute(
             """UPDATE navigation_tasks
-               SET created_by_web_session_id = ?, latest_web_session_id = ?,
-                   agentscope_session_id = ?
+               SET created_by_web_session_id = ?, agentscope_session_id = ?
                WHERE task_id = ?""",
-            ("web-owner", "web-owner", "web-owner__as", task.task_id),
+            ("web-owner", "web-owner__as", task.task_id),
         )
     runtime = object.__new__(runtime_module.AgentScopeRuntime)
     runtime.config = SimpleNamespace(workspace_root=tmp_path)
@@ -1069,7 +1057,7 @@ def test_task_status_completed_without_active_plan_remains_in_planning_activity(
     final_grid.mkdir(parents=True)
     services.task_store.update_task_for_session(
         task.task_id, web_session_id="as-session-1", agentscope_session_id="as-session-1",
-        phase="completed", status="completed",
+        status="completed",
     )
 
     names = {
@@ -1097,7 +1085,7 @@ def test_planning_evidence_list_is_explicitly_bounded_to_5500_chars(monkeypatch,
     final_grid.mkdir(parents=True)
     services.task_store.update_task_for_session(
         task.task_id, web_session_id="as-session-1", agentscope_session_id="as-session-1",
-        phase="completed", status="completed",
+        status="completed",
     )
     rows = [
         SimpleNamespace(

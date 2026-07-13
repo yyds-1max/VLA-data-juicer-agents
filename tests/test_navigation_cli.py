@@ -121,28 +121,3 @@ def test_cli_uses_durable_terminal_state_not_executor_text(
     assert report["status"] == expected_status
     if executor_error is TurnCancelled:
         assert report["error_type"] == "TurnCancelled"
-
-
-def test_cli_completed_entry_skips_plan_and_execution(tmp_path, monkeypatch):
-    settings = NavigationSettings(runs_root=tmp_path / "runs", vladatasets_root=tmp_path / "data")
-    task = SimpleNamespace(
-        task_id="task-1",
-        phase=SimpleNamespace(value="completed"),
-        status=SimpleNamespace(value="completed"),
-        artifact_snapshot=SimpleNamespace(
-            model_dump=lambda mode="json": {"final_outputs_exist": True}
-        ),
-    )
-    monkeypatch.setattr("vla_data_juicer_agents.cli.NavigationSettings", lambda: settings)
-    monkeypatch.setattr(
-        "vla_data_juicer_agents.cli.prepare_direct_navigation_entry",
-        lambda **_kwargs: (SimpleNamespace(), task),
-    )
-    monkeypatch.setattr(
-        "vla_data_juicer_agents.cli.run_direct_plan_until_submitted",
-        lambda **_kwargs: pytest.fail("completed entry must not plan"),
-    )
-
-    exit_code = asyncio.run(async_main(["run", "--date", "20270605", "--dry-run"]))
-
-    assert exit_code == 0
