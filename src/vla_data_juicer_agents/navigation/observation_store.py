@@ -18,7 +18,6 @@ from vla_data_juicer_agents.navigation.observation_models import (
     ObservationKind,
     ObservationPayload,
 )
-from vla_data_juicer_agents.navigation.task_state import NavigationTaskPhase
 from vla_data_juicer_agents.navigation.task_store import authorize_navigation_task_write
 
 
@@ -73,7 +72,6 @@ class SqliteNavigationObservationStore:
                 CREATE TABLE IF NOT EXISTS navigation_observation_revisions (
                     task_id TEXT NOT NULL,
                     revision INTEGER NOT NULL,
-                    phase TEXT NOT NULL,
                     revision_json TEXT NOT NULL,
                     created_at TEXT NOT NULL,
                     PRIMARY KEY (task_id, revision)
@@ -107,13 +105,13 @@ class SqliteNavigationObservationStore:
     def append(
         self,
         task_id: str,
-        phase: NavigationTaskPhase | str,
         completed_kind: ObservationKind,
         payloads: list[ObservationPayload],
         evidence_writes: list[EvidenceWrite],
         evidence_store: NavigationEvidenceWriter,
-        *, expected_web_session_id: str | None = None,
-        expected_agentscope_session_id: str | None = None,
+        *,
+        expected_web_session_id: str,
+        expected_agentscope_session_id: str,
     ) -> NavigationObservationRevision:
         incoming_payloads = [
             _OBSERVATION_PAYLOAD_ADAPTER.validate_python(payload) for payload in payloads
@@ -152,7 +150,6 @@ class SqliteNavigationObservationStore:
             revision = NavigationObservationRevision(
                 task_id=task_id,
                 revision=revision_number,
-                phase=phase,
                 completed_kinds=completed_kinds,
                 payloads=accumulated_payloads,
             )
@@ -176,13 +173,12 @@ class SqliteNavigationObservationStore:
             connection.execute(
                 """
                 INSERT INTO navigation_observation_revisions (
-                    task_id, revision, phase, revision_json, created_at
-                ) VALUES (?, ?, ?, ?, ?)
+                    task_id, revision, revision_json, created_at
+                ) VALUES (?, ?, ?, ?)
                 """,
                 (
                     task_id,
                     revision_number,
-                    revision.phase.value,
                     self._canonical_json(revision.model_dump(mode="json")),
                     revision.created_at,
                 ),

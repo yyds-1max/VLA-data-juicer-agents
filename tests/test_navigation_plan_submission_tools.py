@@ -116,7 +116,6 @@ def _append_fact(
 ):
     return store.append(
         task.task_id,
-        task.phase,
         kind,
         [payload],
         [
@@ -128,6 +127,8 @@ def _append_fact(
             )
         ],
         evidence_store,
+        expected_web_session_id=task.created_by_web_session_id,
+        expected_agentscope_session_id=task.agentscope_session_id,
     )
 
 
@@ -845,7 +846,6 @@ def test_observation_advance_after_audit_cannot_activate_stale_complete_plan(
         assert latest is not None
         services.observation_store.append(
             bound.task_id,
-            bound.phase,
             "artifact_state",
             [_artifact(bound.date)],
             [],

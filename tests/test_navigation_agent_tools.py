@@ -1,9 +1,6 @@
 import asyncio
 import json
 import sqlite3
-import time
-from threading import Event
-from concurrent.futures import ThreadPoolExecutor
 from types import SimpleNamespace
 
 import pytest
@@ -25,12 +22,10 @@ from vla_data_juicer_agents.navigation.services import (
     NavigationServices,
     build_navigation_services,
 )
-from vla_data_juicer_agents.navigation import services as navigation_services_module
 from vla_data_juicer_agents.navigation.plan_models import ExtractSyncPlanInput
 from vla_data_juicer_agents.navigation.evidence_store import FileNavigationEvidenceStore
 from vla_data_juicer_agents.navigation.observation_models import (
     ArtifactStateObservation,
-    EvidenceWrite,
 )
 from vla_data_juicer_agents.navigation.observation_store import (
     SqliteNavigationObservationStore,
@@ -517,7 +512,7 @@ def test_phase_resolver_uses_exact_session_and_exposes_only_current_submit_schem
     }
 
     assert planning_names == {
-        "get_phase_planning_context_tool",
+        "get_navigation_task_context_tool",
         "list_observation_evidence_tool",
         "read_observation_evidence_tool",
         "describe_processing_action_tool",
@@ -624,220 +619,82 @@ def test_bound_task_tools_reject_foreign_task_and_stale_session_without_mutation
     assert services.task_store.get_task(foreign.task_id) == before
 
 
-def test_navigation_services_migrate_legacy_observations_transactionally_once(tmp_path):
-    legacy = SqliteNavigationObservationStore(tmp_path / "navigation-observations.sqlite")
-    evidence = FileNavigationEvidenceStore(tmp_path / "navigation-evidence")
-    payload = ArtifactStateObservation(
-        snapshot=NavigationArtifactSnapshot(
-            date="20260710",
-            segments=["20260710_120000"],
-            raw_input_exists=True,
-        )
-    )
-    revision = legacy.append(
-        "nav-legacy",
-        "extract_sync",
-        "artifact_state",
-        [payload],
-        [
-            EvidenceWrite(
-                kind="artifact_state",
-                source_tool="legacy_runtime",
-                payload=payload.model_dump(mode="json"),
-                summary="legacy artifact state",
-            )
-        ],
-        evidence,
-    )
+def test_navigation_services_initialize_phase_neutral_observation_schema_repeatedly(tmp_path):
+    from vla_data_juicer_agents.navigation import services as services_module
 
     first = build_navigation_services(tmp_path)
-    with sqlite3.connect(tmp_path / "navigation-observations.sqlite") as connection:
-        connection.execute(
-            "UPDATE navigation_observation_revisions SET revision_json = '{poisoned'"
-        )
     second = build_navigation_services(tmp_path)
 
-    assert first.observation_store.latest("nav-legacy") == revision
-    assert second.observation_store.latest("nav-legacy") == revision
-    assert len(second.observation_store.list_evidence("nav-legacy")) == 1
+    assert first.observation_store.db_path == second.observation_store.db_path
+    with sqlite3.connect(first.observation_store.db_path) as connection:
+        columns = {
+            row[1]
+            for row in connection.execute(
+                "PRAGMA table_info(navigation_observation_revisions)"
+            )
+        }
+        migration_table = connection.execute(
+            "SELECT 1 FROM sqlite_master "
+            "WHERE type='table' AND name='navigation_service_migrations'"
+        ).fetchone()
+    assert columns == {"task_id", "revision", "revision_json", "created_at"}
+    assert migration_table is None
+    assert not hasattr(services_module, "_migrate_legacy_observations")
 
 
-def _write_legacy_observation_fixture(tmp_path):
-    legacy = SqliteNavigationObservationStore(tmp_path / "navigation-observations.sqlite")
-    evidence = FileNavigationEvidenceStore(tmp_path / "navigation-evidence")
-    payload = ArtifactStateObservation(
-        snapshot=NavigationArtifactSnapshot(date="20260710", raw_input_exists=True)
-    )
-    revision = legacy.append(
-        "nav-legacy-integrity", "extract_sync", "artifact_state", [payload],
-        [EvidenceWrite(
-            kind="artifact_state", source_tool="legacy", payload={"ok": True},
-            summary="legacy",
-        )],
-        evidence,
-    )
-    return revision, evidence
-
-
-@pytest.mark.parametrize("corruption", ["missing", "extra", "wrong_revision", "duplicate"])
-def test_legacy_migration_requires_bidirectional_evidence_integrity(tmp_path, corruption):
-    revision, evidence = _write_legacy_observation_fixture(tmp_path)
+def test_phase_bearing_observation_schema_requires_reset_without_copying_legacy_state(
+    tmp_path,
+):
+    services = build_navigation_services(tmp_path)
+    target_path = services.task_store.db_path
+    with sqlite3.connect(target_path) as connection:
+        connection.execute("PRAGMA foreign_keys = OFF")
+        connection.execute("DROP TABLE navigation_evidence")
+        connection.execute("DROP TABLE navigation_observation_revisions")
+        connection.execute(
+            """CREATE TABLE navigation_observation_revisions (
+                task_id TEXT NOT NULL,
+                revision INTEGER NOT NULL,
+                phase TEXT NOT NULL,
+                revision_json TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                PRIMARY KEY (task_id, revision)
+            )"""
+        )
+        connection.execute(
+            """CREATE TABLE navigation_evidence (
+                ref TEXT PRIMARY KEY,
+                task_id TEXT NOT NULL,
+                observation_revision INTEGER NOT NULL,
+                kind TEXT NOT NULL,
+                summary TEXT NOT NULL,
+                byte_size INTEGER NOT NULL,
+                source_tool TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                FOREIGN KEY (task_id, observation_revision)
+                    REFERENCES navigation_observation_revisions(task_id, revision)
+            )"""
+        )
+        connection.execute(
+            """CREATE INDEX idx_navigation_evidence_task_revision_kind
+               ON navigation_evidence (task_id, observation_revision, kind)"""
+        )
+        connection.execute(
+            "INSERT INTO navigation_observation_revisions VALUES (?, ?, ?, ?, ?)",
+            ("legacy-task", 1, "extract_sync", "{}", "now"),
+        )
     legacy_path = tmp_path / "navigation-observations.sqlite"
     with sqlite3.connect(legacy_path) as connection:
-        if corruption == "missing":
-            connection.execute("DELETE FROM navigation_evidence")
-        elif corruption == "wrong_revision":
-            connection.execute("UPDATE navigation_evidence SET observation_revision = 99")
-        elif corruption == "extra":
-            descriptor = evidence.write(
-                revision.task_id, revision.revision, "extra", "legacy", {"x": 1}, "extra"
-            )
-            connection.execute(
-                "INSERT INTO navigation_evidence VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-                tuple(descriptor.model_dump(mode="json").values()),
-            )
-        else:
-            connection.execute("ALTER TABLE navigation_evidence RENAME TO evidence_old")
-            connection.execute(
-                """CREATE TABLE navigation_evidence (
-                    ref TEXT, task_id TEXT, observation_revision INTEGER, kind TEXT,
-                    summary TEXT, byte_size INTEGER, source_tool TEXT, created_at TEXT)"""
-            )
-            connection.execute("INSERT INTO navigation_evidence SELECT * FROM evidence_old")
-            connection.execute("INSERT INTO navigation_evidence SELECT * FROM evidence_old")
-            connection.execute("DROP TABLE evidence_old")
-
-    with pytest.raises(navigation_services_module.LegacyObservationMigrationError):
-        build_navigation_services(tmp_path)
-
-
-def test_completed_legacy_marker_fast_path_needs_no_target_write_lock(tmp_path):
-    _write_legacy_observation_fixture(tmp_path)
-    first = build_navigation_services(tmp_path)
-    locked = Event()
-
-    def transient_writer():
-        connection = sqlite3.connect(first.task_store.db_path)
-        connection.execute("BEGIN IMMEDIATE")
-        locked.set()
-        time.sleep(0.1)
-        connection.rollback()
-        connection.close()
-
-    with ThreadPoolExecutor(max_workers=1) as executor:
-        future = executor.submit(transient_writer)
-        locked.wait()
-        resumed = build_navigation_services(tmp_path)
-        future.result()
-
-    assert resumed.observation_store.latest("nav-legacy-integrity") is not None
-
-
-def test_concurrent_navigation_service_builders_migrate_once(tmp_path):
-    _write_legacy_observation_fixture(tmp_path)
-
-    with ThreadPoolExecutor(max_workers=2) as executor:
-        services = list(executor.map(lambda _: build_navigation_services(tmp_path), range(2)))
-
-    assert all(
-        item.observation_store.latest("nav-legacy-integrity") is not None
-        for item in services
-    )
-    with sqlite3.connect(tmp_path / "navigation-tasks.sqlite") as connection:
-        assert connection.execute(
-            "SELECT COUNT(*) FROM navigation_service_migrations"
-        ).fetchone()[0] == 1
-
-
-def test_marker_only_legacy_database_requires_reset_without_mutation(tmp_path):
-    db_path = tmp_path / "navigation-tasks.sqlite"
-    with sqlite3.connect(db_path) as connection:
-        connection.execute(
-            "CREATE TABLE navigation_service_migrations (name TEXT PRIMARY KEY, completed_at TEXT)"
-        )
-        connection.execute(
-            "INSERT INTO navigation_service_migrations VALUES (?, ?)",
-            ("legacy_observations_to_unified_v1", "now"),
-        )
-        before_schema = connection.execute(
-            "SELECT type, name, sql FROM sqlite_master ORDER BY type, name"
-        ).fetchall()
-    before_bytes = db_path.read_bytes()
+        connection.execute("CREATE TABLE legacy_sentinel (value TEXT)")
+        connection.execute("INSERT INTO legacy_sentinel VALUES ('do-not-copy')")
+    target_before = target_path.read_bytes()
+    legacy_before = legacy_path.read_bytes()
 
     with pytest.raises(NavigationStateResetRequired):
         build_navigation_services(tmp_path)
 
-    assert db_path.read_bytes() == before_bytes
-    with sqlite3.connect(db_path) as connection:
-        after_schema = connection.execute(
-            "SELECT type, name, sql FROM sqlite_master ORDER BY type, name"
-        ).fetchall()
-    assert after_schema == before_schema
-
-
-@pytest.mark.parametrize("failure", ["invalid_json", "partial_schema"])
-def test_navigation_services_reject_corrupt_legacy_db_without_partial_import(
-    tmp_path, failure
-):
-    legacy_path = tmp_path / "navigation-observations.sqlite"
-    with sqlite3.connect(legacy_path) as connection:
-        connection.execute(
-            """
-            CREATE TABLE navigation_observation_revisions (
-                task_id TEXT, revision INTEGER, phase TEXT,
-                revision_json TEXT, created_at TEXT
-            )
-            """
-        )
-        if failure == "invalid_json":
-            connection.execute(
-                """
-                CREATE TABLE navigation_evidence (
-                    ref TEXT, task_id TEXT, observation_revision INTEGER,
-                    kind TEXT, summary TEXT, byte_size INTEGER,
-                    source_tool TEXT, created_at TEXT
-                )
-                """
-            )
-            connection.execute(
-                "INSERT INTO navigation_observation_revisions VALUES (?, ?, ?, ?, ?)",
-                ("nav-corrupt", 1, "extract_sync", "{bad-json", "now"),
-            )
-
-    with pytest.raises(navigation_services_module.LegacyObservationMigrationError):
-        build_navigation_services(tmp_path)
-
-    with sqlite3.connect(tmp_path / "navigation-tasks.sqlite") as connection:
-        count = connection.execute(
-            "SELECT COUNT(*) FROM navigation_observation_revisions"
-        ).fetchone()[0]
-    assert count == 0
-
-
-def test_navigation_services_reject_conflicting_legacy_revision_before_marker(tmp_path):
-    unified = build_navigation_services(tmp_path)
-    evidence = unified.evidence_store
-    target_payload = ArtifactStateObservation(
-        snapshot=NavigationArtifactSnapshot(date="20260710", raw_input_exists=True)
-    )
-    unified.observation_store.append(
-        "nav-conflict", "extract_sync", "artifact_state", [target_payload], [], evidence
-    )
-    legacy = SqliteNavigationObservationStore(tmp_path / "navigation-observations.sqlite")
-    legacy_payload = ArtifactStateObservation(
-        snapshot=NavigationArtifactSnapshot(date="20260711", raw_input_exists=True)
-    )
-    legacy.append(
-        "nav-conflict", "extract_sync", "artifact_state", [legacy_payload], [], evidence
-    )
-
-    with pytest.raises(
-        navigation_services_module.LegacyObservationMigrationError,
-        match="conflicts with unified state",
-    ):
-        build_navigation_services(tmp_path)
-
-    assert unified.observation_store.latest("nav-conflict").payloads == [target_payload]
+    assert target_path.read_bytes() == target_before
+    assert legacy_path.read_bytes() == legacy_before
 
 
 def test_phase_resolver_exposes_missing_inspections_without_submission_or_execution(tmp_path):
@@ -874,7 +731,7 @@ def test_phase_resolver_exposes_missing_inspections_without_submission_or_execut
         "inspect_navigation_raw_metadata_tool",
         "inspect_navigation_sensor_candidates_tool",
         "inspect_navigation_topic_candidates_tool",
-        "get_phase_planning_context_tool",
+        "get_navigation_task_context_tool",
         "list_observation_evidence_tool",
         "read_observation_evidence_tool",
         "describe_processing_action_tool",
@@ -924,7 +781,6 @@ def test_phase_resolver_fails_closed_when_child_commit_advances_read_revision(
         reconciled = original_reconcile(stale_task, settings=settings)
         services.observation_store.append(
             task.task_id,
-            task.phase,
             "artifact_state",
             [
                 ArtifactStateObservation(

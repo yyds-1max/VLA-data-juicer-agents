@@ -19,10 +19,10 @@ from vla_data_juicer_agents.navigation.task_store import SqliteNavigationTaskSto
 FIXTURE_ROOT = Path(__file__).parent / "fixtures" / "navigation" / "VLADatasets"
 INSPECTION_RESULT_KEYS = {
     "ok",
-    "observation_delta",
-    "evidence_refs",
     "observation_revision",
-    "remaining_missing_observations",
+    "observed_kind",
+    "summary",
+    "evidence_refs",
 }
 
 
@@ -90,7 +90,7 @@ def test_builder_exposes_factual_and_cognitive_tools_without_semantic_inference(
         "inspect_navigation_runtime_assets_tool",
         "inspect_navigation_calibration_inventory_tool",
         "inspect_navigation_localization_sources_tool",
-        "get_phase_planning_context_tool",
+        "get_navigation_task_context_tool",
         "list_observation_evidence_tool",
         "read_observation_evidence_tool",
         "describe_processing_action_tool",
@@ -137,9 +137,12 @@ def test_stale_inspection_toolkit_cannot_write_revision_or_evidence_after_rebind
         agentscope_session_id="as-new",
     )
 
-    with pytest.raises(PermissionError, match="session mismatch"):
-        _invoke_tool(tools["inspect_navigation_raw_metadata_tool"], {})
+    result = _invoke_tool(tools["inspect_navigation_raw_metadata_tool"], {})
 
+    assert set(result) == {"ok", "error_type", "message"}
+    assert result["ok"] is False
+    assert result["error_type"] == "permission_error"
+    assert "session mismatch" in result["message"]
     assert observation_store.latest(task.task_id) is None
     assert not (tmp_path / "evidence" / task.task_id).exists()
 
@@ -151,13 +154,9 @@ def test_inspection_tool_returns_only_compact_delta_and_external_evidence(tmp_pa
 
     assert set(result) == INSPECTION_RESULT_KEYS
     assert result["ok"] is True
-    assert result["observation_delta"]["kind"] == "raw_metadata"
+    assert result["observed_kind"] == "raw_metadata"
+    assert result["summary"]["topic_count"] >= 1
     assert result["observation_revision"] == 1
-    assert result["remaining_missing_observations"] == [
-        "artifact_state",
-        "sensor_candidates",
-        "topic_candidates",
-    ]
     assert len(json.dumps(result, ensure_ascii=False, separators=(",", ":"))) <= 4_000
     revision = observation_store.latest("nav-observe-1")
     assert revision is not None
@@ -207,8 +206,8 @@ def test_large_topic_inventory_is_compacted_before_single_persisted_revision(tmp
 
     result = _invoke_tool(tools["inspect_navigation_topic_candidates_tool"], {})
 
-    compact = result["observation_delta"]
-    assert compact["kind"] == "topic_candidates"
+    compact = result["summary"]
+    assert result["observed_kind"] == "topic_candidates"
     assert compact["available_topic_count"] == len(topics)
     assert "available_topics" not in compact
     assert len(json.dumps(compact, ensure_ascii=False, separators=(",", ":"))) <= 2_000
@@ -259,8 +258,14 @@ def test_extract_observation_tools_complete_phase_without_selecting_params(tmp_p
     assert "topic_whitelist" not in serialized
     assert "topic_map" not in serialized
     assert "query_dir" not in serialized
-    context = _invoke_tool(tools["get_phase_planning_context_tool"], {})
-    assert context["observation_status"]["complete"] is True
+    context = _invoke_tool(tools["get_navigation_task_context_tool"], {})
+    assert context["observed_kinds"] == [
+        "artifact_state",
+        "raw_metadata",
+        "sensor_candidates",
+        "topic_candidates",
+    ]
+    assert context["available_stage_ids"] == ["extract_sync", "finish_processing"]
     assert len(context["evidence_catalog"]) == 4
 
 
@@ -281,13 +286,13 @@ def test_finish_inventory_tools_report_only_measured_candidates(tmp_path):
     calibration = _invoke_tool(tools["inspect_navigation_calibration_inventory_tool"], {})
     localization = _invoke_tool(tools["inspect_navigation_localization_sources_tool"], {})
 
-    assert calibration["observation_delta"] == {
-        "kind": "calibration_inventory",
+    assert calibration["observed_kind"] == "calibration_inventory"
+    assert calibration["summary"] == {
         "sensor_source_count": 1,
         "sensor_sources_preview": ["NoobScenes/params/20260529_go2w/sensors"],
     }
-    assert localization["observation_delta"] == {
-        "kind": "localization_sources",
+    assert localization["observed_kind"] == "localization_sources"
+    assert localization["summary"] == {
         "available_source_count": 1,
         "available_sources_preview": ["odom"],
         "conversion_available": True,
@@ -374,7 +379,7 @@ def test_repeated_inspections_paginate_evidence_and_context_by_character_budget(
     assert second["evidence"][0]["observation_revision"] == first["next_cursor"] + 1
     assert len(json.dumps(second, ensure_ascii=False, separators=(",", ":"))) <= 5_500
 
-    context = _invoke_tool(tools["get_phase_planning_context_tool"], {})
+    context = _invoke_tool(tools["get_navigation_task_context_tool"], {})
     assert len(json.dumps(context, ensure_ascii=False, separators=(",", ":"))) <= 5_500
     assert context["evidence_next_cursor"] == len(context["evidence_catalog"])
     assert context["evidence_next_cursor"] < 30

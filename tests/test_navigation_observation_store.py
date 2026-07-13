@@ -30,13 +30,39 @@ def _sensor_observation() -> SensorCandidatesObservation:
     )
 
 
+def _append(store, task_id, kind, payloads, writes, evidence):
+    return store.append(
+        task_id,
+        kind,
+        payloads,
+        writes,
+        evidence,
+        expected_web_session_id=None,
+        expected_agentscope_session_id=None,
+    )
+
+
 def test_observation_revision_is_monotonic_and_carries_forward_facts(tmp_path):
     store = SqliteNavigationObservationStore(tmp_path / "state.sqlite")
     evidence = FileNavigationEvidenceStore(tmp_path / "evidence")
 
-    first = store.append("nav-1", "extract_sync", "raw_metadata", [_raw_observation()], [], evidence)
+    first = store.append(
+        "nav-1",
+        "raw_metadata",
+        [_raw_observation()],
+        [],
+        evidence,
+        expected_web_session_id="web-1",
+        expected_agentscope_session_id="as-1",
+    )
     second = store.append(
-        "nav-1", "extract_sync", "sensor_candidates", [_sensor_observation()], [], evidence
+        "nav-1",
+        "sensor_candidates",
+        [_sensor_observation()],
+        [],
+        evidence,
+        expected_web_session_id="web-1",
+        expected_agentscope_session_id="as-1",
     )
 
     assert (first.revision, second.revision) == (1, 2)
@@ -46,13 +72,22 @@ def test_observation_revision_is_monotonic_and_carries_forward_facts(tmp_path):
     assert store.get("nav-1", 1) == first
     assert store.latest("nav-missing") is None
 
+    with sqlite3.connect(tmp_path / "state.sqlite") as connection:
+        columns = {
+            row[1]
+            for row in connection.execute(
+                "PRAGMA table_info(navigation_observation_revisions)"
+            )
+        }
+    assert columns == {"task_id", "revision", "revision_json", "created_at"}
+
 
 def test_observation_revisions_are_allocated_per_task(tmp_path):
     store = SqliteNavigationObservationStore(tmp_path / "state.sqlite")
     evidence = FileNavigationEvidenceStore(tmp_path / "evidence")
 
-    nav_one = store.append("nav-1", "extract_sync", "raw_metadata", [_raw_observation()], [], evidence)
-    nav_two = store.append("nav-2", "extract_sync", "raw_metadata", [_raw_observation()], [], evidence)
+    nav_one = _append(store, "nav-1", "raw_metadata", [_raw_observation()], [], evidence)
+    nav_two = _append(store, "nav-2", "raw_metadata", [_raw_observation()], [], evidence)
 
     assert nav_one.revision == nav_two.revision == 1
 
@@ -73,12 +108,12 @@ def test_append_persists_evidence_metadata_and_filters_by_task_kind_and_revision
         summary="one candidate",
     )
 
-    first = store.append(
-        "nav-1", "extract_sync", "raw_metadata", [_raw_observation()], [first_write], evidence
+    first = _append(
+        store, "nav-1", "raw_metadata", [_raw_observation()], [first_write], evidence
     )
-    second = store.append(
+    second = _append(
+        store,
         "nav-1",
-        "extract_sync",
         "sensor_candidates",
         [_sensor_observation()],
         [second_write],
@@ -105,9 +140,9 @@ def test_observation_and_evidence_commits_advance_task_aggregate_revision(tmp_pa
     store = SqliteNavigationObservationStore(db_path)
     evidence = FileNavigationEvidenceStore(tmp_path / "evidence")
 
-    store.append(
+    _append(
+        store,
         task.task_id,
-        "extract_sync",
         "raw_metadata",
         [_raw_observation()],
         [EvidenceWrite(
@@ -131,9 +166,9 @@ def test_task_first_initialization_installs_observation_triggers(tmp_path):
     )
     store = SqliteNavigationObservationStore(db_path)
 
-    store.append(
+    _append(
+        store,
         task.task_id,
-        "extract_sync",
         "raw_metadata",
         [_raw_observation()],
         [],
@@ -158,11 +193,12 @@ def test_owned_task_observation_append_rejects_omitted_session(tmp_path):
     with pytest.raises(PermissionError, match="session mismatch"):
         store.append(
             task.task_id,
-            "extract_sync",
             "raw_metadata",
             [_raw_observation()],
             [],
             FileNavigationEvidenceStore(tmp_path / "evidence"),
+            expected_web_session_id=None,
+            expected_agentscope_session_id=None,
         )
 
     assert store.latest(task.task_id) is None
@@ -192,7 +228,14 @@ def test_append_rolls_back_database_and_written_evidence_on_failure(tmp_path):
     ]
 
     with pytest.raises(RuntimeError, match="write failed"):
-        store.append("nav-1", "extract_sync", "raw_metadata", [_raw_observation()], writes, FailingEvidenceStore())
+        _append(
+            store,
+            "nav-1",
+            "raw_metadata",
+            [_raw_observation()],
+            writes,
+            FailingEvidenceStore(),
+        )
 
     assert store.latest("nav-1") is None
     assert list(root.rglob("*.json")) == []
@@ -231,9 +274,9 @@ def test_append_surfaces_all_evidence_cleanup_failures_after_database_rollback(t
     ]
 
     with pytest.raises(ObservationRollbackCleanupError) as captured:
-        store.append(
+        _append(
+            store,
             "nav-1",
-            "extract_sync",
             "raw_metadata",
             [_raw_observation()],
             writes,

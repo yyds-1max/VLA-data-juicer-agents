@@ -472,11 +472,12 @@ def test_finish_plan_invalidates_when_reconciliation_falls_back_to_extract_sync(
     evidence_store = FileNavigationEvidenceStore(tmp_path / "evidence")
     observation = observation_store.append(
         task.task_id,
-        task.phase,
         "calibration_inventory",
         [CalibrationInventoryObservation(sensor_sources=[source])],
         [],
         evidence_store,
+        expected_web_session_id=None,
+        expected_agentscope_session_id=None,
     )
     plan_store = SqliteNavigationPlanRepository(db_path)
     plan = plan_store.activate(
@@ -1078,11 +1079,12 @@ def test_failed_validation_with_final_artifacts_does_not_complete_fresh_task(
     evidence_store = FileNavigationEvidenceStore(tmp_path / "evidence")
     observation = SqliteNavigationObservationStore(db_path).append(
         task.task_id,
-        task.phase,
         "calibration_inventory",
         [CalibrationInventoryObservation(sensor_sources=[source])],
         [],
         evidence_store,
+        expected_web_session_id=None,
+        expected_agentscope_session_id=None,
     )
     plan_store = SqliteNavigationPlanRepository(db_path)
     plan = plan_store.activate(
@@ -1330,7 +1332,6 @@ def test_calibration_source_must_match_plan_revision_inventory_and_processing_ro
     evidence_store = FileNavigationEvidenceStore(tmp_path / "evidence")
     observation = observation_store.append(
         task.task_id,
-        task.phase,
         "calibration_inventory",
         [CalibrationInventoryObservation(sensor_sources=[observed_source])],
         [
@@ -1342,6 +1343,8 @@ def test_calibration_source_must_match_plan_revision_inventory_and_processing_ro
             )
         ],
         evidence_store,
+        expected_web_session_id=None,
+        expected_agentscope_session_id=None,
     )
     plan_store = SqliteNavigationPlanRepository(db_path)
     plan = plan_store.activate(
@@ -1420,11 +1423,12 @@ def test_plan_bound_human_decision_waits_and_transitions_ledger_exactly_once(
     evidence_store = FileNavigationEvidenceStore(tmp_path / "evidence")
     observation = observation_store.append(
         task.task_id,
-        task.phase,
         "calibration_inventory",
         [CalibrationInventoryObservation(sensor_sources=[source])],
         [],
         evidence_store,
+        expected_web_session_id=None,
+        expected_agentscope_session_id=None,
     )
     plan_store = SqliteNavigationPlanRepository(db_path)
     plan = plan_store.activate(
@@ -1559,11 +1563,12 @@ def test_human_decision_finalize_does_not_borrow_rebound_session_authority(
     evidence_store = FileNavigationEvidenceStore(tmp_path / "evidence")
     observation = observation_store.append(
         task.task_id,
-        task.phase,
         "calibration_inventory",
         [CalibrationInventoryObservation(sensor_sources=[source])],
         [],
         evidence_store,
+        expected_web_session_id=None,
+        expected_agentscope_session_id=None,
     )
     task = task_store.update_task(
         task.task_id,

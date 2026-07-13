@@ -82,6 +82,25 @@ _SUPPORTED_TABLE_SQL = {
            retry_count INTEGER NOT NULL DEFAULT 0,
            FOREIGN KEY (task_id) REFERENCES navigation_tasks(task_id)
        )""",
+    "navigation_observation_revisions": """CREATE TABLE navigation_observation_revisions (
+           task_id TEXT NOT NULL,
+           revision INTEGER NOT NULL,
+           revision_json TEXT NOT NULL,
+           created_at TEXT NOT NULL,
+           PRIMARY KEY (task_id, revision)
+       )""",
+    "navigation_evidence": """CREATE TABLE navigation_evidence (
+           ref TEXT PRIMARY KEY,
+           task_id TEXT NOT NULL,
+           observation_revision INTEGER NOT NULL,
+           kind TEXT NOT NULL,
+           summary TEXT NOT NULL,
+           byte_size INTEGER NOT NULL,
+           source_tool TEXT NOT NULL,
+           created_at TEXT NOT NULL,
+           FOREIGN KEY (task_id, observation_revision)
+               REFERENCES navigation_observation_revisions(task_id, revision)
+       )""",
 }
 _SUPPORTED_INDEX_SQL = {
     "idx_navigation_tasks_date_updated": """CREATE INDEX
@@ -108,6 +127,9 @@ _SUPPORTED_INDEX_SQL = {
         idx_navigation_task_steps_plan_step_id
         ON navigation_task_steps (plan_id, step_id)
         WHERE plan_id IS NOT NULL""",
+    "idx_navigation_evidence_task_revision_kind": """CREATE INDEX
+        idx_navigation_evidence_task_revision_kind
+        ON navigation_evidence (task_id, observation_revision, kind)""",
 }
 
 

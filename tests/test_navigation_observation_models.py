@@ -31,7 +31,6 @@ def test_unavailable_resource_still_completes_observation_kind():
     revision = NavigationObservationRevision(
         task_id="nav-1",
         revision=1,
-        phase="finish_processing",
         completed_kinds=["runtime_assets"],
         payloads=[
             RuntimeAssetsObservation(
@@ -43,6 +42,13 @@ def test_unavailable_resource_still_completes_observation_kind():
     )
 
     assert revision.completed_kinds == ["runtime_assets"]
+
+
+def test_observation_revision_schema_is_phase_neutral():
+    schema = NavigationObservationRevision.model_json_schema()
+
+    assert "phase" not in schema["properties"]
+    assert "phase" not in schema.get("required", [])
 
 
 def test_observation_payload_uses_kind_discriminator():

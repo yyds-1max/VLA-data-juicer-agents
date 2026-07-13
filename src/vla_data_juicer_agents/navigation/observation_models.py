@@ -5,10 +5,7 @@ from typing import Annotated, Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field
 
-from vla_data_juicer_agents.navigation.task_state import (
-    NavigationArtifactSnapshot,
-    NavigationTaskPhase,
-)
+from vla_data_juicer_agents.navigation.task_state import NavigationArtifactSnapshot
 
 
 class StrictModel(BaseModel):
@@ -133,7 +130,6 @@ class EvidenceDescriptor(StrictModel):
 class NavigationObservationRevision(StrictModel):
     task_id: str
     revision: int = Field(ge=1)
-    phase: NavigationTaskPhase
     completed_kinds: list[ObservationKind]
     payloads: list[ObservationPayload]
     evidence_refs: list[str] = Field(default_factory=list)

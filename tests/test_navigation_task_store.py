@@ -26,12 +26,15 @@ _CORE_SCHEMA_OBJECTS = (
     "navigation_state_schema",
     "navigation_tasks",
     "navigation_task_steps",
+    "navigation_observation_revisions",
+    "navigation_evidence",
     "idx_navigation_tasks_date_updated",
     "idx_navigation_tasks_target_history",
     "idx_navigation_tasks_session",
     "idx_navigation_tasks_attempt_replay",
     "idx_navigation_task_steps_plan_sequence",
     "idx_navigation_task_steps_plan_step_id",
+    "idx_navigation_evidence_task_revision_kind",
 )
 
 

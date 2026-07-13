@@ -277,7 +277,7 @@ def test_representative_model_authored_transcript_stays_bounded_without_compacti
         "planning",
         "Use the completed facts to submit one complete extract-sync plan.",
     )
-    context = _call(planning_tools["get_phase_planning_context_tool"])
+    context = _call(planning_tools["get_navigation_task_context_tool"])
     record("planning_context", context, 5_500)
     evidence_list = _call(
         planning_tools["list_observation_evidence_tool"],

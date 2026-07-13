@@ -774,15 +774,6 @@ def validate_navigation_plan(
                 "Observation belongs to another task",
             )
         )
-    if observation.phase.value != phase:
-        errors.append(
-            _plan_issue(
-                "observation.phase",
-                "observation_phase_mismatch",
-                "Observation does not match the submitted plan phase",
-                [phase],
-            )
-        )
     required = PHASE_REQUIRED_OBSERVATIONS[phase]
     missing = [kind for kind in required if kind not in observation.completed_kinds]
     if missing:

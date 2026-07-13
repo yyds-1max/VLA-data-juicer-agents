@@ -14,6 +14,9 @@ from vla_data_juicer_agents.core.cancellation import (
     current_cancellation,
 )
 from vla_data_juicer_agents.navigation.config import NavigationSettings
+from vla_data_juicer_agents.navigation.artifact_inspection import (
+    build_navigation_artifact_snapshot,
+)
 from vla_data_juicer_agents.navigation.evidence_store import FileNavigationEvidenceStore
 from vla_data_juicer_agents.navigation.execution_tools import (
     assemble_finish_temp,
@@ -43,10 +46,7 @@ from vla_data_juicer_agents.navigation.plan_store import (
     MAX_RESULT_OUTBOX_CHARS,
     SqliteNavigationPlanRepository,
 )
-from vla_data_juicer_agents.navigation.task_reconciliation import (
-    build_navigation_artifact_snapshot,
-    reconcile_navigation_task,
-)
+from vla_data_juicer_agents.navigation.task_reconciliation import reconcile_navigation_task
 from vla_data_juicer_agents.navigation.task_state import NavigationTask
 from vla_data_juicer_agents.navigation.task_store import (
     NavigationTaskOwnershipError,

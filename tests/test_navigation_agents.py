@@ -107,7 +107,7 @@ def _real_terminal_services(tmp_path, *, dry_run: bool):
 
 def test_create_plan_agent_uses_only_resolved_tools(monkeypatch):
     monkeypatch.setenv("DASHSCOPE_API_KEY", "test-key")
-    tools = [SimpleNamespace(name="get_phase_planning_context_tool")]
+    tools = [SimpleNamespace(name="get_navigation_task_context_tool")]
 
     agent = create_plan_agent(tools=tools)
 

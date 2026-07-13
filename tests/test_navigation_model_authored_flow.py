@@ -81,7 +81,7 @@ def _evidence_by_kind(services, task_id):
 
 def _activate_extract_plan(services, task, session_id, web_session_id=None):
     tools = _complete_required_inspections(services, session_id, web_session_id)
-    context = _call(tools["get_phase_planning_context_tool"])
+    context = _call(tools["get_navigation_task_context_tool"])
     payload = _extract_plan(_evidence_by_kind(services, task.task_id))
     result = _call(
         tools["submit_extract_sync_plan_tool"],
@@ -217,7 +217,7 @@ def test_existing_sync_and_scene_mode_select_finish_plan_without_extract_tools(t
     assert task.phase.value == "finish_processing"
     tools = _complete_required_inspections(services, "direct-flow")
     assert "submit_extract_sync_plan_tool" not in tools
-    context = _call(tools["get_phase_planning_context_tool"])
+    context = _call(tools["get_navigation_task_context_tool"])
     result = _call(
         tools["submit_finish_processing_plan_tool"],
         planning_context_revision=context["planning_context_revision"],

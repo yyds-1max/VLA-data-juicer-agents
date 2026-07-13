@@ -27,22 +27,22 @@ from vla_data_juicer_agents.navigation.task_state import NavigationTask
 
 
 PLANNING_CONTEXT_MAX_CHARS = 5_500
+NavigationStageId = Literal["extract_sync", "finish_processing"]
+AVAILABLE_STAGE_IDS: list[NavigationStageId] = ["extract_sync", "finish_processing"]
 
 
-class ObservationStatus(StrictModel):
-    complete: bool
-    required: list[str]
-    completed: list[str]
-    missing: list[str]
-
-
-class PhasePlanningContext(StrictModel):
+class NavigationTaskContext(StrictModel):
     task_id: str
-    phase: Literal["extract_sync", "finish_processing"]
+    request: str
+    target: str
+    date: str
+    segments: list[str] | None
+    scene_mode: Literal["in", "out"] | None
     planning_context_revision: str
-    observation_status: ObservationStatus
+    observation_revision: int
+    observed_kinds: list[ObservationKind]
     fact_summary: dict[str, Any]
-    available_action_ids: list[str]
+    available_stage_ids: list[NavigationStageId]
     evidence_catalog: list[EvidenceDescriptor]
     evidence_next_cursor: int | None = None
 
@@ -72,10 +72,11 @@ def compute_planning_context_revision(
 ) -> str:
     payload = {
         "task_id": task.task_id,
+        "request": task.request,
+        "target": task.target,
         "date": task.date,
         "segments": task.segments,
         "scene_mode": task.scene_mode,
-        "phase": task.phase.value,
         "guidance_revision": task.guidance_revision,
         "observation_revision": observation_revision,
         "capability_revision": capability_revision,
@@ -85,26 +86,17 @@ def compute_planning_context_revision(
     ).hexdigest()
 
 
-def build_phase_planning_context(
+def build_navigation_task_context(
     *,
     task: NavigationTask,
-    observation: NavigationObservationRevision,
+    observation: NavigationObservationRevision | None,
     evidence: Sequence[EvidenceDescriptor] | None = None,
     capabilities: Sequence[ToolCapability] | dict[str, Any],
-) -> PhasePlanningContext:
-    phase = task.phase.value
-    if phase not in PHASE_REQUIRED_OBSERVATIONS:
-        raise ValueError(f"task phase does not support planning context: {phase}")
-    if observation.task_id != task.task_id:
+) -> NavigationTaskContext:
+    if observation is not None and observation.task_id != task.task_id:
         raise PermissionError("observation belongs to another task")
-    if observation.phase.value != phase:
-        raise ValueError("observation phase does not match the active task phase")
 
-    required = list(PHASE_REQUIRED_OBSERVATIONS[phase])
-    completed_set = set(observation.completed_kinds)
-    completed = [kind for kind in required if kind in completed_set]
-    missing = [kind for kind in required if kind not in completed_set]
-    capability_items, capability_revision = _capability_items_and_revision(capabilities)
+    observation_revision = observation.revision if observation is not None else 0
     descriptors = list(evidence or [])
     for descriptor in descriptors:
         if descriptor.task_id != task.task_id:
@@ -112,24 +104,28 @@ def build_phase_planning_context(
     descriptors = [
         descriptor
         for descriptor in descriptors
-        if descriptor.observation_revision <= observation.revision
+        if descriptor.observation_revision <= observation_revision
     ]
-    context = PhasePlanningContext(
+    context = NavigationTaskContext(
         task_id=task.task_id,
-        phase=phase,
+        request=preview_string(task.request),
+        target=preview_string(task.target),
+        date=task.date,
+        segments=(
+            [preview_string(segment) for segment in task.segments[:5]]
+            if task.segments is not None
+            else None
+        ),
+        scene_mode=task.scene_mode,
         planning_context_revision=compute_planning_context_revision(
             task=task,
-            observation_revision=observation.revision,
-            capability_revision=capability_revision,
+            observation_revision=observation_revision,
+            capability_revision=_capability_revision(capabilities),
         ),
-        observation_status=ObservationStatus(
-            complete=not missing,
-            required=required,
-            completed=completed,
-            missing=missing,
-        ),
-        fact_summary=_project_fact_summary(task, observation, required),
-        available_action_ids=_available_action_ids(capability_items, phase),
+        observation_revision=observation_revision,
+        observed_kinds=(list(observation.completed_kinds) if observation is not None else []),
+        fact_summary=_project_fact_summary(observation),
+        available_stage_ids=list(AVAILABLE_STAGE_IDS),
         evidence_catalog=[],
         evidence_next_cursor=0 if descriptors else None,
     )
@@ -157,25 +153,12 @@ def build_phase_planning_context(
 
 
 def _project_fact_summary(
-    task: NavigationTask,
-    observation: NavigationObservationRevision,
-    required: list[ObservationKind],
+    observation: NavigationObservationRevision | None,
 ) -> dict[str, Any]:
-    facts: dict[str, Any] = {
-        "date": task.date,
-        "segment_count": len(task.segments) if task.segments is not None else None,
-        "segments": (
-            [preview_string(segment) for segment in task.segments[:5]]
-            if task.segments is not None
-            else None
-        ),
-        "segments_truncated": bool(task.segments and len(task.segments) > 5),
-        "scene_mode": task.scene_mode,
-    }
-    allowed = {*required, "user_guidance"}
+    if observation is None:
+        return {}
+    facts: dict[str, Any] = {}
     for payload in observation.payloads:
-        if payload.kind not in allowed:
-            continue
         compact = compact_observation_payload(
             payload,
             preview_items=3,
@@ -186,31 +169,9 @@ def _project_fact_summary(
     return facts
 
 
-def _capability_items_and_revision(
+def _capability_revision(
     capabilities: Sequence[ToolCapability] | dict[str, Any],
-) -> tuple[list[ToolCapability], str]:
-    revision = CAPABILITY_CATALOG_REVISION
-    raw_items: Sequence[ToolCapability | dict[str, Any]]
+) -> str:
     if isinstance(capabilities, dict):
-        revision = str(capabilities.get("revision", revision))
-        raw_items = capabilities.get("capabilities", [])
-    else:
-        raw_items = capabilities
-    return [
-        item if isinstance(item, ToolCapability) else ToolCapability.model_validate(item)
-        for item in raw_items
-    ], revision
-
-
-def _available_action_ids(capabilities: list[ToolCapability], phase: str) -> list[str]:
-    action_ids: list[str] = []
-    for capability in capabilities:
-        if capability.phase != phase or not capability.executor_agent_allowed:
-            continue
-        if not any(
-            variant.status == "available" for variant in capability.variants
-        ):
-            continue
-        if capability.tool_name not in action_ids:
-            action_ids.append(capability.tool_name)
-    return action_ids
+        return str(capabilities.get("revision", CAPABILITY_CATALOG_REVISION))
+    return CAPABILITY_CATALOG_REVISION

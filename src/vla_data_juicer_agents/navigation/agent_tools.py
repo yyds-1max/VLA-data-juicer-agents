@@ -98,7 +98,7 @@ _INSPECTION_TOOL_BY_KIND = {
     "localization_sources": "inspect_navigation_localization_sources_tool",
 }
 _COGNITIVE_TOOL_NAMES = {
-    "get_phase_planning_context_tool", "list_observation_evidence_tool",
+    "get_navigation_task_context_tool", "list_observation_evidence_tool",
     "read_observation_evidence_tool", "describe_processing_action_tool",
 }
 
@@ -210,7 +210,7 @@ def resolve_navigation_agent_tools(
         return _trust([tool for tool in task_tools if tool.name in allowed])
 
     observation = services.observation_store.latest(task.task_id)
-    completed = set(observation.completed_kinds) if observation is not None and observation.phase.value == task.phase.value else set()
+    completed = set(observation.completed_kinds) if observation is not None else set()
     missing = [kind for kind in PHASE_REQUIRED_OBSERVATIONS[task.phase.value] if kind not in completed]
     observation_tools = build_navigation_observation_tools(
         task=task,

@@ -78,7 +78,6 @@ def extract_observation() -> NavigationObservationRevision:
     return NavigationObservationRevision(
         task_id="nav-plan-1",
         revision=4,
-        phase=NavigationTaskPhase.EXTRACT_SYNC,
         completed_kinds=[
             "artifact_state",
             "raw_metadata",
@@ -132,7 +131,6 @@ def finish_observation(
     return NavigationObservationRevision(
         task_id="nav-plan-1",
         revision=5,
-        phase=NavigationTaskPhase.FINISH_PROCESSING,
         completed_kinds=[
             "artifact_state",
             "gridmap_artifacts",
@@ -592,11 +590,10 @@ def test_output_validation_must_be_the_last_step():
     assert "validation_not_last" in issue_codes(report)
 
 
-def test_observation_must_match_bound_task_phase_and_complete_required_kinds():
+def test_observation_must_match_bound_task_and_complete_required_kinds():
     observation = extract_observation().model_copy(
         update={
             "task_id": "nav-other",
-            "phase": NavigationTaskPhase.FINISH_PROCESSING,
             "completed_kinds": ["raw_metadata"],
         }
     )
@@ -605,7 +602,6 @@ def test_observation_must_match_bound_task_phase_and_complete_required_kinds():
 
     assert issue_codes(report) == {
         "observation_task_mismatch",
-        "observation_phase_mismatch",
         "missing_required_observation",
     }
 

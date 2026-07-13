@@ -2,12 +2,16 @@ from __future__ import annotations
 
 import json
 from collections.abc import Callable
+from functools import wraps
 from typing import Any
 
 from agentscope.tool import FunctionTool
 
 from vla_data_juicer_agents.navigation.catalog import (
     list_navigation_tool_capabilities,
+)
+from vla_data_juicer_agents.navigation.artifact_inspection import (
+    build_navigation_artifact_snapshot,
 )
 from vla_data_juicer_agents.navigation.config import NavigationSettings
 from vla_data_juicer_agents.navigation.context_budget import (
@@ -41,11 +45,7 @@ from vla_data_juicer_agents.navigation.observation_store import (
     SqliteNavigationObservationStore,
 )
 from vla_data_juicer_agents.navigation.planning_context import (
-    PHASE_REQUIRED_OBSERVATIONS,
-    build_phase_planning_context,
-)
-from vla_data_juicer_agents.navigation.task_reconciliation import (
-    build_navigation_artifact_snapshot,
+    build_navigation_task_context,
 )
 from vla_data_juicer_agents.navigation.task_state import NavigationTask
 
@@ -108,10 +108,6 @@ def build_navigation_observation_tools(
     expected_web_session_id: str | None = None,
     expected_agentscope_session_id: str | None = None,
 ) -> list[FunctionTool]:
-    required = PHASE_REQUIRED_OBSERVATIONS.get(task.phase.value)
-    if required is None:
-        raise ValueError(f"task phase does not support observation tools: {task.phase.value}")
-
     def append_observation(
         *,
         kind: ObservationKind,
@@ -124,20 +120,20 @@ def build_navigation_observation_tools(
             payload,
             max_chars=OBSERVATION_DELTA_MAX_CHARS,
         )
+        compact_delta.pop("kind", None)
         ensure_payload_within_limit(
             {
                 "ok": True,
-                "observation_delta": compact_delta,
-                "evidence_refs": ["x" * (2 * len(task.task_id) + 512)],
                 "observation_revision": 10**30,
-                "remaining_missing_observations": list(required),
+                "observed_kind": kind,
+                "summary": compact_delta,
+                "evidence_refs": ["x" * (2 * len(task.task_id) + 512)],
             },
             max_chars=INSPECTION_RESULT_MAX_CHARS,
             label=f"{source_tool}_preflight",
         )
         revision = observation_store.append(
             task.task_id,
-            task.phase,
             kind,
             [payload],
             [
@@ -152,23 +148,37 @@ def build_navigation_observation_tools(
             expected_web_session_id=expected_web_session_id,
             expected_agentscope_session_id=expected_agentscope_session_id,
         )
-        missing = [
-            item
-            for item in required
-            if item not in revision.completed_kinds
-        ]
         result = {
             "ok": True,
-            "observation_delta": compact_delta,
-            "evidence_refs": revision.evidence_refs,
             "observation_revision": revision.revision,
-            "remaining_missing_observations": missing,
+            "observed_kind": kind,
+            "summary": compact_delta,
+            "evidence_refs": revision.evidence_refs,
         }
         return ensure_payload_within_limit(
             result,
             max_chars=INSPECTION_RESULT_MAX_CHARS,
             label=source_tool,
         )
+
+    def bounded_inspection(func: Callable[[], dict[str, Any]]) -> Callable[[], dict[str, Any]]:
+        @wraps(func)
+        def invoke() -> dict[str, Any]:
+            try:
+                return func()
+            except Exception as error:
+                result = {
+                    "ok": False,
+                    "error_type": _inspection_error_type(error),
+                    "message": str(error)[:1_000],
+                }
+                return ensure_payload_within_limit(
+                    result,
+                    max_chars=INSPECTION_RESULT_MAX_CHARS,
+                    label=f"{func.__name__}_error",
+                )
+
+        return invoke
 
     def inspect_navigation_raw_metadata() -> dict[str, Any]:
         """Inspect selected raw ROS metadata and record factual topic measurements."""
@@ -297,16 +307,14 @@ def build_navigation_observation_tools(
             summary=f"Found {len(payload.available_sources)} localization source kind(s).",
         )
 
-    def get_phase_planning_context() -> dict[str, Any]:
-        """Return the bounded factual planning context for the bound task and active phase."""
+    def get_navigation_task_context() -> dict[str, Any]:
+        """Return the bounded factual, stage-neutral context for the bound task."""
         observation = observation_store.latest(task.task_id)
-        if observation is None:
-            raise ValueError("no observations recorded for the active task")
         evidence = observation_store.list_evidence(
             task.task_id,
             limit=101,
         )
-        return build_phase_planning_context(
+        return build_navigation_task_context(
             task=task,
             observation=observation,
             evidence=evidence,
@@ -385,16 +393,26 @@ def build_navigation_observation_tools(
         raise KeyError(f"action is not available in active phase: {action_id}")
 
     return [
-        _make_tool(inspect_navigation_raw_metadata, "inspect_navigation_raw_metadata_tool"),
-        _make_tool(inspect_sensor_candidates, "inspect_navigation_sensor_candidates_tool"),
-        _make_tool(inspect_topic_candidates, "inspect_navigation_topic_candidates_tool"),
-        _make_tool(inspect_artifact_state, "inspect_navigation_artifact_state_tool"),
-        _make_tool(inspect_gridmap_state, "inspect_navigation_gridmap_artifacts_tool"),
-        _make_tool(inspect_runtime_asset_inventory, "inspect_navigation_runtime_assets_tool"),
-        _make_tool(inspect_calibration_inventory, "inspect_navigation_calibration_inventory_tool"),
-        _make_tool(inspect_localization_inventory, "inspect_navigation_localization_sources_tool"),
-        _make_tool(get_phase_planning_context, "get_phase_planning_context_tool"),
+        _make_tool(bounded_inspection(inspect_navigation_raw_metadata), "inspect_navigation_raw_metadata_tool"),
+        _make_tool(bounded_inspection(inspect_sensor_candidates), "inspect_navigation_sensor_candidates_tool"),
+        _make_tool(bounded_inspection(inspect_topic_candidates), "inspect_navigation_topic_candidates_tool"),
+        _make_tool(bounded_inspection(inspect_artifact_state), "inspect_navigation_artifact_state_tool"),
+        _make_tool(bounded_inspection(inspect_gridmap_state), "inspect_navigation_gridmap_artifacts_tool"),
+        _make_tool(bounded_inspection(inspect_runtime_asset_inventory), "inspect_navigation_runtime_assets_tool"),
+        _make_tool(bounded_inspection(inspect_calibration_inventory), "inspect_navigation_calibration_inventory_tool"),
+        _make_tool(bounded_inspection(inspect_localization_inventory), "inspect_navigation_localization_sources_tool"),
+        _make_tool(get_navigation_task_context, "get_navigation_task_context_tool"),
         _make_tool(list_observation_evidence, "list_observation_evidence_tool"),
         _make_tool(read_observation_evidence, "read_observation_evidence_tool"),
         _make_tool(describe_processing_action, "describe_processing_action_tool"),
     ]
+
+
+def _inspection_error_type(error: Exception) -> str:
+    if isinstance(error, PermissionError):
+        return "permission_error"
+    if isinstance(error, FileNotFoundError):
+        return "file_not_found"
+    if isinstance(error, ValueError):
+        return "invalid_inspection_request"
+    return "inspection_failed"
