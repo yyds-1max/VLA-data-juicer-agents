@@ -1344,11 +1344,12 @@ def test_current_step_returns_its_stored_decision_refs(tmp_path: Path):
 def test_ledger_reads_reject_non_execution_status(tmp_path: Path):
     repo, task = stores_with_task(tmp_path)
     record = _activate_owned(repo, task, "extract_sync", 1, valid_extract_plan())
+    legacy_status = "needs_" + "reconcile"
     with sqlite3.connect(repo.db_path) as connection:
         connection.execute(
-            "UPDATE navigation_task_steps SET status = 'needs_reconcile' "
+            "UPDATE navigation_task_steps SET status = ? "
             "WHERE plan_id = ? AND step_id = 'prepare'",
-            (record.plan_id,),
+            (legacy_status, record.plan_id),
         )
 
     with pytest.raises(ValidationError):

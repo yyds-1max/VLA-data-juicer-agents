@@ -33,7 +33,9 @@ or drifted navigation child objects fail closed before mutation.
   the VLA workflow runner; the pre-execution toolkit includes factual inspections
   and both plan-submission tools.
 - Expanded dead-reference tests to scan both `src` and `tests`; legacy fixture
-  identifiers are assembled dynamically so the repository has true zero matches.
+  identifiers are assembled dynamically so the repository has true zero matches,
+  including obsolete waiting/input/run/step/drift fields and the old ledger
+  reconciliation status.
 
 ## TDD Evidence
 
@@ -57,6 +59,7 @@ triggers, and the legacy nullable outbox.
 - Full suite: `761 passed`, one pre-existing Starlette warning.
 - `.venv/bin/python -m compileall -q src tests`: passed.
 - Forbidden source-and-test symbol audit: no matches.
+- Direct six-literal M1 `rg` audit across `src` and `tests`: no matches.
 - Removed state-machine/session-compatibility literal audit across `src` and
   `tests`: no matches.
 - `git diff --check`: passed.

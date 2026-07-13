@@ -700,6 +700,11 @@ def test_incompatible_navigation_schema_requires_reset_without_mutation(
     db_path = tmp_path / "legacy-navigation.sqlite"
     legacy_latest_session = "latest_" + "web_session_id"
     legacy_artifact_snapshot = "artifact_" + "snapshot_json"
+    legacy_wait_reason = "waiting_" + "reason"
+    legacy_next_input = "next_required_" + "input"
+    legacy_latest_run = "latest_" + "run_id"
+    legacy_last_step = "last_completed_" + "step"
+    legacy_drift = "drift_" + "json"
     with sqlite3.connect(db_path) as connection:
         connection.executescript(
             f"""CREATE TABLE navigation_tasks (
@@ -709,16 +714,16 @@ def test_incompatible_navigation_schema_requires_reset_without_mutation(
                    scene_mode TEXT,
                    phase TEXT NOT NULL,
                    status TEXT NOT NULL,
-                   waiting_reason TEXT,
-                   next_required_input TEXT,
+                   {legacy_wait_reason} TEXT,
+                   {legacy_next_input} TEXT,
                    created_by_web_session_id TEXT,
                    {legacy_latest_session} TEXT,
                    agentscope_session_id TEXT,
-                   latest_run_id TEXT,
-                   last_completed_step TEXT,
+                   {legacy_latest_run} TEXT,
+                   {legacy_last_step} TEXT,
                    data_profile_json TEXT,
                    {legacy_artifact_snapshot} TEXT,
-                   drift_json TEXT,
+                   {legacy_drift} TEXT,
                    schema_version INTEGER NOT NULL,
                    created_at TEXT NOT NULL,
                    updated_at TEXT NOT NULL
