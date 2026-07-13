@@ -32,6 +32,16 @@ execution progress outside the model context. This design applies that ownership
 boundary while retaining strict JSON and domain validation required by navigation
 processing.
 
+A later server test exposed a separate task-entry design error. A new Web session
+could not delegate `20270623/20260623_145550` to the NavigationDataAgent because an
+old `completed` task for the same data was permanently owned by another Web session.
+The main router received the ownership error but twice told the user that processing
+had started. This happened because the implementation treated one date/segment scope
+as a cross-session durable workflow identity. That is not the required behavior.
+Continuing from existing data products means inspecting those products again in a new
+task attempt; it does not mean restoring an old Web session, AgentScope context,
+task, observation history, or plan.
+
 ## Goals
 
 - Make the model the sole author of navigation plan semantics.
@@ -47,8 +57,19 @@ processing.
   capabilities on demand.
 - Keep routine tool results bounded and keep the standard navigation workflow below
   AgentScope's compact trigger.
-- Recover the current phase, active plan, and current step from durable state even
-  if the conversation is compacted or resumed in another web session.
+- Let the main router distinguish ordinary conversation from a concrete navigation
+  processing request and delegate only the latter to the NavigationDataAgent.
+- Require the NavigationDataAgent to investigate current raw, intermediate, and
+  final products before it chooses a processing stage or authors a plan, including
+  when the user claims that an earlier stage has already completed.
+- Keep same-session plan and execution progress durable across compaction, process
+  restart, cancellation, and later continuation without making task state an
+  authoritative description of current filesystem products.
+- Start a fresh task attempt in every new Web session instead of transferring or
+  restoring an old task attempt.
+- Preserve the two major business stages: after extract/sync, the model asks whether
+  the user wants to continue and collects the finish-processing inputs before it
+  plans the second stage.
 - Delete the superseded draft/finalize implementation in the same change so the
   repository contains one planning design, not parallel old and new paths.
 
@@ -60,6 +81,12 @@ processing.
   calibration strategy, processing step, or stage variant.
 - Do not adopt Datus's Markdown plan format; navigation plans remain strict JSON.
 - Do not add a distributed workflow engine.
+- Do not implement cross-Web-session task, plan, observation, or AgentScope-context
+  recovery.
+- Do not let entry code inspect products automatically, choose the current stage, or
+  force the model to stop or continue at a stage boundary.
+- Do not treat persisted task phase/status or a user's description of prior work as
+  proof that an intermediate or final product currently exists.
 - Do not automatically convert an ambiguous legacy profile draft into a new plan.
 - Do not preserve obsolete planning tool aliases or deprecated implementation stubs.
 
@@ -69,7 +96,7 @@ The system has three authoritative state categories:
 
 | State | Meaning | Owner | Mutability |
 | --- | --- | --- | --- |
-| Observation Store | What was observed | Investigation code | Append by revision |
+| Observation Store | Facts returned by model-invoked investigation tools | Model chooses calls; tools record facts | Append by revision |
 | Plan Repository | What the model decided to do | Model, validated by code | Immutable revisions |
 | Execution Ledger | What has executed and what comes next | Execution runtime | Mutable state machine |
 
@@ -87,51 +114,81 @@ and tolerance are supported.
 
 ## Architecture
 
-### Entry Reconciliation and Phase Selection
+### Router, Session, and Task-Attempt Boundaries
 
-Every navigation processing entry follows the same ordering, including the first
-request for a date, a continuation in the same session, a cross-session resume, and
-a request made after test artifacts were manually deleted:
+The main router owns conversation triage. It answers ordinary conversation and
+capability questions itself. When the user supplies a concrete navigation-processing
+target, it calls `start_navigation_data_task` and delegates to the
+NavigationDataAgent. It does not inspect navigation products, select a processing
+stage, or claim that delegation succeeded unless the tool returns `ok: true` and
+`started: true`.
 
-1. create or load the durable task for the selected date and segments
-2. inspect current raw, intermediate, and final artifacts
-3. reconcile persisted task state with that artifact snapshot
-4. select the earliest incomplete processing phase or step
-5. only then build the phase observation checklist and enter investigation/planning
+A `NavigationTask` is one task attempt, not the global lifecycle of one dataset
+scope. The boundaries are:
 
-Artifact reconciliation is therefore an unconditional entry gate, not a special
-rerun workflow. The initial snapshot includes at least raw input, prepared raw temp,
-per-segment `sync_data`, finish-temp samples, final outputs, final grid maps, and
-available validation markers.
+- the first delegation in a Web session creates a task attempt bound to that Web and
+  AgentScope session;
+- later continuation in the same Web/AgentScope session may reuse that attempt's
+  plan and execution ledger, but the model re-inspects facts that may have changed;
+- delegation from a new Web session creates a new task attempt and does not load,
+  transfer, or mutate an earlier session's task, plan, observations, or conversation;
+- completed, failed, waiting-user, or planning attempts for the same date/segments
+  do not block a new task attempt;
+- an actual data-writing action for the same target holds a narrow resource lock.
+  A conflicting execution returns `navigation_data_busy`; it does not trigger
+  cross-session recovery or ownership transfer.
 
-Phase selection follows artifact dependencies:
+Historical attempts remain queryable for diagnostics and audit. They are not an
+authoritative dataset state machine and are never selected merely because their date
+and segments match a new request.
 
-- selected raw data exists but selected `sync_data` is incomplete: enter
-  `extract_sync`
-- selected `sync_data` is complete but finish-processing outputs are incomplete:
-  enter `finish_processing` at the earliest step whose required output is absent or
-  invalid
-- required final outputs and validation markers are complete: reconcile the task as
-  `completed`
-- artifacts are partially present or internally inconsistent: record the exact
-  artifact facts and enter `needs_reconcile` before planning the affected work
+### Model-Directed Investigation and Stage Choice
 
-Observed artifacts override stale persisted phase/status. This phase derivation is
-not semantic plan generation: code determines only which prerequisite outputs exist
-and which dependency boundary is incomplete. The model still decides the plan,
-steps, variants, and parameters for the selected phase.
+After delegation succeeds, the NavigationDataAgent decides what to investigate and
+calls registered read-only tools to obtain current facts. Entry code does not create
+an artifact snapshot or choose a phase on the model's behalf. The prompt and compact
+domain guidance teach the model to establish, in dependency order:
+
+1. the requested date and selected segment inventory
+2. raw-input availability and structure
+3. prepared-raw and per-segment extract/sync products
+4. finish-temporary, annotation, tracking, projection, final-output, and validation
+   products
+5. detailed topic, sensor, calibration, localization, and gridmap facts needed only
+   for the stage that remains to be planned
+
+The model must not trust the user's description of prior progress, conversation
+memory, or a persisted task status as product evidence. It may use those inputs as
+guidance, but it verifies them with tools before planning.
+
+The model chooses the stage by choosing the corresponding complete-plan submission
+tool:
+
+- incomplete extract/sync products normally lead to an extract-sync plan;
+- complete extract/sync products with incomplete finish products normally lead to a
+  finish-processing plan;
+- complete validated final products normally lead to a user-facing no-work-needed
+  result;
+- partial or contradictory products lead to more investigation, an explicit user
+  decision when destructive replacement is required, or a plan that handles the
+  observed condition.
+
+These are domain recommendations, not code-authored phase transitions. Validators
+may reject a plan whose preconditions are contradicted by current evidence, but they
+do not select an alternative plan or stage.
 
 ### Observation Store
 
-Add a task-scoped `NavigationObservationStore`. Observations belong to the durable
-`NavigationTask`, not to an AgentScope session, so a new session can resume planning.
+Add a task-attempt-scoped `NavigationObservationStore`. An observation is appended
+only when the NavigationDataAgent invokes an investigation tool. A new Web session
+starts with a new task attempt and new observations; it does not reuse observations
+from an older attempt for the same date/segments.
 
 Each observation revision contains:
 
 - `task_id`
 - `revision`
-- `phase`
-- `required_observation_status`
+- factual investigation kind/scope
 - normalized typed facts
 - evidence metadata
 - `created_at`
@@ -147,17 +204,19 @@ visible state. Initial models should cover:
 - processing artifact inventory
 - gridmap artifact inventory
 - runtime tool and asset availability
-- user-provided task facts such as `scene_mode`
+- user-provided guidance such as `scene_mode`, clearly distinguished from observed
+  product facts
 
 Observation models must not contain policy fields such as
 `localization_policy`, `gridmap_policy`, `calibration_policy`, or
 `stage_variants`.
 
-The phase checklist determines which observation types must have been attempted. A
-completed observation may state that a resource is unavailable; completeness means
-the fact is known, not that the desired resource exists. Resource availability is
-handled by plan validation or a human decision, not by marking the observation as
-permanently missing.
+The guidance recommends the investigation order, while the model decides which
+detail tools are necessary. Plan validation may require specific observation kinds
+and evidence for the plan being submitted. An observation may state that a resource
+is unavailable; completeness means the relevant fact is known, not that the desired
+resource exists. Resource availability is handled by plan validation, a different
+model-authored choice, or a human decision.
 
 ### Evidence Store
 
@@ -177,20 +236,21 @@ Every evidence read is:
 
 ### Planning Context Projector
 
-`NavigationPlanningContextProjector` produces the only default planning view. It
+`NavigationPlanningContextProjector` produces the only default task-attempt view. It
 contains:
 
-- current task and phase identifiers
+- current task-attempt identifier and requested target
 - the current observation revision
-- required observation completion and missing observation kinds
-- compact facts needed for the active phase
+- compact facts already observed
 - relevant user guidance
-- active-phase action identifiers
+- available stage-specific action identifiers
 - evidence catalog entries with summaries and refs
 
-It excludes raw evidence payloads, inactive-phase facts, plan schemas, previous plan
-candidates, legacy profile drafts, historical validation errors, and execution
-results unrelated to planning.
+It excludes raw evidence payloads, product claims copied from older task attempts,
+plan schemas, previous plan candidates, legacy profile drafts, historical validation
+errors, and execution results unrelated to the current attempt. It may report that a
+validator-required fact is absent, but it must not recommend a stage, action,
+variant, or parameter.
 
 ### Plan Repository
 
@@ -238,10 +298,11 @@ instead of adding a parallel step table. Its rows are bound to `plan_id` and
 Planning needs a small, stable set of tools that extend what the model can know
 without processing or mutating source data.
 
-### `get_phase_planning_context`
+### `get_navigation_task_context`
 
-Returns the active phase's compact context, observation completeness, fact summary,
-available action ids, evidence catalog, and `planning_context_revision`.
+Returns the current attempt's target, compact observed facts, evidence catalog,
+user guidance, available stage identifiers, and `planning_context_revision`. It does
+not return an entry-code-selected active phase.
 
 ### `list_observation_evidence`
 
@@ -256,7 +317,7 @@ It never accepts an arbitrary path.
 ### `describe_processing_action`
 
 Returns the variants, parameter contract, preconditions, and constraints for one
-active-phase action. It describes capability but does not recommend an action or
+requested action. It describes capability but does not recommend an action or
 variant.
 
 Existing inspection tools remain read-only, but their return contract changes. Each
@@ -266,7 +327,9 @@ tool persists the full result, appends normalized observations, and returns only
 - an observation delta summary
 - evidence refs
 - the new observation revision
-- remaining missing observation kinds
+
+Inspection tools do not return a code-authored processing stage, next tool, semantic
+profile, recommended sensor binding, or recommended plan.
 
 The current semantic `infer_*` tools are replaced rather than retained as aliases:
 
@@ -285,19 +348,22 @@ not copied into the new Observation Store.
 
 ## Phase-Specific Complete Plan Contracts
 
-The model submits one complete business plan per phase:
+The model submits one complete business plan for the stage it selected:
 
 - `submit_extract_sync_plan(planning_context_revision, plan)`
 - `submit_finish_processing_plan(planning_context_revision, plan)`
 
-The tool runtime adds task-owned metadata after validation:
+Both submission tools are available after delegation so that choosing the tool is
+the model's stage decision. The schemas stay phase-specific; they are not combined
+into one large union or injected as prompt text. The tool runtime adds task-owned
+metadata after validation:
 
 - `plan_id`
 - plan revision
 - contract version
 - date and selected segments
 - scene mode when applicable
-- phase
+- model-selected phase
 - timestamps
 - observation revision
 
@@ -306,7 +372,9 @@ The model must not repeat these known request facts inside the business plan.
 user guidance revision, observation revision, and active capability-catalog
 revision. It proves which complete planning view the model used.
 
-All plan input models use `extra="forbid"`. Each phase exposes only its own schema.
+All plan input models use `extra="forbid"`. Each submission call validates only its
+own phase schema. Code records the accepted plan's phase on the task attempt for
+execution and telemetry; it does not infer that phase from artifacts.
 
 ### Extract-Sync Plan Input
 
@@ -363,14 +431,14 @@ trees.
 
 The submission boundary performs, in order:
 
-1. task and phase check
+1. task-attempt and submission-tool check
 2. planning-context revision check
 3. Pydantic/JSON structure validation
 4. evidence-ref ownership and revision validation
 5. action, variant, and argument validation
 6. reference validation against observed facts
 7. dependency graph and phase-order validation
-8. navigation business-rule validation
+8. navigation business-rule and observed-precondition validation
 9. one database transaction that saves the active plan and initializes its ledger
 
 Any failure leaves both the active plan and execution ledger unchanged.
@@ -404,6 +472,8 @@ patch endpoint exists.
 A successful response returns only `ok: true`, `plan_id`, revision, step count,
 status, and next action. It does not echo the plan the model just submitted. Both
 success and failure responses therefore expose the same top-level `ok` discriminator.
+The runtime never replaces a rejected model choice with a code-generated stage or
+plan.
 
 ## Plan-Bound Execution
 
@@ -424,16 +494,47 @@ Before execution, the wrapper verifies:
 - the invoked tool matches the step action
 - all dependencies are complete
 - the step is currently executable
-- task/artifact reconciliation has not invalidated the plan
+- observed input refs and required filesystem preconditions still hold
 - stored arguments still satisfy the underlying tool contract
+- no other task attempt currently holds the data-writing resource lock for the same
+  target
 
 Full processing results are persisted externally. Tool responses return status,
 short summaries, produced refs, and the next action.
 
-If execution reveals facts that invalidate the plan, the runtime appends a new
-observation revision, marks the ledger and task `needs_replan`, invalidates the old
-plan without modifying it, and returns to planning. The model then submits a new
-complete plan based on the new context revision.
+If execution reveals facts that invalidate the plan, the runtime persists those
+facts, marks the ledger `needs_replan`, invalidates the old plan without modifying
+it, and returns a compact failure with evidence refs. The model decides what to
+inspect next and submits a new complete plan based on the new context revision. The
+runtime does not choose the replacement stage or steps.
+
+### Two-Stage User Interaction
+
+Navigation processing has two major business stages, but their conversational
+boundary is model-governed rather than a hard-coded workflow transition.
+
+After the accepted extract-sync plan finishes, the NavigationDataAgent follows the
+domain guidance to:
+
+1. inspect or validate the produced sync artifacts
+2. tell the user what completed and what remains
+3. ask whether the user wants to continue with finish processing now
+4. if continuing, collect only the finish-processing inputs that are still needed,
+   such as scene mode and any required confirmation context
+5. investigate finish-specific facts and submit one complete finish-processing plan
+
+If the user stops, the same task attempt and extract-sync ledger remain durable for
+same-session continuation. On a later message in that session, the model rechecks
+the relevant artifacts before it plans finish processing. If the user instead opens
+a new Web session, the router delegates a new task attempt; the new
+NavigationDataAgent independently investigates the products and normally discovers
+that extract/sync is already complete.
+
+No entry-state machine automatically advances to finish processing, and no code gate
+pretends that a user confirmation occurred. Safety validators and plan-bound tool
+authorization remain code-enforced, but asking, waiting, interpreting the reply, and
+choosing whether to author the finish plan belong to the model under prompt and
+guidance instructions.
 
 ### Fail-Closed Human-Decision Delivery Recovery
 
@@ -486,44 +587,155 @@ Fully automatic lease reclamation requires a future AgentScope session-transacti
 fencing token and is explicitly outside this iteration. AgentScope context
 compression remains unchanged.
 
-## Tool Exposure by Phase
+## Tool Exposure by Workflow Activity
 
-The active tool set is resolved from durable task state for each agent turn or
-toolkit refresh.
+Tool exposure follows the current task attempt's activity, not a phase inferred by
+entry code.
 
-- Investigation: task tools, relevant inspection tools, and read-only cognitive
-  tools.
-- Planning: read-only cognitive tools and the one active-phase plan submission tool.
+- Main router: conversation tools plus `start_navigation_data_task`; it does not
+  receive navigation investigation, plan, or processing tools.
+- Investigation and planning: task-context, artifact/inventory inspection, bounded
+  evidence/action-description tools, and both phase-specific complete-plan
+  submission tools. Choosing a submission tool is the model's stage choice.
 - Execution: execution overview/current-step tools, the small set of plan-bound
-  processing tools referenced by remaining steps, and required human-decision tools.
-  Each wrapper accepts only `plan_id`/`step_id` and authorizes only the current
-  executable step, so exposing the remaining action names does not permit skipping
-  or reordering steps within one AgentScope ReAct turn.
+  processing tools referenced by the accepted plan, and required human-decision
+  tools. Each wrapper accepts only `plan_id`/`step_id` and authorizes only the
+  current executable step.
+- Between stages: investigation and planning tools remain available. The prompt and
+  guidance tell the model to ask the user before finish processing; code does not
+  fabricate that decision or automatically submit a second-stage plan.
 
-Inactive-phase plan schemas and unrelated processing tool schemas are not exposed.
-Execution wrappers remain a hard authorization boundary even if a stale client tries
-to invoke a hidden tool.
+Both complete-plan schemas may be exposed during investigation, but no execution
+schema, inactive legacy schema, full capability catalog, or generated schema
+snapshot is placed in prompt or tool results. If the two strict schemas later exceed
+the measured context budget, the model may first select a stage through a tiny
+model-authored stage-selection call that only changes tool exposure; code still must
+not select the stage. This fallback is allowed only with context measurements and is
+not the default design.
 
-## Prompt Design
+Execution wrappers and the target-scoped data-writing lock remain hard authorization
+boundaries even if a stale client invokes a hidden tool.
 
-The NavigationDataAgent prompt must state:
+## Prompt and Domain-Guidance Design
 
-- investigation records facts only
-- the model owns every semantic plan decision
-- the model may inspect evidence and capability details on demand
-- required observations must be complete before plan submission
-- each phase plan is submitted once as complete strict JSON
-- validation failure requires complete resubmission, never a patch
-- execution follows the stored active plan one step at a time
-- durable tools are authoritative for phase and step state after resume or compact
+Prompt content is split deliberately so that each rule has one home.
 
-The prompt must not embed generated plan schemas, draft snapshots, repeated state
-panels, exhaustive capability catalogs, or long tool-order instructions that the
-runtime already enforces.
+### Main Router Prompt
 
-A compact state anchor may be injected per turn with only task id, phase, task
-status, observation revision, active plan id/revision, and current step id. It must
-be generated from durable state rather than conversation history.
+The main router prompt contains only routing policy:
+
+- answer ordinary conversation and capability questions directly
+- delegate only a concrete navigation-processing request with a date/path/dataset
+  target
+- preserve the user's target, optional segments, optional scene context, request,
+  and response language in the handoff
+- do not inspect navigation products or decide a navigation-processing stage
+- report delegation success only when `start_navigation_data_task` returns
+  `ok: true` and `started: true`
+- report a compact truthful failure for `ok: false`; never claim the task started
+  and never use shell/file tools to work around a failed handoff
+
+`start_navigation_data_task` is terminal for the router turn. After it is invoked,
+the Web runtime renders the authoritative user-facing outcome from the structured
+tool result and does not accept a post-tool free-text success claim from the model.
+This prevents the exact observed failure where the model received an error ToolResult
+and then stated that the task had started.
+
+The handoff tool itself returns a stable contract:
+
+```json
+{"ok": true, "started": true, "task_id": "nav_..."}
+```
+
+or:
+
+```json
+{
+  "ok": false,
+  "started": false,
+  "error_type": "navigation_data_busy",
+  "message": "This target currently has a running data-processing action."
+}
+```
+
+### NavigationDataAgent Prompt
+
+The NavigationDataAgent system prompt contains concise, durable invariants:
+
+- investigate before deciding; user statements, conversation memory, older task
+  status, and older product snapshots are guidance rather than current facts
+- the model decides which investigation tools to call, which stage applies, and all
+  plan semantics
+- investigation tools record and return facts only
+- submit one complete strict JSON plan through the chosen stage tool; never patch
+- on validation failure, use bounded errors/evidence and resubmit a complete plan
+- execute only the accepted immutable plan through plan-bound tools
+- after extract/sync, verify outputs, report completion, ask whether to continue,
+  and collect required finish inputs before authoring the finish plan
+- same-session durable Plan/ledger state survives compaction or restart, but mutable
+  product facts are rechecked before new work
+- a new Web session is a new task attempt and never resumes an old attempt
+
+The system prompt does not contain a generated schema, exhaustive action catalog,
+long command cookbook, repeated state panel, or a copy of the domain-guidance file.
+
+### `navigation-plan-agent-guidance.md`
+
+The guidance file is a compact domain playbook, not a second system prompt. It is
+loaded once per NavigationDataAgent context or exposed as one bounded guidance
+resource. It contains only information that materially improves model decisions:
+
+1. **Product dependency map**: raw acquisition data -> prepared/extracted data ->
+   per-segment `sync_data` -> finish temporary data -> annotation/tracking/projection
+   -> final outputs and validation markers.
+2. **Recommended investigation order**: confirm target and segment inventory; inspect
+   product existence/completeness; then inspect detailed topics, timestamps, sensors,
+   calibration, localization, and gridmap only for the remaining stage.
+3. **Common extract-sync work**: prepare raw data, inspect ROS topics and timing,
+   choose sensor bindings and sync reference/method, extract, synchronize, and
+   validate selected outputs.
+4. **Common finish-processing work**: confirm continuation and required user inputs,
+   inspect localization/gridmap/calibration facts, prepare finish data, request
+   bounded human decisions when necessary, run annotation/tracking/projection, and
+   validate final outputs.
+5. **Decision ownership**: the model chooses reference sensor, sync policy,
+   localization, calibration, gridmap, ordered steps, variants, and parameters; code
+   only validates against facts and capabilities.
+6. **User-confirmation points**: whether to continue after extract/sync, missing
+   finish inputs, destructive overwrite/delete, and plan-declared calibration/GUI
+   decisions.
+7. **Failure behavior**: inspect before retry, do not repeat destructive actions
+   without confirmation, and resubmit a whole plan after validation failure.
+8. **Few-shot examples** limited to decision boundaries that are easy to mishandle:
+   - user says sync is complete, but inspection finds missing segment outputs ->
+     investigate and choose extract-sync rather than trusting the statement;
+   - a new session finds complete sync products and missing finish products -> ask
+     for/confirm finish inputs, then submit a finish-processing plan without
+     restoring the older task;
+   - extract/sync just completed -> report and ask whether to continue instead of
+     immediately running finish tools;
+   - invalid complete plan -> correct the indicated fields and resubmit the complete
+     JSON, never a patch.
+
+Few-shots show compact observations, reasoning criteria, and the correct next
+action. They do not embed full schemas, large tool payloads, complete transcripts,
+or fixed business choices that should depend on the actual data.
+
+Deployment acceptance instructions, Git synchronization, token-metric collection,
+legacy draft-directory cleanup, and operator-only recovery runbooks are removed from
+`navigation-plan-agent-guidance.md` and kept in separate operator documentation.
+They do not help the NavigationDataAgent decide a data plan and must not consume its
+context.
+
+The prompt and guidance are reviewed together for duplication. Identity, safety,
+tool-result truthfulness, and strict-plan invariants stay in the prompt. Domain
+knowledge, investigation method, common stage steps, confirmation points, and
+few-shots stay in the guidance file.
+
+A compact state anchor may be injected per turn with only task-attempt id, accepted
+plan id/revision when present, current ledger step, observation revision, and actual
+execution status. It must not assert that current products exist or choose the next
+stage.
 
 ## Context Budgets
 
@@ -532,7 +744,7 @@ Application-level responses stay below AgentScope's configured result limit:
 | Response | Target | Hard maximum |
 | --- | ---: | ---: |
 | Inspection observation delta | 2,000 chars | 4,000 chars |
-| Phase planning context | 4,000 chars | 5,500 chars |
+| Task-attempt planning context | 4,000 chars | 5,500 chars |
 | Evidence detail page | 4,000 chars | 5,500 chars |
 | Plan validation failure | 2,000 chars | 3,000 chars |
 | Execution overview/current step | 2,000 chars | 4,000 chars |
@@ -552,18 +764,35 @@ sub-session rotation can be reconsidered as a separate design.
 
 ## Persistence and Recovery
 
-On every processing entry, the runtime reconstructs state from:
+Persistence is attempt-scoped and has two purposes: safe same-session continuation
+and auditable side-effect execution. It is not a cross-session dataset state machine.
 
-- `NavigationTaskStore`
-- `NavigationObservationStore`
-- `NavigationPlanRepository`
-- execution ledger
-- current artifact reconciliation
+Persist for one task attempt:
 
-Conversation messages may help the model understand user intent, but they never
-decide the current phase or completed step. After any compact or new web session, the
-agent first reads the compact durable state anchor and then requests details only as
-needed.
+- request target, selected segments, Web/AgentScope session ids, and timestamps
+- compact lifecycle status for diagnostics (`active`, `waiting_user`, `completed`,
+  `failed`, `cancelled`, or `superseded`)
+- observations/evidence produced by tools the model actually called
+- immutable accepted Plan revisions and validation attempts
+- execution ledger, staged results/outbox, human-decision handoffs, and resource-lock
+  ownership needed for exactly-once side effects
+
+An accepted plan's phase may be stored as execution metadata. It is authoritative
+for that plan's ledger only; it is not proof of current filesystem products and is
+not used to route a new Web session.
+
+After compaction, restart, cancellation, or a later message in the same session, the
+agent may recover its accepted Plan and current ledger step from durable stores. It
+rechecks mutable product facts before it authors another plan or repeats work.
+
+A new Web session creates a fresh attempt. It reads no older attempt as planning
+state and independently invokes investigation tools. Historical attempts remain
+available to operators but are excluded from the default model context.
+
+The only cross-attempt coordination is a narrow target-scoped lock around actual
+data-writing actions. Completed, failed, waiting-user, and planning attempts do not
+block delegation. A genuinely running conflicting action returns a compact busy
+result and performs no ownership transfer or automatic recovery.
 
 ## Legacy Design Removal and Migration
 
@@ -588,22 +817,27 @@ Do not leave deprecated wrappers, compatibility aliases, unreachable branches, o
 commented-out old code. Source files that become empty or wholly obsolete are
 deleted. The implementation plan must include an `rg`-based dead-reference audit.
 
-The SQLite migration preserves durable task identity, request fields, scene mode,
-artifact snapshot, drift, and completed execution evidence. It removes the obsolete
-`data_profile_json` field through a transactional table migration after marking
-affected unfinished tasks `needs_replan`. It does not attempt to convert the old
-profile into decisions. `needs_replan` is added as an explicit durable task and
-execution-ledger status.
+The SQLite migration preserves old task attempts, request fields, completed execution
+evidence, plans, and ledgers for audit. It removes the obsolete `data_profile_json`
+field through a transactional table migration after marking affected unfinished
+plans `needs_replan`. It does not attempt to convert the old profile into decisions.
+
+Remove the invariant and unique index that make `(date, segments)` one global active
+task across Web sessions. New delegation creates a new attempt. Same-session lookup
+uses the verified Web/AgentScope session pair and task id, never a global
+date/segments owner. Current execution authorization remains attempt- and
+plan-bound. A separate target lock protects only running data-writing actions.
 
 Old session-scoped draft files are no longer read. They are not automatically
 deleted from deployment storage because that would be an unrelated destructive data
 operation; operational cleanup can remove them after rollout verification. No
 runtime compatibility code remains for those files.
 
-Existing unfinished tasks retain their task and artifact state but have no active
-new-format plan. On continuation they reconcile current artifacts, refresh
-observations, and ask the model for a new complete phase plan. Existing completed
-tasks remain completed if artifact reconciliation confirms their outputs.
+Existing tasks remain historical attempts. A verified continuation in their same
+Web/AgentScope session may recover the attempt's valid Plan/ledger, subject to fresh
+fact checks before new work. A request from a new Web session never attaches to an
+existing task, regardless of whether that task is completed, failed, waiting, or
+unfinished.
 
 ## Testing Strategy
 
@@ -611,16 +845,19 @@ tasks remain completed if artifact reconciliation confirms their outputs.
 
 - typed observations accept measurements and inventories and do not expose policy
   fields
+- no observation or artifact snapshot is created until the model invokes an
+  investigation tool
 - inspection calls persist complete evidence and return only bounded deltas/refs
 - evidence refs are task- and revision-scoped
 - arbitrary path reads and cross-task refs are rejected
 - field selection, pagination, and hard response limits are enforced
-- required observation completion is independent of resource availability
+- a new Web session cannot read an older attempt's observations as its planning
+  context
 
 ### Plan Contract and Submission Tests
 
 - all nested plan inputs reject extra fields
-- the generated active-phase tool schema contains only active-phase fields
+- each generated phase submission schema contains only that phase's fields
 - duplicate legacy profile fields do not exist
 - valid extract-sync and finish-processing plans succeed in one submission
 - missing fields, bad refs, unsupported variants, invalid arguments, cycles, and
@@ -630,6 +867,8 @@ tasks remain completed if artifact reconciliation confirms their outputs.
 - successful responses do not echo the complete plan
 - full failed candidates and validation details remain available only in submission
   attempt storage
+- choosing `submit_extract_sync_plan` or `submit_finish_processing_plan` records the
+  model-selected phase; no artifact-entry function chooses it first
 
 ### Execution Tests
 
@@ -644,27 +883,60 @@ tasks remain completed if artifact reconciliation confirms their outputs.
 
 ### Integration Tests
 
-- raw-only artifact state selects `extract_sync` before any plan is requested
-- complete selected `sync_data` with missing downstream outputs selects
-  `finish_processing` without rerunning extract-sync
-- complete validated final artifacts reconcile directly to `completed`
-- deleting test artifacts after a completed run causes the next ordinary task entry
-  to select the earliest incomplete phase from the new snapshot
+- the main router delegates a concrete navigation request and does not delegate
+  ordinary conversation or a capability question
+- a failed handoff returns `ok: false, started: false`, remains on the router, and
+  terminates the router turn with an authoritative failure response
+- a successful handoff returns `ok: true, started: true` and creates a task attempt
+  for the current Web/AgentScope session without a second model-authored success
+  message
+- a new Web session for the same date/segments creates a new task attempt rather
+  than attaching to or being blocked by an older completed/waiting/failed attempt
+- a genuinely running data-writing action for the same target returns
+  `navigation_data_busy` without mutating either attempt
+- raw-only investigation facts lead the model to submit an extract-sync plan
+- complete selected `sync_data` plus missing downstream products lead the model to
+  ask for required finish inputs and submit a finish-processing plan without
+  rerunning extract-sync
+- complete validated final-product facts lead the model to report that no processing
+  is needed
+- deleting test products after an earlier completed attempt causes a new-session
+  NavigationDataAgent to investigate again and choose work from current facts
 - complete extract-sync investigation, model-authored plan, and dry-run execution
-- scene-mode update followed by complete finish-processing planning and execution
+- after extract-sync execution, the model verifies outputs, reports completion, asks
+  whether to continue, and does not invoke finish-processing tools before the user
+  answers
+- same-session continuation rechecks relevant products before finish planning
+- new-session continuation creates a fresh attempt, distrusts the user's claim that
+  extract/sync completed until tools verify it, and then plans the appropriate stage
 - model selection of sync reference, localization, gridmap, calibration, steps, and
   variants based on provided facts
 - invalid complete plan followed by a corrected complete resubmission
 - exact regression for the former nested `topic_params` finalize failure, proving no
   partial draft can be created
-- resume from a new web session using durable state only
-- recovery after a deliberately compacted conversation without phase/step loss
+- recovery after a deliberately compacted same-session conversation retains the
+  accepted Plan/current ledger step while requiring fresh mutable facts for new work
 - all active tool lists exclude legacy draft/finalize tool names
+
+### Prompt and Guidance Tests
+
+- the router prompt defines triage and truthful handoff-result handling but contains
+  no navigation artifact investigation or stage-selection policy
+- the NavigationDataAgent prompt states model ownership, investigate-before-decide,
+  strict complete-plan submission, same-session durability, fresh new-session task
+  semantics, and the two-stage user-confirmation boundary
+- `navigation-plan-agent-guidance.md` contains the dependency map, recommended
+  investigation order, common steps for both stages, confirmation points, failure
+  behavior, and the bounded few-shot cases required by this design
+- prompt and guidance have no duplicated long blocks, generated schemas, exhaustive
+  catalogs, draft snapshots, or obsolete cross-session-resume instructions
+- the combined prompt, guidance, exposed tool schemas, and representative compact
+  anchor are measured as part of the context regression budget
 
 ### Context Regression Tests
 
 - record every tool response size and reject budget violations
-- record exposed tool-schema size per phase
+- record exposed tool-schema size per workflow activity
 - simulate representative investigation plus validation retry plus full execution
 - assert no returned payload contains full schemas, full drafts, or accumulated
   validation history
@@ -682,7 +954,9 @@ tasks remain completed if artifact reconciliation confirms their outputs.
 
 1. The model selects all navigation strategies, steps, variants, and business
    parameters from observations, guidance, and capability contracts.
-2. Code records facts and validates decisions but does not fill semantic plan fields.
+2. The NavigationDataAgent decides which investigation tools to call; code records
+   returned facts and validates decisions but does not inspect automatically or fill
+   semantic plan fields.
 3. Each phase uses one complete strict JSON submission; there is no patch/finalize
    loop.
 4. A valid plan succeeds in one call, and an invalid call cannot pollute active
@@ -694,31 +968,44 @@ tasks remain completed if artifact reconciliation confirms their outputs.
 7. Execution uses canonical plan arguments and proceeds one stored step at a time.
 8. The standard representative workflow does not trigger AgentScope compaction and
    stays within the defined headroom budget.
-9. Forced compaction or cross-session resume cannot lose the authoritative phase,
-   plan, or current step.
+9. Forced compaction or same-session restart cannot lose the accepted Plan or current
+   ledger step; new Web sessions deliberately start fresh task attempts.
 10. AgentScope compression and phase-boundary session handling are unchanged.
 11. The old draft/finalize/profile-generation implementation and all dead references
     are deleted in the same optimization change.
-12. Every processing request reconciles current intermediate/final artifacts before
-    choosing a planning phase, so stale task state cannot force the wrong starting
-    point.
+12. Before choosing a stage, every NavigationDataAgent calls investigation tools for
+    current intermediate/final products and does not trust stale task state or user
+    claims as product facts.
+13. After extract/sync, the model asks whether to continue and collects required
+    finish inputs before it authors a finish-processing plan; this behavior comes
+    from concise prompt/domain guidance rather than a code-selected phase transition.
+14. A new Web session for an existing data target creates a new attempt; only an
+    actual conflicting data-writing action may return `navigation_data_busy`.
+15. Router handoff results use explicit `ok`/`started` booleans, and a failed tool
+    result cannot be presented as a successful delegation.
 
 ## Implementation Sequence
 
-1. Add typed observation/evidence models, persistence, context projection, and
-   bounded read-only cognitive tools.
-2. Add normalized phase plan inputs, discriminated step schemas, plan repository,
+1. Redefine `NavigationTask` as a session-bound task attempt, remove global
+   date/segments ownership, add the narrow data-writing resource lock, and make the
+   handoff contract return explicit `ok`/`started` fields.
+2. Add model-invoked typed observation/evidence tools, persistence, context
+   projection, and bounded read-only cognitive tools; remove automatic entry
+   inspection and code-authored phase selection.
+3. Add normalized phase plan inputs, discriminated step schemas, plan repository,
    submission-attempt audit storage, and atomic submission tools.
-3. Adapt existing validators to the new facts/decisions boundary and remove profile
+4. Adapt existing validators to the new facts/decisions boundary and remove profile
    duplication.
-4. Bind the execution ledger and execution tool wrappers to immutable plan
+5. Bind the execution ledger and execution tool wrappers to immutable plan
    revisions.
-5. Resolve the exposed tool set from durable phase state and simplify prompts/state
-   anchors.
-6. Migrate durable task storage, mark ambiguous unfinished work `needs_replan`, and
+6. Resolve tools by task-attempt activity, then rewrite the router prompt,
+   NavigationDataAgent prompt, `navigation-plan-agent-guidance.md`, and compact state
+   anchor according to the non-duplication rules and few-shot requirements.
+7. Migrate durable task storage, mark ambiguous unfinished work `needs_replan`, and
    remove the legacy draft/finalize implementation and tests.
-7. Run focused unit and integration tests, the complete local suite, schema/context
+8. Run focused unit and integration tests, the complete local suite, schema/context
    size audits, and the dead-reference audit.
-8. Deploy the synchronized code to the server, reconcile a real task, and run an
+9. Deploy the synchronized code to the server, run a fresh NavigationDataAgent
+   investigation on real data, and run an
    instrumented real-data acceptance test before considering any additional context
    mechanism changes.
