@@ -24,6 +24,7 @@ from vla_data_juicer_agents.navigation.observation_models import (
 )
 from vla_data_juicer_agents.navigation.observation_store import SqliteNavigationObservationStore
 from vla_data_juicer_agents.navigation.observation_tools import build_navigation_observation_tools
+from vla_data_juicer_agents.navigation.planning_context import NavigationTaskContext
 from vla_data_juicer_agents.navigation.task_state import (
     NavigationArtifactSnapshot,
     NavigationTask,
@@ -499,6 +500,41 @@ def test_real_context_tool_globally_bounds_all_observation_kinds_and_evidence(tm
     assert context["fact_summary"]["localization_sources"]["conversion_available"] is True
     assert context["evidence_catalog"]
     assert context["evidence_next_cursor"] is not None
+
+
+def test_real_context_tool_bounds_revision_zero_identity_after_json_escaping(tmp_path):
+    adversarial = 'quoted-"-backslash-\\-newline-\n-' + "\x00" * 160
+    task = NavigationTask(
+        task_id="nav-observe-1",
+        request=adversarial,
+        target=adversarial,
+        date="20270605",
+        segments=[f"segment-{index}-{adversarial}" for index in range(5)],
+    )
+    tools, observation_store, _ = _tools(tmp_path, task=task)
+
+    context = _invoke_tool(tools["get_navigation_task_context_tool"], {})
+    repeated = _invoke_tool(tools["get_navigation_task_context_tool"], {})
+    serialized = json.dumps(context, ensure_ascii=False, separators=(",", ":"))
+
+    assert observation_store.latest(task.task_id) is None
+    assert context == repeated
+    assert set(context) == set(NavigationTaskContext.model_fields)
+    assert context["observation_revision"] == 0
+    assert context["observed_kinds"] == []
+    assert context["fact_summary"] == {}
+    assert context["evidence_catalog"] == []
+    assert context["evidence_next_cursor"] is None
+    assert context["segments"] is not None
+    assert len(context["segments"]) == 5
+    assert all(context[field] for field in ("request", "target"))
+    assert all(context["segments"])
+    assert all(
+        character.isprintable()
+        for value in [context["request"], context["target"], *context["segments"]]
+        for character in value
+    )
+    assert len(serialized) <= 5_500
 
 
 @pytest.mark.parametrize(

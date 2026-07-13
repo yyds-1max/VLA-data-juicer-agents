@@ -22,12 +22,12 @@ from vla_data_juicer_agents.navigation.observation_models import (
 )
 from vla_data_juicer_agents.navigation.observation_projection import (
     compact_observation_payload,
-    preview_string,
 )
 from vla_data_juicer_agents.navigation.task_state import NavigationTask
 
 
 PLANNING_CONTEXT_MAX_CHARS = 5_500
+PLANNING_IDENTITY_MAX_CHARS = 1_600
 NavigationStageId = Literal["extract_sync", "finish_processing"]
 AVAILABLE_STAGE_IDS: list[NavigationStageId] = ["extract_sync", "finish_processing"]
 
@@ -108,16 +108,13 @@ def build_navigation_task_context(
         if descriptor.observation_revision <= observation_revision
     ]
     payloads = list(observation.payloads) if observation is not None else []
+    request, target, segments = _bounded_task_identity(task)
     context = NavigationTaskContext(
         task_id=task.task_id,
-        request=preview_string(task.request),
-        target=preview_string(task.target),
+        request=request,
+        target=target,
         date=task.date,
-        segments=(
-            [preview_string(segment) for segment in task.segments[:5]]
-            if task.segments is not None
-            else None
-        ),
+        segments=segments,
         scene_mode=task.scene_mode,
         planning_context_revision=compute_planning_context_revision(
             task=task,
@@ -152,6 +149,47 @@ def build_navigation_task_context(
         prefix = candidate_prefix
         context = candidate
     return _enrich_fact_summary(context, payloads)
+
+
+def _bounded_task_identity(
+    task: NavigationTask,
+) -> tuple[str, str, list[str] | None]:
+    segment_sources = list(task.segments[:5]) if task.segments is not None else None
+    sources = [task.request, task.target, *(segment_sources or [])]
+    values = ["" for _ in sources]
+
+    for preview_chars in (40, 80, 160):
+        for index, source in enumerate(sources):
+            candidate_values = list(values)
+            candidate_values[index] = _sanitized_identity_preview(
+                source,
+                max_chars=preview_chars,
+            )
+            candidate = {
+                "request": candidate_values[0],
+                "target": candidate_values[1],
+                "segments": (
+                    candidate_values[2:] if segment_sources is not None else None
+                ),
+            }
+            if serialized_chars(candidate) <= PLANNING_IDENTITY_MAX_CHARS:
+                values = candidate_values
+
+    return (
+        values[0],
+        values[1],
+        values[2:] if segment_sources is not None else None,
+    )
+
+
+def _sanitized_identity_preview(value: str, *, max_chars: int) -> str:
+    preview = "".join(
+        character if character.isprintable() else " "
+        for character in value[:max_chars]
+    )
+    if len(value) <= max_chars:
+        return preview
+    return f"{preview[: max_chars - 1]}…"
 
 
 def _minimal_fact_summary(
