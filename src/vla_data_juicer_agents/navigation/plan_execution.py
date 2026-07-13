@@ -43,6 +43,7 @@ from vla_data_juicer_agents.navigation.plan_store import (
     MAX_RESULT_OUTBOX_CHARS,
     NavigationExecutionSnapshot,
     SqliteNavigationPlanRepository,
+    StepClaimOutcome,
 )
 from vla_data_juicer_agents.navigation.task_state import NavigationTask
 from vla_data_juicer_agents.navigation.task_store import SqliteNavigationTaskStore
@@ -213,6 +214,105 @@ def resolve_step_arguments(
     if action == "validate_navigation_outputs":
         return {"date": task.date, **common}
     raise ValueError(f"unsupported navigation plan action: {action}")
+
+
+def verify_plan_step_preconditions(
+    *,
+    task: NavigationTask,
+    plan: NavigationPlanRecord,
+    step: Any,
+    settings: NavigationSettings,
+) -> dict[str, Any] | None:
+    """Check only concrete inputs required by canonical arguments for one step."""
+    arguments = resolve_step_arguments(
+        task=task,
+        plan=plan.plan,
+        step=step,
+        settings=settings,
+    )
+    missing: list[Path] = []
+
+    def require(path: Path) -> None:
+        if not path.exists():
+            missing.append(path)
+
+    def require_segments(root: Path, *, suffix: tuple[str, ...] = ()) -> None:
+        if task.segments is None:
+            require(root)
+            return
+        for segment in task.segments:
+            require(root.joinpath(segment, *suffix))
+
+    action = step.action
+    if action == "prepare_raw_data":
+        require_segments(settings.raw_data_root / task.date)
+    elif action == "extract_and_sync_navigation_data":
+        raw_temp = settings.raw_data_root / f"{task.date}_temp"
+        input_root = (
+            raw_temp
+            if raw_temp.exists() or not task.dry_run
+            else settings.raw_data_root / task.date
+        )
+        require_segments(input_root)
+    elif action in {_EXTERNAL_ACTION, "assemble_finish_temp"}:
+        require(Path(arguments["selected_sensor_source"]))
+        if action == "assemble_finish_temp":
+            require_segments(
+                settings.clip_data_root / task.date,
+                suffix=("sync_data",),
+            )
+    elif action in {
+        "run_noobscene_preprocessing",
+        "run_initial_annotation_gui",
+        "run_tracking",
+        "prepare_gridmap_for_projection",
+        "run_projection_and_trajectory",
+    }:
+        if not task.dry_run:
+            require(Path(arguments["finish_temp_path"]))
+
+    if not missing:
+        return None
+    return {
+        "action": action,
+        "canonical_argument_keys": sorted(arguments),
+        "missing_inputs": [str(path)[:800] for path in missing[:20]],
+        "missing_input_count": len(missing),
+    }
+
+
+def _record_changed_preconditions(
+    *,
+    task: NavigationTask,
+    plan: NavigationPlanRecord,
+    step: Any,
+    failure: dict[str, Any],
+    plan_store: SqliteNavigationPlanRepository,
+    evidence_store: FileNavigationEvidenceStore,
+    expected_web_session_id: str | None,
+    expected_agentscope_session_id: str | None,
+) -> dict[str, Any]:
+    descriptor = evidence_store.write(
+        task.task_id,
+        plan.observation_revision,
+        "execution_precondition",
+        step.action,
+        failure,
+        f"Input precondition changed before {step.step_id}",
+    )
+    plan_store.mark_needs_replan(
+        plan.plan_id,
+        "input_precondition_changed",
+        expected_web_session_id=expected_web_session_id,
+        expected_agentscope_session_id=expected_agentscope_session_id,
+    )
+    return _compact_error(
+        "input_precondition_changed",
+        "A concrete input required by the accepted plan changed before execution.",
+        result_ref=descriptor.ref,
+        missing_input_count=failure["missing_input_count"],
+        next_action="submit_complete_plan",
+    )
 
 
 def _plan_step(plan: NavigationPlanRecord, step_id: str) -> Any | None:
@@ -526,13 +626,37 @@ def _invoke_plan_step(
                 next_action="submit_complete_plan",
             )
         return _terminal_error(plan_store, plan.plan_id)
-    if not plan_store.claim_step(
+    precondition_failure = verify_plan_step_preconditions(
+        task=task,
+        plan=plan,
+        step=step,
+        settings=settings,
+    )
+    if precondition_failure is not None:
+        return _record_changed_preconditions(
+            task=task,
+            plan=plan,
+            step=step,
+            failure=precondition_failure,
+            plan_store=plan_store,
+            evidence_store=evidence_store,
+            expected_web_session_id=expected_web_session_id,
+            expected_agentscope_session_id=expected_agentscope_session_id,
+        )
+    claim_outcome = plan_store.claim_step(
         plan.plan_id,
         step.step_id,
         step.action,
         expected_web_session_id=expected_web_session_id,
         expected_agentscope_session_id=expected_agentscope_session_id,
-    ):
+    )
+    if claim_outcome is StepClaimOutcome.NAVIGATION_DATA_BUSY:
+        return _compact_error(
+            "navigation_data_busy",
+            "An overlapping navigation data write is already running.",
+            retry="wait_and_reinspect",
+        )
+    if claim_outcome is not StepClaimOutcome.CLAIMED:
         return _terminal_error(plan_store, plan.plan_id)
 
     try:
@@ -651,13 +775,14 @@ def prepare_plan_human_decision(
     *,
     task: NavigationTask,
     plan_store: SqliteNavigationPlanRepository,
+    evidence_store: FileNavigationEvidenceStore,
     settings: NavigationSettings,
     plan_id: str,
     step_id: str,
     expected_web_session_id: str | None = None,
     expected_agentscope_session_id: str | None = None,
 ) -> dict[str, Any] | None:
-    _task, plan, step, snapshot, gate_error = _gate_step(
+    durable_task, plan, step, snapshot, gate_error = _gate_step(
         bound_task=task,
         requested_plan_id=plan_id,
         requested_step_id=step_id,
@@ -669,11 +794,28 @@ def prepare_plan_human_decision(
     )
     if gate_error is not None:
         return gate_error
-    assert plan is not None and step is not None
+    assert durable_task is not None and plan is not None and step is not None
     assert snapshot is not None
     current = snapshot.current
     if current is not None and current["step"]["status"] == "waiting_user":
         return None
+    precondition_failure = verify_plan_step_preconditions(
+        task=durable_task,
+        plan=plan,
+        step=step,
+        settings=settings,
+    )
+    if precondition_failure is not None:
+        return _record_changed_preconditions(
+            task=durable_task,
+            plan=plan,
+            step=step,
+            failure=precondition_failure,
+            plan_store=plan_store,
+            evidence_store=evidence_store,
+            expected_web_session_id=expected_web_session_id,
+            expected_agentscope_session_id=expected_agentscope_session_id,
+        )
     if not plan_store.mark_waiting_user(
         plan.plan_id,
         step.step_id,
@@ -851,6 +993,7 @@ def build_plan_bound_execution_tools(
                     gate=lambda tool_input: prepare_plan_human_decision(
                         task=task,
                         plan_store=plan_store,
+                        evidence_store=evidence_store,
                         settings=settings,
                         plan_id=tool_input.get("plan_id", ""),
                         step_id=tool_input.get("step_id", ""),

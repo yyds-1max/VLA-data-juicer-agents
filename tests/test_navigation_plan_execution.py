@@ -26,8 +26,11 @@ from vla_data_juicer_agents.navigation.plan_models import (
     ExtractSyncPlanInput,
     FinishProcessingPlanInput,
 )
-from vla_data_juicer_agents.navigation.plan_store import SqliteNavigationPlanRepository
-from vla_data_juicer_agents.navigation.plan_store import ActivePlanExecutionConflict
+from vla_data_juicer_agents.navigation.plan_store import (
+    ActivePlanExecutionConflict,
+    SqliteNavigationPlanRepository,
+    StepClaimOutcome,
+)
 from vla_data_juicer_agents.navigation.task_state import NavigationTask
 from vla_data_juicer_agents.navigation.task_store import SqliteNavigationTaskStore
 from vla_data_juicer_agents.runtime.agentscope_runtime import (
@@ -416,10 +419,12 @@ def test_execution_gate_rejects_unmet_dependency_without_invoking(monkeypatch, t
     assert invoked == []
 
 
-def test_execution_does_not_reconcile_artifacts_or_invalidate_plan_before_invocation(
+def test_changed_input_precondition_records_evidence_without_artifact_reconciliation(
     monkeypatch,
     tmp_path,
 ):
+    from vla_data_juicer_agents.navigation import artifact_inspection, task_reconciliation
+
     services = build_services(tmp_path)
     invoked = []
     monkeypatch.setattr(
@@ -427,6 +432,28 @@ def test_execution_does_not_reconcile_artifacts_or_invalidate_plan_before_invoca
         "extract_and_sync_navigation_data",
         lambda **kwargs: invoked.append(kwargs)
         or ok_result("extract_and_sync_navigation_data"),
+    )
+    monkeypatch.setattr(
+        artifact_inspection,
+        "build_navigation_artifact_snapshot",
+        lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("artifact snapshot called")),
+    )
+    monkeypatch.setattr(
+        plan_execution,
+        "build_navigation_artifact_snapshot",
+        artifact_inspection.build_navigation_artifact_snapshot,
+        raising=False,
+    )
+    monkeypatch.setattr(
+        task_reconciliation,
+        "reconcile_navigation_task",
+        lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("task reconcile called")),
+    )
+    monkeypatch.setattr(
+        plan_execution,
+        "reconcile_navigation_task",
+        task_reconciliation.reconcile_navigation_task,
+        raising=False,
     )
     raw_root = services.settings.raw_data_root / services.task.date
     for child in raw_root.iterdir():
@@ -439,10 +466,93 @@ def test_execution_does_not_reconcile_artifacts_or_invalidate_plan_before_invoca
         step_id="sync",
     )
 
-    assert result["ok"] is True
-    assert len(invoked) == 1
-    assert services.plan_store.get(services.plan.plan_id).status == "completed"
-    assert services.task_store.get_task(services.task.task_id).phase.value == "extract_sync"
+    assert result["ok"] is False
+    assert result["error_type"] == "input_precondition_changed"
+    assert result["next_action"] == "submit_complete_plan"
+    assert result["result_ref"]
+    assert len(json.dumps(result, ensure_ascii=False)) <= 4000
+    assert invoked == []
+    assert services.plan_store.get(services.plan.plan_id).status == "invalidated"
+    assert services.plan_store.get_current_step(services.plan.plan_id)["step"]["status"] == "needs_replan"
+    evidence = services.evidence_store.read(services.task.task_id, result["result_ref"])
+    assert evidence["data"]["missing_inputs"]
+
+
+def test_plan_bound_writer_returns_compact_busy_without_invocation(monkeypatch, tmp_path):
+    settings = NavigationSettings(
+        vladatasets_root=tmp_path / "datasets",
+        processing_root=tmp_path / "processing",
+    )
+    date, segment = "20260710", "segment-a"
+    (settings.raw_data_root / date / segment).mkdir(parents=True)
+    db_path = tmp_path / "navigation.sqlite"
+    task_store = SqliteNavigationTaskStore(db_path)
+    plan_store = SqliteNavigationPlanRepository(db_path)
+    tasks = []
+    plans = []
+    for owner in ("web-a", "web-b"):
+        agent = f"{owner}-agent"
+        task = task_store.create_task_attempt(
+            request="process navigation data",
+            target=date,
+            date=date,
+            segments=[segment],
+            scene_mode=None,
+            dry_run=False,
+            web_session_id=owner,
+            agentscope_session_id=agent,
+        ).task
+        plan = plan_store.activate(
+            task,
+            "extract_sync",
+            1,
+            extract_plan(two_steps=True),
+            expected_web_session_id=owner,
+            expected_agentscope_session_id=agent,
+        )
+        tasks.append((task, owner, agent))
+        plans.append(plan)
+    assert plan_store.claim_step(
+        plans[0].plan_id,
+        "prepare",
+        "prepare_raw_data",
+        expected_web_session_id="web-a",
+        expected_agentscope_session_id="web-a-agent",
+    ) is StepClaimOutcome.CLAIMED
+    invoked = []
+    monkeypatch.setattr(
+        plan_execution,
+        "prepare_raw_data",
+        lambda **kwargs: invoked.append(kwargs) or ok_result("prepare_raw_data"),
+    )
+    task, owner, agent = tasks[1]
+    tools = {
+        tool.name: tool
+        for tool in plan_execution.build_plan_bound_execution_tools(
+            task=task,
+            plan_store=plan_store,
+            evidence_store=FileNavigationEvidenceStore(tmp_path / "evidence"),
+            settings=settings,
+            dry_run=False,
+            cancellation=None,
+            web_session_id=owner,
+            agentscope_session_id=agent,
+        )
+    }
+
+    result = call_tool(
+        tools["prepare_raw_data_tool"],
+        plan_id=plans[1].plan_id,
+        step_id="prepare",
+    )
+
+    assert result == {
+        "ok": False,
+        "error_type": "navigation_data_busy",
+        "message": "An overlapping navigation data write is already running.",
+        "retry": "wait_and_reinspect",
+    }
+    assert invoked == []
 
 
 def test_finish_plan_execution_permission_does_not_infer_phase_from_artifacts(tmp_path):
@@ -504,6 +614,70 @@ def test_finish_plan_execution_permission_does_not_infer_phase_from_artifacts(tm
     assert permission.behavior.value == "allow"
     assert plan_store.get(plan.plan_id).status == "active"
     assert task_store.get_task(task.task_id).status.value == "pending"
+
+
+def test_human_decision_permission_fails_closed_when_sensor_input_disappears(tmp_path):
+    settings = NavigationSettings(
+        vladatasets_root=tmp_path / "datasets",
+        processing_root=tmp_path / "processing",
+    )
+    source = "NoobScenes/params/observed/sensors"
+    source_path = settings.processing_root / source
+    source_path.mkdir(parents=True)
+    date, segment = "20260710", "segment-a"
+    (settings.raw_data_root / date / segment).mkdir(parents=True)
+    db_path = tmp_path / "navigation.sqlite"
+    task_store = SqliteNavigationTaskStore(db_path)
+    task = task_store.create_or_update_task(
+        date=date,
+        segments=[segment],
+        scene_mode="out",
+        dry_run=True,
+    )
+    task = task_store.update_task(task.task_id, phase="finish_processing", status="pending")
+    observation_store = SqliteNavigationObservationStore(db_path)
+    evidence_store = FileNavigationEvidenceStore(tmp_path / "evidence")
+    observation = observation_store.append(
+        task.task_id,
+        "calibration_inventory",
+        [CalibrationInventoryObservation(sensor_sources=[source])],
+        [],
+        evidence_store,
+        expected_web_session_id=None,
+        expected_agentscope_session_id=None,
+    )
+    plan_store = SqliteNavigationPlanRepository(db_path)
+    plan = plan_store.activate(
+        task,
+        "finish_processing",
+        observation.revision,
+        finish_plan(source),
+    )
+    tool = next(
+        candidate
+        for candidate in plan_execution.build_plan_bound_execution_tools(
+            task=task,
+            plan_store=plan_store,
+            evidence_store=evidence_store,
+            settings=settings,
+            dry_run=True,
+            cancellation=None,
+        )
+        if candidate.name == "request_human_decision"
+    )
+    source_path.rmdir()
+
+    permission = asyncio.run(
+        tool.check_permissions({"plan_id": plan.plan_id, "step_id": "confirm"}, None)
+    )
+
+    assert permission.behavior.value == "deny"
+    assert "concrete input" in permission.message
+    assert plan_store.get(plan.plan_id).status == "invalidated"
+    assert plan_store.get_current_step(plan.plan_id)["step"]["status"] == "needs_replan"
+    evidence_files = list((evidence_store.root / task.task_id / str(observation.revision)).glob("*.json"))
+    assert len(evidence_files) == 1
+    assert json.loads(evidence_files[0].read_text(encoding="utf-8"))["missing_inputs"]
 
 
 def test_stale_agentscope_session_cannot_claim_plan_bound_step(monkeypatch, tmp_path):
@@ -619,7 +793,7 @@ def test_superseded_plan_cannot_claim_pending_step(tmp_path):
         "extract_and_sync_navigation_data",
     )
 
-    assert claimed is False
+    assert claimed is StepClaimOutcome.NOT_CLAIMABLE
     assert services.plan_store.get_current_step(old_plan.plan_id)["step"]["status"] == "pending"
 
 

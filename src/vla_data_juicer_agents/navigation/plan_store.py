@@ -6,6 +6,7 @@ import re
 import sqlite3
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
+from enum import Enum
 from pathlib import Path
 from typing import Any, Literal, cast
 from uuid import uuid4
@@ -14,6 +15,9 @@ from pydantic import BaseModel, ConfigDict
 
 from vla_data_juicer_agents.navigation.aggregate_revision import (
     ensure_navigation_aggregate_revision_triggers,
+)
+from vla_data_juicer_agents.navigation.catalog import (
+    list_navigation_tool_capabilities,
 )
 
 from vla_data_juicer_agents.navigation.plan_models import (
@@ -27,6 +31,8 @@ from vla_data_juicer_agents.navigation.task_state import NavigationTask, utc_now
 from vla_data_juicer_agents.navigation.task_store import (
     SqliteNavigationTaskStore,
     authorize_navigation_task_write,
+    navigation_targets_overlap,
+    normalize_segments,
 )
 from vla_data_juicer_agents.navigation.planning_context import (
     compute_planning_context_revision,
@@ -63,6 +69,15 @@ class _StrictReadModel(BaseModel):
 
 class ActivePlanExecutionConflict(RuntimeError):
     """Raised when a replacement would orphan in-flight active-plan work."""
+
+
+class StepClaimOutcome(str, Enum):
+    CLAIMED = "claimed"
+    NOT_CLAIMABLE = "not_claimable"
+    NAVIGATION_DATA_BUSY = "navigation_data_busy"
+
+    def __bool__(self) -> bool:
+        return self is StepClaimOutcome.CLAIMED
 
 
 class StagedStepResult(_StrictReadModel):
@@ -976,15 +991,89 @@ class SqliteNavigationPlanRepository:
         *,
         expected_web_session_id: str | None = None,
         expected_agentscope_session_id: str | None = None,
-    ) -> bool:
+    ) -> StepClaimOutcome:
         """Atomically claim one pending ledger step for exactly-once invocation."""
-        with self._connect() as connection:
+        connection = self._connect()
+        try:
+            connection.execute("BEGIN IMMEDIATE")
             self._authorize_plan_write(
                 connection,
                 plan_id,
                 expected_web_session_id=expected_web_session_id,
                 expected_agentscope_session_id=expected_agentscope_session_id,
             )
+            candidate = connection.execute(
+                """
+                SELECT steps.status, tasks.dry_run, tasks.date, tasks.segments_json,
+                       plans.status AS plan_status
+                FROM navigation_task_steps AS steps
+                JOIN navigation_plans AS plans ON plans.plan_id = steps.plan_id
+                JOIN navigation_tasks AS tasks ON tasks.task_id = steps.task_id
+                JOIN json_each(plans.plan_json, '$.steps') AS plan_step
+                  ON json_extract(plan_step.value, '$.step_id') = steps.step_id
+                 AND json_extract(plan_step.value, '$.action') = steps.tool_name
+                WHERE steps.plan_id = ? AND steps.step_id = ? AND steps.tool_name = ?
+                """,
+                (plan_id, step_id, action),
+            ).fetchone()
+            if (
+                candidate is None
+                or candidate["status"] != "pending"
+                or candidate["plan_status"] != "active"
+            ):
+                connection.rollback()
+                return StepClaimOutcome.NOT_CLAIMABLE
+
+            locking_actions = {
+                capability.tool_name
+                for capability in list_navigation_tool_capabilities()
+                if capability.locks_navigation_target
+            }
+            if not bool(candidate["dry_run"]) and action in locking_actions:
+                placeholders = ", ".join("?" for _ in locking_actions)
+                running_rows = connection.execute(
+                    f"""
+                    SELECT tasks.date, tasks.segments_json
+                    FROM navigation_task_steps AS steps
+                    JOIN navigation_plans AS plans ON plans.plan_id = steps.plan_id
+                    JOIN navigation_tasks AS tasks ON tasks.task_id = steps.task_id
+                    JOIN json_each(plans.plan_json, '$.steps') AS plan_step
+                      ON json_extract(plan_step.value, '$.step_id') = steps.step_id
+                     AND json_extract(plan_step.value, '$.action') = steps.tool_name
+                    WHERE steps.status = 'running'
+                      AND plans.status = 'active'
+                      AND tasks.dry_run = 0
+                      AND tasks.date = ?
+                      AND steps.tool_name IN ({placeholders})
+                      AND NOT (steps.plan_id = ? AND steps.step_id = ?)
+                    """,
+                    (
+                        candidate["date"],
+                        *sorted(locking_actions),
+                        plan_id,
+                        step_id,
+                    ),
+                ).fetchall()
+                candidate_segments = normalize_segments(
+                    json.loads(candidate["segments_json"])
+                    if candidate["segments_json"] is not None
+                    else None
+                )
+                for running in running_rows:
+                    running_segments = normalize_segments(
+                        json.loads(running["segments_json"])
+                        if running["segments_json"] is not None
+                        else None
+                    )
+                    if navigation_targets_overlap(
+                        left_date=candidate["date"],
+                        left_segments=candidate_segments,
+                        right_date=running["date"],
+                        right_segments=running_segments,
+                    ):
+                        connection.rollback()
+                        return StepClaimOutcome.NAVIGATION_DATA_BUSY
+
             cursor = connection.execute(
                 """
                 UPDATE navigation_task_steps
@@ -1009,7 +1098,16 @@ class SqliteNavigationPlanRepository:
                     expected_agentscope_session_id,
                 ),
             )
-        return cursor.rowcount == 1
+            if cursor.rowcount != 1:
+                connection.rollback()
+                return StepClaimOutcome.NOT_CLAIMABLE
+            connection.commit()
+            return StepClaimOutcome.CLAIMED
+        except Exception:
+            connection.rollback()
+            raise
+        finally:
+            connection.close()
 
     def mark_waiting_user(
         self,
@@ -1286,6 +1384,35 @@ class SqliteNavigationPlanRepository:
                         """,
                         (utc_now(), plan_id),
                     )
+                    plan_row = connection.execute(
+                        "SELECT phase, task_id FROM navigation_plans WHERE plan_id = ?",
+                        (plan_id,),
+                    ).fetchone()
+                    if plan_row is not None:
+                        terminal_validation = connection.execute(
+                            """SELECT 1
+                               FROM navigation_task_steps
+                               WHERE plan_id = ?
+                                 AND tool_name = 'validate_navigation_outputs'
+                                 AND status = 'completed'
+                                 AND sequence = (
+                                     SELECT MAX(sequence) FROM navigation_task_steps
+                                     WHERE plan_id = ?
+                                 )""",
+                            (plan_id, plan_id),
+                        ).fetchone()
+                        attempt_status = "active"
+                        if (
+                            plan_row["phase"] == "finish_processing"
+                            and terminal_validation is not None
+                        ):
+                            attempt_status = "completed"
+                        connection.execute(
+                            """UPDATE navigation_tasks
+                               SET status = ?, updated_at = ?
+                               WHERE task_id = ?""",
+                            (attempt_status, utc_now(), plan_row["task_id"]),
+                        )
             else:
                 connection.execute(
                     """UPDATE navigation_tasks

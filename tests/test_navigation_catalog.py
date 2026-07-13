@@ -40,12 +40,19 @@ def test_catalog_marks_effects_and_plan_agent_visibility():
 
 def test_catalog_marks_every_data_mutating_processing_action_as_target_locking():
     capabilities = _capability_by_stage()
+    mutating_executable_actions = {
+        name
+        for name, capability in capabilities.items()
+        if capability.executor_agent_allowed
+        and capability.effects in {"write", "execute", "external"}
+    }
     locking_actions = {
         name
         for name, capability in capabilities.items()
         if capability.locks_navigation_target
     }
 
+    assert locking_actions == mutating_executable_actions
     assert locking_actions == {
         "prepare_raw_data",
         "extract_and_sync_navigation_data",
@@ -56,6 +63,18 @@ def test_catalog_marks_every_data_mutating_processing_action_as_target_locking()
         "prepare_gridmap_for_projection",
         "run_projection_and_trajectory",
     }
+
+
+def test_catalog_never_locks_read_validation_or_human_decision_actions():
+    capabilities = _capability_by_stage()
+
+    assert all(
+        not capability.locks_navigation_target
+        for capability in capabilities.values()
+        if capability.effects == "read"
+    )
+    assert capabilities["confirm_navigation_calibration_params"].locks_navigation_target is False
+    assert capabilities["validate_navigation_outputs"].locks_navigation_target is False
 
 
 def test_catalog_exposes_calibration_confirmation_capability():

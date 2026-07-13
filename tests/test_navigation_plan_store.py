@@ -1,7 +1,9 @@
 import json
 import sqlite3
+from concurrent.futures import ThreadPoolExecutor
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from threading import Barrier
 
 import pytest
 from pydantic import ValidationError
@@ -11,8 +13,11 @@ from vla_data_juicer_agents.navigation.plan_models import (
     FinishProcessingPlanInput,
     PlanSubmissionAttempt,
 )
-from vla_data_juicer_agents.navigation.plan_store import SqliteNavigationPlanRepository
-from vla_data_juicer_agents.navigation.plan_store import ActivePlanExecutionConflict
+from vla_data_juicer_agents.navigation.plan_store import (
+    ActivePlanExecutionConflict,
+    SqliteNavigationPlanRepository,
+    StepClaimOutcome,
+)
 from vla_data_juicer_agents.navigation.observation_store import (
     SqliteNavigationObservationStore,
 )
@@ -127,6 +132,458 @@ def stores_with_task(tmp_path: Path):
         scene_mode=None,
     )
     return SqliteNavigationPlanRepository(db_path), task
+
+
+def attempt_with_extract_plan(
+    repo: SqliteNavigationPlanRepository,
+    *,
+    owner: str,
+    date: str = "20270623",
+    segments: list[str] | None = None,
+    dry_run: bool = False,
+):
+    agentscope_session_id = f"{owner}-agent"
+    task = SqliteNavigationTaskStore(repo.db_path).create_task_attempt(
+        request="process navigation data",
+        target=date,
+        date=date,
+        segments=segments,
+        scene_mode=None,
+        dry_run=dry_run,
+        web_session_id=owner,
+        agentscope_session_id=agentscope_session_id,
+    ).task
+    plan = repo.activate(
+        task,
+        "extract_sync",
+        1,
+        valid_extract_plan(),
+        expected_web_session_id=owner,
+        expected_agentscope_session_id=agentscope_session_id,
+    )
+    return task, plan, agentscope_session_id
+
+
+def claim_prepare(repo, plan, *, owner: str, agentscope_session_id: str):
+    return repo.claim_step(
+        plan.plan_id,
+        "prepare",
+        "prepare_raw_data",
+        expected_web_session_id=owner,
+        expected_agentscope_session_id=agentscope_session_id,
+    )
+
+
+def finalize_claimed_step(
+    repo: SqliteNavigationPlanRepository,
+    plan,
+    *,
+    step_id: str,
+    action: str,
+    owner: str,
+    agentscope_session_id: str,
+    target_status: str,
+):
+    assert repo.claim_step(
+        plan.plan_id,
+        step_id,
+        action,
+        expected_web_session_id=owner,
+        expected_agentscope_session_id=agentscope_session_id,
+    ) is StepClaimOutcome.CLAIMED
+    staged = repo.stage_step_result(
+        plan.plan_id,
+        step_id,
+        target_status=target_status,
+        full_result={"ok": target_status == "completed", "message": target_status},
+        result_summary={"ok": target_status == "completed", "message": target_status},
+        expected_web_session_id=owner,
+        expected_agentscope_session_id=agentscope_session_id,
+    )
+    assert staged.result_ref is not None
+    assert repo.attach_staged_result_evidence(
+        plan.plan_id,
+        step_id,
+        staged.result_ref,
+        expected_web_session_id=owner,
+        expected_agentscope_session_id=agentscope_session_id,
+    )
+    assert repo.finalize_staged_step(
+        plan.plan_id,
+        step_id,
+        expected_web_session_id=owner,
+        expected_agentscope_session_id=agentscope_session_id,
+    )
+
+
+@pytest.mark.parametrize(
+    ("left_date", "left_segments", "right_date", "right_segments", "expected"),
+    [
+        ("20270623", None, "20270623", ["segment-a"], StepClaimOutcome.NAVIGATION_DATA_BUSY),
+        ("20270623", ["segment-a"], "20270623", None, StepClaimOutcome.NAVIGATION_DATA_BUSY),
+        (
+            "20270623",
+            ["segment-a", "segment-b"],
+            "20270623",
+            ["segment-b", "segment-c"],
+            StepClaimOutcome.NAVIGATION_DATA_BUSY,
+        ),
+        ("20270623", ["segment-a"], "20270623", ["segment-b"], StepClaimOutcome.CLAIMED),
+        ("20270623", None, "20270624", None, StepClaimOutcome.CLAIMED),
+    ],
+)
+def test_claim_step_locks_only_overlapping_navigation_targets(
+    tmp_path: Path,
+    left_date: str,
+    left_segments: list[str] | None,
+    right_date: str,
+    right_segments: list[str] | None,
+    expected: StepClaimOutcome,
+):
+    repo = SqliteNavigationPlanRepository(tmp_path / "navigation.sqlite")
+    _left_task, left_plan, left_agent = attempt_with_extract_plan(
+        repo, owner="web-left", date=left_date, segments=left_segments
+    )
+    _right_task, right_plan, right_agent = attempt_with_extract_plan(
+        repo, owner="web-right", date=right_date, segments=right_segments
+    )
+
+    assert claim_prepare(
+        repo, left_plan, owner="web-left", agentscope_session_id=left_agent
+    ) is StepClaimOutcome.CLAIMED
+    assert claim_prepare(
+        repo, right_plan, owner="web-right", agentscope_session_id=right_agent
+    ) is expected
+
+
+def test_dry_run_claims_neither_acquire_nor_conflict_with_target_lock(tmp_path: Path):
+    repo = SqliteNavigationPlanRepository(tmp_path / "navigation.sqlite")
+    _dry_task, dry_plan, dry_agent = attempt_with_extract_plan(
+        repo,
+        owner="web-dry",
+        segments=["segment-a"],
+        dry_run=True,
+    )
+    _real_task, real_plan, real_agent = attempt_with_extract_plan(
+        repo,
+        owner="web-real",
+        segments=["segment-a"],
+    )
+
+    assert claim_prepare(
+        repo, dry_plan, owner="web-dry", agentscope_session_id=dry_agent
+    ) is StepClaimOutcome.CLAIMED
+    assert claim_prepare(
+        repo, real_plan, owner="web-real", agentscope_session_id=real_agent
+    ) is StepClaimOutcome.CLAIMED
+
+    second_repo = SqliteNavigationPlanRepository(tmp_path / "second.sqlite")
+    _real_task, first_real, first_real_agent = attempt_with_extract_plan(
+        second_repo,
+        owner="web-real-first",
+        segments=["segment-a"],
+    )
+    _dry_task, second_dry, second_dry_agent = attempt_with_extract_plan(
+        second_repo,
+        owner="web-dry-second",
+        segments=["segment-a"],
+        dry_run=True,
+    )
+    assert claim_prepare(
+        second_repo,
+        first_real,
+        owner="web-real-first",
+        agentscope_session_id=first_real_agent,
+    ) is StepClaimOutcome.CLAIMED
+    assert claim_prepare(
+        second_repo,
+        second_dry,
+        owner="web-dry-second",
+        agentscope_session_id=second_dry_agent,
+    ) is StepClaimOutcome.CLAIMED
+
+
+def test_running_non_locking_validation_step_does_not_block_writer(tmp_path: Path):
+    repo = SqliteNavigationPlanRepository(tmp_path / "navigation.sqlite")
+    task_store = SqliteNavigationTaskStore(repo.db_path)
+    task = task_store.create_task_attempt(
+        request="validate navigation data",
+        target="20270623",
+        date="20270623",
+        segments=["segment-a"],
+        scene_mode="out",
+        dry_run=False,
+        web_session_id="web-validator",
+        agentscope_session_id="web-validator-agent",
+    ).task
+    payload = valid_finish_plan().model_dump(mode="json")
+    payload["steps"] = [
+        {
+            "step_id": "validate",
+            "action": "validate_navigation_outputs",
+            "variant": "expect_gridmap",
+            "arguments": {},
+            "depends_on": [],
+            "failure_policy": "stop",
+            "decision_refs": ["gridmap"],
+        }
+    ]
+    validation_plan = repo.activate(
+        task,
+        "finish_processing",
+        1,
+        FinishProcessingPlanInput.model_validate(payload),
+        expected_web_session_id="web-validator",
+        expected_agentscope_session_id="web-validator-agent",
+    )
+    assert repo.claim_step(
+        validation_plan.plan_id,
+        "validate",
+        "validate_navigation_outputs",
+        expected_web_session_id="web-validator",
+        expected_agentscope_session_id="web-validator-agent",
+    ) is StepClaimOutcome.CLAIMED
+
+    _candidate_task, candidate_plan, candidate_agent = attempt_with_extract_plan(
+        repo, owner="web-candidate", segments=["segment-a"]
+    )
+    assert claim_prepare(
+        repo,
+        candidate_plan,
+        owner="web-candidate",
+        agentscope_session_id=candidate_agent,
+    ) is StepClaimOutcome.CLAIMED
+
+
+@pytest.mark.parametrize(
+    ("task_status", "step_status"),
+    [
+        ("active", "pending"),
+        ("waiting_user", "waiting_user"),
+        ("completed", "completed"),
+        ("failed", "failed"),
+    ],
+)
+def test_non_running_attempts_never_hold_target_lock(
+    tmp_path: Path,
+    task_status: str,
+    step_status: str,
+):
+    repo = SqliteNavigationPlanRepository(tmp_path / "navigation.sqlite")
+    task, plan, agent = attempt_with_extract_plan(
+        repo, owner="web-inactive", segments=["segment-a"]
+    )
+    SqliteNavigationTaskStore(repo.db_path).update_task_for_session(
+        task.task_id,
+        web_session_id="web-inactive",
+        agentscope_session_id=agent,
+        status=task_status,
+    )
+    with sqlite3.connect(repo.db_path) as connection:
+        connection.execute(
+            "UPDATE navigation_task_steps SET status = ? "
+            "WHERE plan_id = ? AND step_id = 'prepare'",
+            (step_status, plan.plan_id),
+        )
+
+    _candidate, candidate_plan, candidate_agent = attempt_with_extract_plan(
+        repo, owner="web-candidate", segments=["segment-a"]
+    )
+    assert claim_prepare(
+        repo,
+        candidate_plan,
+        owner="web-candidate",
+        agentscope_session_id=candidate_agent,
+    ) is StepClaimOutcome.CLAIMED
+
+
+def test_two_simultaneous_overlapping_claims_have_one_busy_loser(tmp_path: Path):
+    db_path = tmp_path / "navigation.sqlite"
+    repo = SqliteNavigationPlanRepository(db_path)
+    claims = []
+    for owner in ("web-a", "web-b"):
+        _task, plan, agent = attempt_with_extract_plan(
+            repo, owner=owner, segments=["segment-a"]
+        )
+        claims.append((owner, plan.plan_id, agent))
+    barrier = Barrier(2)
+
+    def claim(claim_data):
+        owner, plan_id, agent = claim_data
+        barrier.wait()
+        return SqliteNavigationPlanRepository(db_path).claim_step(
+            plan_id,
+            "prepare",
+            "prepare_raw_data",
+            expected_web_session_id=owner,
+            expected_agentscope_session_id=agent,
+        )
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        outcomes = list(executor.map(claim, claims))
+
+    assert sorted(outcome.value for outcome in outcomes) == [
+        StepClaimOutcome.CLAIMED.value,
+        StepClaimOutcome.NAVIGATION_DATA_BUSY.value,
+    ]
+    with sqlite3.connect(db_path) as connection:
+        running = connection.execute(
+            "SELECT COUNT(*) FROM navigation_task_steps WHERE status = 'running'"
+        ).fetchone()[0]
+    assert running == 1
+
+
+@pytest.mark.parametrize("terminal_status", ["completed", "failed"])
+def test_terminal_step_releases_target_lock(tmp_path: Path, terminal_status: str):
+    repo = SqliteNavigationPlanRepository(tmp_path / "navigation.sqlite")
+    _task, plan, agent = attempt_with_extract_plan(
+        repo, owner="web-first", segments=["segment-a"]
+    )
+    finalize_claimed_step(
+        repo,
+        plan,
+        step_id="prepare",
+        action="prepare_raw_data",
+        owner="web-first",
+        agentscope_session_id=agent,
+        target_status=terminal_status,
+    )
+
+    _candidate, candidate_plan, candidate_agent = attempt_with_extract_plan(
+        repo, owner="web-second", segments=["segment-a"]
+    )
+    assert claim_prepare(
+        repo,
+        candidate_plan,
+        owner="web-second",
+        agentscope_session_id=candidate_agent,
+    ) is StepClaimOutcome.CLAIMED
+
+
+def test_completed_extract_plan_leaves_attempt_active(tmp_path: Path):
+    repo = SqliteNavigationPlanRepository(tmp_path / "navigation.sqlite")
+    task, plan, agent = attempt_with_extract_plan(
+        repo, owner="web-extract", segments=["segment-a"]
+    )
+
+    finalize_claimed_step(
+        repo,
+        plan,
+        step_id="prepare",
+        action="prepare_raw_data",
+        owner="web-extract",
+        agentscope_session_id=agent,
+        target_status="completed",
+    )
+    finalize_claimed_step(
+        repo,
+        plan,
+        step_id="sync",
+        action="extract_and_sync_navigation_data",
+        owner="web-extract",
+        agentscope_session_id=agent,
+        target_status="completed",
+    )
+
+    assert repo.get(plan.plan_id).status == "completed"
+    stored = SqliteNavigationTaskStore(repo.db_path).get_task(task.task_id)
+    assert stored is not None
+    assert stored.status.value == "active"
+    assert stored.accepted_plan_phase.value == "extract_sync"
+
+
+def test_finish_plan_completes_attempt_only_after_terminal_validation(tmp_path: Path):
+    repo = SqliteNavigationPlanRepository(tmp_path / "navigation.sqlite")
+    owner = "web-finish"
+    agent = "web-finish-agent"
+    task = SqliteNavigationTaskStore(repo.db_path).create_task_attempt(
+        request="finish navigation data",
+        target="20270623",
+        date="20270623",
+        segments=["segment-a"],
+        scene_mode="out",
+        dry_run=False,
+        web_session_id=owner,
+        agentscope_session_id=agent,
+    ).task
+    payload = valid_finish_plan().model_dump(mode="json")
+    payload["steps"] = [
+        payload["steps"][0],
+        {
+            "step_id": "validate",
+            "action": "validate_navigation_outputs",
+            "variant": "expect_gridmap",
+            "arguments": {},
+            "depends_on": ["confirm"],
+            "failure_policy": "stop",
+            "decision_refs": ["gridmap"],
+        },
+    ]
+    plan = repo.activate(
+        task,
+        "finish_processing",
+        1,
+        FinishProcessingPlanInput.model_validate(payload),
+        expected_web_session_id=owner,
+        expected_agentscope_session_id=agent,
+    )
+
+    finalize_claimed_step(
+        repo,
+        plan,
+        step_id="confirm",
+        action="confirm_navigation_calibration_params",
+        owner=owner,
+        agentscope_session_id=agent,
+        target_status="completed",
+    )
+    assert SqliteNavigationTaskStore(repo.db_path).get_task(task.task_id).status.value == "active"
+    assert repo.get(plan.plan_id).status == "active"
+
+    finalize_claimed_step(
+        repo,
+        plan,
+        step_id="validate",
+        action="validate_navigation_outputs",
+        owner=owner,
+        agentscope_session_id=agent,
+        target_status="completed",
+    )
+    assert repo.get(plan.plan_id).status == "completed"
+    assert SqliteNavigationTaskStore(repo.db_path).get_task(task.task_id).status.value == "completed"
+
+
+def test_stale_running_writer_blocks_until_controlled_step_recovery(tmp_path: Path):
+    repo = SqliteNavigationPlanRepository(tmp_path / "navigation.sqlite")
+    _task, plan, agent = attempt_with_extract_plan(
+        repo, owner="web-stale", segments=["segment-a"]
+    )
+    _candidate, candidate_plan, candidate_agent = attempt_with_extract_plan(
+        repo, owner="web-candidate", segments=["segment-a"]
+    )
+    assert claim_prepare(
+        repo, plan, owner="web-stale", agentscope_session_id=agent
+    ) is StepClaimOutcome.CLAIMED
+    assert claim_prepare(
+        repo,
+        candidate_plan,
+        owner="web-candidate",
+        agentscope_session_id=candidate_agent,
+    ) is StepClaimOutcome.NAVIGATION_DATA_BUSY
+
+    assert repo.recover_running_step_without_result(
+        plan.plan_id,
+        "prepare",
+        "operator-controlled recovery",
+        expected_web_session_id="web-stale",
+        expected_agentscope_session_id=agent,
+    )
+    assert claim_prepare(
+        repo,
+        candidate_plan,
+        owner="web-candidate",
+        agentscope_session_id=candidate_agent,
+    ) is StepClaimOutcome.CLAIMED
 
 
 def test_repository_migrates_legacy_pending_only_handoff_schema(tmp_path: Path):
@@ -477,7 +934,7 @@ def test_step_transition_fails_closed_when_web_owner_rebinds_after_authorization
 
     def authorize_then_rebind(connection, plan_id, **kwargs):
         original_authorize(connection, plan_id, **kwargs)
-        with sqlite3.connect(repo.db_path) as rebind:
+        with sqlite3.connect(repo.db_path, timeout=0) as rebind:
             rebind.execute(
                 "UPDATE navigation_tasks SET latest_web_session_id = ? WHERE task_id = ?",
                 ("web-two", task.task_id),
@@ -485,15 +942,18 @@ def test_step_transition_fails_closed_when_web_owner_rebinds_after_authorization
 
     monkeypatch.setattr(repo, "_authorize_plan_write", authorize_then_rebind)
 
-    transitioned = getattr(repo, transition)(
+    transition_call = lambda: getattr(repo, transition)(
         plan.plan_id,
         "prepare",
         "prepare_raw_data",
         expected_web_session_id="web-one",
         expected_agentscope_session_id=None,
     )
-
-    assert transitioned is False
+    if transition == "claim_step":
+        with pytest.raises(sqlite3.OperationalError, match="locked"):
+            transition_call()
+    else:
+        assert transition_call() is False
     assert repo.get_current_step(plan.plan_id)["step"]["status"] == "pending"
 
 
@@ -693,7 +1153,10 @@ def test_activation_rejects_supersede_while_active_step_is_in_flight(
         if in_flight_status == "running"
         else repo.mark_waiting_user(first.plan_id, "prepare", "prepare_raw_data")
     )
-    assert transition is True
+    if in_flight_status == "running":
+        assert transition is StepClaimOutcome.CLAIMED
+    else:
+        assert transition is True
 
     with pytest.raises(ActivePlanExecutionConflict):
         repo.activate(task, "extract_sync", 2, valid_extract_plan())
@@ -802,7 +1265,10 @@ def test_invalidation_wins_before_claim_and_prevents_execution_claim(tmp_path: P
     record = repo.activate(task, "extract_sync", 1, valid_extract_plan())
 
     assert repo.invalidate(record.plan_id, "artifact drift").status == "invalidated"
-    assert repo.claim_step(record.plan_id, "prepare", "prepare_raw_data") is False
+    assert (
+        repo.claim_step(record.plan_id, "prepare", "prepare_raw_data")
+        is StepClaimOutcome.NOT_CLAIMABLE
+    )
 
 
 def test_compact_reads_expose_execution_status_and_no_legacy_payloads(tmp_path: Path):
