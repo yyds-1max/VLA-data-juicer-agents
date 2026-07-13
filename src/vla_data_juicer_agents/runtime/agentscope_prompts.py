@@ -1,5 +1,14 @@
 from __future__ import annotations
 
+from pathlib import Path
+
+
+NAVIGATION_AGENT_GUIDANCE_PATH = (
+    Path(__file__).resolve().parents[3]
+    / "docs"
+    / "navigation-plan-agent-guidance.md"
+)
+
 
 def main_router_prompt() -> str:
     return """
@@ -50,3 +59,20 @@ Confirm overwrite or delete actions through request_human_decision before the de
 Provide final summaries in the user's language, including what was completed,
 what remains, and any decisions or blocked steps.
 """.strip()
+
+
+def navigation_agent_system_prompt() -> str:
+    """Build the one bootstrap-time NavigationDataAgent system context."""
+    try:
+        guidance = NAVIGATION_AGENT_GUIDANCE_PATH.read_text(encoding="utf-8").strip()
+    except OSError as error:
+        raise RuntimeError(
+            "navigation agent guidance is missing or unreadable: "
+            f"{NAVIGATION_AGENT_GUIDANCE_PATH}"
+        ) from error
+    if not guidance:
+        raise RuntimeError(
+            "navigation agent guidance is missing or empty: "
+            f"{NAVIGATION_AGENT_GUIDANCE_PATH}"
+        )
+    return f"{navigation_agent_prompt()}\n\n{guidance}"

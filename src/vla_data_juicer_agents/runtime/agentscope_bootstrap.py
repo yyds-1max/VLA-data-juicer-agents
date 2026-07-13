@@ -9,7 +9,7 @@ from agentscope.credential import DashScopeCredential
 from vla_data_juicer_agents.runtime.agentscope_config import AgentScopeRuntimeConfig
 from vla_data_juicer_agents.runtime.agentscope_prompts import (
     main_router_prompt,
-    navigation_agent_prompt,
+    navigation_agent_system_prompt,
 )
 
 
@@ -52,6 +52,7 @@ async def bootstrap_agentscope_records(
     storage: StorageBase,
     config: AgentScopeRuntimeConfig,
 ) -> BootstrappedAgentRecords:
+    navigation_system_prompt = navigation_agent_system_prompt()
     credential = DashScopeCredential(
         id=config.credential_id,
         name="DashScope",
@@ -76,7 +77,7 @@ async def bootstrap_agentscope_records(
             user_id=config.user_id,
             agent_id=config.navigation_agent_id,
             name="NavigationDataAgent",
-            system_prompt=navigation_agent_prompt(),
+            system_prompt=navigation_system_prompt,
             max_iters=40,
         ),
     )

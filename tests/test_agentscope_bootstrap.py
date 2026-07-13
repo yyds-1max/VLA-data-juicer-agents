@@ -153,6 +153,42 @@ def test_navigation_agent_prompt_has_no_legacy_guidance_loader_contract():
 
 
 @pytest.mark.asyncio
+async def test_bootstrap_injects_navigation_guidance_once_and_never_into_router():
+    storage = FakeStorage()
+
+    await bootstrap_agentscope_records(storage, _config())
+
+    router_prompt, navigation_prompt = [
+        record.data.system_prompt for _, record in storage.agents
+    ]
+    guidance_marker = "# Navigation Plan Agent Guidance"
+    assert guidance_marker not in router_prompt
+    assert navigation_prompt.count(guidance_marker) == 1
+    assert navigation_prompt.count("## Product dependency map") == 1
+    assert navigation_prompt.count("## Four bounded few-shots") == 1
+    assert navigation_prompt.count("### Few-shot 4: invalid complete Plan") == 1
+
+
+@pytest.mark.asyncio
+async def test_bootstrap_fails_closed_before_writes_when_navigation_guidance_is_missing(
+    tmp_path, monkeypatch
+):
+    missing = tmp_path / "missing-navigation-guidance.md"
+    monkeypatch.setattr(
+        "vla_data_juicer_agents.runtime.agentscope_prompts.NAVIGATION_AGENT_GUIDANCE_PATH",
+        missing,
+        raising=False,
+    )
+    storage = FakeStorage()
+
+    with pytest.raises(RuntimeError, match="navigation agent guidance.*missing"):
+        await bootstrap_agentscope_records(storage, _config())
+
+    assert storage.credentials == []
+    assert storage.agents == []
+
+
+@pytest.mark.asyncio
 async def test_bootstrap_agentscope_records_upserts_credential_and_agents():
     storage = FakeStorage()
     config = _config()

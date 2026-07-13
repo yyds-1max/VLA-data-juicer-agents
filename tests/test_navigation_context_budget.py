@@ -9,13 +9,45 @@ from types import SimpleNamespace
 from vla_data_juicer_agents.navigation.agent_tools import resolve_navigation_agent_tools
 from vla_data_juicer_agents.navigation.config import NavigationSettings
 from vla_data_juicer_agents.navigation.services import build_navigation_services
-from vla_data_juicer_agents.runtime.agentscope_prompts import navigation_agent_prompt
+from vla_data_juicer_agents.runtime.agentscope_bootstrap import bootstrap_agentscope_records
+from vla_data_juicer_agents.runtime.agentscope_config import AgentScopeRuntimeConfig
 from vla_data_juicer_agents.runtime.agentscope_runtime import AgentScopeRuntime
 
 
 REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
 GUIDANCE_PATH = REPOSITORY_ROOT / "docs" / "navigation-plan-agent-guidance.md"
 SERVER_ACCEPTANCE_PATH = REPOSITORY_ROOT / "docs" / "navigation-plan-server-acceptance.md"
+
+
+class _BootstrapStorage:
+    def __init__(self):
+        self.agents = []
+
+    async def upsert_credential(self, _user_id, credential):
+        return credential.id
+
+    async def upsert_agent(self, _user_id, record):
+        self.agents.append(record)
+        return record.id
+
+
+def _production_agent_prompts(workspace_root):
+    storage = _BootstrapStorage()
+    config = AgentScopeRuntimeConfig(
+        user_id="budget-user",
+        redis_url="redis://localhost:6379/0",
+        workspace_root=workspace_root,
+        dashscope_api_key="budget-key",
+        dashscope_base_url=None,
+        default_model="budget-default",
+        router_model="budget-router",
+        navigation_model="budget-navigation",
+    )
+    asyncio.run(bootstrap_agentscope_records(storage, config))
+    return {
+        record.data.name: record.data.system_prompt
+        for record in storage.agents
+    }
 
 
 def _decode(value):
@@ -254,13 +286,12 @@ def test_static_prompt_guidance_submission_schemas_and_anchor_fit_context_budget
         },
         separators=(",", ":"),
     )
+    prompts = _production_agent_prompts(tmp_path)
+    production_navigation_prompt = prompts["NavigationDataAgent"]
+    assert production_navigation_prompt.count("# Navigation Plan Agent Guidance") == 1
+    assert "# Navigation Plan Agent Guidance" not in prompts["MainRouterAgent"]
     static_context = "\n".join(
-        [
-            navigation_agent_prompt(),
-            GUIDANCE_PATH.read_text(encoding="utf-8"),
-            schemas,
-            compact_anchor,
-        ]
+        [production_navigation_prompt, schemas, compact_anchor]
     )
 
     assert (len(static_context) + 3) // 4 <= 83_885
@@ -279,9 +310,11 @@ def test_representative_model_authored_transcript_stays_bounded_without_compacti
         tmp_path,
         NavigationSettings(vladatasets_root=data_root),
     )
-    system_chars = len(navigation_agent_prompt()) + 1 + len(
-        GUIDANCE_PATH.read_text(encoding="utf-8")
-    )
+    production_navigation_prompt = _production_agent_prompts(tmp_path)[
+        "NavigationDataAgent"
+    ]
+    assert production_navigation_prompt.count("# Navigation Plan Agent Guidance") == 1
+    system_chars = len(production_navigation_prompt)
     retained_history: list[str] = []
     transcript: list[tuple[str, str]] = []
     turn_measurements: list[TurnMeasurement] = []
