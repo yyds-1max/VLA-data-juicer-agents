@@ -316,7 +316,6 @@ def test_representative_model_authored_transcript_stays_bounded_without_compacti
     assert production_navigation_prompt.count("# Navigation Plan Agent Guidance") == 1
     system_chars = len(production_navigation_prompt)
     retained_history: list[str] = []
-    transcript: list[tuple[str, str]] = []
     turn_measurements: list[TurnMeasurement] = []
     compact_events: list[dict[str, int | str]] = []
     external_invocations: list[str] = []
@@ -400,7 +399,25 @@ def test_representative_model_authored_transcript_stays_bounded_without_compacti
         measure_model_call(f"{name}:start")
         return tools
 
-    def record(kind, payload, hard_max):
+    def invoke(tools, tool_name, hard_max, **arguments):
+        retained_history.append(
+            json.dumps(
+                {
+                    "role": "assistant",
+                    "content": (
+                        "Progress: Using current durable facts; "
+                        f"calling {tool_name}."
+                    ),
+                    "tool_call": {
+                        "name": tool_name,
+                        "arguments": arguments,
+                    },
+                },
+                ensure_ascii=False,
+                separators=(",", ":"),
+            )
+        )
+        payload = _call(tools[tool_name], **arguments)
         encoded_payload = json.dumps(
             payload,
             ensure_ascii=False,
@@ -410,19 +427,29 @@ def test_representative_model_authored_transcript_stays_bounded_without_compacti
         assert "schema_snapshot" not in encoded_payload
         assert "data_profile_draft" not in encoded_payload
         assert "validation_history" not in encoded_payload
-        transcript.append((kind, encoded_payload))
         retained_history.append(
             json.dumps(
-                {"role": "tool", "name": kind, "content": payload},
+                {"role": "tool", "name": tool_name, "content": payload},
                 ensure_ascii=False,
                 separators=(",", ":"),
             )
         )
-        count_key = (current_invocation, kind)
+        count_key = (current_invocation, tool_name)
         result_counts[count_key] = result_counts.get(count_key, 0) + 1
         measure_model_call(
-            f"{current_invocation}:after:{kind}:{result_counts[count_key]}"
+            f"{current_invocation}:after:{tool_name}:{result_counts[count_key]}"
         )
+        return payload
+
+    def record_final(content):
+        retained_history.append(
+            json.dumps(
+                {"role": "assistant", "content": content, "final": True},
+                ensure_ascii=False,
+                separators=(",", ":"),
+            )
+        )
+        measure_model_call(f"{current_invocation}:final")
 
     entered_task = services.task_store.create_task_attempt(
         request="Process the selected navigation dataset.",
@@ -435,11 +462,13 @@ def test_representative_model_authored_transcript_stays_bounded_without_compacti
         agentscope_session_id=session_id,
     ).task
     entry_tools = start_invocation("entry", "Process the selected navigation dataset.")
-    entry = _call(
-        entry_tools["record_navigation_user_guidance_tool"],
+    invoke(
+        entry_tools,
+        "record_navigation_user_guidance_tool",
+        4_000,
         text="Process the selected navigation dataset.",
     )
-    record("entry", entry, 4_000)
+    record_final("Recorded the request guidance and will inspect current products.")
 
     inspection_tools = start_invocation(
         "inspection",
@@ -452,28 +481,31 @@ def test_representative_model_authored_transcript_stays_bounded_without_compacti
     )
     assert inspection_names
     for name in inspection_names:
-        record("inspection", _call(inspection_tools[name]), 4_000)
+        invoke(inspection_tools, name, 4_000)
+    record_final("Recorded the current factual product and input observations.")
 
     planning_tools = start_invocation(
         "planning",
         "Use the completed facts to submit one complete extract-sync plan.",
     )
-    context = _call(planning_tools["get_navigation_task_context_tool"])
-    record("planning_context", context, 5_500)
-    evidence_list = _call(
-        planning_tools["list_observation_evidence_tool"],
+    context = invoke(
+        planning_tools,
+        "get_navigation_task_context_tool",
+        5_500,
+    )
+    evidence_list = invoke(
+        planning_tools,
+        "list_observation_evidence_tool",
+        5_500,
         limit=20,
     )
-    record("evidence_list", evidence_list, 5_500)
     first_ref = evidence_list["evidence"][0]["ref"]
-    record(
-        "evidence_detail",
-        _call(
-            planning_tools["read_observation_evidence_tool"],
-            ref=first_ref,
-            limit=10,
-        ),
+    invoke(
+        planning_tools,
+        "read_observation_evidence_tool",
         5_500,
+        ref=first_ref,
+        limit=10,
     )
     evidence_by_kind = {
         row.kind: row.ref
@@ -488,20 +520,23 @@ def test_representative_model_authored_transcript_stays_bounded_without_compacti
         "unobserved_sensor"
     )
     submit_name = "submit_extract_sync_plan_tool"
-    invalid = _call(
-        planning_tools[submit_name],
+    invalid = invoke(
+        planning_tools,
+        submit_name,
+        3_000,
         planning_context_revision=context["planning_context_revision"],
         plan=invalid_plan,
     )
     assert invalid["ok"] is False
-    record("submit_failure", invalid, 3_000)
-    success = _call(
-        planning_tools[submit_name],
+    success = invoke(
+        planning_tools,
+        submit_name,
+        2_000,
         planning_context_revision=context["planning_context_revision"],
         plan=valid_plan,
     )
     assert success["ok"] is True
-    record("submit_success", success, 2_000)
+    record_final("The complete extract-sync Plan was accepted for execution.")
 
     execution_tools = start_invocation(
         "execution",
@@ -509,21 +544,56 @@ def test_representative_model_authored_transcript_stays_bounded_without_compacti
     )
     while services.plan_store.get(success["plan_id"]).status == "active":
         current = services.plan_store.get_current_step(success["plan_id"])
-        record(
-            "execution_overview",
-            _call(
-                execution_tools["get_plan_execution_overview_tool"],
-                plan_id=success["plan_id"],
-            ),
+        invoke(
+            execution_tools,
+            "get_plan_execution_overview_tool",
             4_000,
+            plan_id=success["plan_id"],
         )
         step = current["step"]
-        result = _call(
-            execution_tools[f"{step['action']}_tool"],
+        invoke(
+            execution_tools,
+            f"{step['action']}_tool",
+            4_000,
             plan_id=success["plan_id"],
             step_id=step["step_id"],
         )
-        record("processing_result", result, 4_000)
+    record_final("Executed the accepted Plan and recorded its final ledger state.")
+
+    decoded_history = [json.loads(message) for message in retained_history]
+    assert {message["role"] for message in decoded_history} == {
+        "user",
+        "assistant",
+        "tool",
+    }
+    assistant_tool_calls = [
+        message
+        for message in decoded_history
+        if message["role"] == "assistant" and "tool_call" in message
+    ]
+    assert assistant_tool_calls
+    assert all(message["content"].startswith("Progress: ") for message in assistant_tool_calls)
+    assert all(message["tool_call"]["name"] for message in assistant_tool_calls)
+    final_assistant_messages = [
+        message
+        for message in decoded_history
+        if message["role"] == "assistant" and message.get("final") is True
+    ]
+    assert len(final_assistant_messages) == len(external_invocations)
+    submit_calls = [
+        message["tool_call"]
+        for message in assistant_tool_calls
+        if message["tool_call"]["name"] == submit_name
+    ]
+    assert [call["arguments"]["plan"] for call in submit_calls] == [
+        invalid_plan,
+        valid_plan,
+    ]
+    assert all(
+        message["name"] in {call["tool_call"]["name"] for call in assistant_tool_calls}
+        for message in decoded_history
+        if message["role"] == "tool"
+    )
 
     peak = max(turn_measurements, key=lambda turn: turn.estimated_tokens)
     metrics = {
@@ -535,7 +605,10 @@ def test_representative_model_authored_transcript_stays_bounded_without_compacti
     }
     assert metrics["invocations"] == ["entry", "inspection", "planning", "execution"]
     assert any(":after:" in turn.name for turn in turn_measurements)
-    assert ":after:" in metrics["peak_turn"]
+    assert all(
+        f"{invocation}:final" in metrics["measurement_labels"]
+        for invocation in metrics["invocations"]
+    )
     assert metrics["peak_estimated_tokens"] == max(
         turn.estimated_tokens for turn in turn_measurements
     )
