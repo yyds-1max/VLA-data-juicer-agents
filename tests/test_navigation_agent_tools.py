@@ -842,6 +842,124 @@ def test_stale_execution_read_tools_reauthorize_at_call_time(tmp_path, mutation)
     assert current == {"ok": False, "error_type": "inactive_navigation_plan"}
 
 
+def test_new_attempt_for_same_session_revokes_all_tools_from_previous_attempt(
+    tmp_path,
+    monkeypatch,
+):
+    from vla_data_juicer_agents.navigation import plan_execution
+
+    services, task_a, built = _resolver_services_from_complete(tmp_path)
+    plan_a = services.plan_store.activate(
+        task_a,
+        "extract_sync",
+        4,
+        ExtractSyncPlanInput.model_validate(valid_extract_plan_payload(built)),
+        expected_web_session_id="as-session-1",
+        expected_agentscope_session_id="as-session-1",
+    )
+    invoked = []
+    monkeypatch.setattr(
+        plan_execution,
+        "prepare_raw_data",
+        lambda **kwargs: invoked.append(kwargs)
+        or {
+            "ok": True,
+            "tool_name": "prepare_raw_data",
+            "message": "must not run",
+        },
+    )
+    tools_a = {
+        tool.name: tool
+        for tool in resolve_navigation_agent_tools(
+            services=services,
+            agentscope_session_id="as-session-1",
+            web_session_id="as-session-1",
+            cancellation=None,
+        )
+    }
+    task_a_before = services.task_store.get_task(task_a.task_id)
+    plan_a_before = services.plan_store.get(plan_a.plan_id)
+    ledger_a_before = services.plan_store.get_execution_overview(plan_a.plan_id)
+
+    task_b = services.task_store.create_task_attempt(
+        request="process a different navigation target",
+        target="20260711/20260711_120000",
+        date="20260711",
+        segments=["20260711_120000"],
+        scene_mode=None,
+        dry_run=True,
+        web_session_id="as-session-1",
+        agentscope_session_id="as-session-1",
+    ).task
+    task_b_before = services.task_store.get_task(task_b.task_id)
+    resolver_b_names = {
+        tool.name
+        for tool in resolve_navigation_agent_tools(
+            services=services,
+            agentscope_session_id="as-session-1",
+            web_session_id="as-session-1",
+            cancellation=None,
+        )
+    }
+
+    overview = _decode_tool_payload(
+        asyncio.run(
+            tools_a["get_plan_execution_overview_tool"](plan_id=plan_a.plan_id)
+        )
+    )
+    current = _decode_tool_payload(
+        asyncio.run(tools_a["get_current_plan_step_tool"](plan_id=plan_a.plan_id))
+    )
+    processing = _decode_tool_payload(
+        asyncio.run(
+            tools_a["prepare_raw_data_tool"](
+                plan_id=plan_a.plan_id,
+                step_id="prepare_raw",
+            )
+        )
+    )
+
+    assert resolver_b_names == PLANNING_TOOL_NAMES
+    assert overview == {"ok": False, "error_type": "inactive_navigation_plan"}
+    assert current == {"ok": False, "error_type": "inactive_navigation_plan"}
+    assert processing["ok"] is False
+    assert processing["error_type"] == "navigation_task_session_mismatch"
+    assert invoked == []
+    assert services.task_store.get_task(task_a.task_id) == task_a_before
+    assert services.plan_store.get(plan_a.plan_id) == plan_a_before
+    assert services.plan_store.get_execution_overview(plan_a.plan_id) == ledger_a_before
+    assert services.task_store.get_task(task_b.task_id) == task_b_before
+    assert services.plan_store.get_active_for_task(task_b.task_id) is None
+
+
+def test_exact_attempt_retry_keeps_the_same_current_task_authorized(tmp_path):
+    services = build_navigation_services(tmp_path)
+    arguments = {
+        "request": "process navigation target",
+        "target": "20260711/20260711_120000",
+        "date": "20260711",
+        "segments": ["20260711_120000"],
+        "scene_mode": None,
+        "dry_run": True,
+        "web_session_id": "web-owner",
+        "agentscope_session_id": "web-owner__agent",
+    }
+    first = services.task_store.create_task_attempt(**arguments)
+    retry = services.task_store.create_task_attempt(**arguments)
+
+    snapshot = services.plan_store.read_execution_snapshot(
+        web_session_id="web-owner",
+        agentscope_session_id="web-owner__agent",
+        task_id=first.task.task_id,
+    )
+
+    assert first.created is True
+    assert retry.created is False
+    assert retry.task.task_id == first.task.task_id
+    assert snapshot is not None
+    assert snapshot.task.task_id == first.task.task_id
+
+
 def test_activity_resolver_returns_failed_active_ledger_to_planning(tmp_path):
     services, task, built = _resolver_services_from_complete(tmp_path)
     active = services.plan_store.activate(

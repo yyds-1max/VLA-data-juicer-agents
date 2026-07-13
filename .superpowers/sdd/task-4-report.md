@@ -72,10 +72,10 @@ Final commands and results:
 
 ```text
 .venv/bin/python -m pytest tests/test_navigation_agent_tools.py tests/test_navigation_task_tools.py tests/test_session_tool_registry.py tests/test_navigation_plan_submission_tools.py tests/test_navigation_plan_validation.py tests/test_navigation_plan_store.py tests/test_navigation_plan_contracts.py tests/test_navigation_plan_execution.py tests/test_navigation_observation_tools.py tests/test_navigation_observation_store.py tests/test_navigation_context_budget.py tests/test_navigation_model_authored_flow.py tests/test_web_agentscope_session.py -q
-370 passed in 12.84s
+372 passed in 9.92s
 
 .venv/bin/python -m pytest -q
-744 passed, 1 warning in 17.22s
+746 passed, 1 warning in 16.27s
 
 .venv/bin/python -m compileall -q src tests
 success
@@ -118,6 +118,17 @@ regressions:
 
 The follow-up implementation review found no remaining Critical or Important
 issues.
+
+A subsequent review found one more Important current-attempt fencing gap: after
+the same Web/AgentScope session created a different target attempt, a toolkit
+captured from the previous attempt could still authorize by explicitly passing
+its old `task_id`. The snapshot transaction now first selects the exact-session
+current attempt using the same `created_at DESC, rowid DESC` ordering as
+`find_by_session`, then treats a supplied `task_id` only as an assertion. A
+different-target successor revokes the old overview, current-step, and processing
+tools before claim or mutation, while an exact same-target retry remains bound to
+the same task. The independent current-attempt follow-up review found no Critical
+or Important blockers.
 
 Task 7 remains responsible for final deletion of any dead compatibility code not
 reachable through the Task 4 model-facing resolver.

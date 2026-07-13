@@ -641,24 +641,23 @@ class SqliteNavigationPlanRepository:
         connection = self._connect()
         try:
             connection.execute("BEGIN")
-            task_clause = "AND task_id = ?" if task_id is not None else ""
             params: tuple[Any, ...] = (
                 web_session_id,
                 web_session_id,
                 agentscope_session_id,
-                *((task_id,) if task_id is not None else ()),
             )
             task_row = connection.execute(
-                f"""SELECT * FROM navigation_tasks
+                """SELECT * FROM navigation_tasks
                     WHERE created_by_web_session_id IS ?
                       AND latest_web_session_id IS ?
                       AND agentscope_session_id IS ?
-                      {task_clause}
                     ORDER BY created_at DESC, rowid DESC
                     LIMIT 1""",
                 params,
             ).fetchone()
-            if task_row is None:
+            if task_row is None or (
+                task_id is not None and task_row["task_id"] != task_id
+            ):
                 connection.commit()
                 return None
             task = SqliteNavigationTaskStore(
