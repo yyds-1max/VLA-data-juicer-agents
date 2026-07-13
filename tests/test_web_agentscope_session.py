@@ -676,7 +676,9 @@ async def test_runtime_submit_user_message_routes_to_active_navigation_agent_aft
 @pytest.mark.asyncio
 async def test_runtime_start_navigation_agent_task_creates_durable_task_without_draft(
     tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    monkeypatch.setenv("VLA_VLADATASETS_ROOT", str(tmp_path / "vladatasets"))
     chat_run_registry = FakeChatRunRegistry()
     chat_service = FakeChatService()
     runtime = AgentScopeRuntime(
