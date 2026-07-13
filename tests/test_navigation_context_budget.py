@@ -168,6 +168,13 @@ class TurnMeasurement:
     estimated_tokens: int
 
 
+@dataclass(frozen=True)
+class ToolResultMeasurement:
+    invocation: str
+    tool_name: str
+    serialized_chars: int
+
+
 def test_navigation_guidance_has_exact_playbook_sections_and_four_bounded_few_shots():
     guidance = GUIDANCE_PATH.read_text(encoding="utf-8")
     headings = re.findall(r"^## (.+)$", guidance, flags=re.MULTILINE)
@@ -208,6 +215,16 @@ def test_navigation_guidance_excludes_operator_acceptance_runbook():
     for topic in operator_topics:
         assert topic not in guidance
         assert topic in acceptance
+
+
+def test_server_acceptance_requires_safe_execution_mode_and_attended_gui_boundary():
+    acceptance = SERVER_ACCEPTANCE_PATH.read_text(encoding="utf-8")
+
+    assert "`dry_run=False`" in acceptance
+    assert "`dry_run=True` only for an explicitly selected test run" in acceptance
+    assert "GUI/human steps" in acceptance
+    assert "the user is present" in acceptance
+    assert "explicitly asked to continue" in acceptance
 
 
 def test_compact_navigation_anchor_contains_only_durable_execution_coordinates():
@@ -317,6 +334,8 @@ def test_representative_model_authored_transcript_stays_bounded_without_compacti
     system_chars = len(production_navigation_prompt)
     retained_history: list[str] = []
     turn_measurements: list[TurnMeasurement] = []
+    tool_result_measurements: list[ToolResultMeasurement] = []
+    exposed_schema_chars: dict[str, int] = {}
     compact_events: list[dict[str, int | str]] = []
     external_invocations: list[str] = []
     result_counts: dict[tuple[str, str], int] = {}
@@ -388,6 +407,7 @@ def test_representative_model_authored_transcript_stays_bounded_without_compacti
         assert "schema_snapshot" not in encoded_schemas
         assert "data_profile_draft" not in encoded_schemas
         external_invocations.append(name)
+        exposed_schema_chars[name] = len(encoded_schemas)
         current_invocation = name
         current_schema_chars = len(encoded_schemas)
         measure_model_call(f"{name}:start")
@@ -421,6 +441,13 @@ def test_representative_model_authored_transcript_stays_bounded_without_compacti
         assert "schema_snapshot" not in encoded_payload
         assert "data_profile_draft" not in encoded_payload
         assert "validation_history" not in encoded_payload
+        tool_result_measurements.append(
+            ToolResultMeasurement(
+                invocation=current_invocation,
+                tool_name=tool_name,
+                serialized_chars=len(encoded_payload),
+            )
+        )
         retained_history.append(
             json.dumps(
                 {"role": "tool", "name": tool_name, "content": payload},
@@ -522,6 +549,8 @@ def test_representative_model_authored_transcript_stays_bounded_without_compacti
         plan=invalid_plan,
     )
     assert invalid["ok"] is False
+    validation_failure_measurement = tool_result_measurements[-1]
+    assert validation_failure_measurement.tool_name == submit_name
     success = invoke(
         planning_tools,
         submit_name,
@@ -594,8 +623,25 @@ def test_representative_model_authored_transcript_stays_bounded_without_compacti
         "invocations": external_invocations,
         "measurement_labels": [turn.name for turn in turn_measurements],
         "peak_turn": peak.name,
-        "peak_estimated_tokens": peak.estimated_tokens,
+        "peak_model_input_tokens": peak.estimated_tokens,
+        "tool_result_chars": [
+            {
+                "invocation": item.invocation,
+                "tool_name": item.tool_name,
+                "serialized_chars": item.serialized_chars,
+            }
+            for item in tool_result_measurements
+        ],
+        "max_tool_result_chars": max(
+            item.serialized_chars for item in tool_result_measurements
+        ),
+        "validation_failure_chars": validation_failure_measurement.serialized_chars,
+        "exposed_tool_schema_chars": exposed_schema_chars,
+        "per_turn_model_input_tokens": {
+            turn.name: turn.estimated_tokens for turn in turn_measurements
+        },
         "compact_events": compact_events,
+        "compact_event_count": len(compact_events),
     }
     assert metrics["invocations"] == ["entry", "inspection", "planning", "execution"]
     assert any(":after:" in turn.name for turn in turn_measurements)
@@ -603,8 +649,17 @@ def test_representative_model_authored_transcript_stays_bounded_without_compacti
         f"{invocation}:final" in metrics["measurement_labels"]
         for invocation in metrics["invocations"]
     )
-    assert metrics["peak_estimated_tokens"] == max(
+    assert set(metrics["exposed_tool_schema_chars"]) == set(external_invocations)
+    assert all(chars > 0 for chars in metrics["exposed_tool_schema_chars"].values())
+    assert len(metrics["tool_result_chars"]) == len(
+        [message for message in decoded_history if message["role"] == "tool"]
+    )
+    assert len(metrics["per_turn_model_input_tokens"]) == len(turn_measurements)
+    assert metrics["peak_model_input_tokens"] == max(
         turn.estimated_tokens for turn in turn_measurements
     )
-    assert metrics["peak_estimated_tokens"] < token_limit
+    assert metrics["max_tool_result_chars"] <= 5_500
+    assert metrics["validation_failure_chars"] <= 3_000
+    assert metrics["peak_model_input_tokens"] <= token_limit
+    assert metrics["compact_event_count"] == 0
     assert metrics["compact_events"] == []

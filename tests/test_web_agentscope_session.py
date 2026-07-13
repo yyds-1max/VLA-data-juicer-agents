@@ -15,6 +15,7 @@ from vla_data_juicer_agents.navigation.plan_models import FinishProcessingPlanIn
 from vla_data_juicer_agents.navigation.plan_store import (
     ActivePlanExecutionConflict,
     SqliteNavigationPlanRepository,
+    StepClaimOutcome,
 )
 from vla_data_juicer_agents.navigation.routing import is_high_confidence_navigation_request
 from vla_data_juicer_agents.navigation.task_state import (
@@ -843,6 +844,157 @@ async def test_runtime_completed_waiting_or_failed_attempt_does_not_block_handof
 
     assert newer.task_id != older.task_id
     await registry.drain()
+
+
+@pytest.mark.asyncio
+async def test_completed_history_handoff_is_truthful_and_never_reports_cross_session_error(
+    tmp_path: Path,
+) -> None:
+    registry = FakeChatRunRegistry()
+    runtime = _runtime(chat_run_registry=registry, workspace_root=tmp_path)
+    message = agentscope_runtime_module._navigation_handoff_message(
+        request="处理 20270605 的导航数据",
+        target="20270605",
+        date="20270605",
+        scene_mode=None,
+        clips=["segment-a"],
+        reason="completed history regression",
+        response_language="Chinese",
+    )
+    old = await runtime.start_navigation_agent_task(
+        web_session_id="web-old",
+        message=message,
+    )
+    runtime._navigation_task_store().update_task_for_session(
+        old.task_id,
+        web_session_id="web-old",
+        agentscope_session_id=old.agentscope_session_id,
+        status=NavigationTaskStatus.COMPLETED.value,
+    )
+    tool = agentscope_runtime_module.NavigationHandoffTool(
+        runtime=runtime,
+        web_session_id="web-new",
+    )
+
+    result = await tool(
+        request="处理 20270605 的导航数据",
+        target="20270605",
+        date="20270605",
+        scene_mode="unknown",
+        clips=["segment-a"],
+        reason="new session continuation",
+        missing_fields=[],
+        confidence="high",
+        response_language="Chinese",
+    )
+
+    assert result.state == ToolResultState.SUCCESS
+    assert result.metadata["ok"] is True
+    assert result.metadata["started"] is True
+    assert result.metadata["task_id"] != old.task_id
+    assert "belongs to another Web session" not in result.content[0].text
+    assert "不属于" not in result.content[0].text
+    await registry.drain()
+
+
+@pytest.mark.asyncio
+async def test_real_running_writer_returns_bounded_truthful_busy_handoff(
+    tmp_path: Path,
+) -> None:
+    runtime = _runtime(
+        chat_run_registry=FakeChatRunRegistry(),
+        workspace_root=tmp_path,
+    )
+    task_store = runtime._navigation_task_store()
+    writer = task_store.create_task_attempt(
+        request="write navigation products",
+        target="20270605/segment-a",
+        date="20270605",
+        segments=["segment-a"],
+        scene_mode="out",
+        dry_run=False,
+        web_session_id="web-writer",
+        agentscope_session_id="as-writer",
+    ).task
+    plan_store = SqliteNavigationPlanRepository(tmp_path / "navigation-tasks.sqlite")
+    plan = plan_store.activate(
+        writer,
+        "finish_processing",
+        0,
+        FinishProcessingPlanInput.model_validate(
+            {
+                "decisions": {
+                    "localization": {
+                        "source": "odom",
+                        "conversion": "odom_to_ins",
+                        "reason": "observed",
+                        "evidence_refs": ["evidence:localization"],
+                    },
+                    "gridmap": {
+                        "source": "existing_gridmap",
+                        "reason": "observed",
+                        "evidence_refs": ["evidence:gridmap"],
+                    },
+                    "calibration": {
+                        "mode": "hardcoded_with_user_confirmation",
+                        "selected_sensor_source": "NoobScenes/params/selected/sensors",
+                        "requires_user_confirmation": True,
+                        "reason": "observed",
+                        "evidence_refs": ["evidence:calibration"],
+                    },
+                },
+                "steps": [
+                    {
+                        "step_id": "assemble",
+                        "action": "assemble_finish_temp",
+                        "variant": "default",
+                        "arguments": {},
+                        "depends_on": [],
+                        "failure_policy": "stop",
+                        "decision_refs": ["calibration"],
+                    }
+                ],
+            }
+        ),
+        expected_web_session_id="web-writer",
+        expected_agentscope_session_id="as-writer",
+    )
+    assert plan_store.claim_step(
+        plan.plan_id,
+        "assemble",
+        "assemble_finish_temp",
+        expected_web_session_id="web-writer",
+        expected_agentscope_session_id="as-writer",
+    ) is StepClaimOutcome.CLAIMED
+    tool = agentscope_runtime_module.NavigationHandoffTool(
+        runtime=runtime,
+        web_session_id="web-blocked",
+    )
+
+    result = await tool(
+        request="处理 20270605 的 segment-a",
+        target="20270605/segment-a",
+        date="20270605",
+        scene_mode="outdoor",
+        clips=["segment-a"],
+        reason="same target",
+        missing_fields=[],
+        confidence="high",
+        response_language="Chinese",
+    )
+
+    assert result.state == ToolResultState.ERROR
+    assert result.metadata == {
+        "ok": False,
+        "started": False,
+        "error_type": "navigation_data_busy",
+        "message": "该目标当前有正在运行的数据写入操作。",
+    }
+    assert len(result.content[0].text) <= 4_000
+    assert runtime._navigation_task_store().find_by_session(
+        web_session_id="web-blocked",
+        agentscope_session_id="web-blocked__navigation-data-agent",
+    ) is None
 
 
 @pytest.mark.asyncio

@@ -1,13 +1,16 @@
 import shutil
 from types import SimpleNamespace
 
+import vla_data_juicer_agents.navigation.plan_execution as plan_execution
 from test_navigation_context_budget import (
     _call,
     _extract_plan,
     _write_raw_metadata,
 )
 from vla_data_juicer_agents.navigation.config import NavigationSettings
+from vla_data_juicer_agents.navigation.models import ToolResult
 from vla_data_juicer_agents.navigation.services import build_navigation_services
+from vla_data_juicer_agents.navigation.task_state import NavigationTaskStatus
 from vla_data_juicer_agents.runtime.agentscope_runtime import AgentScopeRuntime
 
 
@@ -22,10 +25,11 @@ def _entry(
     web_session_id="direct-flow",
     scene_mode=None,
     dry_run=True,
+    request="process the selected navigation data",
 ):
     web_session_id = web_session_id or session_id
     return services.task_store.create_task_attempt(
-        request="process the selected navigation data",
+        request=request,
         target=DATE,
         date=DATE,
         segments=[SEGMENT],
@@ -59,6 +63,16 @@ def _complete_required_inspections(services, session_id, web_session_id="direct-
     return _tools(services, session_id, web_session_id)
 
 
+def _inspect(services, session_id, names, web_session_id="direct-flow"):
+    calls = []
+    for name in names:
+        tools = _tools(services, session_id, web_session_id)
+        result = _call(tools[name])
+        assert result["ok"] is True
+        calls.append(name)
+    return calls, _tools(services, session_id, web_session_id)
+
+
 def _evidence_by_kind(services, task_id):
     return {
         descriptor.kind: descriptor.ref
@@ -67,7 +81,17 @@ def _evidence_by_kind(services, task_id):
 
 
 def _activate_extract_plan(services, task, session_id, web_session_id="direct-flow"):
-    tools = _complete_required_inspections(services, session_id, web_session_id)
+    _, tools = _inspect(
+        services,
+        session_id,
+        [
+            "inspect_navigation_artifact_state_tool",
+            "inspect_navigation_raw_metadata_tool",
+            "inspect_navigation_topic_candidates_tool",
+            "inspect_navigation_sensor_candidates_tool",
+        ],
+        web_session_id,
+    )
     context = _call(tools["get_navigation_task_context_tool"])
     payload = _extract_plan(_evidence_by_kind(services, task.task_id))
     result = _call(
@@ -158,27 +182,100 @@ def _settings(tmp_path):
     )
 
 
-def test_raw_only_entry_submits_model_plan_and_executes_all_steps_in_dry_run(tmp_path):
+def _write_finish_inputs(settings):
+    sync_gridmap = (
+        settings.clip_data_root / DATE / SEGMENT / "sync_data" / "clip-1" / "grid_map"
+    )
+    sync_gridmap.mkdir(parents=True, exist_ok=True)
+    (sync_gridmap / "map.json").write_text("{}", encoding="utf-8")
+    (settings.processing_root / "NoobScenes" / "params" / "selected" / "sensors").mkdir(
+        parents=True,
+        exist_ok=True,
+    )
+    converter = settings.processing_root / "NoobScenes" / "include" / "1_odom_convert.py"
+    converter.parent.mkdir(parents=True, exist_ok=True)
+    converter.write_text("# converter", encoding="utf-8")
+    projection = settings.processing_root / "2_pt_project" / "2_othermethod_cjl.py"
+    projection.parent.mkdir(parents=True, exist_ok=True)
+    projection.write_text("# projection", encoding="utf-8")
+
+
+def _execute_active_plan(services, session_id, plan_id, web_session_id="direct-flow"):
+    calls = []
+    while services.plan_store.get(plan_id).status == "active":
+        tools = _tools(services, session_id, web_session_id)
+        current = services.plan_store.get_current_step(plan_id)
+        step = current["step"]
+        calls.append(step["action"])
+        result = _call(
+            tools[f"{step['action']}_tool"],
+            plan_id=plan_id,
+            step_id=step["step_id"],
+        )
+        assert result["ok"] is True
+    return calls
+
+
+def test_raw_only_entry_submits_model_plan_and_executes_canonical_arguments(
+    monkeypatch,
+    tmp_path,
+):
     settings = _settings(tmp_path)
     _write_raw_metadata(settings.vladatasets_root, DATE, SEGMENT)
     services = build_navigation_services(tmp_path, settings)
     task = _entry(services)
 
     assert services.observation_store.latest(task.task_id) is None
+    assert not hasattr(task, "phase")
+    captured = {}
+
+    def record(action):
+        def run(**kwargs):
+            captured[action] = kwargs
+            return ToolResult(ok=True, tool_name=action, message="completed")
+
+        return run
+
+    monkeypatch.setattr(plan_execution, "prepare_raw_data", record("prepare_raw_data"))
+    monkeypatch.setattr(
+        plan_execution,
+        "extract_and_sync_navigation_data",
+        record("extract_and_sync_navigation_data"),
+    )
+
     submitted = _activate_extract_plan(services, task, "direct-flow")
-    while services.plan_store.get(submitted["plan_id"]).status == "active":
-        tools = _tools(services, "direct-flow")
-        current = services.plan_store.get_current_step(submitted["plan_id"])
-        step = current["step"]
-        result = _call(
-            tools[f"{step['action']}_tool"],
-            plan_id=submitted["plan_id"],
-            step_id=step["step_id"],
-        )
-        assert result["ok"] is True
+    executed = _execute_active_plan(services, "direct-flow", submitted["plan_id"])
 
     overview = services.plan_store.get_execution_overview(submitted["plan_id"])
     assert overview.completed_steps == overview.total_steps == 2
+    assert executed == ["prepare_raw_data", "extract_and_sync_navigation_data"]
+    assert captured["prepare_raw_data"] == {
+        "date": DATE,
+        "segments": [SEGMENT],
+        "settings": settings,
+        "dry_run": True,
+    }
+    assert captured["extract_and_sync_navigation_data"] == {
+        "date": DATE,
+        "segments": [SEGMENT],
+        "processes_num": 2,
+        "topic_whitelist": [
+            "/cam_video4/csi_cam/image_raw/compressed",
+            "/rs32_lidar_points",
+            "/sport_odom",
+        ],
+        "topic_map": {
+            "/cam_video4/csi_cam/image_raw/compressed": "fisheye_front",
+            "/rs32_lidar_points": "lidar",
+            "/sport_odom": "odom",
+        },
+        "query_dir": "rs32_lidar_points",
+        "settings": settings,
+        "dry_run": True,
+    }
+    durable_task = services.task_store.get_task(task.task_id)
+    assert durable_task.status == NavigationTaskStatus.ACTIVE
+    assert not hasattr(durable_task, "phase")
     assert (settings.raw_data_root / DATE / SEGMENT / "metadata.yaml").exists()
     assert not (settings.clip_data_root / DATE / SEGMENT / "sync_data").exists()
 
@@ -214,6 +311,164 @@ def test_existing_sync_and_scene_mode_select_finish_plan_without_extract_tools(t
 
     assert result["ok"] is True
     assert services.plan_store.get(result["plan_id"]).phase == "finish_processing"
+
+
+def test_same_session_waits_for_user_then_reinspects_before_finish_plan(tmp_path):
+    settings = _settings(tmp_path)
+    _write_raw_metadata(settings.vladatasets_root, DATE, SEGMENT)
+    services = build_navigation_services(tmp_path, settings)
+    task = _entry(services)
+    extract = _activate_extract_plan(services, task, "direct-flow")
+    _execute_active_plan(services, "direct-flow", extract["plan_id"])
+
+    tools_after_extract = _tools(services, "direct-flow")
+    assert "inspect_navigation_artifact_state_tool" in tools_after_extract
+    assert "submit_extract_sync_plan_tool" in tools_after_extract
+    assert "submit_finish_processing_plan_tool" in tools_after_extract
+    assert "prepare_raw_data_tool" not in tools_after_extract
+    assert services.plan_store.get_active(task.task_id, "finish_processing") is None
+
+    _write_finish_inputs(settings)
+    post_extract_turn = [
+        "inspect_navigation_artifact_state_tool",
+        "assistant: extract/sync verified complete; continue to finish processing?",
+    ]
+    inspected = _call(tools_after_extract[post_extract_turn[0]])
+    assert inspected["ok"] is True
+    assert post_extract_turn[-1].endswith("?")
+    assert not any("submit_finish_processing_plan" in event for event in post_extract_turn)
+    assert services.plan_store.get_active(task.task_id, "finish_processing") is None
+
+    continuation_tools = _tools(services, "direct-flow")
+    guidance = _call(
+        continuation_tools["record_navigation_user_guidance_tool"],
+        text="Continue with finish processing in outdoor scene mode.",
+        scene_mode="out",
+    )
+    assert guidance["ok"] is True
+    calls, planning_tools = _inspect(
+        services,
+        "direct-flow",
+        [
+            "inspect_navigation_artifact_state_tool",
+            "inspect_navigation_gridmap_artifacts_tool",
+            "inspect_navigation_runtime_assets_tool",
+            "inspect_navigation_calibration_inventory_tool",
+            "inspect_navigation_localization_sources_tool",
+        ],
+    )
+    assert calls[0] == "inspect_navigation_artifact_state_tool"
+    context = _call(planning_tools["get_navigation_task_context_tool"])
+    finish = _call(
+        planning_tools["submit_finish_processing_plan_tool"],
+        planning_context_revision=context["planning_context_revision"],
+        plan=_finish_plan(_evidence_by_kind(services, task.task_id)),
+    )
+
+    assert finish["ok"] is True
+    assert services.task_store.get_task(task.task_id).scene_mode == "out"
+    assert services.plan_store.get(finish["plan_id"]).phase == "finish_processing"
+
+
+def test_new_session_distrusts_sync_claim_and_selects_stage_from_inspection(tmp_path):
+    settings = _settings(tmp_path)
+    _write_raw_metadata(settings.vladatasets_root, DATE, SEGMENT)
+    services = build_navigation_services(tmp_path, settings)
+    old = _entry(services, session_id="old", web_session_id="web-old")
+    old_plan = _activate_extract_plan(services, old, "old", "web-old")
+    _execute_active_plan(services, "old", old_plan["plan_id"], "web-old")
+    _write_finish_inputs(settings)
+
+    new = _entry(
+        services,
+        session_id="new",
+        web_session_id="web-new",
+        scene_mode="out",
+        request="同步已完成，请继续处理",
+    )
+    assert new.task_id != old.task_id
+    assert services.observation_store.latest(new.task_id) is None
+    assert services.plan_store.get_active_for_task(new.task_id) is None
+
+    first_result = _call(_tools(services, "new", "web-new")["inspect_navigation_artifact_state_tool"])
+    first_observation = services.observation_store.latest(new.task_id)
+    assert first_result["ok"] is True
+    assert first_observation.completed_kinds == ["artifact_state"]
+    assert first_observation.payloads[0].snapshot.sync_data_exists is True
+
+    _, planning_tools = _inspect(
+        services,
+        "new",
+        [
+            "inspect_navigation_gridmap_artifacts_tool",
+            "inspect_navigation_runtime_assets_tool",
+            "inspect_navigation_calibration_inventory_tool",
+            "inspect_navigation_localization_sources_tool",
+        ],
+        "web-new",
+    )
+    context = _call(planning_tools["get_navigation_task_context_tool"])
+    finish = _call(
+        planning_tools["submit_finish_processing_plan_tool"],
+        planning_context_revision=context["planning_context_revision"],
+        plan=_finish_plan(_evidence_by_kind(services, new.task_id)),
+    )
+    assert finish["ok"] is True
+    assert services.plan_store.get(finish["plan_id"]).phase == "finish_processing"
+
+
+def test_deleted_products_make_new_attempt_reinspect_and_rerun_extract_sync(tmp_path):
+    settings = _settings(tmp_path)
+    _write_raw_metadata(settings.vladatasets_root, DATE, SEGMENT)
+    _write_finish_inputs(settings)
+    final = settings.finish_data_root / DATE / SEGMENT / "clip-1"
+    final.mkdir(parents=True)
+    services = build_navigation_services(tmp_path, settings)
+    historical = _entry(services, session_id="historical", web_session_id="web-historical")
+    services.task_store.update_task_for_session(
+        historical.task_id,
+        web_session_id="web-historical",
+        agentscope_session_id="historical",
+        status=NavigationTaskStatus.COMPLETED.value,
+    )
+    shutil.rmtree(settings.clip_data_root / DATE)
+    shutil.rmtree(settings.finish_data_root / DATE)
+
+    current = _entry(
+        services,
+        session_id="current",
+        web_session_id="web-current",
+        request="同步已完成，请继续处理",
+    )
+    first = _call(
+        _tools(services, "current", "web-current")["inspect_navigation_artifact_state_tool"]
+    )
+    observation = services.observation_store.latest(current.task_id)
+    artifact = observation.payloads[0].snapshot
+    assert first["ok"] is True
+    assert artifact.raw_input_exists is True
+    assert artifact.sync_data_exists is False
+    assert artifact.final_outputs_exist is False
+
+    _, tools = _inspect(
+        services,
+        "current",
+        [
+            "inspect_navigation_raw_metadata_tool",
+            "inspect_navigation_topic_candidates_tool",
+            "inspect_navigation_sensor_candidates_tool",
+        ],
+        "web-current",
+    )
+    context = _call(tools["get_navigation_task_context_tool"])
+    rerun = _call(
+        tools["submit_extract_sync_plan_tool"],
+        planning_context_revision=context["planning_context_revision"],
+        plan=_extract_plan(_evidence_by_kind(services, current.task_id)),
+    )
+    assert rerun["ok"] is True
+    assert current.task_id != historical.task_id
+    assert services.plan_store.get(rerun["plan_id"]).phase == "extract_sync"
 
 
 def test_existing_outputs_are_not_entry_facts_and_new_session_reinspects(tmp_path):
