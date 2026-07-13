@@ -4,8 +4,10 @@ import asyncio
 import inspect
 import json
 import sqlite3
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path
+from threading import Barrier
 from types import SimpleNamespace
 
 import pytest
@@ -18,6 +20,8 @@ from vla_data_juicer_agents.navigation.models import ToolResult
 from vla_data_juicer_agents.navigation.observation_models import (
     CalibrationInventoryObservation,
     EvidenceWrite,
+    GridmapArtifactsObservation,
+    RuntimeAssetsObservation,
 )
 from vla_data_juicer_agents.navigation.observation_store import (
     SqliteNavigationObservationStore,
@@ -478,6 +482,140 @@ def test_changed_input_precondition_records_evidence_without_artifact_reconcilia
     assert evidence["data"]["missing_inputs"]
 
 
+@pytest.mark.parametrize(
+    ("decision_source", "step_variant", "removed_input"),
+    [
+        ("existing_gridmap", "copy_existing_gridmap", "gridmap_json"),
+        ("generated_from_pcd", "generate_from_pcd", "pcd_source"),
+        ("generated_from_pcd", "generate_from_pcd", "pcd_runtime"),
+        ("projection_ready", "skip_if_projection_ready", "gridmap_json"),
+    ],
+)
+def test_gridmap_step_rejects_drift_in_exact_observed_inputs(
+    monkeypatch,
+    tmp_path,
+    decision_source,
+    step_variant,
+    removed_input,
+):
+    settings = NavigationSettings(
+        vladatasets_root=tmp_path / "datasets",
+        processing_root=tmp_path / "processing",
+    )
+    date, segment = "20260710", "segment-a"
+    sensor_source = "NoobScenes/params/observed/sensors"
+    (settings.processing_root / sensor_source).mkdir(parents=True)
+    gridmap_dir = tmp_path / "observed" / "grid_map"
+    gridmap_dir.mkdir(parents=True)
+    gridmap_json = gridmap_dir / "map.json"
+    gridmap_json.write_text("{}", encoding="utf-8")
+    pcd_source = tmp_path / "observed" / "source.pcd"
+    pcd_source.write_text("pcd", encoding="utf-8")
+    settings.pcd_to_grid_script.parent.mkdir(parents=True)
+    settings.pcd_to_grid_script.write_text("# runtime", encoding="utf-8")
+
+    db_path = tmp_path / "navigation.sqlite"
+    task_store = SqliteNavigationTaskStore(db_path)
+    task = task_store.create_or_update_task(
+        date=date,
+        segments=[segment],
+        scene_mode="out",
+        dry_run=True,
+    )
+    task = task_store.update_task(
+        task.task_id,
+        phase="finish_processing",
+        status="pending",
+    )
+    evidence_store = FileNavigationEvidenceStore(tmp_path / "evidence")
+    observation_store = SqliteNavigationObservationStore(db_path)
+    observation = observation_store.append(
+        task.task_id,
+        "gridmap_artifacts",
+        [
+            GridmapArtifactsObservation(
+                existing_gridmap_paths=[str(gridmap_dir)]
+                if decision_source != "generated_from_pcd"
+                else [],
+                pcd_sources=[str(pcd_source)]
+                if decision_source == "generated_from_pcd"
+                else [],
+                projection_ready=decision_source == "projection_ready",
+            ),
+            RuntimeAssetsObservation(
+                pcd_gridmap_tool_available=True,
+                manual_annotation_gui_available=True,
+                projection_variants={"cjl_0525_with_gridmap": True},
+            ),
+            CalibrationInventoryObservation(sensor_sources=[sensor_source]),
+        ],
+        [],
+        evidence_store,
+        expected_web_session_id=None,
+        expected_agentscope_session_id=None,
+    )
+    plan_payload = finish_plan(sensor_source).model_dump(mode="json")
+    plan_payload["decisions"]["gridmap"]["source"] = decision_source
+    next(
+        step for step in plan_payload["steps"] if step["step_id"] == "gridmap"
+    )["variant"] = step_variant
+    plan_store = SqliteNavigationPlanRepository(db_path)
+    plan = plan_store.activate(
+        task,
+        "finish_processing",
+        observation.revision,
+        FinishProcessingPlanInput.model_validate(plan_payload),
+    )
+    with sqlite3.connect(db_path) as connection:
+        connection.execute(
+            "UPDATE navigation_task_steps SET status = 'completed' "
+            "WHERE plan_id = ? AND step_id IN "
+            "('confirm', 'assemble', 'preprocess', 'annotate', 'tracking')",
+            (plan.plan_id,),
+        )
+
+    removed = {
+        "gridmap_json": gridmap_json,
+        "pcd_source": pcd_source,
+        "pcd_runtime": settings.pcd_to_grid_script,
+    }[removed_input]
+    removed.unlink()
+    invoked = []
+    monkeypatch.setattr(
+        plan_execution,
+        "prepare_gridmap_for_projection",
+        lambda **kwargs: invoked.append(kwargs)
+        or ok_result("prepare_gridmap_for_projection"),
+    )
+    tools = {
+        tool.name: tool
+        for tool in plan_execution.build_plan_bound_execution_tools(
+            task=task,
+            plan_store=plan_store,
+            evidence_store=evidence_store,
+            settings=settings,
+            dry_run=True,
+            cancellation=None,
+        )
+    }
+
+    result = call_tool(
+        tools["prepare_gridmap_for_projection_tool"],
+        plan_id=plan.plan_id,
+        step_id="gridmap",
+    )
+
+    assert result["ok"] is False
+    assert result["error_type"] == "input_precondition_changed"
+    assert result["result_ref"]
+    assert invoked == []
+    assert plan_store.get(plan.plan_id).status == "invalidated"
+    assert plan_store.get_current_step(plan.plan_id)["step"]["status"] == "needs_replan"
+    evidence = evidence_store.read(task.task_id, result["result_ref"])
+    expected_missing = gridmap_dir if removed_input == "gridmap_json" else removed
+    assert str(expected_missing) in evidence["data"]["missing_inputs"]
+
+
 def test_plan_bound_writer_returns_compact_busy_without_invocation(monkeypatch, tmp_path):
     settings = NavigationSettings(
         vladatasets_root=tmp_path / "datasets",
@@ -680,6 +818,185 @@ def test_human_decision_permission_fails_closed_when_sensor_input_disappears(tmp
     assert json.loads(evidence_files[0].read_text(encoding="utf-8"))["missing_inputs"]
 
 
+def test_waiting_human_decision_retry_enters_audited_recovery_when_input_drifts(
+    monkeypatch,
+    tmp_path,
+):
+    settings = NavigationSettings(
+        vladatasets_root=tmp_path / "datasets",
+        processing_root=tmp_path / "processing",
+    )
+    source = "NoobScenes/params/observed/sensors"
+    source_path = settings.processing_root / source
+    source_path.mkdir(parents=True)
+    date, segment = "20260710", "segment-a"
+    db_path = tmp_path / "navigation.sqlite"
+    task_store = SqliteNavigationTaskStore(db_path)
+    task = task_store.create_or_update_task(
+        date=date,
+        segments=[segment],
+        scene_mode="out",
+        dry_run=True,
+    )
+    task = task_store.update_task(
+        task.task_id,
+        phase="finish_processing",
+        status="pending",
+    )
+    evidence_store = FileNavigationEvidenceStore(tmp_path / "evidence")
+    observation = SqliteNavigationObservationStore(db_path).append(
+        task.task_id,
+        "calibration_inventory",
+        [CalibrationInventoryObservation(sensor_sources=[source])],
+        [],
+        evidence_store,
+        expected_web_session_id=None,
+        expected_agentscope_session_id=None,
+    )
+    owner, agent = "web-owner", "web-owner-agent"
+    task = task_store.update_task(
+        task.task_id,
+        created_by_web_session_id=owner,
+        latest_web_session_id=owner,
+        agentscope_session_id=agent,
+    )
+    plan_store = SqliteNavigationPlanRepository(db_path)
+    plan = plan_store.activate(
+        task,
+        "finish_processing",
+        observation.revision,
+        finish_plan(source),
+        expected_web_session_id=owner,
+        expected_agentscope_session_id=agent,
+    )
+    outcomes = []
+    original_prepare = plan_execution.prepare_plan_human_decision
+
+    def capture_prepare(**kwargs):
+        outcome = original_prepare(**kwargs)
+        outcomes.append(outcome)
+        return outcome
+
+    monkeypatch.setattr(plan_execution, "prepare_plan_human_decision", capture_prepare)
+    request_tool = next(
+        tool
+        for tool in plan_execution.build_plan_bound_execution_tools(
+            task=task,
+            plan_store=plan_store,
+            evidence_store=evidence_store,
+            settings=settings,
+            dry_run=True,
+            cancellation=None,
+            web_session_id=owner,
+            agentscope_session_id=agent,
+        )
+        if tool.name == "request_human_decision"
+    )
+
+    first_permission = asyncio.run(
+        request_tool.check_permissions(
+            {"plan_id": plan.plan_id, "step_id": "confirm"},
+            None,
+        )
+    )
+    assert first_permission.behavior.value == "allow"
+    assert outcomes[-1] is None
+    assert plan_store.get_current_step(plan.plan_id)["step"]["status"] == "waiting_user"
+    source_path.rmdir()
+
+    retry_permission = asyncio.run(
+        request_tool.check_permissions(
+            {"plan_id": plan.plan_id, "step_id": "confirm"},
+            None,
+        )
+    )
+    denied = outcomes[-1]
+
+    assert retry_permission.behavior.value == "deny"
+    assert denied is not None
+    assert denied["error_type"] == "input_precondition_changed"
+    assert denied["result_ref"]
+    assert denied["recovery_required"] is True
+    handoff = plan_store.get_human_decision_handoff(plan.plan_id, "confirm")
+    assert handoff is not None
+    assert handoff.status == "recovery_required"
+    assert handoff.delivery_status == "recovery_required"
+    assert handoff.recovery_reason_code == "input_precondition_changed"
+    assert handoff.decision == {
+        "plan_id": plan.plan_id,
+        "request_state": "waiting_user",
+        "step_id": "confirm",
+    }
+    assert plan_store.get(plan.plan_id).status == "active"
+    assert plan_store.get_current_step(plan.plan_id)["step"]["status"] == "waiting_user"
+    evidence = evidence_store.read(task.task_id, denied["result_ref"])
+    assert str(source_path) in evidence["data"]["missing_inputs"]
+
+    recovered = plan_store.quarantine_human_decision_handoff(
+        plan.plan_id,
+        "confirm",
+        expected_web_session_id=owner,
+        reason="accepted calibration source disappeared before retry",
+    )
+
+    assert recovered["handoff_status"] == "quarantined"
+    assert plan_store.get(plan.plan_id).status == "invalidated"
+    assert plan_store.get_current_step(plan.plan_id)["step"]["status"] == "needs_replan"
+    assert task_store.get_task(task.task_id).status.value == "needs_replan"
+
+
+def test_waiting_human_decision_retry_without_drift_remains_allowed(tmp_path):
+    settings = NavigationSettings(
+        vladatasets_root=tmp_path / "datasets",
+        processing_root=tmp_path / "processing",
+    )
+    source = "NoobScenes/params/observed/sensors"
+    (settings.processing_root / source).mkdir(parents=True)
+    db_path = tmp_path / "navigation.sqlite"
+    task_store = SqliteNavigationTaskStore(db_path)
+    task = task_store.create_or_update_task(
+        date="20260710",
+        segments=["segment-a"],
+        scene_mode="out",
+        dry_run=True,
+    )
+    task = task_store.update_task(
+        task.task_id,
+        phase="finish_processing",
+        status="pending",
+    )
+    evidence_store = FileNavigationEvidenceStore(tmp_path / "evidence")
+    observation = SqliteNavigationObservationStore(db_path).append(
+        task.task_id,
+        "calibration_inventory",
+        [CalibrationInventoryObservation(sensor_sources=[source])],
+        [],
+        evidence_store,
+        expected_web_session_id=None,
+        expected_agentscope_session_id=None,
+    )
+    plan_store = SqliteNavigationPlanRepository(db_path)
+    plan = plan_store.activate(
+        task,
+        "finish_processing",
+        observation.revision,
+        finish_plan(source),
+    )
+    arguments = {
+        "task": task,
+        "plan_store": plan_store,
+        "evidence_store": evidence_store,
+        "settings": settings,
+        "plan_id": plan.plan_id,
+        "step_id": "confirm",
+    }
+
+    assert plan_execution.prepare_plan_human_decision(**arguments) is None
+    assert plan_execution.prepare_plan_human_decision(**arguments) is None
+    assert plan_store.get_current_step(plan.plan_id)["step"]["status"] == "waiting_user"
+    assert plan_store.get_human_decision_handoff(plan.plan_id, "confirm") is None
+
+
 def test_stale_agentscope_session_cannot_claim_plan_bound_step(monkeypatch, tmp_path):
     services = build_services(tmp_path)
     bound = services.task_store.update_task(
@@ -724,7 +1041,100 @@ def test_stale_agentscope_session_cannot_claim_plan_bound_step(monkeypatch, tmp_
 
     assert result["error_type"] == "navigation_task_session_mismatch"
     assert invoked == []
-    assert services.plan_store.get_current_step(services.plan.plan_id)["step"]["status"] == "pending"
+
+
+def test_old_wrapper_cannot_claim_after_same_session_creates_new_current_attempt(
+    monkeypatch,
+    tmp_path,
+):
+    settings = NavigationSettings(
+        vladatasets_root=tmp_path / "datasets",
+        processing_root=tmp_path / "processing",
+    )
+    date, segment = "20260710", "segment-a"
+    (settings.raw_data_root / date / segment).mkdir(parents=True)
+    db_path = tmp_path / "navigation.sqlite"
+    task_store = SqliteNavigationTaskStore(db_path)
+    owner, agent = "web-owner", "web-owner-agent"
+    task = task_store.create_task_attempt(
+        request="process A",
+        target=date,
+        date=date,
+        segments=[segment],
+        scene_mode=None,
+        dry_run=False,
+        web_session_id=owner,
+        agentscope_session_id=agent,
+    ).task
+    plan_store = SqliteNavigationPlanRepository(db_path)
+    plan = plan_store.activate(
+        task,
+        "extract_sync",
+        1,
+        extract_plan(two_steps=True),
+        expected_web_session_id=owner,
+        expected_agentscope_session_id=agent,
+    )
+    evidence_store = FileNavigationEvidenceStore(tmp_path / "evidence")
+    invoked = []
+    monkeypatch.setattr(
+        plan_execution,
+        "prepare_raw_data",
+        lambda **kwargs: invoked.append(kwargs) or ok_result("prepare_raw_data"),
+    )
+    tool = next(
+        candidate
+        for candidate in plan_execution.build_plan_bound_execution_tools(
+            task=task,
+            plan_store=plan_store,
+            evidence_store=evidence_store,
+            settings=settings,
+            dry_run=False,
+            cancellation=None,
+            web_session_id=owner,
+            agentscope_session_id=agent,
+        )
+        if candidate.name == "prepare_raw_data_tool"
+    )
+    barrier = Barrier(2)
+
+    def create_new_current_attempt():
+        barrier.wait()
+        task_store.create_task_attempt(
+            request="process B",
+            target="20260711",
+            date="20260711",
+            segments=["segment-b"],
+            scene_mode=None,
+            dry_run=False,
+            web_session_id=owner,
+            agentscope_session_id=agent,
+        )
+        barrier.wait()
+
+    original_verify = plan_execution.verify_plan_step_preconditions
+
+    def gate_then_wait_for_new_attempt(**kwargs):
+        result = original_verify(**kwargs)
+        barrier.wait()
+        barrier.wait()
+        return result
+
+    monkeypatch.setattr(
+        plan_execution,
+        "verify_plan_step_preconditions",
+        gate_then_wait_for_new_attempt,
+    )
+
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        future = executor.submit(create_new_current_attempt)
+        result = call_tool(tool, plan_id=plan.plan_id, step_id="prepare")
+        future.result()
+
+    assert result["ok"] is False
+    assert result["error_type"] == "navigation_task_session_mismatch"
+    assert invoked == []
+    assert plan_store.get_current_step(plan.plan_id)["step"]["status"] == "pending"
 
 
 def test_execution_snapshot_cannot_overwrite_same_owner_rebind(monkeypatch, tmp_path):

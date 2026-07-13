@@ -28,6 +28,8 @@ from vla_data_juicer_agents.navigation.execution_tools import (
 )
 from vla_data_juicer_agents.navigation.observation_models import (
     CalibrationInventoryObservation,
+    GridmapArtifactsObservation,
+    RuntimeAssetsObservation,
 )
 from vla_data_juicer_agents.navigation.observation_store import (
     SqliteNavigationObservationStore,
@@ -222,6 +224,7 @@ def verify_plan_step_preconditions(
     plan: NavigationPlanRecord,
     step: Any,
     settings: NavigationSettings,
+    plan_store: SqliteNavigationPlanRepository,
 ) -> dict[str, Any] | None:
     """Check only concrete inputs required by canonical arguments for one step."""
     arguments = resolve_step_arguments(
@@ -243,6 +246,10 @@ def verify_plan_step_preconditions(
         for segment in task.segments:
             require(root.joinpath(segment, *suffix))
 
+    def require_gridmap_json_dir(path: Path) -> None:
+        if not path.is_dir() or not any(child.is_file() for child in path.glob("*.json")):
+            missing.append(path)
+
     action = step.action
     if action == "prepare_raw_data":
         require_segments(settings.raw_data_root / task.date)
@@ -261,11 +268,63 @@ def verify_plan_step_preconditions(
                 settings.clip_data_root / task.date,
                 suffix=("sync_data",),
             )
+    elif action == "prepare_gridmap_for_projection":
+        observation = SqliteNavigationObservationStore(
+            plan_store.db_path,
+            initialize=False,
+        ).get(task.task_id, plan.observation_revision)
+        payloads = observation.payloads if observation is not None else []
+        gridmap = next(
+            (
+                payload
+                for payload in payloads
+                if isinstance(payload, GridmapArtifactsObservation)
+            ),
+            None,
+        )
+        runtime = next(
+            (
+                payload
+                for payload in payloads
+                if isinstance(payload, RuntimeAssetsObservation)
+            ),
+            None,
+        )
+        source = plan.plan.decisions.gridmap.source
+        expected_variant = {
+            "existing_gridmap": "copy_existing_gridmap",
+            "generated_from_pcd": "generate_from_pcd",
+            "projection_ready": "skip_if_projection_ready",
+        }[source]
+        canonical_variant = arguments["gridmap_variant"]
+        if canonical_variant != expected_variant or gridmap is None:
+            missing.append(Path(f"accepted_observation:{source}:{canonical_variant}"))
+        elif canonical_variant == "copy_existing_gridmap":
+            if not gridmap.existing_gridmap_paths:
+                missing.append(Path("accepted_observation:existing_gridmap_paths"))
+            for observed_path in gridmap.existing_gridmap_paths:
+                require_gridmap_json_dir(Path(observed_path))
+        elif canonical_variant == "generate_from_pcd":
+            if not gridmap.pcd_sources:
+                missing.append(Path("accepted_observation:pcd_sources"))
+            for observed_path in gridmap.pcd_sources:
+                if not Path(observed_path).is_file():
+                    missing.append(Path(observed_path))
+            if runtime is None or not runtime.pcd_gridmap_tool_available:
+                missing.append(settings.pcd_to_grid_script)
+            elif not settings.pcd_to_grid_script.is_file():
+                missing.append(settings.pcd_to_grid_script)
+        elif canonical_variant == "skip_if_projection_ready":
+            if not gridmap.projection_ready:
+                missing.append(Path("accepted_observation:projection_ready"))
+            if not gridmap.existing_gridmap_paths:
+                missing.append(Path("accepted_observation:projection_ready_paths"))
+            for observed_path in gridmap.existing_gridmap_paths:
+                require_gridmap_json_dir(Path(observed_path))
     elif action in {
         "run_noobscene_preprocessing",
         "run_initial_annotation_gui",
         "run_tracking",
-        "prepare_gridmap_for_projection",
         "run_projection_and_trajectory",
     }:
         if not task.dry_run:
@@ -631,6 +690,7 @@ def _invoke_plan_step(
         plan=plan,
         step=step,
         settings=settings,
+        plan_store=plan_store,
     )
     if precondition_failure is not None:
         return _record_changed_preconditions(
@@ -657,6 +717,16 @@ def _invoke_plan_step(
             retry="wait_and_reinspect",
         )
     if claim_outcome is not StepClaimOutcome.CLAIMED:
+        if plan_store.read_execution_snapshot(
+            web_session_id=expected_web_session_id,
+            agentscope_session_id=expected_agentscope_session_id,
+            task_id=task.task_id,
+        ) is None:
+            return _compact_error(
+                "navigation_task_session_mismatch",
+                "The bound navigation task is no longer the current attempt for this session.",
+                next_action="inspect_current_navigation_task",
+            )
         return _terminal_error(plan_store, plan.plan_id)
 
     try:
@@ -797,15 +867,46 @@ def prepare_plan_human_decision(
     assert durable_task is not None and plan is not None and step is not None
     assert snapshot is not None
     current = snapshot.current
-    if current is not None and current["step"]["status"] == "waiting_user":
-        return None
+    waiting_user = current is not None and current["step"]["status"] == "waiting_user"
     precondition_failure = verify_plan_step_preconditions(
         task=durable_task,
         plan=plan,
         step=step,
         settings=settings,
+        plan_store=plan_store,
     )
     if precondition_failure is not None:
+        if waiting_user:
+            descriptor = evidence_store.write(
+                durable_task.task_id,
+                plan.observation_revision,
+                "execution_precondition",
+                step.action,
+                precondition_failure,
+                f"Input precondition changed before {step.step_id} retry",
+            )
+            anchored = plan_store.mark_human_decision_recovery_required(
+                plan.plan_id,
+                step.step_id,
+                reason_code="input_precondition_changed",
+                request_anchor={
+                    "plan_id": plan.plan_id,
+                    "request_state": "waiting_user",
+                    "step_id": step.step_id,
+                },
+                expected_web_session_id=expected_web_session_id,
+                expected_agentscope_session_id=expected_agentscope_session_id,
+            )
+            if not anchored:
+                return _terminal_error(plan_store, plan.plan_id)
+            return _compact_error(
+                "input_precondition_changed",
+                "A concrete input changed while the human decision request was waiting; audited recovery is required before replanning.",
+                result_ref=descriptor.ref,
+                missing_input_count=precondition_failure["missing_input_count"],
+                recovery_required=True,
+                next_action="quarantine_human_decision_handoff",
+            )
         return _record_changed_preconditions(
             task=durable_task,
             plan=plan,
@@ -816,6 +917,8 @@ def prepare_plan_human_decision(
             expected_web_session_id=expected_web_session_id,
             expected_agentscope_session_id=expected_agentscope_session_id,
         )
+    if waiting_user:
+        return None
     if not plan_store.mark_waiting_user(
         plan.plan_id,
         step.step_id,

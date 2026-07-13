@@ -1004,8 +1004,8 @@ class SqliteNavigationPlanRepository:
             )
             candidate = connection.execute(
                 """
-                SELECT steps.status, tasks.dry_run, tasks.date, tasks.segments_json,
-                       plans.status AS plan_status
+                SELECT steps.status, tasks.task_id, tasks.dry_run, tasks.date,
+                       tasks.segments_json, plans.status AS plan_status
                 FROM navigation_task_steps AS steps
                 JOIN navigation_plans AS plans ON plans.plan_id = steps.plan_id
                 JOIN navigation_tasks AS tasks ON tasks.task_id = steps.task_id
@@ -1023,6 +1023,31 @@ class SqliteNavigationPlanRepository:
             ):
                 connection.rollback()
                 return StepClaimOutcome.NOT_CLAIMABLE
+
+            if (
+                expected_web_session_id is not None
+                or expected_agentscope_session_id is not None
+            ):
+                current_attempt = connection.execute(
+                    """SELECT task_id
+                       FROM navigation_tasks
+                       WHERE created_by_web_session_id IS ?
+                         AND latest_web_session_id IS ?
+                         AND agentscope_session_id IS ?
+                       ORDER BY created_at DESC, rowid DESC
+                       LIMIT 1""",
+                    (
+                        expected_web_session_id,
+                        expected_web_session_id,
+                        expected_agentscope_session_id,
+                    ),
+                ).fetchone()
+                if (
+                    current_attempt is None
+                    or current_attempt["task_id"] != candidate["task_id"]
+                ):
+                    connection.rollback()
+                    return StepClaimOutcome.NOT_CLAIMABLE
 
             locking_actions = {
                 capability.tool_name
@@ -1787,6 +1812,7 @@ class SqliteNavigationPlanRepository:
         step_id: str,
         *,
         reason_code: str,
+        request_anchor: dict[str, Any] | None = None,
         expected_web_session_id: str | None = None,
         expected_agentscope_session_id: str | None = None,
     ) -> bool:
@@ -1805,6 +1831,46 @@ class SqliteNavigationPlanRepository:
                    WHERE plan_id = ? AND step_id = ?""",
                 (plan_id, step_id),
             ).fetchone()
+            if row is None and request_anchor is not None:
+                canonical_anchor = self._canonical_json(request_anchor)
+                if len(canonical_anchor.encode("utf-8")) > MAX_HUMAN_DECISION_CHARS:
+                    raise ValueError(
+                        f"human decision request anchor exceeds {MAX_HUMAN_DECISION_CHARS} byte limit"
+                    )
+                step_row = connection.execute(
+                    """SELECT steps.task_id
+                       FROM navigation_task_steps AS steps
+                       JOIN navigation_plans AS plans ON plans.plan_id = steps.plan_id
+                       WHERE steps.plan_id = ? AND steps.step_id = ?
+                         AND steps.tool_name = 'confirm_navigation_calibration_params'
+                         AND steps.status = 'waiting_user'
+                         AND plans.status = 'active'""",
+                    (plan_id, step_id),
+                ).fetchone()
+                if step_row is None:
+                    connection.rollback()
+                    return False
+                timestamp = utc_now()
+                connection.execute(
+                    """INSERT INTO navigation_human_decision_handoffs (
+                           plan_id, step_id, task_id, decision_key, decision_json,
+                           status, delivery_status, recovery_reason_code,
+                           created_at, updated_at
+                       ) VALUES (?, ?, ?, ?, ?, 'recovery_required',
+                           'recovery_required', ?, ?, ?)""",
+                    (
+                        plan_id,
+                        step_id,
+                        step_row["task_id"],
+                        hashlib.sha256(canonical_anchor.encode("utf-8")).hexdigest(),
+                        canonical_anchor,
+                        safe_code,
+                        timestamp,
+                        timestamp,
+                    ),
+                )
+                connection.commit()
+                return True
             if row is None or row["status"] == "quarantined":
                 connection.rollback()
                 return False
