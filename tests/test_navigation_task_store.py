@@ -15,6 +15,15 @@ from vla_data_juicer_agents.navigation.task_state import (
 from vla_data_juicer_agents.navigation.task_store import SqliteNavigationTaskStore
 
 
+def test_task_store_exposes_only_cas_compensation_mutators(tmp_path: Path):
+    store = SqliteNavigationTaskStore(tmp_path / "navigation_tasks.sqlite")
+
+    assert not hasattr(store, "restore_task" + "_exact")
+    assert not hasattr(store, "delete" + "_task")
+    assert hasattr(store, "restore_task_exact_if_current")
+    assert hasattr(store, "delete_task_if_current")
+
+
 def test_task_store_idempotently_migrates_plan_ledger_columns(tmp_path: Path):
     db_path = tmp_path / "navigation_tasks.sqlite"
 
@@ -207,50 +216,6 @@ def test_new_task_cleanup_delete_is_state_revision_cas(monkeypatch, tmp_path: Pa
 
     assert deleted is False
     assert store.get_task(created.task_id) == updated
-
-
-def test_task_store_exact_restore_preserves_entire_persisted_model(
-    monkeypatch,
-    tmp_path: Path,
-):
-    tick = 0
-
-    def advancing_utc_now() -> str:
-        nonlocal tick
-        tick += 1
-        return f"2026-07-10T00:00:00.{tick:03d}+00:00"
-
-    monkeypatch.setattr(task_store_module, "utc_now", advancing_utc_now)
-    store = SqliteNavigationTaskStore(tmp_path / "navigation_tasks.sqlite")
-    original = store.create_or_update_task(
-        date="20270623",
-        segments=["segment_a"],
-        scene_mode=None,
-        web_session_id="web-old",
-        agentscope_session_id="as-old",
-    )
-    original = store.update_task_for_session(
-        original.task_id,
-        web_session_id="web-old",
-        agentscope_session_id="as-old",
-        guidance_revision=4,
-        status=NavigationTaskStatus.NEEDS_RECONCILE,
-    )
-    with sqlite3.connect(store.db_path) as connection:
-        connection.execute(
-            """UPDATE navigation_tasks
-               SET guidance_revision = 5, phase = 'extract_sync', status = 'running',
-                   latest_web_session_id = 'web-new', agentscope_session_id = 'as-new',
-                   state_revision = state_revision + 1
-               WHERE task_id = ?""",
-            (original.task_id,),
-        )
-
-    restored = store.restore_task_exact(original)
-
-    assert restored.model_copy(update={"state_revision": original.state_revision}) == original
-    assert restored.state_revision > original.state_revision
-    assert store.get_task(original.task_id) == restored
 
 
 def test_task_store_update_task_ignores_caller_timestamps(monkeypatch, tmp_path: Path):

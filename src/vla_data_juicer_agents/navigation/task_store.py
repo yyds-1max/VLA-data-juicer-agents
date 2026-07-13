@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 import sqlite3
 from pathlib import Path
-from typing import Any, Protocol
+from typing import Any
 from uuid import uuid4
 
 from vla_data_juicer_agents.navigation.aggregate_revision import (
@@ -178,32 +178,6 @@ def authorize_navigation_task_write(
         return
     raise PermissionError("navigation task session mismatch")
 
-
-class NavigationTaskStore(Protocol):
-    def create_or_update_task(
-        self,
-        *,
-        date: str,
-        segments: list[str] | None,
-        scene_mode: str | None,
-        dry_run: bool | None = None,
-        web_session_id: str | None = None,
-        agentscope_session_id: str | None = None,
-    ) -> NavigationTask: ...
-
-    def get_task(self, task_id: str) -> NavigationTask | None: ...
-
-    def find_latest_by_date(self, date: str, segments: list[str] | None = None) -> NavigationTask | None: ...
-
-    def find_latest_by_agentscope_session(self, session_id: str) -> NavigationTask | None: ...
-
-    def list_resumable(self, date: str | None = None) -> list[NavigationTask]: ...
-
-    def update_task(self, task_id: str, **changes: Any) -> NavigationTask: ...
-
-    def restore_task_exact(self, task: NavigationTask) -> NavigationTask: ...
-
-    def delete_task(self, task_id: str) -> None: ...
 
 class SqliteNavigationTaskStore:
     def __init__(self, db_path: str | Path, *, initialize: bool = True) -> None:
@@ -701,23 +675,6 @@ class SqliteNavigationTaskStore:
         payload["state_revision"] = current.state_revision + 1
         return NavigationTask.model_validate(payload)
 
-    def restore_task_exact(self, task: NavigationTask) -> NavigationTask:
-        current = self.get_task(task.task_id)
-        if current is None:
-            raise KeyError(task.task_id)
-        task = task.model_copy(update={"state_revision": current.state_revision + 1})
-        with self._connect() as connection:
-            cursor = self._update_task(connection, task)
-            if cursor.rowcount == 0:
-                raise KeyError(task.task_id)
-            row = connection.execute(
-                "SELECT * FROM navigation_tasks WHERE task_id = ?",
-                (task.task_id,),
-            ).fetchone()
-        if row is None:
-            raise KeyError(task.task_id)
-        return self._task_from_row(row)
-
     def restore_task_exact_if_current(
         self, task: NavigationTask, *, expected_state_revision: int,
         expected_web_session_id: str | None, expected_agentscope_session_id: str | None,
@@ -751,19 +708,6 @@ class SqliteNavigationTaskStore:
                  expected_agentscope_session_id),
             )
         return cursor.rowcount == 1
-
-    def delete_task(self, task_id: str) -> None:
-        with self._connect() as connection:
-            connection.execute(
-                "DELETE FROM navigation_task_steps WHERE task_id = ?",
-                (task_id,),
-            )
-            cursor = connection.execute(
-                "DELETE FROM navigation_tasks WHERE task_id = ?",
-                (task_id,),
-            )
-            if cursor.rowcount == 0:
-                raise KeyError(task_id)
 
     def _insert_task(self, connection: sqlite3.Connection, task: NavigationTask) -> None:
         connection.execute(
