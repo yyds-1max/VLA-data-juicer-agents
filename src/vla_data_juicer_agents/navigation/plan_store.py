@@ -26,7 +26,6 @@ from vla_data_juicer_agents.navigation.task_state import NavigationTask, utc_now
 from vla_data_juicer_agents.navigation.task_store import (
     SqliteNavigationTaskStore,
     authorize_navigation_task_write,
-    ensure_navigation_task_step_ledger_columns,
 )
 from vla_data_juicer_agents.navigation.planning_context import (
     compute_planning_context_revision,
@@ -147,7 +146,6 @@ class SqliteNavigationPlanRepository:
     def _init_schema(self) -> None:
         SqliteNavigationTaskStore(self.db_path)
         with self._connect() as connection:
-            ensure_navigation_task_step_ledger_columns(connection)
             connection.execute(
                 """
                 CREATE TABLE IF NOT EXISTS navigation_plans (

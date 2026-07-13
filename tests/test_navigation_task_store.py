@@ -79,18 +79,41 @@ def test_task_store_exposes_only_cas_compensation_mutators(tmp_path: Path):
     assert hasattr(store, "delete_task_if_current")
 
 
-def test_task_store_idempotently_migrates_plan_ledger_columns(tmp_path: Path):
+def test_task_store_idempotently_creates_supported_schema_generation(tmp_path: Path):
     db_path = tmp_path / "navigation_tasks.sqlite"
 
     SqliteNavigationTaskStore(db_path)
     SqliteNavigationTaskStore(db_path)
 
     with sqlite3.connect(db_path) as connection:
-        columns = {
-            row[1]: row for row in connection.execute(
-                "PRAGMA table_info(navigation_task_steps)"
-            ).fetchall()
+        generation = connection.execute(
+            "SELECT generation FROM navigation_state_schema WHERE singleton = 1"
+        ).fetchone()[0]
+        task_columns = {
+            row[1] for row in connection.execute(
+                "PRAGMA table_info(navigation_tasks)"
+            )
         }
+        ledger_columns = {
+            row[1] for row in connection.execute(
+                "PRAGMA table_info(navigation_task_steps)"
+            )
+        }
+        indexes = {
+            row[1]: bool(row[2])
+            for row in connection.execute("PRAGMA index_list(navigation_tasks)")
+        }
+    assert generation == "navigation-attempts-transitional-v1"
+    assert {
+        "request",
+        "target",
+        "accepted_plan_phase",
+        "phase",
+        "latest_web_session_id",
+        "artifact_snapshot_json",
+        "drift_json",
+    } <= task_columns
+    assert "data_profile_json" not in task_columns
     assert {
         "plan_id",
         "plan_revision",
@@ -98,9 +121,11 @@ def test_task_store_idempotently_migrates_plan_ledger_columns(tmp_path: Path):
         "result_summary_json",
         "result_ref",
         "retry_count",
-    } <= columns.keys()
-    assert columns["retry_count"][3] == 1
-    assert columns["retry_count"][4] == "0"
+    } <= ledger_columns
+    assert indexes["idx_navigation_tasks_target_history"] is False
+    assert indexes["idx_navigation_tasks_session"] is False
+    assert indexes["idx_navigation_tasks_attempt_replay"] is True
+    assert "idx_navigation_tasks_active_date_segments_key" not in indexes
 
 
 def test_task_store_creates_and_loads_navigation_task(tmp_path: Path):
@@ -516,439 +541,147 @@ def test_update_task_serializes_same_timestamp_read_merge_write(monkeypatch, tmp
     assert current.guidance_revision == 7
 
 
-def test_task_store_preserves_legacy_target_history_and_adds_attempt_indexes(
+def test_incompatible_navigation_schema_requires_reset_without_mutation(
     tmp_path: Path,
 ):
-    db_path = tmp_path / "navigation_tasks.sqlite"
-    with sqlite3.connect(db_path) as connection:
-        connection.execute(
-            """
-            CREATE TABLE navigation_tasks (
-                task_id TEXT PRIMARY KEY,
-                date TEXT NOT NULL,
-                segments_json TEXT,
-                scene_mode TEXT,
-                phase TEXT NOT NULL,
-                status TEXT NOT NULL,
-                waiting_reason TEXT,
-                next_required_input TEXT,
-                created_by_web_session_id TEXT,
-                latest_web_session_id TEXT,
-                agentscope_session_id TEXT,
-                latest_run_id TEXT,
-                last_completed_step TEXT,
-                data_profile_json TEXT,
-                artifact_snapshot_json TEXT,
-                drift_json TEXT,
-                schema_version INTEGER NOT NULL,
-                created_at TEXT NOT NULL,
-                updated_at TEXT NOT NULL
-            )
-            """
-        )
-        for task_id, updated_at in [
-            ("nav_old", "2026-07-08T00:00:00.000+00:00"),
-            ("nav_new", "2026-07-08T00:00:01.000+00:00"),
-        ]:
-            connection.execute(
-                """
-                INSERT INTO navigation_tasks (
-                    task_id, date, segments_json, scene_mode, phase, status,
-                    waiting_reason, next_required_input, created_by_web_session_id,
-                    latest_web_session_id, agentscope_session_id, latest_run_id,
-                    last_completed_step, data_profile_json, artifact_snapshot_json,
-                    drift_json, schema_version, created_at, updated_at
-                )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """,
-                (
-                    task_id,
-                    "20270623",
-                    json.dumps(["segment_a"]),
-                    None,
-                    "intake",
-                    "pending",
-                    None,
-                    None,
-                    None,
-                    None,
-                    None,
-                    None,
-                    None,
-                    None,
-                    None,
-                    None,
-                    1,
-                    "2026-07-08T00:00:00.000+00:00",
-                    updated_at,
-                ),
-            )
-
-    store = SqliteNavigationTaskStore(db_path)
-    old = store.get_task("nav_old")
-    new = store.get_task("nav_new")
-    attempt = store.create_task_attempt(
-        request="重新处理",
-        target="20270623",
-        date="20270623",
-        segments=["segment_a"],
-        scene_mode="out",
-        dry_run=False,
-        web_session_id="web-new",
-        agentscope_session_id="as-new",
-    )
-
-    with sqlite3.connect(db_path) as connection:
-        indexes = {
-            row[1]: bool(row[2])
-            for row in connection.execute("PRAGMA index_list(navigation_tasks)")
-        }
-        task_count = connection.execute(
-            "SELECT count(*) FROM navigation_tasks"
-        ).fetchone()[0]
-
-    assert old is not None and new is not None
-    assert old.status == NavigationTaskStatus.PENDING
-    assert new.status == NavigationTaskStatus.PENDING
-    assert old.request == new.request
-    assert 0 < len(old.request) <= 200
-    assert old.target == new.target == "20270623"
-    assert old.created_by_web_session_id == "legacy-web:nav_old"
-    assert old.agentscope_session_id == "legacy-agent:nav_old"
-    assert attempt.created is True
-    assert task_count == 3
-    assert indexes["idx_navigation_tasks_target_history"] is False
-    assert indexes["idx_navigation_tasks_session"] is False
-    assert indexes["idx_navigation_tasks_attempt_replay"] is True
-    assert "idx_navigation_tasks_active_date_segments_key" not in indexes
-
-
-def test_task_store_rebuilds_legacy_profile_table_without_profile_column(tmp_path: Path):
-    db_path = tmp_path / "navigation_tasks.sqlite"
-    with sqlite3.connect(db_path) as connection:
-        connection.execute(
-            """
-            CREATE TABLE navigation_tasks (
-                task_id TEXT PRIMARY KEY, date TEXT NOT NULL, segments_json TEXT,
-                segments_key TEXT, scene_mode TEXT, phase TEXT NOT NULL,
-                status TEXT NOT NULL, waiting_reason TEXT, next_required_input TEXT,
-                created_by_web_session_id TEXT, latest_web_session_id TEXT,
-                agentscope_session_id TEXT, latest_run_id TEXT,
-                last_completed_step TEXT, data_profile_json TEXT,
-                artifact_snapshot_json TEXT, drift_json TEXT,
-                schema_version INTEGER NOT NULL, created_at TEXT NOT NULL,
-                updated_at TEXT NOT NULL
-            )
-            """
-        )
-        connection.execute(
-            """INSERT INTO navigation_tasks VALUES
-            ('legacy', '20270623', NULL, '__all__', NULL, 'finish_processing',
-             'running', NULL, NULL, NULL, NULL, NULL, NULL, NULL,
-             '{"legacy":true}', NULL, NULL, 1,
-             '2026-07-08T00:00:00.000+00:00', '2026-07-08T00:00:00.000+00:00')"""
-        )
-
-    store = SqliteNavigationTaskStore(db_path)
-    task = store.get_task("legacy")
-
-    assert task.status == NavigationTaskStatus.NEEDS_REPLAN
-    assert task.schema_version == TASK_SCHEMA_VERSION
-    with sqlite3.connect(db_path) as connection:
-        columns = {row[1] for row in connection.execute("PRAGMA table_info(navigation_tasks)")}
-        assert "data_profile_json" not in columns
-        assert connection.execute("PRAGMA foreign_key_check").fetchall() == []
-
-
-def test_attempt_migration_backfills_accepted_phase_from_newest_plan_then_legacy_phase(
-    tmp_path: Path,
-):
-    db_path = tmp_path / "navigation_tasks.sqlite"
-    store = SqliteNavigationTaskStore(db_path)
-    planned = store.create_or_update_task(
-        date="20270623",
-        segments=None,
-        scene_mode=None,
-        web_session_id="web-plan",
-        agentscope_session_id="as-plan",
-    )
-    fallback = store.create_or_update_task(
-        date="20270624",
-        segments=None,
-        scene_mode=None,
-        web_session_id="web-fallback",
-        agentscope_session_id="as-fallback",
-    )
-    with sqlite3.connect(db_path) as connection:
-        connection.execute(
-            "UPDATE navigation_tasks SET phase = 'extract_sync' WHERE task_id = ?",
-            (fallback.task_id,),
-        )
-        connection.execute(
-            """CREATE TABLE navigation_plans (
-                   plan_id TEXT PRIMARY KEY,
-                   task_id TEXT NOT NULL,
-                   phase TEXT NOT NULL,
-                   plan_revision INTEGER NOT NULL,
-                   created_at TEXT NOT NULL
-               )"""
-        )
-        connection.executemany(
-            "INSERT INTO navigation_plans VALUES (?, ?, ?, ?, ?)",
-            [
-                ("plan-old", planned.task_id, "extract_sync", 2, "2026-07-08T00:00:00Z"),
-                ("plan-new", planned.task_id, "finish_processing", 1, "2026-07-08T00:00:01Z"),
-            ],
-        )
-
-    migrated = SqliteNavigationTaskStore(db_path)
-
-    assert (
-        migrated.get_task(planned.task_id).accepted_plan_phase
-        == NavigationTaskPhase.FINISH_PROCESSING
-    )
-    assert (
-        migrated.get_task(fallback.task_id).accepted_plan_phase
-        == NavigationTaskPhase.EXTRACT_SYNC
-    )
-
-
-def test_idempotent_attempt_migration_does_not_reclassify_transitional_legacy_rows(
-    tmp_path: Path,
-):
-    db_path = tmp_path / "navigation_tasks.sqlite"
-    store = SqliteNavigationTaskStore(db_path)
-    transitional = store.create_or_update_task(
-        date="20270623", segments=None, scene_mode=None
-    )
-
-    reopened = SqliteNavigationTaskStore(db_path).get_task(transitional.task_id)
-
-    assert reopened is not None
-    assert reopened.created_by_web_session_id is None
-    assert reopened.agentscope_session_id is None
-
-
-def test_task_table_migration_preserves_deployment_owned_trigger(tmp_path: Path):
-    db_path = tmp_path / "navigation_tasks.sqlite"
+    db_path = tmp_path / "legacy-navigation.sqlite"
     with sqlite3.connect(db_path) as connection:
         connection.executescript(
-            """
-            CREATE TABLE navigation_tasks (
-                task_id TEXT PRIMARY KEY, date TEXT NOT NULL, segments_json TEXT,
-                segments_key TEXT, scene_mode TEXT, phase TEXT NOT NULL,
-                status TEXT NOT NULL, waiting_reason TEXT, next_required_input TEXT,
-                created_by_web_session_id TEXT, latest_web_session_id TEXT,
-                agentscope_session_id TEXT, latest_run_id TEXT,
-                last_completed_step TEXT, data_profile_json TEXT,
-                artifact_snapshot_json TEXT, drift_json TEXT,
-                schema_version INTEGER NOT NULL, created_at TEXT NOT NULL,
-                updated_at TEXT NOT NULL
-            );
-            INSERT INTO navigation_tasks VALUES (
-                'legacy', '20270623', NULL, '__all__', NULL, 'intake', 'pending',
-                NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, 1,
-                '2026-07-08T00:00:00.000+00:00', '2026-07-08T00:00:00.000+00:00'
-            );
-            CREATE TABLE deployment_events (task_id TEXT);
-            CREATE TABLE deployment_audit (task_id TEXT);
-            CREATE TRIGGER trg_deployment_owned_aggregate_revision_after_insert
-            AFTER INSERT ON deployment_events
-            BEGIN
-              INSERT INTO deployment_audit(task_id)
-              SELECT task_id FROM navigation_tasks WHERE task_id = NEW.task_id;
-            END;
-            """
+            """CREATE TABLE navigation_tasks (
+                   task_id TEXT PRIMARY KEY,
+                   date TEXT NOT NULL,
+                   segments_json TEXT,
+                   scene_mode TEXT,
+                   phase TEXT NOT NULL,
+                   status TEXT NOT NULL,
+                   waiting_reason TEXT,
+                   next_required_input TEXT,
+                   created_by_web_session_id TEXT,
+                   latest_web_session_id TEXT,
+                   agentscope_session_id TEXT,
+                   latest_run_id TEXT,
+                   last_completed_step TEXT,
+                   data_profile_json TEXT,
+                   artifact_snapshot_json TEXT,
+                   drift_json TEXT,
+                   schema_version INTEGER NOT NULL,
+                   created_at TEXT NOT NULL,
+                   updated_at TEXT NOT NULL
+               );
+               INSERT INTO navigation_tasks VALUES (
+                   'legacy', '20270623', NULL, NULL, 'intake', 'pending',
+                   NULL, NULL, 'web-old', 'web-old', 'as-old', NULL, NULL,
+                   '{"legacy":true}', NULL, NULL, 1,
+                   '2026-07-08T00:00:00.000+00:00',
+                   '2026-07-08T00:00:00.000+00:00'
+               );"""
         )
+        before_schema = connection.execute(
+            "SELECT type, name, sql FROM sqlite_master ORDER BY type, name"
+        ).fetchall()
+        before_rows = connection.execute(
+            "SELECT * FROM navigation_tasks ORDER BY task_id"
+        ).fetchall()
+    before_bytes = db_path.read_bytes()
 
-    SqliteNavigationTaskStore(db_path)
+    caught: RuntimeError | None = None
+    try:
+        SqliteNavigationTaskStore(db_path)
+    except RuntimeError as error:
+        caught = error
 
+    after_bytes = db_path.read_bytes()
     with sqlite3.connect(db_path) as connection:
-        assert connection.execute(
-            "SELECT 1 FROM sqlite_master WHERE type='trigger' AND name=?",
-            ("trg_deployment_owned_aggregate_revision_after_insert",),
-        ).fetchone() == (1,)
-        connection.execute("INSERT INTO deployment_events VALUES ('legacy')")
-        assert connection.execute("SELECT task_id FROM deployment_audit").fetchall() == [("legacy",)]
+        after_schema = connection.execute(
+            "SELECT type, name, sql FROM sqlite_master ORDER BY type, name"
+        ).fetchall()
+        after_rows = connection.execute(
+            "SELECT * FROM navigation_tasks ORDER BY task_id"
+        ).fetchall()
+
+    assert after_bytes == before_bytes
+    assert after_schema == before_schema
+    assert after_rows == before_rows
+    assert caught is not None
+    assert caught.__class__.__name__ == "NavigationStateResetRequired"
+    assert str(db_path) in str(caught)
+    assert "back up" in str(caught).lower()
+    assert "fresh" in str(caught).lower()
+    assert len(str(caught)) <= 1000
 
 
-def test_task_store_migrates_json_encoded_segment_entry(tmp_path: Path):
-    db_path = tmp_path / "navigation_tasks.sqlite"
-    with sqlite3.connect(db_path) as connection:
-        connection.execute(
-            """
-            CREATE TABLE navigation_tasks (
-                task_id TEXT PRIMARY KEY,
-                date TEXT NOT NULL,
-                segments_json TEXT,
-                segments_key TEXT,
-                scene_mode TEXT,
-                phase TEXT NOT NULL,
-                status TEXT NOT NULL,
-                waiting_reason TEXT,
-                next_required_input TEXT,
-                created_by_web_session_id TEXT,
-                latest_web_session_id TEXT,
-                agentscope_session_id TEXT,
-                latest_run_id TEXT,
-                last_completed_step TEXT,
-                data_profile_json TEXT,
-                artifact_snapshot_json TEXT,
-                drift_json TEXT,
-                schema_version INTEGER NOT NULL,
-                created_at TEXT NOT NULL,
-                updated_at TEXT NOT NULL
-            )
-            """
-        )
-        connection.execute(
-            """
-            INSERT INTO navigation_tasks (
-                task_id, date, segments_json, segments_key, scene_mode, phase, status,
-                waiting_reason, next_required_input, created_by_web_session_id,
-                latest_web_session_id, agentscope_session_id, latest_run_id,
-                last_completed_step, data_profile_json, artifact_snapshot_json,
-                drift_json, schema_version, created_at, updated_at
-            )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """,
-            (
-                "nav_bad_segments",
-                "20270623",
-                json.dumps(['["20260623_145550"]']),
-                json.dumps(['["20260623_145550"]'], separators=(",", ":")),
-                None,
-                "intake",
-                "pending",
-                None,
-                None,
-                "web-1",
-                "web-1",
-                "agent-1",
-                None,
-                None,
-                None,
-                None,
-                None,
-                1,
-                "2026-07-08T00:00:00.000+00:00",
-                "2026-07-08T00:00:00.000+00:00",
-            ),
-        )
-
-    store = SqliteNavigationTaskStore(db_path)
-    task = store.get_task("nav_bad_segments")
-
-    assert task.segments == ["20260623_145550"]
-    assert store.find_latest_by_date("20270623", ["20260623_145550"]).task_id == task.task_id
-
-    with sqlite3.connect(db_path) as connection:
-        row = connection.execute(
-            "SELECT segments_json, segments_key FROM navigation_tasks WHERE task_id = ?",
-            ("nav_bad_segments",),
-        ).fetchone()
-
-    assert json.loads(row[0]) == ["20260623_145550"]
-    assert row[1] == '["20260623_145550"]'
-
-
-def test_task_store_migrates_json_encoded_segment_entry_with_existing_unique_index(
+def test_supported_generation_with_broken_contract_requires_reset_without_repair(
     tmp_path: Path,
 ):
-    db_path = tmp_path / "navigation_tasks.sqlite"
+    db_path = tmp_path / "broken-navigation.sqlite"
+    SqliteNavigationTaskStore(db_path)
     with sqlite3.connect(db_path) as connection:
         connection.execute(
-            """
-            CREATE TABLE navigation_tasks (
-                task_id TEXT PRIMARY KEY,
-                date TEXT NOT NULL,
-                segments_json TEXT,
-                segments_key TEXT,
-                scene_mode TEXT,
-                phase TEXT NOT NULL,
-                status TEXT NOT NULL,
-                waiting_reason TEXT,
-                next_required_input TEXT,
-                created_by_web_session_id TEXT,
-                latest_web_session_id TEXT,
-                agentscope_session_id TEXT,
-                latest_run_id TEXT,
-                last_completed_step TEXT,
-                data_profile_json TEXT,
-                artifact_snapshot_json TEXT,
-                drift_json TEXT,
-                schema_version INTEGER NOT NULL,
-                created_at TEXT NOT NULL,
-                updated_at TEXT NOT NULL
-            )
-            """
+            """CREATE TABLE IF NOT EXISTS navigation_state_schema (
+                   singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+                   generation TEXT NOT NULL
+               )"""
         )
         connection.execute(
-            """
-            CREATE UNIQUE INDEX idx_navigation_tasks_active_date_segments_key
-            ON navigation_tasks (date, segments_key)
-            WHERE status != 'superseded'
-            """
+            """INSERT OR REPLACE INTO navigation_state_schema
+               (singleton, generation) VALUES (1, ?)""",
+            ("navigation-attempts-transitional-v1",),
         )
-        for task_id, segments, key, updated_at in [
-            (
-                "nav_good",
-                ["20260623_145550"],
-                '["20260623_145550"]',
-                "2026-07-08T00:00:01.000+00:00",
-            ),
-            (
-                "nav_bad",
-                ['["20260623_145550"]'],
-                '["[\\"20260623_145550\\"]"]',
-                "2026-07-08T00:00:00.000+00:00",
-            ),
-        ]:
-            connection.execute(
-                """
-                INSERT INTO navigation_tasks (
-                    task_id, date, segments_json, segments_key, scene_mode, phase, status,
-                    waiting_reason, next_required_input, created_by_web_session_id,
-                    latest_web_session_id, agentscope_session_id, latest_run_id,
-                    last_completed_step, data_profile_json, artifact_snapshot_json,
-                    drift_json, schema_version, created_at, updated_at
-                )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """,
-                (
-                    task_id,
-                    "20270623",
-                    json.dumps(segments),
-                    key,
-                    None,
-                    "intake",
-                    "pending",
-                    None,
-                    None,
-                    None,
-                    None,
-                    None,
-                    None,
-                    None,
-                    None,
-                    None,
-                    None,
-                    1,
-                    "2026-07-08T00:00:00.000+00:00",
-                    updated_at,
-                ),
-            )
+        connection.execute("DROP INDEX idx_navigation_tasks_attempt_replay")
+        before_schema = connection.execute(
+            "SELECT type, name, sql FROM sqlite_master ORDER BY type, name"
+        ).fetchall()
+    before_bytes = db_path.read_bytes()
 
-    store = SqliteNavigationTaskStore(db_path)
-    active = store.find_latest_by_date("20270623", ["20260623_145550"])
+    caught: RuntimeError | None = None
+    try:
+        SqliteNavigationTaskStore(db_path)
+    except RuntimeError as error:
+        caught = error
 
-    assert active.task_id == "nav_good"
-    assert active.segments == ["20260623_145550"]
-    assert store.get_task("nav_bad").status == NavigationTaskStatus.PENDING
-    assert store.get_task("nav_bad").segments == ["20260623_145550"]
+    after_bytes = db_path.read_bytes()
     with sqlite3.connect(db_path) as connection:
-        indexes = {row[1] for row in connection.execute("PRAGMA index_list(navigation_tasks)")}
-    assert "idx_navigation_tasks_active_date_segments_key" not in indexes
+        after_schema = connection.execute(
+            "SELECT type, name, sql FROM sqlite_master ORDER BY type, name"
+        ).fetchall()
+
+    assert after_bytes == before_bytes
+    assert after_schema == before_schema
+    assert caught is not None
+    assert caught.__class__.__name__ == "NavigationStateResetRequired"
+
+
+def test_supported_generation_with_wrong_partial_index_requires_reset(
+    tmp_path: Path,
+):
+    db_path = tmp_path / "wrong-partial-index.sqlite"
+    SqliteNavigationTaskStore(db_path)
+    with sqlite3.connect(db_path) as connection:
+        connection.execute("DROP INDEX idx_navigation_task_steps_plan_sequence")
+        connection.execute(
+            """CREATE UNIQUE INDEX idx_navigation_task_steps_plan_sequence
+               ON navigation_task_steps (plan_id, sequence)
+               WHERE plan_id IS NULL"""
+        )
+        before_schema = connection.execute(
+            "SELECT type, name, sql FROM sqlite_master ORDER BY type, name"
+        ).fetchall()
+    before_bytes = db_path.read_bytes()
+
+    caught: RuntimeError | None = None
+    try:
+        SqliteNavigationTaskStore(db_path)
+    except RuntimeError as error:
+        caught = error
+
+    assert db_path.read_bytes() == before_bytes
+    with sqlite3.connect(db_path) as connection:
+        after_schema = connection.execute(
+            "SELECT type, name, sql FROM sqlite_master ORDER BY type, name"
+        ).fetchall()
+    assert after_schema == before_schema
+    assert caught is not None
+    assert caught.__class__.__name__ == "NavigationStateResetRequired"
 
 
 def test_create_or_update_task_preserves_latest_web_session_when_omitted(tmp_path: Path):

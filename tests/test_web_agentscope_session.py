@@ -602,9 +602,14 @@ async def test_runtime_submit_user_message_keeps_main_router_session_for_navigat
 
 
 @pytest.mark.asyncio
-async def test_runtime_start_navigation_agent_task_switches_mapping_and_spawns_navigation_run() -> None:
+async def test_runtime_start_navigation_agent_task_switches_mapping_and_spawns_navigation_run(
+    tmp_path: Path,
+) -> None:
     chat_run_registry = FakeChatRunRegistry()
-    runtime = _runtime(chat_run_registry=chat_run_registry)
+    runtime = _runtime(
+        chat_run_registry=chat_run_registry,
+        workspace_root=tmp_path / "workspace",
+    )
     handoff_message = agentscope_runtime_module._navigation_handoff_message(
         request="处理 20270605 的室外数据",
         target="20270605",
@@ -641,9 +646,14 @@ async def test_runtime_start_navigation_agent_task_switches_mapping_and_spawns_n
 
 
 @pytest.mark.asyncio
-async def test_runtime_submit_user_message_routes_to_active_navigation_agent_after_handoff() -> None:
+async def test_runtime_submit_user_message_routes_to_active_navigation_agent_after_handoff(
+    tmp_path: Path,
+) -> None:
     chat_run_registry = FakeChatRunRegistry()
-    runtime = _runtime(chat_run_registry=chat_run_registry)
+    runtime = _runtime(
+        chat_run_registry=chat_run_registry,
+        workspace_root=tmp_path / "workspace",
+    )
 
     await runtime.submit_user_message(web_session_id="web-1", message="处理 20270623 的导航数据")
     await chat_run_registry.drain()
@@ -2092,6 +2102,7 @@ async def test_runtime_subscribe_hydrates_pending_human_decision_after_restart(t
         storage=storage,
         chat_run_registry=FakeChatRunRegistry(),
         message_bus=FakeAgentScopeMessageBus(),
+        workspace_root=tmp_path / "workspace",
     )
     runtime.set_web_session_store(store)
 
@@ -2117,7 +2128,9 @@ async def test_runtime_subscribe_hydrates_pending_human_decision_after_restart(t
 
 
 @pytest.mark.asyncio
-async def test_runtime_subscribe_polls_pending_human_decision_before_idle_exit() -> None:
+async def test_runtime_subscribe_polls_pending_human_decision_before_idle_exit(
+    tmp_path: Path,
+) -> None:
     storage = DelayedPendingDecisionStorage(
         pending_record=_agentscope_session_record(
             reply_id="reply-1",
@@ -2133,6 +2146,7 @@ async def test_runtime_subscribe_polls_pending_human_decision_before_idle_exit()
         storage=storage,
         chat_run_registry=FakeChatRunRegistry(),
         message_bus=FakeAgentScopeMessageBus(running_states=[False]),
+        workspace_root=tmp_path / "workspace",
     )
     runtime.web_sessions["web-1"] = ("navigation-data-agent", "as-session-1")
 

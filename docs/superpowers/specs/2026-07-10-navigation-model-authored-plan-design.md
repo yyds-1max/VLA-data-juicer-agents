@@ -824,10 +824,14 @@ Do not leave deprecated wrappers, compatibility aliases, unreachable branches, o
 commented-out old code. Source files that become empty or wholly obsolete are
 deleted. The implementation plan must include an `rg`-based dead-reference audit.
 
-The SQLite migration preserves old task attempts, request fields, completed execution
-evidence, plans, and ledgers for audit. It removes the obsolete `data_profile_json`
-field through a transactional table migration after marking affected unfinished
-plans `needs_replan`. It does not attempt to convert the old profile into decisions.
+This is an explicit development-stage durable-state reset, not a backward-compatible
+SQLite migration. The old Task, Observation, Evidence metadata, Plan, ledger,
+outbox, and human-handoff records were produced only by test runs under a flawed
+task-identity design and have no audit or recovery value. New code detects an
+incompatible navigation-state schema and fails closed with
+`NavigationStateResetRequired`; it never rewrites, merges, or silently deletes the
+old database. The deployment runbook stops the service, backs up the old navigation
+state, and creates a fresh database with the new schema.
 
 Remove the invariant and unique index that make `(date, segments)` one global active
 task across Web sessions. New delegation creates a new attempt. Same-session lookup
@@ -835,16 +839,16 @@ uses the verified Web/AgentScope session pair and task id, never a global
 date/segments owner. Current execution authorization remains attempt- and
 plan-bound. A separate target lock protects only running data-writing actions.
 
-Old session-scoped draft files are no longer read. They are not automatically
-deleted from deployment storage because that would be an unrelated destructive data
-operation; operational cleanup can remove them after rollout verification. No
-runtime compatibility code remains for those files.
+Old session-scoped draft/evidence files are no longer read. They are not deleted by
+application startup. The reset runbook may remove them only after the backed-up
+SQLite state has been verified and only within the configured navigation-state
+root; raw acquisition data and processing products are outside that cleanup scope.
+No runtime compatibility code remains for old files or schemas.
 
-Existing tasks remain historical attempts. A verified continuation in their same
-Web/AgentScope session may recover the attempt's valid Plan/ledger, subject to fresh
-fact checks before new work. A request from a new Web session never attaches to an
-existing task, regardless of whether that task is completed, failed, waiting, or
-unfinished.
+Attempts created after the reset remain historical attempts for diagnostics and
+same-session Plan/ledger recovery. A request from a new Web session never attaches
+to an attempt from another session, regardless of whether that attempt is completed,
+failed, waiting, or unfinished.
 
 ## Testing Strategy
 
@@ -1008,8 +1012,9 @@ unfinished.
 6. Resolve tools by task-attempt activity, then rewrite the router prompt,
    NavigationDataAgent prompt, `navigation-plan-agent-guidance.md`, and compact state
    anchor according to the non-duplication rules and few-shot requirements.
-7. Migrate durable task storage, mark ambiguous unfinished work `needs_replan`, and
-   remove the legacy draft/finalize implementation and tests.
+7. Enforce the new navigation-state schema generation, document the explicit
+   backup/reset procedure for incompatible development databases, and remove the
+   legacy draft/finalize implementation and tests.
 8. Run focused unit and integration tests, the complete local suite, schema/context
    size audits, and the dead-reference audit.
 9. Deploy the synchronized code to the server, run a fresh NavigationDataAgent

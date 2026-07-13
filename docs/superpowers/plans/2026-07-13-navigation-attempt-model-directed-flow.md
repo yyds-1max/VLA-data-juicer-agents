@@ -20,6 +20,7 @@
 - Only an actual running step whose capability declares `locks_navigation_target=True` may block an overlapping target with `navigation_data_busy`.
 - Preserve plan-bound argument loading, exactly-once step transitions, cancellation, staged-result/outbox recovery, and fail-closed human-decision recovery.
 - Preserve `dry_run=False` as the public/default behavior. Remove `dry_run` from the router/model-facing tool schema; tests or operators may inject `dry_run=True` only through trusted runtime/direct-CLI configuration.
+- Do not migrate or normalize pre-redesign navigation durable state. An incompatible SQLite schema raises `NavigationStateResetRequired` without mutating the file; operators stop the service, back it up, and create a fresh navigation-state database.
 - Keep AgentScope compression and phase-boundary session handling unchanged.
 - Keep routine response limits: planning context/evidence at most 5,500 serialized characters, validation errors at most 3,000, and other tool results at most 4,000.
 - Remove superseded functions, fields, migrations, prompts, fixtures, and tests in this change. Do not leave compatibility aliases, deprecated wrappers, or unreachable branches after Task 7.
@@ -49,7 +50,7 @@
 - Modify: `tests/test_navigation_task_store.py`
 - Modify: `tests/test_navigation_catalog.py`
 
-**Final interfaces after Task 7:** Task 1 adds the new fields and APIs first; legacy columns and enum values remain temporarily so intermediate commits stay runnable, then Task 7 performs the destructive schema narrowing shown here.
+**Final interfaces after Task 7:** Task 1 creates a fresh transitional schema with the new attempt fields plus temporary legacy columns needed by unchanged consumers. It never upgrades an old deployment database. Task 7 removes the consumers and creates only the final clean schema shown here.
 
 ```python
 class NavigationTaskStatus(str, Enum):
@@ -114,7 +115,7 @@ find_running_target_writer(
 
 `TaskAttemptCreation` contains `task` and `created: bool`. Replaying the same exact session/date/segments/target returns `created=False`; the same session may own a later attempt for a different target.
 
-- [ ] **Step 1: Replace global-owner tests with attempt-boundary tests**
+- [ ] **Step 1: Replace global-owner and legacy-migration tests with clean-cutover tests**
 
 Add tests proving:
 
@@ -157,23 +158,22 @@ def test_foreign_session_cannot_mutate_an_attempt(tmp_path: Path):
 
 Add a two-thread barrier test proving concurrent calls with the same Web/AgentScope/target tuple create one row and both return the same task id. Add a test proving the same session can create a distinct later attempt for a different target.
 
+Add an old-schema fixture proving initialization raises `NavigationStateResetRequired`, includes the configured database path and reset instruction in its bounded message, and leaves the database byte-for-byte/logically unchanged. Do not assert conversion, backfill, superseding, or preservation of old rows in the new store.
+
 - [ ] **Step 2: Run the focused tests and confirm the old invariant fails**
 
 Run: `pytest tests/test_navigation_task_store.py -q`
 
 Expected: the distinct-attempt test fails because the current store reuses or rejects the matching global target.
 
-- [ ] **Step 3: Add the attempt fields and non-destructive transactional migration**
+- [ ] **Step 3: Create the new schema generation and fail closed on old state**
 
-Migration rules, in one `BEGIN IMMEDIATE` transaction:
+Define a navigation-state schema-generation marker and `NavigationStateResetRequired` in the task-store boundary. Initialization follows exactly two paths:
 
-1. Drop `idx_navigation_tasks_active_date_segments_key`.
-2. Add/backfill `request`, `target`, and `accepted_plan_phase`; legacy requests use a bounded audit string and legacy targets use their dataset date.
-3. Before making live models require session identity, backfill NULL owners as non-resumable historical audit identities `legacy-web:{task_id}` and `legacy-agent:{task_id}`. Exact live-session lookup can never select those synthetic ids.
-4. Backfill `accepted_plan_phase` from the newest persisted Plan when present; otherwise copy legacy task `phase` only when it is `extract_sync` or `finish_processing`. Never use it as product evidence.
-5. Create non-unique audit index `idx_navigation_tasks_target_history(date, segments_key, created_at)`, session lookup index `idx_navigation_tasks_session(created_by_web_session_id, agentscope_session_id, created_at)`, and unique replay index `idx_navigation_tasks_attempt_replay(created_by_web_session_id, agentscope_session_id, date, segments_key, target)`.
+1. An empty/new database creates the Task 1 transitional schema, including `request`, `target`, `accepted_plan_phase`, non-unique target-history/session indexes, the unique replay index, and no global `(date, segments)` uniqueness.
+2. A database containing navigation tables without the exact supported generation/required columns/index contract raises `NavigationStateResetRequired` before executing any `ALTER`, `UPDATE`, `DROP`, or row copy.
 
-Do not remove legacy columns or enum values in this task. Existing code still reads them until its replacement lands; Task 7 rebuilds the table once no consumer remains.
+Remove task/profile/segment/attempt backfill and table-rebuild migrations that exist only for pre-redesign state. Do not add synthetic legacy identities or duplicate-history normalization. Keep temporary legacy columns and enum values only in the fresh transitional `CREATE TABLE` statement so Tasks 2–6 remain runnable; they are not a compatibility promise to old files.
 
 - [ ] **Step 4: Implement `create_task_attempt` and immutable session identity**
 
@@ -185,7 +185,7 @@ Add `locks_navigation_target: bool = False` to `ToolCapability` and mark every c
 
 - [ ] **Step 6: Keep old consumers compiling temporarily**
 
-Until Tasks 2–6 switch all consumers, legacy read helpers may remain private in `task_store.py`, but no new code may call `create_or_update_task`, `find_latest_by_date`, or any ownership-transfer path. Task 7 deletes them.
+Until Tasks 2–6 switch all consumers, legacy read helpers may remain private in `task_store.py`, but no new code may call `create_or_update_task`, `find_latest_by_date`, or any ownership-transfer path. They operate only on databases freshly created by this branch. Task 7 deletes them.
 
 - [ ] **Step 7: Verify and commit**
 
@@ -361,9 +361,9 @@ Run: `pytest tests/test_navigation_observation_models.py tests/test_navigation_o
 
 Expected: current revision/context require a phase and return a phase-specific checklist.
 
-- [ ] **Step 3: Migrate observation storage**
+- [ ] **Step 3: Create phase-neutral observation storage without legacy conversion**
 
-Rebuild `navigation_observation_revisions` without the `phase` column. While copying historical `revision_json`, remove only the top-level legacy `phase`; keep factual payloads, evidence refs, revisions, and timestamps unchanged. Because `navigation_evidence` references this parent, use the same safe parent-table procedure as Task 7: disable foreign keys before `BEGIN IMMEDIATE`, replace the parent and recreate its triggers/indexes inside the transaction, re-enable foreign keys afterward, and require an empty `PRAGMA foreign_key_check`. Test rollback and an evidence-bearing legacy fixture.
+Create `navigation_observation_revisions` without a `phase` column in the supported fresh schema. Do not rebuild or copy an existing phase-bearing table. Such a table belongs to an incompatible navigation-state generation and is rejected by the Task 1 store boundary before any observation/evidence service mutates it.
 
 Change the append interface to:
 
@@ -383,7 +383,7 @@ def append(
 
 Update the temporary legacy reconciliation caller to the phase-neutral append signature in the same commit. It remains unreachable from the Web entry after Task 2 and is deleted in Task 7; this prevents an intermediate broken import/test state without preserving it as a final compatibility path.
 
-Update `services._migrate_legacy_observations` in the same transaction: accept legacy rows whose column/JSON contains `phase`, validate the remaining identity/timestamp fields, remove only the top-level JSON `phase`, and insert the normalized phase-free row into the unified table. Conflict comparison uses normalized JSON on both sides. Preserve the one-time migration marker, rollback behavior, evidence ownership validation, and idempotent/concurrent initialization tests in `tests/test_navigation_agent_tools.py`.
+Delete `services._migrate_legacy_observations`, its migration marker, and conversion/conflict fixtures. Replace them with tests that a fresh unified service initializes phase-neutral observation/evidence tables repeatedly and that an incompatible legacy observation schema produces `NavigationStateResetRequired` without copying evidence or changing either database.
 
 Mechanically update every current consumer of `observation.phase` and `PhasePlanningContext` in `plan_validation.py`, `plan_submission_tools.py`, and `agent_tools.py`. At this intermediate commit they may still use the legacy task phase to choose the one exposed submission tool; Task 4 removes that final phase prerequisite. No consumer may read a removed observation field.
 
@@ -698,11 +698,9 @@ The factual snapshot builder already lives in `artifact_inspection.py`; handoff 
 
 Remove global date/segments claim/update, cross-session rebind, latest-session ownership, automatic phase/status mutators, artifact/drift snapshots on Task, and dataset-state transition helpers.
 
-Rebuild `navigation_tasks` without `latest_web_session_id`, legacy `phase`, `artifact_snapshot_json`, `drift_json`, `last_completed_step`, `latest_run_id`, `waiting_reason`, or `next_required_input`. Map legacy statuses `pending`, `running`, `needs_reconcile`, and `needs_rerun` to `active`; map `waiting_scene_mode` to `waiting_user`; preserve `needs_replan` and terminal equivalents because `needs_replan` is operational recovery state, not product evidence.
+Remove `latest_web_session_id`, legacy `phase`, `artifact_snapshot_json`, `drift_json`, `last_completed_step`, `latest_run_id`, `waiting_reason`, and `next_required_input` from the supported schema and model. Bump the schema generation. The final code creates this clean table only for a new database and raises `NavigationStateResetRequired` for the Task 1 transitional generation or any older schema; it does not rebuild/copy the parent table or map old statuses.
 
-Preserve the non-resumable historical audit identities backfilled in Task 1; the final table makes both owner columns `NOT NULL`, and exact live-session lookup never selects the synthetic ids.
-
-Perform the parent-table replacement with `PRAGMA foreign_keys=OFF` set before `BEGIN IMMEDIATE`, create/copy/drop/rename and recreate task indexes/aggregate triggers inside the transaction, commit, restore `PRAGMA foreign_keys=ON`, and require `PRAGMA foreign_key_check` to return zero rows. On any failure, roll back, restore foreign-key enforcement, and leave the original parent/child schema intact. Run the migration twice and against fixtures containing Plan, step, observation, evidence, outbox, attempt, and handoff children.
+Keep `needs_replan` in the final status enum because it is operational recovery state, not product evidence. Add tests for fresh final-schema creation and fail-fast incompatible-schema detection, not pre-migration row preservation.
 
 - [ ] **Step 4: Update direct workflow/CLI entry**
 
@@ -712,7 +710,7 @@ Direct local workflow entry must create its own explicit attempt identity (`web_
 
 Human-decision controlled recovery continues to quarantine the handoff, invalidate the Plan, and mark the task plus unfinished ledger rows `needs_replan`. This status authorizes controlled replanning for the same attempt; it is never treated as proof about filesystem products.
 
-- [ ] **Step 6: Run focused migration and integration tests**
+- [ ] **Step 6: Run focused schema and integration tests**
 
 Run:
 
@@ -720,7 +718,7 @@ Run:
 pytest tests/test_navigation_task_store.py tests/test_navigation_observation_store.py tests/test_navigation_model_authored_flow.py tests/test_navigation_cli.py tests/test_web_agentscope_session.py tests/test_web_human_decision_api.py -q
 ```
 
-Expected: pass, including opening a pre-migration SQLite fixture twice idempotently.
+Expected: pass, including repeat initialization of the exact supported schema and fail-fast rejection of an incompatible schema without mutation.
 
 - [ ] **Step 7: Run the dead-reference audit and commit**
 

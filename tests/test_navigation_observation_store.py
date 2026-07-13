@@ -123,13 +123,13 @@ def test_observation_and_evidence_commits_advance_task_aggregate_revision(tmp_pa
     assert current.state_revision == task.state_revision + 2
 
 
-def test_task_initializer_installs_triggers_for_preexisting_observation_tables(tmp_path):
+def test_task_first_initialization_installs_observation_triggers(tmp_path):
     db_path = tmp_path / "state.sqlite"
-    store = SqliteNavigationObservationStore(db_path)
     task_store = SqliteNavigationTaskStore(db_path)
     task = task_store.create_or_update_task(
         date="20260710", segments=["20260710_120000"], scene_mode=None,
     )
+    store = SqliteNavigationObservationStore(db_path)
 
     store.append(
         task.task_id,

@@ -16,7 +16,10 @@ from vla_data_juicer_agents.navigation.agent_tools import (
     PlanBoundHumanDecisionTool,
     resolve_navigation_agent_tools,
 )
-from vla_data_juicer_agents.navigation.task_store import SqliteNavigationTaskStore
+from vla_data_juicer_agents.navigation.task_store import (
+    NavigationStateResetRequired,
+    SqliteNavigationTaskStore,
+)
 from vla_data_juicer_agents.navigation.task_tools import build_navigation_task_tools
 from vla_data_juicer_agents.navigation.services import (
     NavigationServices,
@@ -680,7 +683,7 @@ def test_concurrent_navigation_service_builders_migrate_once(tmp_path):
         ).fetchone()[0] == 1
 
 
-def test_marker_only_database_is_fully_upgraded_before_services_return(tmp_path):
+def test_marker_only_legacy_database_requires_reset_without_mutation(tmp_path):
     db_path = tmp_path / "navigation-tasks.sqlite"
     with sqlite3.connect(db_path) as connection:
         connection.execute(
@@ -690,15 +693,20 @@ def test_marker_only_database_is_fully_upgraded_before_services_return(tmp_path)
             "INSERT INTO navigation_service_migrations VALUES (?, ?)",
             ("legacy_observations_to_unified_v1", "now"),
         )
+        before_schema = connection.execute(
+            "SELECT type, name, sql FROM sqlite_master ORDER BY type, name"
+        ).fetchall()
+    before_bytes = db_path.read_bytes()
 
-    services = build_navigation_services(tmp_path)
-    task = services.task_store.create_or_update_task(
-        date="20260710", segments=None, scene_mode=None,
-    )
+    with pytest.raises(NavigationStateResetRequired):
+        build_navigation_services(tmp_path)
 
-    assert services.task_store.get_task(task.task_id) is not None
-    assert services.observation_store.latest(task.task_id) is None
-    assert services.plan_store.get_active(task.task_id, "extract_sync") is None
+    assert db_path.read_bytes() == before_bytes
+    with sqlite3.connect(db_path) as connection:
+        after_schema = connection.execute(
+            "SELECT type, name, sql FROM sqlite_master ORDER BY type, name"
+        ).fetchall()
+    assert after_schema == before_schema
 
 
 @pytest.mark.parametrize("failure", ["invalid_json", "partial_schema"])

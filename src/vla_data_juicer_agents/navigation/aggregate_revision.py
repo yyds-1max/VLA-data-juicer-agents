@@ -19,14 +19,6 @@ NAVIGATION_AGGREGATE_REVISION_TRIGGER_NAMES = frozenset(
 )
 
 
-def drop_navigation_aggregate_revision_triggers(
-    connection: sqlite3.Connection,
-) -> None:
-    """Drop only the triggers owned by the navigation aggregate migration."""
-    for trigger_name in NAVIGATION_AGGREGATE_REVISION_TRIGGER_NAMES:
-        connection.execute(f'DROP TRIGGER IF EXISTS "{trigger_name}"')
-
-
 def ensure_navigation_aggregate_revision_triggers(
     connection: sqlite3.Connection,
 ) -> None:
