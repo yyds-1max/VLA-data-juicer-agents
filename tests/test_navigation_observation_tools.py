@@ -5,11 +5,27 @@ from pathlib import Path
 
 import pytest
 
+from vla_data_juicer_agents.navigation import observation_tools as observation_tools_module
 from vla_data_juicer_agents.navigation.config import NavigationSettings
 from vla_data_juicer_agents.navigation.evidence_store import FileNavigationEvidenceStore
+from vla_data_juicer_agents.navigation.observation_models import (
+    ArtifactStateObservation,
+    CalibrationInventoryObservation,
+    EvidenceWrite,
+    GridmapArtifactsObservation,
+    LocalizationSourcesObservation,
+    RawMetadataObservation,
+    RuntimeAssetsObservation,
+    SensorCandidatesObservation,
+    SensorRoleCandidate,
+    TopicCandidatesObservation,
+    TopicMeasurement,
+    UserGuidanceObservation,
+)
 from vla_data_juicer_agents.navigation.observation_store import SqliteNavigationObservationStore
 from vla_data_juicer_agents.navigation.observation_tools import build_navigation_observation_tools
 from vla_data_juicer_agents.navigation.task_state import (
+    NavigationArtifactSnapshot,
     NavigationTask,
     NavigationTaskPhase,
 )
@@ -383,3 +399,161 @@ def test_repeated_inspections_paginate_evidence_and_context_by_character_budget(
     assert len(json.dumps(context, ensure_ascii=False, separators=(",", ":"))) <= 5_500
     assert context["evidence_next_cursor"] == len(context["evidence_catalog"])
     assert context["evidence_next_cursor"] < 30
+
+
+def test_real_context_tool_globally_bounds_all_observation_kinds_and_evidence(tmp_path):
+    long_names = [f"item-{index:03d}-" + "x" * 300 for index in range(40)]
+    payloads = [
+        ArtifactStateObservation(
+            snapshot=NavigationArtifactSnapshot(
+                date="20270605",
+                segments=long_names,
+                raw_input_exists=True,
+                sync_data_exists=True,
+                sync_data_by_segment={name: index % 2 == 0 for index, name in enumerate(long_names)},
+                finish_temp_samples_exists=True,
+                final_outputs_exist=False,
+                final_grid_map_exists=False,
+                sync_image_samples=[f"clip/{name}/image.jpg" for name in long_names],
+            )
+        ),
+        RawMetadataObservation(
+            segments=long_names,
+            topics=[
+                TopicMeasurement(
+                    topic=f"/topic/{name}",
+                    message_type=f"custom_msgs/msg/{name}",
+                    message_count=index + 1,
+                )
+                for index, name in enumerate(long_names)
+            ],
+        ),
+        SensorCandidatesObservation(
+            candidates=[
+                SensorRoleCandidate(
+                    role=("lidar" if index % 2 else "fisheye_front"),
+                    topic=f"/sensor/{name}",
+                    message_type=f"custom_msgs/msg/{name}",
+                    confidence=0.5,
+                )
+                for index, name in enumerate(long_names)
+            ]
+        ),
+        TopicCandidatesObservation(
+            available_topics=[f"/available/{name}" for name in long_names],
+            suggested_role_names={
+                f"role-{index:03d}-" + "r" * 200: [f"/available/{name}"]
+                for index, name in enumerate(long_names)
+            },
+        ),
+        GridmapArtifactsObservation(
+            existing_gridmap_paths=[f"gridmaps/{name}.pcd" for name in long_names],
+            pcd_sources=[f"sources/{name}.pcd" for name in long_names],
+            projection_ready=True,
+        ),
+        RuntimeAssetsObservation(
+            pcd_gridmap_tool_available=True,
+            manual_annotation_gui_available=False,
+            projection_variants={f"variant-{name}": True for name in long_names},
+        ),
+        CalibrationInventoryObservation(
+            sensor_sources=[f"params/{name}/sensors" for name in long_names]
+        ),
+        LocalizationSourcesObservation(
+            available_sources=["odom", "ins"],
+            conversion_available=True,
+        ),
+        UserGuidanceObservation(
+            guidance_revision=7,
+            text="guidance-" + "g" * 2_000,
+        ),
+    ]
+    tools, observation_store, _ = _tools(tmp_path)
+    for payload in payloads:
+        observation_store.append(
+            "nav-observe-1",
+            payload.kind,
+            [payload],
+            [
+                EvidenceWrite(
+                    kind=payload.kind,
+                    source_tool=f"inspect_{payload.kind}_tool",
+                    payload=payload.model_dump(mode="json"),
+                    summary=f"{payload.kind}: " + "s" * 450,
+                )
+            ],
+            FileNavigationEvidenceStore(tmp_path / "evidence"),
+            expected_web_session_id=None,
+            expected_agentscope_session_id=None,
+        )
+
+    context = _invoke_tool(tools["get_navigation_task_context_tool"], {})
+    serialized = json.dumps(context, ensure_ascii=False, separators=(",", ":"))
+
+    assert len(serialized) <= 5_500
+    assert set(context["fact_summary"]) == {payload.kind for payload in payloads}
+    assert context["fact_summary"]["raw_metadata"]["topic_count"] == len(long_names)
+    assert context["fact_summary"]["artifact_state"]["sync_data_exists"] is True
+    assert context["fact_summary"]["gridmap_artifacts"]["projection_ready"] is True
+    assert context["fact_summary"]["runtime_assets"]["pcd_gridmap_tool_available"] is True
+    assert context["fact_summary"]["localization_sources"]["conversion_available"] is True
+    assert context["evidence_catalog"]
+    assert context["evidence_next_cursor"] is not None
+
+
+@pytest.mark.parametrize(
+    "message",
+    [
+        'quoted "value" ' * 1_000,
+        "backslash\\value " * 1_000,
+        "line one\nline two\r\n" * 1_000,
+        "\x00" * 1_000,
+    ],
+)
+def test_inspection_failure_is_json_bounded_sanitized_and_never_persists(
+    monkeypatch,
+    tmp_path,
+    message,
+):
+    def fail(*_args, **_kwargs):
+        raise ValueError(message)
+
+    monkeypatch.setattr(observation_tools_module, "inspect_raw_date", fail)
+    tools, observation_store, _ = _tools(tmp_path)
+
+    result = _invoke_tool(tools["inspect_navigation_raw_metadata_tool"], {})
+
+    assert set(result) == {"ok", "error_type", "message"}
+    assert result["ok"] is False
+    assert result["error_type"] == "invalid_inspection_request"
+    assert "\x00" not in result["message"]
+    assert "\n" not in result["message"]
+    assert "\r" not in result["message"]
+    assert len(json.dumps(result, ensure_ascii=False, separators=(",", ":"))) <= 4_000
+    assert observation_store.latest("nav-observe-1") is None
+    assert not (tmp_path / "evidence" / "nav-observe-1").exists()
+
+
+def test_inspection_failure_uses_fixed_fallback_when_exception_stringification_fails(
+    monkeypatch,
+    tmp_path,
+):
+    class BrokenMessageError(Exception):
+        def __str__(self):
+            raise RuntimeError("cannot stringify")
+
+    def fail(*_args, **_kwargs):
+        raise BrokenMessageError()
+
+    monkeypatch.setattr(observation_tools_module, "inspect_raw_date", fail)
+    tools, observation_store, _ = _tools(tmp_path)
+
+    result = _invoke_tool(tools["inspect_navigation_raw_metadata_tool"], {})
+
+    assert result == {
+        "ok": False,
+        "error_type": "inspection_failed",
+        "message": "Inspection failed.",
+    }
+    assert observation_store.latest("nav-observe-1") is None
+    assert not (tmp_path / "evidence" / "nav-observe-1").exists()

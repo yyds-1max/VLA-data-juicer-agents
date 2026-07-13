@@ -53,6 +53,11 @@ from vla_data_juicer_agents.navigation.task_state import NavigationTask
 INSPECTION_RESULT_MAX_CHARS = 4_000
 OBSERVATION_DELTA_MAX_CHARS = 2_000
 COGNITIVE_RESULT_MAX_CHARS = 5_500
+_INSPECTION_FAILURE_FALLBACK = {
+    "ok": False,
+    "error_type": "inspection_failed",
+    "message": "Inspection failed.",
+}
 
 
 def _make_tool(func: Callable[..., dict[str, Any]], name: str) -> FunctionTool:
@@ -167,16 +172,7 @@ def build_navigation_observation_tools(
             try:
                 return func()
             except Exception as error:
-                result = {
-                    "ok": False,
-                    "error_type": _inspection_error_type(error),
-                    "message": str(error)[:1_000],
-                }
-                return ensure_payload_within_limit(
-                    result,
-                    max_chars=INSPECTION_RESULT_MAX_CHARS,
-                    label=f"{func.__name__}_error",
-                )
+                return _bounded_inspection_failure(error)
 
         return invoke
 
@@ -416,3 +412,44 @@ def _inspection_error_type(error: Exception) -> str:
     if isinstance(error, ValueError):
         return "invalid_inspection_request"
     return "inspection_failed"
+
+
+def _bounded_inspection_failure(error: Exception) -> dict[str, Any]:
+    """Build a sanitized three-field failure that cannot exceed the tool budget."""
+    try:
+        error_type = _inspection_error_type(error)
+        message = "".join(
+            character if character.isprintable() else " "
+            for character in str(error)
+        ).strip()
+        if not message:
+            message = _INSPECTION_FAILURE_FALLBACK["message"]
+        result = {
+            "ok": False,
+            "error_type": error_type,
+            "message": message,
+        }
+        if serialized_chars(result) <= INSPECTION_RESULT_MAX_CHARS:
+            return result
+
+        low = 0
+        high = len(message)
+        while low < high:
+            midpoint = (low + high + 1) // 2
+            candidate = {
+                **result,
+                "message": f"{message[:midpoint]}…",
+            }
+            if serialized_chars(candidate) <= INSPECTION_RESULT_MAX_CHARS:
+                low = midpoint
+            else:
+                high = midpoint - 1
+        bounded = {
+            **result,
+            "message": f"{message[:low]}…",
+        }
+        if serialized_chars(bounded) <= INSPECTION_RESULT_MAX_CHARS:
+            return bounded
+    except BaseException:
+        pass
+    return dict(_INSPECTION_FAILURE_FALLBACK)

@@ -17,6 +17,7 @@ from vla_data_juicer_agents.navigation.observation_models import (
     EvidenceDescriptor,
     NavigationObservationRevision,
     ObservationKind,
+    ObservationPayload,
     StrictModel,
 )
 from vla_data_juicer_agents.navigation.observation_projection import (
@@ -106,6 +107,7 @@ def build_navigation_task_context(
         for descriptor in descriptors
         if descriptor.observation_revision <= observation_revision
     ]
+    payloads = list(observation.payloads) if observation is not None else []
     context = NavigationTaskContext(
         task_id=task.task_id,
         request=preview_string(task.request),
@@ -124,7 +126,7 @@ def build_navigation_task_context(
         ),
         observation_revision=observation_revision,
         observed_kinds=(list(observation.completed_kinds) if observation is not None else []),
-        fact_summary=_project_fact_summary(observation),
+        fact_summary=_minimal_fact_summary(payloads),
         available_stage_ids=list(AVAILABLE_STAGE_IDS),
         evidence_catalog=[],
         evidence_next_cursor=0 if descriptors else None,
@@ -149,24 +151,128 @@ def build_navigation_task_context(
             break
         prefix = candidate_prefix
         context = candidate
+    return _enrich_fact_summary(context, payloads)
+
+
+def _minimal_fact_summary(
+    payloads: Sequence[ObservationPayload],
+) -> dict[str, Any]:
+    facts: dict[str, Any] = {}
+    for payload in payloads:
+        if payload.kind == "raw_metadata":
+            facts[payload.kind] = {
+                "segment_count": len(payload.segments),
+                "topic_count": len(payload.topics),
+                "total_message_count": sum(
+                    topic.message_count for topic in payload.topics
+                ),
+            }
+        elif payload.kind == "sensor_candidates":
+            role_counts: dict[str, int] = {}
+            for candidate in payload.candidates:
+                role_counts[candidate.role] = role_counts.get(candidate.role, 0) + 1
+            facts[payload.kind] = {
+                "candidate_count": len(payload.candidates),
+                "role_counts": dict(sorted(role_counts.items())),
+            }
+        elif payload.kind == "topic_candidates":
+            facts[payload.kind] = {
+                "available_topic_count": len(payload.available_topics),
+                "suggested_role_count": len(payload.suggested_role_names),
+                "suggested_topic_assignment_count": sum(
+                    len(topics) for topics in payload.suggested_role_names.values()
+                ),
+            }
+        elif payload.kind == "artifact_state":
+            snapshot = payload.snapshot
+            facts[payload.kind] = {
+                "segment_count": len(snapshot.segments or []),
+                "raw_input_exists": snapshot.raw_input_exists,
+                "raw_temp_exists": snapshot.raw_temp_exists,
+                "sync_data_exists": snapshot.sync_data_exists,
+                "synced_segment_count": sum(snapshot.sync_data_by_segment.values()),
+                "finish_temp_samples_exists": snapshot.finish_temp_samples_exists,
+                "final_outputs_exist": snapshot.final_outputs_exist,
+                "final_grid_map_exists": snapshot.final_grid_map_exists,
+                "sync_image_sample_count": len(snapshot.sync_image_samples),
+            }
+        elif payload.kind == "gridmap_artifacts":
+            facts[payload.kind] = {
+                "existing_gridmap_count": len(payload.existing_gridmap_paths),
+                "pcd_source_count": len(payload.pcd_sources),
+                "projection_ready": payload.projection_ready,
+            }
+        elif payload.kind == "runtime_assets":
+            facts[payload.kind] = {
+                "pcd_gridmap_tool_available": payload.pcd_gridmap_tool_available,
+                "manual_annotation_gui_available": payload.manual_annotation_gui_available,
+                "projection_variant_count": len(payload.projection_variants),
+                "available_projection_variant_count": sum(
+                    bool(available)
+                    for available in payload.projection_variants.values()
+                ),
+            }
+        elif payload.kind == "calibration_inventory":
+            facts[payload.kind] = {
+                "sensor_source_count": len(payload.sensor_sources),
+            }
+        elif payload.kind == "localization_sources":
+            facts[payload.kind] = {
+                "available_source_count": len(payload.available_sources),
+                "available_sources_preview": list(payload.available_sources),
+                "conversion_available": payload.conversion_available,
+            }
+        elif payload.kind == "user_guidance":
+            facts[payload.kind] = {
+                "guidance_revision": payload.guidance_revision,
+                "text_length": len(payload.text),
+                "text_truncated": bool(payload.text),
+            }
+    return facts
+
+
+def _enrich_fact_summary(
+    context: NavigationTaskContext,
+    payloads: Sequence[ObservationPayload],
+) -> NavigationTaskContext:
+    for preview_items, string_chars in ((1, 80), (3, 160)):
+        for payload in payloads:
+            try:
+                projection = compact_observation_payload(
+                    payload,
+                    preview_items=preview_items,
+                    max_chars=1_800,
+                )
+            except ValueError:
+                continue
+            projection.pop("kind", None)
+            projection = _clip_projection_strings(projection, string_chars)
+            candidate = context.model_copy(
+                update={
+                    "fact_summary": {
+                        **context.fact_summary,
+                        payload.kind: projection,
+                    }
+                }
+            )
+            if serialized_chars(candidate.model_dump(mode="json")) <= PLANNING_CONTEXT_MAX_CHARS:
+                context = candidate
     return context
 
 
-def _project_fact_summary(
-    observation: NavigationObservationRevision | None,
-) -> dict[str, Any]:
-    if observation is None:
-        return {}
-    facts: dict[str, Any] = {}
-    for payload in observation.payloads:
-        compact = compact_observation_payload(
-            payload,
-            preview_items=3,
-            max_chars=1_800,
-        )
-        compact.pop("kind", None)
-        facts[payload.kind] = compact
-    return facts
+def _clip_projection_strings(value: Any, max_chars: int) -> Any:
+    if isinstance(value, str):
+        if len(value) <= max_chars:
+            return value
+        return f"{value[: max_chars - 1]}…"
+    if isinstance(value, list):
+        return [_clip_projection_strings(item, max_chars) for item in value]
+    if isinstance(value, dict):
+        return {
+            key: _clip_projection_strings(item, max_chars)
+            for key, item in value.items()
+        }
+    return value
 
 
 def _capability_revision(
