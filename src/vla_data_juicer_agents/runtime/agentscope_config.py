@@ -21,6 +21,18 @@ def _required_env(name: str) -> str:
     return value
 
 
+def _bool_env(name: str, *, default: bool = False) -> bool:
+    value = _env(name)
+    if value is None:
+        return default
+    normalized = value.lower()
+    if normalized in {"1", "true", "yes", "on"}:
+        return True
+    if normalized in {"0", "false", "no", "off"}:
+        return False
+    raise ValueError(f"{name} must be a boolean")
+
+
 @dataclass(frozen=True)
 class AgentScopeRuntimeConfig:
     user_id: str
@@ -35,6 +47,7 @@ class AgentScopeRuntimeConfig:
     main_router_agent_id: str = "main-router-agent"
     navigation_agent_id: str = "navigation-data-agent"
     agentscope_mount_path: str = "/api/agentscope"
+    navigation_dry_run: bool = False
 
     def redis_connection_kwargs(self) -> dict[str, str | int | None]:
         parsed = urlparse(self.redis_url)
@@ -89,4 +102,5 @@ class AgentScopeRuntimeConfig:
             router_model=router_model_env or default_model,
             navigation_model=navigation_model_env or default_model,
             agentscope_mount_path=_env("VLA_AGENTSCOPE_MOUNT_PATH") or "/api/agentscope",
+            navigation_dry_run=_bool_env("VLA_AGENT_NAVIGATION_DRY_RUN"),
         )

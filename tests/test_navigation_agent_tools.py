@@ -60,7 +60,10 @@ class FakeNavigationHandoffRuntime:
 
     async def start_navigation_agent_task(self, *, web_session_id: str, message: str) -> str:
         self.started.append({"web_session_id": web_session_id, "message": message})
-        return "navigation-session"
+        return SimpleNamespace(
+            task_id="nav-test-1",
+            agentscope_session_id="navigation-session",
+        )
 
     def record_navigation_handoff(self, payload: dict) -> None:
         self.records.append(payload)
@@ -134,8 +137,8 @@ def test_navigation_handoff_tool_declares_structured_schema():
         "missing_fields",
         "confidence",
         "response_language",
-        "dry_run",
     }
+    assert "dry_run" not in tool.input_schema["properties"]
     assert tool.input_schema["required"] == [
         "request",
         "target",
@@ -247,6 +250,14 @@ def test_navigation_handoff_tool_starts_navigation_with_structured_context():
     )
 
     assert result.state is ToolResultState.SUCCESS
+    result_payload = json.loads(_text(result))
+    assert result_payload == result.metadata
+    assert result_payload == {
+        "ok": True,
+        "started": True,
+        "task_id": "nav-test-1",
+        "message": "导航数据任务已启动。",
+    }
     assert runtime.started[0]["web_session_id"] == "web-1"
     message = runtime.started[0]["message"]
     assert "导航数据处理请求：" in message
@@ -305,11 +316,8 @@ def test_navigation_handoff_message_includes_structured_json_for_task_entry():
         "target": "20270605",
         "date": "20270605",
         "scene_mode": "out",
-        "clips": ["20260605_152856"],
         "segments": ["20260605_152856"],
-        "reason": "用户要处理导航数据",
         "response_language": "Chinese",
-        "dry_run": False,
     }
 
 
@@ -362,10 +370,68 @@ def test_navigation_handoff_tool_records_observability_payload():
             "missing_fields": [],
             "confidence": "medium",
             "response_language": "Chinese",
-            "dry_run": False,
+            "ok": True,
             "started": True,
+            "task_id": "nav-test-1",
         }
     ]
+
+
+def test_navigation_handoff_tool_returns_authoritative_busy_json():
+    class BusyRuntime(FakeNavigationHandoffRuntime):
+        async def start_navigation_agent_task(self, **_kwargs):
+            raise runtime_module.NavigationDataBusyError("busy")
+
+    tool = NavigationHandoffTool(runtime=BusyRuntime(), web_session_id="web-1")
+
+    result = asyncio.run(
+        tool(
+            request="处理 20270605 的导航数据",
+            target="20270605",
+            date="20270605",
+            reason="用户请求处理",
+            missing_fields=[],
+            confidence="high",
+            response_language="Chinese",
+        )
+    )
+
+    assert result.state is ToolResultState.ERROR
+    assert json.loads(_text(result)) == result.metadata == {
+        "ok": False,
+        "started": False,
+        "error_type": "navigation_data_busy",
+        "message": "该目标当前有正在运行的数据写入操作。",
+    }
+
+
+def test_navigation_handoff_tool_bounds_unknown_start_failure(caplog):
+    class FailingRuntime(FakeNavigationHandoffRuntime):
+        async def start_navigation_agent_task(self, **_kwargs):
+            raise RuntimeError("secret internal failure")
+
+    tool = NavigationHandoffTool(runtime=FailingRuntime(), web_session_id="web-1")
+
+    result = asyncio.run(
+        tool(
+            request="处理 20270605 的导航数据",
+            target="20270605",
+            date="20270605",
+            reason="用户请求处理",
+            missing_fields=[],
+            confidence="high",
+            response_language="Chinese",
+        )
+    )
+
+    payload = json.loads(_text(result))
+    assert result.state is ToolResultState.ERROR
+    assert payload == result.metadata
+    assert payload["ok"] is False
+    assert payload["started"] is False
+    assert payload["error_type"] == "navigation_start_failed"
+    assert "secret internal failure" not in _text(result)
+    assert "correlation_id=" in caplog.text
 
 
 def test_create_agentscope_runtime_wires_navigation_tools_factory(monkeypatch, tmp_path):
@@ -908,9 +974,7 @@ def test_phase_resolver_fails_closed_when_child_commit_advances_read_revision(
     assert tools == []
 
 
-def test_runtime_anchor_fails_closed_when_child_commit_advances_read_revision(
-    tmp_path, monkeypatch
-):
+def test_runtime_anchor_does_not_reconcile_or_append_observation(tmp_path, monkeypatch):
     services, task, _built = _resolver_services_from_complete(tmp_path)
     with sqlite3.connect(services.task_store.db_path) as connection:
         connection.execute(
@@ -922,25 +986,16 @@ def test_runtime_anchor_fails_closed_when_child_commit_advances_read_revision(
         )
     bound = services.task_store.get_task(task.task_id)
     assert bound is not None
-    original_reconcile = runtime_module.reconcile_navigation_task
+    before = services.observation_store.latest(task.task_id)
+    from vla_data_juicer_agents.navigation import task_reconciliation
 
-    def reconcile_then_advance(stale_task, *, settings):
-        result = original_reconcile(stale_task, settings=settings)
-        services.observation_store.append(
-            task.task_id,
-            task.phase,
-            "artifact_state",
-            [ArtifactStateObservation(snapshot=NavigationArtifactSnapshot(
-                date=task.date, segments=task.segments, raw_input_exists=True,
-            ))],
-            [],
-            services.evidence_store,
-            expected_web_session_id="web-owner",
-            expected_agentscope_session_id="web-owner__as",
-        )
-        return result
-
-    monkeypatch.setattr(runtime_module, "reconcile_navigation_task", reconcile_then_advance)
+    monkeypatch.setattr(
+        task_reconciliation,
+        "build_navigation_artifact_snapshot",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("runtime anchor must not inspect artifacts")
+        ),
+    )
     runtime = object.__new__(runtime_module.AgentScopeRuntime)
     runtime.config = SimpleNamespace(workspace_root=tmp_path)
     runtime._navigation_services = lambda: services
@@ -949,7 +1004,8 @@ def test_runtime_anchor_fails_closed_when_child_commit_advances_read_revision(
         "web-owner__as", web_session_id="web-owner"
     )
 
-    assert anchor["task_id"] is None
+    assert anchor["task_id"] == task.task_id
+    assert services.observation_store.latest(task.task_id) == before
 
 
 def test_phase_resolver_completed_state_has_only_compact_state_and_evidence(tmp_path):

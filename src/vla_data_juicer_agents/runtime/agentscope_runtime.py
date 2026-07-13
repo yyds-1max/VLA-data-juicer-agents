@@ -33,14 +33,10 @@ from vla_data_juicer_agents.navigation.services import (
     NavigationServices,
     build_navigation_services,
 )
-from vla_data_juicer_agents.navigation.task_reconciliation import (
-    _navigation_scene_mode_for_request,
+from vla_data_juicer_agents.navigation.task_entry import (
+    NavigationTaskEntryError,
     _structured_handoff_payload_from_message,
-    prepare_navigation_task_entry,
-    reconcile_navigation_task,
-)
-from vla_data_juicer_agents.navigation.task_store import (
-    NavigationTaskStateRevisionError,
+    parse_navigation_task_entry,
 )
 from vla_data_juicer_agents.runtime.agentscope_bootstrap import bootstrap_agentscope_records
 from vla_data_juicer_agents.runtime.agentscope_config import AgentScopeRuntimeConfig
@@ -63,6 +59,16 @@ class AgentScopeRecoveryMetrics:
     event_loop_lag_seconds: float | None = None
     recovered_wakeup_runs: int = 0
     recovered_orphan_inbox_runs: int = 0
+
+
+@dataclass(frozen=True)
+class NavigationTaskStartResult:
+    task_id: str
+    agentscope_session_id: str
+
+
+class NavigationDataBusyError(RuntimeError):
+    """Raised when an overlapping navigation writer is already running."""
 
 
 @dataclass
@@ -153,25 +159,49 @@ class AgentScopeRuntime:
             return self.config.navigation_agent_id
         return self.config.main_router_agent_id
 
-    async def start_navigation_agent_task(self, *, web_session_id: str, message: str) -> str:
+    async def start_navigation_agent_task(
+        self,
+        *,
+        web_session_id: str,
+        message: str,
+    ) -> NavigationTaskStartResult:
         await self.ensure_bootstrapped()
 
+        entry = parse_navigation_task_entry(message)
+        services = self._navigation_services()
+        writer = services.task_store.find_running_target_writer(
+            date=entry.date,
+            segments=entry.segments,
+        )
+        if writer is not None:
+            raise NavigationDataBusyError(
+                "an overlapping navigation data writer is already running"
+            )
+
         previous_mapping = self._web_session_mapping(web_session_id)
+        creation = None
+        session_id: str | None = None
         try:
             session_id = await self.ensure_web_session(
                 web_session_id,
                 agent_id=self.config.navigation_agent_id,
                 model=self.config.navigation_model,
             )
-            services = self._navigation_services()
-            prepare_navigation_task_entry(
-                task_store=services.task_store,
-                observation_store=services.observation_store,
-                evidence_store=services.evidence_store,
-                message=message,
+            creation = services.task_store.create_task_attempt(
+                request=entry.request,
+                target=entry.target,
+                date=entry.date,
+                segments=entry.segments,
+                scene_mode=entry.scene_mode,
+                dry_run=self.config.navigation_dry_run,
                 web_session_id=web_session_id,
                 agentscope_session_id=session_id,
-                settings=services.settings,
+            )
+            await self._start_agent_run(
+                web_session_id=web_session_id,
+                agent_id=self.config.navigation_agent_id,
+                model=self.config.navigation_model,
+                message=message,
             )
         except Exception as entry_error:
             try:
@@ -181,14 +211,28 @@ class AgentScopeRuntime:
                     "navigation entry session-mapping compensation failed: "
                     f"{compensation_error!r}"
                 )
+            if creation is not None and creation.created and session_id is not None:
+                try:
+                    deleted = services.task_store.delete_task_if_current(
+                        creation.task.task_id,
+                        expected_state_revision=creation.task.state_revision,
+                        expected_web_session_id=web_session_id,
+                        expected_agentscope_session_id=session_id,
+                    )
+                    if not deleted:
+                        entry_error.add_note(
+                            "navigation attempt compensation skipped: task changed"
+                        )
+                except Exception as compensation_error:
+                    entry_error.add_note(
+                        "navigation attempt compensation failed: "
+                        f"{compensation_error!r}"
+                    )
             raise
-        session_id = await self._start_agent_run(
-            web_session_id=web_session_id,
-            agent_id=self.config.navigation_agent_id,
-            model=self.config.navigation_model,
-            message=message,
+        return NavigationTaskStartResult(
+            task_id=creation.task.task_id,
+            agentscope_session_id=session_id,
         )
-        return session_id
 
     async def _start_agent_run(
         self,
@@ -304,7 +348,10 @@ class AgentScopeRuntime:
         web_session_id: str,
     ) -> dict[str, Any]:
         services = self._navigation_services()
-        task = services.task_store.find_latest_by_agentscope_session(agentscope_session_id)
+        task = services.task_store.find_by_session(
+            web_session_id=web_session_id,
+            agentscope_session_id=agentscope_session_id,
+        )
         if task is None:
             return {
                 "task_id": None,
@@ -315,46 +362,22 @@ class AgentScopeRuntime:
                 "active_plan_revision": None,
                 "current_step_id": None,
             }
-        reconciled = reconcile_navigation_task(task, settings=services.settings)
-        changes = reconciled.model_dump(mode="json")
-        for field in (
-            "task_id",
-            "created_by_web_session_id",
-            "latest_web_session_id",
-            "agentscope_session_id",
-            "created_at",
-            "updated_at",
-            "state_revision",
-        ):
-            changes.pop(field, None)
-        try:
-            task = services.task_store.update_task_for_session(
-                task.task_id,
-                web_session_id=web_session_id,
-                agentscope_session_id=agentscope_session_id,
-                expected_state_revision=task.state_revision,
-                **changes,
-            )
-        except (PermissionError, NavigationTaskStateRevisionError):
-            return {
-                "task_id": None,
-                "phase": None,
-                "task_status": None,
-                "observation_revision": None,
-                "active_plan_id": None,
-                "active_plan_revision": None,
-                "current_step_id": None,
-            }
         observation = services.observation_store.latest(task.task_id)
+        accepted_phase = task.accepted_plan_phase
+        if accepted_phase is None and task.phase.value in {
+            "extract_sync",
+            "finish_processing",
+        }:
+            accepted_phase = task.phase
         plan = (
-            services.plan_store.get_active(task.task_id, task.phase.value)
-            if task.phase.value in {"extract_sync", "finish_processing"}
+            services.plan_store.get_active(task.task_id, accepted_phase.value)
+            if accepted_phase is not None
             else None
         )
         current = services.plan_store.get_current_step(plan.plan_id) if plan is not None else None
         return {
             "task_id": task.task_id,
-            "phase": task.phase.value,
+            "phase": accepted_phase.value if accepted_phase is not None else None,
             "task_status": task.status.value,
             "observation_revision": observation.revision if observation is not None else None,
             "active_plan_id": plan.plan_id if plan is not None else None,
@@ -1991,11 +2014,28 @@ def _web_session_id_from_agentscope_session(session_id: str, *, agent_id: str) -
     return session_id
 
 
-def _handoff_error(message: str, payload: dict[str, Any]) -> ToolChunk:
+def _handoff_chunk(payload: dict[str, Any], *, state: ToolResultState) -> ToolChunk:
+    text = json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
     return ToolChunk(
-        content=[TextBlock(text=message)],
-        state=ToolResultState.ERROR,
+        content=[TextBlock(text=text)],
+        state=state,
         metadata=payload,
+    )
+
+
+def _handoff_error(
+    message: str,
+    *,
+    error_type: str = "invalid_navigation_handoff",
+) -> ToolChunk:
+    return _handoff_chunk(
+        {
+            "ok": False,
+            "started": False,
+            "error_type": error_type,
+            "message": message,
+        },
+        state=ToolResultState.ERROR,
     )
 
 
@@ -2040,7 +2080,6 @@ def _navigation_handoff_message(
     clips: list[str],
     reason: str,
     response_language: str | None,
-    dry_run: bool = False,
 ) -> str:
     clip_text = ", ".join(clips) if clips else "all"
     language = _resolve_response_language(response_language, request)
@@ -2049,12 +2088,16 @@ def _navigation_handoff_message(
         "request": request,
         "target": target,
         "date": date,
-        "scene_mode": _navigation_scene_mode_for_request(scene_mode),
-        "clips": clips,
+        "scene_mode": {
+            "indoor": "in",
+            "in": "in",
+            "室内": "in",
+            "outdoor": "out",
+            "out": "out",
+            "室外": "out",
+        }.get(scene_mode or ""),
         "segments": clips or None,
-        "reason": reason,
         "response_language": language,
-        "dry_run": bool(dry_run),
     }
     structured_lines = [
         "Structured handoff JSON:",
@@ -2172,10 +2215,6 @@ class NavigationHandoffTool(ToolBase):
                 "type": "string",
                 "description": "The language the user is using and expects for responses, such as Chinese or English.",
             },
-            "dry_run": {
-                "type": "boolean",
-                "description": "Whether the navigation task should execute in dry-run mode.",
-            },
         },
         "required": [
             "request",
@@ -2217,7 +2256,6 @@ class NavigationHandoffTool(ToolBase):
         response_language: str | None = None,
         clips: list[str] | None = None,
         scene_mode: str | None = None,
-        dry_run: bool = False,
     ) -> ToolChunk:
         normalized_clips = list(clips or [])
         normalized_language = _resolve_response_language(response_language, request)
@@ -2233,7 +2271,7 @@ class NavigationHandoffTool(ToolBase):
             "missing_fields": list(missing_fields),
             "confidence": confidence,
             "response_language": normalized_language,
-            "dry_run": bool(dry_run),
+            "ok": False,
             "started": False,
         }
 
@@ -2241,22 +2279,19 @@ class NavigationHandoffTool(ToolBase):
             self._record_handoff(payload)
             return _handoff_error(
                 "Navigation handoff rejected because confidence must be medium or high.",
-                payload,
             )
         if missing_fields:
             self._record_handoff(payload)
             return _handoff_error(
                 "Navigation handoff rejected because missing_fields is not empty.",
-                payload,
             )
         if not target.strip():
             self._record_handoff(payload)
-            return _handoff_error("Navigation handoff rejected because target is missing.", payload)
+            return _handoff_error("Navigation handoff rejected because target is missing.")
         if not re.fullmatch(r"[0-9]{8}", date.strip()):
             self._record_handoff(payload)
             return _handoff_error(
                 "Navigation handoff rejected because date must be a YYYYMMDD dataset date.",
-                payload,
             )
 
         navigation_request = _navigation_handoff_message(
@@ -2267,22 +2302,63 @@ class NavigationHandoffTool(ToolBase):
             clips=normalized_clips,
             reason=reason,
             response_language=normalized_language,
-            dry_run=dry_run,
         )
-        await self._runtime.start_navigation_agent_task(
-            web_session_id=self._web_session_id,
-            message=navigation_request,
+        try:
+            started = await self._runtime.start_navigation_agent_task(
+                web_session_id=self._web_session_id,
+                message=navigation_request,
+            )
+        except NavigationTaskEntryError as error:
+            result = _handoff_error(str(error))
+            payload["error_type"] = "invalid_navigation_handoff"
+            self._record_handoff(payload)
+            return result
+        except NavigationDataBusyError:
+            message = (
+                "该目标当前有正在运行的数据写入操作。"
+                if normalized_language == "Chinese"
+                else "This target currently has a running data-writing action."
+            )
+            payload["error_type"] = "navigation_data_busy"
+            self._record_handoff(payload)
+            return _handoff_error(message, error_type="navigation_data_busy")
+        except Exception:
+            correlation_id = uuid4().hex
+            _logger.exception(
+                "Navigation handoff start failed; correlation_id=%s",
+                correlation_id,
+            )
+            message = (
+                f"导航数据任务启动失败。关联 ID: {correlation_id}"
+                if normalized_language == "Chinese"
+                else f"Navigation data task failed to start. Correlation ID: {correlation_id}"
+            )
+            payload["error_type"] = "navigation_start_failed"
+            payload["correlation_id"] = correlation_id
+            self._record_handoff(payload)
+            return _handoff_error(message, error_type="navigation_start_failed")
+
+        result_payload = {
+            "ok": True,
+            "started": True,
+            "task_id": started.task_id,
+            "message": (
+                "导航数据任务已启动。"
+                if normalized_language == "Chinese"
+                else "Navigation data task started."
+            ),
+        }
+        payload.update(
+            {
+                "ok": True,
+                "started": True,
+                "task_id": started.task_id,
+            }
         )
-        payload["started"] = True
         self._record_handoff(payload)
-        return ToolChunk(
-            content=[
-                TextBlock(
-                    text="Navigation data task started.",
-                ),
-            ],
+        return _handoff_chunk(
+            result_payload,
             state=ToolResultState.SUCCESS,
-            metadata=payload,
         )
 
     def _record_handoff(self, payload: dict[str, Any]) -> None:

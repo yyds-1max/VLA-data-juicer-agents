@@ -635,13 +635,12 @@ The main router prompt contains only routing policy:
 - report a compact truthful failure for `ok: false`; never claim the task started
   and never use shell/file tools to work around a failed handoff
 
-`start_navigation_data_task` is terminal for the router turn. After its ToolResult
-is durable, a router-only AgentScope reply middleware ends the reasoning/acting loop,
-so the router cannot call another tool or generate another model response in that
-turn. The Web runtime renders the authoritative user-facing outcome from the
-structured tool result and defensively ignores any post-tool free text. This
-prevents the exact observed failure where the model received an error ToolResult and
-then stated that the task had started.
+`start_navigation_data_task` returns a structured, truthful result to the router.
+The router prompt requires any user-facing response to follow that result: it may
+report success only for `ok: true, started: true`, and must report failure for
+`ok: false`. No router-only reply middleware or event-adapter suppression is added;
+the session-bound Attempt contract removes the former cross-session ownership error
+that caused the observed misleading response.
 
 The handoff tool itself returns a stable contract:
 
@@ -897,10 +896,9 @@ failed, waiting, or unfinished.
 - the main router delegates a concrete navigation request and does not delegate
   ordinary conversation or a capability question
 - a failed handoff returns `ok: false, started: false`, remains on the router, and
-  terminates the router turn with an authoritative failure response
+  gives the router a bounded truthful failure result
 - a successful handoff returns `ok: true, started: true` and creates a task attempt
-  for the current Web/AgentScope session without a second model-authored success
-  message
+  for the current Web/AgentScope session
 - a new Web session for the same date/segments creates a new task attempt rather
   than attaching to or being blocked by an older completed/waiting/failed attempt
 - a genuinely running data-writing action for the same target returns

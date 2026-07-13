@@ -35,7 +35,7 @@
 | Planning | Strict phase-specific JSON inputs, validation attempts, atomic Plan activation | Task-phase prerequisite, single phase-selected submission tool, deterministic phase routing |
 | Execution | Immutable Plan, canonical arguments, ledger, outbox, recovery | Artifact reconciliation after each step, task phase as product truth |
 | Sessions | Web-to-AgentScope mapping, same-session durable Plan/ledger | Cross-session ownership transfer and global active target identity |
-| Router | Concrete-task triage and handoff tool | Free-text claims after authoritative handoff result |
+| Router | Concrete-task triage and structured handoff tool | Global target ownership and ambiguous handoff results |
 | Prompts | Short durable invariants | Repeated schemas, operator runbooks, automatic phase/reconciliation instructions |
 
 ---
@@ -201,13 +201,9 @@ Commit: `git commit -m "refactor: make navigation tasks session-bound attempts"`
 
 **Files:**
 - Create: `src/vla_data_juicer_agents/navigation/task_entry.py`
-- Create: `src/vla_data_juicer_agents/runtime/agentscope_middlewares.py`
 - Modify: `src/vla_data_juicer_agents/runtime/agentscope_runtime.py`
-- Modify: `src/vla_data_juicer_agents/adapters/agentscope/events.py`
 - Modify: `tests/test_web_agentscope_session.py`
-- Modify: `tests/test_agentscope_event_adapter.py`
 - Modify: `tests/test_navigation_agent_tools.py`
-- Create: `tests/test_agentscope_middlewares.py`
 
 **Final contracts:**
 
@@ -277,32 +273,9 @@ If task creation or `_start_agent_run` scheduling fails, restore the prior Web m
 
 `NavigationHandoffTool.__call__` catches only declared entry/busy errors and encodes the same payload in `TextBlock.text` and `metadata`. Unknown exceptions are logged with their traceback and correlation id, then converted to a bounded `navigation_start_failed` response before reaching the model. Both success and failure include boolean `ok` and `started`.
 
-- [ ] **Step 7: Terminate the AgentScope router loop after the handoff result**
+- [ ] **Step 7: Verify and commit**
 
-AgentScope 2.0.1 `ToolChunk` has no terminal-turn flag, but `create_app` supports `extra_agent_middlewares`. Implement `TerminalNavigationHandoffMiddleware.on_reply` and register it only for the main router:
-
-- pass through events until the `start_navigation_data_task` `ToolResultEndEvent` has been yielded and saved into AgentScope context;
-- then emit one matching `ReplyEndEvent` and return from `on_reply`, closing the wrapped async generator;
-- never enter another reasoning iteration, model call, or tool call for that reply;
-- do not terminate before `ToolResultEndEvent`, because the structured result and tool-call state must be durable.
-
-The Web event adapter then renders the authoritative result:
-
-- when `TOOL_RESULT_END` belongs to `start_navigation_data_task`, parse the bounded JSON result;
-- emit one authoritative `final` event from its `message`;
-- record that event's `reply_id` as terminal and clear it on the next `REPLY_START`;
-- suppress later `assistant_delta` and `final` events only for that same router `reply_id`;
-- continue emitting the tool lifecycle event for audit.
-
-The adapter suppression is defense in depth; the middleware is the actual execution boundary. Future messages use the already switched NavigationDataAgent mapping after success and remain on the router after failure.
-
-- [ ] **Step 8: Add the exact regression for the observed lie**
-
-Drive a fake Agent through the middleware with a failed `start_navigation_data_task` result followed by a fake model/tool iteration. Assert the stream stops at the synthetic `ReplyEndEvent`, the fake second model call count is zero, and no later Bash/Read/tool call executes. Separately feed the adapter a defensive sequence containing later text “任务已启动” and assert that the Web event list contains only the authoritative failure final.
-
-- [ ] **Step 9: Verify and commit**
-
-Run: `pytest tests/test_agentscope_middlewares.py tests/test_agentscope_event_adapter.py tests/test_web_agentscope_session.py tests/test_navigation_agent_tools.py -q -k 'handoff or terminal or start_navigation or cross_web'`
+Run: `pytest tests/test_web_agentscope_session.py tests/test_navigation_agent_tools.py -q -k 'handoff or start_navigation or cross_web'`
 
 Expected: pass.
 
@@ -626,7 +599,7 @@ Expected: current text still asserts automatic entry reconciliation/durable phas
 
 - [ ] **Step 3: Rewrite the main router prompt**
 
-Keep routing rules only. The router answers ordinary conversation/capability questions itself and delegates a concrete target. It never decides product stage. After calling `start_navigation_data_task`, it treats its structured result as authoritative and produces no independent success claim.
+Keep routing rules only. The router answers ordinary conversation/capability questions itself and delegates a concrete target. It never decides product stage. After calling `start_navigation_data_task`, it bases its user-facing response on the structured result and reports success only for `ok:true, started:true`.
 
 - [ ] **Step 4: Rewrite the NavigationDataAgent prompt**
 
@@ -756,7 +729,7 @@ Test: after a historical completed attempt, simulated products are removed while
 
 - [ ] **Step 5: Add exact handoff and busy regressions**
 
-Test the server failure shape: a completed old task never causes “belongs to another Web session”. A concurrently running overlapping write yields a truthful terminal `ok:false/started:false/navigation_data_busy`; the UI never receives a later “started” claim.
+Test the server failure shape: a completed old task never causes “belongs to another Web session”. A concurrently running overlapping write yields a truthful bounded `ok:false/started:false/navigation_data_busy` result.
 
 - [ ] **Step 6: Run context instrumentation**
 

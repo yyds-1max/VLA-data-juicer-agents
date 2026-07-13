@@ -143,7 +143,10 @@ class CapturingNavigationTaskRuntime:
 
     async def start_navigation_agent_task(self, *, web_session_id: str, message: str) -> str:
         self.started_tasks.append({"web_session_id": web_session_id, "message": message})
-        return "navigation-session-1"
+        return SimpleNamespace(
+            task_id="nav-test-1",
+            agentscope_session_id="navigation-session-1",
+        )
 
     def record_navigation_handoff(self, payload: dict) -> None:
         self.handoffs.append(payload)
@@ -622,12 +625,13 @@ async def test_runtime_start_navigation_agent_task_switches_mapping_and_spawns_n
 
     await runtime.submit_user_message(web_session_id="web-1", message="处理 20270605 的室外数据")
     await chat_run_registry.drain()
-    session_id = await runtime.start_navigation_agent_task(
+    started = await runtime.start_navigation_agent_task(
         web_session_id="web-1",
         message=handoff_message,
     )
 
-    assert session_id == "web-1__navigation-data-agent"
+    assert started.agentscope_session_id == "web-1__navigation-data-agent"
+    assert started.task_id.startswith("nav_")
     assert runtime.web_sessions == {"web-1": ("navigation-data-agent", "web-1__navigation-data-agent")}
     assert [session["agent_id"] for session in runtime.storage.sessions] == [
         "main-router-agent",
@@ -684,7 +688,7 @@ async def test_runtime_submit_user_message_routes_to_active_navigation_agent_aft
 
 
 @pytest.mark.asyncio
-async def test_runtime_start_navigation_agent_task_creates_durable_task_without_draft(
+async def test_runtime_start_navigation_agent_task_creates_attempt_without_observations(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -713,35 +717,41 @@ async def test_runtime_start_navigation_agent_task_creates_durable_task_without_
         response_language="Chinese",
     )
 
-    session_id = await runtime.start_navigation_agent_task(
+    started = await runtime.start_navigation_agent_task(
         web_session_id="web-1",
         message=message,
     )
-    task = runtime._navigation_task_store().find_latest_by_agentscope_session(session_id)
+    task = runtime._navigation_task_store().find_by_session(
+        web_session_id="web-1",
+        agentscope_session_id=started.agentscope_session_id,
+    )
 
-    assert session_id == "web-1__navigation-data-agent"
+    assert started.agentscope_session_id == "web-1__navigation-data-agent"
+    assert started.task_id == task.task_id
     assert not (tmp_path / "navigation-plan-drafts").exists()
     assert task is not None
-    assert task.phase == NavigationTaskPhase.INTAKE
-    assert task.status == NavigationTaskStatus.NEEDS_RECONCILE
-    assert task.guidance_revision == 1
+    assert task.request.startswith("请帮我处理")
+    assert task.target == "20260605_152856"
+    assert task.dry_run is False
+    assert task.status == NavigationTaskStatus.ACTIVE
+    assert task.guidance_revision == 0
     revision = SqliteNavigationObservationStore(
         tmp_path / "navigation-tasks.sqlite"
     ).latest(task.task_id)
-    assert revision is not None
-    assert {payload.kind for payload in revision.payloads} == {
-        "artifact_state",
-        "user_guidance",
-    }
+    assert revision is None
     await chat_run_registry.drain()
 
 
 @pytest.mark.asyncio
-async def test_runtime_start_navigation_agent_task_preserves_dry_run_from_handoff(
+async def test_runtime_start_navigation_agent_task_uses_trusted_dry_run_configuration(
     tmp_path: Path,
 ) -> None:
     chat_run_registry = FakeChatRunRegistry()
     runtime = _runtime(chat_run_registry=chat_run_registry, workspace_root=tmp_path)
+    runtime.config = _agentscope_config(
+        workspace_root=tmp_path,
+        navigation_dry_run=True,
+    )
     message = agentscope_runtime_module._navigation_handoff_message(
         request="请帮我 dry run 处理 20270605 的导航数据",
         target="20270605",
@@ -750,14 +760,16 @@ async def test_runtime_start_navigation_agent_task_preserves_dry_run_from_handof
         clips=[],
         reason="用户要求 dry run",
         response_language="Chinese",
-        dry_run=True,
     )
 
-    session_id = await runtime.start_navigation_agent_task(
+    started = await runtime.start_navigation_agent_task(
         web_session_id="web-1",
         message=message,
     )
-    task = runtime._navigation_task_store().find_latest_by_agentscope_session(session_id)
+    task = runtime._navigation_task_store().find_by_session(
+        web_session_id="web-1",
+        agentscope_session_id=started.agentscope_session_id,
+    )
 
     assert task is not None
     assert task.dry_run is True
@@ -766,7 +778,7 @@ async def test_runtime_start_navigation_agent_task_preserves_dry_run_from_handof
 
 
 @pytest.mark.asyncio
-async def test_runtime_same_date_cross_web_handoff_cannot_rebind_owner(tmp_path: Path) -> None:
+async def test_runtime_same_date_cross_web_handoff_creates_distinct_attempts(tmp_path: Path) -> None:
     chat_run_registry = FakeChatRunRegistry()
     runtime = _runtime(chat_run_registry=chat_run_registry, workspace_root=tmp_path)
     message = agentscope_runtime_module._navigation_handoff_message(
@@ -778,23 +790,97 @@ async def test_runtime_same_date_cross_web_handoff_cannot_rebind_owner(tmp_path:
         reason="owner test",
         response_language="Chinese",
     )
-    owner_session = await runtime.start_navigation_agent_task(
+    owner = await runtime.start_navigation_agent_task(
         web_session_id="web-owner",
         message=message,
     )
-    owned = runtime._navigation_task_store().find_latest_by_agentscope_session(
-        owner_session
+    foreign = await runtime.start_navigation_agent_task(
+        web_session_id="web-foreign",
+        message=message,
     )
 
-    with pytest.raises(PermissionError, match="another Web session"):
-        await runtime.start_navigation_agent_task(
-            web_session_id="web-foreign",
-            message=message,
-        )
-
-    assert runtime._navigation_task_store().get_task(owned.task_id) == owned
-    assert "web-foreign" not in runtime.web_sessions
+    assert owner.task_id != foreign.task_id
+    assert runtime.web_sessions["web-owner"][0] == "navigation-data-agent"
+    assert runtime.web_sessions["web-foreign"][0] == "navigation-data-agent"
     await chat_run_registry.drain()
+
+
+@pytest.mark.parametrize(
+    "older_status",
+    [
+        NavigationTaskStatus.COMPLETED,
+        NavigationTaskStatus.WAITING_USER,
+        NavigationTaskStatus.FAILED,
+    ],
+)
+@pytest.mark.asyncio
+async def test_runtime_completed_waiting_or_failed_attempt_does_not_block_handoff(
+    tmp_path: Path,
+    older_status: NavigationTaskStatus,
+) -> None:
+    registry = FakeChatRunRegistry()
+    runtime = _runtime(chat_run_registry=registry, workspace_root=tmp_path)
+    message = agentscope_runtime_module._navigation_handoff_message(
+        request="处理 20270605 的导航数据",
+        target="20270605",
+        date="20270605",
+        scene_mode=None,
+        clips=[],
+        reason="status test",
+        response_language="Chinese",
+    )
+    older = await runtime.start_navigation_agent_task(
+        web_session_id="web-old",
+        message=message,
+    )
+    runtime._navigation_task_store().update_task_for_session(
+        older.task_id,
+        web_session_id="web-old",
+        agentscope_session_id=older.agentscope_session_id,
+        status=older_status.value,
+    )
+
+    newer = await runtime.start_navigation_agent_task(
+        web_session_id="web-new",
+        message=message,
+    )
+
+    assert newer.task_id != older.task_id
+    await registry.drain()
+
+
+@pytest.mark.asyncio
+async def test_runtime_busy_preflight_does_not_change_web_mapping(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    runtime = _runtime(workspace_root=tmp_path)
+    runtime.web_sessions["web-1"] = ("main-router-agent", "as-main")
+    services = runtime._navigation_services()
+    monkeypatch.setattr(
+        services.task_store,
+        "find_running_target_writer",
+        lambda **_kwargs: SimpleNamespace(task_id="nav-writer"),
+    )
+    monkeypatch.setattr(runtime, "_navigation_services", lambda: services)
+    message = agentscope_runtime_module._navigation_handoff_message(
+        request="处理 20270623 的导航数据",
+        target="20270623",
+        date="20270623",
+        scene_mode=None,
+        clips=[],
+        reason="busy test",
+        response_language="Chinese",
+    )
+
+    with pytest.raises(agentscope_runtime_module.NavigationDataBusyError):
+        await runtime.start_navigation_agent_task(web_session_id="web-1", message=message)
+
+    assert runtime.web_sessions == {"web-1": ("main-router-agent", "as-main")}
+    assert services.task_store.find_by_session(
+        web_session_id="web-1",
+        agentscope_session_id="web-1__navigation-data-agent",
+    ) is None
 
 
 @pytest.mark.asyncio
@@ -840,12 +926,12 @@ async def test_runtime_failed_navigation_entry_restores_non_navigation_mapping_a
     )
     runtime.set_web_session_store(store)
 
-    def fail_entry(**kwargs):
-        raise RuntimeError("evidence append failed")
+    def fail_entry(_message):
+        raise RuntimeError("handoff parsing failed")
 
     monkeypatch.setattr(
         agentscope_runtime_module,
-        "prepare_navigation_task_entry",
+        "parse_navigation_task_entry",
         fail_entry,
     )
     message = agentscope_runtime_module._navigation_handoff_message(
@@ -858,18 +944,123 @@ async def test_runtime_failed_navigation_entry_restores_non_navigation_mapping_a
         response_language="Chinese",
     )
 
-    with pytest.raises(RuntimeError, match="evidence append failed"):
+    with pytest.raises(RuntimeError, match="handoff parsing failed"):
         await runtime.start_navigation_agent_task(
             web_session_id=web_session.id,
             message=message,
         )
 
-    assert runtime.web_sessions == {web_session.id: ("main-router-agent", "as-main")}
+    assert runtime.web_sessions == {}
     mapping = store.get_agentscope_session_mapping(web_session.id)
     assert mapping is not None
     assert mapping.agent_id == "main-router-agent"
     assert mapping.agentscope_session_id == "as-main"
     assert chat_run_registry.spawns == []
+
+
+@pytest.mark.asyncio
+async def test_runtime_start_failure_deletes_new_attempt_and_restores_mapping(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    runtime = _runtime(
+        chat_run_registry=FakeChatRunRegistry(),
+        workspace_root=tmp_path,
+    )
+    runtime.web_sessions["web-1"] = ("main-router-agent", "as-main")
+
+    async def fail_start(**_kwargs):
+        raise RuntimeError("schedule failed")
+
+    monkeypatch.setattr(runtime, "_start_agent_run", fail_start)
+    message = agentscope_runtime_module._navigation_handoff_message(
+        request="处理 20270623 的导航数据",
+        target="20270623",
+        date="20270623",
+        scene_mode=None,
+        clips=[],
+        reason="用户请求导航处理",
+        response_language="Chinese",
+    )
+
+    with pytest.raises(RuntimeError, match="schedule failed"):
+        await runtime.start_navigation_agent_task(web_session_id="web-1", message=message)
+
+    assert runtime.web_sessions == {"web-1": ("main-router-agent", "as-main")}
+    assert runtime._navigation_task_store().find_by_session(
+        web_session_id="web-1",
+        agentscope_session_id="web-1__navigation-data-agent",
+    ) is None
+
+
+@pytest.mark.asyncio
+async def test_runtime_task_creation_failure_restores_mapping(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    runtime = _runtime(workspace_root=tmp_path)
+    runtime.web_sessions["web-1"] = ("main-router-agent", "as-main")
+    services = runtime._navigation_services()
+
+    def fail_creation(**_kwargs):
+        raise RuntimeError("task creation failed")
+
+    monkeypatch.setattr(services.task_store, "create_task_attempt", fail_creation)
+    monkeypatch.setattr(runtime, "_navigation_services", lambda: services)
+    message = agentscope_runtime_module._navigation_handoff_message(
+        request="处理 20270623 的导航数据",
+        target="20270623",
+        date="20270623",
+        scene_mode=None,
+        clips=[],
+        reason="failure test",
+        response_language="Chinese",
+    )
+
+    with pytest.raises(RuntimeError, match="task creation failed"):
+        await runtime.start_navigation_agent_task(web_session_id="web-1", message=message)
+
+    assert runtime.web_sessions == {"web-1": ("main-router-agent", "as-main")}
+
+
+@pytest.mark.asyncio
+async def test_runtime_retry_start_failure_keeps_reused_attempt(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    registry = FakeChatRunRegistry()
+    runtime = _runtime(chat_run_registry=registry, workspace_root=tmp_path)
+    message = agentscope_runtime_module._navigation_handoff_message(
+        request="处理 20270623 的导航数据",
+        target="20270623",
+        date="20270623",
+        scene_mode=None,
+        clips=[],
+        reason="retry test",
+        response_language="Chinese",
+    )
+    first = await runtime.start_navigation_agent_task(
+        web_session_id="web-1",
+        message=message,
+    )
+    await registry.drain()
+
+    async def fail_start(**_kwargs):
+        raise RuntimeError("retry schedule failed")
+
+    monkeypatch.setattr(runtime, "_start_agent_run", fail_start)
+    with pytest.raises(RuntimeError, match="retry schedule failed"):
+        await runtime.start_navigation_agent_task(web_session_id="web-1", message=message)
+
+    task = runtime._navigation_task_store().find_by_session(
+        web_session_id="web-1",
+        agentscope_session_id=first.agentscope_session_id,
+    )
+    assert task is not None
+    assert task.task_id == first.task_id
+    assert runtime.web_sessions == {
+        "web-1": ("navigation-data-agent", first.agentscope_session_id)
+    }
 
 
 @pytest.mark.asyncio
@@ -959,23 +1150,21 @@ async def test_navigation_handoff_tool_allows_unknown_scene_mode() -> None:
 
 
 @pytest.mark.asyncio
-async def test_navigation_handoff_tool_preserves_dry_run_payload() -> None:
+async def test_navigation_handoff_tool_does_not_expose_dry_run_payload() -> None:
     runtime = CapturingNavigationTaskRuntime()
     tool = agentscope_runtime_module.NavigationHandoffTool(
         runtime=runtime,
         web_session_id="web-1",
     )
 
-    assert "dry_run" in tool.input_schema["properties"]
-    assert "dry_run" not in tool.input_schema["required"]
+    assert "dry_run" not in tool.input_schema["properties"]
 
     result = await tool(
-        request="请 dry run 处理 20270605 的导航数据",
+        request="请处理 20270605 的导航数据",
         target="20270605",
         date="20270605",
         scene_mode="unknown",
-        dry_run=True,
-        reason="用户要求 dry run",
+        reason="用户请求导航处理",
         missing_fields=[],
         confidence="high",
         response_language="Chinese",
@@ -985,8 +1174,8 @@ async def test_navigation_handoff_tool_preserves_dry_run_payload() -> None:
     )
 
     assert result.state == ToolResultState.SUCCESS
-    assert payload["dry_run"] is True
-    assert runtime.handoffs[-1]["dry_run"] is True
+    assert "dry_run" not in payload
+    assert "dry_run" not in runtime.handoffs[-1]
 
 
 @pytest.mark.asyncio
