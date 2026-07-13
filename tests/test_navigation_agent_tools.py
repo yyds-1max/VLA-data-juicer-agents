@@ -1021,11 +1021,11 @@ def test_runtime_anchor_does_not_reconcile_or_append_observation(tmp_path, monke
         "web-owner__as", web_session_id="web-owner"
     )
 
-    assert anchor["task_id"] == task.task_id
+    assert anchor["task_attempt_id"] == task.task_id
     assert services.observation_store.latest(task.task_id) == before
 
 
-def test_runtime_anchor_derives_phase_from_active_plan(tmp_path):
+def test_runtime_anchor_exposes_accepted_plan_without_phase_routing(tmp_path):
     services, task, built = _resolver_services_from_complete(tmp_path)
     active = services.plan_store.activate(
         task,
@@ -1052,8 +1052,9 @@ def test_runtime_anchor_derives_phase_from_active_plan(tmp_path):
         web_session_id="web-owner",
     )
 
-    assert anchor["phase"] == active.phase
-    assert anchor["active_plan_id"] == active.plan_id
+    assert anchor["accepted_plan_id"] == active.plan_id
+    assert anchor["accepted_plan_revision"] == active.plan_revision
+    assert "phase" not in anchor
 
 
 def test_task_status_completed_without_active_plan_remains_in_planning_activity(tmp_path):

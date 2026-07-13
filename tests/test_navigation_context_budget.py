@@ -1,12 +1,21 @@
 import asyncio
 import copy
 import json
+import re
 from dataclasses import dataclass
+from pathlib import Path
+from types import SimpleNamespace
 
 from vla_data_juicer_agents.navigation.agent_tools import resolve_navigation_agent_tools
 from vla_data_juicer_agents.navigation.config import NavigationSettings
 from vla_data_juicer_agents.navigation.services import build_navigation_services
 from vla_data_juicer_agents.runtime.agentscope_prompts import navigation_agent_prompt
+from vla_data_juicer_agents.runtime.agentscope_runtime import AgentScopeRuntime
+
+
+REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
+GUIDANCE_PATH = REPOSITORY_ROOT / "docs" / "navigation-plan-agent-guidance.md"
+SERVER_ACCEPTANCE_PATH = REPOSITORY_ROOT / "docs" / "navigation-plan-server-acceptance.md"
 
 
 def _decode(value):
@@ -127,6 +136,136 @@ class TurnMeasurement:
     estimated_tokens: int
 
 
+def test_navigation_guidance_has_exact_playbook_sections_and_four_bounded_few_shots():
+    guidance = GUIDANCE_PATH.read_text(encoding="utf-8")
+    headings = re.findall(r"^## (.+)$", guidance, flags=re.MULTILINE)
+
+    assert headings == [
+        "Product dependency map",
+        "Recommended investigation order",
+        "Common extract-sync work",
+        "Common finish-processing work",
+        "Model/code decision ownership",
+        "User-confirmation points",
+        "Failure/retry behavior",
+        "Four bounded few-shots",
+    ]
+    assert len(re.findall(r"^### Few-shot \d+: ", guidance, flags=re.MULTILINE)) == 4
+    for required_case in [
+        "user claims sync is complete",
+        "new session",
+        "extract/sync just completed",
+        "invalid complete Plan",
+    ]:
+        assert required_case in guidance
+    assert len(guidance) <= 12_000
+
+
+def test_navigation_guidance_excludes_operator_acceptance_runbook():
+    guidance = GUIDANCE_PATH.read_text(encoding="utf-8").lower()
+    acceptance = SERVER_ACCEPTANCE_PATH.read_text(encoding="utf-8").lower()
+    operator_topics = [
+        "deployment synchronization",
+        "git checks",
+        "token measurement",
+        "server log queries",
+        "real-data acceptance",
+        "legacy storage cleanup",
+    ]
+
+    for topic in operator_topics:
+        assert topic not in guidance
+        assert topic in acceptance
+
+
+def test_compact_navigation_anchor_contains_only_durable_execution_coordinates():
+    task = SimpleNamespace(
+        task_id="attempt-1",
+        accepted_plan_phase=SimpleNamespace(value="extract_sync"),
+    )
+    plan = SimpleNamespace(
+        plan_id="plan-1",
+        plan_revision=3,
+    )
+    services = SimpleNamespace(
+        task_store=SimpleNamespace(find_by_session=lambda **_kwargs: task),
+        observation_store=SimpleNamespace(latest=lambda _task_id: SimpleNamespace(revision=7)),
+        plan_store=SimpleNamespace(
+            get_active=lambda _task_id, _phase: plan,
+            get_current_step=lambda _plan_id: {
+                "step": {"step_id": "sync", "status": "running"}
+            },
+        ),
+    )
+    runtime = object.__new__(AgentScopeRuntime)
+    runtime._navigation_services = lambda: services
+
+    anchor = runtime._navigation_durable_state_anchor("as-1", web_session_id="web-1")
+
+    assert anchor == {
+        "task_attempt_id": "attempt-1",
+        "observation_revision": 7,
+        "accepted_plan_id": "plan-1",
+        "accepted_plan_revision": 3,
+        "current_ledger_step": "sync",
+        "execution_status": "running",
+    }
+
+
+def test_static_prompt_guidance_submission_schemas_and_anchor_fit_context_budget(tmp_path):
+    services = build_navigation_services(tmp_path)
+    session_id = "static-budget"
+    services.task_store.create_task_attempt(
+        request="Process navigation data.",
+        target="20260710",
+        date="20260710",
+        segments=None,
+        scene_mode=None,
+        dry_run=True,
+        web_session_id=session_id,
+        agentscope_session_id=session_id,
+    )
+    tools = _tool_map(services, session_id)
+    submission_names = {
+        "submit_extract_sync_plan_tool",
+        "submit_finish_processing_plan_tool",
+    }
+    assert submission_names <= tools.keys()
+    schemas = json.dumps(
+        [
+            {
+                "name": tools[name].name,
+                "description": tools[name].description,
+                "input_schema": tools[name].input_schema,
+            }
+            for name in sorted(submission_names)
+        ],
+        ensure_ascii=False,
+        separators=(",", ":"),
+    )
+    compact_anchor = json.dumps(
+        {
+            "task_attempt_id": "attempt-1",
+            "observation_revision": 7,
+            "accepted_plan_id": "plan-1",
+            "accepted_plan_revision": 3,
+            "current_ledger_step": "sync",
+            "execution_status": "running",
+        },
+        separators=(",", ":"),
+    )
+    static_context = "\n".join(
+        [
+            navigation_agent_prompt(),
+            GUIDANCE_PATH.read_text(encoding="utf-8"),
+            schemas,
+            compact_anchor,
+        ]
+    )
+
+    assert (len(static_context) + 3) // 4 <= 83_885
+
+
 def test_representative_model_authored_transcript_stays_bounded_without_compaction(tmp_path):
     # This models four real AgentScope invocations. The runtime refreshes extra
     # tools only at an invocation boundary, appends one durable anchor to that
@@ -140,7 +279,9 @@ def test_representative_model_authored_transcript_stays_bounded_without_compacti
         tmp_path,
         NavigationSettings(vladatasets_root=data_root),
     )
-    system_chars = len(navigation_agent_prompt())
+    system_chars = len(navigation_agent_prompt()) + 1 + len(
+        GUIDANCE_PATH.read_text(encoding="utf-8")
+    )
     retained_history: list[str] = []
     transcript: list[tuple[str, str]] = []
     turn_measurements: list[TurnMeasurement] = []
@@ -165,13 +306,14 @@ def test_representative_model_authored_transcript_stays_bounded_without_compacti
         )
         current = services.plan_store.get_current_step(plan.plan_id) if plan else None
         return {
-            "task_id": task.task_id if task else None,
-            "phase": plan.phase if plan else None,
-            "task_status": task.status.value if task else None,
+            "task_attempt_id": task.task_id if task else None,
             "observation_revision": observation.revision if observation else None,
-            "active_plan_id": plan.plan_id if plan else None,
-            "active_plan_revision": plan.plan_revision if plan else None,
-            "current_step_id": current["step"]["step_id"] if current else None,
+            "accepted_plan_id": plan.plan_id if plan else None,
+            "accepted_plan_revision": plan.plan_revision if plan else None,
+            "current_ledger_step": current["step"]["step_id"] if current else None,
+            "execution_status": (
+                current["step"]["status"] if current else getattr(plan, "status", None)
+            ),
         }
 
     def measure_model_call(label):

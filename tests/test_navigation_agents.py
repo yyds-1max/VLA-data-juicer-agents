@@ -112,8 +112,28 @@ def test_create_plan_agent_uses_only_resolved_tools(monkeypatch):
     agent = create_plan_agent(tools=tools)
 
     assert agent.tools == tools
-    assert "complete JSON plan" in agent.instructions
+    assert "complete JSON Plan" in agent.instructions
     assert "data_profile_draft" not in agent.instructions
+
+
+def test_plan_agent_prompt_keeps_model_ownership_without_phase_routing():
+    for contract in [
+        "investigate current products before deciding",
+        "choose which inspection tools",
+        "choose the processing stage",
+        "Both complete-plan submission tools",
+        "steps, variants, and business parameters",
+        "resubmit the whole complete JSON Plan",
+    ]:
+        assert contract in PLAN_AGENT_INSTRUCTIONS
+
+    for obsolete in [
+        "current durable phase",
+        "active phase",
+        "one submission tool",
+        "reconcile artifacts",
+    ]:
+        assert obsolete not in PLAN_AGENT_INSTRUCTIONS.lower()
 
 
 def test_create_executor_agent_uses_only_plan_bound_tools(monkeypatch):

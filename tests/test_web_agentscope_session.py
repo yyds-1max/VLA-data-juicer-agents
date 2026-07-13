@@ -503,12 +503,13 @@ def test_navigation_rule_fallback_is_narrow_and_explicit() -> None:
     assert not is_high_confidence_navigation_request("annotate this chart")
 
 
-def test_web_navigation_prompt_describes_cross_session_resume_gate() -> None:
+def test_web_navigation_prompt_describes_session_attempt_boundaries() -> None:
     prompt = navigation_agent_prompt()
 
-    assert "When the user supplies scene mode for a waiting task" in prompt
-    assert "update durable task state, reconcile artifacts" in prompt
-    assert "runtime-selected phase tools" in prompt
+    assert "same-session continuation" in prompt
+    assert "new Web session is a fresh task attempt" in prompt
+    assert "must investigate again" in prompt
+    assert "runtime-selected phase" not in prompt
 
 @pytest.mark.asyncio
 async def test_runtime_submit_user_message_starts_navigation_requests_with_main_router() -> None:
@@ -1172,7 +1173,7 @@ async def test_runtime_cursor_persistence_failure_after_spawn_is_nonfatal(
     await registry.drain()
 
 
-def test_runtime_anchor_does_not_expose_legacy_phase_without_active_plan(
+def test_runtime_anchor_does_not_expose_phase_without_accepted_plan(
     tmp_path: Path,
 ) -> None:
     runtime = _runtime(workspace_root=tmp_path)
@@ -1199,8 +1200,9 @@ def test_runtime_anchor_does_not_expose_legacy_phase_without_active_plan(
         web_session_id="web-1",
     )
 
-    assert anchor["phase"] is None
-    assert anchor["active_plan_id"] is None
+    assert anchor["accepted_plan_id"] is None
+    assert anchor["accepted_plan_revision"] is None
+    assert "phase" not in anchor
 
 
 @pytest.mark.asyncio

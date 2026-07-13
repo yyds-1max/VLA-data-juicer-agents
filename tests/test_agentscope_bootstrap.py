@@ -8,6 +8,7 @@ from vla_data_juicer_agents.runtime.agentscope_prompts import (
     main_router_prompt,
     navigation_agent_prompt,
 )
+from vla_data_juicer_agents.runtime.agentscope_runtime import NavigationHandoffTool
 
 
 class FakeStorage:
@@ -39,7 +40,7 @@ def _config(**overrides) -> AgentScopeRuntimeConfig:
     return AgentScopeRuntimeConfig(**values)
 
 
-def test_main_router_prompt_presents_datapilot_and_sets_task_readiness_rules():
+def test_main_router_prompt_is_triage_only_and_handles_handoff_truthfully():
     prompt = main_router_prompt()
 
     assert prompt.startswith("You are DataPilot")
@@ -47,68 +48,80 @@ def test_main_router_prompt_presents_datapilot_and_sets_task_readiness_rules():
     assert "Do not reveal internal agent names" in prompt
     assert "Ordinary conversation" in prompt
     assert "Capability questions" in prompt
-    assert "do not inspect the workspace" in prompt
-    assert "date, path, or" in prompt
-    assert "dataset target" in prompt
-    assert "ask for the data date or path" in prompt
-    assert "Do not ask indoor/outdoor before extract/sync" in prompt
-    assert "combine it with the pending task context" in prompt
-    assert "If no clip is specified, process all clips" in prompt
-    assert "If a specified clip does not exist" in prompt
-    assert "Camera and sensor parameter confirmation belongs to finish-processing" in prompt
-    assert "Before real processing, camera parameters must be confirmed" not in prompt
+    assert "concrete navigation-processing request" in prompt
+    assert "date, path, or dataset target" in prompt
     assert "start_navigation_data_task" in prompt
-    assert "call start_navigation_data_task" in prompt
-    assert "target" in prompt
-    assert "date" in prompt
-    assert "scene_mode" in prompt
-    assert "missing_fields" in prompt
-    assert "confidence" in prompt
-    assert "Do not call start_navigation_data_task with non-empty missing_fields" in prompt
-    assert "vla_run_workflow" in prompt
-    assert "vla_continue_workflow" in prompt
-    assert "user's language" in prompt
+    for preserved in ["request", "target", "date", "clips", "scene_mode", "response_language"]:
+        assert preserved in prompt
+    assert "`ok: true` and `started: true`" in prompt
+    assert "`ok: false`" in prompt
+    assert "never claim" in prompt.lower()
+    assert "shell" in prompt.lower()
     assert "You are MainRouterAgent" not in prompt
     assert "route to NavigationDataAgent" not in prompt
 
-    for term in [
-        "VLA navigation data",
+    for artifact_or_stage_rule in [
         "ROS bag/db3",
         "odom",
-        "trajectory",
         "gridmap",
         "camera calibration",
-        "dataset extraction",
         "sync_data",
         "finish_data",
         "annotation",
-        "gen_box.py",
         "tracking",
         "projection",
+        "extract/sync",
+        "finish-processing",
+        "active phase",
     ]:
-        assert term in prompt
+        assert artifact_or_stage_rule not in prompt
 
     assert "mock" not in prompt.lower()
 
 
-def test_navigation_agent_prompt_requires_plan_execute_react_and_human_decisions():
+def test_router_handoff_schema_omits_dry_run():
+    schema = NavigationHandoffTool.input_schema
+
+    assert "dry_run" not in schema["properties"]
+    assert "dry_run" not in schema["required"]
+    assert _config().navigation_dry_run is False
+
+
+def test_navigation_agent_prompt_requires_model_directed_investigation_and_plans():
     prompt = navigation_agent_prompt()
 
     for exact_concept in [
-        "observations are facts",
-        "model owns semantic decisions",
-        "submit one complete JSON plan",
-        "resubmit complete plan",
-        "durable state is authoritative",
+        "Investigate before deciding",
+        "user claims",
+        "conversation memory",
+        "older task status",
+        "current product facts",
+        "which investigation tools",
+        "processing stage",
+        "decisions, steps, variants, and business parameters",
+        "complete strict JSON Plan",
+        "resubmit the whole Plan",
+        "Execute only the accepted immutable Plan",
+        "verify the produced outputs",
+        "ask whether to continue",
+        "finish-processing inputs",
+        "same-session",
+        "new Web session",
+        "fresh task attempt",
     ]:
         assert exact_concept in prompt
 
-    for legacy_concept in [
+    for duplicated_or_legacy_concept in [
         "phase_profile_schema",
         "data_profile_draft",
         "data_profile_patch",
+        "runtime-selected phase",
+        "active phase",
+        "Reconcile raw, intermediate, and final artifacts",
+        "one submission tool exposed",
+        "phase schema",
     ]:
-        assert legacy_concept not in prompt
+        assert duplicated_or_legacy_concept not in prompt
 
     for retained_contract in [
         "plan-and-execute",
@@ -120,8 +133,6 @@ def test_navigation_agent_prompt_requires_plan_execute_react_and_human_decisions
         "final summaries in the user's language",
         "concise progress updates",
         "cancelled",
-        "two-phase",
-        "Reconcile raw, intermediate, and final artifacts",
     ]:
         assert retained_contract in prompt
     assert "confirm_navigation_calibration_params_tool" not in prompt
@@ -136,7 +147,7 @@ def test_navigation_agent_prompt_requires_plan_execute_react_and_human_decisions
 def test_navigation_agent_prompt_has_no_legacy_guidance_loader_contract():
     prompt = navigation_agent_prompt()
 
-    assert "durable state is authoritative" in prompt
+    assert "accepted Plan and execution ledger are durable" in prompt
     assert "navigation-data-agent-planning-guidance" not in prompt
     assert "data_profile_patch" not in prompt
 

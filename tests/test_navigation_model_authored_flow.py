@@ -251,7 +251,7 @@ def test_completed_outputs_expose_no_processing_tools_and_deletion_reselects_fin
     assert "submit_finish_processing_plan_tool" in planning
 
 
-def test_cleared_conversation_recovers_phase_plan_and_current_step_from_sqlite(tmp_path):
+def test_cleared_conversation_recovers_compact_plan_and_ledger_anchor_from_sqlite(tmp_path):
     settings = _settings(tmp_path)
     _write_raw_metadata(settings.vladatasets_root, DATE, SEGMENT)
     services = build_navigation_services(tmp_path, settings)
@@ -278,11 +278,10 @@ def test_cleared_conversation_recovers_phase_plan_and_current_step_from_sqlite(t
     )
 
     assert anchor == {
-        "task_id": task.task_id,
-        "phase": "extract_sync",
-        "task_status": anchor["task_status"],
+        "task_attempt_id": task.task_id,
         "observation_revision": anchor["observation_revision"],
-        "active_plan_id": submitted["plan_id"],
-        "active_plan_revision": submitted["plan_revision"],
-        "current_step_id": "prepare_raw",
+        "accepted_plan_id": submitted["plan_id"],
+        "accepted_plan_revision": submitted["plan_revision"],
+        "current_ledger_step": "prepare_raw",
+        "execution_status": "pending",
     }

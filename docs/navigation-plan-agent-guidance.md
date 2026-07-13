@@ -1,53 +1,77 @@
-# Navigation model-authored plan guidance
+# Navigation Plan Agent Guidance
 
-Navigation state has three authorities: investigation code appends factual observations,
-the model authors one complete phase JSON plan, and the execution runtime advances the
-ledger for the immutable stored plan. Conversation text is never authoritative state.
+## Product dependency map
 
-Every entry inspects raw, intermediate, and final artifacts before phase selection. Use
-only the tools resolved for that durable phase. Complete every required observation;
-when a detailed payload is needed, list and read its task-scoped evidence reference.
-Unavailable resources are facts, not missing observations.
+Products normally depend on one another in this order:
 
-The model alone chooses sensor bindings, the time-sync reference and tolerance,
-localization source/conversion, calibration source/mode, gridmap source, ordered steps,
-variants, and business parameters. Code validates these choices against observed facts
-and capability contracts but does not synthesize them.
+`raw acquisition -> prepared/extracted data -> per-segment sync_data -> finish temporary data -> annotation -> tracking -> projection -> final outputs + validation markers`
 
-Submit exactly one complete JSON plan through the active phase submission tool. Do not
-send partial updates. On validation failure, use the bounded errors and evidence tools,
-then resubmit a complete replacement. A successful response includes `ok: true` and the
-immutable plan identity. Execution tools accept only `plan_id` and `step_id`; server code
-loads canonical arguments from the plan repository.
+Existence is not completeness. Check the requested segment inventory and validation evidence at each dependency boundary before relying on a downstream product.
 
-Routine results and detailed evidence reads are bounded. Avoid repeating prior tool
-payloads or plan candidates in assistant messages. After compaction or resume, recover
-phase, active plan, and current step from the durable state tools.
+## Recommended investigation order
 
-Older deployments may still contain a `navigation-plan-drafts/` directory. Current code
-does not read or write it. Operations may remove that directory only after rollout
-verification; application code intentionally does not delete deployed state.
+1. Confirm the requested date/path and selected segment inventory.
+2. Inspect raw, prepared, sync, finish, final, and validation product facts in dependency order.
+3. If work remains before sync, inspect only the topic, timestamp, sensor-role, and runtime facts needed to plan it.
+4. If sync is complete and later work remains, first confirm continuation and needed user inputs, then inspect localization, gridmap, calibration, and runtime facts.
+5. Read bounded evidence pages and action contracts only when summaries do not support a decision. Select the stage by choosing one of the two complete-Plan submission tools.
 
-## Server acceptance runbook
+## Common extract-sync work
 
-Server acceptance is a post-deployment operation and is not completed by the local
-test suite. Before running it, synchronize the server checkout to the exact reviewed
-revision and record both local and server `git rev-parse HEAD`; stop if they differ.
+- Establish raw availability and segment coverage; prepare raw layout when required.
+- Inspect ROS topics/types/counts/timing and sensor-role candidates.
+- Choose sensor bindings, topic selection/mapping, query source, sync reference/method/tolerance, and concise evidence-backed reasons.
+- Choose ordered extract/sync steps, supported variants, parameters, dependencies, and failure policies.
+- Execute only the accepted Plan, then inspect the selected segment outputs and synchronization quality.
 
-Start with read-only checks for one known test date: service logs, the reconciled task
-and artifact snapshot, observation revisions/evidence descriptors, active plan and
-submission attempts, execution ledger/outbox rows, and the tool names resolved for the
-durable phase. Record per-turn model input tokens, every tool-result character count,
-compact events, plan revision, current step, and ledger transitions.
+## Common finish-processing work
 
-After the read-only state matches the synchronized revision, run the normal task in
-dry-run mode. Confirm artifact reconciliation precedes planning, one valid complete
-plan activates without any draft/finalize loop, peak input remains below 83,885 tokens,
-and no standard-run compact event occurs. A forced-compaction check must recover phase,
-active plan, and current step from SQLite rather than conversation text.
+- Confirm that the user wants to continue and collect missing inputs such as scene mode.
+- Inspect finish inputs, localization sources/conversions, gridmap sources/preparation, calibration inventory, and relevant runtime assets.
+- Choose evidence-backed localization, gridmap, and calibration decisions, then ordered preparation, human-decision, annotation, tracking, projection, and validation steps as the observed case requires.
+- Treat GUI work as bounded human-in-the-loop execution. Verify final outputs and validation markers after execution.
 
-Only after dry-run evidence is reviewed may an operator run the separately authorized
-real-data test. Deleting test outputs for a subsequent ordinary entry should select the
-earliest incomplete phase. Do not change AgentScope compression or add phase sub-session
-rotation during this acceptance; if the synchronized real run still exceeds the target,
-preserve the transcript metrics and open a separate design task.
+## Model/code decision ownership
+
+The model chooses inspection calls, stage, reference sensor, sync policy, sensor/topic bindings, localization, calibration, gridmap, ordered steps, variants, business parameters, dependencies, failure policies, and reasons from facts and action contracts. Code records observations, checks concurrency and authorization, validates a complete Plan, stores it immutably, and executes canonical accepted arguments. Code-derived identifiers, timestamps, output declarations, and ledger status are metadata, not semantic choices.
+
+## User-confirmation points
+
+Ask the user when:
+
+- extract/sync has been verified and finish processing could begin;
+- a required finish input is missing;
+- work would overwrite, delete, or destructively replace products;
+- the accepted Plan reaches a declared calibration or GUI decision.
+
+Do not treat silence, remembered text, or a code status as consent.
+
+## Failure/retry behavior
+
+Inspect current inputs and outputs before retrying. A non-destructive retry may proceed when still authorized by the accepted Plan; ask again before destructive replacement. If facts invalidate the Plan, investigate and author a new complete Plan. If submission validation fails, correct the reported paths using evidence/action contracts and resubmit the entire Plan; never send a patch. Report failures and blocked state truthfully.
+
+## Four bounded few-shots
+
+### Few-shot 1: user claims sync is complete, but products are missing
+
+- Observation: current artifact inspection finds one requested segment without `sync_data` or its validation evidence.
+- Criteria: the statement is guidance, not product proof; downstream work lacks a dependency.
+- Next: inspect raw/topic/sensor/timing facts and, if supported, submit a complete extract-sync Plan.
+
+### Few-shot 2: new session finds sync complete and finish missing
+
+- Observation: this fresh attempt independently verifies complete sync products and missing finish/final products.
+- Criteria: do not restore the older attempt; finish inputs and finish-specific facts are still required.
+- Next: ask for or confirm continuation and missing inputs, inspect localization/gridmap/calibration facts, then submit a complete finish Plan if supported.
+
+### Few-shot 3: extract/sync just completed
+
+- Observation: execution ended and follow-up inspection verifies the selected sync outputs.
+- Criteria: stage completion is not consent to continue.
+- Next: report what completed and remains, ask whether to continue now, and wait for the answer before finish planning.
+
+### Few-shot 4: invalid complete Plan
+
+- Observation: validation returns bounded errors for one decision and one step argument.
+- Criteria: the rejected candidate did not replace the accepted Plan; a patch is not a valid submission.
+- Next: inspect the cited evidence/action contract, correct the fields, and resubmit the whole complete JSON Plan.

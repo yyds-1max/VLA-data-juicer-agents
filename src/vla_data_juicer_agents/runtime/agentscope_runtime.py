@@ -382,13 +382,12 @@ class AgentScopeRuntime:
         )
         if task is None:
             return {
-                "task_id": None,
-                "phase": None,
-                "task_status": None,
+                "task_attempt_id": None,
                 "observation_revision": None,
-                "active_plan_id": None,
-                "active_plan_revision": None,
-                "current_step_id": None,
+                "accepted_plan_id": None,
+                "accepted_plan_revision": None,
+                "current_ledger_step": None,
+                "execution_status": None,
             }
         observation = services.observation_store.latest(task.task_id)
         phase_hint = task.accepted_plan_phase
@@ -399,14 +398,17 @@ class AgentScopeRuntime:
         )
         current = services.plan_store.get_current_step(plan.plan_id) if plan is not None else None
         return {
-            "task_id": task.task_id,
-            "phase": plan.phase if plan is not None else None,
-            "task_status": task.status.value,
+            "task_attempt_id": task.task_id,
             "observation_revision": observation.revision if observation is not None else None,
-            "active_plan_id": plan.plan_id if plan is not None else None,
-            "active_plan_revision": plan.plan_revision if plan is not None else None,
-            "current_step_id": (
+            "accepted_plan_id": plan.plan_id if plan is not None else None,
+            "accepted_plan_revision": plan.plan_revision if plan is not None else None,
+            "current_ledger_step": (
                 current["step"]["step_id"] if current is not None else None
+            ),
+            "execution_status": (
+                current["step"]["status"]
+                if current is not None
+                else getattr(plan, "status", None)
             ),
         }
 
