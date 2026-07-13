@@ -1024,8 +1024,7 @@ async def test_runtime_task_creation_failure_restores_mapping(
 
 
 @pytest.mark.asyncio
-async def test_runtime_retry_start_failure_keeps_reused_attempt(
-    monkeypatch,
+async def test_runtime_exact_retry_ignores_own_writer_and_does_not_spawn_again(
     tmp_path: Path,
 ) -> None:
     registry = FakeChatRunRegistry()
@@ -1035,32 +1034,173 @@ async def test_runtime_retry_start_failure_keeps_reused_attempt(
         target="20270623",
         date="20270623",
         scene_mode=None,
-        clips=[],
-        reason="retry test",
+        clips=["segment-a"],
+        reason="exact retry",
         response_language="Chinese",
     )
     first = await runtime.start_navigation_agent_task(
         web_session_id="web-1",
         message=message,
     )
+    db_path = tmp_path / "navigation-tasks.sqlite"
+    SqliteNavigationPlanRepository(db_path)
+    timestamp = "2026-07-13T00:00:00.000+00:00"
+    plan_id = f"plan-{first.task_id}"
+    with sqlite3.connect(db_path) as connection:
+        connection.execute(
+            """INSERT INTO navigation_plans (
+                   plan_id, task_id, phase, plan_revision, contract_version,
+                   observation_revision, plan_json, validation_summary_json,
+                   status, invalidation_reason, created_at, updated_at
+               ) VALUES (?, ?, 'extract_sync', 1, 'test', 1, ?, '{}',
+                         'active', NULL, ?, ?)""",
+            (
+                plan_id,
+                first.task_id,
+                json.dumps(
+                    {
+                        "steps": [
+                            {
+                                "step_id": "writer",
+                                "action": "prepare_raw_data",
+                            }
+                        ]
+                    }
+                ),
+                timestamp,
+                timestamp,
+            ),
+        )
+        connection.execute(
+            """INSERT INTO navigation_task_steps (
+                   id, task_id, phase, step_id, tool_name, status,
+                   plan_id, plan_revision, sequence, started_at
+               ) VALUES (?, ?, 'extract_sync', 'writer', 'prepare_raw_data',
+                         'running', ?, 1, 1, ?)""",
+            (f"ledger-{first.task_id}", first.task_id, plan_id, timestamp),
+        )
+    replay = await runtime.start_navigation_agent_task(
+        web_session_id="web-1",
+        message=message,
+    )
+
+    assert replay == first
+    assert len(registry.spawns) == 1
     await registry.drain()
 
-    async def fail_start(**_kwargs):
-        raise RuntimeError("retry schedule failed")
 
-    monkeypatch.setattr(runtime, "_start_agent_run", fail_start)
-    with pytest.raises(RuntimeError, match="retry schedule failed"):
+@pytest.mark.asyncio
+async def test_runtime_anchor_failure_cleans_registration_mapping_and_attempt(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    registry = FakeChatRunRegistry()
+    runtime = _runtime(chat_run_registry=registry, workspace_root=tmp_path)
+    session_id = "web-1__navigation-data-agent"
+    monkeypatch.setattr(
+        runtime,
+        "_navigation_durable_state_anchor",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            RuntimeError("anchor failed")
+        ),
+    )
+    message = agentscope_runtime_module._navigation_handoff_message(
+        request="处理 20270623 的导航数据",
+        target="20270623",
+        date="20270623",
+        scene_mode=None,
+        clips=[],
+        reason="anchor failure",
+        response_language="Chinese",
+    )
+
+    with pytest.raises(RuntimeError, match="anchor failed"):
         await runtime.start_navigation_agent_task(web_session_id="web-1", message=message)
 
-    task = runtime._navigation_task_store().find_by_session(
+    assert runtime.web_sessions == {}
+    assert runtime.run_cancellation(session_id) is None
+    assert registry.spawns == []
+    assert runtime._navigation_task_store().find_by_session(
         web_session_id="web-1",
-        agentscope_session_id=first.agentscope_session_id,
+        agentscope_session_id=session_id,
+    ) is None
+
+
+@pytest.mark.asyncio
+async def test_runtime_cursor_persistence_failure_after_spawn_is_nonfatal(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    message_bus = FakeAgentScopeMessageBus(
+        replay_events=[("9-0", {"type": "REPLY_END"})]
     )
-    assert task is not None
-    assert task.task_id == first.task_id
+    registry = FakeChatRunRegistry()
+    runtime = _runtime(
+        chat_run_registry=registry,
+        message_bus=message_bus,
+        workspace_root=tmp_path,
+    )
+    monkeypatch.setattr(
+        runtime,
+        "_save_web_session_event_cursor",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            RuntimeError("cursor persistence failed")
+        ),
+    )
+    message = agentscope_runtime_module._navigation_handoff_message(
+        request="处理 20270623 的导航数据",
+        target="20270623",
+        date="20270623",
+        scene_mode=None,
+        clips=[],
+        reason="cursor failure",
+        response_language="Chinese",
+    )
+
+    started = await runtime.start_navigation_agent_task(
+        web_session_id="web-1",
+        message=message,
+    )
+
     assert runtime.web_sessions == {
-        "web-1": ("navigation-data-agent", first.agentscope_session_id)
+        "web-1": ("navigation-data-agent", started.agentscope_session_id)
     }
+    assert runtime._navigation_task_store().get_task(started.task_id) is not None
+    assert runtime.run_cancellation(started.agentscope_session_id) is not None
+    assert len(registry.spawns) == 1
+    assert runtime.event_cursors == {}
+    await registry.drain()
+
+
+def test_runtime_anchor_does_not_expose_legacy_phase_without_active_plan(
+    tmp_path: Path,
+) -> None:
+    runtime = _runtime(workspace_root=tmp_path)
+    session_id = "web-1__navigation-data-agent"
+    task = runtime._navigation_task_store().create_task_attempt(
+        request="处理导航数据",
+        target="20270623",
+        date="20270623",
+        segments=None,
+        scene_mode=None,
+        dry_run=False,
+        web_session_id="web-1",
+        agentscope_session_id=session_id,
+    ).task
+    runtime._navigation_task_store().update_task_for_session(
+        task.task_id,
+        web_session_id="web-1",
+        agentscope_session_id=session_id,
+        phase="extract_sync",
+    )
+
+    anchor = runtime._navigation_durable_state_anchor(
+        session_id,
+        web_session_id="web-1",
+    )
+
+    assert anchor["phase"] is None
+    assert anchor["active_plan_id"] is None
 
 
 @pytest.mark.asyncio

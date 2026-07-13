@@ -38,6 +38,7 @@ from vla_data_juicer_agents.navigation.task_entry import (
     _structured_handoff_payload_from_message,
     parse_navigation_task_entry,
 )
+from vla_data_juicer_agents.navigation.task_store import normalize_segments
 from vla_data_juicer_agents.runtime.agentscope_bootstrap import bootstrap_agentscope_records
 from vla_data_juicer_agents.runtime.agentscope_config import AgentScopeRuntimeConfig
 
@@ -169,6 +170,25 @@ class AgentScopeRuntime:
 
         entry = parse_navigation_task_entry(message)
         services = self._navigation_services()
+        previous_mapping = self._web_session_mapping(web_session_id)
+        if (
+            previous_mapping is not None
+            and previous_mapping[0] == self.config.navigation_agent_id
+        ):
+            existing = services.task_store.find_by_session(
+                web_session_id=web_session_id,
+                agentscope_session_id=previous_mapping[1],
+            )
+            if (
+                existing is not None
+                and existing.target == entry.target
+                and existing.date == entry.date
+                and existing.segments == normalize_segments(entry.segments)
+            ):
+                return NavigationTaskStartResult(
+                    task_id=existing.task_id,
+                    agentscope_session_id=previous_mapping[1],
+                )
         writer = services.task_store.find_running_target_writer(
             date=entry.date,
             segments=entry.segments,
@@ -178,7 +198,6 @@ class AgentScopeRuntime:
                 "an overlapping navigation data writer is already running"
             )
 
-        previous_mapping = self._web_session_mapping(web_session_id)
         creation = None
         session_id: str | None = None
         try:
@@ -249,9 +268,6 @@ class AgentScopeRuntime:
             model=model,
         )
         tail_cursor = await self._event_log_tail_cursor(session_id)
-        cancellation = CancellationContext()
-        previous_cancellation = self.run_cancellation(session_id)
-        self.register_run_cancellation(session_id, cancellation)
 
         if agent_id == self.config.navigation_agent_id:
             anchor = self._navigation_durable_state_anchor(
@@ -262,6 +278,10 @@ class AgentScopeRuntime:
                 f"{message}\n\nDurable navigation state anchor (authoritative): "
                 f"{json.dumps(anchor, ensure_ascii=False, sort_keys=True)}"
             )
+
+        cancellation = CancellationContext()
+        previous_cancellation = self.run_cancellation(session_id)
+        self.register_run_cancellation(session_id, cancellation)
 
         async def run_with_cancellation() -> None:
             try:
@@ -285,7 +305,15 @@ class AgentScopeRuntime:
                 self.clear_run_cancellation(session_id, cancellation)
             raise
         if tail_cursor is not None:
-            self._remember_event_cursor(session_id, tail_cursor)
+            try:
+                self._remember_event_cursor(session_id, tail_cursor)
+            except Exception:
+                _logger.exception(
+                    "AgentScope event cursor persistence failed after run spawn; "
+                    "the accepted run remains authoritative: session_id=%s cursor=%s",
+                    session_id,
+                    tail_cursor,
+                )
         return session_id
 
     async def interrupt_web_session(self, *, web_session_id: str) -> bool:
@@ -363,21 +391,21 @@ class AgentScopeRuntime:
                 "current_step_id": None,
             }
         observation = services.observation_store.latest(task.task_id)
-        accepted_phase = task.accepted_plan_phase
-        if accepted_phase is None and task.phase.value in {
+        phase_hint = task.accepted_plan_phase
+        if phase_hint is None and task.phase.value in {
             "extract_sync",
             "finish_processing",
         }:
-            accepted_phase = task.phase
+            phase_hint = task.phase
         plan = (
-            services.plan_store.get_active(task.task_id, accepted_phase.value)
-            if accepted_phase is not None
+            services.plan_store.get_active(task.task_id, phase_hint.value)
+            if phase_hint is not None
             else None
         )
         current = services.plan_store.get_current_step(plan.plan_id) if plan is not None else None
         return {
             "task_id": task.task_id,
-            "phase": accepted_phase.value if accepted_phase is not None else None,
+            "phase": plan.phase if plan is not None else None,
             "task_status": task.status.value,
             "observation_revision": observation.revision if observation is not None else None,
             "active_plan_id": plan.plan_id if plan is not None else None,
@@ -1429,8 +1457,8 @@ class AgentScopeRuntime:
         entry_id: str,
     ) -> None:
         if self._is_new_event(agentscope_session_id, entry_id):
-            self.event_cursors[agentscope_session_id] = entry_id
             self._save_web_session_event_cursor(agentscope_session_id, entry_id)
+            self.event_cursors[agentscope_session_id] = entry_id
 
     def _event_cursor(self, agentscope_session_id: str) -> str | None:
         cursor = self.event_cursors.get(agentscope_session_id)

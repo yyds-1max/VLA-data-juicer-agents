@@ -1008,6 +1008,37 @@ def test_runtime_anchor_does_not_reconcile_or_append_observation(tmp_path, monke
     assert services.observation_store.latest(task.task_id) == before
 
 
+def test_runtime_anchor_derives_phase_from_active_plan(tmp_path):
+    services, task, built = _resolver_services_from_complete(tmp_path)
+    active = services.plan_store.activate(
+        task,
+        "extract_sync",
+        4,
+        ExtractSyncPlanInput.model_validate(valid_extract_plan_payload(built)),
+        expected_web_session_id=None,
+        expected_agentscope_session_id="as-session-1",
+    )
+    with sqlite3.connect(services.task_store.db_path) as connection:
+        connection.execute(
+            """UPDATE navigation_tasks
+               SET created_by_web_session_id = ?, latest_web_session_id = ?,
+                   agentscope_session_id = ?
+               WHERE task_id = ?""",
+            ("web-owner", "web-owner", "web-owner__as", task.task_id),
+        )
+    runtime = object.__new__(runtime_module.AgentScopeRuntime)
+    runtime.config = SimpleNamespace(workspace_root=tmp_path)
+    runtime._navigation_services = lambda: services
+
+    anchor = runtime._navigation_durable_state_anchor(
+        "web-owner__as",
+        web_session_id="web-owner",
+    )
+
+    assert anchor["phase"] == active.phase
+    assert anchor["active_plan_id"] == active.plan_id
+
+
 def test_phase_resolver_completed_state_has_only_compact_state_and_evidence(tmp_path):
     services, task, _built = _resolver_services_from_complete(tmp_path)
     final_grid = (
