@@ -3,6 +3,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 SOURCE_ROOT = ROOT / "src"
+TEST_ROOT = ROOT / "tests"
 
 
 def test_navigation_source_has_no_superseded_dataset_state_machine_references():
@@ -23,11 +24,12 @@ def test_navigation_source_has_no_superseded_dataset_state_machine_references():
     )
 
     matches: list[str] = []
-    for path in SOURCE_ROOT.rglob("*.py"):
-        text = path.read_text(encoding="utf-8")
-        for symbol in forbidden:
-            if symbol in text:
-                matches.append(f"{path.relative_to(ROOT)}: {symbol}")
+    for scan_root in (SOURCE_ROOT, TEST_ROOT):
+        for path in scan_root.rglob("*.py"):
+            text = path.read_text(encoding="utf-8")
+            for symbol in forbidden:
+                if symbol in text:
+                    matches.append(f"{path.relative_to(ROOT)}: {symbol}")
     assert matches == []
 
 

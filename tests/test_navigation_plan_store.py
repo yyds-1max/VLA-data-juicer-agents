@@ -22,7 +22,10 @@ from vla_data_juicer_agents.navigation.observation_store import (
     SqliteNavigationObservationStore,
 )
 from vla_data_juicer_agents.navigation.task_state import NavigationTask
-from vla_data_juicer_agents.navigation.task_store import SqliteNavigationTaskStore
+from vla_data_juicer_agents.navigation.task_store import (
+    NavigationStateResetRequired,
+    SqliteNavigationTaskStore,
+)
 
 
 def valid_extract_plan(*, decision_ref: str = "sensor_bindings") -> ExtractSyncPlanInput:
@@ -123,11 +126,21 @@ def valid_finish_plan() -> FinishProcessingPlanInput:
     )
 
 
+def _activate_owned(repo, task, *args, **kwargs):
+    kwargs.setdefault(
+        "expected_web_session_id", task.created_by_web_session_id
+    )
+    kwargs.setdefault(
+        "expected_agentscope_session_id", task.agentscope_session_id
+    )
+    return repo.activate(task, *args, **kwargs)
+
+
 def stores_with_task(
     tmp_path: Path,
     *,
-    web_session_id: str | None = None,
-    agentscope_session_id: str | None = None,
+    web_session_id: str = "web-test",
+    agentscope_session_id: str = "as-test",
 ):
     db_path = tmp_path / "navigation_tasks.sqlite"
     task_store = SqliteNavigationTaskStore(db_path)
@@ -163,7 +176,7 @@ def attempt_with_extract_plan(
         web_session_id=owner,
         agentscope_session_id=agentscope_session_id,
     ).task
-    plan = repo.activate(
+    plan = _activate_owned(repo,
         task,
         "extract_sync",
         1,
@@ -338,7 +351,7 @@ def test_running_non_locking_validation_step_does_not_block_writer(tmp_path: Pat
             "decision_refs": ["gridmap"],
         }
     ]
-    validation_plan = repo.activate(
+    validation_plan = _activate_owned(repo,
         task,
         "finish_processing",
         1,
@@ -529,7 +542,7 @@ def test_finish_plan_completes_attempt_only_after_terminal_validation(tmp_path: 
             "decision_refs": ["gridmap"],
         },
     ]
-    plan = repo.activate(
+    plan = _activate_owned(repo,
         task,
         "finish_processing",
         1,
@@ -596,10 +609,11 @@ def test_stale_running_writer_blocks_until_controlled_step_recovery(tmp_path: Pa
     ) is StepClaimOutcome.CLAIMED
 
 
-def test_repository_migrates_legacy_pending_only_handoff_schema(tmp_path: Path):
+def test_repository_rejects_legacy_handoff_schema_without_mutation(tmp_path: Path):
     db_path = tmp_path / "navigation_tasks.sqlite"
     SqliteNavigationTaskStore(db_path)
     with sqlite3.connect(db_path) as connection:
+        connection.execute("DROP TABLE navigation_human_decision_handoffs")
         connection.execute(
             """CREATE TABLE navigation_human_decision_handoffs (
                 plan_id TEXT NOT NULL, step_id TEXT NOT NULL, task_id TEXT NOT NULL,
@@ -609,31 +623,25 @@ def test_repository_migrates_legacy_pending_only_handoff_schema(tmp_path: Path):
                 PRIMARY KEY (plan_id, step_id)
             )"""
         )
+        before_schema = connection.execute(
+            "SELECT type, name, sql FROM sqlite_master ORDER BY type, name"
+        ).fetchall()
+    before_bytes = db_path.read_bytes()
 
-    SqliteNavigationPlanRepository(db_path)
+    with pytest.raises(NavigationStateResetRequired):
+        SqliteNavigationPlanRepository(db_path)
 
+    assert db_path.read_bytes() == before_bytes
     with sqlite3.connect(db_path) as connection:
-        columns = {
-            row[1]
-            for row in connection.execute(
-                "PRAGMA table_info(navigation_human_decision_handoffs)"
-            )
-        }
-    assert {
-        "delivery_status",
-        "delivery_owner",
-        "delivery_token",
-        "leased_at",
-        "expires_at",
-        "recovery_reason_code",
-        "recovery_reason",
-        "recovered_at",
-    } <= columns
+        after_schema = connection.execute(
+            "SELECT type, name, sql FROM sqlite_master ORDER BY type, name"
+        ).fetchall()
+    assert after_schema == before_schema
 
 
 def test_repository_migrates_delivery_lease_and_fails_closed_after_expiry(tmp_path: Path):
     repo, task = stores_with_task(tmp_path)
-    plan = repo.activate(task, "extract_sync", 1, valid_extract_plan())
+    plan = _activate_owned(repo, task, "extract_sync", 1, valid_extract_plan())
     with sqlite3.connect(repo.db_path) as connection:
         connection.execute(
             """INSERT INTO navigation_human_decision_handoffs (
@@ -656,7 +664,9 @@ def test_repository_migrates_delivery_lease_and_fails_closed_after_expiry(tmp_pa
         )
 
     assert repo.claim_human_decision_delivery(
-        plan.plan_id, "prepare", "decision", owner="new-owner"
+        plan.plan_id, "prepare", "decision", owner="new-owner",
+        expected_web_session_id=task.created_by_web_session_id,
+        expected_agentscope_session_id=task.agentscope_session_id,
     ) == ("busy", None)
     with sqlite3.connect(repo.db_path) as connection:
         connection.execute(
@@ -664,7 +674,9 @@ def test_repository_migrates_delivery_lease_and_fails_closed_after_expiry(tmp_pa
             ((datetime.now(UTC) - timedelta(seconds=1)).isoformat(), plan.plan_id),
         )
     status, token = repo.claim_human_decision_delivery(
-        plan.plan_id, "prepare", "decision", owner="new-owner"
+        plan.plan_id, "prepare", "decision", owner="new-owner",
+        expected_web_session_id=task.created_by_web_session_id,
+        expected_agentscope_session_id=task.agentscope_session_id,
     )
     assert status == "recovery_required" and token is None
     handoff = repo.get_human_decision_handoff(plan.plan_id, "prepare")
@@ -676,9 +688,9 @@ def test_repository_migrates_delivery_lease_and_fails_closed_after_expiry(tmp_pa
 
 def test_controlled_handoff_recovery_preserves_audit_and_unblocks_replacement(tmp_path: Path):
     repo, task = stores_with_task(tmp_path, web_session_id="web-owner")
-    plan = repo.activate(
+    plan = _activate_owned(repo,
         task, "extract_sync", 1, valid_extract_plan(),
-        expected_web_session_id="web-owner", expected_agentscope_session_id=None,
+        expected_web_session_id="web-owner", expected_agentscope_session_id=task.agentscope_session_id,
     )
     timestamp = datetime.now(UTC).isoformat()
     with sqlite3.connect(repo.db_path) as connection:
@@ -696,14 +708,14 @@ def test_controlled_handoff_recovery_preserves_audit_and_unblocks_replacement(tm
         "prepare",
         reason_code="missing_agentscope_session",
         expected_web_session_id="web-owner",
-        expected_agentscope_session_id=None,
+        expected_agentscope_session_id=task.agentscope_session_id,
     )
     assert repo.mark_human_decision_recovery_required(
         plan.plan_id,
         "prepare",
         reason_code="missing_agentscope_session",
         expected_web_session_id="web-owner",
-        expected_agentscope_session_id=None,
+        expected_agentscope_session_id=task.agentscope_session_id,
     )
     with pytest.raises(ActivePlanExecutionConflict, match="Web session"):
         repo.quarantine_human_decision_handoff(
@@ -740,14 +752,14 @@ def test_controlled_handoff_recovery_preserves_audit_and_unblocks_replacement(tm
     assert repo.get_current_step(plan.plan_id)["step"]["status"] == "needs_replan"
     task = SqliteNavigationTaskStore(repo.db_path).get_task(task.task_id)
     assert task.status.value == "needs_replan"
-    replacement = repo.activate(
+    replacement = _activate_owned(repo,
         task, "extract_sync", 2, valid_extract_plan(),
-        expected_web_session_id="web-owner", expected_agentscope_session_id=None,
+        expected_web_session_id="web-owner", expected_agentscope_session_id=task.agentscope_session_id,
     )
     assert replacement.status == "active"
     assert not repo.claim_step(
         plan.plan_id, "prepare", "prepare_raw_data",
-        expected_web_session_id="web-owner", expected_agentscope_session_id=None,
+        expected_web_session_id="web-owner", expected_agentscope_session_id=task.agentscope_session_id,
     )
 
 
@@ -756,9 +768,9 @@ def test_controlled_handoff_recovery_rejects_non_recovery_states(
     tmp_path: Path, delivery_status: str
 ):
     repo, task = stores_with_task(tmp_path, web_session_id="web-owner")
-    plan = repo.activate(
+    plan = _activate_owned(repo,
         task, "extract_sync", 1, valid_extract_plan(),
-        expected_web_session_id="web-owner", expected_agentscope_session_id=None,
+        expected_web_session_id="web-owner", expected_agentscope_session_id=task.agentscope_session_id,
     )
     timestamp = datetime.now(UTC).isoformat()
     status = "quarantined" if delivery_status == "quarantined" else "pending"
@@ -779,48 +791,44 @@ def test_controlled_handoff_recovery_rejects_non_recovery_states(
         )
 
 
-def test_repository_backfills_legacy_null_result_ref_and_lazy_recovers(tmp_path: Path):
-    repo, task = stores_with_task(tmp_path)
-    plan = repo.activate(task, "extract_sync", 1, valid_extract_plan())
-    assert repo.claim_step(plan.plan_id, "prepare", "prepare_raw_data")
-    staged = repo.stage_step_result(
-        plan.plan_id,
-        "prepare",
-        target_status="completed",
-        full_result={"message": "done", "ok": True, "tool_name": "prepare_raw_data"},
-        result_summary={"message": "done", "ok": True, "tool_name": "prepare_raw_data"},
-    )
-    with sqlite3.connect(repo.db_path) as connection:
-        connection.execute(
-            "UPDATE navigation_step_result_outbox SET result_ref = NULL WHERE plan_id = ?",
-            (plan.plan_id,),
-        )
-
-    reopened = SqliteNavigationPlanRepository(repo.db_path)
-    migrated = reopened.get_staged_step_result(plan.plan_id, "prepare")
-    assert migrated is not None
-    assert migrated.result_ref == staged.result_ref
-    with sqlite3.connect(repo.db_path) as connection:
-        connection.execute(
-            "UPDATE navigation_step_result_outbox SET result_ref = NULL WHERE plan_id = ?",
-            (plan.plan_id,),
-        )
-    assert reopened.get_staged_step_result(plan.plan_id, "prepare").result_ref == staged.result_ref
-    assert reopened.finalize_staged_step(plan.plan_id, "prepare") is True
-    with sqlite3.connect(repo.db_path) as connection:
-        status = connection.execute(
-            "SELECT status FROM navigation_task_steps WHERE plan_id = ? AND step_id = 'prepare'",
-            (plan.plan_id,),
+def test_repository_rejects_nullable_legacy_result_ref_schema_without_mutation(
+    tmp_path: Path,
+):
+    db_path = tmp_path / "navigation.sqlite"
+    SqliteNavigationPlanRepository(db_path)
+    with sqlite3.connect(db_path) as connection:
+        table_sql = connection.execute(
+            "SELECT sql FROM sqlite_master WHERE type = 'table' "
+            "AND name = 'navigation_step_result_outbox'"
         ).fetchone()[0]
-    assert status == "completed"
+        connection.execute("DROP TABLE navigation_step_result_outbox")
+        connection.execute(table_sql.replace("result_ref TEXT NOT NULL", "result_ref TEXT"))
+        before_schema = connection.execute(
+            "SELECT type, name, sql FROM sqlite_master ORDER BY type, name"
+        ).fetchall()
+    before_bytes = db_path.read_bytes()
+
+    with pytest.raises(NavigationStateResetRequired):
+        SqliteNavigationPlanRepository(db_path)
+
+    assert db_path.read_bytes() == before_bytes
+    with sqlite3.connect(db_path) as connection:
+        after_schema = connection.execute(
+            "SELECT type, name, sql FROM sqlite_master ORDER BY type, name"
+        ).fetchall()
+    assert after_schema == before_schema
 
 
 def test_step_ledger_transitions_increment_task_state_revision(tmp_path: Path):
     repo, task = stores_with_task(tmp_path)
-    plan = repo.activate(task, "extract_sync", 1, valid_extract_plan())
+    plan = _activate_owned(repo, task, "extract_sync", 1, valid_extract_plan())
     after_activation = SqliteNavigationTaskStore(repo.db_path).get_task(task.task_id)
 
-    assert repo.claim_step(plan.plan_id, "prepare", "prepare_raw_data")
+    assert repo.claim_step(
+        plan.plan_id, "prepare", "prepare_raw_data",
+        expected_web_session_id=task.created_by_web_session_id,
+        expected_agentscope_session_id=task.agentscope_session_id,
+    )
     after_claim = SqliteNavigationTaskStore(repo.db_path).get_task(task.task_id)
     assert after_claim.state_revision == after_activation.state_revision + 1
 
@@ -830,15 +838,23 @@ def test_step_ledger_transitions_increment_task_state_revision(tmp_path: Path):
         target_status="completed",
         full_result={"message": "done", "ok": True, "tool_name": "prepare_raw_data"},
         result_summary={"message": "done", "ok": True, "tool_name": "prepare_raw_data"},
+        expected_web_session_id=task.created_by_web_session_id,
+        expected_agentscope_session_id=task.agentscope_session_id,
     )
     after_stage = SqliteNavigationTaskStore(repo.db_path).get_task(task.task_id)
     assert after_stage.state_revision == after_claim.state_revision + 1
-    assert repo.finalize_staged_step(plan.plan_id, "prepare")
+    assert repo.finalize_staged_step(
+        plan.plan_id, "prepare",
+        expected_web_session_id=task.created_by_web_session_id,
+        expected_agentscope_session_id=task.agentscope_session_id,
+    )
     after_finalize = SqliteNavigationTaskStore(repo.db_path).get_task(task.task_id)
     assert after_finalize.state_revision == after_stage.state_revision + 2
 
     assert repo.mark_waiting_user(
-        plan.plan_id, "sync", "extract_and_sync_navigation_data"
+        plan.plan_id, "sync", "extract_and_sync_navigation_data",
+        expected_web_session_id=task.created_by_web_session_id,
+        expected_agentscope_session_id=task.agentscope_session_id,
     )
     after_waiting = SqliteNavigationTaskStore(repo.db_path).get_task(task.task_id)
     assert after_waiting.state_revision == after_finalize.state_revision + 1
@@ -922,7 +938,7 @@ def test_activate_plan_and_ledger_is_atomic(tmp_path: Path):
     repo, task = stores_with_task(tmp_path)
     before = SqliteNavigationTaskStore(repo.db_path).get_task(task.task_id)
 
-    record = repo.activate(task, "extract_sync", 3, valid_extract_plan())
+    record = _activate_owned(repo, task, "extract_sync", 3, valid_extract_plan())
 
     assert repo.get_active(task.task_id, "extract_sync").plan_id == record.plan_id
     assert [
@@ -939,7 +955,7 @@ def test_failed_activation_does_not_supersede_active_plan(
     monkeypatch,
 ):
     repo, task = stores_with_task(tmp_path)
-    first = repo.activate(task, "extract_sync", 1, valid_extract_plan())
+    first = _activate_owned(repo, task, "extract_sync", 1, valid_extract_plan())
     monkeypatch.setattr(
         repo,
         "_insert_ledger_rows",
@@ -947,7 +963,7 @@ def test_failed_activation_does_not_supersede_active_plan(
     )
 
     with pytest.raises(sqlite3.IntegrityError):
-        repo.activate(task, "extract_sync", 2, valid_extract_plan())
+        _activate_owned(repo, task, "extract_sync", 2, valid_extract_plan())
 
     assert repo.get_active(task.task_id, "extract_sync").plan_id == first.plan_id
     with sqlite3.connect(repo.db_path) as connection:
@@ -970,7 +986,7 @@ def test_failed_first_activation_does_not_record_selected_phase(tmp_path: Path, 
     )
 
     with pytest.raises(sqlite3.IntegrityError):
-        repo.activate(task, "extract_sync", 1, valid_extract_plan())
+        _activate_owned(repo, task, "extract_sync", 1, valid_extract_plan())
 
     stored = SqliteNavigationTaskStore(repo.db_path).get_task(task.task_id)
     assert stored is not None
@@ -1006,7 +1022,11 @@ def test_record_attempt_is_audit_only_and_preserves_full_failure(tmp_path: Path)
     )
 
     before_attempt = SqliteNavigationTaskStore(repo.db_path).get_task(task.task_id)
-    assert repo.record_attempt(attempt) == attempt
+    assert repo.record_attempt(
+        attempt,
+        expected_web_session_id=task.created_by_web_session_id,
+        expected_agentscope_session_id=task.agentscope_session_id,
+    ) == attempt
     after_attempt = SqliteNavigationTaskStore(repo.db_path).get_task(task.task_id)
     assert after_attempt.state_revision == before_attempt.state_revision + 1
 
@@ -1025,10 +1045,10 @@ def test_record_attempt_is_audit_only_and_preserves_full_failure(tmp_path: Path)
 def test_activation_creates_immutable_revisions_and_supersedes_previous(tmp_path: Path):
     repo, task = stores_with_task(tmp_path)
     first_plan = valid_extract_plan()
-    first = repo.activate(task, "extract_sync", 1, first_plan)
+    first = _activate_owned(repo, task, "extract_sync", 1, first_plan)
     first_json = first.plan.model_dump_json()
     after_first = SqliteNavigationTaskStore(repo.db_path).get_task(task.task_id)
-    second = repo.activate(task, "extract_sync", 2, valid_extract_plan())
+    second = _activate_owned(repo, task, "extract_sync", 2, valid_extract_plan())
     after_second = SqliteNavigationTaskStore(repo.db_path).get_task(task.task_id)
 
     assert (first.plan_revision, second.plan_revision) == (1, 2)
@@ -1042,9 +1062,9 @@ def test_activation_creates_immutable_revisions_and_supersedes_previous(tmp_path
 
 def test_cross_phase_activation_replaces_the_whole_active_plan_atomically(tmp_path: Path):
     repo, task = stores_with_task(tmp_path)
-    extract = repo.activate(task, "extract_sync", 1, valid_extract_plan())
+    extract = _activate_owned(repo, task, "extract_sync", 1, valid_extract_plan())
 
-    finish = repo.activate(task, "finish_processing", 2, valid_finish_plan())
+    finish = _activate_owned(repo, task, "finish_processing", 2, valid_finish_plan())
 
     assert repo.get(extract.plan_id).status == "superseded"
     assert repo.get(finish.plan_id).status == "active"
@@ -1069,7 +1089,7 @@ def test_execution_snapshot_reads_task_plan_and_ledger_in_one_state(
         web_session_id="web-owner",
         agentscope_session_id="web-owner__agent",
     )
-    plan = repo.activate(
+    plan = _activate_owned(repo,
         task,
         "extract_sync",
         1,
@@ -1105,11 +1125,19 @@ def test_activation_rejects_supersede_while_active_step_is_in_flight(
     in_flight_status: str,
 ):
     repo, task = stores_with_task(tmp_path)
-    first = repo.activate(task, "extract_sync", 1, valid_extract_plan())
+    first = _activate_owned(repo, task, "extract_sync", 1, valid_extract_plan())
     transition = (
-        repo.claim_step(first.plan_id, "prepare", "prepare_raw_data")
+        repo.claim_step(
+            first.plan_id, "prepare", "prepare_raw_data",
+            expected_web_session_id=task.created_by_web_session_id,
+            expected_agentscope_session_id=task.agentscope_session_id,
+        )
         if in_flight_status == "running"
-        else repo.mark_waiting_user(first.plan_id, "prepare", "prepare_raw_data")
+        else repo.mark_waiting_user(
+            first.plan_id, "prepare", "prepare_raw_data",
+            expected_web_session_id=task.created_by_web_session_id,
+            expected_agentscope_session_id=task.agentscope_session_id,
+        )
     )
     if in_flight_status == "running":
         assert transition is StepClaimOutcome.CLAIMED
@@ -1117,7 +1145,7 @@ def test_activation_rejects_supersede_while_active_step_is_in_flight(
         assert transition is True
 
     with pytest.raises(ActivePlanExecutionConflict):
-        repo.activate(task, "extract_sync", 2, valid_extract_plan())
+        _activate_owned(repo, task, "extract_sync", 2, valid_extract_plan())
 
     assert repo.get_active(task.task_id, "extract_sync").plan_id == first.plan_id
     assert repo.get_current_step(first.plan_id)["step"]["status"] == in_flight_status
@@ -1125,28 +1153,38 @@ def test_activation_rejects_supersede_while_active_step_is_in_flight(
 
 def test_activation_rejects_supersede_while_result_outbox_exists(tmp_path: Path):
     repo, task = stores_with_task(tmp_path)
-    first = repo.activate(task, "extract_sync", 1, valid_extract_plan())
-    assert repo.claim_step(first.plan_id, "prepare", "prepare_raw_data")
+    first = _activate_owned(repo, task, "extract_sync", 1, valid_extract_plan())
+    assert repo.claim_step(
+        first.plan_id, "prepare", "prepare_raw_data",
+        expected_web_session_id=task.created_by_web_session_id,
+        expected_agentscope_session_id=task.agentscope_session_id,
+    )
     repo.stage_step_result(
         first.plan_id,
         "prepare",
         target_status="completed",
         full_result={"ok": True, "tool_name": "prepare_raw_data", "message": "done"},
         result_summary={"ok": True, "tool_name": "prepare_raw_data", "message": "done"},
+        expected_web_session_id=task.created_by_web_session_id,
+        expected_agentscope_session_id=task.agentscope_session_id,
     )
 
     with pytest.raises(ActivePlanExecutionConflict):
-        repo.activate(task, "extract_sync", 2, valid_extract_plan())
+        _activate_owned(repo, task, "extract_sync", 2, valid_extract_plan())
 
     assert repo.get_staged_step_result(first.plan_id, "prepare") is not None
 
 
 def test_invalidate_removes_plan_from_active_lookup_without_mutating_plan(tmp_path: Path):
     repo, task = stores_with_task(tmp_path)
-    record = repo.activate(task, "extract_sync", 1, valid_extract_plan())
+    record = _activate_owned(repo, task, "extract_sync", 1, valid_extract_plan())
     canonical = record.plan.model_dump_json()
 
-    invalidated = repo.invalidate(record.plan_id, "artifact drift")
+    invalidated = repo.invalidate(
+        record.plan_id, "artifact drift",
+        expected_web_session_id=task.created_by_web_session_id,
+        expected_agentscope_session_id=task.agentscope_session_id,
+    )
 
     assert invalidated.status == "invalidated"
     assert invalidated.plan.model_dump_json() == canonical
@@ -1167,7 +1205,7 @@ def test_invalidate_requires_exact_session_for_owned_task(
         web_session_id="web-owner",
         agentscope_session_id="agentscope-owner",
     )
-    owned_plan = repo.activate(
+    owned_plan = _activate_owned(repo,
         task, "extract_sync", 1, valid_extract_plan(),
         expected_web_session_id="web-owner",
         expected_agentscope_session_id="agentscope-owner",
@@ -1198,11 +1236,19 @@ def test_plan_mutations_reject_claimed_execution_in_same_transaction(
     tmp_path: Path, mutation: str
 ):
     repo, task = stores_with_task(tmp_path)
-    record = repo.activate(task, "extract_sync", 1, valid_extract_plan())
-    assert repo.claim_step(record.plan_id, "prepare", "prepare_raw_data")
+    record = _activate_owned(repo, task, "extract_sync", 1, valid_extract_plan())
+    assert repo.claim_step(
+        record.plan_id, "prepare", "prepare_raw_data",
+        expected_web_session_id=task.created_by_web_session_id,
+        expected_agentscope_session_id=task.agentscope_session_id,
+    )
 
     with pytest.raises(ActivePlanExecutionConflict):
-        getattr(repo, mutation)(record.plan_id, "artifact drift")
+        getattr(repo, mutation)(
+            record.plan_id, "artifact drift",
+            expected_web_session_id=task.created_by_web_session_id,
+            expected_agentscope_session_id=task.agentscope_session_id,
+        )
 
     assert repo.get(record.plan_id).status == "active"
     assert repo.get_current_step(record.plan_id)["step"]["status"] == "running"
@@ -1210,18 +1256,26 @@ def test_plan_mutations_reject_claimed_execution_in_same_transaction(
 
 def test_invalidation_wins_before_claim_and_prevents_execution_claim(tmp_path: Path):
     repo, task = stores_with_task(tmp_path)
-    record = repo.activate(task, "extract_sync", 1, valid_extract_plan())
+    record = _activate_owned(repo, task, "extract_sync", 1, valid_extract_plan())
 
-    assert repo.invalidate(record.plan_id, "artifact drift").status == "invalidated"
+    assert repo.invalidate(
+        record.plan_id, "artifact drift",
+        expected_web_session_id=task.created_by_web_session_id,
+        expected_agentscope_session_id=task.agentscope_session_id,
+    ).status == "invalidated"
     assert (
-        repo.claim_step(record.plan_id, "prepare", "prepare_raw_data")
+        repo.claim_step(
+            record.plan_id, "prepare", "prepare_raw_data",
+            expected_web_session_id=task.created_by_web_session_id,
+            expected_agentscope_session_id=task.agentscope_session_id,
+        )
         is StepClaimOutcome.NOT_CLAIMABLE
     )
 
 
 def test_compact_reads_expose_execution_status_and_no_legacy_payloads(tmp_path: Path):
     repo, task = stores_with_task(tmp_path)
-    record = repo.activate(task, "extract_sync", 1, valid_extract_plan())
+    record = _activate_owned(repo, task, "extract_sync", 1, valid_extract_plan())
 
     overview = repo.get_execution_overview(record.plan_id)
     current = repo.get_current_step(record.plan_id)
@@ -1273,7 +1327,7 @@ def test_compact_reads_expose_execution_status_and_no_legacy_payloads(tmp_path: 
 
 def test_current_step_returns_its_stored_decision_refs(tmp_path: Path):
     repo, task = stores_with_task(tmp_path)
-    record = repo.activate(task, "extract_sync", 1, valid_extract_plan())
+    record = _activate_owned(repo, task, "extract_sync", 1, valid_extract_plan())
     with sqlite3.connect(repo.db_path) as connection:
         connection.execute(
             "UPDATE navigation_task_steps SET status = 'completed' "
@@ -1289,7 +1343,7 @@ def test_current_step_returns_its_stored_decision_refs(tmp_path: Path):
 
 def test_ledger_reads_reject_non_execution_status(tmp_path: Path):
     repo, task = stores_with_task(tmp_path)
-    record = repo.activate(task, "extract_sync", 1, valid_extract_plan())
+    record = _activate_owned(repo, task, "extract_sync", 1, valid_extract_plan())
     with sqlite3.connect(repo.db_path) as connection:
         connection.execute(
             "UPDATE navigation_task_steps SET status = 'needs_reconcile' "
@@ -1304,7 +1358,7 @@ def test_ledger_reads_reject_non_execution_status(tmp_path: Path):
 def test_compact_reads_enforce_4000_character_limit(tmp_path: Path):
     repo, task = stores_with_task(tmp_path)
     oversized_ref = "decision_" + "x" * 4100
-    record = repo.activate(
+    record = _activate_owned(repo,
         task,
         "extract_sync",
         1,
@@ -1325,10 +1379,15 @@ def test_activation_requires_a_persisted_task_and_leaves_no_partial_rows(tmp_pat
     db_path = tmp_path / "navigation_tasks.sqlite"
     SqliteNavigationTaskStore(db_path)
     repo = SqliteNavigationPlanRepository(db_path)
-    missing_task = NavigationTask(task_id="nav-missing", date="20270623")
+    missing_task = NavigationTask(
+        task_id="nav-missing",
+        date="20270623",
+        created_by_web_session_id="web-missing",
+        agentscope_session_id="as-missing",
+    )
 
     with pytest.raises(KeyError, match="nav-missing"):
-        repo.activate(missing_task, "extract_sync", 1, valid_extract_plan())
+        _activate_owned(repo, missing_task, "extract_sync", 1, valid_extract_plan())
 
     with sqlite3.connect(db_path) as connection:
         assert connection.execute("SELECT COUNT(*) FROM navigation_plans").fetchone()[0] == 0

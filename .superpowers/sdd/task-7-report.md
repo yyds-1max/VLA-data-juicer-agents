@@ -1,73 +1,73 @@
-# Task 7 Report: Remove the Navigation Dataset State Machine
+# Task 7 Report: Final Navigation Attempt Contract
 
 ## Status
 
-Complete. Navigation task persistence now represents one explicit attempt and its
-session identity; it no longer stores or derives a dataset lifecycle state machine.
-Legacy and Task 1 transitional schema generations fail closed with
-`NavigationStateResetRequired`. No migration or backfill path was added.
+Complete. Navigation persistence now has one reset-only schema contract and one
+explicit, non-null Web/AgentScope owner pair per attempt. Direct planning and
+execution resolve tools only through that exact durable pair. Legacy, missing,
+or drifted navigation child objects fail closed before mutation.
 
 ## Delivered
 
-- Bumped the navigation task schema to version 3 and the clean generation marker
-  to `navigation-attempts-final-v2`.
-- Reduced `navigation_tasks` to attempt identity, request/target inputs, factual
-  guidance/state revisions, coarse status, accepted plan stage, session ownership,
-  and timestamps.
+- Centralized all nine tables, nine indexes, and twenty-one aggregate-revision
+  triggers in `navigation/schema.py`; every navigation repository uses that
+  initializer.
+- Fresh schema creation is one `BEGIN IMMEDIATE` transaction and writes the
+  `navigation_state_schema` marker last.
+- Existing databases are inspected read-only against exact columns, constraints,
+  foreign keys, indexes, partial-index SQL, triggers, and generation marker.
+- Deleted plan-repository migrations, nullable outbox repair, table rebuild/copy,
+  `ALTER TABLE`, and lazy backfill paths.
+- Made both task session columns SQL `NOT NULL`, made both Pydantic fields required
+  non-empty strings, rejected `None`, empty, and whitespace-only creation input,
+  and authorized writes only for an exact non-null pair.
 - Removed task phase, waiting-state, run-resume, artifact-snapshot, drift, global
   date lookup/upsert, unowned mutation, restore, and reconciliation APIs.
-- Deleted `navigation/task_reconciliation.py` and its state-machine test suite.
-- Preserved exact-attempt session authorization, CAS runtime-start compensation,
-  target-writer locks, plan/step ledger recovery, result outbox, human handoff,
+- Preserved exact-attempt authorization, CAS compensation, target-writer locks,
+  plan/step recovery, result outbox, human handoff, cancellation, dry-run behavior,
   and `needs_replan` behavior.
-- Changed direct CLI/tool workflows to create a new explicit attempt with
-  `direct:<run_id>` Web identity and the actual AgentScope session identity.
-- Made direct planning activity-driven: the model investigates current facts and
-  submits the appropriate plan stage without a persisted task-phase gate.
-- Added dead-reference tests and fail-closed tests for both older and Task 1
-  transitional schema generations, including byte-for-byte non-mutation checks.
+- Changed direct CLI/tool workflows to carry durable Web and AgentScope identities
+  through planning and execution. The resolver no longer infers Web ownership from
+  an AgentScope ID string shape.
+- Covered the real resolver, real direct planning loop, real CLI `async_main`, and
+  the VLA workflow runner; the pre-execution toolkit includes factual inspections
+  and both plan-submission tools.
+- Expanded dead-reference tests to scan both `src` and `tests`; legacy fixture
+  identifiers are assembled dynamically so the repository has true zero matches.
 
 ## TDD Evidence
 
-Initial RED command:
+The direct-resolution RED group failed because a valid durable pair whose IDs did
+not share the legacy string shape received no tools, and the real planning loop had
+no factual/submission tools. After removing the heuristic and propagating the Web
+identity, the group passed.
 
-```text
-.venv/bin/pytest tests/test_navigation_dead_references.py \
-  tests/test_navigation_task_store.py::test_task_store_exposes_only_attempt_scoped_mutators \
-  tests/test_navigation_task_store.py::test_task_store_idempotently_creates_supported_schema_generation \
-  tests/test_navigation_task_store.py::test_task_store_creates_and_loads_navigation_task -q
-```
-
-Initial result: 3 failed, 2 passed. Failures proved that legacy source references
-and APIs still existed and the store still advertised the transitional generation.
-After the production cleanup, the same group passed 5/5.
-
-The first full-suite run found three mechanical legacy-test references, not runtime
-regressions. Their business coverage was retained: context-budget anchoring now
-uses exact session-pair lookup, and guidance tests continue to prove atomic success
-and failure without partial persistence.
+The schema RED group failed because fresh initialization omitted plan, outbox,
+handoff, and submission-attempt tables and because all three repository entry
+points accepted a drifted child contract. The identity RED group accepted missing
+or blank model fields and empty creation inputs. Those groups now pass, including
+read-only byte/logical non-mutation checks for missing and drifted tables, indexes,
+triggers, and the legacy nullable outbox.
 
 ## Verification
 
-- High-risk plan store/execution/tool group: `160 passed`.
-- Requested focused suite: `164 passed`, one pre-existing Starlette warning.
-- Schema/dead-reference group: `26 passed`.
-- Full suite: `746 passed`, one pre-existing Starlette warning.
+- Direct resolver/runner integration group: passed.
+- Six-module high-risk group: `193 passed`.
+- Plan execution: `43 passed`.
+- Full suite: `761 passed`, one pre-existing Starlette warning.
 - `.venv/bin/python -m compileall -q src tests`: passed.
-- Forbidden production symbol audit: no matches.
-- `build_navigation_artifact_snapshot` audit in `plan_execution.py`: no matches.
-- Removed phase/status/restore/latest-session symbol audit across `src` and
+- Forbidden source-and-test symbol audit: no matches.
+- Removed state-machine/session-compatibility literal audit across `src` and
   `tests`: no matches.
-- `git diff --check`: passed after removing one trailing blank line.
+- `git diff --check`: passed.
 
 ## Test Coverage Decisions
 
-Only tests whose subject was the deleted state machine itself were removed:
-reconciliation, global task upsert/rebind, automatic dataset-phase advancement,
-and automatic completed-entry short-circuit behavior. Tests for authorization,
-locking, durable observations, plan ledger transitions, staged-result recovery,
-outbox/handoff crash consistency, cancellation, controlled human recovery, direct
-workflow identity, and `needs_replan` remain.
+Authorization, lock ownership, durable observations, plan-ledger transitions,
+staged-result recovery, outbox/handoff crash consistency, cancellation, controlled
+human recovery, dry-run completion, and `needs_replan` coverage remain. Tests now
+construct every navigation task with an explicit owner pair; fail-closed tests use
+an explicit wrong pair rather than the removed unowned compatibility path.
 
 ## Known Warning
 

@@ -194,6 +194,7 @@ def test_direct_planning_refreshes_activity_tools_after_durable_observation_prog
     task = SimpleNamespace(
         task_id="task-1",
         state_revision=1,
+        created_by_web_session_id="direct:web",
     )
     store = _PlanStore()
     task_store = SimpleNamespace(get_task=lambda _task_id: task)
@@ -242,6 +243,7 @@ def test_direct_planning_stops_after_one_round_without_durable_progress(monkeypa
     task = SimpleNamespace(
         task_id="task-1",
         state_revision=1,
+        created_by_web_session_id="direct:web",
     )
     services = SimpleNamespace(
         task_store=SimpleNamespace(get_task=lambda _task_id: task),
@@ -293,10 +295,12 @@ def test_direct_planning_uses_post_resolver_revision_as_round_boundary(tmp_path,
     assert task.created_by_web_session_id == "direct:run"
     assert task.agentscope_session_id == "direct-session"
     rounds = 0
+    resolved_tool_names = []
 
-    def silent_agent(**_kwargs):
+    def silent_agent(*, tools, **_kwargs):
         nonlocal rounds
         rounds += 1
+        resolved_tool_names.append({tool.name for tool in tools})
         return _SilentAgent()
 
     monkeypatch.setattr(
@@ -315,6 +319,11 @@ def test_direct_planning_uses_post_resolver_revision_as_round_boundary(tmp_path,
         )
 
     assert rounds == 1
+    assert any(
+        name.startswith("inspect_navigation_") for name in resolved_tool_names[0]
+    )
+    assert "submit_extract_sync_plan_tool" in resolved_tool_names[0]
+    assert "submit_finish_processing_plan_tool" in resolved_tool_names[0]
 
 
 @pytest.mark.parametrize(

@@ -19,7 +19,7 @@ def _entry(
     services,
     *,
     session_id="direct-flow",
-    web_session_id=None,
+    web_session_id="direct-flow",
     scene_mode=None,
     dry_run=True,
 ):
@@ -36,8 +36,7 @@ def _entry(
     ).task
 
 
-def _tools(services, session_id, web_session_id=None):
-    web_session_id = web_session_id or session_id
+def _tools(services, session_id, web_session_id="direct-flow"):
     from vla_data_juicer_agents.navigation.agent_tools import resolve_navigation_agent_tools
 
     return {
@@ -51,7 +50,7 @@ def _tools(services, session_id, web_session_id=None):
     }
 
 
-def _complete_required_inspections(services, session_id, web_session_id=None):
+def _complete_required_inspections(services, session_id, web_session_id="direct-flow"):
     tools = _tools(services, session_id, web_session_id)
     names = sorted(name for name in tools if name.startswith("inspect_navigation_"))
     assert names
@@ -67,7 +66,7 @@ def _evidence_by_kind(services, task_id):
     }
 
 
-def _activate_extract_plan(services, task, session_id, web_session_id=None):
+def _activate_extract_plan(services, task, session_id, web_session_id="direct-flow"):
     tools = _complete_required_inspections(services, session_id, web_session_id)
     context = _call(tools["get_navigation_task_context_tool"])
     payload = _extract_plan(_evidence_by_kind(services, task.task_id))

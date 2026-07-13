@@ -2,17 +2,17 @@ from __future__ import annotations
 
 import json
 import sqlite3
-from dataclasses import dataclass
-from functools import lru_cache
 from pathlib import Path
 from typing import Any
 from uuid import uuid4
 
-from vla_data_juicer_agents.navigation.aggregate_revision import (
-    ensure_navigation_aggregate_revision_triggers,
-)
 from vla_data_juicer_agents.navigation.catalog import (
     list_navigation_tool_capabilities,
+)
+from vla_data_juicer_agents.navigation.schema import (
+    NAVIGATION_STATE_SCHEMA_GENERATION,
+    NavigationStateResetRequired,
+    initialize_navigation_schema,
 )
 
 from vla_data_juicer_agents.navigation.task_state import (
@@ -23,223 +23,6 @@ from vla_data_juicer_agents.navigation.task_state import (
     TaskAttemptCreation,
     utc_now,
 )
-
-
-NAVIGATION_STATE_SCHEMA_GENERATION = "navigation-attempts-final-v2"
-_RESET_MESSAGE_MAX_CHARS = 1000
-_SUPPORTED_TABLE_SQL = {
-    "navigation_state_schema": """CREATE TABLE navigation_state_schema (
-           singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
-           generation TEXT NOT NULL
-       )""",
-    "navigation_tasks": """CREATE TABLE navigation_tasks (
-           task_id TEXT PRIMARY KEY,
-           request TEXT NOT NULL,
-           target TEXT NOT NULL,
-           date TEXT NOT NULL,
-           segments_json TEXT,
-           segments_key TEXT NOT NULL,
-           scene_mode TEXT,
-           dry_run INTEGER NOT NULL DEFAULT 0,
-           guidance_revision INTEGER NOT NULL DEFAULT 0,
-           state_revision INTEGER NOT NULL DEFAULT 0,
-           status TEXT NOT NULL,
-           accepted_plan_phase TEXT,
-           created_by_web_session_id TEXT,
-           agentscope_session_id TEXT,
-           schema_version INTEGER NOT NULL,
-           created_at TEXT NOT NULL,
-           updated_at TEXT NOT NULL
-       )""",
-    "navigation_task_steps": """CREATE TABLE navigation_task_steps (
-           id TEXT PRIMARY KEY,
-           task_id TEXT NOT NULL,
-           phase TEXT NOT NULL,
-           step_id TEXT NOT NULL,
-           tool_name TEXT NOT NULL,
-           status TEXT NOT NULL,
-           arguments_json TEXT,
-           result_json TEXT,
-           produced_paths_json TEXT,
-           started_at TEXT,
-           finished_at TEXT,
-           plan_id TEXT,
-           plan_revision INTEGER,
-           sequence INTEGER,
-           result_summary_json TEXT,
-           result_ref TEXT,
-           retry_count INTEGER NOT NULL DEFAULT 0,
-           FOREIGN KEY (task_id) REFERENCES navigation_tasks(task_id)
-       )""",
-    "navigation_observation_revisions": """CREATE TABLE navigation_observation_revisions (
-           task_id TEXT NOT NULL,
-           revision INTEGER NOT NULL,
-           revision_json TEXT NOT NULL,
-           created_at TEXT NOT NULL,
-           PRIMARY KEY (task_id, revision)
-       )""",
-    "navigation_evidence": """CREATE TABLE navigation_evidence (
-           ref TEXT PRIMARY KEY,
-           task_id TEXT NOT NULL,
-           observation_revision INTEGER NOT NULL,
-           kind TEXT NOT NULL,
-           summary TEXT NOT NULL,
-           byte_size INTEGER NOT NULL,
-           source_tool TEXT NOT NULL,
-           created_at TEXT NOT NULL,
-           FOREIGN KEY (task_id, observation_revision)
-               REFERENCES navigation_observation_revisions(task_id, revision)
-       )""",
-}
-_SUPPORTED_INDEX_SQL = {
-    "idx_navigation_tasks_date_updated": """CREATE INDEX
-        idx_navigation_tasks_date_updated
-        ON navigation_tasks (date, updated_at)""",
-    "idx_navigation_tasks_target_history": """CREATE INDEX
-        idx_navigation_tasks_target_history
-        ON navigation_tasks (date, segments_key, created_at)""",
-    "idx_navigation_tasks_session": """CREATE INDEX idx_navigation_tasks_session
-        ON navigation_tasks (
-            created_by_web_session_id, agentscope_session_id, created_at
-        )""",
-    "idx_navigation_tasks_attempt_replay": """CREATE UNIQUE INDEX
-        idx_navigation_tasks_attempt_replay
-        ON navigation_tasks (
-            created_by_web_session_id, agentscope_session_id,
-            date, segments_key, target
-        )""",
-    "idx_navigation_task_steps_plan_sequence": """CREATE UNIQUE INDEX
-        idx_navigation_task_steps_plan_sequence
-        ON navigation_task_steps (plan_id, sequence)
-        WHERE plan_id IS NOT NULL""",
-    "idx_navigation_task_steps_plan_step_id": """CREATE UNIQUE INDEX
-        idx_navigation_task_steps_plan_step_id
-        ON navigation_task_steps (plan_id, step_id)
-        WHERE plan_id IS NOT NULL""",
-    "idx_navigation_evidence_task_revision_kind": """CREATE INDEX
-        idx_navigation_evidence_task_revision_kind
-        ON navigation_evidence (task_id, observation_revision, kind)""",
-}
-
-
-@dataclass(frozen=True)
-class _IndexContract:
-    name: str
-    unique: bool
-    origin: str
-    partial: bool
-    columns: tuple[tuple[int, int, str | None, int, str | None, int], ...]
-    create_sql: str | None
-
-
-@dataclass(frozen=True)
-class _TableContract:
-    columns: tuple[tuple[str, str, int, str | None, int, int], ...]
-    foreign_keys: tuple[tuple[int, int, str, str, str, str, str, str], ...]
-    indexes: tuple[_IndexContract, ...]
-    create_sql: str
-
-
-def _normalize_create_sql(sql: str) -> str:
-    return " ".join(sql.lower().split())
-
-
-def _create_supported_core_schema(connection: sqlite3.Connection) -> None:
-    for statement in _SUPPORTED_TABLE_SQL.values():
-        connection.execute(statement)
-    for statement in _SUPPORTED_INDEX_SQL.values():
-        connection.execute(statement)
-
-
-def _read_table_contract(
-    connection: sqlite3.Connection,
-    table: str,
-) -> _TableContract:
-    columns = tuple(
-        (
-            row["name"],
-            row["type"],
-            int(row["notnull"]),
-            row["dflt_value"],
-            int(row["pk"]),
-            int(row["hidden"]),
-        )
-        for row in connection.execute(f'PRAGMA table_xinfo("{table}")').fetchall()
-    )
-    foreign_keys = tuple(
-        (
-            int(row["id"]),
-            int(row["seq"]),
-            row["table"],
-            row["from"],
-            row["to"],
-            row["on_update"],
-            row["on_delete"],
-            row["match"],
-        )
-        for row in connection.execute(
-            f'PRAGMA foreign_key_list("{table}")'
-        ).fetchall()
-    )
-    indexes: list[_IndexContract] = []
-    for row in connection.execute(f'PRAGMA index_list("{table}")').fetchall():
-        name = row["name"]
-        sql_row = connection.execute(
-            "SELECT sql FROM sqlite_master WHERE type = 'index' AND name = ?",
-            (name,),
-        ).fetchone()
-        create_sql = None
-        if sql_row is not None and sql_row["sql"] is not None:
-            create_sql = _normalize_create_sql(sql_row["sql"])
-        ordered_columns = tuple(
-            (
-                int(column["seqno"]),
-                int(column["cid"]),
-                column["name"],
-                int(column["desc"]),
-                column["coll"],
-                int(column["key"]),
-            )
-            for column in connection.execute(
-                f'PRAGMA index_xinfo("{name}")'
-            ).fetchall()
-        )
-        indexes.append(
-            _IndexContract(
-                name=name,
-                unique=bool(row["unique"]),
-                origin=row["origin"],
-                partial=bool(row["partial"]),
-                columns=ordered_columns,
-                create_sql=create_sql,
-            )
-        )
-    indexes.sort(key=lambda index: index.name)
-    table_row = connection.execute(
-        "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = ?",
-        (table,),
-    ).fetchone()
-    return _TableContract(
-        columns=columns,
-        foreign_keys=foreign_keys,
-        indexes=tuple(indexes),
-        create_sql=_normalize_create_sql(table_row["sql"]),
-    )
-
-
-@lru_cache(maxsize=1)
-def _supported_schema_contract() -> dict[str, _TableContract]:
-    connection = sqlite3.connect(":memory:")
-    connection.row_factory = sqlite3.Row
-    connection.execute("PRAGMA foreign_keys = ON")
-    try:
-        _create_supported_core_schema(connection)
-        return {
-            table: _read_table_contract(connection, table)
-            for table in _SUPPORTED_TABLE_SQL
-        }
-    finally:
-        connection.close()
 
 
 def _json_dump(value: Any) -> str | None:
@@ -336,27 +119,12 @@ class NavigationTaskStateRevisionError(RuntimeError):
     pass
 
 
-class NavigationStateResetRequired(RuntimeError):
-    def __init__(self, db_path: str | Path, reason: str) -> None:
-        self.db_path = Path(db_path)
-        path_text = str(self.db_path)
-        if len(path_text) > 500:
-            path_text = f"...{path_text[-497:]}"
-        bounded_reason = reason[:240]
-        message = (
-            f"Navigation state reset required for database '{path_text}': "
-            f"{bounded_reason}. Stop the service, back up this database, move or "
-            "remove it, then restart to create a fresh navigation-state database."
-        )
-        super().__init__(message[:_RESET_MESSAGE_MAX_CHARS])
-
-
 def authorize_navigation_task_write(
     connection: sqlite3.Connection,
     task_id: str,
     *,
-    expected_web_session_id: str | None,
-    expected_agentscope_session_id: str | None,
+    expected_web_session_id: str,
+    expected_agentscope_session_id: str,
 ) -> None:
     """Reject writes to an owned task unless the exact durable session is supplied."""
     if connection.execute(
@@ -371,10 +139,7 @@ def authorize_navigation_task_write(
     if row is None:
         return
     durable = (row["created_by_web_session_id"], row["agentscope_session_id"])
-    if durable == (None, None):
-        if expected_web_session_id is None and expected_agentscope_session_id is None:
-            return
-    elif durable == (expected_web_session_id, expected_agentscope_session_id):
+    if durable == (expected_web_session_id, expected_agentscope_session_id):
         return
     raise PermissionError("navigation task session mismatch")
 
@@ -392,89 +157,8 @@ class SqliteNavigationTaskStore:
         connection.execute("PRAGMA foreign_keys = ON")
         return connection
 
-    def _read_only_connect(self) -> sqlite3.Connection:
-        uri = f"{self.db_path.resolve().as_uri()}?mode=ro"
-        connection = sqlite3.connect(uri, uri=True)
-        connection.row_factory = sqlite3.Row
-        connection.execute("PRAGMA foreign_keys = ON")
-        return connection
-
-    @staticmethod
-    def _navigation_table_names(connection: sqlite3.Connection) -> set[str]:
-        return {
-            row["name"]
-            for row in connection.execute(
-                """SELECT name FROM sqlite_master
-                   WHERE type = 'table' AND name GLOB 'navigation_*'"""
-            ).fetchall()
-        }
-
-    def _schema_contract_violation(
-        self,
-        connection: sqlite3.Connection,
-    ) -> str | None:
-        tables = self._navigation_table_names(connection)
-        required_tables = set(_SUPPORTED_TABLE_SQL)
-        missing_tables = required_tables - tables
-        if missing_tables:
-            return f"missing required tables {sorted(missing_tables)}"
-        expected_contract = _supported_schema_contract()
-        for table in _SUPPORTED_TABLE_SQL:
-            if _read_table_contract(connection, table) != expected_contract[table]:
-                return f"{table} does not match the generation contract"
-        marker_rows = connection.execute(
-            "SELECT singleton, generation FROM navigation_state_schema"
-        ).fetchall()
-        if len(marker_rows) != 1 or marker_rows[0]["singleton"] != 1:
-            return "navigation state schema marker is missing or ambiguous"
-        if marker_rows[0]["generation"] != NAVIGATION_STATE_SCHEMA_GENERATION:
-            return (
-                "unsupported navigation state generation "
-                f"{marker_rows[0]['generation']!r}"
-            )
-        return None
-
     def _init_schema(self) -> None:
-        if self.db_path.exists() and self.db_path.stat().st_size:
-            try:
-                with self._read_only_connect() as connection:
-                    if self._navigation_table_names(connection):
-                        violation = self._schema_contract_violation(connection)
-                        if violation is not None:
-                            raise NavigationStateResetRequired(self.db_path, violation)
-                        return
-            except NavigationStateResetRequired:
-                raise
-            except sqlite3.DatabaseError as error:
-                raise NavigationStateResetRequired(
-                    self.db_path,
-                    f"database cannot be inspected ({error.__class__.__name__}: {error})",
-                ) from error
-        self._create_supported_schema()
-
-    def _create_supported_schema(self) -> None:
-        connection = self._connect()
-        try:
-            connection.execute("BEGIN IMMEDIATE")
-            if self._navigation_table_names(connection):
-                violation = self._schema_contract_violation(connection)
-                if violation is not None:
-                    raise NavigationStateResetRequired(self.db_path, violation)
-                connection.commit()
-                return
-            _create_supported_core_schema(connection)
-            connection.execute(
-                """INSERT INTO navigation_state_schema (singleton, generation)
-                   VALUES (1, ?)""",
-                (NAVIGATION_STATE_SCHEMA_GENERATION,),
-            )
-            ensure_navigation_aggregate_revision_triggers(connection)
-            connection.commit()
-        except Exception:
-            connection.rollback()
-            raise
-        finally:
-            connection.close()
+        initialize_navigation_schema(self.db_path)
 
     def create_task_attempt(
         self,
@@ -488,6 +172,12 @@ class SqliteNavigationTaskStore:
         web_session_id: str,
         agentscope_session_id: str,
     ) -> TaskAttemptCreation:
+        if not isinstance(web_session_id, str) or not web_session_id.strip():
+            raise ValueError("web_session_id must be a non-empty string")
+        if not isinstance(agentscope_session_id, str) or not agentscope_session_id.strip():
+            raise ValueError("agentscope_session_id must be a non-empty string")
+        web_session_id = web_session_id.strip()
+        agentscope_session_id = agentscope_session_id.strip()
         segments = normalize_segments(segments)
         key = _segments_key(segments)
         connection = self._connect()

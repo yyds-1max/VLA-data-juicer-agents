@@ -135,9 +135,7 @@ def resolve_navigation_agent_tools(
     cancellation: CancellationContext | None,
     web_session_id: str | None = None,
 ) -> list[ToolBase]:
-    if web_session_id is None or not (
-        agentscope_session_id == web_session_id or agentscope_session_id.startswith(f"{web_session_id}__")
-    ):
+    if web_session_id is None:
         return []
     snapshot = services.plan_store.read_execution_snapshot(
         web_session_id=web_session_id,

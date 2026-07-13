@@ -550,6 +550,34 @@ def test_no_task_entry_requires_verified_web_agentscope_session_pair(tmp_path):
     assert tools == []
 
 
+def test_direct_attempt_resolver_uses_durable_exact_pair_not_id_shape(tmp_path):
+    services = build_navigation_services(tmp_path)
+    services.task_store.create_task_attempt(
+        request="Direct navigation workflow",
+        target="20260710",
+        date="20260710",
+        segments=None,
+        scene_mode=None,
+        dry_run=True,
+        web_session_id="direct:run-1",
+        agentscope_session_id="direct__run-1",
+    )
+
+    names = {
+        tool.name
+        for tool in resolve_navigation_agent_tools(
+            services=services,
+            web_session_id="direct:run-1",
+            agentscope_session_id="direct__run-1",
+            cancellation=None,
+        )
+    }
+
+    assert any(name.startswith("inspect_navigation_") for name in names)
+    assert "submit_extract_sync_plan_tool" in names
+    assert "submit_finish_processing_plan_tool" in names
+
+
 def test_cross_web_session_without_bound_attempt_exposes_no_task_mutation(tmp_path):
     services = build_navigation_services(tmp_path)
     existing = services.task_store.create_task_attempt(

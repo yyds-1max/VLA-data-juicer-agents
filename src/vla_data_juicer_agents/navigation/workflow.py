@@ -212,6 +212,7 @@ async def run_direct_plan_until_submitted(
         tools = resolve_navigation_agent_tools(
             services=services,
             agentscope_session_id=agentscope_session_id,
+            web_session_id=current.created_by_web_session_id,
             cancellation=cancellation,
         )
         round_start = services.task_store.get_task(current.task_id)

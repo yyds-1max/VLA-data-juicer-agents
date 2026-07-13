@@ -213,7 +213,14 @@ def test_plan_record_and_submission_attempt_round_trip_strict_contracts():
 
 
 def test_task_domain_carries_replanning_inputs_before_persistence_migration():
-    task = NavigationTask(task_id="nav-1", date="20260710", dry_run=True, guidance_revision=3)
+    task = NavigationTask(
+        task_id="nav-1",
+        created_by_web_session_id="web-plan",
+        agentscope_session_id="as-plan",
+        date="20260710",
+        dry_run=True,
+        guidance_revision=3,
+    )
 
     assert NavigationTaskStatus.NEEDS_REPLAN == "needs_replan"
     assert task.dry_run is True

@@ -98,8 +98,8 @@ def _create_task(
     segments: list[str] | None,
     scene_mode: str | None,
     dry_run: bool = False,
-    web_session_id: str | None = None,
-    agentscope_session_id: str | None = None,
+    web_session_id: str = "web-test",
+    agentscope_session_id: str = "as-test",
 ) -> NavigationTask:
     return store.create_task_attempt(
         request="Process navigation data",
@@ -292,8 +292,20 @@ class Services:
                 settings=self.settings,
                 dry_run=True,
                 cancellation=cancellation,
+                web_session_id=self.task.created_by_web_session_id,
+                agentscope_session_id=self.task.agentscope_session_id,
             )
         }
+
+
+def _activate_plan(store, task, *args, **kwargs):
+    kwargs.setdefault(
+        "expected_web_session_id", task.created_by_web_session_id
+    )
+    kwargs.setdefault(
+        "expected_agentscope_session_id", task.agentscope_session_id
+    )
+    return store.activate(task, *args, **kwargs)
 
 
 def build_services(tmp_path: Path, *, two_steps: bool = False) -> Services:
@@ -315,7 +327,14 @@ def build_services(tmp_path: Path, *, two_steps: bool = False) -> Services:
     observation_store = SqliteNavigationObservationStore(db_path)
     evidence_store = FileNavigationEvidenceStore(tmp_path / "evidence")
     plan_store = SqliteNavigationPlanRepository(db_path)
-    plan = plan_store.activate(task, "extract_sync", 1, extract_plan(two_steps=two_steps))
+    plan = _activate_plan(plan_store,
+        task,
+        "extract_sync",
+        1,
+        extract_plan(two_steps=two_steps),
+        expected_web_session_id=task.created_by_web_session_id,
+        expected_agentscope_session_id=task.agentscope_session_id,
+    )
     return Services(
         task=task,
         task_store=task_store,
@@ -404,7 +423,7 @@ def test_execution_gate_rejects_without_invoking(
     if mutation == "wrong_plan":
         plan_id = "nav_plan_missing"
     elif mutation == "inactive":
-        services.plan_store.activate(
+        _activate_plan(services.plan_store,
             services.task,
             "extract_sync",
             1,
@@ -545,8 +564,8 @@ def test_gridmap_step_rejects_drift_in_exact_observed_inputs(
         ],
         [],
         evidence_store,
-        expected_web_session_id=None,
-        expected_agentscope_session_id=None,
+        expected_web_session_id=task.created_by_web_session_id,
+        expected_agentscope_session_id=task.agentscope_session_id,
     )
     plan_payload = finish_plan(sensor_source).model_dump(mode="json")
     plan_payload["decisions"]["gridmap"]["source"] = decision_source
@@ -554,7 +573,7 @@ def test_gridmap_step_rejects_drift_in_exact_observed_inputs(
         step for step in plan_payload["steps"] if step["step_id"] == "gridmap"
     )["variant"] = step_variant
     plan_store = SqliteNavigationPlanRepository(db_path)
-    plan = plan_store.activate(
+    plan = _activate_plan(plan_store,
         task,
         "finish_processing",
         observation.revision,
@@ -590,6 +609,8 @@ def test_gridmap_step_rejects_drift_in_exact_observed_inputs(
             settings=settings,
             dry_run=True,
             cancellation=None,
+            web_session_id=task.created_by_web_session_id,
+            agentscope_session_id=task.agentscope_session_id,
         )
     }
 
@@ -634,7 +655,7 @@ def test_plan_bound_writer_returns_compact_busy_without_invocation(monkeypatch, 
             web_session_id=owner,
             agentscope_session_id=agent,
         ).task
-        plan = plan_store.activate(
+        plan = _activate_plan(plan_store,
             task,
             "extract_sync",
             1,
@@ -714,11 +735,11 @@ def test_finish_plan_execution_permission_does_not_infer_phase_from_artifacts(tm
         [CalibrationInventoryObservation(sensor_sources=[source])],
         [],
         evidence_store,
-        expected_web_session_id=None,
-        expected_agentscope_session_id=None,
+        expected_web_session_id=task.created_by_web_session_id,
+        expected_agentscope_session_id=task.agentscope_session_id,
     )
     plan_store = SqliteNavigationPlanRepository(db_path)
-    plan = plan_store.activate(
+    plan = _activate_plan(plan_store,
         task,
         "finish_processing",
         observation.revision,
@@ -734,6 +755,8 @@ def test_finish_plan_execution_permission_does_not_infer_phase_from_artifacts(tm
             settings=settings,
             dry_run=True,
             cancellation=None,
+            web_session_id=task.created_by_web_session_id,
+            agentscope_session_id=task.agentscope_session_id,
         )
     }
     permission = asyncio.run(
@@ -775,11 +798,11 @@ def test_human_decision_permission_fails_closed_when_sensor_input_disappears(tmp
         [CalibrationInventoryObservation(sensor_sources=[source])],
         [],
         evidence_store,
-        expected_web_session_id=None,
-        expected_agentscope_session_id=None,
+        expected_web_session_id=task.created_by_web_session_id,
+        expected_agentscope_session_id=task.agentscope_session_id,
     )
     plan_store = SqliteNavigationPlanRepository(db_path)
-    plan = plan_store.activate(
+    plan = _activate_plan(plan_store,
         task,
         "finish_processing",
         observation.revision,
@@ -794,6 +817,8 @@ def test_human_decision_permission_fails_closed_when_sensor_input_disappears(tmp
             settings=settings,
             dry_run=True,
             cancellation=None,
+            web_session_id=task.created_by_web_session_id,
+            agentscope_session_id=task.agentscope_session_id,
         )
         if candidate.name == "request_human_decision"
     )
@@ -840,8 +865,8 @@ def test_waiting_human_decision_retry_enters_audited_recovery_when_input_drifts(
         [CalibrationInventoryObservation(sensor_sources=[source])],
         [],
         evidence_store,
-        expected_web_session_id=None,
-        expected_agentscope_session_id=None,
+        expected_web_session_id=task.created_by_web_session_id,
+        expected_agentscope_session_id=task.agentscope_session_id,
     )
     owner, agent = "web-owner", "web-owner-agent"
     with sqlite3.connect(db_path) as connection:
@@ -854,7 +879,7 @@ def test_waiting_human_decision_retry_enters_audited_recovery_when_input_drifts(
     task = task_store.get_task(task.task_id)
     assert task is not None
     plan_store = SqliteNavigationPlanRepository(db_path)
-    plan = plan_store.activate(
+    plan = _activate_plan(plan_store,
         task,
         "finish_processing",
         observation.revision,
@@ -961,11 +986,11 @@ def test_waiting_human_decision_retry_without_drift_remains_allowed(tmp_path):
         [CalibrationInventoryObservation(sensor_sources=[source])],
         [],
         evidence_store,
-        expected_web_session_id=None,
-        expected_agentscope_session_id=None,
+        expected_web_session_id=task.created_by_web_session_id,
+        expected_agentscope_session_id=task.agentscope_session_id,
     )
     plan_store = SqliteNavigationPlanRepository(db_path)
-    plan = plan_store.activate(
+    plan = _activate_plan(plan_store,
         task,
         "finish_processing",
         observation.revision,
@@ -978,6 +1003,8 @@ def test_waiting_human_decision_retry_without_drift_remains_allowed(tmp_path):
         "settings": settings,
         "plan_id": plan.plan_id,
         "step_id": "confirm",
+        "expected_web_session_id": task.created_by_web_session_id,
+        "expected_agentscope_session_id": task.agentscope_session_id,
     }
 
     assert plan_execution.prepare_plan_human_decision(**arguments) is None
@@ -1012,11 +1039,11 @@ def test_captured_human_decision_tool_denies_existing_recovery_without_mutation(
         [CalibrationInventoryObservation(sensor_sources=[source])],
         [],
         evidence_store,
-        expected_web_session_id=None,
-        expected_agentscope_session_id=None,
+        expected_web_session_id=task.created_by_web_session_id,
+        expected_agentscope_session_id=task.agentscope_session_id,
     )
     plan_store = SqliteNavigationPlanRepository(db_path)
-    plan = plan_store.activate(
+    plan = _activate_plan(plan_store,
         task,
         "finish_processing",
         observation.revision,
@@ -1040,6 +1067,8 @@ def test_captured_human_decision_tool_denies_existing_recovery_without_mutation(
             settings=settings,
             dry_run=True,
             cancellation=None,
+            web_session_id=task.created_by_web_session_id,
+            agentscope_session_id=task.agentscope_session_id,
         )
         if tool.name == "request_human_decision"
     )
@@ -1059,6 +1088,8 @@ def test_captured_human_decision_tool_denies_existing_recovery_without_mutation(
             "request_state": "waiting_user",
             "step_id": "confirm",
         },
+        expected_web_session_id=task.created_by_web_session_id,
+        expected_agentscope_session_id=task.agentscope_session_id,
     )
     handoff_before = plan_store.get_human_decision_handoff(
         plan.plan_id,
@@ -1126,7 +1157,7 @@ def test_old_wrapper_cannot_claim_after_same_session_creates_new_current_attempt
         agentscope_session_id=agent,
     ).task
     plan_store = SqliteNavigationPlanRepository(db_path)
-    plan = plan_store.activate(
+    plan = _activate_plan(plan_store,
         task,
         "extract_sync",
         1,
@@ -1199,7 +1230,7 @@ def test_old_wrapper_cannot_claim_after_same_session_creates_new_current_attempt
 def test_superseded_plan_cannot_claim_pending_step(tmp_path):
     services = build_services(tmp_path)
     old_plan = services.plan
-    services.plan_store.activate(
+    _activate_plan(services.plan_store,
         services.task,
         "extract_sync",
         1,
@@ -1210,6 +1241,8 @@ def test_superseded_plan_cannot_claim_pending_step(tmp_path):
         old_plan.plan_id,
         "sync",
         "extract_and_sync_navigation_data",
+        expected_web_session_id=services.task.created_by_web_session_id,
+        expected_agentscope_session_id=services.task.agentscope_session_id,
     )
 
     assert claimed is StepClaimOutcome.NOT_CLAIMABLE
@@ -1222,7 +1255,7 @@ def test_stale_execution_toolkit_rejects_before_artifact_or_durable_state_mutati
     services = build_services(tmp_path)
     stale_tool = services.tools()["extract_and_sync_navigation_data_tool"]
     old_plan = services.plan
-    replacement = services.plan_store.activate(
+    replacement = _activate_plan(services.plan_store,
         services.task,
         "extract_sync",
         2,
@@ -1311,7 +1344,7 @@ def test_activate_rejects_supersede_after_step_claim_without_losing_execution(
     def action(**kwargs):
         invoked.append(kwargs)
         with pytest.raises(ActivePlanExecutionConflict):
-            services.plan_store.activate(
+            _activate_plan(services.plan_store,
                 services.task,
                 "extract_sync",
                 1,
@@ -1370,6 +1403,8 @@ def test_evidence_write_failure_recovers_from_durable_result_without_reinvoking(
             settings=services.settings,
             dry_run=True,
             cancellation=None,
+            web_session_id=persisted_before_recovery.created_by_web_session_id,
+            agentscope_session_id=persisted_before_recovery.agentscope_session_id,
         )
     }
     second = call_tool(
@@ -1588,6 +1623,8 @@ def test_running_step_without_staged_result_transitions_to_needs_replan(
         services.plan.plan_id,
         "sync",
         "extract_and_sync_navigation_data",
+        expected_web_session_id=services.task.created_by_web_session_id,
+        expected_agentscope_session_id=services.task.agentscope_session_id,
     )
 
     result = call_tool(tool, plan_id=services.plan.plan_id, step_id="sync")
@@ -1656,6 +1693,8 @@ def test_failed_step_does_not_infer_artifact_state_and_exposes_no_fresh_executio
             settings=services.settings,
             dry_run=True,
             cancellation=None,
+            web_session_id=stored.created_by_web_session_id,
+            agentscope_session_id=stored.agentscope_session_id,
         )
     }
     assert result["status"] == "failed"
@@ -1689,11 +1728,11 @@ def test_failed_validation_does_not_infer_final_artifacts_or_expose_execution_to
         [CalibrationInventoryObservation(sensor_sources=[source])],
         [],
         evidence_store,
-        expected_web_session_id=None,
-        expected_agentscope_session_id=None,
+        expected_web_session_id=task.created_by_web_session_id,
+        expected_agentscope_session_id=task.agentscope_session_id,
     )
     plan_store = SqliteNavigationPlanRepository(db_path)
-    plan = plan_store.activate(
+    plan = _activate_plan(plan_store,
         task, "finish_processing", observation.revision, finish_plan(source)
     )
     with sqlite3.connect(db_path) as connection:
@@ -1721,6 +1760,8 @@ def test_failed_validation_does_not_infer_final_artifacts_or_expose_execution_to
             settings=settings,
             dry_run=True,
             cancellation=None,
+            web_session_id=task.created_by_web_session_id,
+            agentscope_session_id=task.agentscope_session_id,
         )
     }
     result = call_tool(
@@ -1738,6 +1779,8 @@ def test_failed_validation_does_not_infer_final_artifacts_or_expose_execution_to
             settings=settings,
             dry_run=True,
             cancellation=None,
+            web_session_id=stored.created_by_web_session_id,
+            agentscope_session_id=stored.agentscope_session_id,
         )
     }
     assert result["status"] == "failed"
@@ -1749,7 +1792,11 @@ def test_failed_validation_does_not_infer_final_artifacts_or_expose_execution_to
 def test_force_running_recovery_refuses_to_orphan_task_phase_handoff(tmp_path):
     services = build_services(tmp_path)
     assert services.plan_store.claim_step(
-        services.plan.plan_id, "sync", "extract_and_sync_navigation_data"
+        services.plan.plan_id,
+        "sync",
+        "extract_and_sync_navigation_data",
+        expected_web_session_id=services.task.created_by_web_session_id,
+        expected_agentscope_session_id=services.task.agentscope_session_id,
     )
     with sqlite3.connect(services.plan_store.db_path) as connection:
         now = "2026-07-12T00:00:00+00:00"
@@ -1857,6 +1904,8 @@ def test_resolve_finish_arguments_are_derived_from_task_decisions_and_settings(t
     plan = finish_plan(source)
     task = NavigationTask(
         task_id="nav-finish",
+        created_by_web_session_id="web-test",
+        agentscope_session_id="as-test",
         date="20260710",
         segments=["segment-a"],
         scene_mode="out",
@@ -1940,11 +1989,11 @@ def test_calibration_source_must_match_plan_revision_inventory_and_processing_ro
             )
         ],
         evidence_store,
-        expected_web_session_id=None,
-        expected_agentscope_session_id=None,
+        expected_web_session_id=task.created_by_web_session_id,
+        expected_agentscope_session_id=task.agentscope_session_id,
     )
     plan_store = SqliteNavigationPlanRepository(db_path)
-    plan = plan_store.activate(
+    plan = _activate_plan(plan_store,
         task,
         "finish_processing",
         observation.revision,
@@ -1972,6 +2021,8 @@ def test_calibration_source_must_match_plan_revision_inventory_and_processing_ro
             settings=settings,
             dry_run=True,
             cancellation=None,
+            web_session_id=task.created_by_web_session_id,
+            agentscope_session_id=task.agentscope_session_id,
         )
     }
     result = call_tool(
@@ -2024,11 +2075,11 @@ def test_plan_bound_human_decision_waits_and_transitions_ledger_exactly_once(
         [CalibrationInventoryObservation(sensor_sources=[source])],
         [],
         evidence_store,
-        expected_web_session_id=None,
-        expected_agentscope_session_id=None,
+        expected_web_session_id=task.created_by_web_session_id,
+        expected_agentscope_session_id=task.agentscope_session_id,
     )
     plan_store = SqliteNavigationPlanRepository(db_path)
-    plan = plan_store.activate(
+    plan = _activate_plan(plan_store,
         task,
         "finish_processing",
         observation.revision,
@@ -2043,6 +2094,8 @@ def test_plan_bound_human_decision_waits_and_transitions_ledger_exactly_once(
             settings=settings,
             dry_run=True,
             cancellation=None,
+            web_session_id=task.created_by_web_session_id,
+            agentscope_session_id=task.agentscope_session_id,
         )
     }
     assert set(tools) == {
@@ -2091,6 +2144,8 @@ def test_plan_bound_human_decision_waits_and_transitions_ledger_exactly_once(
         plan_id=plan.plan_id,
         step_id="confirm",
         decision={"action": action},
+        expected_web_session_id=task.created_by_web_session_id,
+        expected_agentscope_session_id=task.agentscope_session_id,
     )
     duplicate = plan_execution.submit_plan_human_decision(
         plan_store=plan_store,
@@ -2098,6 +2153,8 @@ def test_plan_bound_human_decision_waits_and_transitions_ledger_exactly_once(
         plan_id=plan.plan_id,
         step_id="confirm",
         decision={"action": action},
+        expected_web_session_id=task.created_by_web_session_id,
+        expected_agentscope_session_id=task.agentscope_session_id,
     )
 
     assert permission.behavior.value == "allow"

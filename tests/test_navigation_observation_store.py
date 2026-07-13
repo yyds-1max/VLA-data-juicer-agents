@@ -38,8 +38,8 @@ def _append(
     writes,
     evidence,
     *,
-    web_session_id=None,
-    agentscope_session_id=None,
+    web_session_id="web-test",
+    agentscope_session_id="as-test",
 ):
     return store.append(
         task_id,
@@ -196,7 +196,7 @@ def test_task_first_initialization_installs_observation_triggers(tmp_path):
     assert task_store.get_task(task.task_id).state_revision == task.state_revision + 1
 
 
-def test_owned_task_observation_append_rejects_omitted_session(tmp_path):
+def test_owned_task_observation_append_rejects_wrong_session(tmp_path):
     db_path = tmp_path / "state.sqlite"
     task_store = SqliteNavigationTaskStore(db_path)
     task = task_store.create_task_attempt(
@@ -218,8 +218,8 @@ def test_owned_task_observation_append_rejects_omitted_session(tmp_path):
             [_raw_observation()],
             [],
             FileNavigationEvidenceStore(tmp_path / "evidence"),
-            expected_web_session_id=None,
-            expected_agentscope_session_id=None,
+            expected_web_session_id="web-wrong",
+            expected_agentscope_session_id="as-wrong",
         )
 
     assert store.latest(task.task_id) is None

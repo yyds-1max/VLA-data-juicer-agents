@@ -4,6 +4,8 @@ from types import SimpleNamespace
 
 import pytest
 
+from test_navigation_context_budget import _call, _write_raw_metadata
+from test_navigation_model_authored_flow import _activate_extract_plan
 from vla_data_juicer_agents.cli import async_main, parse_args
 from vla_data_juicer_agents.core.cancellation import TurnCancelled
 from vla_data_juicer_agents.navigation.config import NavigationSettings
@@ -34,6 +36,69 @@ def test_parse_segments_requires_at_least_one_value():
         parse_args(["plan", "--date", "20270605", "--segments"])
 
 
+def test_cli_direct_run_executes_with_real_attempt_bound_resolver(tmp_path, monkeypatch):
+    date = "20270605"
+    segment = "20270605_120000"
+    settings = NavigationSettings(
+        runs_root=tmp_path / "runs",
+        vladatasets_root=tmp_path / "data",
+    )
+    _write_raw_metadata(settings.vladatasets_root, date, segment)
+    captured = {}
+
+    async def submit_real_plan(*, services, task, agentscope_session_id, **_kwargs):
+        captured["services"] = services
+        submitted = await asyncio.to_thread(
+            _activate_extract_plan,
+            services,
+            task,
+            agentscope_session_id,
+            task.created_by_web_session_id,
+        )
+        return services.plan_store.get(submitted["plan_id"])
+
+    def capture_executor(*, tools, **_kwargs):
+        captured["tool_names"] = {tool.name for tool in tools}
+        return {tool.name: tool for tool in tools}
+
+    async def execute_real_tools(tool_map, plan, **_kwargs):
+        services = captured["services"]
+        while services.plan_store.get(plan.plan_id).status == "active":
+            current = services.plan_store.get_current_step(plan.plan_id)["step"]
+            result = await asyncio.to_thread(
+                _call,
+                tool_map[f"{current['action']}_tool"],
+                plan_id=plan.plan_id,
+                step_id=current["step_id"],
+            )
+            assert result["ok"] is True
+        return "executed from durable plan"
+
+    monkeypatch.setattr("vla_data_juicer_agents.cli.NavigationSettings", lambda: settings)
+    monkeypatch.setattr(
+        "vla_data_juicer_agents.cli.run_direct_plan_until_submitted",
+        submit_real_plan,
+    )
+    monkeypatch.setattr(
+        "vla_data_juicer_agents.cli.create_executor_agent",
+        capture_executor,
+    )
+    monkeypatch.setattr(
+        "vla_data_juicer_agents.cli.run_executor_agent",
+        execute_real_tools,
+    )
+
+    exit_code = asyncio.run(
+        async_main(
+            ["run", "--date", date, "--segments", segment, "--dry-run"]
+        )
+    )
+
+    assert exit_code == 0
+    assert "extract_and_sync_navigation_data_tool" in captured["tool_names"]
+    assert "prepare_raw_data_tool" in captured["tool_names"]
+
+
 @pytest.mark.parametrize(
     ("ledger_status", "executor_error", "expected_status", "expected_exit"),
     [
@@ -53,14 +118,17 @@ def test_cli_uses_durable_terminal_state_not_executor_text(
     expected_exit,
 ):
     settings = NavigationSettings(runs_root=tmp_path / "runs", vladatasets_root=tmp_path / "data")
-    task = SimpleNamespace(task_id="task-1", phase=SimpleNamespace(value="extract_sync"))
+    task = SimpleNamespace(
+        task_id="task-1",
+        created_by_web_session_id="direct:run",
+        agentscope_session_id="direct__run",
+    )
     ledger_complete = ledger_status == "dry_run_completed"
     terminal_task = SimpleNamespace(
         task_id="task-1",
-        phase=SimpleNamespace(value="extract_sync"),
         status=SimpleNamespace(
             value=(
-                "needs_rerun"
+                "completed"
                 if ledger_complete
                 else "pending"
                 if ledger_status == "waiting_user"

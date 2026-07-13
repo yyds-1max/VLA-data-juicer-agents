@@ -56,8 +56,8 @@ class NavigationTask(BaseModel):
     state_revision: int = Field(default=0, ge=0)
     status: NavigationTaskStatus = NavigationTaskStatus.ACTIVE
     accepted_plan_phase: Literal["extract_sync", "finish_processing"] | None = None
-    created_by_web_session_id: str | None = None
-    agentscope_session_id: str | None = None
+    created_by_web_session_id: str
+    agentscope_session_id: str
     schema_version: int = TASK_SCHEMA_VERSION
     created_at: str = Field(default_factory=utc_now)
     updated_at: str = Field(default_factory=utc_now)
@@ -66,6 +66,14 @@ class NavigationTask(BaseModel):
     @classmethod
     def validate_date(cls, value: str) -> str:
         return _validate_date(value)
+
+    @field_validator("created_by_web_session_id", "agentscope_session_id")
+    @classmethod
+    def validate_session_identity(cls, value: str) -> str:
+        normalized = value.strip()
+        if not normalized:
+            raise ValueError("navigation session identity must be non-empty")
+        return normalized
 
 
 class TaskAttemptCreation(BaseModel):

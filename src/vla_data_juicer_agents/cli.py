@@ -73,6 +73,7 @@ async def async_main(argv: list[str] | None = None) -> int:
         execution_tools = resolve_navigation_agent_tools(
             services=services,
             agentscope_session_id=session_id,
+            web_session_id=task.created_by_web_session_id,
             cancellation=None,
         )
         executor = create_executor_agent(model=args.model, tools=execution_tools, dry_run=args.dry_run)

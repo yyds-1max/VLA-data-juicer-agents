@@ -36,6 +36,8 @@ from vla_data_juicer_agents.navigation.task_state import (
 def extract_task() -> NavigationTask:
     return NavigationTask(
         task_id="nav-plan-1",
+        created_by_web_session_id="web-plan",
+        agentscope_session_id="as-plan",
         date="20260710",
         segments=["20260710_120000"],
     )
@@ -44,6 +46,8 @@ def extract_task() -> NavigationTask:
 def finish_task() -> NavigationTask:
     return NavigationTask(
         task_id="nav-plan-1",
+        created_by_web_session_id="web-plan",
+        agentscope_session_id="as-plan",
         date="20260710",
         segments=["20260710_120000"],
         scene_mode="out",

@@ -74,6 +74,8 @@ def _decode_tool_payload(payload):
 def _task(*, scene_mode=None):
     return NavigationTask(
         task_id="nav-observe-1",
+        created_by_web_session_id="web-observe",
+        agentscope_session_id="as-observe",
         date="20270605",
         segments=["20260605_152856"],
         scene_mode=scene_mode,
@@ -88,6 +90,8 @@ def _tools(tmp_path, *, task=None, settings=None):
         observation_store=observation_store,
         evidence_store=evidence_store,
         settings=settings or NavigationSettings(vladatasets_root=FIXTURE_ROOT),
+        expected_web_session_id=(task or _task()).created_by_web_session_id,
+        expected_agentscope_session_id=(task or _task()).agentscope_session_id,
     )
     return {tool.name: tool for tool in built}, observation_store, evidence_store
 
@@ -161,6 +165,8 @@ def test_large_topic_inventory_is_compacted_before_single_persisted_revision(tmp
     )
     task = NavigationTask(
         task_id="nav-large-inventory",
+        created_by_web_session_id="web-observe",
+        agentscope_session_id="as-observe",
         date="20270605",
         segments=["segment_a"],
     )
@@ -451,8 +457,8 @@ def test_real_context_tool_globally_bounds_all_observation_kinds_and_evidence(tm
                 )
             ],
             FileNavigationEvidenceStore(tmp_path / "evidence"),
-            expected_web_session_id=None,
-            expected_agentscope_session_id=None,
+            expected_web_session_id="web-observe",
+            expected_agentscope_session_id="as-observe",
         )
 
     context = _invoke_tool(tools["get_navigation_task_context_tool"], {})
@@ -473,6 +479,8 @@ def test_real_context_tool_bounds_revision_zero_identity_after_json_escaping(tmp
     adversarial = 'quoted-"-backslash-\\-newline-\n-' + "\x00" * 160
     task = NavigationTask(
         task_id="nav-observe-1",
+        created_by_web_session_id="web-observe",
+        agentscope_session_id="as-observe",
         request=adversarial,
         target=adversarial,
         date="20270605",

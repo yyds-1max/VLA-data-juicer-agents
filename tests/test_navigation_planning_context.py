@@ -27,6 +27,8 @@ from vla_data_juicer_agents.navigation.task_state import NavigationTask
 def _task() -> NavigationTask:
     return NavigationTask(
         task_id="nav-1",
+        created_by_web_session_id="web-plan",
+        agentscope_session_id="as-plan",
         request="Process the selected navigation clips.",
         target="20260710/20260710_120000",
         date="20260710",

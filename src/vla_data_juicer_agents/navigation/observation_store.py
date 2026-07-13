@@ -7,10 +7,6 @@ from typing import Any, Protocol
 
 from pydantic import TypeAdapter
 
-from vla_data_juicer_agents.navigation.aggregate_revision import (
-    ensure_navigation_aggregate_revision_triggers,
-)
-
 from vla_data_juicer_agents.navigation.observation_models import (
     EvidenceDescriptor,
     EvidenceWrite,
@@ -20,6 +16,7 @@ from vla_data_juicer_agents.navigation.observation_models import (
     UserGuidanceObservation,
 )
 from vla_data_juicer_agents.navigation.task_state import utc_now
+from vla_data_juicer_agents.navigation.schema import initialize_navigation_schema
 from vla_data_juicer_agents.navigation.task_store import (
     NavigationTaskStateRevisionError,
     authorize_navigation_task_write,
@@ -71,41 +68,7 @@ class SqliteNavigationObservationStore:
         return connection
 
     def _init_schema(self) -> None:
-        with self._connect() as connection:
-            connection.execute(
-                """
-                CREATE TABLE IF NOT EXISTS navigation_observation_revisions (
-                    task_id TEXT NOT NULL,
-                    revision INTEGER NOT NULL,
-                    revision_json TEXT NOT NULL,
-                    created_at TEXT NOT NULL,
-                    PRIMARY KEY (task_id, revision)
-                )
-                """
-            )
-            connection.execute(
-                """
-                CREATE TABLE IF NOT EXISTS navigation_evidence (
-                    ref TEXT PRIMARY KEY,
-                    task_id TEXT NOT NULL,
-                    observation_revision INTEGER NOT NULL,
-                    kind TEXT NOT NULL,
-                    summary TEXT NOT NULL,
-                    byte_size INTEGER NOT NULL,
-                    source_tool TEXT NOT NULL,
-                    created_at TEXT NOT NULL,
-                    FOREIGN KEY (task_id, observation_revision)
-                        REFERENCES navigation_observation_revisions(task_id, revision)
-                )
-                """
-            )
-            connection.execute(
-                """
-                CREATE INDEX IF NOT EXISTS idx_navigation_evidence_task_revision_kind
-                ON navigation_evidence (task_id, observation_revision, kind)
-                """
-            )
-            ensure_navigation_aggregate_revision_triggers(connection)
+        initialize_navigation_schema(self.db_path)
 
     def append(
         self,

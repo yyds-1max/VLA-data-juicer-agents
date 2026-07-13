@@ -246,6 +246,7 @@ async def run_vla_workflow(ctx: ToolContext, raw_args: RunVLAWorkflowInput | dic
             tools=resolve_navigation_agent_tools(
                 services=services,
                 agentscope_session_id=session_id,
+                web_session_id=task.created_by_web_session_id,
                 cancellation=cancellation,
             ),
         )

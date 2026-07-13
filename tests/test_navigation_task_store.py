@@ -6,13 +6,21 @@ from threading import Barrier
 from pathlib import Path
 
 import pytest
+from pydantic import ValidationError
 
 import vla_data_juicer_agents.navigation.task_store as task_store_module
 from vla_data_juicer_agents.navigation.plan_store import (
     SqliteNavigationPlanRepository,
 )
+from vla_data_juicer_agents.navigation.observation_store import (
+    SqliteNavigationObservationStore,
+)
+from vla_data_juicer_agents.navigation.aggregate_revision import (
+    NAVIGATION_AGGREGATE_REVISION_TRIGGER_NAMES,
+)
 from vla_data_juicer_agents.navigation.task_state import (
     TASK_SCHEMA_VERSION,
+    NavigationTask,
     NavigationTaskStatus,
 )
 from vla_data_juicer_agents.navigation.task_store import (
@@ -187,6 +195,111 @@ def test_task_store_idempotently_creates_supported_schema_generation(tmp_path: P
     assert "idx_navigation_tasks_active_date_segments_key" not in indexes
 
 
+def test_fresh_task_store_creates_complete_final_navigation_schema(tmp_path: Path):
+    db_path = tmp_path / "navigation.sqlite"
+
+    SqliteNavigationTaskStore(db_path)
+
+    with sqlite3.connect(db_path) as connection:
+        tables = {
+            row[0]
+            for row in connection.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'table' "
+                "AND name GLOB 'navigation_*'"
+            )
+        }
+        triggers = {
+            row[0]
+            for row in connection.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'trigger' "
+                "AND name GLOB 'trg_navigation_*'"
+            )
+        }
+        marker = connection.execute(
+            "SELECT singleton, generation FROM navigation_state_schema"
+        ).fetchall()
+
+    assert tables == {
+        "navigation_state_schema",
+        "navigation_tasks",
+        "navigation_task_steps",
+        "navigation_observation_revisions",
+        "navigation_evidence",
+        "navigation_plans",
+        "navigation_step_result_outbox",
+        "navigation_human_decision_handoffs",
+        "navigation_plan_submission_attempts",
+    }
+    assert triggers == NAVIGATION_AGGREGATE_REVISION_TRIGGER_NAMES
+    assert marker == [(1, "navigation-attempts-final-v2")]
+
+
+@pytest.mark.parametrize(
+    "initializer",
+    [
+        SqliteNavigationTaskStore,
+        SqliteNavigationObservationStore,
+        SqliteNavigationPlanRepository,
+    ],
+)
+def test_any_store_rejects_child_schema_drift_without_mutation(
+    tmp_path: Path,
+    initializer,
+):
+    db_path = tmp_path / f"drift-{initializer.__name__}.sqlite"
+    SqliteNavigationPlanRepository(db_path)
+    with sqlite3.connect(db_path) as connection:
+        connection.execute(
+            "ALTER TABLE navigation_plans ADD COLUMN unexpected_state TEXT"
+        )
+        before_schema = connection.execute(
+            "SELECT type, name, sql FROM sqlite_master ORDER BY type, name"
+        ).fetchall()
+    before_bytes = db_path.read_bytes()
+
+    with pytest.raises(NavigationStateResetRequired):
+        initializer(db_path)
+
+    assert db_path.read_bytes() == before_bytes
+    with sqlite3.connect(db_path) as connection:
+        after_schema = connection.execute(
+            "SELECT type, name, sql FROM sqlite_master ORDER BY type, name"
+        ).fetchall()
+    assert after_schema == before_schema
+
+
+@pytest.mark.parametrize(
+    "drift_sql",
+    [
+        "DROP TABLE navigation_step_result_outbox",
+        "DROP INDEX idx_navigation_plan_attempts_task_phase_created",
+        "DROP TRIGGER trg_navigation_plans_aggregate_revision_after_update",
+    ],
+)
+def test_full_schema_contract_rejects_missing_child_object_without_mutation(
+    tmp_path: Path,
+    drift_sql: str,
+):
+    db_path = tmp_path / "missing-child.sqlite"
+    SqliteNavigationTaskStore(db_path)
+    with sqlite3.connect(db_path) as connection:
+        connection.execute(drift_sql)
+        before_schema = connection.execute(
+            "SELECT type, name, sql FROM sqlite_master ORDER BY type, name"
+        ).fetchall()
+    before_bytes = db_path.read_bytes()
+
+    with pytest.raises(NavigationStateResetRequired):
+        SqliteNavigationTaskStore(db_path)
+
+    assert db_path.read_bytes() == before_bytes
+    with sqlite3.connect(db_path) as connection:
+        after_schema = connection.execute(
+            "SELECT type, name, sql FROM sqlite_master ORDER BY type, name"
+        ).fetchall()
+    assert after_schema == before_schema
+
+
 def test_task_store_creates_and_loads_navigation_task(tmp_path: Path):
     store = SqliteNavigationTaskStore(tmp_path / "navigation_tasks.sqlite")
 
@@ -213,6 +326,64 @@ def test_task_store_creates_and_loads_navigation_task(tmp_path: Path):
     assert loaded.created_by_web_session_id == "web-1"
     assert loaded.agentscope_session_id == "agent-1"
     assert loaded.schema_version == TASK_SCHEMA_VERSION
+
+
+def test_navigation_task_requires_nonempty_session_identity_pair():
+    common = {
+        "task_id": "nav-test",
+        "request": "Process navigation data",
+        "target": "20270623",
+        "date": "20270623",
+    }
+
+    with pytest.raises(ValidationError):
+        NavigationTask.model_validate(common)
+    with pytest.raises(ValidationError):
+        NavigationTask.model_validate(
+            {
+                **common,
+                "created_by_web_session_id": " ",
+                "agentscope_session_id": "agent-1",
+            }
+        )
+
+
+def test_navigation_task_schema_requires_session_identity_columns(tmp_path: Path):
+    db_path = tmp_path / "navigation.sqlite"
+    SqliteNavigationTaskStore(db_path)
+
+    with sqlite3.connect(db_path) as connection:
+        columns = {
+            row[1]: bool(row[3])
+            for row in connection.execute("PRAGMA table_info(navigation_tasks)")
+        }
+
+    assert columns["created_by_web_session_id"] is True
+    assert columns["agentscope_session_id"] is True
+
+
+@pytest.mark.parametrize(
+    ("web_session_id", "agentscope_session_id"),
+    [(None, "agent-1"), ("web-1", None), ("", "agent-1"), ("web-1", " ")],
+)
+def test_create_attempt_rejects_missing_or_empty_session_identity(
+    tmp_path: Path,
+    web_session_id,
+    agentscope_session_id,
+):
+    store = SqliteNavigationTaskStore(tmp_path / "navigation.sqlite")
+
+    with pytest.raises((TypeError, ValueError, ValidationError)):
+        store.create_task_attempt(
+            request="Process navigation data",
+            target="20270623",
+            date="20270623",
+            segments=None,
+            scene_mode=None,
+            dry_run=False,
+            web_session_id=web_session_id,
+            agentscope_session_id=agentscope_session_id,
+        )
 
 
 def test_new_web_sessions_create_distinct_attempts_for_same_target(tmp_path: Path):
@@ -527,9 +698,11 @@ def test_incompatible_navigation_schema_requires_reset_without_mutation(
     tmp_path: Path,
 ):
     db_path = tmp_path / "legacy-navigation.sqlite"
+    legacy_latest_session = "latest_" + "web_session_id"
+    legacy_artifact_snapshot = "artifact_" + "snapshot_json"
     with sqlite3.connect(db_path) as connection:
         connection.executescript(
-            """CREATE TABLE navigation_tasks (
+            f"""CREATE TABLE navigation_tasks (
                    task_id TEXT PRIMARY KEY,
                    date TEXT NOT NULL,
                    segments_json TEXT,
@@ -539,12 +712,12 @@ def test_incompatible_navigation_schema_requires_reset_without_mutation(
                    waiting_reason TEXT,
                    next_required_input TEXT,
                    created_by_web_session_id TEXT,
-                   latest_web_session_id TEXT,
+                   {legacy_latest_session} TEXT,
                    agentscope_session_id TEXT,
                    latest_run_id TEXT,
                    last_completed_step TEXT,
                    data_profile_json TEXT,
-                   artifact_snapshot_json TEXT,
+                   {legacy_artifact_snapshot} TEXT,
                    drift_json TEXT,
                    schema_version INTEGER NOT NULL,
                    created_at TEXT NOT NULL,
@@ -553,7 +726,7 @@ def test_incompatible_navigation_schema_requires_reset_without_mutation(
                INSERT INTO navigation_tasks VALUES (
                    'legacy', '20270623', NULL, NULL, 'intake', 'pending',
                    NULL, NULL, 'web-old', 'web-old', 'as-old', NULL, NULL,
-                   '{"legacy":true}', NULL, NULL, 1,
+                   '{{"legacy":true}}', NULL, NULL, 1,
                    '2026-07-08T00:00:00.000+00:00',
                    '2026-07-08T00:00:00.000+00:00'
                );"""

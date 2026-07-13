@@ -13,9 +13,6 @@ from uuid import uuid4
 
 from pydantic import BaseModel, ConfigDict
 
-from vla_data_juicer_agents.navigation.aggregate_revision import (
-    ensure_navigation_aggregate_revision_triggers,
-)
 from vla_data_juicer_agents.navigation.catalog import (
     list_navigation_tool_capabilities,
 )
@@ -28,6 +25,7 @@ from vla_data_juicer_agents.navigation.plan_models import (
     PlanSubmissionAttempt,
 )
 from vla_data_juicer_agents.navigation.task_state import NavigationTask, utc_now
+from vla_data_juicer_agents.navigation.schema import initialize_navigation_schema
 from vla_data_juicer_agents.navigation.task_store import (
     SqliteNavigationTaskStore,
     authorize_navigation_task_write,
@@ -172,222 +170,7 @@ class SqliteNavigationPlanRepository:
             )
 
     def _init_schema(self) -> None:
-        SqliteNavigationTaskStore(self.db_path)
-        with self._connect() as connection:
-            connection.execute(
-                """
-                CREATE TABLE IF NOT EXISTS navigation_plans (
-                    plan_id TEXT PRIMARY KEY,
-                    task_id TEXT NOT NULL,
-                    phase TEXT NOT NULL CHECK (phase IN ('extract_sync', 'finish_processing')),
-                    plan_revision INTEGER NOT NULL,
-                    contract_version TEXT NOT NULL,
-                    observation_revision INTEGER NOT NULL,
-                    plan_json TEXT NOT NULL,
-                    validation_summary_json TEXT NOT NULL,
-                    status TEXT NOT NULL CHECK (
-                        status IN ('active', 'superseded', 'completed', 'invalidated')
-                    ),
-                    invalidation_reason TEXT,
-                    created_at TEXT NOT NULL,
-                    updated_at TEXT NOT NULL,
-                    UNIQUE (task_id, phase, plan_revision),
-                    FOREIGN KEY (task_id) REFERENCES navigation_tasks(task_id)
-                        ON DELETE CASCADE
-                )
-                """
-            )
-            connection.execute(
-                """
-                CREATE TABLE IF NOT EXISTS navigation_step_result_outbox (
-                    plan_id TEXT NOT NULL,
-                    step_id TEXT NOT NULL,
-                    task_id TEXT NOT NULL,
-                    plan_revision INTEGER NOT NULL,
-                    target_status TEXT NOT NULL CHECK (target_status IN ('completed', 'failed')),
-                    expected_statuses_json TEXT NOT NULL,
-                    full_result_json TEXT NOT NULL,
-                    result_summary_json TEXT NOT NULL,
-                    result_ref TEXT,
-                    created_at TEXT NOT NULL,
-                    updated_at TEXT NOT NULL,
-                    PRIMARY KEY (plan_id, step_id),
-                    FOREIGN KEY (plan_id) REFERENCES navigation_plans(plan_id)
-                        ON DELETE CASCADE,
-                    FOREIGN KEY (task_id) REFERENCES navigation_tasks(task_id)
-                        ON DELETE CASCADE
-                )
-                """
-            )
-            connection.execute(
-                """
-                CREATE TABLE IF NOT EXISTS navigation_human_decision_handoffs (
-                    plan_id TEXT NOT NULL,
-                    step_id TEXT NOT NULL,
-                    task_id TEXT NOT NULL,
-                    decision_key TEXT NOT NULL,
-                    decision_json TEXT NOT NULL,
-                    status TEXT NOT NULL CHECK (
-                        status IN ('pending', 'recovery_required', 'quarantined')
-                    ),
-                    delivery_status TEXT NOT NULL DEFAULT 'pending' CHECK (
-                        delivery_status IN (
-                            'pending', 'delivering', 'delivered',
-                            'recovery_required', 'quarantined'
-                        )
-                    ),
-                    delivery_owner TEXT,
-                    delivery_token TEXT,
-                    leased_at TEXT,
-                    expires_at TEXT,
-                    recovery_reason_code TEXT,
-                    recovery_reason TEXT,
-                    recovered_at TEXT,
-                    created_at TEXT NOT NULL,
-                    updated_at TEXT NOT NULL,
-                    PRIMARY KEY (plan_id, step_id),
-                    FOREIGN KEY (plan_id) REFERENCES navigation_plans(plan_id)
-                        ON DELETE CASCADE,
-                    FOREIGN KEY (task_id) REFERENCES navigation_tasks(task_id)
-                        ON DELETE CASCADE
-                )
-                """
-            )
-            self._ensure_handoff_recovery_schema(connection)
-            connection.execute(
-                """
-                CREATE UNIQUE INDEX IF NOT EXISTS idx_navigation_plans_active_task_phase
-                ON navigation_plans (task_id, phase)
-                WHERE status = 'active'
-                """
-            )
-            handoff_columns = {
-                row["name"]
-                for row in connection.execute(
-                    "PRAGMA table_info(navigation_human_decision_handoffs)"
-                ).fetchall()
-            }
-            if "delivery_status" not in handoff_columns:
-                connection.execute(
-                    """ALTER TABLE navigation_human_decision_handoffs
-                       ADD COLUMN delivery_status TEXT NOT NULL DEFAULT 'pending'"""
-                )
-            for name in (
-                "delivery_owner",
-                "delivery_token",
-                "leased_at",
-                "expires_at",
-                "recovery_reason_code",
-                "recovery_reason",
-                "recovered_at",
-            ):
-                if name not in handoff_columns:
-                    connection.execute(
-                        f"ALTER TABLE navigation_human_decision_handoffs ADD COLUMN {name} TEXT"
-                    )
-            self._backfill_null_result_refs(connection)
-            connection.execute(
-                """
-                CREATE TABLE IF NOT EXISTS navigation_plan_submission_attempts (
-                    attempt_id TEXT PRIMARY KEY,
-                    task_id TEXT NOT NULL,
-                    phase TEXT NOT NULL CHECK (phase IN ('extract_sync', 'finish_processing')),
-                    planning_context_revision TEXT NOT NULL,
-                    candidate_json TEXT NOT NULL,
-                    validation_json TEXT NOT NULL,
-                    created_at TEXT NOT NULL,
-                    FOREIGN KEY (task_id) REFERENCES navigation_tasks(task_id)
-                        ON DELETE CASCADE
-                )
-                """
-            )
-            connection.execute(
-                """
-                CREATE INDEX IF NOT EXISTS idx_navigation_plan_attempts_task_phase_created
-                ON navigation_plan_submission_attempts (task_id, phase, created_at)
-                """
-            )
-            ensure_navigation_aggregate_revision_triggers(connection)
-
-    @staticmethod
-    def _ensure_handoff_recovery_schema(connection: sqlite3.Connection) -> None:
-        row = connection.execute(
-            "SELECT sql FROM sqlite_master WHERE type = 'table' "
-            "AND name = 'navigation_human_decision_handoffs'"
-        ).fetchone()
-        if row is None or "recovery_required" in str(row["sql"]):
-            return
-        connection.execute(
-            """CREATE TABLE navigation_human_decision_handoffs_recovery (
-                plan_id TEXT NOT NULL,
-                step_id TEXT NOT NULL,
-                task_id TEXT NOT NULL,
-                decision_key TEXT NOT NULL,
-                decision_json TEXT NOT NULL,
-                status TEXT NOT NULL CHECK (
-                    status IN ('pending', 'recovery_required', 'quarantined')
-                ),
-                delivery_status TEXT NOT NULL DEFAULT 'pending' CHECK (
-                    delivery_status IN (
-                        'pending', 'delivering', 'delivered',
-                        'recovery_required', 'quarantined'
-                    )
-                ),
-                delivery_owner TEXT,
-                delivery_token TEXT,
-                leased_at TEXT,
-                expires_at TEXT,
-                recovery_reason_code TEXT,
-                recovery_reason TEXT,
-                recovered_at TEXT,
-                created_at TEXT NOT NULL,
-                updated_at TEXT NOT NULL,
-                PRIMARY KEY (plan_id, step_id),
-                FOREIGN KEY (plan_id) REFERENCES navigation_plans(plan_id)
-                    ON DELETE CASCADE,
-                FOREIGN KEY (task_id) REFERENCES navigation_tasks(task_id)
-                    ON DELETE CASCADE
-            )"""
-        )
-        old_columns = {
-            item["name"]
-            for item in connection.execute(
-                "PRAGMA table_info(navigation_human_decision_handoffs)"
-            ).fetchall()
-        }
-        expressions = {
-            name: name if name in old_columns else "NULL"
-            for name in (
-                "delivery_owner",
-                "delivery_token",
-                "leased_at",
-                "expires_at",
-            )
-        }
-        delivery_status = (
-            "COALESCE(delivery_status, 'pending')"
-            if "delivery_status" in old_columns
-            else "'pending'"
-        )
-        connection.execute(
-            f"""INSERT INTO navigation_human_decision_handoffs_recovery (
-                    plan_id, step_id, task_id, decision_key, decision_json,
-                    status, delivery_status, delivery_owner, delivery_token,
-                    leased_at, expires_at, recovery_reason_code, recovery_reason,
-                    recovered_at, created_at, updated_at
-                )
-                SELECT plan_id, step_id, task_id, decision_key, decision_json,
-                       status, {delivery_status}, {expressions['delivery_owner']},
-                       {expressions['delivery_token']}, {expressions['leased_at']},
-                       {expressions['expires_at']}, NULL, NULL, NULL,
-                       created_at, updated_at
-                FROM navigation_human_decision_handoffs"""
-        )
-        connection.execute("DROP TABLE navigation_human_decision_handoffs")
-        connection.execute(
-            "ALTER TABLE navigation_human_decision_handoffs_recovery "
-            "RENAME TO navigation_human_decision_handoffs"
-        )
+        initialize_navigation_schema(self.db_path)
 
     def record_attempt(self, attempt: PlanSubmissionAttempt, *,
                        expected_web_session_id: str | None = None,
@@ -1274,9 +1057,6 @@ class SqliteNavigationPlanRepository:
         step_id: str,
     ) -> StagedStepResult | None:
         with self._connect() as connection:
-            self._backfill_null_result_refs(
-                connection, plan_id=plan_id, step_id=step_id
-            )
             row = connection.execute(
                 """
                 SELECT * FROM navigation_step_result_outbox
@@ -2181,53 +1961,6 @@ class SqliteNavigationPlanRepository:
             observation_revision,
             f"{plan_id}:{step_id}:{digest}",
         )
-
-    def _backfill_null_result_refs(
-        self,
-        connection: sqlite3.Connection,
-        *,
-        plan_id: str | None = None,
-        step_id: str | None = None,
-    ) -> None:
-        where = "WHERE outbox.result_ref IS NULL"
-        params: list[Any] = []
-        if plan_id is not None:
-            where += " AND outbox.plan_id = ?"
-            params.append(plan_id)
-        if step_id is not None:
-            where += " AND outbox.step_id = ?"
-            params.append(step_id)
-        rows = connection.execute(
-            f"""SELECT outbox.plan_id, outbox.step_id, outbox.task_id,
-                       outbox.full_result_json, plans.observation_revision
-                FROM navigation_step_result_outbox AS outbox
-                JOIN navigation_plans AS plans ON plans.plan_id = outbox.plan_id
-                {where}""",
-            params,
-        ).fetchall()
-        for row in rows:
-            canonical_full = self._canonical_json(
-                self._redact_sensitive(json.loads(row["full_result_json"]))
-            )
-            result_ref = self._intended_result_ref(
-                row["task_id"],
-                int(row["observation_revision"]),
-                row["plan_id"],
-                row["step_id"],
-                canonical_full,
-            )
-            connection.execute(
-                """UPDATE navigation_step_result_outbox
-                   SET full_result_json = ?, result_ref = ?, updated_at = ?
-                   WHERE plan_id = ? AND step_id = ? AND result_ref IS NULL""",
-                (
-                    canonical_full,
-                    result_ref,
-                    utc_now(),
-                    row["plan_id"],
-                    row["step_id"],
-                ),
-            )
 
     @classmethod
     def _redact_sensitive(cls, payload: Any) -> Any:

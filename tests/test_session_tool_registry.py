@@ -883,12 +883,9 @@ def _direct_workflow_fakes(
     )
     completed_task = SimpleNamespace(
         task_id="task-1",
-        phase=SimpleNamespace(
-            value="completed" if complete and not dry_run_complete else "extract_sync"
-        ),
         status=SimpleNamespace(
             value=(
-                "needs_rerun"
+                "completed"
                 if dry_run_complete
                 else "pending"
                 if terminal_status == "waiting_user"
@@ -901,7 +898,11 @@ def _direct_workflow_fakes(
         plan_store=plan_store,
         task_store=SimpleNamespace(get_task=lambda _task_id: completed_task),
     )
-    task = SimpleNamespace(task_id="task-1", phase=SimpleNamespace(value="extract_sync"))
+    task = SimpleNamespace(
+        task_id="task-1",
+        created_by_web_session_id="direct:run",
+        agentscope_session_id="direct__run",
+    )
     monkeypatch.setattr(
         "vla_data_juicer_agents.tools.vla.run_workflow.prepare_direct_navigation_entry",
         lambda **_kwargs: (services, task),
