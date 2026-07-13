@@ -1,5 +1,6 @@
 import json
 import sqlite3
+from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
 from threading import Barrier
 from pathlib import Path
@@ -15,7 +16,52 @@ from vla_data_juicer_agents.navigation.task_state import (
     NavigationTaskPhase,
     NavigationTaskStatus,
 )
-from vla_data_juicer_agents.navigation.task_store import SqliteNavigationTaskStore
+from vla_data_juicer_agents.navigation.task_store import (
+    NavigationStateResetRequired,
+    SqliteNavigationTaskStore,
+)
+
+
+_CORE_SCHEMA_OBJECTS = (
+    "navigation_state_schema",
+    "navigation_tasks",
+    "navigation_task_steps",
+    "idx_navigation_tasks_date_updated",
+    "idx_navigation_tasks_target_history",
+    "idx_navigation_tasks_session",
+    "idx_navigation_tasks_attempt_replay",
+    "idx_navigation_task_steps_plan_sequence",
+    "idx_navigation_task_steps_plan_step_id",
+)
+
+
+def _create_supported_schema_variant(
+    tmp_path: Path,
+    db_path: Path,
+    *,
+    task_sql_transform: Callable[[str], str],
+) -> None:
+    canonical_path = tmp_path / f"canonical-{db_path.name}"
+    SqliteNavigationTaskStore(canonical_path)
+    placeholders = ", ".join("?" for _ in _CORE_SCHEMA_OBJECTS)
+    with sqlite3.connect(canonical_path) as connection:
+        sql_by_name = dict(
+            connection.execute(
+                f"SELECT name, sql FROM sqlite_master WHERE name IN ({placeholders})",
+                _CORE_SCHEMA_OBJECTS,
+            ).fetchall()
+        )
+
+    with sqlite3.connect(db_path) as connection:
+        connection.execute(sql_by_name["navigation_state_schema"])
+        connection.execute(
+            "INSERT INTO navigation_state_schema VALUES (1, ?)",
+            ("navigation-attempts-transitional-v1",),
+        )
+        connection.execute(task_sql_transform(sql_by_name["navigation_tasks"]))
+        connection.execute(sql_by_name["navigation_task_steps"])
+        for name in _CORE_SCHEMA_OBJECTS[3:]:
+            connection.execute(sql_by_name[name])
 
 
 def _insert_plan_ledger_step(
@@ -682,6 +728,90 @@ def test_supported_generation_with_wrong_partial_index_requires_reset(
     assert after_schema == before_schema
     assert caught is not None
     assert caught.__class__.__name__ == "NavigationStateResetRequired"
+
+
+def test_supported_generation_with_altered_column_definition_requires_reset(
+    tmp_path: Path,
+):
+    db_path = tmp_path / "nullable-target.sqlite"
+    _create_supported_schema_variant(
+        tmp_path,
+        db_path,
+        task_sql_transform=lambda sql: sql.replace(
+            "target TEXT NOT NULL",
+            "target TEXT",
+        ),
+    )
+    with sqlite3.connect(db_path) as connection:
+        target = next(
+            row
+            for row in connection.execute("PRAGMA table_xinfo(navigation_tasks)")
+            if row[1] == "target"
+        )
+        before_schema = connection.execute(
+            "SELECT type, name, sql FROM sqlite_master ORDER BY type, name"
+        ).fetchall()
+    assert target[3] == 0
+    before_bytes = db_path.read_bytes()
+
+    with pytest.raises(NavigationStateResetRequired):
+        SqliteNavigationTaskStore(db_path)
+
+    assert db_path.read_bytes() == before_bytes
+    with sqlite3.connect(db_path) as connection:
+        after_schema = connection.execute(
+            "SELECT type, name, sql FROM sqlite_master ORDER BY type, name"
+        ).fetchall()
+    assert after_schema == before_schema
+
+
+def test_supported_generation_rejects_unexpected_unique_autoindex_without_mutation(
+    tmp_path: Path,
+):
+    db_path = tmp_path / "global-target-owner.sqlite"
+
+    def add_global_target_owner(sql: str) -> str:
+        prefix, closing = sql.rsplit(")", 1)
+        return f"{prefix}, UNIQUE (date, segments_key)){closing}"
+
+    _create_supported_schema_variant(
+        tmp_path,
+        db_path,
+        task_sql_transform=add_global_target_owner,
+    )
+    with sqlite3.connect(db_path) as connection:
+        indexes = connection.execute("PRAGMA index_list(navigation_tasks)").fetchall()
+        before_schema = connection.execute(
+            "SELECT type, name, sql FROM sqlite_master ORDER BY type, name"
+        ).fetchall()
+    assert any(row[3] == "u" for row in indexes)
+    before_bytes = db_path.read_bytes()
+
+    with pytest.raises(NavigationStateResetRequired):
+        SqliteNavigationTaskStore(db_path)
+
+    assert db_path.read_bytes() == before_bytes
+    with sqlite3.connect(db_path) as connection:
+        after_schema = connection.execute(
+            "SELECT type, name, sql FROM sqlite_master ORDER BY type, name"
+        ).fetchall()
+    assert after_schema == before_schema
+
+
+def test_corrupt_navigation_database_requires_reset_without_mutation(tmp_path: Path):
+    db_path = tmp_path / "corrupt-navigation.sqlite"
+    original = b"this is not a sqlite database\x00\xff"
+    db_path.write_bytes(original)
+
+    with pytest.raises(NavigationStateResetRequired) as caught:
+        SqliteNavigationTaskStore(db_path)
+
+    assert db_path.read_bytes() == original
+    assert isinstance(caught.value.__cause__, sqlite3.DatabaseError)
+    assert str(db_path) in str(caught.value)
+    assert "back up" in str(caught.value).lower()
+    assert "fresh" in str(caught.value).lower()
+    assert len(str(caught.value)) <= 1000
 
 
 def test_create_or_update_task_preserves_latest_web_session_when_omitted(tmp_path: Path):
