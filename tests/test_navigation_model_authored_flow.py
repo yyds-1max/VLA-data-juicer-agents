@@ -5,7 +5,6 @@ from types import SimpleNamespace
 from test_navigation_context_budget import (
     _call,
     _extract_plan,
-    _tool_map,
     _write_raw_metadata,
 )
 from vla_data_juicer_agents.navigation.config import NavigationSettings
@@ -26,6 +25,7 @@ def _entry(
     scene_mode=None,
     dry_run=True,
 ):
+    web_session_id = web_session_id or session_id
     return prepare_navigation_task_entry(
         task_store=services.task_store,
         observation_store=services.observation_store,
@@ -47,8 +47,7 @@ def _entry(
 
 
 def _tools(services, session_id, web_session_id=None):
-    if web_session_id is None:
-        return _tool_map(services, session_id)
+    web_session_id = web_session_id or session_id
     from vla_data_juicer_agents.navigation.agent_tools import resolve_navigation_agent_tools
 
     return {
@@ -63,13 +62,12 @@ def _tools(services, session_id, web_session_id=None):
 
 
 def _complete_required_inspections(services, session_id, web_session_id=None):
-    while True:
-        tools = _tools(services, session_id, web_session_id)
-        names = sorted(name for name in tools if name.startswith("inspect_navigation_"))
-        if not names:
-            return tools
-        for name in names:
-            assert _call(tools[name])["ok"] is True
+    tools = _tools(services, session_id, web_session_id)
+    names = sorted(name for name in tools if name.startswith("inspect_navigation_"))
+    assert names
+    for name in names:
+        assert _call(tools[name])["ok"] is True
+    return _tools(services, session_id, web_session_id)
 
 
 def _evidence_by_kind(services, task_id):
@@ -216,7 +214,8 @@ def test_existing_sync_and_scene_mode_select_finish_plan_without_extract_tools(t
 
     assert task.phase.value == "finish_processing"
     tools = _complete_required_inspections(services, "direct-flow")
-    assert "submit_extract_sync_plan_tool" not in tools
+    assert "submit_extract_sync_plan_tool" in tools
+    assert "submit_finish_processing_plan_tool" in tools
     context = _call(tools["get_navigation_task_context_tool"])
     result = _call(
         tools["submit_finish_processing_plan_tool"],
@@ -239,18 +238,17 @@ def test_completed_outputs_expose_no_processing_tools_and_deletion_reselects_fin
 
     assert completed.phase.value == "completed"
     names = set(_tools(services, "direct-flow"))
-    assert names == {
-        "get_navigation_task_state_tool",
-        "list_navigation_task_evidence_tool",
-        "read_navigation_task_evidence_tool",
-    }
+    assert "inspect_navigation_artifact_state_tool" in names
+    assert "submit_extract_sync_plan_tool" in names
+    assert "submit_finish_processing_plan_tool" in names
+    assert not any(name.endswith("_data_tool") for name in names)
 
     shutil.rmtree(settings.finish_data_root / DATE)
     resumed = _entry(services, scene_mode="out")
     assert resumed.phase.value == "finish_processing"
-    assert "submit_extract_sync_plan_tool" not in _complete_required_inspections(
-        services, "direct-flow"
-    )
+    planning = _complete_required_inspections(services, "direct-flow")
+    assert "submit_extract_sync_plan_tool" in planning
+    assert "submit_finish_processing_plan_tool" in planning
 
 
 def test_cleared_conversation_recovers_phase_plan_and_current_step_from_sqlite(tmp_path):

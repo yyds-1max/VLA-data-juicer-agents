@@ -606,7 +606,7 @@ def test_observation_must_match_bound_task_and_complete_required_kinds():
     }
 
 
-def test_plan_type_must_match_the_bound_task_phase():
+def test_submitted_plan_type_selects_stage_without_bound_task_phase():
     task = extract_task().model_copy(
         update={"phase": NavigationTaskPhase.FINISH_PROCESSING}
     )
@@ -620,14 +620,7 @@ def test_plan_type_must_match_the_bound_task_phase():
         capabilities=list_navigation_tool_capabilities(),
     )
 
-    assert report.errors == [
-        PlanValidationIssue(
-            path="task.phase",
-            code="task_phase_mismatch",
-            message="Plan type does not match the active task phase",
-            allowed_values=["finish_processing"],
-        )
-    ]
+    assert report.ok is True
 
 
 def test_errors_are_deduplicated_sorted_and_capped_at_eight_public_issues():

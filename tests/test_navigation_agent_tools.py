@@ -48,6 +48,25 @@ from vla_data_juicer_agents.runtime.agentscope_runtime import (
 )
 
 
+PLANNING_TOOL_NAMES = {
+    "inspect_navigation_raw_metadata_tool",
+    "inspect_navigation_sensor_candidates_tool",
+    "inspect_navigation_topic_candidates_tool",
+    "inspect_navigation_artifact_state_tool",
+    "inspect_navigation_gridmap_artifacts_tool",
+    "inspect_navigation_runtime_assets_tool",
+    "inspect_navigation_calibration_inventory_tool",
+    "inspect_navigation_localization_sources_tool",
+    "get_navigation_task_context_tool",
+    "list_observation_evidence_tool",
+    "read_observation_evidence_tool",
+    "describe_processing_action_tool",
+    "record_navigation_user_guidance_tool",
+    "submit_extract_sync_plan_tool",
+    "submit_finish_processing_plan_tool",
+}
+
+
 class FakeNavigationHandoffRuntime:
     def __init__(self) -> None:
         self.started: list[dict[str, str]] = []
@@ -456,7 +475,7 @@ def test_create_agentscope_runtime_wires_navigation_tools_factory(monkeypatch, t
         tool.name
         for tool in asyncio.run(factory("alice", config.navigation_agent_id, "session-1"))
     }
-    assert tool_names == {"get_or_create_navigation_task_tool"}
+    assert tool_names == set()
 
 
 def _resolver_services_from_complete(tmp_path, session_id="as-session-1"):
@@ -468,6 +487,8 @@ def _resolver_services_from_complete(tmp_path, session_id="as-session-1"):
     task_store = SqliteNavigationTaskStore(built.plan_store.db_path)
     task = task_store.update_task(
         built.task.task_id,
+        created_by_web_session_id=session_id,
+        latest_web_session_id=session_id,
         agentscope_session_id=session_id,
     )
     services = NavigationServices(
@@ -491,7 +512,7 @@ def test_navigation_services_share_one_database_and_idempotent_migrations(tmp_pa
     assert first.evidence_store.root == tmp_path / "navigation-evidence"
 
 
-def test_phase_resolver_uses_exact_session_and_exposes_only_current_submit_schema(tmp_path):
+def test_activity_resolver_uses_exact_session_and_exposes_both_submit_schemas(tmp_path):
     services, _task, _built = _resolver_services_from_complete(tmp_path)
 
     planning_names = {
@@ -499,6 +520,7 @@ def test_phase_resolver_uses_exact_session_and_exposes_only_current_submit_schem
         for tool in resolve_navigation_agent_tools(
             services=services,
             agentscope_session_id="as-session-1",
+            web_session_id="as-session-1",
             cancellation=None,
         )
     }
@@ -511,16 +533,9 @@ def test_phase_resolver_uses_exact_session_and_exposes_only_current_submit_schem
         )
     }
 
-    assert planning_names == {
-        "get_navigation_task_context_tool",
-        "list_observation_evidence_tool",
-        "read_observation_evidence_tool",
-        "describe_processing_action_tool",
-        "submit_extract_sync_plan_tool",
-    }
-    assert other_session_names == {"get_or_create_navigation_task_tool"}
+    assert planning_names == PLANNING_TOOL_NAMES
+    assert other_session_names == set()
     assert not any("draft" in name or "finalize" in name for name in planning_names)
-    assert "submit_finish_processing_plan_tool" not in planning_names
 
 
 def test_no_task_entry_requires_verified_web_agentscope_session_pair(tmp_path):
@@ -536,7 +551,7 @@ def test_no_task_entry_requires_verified_web_agentscope_session_pair(tmp_path):
     assert tools == []
 
 
-def test_cross_web_session_entry_cannot_rebind_existing_task_by_date(tmp_path):
+def test_cross_web_session_without_bound_attempt_exposes_no_task_mutation(tmp_path):
     services = build_navigation_services(tmp_path)
     services.task_store.create_or_update_task(
         date="20260710",
@@ -555,68 +570,8 @@ def test_cross_web_session_entry_cannot_rebind_existing_task_by_date(tmp_path):
         )
     }
 
-    result = _decode_tool_payload(
-        asyncio.run(tools["get_or_create_navigation_task_tool"](date="20260710"))
-    )
-
-    assert result["ok"] is False
-    assert result["error_type"] == "navigation_task_session_mismatch"
+    assert tools == {}
     assert services.task_store.find_latest_by_date("20260710").created_by_web_session_id == "web-a"
-
-
-def test_bound_task_tools_reject_foreign_task_and_stale_session_without_mutation(tmp_path):
-    services = build_navigation_services(tmp_path)
-    bound = services.task_store.create_or_update_task(
-        date="20260710",
-        segments=None,
-        scene_mode=None,
-        web_session_id="web-a",
-        agentscope_session_id="as-a",
-    )
-    foreign = services.task_store.create_or_update_task(
-        date="20260711",
-        segments=None,
-        scene_mode=None,
-        web_session_id="web-b",
-        agentscope_session_id="as-b",
-    )
-    before = services.task_store.get_task(foreign.task_id)
-    tools = {
-        tool.name: tool
-        for tool in build_navigation_task_tools(
-            store=services.task_store,
-            session_id="as-a",
-            web_session_id="web-a",
-            settings=services.settings,
-            bound_task=bound,
-        )
-    }
-
-    foreign_result = _decode_tool_payload(
-        asyncio.run(tools["reconcile_navigation_task_tool"](task_id=foreign.task_id))
-    )
-    stale_tools = {
-        tool.name: tool
-        for tool in build_navigation_task_tools(
-            store=services.task_store,
-            session_id="as-stale",
-            web_session_id="web-a",
-            settings=services.settings,
-            bound_task=bound,
-        )
-    }
-    stale_result = _decode_tool_payload(
-        asyncio.run(
-            stale_tools["update_navigation_task_scene_mode_tool"](
-                task_id=bound.task_id,
-                scene_mode="in",
-            )
-        )
-    )
-
-    assert foreign_result["error_type"] == "navigation_task_session_mismatch"
-    assert stale_result["error_type"] == "navigation_task_session_mismatch"
-    assert services.task_store.get_task(foreign.task_id) == before
 
 
 def test_navigation_services_initialize_phase_neutral_observation_schema_repeatedly(tmp_path):
@@ -697,7 +652,7 @@ def test_phase_bearing_observation_schema_requires_reset_without_copying_legacy_
     assert legacy_path.read_bytes() == legacy_before
 
 
-def test_phase_resolver_exposes_missing_inspections_without_submission_or_execution(tmp_path):
+def test_activity_resolver_exposes_all_planning_tools_before_facts_are_complete(tmp_path):
     data_root = tmp_path / "vla-data"
     (data_root / "raw_data" / "20260710" / "20260710_120000").mkdir(parents=True)
     services = build_navigation_services(
@@ -708,11 +663,12 @@ def test_phase_resolver_exposes_missing_inspections_without_submission_or_execut
         date="20260710",
         segments=["20260710_120000"],
         scene_mode=None,
+        web_session_id="as-session-1",
         agentscope_session_id="as-session-1",
     )
     services.task_store.update_task_for_session(
         created.task_id,
-        web_session_id=None,
+        web_session_id="as-session-1",
         agentscope_session_id="as-session-1",
         phase="extract_sync",
     )
@@ -722,21 +678,12 @@ def test_phase_resolver_exposes_missing_inspections_without_submission_or_execut
         for tool in resolve_navigation_agent_tools(
             services=services,
             agentscope_session_id="as-session-1",
+            web_session_id="as-session-1",
             cancellation=None,
         )
     }
 
-    assert names == {
-        "inspect_navigation_artifact_state_tool",
-        "inspect_navigation_raw_metadata_tool",
-        "inspect_navigation_sensor_candidates_tool",
-        "inspect_navigation_topic_candidates_tool",
-        "get_navigation_task_context_tool",
-        "list_observation_evidence_tool",
-        "read_observation_evidence_tool",
-        "describe_processing_action_tool",
-    }
-    assert not any(name.startswith("submit_") for name in names)
+    assert names == PLANNING_TOOL_NAMES
     assert not any(name in {"prepare_raw_data_tool", "extract_and_sync_navigation_data_tool"} for name in names)
 
 
@@ -748,7 +695,7 @@ def test_phase_resolver_recovers_active_plan_and_only_remaining_actions(tmp_path
         "extract_sync",
         4,
         plan,
-        expected_web_session_id=None,
+        expected_web_session_id="as-session-1",
         expected_agentscope_session_id="as-session-1",
     )
 
@@ -757,6 +704,7 @@ def test_phase_resolver_recovers_active_plan_and_only_remaining_actions(tmp_path
         for tool in resolve_navigation_agent_tools(
             services=services,
             agentscope_session_id="as-session-1",
+            web_session_id="as-session-1",
             cancellation=None,
         )
     }
@@ -771,63 +719,35 @@ def test_phase_resolver_recovers_active_plan_and_only_remaining_actions(tmp_path
     assert "request_human_decision" not in names
 
 
-def test_phase_resolver_fails_closed_when_child_commit_advances_read_revision(
-    tmp_path, monkeypatch
-):
+def test_activity_resolver_returns_failed_active_ledger_to_planning(tmp_path):
     services, task, built = _resolver_services_from_complete(tmp_path)
-    original_reconcile = agent_tools_module.reconcile_navigation_task
-
-    def reconcile_then_advance(stale_task, *, settings):
-        reconciled = original_reconcile(stale_task, settings=settings)
-        services.observation_store.append(
-            task.task_id,
-            "artifact_state",
-            [
-                ArtifactStateObservation(
-                    snapshot=NavigationArtifactSnapshot(
-                        date=task.date,
-                        segments=task.segments,
-                        raw_input_exists=True,
-                    )
-                )
-            ],
-            [],
-            services.evidence_store,
-            expected_web_session_id="web-owner",
-            expected_agentscope_session_id="web-owner__as",
-        )
-        return reconciled
-
-    with sqlite3.connect(services.task_store.db_path) as connection:
-        connection.execute(
-            """UPDATE navigation_tasks
-               SET created_by_web_session_id = ?, latest_web_session_id = ?,
-                   agentscope_session_id = ?
-               WHERE task_id = ?""",
-            ("web-owner", "web-owner", "web-owner__as", task.task_id),
-        )
-    bound = services.task_store.get_task(task.task_id)
-    assert bound is not None
-    assert bound.agentscope_session_id == "web-owner__as"
-    monkeypatch.setattr(agent_tools_module, "reconcile_navigation_task", reconcile_then_advance)
-    original_update = services.task_store.update_task_for_session
-    captured = {}
-
-    def capture_update(*args, **kwargs):
-        captured.update(kwargs)
-        return original_update(*args, **kwargs)
-
-    monkeypatch.setattr(services.task_store, "update_task_for_session", capture_update)
-
-    tools = resolve_navigation_agent_tools(
-        services=services,
-        agentscope_session_id="web-owner__as",
-        web_session_id="web-owner",
-        cancellation=None,
+    active = services.plan_store.activate(
+        task,
+        "extract_sync",
+        4,
+        ExtractSyncPlanInput.model_validate(valid_extract_plan_payload(built)),
+        expected_web_session_id="as-session-1",
+        expected_agentscope_session_id="as-session-1",
     )
+    first_step = active.plan.steps[0]
+    with sqlite3.connect(services.plan_store.db_path) as connection:
+        connection.execute(
+            """UPDATE navigation_task_steps SET status = 'failed'
+               WHERE plan_id = ? AND step_id = ?""",
+            (active.plan_id, first_step.step_id),
+        )
 
-    assert captured["expected_state_revision"] == bound.state_revision
-    assert tools == []
+    names = {
+        tool.name
+        for tool in resolve_navigation_agent_tools(
+            services=services,
+            agentscope_session_id="as-session-1",
+            web_session_id="as-session-1",
+            cancellation=None,
+        )
+    }
+
+    assert names == PLANNING_TOOL_NAMES
 
 
 def test_runtime_anchor_does_not_reconcile_or_append_observation(tmp_path, monkeypatch):
@@ -871,7 +791,7 @@ def test_runtime_anchor_derives_phase_from_active_plan(tmp_path):
         "extract_sync",
         4,
         ExtractSyncPlanInput.model_validate(valid_extract_plan_payload(built)),
-        expected_web_session_id=None,
+        expected_web_session_id="as-session-1",
         expected_agentscope_session_id="as-session-1",
     )
     with sqlite3.connect(services.task_store.db_path) as connection:
@@ -895,7 +815,7 @@ def test_runtime_anchor_derives_phase_from_active_plan(tmp_path):
     assert anchor["active_plan_id"] == active.plan_id
 
 
-def test_phase_resolver_completed_state_has_only_compact_state_and_evidence(tmp_path):
+def test_task_status_completed_without_active_plan_remains_in_planning_activity(tmp_path):
     services, task, _built = _resolver_services_from_complete(tmp_path)
     final_grid = (
         services.settings.finish_data_root
@@ -906,7 +826,7 @@ def test_phase_resolver_completed_state_has_only_compact_state_and_evidence(tmp_
     )
     final_grid.mkdir(parents=True)
     services.task_store.update_task_for_session(
-        task.task_id, web_session_id=None, agentscope_session_id="as-session-1",
+        task.task_id, web_session_id="as-session-1", agentscope_session_id="as-session-1",
         phase="completed", status="completed",
     )
 
@@ -915,18 +835,15 @@ def test_phase_resolver_completed_state_has_only_compact_state_and_evidence(tmp_
         for tool in resolve_navigation_agent_tools(
             services=services,
             agentscope_session_id="as-session-1",
+            web_session_id="as-session-1",
             cancellation=None,
         )
     }
 
-    assert names == {
-        "get_navigation_task_state_tool",
-        "list_navigation_task_evidence_tool",
-        "read_navigation_task_evidence_tool",
-    }
+    assert names == PLANNING_TOOL_NAMES
 
 
-def test_completed_evidence_list_is_explicitly_bounded_to_4000_chars(monkeypatch, tmp_path):
+def test_planning_evidence_list_is_explicitly_bounded_to_5500_chars(monkeypatch, tmp_path):
     services, task, _built = _resolver_services_from_complete(tmp_path)
     final_grid = (
         services.settings.finish_data_root
@@ -937,7 +854,7 @@ def test_completed_evidence_list_is_explicitly_bounded_to_4000_chars(monkeypatch
     )
     final_grid.mkdir(parents=True)
     services.task_store.update_task_for_session(
-        task.task_id, web_session_id=None, agentscope_session_id="as-session-1",
+        task.task_id, web_session_id="as-session-1", agentscope_session_id="as-session-1",
         phase="completed", status="completed",
     )
     rows = [
@@ -955,16 +872,16 @@ def test_completed_evidence_list_is_explicitly_bounded_to_4000_chars(monkeypatch
         for tool in resolve_navigation_agent_tools(
             services=services,
             agentscope_session_id="as-session-1",
-            web_session_id=None,
+                web_session_id="as-session-1",
             cancellation=None,
         )
     }
 
     result = _decode_tool_payload(
-        asyncio.run(tools["list_navigation_task_evidence_tool"](limit=20))
+        asyncio.run(tools["list_observation_evidence_tool"](limit=20))
     )
 
-    assert len(json.dumps(result, separators=(",", ":"))) <= 4000
+    assert len(json.dumps(result, separators=(",", ":"))) <= 5500
 
 
 def test_resolved_execution_reads_are_explicitly_bounded_to_4000_chars(tmp_path):
@@ -974,7 +891,7 @@ def test_resolved_execution_reads_are_explicitly_bounded_to_4000_chars(tmp_path)
         "extract_sync",
         4,
         ExtractSyncPlanInput.model_validate(valid_extract_plan_payload(built)),
-        expected_web_session_id=None,
+        expected_web_session_id="as-session-1",
         expected_agentscope_session_id="as-session-1",
     )
     tools = {
@@ -982,7 +899,7 @@ def test_resolved_execution_reads_are_explicitly_bounded_to_4000_chars(tmp_path)
         for tool in resolve_navigation_agent_tools(
             services=services,
             agentscope_session_id="as-session-1",
-            web_session_id=None,
+            web_session_id="as-session-1",
             cancellation=None,
         )
     }
@@ -996,3 +913,100 @@ def test_resolved_execution_reads_are_explicitly_bounded_to_4000_chars(tmp_path)
 
     assert len(json.dumps(overview, separators=(",", ":"))) <= 4000
     assert len(json.dumps(current, separators=(",", ":"))) <= 4000
+
+
+def test_activity_resolver_fresh_attempt_exposes_all_planning_tools_without_mutation(
+    tmp_path,
+):
+    services = build_navigation_services(tmp_path)
+    task = services.task_store.create_task_attempt(
+        request="process current navigation data",
+        target="20260710/20260710_120000",
+        date="20260710",
+        segments=["20260710_120000"],
+        scene_mode=None,
+        dry_run=False,
+        web_session_id="web-owner",
+        agentscope_session_id="web-owner__navigation-data-agent",
+    ).task
+    before = services.task_store.get_task(task.task_id)
+
+    names = {
+        tool.name
+        for tool in resolve_navigation_agent_tools(
+            services=services,
+            agentscope_session_id="web-owner__navigation-data-agent",
+            web_session_id="web-owner",
+            cancellation=None,
+        )
+    }
+
+    assert names == {
+        "inspect_navigation_raw_metadata_tool",
+        "inspect_navigation_sensor_candidates_tool",
+        "inspect_navigation_topic_candidates_tool",
+        "inspect_navigation_artifact_state_tool",
+        "inspect_navigation_gridmap_artifacts_tool",
+        "inspect_navigation_runtime_assets_tool",
+        "inspect_navigation_calibration_inventory_tool",
+        "inspect_navigation_localization_sources_tool",
+        "get_navigation_task_context_tool",
+        "list_observation_evidence_tool",
+        "read_observation_evidence_tool",
+        "describe_processing_action_tool",
+        "record_navigation_user_guidance_tool",
+        "submit_extract_sync_plan_tool",
+        "submit_finish_processing_plan_tool",
+    }
+    assert services.task_store.get_task(task.task_id) == before
+    assert services.observation_store.latest(task.task_id) is None
+
+
+def test_activity_resolver_without_bound_attempt_fails_closed(tmp_path):
+    services = build_navigation_services(tmp_path)
+
+    tools = resolve_navigation_agent_tools(
+        services=services,
+        agentscope_session_id="web-owner__navigation-data-agent",
+        web_session_id="web-owner",
+        cancellation=None,
+    )
+
+    assert tools == []
+
+
+def test_completed_extract_plan_returns_to_stage_neutral_planning_tools(tmp_path):
+    services, task, built = _resolver_services_from_complete(tmp_path)
+    active = services.plan_store.activate(
+        task,
+        "extract_sync",
+        4,
+        ExtractSyncPlanInput.model_validate(valid_extract_plan_payload(built)),
+        expected_web_session_id="as-session-1",
+        expected_agentscope_session_id="as-session-1",
+    )
+    with sqlite3.connect(services.plan_store.db_path) as connection:
+        connection.execute(
+            "UPDATE navigation_task_steps SET status = 'completed' WHERE plan_id = ?",
+            (active.plan_id,),
+        )
+        connection.execute(
+            "UPDATE navigation_plans SET status = 'completed' WHERE plan_id = ?",
+            (active.plan_id,),
+        )
+
+    names = {
+        tool.name
+        for tool in resolve_navigation_agent_tools(
+            services=services,
+            agentscope_session_id="as-session-1",
+            web_session_id="as-session-1",
+            cancellation=None,
+        )
+    }
+
+    assert "submit_extract_sync_plan_tool" in names
+    assert "submit_finish_processing_plan_tool" in names
+    assert "inspect_navigation_artifact_state_tool" in names
+    assert "get_plan_execution_overview_tool" not in names
+    assert "get_current_plan_step_tool" not in names

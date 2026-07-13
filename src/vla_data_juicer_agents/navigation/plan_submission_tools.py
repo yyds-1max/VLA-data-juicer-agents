@@ -90,21 +90,11 @@ def _structure_report(error: ValidationError) -> PlanValidationReport:
 def _context_report(
     *,
     task: NavigationTask,
-    phase: PlanPhase,
     observation: NavigationObservationRevision | None,
     submitted_revision: str,
     capability_revision: str,
 ) -> PlanValidationReport:
     issues: list[PlanValidationIssue] = []
-    if task.phase.value != phase:
-        issues.append(
-            PlanValidationIssue(
-                path="task.phase",
-                code="task_phase_mismatch",
-                message="Submission tool does not match the active task phase",
-                allowed_values=[task.phase.value],
-            )
-        )
     if observation is None:
         issues.append(
             PlanValidationIssue(
@@ -207,13 +197,7 @@ def build_navigation_plan_submission_tools(
     expected_web_session_id: str | None = None,
     expected_agentscope_session_id: str | None = None,
 ) -> list[FunctionTool]:
-    """Build the single complete-plan submission tool for the bound task phase."""
-    phase_value = task.phase.value
-    if phase_value not in {"extract_sync", "finish_processing"}:
-        raise ValueError(
-            f"task phase does not support plan submission: {phase_value}"
-        )
-    active_phase = cast(PlanPhase, phase_value)
+    """Build both strict complete-plan tools for a phase-neutral planning attempt."""
     capability_revision = _capability_revision(capabilities)
 
     # Evidence payloads remain external. Submission validates refs against the
@@ -231,7 +215,6 @@ def build_navigation_plan_submission_tools(
         observation = observation_store.latest(task.task_id)
         context_report = _context_report(
             task=task,
-            phase=phase,
             observation=observation,
             submitted_revision=planning_context_revision,
             capability_revision=capability_revision,
@@ -341,18 +324,18 @@ def build_navigation_plan_submission_tools(
             plan=plan,
         )
 
-    if active_phase == "extract_sync":
-        return [
-            FunctionTool(
-                submit_extract_sync_plan_tool,
-                name="submit_extract_sync_plan_tool",
-                is_concurrency_safe=False,
-            )
-        ]
-    return [
+    tools = [
+        FunctionTool(
+            submit_extract_sync_plan_tool,
+            name="submit_extract_sync_plan_tool",
+            is_concurrency_safe=False,
+        ),
         FunctionTool(
             submit_finish_processing_plan_tool,
             name="submit_finish_processing_plan_tool",
             is_concurrency_safe=False,
         )
     ]
+    for tool in tools:
+        tool.input_schema["additionalProperties"] = False
+    return tools

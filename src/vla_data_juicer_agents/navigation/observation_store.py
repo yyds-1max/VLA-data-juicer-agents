@@ -17,8 +17,13 @@ from vla_data_juicer_agents.navigation.observation_models import (
     NavigationObservationRevision,
     ObservationKind,
     ObservationPayload,
+    UserGuidanceObservation,
 )
-from vla_data_juicer_agents.navigation.task_store import authorize_navigation_task_write
+from vla_data_juicer_agents.navigation.task_state import utc_now
+from vla_data_juicer_agents.navigation.task_store import (
+    NavigationTaskStateRevisionError,
+    authorize_navigation_task_write,
+)
 
 
 _OBSERVATION_PAYLOAD_ADAPTER = TypeAdapter(ObservationPayload)
@@ -204,6 +209,152 @@ class SqliteNavigationObservationStore:
                 )
             connection.commit()
             return revision
+        except Exception as append_error:
+            connection.rollback()
+            cleanup_errors: list[Exception] = []
+            for descriptor in reversed(written_descriptors):
+                try:
+                    evidence_store.delete(task_id, descriptor.ref)
+                except Exception as cleanup_error:
+                    cleanup_errors.append(cleanup_error)
+            if cleanup_errors:
+                raise ObservationRollbackCleanupError(
+                    append_error,
+                    cleanup_errors,
+                ) from append_error
+            raise
+        finally:
+            connection.close()
+
+    def append_user_guidance(
+        self,
+        task_id: str,
+        *,
+        text: str,
+        scene_mode: str | None,
+        expected_state_revision: int,
+        evidence_store: NavigationEvidenceWriter,
+        expected_web_session_id: str,
+        expected_agentscope_session_id: str,
+    ) -> tuple[int, NavigationObservationRevision]:
+        """Advance guidance state and its evidence-bearing observation atomically."""
+        connection = self._connect()
+        written_descriptors: list[EvidenceDescriptor] = []
+        try:
+            connection.execute("BEGIN IMMEDIATE")
+            authorize_navigation_task_write(
+                connection,
+                task_id,
+                expected_web_session_id=expected_web_session_id,
+                expected_agentscope_session_id=expected_agentscope_session_id,
+            )
+            task_row = connection.execute(
+                """SELECT state_revision, guidance_revision
+                   FROM navigation_tasks WHERE task_id = ?""",
+                (task_id,),
+            ).fetchone()
+            if task_row is None:
+                raise KeyError(task_id)
+            if int(task_row["state_revision"]) != expected_state_revision:
+                raise NavigationTaskStateRevisionError(
+                    "navigation task state revision changed"
+                )
+            guidance_revision = int(task_row["guidance_revision"]) + 1
+            cursor = connection.execute(
+                """UPDATE navigation_tasks
+                   SET guidance_revision = ?,
+                       scene_mode = COALESCE(?, scene_mode),
+                       updated_at = ?, state_revision = state_revision + 1
+                   WHERE task_id = ? AND state_revision = ?""",
+                (
+                    guidance_revision,
+                    scene_mode,
+                    utc_now(),
+                    task_id,
+                    expected_state_revision,
+                ),
+            )
+            if cursor.rowcount != 1:
+                raise NavigationTaskStateRevisionError(
+                    "navigation task state revision changed"
+                )
+
+            payload = UserGuidanceObservation(
+                guidance_revision=guidance_revision,
+                text=text,
+            )
+            previous_row = connection.execute(
+                """SELECT revision_json
+                   FROM navigation_observation_revisions
+                   WHERE task_id = ?
+                   ORDER BY revision DESC LIMIT 1""",
+                (task_id,),
+            ).fetchone()
+            previous = (
+                NavigationObservationRevision.model_validate_json(
+                    previous_row["revision_json"]
+                )
+                if previous_row is not None
+                else None
+            )
+            revision_number = 1 if previous is None else previous.revision + 1
+            completed_kinds = (
+                list(previous.completed_kinds) if previous is not None else []
+            )
+            if "user_guidance" not in completed_kinds:
+                completed_kinds.append("user_guidance")
+            accumulated_payloads = self._merge_payloads(previous, [payload])
+            write = EvidenceWrite(
+                kind="user_guidance",
+                source_tool="record_navigation_user_guidance_tool",
+                payload=payload.model_dump(mode="json"),
+                summary=f"navigation user guidance revision {guidance_revision}",
+            )
+            descriptor = evidence_store.write(
+                task_id,
+                revision_number,
+                write.kind,
+                write.source_tool,
+                write.payload,
+                write.summary,
+            )
+            written_descriptors.append(descriptor)
+            revision = NavigationObservationRevision(
+                task_id=task_id,
+                revision=revision_number,
+                completed_kinds=completed_kinds,
+                payloads=accumulated_payloads,
+                evidence_refs=[descriptor.ref],
+            )
+            connection.execute(
+                """INSERT INTO navigation_observation_revisions (
+                       task_id, revision, revision_json, created_at
+                   ) VALUES (?, ?, ?, ?)""",
+                (
+                    task_id,
+                    revision_number,
+                    self._canonical_json(revision.model_dump(mode="json")),
+                    revision.created_at,
+                ),
+            )
+            connection.execute(
+                """INSERT INTO navigation_evidence (
+                       ref, task_id, observation_revision, kind, summary,
+                       byte_size, source_tool, created_at
+                   ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+                (
+                    descriptor.ref,
+                    descriptor.task_id,
+                    descriptor.observation_revision,
+                    descriptor.kind,
+                    descriptor.summary,
+                    descriptor.byte_size,
+                    descriptor.source_tool,
+                    descriptor.created_at,
+                ),
+            )
+            connection.commit()
+            return guidance_revision, revision
         except Exception as append_error:
             connection.rollback()
             cleanup_errors: list[Exception] = []

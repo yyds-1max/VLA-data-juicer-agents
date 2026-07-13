@@ -140,7 +140,8 @@ def build_services(tmp_path: Path, phase: str) -> Services:
         segments=["20260710_120000"],
         scene_mode="out" if phase == "finish_processing" else None,
     )
-    task = task_store.update_task(created.task_id, phase=phase)
+    task = task_store.get_task(created.task_id)
+    assert task is not None
     observation_store = SqliteNavigationObservationStore(db_path)
     evidence_store = FileNavigationEvidenceStore(tmp_path / "evidence")
     refs: dict[str, str] = {}
@@ -430,17 +431,26 @@ def _ledger_count(services: Services) -> int:
         ).fetchone()[0]
 
 
-def test_builder_exposes_only_active_phase_complete_typed_schema(tmp_path):
+def test_builder_exposes_both_phase_specific_complete_typed_schemas(tmp_path):
     services = build_services(tmp_path, "extract_sync")
 
-    assert set(services.tools) == {"submit_extract_sync_plan_tool"}
-    schema = services.tools["submit_extract_sync_plan_tool"].input_schema
-    assert set(schema["properties"]) == {"planning_context_revision", "plan"}
-    assert set(schema["required"]) == {"planning_context_revision", "plan"}
-    serialized = json.dumps(schema)
-    assert "ExtractSyncPlanInput" in serialized
-    assert "FinishProcessingPlanInput" not in serialized
-    assert "task_id" not in schema["properties"]
+    assert set(services.tools) == {
+        "submit_extract_sync_plan_tool",
+        "submit_finish_processing_plan_tool",
+    }
+    extract_schema = services.tools["submit_extract_sync_plan_tool"].input_schema
+    finish_schema = services.tools["submit_finish_processing_plan_tool"].input_schema
+    for schema in (extract_schema, finish_schema):
+        assert set(schema["properties"]) == {"planning_context_revision", "plan"}
+        assert set(schema["required"]) == {"planning_context_revision", "plan"}
+        assert schema["additionalProperties"] is False
+        assert "task_id" not in schema["properties"]
+    extract_serialized = json.dumps(extract_schema)
+    finish_serialized = json.dumps(finish_schema)
+    assert "ExtractSyncPlanInput" in extract_serialized
+    assert "FinishProcessingPlanInput" not in extract_serialized
+    assert "FinishProcessingPlanInput" in finish_serialized
+    assert "ExtractSyncPlanInput" not in finish_serialized
 
 
 def test_valid_extract_submission_returns_exact_six_field_success_contract(tmp_path):
@@ -456,6 +466,11 @@ def test_valid_extract_submission_returns_exact_six_field_success_contract(tmp_p
     assert result["next_action"] == "prepare_raw_data"
     assert "workflow_plan_json" not in result
     assert len(json.dumps(result, ensure_ascii=False, separators=(",", ":"))) <= 4_000
+    stored_task = SqliteNavigationTaskStore(services.plan_store.db_path).get_task(
+        services.task.task_id
+    )
+    assert stored_task is not None
+    assert stored_task.accepted_plan_phase == NavigationTaskPhase.EXTRACT_SYNC
 
 
 def test_valid_finish_plan_does_not_require_nested_topic_params_copy(tmp_path):
@@ -467,6 +482,11 @@ def test_valid_finish_plan_does_not_require_nested_topic_params_copy(tmp_path):
     assert result["ok"] is True
     assert "workflow_plan_json" not in result
     assert "topic_params" not in json.dumps(result)
+    stored_task = SqliteNavigationTaskStore(services.plan_store.db_path).get_task(
+        services.task.task_id
+    )
+    assert stored_task is not None
+    assert stored_task.accepted_plan_phase == NavigationTaskPhase.FINISH_PROCESSING
 
 
 def test_invalid_complete_submission_never_creates_partial_state(tmp_path):
@@ -482,6 +502,11 @@ def test_invalid_complete_submission_never_creates_partial_state(tmp_path):
     assert "draft" not in result and "schema" not in result
     assert services.plan_store.get_active(services.task.task_id, "finish_processing") is None
     assert _ledger_count(services) == 0
+    stored_task = SqliteNavigationTaskStore(services.plan_store.db_path).get_task(
+        services.task.task_id
+    )
+    assert stored_task is not None
+    assert stored_task.accepted_plan_phase is None
     rows = _audit_rows(services)
     assert len(rows) == 1
     assert json.loads(rows[0][0]) == payload

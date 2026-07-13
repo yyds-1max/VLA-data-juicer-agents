@@ -316,7 +316,7 @@ def test_finish_inventory_tools_report_only_measured_candidates(tmp_path):
     }
 
 
-def test_cognitive_tools_bind_task_paginate_evidence_and_describe_active_action(tmp_path):
+def test_cognitive_tools_bind_task_paginate_evidence_and_describe_requested_action(tmp_path):
     tools, _, _ = _tools(tmp_path)
     inspected = _invoke_tool(tools["inspect_navigation_raw_metadata_tool"], {})
     _invoke_tool(tools["inspect_navigation_sensor_candidates_tool"], {})
@@ -343,9 +343,27 @@ def test_cognitive_tools_bind_task_paginate_evidence_and_describe_active_action(
     assert second_page["evidence"][0]["observation_revision"] == 2
     assert second_page["next_cursor"] is None
     assert read == {"data": {"date": "20270605"}, "next_cursor": None}
-    assert described["tool_name"] == "prepare_raw_data"
-    assert described["phase"] == "extract_sync"
-    assert described["executor_agent_allowed"] is True
+    assert described["action_id"] == "prepare_raw_data"
+    assert set(described) == {
+        "action_id",
+        "variants",
+        "parameter_contract",
+        "preconditions",
+        "constraints",
+    }
+    assert described["variants"] == [{"id": "default"}]
+    assert described["parameter_contract"]["additionalProperties"] is False
+    assert set(described["constraints"]) == {
+        "human_blocking",
+        "locks_navigation_target",
+        "supports_dry_run",
+    }
+
+    finish_action = _invoke_tool(
+        tools["describe_processing_action_tool"],
+        {"action_id": "run_tracking"},
+    )
+    assert finish_action["action_id"] == "run_tracking"
 
 
 def test_read_observation_evidence_default_ref_pages_by_character_budget(tmp_path):

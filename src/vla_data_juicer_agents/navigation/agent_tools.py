@@ -1,4 +1,4 @@
-"""Durable phase-aware AgentScope tools for navigation processing."""
+"""Activity-driven AgentScope tools for one bound navigation attempt."""
 
 from __future__ import annotations
 
@@ -10,14 +10,11 @@ from agentscope.tool import FunctionTool, ToolBase
 
 from vla_data_juicer_agents.core.cancellation import CancellationContext
 from vla_data_juicer_agents.navigation.catalog import list_navigation_tool_capabilities
-from vla_data_juicer_agents.navigation.context_budget import ensure_payload_within_limit, serialized_chars
+from vla_data_juicer_agents.navigation.context_budget import ensure_payload_within_limit
 from vla_data_juicer_agents.navigation.observation_tools import build_navigation_observation_tools
 from vla_data_juicer_agents.navigation.plan_execution import build_plan_bound_execution_tools
 from vla_data_juicer_agents.navigation.plan_submission_tools import build_navigation_plan_submission_tools
-from vla_data_juicer_agents.navigation.planning_context import PHASE_REQUIRED_OBSERVATIONS
 from vla_data_juicer_agents.navigation.services import NavigationServices
-from vla_data_juicer_agents.navigation.task_reconciliation import reconcile_navigation_task
-from vla_data_juicer_agents.navigation.task_store import NavigationTaskStateRevisionError
 from vla_data_juicer_agents.navigation.task_tools import build_navigation_task_tools
 
 
@@ -87,66 +84,6 @@ def _trust(tools: list[Any]) -> list[Any]:
     return [tool if getattr(tool, "is_external_tool", False) else _TrustedNavigationTool(tool) for tool in tools]
 
 
-_INSPECTION_TOOL_BY_KIND = {
-    "raw_metadata": "inspect_navigation_raw_metadata_tool",
-    "sensor_candidates": "inspect_navigation_sensor_candidates_tool",
-    "topic_candidates": "inspect_navigation_topic_candidates_tool",
-    "artifact_state": "inspect_navigation_artifact_state_tool",
-    "gridmap_artifacts": "inspect_navigation_gridmap_artifacts_tool",
-    "runtime_assets": "inspect_navigation_runtime_assets_tool",
-    "calibration_inventory": "inspect_navigation_calibration_inventory_tool",
-    "localization_sources": "inspect_navigation_localization_sources_tool",
-}
-_COGNITIVE_TOOL_NAMES = {
-    "get_navigation_task_context_tool", "list_observation_evidence_tool",
-    "read_observation_evidence_tool", "describe_processing_action_tool",
-}
-
-
-def _compact_task_tools(*, services: NavigationServices, agentscope_session_id: str, web_session_id: str | None) -> list[ToolBase]:
-    tools = build_navigation_task_tools(
-        store=services.task_store,
-        session_id=agentscope_session_id,
-        web_session_id=web_session_id,
-        settings=services.settings,
-    )
-    return [tool for tool in tools if tool.name == "get_or_create_navigation_task_tool"]
-
-
-def _durable_state_tools(*, services: NavigationServices, task: Any) -> list[ToolBase]:
-    def get_navigation_task_state_tool() -> dict[str, Any]:
-        current = services.task_store.get_task(task.task_id)
-        if current is None:
-            return {"ok": False, "error_type": "navigation_task_not_found"}
-        return {"ok": True, "task_id": current.task_id, "phase": current.phase.value, "status": current.status.value}
-
-    def list_navigation_task_evidence_tool(cursor: int = 0, limit: int = 20) -> dict[str, Any]:
-        if limit < 1 or limit > 50:
-            raise ValueError("limit must be between 1 and 50")
-        rows = services.observation_store.list_evidence(task.task_id, cursor=cursor, limit=limit + 1)
-        result: dict[str, Any] = {"evidence": [], "next_cursor": None}
-        for row in rows[:limit]:
-            evidence = [*result["evidence"], row.model_dump(mode="json")]
-            candidate = {"evidence": evidence, "next_cursor": cursor + len(evidence) if len(rows) > len(evidence) else None}
-            if serialized_chars(candidate) > 4_000:
-                break
-            result = candidate
-        return ensure_payload_within_limit(result, max_chars=4_000, label="completed_navigation_evidence_list")
-
-    def read_navigation_task_evidence_tool(ref: str, fields: list[str] | None = None, cursor: int = 0, limit: int = 50) -> dict[str, Any]:
-        return ensure_payload_within_limit(
-            services.evidence_store.read(task.task_id, ref, fields=fields, cursor=cursor, limit=limit, max_chars=4_000),
-            max_chars=4_000,
-            label="completed_navigation_evidence_read",
-        )
-
-    return [
-        FunctionTool(get_navigation_task_state_tool, is_read_only=True),
-        FunctionTool(list_navigation_task_evidence_tool, is_read_only=True),
-        FunctionTool(read_navigation_task_evidence_tool, is_read_only=True),
-    ]
-
-
 def _execution_state_tools(*, services: NavigationServices, plan: Any) -> list[ToolBase]:
     def get_plan_execution_overview_tool(plan_id: str) -> dict[str, Any]:
         if plan_id != plan.plan_id:
@@ -173,45 +110,23 @@ def resolve_navigation_agent_tools(
     cancellation: CancellationContext | None,
     web_session_id: str | None = None,
 ) -> list[ToolBase]:
-    if web_session_id is not None and not (
+    if web_session_id is None or not (
         agentscope_session_id == web_session_id or agentscope_session_id.startswith(f"{web_session_id}__")
     ):
         return []
-    task = services.task_store.find_latest_by_agentscope_session(agentscope_session_id)
+    task = services.task_store.find_by_session(
+        web_session_id=web_session_id,
+        agentscope_session_id=agentscope_session_id,
+    )
     if task is None:
-        return _trust(_compact_task_tools(services=services, agentscope_session_id=agentscope_session_id, web_session_id=web_session_id))
-
-    reconciled = reconcile_navigation_task(task, settings=services.settings)
-    changes = reconciled.model_dump(mode="json")
-    for field in ("task_id", "created_by_web_session_id", "latest_web_session_id", "agentscope_session_id", "created_at", "updated_at", "state_revision"):
-        changes.pop(field, None)
-    try:
-        task = services.task_store.update_task_for_session(
-            task.task_id,
-            web_session_id=web_session_id,
-            agentscope_session_id=agentscope_session_id,
-            expected_state_revision=task.state_revision,
-            **changes,
-        )
-    except (PermissionError, NavigationTaskStateRevisionError):
+        return []
+    if (
+        task.created_by_web_session_id != web_session_id
+        or task.latest_web_session_id != web_session_id
+        or task.agentscope_session_id != agentscope_session_id
+    ):
         return []
 
-    if task.phase.value == "completed" or task.status.value == "completed":
-        return _trust(_durable_state_tools(services=services, task=task))
-    if task.phase.value not in PHASE_REQUIRED_OBSERVATIONS:
-        task_tools = build_navigation_task_tools(
-            store=services.task_store,
-            session_id=agentscope_session_id,
-            web_session_id=web_session_id,
-            settings=services.settings,
-            bound_task=task,
-        )
-        allowed = {"get_or_create_navigation_task_tool", "reconcile_navigation_task_tool", "update_navigation_task_scene_mode_tool"}
-        return _trust([tool for tool in task_tools if tool.name in allowed])
-
-    observation = services.observation_store.latest(task.task_id)
-    completed = set(observation.completed_kinds) if observation is not None else set()
-    missing = [kind for kind in PHASE_REQUIRED_OBSERVATIONS[task.phase.value] if kind not in completed]
     observation_tools = build_navigation_observation_tools(
         task=task,
         observation_store=services.observation_store,
@@ -220,9 +135,19 @@ def resolve_navigation_agent_tools(
         expected_web_session_id=web_session_id,
         expected_agentscope_session_id=agentscope_session_id,
     )
-    cognitive = [tool for tool in observation_tools if tool.name in _COGNITIVE_TOOL_NAMES]
-    active_plan = services.plan_store.get_active(task.task_id, task.phase.value)
-    if active_plan is not None:
+    active_plan = services.plan_store.get_active_for_task(task.task_id)
+    current = (
+        services.plan_store.get_current_step(active_plan.plan_id)
+        if active_plan is not None
+        else None
+    )
+    current_status = ((current or {}).get("step") or {}).get("status")
+    if active_plan is not None and current_status in {
+        "pending",
+        "running",
+        "waiting_user",
+    }:
+        execution_state = _execution_state_tools(services=services, plan=active_plan)
         execution = build_plan_bound_execution_tools(
             task=task,
             plan_store=services.plan_store,
@@ -233,16 +158,22 @@ def resolve_navigation_agent_tools(
             web_session_id=web_session_id,
             agentscope_session_id=agentscope_session_id,
         )
-        current = services.plan_store.get_current_step(active_plan.plan_id)
         step = (current or {}).get("step") or {}
         if step.get("action") == "confirm_navigation_calibration_params":
             handoff = services.plan_store.get_human_decision_handoff(active_plan.plan_id, step.get("step_id", ""))
             if handoff is not None and handoff.status == "recovery_required":
-                execution = [tool for tool in execution if tool.name != "request_human_decision"]
-        return _trust([*_execution_state_tools(services=services, plan=active_plan), *execution])
-    if missing:
-        names = {_INSPECTION_TOOL_BY_KIND[kind] for kind in missing}
-        return _trust([*[tool for tool in observation_tools if tool.name in names], *cognitive])
+                return _trust(execution_state)
+        return _trust([*execution_state, *execution])
+
+    guidance = build_navigation_task_tools(
+        store=services.task_store,
+        observation_store=services.observation_store,
+        evidence_store=services.evidence_store,
+        session_id=agentscope_session_id,
+        web_session_id=web_session_id,
+        settings=services.settings,
+        bound_task=task,
+    )
     submission = build_navigation_plan_submission_tools(
         task=task,
         observation_store=services.observation_store,
@@ -252,4 +183,4 @@ def resolve_navigation_agent_tools(
         expected_web_session_id=web_session_id,
         expected_agentscope_session_id=agentscope_session_id,
     )
-    return _trust([*cognitive, *submission])
+    return _trust([*observation_tools, *guidance, *submission])

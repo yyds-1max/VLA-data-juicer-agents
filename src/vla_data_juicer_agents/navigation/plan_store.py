@@ -460,17 +460,9 @@ class SqliteNavigationPlanRepository:
             ).fetchone()
             plan_revision = int(revision_row["latest_revision"]) + 1
             timestamp = utc_now()
-            active_row = connection.execute(
-                """
-                SELECT plan_id FROM navigation_plans
-                WHERE task_id = ? AND phase = ? AND status = 'active'
-                """,
-                (task.task_id, phase_value),
-            ).fetchone()
-            if self._task_phase_has_in_flight_work(
+            if self._task_has_in_flight_work(
                 connection,
                 task.task_id,
-                phase_value,
             ):
                 raise ActivePlanExecutionConflict(
                     "cannot supersede an active navigation plan with running, "
@@ -480,9 +472,9 @@ class SqliteNavigationPlanRepository:
                 """
                 UPDATE navigation_plans
                 SET status = 'superseded', updated_at = ?
-                WHERE task_id = ? AND phase = ? AND status = 'active'
+                WHERE task_id = ? AND status = 'active'
                 """,
-                (timestamp, task.task_id, phase_value),
+                (timestamp, task.task_id),
             )
             record = NavigationPlanRecord(
                 plan_id=f"nav_plan_{uuid4().hex}",
@@ -518,6 +510,15 @@ class SqliteNavigationPlanRepository:
                 ),
             )
             self._insert_ledger_rows(connection, record)
+            cursor = connection.execute(
+                """UPDATE navigation_tasks
+                   SET accepted_plan_phase = ?, updated_at = ?,
+                       state_revision = state_revision + 1
+                   WHERE task_id = ?""",
+                (phase_value, timestamp, task.task_id),
+            )
+            if cursor.rowcount != 1:
+                raise KeyError(task.task_id)
             connection.commit()
             return record
         except Exception:
@@ -560,10 +561,9 @@ class SqliteNavigationPlanRepository:
         return handoff is not None
 
     @staticmethod
-    def _task_phase_has_in_flight_work(
+    def _task_has_in_flight_work(
         connection: sqlite3.Connection,
         task_id: str,
-        phase: str,
     ) -> bool:
         row = connection.execute(
             """
@@ -575,7 +575,7 @@ class SqliteNavigationPlanRepository:
               ON outbox.plan_id = plans.plan_id
             LEFT JOIN navigation_human_decision_handoffs AS handoffs
               ON handoffs.plan_id = plans.plan_id
-            WHERE plans.task_id = ? AND plans.phase = ?
+            WHERE plans.task_id = ?
               AND (
                 steps.status IN ('running', 'waiting_user')
                 OR outbox.plan_id IS NOT NULL
@@ -583,7 +583,7 @@ class SqliteNavigationPlanRepository:
               )
             LIMIT 1
             """,
-            (task_id, phase),
+            (task_id,),
         ).fetchone()
         return row is not None
 
@@ -600,6 +600,20 @@ class SqliteNavigationPlanRepository:
                 WHERE task_id = ? AND phase = ? AND status = 'active'
                 """,
                 (task_id, phase_value),
+            ).fetchone()
+        return self._record_from_row(row) if row is not None else None
+
+    def get_active_for_task(self, task_id: str) -> NavigationPlanRecord | None:
+        """Return only the plan selected by the task's durable accepted phase."""
+        with self._connect() as connection:
+            row = connection.execute(
+                """SELECT plans.*
+                   FROM navigation_tasks AS tasks
+                   JOIN navigation_plans AS plans
+                     ON plans.task_id = tasks.task_id
+                    AND plans.phase = tasks.accepted_plan_phase
+                   WHERE tasks.task_id = ? AND plans.status = 'active'""",
+                (task_id,),
             ).fetchone()
         return self._record_from_row(row) if row is not None else None
 

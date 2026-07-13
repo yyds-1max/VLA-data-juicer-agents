@@ -48,7 +48,7 @@ class NavigationTaskContext(StrictModel):
     evidence_next_cursor: int | None = None
 
 
-PHASE_REQUIRED_OBSERVATIONS: dict[str, tuple[ObservationKind, ...]] = {
+PLAN_REQUIRED_OBSERVATIONS: dict[str, tuple[ObservationKind, ...]] = {
     "extract_sync": (
         "artifact_state",
         "raw_metadata",

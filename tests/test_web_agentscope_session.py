@@ -1204,7 +1204,7 @@ def test_runtime_anchor_does_not_expose_legacy_phase_without_active_plan(
 
 
 @pytest.mark.asyncio
-async def test_runtime_registers_navigation_task_tools_for_navigation_agent(tmp_path):
+async def test_runtime_exposes_no_navigation_mutations_before_attempt_creation(tmp_path):
     runtime = _runtime(workspace_root=tmp_path)
     await runtime.ensure_bootstrapped()
 
@@ -1219,8 +1219,7 @@ async def test_runtime_registers_navigation_task_tools_for_navigation_agent(tmp_
     )
     names = {tool.name for tool in tools}
 
-    assert "get_or_create_navigation_task_tool" in names
-    assert names == {"get_or_create_navigation_task_tool"}
+    assert names == set()
 
 
 @pytest.mark.asyncio

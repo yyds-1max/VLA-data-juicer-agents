@@ -8,6 +8,7 @@ from pydantic import ValidationError
 
 from vla_data_juicer_agents.navigation.plan_models import (
     ExtractSyncPlanInput,
+    FinishProcessingPlanInput,
     PlanSubmissionAttempt,
 )
 from vla_data_juicer_agents.navigation.plan_store import SqliteNavigationPlanRepository
@@ -74,6 +75,44 @@ def valid_extract_plan(*, decision_ref: str = "sensor_bindings") -> ExtractSyncP
                     "failure_policy": "stop",
                     "decision_refs": [decision_ref],
                 },
+            ],
+        }
+    )
+
+
+def valid_finish_plan() -> FinishProcessingPlanInput:
+    return FinishProcessingPlanInput.model_validate(
+        {
+            "decisions": {
+                "localization": {
+                    "source": "odom",
+                    "conversion": "odom_to_ins",
+                    "reason": "Observed odometry.",
+                    "evidence_refs": ["evidence:localization"],
+                },
+                "gridmap": {
+                    "source": "existing_gridmap",
+                    "reason": "Observed gridmap.",
+                    "evidence_refs": ["evidence:gridmap"],
+                },
+                "calibration": {
+                    "mode": "hardcoded_with_user_confirmation",
+                    "selected_sensor_source": "fisheye_front",
+                    "requires_user_confirmation": True,
+                    "reason": "Observed calibration source.",
+                    "evidence_refs": ["evidence:calibration"],
+                },
+            },
+            "steps": [
+                {
+                    "step_id": "confirm",
+                    "action": "confirm_navigation_calibration_params",
+                    "variant": "default",
+                    "arguments": {},
+                    "depends_on": [],
+                    "failure_policy": "stop",
+                    "decision_refs": ["calibration"],
+                }
             ],
         }
     )
@@ -460,6 +499,7 @@ def test_step_transition_fails_closed_when_web_owner_rebinds_after_authorization
 
 def test_activate_plan_and_ledger_is_atomic(tmp_path: Path):
     repo, task = stores_with_task(tmp_path)
+    before = SqliteNavigationTaskStore(repo.db_path).get_task(task.task_id)
 
     record = repo.activate(task, "extract_sync", 3, valid_extract_plan())
 
@@ -467,6 +507,10 @@ def test_activate_plan_and_ledger_is_atomic(tmp_path: Path):
     assert [
         step.step_id for step in repo.get_execution_overview(record.plan_id).steps
     ] == ["prepare", "sync"]
+    after = SqliteNavigationTaskStore(repo.db_path).get_task(task.task_id)
+    assert before is not None and after is not None
+    assert after.accepted_plan_phase.value == "extract_sync"
+    assert after.state_revision > before.state_revision
 
 
 def test_failed_activation_does_not_supersede_active_plan(
@@ -494,6 +538,23 @@ def test_failed_activation_does_not_supersede_active_plan(
         ).fetchall()
     assert plans == [(first.plan_id, "active")]
     assert steps == [(first.plan_id, "prepare"), (first.plan_id, "sync")]
+
+
+def test_failed_first_activation_does_not_record_selected_phase(tmp_path: Path, monkeypatch):
+    repo, task = stores_with_task(tmp_path)
+    monkeypatch.setattr(
+        repo,
+        "_insert_ledger_rows",
+        lambda *args: (_ for _ in ()).throw(sqlite3.IntegrityError()),
+    )
+
+    with pytest.raises(sqlite3.IntegrityError):
+        repo.activate(task, "extract_sync", 1, valid_extract_plan())
+
+    stored = SqliteNavigationTaskStore(repo.db_path).get_task(task.task_id)
+    assert stored is not None
+    assert stored.accepted_plan_phase is None
+    assert repo.get_active(task.task_id, "extract_sync") is None
 
 
 def test_record_attempt_is_audit_only_and_preserves_full_failure(tmp_path: Path):
@@ -556,6 +617,21 @@ def test_activation_creates_immutable_revisions_and_supersedes_previous(tmp_path
     assert repo.get_active(task.task_id, "extract_sync").plan_id == second.plan_id
     assert after_first.state_revision > task.state_revision
     assert after_second.state_revision > after_first.state_revision
+
+
+def test_cross_phase_activation_replaces_the_whole_active_plan_atomically(tmp_path: Path):
+    repo, task = stores_with_task(tmp_path)
+    extract = repo.activate(task, "extract_sync", 1, valid_extract_plan())
+
+    finish = repo.activate(task, "finish_processing", 2, valid_finish_plan())
+
+    assert repo.get(extract.plan_id).status == "superseded"
+    assert repo.get(finish.plan_id).status == "active"
+    assert repo.get_active(task.task_id, "extract_sync") is None
+    assert repo.get_active_for_task(task.task_id).plan_id == finish.plan_id
+    stored = SqliteNavigationTaskStore(repo.db_path).get_task(task.task_id)
+    assert stored is not None
+    assert stored.accepted_plan_phase.value == "finish_processing"
 
 
 @pytest.mark.parametrize("in_flight_status", ["running", "waiting_user"])

@@ -26,7 +26,7 @@ from vla_data_juicer_agents.navigation.plan_models import (
     PlanValidationIssue,
     PlanValidationReport,
 )
-from vla_data_juicer_agents.navigation.planning_context import PHASE_REQUIRED_OBSERVATIONS
+from vla_data_juicer_agents.navigation.planning_context import PLAN_REQUIRED_OBSERVATIONS
 from vla_data_juicer_agents.navigation.task_state import NavigationTask
 
 MAX_PUBLIC_PLAN_VALIDATION_ISSUES = 8
@@ -756,16 +756,7 @@ def validate_navigation_plan(
             ]
         )
 
-    # Stage 1: bound task, phase, and observation completeness.
-    if task.phase.value != phase:
-        errors.append(
-            _plan_issue(
-                "task.phase",
-                "task_phase_mismatch",
-                "Plan type does not match the active task phase",
-                [task.phase.value],
-            )
-        )
+    # Stage 1: bound task and submitted-plan-specific observation completeness.
     if observation.task_id != task.task_id:
         errors.append(
             _plan_issue(
@@ -774,7 +765,7 @@ def validate_navigation_plan(
                 "Observation belongs to another task",
             )
         )
-    required = PHASE_REQUIRED_OBSERVATIONS[phase]
+    required = PLAN_REQUIRED_OBSERVATIONS[phase]
     missing = [kind for kind in required if kind not in observation.completed_kinds]
     if missing:
         errors.append(

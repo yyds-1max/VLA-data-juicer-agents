@@ -33,6 +33,7 @@ def _tool_map(services, session_id):
         for tool in resolve_navigation_agent_tools(
             services=services,
             agentscope_session_id=session_id,
+            web_session_id=session_id,
             cancellation=None,
         )
     }
@@ -153,14 +154,19 @@ def test_representative_model_authored_transcript_stays_bounded_without_compacti
         task = services.task_store.find_latest_by_agentscope_session(session_id)
         observation = services.observation_store.latest(task.task_id) if task else None
         plan = (
-            services.plan_store.get_active(task.task_id, task.phase.value)
-            if task and task.phase.value in {"extract_sync", "finish_processing"}
+            services.plan_store.get_active(
+                task.task_id,
+                task.accepted_plan_phase.value,
+            )
+            if task
+            and task.accepted_plan_phase is not None
+            and task.accepted_plan_phase.value in {"extract_sync", "finish_processing"}
             else None
         )
         current = services.plan_store.get_current_step(plan.plan_id) if plan else None
         return {
             "task_id": task.task_id if task else None,
-            "phase": task.phase.value if task else None,
+            "phase": plan.phase if plan else None,
             "task_status": task.status.value if task else None,
             "observation_revision": observation.revision if observation else None,
             "active_plan_id": plan.plan_id if plan else None,
@@ -243,22 +249,22 @@ def test_representative_model_authored_transcript_stays_bounded_without_compacti
             f"{current_invocation}:after:{kind}:{result_counts[count_key]}"
         )
 
-    entry_tools = start_invocation("entry", "Process the selected navigation dataset.")
-    entry = _call(
-        entry_tools["get_or_create_navigation_task_tool"],
+    entered_task = services.task_store.create_task_attempt(
+        request="Process the selected navigation dataset.",
+        target=f"{date}/{segment}",
         date=date,
         segments=[segment],
         scene_mode=None,
+        dry_run=True,
+        web_session_id=session_id,
+        agentscope_session_id=session_id,
+    ).task
+    entry_tools = start_invocation("entry", "Process the selected navigation dataset.")
+    entry = _call(
+        entry_tools["record_navigation_user_guidance_tool"],
+        text="Process the selected navigation dataset.",
     )
     record("entry", entry, 4_000)
-    entered_task = services.task_store.get_task(entry["task"]["task_id"])
-    services.task_store.update_task_for_session(
-        entered_task.task_id,
-        web_session_id=None,
-        agentscope_session_id=session_id,
-        expected_state_revision=entered_task.state_revision,
-        dry_run=True,
-    )
 
     inspection_tools = start_invocation(
         "inspection",
@@ -297,7 +303,7 @@ def test_representative_model_authored_transcript_stays_bounded_without_compacti
     evidence_by_kind = {
         row.kind: row.ref
         for row in services.observation_store.list_evidence(
-            entry["task"]["task_id"],
+            entered_task.task_id,
             limit=50,
         )
     }

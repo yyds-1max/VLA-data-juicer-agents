@@ -392,11 +392,6 @@ class AgentScopeRuntime:
             }
         observation = services.observation_store.latest(task.task_id)
         phase_hint = task.accepted_plan_phase
-        if phase_hint is None and task.phase.value in {
-            "extract_sync",
-            "finish_processing",
-        }:
-            phase_hint = task.phase
         plan = (
             services.plan_store.get_active(task.task_id, phase_hint.value)
             if phase_hint is not None

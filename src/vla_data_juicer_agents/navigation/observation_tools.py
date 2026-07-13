@@ -44,6 +44,10 @@ from vla_data_juicer_agents.navigation.observation_projection import (
 from vla_data_juicer_agents.navigation.observation_store import (
     SqliteNavigationObservationStore,
 )
+from vla_data_juicer_agents.navigation.plan_models import (
+    EmptyArguments,
+    ExtractSyncArguments,
+)
 from vla_data_juicer_agents.navigation.planning_context import (
     build_navigation_task_context,
 )
@@ -377,16 +381,41 @@ def build_navigation_observation_tools(
         )
 
     def describe_processing_action(action_id: str) -> dict[str, Any]:
-        """Describe one executor action available in the bound task's active phase."""
+        """Describe only the requested executor action without choosing a stage."""
+        argument_models = {
+            "EmptyArguments": EmptyArguments,
+            "ExtractSyncArguments": ExtractSyncArguments,
+        }
         for capability in list_navigation_tool_capabilities():
             if (
                 capability.tool_name == action_id
-                and capability.phase == task.phase.value
                 and capability.executor_agent_allowed
                 and any(variant.status == "available" for variant in capability.variants)
             ):
-                return capability.model_dump(mode="json")
-        raise KeyError(f"action is not available in active phase: {action_id}")
+                variants = [
+                    variant
+                    for variant in capability.variants
+                    if variant.status == "available"
+                ]
+                argument_model = argument_models.get(capability.argument_model or "")
+                if argument_model is None:
+                    raise KeyError(f"action parameter contract is unavailable: {action_id}")
+                return {
+                    "action_id": capability.tool_name,
+                    "variants": [{"id": variant.id} for variant in variants],
+                    "parameter_contract": argument_model.model_json_schema(),
+                    "preconditions": {
+                        variant.id: variant.selectors
+                        for variant in variants
+                        if variant.selectors
+                    },
+                    "constraints": {
+                        "human_blocking": capability.human_blocking,
+                        "locks_navigation_target": capability.locks_navigation_target,
+                        "supports_dry_run": capability.supports_dry_run,
+                    },
+                }
+        raise KeyError(f"processing action is unavailable: {action_id}")
 
     return [
         _make_tool(bounded_inspection(inspect_navigation_raw_metadata), "inspect_navigation_raw_metadata_tool"),

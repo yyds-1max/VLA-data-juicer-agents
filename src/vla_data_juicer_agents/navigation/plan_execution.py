@@ -968,10 +968,7 @@ def build_plan_bound_execution_tools(
 ) -> list[ToolBase]:
     """Expose only distinct actions remaining in the task's active immutable plan."""
     _ = dry_run  # The durable task is the canonical dry-run authority.
-    phase = task.phase.value
-    if phase not in {"extract_sync", "finish_processing"}:
-        return []
-    active = plan_store.get_active(task.task_id, phase)
+    active = plan_store.get_active_for_task(task.task_id)
     if active is None:
         return []
     overview = plan_store.get_execution_overview(active.plan_id)
