@@ -635,11 +635,13 @@ The main router prompt contains only routing policy:
 - report a compact truthful failure for `ok: false`; never claim the task started
   and never use shell/file tools to work around a failed handoff
 
-`start_navigation_data_task` is terminal for the router turn. After it is invoked,
-the Web runtime renders the authoritative user-facing outcome from the structured
-tool result and does not accept a post-tool free-text success claim from the model.
-This prevents the exact observed failure where the model received an error ToolResult
-and then stated that the task had started.
+`start_navigation_data_task` is terminal for the router turn. After its ToolResult
+is durable, a router-only AgentScope reply middleware ends the reasoning/acting loop,
+so the router cannot call another tool or generate another model response in that
+turn. The Web runtime renders the authoritative user-facing outcome from the
+structured tool result and defensively ignores any post-tool free text. This
+prevents the exact observed failure where the model received an error ToolResult and
+then stated that the task had started.
 
 The handoff tool itself returns a stable contract:
 
@@ -657,6 +659,10 @@ or:
   "message": "This target currently has a running data-processing action."
 }
 ```
+
+`dry_run` is not part of the router/model-facing handoff schema. Production defaults
+to real execution (`dry_run=false`); tests and operators may select dry-run only
+through trusted runtime or direct-CLI configuration.
 
 ### NavigationDataAgent Prompt
 
@@ -770,8 +776,9 @@ and auditable side-effect execution. It is not a cross-session dataset state mac
 Persist for one task attempt:
 
 - request target, selected segments, Web/AgentScope session ids, and timestamps
-- compact lifecycle status for diagnostics (`active`, `waiting_user`, `completed`,
-  `failed`, `cancelled`, or `superseded`)
+- compact lifecycle status for diagnostics (`active`, `waiting_user`,
+  `needs_replan`, `completed`, `failed`, `cancelled`, or `superseded`);
+  `needs_replan` is an execution-recovery condition, never product evidence
 - observations/evidence produced by tools the model actually called
 - immutable accepted Plan revisions and validation attempts
 - execution ledger, staged results/outbox, human-decision handoffs, and resource-lock
