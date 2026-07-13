@@ -1,6 +1,7 @@
 import asyncio
 import copy
 import json
+from dataclasses import dataclass
 
 from vla_data_juicer_agents.navigation.agent_tools import resolve_navigation_agent_tools
 from vla_data_juicer_agents.navigation.config import NavigationSettings
@@ -116,38 +117,39 @@ def _extract_plan(evidence_by_kind):
     }
 
 
+@dataclass(frozen=True)
+class TurnMeasurement:
+    name: str
+    retained_history_chars: int
+    current_schema_chars: int
+    current_context_chars: int
+    estimated_tokens: int
+
+
 def test_representative_model_authored_transcript_stays_bounded_without_compaction(tmp_path):
+    # This models four real AgentScope invocations. The runtime refreshes extra
+    # tools only at an invocation boundary, appends one durable anchor to that
+    # invocation's new user message, and retains that message and tool results.
+    # Tool schemas belong only to the current invocation and never enter history.
     date, segment, session_id = "20260710", "20260710_120000", "direct-budget"
+    token_limit = 83_885
     data_root = tmp_path / "VLADatasets"
     _write_raw_metadata(data_root, date, segment)
     services = build_navigation_services(
         tmp_path,
         NavigationSettings(vladatasets_root=data_root),
     )
-    transcript = []
-    peak_application_chars = len(navigation_agent_prompt())
+    system_chars = len(navigation_agent_prompt())
+    retained_history: list[str] = []
+    transcript: list[tuple[str, str]] = []
+    turn_measurements: list[TurnMeasurement] = []
+    compact_events: list[dict[str, int | str]] = []
+    external_invocations: list[str] = []
+    result_counts: dict[tuple[str, str], int] = {}
+    current_invocation = ""
+    current_schema_chars = 0
 
-    def record(kind, payload, hard_max):
-        nonlocal peak_application_chars
-        encoded = json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
-        assert len(encoded) <= hard_max
-        assert "schema_snapshot" not in encoded
-        assert "data_profile_draft" not in encoded
-        assert "validation_history" not in encoded
-        transcript.append((kind, encoded))
-        peak_application_chars += len(encoded)
-
-    def resolve_and_record_schemas():
-        nonlocal peak_application_chars
-        resolved = _tool_map(services, session_id)
-        encoded = json.dumps(
-            [getattr(tool, "input_schema", {}) for tool in resolved.values()],
-            ensure_ascii=False,
-            separators=(",", ":"),
-        )
-        assert "schema_snapshot" not in encoded
-        assert "data_profile_draft" not in encoded
-        peak_application_chars += len(encoded)
+    def current_anchor():
         task = services.task_store.find_latest_by_agentscope_session(session_id)
         observation = services.observation_store.latest(task.task_id) if task else None
         plan = (
@@ -156,7 +158,7 @@ def test_representative_model_authored_transcript_stays_bounded_without_compacti
             else None
         )
         current = services.plan_store.get_current_step(plan.plan_id) if plan else None
-        anchor = {
+        return {
             "task_id": task.task_id if task else None,
             "phase": task.phase.value if task else None,
             "task_status": task.status.value if task else None,
@@ -165,14 +167,85 @@ def test_representative_model_authored_transcript_stays_bounded_without_compacti
             "active_plan_revision": plan.plan_revision if plan else None,
             "current_step_id": current["step"]["step_id"] if current else None,
         }
-        peak_application_chars += len(
-            json.dumps(anchor, ensure_ascii=False, separators=(",", ":"))
-        )
-        return resolved
 
-    tools = resolve_and_record_schemas()
+    def measure_model_call(label):
+        retained_chars = sum(len(message) for message in retained_history)
+        context_chars = system_chars + retained_chars + current_schema_chars
+        estimated_tokens = (context_chars + 3) // 4
+        measurement = TurnMeasurement(
+            name=label,
+            retained_history_chars=retained_chars,
+            current_schema_chars=current_schema_chars,
+            current_context_chars=context_chars,
+            estimated_tokens=estimated_tokens,
+        )
+        turn_measurements.append(measurement)
+        if estimated_tokens >= token_limit:
+            compact_events.append(
+                {"turn": label, "estimated_tokens": estimated_tokens}
+            )
+
+    def start_invocation(name, user_text):
+        nonlocal current_invocation, current_schema_chars
+        tools = _tool_map(services, session_id)
+        user_message = json.dumps(
+            {
+                "role": "user",
+                "content": user_text,
+                "durable_navigation_state": current_anchor(),
+            },
+            ensure_ascii=False,
+            separators=(",", ":"),
+        )
+        retained_history.append(user_message)
+        schema_payload = [
+            {
+                "name": tool.name,
+                "description": getattr(tool, "description", ""),
+                "input_schema": getattr(tool, "input_schema", {}),
+            }
+            for tool in tools.values()
+        ]
+        encoded_schemas = json.dumps(
+            schema_payload,
+            ensure_ascii=False,
+            separators=(",", ":"),
+        )
+        assert "schema_snapshot" not in encoded_schemas
+        assert "data_profile_draft" not in encoded_schemas
+        external_invocations.append(name)
+        current_invocation = name
+        current_schema_chars = len(encoded_schemas)
+        measure_model_call(f"{name}:start")
+        return tools
+
+    def record(kind, payload, hard_max):
+        encoded_payload = json.dumps(
+            payload,
+            ensure_ascii=False,
+            separators=(",", ":"),
+        )
+        assert len(encoded_payload) <= hard_max
+        assert "schema_snapshot" not in encoded_payload
+        assert "data_profile_draft" not in encoded_payload
+        assert "validation_history" not in encoded_payload
+        transcript.append((kind, encoded_payload))
+        retained_history.append(
+            json.dumps(
+                {"role": "tool", "name": kind, "content": payload},
+                ensure_ascii=False,
+                separators=(",", ":"),
+            )
+        )
+        count_key = (current_invocation, kind)
+        result_counts[count_key] = result_counts.get(count_key, 0) + 1
+        measure_model_call(
+            f"{current_invocation}:after:{kind}:{result_counts[count_key]}"
+        )
+
+    entry_tools = start_invocation("entry", "Process the selected navigation dataset.")
     entry = _call(
-        tools["get_or_create_navigation_task_tool"],
+        entry_tools["get_or_create_navigation_task_tool"],
         date=date,
         segments=[segment],
         scene_mode=None,
@@ -187,66 +260,103 @@ def test_representative_model_authored_transcript_stays_bounded_without_compacti
         dry_run=True,
     )
 
-    while True:
-        tools = resolve_and_record_schemas()
-        inspection_names = sorted(name for name in tools if name.startswith("inspect_navigation_"))
-        if not inspection_names:
-            break
-        for name in inspection_names:
-            record("inspection", _call(tools[name]), 4_000)
+    inspection_tools = start_invocation(
+        "inspection",
+        "Continue from durable state and record every required factual observation.",
+    )
+    inspection_names = sorted(
+        name
+        for name in inspection_tools
+        if name.startswith("inspect_navigation_")
+    )
+    assert inspection_names
+    for name in inspection_names:
+        record("inspection", _call(inspection_tools[name]), 4_000)
 
-    tools = resolve_and_record_schemas()
-    context = _call(tools["get_phase_planning_context_tool"])
+    planning_tools = start_invocation(
+        "planning",
+        "Use the completed facts to submit one complete extract-sync plan.",
+    )
+    context = _call(planning_tools["get_phase_planning_context_tool"])
     record("planning_context", context, 5_500)
-    evidence_list = _call(tools["list_observation_evidence_tool"], limit=20)
+    evidence_list = _call(
+        planning_tools["list_observation_evidence_tool"],
+        limit=20,
+    )
     record("evidence_list", evidence_list, 5_500)
     first_ref = evidence_list["evidence"][0]["ref"]
     record(
         "evidence_detail",
-        _call(tools["read_observation_evidence_tool"], ref=first_ref, limit=10),
+        _call(
+            planning_tools["read_observation_evidence_tool"],
+            ref=first_ref,
+            limit=10,
+        ),
         5_500,
     )
     evidence_by_kind = {
-        row.kind: row.ref for row in services.observation_store.list_evidence(entry["task"]["task_id"], limit=50)
+        row.kind: row.ref
+        for row in services.observation_store.list_evidence(
+            entry["task"]["task_id"],
+            limit=50,
+        )
     }
     valid_plan = _extract_plan(evidence_by_kind)
     invalid_plan = copy.deepcopy(valid_plan)
-    invalid_plan["decisions"]["time_sync"]["reference_sensor"] = "unobserved_sensor"
+    invalid_plan["decisions"]["time_sync"]["reference_sensor"] = (
+        "unobserved_sensor"
+    )
     submit_name = "submit_extract_sync_plan_tool"
     invalid = _call(
-        tools[submit_name],
+        planning_tools[submit_name],
         planning_context_revision=context["planning_context_revision"],
         plan=invalid_plan,
     )
     assert invalid["ok"] is False
     record("submit_failure", invalid, 3_000)
     success = _call(
-        tools[submit_name],
+        planning_tools[submit_name],
         planning_context_revision=context["planning_context_revision"],
         plan=valid_plan,
     )
     assert success["ok"] is True
     record("submit_success", success, 2_000)
 
-    while True:
-        tools = resolve_and_record_schemas()
-        plan = services.plan_store.get(success["plan_id"])
+    execution_tools = start_invocation(
+        "execution",
+        "Execute every remaining stored plan step in order.",
+    )
+    while services.plan_store.get(success["plan_id"]).status == "active":
         current = services.plan_store.get_current_step(success["plan_id"])
-        if current is None or plan.status != "active":
-            break
         record(
             "execution_overview",
-            _call(tools["get_plan_execution_overview_tool"], plan_id=success["plan_id"]),
+            _call(
+                execution_tools["get_plan_execution_overview_tool"],
+                plan_id=success["plan_id"],
+            ),
             4_000,
         )
         step = current["step"]
         result = _call(
-            tools[f"{step['action']}_tool"],
+            execution_tools[f"{step['action']}_tool"],
             plan_id=success["plan_id"],
             step_id=step["step_id"],
         )
         record("processing_result", result, 4_000)
 
-    estimated_tokens = (peak_application_chars + 3) // 4
-    assert estimated_tokens < 83_885
-    assert all(kind != "compact" for kind, _ in transcript)
+    peak = max(turn_measurements, key=lambda turn: turn.estimated_tokens)
+    metrics = {
+        "invocations": external_invocations,
+        "measurement_labels": [turn.name for turn in turn_measurements],
+        "peak_turn": peak.name,
+        "peak_estimated_tokens": peak.estimated_tokens,
+        "compact_events": compact_events,
+    }
+    assert metrics["invocations"] == ["entry", "inspection", "planning", "execution"]
+    assert any(":after:" in turn.name for turn in turn_measurements)
+    assert ":after:" in metrics["peak_turn"]
+    assert metrics["peak_estimated_tokens"] == max(
+        turn.estimated_tokens for turn in turn_measurements
+    )
+    assert metrics["peak_estimated_tokens"] < token_limit
+    assert metrics["compact_events"] == []
