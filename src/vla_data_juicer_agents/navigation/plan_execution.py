@@ -866,6 +866,16 @@ def prepare_plan_human_decision(
         return gate_error
     assert durable_task is not None and plan is not None and step is not None
     assert snapshot is not None
+    if (
+        snapshot.handoff is not None
+        and snapshot.handoff.status == "recovery_required"
+    ):
+        return _compact_error(
+            "human_handoff_recovery_required",
+            "The human-decision handoff requires controlled recovery before "
+            "another request may be authorized.",
+            next_action="quarantine_human_decision_handoff",
+        )
     current = snapshot.current
     waiting_user = current is not None and current["step"]["status"] == "waiting_user"
     precondition_failure = verify_plan_step_preconditions(

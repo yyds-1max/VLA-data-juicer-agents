@@ -3,7 +3,7 @@
 ## Status
 
 Implementation complete. The original implementation passed independent review,
-then an external audit found three Important follow-up gaps. All three now have
+then external audits found four Important follow-up gaps. All four now have
 RED/GREEN regression coverage and are fixed at the repository/execution boundary.
 
 ## RED evidence
@@ -35,12 +35,13 @@ test_human_decision_permission_fails_closed_when_sensor_input_disappears
 AssertionError: assert 'allow' == 'deny'
 ```
 
-The external-audit follow-up RED runs then reproduced all three gaps:
+The external-audit follow-up RED runs then reproduced all four gaps:
 
 ```text
 current-attempt barrier race: old A wrapper returned ok=True after B became current
 gridmap input drift: 4 failed (all variants still returned ok=True)
 waiting_user retry drift: retry returned None/allow after sensor source deletion
+captured recovery retry: existing recovery_required handoff still returned allow
 ```
 
 ## Implemented behavior
@@ -80,6 +81,9 @@ waiting_user retry drift: retry returned None/allow after sensor source deletion
   `recovery_required -> quarantine -> needs_replan` protocol. A recovery-only
   request anchor is created only when no decision handoff exists; no-drift retries
   remain allowed.
+- Deny captured human-decision tools immediately after the authoritative gate when
+  the snapshot already has a `recovery_required` handoff. This bounded read-only
+  denial runs before precondition checks, evidence writes, or `waiting_user` allow.
 - Kept extract-sync completion on an active attempt. Finish-processing completes
   the attempt only after every ledger step is complete and the terminal completed
   step is `validate_navigation_outputs`.
@@ -109,20 +113,22 @@ Tests cover:
   current attempt between precondition verification and claim;
 - all canonical gridmap variants, including missing PCD runtime;
 - waiting-user permission retry with and without input drift, including controlled
-  quarantine and replan.
+  quarantine and replan;
+- a captured human-decision tool retry against an existing recovery handoff,
+  including byte-identical database/evidence and logically identical durable state.
 
 ## Verification
 
 Focused Task 5 suite after the external-audit fixes:
 
 ```text
-106 passed in 1.34s
+110 passed in 1.53s
 ```
 
 Complete Python suite:
 
 ```text
-773 passed, 1 warning in 9.17s
+774 passed, 1 warning in 9.26s
 ```
 
 The warning is the pre-existing Starlette `httpx` deprecation warning.
@@ -152,6 +158,12 @@ current-attempt claim TOCTOU, incomplete gridmap preconditions, and fail-open
 `waiting_user` permission retries. Each finding was independently reproduced
 before implementation and is covered by the follow-up tests above. A final
 read-only review of those fixes is recorded with the handoff.
+
+A subsequent review found one remaining Important authorization gap: a captured
+request tool could allow a no-drift retry even when its authoritative snapshot
+already contained a `recovery_required` handoff. It also noted the stale focused
+and full-suite counts as one Minor report issue. The authorization gap was
+reproduced before the fix, and this report now records the fresh actual counts.
 
 ## Concerns
 

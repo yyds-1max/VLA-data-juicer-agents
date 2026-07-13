@@ -997,6 +997,126 @@ def test_waiting_human_decision_retry_without_drift_remains_allowed(tmp_path):
     assert plan_store.get_human_decision_handoff(plan.plan_id, "confirm") is None
 
 
+def test_captured_human_decision_tool_denies_existing_recovery_without_mutation(
+    monkeypatch,
+    tmp_path,
+):
+    settings = NavigationSettings(
+        vladatasets_root=tmp_path / "datasets",
+        processing_root=tmp_path / "processing",
+    )
+    source = "NoobScenes/params/observed/sensors"
+    (settings.processing_root / source).mkdir(parents=True)
+    db_path = tmp_path / "navigation.sqlite"
+    task_store = SqliteNavigationTaskStore(db_path)
+    task = task_store.create_or_update_task(
+        date="20260710",
+        segments=["segment-a"],
+        scene_mode="out",
+        dry_run=True,
+    )
+    task = task_store.update_task(
+        task.task_id,
+        phase="finish_processing",
+        status="pending",
+    )
+    evidence_store = FileNavigationEvidenceStore(tmp_path / "evidence")
+    observation = SqliteNavigationObservationStore(db_path).append(
+        task.task_id,
+        "calibration_inventory",
+        [CalibrationInventoryObservation(sensor_sources=[source])],
+        [],
+        evidence_store,
+        expected_web_session_id=None,
+        expected_agentscope_session_id=None,
+    )
+    plan_store = SqliteNavigationPlanRepository(db_path)
+    plan = plan_store.activate(
+        task,
+        "finish_processing",
+        observation.revision,
+        finish_plan(source),
+    )
+    outcomes = []
+    original_prepare = plan_execution.prepare_plan_human_decision
+
+    def capture_prepare(**kwargs):
+        outcome = original_prepare(**kwargs)
+        outcomes.append(outcome)
+        return outcome
+
+    monkeypatch.setattr(plan_execution, "prepare_plan_human_decision", capture_prepare)
+    request_tool = next(
+        tool
+        for tool in plan_execution.build_plan_bound_execution_tools(
+            task=task,
+            plan_store=plan_store,
+            evidence_store=evidence_store,
+            settings=settings,
+            dry_run=True,
+            cancellation=None,
+        )
+        if tool.name == "request_human_decision"
+    )
+    first_permission = asyncio.run(
+        request_tool.check_permissions(
+            {"plan_id": plan.plan_id, "step_id": "confirm"},
+            None,
+        )
+    )
+    assert first_permission.behavior.value == "allow"
+    assert plan_store.mark_human_decision_recovery_required(
+        plan.plan_id,
+        "confirm",
+        reason_code="delivery_lease_expired",
+        request_anchor={
+            "plan_id": plan.plan_id,
+            "request_state": "waiting_user",
+            "step_id": "confirm",
+        },
+    )
+    handoff_before = plan_store.get_human_decision_handoff(
+        plan.plan_id,
+        "confirm",
+    ).model_dump(mode="json")
+    ledger_before = plan_store.get_current_step(plan.plan_id)
+    plan_before = plan_store.get(plan.plan_id).model_dump(mode="json")
+    task_before = task_store.get_task(task.task_id).model_dump(mode="json")
+    db_before = db_path.read_bytes()
+    evidence_before = {
+        str(path.relative_to(evidence_store.root)): path.read_bytes()
+        for path in evidence_store.root.rglob("*")
+        if path.is_file()
+    }
+
+    retry_permission = asyncio.run(
+        request_tool.check_permissions(
+            {"plan_id": plan.plan_id, "step_id": "confirm"},
+            None,
+        )
+    )
+    denied = outcomes[-1]
+
+    assert retry_permission.behavior.value == "deny"
+    assert denied is not None
+    assert denied["error_type"] == "human_handoff_recovery_required"
+    assert denied["next_action"] == "quarantine_human_decision_handoff"
+    assert len(json.dumps(denied, ensure_ascii=False)) <= 4000
+    assert db_path.read_bytes() == db_before
+    assert plan_store.get_human_decision_handoff(
+        plan.plan_id,
+        "confirm",
+    ).model_dump(mode="json") == handoff_before
+    assert plan_store.get_current_step(plan.plan_id) == ledger_before
+    assert plan_store.get(plan.plan_id).model_dump(mode="json") == plan_before
+    assert task_store.get_task(task.task_id).model_dump(mode="json") == task_before
+    assert {
+        str(path.relative_to(evidence_store.root)): path.read_bytes()
+        for path in evidence_store.root.rglob("*")
+        if path.is_file()
+    } == evidence_before
+
+
 def test_stale_agentscope_session_cannot_claim_plan_bound_step(monkeypatch, tmp_path):
     services = build_services(tmp_path)
     bound = services.task_store.update_task(
