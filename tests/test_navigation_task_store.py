@@ -7,12 +7,67 @@ from pathlib import Path
 import pytest
 
 import vla_data_juicer_agents.navigation.task_store as task_store_module
+from vla_data_juicer_agents.navigation.plan_store import (
+    SqliteNavigationPlanRepository,
+)
 from vla_data_juicer_agents.navigation.task_state import (
     TASK_SCHEMA_VERSION,
     NavigationTaskPhase,
     NavigationTaskStatus,
 )
 from vla_data_juicer_agents.navigation.task_store import SqliteNavigationTaskStore
+
+
+def _insert_plan_ledger_step(
+    db_path: Path,
+    *,
+    task_id: str,
+    ledger_action: str,
+    plan_action: str | None = None,
+    status: str = "running",
+) -> tuple[str, str]:
+    SqliteNavigationPlanRepository(db_path)
+    plan_id = f"plan-{task_id}"
+    step_id = "step-1"
+    plan_payload = {
+        "steps": [
+            {
+                "step_id": step_id,
+                "action": plan_action or ledger_action,
+            }
+        ]
+    }
+    with sqlite3.connect(db_path) as connection:
+        connection.execute(
+            """INSERT INTO navigation_plans (
+                   plan_id, task_id, phase, plan_revision, contract_version,
+                   observation_revision, plan_json, validation_summary_json,
+                   status, invalidation_reason, created_at, updated_at
+               ) VALUES (?, ?, 'extract_sync', 1, 'test', 1, ?, '{}',
+                         'active', NULL, ?, ?)""",
+            (
+                plan_id,
+                task_id,
+                json.dumps(plan_payload),
+                "2026-07-08T00:00:00.000+00:00",
+                "2026-07-08T00:00:00.000+00:00",
+            ),
+        )
+        connection.execute(
+            """INSERT INTO navigation_task_steps (
+                   id, task_id, phase, step_id, tool_name, status,
+                   plan_id, plan_revision, sequence
+               ) VALUES (?, ?, 'extract_sync', ?, ?, ?, ?, 1, 1)""",
+            (
+                f"ledger-{task_id}",
+                task_id,
+                step_id,
+                ledger_action,
+                status,
+                plan_id,
+            ),
+        )
+    return plan_id, step_id
 
 
 def test_task_store_exposes_only_cas_compensation_mutators(tmp_path: Path):
@@ -74,78 +129,264 @@ def test_task_store_creates_and_loads_navigation_task(tmp_path: Path):
     assert loaded.schema_version == TASK_SCHEMA_VERSION
 
 
-def test_task_store_updates_existing_date_and_segments(tmp_path: Path):
-    store = SqliteNavigationTaskStore(tmp_path / "navigation_tasks.sqlite")
-    first = store.create_or_update_task(date="20270623", segments=None, scene_mode=None)
-
-    second = store.create_or_update_task(
+def test_new_web_sessions_create_distinct_attempts_for_same_target(tmp_path: Path):
+    store = SqliteNavigationTaskStore(tmp_path / "tasks.sqlite")
+    first = store.create_task_attempt(
+        request="处理数据",
+        target="20270623",
         date="20270623",
-        segments=None,
-        scene_mode="out",
-        web_session_id="web-1",
+        segments=["20260623_145550"],
+        scene_mode=None,
+        dry_run=False,
+        web_session_id="web-a",
+        agentscope_session_id="as-a",
+    )
+    second = store.create_task_attempt(
+        request="继续处理",
+        target="20270623",
+        date="20270623",
+        segments=["20260623_145550"],
+        scene_mode=None,
+        dry_run=False,
+        web_session_id="web-b",
+        agentscope_session_id="as-b",
     )
 
-    assert second.task_id == first.task_id
-    assert second.scene_mode == "out"
-    assert second.latest_web_session_id == "web-1"
-    assert store.find_latest_by_date("20270623").task_id == first.task_id
+    assert first.created is True
+    assert second.created is True
+    assert first.task.request == "处理数据"
+    assert first.task.target == "20270623"
+    assert first.task.status.value == "active"
+    assert first.task.accepted_plan_phase is None
+    assert first.task_id != second.task_id
+    found = store.find_by_session(
+        web_session_id="web-b", agentscope_session_id="as-b"
+    )
+    assert found is not None
+    assert found.task_id == second.task_id
 
 
-def test_task_claim_rejects_cross_web_owner_without_any_mutation(tmp_path: Path):
-    store = SqliteNavigationTaskStore(tmp_path / "navigation_tasks.sqlite")
-    owned = store.create_or_update_task(
+def test_foreign_session_cannot_mutate_an_attempt(tmp_path: Path):
+    store = SqliteNavigationTaskStore(tmp_path / "tasks.sqlite")
+    task = store.create_task_attempt(
+        request="处理数据",
+        target="20270623",
         date="20270623",
         segments=None,
         scene_mode=None,
         dry_run=False,
-        web_session_id="web-owner",
-        agentscope_session_id="as-owner",
+        web_session_id="web-a",
+        agentscope_session_id="as-a",
     )
 
     with pytest.raises(task_store_module.NavigationTaskOwnershipError):
-        store.create_or_update_task(
-            date="20270623",
-            segments=None,
-            scene_mode="out",
-            dry_run=True,
-            web_session_id="web-foreign",
-            agentscope_session_id="as-foreign",
+        store.update_task_for_session(
+            task.task_id,
+            web_session_id="web-b",
+            agentscope_session_id="as-b",
+            status="completed",
         )
 
-    assert store.get_task(owned.task_id) == owned
+
+def test_exact_attempt_replay_returns_existing_attempt(tmp_path: Path):
+    store = SqliteNavigationTaskStore(tmp_path / "tasks.sqlite")
+    arguments = {
+        "request": "处理数据",
+        "target": "20270623",
+        "date": "20270623",
+        "segments": ["segment-b", "segment-a"],
+        "scene_mode": None,
+        "dry_run": False,
+        "web_session_id": "web-a",
+        "agentscope_session_id": "as-a",
+    }
+
+    first = store.create_task_attempt(**arguments)
+    replay = store.create_task_attempt(
+        **{
+            **arguments,
+            "request": "这次重放不应覆盖原请求",
+            "segments": ["segment-a", "segment-b"],
+        }
+    )
+
+    assert first.created is True
+    assert replay.created is False
+    assert replay.task_id == first.task_id
+    assert replay.task.request == "处理数据"
 
 
-def test_concurrent_task_claim_has_one_creator_and_never_rebinds_loser(tmp_path: Path):
-    db_path = tmp_path / "navigation_tasks.sqlite"
+def test_concurrent_exact_attempt_replay_creates_one_row(tmp_path: Path):
+    db_path = tmp_path / "tasks.sqlite"
     SqliteNavigationTaskStore(db_path)
     barrier = Barrier(2)
 
-    def claim(web_session_id: str):
+    def create_attempt(request: str):
         store = SqliteNavigationTaskStore(db_path)
         barrier.wait()
-        try:
-            task = store.create_or_update_task(
-                date="20270623",
-                segments=["segment-a"],
-                scene_mode=None,
-                web_session_id=web_session_id,
-                agentscope_session_id=f"as-{web_session_id}",
-            )
-            return ("won", task.created_by_web_session_id)
-        except task_store_module.NavigationTaskOwnershipError:
-            return ("lost", web_session_id)
+        return store.create_task_attempt(
+            request=request,
+            target="20270623",
+            date="20270623",
+            segments=["segment-a"],
+            scene_mode=None,
+            dry_run=False,
+            web_session_id="web-a",
+            agentscope_session_id="as-a",
+        )
 
     with ThreadPoolExecutor(max_workers=2) as executor:
-        results = list(executor.map(claim, ["web-a", "web-b"]))
+        results = list(executor.map(create_attempt, ["first", "second"]))
 
-    assert sorted(status for status, _ in results) == ["lost", "won"]
-    stored = SqliteNavigationTaskStore(db_path).find_latest_by_date(
-        "20270623", ["segment-a"]
+    assert {result.task_id for result in results} == {results[0].task_id}
+    assert sorted(result.created for result in results) == [False, True]
+    with sqlite3.connect(db_path) as connection:
+        assert connection.execute("SELECT count(*) FROM navigation_tasks").fetchone()[0] == 1
+
+
+def test_same_session_can_create_later_attempt_for_different_target(tmp_path: Path):
+    store = SqliteNavigationTaskStore(tmp_path / "tasks.sqlite")
+    common = {
+        "request": "处理数据",
+        "date": "20270623",
+        "segments": ["segment-a"],
+        "scene_mode": None,
+        "dry_run": False,
+        "web_session_id": "web-a",
+        "agentscope_session_id": "as-a",
+    }
+
+    first = store.create_task_attempt(target="20270623", **common)
+    second = store.create_task_attempt(target="20260623_145550", **common)
+
+    assert first.created is True
+    assert second.created is True
+    assert first.task_id != second.task_id
+    found = store.find_by_session(
+        web_session_id="web-a", agentscope_session_id="as-a"
     )
-    winner = next(owner for status, owner in results if status == "won")
-    assert stored.created_by_web_session_id == winner
-    assert stored.latest_web_session_id == winner
-    assert stored.agentscope_session_id == f"as-{winner}"
+    assert found is not None
+    assert found.task_id == second.task_id
+
+
+def test_running_target_writer_returns_overlapping_mutating_plan_step(tmp_path: Path):
+    db_path = tmp_path / "tasks.sqlite"
+    store = SqliteNavigationTaskStore(db_path)
+    attempt = store.create_task_attempt(
+        request="处理数据",
+        target="20270623",
+        date="20270623",
+        segments=["segment-a", "segment-b"],
+        scene_mode=None,
+        dry_run=False,
+        web_session_id="web-a",
+        agentscope_session_id="as-a",
+    )
+    plan_id, step_id = _insert_plan_ledger_step(
+        db_path,
+        task_id=attempt.task_id,
+        ledger_action="prepare_raw_data",
+    )
+
+    writer = store.find_running_target_writer(
+        date="20270623", segments=["segment-b", "segment-c"]
+    )
+
+    assert writer is not None
+    assert writer.task_id == attempt.task_id
+    assert writer.plan_id == plan_id
+    assert writer.step_id == step_id
+    assert writer.action == "prepare_raw_data"
+    assert writer.date == "20270623"
+    assert writer.segments == ["segment-a", "segment-b"]
+    assert (
+        store.find_running_target_writer(
+            date="20270623", segments=["segment-c"]
+        )
+        is None
+    )
+    assert (
+        store.find_running_target_writer(date="20270624", segments=None) is None
+    )
+
+
+@pytest.mark.parametrize(
+    ("writer_segments", "requested_segments"),
+    [(None, ["segment-z"]), (["segment-a"], None)],
+)
+def test_running_target_writer_treats_all_segments_as_overlapping(
+    tmp_path: Path,
+    writer_segments: list[str] | None,
+    requested_segments: list[str] | None,
+):
+    db_path = tmp_path / "tasks.sqlite"
+    store = SqliteNavigationTaskStore(db_path)
+    attempt = store.create_task_attempt(
+        request="处理数据",
+        target="20270623",
+        date="20270623",
+        segments=writer_segments,
+        scene_mode=None,
+        dry_run=False,
+        web_session_id="web-a",
+        agentscope_session_id="as-a",
+    )
+    _insert_plan_ledger_step(
+        db_path,
+        task_id=attempt.task_id,
+        ledger_action="extract_and_sync_navigation_data",
+    )
+
+    writer = store.find_running_target_writer(
+        date="20270623", segments=requested_segments
+    )
+
+    assert writer is not None
+    assert writer.task_id == attempt.task_id
+
+
+@pytest.mark.parametrize(
+    ("dry_run", "status", "ledger_action", "plan_action"),
+    [
+        (True, "running", "prepare_raw_data", None),
+        (False, "pending", "prepare_raw_data", None),
+        (False, "running", "validate_navigation_outputs", None),
+        (False, "running", "prepare_raw_data", "validate_navigation_outputs"),
+    ],
+)
+def test_running_target_writer_ignores_non_writers(
+    tmp_path: Path,
+    dry_run: bool,
+    status: str,
+    ledger_action: str,
+    plan_action: str | None,
+):
+    db_path = tmp_path / "tasks.sqlite"
+    store = SqliteNavigationTaskStore(db_path)
+    attempt = store.create_task_attempt(
+        request="处理数据",
+        target="20270623",
+        date="20270623",
+        segments=None,
+        scene_mode=None,
+        dry_run=dry_run,
+        web_session_id="web-a",
+        agentscope_session_id="as-a",
+    )
+    _insert_plan_ledger_step(
+        db_path,
+        task_id=attempt.task_id,
+        ledger_action=ledger_action,
+        plan_action=plan_action,
+        status=status,
+    )
+
+    assert (
+        store.find_running_target_writer(
+            date="20270623", segments=["segment-a"]
+        )
+        is None
+    )
 
 
 def test_owned_update_rejects_identity_field_changes_without_mutation(tmp_path: Path):
@@ -275,38 +516,9 @@ def test_update_task_serializes_same_timestamp_read_merge_write(monkeypatch, tmp
     assert current.guidance_revision == 7
 
 
-def test_task_store_keeps_one_active_task_per_date_and_segments_key(tmp_path: Path):
-    store = SqliteNavigationTaskStore(tmp_path / "navigation_tasks.sqlite")
-
-    first = store.create_or_update_task(
-        date="20270623",
-        segments=["segment_b", "segment_a"],
-        scene_mode=None,
-        web_session_id="web-1",
-    )
-    second = store.create_or_update_task(
-        date="20270623",
-        segments=["segment_a", "segment_b"],
-        scene_mode="out",
-        web_session_id="web-1",
-    )
-    different = store.create_or_update_task(
-        date="20270623",
-        segments=["segment_a"],
-        scene_mode=None,
-        web_session_id="web-3",
-    )
-
-    assert second.task_id == first.task_id
-    assert second.segments == ["segment_b", "segment_a"]
-    assert second.scene_mode == "out"
-    assert different.task_id != first.task_id
-    assert store.find_latest_by_date("20270623", ["segment_b", "segment_a"]).task_id == first.task_id
-    assert store.find_latest_by_date("20270623", ["segment_a", "segment_b"]).task_id == first.task_id
-    assert store.find_latest_by_date("20270623", ["segment_a"]).task_id == different.task_id
-
-
-def test_task_store_migrates_legacy_duplicate_active_segments(tmp_path: Path):
+def test_task_store_preserves_legacy_target_history_and_adds_attempt_indexes(
+    tmp_path: Path,
+):
     db_path = tmp_path / "navigation_tasks.sqlite"
     with sqlite3.connect(db_path) as connection:
         connection.execute(
@@ -373,30 +585,42 @@ def test_task_store_migrates_legacy_duplicate_active_segments(tmp_path: Path):
             )
 
     store = SqliteNavigationTaskStore(db_path)
-    task = store.create_or_update_task(
+    old = store.get_task("nav_old")
+    new = store.get_task("nav_new")
+    attempt = store.create_task_attempt(
+        request="重新处理",
+        target="20270623",
         date="20270623",
         segments=["segment_a"],
         scene_mode="out",
+        dry_run=False,
         web_session_id="web-new",
+        agentscope_session_id="as-new",
     )
 
     with sqlite3.connect(db_path) as connection:
-        active_count = connection.execute(
-            """
-            SELECT count(*) FROM navigation_tasks
-            WHERE date = ? AND status != ?
-            """,
-            ("20270623", NavigationTaskStatus.SUPERSEDED.value),
-        ).fetchone()[0]
-        old_status = connection.execute(
-            "SELECT status FROM navigation_tasks WHERE task_id = ?",
-            ("nav_old",),
+        indexes = {
+            row[1]: bool(row[2])
+            for row in connection.execute("PRAGMA index_list(navigation_tasks)")
+        }
+        task_count = connection.execute(
+            "SELECT count(*) FROM navigation_tasks"
         ).fetchone()[0]
 
-    assert task.task_id == "nav_new"
-    assert task.scene_mode == "out"
-    assert active_count == 1
-    assert old_status == NavigationTaskStatus.SUPERSEDED.value
+    assert old is not None and new is not None
+    assert old.status == NavigationTaskStatus.PENDING
+    assert new.status == NavigationTaskStatus.PENDING
+    assert old.request == new.request
+    assert 0 < len(old.request) <= 200
+    assert old.target == new.target == "20270623"
+    assert old.created_by_web_session_id == "legacy-web:nav_old"
+    assert old.agentscope_session_id == "legacy-agent:nav_old"
+    assert attempt.created is True
+    assert task_count == 3
+    assert indexes["idx_navigation_tasks_target_history"] is False
+    assert indexes["idx_navigation_tasks_session"] is False
+    assert indexes["idx_navigation_tasks_attempt_replay"] is True
+    assert "idx_navigation_tasks_active_date_segments_key" not in indexes
 
 
 def test_task_store_rebuilds_legacy_profile_table_without_profile_column(tmp_path: Path):
@@ -434,6 +658,75 @@ def test_task_store_rebuilds_legacy_profile_table_without_profile_column(tmp_pat
         columns = {row[1] for row in connection.execute("PRAGMA table_info(navigation_tasks)")}
         assert "data_profile_json" not in columns
         assert connection.execute("PRAGMA foreign_key_check").fetchall() == []
+
+
+def test_attempt_migration_backfills_accepted_phase_from_newest_plan_then_legacy_phase(
+    tmp_path: Path,
+):
+    db_path = tmp_path / "navigation_tasks.sqlite"
+    store = SqliteNavigationTaskStore(db_path)
+    planned = store.create_or_update_task(
+        date="20270623",
+        segments=None,
+        scene_mode=None,
+        web_session_id="web-plan",
+        agentscope_session_id="as-plan",
+    )
+    fallback = store.create_or_update_task(
+        date="20270624",
+        segments=None,
+        scene_mode=None,
+        web_session_id="web-fallback",
+        agentscope_session_id="as-fallback",
+    )
+    with sqlite3.connect(db_path) as connection:
+        connection.execute(
+            "UPDATE navigation_tasks SET phase = 'extract_sync' WHERE task_id = ?",
+            (fallback.task_id,),
+        )
+        connection.execute(
+            """CREATE TABLE navigation_plans (
+                   plan_id TEXT PRIMARY KEY,
+                   task_id TEXT NOT NULL,
+                   phase TEXT NOT NULL,
+                   plan_revision INTEGER NOT NULL,
+                   created_at TEXT NOT NULL
+               )"""
+        )
+        connection.executemany(
+            "INSERT INTO navigation_plans VALUES (?, ?, ?, ?, ?)",
+            [
+                ("plan-old", planned.task_id, "extract_sync", 2, "2026-07-08T00:00:00Z"),
+                ("plan-new", planned.task_id, "finish_processing", 1, "2026-07-08T00:00:01Z"),
+            ],
+        )
+
+    migrated = SqliteNavigationTaskStore(db_path)
+
+    assert (
+        migrated.get_task(planned.task_id).accepted_plan_phase
+        == NavigationTaskPhase.FINISH_PROCESSING
+    )
+    assert (
+        migrated.get_task(fallback.task_id).accepted_plan_phase
+        == NavigationTaskPhase.EXTRACT_SYNC
+    )
+
+
+def test_idempotent_attempt_migration_does_not_reclassify_transitional_legacy_rows(
+    tmp_path: Path,
+):
+    db_path = tmp_path / "navigation_tasks.sqlite"
+    store = SqliteNavigationTaskStore(db_path)
+    transitional = store.create_or_update_task(
+        date="20270623", segments=None, scene_mode=None
+    )
+
+    reopened = SqliteNavigationTaskStore(db_path).get_task(transitional.task_id)
+
+    assert reopened is not None
+    assert reopened.created_by_web_session_id is None
+    assert reopened.agentscope_session_id is None
 
 
 def test_task_table_migration_preserves_deployment_owned_trigger(tmp_path: Path):
@@ -651,7 +944,11 @@ def test_task_store_migrates_json_encoded_segment_entry_with_existing_unique_ind
 
     assert active.task_id == "nav_good"
     assert active.segments == ["20260623_145550"]
-    assert store.get_task("nav_bad").status == NavigationTaskStatus.SUPERSEDED
+    assert store.get_task("nav_bad").status == NavigationTaskStatus.PENDING
+    assert store.get_task("nav_bad").segments == ["20260623_145550"]
+    with sqlite3.connect(db_path) as connection:
+        indexes = {row[1] for row in connection.execute("PRAGMA index_list(navigation_tasks)")}
+    assert "idx_navigation_tasks_active_date_segments_key" not in indexes
 
 
 def test_create_or_update_task_preserves_latest_web_session_when_omitted(tmp_path: Path):

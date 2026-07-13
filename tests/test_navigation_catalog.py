@@ -38,6 +38,26 @@ def test_catalog_marks_effects_and_plan_agent_visibility():
     assert capabilities["run_tracking"].executor_agent_allowed is True
 
 
+def test_catalog_marks_every_data_mutating_processing_action_as_target_locking():
+    capabilities = _capability_by_stage()
+    locking_actions = {
+        name
+        for name, capability in capabilities.items()
+        if capability.locks_navigation_target
+    }
+
+    assert locking_actions == {
+        "prepare_raw_data",
+        "extract_and_sync_navigation_data",
+        "assemble_finish_temp",
+        "run_noobscene_preprocessing",
+        "run_initial_annotation_gui",
+        "run_tracking",
+        "prepare_gridmap_for_projection",
+        "run_projection_and_trajectory",
+    }
+
+
 def test_catalog_exposes_calibration_confirmation_capability():
     capabilities = _capability_by_stage()
     capability = capabilities["confirm_navigation_calibration_params"]

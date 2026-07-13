@@ -28,6 +28,7 @@ class ToolCapability(BaseModel):
     plan_agent_allowed: bool = False
     executor_agent_allowed: bool = False
     human_blocking: bool = False
+    locks_navigation_target: bool = False
     phase: CapabilityPhase | None = None
     argument_model: str | None = None
     declared_output_kinds: list[str] = Field(default_factory=list)
@@ -119,6 +120,7 @@ NAVIGATION_TOOL_CAPABILITIES: tuple[ToolCapability, ...] = (
         variants=[ToolVariantCapability(id="default")],
         supports_dry_run=True,
         executor_agent_allowed=True,
+        locks_navigation_target=True,
         phase="extract_sync",
         argument_model="EmptyArguments",
         declared_output_kinds=["raw_temp", "clip_root"],
@@ -138,6 +140,7 @@ NAVIGATION_TOOL_CAPABILITIES: tuple[ToolCapability, ...] = (
         ],
         supports_dry_run=True,
         executor_agent_allowed=True,
+        locks_navigation_target=True,
         phase="extract_sync",
         argument_model="ExtractSyncArguments",
         declared_output_kinds=["sync_data"],
@@ -161,6 +164,7 @@ NAVIGATION_TOOL_CAPABILITIES: tuple[ToolCapability, ...] = (
         variants=[ToolVariantCapability(id="default")],
         supports_dry_run=True,
         executor_agent_allowed=True,
+        locks_navigation_target=True,
         phase="finish_processing",
         argument_model="EmptyArguments",
         declared_output_kinds=["finish_temp"],
@@ -172,6 +176,7 @@ NAVIGATION_TOOL_CAPABILITIES: tuple[ToolCapability, ...] = (
         variants=[ToolVariantCapability(id="default")],
         supports_dry_run=True,
         executor_agent_allowed=True,
+        locks_navigation_target=True,
         phase="finish_processing",
         argument_model="EmptyArguments",
         declared_output_kinds=["noobscene_metadata"],
@@ -183,6 +188,7 @@ NAVIGATION_TOOL_CAPABILITIES: tuple[ToolCapability, ...] = (
         variants=[ToolVariantCapability(id="human_gui")],
         supports_dry_run=True,
         executor_agent_allowed=True,
+        locks_navigation_target=True,
         phase="finish_processing",
         argument_model="EmptyArguments",
         declared_output_kinds=["annotation_yaml"],
@@ -194,6 +200,7 @@ NAVIGATION_TOOL_CAPABILITIES: tuple[ToolCapability, ...] = (
         variants=[ToolVariantCapability(id="default")],
         supports_dry_run=True,
         executor_agent_allowed=True,
+        locks_navigation_target=True,
         phase="finish_processing",
         argument_model="EmptyArguments",
         declared_output_kinds=["tracking_outputs"],
@@ -218,6 +225,7 @@ NAVIGATION_TOOL_CAPABILITIES: tuple[ToolCapability, ...] = (
         ],
         supports_dry_run=True,
         executor_agent_allowed=True,
+        locks_navigation_target=True,
         phase="finish_processing",
         argument_model="EmptyArguments",
         declared_output_kinds=["projection_gridmap"],
@@ -238,6 +246,7 @@ NAVIGATION_TOOL_CAPABILITIES: tuple[ToolCapability, ...] = (
         ],
         supports_dry_run=True,
         executor_agent_allowed=True,
+        locks_navigation_target=True,
         phase="finish_processing",
         argument_model="EmptyArguments",
         declared_output_kinds=["finish_data", "trajectory"],

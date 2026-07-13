@@ -7,18 +7,26 @@ from typing import Any
 from uuid import uuid4
 
 from vla_data_juicer_agents.navigation.aggregate_revision import (
-    NAVIGATION_AGGREGATE_REVISION_TRIGGER_NAMES,
+    drop_navigation_aggregate_revision_triggers,
     ensure_navigation_aggregate_revision_triggers,
+)
+from vla_data_juicer_agents.navigation.catalog import (
+    list_navigation_tool_capabilities,
 )
 
 from vla_data_juicer_agents.navigation.task_state import (
     TASK_SCHEMA_VERSION,
     NavigationArtifactSnapshot,
+    NavigationRunningWriter,
     NavigationTask,
     NavigationTaskDrift,
     NavigationTaskStatus,
+    TaskAttemptCreation,
     utc_now,
 )
+
+
+LEGACY_TASK_REQUEST = "Historical navigation task migrated without its original request."
 
 
 def _json_dump(value: Any) -> str | None:
@@ -79,6 +87,22 @@ def _segments_key(segments: list[str] | None) -> str:
     if segments is None:
         return "__all__"
     return json.dumps(sorted(segments), ensure_ascii=False, separators=(",", ":"))
+
+
+def navigation_targets_overlap(
+    *,
+    left_date: str,
+    left_segments: list[str] | None,
+    right_date: str,
+    right_segments: list[str] | None,
+) -> bool:
+    if left_date != right_date:
+        return False
+    normalized_left = normalize_segments(left_segments)
+    normalized_right = normalize_segments(right_segments)
+    if normalized_left is None or normalized_right is None:
+        return True
+    return bool(set(normalized_left).intersection(normalized_right))
 
 
 def ensure_navigation_task_step_ledger_columns(connection: sqlite3.Connection) -> None:
@@ -155,26 +179,17 @@ def authorize_navigation_task_write(
     ).fetchone() is None:
         return
     row = connection.execute(
-        """SELECT created_by_web_session_id, latest_web_session_id,
-                  agentscope_session_id
+        """SELECT created_by_web_session_id, agentscope_session_id
            FROM navigation_tasks WHERE task_id = ?""",
         (task_id,),
     ).fetchone()
     if row is None:
         return
-    durable = (
-        row["created_by_web_session_id"],
-        row["latest_web_session_id"],
-        row["agentscope_session_id"],
-    )
-    if durable == (None, None, None):
+    durable = (row["created_by_web_session_id"], row["agentscope_session_id"])
+    if durable == (None, None):
         if expected_web_session_id is None and expected_agentscope_session_id is None:
             return
-    elif durable == (
-        expected_web_session_id,
-        expected_web_session_id,
-        expected_agentscope_session_id,
-    ):
+    elif durable == (expected_web_session_id, expected_agentscope_session_id):
         return
     raise PermissionError("navigation task session mismatch")
 
@@ -198,6 +213,8 @@ class SqliteNavigationTaskStore:
                 """
                 CREATE TABLE IF NOT EXISTS navigation_tasks (
                     task_id TEXT PRIMARY KEY,
+                    request TEXT,
+                    target TEXT,
                     date TEXT NOT NULL,
                     segments_json TEXT,
                     segments_key TEXT,
@@ -207,6 +224,7 @@ class SqliteNavigationTaskStore:
                     state_revision INTEGER NOT NULL DEFAULT 0,
                     phase TEXT NOT NULL,
                     status TEXT NOT NULL,
+                    accepted_plan_phase TEXT,
                     waiting_reason TEXT,
                     next_required_input TEXT,
                     created_by_web_session_id TEXT,
@@ -223,19 +241,13 @@ class SqliteNavigationTaskStore:
                 """
             )
             self._migrate_task_entry_fields(connection)
-            self._migrate_segments_key(connection)
+            self._ensure_segments_key_column(connection)
             self._rebuild_task_table_without_legacy_profile(connection)
+            self._migrate_task_attempt_fields(connection)
             connection.execute(
                 """
                 CREATE INDEX IF NOT EXISTS idx_navigation_tasks_date_updated
                 ON navigation_tasks (date, updated_at)
-                """
-            )
-            connection.execute(
-                """
-                CREATE UNIQUE INDEX IF NOT EXISTS idx_navigation_tasks_active_date_segments_key
-                ON navigation_tasks (date, segments_key)
-                WHERE status != 'superseded'
                 """
             )
             connection.execute(
@@ -285,8 +297,7 @@ class SqliteNavigationTaskStore:
         connection.execute("PRAGMA legacy_alter_table = ON")
         try:
             connection.execute("BEGIN IMMEDIATE")
-            for trigger_name in NAVIGATION_AGGREGATE_REVISION_TRIGGER_NAMES:
-                connection.execute(f'DROP TRIGGER IF EXISTS "{trigger_name}"')
+            drop_navigation_aggregate_revision_triggers(connection)
             connection.execute("DROP TABLE IF EXISTS navigation_tasks_new")
             connection.execute(
                 """
@@ -349,10 +360,6 @@ class SqliteNavigationTaskStore:
             connection.execute(
                 "CREATE INDEX idx_navigation_tasks_date_updated ON navigation_tasks (date, updated_at)"
             )
-            connection.execute(
-                """CREATE UNIQUE INDEX idx_navigation_tasks_active_date_segments_key
-                ON navigation_tasks (date, segments_key) WHERE status != 'superseded'"""
-            )
             ensure_navigation_aggregate_revision_triggers(connection)
             connection.commit()
         except Exception:
@@ -386,14 +393,15 @@ class SqliteNavigationTaskStore:
                 "ALTER TABLE navigation_tasks ADD COLUMN state_revision INTEGER NOT NULL DEFAULT 0"
             )
 
-    def _migrate_segments_key(self, connection: sqlite3.Connection) -> None:
-        connection.execute("DROP INDEX IF EXISTS idx_navigation_tasks_active_date_segments_key")
+    def _ensure_segments_key_column(self, connection: sqlite3.Connection) -> None:
         columns = {
             row["name"]
             for row in connection.execute("PRAGMA table_info(navigation_tasks)").fetchall()
         }
         if "segments_key" not in columns:
             connection.execute("ALTER TABLE navigation_tasks ADD COLUMN segments_key TEXT")
+
+    def _canonicalize_segments_key(self, connection: sqlite3.Connection) -> None:
         rows = connection.execute(
             "SELECT rowid, segments_json, segments_key FROM navigation_tasks"
         ).fetchall()
@@ -411,31 +419,241 @@ class SqliteNavigationTaskStore:
                 """,
                 (canonical_json, canonical_key, row["rowid"]),
             )
-        duplicate_rows = connection.execute(
-            """
-            SELECT rowid FROM (
-                SELECT
-                    rowid,
-                    ROW_NUMBER() OVER (
-                        PARTITION BY date, segments_key
-                        ORDER BY updated_at DESC, rowid DESC
-                    ) AS duplicate_rank
-                FROM navigation_tasks
-                WHERE status != ?
-            )
-            WHERE duplicate_rank > 1
-            """,
-            (NavigationTaskStatus.SUPERSEDED.value,),
-        ).fetchall()
-        for row in duplicate_rows:
+
+    def _migrate_task_attempt_fields(self, connection: sqlite3.Connection) -> None:
+        connection.commit()
+        try:
+            connection.execute("BEGIN IMMEDIATE")
             connection.execute(
-                """
-                UPDATE navigation_tasks
-                SET status = ?, updated_at = ?, state_revision = state_revision + 1
-                WHERE rowid = ?
-                """,
-                (NavigationTaskStatus.SUPERSEDED.value, utc_now(), row["rowid"]),
+                "DROP INDEX IF EXISTS idx_navigation_tasks_active_date_segments_key"
             )
+            self._canonicalize_segments_key(connection)
+            columns = {
+                row["name"]
+                for row in connection.execute(
+                    "PRAGMA table_info(navigation_tasks)"
+                ).fetchall()
+            }
+            is_legacy_task_table = not {
+                "request",
+                "target",
+                "accepted_plan_phase",
+            }.issubset(columns)
+            for name, statement in {
+                "request": "ALTER TABLE navigation_tasks ADD COLUMN request TEXT",
+                "target": "ALTER TABLE navigation_tasks ADD COLUMN target TEXT",
+                "accepted_plan_phase": (
+                    "ALTER TABLE navigation_tasks ADD COLUMN accepted_plan_phase TEXT"
+                ),
+            }.items():
+                if name not in columns:
+                    connection.execute(statement)
+
+            connection.execute(
+                """UPDATE navigation_tasks
+                   SET request = ?
+                   WHERE request IS NULL OR trim(request) = ''""",
+                (LEGACY_TASK_REQUEST,),
+            )
+            connection.execute(
+                """UPDATE navigation_tasks
+                   SET target = date
+                   WHERE target IS NULL OR trim(target) = ''"""
+            )
+            if is_legacy_task_table:
+                connection.execute(
+                    """UPDATE navigation_tasks
+                       SET created_by_web_session_id = 'legacy-web:' || task_id
+                       WHERE created_by_web_session_id IS NULL"""
+                )
+                connection.execute(
+                    """UPDATE navigation_tasks
+                       SET agentscope_session_id = 'legacy-agent:' || task_id
+                       WHERE agentscope_session_id IS NULL"""
+                )
+
+            has_plans = connection.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='table' AND name='navigation_plans'"
+            ).fetchone()
+            if has_plans is not None:
+                connection.execute(
+                    """UPDATE navigation_tasks AS tasks
+                       SET accepted_plan_phase = (
+                           SELECT plans.phase
+                           FROM navigation_plans AS plans
+                           WHERE plans.task_id = tasks.task_id
+                           ORDER BY plans.created_at DESC,
+                                    plans.plan_revision DESC,
+                                    plans.rowid DESC
+                           LIMIT 1
+                       )
+                       WHERE tasks.accepted_plan_phase IS NULL
+                         AND EXISTS (
+                             SELECT 1 FROM navigation_plans AS plans
+                             WHERE plans.task_id = tasks.task_id
+                         )"""
+                )
+            connection.execute(
+                """UPDATE navigation_tasks
+                   SET accepted_plan_phase = phase
+                   WHERE accepted_plan_phase IS NULL
+                     AND phase IN ('extract_sync', 'finish_processing')"""
+            )
+            connection.execute(
+                """CREATE INDEX IF NOT EXISTS idx_navigation_tasks_target_history
+                   ON navigation_tasks (date, segments_key, created_at)"""
+            )
+            connection.execute(
+                """CREATE INDEX IF NOT EXISTS idx_navigation_tasks_session
+                   ON navigation_tasks (
+                       created_by_web_session_id, agentscope_session_id, created_at
+                   )"""
+            )
+            connection.execute(
+                """CREATE UNIQUE INDEX IF NOT EXISTS idx_navigation_tasks_attempt_replay
+                   ON navigation_tasks (
+                       created_by_web_session_id, agentscope_session_id,
+                       date, segments_key, target
+                   )"""
+            )
+            connection.commit()
+        except Exception:
+            connection.rollback()
+            raise
+
+    def create_task_attempt(
+        self,
+        *,
+        request: str,
+        target: str,
+        date: str,
+        segments: list[str] | None,
+        scene_mode: str | None,
+        dry_run: bool,
+        web_session_id: str,
+        agentscope_session_id: str,
+    ) -> TaskAttemptCreation:
+        segments = normalize_segments(segments)
+        key = _segments_key(segments)
+        connection = self._connect()
+        try:
+            connection.execute("BEGIN IMMEDIATE")
+            row = connection.execute(
+                """SELECT * FROM navigation_tasks
+                   WHERE created_by_web_session_id = ?
+                     AND agentscope_session_id = ?
+                     AND date = ? AND segments_key = ? AND target = ?
+                   LIMIT 1""",
+                (web_session_id, agentscope_session_id, date, key, target),
+            ).fetchone()
+            if row is not None:
+                connection.commit()
+                return TaskAttemptCreation(
+                    task=self._task_from_row(row), created=False
+                )
+
+            timestamp = utc_now()
+            task = NavigationTask(
+                task_id=f"nav_{uuid4().hex}",
+                request=request,
+                target=target,
+                date=date,
+                segments=segments,
+                scene_mode=scene_mode if scene_mode in {"in", "out"} else None,
+                dry_run=bool(dry_run),
+                state_revision=1,
+                status=NavigationTaskStatus.ACTIVE,
+                created_by_web_session_id=web_session_id,
+                latest_web_session_id=web_session_id,
+                agentscope_session_id=agentscope_session_id,
+                created_at=timestamp,
+                updated_at=timestamp,
+            )
+            self._insert_task(connection, task)
+            connection.commit()
+            return TaskAttemptCreation(task=task, created=True)
+        except Exception:
+            connection.rollback()
+            raise
+        finally:
+            connection.close()
+
+    def find_by_session(
+        self,
+        *,
+        web_session_id: str,
+        agentscope_session_id: str,
+    ) -> NavigationTask | None:
+        with self._connect() as connection:
+            row = connection.execute(
+                """SELECT * FROM navigation_tasks
+                   WHERE created_by_web_session_id = ?
+                     AND agentscope_session_id = ?
+                   ORDER BY created_at DESC, rowid DESC
+                   LIMIT 1""",
+                (web_session_id, agentscope_session_id),
+            ).fetchone()
+        return self._task_from_row(row) if row is not None else None
+
+    def find_running_target_writer(
+        self,
+        *,
+        date: str,
+        segments: list[str] | None,
+    ) -> NavigationRunningWriter | None:
+        locking_actions = [
+            capability.tool_name
+            for capability in list_navigation_tool_capabilities()
+            if capability.locks_navigation_target
+        ]
+        if not locking_actions:
+            return None
+        placeholders = ", ".join("?" for _ in locking_actions)
+        with self._connect() as connection:
+            if connection.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='table' AND name='navigation_plans'"
+            ).fetchone() is None:
+                return None
+            rows = connection.execute(
+                f"""SELECT tasks.task_id, tasks.date, tasks.segments_json,
+                           steps.plan_id, steps.step_id, steps.tool_name AS action
+                    FROM navigation_task_steps AS steps
+                    JOIN navigation_tasks AS tasks
+                      ON tasks.task_id = steps.task_id
+                    JOIN navigation_plans AS plans
+                      ON plans.plan_id = steps.plan_id
+                    JOIN json_each(plans.plan_json, '$.steps') AS plan_step
+                      ON json_extract(plan_step.value, '$.step_id') = steps.step_id
+                     AND json_extract(plan_step.value, '$.action') = steps.tool_name
+                    WHERE steps.status = 'running'
+                      AND plans.status = 'active'
+                      AND tasks.dry_run = 0
+                      AND tasks.date = ?
+                      AND steps.tool_name IN ({placeholders})
+                    ORDER BY steps.started_at DESC,
+                             tasks.updated_at DESC,
+                             steps.rowid DESC""",
+                (date, *locking_actions),
+            ).fetchall()
+        requested_segments = normalize_segments(segments)
+        for row in rows:
+            writer_segments = normalize_segments(_json_load(row["segments_json"]))
+            if not navigation_targets_overlap(
+                left_date=date,
+                left_segments=requested_segments,
+                right_date=row["date"],
+                right_segments=writer_segments,
+            ):
+                continue
+            return NavigationRunningWriter(
+                task_id=row["task_id"],
+                plan_id=row["plan_id"],
+                step_id=row["step_id"],
+                action=row["action"],
+                date=row["date"],
+                segments=writer_segments,
+            )
+        return None
 
     def create_or_update_task(
         self,
@@ -465,6 +683,8 @@ class SqliteNavigationTaskStore:
             if row is None:
                 task = NavigationTask(
                     task_id=f"nav_{uuid4().hex}",
+                    request=LEGACY_TASK_REQUEST,
+                    target=date,
                     date=date,
                     segments=segments,
                     scene_mode=scene_mode if scene_mode in {"in", "out"} else None,
@@ -688,7 +908,8 @@ class SqliteNavigationTaskStore:
                 waiting_reason=?, next_required_input=?, created_by_web_session_id=?,
                 latest_web_session_id=?, agentscope_session_id=?, latest_run_id=?,
                 last_completed_step=?, artifact_snapshot_json=?,
-                drift_json=?, schema_version=?, created_at=?, updated_at=?
+                drift_json=?, schema_version=?, created_at=?, updated_at=?,
+                request=?, target=?, accepted_plan_phase=?
                 WHERE task_id=? AND state_revision=? AND latest_web_session_id IS ?
                   AND agentscope_session_id IS ?""",
                 values[1:] + (values[0], expected_state_revision,
@@ -718,9 +939,10 @@ class SqliteNavigationTaskStore:
                 waiting_reason, next_required_input, created_by_web_session_id,
                 latest_web_session_id, agentscope_session_id, latest_run_id,
                 last_completed_step, artifact_snapshot_json,
-                drift_json, schema_version, created_at, updated_at
+                drift_json, schema_version, created_at, updated_at,
+                request, target, accepted_plan_phase
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             self._task_values(task),
         )
@@ -754,7 +976,10 @@ class SqliteNavigationTaskStore:
                 drift_json = ?,
                 schema_version = ?,
                 created_at = ?,
-                updated_at = ?
+                updated_at = ?,
+                request = ?,
+                target = ?,
+                accepted_plan_phase = ?
             WHERE task_id = ?
             """,
             values[1:] + (values[0],),
@@ -784,6 +1009,13 @@ class SqliteNavigationTaskStore:
             task.schema_version,
             task.created_at,
             task.updated_at,
+            task.request,
+            task.target,
+            (
+                task.accepted_plan_phase.value
+                if task.accepted_plan_phase is not None
+                else None
+            ),
         )
 
     def _task_from_row(self, row: sqlite3.Row) -> NavigationTask:
@@ -791,6 +1023,8 @@ class SqliteNavigationTaskStore:
         drift = _json_load(row["drift_json"])
         return NavigationTask(
             task_id=row["task_id"],
+            request=row["request"],
+            target=row["target"],
             date=row["date"],
             segments=normalize_segments(_json_load(row["segments_json"])),
             scene_mode=row["scene_mode"],
@@ -799,6 +1033,7 @@ class SqliteNavigationTaskStore:
             state_revision=row["state_revision"],
             phase=row["phase"],
             status=row["status"],
+            accepted_plan_phase=row["accepted_plan_phase"],
             waiting_reason=row["waiting_reason"],
             next_required_input=row["next_required_input"],
             created_by_web_session_id=row["created_by_web_session_id"],

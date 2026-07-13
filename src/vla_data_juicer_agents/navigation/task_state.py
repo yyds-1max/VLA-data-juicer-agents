@@ -25,11 +25,13 @@ class NavigationTaskPhase(StrEnum):
 
 
 class NavigationTaskStatus(StrEnum):
+    ACTIVE = "active"
     PENDING = "pending"
     RUNNING = "running"
     WAITING_USER = "waiting_user"
     COMPLETED = "completed"
     FAILED = "failed"
+    CANCELLED = "cancelled"
     NEEDS_RECONCILE = "needs_reconcile"
     NEEDS_RERUN = "needs_rerun"
     NEEDS_REPLAN = "needs_replan"
@@ -67,6 +69,8 @@ class NavigationArtifactSnapshot(BaseModel):
 
 class NavigationTask(BaseModel):
     task_id: str
+    request: str = ""
+    target: str = ""
     date: str
     segments: list[str] | None = None
     scene_mode: Literal["in", "out"] | None = None
@@ -75,6 +79,7 @@ class NavigationTask(BaseModel):
     state_revision: int = Field(default=0, ge=0)
     phase: NavigationTaskPhase = NavigationTaskPhase.INTAKE
     status: NavigationTaskStatus = NavigationTaskStatus.PENDING
+    accepted_plan_phase: NavigationTaskPhase | None = None
     waiting_reason: str | None = None
     next_required_input: str | None = None
     created_by_web_session_id: str | None = None
@@ -92,3 +97,21 @@ class NavigationTask(BaseModel):
     @classmethod
     def validate_date(cls, value: str) -> str:
         return _validate_date(value)
+
+
+class TaskAttemptCreation(BaseModel):
+    task: NavigationTask
+    created: bool
+
+    @property
+    def task_id(self) -> str:
+        return self.task.task_id
+
+
+class NavigationRunningWriter(BaseModel):
+    task_id: str
+    plan_id: str
+    step_id: str
+    action: str
+    date: str
+    segments: list[str] | None = None
