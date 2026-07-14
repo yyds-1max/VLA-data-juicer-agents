@@ -1,76 +1,65 @@
+from __future__ import annotations
+
+import json
 import shutil
 from types import SimpleNamespace
 
+import pytest
+from agentscope.message import Msg, TextBlock
+
 import vla_data_juicer_agents.navigation.plan_execution as plan_execution
-from test_navigation_context_budget import (
-    _call,
-    _extract_plan,
-    _write_raw_metadata,
+from navigation_agentscope_harness import (
+    ScriptedChatModel,
+    build_agent,
+    build_runtime,
+    event_types,
+    refresh_tools,
+    run_reply,
+    text_deltas,
+    tool_call_names,
+    tool_result_outputs,
 )
-from vla_data_juicer_agents.navigation.config import NavigationSettings
+from vla_data_juicer_agents.navigation.agent_tools import resolve_navigation_agent_tools
+from test_navigation_context_budget import _call, _extract_plan, _write_raw_metadata
 from vla_data_juicer_agents.navigation.models import ToolResult
-from vla_data_juicer_agents.navigation.services import build_navigation_services
 from vla_data_juicer_agents.navigation.task_state import NavigationTaskStatus
-from vla_data_juicer_agents.runtime.agentscope_runtime import AgentScopeRuntime
+from vla_data_juicer_agents.runtime.agentscope_runtime import (
+    AgentScopeRuntime,
+    NavigationHandoffTool,
+)
 
 
 DATE = "20260710"
 SEGMENT = "20260710_120000"
+EXTRACT_INSPECTIONS = [
+    "inspect_navigation_artifact_state_tool",
+    "inspect_navigation_raw_metadata_tool",
+    "inspect_navigation_topic_candidates_tool",
+    "inspect_navigation_sensor_candidates_tool",
+]
+FINISH_INSPECTIONS = [
+    "inspect_navigation_artifact_state_tool",
+    "inspect_navigation_gridmap_artifacts_tool",
+    "inspect_navigation_runtime_assets_tool",
+    "inspect_navigation_calibration_inventory_tool",
+    "inspect_navigation_localization_sources_tool",
+]
 
 
-def _entry(
-    services,
-    *,
-    session_id="direct-flow",
-    web_session_id="direct-flow",
-    scene_mode=None,
-    dry_run=True,
-    request="process the selected navigation data",
-):
-    web_session_id = web_session_id or session_id
-    return services.task_store.create_task_attempt(
-        request=request,
-        target=DATE,
-        date=DATE,
-        segments=[SEGMENT],
-        scene_mode=scene_mode,
-        dry_run=dry_run,
-        web_session_id=web_session_id,
-        agentscope_session_id=session_id,
-    ).task
-
-
-def _tools(services, session_id, web_session_id="direct-flow"):
-    from vla_data_juicer_agents.navigation.agent_tools import resolve_navigation_agent_tools
-
-    return {
-        tool.name: tool
-        for tool in resolve_navigation_agent_tools(
-            services=services,
-            agentscope_session_id=session_id,
-            web_session_id=web_session_id,
-            cancellation=None,
-        )
-    }
-
-
-def _complete_required_inspections(services, session_id, web_session_id="direct-flow"):
-    tools = _tools(services, session_id, web_session_id)
-    names = sorted(name for name in tools if name.startswith("inspect_navigation_"))
-    assert names
-    for name in names:
-        assert _call(tools[name])["ok"] is True
-    return _tools(services, session_id, web_session_id)
-
-
-def _inspect(services, session_id, names, web_session_id="direct-flow"):
-    calls = []
-    for name in names:
-        tools = _tools(services, session_id, web_session_id)
-        result = _call(tools[name])
-        assert result["ok"] is True
-        calls.append(name)
-    return calls, _tools(services, session_id, web_session_id)
+def _tool_result_json(messages: list[Msg]) -> dict:
+    for message in reversed(messages):
+        blocks = message.get_content_blocks("tool_result")
+        if not blocks:
+            continue
+        output = blocks[-1].output
+        if isinstance(output, str):
+            text = output
+        else:
+            text = "".join(
+                item.text for item in output if isinstance(item, TextBlock)
+            )
+        return json.loads(text)
+    raise AssertionError("scripted model expected a prior tool result")
 
 
 def _evidence_by_kind(services, task_id):
@@ -81,23 +70,32 @@ def _evidence_by_kind(services, task_id):
 
 
 def _activate_extract_plan(services, task, session_id, web_session_id="direct-flow"):
-    _, tools = _inspect(
-        services,
-        session_id,
-        [
-            "inspect_navigation_artifact_state_tool",
-            "inspect_navigation_raw_metadata_tool",
-            "inspect_navigation_topic_candidates_tool",
-            "inspect_navigation_sensor_candidates_tool",
-        ],
-        web_session_id,
-    )
+    """Compatibility fixture used by the direct CLI integration test."""
+    for name in EXTRACT_INSPECTIONS:
+        tools = {
+            tool.name: tool
+            for tool in resolve_navigation_agent_tools(
+                services=services,
+                agentscope_session_id=session_id,
+                web_session_id=web_session_id,
+                cancellation=None,
+            )
+        }
+        assert _call(tools[name])["ok"] is True
+    tools = {
+        tool.name: tool
+        for tool in resolve_navigation_agent_tools(
+            services=services,
+            agentscope_session_id=session_id,
+            web_session_id=web_session_id,
+            cancellation=None,
+        )
+    }
     context = _call(tools["get_navigation_task_context_tool"])
-    payload = _extract_plan(_evidence_by_kind(services, task.task_id))
     result = _call(
         tools["submit_extract_sync_plan_tool"],
         planning_context_revision=context["planning_context_revision"],
-        plan=payload,
+        plan=_extract_plan(_evidence_by_kind(services, task.task_id)),
     )
     assert result["ok"] is True
     return result
@@ -175,13 +173,6 @@ def _finish_plan(evidence):
     }
 
 
-def _settings(tmp_path):
-    return NavigationSettings(
-        vladatasets_root=tmp_path / "VLADatasets",
-        processing_root=tmp_path / "processing",
-    )
-
-
 def _write_finish_inputs(settings):
     sync_gridmap = (
         settings.clip_data_root / DATE / SEGMENT / "sync_data" / "clip-1" / "grid_map"
@@ -200,33 +191,160 @@ def _write_finish_inputs(settings):
     projection.write_text("# projection", encoding="utf-8")
 
 
-def _execute_active_plan(services, session_id, plan_id, web_session_id="direct-flow"):
-    calls = []
-    while services.plan_store.get(plan_id).status == "active":
-        tools = _tools(services, session_id, web_session_id)
-        current = services.plan_store.get_current_step(plan_id)
-        step = current["step"]
-        calls.append(step["action"])
-        result = _call(
-            tools[f"{step['action']}_tool"],
-            plan_id=plan_id,
-            step_id=step["step_id"],
-        )
-        assert result["ok"] is True
-    return calls
+def _handoff_arguments(request: str):
+    return {
+        "request": request,
+        "target": DATE,
+        "date": DATE,
+        "scene_mode": "unknown",
+        "clips": [SEGMENT],
+        "reason": "concrete navigation processing request",
+        "missing_fields": [],
+        "confidence": "high",
+        "response_language": "Chinese",
+    }
 
 
-def test_raw_only_entry_submits_model_plan_and_executes_canonical_arguments(
-    monkeypatch,
-    tmp_path,
+async def _router_handoff(runtime, storage, registry, web_session_id, request):
+    model = ScriptedChatModel()
+    model.enqueue_tool("start_navigation_data_task", _handoff_arguments(request))
+    model.enqueue_text("导航数据任务已启动。")
+    agent = build_agent(
+        storage.agents[runtime.config.main_router_agent_id],
+        model,
+        [NavigationHandoffTool(runtime=runtime, web_session_id=web_session_id)],
+    )
+    events = await run_reply(agent, request)
+    await registry.drain()
+    model.assert_exhausted()
+    assert "TOOL_RESULT_END" in event_types(events)
+    assert "REPLY_END" in event_types(events)
+    assert text_deltas(events) == "导航数据任务已启动。"
+    agentscope_session_id = runtime.web_sessions[web_session_id][1]
+    task = runtime._navigation_task_store().find_by_session(
+        web_session_id=web_session_id,
+        agentscope_session_id=agentscope_session_id,
+    )
+    assert task is not None
+    return task, agentscope_session_id, events, model
+
+
+def _navigation_agent(runtime, storage, web_session_id, session_id):
+    model = ScriptedChatModel()
+    agent = build_agent(
+        storage.agents[runtime.config.navigation_agent_id],
+        model,
+        runtime._navigation_tools_for_session(
+            web_session_id=web_session_id,
+            agentscope_session_id=session_id,
+        ),
+    )
+    return agent, model
+
+
+def _queue_extract_plan(model, services, task):
+    for name in EXTRACT_INSPECTIONS:
+        model.enqueue_tool(name, {})
+    model.enqueue_tool("get_navigation_task_context_tool", {})
+    model.enqueue_tool(
+        "submit_extract_sync_plan_tool",
+        lambda messages: {
+            "planning_context_revision": _tool_result_json(messages)[
+                "planning_context_revision"
+            ],
+            "plan": _extract_plan(_evidence_by_kind(services, task.task_id)),
+        },
+    )
+    model.enqueue_text("完整 extract-sync Plan 已接受。")
+
+
+async def _submit_extract_plan(agent, model, services, task, request):
+    before = len(tool_call_names(agent))
+    _queue_extract_plan(model, services, task)
+    events = await run_reply(agent, request)
+    calls = tool_call_names(agent)[before:]
+    assert calls == [
+        *EXTRACT_INSPECTIONS,
+        "get_navigation_task_context_tool",
+        "submit_extract_sync_plan_tool",
+    ]
+    assert "REPLY_END" in event_types(events)
+    assert text_deltas(events) == "完整 extract-sync Plan 已接受。"
+    active = services.plan_store.get_active_for_task(task.task_id)
+    assert active is not None and active.phase == "extract_sync"
+    return active, events
+
+
+async def _execute_extract_plan(
+    runtime,
+    agent,
+    model,
+    web_session_id,
+    session_id,
+    plan,
 ):
-    settings = _settings(tmp_path)
-    _write_raw_metadata(settings.vladatasets_root, DATE, SEGMENT)
-    services = build_navigation_services(tmp_path, settings)
-    task = _entry(services)
+    refresh_tools(
+        agent,
+        runtime._navigation_tools_for_session(
+            web_session_id=web_session_id,
+            agentscope_session_id=session_id,
+        ),
+    )
+    before = len(tool_call_names(agent))
+    model.enqueue_tool(
+        "prepare_raw_data_tool",
+        {"plan_id": plan.plan_id, "step_id": "prepare_raw"},
+    )
+    model.enqueue_tool(
+        "extract_and_sync_navigation_data_tool",
+        {"plan_id": plan.plan_id, "step_id": "extract_sync"},
+    )
+    model.enqueue_text("extract-sync 执行完成。")
+    events = await run_reply(agent, "执行已接受的 Plan。")
+    assert tool_call_names(agent)[before:] == [
+        "prepare_raw_data_tool",
+        "extract_and_sync_navigation_data_tool",
+    ]
+    assert text_deltas(events) == "extract-sync 执行完成。"
+    return events
 
+
+@pytest.fixture
+def navigation_environment(monkeypatch, tmp_path):
+    data_root = tmp_path / "VLADatasets"
+    processing_root = tmp_path / "processing"
+    monkeypatch.setenv("VLA_VLADATASETS_ROOT", str(data_root))
+    monkeypatch.setenv("VLA_PROCESSING_ROOT", str(processing_root))
+    _write_raw_metadata(data_root, DATE, SEGMENT)
+    return tmp_path, data_root, processing_root
+
+
+@pytest.mark.asyncio
+async def test_raw_only_router_and_navigation_agents_submit_and_execute_canonical_plan(
+    monkeypatch,
+    navigation_environment,
+):
+    tmp_path, _data_root, _processing_root = navigation_environment
+    runtime, storage, registry = await build_runtime(tmp_path, dry_run=True)
+    task, session_id, _router_events, _router_model = await _router_handoff(
+        runtime,
+        storage,
+        registry,
+        "web-raw",
+        "处理这批导航数据",
+    )
+    services = runtime._navigation_services()
     assert services.observation_store.latest(task.task_id) is None
     assert not hasattr(task, "phase")
+    agent, model = _navigation_agent(runtime, storage, "web-raw", session_id)
+    plan, _planning_events = await _submit_extract_plan(
+        agent,
+        model,
+        services,
+        task,
+        "检查当前事实并提交完整 Plan。",
+    )
+
     captured = {}
 
     def record(action):
@@ -242,17 +360,12 @@ def test_raw_only_entry_submits_model_plan_and_executes_canonical_arguments(
         "extract_and_sync_navigation_data",
         record("extract_and_sync_navigation_data"),
     )
+    await _execute_extract_plan(runtime, agent, model, "web-raw", session_id, plan)
 
-    submitted = _activate_extract_plan(services, task, "direct-flow")
-    executed = _execute_active_plan(services, "direct-flow", submitted["plan_id"])
-
-    overview = services.plan_store.get_execution_overview(submitted["plan_id"])
-    assert overview.completed_steps == overview.total_steps == 2
-    assert executed == ["prepare_raw_data", "extract_and_sync_navigation_data"]
     assert captured["prepare_raw_data"] == {
         "date": DATE,
         "segments": [SEGMENT],
-        "settings": settings,
+        "settings": services.settings,
         "dry_run": True,
     }
     assert captured["extract_and_sync_navigation_data"] == {
@@ -270,263 +383,260 @@ def test_raw_only_entry_submits_model_plan_and_executes_canonical_arguments(
             "/sport_odom": "odom",
         },
         "query_dir": "rs32_lidar_points",
-        "settings": settings,
+        "settings": services.settings,
         "dry_run": True,
     }
-    durable_task = services.task_store.get_task(task.task_id)
-    assert durable_task.status == NavigationTaskStatus.ACTIVE
-    assert not hasattr(durable_task, "phase")
-    assert (settings.raw_data_root / DATE / SEGMENT / "metadata.yaml").exists()
-    assert not (settings.clip_data_root / DATE / SEGMENT / "sync_data").exists()
+    assert services.plan_store.get(plan.plan_id).status == "completed"
+    assert services.task_store.get_task(task.task_id).status == NavigationTaskStatus.ACTIVE
+    model.assert_exhausted()
 
 
-def test_existing_sync_and_scene_mode_select_finish_plan_without_extract_tools(tmp_path):
-    settings = _settings(tmp_path)
-    _write_raw_metadata(settings.vladatasets_root, DATE, SEGMENT)
-    gridmap = settings.clip_data_root / DATE / SEGMENT / "sync_data" / "clip-1" / "grid_map"
-    gridmap.mkdir(parents=True)
-    (gridmap / "map.json").write_text("{}", encoding="utf-8")
-    (settings.processing_root / "NoobScenes" / "params" / "selected" / "sensors").mkdir(
-        parents=True
+@pytest.mark.asyncio
+async def test_same_session_agent_asks_before_finish_then_reinspects_after_user_reply(
+    navigation_environment,
+):
+    tmp_path, _data_root, _processing_root = navigation_environment
+    runtime, storage, registry = await build_runtime(tmp_path, dry_run=True)
+    task, session_id, *_ = await _router_handoff(
+        runtime,
+        storage,
+        registry,
+        "web-same",
+        "处理这批导航数据",
     )
-    converter = settings.processing_root / "NoobScenes" / "include" / "1_odom_convert.py"
-    converter.parent.mkdir(parents=True)
-    converter.write_text("# converter", encoding="utf-8")
-    projection = settings.processing_root / "2_pt_project" / "2_othermethod_cjl.py"
-    projection.parent.mkdir(parents=True)
-    projection.write_text("# projection", encoding="utf-8")
-    services = build_navigation_services(tmp_path, settings)
-    task = _entry(services, scene_mode="out")
+    services = runtime._navigation_services()
+    agent, model = _navigation_agent(runtime, storage, "web-same", session_id)
+    plan, _ = await _submit_extract_plan(agent, model, services, task, "检查并规划。")
+    await _execute_extract_plan(runtime, agent, model, "web-same", session_id, plan)
+    assert services.plan_store.get(plan.plan_id).status == "completed"
+    _write_finish_inputs(services.settings)
 
-    assert task.accepted_plan_phase is None
-    tools = _complete_required_inspections(services, "direct-flow")
-    assert "submit_extract_sync_plan_tool" in tools
-    assert "submit_finish_processing_plan_tool" in tools
-    context = _call(tools["get_navigation_task_context_tool"])
-    result = _call(
-        tools["submit_finish_processing_plan_tool"],
-        planning_context_revision=context["planning_context_revision"],
-        plan=_finish_plan(_evidence_by_kind(services, task.task_id)),
+    refresh_tools(
+        agent,
+        runtime._navigation_tools_for_session(
+            web_session_id="web-same",
+            agentscope_session_id=session_id,
+        ),
     )
+    before = len(tool_call_names(agent))
+    model.enqueue_tool("inspect_navigation_artifact_state_tool", {})
+    question = "extract/sync 已核验完成。是否继续 finish processing？"
+    model.enqueue_text(question)
+    boundary_events = await run_reply(agent, "核验 extract/sync 结果。")
 
-    assert result["ok"] is True
-    assert services.plan_store.get(result["plan_id"]).phase == "finish_processing"
-
-
-def test_same_session_waits_for_user_then_reinspects_before_finish_plan(tmp_path):
-    settings = _settings(tmp_path)
-    _write_raw_metadata(settings.vladatasets_root, DATE, SEGMENT)
-    services = build_navigation_services(tmp_path, settings)
-    task = _entry(services)
-    extract = _activate_extract_plan(services, task, "direct-flow")
-    _execute_active_plan(services, "direct-flow", extract["plan_id"])
-
-    tools_after_extract = _tools(services, "direct-flow")
-    assert "inspect_navigation_artifact_state_tool" in tools_after_extract
-    assert "submit_extract_sync_plan_tool" in tools_after_extract
-    assert "submit_finish_processing_plan_tool" in tools_after_extract
-    assert "prepare_raw_data_tool" not in tools_after_extract
-    assert services.plan_store.get_active(task.task_id, "finish_processing") is None
-
-    _write_finish_inputs(settings)
-    post_extract_turn = [
-        "inspect_navigation_artifact_state_tool",
-        "assistant: extract/sync verified complete; continue to finish processing?",
+    assert tool_call_names(agent)[before:] == [
+        "inspect_navigation_artifact_state_tool"
     ]
-    inspected = _call(tools_after_extract[post_extract_turn[0]])
-    assert inspected["ok"] is True
-    assert post_extract_turn[-1].endswith("?")
-    assert not any("submit_finish_processing_plan" in event for event in post_extract_turn)
+    assert text_deltas(boundary_events) == question
+    assert "REPLY_END" in event_types(boundary_events)
     assert services.plan_store.get_active(task.task_id, "finish_processing") is None
 
-    continuation_tools = _tools(services, "direct-flow")
-    guidance = _call(
-        continuation_tools["record_navigation_user_guidance_tool"],
-        text="Continue with finish processing in outdoor scene mode.",
-        scene_mode="out",
+    before = len(tool_call_names(agent))
+    model.enqueue_tool(
+        "record_navigation_user_guidance_tool",
+        {"text": "继续室外 finish processing。", "scene_mode": "out"},
     )
-    assert guidance["ok"] is True
-    calls, planning_tools = _inspect(
-        services,
-        "direct-flow",
-        [
-            "inspect_navigation_artifact_state_tool",
-            "inspect_navigation_gridmap_artifacts_tool",
-            "inspect_navigation_runtime_assets_tool",
-            "inspect_navigation_calibration_inventory_tool",
-            "inspect_navigation_localization_sources_tool",
-        ],
-    )
-    assert calls[0] == "inspect_navigation_artifact_state_tool"
-    context = _call(planning_tools["get_navigation_task_context_tool"])
-    finish = _call(
-        planning_tools["submit_finish_processing_plan_tool"],
-        planning_context_revision=context["planning_context_revision"],
-        plan=_finish_plan(_evidence_by_kind(services, task.task_id)),
-    )
+    model.enqueue_text("已记录用户确认，将基于最新任务状态继续检查。")
+    guidance_events = await run_reply(agent, "继续，室外场景。")
 
-    assert finish["ok"] is True
+    assert tool_call_names(agent)[before:] == [
+        "record_navigation_user_guidance_tool",
+    ]
+    assert text_deltas(guidance_events) == "已记录用户确认，将基于最新任务状态继续检查。"
     assert services.task_store.get_task(task.task_id).scene_mode == "out"
-    assert services.plan_store.get(finish["plan_id"]).phase == "finish_processing"
+    assert services.plan_store.get_active(task.task_id, "finish_processing") is None
+
+    # Guidance advances the durable planning fence, so the next production
+    # resolver cycle must bind tools to that new revision before submission.
+    refresh_tools(
+        agent,
+        runtime._navigation_tools_for_session(
+            web_session_id="web-same",
+            agentscope_session_id=session_id,
+        ),
+    )
+    for name in FINISH_INSPECTIONS:
+        model.enqueue_tool(name, {})
+    model.enqueue_tool("get_navigation_task_context_tool", {})
+    model.enqueue_tool(
+        "submit_finish_processing_plan_tool",
+        lambda messages: {
+            "planning_context_revision": _tool_result_json(messages)[
+                "planning_context_revision"
+            ],
+            "plan": _finish_plan(_evidence_by_kind(services, task.task_id)),
+        },
+    )
+    model.enqueue_text("完整 finish-processing Plan 已接受。")
+    continued_events = await run_reply(agent, "依据已记录的确认继续重检并规划。")
+    submit_result = json.loads(tool_result_outputs(agent)[-1])
+    assert submit_result["ok"] is True, submit_result
+
+    assert tool_call_names(agent)[before:] == [
+        "record_navigation_user_guidance_tool",
+        *FINISH_INSPECTIONS,
+        "get_navigation_task_context_tool",
+        "submit_finish_processing_plan_tool",
+    ]
+    assert text_deltas(continued_events) == "完整 finish-processing Plan 已接受。"
+    finish = services.plan_store.get_active_for_task(task.task_id)
+    assert finish is not None and finish.phase == "finish_processing"
+    assert services.task_store.get_task(task.task_id).scene_mode == "out"
+    model.assert_exhausted()
 
 
-def test_new_session_distrusts_sync_claim_and_selects_stage_from_inspection(tmp_path):
-    settings = _settings(tmp_path)
-    _write_raw_metadata(settings.vladatasets_root, DATE, SEGMENT)
-    services = build_navigation_services(tmp_path, settings)
-    old = _entry(services, session_id="old", web_session_id="web-old")
-    old_plan = _activate_extract_plan(services, old, "old", "web-old")
-    _execute_active_plan(services, "old", old_plan["plan_id"], "web-old")
-    _write_finish_inputs(settings)
-
-    new = _entry(
-        services,
-        session_id="new",
-        web_session_id="web-new",
+@pytest.mark.asyncio
+async def test_new_session_agent_distrusts_sync_claim_and_inspects_before_finish(
+    navigation_environment,
+):
+    tmp_path, _data_root, _processing_root = navigation_environment
+    runtime, storage, registry = await build_runtime(tmp_path, dry_run=True)
+    services = runtime._navigation_services()
+    old = services.task_store.create_task_attempt(
+        request="historical completed attempt",
+        target=DATE,
+        date=DATE,
+        segments=[SEGMENT],
         scene_mode="out",
-        request="同步已完成，请继续处理",
+        dry_run=True,
+        web_session_id="web-old",
+        agentscope_session_id="as-old",
+    ).task
+    services.task_store.update_task_for_session(
+        old.task_id,
+        web_session_id="web-old",
+        agentscope_session_id="as-old",
+        status=NavigationTaskStatus.COMPLETED.value,
+    )
+    _write_finish_inputs(services.settings)
+
+    new, session_id, *_ = await _router_handoff(
+        runtime,
+        storage,
+        registry,
+        "web-new",
+        "同步已完成，请继续处理",
     )
     assert new.task_id != old.task_id
     assert services.observation_store.latest(new.task_id) is None
     assert services.plan_store.get_active_for_task(new.task_id) is None
-
-    first_result = _call(_tools(services, "new", "web-new")["inspect_navigation_artifact_state_tool"])
-    first_observation = services.observation_store.latest(new.task_id)
-    assert first_result["ok"] is True
-    assert first_observation.completed_kinds == ["artifact_state"]
-    assert first_observation.payloads[0].snapshot.sync_data_exists is True
-
-    _, planning_tools = _inspect(
-        services,
-        "new",
-        [
-            "inspect_navigation_gridmap_artifacts_tool",
-            "inspect_navigation_runtime_assets_tool",
-            "inspect_navigation_calibration_inventory_tool",
-            "inspect_navigation_localization_sources_tool",
-        ],
-        "web-new",
+    agent, model = _navigation_agent(runtime, storage, "web-new", session_id)
+    for name in FINISH_INSPECTIONS:
+        model.enqueue_tool(name, {})
+    model.enqueue_tool("get_navigation_task_context_tool", {})
+    model.enqueue_tool(
+        "submit_finish_processing_plan_tool",
+        lambda messages: {
+            "planning_context_revision": _tool_result_json(messages)[
+                "planning_context_revision"
+            ],
+            "plan": _finish_plan(_evidence_by_kind(services, new.task_id)),
+        },
     )
-    context = _call(planning_tools["get_navigation_task_context_tool"])
-    finish = _call(
-        planning_tools["submit_finish_processing_plan_tool"],
-        planning_context_revision=context["planning_context_revision"],
-        plan=_finish_plan(_evidence_by_kind(services, new.task_id)),
-    )
-    assert finish["ok"] is True
-    assert services.plan_store.get(finish["plan_id"]).phase == "finish_processing"
+    model.enqueue_text("当前事实支持 finish-processing Plan。")
+
+    events = await run_reply(agent, "同步已完成，请继续处理。")
+
+    calls = tool_call_names(agent)
+    assert calls == [
+        *FINISH_INSPECTIONS,
+        "get_navigation_task_context_tool",
+        "submit_finish_processing_plan_tool",
+    ]
+    assert calls[0] == "inspect_navigation_artifact_state_tool"
+    observation = services.observation_store.latest(new.task_id)
+    assert observation is not None
+    assert observation.payloads[0].snapshot.sync_data_exists is True
+    assert text_deltas(events) == "当前事实支持 finish-processing Plan。"
+    assert services.plan_store.get_active_for_task(new.task_id).phase == "finish_processing"
+    model.assert_exhausted()
 
 
-def test_deleted_products_make_new_attempt_reinspect_and_rerun_extract_sync(tmp_path):
-    settings = _settings(tmp_path)
-    _write_raw_metadata(settings.vladatasets_root, DATE, SEGMENT)
-    _write_finish_inputs(settings)
-    final = settings.finish_data_root / DATE / SEGMENT / "clip-1"
+@pytest.mark.asyncio
+async def test_deleted_products_make_new_session_agent_choose_extract_again(
+    navigation_environment,
+):
+    tmp_path, _data_root, _processing_root = navigation_environment
+    runtime, storage, registry = await build_runtime(tmp_path, dry_run=True)
+    services = runtime._navigation_services()
+    _write_finish_inputs(services.settings)
+    final = services.settings.finish_data_root / DATE / SEGMENT / "clip-1"
     final.mkdir(parents=True)
-    services = build_navigation_services(tmp_path, settings)
-    historical = _entry(services, session_id="historical", web_session_id="web-historical")
+    historical = services.task_store.create_task_attempt(
+        request="historical completed attempt",
+        target=DATE,
+        date=DATE,
+        segments=[SEGMENT],
+        scene_mode="out",
+        dry_run=True,
+        web_session_id="web-history",
+        agentscope_session_id="as-history",
+    ).task
     services.task_store.update_task_for_session(
         historical.task_id,
-        web_session_id="web-historical",
-        agentscope_session_id="historical",
+        web_session_id="web-history",
+        agentscope_session_id="as-history",
         status=NavigationTaskStatus.COMPLETED.value,
     )
-    shutil.rmtree(settings.clip_data_root / DATE)
-    shutil.rmtree(settings.finish_data_root / DATE)
+    shutil.rmtree(services.settings.clip_data_root / DATE)
+    shutil.rmtree(services.settings.finish_data_root / DATE)
 
-    current = _entry(
-        services,
-        session_id="current",
-        web_session_id="web-current",
-        request="同步已完成，请继续处理",
+    current, session_id, *_ = await _router_handoff(
+        runtime,
+        storage,
+        registry,
+        "web-rerun",
+        "同步已完成，请继续处理",
     )
-    first = _call(
-        _tools(services, "current", "web-current")["inspect_navigation_artifact_state_tool"]
-    )
-    observation = services.observation_store.latest(current.task_id)
-    artifact = observation.payloads[0].snapshot
-    assert first["ok"] is True
+    agent, model = _navigation_agent(runtime, storage, "web-rerun", session_id)
+    _queue_extract_plan(model, services, current)
+    events = await run_reply(agent, "同步已完成，请继续处理。")
+
+    calls = tool_call_names(agent)
+    assert calls == [
+        *EXTRACT_INSPECTIONS,
+        "get_navigation_task_context_tool",
+        "submit_extract_sync_plan_tool",
+    ]
+    assert calls[0] == "inspect_navigation_artifact_state_tool"
+    artifact = services.observation_store.latest(current.task_id).payloads[0].snapshot
     assert artifact.raw_input_exists is True
     assert artifact.sync_data_exists is False
     assert artifact.final_outputs_exist is False
-
-    _, tools = _inspect(
-        services,
-        "current",
-        [
-            "inspect_navigation_raw_metadata_tool",
-            "inspect_navigation_topic_candidates_tool",
-            "inspect_navigation_sensor_candidates_tool",
-        ],
-        "web-current",
-    )
-    context = _call(tools["get_navigation_task_context_tool"])
-    rerun = _call(
-        tools["submit_extract_sync_plan_tool"],
-        planning_context_revision=context["planning_context_revision"],
-        plan=_extract_plan(_evidence_by_kind(services, current.task_id)),
-    )
-    assert rerun["ok"] is True
-    assert current.task_id != historical.task_id
-    assert services.plan_store.get(rerun["plan_id"]).phase == "extract_sync"
-
-
-def test_existing_outputs_are_not_entry_facts_and_new_session_reinspects(tmp_path):
-    settings = _settings(tmp_path)
-    _write_raw_metadata(settings.vladatasets_root, DATE, SEGMENT)
-    (settings.clip_data_root / DATE / SEGMENT / "sync_data").mkdir(parents=True)
-    final_grid = settings.finish_data_root / DATE / SEGMENT / "clip-1" / "grid_map"
-    final_grid.mkdir(parents=True)
-    services = build_navigation_services(tmp_path, settings)
-    first = _entry(services, session_id="first", scene_mode="out")
-
-    assert services.observation_store.latest(first.task_id) is None
-    names = set(_tools(services, "first"))
-    assert "inspect_navigation_artifact_state_tool" in names
-    assert "submit_extract_sync_plan_tool" in names
-    assert "submit_finish_processing_plan_tool" in names
-    assert not any(name.endswith("_data_tool") for name in names)
-
-    shutil.rmtree(settings.finish_data_root / DATE)
-    second = _entry(services, session_id="second", scene_mode="out")
-    assert second.task_id != first.task_id
-    assert services.observation_store.latest(second.task_id) is None
-    planning = _complete_required_inspections(services, "second")
-    assert "submit_extract_sync_plan_tool" in planning
-    assert "submit_finish_processing_plan_tool" in planning
+    assert text_deltas(events) == "完整 extract-sync Plan 已接受。"
+    assert services.plan_store.get_active_for_task(current.task_id).phase == "extract_sync"
+    model.assert_exhausted()
 
 
 def test_cleared_conversation_recovers_compact_plan_and_ledger_anchor_from_sqlite(tmp_path):
-    settings = _settings(tmp_path)
-    _write_raw_metadata(settings.vladatasets_root, DATE, SEGMENT)
-    services = build_navigation_services(tmp_path, settings)
-    web_session_id = "web-owner"
-    session_id = "web-owner__navigation-data-agent"
-    task = _entry(
-        services,
-        session_id=session_id,
-        web_session_id=web_session_id,
+    runtime = object.__new__(AgentScopeRuntime)
+    task = SimpleNamespace(
+        task_id="attempt-1",
+        accepted_plan_phase="extract_sync",
     )
-    submitted = _activate_extract_plan(
-        services,
-        task,
-        session_id,
-        web_session_id,
+    plan = SimpleNamespace(plan_id="plan-1", plan_revision=1)
+    services = SimpleNamespace(
+        task_store=SimpleNamespace(find_by_session=lambda **_kwargs: task),
+        observation_store=SimpleNamespace(latest=lambda _task_id: SimpleNamespace(revision=4)),
+        plan_store=SimpleNamespace(
+            get_active=lambda _task_id, _phase: plan,
+            get_current_step=lambda _plan_id: {
+                "step": {"step_id": "prepare_raw", "status": "pending"}
+            },
+        ),
     )
+    runtime._navigation_services = lambda: services
 
-    recovered_runtime = object.__new__(AgentScopeRuntime)
-    recovered_runtime.config = SimpleNamespace(workspace_root=tmp_path)
-    recovered_runtime._navigation_services = lambda: services
-    anchor = recovered_runtime._navigation_durable_state_anchor(
-        session_id,
-        web_session_id=web_session_id,
+    anchor = runtime._navigation_durable_state_anchor(
+        "as-owner",
+        web_session_id="web-owner",
     )
 
     assert anchor == {
-        "task_attempt_id": task.task_id,
-        "observation_revision": anchor["observation_revision"],
-        "accepted_plan_id": submitted["plan_id"],
-        "accepted_plan_revision": submitted["plan_revision"],
+        "task_attempt_id": "attempt-1",
+        "observation_revision": 4,
+        "accepted_plan_id": "plan-1",
+        "accepted_plan_revision": 1,
         "current_ledger_step": "prepare_raw",
         "execution_status": "pending",
     }

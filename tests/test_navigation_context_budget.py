@@ -2,10 +2,23 @@ import asyncio
 import copy
 import json
 import re
-from dataclasses import dataclass
 from pathlib import Path
 from types import SimpleNamespace
 
+import pytest
+from agentscope.message import Msg, TextBlock
+
+from navigation_agentscope_harness import (
+    ScriptedChatModel,
+    build_agent,
+    build_runtime,
+    event_types,
+    refresh_tools,
+    run_reply,
+    text_deltas,
+    tool_call_names,
+    tool_result_outputs,
+)
 from vla_data_juicer_agents.navigation.agent_tools import resolve_navigation_agent_tools
 from vla_data_juicer_agents.navigation.config import NavigationSettings
 from vla_data_juicer_agents.navigation.services import build_navigation_services
@@ -159,22 +172,6 @@ def _extract_plan(evidence_by_kind):
     }
 
 
-@dataclass(frozen=True)
-class TurnMeasurement:
-    name: str
-    retained_history_chars: int
-    current_schema_chars: int
-    current_context_chars: int
-    estimated_tokens: int
-
-
-@dataclass(frozen=True)
-class ToolResultMeasurement:
-    invocation: str
-    tool_name: str
-    serialized_chars: int
-
-
 def test_navigation_guidance_has_exact_playbook_sections_and_four_bounded_few_shots():
     guidance = GUIDANCE_PATH.read_text(encoding="utf-8")
     headings = re.findall(r"^## (.+)$", guidance, flags=re.MULTILINE)
@@ -314,352 +311,208 @@ def test_static_prompt_guidance_submission_schemas_and_anchor_fit_context_budget
     assert (len(static_context) + 3) // 4 <= 83_885
 
 
-def test_representative_model_authored_transcript_stays_bounded_without_compaction(tmp_path):
-    # This models four real AgentScope invocations. The runtime refreshes extra
-    # tools only at an invocation boundary, appends one durable anchor to that
-    # invocation's new user message, and retains that message and tool results.
-    # Tool schemas belong only to the current invocation and never enter history.
-    date, segment, session_id = "20260710", "20260710_120000", "direct-budget"
+def _latest_tool_json(messages: list[Msg], required_key: str | None = None):
+    for message in reversed(messages):
+        for block in reversed(message.get_content_blocks("tool_result")):
+            if isinstance(block.output, str):
+                text = block.output
+            else:
+                text = "".join(
+                    item.text for item in block.output if isinstance(item, TextBlock)
+                )
+            payload = json.loads(text)
+            if required_key is None or required_key in payload:
+                return payload
+    raise AssertionError(f"no tool result contains {required_key!r}")
+
+
+@pytest.mark.asyncio
+async def test_representative_model_authored_transcript_stays_bounded_without_compaction(
+    monkeypatch,
+    tmp_path,
+):
+    date, segment = "20260710", "20260710_120000"
+    web_session_id = "web-budget"
+    agentscope_session_id = "as-budget"
     token_limit = 83_885
     data_root = tmp_path / "VLADatasets"
+    processing_root = tmp_path / "processing"
+    monkeypatch.setenv("VLA_VLADATASETS_ROOT", str(data_root))
+    monkeypatch.setenv("VLA_PROCESSING_ROOT", str(processing_root))
     _write_raw_metadata(data_root, date, segment)
-    services = build_navigation_services(
-        tmp_path,
-        NavigationSettings(vladatasets_root=data_root),
-    )
-    production_navigation_prompt = _production_agent_prompts(tmp_path)[
-        "NavigationDataAgent"
-    ]
-    assert production_navigation_prompt.count("# Navigation Plan Agent Guidance") == 1
-    system_chars = len(production_navigation_prompt)
-    retained_history: list[str] = []
-    turn_measurements: list[TurnMeasurement] = []
-    tool_result_measurements: list[ToolResultMeasurement] = []
-    exposed_schema_chars: dict[str, int] = {}
-    compact_events: list[dict[str, int | str]] = []
-    external_invocations: list[str] = []
-    result_counts: dict[tuple[str, str], int] = {}
-    current_invocation = ""
-    current_schema_chars = 0
 
-    def current_anchor():
-        task = services.task_store.find_by_session(
-            web_session_id=session_id,
-            agentscope_session_id=session_id,
-        )
-        observation = services.observation_store.latest(task.task_id) if task else None
-        plan = services.plan_store.get_active_for_task(task.task_id) if task else None
-        current = services.plan_store.get_current_step(plan.plan_id) if plan else None
-        return {
-            "task_attempt_id": task.task_id if task else None,
-            "observation_revision": observation.revision if observation else None,
-            "accepted_plan_id": plan.plan_id if plan else None,
-            "accepted_plan_revision": plan.plan_revision if plan else None,
-            "current_ledger_step": current["step"]["step_id"] if current else None,
-            "execution_status": (
-                current["step"]["status"] if current else getattr(plan, "status", None)
-            ),
-        }
-
-    def measure_model_call(label):
-        retained_chars = sum(len(message) for message in retained_history)
-        context_chars = system_chars + retained_chars + current_schema_chars
-        estimated_tokens = (context_chars + 3) // 4
-        measurement = TurnMeasurement(
-            name=label,
-            retained_history_chars=retained_chars,
-            current_schema_chars=current_schema_chars,
-            current_context_chars=context_chars,
-            estimated_tokens=estimated_tokens,
-        )
-        turn_measurements.append(measurement)
-        if estimated_tokens >= token_limit:
-            compact_events.append(
-                {"turn": label, "estimated_tokens": estimated_tokens}
-            )
-
-    def start_invocation(name, user_text):
-        nonlocal current_invocation, current_schema_chars
-        tools = _tool_map(services, session_id)
-        user_message = json.dumps(
-            {
-                "role": "user",
-                "content": user_text,
-                "durable_navigation_state": current_anchor(),
-            },
-            ensure_ascii=False,
-            separators=(",", ":"),
-        )
-        retained_history.append(user_message)
-        schema_payload = [
-            {
-                "name": tool.name,
-                "description": getattr(tool, "description", ""),
-                "input_schema": getattr(tool, "input_schema", {}),
-            }
-            for tool in tools.values()
-        ]
-        encoded_schemas = json.dumps(
-            schema_payload,
-            ensure_ascii=False,
-            separators=(",", ":"),
-        )
-        assert "schema_snapshot" not in encoded_schemas
-        assert "data_profile_draft" not in encoded_schemas
-        external_invocations.append(name)
-        exposed_schema_chars[name] = len(encoded_schemas)
-        current_invocation = name
-        current_schema_chars = len(encoded_schemas)
-        measure_model_call(f"{name}:start")
-        return tools
-
-    def invoke(tools, tool_name, hard_max, **arguments):
-        retained_history.append(
-            json.dumps(
-                {
-                    "role": "assistant",
-                    "content": (
-                        "Progress: Using current durable facts; "
-                        f"calling {tool_name}."
-                    ),
-                    "tool_call": {
-                        "name": tool_name,
-                        "arguments": arguments,
-                    },
-                },
-                ensure_ascii=False,
-                separators=(",", ":"),
-            )
-        )
-        payload = _call(tools[tool_name], **arguments)
-        encoded_payload = json.dumps(
-            payload,
-            ensure_ascii=False,
-            separators=(",", ":"),
-        )
-        assert len(encoded_payload) <= hard_max
-        assert "schema_snapshot" not in encoded_payload
-        assert "data_profile_draft" not in encoded_payload
-        assert "validation_history" not in encoded_payload
-        tool_result_measurements.append(
-            ToolResultMeasurement(
-                invocation=current_invocation,
-                tool_name=tool_name,
-                serialized_chars=len(encoded_payload),
-            )
-        )
-        retained_history.append(
-            json.dumps(
-                {"role": "tool", "name": tool_name, "content": payload},
-                ensure_ascii=False,
-                separators=(",", ":"),
-            )
-        )
-        count_key = (current_invocation, tool_name)
-        result_counts[count_key] = result_counts.get(count_key, 0) + 1
-        measure_model_call(
-            f"{current_invocation}:after:{tool_name}:{result_counts[count_key]}"
-        )
-        return payload
-
-    def record_final(content):
-        retained_history.append(
-            json.dumps(
-                {"role": "assistant", "content": content, "final": True},
-                ensure_ascii=False,
-                separators=(",", ":"),
-            )
-        )
-        measure_model_call(f"{current_invocation}:final")
-
-    entered_task = services.task_store.create_task_attempt(
+    runtime, storage, _registry = await build_runtime(tmp_path, dry_run=True)
+    services = runtime._navigation_services()
+    task = services.task_store.create_task_attempt(
         request="Process the selected navigation dataset.",
         target=f"{date}/{segment}",
         date=date,
         segments=[segment],
         scene_mode=None,
         dry_run=True,
-        web_session_id=session_id,
-        agentscope_session_id=session_id,
+        web_session_id=web_session_id,
+        agentscope_session_id=agentscope_session_id,
     ).task
-    entry_tools = start_invocation("entry", "Process the selected navigation dataset.")
-    invoke(
-        entry_tools,
-        "record_navigation_user_guidance_tool",
-        4_000,
-        text="Process the selected navigation dataset.",
+    model = ScriptedChatModel()
+    agent = build_agent(
+        storage.agents[runtime.config.navigation_agent_id],
+        model,
+        runtime._navigation_tools_for_session(
+            web_session_id=web_session_id,
+            agentscope_session_id=agentscope_session_id,
+        ),
     )
-    record_final("Recorded the request guidance and will inspect current products.")
 
-    inspection_tools = start_invocation(
-        "inspection",
-        "Continue from durable state and record every required factual observation.",
-    )
-    inspection_names = sorted(
-        name
-        for name in inspection_tools
-        if name.startswith("inspect_navigation_")
-    )
-    assert inspection_names
+    inspection_names = [
+        "inspect_navigation_artifact_state_tool",
+        "inspect_navigation_raw_metadata_tool",
+        "inspect_navigation_topic_candidates_tool",
+        "inspect_navigation_sensor_candidates_tool",
+    ]
     for name in inspection_names:
-        invoke(inspection_tools, name, 4_000)
-    record_final("Recorded the current factual product and input observations.")
-
-    planning_tools = start_invocation(
-        "planning",
-        "Use the completed facts to submit one complete extract-sync plan.",
-    )
-    context = invoke(
-        planning_tools,
-        "get_navigation_task_context_tool",
-        5_500,
-    )
-    evidence_list = invoke(
-        planning_tools,
-        "list_observation_evidence_tool",
-        5_500,
-        limit=20,
-    )
-    first_ref = evidence_list["evidence"][0]["ref"]
-    invoke(
-        planning_tools,
+        model.enqueue_tool(name, {})
+    model.enqueue_tool("get_navigation_task_context_tool", {})
+    model.enqueue_tool("list_observation_evidence_tool", {"limit": 20})
+    model.enqueue_tool(
         "read_observation_evidence_tool",
-        5_500,
-        ref=first_ref,
-        limit=10,
+        lambda messages: {
+            "ref": _latest_tool_json(messages, "evidence")["evidence"][0]["ref"],
+            "limit": 10,
+        },
     )
-    evidence_by_kind = {
-        row.kind: row.ref
-        for row in services.observation_store.list_evidence(
-            entered_task.task_id,
-            limit=50,
-        )
-    }
-    valid_plan = _extract_plan(evidence_by_kind)
-    invalid_plan = copy.deepcopy(valid_plan)
-    invalid_plan["decisions"]["time_sync"]["reference_sensor"] = (
-        "unobserved_sensor"
-    )
-    submit_name = "submit_extract_sync_plan_tool"
-    invalid = invoke(
-        planning_tools,
-        submit_name,
-        3_000,
-        planning_context_revision=context["planning_context_revision"],
-        plan=invalid_plan,
-    )
-    assert invalid["ok"] is False
-    validation_failure_measurement = tool_result_measurements[-1]
-    assert validation_failure_measurement.tool_name == submit_name
-    success = invoke(
-        planning_tools,
-        submit_name,
-        2_000,
-        planning_context_revision=context["planning_context_revision"],
-        plan=valid_plan,
-    )
-    assert success["ok"] is True
-    record_final("The complete extract-sync Plan was accepted for execution.")
 
-    execution_tools = start_invocation(
-        "execution",
+    def submission(messages: list[Msg], *, valid: bool):
+        evidence_by_kind = {
+            row.kind: row.ref
+            for row in services.observation_store.list_evidence(task.task_id, limit=50)
+        }
+        plan = _extract_plan(evidence_by_kind)
+        if not valid:
+            plan = copy.deepcopy(plan)
+            plan["decisions"]["time_sync"]["reference_sensor"] = "unobserved_sensor"
+        return {
+            "planning_context_revision": _latest_tool_json(
+                messages,
+                "planning_context_revision",
+            )["planning_context_revision"],
+            "plan": plan,
+        }
+
+    submit_name = "submit_extract_sync_plan_tool"
+    model.enqueue_tool(submit_name, lambda messages: submission(messages, valid=False))
+    model.enqueue_tool(submit_name, lambda messages: submission(messages, valid=True))
+    planning_final = "The corrected complete extract-sync Plan was accepted."
+    model.enqueue_text(planning_final)
+
+    planning_events = await run_reply(
+        agent,
+        "Inspect durable facts, check evidence, and submit a complete Plan.",
+    )
+    planning_calls = tool_call_names(agent)
+    assert planning_calls == [
+        *inspection_names,
+        "get_navigation_task_context_tool",
+        "list_observation_evidence_tool",
+        "read_observation_evidence_tool",
+        submit_name,
+        submit_name,
+    ]
+    assert "TOOL_RESULT_END" in event_types(planning_events)
+    assert "REPLY_END" in event_types(planning_events)
+    assert text_deltas(planning_events) == planning_final
+
+    planning_results = tool_result_outputs(agent)
+    invalid_result = json.loads(planning_results[-2])
+    success = json.loads(planning_results[-1])
+    assert invalid_result["ok"] is False
+    assert invalid_result["error_type"] == "plan_validation_failed"
+    assert success["ok"] is True
+    plan_id = success["plan_id"]
+
+    refresh_tools(
+        agent,
+        runtime._navigation_tools_for_session(
+            web_session_id=web_session_id,
+            agentscope_session_id=agentscope_session_id,
+        ),
+    )
+    execution_start = len(tool_call_names(agent))
+    model.enqueue_tool("get_plan_execution_overview_tool", {"plan_id": plan_id})
+    model.enqueue_tool(
+        "prepare_raw_data_tool",
+        {"plan_id": plan_id, "step_id": "prepare_raw"},
+    )
+    model.enqueue_tool("get_plan_execution_overview_tool", {"plan_id": plan_id})
+    model.enqueue_tool(
+        "extract_and_sync_navigation_data_tool",
+        {"plan_id": plan_id, "step_id": "extract_sync"},
+    )
+    execution_final = "Executed the accepted Plan and recorded its final ledger state."
+    model.enqueue_text(execution_final)
+    execution_events = await run_reply(
+        agent,
         "Execute every remaining stored plan step in order.",
     )
-    while services.plan_store.get(success["plan_id"]).status == "active":
-        current = services.plan_store.get_current_step(success["plan_id"])
-        invoke(
-            execution_tools,
-            "get_plan_execution_overview_tool",
-            4_000,
-            plan_id=success["plan_id"],
-        )
-        step = current["step"]
-        invoke(
-            execution_tools,
-            f"{step['action']}_tool",
-            4_000,
-            plan_id=success["plan_id"],
-            step_id=step["step_id"],
-        )
-    record_final("Executed the accepted Plan and recorded its final ledger state.")
+    assert tool_call_names(agent)[execution_start:] == [
+        "get_plan_execution_overview_tool",
+        "prepare_raw_data_tool",
+        "get_plan_execution_overview_tool",
+        "extract_and_sync_navigation_data_tool",
+    ]
+    assert "TOOL_RESULT_END" in event_types(execution_events)
+    assert "REPLY_END" in event_types(execution_events)
+    assert text_deltas(execution_events) == execution_final
+    assert services.plan_store.get(plan_id).status == "completed"
+    model.assert_exhausted()
 
-    decoded_history = [json.loads(message) for message in retained_history]
-    assert {message["role"] for message in decoded_history} == {
-        "user",
-        "assistant",
-        "tool",
-    }
-    assistant_tool_calls = [
-        message
-        for message in decoded_history
-        if message["role"] == "assistant" and "tool_call" in message
+    all_results = tool_result_outputs(agent)
+    result_measurements = [
+        {
+            "tool_name": name,
+            "serialized_chars": len(output),
+        }
+        for name, output in zip(tool_call_names(agent), all_results, strict=True)
     ]
-    assert assistant_tool_calls
-    assert all(message["content"].startswith("Progress: ") for message in assistant_tool_calls)
-    assert all(message["tool_call"]["name"] for message in assistant_tool_calls)
-    final_assistant_messages = [
-        message
-        for message in decoded_history
-        if message["role"] == "assistant" and message.get("final") is True
+    schema_chars = [
+        len(json.dumps(call.tools, ensure_ascii=False, separators=(",", ":")))
+        for call in model.invocations
     ]
-    assert len(final_assistant_messages) == len(external_invocations)
-    submit_calls = [
-        message["tool_call"]
-        for message in assistant_tool_calls
-        if message["tool_call"]["name"] == submit_name
+    assistant_blocks = [
+        block
+        for invocation in model.invocations
+        for block in invocation.response_blocks
     ]
-    assert [call["arguments"]["plan"] for call in submit_calls] == [
-        invalid_plan,
-        valid_plan,
+    final_texts = [
+        block["text"] for block in assistant_blocks if block["type"] == "text"
     ]
-    assert all(
-        message["name"] in {call["tool_call"]["name"] for call in assistant_tool_calls}
-        for message in decoded_history
-        if message["role"] == "tool"
-    )
-
-    peak = max(turn_measurements, key=lambda turn: turn.estimated_tokens)
     metrics = {
-        "invocations": external_invocations,
-        "measurement_labels": [turn.name for turn in turn_measurements],
-        "peak_turn": peak.name,
-        "peak_model_input_tokens": peak.estimated_tokens,
-        "tool_result_chars": [
-            {
-                "invocation": item.invocation,
-                "tool_name": item.tool_name,
-                "serialized_chars": item.serialized_chars,
-            }
-            for item in tool_result_measurements
-        ],
-        "max_tool_result_chars": max(
-            item.serialized_chars for item in tool_result_measurements
+        "model_invocation_count": len(model.invocations),
+        "peak_model_input_tokens": max(
+            invocation.input_tokens for invocation in model.invocations
         ),
-        "validation_failure_chars": validation_failure_measurement.serialized_chars,
-        "exposed_tool_schema_chars": exposed_schema_chars,
-        "per_turn_model_input_tokens": {
-            turn.name: turn.estimated_tokens for turn in turn_measurements
-        },
-        "compact_events": compact_events,
-        "compact_event_count": len(compact_events),
+        "per_call_model_input_tokens": [
+            invocation.input_tokens for invocation in model.invocations
+        ],
+        "formatted_message_counts": [
+            len(invocation.formatted_messages) for invocation in model.invocations
+        ],
+        "exposed_tool_schema_chars": schema_chars,
+        "tool_result_chars": result_measurements,
+        "max_tool_result_chars": max(
+            item["serialized_chars"] for item in result_measurements
+        ),
+        "validation_failure_chars": len(planning_results[-2]),
+        "compact_events": model.compact_events,
+        "compact_event_count": model.compact_event_count,
     }
-    assert metrics["invocations"] == ["entry", "inspection", "planning", "execution"]
-    assert any(":after:" in turn.name for turn in turn_measurements)
-    assert all(
-        f"{invocation}:final" in metrics["measurement_labels"]
-        for invocation in metrics["invocations"]
-    )
-    assert set(metrics["exposed_tool_schema_chars"]) == set(external_invocations)
-    assert all(chars > 0 for chars in metrics["exposed_tool_schema_chars"].values())
-    assert len(metrics["tool_result_chars"]) == len(
-        [message for message in decoded_history if message["role"] == "tool"]
-    )
-    assert len(metrics["per_turn_model_input_tokens"]) == len(turn_measurements)
-    assert metrics["peak_model_input_tokens"] == max(
-        turn.estimated_tokens for turn in turn_measurements
-    )
+    assert final_texts == [planning_final, execution_final]
+    assert metrics["model_invocation_count"] == len(assistant_blocks)
+    assert all(metrics["formatted_message_counts"])
+    assert all(chars > 0 for chars in metrics["exposed_tool_schema_chars"])
+    assert all(tokens > 0 for tokens in metrics["per_call_model_input_tokens"])
     assert metrics["max_tool_result_chars"] <= 5_500
     assert metrics["validation_failure_chars"] <= 3_000
     assert metrics["peak_model_input_tokens"] <= token_limit
     assert metrics["compact_event_count"] == 0
     assert metrics["compact_events"] == []
+    assert not getattr(agent.state, "summary", None)

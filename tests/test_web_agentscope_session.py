@@ -966,6 +966,7 @@ async def test_real_running_writer_returns_bounded_truthful_busy_handoff(
         expected_web_session_id="web-writer",
         expected_agentscope_session_id="as-writer",
     ) is StepClaimOutcome.CLAIMED
+    runtime.web_sessions["web-blocked"] = ("main-router-agent", "as-router")
     tool = agentscope_runtime_module.NavigationHandoffTool(
         runtime=runtime,
         web_session_id="web-blocked",
@@ -991,6 +992,9 @@ async def test_real_running_writer_returns_bounded_truthful_busy_handoff(
         "message": "该目标当前有正在运行的数据写入操作。",
     }
     assert len(result.content[0].text) <= 4_000
+    assert runtime.web_sessions == {
+        "web-blocked": ("main-router-agent", "as-router")
+    }
     assert runtime._navigation_task_store().find_by_session(
         web_session_id="web-blocked",
         agentscope_session_id="web-blocked__navigation-data-agent",
