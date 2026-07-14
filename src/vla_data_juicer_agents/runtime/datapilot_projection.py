@@ -7,9 +7,14 @@ from collections.abc import AsyncGenerator, Callable
 from typing import Any, Literal
 
 from agentscope.event import EventBase
-from agentscope.message import TextBlock, ToolResultState
+from agentscope.message import AssistantMsg, TextBlock, ToolResultState
 from agentscope.middleware import MiddlewareBase
 from agentscope.tool import ToolResponse
+
+from vla_data_juicer_agents.core.cancellation import (
+    CancellationContext,
+    bind_cancellation,
+)
 
 
 SUPPRESSED_TOOL_RESULT_EVENTS = {
@@ -18,6 +23,12 @@ SUPPRESSED_TOOL_RESULT_EVENTS = {
     "TOOL_RESULT_DATA_DELTA",
     "TOOL_RESULT_END",
 }
+SUPPRESSED_THINKING_EVENTS = {
+    "THINKING_BLOCK_START",
+    "THINKING_BLOCK_DELTA",
+    "THINKING_BLOCK_END",
+}
+SUPPRESSED_PUBLIC_EVENTS = SUPPRESSED_TOOL_RESULT_EVENTS | SUPPRESSED_THINKING_EVENTS
 _AGENT_NAMED_EVENT_TYPES = {"REPLY_START", "EXCEED_MAX_ITERS"}
 
 
@@ -135,7 +146,7 @@ class DataPilotReplyProjectionMiddleware(MiddlewareBase):
             if event_type == "REPLY_START":
                 reply_id = str(raw.get("reply_id", ""))
                 ordinal = 0
-            if event_type not in SUPPRESSED_TOOL_RESULT_EVENTS:
+            if event_type not in SUPPRESSED_PUBLIC_EVENTS:
                 public = sanitize_agent_event(
                     raw,
                     public_name="DataPilot",
@@ -153,6 +164,54 @@ class DataPilotReplyProjectionMiddleware(MiddlewareBase):
                 )
                 ordinal += 1
             yield event
+
+
+class DataPilotRunBoundaryMiddleware(MiddlewareBase):
+    """Bind cancellation to every ChatService run and fence stopped wakeups."""
+
+    def __init__(self, session_id: str, sink: Any) -> None:
+        self._session_id = session_id
+        self._sink = sink
+
+    async def on_reply(
+        self,
+        agent: Any,
+        input_kwargs: dict[str, Any],
+        next_handler: Callable[..., AsyncGenerator],
+    ) -> AsyncGenerator:
+        should_suppress = getattr(self._sink, "should_suppress_wakeup", None)
+        if (
+            input_kwargs.get("inputs") is None
+            and callable(should_suppress)
+            and should_suppress(self._session_id)
+        ):
+            # Ack the already-dequeued wakeup without a model call or a
+            # public reply.  ChatService still receives a final Msg.
+            yield AssistantMsg(
+                name=getattr(agent, "name", "DataPilot"),
+                content=[],
+            )
+            return
+
+        cancellation = self._sink.run_cancellation(self._session_id)
+        owns_cancellation = cancellation is None
+        if cancellation is None:
+            cancellation = CancellationContext()
+            self._sink.register_run_cancellation(
+                self._session_id,
+                cancellation,
+            )
+        try:
+            async with cancellation.track_agent(self._session_id):
+                with bind_cancellation(cancellation):
+                    async for item in next_handler(**input_kwargs):
+                        yield item
+        finally:
+            if owns_cancellation:
+                self._sink.clear_run_cancellation(
+                    self._session_id,
+                    cancellation,
+                )
 
 
 def _response_text(response: ToolResponse) -> str:
@@ -228,6 +287,18 @@ class DataPilotToolOutcomeMiddleware(MiddlewareBase):
         self._session_id = session_id
         self._sink = sink
 
+    def _stopped_delivery(self, tool_call_id: str, finished: Any) -> bool:
+        should_suppress = getattr(
+            self._sink,
+            "should_suppress_tool_delivery",
+            None,
+        )
+        return bool(
+            finished is None
+            and callable(should_suppress)
+            and should_suppress(self._session_id, tool_call_id)
+        )
+
     async def on_acting(
         self,
         agent: Any,
@@ -247,21 +318,32 @@ class DataPilotToolOutcomeMiddleware(MiddlewareBase):
             except StopAsyncIteration:
                 break
             except (Exception, asyncio.CancelledError) as exc:
-                await self._sink.finish_public_tool(
+                finished = await self._sink.finish_public_tool(
                     self._session_id,
                     tool_call_id=tool_call.id,
                     status="failure",
                     summary=str(exc),
                     error_type=type(exc).__name__,
                 )
+                if self._stopped_delivery(tool_call.id, finished):
+                    raise asyncio.CancelledError(
+                        "explicitly stopped tool result suppressed"
+                    ) from None
                 raise
             if isinstance(item, ToolResponse):
                 status, summary, error_type = classify_real_tool_response(item)
-                await self._sink.finish_public_tool(
+                finished = await self._sink.finish_public_tool(
                     self._session_id,
                     tool_call_id=tool_call.id,
                     status=status,
                     summary=summary,
                     error_type=error_type,
                 )
+                if self._stopped_delivery(tool_call.id, finished):
+                    # ToolOffload treats task cancellation as a deliberate
+                    # no-delivery outcome, preventing a stopped late result
+                    # from entering the inbox and waking another model run.
+                    raise asyncio.CancelledError(
+                        "explicitly stopped tool result suppressed"
+                    )
             yield item

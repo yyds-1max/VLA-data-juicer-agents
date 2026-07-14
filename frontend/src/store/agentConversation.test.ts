@@ -8,6 +8,7 @@ import type {
 import {
   applyPublicEvent,
   createAgentConversation,
+  hasActiveExecution,
   markConversationInterrupting,
   normalizePublicAgentEvent,
   restoreAgentConversation,
@@ -429,6 +430,50 @@ describe("AgentScope conversation reduction", () => {
     expect(state.toolRuns).toEqual({});
     expect(state.pendingHumanDecision).toBeNull();
     expect(state.lastSequence).toBe(1);
+  });
+
+  it("consumes thinking event sequences without retaining private reasoning", () => {
+    const state = createAgentConversation();
+    applyPublicEvent(state, envelope(1, replyStart("reply-1")));
+    applyPublicEvent(
+      state,
+      envelope(2, {
+        id: "thinking-start",
+        created_at: CREATED_AT,
+        type: "THINKING_BLOCK_START",
+        reply_id: "reply-1",
+        block_id: "thought-1",
+      } as AgentEvent),
+    );
+    applyPublicEvent(
+      state,
+      envelope(3, {
+        id: "thinking-delta",
+        created_at: CREATED_AT,
+        type: "THINKING_BLOCK_DELTA",
+        reply_id: "reply-1",
+        block_id: "thought-1",
+        delta: "private chain of thought",
+      } as AgentEvent),
+    );
+
+    expect(state.lastSequence).toBe(3);
+    expect(JSON.stringify(state.messages)).not.toContain("private chain of thought");
+    expect(state.messages[0].content).toEqual([]);
+  });
+
+  it("treats a restored running tool as active execution while reply is idle", () => {
+    const restored = restoreAgentConversation({
+      messages: [],
+      events: [],
+      toolRuns: [toolRun({ tool_call_id: "call-background", status: "running" })],
+      lastSequence: 0,
+    });
+
+    expect(restored.phase).toBe("idle");
+    expect(hasActiveExecution(restored)).toBe(true);
+    markConversationInterrupting(restored);
+    expect(restored.phase).toBe("interrupting");
   });
 
   it("normalizes missing or private reply session ids to the public envelope session", () => {

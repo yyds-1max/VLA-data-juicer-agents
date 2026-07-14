@@ -190,7 +190,10 @@ not keep browser streams open and do not control background execution.
 
 Public tool terminal states are exactly `success`, `failure`, and `stopped`. A tool
 uses `stopped` only after an explicit user stop; background execution by itself is
-not a separate terminal state.
+not a separate terminal state. A background tool remains stoppable after its first
+reply ends. Once an explicit stop succeeds, late results from that stopped execution
+are durably fenced and cannot enqueue a wakeup or produce another assistant reply;
+the next user message starts a new execution generation normally.
 
 Frontend verification commands:
 

@@ -77,6 +77,7 @@ class BackgroundCase:
     store: WebSessionStore
     public_bus: SessionEventBus
     message_bus: DeterministicMessageBus
+    background_manager: BackgroundTaskManager
     registry: RecordingChatRunRegistry
     model: SignalingScriptedChatModel
     web_session_id: str
@@ -253,6 +254,7 @@ async def _build_case(
         store=store,
         public_bus=public_bus,
         message_bus=message_bus,
+        background_manager=background_manager,
         registry=registry,
         model=model,
         web_session_id=public_session.id,
@@ -461,23 +463,19 @@ async def test_real_agentscope_explicit_stop_wins_over_late_background_success(
             for event in detail.events
         )
 
-        await _wait_until(
-            lambda: not case.message_bus._queues[MessageBusKeys.wakeup_queue()]
-            and case.registry.get(case.agentscope_session_id) is None,
-        )
-        await _finish_background(case)
+        case.release_tool.set()
+        await _wait_until(lambda: not case.background_manager.tasks)
+        await asyncio.sleep(0)
         replayed = await _replay_from_zero(case)
 
         detail = case.store.get_session(case.web_session_id)
         assert detail is not None
         assert [row.status for row in detail.tool_runs] == ["stopped"]
-        _assert_public_replay_contract(
-            case,
-            replayed,
-            expected_status="stopped",
-            expected_error_type=None,
-        )
-        assert case.wakeup_snapshots[0]["tool_runs"][0]["status"] == "stopped"
-        case.model.assert_exhausted()
+        terminals = _terminal_events(replayed)
+        assert [terminal["status"] for terminal in terminals] == ["stopped"]
+        assert len(_assistant_reply_ids(replayed)) == 1
+        assert len(case.model.invocations) == 2
+        assert case.wakeup_snapshots == []
+        assert case.message_bus._queues[MessageBusKeys.wakeup_queue()] == []
     finally:
         await case.stack.aclose()

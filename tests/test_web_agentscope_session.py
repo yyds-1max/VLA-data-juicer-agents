@@ -40,6 +40,7 @@ from vla_data_juicer_agents.runtime.agentscope_runtime import (
 )
 from vla_data_juicer_agents.runtime.datapilot_projection import (
     DataPilotReplyProjectionMiddleware,
+    DataPilotRunBoundaryMiddleware,
     DataPilotToolOutcomeMiddleware,
 )
 from vla_data_juicer_agents.runtime.agentscope_prompts import navigation_agent_prompt
@@ -47,12 +48,14 @@ from vla_data_juicer_agents.runtime.navigation_tool_surface import (
     NavigationToolSurfaceMiddleware,
 )
 from vla_data_juicer_agents.web.agent_session import AgentScopeWebSessionManager
+from vla_data_juicer_agents.web.event_stream import SessionEventBus
 from vla_data_juicer_agents.web.schemas import (
     HumanDecisionRequest,
     InterruptResponse,
     SessionRecord,
 )
 from vla_data_juicer_agents.web.session_store import WebSessionStore
+from vla_data_juicer_agents.web.sse import stream_session_events
 
 
 class FakeAgentScopeRuntime:
@@ -1336,10 +1339,11 @@ async def test_web_navigation_assembly_uses_middleware_not_basic_domain_tools(
     )
 
     assert tools == []
-    assert len(middlewares) == 3
-    assert isinstance(middlewares[0], DataPilotReplyProjectionMiddleware)
-    assert isinstance(middlewares[1], DataPilotToolOutcomeMiddleware)
-    middleware = middlewares[2]
+    assert len(middlewares) == 4
+    assert isinstance(middlewares[0], DataPilotRunBoundaryMiddleware)
+    assert isinstance(middlewares[1], DataPilotReplyProjectionMiddleware)
+    assert isinstance(middlewares[2], DataPilotToolOutcomeMiddleware)
+    middleware = middlewares[3]
     assert isinstance(middleware, NavigationToolSurfaceMiddleware)
     assert middleware._web_session_id == "web-1"
     assert middleware._agentscope_session_id == session_id
@@ -2072,12 +2076,16 @@ async def test_explicit_stop_serializes_real_tool_response_as_stopped(
         consumer_done_during_stop = consumer.done()
     finally:
         release_remote.set()
-        stop_result, yielded = await asyncio.gather(stop_task, consumer)
+        stop_result, yielded = await asyncio.gather(
+            stop_task,
+            consumer,
+            return_exceptions=True,
+        )
 
     assert status_during_stop == "running"
     assert consumer_done_during_stop is False
     assert stop_result.stopped_tool_call_ids == ["call-race"]
-    assert len(yielded) == 1
+    assert isinstance(yielded, asyncio.CancelledError)
     detail = store.get_session(public_session.id)
     assert detail is not None
     assert detail.tool_runs[0].status == "stopped"
@@ -3080,6 +3088,12 @@ async def test_runtime_recovers_wakeup_after_transient_dequeue_timeout() -> None
             "message": None,
         }
     ]
+    assert len(runtime.app.state.chat_service.seen_cancellations) == 1
+    assert isinstance(
+        runtime.app.state.chat_service.seen_cancellations[0],
+        CancellationContext,
+    )
+    assert runtime.run_cancellation("as-session-1") is None
     assert runtime.recovery_metrics.redis_timeout_count == 1
 
 
@@ -3453,6 +3467,119 @@ async def test_runtime_projection_persists_then_broadcasts_and_ignores_late_term
 
 
 @pytest.mark.asyncio
+async def test_tool_terminal_sanitizes_every_private_identity_before_ledger_write(
+    tmp_path: Path,
+) -> None:
+    store = WebSessionStore(tmp_path / "sessions.sqlite")
+    public_session = store.create_session("private terminal")
+    internal_session_id = "internal-navigation-session"
+    other_session_id = "other-internal-router-session"
+    store.save_agentscope_session_mapping(
+        public_session.id,
+        agent_id="navigation-data-agent",
+        agentscope_session_id=internal_session_id,
+    )
+    store.save_agentscope_session_mapping(
+        public_session.id,
+        agent_id="historical-private-agent",
+        agentscope_session_id=other_session_id,
+    )
+    runtime = _runtime(workspace_root=tmp_path)
+    runtime.set_web_session_store(store)
+    await runtime.start_public_tool(
+        internal_session_id,
+        tool_call_id="public-call-1",
+        tool_name="extract",
+    )
+
+    await runtime.finish_public_tool(
+        internal_session_id,
+        tool_call_id="public-call-1",
+        status="failure",
+        summary=(
+            f"nested error: {internal_session_id}; {other_session_id}; "
+            "navigation-data-agent; historical-private-agent; alice"
+        ),
+        error_type=other_session_id,
+    )
+
+    detail = store.get_session(public_session.id)
+    assert detail is not None
+    serialized = json.dumps(detail.model_dump(mode="json"), ensure_ascii=False)
+    for private in (
+        internal_session_id,
+        other_session_id,
+        "navigation-data-agent",
+        "historical-private-agent",
+        "alice",
+    ):
+        assert private not in serialized
+    assert "public-call-1" in serialized
+    assert detail.tool_runs[0].error_type == "private_runtime_identity"
+    assert detail.events[-1].event["value"]["error_type"] == (
+        "private_runtime_identity"
+    )
+    bus = SessionEventBus()
+    async with stream_session_events(store, bus, public_session.id, 0) as stream:
+        replayed = [await anext(stream) for _ in detail.events]
+    replay_json = json.dumps(
+        [record.model_dump(mode="json") for record in replayed],
+        ensure_ascii=False,
+    )
+    for private in (
+        internal_session_id,
+        other_session_id,
+        "navigation-data-agent",
+        "historical-private-agent",
+        "alice",
+    ):
+        assert private not in replay_json
+
+
+@pytest.mark.asyncio
+async def test_tool_terminal_identity_lookup_failure_persists_only_safe_generic(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    store = WebSessionStore(tmp_path / "sessions.sqlite")
+    public_session = store.create_session("lookup failure")
+    store.save_agentscope_session_mapping(
+        public_session.id,
+        agent_id="navigation-data-agent",
+        agentscope_session_id="private-session",
+    )
+    runtime = _runtime(workspace_root=tmp_path)
+    runtime.set_web_session_store(store)
+    await runtime.start_public_tool(
+        "private-session",
+        tool_call_id="public-call-2",
+        tool_name="extract",
+    )
+    monkeypatch.setattr(
+        runtime,
+        "projection_private_identities",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            sqlite3.OperationalError("identity db unavailable private-session")
+        ),
+    )
+
+    await runtime.finish_public_tool(
+        "private-session",
+        tool_call_id="public-call-2",
+        status="failure",
+        summary="secret private-session",
+        error_type="private-session",
+    )
+
+    detail = store.get_session(public_session.id)
+    assert detail is not None
+    assert detail.tool_runs[0].summary == "Tool execution details unavailable."
+    assert detail.tool_runs[0].error_type == "public_sanitization_failed"
+    serialized = json.dumps(detail.model_dump(mode="json"), ensure_ascii=False)
+    assert "secret private-session" not in serialized
+
+
+@pytest.mark.asyncio
 async def test_sync_live_publisher_failure_keeps_persisted_reply_and_yields_event(
     tmp_path: Path,
     caplog,
@@ -3648,6 +3775,65 @@ async def test_explicit_stop_is_idempotent_ignores_late_tool_outcome_and_allows_
     assert chat_run_registry.spawns[-1]["session_id"] == internal_session_id
     assert runtime.run_cancellation(internal_session_id) is not None
     await chat_run_registry.drain()
+
+
+@pytest.mark.asyncio
+async def test_stopped_generation_suppresses_restart_wakeup_until_new_user_turn(
+    tmp_path: Path,
+) -> None:
+    store = WebSessionStore(tmp_path / "sessions.sqlite")
+    public_session = store.create_session("restart stop boundary")
+    internal_session_id = "router-session"
+    store.save_agentscope_session_mapping(
+        public_session.id,
+        agent_id="main-router-agent",
+        agentscope_session_id=internal_session_id,
+    )
+    store.begin_execution_generation(public_session.id)
+    store.stop_open_tool_runs_with_terminal_events(
+        public_session.id,
+        lambda _row: pytest.fail("no running tool should require an event"),
+    )
+
+    restarted = _runtime(chat_run_registry=FakeChatRunRegistry())
+    restarted.set_web_session_store(WebSessionStore(store.db_path))
+    middleware = DataPilotRunBoundaryMiddleware(internal_session_id, restarted)
+    model_calls = 0
+
+    async def handler(**_kwargs):
+        nonlocal model_calls
+        model_calls += 1
+        yield ReplyStartEvent(
+            session_id=internal_session_id,
+            reply_id="unexpected-reply",
+            name="MainRouterAgent",
+        )
+
+    suppressed = [
+        item
+        async for item in middleware.on_reply(
+            SimpleNamespace(name="MainRouterAgent"),
+            {"inputs": None},
+            handler,
+        )
+    ]
+
+    assert model_calls == 0
+    assert len(suppressed) == 1
+    assert isinstance(suppressed[0], Msg)
+
+    store.begin_execution_generation(public_session.id)
+    resumed = [
+        item
+        async for item in middleware.on_reply(
+            SimpleNamespace(name="MainRouterAgent"),
+            {"inputs": None},
+            handler,
+        )
+    ]
+    assert model_calls == 1
+    assert isinstance(resumed[0], ReplyStartEvent)
+    assert restarted.run_cancellation(internal_session_id) is None
 
 
 @pytest.mark.asyncio

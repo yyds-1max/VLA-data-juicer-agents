@@ -43,6 +43,7 @@ from vla_data_juicer_agents.runtime.agentscope_bootstrap import bootstrap_agents
 from vla_data_juicer_agents.runtime.agentscope_config import AgentScopeRuntimeConfig
 from vla_data_juicer_agents.runtime.datapilot_projection import (
     DataPilotReplyProjectionMiddleware,
+    DataPilotRunBoundaryMiddleware,
     DataPilotToolOutcomeMiddleware,
     sanitize_agent_event,
 )
@@ -115,12 +116,16 @@ class AgentScopeRuntime:
         self.web_session_store = store
         self.web_event_publisher = publisher
 
-    def projection_private_identities(self) -> set[str]:
+    def projection_private_identities(
+        self,
+        web_session_id: str | None = None,
+    ) -> set[str]:
         identities = {
             "MainRouterAgent",
             self.config.main_router_agent_id,
             "NavigationDataAgent",
             self.config.navigation_agent_id,
+            self.config.user_id,
         }
         for agent_id, session_id in self.web_sessions.values():
             identities.update((agent_id, session_id))
@@ -129,13 +134,51 @@ class AgentScopeRuntime:
             "list_agentscope_session_mappings",
             None,
         )
-        if callable(list_mappings):
-            for web_session_id in self.web_sessions:
-                for mapping in list_mappings(web_session_id):
+        list_all_mappings = getattr(
+            self.web_session_store,
+            "list_all_agentscope_session_mappings",
+            None,
+        )
+        if web_session_id is None and callable(list_all_mappings):
+            for mapping in list_all_mappings():
+                identities.update(
+                    (mapping.agent_id, mapping.agentscope_session_id)
+                )
+        elif callable(list_mappings):
+            web_session_ids = (
+                [web_session_id]
+                if web_session_id is not None
+                else list(self.web_sessions)
+            )
+            for mapped_web_session_id in web_session_ids:
+                for mapping in list_mappings(mapped_web_session_id):
                     identities.update(
                         (mapping.agent_id, mapping.agentscope_session_id)
                     )
         return identities
+
+    def _sanitize_public_tool_outcome(
+        self,
+        public_session_id: str,
+        summary: str,
+        error_type: str | None,
+    ) -> tuple[str, str | None]:
+        try:
+            identities = self.projection_private_identities(public_session_id)
+        except Exception:  # pylint: disable=broad-except
+            _logger.exception("Public tool outcome identity lookup failed closed")
+            return "Tool execution details unavailable.", "public_sanitization_failed"
+        event = sanitize_agent_event(
+            {"summary": summary, "error_type": error_type},
+            private_identities=identities,
+        )
+        sanitized_summary = str(event.get("summary", ""))
+        sanitized_error = event.get("error_type")
+        if error_type is not None and error_type in identities:
+            sanitized_error = "private_runtime_identity"
+        elif sanitized_error is not None:
+            sanitized_error = str(sanitized_error)
+        return sanitized_summary, sanitized_error
 
     async def project_agent_event(
         self,
@@ -185,6 +228,11 @@ class AgentScopeRuntime:
         if public_session_id is None:
             return None
         async with self._tool_outcome_lock(public_session_id):
+            summary, error_type = self._sanitize_public_tool_outcome(
+                public_session_id,
+                summary,
+                error_type,
+            )
             tool_run = self.web_session_store.finish_tool_run(
                 public_session_id,
                 tool_call_id,
@@ -211,6 +259,28 @@ class AgentScopeRuntime:
             )
         await self._publish_public_record(public_session_id, record)
         return tool_run
+
+    def should_suppress_tool_delivery(
+        self,
+        agentscope_session_id: str,
+        tool_call_id: str,
+    ) -> bool:
+        public_session_id = self._public_session_id(agentscope_session_id)
+        if public_session_id is None or self.web_session_store is None:
+            return False
+        status = self.web_session_store.tool_run_status(
+            public_session_id,
+            tool_call_id,
+        )
+        return status == "stopped"
+
+    def should_suppress_wakeup(self, agentscope_session_id: str) -> bool:
+        public_session_id = self._public_session_id(agentscope_session_id)
+        if public_session_id is None or self.web_session_store is None:
+            return False
+        return self.web_session_store.execution_generation_is_stopped(
+            public_session_id
+        )
 
     def _tool_outcome_lock(self, public_session_id: str) -> asyncio.Lock:
         lock = self._tool_outcome_locks.get(public_session_id)
@@ -470,6 +540,8 @@ class AgentScopeRuntime:
             agent_id=agent_id,
             model=model,
         )
+        if self.web_session_store is not None:
+            self.web_session_store.begin_execution_generation(web_session_id)
         if agent_id == self.config.navigation_agent_id:
             anchor = self._navigation_durable_state_anchor(
                 session_id,
@@ -1444,17 +1516,29 @@ class AgentScopeRuntime:
             if record is None:
                 return False
 
+        cancellation = CancellationContext()
+        self.register_run_cancellation(session_id, cancellation)
+
+        async def run_with_cancellation() -> None:
+            try:
+                async with cancellation.track_agent(session_id):
+                    with bind_cancellation(cancellation):
+                        await self.app.state.chat_service.run(
+                            user_id=user_id,
+                            session_id=session_id,
+                            agent_id=agent_id,
+                            input_msg=None,
+                        )
+            finally:
+                self.clear_run_cancellation(session_id, cancellation)
+
         try:
             self._spawn_chat_run(
-                self.app.state.chat_service.run(
-                    user_id=user_id,
-                    session_id=session_id,
-                    agent_id=agent_id,
-                    input_msg=None,
-                ),
+                run_with_cancellation(),
                 session_id=session_id,
             )
         except RuntimeError:
+            self.clear_run_cancellation(session_id, cancellation)
             _logger.debug(
                 "AgentScope wakeup recovery skipped duplicate run: "
                 "session_id=%s source=%s",
@@ -2332,6 +2416,7 @@ def build_extra_agent_middlewares_factory(
         if runtime is None:
             raise RuntimeError("navigation runtime is unavailable")
         middlewares: list[Any] = [
+            DataPilotRunBoundaryMiddleware(session_id, runtime),
             DataPilotReplyProjectionMiddleware(session_id, runtime),
             DataPilotToolOutcomeMiddleware(session_id, runtime),
         ]

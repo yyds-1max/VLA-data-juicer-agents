@@ -14,6 +14,9 @@ from agentscope.event import (
     ReplyEndEvent,
     ReplyStartEvent,
     TextBlockDeltaEvent,
+    ThinkingBlockDeltaEvent,
+    ThinkingBlockEndEvent,
+    ThinkingBlockStartEvent,
     ToolCallStartEvent,
     ToolResultDataDeltaEvent,
     ToolResultEndEvent,
@@ -254,6 +257,55 @@ async def test_reply_projection_suppresses_every_native_tool_result_event():
 
     assert yielded == source_events
     assert [event["type"] for event in sink.events] == ["REPLY_START", "REPLY_END"]
+
+
+@pytest.mark.asyncio
+async def test_reply_projection_never_persists_native_thinking_content():
+    source_events = [
+        ReplyStartEvent(
+            session_id="internal-nav-session",
+            reply_id="reply-1",
+            name="navigation-data-agent",
+        ),
+        ThinkingBlockStartEvent(reply_id="reply-1", block_id="thought-1"),
+        ThinkingBlockDeltaEvent(
+            reply_id="reply-1",
+            block_id="thought-1",
+            delta="private chain of thought",
+        ),
+        ThinkingBlockEndEvent(reply_id="reply-1", block_id="thought-1"),
+        TextBlockDeltaEvent(
+            reply_id="reply-1",
+            block_id="answer-1",
+            delta="public answer",
+        ),
+        ReplyEndEvent(
+            session_id="internal-nav-session",
+            reply_id="reply-1",
+        ),
+    ]
+    sink = RecordingSink()
+    middleware = DataPilotReplyProjectionMiddleware(
+        "internal-nav-session",
+        sink,
+    )
+
+    async def handler(**_kwargs: Any):
+        for event in source_events:
+            yield event
+
+    yielded = [
+        event async for event in middleware.on_reply(SimpleNamespace(), {}, handler)
+    ]
+
+    assert yielded == source_events
+    assert [event["type"] for event in sink.events] == [
+        "REPLY_START",
+        "TEXT_BLOCK_DELTA",
+        "REPLY_END",
+    ]
+    assert "private chain of thought" not in json.dumps(sink.events)
+    assert "public answer" in json.dumps(sink.events)
 
 
 @pytest.mark.asyncio
@@ -535,6 +587,31 @@ async def test_tool_outcome_records_non_user_cancellation_as_failure_and_reraise
         ("call-1", "failure", "worker cancelled", "CancelledError")
     ]
     assert all(status != "stopped" for _, status, _, _ in sink.terminals)
+
+
+@pytest.mark.asyncio
+async def test_stopped_late_exception_becomes_no_delivery_cancellation():
+    class StoppedSink(RecordingSink):
+        def should_suppress_tool_delivery(self, _session_id, _tool_call_id):
+            return True
+
+    sink = StoppedSink()
+    middleware = DataPilotToolOutcomeMiddleware("internal-nav-session", sink)
+    tool_call = ToolCallBlock(id="call-stopped", name="extract", input="{}")
+
+    async def failed_handler(**_kwargs: Any):
+        raise RuntimeError("late private failure")
+        yield
+
+    with pytest.raises(asyncio.CancelledError, match="explicitly stopped"):
+        _ = [
+            item
+            async for item in middleware.on_acting(
+                SimpleNamespace(),
+                {"tool_call": tool_call},
+                failed_handler,
+            )
+        ]
 
 
 @pytest.mark.asyncio

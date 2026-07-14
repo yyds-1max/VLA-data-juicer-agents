@@ -4,7 +4,6 @@ import type {
   HintBlock,
   Msg,
   TextBlock,
-  ThinkingBlock,
 } from "@agentscope-ai/agentscope/message";
 
 import type { PublicToolRun } from "../../api/types";
@@ -152,7 +151,7 @@ function blockText(block: Msg["content"][number]): string {
     return (block as TextBlock).text;
   }
   if (block.type === "thinking") {
-    return (block as ThinkingBlock).thinking;
+    return "";
   }
   if (block.type === "hint") {
     const hint = (block as HintBlock).hint;

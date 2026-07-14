@@ -145,13 +145,21 @@ export function applyPublicEvent(
   } else if (!eventBelongsToCurrentReply(state, event)) {
     state.lastSequence = envelope.sequence;
     return;
+  } else if (isThinkingEvent(event)) {
+    // Public backends suppress these events. Consume their sequence only as
+    // a defense against legacy/malicious snapshots; never feed private
+    // reasoning content into the SDK message.
+    state.lastSequence = envelope.sequence;
+    return;
   } else if (event.type === EventType.REPLY_END) {
     const message = currentReply(state);
     if (message) {
       appendEvent(message, event);
     }
     state.currentReplyId = null;
-    state.phase = "idle";
+    state.phase = state.phase === "interrupting" && hasRunningTool(state)
+      ? "interrupting"
+      : "idle";
   } else if (event.type === EventType.CUSTOM) {
     applyDataPilotCustomEvent(state, envelope, event as CustomEvent);
   } else {
@@ -190,9 +198,21 @@ function eventBelongsToCurrentReply(
 }
 
 export function markConversationInterrupting(state: AgentConversationState): void {
-  if (state.phase === "streaming") {
+  if (state.phase === "streaming" || hasRunningTool(state)) {
     state.phase = "interrupting";
   }
+}
+
+export function hasActiveExecution(state: AgentConversationState): boolean {
+  return state.phase !== "idle" || hasRunningTool(state);
+}
+
+function hasRunningTool(state: AgentConversationState): boolean {
+  return Object.values(state.toolRuns).some((run) => run.status === "running");
+}
+
+function isThinkingEvent(event: AgentEvent): boolean {
+  return String(event.type).startsWith("THINKING_BLOCK_");
 }
 
 export function appendPersistedMessage(
@@ -334,6 +354,13 @@ function projectTerminalTool(
     started_at: existing?.started_at ?? event.created_at,
     finished_at: event.created_at,
   };
+  if (
+    state.phase === "interrupting" &&
+    !state.currentReplyId &&
+    !hasRunningTool(state)
+  ) {
+    state.phase = "idle";
+  }
 }
 
 function projectExternalDecision(

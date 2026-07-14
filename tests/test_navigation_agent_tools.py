@@ -64,6 +64,7 @@ from vla_data_juicer_agents.runtime.agentscope_runtime import (
 )
 from vla_data_juicer_agents.runtime.datapilot_projection import (
     DataPilotReplyProjectionMiddleware,
+    DataPilotRunBoundaryMiddleware,
     DataPilotToolOutcomeMiddleware,
 )
 from vla_data_juicer_agents.runtime.navigation_tool_surface import (
@@ -198,10 +199,11 @@ def test_navigation_middleware_factory_binds_exact_session_and_runtime(tmp_path)
         )
     )
 
-    assert len(middlewares) == 3
-    assert isinstance(middlewares[0], DataPilotReplyProjectionMiddleware)
-    assert isinstance(middlewares[1], DataPilotToolOutcomeMiddleware)
-    middleware = middlewares[2]
+    assert len(middlewares) == 4
+    assert isinstance(middlewares[0], DataPilotRunBoundaryMiddleware)
+    assert isinstance(middlewares[1], DataPilotReplyProjectionMiddleware)
+    assert isinstance(middlewares[2], DataPilotToolOutcomeMiddleware)
+    middleware = middlewares[3]
     assert isinstance(middleware, NavigationToolSurfaceMiddleware)
     assert middleware._services is services
     assert middleware._web_session_id == "web-1"
@@ -215,6 +217,7 @@ def test_navigation_middleware_factory_binds_exact_session_and_runtime(tmp_path)
         )
     )
     assert [type(middleware) for middleware in router_middlewares] == [
+        DataPilotRunBoundaryMiddleware,
         DataPilotReplyProjectionMiddleware,
         DataPilotToolOutcomeMiddleware,
     ]
@@ -584,17 +587,21 @@ def test_create_agentscope_runtime_wires_navigation_factories(monkeypatch, tmp_p
             navigation_session_id,
         )
     )
-    assert len(navigation_middlewares) == 3
+    assert len(navigation_middlewares) == 4
     assert isinstance(
         navigation_middlewares[0],
-        DataPilotReplyProjectionMiddleware,
+        DataPilotRunBoundaryMiddleware,
     )
     assert isinstance(
         navigation_middlewares[1],
-        DataPilotToolOutcomeMiddleware,
+        DataPilotReplyProjectionMiddleware,
     )
     assert isinstance(
         navigation_middlewares[2],
+        DataPilotToolOutcomeMiddleware,
+    )
+    assert isinstance(
+        navigation_middlewares[3],
         NavigationToolSurfaceMiddleware,
     )
 
@@ -603,6 +610,7 @@ def test_create_agentscope_runtime_wires_navigation_factories(monkeypatch, tmp_p
         middlewares_factory("alice", config.main_router_agent_id, router_session_id)
     )
     assert [type(middleware) for middleware in router_middlewares] == [
+        DataPilotRunBoundaryMiddleware,
         DataPilotReplyProjectionMiddleware,
         DataPilotToolOutcomeMiddleware,
     ]
@@ -623,6 +631,7 @@ def test_create_agentscope_runtime_wires_navigation_factories(monkeypatch, tmp_p
         middlewares_factory("alice", unknown_agent_id, unknown_session_id)
     )
     assert [type(middleware) for middleware in unknown_middlewares] == [
+        DataPilotRunBoundaryMiddleware,
         DataPilotReplyProjectionMiddleware,
         DataPilotToolOutcomeMiddleware,
     ]

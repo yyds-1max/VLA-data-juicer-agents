@@ -83,7 +83,11 @@ def test_fresh_store_creates_public_event_schema(tmp_path: Path):
 
     assert generation == (SCHEMA_GENERATION,)
     assert "status" not in session_columns
-    assert {"public_events", "public_tool_runs"} <= tables
+    assert {
+        "public_events",
+        "public_tool_runs",
+        "session_execution_boundaries",
+    } <= tables
 
 
 def test_schema_generation_check_holds_write_lock_against_concurrent_initializer(
@@ -277,6 +281,54 @@ def test_stop_open_tool_runs_only_stops_running_rows(tmp_path: Path):
         "stopped",
         "success",
     ]
+
+
+def test_execution_stop_boundary_survives_restart_and_new_generation_clears_it(
+    tmp_path: Path,
+):
+    db_path = tmp_path / "sessions.sqlite"
+    store = WebSessionStore(db_path)
+    session = store.create_session(title="generation boundary")
+
+    assert store.begin_execution_generation(session.id) == 1
+    assert store.execution_generation_is_stopped(session.id) is False
+    stopped, events = store.stop_open_tool_runs_with_terminal_events(
+        session.id,
+        lambda _row: pytest.fail("no running rows"),
+    )
+    assert stopped == []
+    assert events == []
+    assert WebSessionStore(db_path).execution_generation_is_stopped(session.id) is True
+
+    assert store.begin_execution_generation(session.id) == 2
+    assert WebSessionStore(db_path).execution_generation_is_stopped(session.id) is False
+
+    store.delete_session(session.id)
+    with sqlite3.connect(db_path) as connection:
+        assert connection.execute(
+            "SELECT COUNT(*) FROM session_execution_boundaries"
+        ).fetchone() == (0,)
+
+
+def test_existing_v1_schema_adds_stop_boundary_table_without_resetting_sessions(
+    tmp_path: Path,
+):
+    db_path = tmp_path / "sessions.sqlite"
+    store = WebSessionStore(db_path)
+    session = store.create_session(title="preserved v1 session")
+    with sqlite3.connect(db_path) as connection:
+        connection.execute("DROP TABLE session_execution_boundaries")
+        assert connection.execute(
+            "SELECT generation FROM web_schema WHERE singleton = 1"
+        ).fetchone() == (SCHEMA_GENERATION,)
+
+    reopened = WebSessionStore(db_path)
+
+    assert reopened.list_sessions() == [session]
+    with sqlite3.connect(db_path) as connection:
+        assert connection.execute(
+            "SELECT name FROM sqlite_master WHERE name = 'session_execution_boundaries'"
+        ).fetchone() == ("session_execution_boundaries",)
 
 
 def test_store_rejects_message_and_event_for_missing_session(tmp_path: Path):

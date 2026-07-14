@@ -15,6 +15,7 @@ import {
 } from "../../api/client";
 import type { PendingHumanDecision, SessionRecord } from "../../api/types";
 import { datapilotStore } from "../../store/datapilotStore";
+import { hasActiveExecution } from "../../store/agentConversation";
 import { Composer } from "./Composer";
 import { DraftNewSessionView } from "./DraftNewSessionView";
 import { HumanDecisionDialog } from "./HumanDecisionDialog";
@@ -52,7 +53,7 @@ export function DataPilotWindow() {
   const currentSessionId = useStore(datapilotStore, (state) => state.currentSessionId);
   const sessions = useStore(datapilotStore, (state) => state.sessions);
   const conversation = useStore(datapilotStore, (state) => state.conversation);
-  const running = conversation.phase !== "idle";
+  const running = hasActiveExecution(conversation);
   const interrupting = conversation.phase === "interrupting";
   const pendingHumanDecision = conversation.pendingHumanDecision;
   const floatingOffset = useStore(datapilotStore, (state) => state.floatingOffset);
@@ -535,6 +536,7 @@ export function DataPilotWindow() {
       const state = datapilotStore.getState();
       if (interrupted && state.currentSessionId === sessionId) {
         state.markInterrupting();
+        setStopRequestPending(false);
       } else {
         setStopRequestPending(false);
       }

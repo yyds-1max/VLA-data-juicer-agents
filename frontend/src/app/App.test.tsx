@@ -230,6 +230,31 @@ test("MessageList keeps owned tool rows with their reply and appends only orphan
   expect(secondReply.compareDocumentPosition(orphanTool) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
 });
 
+test("MessageList never renders thinking blocks from legacy or malicious snapshots", () => {
+  render(
+    <MessageList
+      messages={[
+        AssistantMsg({
+          id: "reply-thinking",
+          name: "DataPilot",
+          content: [
+            {
+              type: "thinking",
+              id: "private-thought",
+              thinking: "private chain of thought",
+            },
+            { type: "text", id: "public-answer", text: "public answer" },
+          ],
+        }),
+      ]}
+      toolRuns={{}}
+    />,
+  );
+
+  expect(screen.queryByText("private chain of thought")).not.toBeInTheDocument();
+  expect(screen.getByText("public answer")).toBeVisible();
+});
+
 function setOpenActiveSessionWithPendingDecision(
   decision: PendingHumanDecision,
   options: { sessionId?: string; title?: string } = {},
@@ -2712,6 +2737,118 @@ test("running stop interrupts the current turn without leaving active mode", asy
   expect(datapilotStore.getState().mode).toBe("active_session");
   expect(datapilotStore.getState().currentSessionId).toBe("session-1");
   expect(datapilotStore.getState().conversation.phase).toBe("interrupting");
+});
+
+test("background running tool remains stoppable after REPLY_END and resumes send only at terminal", async () => {
+  datapilotStore.setState({
+    open: true,
+    mode: "active_session",
+    currentSessionId: "session-1",
+    previousActiveSessionId: null,
+    sessions: [],
+    conversation: {
+      ...createAgentConversation(),
+      phase: "idle",
+      currentReplyId: null,
+      toolRuns: {
+        "call-background": {
+          session_id: "session-1",
+          tool_call_id: "call-background",
+          tool_name: "extract",
+          status: "running",
+          summary: "",
+          error_type: null,
+          started_at: "2026-06-26T00:00:00Z",
+          finished_at: null,
+        },
+      },
+    },
+  });
+  await renderAppWithDashboardSettled();
+
+  const input = screen.getByPlaceholderText("继续描述任务…");
+  fireEvent.change(input, { target: { value: "保留草稿" } });
+  fireEvent.click(screen.getByRole("button", { name: "Stop current run" }));
+
+  await waitFor(() => expect(apiMocks.interruptTurn).toHaveBeenCalledWith("session-1"));
+  expect(apiMocks.submitTurn).not.toHaveBeenCalled();
+  expect(input).toHaveValue("保留草稿");
+  expect(screen.getByRole("button", { name: "Interrupt requested" })).toBeDisabled();
+
+  act(() => {
+    datapilotStore.getState().applyEvent({
+      id: "event-stopped",
+      session_id: "session-1",
+      sequence: 1,
+      dedupe_key: "stopped".padStart(64, "0"),
+      created_at: "2026-06-26T00:00:01Z",
+      event: {
+        id: "terminal-stopped",
+        created_at: "2026-06-26T00:00:01Z",
+        type: EventType.CUSTOM,
+        name: "datapilot_tool_terminal",
+        value: {
+          tool_call_id: "call-background",
+          status: "stopped",
+          summary: "已由用户停止",
+        },
+      },
+    });
+  });
+
+  expect(await screen.findByRole("button", { name: "Send message" })).toBeEnabled();
+  expect(input).toHaveValue("保留草稿");
+});
+
+test("stop response cannot strand interrupt pending when terminal arrived first", async () => {
+  const interrupt = deferred<boolean>();
+  apiMocks.interruptTurn.mockReturnValue(interrupt.promise);
+  datapilotStore.setState({
+    open: true,
+    mode: "active_session",
+    currentSessionId: "session-1",
+    sessions: [],
+    conversation: {
+      ...createAgentConversation(),
+      toolRuns: {
+        "call-race": {
+          session_id: "session-1",
+          tool_call_id: "call-race",
+          tool_name: "extract",
+          status: "running",
+          summary: "",
+          error_type: null,
+          started_at: "2026-06-26T00:00:00Z",
+          finished_at: null,
+        },
+      },
+    },
+  });
+  await renderAppWithDashboardSettled();
+  fireEvent.click(screen.getByRole("button", { name: "Stop current run" }));
+
+  act(() => {
+    datapilotStore.getState().applyEvent({
+      id: "event-race-stopped",
+      session_id: "session-1",
+      sequence: 1,
+      dedupe_key: "race-stopped".padStart(64, "0"),
+      created_at: "2026-06-26T00:00:01Z",
+      event: {
+        id: "race-stopped",
+        created_at: "2026-06-26T00:00:01Z",
+        type: EventType.CUSTOM,
+        name: "datapilot_tool_terminal",
+        value: { tool_call_id: "call-race", status: "stopped" },
+      },
+    });
+  });
+  await act(async () => {
+    interrupt.resolve(true);
+    await interrupt.promise;
+  });
+
+  expect(await screen.findByRole("button", { name: "Send message" })).toBeEnabled();
 });
 
 test("stop keeps the draft editable and submits it after the terminating REPLY_END", async () => {

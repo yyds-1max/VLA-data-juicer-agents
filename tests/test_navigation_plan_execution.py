@@ -4,13 +4,17 @@ import asyncio
 import inspect
 import json
 import sqlite3
+import time
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path
-from threading import Barrier
+from threading import Barrier, Event
 from types import SimpleNamespace
 
 import pytest
+from agentscope.app.middleware import ToolOffloadMiddleware
+from agentscope.message import ToolCallBlock
+from agentscope.tool import Toolkit
 
 import vla_data_juicer_agents.navigation.plan_execution as plan_execution
 import vla_data_juicer_agents.navigation.plan_models as plan_models
@@ -405,6 +409,149 @@ def test_plan_bound_tools_expose_only_ids_and_all_remaining_distinct_actions(tmp
         assert set(tool.input_schema["properties"]) == {"plan_id", "step_id"}
         assert set(tool.input_schema["required"]) == {"plan_id", "step_id"}
         assert tool.input_schema["additionalProperties"] is False
+
+
+@pytest.mark.asyncio
+async def test_plan_bound_processing_tool_yields_to_offload_timeout_and_event_loop(
+    monkeypatch,
+    tmp_path,
+):
+    """Exercise the production-created FunctionTool, not an async fake tool."""
+    services = build_services(tmp_path)
+
+    def blocking_extract(**_kwargs):
+        time.sleep(0.08)
+        return ok_result("extract_and_sync_navigation_data")
+
+    monkeypatch.setattr(
+        plan_execution,
+        "extract_and_sync_navigation_data",
+        blocking_extract,
+    )
+    tool = services.tools()["extract_and_sync_navigation_data_tool"]
+    registered = asyncio.Event()
+    heartbeat = asyncio.Event()
+
+    class BackgroundManager:
+        async def register_task(self, **_kwargs):
+            registered.set()
+            return "background-plan-tool"
+
+    class MessageBus:
+        async def queue_push(self, *_args, **_kwargs):
+            return "entry"
+
+        async def publish(self, *_args, **_kwargs):
+            return None
+
+    agent = SimpleNamespace(
+        name="NavigationDataAgent",
+        state=SimpleNamespace(session_id=services.task.agentscope_session_id),
+        toolkit=Toolkit(tools=[tool]),
+    )
+    middleware = ToolOffloadMiddleware(
+        bg_manager=BackgroundManager(),
+        message_bus=MessageBus(),
+        user_id="test-user",
+        agent_id="navigation-agent",
+        timeout_secs=0.01,
+    )
+    tool_call = ToolCallBlock(
+        id="call-plan-sync",
+        name=tool.name,
+        input=json.dumps(
+            {"plan_id": services.plan.plan_id, "step_id": "sync"}
+        ),
+    )
+
+    async def next_handler(**_kwargs):
+        result = await tool(
+            plan_id=services.plan.plan_id,
+            step_id="sync",
+        )
+        if hasattr(result, "__aiter__"):
+            async for item in result:
+                yield item
+        else:
+            yield result
+
+    async def pulse():
+        await asyncio.sleep(0.02)
+        heartbeat.set()
+
+    pulse_task = asyncio.create_task(pulse())
+    started = asyncio.get_running_loop().time()
+    stream = middleware.on_acting(
+        agent,
+        {"tool_call": tool_call},
+        next_handler,
+    )
+    await anext(stream)
+    elapsed = asyncio.get_running_loop().time() - started
+
+    assert elapsed < 0.06
+    assert registered.is_set()
+    await pulse_task
+    assert heartbeat.is_set()
+    assert asyncio.get_running_loop().time() - started < 0.06
+    await stream.aclose()
+
+
+@pytest.mark.asyncio
+async def test_plan_bound_worker_observes_shared_cancellation_after_async_wrapper_cancel(
+    monkeypatch,
+    tmp_path,
+):
+    services = build_services(tmp_path)
+    cancellation = CancellationContext()
+    worker_started = Event()
+    worker_stopped = Event()
+
+    def cancellable_extract(**_kwargs):
+        worker_started.set()
+        try:
+            while True:
+                active = plan_execution.current_cancellation()
+                assert active is cancellation
+                active.raise_if_cancelled()
+                time.sleep(0.005)
+        finally:
+            worker_stopped.set()
+
+    monkeypatch.setattr(
+        plan_execution,
+        "extract_and_sync_navigation_data",
+        cancellable_extract,
+    )
+    tool = services.tools(cancellation=cancellation)[
+        "extract_and_sync_navigation_data_tool"
+    ]
+
+    async def invoke():
+        async with cancellation.track_agent("as-test"):
+            await tool(plan_id=services.plan.plan_id, step_id="sync")
+
+    task = asyncio.create_task(invoke())
+    assert await asyncio.to_thread(worker_started.wait, 1)
+    started = asyncio.get_running_loop().time()
+    assert cancellation.cancel() is True
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    assert await asyncio.to_thread(worker_stopped.wait, 1)
+    assert asyncio.get_running_loop().time() - started < 0.5
+
+    snapshot = None
+    for _ in range(100):
+        snapshot = services.plan_store.read_execution_snapshot(
+            web_session_id=services.task.created_by_web_session_id,
+            agentscope_session_id=services.task.agentscope_session_id,
+            task_id=services.task.task_id,
+        )
+        if snapshot is not None and snapshot.overview.steps[0].status != "running":
+            break
+        await asyncio.sleep(0.005)
+    assert snapshot is not None
+    assert snapshot.overview.steps[0].status == "failed"
 
 
 @pytest.mark.parametrize(

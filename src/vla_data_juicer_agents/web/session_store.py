@@ -22,6 +22,7 @@ from vla_data_juicer_agents.web.schemas import (
 
 WEB_SCHEMA_GENERATION = "agentscope-native-events-v1"
 WEB_CONTROL_TABLES = (
+    "session_execution_boundaries",
     "human_decision_consumptions",
     "public_tool_runs",
     "public_events",
@@ -165,6 +166,17 @@ class WebSessionStore:
                 request_id TEXT,
                 consumed_at TEXT NOT NULL,
                 PRIMARY KEY (agentscope_session_id, reply_id, tool_call_id)
+            )
+            """
+        )
+        connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS session_execution_boundaries (
+                session_id TEXT PRIMARY KEY,
+                generation INTEGER NOT NULL DEFAULT 0,
+                stopped_generation INTEGER,
+                updated_at TEXT NOT NULL,
+                FOREIGN KEY (session_id) REFERENCES sessions(id)
             )
             """
         )
@@ -402,6 +414,53 @@ class WebSessionStore:
         assert row is not None
         return self._tool_run_from_row(row)
 
+    def tool_run_status(self, session_id: str, tool_call_id: str) -> str | None:
+        with self._connect() as connection:
+            row = connection.execute(
+                """
+                SELECT status FROM public_tool_runs
+                WHERE session_id = ? AND tool_call_id = ?
+                """,
+                (session_id, tool_call_id),
+            ).fetchone()
+        return str(row[0]) if row is not None else None
+
+    def begin_execution_generation(self, session_id: str) -> int:
+        timestamp = _now()
+        with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            self._require_session(connection, session_id)
+            connection.execute(
+                """
+                INSERT INTO session_execution_boundaries (
+                    session_id, generation, stopped_generation, updated_at
+                ) VALUES (?, 1, NULL, ?)
+                ON CONFLICT(session_id) DO UPDATE SET
+                    generation = generation + 1,
+                    stopped_generation = NULL,
+                    updated_at = excluded.updated_at
+                """,
+                (session_id, timestamp),
+            )
+            row = connection.execute(
+                "SELECT generation FROM session_execution_boundaries WHERE session_id = ?",
+                (session_id,),
+            ).fetchone()
+        assert row is not None
+        return int(row[0])
+
+    def execution_generation_is_stopped(self, session_id: str) -> bool:
+        with self._connect() as connection:
+            row = connection.execute(
+                """
+                SELECT generation, stopped_generation
+                FROM session_execution_boundaries
+                WHERE session_id = ?
+                """,
+                (session_id,),
+            ).fetchone()
+        return bool(row is not None and row[1] is not None and row[0] == row[1])
+
     def finish_tool_run(
         self,
         session_id: str,
@@ -490,8 +549,6 @@ class WebSessionStore:
                 )
                 for row in rows
             ]
-            if not stopped:
-                return [], []
             connection.execute(
                 """
                 UPDATE public_tool_runs
@@ -500,6 +557,19 @@ class WebSessionStore:
                 """,
                 (finished_at, session_id),
             )
+            connection.execute(
+                """
+                INSERT INTO session_execution_boundaries (
+                    session_id, generation, stopped_generation, updated_at
+                ) VALUES (?, 0, 0, ?)
+                ON CONFLICT(session_id) DO UPDATE SET
+                    stopped_generation = generation,
+                    updated_at = excluded.updated_at
+                """,
+                (session_id, finished_at),
+            )
+            if not stopped:
+                return [], []
             sequence = int(
                 connection.execute(
                     """
@@ -614,6 +684,10 @@ class WebSessionStore:
             connection.execute("DELETE FROM public_events WHERE session_id = ?", (session_id,))
             connection.execute("DELETE FROM public_tool_runs WHERE session_id = ?", (session_id,))
             connection.execute(
+                "DELETE FROM session_execution_boundaries WHERE session_id = ?",
+                (session_id,),
+            )
+            connection.execute(
                 "DELETE FROM agentscope_sessions WHERE web_session_id = ?", (session_id,)
             )
             cursor = connection.execute("DELETE FROM sessions WHERE id = ?", (session_id,))
@@ -648,6 +722,26 @@ class WebSessionStore:
                 """,
                 (web_session_id, agent_id, agentscope_session_id, timestamp),
             )
+
+    def list_all_agentscope_session_mappings(
+        self,
+    ) -> list[AgentScopeSessionMapping]:
+        with self._connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT web_session_id, agent_id, agentscope_session_id
+                FROM agentscope_sessions
+                ORDER BY web_session_id, updated_at, rowid
+                """
+            ).fetchall()
+        return [
+            AgentScopeSessionMapping(
+                web_session_id=str(row["web_session_id"]),
+                agent_id=str(row["agent_id"]),
+                agentscope_session_id=str(row["agentscope_session_id"]),
+            )
+            for row in rows
+        ]
 
     def restore_agentscope_session_mapping(
         self,

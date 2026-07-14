@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import json
 import hashlib
 from pathlib import Path
@@ -1170,8 +1171,13 @@ def build_plan_bound_execution_tools(
     tools: list[ToolBase] = []
 
     def make_invoke(action: str, function: Callable[..., Any]):
-        def invoke(plan_id: str, step_id: str) -> dict[str, Any]:
-            return _invoke_plan_step(
+        async def invoke(plan_id: str, step_id: str) -> dict[str, Any]:
+            # AgentScope's FunctionTool calls synchronous functions directly on
+            # the event loop.  Plan steps can run subprocesses for minutes, so
+            # keep the orchestration body in a worker while sharing the same
+            # cancellation token (asyncio.to_thread copies contextvars).
+            return await asyncio.to_thread(
+                _invoke_plan_step,
                 bound_task=task,
                 plan_id=plan_id,
                 step_id=step_id,
