@@ -31,6 +31,12 @@ type DragState = {
   originY: number;
 };
 
+type StreamLease = {
+  sessionId: string;
+  generation: number;
+  controller: AbortController;
+};
+
 export function DataPilotWindow() {
   const open = useStore(datapilotStore, (state) => state.open);
   const mode = useStore(datapilotStore, (state) => state.mode);
@@ -52,9 +58,14 @@ export function DataPilotWindow() {
     width: typeof window === "undefined" ? 1280 : window.innerWidth,
     height: typeof window === "undefined" ? 900 : window.innerHeight,
   }));
-  const streamRef = useRef<{ sessionId: string; controller: AbortController } | null>(null);
+  const streamRef = useRef<StreamLease | null>(null);
   const startEventStreamRef = useRef<(sessionId: string) => void>(() => undefined);
   const reconnectTimerRef = useRef<number | null>(null);
+  const lifecycleGenerationRef = useRef(0);
+  const mountedRef = useRef(false);
+  const selectionGenerationRef = useRef(0);
+  const selectionTargetRef = useRef<string | null>(null);
+  const deletedSessionIdsRef = useRef(new Set<string>());
   const reconnectStateRef = useRef<{ sessionId: string | null; attempts: number }>({
     sessionId: null,
     attempts: 0,
@@ -71,63 +82,99 @@ export function DataPilotWindow() {
     reconnectTimerRef.current = null;
   }, []);
 
-  const refreshSessionSnapshot = useCallback(async (sessionId: string) => {
-    try {
-      const detail = await getSession(sessionId);
-      datapilotStore.getState().refreshActiveSession(detail);
-    } catch (error) {
-      console.error("Failed to refresh DataPilot active session", error);
-    }
-  }, []);
-
-  const abortEventStream = useCallback(() => {
+  const invalidateEventLifecycle = useCallback(() => {
+    lifecycleGenerationRef.current += 1;
     clearReconnectTimer();
     const active = streamRef.current;
     streamRef.current = null;
     active?.controller.abort();
   }, [clearReconnectTimer]);
 
+  const isCurrentLease = useCallback((lease: StreamLease) => {
+    const state = datapilotStore.getState();
+    return (
+      mountedRef.current &&
+      lifecycleGenerationRef.current === lease.generation &&
+      streamRef.current === lease &&
+      state.open &&
+      state.mode === "active_session" &&
+      state.currentSessionId === lease.sessionId &&
+      !deletedSessionIdsRef.current.has(lease.sessionId)
+    );
+  }, []);
+
   const startEventStream = useCallback(
     (sessionId: string) => {
       const active = streamRef.current;
-      if (active?.sessionId === sessionId && !active.controller.signal.aborted) {
+      if (active?.sessionId === sessionId) {
         return;
       }
 
-      abortEventStream();
+      if (active) {
+        invalidateEventLifecycle();
+      }
       if (reconnectStateRef.current.sessionId !== sessionId) {
         reconnectStateRef.current = { sessionId, attempts: 0 };
       }
       const controller = new AbortController();
-      streamRef.current = { sessionId, controller };
+      const lease: StreamLease = {
+        sessionId,
+        generation: lifecycleGenerationRef.current,
+        controller,
+      };
+      streamRef.current = lease;
 
       void (async () => {
         const afterSequence = datapilotStore.getState().conversation.lastSequence;
+        let replayRequired = false;
         try {
           for await (const event of streamSessionEvents(
             sessionId,
             afterSequence,
             controller.signal,
           )) {
-            if (streamRef.current?.controller !== controller || controller.signal.aborted) {
+            if (!isCurrentLease(lease)) {
               return;
             }
+            const beforeCursor = datapilotStore.getState().conversation.lastSequence;
             datapilotStore.getState().applyEvent(event);
-            reconnectStateRef.current.attempts = 0;
+            const afterCursor = datapilotStore.getState().conversation.lastSequence;
+            if (event.sequence > beforeCursor && afterCursor === beforeCursor) {
+              replayRequired = true;
+              controller.abort();
+              break;
+            }
+            if (afterCursor > beforeCursor) {
+              reconnectStateRef.current.attempts = 0;
+            }
           }
         } catch (error) {
-          if (!controller.signal.aborted) {
+          if (isCurrentLease(lease) && !controller.signal.aborted && !replayRequired) {
             console.error("DataPilot event stream failed", error);
           }
         }
 
-        if (streamRef.current?.controller !== controller || controller.signal.aborted) {
+        if (!isCurrentLease(lease)) {
           return;
         }
-        streamRef.current = null;
-        await refreshSessionSnapshot(sessionId);
-        if (controller.signal.aborted) {
+        const cursorBeforeRefresh = datapilotStore.getState().conversation.lastSequence;
+        try {
+          const detail = await getSession(sessionId);
+          if (!isCurrentLease(lease)) {
+            return;
+          }
+          datapilotStore.getState().refreshActiveSession(detail);
+        } catch (error) {
+          if (!isCurrentLease(lease)) {
+            return;
+          }
+          console.error("Failed to refresh DataPilot active session", error);
+        }
+        if (!isCurrentLease(lease)) {
           return;
+        }
+        if (datapilotStore.getState().conversation.lastSequence > cursorBeforeRefresh) {
+          reconnectStateRef.current.attempts = 0;
         }
         reconnectStateRef.current.attempts += 1;
         const reconnectDelay = Math.min(
@@ -136,25 +183,31 @@ export function DataPilotWindow() {
         );
         reconnectTimerRef.current = window.setTimeout(() => {
           reconnectTimerRef.current = null;
-          const state = datapilotStore.getState();
-          if (
-            state.open &&
-            state.mode === "active_session" &&
-            state.currentSessionId === sessionId &&
-            !streamRef.current
-          ) {
-            startEventStreamRef.current(sessionId);
+          if (isCurrentLease(lease)) {
+            controller.abort();
+            streamRef.current = null;
+            startEventStreamRef.current(lease.sessionId);
           }
         }, reconnectDelay);
       })();
     },
-    [abortEventStream, refreshSessionSnapshot],
+    [invalidateEventLifecycle, isCurrentLease],
   );
   startEventStreamRef.current = startEventStream;
 
   useEffect(() => {
+    mountedRef.current = true;
+    return () => {
+      mountedRef.current = false;
+      selectionGenerationRef.current += 1;
+      selectionTargetRef.current = null;
+      invalidateEventLifecycle();
+    };
+  }, [invalidateEventLifecycle]);
+
+  useEffect(() => {
     if (!open || mode !== "active_session" || !currentSessionId) {
-      abortEventStream();
+      invalidateEventLifecycle();
       reconnectStateRef.current = { sessionId: null, attempts: 0 };
       return undefined;
     }
@@ -178,12 +231,10 @@ export function DataPilotWindow() {
     return () => {
       cancelled = true;
       if (streamRef.current?.sessionId === sessionId) {
-        abortEventStream();
+        invalidateEventLifecycle();
       }
     };
-  }, [abortEventStream, currentSessionId, mode, open, startEventStream]);
-
-  useEffect(() => abortEventStream, [abortEventStream]);
+  }, [currentSessionId, invalidateEventLifecycle, mode, open, startEventStream]);
 
   useEffect(() => {
     if (conversation.phase === "idle") {
@@ -237,21 +288,51 @@ export function DataPilotWindow() {
   };
 
   const handleNewSession = () => {
-    abortEventStream();
+    selectionGenerationRef.current += 1;
+    selectionTargetRef.current = null;
+    invalidateEventLifecycle();
     setHistoryOpen(false);
     datapilotStore.getState().enterDraft();
   };
 
   const handleSelectHistory = async (session: SessionRecord) => {
-    abortEventStream();
+    const previousState = datapilotStore.getState();
+    const previousMode = previousState.mode;
+    const previousSessionId = previousState.currentSessionId;
+    const selectionGeneration = selectionGenerationRef.current + 1;
+    selectionGenerationRef.current = selectionGeneration;
+    selectionTargetRef.current = session.id;
+    invalidateEventLifecycle();
+    const lifecycleGeneration = lifecycleGenerationRef.current;
+    const ownsSelection = () => {
+      const state = datapilotStore.getState();
+      return (
+        mountedRef.current &&
+        selectionGenerationRef.current === selectionGeneration &&
+        selectionTargetRef.current === session.id &&
+        lifecycleGenerationRef.current === lifecycleGeneration &&
+        !deletedSessionIdsRef.current.has(session.id) &&
+        state.open &&
+        state.mode === previousMode &&
+        state.currentSessionId === previousSessionId
+      );
+    };
     try {
       const detail = await getSession(session.id);
+      if (!ownsSelection()) {
+        return;
+      }
+      selectionTargetRef.current = null;
       datapilotStore.getState().restoreSession(detail);
       setHistoryOpen(false);
+      startEventStream(session.id);
     } catch (error) {
-      const state = datapilotStore.getState();
-      if (state.open && state.mode === "active_session" && state.currentSessionId) {
-        startEventStream(state.currentSessionId);
+      if (!ownsSelection()) {
+        return;
+      }
+      selectionTargetRef.current = null;
+      if (previousMode === "active_session" && previousSessionId) {
+        startEventStream(previousSessionId);
       }
       console.error("Failed to restore DataPilot session", error);
     }
@@ -260,12 +341,25 @@ export function DataPilotWindow() {
   const handleDeleteHistory = async (session: SessionRecord) => {
     try {
       await deleteSession(session.id);
+      deletedSessionIdsRef.current.add(session.id);
+      const cancelledSelection = selectionTargetRef.current === session.id;
+      if (cancelledSelection) {
+        selectionGenerationRef.current += 1;
+        selectionTargetRef.current = null;
+      }
       const store = datapilotStore.getState();
       store.setSessions(store.sessions.filter((item) => item.id !== session.id));
       if (store.currentSessionId === session.id) {
-        abortEventStream();
+        invalidateEventLifecycle();
         store.enterDraft();
         setHistoryOpen(false);
+      } else if (
+        cancelledSelection &&
+        store.open &&
+        store.mode === "active_session" &&
+        store.currentSessionId
+      ) {
+        startEventStream(store.currentSessionId);
       }
     } catch (error) {
       console.error("Failed to delete DataPilot session", error);
@@ -282,7 +376,7 @@ export function DataPilotWindow() {
       await submitTurn(session.id, message);
       datapilotStore.getState().appendUserMessage(userMessage);
     } catch (error) {
-      abortEventStream();
+      invalidateEventLifecycle();
       datapilotStore.getState().enterDraft();
       console.error("Failed to submit DataPilot draft turn", error);
     }

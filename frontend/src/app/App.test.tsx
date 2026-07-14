@@ -2,6 +2,7 @@ import "@testing-library/jest-dom/vitest";
 import { act, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { EventType } from "@agentscope-ai/agentscope/event";
 import { AssistantMsg, UserMsg } from "@agentscope-ai/agentscope/message";
+import { StrictMode } from "react";
 
 import {
   createSession,
@@ -21,8 +22,10 @@ import type {
   PendingHumanDecision,
   PublicEventEnvelope,
   PublicToolRun,
+  SessionDetail,
 } from "../api/types";
 import { Composer } from "../components/datapilot/Composer";
+import { DataPilotWindow } from "../components/datapilot/DataPilotWindow";
 import { MessageList } from "../components/datapilot/MessageList";
 import { resetNavigationDatasetSummaryCache } from "../features/console/navigationDatasetSummaryCache";
 import { createAgentConversation } from "../store/agentConversation";
@@ -119,6 +122,34 @@ function replayedAssistantReply(text: string): PublicEventEnvelope[] {
       delta: text,
     }),
   ];
+}
+
+function publicEnvelope(
+  sequence: number,
+  event: PublicEventEnvelope["event"],
+  sessionId = "session-1",
+): PublicEventEnvelope {
+  return {
+    id: `event-${sequence}`,
+    session_id: sessionId,
+    sequence,
+    dedupe_key: String(sequence).padStart(64, "0"),
+    created_at: `2026-06-26T00:00:${String(sequence).padStart(2, "0")}Z`,
+    event,
+  };
+}
+
+function emptySessionDetail(sessionId: string, lastSequence = 0): SessionDetail {
+  return {
+    id: sessionId,
+    title: sessionId,
+    created_at: "2026-06-26T00:00:00Z",
+    updated_at: "2026-06-26T00:00:00Z",
+    messages: [],
+    events: [],
+    tool_runs: [],
+    last_sequence: lastSequence,
+  };
 }
 
 function deferred<T>() {
@@ -1541,6 +1572,121 @@ test("switching selected sessions aborts A before opening B and resumes each cur
   expect(apiMocks.streamSessionEvents).toHaveBeenCalledTimes(2);
 });
 
+test("a sequence gap aborts the stream and reconnects from the unadvanced cursor", async () => {
+  const signals: AbortSignal[] = [];
+  const gap = publicEnvelope(3, {
+    id: "gap-reply-start",
+    created_at: "2026-06-26T00:00:03Z",
+    type: EventType.REPLY_START,
+    session_id: "session-1",
+    reply_id: "reply-gap",
+    name: "DataPilot",
+    role: "assistant",
+  });
+  apiMocks.streamSessionEvents.mockImplementation((_sessionId, _cursor, signal) => {
+    signals.push(signal);
+    return signals.length === 1 ? eventStream([gap], signal) : waitingEventStream(signal);
+  });
+  apiMocks.getSession.mockResolvedValue(emptySessionDetail("session-1", 1));
+  datapilotStore.setState({
+    open: true,
+    mode: "active_session",
+    currentSessionId: "session-1",
+    conversation: { ...createAgentConversation(), lastSequence: 1 },
+  });
+
+  await renderAppWithDashboardSettled();
+
+  await waitFor(() => expect(signals[0]?.aborted).toBe(true));
+  await waitFor(() => expect(apiMocks.getSession).toHaveBeenCalledTimes(2));
+  await waitFor(() => expect(apiMocks.streamSessionEvents).toHaveBeenCalledTimes(2));
+  expect(apiMocks.streamSessionEvents).toHaveBeenNthCalledWith(
+    2,
+    "session-1",
+    1,
+    expect.any(AbortSignal),
+  );
+  expect(datapilotStore.getState().conversation.lastSequence).toBe(1);
+});
+
+test("an ownerless continuation triggers snapshot repair before reconnect", async () => {
+  const initialSnapshot = deferred<ReturnType<typeof emptySessionDetail>>();
+  const ownerless = publicEnvelope(1, {
+    id: "ownerless-delta",
+    created_at: "2026-06-26T00:00:01Z",
+    type: EventType.TEXT_BLOCK_DELTA,
+    reply_id: "missing-reply-start",
+    block_id: "block-1",
+    delta: "must replay",
+  });
+  const repaired = {
+    ...emptySessionDetail("session-1", 3),
+    events: replayedAssistantReply("snapshot repaired"),
+  };
+  const signals: AbortSignal[] = [];
+  apiMocks.getSession
+    .mockImplementationOnce(() => initialSnapshot.promise)
+    .mockResolvedValue(repaired);
+  apiMocks.streamSessionEvents.mockImplementation((_sessionId, _cursor, signal) => {
+    signals.push(signal);
+    return signals.length === 1 ? eventStream([ownerless], signal) : waitingEventStream(signal);
+  });
+  datapilotStore.setState({
+    open: true,
+    mode: "active_session",
+    currentSessionId: "session-1",
+    conversation: createAgentConversation(),
+  });
+
+  await renderAppWithDashboardSettled();
+
+  await waitFor(() => expect(signals[0]?.aborted).toBe(true));
+  expect(await screen.findByText("snapshot repaired")).toBeVisible();
+  await waitFor(() => expect(apiMocks.streamSessionEvents).toHaveBeenCalledTimes(2));
+  expect(apiMocks.streamSessionEvents).toHaveBeenNthCalledWith(
+    2,
+    "session-1",
+    3,
+    expect.any(AbortSignal),
+  );
+  initialSnapshot.resolve(repaired);
+});
+
+test("a consumed wrong-owner event advances normally without forcing replay", async () => {
+  let signal: AbortSignal | undefined;
+  const wrongOwner = publicEnvelope(2, {
+    id: "wrong-owner-delta",
+    created_at: "2026-06-26T00:00:02Z",
+    type: EventType.TEXT_BLOCK_DELTA,
+    reply_id: "reply-other",
+    block_id: "block-1",
+    delta: "ignored",
+  });
+  apiMocks.streamSessionEvents.mockImplementation((_sessionId, _cursor, nextSignal) => {
+    signal = nextSignal;
+    return eventStream([wrongOwner], nextSignal);
+  });
+  apiMocks.getSession.mockResolvedValue(emptySessionDetail("session-1", 1));
+  datapilotStore.setState({
+    open: true,
+    mode: "active_session",
+    currentSessionId: "session-1",
+    conversation: {
+      ...createAgentConversation(),
+      phase: "streaming",
+      currentReplyId: "reply-1",
+      lastSequence: 1,
+    },
+  });
+
+  await renderAppWithDashboardSettled();
+
+  await waitFor(() => expect(datapilotStore.getState().conversation.lastSequence).toBe(2));
+  expect(signal?.aborted).toBe(false);
+  expect(apiMocks.streamSessionEvents).toHaveBeenCalledTimes(1);
+  expect(apiMocks.getSession).toHaveBeenCalledTimes(1);
+});
+
 test("new session enters draft mode without creating a session", async () => {
   datapilotStore.setState({
     open: true,
@@ -1904,6 +2050,100 @@ test("a retryable selected-stream error reconnects once from the preserved curso
   consoleError.mockRestore();
 });
 
+test("unmount invalidates a stream while its reconnect snapshot is pending", async () => {
+  const reconnectSnapshot = deferred<ReturnType<typeof emptySessionDetail>>();
+  let endedSignal: AbortSignal | undefined;
+  apiMocks.streamSessionEvents.mockImplementation((_sessionId, _cursor, signal) => {
+    endedSignal = signal;
+    return (async function* () {
+      return;
+    })();
+  });
+  apiMocks.getSession
+    .mockResolvedValueOnce(emptySessionDetail("session-1"))
+    .mockReturnValueOnce(reconnectSnapshot.promise);
+  datapilotStore.setState({
+    open: true,
+    mode: "active_session",
+    currentSessionId: "session-1",
+    conversation: createAgentConversation(),
+  });
+
+  const rendered = render(<DataPilotWindow />);
+  await waitFor(() => expect(apiMocks.getSession).toHaveBeenCalledTimes(2));
+  rendered.unmount();
+
+  expect(endedSignal?.aborted).toBe(true);
+  reconnectSnapshot.resolve(emptySessionDetail("session-1"));
+  await act(async () => {
+    await reconnectSnapshot.promise;
+    await new Promise((resolve) => window.setTimeout(resolve, 350));
+  });
+  expect(apiMocks.streamSessionEvents).toHaveBeenCalledTimes(1);
+});
+
+test("unmount cancels an already queued reconnect timer and its ended lease", async () => {
+  vi.useFakeTimers();
+  try {
+    let endedSignal: AbortSignal | undefined;
+    apiMocks.streamSessionEvents.mockImplementation((_sessionId, _cursor, signal) => {
+      endedSignal = signal;
+      return (async function* () {
+        return;
+      })();
+    });
+    apiMocks.getSession.mockResolvedValue(emptySessionDetail("session-1"));
+    datapilotStore.setState({
+      open: true,
+      mode: "active_session",
+      currentSessionId: "session-1",
+      conversation: createAgentConversation(),
+    });
+
+    const rendered = render(<DataPilotWindow />);
+    await act(async () => {
+      for (let index = 0; index < 6; index += 1) await Promise.resolve();
+    });
+    expect(vi.getTimerCount()).toBeGreaterThan(0);
+    rendered.unmount();
+
+    expect(endedSignal?.aborted).toBe(true);
+    await act(async () => {
+      await vi.runAllTimersAsync();
+    });
+    expect(apiMocks.streamSessionEvents).toHaveBeenCalledTimes(1);
+  } finally {
+    vi.useRealTimers();
+  }
+});
+
+test("StrictMode leaves exactly one selected-session lease alive", async () => {
+  const signals: AbortSignal[] = [];
+  apiMocks.streamSessionEvents.mockImplementation((_sessionId, _cursor, signal) => {
+    signals.push(signal);
+    return waitingEventStream(signal);
+  });
+  apiMocks.getSession.mockResolvedValue(emptySessionDetail("session-1"));
+  datapilotStore.setState({
+    open: true,
+    mode: "active_session",
+    currentSessionId: "session-1",
+    conversation: createAgentConversation(),
+  });
+
+  const rendered = render(
+    <StrictMode>
+      <DataPilotWindow />
+    </StrictMode>,
+  );
+  await waitFor(() => expect(signals.length).toBeGreaterThanOrEqual(2));
+
+  expect(signals.filter((signal) => !signal.aborted)).toHaveLength(1);
+  expect(signals.at(-1)?.aborted).toBe(false);
+  rendered.unmount();
+  expect(signals.at(-1)?.aborted).toBe(true);
+});
+
 
 test("selecting any saved session restores it as writable active_session", async () => {
   apiMocks.listSessions.mockResolvedValue([
@@ -1946,6 +2186,136 @@ test("selecting any saved session restores it as writable active_session", async
   });
   fireEvent.click(screen.getByRole("button", { name: "Send message" }));
   await waitFor(() => expect(apiMocks.submitTurn).toHaveBeenCalledWith("saved-1", "继续执行"));
+});
+
+test("reselecting the current history session replaces its stream", async () => {
+  const signals: AbortSignal[] = [];
+  apiMocks.listSessions.mockResolvedValue([
+    {
+      id: "session-a",
+      title: "Session A",
+      created_at: "2026-06-25T01:00:00Z",
+      updated_at: "2026-06-25T02:00:00Z",
+    },
+  ]);
+  apiMocks.getSession.mockResolvedValue(emptySessionDetail("session-a"));
+  apiMocks.streamSessionEvents.mockImplementation((_sessionId, _cursor, signal) => {
+    signals.push(signal);
+    return waitingEventStream(signal);
+  });
+  datapilotStore.setState({
+    open: true,
+    mode: "active_session",
+    currentSessionId: "session-a",
+    sessions: [],
+    conversation: createAgentConversation(),
+  });
+  await renderAppWithDashboardSettled();
+  await waitFor(() => expect(apiMocks.streamSessionEvents).toHaveBeenCalledTimes(1));
+
+  fireEvent.click(screen.getByRole("button", { name: "History" }));
+  fireEvent.click(await screen.findByRole("button", { name: "Open session Session A" }));
+
+  await waitFor(() => expect(apiMocks.streamSessionEvents).toHaveBeenCalledTimes(2));
+  expect(signals[0]?.aborted).toBe(true);
+  expect(signals[1]?.aborted).toBe(false);
+  expect(datapilotStore.getState().currentSessionId).toBe("session-a");
+});
+
+test("rapid history selections keep only the latest response and stream", async () => {
+  const sessionB = deferred<ReturnType<typeof emptySessionDetail>>();
+  const sessionC = deferred<ReturnType<typeof emptySessionDetail>>();
+  apiMocks.listSessions.mockResolvedValue([
+    {
+      id: "session-b",
+      title: "Session B",
+      created_at: "2026-06-25T01:00:00Z",
+      updated_at: "2026-06-25T02:00:00Z",
+    },
+    {
+      id: "session-c",
+      title: "Session C",
+      created_at: "2026-06-25T01:00:00Z",
+      updated_at: "2026-06-25T02:00:00Z",
+    },
+  ]);
+  apiMocks.getSession.mockImplementation((sessionId) =>
+    sessionId === "session-b" ? sessionB.promise : sessionC.promise,
+  );
+  const opened: string[] = [];
+  apiMocks.streamSessionEvents.mockImplementation((sessionId, _cursor, signal) => {
+    opened.push(sessionId);
+    return waitingEventStream(signal);
+  });
+  await renderAppWithDashboardSettled();
+  fireEvent.click(screen.getByRole("button", { name: "Open DataPilot" }));
+  fireEvent.click(screen.getByRole("button", { name: "History" }));
+
+  fireEvent.click(await screen.findByRole("button", { name: "Open session Session B" }));
+  fireEvent.click(screen.getByRole("button", { name: "Open session Session C" }));
+  sessionC.resolve(emptySessionDetail("session-c", 4));
+
+  await waitFor(() => expect(datapilotStore.getState().currentSessionId).toBe("session-c"));
+  expect(opened).toEqual(["session-c"]);
+
+  sessionB.resolve(emptySessionDetail("session-b", 2));
+  await act(async () => {
+    await sessionB.promise;
+    await Promise.resolve();
+  });
+
+  expect(datapilotStore.getState().currentSessionId).toBe("session-c");
+  expect(opened).toEqual(["session-c"]);
+});
+
+test("deleting a session while its history snapshot is pending prevents resurrection", async () => {
+  const sessionB = deferred<ReturnType<typeof emptySessionDetail>>();
+  apiMocks.listSessions.mockResolvedValue([
+    {
+      id: "session-b",
+      title: "Session B",
+      created_at: "2026-06-25T01:00:00Z",
+      updated_at: "2026-06-25T02:00:00Z",
+    },
+  ]);
+  apiMocks.getSession.mockImplementation((sessionId) =>
+    sessionId === "session-b"
+      ? sessionB.promise
+      : Promise.resolve(emptySessionDetail("session-a")),
+  );
+  const opened: string[] = [];
+  const signals: AbortSignal[] = [];
+  apiMocks.streamSessionEvents.mockImplementation((sessionId, _cursor, signal) => {
+    opened.push(sessionId);
+    signals.push(signal);
+    return waitingEventStream(signal);
+  });
+  datapilotStore.setState({
+    open: true,
+    mode: "active_session",
+    currentSessionId: "session-a",
+    sessions: [],
+    conversation: createAgentConversation(),
+  });
+  await renderAppWithDashboardSettled();
+  await waitFor(() => expect(opened).toEqual(["session-a"]));
+  fireEvent.click(screen.getByRole("button", { name: "History" }));
+
+  fireEvent.click(await screen.findByRole("button", { name: "Open session Session B" }));
+  await waitFor(() => expect(signals[0]?.aborted).toBe(true));
+  fireEvent.click(screen.getByRole("button", { name: "Delete session Session B" }));
+  await waitFor(() => expect(apiMocks.deleteSession).toHaveBeenCalledWith("session-b"));
+  await waitFor(() => expect(opened).toEqual(["session-a", "session-a"]));
+  sessionB.resolve(emptySessionDetail("session-b"));
+  await act(async () => {
+    await sessionB.promise;
+    await Promise.resolve();
+  });
+
+  expect(datapilotStore.getState().mode).toBe("active_session");
+  expect(datapilotStore.getState().currentSessionId).toBe("session-a");
+  expect(opened).toEqual(["session-a", "session-a"]);
+  expect(signals[1]?.aborted).toBe(false);
 });
 
 test("deleting history stops propagation and removes it only after a successful 204", async () => {
