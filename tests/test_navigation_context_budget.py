@@ -23,6 +23,9 @@ from vla_data_juicer_agents.navigation.agent_tools import (
     resolve_navigation_agent_tools,
     resolve_navigation_tool_surface,
 )
+from vla_data_juicer_agents.navigation.catalog import (
+    list_navigation_tool_capabilities,
+)
 from vla_data_juicer_agents.navigation.config import NavigationSettings
 from vla_data_juicer_agents.navigation.plan_models import (
     ExtractSyncPlanInput,
@@ -38,6 +41,7 @@ from vla_data_juicer_agents.navigation.tool_groups import (
     NAVIGATION_EXECUTION_ACTIONS,
     NAVIGATION_EXECUTION_STATE,
     NAVIGATION_INVESTIGATION,
+    NAVIGATION_GROUP_NAMES,
     NAVIGATION_PLAN_AUTHORING,
 )
 from vla_data_juicer_agents.runtime.agentscope_bootstrap import bootstrap_agentscope_records
@@ -53,6 +57,66 @@ from test_navigation_plan_submission_tools import (
 REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
 GUIDANCE_PATH = REPOSITORY_ROOT / "docs" / "navigation-plan-agent-guidance.md"
 SERVER_ACCEPTANCE_PATH = REPOSITORY_ROOT / "docs" / "navigation-plan-server-acceptance.md"
+
+AGENTSCOPE_GENERIC_OR_RESET_TOOL_NAMES = {
+    "Bash",
+    "Read",
+    "Write",
+    "Edit",
+    "Glob",
+    "Grep",
+    "TaskCreate",
+    "TaskGet",
+    "TaskList",
+    "TaskUpdate",
+    "TaskStop",
+    "ScheduleCreate",
+    "ScheduleView",
+    "ScheduleDelete",
+    "ScheduleList",
+    "TeamCreate",
+    "AgentCreate",
+    "TeamSay",
+    "TeamDelete",
+    "Skill",
+    "reset_tools",
+    # Preserve coverage for the lowercase generic fixtures used by the
+    # AgentScope integration regressions.
+    "bash",
+    "read",
+    "write",
+    "edit",
+    "task",
+    "schedule",
+    "team",
+    "skill_viewer",
+}
+AGENTSCOPE_GENERIC_TOOL_PREFIXES = (
+    "Task",
+    "Schedule",
+    "Team",
+    "Agent",
+    "Skill",
+    "MCP",
+    "mcp_",
+    "skill_",
+)
+EXECUTION_STATE_SCHEMA_NAMES = {
+    "get_current_plan_step_tool",
+    "get_plan_execution_overview_tool",
+}
+EXECUTION_ACTION_SCHEMA_NAMES = {
+    "prepare_raw_data_tool",
+    "extract_and_sync_navigation_data_tool",
+    "request_human_decision",
+    "assemble_finish_temp_tool",
+    "run_noobscene_preprocessing_tool",
+    "run_initial_annotation_gui_tool",
+    "run_tracking_tool",
+    "prepare_gridmap_for_projection_tool",
+    "run_projection_and_trajectory_tool",
+    "validate_navigation_outputs_tool",
+}
 
 
 class _BootstrapStorage:
@@ -328,6 +392,28 @@ def _resolve_surface(services, session_id):
     return surface
 
 
+def _assert_surface_has_no_agentscope_generic_paths(surface):
+    assert (
+        tuple(group.name for group in surface.groups)
+        == surface.active_group_names
+    )
+    assert set(surface.active_group_names) <= set(NAVIGATION_GROUP_NAMES)
+    for group in surface.groups:
+        assert group.name in NAVIGATION_GROUP_NAMES
+        assert not hasattr(group, "skills_or_loaders")
+        assert not hasattr(group, "mcps")
+
+    tools = surface.flatten_active_tools()
+    names = {tool.name for tool in tools}
+    assert AGENTSCOPE_GENERIC_OR_RESET_TOOL_NAMES.isdisjoint(names)
+    assert all(
+        not name.startswith(AGENTSCOPE_GENERIC_TOOL_PREFIXES)
+        for name in names
+    )
+    assert all(not getattr(tool, "is_mcp", False) for tool in tools)
+    assert all(getattr(tool, "mcp_name", None) is None for tool in tools)
+
+
 def _actual_navigation_surfaces(tmp_path):
     planning_session = "planning-budget"
     planning_services, _planning_built = _surface_services(
@@ -402,6 +488,24 @@ def _actual_navigation_surfaces(tmp_path):
     return planning, execution, recovery
 
 
+def test_execution_schema_denylist_matches_catalog_and_external_schema():
+    catalog_action_schemas = {
+        (
+            "request_human_decision"
+            if capability.tool_name == "confirm_navigation_calibration_params"
+            else f"{capability.tool_name}_tool"
+        )
+        for capability in list_navigation_tool_capabilities()
+        if capability.executor_agent_allowed
+    }
+
+    assert EXECUTION_ACTION_SCHEMA_NAMES == catalog_action_schemas
+    assert EXECUTION_STATE_SCHEMA_NAMES == {
+        "get_current_plan_step_tool",
+        "get_plan_execution_overview_tool",
+    }
+
+
 def test_actual_grouped_surface_schemas_fit_context_budget(tmp_path):
     planning, execution, recovery = _actual_navigation_surfaces(tmp_path)
     surfaces = {
@@ -413,18 +517,11 @@ def test_actual_grouped_surface_schemas_fit_context_budget(tmp_path):
         activity: [tool.name for tool in surface.flatten_active_tools()]
         for activity, surface in surfaces.items()
     }
-    generic_or_reset_names = {"bash", "read", "task", "reset_tools"}
-
-    planning_excluded = {
-        tool.name
-        for group_name in (
-            NAVIGATION_EXECUTION_STATE,
-            NAVIGATION_EXECUTION_ACTIONS,
-        )
-        for tool in execution.group(group_name).tools
-    }
-    assert planning_excluded.isdisjoint(names["planning"])
-    assert generic_or_reset_names.isdisjoint(names["planning"])
+    assert (
+        EXECUTION_STATE_SCHEMA_NAMES | EXECUTION_ACTION_SCHEMA_NAMES
+    ).isdisjoint(names["planning"])
+    assert NAVIGATION_EXECUTION_STATE not in planning.active_group_names
+    assert NAVIGATION_EXECUTION_ACTIONS not in planning.active_group_names
 
     execution_excluded = {
         tool.name
@@ -437,22 +534,31 @@ def test_actual_grouped_surface_schemas_fit_context_budget(tmp_path):
         "submit_extract_sync_plan_tool",
         "submit_finish_processing_plan_tool",
     }.isdisjoint(names["execution"])
-    assert generic_or_reset_names.isdisjoint(names["execution"])
-
-    execution_action_names = {
+    assert execution.group(NAVIGATION_EXECUTION_STATE).tools
+    assert {
+        tool.name for tool in execution.group(NAVIGATION_EXECUTION_STATE).tools
+    } == EXECUTION_STATE_SCHEMA_NAMES
+    assert {
         tool.name for tool in execution.group(NAVIGATION_EXECUTION_ACTIONS).tools
-    }
+    } <= EXECUTION_ACTION_SCHEMA_NAMES
+
     plan_authoring_names = {
         tool.name for tool in planning.group(NAVIGATION_PLAN_AUTHORING).tools
     }
-    assert execution_action_names.isdisjoint(names["recovery_required"])
+    assert EXECUTION_ACTION_SCHEMA_NAMES.isdisjoint(names["recovery_required"])
     assert plan_authoring_names.isdisjoint(names["recovery_required"])
-    assert generic_or_reset_names.isdisjoint(names["recovery_required"])
+    assert NAVIGATION_EXECUTION_STATE in recovery.active_group_names
+    assert NAVIGATION_EXECUTION_ACTIONS not in recovery.active_group_names
+    assert NAVIGATION_PLAN_AUTHORING not in recovery.active_group_names
+    assert {
+        tool.name for tool in recovery.group(NAVIGATION_EXECUTION_STATE).tools
+    } == EXECUTION_STATE_SCHEMA_NAMES
 
     for activity, surface in surfaces.items():
         assert surface.activity == activity
         assert surface.group(NAVIGATION_DIAGNOSTICS).tools == ()
         assert len(names[activity]) == len(set(names[activity]))
+        _assert_surface_has_no_agentscope_generic_paths(surface)
 
     schemas = {
         activity: _serialize_surface_schemas(surface)

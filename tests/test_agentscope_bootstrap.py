@@ -157,6 +157,7 @@ def test_navigation_agent_prompt_states_system_managed_phase_transitions():
         "investigation/planning tools become available again",
     ]:
         assert exact_contract in prompt
+    assert prompt.lower().count("after extract/sync") == 1
 
 
 def test_navigation_agent_prompt_has_no_legacy_guidance_loader_contract():
