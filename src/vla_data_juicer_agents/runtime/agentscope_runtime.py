@@ -1,11 +1,14 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
+import inspect
 import json
 import logging
 import re
 from contextlib import suppress
 from dataclasses import dataclass, field
+from datetime import UTC, datetime
 from types import SimpleNamespace
 from typing import Any
 from uuid import uuid4
@@ -14,7 +17,7 @@ import agentscope.app
 from agentscope.app.message_bus import MessageBusKeys, RedisMessageBus
 from agentscope.app.storage import ChatModelConfig, RedisStorage, SessionConfig
 from agentscope.app.workspace_manager import LocalWorkspaceManager
-from agentscope.event import ExternalExecutionResultEvent
+from agentscope.event import CustomEvent, ExternalExecutionResultEvent
 from agentscope.message import TextBlock, ToolCallState, ToolResultBlock, ToolResultState, UserMsg
 from agentscope.permission import PermissionBehavior, PermissionDecision
 from agentscope.tool import ToolBase, ToolChunk
@@ -41,6 +44,10 @@ from vla_data_juicer_agents.navigation.task_entry import (
 from vla_data_juicer_agents.navigation.task_store import normalize_segments
 from vla_data_juicer_agents.runtime.agentscope_bootstrap import bootstrap_agentscope_records
 from vla_data_juicer_agents.runtime.agentscope_config import AgentScopeRuntimeConfig
+from vla_data_juicer_agents.runtime.datapilot_projection import (
+    DataPilotReplyProjectionMiddleware,
+    DataPilotToolOutcomeMiddleware,
+)
 from vla_data_juicer_agents.runtime.navigation_tool_surface import (
     NavigationToolSurfaceMiddleware,
 )
@@ -85,6 +92,7 @@ class AgentScopeRuntime:
     web_sessions: dict[str, tuple[str, str]] = field(default_factory=dict)
     event_cursors: dict[str, str | None] = field(default_factory=dict)
     web_session_store: Any | None = None
+    web_event_publisher: Any | None = None
     _active_human_decision_claims: set[str] = field(default_factory=set)
     _run_cancellations: dict[str, CancellationContext] = field(default_factory=dict)
     recovery_metrics: AgentScopeRecoveryMetrics = field(default_factory=AgentScopeRecoveryMetrics)
@@ -105,6 +113,108 @@ class AgentScopeRuntime:
 
     def set_web_session_store(self, store: Any) -> None:
         self.web_session_store = store
+
+    def set_web_transport(self, store: Any, publisher: Any | None) -> None:
+        self.web_session_store = store
+        self.web_event_publisher = publisher
+
+    async def project_agent_event(
+        self,
+        agentscope_session_id: str,
+        *,
+        dedupe_key: str,
+        event: dict[str, Any],
+    ) -> Any | None:
+        public_session_id = self._public_session_id(agentscope_session_id)
+        if public_session_id is None:
+            return None
+        record = self.web_session_store.append_public_event(
+            public_session_id,
+            dedupe_key,
+            event,
+        )
+        await self._publish_public_record(public_session_id, record)
+        return record
+
+    async def start_public_tool(
+        self,
+        agentscope_session_id: str,
+        *,
+        tool_call_id: str,
+        tool_name: str,
+    ) -> Any | None:
+        public_session_id = self._public_session_id(agentscope_session_id)
+        if public_session_id is None:
+            return None
+        return self.web_session_store.start_tool_run(
+            public_session_id,
+            tool_call_id,
+            tool_name,
+            datetime.now(UTC).isoformat(timespec="milliseconds"),
+        )
+
+    async def finish_public_tool(
+        self,
+        agentscope_session_id: str,
+        *,
+        tool_call_id: str,
+        status: str,
+        summary: str,
+        error_type: str | None,
+    ) -> Any | None:
+        public_session_id = self._public_session_id(agentscope_session_id)
+        if public_session_id is None:
+            return None
+        tool_run = self.web_session_store.finish_tool_run(
+            public_session_id,
+            tool_call_id,
+            status=status,
+            summary=summary,
+            error_type=error_type,
+        )
+        if tool_run is None:
+            return None
+        event = CustomEvent(
+            name="datapilot_tool_terminal",
+            value={
+                "tool_call_id": tool_call_id,
+                "status": status,
+                "summary": summary,
+                "error_type": error_type,
+            },
+        ).model_dump(mode="json")
+        identity = f"tool-terminal:{agentscope_session_id}:{tool_call_id}:{status}"
+        record = self.web_session_store.append_public_event(
+            public_session_id,
+            hashlib.sha256(identity.encode("utf-8")).hexdigest(),
+            event,
+        )
+        await self._publish_public_record(public_session_id, record)
+        return tool_run
+
+    def _public_session_id(self, agentscope_session_id: str) -> str | None:
+        if self.web_session_store is None:
+            return None
+        get_mapping = getattr(
+            self.web_session_store,
+            "get_agentscope_session_mapping_by_agentscope_session",
+            None,
+        )
+        if callable(get_mapping):
+            mapping = get_mapping(agentscope_session_id)
+            if mapping is not None:
+                return mapping.web_session_id
+        for web_session_id, (_agent_id, session_id) in self.web_sessions.items():
+            if session_id == agentscope_session_id:
+                return web_session_id
+        return None
+
+    async def _publish_public_record(self, session_id: str, record: Any) -> None:
+        if self.web_event_publisher is None:
+            return
+        result = self.web_event_publisher(session_id, record)
+        if inspect.isawaitable(result):
+            await result
 
     def web_session_subscription_key(self, *, web_session_id: str) -> tuple[str, str] | None:
         return self._web_session_mapping(web_session_id)
@@ -2430,22 +2540,27 @@ def build_extra_agent_middlewares_factory(
         agent_id: str,
         session_id: str,
     ) -> list[Any]:
-        if agent_id != config.navigation_agent_id:
-            return []
         if runtime is None:
             raise RuntimeError("navigation runtime is unavailable")
+        middlewares: list[Any] = [
+            DataPilotReplyProjectionMiddleware(session_id, runtime),
+            DataPilotToolOutcomeMiddleware(session_id, runtime),
+        ]
+        if agent_id != config.navigation_agent_id:
+            return middlewares
         web_session_id = _web_session_id_from_agentscope_session(
             session_id,
             agent_id=config.navigation_agent_id,
         )
-        return [
+        middlewares.append(
             NavigationToolSurfaceMiddleware(
                 services=runtime._navigation_services(),
                 web_session_id=web_session_id,
                 agentscope_session_id=session_id,
                 cancellation=runtime.run_cancellation(session_id),
             )
-        ]
+        )
+        return middlewares
 
     return extra_agent_middlewares
 

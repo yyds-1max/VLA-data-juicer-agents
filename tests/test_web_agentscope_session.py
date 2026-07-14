@@ -1,4 +1,5 @@
 import asyncio
+import hashlib
 import json
 import sqlite3
 from pathlib import Path
@@ -30,6 +31,10 @@ from vla_data_juicer_agents.runtime.agentscope_runtime import (
     build_extra_agent_middlewares_factory,
     build_extra_agent_tools_factory,
 )
+from vla_data_juicer_agents.runtime.datapilot_projection import (
+    DataPilotReplyProjectionMiddleware,
+    DataPilotToolOutcomeMiddleware,
+)
 from vla_data_juicer_agents.runtime.agentscope_prompts import navigation_agent_prompt
 from vla_data_juicer_agents.runtime.navigation_tool_surface import (
     NavigationToolSurfaceMiddleware,
@@ -53,9 +58,14 @@ class StoreAwareAgentScopeRuntime(FakeAgentScopeRuntime):
     def __init__(self) -> None:
         super().__init__()
         self.web_session_store = None
+        self.web_event_publisher = None
 
     def set_web_session_store(self, store) -> None:
         self.web_session_store = store
+
+    def set_web_transport(self, store, publisher) -> None:
+        self.web_session_store = store
+        self.web_event_publisher = publisher
 
 
 class EventingAgentScopeRuntime(FakeAgentScopeRuntime):
@@ -1402,8 +1412,10 @@ async def test_web_navigation_assembly_uses_middleware_not_basic_domain_tools(
     )
 
     assert tools == []
-    assert len(middlewares) == 1
-    middleware = middlewares[0]
+    assert len(middlewares) == 3
+    assert isinstance(middlewares[0], DataPilotReplyProjectionMiddleware)
+    assert isinstance(middlewares[1], DataPilotToolOutcomeMiddleware)
+    middleware = middlewares[2]
     assert isinstance(middleware, NavigationToolSurfaceMiddleware)
     assert middleware._web_session_id == "web-1"
     assert middleware._agentscope_session_id == session_id
@@ -2965,18 +2977,102 @@ async def test_create_session_creates_compatible_record_and_persists(tmp_path: P
     assert session.title == "处理 20270605 的室外导航数据，并进行 dry-ru"
     detail = store.get_session(session.id)
     assert detail is not None
-    assert detail.model_dump(exclude={"messages", "events"}) == session.model_dump()
+    assert detail.model_dump(
+        exclude={"messages", "events", "tool_runs", "last_sequence"}
+    ) == session.model_dump()
     assert detail.messages == []
     assert detail.events == []
 
 
-def test_agentscope_web_session_manager_attaches_store_to_runtime(tmp_path: Path) -> None:
+def test_agentscope_web_session_manager_attaches_transport_to_runtime(tmp_path: Path) -> None:
     store = WebSessionStore(tmp_path / "sessions.sqlite")
     runtime = StoreAwareAgentScopeRuntime()
+    publisher = lambda _session_id, _record: None
 
-    AgentScopeWebSessionManager(store=store, runtime=runtime)
+    AgentScopeWebSessionManager(
+        store=store,
+        runtime=runtime,
+        event_callback=publisher,
+    )
 
     assert runtime.web_session_store is store
+    assert runtime.web_event_publisher is publisher
+
+
+@pytest.mark.asyncio
+async def test_runtime_projection_persists_then_broadcasts_and_ignores_late_terminal(
+    tmp_path: Path,
+) -> None:
+    store = WebSessionStore(tmp_path / "sessions.sqlite")
+    public_session = store.create_session("处理导航数据")
+    internal_session_id = "internal-navigation-session"
+    store.save_agentscope_session_mapping(
+        public_session.id,
+        agent_id="navigation-data-agent",
+        agentscope_session_id=internal_session_id,
+    )
+    published = []
+
+    async def publish(session_id, record) -> None:
+        detail = store.get_session(session_id)
+        assert detail is not None
+        assert detail.events[-1].id == record.id
+        published.append((session_id, record))
+
+    runtime = _runtime(workspace_root=tmp_path)
+    runtime.set_web_transport(store, publish)
+    event = {
+        "type": "REPLY_START",
+        "reply_id": "reply-1",
+        "name": "DataPilot",
+        "role": "assistant",
+    }
+    dedupe_key = hashlib.sha256(b"event-1").hexdigest()
+
+    await runtime.project_agent_event(
+        internal_session_id,
+        dedupe_key=dedupe_key,
+        event=event,
+    )
+    await runtime.start_public_tool(
+        internal_session_id,
+        tool_call_id="call-1",
+        tool_name="extract",
+    )
+    await runtime.finish_public_tool(
+        internal_session_id,
+        tool_call_id="call-1",
+        status="failure",
+        summary="extract failed",
+        error_type="extract_sync_failed",
+    )
+    await runtime.finish_public_tool(
+        internal_session_id,
+        tool_call_id="call-1",
+        status="success",
+        summary="late placeholder",
+        error_type=None,
+    )
+
+    detail = store.get_session(public_session.id)
+    assert detail is not None
+    assert [(run.tool_call_id, run.status, run.error_type) for run in detail.tool_runs] == [
+        ("call-1", "failure", "extract_sync_failed")
+    ]
+    terminal_events = [
+        record.event
+        for record in detail.events
+        if record.event.get("name") == "datapilot_tool_terminal"
+    ]
+    assert len(terminal_events) == 1
+    assert terminal_events[0]["type"] == "CUSTOM"
+    assert terminal_events[0]["value"] == {
+        "tool_call_id": "call-1",
+        "status": "failure",
+        "summary": "extract failed",
+        "error_type": "extract_sync_failed",
+    }
+    assert [record.sequence for _, record in published] == [1, 2]
 
 
 @pytest.mark.asyncio

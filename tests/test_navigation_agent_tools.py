@@ -58,6 +58,10 @@ from vla_data_juicer_agents.runtime.agentscope_runtime import (
     build_extra_agent_tools_factory,
     create_agentscope_runtime,
 )
+from vla_data_juicer_agents.runtime.datapilot_projection import (
+    DataPilotReplyProjectionMiddleware,
+    DataPilotToolOutcomeMiddleware,
+)
 from vla_data_juicer_agents.runtime.navigation_tool_surface import (
     NavigationToolSurfaceMiddleware,
 )
@@ -190,23 +194,26 @@ def test_navigation_middleware_factory_binds_exact_session_and_runtime(tmp_path)
         )
     )
 
-    assert len(middlewares) == 1
-    middleware = middlewares[0]
+    assert len(middlewares) == 3
+    assert isinstance(middlewares[0], DataPilotReplyProjectionMiddleware)
+    assert isinstance(middlewares[1], DataPilotToolOutcomeMiddleware)
+    middleware = middlewares[2]
     assert isinstance(middleware, NavigationToolSurfaceMiddleware)
     assert middleware._services is services
     assert middleware._web_session_id == "web-1"
     assert middleware._agentscope_session_id == "web-1__navigation-data-agent"
     assert middleware._cancellation is cancellation
-    assert (
-        asyncio.run(
-            factory(
-                "alice",
-                config.main_router_agent_id,
-                "web-1__main-router-agent",
-            )
+    router_middlewares = asyncio.run(
+        factory(
+            "alice",
+            config.main_router_agent_id,
+            "web-1__main-router-agent",
         )
-        == []
     )
+    assert [type(middleware) for middleware in router_middlewares] == [
+        DataPilotReplyProjectionMiddleware,
+        DataPilotToolOutcomeMiddleware,
+    ]
 
 
 def test_navigation_middleware_factory_fails_closed_without_runtime(tmp_path):
@@ -573,16 +580,28 @@ def test_create_agentscope_runtime_wires_navigation_factories(monkeypatch, tmp_p
             navigation_session_id,
         )
     )
-    assert len(navigation_middlewares) == 1
+    assert len(navigation_middlewares) == 3
     assert isinstance(
         navigation_middlewares[0],
+        DataPilotReplyProjectionMiddleware,
+    )
+    assert isinstance(
+        navigation_middlewares[1],
+        DataPilotToolOutcomeMiddleware,
+    )
+    assert isinstance(
+        navigation_middlewares[2],
         NavigationToolSurfaceMiddleware,
     )
 
     router_session_id = "web-1__main-router-agent"
-    assert asyncio.run(
+    router_middlewares = asyncio.run(
         middlewares_factory("alice", config.main_router_agent_id, router_session_id)
-    ) == []
+    )
+    assert [type(middleware) for middleware in router_middlewares] == [
+        DataPilotReplyProjectionMiddleware,
+        DataPilotToolOutcomeMiddleware,
+    ]
     router_tool_names = {
         tool.name
         for tool in asyncio.run(
@@ -596,9 +615,13 @@ def test_create_agentscope_runtime_wires_navigation_factories(monkeypatch, tmp_p
     assert asyncio.run(
         tools_factory("alice", unknown_agent_id, unknown_session_id)
     ) == []
-    assert asyncio.run(
+    unknown_middlewares = asyncio.run(
         middlewares_factory("alice", unknown_agent_id, unknown_session_id)
-    ) == []
+    )
+    assert [type(middleware) for middleware in unknown_middlewares] == [
+        DataPilotReplyProjectionMiddleware,
+        DataPilotToolOutcomeMiddleware,
+    ]
 
 
 def _resolver_services_from_complete(
