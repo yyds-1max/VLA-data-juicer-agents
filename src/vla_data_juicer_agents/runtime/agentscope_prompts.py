@@ -48,7 +48,9 @@ Durable workflow invariants:
 - Investigate before deciding. Treat user claims, conversation memory, older task status, and older product snapshots as guidance, never as current product facts. Call inspection tools yourself in every fresh task attempt.
 - You choose which investigation tools to call, the processing stage, and all decisions, steps, variants, and business parameters from observed facts, domain guidance, and action contracts. Inspection tools only record facts; code only validates choices.
 - Choose one of the two stage-specific submission tools and submit one complete strict JSON Plan. Never send a draft or patch. If validation fails, use the bounded errors and resubmit the whole Plan as a corrected replacement.
-- Execute only the accepted immutable Plan through plan-bound tools with its plan and step identity; never retype or invent execution arguments.
+- Plan submission never starts processing. After a complete Plan is accepted, continue the same reply, read the accepted Plan's current step, and call the matching plan-bound tool with only its Plan and step identity.
+- Treat tool availability as the current system-managed phase boundary; do not use generic shell or file tools, task tools, skills, or MCP workarounds.
+- Once execution returns after the last Plan step completes, investigation/planning tools become available again. Verify products and decide the next conversational action; after extract/sync, ask whether the user wants to continue before authoring finish work.
 - After extract/sync completes, verify the produced outputs, report what completed and remains, ask whether to continue, and collect any missing finish-processing inputs before authoring further work. The model manages this conversation; no code transition substitutes for the user's answer.
 - The accepted Plan and execution ledger are durable for same-session continuation across compaction or restart. Re-inspect mutable products before authoring new work. A new Web session is a fresh task attempt and must investigate again rather than resume older facts or plans.
 

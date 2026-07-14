@@ -19,12 +19,35 @@ from navigation_agentscope_harness import (
     tool_call_names,
     tool_result_outputs,
 )
-from vla_data_juicer_agents.navigation.agent_tools import resolve_navigation_agent_tools
+from vla_data_juicer_agents.navigation.agent_tools import (
+    resolve_navigation_agent_tools,
+    resolve_navigation_tool_surface,
+)
 from vla_data_juicer_agents.navigation.config import NavigationSettings
-from vla_data_juicer_agents.navigation.services import build_navigation_services
+from vla_data_juicer_agents.navigation.plan_models import (
+    ExtractSyncPlanInput,
+    FinishProcessingPlanInput,
+)
+from vla_data_juicer_agents.navigation.services import (
+    NavigationServices,
+    build_navigation_services,
+)
+from vla_data_juicer_agents.navigation.task_store import SqliteNavigationTaskStore
+from vla_data_juicer_agents.navigation.tool_groups import (
+    NAVIGATION_DIAGNOSTICS,
+    NAVIGATION_EXECUTION_ACTIONS,
+    NAVIGATION_EXECUTION_STATE,
+    NAVIGATION_INVESTIGATION,
+    NAVIGATION_PLAN_AUTHORING,
+)
 from vla_data_juicer_agents.runtime.agentscope_bootstrap import bootstrap_agentscope_records
 from vla_data_juicer_agents.runtime.agentscope_config import AgentScopeRuntimeConfig
 from vla_data_juicer_agents.runtime.agentscope_runtime import AgentScopeRuntime
+from test_navigation_plan_submission_tools import (
+    build_services as build_complete_plan_services,
+    valid_extract_plan_payload,
+    valid_finish_plan_payload,
+)
 
 
 REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
@@ -258,37 +281,185 @@ def test_compact_navigation_anchor_contains_only_durable_execution_coordinates()
     }
 
 
-def test_static_prompt_guidance_submission_schemas_and_anchor_fit_context_budget(tmp_path):
-    services = build_navigation_services(tmp_path)
-    session_id = "static-budget"
-    services.task_store.create_task_attempt(
-        request="Process navigation data.",
-        target="20260710",
-        date="20260710",
-        segments=None,
-        scene_mode=None,
-        dry_run=True,
-        web_session_id=session_id,
-        agentscope_session_id=session_id,
-    )
-    tools = _tool_map(services, session_id)
-    submission_names = {
-        "submit_extract_sync_plan_tool",
-        "submit_finish_processing_plan_tool",
-    }
-    assert submission_names <= tools.keys()
-    schemas = json.dumps(
+def _serialize_surface_schemas(surface):
+    return json.dumps(
         [
             {
-                "name": tools[name].name,
-                "description": tools[name].description,
-                "input_schema": tools[name].input_schema,
+                "name": tool.name,
+                "description": tool.description,
+                "input_schema": tool.input_schema,
             }
-            for name in sorted(submission_names)
+            for tool in surface.flatten_active_tools()
         ],
         ensure_ascii=False,
         separators=(",", ":"),
     )
+
+
+def _surface_services(tmp_path, phase, session_id):
+    built = build_complete_plan_services(
+        tmp_path,
+        phase,
+        web_session_id=session_id,
+        agentscope_session_id=session_id,
+    )
+    data_root = tmp_path / "vla-data"
+    (data_root / "raw_data" / built.task.date / built.task.segments[0]).mkdir(
+        parents=True
+    )
+    services = NavigationServices(
+        settings=NavigationSettings(vladatasets_root=data_root),
+        task_store=SqliteNavigationTaskStore(built.plan_store.db_path),
+        observation_store=built.observation_store,
+        evidence_store=built.evidence_store,
+        plan_store=built.plan_store,
+    )
+    return services, built
+
+
+def _resolve_surface(services, session_id):
+    surface = resolve_navigation_tool_surface(
+        services=services,
+        agentscope_session_id=session_id,
+        web_session_id=session_id,
+        cancellation=None,
+    )
+    assert surface is not None
+    return surface
+
+
+def _actual_navigation_surfaces(tmp_path):
+    planning_session = "planning-budget"
+    planning_services, _planning_built = _surface_services(
+        tmp_path / "planning",
+        "extract_sync",
+        planning_session,
+    )
+    planning = _resolve_surface(planning_services, planning_session)
+
+    execution_session = "execution-budget"
+    execution_services, execution_built = _surface_services(
+        tmp_path / "execution",
+        "extract_sync",
+        execution_session,
+    )
+    execution_observation = execution_services.observation_store.latest(
+        execution_built.task.task_id
+    )
+    assert execution_observation is not None
+    execution_services.plan_store.activate(
+        execution_built.task,
+        "extract_sync",
+        execution_observation.revision,
+        ExtractSyncPlanInput.model_validate(
+            valid_extract_plan_payload(execution_built)
+        ),
+        expected_web_session_id=execution_session,
+        expected_agentscope_session_id=execution_session,
+    )
+    execution = _resolve_surface(execution_services, execution_session)
+
+    recovery_session = "recovery-budget"
+    recovery_services, recovery_built = _surface_services(
+        tmp_path / "recovery",
+        "finish_processing",
+        recovery_session,
+    )
+    recovery_observation = recovery_services.observation_store.latest(
+        recovery_built.task.task_id
+    )
+    assert recovery_observation is not None
+    recovery_plan = recovery_services.plan_store.activate(
+        recovery_built.task,
+        "finish_processing",
+        recovery_observation.revision,
+        FinishProcessingPlanInput.model_validate(
+            valid_finish_plan_payload(recovery_built)
+        ),
+        expected_web_session_id=recovery_session,
+        expected_agentscope_session_id=recovery_session,
+    )
+    first_step = recovery_plan.plan.steps[0]
+    assert recovery_services.plan_store.mark_waiting_user(
+        recovery_plan.plan_id,
+        first_step.step_id,
+        first_step.action,
+        expected_web_session_id=recovery_session,
+        expected_agentscope_session_id=recovery_session,
+    )
+    assert recovery_services.plan_store.mark_human_decision_recovery_required(
+        recovery_plan.plan_id,
+        first_step.step_id,
+        reason_code="ambiguous_delivery_state",
+        request_anchor={
+            "plan_id": recovery_plan.plan_id,
+            "step_id": first_step.step_id,
+        },
+        expected_web_session_id=recovery_session,
+        expected_agentscope_session_id=recovery_session,
+    )
+    recovery = _resolve_surface(recovery_services, recovery_session)
+    return planning, execution, recovery
+
+
+def test_actual_grouped_surface_schemas_fit_context_budget(tmp_path):
+    planning, execution, recovery = _actual_navigation_surfaces(tmp_path)
+    surfaces = {
+        "planning": planning,
+        "execution": execution,
+        "recovery_required": recovery,
+    }
+    names = {
+        activity: [tool.name for tool in surface.flatten_active_tools()]
+        for activity, surface in surfaces.items()
+    }
+    generic_or_reset_names = {"bash", "read", "task", "reset_tools"}
+
+    planning_excluded = {
+        tool.name
+        for group_name in (
+            NAVIGATION_EXECUTION_STATE,
+            NAVIGATION_EXECUTION_ACTIONS,
+        )
+        for tool in execution.group(group_name).tools
+    }
+    assert planning_excluded.isdisjoint(names["planning"])
+    assert generic_or_reset_names.isdisjoint(names["planning"])
+
+    execution_excluded = {
+        tool.name
+        for group_name in (NAVIGATION_INVESTIGATION, NAVIGATION_PLAN_AUTHORING)
+        for tool in planning.group(group_name).tools
+    }
+    assert execution_excluded.isdisjoint(names["execution"])
+    assert {
+        "describe_processing_action_tool",
+        "submit_extract_sync_plan_tool",
+        "submit_finish_processing_plan_tool",
+    }.isdisjoint(names["execution"])
+    assert generic_or_reset_names.isdisjoint(names["execution"])
+
+    execution_action_names = {
+        tool.name for tool in execution.group(NAVIGATION_EXECUTION_ACTIONS).tools
+    }
+    plan_authoring_names = {
+        tool.name for tool in planning.group(NAVIGATION_PLAN_AUTHORING).tools
+    }
+    assert execution_action_names.isdisjoint(names["recovery_required"])
+    assert plan_authoring_names.isdisjoint(names["recovery_required"])
+    assert generic_or_reset_names.isdisjoint(names["recovery_required"])
+
+    for activity, surface in surfaces.items():
+        assert surface.activity == activity
+        assert surface.group(NAVIGATION_DIAGNOSTICS).tools == ()
+        assert len(names[activity]) == len(set(names[activity]))
+
+    schemas = {
+        activity: _serialize_surface_schemas(surface)
+        for activity, surface in surfaces.items()
+    }
+    assert len(schemas["execution"]) < len(schemas["planning"])
+
     compact_anchor = json.dumps(
         {
             "task_attempt_id": "attempt-1",
@@ -304,11 +475,11 @@ def test_static_prompt_guidance_submission_schemas_and_anchor_fit_context_budget
     production_navigation_prompt = prompts["NavigationDataAgent"]
     assert production_navigation_prompt.count("# Navigation Plan Agent Guidance") == 1
     assert "# Navigation Plan Agent Guidance" not in prompts["MainRouterAgent"]
-    static_context = "\n".join(
-        [production_navigation_prompt, schemas, compact_anchor]
-    )
-
-    assert (len(static_context) + 3) // 4 <= 83_885
+    for activity, active_schemas in schemas.items():
+        static_context = "\n".join(
+            [production_navigation_prompt, active_schemas, compact_anchor]
+        )
+        assert (len(static_context) + 3) // 4 <= 83_885, activity
 
 
 def _latest_tool_json(messages: list[Msg], required_key: str | None = None):

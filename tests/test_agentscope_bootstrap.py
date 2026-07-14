@@ -101,7 +101,7 @@ def test_navigation_agent_prompt_requires_model_directed_investigation_and_plans
         "decisions, steps, variants, and business parameters",
         "complete strict JSON Plan",
         "resubmit the whole Plan",
-        "Execute only the accepted immutable Plan",
+        "After a complete Plan is accepted",
         "verify the produced outputs",
         "ask whether to continue",
         "finish-processing inputs",
@@ -142,6 +142,21 @@ def test_navigation_agent_prompt_requires_model_directed_investigation_and_plans
     assert "继续执行 plus" not in prompt
     assert "You are NavigationDataAgent" not in prompt
     assert "mock" not in prompt.lower()
+
+
+def test_navigation_agent_prompt_states_system_managed_phase_transitions():
+    prompt = navigation_agent_prompt()
+
+    for exact_contract in [
+        "Plan submission never starts processing",
+        "continue the same reply",
+        "read the accepted Plan's current step",
+        "call the matching plan-bound tool",
+        "do not use generic shell or file tools",
+        "after the last Plan step",
+        "investigation/planning tools become available again",
+    ]:
+        assert exact_contract in prompt
 
 
 def test_navigation_agent_prompt_has_no_legacy_guidance_loader_contract():
