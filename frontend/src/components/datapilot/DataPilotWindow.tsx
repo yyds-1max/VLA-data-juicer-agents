@@ -37,6 +37,15 @@ type StreamLease = {
   controller: AbortController;
 };
 
+type ActiveSubmitRequest = {
+  id: number;
+  sessionId: string;
+  generation: number;
+  userMessage: ReturnType<typeof localUserMessage>;
+  outcome: "pending" | "success" | "failure";
+  error?: unknown;
+};
+
 export function DataPilotWindow() {
   const open = useStore(datapilotStore, (state) => state.open);
   const mode = useStore(datapilotStore, (state) => state.mode);
@@ -68,6 +77,8 @@ export function DataPilotWindow() {
   const selectionGenerationRef = useRef(0);
   const selectionTargetRef = useRef<string | null>(null);
   const draftRequestGenerationRef = useRef(0);
+  const activeSubmitRequestIdRef = useRef(0);
+  const activeSubmitQueueRef = useRef(new Map<number, ActiveSubmitRequest>());
   const deletedSessionIdsRef = useRef(new Set<string>());
   const reconnectStateRef = useRef<{ sessionId: string | null; attempts: number }>({
     sessionId: null,
@@ -87,11 +98,43 @@ export function DataPilotWindow() {
 
   const invalidateEventLifecycle = useCallback(() => {
     lifecycleGenerationRef.current += 1;
+    activeSubmitQueueRef.current.clear();
     clearReconnectTimer();
     const active = streamRef.current;
     streamRef.current = null;
     active?.controller.abort();
   }, [clearReconnectTimer]);
+
+  const ownsActiveSubmitRequest = useCallback((request: ActiveSubmitRequest) => {
+    const state = datapilotStore.getState();
+    return (
+      mountedRef.current &&
+      activeSubmitQueueRef.current.get(request.id) === request &&
+      lifecycleGenerationRef.current === request.generation &&
+      state.open &&
+      state.mode === "active_session" &&
+      state.currentSessionId === request.sessionId &&
+      !deletedSessionIdsRef.current.has(request.sessionId)
+    );
+  }, []);
+
+  const flushActiveSubmitQueue = useCallback(() => {
+    for (const [requestId, request] of activeSubmitQueueRef.current) {
+      if (request.outcome === "pending") {
+        break;
+      }
+      const owned = ownsActiveSubmitRequest(request);
+      activeSubmitQueueRef.current.delete(requestId);
+      if (!owned) {
+        continue;
+      }
+      if (request.outcome === "success") {
+        datapilotStore.getState().appendUserMessage(request.userMessage);
+      } else {
+        console.error("Failed to submit DataPilot active turn", request.error);
+      }
+    }
+  }, [ownsActiveSubmitRequest]);
 
   const isCurrentLease = useCallback((lease: StreamLease) => {
     const state = datapilotStore.getState();
@@ -442,13 +485,41 @@ export function DataPilotWindow() {
       return;
     }
 
+    const sessionId = currentSessionId;
+    startEventStream(sessionId, lifecycleGenerationRef.current);
+    const state = datapilotStore.getState();
+    if (
+      !mountedRef.current ||
+      !state.open ||
+      state.mode !== "active_session" ||
+      state.currentSessionId !== sessionId ||
+      deletedSessionIdsRef.current.has(sessionId)
+    ) {
+      return;
+    }
+    const request: ActiveSubmitRequest = {
+      id: activeSubmitRequestIdRef.current + 1,
+      sessionId,
+      generation: lifecycleGenerationRef.current,
+      userMessage: localUserMessage(sessionId, message),
+      outcome: "pending",
+    };
+    activeSubmitRequestIdRef.current = request.id;
+    activeSubmitQueueRef.current.set(request.id, request);
     try {
-      const userMessage = localUserMessage(currentSessionId, message);
-      startEventStream(currentSessionId, lifecycleGenerationRef.current);
-      await submitTurn(currentSessionId, message);
-      datapilotStore.getState().appendUserMessage(userMessage);
+      await submitTurn(sessionId, message);
+      const current = activeSubmitQueueRef.current.get(request.id);
+      if (current === request) {
+        request.outcome = "success";
+        flushActiveSubmitQueue();
+      }
     } catch (error) {
-      console.error("Failed to submit DataPilot active turn", error);
+      const current = activeSubmitQueueRef.current.get(request.id);
+      if (current === request) {
+        request.outcome = "failure";
+        request.error = error;
+        flushActiveSubmitQueue();
+      }
     }
   };
 

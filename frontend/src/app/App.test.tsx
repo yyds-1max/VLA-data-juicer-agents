@@ -1963,6 +1963,166 @@ test("failed active submit does not append a local user message", async () => {
   consoleError.mockRestore();
 });
 
+test("late active submit response cannot append into a restored session", async () => {
+  const submission = deferred<string>();
+  apiMocks.submitTurn.mockReturnValue(submission.promise);
+  apiMocks.listSessions.mockResolvedValue([
+    {
+      id: "session-b",
+      title: "Session B",
+      created_at: "2026-06-26T01:00:00Z",
+      updated_at: "2026-06-26T02:00:00Z",
+    },
+  ]);
+  apiMocks.getSession.mockImplementation((sessionId) =>
+    Promise.resolve(emptySessionDetail(sessionId)),
+  );
+  const opened: string[] = [];
+  apiMocks.streamSessionEvents.mockImplementation((sessionId, _cursor, signal) => {
+    opened.push(sessionId);
+    return waitingEventStream(signal);
+  });
+  datapilotStore.setState({
+    open: true,
+    mode: "active_session",
+    currentSessionId: "session-a",
+    sessions: [],
+    conversation: createAgentConversation(),
+  });
+  await renderAppWithDashboardSettled();
+
+  fireEvent.change(screen.getByPlaceholderText("继续描述任务…"), {
+    target: { value: "只属于 A 的消息" },
+  });
+  fireEvent.click(screen.getByRole("button", { name: "Send message" }));
+  await waitFor(() => expect(apiMocks.submitTurn).toHaveBeenCalledWith("session-a", "只属于 A 的消息"));
+
+  fireEvent.click(screen.getByRole("button", { name: "History" }));
+  fireEvent.click(await screen.findByRole("button", { name: "Open session Session B" }));
+  await waitFor(() => expect(datapilotStore.getState().currentSessionId).toBe("session-b"));
+  const streamsBeforeLateResponse = [...opened];
+
+  submission.resolve("turn-a");
+  await act(async () => {
+    await submission.promise;
+    await Promise.resolve();
+  });
+
+  expect(datapilotStore.getState().mode).toBe("active_session");
+  expect(datapilotStore.getState().currentSessionId).toBe("session-b");
+  expect(datapilotStore.getState().conversation.messages).toEqual([]);
+  expect(screen.queryByText("只属于 A 的消息")).not.toBeInTheDocument();
+  expect(opened).toEqual(streamsBeforeLateResponse);
+});
+
+test("late active submit response cannot append after deleting its session", async () => {
+  const submission = deferred<string>();
+  apiMocks.submitTurn.mockReturnValue(submission.promise);
+  apiMocks.listSessions.mockResolvedValue([
+    {
+      id: "session-a",
+      title: "Session A",
+      created_at: "2026-06-26T01:00:00Z",
+      updated_at: "2026-06-26T02:00:00Z",
+    },
+  ]);
+  apiMocks.getSession.mockResolvedValue(emptySessionDetail("session-a"));
+  datapilotStore.setState({
+    open: true,
+    mode: "active_session",
+    currentSessionId: "session-a",
+    sessions: [],
+    conversation: createAgentConversation(),
+  });
+  await renderAppWithDashboardSettled();
+
+  fireEvent.change(screen.getByPlaceholderText("继续描述任务…"), {
+    target: { value: "删除后不得出现" },
+  });
+  fireEvent.click(screen.getByRole("button", { name: "Send message" }));
+  await waitFor(() => expect(apiMocks.submitTurn).toHaveBeenCalledWith("session-a", "删除后不得出现"));
+
+  fireEvent.click(screen.getByRole("button", { name: "History" }));
+  fireEvent.click(await screen.findByRole("button", { name: "Delete session Session A" }));
+  await waitFor(() => expect(datapilotStore.getState().mode).toBe("draft_new_session"));
+
+  submission.resolve("turn-a");
+  await act(async () => {
+    await submission.promise;
+    await Promise.resolve();
+  });
+
+  expect(datapilotStore.getState().mode).toBe("draft_new_session");
+  expect(datapilotStore.getState().currentSessionId).toBeNull();
+  expect(datapilotStore.getState().conversation.messages).toEqual([]);
+  expect(screen.queryByText("删除后不得出现")).not.toBeInTheDocument();
+});
+
+test("a pending active submit appends once when its session still owns the response", async () => {
+  const submission = deferred<string>();
+  apiMocks.submitTurn.mockReturnValue(submission.promise);
+  apiMocks.getSession.mockResolvedValue(emptySessionDetail("session-a"));
+  datapilotStore.setState({
+    open: true,
+    mode: "active_session",
+    currentSessionId: "session-a",
+    sessions: [],
+    conversation: createAgentConversation(),
+  });
+  await renderAppWithDashboardSettled();
+
+  fireEvent.change(screen.getByPlaceholderText("继续描述任务…"), {
+    target: { value: "合法迟到消息" },
+  });
+  fireEvent.click(screen.getByRole("button", { name: "Send message" }));
+  await waitFor(() => expect(apiMocks.submitTurn).toHaveBeenCalledWith("session-a", "合法迟到消息"));
+  expect(datapilotStore.getState().conversation.messages).toEqual([]);
+
+  submission.resolve("turn-a");
+  await waitFor(() => expect(screen.getByText("合法迟到消息")).toBeVisible());
+  expect(datapilotStore.getState().conversation.messages).toHaveLength(1);
+});
+
+test("concurrent active submits append in submission order when responses finish out of order", async () => {
+  const firstSubmission = deferred<string>();
+  const secondSubmission = deferred<string>();
+  apiMocks.submitTurn
+    .mockReturnValueOnce(firstSubmission.promise)
+    .mockReturnValueOnce(secondSubmission.promise);
+  apiMocks.getSession.mockResolvedValue(emptySessionDetail("session-a"));
+  datapilotStore.setState({
+    open: true,
+    mode: "active_session",
+    currentSessionId: "session-a",
+    sessions: [],
+    conversation: createAgentConversation(),
+  });
+  await renderAppWithDashboardSettled();
+  const input = screen.getByPlaceholderText("继续描述任务…");
+
+  fireEvent.change(input, { target: { value: "第一条" } });
+  fireEvent.click(screen.getByRole("button", { name: "Send message" }));
+  fireEvent.change(input, { target: { value: "第二条" } });
+  fireEvent.click(screen.getByRole("button", { name: "Send message" }));
+  expect(apiMocks.submitTurn).toHaveBeenNthCalledWith(1, "session-a", "第一条");
+  expect(apiMocks.submitTurn).toHaveBeenNthCalledWith(2, "session-a", "第二条");
+
+  secondSubmission.resolve("turn-2");
+  await act(async () => {
+    await secondSubmission.promise;
+    await Promise.resolve();
+  });
+  expect(datapilotStore.getState().conversation.messages).toEqual([]);
+
+  firstSubmission.resolve("turn-1");
+  const firstMessage = await screen.findByText("第一条");
+  const secondMessage = screen.getByText("第二条");
+  expect(
+    firstMessage.compareDocumentPosition(secondMessage) & Node.DOCUMENT_POSITION_FOLLOWING,
+  ).toBeTruthy();
+  expect(datapilotStore.getState().conversation.messages).toHaveLength(2);
+});
+
 test("reopening an active session opens its SSE stream before submitting the turn", async () => {
   const calls: string[] = [];
   apiMocks.streamSessionEvents.mockImplementation((sessionId, afterSequence, signal) => {
