@@ -24,8 +24,15 @@ from vla_data_juicer_agents.navigation.task_state import (
 from vla_data_juicer_agents.navigation.task_store import SqliteNavigationTaskStore
 from vla_data_juicer_agents.runtime.agentscope_config import AgentScopeRuntimeConfig
 import vla_data_juicer_agents.runtime.agentscope_runtime as agentscope_runtime_module
-from vla_data_juicer_agents.runtime.agentscope_runtime import AgentScopeRuntime
+from vla_data_juicer_agents.runtime.agentscope_runtime import (
+    AgentScopeRuntime,
+    build_extra_agent_middlewares_factory,
+    build_extra_agent_tools_factory,
+)
 from vla_data_juicer_agents.runtime.agentscope_prompts import navigation_agent_prompt
+from vla_data_juicer_agents.runtime.navigation_tool_surface import (
+    NavigationToolSurfaceMiddleware,
+)
 from vla_data_juicer_agents.web.agent_session import AgentScopeWebSessionManager
 from vla_data_juicer_agents.web.schemas import HumanDecisionRequest, SessionRecord
 from vla_data_juicer_agents.web.session_store import WebSessionStore
@@ -1357,40 +1364,10 @@ def test_runtime_anchor_does_not_expose_phase_without_accepted_plan(
 
 
 @pytest.mark.asyncio
-async def test_runtime_exposes_no_navigation_mutations_before_attempt_creation(tmp_path):
-    runtime = _runtime(workspace_root=tmp_path)
-    await runtime.ensure_bootstrapped()
-
-    session_id = await runtime.ensure_web_session(
-        "web-1",
-        agent_id=runtime.config.navigation_agent_id,
-        model=runtime.config.navigation_model,
-    )
-    tools = runtime._navigation_tools_for_session(
-        web_session_id="web-1",
-        agentscope_session_id=session_id,
-    )
-    names = {tool.name for tool in tools}
-
-    assert names == set()
-
-
-@pytest.mark.asyncio
-async def test_runtime_navigation_tools_resolve_from_durable_services_each_turn(
+async def test_web_navigation_assembly_uses_middleware_not_basic_domain_tools(
     monkeypatch,
-    tmp_path: Path,
-) -> None:
-    captured = {}
-
-    def fake_resolve_navigation_agent_tools(**kwargs):
-        captured.update(kwargs)
-        return []
-
-    monkeypatch.setattr(
-        agentscope_runtime_module,
-        "resolve_navigation_agent_tools",
-        fake_resolve_navigation_agent_tools,
-    )
+    tmp_path,
+):
     runtime = _runtime(workspace_root=tmp_path)
     await runtime.ensure_bootstrapped()
     session_id = await runtime.ensure_web_session(
@@ -1398,14 +1375,37 @@ async def test_runtime_navigation_tools_resolve_from_durable_services_each_turn(
         agent_id=runtime.config.navigation_agent_id,
         model=runtime.config.navigation_model,
     )
-    tools = runtime._navigation_tools_for_session(
-        web_session_id="web-1",
-        agentscope_session_id=session_id,
+    monkeypatch.setattr(
+        runtime,
+        "_navigation_tools_for_session",
+        lambda **_kwargs: pytest.fail("Web assembly called the direct flat adapter"),
+    )
+    extra_tools = build_extra_agent_tools_factory(runtime.config, runtime=runtime)
+    extra_middlewares = build_extra_agent_middlewares_factory(
+        runtime.config,
+        runtime=runtime,
+    )
+    tools = await extra_tools(
+        runtime.config.user_id,
+        runtime.config.navigation_agent_id,
+        session_id,
+    )
+    middlewares = await extra_middlewares(
+        runtime.config.user_id,
+        runtime.config.navigation_agent_id,
+        session_id,
     )
 
     assert tools == []
-    assert captured["agentscope_session_id"] == session_id
-    assert captured["services"].task_store.db_path == tmp_path / "navigation-tasks.sqlite"
+    assert len(middlewares) == 1
+    middleware = middlewares[0]
+    assert isinstance(middleware, NavigationToolSurfaceMiddleware)
+    assert middleware._web_session_id == "web-1"
+    assert middleware._agentscope_session_id == session_id
+    assert (
+        middleware._services.task_store.db_path
+        == tmp_path / "navigation-tasks.sqlite"
+    )
 
 
 @pytest.mark.asyncio

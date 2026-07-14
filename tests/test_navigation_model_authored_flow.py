@@ -229,7 +229,8 @@ async def _router_handoff(runtime, storage, registry, web_session_id, request):
     return task, agentscope_session_id, events, model
 
 
-def _navigation_agent(runtime, storage, web_session_id, session_id):
+def _direct_flat_navigation_agent(runtime, storage, web_session_id, session_id):
+    """Build the direct model/CLI adapter path, not Web ChatService assembly."""
     model = ScriptedChatModel()
     agent = build_agent(
         storage.agents[runtime.config.navigation_agent_id],
@@ -240,6 +241,17 @@ def _navigation_agent(runtime, storage, web_session_id, session_id):
         ),
     )
     return agent, model
+
+
+def _refresh_direct_flat_tools(runtime, agent, web_session_id, session_id):
+    """Refresh only the direct flat adapter; Web uses system-managed middleware."""
+    refresh_tools(
+        agent,
+        runtime._navigation_tools_for_session(
+            web_session_id=web_session_id,
+            agentscope_session_id=session_id,
+        ),
+    )
 
 
 def _queue_extract_plan(model, services, task):
@@ -283,12 +295,11 @@ async def _execute_extract_plan(
     session_id,
     plan,
 ):
-    refresh_tools(
+    _refresh_direct_flat_tools(
+        runtime,
         agent,
-        runtime._navigation_tools_for_session(
-            web_session_id=web_session_id,
-            agentscope_session_id=session_id,
-        ),
+        web_session_id,
+        session_id,
     )
     before = len(tool_call_names(agent))
     model.enqueue_tool(
@@ -336,7 +347,9 @@ async def test_raw_only_router_and_navigation_agents_submit_and_execute_canonica
     services = runtime._navigation_services()
     assert services.observation_store.latest(task.task_id) is None
     assert not hasattr(task, "phase")
-    agent, model = _navigation_agent(runtime, storage, "web-raw", session_id)
+    agent, model = _direct_flat_navigation_agent(
+        runtime, storage, "web-raw", session_id
+    )
     plan, _planning_events = await _submit_extract_plan(
         agent,
         model,
@@ -405,18 +418,19 @@ async def test_same_session_agent_asks_before_finish_then_reinspects_after_user_
         "处理这批导航数据",
     )
     services = runtime._navigation_services()
-    agent, model = _navigation_agent(runtime, storage, "web-same", session_id)
+    agent, model = _direct_flat_navigation_agent(
+        runtime, storage, "web-same", session_id
+    )
     plan, _ = await _submit_extract_plan(agent, model, services, task, "检查并规划。")
     await _execute_extract_plan(runtime, agent, model, "web-same", session_id, plan)
     assert services.plan_store.get(plan.plan_id).status == "completed"
     _write_finish_inputs(services.settings)
 
-    refresh_tools(
+    _refresh_direct_flat_tools(
+        runtime,
         agent,
-        runtime._navigation_tools_for_session(
-            web_session_id="web-same",
-            agentscope_session_id=session_id,
-        ),
+        "web-same",
+        session_id,
     )
     before = len(tool_call_names(agent))
     model.enqueue_tool("inspect_navigation_artifact_state_tool", {})
@@ -446,14 +460,13 @@ async def test_same_session_agent_asks_before_finish_then_reinspects_after_user_
     assert services.task_store.get_task(task.task_id).scene_mode == "out"
     assert services.plan_store.get_active(task.task_id, "finish_processing") is None
 
-    # Guidance advances the durable planning fence, so the next production
-    # resolver cycle must bind tools to that new revision before submission.
-    refresh_tools(
+    # Guidance advances the durable planning fence, so the next direct-adapter
+    # cycle must bind tools to that new revision before submission.
+    _refresh_direct_flat_tools(
+        runtime,
         agent,
-        runtime._navigation_tools_for_session(
-            web_session_id="web-same",
-            agentscope_session_id=session_id,
-        ),
+        "web-same",
+        session_id,
     )
     for name in FINISH_INSPECTIONS:
         model.enqueue_tool(name, {})
@@ -520,7 +533,9 @@ async def test_new_session_agent_distrusts_sync_claim_and_inspects_before_finish
     assert new.task_id != old.task_id
     assert services.observation_store.latest(new.task_id) is None
     assert services.plan_store.get_active_for_task(new.task_id) is None
-    agent, model = _navigation_agent(runtime, storage, "web-new", session_id)
+    agent, model = _direct_flat_navigation_agent(
+        runtime, storage, "web-new", session_id
+    )
     for name in FINISH_INSPECTIONS:
         model.enqueue_tool(name, {})
     model.enqueue_tool("get_navigation_task_context_tool", {})
@@ -588,7 +603,9 @@ async def test_deleted_products_make_new_session_agent_choose_extract_again(
         "web-rerun",
         "同步已完成，请继续处理",
     )
-    agent, model = _navigation_agent(runtime, storage, "web-rerun", session_id)
+    agent, model = _direct_flat_navigation_agent(
+        runtime, storage, "web-rerun", session_id
+    )
     _queue_extract_plan(model, services, current)
     events = await run_reply(agent, "同步已完成，请继续处理。")
 
