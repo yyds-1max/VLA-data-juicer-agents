@@ -118,6 +118,18 @@ class AgentScopeRuntime:
         self.web_session_store = store
         self.web_event_publisher = publisher
 
+    def projection_private_identities(self) -> set[str]:
+        identities = {
+            "MainRouterAgent",
+            self.config.main_router_agent_id,
+            "NavigationDataAgent",
+            self.config.navigation_agent_id,
+        }
+        identities.update(
+            session_id for _agent_id, session_id in self.web_sessions.values()
+        )
+        return identities
+
     async def project_agent_event(
         self,
         agentscope_session_id: str,
@@ -212,9 +224,18 @@ class AgentScopeRuntime:
     async def _publish_public_record(self, session_id: str, record: Any) -> None:
         if self.web_event_publisher is None:
             return
-        result = self.web_event_publisher(session_id, record)
-        if inspect.isawaitable(result):
-            await result
+        try:
+            result = self.web_event_publisher(session_id, record)
+            if inspect.isawaitable(result):
+                await result
+        except Exception:  # pylint: disable=broad-except
+            _logger.warning(
+                "Live public event publish failed; persisted replay remains "
+                "available: session_id=%s sequence=%s",
+                session_id,
+                getattr(record, "sequence", None),
+                exc_info=True,
+            )
 
     def web_session_subscription_key(self, *, web_session_id: str) -> tuple[str, str] | None:
         return self._web_session_mapping(web_session_id)

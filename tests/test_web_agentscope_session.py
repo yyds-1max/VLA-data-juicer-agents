@@ -7,9 +7,10 @@ from types import SimpleNamespace
 
 import pytest
 from agentscope.app.message_bus import MessageBusKeys
-from agentscope.event import ExternalExecutionResultEvent
+from agentscope.event import ExternalExecutionResultEvent, ReplyStartEvent
 from agentscope.message import Msg, ToolCallBlock, ToolCallState, ToolResultState
 from agentscope.permission import PermissionBehavior, PermissionContext
+from agentscope.tool import ToolResponse
 
 from vla_data_juicer_agents.core.cancellation import CancellationContext, current_cancellation
 from vla_data_juicer_agents.navigation.observation_store import SqliteNavigationObservationStore
@@ -3020,6 +3021,17 @@ async def test_runtime_projection_persists_then_broadcasts_and_ignores_late_term
         published.append((session_id, record))
 
     runtime = _runtime(workspace_root=tmp_path)
+    runtime.web_sessions["other-public"] = (
+        "main-router-agent",
+        "other-internal-router-session",
+    )
+    assert {
+        "MainRouterAgent",
+        "main-router-agent",
+        "NavigationDataAgent",
+        "navigation-data-agent",
+        "other-internal-router-session",
+    } <= runtime.projection_private_identities()
     runtime.set_web_transport(store, publish)
     event = {
         "type": "REPLY_START",
@@ -3073,6 +3085,115 @@ async def test_runtime_projection_persists_then_broadcasts_and_ignores_late_term
         "error_type": "extract_sync_failed",
     }
     assert [record.sequence for _, record in published] == [1, 2]
+
+
+@pytest.mark.asyncio
+async def test_sync_live_publisher_failure_keeps_persisted_reply_and_yields_event(
+    tmp_path: Path,
+    caplog,
+) -> None:
+    store = WebSessionStore(tmp_path / "sessions.sqlite")
+    public_session = store.create_session("reply projection")
+    internal_session_id = "internal-router-session"
+    store.save_agentscope_session_mapping(
+        public_session.id,
+        agent_id="main-router-agent",
+        agentscope_session_id=internal_session_id,
+    )
+
+    def publish(_session_id, _record) -> None:
+        raise ConnectionError("browser disconnected")
+
+    runtime = _runtime(workspace_root=tmp_path)
+    runtime.set_web_transport(store, publish)
+    middleware = DataPilotReplyProjectionMiddleware(internal_session_id, runtime)
+    event = ReplyStartEvent(
+        session_id=internal_session_id,
+        reply_id="reply-1",
+        name="MainRouterAgent",
+    )
+
+    async def handler(**_kwargs):
+        yield event
+
+    yielded = [
+        item
+        async for item in middleware.on_reply(
+            SimpleNamespace(name="MainRouterAgent"),
+            {},
+            handler,
+        )
+    ]
+
+    detail = store.get_session(public_session.id)
+    assert yielded == [event]
+    assert detail is not None
+    assert [record.event["type"] for record in detail.events] == ["REPLY_START"]
+    assert "Live public event publish failed" in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_async_live_publisher_failure_keeps_tool_terminal_and_yields_response(
+    tmp_path: Path,
+    caplog,
+) -> None:
+    store = WebSessionStore(tmp_path / "sessions.sqlite")
+    public_session = store.create_session("tool outcome")
+    internal_session_id = "internal-navigation-session"
+    store.save_agentscope_session_mapping(
+        public_session.id,
+        agent_id="navigation-data-agent",
+        agentscope_session_id=internal_session_id,
+    )
+
+    async def publish(_session_id, _record) -> None:
+        await asyncio.sleep(0)
+        raise ConnectionError("slow browser disconnected")
+
+    runtime = _runtime(workspace_root=tmp_path)
+    runtime.set_web_transport(store, publish)
+    finish_calls = 0
+    finish_public_tool = runtime.finish_public_tool
+
+    async def finish_spy(*args, **kwargs):
+        nonlocal finish_calls
+        finish_calls += 1
+        return await finish_public_tool(*args, **kwargs)
+
+    runtime.finish_public_tool = finish_spy
+    middleware = DataPilotToolOutcomeMiddleware(internal_session_id, runtime)
+    tool_call = ToolCallBlock(
+        id="call-1",
+        name="extract",
+        input="{}",
+    )
+    response = ToolResponse(id="call-1", state=ToolResultState.SUCCESS)
+
+    async def handler(**_kwargs):
+        yield response
+
+    yielded = [
+        item
+        async for item in middleware.on_acting(
+            SimpleNamespace(),
+            {"tool_call": tool_call},
+            handler,
+        )
+    ]
+
+    detail = store.get_session(public_session.id)
+    assert yielded == [response]
+    assert detail is not None
+    assert [(run.tool_call_id, run.status) for run in detail.tool_runs] == [
+        ("call-1", "success")
+    ]
+    assert [
+        record.event["name"]
+        for record in detail.events
+        if record.event["type"] == "CUSTOM"
+    ] == ["datapilot_tool_terminal"]
+    assert finish_calls == 1
+    assert "Live public event publish failed" in caplog.text
 
 
 @pytest.mark.asyncio

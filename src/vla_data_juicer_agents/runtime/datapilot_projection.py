@@ -6,6 +6,7 @@ import json
 from collections.abc import AsyncGenerator, Callable
 from typing import Any, Literal
 
+from agentscope.event import EventBase
 from agentscope.message import TextBlock, ToolResultState
 from agentscope.middleware import MiddlewareBase
 from agentscope.tool import ToolResponse
@@ -17,11 +18,7 @@ SUPPRESSED_TOOL_RESULT_EVENTS = {
     "TOOL_RESULT_DATA_DELTA",
     "TOOL_RESULT_END",
 }
-_INTERNAL_IDENTITY_FIELDS = {
-    "agent_id",
-    "agentscope_session_id",
-    "session_id",
-}
+_AGENT_NAMED_EVENT_TYPES = {"REPLY_START", "EXCEED_MAX_ITERS"}
 
 
 def _event_type(event: dict[str, Any]) -> str:
@@ -29,15 +26,56 @@ def _event_type(event: dict[str, Any]) -> str:
     return str(event_type).upper() if event_type is not None else ""
 
 
-def _strip_internal_identity(value: Any) -> Any:
+def _is_private_identity_field(key: str) -> bool:
+    collapsed = "".join(
+        character for character in key.lower() if character.isalnum()
+    )
+    return collapsed.endswith("agentid") or collapsed.endswith("sessionid")
+
+
+def _replace_private_identities(
+    value: str,
+    private_identities: set[str],
+    public_name: str,
+) -> str:
+    public = value
+    for private in sorted(private_identities, key=len, reverse=True):
+        if private:
+            public = public.replace(private, public_name)
+    return public
+
+
+def _strip_internal_identity(
+    value: Any,
+    *,
+    private_identities: set[str],
+    public_name: str,
+) -> Any:
     if isinstance(value, dict):
         return {
-            key: _strip_internal_identity(item)
+            _replace_private_identities(
+                key,
+                private_identities,
+                public_name,
+            ): _strip_internal_identity(
+                item,
+                private_identities=private_identities,
+                public_name=public_name,
+            )
             for key, item in value.items()
-            if key not in _INTERNAL_IDENTITY_FIELDS
+            if not _is_private_identity_field(key)
         }
     if isinstance(value, list):
-        return [_strip_internal_identity(item) for item in value]
+        return [
+            _strip_internal_identity(
+                item,
+                private_identities=private_identities,
+                public_name=public_name,
+            )
+            for item in value
+        ]
+    if isinstance(value, str):
+        return _replace_private_identities(value, private_identities, public_name)
     return value
 
 
@@ -45,12 +83,34 @@ def sanitize_agent_event(
     event: dict[str, Any],
     *,
     public_name: str = "DataPilot",
+    private_identities: set[str] | None = None,
 ) -> dict[str, Any]:
     """Remove private runtime identities without changing AgentScope payloads."""
-    public = _strip_internal_identity(event)
-    if "name" in public:
-        public["name"] = public_name
-    return public
+    identities = set(private_identities or ())
+    if _event_type(event) in _AGENT_NAMED_EVENT_TYPES:
+        agent_name = event.get("name")
+        if isinstance(agent_name, str):
+            identities.add(agent_name)
+    return _strip_internal_identity(
+        event,
+        private_identities=identities,
+        public_name=public_name,
+    )
+
+
+def _projection_private_identities(agent: Any, sink: Any, session_id: str) -> set[str]:
+    identities = {session_id}
+    agent_name = getattr(agent, "name", None)
+    if isinstance(agent_name, str):
+        identities.add(agent_name)
+    provider = getattr(sink, "projection_private_identities", None)
+    if callable(provider):
+        identities.update(
+            identity
+            for identity in provider()
+            if isinstance(identity, str) and identity
+        )
+    return identities
 
 
 class DataPilotReplyProjectionMiddleware(MiddlewareBase):
@@ -67,13 +127,24 @@ class DataPilotReplyProjectionMiddleware(MiddlewareBase):
         reply_id = ""
         ordinal = 0
         async for event in next_handler(**input_kwargs):
+            if not isinstance(event, EventBase):
+                yield event
+                continue
             raw = event.model_dump(mode="json")
             event_type = _event_type(raw)
             if event_type == "REPLY_START":
                 reply_id = str(raw.get("reply_id", ""))
                 ordinal = 0
             if event_type not in SUPPRESSED_TOOL_RESULT_EVENTS:
-                public = sanitize_agent_event(raw, public_name="DataPilot")
+                public = sanitize_agent_event(
+                    raw,
+                    public_name="DataPilot",
+                    private_identities=_projection_private_identities(
+                        agent,
+                        self._sink,
+                        self._session_id,
+                    ),
+                )
                 identity = f"{self._session_id}:{reply_id}:{ordinal}"
                 await self._sink.project_agent_event(
                     self._session_id,
