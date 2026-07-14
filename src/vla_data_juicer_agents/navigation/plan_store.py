@@ -170,6 +170,93 @@ class SqliteNavigationPlanRepository:
                 expected_agentscope_session_id=expected_agentscope_session_id,
             )
 
+    @staticmethod
+    def _authorize_claim_terminalization(
+        connection: sqlite3.Connection,
+        plan_id: str,
+        step_id: str,
+        action: str,
+        *,
+        expected_web_session_id: str | None,
+        expected_agentscope_session_id: str | None,
+    ) -> sqlite3.Row:
+        """Authorize completion of an already-durable execution claim.
+
+        Starting new work is fenced to the newest attempt elsewhere. Once a step is
+        durably claimed, however, its exact owner must be able to record the result
+        even if that same owner creates a newer attempt while the action is running.
+        """
+        if not all(
+            isinstance(value, str) and value.strip()
+            for value in (
+                action,
+                expected_web_session_id,
+                expected_agentscope_session_id,
+            )
+        ):
+            raise PermissionError("navigation task session mismatch")
+        row = connection.execute(
+            """SELECT steps.task_id, steps.status, steps.tool_name,
+                      plans.status AS plan_status
+               FROM navigation_task_steps AS steps
+               JOIN navigation_plans AS plans ON plans.plan_id = steps.plan_id
+               JOIN navigation_tasks AS tasks ON tasks.task_id = steps.task_id
+               WHERE steps.plan_id = ? AND steps.step_id = ?
+                 AND steps.tool_name = ? AND plans.status = 'active'
+                 AND tasks.created_by_web_session_id = ?
+                 AND tasks.agentscope_session_id = ?""",
+            (
+                plan_id,
+                step_id,
+                action,
+                expected_web_session_id,
+                expected_agentscope_session_id,
+            ),
+        ).fetchone()
+        if row is None:
+            raise PermissionError("navigation task session mismatch")
+        return row
+
+    @staticmethod
+    def _authorize_handoff_terminalization(
+        connection: sqlite3.Connection,
+        plan_id: str,
+        step_id: str,
+        *,
+        expected_web_session_id: str | None,
+        expected_agentscope_session_id: str | None,
+    ) -> sqlite3.Row:
+        """Authorize delivery/recovery of an already-durable human handoff."""
+        if not all(
+            isinstance(value, str) and value.strip()
+            for value in (
+                expected_web_session_id,
+                expected_agentscope_session_id,
+            )
+        ):
+            raise PermissionError("navigation task session mismatch")
+        row = connection.execute(
+            """SELECT handoffs.task_id, handoffs.status, handoffs.delivery_status,
+                      steps.tool_name
+               FROM navigation_human_decision_handoffs AS handoffs
+               JOIN navigation_task_steps AS steps
+                 ON steps.plan_id = handoffs.plan_id
+                AND steps.step_id = handoffs.step_id
+               JOIN navigation_tasks AS tasks ON tasks.task_id = handoffs.task_id
+               WHERE handoffs.plan_id = ? AND handoffs.step_id = ?
+                 AND tasks.created_by_web_session_id = ?
+                 AND tasks.agentscope_session_id = ?""",
+            (
+                plan_id,
+                step_id,
+                expected_web_session_id,
+                expected_agentscope_session_id,
+            ),
+        ).fetchone()
+        if row is None:
+            raise PermissionError("navigation task session mismatch")
+        return row
+
     def _init_schema(self) -> None:
         initialize_navigation_schema(self.db_path)
 
@@ -935,6 +1022,7 @@ class SqliteNavigationPlanRepository:
         plan_id: str,
         step_id: str,
         *,
+        expected_action: str,
         target_status: Literal["completed", "failed"],
         full_result: dict[str, Any],
         result_summary: dict[str, Any],
@@ -944,8 +1032,8 @@ class SqliteNavigationPlanRepository:
     ) -> StagedStepResult:
         """Durably stage a post-side-effect result before crossing to file evidence."""
         self._ensure_within_limit(result_summary, label="execution result summary")
-        if not expected_statuses:
-            raise ValueError("expected_statuses must not be empty")
+        if expected_statuses != ("running",):
+            raise ValueError("claimed execution results must be staged from running")
         canonical_full = self._canonical_json(full_result)
         if len(canonical_full.encode("utf-8")) > MAX_RESULT_OUTBOX_CHARS:
             raise ValueError(
@@ -956,9 +1044,11 @@ class SqliteNavigationPlanRepository:
         connection = self._connect()
         try:
             connection.execute("BEGIN IMMEDIATE")
-            self._authorize_plan_write(
+            self._authorize_claim_terminalization(
                 connection,
                 plan_id,
+                step_id,
+                expected_action,
                 expected_web_session_id=expected_web_session_id,
                 expected_agentscope_session_id=expected_agentscope_session_id,
             )
@@ -1054,14 +1144,16 @@ class SqliteNavigationPlanRepository:
         plan_id: str,
         step_id: str,
         result_ref: str,
-        *, expected_web_session_id: str | None = None,
+        *, expected_action: str,
+        expected_web_session_id: str | None = None,
         expected_agentscope_session_id: str | None = None,
     ) -> bool:
         """Attach task-scoped evidence to a staged result without finishing it."""
         connection = self._connect()
         try:
             connection.execute("BEGIN IMMEDIATE")
-            self._authorize_plan_write(connection, plan_id,
+            self._authorize_claim_terminalization(
+                connection, plan_id, step_id, expected_action,
                 expected_web_session_id=expected_web_session_id,
                 expected_agentscope_session_id=expected_agentscope_session_id)
             row = connection.execute(
@@ -1094,6 +1186,7 @@ class SqliteNavigationPlanRepository:
 
     def finalize_staged_step(
         self, plan_id: str, step_id: str, *,
+        expected_action: str,
         expected_web_session_id: str | None = None,
         expected_agentscope_session_id: str | None = None,
     ) -> bool:
@@ -1101,7 +1194,8 @@ class SqliteNavigationPlanRepository:
         connection = self._connect()
         try:
             connection.execute("BEGIN IMMEDIATE")
-            self._authorize_plan_write(connection, plan_id,
+            self._authorize_claim_terminalization(
+                connection, plan_id, step_id, expected_action,
                 expected_web_session_id=expected_web_session_id,
                 expected_agentscope_session_id=expected_agentscope_session_id)
             row = connection.execute(
@@ -1215,14 +1309,16 @@ class SqliteNavigationPlanRepository:
         plan_id: str,
         step_id: str,
         reason: str,
-        *, expected_web_session_id: str | None = None,
+        *, expected_action: str,
+        expected_web_session_id: str | None = None,
         expected_agentscope_session_id: str | None = None,
     ) -> bool:
         """Conservatively invalidate an unrecoverable running step without rerunning it."""
         connection = self._connect()
         try:
             connection.execute("BEGIN IMMEDIATE")
-            self._authorize_plan_write(connection, plan_id,
+            self._authorize_claim_terminalization(
+                connection, plan_id, step_id, expected_action,
                 expected_web_session_id=expected_web_session_id,
                 expected_agentscope_session_id=expected_agentscope_session_id)
             row = connection.execute(
@@ -1461,7 +1557,8 @@ class SqliteNavigationPlanRepository:
     ) -> bool:
         with self._connect() as connection:
             connection.execute("BEGIN IMMEDIATE")
-            self._authorize_plan_write(connection, plan_id,
+            self._authorize_handoff_terminalization(
+                connection, plan_id, step_id,
                 expected_web_session_id=expected_web_session_id,
                 expected_agentscope_session_id=expected_agentscope_session_id)
             cursor = connection.execute(
@@ -1485,7 +1582,8 @@ class SqliteNavigationPlanRepository:
         connection = self._connect()
         try:
             connection.execute("BEGIN IMMEDIATE")
-            self._authorize_plan_write(connection, plan_id,
+            self._authorize_handoff_terminalization(
+                connection, plan_id, step_id,
                 expected_web_session_id=expected_web_session_id,
                 expected_agentscope_session_id=expected_agentscope_session_id)
             row = connection.execute(
@@ -1572,15 +1670,27 @@ class SqliteNavigationPlanRepository:
         connection = self._connect()
         try:
             connection.execute("BEGIN IMMEDIATE")
-            self._authorize_plan_write(connection, plan_id,
-                expected_web_session_id=expected_web_session_id,
-                expected_agentscope_session_id=expected_agentscope_session_id)
             row = connection.execute(
                 """SELECT status, delivery_status
                    FROM navigation_human_decision_handoffs
                    WHERE plan_id = ? AND step_id = ?""",
                 (plan_id, step_id),
             ).fetchone()
+            if row is None:
+                self._authorize_plan_write(
+                    connection,
+                    plan_id,
+                    expected_web_session_id=expected_web_session_id,
+                    expected_agentscope_session_id=expected_agentscope_session_id,
+                )
+            else:
+                self._authorize_handoff_terminalization(
+                    connection,
+                    plan_id,
+                    step_id,
+                    expected_web_session_id=expected_web_session_id,
+                    expected_agentscope_session_id=expected_agentscope_session_id,
+                )
             if row is None and request_anchor is not None:
                 canonical_anchor = self._canonical_json(request_anchor)
                 if len(canonical_anchor.encode("utf-8")) > MAX_HUMAN_DECISION_CHARS:
@@ -1674,9 +1784,10 @@ class SqliteNavigationPlanRepository:
                 raise ActivePlanExecutionConflict(
                     "human handoff does not belong to the requested Web session"
                 )
-            authorize_navigation_task_write(
+            self._authorize_handoff_terminalization(
                 connection,
-                row["task_id"],
+                plan_id,
+                step_id,
                 expected_web_session_id=expected_web_session_id,
                 expected_agentscope_session_id=row["agentscope_session_id"],
             )
@@ -1761,7 +1872,8 @@ class SqliteNavigationPlanRepository:
     ) -> bool:
         with self._connect() as connection:
             connection.execute("BEGIN IMMEDIATE")
-            self._authorize_plan_write(connection, plan_id,
+            self._authorize_handoff_terminalization(
+                connection, plan_id, step_id,
                 expected_web_session_id=expected_web_session_id,
                 expected_agentscope_session_id=expected_agentscope_session_id)
             cursor = connection.execute(
@@ -1786,7 +1898,8 @@ class SqliteNavigationPlanRepository:
         """Record durable AgentScope consumption observed outside our lease state."""
         with self._connect() as connection:
             connection.execute("BEGIN IMMEDIATE")
-            self._authorize_plan_write(connection, plan_id,
+            self._authorize_handoff_terminalization(
+                connection, plan_id, step_id,
                 expected_web_session_id=expected_web_session_id,
                 expected_agentscope_session_id=expected_agentscope_session_id)
             cursor = connection.execute(
@@ -1847,6 +1960,78 @@ class SqliteNavigationPlanRepository:
                 SET status = 'needs_replan', updated_at = ?, state_revision = state_revision + 1
                 WHERE task_id = ?
                 """,
+                (timestamp, row["task_id"]),
+            )
+            connection.commit()
+            return True
+        except Exception:
+            connection.rollback()
+            raise
+        finally:
+            connection.close()
+
+    def mark_terminalized_claim_needs_replan(
+        self,
+        plan_id: str,
+        step_id: str,
+        reason: str,
+        *,
+        expected_action: str,
+        expected_web_session_id: str | None = None,
+        expected_agentscope_session_id: str | None = None,
+    ) -> bool:
+        """Invalidate after a claimed step durably finalized an unusable result."""
+        connection = self._connect()
+        try:
+            connection.execute("BEGIN IMMEDIATE")
+            self._authorize_claim_terminalization(
+                connection,
+                plan_id,
+                step_id,
+                expected_action,
+                expected_web_session_id=expected_web_session_id,
+                expected_agentscope_session_id=expected_agentscope_session_id,
+            )
+            row = connection.execute(
+                """SELECT plans.task_id
+                   FROM navigation_task_steps AS steps
+                   JOIN navigation_plans AS plans ON plans.plan_id = steps.plan_id
+                   WHERE steps.plan_id = ? AND steps.step_id = ?
+                     AND steps.status IN ('completed', 'failed')
+                     AND steps.result_ref IS NOT NULL
+                     AND plans.status = 'active'
+                     AND NOT EXISTS (
+                         SELECT 1 FROM navigation_step_result_outbox AS outbox
+                         WHERE outbox.plan_id = steps.plan_id
+                           AND outbox.step_id = steps.step_id
+                     )""",
+                (plan_id, step_id),
+            ).fetchone()
+            if row is None:
+                connection.rollback()
+                return False
+            if self._active_plan_has_in_flight_work(connection, plan_id):
+                raise ActivePlanExecutionConflict(
+                    "cannot mark a navigation plan needs-replan with in-flight work"
+                )
+            timestamp = utc_now()
+            connection.execute(
+                """UPDATE navigation_plans
+                   SET status = 'invalidated', invalidation_reason = ?, updated_at = ?
+                   WHERE plan_id = ? AND status = 'active'""",
+                (reason, timestamp, plan_id),
+            )
+            connection.execute(
+                """UPDATE navigation_task_steps
+                   SET status = 'needs_replan', finished_at = ?
+                   WHERE plan_id = ? AND status != 'completed'""",
+                (timestamp, plan_id),
+            )
+            connection.execute(
+                """UPDATE navigation_tasks
+                   SET status = 'needs_replan', updated_at = ?,
+                       state_revision = state_revision + 1
+                   WHERE task_id = ?""",
                 (timestamp, row["task_id"]),
             )
             connection.commit()

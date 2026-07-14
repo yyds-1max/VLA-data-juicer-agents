@@ -1415,6 +1415,211 @@ def test_human_decision_retry_cleans_evidence_when_attempt_changes_before_write(
     assert list((evidence_store.root / task.task_id).rglob("*.json")) == []
 
 
+@pytest.mark.parametrize("outcome", ["success", "failure", "cancel"])
+def test_claimed_step_terminalizes_after_action_creates_a_new_current_attempt(
+    outcome,
+    monkeypatch,
+    tmp_path,
+):
+    services = build_services(tmp_path, two_steps=True)
+    owner = services.task.created_by_web_session_id
+    agent = services.task.agentscope_session_id
+    services.task = services.task_store.update_task_for_session(
+        services.task.task_id,
+        web_session_id=owner,
+        agentscope_session_id=agent,
+        dry_run=False,
+    )
+    action_calls = []
+    created = []
+
+    def action_creating_new_attempt(**kwargs):
+        action_calls.append(kwargs)
+        created.append(
+            services.task_store.create_task_attempt(
+                request="process B",
+                target="20260711",
+                date="20260711",
+                segments=["segment-b"],
+                scene_mode=None,
+                dry_run=False,
+                web_session_id=owner,
+                agentscope_session_id=agent,
+            ).task
+        )
+        if outcome == "cancel":
+            raise TurnCancelled("cancel after side effect")
+        if outcome == "failure":
+            return failed_result("prepare_raw_data")
+        return ok_result("prepare_raw_data")
+
+    monkeypatch.setattr(
+        plan_execution,
+        "prepare_raw_data",
+        action_creating_new_attempt,
+    )
+    tool = services.tools()["prepare_raw_data_tool"]
+    with sqlite3.connect(services.plan_store.db_path) as connection:
+        audits_before = connection.execute(
+            "SELECT count(*) FROM navigation_plan_submission_attempts"
+        ).fetchone()[0]
+
+    if outcome == "cancel":
+        with pytest.raises(TurnCancelled, match="cancel after side effect"):
+            call_tool(tool, plan_id=services.plan.plan_id, step_id="prepare")
+        result = None
+    else:
+        result = call_tool(tool, plan_id=services.plan.plan_id, step_id="prepare")
+
+    assert len(action_calls) == 1
+    assert len(created) == 1
+    overview = services.plan_store.get_execution_overview(services.plan.plan_id)
+    expected_status = "completed" if outcome == "success" else "failed"
+    assert overview.steps[0].status == expected_status
+    assert all(step.status != "running" for step in overview.steps)
+    if result is not None:
+        assert result["status"] == expected_status
+        assert result["ok"] is (outcome == "success")
+    with sqlite3.connect(services.plan_store.db_path) as connection:
+        ledger = connection.execute(
+            """SELECT result_ref FROM navigation_task_steps
+               WHERE plan_id = ? AND step_id = 'prepare'""",
+            (services.plan.plan_id,),
+        ).fetchone()
+        assert ledger is not None and ledger[0]
+        assert connection.execute(
+            "SELECT count(*) FROM navigation_step_result_outbox WHERE plan_id = ?",
+            (services.plan.plan_id,),
+        ).fetchone()[0] == 0
+        assert connection.execute(
+            "SELECT count(*) FROM navigation_plan_submission_attempts"
+        ).fetchone()[0] == audits_before
+    assert services.evidence_store.exists(services.task.task_id, ledger[0])
+    assert services.task_store.find_running_target_writer(
+        date=services.task.date,
+        segments=services.task.segments,
+    ) is None
+    assert services.task_store.get_task(created[0].task_id) == created[0]
+    assert services.plan_store.get_active_for_task(created[0].task_id) is None
+
+
+def test_post_claim_stage_failure_recovers_after_a_new_current_attempt(
+    monkeypatch,
+    tmp_path,
+):
+    services = build_services(tmp_path, two_steps=True)
+    owner = services.task.created_by_web_session_id
+    agent = services.task.agentscope_session_id
+    services.task = services.task_store.update_task_for_session(
+        services.task.task_id,
+        web_session_id=owner,
+        agentscope_session_id=agent,
+        dry_run=False,
+    )
+    created = []
+    action_calls = []
+
+    def action_creating_new_attempt(**kwargs):
+        action_calls.append(kwargs)
+        created.append(
+            services.task_store.create_task_attempt(
+                request="process B",
+                target="20260711",
+                date="20260711",
+                segments=["segment-b"],
+                scene_mode=None,
+                dry_run=False,
+                web_session_id=owner,
+                agentscope_session_id=agent,
+            ).task
+        )
+        return ok_result("prepare_raw_data")
+
+    monkeypatch.setattr(
+        plan_execution,
+        "prepare_raw_data",
+        action_creating_new_attempt,
+    )
+    monkeypatch.setattr(
+        services.plan_store,
+        "stage_step_result",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            sqlite3.OperationalError("stage unavailable")
+        ),
+    )
+    tool = services.tools()["prepare_raw_data_tool"]
+
+    result = call_tool(tool, plan_id=services.plan.plan_id, step_id="prepare")
+
+    assert result["ok"] is False
+    assert result["error_type"] == "step_recovery_requires_replan"
+    assert len(action_calls) == 1
+    assert len(created) == 1
+    assert services.plan_store.get_execution_overview(
+        services.plan.plan_id
+    ).steps[0].status == "needs_replan"
+    assert services.plan_store.get_staged_step_result(
+        services.plan.plan_id, "prepare"
+    ) is None
+    assert services.task_store.find_running_target_writer(
+        date=services.task.date,
+        segments=services.task.segments,
+    ) is None
+    assert services.task_store.get_task(created[0].task_id) == created[0]
+
+
+def test_oversized_claim_result_replans_after_action_creates_new_current_attempt(
+    monkeypatch,
+    tmp_path,
+):
+    services = build_services(tmp_path, two_steps=True)
+    owner = services.task.created_by_web_session_id
+    agent = services.task.agentscope_session_id
+    services.task = services.task_store.update_task_for_session(
+        services.task.task_id,
+        web_session_id=owner,
+        agentscope_session_id=agent,
+        dry_run=False,
+    )
+    created = []
+
+    def oversized_action(**_kwargs):
+        created.append(
+            services.task_store.create_task_attempt(
+                request="process B",
+                target="20260711",
+                date="20260711",
+                segments=["segment-b"],
+                scene_mode=None,
+                dry_run=False,
+                web_session_id=owner,
+                agentscope_session_id=agent,
+            ).task
+        )
+        return ok_result("prepare_raw_data", blob="x" * 300_000)
+
+    monkeypatch.setattr(plan_execution, "prepare_raw_data", oversized_action)
+
+    result = call_tool(
+        services.tools()["prepare_raw_data_tool"],
+        plan_id=services.plan.plan_id,
+        step_id="prepare",
+    )
+
+    assert result["error_type"] == "processing_result_oversized"
+    assert result["status"] == "needs_replan"
+    assert services.plan_store.get(services.plan.plan_id).status == "invalidated"
+    assert services.plan_store.get_execution_overview(
+        services.plan.plan_id
+    ).steps[0].status == "needs_replan"
+    assert services.task_store.find_running_target_writer(
+        date=services.task.date,
+        segments=services.task.segments,
+    ) is None
+    assert services.task_store.get_task(created[0].task_id) == created[0]
+    assert services.plan_store.get_active_for_task(created[0].task_id) is None
+
+
 def test_superseded_plan_cannot_claim_pending_step(tmp_path):
     services = build_services(tmp_path)
     old_plan = services.plan

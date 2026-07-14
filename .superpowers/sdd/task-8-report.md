@@ -128,3 +128,24 @@ Remediation verification: focused navigation modules `219 passed`; full Python
 suite `770 passed` with the same pre-existing warning; compileall and diff check
 passed; all three final dead-reference searches returned no matches. No frontend
 files changed, so the frontend suite/build was not rerun for this remediation.
+
+## Durable Claim Terminalization Follow-up
+
+Final authorization review found one necessary exception to the newest-Attempt
+fence: an action may create Attempt B after Attempt A has already durably claimed
+its step. Applying the generic fence to A's result staging and recovery stranded
+the step in `running`, leaked a secondary session-mismatch exception, and retained
+the target writer lock.
+
+TDD regressions execute the real wrapper while the leaf action creates B and cover
+success, processing failure, cancellation, oversized output, and result-stage
+failure. Post-claim operations now require the exact non-null durable owner pair
+plus exact plan/step/action and a durable running/staged/terminalized state. New
+claims and all other new mutations remain newest-Attempt fenced. The same narrow
+rule applies to an already-staged human handoff's delivery or recovery; initiating
+a new handoff remains newest-Attempt fenced. A terminalizes without rerunning the
+action, releases its target lock, and never mutates B.
+
+Follow-up verification: focused execution/store/Web handoff modules `215 passed`;
+full Python suite `777 passed` with the same pre-existing warning; compileall and
+diff check passed; all three dead-reference searches returned no matches.

@@ -217,6 +217,7 @@ def finalize_claimed_step(
     staged = repo.stage_step_result(
         plan.plan_id,
         step_id,
+        expected_action=action,
         target_status=target_status,
         full_result={"ok": target_status == "completed", "message": target_status},
         result_summary={"ok": target_status == "completed", "message": target_status},
@@ -228,12 +229,14 @@ def finalize_claimed_step(
         plan.plan_id,
         step_id,
         staged.result_ref,
+        expected_action=action,
         expected_web_session_id=owner,
         expected_agentscope_session_id=agentscope_session_id,
     )
     assert repo.finalize_staged_step(
         plan.plan_id,
         step_id,
+        expected_action=action,
         expected_web_session_id=owner,
         expected_agentscope_session_id=agentscope_session_id,
     )
@@ -598,6 +601,7 @@ def test_stale_running_writer_blocks_until_controlled_step_recovery(tmp_path: Pa
         plan.plan_id,
         "prepare",
         "operator-controlled recovery",
+        expected_action="prepare_raw_data",
         expected_web_session_id="web-stale",
         expected_agentscope_session_id=agent,
     )
@@ -763,7 +767,7 @@ def test_controlled_handoff_recovery_preserves_audit_and_unblocks_replacement(tm
     )
 
 
-def test_controlled_handoff_recovery_rejects_a_non_current_attempt(tmp_path: Path):
+def test_staged_handoff_recovery_finishes_after_a_new_current_attempt(tmp_path: Path):
     repo, task = stores_with_task(tmp_path, web_session_id="web-owner")
     plan = _activate_owned(
         repo,
@@ -785,6 +789,44 @@ def test_controlled_handoff_recovery_rejects_a_non_current_attempt(tmp_path: Pat
             (plan.plan_id, task.task_id, timestamp, timestamp),
         )
     task_store = SqliteNavigationTaskStore(repo.db_path)
+    newer = task_store.create_task_attempt(
+        request="process B",
+        target="20260711",
+        date="20260711",
+        segments=["segment-b"],
+        scene_mode=None,
+        dry_run=True,
+        web_session_id="web-owner",
+        agentscope_session_id=task.agentscope_session_id,
+    )
+    newer_before = task_store.get_task(newer.task.task_id)
+
+    recovered = repo.quarantine_human_decision_handoff(
+        plan.plan_id,
+        "prepare",
+        expected_web_session_id="web-owner",
+        reason="operator requested recovery",
+    )
+
+    assert recovered["recovered"] is True
+    assert repo.get_human_decision_handoff(plan.plan_id, "prepare").status == "quarantined"
+    assert repo.get(plan.plan_id).status == "invalidated"
+    assert repo.get_current_step(plan.plan_id)["step"]["status"] == "needs_replan"
+    assert task_store.get_task(newer.task.task_id) == newer_before
+
+
+def test_non_current_attempt_cannot_initiate_a_human_handoff(tmp_path: Path):
+    repo, task = stores_with_task(tmp_path, web_session_id="web-owner")
+    plan = _activate_owned(
+        repo,
+        task,
+        "finish_processing",
+        1,
+        valid_finish_plan(),
+        expected_web_session_id="web-owner",
+        expected_agentscope_session_id=task.agentscope_session_id,
+    )
+    task_store = SqliteNavigationTaskStore(repo.db_path)
     task_store.create_task_attempt(
         request="process B",
         target="20260711",
@@ -795,23 +837,21 @@ def test_controlled_handoff_recovery_rejects_a_non_current_attempt(tmp_path: Pat
         web_session_id="web-owner",
         agentscope_session_id=task.agentscope_session_id,
     )
-    before_handoff = repo.get_human_decision_handoff(plan.plan_id, "prepare")
-    before_plan = repo.get(plan.plan_id)
-    before_step = repo.get_current_step(plan.plan_id)
-    before_task = task_store.get_task(task.task_id)
 
     with pytest.raises(PermissionError, match="session mismatch"):
-        repo.quarantine_human_decision_handoff(
+        repo.stage_human_decision_handoff(
             plan.plan_id,
-            "prepare",
+            "confirm",
+            decision_key="decision",
+            decision={"parameters": {}},
+            target_status="completed",
+            full_result={"ok": True},
+            result_summary={"ok": True},
             expected_web_session_id="web-owner",
-            reason="operator requested recovery",
+            expected_agentscope_session_id=task.agentscope_session_id,
         )
 
-    assert repo.get_human_decision_handoff(plan.plan_id, "prepare") == before_handoff
-    assert repo.get(plan.plan_id) == before_plan
-    assert repo.get_current_step(plan.plan_id) == before_step
-    assert task_store.get_task(task.task_id) == before_task
+    assert repo.get_human_decision_handoff(plan.plan_id, "confirm") is None
 
 
 @pytest.mark.parametrize("delivery_status", ["pending", "delivering", "delivered", "quarantined"])
@@ -886,6 +926,7 @@ def test_step_ledger_transitions_increment_task_state_revision(tmp_path: Path):
     repo.stage_step_result(
         plan.plan_id,
         "prepare",
+        expected_action="prepare_raw_data",
         target_status="completed",
         full_result={"message": "done", "ok": True, "tool_name": "prepare_raw_data"},
         result_summary={"message": "done", "ok": True, "tool_name": "prepare_raw_data"},
@@ -896,6 +937,7 @@ def test_step_ledger_transitions_increment_task_state_revision(tmp_path: Path):
     assert after_stage.state_revision == after_claim.state_revision + 1
     assert repo.finalize_staged_step(
         plan.plan_id, "prepare",
+        expected_action="prepare_raw_data",
         expected_web_session_id=task.created_by_web_session_id,
         expected_agentscope_session_id=task.agentscope_session_id,
     )
@@ -909,6 +951,33 @@ def test_step_ledger_transitions_increment_task_state_revision(tmp_path: Path):
     )
     after_waiting = SqliteNavigationTaskStore(repo.db_path).get_task(task.task_id)
     assert after_waiting.state_revision == after_finalize.state_revision + 1
+
+
+def test_claim_terminalization_rejects_the_wrong_action(tmp_path: Path):
+    repo, task = stores_with_task(tmp_path)
+    plan = _activate_owned(repo, task, "extract_sync", 1, valid_extract_plan())
+    assert repo.claim_step(
+        plan.plan_id,
+        "prepare",
+        "prepare_raw_data",
+        expected_web_session_id=task.created_by_web_session_id,
+        expected_agentscope_session_id=task.agentscope_session_id,
+    ) is StepClaimOutcome.CLAIMED
+
+    with pytest.raises(PermissionError, match="session mismatch"):
+        repo.stage_step_result(
+            plan.plan_id,
+            "prepare",
+            expected_action="extract_and_sync_navigation_data",
+            target_status="completed",
+            full_result={"ok": True},
+            result_summary={"ok": True},
+            expected_web_session_id=task.created_by_web_session_id,
+            expected_agentscope_session_id=task.agentscope_session_id,
+        )
+
+    assert repo.get_current_step(plan.plan_id)["step"]["status"] == "running"
+    assert repo.get_staged_step_result(plan.plan_id, "prepare") is None
 
 
 def test_plan_repository_can_initialize_before_task_store(tmp_path: Path):
@@ -968,10 +1037,10 @@ def test_owned_task_plan_writes_reject_omitted_session(tmp_path: Path):
         repository.stage_step_result(
             plan.plan_id,
             "prepare",
+            expected_action="prepare_raw_data",
             target_status="completed",
             full_result={"ok": True},
             result_summary={"ok": True},
-            expected_statuses=("pending",),
         )
     with pytest.raises(PermissionError, match="session mismatch"):
         repository.stage_human_decision_handoff(
@@ -1213,6 +1282,7 @@ def test_activation_rejects_supersede_while_result_outbox_exists(tmp_path: Path)
     repo.stage_step_result(
         first.plan_id,
         "prepare",
+        expected_action="prepare_raw_data",
         target_status="completed",
         full_result={"ok": True, "tool_name": "prepare_raw_data", "message": "done"},
         result_summary={"ok": True, "tool_name": "prepare_raw_data", "message": "done"},

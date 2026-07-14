@@ -382,6 +382,7 @@ def test_direct_terminal_treats_completed_dry_run_ledger_as_success(tmp_path):
     services.plan_store.stage_step_result(
         plan.plan_id,
         "prepare",
+        expected_action="prepare_raw_data",
         target_status="completed",
         full_result={"ok": True, "tool_name": "prepare_raw_data", "message": "dry run"},
         result_summary={"ok": True, "tool_name": "prepare_raw_data", "message": "dry run"},
@@ -390,6 +391,7 @@ def test_direct_terminal_treats_completed_dry_run_ledger_as_success(tmp_path):
     )
     assert services.plan_store.finalize_staged_step(
         plan.plan_id, "prepare",
+        expected_action="prepare_raw_data",
         expected_web_session_id="direct:test-run",
         expected_agentscope_session_id="direct-session",
     )

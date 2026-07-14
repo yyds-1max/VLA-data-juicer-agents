@@ -605,6 +605,7 @@ def _finalize_staged_result(
             wrote_evidence = True
         if not plan_store.attach_staged_result_evidence(
             plan.plan_id, step.step_id, result_ref,
+            expected_action=step.action,
             expected_web_session_id=expected_web_session_id,
             expected_agentscope_session_id=expected_agentscope_session_id,
         ):
@@ -622,6 +623,7 @@ def _finalize_staged_result(
     try:
         finalized = plan_store.finalize_staged_step(
             plan.plan_id, step.step_id,
+            expected_action=step.action,
             expected_web_session_id=expected_web_session_id,
             expected_agentscope_session_id=expected_agentscope_session_id,
         )
@@ -697,6 +699,7 @@ def _invoke_plan_step(
                 plan.plan_id,
                 step.step_id,
                 "running step has no staged result after process interruption",
+                expected_action=step.action,
                 expected_web_session_id=expected_web_session_id,
                 expected_agentscope_session_id=expected_agentscope_session_id,
             )
@@ -775,6 +778,7 @@ def _invoke_plan_step(
             plan_store.stage_step_result(
                 plan.plan_id,
                 step.step_id,
+                expected_action=step.action,
                 target_status="failed",
                 full_result=payload,
                 result_summary=_result_summary(payload),
@@ -802,6 +806,7 @@ def _invoke_plan_step(
                 plan.plan_id,
                 step.step_id,
                 "cancellation result could not be staged",
+                expected_action=step.action,
                 expected_web_session_id=expected_web_session_id,
                 expected_agentscope_session_id=expected_agentscope_session_id,
             )
@@ -824,6 +829,7 @@ def _invoke_plan_step(
         plan_store.stage_step_result(
             plan.plan_id,
             step.step_id,
+            expected_action=step.action,
             target_status=terminal_status,
             full_result=payload,
             result_summary=summary,
@@ -835,6 +841,7 @@ def _invoke_plan_step(
             plan.plan_id,
             step.step_id,
             "processing result could not be staged after underlying execution",
+            expected_action=step.action,
             expected_web_session_id=expected_web_session_id,
             expected_agentscope_session_id=expected_agentscope_session_id,
         )
@@ -854,9 +861,11 @@ def _invoke_plan_step(
         expected_agentscope_session_id=expected_agentscope_session_id,
     )
     if oversized and response.get("error_type") != "result_finalize_retry_required":
-        plan_store.mark_needs_replan(
+        plan_store.mark_terminalized_claim_needs_replan(
             plan.plan_id,
+            step.step_id,
             "processing result exceeded the durable outbox payload policy",
+            expected_action=step.action,
             expected_web_session_id=expected_web_session_id,
             expected_agentscope_session_id=expected_agentscope_session_id,
         )
