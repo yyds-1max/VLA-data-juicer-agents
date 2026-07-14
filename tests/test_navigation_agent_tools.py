@@ -1,6 +1,8 @@
 import asyncio
 import json
 import sqlite3
+from concurrent.futures import ThreadPoolExecutor
+from threading import Barrier
 from types import SimpleNamespace
 
 import pytest
@@ -1645,6 +1647,124 @@ def test_failed_result_reader_is_plan_bound_paginated_and_schema_exact(tmp_path)
     assert "result_ref" not in current["step"]
 
 
+def test_generic_evidence_reader_rejects_any_navigation_step_result_ref(tmp_path):
+    services, task, built = _resolver_services_from_complete(tmp_path)
+    active = services.plan_store.activate(
+        task,
+        "extract_sync",
+        4,
+        ExtractSyncPlanInput.model_validate(valid_extract_plan_payload(built)),
+        expected_web_session_id="as-session-1",
+        expected_agentscope_session_id="as-session-1",
+    )
+    first_step = active.plan.steps[0]
+    _stage_failed_result(
+        services,
+        active,
+        first_step,
+        {"ok": False, "message": "failed"},
+        "as-session-1",
+    )
+    snapshot = services.plan_store.read_execution_snapshot(
+        web_session_id="as-session-1",
+        agentscope_session_id="as-session-1",
+        task_id=task.task_id,
+    )
+    assert snapshot is not None
+    internal_ref = snapshot.current["step"]["result_ref"]
+    tools = {
+        tool.name: tool
+        for tool in resolve_navigation_agent_tools(
+            services=services,
+            agentscope_session_id="as-session-1",
+            web_session_id="as-session-1",
+            cancellation=None,
+        )
+    }
+
+    denied = _decode_tool_payload(
+        asyncio.run(
+            tools["read_observation_evidence_tool"](ref=internal_ref)
+        )
+    )
+
+    assert denied == {
+        "ok": False,
+        "error_type": "navigation_step_result_requires_plan_reader",
+    }
+    assert "result_ref" not in json.dumps(denied)
+
+
+def test_failed_result_reader_discards_data_when_attempt_changes_during_read(
+    tmp_path,
+    monkeypatch,
+):
+    services, task, built = _resolver_services_from_complete(tmp_path)
+    active = services.plan_store.activate(
+        task,
+        "extract_sync",
+        4,
+        ExtractSyncPlanInput.model_validate(valid_extract_plan_payload(built)),
+        expected_web_session_id="as-session-1",
+        expected_agentscope_session_id="as-session-1",
+    )
+    first_step = active.plan.steps[0]
+    _stage_failed_result(
+        services,
+        active,
+        first_step,
+        {"ok": False, "message": "must be discarded"},
+        "as-session-1",
+    )
+    tools = {
+        tool.name: tool
+        for tool in resolve_navigation_agent_tools(
+            services=services,
+            agentscope_session_id="as-session-1",
+            web_session_id="as-session-1",
+            cancellation=None,
+        )
+    }
+    reader = tools["read_navigation_step_result_tool"]
+    entered_read = Barrier(2)
+    release_read = Barrier(2)
+    original_read = services.evidence_store.read
+
+    def blocking_read(*args, **kwargs):
+        entered_read.wait()
+        release_read.wait()
+        return original_read(*args, **kwargs)
+
+    monkeypatch.setattr(services.evidence_store, "read", blocking_read)
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        pending = executor.submit(
+            lambda: _decode_tool_payload(
+                asyncio.run(
+                    reader(plan_id=active.plan_id, step_id=first_step.step_id)
+                )
+            )
+        )
+        entered_read.wait()
+        services.task_store.create_task_attempt(
+            request="replacement task",
+            target="20260712",
+            date="20260712",
+            segments=["20260712_120000"],
+            scene_mode=None,
+            dry_run=True,
+            web_session_id="as-session-1",
+            agentscope_session_id="as-session-1",
+        )
+        release_read.wait()
+        result = pending.result(timeout=5)
+
+    assert result == {
+        "ok": False,
+        "error_type": "navigation_step_result_unavailable",
+    }
+    assert "must be discarded" not in json.dumps(result)
+
+
 @pytest.mark.parametrize(
     ("requested_plan", "requested_step"),
     [("wrong-plan", "current"), ("current", "wrong-step")],
@@ -1736,6 +1856,15 @@ def test_failed_result_reader_reauthorizes_attempt_and_bounds_inputs(
             )
         )
     )
+    reserved = _decode_tool_payload(
+        asyncio.run(
+            reader(
+                plan_id=active.plan_id,
+                step_id=first_step.step_id,
+                fields=["result_ref"],
+            )
+        )
+    )
     if ownership_change == "session":
         with sqlite3.connect(services.plan_store.db_path) as connection:
             connection.execute(
@@ -1761,6 +1890,10 @@ def test_failed_result_reader_reauthorizes_attempt_and_bounds_inputs(
     )
 
     assert oversized == {
+        "ok": False,
+        "error_type": "navigation_step_result_request_invalid",
+    }
+    assert reserved == {
         "ok": False,
         "error_type": "navigation_step_result_request_invalid",
     }

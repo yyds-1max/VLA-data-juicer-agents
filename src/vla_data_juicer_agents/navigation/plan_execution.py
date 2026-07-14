@@ -378,6 +378,8 @@ def _record_changed_preconditions(
                 "message": "A concrete input required by the accepted plan changed before execution.",
                 "side_effect_state": "not_started",
             },
+            step_id=step.step_id,
+            result_ref=descriptor.ref,
             expected_web_session_id=expected_web_session_id,
             expected_agentscope_session_id=expected_agentscope_session_id,
         )
@@ -393,7 +395,7 @@ def _record_changed_preconditions(
     return _compact_error(
         "input_precondition_changed",
         "A concrete input required by the accepted plan changed before execution.",
-        result_ref=descriptor.ref,
+        result_available=True,
         missing_input_count=failure["missing_input_count"],
         next_action="submit_complete_plan",
     )
@@ -676,7 +678,7 @@ def _finalize_staged_result(
         "plan_id": plan.plan_id,
         "step_id": step.step_id,
         "status": staged.target_status,
-        "result_ref": result_ref,
+        "result_available": True,
         "next_action": (
             _next_action(plan_store, plan.plan_id)
             if staged.target_status == "completed"
@@ -999,7 +1001,7 @@ def prepare_plan_human_decision(
             return _compact_error(
                 "input_precondition_changed",
                 "A concrete input changed while the human decision request was waiting; audited recovery is required before replanning.",
-                result_ref=descriptor.ref,
+                result_available=True,
                 missing_input_count=precondition_failure["missing_input_count"],
                 recovery_required=True,
                 next_action="quarantine_human_decision_handoff",

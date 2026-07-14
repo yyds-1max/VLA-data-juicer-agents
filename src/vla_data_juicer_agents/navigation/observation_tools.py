@@ -48,6 +48,9 @@ from vla_data_juicer_agents.navigation.plan_models import (
     EmptyArguments,
     ExtractSyncArguments,
 )
+from vla_data_juicer_agents.navigation.plan_store import (
+    SqliteNavigationPlanRepository,
+)
 from vla_data_juicer_agents.navigation.planning_context import (
     build_navigation_task_context,
 )
@@ -62,6 +65,7 @@ _INSPECTION_FAILURE_FALLBACK = {
     "error_type": "inspection_failed",
     "message": "Inspection failed.",
 }
+_RESERVED_EVIDENCE_FIELDS = frozenset({"result_ref"})
 
 
 def _make_tool(func: Callable[..., dict[str, Any]], name: str) -> FunctionTool:
@@ -113,10 +117,15 @@ def build_navigation_observation_tools(
     task: NavigationTask,
     observation_store: SqliteNavigationObservationStore,
     evidence_store: FileNavigationEvidenceStore,
+    plan_store: SqliteNavigationPlanRepository | None = None,
     settings: NavigationSettings,
     expected_web_session_id: str | None = None,
     expected_agentscope_session_id: str | None = None,
 ) -> list[FunctionTool]:
+    plan_store = plan_store or SqliteNavigationPlanRepository(
+        observation_store.db_path,
+        initialize=False,
+    )
     def append_observation(
         *,
         kind: ObservationKind,
@@ -372,13 +381,33 @@ def build_navigation_observation_tools(
         limit: int = 50,
     ) -> dict[str, Any]:
         """Read selected, paginated evidence fields owned by the bound task."""
-        return evidence_store.read(
+        normalized_fields = _normalize_fields(fields)
+        if normalized_fields is not None and any(
+            field.lower() in _RESERVED_EVIDENCE_FIELDS
+            for field in normalized_fields
+        ):
+            return {
+                "ok": False,
+                "error_type": "navigation_evidence_request_invalid",
+            }
+        if plan_store.is_step_result_ref(task.task_id, ref):
+            return {
+                "ok": False,
+                "error_type": "navigation_step_result_requires_plan_reader",
+            }
+        result = evidence_store.read(
             task.task_id,
             ref,
-            fields=_normalize_fields(fields),
+            fields=normalized_fields,
             cursor=cursor,
             limit=limit,
         )
+        if plan_store.is_step_result_ref(task.task_id, ref):
+            return {
+                "ok": False,
+                "error_type": "navigation_step_result_requires_plan_reader",
+            }
+        return result
 
     def describe_processing_action(action_id: str) -> dict[str, Any]:
         """Describe only the requested executor action without choosing a stage."""

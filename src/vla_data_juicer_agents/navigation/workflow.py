@@ -11,6 +11,9 @@ from vla_data_juicer_agents.core.cancellation import CancellationContext, TurnCa
 from vla_data_juicer_agents.core.events import EventEmitter, EventScope
 from vla_data_juicer_agents.navigation.agent_tools import resolve_navigation_agent_tools
 from vla_data_juicer_agents.navigation.agents import create_plan_agent
+from vla_data_juicer_agents.navigation.evidence_store import (
+    strip_reserved_identity_fields,
+)
 from vla_data_juicer_agents.navigation.models import NavigationRequest
 from vla_data_juicer_agents.navigation.plan_models import NavigationPlanRecord
 from vla_data_juicer_agents.navigation.run_state import WorkflowRunStore
@@ -303,7 +306,7 @@ def direct_execution_terminal_state(
         "plan_id": plan_id,
         "plan_status": plan_status,
         "dry_run": task_dry_run,
-        "current_step": current,
+        "current_step": strip_reserved_identity_fields(current),
         "execution_overview": overview,
     }
 

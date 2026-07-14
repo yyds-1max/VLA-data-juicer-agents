@@ -11,6 +11,9 @@ from agentscope.tool import FunctionTool, ToolBase
 from vla_data_juicer_agents.core.cancellation import CancellationContext
 from vla_data_juicer_agents.navigation.catalog import list_navigation_tool_capabilities
 from vla_data_juicer_agents.navigation.context_budget import ensure_payload_within_limit
+from vla_data_juicer_agents.navigation.evidence_store import (
+    strip_reserved_identity_fields,
+)
 from vla_data_juicer_agents.navigation.observation_tools import build_navigation_observation_tools
 from vla_data_juicer_agents.navigation.plan_execution import build_plan_bound_execution_tools
 from vla_data_juicer_agents.navigation.plan_store import NavigationExecutionSnapshot
@@ -51,6 +54,7 @@ _EXECUTION_STATE_TOOL_NAMES = {
     "get_current_plan_step_tool",
 }
 _FAILED_RESULT_TOOL_NAMES = {"read_navigation_step_result_tool"}
+_RESERVED_RESULT_FIELDS = frozenset({"result_ref"})
 _FIXED_TOOL_NAMES_BY_ACTIVITY = {
     "planning": _OBSERVATION_FIXED_TOOL_NAMES
     | {
@@ -184,11 +188,10 @@ def _execution_state_tools(
             return {"ok": False, "error_type": "inactive_navigation_plan"}
         if current.current is None:
             return None
-        payload = {
+        payload = strip_reserved_identity_fields({
             **current.current,
             "step": {**current.current["step"]},
-        }
-        payload["step"].pop("result_ref", None)
+        })
         return ensure_payload_within_limit(
             payload,
             max_chars=4_000,
@@ -224,6 +227,39 @@ def _failed_step_result_tools(
             "error_type": "navigation_step_result_request_invalid",
         }
 
+    def authorization_fingerprint(
+        current: NavigationExecutionSnapshot | None,
+        *,
+        plan_id: str,
+        step_id: str,
+    ) -> tuple[Any, ...] | None:
+        current_step = (
+            ((current.current if current is not None else None) or {}).get("step")
+        )
+        if (
+            current is None
+            or current.activity != "failed_recovery"
+            or current.active_plan is None
+            or current.active_plan.plan_id != plan_id
+            or not isinstance(current_step, dict)
+            or current_step.get("step_id") != step_id
+            or current_step.get("status") not in {"failed", "needs_replan"}
+            or not isinstance(current_step.get("result_ref"), str)
+        ):
+            return None
+        return (
+            current.task.task_id,
+            current.task.created_by_web_session_id,
+            current.task.agentscope_session_id,
+            current.active_plan.plan_id,
+            current.active_plan.plan_revision,
+            current.active_plan.status,
+            current.current.get("plan_revision"),
+            current_step.get("step_id"),
+            current_step.get("status"),
+            current_step.get("result_ref"),
+        )
+
     def read_navigation_step_result_tool(
         plan_id: str,
         step_id: str,
@@ -244,7 +280,10 @@ def _failed_step_result_tools(
                 not isinstance(fields, list)
                 or len(fields) > 20
                 or any(
-                    not isinstance(field, str) or not field or len(field) > 200
+                    not isinstance(field, str)
+                    or not field
+                    or len(field) > 200
+                    or field.lower() in _RESERVED_RESULT_FIELDS
                     for field in fields
                 )
             )
@@ -263,30 +302,35 @@ def _failed_step_result_tools(
             agentscope_session_id=agentscope_session_id,
             task_id=snapshot.task.task_id,
         )
-        current_step = ((current.current if current is not None else None) or {}).get(
-            "step"
+        fingerprint = authorization_fingerprint(
+            current,
+            plan_id=plan_id,
+            step_id=step_id,
         )
-        if (
-            current is None
-            or current.activity != "failed_recovery"
-            or current.active_plan is None
-            or current.active_plan.plan_id != plan_id
-            or not isinstance(current_step, dict)
-            or current_step.get("step_id") != step_id
-            or current_step.get("status") not in {"failed", "needs_replan"}
-            or not isinstance(current_step.get("result_ref"), str)
-        ):
+        if fingerprint is None or current is None:
             return unavailable()
         try:
-            return services.evidence_store.read(
+            result = services.evidence_store.read(
                 current.task.task_id,
-                current_step["result_ref"],
+                fingerprint[-1],
                 fields=fields,
                 cursor=cursor,
                 limit=limit,
             )
         except Exception:
             return unavailable()
+        refreshed = services.plan_store.read_execution_snapshot(
+            web_session_id=web_session_id,
+            agentscope_session_id=agentscope_session_id,
+            task_id=snapshot.task.task_id,
+        )
+        if authorization_fingerprint(
+            refreshed,
+            plan_id=plan_id,
+            step_id=step_id,
+        ) != fingerprint:
+            return unavailable()
+        return result
 
     tool = FunctionTool(read_navigation_step_result_tool, is_read_only=True)
     tool.input_schema["additionalProperties"] = False
@@ -306,6 +350,7 @@ def build_navigation_tool_groups(
         task=task,
         observation_store=services.observation_store,
         evidence_store=services.evidence_store,
+        plan_store=services.plan_store,
         settings=services.settings,
         expected_web_session_id=web_session_id,
         expected_agentscope_session_id=agentscope_session_id,

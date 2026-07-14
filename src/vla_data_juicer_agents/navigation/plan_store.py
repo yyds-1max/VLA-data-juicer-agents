@@ -1044,6 +1044,24 @@ class SqliteNavigationPlanRepository:
         self._ensure_within_limit(payload, label="current step")
         return payload
 
+    def is_step_result_ref(self, task_id: str, result_ref: str) -> bool:
+        """Classify staged or durable execution evidence without decoding its ref."""
+        if not isinstance(task_id, str) or not isinstance(result_ref, str):
+            return False
+        with self._connect() as connection:
+            row = connection.execute(
+                """SELECT 1
+                   FROM navigation_task_steps
+                   WHERE task_id = ? AND result_ref = ?
+                   UNION ALL
+                   SELECT 1
+                   FROM navigation_step_result_outbox
+                   WHERE task_id = ? AND result_ref = ?
+                   LIMIT 1""",
+                (task_id, result_ref, task_id, result_ref),
+            ).fetchone()
+        return row is not None
+
     def claim_step(
         self,
         plan_id: str,
@@ -2127,10 +2145,14 @@ class SqliteNavigationPlanRepository:
     def mark_needs_replan(
         self, plan_id: str, reason: str, *,
         result_summary: dict[str, Any] | None = None,
+        step_id: str | None = None,
+        result_ref: str | None = None,
         expected_web_session_id: str | None = None,
         expected_agentscope_session_id: str | None = None,
     ) -> bool:
         """Invalidate one active plan and its unfinished ledger in one transaction."""
+        if (step_id is None) != (result_ref is None):
+            raise ValueError("step_id and result_ref must be provided together")
         connection = self._connect()
         try:
             connection.execute("BEGIN IMMEDIATE")
@@ -2171,10 +2193,21 @@ class SqliteNavigationPlanRepository:
                 """
                 UPDATE navigation_task_steps
                 SET status = 'needs_replan', finished_at = ?,
-                    result_summary_json = COALESCE(?, result_summary_json)
+                    result_summary_json = COALESCE(?, result_summary_json),
+                    result_ref = CASE
+                        WHEN ? IS NOT NULL AND step_id = ? THEN ?
+                        ELSE result_ref
+                    END
                 WHERE plan_id = ? AND status != 'completed'
                 """,
-                (timestamp, canonical_summary, plan_id),
+                (
+                    timestamp,
+                    canonical_summary,
+                    step_id,
+                    step_id,
+                    result_ref,
+                    plan_id,
+                ),
             )
             connection.execute(
                 """

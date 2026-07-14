@@ -73,6 +73,21 @@ def call_tool(tool, **arguments):
     return asyncio.run(_call())
 
 
+def stored_step_result_ref(
+    plan_store: SqliteNavigationPlanRepository,
+    plan_id: str,
+    step_id: str,
+) -> str:
+    with sqlite3.connect(plan_store.db_path) as connection:
+        row = connection.execute(
+            """SELECT result_ref FROM navigation_task_steps
+               WHERE plan_id = ? AND step_id = ?""",
+            (plan_id, step_id),
+        ).fetchone()
+    assert row is not None and isinstance(row[0], str)
+    return row[0]
+
+
 def ok_result(tool_name: str, *, blob: str = "") -> ToolResult:
     return ToolResult(
         ok=True,
@@ -364,6 +379,8 @@ def test_extract_wrapper_loads_canonical_topics_from_plan(monkeypatch, tmp_path)
 
     assert result["ok"] is True
     assert result["side_effect_state"] == "completed"
+    assert result["result_available"] is True
+    assert "result_ref" not in json.dumps(result)
     assert captured == {
         "date": services.task.date,
         "segments": services.task.segments,
@@ -525,7 +542,8 @@ def test_changed_input_precondition_records_evidence_without_artifact_reconcilia
     assert result["ok"] is False
     assert result["error_type"] == "input_precondition_changed"
     assert result["next_action"] == "submit_complete_plan"
-    assert result["result_ref"]
+    assert result["result_available"] is True
+    assert "result_ref" not in json.dumps(result)
     assert len(json.dumps(result, ensure_ascii=False)) <= 4000
     assert invoked == []
     assert services.plan_store.get(services.plan.plan_id).status == "invalidated"
@@ -538,7 +556,9 @@ def test_changed_input_precondition_records_evidence_without_artifact_reconcilia
     assert snapshot is not None
     assert snapshot.activity == "failed_recovery"
     assert snapshot.current["step"]["result_summary"]["side_effect_state"] == "not_started"
-    evidence = services.evidence_store.read(services.task.task_id, result["result_ref"])
+    internal_ref = snapshot.current["step"]["result_ref"]
+    assert isinstance(internal_ref, str)
+    evidence = services.evidence_store.read(services.task.task_id, internal_ref)
     assert evidence["data"]["missing_inputs"]
 
 
@@ -665,11 +685,14 @@ def test_gridmap_step_rejects_drift_in_exact_observed_inputs(
 
     assert result["ok"] is False
     assert result["error_type"] == "input_precondition_changed"
-    assert result["result_ref"]
+    assert result["result_available"] is True
+    assert "result_ref" not in json.dumps(result)
     assert invoked == []
     assert plan_store.get(plan.plan_id).status == "invalidated"
     assert plan_store.get_current_step(plan.plan_id)["step"]["status"] == "needs_replan"
-    evidence = evidence_store.read(task.task_id, result["result_ref"])
+    internal_ref = plan_store.get_current_step(plan.plan_id)["step"]["result_ref"]
+    assert isinstance(internal_ref, str)
+    evidence = evidence_store.read(task.task_id, internal_ref)
     expected_missing = gridmap_dir if removed_input == "gridmap_json" else removed
     assert str(expected_missing) in evidence["data"]["missing_inputs"]
 
@@ -976,7 +999,8 @@ def test_waiting_human_decision_retry_enters_audited_recovery_when_input_drifts(
     assert retry_permission.behavior.value == "deny"
     assert denied is not None
     assert denied["error_type"] == "input_precondition_changed"
-    assert denied["result_ref"]
+    assert denied["result_available"] is True
+    assert "result_ref" not in json.dumps(denied)
     assert denied["recovery_required"] is True
     handoff = plan_store.get_human_decision_handoff(plan.plan_id, "confirm")
     assert handoff is not None
@@ -990,8 +1014,13 @@ def test_waiting_human_decision_retry_enters_audited_recovery_when_input_drifts(
     }
     assert plan_store.get(plan.plan_id).status == "active"
     assert plan_store.get_current_step(plan.plan_id)["step"]["status"] == "waiting_user"
-    evidence = evidence_store.read(task.task_id, denied["result_ref"])
-    assert str(source_path) in evidence["data"]["missing_inputs"]
+    evidence_files = list((evidence_store.root / task.task_id).rglob("*.json"))
+    matching_payloads = [
+        json.loads(path.read_text(encoding="utf-8"))
+        for path in evidence_files
+        if "missing_inputs" in json.loads(path.read_text(encoding="utf-8"))
+    ]
+    assert any(str(source_path) in payload["missing_inputs"] for payload in matching_payloads)
 
     recovered = plan_store.quarantine_human_decision_handoff(
         plan.plan_id,
@@ -2265,8 +2294,11 @@ def test_processing_result_recursively_redacts_secrets_before_outbox_and_evidenc
         plan_id=services.plan.plan_id,
         step_id="sync",
     )
+    assert result["result_available"] is True
+    assert "result_ref" not in json.dumps(result)
     payload = services.evidence_store.read(
-        services.task.task_id, result["result_ref"]
+        services.task.task_id,
+        stored_step_result_ref(services.plan_store, services.plan.plan_id, "sync"),
     )["data"]
 
     assert payload["details"] == {
@@ -2296,6 +2328,8 @@ def test_oversized_processing_result_is_bounded_and_moves_to_needs_replan(
 
     assert result["error_type"] == "processing_result_oversized"
     assert result["status"] == "needs_replan"
+    assert result["result_available"] is True
+    assert "result_ref" not in json.dumps(result)
     assert len(json.dumps(result)) <= 4000
     assert services.plan_store.get(services.plan.plan_id).status == "invalidated"
     assert services.plan_store.get_current_step(services.plan.plan_id)["step"]["status"] == "needs_replan"
@@ -2349,6 +2383,8 @@ def test_failed_step_is_recorded_exactly_once_and_duplicate_does_not_reinvoke(
     second = call_tool(tool, plan_id=services.plan.plan_id, step_id="sync")
 
     assert first["ok"] is False
+    assert first["result_available"] is True
+    assert "result_ref" not in json.dumps(first)
     assert first["next_action"] == "manual_recovery"
     assert second["error_type"] == "step_already_terminal"
     assert second["next_action"] == "manual_recovery"
@@ -2590,6 +2626,8 @@ def test_cancelled_result_finalize_failure_is_recoverable_without_reinvoking(
     assert recovered["status"] == "failed"
     assert recovered["error_type"] == "turn_cancelled"
     assert recovered["side_effect_state"] == "partial_or_unknown"
+    assert recovered["result_available"] is True
+    assert "result_ref" not in json.dumps(recovered)
     assert recovered["next_action"] == "manual_recovery"
     assert len(invoked) == 1
 
