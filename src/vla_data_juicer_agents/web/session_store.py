@@ -42,7 +42,6 @@ class AgentScopeSessionMapping:
     web_session_id: str
     agent_id: str
     agentscope_session_id: str
-    event_cursor: str | None = None
 
 
 class WebSessionStore:
@@ -149,7 +148,6 @@ class WebSessionStore:
                 web_session_id TEXT NOT NULL,
                 agent_id TEXT NOT NULL,
                 agentscope_session_id TEXT NOT NULL,
-                event_cursor TEXT,
                 active INTEGER NOT NULL DEFAULT 1,
                 updated_at TEXT NOT NULL,
                 PRIMARY KEY (web_session_id, agent_id),
@@ -640,16 +638,11 @@ class WebSessionStore:
                 """
                 INSERT INTO agentscope_sessions (
                     web_session_id, agent_id, agentscope_session_id,
-                    event_cursor, active, updated_at
+                    active, updated_at
                 )
-                VALUES (?, ?, ?, NULL, 1, ?)
+                VALUES (?, ?, ?, 1, ?)
                 ON CONFLICT(web_session_id, agent_id) DO UPDATE SET
                     agentscope_session_id = excluded.agentscope_session_id,
-                    event_cursor = CASE
-                        WHEN agentscope_sessions.agentscope_session_id = excluded.agentscope_session_id
-                        THEN agentscope_sessions.event_cursor
-                        ELSE NULL
-                    END,
                     active = 1,
                     updated_at = excluded.updated_at
                 """,
@@ -689,7 +682,7 @@ class WebSessionStore:
         with self._connect() as connection:
             row = connection.execute(
                 """
-                SELECT web_session_id, agent_id, agentscope_session_id, event_cursor
+                SELECT web_session_id, agent_id, agentscope_session_id
                 FROM agentscope_sessions
                 WHERE web_session_id = ? AND active = 1
                 ORDER BY updated_at DESC
@@ -707,7 +700,7 @@ class WebSessionStore:
         with self._connect() as connection:
             row = connection.execute(
                 """
-                SELECT web_session_id, agent_id, agentscope_session_id, event_cursor
+                SELECT web_session_id, agent_id, agentscope_session_id
                 FROM agentscope_sessions
                 WHERE web_session_id = ? AND agent_id = ?
                 """,
@@ -722,7 +715,7 @@ class WebSessionStore:
         with self._connect() as connection:
             rows = connection.execute(
                 """
-                SELECT web_session_id, agent_id, agentscope_session_id, event_cursor
+                SELECT web_session_id, agent_id, agentscope_session_id
                 FROM agentscope_sessions
                 WHERE web_session_id = ?
                 ORDER BY agent_id
@@ -738,27 +731,13 @@ class WebSessionStore:
         with self._connect() as connection:
             row = connection.execute(
                 """
-                SELECT web_session_id, agent_id, agentscope_session_id, event_cursor
+                SELECT web_session_id, agent_id, agentscope_session_id
                 FROM agentscope_sessions
                 WHERE agentscope_session_id = ?
                 """,
                 (agentscope_session_id,),
             ).fetchone()
         return self._agentscope_mapping_from_row(row) if row is not None else None
-
-    def save_agentscope_event_cursor(self, agentscope_session_id: str, cursor: str) -> None:
-        timestamp = _now()
-        with self._connect() as connection:
-            result = connection.execute(
-                """
-                UPDATE agentscope_sessions
-                SET event_cursor = ?, updated_at = ?
-                WHERE agentscope_session_id = ?
-                """,
-                (cursor, timestamp, agentscope_session_id),
-            )
-            if result.rowcount == 0:
-                raise KeyError(agentscope_session_id)
 
     @staticmethod
     def _require_session(connection: sqlite3.Connection, session_id: str) -> None:
@@ -848,5 +827,4 @@ class WebSessionStore:
             web_session_id=row["web_session_id"],
             agent_id=row["agent_id"],
             agentscope_session_id=row["agentscope_session_id"],
-            event_cursor=row["event_cursor"],
         )
