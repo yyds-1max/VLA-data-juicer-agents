@@ -39,6 +39,10 @@ from vla_data_juicer_agents.web.session_store import WebSessionStore
 from vla_data_juicer_agents.web.sse import iter_sse
 
 logger = logging.getLogger(__name__)
+SESSION_DELETE_ERROR = {
+    "code": "session_delete_failed",
+    "message": "DataPilot could not delete this session. Please retry.",
+}
 
 
 def create_app(
@@ -129,12 +133,13 @@ def create_app(
 
     @app.delete("/api/sessions/{session_id}", status_code=204)
     async def delete_session(session_id: str) -> Response:
+        if store.get_session(session_id) is None:
+            raise HTTPException(status_code=404, detail="Session not found")
         try:
             await _maybe_await(manager.delete_session(session_id))
-        except KeyError as exc:
-            raise HTTPException(status_code=404, detail="Session not found") from exc
-        except (RuntimeError, ValueError) as exc:
-            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        except Exception as exc:  # pylint: disable=broad-except
+            logger.exception("DataPilot session deletion failed: session_id=%s", session_id)
+            raise HTTPException(status_code=409, detail=SESSION_DELETE_ERROR) from exc
         return Response(status_code=204)
 
     @app.get("/api/navigation/datasets/summary")

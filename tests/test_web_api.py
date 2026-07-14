@@ -4,6 +4,7 @@ import asyncio
 import inspect
 import json
 import logging
+import sqlite3
 import time
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -88,7 +89,7 @@ class RecordingSessionService:
     async def delete_session(self, user_id: str, agent_id: str, session_id: str) -> bool:
         self.calls.append((user_id, agent_id, session_id))
         if session_id == self.fail_on_session:
-            raise RuntimeError("AgentScope deletion failed")
+            raise RuntimeError(f"delete failed for {agent_id} / {session_id}")
         return True
 
 
@@ -109,9 +110,24 @@ class FailOnceSessionService:
         return True
 
 
+class IdempotentSessionService:
+    def __init__(self) -> None:
+        self.calls: list[tuple[str, str, str]] = []
+        self.deleted_sessions: set[str] = set()
+
+    async def delete_session(self, user_id: str, agent_id: str, session_id: str) -> bool:
+        self.calls.append((user_id, agent_id, session_id))
+        if session_id in self.deleted_sessions:
+            return False
+        self.deleted_sessions.add(session_id)
+        return True
+
+
 def make_deletion_client(
     tmp_path: Path,
-    session_service: RecordingSessionService | FailOnceSessionService,
+    session_service: (
+        RecordingSessionService | FailOnceSessionService | IdempotentSessionService
+    ),
 ) -> tuple[TestClient, AgentScopeRuntime]:
     agentscope_app = FastAPI()
     agentscope_app.state.session_service = session_service
@@ -745,7 +761,7 @@ def test_delete_session_removes_only_control_state_and_preserves_artifact_bytes(
 
 
 def test_agentscope_delete_failure_keeps_public_and_navigation_control_state(tmp_path: Path):
-    service = RecordingSessionService(fail_on_session="worker-session")
+    service = RecordingSessionService(fail_on_session="internal-as-session")
     client, runtime = make_deletion_client(tmp_path, service)
     session_id = _create_session(client)
     runtime.web_session_store.save_agentscope_session_mapping(
@@ -755,8 +771,8 @@ def test_agentscope_delete_failure_keeps_public_and_navigation_control_state(tmp
     )
     runtime.web_session_store.save_agentscope_session_mapping(
         session_id,
-        agent_id="worker-agent",
-        agentscope_session_id="worker-session",
+        agent_id="internal-agent",
+        agentscope_session_id="internal-as-session",
     )
     navigation_store = SqliteNavigationTaskStore(
         runtime.config.workspace_root / "navigation-tasks.sqlite"
@@ -775,6 +791,14 @@ def test_agentscope_delete_failure_keeps_public_and_navigation_control_state(tmp
     response = client.delete(f"/api/sessions/{session_id}")
 
     assert response.status_code == 409
+    assert response.json() == {
+        "detail": {
+            "code": "session_delete_failed",
+            "message": "DataPilot could not delete this session. Please retry.",
+        }
+    }
+    assert "internal-agent" not in response.text
+    assert "internal-as-session" not in response.text
     assert runtime.web_session_store.get_session(session_id) is not None
     assert [item.task_id for item in navigation_store.find_by_web_session(session_id)] == [
         task.task_id
@@ -807,6 +831,241 @@ def test_agentscope_delete_retry_accepts_already_absent_earlier_mapping(tmp_path
         ("delete-user", "worker-agent", "worker-session"),
         ("delete-user", "navigation-data-agent", "navigation-session"),
         ("delete-user", "worker-agent", "worker-session"),
+    ]
+
+
+@pytest.mark.parametrize(
+    "error",
+    [
+        OSError("private evidence path /raw/internal"),
+        sqlite3.OperationalError("private table internal_control"),
+        RuntimeError("private runtime internal-agent"),
+        ValueError("private task internal-as-session"),
+    ],
+)
+def test_delete_error_boundary_returns_stable_non_sensitive_response(
+    tmp_path: Path,
+    error: Exception,
+):
+    client = make_client(tmp_path)
+    session_id = _create_session(client)
+
+    def fail_delete(_session_id: str) -> None:
+        raise error
+
+    client.app.state.manager.delete_session = fail_delete
+
+    response = client.delete(f"/api/sessions/{session_id}")
+
+    assert response.status_code == 409
+    assert response.json() == {
+        "detail": {
+            "code": "session_delete_failed",
+            "message": "DataPilot could not delete this session. Please retry.",
+        }
+    }
+    assert "private" not in response.text
+    assert "internal" not in response.text
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("error", [asyncio.CancelledError(), KeyboardInterrupt()])
+async def test_delete_error_boundary_does_not_swallow_base_exceptions(
+    tmp_path: Path,
+    error: BaseException,
+):
+    app = create_app(
+        working_dir=str(tmp_path / ".djx"),
+        db_path=tmp_path / "sessions.sqlite",
+        controller_factory=FakeController,
+    )
+    session = app.state.manager.create_session("delete")
+
+    async def fail_delete(_session_id: str) -> None:
+        raise error
+
+    app.state.manager.delete_session = fail_delete
+    endpoint = next(
+        route.endpoint
+        for route in app.routes
+        if getattr(route, "path", None) == "/api/sessions/{session_id}"
+        and "DELETE" in getattr(route, "methods", set())
+    )
+
+    with pytest.raises(type(error)):
+        await endpoint(session.id)
+
+
+def test_evidence_root_symlink_failure_preserves_raw_navigation_and_public_state(
+    tmp_path: Path,
+):
+    raw_artifact = tmp_path / "raw_data" / "clip" / "raw.db3"
+    raw_artifact.parent.mkdir(parents=True)
+    raw_artifact.write_bytes(b"raw")
+    service = IdempotentSessionService()
+    client, runtime = make_deletion_client(tmp_path, service)
+    session_id = _create_session(client)
+    runtime.web_session_store.save_agentscope_session_mapping(
+        session_id,
+        agent_id="navigation-data-agent",
+        agentscope_session_id="navigation-session",
+    )
+    navigation_store = SqliteNavigationTaskStore(
+        runtime.config.workspace_root / "navigation-tasks.sqlite"
+    )
+    task = navigation_store.create_task_attempt(
+        request="process",
+        target="20270623",
+        date="20270623",
+        segments=None,
+        scene_mode=None,
+        dry_run=True,
+        web_session_id=session_id,
+        agentscope_session_id="navigation-session",
+    ).task
+    evidence_root = runtime.config.workspace_root / "navigation-evidence"
+    evidence_root.parent.mkdir(parents=True, exist_ok=True)
+    evidence_root.symlink_to(raw_artifact.parent, target_is_directory=True)
+
+    response = client.delete(f"/api/sessions/{session_id}")
+
+    assert response.status_code == 409
+    assert response.json()["detail"]["code"] == "session_delete_failed"
+    assert runtime.web_session_store.get_session(session_id) is not None
+    assert navigation_store.get_task(task.task_id) is not None
+    assert raw_artifact.read_bytes() == b"raw"
+
+
+def test_navigation_db_failure_after_evidence_delete_retries_safely(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    service = IdempotentSessionService()
+    client, runtime = make_deletion_client(tmp_path, service)
+    session_id = _create_session(client)
+    runtime.web_session_store.save_agentscope_session_mapping(
+        session_id,
+        agent_id="navigation-data-agent",
+        agentscope_session_id="navigation-session",
+    )
+    services = runtime._navigation_services()
+    task = services.task_store.create_task_attempt(
+        request="process",
+        target="20270623",
+        date="20270623",
+        segments=None,
+        scene_mode=None,
+        dry_run=True,
+        web_session_id=session_id,
+        agentscope_session_id="navigation-session",
+    ).task
+    evidence = (
+        runtime.config.workspace_root
+        / "navigation-evidence"
+        / task.task_id
+        / "e.json"
+    )
+    evidence.parent.mkdir(parents=True)
+    evidence.write_bytes(b"evidence")
+    original_connect = services.task_store._connect
+    fail_transaction = True
+
+    class InjectedFailureConnection:
+        def __init__(self, connection):
+            self.connection = connection
+
+        def execute(self, sql: str, parameters=()):
+            if (
+                fail_transaction
+                and 'DELETE FROM "navigation_human_decision_handoffs"' in sql
+            ):
+                raise sqlite3.OperationalError("internal navigation table")
+            return self.connection.execute(sql, parameters)
+
+        def __enter__(self):
+            self.connection.__enter__()
+            return self
+
+        def __exit__(self, exc_type, exc, traceback):
+            return self.connection.__exit__(exc_type, exc, traceback)
+
+        def __getattr__(self, name: str):
+            return getattr(self.connection, name)
+
+    def injected_connect():
+        return InjectedFailureConnection(original_connect())
+
+    monkeypatch.setattr(runtime, "_navigation_services", lambda: services)
+    monkeypatch.setattr(services.task_store, "_connect", injected_connect)
+
+    first = client.delete(f"/api/sessions/{session_id}")
+
+    assert first.status_code == 409
+    assert first.json()["detail"]["code"] == "session_delete_failed"
+    assert "internal navigation table" not in first.text
+    assert not evidence.exists()
+    assert services.task_store.get_task(task.task_id) is not None
+    assert runtime.web_session_store.get_session(session_id) is not None
+
+    fail_transaction = False
+    second = client.delete(f"/api/sessions/{session_id}")
+
+    assert second.status_code == 204
+    assert runtime.web_session_store.get_session(session_id) is None
+
+
+def test_public_db_failure_after_dependencies_delete_retries_safely(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    service = IdempotentSessionService()
+    client, runtime = make_deletion_client(tmp_path, service)
+    session_id = _create_session(client)
+    runtime.web_session_store.save_agentscope_session_mapping(
+        session_id,
+        agent_id="navigation-data-agent",
+        agentscope_session_id="navigation-session",
+    )
+    navigation_store = SqliteNavigationTaskStore(
+        runtime.config.workspace_root / "navigation-tasks.sqlite"
+    )
+    task = navigation_store.create_task_attempt(
+        request="process",
+        target="20270623",
+        date="20270623",
+        segments=None,
+        scene_mode=None,
+        dry_run=True,
+        web_session_id=session_id,
+        agentscope_session_id="navigation-session",
+    ).task
+    original_delete = runtime.web_session_store.delete_session
+    failed_once = False
+
+    def fail_public_once(web_session_id: str) -> None:
+        nonlocal failed_once
+        if not failed_once:
+            failed_once = True
+            raise sqlite3.OperationalError(
+                "public db failed for internal-agent / internal-as-session"
+            )
+        original_delete(web_session_id)
+
+    monkeypatch.setattr(runtime.web_session_store, "delete_session", fail_public_once)
+
+    first = client.delete(f"/api/sessions/{session_id}")
+    second = client.delete(f"/api/sessions/{session_id}")
+
+    assert first.status_code == 409
+    assert first.json()["detail"]["code"] == "session_delete_failed"
+    assert "internal-agent" not in first.text
+    assert "internal-as-session" not in first.text
+    assert navigation_store.get_task(task.task_id) is None
+    assert second.status_code == 204
+    assert runtime.web_session_store.get_session(session_id) is None
+    assert service.calls == [
+        ("delete-user", "navigation-data-agent", "navigation-session"),
+        ("delete-user", "navigation-data-agent", "navigation-session"),
     ]
 
 

@@ -38,6 +38,12 @@ _CONTROL_CHILD_TABLES = (
 )
 
 
+def validate_navigation_task_id(task_id: str) -> str:
+    if not isinstance(task_id, str) or _SAFE_TASK_ID.fullmatch(task_id) is None:
+        raise ValueError("task_id contains unsupported path characters")
+    return task_id
+
+
 def _json_dump(value: Any) -> str | None:
     if value is None:
         return None
@@ -289,8 +295,7 @@ class SqliteNavigationTaskStore:
             ).fetchall()
             task_ids = [str(row["task_id"]) for row in rows]
             for task_id in task_ids:
-                if _SAFE_TASK_ID.fullmatch(task_id) is None:
-                    raise ValueError("task_id contains unsupported path characters")
+                validate_navigation_task_id(task_id)
             for task_id in task_ids:
                 for table in _CONTROL_CHILD_TABLES:
                     connection.execute(

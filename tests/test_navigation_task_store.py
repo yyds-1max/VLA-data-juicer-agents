@@ -1112,6 +1112,34 @@ def test_delete_control_state_rejects_unsafe_task_id_without_deleting_rows(tmp_p
         ).fetchone()[0] == 1
 
 
+def test_delete_control_state_validates_all_task_ids_before_any_side_effect(tmp_path: Path):
+    workspace = tmp_path / "workspace"
+    services = build_navigation_services(workspace)
+    with sqlite3.connect(services.task_store.db_path) as connection:
+        connection.execute(
+            """INSERT INTO navigation_tasks (
+                   task_id, request, target, date, segments_json, segments_key,
+                   scene_mode, dry_run, guidance_revision, state_revision, status,
+                   accepted_plan_phase, created_by_web_session_id,
+                   agentscope_session_id, schema_version, created_at, updated_at
+               ) VALUES ('bad id', 'unsafe', 'target', '20270623', NULL,
+                         '__all__', NULL, 1, 0, 1, 'active', NULL, 'web-owned',
+                         'as-owned', 3, 'now', 'now')"""
+        )
+    evidence = workspace / "navigation-evidence" / "bad id" / "payload.json"
+    evidence.parent.mkdir(parents=True)
+    evidence.write_bytes(b"must remain")
+
+    with pytest.raises(ValueError, match="task_id"):
+        services.delete_control_state_for_web_session("web-owned")
+
+    assert evidence.read_bytes() == b"must remain"
+    with sqlite3.connect(services.task_store.db_path) as connection:
+        assert connection.execute(
+            "SELECT COUNT(*) FROM navigation_tasks WHERE task_id = 'bad id'"
+        ).fetchone()[0] == 1
+
+
 def test_delete_control_state_unlinks_task_symlink_without_following_it(tmp_path: Path):
     workspace = tmp_path / "workspace"
     services = build_navigation_services(workspace)

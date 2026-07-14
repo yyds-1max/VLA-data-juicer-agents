@@ -10,7 +10,10 @@ from vla_data_juicer_agents.navigation.observation_store import (
     SqliteNavigationObservationStore,
 )
 from vla_data_juicer_agents.navigation.plan_store import SqliteNavigationPlanRepository
-from vla_data_juicer_agents.navigation.task_store import SqliteNavigationTaskStore
+from vla_data_juicer_agents.navigation.task_store import (
+    SqliteNavigationTaskStore,
+    validate_navigation_task_id,
+)
 
 
 @dataclass(frozen=True)
@@ -28,6 +31,8 @@ class NavigationServices:
         task_ids = [
             task.task_id for task in self.task_store.find_by_web_session(web_session_id)
         ]
+        for task_id in task_ids:
+            validate_navigation_task_id(task_id)
         for task_id in task_ids:
             task_path = evidence_root / task_id
             if task_path.parent != evidence_root:
