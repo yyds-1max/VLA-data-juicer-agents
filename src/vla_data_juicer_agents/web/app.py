@@ -133,13 +133,15 @@ def create_app(
 
     @app.delete("/api/sessions/{session_id}", status_code=204)
     async def delete_session(session_id: str) -> Response:
-        if store.get_session(session_id) is None:
-            raise HTTPException(status_code=404, detail="Session not found")
         try:
-            await _maybe_await(manager.delete_session(session_id))
+            session = store.get_session(session_id)
+            if session is not None:
+                await _maybe_await(manager.delete_session(session_id))
         except Exception as exc:  # pylint: disable=broad-except
             logger.exception("DataPilot session deletion failed: session_id=%s", session_id)
             raise HTTPException(status_code=409, detail=SESSION_DELETE_ERROR) from exc
+        if session is None:
+            raise HTTPException(status_code=404, detail="Session not found")
         return Response(status_code=204)
 
     @app.get("/api/navigation/datasets/summary")

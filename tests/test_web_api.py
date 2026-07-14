@@ -868,6 +868,36 @@ def test_delete_error_boundary_returns_stable_non_sensitive_response(
     assert "internal" not in response.text
 
 
+def test_delete_preflight_database_failure_uses_stable_logged_error_boundary(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+):
+    client = make_client(tmp_path)
+    session_id = _create_session(client)
+
+    def fail_preflight(_session_id: str):
+        raise sqlite3.OperationalError(
+            "preflight failed for internal-agent / internal-as-session"
+        )
+
+    monkeypatch.setattr(client.app.state.store, "get_session", fail_preflight)
+
+    with caplog.at_level(logging.ERROR, logger="vla_data_juicer_agents.web.app"):
+        response = client.delete(f"/api/sessions/{session_id}")
+
+    assert response.status_code == 409
+    assert response.json() == {
+        "detail": {
+            "code": "session_delete_failed",
+            "message": "DataPilot could not delete this session. Please retry.",
+        }
+    }
+    assert "internal-agent" not in response.text
+    assert "internal-as-session" not in response.text
+    assert "DataPilot session deletion failed" in caplog.text
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize("error", [asyncio.CancelledError(), KeyboardInterrupt()])
 async def test_delete_error_boundary_does_not_swallow_base_exceptions(
@@ -934,6 +964,53 @@ def test_evidence_root_symlink_failure_preserves_raw_navigation_and_public_state
     assert runtime.web_session_store.get_session(session_id) is not None
     assert navigation_store.get_task(task.task_id) is not None
     assert raw_artifact.read_bytes() == b"raw"
+
+
+def test_delete_api_bad_task_id_preserves_evidence_navigation_and_public_rows(
+    tmp_path: Path,
+):
+    service = IdempotentSessionService()
+    client, runtime = make_deletion_client(tmp_path, service)
+    session_id = _create_session(client)
+    runtime.web_session_store.save_agentscope_session_mapping(
+        session_id,
+        agent_id="navigation-data-agent",
+        agentscope_session_id="navigation-session",
+    )
+    navigation_store = SqliteNavigationTaskStore(
+        runtime.config.workspace_root / "navigation-tasks.sqlite"
+    )
+    with sqlite3.connect(navigation_store.db_path) as connection:
+        connection.execute(
+            """INSERT INTO navigation_tasks (
+                   task_id, request, target, date, segments_json, segments_key,
+                   scene_mode, dry_run, guidance_revision, state_revision, status,
+                   accepted_plan_phase, created_by_web_session_id,
+                   agentscope_session_id, schema_version, created_at, updated_at
+               ) VALUES ('bad id', 'unsafe', 'target', '20270623', NULL,
+                         '__all__', NULL, 1, 0, 1, 'active', NULL, ?,
+                         'navigation-session', 3, 'now', 'now')""",
+            (session_id,),
+        )
+    evidence = (
+        runtime.config.workspace_root
+        / "navigation-evidence"
+        / "bad id"
+        / "payload.json"
+    )
+    evidence.parent.mkdir(parents=True)
+    evidence.write_bytes(b"must remain")
+
+    response = client.delete(f"/api/sessions/{session_id}")
+
+    assert response.status_code == 409
+    assert response.json()["detail"]["code"] == "session_delete_failed"
+    assert evidence.read_bytes() == b"must remain"
+    with sqlite3.connect(navigation_store.db_path) as connection:
+        assert connection.execute(
+            "SELECT COUNT(*) FROM navigation_tasks WHERE task_id = 'bad id'"
+        ).fetchone()[0] == 1
+    assert runtime.web_session_store.get_session(session_id) is not None
 
 
 def test_navigation_db_failure_after_evidence_delete_retries_safely(

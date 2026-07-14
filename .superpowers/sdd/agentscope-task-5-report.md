@@ -72,3 +72,10 @@ The Task 5 review identified one response-confidentiality issue and one validati
 - The final public-store failure test runs AgentScope and Navigation deletion successfully, injects a public SQLite failure containing internal identities, verifies the stable non-sensitive response, then retries through AgentScope `False` and Navigation no-op to 204.
 
 The three-stage retry boundary remains intentional: evidence failure occurs before the DB transaction and preserves DB/public state; an in-transaction SQLite failure rolls all Navigation rows back while public state remains; a final public-store failure leaves the public row for retry after AgentScope/Navigation have already reached their deletion postconditions.
+
+## Second review follow-up
+
+- RED: injecting `sqlite3.OperationalError("preflight failed for internal-agent / internal-as-session")` from the DELETE route's public-session `get_session` preflight escaped as an unlogged server error.
+- GREEN: the preflight now runs inside the same ordinary-`Exception` boundary as deletion. It logs via `logger.exception` and returns the stable 409 `session_delete_failed` DataPilot response without either internal identity. A genuine `None` preflight still returns 404, while `asyncio.CancelledError` and `KeyboardInterrupt` remain uncaught.
+- Added an end-to-end DELETE regression with `task_id="bad id"`; the stable 409 response leaves exact evidence bytes, the Navigation task row, and the public session row intact.
+- Focused regressions passed, followed by the four-file brief group with `201 passed`; `compileall`, diff-check, tracked-report guard, and data-root scan also passed.
