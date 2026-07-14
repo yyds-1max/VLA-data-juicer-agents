@@ -30,6 +30,9 @@ from vla_data_juicer_agents.runtime.agentscope_bootstrap import (
 from vla_data_juicer_agents.navigation.agent_tools import (
     resolve_navigation_agent_tools,
 )
+from vla_data_juicer_agents.navigation.catalog import (
+    list_navigation_tool_capabilities,
+)
 from vla_data_juicer_agents.navigation.models import ToolResult
 from vla_data_juicer_agents.navigation.task_state import NavigationTaskStatus
 from vla_data_juicer_agents.runtime.agentscope_runtime import (
@@ -61,7 +64,7 @@ EXECUTION_TOOL_NAMES = {
     "get_plan_execution_overview_tool",
     "prepare_raw_data_tool",
     "extract_and_sync_navigation_data_tool",
-    "confirm_navigation_calibration_params_tool",
+    "request_human_decision",
     "assemble_finish_temp_tool",
     "run_noobscene_preprocessing_tool",
     "run_initial_annotation_gui_tool",
@@ -96,6 +99,24 @@ class ProcessingSpy:
             )
 
         return invoke
+
+
+def test_execution_denylist_matches_catalog_and_real_external_schema():
+    catalog_action_schemas = {
+        (
+            "request_human_decision"
+            if capability.tool_name == "confirm_navigation_calibration_params"
+            else f"{capability.tool_name}_tool"
+        )
+        for capability in list_navigation_tool_capabilities()
+        if capability.executor_agent_allowed
+    }
+
+    assert EXECUTION_TOOL_NAMES == {
+        "get_current_plan_step_tool",
+        "get_plan_execution_overview_tool",
+        *catalog_action_schemas,
+    }
 
 
 def _evidence_by_kind(services, task_id: str) -> dict[str, str]:
@@ -452,8 +473,8 @@ async def test_failed_plan_submission_keeps_planning_surface_in_same_reply(
         "submit_extract_sync_plan_tool",
         "submit_finish_processing_plan_tool",
     } <= next_names
-    assert "prepare_raw_data_tool" not in next_names
-    assert "reset_tools" not in next_names
+    assert EXECUTION_TOOL_NAMES.isdisjoint(next_names)
+    assert GENERIC_OR_RESET_TOOL_NAMES.isdisjoint(next_names)
     result = latest_tool_result_json(storage.updated_state.context)
     assert result["ok"] is False
     assert result["error_type"] == "planning_context_mismatch"
@@ -502,8 +523,8 @@ async def test_restart_rebuilds_planning_surface_over_stale_execution_cache(
 
     names = schema_names(model.invocations[0].tools)
     assert "submit_extract_sync_plan_tool" in names
-    assert "prepare_raw_data_tool" not in names
-    assert {"bash", "read", "task", "reset_tools"}.isdisjoint(names)
+    assert EXECUTION_TOOL_NAMES.isdisjoint(names)
+    assert GENERIC_OR_RESET_TOOL_NAMES.isdisjoint(names)
     assert storage.updated_state.tool_context.activated_groups == [
         NAVIGATION_EVIDENCE_READ,
         NAVIGATION_INVESTIGATION,
@@ -599,9 +620,8 @@ async def test_final_extract_action_switches_back_to_planning_in_same_reply(
         "submit_extract_sync_plan_tool",
         "submit_finish_processing_plan_tool",
     } <= after_final_names
-    assert "get_current_plan_step_tool" not in after_final_names
-    assert "prepare_raw_data_tool" not in after_final_names
-    assert "reset_tools" not in after_final_names
+    assert EXECUTION_TOOL_NAMES.isdisjoint(after_final_names)
+    assert GENERIC_OR_RESET_TOOL_NAMES.isdisjoint(after_final_names)
     assert processing_spy.calls == [("prepare_raw_data", 1)]
     assert services.plan_store.get(plan.plan_id).status == "completed"
     task = services.task_store.get_task(built.task.task_id)
