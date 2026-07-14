@@ -13,6 +13,9 @@ import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
+from vla_data_juicer_agents.navigation.task_store import SqliteNavigationTaskStore
+from vla_data_juicer_agents.runtime.agentscope_config import AgentScopeRuntimeConfig
+from vla_data_juicer_agents.runtime.agentscope_runtime import AgentScopeRuntime
 from vla_data_juicer_agents.web.app import (
     _consume_turn_result_when_idle,
     _create_logged_task,
@@ -75,6 +78,65 @@ def make_client(tmp_path: Path) -> TestClient:
         controller_factory=FakeController,
     )
     return TestClient(app)
+
+
+class RecordingSessionService:
+    def __init__(self, *, fail_on_session: str | None = None) -> None:
+        self.calls: list[tuple[str, str, str]] = []
+        self.fail_on_session = fail_on_session
+
+    async def delete_session(self, user_id: str, agent_id: str, session_id: str) -> bool:
+        self.calls.append((user_id, agent_id, session_id))
+        if session_id == self.fail_on_session:
+            raise RuntimeError("AgentScope deletion failed")
+        return True
+
+
+class FailOnceSessionService:
+    def __init__(self) -> None:
+        self.calls: list[tuple[str, str, str]] = []
+        self.deleted_sessions: set[str] = set()
+        self.failed_once = False
+
+    async def delete_session(self, user_id: str, agent_id: str, session_id: str) -> bool:
+        self.calls.append((user_id, agent_id, session_id))
+        if session_id in self.deleted_sessions:
+            return False
+        if session_id == "worker-session" and not self.failed_once:
+            self.failed_once = True
+            raise RuntimeError("AgentScope deletion failed once")
+        self.deleted_sessions.add(session_id)
+        return True
+
+
+def make_deletion_client(
+    tmp_path: Path,
+    session_service: RecordingSessionService | FailOnceSessionService,
+) -> tuple[TestClient, AgentScopeRuntime]:
+    agentscope_app = FastAPI()
+    agentscope_app.state.session_service = session_service
+    runtime = AgentScopeRuntime(
+        config=AgentScopeRuntimeConfig(
+            user_id="delete-user",
+            redis_url="redis://localhost:6379/0",
+            workspace_root=tmp_path / "workspace",
+            dashscope_api_key="test-key",
+            dashscope_base_url=None,
+            default_model="qwen-test",
+            router_model="qwen-test",
+            navigation_model="qwen-test",
+        ),
+        storage=object(),
+        message_bus=object(),
+        workspace_manager=object(),
+        app=agentscope_app,
+    )
+    app = create_app(
+        working_dir=str(tmp_path / "workspace"),
+        db_path=tmp_path / "sessions.sqlite",
+        agentscope_runtime=runtime,
+    )
+    return TestClient(app), runtime
 
 
 def test_create_session_returns_title(tmp_path: Path):
@@ -606,6 +668,146 @@ def test_get_unknown_session_returns_404(tmp_path: Path):
     response = client.get("/api/sessions/missing")
 
     assert response.status_code == 404
+
+
+def test_delete_session_removes_only_control_state_and_preserves_artifact_bytes(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    datasets = tmp_path / "VLADatasets"
+    monkeypatch.setenv("VLA_VLADATASETS_ROOT", str(datasets))
+    raw_artifact = datasets / "raw_data" / "20270623" / "clip-a" / "raw.db3"
+    sync_artifact = (
+        datasets / "raw_data" / "20270623" / "clip-a" / "sync_data" / "frame.jpg"
+    )
+    clip_artifact = datasets / "clip_data" / "20270623" / "clip-a" / "clip.db3"
+    finish_artifact = datasets / "finish_data" / "20270623" / "clip-a" / "result.bin"
+    for path, payload in (
+        (raw_artifact, b"raw"),
+        (sync_artifact, b"sync"),
+        (clip_artifact, b"clip"),
+        (finish_artifact, b"finish"),
+    ):
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(payload)
+
+    service = RecordingSessionService()
+    client, runtime = make_deletion_client(tmp_path, service)
+    session_id = _create_session(client)
+    runtime.web_session_store.save_agentscope_session_mapping(
+        session_id,
+        agent_id="worker-agent",
+        agentscope_session_id="inactive-worker-session",
+    )
+    runtime.web_session_store.save_agentscope_session_mapping(
+        session_id,
+        agent_id="navigation-data-agent",
+        agentscope_session_id="active-navigation-session",
+    )
+    navigation_store = SqliteNavigationTaskStore(
+        runtime.config.workspace_root / "navigation-tasks.sqlite"
+    )
+    task = navigation_store.create_task_attempt(
+        request="process",
+        target="20270623",
+        date="20270623",
+        segments=["clip-a"],
+        scene_mode="out",
+        dry_run=False,
+        web_session_id=session_id,
+        agentscope_session_id="active-navigation-session",
+    ).task
+    evidence = (
+        runtime.config.workspace_root
+        / "navigation-evidence"
+        / task.task_id
+        / "1"
+        / "e.json"
+    )
+    evidence.parent.mkdir(parents=True)
+    evidence.write_bytes(b"control evidence")
+
+    response = client.delete(f"/api/sessions/{session_id}")
+
+    assert response.status_code == 204
+    assert runtime.web_session_store.get_session(session_id) is None
+    assert navigation_store.find_by_web_session(session_id) == []
+    assert not evidence.exists()
+    assert raw_artifact.read_bytes() == b"raw"
+    assert sync_artifact.read_bytes() == b"sync"
+    assert clip_artifact.read_bytes() == b"clip"
+    assert finish_artifact.read_bytes() == b"finish"
+    assert service.calls == [
+        ("delete-user", "navigation-data-agent", "active-navigation-session"),
+        ("delete-user", "worker-agent", "inactive-worker-session"),
+    ]
+    assert client.delete(f"/api/sessions/{session_id}").status_code == 404
+
+
+def test_agentscope_delete_failure_keeps_public_and_navigation_control_state(tmp_path: Path):
+    service = RecordingSessionService(fail_on_session="worker-session")
+    client, runtime = make_deletion_client(tmp_path, service)
+    session_id = _create_session(client)
+    runtime.web_session_store.save_agentscope_session_mapping(
+        session_id,
+        agent_id="navigation-data-agent",
+        agentscope_session_id="navigation-session",
+    )
+    runtime.web_session_store.save_agentscope_session_mapping(
+        session_id,
+        agent_id="worker-agent",
+        agentscope_session_id="worker-session",
+    )
+    navigation_store = SqliteNavigationTaskStore(
+        runtime.config.workspace_root / "navigation-tasks.sqlite"
+    )
+    task = navigation_store.create_task_attempt(
+        request="process",
+        target="20270623",
+        date="20270623",
+        segments=None,
+        scene_mode=None,
+        dry_run=True,
+        web_session_id=session_id,
+        agentscope_session_id="navigation-session",
+    ).task
+
+    response = client.delete(f"/api/sessions/{session_id}")
+
+    assert response.status_code == 409
+    assert runtime.web_session_store.get_session(session_id) is not None
+    assert [item.task_id for item in navigation_store.find_by_web_session(session_id)] == [
+        task.task_id
+    ]
+
+
+def test_agentscope_delete_retry_accepts_already_absent_earlier_mapping(tmp_path: Path):
+    service = FailOnceSessionService()
+    client, runtime = make_deletion_client(tmp_path, service)
+    session_id = _create_session(client)
+    runtime.web_session_store.save_agentscope_session_mapping(
+        session_id,
+        agent_id="navigation-data-agent",
+        agentscope_session_id="navigation-session",
+    )
+    runtime.web_session_store.save_agentscope_session_mapping(
+        session_id,
+        agent_id="worker-agent",
+        agentscope_session_id="worker-session",
+    )
+
+    first = client.delete(f"/api/sessions/{session_id}")
+    second = client.delete(f"/api/sessions/{session_id}")
+
+    assert first.status_code == 409
+    assert second.status_code == 204
+    assert runtime.web_session_store.get_session(session_id) is None
+    assert service.calls == [
+        ("delete-user", "navigation-data-agent", "navigation-session"),
+        ("delete-user", "worker-agent", "worker-session"),
+        ("delete-user", "navigation-data-agent", "navigation-session"),
+        ("delete-user", "worker-agent", "worker-session"),
+    ]
 
 
 def test_create_app_reads_working_dir_and_model_from_env(tmp_path: Path, monkeypatch):

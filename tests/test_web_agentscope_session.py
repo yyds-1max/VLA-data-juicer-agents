@@ -2647,6 +2647,30 @@ async def test_submit_turn_appends_user_message_calls_runtime_and_returns_turn_i
     assert detail is not None
     assert [(message.role, message.content) for message in detail.messages] == [("user", "开始处理")]
 
+
+@pytest.mark.asyncio
+async def test_saved_session_remains_resumable_after_manager_restart(tmp_path: Path) -> None:
+    store = WebSessionStore(tmp_path / "sessions.sqlite")
+    first_runtime = FakeAgentScopeRuntime()
+    first_manager = AgentScopeWebSessionManager(store=store, runtime=first_runtime)
+    session = await first_manager.create_session("first")
+    await first_manager.submit_turn(session.id, "first")
+
+    restarted_runtime = FakeAgentScopeRuntime(turn_id="turn-after-restart")
+    recreated_manager = AgentScopeWebSessionManager(
+        store=WebSessionStore(store.db_path),
+        runtime=restarted_runtime,
+    )
+
+    turn_id = await recreated_manager.submit_turn(session.id, "continue")
+
+    assert turn_id == "turn-after-restart"
+    assert restarted_runtime.submissions[-1]["web_session_id"] == session.id
+    assert [message.content for message in store.get_session(session.id).messages] == [
+        "first",
+        "continue",
+    ]
+
 @pytest.mark.asyncio
 async def test_submit_turn_rejection_does_not_append_user_message(tmp_path: Path) -> None:
     store = WebSessionStore(tmp_path / "sessions.sqlite")

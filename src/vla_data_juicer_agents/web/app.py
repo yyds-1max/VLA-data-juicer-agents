@@ -10,7 +10,7 @@ from pathlib import Path
 from typing import Any
 from uuid import uuid4
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Response
 from fastapi.responses import FileResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 
@@ -126,6 +126,16 @@ def create_app(
         if session is None:
             raise HTTPException(status_code=404, detail="Session not found")
         return {"session": session.model_dump()}
+
+    @app.delete("/api/sessions/{session_id}", status_code=204)
+    async def delete_session(session_id: str) -> Response:
+        try:
+            await _maybe_await(manager.delete_session(session_id))
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail="Session not found") from exc
+        except (RuntimeError, ValueError) as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        return Response(status_code=204)
 
     @app.get("/api/navigation/datasets/summary")
     async def navigation_dataset_summary() -> dict[str, Any]:

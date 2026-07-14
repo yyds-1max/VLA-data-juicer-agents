@@ -516,6 +516,15 @@ class WebSessionStore:
 
     def delete_session(self, session_id: str) -> None:
         with self._connect() as connection:
+            mappings = connection.execute(
+                "SELECT agentscope_session_id FROM agentscope_sessions WHERE web_session_id = ?",
+                (session_id,),
+            ).fetchall()
+            for mapping in mappings:
+                connection.execute(
+                    "DELETE FROM human_decision_consumptions WHERE agentscope_session_id = ?",
+                    (mapping["agentscope_session_id"],),
+                )
             connection.execute("DELETE FROM messages WHERE session_id = ?", (session_id,))
             connection.execute("DELETE FROM public_events WHERE session_id = ?", (session_id,))
             connection.execute("DELETE FROM public_tool_runs WHERE session_id = ?", (session_id,))

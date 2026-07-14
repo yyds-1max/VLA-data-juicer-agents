@@ -55,6 +55,14 @@ class AgentScopeWebSessionManager:
             return False
         return bool(await interrupt_web_session(web_session_id=session_id))
 
+    async def delete_session(self, session_id: str) -> None:
+        if self._store.get_session(session_id) is None:
+            raise KeyError(session_id)
+        deleted = await self._runtime.delete_web_session(session_id)
+        if not deleted:
+            raise RuntimeError("AgentScope Web session deletion failed")
+        self._store.delete_session(session_id)
+
     async def submit_human_decision(self, session_id: str, decision: dict[str, Any]) -> bool:
         if self._store.get_session(session_id) is None:
             raise KeyError(session_id)

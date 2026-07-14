@@ -349,3 +349,11 @@ def test_store_keeps_agentscope_mappings_and_human_decisions_internal(tmp_path: 
     detail = store.get_session(session.id)
     assert detail is not None
     assert "internal-as-session" not in detail.model_dump_json()
+
+    store.delete_session(session.id)
+
+    assert not store.is_human_decision_consumed(
+        agentscope_session_id="internal-as-session",
+        reply_id="reply-1",
+        tool_call_id="call-1",
+    )

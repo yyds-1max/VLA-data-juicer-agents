@@ -23,6 +23,7 @@ from vla_data_juicer_agents.navigation.task_state import (
     NavigationTask,
     NavigationTaskStatus,
 )
+from vla_data_juicer_agents.navigation.services import build_navigation_services
 from vla_data_juicer_agents.navigation.task_store import (
     NavigationStateResetRequired,
     SqliteNavigationTaskStore,
@@ -1001,3 +1002,174 @@ def test_task_store_round_trips_attempt_fields_and_finds_exact_session(
     assert loaded.status == NavigationTaskStatus.NEEDS_REPLAN
     assert by_session is not None
     assert by_session.task_id == updated.task_id
+
+
+def test_delete_control_state_for_web_session_removes_all_owned_rows_and_evidence(
+    tmp_path: Path,
+):
+    workspace = tmp_path / "workspace"
+    services = build_navigation_services(workspace)
+    store = services.task_store
+    owned = store.create_task_attempt(
+        request="owned",
+        target="20270623",
+        date="20270623",
+        segments=["owned"],
+        scene_mode=None,
+        dry_run=True,
+        web_session_id="web-owned",
+        agentscope_session_id="as-owned",
+    ).task
+    foreign = store.create_task_attempt(
+        request="foreign",
+        target="20270623",
+        date="20270623",
+        segments=["foreign"],
+        scene_mode=None,
+        dry_run=True,
+        web_session_id="web-foreign",
+        agentscope_session_id="as-foreign",
+    ).task
+    plan_id, step_id = _insert_plan_ledger_step(
+        store.db_path,
+        task_id=owned.task_id,
+        ledger_action="extract_bag_clip",
+    )
+    with sqlite3.connect(store.db_path) as connection:
+        connection.execute(
+            "INSERT INTO navigation_observation_revisions VALUES (?, 1, '{}', ?)",
+            (owned.task_id, owned.created_at),
+        )
+        connection.execute(
+            "INSERT INTO navigation_evidence VALUES (?, ?, 1, 'metadata', 'safe', 4, 'test', ?)",
+            ("evidence-owned", owned.task_id, owned.created_at),
+        )
+        connection.execute(
+            """INSERT INTO navigation_plan_submission_attempts
+               VALUES ('attempt-owned', ?, 'extract_sync', 'rev', '{}', '{}', ?)""",
+            (owned.task_id, owned.created_at),
+        )
+        connection.execute(
+            """INSERT INTO navigation_step_result_outbox
+               VALUES (?, ?, ?, 1, 'completed', '[\"running\"]', '{}', '{}',
+                       'result-ref', ?, ?)""",
+            (plan_id, step_id, owned.task_id, owned.created_at, owned.updated_at),
+        )
+        connection.execute(
+            """INSERT INTO navigation_human_decision_handoffs (
+                   plan_id, step_id, task_id, decision_key, decision_json, status,
+                   delivery_status, created_at, updated_at
+               ) VALUES (?, ?, ?, 'decision', '{}', 'pending', 'pending', ?, ?)""",
+            (plan_id, step_id, owned.task_id, owned.created_at, owned.updated_at),
+        )
+    evidence = workspace / "navigation-evidence" / owned.task_id / "1" / "payload.json"
+    evidence.parent.mkdir(parents=True)
+    evidence.write_bytes(b"control evidence")
+
+    deleted = services.delete_control_state_for_web_session("web-owned")
+
+    assert deleted == [owned.task_id]
+    assert store.find_by_web_session("web-owned") == []
+    assert [task.task_id for task in store.find_by_web_session("web-foreign")] == [
+        foreign.task_id
+    ]
+    assert not (workspace / "navigation-evidence" / owned.task_id).exists()
+    with sqlite3.connect(store.db_path) as connection:
+        for table in (
+            "navigation_step_result_outbox",
+            "navigation_human_decision_handoffs",
+            "navigation_evidence",
+            "navigation_plan_submission_attempts",
+            "navigation_task_steps",
+            "navigation_plans",
+            "navigation_observation_revisions",
+        ):
+            assert connection.execute(
+                f"SELECT COUNT(*) FROM {table} WHERE task_id = ?", (owned.task_id,)
+            ).fetchone()[0] == 0
+
+
+def test_delete_control_state_rejects_unsafe_task_id_without_deleting_rows(tmp_path: Path):
+    services = build_navigation_services(tmp_path / "workspace")
+    with sqlite3.connect(services.task_store.db_path) as connection:
+        connection.execute(
+            """INSERT INTO navigation_tasks (
+                   task_id, request, target, date, segments_json, segments_key,
+                   scene_mode, dry_run, guidance_revision, state_revision, status,
+                   accepted_plan_phase, created_by_web_session_id,
+                   agentscope_session_id, schema_version, created_at, updated_at
+               ) VALUES ('../raw_data', 'unsafe', 'target', '20270623', NULL,
+                         '__all__', NULL, 1, 0, 1, 'active', NULL, 'web-owned',
+                         'as-owned', 2, 'now', 'now')"""
+        )
+
+    with pytest.raises(ValueError, match="task_id"):
+        services.delete_control_state_for_web_session("web-owned")
+
+    with sqlite3.connect(services.task_store.db_path) as connection:
+        assert connection.execute(
+            "SELECT COUNT(*) FROM navigation_tasks WHERE created_by_web_session_id = 'web-owned'"
+        ).fetchone()[0] == 1
+
+
+def test_delete_control_state_unlinks_task_symlink_without_following_it(tmp_path: Path):
+    workspace = tmp_path / "workspace"
+    services = build_navigation_services(workspace)
+    task = services.task_store.create_task_attempt(
+        request="owned",
+        target="20270623",
+        date="20270623",
+        segments=None,
+        scene_mode=None,
+        dry_run=True,
+        web_session_id="web-owned",
+        agentscope_session_id="as-owned",
+    ).task
+    raw_artifact = tmp_path / "raw_data" / "clip" / "raw.db3"
+    raw_artifact.parent.mkdir(parents=True)
+    raw_artifact.write_bytes(b"raw")
+    evidence_root = workspace / "navigation-evidence"
+    evidence_root.mkdir(parents=True)
+    task_link = evidence_root / task.task_id
+    task_link.symlink_to(raw_artifact.parent, target_is_directory=True)
+
+    assert services.delete_control_state_for_web_session("web-owned") == [task.task_id]
+
+    assert not task_link.exists()
+    assert not task_link.is_symlink()
+    assert raw_artifact.read_bytes() == b"raw"
+
+
+def test_evidence_delete_failure_keeps_navigation_database_rows(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    workspace = tmp_path / "workspace"
+    services = build_navigation_services(workspace)
+    task = services.task_store.create_task_attempt(
+        request="owned",
+        target="20270623",
+        date="20270623",
+        segments=None,
+        scene_mode=None,
+        dry_run=True,
+        web_session_id="web-owned",
+        agentscope_session_id="as-owned",
+    ).task
+    evidence = workspace / "navigation-evidence" / task.task_id / "1" / "payload.json"
+    evidence.parent.mkdir(parents=True)
+    evidence.write_bytes(b"control evidence")
+
+    def fail_rmtree(_path: Path) -> None:
+        raise OSError("evidence deletion failed")
+
+    monkeypatch.setattr(
+        "vla_data_juicer_agents.navigation.services.shutil.rmtree",
+        fail_rmtree,
+    )
+
+    with pytest.raises(OSError, match="evidence deletion failed"):
+        services.delete_control_state_for_web_session("web-owned")
+
+    assert services.task_store.get_task(task.task_id) is not None
+    assert evidence.read_bytes() == b"control evidence"

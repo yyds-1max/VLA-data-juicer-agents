@@ -60,7 +60,7 @@ class WebSessionManager:
         with self._lock:
             return self.get_controller(session_id).request_interrupt()
 
-    def mark_historical(self, session_id: str) -> None:
+    def delete_session(self, session_id: str) -> None:
         with self._lock:
-            self._store.mark_historical(session_id)
+            self._store.delete_session(session_id)
             self._controllers.pop(session_id, None)

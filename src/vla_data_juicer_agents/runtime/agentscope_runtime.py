@@ -457,6 +457,21 @@ class AgentScopeRuntime:
         interrupted = True
         return interrupted
 
+    async def delete_web_session(self, web_session_id: str) -> bool:
+        if self.web_session_store is None:
+            raise RuntimeError("Web session store is not configured")
+        mappings = self.web_session_store.list_agentscope_session_mappings(web_session_id)
+        session_service = self.app.state.session_service
+        for mapping in mappings:
+            await session_service.delete_session(
+                self.config.user_id,
+                mapping.agent_id,
+                mapping.agentscope_session_id,
+            )
+        self._navigation_services().delete_control_state_for_web_session(web_session_id)
+        self.web_sessions.pop(web_session_id, None)
+        return True
+
     def register_run_cancellation(
         self,
         agentscope_session_id: str,
