@@ -5,6 +5,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
+from agentscope.app.message_bus import MessageBusKeys
 from agentscope.event import ExternalExecutionResultEvent
 from agentscope.message import Msg, ToolCallBlock, ToolCallState, ToolResultState
 from agentscope.permission import PermissionBehavior, PermissionContext
@@ -184,6 +185,7 @@ class FakeAgentScopeMessageBus:
         self.read_since: list[str | None] = []
         self.subscribe_keys: list[str] = []
         self.cancelled_sessions: list[str] = []
+        self.published: list[tuple[str, dict]] = []
         self.dequeue_calls = 0
 
     async def session_read_events(self, session_id: str, since=None):
@@ -215,6 +217,9 @@ class FakeAgentScopeMessageBus:
 
     async def session_publish_cancel(self, session_id: str) -> None:
         self.cancelled_sessions.append(session_id)
+
+    async def publish(self, key: str, payload: dict) -> None:
+        self.published.append((key, payload))
 
     async def dequeue_wakeups(self, max_count: int = 64):
         self.dequeue_calls += 1
@@ -1573,11 +1578,11 @@ async def test_runtime_interrupt_web_session_returns_false_without_mapping() -> 
     interrupted = await runtime.interrupt_web_session(web_session_id="web-1")
 
     assert interrupted is False
-    assert message_bus.cancelled_sessions == []
+    assert message_bus.published == []
 
 
 @pytest.mark.asyncio
-async def test_runtime_interrupt_web_session_publishes_agentscope_cancel() -> None:
+async def test_runtime_interrupt_web_session_publishes_agentscope_interrupt() -> None:
     message_bus = FakeAgentScopeMessageBus()
     runtime = _runtime(chat_run_registry=FakeChatRunRegistry(), message_bus=message_bus)
     runtime.web_sessions["web-1"] = ("main-router-agent", "as-session-1")
@@ -1585,7 +1590,12 @@ async def test_runtime_interrupt_web_session_publishes_agentscope_cancel() -> No
     interrupted = await runtime.interrupt_web_session(web_session_id="web-1")
 
     assert interrupted is True
-    assert message_bus.cancelled_sessions == ["as-session-1"]
+    assert message_bus.published == [
+        (
+            MessageBusKeys.session_interrupt_channel(),
+            {"session_id": "as-session-1"},
+        ),
+    ]
     assert runtime.web_sessions["web-1"] == ("main-router-agent", "as-session-1")
 
 
@@ -1601,7 +1611,12 @@ async def test_runtime_interrupt_web_session_cancels_registered_context() -> Non
 
     assert interrupted is True
     assert cancellation.cancelled is True
-    assert message_bus.cancelled_sessions == ["as-session-1"]
+    assert message_bus.published == [
+        (
+            MessageBusKeys.session_interrupt_channel(),
+            {"session_id": "as-session-1"},
+        ),
+    ]
     assert runtime.web_sessions["web-1"] == ("navigation-data-agent", "as-session-1")
 
 

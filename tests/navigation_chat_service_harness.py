@@ -105,6 +105,7 @@ class ChatServiceWorkspaceManager:
             agent_id=agent_id,
             session_id=session_id,
             workspace_id=workspace_id,
+            workdir=f"/tmp/chat-service-workspace/{workspace_id}",
             offload_context=offload_context,
         )
 
@@ -117,6 +118,28 @@ class ChatServiceBus:
     async def session_run(self, _session_id: str):
         yield
 
+    @asynccontextmanager
+    async def acquire_lock(self, _key: str, *, ttl_secs: int):
+        del ttl_secs
+        yield
+
+    async def log_append(
+        self,
+        _key: str,
+        event: dict[str, Any],
+        *,
+        max_len: int,
+    ) -> str:
+        del max_len
+        self.events.append(event)
+        return str(len(self.events))
+
+    async def publish(self, _key: str, _payload: dict[str, Any]) -> None:
+        pass
+
+    async def log_trim(self, _key: str) -> None:
+        pass
+
     async def session_publish_event(
         self,
         _session_id: str,
@@ -127,6 +150,15 @@ class ChatServiceBus:
     async def inbox_drain(
         self,
         _session_id: str,
+        *,
+        max_count: int,
+    ) -> list[Any]:
+        del max_count
+        return []
+
+    async def queue_drain(
+        self,
+        _key: str,
         *,
         max_count: int,
     ) -> list[Any]:

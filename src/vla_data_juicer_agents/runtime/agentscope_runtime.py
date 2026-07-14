@@ -11,7 +11,7 @@ from typing import Any
 from uuid import uuid4
 
 import agentscope.app
-from agentscope.app.message_bus import RedisMessageBus
+from agentscope.app.message_bus import MessageBusKeys, RedisMessageBus
 from agentscope.app.storage import ChatModelConfig, RedisStorage, SessionConfig
 from agentscope.app.workspace_manager import LocalWorkspaceManager
 from agentscope.event import ExternalExecutionResultEvent
@@ -330,10 +330,11 @@ class AgentScopeRuntime:
         if cancellation is not None:
             interrupted = cancellation.cancel() or interrupted
 
-        publish_cancel = getattr(self.message_bus, "session_publish_cancel", None)
-        if callable(publish_cancel):
-            await publish_cancel(agentscope_session_id)
-            interrupted = True
+        await self.message_bus.publish(
+            MessageBusKeys.session_interrupt_channel(),
+            {"session_id": agentscope_session_id},
+        )
+        interrupted = True
         return interrupted
 
     def register_run_cancellation(
