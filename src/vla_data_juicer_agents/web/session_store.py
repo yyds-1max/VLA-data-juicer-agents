@@ -1,19 +1,35 @@
 from __future__ import annotations
 
-import sqlite3
 import json
-from datetime import UTC, datetime
+import re
+import sqlite3
 from dataclasses import dataclass
+from datetime import UTC, datetime
 from pathlib import Path
+from typing import Any, Literal
 from uuid import uuid4
 
 from vla_data_juicer_agents.web.schemas import (
     ChatMessageRecord,
     MessageRole,
+    PublicEventRecord,
+    PublicToolRun,
     SessionDetail,
     SessionRecord,
-    TimelineEventRecord,
 )
+
+
+WEB_SCHEMA_GENERATION = "agentscope-native-events-v1"
+WEB_CONTROL_TABLES = (
+    "human_decision_consumptions",
+    "public_tool_runs",
+    "public_events",
+    "agentscope_sessions",
+    "messages",
+    "sessions",
+    "web_schema",
+)
+_SHA256_HEX = re.compile(r"^[0-9a-f]{64}$")
 
 
 def _now() -> str:
@@ -35,105 +51,96 @@ class WebSessionStore:
         self._init_schema()
 
     def _connect(self) -> sqlite3.Connection:
-        connection = sqlite3.connect(self.db_path)
+        connection = sqlite3.connect(self.db_path, timeout=30.0)
         connection.execute("PRAGMA foreign_keys = ON")
         connection.row_factory = sqlite3.Row
         return connection
 
     def _init_schema(self) -> None:
-        with self._connect() as connection:
-            connection.execute(
-                """
-                CREATE TABLE IF NOT EXISTS sessions (
-                    id TEXT PRIMARY KEY,
-                    title TEXT NOT NULL,
-                    status TEXT NOT NULL,
-                    created_at TEXT NOT NULL,
-                    updated_at TEXT NOT NULL
-                )
-                """
-            )
-            connection.execute(
-                """
-                CREATE TABLE IF NOT EXISTS messages (
-                    id TEXT PRIMARY KEY,
-                    session_id TEXT NOT NULL,
-                    role TEXT NOT NULL,
-                    content TEXT NOT NULL,
-                    created_at TEXT NOT NULL,
-                    FOREIGN KEY (session_id) REFERENCES sessions(id)
-                )
-                """
-            )
-            connection.execute(
-                """
-                CREATE TABLE IF NOT EXISTS timeline_events (
-                    id TEXT PRIMARY KEY,
-                    session_id TEXT NOT NULL,
-                    seq INTEGER NOT NULL,
-                    type TEXT NOT NULL,
-                    source TEXT,
-                    run_id TEXT,
-                    parent_run_id TEXT,
-                    timestamp TEXT,
-                    payload_json TEXT NOT NULL,
-                    created_at TEXT NOT NULL,
-                    FOREIGN KEY (session_id) REFERENCES sessions(id)
-                )
-                """
-            )
-            connection.execute(
-                """
-                CREATE INDEX IF NOT EXISTS idx_timeline_events_session_seq
-                ON timeline_events (session_id, seq)
-                """
-            )
-            connection.execute(
-                """
-                CREATE TABLE IF NOT EXISTS agentscope_sessions (
-                    web_session_id TEXT NOT NULL,
-                    agent_id TEXT NOT NULL,
-                    agentscope_session_id TEXT NOT NULL,
-                    event_cursor TEXT,
-                    active INTEGER NOT NULL DEFAULT 1,
-                    updated_at TEXT NOT NULL,
-                    PRIMARY KEY (web_session_id, agent_id),
-                    FOREIGN KEY (web_session_id) REFERENCES sessions(id)
-                )
-                """
-            )
-            connection.execute(
-                """
-                CREATE TABLE IF NOT EXISTS human_decision_consumptions (
-                    agentscope_session_id TEXT NOT NULL,
-                    reply_id TEXT NOT NULL,
-                    tool_call_id TEXT NOT NULL,
-                    action TEXT NOT NULL,
-                    request_id TEXT,
-                    consumed_at TEXT NOT NULL,
-                    PRIMARY KEY (agentscope_session_id, reply_id, tool_call_id)
-                )
-                """
-            )
-            self._migrate_agentscope_sessions_schema(connection)
-            connection.execute(
-                """
-                CREATE INDEX IF NOT EXISTS idx_agentscope_sessions_agentscope_id
-                ON agentscope_sessions (agentscope_session_id)
-                """
-            )
+        connection = self._connect()
+        try:
+            # A legacy non-whitelisted table can still reference a Web control table.
+            # Resetting foreign-key enforcement for this connection lets us replace only
+            # the explicit development-control whitelist without touching that neighbor.
+            connection.execute("PRAGMA foreign_keys = OFF")
+            if self._schema_generation(connection) != WEB_SCHEMA_GENERATION:
+                for table in WEB_CONTROL_TABLES:
+                    connection.execute(f'DROP TABLE IF EXISTS "{table}"')
+            self._create_schema(connection)
+            connection.commit()
+        finally:
+            connection.close()
 
-    def _migrate_agentscope_sessions_schema(self, connection: sqlite3.Connection) -> None:
-        columns = connection.execute("PRAGMA table_info(agentscope_sessions)").fetchall()
-        if not columns:
-            return
-        primary_key_columns = [row["name"] for row in columns if row["pk"]]
-        if primary_key_columns != ["web_session_id"]:
-            return
-        connection.execute("ALTER TABLE agentscope_sessions RENAME TO agentscope_sessions_legacy")
+    @staticmethod
+    def _schema_generation(connection: sqlite3.Connection) -> str | None:
+        try:
+            row = connection.execute(
+                "SELECT generation FROM web_schema WHERE singleton = 1"
+            ).fetchone()
+        except sqlite3.Error:
+            return None
+        return str(row[0]) if row is not None else None
+
+    @staticmethod
+    def _create_schema(connection: sqlite3.Connection) -> None:
         connection.execute(
             """
-            CREATE TABLE agentscope_sessions (
+            CREATE TABLE IF NOT EXISTS sessions (
+                id TEXT PRIMARY KEY,
+                title TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            )
+            """
+        )
+        connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS messages (
+                id TEXT PRIMARY KEY,
+                session_id TEXT NOT NULL,
+                role TEXT NOT NULL,
+                content TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                FOREIGN KEY (session_id) REFERENCES sessions(id)
+            )
+            """
+        )
+        connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS public_events (
+                id TEXT PRIMARY KEY,
+                session_id TEXT NOT NULL,
+                sequence INTEGER NOT NULL,
+                dedupe_key TEXT NOT NULL,
+                event_json TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                UNIQUE (session_id, sequence),
+                UNIQUE (session_id, dedupe_key),
+                FOREIGN KEY (session_id) REFERENCES sessions(id)
+            )
+            """
+        )
+        connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS public_tool_runs (
+                session_id TEXT NOT NULL,
+                tool_call_id TEXT NOT NULL,
+                tool_name TEXT NOT NULL,
+                status TEXT NOT NULL CHECK (
+                    status IN ('running', 'success', 'failure', 'stopped')
+                ),
+                summary TEXT NOT NULL DEFAULT '',
+                error_type TEXT,
+                started_at TEXT NOT NULL,
+                finished_at TEXT,
+                PRIMARY KEY (session_id, tool_call_id),
+                FOREIGN KEY (session_id) REFERENCES sessions(id)
+            )
+            """
+        )
+        connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS agentscope_sessions (
                 web_session_id TEXT NOT NULL,
                 agent_id TEXT NOT NULL,
                 agentscope_session_id TEXT NOT NULL,
@@ -147,36 +154,61 @@ class WebSessionStore:
         )
         connection.execute(
             """
-            INSERT INTO agentscope_sessions (
-                web_session_id,
-                agent_id,
-                agentscope_session_id,
-                event_cursor,
-                active,
-                updated_at
+            CREATE TABLE IF NOT EXISTS human_decision_consumptions (
+                agentscope_session_id TEXT NOT NULL,
+                reply_id TEXT NOT NULL,
+                tool_call_id TEXT NOT NULL,
+                action TEXT NOT NULL,
+                request_id TEXT,
+                consumed_at TEXT NOT NULL,
+                PRIMARY KEY (agentscope_session_id, reply_id, tool_call_id)
             )
-            SELECT web_session_id, agent_id, agentscope_session_id, event_cursor, 1, updated_at
-            FROM agentscope_sessions_legacy
             """
         )
-        connection.execute("DROP TABLE agentscope_sessions_legacy")
+        connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS web_schema (
+                singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+                generation TEXT NOT NULL
+            )
+            """
+        )
+        connection.execute(
+            """
+            INSERT INTO web_schema (singleton, generation)
+            VALUES (1, ?)
+            ON CONFLICT(singleton) DO UPDATE SET generation = excluded.generation
+            """,
+            (WEB_SCHEMA_GENERATION,),
+        )
+        connection.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_public_events_session_sequence
+            ON public_events (session_id, sequence)
+            """
+        )
+        connection.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_agentscope_sessions_agentscope_id
+            ON agentscope_sessions (agentscope_session_id)
+            """
+        )
 
     def create_session(self, title: str) -> SessionRecord:
         timestamp = _now()
         record = SessionRecord(
             id=f"session_{uuid4().hex}",
             title=title,
-            status="active",
             created_at=timestamp,
             updated_at=timestamp,
         )
         with self._connect() as connection:
             connection.execute(
                 """
-                INSERT INTO sessions (id, title, status, created_at, updated_at)
-                VALUES (?, ?, ?, ?, ?)
+                INSERT INTO sessions (id, title, created_at, updated_at)
+                VALUES (?, ?, ?, ?)
                 """,
-                (record.id, record.title, record.status, record.created_at, record.updated_at),
+                (record.id, record.title, record.created_at, record.updated_at),
             )
         return record
 
@@ -184,7 +216,7 @@ class WebSessionStore:
         with self._connect() as connection:
             rows = connection.execute(
                 """
-                SELECT id, title, status, created_at, updated_at
+                SELECT id, title, created_at, updated_at
                 FROM sessions
                 ORDER BY updated_at DESC, rowid DESC
                 LIMIT ?
@@ -197,7 +229,7 @@ class WebSessionStore:
         with self._connect() as connection:
             session_row = connection.execute(
                 """
-                SELECT id, title, status, created_at, updated_at
+                SELECT id, title, created_at, updated_at
                 FROM sessions
                 WHERE id = ?
                 """,
@@ -205,7 +237,6 @@ class WebSessionStore:
             ).fetchone()
             if session_row is None:
                 return None
-
             message_rows = connection.execute(
                 """
                 SELECT id, session_id, role, content, created_at
@@ -217,20 +248,32 @@ class WebSessionStore:
             ).fetchall()
             event_rows = connection.execute(
                 """
-                SELECT id, session_id, seq, type, source, run_id, parent_run_id,
-                       timestamp, payload_json, created_at
-                FROM timeline_events
+                SELECT id, session_id, sequence, dedupe_key, event_json, created_at
+                FROM public_events
                 WHERE session_id = ?
-                ORDER BY seq ASC, rowid ASC
+                ORDER BY sequence ASC
+                """,
+                (session_id,),
+            ).fetchall()
+            tool_rows = connection.execute(
+                """
+                SELECT session_id, tool_call_id, tool_name, status, summary,
+                       error_type, started_at, finished_at
+                FROM public_tool_runs
+                WHERE session_id = ?
+                ORDER BY started_at ASC, rowid ASC
                 """,
                 (session_id,),
             ).fetchall()
 
         session = self._session_from_row(session_row)
+        events = [self._public_event_from_row(row) for row in event_rows]
         return SessionDetail(
             **session.model_dump(),
             messages=[self._message_from_row(row) for row in message_rows],
-            events=[self._timeline_event_from_row(row) for row in event_rows],
+            events=events,
+            tool_runs=[self._tool_run_from_row(row) for row in tool_rows],
+            last_sequence=events[-1].sequence if events else 0,
         )
 
     def append_message(self, session_id: str, *, role: MessageRole, content: str) -> ChatMessageRecord:
@@ -243,16 +286,7 @@ class WebSessionStore:
             created_at=timestamp,
         )
         with self._connect() as connection:
-            exists = connection.execute(
-                """
-                SELECT 1
-                FROM sessions
-                WHERE id = ?
-                """,
-                (session_id,),
-            ).fetchone()
-            if exists is None:
-                raise KeyError(session_id)
+            self._require_session(connection, session_id)
             connection.execute(
                 """
                 INSERT INTO messages (id, session_id, role, content, created_at)
@@ -260,100 +294,167 @@ class WebSessionStore:
                 """,
                 (record.id, record.session_id, record.role, record.content, record.created_at),
             )
-            connection.execute(
-                """
-                UPDATE sessions
-                SET updated_at = ?
-                WHERE id = ?
-                """,
-                (timestamp, session_id),
-            )
+            self._touch_session(connection, session_id, timestamp)
         return record
 
-    def append_timeline_event(self, session_id: str, event: dict) -> TimelineEventRecord:
+    def append_public_event(
+        self,
+        session_id: str,
+        dedupe_key: str,
+        event: dict[str, Any],
+    ) -> PublicEventRecord:
+        if _SHA256_HEX.fullmatch(dedupe_key) is None:
+            raise ValueError("dedupe_key must be a lowercase SHA-256 hexadecimal digest")
+        event_json = json.dumps(event, ensure_ascii=False)
         timestamp = _now()
-        payload = event.get("payload")
-        safe_payload = payload if isinstance(payload, dict) else {}
-        record_id = f"event_{uuid4().hex}"
         with self._connect() as connection:
-            exists = connection.execute(
+            connection.execute("BEGIN IMMEDIATE")
+            self._require_session(connection, session_id)
+            duplicate = connection.execute(
                 """
-                SELECT 1
-                FROM sessions
-                WHERE id = ?
+                SELECT id, session_id, sequence, dedupe_key, event_json, created_at
+                FROM public_events
+                WHERE session_id = ? AND dedupe_key = ?
                 """,
-                (session_id,),
+                (session_id, dedupe_key),
             ).fetchone()
-            if exists is None:
-                raise KeyError(session_id)
-            duplicate = self._duplicate_human_decision_event(
-                connection,
-                session_id=session_id,
-                event=event,
-                payload=safe_payload,
-            )
             if duplicate is not None:
-                return duplicate
-            seq = int(
+                return self._public_event_from_row(duplicate)
+            sequence = int(
                 connection.execute(
                     """
-                    SELECT COALESCE(MAX(seq), 0) + 1
-                    FROM timeline_events
+                    SELECT COALESCE(MAX(sequence), 0) + 1
+                    FROM public_events
                     WHERE session_id = ?
                     """,
                     (session_id,),
                 ).fetchone()[0]
             )
+            record = PublicEventRecord(
+                id=f"event_{uuid4().hex}",
+                session_id=session_id,
+                sequence=sequence,
+                dedupe_key=dedupe_key,
+                event=event,
+                created_at=timestamp,
+            )
             connection.execute(
                 """
-                INSERT INTO timeline_events (
-                    id,
-                    session_id,
-                    seq,
-                    type,
-                    source,
-                    run_id,
-                    parent_run_id,
-                    timestamp,
-                    payload_json,
-                    created_at
+                INSERT INTO public_events (
+                    id, session_id, sequence, dedupe_key, event_json, created_at
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?)
                 """,
                 (
-                    record_id,
-                    session_id,
-                    seq,
-                    str(event.get("type", "")),
-                    _optional_text(event.get("source")),
-                    _optional_text(event.get("run_id")),
-                    _optional_text(event.get("parent_run_id")),
-                    _optional_text(event.get("timestamp")),
-                    json.dumps(safe_payload, ensure_ascii=False),
-                    timestamp,
+                    record.id,
+                    record.session_id,
+                    record.sequence,
+                    record.dedupe_key,
+                    event_json,
+                    record.created_at,
                 ),
             )
+            self._touch_session(connection, session_id, timestamp)
+        return record
+
+    def list_public_events(
+        self,
+        session_id: str,
+        after_sequence: int = 0,
+    ) -> list[PublicEventRecord]:
+        with self._connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT id, session_id, sequence, dedupe_key, event_json, created_at
+                FROM public_events
+                WHERE session_id = ? AND sequence > ?
+                ORDER BY sequence ASC
+                """,
+                (session_id, after_sequence),
+            ).fetchall()
+        return [self._public_event_from_row(row) for row in rows]
+
+    def start_tool_run(
+        self,
+        session_id: str,
+        tool_call_id: str,
+        tool_name: str,
+        started_at: str,
+    ) -> PublicToolRun:
+        with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            self._require_session(connection, session_id)
             connection.execute(
                 """
-                UPDATE sessions
-                SET updated_at = ?
-                WHERE id = ?
+                INSERT INTO public_tool_runs (
+                    session_id, tool_call_id, tool_name, status, summary,
+                    error_type, started_at, finished_at
+                )
+                VALUES (?, ?, ?, 'running', '', NULL, ?, NULL)
+                ON CONFLICT(session_id, tool_call_id) DO NOTHING
                 """,
-                (timestamp, session_id),
+                (session_id, tool_call_id, tool_name, started_at),
             )
+            row = self._select_tool_run(connection, session_id, tool_call_id)
+        assert row is not None
+        return self._tool_run_from_row(row)
 
-        return TimelineEventRecord(
-            id=record_id,
-            session_id=session_id,
-            seq=seq,
-            type=str(event.get("type", "")),
-            source=_optional_text(event.get("source")),
-            run_id=_optional_text(event.get("run_id")),
-            parent_run_id=_optional_text(event.get("parent_run_id")),
-            timestamp=_optional_text(event.get("timestamp")),
-            payload=safe_payload,
-            created_at=timestamp,
-        )
+    def finish_tool_run(
+        self,
+        session_id: str,
+        tool_call_id: str,
+        *,
+        status: Literal["success", "failure"],
+        summary: str = "",
+        error_type: str | None = None,
+    ) -> PublicToolRun | None:
+        if status not in {"success", "failure"}:
+            raise ValueError("finish_tool_run status must be success or failure")
+        finished_at = _now()
+        with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            cursor = connection.execute(
+                """
+                UPDATE public_tool_runs
+                SET status = ?, summary = ?, error_type = ?, finished_at = ?
+                WHERE session_id = ? AND tool_call_id = ? AND status = 'running'
+                """,
+                (status, summary, error_type, finished_at, session_id, tool_call_id),
+            )
+            if cursor.rowcount != 1:
+                return None
+            row = self._select_tool_run(connection, session_id, tool_call_id)
+        assert row is not None
+        return self._tool_run_from_row(row)
+
+    def stop_open_tool_runs(self, session_id: str) -> list[PublicToolRun]:
+        finished_at = _now()
+        with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            rows = connection.execute(
+                """
+                SELECT session_id, tool_call_id, tool_name, status, summary,
+                       error_type, started_at, finished_at
+                FROM public_tool_runs
+                WHERE session_id = ? AND status = 'running'
+                ORDER BY started_at ASC, rowid ASC
+                """,
+                (session_id,),
+            ).fetchall()
+            connection.execute(
+                """
+                UPDATE public_tool_runs
+                SET status = 'stopped', finished_at = ?
+                WHERE session_id = ? AND status = 'running'
+                """,
+                (finished_at, session_id),
+            )
+        return [
+            self._tool_run_from_row(row).model_copy(
+                update={"status": "stopped", "finished_at": finished_at}
+            )
+            for row in rows
+        ]
 
     def mark_human_decision_consumed(
         self,
@@ -369,12 +470,8 @@ class WebSessionStore:
             connection.execute(
                 """
                 INSERT INTO human_decision_consumptions (
-                    agentscope_session_id,
-                    reply_id,
-                    tool_call_id,
-                    action,
-                    request_id,
-                    consumed_at
+                    agentscope_session_id, reply_id, tool_call_id, action,
+                    request_id, consumed_at
                 )
                 VALUES (?, ?, ?, ?, ?, ?)
                 ON CONFLICT(agentscope_session_id, reply_id, tool_call_id)
@@ -413,25 +510,14 @@ class WebSessionStore:
             ).fetchone()
         return row is not None
 
-    def mark_historical(self, session_id: str) -> None:
-        timestamp = _now()
-        with self._connect() as connection:
-            cursor = connection.execute(
-                """
-                UPDATE sessions
-                SET status = ?, updated_at = ?
-                WHERE id = ?
-                """,
-                ("historical", timestamp, session_id),
-            )
-            if cursor.rowcount == 0:
-                raise KeyError(session_id)
-
     def delete_session(self, session_id: str) -> None:
         with self._connect() as connection:
             connection.execute("DELETE FROM messages WHERE session_id = ?", (session_id,))
-            connection.execute("DELETE FROM timeline_events WHERE session_id = ?", (session_id,))
-            connection.execute("DELETE FROM agentscope_sessions WHERE web_session_id = ?", (session_id,))
+            connection.execute("DELETE FROM public_events WHERE session_id = ?", (session_id,))
+            connection.execute("DELETE FROM public_tool_runs WHERE session_id = ?", (session_id,))
+            connection.execute(
+                "DELETE FROM agentscope_sessions WHERE web_session_id = ?", (session_id,)
+            )
             cursor = connection.execute("DELETE FROM sessions WHERE id = ?", (session_id,))
             if cursor.rowcount == 0:
                 raise KeyError(session_id)
@@ -445,37 +531,19 @@ class WebSessionStore:
     ) -> None:
         timestamp = _now()
         with self._connect() as connection:
-            exists = connection.execute(
-                """
-                SELECT 1
-                FROM sessions
-                WHERE id = ?
-                """,
-                (web_session_id,),
-            ).fetchone()
-            if exists is None:
-                raise KeyError(web_session_id)
+            self._require_session(connection, web_session_id)
             connection.execute(
-                """
-                UPDATE agentscope_sessions
-                SET active = 0
-                WHERE web_session_id = ?
-                """,
+                "UPDATE agentscope_sessions SET active = 0 WHERE web_session_id = ?",
                 (web_session_id,),
             )
             connection.execute(
                 """
                 INSERT INTO agentscope_sessions (
-                    web_session_id,
-                    agent_id,
-                    agentscope_session_id,
-                    event_cursor,
-                    active,
-                    updated_at
+                    web_session_id, agent_id, agentscope_session_id,
+                    event_cursor, active, updated_at
                 )
                 VALUES (?, ?, ?, NULL, 1, ?)
                 ON CONFLICT(web_session_id, agent_id) DO UPDATE SET
-                    agent_id = excluded.agent_id,
                     agentscope_session_id = excluded.agentscope_session_id,
                     event_cursor = CASE
                         WHEN agentscope_sessions.agentscope_session_id = excluded.agentscope_session_id
@@ -507,9 +575,7 @@ class WebSessionStore:
                 """
                 UPDATE agentscope_sessions
                 SET active = 1, updated_at = ?
-                WHERE web_session_id = ?
-                  AND agent_id = ?
-                  AND agentscope_session_id = ?
+                WHERE web_session_id = ? AND agent_id = ? AND agentscope_session_id = ?
                 """,
                 (timestamp, web_session_id, agent_id, agentscope_session_id),
             )
@@ -526,7 +592,7 @@ class WebSessionStore:
                 SELECT web_session_id, agent_id, agentscope_session_id, event_cursor
                 FROM agentscope_sessions
                 WHERE web_session_id = ? AND active = 1
-                ORDER BY active DESC, updated_at DESC
+                ORDER BY updated_at DESC
                 LIMIT 1
                 """,
                 (web_session_id,),
@@ -578,60 +644,46 @@ class WebSessionStore:
             if result.rowcount == 0:
                 raise KeyError(agentscope_session_id)
 
-    def _duplicate_human_decision_event(
-        self,
+    @staticmethod
+    def _require_session(connection: sqlite3.Connection, session_id: str) -> None:
+        exists = connection.execute(
+            "SELECT 1 FROM sessions WHERE id = ?", (session_id,)
+        ).fetchone()
+        if exists is None:
+            raise KeyError(session_id)
+
+    @staticmethod
+    def _touch_session(
         connection: sqlite3.Connection,
-        *,
         session_id: str,
-        event: dict,
-        payload: dict,
-    ) -> TimelineEventRecord | None:
-        if event.get("type") != "human_decision_required":
-            return None
-        reply_id = payload.get("reply_id")
-        tool_call_id = payload.get("tool_call_id")
-        if not isinstance(reply_id, str) or not isinstance(tool_call_id, str):
-            return None
-        rows = connection.execute(
+        timestamp: str,
+    ) -> None:
+        connection.execute(
+            "UPDATE sessions SET updated_at = ? WHERE id = ?",
+            (timestamp, session_id),
+        )
+
+    @staticmethod
+    def _select_tool_run(
+        connection: sqlite3.Connection,
+        session_id: str,
+        tool_call_id: str,
+    ) -> sqlite3.Row | None:
+        return connection.execute(
             """
-            SELECT id, session_id, seq, type, source, run_id, parent_run_id,
-                   timestamp, payload_json, created_at
-            FROM timeline_events
-            WHERE session_id = ?
-              AND type = ?
-              AND run_id IS ?
-            ORDER BY seq ASC
+            SELECT session_id, tool_call_id, tool_name, status, summary,
+                   error_type, started_at, finished_at
+            FROM public_tool_runs
+            WHERE session_id = ? AND tool_call_id = ?
             """,
-            (
-                session_id,
-                "human_decision_required",
-                _optional_text(event.get("run_id")),
-            ),
-        ).fetchall()
-        for row in rows:
-            existing = self._timeline_event_from_row(row)
-            if (
-                existing.payload.get("reply_id") == reply_id
-                and existing.payload.get("tool_call_id") == tool_call_id
-            ):
-                if (
-                    payload.get("recovery_required") is True
-                    and existing.payload.get("recovery_required") is not True
-                ):
-                    connection.execute(
-                        "UPDATE timeline_events SET payload_json = ? WHERE id = ?",
-                        (json.dumps(payload, ensure_ascii=False), existing.id),
-                    )
-                    return existing.model_copy(update={"payload": payload})
-                return existing
-        return None
+            (session_id, tool_call_id),
+        ).fetchone()
 
     @staticmethod
     def _session_from_row(row: sqlite3.Row) -> SessionRecord:
         return SessionRecord(
             id=row["id"],
             title=row["title"],
-            status=row["status"],
             created_at=row["created_at"],
             updated_at=row["updated_at"],
         )
@@ -647,22 +699,31 @@ class WebSessionStore:
         )
 
     @staticmethod
-    def _timeline_event_from_row(row: sqlite3.Row) -> TimelineEventRecord:
+    def _public_event_from_row(row: sqlite3.Row) -> PublicEventRecord:
         try:
-            payload = json.loads(row["payload_json"])
+            event = json.loads(row["event_json"])
         except (TypeError, json.JSONDecodeError):
-            payload = {}
-        return TimelineEventRecord(
+            event = {}
+        return PublicEventRecord(
             id=row["id"],
             session_id=row["session_id"],
-            seq=int(row["seq"]),
-            type=row["type"],
-            source=row["source"],
-            run_id=row["run_id"],
-            parent_run_id=row["parent_run_id"],
-            timestamp=row["timestamp"],
-            payload=payload if isinstance(payload, dict) else {},
+            sequence=int(row["sequence"]),
+            dedupe_key=row["dedupe_key"],
+            event=event if isinstance(event, dict) else {},
             created_at=row["created_at"],
+        )
+
+    @staticmethod
+    def _tool_run_from_row(row: sqlite3.Row) -> PublicToolRun:
+        return PublicToolRun(
+            session_id=row["session_id"],
+            tool_call_id=row["tool_call_id"],
+            tool_name=row["tool_name"],
+            status=row["status"],
+            summary=row["summary"],
+            error_type=row["error_type"],
+            started_at=row["started_at"],
+            finished_at=row["finished_at"],
         )
 
     @staticmethod
@@ -673,7 +734,3 @@ class WebSessionStore:
             agentscope_session_id=row["agentscope_session_id"],
             event_cursor=row["event_cursor"],
         )
-
-
-def _optional_text(value: object) -> str | None:
-    return value if isinstance(value, str) and value else None

@@ -5,9 +5,9 @@ from typing import Any, Literal
 from pydantic import BaseModel, Field, field_validator
 
 
-SessionStatus = Literal["draft", "active", "historical"]
 MessageRole = Literal["user", "assistant", "system"]
 HumanDecisionAction = Literal["confirm", "stop", "guide"]
+ToolRunStatus = Literal["running", "success", "failure", "stopped"]
 
 
 def generate_session_title(message: str, *, limit: int = 30) -> str:
@@ -18,7 +18,6 @@ def generate_session_title(message: str, *, limit: int = 30) -> str:
 class SessionRecord(BaseModel):
     id: str
     title: str
-    status: SessionStatus
     created_at: str
     updated_at: str
 
@@ -31,22 +30,31 @@ class ChatMessageRecord(BaseModel):
     created_at: str
 
 
-class TimelineEventRecord(BaseModel):
+class PublicEventRecord(BaseModel):
     id: str
     session_id: str
-    seq: int
-    type: str
-    source: str | None = None
-    run_id: str | None = None
-    parent_run_id: str | None = None
-    timestamp: str | None = None
-    payload: dict[str, Any] = Field(default_factory=dict)
+    sequence: int
+    dedupe_key: str = Field(pattern=r"^[0-9a-f]{64}$")
+    event: dict[str, Any]
     created_at: str
+
+
+class PublicToolRun(BaseModel):
+    session_id: str
+    tool_call_id: str
+    tool_name: str
+    status: ToolRunStatus
+    summary: str = ""
+    error_type: str | None = None
+    started_at: str
+    finished_at: str | None = None
 
 
 class SessionDetail(SessionRecord):
     messages: list[ChatMessageRecord] = Field(default_factory=list)
-    events: list[TimelineEventRecord] = Field(default_factory=list)
+    events: list[PublicEventRecord] = Field(default_factory=list)
+    tool_runs: list[PublicToolRun] = Field(default_factory=list)
+    last_sequence: int = 0
 
 
 class CreateSessionResponse(BaseModel):
