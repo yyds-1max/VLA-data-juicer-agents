@@ -1,10 +1,10 @@
-export type SessionStatus = "draft" | "active" | "historical";
+import type { AgentEvent } from "@agentscope-ai/agentscope/event";
+
 export type MessageRole = "user" | "assistant" | "system";
 
 export interface SessionRecord {
   id: string;
   title: string;
-  status: SessionStatus;
   created_at: string;
   updated_at: string;
 }
@@ -17,25 +17,33 @@ export interface ChatMessageRecord {
   created_at: string;
 }
 
-export interface TimelineEventRecord extends AgentEvent {
+export interface PublicEventEnvelope {
   id: string;
   session_id: string;
-  seq: number;
+  sequence: number;
+  dedupe_key: string;
+  event: AgentEvent;
   created_at: string;
+}
+
+export type PublicToolStatus = "running" | "success" | "failure" | "stopped";
+
+export interface PublicToolRun {
+  session_id: string;
+  tool_call_id: string;
+  tool_name: string;
+  status: PublicToolStatus;
+  summary: string;
+  error_type: string | null;
+  started_at: string;
+  finished_at: string | null;
 }
 
 export interface SessionDetail extends SessionRecord {
   messages: ChatMessageRecord[];
-  events?: TimelineEventRecord[];
-}
-
-export interface AgentEvent {
-  type: string;
-  source?: string | null;
-  run_id?: string | null;
-  parent_run_id?: string | null;
-  timestamp?: string | null;
-  payload: Record<string, unknown>;
+  events: PublicEventEnvelope[];
+  tool_runs: PublicToolRun[];
+  last_sequence: number;
 }
 
 export type HumanDecisionAction = "confirm" | "stop" | "guide";

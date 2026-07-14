@@ -1,70 +1,41 @@
-import { useCallback, useEffect, useLayoutEffect, useRef, useState } from "react";
+import { useCallback, useLayoutEffect, useRef } from "react";
+import type {
+  DataBlock,
+  HintBlock,
+  Msg,
+  TextBlock,
+  ThinkingBlock,
+} from "@agentscope-ai/agentscope/message";
 
-import type { ChatMessageRecord } from "../../api/types";
-import type { ActiveAgent, ActiveTool, RunState, TimelineItem } from "../../store/eventReducer";
+import type { PublicToolRun } from "../../api/types";
 import { cn } from "../../lib/utils";
-import { AgentRunSummary, ToolStatusDot, type AgentRunTimelineItem } from "./AgentRunSummary";
+import { ToolStatusDot } from "./AgentRunSummary";
 
 type MessageListProps = {
-  messages: ChatMessageRecord[];
-  run: RunState;
+  messages: Msg[];
+  toolRuns: Record<string, PublicToolRun>;
 };
 
 const STICKY_BOTTOM_THRESHOLD = 24;
 
-type OrderedTimelineItem = AgentRunTimelineItem;
-
-type MessageEntry = {
-  type: "message";
-  key: string;
-  timestamp: number;
-  sequence: number;
-  message: ChatMessageRecord;
-};
-
-type TimelineEntry = {
-  type: "timeline";
-  key: string;
-  timestamp: number;
-  sequence: number;
-  item: OrderedTimelineItem;
-};
-
-type AgentRunSummaryEntry = {
-  type: "agent-run-summary";
-  key: string;
-  timestamp: number;
-  sequence: number;
-  source: string;
-  items: OrderedTimelineItem[];
-};
-
-type ChronologicalEntry = MessageEntry | TimelineEntry;
-type RenderEntry = ChronologicalEntry | AgentRunSummaryEntry;
-
-export function MessageList({ messages, run }: MessageListProps) {
-  const visibleMessages = filterMessagesCoveredByTimeline(messages, run);
-  const hasContent = visibleMessages.length > 0 || run.timeline.length > 0 || Boolean(run.activeText);
-  const entries = renderEntries(visibleMessages, run);
-  const now = useActiveNow(run.activeText ? run.activeStartedAt : null);
-  const activeText = formatActiveText(run.activeText, run.activeStartedAt, now);
+export function MessageList({ messages, toolRuns }: MessageListProps) {
+  const runs = Object.values(toolRuns).sort(compareToolRuns);
+  const hasContent = messages.length > 0 || runs.length > 0;
   const scrollAreaRef = useRef<HTMLDivElement | null>(null);
   const shouldStickToBottomRef = useRef(true);
 
   const handleScroll = useCallback(() => {
     const scrollArea = scrollAreaRef.current;
-    if (!scrollArea) {
-      return;
+    if (scrollArea) {
+      shouldStickToBottomRef.current = isScrolledNearBottom(scrollArea);
     }
-    shouldStickToBottomRef.current = isScrolledNearBottom(scrollArea);
   }, []);
 
   useLayoutEffect(() => {
     const scrollArea = scrollAreaRef.current;
-    if (!scrollArea || !shouldStickToBottomRef.current) {
-      return;
+    if (scrollArea && shouldStickToBottomRef.current) {
+      scrollArea.scrollTop = scrollArea.scrollHeight;
     }
-    scrollArea.scrollTop = scrollArea.scrollHeight;
   });
 
   return (
@@ -76,22 +47,12 @@ export function MessageList({ messages, run }: MessageListProps) {
     >
       {hasContent ? (
         <>
-          {entries.map((entry) =>
-            entry.type === "message" ? (
-              <MessageBubble key={entry.key} message={entry.message} />
-            ) : entry.type === "agent-run-summary" ? (
-              <AgentRunSummary key={entry.key} source={entry.source} items={entry.items} />
-            ) : entry.item.kind === "tool" ? (
-              <ToolLine key={entry.key} item={entry.item} />
-            ) : (
-              <TimelineBubble key={entry.key} item={entry.item} />
-            ),
-          )}
-          {activeText ? (
-            <div className="mr-auto flex max-w-[92%] items-center gap-2 px-2 py-1 text-xs text-console-muted">
-              {activeText}
-            </div>
-          ) : null}
+          {messages.map((message) => (
+            <MessageBubble key={message.id} message={message} />
+          ))}
+          {runs.map((run) => (
+            <ToolRunLine key={run.tool_call_id} run={run} />
+          ))}
         </>
       ) : (
         <div className="mt-auto rounded-lg border border-console-line bg-console-panel px-3 py-3 text-sm text-console-muted shadow-sm">
@@ -102,174 +63,12 @@ export function MessageList({ messages, run }: MessageListProps) {
   );
 }
 
-function filterMessagesCoveredByTimeline(messages: ChatMessageRecord[], run: RunState): ChatMessageRecord[] {
-  const assistantTextCounts = new Map<string, number>();
-  for (const item of run.timeline) {
-    if (item.kind !== "assistant") {
-      continue;
-    }
-    assistantTextCounts.set(item.text, (assistantTextCounts.get(item.text) ?? 0) + 1);
-  }
-  if (assistantTextCounts.size === 0) {
-    return messages;
-  }
-
-  return messages.filter((message) => {
-    if (message.role !== "assistant") {
-      return true;
-    }
-    const count = assistantTextCounts.get(message.content) ?? 0;
-    if (count <= 0) {
-      return true;
-    }
-    assistantTextCounts.set(message.content, count - 1);
-    return false;
-  });
-}
-
-function isScrolledNearBottom(element: HTMLElement) {
-  const distanceToBottom = element.scrollHeight - element.scrollTop - element.clientHeight;
-  return distanceToBottom <= STICKY_BOTTOM_THRESHOLD;
-}
-
-export function formatActiveText(activeText: string, startedAt: number | null, now: number): string {
-  if (!activeText) {
-    return "";
-  }
-  if (startedAt === null) {
-    return activeText;
-  }
-  const elapsed = Math.max(Math.floor((now - startedAt) / 1000), 0);
-  return `${activeText} +${elapsed}s`;
-}
-
-function useActiveNow(startedAt: number | null): number {
-  const [now, setNow] = useState(() => Date.now());
-
-  useEffect(() => {
-    if (startedAt === null) {
-      return undefined;
-    }
-    setNow(Date.now());
-    const timer = window.setInterval(() => setNow(Date.now()), 1000);
-    return () => window.clearInterval(timer);
-  }, [startedAt]);
-
-  return now;
-}
-
-function renderEntries(messages: ChatMessageRecord[], run: RunState): RenderEntry[] {
-  const entries = chronologicalEntries(messages, run.timeline);
-  const childGroups = completedChildGroups(entries, run);
-  const emittedGroups = new Set<string>();
-
-  return entries.flatMap((entry): RenderEntry[] => {
-    if (entry.type !== "timeline" || !isChildTimelineItem(entry.item)) {
-      return [entry];
-    }
-    if (entry.item.kind === "tool") {
-      return [entry];
-    }
-
-    const groupKey = childRunKey(entry.item);
-    const group = childGroups.get(groupKey);
-    if (!group) {
-      return [entry];
-    }
-    if (emittedGroups.has(groupKey)) {
-      return [];
-    }
-
-    emittedGroups.add(groupKey);
-    return [
-      {
-        type: "agent-run-summary",
-        key: `agent-run-summary-${groupKey}`,
-        timestamp: entry.timestamp,
-        sequence: entry.sequence,
-        source: group[0]?.item.source ?? entry.item.source,
-        items: group.map((item) => item.item),
-      },
-    ];
-  });
-}
-
-function completedChildGroups(entries: ChronologicalEntry[], run: RunState): Map<string, TimelineEntry[]> {
-  const groups = new Map<string, TimelineEntry[]>();
-
-  for (const entry of entries) {
-    if (
-      entry.type !== "timeline" ||
-      !isChildTimelineItem(entry.item) ||
-      entry.item.kind === "tool" ||
-      isChildRunActive(entry.item, run)
-    ) {
-      continue;
-    }
-
-    const groupKey = childRunKey(entry.item);
-    const group = groups.get(groupKey) ?? [];
-    group.push(entry);
-    groups.set(groupKey, group);
-  }
-
-  return groups;
-}
-
-function chronologicalEntries(messages: ChatMessageRecord[], timeline: TimelineItem[]): ChronologicalEntry[] {
-  return [
-    ...messages.map((message, index) => ({
-      type: "message" as const,
-      key: message.id,
-      timestamp: timestampMs(message.created_at),
-      sequence: index,
-      message,
-    })),
-    ...timeline.map((item, index) => {
-      const orderedItem = item as OrderedTimelineItem;
-      return {
-        type: "timeline" as const,
-        key: `${orderedItem.kind}-${orderedItem.runId ?? "run"}-${orderedItem.sequence ?? index}`,
-        timestamp: timestampMs(orderedItem.createdAt),
-        sequence: messages.length + (orderedItem.sequence ?? index),
-        item: orderedItem,
-      };
-    }),
-  ].sort((left, right) => left.timestamp - right.timestamp || left.sequence - right.sequence);
-}
-
-function isChildTimelineItem(item: TimelineItem): boolean {
-  return !isPrimaryConversationSource(item.source);
-}
-
-function isChildRunActive(item: TimelineItem, run: RunState): boolean {
-  return (
-    Object.values(run.activeAgents).some((agent) => activeMatchesItem(agent, item)) ||
-    Object.values(run.activeTools).some((tool) => activeMatchesItem(tool, item))
-  );
-}
-
-function activeMatchesItem(active: ActiveAgent | ActiveTool, item: TimelineItem): boolean {
-  if (item.runId && active.runId === item.runId) {
-    return true;
-  }
-  return active.source === item.source;
-}
-
-function childRunKey(item: TimelineItem): string {
-  return item.runId ? `run:${item.runId}` : `source:${item.source}`;
-}
-
-function timestampMs(value: string | undefined): number {
-  if (!value) {
-    return Date.now();
-  }
-  const parsed = Date.parse(value);
-  return Number.isNaN(parsed) ? Date.now() : parsed;
-}
-
-function MessageBubble({ message }: { message: ChatMessageRecord }) {
+function MessageBubble({ message }: { message: Msg }) {
   const isUser = message.role === "user";
+  const text = visibleMessageText(message);
+  if (!text) {
+    return null;
+  }
 
   return (
     <article
@@ -283,48 +82,58 @@ function MessageBubble({ message }: { message: ChatMessageRecord }) {
       <div className="mb-1 text-[11px] font-medium text-console-muted">
         {isUser ? "You" : message.role === "assistant" ? "DataPilot" : "System"}
       </div>
-      <p className="whitespace-pre-wrap break-words">{message.content}</p>
+      <p className="whitespace-pre-wrap break-words">{text}</p>
     </article>
   );
 }
 
-function TimelineBubble({ item }: { item: TimelineItem }) {
-  const showSource = !isPrimaryConversationSource(item.source);
-
-  return (
-    <article className="mr-auto max-w-[92%] rounded-lg border border-console-line bg-console-panel px-3 py-2 text-sm leading-6 text-console-text shadow-sm">
-      <div className="mb-1 flex items-center gap-2 text-[11px] font-medium text-console-muted">
-        <span>{item.kind === "assistant" ? "DataPilot" : item.kind}</span>
-        {showSource ? <span className="truncate font-normal">{item.source}</span> : null}
-      </div>
-      {item.kind === "tool" ? (
-        <div className="flex min-w-0 items-center gap-2 whitespace-pre-wrap break-words">
-          <ToolStatusDot status={item.status} />
-          <span className="min-w-0 break-words">{item.text}</span>
-        </div>
-      ) : (
-        <p className="whitespace-pre-wrap break-words">{item.text}</p>
-      )}
-    </article>
-  );
-}
-
-function ToolLine({ item }: { item: TimelineItem }) {
+function ToolRunLine({ run }: { run: PublicToolRun }) {
   return (
     <div className="mr-auto flex max-w-[92%] items-center gap-2 px-2 py-1 text-xs text-console-muted">
-      <ToolStatusDot status={item.status} />
-      <span className="min-w-0 break-words">{item.text}</span>
+      <ToolStatusDot status={run.status} />
+      <span className="min-w-0 break-words">
+        {run.tool_name}
+        {run.summary ? ` · ${run.summary}` : ""}
+      </span>
     </div>
   );
 }
 
-function isPrimaryConversationSource(source: string): boolean {
-  const normalized = source.trim().toLowerCase();
-  return (
-    normalized === "" ||
-    normalized === "main" ||
-    normalized === "agentscope" ||
-    normalized === "main-router-agent" ||
-    normalized === "mainrouteragent"
-  );
+function visibleMessageText(message: Msg): string {
+  return message.content
+    .map((block) => blockText(block))
+    .filter(Boolean)
+    .join("\n");
+}
+
+function blockText(block: Msg["content"][number]): string {
+  if (block.type === "text") {
+    return (block as TextBlock).text;
+  }
+  if (block.type === "thinking") {
+    return (block as ThinkingBlock).thinking;
+  }
+  if (block.type === "hint") {
+    const hint = (block as HintBlock).hint;
+    return typeof hint === "string"
+      ? hint
+      : hint.map((item) => (item.type === "text" ? item.text : dataLabel(item))).join("\n");
+  }
+  if (block.type === "data") {
+    return dataLabel(block as DataBlock);
+  }
+  return "";
+}
+
+function dataLabel(block: DataBlock): string {
+  return block.name ? `[${block.name}]` : `[${block.source.media_type}]`;
+}
+
+function compareToolRuns(left: PublicToolRun, right: PublicToolRun): number {
+  return left.started_at.localeCompare(right.started_at) ||
+    left.tool_call_id.localeCompare(right.tool_call_id);
+}
+
+function isScrolledNearBottom(element: HTMLElement): boolean {
+  return element.scrollHeight - element.scrollTop - element.clientHeight <= STICKY_BOTTOM_THRESHOLD;
 }

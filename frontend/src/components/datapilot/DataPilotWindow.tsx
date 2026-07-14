@@ -35,11 +35,10 @@ export function DataPilotWindow() {
   const mode = useStore(datapilotStore, (state) => state.mode);
   const currentSessionId = useStore(datapilotStore, (state) => state.currentSessionId);
   const sessions = useStore(datapilotStore, (state) => state.sessions);
-  const messages = useStore(datapilotStore, (state) => state.messages);
-  const run = useStore(datapilotStore, (state) => state.run);
-  const running = useStore(datapilotStore, (state) => state.run.running);
-  const interrupting = useStore(datapilotStore, (state) => state.run.interrupting);
-  const pendingHumanDecision = useStore(datapilotStore, (state) => state.run.pendingHumanDecision);
+  const conversation = useStore(datapilotStore, (state) => state.conversation);
+  const running = conversation.phase !== "idle";
+  const interrupting = conversation.phase === "interrupting";
+  const pendingHumanDecision = conversation.pendingHumanDecision;
   const floatingOffset = useStore(datapilotStore, (state) => state.floatingOffset);
   const setFloatingOffset = useStore(datapilotStore, (state) => state.setFloatingOffset);
   const [historyOpen, setHistoryOpen] = useState(false);
@@ -199,11 +198,7 @@ export function DataPilotWindow() {
   const handleSelectHistory = async (session: SessionRecord) => {
     closeSocket();
     const detail = await getSession(session.id);
-    if (detail.status === "active") {
-      datapilotStore.getState().restoreActiveSession(detail, detail.messages);
-    } else {
-      datapilotStore.getState().restoreHistory(detail, detail.messages);
-    }
+    datapilotStore.getState().restoreSession(detail);
     setHistoryOpen(false);
   };
 
@@ -245,14 +240,7 @@ export function DataPilotWindow() {
 
     const interrupted = await interruptTurn(currentSessionId);
     if (interrupted) {
-      datapilotStore.getState().applyEvent({
-        type: "interrupt_requested",
-        source: "main",
-        run_id: currentSessionId,
-        parent_run_id: null,
-        timestamp: new Date().toISOString(),
-        payload: {},
-      });
+      datapilotStore.getState().markInterrupting();
     }
   };
 
@@ -321,7 +309,7 @@ export function DataPilotWindow() {
         return (
           humanDecisionRecoveryRequestRef.current === requestToken &&
           state.currentSessionId === sessionId &&
-          samePendingHumanDecision(state.run.pendingHumanDecision, decision)
+          samePendingHumanDecision(state.conversation.pendingHumanDecision, decision)
         );
       };
       setRecoveringHumanDecision(true);
@@ -478,7 +466,7 @@ export function DataPilotWindow() {
         <DraftNewSessionView running={running} onSubmit={handleDraftSubmit} onInterrupt={handleInterrupt} />
       ) : mode === "active_session" ? (
         <div className="flex min-h-0 flex-1 flex-col bg-console-panel">
-          <MessageList messages={messages} run={run} />
+          <MessageList messages={conversation.messages} toolRuns={conversation.toolRuns} />
           <HumanDecisionDialog
             key={`${currentSessionId ?? ""}:${pendingHumanDecision?.replyId ?? ""}:${pendingHumanDecision?.toolCallId ?? ""}`}
             decision={pendingHumanDecision}
@@ -501,9 +489,7 @@ export function DataPilotWindow() {
             </div>
           )}
         </div>
-      ) : (
-        <MessageList messages={messages} run={run} />
-      )}
+      ) : null}
     </section>
   );
 }

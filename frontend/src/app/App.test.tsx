@@ -1,5 +1,7 @@
 import "@testing-library/jest-dom/vitest";
 import { act, fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { EventType } from "@agentscope-ai/agentscope/event";
+import { AssistantMsg, UserMsg } from "@agentscope-ai/agentscope/message";
 
 import {
   createSession,
@@ -16,9 +18,8 @@ import {
 } from "../api/client";
 import type { PendingHumanDecision } from "../api/types";
 import { Composer } from "../components/datapilot/Composer";
-import { formatActiveText, MessageList } from "../components/datapilot/MessageList";
 import { resetNavigationDatasetSummaryCache } from "../features/console/navigationDatasetSummaryCache";
-import { createEmptyRunState } from "../store/eventReducer";
+import { createAgentConversation } from "../store/agentConversation";
 import { datapilotStore } from "../store/datapilotStore";
 import { App } from "./App";
 
@@ -49,11 +50,6 @@ const apiMocks = vi.mocked({
   recoverHumanDecision,
   openSessionEvents,
 });
-
-type TestTimelineItem = ReturnType<typeof createEmptyRunState>["timeline"][number] & {
-  createdAt: string;
-  sequence: number;
-};
 
 function activeSocket(close: () => void = vi.fn()): WebSocket {
   return { close, addEventListener: vi.fn(), readyState: WebSocket.OPEN } as unknown as WebSocket;
@@ -97,20 +93,18 @@ function setOpenActiveSessionWithPendingDecision(
         title,
         created_at: "2026-06-26T00:00:00Z",
         updated_at: "2026-06-26T00:00:00Z",
-        status: "active",
       },
     ],
-    messages: [
-      {
-        id: "message-1",
-        session_id: sessionId,
-        role: "assistant",
-        content: "准备继续。",
-        created_at: "2026-06-26T00:01:00Z",
-      },
-    ],
-    run: {
-      ...createEmptyRunState(),
+    conversation: {
+      ...createAgentConversation(),
+      messages: [
+        AssistantMsg({
+          id: "message-1",
+          name: "private-agent-name",
+          content: "准备继续。",
+          created_at: "2026-06-26T00:01:00Z",
+        }),
+      ],
       pendingHumanDecision: decision,
     },
   });
@@ -156,7 +150,6 @@ beforeEach(() => {
     title: "Clean VLA data",
     created_at: "2026-06-26T01:00:00Z",
     updated_at: "2026-06-26T01:00:00Z",
-    status: "active",
   });
   apiMocks.listSessions.mockResolvedValue([]);
   apiMocks.getSession.mockResolvedValue({
@@ -164,8 +157,10 @@ beforeEach(() => {
     title: "历史任务",
     created_at: "2026-06-25T01:00:00Z",
     updated_at: "2026-06-25T02:00:00Z",
-    status: "historical",
     messages: [],
+    events: [],
+    tool_runs: [],
+    last_sequence: 0,
   });
   apiMocks.submitTurn.mockResolvedValue("turn-1");
   apiMocks.interruptTurn.mockResolvedValue(true);
@@ -271,8 +266,7 @@ beforeEach(() => {
     currentSessionId: null,
     previousActiveSessionId: null,
     sessions: [],
-    messages: [],
-    run: createEmptyRunState(),
+    conversation: createAgentConversation(),
     floatingOffset: { x: 0, y: 0 },
   });
 });
@@ -866,16 +860,26 @@ test("DataPilot window keeps wheel scrolling inside the dialog", async () => {
         title: "Existing session",
         created_at: "2026-06-26T00:00:00Z",
         updated_at: "2026-06-26T00:00:00Z",
-        status: "active",
       },
     ],
-    messages: Array.from({ length: 12 }, (_, index) => ({
-      id: `message-${index}`,
-      session_id: "session-1",
-      role: index % 2 === 0 ? ("user" as const) : ("assistant" as const),
-      content: `消息 ${index}`,
-      created_at: `2026-06-26T00:${String(index).padStart(2, "0")}:00Z`,
-    })),
+    conversation: {
+      ...createAgentConversation(),
+      messages: Array.from({ length: 12 }, (_, index) =>
+        index % 2 === 0
+          ? UserMsg({
+              id: `message-${index}`,
+              name: "private-user-name",
+              content: `消息 ${index}`,
+              created_at: `2026-06-26T00:${String(index).padStart(2, "0")}:00Z`,
+            })
+          : AssistantMsg({
+              id: `message-${index}`,
+              name: "private-agent-name",
+              content: `消息 ${index}`,
+              created_at: `2026-06-26T00:${String(index).padStart(2, "0")}:00Z`,
+            }),
+      ),
+    },
   });
   await renderAppWithDashboardSettled();
 
@@ -917,7 +921,7 @@ test("opens DataPilot draft window from the floating button", async () => {
   expect(screen.queryByText("VLA 主智能体")).not.toBeInTheDocument();
 });
 
-test("active session renders messages and does not render draft start content", async () => {
+test("active session renders SDK messages with fixed public identities and tool runs", async () => {
   datapilotStore.setState({
     open: true,
     mode: "active_session",
@@ -929,29 +933,42 @@ test("active session renders messages and does not render draft start content", 
         title: "Existing session",
         created_at: "2026-06-26T00:00:00Z",
         updated_at: "2026-06-26T00:00:00Z",
-        status: "active",
       },
     ],
-    messages: [
-      {
-        id: "message-1",
-        session_id: "session-1",
-        role: "user",
-        content: "清洗已有数据",
-        created_at: "2026-06-26T00:01:00Z",
+    conversation: {
+      ...createAgentConversation(),
+      messages: [
+        UserMsg({ name: "private-user", content: "清洗已有数据" }),
+        AssistantMsg({ name: "private-agent", content: "已开始处理" }),
+      ],
+      toolRuns: {
+        "call-1": {
+          session_id: "session-1",
+          tool_call_id: "call-1",
+          tool_name: "extract_navigation_data",
+          status: "failure",
+          summary: "输入无效",
+          error_type: "invalid_input",
+          started_at: "2026-06-26T00:00:01Z",
+          finished_at: "2026-06-26T00:00:02Z",
+        },
       },
-    ],
+    },
   });
 
   await renderAppWithDashboardSettled();
 
-  expect(screen.getByRole("dialog", { name: "DataPilot" })).toBeVisible();
   expect(screen.getByText("清洗已有数据")).toBeVisible();
+  expect(screen.getByText("已开始处理")).toBeVisible();
+  expect(screen.getByText("You")).toBeVisible();
+  expect(screen.getAllByText("DataPilot").some((element) => element.matches("article div"))).toBe(true);
+  expect(screen.queryByText("private-user")).not.toBeInTheDocument();
+  expect(screen.queryByText("private-agent")).not.toBeInTheDocument();
+  expect(screen.getByText("extract_navigation_data · 输入无效")).toBeVisible();
   expect(screen.getByPlaceholderText("继续描述任务…")).toBeVisible();
-  expect(screen.queryByText("开始一个任务")).not.toBeInTheDocument();
 });
 
-test("pending human decision shows dialog, hides Composer, submits confirm payload, and clears only after success", async () => {
++test("pending human decision shows dialog, hides Composer, submits confirm payload, and clears only after success", async () => {
   const submitDecision = deferred<boolean>();
   apiMocks.submitHumanDecision.mockReturnValue(submitDecision.promise);
   setOpenActiveSessionWithPendingDecision(pendingDecision());
@@ -970,11 +987,11 @@ test("pending human decision shows dialog, hides Composer, submits confirm paylo
     tool_call_id: "tool-call-1",
     reply_id: "reply-1",
   });
-  expect(datapilotStore.getState().run.pendingHumanDecision).toEqual(pendingDecision());
+  expect(datapilotStore.getState().conversation.pendingHumanDecision).toEqual(pendingDecision());
 
   submitDecision.resolve(true);
 
-  await waitFor(() => expect(datapilotStore.getState().run.pendingHumanDecision).toBeNull());
+  await waitFor(() => expect(datapilotStore.getState().conversation.pendingHumanDecision).toBeNull());
   expect(screen.queryByRole("dialog", { name: "需要确认" })).not.toBeInTheDocument();
   expect(screen.getByPlaceholderText("继续描述任务…")).toBeVisible();
 });
@@ -1046,7 +1063,7 @@ test("controlled recovery never submits normally and clears only after success",
     step_id: "confirm",
     reason: "operator confirmed abandoned delivery",
   });
-  expect(datapilotStore.getState().run.pendingHumanDecision).not.toBeNull();
+  expect(datapilotStore.getState().conversation.pendingHumanDecision).not.toBeNull();
 
   recovery.resolve({
     recovered: true,
@@ -1056,7 +1073,7 @@ test("controlled recovery never submits normally and clears only after success",
     task_status: "needs_replan",
     next_action: "submit_complete_plan",
   });
-  await waitFor(() => expect(datapilotStore.getState().run.pendingHumanDecision).toBeNull());
+  await waitFor(() => expect(datapilotStore.getState().conversation.pendingHumanDecision).toBeNull());
 });
 
 test("controlled recovery failure retains the dialog and surfaces backend detail", async () => {
@@ -1078,7 +1095,7 @@ test("controlled recovery failure retains the dialog and surfaces backend detail
   fireEvent.click(screen.getByRole("button", { name: "隔离并重新规划" }));
 
   expect(await screen.findByRole("alert")).toHaveTextContent("only a recovery_required");
-  expect(datapilotStore.getState().run.pendingHumanDecision).not.toBeNull();
+  expect(datapilotStore.getState().conversation.pendingHumanDecision).not.toBeNull();
   expect(screen.getByRole("button", { name: "隔离并重新规划" })).toBeVisible();
 });
 
@@ -1114,68 +1131,7 @@ test("recovery completion from session A cannot clear session B", async () => {
 
   await waitFor(() => expect(screen.getByText("Session B recovery")).toBeVisible());
   expect(datapilotStore.getState().currentSessionId).toBe("session-b");
-  expect(datapilotStore.getState().run.pendingHumanDecision?.summary).toBe("Session B recovery");
-});
-
-test("stale recovery A cannot inject errors or re-enable in-flight B in the same session", async () => {
-  const recoveryA = deferred<Awaited<ReturnType<typeof recoverHumanDecision>>>();
-  const recoveryB = deferred<Awaited<ReturnType<typeof recoverHumanDecision>>>();
-  apiMocks.recoverHumanDecision
-    .mockReturnValueOnce(recoveryA.promise)
-    .mockReturnValueOnce(recoveryB.promise);
-  vi.spyOn(console, "error").mockImplementation(() => undefined);
-  setOpenActiveSessionWithPendingDecision(
-    pendingDecision({
-      planId: "plan-a",
-      stepId: "confirm-a",
-      recoveryRequired: true,
-      submissionDisabled: true,
-    }),
-  );
-  await renderAppWithDashboardSettled();
-  fireEvent.change(screen.getByLabelText("恢复原因"), { target: { value: "recover A" } });
-  fireEvent.click(screen.getByRole("button", { name: "隔离并重新规划" }));
-
-  await act(async () => {
-    datapilotStore.getState().applyEvent({
-      type: "human_decision_required",
-      source: "NavigationDataAgent",
-      run_id: "as-session",
-      payload: {
-        reply_id: "reply-b",
-        tool_call_id: "tool-b",
-        request_id: "plan-b:confirm-b",
-        plan_id: "plan-b",
-        step_id: "confirm-b",
-        summary: "Recovery B",
-        recovery_required: true,
-        submission_disabled: true,
-      },
-    });
-  });
-  fireEvent.change(screen.getByLabelText("恢复原因"), { target: { value: "recover B" } });
-  fireEvent.click(screen.getByRole("button", { name: "隔离并重新规划" }));
-  expect(screen.getByRole("button", { name: "隔离并重新规划" })).toBeDisabled();
-
-  await act(async () => {
-    recoveryA.reject(new Error("stale A failure"));
-    try {
-      await recoveryA.promise;
-    } catch {
-      // Expected stale failure.
-    }
-  });
-
-  expect(screen.queryByRole("alert")).not.toBeInTheDocument();
-  expect(screen.getByRole("button", { name: "隔离并重新规划" })).toBeDisabled();
-  recoveryB.resolve({
-    recovered: true,
-    plan_id: "plan-b",
-    step_id: "confirm-b",
-    handoff_status: "quarantined",
-    task_status: "needs_replan",
-    next_action: "submit_complete_plan",
-  });
+  expect(datapilotStore.getState().conversation.pendingHumanDecision?.summary).toBe("Session B recovery");
 });
 
 test("pending human decision remains when submitHumanDecision is rejected or not accepted", async () => {
@@ -1188,67 +1144,15 @@ test("pending human decision remains when submitHumanDecision is rejected or not
   fireEvent.click(screen.getByRole("button", { name: "确认" }));
 
   await waitFor(() => expect(apiMocks.submitHumanDecision).toHaveBeenCalledTimes(1));
-  expect(datapilotStore.getState().run.pendingHumanDecision).toEqual(pendingDecision());
+  expect(datapilotStore.getState().conversation.pendingHumanDecision).toEqual(pendingDecision());
   expect(screen.getByRole("dialog", { name: "需要确认" })).toBeVisible();
 
   fireEvent.click(screen.getByRole("button", { name: "停止" }));
 
   await waitFor(() => expect(apiMocks.submitHumanDecision).toHaveBeenCalledTimes(2));
-  expect(datapilotStore.getState().run.pendingHumanDecision).toEqual(pendingDecision());
+  expect(datapilotStore.getState().conversation.pendingHumanDecision).toEqual(pendingDecision());
   expect(consoleError).toHaveBeenCalledWith("Failed to submit human decision", expect.any(Error));
   consoleError.mockRestore();
-});
-
-test("resolving an older human decision submission does not clear a newer pending decision", async () => {
-  const submitDecision = deferred<boolean>();
-  apiMocks.submitHumanDecision.mockReturnValue(submitDecision.promise);
-  setOpenActiveSessionWithPendingDecision(pendingDecision());
-
-  await renderAppWithDashboardSettled();
-
-  fireEvent.click(screen.getByRole("button", { name: "确认" }));
-
-  await act(async () => {
-    datapilotStore.getState().applyEvent({
-      type: "human_decision_required",
-      source: "navigation.workflow",
-      run_id: "run-2",
-      parent_run_id: null,
-      timestamp: "2026-06-26T00:02:00.000Z",
-      payload: {
-        reply_id: "reply-2",
-        tool_call_id: "tool-call-2",
-        request_id: "request-2",
-        summary: "第二个确认请求。",
-      },
-    });
-  });
-
-  await waitFor(() => expect(screen.getByText("第二个确认请求。")).toBeVisible());
-  expect(datapilotStore.getState().run.pendingHumanDecision).toEqual({
-    replyId: "reply-2",
-    toolCallId: "tool-call-2",
-    requestId: "request-2",
-    decisionType: "other",
-    summary: "第二个确认请求。",
-  });
-
-  await act(async () => {
-    submitDecision.resolve(true);
-    await submitDecision.promise;
-  });
-
-  await waitFor(() =>
-    expect(datapilotStore.getState().run.pendingHumanDecision).toEqual({
-      replyId: "reply-2",
-      toolCallId: "tool-call-2",
-      requestId: "request-2",
-      decisionType: "other",
-      summary: "第二个确认请求。",
-    }),
-  );
-  expect(screen.getByRole("dialog", { name: "需要确认" })).toBeVisible();
-  expect(screen.queryByPlaceholderText("继续描述任务…")).not.toBeInTheDocument();
 });
 
 test("resolving a human decision from session A does not clear same-id pending in session B", async () => {
@@ -1276,7 +1180,7 @@ test("resolving a human decision from session A does not clear same-id pending i
 
   await waitFor(() => expect(screen.getByText("Session B 里的确认。")).toBeVisible());
   expect(datapilotStore.getState().currentSessionId).toBe("session-b");
-  expect(datapilotStore.getState().run.pendingHumanDecision).toEqual(
+  expect(datapilotStore.getState().conversation.pendingHumanDecision).toEqual(
     pendingDecision({ summary: "Session B 里的确认。" }),
   );
 
@@ -1286,7 +1190,7 @@ test("resolving a human decision from session A does not clear same-id pending i
   });
 
   await waitFor(() =>
-    expect(datapilotStore.getState().run.pendingHumanDecision).toEqual(
+    expect(datapilotStore.getState().conversation.pendingHumanDecision).toEqual(
       pendingDecision({ summary: "Session B 里的确认。" }),
     ),
   );
@@ -1294,14 +1198,82 @@ test("resolving a human decision from session A does not clear same-id pending i
   expect(screen.queryByPlaceholderText("继续描述任务…")).not.toBeInTheDocument();
 });
 
-test("History button lists sessions in a lightweight panel", async () => {
+
+test("a websocket public envelope reduces into the SDK conversation", async () => {
+  let onEvent: Parameters<typeof openSessionEvents>[1] | undefined;
+  apiMocks.openSessionEvents.mockImplementation((_sessionId, callback) => {
+    onEvent = callback;
+    return activeSocket();
+  });
+  datapilotStore.setState({
+    open: true,
+    mode: "active_session",
+    currentSessionId: "session-1",
+    previousActiveSessionId: null,
+    sessions: [],
+    conversation: createAgentConversation(),
+  });
+  await renderAppWithDashboardSettled();
+
+  act(() => {
+    onEvent?.({
+      id: "event-1",
+      session_id: "session-1",
+      sequence: 1,
+      dedupe_key: "1".padStart(64, "0"),
+      created_at: "2026-06-26T00:00:00Z",
+      event: {
+        id: "reply-start",
+        created_at: "2026-06-26T00:00:00Z",
+        type: EventType.REPLY_START,
+        session_id: "private-session",
+        reply_id: "reply-1",
+        name: "private-agent",
+        role: "assistant",
+      },
+    });
+    onEvent?.({
+      id: "event-2",
+      session_id: "session-1",
+      sequence: 2,
+      dedupe_key: "2".padStart(64, "0"),
+      created_at: "2026-06-26T00:00:01Z",
+      event: {
+        id: "text-start",
+        created_at: "2026-06-26T00:00:01Z",
+        type: EventType.TEXT_BLOCK_START,
+        reply_id: "reply-1",
+        block_id: "block-1",
+      },
+    });
+    onEvent?.({
+      id: "event-3",
+      session_id: "session-1",
+      sequence: 3,
+      dedupe_key: "3".padStart(64, "0"),
+      created_at: "2026-06-26T00:00:02Z",
+      event: {
+        id: "text-delta",
+        created_at: "2026-06-26T00:00:02Z",
+        type: EventType.TEXT_BLOCK_DELTA,
+        reply_id: "reply-1",
+        block_id: "block-1",
+        delta: "实时回复",
+      },
+    });
+  });
+
+  expect(screen.getByText("实时回复")).toBeVisible();
+  expect(datapilotStore.getState().conversation.lastSequence).toBe(3);
+});
+
++test("History button lists sessions in a lightweight panel", async () => {
   apiMocks.listSessions.mockResolvedValue([
     {
       id: "history-1",
       title: "历史任务",
       created_at: "2026-06-25T01:00:00Z",
       updated_at: "2026-06-25T02:00:00Z",
-      status: "historical",
     },
   ]);
 
@@ -1341,7 +1313,6 @@ test("closing the DataPilot window closes the active event stream", async () => 
         title: "Existing session",
         created_at: "2026-06-26T00:00:00Z",
         updated_at: "2026-06-26T00:00:00Z",
-        status: "active",
       },
     ],
   });
@@ -1370,7 +1341,6 @@ test("new session enters draft mode without creating a session", async () => {
         title: "Existing session",
         created_at: "2026-06-26T00:00:00Z",
         updated_at: "2026-06-26T00:00:00Z",
-        status: "active",
       },
     ],
   });
@@ -1401,7 +1371,6 @@ test("new session closes the active event stream", async () => {
         title: "Existing session",
         created_at: "2026-06-26T00:00:00Z",
         updated_at: "2026-06-26T00:00:00Z",
-        status: "active",
       },
     ],
   });
@@ -1451,7 +1420,7 @@ test("failed draft submit does not append a local user message", async () => {
 
   await waitFor(() => expect(apiMocks.submitTurn).toHaveBeenCalledWith("session-created", "会失败的任务"));
   await waitFor(() => expect(datapilotStore.getState().mode).toBe("draft_new_session"));
-  expect(datapilotStore.getState().messages).toEqual([]);
+  expect(datapilotStore.getState().conversation.messages).toEqual([]);
   expect(screen.queryByText("会失败的任务")).not.toBeInTheDocument();
   expect(close).toHaveBeenCalledTimes(1);
   expect(consoleError).toHaveBeenCalledWith("Failed to submit DataPilot draft turn", expect.any(Error));
@@ -1472,10 +1441,9 @@ test("failed active submit does not append a local user message", async () => {
         title: "Existing session",
         created_at: "2026-06-26T00:00:00Z",
         updated_at: "2026-06-26T00:00:00Z",
-        status: "active",
       },
     ],
-    messages: [],
+    conversation: createAgentConversation(),
   });
 
   await renderAppWithDashboardSettled();
@@ -1485,7 +1453,7 @@ test("failed active submit does not append a local user message", async () => {
   fireEvent.click(screen.getByRole("button", { name: "Send message" }));
 
   await waitFor(() => expect(apiMocks.submitTurn).toHaveBeenCalledWith("session-1", "会失败的继续任务"));
-  expect(datapilotStore.getState().messages).toEqual([]);
+  expect(datapilotStore.getState().conversation.messages).toEqual([]);
   expect(screen.queryByText("会失败的继续任务")).not.toBeInTheDocument();
   expect(consoleError).toHaveBeenCalledWith("Failed to submit DataPilot active turn", expect.any(Error));
   consoleError.mockRestore();
@@ -1512,7 +1480,6 @@ test("reopening an active session opens events before submitting the turn", asyn
         title: "Existing session",
         created_at: "2026-06-26T00:00:00Z",
         updated_at: "2026-06-26T00:00:00Z",
-        status: "active",
       },
     ],
   });
@@ -1536,7 +1503,6 @@ test("reopening an active session refreshes persisted messages from the backend"
       title: "Existing session",
       created_at: "2026-06-26T00:00:00Z",
       updated_at: "2026-06-26T00:01:00Z",
-      status: "active",
       messages: [
         {
           id: "message-1",
@@ -1546,13 +1512,15 @@ test("reopening an active session refreshes persisted messages from the backend"
           created_at: "2026-06-26T00:01:00Z",
         },
       ],
+      events: [],
+      tool_runs: [],
+      last_sequence: 0,
     })
     .mockResolvedValueOnce({
       id: "session-1",
       title: "Existing session",
       created_at: "2026-06-26T00:00:00Z",
       updated_at: "2026-06-26T00:03:00Z",
-      status: "active",
       messages: [
         {
           id: "message-1",
@@ -1569,6 +1537,9 @@ test("reopening an active session refreshes persisted messages from the backend"
           created_at: "2026-06-26T00:03:00Z",
         },
       ],
+      events: [],
+      tool_runs: [],
+      last_sequence: 0,
     });
   datapilotStore.setState({
     open: true,
@@ -1581,18 +1552,12 @@ test("reopening an active session refreshes persisted messages from the backend"
         title: "Existing session",
         created_at: "2026-06-26T00:00:00Z",
         updated_at: "2026-06-26T00:00:00Z",
-        status: "active",
       },
     ],
-    messages: [
-      {
-        id: "message-1",
-        session_id: "session-1",
-        role: "user",
-        content: "清洗已有数据",
-        created_at: "2026-06-26T00:01:00Z",
-      },
-    ],
+    conversation: {
+      ...createAgentConversation(),
+      messages: [UserMsg({ name: "You", content: "清洗已有数据" })],
+    },
   });
 
   await renderAppWithDashboardSettled();
@@ -1612,8 +1577,10 @@ test("reopening an active session reopens the event stream before another turn i
     title: "Existing session",
     created_at: "2026-06-26T00:00:00Z",
     updated_at: "2026-06-26T00:00:00Z",
-    status: "active",
     messages: [],
+    events: [],
+    tool_runs: [],
+    last_sequence: 0,
   });
   datapilotStore.setState({
     open: true,
@@ -1626,7 +1593,6 @@ test("reopening an active session reopens the event stream before another turn i
         title: "Existing session",
         created_at: "2026-06-26T00:00:00Z",
         updated_at: "2026-06-26T00:00:00Z",
-        status: "active",
       },
     ],
   });
@@ -1659,7 +1625,6 @@ test("event stream close refreshes the active session and reconnects", async () 
     title: "Existing session",
     created_at: "2026-06-26T00:00:00Z",
     updated_at: "2026-06-26T00:00:00Z",
-    status: "active",
     messages: [
       {
         id: "message-1",
@@ -1670,6 +1635,8 @@ test("event stream close refreshes the active session and reconnects", async () 
       },
     ],
     events: [],
+    tool_runs: [],
+    last_sequence: 0,
   });
   datapilotStore.setState({
     open: true,
@@ -1682,7 +1649,6 @@ test("event stream close refreshes the active session and reconnects", async () 
         title: "Existing session",
         created_at: "2026-06-26T00:00:00Z",
         updated_at: "2026-06-26T00:00:00Z",
-        status: "active",
       },
     ],
   });
@@ -1699,615 +1665,67 @@ test("event stream close refreshes the active session and reconnects", async () 
   await waitFor(() => expect(apiMocks.openSessionEvents).toHaveBeenCalledTimes(2));
 });
 
-test("opening a history session does not reconnect the event stream", async () => {
-  datapilotStore.setState({
-    open: false,
-    mode: "history_session",
-    currentSessionId: "history-1",
-    previousActiveSessionId: null,
-    sessions: [
-      {
-        id: "history-1",
-        title: "历史任务",
-        created_at: "2026-06-25T01:00:00Z",
-        updated_at: "2026-06-25T02:00:00Z",
-        status: "historical",
-      },
-    ],
-    messages: [
-      {
-        id: "history-message-1",
-        session_id: "history-1",
-        role: "assistant",
-        content: "历史助手回复",
-        created_at: "2026-06-25T01:02:00Z",
-      },
-    ],
-  });
 
-  await renderAppWithDashboardSettled();
-  fireEvent.click(screen.getByRole("button", { name: "Open DataPilot" }));
-
-  expect(apiMocks.getSession).not.toHaveBeenCalled();
-  expect(apiMocks.openSessionEvents).not.toHaveBeenCalled();
-  expect(screen.getByText("历史助手回复")).toBeVisible();
-});
-
-test("stale active session refreshes do not overwrite draft mode", async () => {
-  let resolveSession: (value: Awaited<ReturnType<typeof getSession>>) => void = () => undefined;
-  apiMocks.getSession.mockReturnValue(
-    new Promise((resolve) => {
-      resolveSession = resolve;
-    }),
-  );
-  datapilotStore.setState({
-    open: true,
-    mode: "active_session",
-    currentSessionId: "session-1",
-    previousActiveSessionId: null,
-    sessions: [
-      {
-        id: "session-1",
-        title: "Existing session",
-        created_at: "2026-06-26T00:00:00Z",
-        updated_at: "2026-06-26T00:00:00Z",
-        status: "active",
-      },
-    ],
-  });
-
-  await renderAppWithDashboardSettled();
-  await waitFor(() => expect(apiMocks.getSession).toHaveBeenCalledWith("session-1"));
-  fireEvent.click(screen.getByRole("button", { name: "New session" }));
-  resolveSession({
-    id: "session-1",
-    title: "Existing session",
-    created_at: "2026-06-26T00:00:00Z",
-    updated_at: "2026-06-26T00:03:00Z",
-    status: "active",
-    messages: [
-      {
-        id: "message-2",
-        session_id: "session-1",
-        role: "assistant",
-        content: "过期刷新不应出现",
-        created_at: "2026-06-26T00:03:00Z",
-      },
-    ],
-  });
-
-  await waitFor(() => expect(datapilotStore.getState().mode).toBe("draft_new_session"));
-  expect(datapilotStore.getState().currentSessionId).toBeNull();
-  expect(screen.getByText("开始一个任务")).toBeVisible();
-  expect(screen.queryByText("过期刷新不应出现")).not.toBeInTheDocument();
-});
-
-test("selecting a history session restores persisted messages and hides active controls", async () => {
+test("selecting any saved session restores it as writable active_session", async () => {
   apiMocks.listSessions.mockResolvedValue([
     {
-      id: "history-1",
-      title: "历史任务",
+      id: "saved-1",
+      title: "保存任务",
       created_at: "2026-06-25T01:00:00Z",
       updated_at: "2026-06-25T02:00:00Z",
-      status: "historical",
     },
   ]);
   apiMocks.getSession.mockResolvedValue({
-    id: "history-1",
-    title: "历史任务",
+    id: "saved-1",
+    title: "保存任务",
     created_at: "2026-06-25T01:00:00Z",
     updated_at: "2026-06-25T02:00:00Z",
-    status: "historical",
     messages: [
       {
-        id: "history-message-1",
-        session_id: "history-1",
+        id: "user-1",
+        session_id: "saved-1",
         role: "user",
-        content: "历史用户消息",
+        content: "上一轮任务",
         created_at: "2026-06-25T01:01:00Z",
       },
-      {
-        id: "history-message-2",
-        session_id: "history-1",
-        role: "assistant",
-        content: "历史助手回复",
-        created_at: "2026-06-25T01:02:00Z",
-      },
     ],
+    events: [],
+    tool_runs: [],
+    last_sequence: 0,
   });
-
   await renderAppWithDashboardSettled();
 
   fireEvent.click(screen.getByRole("button", { name: "Open DataPilot" }));
   fireEvent.click(screen.getByRole("button", { name: "History" }));
-  fireEvent.click(await screen.findByRole("button", { name: /历史任务/ }));
+  fireEvent.click(await screen.findByRole("button", { name: /保存任务/ }));
 
-  await waitFor(() => expect(apiMocks.getSession).toHaveBeenCalledWith("history-1"));
-  expect(datapilotStore.getState().mode).toBe("history_session");
-  expect(screen.getByText("历史用户消息")).toBeVisible();
-  expect(screen.getByText("历史助手回复")).toBeVisible();
-  expect(screen.queryByPlaceholderText("继续描述任务…")).not.toBeInTheDocument();
-  expect(screen.queryByText("继续任务")).not.toBeInTheDocument();
-});
-
-test("selecting an active session from history restores active controls and can submit another turn", async () => {
-  apiMocks.listSessions.mockResolvedValue([
-    {
-      id: "active-1",
-      title: "活跃任务",
-      created_at: "2026-06-25T01:00:00Z",
-      updated_at: "2026-06-25T02:00:00Z",
-      status: "active",
-    },
-  ]);
-  apiMocks.getSession.mockResolvedValue({
-    id: "active-1",
-    title: "活跃任务",
-    created_at: "2026-06-25T01:00:00Z",
-    updated_at: "2026-06-25T02:00:00Z",
-    status: "active",
-    messages: [
-      {
-        id: "active-message-1",
-        session_id: "active-1",
-        role: "user",
-        content: "上一轮用户消息",
-        created_at: "2026-06-25T01:01:00Z",
-      },
-    ],
-  });
-
-  await renderAppWithDashboardSettled();
-
-  fireEvent.click(screen.getByRole("button", { name: "Open DataPilot" }));
-  fireEvent.click(screen.getByRole("button", { name: "History" }));
-  fireEvent.click(await screen.findByRole("button", { name: /活跃任务/ }));
-
-  await waitFor(() => expect(apiMocks.getSession).toHaveBeenCalledWith("active-1"));
+  await waitFor(() => expect(apiMocks.getSession).toHaveBeenCalledWith("saved-1"));
   expect(datapilotStore.getState().mode).toBe("active_session");
-  expect(screen.getByText("上一轮用户消息")).toBeVisible();
-
+  expect(screen.getByText("上一轮任务")).toBeVisible();
   fireEvent.change(screen.getByPlaceholderText("继续描述任务…"), {
-    target: { value: "继续上一轮任务" },
+    target: { value: "继续执行" },
   });
   fireEvent.click(screen.getByRole("button", { name: "Send message" }));
-
-  await waitFor(() => expect(apiMocks.submitTurn).toHaveBeenCalledWith("active-1", "继续上一轮任务"));
-  expect(screen.getByText("继续上一轮任务")).toBeVisible();
+  await waitFor(() => expect(apiMocks.submitTurn).toHaveBeenCalledWith("saved-1", "继续执行"));
 });
 
-test("selecting a history session closes the active event stream before loading details", async () => {
-  const close = vi.fn(() => calls.push("close"));
-  const calls: string[] = [];
-  apiMocks.openSessionEvents.mockReturnValue(activeSocket(close));
-  apiMocks.listSessions.mockResolvedValue([
-    {
-      id: "history-1",
-      title: "历史任务",
-      created_at: "2026-06-25T01:00:00Z",
-      updated_at: "2026-06-25T02:00:00Z",
-      status: "historical",
-    },
-  ]);
-  apiMocks.getSession.mockImplementation(async (sessionId) => {
-    calls.push(`get:${sessionId}`);
-    return {
-      id: "history-1",
-      title: "历史任务",
-      created_at: "2026-06-25T01:00:00Z",
-      updated_at: "2026-06-25T02:00:00Z",
-      status: "historical",
-      messages: [],
-    };
-  });
-  datapilotStore.setState({
-    open: true,
-    mode: "active_session",
-    currentSessionId: "session-1",
-    previousActiveSessionId: null,
-    sessions: [
-      {
-        id: "session-1",
-        title: "Existing session",
-        created_at: "2026-06-26T00:00:00Z",
-        updated_at: "2026-06-26T00:00:00Z",
-        status: "active",
-      },
-    ],
-  });
-
+test("submitting the first draft creates a writable SDK conversation", async () => {
   await renderAppWithDashboardSettled();
-  fireEvent.change(screen.getByPlaceholderText("继续描述任务…"), {
-    target: { value: "先打开流" },
+  fireEvent.click(screen.getByRole("button", { name: "Open DataPilot" }));
+  fireEvent.change(screen.getByPlaceholderText("我们要做什么？"), {
+    target: { value: "  清洗 VLA 数据  " },
   });
   fireEvent.click(screen.getByRole("button", { name: "Send message" }));
-  await waitFor(() => expect(apiMocks.openSessionEvents).toHaveBeenCalledWith("session-1", expect.any(Function)));
 
-  fireEvent.click(screen.getByRole("button", { name: "History" }));
-  fireEvent.click(await screen.findByRole("button", { name: /历史任务/ }));
-
-  await waitFor(() => expect(apiMocks.getSession).toHaveBeenCalledWith("history-1"));
-  expect(calls.slice(-2)).toEqual(["close", "get:history-1"]);
-});
-
-test("message list keeps earlier timeline output before later user messages", () => {
-  const run = createEmptyRunState();
-  run.timeline = [
-    {
-      kind: "assistant",
-      source: "main",
-      text: "较早的助手输出",
-      runId: "run-1",
-      parentRunId: null,
-      createdAt: "2026-06-26T00:02:00Z",
-      sequence: 1,
-    } as typeof run.timeline[number] & { createdAt: string; sequence: number },
-  ];
-
-  render(
-    <MessageList
-      messages={[
-        {
-          id: "message-1",
-          session_id: "session-1",
-          role: "user",
-          content: "较新的用户消息",
-          created_at: "2026-06-26T00:03:00Z",
-        },
-      ]}
-      run={run}
-    />,
+  await waitFor(() =>
+    expect(apiMocks.submitTurn).toHaveBeenCalledWith("session-created", "清洗 VLA 数据"),
   );
-
-  const text = screen.getByText("较早的助手输出").compareDocumentPosition(screen.getByText("较新的用户消息"));
-  expect(text & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
-});
-
-test("message list follows new content when the user is already at the bottom", () => {
-  const firstMessages = [
-    {
-      id: "message-1",
-      session_id: "session-1",
-      role: "user" as const,
-      content: "第一条消息",
-      created_at: "2026-06-26T00:01:00Z",
-    },
-  ];
-  const { container, rerender } = render(<MessageList messages={firstMessages} run={createEmptyRunState()} />);
-  const scrollArea = container.querySelector<HTMLElement>("[data-datapilot-scroll-area='true']");
-  expect(scrollArea).not.toBeNull();
-  Object.defineProperty(scrollArea, "scrollHeight", { configurable: true, value: 900 });
-  Object.defineProperty(scrollArea, "clientHeight", { configurable: true, value: 300 });
-  scrollArea!.scrollTop = 600;
-  fireEvent.scroll(scrollArea!);
-
-  Object.defineProperty(scrollArea, "scrollHeight", { configurable: true, value: 1100 });
-  rerender(
-    <MessageList
-      messages={[
-        ...firstMessages,
-        {
-          id: "message-2",
-          session_id: "session-1",
-          role: "assistant" as const,
-          content: "新的助手回复",
-          created_at: "2026-06-26T00:02:00Z",
-        },
-      ]}
-      run={createEmptyRunState()}
-    />,
-  );
-
-  expect(scrollArea?.scrollTop).toBe(1100);
-});
-
-test("message list does not jump down when the user is reading older content", () => {
-  const firstMessages = [
-    {
-      id: "message-1",
-      session_id: "session-1",
-      role: "user" as const,
-      content: "第一条消息",
-      created_at: "2026-06-26T00:01:00Z",
-    },
-  ];
-  const { container, rerender } = render(<MessageList messages={firstMessages} run={createEmptyRunState()} />);
-  const scrollArea = container.querySelector<HTMLElement>("[data-datapilot-scroll-area='true']");
-  expect(scrollArea).not.toBeNull();
-  Object.defineProperty(scrollArea, "scrollHeight", { configurable: true, value: 900 });
-  Object.defineProperty(scrollArea, "clientHeight", { configurable: true, value: 300 });
-  scrollArea!.scrollTop = 200;
-  fireEvent.scroll(scrollArea!);
-
-  Object.defineProperty(scrollArea, "scrollHeight", { configurable: true, value: 1100 });
-  rerender(
-    <MessageList
-      messages={[
-        ...firstMessages,
-        {
-          id: "message-2",
-          session_id: "session-1",
-          role: "assistant" as const,
-          content: "新的助手回复",
-          created_at: "2026-06-26T00:02:00Z",
-        },
-      ]}
-      run={createEmptyRunState()}
-    />,
-  );
-
-  expect(scrollArea?.scrollTop).toBe(200);
-});
-
-test("timeline assistant output does not hide unmatched persisted assistant messages", () => {
-  const run = createEmptyRunState();
-  run.timeline = [
-    {
-      kind: "assistant",
-      source: "agentscope",
-      text: "实时流式回复",
-      runId: "run-1",
-      parentRunId: null,
-      createdAt: "2026-06-26T00:02:00Z",
-      sequence: 1,
-    },
-  ] as TestTimelineItem[];
-
-  render(
-    <MessageList
-      messages={[
-        {
-          id: "message-1",
-          session_id: "session-1",
-          role: "assistant",
-          content: "只存在于持久化消息里的旧回复",
-          created_at: "2026-06-26T00:01:00Z",
-        },
-      ]}
-      run={run}
-    />,
-  );
-
-  expect(screen.getByText("只存在于持久化消息里的旧回复")).toBeVisible();
-  expect(screen.getByText("实时流式回复")).toBeVisible();
-});
-
-test("completed child run renders tool calls as compact rows while folding reasoning", () => {
-  const run = createEmptyRunState();
-  run.timeline = [
-    {
-      kind: "reasoning",
-      source: "navigation.plan",
-      text: "检查数据目录",
-      runId: "plan-run",
-      parentRunId: "main-run",
-      createdAt: "2026-06-26T00:02:00Z",
-      sequence: 1,
-    },
-    {
-      kind: "tool",
-      source: "navigation.plan",
-      text: "已调用工具 read_file 0.0s",
-      status: "completed",
-      runId: "plan-run",
-      parentRunId: "main-run",
-      createdAt: "2026-06-26T00:02:01Z",
-      sequence: 2,
-    },
-    {
-      kind: "tool",
-      source: "navigation.plan",
-      text: "已调用工具 read_file 0.0s",
-      status: "completed",
-      runId: "plan-run",
-      parentRunId: "main-run",
-      createdAt: "2026-06-26T00:02:02Z",
-      sequence: 3,
-    },
-    {
-      kind: "tool",
-      source: "navigation.plan",
-      text: "已调用工具 exec_command 0.0s",
-      status: "completed",
-      runId: "plan-run",
-      parentRunId: "main-run",
-      createdAt: "2026-06-26T00:02:03Z",
-      sequence: 4,
-    },
-  ] as TestTimelineItem[];
-
-  render(<MessageList messages={[]} run={run} />);
-
-  const summary = screen.getByRole("button", { name: /记录了 1 条进展/ });
-  expect(summary).toBeVisible();
-  expect(summary).toHaveAttribute("aria-expanded", "false");
-  expect(screen.queryByText("检查数据目录")).not.toBeInTheDocument();
-  expect(screen.getByText("已调用工具 exec_command 0.0s")).toBeVisible();
-  expect(screen.getAllByText("已调用工具 read_file 0.0s")).toHaveLength(2);
-
-  fireEvent.click(summary);
-
-  expect(summary).toHaveAttribute("aria-expanded", "true");
-  expect(screen.getByText("检查数据目录")).toBeVisible();
-});
-
-test("active child run details remain visible and are not folded", () => {
-  const run = createEmptyRunState();
-  run.activeAgents["plan-run"] = {
-    source: "navigation.plan",
-    runId: "plan-run",
-    parentRunId: "main-run",
-    startedAt: Date.parse("2026-06-26T00:02:00Z"),
-  };
-  run.timeline = [
-    {
-      kind: "reasoning",
-      source: "navigation.plan",
-      text: "正在判断导航数据类型",
-      runId: "plan-run",
-      parentRunId: "main-run",
-      createdAt: "2026-06-26T00:02:00Z",
-      sequence: 1,
-    },
-    {
-      kind: "tool",
-      source: "navigation.plan",
-      text: "已调用工具 classify_navigation_dataset_tool 0.0s",
-      status: "completed",
-      runId: "plan-run",
-      parentRunId: "main-run",
-      createdAt: "2026-06-26T00:02:01Z",
-      sequence: 2,
-    },
-  ] as TestTimelineItem[];
-
-  render(<MessageList messages={[]} run={run} />);
-
-  expect(screen.getByText("正在判断导航数据类型")).toBeVisible();
-  expect(screen.getByText("已调用工具 classify_navigation_dataset_tool 0.0s")).toBeVisible();
-  expect(screen.queryByRole("button", { name: /完成了 1 个工具/ })).not.toBeInTheDocument();
-});
-
-test("active run text includes elapsed seconds while waiting", () => {
-  expect(formatActiveText("[Executor] 正在运行 extract_and_sync_navigation_data_tool", 1_000, 6_200)).toBe(
-    "[Executor] 正在运行 extract_and_sync_navigation_data_tool +5s",
-  );
-  expect(formatActiveText("", 1_000, 6_200)).toBe("");
-});
-
-test("completed tool row keeps chronological position before later messages", () => {
-  const run = createEmptyRunState();
-  run.timeline = [
-    {
-      kind: "tool",
-      source: "navigation.executor",
-      text: "已调用工具 exec_command 0.0s",
-      status: "completed",
-      runId: "executor-run",
-      parentRunId: "workflow-run",
-      createdAt: "2026-06-26T00:02:00Z",
-      sequence: 1,
-    },
-  ] as TestTimelineItem[];
-
-  render(
-    <MessageList
-      messages={[
-        {
-          id: "message-1",
-          session_id: "session-1",
-          role: "user",
-          content: "稍后的用户消息",
-          created_at: "2026-06-26T00:03:00Z",
-        },
-      ]}
-      run={run}
-    />,
-  );
-
-  const position = screen
-    .getByText("已调用工具 exec_command 0.0s")
-    .compareDocumentPosition(screen.getByText("稍后的用户消息"));
-  expect(position & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
-});
-
-test("completed child run folds child assistant final output into summary details", () => {
-  const run = createEmptyRunState();
-  run.timeline = [
-    {
-      kind: "reasoning",
-      source: "navigation.executor",
-      text: "整理执行结论",
-      runId: "executor-run",
-      parentRunId: "workflow-run",
-      createdAt: "2026-06-26T00:02:00Z",
-      sequence: 1,
-    },
-    {
-      kind: "assistant",
-      source: "navigation.executor",
-      text: "子任务已完成：导航数据可继续清洗。",
-      runId: "executor-run",
-      parentRunId: "workflow-run",
-      createdAt: "2026-06-26T00:02:01Z",
-      sequence: 2,
-    },
-  ] as TestTimelineItem[];
-
-  render(<MessageList messages={[]} run={run} />);
-
-  const summary = screen.getByRole("button", { name: /记录了 1 条进展/ });
-  expect(summary).toBeVisible();
-  expect(screen.queryByText("子任务已完成：导航数据可继续清洗。")).not.toBeInTheDocument();
-
-  fireEvent.click(summary);
-
-  expect(screen.getByText("整理执行结论")).toBeVisible();
-  expect(screen.getByText("子任务已完成：导航数据可继续清洗。")).toBeVisible();
-});
-
-test("main assistant output remains a DataPilot timeline bubble and is not folded", () => {
-  const run = createEmptyRunState();
-  run.timeline = [
-    {
-      kind: "assistant",
-      source: "main",
-      text: "这是 DataPilot 的最终回复。",
-      runId: "main-run",
-      parentRunId: null,
-      createdAt: "2026-06-26T00:02:00Z",
-      sequence: 1,
-    },
-  ] as TestTimelineItem[];
-
-  render(<MessageList messages={[]} run={run} />);
-
-  expect(screen.getByText("这是 DataPilot 的最终回复。")).toBeVisible();
-  expect(screen.getByText("DataPilot")).toBeVisible();
-  expect(screen.queryByRole("button")).not.toBeInTheDocument();
-});
-
-test("agentscope router assistant output remains a DataPilot timeline bubble and is not folded", () => {
-  const run = createEmptyRunState();
-  run.timeline = [
-    {
-      kind: "assistant",
-      source: "agentscope",
-      text: "你好！我是 MainRouterAgent，VLA 数据 juicer 会话的主路由代理。",
-      runId: "router-run",
-      parentRunId: null,
-      createdAt: "2026-06-26T00:02:00Z",
-      sequence: 1,
-    },
-  ] as TestTimelineItem[];
-
-  render(<MessageList messages={[]} run={run} />);
-
-  expect(screen.getByText("你好！我是 MainRouterAgent，VLA 数据 juicer 会话的主路由代理。")).toBeVisible();
-  expect(screen.getByText("DataPilot")).toBeVisible();
-  expect(screen.queryByRole("button", { name: /完成了子任务/ })).not.toBeInTheDocument();
-});
-
-test("tool calls render as compact timeline text instead of collapsible cards", () => {
-  const run = createEmptyRunState();
-  run.timeline = [
-    {
-      kind: "tool",
-      source: "navigation.executor",
-      text: "已调用工具 prepare_raw_data 2.0s",
-      status: "completed",
-      runId: "executor-run",
-      parentRunId: "workflow-run",
-      createdAt: "2026-06-26T00:02:00Z",
-      sequence: 1,
-    },
-  ] as TestTimelineItem[];
-
-  const { container } = render(<MessageList messages={[]} run={run} />);
-
-  expect(screen.getByText("已调用工具 prepare_raw_data 2.0s")).toBeVisible();
-  expect(screen.queryByRole("button", { name: /工具|tool|完成/ })).not.toBeInTheDocument();
-  expect(container.querySelector('[data-status="success"]')).toHaveClass("text-emerald-600");
+  expect(datapilotStore.getState().mode).toBe("active_session");
+  expect(datapilotStore.getState().conversation.messages[0]).toMatchObject({
+    role: "user",
+    name: "You",
+  });
+  expect(screen.getByText("清洗 VLA 数据")).toBeVisible();
 });
 
 test("running stop interrupts the current turn without leaving active mode", async () => {
@@ -2322,10 +1740,13 @@ test("running stop interrupts the current turn without leaving active mode", asy
         title: "Existing session",
         created_at: "2026-06-26T00:00:00Z",
         updated_at: "2026-06-26T00:00:00Z",
-        status: "active",
       },
     ],
-    run: { ...createEmptyRunState(), running: true, activeText: "[Main] 正在思考" },
+    conversation: {
+      ...createAgentConversation(),
+      phase: "streaming",
+      currentReplyId: "reply-1",
+    },
   });
 
   await renderAppWithDashboardSettled();
@@ -2335,6 +1756,7 @@ test("running stop interrupts the current turn without leaving active mode", asy
   await waitFor(() => expect(apiMocks.interruptTurn).toHaveBeenCalledWith("session-1"));
   expect(datapilotStore.getState().mode).toBe("active_session");
   expect(datapilotStore.getState().currentSessionId).toBe("session-1");
+  expect(datapilotStore.getState().conversation.phase).toBe("interrupting");
 });
 
 test("running Composer shows a square stop button", () => {

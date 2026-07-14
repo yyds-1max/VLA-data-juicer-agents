@@ -14,13 +14,15 @@ import {
   submitHumanDecision,
   submitTurn,
 } from "./client";
+import { EventType } from "@agentscope-ai/agentscope/event";
+
 import type {
-  AgentEvent,
   HumanDecisionPayload,
   HumanDecisionRecoveryRequest,
   HumanDecisionRecoveryResponse,
   NavigationDatasetSummary,
   NavigationSyncImageListing,
+  PublicEventEnvelope,
   SessionDetail,
   SessionRecord,
 } from "./types";
@@ -29,7 +31,6 @@ function session(overrides: Partial<SessionRecord> = {}): SessionRecord {
   return {
     id: "session-1",
     title: "Active",
-    status: "active",
     created_at: "2026-06-26T00:00:00Z",
     updated_at: "2026-06-26T00:00:00Z",
     ...overrides,
@@ -40,6 +41,9 @@ function detail(overrides: Partial<SessionDetail> = {}): SessionDetail {
   return {
     ...session(),
     messages: [],
+    events: [],
+    tool_runs: [],
+    last_sequence: 0,
     ...overrides,
   };
 }
@@ -206,7 +210,20 @@ describe("api client", () => {
       string,
       (message: MessageEvent<string>) => void,
     ];
-    const event: AgentEvent = { type: "token", payload: { text: "hello" } };
+    const event: PublicEventEnvelope = {
+      id: "event-1",
+      session_id: "session/with space",
+      sequence: 1,
+      dedupe_key: "1".padStart(64, "0"),
+      event: {
+        id: "custom-1",
+        created_at: "2026-06-26T00:00:00Z",
+        type: EventType.CUSTOM,
+        name: "datapilot_progress",
+        value: {},
+      },
+      created_at: "2026-06-26T00:00:00Z",
+    };
     onMessage(new MessageEvent("message", { data: JSON.stringify(event) }));
 
     expect(onEvent).toHaveBeenCalledWith(event);

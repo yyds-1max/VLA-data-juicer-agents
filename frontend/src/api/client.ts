@@ -1,11 +1,11 @@
 import type {
-  AgentEvent,
   HumanDecisionPayload,
   HumanDecisionRecoveryRequest,
   HumanDecisionRecoveryResponse,
   NavigationDatasetSummary,
   NavigationDateSummary,
   NavigationSyncImageListing,
+  PublicEventEnvelope,
   SessionDetail,
   SessionRecord,
 } from "./types";
@@ -110,12 +110,15 @@ export async function recoverHumanDecision(
   );
 }
 
-export function openSessionEvents(sessionId: string, onEvent: (event: AgentEvent) => void): WebSocket {
+export function openSessionEvents(
+  sessionId: string,
+  onEvent: (event: PublicEventEnvelope) => void,
+): WebSocket {
   const protocol = window.location.protocol === "https:" ? "wss:" : "ws:";
   const socket = new WebSocket(`${protocol}//${window.location.host}${sessionPath(sessionId)}/events`);
   socket.addEventListener("message", (message) => {
     try {
-      onEvent(JSON.parse(message.data) as AgentEvent);
+      onEvent(JSON.parse(message.data) as PublicEventEnvelope);
     } catch (error) {
       console.error("Failed to parse DataPilot event", error);
     }
