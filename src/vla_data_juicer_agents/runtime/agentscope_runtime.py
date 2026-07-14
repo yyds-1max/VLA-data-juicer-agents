@@ -91,6 +91,7 @@ class AgentScopeRuntime:
     web_event_publisher: Any | None = None
     _active_human_decision_claims: set[str] = field(default_factory=set)
     _run_cancellations: dict[str, CancellationContext] = field(default_factory=dict)
+    _tool_outcome_locks: dict[str, asyncio.Lock] = field(default_factory=dict)
     recovery_metrics: AgentScopeRecoveryMetrics = field(default_factory=AgentScopeRecoveryMetrics)
     bootstrapped: bool = False
 
@@ -183,32 +184,40 @@ class AgentScopeRuntime:
         public_session_id = self._public_session_id(agentscope_session_id)
         if public_session_id is None:
             return None
-        tool_run = self.web_session_store.finish_tool_run(
-            public_session_id,
-            tool_call_id,
-            status=status,
-            summary=summary,
-            error_type=error_type,
-        )
-        if tool_run is None:
-            return None
-        event = CustomEvent(
-            name="datapilot_tool_terminal",
-            value={
-                "tool_call_id": tool_call_id,
-                "status": status,
-                "summary": summary,
-                "error_type": error_type,
-            },
-        ).model_dump(mode="json")
-        identity = f"tool-terminal:{agentscope_session_id}:{tool_call_id}:{status}"
-        record = self.web_session_store.append_public_event(
-            public_session_id,
-            hashlib.sha256(identity.encode("utf-8")).hexdigest(),
-            event,
-        )
+        async with self._tool_outcome_lock(public_session_id):
+            tool_run = self.web_session_store.finish_tool_run(
+                public_session_id,
+                tool_call_id,
+                status=status,
+                summary=summary,
+                error_type=error_type,
+            )
+            if tool_run is None:
+                return None
+            event = CustomEvent(
+                name="datapilot_tool_terminal",
+                value={
+                    "tool_call_id": tool_call_id,
+                    "status": status,
+                    "summary": summary,
+                    "error_type": error_type,
+                },
+            ).model_dump(mode="json")
+            identity = f"tool-terminal:{agentscope_session_id}:{tool_call_id}:{status}"
+            record = self.web_session_store.append_public_event(
+                public_session_id,
+                hashlib.sha256(identity.encode("utf-8")).hexdigest(),
+                event,
+            )
         await self._publish_public_record(public_session_id, record)
         return tool_run
+
+    def _tool_outcome_lock(self, public_session_id: str) -> asyncio.Lock:
+        lock = self._tool_outcome_locks.get(public_session_id)
+        if lock is None:
+            lock = asyncio.Lock()
+            self._tool_outcome_locks[public_session_id] = lock
+        return lock
 
     def _public_session_id(self, agentscope_session_id: str) -> str | None:
         if self.web_session_store is None:
@@ -450,77 +459,83 @@ class AgentScopeRuntime:
         if not mappings and self.web_session_store is None:
             return InterruptResponse(interrupted=False)
 
-        interrupted = bool(mappings)
-        for _agent_id, agentscope_session_id in mappings:
-            cancellation = self.run_cancellation(agentscope_session_id)
-            if cancellation is not None:
-                interrupted = cancellation.cancel() or interrupted
+        records = []
+        async with self._tool_outcome_lock(web_session_id):
+            interrupted = bool(mappings)
+            for _agent_id, agentscope_session_id in mappings:
+                cancellation = self.run_cancellation(agentscope_session_id)
+                if cancellation is not None:
+                    interrupted = cancellation.cancel() or interrupted
 
-        failures: list[Exception] = []
-        chat_service = self.app.state.chat_service
-        for agent_id, agentscope_session_id in mappings:
-            try:
-                await chat_service.interrupt(
-                    self.config.user_id,
-                    agentscope_session_id,
-                    agent_id,
-                )
-            except LookupError:
-                # Historical mappings can outlive an AgentScope session. The
-                # target is already absent, so interruption is idempotently done.
-                continue
-            except Exception as exc:  # pylint: disable=broad-except
-                failures.append(exc)
-
-        cancelled_task_ids: set[str] = set()
-        for _agent_id, agentscope_session_id in mappings:
-            try:
-                tasks = await self.message_bus.registry_getall(
-                    MessageBusKeys.bg_tasks(agentscope_session_id),
-                )
-            except Exception as exc:  # pylint: disable=broad-except
-                failures.append(exc)
-                continue
-            for task_id in tasks:
-                if task_id in cancelled_task_ids:
-                    continue
-                cancelled_task_ids.add(task_id)
+            failures: list[Exception] = []
+            chat_service = self.app.state.chat_service
+            for agent_id, agentscope_session_id in mappings:
                 try:
-                    await self.message_bus.publish(
-                        MessageBusKeys.task_cancel_channel(),
-                        {"task_id": task_id},
+                    await chat_service.interrupt(
+                        self.config.user_id,
+                        agentscope_session_id,
+                        agent_id,
                     )
+                except LookupError:
+                    # Historical mappings can outlive an AgentScope session.
+                    continue
                 except Exception as exc:  # pylint: disable=broad-except
                     failures.append(exc)
 
-        if failures:
-            raise RuntimeError("explicit stop cancellation failed") from failures[0]
+            cancelled_task_ids: set[str] = set()
+            for _agent_id, agentscope_session_id in mappings:
+                try:
+                    tasks = await self.message_bus.registry_getall(
+                        MessageBusKeys.bg_tasks(agentscope_session_id),
+                    )
+                except Exception as exc:  # pylint: disable=broad-except
+                    failures.append(exc)
+                    continue
+                for task_id in tasks:
+                    if task_id in cancelled_task_ids:
+                        continue
+                    cancelled_task_ids.add(task_id)
+                    try:
+                        await self.message_bus.publish(
+                            MessageBusKeys.task_cancel_channel(),
+                            {"task_id": task_id},
+                        )
+                    except Exception as exc:  # pylint: disable=broad-except
+                        failures.append(exc)
 
-        if self.web_session_store is None:
-            return InterruptResponse(interrupted=interrupted)
-        stopped = self.web_session_store.stop_open_tool_runs(web_session_id)
-        for row in stopped:
-            event = CustomEvent(
-                name="datapilot_tool_terminal",
-                value={
-                    "tool_call_id": row.tool_call_id,
-                    "status": "stopped",
-                    "summary": "已由用户停止",
-                },
-            ).model_dump(mode="json")
-            event = sanitize_agent_event(
-                event,
-                private_identities=self.projection_private_identities(),
+            if failures:
+                raise RuntimeError("explicit stop cancellation failed") from failures[0]
+
+            if self.web_session_store is None:
+                return InterruptResponse(interrupted=interrupted)
+            private_identities = self.projection_private_identities()
+
+            def terminal_event(row: Any) -> tuple[str, dict[str, Any]]:
+                event = CustomEvent(
+                    name="datapilot_tool_terminal",
+                    value={
+                        "tool_call_id": row.tool_call_id,
+                        "status": "stopped",
+                        "summary": "已由用户停止",
+                    },
+                ).model_dump(mode="json")
+                event = sanitize_agent_event(
+                    event,
+                    private_identities=private_identities,
+                )
+                identity = (
+                    f"explicit-stop-tool-terminal:{web_session_id}:"
+                    f"{row.tool_call_id}:stopped"
+                )
+                return hashlib.sha256(identity.encode("utf-8")).hexdigest(), event
+
+            stopped, records = (
+                self.web_session_store.stop_open_tool_runs_with_terminal_events(
+                    web_session_id,
+                    terminal_event,
+                )
             )
-            identity = (
-                f"explicit-stop-tool-terminal:{web_session_id}:"
-                f"{row.tool_call_id}:stopped"
-            )
-            record = self.web_session_store.append_public_event(
-                web_session_id,
-                hashlib.sha256(identity.encode("utf-8")).hexdigest(),
-                event,
-            )
+        for record in records:
             await self._publish_public_record(web_session_id, record)
         return InterruptResponse(
             interrupted=interrupted or bool(stopped),

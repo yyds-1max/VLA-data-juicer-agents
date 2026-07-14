@@ -193,7 +193,8 @@ def create_app(
             result = await _maybe_await(manager.interrupt(session_id))
         except KeyError as exc:
             raise HTTPException(status_code=404, detail="Session not found") from exc
-        except RuntimeError as exc:
+        except Exception as exc:  # pylint: disable=broad-except
+            logger.exception("DataPilot session stop failed")
             raise HTTPException(
                 status_code=503,
                 detail="Session stop failed; retry the request",

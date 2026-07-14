@@ -1823,10 +1823,10 @@ async def test_runtime_interrupt_durable_stop_failure_does_not_publish_stopped(
     published = []
     runtime.set_web_transport(store, lambda *_args: published.append(_args))
 
-    def fail_stop(_session_id: str):
+    def fail_stop(_session_id: str, _terminal_event_factory):
         raise sqlite3.OperationalError("disk full")
 
-    store.stop_open_tool_runs = fail_stop
+    store.stop_open_tool_runs_with_terminal_events = fail_stop
 
     with pytest.raises(sqlite3.OperationalError, match="disk full"):
         await runtime.interrupt_web_session(web_session_id=public_session.id)
@@ -1876,6 +1876,389 @@ async def test_runtime_interrupt_live_publish_failure_keeps_durable_stopped(
     assert detail.tool_runs[0].status == "stopped"
     assert [record.event["value"]["status"] for record in detail.events] == ["stopped"]
     assert "Live public event publish failed" in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_explicit_stop_serializes_real_middleware_cancellation_as_stopped(
+    tmp_path: Path,
+) -> None:
+    remote_entered = asyncio.Event()
+    release_remote = asyncio.Event()
+
+    class BlockingChatService(FakeChatService):
+        async def interrupt(self, user_id, session_id, agent_id):
+            self.interrupt_calls.append((user_id, session_id, agent_id))
+            remote_entered.set()
+            await release_remote.wait()
+
+    runtime = _runtime(
+        chat_run_registry=FakeChatRunRegistry(),
+        message_bus=FakeAgentScopeMessageBus(),
+    )
+    runtime.app.state.chat_service = BlockingChatService()
+    store = WebSessionStore(tmp_path / "sessions.sqlite")
+    public_session = store.create_session("cancel race")
+    internal_session_id = "navigation-session"
+    store.save_agentscope_session_mapping(
+        public_session.id,
+        agent_id="navigation-data-agent",
+        agentscope_session_id=internal_session_id,
+    )
+    runtime.set_web_session_store(store)
+    cancellation = CancellationContext()
+    runtime.register_run_cancellation(internal_session_id, cancellation)
+    middleware = DataPilotToolOutcomeMiddleware(internal_session_id, runtime)
+    tool_call = ToolCallBlock(id="call-race", name="extract", input="{}")
+    handler_started = asyncio.Event()
+    handler_cancelled = asyncio.Event()
+
+    async def handler(**_kwargs):
+        handler_started.set()
+        try:
+            await asyncio.Future()
+        except asyncio.CancelledError:
+            handler_cancelled.set()
+            raise
+        yield  # pragma: no cover
+
+    async def consume() -> None:
+        async with cancellation.track_agent(internal_session_id):
+            async for _ in middleware.on_acting(
+                SimpleNamespace(),
+                {"tool_call": tool_call},
+                handler,
+            ):
+                pass
+
+    consumer = asyncio.create_task(consume())
+    await handler_started.wait()
+    stop_task = asyncio.create_task(
+        runtime.interrupt_web_session(web_session_id=public_session.id)
+    )
+    status_during_stop = None
+    consumer_done_during_stop = None
+    try:
+        await remote_entered.wait()
+        await handler_cancelled.wait()
+        await asyncio.sleep(0)
+
+        detail_during_stop = store.get_session(public_session.id)
+        assert detail_during_stop is not None
+        status_during_stop = detail_during_stop.tool_runs[0].status
+        consumer_done_during_stop = consumer.done()
+    finally:
+        release_remote.set()
+        stop_result, cancellation_result = await asyncio.gather(
+            stop_task,
+            consumer,
+            return_exceptions=True,
+        )
+
+    assert status_during_stop == "running"
+    assert consumer_done_during_stop is False
+    assert isinstance(stop_result, InterruptResponse)
+    assert stop_result.stopped_tool_call_ids == ["call-race"]
+    assert isinstance(cancellation_result, asyncio.CancelledError)
+    detail = store.get_session(public_session.id)
+    assert detail is not None
+    assert detail.tool_runs[0].status == "stopped"
+    assert [record.event["value"]["status"] for record in detail.events] == ["stopped"]
+
+
+@pytest.mark.asyncio
+async def test_explicit_stop_serializes_real_tool_response_as_stopped(
+    tmp_path: Path,
+) -> None:
+    remote_entered = asyncio.Event()
+    release_remote = asyncio.Event()
+
+    class BlockingChatService(FakeChatService):
+        async def interrupt(self, user_id, session_id, agent_id):
+            self.interrupt_calls.append((user_id, session_id, agent_id))
+            remote_entered.set()
+            await release_remote.wait()
+
+    runtime = _runtime(
+        chat_run_registry=FakeChatRunRegistry(),
+        message_bus=FakeAgentScopeMessageBus(),
+    )
+    runtime.app.state.chat_service = BlockingChatService()
+    store = WebSessionStore(tmp_path / "sessions.sqlite")
+    public_session = store.create_session("success race")
+    internal_session_id = "navigation-session"
+    store.save_agentscope_session_mapping(
+        public_session.id,
+        agent_id="navigation-data-agent",
+        agentscope_session_id=internal_session_id,
+    )
+    runtime.set_web_session_store(store)
+    outcome_attempted = asyncio.Event()
+    finish_public_tool = runtime.finish_public_tool
+
+    async def observed_finish(*args, **kwargs):
+        outcome_attempted.set()
+        return await finish_public_tool(*args, **kwargs)
+
+    runtime.finish_public_tool = observed_finish
+    middleware = DataPilotToolOutcomeMiddleware(internal_session_id, runtime)
+    tool_call = ToolCallBlock(id="call-race", name="extract", input="{}")
+    emit_response = asyncio.Event()
+
+    async def handler(**_kwargs):
+        await emit_response.wait()
+        yield ToolResponse(id="call-race", state=ToolResultState.SUCCESS)
+
+    async def consume() -> list[ToolResponse]:
+        return [
+            item
+            async for item in middleware.on_acting(
+                SimpleNamespace(),
+                {"tool_call": tool_call},
+                handler,
+            )
+        ]
+
+    consumer = asyncio.create_task(consume())
+    while store.get_session(public_session.id).tool_runs == []:
+        await asyncio.sleep(0)
+    stop_task = asyncio.create_task(
+        runtime.interrupt_web_session(web_session_id=public_session.id)
+    )
+    status_during_stop = None
+    consumer_done_during_stop = None
+    try:
+        await remote_entered.wait()
+        emit_response.set()
+        await outcome_attempted.wait()
+        await asyncio.sleep(0)
+
+        detail_during_stop = store.get_session(public_session.id)
+        assert detail_during_stop is not None
+        status_during_stop = detail_during_stop.tool_runs[0].status
+        consumer_done_during_stop = consumer.done()
+    finally:
+        release_remote.set()
+        stop_result, yielded = await asyncio.gather(stop_task, consumer)
+
+    assert status_during_stop == "running"
+    assert consumer_done_during_stop is False
+    assert stop_result.stopped_tool_call_ids == ["call-race"]
+    assert len(yielded) == 1
+    detail = store.get_session(public_session.id)
+    assert detail is not None
+    assert detail.tool_runs[0].status == "stopped"
+    assert [record.event["value"]["status"] for record in detail.events] == ["stopped"]
+
+
+@pytest.mark.asyncio
+async def test_failed_remote_stop_releases_real_cancellation_outcome_as_failure(
+    tmp_path: Path,
+) -> None:
+    remote_entered = asyncio.Event()
+    release_remote = asyncio.Event()
+
+    class FailingBlockingChatService(FakeChatService):
+        async def interrupt(self, user_id, session_id, agent_id):
+            self.interrupt_calls.append((user_id, session_id, agent_id))
+            remote_entered.set()
+            await release_remote.wait()
+            raise ConnectionError("remote stop failed")
+
+    runtime = _runtime(
+        chat_run_registry=FakeChatRunRegistry(),
+        message_bus=FakeAgentScopeMessageBus(),
+    )
+    runtime.app.state.chat_service = FailingBlockingChatService()
+    store = WebSessionStore(tmp_path / "sessions.sqlite")
+    public_session = store.create_session("failed stop race")
+    internal_session_id = "navigation-session"
+    store.save_agentscope_session_mapping(
+        public_session.id,
+        agent_id="navigation-data-agent",
+        agentscope_session_id=internal_session_id,
+    )
+    runtime.set_web_session_store(store)
+    cancellation = CancellationContext()
+    runtime.register_run_cancellation(internal_session_id, cancellation)
+    middleware = DataPilotToolOutcomeMiddleware(internal_session_id, runtime)
+    tool_call = ToolCallBlock(id="call-race", name="extract", input="{}")
+    handler_started = asyncio.Event()
+    handler_cancelled = asyncio.Event()
+
+    async def handler(**_kwargs):
+        handler_started.set()
+        try:
+            await asyncio.Future()
+        except asyncio.CancelledError:
+            handler_cancelled.set()
+            raise
+        yield  # pragma: no cover
+
+    async def consume() -> None:
+        async with cancellation.track_agent(internal_session_id):
+            async for _ in middleware.on_acting(
+                SimpleNamespace(),
+                {"tool_call": tool_call},
+                handler,
+            ):
+                pass
+
+    consumer = asyncio.create_task(consume())
+    await handler_started.wait()
+    stop_task = asyncio.create_task(
+        runtime.interrupt_web_session(web_session_id=public_session.id)
+    )
+    status_during_stop = None
+    try:
+        await remote_entered.wait()
+        await handler_cancelled.wait()
+        await asyncio.sleep(0)
+        status_during_stop = store.get_session(public_session.id).tool_runs[0].status
+    finally:
+        release_remote.set()
+        stop_result, cancellation_result = await asyncio.gather(
+            stop_task,
+            consumer,
+            return_exceptions=True,
+        )
+
+    assert status_during_stop == "running"
+    assert isinstance(stop_result, RuntimeError)
+    assert isinstance(cancellation_result, asyncio.CancelledError)
+    detail = store.get_session(public_session.id)
+    assert detail is not None
+    assert detail.tool_runs[0].status == "failure"
+    assert [record.event["value"]["status"] for record in detail.events] == ["failure"]
+
+
+@pytest.mark.asyncio
+async def test_explicit_stop_rolls_back_all_tools_when_second_terminal_insert_fails(
+    tmp_path: Path,
+) -> None:
+    runtime = _runtime(
+        chat_run_registry=FakeChatRunRegistry(),
+        message_bus=FakeAgentScopeMessageBus(),
+    )
+    store = WebSessionStore(tmp_path / "sessions.sqlite")
+    public_session = store.create_session("atomic stop")
+    store.save_agentscope_session_mapping(
+        public_session.id,
+        agent_id="main-router-agent",
+        agentscope_session_id="router-session",
+    )
+    store.append_public_event(
+        public_session.id,
+        hashlib.sha256(b"existing-event").hexdigest(),
+        {"type": "REPLY_START", "reply_id": "reply-1", "name": "DataPilot"},
+    )
+    for tool_call_id in ("call-1", "call-2"):
+        store.start_tool_run(
+            public_session.id,
+            tool_call_id,
+            "extract",
+            f"2026-07-15T00:00:0{tool_call_id[-1]}.000+00:00",
+        )
+    runtime.set_web_session_store(store)
+    with sqlite3.connect(store.db_path) as connection:
+        connection.execute(
+            """
+            CREATE TRIGGER fail_second_stop_terminal
+            BEFORE INSERT ON public_events
+            WHEN NEW.event_json LIKE '%\"tool_call_id\": \"call-2\"%'
+            BEGIN
+                SELECT RAISE(ABORT, 'second stop terminal failed');
+            END
+            """
+        )
+
+    with pytest.raises(sqlite3.IntegrityError, match="second stop terminal failed"):
+        await runtime.interrupt_web_session(web_session_id=public_session.id)
+
+    failed_detail = store.get_session(public_session.id)
+    assert failed_detail is not None
+    assert [row.status for row in failed_detail.tool_runs] == ["running", "running"]
+    assert [record.sequence for record in failed_detail.events] == [1]
+
+    with sqlite3.connect(store.db_path) as connection:
+        connection.execute("DROP TRIGGER fail_second_stop_terminal")
+
+    retried = await runtime.interrupt_web_session(web_session_id=public_session.id)
+
+    assert retried.stopped_tool_call_ids == ["call-1", "call-2"]
+    detail = store.get_session(public_session.id)
+    assert detail is not None
+    assert [row.status for row in detail.tool_runs] == ["stopped", "stopped"]
+    terminals = [
+        record
+        for record in detail.events
+        if record.event.get("name") == "datapilot_tool_terminal"
+    ]
+    assert [record.sequence for record in terminals] == [2, 3]
+    assert [record.event["value"]["tool_call_id"] for record in terminals] == [
+        "call-1",
+        "call-2",
+    ]
+    assert all(len(record.dedupe_key) == 64 for record in terminals)
+    assert all("call-" not in record.dedupe_key for record in terminals)
+
+
+@pytest.mark.asyncio
+async def test_concurrent_explicit_stops_are_serialized_and_terminalize_once(
+    tmp_path: Path,
+) -> None:
+    first_remote_entered = asyncio.Event()
+    release_first_remote = asyncio.Event()
+    second_remote_entered = asyncio.Event()
+
+    class SequencedChatService(FakeChatService):
+        async def interrupt(self, user_id, session_id, agent_id):
+            self.interrupt_calls.append((user_id, session_id, agent_id))
+            if len(self.interrupt_calls) == 1:
+                first_remote_entered.set()
+                await release_first_remote.wait()
+            else:
+                second_remote_entered.set()
+
+    runtime = _runtime(
+        chat_run_registry=FakeChatRunRegistry(),
+        message_bus=FakeAgentScopeMessageBus(),
+    )
+    runtime.app.state.chat_service = SequencedChatService()
+    store = WebSessionStore(tmp_path / "sessions.sqlite")
+    public_session = store.create_session("concurrent stops")
+    store.save_agentscope_session_mapping(
+        public_session.id,
+        agent_id="main-router-agent",
+        agentscope_session_id="router-session",
+    )
+    store.start_tool_run(
+        public_session.id,
+        "call-1",
+        "extract",
+        "2026-07-15T00:00:00.000+00:00",
+    )
+    runtime.set_web_session_store(store)
+
+    first = asyncio.create_task(
+        runtime.interrupt_web_session(web_session_id=public_session.id)
+    )
+    await first_remote_entered.wait()
+    second = asyncio.create_task(
+        runtime.interrupt_web_session(web_session_id=public_session.id)
+    )
+    await asyncio.sleep(0)
+
+    assert second_remote_entered.is_set() is False
+    release_first_remote.set()
+    first_result, second_result = await asyncio.gather(first, second)
+
+    assert second_remote_entered.is_set() is True
+    assert first_result.stopped_tool_call_ids == ["call-1"]
+    assert second_result.stopped_tool_call_ids == []
+    detail = store.get_session(public_session.id)
+    assert detail is not None
+    assert detail.tool_runs[0].status == "stopped"
+    assert [record.event["value"]["status"] for record in detail.events] == ["stopped"]
 
 
 @pytest.mark.asyncio

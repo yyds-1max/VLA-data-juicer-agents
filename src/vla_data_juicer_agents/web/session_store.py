@@ -6,6 +6,7 @@ import sqlite3
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
+from collections.abc import Callable
 from typing import Any, Literal
 from uuid import uuid4
 
@@ -459,6 +460,92 @@ class WebSessionStore:
             )
             for row in rows
         ]
+
+    def stop_open_tool_runs_with_terminal_events(
+        self,
+        session_id: str,
+        terminal_event_factory: Callable[
+            [PublicToolRun],
+            tuple[str, dict[str, Any]],
+        ],
+    ) -> tuple[list[PublicToolRun], list[PublicEventRecord]]:
+        """Stop every running tool and append its terminal event atomically."""
+        finished_at = _now()
+        stopped: list[PublicToolRun] = []
+        records: list[PublicEventRecord] = []
+        with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            self._require_session(connection, session_id)
+            rows = connection.execute(
+                """
+                SELECT session_id, tool_call_id, tool_name, status, summary,
+                       error_type, started_at, finished_at
+                FROM public_tool_runs
+                WHERE session_id = ? AND status = 'running'
+                ORDER BY started_at ASC, rowid ASC
+                """,
+                (session_id,),
+            ).fetchall()
+            stopped = [
+                self._tool_run_from_row(row).model_copy(
+                    update={"status": "stopped", "finished_at": finished_at}
+                )
+                for row in rows
+            ]
+            if not stopped:
+                return [], []
+            connection.execute(
+                """
+                UPDATE public_tool_runs
+                SET status = 'stopped', finished_at = ?
+                WHERE session_id = ? AND status = 'running'
+                """,
+                (finished_at, session_id),
+            )
+            sequence = int(
+                connection.execute(
+                    """
+                    SELECT COALESCE(MAX(sequence), 0) + 1
+                    FROM public_events
+                    WHERE session_id = ?
+                    """,
+                    (session_id,),
+                ).fetchone()[0]
+            )
+            for tool_run in stopped:
+                dedupe_key, event = terminal_event_factory(tool_run)
+                if _SHA256_HEX.fullmatch(dedupe_key) is None:
+                    raise ValueError(
+                        "dedupe_key must be a lowercase SHA-256 hexadecimal digest"
+                    )
+                record = PublicEventRecord(
+                    id=f"event_{uuid4().hex}",
+                    session_id=session_id,
+                    sequence=sequence,
+                    dedupe_key=dedupe_key,
+                    event=event,
+                    created_at=finished_at,
+                )
+                connection.execute(
+                    """
+                    INSERT INTO public_events (
+                        id, session_id, sequence, dedupe_key, event_json, created_at
+                    )
+                    VALUES (?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        record.id,
+                        record.session_id,
+                        record.sequence,
+                        record.dedupe_key,
+                        json.dumps(record.event, ensure_ascii=False),
+                        record.created_at,
+                    ),
+                )
+                records.append(record)
+                sequence += 1
+            self._touch_session(connection, session_id, finished_at)
+        return stopped, records
 
     def mark_human_decision_consumed(
         self,

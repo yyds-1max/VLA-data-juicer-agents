@@ -701,8 +701,19 @@ def test_agentscope_interrupt_returns_only_public_stop_fields(tmp_path: Path):
     assert "private-session-must-not-leak" not in response.text
 
 
-def test_agentscope_interrupt_failure_is_retryable_without_internal_id_leak(
+@pytest.mark.parametrize(
+    "error",
+    [
+        OSError("private durable path /internal/stop"),
+        sqlite3.OperationalError("private table internal_tool_runs"),
+        RuntimeError("private runtime internal-agent"),
+        ValueError("private terminal internal-as-session"),
+    ],
+)
+def test_agentscope_interrupt_failure_is_logged_retryable_and_non_sensitive(
     tmp_path: Path,
+    error: Exception,
+    caplog: pytest.LogCaptureFixture,
 ):
     class FailingRuntime:
         def __init__(self) -> None:
@@ -710,9 +721,8 @@ def test_agentscope_interrupt_failure_is_retryable_without_internal_id_leak(
             self.config = SimpleNamespace(agentscope_mount_path="/api/agentscope")
 
         async def interrupt_web_session(self, *, web_session_id: str):
-            raise RuntimeError(
-                f"private AgentScope session as-secret for {web_session_id} failed"
-            )
+            del web_session_id
+            raise error
 
     app = create_app(
         working_dir=str(tmp_path / ".djx"),
@@ -723,12 +733,47 @@ def test_agentscope_interrupt_failure_is_retryable_without_internal_id_leak(
     client = TestClient(app, raise_server_exceptions=False)
     session_id = _create_session(client)
 
-    response = client.post(f"/api/sessions/{session_id}/interrupt")
+    with caplog.at_level(logging.ERROR, logger="vla_data_juicer_agents.web.app"):
+        response = client.post(f"/api/sessions/{session_id}/interrupt")
 
     assert response.status_code == 503
     assert response.json() == {"detail": "Session stop failed; retry the request"}
-    assert "as-secret" not in response.text
+    assert "private" not in response.text
+    assert "internal" not in response.text
     assert session_id not in response.text
+    assert "DataPilot session stop failed" in caplog.text
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("error", [asyncio.CancelledError(), KeyboardInterrupt()])
+async def test_interrupt_error_boundary_does_not_swallow_base_exceptions(
+    tmp_path: Path,
+    error: BaseException,
+):
+    class FailingRuntime:
+        def __init__(self) -> None:
+            self.app = FastAPI()
+            self.config = SimpleNamespace(agentscope_mount_path="/api/agentscope")
+
+        async def interrupt_web_session(self, *, web_session_id: str):
+            del web_session_id
+            raise error
+
+    app = create_app(
+        working_dir=str(tmp_path / ".djx"),
+        db_path=tmp_path / "sessions.sqlite",
+        controller_factory=FakeController,
+        agentscope_runtime=FailingRuntime(),
+    )
+    session = app.state.store.create_session("stop")
+    endpoint = next(
+        route.endpoint
+        for route in app.routes
+        if getattr(route, "path", None) == "/api/sessions/{session_id}/interrupt"
+    )
+
+    with pytest.raises(type(error)):
+        await endpoint(session.id)
 
 
 def test_turn_and_interrupt_unknown_active_session_return_404(tmp_path: Path):
