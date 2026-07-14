@@ -12,6 +12,13 @@ from vla_data_juicer_agents.navigation.config import NavigationSettings
 from vla_data_juicer_agents.navigation.agent_tools import (
     PlanBoundHumanDecisionTool,
     resolve_navigation_agent_tools,
+    resolve_navigation_tool_surface,
+)
+from vla_data_juicer_agents.navigation.tool_groups import (
+    NAVIGATION_ARTIFACT_CHECKS,
+    NAVIGATION_EXECUTION_ACTIONS,
+    NAVIGATION_EXECUTION_STATE,
+    NAVIGATION_PLAN_AUTHORING,
 )
 from vla_data_juicer_agents.navigation.task_store import (
     NavigationStateResetRequired,
@@ -22,7 +29,11 @@ from vla_data_juicer_agents.navigation.services import (
     NavigationServices,
     build_navigation_services,
 )
-from vla_data_juicer_agents.navigation.plan_models import ExtractSyncPlanInput
+from vla_data_juicer_agents.navigation.plan_models import (
+    ExtractSyncPlanInput,
+    FinishProcessingPlanInput,
+)
+from vla_data_juicer_agents.navigation.plan_store import StepClaimOutcome
 from vla_data_juicer_agents.navigation.evidence_store import FileNavigationEvidenceStore
 from vla_data_juicer_agents.navigation.observation_models import (
     ArtifactStateObservation,
@@ -33,6 +44,7 @@ from vla_data_juicer_agents.navigation.observation_store import (
 from test_navigation_plan_submission_tools import (
     build_services as build_complete_plan_services,
     valid_extract_plan_payload,
+    valid_finish_plan_payload,
 )
 from vla_data_juicer_agents.navigation.task_state import (
     NavigationArtifactSnapshot,
@@ -63,6 +75,13 @@ PLANNING_TOOL_NAMES = {
     "record_navigation_user_guidance_tool",
     "submit_extract_sync_plan_tool",
     "submit_finish_processing_plan_tool",
+}
+
+EXECUTION_OBSERVATION_TOOL_NAMES = {
+    "list_observation_evidence_tool",
+    "read_observation_evidence_tool",
+    "inspect_navigation_artifact_state_tool",
+    "inspect_navigation_gridmap_artifacts_tool",
 }
 
 
@@ -477,10 +496,14 @@ def test_create_agentscope_runtime_wires_navigation_tools_factory(monkeypatch, t
     assert tool_names == set()
 
 
-def _resolver_services_from_complete(tmp_path, session_id="as-session-1"):
+def _resolver_services_from_complete(
+    tmp_path,
+    session_id="as-session-1",
+    phase="extract_sync",
+):
     built = build_complete_plan_services(
         tmp_path,
-        "extract_sync",
+        phase,
         web_session_id=session_id,
         agentscope_session_id=session_id,
     )
@@ -498,6 +521,200 @@ def _resolver_services_from_complete(tmp_path, session_id="as-session-1"):
         plan_store=built.plan_store,
     )
     return services, task, built
+
+
+def _surface(services, session_id):
+    return resolve_navigation_tool_surface(
+        services=services,
+        agentscope_session_id=session_id,
+        web_session_id=session_id,
+        cancellation=None,
+    )
+
+
+def _group_tool_names(surface):
+    return {
+        group.name: {tool.name for tool in group.tools}
+        for group in surface.groups
+    }
+
+
+def _terminalize_plan(services, plan, session_id):
+    for step in plan.plan.steps:
+        assert services.plan_store.claim_step(
+            plan.plan_id,
+            step.step_id,
+            step.action,
+            expected_web_session_id=session_id,
+            expected_agentscope_session_id=session_id,
+        ) is StepClaimOutcome.CLAIMED
+        staged = services.plan_store.stage_step_result(
+            plan.plan_id,
+            step.step_id,
+            expected_action=step.action,
+            target_status="completed",
+            full_result={"ok": True, "message": "completed"},
+            result_summary={"ok": True, "message": "completed"},
+            expected_web_session_id=session_id,
+            expected_agentscope_session_id=session_id,
+        )
+        assert staged.result_ref is not None
+        assert services.plan_store.finalize_staged_step(
+            plan.plan_id,
+            step.step_id,
+            expected_action=step.action,
+            expected_web_session_id=session_id,
+            expected_agentscope_session_id=session_id,
+        )
+
+
+def test_grouped_surface_resolves_planning_catalog(tmp_path):
+    services, _task, _built = _resolver_services_from_complete(tmp_path)
+
+    planning = _surface(services, "as-session-1")
+
+    assert planning is not None
+    assert planning.activity == "planning"
+    assert "describe_processing_action_tool" in {
+        tool.name for tool in planning.group(NAVIGATION_PLAN_AUTHORING).tools
+    }
+    with pytest.raises(LookupError):
+        planning.group(NAVIGATION_EXECUTION_ACTIONS)
+
+
+def test_grouped_surface_resolves_execution_catalog(tmp_path):
+    services, task, built = _resolver_services_from_complete(tmp_path)
+    services.plan_store.activate(
+        task,
+        "extract_sync",
+        4,
+        ExtractSyncPlanInput.model_validate(valid_extract_plan_payload(built)),
+        expected_web_session_id="as-session-1",
+        expected_agentscope_session_id="as-session-1",
+    )
+
+    execution = _surface(services, "as-session-1")
+
+    assert execution is not None
+    assert execution.activity == "execution"
+    names_by_group = _group_tool_names(execution)
+    assert names_by_group[NAVIGATION_EXECUTION_STATE] == {
+        "get_plan_execution_overview_tool",
+        "get_current_plan_step_tool",
+    }
+    assert "prepare_raw_data_tool" in names_by_group[NAVIGATION_EXECUTION_ACTIONS]
+    with pytest.raises(LookupError):
+        execution.group(NAVIGATION_PLAN_AUTHORING)
+
+
+def test_grouped_surface_hides_execution_actions_during_recovery(tmp_path):
+    services, task, built = _resolver_services_from_complete(
+        tmp_path,
+        phase="finish_processing",
+    )
+    observation = services.observation_store.latest(task.task_id)
+    assert observation is not None
+    active = services.plan_store.activate(
+        task,
+        "finish_processing",
+        observation.revision,
+        FinishProcessingPlanInput.model_validate(valid_finish_plan_payload(built)),
+        expected_web_session_id="as-session-1",
+        expected_agentscope_session_id="as-session-1",
+    )
+    first_step = active.plan.steps[0]
+    assert services.plan_store.mark_waiting_user(
+        active.plan_id,
+        first_step.step_id,
+        first_step.action,
+        expected_web_session_id="as-session-1",
+        expected_agentscope_session_id="as-session-1",
+    )
+    assert services.plan_store.mark_human_decision_recovery_required(
+        active.plan_id,
+        first_step.step_id,
+        reason_code="ambiguous_delivery_state",
+        request_anchor={"plan_id": active.plan_id, "step_id": first_step.step_id},
+        expected_web_session_id="as-session-1",
+        expected_agentscope_session_id="as-session-1",
+    )
+
+    recovery = _surface(services, "as-session-1")
+
+    assert recovery is not None
+    assert recovery.activity == "recovery_required"
+    with pytest.raises(LookupError):
+        recovery.group(NAVIGATION_EXECUTION_ACTIONS)
+    with pytest.raises(LookupError):
+        recovery.group(NAVIGATION_PLAN_AUTHORING)
+
+
+def test_grouped_surface_reverse_transition_returns_completed_extract_to_planning(
+    tmp_path,
+):
+    services, task, built = _resolver_services_from_complete(tmp_path)
+    active = services.plan_store.activate(
+        task,
+        "extract_sync",
+        4,
+        ExtractSyncPlanInput.model_validate(valid_extract_plan_payload(built)),
+        expected_web_session_id="as-session-1",
+        expected_agentscope_session_id="as-session-1",
+    )
+    _terminalize_plan(services, active, "as-session-1")
+
+    planning = _surface(services, "as-session-1")
+
+    assert planning is not None
+    assert planning.activity == "planning"
+    assert planning.group(NAVIGATION_ARTIFACT_CHECKS).tools
+    assert planning.group(NAVIGATION_PLAN_AUTHORING).tools
+    with pytest.raises(LookupError):
+        planning.group(NAVIGATION_EXECUTION_STATE)
+    with pytest.raises(LookupError):
+        planning.group(NAVIGATION_EXECUTION_ACTIONS)
+
+
+def test_grouped_surface_finish_plan_completion_has_no_execution_actions(tmp_path):
+    services, task, built = _resolver_services_from_complete(
+        tmp_path,
+        phase="finish_processing",
+    )
+    observation = services.observation_store.latest(task.task_id)
+    assert observation is not None
+    active = services.plan_store.activate(
+        task,
+        "finish_processing",
+        observation.revision,
+        FinishProcessingPlanInput.model_validate(valid_finish_plan_payload(built)),
+        expected_web_session_id="as-session-1",
+        expected_agentscope_session_id="as-session-1",
+    )
+    _terminalize_plan(services, active, "as-session-1")
+
+    surface = _surface(services, "as-session-1")
+
+    assert services.task_store.get_task(task.task_id).status == NavigationTaskStatus.COMPLETED
+    assert surface is not None
+    assert surface.activity == "planning"
+    with pytest.raises(LookupError):
+        surface.group(NAVIGATION_EXECUTION_ACTIONS)
+
+
+def test_flat_adapter_matches_grouped_surface_order(tmp_path):
+    services, _task, _built = _resolver_services_from_complete(tmp_path)
+    surface = _surface(services, "as-session-1")
+    flat = resolve_navigation_agent_tools(
+        services=services,
+        agentscope_session_id="as-session-1",
+        web_session_id="as-session-1",
+        cancellation=None,
+    )
+
+    assert surface is not None
+    assert [tool.name for tool in flat] == [
+        tool.name for tool in surface.flatten_active_tools()
+    ]
 
 
 def test_navigation_services_share_one_database_and_idempotent_migrations(tmp_path):
@@ -740,6 +957,7 @@ def test_activity_resolver_recovers_active_plan_and_only_remaining_actions(tmp_p
     assert names == {
         "get_plan_execution_overview_tool",
         "get_current_plan_step_tool",
+        *EXECUTION_OBSERVATION_TOOL_NAMES,
         *remaining,
     }
     assert not any(name.startswith("submit_") for name in names)
@@ -807,6 +1025,7 @@ def test_resolver_and_execution_builder_consume_one_repository_snapshot(
         "get_current_plan_step_tool",
         "prepare_raw_data_tool",
         "extract_and_sync_navigation_data_tool",
+        *EXECUTION_OBSERVATION_TOOL_NAMES,
     }
 
 
