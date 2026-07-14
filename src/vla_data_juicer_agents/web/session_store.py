@@ -22,6 +22,7 @@ from vla_data_juicer_agents.web.schemas import (
 
 WEB_SCHEMA_GENERATION = "agentscope-native-events-v1"
 WEB_CONTROL_TABLES = (
+    "tool_execution_provenance",
     "session_execution_boundaries",
     "human_decision_consumptions",
     "public_tool_runs",
@@ -176,6 +177,19 @@ class WebSessionStore:
                 generation INTEGER NOT NULL DEFAULT 0,
                 stopped_generation INTEGER,
                 updated_at TEXT NOT NULL,
+                FOREIGN KEY (session_id) REFERENCES sessions(id)
+            )
+            """
+        )
+        connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS tool_execution_provenance (
+                session_id TEXT NOT NULL,
+                tool_call_id TEXT NOT NULL,
+                tool_name TEXT NOT NULL,
+                generation INTEGER NOT NULL,
+                delivery_suppressed INTEGER NOT NULL DEFAULT 0,
+                PRIMARY KEY (session_id, tool_call_id),
                 FOREIGN KEY (session_id) REFERENCES sessions(id)
             )
             """
@@ -410,6 +424,24 @@ class WebSessionStore:
                 """,
                 (session_id, tool_call_id, tool_name, started_at),
             )
+            connection.execute(
+                """
+                INSERT INTO tool_execution_provenance (
+                    session_id, tool_call_id, tool_name, generation,
+                    delivery_suppressed
+                )
+                VALUES (
+                    ?, ?, ?,
+                    COALESCE((
+                        SELECT generation FROM session_execution_boundaries
+                        WHERE session_id = ?
+                    ), 0),
+                    0
+                )
+                ON CONFLICT(session_id, tool_call_id) DO NOTHING
+                """,
+                (session_id, tool_call_id, tool_name, session_id),
+            )
             row = self._select_tool_run(connection, session_id, tool_call_id)
         assert row is not None
         return self._tool_run_from_row(row)
@@ -424,6 +456,40 @@ class WebSessionStore:
                 (session_id, tool_call_id),
             ).fetchone()
         return str(row[0]) if row is not None else None
+
+    def tool_delivery_is_suppressed(
+        self,
+        session_id: str,
+        tool_name: str,
+        tool_call_id: str,
+    ) -> bool:
+        with self._connect() as connection:
+            row = connection.execute(
+                """
+                SELECT delivery_suppressed
+                FROM tool_execution_provenance
+                WHERE session_id = ? AND tool_call_id = ? AND tool_name = ?
+                """,
+                (session_id, tool_call_id, tool_name),
+            ).fetchone()
+        return bool(row is not None and row[0])
+
+    def tool_delivery_sublabel_is_suppressed(
+        self,
+        session_id: str,
+        sublabel: str,
+    ) -> bool:
+        with self._connect() as connection:
+            row = connection.execute(
+                """
+                SELECT delivery_suppressed
+                FROM tool_execution_provenance
+                WHERE session_id = ?
+                  AND tool_name || ' · ' || tool_call_id = ?
+                """,
+                (session_id, sublabel),
+            ).fetchone()
+        return bool(row is not None and row[0])
 
     def begin_execution_generation(self, session_id: str) -> int:
         timestamp = _now()
@@ -489,6 +555,95 @@ class WebSessionStore:
         assert row is not None
         return self._tool_run_from_row(row)
 
+    def finish_tool_run_with_terminal_event(
+        self,
+        session_id: str,
+        tool_call_id: str,
+        *,
+        status: Literal["success", "failure"],
+        terminal_event_factory: Callable[
+            [PublicToolRun],
+            tuple[str, dict[str, Any]],
+        ],
+        summary: str = "",
+        error_type: str | None = None,
+    ) -> tuple[PublicToolRun, PublicEventRecord] | None:
+        """Finish one running tool and append its terminal event atomically."""
+        if status not in {"success", "failure"}:
+            raise ValueError(
+                "finish_tool_run_with_terminal_event status must be success or failure"
+            )
+        finished_at = _now()
+        with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            self._require_session(connection, session_id)
+            cursor = connection.execute(
+                """
+                UPDATE public_tool_runs
+                SET status = ?, summary = ?, error_type = ?, finished_at = ?
+                WHERE session_id = ? AND tool_call_id = ? AND status = 'running'
+                """,
+                (status, summary, error_type, finished_at, session_id, tool_call_id),
+            )
+            if cursor.rowcount != 1:
+                return None
+            row = self._select_tool_run(connection, session_id, tool_call_id)
+            assert row is not None
+            tool_run = self._tool_run_from_row(row)
+            dedupe_key, event = terminal_event_factory(tool_run)
+            if _SHA256_HEX.fullmatch(dedupe_key) is None:
+                raise ValueError(
+                    "dedupe_key must be a lowercase SHA-256 hexadecimal digest"
+                )
+
+            duplicate = connection.execute(
+                """
+                SELECT id, session_id, sequence, dedupe_key, event_json, created_at
+                FROM public_events
+                WHERE session_id = ? AND dedupe_key = ?
+                """,
+                (session_id, dedupe_key),
+            ).fetchone()
+            if duplicate is not None:
+                record = self._public_event_from_row(duplicate)
+            else:
+                sequence = int(
+                    connection.execute(
+                        """
+                        SELECT COALESCE(MAX(sequence), 0) + 1
+                        FROM public_events
+                        WHERE session_id = ?
+                        """,
+                        (session_id,),
+                    ).fetchone()[0]
+                )
+                record = PublicEventRecord(
+                    id=f"event_{uuid4().hex}",
+                    session_id=session_id,
+                    sequence=sequence,
+                    dedupe_key=dedupe_key,
+                    event=event,
+                    created_at=finished_at,
+                )
+                connection.execute(
+                    """
+                    INSERT INTO public_events (
+                        id, session_id, sequence, dedupe_key, event_json, created_at
+                    )
+                    VALUES (?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        record.id,
+                        record.session_id,
+                        record.sequence,
+                        record.dedupe_key,
+                        json.dumps(record.event, ensure_ascii=False),
+                        record.created_at,
+                    ),
+                )
+            self._touch_session(connection, session_id, finished_at)
+        return tool_run, record
+
     def stop_open_tool_runs(self, session_id: str) -> list[PublicToolRun]:
         finished_at = _now()
         with self._connect() as connection:
@@ -533,6 +688,35 @@ class WebSessionStore:
         with self._connect() as connection:
             connection.execute("BEGIN IMMEDIATE")
             self._require_session(connection, session_id)
+            generation_row = connection.execute(
+                """
+                SELECT generation FROM session_execution_boundaries
+                WHERE session_id = ?
+                """,
+                (session_id,),
+            ).fetchone()
+            generation = int(generation_row[0]) if generation_row is not None else 0
+            connection.execute(
+                """
+                INSERT INTO tool_execution_provenance (
+                    session_id, tool_call_id, tool_name, generation,
+                    delivery_suppressed
+                )
+                SELECT session_id, tool_call_id, tool_name, ?, 0
+                FROM public_tool_runs
+                WHERE session_id = ?
+                ON CONFLICT(session_id, tool_call_id) DO NOTHING
+                """,
+                (generation, session_id),
+            )
+            connection.execute(
+                """
+                UPDATE tool_execution_provenance
+                SET delivery_suppressed = 1
+                WHERE session_id = ?
+                """,
+                (session_id,),
+            )
             rows = connection.execute(
                 """
                 SELECT session_id, tool_call_id, tool_name, status, summary,
@@ -683,6 +867,10 @@ class WebSessionStore:
             connection.execute("DELETE FROM messages WHERE session_id = ?", (session_id,))
             connection.execute("DELETE FROM public_events WHERE session_id = ?", (session_id,))
             connection.execute("DELETE FROM public_tool_runs WHERE session_id = ?", (session_id,))
+            connection.execute(
+                "DELETE FROM tool_execution_provenance WHERE session_id = ?",
+                (session_id,),
+            )
             connection.execute(
                 "DELETE FROM session_execution_boundaries WHERE session_id = ?",
                 (session_id,),

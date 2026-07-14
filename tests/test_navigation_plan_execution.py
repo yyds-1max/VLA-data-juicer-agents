@@ -13,12 +13,17 @@ from types import SimpleNamespace
 
 import pytest
 from agentscope.app.middleware import ToolOffloadMiddleware
+from agentscope.app.message_bus import MessageBusKeys
 from agentscope.message import ToolCallBlock
 from agentscope.tool import Toolkit
 
 import vla_data_juicer_agents.navigation.plan_execution as plan_execution
 import vla_data_juicer_agents.navigation.plan_models as plan_models
-from vla_data_juicer_agents.core.cancellation import CancellationContext, TurnCancelled
+from vla_data_juicer_agents.core.cancellation import (
+    CancellationContext,
+    TurnCancelled,
+    bind_cancellation,
+)
 from vla_data_juicer_agents.navigation.config import NavigationSettings
 from vla_data_juicer_agents.navigation.evidence_store import FileNavigationEvidenceStore
 from vla_data_juicer_agents.navigation.models import ToolResult
@@ -43,8 +48,13 @@ from vla_data_juicer_agents.navigation.plan_store import (
 from vla_data_juicer_agents.navigation.task_state import NavigationTask
 from vla_data_juicer_agents.navigation.task_store import SqliteNavigationTaskStore
 from vla_data_juicer_agents.runtime.agentscope_runtime import (
+    AgentScopeRuntime,
     _human_decision_payload_from_tool_call,
 )
+from vla_data_juicer_agents.runtime.datapilot_projection import (
+    DataPilotToolOutcomeMiddleware,
+)
+from vla_data_juicer_agents.web.session_store import WebSessionStore
 
 
 def _decode_tool_payload(payload):
@@ -552,6 +562,137 @@ async def test_plan_bound_worker_observes_shared_cancellation_after_async_wrappe
         await asyncio.sleep(0.005)
     assert snapshot is not None
     assert snapshot.overview.steps[0].status == "failed"
+
+
+@pytest.mark.asyncio
+async def test_production_offloaded_worker_keeps_cancellation_lease_after_reply_cleanup(
+    monkeypatch,
+    tmp_path,
+):
+    services = build_services(tmp_path)
+    worker_started = Event()
+    worker_stopped = Event()
+
+    def cancellable_extract(**_kwargs):
+        worker_started.set()
+        try:
+            while True:
+                active = plan_execution.current_cancellation()
+                assert active is not None
+                active.raise_if_cancelled()
+                time.sleep(0.005)
+        finally:
+            worker_stopped.set()
+
+    monkeypatch.setattr(
+        plan_execution,
+        "extract_and_sync_navigation_data",
+        cancellable_extract,
+    )
+
+    class BackgroundManager:
+        task: asyncio.Task | None = None
+
+        async def register_task(self, *, asyncio_task, **_kwargs):
+            self.task = asyncio_task
+            return "background-plan-tool"
+
+    class MessageBus:
+        def __init__(self, manager):
+            self.manager = manager
+
+        async def registry_getall(self, _key):
+            return {"background-plan-tool": "registered"}
+
+        async def publish(self, key, payload):
+            if key == MessageBusKeys.task_cancel_channel() and (
+                payload.get("task_id") == "background-plan-tool"
+                and self.manager.task is not None
+            ):
+                self.manager.task.cancel()
+
+        async def queue_push(self, *_args, **_kwargs):
+            return "entry"
+
+    class ChatService:
+        async def interrupt(self, *_args):
+            return None
+
+    manager = BackgroundManager()
+    message_bus = MessageBus(manager)
+    config = SimpleNamespace(
+        user_id="alice",
+        main_router_agent_id="main-router-agent",
+        navigation_agent_id="navigation-data-agent",
+    )
+    runtime = AgentScopeRuntime(
+        config=config,
+        storage=None,
+        message_bus=message_bus,
+        workspace_manager=None,
+        app=SimpleNamespace(state=SimpleNamespace(chat_service=ChatService())),
+        bootstrapped=True,
+    )
+    store = WebSessionStore(tmp_path / "web.sqlite")
+    public_session = store.create_session("production cancellation lease")
+    internal_session_id = services.task.agentscope_session_id
+    store.save_agentscope_session_mapping(
+        public_session.id,
+        agent_id=config.navigation_agent_id,
+        agentscope_session_id=internal_session_id,
+    )
+    runtime.set_web_session_store(store)
+    cancellation = CancellationContext()
+    runtime.register_run_cancellation(internal_session_id, cancellation)
+    tool = services.tools(cancellation=cancellation)[
+        "extract_and_sync_navigation_data_tool"
+    ]
+    agent = SimpleNamespace(
+        name="NavigationDataAgent",
+        state=SimpleNamespace(session_id=internal_session_id),
+        toolkit=Toolkit(tools=[tool]),
+    )
+    tool_call = ToolCallBlock(
+        id="call-plan-sync",
+        name=tool.name,
+        input=json.dumps({"plan_id": services.plan.plan_id, "step_id": "sync"}),
+    )
+    offload = ToolOffloadMiddleware(
+        bg_manager=manager,
+        message_bus=message_bus,
+        user_id="alice",
+        agent_id=config.navigation_agent_id,
+        timeout_secs=0.01,
+    )
+    outcome = DataPilotToolOutcomeMiddleware(internal_session_id, runtime)
+
+    async def invoke_tool(**_kwargs):
+        yield await tool(plan_id=services.plan.plan_id, step_id="sync")
+
+    async def outcome_chain(**kwargs):
+        async for item in outcome.on_acting(agent, kwargs, invoke_tool):
+            yield item
+
+    try:
+        with bind_cancellation(cancellation):
+            stream = offload.on_acting(
+                agent,
+                {"tool_call": tool_call},
+                outcome_chain,
+            )
+            await anext(stream)
+        assert await asyncio.to_thread(worker_started.wait, 1)
+
+        runtime.clear_run_cancellation(internal_session_id, cancellation)
+        await runtime.interrupt_web_session(web_session_id=public_session.id)
+
+        assert await asyncio.to_thread(worker_stopped.wait, 0.5)
+        assert cancellation.cancelled is True
+    finally:
+        cancellation.cancel()
+        await asyncio.to_thread(worker_stopped.wait, 1)
+        if manager.task is not None:
+            await asyncio.gather(manager.task, return_exceptions=True)
 
 
 @pytest.mark.parametrize(

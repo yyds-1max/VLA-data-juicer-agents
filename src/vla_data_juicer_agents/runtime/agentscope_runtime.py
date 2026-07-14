@@ -21,7 +21,11 @@ from agentscope.message import TextBlock, ToolCallState, ToolResultBlock, ToolRe
 from agentscope.permission import PermissionBehavior, PermissionDecision
 from agentscope.tool import ToolBase, ToolChunk
 
-from vla_data_juicer_agents.core.cancellation import CancellationContext, bind_cancellation
+from vla_data_juicer_agents.core.cancellation import (
+    CancellationContext,
+    bind_cancellation,
+    current_cancellation,
+)
 from vla_data_juicer_agents.navigation.agent_tools import resolve_navigation_agent_tools
 from vla_data_juicer_agents.navigation.config import NavigationSettings
 from vla_data_juicer_agents.navigation.plan_execution import (
@@ -81,6 +85,56 @@ class NavigationDataBusyError(RuntimeError):
 
 
 @dataclass
+class _CancellationLease:
+    cancellation: CancellationContext
+    generation: int | None = None
+    foreground_refs: int = 1
+    tool_call_ids: set[str] = field(default_factory=set)
+
+
+class _StopAwareMessageBus:
+    """Filter stopped ToolOffload results at AgentScope's inbox drain seam."""
+
+    def __init__(self, wrapped: Any, runtime_provider: Any) -> None:
+        self._wrapped = wrapped
+        self._runtime_provider = runtime_provider
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._wrapped, name)
+
+    async def __aenter__(self) -> "_StopAwareMessageBus":
+        await self._wrapped.__aenter__()
+        return self
+
+    async def __aexit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc_value: BaseException | None,
+        traceback: Any,
+    ) -> None:
+        await self._wrapped.__aexit__(exc_type, exc_value, traceback)
+
+    async def queue_drain(
+        self,
+        key: str,
+        *,
+        max_count: int,
+    ) -> list[tuple[str, dict[str, Any]]]:
+        entries = await self._wrapped.queue_drain(key, max_count=max_count)
+        inbox_prefix = MessageBusKeys.inbox("")
+        if not key.startswith(inbox_prefix):
+            return entries
+        runtime = self._runtime_provider()
+        if runtime is None:
+            return entries
+        agentscope_session_id = key[len(inbox_prefix) :]
+        return runtime.filter_stopped_tool_hints(
+            agentscope_session_id,
+            entries,
+        )
+
+
+@dataclass
 class AgentScopeRuntime:
     config: AgentScopeRuntimeConfig
     storage: Any
@@ -91,7 +145,7 @@ class AgentScopeRuntime:
     web_session_store: Any | None = None
     web_event_publisher: Any | None = None
     _active_human_decision_claims: set[str] = field(default_factory=set)
-    _run_cancellations: dict[str, CancellationContext] = field(default_factory=dict)
+    _run_cancellations: dict[str, list[_CancellationLease]] = field(default_factory=dict)
     _tool_outcome_locks: dict[str, asyncio.Lock] = field(default_factory=dict)
     recovery_metrics: AgentScopeRecoveryMetrics = field(default_factory=AgentScopeRecoveryMetrics)
     bootstrapped: bool = False
@@ -208,12 +262,20 @@ class AgentScopeRuntime:
         public_session_id = self._public_session_id(agentscope_session_id)
         if public_session_id is None:
             return None
-        return self.web_session_store.start_tool_run(
+        tool_run = self.web_session_store.start_tool_run(
             public_session_id,
             tool_call_id,
             tool_name,
             datetime.now(UTC).isoformat(timespec="milliseconds"),
         )
+        cancellation = current_cancellation()
+        if cancellation is not None:
+            self.retain_tool_cancellation(
+                agentscope_session_id,
+                tool_call_id,
+                cancellation,
+            )
+        return tool_run
 
     async def finish_public_tool(
         self,
@@ -224,41 +286,51 @@ class AgentScopeRuntime:
         summary: str,
         error_type: str | None,
     ) -> Any | None:
-        public_session_id = self._public_session_id(agentscope_session_id)
-        if public_session_id is None:
-            return None
-        async with self._tool_outcome_lock(public_session_id):
-            summary, error_type = self._sanitize_public_tool_outcome(
-                public_session_id,
-                summary,
-                error_type,
-            )
-            tool_run = self.web_session_store.finish_tool_run(
-                public_session_id,
-                tool_call_id,
-                status=status,
-                summary=summary,
-                error_type=error_type,
-            )
-            if tool_run is None:
+        cancellation = current_cancellation()
+        try:
+            public_session_id = self._public_session_id(agentscope_session_id)
+            if public_session_id is None:
                 return None
-            event = CustomEvent(
-                name="datapilot_tool_terminal",
-                value={
-                    "tool_call_id": tool_call_id,
-                    "status": status,
-                    "summary": summary,
-                    "error_type": error_type,
-                },
-            ).model_dump(mode="json")
-            identity = f"tool-terminal:{agentscope_session_id}:{tool_call_id}:{status}"
-            record = self.web_session_store.append_public_event(
-                public_session_id,
-                hashlib.sha256(identity.encode("utf-8")).hexdigest(),
-                event,
-            )
-        await self._publish_public_record(public_session_id, record)
-        return tool_run
+            async with self._tool_outcome_lock(public_session_id):
+                summary, error_type = self._sanitize_public_tool_outcome(
+                    public_session_id,
+                    summary,
+                    error_type,
+                )
+                identity = f"tool-terminal:{agentscope_session_id}:{tool_call_id}:{status}"
+
+                def terminal_event(tool_run: Any) -> tuple[str, dict[str, Any]]:
+                    event = CustomEvent(
+                        name="datapilot_tool_terminal",
+                        value={
+                            "tool_call_id": tool_run.tool_call_id,
+                            "status": tool_run.status,
+                            "summary": tool_run.summary,
+                            "error_type": tool_run.error_type,
+                        },
+                    ).model_dump(mode="json")
+                    return hashlib.sha256(identity.encode("utf-8")).hexdigest(), event
+
+                result = self.web_session_store.finish_tool_run_with_terminal_event(
+                    public_session_id,
+                    tool_call_id,
+                    status=status,
+                    summary=summary,
+                    error_type=error_type,
+                    terminal_event_factory=terminal_event,
+                )
+                if result is None:
+                    return None
+                tool_run, record = result
+            await self._publish_public_record(public_session_id, record)
+            return tool_run
+        finally:
+            if cancellation is not None:
+                self.release_tool_cancellation(
+                    agentscope_session_id,
+                    tool_call_id,
+                    cancellation,
+                )
 
     def should_suppress_tool_delivery(
         self,
@@ -281,6 +353,44 @@ class AgentScopeRuntime:
         return self.web_session_store.execution_generation_is_stopped(
             public_session_id
         )
+
+    def filter_stopped_tool_hints(
+        self,
+        agentscope_session_id: str,
+        entries: list[tuple[str, dict[str, Any]]],
+    ) -> list[tuple[str, dict[str, Any]]]:
+        public_session_id = self._public_session_id(agentscope_session_id)
+        if public_session_id is None or self.web_session_store is None:
+            return entries
+        retained: list[tuple[str, dict[str, Any]]] = []
+        for entry_id, payload in entries:
+            source = payload.get("source") if isinstance(payload, dict) else None
+            try:
+                source_payload = json.loads(source) if isinstance(source, str) else None
+            except json.JSONDecodeError:
+                source_payload = None
+            if not (
+                isinstance(source_payload, dict)
+                and source_payload.get("label") == "tool_output"
+                and isinstance(source_payload.get("sublabel"), str)
+            ):
+                retained.append((entry_id, payload))
+                continue
+            sublabel = source_payload["sublabel"]
+            suppressed = (
+                self.web_session_store.tool_delivery_sublabel_is_suppressed(
+                    public_session_id,
+                    sublabel,
+                )
+            )
+            if suppressed:
+                _logger.info(
+                    "Dropped stopped ToolOffload inbox result: session_id=%s",
+                    agentscope_session_id,
+                )
+            else:
+                retained.append((entry_id, payload))
+        return retained
 
     def _tool_outcome_lock(self, public_session_id: str) -> asyncio.Lock:
         lock = self._tool_outcome_locks.get(public_session_id)
@@ -540,8 +650,9 @@ class AgentScopeRuntime:
             agent_id=agent_id,
             model=model,
         )
+        generation = None
         if self.web_session_store is not None:
-            self.web_session_store.begin_execution_generation(web_session_id)
+            generation = self.web_session_store.begin_execution_generation(web_session_id)
         if agent_id == self.config.navigation_agent_id:
             anchor = self._navigation_durable_state_anchor(
                 session_id,
@@ -553,8 +664,11 @@ class AgentScopeRuntime:
             )
 
         cancellation = CancellationContext()
-        previous_cancellation = self.run_cancellation(session_id)
-        self.register_run_cancellation(session_id, cancellation)
+        self.register_run_cancellation(
+            session_id,
+            cancellation,
+            generation=generation,
+        )
 
         async def run_with_cancellation() -> None:
             try:
@@ -572,10 +686,7 @@ class AgentScopeRuntime:
         try:
             self._spawn_chat_run(run_with_cancellation(), session_id=session_id)
         except Exception:
-            if previous_cancellation is not None:
-                self.register_run_cancellation(session_id, previous_cancellation)
-            else:
-                self.clear_run_cancellation(session_id, cancellation)
+            self.clear_run_cancellation(session_id, cancellation)
             raise
         return session_id
 
@@ -592,9 +703,10 @@ class AgentScopeRuntime:
         async with self._tool_outcome_lock(web_session_id):
             interrupted = bool(mappings)
             for _agent_id, agentscope_session_id in mappings:
-                cancellation = self.run_cancellation(agentscope_session_id)
-                if cancellation is not None:
-                    interrupted = cancellation.cancel() or interrupted
+                interrupted = (
+                    self.cancel_run_cancellations(agentscope_session_id)
+                    or interrupted
+                )
 
             failures: list[Exception] = []
             chat_service = self.app.state.chat_service
@@ -636,9 +748,9 @@ class AgentScopeRuntime:
                 raise RuntimeError("explicit stop cancellation failed") from failures[0]
 
             if self.web_session_store is None:
+                for _agent_id, agentscope_session_id in mappings:
+                    self.discard_run_cancellations(agentscope_session_id)
                 return InterruptResponse(interrupted=interrupted)
-            private_identities = self.projection_private_identities()
-
             def terminal_event(row: Any) -> tuple[str, dict[str, Any]]:
                 event = CustomEvent(
                     name="datapilot_tool_terminal",
@@ -648,10 +760,6 @@ class AgentScopeRuntime:
                         "summary": "已由用户停止",
                     },
                 ).model_dump(mode="json")
-                event = sanitize_agent_event(
-                    event,
-                    private_identities=private_identities,
-                )
                 identity = (
                     f"explicit-stop-tool-terminal:{web_session_id}:"
                     f"{row.tool_call_id}:stopped"
@@ -664,6 +772,8 @@ class AgentScopeRuntime:
                     terminal_event,
                 )
             )
+            for _agent_id, agentscope_session_id in mappings:
+                self.discard_run_cancellations(agentscope_session_id)
             if interrupted or stopped:
                 resolution = self._append_human_decision_resolution(
                     web_session_id,
@@ -705,11 +815,13 @@ class AgentScopeRuntime:
         mappings = self.web_session_store.list_agentscope_session_mappings(web_session_id)
         session_service = self.app.state.session_service
         for mapping in mappings:
+            self.cancel_run_cancellations(mapping.agentscope_session_id)
             await session_service.delete_session(
                 self.config.user_id,
                 mapping.agent_id,
                 mapping.agentscope_session_id,
             )
+            self.discard_run_cancellations(mapping.agentscope_session_id)
         self._navigation_services().delete_control_state_for_web_session(web_session_id)
         self.web_sessions.pop(web_session_id, None)
         return True
@@ -718,18 +830,94 @@ class AgentScopeRuntime:
         self,
         agentscope_session_id: str,
         cancellation: CancellationContext,
+        *,
+        generation: int | None = None,
     ) -> None:
-        self._run_cancellations[agentscope_session_id] = cancellation
+        leases = self._run_cancellations.setdefault(agentscope_session_id, [])
+        for lease in leases:
+            if lease.cancellation is cancellation:
+                lease.foreground_refs += 1
+                if generation is not None:
+                    lease.generation = generation
+                return
+        leases.append(
+            _CancellationLease(
+                cancellation=cancellation,
+                generation=generation,
+            )
+        )
 
     def run_cancellation(self, agentscope_session_id: str) -> CancellationContext | None:
-        return self._run_cancellations.get(agentscope_session_id)
+        leases = self._run_cancellations.get(agentscope_session_id, [])
+        return next(
+            (
+                lease.cancellation
+                for lease in reversed(leases)
+                if not lease.cancellation.cancelled
+            ),
+            None,
+        )
+
+    def retain_tool_cancellation(
+        self,
+        agentscope_session_id: str,
+        tool_call_id: str,
+        cancellation: CancellationContext,
+    ) -> None:
+        leases = self._run_cancellations.setdefault(agentscope_session_id, [])
+        lease = next(
+            (item for item in leases if item.cancellation is cancellation),
+            None,
+        )
+        if lease is None:
+            lease = _CancellationLease(
+                cancellation=cancellation,
+                foreground_refs=0,
+            )
+            leases.append(lease)
+        lease.tool_call_ids.add(tool_call_id)
+
+    def release_tool_cancellation(
+        self,
+        agentscope_session_id: str,
+        tool_call_id: str,
+        cancellation: CancellationContext,
+    ) -> None:
+        for lease in self._run_cancellations.get(agentscope_session_id, []):
+            if lease.cancellation is cancellation:
+                lease.tool_call_ids.discard(tool_call_id)
+                break
+        self._prune_run_cancellations(agentscope_session_id)
+
+    def cancel_run_cancellations(self, agentscope_session_id: str) -> bool:
+        cancelled = False
+        for lease in self._run_cancellations.get(agentscope_session_id, []):
+            cancelled = lease.cancellation.cancel() or cancelled
+        return cancelled
+
+    def discard_run_cancellations(self, agentscope_session_id: str) -> None:
+        self._run_cancellations.pop(agentscope_session_id, None)
 
     def clear_run_cancellation(
         self,
         agentscope_session_id: str,
         cancellation: CancellationContext,
     ) -> None:
-        if self._run_cancellations.get(agentscope_session_id) is cancellation:
+        for lease in self._run_cancellations.get(agentscope_session_id, []):
+            if lease.cancellation is cancellation:
+                lease.foreground_refs = max(0, lease.foreground_refs - 1)
+                break
+        self._prune_run_cancellations(agentscope_session_id)
+
+    def _prune_run_cancellations(self, agentscope_session_id: str) -> None:
+        leases = [
+            lease
+            for lease in self._run_cancellations.get(agentscope_session_id, [])
+            if lease.foreground_refs > 0 or lease.tool_call_ids
+        ]
+        if leases:
+            self._run_cancellations[agentscope_session_id] = leases
+        else:
             self._run_cancellations.pop(agentscope_session_id, None)
 
     def record_navigation_handoff(self, payload: dict[str, Any]) -> None:
@@ -1010,26 +1198,22 @@ class AgentScopeRuntime:
                 output=json.dumps(_human_decision_tool_output(pending_tool_name, decision), ensure_ascii=False),
                 state=ToolResultState.SUCCESS,
             )
+            handoff_identity = (
+                f"navigation-human-handoff:{plan_id}:{step_id}:{decision_key}"
+                if plan_bound_handoff
+                else _human_continuation_identity(
+                    agentscope_session_id,
+                    pending_tool_name,
+                    decision,
+                )
+            )
             input_msg = ExternalExecutionResultEvent(
-                id=(
-                    f"navigation-human-handoff:{plan_id}:{step_id}:{decision_key}"
-                    if plan_bound_handoff
-                    else uuid4().hex
-                ),
-                metadata=(
-                    {
-                        "idempotency_key": (
-                            f"navigation-human-handoff:{plan_id}:{step_id}:{decision_key}"
-                        )
-                    }
-                    if plan_bound_handoff
-                    else {}
-                ),
+                id=handoff_identity,
+                metadata={"idempotency_key": handoff_identity},
                 reply_id=decision["reply_id"],
                 execution_results=[result],
             )
             cancellation = CancellationContext()
-            previous_cancellation = self.run_cancellation(agentscope_session_id)
             self.register_run_cancellation(agentscope_session_id, cancellation)
 
             async def run_with_claim() -> None:
@@ -1143,13 +1327,7 @@ class AgentScopeRuntime:
                         expected_web_session_id=web_session_id,
                         expected_agentscope_session_id=agentscope_session_id,
                     )
-                if previous_cancellation is not None:
-                    self.register_run_cancellation(
-                        agentscope_session_id,
-                        previous_cancellation,
-                    )
-                else:
-                    self.clear_run_cancellation(agentscope_session_id, cancellation)
+                self.clear_run_cancellation(agentscope_session_id, cancellation)
                 raise
             if not plan_bound_handoff:
                 self._mark_human_decision_consumed(
@@ -1832,6 +2010,28 @@ def _human_decision_claim_key(agentscope_session_id: str, decision: dict[str, An
     )
 
 
+def _human_continuation_identity(
+    agentscope_session_id: str,
+    tool_name: str,
+    decision: dict[str, Any],
+) -> str:
+    canonical = json.dumps(
+        {
+            "agentscope_session_id": agentscope_session_id,
+            "tool_name": tool_name,
+            "reply_id": decision.get("reply_id"),
+            "tool_call_id": decision.get("tool_call_id"),
+            "action": decision.get("action"),
+            "text": decision.get("text"),
+            "request_id": decision.get("request_id"),
+        },
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    return f"human-handoff:{hashlib.sha256(canonical.encode('utf-8')).hexdigest()}"
+
+
 def _durable_plan_decision(decision: dict[str, Any]) -> dict[str, Any]:
     return {
         "action": decision.get("action"),
@@ -2442,11 +2642,15 @@ def build_extra_agent_middlewares_factory(
 def create_agentscope_runtime(config: AgentScopeRuntimeConfig) -> AgentScopeRuntime:
     redis_kwargs = config.redis_connection_kwargs()
     storage = RedisStorage(**redis_kwargs)
-    message_bus = RedisMessageBus(**redis_kwargs)
+    redis_message_bus = RedisMessageBus(**redis_kwargs)
     workspace_manager = LocalWorkspaceManager(
         basedir=str(config.workspace_root / "agentscope-workspaces"),
     )
     runtime_holder: dict[str, AgentScopeRuntime] = {}
+    message_bus = _StopAwareMessageBus(
+        redis_message_bus,
+        lambda: runtime_holder.get("runtime"),
+    )
 
     async def extra_agent_tools(user_id: str, agent_id: str, session_id: str) -> list[Any]:
         runtime = runtime_holder.get("runtime")

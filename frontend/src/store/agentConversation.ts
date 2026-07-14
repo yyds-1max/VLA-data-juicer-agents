@@ -135,6 +135,13 @@ export function applyPublicEvent(
   }
 
   const event = normalizePublicAgentEvent(envelope);
+  if (isThinkingEvent(event)) {
+    // Public backends suppress these events. Consume their sequence before
+    // reply ownership checks as a defense against legacy/malicious streams;
+    // never feed private reasoning content into the SDK message.
+    state.lastSequence = envelope.sequence;
+    return;
+  }
   if (event.type === EventType.REPLY_START) {
     const start = event as ReplyStartEvent;
     if (!state.currentReplyId && stringValue(start.reply_id)) {
@@ -143,12 +150,6 @@ export function applyPublicEvent(
   } else if (isReplyScopedEvent(event) && !state.currentReplyId) {
     return;
   } else if (!eventBelongsToCurrentReply(state, event)) {
-    state.lastSequence = envelope.sequence;
-    return;
-  } else if (isThinkingEvent(event)) {
-    // Public backends suppress these events. Consume their sequence only as
-    // a defense against legacy/malicious snapshots; never feed private
-    // reasoning content into the SDK message.
     state.lastSequence = envelope.sequence;
     return;
   } else if (event.type === EventType.REPLY_END) {
@@ -212,7 +213,9 @@ function hasRunningTool(state: AgentConversationState): boolean {
 }
 
 function isThinkingEvent(event: AgentEvent): boolean {
-  return String(event.type).startsWith("THINKING_BLOCK_");
+  return event.type === EventType.THINKING_BLOCK_START ||
+    event.type === EventType.THINKING_BLOCK_DELTA ||
+    event.type === EventType.THINKING_BLOCK_END;
 }
 
 export function appendPersistedMessage(

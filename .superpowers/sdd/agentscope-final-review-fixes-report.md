@@ -123,3 +123,115 @@ public tool_call_id remains unchanged.
   is a separate performance change.
 - `_tool_outcome_locks` remains an unbounded per-runtime session cache, as noted by the
   earlier review. It was not changed in this high-risk correctness/security fix.
+
+## Round 2 final re-review fixes
+
+Baseline: `041dae4`
+
+The second review was handled with the same review-verification, systematic-debugging,
+and test-first process. Six independent RED reproductions were recorded before any
+round-2 product code changed, and a root-cause checkpoint was sent to the parent agent.
+
+### Critical: cancellation lease survives ToolOffload foreground cleanup
+
+Root cause: `_start_agent_run()` removed the session's only CancellationContext when
+the first ChatService reply ended. Official ToolOffload had already returned its
+placeholder, but its production plan FunctionTool was still awaiting an
+`asyncio.to_thread` worker. A later Stop could cancel the AgentScope drain task, not
+the worker thread or its child process.
+
+RED: an actual production-created plan FunctionTool, official ToolOffload timeout, and
+a cooperative blocking worker reached foreground cleanup. Stop canceled the drain,
+but the worker did not exit within 500ms and stopped only when the discarded token was
+manually canceled.
+
+GREEN: runtime cancellation state is now a per-session collection of generation-aware
+leases. Each lease counts foreground users and retains every active tool-call ID.
+ToolOutcome start retains the currently bound token; real terminal/exception releases
+that tool; reply cleanup only releases its foreground reference. Stop and delete cancel
+all retained leases before AgentScope task cancellation, and a completed Stop discards
+them. Multiple tools and a newer generation do not overwrite an older running lease.
+
+Self-review found and test-first fixed one additional edge: a direct wakeup can reuse
+an old tool lease. RunBoundary now acquires/releases a foreground reference even when
+the token already exists, so the last background terminal cannot prune the token while
+the wakeup reasoning run is still stoppable.
+
+### Important: normal tool terminal is one SQLite transaction
+
+Root cause: runtime first committed `finish_tool_run()` and then opened a separate
+transaction for `append_public_event()`. An injected append failure left a successful
+ledger row with no canonical terminal event.
+
+GREEN: `finish_tool_run_with_terminal_event()` performs the conditional first-terminal
+transition, canonical event construction and validation, dedupe/sequence allocation,
+event insert, and session touch in one `BEGIN IMMEDIATE`. Encoding or insert failure
+rolls the ledger back to running. Concurrent success/failure has exactly one winner;
+late outcomes return `None` and do not invoke the event factory. Runtime publishes only
+after the transaction commits.
+
+### Important: resumed HITL continuations have stable distinct identities
+
+Root cause: AgentScope's awaiting continuation path does not emit REPLY_START, and each
+ChatService run rebuilds projection middleware. Each continuation therefore started at
+`reply_id=''`, ordinal zero, producing the same `hash(session::0)`.
+
+GREEN: projection seeds continuation identity from the input event's durable reply ID
+and idempotency key (falling back to its stable event ID), plus the event type and
+ordinal. A normal REPLY_START switches back to the established reply identity format.
+Two sequential continuations in one reply are distinct; replay/restart of the same
+input is stable. Non-plan human continuation IDs are now canonical SHA-256 values
+rather than random UUIDs and carry the same idempotency key in metadata.
+
+### Important: stopped ToolOffload hints cannot cross into a new generation
+
+Root cause: suppressing an `inputs=None` wakeup left its already queued HintBlock in
+the inbox. A new turn cleared the current stop boundary, then framework InboxMiddleware
+drained and injected the old result before any extra DataPilot reasoning middleware.
+
+GREEN: `tool_execution_provenance` durably records tool, generation, and delivery
+suppression. Explicit Stop marks delivery suppression in the same transaction as the
+stop boundary and terminal events; the tombstone survives later generations and is
+removed with the session. Stop suppresses older-generation tools too, covering a
+retained worker after a newer turn. Fresh and existing v1 databases create the table
+without resetting sessions.
+
+The production AgentScope app receives a DataPilot-owned message-bus wrapper. It keeps
+the official single inbox drain but filters after drain and before InboxMiddleware
+injection, using an exact persisted `tool_name · tool_call_id` comparison. It does not
+patch AgentScope. A real deterministic bus/official Inbox test proves an old stopped
+hint is dropped while a normal new-generation success hint in the same batch is kept.
+The wrapper also explicitly delegates AgentScope's asynchronous context-manager
+lifecycle; a focused RED caught that Python special methods are not forwarded through
+`__getattr__`, and the lifecycle regression now passes.
+
+### Important: ownerless thinking advances the frontend cursor
+
+Root cause: the reply-owner guard returned before the defensive thinking guard. An
+ownerless thinking event did not advance sequence, so the following valid REPLY_START
+looked like a gap and was rejected too.
+
+GREEN: the exact three AgentScope thinking event types are consumed before ownership
+checks and never reduced into message content. The ownerless-thinking-then-valid-reply
+RED now reaches sequence four and renders only the public answer.
+
+### Important: correlation IDs are never sanitized
+
+Root cause: explicit Stop sanitized the entire terminal event. A valid public
+tool_call_id containing a private identity substring was rewritten in the event while
+the ledger retained the original ID.
+
+GREEN: Stop constructs its fixed public summary directly and never sends correlation,
+status, or dedupe fields through identity sanitization. Success/failure continue to
+sanitize only summary and error_type before the atomic ledger/event write. The
+adversarial tool_call_id is byte-identical in response, ledger, and event.
+
+### Round 2 verification
+
+- Full backend: `917 passed, 1 warning` (the existing Starlette deprecation warning).
+- Full frontend: `177 passed`.
+- Frontend production build: passed (Vite 1626 modules transformed).
+- TypeScript `npx tsc --noEmit`: passed.
+- Python `compileall`: passed.
+- `git diff --check`: passed.
+- AgentScope runtime assembly smoke test with the owned message-bus wrapper: passed.

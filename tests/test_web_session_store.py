@@ -87,6 +87,7 @@ def test_fresh_store_creates_public_event_schema(tmp_path: Path):
         "public_events",
         "public_tool_runs",
         "session_execution_boundaries",
+        "tool_execution_provenance",
     } <= tables
 
 
@@ -262,6 +263,92 @@ def test_finish_tool_run_is_first_terminal_wins(tmp_path: Path):
     assert store.get_session(session.id).tool_runs == [failed]
 
 
+def test_finish_tool_run_with_terminal_event_rolls_back_on_event_encoding_failure(
+    tmp_path: Path,
+):
+    store = WebSessionStore(tmp_path / "sessions.sqlite")
+    session = store.create_session(title="atomic tool terminal")
+    started_at = "2026-06-26T10:00:00.000+00:00"
+    store.start_tool_run(session.id, "call-atomic", "extract", started_at)
+
+    def invalid_terminal_event(tool_run):
+        assert tool_run.status == "success"
+        return (
+            _digest("tool-terminal:call-atomic:success"),
+            {"type": "CUSTOM", "value": {"not_json": object()}},
+        )
+
+    with pytest.raises(TypeError, match="JSON serializable"):
+        store.finish_tool_run_with_terminal_event(
+            session.id,
+            "call-atomic",
+            status="success",
+            summary="done",
+            terminal_event_factory=invalid_terminal_event,
+        )
+
+    detail = store.get_session(session.id)
+    assert detail is not None
+    assert [(row.tool_call_id, row.status) for row in detail.tool_runs] == [
+        ("call-atomic", "running")
+    ]
+    assert detail.events == []
+
+
+def test_finish_tool_run_with_terminal_event_has_one_concurrent_winner(
+    tmp_path: Path,
+):
+    store = WebSessionStore(tmp_path / "sessions.sqlite")
+    session = store.create_session(title="concurrent tool terminal")
+    started_at = "2026-06-26T10:00:00.000+00:00"
+    store.start_tool_run(session.id, "call-race", "extract", started_at)
+
+    def finish(status: str):
+        return store.finish_tool_run_with_terminal_event(
+            session.id,
+            "call-race",
+            status=status,
+            summary=f"{status} outcome",
+            error_type="RuntimeError" if status == "failure" else None,
+            terminal_event_factory=lambda tool_run: (
+                _digest(f"tool-terminal:call-race:{status}"),
+                {
+                    "type": "CUSTOM",
+                    "name": "datapilot_tool_terminal",
+                    "value": {
+                        "tool_call_id": tool_run.tool_call_id,
+                        "status": tool_run.status,
+                        "summary": tool_run.summary,
+                        "error_type": tool_run.error_type,
+                    },
+                },
+            ),
+        )
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        results = list(executor.map(finish, ("success", "failure")))
+
+    winners = [result for result in results if result is not None]
+    assert len(winners) == 1
+    winning_run, winning_event = winners[0]
+    detail = store.get_session(session.id)
+    assert detail is not None
+    assert detail.tool_runs == [winning_run]
+    assert detail.events == [winning_event]
+    assert winning_event.event["value"]["status"] == winning_run.status
+    assert winning_event.event["value"]["summary"] == winning_run.summary
+    assert store.finish_tool_run_with_terminal_event(
+        session.id,
+        "call-race",
+        status="success" if winning_run.status == "failure" else "failure",
+        summary="late outcome",
+        terminal_event_factory=lambda _tool_run: pytest.fail(
+            "late outcome must not build another terminal event"
+        ),
+    ) is None
+    assert store.get_session(session.id) == detail
+
+
 def test_stop_open_tool_runs_only_stops_running_rows(tmp_path: Path):
     store = WebSessionStore(tmp_path / "sessions.sqlite")
     session = store.create_session(title="stop tools")
@@ -318,6 +405,7 @@ def test_existing_v1_schema_adds_stop_boundary_table_without_resetting_sessions(
     session = store.create_session(title="preserved v1 session")
     with sqlite3.connect(db_path) as connection:
         connection.execute("DROP TABLE session_execution_boundaries")
+        connection.execute("DROP TABLE tool_execution_provenance")
         assert connection.execute(
             "SELECT generation FROM web_schema WHERE singleton = 1"
         ).fetchone() == (SCHEMA_GENERATION,)
@@ -329,6 +417,93 @@ def test_existing_v1_schema_adds_stop_boundary_table_without_resetting_sessions(
         assert connection.execute(
             "SELECT name FROM sqlite_master WHERE name = 'session_execution_boundaries'"
         ).fetchone() == ("session_execution_boundaries",)
+        assert connection.execute(
+            "SELECT name FROM sqlite_master WHERE name = 'tool_execution_provenance'"
+        ).fetchone() == ("tool_execution_provenance",)
+
+
+def test_stopped_generation_keeps_tool_delivery_tombstone_after_new_generation_and_delete(
+    tmp_path: Path,
+):
+    db_path = tmp_path / "sessions.sqlite"
+    store = WebSessionStore(db_path)
+    session = store.create_session(title="delivery tombstone")
+    store.begin_execution_generation(session.id)
+    store.start_tool_run(
+        session.id,
+        "call-completed-before-stop",
+        "extract",
+        "2026-07-15T00:00:00.000+00:00",
+    )
+    store.finish_tool_run(
+        session.id,
+        "call-completed-before-stop",
+        status="success",
+        summary="done",
+    )
+    assert store.tool_delivery_sublabel_is_suppressed(
+        session.id,
+        "extract · call-completed-before-stop",
+    ) is False
+
+    stopped, records = store.stop_open_tool_runs_with_terminal_events(
+        session.id,
+        lambda _row: pytest.fail("terminal already won before stop"),
+    )
+    assert stopped == []
+    assert records == []
+    assert WebSessionStore(db_path).tool_delivery_sublabel_is_suppressed(
+        session.id,
+        "extract · call-completed-before-stop",
+    ) is True
+
+    store.begin_execution_generation(session.id)
+    assert store.tool_delivery_sublabel_is_suppressed(
+        session.id,
+        "extract · call-completed-before-stop",
+    ) is True
+
+    store.delete_session(session.id)
+    with sqlite3.connect(db_path) as connection:
+        assert connection.execute(
+            "SELECT COUNT(*) FROM tool_execution_provenance"
+        ).fetchone() == (0,)
+
+
+def test_stop_suppresses_an_older_generation_tool_that_is_still_running(
+    tmp_path: Path,
+):
+    store = WebSessionStore(tmp_path / "sessions.sqlite")
+    session = store.create_session(title="older running delivery")
+    assert store.begin_execution_generation(session.id) == 1
+    store.start_tool_run(
+        session.id,
+        "call-generation-one",
+        "extract",
+        "2026-07-15T00:00:00.000+00:00",
+    )
+    assert store.begin_execution_generation(session.id) == 2
+
+    stopped, _records = store.stop_open_tool_runs_with_terminal_events(
+        session.id,
+        lambda row: (
+            _digest(f"stop:{row.tool_call_id}"),
+            {
+                "type": "CUSTOM",
+                "name": "datapilot_tool_terminal",
+                "value": {
+                    "tool_call_id": row.tool_call_id,
+                    "status": "stopped",
+                },
+            },
+        ),
+    )
+
+    assert [row.tool_call_id for row in stopped] == ["call-generation-one"]
+    assert store.tool_delivery_sublabel_is_suppressed(
+        session.id,
+        "extract · call-generation-one",
+    ) is True
 
 
 def test_store_rejects_message_and_event_for_missing_session(tmp_path: Path):

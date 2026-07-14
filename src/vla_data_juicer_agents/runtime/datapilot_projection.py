@@ -135,7 +135,20 @@ class DataPilotReplyProjectionMiddleware(MiddlewareBase):
         input_kwargs: dict[str, Any],
         next_handler: Callable[..., AsyncGenerator],
     ) -> AsyncGenerator:
-        reply_id = ""
+        inputs = input_kwargs.get("inputs")
+        reply_id = str(getattr(inputs, "reply_id", "") or "")
+        continuation_scope = ""
+        if reply_id and isinstance(inputs, EventBase):
+            metadata = getattr(inputs, "metadata", {}) or {}
+            stable_input_id = metadata.get("idempotency_key") or getattr(
+                inputs,
+                "id",
+                "",
+            )
+            continuation_scope = (
+                f"{_event_type(inputs.model_dump(mode='json'))}:"
+                f"{stable_input_id}"
+            )
         ordinal = 0
         async for event in next_handler(**input_kwargs):
             if not isinstance(event, EventBase):
@@ -145,6 +158,7 @@ class DataPilotReplyProjectionMiddleware(MiddlewareBase):
             event_type = _event_type(raw)
             if event_type == "REPLY_START":
                 reply_id = str(raw.get("reply_id", ""))
+                continuation_scope = ""
                 ordinal = 0
             if event_type not in SUPPRESSED_PUBLIC_EVENTS:
                 public = sanitize_agent_event(
@@ -156,7 +170,10 @@ class DataPilotReplyProjectionMiddleware(MiddlewareBase):
                         self._session_id,
                     ),
                 )
-                identity = f"{self._session_id}:{reply_id}:{ordinal}"
+                identity = f"{self._session_id}:{reply_id}:"
+                if continuation_scope:
+                    identity += f"continuation:{continuation_scope}:"
+                identity += str(ordinal)
                 await self._sink.project_agent_event(
                     self._session_id,
                     dedupe_key=hashlib.sha256(identity.encode("utf-8")).hexdigest(),
@@ -194,24 +211,22 @@ class DataPilotRunBoundaryMiddleware(MiddlewareBase):
             return
 
         cancellation = self._sink.run_cancellation(self._session_id)
-        owns_cancellation = cancellation is None
         if cancellation is None:
             cancellation = CancellationContext()
-            self._sink.register_run_cancellation(
-                self._session_id,
-                cancellation,
-            )
+        self._sink.register_run_cancellation(
+            self._session_id,
+            cancellation,
+        )
         try:
             async with cancellation.track_agent(self._session_id):
                 with bind_cancellation(cancellation):
                     async for item in next_handler(**input_kwargs):
                         yield item
         finally:
-            if owns_cancellation:
-                self._sink.clear_run_cancellation(
-                    self._session_id,
-                    cancellation,
-                )
+            self._sink.clear_run_cancellation(
+                self._session_id,
+                cancellation,
+            )
 
 
 def _response_text(response: ToolResponse) -> str:

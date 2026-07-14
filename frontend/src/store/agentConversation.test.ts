@@ -462,6 +462,29 @@ describe("AgentScope conversation reduction", () => {
     expect(state.messages[0].content).toEqual([]);
   });
 
+  it("consumes ownerless thinking before accepting the next reply", () => {
+    const state = createAgentConversation();
+    applyPublicEvent(
+      state,
+      envelope(1, {
+        id: "orphan-thinking",
+        created_at: CREATED_AT,
+        type: "THINKING_BLOCK_DELTA",
+        reply_id: "stale-reply",
+        block_id: "stale-thought",
+        delta: "private stale reasoning",
+      } as AgentEvent),
+    );
+    applyPublicEvent(state, envelope(2, replyStart("reply-2")));
+    applyPublicEvent(state, envelope(3, textStart("reply-2", "block-2")));
+    applyPublicEvent(state, envelope(4, textDelta("reply-2", "block-2", "visible")));
+
+    expect(state.lastSequence).toBe(4);
+    expect(state.currentReplyId).toBe("reply-2");
+    expect(JSON.stringify(state.messages)).not.toContain("private stale reasoning");
+    expect(JSON.stringify(state.messages)).toContain("visible");
+  });
+
   it("treats a restored running tool as active execution while reply is idle", () => {
     const restored = restoreAgentConversation({
       messages: [],

@@ -10,6 +10,7 @@ import pytest
 from agentscope.app.middleware import ToolOffloadMiddleware
 from agentscope.event import (
     CustomEvent,
+    ExternalExecutionResultEvent,
     HintBlockEvent,
     ReplyEndEvent,
     ReplyStartEvent,
@@ -27,6 +28,7 @@ from agentscope.message import (
     AssistantMsg,
     TextBlock,
     ToolCallBlock,
+    ToolResultBlock,
     ToolResultState,
 )
 from agentscope.tool import Toolkit, ToolResponse
@@ -306,6 +308,57 @@ async def test_reply_projection_never_persists_native_thinking_content():
     ]
     assert "private chain of thought" not in json.dumps(sink.events)
     assert "public answer" in json.dumps(sink.events)
+
+
+@pytest.mark.asyncio
+async def test_reply_projection_distinguishes_sequential_hitl_continuations_without_reply_start():
+    sink = RecordingSink()
+    agent = SimpleNamespace(state=SimpleNamespace(reply_id="reply-1"))
+
+    def continuation(tool_call_id: str) -> ExternalExecutionResultEvent:
+        return ExternalExecutionResultEvent(
+            id=f"continuation-{tool_call_id}",
+            reply_id="reply-1",
+            execution_results=[
+                ToolResultBlock(
+                    id=tool_call_id,
+                    name="request_human_decision",
+                    output="confirmed",
+                    state=ToolResultState.SUCCESS,
+                )
+            ],
+        )
+
+    async def project_one(input_event: ExternalExecutionResultEvent, delta: str) -> str:
+        middleware = DataPilotReplyProjectionMiddleware(
+            "internal-nav-session",
+            sink,
+        )
+
+        async def handler(**_kwargs: Any):
+            yield TextBlockDeltaEvent(
+                reply_id="reply-1",
+                block_id=f"block-{delta}",
+                delta=delta,
+            )
+
+        await anext(
+            middleware.on_reply(
+                agent,
+                {"inputs": input_event},
+                handler,
+            )
+        )
+        return sink.dedupe_keys[-1]
+
+    first_input = continuation("confirm-1")
+    second_input = continuation("confirm-2")
+    first_key = await project_one(first_input, "first")
+    second_key = await project_one(second_input, "second")
+    retry_key = await project_one(first_input, "first")
+
+    assert first_key != second_key
+    assert retry_key == first_key
 
 
 @pytest.mark.asyncio

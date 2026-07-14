@@ -1583,6 +1583,89 @@ async def test_runtime_interrupt_web_session_stops_active_chat_and_public_tool(
 
 
 @pytest.mark.asyncio
+async def test_explicit_stop_preserves_public_tool_call_id_containing_private_identity(
+    tmp_path: Path,
+) -> None:
+    message_bus = FakeAgentScopeMessageBus()
+    runtime = _runtime(chat_run_registry=FakeChatRunRegistry(), message_bus=message_bus)
+    store = WebSessionStore(tmp_path / "sessions.sqlite")
+    public_session = store.create_session("correlation identity")
+    private_session_id = "private-as-session"
+    public_tool_call_id = f"public-call-containing-{private_session_id}"
+    store.save_agentscope_session_mapping(
+        public_session.id,
+        agent_id="main-router-agent",
+        agentscope_session_id=private_session_id,
+    )
+    store.start_tool_run(
+        public_session.id,
+        public_tool_call_id,
+        "extract",
+        "2026-07-15T00:00:00.000+00:00",
+    )
+    runtime.set_web_session_store(store)
+
+    result = await runtime.interrupt_web_session(web_session_id=public_session.id)
+
+    detail = store.get_session(public_session.id)
+    assert detail is not None
+    assert result.stopped_tool_call_ids == [public_tool_call_id]
+    assert detail.tool_runs[0].tool_call_id == public_tool_call_id
+    terminal = next(
+        record.event
+        for record in detail.events
+        if record.event.get("name") == "datapilot_tool_terminal"
+    )
+    assert terminal["value"]["tool_call_id"] == public_tool_call_id
+
+
+@pytest.mark.asyncio
+async def test_tool_terminal_event_append_failure_rolls_back_ledger_transition(
+    tmp_path: Path,
+) -> None:
+    store = WebSessionStore(tmp_path / "sessions.sqlite")
+    public_session = store.create_session("atomic terminal")
+    internal_session_id = "internal-navigation-session"
+    store.save_agentscope_session_mapping(
+        public_session.id,
+        agent_id="navigation-data-agent",
+        agentscope_session_id=internal_session_id,
+    )
+    runtime = _runtime(workspace_root=tmp_path)
+    runtime.set_web_session_store(store)
+    await runtime.start_public_tool(
+        internal_session_id,
+        tool_call_id="call-atomic",
+        tool_name="extract",
+    )
+
+    with sqlite3.connect(store.db_path) as connection:
+        connection.execute(
+            """
+            CREATE TRIGGER fail_atomic_terminal
+            BEFORE INSERT ON public_events
+            BEGIN
+                SELECT RAISE(ABORT, 'terminal append failed');
+            END
+            """
+        )
+
+    with pytest.raises(sqlite3.IntegrityError, match="terminal append failed"):
+        await runtime.finish_public_tool(
+            internal_session_id,
+            tool_call_id="call-atomic",
+            status="success",
+            summary="done",
+            error_type=None,
+        )
+
+    detail = store.get_session(public_session.id)
+    assert detail is not None
+    assert detail.tool_runs[0].status == "running"
+    assert detail.events == []
+
+
+@pytest.mark.asyncio
 async def test_runtime_interrupt_web_session_interrupts_hitl_and_all_historical_mappings(
     tmp_path: Path,
 ) -> None:
@@ -2326,6 +2409,60 @@ async def test_runtime_start_agent_run_registers_binds_and_cleans_cancellation()
 
     assert runtime.run_cancellation(session_id) is None
     assert runtime.app.state.chat_service.seen_cancellations == [cancellation]
+
+
+def test_runtime_cancels_retained_tool_leases_across_generations_and_multiple_tools() -> None:
+    runtime = _runtime()
+    first = CancellationContext()
+    second = CancellationContext()
+    session_id = "as-session-lease"
+
+    runtime.register_run_cancellation(session_id, first, generation=1)
+    runtime.retain_tool_cancellation(session_id, "call-1", first)
+    runtime.retain_tool_cancellation(session_id, "call-2", first)
+    runtime.clear_run_cancellation(session_id, first)
+    runtime.register_run_cancellation(session_id, second, generation=2)
+    runtime.retain_tool_cancellation(session_id, "call-3", second)
+    runtime.clear_run_cancellation(session_id, second)
+
+    assert runtime.run_cancellation(session_id) is second
+    assert runtime.cancel_run_cancellations(session_id) is True
+    assert first.cancelled is True
+    assert second.cancelled is True
+    runtime.discard_run_cancellations(session_id)
+    assert runtime.run_cancellation(session_id) is None
+
+
+@pytest.mark.asyncio
+async def test_direct_wakeup_keeps_foreground_lease_when_last_background_tool_finishes() -> None:
+    runtime = _runtime()
+    cancellation = CancellationContext()
+    session_id = "as-direct-wakeup"
+    runtime.register_run_cancellation(session_id, cancellation, generation=1)
+    runtime.retain_tool_cancellation(session_id, "call-1", cancellation)
+    runtime.clear_run_cancellation(session_id, cancellation)
+    middleware = DataPilotRunBoundaryMiddleware(session_id, runtime)
+
+    async def handler(**_kwargs):
+        runtime.release_tool_cancellation(session_id, "call-1", cancellation)
+        assert runtime.run_cancellation(session_id) is cancellation
+        yield ReplyStartEvent(
+            session_id=session_id,
+            reply_id="reply-wakeup",
+            name="MainRouterAgent",
+        )
+
+    yielded = [
+        item
+        async for item in middleware.on_reply(
+            SimpleNamespace(name="MainRouterAgent"),
+            {"inputs": None},
+            handler,
+        )
+    ]
+
+    assert len(yielded) == 1
+    assert runtime.run_cancellation(session_id) is None
 
 
 @pytest.mark.asyncio

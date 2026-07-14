@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 from contextlib import AsyncExitStack
 from dataclasses import dataclass
@@ -16,7 +17,9 @@ from agentscope.app._manager import (
 )
 from agentscope.app._service._chat import ChatService
 from agentscope.app.message_bus import MessageBusKeys
-from agentscope.app.middleware import ToolOffloadMiddleware
+from agentscope.app.middleware import InboxMiddleware, ToolOffloadMiddleware
+from agentscope.event import HintBlockEvent
+from agentscope.message import HintBlock, UserMsg
 from agentscope.permission import PermissionBehavior, PermissionDecision
 from agentscope.tool import FunctionTool, Toolkit
 
@@ -34,7 +37,11 @@ from vla_data_juicer_agents.runtime.agentscope_bootstrap import (
 )
 from vla_data_juicer_agents.runtime.agentscope_runtime import (
     AgentScopeRuntime,
+    _StopAwareMessageBus,
     build_extra_agent_middlewares_factory,
+)
+from vla_data_juicer_agents.runtime.datapilot_projection import (
+    DataPilotRunBoundaryMiddleware,
 )
 from vla_data_juicer_agents.web.agent_session import AgentScopeWebSessionManager
 from vla_data_juicer_agents.web.event_stream import SessionEventBus
@@ -479,3 +486,167 @@ async def test_real_agentscope_explicit_stop_wins_over_late_background_success(
         assert case.message_bus._queues[MessageBusKeys.wakeup_queue()] == []
     finally:
         await case.stack.aclose()
+
+
+@pytest.mark.asyncio
+async def test_stopped_tool_hint_queued_during_suppressed_wakeup_is_not_injected_into_new_turn(
+    tmp_path: Path,
+) -> None:
+    config = runtime_config(tmp_path)
+    message_bus = DeterministicMessageBus()
+    store = WebSessionStore(tmp_path / "stale-hint.sqlite")
+    public_session = store.create_session("stale stopped hint")
+    internal_session_id = "private-router-session"
+    tool_call_id = "call-stopped-before-wakeup"
+    store.save_agentscope_session_mapping(
+        public_session.id,
+        agent_id=config.main_router_agent_id,
+        agentscope_session_id=internal_session_id,
+    )
+    store.begin_execution_generation(public_session.id)
+    store.start_tool_run(
+        public_session.id,
+        tool_call_id,
+        "extract",
+        "2026-07-15T00:00:00.000+00:00",
+    )
+    store.stop_open_tool_runs_with_terminal_events(
+        public_session.id,
+        lambda row: (
+            hashlib.sha256(f"stop:{row.tool_call_id}".encode()).hexdigest(),
+            {
+                "type": "CUSTOM",
+                "name": "datapilot_tool_terminal",
+                "value": {
+                    "tool_call_id": row.tool_call_id,
+                    "status": "stopped",
+                    "summary": "已由用户停止",
+                },
+            },
+        ),
+    )
+    stale_hint = HintBlock(
+        source=json.dumps(
+            {
+                "label": "tool_output",
+                "sublabel": f"extract · {tool_call_id}",
+            }
+        ),
+        hint="OLD STOPPED RESULT",
+    )
+    inbox_key = MessageBusKeys.inbox(internal_session_id)
+    await message_bus.queue_push(inbox_key, stale_hint.model_dump(mode="json"))
+
+    runtime = AgentScopeRuntime(
+        config=config,
+        storage=ChatServiceStorage(),
+        message_bus=message_bus,
+        workspace_manager=ChatServiceWorkspaceManager(),
+        app=SimpleNamespace(state=SimpleNamespace()),
+        bootstrapped=True,
+    )
+    runtime.set_web_session_store(store)
+    boundary = DataPilotRunBoundaryMiddleware(internal_session_id, runtime)
+    agent = SimpleNamespace(
+        name="MainRouterAgent",
+        state=SimpleNamespace(
+            session_id=internal_session_id,
+            reply_id="reply-new",
+            context=[],
+        ),
+    )
+
+    async def should_not_run(**_kwargs):
+        pytest.fail("stopped wakeup must be suppressed")
+        yield  # pragma: no cover
+
+    suppressed = [
+        item
+        async for item in boundary.on_reply(
+            agent,
+            {"inputs": None},
+            should_not_run,
+        )
+    ]
+    assert len(suppressed) == 1
+    assert message_bus._queues[inbox_key]
+
+    store.begin_execution_generation(public_session.id)
+    store.start_tool_run(
+        public_session.id,
+        "call-new-success",
+        "extract",
+        "2026-07-15T00:01:00.000+00:00",
+    )
+    store.finish_tool_run(
+        public_session.id,
+        "call-new-success",
+        status="success",
+        summary="new done",
+    )
+    current_hint = HintBlock(
+        source=json.dumps(
+            {
+                "label": "tool_output",
+                "sublabel": "extract · call-new-success",
+            }
+        ),
+        hint="NEW SUCCESS RESULT",
+    )
+    await message_bus.queue_push(inbox_key, current_hint.model_dump(mode="json"))
+    inbox = InboxMiddleware(
+        _StopAwareMessageBus(message_bus, lambda: runtime)
+    )
+
+    async def reasoning(**_kwargs):
+        return
+        yield  # pragma: no cover
+
+    async def new_turn(**_kwargs):
+        async for item in inbox.on_reasoning(
+            agent,
+            {},
+            reasoning,
+        ):
+            yield item
+
+    resumed = [
+        item
+        async for item in boundary.on_reply(
+            agent,
+            {"inputs": UserMsg(name="user", content="new turn")},
+            new_turn,
+        )
+    ]
+
+    hints = [item for item in resumed if isinstance(item, HintBlockEvent)]
+    assert len(hints) == 1
+    context_json = json.dumps(
+        [message.model_dump(mode="json") for message in agent.state.context],
+        ensure_ascii=False,
+    )
+    assert "OLD STOPPED RESULT" not in context_json
+    assert "NEW SUCCESS RESULT" in context_json
+
+
+@pytest.mark.asyncio
+async def test_stop_aware_message_bus_preserves_wrapped_async_lifecycle() -> None:
+    class LifecycleBus(DeterministicMessageBus):
+        entered = False
+        exited = False
+
+        async def __aenter__(self):
+            self.entered = True
+            return self
+
+        async def __aexit__(self, *_args):
+            self.exited = True
+
+    wrapped = LifecycleBus()
+    proxy = _StopAwareMessageBus(wrapped, lambda: None)
+
+    async with proxy as entered:
+        assert entered is proxy
+        assert wrapped.entered is True
+
+    assert wrapped.exited is True
