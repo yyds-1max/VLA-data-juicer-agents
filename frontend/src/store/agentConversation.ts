@@ -130,6 +130,9 @@ export function applyPublicEvent(
   if (envelope.sequence <= state.lastSequence) {
     return;
   }
+  if (envelope.sequence > state.lastSequence + 1) {
+    return;
+  }
 
   const event = normalizePublicAgentEvent(envelope);
   if (event.type === EventType.REPLY_START) {
@@ -137,6 +140,8 @@ export function applyPublicEvent(
     if (!state.currentReplyId && stringValue(start.reply_id)) {
       startReply(state, start);
     }
+  } else if (isReplyScopedEvent(event) && !state.currentReplyId) {
+    return;
   } else if (!eventBelongsToCurrentReply(state, event)) {
     state.lastSequence = envelope.sequence;
     return;
@@ -164,6 +169,10 @@ export function applyPublicEvent(
   }
 
   state.lastSequence = envelope.sequence;
+}
+
+function isReplyScopedEvent(event: AgentEvent): boolean {
+  return "reply_id" in event;
 }
 
 function eventBelongsToCurrentReply(
@@ -277,6 +286,29 @@ function applyDataPilotCustomEvent(
     if (decision) {
       state.pendingHumanDecision = decision;
     }
+    return;
+  }
+  if (event.name === "datapilot_human_decision_resolved") {
+    projectHumanDecisionResolution(state, event.value);
+  }
+}
+
+function projectHumanDecisionResolution(
+  state: AgentConversationState,
+  value: Record<string, unknown>,
+): void {
+  const pending = state.pendingHumanDecision;
+  if (!pending) {
+    return;
+  }
+  const reason = stringValue(value.reason);
+  if (value.all === true && reason === "stopped") {
+    state.pendingHumanDecision = null;
+    return;
+  }
+  const requestId = stringValue(value.request_id) || stringValue(value.requestId);
+  if (reason === "submitted" && requestId && requestId === pending.requestId) {
+    state.pendingHumanDecision = null;
   }
 }
 

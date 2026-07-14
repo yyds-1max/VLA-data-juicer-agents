@@ -139,6 +139,10 @@ function externalResult(replyId: string, toolCallId: string, requestId: string):
   };
 }
 
+function decisionResolved(value: Record<string, unknown>): AgentEvent {
+  return custom("datapilot_human_decision_resolved", value);
+}
+
 function conversationAwaitingDecision() {
   const state = createAgentConversation();
   applyPublicEvent(state, envelope(1, replyStart("reply-1")));
@@ -559,6 +563,70 @@ describe("AgentScope conversation reduction", () => {
     expect(restored.pendingHumanDecision).toBeNull();
   });
 
+  it("clears matching HITL when replay contains the durable backend resolution event", () => {
+    const restored = restoreAgentConversation({
+      messages: [],
+      events: [
+        envelope(1, replyStart("reply-1")),
+        envelope(2, toolCallStart("reply-1", "decision-1", "request_human_decision")),
+        envelope(3, requireDecision("reply-1", "decision-1", validDecisionInput())),
+        envelope(
+          4,
+          decisionResolved({ request_id: "request-1", reason: "submitted" }),
+        ),
+        envelope(5, replyEnd("reply-1")),
+      ],
+      toolRuns: [],
+      lastSequence: 5,
+    });
+
+    expect(restored.pendingHumanDecision).toBeNull();
+  });
+
+  it("keeps parked HITL pending when a reply ends without a resolution event", () => {
+    const restored = restoreAgentConversation({
+      messages: [],
+      events: [
+        envelope(1, replyStart("reply-1")),
+        envelope(2, toolCallStart("reply-1", "decision-1", "request_human_decision")),
+        envelope(3, requireDecision("reply-1", "decision-1", validDecisionInput())),
+        envelope(4, replyEnd("reply-1")),
+      ],
+      toolRuns: [],
+      lastSequence: 4,
+    });
+
+    expect(restored.pendingHumanDecision).toMatchObject({
+      requestId: "request-1",
+      toolCallId: "decision-1",
+    });
+  });
+
+  it("clears any pending HITL for a durable explicit-stop resolution", () => {
+    const state = conversationAwaitingDecision();
+
+    applyPublicEvent(
+      state,
+      envelope(4, decisionResolved({ all: true, reason: "stopped" })),
+    );
+
+    expect(state.pendingHumanDecision).toBeNull();
+  });
+
+  it.each([
+    { request_id: "wrong-request", reason: "submitted" },
+    { request_id: "request-1" },
+    { all: true },
+    { all: false, reason: "stopped" },
+    { all: true, reason: "submitted" },
+  ])("does not clear HITL for wrong or malformed durable resolution %#", (value) => {
+    const state = conversationAwaitingDecision();
+
+    applyPublicEvent(state, envelope(4, decisionResolved(value)));
+
+    expect(state.pendingHumanDecision).toMatchObject({ requestId: "request-1" });
+  });
+
   it("does not open DataPilot HITL for unrelated external tool execution", () => {
     const state = createAgentConversation();
     applyPublicEvent(state, envelope(1, replyStart("reply-1")));
@@ -639,6 +707,26 @@ describe("AgentScope conversation reduction", () => {
     );
 
     expect(state.pendingHumanDecision).toBeNull();
+  });
+
+  it("does not consume a sequence gap while a reply is active", () => {
+    const state = createAgentConversation();
+    applyPublicEvent(state, envelope(1, replyStart("reply-1")));
+
+    applyPublicEvent(state, envelope(3, textDelta("reply-1", "block-1", "late")));
+
+    expect(state.lastSequence).toBe(1);
+    expect(state.messages[0].content).toEqual([]);
+    expect(state.currentReplyId).toBe("reply-1");
+  });
+
+  it("does not consume an ownerless reply continuation even at the next sequence", () => {
+    const state = createAgentConversation();
+
+    applyPublicEvent(state, envelope(1, textStart("reply-1", "block-1")));
+
+    expect(state.lastSequence).toBe(0);
+    expect(state.messages).toEqual([]);
   });
 });
 
@@ -820,6 +908,45 @@ describe("DataPilot conversation store", () => {
       "server-user",
     ]);
     expect(store.getState().conversation.lastSequence).toBe(2);
+  });
+
+  it("rebuilds a complete snapshot after live events expose a cursor gap", () => {
+    const store = createDataPilotStore();
+    store.setState({
+      open: true,
+      mode: "active_session",
+      currentSessionId: "session-1",
+    });
+
+    store
+      .getState()
+      .applyEvent(envelope(2, textDelta("reply-1", "block-1", "gap delta")));
+    expect(store.getState().conversation.lastSequence).toBe(0);
+
+    store.getState().refreshActiveSession(
+      sessionDetail({
+        messages: [userRecord("user-1", "local request", CREATED_AT)],
+        events: [
+          timedEnvelope(1, replyStart("reply-1"), "2026-07-15T08:00:01.000Z"),
+          timedEnvelope(2, textStart("reply-1", "block-1"), "2026-07-15T08:00:02.000Z"),
+          timedEnvelope(
+            3,
+            textDelta("reply-1", "block-1", "complete reply"),
+            "2026-07-15T08:00:03.000Z",
+          ),
+        ],
+        last_sequence: 3,
+      }),
+    );
+
+    expect(store.getState().conversation.lastSequence).toBe(3);
+    expect(store.getState().conversation.messages.map((message) => message.id)).toEqual([
+      "user-1",
+      "reply-1",
+    ]);
+    expect(store.getState().conversation.messages[1].content).toContainEqual(
+      expect.objectContaining({ type: "text", text: "complete reply" }),
+    );
   });
 });
 

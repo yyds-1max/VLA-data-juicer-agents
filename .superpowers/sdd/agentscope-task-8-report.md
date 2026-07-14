@@ -168,3 +168,62 @@ Fresh review-fix verification:
 No SDK, test, TypeScript, or build warnings remain. The Task 8 boundary is unchanged:
 WebSocket transport remains in place, and no Task 9 fetch-SSE or delete-session work
 was added.
+
+## Second review fix: durable HITL resolution and reconnect gaps
+
+The second independent review fix adds a replayable public source of truth for HITL
+completion and prevents live cursor races from consuming incomplete event streams.
+
+Backend resolution contract:
+
+- Accepted human-decision submissions append a sanitized AgentScope `CustomEvent`
+  named `datapilot_human_decision_resolved` with non-empty public `request_id` and
+  `reason: "submitted"`.
+- Successful explicit stop appends the same event name with `all: true` and
+  `reason: "stopped"`, clearing any parked decision for the public session.
+- Resolution dedupe keys are opaque SHA-256 values. The serialized public record and
+  key expose no AgentScope session or agent identity.
+- Durable append commits before best-effort live publish. Duplicate submissions and
+  stops reuse the durable event identity. If AgentScope accepted a decision but the
+  resolution append failed, the existing consumption ledger lets an exact retry
+  append the missing event without spawning the AgentScope continuation again.
+- Rejected decisions and failed explicit cancellation do not write a false resolution.
+  The HTTP decision schema now rejects empty or whitespace-only public request IDs.
+
+Frontend replay and cursor contract:
+
+- A durable resolution clears pending HITL only for the matching request, or for the
+  strict `all: true`/`reason: "stopped"` contract. Wrong or malformed events do not
+  clear state; native `EXTERNAL_EXECUTION_RESULT` remains supported.
+- `REPLY_END` does not clear pending HITL. Snapshot replay of require → resolution →
+  reply end is resolved, while require → reply end remains parked.
+- Public event reduction requires the next contiguous sequence. Gaps do not reduce or
+  advance `lastSequence`. Reply-scoped continuation without a current owner likewise
+  leaves the cursor unchanged; a wrong owner while another reply is active remains a
+  consumed fail-closed event as specified by the first review fix.
+- Deterministic cursor-0 and cursor-N gap coverage proves a subsequent complete
+  snapshot rebuilds the full SDK reply and retains the server-persisted local user
+  message. No second reducer or Task 9 transport lifecycle was added.
+
+Second review RED/GREEN evidence:
+
+- Backend durable-resolution tests first produced 3 expected failures with the
+  rejection control passing, then passed 4/4. Public request-ID validation separately
+  failed 2/2 before the schema fix and passed 2/2 afterward.
+- Frontend replay/gap tests first produced 5 expected failures with 46 controls
+  passing, then the reducer/store file passed 51/51 without SDK warnings.
+
+Fresh second-review verification:
+
+- frontend client + reducer/store + App targets: 3 files, 123 tests passed;
+- full frontend Vitest: 7 files, 142 tests passed;
+- AgentScope web-session runtime regression: 112 tests passed;
+- focused public-event/HITL/interrupt API and store regression: 66 tests passed;
+- full Python suite: 891 tests passed;
+- standalone TypeScript check, production build (1,626 modules), Python `compileall`,
+  and `git diff --check`: exit 0.
+
+The full Python suite emits one pre-existing third-party `StarletteDeprecationWarning`
+from FastAPI's `TestClient` import. No AgentScope SDK, application runtime, frontend,
+TypeScript, or build warnings are emitted. WebSocket remains the Task 8 transport;
+fetch-SSE, `AbortController`, and session-delete UI remain Task 9 work.

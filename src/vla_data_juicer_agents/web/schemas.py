@@ -91,6 +91,14 @@ class HumanDecisionRequest(BaseModel):
     reply_id: str = Field(max_length=512)
     text: str | None = Field(default=None, max_length=4000, validate_default=True)
 
+    @field_validator("request_id")
+    @classmethod
+    def request_id_must_not_be_empty(cls, value: str) -> str:
+        request_id = value.strip()
+        if not request_id:
+            raise ValueError("request_id must not be empty")
+        return request_id
+
     @field_validator("text")
     @classmethod
     def guide_text_must_not_be_empty(cls, value: str | None, info: Any) -> str | None:

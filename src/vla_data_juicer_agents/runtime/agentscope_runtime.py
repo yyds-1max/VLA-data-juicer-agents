@@ -252,6 +252,63 @@ class AgentScopeRuntime:
                 exc_info=True,
             )
 
+    async def _record_human_decision_resolution(
+        self,
+        web_session_id: str,
+        *,
+        request_id: str | None = None,
+        all_pending: bool = False,
+        reason: str,
+    ) -> Any | None:
+        record = self._append_human_decision_resolution(
+            web_session_id,
+            request_id=request_id,
+            all_pending=all_pending,
+            reason=reason,
+        )
+        if record is not None:
+            await self._publish_public_record(web_session_id, record)
+        return record
+
+    def _append_human_decision_resolution(
+        self,
+        web_session_id: str,
+        *,
+        request_id: str | None = None,
+        all_pending: bool = False,
+        reason: str,
+    ) -> Any | None:
+        if self.web_session_store is None:
+            return None
+        value: dict[str, Any] = {"reason": reason}
+        if all_pending:
+            value["all"] = True
+            public_identity = "all"
+        else:
+            normalized_request_id = (request_id or "").strip()
+            if not normalized_request_id:
+                raise ValueError("human decision resolution requires request_id")
+            value["request_id"] = normalized_request_id
+            public_identity = normalized_request_id
+        event = CustomEvent(
+            name="datapilot_human_decision_resolved",
+            value=value,
+        ).model_dump(mode="json")
+        event = sanitize_agent_event(
+            event,
+            private_identities=self.projection_private_identities(),
+        )
+        identity = (
+            f"human-decision-resolved:{web_session_id}:"
+            f"{public_identity}:{reason}"
+        )
+        record = self.web_session_store.append_public_event(
+            web_session_id,
+            hashlib.sha256(identity.encode("utf-8")).hexdigest(),
+            event,
+        )
+        return record
+
     async def ensure_web_session(self, web_session_id: str, *, agent_id: str, model: str) -> str:
         existing = self.web_sessions.get(web_session_id)
         if existing and existing[0] == agent_id:
@@ -535,6 +592,14 @@ class AgentScopeRuntime:
                     terminal_event,
                 )
             )
+            if interrupted or stopped:
+                resolution = self._append_human_decision_resolution(
+                    web_session_id,
+                    all_pending=True,
+                    reason="stopped",
+                )
+                if resolution is not None:
+                    records.append(resolution)
         for record in records:
             await self._publish_public_record(web_session_id, record)
         return InterruptResponse(
@@ -717,6 +782,17 @@ class AgentScopeRuntime:
 
         claim_handoff = False
         try:
+            if self._is_human_decision_consumed(
+                agentscope_session_id=agentscope_session_id,
+                reply_id=decision["reply_id"],
+                tool_call_id=decision["tool_call_id"],
+            ):
+                await self._record_human_decision_resolution(
+                    web_session_id,
+                    request_id=decision.get("request_id"),
+                    reason="submitted",
+                )
+                return True
             if plan_store is not None:
                 existing = plan_store.get_human_decision_handoff(plan_id, step_id)
                 if existing is not None and existing.status == "quarantined":
@@ -738,6 +814,11 @@ class AgentScopeRuntime:
                     self._mark_human_decision_consumed(
                         agentscope_session_id=agentscope_session_id,
                         decision=decision,
+                    )
+                    await self._record_human_decision_resolution(
+                        web_session_id,
+                        request_id=decision.get("request_id"),
+                        reason="submitted",
                     )
                     return True
                 if existing is not None:
@@ -765,6 +846,11 @@ class AgentScopeRuntime:
                         self._mark_human_decision_consumed(
                             agentscope_session_id=agentscope_session_id,
                             decision=decision,
+                        )
+                        await self._record_human_decision_resolution(
+                            web_session_id,
+                            request_id=decision.get("request_id"),
+                            reason="submitted",
                         )
                         return True
                     if external_state not in {"submitted", "consumed"}:
@@ -826,6 +912,11 @@ class AgentScopeRuntime:
                     self._mark_human_decision_consumed(
                         agentscope_session_id=agentscope_session_id,
                         decision=decision,
+                    )
+                    await self._record_human_decision_resolution(
+                        web_session_id,
+                        request_id=decision.get("request_id"),
+                        reason="submitted",
                     )
                     return True
                 if delivery == "recovery_required":
@@ -994,6 +1085,11 @@ class AgentScopeRuntime:
                     decision=decision,
                 )
             claim_handoff = True
+            await self._record_human_decision_resolution(
+                web_session_id,
+                request_id=decision.get("request_id"),
+                reason="submitted",
+            )
             return True
         finally:
             if not claim_handoff:

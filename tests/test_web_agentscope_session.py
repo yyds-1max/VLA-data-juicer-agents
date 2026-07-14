@@ -1574,7 +1574,7 @@ async def test_runtime_interrupt_web_session_stops_active_chat_and_public_tool(
     assert len(terminal[0].dedupe_key) == 64
     assert "call-1" not in terminal[0].dedupe_key
     assert [(session_id, record.id) for session_id, record in published] == [
-        (public_session.id, terminal[0].id)
+        (public_session.id, record.id) for record in detail.events
     ]
 
 
@@ -1596,15 +1596,41 @@ async def test_runtime_interrupt_web_session_interrupts_hitl_and_all_historical_
         agent_id="navigation-data-agent",
         agentscope_session_id="parked-hitl-session",
     )
-    runtime.set_web_session_store(store)
+    published = []
+
+    def publish(session_id, record):
+        detail = store.get_session(session_id)
+        assert detail is not None
+        assert record.id in [persisted.id for persisted in detail.events]
+        published.append(record)
+
+    runtime.set_web_transport(store, publish)
 
     result = await runtime.interrupt_web_session(web_session_id=public_session.id)
+    repeated = await runtime.interrupt_web_session(web_session_id=public_session.id)
 
     assert result == InterruptResponse(interrupted=True, stopped_tool_call_ids=[])
+    assert repeated == InterruptResponse(interrupted=True, stopped_tool_call_ids=[])
     assert runtime.app.state.chat_service.interrupt_calls == [
         ("alice", "historical-worker-session", "historical-worker-agent"),
         ("alice", "parked-hitl-session", "navigation-data-agent"),
+        ("alice", "historical-worker-session", "historical-worker-agent"),
+        ("alice", "parked-hitl-session", "navigation-data-agent"),
     ]
+    detail = store.get_session(public_session.id)
+    assert detail is not None
+    resolved = [
+        record
+        for record in detail.events
+        if record.event.get("name") == "datapilot_human_decision_resolved"
+    ]
+    assert len(resolved) == 1
+    assert resolved[0].event["value"] == {"all": True, "reason": "stopped"}
+    assert len(resolved[0].dedupe_key) == 64
+    serialized = json.dumps(resolved[0].model_dump(mode="json"), ensure_ascii=False)
+    assert "historical-worker-session" not in serialized
+    assert "parked-hitl-session" not in serialized
+    assert published[0] == resolved[0]
 
 
 @pytest.mark.asyncio
@@ -1874,7 +1900,11 @@ async def test_runtime_interrupt_live_publish_failure_keeps_durable_stopped(
     detail = store.get_session(public_session.id)
     assert detail is not None
     assert detail.tool_runs[0].status == "stopped"
-    assert [record.event["value"]["status"] for record in detail.events] == ["stopped"]
+    assert [
+        record.event["value"]["status"]
+        for record in detail.events
+        if record.event.get("name") == "datapilot_tool_terminal"
+    ] == ["stopped"]
     assert "Live public event publish failed" in caplog.text
 
 
@@ -1962,7 +1992,11 @@ async def test_explicit_stop_serializes_real_middleware_cancellation_as_stopped(
     detail = store.get_session(public_session.id)
     assert detail is not None
     assert detail.tool_runs[0].status == "stopped"
-    assert [record.event["value"]["status"] for record in detail.events] == ["stopped"]
+    assert [
+        record.event["value"]["status"]
+        for record in detail.events
+        if record.event.get("name") == "datapilot_tool_terminal"
+    ] == ["stopped"]
 
 
 @pytest.mark.asyncio
@@ -2047,7 +2081,11 @@ async def test_explicit_stop_serializes_real_tool_response_as_stopped(
     detail = store.get_session(public_session.id)
     assert detail is not None
     assert detail.tool_runs[0].status == "stopped"
-    assert [record.event["value"]["status"] for record in detail.events] == ["stopped"]
+    assert [
+        record.event["value"]["status"]
+        for record in detail.events
+        if record.event.get("name") == "datapilot_tool_terminal"
+    ] == ["stopped"]
 
 
 @pytest.mark.asyncio
@@ -2258,7 +2296,11 @@ async def test_concurrent_explicit_stops_are_serialized_and_terminalize_once(
     detail = store.get_session(public_session.id)
     assert detail is not None
     assert detail.tool_runs[0].status == "stopped"
-    assert [record.event["value"]["status"] for record in detail.events] == ["stopped"]
+    assert [
+        record.event["value"]["status"]
+        for record in detail.events
+        if record.event.get("name") == "datapilot_tool_terminal"
+    ] == ["stopped"]
 
 
 @pytest.mark.asyncio
@@ -2404,6 +2446,159 @@ async def test_runtime_submit_human_decision_resumes_calibration_request_human_d
         "tool_name": "confirm_navigation_calibration_params",
         "message": "Camera parameters confirmed by user.",
     }
+
+
+@pytest.mark.asyncio
+async def test_runtime_persists_human_decision_resolution_before_best_effort_publish(
+    tmp_path: Path,
+) -> None:
+    chat_run_registry = FakeChatRunRegistry()
+    storage = FakeAgentScopeStorage()
+    storage.session_records[("alice", "navigation-data-agent", "private-as-session")] = (
+        _agentscope_session_record()
+    )
+    runtime = _runtime(storage=storage, chat_run_registry=chat_run_registry)
+    store = WebSessionStore(tmp_path / "sessions.sqlite")
+    public_session = store.create_session("decision resolution")
+    store.save_agentscope_session_mapping(
+        public_session.id,
+        agent_id="navigation-data-agent",
+        agentscope_session_id="private-as-session",
+    )
+    published = []
+
+    def publish(session_id, record):
+        detail = store.get_session(session_id)
+        assert detail is not None
+        assert record.id in [persisted.id for persisted in detail.events]
+        published.append(record)
+
+    runtime.set_web_transport(store, publish)
+    decision = {
+        "action": "confirm",
+        "request_id": "public-request-1",
+        "tool_call_id": "tool-call-1",
+        "reply_id": "reply-1",
+    }
+
+    accepted = await runtime.submit_human_decision(
+        web_session_id=public_session.id,
+        decision=decision,
+    )
+    await chat_run_registry.drain()
+
+    assert accepted is True
+    detail = store.get_session(public_session.id)
+    assert detail is not None
+    resolved = [
+        record
+        for record in detail.events
+        if record.event.get("name") == "datapilot_human_decision_resolved"
+    ]
+    assert len(resolved) == 1
+    assert resolved[0].event["value"] == {
+        "request_id": "public-request-1",
+        "reason": "submitted",
+    }
+    assert len(resolved[0].dedupe_key) == 64
+    serialized = json.dumps(resolved[0].model_dump(mode="json"), ensure_ascii=False)
+    assert "private-as-session" not in serialized
+    assert "navigation-data-agent" not in serialized
+    assert published == resolved
+
+
+@pytest.mark.asyncio
+async def test_runtime_human_decision_resolution_append_failure_can_be_retried(
+    tmp_path: Path,
+) -> None:
+    chat_run_registry = FakeChatRunRegistry()
+    storage = FakeAgentScopeStorage()
+    storage.session_records[("alice", "navigation-data-agent", "as-session-1")] = (
+        _agentscope_session_record()
+    )
+    runtime = _runtime(storage=storage, chat_run_registry=chat_run_registry)
+    store = WebSessionStore(tmp_path / "sessions.sqlite")
+    public_session = store.create_session("retry resolution append")
+    store.save_agentscope_session_mapping(
+        public_session.id,
+        agent_id="navigation-data-agent",
+        agentscope_session_id="as-session-1",
+    )
+    runtime.set_web_session_store(store)
+    original_append = store.append_public_event
+    fail_resolution_once = True
+
+    def flaky_append(session_id, dedupe_key, event):
+        nonlocal fail_resolution_once
+        if (
+            fail_resolution_once
+            and event.get("name") == "datapilot_human_decision_resolved"
+        ):
+            fail_resolution_once = False
+            raise RuntimeError("resolution append failed")
+        return original_append(session_id, dedupe_key, event)
+
+    store.append_public_event = flaky_append
+    decision = {
+        "action": "confirm",
+        "request_id": "request-1",
+        "tool_call_id": "tool-call-1",
+        "reply_id": "reply-1",
+    }
+
+    try:
+        with pytest.raises(RuntimeError, match="resolution append failed"):
+            await runtime.submit_human_decision(
+                web_session_id=public_session.id,
+                decision=decision,
+            )
+    finally:
+        await chat_run_registry.drain()
+
+    retried = await runtime.submit_human_decision(
+        web_session_id=public_session.id,
+        decision=decision,
+    )
+
+    assert retried is True
+    assert chat_run_registry.spawns == []
+    detail = store.get_session(public_session.id)
+    assert detail is not None
+    assert [
+        record.event["value"]
+        for record in detail.events
+        if record.event.get("name") == "datapilot_human_decision_resolved"
+    ] == [{"request_id": "request-1", "reason": "submitted"}]
+
+
+@pytest.mark.asyncio
+async def test_runtime_rejected_human_decision_does_not_persist_resolution(
+    tmp_path: Path,
+) -> None:
+    runtime = _runtime(storage=FakeAgentScopeStorage(), chat_run_registry=FakeChatRunRegistry())
+    store = WebSessionStore(tmp_path / "sessions.sqlite")
+    public_session = store.create_session("rejected decision")
+    store.save_agentscope_session_mapping(
+        public_session.id,
+        agent_id="navigation-data-agent",
+        agentscope_session_id="as-session-1",
+    )
+    runtime.set_web_session_store(store)
+
+    accepted = await runtime.submit_human_decision(
+        web_session_id=public_session.id,
+        decision={
+            "action": "confirm",
+            "request_id": "request-1",
+            "tool_call_id": "tool-call-1",
+            "reply_id": "reply-1",
+        },
+    )
+
+    assert accepted is False
+    detail = store.get_session(public_session.id)
+    assert detail is not None
+    assert detail.events == []
 
 
 @pytest.mark.asyncio
@@ -3442,7 +3637,11 @@ async def test_explicit_stop_is_idempotent_ignores_late_tool_outcome_and_allows_
     assert [(row.tool_call_id, row.status) for row in detail.tool_runs] == [
         ("call-1", "stopped")
     ]
-    assert [record.event["value"]["status"] for record in detail.events] == ["stopped"]
+    assert [
+        record.event["value"]["status"]
+        for record in detail.events
+        if record.event.get("name") == "datapilot_tool_terminal"
+    ] == ["stopped"]
 
     await runtime.submit_user_message(web_session_id=public_session.id, message="继续处理")
 
@@ -3614,6 +3813,19 @@ def test_human_decision_request_requires_text_for_guidance(text: str | None) -> 
     )
 
     assert request.text == "继续 dry-run"
+
+
+@pytest.mark.parametrize("request_id", ["", "   "])
+def test_human_decision_request_requires_nonempty_public_request_id(
+    request_id: str,
+) -> None:
+    with pytest.raises(ValueError, match="request_id must not be empty"):
+        HumanDecisionRequest(
+            action="confirm",
+            request_id=request_id,
+            tool_call_id="tool-1",
+            reply_id="reply-1",
+        )
 
 
 @pytest.mark.parametrize("action", ["confirm", "stop"])
