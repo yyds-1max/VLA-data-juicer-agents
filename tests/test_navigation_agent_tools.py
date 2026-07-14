@@ -54,8 +54,12 @@ from vla_data_juicer_agents.runtime import agentscope_runtime as runtime_module
 from vla_data_juicer_agents.runtime.agentscope_config import AgentScopeRuntimeConfig
 from vla_data_juicer_agents.runtime.agentscope_runtime import (
     NavigationHandoffTool,
+    build_extra_agent_middlewares_factory,
     build_extra_agent_tools_factory,
     create_agentscope_runtime,
+)
+from vla_data_juicer_agents.runtime.navigation_tool_surface import (
+    NavigationToolSurfaceMiddleware,
 )
 
 
@@ -101,6 +105,19 @@ class FakeNavigationHandoffRuntime:
         self.records.append(payload)
 
 
+def _config(tmp_path) -> AgentScopeRuntimeConfig:
+    return AgentScopeRuntimeConfig(
+        user_id="alice",
+        redis_url="redis://localhost:6379/0",
+        workspace_root=tmp_path,
+        dashscope_api_key="test-key",
+        dashscope_base_url=None,
+        default_model="qwen-default",
+        router_model="qwen-router",
+        navigation_model="qwen-navigation",
+    )
+
+
 def _text(chunk) -> str:
     return chunk.content[0].text
 
@@ -134,23 +151,76 @@ def test_plan_bound_human_decision_tool_exposes_only_plan_and_step_ids():
     assert tool.input_schema["additionalProperties"] is False
 
 
-def test_extra_agent_tools_factory_registers_router_handoff_when_runtime_available(tmp_path):
-    config = AgentScopeRuntimeConfig(
-        user_id="alice",
-        redis_url="redis://localhost:6379/0",
-        workspace_root=tmp_path,
-        dashscope_api_key="test-key",
-        dashscope_base_url=None,
-        default_model="qwen-default",
-        router_model="qwen-router",
-        navigation_model="qwen-navigation",
+def test_navigation_extra_tools_are_empty_but_router_handoff_is_unchanged(tmp_path):
+    config = _config(tmp_path)
+    runtime = FakeNavigationHandoffRuntime()
+    runtime._navigation_tools_for_session = lambda **_kwargs: [
+        SimpleNamespace(name="legacy_navigation_tool")
+    ]
+    tools = build_extra_agent_tools_factory(config, runtime=runtime)
+
+    navigation_tools = asyncio.run(
+        tools("alice", config.navigation_agent_id, "web-1__navigation-data-agent")
     )
-    runtime = SimpleNamespace()
-    factory = build_extra_agent_tools_factory(config, runtime=runtime)
+    router_tools = asyncio.run(
+        tools("alice", config.main_router_agent_id, "web-1__main-router-agent")
+    )
 
-    router_tools = asyncio.run(factory("alice", config.main_router_agent_id, "web-1__main-router-agent"))
-
+    assert navigation_tools == []
     assert {tool.name for tool in router_tools} == {"start_navigation_data_task"}
+
+
+def test_navigation_middleware_factory_binds_exact_session_and_runtime(tmp_path):
+    config = _config(tmp_path)
+    services = build_navigation_services(tmp_path)
+    cancellation = object()
+    runtime = SimpleNamespace(
+        _navigation_services=lambda: services,
+        run_cancellation=lambda session_id: (
+            cancellation if session_id == "web-1__navigation-data-agent" else None
+        ),
+    )
+    factory = build_extra_agent_middlewares_factory(config, runtime=runtime)
+
+    middlewares = asyncio.run(
+        factory(
+            "alice",
+            config.navigation_agent_id,
+            "web-1__navigation-data-agent",
+        )
+    )
+
+    assert len(middlewares) == 1
+    middleware = middlewares[0]
+    assert isinstance(middleware, NavigationToolSurfaceMiddleware)
+    assert middleware._services is services
+    assert middleware._web_session_id == "web-1"
+    assert middleware._agentscope_session_id == "web-1__navigation-data-agent"
+    assert middleware._cancellation is cancellation
+    assert (
+        asyncio.run(
+            factory(
+                "alice",
+                config.main_router_agent_id,
+                "web-1__main-router-agent",
+            )
+        )
+        == []
+    )
+
+
+def test_navigation_middleware_factory_fails_closed_without_runtime(tmp_path):
+    config = _config(tmp_path)
+    factory = build_extra_agent_middlewares_factory(config, runtime=None)
+
+    with pytest.raises(RuntimeError, match="navigation runtime is unavailable"):
+        asyncio.run(
+            factory(
+                "alice",
+                config.navigation_agent_id,
+                "web-1__navigation-data-agent",
+            )
+        )
 
 
 def test_navigation_handoff_tool_declares_structured_schema():
@@ -466,7 +536,7 @@ def test_navigation_handoff_tool_bounds_unknown_start_failure(caplog):
     assert "correlation_id=" in caplog.text
 
 
-def test_create_agentscope_runtime_wires_navigation_tools_factory(monkeypatch, tmp_path):
+def test_create_agentscope_runtime_wires_navigation_factories(monkeypatch, tmp_path):
     captured = {}
 
     def fake_create_app(**kwargs):
@@ -474,26 +544,43 @@ def test_create_agentscope_runtime_wires_navigation_tools_factory(monkeypatch, t
         return SimpleNamespace(state=SimpleNamespace())
 
     monkeypatch.setattr(runtime_module.agentscope.app, "create_app", fake_create_app)
-    config = AgentScopeRuntimeConfig(
-        user_id="alice",
-        redis_url="redis://localhost:6379/0",
-        workspace_root=tmp_path,
-        dashscope_api_key="test-key",
-        dashscope_base_url=None,
-        default_model="qwen-default",
-        router_model="qwen-router",
-        navigation_model="qwen-navigation",
-    )
+    config = _config(tmp_path)
 
     create_agentscope_runtime(config)
 
-    factory = captured["extra_agent_tools"]
-    assert factory is not None
-    tool_names = {
+    tools_factory = captured["extra_agent_tools"]
+    middlewares_factory = captured["extra_agent_middlewares"]
+    assert callable(tools_factory)
+    assert callable(middlewares_factory)
+
+    navigation_session_id = "web-1__navigation-data-agent"
+    assert asyncio.run(
+        tools_factory("alice", config.navigation_agent_id, navigation_session_id)
+    ) == []
+    navigation_middlewares = asyncio.run(
+        middlewares_factory(
+            "alice",
+            config.navigation_agent_id,
+            navigation_session_id,
+        )
+    )
+    assert len(navigation_middlewares) == 1
+    assert isinstance(
+        navigation_middlewares[0],
+        NavigationToolSurfaceMiddleware,
+    )
+
+    router_session_id = "web-1__main-router-agent"
+    assert asyncio.run(
+        middlewares_factory("alice", config.main_router_agent_id, router_session_id)
+    ) == []
+    router_tool_names = {
         tool.name
-        for tool in asyncio.run(factory("alice", config.navigation_agent_id, "session-1"))
+        for tool in asyncio.run(
+            tools_factory("alice", config.main_router_agent_id, router_session_id)
+        )
     }
-    assert tool_names == set()
+    assert router_tool_names == {"start_navigation_data_task"}
 
 
 def _resolver_services_from_complete(

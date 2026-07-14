@@ -41,6 +41,9 @@ from vla_data_juicer_agents.navigation.task_entry import (
 from vla_data_juicer_agents.navigation.task_store import normalize_segments
 from vla_data_juicer_agents.runtime.agentscope_bootstrap import bootstrap_agentscope_records
 from vla_data_juicer_agents.runtime.agentscope_config import AgentScopeRuntimeConfig
+from vla_data_juicer_agents.runtime.navigation_tool_surface import (
+    NavigationToolSurfaceMiddleware,
+)
 
 _EVENT_STARTUP_GRACE_SECS = 1.0
 _EVENT_IDLE_POLL_SECS = 0.03
@@ -2399,30 +2402,7 @@ def build_extra_agent_tools_factory(
 ):
     async def extra_agent_tools(_user_id: str, agent_id: str, _session_id: str) -> list[Any]:
         if agent_id == config.navigation_agent_id:
-            web_session_id = _web_session_id_from_agentscope_session(
-                _session_id,
-                agent_id=config.navigation_agent_id,
-            )
-            if runtime is not None:
-                session_tools = getattr(runtime, "_navigation_tools_for_session", None)
-                if callable(session_tools):
-                    return session_tools(
-                        web_session_id=web_session_id,
-                        agentscope_session_id=_session_id,
-                    )
-                run_cancellation = getattr(runtime, "run_cancellation", None)
-                return resolve_navigation_agent_tools(
-                    services=build_navigation_services(config.workspace_root),
-                    cancellation=run_cancellation(_session_id) if callable(run_cancellation) else None,
-                    agentscope_session_id=_session_id,
-                    web_session_id=web_session_id,
-                )
-            return resolve_navigation_agent_tools(
-                services=build_navigation_services(config.workspace_root),
-                agentscope_session_id=_session_id,
-                cancellation=None,
-                web_session_id=web_session_id,
-            )
+            return []
         if agent_id == config.main_router_agent_id and runtime is not None:
             web_session_id = _web_session_id_from_agentscope_session(
                 _session_id,
@@ -2437,6 +2417,36 @@ def build_extra_agent_tools_factory(
         return []
 
     return extra_agent_tools
+
+
+def build_extra_agent_middlewares_factory(
+    config: AgentScopeRuntimeConfig,
+    *,
+    runtime: AgentScopeRuntime | None = None,
+):
+    async def extra_agent_middlewares(
+        _user_id: str,
+        agent_id: str,
+        session_id: str,
+    ) -> list[Any]:
+        if agent_id != config.navigation_agent_id:
+            return []
+        if runtime is None:
+            raise RuntimeError("navigation runtime is unavailable")
+        web_session_id = _web_session_id_from_agentscope_session(
+            session_id,
+            agent_id=config.navigation_agent_id,
+        )
+        return [
+            NavigationToolSurfaceMiddleware(
+                services=runtime._navigation_services(),
+                web_session_id=web_session_id,
+                agentscope_session_id=session_id,
+                cancellation=runtime.run_cancellation(session_id),
+            )
+        ]
+
+    return extra_agent_middlewares
 
 
 def create_agentscope_runtime(config: AgentScopeRuntimeConfig) -> AgentScopeRuntime:
@@ -2456,10 +2466,23 @@ def create_agentscope_runtime(config: AgentScopeRuntimeConfig) -> AgentScopeRunt
             session_id,
         )
 
+    async def extra_agent_middlewares(
+        user_id: str,
+        agent_id: str,
+        session_id: str,
+    ) -> list[Any]:
+        runtime = runtime_holder.get("runtime")
+        return await build_extra_agent_middlewares_factory(config, runtime=runtime)(
+            user_id,
+            agent_id,
+            session_id,
+        )
+
     app = agentscope.app.create_app(
         storage=storage,
         message_bus=message_bus,
         workspace_manager=workspace_manager,
+        extra_agent_middlewares=extra_agent_middlewares,
         extra_agent_tools=extra_agent_tools,
         title="DataPilot AgentScope Runtime",
     )
