@@ -122,3 +122,49 @@ No test, TypeScript, or build warnings were emitted.
   it with selected-session fetch-SSE without adding a second reducer path.
 - Tool-run rows are rendered with minimal existing visual treatment; Task 9 owns the
   final Chinese running/success/failure/stopped labels.
+
+## Review fix
+
+The independent review fix tightened the reducer and store around fail-closed public
+event ownership and reconnect behavior:
+
+- Events carrying a native `reply_id` reduce only into the active matching reply;
+  ignored mismatches still advance the public sequence, and a second reply start
+  cannot replace an active reply.
+- Native and Custom HITL payloads now require their complete public contracts. A
+  matching native external-execution result clears the pending decision only after
+  SDK message reduction; snapshot replay therefore does not resurrect a completed
+  decision.
+- Snapshot records create SDK messages only for persisted user rows. Assistant output
+  is reconstructed from public SDK events, avoiding duplicate transcript entries.
+- Custom tool terminal projection accepts only success, failure, or stopped with a
+  non-empty tool-call ID.
+- Live store events are isolated to an open active session with the same session ID.
+  Equal-sequence refreshes preserve local messages and cleared HITL state while
+  merging authoritative tool rows without downgrading terminal state to running;
+  lower-sequence snapshots cannot roll back conversation state.
+- Tool rows now render directly after the SDK message whose `tool_call` block owns
+  them. Only orphan tool rows render at the end of the transcript.
+
+Review RED/GREEN evidence:
+
+- The expanded 34-case reducer suite first produced 16 expected failures, then passed
+  34/34 after the reducer fix.
+- Store isolation and equal-sequence coverage first produced 3 expected failures;
+  the combined reducer/store file now passes 40/40.
+- The two-round MessageList chronology assertion failed before the UI grouping fix
+  and passed afterward. Reconnect fixtures were updated to replay assistant events
+  instead of relying on persisted assistant records.
+
+Fresh review-fix verification:
+
+- targeted client + reducer/store + App: 3 files, 112 tests passed;
+- full frontend Vitest: 7 files, 131 tests passed;
+- standalone `npx tsc --noEmit -p tsconfig.json`: exit 0;
+- `npm run build`: 1,626 modules transformed, exit 0;
+- `git diff --check`, removed-state/internal-identity checks, Task 9 scope checks,
+  and stray `+test` checks: exit 0 with no matches.
+
+No SDK, test, TypeScript, or build warnings remain. The Task 8 boundary is unchanged:
+WebSocket transport remains in place, and no Task 9 fetch-SSE or delete-session work
+was added.

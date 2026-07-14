@@ -4,6 +4,7 @@ import type {
   ChatMessageRecord,
   PendingHumanDecision,
   PublicEventEnvelope,
+  PublicToolRun,
   SessionDetail,
   SessionRecord,
 } from "../api/types";
@@ -89,6 +90,14 @@ export function createDataPilotStore() {
         if (session.last_sequence < state.conversation.lastSequence) {
           return { sessions: upsertSession(state.sessions, session) };
         }
+        if (session.last_sequence === state.conversation.lastSequence) {
+          const conversation = cloneConversation(state.conversation);
+          mergeAuthoritativeToolRuns(conversation, session.tool_runs);
+          return {
+            sessions: upsertSession(state.sessions, session),
+            conversation,
+          };
+        }
         return {
           sessions: upsertSession(state.sessions, session),
           conversation: conversationFromDetail(session),
@@ -113,7 +122,12 @@ export function createDataPilotStore() {
 
     applyEvent: (event) =>
       set((state) => {
-        if (state.currentSessionId && event.session_id !== state.currentSessionId) {
+        if (
+          !state.open ||
+          state.mode !== "active_session" ||
+          !state.currentSessionId ||
+          event.session_id !== state.currentSessionId
+        ) {
           return {};
         }
         const conversation = cloneConversation(state.conversation);
@@ -167,9 +181,31 @@ function cloneConversation(conversation: AgentConversationState): AgentConversat
       Object.entries(conversation.toolRuns).map(([key, run]) => [key, { ...run }]),
     ),
     pendingHumanDecision: conversation.pendingHumanDecision
-      ? { ...conversation.pendingHumanDecision }
+      ? {
+          ...conversation.pendingHumanDecision,
+          options: conversation.pendingHumanDecision.options
+            ? [...conversation.pendingHumanDecision.options]
+            : undefined,
+        }
       : null,
   };
+}
+
+function mergeAuthoritativeToolRuns(
+  conversation: AgentConversationState,
+  toolRuns: PublicToolRun[],
+): void {
+  for (const run of toolRuns) {
+    const existing = conversation.toolRuns[run.tool_call_id];
+    if (existing && isTerminalToolStatus(existing.status) && run.status === "running") {
+      continue;
+    }
+    conversation.toolRuns[run.tool_call_id] = { ...run };
+  }
+}
+
+function isTerminalToolStatus(status: PublicToolRun["status"]): boolean {
+  return status === "success" || status === "failure" || status === "stopped";
 }
 
 function upsertSession(sessions: SessionRecord[], session: SessionRecord): SessionRecord[] {
@@ -189,10 +225,18 @@ function samePendingHumanDecision(
     left.requestId === right.requestId &&
     left.decisionType === right.decisionType &&
     left.summary === right.summary &&
+    sameStringArray(left.options, right.options) &&
     left.planId === right.planId &&
     left.stepId === right.stepId &&
     left.recoveryRequired === right.recoveryRequired &&
     left.submissionDisabled === right.submissionDisabled &&
     left.recoveryEndpoint === right.recoveryEndpoint
   );
+}
+
+function sameStringArray(left?: string[], right?: string[]): boolean {
+  if (!left || !right) {
+    return left === right;
+  }
+  return left.length === right.length && left.every((value, index) => value === right[index]);
 }

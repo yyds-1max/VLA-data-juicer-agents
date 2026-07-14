@@ -54,6 +54,7 @@ export interface PendingHumanDecision {
   requestId: string;
   decisionType: string;
   summary: string;
+  options?: string[];
   planId?: string;
   stepId?: string;
   recoveryRequired?: boolean;

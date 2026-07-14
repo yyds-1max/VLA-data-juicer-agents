@@ -3,12 +3,12 @@ import {
   type AgentEvent,
   type CustomEvent,
   type ReplyStartEvent,
+  type ExternalExecutionResultEvent,
   type RequireExternalExecutionEvent,
   type ToolCallStartEvent,
 } from "@agentscope-ai/agentscope/event";
 import {
   AssistantMsg,
-  SystemMsg,
   UserMsg,
   appendEvent,
   type Msg,
@@ -133,7 +133,13 @@ export function applyPublicEvent(
 
   const event = normalizePublicAgentEvent(envelope);
   if (event.type === EventType.REPLY_START) {
-    startReply(state, event as ReplyStartEvent);
+    const start = event as ReplyStartEvent;
+    if (!state.currentReplyId && stringValue(start.reply_id)) {
+      startReply(state, start);
+    }
+  } else if (!eventBelongsToCurrentReply(state, event)) {
+    state.lastSequence = envelope.sequence;
+    return;
   } else if (event.type === EventType.REPLY_END) {
     const message = currentReply(state);
     if (message) {
@@ -152,10 +158,26 @@ export function applyPublicEvent(
       projectRunningTool(state, envelope, event as ToolCallStartEvent);
     } else if (event.type === EventType.REQUIRE_EXTERNAL_EXECUTION) {
       projectExternalDecision(state, event as RequireExternalExecutionEvent);
+    } else if (event.type === EventType.EXTERNAL_EXECUTION_RESULT) {
+      clearExternalDecision(state, event as ExternalExecutionResultEvent);
     }
   }
 
   state.lastSequence = envelope.sequence;
+}
+
+function eventBelongsToCurrentReply(
+  state: AgentConversationState,
+  event: AgentEvent,
+): boolean {
+  if (!("reply_id" in event)) {
+    return true;
+  }
+  return Boolean(
+    state.currentReplyId &&
+      stringValue(event.reply_id) &&
+      event.reply_id === state.currentReplyId,
+  );
 }
 
 export function markConversationInterrupting(state: AgentConversationState): void {
@@ -217,12 +239,6 @@ function persistedMessage(message: ChatMessageRecord): Msg | null {
   if (message.role === "user") {
     return UserMsg({ ...common, name: "You" });
   }
-  if (message.role === "assistant") {
-    return AssistantMsg({ ...common, name: "DataPilot" });
-  }
-  if (message.role === "system") {
-    return SystemMsg({ ...common, name: "System" });
-  }
   return null;
 }
 
@@ -257,7 +273,10 @@ function applyDataPilotCustomEvent(
     event.name === "human_decision_required" ||
     event.name === "datapilot_human_decision_required"
   ) {
-    state.pendingHumanDecision = pendingDecision(event.value);
+    const decision = customPendingDecision(event.value);
+    if (decision) {
+      state.pendingHumanDecision = decision;
+    }
   }
 }
 
@@ -267,7 +286,7 @@ function projectTerminalTool(
   event: CustomEvent,
 ): void {
   const toolCallId = stringValue(event.value.tool_call_id);
-  const status = toolStatus(event.value.status);
+  const status = terminalToolStatus(event.value.status);
   if (!toolCallId || !status) {
     return;
   }
@@ -296,11 +315,14 @@ function projectExternalDecision(
     return;
   }
   const value = parseToolInput(decisionCall);
-  state.pendingHumanDecision = pendingDecision({
+  const decision = nativePendingDecision({
     ...value,
     reply_id: event.reply_id,
     tool_call_id: decisionCall.id,
   });
+  if (decision) {
+    state.pendingHumanDecision = decision;
+  }
 }
 
 function parseToolInput(toolCall: ToolCallBlock): Record<string, unknown> {
@@ -312,18 +334,61 @@ function parseToolInput(toolCall: ToolCallBlock): Record<string, unknown> {
   }
 }
 
-function pendingDecision(value: Record<string, unknown>): PendingHumanDecision {
+function nativePendingDecision(
+  value: Record<string, unknown>,
+): PendingHumanDecision | null {
+  const replyId = stringValue(value.reply_id) || stringValue(value.replyId);
+  const toolCallId = stringValue(value.tool_call_id) || stringValue(value.toolCallId);
+  const requestId = stringValue(value.request_id) || stringValue(value.requestId);
+  const decisionType = stringValue(value.decision_type) || stringValue(value.decisionType);
+  const summary = stringValue(value.summary);
+  if (!replyId || !toolCallId || !requestId || !decisionType || !summary) {
+    return null;
+  }
+  return buildPendingDecision(value, {
+    replyId,
+    toolCallId,
+    requestId,
+    decisionType,
+    summary,
+  });
+}
+
+function customPendingDecision(
+  value: Record<string, unknown>,
+): PendingHumanDecision | null {
+  const replyId = stringValue(value.reply_id) || stringValue(value.replyId);
+  const toolCallId = stringValue(value.tool_call_id) || stringValue(value.toolCallId);
+  const requestId = stringValue(value.request_id) || stringValue(value.requestId);
+  const decisionType = stringValue(value.decision_type) || stringValue(value.decisionType);
+  const prompt = stringValue(value.prompt);
+  const options = stringArray(value.options);
+  if (!replyId || !toolCallId || !requestId || !decisionType || !prompt || !options) {
+    return null;
+  }
+  return buildPendingDecision(value, {
+    replyId,
+    toolCallId,
+    requestId,
+    decisionType,
+    summary: prompt,
+    options,
+  });
+}
+
+function buildPendingDecision(
+  value: Record<string, unknown>,
+  required: Pick<
+    PendingHumanDecision,
+    "replyId" | "toolCallId" | "requestId" | "decisionType" | "summary"
+  > & { options?: string[] },
+): PendingHumanDecision {
   const planId = stringValue(value.plan_id) || stringValue(value.planId);
   const stepId = stringValue(value.step_id) || stringValue(value.stepId);
   const recoveryEndpoint =
     stringValue(value.recovery_endpoint) || stringValue(value.recoveryEndpoint);
   return {
-    replyId: stringValue(value.reply_id) || stringValue(value.replyId),
-    toolCallId: stringValue(value.tool_call_id) || stringValue(value.toolCallId),
-    requestId: stringValue(value.request_id) || stringValue(value.requestId),
-    decisionType:
-      stringValue(value.decision_type) || stringValue(value.decisionType) || "other",
-    summary: stringValue(value.summary),
+    ...required,
     ...(planId ? { planId } : {}),
     ...(stepId ? { stepId } : {}),
     ...(value.recovery_required === true || value.recoveryRequired === true
@@ -334,6 +399,49 @@ function pendingDecision(value: Record<string, unknown>): PendingHumanDecision {
       : {}),
     ...(recoveryEndpoint ? { recoveryEndpoint } : {}),
   };
+}
+
+function clearExternalDecision(
+  state: AgentConversationState,
+  event: ExternalExecutionResultEvent,
+): void {
+  const pending = state.pendingHumanDecision;
+  if (!pending || pending.replyId !== event.reply_id) {
+    return;
+  }
+  const matchingResult = event.execution_results.find(
+    (result) => result.id === pending.toolCallId,
+  );
+  if (!matchingResult) {
+    return;
+  }
+  const requestId = toolResultRequestId(matchingResult.output);
+  if (requestId && requestId === pending.requestId) {
+    state.pendingHumanDecision = null;
+  }
+}
+
+function toolResultRequestId(
+  output: string | Array<{ type: string; text?: string }>,
+): string {
+  const candidates =
+    typeof output === "string"
+      ? [output]
+      : output.flatMap((block) => (block.type === "text" && block.text ? [block.text] : []));
+  for (const candidate of candidates) {
+    try {
+      const parsed = JSON.parse(candidate) as unknown;
+      if (isRecord(parsed)) {
+        const requestId = stringValue(parsed.request_id) || stringValue(parsed.requestId);
+        if (requestId) {
+          return requestId;
+        }
+      }
+    } catch {
+      continue;
+    }
+  }
+  return "";
 }
 
 function toolNameFromMessages(messages: Msg[], toolCallId: string): string {
@@ -348,13 +456,18 @@ function toolNameFromMessages(messages: Msg[], toolCallId: string): string {
   return "unknown_tool";
 }
 
-function toolStatus(value: unknown): PublicToolStatus | null {
-  return value === "running" ||
-    value === "success" ||
-    value === "failure" ||
-    value === "stopped"
+function terminalToolStatus(value: unknown): PublicToolStatus | null {
+  return value === "success" || value === "failure" || value === "stopped"
     ? value
     : null;
+}
+
+function stringArray(value: unknown): string[] | null {
+  if (!Array.isArray(value) || value.length === 0) {
+    return null;
+  }
+  const items = value.map(stringValue);
+  return items.every(Boolean) ? items : null;
 }
 
 function stringValue(value: unknown): string {

@@ -80,6 +80,79 @@ function custom(name: string, value: Record<string, unknown>): AgentEvent {
   };
 }
 
+function toolCallStart(replyId: string, toolCallId: string, toolName: string): AgentEvent {
+  return {
+    id: `call-start-${toolCallId}`,
+    created_at: CREATED_AT,
+    type: EventType.TOOL_CALL_START,
+    reply_id: replyId,
+    tool_call_id: toolCallId,
+    tool_call_name: toolName,
+  };
+}
+
+function validDecisionInput(): Record<string, unknown> {
+  return {
+    request_id: "request-1",
+    decision_type: "camera_params",
+    summary: "请确认参数",
+  };
+}
+
+function requireDecision(
+  replyId: string,
+  toolCallId: string,
+  input: Record<string, unknown>,
+): AgentEvent {
+  return {
+    id: `external-${toolCallId}`,
+    created_at: CREATED_AT,
+    type: EventType.REQUIRE_EXTERNAL_EXECUTION,
+    reply_id: replyId,
+    tool_calls: [
+      {
+        type: "tool_call",
+        id: toolCallId,
+        name: "request_human_decision",
+        input: JSON.stringify(input),
+        state: "pending",
+      },
+    ],
+  };
+}
+
+function externalResult(replyId: string, toolCallId: string, requestId: string): AgentEvent {
+  return {
+    id: `result-${replyId}-${toolCallId}-${requestId}`,
+    created_at: CREATED_AT,
+    type: EventType.EXTERNAL_EXECUTION_RESULT,
+    reply_id: replyId,
+    execution_results: [
+      {
+        type: "tool_result",
+        id: toolCallId,
+        name: "request_human_decision",
+        output: JSON.stringify({ request_id: requestId }),
+        state: "success",
+      },
+    ],
+  };
+}
+
+function conversationAwaitingDecision() {
+  const state = createAgentConversation();
+  applyPublicEvent(state, envelope(1, replyStart("reply-1")));
+  applyPublicEvent(
+    state,
+    envelope(2, toolCallStart("reply-1", "decision-1", "request_human_decision")),
+  );
+  applyPublicEvent(
+    state,
+    envelope(3, requireDecision("reply-1", "decision-1", validDecisionInput())),
+  );
+  return state;
+}
+
 describe("AgentScope conversation reduction", () => {
   it("reduces a native reply stream into an SDK AssistantMsg", () => {
     const state = createAgentConversation();
@@ -188,6 +261,44 @@ describe("AgentScope conversation reduction", () => {
     expect(state.phase).toBe("streaming");
   });
 
+  it("keeps the active reply when a different reply ends and advances sequence", () => {
+    const state = createAgentConversation();
+    applyPublicEvent(state, envelope(1, replyStart("reply-1")));
+
+    applyPublicEvent(state, envelope(2, replyEnd("reply-other")));
+
+    expect(state.currentReplyId).toBe("reply-1");
+    expect(state.phase).toBe("streaming");
+    expect(state.messages[0].finished_at).toBeUndefined();
+    expect(state.lastSequence).toBe(2);
+  });
+
+  it("rejects a second reply start while a different reply is active", () => {
+    const state = createAgentConversation();
+    applyPublicEvent(state, envelope(1, replyStart("reply-1")));
+
+    applyPublicEvent(state, envelope(2, replyStart("reply-2")));
+
+    expect(state.messages.map((message) => message.id)).toEqual(["reply-1"]);
+    expect(state.currentReplyId).toBe("reply-1");
+    expect(state.lastSequence).toBe(2);
+  });
+
+  it("rejects tool and HITL projections owned by another reply", () => {
+    const state = createAgentConversation();
+    applyPublicEvent(state, envelope(1, replyStart("reply-1")));
+    applyPublicEvent(state, envelope(2, toolCallStart("reply-other", "call-other", "extract")));
+    applyPublicEvent(
+      state,
+      envelope(3, requireDecision("reply-other", "decision-other", validDecisionInput())),
+    );
+
+    expect(state.messages[0].content).toEqual([]);
+    expect(state.toolRuns).toEqual({});
+    expect(state.pendingHumanDecision).toBeNull();
+    expect(state.lastSequence).toBe(3);
+  });
+
   it.each(["success", "failure", "stopped"] as const)(
     "projects a %s custom terminal event into the public tool ledger",
     (status) => {
@@ -219,6 +330,23 @@ describe("AgentScope conversation reduction", () => {
     },
   );
 
+  it.each([
+    { tool_call_id: "call-1", status: "running" },
+    { tool_call_id: "call-1", status: "unknown" },
+    { tool_call_id: "", status: "failure" },
+  ])("rejects non-terminal or malformed tool terminal payload $status", (value) => {
+    const state = createAgentConversation();
+    state.toolRuns["call-1"] = toolRun({ status: "running" });
+
+    applyPublicEvent(
+      state,
+      envelope(1, custom("datapilot_tool_terminal", { ...value, summary: "ignored" })),
+    );
+
+    expect(state.toolRuns).toEqual({ "call-1": toolRun({ status: "running" }) });
+    expect(state.lastSequence).toBe(1);
+  });
+
   it("restores user messages as SDK UserMsg values without trusting persisted names", () => {
     const messages: ChatMessageRecord[] = [
       {
@@ -245,6 +373,36 @@ describe("AgentScope conversation reduction", () => {
     });
     expect(restored.toolRuns["call-1"]).toEqual(toolRun());
     expect(restored.lastSequence).toBe(7);
+  });
+
+  it("ignores persisted assistant and system rows so native replies are not duplicated", () => {
+    const restored = restoreAgentConversation({
+      messages: [
+        userRecord("user-1", "question", "2026-07-15T08:00:00.000Z"),
+        {
+          ...userRecord("assistant-copy", "native answer", "2026-07-15T08:00:03.000Z"),
+          role: "assistant",
+        },
+        {
+          ...userRecord("system-copy", "internal system", "2026-07-15T08:00:04.000Z"),
+          role: "system",
+        },
+      ],
+      events: [
+        timedEnvelope(1, replyStart("reply-1"), "2026-07-15T08:00:01.000Z"),
+        timedEnvelope(2, textStart("reply-1", "block-1"), "2026-07-15T08:00:01.100Z"),
+        timedEnvelope(
+          3,
+          textDelta("reply-1", "block-1", "native answer"),
+          "2026-07-15T08:00:02.000Z",
+        ),
+        timedEnvelope(4, replyEnd("reply-1"), "2026-07-15T08:00:02.100Z"),
+      ],
+      toolRuns: [],
+      lastSequence: 4,
+    });
+
+    expect(restored.messages.map((message) => message.id)).toEqual(["user-1", "reply-1"]);
   });
 
   it("cleans up interrupt state when the native reply ends", () => {
@@ -347,6 +505,60 @@ describe("AgentScope conversation reduction", () => {
     });
   });
 
+  it("clears matching pending HITL after native external execution result reduction", () => {
+    const state = conversationAwaitingDecision();
+
+    applyPublicEvent(
+      state,
+      envelope(4, externalResult("reply-1", "decision-1", "request-1")),
+    );
+
+    expect(state.pendingHumanDecision).toBeNull();
+    expect(state.messages[0].content).toContainEqual(
+      expect.objectContaining({ type: "tool_result", id: "decision-1" }),
+    );
+  });
+
+  it("does not clear pending HITL for a wrong reply, tool, or request result", () => {
+    const state = conversationAwaitingDecision();
+
+    applyPublicEvent(
+      state,
+      envelope(4, externalResult("reply-other", "decision-1", "request-1")),
+    );
+    applyPublicEvent(
+      state,
+      envelope(5, externalResult("reply-1", "decision-other", "request-1")),
+    );
+    applyPublicEvent(
+      state,
+      envelope(6, externalResult("reply-1", "decision-1", "request-other")),
+    );
+
+    expect(state.pendingHumanDecision).toMatchObject({
+      replyId: "reply-1",
+      toolCallId: "decision-1",
+      requestId: "request-1",
+    });
+    expect(state.lastSequence).toBe(6);
+  });
+
+  it("does not resurrect a HITL dialog when snapshot replay includes its result", () => {
+    const restored = restoreAgentConversation({
+      messages: [],
+      events: [
+        envelope(1, replyStart("reply-1")),
+        envelope(2, toolCallStart("reply-1", "decision-1", "request_human_decision")),
+        envelope(3, requireDecision("reply-1", "decision-1", validDecisionInput())),
+        envelope(4, externalResult("reply-1", "decision-1", "request-1")),
+      ],
+      toolRuns: [],
+      lastSequence: 4,
+    });
+
+    expect(restored.pendingHumanDecision).toBeNull();
+  });
+
   it("does not open DataPilot HITL for unrelated external tool execution", () => {
     const state = createAgentConversation();
     applyPublicEvent(state, envelope(1, replyStart("reply-1")));
@@ -371,11 +583,101 @@ describe("AgentScope conversation reduction", () => {
 
     expect(state.pendingHumanDecision).toBeNull();
   });
+
+  it.each([
+    { request_id: "", summary: "prompt" },
+    { request_id: "request-1", summary: "" },
+    { request_id: "request-1", summary: "prompt", decision_type: "" },
+  ])("does not open native HITL for malformed payload %#", (input) => {
+    const state = createAgentConversation();
+    applyPublicEvent(state, envelope(1, replyStart("reply-1")));
+    applyPublicEvent(
+      state,
+      envelope(2, requireDecision("reply-1", "decision-1", input)),
+    );
+
+    expect(state.pendingHumanDecision).toBeNull();
+  });
+
+  it("accepts a complete custom prompt/options HITL contract", () => {
+    const state = createAgentConversation();
+    applyPublicEvent(
+      state,
+      envelope(
+        1,
+        custom("datapilot_human_decision_required", {
+          reply_id: "reply-1",
+          tool_call_id: "decision-1",
+          request_id: "request-1",
+          decision_type: "choice",
+          prompt: "Choose an action",
+          options: ["confirm", "stop"],
+        }),
+      ),
+    );
+
+    expect(state.pendingHumanDecision).toMatchObject({
+      replyId: "reply-1",
+      toolCallId: "decision-1",
+      requestId: "request-1",
+      summary: "Choose an action",
+      options: ["confirm", "stop"],
+    });
+  });
+
+  it.each([
+    { reply_id: "", tool_call_id: "decision-1", request_id: "request-1", prompt: "p", options: ["a"] },
+    { reply_id: "reply-1", tool_call_id: "", request_id: "request-1", prompt: "p", options: ["a"] },
+    { reply_id: "reply-1", tool_call_id: "decision-1", request_id: "", prompt: "p", options: ["a"] },
+    { reply_id: "reply-1", tool_call_id: "decision-1", request_id: "request-1", prompt: "", options: ["a"] },
+    { reply_id: "reply-1", tool_call_id: "decision-1", request_id: "request-1", prompt: "p", options: [] },
+  ])("does not open custom HITL for malformed prompt/options %#", (value) => {
+    const state = createAgentConversation();
+    applyPublicEvent(
+      state,
+      envelope(1, custom("datapilot_human_decision_required", value)),
+    );
+
+    expect(state.pendingHumanDecision).toBeNull();
+  });
 });
 
 describe("DataPilot conversation store", () => {
+  it.each([
+    {
+      name: "draft mode",
+      state: { open: true, mode: "draft_new_session" as const, currentSessionId: null },
+      eventSessionId: "session-1",
+    },
+    {
+      name: "closed active session",
+      state: { open: false, mode: "active_session" as const, currentSessionId: "session-1" },
+      eventSessionId: "session-1",
+    },
+    {
+      name: "another active session",
+      state: { open: true, mode: "active_session" as const, currentSessionId: "session-1" },
+      eventSessionId: "session-other",
+    },
+  ])("ignores late events for $name", ({ state, eventSessionId }) => {
+    const store = createDataPilotStore();
+    store.setState(state);
+
+    store.getState().applyEvent({
+      ...envelope(1, replyStart("reply-1")),
+      session_id: eventSessionId,
+    });
+
+    expect(store.getState().conversation).toEqual(createAgentConversation());
+  });
+
   it("does not mutate a previous SDK message snapshot while reducing nested data blocks", () => {
     const store = createDataPilotStore();
+    store.setState({
+      open: true,
+      mode: "active_session",
+      currentSessionId: "session-1",
+    });
     store.getState().applyEvent(envelope(1, replyStart("reply-1")));
     store.getState().applyEvent(
       envelope(2, {
@@ -409,6 +711,115 @@ describe("DataPilot conversation store", () => {
       type: "data",
       source: { data: "AQ==" },
     });
+  });
+
+  it("merges equal-sequence tool rows without rebuilding local messages or cleared HITL", () => {
+    const store = createDataPilotStore();
+    const decisionEvent = {
+      ...envelope(
+        5,
+        custom("datapilot_human_decision_required", {
+          reply_id: "reply-1",
+          tool_call_id: "decision-1",
+          request_id: "request-1",
+          decision_type: "choice",
+          prompt: "Choose",
+          options: ["confirm", "stop"],
+        }),
+      ),
+      created_at: "2026-07-15T08:00:05.000Z",
+    };
+    store.getState().restoreSession(
+      sessionDetail({
+        events: [decisionEvent],
+        tool_runs: [
+          toolRun({ status: "failure", summary: "failed", finished_at: CREATED_AT }),
+          toolRun({ tool_call_id: "call-3", status: "running" }),
+        ],
+        last_sequence: 5,
+      }),
+    );
+    const pending = store.getState().conversation.pendingHumanDecision!;
+    store.getState().clearPendingHumanDecision(pending, "session-1");
+    store.getState().appendUserMessage(
+      userRecord("local-user", "local draft", "2026-07-15T08:00:06.000Z"),
+    );
+
+    store.getState().refreshActiveSession(
+      sessionDetail({
+        messages: [userRecord("server-user", "server copy", CREATED_AT)],
+        events: [decisionEvent],
+        tool_runs: [
+          toolRun({ status: "running" }),
+          toolRun({ tool_call_id: "call-2", status: "running" }),
+          toolRun({
+            tool_call_id: "call-3",
+            status: "success",
+            summary: "done",
+            finished_at: CREATED_AT,
+          }),
+        ],
+        last_sequence: 5,
+      }),
+    );
+
+    const conversation = store.getState().conversation;
+    expect(conversation.messages.map((message) => message.id)).toEqual(["local-user"]);
+    expect(conversation.pendingHumanDecision).toBeNull();
+    expect(conversation.toolRuns["call-1"]).toMatchObject({
+      status: "failure",
+      summary: "failed",
+    });
+    expect(conversation.toolRuns["call-2"]).toMatchObject({ status: "running" });
+    expect(conversation.toolRuns["call-3"]).toMatchObject({ status: "success" });
+    expect(conversation.lastSequence).toBe(5);
+  });
+
+  it("does not roll back conversation state from a lower-sequence snapshot", () => {
+    const store = createDataPilotStore();
+    store.getState().restoreSession(sessionDetail({ last_sequence: 5 }));
+    store.getState().appendUserMessage(
+      userRecord("local-user", "keep me", "2026-07-15T08:00:06.000Z"),
+    );
+
+    store.getState().refreshActiveSession(
+      sessionDetail({
+        messages: [userRecord("stale-user", "stale", CREATED_AT)],
+        tool_runs: [toolRun({ status: "running" })],
+        last_sequence: 4,
+      }),
+    );
+
+    expect(store.getState().conversation.messages.map((message) => message.id)).toEqual([
+      "local-user",
+    ]);
+    expect(store.getState().conversation.lastSequence).toBe(5);
+    expect(store.getState().conversation.toolRuns).toEqual({});
+  });
+
+  it("fully rebuilds the conversation when restoring a different session", () => {
+    const store = createDataPilotStore();
+    store.getState().restoreSession(sessionDetail({ last_sequence: 5 }));
+    store.getState().appendUserMessage(userRecord("local-user", "old", CREATED_AT));
+
+    store.getState().restoreSession(
+      sessionDetail({
+        id: "session-2",
+        messages: [
+          {
+            ...userRecord("server-user", "new", CREATED_AT),
+            session_id: "session-2",
+          },
+        ],
+        last_sequence: 2,
+      }),
+    );
+
+    expect(store.getState().currentSessionId).toBe("session-2");
+    expect(store.getState().conversation.messages.map((message) => message.id)).toEqual([
+      "server-user",
+    ]);
+    expect(store.getState().conversation.lastSequence).toBe(2);
   });
 });
 
@@ -444,5 +855,21 @@ function timedEnvelope(
   return {
     ...envelope(sequence, { ...event, created_at: createdAt }),
     created_at: createdAt,
+  };
+}
+
+function sessionDetail(
+  overrides: Partial<import("../api/types").SessionDetail> = {},
+): import("../api/types").SessionDetail {
+  return {
+    id: "session-1",
+    title: "session",
+    created_at: CREATED_AT,
+    updated_at: CREATED_AT,
+    messages: [],
+    events: [],
+    tool_runs: [],
+    last_sequence: 0,
+    ...overrides,
   };
 }

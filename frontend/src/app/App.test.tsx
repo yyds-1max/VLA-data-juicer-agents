@@ -16,8 +16,13 @@ import {
   submitHumanDecision,
   submitTurn,
 } from "../api/client";
-import type { PendingHumanDecision } from "../api/types";
+import type {
+  PendingHumanDecision,
+  PublicEventEnvelope,
+  PublicToolRun,
+} from "../api/types";
 import { Composer } from "../components/datapilot/Composer";
+import { MessageList } from "../components/datapilot/MessageList";
 import { resetNavigationDatasetSummaryCache } from "../features/console/navigationDatasetSummaryCache";
 import { createAgentConversation } from "../store/agentConversation";
 import { datapilotStore } from "../store/datapilotStore";
@@ -55,6 +60,47 @@ function activeSocket(close: () => void = vi.fn()): WebSocket {
   return { close, addEventListener: vi.fn(), readyState: WebSocket.OPEN } as unknown as WebSocket;
 }
 
+function replayedAssistantReply(text: string): PublicEventEnvelope[] {
+  const event = (
+    sequence: number,
+    payload: PublicEventEnvelope["event"],
+  ): PublicEventEnvelope => ({
+    id: `event-${sequence}`,
+    session_id: "session-1",
+    sequence,
+    dedupe_key: String(sequence).padStart(64, "0"),
+    created_at: `2026-06-26T00:00:0${sequence}Z`,
+    event: payload,
+  });
+
+  return [
+    event(1, {
+      id: "reply-start",
+      created_at: "2026-06-26T00:00:01Z",
+      type: EventType.REPLY_START,
+      session_id: "session-1",
+      reply_id: "reply-1",
+      name: "DataPilot",
+      role: "assistant",
+    }),
+    event(2, {
+      id: "text-start",
+      created_at: "2026-06-26T00:00:02Z",
+      type: EventType.TEXT_BLOCK_START,
+      reply_id: "reply-1",
+      block_id: "block-1",
+    }),
+    event(3, {
+      id: "text-delta",
+      created_at: "2026-06-26T00:00:03Z",
+      type: EventType.TEXT_BLOCK_DELTA,
+      reply_id: "reply-1",
+      block_id: "block-1",
+      delta: text,
+    }),
+  ];
+}
+
 function deferred<T>() {
   let resolve!: (value: T) => void;
   let reject!: (reason?: unknown) => void;
@@ -75,6 +121,63 @@ function pendingDecision(overrides: Partial<PendingHumanDecision> = {}): Pending
     ...overrides,
   };
 }
+
+test("MessageList keeps owned tool rows with their reply and appends only orphans", () => {
+  const toolRuns: Record<string, PublicToolRun> = {
+    "call-1": {
+      session_id: "session-1",
+      tool_call_id: "call-1",
+      tool_name: "extract_navigation_data",
+      status: "success",
+      summary: "first reply tool",
+      error_type: null,
+      started_at: "2026-06-26T00:00:01Z",
+      finished_at: "2026-06-26T00:00:02Z",
+    },
+    orphan: {
+      session_id: "session-1",
+      tool_call_id: "orphan",
+      tool_name: "orphan_tool",
+      status: "running",
+      summary: "unowned",
+      error_type: null,
+      started_at: "2026-06-26T00:00:03Z",
+      finished_at: null,
+    },
+  };
+
+  render(
+    <MessageList
+      messages={[
+        AssistantMsg({
+          id: "reply-1",
+          name: "DataPilot",
+          content: [
+            { type: "text", id: "text-1", text: "first reply" },
+            {
+              type: "tool_call",
+              id: "call-1",
+              name: "extract_navigation_data",
+              input: "{}",
+              state: "finished",
+            },
+          ],
+        }),
+        AssistantMsg({ id: "reply-2", name: "DataPilot", content: "second reply" }),
+      ]}
+      toolRuns={toolRuns}
+    />,
+  );
+
+  const firstReply = screen.getByText("first reply");
+  const ownedTool = screen.getByText("extract_navigation_data · first reply tool");
+  const secondReply = screen.getByText("second reply");
+  const orphanTool = screen.getByText("orphan_tool · unowned");
+
+  expect(firstReply.compareDocumentPosition(ownedTool) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+  expect(ownedTool.compareDocumentPosition(secondReply) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+  expect(secondReply.compareDocumentPosition(orphanTool) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+});
 
 function setOpenActiveSessionWithPendingDecision(
   decision: PendingHumanDecision,
@@ -968,7 +1071,7 @@ test("active session renders SDK messages with fixed public identities and tool 
   expect(screen.getByPlaceholderText("继续描述任务…")).toBeVisible();
 });
 
-+test("pending human decision shows dialog, hides Composer, submits confirm payload, and clears only after success", async () => {
+test("pending human decision shows dialog, hides Composer, submits confirm payload, and clears only after success", async () => {
   const submitDecision = deferred<boolean>();
   apiMocks.submitHumanDecision.mockReturnValue(submitDecision.promise);
   setOpenActiveSessionWithPendingDecision(pendingDecision());
@@ -1267,7 +1370,7 @@ test("a websocket public envelope reduces into the SDK conversation", async () =
   expect(datapilotStore.getState().conversation.lastSequence).toBe(3);
 });
 
-+test("History button lists sessions in a lightweight panel", async () => {
+test("History button lists sessions in a lightweight panel", async () => {
   apiMocks.listSessions.mockResolvedValue([
     {
       id: "history-1",
@@ -1496,7 +1599,7 @@ test("reopening an active session opens events before submitting the turn", asyn
   expect(calls).toEqual(["open:session-1", "open:session-1", "submit:session-1"]);
 });
 
-test("reopening an active session refreshes persisted messages from the backend", async () => {
+test("reopening an active session refreshes replayed assistant events from the backend", async () => {
   apiMocks.getSession
     .mockResolvedValueOnce({
       id: "session-1",
@@ -1529,17 +1632,10 @@ test("reopening an active session refreshes persisted messages from the backend"
           content: "清洗已有数据",
           created_at: "2026-06-26T00:01:00Z",
         },
-        {
-          id: "message-2",
-          session_id: "session-1",
-          role: "assistant",
-          content: "后台完成后的助手回复",
-          created_at: "2026-06-26T00:03:00Z",
-        },
       ],
-      events: [],
+      events: replayedAssistantReply("后台完成后的助手回复"),
       tool_runs: [],
-      last_sequence: 0,
+      last_sequence: 3,
     });
   datapilotStore.setState({
     open: true,
@@ -1625,18 +1721,10 @@ test("event stream close refreshes the active session and reconnects", async () 
     title: "Existing session",
     created_at: "2026-06-26T00:00:00Z",
     updated_at: "2026-06-26T00:00:00Z",
-    messages: [
-      {
-        id: "message-1",
-        session_id: "session-1",
-        role: "assistant",
-        content: "断线期间完成的回复",
-        created_at: "2026-06-26T00:01:00Z",
-      },
-    ],
-    events: [],
+    messages: [],
+    events: replayedAssistantReply("断线期间完成的回复"),
     tool_runs: [],
-    last_sequence: 0,
+    last_sequence: 3,
   });
   datapilotStore.setState({
     open: true,

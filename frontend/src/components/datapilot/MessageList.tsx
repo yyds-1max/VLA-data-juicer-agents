@@ -1,4 +1,4 @@
-import { useCallback, useLayoutEffect, useRef } from "react";
+import { Fragment, useCallback, useLayoutEffect, useRef } from "react";
 import type {
   DataBlock,
   HintBlock,
@@ -20,6 +20,11 @@ const STICKY_BOTTOM_THRESHOLD = 24;
 
 export function MessageList({ messages, toolRuns }: MessageListProps) {
   const runs = Object.values(toolRuns).sort(compareToolRuns);
+  const { runsByMessageId, ownedToolCallIds } = groupToolRunsByOwningMessage(
+    messages,
+    toolRuns,
+  );
+  const orphanRuns = runs.filter((run) => !ownedToolCallIds.has(run.tool_call_id));
   const hasContent = messages.length > 0 || runs.length > 0;
   const scrollAreaRef = useRef<HTMLDivElement | null>(null);
   const shouldStickToBottomRef = useRef(true);
@@ -48,9 +53,14 @@ export function MessageList({ messages, toolRuns }: MessageListProps) {
       {hasContent ? (
         <>
           {messages.map((message) => (
-            <MessageBubble key={message.id} message={message} />
+            <Fragment key={message.id}>
+              <MessageBubble message={message} />
+              {(runsByMessageId.get(message.id) ?? []).map((run) => (
+                <ToolRunLine key={run.tool_call_id} run={run} />
+              ))}
+            </Fragment>
           ))}
-          {runs.map((run) => (
+          {orphanRuns.map((run) => (
             <ToolRunLine key={run.tool_call_id} run={run} />
           ))}
         </>
@@ -61,6 +71,36 @@ export function MessageList({ messages, toolRuns }: MessageListProps) {
       )}
     </div>
   );
+}
+
+function groupToolRunsByOwningMessage(
+  messages: Msg[],
+  toolRuns: Record<string, PublicToolRun>,
+): {
+  runsByMessageId: Map<string, PublicToolRun[]>;
+  ownedToolCallIds: Set<string>;
+} {
+  const runsByMessageId = new Map<string, PublicToolRun[]>();
+  const ownedToolCallIds = new Set<string>();
+
+  for (const message of messages) {
+    const ownedRuns: PublicToolRun[] = [];
+    for (const block of message.content) {
+      if (block.type !== "tool_call" || ownedToolCallIds.has(block.id)) {
+        continue;
+      }
+      const run = toolRuns[block.id];
+      if (run) {
+        ownedToolCallIds.add(block.id);
+        ownedRuns.push(run);
+      }
+    }
+    if (ownedRuns.length > 0) {
+      runsByMessageId.set(message.id, ownedRuns.sort(compareToolRuns));
+    }
+  }
+
+  return { runsByMessageId, ownedToolCallIds };
 }
 
 function MessageBubble({ message }: { message: Msg }) {
