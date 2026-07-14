@@ -107,6 +107,7 @@ def test_fixed_navigation_tools_are_classified_exactly_once():
             ["read_observation_evidence_tool", "read_observation_evidence_tool"],
             "duplicate",
         ),
+        (["unknown_navigation_tool", "unknown_navigation_tool"], "duplicate"),
     ],
 )
 def test_fixed_classification_rejects_unknown_or_duplicate_tools(names, message):
@@ -117,18 +118,16 @@ def test_fixed_classification_rejects_unknown_or_duplicate_tools(names, message)
 def test_policy_exposes_exact_groups_for_each_activity():
     all_groups = _all_groups()
 
-    assert NavigationToolSurfacePolicy.resolve(
-        "planning", all_groups
-    ).active_group_names == (
+    planning_surface = NavigationToolSurfacePolicy.resolve("planning", all_groups)
+    assert planning_surface.active_group_names == (
         NAVIGATION_EVIDENCE_READ,
         NAVIGATION_INVESTIGATION,
         NAVIGATION_ARTIFACT_CHECKS,
         NAVIGATION_PLAN_AUTHORING,
         NAVIGATION_DIAGNOSTICS,
     )
-    assert NavigationToolSurfacePolicy.resolve(
-        "execution", all_groups
-    ).active_group_names == (
+    execution_surface = NavigationToolSurfacePolicy.resolve("execution", all_groups)
+    assert execution_surface.active_group_names == (
         NAVIGATION_EVIDENCE_READ,
         NAVIGATION_ARTIFACT_CHECKS,
         NAVIGATION_EXECUTION_STATE,
@@ -144,10 +143,12 @@ def test_policy_exposes_exact_groups_for_each_activity():
         NAVIGATION_EXECUTION_STATE,
         NAVIGATION_DIAGNOSTICS,
     )
-    assert NavigationToolSurfacePolicy.resolve("planning", all_groups).group(
-        NAVIGATION_DIAGNOSTICS
-    ).tools == ()
-    assert all(group.instructions is None for group in recovery_surface.groups)
+    assert planning_surface.group(NAVIGATION_DIAGNOSTICS).tools == ()
+    assert all(
+        group.instructions is None
+        for surface in (planning_surface, execution_surface, recovery_surface)
+        for group in surface.groups
+    )
 
 
 def test_policy_rejects_a_missing_required_group_definition():

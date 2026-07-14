@@ -84,14 +84,13 @@ _FIXED_GROUP_NAMES = (
 def classify_fixed_navigation_tools(
     tools: Sequence[ToolBase],
 ) -> dict[str, tuple[ToolBase, ...]]:
+    names = [tool.name for tool in tools]
+    if len(names) != len(set(names)):
+        raise ValueError("duplicate fixed navigation tool names")
+
     grouped: dict[str, list[ToolBase]] = {name: [] for name in _FIXED_GROUP_NAMES}
-    seen_names: set[str] = set()
 
     for tool in tools:
-        if tool.name in seen_names:
-            raise ValueError(f"duplicate fixed navigation tool name: {tool.name}")
-        seen_names.add(tool.name)
-
         group_name = _FIXED_TOOL_GROUP_BY_NAME.get(tool.name)
         if group_name is None:
             raise ValueError(f"unclassified fixed navigation tool: {tool.name}")
