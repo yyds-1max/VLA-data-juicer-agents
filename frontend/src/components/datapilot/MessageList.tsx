@@ -9,7 +9,7 @@ import type {
 
 import type { PublicToolRun } from "../../api/types";
 import { cn } from "../../lib/utils";
-import { ToolStatusDot } from "./AgentRunSummary";
+import { ToolStatusDot, toolStatusText } from "./AgentRunSummary";
 
 type MessageListProps = {
   messages: Msg[];
@@ -120,7 +120,7 @@ function MessageBubble({ message }: { message: Msg }) {
       )}
     >
       <div className="mb-1 text-[11px] font-medium text-console-muted">
-        {isUser ? "You" : message.role === "assistant" ? "DataPilot" : "System"}
+        {isUser ? "You" : "DataPilot"}
       </div>
       <p className="whitespace-pre-wrap break-words">{text}</p>
     </article>
@@ -131,6 +131,7 @@ function ToolRunLine({ run }: { run: PublicToolRun }) {
   return (
     <div className="mr-auto flex max-w-[92%] items-center gap-2 px-2 py-1 text-xs text-console-muted">
       <ToolStatusDot status={run.status} />
+      <span className="shrink-0">{toolStatusText[run.status]}</span>
       <span className="min-w-0 break-words">
         {run.tool_name}
         {run.summary ? ` · ${run.summary}` : ""}

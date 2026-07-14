@@ -4,13 +4,14 @@ import { useStore } from "zustand";
 
 import {
   createSession,
+  deleteSession,
   getSession,
   interruptTurn,
   listSessions,
-  openSessionEvents,
   recoverHumanDecision,
   submitHumanDecision,
   submitTurn,
+  streamSessionEvents,
 } from "../../api/client";
 import type { PendingHumanDecision, SessionRecord } from "../../api/types";
 import { datapilotStore } from "../../store/datapilotStore";
@@ -46,12 +47,18 @@ export function DataPilotWindow() {
   const [closing, setClosing] = useState(false);
   const [recoveringHumanDecision, setRecoveringHumanDecision] = useState(false);
   const [humanDecisionRecoveryError, setHumanDecisionRecoveryError] = useState("");
+  const [stopRequestPending, setStopRequestPending] = useState(false);
   const [viewport, setViewport] = useState(() => ({
     width: typeof window === "undefined" ? 1280 : window.innerWidth,
     height: typeof window === "undefined" ? 900 : window.innerHeight,
   }));
-  const socketRef = useRef<{ sessionId: string; socket: WebSocket } | null>(null);
+  const streamRef = useRef<{ sessionId: string; controller: AbortController } | null>(null);
+  const startEventStreamRef = useRef<(sessionId: string) => void>(() => undefined);
   const reconnectTimerRef = useRef<number | null>(null);
+  const reconnectStateRef = useRef<{ sessionId: string | null; attempts: number }>({
+    sessionId: null,
+    attempts: 0,
+  });
   const humanDecisionRecoveryRequestRef = useRef(0);
   const dragRef = useRef<DragState | null>(null);
   const windowOffset = useMemo(() => visibleWindowOffset(floatingOffset, viewport), [floatingOffset, viewport]);
@@ -73,63 +80,88 @@ export function DataPilotWindow() {
     }
   }, []);
 
-  const closeSocket = useCallback(() => {
+  const abortEventStream = useCallback(() => {
     clearReconnectTimer();
-    const socket = socketRef.current?.socket;
-    socketRef.current = null;
-    socket?.close();
+    const active = streamRef.current;
+    streamRef.current = null;
+    active?.controller.abort();
   }, [clearReconnectTimer]);
 
-  useEffect(() => {
-    if (!open || mode !== "active_session") {
-      closeSocket();
-    }
-  }, [closeSocket, mode, open]);
-
-  useEffect(() => closeSocket, [closeSocket]);
-
-  const openEvents = useCallback(
+  const startEventStream = useCallback(
     (sessionId: string) => {
-      if (socketRef.current?.sessionId === sessionId && isActiveSocket(socketRef.current.socket)) {
+      const active = streamRef.current;
+      if (active?.sessionId === sessionId && !active.controller.signal.aborted) {
         return;
       }
 
-      closeSocket();
-      clearReconnectTimer();
-      const socket = openSessionEvents(sessionId, (event) => datapilotStore.getState().applyEvent(event));
-      socketRef.current = {
-        sessionId,
-        socket,
-      };
+      abortEventStream();
+      if (reconnectStateRef.current.sessionId !== sessionId) {
+        reconnectStateRef.current = { sessionId, attempts: 0 };
+      }
+      const controller = new AbortController();
+      streamRef.current = { sessionId, controller };
 
-      const handleDisconnect = () => {
-        if (socketRef.current?.socket !== socket) {
+      void (async () => {
+        const afterSequence = datapilotStore.getState().conversation.lastSequence;
+        try {
+          for await (const event of streamSessionEvents(
+            sessionId,
+            afterSequence,
+            controller.signal,
+          )) {
+            if (streamRef.current?.controller !== controller || controller.signal.aborted) {
+              return;
+            }
+            datapilotStore.getState().applyEvent(event);
+            reconnectStateRef.current.attempts = 0;
+          }
+        } catch (error) {
+          if (!controller.signal.aborted) {
+            console.error("DataPilot event stream failed", error);
+          }
+        }
+
+        if (streamRef.current?.controller !== controller || controller.signal.aborted) {
           return;
         }
-        socketRef.current = null;
-        void refreshSessionSnapshot(sessionId);
+        streamRef.current = null;
+        await refreshSessionSnapshot(sessionId);
+        if (controller.signal.aborted) {
+          return;
+        }
+        reconnectStateRef.current.attempts += 1;
+        const reconnectDelay = Math.min(
+          250 * 2 ** (reconnectStateRef.current.attempts - 1),
+          5_000,
+        );
         reconnectTimerRef.current = window.setTimeout(() => {
           reconnectTimerRef.current = null;
           const state = datapilotStore.getState();
-          if (state.open && state.mode === "active_session" && state.currentSessionId === sessionId) {
-            openEvents(sessionId);
+          if (
+            state.open &&
+            state.mode === "active_session" &&
+            state.currentSessionId === sessionId &&
+            !streamRef.current
+          ) {
+            startEventStreamRef.current(sessionId);
           }
-        }, 100);
-      };
-      socket.addEventListener("close", handleDisconnect);
-      socket.addEventListener("error", handleDisconnect);
+        }, reconnectDelay);
+      })();
     },
-    [clearReconnectTimer, closeSocket, refreshSessionSnapshot],
+    [abortEventStream, refreshSessionSnapshot],
   );
+  startEventStreamRef.current = startEventStream;
 
   useEffect(() => {
     if (!open || mode !== "active_session" || !currentSessionId) {
-      return;
+      abortEventStream();
+      reconnectStateRef.current = { sessionId: null, attempts: 0 };
+      return undefined;
     }
 
     let cancelled = false;
     const sessionId = currentSessionId;
-    openEvents(sessionId);
+    startEventStream(sessionId);
 
     void getSession(sessionId)
       .then((detail) => {
@@ -145,8 +177,23 @@ export function DataPilotWindow() {
 
     return () => {
       cancelled = true;
+      if (streamRef.current?.sessionId === sessionId) {
+        abortEventStream();
+      }
     };
-  }, [currentSessionId, mode, open, openEvents]);
+  }, [abortEventStream, currentSessionId, mode, open, startEventStream]);
+
+  useEffect(() => abortEventStream, [abortEventStream]);
+
+  useEffect(() => {
+    if (conversation.phase === "idle") {
+      setStopRequestPending(false);
+    }
+  }, [conversation.phase]);
+
+  useEffect(() => {
+    setStopRequestPending(false);
+  }, [currentSessionId]);
 
   useEffect(() => {
     if (open) {
@@ -190,16 +237,39 @@ export function DataPilotWindow() {
   };
 
   const handleNewSession = () => {
-    closeSocket();
+    abortEventStream();
     setHistoryOpen(false);
     datapilotStore.getState().enterDraft();
   };
 
   const handleSelectHistory = async (session: SessionRecord) => {
-    closeSocket();
-    const detail = await getSession(session.id);
-    datapilotStore.getState().restoreSession(detail);
-    setHistoryOpen(false);
+    abortEventStream();
+    try {
+      const detail = await getSession(session.id);
+      datapilotStore.getState().restoreSession(detail);
+      setHistoryOpen(false);
+    } catch (error) {
+      const state = datapilotStore.getState();
+      if (state.open && state.mode === "active_session" && state.currentSessionId) {
+        startEventStream(state.currentSessionId);
+      }
+      console.error("Failed to restore DataPilot session", error);
+    }
+  };
+
+  const handleDeleteHistory = async (session: SessionRecord) => {
+    try {
+      await deleteSession(session.id);
+      const store = datapilotStore.getState();
+      store.setSessions(store.sessions.filter((item) => item.id !== session.id));
+      if (store.currentSessionId === session.id) {
+        abortEventStream();
+        store.enterDraft();
+        setHistoryOpen(false);
+      }
+    } catch (error) {
+      console.error("Failed to delete DataPilot session", error);
+    }
   };
 
   const handleDraftSubmit = async (message: string) => {
@@ -208,11 +278,11 @@ export function DataPilotWindow() {
       const store = datapilotStore.getState();
       store.setActiveSession(session);
       const userMessage = localUserMessage(session.id, message);
-      openEvents(session.id);
+      startEventStream(session.id);
       await submitTurn(session.id, message);
       datapilotStore.getState().appendUserMessage(userMessage);
     } catch (error) {
-      closeSocket();
+      abortEventStream();
       datapilotStore.getState().enterDraft();
       console.error("Failed to submit DataPilot draft turn", error);
     }
@@ -225,7 +295,7 @@ export function DataPilotWindow() {
 
     try {
       const userMessage = localUserMessage(currentSessionId, message);
-      openEvents(currentSessionId);
+      startEventStream(currentSessionId);
       await submitTurn(currentSessionId, message);
       datapilotStore.getState().appendUserMessage(userMessage);
     } catch (error) {
@@ -234,13 +304,23 @@ export function DataPilotWindow() {
   };
 
   const handleInterrupt = async () => {
-    if (!currentSessionId) {
+    if (!currentSessionId || stopRequestPending || interrupting) {
       return;
     }
 
-    const interrupted = await interruptTurn(currentSessionId);
-    if (interrupted) {
-      datapilotStore.getState().markInterrupting();
+    const sessionId = currentSessionId;
+    setStopRequestPending(true);
+    try {
+      const interrupted = await interruptTurn(sessionId);
+      const state = datapilotStore.getState();
+      if (interrupted && state.currentSessionId === sessionId) {
+        state.markInterrupting();
+      } else {
+        setStopRequestPending(false);
+      }
+    } catch (error) {
+      setStopRequestPending(false);
+      console.error("Failed to interrupt DataPilot turn", error);
     }
   };
 
@@ -459,6 +539,7 @@ export function DataPilotWindow() {
         <SessionHistoryPanel
           sessions={sessions}
           onSelect={handleSelectHistory}
+          onDelete={handleDeleteHistory}
           onClose={() => setHistoryOpen(false)}
         />
       ) : null}
@@ -482,7 +563,7 @@ export function DataPilotWindow() {
               <Composer
                 placeholder="继续描述任务…"
                 running={running}
-                interrupting={interrupting}
+                interrupting={interrupting || stopRequestPending}
                 onSubmit={handleActiveSubmit}
                 onInterrupt={handleInterrupt}
               />
@@ -558,8 +639,4 @@ function createLocalId(): string {
       ? crypto.randomUUID()
       : `${Date.now()}-${Math.random().toString(16).slice(2)}`;
   return `local-${suffix}`;
-}
-
-function isActiveSocket(socket: WebSocket): boolean {
-  return socket.readyState === WebSocket.CONNECTING || socket.readyState === WebSocket.OPEN;
 }

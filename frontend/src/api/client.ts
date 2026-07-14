@@ -71,6 +71,19 @@ export async function getSession(sessionId: string): Promise<SessionDetail> {
   return data.session;
 }
 
+export async function deleteSession(sessionId: string): Promise<void> {
+  const response = await fetch(sessionPath(sessionId), {
+    method: "DELETE",
+    headers: { "content-type": "application/json" },
+  });
+  if (!response.ok) {
+    throw new Error(await responseErrorMessage(response));
+  }
+  if (response.status !== 204) {
+    throw new Error(`Expected 204 No Content, received ${response.status} ${response.statusText}`);
+  }
+}
+
 export async function submitTurn(sessionId: string, message: string): Promise<string> {
   const data = await requestJson<{ turn_id: string }>(`${sessionPath(sessionId)}/turns`, {
     method: "POST",
@@ -110,20 +123,121 @@ export async function recoverHumanDecision(
   );
 }
 
-export function openSessionEvents(
+export async function* streamSessionEvents(
   sessionId: string,
-  onEvent: (event: PublicEventEnvelope) => void,
-): WebSocket {
-  const protocol = window.location.protocol === "https:" ? "wss:" : "ws:";
-  const socket = new WebSocket(`${protocol}//${window.location.host}${sessionPath(sessionId)}/events`);
-  socket.addEventListener("message", (message) => {
-    try {
-      onEvent(JSON.parse(message.data) as PublicEventEnvelope);
-    } catch (error) {
-      console.error("Failed to parse DataPilot event", error);
+  afterSequence: number,
+  signal: AbortSignal,
+): AsyncGenerator<PublicEventEnvelope> {
+  try {
+    const response = await fetch(
+      `${sessionPath(sessionId)}/stream?after_sequence=${afterSequence}`,
+      { signal, headers: { Accept: "text/event-stream" } },
+    );
+    if (!response.ok || !response.body) {
+      throw new Error(await responseErrorMessage(response));
     }
-  });
-  return socket;
+
+    yield* parseSse(response.body, signal);
+  } catch (error) {
+    if (!signal.aborted && !isAbortError(error)) {
+      throw error;
+    }
+  }
+}
+
+async function* parseSse(
+  body: ReadableStream<Uint8Array>,
+  signal: AbortSignal,
+): AsyncGenerator<PublicEventEnvelope> {
+  const reader = body.getReader();
+  const decoder = new TextDecoder();
+  let buffer = "";
+  const cancel = () => {
+    void reader.cancel().catch(() => undefined);
+  };
+  signal.addEventListener("abort", cancel, { once: true });
+
+  try {
+    while (!signal.aborted) {
+      const { done, value } = await reader.read();
+      if (done) {
+        buffer += decoder.decode();
+        break;
+      }
+      buffer += decoder.decode(value, { stream: true });
+      const { frames, remainder } = splitSseFrames(buffer);
+      buffer = remainder;
+      for (const frame of frames) {
+        const envelope = publicEnvelopeFromFrame(frame);
+        if (envelope) yield envelope;
+      }
+    }
+
+    if (!signal.aborted && buffer.trim()) {
+      const envelope = publicEnvelopeFromFrame(buffer);
+      if (envelope) yield envelope;
+    }
+  } finally {
+    signal.removeEventListener("abort", cancel);
+    reader.releaseLock();
+  }
+}
+
+function splitSseFrames(buffer: string): { frames: string[]; remainder: string } {
+  const frames: string[] = [];
+  let start = 0;
+  const separator = /\r?\n\r?\n/g;
+  for (let match = separator.exec(buffer); match; match = separator.exec(buffer)) {
+    frames.push(buffer.slice(start, match.index));
+    start = match.index + match[0].length;
+  }
+  return { frames, remainder: buffer.slice(start) };
+}
+
+function publicEnvelopeFromFrame(frame: string): PublicEventEnvelope | null {
+  let eventName = "message";
+  const data: string[] = [];
+  for (const line of frame.split(/\r?\n/)) {
+    if (!line || line.startsWith(":")) continue;
+    const separator = line.indexOf(":");
+    const field = separator < 0 ? line : line.slice(0, separator);
+    let value = separator < 0 ? "" : line.slice(separator + 1);
+    if (value.startsWith(" ")) value = value.slice(1);
+    if (field === "event") eventName = value;
+    if (field === "data") data.push(value);
+  }
+  if ((eventName !== "message" && eventName !== "public_event") || data.length === 0) {
+    return null;
+  }
+
+  try {
+    const value = JSON.parse(data.join("\n")) as unknown;
+    return isPublicEventEnvelope(value) ? value : null;
+  } catch {
+    return null;
+  }
+}
+
+function isPublicEventEnvelope(value: unknown): value is PublicEventEnvelope {
+  if (!value || typeof value !== "object") return false;
+  const envelope = value as Record<string, unknown>;
+  if (!envelope.event || typeof envelope.event !== "object") return false;
+  const event = envelope.event as Record<string, unknown>;
+  return (
+    typeof envelope.id === "string" &&
+    typeof envelope.session_id === "string" &&
+    Number.isSafeInteger(envelope.sequence) &&
+    (envelope.sequence as number) > 0 &&
+    typeof envelope.dedupe_key === "string" &&
+    typeof envelope.created_at === "string" &&
+    typeof event.id === "string" &&
+    typeof event.created_at === "string" &&
+    typeof event.type === "string"
+  );
+}
+
+function isAbortError(error: unknown): boolean {
+  return error instanceof DOMException && error.name === "AbortError";
 }
 
 export async function getNavigationDatasetSummary(): Promise<NavigationDatasetSummary> {

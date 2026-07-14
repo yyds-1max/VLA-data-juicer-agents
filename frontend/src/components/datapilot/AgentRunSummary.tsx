@@ -3,6 +3,13 @@ import { cn } from "../../lib/utils";
 
 type StatusTone = "success" | "failure" | "interrupted" | "pending";
 
+export const toolStatusText = {
+  running: "正在调用",
+  success: "成功",
+  failure: "失败",
+  stopped: "已停止",
+} as const satisfies Record<PublicToolStatus, string>;
+
 export function ToolStatusDot({ status }: { status?: PublicToolStatus }) {
   const tone = statusTone(status);
   return (
