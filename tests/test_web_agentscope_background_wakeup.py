@@ -42,6 +42,14 @@ from vla_data_juicer_agents.web.session_store import WebSessionStore
 from vla_data_juicer_agents.web.sse import stream_session_events
 
 
+FORBIDDEN_PUBLIC_TOOL_RESULT_EVENTS = {
+    "TOOL_RESULT_START",
+    "TOOL_RESULT_TEXT_DELTA",
+    "TOOL_RESULT_DATA_DELTA",
+    "TOOL_RESULT_END",
+}
+
+
 class SignalingScriptedChatModel(ScriptedChatModel):
     def __init__(self) -> None:
         super().__init__()
@@ -312,6 +320,35 @@ def _assert_public_identity_boundary(case: BackgroundCase, events) -> None:
     assert "MainRouterAgent" not in serialized
 
 
+def _assert_public_replay_contract(
+    case: BackgroundCase,
+    events,
+    *,
+    expected_status: str,
+    expected_error_type: str | None,
+) -> dict[str, Any]:
+    assert [record.sequence for record in events] == list(
+        range(1, len(events) + 1)
+    )
+    event_types = {
+        str(record.event.get("type", "")).upper()
+        for record in events
+    }
+    assert event_types.isdisjoint(FORBIDDEN_PUBLIC_TOOL_RESULT_EVENTS)
+
+    terminals = _terminal_events(events)
+    assert len(terminals) == 1
+    terminal = terminals[0]
+    assert terminal["status"] == expected_status
+    assert terminal.get("error_type") == expected_error_type
+
+    reply_ids = _assistant_reply_ids(events)
+    assert len(reply_ids) == 2
+    assert reply_ids[0] != reply_ids[1]
+    _assert_public_identity_boundary(case, events)
+    return terminal
+
+
 @pytest.mark.asyncio
 async def test_real_agentscope_background_failure_replays_after_browser_connects(
     monkeypatch,
@@ -346,22 +383,19 @@ async def test_real_agentscope_background_failure_replays_after_browser_connects
                 "error_type": "extract_sync_failed",
             }
         ]
-        terminals = _terminal_events(replayed)
-        assert [terminal["status"] for terminal in terminals] == ["failure"]
-        assert "completed" not in {terminal["status"] for terminal in terminals}
-        reply_ids = _assistant_reply_ids(replayed)
-        assert len(reply_ids) == 2
-        assert reply_ids[0] != reply_ids[1]
-        assert [record.sequence for record in replayed] == list(
-            range(1, len(replayed) + 1)
+        terminal = _assert_public_replay_contract(
+            case,
+            replayed,
+            expected_status="failure",
+            expected_error_type="extract_sync_failed",
         )
+        assert terminal["error_type"] == "extract_sync_failed"
         assert case.wakeup_snapshots[0]["tool_runs"][0]["status"] == "failure"
         assert any(
             event.get("name") == "datapilot_tool_terminal"
             and event["value"]["status"] == "failure"
             for event in case.wakeup_snapshots[0]["events"]
         )
-        _assert_public_identity_boundary(case, replayed)
         case.model.assert_exhausted()
     finally:
         await case.stack.aclose()
@@ -384,14 +418,13 @@ async def test_real_agentscope_background_success_has_one_terminal_and_wakeup_re
         detail = case.store.get_session(case.web_session_id)
         assert detail is not None
         assert [row.status for row in detail.tool_runs] == ["success"]
-        assert [terminal["status"] for terminal in _terminal_events(replayed)] == [
-            "success"
-        ]
-        reply_ids = _assistant_reply_ids(replayed)
-        assert len(reply_ids) == 2
-        assert reply_ids[0] != reply_ids[1]
+        _assert_public_replay_contract(
+            case,
+            replayed,
+            expected_status="success",
+            expected_error_type=None,
+        )
         assert case.wakeup_snapshots[0]["tool_runs"][0]["status"] == "success"
-        _assert_public_identity_boundary(case, replayed)
         case.model.assert_exhausted()
     finally:
         await case.stack.aclose()
@@ -438,11 +471,13 @@ async def test_real_agentscope_explicit_stop_wins_over_late_background_success(
         detail = case.store.get_session(case.web_session_id)
         assert detail is not None
         assert [row.status for row in detail.tool_runs] == ["stopped"]
-        assert [terminal["status"] for terminal in _terminal_events(replayed)] == [
-            "stopped"
-        ]
+        _assert_public_replay_contract(
+            case,
+            replayed,
+            expected_status="stopped",
+            expected_error_type=None,
+        )
         assert case.wakeup_snapshots[0]["tool_runs"][0]["status"] == "stopped"
-        _assert_public_identity_boundary(case, replayed)
         case.model.assert_exhausted()
     finally:
         await case.stack.aclose()

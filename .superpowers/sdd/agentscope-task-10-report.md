@@ -74,3 +74,60 @@ passed
 ## Production changes
 
 None. The regression validates the integration wiring delivered by earlier tasks without adding sleeps, grace periods, browser-controlled execution, automatic reruns, or AgentScope source modifications.
+
+## Reviewer-oracle fix
+
+Follow-up status: DONE
+
+The three scenarios now share one complete public replay contract. For every
+replay opened from sequence zero it asserts:
+
+- sequences are exactly `1..N` with no gap;
+- no native AgentScope `TOOL_RESULT_START`, `TOOL_RESULT_TEXT_DELTA`,
+  `TOOL_RESULT_DATA_DELTA`, or `TOOL_RESULT_END` event is public;
+- exactly one canonical `datapilot_tool_terminal` exists;
+- the terminal status and error type match the scenario (`failure /
+  extract_sync_failed`, `success / None`, or `stopped / None`);
+- exactly two ordered, distinct, runtime-produced `REPLY_START.reply_id`
+  values exist, including the cancellation-resistant stop case's natural
+  wakeup reply;
+- private identity cleanup still holds.
+
+### Mutation / RED proof
+
+After writing the stronger assertions, the production
+`SUPPRESSED_TOOL_RESULT_EVENTS` set was temporarily replaced with an empty
+set and the failure scenario was run. This mutation was not committed.
+
+```text
+.venv/bin/pytest tests/test_web_agentscope_background_wakeup.py::test_real_agentscope_background_failure_replays_after_browser_connects -q
+1 failed
+
+AssertionError at:
+assert event_types.isdisjoint(FORBIDDEN_PUBLIC_TOOL_RESULT_EVENTS)
+```
+
+The captured real AgentScope log also showed
+`Synthetic ToolResponse yielded for offloaded tool`, proving the new oracle
+failed on the intended outer ToolOffload placeholder event stream. The
+suppression set was restored byte-for-byte; `git diff` for
+`datapilot_projection.py` is empty.
+
+After restoration:
+
+```text
+.venv/bin/pytest tests/test_web_agentscope_background_wakeup.py -v
+3 passed in 0.46s
+
+.venv/bin/pytest -q tests/test_web_agentscope_background_wakeup.py tests/test_datapilot_projection.py tests/test_web_sse.py tests/test_web_agentscope_session.py
+133 passed in 1.10s
+
+.venv/bin/pytest -q
+894 passed, 1 known Starlette/httpx deprecation warning in 8.58s
+
+.venv/bin/python -m compileall -q src tests/navigation_chat_service_harness.py tests/test_web_agentscope_background_wakeup.py
+passed
+
+git diff --check
+passed
+```
