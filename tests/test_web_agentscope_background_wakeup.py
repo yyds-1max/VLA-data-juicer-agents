@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+import sqlite3
 from contextlib import AsyncExitStack
 from dataclasses import dataclass
 from pathlib import Path
@@ -10,6 +11,7 @@ from types import SimpleNamespace
 from typing import Any
 
 import pytest
+from pydantic import ValidationError
 from agentscope.app._manager import (
     BackgroundTaskManager,
     CancelDispatcher,
@@ -650,3 +652,176 @@ async def test_stop_aware_message_bus_preserves_wrapped_async_lifecycle() -> Non
         assert wrapped.entered is True
 
     assert wrapped.exited is True
+
+
+@pytest.mark.asyncio
+async def test_stop_aware_inbox_filters_only_valid_hint_blocks_and_preserves_order(
+    tmp_path: Path,
+) -> None:
+    config = runtime_config(tmp_path)
+    bus = DeterministicMessageBus()
+    store = WebSessionStore(tmp_path / "hint-validation.sqlite")
+    public_session = store.create_session("hint validation")
+    internal_session_id = "private-validation-session"
+    store.save_agentscope_session_mapping(
+        public_session.id,
+        agent_id=config.main_router_agent_id,
+        agentscope_session_id=internal_session_id,
+    )
+    store.begin_execution_generation(public_session.id)
+    store.start_tool_run(
+        public_session.id,
+        "call-stopped",
+        "extract",
+        "2026-07-15T00:00:00.000+00:00",
+    )
+    store.stop_open_tool_runs_with_terminal_events(
+        public_session.id,
+        lambda row: (
+            hashlib.sha256(f"stop:{row.tool_call_id}".encode()).hexdigest(),
+            {"type": "CUSTOM", "value": {"tool_call_id": row.tool_call_id}},
+        ),
+    )
+    runtime = AgentScopeRuntime(
+        config=config,
+        storage=ChatServiceStorage(),
+        message_bus=bus,
+        workspace_manager=ChatServiceWorkspaceManager(),
+        app=SimpleNamespace(state=SimpleNamespace()),
+        bootstrapped=True,
+    )
+    runtime.set_web_session_store(store)
+    inbox_key = MessageBusKeys.inbox(internal_session_id)
+    stopped_source = json.dumps(
+        {"label": "tool_output", "sublabel": "extract · call-stopped"}
+    )
+    normal = HintBlock(
+        source=json.dumps(
+            {"label": "tool_output", "sublabel": "extract · call-normal"}
+        ),
+        hint="NORMAL",
+    ).model_dump(mode="json")
+    malformed = {"type": "not-a-hint", "source": stopped_source}
+    stopped = HintBlock(
+        source=stopped_source,
+        hint="STOPPED",
+    ).model_dump(mode="json")
+    unrelated = {"type": "team_message", "source": stopped_source, "payload": "keep"}
+    original_payloads = [normal, malformed, stopped, unrelated]
+    for payload in original_payloads:
+        await bus.queue_push(inbox_key, payload)
+
+    retained = await _StopAwareMessageBus(bus, lambda: runtime).queue_drain(
+        inbox_key,
+        max_count=100,
+    )
+
+    assert [payload for _entry_id, payload in retained] == [
+        normal,
+        malformed,
+        unrelated,
+    ]
+    with pytest.raises(ValidationError):
+        HintBlock.model_validate(malformed)
+
+    await bus.queue_push(inbox_key, malformed)
+    inbox = InboxMiddleware(_StopAwareMessageBus(bus, lambda: runtime))
+    agent = SimpleNamespace(
+        name="MainRouterAgent",
+        state=SimpleNamespace(
+            session_id=internal_session_id,
+            reply_id="reply-validation",
+            context=[],
+        ),
+    )
+
+    async def reasoning(**_kwargs):
+        return
+        yield  # pragma: no cover
+
+    with pytest.raises(ValidationError):
+        _ = [
+            item
+            async for item in inbox.on_reasoning(agent, {}, reasoning)
+        ]
+
+
+@pytest.mark.asyncio
+async def test_stop_aware_inbox_lookup_failure_returns_original_batch_in_order(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = runtime_config(tmp_path)
+    bus = DeterministicMessageBus()
+    store = WebSessionStore(tmp_path / "hint-lookup-failure.sqlite")
+    public_session = store.create_session("hint lookup failure")
+    internal_session_id = "private-lookup-session"
+    store.save_agentscope_session_mapping(
+        public_session.id,
+        agent_id=config.main_router_agent_id,
+        agentscope_session_id=internal_session_id,
+    )
+    runtime = AgentScopeRuntime(
+        config=config,
+        storage=ChatServiceStorage(),
+        message_bus=bus,
+        workspace_manager=ChatServiceWorkspaceManager(),
+        app=SimpleNamespace(state=SimpleNamespace()),
+        bootstrapped=True,
+    )
+    runtime.set_web_session_store(store)
+    monkeypatch.setattr(
+        store,
+        "tool_delivery_sublabel_is_suppressed",
+        lambda *_args: (_ for _ in ()).throw(
+            sqlite3.OperationalError("database is locked")
+        ),
+    )
+    inbox_key = MessageBusKeys.inbox(internal_session_id)
+    payloads = [
+        HintBlock(
+            source=json.dumps(
+                {"label": "tool_output", "sublabel": "extract · call-1"}
+            ),
+            hint="FIRST",
+        ).model_dump(mode="json"),
+        HintBlock(hint="SECOND").model_dump(mode="json"),
+    ]
+    original_entries = [
+        (await bus.queue_push(inbox_key, payload), payload)
+        for payload in payloads
+    ]
+
+    retained = await _StopAwareMessageBus(bus, lambda: runtime).queue_drain(
+        inbox_key,
+        max_count=100,
+    )
+
+    assert retained == original_entries
+    assert bus._queues[inbox_key] == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("call_style", ["default", "positional", "keyword"])
+async def test_stop_aware_queue_drain_matches_agentscope_call_signature(call_style: str) -> None:
+    class SignatureBus:
+        seen: list[int] = []
+
+        async def queue_drain(self, _key, max_count=100):
+            self.seen.append(max_count)
+            return []
+
+    wrapped = SignatureBus()
+    proxy = _StopAwareMessageBus(wrapped, lambda: None)
+
+    if call_style == "default":
+        await proxy.queue_drain("ordinary-key")
+        expected = 100
+    elif call_style == "positional":
+        await proxy.queue_drain("ordinary-key", 7)
+        expected = 7
+    else:
+        await proxy.queue_drain("ordinary-key", max_count=9)
+        expected = 9
+
+    assert wrapped.seen == [expected]

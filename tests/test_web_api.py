@@ -15,6 +15,7 @@ from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
 from vla_data_juicer_agents.navigation.task_store import SqliteNavigationTaskStore
+from vla_data_juicer_agents.core.cancellation import CancellationContext
 from vla_data_juicer_agents.runtime.agentscope_config import AgentScopeRuntimeConfig
 from vla_data_juicer_agents.runtime.agentscope_runtime import AgentScopeRuntime
 from vla_data_juicer_agents.web.app import (
@@ -866,6 +867,91 @@ def test_delete_session_removes_only_control_state_and_preserves_artifact_bytes(
         ("delete-user", "worker-agent", "inactive-worker-session"),
     ]
     assert client.delete(f"/api/sessions/{session_id}").status_code == 404
+
+
+def test_delete_cancels_every_retained_lease_before_first_agentscope_delete(
+    tmp_path: Path,
+):
+    cancellations = [CancellationContext(), CancellationContext()]
+
+    class AllCancelledBeforeDeleteService(RecordingSessionService):
+        async def delete_session(self, user_id, agent_id, session_id):
+            assert all(item.cancelled for item in cancellations)
+            return await super().delete_session(user_id, agent_id, session_id)
+
+    service = AllCancelledBeforeDeleteService()
+    client, runtime = make_deletion_client(tmp_path, service)
+    session_id = _create_session(client)
+    mappings = [
+        ("navigation-data-agent", "navigation-session"),
+        ("worker-agent", "worker-session"),
+    ]
+    for (agent_id, agentscope_session_id), cancellation in zip(
+        mappings,
+        cancellations,
+        strict=True,
+    ):
+        runtime.web_session_store.save_agentscope_session_mapping(
+            session_id,
+            agent_id=agent_id,
+            agentscope_session_id=agentscope_session_id,
+        )
+        runtime.register_run_cancellation(agentscope_session_id, cancellation)
+
+    response = client.delete(f"/api/sessions/{session_id}")
+
+    assert response.status_code == 204
+    assert all(item.cancelled for item in cancellations)
+    assert runtime.web_session_store.get_session(session_id) is None
+
+
+def test_delete_cancel_failure_attempts_remaining_leases_before_safe_abort(
+    tmp_path: Path,
+):
+    class FailingCancellation(CancellationContext):
+        def cancel(self) -> bool:
+            raise RuntimeError("private cancel failure identity")
+
+    service = RecordingSessionService()
+    client, runtime = make_deletion_client(tmp_path, service)
+    session_id = _create_session(client)
+    mappings = [
+        ("navigation-data-agent", "private-cancel-failure"),
+        ("worker-agent", "worker-session"),
+    ]
+    for agent_id, agentscope_session_id in mappings:
+        runtime.web_session_store.save_agentscope_session_mapping(
+            session_id,
+            agent_id=agent_id,
+            agentscope_session_id=agentscope_session_id,
+        )
+    same_session_remaining = CancellationContext()
+    other_mapping_remaining = CancellationContext()
+    runtime.register_run_cancellation(
+        "private-cancel-failure",
+        FailingCancellation(),
+    )
+    runtime.register_run_cancellation(
+        "private-cancel-failure",
+        same_session_remaining,
+    )
+    runtime.register_run_cancellation("worker-session", other_mapping_remaining)
+
+    response = client.delete(f"/api/sessions/{session_id}")
+
+    assert response.status_code == 409
+    assert response.json() == {
+        "detail": {
+            "code": "session_delete_failed",
+            "message": "DataPilot could not delete this session. Please retry.",
+        }
+    }
+    assert "private-cancel-failure" not in response.text
+    assert "private cancel failure identity" not in response.text
+    assert same_session_remaining.cancelled is True
+    assert other_mapping_remaining.cancelled is True
+    assert service.calls == []
+    assert runtime.web_session_store.get_session(session_id) is not None
 
 
 def test_agentscope_delete_failure_keeps_public_and_navigation_control_state(tmp_path: Path):

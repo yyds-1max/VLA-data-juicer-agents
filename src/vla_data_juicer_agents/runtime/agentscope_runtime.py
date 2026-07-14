@@ -17,9 +17,17 @@ from agentscope.app.message_bus import MessageBusKeys, RedisMessageBus
 from agentscope.app.storage import ChatModelConfig, RedisStorage, SessionConfig
 from agentscope.app.workspace_manager import LocalWorkspaceManager
 from agentscope.event import CustomEvent, ExternalExecutionResultEvent
-from agentscope.message import TextBlock, ToolCallState, ToolResultBlock, ToolResultState, UserMsg
+from agentscope.message import (
+    HintBlock,
+    TextBlock,
+    ToolCallState,
+    ToolResultBlock,
+    ToolResultState,
+    UserMsg,
+)
 from agentscope.permission import PermissionBehavior, PermissionDecision
 from agentscope.tool import ToolBase, ToolChunk
+from pydantic import ValidationError
 
 from vla_data_juicer_agents.core.cancellation import (
     CancellationContext,
@@ -117,8 +125,7 @@ class _StopAwareMessageBus:
     async def queue_drain(
         self,
         key: str,
-        *,
-        max_count: int,
+        max_count: int = 100,
     ) -> list[tuple[str, dict[str, Any]]]:
         entries = await self._wrapped.queue_drain(key, max_count=max_count)
         inbox_prefix = MessageBusKeys.inbox("")
@@ -128,10 +135,18 @@ class _StopAwareMessageBus:
         if runtime is None:
             return entries
         agentscope_session_id = key[len(inbox_prefix) :]
-        return runtime.filter_stopped_tool_hints(
-            agentscope_session_id,
-            entries,
-        )
+        try:
+            return runtime.filter_stopped_tool_hints(
+                agentscope_session_id,
+                entries,
+            )
+        except Exception:  # pylint: disable=broad-except
+            _logger.warning(
+                "Stopped ToolOffload inbox filtering failed open: session_id=%s",
+                agentscope_session_id,
+                exc_info=True,
+            )
+            return entries
 
 
 @dataclass
@@ -364,13 +379,19 @@ class AgentScopeRuntime:
             return entries
         retained: list[tuple[str, dict[str, Any]]] = []
         for entry_id, payload in entries:
-            source = payload.get("source") if isinstance(payload, dict) else None
+            try:
+                hint = HintBlock.model_validate(payload)
+            except ValidationError:  # AgentScope Inbox owns canonical validation.
+                retained.append((entry_id, payload))
+                continue
+            source = hint.source
             try:
                 source_payload = json.loads(source) if isinstance(source, str) else None
             except json.JSONDecodeError:
                 source_payload = None
             if not (
                 isinstance(source_payload, dict)
+                and set(source_payload) == {"label", "sublabel"}
                 and source_payload.get("label") == "tool_output"
                 and isinstance(source_payload.get("sublabel"), str)
             ):
@@ -814,13 +835,23 @@ class AgentScopeRuntime:
             raise RuntimeError("Web session store is not configured")
         mappings = self.web_session_store.list_agentscope_session_mappings(web_session_id)
         session_service = self.app.state.session_service
+        cancellation_failures: list[Exception] = []
         for mapping in mappings:
-            self.cancel_run_cancellations(mapping.agentscope_session_id)
+            try:
+                self.cancel_run_cancellations(mapping.agentscope_session_id)
+            except Exception as exc:  # pylint: disable=broad-except
+                cancellation_failures.append(exc)
+        if cancellation_failures:
+            raise RuntimeError("AgentScope session cancellation failed") from (
+                cancellation_failures[0]
+            )
+        for mapping in mappings:
             await session_service.delete_session(
                 self.config.user_id,
                 mapping.agent_id,
                 mapping.agentscope_session_id,
             )
+        for mapping in mappings:
             self.discard_run_cancellations(mapping.agentscope_session_id)
         self._navigation_services().delete_control_state_for_web_session(web_session_id)
         self.web_sessions.pop(web_session_id, None)
@@ -891,8 +922,14 @@ class AgentScopeRuntime:
 
     def cancel_run_cancellations(self, agentscope_session_id: str) -> bool:
         cancelled = False
+        failures: list[Exception] = []
         for lease in self._run_cancellations.get(agentscope_session_id, []):
-            cancelled = lease.cancellation.cancel() or cancelled
+            try:
+                cancelled = lease.cancellation.cancel() or cancelled
+            except Exception as exc:  # pylint: disable=broad-except
+                failures.append(exc)
+        if failures:
+            raise RuntimeError("AgentScope cancellation lease failed") from failures[0]
         return cancelled
 
     def discard_run_cancellations(self, agentscope_session_id: str) -> None:

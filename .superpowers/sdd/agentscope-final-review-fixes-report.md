@@ -235,3 +235,62 @@ adversarial tool_call_id is byte-identical in response, ledger, and event.
 - Python `compileall`: passed.
 - `git diff --check`: passed.
 - AgentScope runtime assembly smoke test with the owned message-bus wrapper: passed.
+
+## Round 3 patch-review fixes
+
+Baseline: `cfb9f51`
+
+The final patch review found one delete-ordering safety issue, one inbox-validation
+failure mode, and one MessageBus signature mismatch. Tests were added and observed
+failing before the small production changes.
+
+### Delete cancels every retained lease before destructive session deletion
+
+Root cause: `delete_web_session()` interleaved one lease cancellation with one
+AgentScope SessionService deletion. With two mappings, the first deletion began while
+the second mapping's production worker token was still live.
+
+RED: two retained tokens and a SessionService callback asserted that every token was
+canceled at the first delete call. The endpoint returned 409 because the second token
+was not canceled yet.
+
+GREEN: deletion now has three explicit phases. It first materializes all mappings and
+attempts cancellation for every retained lease. Cancellation exceptions are collected
+without skipping later leases in the same session or later mappings; any failure aborts before the first destructive
+AgentScope delete and reaches the existing generic 409 boundary without exposing a
+private identity. Only a successful cancel-all phase may delete mapped AgentScope
+sessions. Lease discard happens only after every mapped deletion succeeds, preserving
+the existing idempotent retry semantics when a later mapped deletion fails. Control
+rows and navigation control state continue through the established finalization path.
+
+### Inbox filtering preserves AgentScope validation and fails open after drain
+
+Root cause: the stop-aware bus parsed the raw `source` field before AgentScope's
+official InboxMiddleware validation. A malformed/non-HintBlock payload could forge an
+exact stopped sublabel and be silently dropped. A tombstone SQLite exception occurred
+after destructive queue drain and propagated, permanently losing the batch.
+
+RED: a mixed batch containing normal, malformed exact-stopped, valid stopped, and
+unrelated payloads lost both malformed entries; an injected SQLite lookup error raised
+after drain. The original wrapper also failed the default and positional forms of the
+AgentScope MessageBus API.
+
+GREEN: each entry is classified with AgentScope 2.0.4 `HintBlock.model_validate`.
+Validation failures are retained byte-for-byte so official InboxMiddleware still
+raises its canonical ValidationError. Only a valid HintBlock with the complete official
+two-field source and an exact persisted sublabel match is removed. Filtering exceptions
+after drain log a warning and return the complete original `(entry_id, payload)` batch
+in original order; this deliberately fails open rather than losing acknowledged
+messages. A real InboxMiddleware integration verifies malformed input remains visible
+to official validation.
+
+The wrapper now exposes `queue_drain(key, max_count=100)`, matching AgentScope 2.0.4.
+Default, positional, and keyword max-count calls all delegate correctly.
+
+### Round 3 verification
+
+- Focused delete/inbox/store/runtime groups: `208 passed, 1 warning`.
+- Full backend: `924 passed, 1 warning` (the existing Starlette deprecation warning).
+- Python `compileall`: passed.
+- `git diff --check`: passed.
+- No frontend files changed in round 3.
