@@ -38,6 +38,7 @@ from vla_data_juicer_agents.navigation.plan_models import (
     ExtractSyncPlanInput,
     FinishProcessingPlanInput,
     NavigationPlanRecord,
+    SideEffectState,
 )
 from vla_data_juicer_agents.navigation.plan_store import (
     ActivePlanExecutionConflict,
@@ -99,7 +100,7 @@ def _bounded_result_payload(payload: dict[str, Any], *, action: str) -> tuple[di
     return {
         "ok": False,
         "tool_name": action[:200],
-        "message": "Processing returned an oversized result; the bounded digest is retained and replanning is required.",
+        "message": "Processing returned an oversized result; the bounded digest is retained and manual recovery is required.",
         "details": {
             "error_type": "processing_result_oversized",
             "sha256": hashlib.sha256(canonical.encode("utf-8")).hexdigest(),
@@ -371,6 +372,12 @@ def _record_changed_preconditions(
         transitioned = plan_store.mark_needs_replan(
             plan.plan_id,
             "input_precondition_changed",
+            result_summary={
+                "ok": False,
+                "error_type": "input_precondition_changed",
+                "message": "A concrete input required by the accepted plan changed before execution.",
+                "side_effect_state": "not_started",
+            },
             expected_web_session_id=expected_web_session_id,
             expected_agentscope_session_id=expected_agentscope_session_id,
         )
@@ -534,21 +541,42 @@ def _result_payload(result: Any) -> dict[str, Any]:
     raise TypeError(f"navigation processing action returned unsupported result: {type(result)!r}")
 
 
-def _result_summary(payload: dict[str, Any]) -> dict[str, Any]:
+def _side_effect_state(*, invoked: bool, ok: bool) -> SideEffectState:
+    if not invoked:
+        return "not_started"
+    return "completed" if ok else "partial_or_unknown"
+
+
+def _result_summary(
+    payload: dict[str, Any],
+    *,
+    invoked: bool,
+) -> dict[str, Any]:
     details = payload.get("details") if isinstance(payload.get("details"), dict) else {}
     error_type = details.get("error_type") or payload.get("error_type")
+    ok = bool(payload.get("ok"))
     return {
-        "ok": bool(payload.get("ok")),
+        "ok": ok,
         "tool_name": str(payload.get("tool_name", ""))[:200],
         "message": str(payload.get("message", ""))[:800],
         "error_type": str(error_type)[:200] if error_type else None,
         "produced_path_count": len(payload.get("produced_paths") or []),
+        "side_effect_state": _side_effect_state(invoked=invoked, ok=ok),
     }
 
 
 def _next_action(plan_store: SqliteNavigationPlanRepository, plan_id: str) -> str | None:
     current = plan_store.get_current_step(plan_id)
     return current["step"]["action"] if current is not None else None
+
+
+def _failed_recovery_next_action(result_summary: Any) -> str:
+    if (
+        isinstance(result_summary, dict)
+        and result_summary.get("side_effect_state") == "not_started"
+    ):
+        return "submit_complete_plan"
+    return "manual_recovery"
 
 
 def _terminal_error(
@@ -558,7 +586,9 @@ def _terminal_error(
     current = plan_store.get_current_step(plan_id)
     status = (current or {}).get("step", {}).get("status")
     next_action = (
-        "submit_complete_plan"
+        _failed_recovery_next_action(
+            ((current or {}).get("step") or {}).get("result_summary")
+        )
         if status in {"failed", "needs_replan"}
         else "manual_recovery"
         if status == "running"
@@ -594,8 +624,8 @@ def _finalize_staged_result(
     if staged is None:
         return _compact_error(
             "step_recovery_requires_replan",
-            "The running step has no durable staged result. Replan or perform manual recovery; the underlying action will not be rerun automatically.",
-            next_action="submit_complete_plan",
+            "The running step has no durable staged result. Manual recovery is required; the underlying action will not be rerun automatically.",
+            next_action="manual_recovery",
         )
     result_ref = staged.result_ref
     if result_ref is None:
@@ -650,7 +680,7 @@ def _finalize_staged_result(
         "next_action": (
             _next_action(plan_store, plan.plan_id)
             if staged.target_status == "completed"
-            else "submit_complete_plan"
+            else _failed_recovery_next_action(staged.result_summary)
         ),
     }
     if len(_canonical_json(response)) > MAX_EXECUTION_READ_CHARS:
@@ -723,7 +753,7 @@ def _invoke_plan_step(
             return _compact_error(
                 "step_recovery_requires_replan",
                 "The running step has no durable staged result. It was moved to needs_replan and will not be rerun automatically.",
-                next_action="submit_complete_plan",
+                next_action="manual_recovery",
             )
         return _terminal_error(plan_store, plan.plan_id)
     precondition_failure = verify_plan_step_preconditions(
@@ -766,6 +796,7 @@ def _invoke_plan_step(
             return _session_mismatch_error()
         return _terminal_error(plan_store, plan.plan_id)
 
+    invoked = False
     try:
         arguments = resolve_step_arguments(
             task=task,
@@ -776,6 +807,7 @@ def _invoke_plan_step(
         with bind_cancellation(active_cancellation):
             if active_cancellation is not None:
                 active_cancellation.raise_if_cancelled()
+            invoked = True
             payload = _result_payload(function(**arguments))
     except TurnCancelled:
         payload = {
@@ -791,7 +823,7 @@ def _invoke_plan_step(
                 expected_action=step.action,
                 target_status="failed",
                 full_result=payload,
-                result_summary=_result_summary(payload),
+                result_summary=_result_summary(payload, invoked=invoked),
                 expected_web_session_id=expected_web_session_id,
                 expected_agentscope_session_id=expected_agentscope_session_id,
             )
@@ -817,6 +849,7 @@ def _invoke_plan_step(
                 step.step_id,
                 "cancellation result could not be staged",
                 expected_action=step.action,
+                side_effect_state=_side_effect_state(invoked=invoked, ok=False),
                 expected_web_session_id=expected_web_session_id,
                 expected_agentscope_session_id=expected_agentscope_session_id,
             )
@@ -833,7 +866,7 @@ def _invoke_plan_step(
         }
 
     payload, oversized = _bounded_result_payload(payload, action=action)
-    summary = _result_summary(payload)
+    summary = _result_summary(payload, invoked=invoked)
     terminal_status = "completed" if summary["ok"] else "failed"
     try:
         plan_store.stage_step_result(
@@ -852,13 +885,16 @@ def _invoke_plan_step(
             step.step_id,
             "processing result could not be staged after underlying execution",
             expected_action=step.action,
+            side_effect_state=_side_effect_state(invoked=invoked, ok=False),
             expected_web_session_id=expected_web_session_id,
             expected_agentscope_session_id=expected_agentscope_session_id,
         )
         return _compact_error(
             "step_recovery_requires_replan",
             "The underlying action finished but its result could not be staged. The step was moved to needs_replan and will not be rerun automatically.",
-            next_action="submit_complete_plan",
+            next_action=_failed_recovery_next_action(
+                {"side_effect_state": _side_effect_state(invoked=invoked, ok=False)}
+            ),
         )
     response = _finalize_staged_result(
         task=task,
@@ -880,7 +916,7 @@ def _invoke_plan_step(
             expected_agentscope_session_id=expected_agentscope_session_id,
         )
         response["status"] = "needs_replan"
-        response["next_action"] = "submit_complete_plan"
+        response["next_action"] = "manual_recovery"
     return response
 
 
@@ -1065,7 +1101,7 @@ def submit_plan_human_decision(
             decision=normalized_decision,
             target_status="completed" if payload["ok"] else "failed",
             full_result=payload,
-            result_summary=_result_summary(payload),
+            result_summary=_result_summary(payload, invoked=False),
             expected_web_session_id=expected_web_session_id,
             expected_agentscope_session_id=expected_agentscope_session_id,
         )

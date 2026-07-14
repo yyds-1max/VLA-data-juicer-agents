@@ -13,6 +13,7 @@ from types import SimpleNamespace
 import pytest
 
 import vla_data_juicer_agents.navigation.plan_execution as plan_execution
+import vla_data_juicer_agents.navigation.plan_models as plan_models
 from vla_data_juicer_agents.core.cancellation import CancellationContext, TurnCancelled
 from vla_data_juicer_agents.navigation.config import NavigationSettings
 from vla_data_juicer_agents.navigation.evidence_store import FileNavigationEvidenceStore
@@ -362,6 +363,7 @@ def test_extract_wrapper_loads_canonical_topics_from_plan(monkeypatch, tmp_path)
     )
 
     assert result["ok"] is True
+    assert result["side_effect_state"] == "completed"
     assert captured == {
         "date": services.task.date,
         "segments": services.task.segments,
@@ -463,6 +465,40 @@ def test_execution_gate_rejects_unmet_dependency_without_invoking(monkeypatch, t
     assert invoked == []
 
 
+def test_post_claim_argument_failure_is_not_misclassified_as_invoked(
+    monkeypatch,
+    tmp_path,
+):
+    services = build_services(tmp_path)
+    invoked = []
+    monkeypatch.setattr(
+        plan_execution,
+        "verify_plan_step_preconditions",
+        lambda **_kwargs: None,
+    )
+    monkeypatch.setattr(
+        plan_execution,
+        "resolve_step_arguments",
+        lambda **_kwargs: (_ for _ in ()).throw(ValueError("argument resolution failed")),
+    )
+    monkeypatch.setattr(
+        plan_execution,
+        "extract_and_sync_navigation_data",
+        lambda **kwargs: invoked.append(kwargs) or ok_result("extract_and_sync_navigation_data"),
+    )
+
+    result = call_tool(
+        services.tools()["extract_and_sync_navigation_data_tool"],
+        plan_id=services.plan.plan_id,
+        step_id="sync",
+    )
+
+    assert result["status"] == "failed"
+    assert result["error_type"] == "processing_exception"
+    assert result["side_effect_state"] == "not_started"
+    assert invoked == []
+
+
 def test_changed_input_precondition_records_evidence_without_artifact_reconciliation(
     monkeypatch,
     tmp_path,
@@ -494,6 +530,14 @@ def test_changed_input_precondition_records_evidence_without_artifact_reconcilia
     assert invoked == []
     assert services.plan_store.get(services.plan.plan_id).status == "invalidated"
     assert services.plan_store.get_current_step(services.plan.plan_id)["step"]["status"] == "needs_replan"
+    snapshot = services.plan_store.read_execution_snapshot(
+        web_session_id=services.task.created_by_web_session_id,
+        agentscope_session_id=services.task.agentscope_session_id,
+        task_id=services.task.task_id,
+    )
+    assert snapshot is not None
+    assert snapshot.activity == "failed_recovery"
+    assert snapshot.current["step"]["result_summary"]["side_effect_state"] == "not_started"
     evidence = services.evidence_store.read(services.task.task_id, result["result_ref"])
     assert evidence["data"]["missing_inputs"]
 
@@ -2193,7 +2237,7 @@ def test_underlying_exception_stages_failure_and_retry_only_finalizes(
     assert first["error_type"] == "result_finalize_retry_required"
     assert second["ok"] is False
     assert second["error_type"] == "processing_exception"
-    assert second["next_action"] == "submit_complete_plan"
+    assert second["next_action"] == "manual_recovery"
     assert len(invoked) == 1
 
 
@@ -2281,7 +2325,7 @@ def test_running_step_without_staged_result_transitions_to_needs_replan(
     result = call_tool(tool, plan_id=services.plan.plan_id, step_id="sync")
 
     assert result["error_type"] == "step_recovery_requires_replan"
-    assert result["next_action"] == "submit_complete_plan"
+    assert result["next_action"] == "manual_recovery"
     assert invoked == []
     assert services.plan_store.get(services.plan.plan_id).status == "invalidated"
     assert services.plan_store.get_current_step(services.plan.plan_id)["step"]["status"] == "needs_replan"
@@ -2305,11 +2349,13 @@ def test_failed_step_is_recorded_exactly_once_and_duplicate_does_not_reinvoke(
     second = call_tool(tool, plan_id=services.plan.plan_id, step_id="sync")
 
     assert first["ok"] is False
-    assert first["next_action"] == "submit_complete_plan"
+    assert first["next_action"] == "manual_recovery"
     assert second["error_type"] == "step_already_terminal"
-    assert second["next_action"] == "submit_complete_plan"
+    assert second["next_action"] == "manual_recovery"
     assert len(invoked) == 1
-    assert services.plan_store.get_current_step(services.plan.plan_id)["step"]["status"] == "failed"
+    current = services.plan_store.get_current_step(services.plan.plan_id)["step"]
+    assert current["status"] == "failed"
+    assert current["result_summary"]["side_effect_state"] == "partial_or_unknown"
 
 
 def test_failed_step_does_not_infer_artifact_state_and_exposes_no_fresh_execution_tools(
@@ -2349,6 +2395,7 @@ def test_failed_step_does_not_infer_artifact_state_and_exposes_no_fresh_executio
         )
     }
     assert result["status"] == "failed"
+    assert result["side_effect_state"] == "partial_or_unknown"
     assert stored.accepted_plan_phase == "extract_sync"
     assert stored.status.value == "failed"
     assert fresh == {}
@@ -2542,8 +2589,17 @@ def test_cancelled_result_finalize_failure_is_recoverable_without_reinvoking(
 
     assert recovered["status"] == "failed"
     assert recovered["error_type"] == "turn_cancelled"
-    assert recovered["next_action"] == "submit_complete_plan"
+    assert recovered["side_effect_state"] == "partial_or_unknown"
+    assert recovered["next_action"] == "manual_recovery"
     assert len(invoked) == 1
+
+
+def test_side_effect_state_literal_has_only_conservative_states():
+    assert set(plan_models.SideEffectState.__args__) == {
+        "not_started",
+        "completed",
+        "partial_or_unknown",
+    }
 
 
 def test_resolve_finish_arguments_are_derived_from_task_decisions_and_settings(tmp_path):

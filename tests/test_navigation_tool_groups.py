@@ -64,6 +64,7 @@ def test_fixed_navigation_tools_are_classified_exactly_once():
         _tool("submit_finish_processing_plan_tool"),
         _tool("get_plan_execution_overview_tool"),
         _tool("get_current_plan_step_tool"),
+        _tool("read_navigation_step_result_tool"),
     ]
 
     grouped = classify_fixed_navigation_tools(tools)
@@ -96,6 +97,7 @@ def test_fixed_navigation_tools_are_classified_exactly_once():
             "get_plan_execution_overview_tool",
             "get_current_plan_step_tool",
         },
+        NAVIGATION_DIAGNOSTICS: {"read_navigation_step_result_tool"},
     }
 
 
@@ -141,6 +143,14 @@ def test_policy_exposes_exact_groups_for_each_activity():
         NAVIGATION_EVIDENCE_READ,
         NAVIGATION_ARTIFACT_CHECKS,
         NAVIGATION_EXECUTION_STATE,
+        NAVIGATION_DIAGNOSTICS,
+    )
+    failed_surface = NavigationToolSurfacePolicy.resolve("failed_recovery", all_groups)
+    assert failed_surface.active_group_names == (
+        NAVIGATION_EVIDENCE_READ,
+        NAVIGATION_ARTIFACT_CHECKS,
+        NAVIGATION_EXECUTION_STATE,
+        NAVIGATION_PLAN_AUTHORING,
         NAVIGATION_DIAGNOSTICS,
     )
     assert planning_surface.group(NAVIGATION_DIAGNOSTICS).tools == ()

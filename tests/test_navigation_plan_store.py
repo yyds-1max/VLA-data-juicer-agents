@@ -1197,7 +1197,11 @@ def test_cross_phase_activation_replaces_the_whole_active_plan_atomically(tmp_pa
 
 @pytest.mark.parametrize(
     ("current_status", "expected_activity"),
-    [("pending", "execution"), ("failed", "planning"), ("needs_replan", "planning")],
+    [
+        ("pending", "execution"),
+        ("failed", "failed_recovery"),
+        ("needs_replan", "failed_recovery"),
+    ],
 )
 def test_execution_snapshot_reads_task_plan_and_ledger_in_one_state(
     tmp_path: Path,
@@ -1237,6 +1241,47 @@ def test_execution_snapshot_reads_task_plan_and_ledger_in_one_state(
     assert snapshot.current["step"]["status"] == current_status
     assert snapshot.overview.current_step_id == "prepare"
     assert snapshot.activity == expected_activity
+
+
+def test_execution_snapshot_prefers_handoff_recovery_over_failed_recovery(tmp_path: Path):
+    repo, task = stores_with_task(
+        tmp_path,
+        web_session_id="web-owner",
+        agentscope_session_id="web-owner__agent",
+    )
+    plan = _activate_owned(
+        repo,
+        task,
+        "finish_processing",
+        1,
+        valid_finish_plan(),
+        expected_web_session_id="web-owner",
+        expected_agentscope_session_id="web-owner__agent",
+    )
+    assert repo.mark_waiting_user(
+        plan.plan_id,
+        "confirm",
+        "confirm_navigation_calibration_params",
+        expected_web_session_id="web-owner",
+        expected_agentscope_session_id="web-owner__agent",
+    )
+    assert repo.mark_human_decision_recovery_required(
+        plan.plan_id,
+        "confirm",
+        reason_code="ambiguous_delivery_state",
+        request_anchor={"plan_id": plan.plan_id, "step_id": "confirm"},
+        expected_web_session_id="web-owner",
+        expected_agentscope_session_id="web-owner__agent",
+    )
+
+    snapshot = repo.read_execution_snapshot(
+        web_session_id="web-owner",
+        agentscope_session_id="web-owner__agent",
+        task_id=task.task_id,
+    )
+
+    assert snapshot is not None
+    assert snapshot.activity == "recovery_required"
 
 
 @pytest.mark.parametrize("in_flight_status", ["running", "waiting_user"])

@@ -16,6 +16,8 @@ from vla_data_juicer_agents.navigation.agent_tools import (
 )
 from vla_data_juicer_agents.navigation.tool_groups import (
     NAVIGATION_ARTIFACT_CHECKS,
+    NAVIGATION_DIAGNOSTICS,
+    NAVIGATION_EVIDENCE_READ,
     NAVIGATION_EXECUTION_ACTIONS,
     NAVIGATION_EXECUTION_STATE,
     NAVIGATION_PLAN_AUTHORING,
@@ -694,6 +696,47 @@ def _terminalize_plan(services, plan, session_id):
             expected_web_session_id=session_id,
             expected_agentscope_session_id=session_id,
         )
+
+
+def _stage_failed_result(services, plan, step, payload, session_id):
+    assert services.plan_store.claim_step(
+        plan.plan_id,
+        step.step_id,
+        step.action,
+        expected_web_session_id=session_id,
+        expected_agentscope_session_id=session_id,
+    ) is StepClaimOutcome.CLAIMED
+    staged = services.plan_store.stage_step_result(
+        plan.plan_id,
+        step.step_id,
+        expected_action=step.action,
+        target_status="failed",
+        full_result=payload,
+        result_summary={
+            "ok": False,
+            "tool_name": step.action,
+            "message": "failed",
+            "side_effect_state": "partial_or_unknown",
+        },
+        expected_web_session_id=session_id,
+        expected_agentscope_session_id=session_id,
+    )
+    services.evidence_store.write(
+        plan.task_id,
+        plan.observation_revision,
+        "execution_result",
+        step.action,
+        staged.full_result,
+        "failed result",
+        ref=staged.result_ref,
+    )
+    assert services.plan_store.finalize_staged_step(
+        plan.plan_id,
+        step.step_id,
+        expected_action=step.action,
+        expected_web_session_id=session_id,
+        expected_agentscope_session_id=session_id,
+    )
 
 
 def test_grouped_surface_resolves_planning_catalog(tmp_path):
@@ -1433,7 +1476,59 @@ def test_exact_attempt_retry_keeps_the_same_current_task_authorized(tmp_path):
     assert snapshot.task.task_id == first.task.task_id
 
 
-def test_activity_resolver_returns_failed_active_ledger_to_planning(tmp_path):
+def test_activity_resolver_exposes_exact_partial_failed_recovery_surface(tmp_path):
+    services, task, built = _resolver_services_from_complete(tmp_path)
+    active = services.plan_store.activate(
+        task,
+        "extract_sync",
+        4,
+        ExtractSyncPlanInput.model_validate(valid_extract_plan_payload(built)),
+        expected_web_session_id="as-session-1",
+        expected_agentscope_session_id="as-session-1",
+    )
+    first_step = active.plan.steps[0]
+    _stage_failed_result(
+        services,
+        active,
+        first_step,
+        {"ok": False, "tool_name": first_step.action, "message": "failed"},
+        "as-session-1",
+    )
+
+    surface = _surface(services, "as-session-1")
+    assert surface is not None
+
+    assert surface.activity == "failed_recovery"
+    assert _group_tool_names(surface) == {
+        NAVIGATION_EVIDENCE_READ: {
+            "list_observation_evidence_tool",
+            "read_observation_evidence_tool",
+        },
+        NAVIGATION_ARTIFACT_CHECKS: {
+            "inspect_navigation_artifact_state_tool",
+            "inspect_navigation_gridmap_artifacts_tool",
+        },
+        NAVIGATION_EXECUTION_STATE: {
+            "get_plan_execution_overview_tool",
+            "get_current_plan_step_tool",
+        },
+        NAVIGATION_PLAN_AUTHORING: set(),
+        NAVIGATION_DIAGNOSTICS: {"read_navigation_step_result_tool"},
+    }
+    assert {tool.name for tool in surface.flatten_active_tools()} == {
+        "list_observation_evidence_tool",
+        "read_observation_evidence_tool",
+        "inspect_navigation_artifact_state_tool",
+        "inspect_navigation_gridmap_artifacts_tool",
+        "get_plan_execution_overview_tool",
+        "get_current_plan_step_tool",
+        "read_navigation_step_result_tool",
+    }
+    with pytest.raises(LookupError):
+        surface.group(NAVIGATION_EXECUTION_ACTIONS)
+
+
+def test_not_started_failed_recovery_allows_plan_authoring_but_no_execution(tmp_path):
     services, task, built = _resolver_services_from_complete(tmp_path)
     active = services.plan_store.activate(
         task,
@@ -1446,13 +1541,138 @@ def test_activity_resolver_returns_failed_active_ledger_to_planning(tmp_path):
     first_step = active.plan.steps[0]
     with sqlite3.connect(services.plan_store.db_path) as connection:
         connection.execute(
-            """UPDATE navigation_task_steps SET status = 'failed'
+            """UPDATE navigation_task_steps
+               SET status = 'needs_replan',
+                   result_summary_json = ?
                WHERE plan_id = ? AND step_id = ?""",
-            (active.plan_id, first_step.step_id),
+            (
+                json.dumps({"ok": False, "side_effect_state": "not_started"}),
+                active.plan_id,
+                first_step.step_id,
+            ),
         )
 
-    names = {
-        tool.name
+    surface = _surface(services, "as-session-1")
+    assert surface is not None
+
+    assert surface.activity == "failed_recovery"
+    assert _group_tool_names(surface)[NAVIGATION_PLAN_AUTHORING] == {
+        "get_navigation_task_context_tool",
+        "describe_processing_action_tool",
+        "record_navigation_user_guidance_tool",
+        "submit_extract_sync_plan_tool",
+        "submit_finish_processing_plan_tool",
+    }
+    assert _group_tool_names(surface)[NAVIGATION_DIAGNOSTICS] == {
+        "read_navigation_step_result_tool"
+    }
+    with pytest.raises(LookupError):
+        surface.group(NAVIGATION_EXECUTION_ACTIONS)
+
+
+def test_failed_result_reader_is_plan_bound_paginated_and_schema_exact(tmp_path):
+    services, task, built = _resolver_services_from_complete(tmp_path)
+    active = services.plan_store.activate(
+        task,
+        "extract_sync",
+        4,
+        ExtractSyncPlanInput.model_validate(valid_extract_plan_payload(built)),
+        expected_web_session_id="as-session-1",
+        expected_agentscope_session_id="as-session-1",
+    )
+    first_step = active.plan.steps[0]
+    _stage_failed_result(
+        services,
+        active,
+        first_step,
+        {
+            "ok": False,
+            "tool_name": first_step.action,
+            "message": "failed",
+            "commands": [
+                {"command": ["processor", "one"], "return_code": 1, "stderr": "one"},
+                {"command": ["processor", "two"], "return_code": 2, "stderr": "two"},
+            ],
+            "details": {"error_type": "processing_failed", "safe": "detail"},
+        },
+        "as-session-1",
+    )
+    surface = _surface(services, "as-session-1")
+    assert surface is not None
+    reader = surface.group(NAVIGATION_DIAGNOSTICS).tools[0]
+
+    assert reader.name == "read_navigation_step_result_tool"
+    assert set(reader.input_schema["properties"]) == {
+        "plan_id",
+        "step_id",
+        "fields",
+        "cursor",
+        "limit",
+    }
+    assert set(reader.input_schema["required"]) == {"plan_id", "step_id"}
+    assert reader.input_schema["additionalProperties"] is False
+    page = _decode_tool_payload(
+        asyncio.run(
+            reader(
+                plan_id=active.plan_id,
+                step_id=first_step.step_id,
+                fields=["commands", "details"],
+                cursor=0,
+                limit=1,
+            )
+        )
+    )
+
+    assert page == {
+        "data": {
+            "commands": [
+                {
+                    "command": ["processor", "one"],
+                    "return_code": 1,
+                    "stderr": "one",
+                }
+            ],
+            "details": {"error_type": "processing_failed", "safe": "detail"},
+        },
+        "next_cursor": 1,
+    }
+    tools = {tool.name: tool for tool in surface.flatten_active_tools()}
+    current = _decode_tool_payload(
+        asyncio.run(
+            tools["get_current_plan_step_tool"](plan_id=active.plan_id)
+        )
+    )
+    assert "result_ref" not in current["step"]
+
+
+@pytest.mark.parametrize(
+    ("requested_plan", "requested_step"),
+    [("wrong-plan", "current"), ("current", "wrong-step")],
+)
+def test_failed_result_reader_rejects_wrong_plan_or_step_without_ref(
+    tmp_path,
+    requested_plan,
+    requested_step,
+):
+    services, task, built = _resolver_services_from_complete(tmp_path)
+    active = services.plan_store.activate(
+        task,
+        "extract_sync",
+        4,
+        ExtractSyncPlanInput.model_validate(valid_extract_plan_payload(built)),
+        expected_web_session_id="as-session-1",
+        expected_agentscope_session_id="as-session-1",
+    )
+    first_step = active.plan.steps[0]
+    _stage_failed_result(
+        services,
+        active,
+        first_step,
+        {"ok": False, "message": "failed"},
+        "as-session-1",
+    )
+    tools = {
+        tool.name: tool
         for tool in resolve_navigation_agent_tools(
             services=services,
             agentscope_session_id="as-session-1",
@@ -1461,7 +1681,91 @@ def test_activity_resolver_returns_failed_active_ledger_to_planning(tmp_path):
         )
     }
 
-    assert names == PLANNING_TOOL_NAMES
+    denied = _decode_tool_payload(
+        asyncio.run(
+            tools["read_navigation_step_result_tool"](
+                plan_id=(active.plan_id if requested_plan == "current" else requested_plan),
+                step_id=(first_step.step_id if requested_step == "current" else requested_step),
+            )
+        )
+    )
+
+    assert denied == {"ok": False, "error_type": "navigation_step_result_unavailable"}
+    assert "result_ref" not in json.dumps(denied)
+
+
+@pytest.mark.parametrize("ownership_change", ["session", "new_task"])
+def test_failed_result_reader_reauthorizes_attempt_and_bounds_inputs(
+    tmp_path,
+    ownership_change,
+):
+    services, task, built = _resolver_services_from_complete(tmp_path)
+    active = services.plan_store.activate(
+        task,
+        "extract_sync",
+        4,
+        ExtractSyncPlanInput.model_validate(valid_extract_plan_payload(built)),
+        expected_web_session_id="as-session-1",
+        expected_agentscope_session_id="as-session-1",
+    )
+    first_step = active.plan.steps[0]
+    _stage_failed_result(
+        services,
+        active,
+        first_step,
+        {"ok": False, "message": "failed"},
+        "as-session-1",
+    )
+    tools = {
+        tool.name: tool
+        for tool in resolve_navigation_agent_tools(
+            services=services,
+            agentscope_session_id="as-session-1",
+            web_session_id="as-session-1",
+            cancellation=None,
+        )
+    }
+    reader = tools["read_navigation_step_result_tool"]
+    oversized = _decode_tool_payload(
+        asyncio.run(
+            reader(
+                plan_id=active.plan_id,
+                step_id=first_step.step_id,
+                fields=[f"field-{index}" for index in range(21)],
+                limit=101,
+            )
+        )
+    )
+    if ownership_change == "session":
+        with sqlite3.connect(services.plan_store.db_path) as connection:
+            connection.execute(
+                """UPDATE navigation_tasks
+                   SET created_by_web_session_id = 'other-web',
+                       agentscope_session_id = 'other-agent'
+                   WHERE task_id = ?""",
+                (task.task_id,),
+            )
+    else:
+        services.task_store.create_task_attempt(
+            request="process another target",
+            target="20260712",
+            date="20260712",
+            segments=["20260712_120000"],
+            scene_mode=None,
+            dry_run=True,
+            web_session_id="as-session-1",
+            agentscope_session_id="as-session-1",
+        )
+    stale = _decode_tool_payload(
+        asyncio.run(reader(plan_id=active.plan_id, step_id=first_step.step_id))
+    )
+
+    assert oversized == {
+        "ok": False,
+        "error_type": "navigation_step_result_request_invalid",
+    }
+    assert stale == {"ok": False, "error_type": "navigation_step_result_unavailable"}
+    assert "result_ref" not in json.dumps({"oversized": oversized, "stale": stale})
 
 
 def test_runtime_anchor_does_not_reconcile_or_append_observation(tmp_path, monkeypatch):
