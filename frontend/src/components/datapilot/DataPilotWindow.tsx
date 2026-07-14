@@ -59,12 +59,15 @@ export function DataPilotWindow() {
     height: typeof window === "undefined" ? 900 : window.innerHeight,
   }));
   const streamRef = useRef<StreamLease | null>(null);
-  const startEventStreamRef = useRef<(sessionId: string) => void>(() => undefined);
+  const startEventStreamRef = useRef<(sessionId: string, generation: number) => void>(
+    () => undefined,
+  );
   const reconnectTimerRef = useRef<number | null>(null);
   const lifecycleGenerationRef = useRef(0);
   const mountedRef = useRef(false);
   const selectionGenerationRef = useRef(0);
   const selectionTargetRef = useRef<string | null>(null);
+  const draftRequestGenerationRef = useRef(0);
   const deletedSessionIdsRef = useRef(new Set<string>());
   const reconnectStateRef = useRef<{ sessionId: string | null; attempts: number }>({
     sessionId: null,
@@ -104,7 +107,18 @@ export function DataPilotWindow() {
   }, []);
 
   const startEventStream = useCallback(
-    (sessionId: string) => {
+    (sessionId: string, expectedGeneration: number) => {
+      const state = datapilotStore.getState();
+      if (
+        !mountedRef.current ||
+        lifecycleGenerationRef.current !== expectedGeneration ||
+        !state.open ||
+        state.mode !== "active_session" ||
+        state.currentSessionId !== sessionId ||
+        deletedSessionIdsRef.current.has(sessionId)
+      ) {
+        return;
+      }
       const active = streamRef.current;
       if (active?.sessionId === sessionId) {
         return;
@@ -186,7 +200,7 @@ export function DataPilotWindow() {
           if (isCurrentLease(lease)) {
             controller.abort();
             streamRef.current = null;
-            startEventStreamRef.current(lease.sessionId);
+            startEventStreamRef.current(lease.sessionId, lease.generation);
           }
         }, reconnectDelay);
       })();
@@ -199,6 +213,7 @@ export function DataPilotWindow() {
     mountedRef.current = true;
     return () => {
       mountedRef.current = false;
+      draftRequestGenerationRef.current += 1;
       selectionGenerationRef.current += 1;
       selectionTargetRef.current = null;
       invalidateEventLifecycle();
@@ -214,7 +229,7 @@ export function DataPilotWindow() {
 
     let cancelled = false;
     const sessionId = currentSessionId;
-    startEventStream(sessionId);
+    startEventStream(sessionId, lifecycleGenerationRef.current);
 
     void getSession(sessionId)
       .then((detail) => {
@@ -288,6 +303,7 @@ export function DataPilotWindow() {
   };
 
   const handleNewSession = () => {
+    draftRequestGenerationRef.current += 1;
     selectionGenerationRef.current += 1;
     selectionTargetRef.current = null;
     invalidateEventLifecycle();
@@ -296,6 +312,7 @@ export function DataPilotWindow() {
   };
 
   const handleSelectHistory = async (session: SessionRecord) => {
+    draftRequestGenerationRef.current += 1;
     const previousState = datapilotStore.getState();
     const previousMode = previousState.mode;
     const previousSessionId = previousState.currentSessionId;
@@ -325,14 +342,14 @@ export function DataPilotWindow() {
       selectionTargetRef.current = null;
       datapilotStore.getState().restoreSession(detail);
       setHistoryOpen(false);
-      startEventStream(session.id);
+      startEventStream(session.id, lifecycleGeneration);
     } catch (error) {
       if (!ownsSelection()) {
         return;
       }
       selectionTargetRef.current = null;
       if (previousMode === "active_session" && previousSessionId) {
-        startEventStream(previousSessionId);
+        startEventStream(previousSessionId, lifecycleGeneration);
       }
       console.error("Failed to restore DataPilot session", error);
     }
@@ -359,7 +376,7 @@ export function DataPilotWindow() {
         store.mode === "active_session" &&
         store.currentSessionId
       ) {
-        startEventStream(store.currentSessionId);
+        startEventStream(store.currentSessionId, lifecycleGenerationRef.current);
       }
     } catch (error) {
       console.error("Failed to delete DataPilot session", error);
@@ -367,15 +384,53 @@ export function DataPilotWindow() {
   };
 
   const handleDraftSubmit = async (message: string) => {
+    const requestGeneration = draftRequestGenerationRef.current + 1;
+    draftRequestGenerationRef.current = requestGeneration;
+    const lifecycleGeneration = lifecycleGenerationRef.current;
+    let createdSessionId: string | null = null;
+    const ownsDraftIntent = () => {
+      const state = datapilotStore.getState();
+      return (
+        mountedRef.current &&
+        draftRequestGenerationRef.current === requestGeneration &&
+        lifecycleGenerationRef.current === lifecycleGeneration &&
+        state.open &&
+        state.mode === "draft_new_session" &&
+        state.currentSessionId === null
+      );
+    };
+    const ownsCreatedSession = () => {
+      const state = datapilotStore.getState();
+      return Boolean(
+        createdSessionId &&
+          mountedRef.current &&
+          draftRequestGenerationRef.current === requestGeneration &&
+          lifecycleGenerationRef.current === lifecycleGeneration &&
+          state.open &&
+          state.mode === "active_session" &&
+          state.currentSessionId === createdSessionId &&
+          !deletedSessionIdsRef.current.has(createdSessionId),
+      );
+    };
     try {
       const session = await createSession(message);
+      if (!ownsDraftIntent()) {
+        return;
+      }
+      createdSessionId = session.id;
       const store = datapilotStore.getState();
       store.setActiveSession(session);
       const userMessage = localUserMessage(session.id, message);
-      startEventStream(session.id);
+      startEventStream(session.id, lifecycleGeneration);
       await submitTurn(session.id, message);
+      if (!ownsCreatedSession()) {
+        return;
+      }
       datapilotStore.getState().appendUserMessage(userMessage);
     } catch (error) {
+      if (!(createdSessionId ? ownsCreatedSession() : ownsDraftIntent())) {
+        return;
+      }
       invalidateEventLifecycle();
       datapilotStore.getState().enterDraft();
       console.error("Failed to submit DataPilot draft turn", error);
@@ -389,7 +444,7 @@ export function DataPilotWindow() {
 
     try {
       const userMessage = localUserMessage(currentSessionId, message);
-      startEventStream(currentSessionId);
+      startEventStream(currentSessionId, lifecycleGenerationRef.current);
       await submitTurn(currentSessionId, message);
       datapilotStore.getState().appendUserMessage(userMessage);
     } catch (error) {

@@ -1765,6 +1765,146 @@ test("submitting the first draft message creates a session, opens events, submit
   expect(screen.queryByText("开始一个任务")).not.toBeInTheDocument();
 });
 
+test("closing while draft session creation is pending ignores the late created session", async () => {
+  const creation = deferred<Awaited<ReturnType<typeof createSession>>>();
+  apiMocks.createSession.mockReturnValue(creation.promise);
+  await renderAppWithDashboardSettled();
+  fireEvent.click(screen.getByRole("button", { name: "Open DataPilot" }));
+  fireEvent.change(screen.getByPlaceholderText("我们要做什么？"), {
+    target: { value: "迟到的创建" },
+  });
+  fireEvent.click(screen.getByRole("button", { name: "Send message" }));
+  await waitFor(() => expect(apiMocks.createSession).toHaveBeenCalledWith("迟到的创建"));
+
+  fireEvent.click(screen.getByRole("button", { name: "Close DataPilot" }));
+  creation.resolve({
+    id: "late-session",
+    title: "Late session",
+    created_at: "2026-06-26T01:00:00Z",
+    updated_at: "2026-06-26T01:00:00Z",
+  });
+  await act(async () => {
+    await creation.promise;
+    await Promise.resolve();
+  });
+
+  expect(datapilotStore.getState().open).toBe(false);
+  expect(datapilotStore.getState().mode).toBe("draft_new_session");
+  expect(datapilotStore.getState().currentSessionId).toBeNull();
+  expect(apiMocks.streamSessionEvents).not.toHaveBeenCalled();
+  expect(apiMocks.submitTurn).not.toHaveBeenCalled();
+  await waitFor(() => expect(screen.queryByRole("dialog", { name: "DataPilot" })).not.toBeInTheDocument());
+});
+
+test("unmount while draft session creation is pending ignores the late created session", async () => {
+  const creation = deferred<Awaited<ReturnType<typeof createSession>>>();
+  apiMocks.createSession.mockReturnValue(creation.promise);
+  datapilotStore.setState({
+    open: true,
+    mode: "draft_new_session",
+    currentSessionId: null,
+    conversation: createAgentConversation(),
+  });
+  const rendered = render(<DataPilotWindow />);
+  fireEvent.change(screen.getByPlaceholderText("我们要做什么？"), {
+    target: { value: "卸载后的创建" },
+  });
+  fireEvent.click(screen.getByRole("button", { name: "Send message" }));
+  await waitFor(() => expect(apiMocks.createSession).toHaveBeenCalledWith("卸载后的创建"));
+
+  rendered.unmount();
+  creation.resolve({
+    id: "unmounted-session",
+    title: "Unmounted session",
+    created_at: "2026-06-26T01:00:00Z",
+    updated_at: "2026-06-26T01:00:00Z",
+  });
+  await act(async () => {
+    await creation.promise;
+    await Promise.resolve();
+  });
+
+  expect(datapilotStore.getState().mode).toBe("draft_new_session");
+  expect(datapilotStore.getState().currentSessionId).toBeNull();
+  expect(apiMocks.streamSessionEvents).not.toHaveBeenCalled();
+  expect(apiMocks.submitTurn).not.toHaveBeenCalled();
+});
+
+test("starting a new draft invalidates an older pending session creation", async () => {
+  const creation = deferred<Awaited<ReturnType<typeof createSession>>>();
+  apiMocks.createSession.mockReturnValue(creation.promise);
+  await renderAppWithDashboardSettled();
+  fireEvent.click(screen.getByRole("button", { name: "Open DataPilot" }));
+  fireEvent.change(screen.getByPlaceholderText("我们要做什么？"), {
+    target: { value: "旧草稿" },
+  });
+  fireEvent.click(screen.getByRole("button", { name: "Send message" }));
+  await waitFor(() => expect(apiMocks.createSession).toHaveBeenCalledWith("旧草稿"));
+
+  fireEvent.click(screen.getByRole("button", { name: "New session" }));
+  creation.resolve({
+    id: "superseded-session",
+    title: "Superseded",
+    created_at: "2026-06-26T01:00:00Z",
+    updated_at: "2026-06-26T01:00:00Z",
+  });
+  await act(async () => {
+    await creation.promise;
+    await Promise.resolve();
+  });
+
+  expect(datapilotStore.getState().mode).toBe("draft_new_session");
+  expect(datapilotStore.getState().currentSessionId).toBeNull();
+  expect(apiMocks.streamSessionEvents).not.toHaveBeenCalled();
+  expect(apiMocks.submitTurn).not.toHaveBeenCalled();
+  expect(screen.getByPlaceholderText("我们要做什么？")).toHaveValue("");
+});
+
+test("an older draft creation cannot overwrite a newer successful creation", async () => {
+  const firstCreation = deferred<Awaited<ReturnType<typeof createSession>>>();
+  const secondCreation = deferred<Awaited<ReturnType<typeof createSession>>>();
+  apiMocks.createSession
+    .mockReturnValueOnce(firstCreation.promise)
+    .mockReturnValueOnce(secondCreation.promise);
+  await renderAppWithDashboardSettled();
+  fireEvent.click(screen.getByRole("button", { name: "Open DataPilot" }));
+  const input = screen.getByPlaceholderText("我们要做什么？");
+
+  fireEvent.change(input, { target: { value: "first" } });
+  fireEvent.click(screen.getByRole("button", { name: "Send message" }));
+  fireEvent.change(input, { target: { value: "second" } });
+  fireEvent.click(screen.getByRole("button", { name: "Send message" }));
+  expect(apiMocks.createSession).toHaveBeenCalledTimes(2);
+
+  secondCreation.resolve({
+    id: "session-newer",
+    title: "Newer",
+    created_at: "2026-06-26T02:00:00Z",
+    updated_at: "2026-06-26T02:00:00Z",
+  });
+  await waitFor(() => expect(datapilotStore.getState().currentSessionId).toBe("session-newer"));
+  await waitFor(() => expect(apiMocks.submitTurn).toHaveBeenCalledWith("session-newer", "second"));
+
+  firstCreation.resolve({
+    id: "session-older",
+    title: "Older",
+    created_at: "2026-06-26T01:00:00Z",
+    updated_at: "2026-06-26T01:00:00Z",
+  });
+  await act(async () => {
+    await firstCreation.promise;
+    await Promise.resolve();
+  });
+
+  expect(datapilotStore.getState().currentSessionId).toBe("session-newer");
+  expect(apiMocks.streamSessionEvents).not.toHaveBeenCalledWith(
+    "session-older",
+    expect.any(Number),
+    expect.any(AbortSignal),
+  );
+  expect(apiMocks.submitTurn).not.toHaveBeenCalledWith("session-older", "first");
+});
+
 test("failed draft submit does not append a local user message", async () => {
   const consoleError = vi.spyOn(console, "error").mockImplementation(() => undefined);
   let activeSignal: AbortSignal | undefined;
