@@ -546,7 +546,15 @@ def test_create_agentscope_runtime_wires_navigation_factories(monkeypatch, tmp_p
     monkeypatch.setattr(runtime_module.agentscope.app, "create_app", fake_create_app)
     config = _config(tmp_path)
 
-    create_agentscope_runtime(config)
+    runtime = create_agentscope_runtime(config)
+
+    legacy_navigation_tool_calls = []
+
+    def legacy_navigation_tools_for_session(**kwargs):
+        legacy_navigation_tool_calls.append(kwargs)
+        return [SimpleNamespace(name="legacy_navigation_tool")]
+
+    runtime._navigation_tools_for_session = legacy_navigation_tools_for_session
 
     tools_factory = captured["extra_agent_tools"]
     middlewares_factory = captured["extra_agent_middlewares"]
@@ -557,6 +565,7 @@ def test_create_agentscope_runtime_wires_navigation_factories(monkeypatch, tmp_p
     assert asyncio.run(
         tools_factory("alice", config.navigation_agent_id, navigation_session_id)
     ) == []
+    assert legacy_navigation_tool_calls == []
     navigation_middlewares = asyncio.run(
         middlewares_factory(
             "alice",
@@ -581,6 +590,15 @@ def test_create_agentscope_runtime_wires_navigation_factories(monkeypatch, tmp_p
         )
     }
     assert router_tool_names == {"start_navigation_data_task"}
+
+    unknown_agent_id = "unknown-agent"
+    unknown_session_id = "web-1__unknown-agent"
+    assert asyncio.run(
+        tools_factory("alice", unknown_agent_id, unknown_session_id)
+    ) == []
+    assert asyncio.run(
+        middlewares_factory("alice", unknown_agent_id, unknown_session_id)
+    ) == []
 
 
 def _resolver_services_from_complete(
