@@ -619,6 +619,22 @@ class WebSessionStore:
             ).fetchone()
         return self._agentscope_mapping_from_row(row) if row is not None else None
 
+    def list_agentscope_session_mappings(
+        self,
+        web_session_id: str,
+    ) -> list[AgentScopeSessionMapping]:
+        with self._connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT web_session_id, agent_id, agentscope_session_id, event_cursor
+                FROM agentscope_sessions
+                WHERE web_session_id = ?
+                ORDER BY agent_id
+                """,
+                (web_session_id,),
+            ).fetchall()
+        return [self._agentscope_mapping_from_row(row) for row in rows]
+
     def get_agentscope_session_mapping_by_agentscope_session(
         self,
         agentscope_session_id: str,

@@ -125,9 +125,19 @@ class AgentScopeRuntime:
             "NavigationDataAgent",
             self.config.navigation_agent_id,
         }
-        identities.update(
-            session_id for _agent_id, session_id in self.web_sessions.values()
+        for agent_id, session_id in self.web_sessions.values():
+            identities.update((agent_id, session_id))
+        list_mappings = getattr(
+            self.web_session_store,
+            "list_agentscope_session_mappings",
+            None,
         )
+        if callable(list_mappings):
+            for web_session_id in self.web_sessions:
+                for mapping in list_mappings(web_session_id):
+                    identities.update(
+                        (mapping.agent_id, mapping.agentscope_session_id)
+                    )
         return identities
 
     async def project_agent_event(

@@ -7,7 +7,13 @@ from types import SimpleNamespace
 
 import pytest
 from agentscope.app.message_bus import MessageBusKeys
-from agentscope.event import ExternalExecutionResultEvent, ReplyStartEvent
+from agentscope.event import (
+    CustomEvent,
+    ExternalExecutionResultEvent,
+    HintBlockEvent,
+    ReplyEndEvent,
+    ReplyStartEvent,
+)
 from agentscope.message import Msg, ToolCallBlock, ToolCallState, ToolResultState
 from agentscope.permission import PermissionBehavior, PermissionContext
 from agentscope.tool import ToolResponse
@@ -1573,6 +1579,37 @@ async def test_runtime_preserves_per_agent_mapping_cursor_when_active_agent_chan
     assert store.get_agentscope_session_mapping(web_session.id).agent_id == "main-router-agent"
 
 
+def test_store_lists_all_agent_mappings_for_one_web_session(tmp_path: Path) -> None:
+    store = WebSessionStore(tmp_path / "sessions.sqlite")
+    first_session = store.create_session("first")
+    second_session = store.create_session("second")
+    store.save_agentscope_session_mapping(
+        first_session.id,
+        agent_id="historical-worker-agent",
+        agentscope_session_id="historical-worker-session",
+    )
+    store.save_agentscope_session_mapping(
+        first_session.id,
+        agent_id="navigation-data-agent",
+        agentscope_session_id="current-navigation-session",
+    )
+    store.save_agentscope_session_mapping(
+        second_session.id,
+        agent_id="other-agent",
+        agentscope_session_id="other-session",
+    )
+
+    mappings = store.list_agentscope_session_mappings(first_session.id)
+
+    assert {
+        (mapping.agent_id, mapping.agentscope_session_id)
+        for mapping in mappings
+    } == {
+        ("historical-worker-agent", "historical-worker-session"),
+        ("navigation-data-agent", "current-navigation-session"),
+    }
+
+
 @pytest.mark.asyncio
 async def test_runtime_submit_user_message_requires_chat_run_registry() -> None:
     runtime = _runtime(chat_run_registry=None)
@@ -2964,6 +3001,105 @@ async def test_runtime_event_cursor_persists_across_runtime_restart(tmp_path: Pa
         ("assistant_delta", {"delta": "新"}),
         ("final", {"text": "新"}),
     ]
+
+
+@pytest.mark.asyncio
+async def test_reply_projection_hides_historical_and_in_memory_mapping_identities(
+    tmp_path: Path,
+) -> None:
+    store = WebSessionStore(tmp_path / "sessions.sqlite")
+    public_session = store.create_session("处理历史导航数据")
+    historical_agent_id = "historical-worker-agent"
+    historical_session_id = "historical-worker-session"
+    current_session_id = "current-navigation-session"
+    memory_agent_id = "memory-installed-agent"
+    memory_session_id = "memory-installed-session"
+    store.save_agentscope_session_mapping(
+        public_session.id,
+        agent_id=historical_agent_id,
+        agentscope_session_id=historical_session_id,
+    )
+    store.save_agentscope_session_mapping(
+        public_session.id,
+        agent_id="navigation-data-agent",
+        agentscope_session_id=current_session_id,
+    )
+    runtime = _runtime(workspace_root=tmp_path)
+    runtime.web_sessions[public_session.id] = (
+        "navigation-data-agent",
+        current_session_id,
+    )
+    runtime.web_sessions["memory-public-session"] = (
+        memory_agent_id,
+        memory_session_id,
+    )
+    runtime.set_web_transport(store, None)
+    assert {
+        historical_agent_id,
+        historical_session_id,
+        memory_agent_id,
+        memory_session_id,
+    } <= runtime.projection_private_identities()
+    middleware = DataPilotReplyProjectionMiddleware(current_session_id, runtime)
+    source_items = [
+        ReplyStartEvent(
+            session_id=current_session_id,
+            reply_id="reply-identity",
+            name="NavigationDataAgent",
+        ),
+        HintBlockEvent(
+            reply_id="reply-identity",
+            block_id="hint-identity",
+            source=f"{historical_agent_id}/{historical_session_id}",
+            hint="continue",
+        ),
+        CustomEvent(
+            name="datapilot_progress",
+            metadata={"safe": "keep"},
+            value={
+                "description": (
+                    f"{historical_agent_id} at {historical_session_id}; "
+                    f"{memory_agent_id} at {memory_session_id}"
+                ),
+                "safe": "keep-value",
+            },
+        ),
+        ReplyEndEvent(
+            session_id=current_session_id,
+            reply_id="reply-identity",
+        ),
+    ]
+
+    async def handler(**_kwargs):
+        for item in source_items:
+            yield item
+
+    yielded = [
+        item
+        async for item in middleware.on_reply(
+            SimpleNamespace(name="NavigationDataAgent"),
+            {},
+            handler,
+        )
+    ]
+
+    assert yielded == source_items
+    detail = store.get_session(public_session.id)
+    assert detail is not None
+    public_json = json.dumps(
+        [record.event for record in detail.events],
+        ensure_ascii=False,
+    )
+    for private_identity in (
+        historical_agent_id,
+        historical_session_id,
+        memory_agent_id,
+        memory_session_id,
+    ):
+        assert private_identity not in public_json
+    assert detail.events[1].event["source"] == "DataPilot/DataPilot"
+    assert detail.events[2].event["metadata"] == {"safe": "keep"}
+    assert detail.events[2].event["value"]["safe"] == "keep-value"
 
 
 @pytest.mark.asyncio

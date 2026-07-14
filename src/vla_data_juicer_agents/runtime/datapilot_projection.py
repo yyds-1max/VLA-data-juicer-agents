@@ -240,24 +240,28 @@ class DataPilotToolOutcomeMiddleware(MiddlewareBase):
             tool_call_id=tool_call.id,
             tool_name=tool_call.name,
         )
-        try:
-            async for item in next_handler(**input_kwargs):
-                if isinstance(item, ToolResponse):
-                    status, summary, error_type = classify_real_tool_response(item)
-                    await self._sink.finish_public_tool(
-                        self._session_id,
-                        tool_call_id=tool_call.id,
-                        status=status,
-                        summary=summary,
-                        error_type=error_type,
-                    )
-                yield item
-        except (Exception, asyncio.CancelledError) as exc:
-            await self._sink.finish_public_tool(
-                self._session_id,
-                tool_call_id=tool_call.id,
-                status="failure",
-                summary=str(exc),
-                error_type=type(exc).__name__,
-            )
-            raise
+        stream = next_handler(**input_kwargs)
+        while True:
+            try:
+                item = await anext(stream)
+            except StopAsyncIteration:
+                break
+            except (Exception, asyncio.CancelledError) as exc:
+                await self._sink.finish_public_tool(
+                    self._session_id,
+                    tool_call_id=tool_call.id,
+                    status="failure",
+                    summary=str(exc),
+                    error_type=type(exc).__name__,
+                )
+                raise
+            if isinstance(item, ToolResponse):
+                status, summary, error_type = classify_real_tool_response(item)
+                await self._sink.finish_public_tool(
+                    self._session_id,
+                    tool_call_id=tool_call.id,
+                    status=status,
+                    summary=summary,
+                    error_type=error_type,
+                )
+            yield item

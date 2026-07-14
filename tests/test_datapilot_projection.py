@@ -469,6 +469,48 @@ async def test_tool_outcome_records_real_response_terminal_before_yield(
 
 
 @pytest.mark.asyncio
+async def test_tool_outcome_does_not_retry_durable_finish_failure():
+    class DurableFinishError(RuntimeError):
+        pass
+
+    durable_error = DurableFinishError("terminal append failed")
+
+    class FailingFinishSink(RecordingSink):
+        def __init__(self) -> None:
+            super().__init__()
+            self.finish_calls = 0
+
+        async def finish_public_tool(self, *args: Any, **kwargs: Any) -> None:
+            self.finish_calls += 1
+            raise durable_error
+
+    sink = FailingFinishSink()
+    middleware = DataPilotToolOutcomeMiddleware("internal-nav-session", sink)
+    tool_call = ToolCallBlock(id="call-1", name="extract", input="{}")
+    response = ToolResponse(
+        id="call-1",
+        content=[TextBlock(text='{"ok":true,"message":"done"}')],
+        state=ToolResultState.SUCCESS,
+    )
+
+    async def handler(**_kwargs: Any):
+        yield response
+
+    with pytest.raises(DurableFinishError) as exc_info:
+        _ = [
+            item
+            async for item in middleware.on_acting(
+                SimpleNamespace(),
+                {"tool_call": tool_call},
+                handler,
+            )
+        ]
+
+    assert exc_info.value is durable_error
+    assert sink.finish_calls == 1
+
+
+@pytest.mark.asyncio
 async def test_tool_outcome_records_non_user_cancellation_as_failure_and_reraises():
     sink = RecordingSink()
     middleware = DataPilotToolOutcomeMiddleware("internal-nav-session", sink)
