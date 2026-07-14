@@ -230,6 +230,26 @@ def build_agent(record, model: ScriptedChatModel, tools: list[Any]) -> Agent:
     )
 
 
+def build_agent_with_middlewares(
+    record,
+    model,
+    *,
+    tools=None,
+    middlewares=None,
+    state=None,
+):
+    return Agent(
+        name=record.data.name,
+        system_prompt=record.data.system_prompt,
+        model=model,
+        toolkit=Toolkit(tools=tools or []),
+        context_config=record.data.context_config,
+        react_config=record.data.react_config,
+        middlewares=middlewares or [],
+        state=state,
+    )
+
+
 def refresh_tools(agent: Agent, tools: list[Any]) -> None:
     agent.toolkit = Toolkit(tools=tools)
 
