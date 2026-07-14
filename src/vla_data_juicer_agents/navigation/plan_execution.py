@@ -454,6 +454,16 @@ def _gate_step(
         task_id=bound_task.task_id,
     )
     if snapshot is None:
+        snapshot = plan_store.read_claim_terminalization_snapshot(
+            plan_id=requested_plan_id,
+            step_id=requested_step_id,
+            action=expected_action,
+            expected_web_session_id=expected_web_session_id,
+            expected_agentscope_session_id=expected_agentscope_session_id,
+        )
+        if snapshot is not None and snapshot.task.task_id != bound_task.task_id:
+            snapshot = None
+    if snapshot is None:
         return bound_task, None, None, None, _compact_error(
             "navigation_task_session_mismatch",
             "The plan-bound task is no longer owned by this AgentScope session.",

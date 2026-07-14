@@ -1620,6 +1620,265 @@ def test_oversized_claim_result_replans_after_action_creates_new_current_attempt
     assert services.plan_store.get_active_for_task(created[0].task_id) is None
 
 
+@pytest.mark.parametrize("failure_point", ["evidence", "attach", "finalize"])
+@pytest.mark.parametrize("outcome", ["success", "failure"])
+def test_staged_claim_retry_terminalizes_after_a_new_current_attempt(
+    failure_point,
+    outcome,
+    monkeypatch,
+    tmp_path,
+):
+    services = build_services(tmp_path, two_steps=True)
+    owner = services.task.created_by_web_session_id
+    agent = services.task.agentscope_session_id
+    services.task = services.task_store.update_task_for_session(
+        services.task.task_id,
+        web_session_id=owner,
+        agentscope_session_id=agent,
+        dry_run=False,
+    )
+    action_calls = []
+    created = []
+
+    def action_creating_new_attempt(**kwargs):
+        action_calls.append(kwargs)
+        created.append(
+            services.task_store.create_task_attempt(
+                request="process B",
+                target="20260711",
+                date="20260711",
+                segments=["segment-b"],
+                scene_mode=None,
+                dry_run=False,
+                web_session_id=owner,
+                agentscope_session_id=agent,
+            ).task
+        )
+        if outcome == "failure":
+            return failed_result("prepare_raw_data")
+        return ok_result("prepare_raw_data")
+
+    monkeypatch.setattr(plan_execution, "prepare_raw_data", action_creating_new_attempt)
+    target = (
+        services.evidence_store
+        if failure_point == "evidence"
+        else services.plan_store
+    )
+    method_name = {
+        "evidence": "write",
+        "attach": "attach_staged_result_evidence",
+        "finalize": "finalize_staged_step",
+    }[failure_point]
+    original = getattr(target, method_name)
+    failure_calls = 0
+
+    def fail_once(*args, **kwargs):
+        nonlocal failure_calls
+        failure_calls += 1
+        if failure_calls == 1:
+            raise sqlite3.OperationalError(f"{failure_point} unavailable")
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(target, method_name, fail_once)
+    tool = services.tools()["prepare_raw_data_tool"]
+
+    first = call_tool(tool, plan_id=services.plan.plan_id, step_id="prepare")
+
+    assert first["ok"] is False
+    assert first["error_type"] == "result_finalize_retry_required"
+    assert len(action_calls) == 1
+    assert len(created) == 1
+    with sqlite3.connect(services.plan_store.db_path) as connection:
+        connection.row_factory = sqlite3.Row
+        newer_before = dict(
+            connection.execute(
+                "SELECT * FROM navigation_tasks WHERE task_id = ?",
+                (created[0].task_id,),
+            ).fetchone()
+        )
+    assert services.plan_store.get_staged_step_result(
+        services.plan.plan_id, "prepare"
+    ) is not None
+
+    second = call_tool(tool, plan_id=services.plan.plan_id, step_id="prepare")
+
+    expected_status = "completed" if outcome == "success" else "failed"
+    assert second["ok"] is (outcome == "success")
+    assert second["status"] == expected_status
+    assert len(action_calls) == 1
+    overview = services.plan_store.get_execution_overview(services.plan.plan_id)
+    assert overview.steps[0].status == expected_status
+    assert all(step.status != "running" for step in overview.steps)
+    assert services.plan_store.get_staged_step_result(
+        services.plan.plan_id, "prepare"
+    ) is None
+    assert services.task_store.find_running_target_writer(
+        date=services.task.date,
+        segments=services.task.segments,
+    ) is None
+    with sqlite3.connect(services.plan_store.db_path) as connection:
+        connection.row_factory = sqlite3.Row
+        ledger = connection.execute(
+            """SELECT result_ref FROM navigation_task_steps
+               WHERE plan_id = ? AND step_id = 'prepare'""",
+            (services.plan.plan_id,),
+        ).fetchone()
+        assert ledger is not None and ledger["result_ref"]
+        newer_after = dict(
+            connection.execute(
+                "SELECT * FROM navigation_tasks WHERE task_id = ?",
+                (created[0].task_id,),
+            ).fetchone()
+        )
+        assert connection.execute(
+            "SELECT count(*) FROM navigation_plans WHERE task_id = ?",
+            (created[0].task_id,),
+        ).fetchone()[0] == 0
+    assert services.evidence_store.exists(
+        services.task.task_id, ledger["result_ref"]
+    )
+    assert newer_after == newer_before
+
+
+def test_staged_claim_recovery_snapshot_rejects_wrong_owner_and_action(
+    monkeypatch,
+    tmp_path,
+):
+    services = build_services(tmp_path, two_steps=True)
+    owner = services.task.created_by_web_session_id
+    agent = services.task.agentscope_session_id
+
+    def action_creating_new_attempt(**_kwargs):
+        services.task_store.create_task_attempt(
+            request="process B",
+            target="20260711",
+            date="20260711",
+            segments=["segment-b"],
+            scene_mode=None,
+            dry_run=False,
+            web_session_id=owner,
+            agentscope_session_id=agent,
+        )
+        return ok_result("prepare_raw_data")
+
+    monkeypatch.setattr(plan_execution, "prepare_raw_data", action_creating_new_attempt)
+    monkeypatch.setattr(
+        services.evidence_store,
+        "write",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            sqlite3.OperationalError("evidence unavailable")
+        ),
+    )
+    first = call_tool(
+        services.tools()["prepare_raw_data_tool"],
+        plan_id=services.plan.plan_id,
+        step_id="prepare",
+    )
+    assert first["error_type"] == "result_finalize_retry_required"
+
+    assert services.plan_store.read_claim_terminalization_snapshot(
+        plan_id=services.plan.plan_id,
+        step_id="prepare",
+        action="prepare_raw_data",
+        expected_web_session_id="wrong-owner",
+        expected_agentscope_session_id=agent,
+    ) is None
+    assert services.plan_store.read_claim_terminalization_snapshot(
+        plan_id=services.plan.plan_id,
+        step_id="prepare",
+        action="extract_and_sync_navigation_data",
+        expected_web_session_id=owner,
+        expected_agentscope_session_id=agent,
+    ) is None
+
+
+def test_claim_terminalization_snapshot_does_not_expose_pending_work(tmp_path):
+    services = build_services(tmp_path, two_steps=True)
+
+    assert services.plan_store.read_claim_terminalization_snapshot(
+        plan_id=services.plan.plan_id,
+        step_id="prepare",
+        action="prepare_raw_data",
+        expected_web_session_id=services.task.created_by_web_session_id,
+        expected_agentscope_session_id=services.task.agentscope_session_id,
+    ) is None
+
+
+def test_cancelled_staged_claim_retry_does_not_rerun_after_new_attempt(
+    monkeypatch,
+    tmp_path,
+):
+    services = build_services(tmp_path, two_steps=True)
+    owner = services.task.created_by_web_session_id
+    agent = services.task.agentscope_session_id
+    services.task = services.task_store.update_task_for_session(
+        services.task.task_id,
+        web_session_id=owner,
+        agentscope_session_id=agent,
+        dry_run=False,
+    )
+    action_calls = []
+    created = []
+
+    def cancel_after_creating_new_attempt(**kwargs):
+        action_calls.append(kwargs)
+        created.append(
+            services.task_store.create_task_attempt(
+                request="process B",
+                target="20260711",
+                date="20260711",
+                segments=["segment-b"],
+                scene_mode=None,
+                dry_run=False,
+                web_session_id=owner,
+                agentscope_session_id=agent,
+            ).task
+        )
+        raise TurnCancelled("cancel after side effect")
+
+    monkeypatch.setattr(
+        plan_execution,
+        "prepare_raw_data",
+        cancel_after_creating_new_attempt,
+    )
+    original_finalize = services.plan_store.finalize_staged_step
+    finalize_calls = 0
+
+    def fail_finalize_once(*args, **kwargs):
+        nonlocal finalize_calls
+        finalize_calls += 1
+        if finalize_calls == 1:
+            raise sqlite3.OperationalError("finalize unavailable")
+        return original_finalize(*args, **kwargs)
+
+    monkeypatch.setattr(
+        services.plan_store,
+        "finalize_staged_step",
+        fail_finalize_once,
+    )
+    tool = services.tools()["prepare_raw_data_tool"]
+
+    with pytest.raises(TurnCancelled):
+        call_tool(tool, plan_id=services.plan.plan_id, step_id="prepare")
+    assert services.plan_store.get_staged_step_result(
+        services.plan.plan_id, "prepare"
+    ) is not None
+
+    result = call_tool(tool, plan_id=services.plan.plan_id, step_id="prepare")
+
+    assert result["ok"] is False
+    assert result["status"] == "failed"
+    assert len(action_calls) == 1
+    assert services.plan_store.get_staged_step_result(
+        services.plan.plan_id, "prepare"
+    ) is None
+    assert services.task_store.find_running_target_writer(
+        date=services.task.date,
+        segments=services.task.segments,
+    ) is None
+    assert services.task_store.get_task(created[0].task_id) == created[0]
+
+
 def test_superseded_plan_cannot_claim_pending_step(tmp_path):
     services = build_services(tmp_path)
     old_plan = services.plan

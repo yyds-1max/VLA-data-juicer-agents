@@ -149,3 +149,24 @@ action, releases its target lock, and never mutates B.
 Follow-up verification: focused execution/store/Web handoff modules `215 passed`;
 full Python suite `777 passed` with the same pre-existing warning; compileall and
 diff check passed; all three dead-reference searches returned no matches.
+
+## Staged Claim Retry Follow-up
+
+A further final review found that an already-staged result could still be stranded
+if its first evidence write, outbox attach, or ledger finalize failed after Attempt
+B became current. The second wrapper call entered the ordinary newest-Attempt gate
+before observing A's durable outbox, so it returned a session mismatch and retained
+A's running step and target lock.
+
+The repository now exposes a read-only terminalization snapshot only for an exact
+non-null owner pair, plan, step, and action with an active Plan, durable `running`
+step, matching result outbox whose expected status includes `running`, and no
+unfinished prior step. The wrapper may use that snapshot only to retry evidence
+and ledger finalization; it cannot claim pending work or invoke the action again.
+TDD covers success and failure results across first-failure evidence/attach/finalize
+boundaries, cancellation finalization retry, wrong owner/action, and pending-state
+denial. Attempt B remains byte-for-byte unchanged during retry.
+
+Staged-retry verification: focused high-risk modules `285 passed`; full Python
+suite `786 passed` with the same pre-existing warning; compileall and diff check
+passed; all three dead-reference searches returned no matches.
