@@ -52,7 +52,11 @@ class ChatServiceStorage:
         agent_id: str,
         session_id: str,
     ) -> SessionRecord | None:
-        return self.sessions.get((user_id, agent_id, session_id))
+        record = self.sessions.get((user_id, agent_id, session_id))
+        if record is None:
+            return None
+        state = AgentState.model_validate(record.state.model_dump(mode="json"))
+        return record.model_copy(update={"state": state})
 
     async def upsert_message(self, user_id: str, session_id: str, message: Any) -> str:
         self.messages[(user_id, session_id, message.id)] = message
@@ -74,8 +78,14 @@ class ChatServiceStorage:
         session_id: str,
         state: AgentState,
     ) -> None:
-        self.sessions[(user_id, agent_id, session_id)].state = state
-        self.updated_state = state
+        key = (user_id, agent_id, session_id)
+        persisted = AgentState.model_validate(state.model_dump(mode="json"))
+        self.sessions[key] = self.sessions[key].model_copy(
+            update={"state": persisted},
+        )
+        self.updated_state = AgentState.model_validate(
+            persisted.model_dump(mode="json"),
+        )
 
 
 class ChatServiceWorkspaceManager:
