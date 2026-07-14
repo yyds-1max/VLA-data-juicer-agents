@@ -63,11 +63,15 @@ class WebSessionStore:
             # Resetting foreign-key enforcement for this connection lets us replace only
             # the explicit development-control whitelist without touching that neighbor.
             connection.execute("PRAGMA foreign_keys = OFF")
+            connection.execute("BEGIN IMMEDIATE")
             if self._schema_generation(connection) != WEB_SCHEMA_GENERATION:
                 for table in WEB_CONTROL_TABLES:
                     connection.execute(f'DROP TABLE IF EXISTS "{table}"')
             self._create_schema(connection)
             connection.commit()
+        except Exception:
+            connection.rollback()
+            raise
         finally:
             connection.close()
 

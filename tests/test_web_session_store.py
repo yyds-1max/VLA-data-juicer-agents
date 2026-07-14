@@ -86,6 +86,36 @@ def test_fresh_store_creates_public_event_schema(tmp_path: Path):
     assert {"public_events", "public_tool_runs"} <= tables
 
 
+def test_schema_generation_check_holds_write_lock_against_concurrent_initializer(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    db_path = tmp_path / "sessions.sqlite"
+    original = WebSessionStore._schema_generation
+    contender_was_locked: list[bool] = []
+
+    def probe_generation(connection: sqlite3.Connection) -> str | None:
+        contender = sqlite3.connect(db_path, timeout=0)
+        try:
+            try:
+                contender.execute("BEGIN IMMEDIATE")
+            except sqlite3.OperationalError as exc:
+                assert "locked" in str(exc)
+                contender_was_locked.append(True)
+            else:
+                contender_was_locked.append(False)
+                contender.rollback()
+        finally:
+            contender.close()
+        return original(connection)
+
+    monkeypatch.setattr(WebSessionStore, "_schema_generation", staticmethod(probe_generation))
+
+    WebSessionStore(db_path)
+
+    assert contender_was_locked == [True]
+
+
 def test_old_web_schema_is_reset_without_touching_artifacts_or_other_tables(tmp_path: Path):
     db_path = tmp_path / "sessions.sqlite"
     _create_legacy_web_schema(db_path)
