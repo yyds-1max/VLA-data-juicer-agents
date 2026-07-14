@@ -16,8 +16,6 @@ class FakeAgentScopeRuntime:
         self.messages: list[tuple[str, str]] = []
         self.decisions: list[tuple[str, dict]] = []
         self.recoveries: list[tuple[str, dict]] = []
-        self.events: list[dict] = []
-        self.subscriptions: list[str] = []
 
     async def submit_user_message(self, *, web_session_id: str, message: str) -> str:
         self.messages.append((web_session_id, message))
@@ -39,12 +37,6 @@ class FakeAgentScopeRuntime:
             "task_status": "needs_replan",
             "next_action": "submit_complete_plan",
         }
-
-    async def subscribe_web_session_events(self, *, web_session_id: str):
-        self.subscriptions.append(web_session_id)
-        for event in self.events:
-            yield event
-
 
 def _client(tmp_path, runtime: FakeAgentScopeRuntime) -> TestClient:
     app = create_app(
@@ -96,36 +88,6 @@ def test_plan_bound_human_decision_ids_are_forwarded_to_runtime(tmp_path) -> Non
 
     assert response.status_code == 200
     assert runtime.decisions == [(session_id, payload)]
-
-
-def test_human_decision_confirm_drains_agentscope_events(tmp_path) -> None:
-    runtime = FakeAgentScopeRuntime()
-    runtime.events = [
-        {
-            "type": "final",
-            "source": "NavigationDataAgent",
-            "payload": {"text": "继续处理完成"},
-        }
-    ]
-    client = _client(tmp_path, runtime)
-    session_id = _create_session(client)
-
-    response = client.post(
-        f"/api/sessions/{session_id}/human-decisions",
-        json={
-            "action": "confirm",
-            "request_id": "request-1",
-            "tool_call_id": "tool-call-1",
-            "reply_id": "reply-1",
-        },
-    )
-
-    assert response.status_code == 200
-    assert runtime.subscriptions == [session_id]
-    detail = client.get(f"/api/sessions/{session_id}").json()["session"]
-    assert [(message["role"], message["content"]) for message in detail["messages"]] == [
-        ("assistant", "继续处理完成")
-    ]
 
 
 def test_human_decision_guide_preserves_structured_text_payload(tmp_path) -> None:

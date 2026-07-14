@@ -2,10 +2,10 @@ from __future__ import annotations
 
 import asyncio
 import inspect
+import json
 import logging
 import time
 from contextlib import asynccontextmanager
-from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -321,18 +321,87 @@ def test_submit_turn_runtime_error_returns_409(tmp_path: Path):
     assert response.json()["detail"] == "A session turn is already active."
 
 
-def test_session_events_websocket_receives_background_turn_events(tmp_path: Path):
+def test_session_stream_returns_404_for_unknown_session(tmp_path: Path):
     client = make_client(tmp_path)
-    session_id = _create_session(client)
 
-    with client.websocket_connect(f"/api/sessions/{session_id}/events") as websocket:
-        response = client.post(f"/api/sessions/{session_id}/turns", json={"message": "开始处理"})
-        assert response.status_code == 200
-        with ThreadPoolExecutor(max_workers=1) as executor:
-            event = executor.submit(websocket.receive_json).result(timeout=1)
+    response = client.get("/api/sessions/missing/stream")
 
-    assert event["type"] == "final"
-    assert event["payload"]["text"] == "完成: 开始处理"
+    assert response.status_code == 404
+    assert response.json() == {"detail": "Session not found"}
+
+
+@pytest.mark.asyncio
+async def test_session_stream_is_sse_and_honors_after_sequence(tmp_path: Path) -> None:
+    app = create_app(
+        working_dir=str(tmp_path / ".djx"),
+        db_path=tmp_path / "sessions.sqlite",
+        controller_factory=FakeController,
+    )
+    session = app.state.manager.create_session("stream cursor")
+    first = app.state.store.append_public_event(
+        session.id,
+        "1" * 64,
+        {"type": "first"},
+    )
+    second = app.state.store.append_public_event(
+        session.id,
+        "2" * 64,
+        {"type": "second"},
+    )
+    endpoint = _route_endpoint(app, f"/api/sessions/{{session_id}}/stream")
+
+    response = await endpoint(session.id, after_sequence=first.sequence)
+    frame = await anext(response.body_iterator)
+    await response.body_iterator.aclose()
+
+    assert response.media_type == "text/event-stream"
+    assert response.headers["content-type"].startswith("text/event-stream")
+    assert response.headers["cache-control"] == "no-cache"
+    assert response.headers["x-accel-buffering"] == "no"
+    assert json.loads(frame.removeprefix(b"data: ").removesuffix(b"\n\n"))["id"] == second.id
+
+
+@pytest.mark.asyncio
+async def test_session_stream_emits_heartbeat_comment(tmp_path: Path) -> None:
+    app = create_app(
+        working_dir=str(tmp_path / ".djx"),
+        db_path=tmp_path / "sessions.sqlite",
+        controller_factory=FakeController,
+        sse_heartbeat_seconds=0.01,
+    )
+    session = app.state.manager.create_session("heartbeat")
+    endpoint = _route_endpoint(app, f"/api/sessions/{{session_id}}/stream")
+
+    response = await endpoint(session.id, after_sequence=0)
+    frame = await asyncio.wait_for(anext(response.body_iterator), timeout=1)
+    await response.body_iterator.aclose()
+
+    assert frame == b": heartbeat\n\n"
+
+
+@pytest.mark.asyncio
+async def test_session_stream_does_not_receive_other_session_events(tmp_path: Path) -> None:
+    app = create_app(
+        working_dir=str(tmp_path / ".djx"),
+        db_path=tmp_path / "sessions.sqlite",
+        controller_factory=FakeController,
+        sse_heartbeat_seconds=0.01,
+    )
+    selected = app.state.manager.create_session("selected")
+    other = app.state.manager.create_session("other")
+    other_record = app.state.store.append_public_event(
+        other.id,
+        "3" * 64,
+        {"type": "wrong-session"},
+    )
+    endpoint = _route_endpoint(app, f"/api/sessions/{{session_id}}/stream")
+
+    response = await endpoint(selected.id, after_sequence=0)
+    await app.state.bus.publish(other.id, other_record)
+    frame = await asyncio.wait_for(anext(response.body_iterator), timeout=1)
+    await response.body_iterator.aclose()
+
+    assert frame == b": heartbeat\n\n"
 
 
 def test_list_sessions_returns_session_records(tmp_path: Path):
@@ -344,7 +413,7 @@ def test_list_sessions_returns_session_records(tmp_path: Path):
     assert response.status_code == 200
     sessions = response.json()["sessions"]
     assert len(sessions) == 1
-    assert set(sessions[0]) == {"id", "title", "status", "created_at", "updated_at"}
+    assert set(sessions[0]) == {"id", "title", "created_at", "updated_at"}
 
 
 def test_get_session_returns_persisted_messages_after_turn_submission(tmp_path: Path):
@@ -594,6 +663,10 @@ def test_navigation_sync_image_route_rejects_unsafe_sequence(tmp_path: Path, mon
 def _create_session(client: TestClient) -> str:
     response = client.post("/api/sessions", json={"message": "处理 20270605 的室外导航数据"})
     return response.json()["session"]["id"]
+
+
+def _route_endpoint(app: FastAPI, path: str):
+    return next(route.endpoint for route in app.routes if getattr(route, "path", None) == path)
 
 
 def _write_dataset_metadata(clip_dir: Path) -> None:

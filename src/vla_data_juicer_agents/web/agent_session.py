@@ -1,15 +1,17 @@
 from __future__ import annotations
 
-import asyncio
-import inspect
 from collections.abc import Callable
 from typing import Any
 from uuid import uuid4
 
-from vla_data_juicer_agents.web.schemas import SessionRecord, generate_session_title
+from vla_data_juicer_agents.web.schemas import (
+    PublicEventRecord,
+    SessionRecord,
+    generate_session_title,
+)
 from vla_data_juicer_agents.web.session_store import WebSessionStore
 
-EventCallback = Callable[[str, dict[str, Any]], Any]
+EventCallback = Callable[[str, PublicEventRecord], Any]
 
 
 class AgentScopeWebSessionManager:
@@ -23,7 +25,6 @@ class AgentScopeWebSessionManager:
         self._store = store
         self._runtime = runtime
         self._event_callback = event_callback
-        self._forward_locks: dict[str, asyncio.Lock] = {}
         set_transport = getattr(self._runtime, "set_web_transport", None)
         if callable(set_transport):
             set_transport(self._store, self._event_callback)
@@ -75,58 +76,3 @@ class AgentScopeWebSessionManager:
             raise RuntimeError("Human decision recovery is not supported")
         result = await recover(web_session_id=session_id, recovery=recovery)
         return dict(result)
-
-    async def forward_events_until_idle(self, session_id: str) -> None:
-        async with self._forward_lock(session_id):
-            await self._forward_events_until_idle_unlocked(session_id)
-
-    def _forward_lock(self, session_id: str) -> asyncio.Lock:
-        lock = self._forward_locks.get(session_id)
-        if lock is None:
-            lock = asyncio.Lock()
-            self._forward_locks[session_id] = lock
-        return lock
-
-    async def _forward_events_until_idle_unlocked(self, session_id: str) -> None:
-        subscribe_events = getattr(self._runtime, "subscribe_web_session_events", None)
-        if subscribe_events is None:
-            return
-
-        seen_subscription_keys: set[object] = set()
-        while True:
-            before_key = self._runtime_subscription_key(session_id)
-            if before_key in seen_subscription_keys:
-                return
-            seen_subscription_keys.add(before_key)
-
-            persisted_final_texts: set[str] = set()
-            async for event in subscribe_events(web_session_id=session_id):
-                self._store.append_timeline_event(session_id, event)
-                if self._event_callback is not None:
-                    callback_result = self._event_callback(session_id, event)
-                    if inspect.isawaitable(callback_result):
-                        await callback_result
-                text = _final_event_text(event)
-                if text is not None and text not in persisted_final_texts:
-                    self._store.append_message(session_id, role="assistant", content=text)
-                    persisted_final_texts.add(text)
-
-            after_key = self._runtime_subscription_key(session_id)
-            if after_key == before_key:
-                return
-
-    def _runtime_subscription_key(self, session_id: str) -> object:
-        subscription_key = getattr(self._runtime, "web_session_subscription_key", None)
-        if not callable(subscription_key):
-            return None
-        return subscription_key(web_session_id=session_id)
-
-
-def _final_event_text(event: dict[str, Any]) -> str | None:
-    if event.get("type") != "final":
-        return None
-    payload = event.get("payload")
-    if not isinstance(payload, dict):
-        return None
-    text = payload.get("text")
-    return text if isinstance(text, str) and text else None

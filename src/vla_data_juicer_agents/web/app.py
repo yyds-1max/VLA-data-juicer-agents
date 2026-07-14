@@ -1,15 +1,17 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import inspect
 import logging
 import os
 from contextlib import asynccontextmanager, suppress
 from pathlib import Path
 from typing import Any
+from uuid import uuid4
 
-from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
-from fastapi.responses import FileResponse
+from fastapi import FastAPI, HTTPException
+from fastapi.responses import FileResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 
 from vla_data_juicer_agents.navigation.dataset_catalog import (
@@ -19,6 +21,7 @@ from vla_data_juicer_agents.navigation.dataset_catalog import (
     scan_navigation_date,
 )
 from vla_data_juicer_agents.tui.controller import SessionController
+from vla_data_juicer_agents.web.agent_session import AgentScopeWebSessionManager
 from vla_data_juicer_agents.web.event_stream import SessionEventBus
 from vla_data_juicer_agents.web.schemas import (
     CreateSessionResponse,
@@ -29,10 +32,11 @@ from vla_data_juicer_agents.web.schemas import (
     HumanDecisionRecoveryResponse,
     HumanDecisionResponse,
     InterruptResponse,
+    PublicEventRecord,
 )
-from vla_data_juicer_agents.web.agent_session import AgentScopeWebSessionManager
 from vla_data_juicer_agents.web.session_manager import ControllerFactory, WebSessionManager
 from vla_data_juicer_agents.web.session_store import WebSessionStore
+from vla_data_juicer_agents.web.sse import iter_sse
 
 logger = logging.getLogger(__name__)
 
@@ -44,6 +48,7 @@ def create_app(
     controller_factory: ControllerFactory = SessionController,
     frontend_dist: str | Path | None = None,
     agentscope_runtime: Any | None = None,
+    sse_heartbeat_seconds: float = 15.0,
 ) -> FastAPI:
     if working_dir is None:
         working_dir = os.environ.get("VLA_DATA_AGENT_WEB_WORKING_DIR", "./.djx")
@@ -56,7 +61,7 @@ def create_app(
     store = WebSessionStore(database_path)
     bus = SessionEventBus()
 
-    async def publish_session_event(session_id: str, event: dict[str, Any]) -> None:
+    async def publish_session_event(session_id: str, event: PublicEventRecord) -> None:
         await bus.publish(session_id, event)
 
     if agentscope_runtime is None:
@@ -163,11 +168,6 @@ def create_app(
                 _drain_controller_events(session_id, manager, store, bus),
                 name=f"controller-events:{session_id}",
             )
-        else:
-            _create_logged_task(
-                manager.forward_events_until_idle(session_id),
-                name=f"agentscope-events:{session_id}",
-            )
         return CreateTurnResponse(turn_id=turn_id)
 
     @app.post("/api/sessions/{session_id}/interrupt", response_model=InterruptResponse)
@@ -196,11 +196,6 @@ def create_app(
             raise HTTPException(status_code=409, detail=str(exc)) from exc
         if not accepted:
             raise HTTPException(status_code=409, detail="Human decision was not accepted")
-        if agentscope_runtime is not None:
-            _create_logged_task(
-                manager.forward_events_until_idle(session_id),
-                name=f"agentscope-events:{session_id}",
-            )
         return HumanDecisionResponse(accepted=True)
 
     @app.post(
@@ -227,20 +222,27 @@ def create_app(
             raise HTTPException(status_code=409, detail=str(exc)) from exc
         return HumanDecisionRecoveryResponse.model_validate(result)
 
-    @app.websocket("/api/sessions/{session_id}/events")
-    async def session_events(websocket: WebSocket, session_id: str) -> None:
-        await websocket.accept()
-        if agentscope_runtime is not None:
-            _create_logged_task(
-                manager.forward_events_until_idle(session_id),
-                name=f"agentscope-events-ws:{session_id}",
-            )
-        try:
-            async with bus.subscribe(session_id) as queue:
-                while True:
-                    await websocket.send_json(await queue.get())
-        except WebSocketDisconnect:
-            return
+    @app.get("/api/sessions/{session_id}/stream")
+    async def session_stream(
+        session_id: str,
+        after_sequence: int = 0,
+    ) -> StreamingResponse:
+        if store.get_session(session_id) is None:
+            raise HTTPException(status_code=404, detail="Session not found")
+        return StreamingResponse(
+            iter_sse(
+                store,
+                bus,
+                session_id,
+                after_sequence,
+                heartbeat_seconds=sse_heartbeat_seconds,
+            ),
+            media_type="text/event-stream",
+            headers={
+                "Cache-Control": "no-cache",
+                "X-Accel-Buffering": "no",
+            },
+        )
 
     if frontend_dist is not None:
         frontend_path = Path(frontend_dist)
@@ -304,8 +306,12 @@ async def _drain_controller_events(
 
     async def drain_once() -> None:
         for event in controller.drain_events():
-            store.append_timeline_event(session_id, event)
-            await bus.publish(session_id, event)
+            record = store.append_public_event(
+                session_id,
+                hashlib.sha256(uuid4().bytes).hexdigest(),
+                event,
+            )
+            await bus.publish(session_id, record)
             text = _final_event_text(event)
             if text is not None and text not in persisted_final_texts:
                 store.append_message(session_id, role="assistant", content=text)

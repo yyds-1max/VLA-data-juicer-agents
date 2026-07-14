@@ -38,7 +38,6 @@ from vla_data_juicer_agents.navigation.plan_store import (
 from vla_data_juicer_agents.navigation.task_state import NavigationTask
 from vla_data_juicer_agents.navigation.task_store import SqliteNavigationTaskStore
 from vla_data_juicer_agents.runtime.agentscope_runtime import (
-    _enrich_plan_human_decision_event,
     _human_decision_payload_from_tool_call,
 )
 
@@ -2775,21 +2774,6 @@ def test_plan_bound_human_decision_waits_and_transitions_ledger_exactly_once(
         ),
         plan_store=plan_store,
     )
-    live_event = _enrich_plan_human_decision_event(
-        {
-            "type": "human_decision_required",
-            "payload": {
-                "reply_id": "reply-1",
-                "tool_call_id": "call-1",
-                "plan_id": plan.plan_id,
-                "step_id": "confirm",
-                "decision_type": "other",
-                "request_id": "",
-                "summary": "",
-            },
-        },
-        plan_store=plan_store,
-    )
     first = plan_execution.submit_plan_human_decision(
         plan_store=plan_store,
         evidence_store=evidence_store,
@@ -2819,11 +2803,6 @@ def test_plan_bound_human_decision_waits_and_transitions_ledger_exactly_once(
         ),
         "plan_id": plan.plan_id,
         "step_id": "confirm",
-    }
-    assert live_event["payload"] == {
-        **metadata,
-        "reply_id": "reply-1",
-        "tool_call_id": "call-1",
     }
     assert first is True
     assert duplicate is True

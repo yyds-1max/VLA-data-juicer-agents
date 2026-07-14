@@ -9,7 +9,6 @@ import re
 from contextlib import suppress
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
-from types import SimpleNamespace
 from typing import Any
 from uuid import uuid4
 
@@ -22,9 +21,7 @@ from agentscope.message import TextBlock, ToolCallState, ToolResultBlock, ToolRe
 from agentscope.permission import PermissionBehavior, PermissionDecision
 from agentscope.tool import ToolBase, ToolChunk
 
-from vla_data_juicer_agents.adapters.agentscope import AgentScopeEventAdapter
 from vla_data_juicer_agents.core.cancellation import CancellationContext, bind_cancellation
-from vla_data_juicer_agents.core.events import CallbackEventSink, EventEmitter
 from vla_data_juicer_agents.navigation.agent_tools import resolve_navigation_agent_tools
 from vla_data_juicer_agents.navigation.config import NavigationSettings
 from vla_data_juicer_agents.navigation.plan_execution import (
@@ -52,8 +49,6 @@ from vla_data_juicer_agents.runtime.navigation_tool_surface import (
     NavigationToolSurfaceMiddleware,
 )
 
-_EVENT_STARTUP_GRACE_SECS = 1.0
-_EVENT_IDLE_POLL_SECS = 0.03
 _WAKEUP_RECOVERY_INTERVAL_SECS = 5.0
 _WAKEUP_RECOVERY_RETRY_DELAYS = (0.2, 1.0)
 _HUMAN_DECISION_TOOL_NAMES = {
@@ -90,7 +85,6 @@ class AgentScopeRuntime:
     workspace_manager: Any
     app: Any
     web_sessions: dict[str, tuple[str, str]] = field(default_factory=dict)
-    event_cursors: dict[str, str | None] = field(default_factory=dict)
     web_session_store: Any | None = None
     web_event_publisher: Any | None = None
     _active_human_decision_claims: set[str] = field(default_factory=set)
@@ -246,9 +240,6 @@ class AgentScopeRuntime:
                 getattr(record, "sequence", None),
                 exc_info=True,
             )
-
-    def web_session_subscription_key(self, *, web_session_id: str) -> tuple[str, str] | None:
-        return self._web_session_mapping(web_session_id)
 
     async def ensure_web_session(self, web_session_id: str, *, agent_id: str, model: str) -> str:
         existing = self.web_sessions.get(web_session_id)
@@ -411,8 +402,6 @@ class AgentScopeRuntime:
             agent_id=agent_id,
             model=model,
         )
-        tail_cursor = await self._event_log_tail_cursor(session_id)
-
         if agent_id == self.config.navigation_agent_id:
             anchor = self._navigation_durable_state_anchor(
                 session_id,
@@ -448,16 +437,6 @@ class AgentScopeRuntime:
             else:
                 self.clear_run_cancellation(session_id, cancellation)
             raise
-        if tail_cursor is not None:
-            try:
-                self._remember_event_cursor(session_id, tail_cursor)
-            except Exception:
-                _logger.exception(
-                    "AgentScope event cursor persistence failed after run spawn; "
-                    "the accepted run remains authoritative: session_id=%s cursor=%s",
-                    session_id,
-                    tail_cursor,
-                )
         return session_id
 
     async def interrupt_web_session(self, *, web_session_id: str) -> bool:
@@ -1370,215 +1349,6 @@ class AgentScopeRuntime:
                 return agent_id
         return None
 
-    async def _event_log_tail_cursor(self, agentscope_session_id: str) -> str | None:
-        read_events = getattr(self.message_bus, "session_read_events", None)
-        if read_events is None:
-            return None
-        entries = await read_events(
-            agentscope_session_id,
-            since=self._event_cursor(agentscope_session_id),
-        )
-        if not entries:
-            return None
-        return entries[-1][0]
-
-    async def subscribe_web_session_events(self, *, web_session_id: str):
-        mapped = self._web_session_mapping(web_session_id)
-        if mapped is None:
-            return
-
-        agent_id, agentscope_session_id = mapped
-        translated_events: asyncio.Queue[dict[str, Any]] = asyncio.Queue()
-        live_events: asyncio.Queue[dict[str, Any] | None] = asyncio.Queue()
-        live_ready = asyncio.Event()
-        scope = EventEmitter(CallbackEventSink(translated_events.put_nowait)).scope(
-            "agentscope",
-            run_id=agentscope_session_id,
-        )
-        adapter = AgentScopeEventAdapter(
-            scope,
-            emit_text_events=True,
-            emit_final_events=True,
-        )
-        seen_entry_ids: set[str] = set()
-        seen_pending_decision_states: dict[tuple[str, str], str] = {}
-        saw_event = False
-        saw_reply_end = False
-        saw_running = False
-        startup_deadline = asyncio.get_running_loop().time() + _EVENT_STARTUP_GRACE_SECS
-        events_key = _session_events_key(self.message_bus, agentscope_session_id)
-
-        async def feed_live_events() -> None:
-            try:
-                async for event in self.message_bus.subscribe(
-                    events_key,
-                    on_ready=live_ready.set,
-                ):
-                    await live_events.put(event)
-            finally:
-                await live_events.put(None)
-
-        feeder_task = asyncio.create_task(
-            feed_live_events(),
-            name=f"agentscope-web-events:{agentscope_session_id}",
-        )
-
-        def accept_raw_event(raw_event: dict[str, Any]) -> list[dict[str, Any]]:
-            adapter.accept(_to_attribute_event(_strip_internal_event_fields(raw_event)))
-            events = []
-            while not translated_events.empty():
-                event = translated_events.get_nowait()
-                payload = event.get("payload")
-                if (
-                    event.get("type") == "human_decision_required"
-                    and isinstance(payload, dict)
-                    and isinstance(payload.get("plan_id"), str)
-                    and isinstance(payload.get("step_id"), str)
-                ):
-                    event = _enrich_plan_human_decision_event(
-                        event,
-                        plan_store=self._navigation_plan_store(),
-                    )
-                    if event is None:
-                        continue
-                    enriched_payload = event.get("payload")
-                    if (
-                        isinstance(enriched_payload, dict)
-                        and enriched_payload.get("recovery_required") is True
-                    ):
-                        enriched_payload["submission_disabled"] = True
-                        enriched_payload["recovery_endpoint"] = (
-                            f"/api/sessions/{web_session_id}/human-decisions/recovery"
-                        )
-                events.append(event)
-            return events
-
-        def should_emit_human_decision(event: dict[str, Any] | None) -> bool:
-            identity = _human_decision_event_key(event)
-            if not identity:
-                return event is not None
-            payload = event.get("payload") if event is not None else None
-            state = (
-                "recovery_required"
-                if isinstance(payload, dict) and payload.get("recovery_required") is True
-                else "normal"
-            )
-            previous = seen_pending_decision_states.get(identity)
-            if previous == state or (
-                previous == "recovery_required" and state == "normal"
-            ):
-                return False
-            seen_pending_decision_states[identity] = state
-            return True
-
-        try:
-            with suppress(TimeoutError):
-                await asyncio.wait_for(live_ready.wait(), timeout=_EVENT_STARTUP_GRACE_SECS)
-
-            pending_event = await self._pending_human_decision_event(
-                web_session_id=web_session_id,
-                agent_id=agent_id,
-                agentscope_session_id=agentscope_session_id,
-            )
-            if pending_event is not None and should_emit_human_decision(pending_event):
-                yield pending_event
-
-            cursor = self._event_cursor(agentscope_session_id)
-            for entry_id, raw_event in await self.message_bus.session_read_events(
-                agentscope_session_id,
-                since=cursor,
-            ):
-                if not self._is_new_event(agentscope_session_id, entry_id):
-                    continue
-                seen_entry_ids.add(entry_id)
-                saw_event = True
-                if _raw_event_type(raw_event) == "REPLY_END":
-                    saw_reply_end = True
-                for event in accept_raw_event(raw_event):
-                    decision_key = (
-                        _human_decision_event_key(event)
-                        if event.get("type") == "human_decision_required"
-                        else ""
-                    )
-                    if decision_key:
-                        if not should_emit_human_decision(event):
-                            continue
-                    yield event
-                self._remember_event_cursor(
-                    agentscope_session_id,
-                    entry_id,
-                )
-
-            while True:
-                running = bool(await self.message_bus.session_is_running(agentscope_session_id))
-                local_running = self._is_local_agent_run_active(agentscope_session_id)
-                saw_running = saw_running or running or local_running
-
-                live_feed_finished = False
-                try:
-                    raw_event = await asyncio.wait_for(
-                        live_events.get(),
-                        timeout=_EVENT_IDLE_POLL_SECS,
-                    )
-                except TimeoutError:
-                    raw_event = None
-                else:
-                    if raw_event is None:
-                        live_feed_finished = True
-                    else:
-                        entry_id = _raw_event_entry_id(raw_event)
-                        if entry_id and entry_id in seen_entry_ids:
-                            continue
-                        if entry_id:
-                            if not self._is_new_event(agentscope_session_id, entry_id):
-                                continue
-                            seen_entry_ids.add(entry_id)
-                        saw_event = True
-                        if _raw_event_type(raw_event) == "REPLY_END":
-                            saw_reply_end = True
-                        for event in accept_raw_event(raw_event):
-                            decision_key = (
-                                _human_decision_event_key(event)
-                                if event.get("type") == "human_decision_required"
-                                else ""
-                            )
-                            if decision_key:
-                                if not should_emit_human_decision(event):
-                                    continue
-                            yield event
-                        if entry_id:
-                            self._remember_event_cursor(
-                                agentscope_session_id,
-                                entry_id,
-                            )
-                        continue
-
-                pending_event = await self._pending_human_decision_event(
-                    web_session_id=web_session_id,
-                    agent_id=agent_id,
-                    agentscope_session_id=agentscope_session_id,
-                )
-                if pending_event is not None and should_emit_human_decision(pending_event):
-                    saw_event = True
-                    yield pending_event
-                    continue
-                if live_feed_finished:
-                    break
-
-                now = asyncio.get_running_loop().time()
-                if running or local_running:
-                    continue
-                if saw_reply_end:
-                    break
-                if saw_event and saw_running:
-                    break
-                if now >= startup_deadline:
-                    break
-        finally:
-            feeder_task.cancel()
-            with suppress(asyncio.CancelledError):
-                await feeder_task
-
     def _is_local_agent_run_active(self, agentscope_session_id: str) -> bool:
         if self.run_cancellation(agentscope_session_id) is not None:
             return True
@@ -1588,31 +1358,6 @@ class AgentScopeRuntime:
             return False
         task = get_task(agentscope_session_id)
         return bool(task is not None and not task.done())
-
-    def _is_new_event(self, agentscope_session_id: str, entry_id: str) -> bool:
-        cursor = self._event_cursor(agentscope_session_id)
-        return cursor is None or _stream_id_is_newer(entry_id, cursor)
-
-    def _remember_event_cursor(
-        self,
-        agentscope_session_id: str,
-        entry_id: str,
-    ) -> None:
-        if self._is_new_event(agentscope_session_id, entry_id):
-            self._save_web_session_event_cursor(agentscope_session_id, entry_id)
-            self.event_cursors[agentscope_session_id] = entry_id
-
-    def _event_cursor(self, agentscope_session_id: str) -> str | None:
-        cursor = self.event_cursors.get(agentscope_session_id)
-        if cursor is not None:
-            return cursor
-        mapping = self._web_session_mapping_for_agentscope_session(agentscope_session_id)
-        if mapping is None:
-            return None
-        _agent_id, _session_id, persisted_cursor = mapping
-        if persisted_cursor:
-            self.event_cursors[agentscope_session_id] = persisted_cursor
-        return persisted_cursor
 
     def _web_session_mapping(self, web_session_id: str) -> tuple[str, str] | None:
         mapped = self.web_sessions.get(web_session_id)
@@ -1649,24 +1394,6 @@ class AgentScopeRuntime:
         if mapping is None:
             return None
         return mapping.agent_id, mapping.agentscope_session_id
-
-    def _web_session_mapping_for_agentscope_session(
-        self,
-        agentscope_session_id: str,
-    ) -> tuple[str, str, str | None] | None:
-        if self.web_session_store is None:
-            return None
-        get_mapping = getattr(
-            self.web_session_store,
-            "get_agentscope_session_mapping_by_agentscope_session",
-            None,
-        )
-        if not callable(get_mapping):
-            return None
-        mapping = get_mapping(agentscope_session_id)
-        if mapping is None:
-            return None
-        return mapping.agent_id, mapping.agentscope_session_id, mapping.event_cursor
 
     def _save_web_session_mapping(
         self,
@@ -1711,91 +1438,6 @@ class AgentScopeRuntime:
                 agent_id,
                 agentscope_session_id,
             )
-
-    def _save_web_session_event_cursor(self, agentscope_session_id: str, cursor: str) -> None:
-        if self.web_session_store is None:
-            return
-        save_cursor = getattr(self.web_session_store, "save_agentscope_event_cursor", None)
-        if callable(save_cursor):
-            save_cursor(agentscope_session_id, cursor)
-
-    async def _pending_human_decision_event(
-        self,
-        *,
-        web_session_id: str,
-        agent_id: str,
-        agentscope_session_id: str,
-    ) -> dict[str, Any] | None:
-        get_session = getattr(self.storage, "get_session", None)
-        if get_session is None:
-            return None
-        record = await get_session(self.config.user_id, agent_id, agentscope_session_id)
-        if record is None:
-            return None
-        state = getattr(record, "state", None)
-        reply_id = getattr(state, "reply_id", None)
-        if not reply_id:
-            return None
-        for message in getattr(state, "context", []) or []:
-            for tool_call in _tool_call_blocks(message):
-                if (
-                    getattr(tool_call, "name", None) in _HUMAN_DECISION_TOOL_NAMES
-                    and _state_value(getattr(tool_call, "state", None))
-                    == ToolCallState.SUBMITTED.value
-                ):
-                    payload = _human_decision_payload_from_tool_call(
-                        tool_call,
-                        plan_store=self._navigation_plan_store(),
-                    )
-                    if payload is None:
-                        tool_input = _tool_call_input(tool_call)
-                        plan_id = tool_input.get("plan_id")
-                        step_id = tool_input.get("step_id")
-                        if isinstance(plan_id, str) and isinstance(step_id, str):
-                            handoff = self._navigation_plan_store().get_human_decision_handoff(
-                                plan_id, step_id
-                            )
-                            if handoff is not None and handoff.status == "quarantined":
-                                self._mark_human_decision_consumed(
-                                    agentscope_session_id=agentscope_session_id,
-                                    decision={
-                                        "reply_id": reply_id,
-                                        "tool_call_id": str(getattr(tool_call, "id", "")),
-                                        "action": "quarantined",
-                                        "request_id": f"{plan_id}:{step_id}",
-                                    },
-                                )
-                        continue
-                    claim_key = _human_decision_claim_key(
-                        agentscope_session_id,
-                        {
-                            "reply_id": reply_id,
-                            "tool_call_id": getattr(tool_call, "id", ""),
-                        },
-                    )
-                    if self._is_human_decision_consumed(
-                        agentscope_session_id=agentscope_session_id,
-                        reply_id=reply_id,
-                        tool_call_id=getattr(tool_call, "id", ""),
-                    ):
-                        continue
-                    if await self._is_human_decision_claim_active(claim_key):
-                        continue
-                    payload["reply_id"] = reply_id
-                    payload["tool_call_id"] = getattr(tool_call, "id", "")
-                    if payload.get("recovery_required") is True:
-                        payload["submission_disabled"] = True
-                        payload["recovery_endpoint"] = (
-                            f"/api/sessions/{web_session_id}/human-decisions/recovery"
-                        )
-                    return {
-                        "type": "human_decision_required",
-                        "source": "NavigationDataAgent",
-                        "run_id": agentscope_session_id,
-                        "parent_run_id": None,
-                        "payload": payload,
-                    }
-        return None
 
     async def _is_human_decision_claim_active(self, claim_key: str) -> bool:
         if claim_key in self._active_human_decision_claims:
@@ -1843,16 +1485,6 @@ class AgentScopeRuntime:
                 tool_call_id=str(tool_call_id),
             )
         )
-
-
-def _to_attribute_event(value: Any) -> Any:
-    if isinstance(value, dict):
-        return SimpleNamespace(
-            **{key: _to_attribute_event(item) for key, item in value.items()}
-        )
-    if isinstance(value, list):
-        return [_to_attribute_event(item) for item in value]
-    return value
 
 
 class _HumanDecisionClaim:
@@ -1986,39 +1618,6 @@ def _human_decision_payload_from_tool_call(
     }
 
 
-def _enrich_plan_human_decision_event(
-    event: dict[str, Any],
-    *,
-    plan_store: SqliteNavigationPlanRepository,
-) -> dict[str, Any] | None:
-    payload = event.get("payload")
-    if not isinstance(payload, dict):
-        return event
-    plan_id = payload.get("plan_id")
-    step_id = payload.get("step_id")
-    if not isinstance(plan_id, str) or not isinstance(step_id, str):
-        return event
-    handoff = plan_store.get_human_decision_handoff(plan_id, step_id)
-    if handoff is not None and handoff.status == "quarantined":
-        return None
-    metadata = _human_decision_payload_from_tool_call(
-        SimpleNamespace(
-            name="request_human_decision",
-            input={"plan_id": plan_id, "step_id": step_id},
-        ),
-        plan_store=plan_store,
-    )
-    if metadata is None:
-        return event
-    enriched = dict(event)
-    enriched["payload"] = {
-        **metadata,
-        "reply_id": payload.get("reply_id", ""),
-        "tool_call_id": payload.get("tool_call_id", ""),
-    }
-    return enriched
-
-
 def _human_decision_tool_output(tool_name: str, decision: dict[str, Any]) -> dict[str, Any]:
     output = {
         "action": decision["action"],
@@ -2075,32 +1674,6 @@ def _is_calibration_confirmation_decision(decision: dict[str, Any]) -> bool:
     )
 
 
-def _human_decision_event_key(
-    event: dict[str, Any] | None,
-) -> tuple[str, str] | None:
-    if event is None:
-        return None
-    payload = event.get("payload")
-    if not isinstance(payload, dict):
-        return None
-    reply_id = payload.get("reply_id")
-    tool_call_id = payload.get("tool_call_id")
-    if not isinstance(reply_id, str) or not reply_id:
-        return None
-    if not isinstance(tool_call_id, str) or not tool_call_id:
-        return None
-    return reply_id, tool_call_id
-
-
-def _session_events_key(message_bus: Any, session_id: str) -> str:
-    template = getattr(
-        message_bus,
-        "_SESSION_EVENTS_KEY",
-        "agentscope:session:events:{sid}",
-    )
-    return str(template).format(sid=session_id)
-
-
 async def _retry_async(
     operation_factory: Any,
     *,
@@ -2145,37 +1718,6 @@ def _session_id_from_inbox_key(key: str, template: str) -> str | None:
     end = len(key) - len(suffix) if suffix else len(key)
     session_id = key[len(prefix):end]
     return session_id or None
-
-
-def _strip_internal_event_fields(event: dict[str, Any]) -> dict[str, Any]:
-    return {key: value for key, value in event.items() if key != "_entry_id"}
-
-
-def _raw_event_entry_id(event: dict[str, Any]) -> str | None:
-    entry_id = event.get("_entry_id")
-    return entry_id if isinstance(entry_id, str) and entry_id else None
-
-
-def _raw_event_type(event: dict[str, Any]) -> str:
-    event_type = event.get("type")
-    return str(event_type) if event_type is not None else ""
-
-
-def _stream_id_is_newer(entry_id: str, cursor: str) -> bool:
-    entry_parts = _stream_id_parts(entry_id)
-    cursor_parts = _stream_id_parts(cursor)
-    if entry_parts is None or cursor_parts is None:
-        return entry_id > cursor
-    return entry_parts > cursor_parts
-
-
-def _stream_id_parts(entry_id: str) -> tuple[int, int] | None:
-    try:
-        first, second = entry_id.split("-", 1)
-        return int(first), int(second)
-    except ValueError:
-        return None
-
 
 def _web_session_id_from_agentscope_session(session_id: str, *, agent_id: str) -> str:
     suffix = f"__{agent_id}"
