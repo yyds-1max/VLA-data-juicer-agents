@@ -67,6 +67,11 @@ class NavigationToolSurfaceMiddleware(MiddlewareBase):
                 "navigation tool surface unavailable"
             ) from error
 
+    async def on_reply(self, agent, input_kwargs, next_handler):
+        self._synchronize(agent)
+        async for item in next_handler(**input_kwargs):
+            yield item
+
     async def on_reasoning(self, agent, input_kwargs, next_handler):
         self._synchronize(agent)
         async for item in next_handler(**input_kwargs):

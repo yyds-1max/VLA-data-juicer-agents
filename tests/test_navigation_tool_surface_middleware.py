@@ -129,6 +129,95 @@ def _agent(
 
 
 @pytest.mark.asyncio
+async def test_reply_refreshes_surface_before_forwarding_to_agent(
+    monkeypatch,
+    record,
+    generic_tools,
+    agent_state,
+    planning,
+):
+    resolver = SequenceResolver(planning)
+    middleware = _middleware(monkeypatch, resolver)
+    agent = _agent(record, generic_tools, agent_state, middleware)
+    seen = []
+
+    async def forwarding_reply(**_kwargs):
+        seen.append(
+            (
+                [group.name for group in agent.toolkit.tool_groups],
+                [
+                    tool.name
+                    for group in agent.toolkit.tool_groups
+                    for tool in group.tools
+                ],
+                list(agent.state.tool_context.activated_groups),
+            )
+        )
+        yield "forwarded"
+
+    events = [
+        event
+        async for event in middleware.on_reply(
+            agent,
+            {"inputs": None},
+            forwarding_reply,
+        )
+    ]
+
+    assert seen == [
+        (
+            ["basic", "planning_evidence", "planning_authoring"],
+            ["planning_evidence_tool", "planning_authoring_tool"],
+            list(planning.active_group_names),
+        )
+    ]
+    assert resolver.calls == 1
+    assert events == ["forwarded"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "resolver_result",
+    [None, RuntimeError("sensitive sqlite path: /private/navigation.sqlite")],
+)
+async def test_reply_refresh_failure_clears_surface_before_forwarding(
+    monkeypatch,
+    record,
+    generic_tools,
+    agent_state,
+    resolver_result,
+):
+    middleware = _middleware(monkeypatch, SequenceResolver(resolver_result))
+    agent = _agent(record, generic_tools, agent_state, middleware)
+    group_list = agent.toolkit.tool_groups
+    handler_calls = 0
+
+    async def must_not_run(**_kwargs):
+        nonlocal handler_calls
+        handler_calls += 1
+        yield "unexpected"
+
+    with pytest.raises(NavigationToolSurfaceSyncError) as error:
+        _ = [
+            item
+            async for item in middleware.on_reply(
+                agent,
+                {"inputs": None},
+                must_not_run,
+            )
+        ]
+
+    assert str(error.value) == "navigation tool surface unavailable"
+    assert "sensitive" not in str(error.value)
+    assert handler_calls == 0
+    assert agent.toolkit.tool_groups is group_list
+    assert len(agent.toolkit.tool_groups) == 1
+    assert agent.toolkit.tool_groups[0].name == "basic"
+    assert agent.toolkit.tool_groups[0].tools == []
+    assert agent.state.tool_context.activated_groups == []
+
+
+@pytest.mark.asyncio
 async def test_reasoning_refresh_overwrites_stale_groups_and_removes_generic_tools(
     monkeypatch,
     record,

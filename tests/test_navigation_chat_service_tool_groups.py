@@ -8,6 +8,8 @@ import pytest
 from agentscope.app._service._chat import ChatService
 from agentscope.app.storage import ChatModelConfig, SessionConfig
 from agentscope.message import UserMsg
+from agentscope.skill import Skill
+from agentscope.tool import FunctionTool, ToolGroup, Toolkit
 
 import agentscope.app._service._chat as chat_service_module
 import vla_data_juicer_agents.navigation.plan_execution as plan_execution
@@ -38,6 +40,9 @@ from vla_data_juicer_agents.navigation.task_state import NavigationTaskStatus
 from vla_data_juicer_agents.runtime.agentscope_runtime import (
     AgentScopeRuntime,
     build_extra_agent_middlewares_factory,
+)
+from vla_data_juicer_agents.runtime.navigation_tool_surface import (
+    NavigationToolSurfaceSyncError,
 )
 from vla_data_juicer_agents.navigation.plan_models import ExtractSyncPlanInput
 from vla_data_juicer_agents.navigation.tool_groups import (
@@ -99,6 +104,65 @@ class ProcessingSpy:
             )
 
         return invoke
+
+
+class ModelInputProbe(ScriptedChatModel):
+    def __init__(self, *, context_size: int = 131_072) -> None:
+        super().__init__(context_size=context_size)
+        self.token_count_inputs: list[dict[str, object]] = []
+        self.api_call_count = 0
+
+    async def count_tokens(self, messages, tools):
+        self.token_count_inputs.append(
+            {
+                "messages": json.dumps(
+                    [message.model_dump(mode="json") for message in messages],
+                    ensure_ascii=False,
+                ),
+                "tool_names": schema_names(list(tools or [])),
+            }
+        )
+        return await super().count_tokens(messages, tools)
+
+    async def _call_api(self, *args, **kwargs):
+        self.api_call_count += 1
+        return await super()._call_api(*args, **kwargs)
+
+
+def _generic_toolkit_with_skill_group() -> Toolkit:
+    def ok() -> dict[str, bool]:
+        return {"ok": True}
+
+    return Toolkit(
+        tools=[
+            FunctionTool(ok, name="bash", is_read_only=True),
+            FunctionTool(ok, name="read", is_read_only=True),
+            FunctionTool(ok, name="task", is_read_only=True),
+        ],
+        tool_groups=[
+            ToolGroup(
+                name="generic_extensions",
+                description="Generic skill and MCP-equivalent tools.",
+                instructions="FORBIDDEN_GENERIC_GROUP_INSTRUCTIONS",
+                tools=[
+                    FunctionTool(
+                        ok,
+                        name="generic_mcp_equivalent_tool",
+                        is_read_only=True,
+                    )
+                ],
+                skills_or_loaders=[
+                    Skill(
+                        name="forbidden_generic_skill",
+                        description="FORBIDDEN_GENERIC_SKILL_INSTRUCTIONS",
+                        dir="/tmp/forbidden-generic-skill",
+                        markdown="# Forbidden generic skill",
+                        updated_at=0.0,
+                    )
+                ],
+            )
+        ],
+    )
 
 
 def test_execution_denylist_matches_catalog_and_real_external_schema():
@@ -295,15 +359,205 @@ async def _real_chat_service_case(monkeypatch, tmp_path, *, web_session_id: str)
     return config, session_id, built, services, storage, bus, service
 
 
-def _patch_assembly(monkeypatch, model):
+def _patch_assembly(monkeypatch, model, *, toolkit=None):
     async def async_get_scripted_model(*_args, **_kwargs):
         return model
 
     async def async_get_generic_toolkit(**_kwargs):
-        return generic_toolkit()
+        return toolkit or generic_toolkit()
 
     monkeypatch.setattr(chat_service_module, "get_model", async_get_scripted_model)
     monkeypatch.setattr(chat_service_module, "get_toolkit", async_get_generic_toolkit)
+
+
+@pytest.mark.asyncio
+async def test_compression_uses_authorized_surface_before_first_reasoning(
+    monkeypatch,
+    tmp_path,
+):
+    config, session_id, _built, _services, storage, _bus, service = (
+        await _real_chat_service_case(
+            monkeypatch,
+            tmp_path,
+            web_session_id="web-compression-barrier",
+        )
+    )
+    record = storage.agents[config.navigation_agent_id]
+    storage.agents[config.navigation_agent_id] = record.model_copy(
+        update={
+            "data": record.data.model_copy(
+                update={
+                    "context_config": record.data.context_config.model_copy(
+                        update={"trigger_ratio": 0.1, "reserve_ratio": 0.05}
+                    )
+                }
+            )
+        }
+    )
+    state = storage.sessions[
+        (config.user_id, config.navigation_agent_id, session_id)
+    ].state
+    state.context[:] = [
+        UserMsg(
+            name="user",
+            content="PRELOADED_CONTEXT " + "navigation context " * 1_500,
+        )
+    ]
+    state.tool_context.activated_groups[:] = ["generic_extensions"]
+
+    model = ModelInputProbe(context_size=16_384)
+    model.enqueue_tool(
+        "generate_structured_output",
+        {
+            "task_overview": "Continue the authorized navigation task.",
+            "current_state": "Planning is active.",
+            "important_discoveries": "Evidence is stored durably.",
+            "next_steps": "Use only the current navigation surface.",
+            "context_to_preserve": "Keep the session identity bound.",
+        },
+    )
+    model.enqueue_text("压缩后继续规划。")
+    toolkit = _generic_toolkit_with_skill_group()
+    _patch_assembly(monkeypatch, model, toolkit=toolkit)
+
+    await service._run_impl(
+        config.user_id,
+        session_id,
+        config.navigation_agent_id,
+        UserMsg(name="user", content="继续规划"),
+    )
+
+    assert model.compact_event_count == 1
+    assert model.api_call_count == 2
+    assert len(model.invocations) == 2
+    first_prepared_input = model.token_count_inputs[0]
+    prepared_names = first_prepared_input["tool_names"]
+    assert {
+        "inspect_navigation_raw_metadata_tool",
+        "submit_extract_sync_plan_tool",
+    } <= prepared_names
+    assert {
+        "bash",
+        "read",
+        "task",
+        "generic_mcp_equivalent_tool",
+        "Skill",
+        "skill_viewer",
+    }.isdisjoint(prepared_names)
+    assert "FORBIDDEN_GENERIC_SKILL_INSTRUCTIONS" not in first_prepared_input[
+        "messages"
+    ]
+
+    compression_input = json.dumps(
+        model.invocations[0].formatted_messages,
+        ensure_ascii=False,
+    )
+    assert schema_names(model.invocations[0].tools) == {
+        "generate_structured_output"
+    }
+    assert "FORBIDDEN_GENERIC_SKILL_INSTRUCTIONS" not in compression_input
+    assert "FORBIDDEN_GENERIC_GROUP_INSTRUCTIONS" not in compression_input
+    assert "generic_mcp_equivalent_tool" not in compression_input
+    assert "reset_tools" not in compression_input
+
+    reasoning_names = schema_names(model.invocations[1].tools)
+    assert "submit_extract_sync_plan_tool" in reasoning_names
+    assert GENERIC_OR_RESET_TOOL_NAMES.isdisjoint(reasoning_names)
+    assert "generic_mcp_equivalent_tool" not in reasoning_names
+    assert storage.updated_state.tool_context.activated_groups == [
+        NAVIGATION_EVIDENCE_READ,
+        NAVIGATION_INVESTIGATION,
+        NAVIGATION_ARTIFACT_CHECKS,
+        NAVIGATION_PLAN_AUTHORING,
+        NAVIGATION_DIAGNOSTICS,
+    ]
+    model.assert_exhausted()
+
+
+@pytest.mark.asyncio
+async def test_missing_attempt_fails_before_compression_or_model_call(
+    monkeypatch,
+    tmp_path,
+):
+    config = runtime_config(tmp_path)
+    storage = ChatServiceStorage()
+    await bootstrap_agentscope_records(storage, config)
+    session_id = f"web-missing-attempt__{config.navigation_agent_id}"
+    await storage.upsert_session(
+        config.user_id,
+        config.navigation_agent_id,
+        SessionConfig(
+            workspace_id="workspace-missing-attempt",
+            chat_model_config=ChatModelConfig(
+                type="scripted",
+                credential_id=config.credential_id,
+                model="scripted",
+                parameters={},
+            ),
+        ),
+        session_id=session_id,
+    )
+    bus = ChatServiceBus()
+    workspace_manager = ChatServiceWorkspaceManager()
+    runtime = AgentScopeRuntime(
+        config=config,
+        storage=storage,
+        message_bus=bus,
+        workspace_manager=workspace_manager,
+        app=None,
+    )
+    service = ChatService(
+        storage=storage,
+        workspace_manager=workspace_manager,
+        scheduler_manager=InertManager(),
+        background_task_manager=InertManager(),
+        message_bus=bus,
+        extra_agent_middlewares=build_extra_agent_middlewares_factory(
+            config,
+            runtime=runtime,
+        ),
+    )
+    state = storage.sessions[
+        (config.user_id, config.navigation_agent_id, session_id)
+    ].state
+    state.context[:] = [
+        UserMsg(name="user", content="PRELOADED_CONTEXT " * 2_000)
+    ]
+    state.tool_context.activated_groups[:] = ["generic_extensions"]
+    model = ModelInputProbe(context_size=4_096)
+    toolkit = _generic_toolkit_with_skill_group()
+    get_model_calls = 0
+
+    async def get_model_spy(*_args, **_kwargs):
+        nonlocal get_model_calls
+        get_model_calls += 1
+        return model
+
+    async def get_toolkit_spy(**_kwargs):
+        return toolkit
+
+    monkeypatch.setattr(chat_service_module, "get_model", get_model_spy)
+    monkeypatch.setattr(chat_service_module, "get_toolkit", get_toolkit_spy)
+
+    with pytest.raises(
+        NavigationToolSurfaceSyncError,
+        match="^navigation tool surface unavailable$",
+    ):
+        await service._run_impl(
+            config.user_id,
+            session_id,
+            config.navigation_agent_id,
+            UserMsg(name="user", content="继续"),
+        )
+
+    assert get_model_calls == 1
+    assert model.token_count_inputs == []
+    assert model.api_call_count == 0
+    assert model.invocations == []
+    assert model.compact_event_count == 0
+    assert len(toolkit.tool_groups) == 1
+    assert toolkit.tool_groups[0].name == "basic"
+    assert toolkit.tool_groups[0].tools == []
 
 
 @pytest.mark.asyncio

@@ -96,11 +96,16 @@ class ChatServiceWorkspaceManager:
         session_id: str,
         workspace_id: str,
     ) -> Any:
+        async def offload_context(_session_id: str, *, msgs: list[Any]) -> str:
+            del msgs
+            return "/tmp/chat-service-context-offload.json"
+
         return SimpleNamespace(
             user_id=user_id,
             agent_id=agent_id,
             session_id=session_id,
             workspace_id=workspace_id,
+            offload_context=offload_context,
         )
 
 
