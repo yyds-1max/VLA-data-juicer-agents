@@ -311,7 +311,16 @@ async def _drain_controller_events(
                 hashlib.sha256(uuid4().bytes).hexdigest(),
                 event,
             )
-            await bus.publish(session_id, record)
+            try:
+                await bus.publish(session_id, record)
+            except Exception:  # pylint: disable=broad-except
+                logger.warning(
+                    "Live controller event publish failed; persisted replay remains "
+                    "available: session_id=%s sequence=%s",
+                    session_id,
+                    record.sequence,
+                    exc_info=True,
+                )
             text = _final_event_text(event)
             if text is not None and text not in persisted_final_texts:
                 store.append_message(session_id, role="assistant", content=text)

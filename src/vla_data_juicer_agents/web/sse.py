@@ -50,7 +50,10 @@ async def iter_sse(
         session_id,
         after_sequence,
     ) as records:
-        pending_record = asyncio.create_task(anext(records))
+        pending_record = asyncio.create_task(
+            anext(records),
+            name=f"sse-record:{session_id}",
+        )
         try:
             while True:
                 done, _pending = await asyncio.wait(
@@ -61,7 +64,10 @@ async def iter_sse(
                     yield b": heartbeat\n\n"
                     continue
                 record = pending_record.result()
-                pending_record = asyncio.create_task(anext(records))
+                pending_record = asyncio.create_task(
+                    anext(records),
+                    name=f"sse-record:{session_id}",
+                )
                 yield _encode_data(record)
         finally:
             pending_record.cancel()

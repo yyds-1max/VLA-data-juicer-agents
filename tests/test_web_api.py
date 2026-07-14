@@ -19,6 +19,7 @@ from vla_data_juicer_agents.web.app import (
     _drain_controller_events,
     create_app,
 )
+from vla_data_juicer_agents.web.schemas import PublicEventRecord
 
 
 class FakeController:
@@ -481,6 +482,52 @@ def test_failed_event_drain_consumes_result_after_controller_stops(tmp_path: Pat
     assert controller.consumed is True
     assert controller.is_running is False
     assert [message.content for message in app.state.store.get_session(session.id).messages] == []
+
+
+@pytest.mark.asyncio
+async def test_controller_drain_persists_entire_batch_when_live_publish_fails(
+    tmp_path: Path,
+    caplog,
+) -> None:
+    class FailFirstPublishBus:
+        def __init__(self) -> None:
+            self.published: list[tuple[str, PublicEventRecord]] = []
+
+        async def publish(self, session_id: str, record: PublicEventRecord) -> None:
+            self.published.append((session_id, record))
+            if len(self.published) == 1:
+                raise ConnectionError("browser disconnected")
+
+    app = create_app(
+        working_dir=str(tmp_path / ".djx"),
+        db_path=tmp_path / "sessions.sqlite",
+        controller_factory=FakeController,
+    )
+    session = app.state.manager.create_session("persist the entire batch")
+    controller = FakeController.created[-1]
+    controller._events = [
+        {"type": "reasoning", "payload": {"summary": "first"}},
+        {"type": "reasoning", "payload": {"summary": "second"}},
+    ]
+    controller._result = SimpleNamespace(text="turn complete")
+    bus = FailFirstPublishBus()
+    caplog.set_level(logging.WARNING)
+
+    await _drain_controller_events(session.id, app.state.manager, app.state.store, bus)
+
+    records = app.state.store.list_public_events(session.id)
+    assert all(isinstance(record, PublicEventRecord) for record in records)
+    assert [record.event["payload"]["summary"] for record in records] == [
+        "first",
+        "second",
+    ]
+    assert [record.sequence for _, record in bus.published] == [1, 2]
+    detail = app.state.store.get_session(session.id)
+    assert detail is not None
+    assert [(message.role, message.content) for message in detail.messages] == [
+        ("assistant", "turn complete")
+    ]
+    assert "Live controller event publish failed" in caplog.text
 
 
 def test_cleanup_waits_for_idle_without_timeout_parameter():

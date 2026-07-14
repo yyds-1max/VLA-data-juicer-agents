@@ -102,3 +102,35 @@ async def test_iter_sse_emits_heartbeat_comment_when_idle(tmp_path: Path) -> Non
 
     assert frame == b": heartbeat\n\n"
     assert next_frame == b": heartbeat\n\n"
+
+
+@pytest.mark.asyncio
+async def test_iter_sse_teardown_cancels_pending_read_and_unsubscribes(tmp_path: Path) -> None:
+    store = WebSessionStore(tmp_path / "sessions.sqlite")
+    session = store.create_session("disconnect cleanup")
+    bus = SessionEventBus()
+    task_name = f"sse-record:{session.id}"
+    stream = iter_sse(
+        store,
+        bus,
+        session.id,
+        after_sequence=0,
+        heartbeat_seconds=0,
+    )
+
+    frame = await anext(stream)
+    pending_reads = [
+        task for task in asyncio.all_tasks() if task.get_name() == task_name
+    ]
+    try:
+        assert len(pending_reads) == 1
+        assert pending_reads[0].done() is False
+        assert session.id in bus._subscribers
+    finally:
+        await stream.aclose()
+
+    assert pending_reads[0].done() is True
+    assert pending_reads[0].cancelled() is True
+    assert session.id not in bus._subscribers
+    assert all(task.get_name() != task_name for task in asyncio.all_tasks())
+    assert frame == b": heartbeat\n\n"
