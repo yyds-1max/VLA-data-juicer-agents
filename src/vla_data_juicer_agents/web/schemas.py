@@ -79,6 +79,7 @@ class CreateTurnResponse(BaseModel):
 
 class InterruptResponse(BaseModel):
     interrupted: bool
+    stopped_tool_call_ids: list[str] = Field(default_factory=list)
 
 
 class HumanDecisionRequest(BaseModel):

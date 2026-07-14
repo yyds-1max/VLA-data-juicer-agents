@@ -44,10 +44,12 @@ from vla_data_juicer_agents.runtime.agentscope_config import AgentScopeRuntimeCo
 from vla_data_juicer_agents.runtime.datapilot_projection import (
     DataPilotReplyProjectionMiddleware,
     DataPilotToolOutcomeMiddleware,
+    sanitize_agent_event,
 )
 from vla_data_juicer_agents.runtime.navigation_tool_surface import (
     NavigationToolSurfaceMiddleware,
 )
+from vla_data_juicer_agents.web.schemas import InterruptResponse
 
 _WAKEUP_RECOVERY_INTERVAL_SECS = 5.0
 _WAKEUP_RECOVERY_RETRY_DELAYS = (0.2, 1.0)
@@ -439,23 +441,111 @@ class AgentScopeRuntime:
             raise
         return session_id
 
-    async def interrupt_web_session(self, *, web_session_id: str) -> bool:
-        mapped = self._web_session_mapping(web_session_id)
-        if mapped is None:
-            return False
+    async def interrupt_web_session(
+        self,
+        *,
+        web_session_id: str,
+    ) -> InterruptResponse:
+        mappings = self._all_web_session_mappings(web_session_id)
+        if not mappings and self.web_session_store is None:
+            return InterruptResponse(interrupted=False)
 
-        _agent_id, agentscope_session_id = mapped
-        interrupted = False
-        cancellation = self.run_cancellation(agentscope_session_id)
-        if cancellation is not None:
-            interrupted = cancellation.cancel() or interrupted
+        interrupted = bool(mappings)
+        for _agent_id, agentscope_session_id in mappings:
+            cancellation = self.run_cancellation(agentscope_session_id)
+            if cancellation is not None:
+                interrupted = cancellation.cancel() or interrupted
 
-        await self.message_bus.publish(
-            MessageBusKeys.session_interrupt_channel(),
-            {"session_id": agentscope_session_id},
+        failures: list[Exception] = []
+        chat_service = self.app.state.chat_service
+        for agent_id, agentscope_session_id in mappings:
+            try:
+                await chat_service.interrupt(
+                    self.config.user_id,
+                    agentscope_session_id,
+                    agent_id,
+                )
+            except LookupError:
+                # Historical mappings can outlive an AgentScope session. The
+                # target is already absent, so interruption is idempotently done.
+                continue
+            except Exception as exc:  # pylint: disable=broad-except
+                failures.append(exc)
+
+        cancelled_task_ids: set[str] = set()
+        for _agent_id, agentscope_session_id in mappings:
+            try:
+                tasks = await self.message_bus.registry_getall(
+                    MessageBusKeys.bg_tasks(agentscope_session_id),
+                )
+            except Exception as exc:  # pylint: disable=broad-except
+                failures.append(exc)
+                continue
+            for task_id in tasks:
+                if task_id in cancelled_task_ids:
+                    continue
+                cancelled_task_ids.add(task_id)
+                try:
+                    await self.message_bus.publish(
+                        MessageBusKeys.task_cancel_channel(),
+                        {"task_id": task_id},
+                    )
+                except Exception as exc:  # pylint: disable=broad-except
+                    failures.append(exc)
+
+        if failures:
+            raise RuntimeError("explicit stop cancellation failed") from failures[0]
+
+        if self.web_session_store is None:
+            return InterruptResponse(interrupted=interrupted)
+        stopped = self.web_session_store.stop_open_tool_runs(web_session_id)
+        for row in stopped:
+            event = CustomEvent(
+                name="datapilot_tool_terminal",
+                value={
+                    "tool_call_id": row.tool_call_id,
+                    "status": "stopped",
+                    "summary": "已由用户停止",
+                },
+            ).model_dump(mode="json")
+            event = sanitize_agent_event(
+                event,
+                private_identities=self.projection_private_identities(),
+            )
+            identity = (
+                f"explicit-stop-tool-terminal:{web_session_id}:"
+                f"{row.tool_call_id}:stopped"
+            )
+            record = self.web_session_store.append_public_event(
+                web_session_id,
+                hashlib.sha256(identity.encode("utf-8")).hexdigest(),
+                event,
+            )
+            await self._publish_public_record(web_session_id, record)
+        return InterruptResponse(
+            interrupted=interrupted or bool(stopped),
+            stopped_tool_call_ids=[row.tool_call_id for row in stopped],
         )
-        interrupted = True
-        return interrupted
+
+    def _all_web_session_mappings(
+        self,
+        web_session_id: str,
+    ) -> list[tuple[str, str]]:
+        mappings: list[tuple[str, str]] = []
+        list_mappings = getattr(
+            self.web_session_store,
+            "list_agentscope_session_mappings",
+            None,
+        )
+        if callable(list_mappings):
+            mappings.extend(
+                (mapping.agent_id, mapping.agentscope_session_id)
+                for mapping in list_mappings(web_session_id)
+            )
+        mapped = self.web_sessions.get(web_session_id)
+        if mapped is not None and mapped not in mappings:
+            mappings.append(mapped)
+        return mappings
 
     async def delete_web_session(self, web_session_id: str) -> bool:
         if self.web_session_store is None:

@@ -190,10 +190,24 @@ def create_app(
     @app.post("/api/sessions/{session_id}/interrupt", response_model=InterruptResponse)
     async def interrupt(session_id: str) -> InterruptResponse:
         try:
-            interrupted = await _maybe_await(manager.interrupt(session_id))
+            result = await _maybe_await(manager.interrupt(session_id))
         except KeyError as exc:
             raise HTTPException(status_code=404, detail="Session not found") from exc
-        return InterruptResponse(interrupted=interrupted)
+        except RuntimeError as exc:
+            raise HTTPException(
+                status_code=503,
+                detail="Session stop failed; retry the request",
+            ) from exc
+        if isinstance(result, InterruptResponse):
+            return result
+        interrupted = getattr(result, "interrupted", None)
+        stopped_tool_call_ids = getattr(result, "stopped_tool_call_ids", None)
+        if isinstance(interrupted, bool):
+            return InterruptResponse(
+                interrupted=interrupted,
+                stopped_tool_call_ids=list(stopped_tool_call_ids or ()),
+            )
+        return InterruptResponse(interrupted=bool(result))
 
     @app.post("/api/sessions/{session_id}/human-decisions", response_model=HumanDecisionResponse)
     async def submit_human_decision(

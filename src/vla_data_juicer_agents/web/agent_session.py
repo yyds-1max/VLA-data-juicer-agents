@@ -5,6 +5,7 @@ from typing import Any
 from uuid import uuid4
 
 from vla_data_juicer_agents.web.schemas import (
+    InterruptResponse,
     PublicEventRecord,
     SessionRecord,
     generate_session_title,
@@ -46,14 +47,24 @@ class AgentScopeWebSessionManager:
             return turn_id
         return f"turn_{uuid4().hex}"
 
-    async def interrupt(self, session_id: str) -> bool:
+    async def interrupt(self, session_id: str) -> InterruptResponse:
         if self._store.get_session(session_id) is None:
             raise KeyError(session_id)
 
         interrupt_web_session = getattr(self._runtime, "interrupt_web_session", None)
         if interrupt_web_session is None:
-            return False
-        return bool(await interrupt_web_session(web_session_id=session_id))
+            return InterruptResponse(interrupted=False)
+        result = await interrupt_web_session(web_session_id=session_id)
+        if isinstance(result, InterruptResponse):
+            return result
+        interrupted = getattr(result, "interrupted", None)
+        stopped_tool_call_ids = getattr(result, "stopped_tool_call_ids", None)
+        if isinstance(interrupted, bool):
+            return InterruptResponse(
+                interrupted=interrupted,
+                stopped_tool_call_ids=list(stopped_tool_call_ids or ()),
+            )
+        return InterruptResponse(interrupted=bool(result))
 
     async def delete_session(self, session_id: str) -> None:
         if self._store.get_session(session_id) is None:

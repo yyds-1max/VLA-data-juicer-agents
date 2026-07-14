@@ -665,7 +665,70 @@ def test_interrupt_returns_true_for_active_session(tmp_path: Path):
     response = client.post(f"/api/sessions/{session_id}/interrupt")
 
     assert response.status_code == 200
-    assert response.json() == {"interrupted": True}
+    assert response.json() == {"interrupted": True, "stopped_tool_call_ids": []}
+
+
+def test_agentscope_interrupt_returns_only_public_stop_fields(tmp_path: Path):
+    class FakeRuntime:
+        def __init__(self) -> None:
+            self.app = FastAPI()
+            self.config = SimpleNamespace(agentscope_mount_path="/api/agentscope")
+
+        async def interrupt_web_session(self, *, web_session_id: str):
+            del web_session_id
+            return SimpleNamespace(
+                interrupted=True,
+                stopped_tool_call_ids=["call-public-1"],
+                agentscope_session_id="private-session-must-not-leak",
+            )
+
+    app = create_app(
+        working_dir=str(tmp_path / ".djx"),
+        db_path=tmp_path / "sessions.sqlite",
+        controller_factory=FakeController,
+        agentscope_runtime=FakeRuntime(),
+    )
+    client = TestClient(app)
+    session_id = _create_session(client)
+
+    response = client.post(f"/api/sessions/{session_id}/interrupt")
+
+    assert response.status_code == 200
+    assert response.json() == {
+        "interrupted": True,
+        "stopped_tool_call_ids": ["call-public-1"],
+    }
+    assert "private-session-must-not-leak" not in response.text
+
+
+def test_agentscope_interrupt_failure_is_retryable_without_internal_id_leak(
+    tmp_path: Path,
+):
+    class FailingRuntime:
+        def __init__(self) -> None:
+            self.app = FastAPI()
+            self.config = SimpleNamespace(agentscope_mount_path="/api/agentscope")
+
+        async def interrupt_web_session(self, *, web_session_id: str):
+            raise RuntimeError(
+                f"private AgentScope session as-secret for {web_session_id} failed"
+            )
+
+    app = create_app(
+        working_dir=str(tmp_path / ".djx"),
+        db_path=tmp_path / "sessions.sqlite",
+        controller_factory=FakeController,
+        agentscope_runtime=FailingRuntime(),
+    )
+    client = TestClient(app, raise_server_exceptions=False)
+    session_id = _create_session(client)
+
+    response = client.post(f"/api/sessions/{session_id}/interrupt")
+
+    assert response.status_code == 503
+    assert response.json() == {"detail": "Session stop failed; retry the request"}
+    assert "as-secret" not in response.text
+    assert session_id not in response.text
 
 
 def test_turn_and_interrupt_unknown_active_session_return_404(tmp_path: Path):

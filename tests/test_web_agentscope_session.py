@@ -47,7 +47,11 @@ from vla_data_juicer_agents.runtime.navigation_tool_surface import (
     NavigationToolSurfaceMiddleware,
 )
 from vla_data_juicer_agents.web.agent_session import AgentScopeWebSessionManager
-from vla_data_juicer_agents.web.schemas import HumanDecisionRequest, SessionRecord
+from vla_data_juicer_agents.web.schemas import (
+    HumanDecisionRequest,
+    InterruptResponse,
+    SessionRecord,
+)
 from vla_data_juicer_agents.web.session_store import WebSessionStore
 
 
@@ -81,14 +85,23 @@ class RejectingAgentScopeRuntime(FakeAgentScopeRuntime):
 
 
 class InterruptingAgentScopeRuntime(FakeAgentScopeRuntime):
-    def __init__(self, turn_id: str = "turn_runtime_1", interrupted: bool = True) -> None:
+    def __init__(
+        self,
+        turn_id: str = "turn_runtime_1",
+        interrupted: bool = True,
+        stopped_tool_call_ids: list[str] | None = None,
+    ) -> None:
         super().__init__(turn_id=turn_id)
         self.interrupted = interrupted
+        self.stopped_tool_call_ids = stopped_tool_call_ids or []
         self.interrupts: list[str] = []
 
-    async def interrupt_web_session(self, *, web_session_id: str) -> bool:
+    async def interrupt_web_session(self, *, web_session_id: str) -> InterruptResponse:
         self.interrupts.append(web_session_id)
-        return self.interrupted
+        return InterruptResponse(
+            interrupted=self.interrupted,
+            stopped_tool_call_ids=self.stopped_tool_call_ids,
+        )
 
 
 class HumanDecisionAgentScopeRuntime(FakeAgentScopeRuntime):
@@ -144,6 +157,8 @@ class FakeAgentScopeMessageBus:
         self.subscribe_keys: list[str] = []
         self.cancelled_sessions: list[str] = []
         self.published: list[tuple[str, dict]] = []
+        self.background_tasks: dict[str, dict[str, str]] = {}
+        self.registry_getall_calls: list[str] = []
         self.dequeue_calls = 0
 
     async def session_read_events(self, session_id: str, since=None):
@@ -178,6 +193,10 @@ class FakeAgentScopeMessageBus:
 
     async def publish(self, key: str, payload: dict) -> None:
         self.published.append((key, payload))
+
+    async def registry_getall(self, namespace: str) -> dict[str, str]:
+        self.registry_getall_calls.append(namespace)
+        return dict(self.background_tasks.get(namespace, {}))
 
     async def dequeue_wakeups(self, max_count: int = 64):
         self.dequeue_calls += 1
@@ -262,6 +281,7 @@ class FakeChatService:
     def __init__(self, storage=None) -> None:
         self.runs = []
         self.seen_cancellations = []
+        self.interrupt_calls: list[tuple[str, str, str]] = []
         self.storage = storage
 
     async def run(self, *, user_id, session_id, agent_id, input_msg):
@@ -280,6 +300,9 @@ class FakeChatService:
                 for block in message.get_content_blocks("tool_call"):
                     if block.id == input_msg.execution_results[0].id:
                         block.state = ToolCallState.FINISHED
+
+    async def interrupt(self, user_id, session_id, agent_id):
+        self.interrupt_calls.append((user_id, session_id, agent_id))
 
 
 class FakeChatRunRegistry:
@@ -1482,49 +1505,377 @@ async def test_runtime_interrupt_web_session_returns_false_without_mapping() -> 
     message_bus = FakeAgentScopeMessageBus()
     runtime = _runtime(chat_run_registry=FakeChatRunRegistry(), message_bus=message_bus)
 
-    interrupted = await runtime.interrupt_web_session(web_session_id="web-1")
+    result = await runtime.interrupt_web_session(web_session_id="web-1")
 
-    assert interrupted is False
+    assert result == InterruptResponse(interrupted=False, stopped_tool_call_ids=[])
     assert message_bus.published == []
 
 
 @pytest.mark.asyncio
-async def test_runtime_interrupt_web_session_publishes_agentscope_interrupt() -> None:
+async def test_runtime_interrupt_web_session_stops_active_chat_and_public_tool(
+    tmp_path: Path,
+) -> None:
     message_bus = FakeAgentScopeMessageBus()
     runtime = _runtime(chat_run_registry=FakeChatRunRegistry(), message_bus=message_bus)
-    runtime.web_sessions["web-1"] = ("main-router-agent", "as-session-1")
+    store = WebSessionStore(tmp_path / "sessions.sqlite")
+    public_session = store.create_session("active stop")
+    store.save_agentscope_session_mapping(
+        public_session.id,
+        agent_id="main-router-agent",
+        agentscope_session_id="as-session-1",
+    )
+    store.start_tool_run(
+        public_session.id,
+        "call-1",
+        "extract",
+        "2026-07-15T00:00:00.000+00:00",
+    )
+    published = []
+    runtime.set_web_transport(
+        store,
+        lambda session_id, record: published.append((session_id, record)),
+    )
+    cancellation = CancellationContext()
+    runtime.register_run_cancellation("as-session-1", cancellation)
 
-    interrupted = await runtime.interrupt_web_session(web_session_id="web-1")
+    class OrderCheckingChatService(FakeChatService):
+        async def interrupt(self, user_id, session_id, agent_id):
+            assert cancellation.cancelled is True
+            await super().interrupt(user_id, session_id, agent_id)
 
-    assert interrupted is True
-    assert message_bus.published == [
-        (
-            MessageBusKeys.session_interrupt_channel(),
-            {"session_id": "as-session-1"},
-        ),
+    runtime.app.state.chat_service = OrderCheckingChatService()
+
+    result = await runtime.interrupt_web_session(web_session_id=public_session.id)
+
+    assert result == InterruptResponse(
+        interrupted=True,
+        stopped_tool_call_ids=["call-1"],
+    )
+    assert cancellation.cancelled is True
+    assert runtime.app.state.chat_service.interrupt_calls == [
+        ("alice", "as-session-1", "main-router-agent")
     ]
-    assert runtime.web_sessions["web-1"] == ("main-router-agent", "as-session-1")
+    detail = store.get_session(public_session.id)
+    assert detail is not None
+    assert [(row.tool_call_id, row.status) for row in detail.tool_runs] == [
+        ("call-1", "stopped")
+    ]
+    terminal = [
+        record
+        for record in detail.events
+        if record.event.get("name") == "datapilot_tool_terminal"
+    ]
+    assert len(terminal) == 1
+    assert terminal[0].event["value"] == {
+        "tool_call_id": "call-1",
+        "status": "stopped",
+        "summary": "已由用户停止",
+    }
+    assert len(terminal[0].dedupe_key) == 64
+    assert "call-1" not in terminal[0].dedupe_key
+    assert [(session_id, record.id) for session_id, record in published] == [
+        (public_session.id, terminal[0].id)
+    ]
 
 
 @pytest.mark.asyncio
-async def test_runtime_interrupt_web_session_cancels_registered_context() -> None:
+async def test_runtime_interrupt_web_session_interrupts_hitl_and_all_historical_mappings(
+    tmp_path: Path,
+) -> None:
     message_bus = FakeAgentScopeMessageBus()
     runtime = _runtime(chat_run_registry=FakeChatRunRegistry(), message_bus=message_bus)
-    cancellation = CancellationContext()
-    runtime.web_sessions["web-1"] = ("navigation-data-agent", "as-session-1")
-    runtime.register_run_cancellation("as-session-1", cancellation)
+    store = WebSessionStore(tmp_path / "sessions.sqlite")
+    public_session = store.create_session("parked HITL")
+    store.save_agentscope_session_mapping(
+        public_session.id,
+        agent_id="historical-worker-agent",
+        agentscope_session_id="historical-worker-session",
+    )
+    store.save_agentscope_session_mapping(
+        public_session.id,
+        agent_id="navigation-data-agent",
+        agentscope_session_id="parked-hitl-session",
+    )
+    runtime.set_web_session_store(store)
 
-    interrupted = await runtime.interrupt_web_session(web_session_id="web-1")
+    result = await runtime.interrupt_web_session(web_session_id=public_session.id)
 
-    assert interrupted is True
-    assert cancellation.cancelled is True
-    assert message_bus.published == [
-        (
-            MessageBusKeys.session_interrupt_channel(),
-            {"session_id": "as-session-1"},
-        ),
+    assert result == InterruptResponse(interrupted=True, stopped_tool_call_ids=[])
+    assert runtime.app.state.chat_service.interrupt_calls == [
+        ("alice", "historical-worker-session", "historical-worker-agent"),
+        ("alice", "parked-hitl-session", "navigation-data-agent"),
     ]
-    assert runtime.web_sessions["web-1"] == ("navigation-data-agent", "as-session-1")
+
+
+@pytest.mark.asyncio
+async def test_runtime_interrupt_web_session_cancels_background_registry_keys_once(
+    tmp_path: Path,
+) -> None:
+    message_bus = FakeAgentScopeMessageBus()
+    runtime = _runtime(chat_run_registry=FakeChatRunRegistry(), message_bus=message_bus)
+    store = WebSessionStore(tmp_path / "sessions.sqlite")
+    public_session = store.create_session("background tools")
+    mappings = [
+        ("main-router-agent", "router-session"),
+        ("navigation-data-agent", "navigation-session"),
+    ]
+    for agent_id, session_id in mappings:
+        store.save_agentscope_session_mapping(
+            public_session.id,
+            agent_id=agent_id,
+            agentscope_session_id=session_id,
+        )
+    runtime.set_web_session_store(store)
+    message_bus.background_tasks = {
+        MessageBusKeys.bg_tasks("router-session"): {
+            "bg-task-1": '{"tool_name": "extract"}',
+            "shared-task": '{"tool_name": "shared-router"}',
+        },
+        MessageBusKeys.bg_tasks("navigation-session"): {
+            "shared-task": '{"tool_name": "shared-navigation"}',
+            "bg-task-2": '{"tool_name": "finish"}',
+        },
+    }
+
+    result = await runtime.interrupt_web_session(web_session_id=public_session.id)
+
+    assert result.interrupted is True
+    assert message_bus.registry_getall_calls == [
+        MessageBusKeys.bg_tasks("router-session"),
+        MessageBusKeys.bg_tasks("navigation-session"),
+    ]
+    assert message_bus.published == [
+        (MessageBusKeys.task_cancel_channel(), {"task_id": "bg-task-1"}),
+        (MessageBusKeys.task_cancel_channel(), {"task_id": "shared-task"}),
+        (MessageBusKeys.task_cancel_channel(), {"task_id": "bg-task-2"}),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_runtime_interrupt_failure_attempts_all_mappings_and_is_retryable(
+    tmp_path: Path,
+) -> None:
+    class FailOnceChatService(FakeChatService):
+        def __init__(self) -> None:
+            super().__init__()
+            self.failed = False
+
+        async def interrupt(self, user_id, session_id, agent_id):
+            self.interrupt_calls.append((user_id, session_id, agent_id))
+            if session_id == "first-session" and not self.failed:
+                self.failed = True
+                raise ConnectionError("interrupt transport unavailable")
+
+    message_bus = FakeAgentScopeMessageBus()
+    runtime = _runtime(chat_run_registry=FakeChatRunRegistry(), message_bus=message_bus)
+    runtime.app.state.chat_service = FailOnceChatService()
+    store = WebSessionStore(tmp_path / "sessions.sqlite")
+    public_session = store.create_session("partial stop")
+    for agent_id, session_id in (
+        ("a-agent", "first-session"),
+        ("b-agent", "second-session"),
+    ):
+        store.save_agentscope_session_mapping(
+            public_session.id,
+            agent_id=agent_id,
+            agentscope_session_id=session_id,
+        )
+    store.start_tool_run(
+        public_session.id,
+        "call-1",
+        "extract",
+        "2026-07-15T00:00:00.000+00:00",
+    )
+    runtime.set_web_session_store(store)
+
+    with pytest.raises(RuntimeError, match="explicit stop cancellation failed"):
+        await runtime.interrupt_web_session(web_session_id=public_session.id)
+
+    assert runtime.app.state.chat_service.interrupt_calls == [
+        ("alice", "first-session", "a-agent"),
+        ("alice", "second-session", "b-agent"),
+    ]
+    detail = store.get_session(public_session.id)
+    assert detail is not None
+    assert [(row.tool_call_id, row.status) for row in detail.tool_runs] == [
+        ("call-1", "running")
+    ]
+    assert detail.events == []
+
+    retried = await runtime.interrupt_web_session(web_session_id=public_session.id)
+
+    assert retried.stopped_tool_call_ids == ["call-1"]
+
+
+@pytest.mark.asyncio
+async def test_runtime_background_cancel_failure_attempts_remaining_tasks_and_retries(
+    tmp_path: Path,
+) -> None:
+    class FailOnceCancelBus(FakeAgentScopeMessageBus):
+        def __init__(self) -> None:
+            super().__init__()
+            self.failed = False
+
+        async def publish(self, key: str, payload: dict) -> None:
+            self.published.append((key, payload))
+            if payload["task_id"] == "bg-task-1" and not self.failed:
+                self.failed = True
+                raise ConnectionError("task cancel broadcast unavailable")
+
+    message_bus = FailOnceCancelBus()
+    runtime = _runtime(chat_run_registry=FakeChatRunRegistry(), message_bus=message_bus)
+    store = WebSessionStore(tmp_path / "sessions.sqlite")
+    public_session = store.create_session("partial background stop")
+    store.save_agentscope_session_mapping(
+        public_session.id,
+        agent_id="main-router-agent",
+        agentscope_session_id="router-session",
+    )
+    store.start_tool_run(
+        public_session.id,
+        "call-1",
+        "extract",
+        "2026-07-15T00:00:00.000+00:00",
+    )
+    runtime.set_web_session_store(store)
+    message_bus.background_tasks = {
+        MessageBusKeys.bg_tasks("router-session"): {
+            "bg-task-1": "metadata-one",
+            "bg-task-2": "metadata-two",
+        }
+    }
+
+    with pytest.raises(RuntimeError, match="explicit stop cancellation failed"):
+        await runtime.interrupt_web_session(web_session_id=public_session.id)
+
+    assert message_bus.published == [
+        (MessageBusKeys.task_cancel_channel(), {"task_id": "bg-task-1"}),
+        (MessageBusKeys.task_cancel_channel(), {"task_id": "bg-task-2"}),
+    ]
+    detail = store.get_session(public_session.id)
+    assert detail is not None
+    assert detail.tool_runs[0].status == "running"
+
+    retried = await runtime.interrupt_web_session(web_session_id=public_session.id)
+
+    assert retried.stopped_tool_call_ids == ["call-1"]
+    assert message_bus.published[-2:] == [
+        (MessageBusKeys.task_cancel_channel(), {"task_id": "bg-task-1"}),
+        (MessageBusKeys.task_cancel_channel(), {"task_id": "bg-task-2"}),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_runtime_interrupt_treats_false_and_missing_chat_session_as_idempotent(
+    tmp_path: Path,
+) -> None:
+    class StaleChatService(FakeChatService):
+        async def interrupt(self, user_id, session_id, agent_id):
+            self.interrupt_calls.append((user_id, session_id, agent_id))
+            if session_id == "missing-session":
+                raise LookupError("session was already removed")
+            return False
+
+    runtime = _runtime(
+        chat_run_registry=FakeChatRunRegistry(),
+        message_bus=FakeAgentScopeMessageBus(),
+    )
+    runtime.app.state.chat_service = StaleChatService()
+    store = WebSessionStore(tmp_path / "sessions.sqlite")
+    public_session = store.create_session("stale mappings")
+    for agent_id, session_id in (
+        ("a-agent", "missing-session"),
+        ("b-agent", "idle-session"),
+    ):
+        store.save_agentscope_session_mapping(
+            public_session.id,
+            agent_id=agent_id,
+            agentscope_session_id=session_id,
+        )
+    runtime.set_web_session_store(store)
+
+    result = await runtime.interrupt_web_session(web_session_id=public_session.id)
+
+    assert result == InterruptResponse(interrupted=True, stopped_tool_call_ids=[])
+
+
+@pytest.mark.asyncio
+async def test_runtime_interrupt_durable_stop_failure_does_not_publish_stopped(
+    tmp_path: Path,
+) -> None:
+    runtime = _runtime(
+        chat_run_registry=FakeChatRunRegistry(),
+        message_bus=FakeAgentScopeMessageBus(),
+    )
+    store = WebSessionStore(tmp_path / "sessions.sqlite")
+    public_session = store.create_session("durable failure")
+    store.save_agentscope_session_mapping(
+        public_session.id,
+        agent_id="main-router-agent",
+        agentscope_session_id="router-session",
+    )
+    store.start_tool_run(
+        public_session.id,
+        "call-1",
+        "extract",
+        "2026-07-15T00:00:00.000+00:00",
+    )
+    published = []
+    runtime.set_web_transport(store, lambda *_args: published.append(_args))
+
+    def fail_stop(_session_id: str):
+        raise sqlite3.OperationalError("disk full")
+
+    store.stop_open_tool_runs = fail_stop
+
+    with pytest.raises(sqlite3.OperationalError, match="disk full"):
+        await runtime.interrupt_web_session(web_session_id=public_session.id)
+
+    detail = store.get_session(public_session.id)
+    assert detail is not None
+    assert [(row.tool_call_id, row.status) for row in detail.tool_runs] == [
+        ("call-1", "running")
+    ]
+    assert detail.events == []
+    assert published == []
+
+
+@pytest.mark.asyncio
+async def test_runtime_interrupt_live_publish_failure_keeps_durable_stopped(
+    tmp_path: Path,
+    caplog,
+) -> None:
+    runtime = _runtime(
+        chat_run_registry=FakeChatRunRegistry(),
+        message_bus=FakeAgentScopeMessageBus(),
+    )
+    store = WebSessionStore(tmp_path / "sessions.sqlite")
+    public_session = store.create_session("browser disconnected")
+    store.save_agentscope_session_mapping(
+        public_session.id,
+        agent_id="main-router-agent",
+        agentscope_session_id="router-session",
+    )
+    store.start_tool_run(
+        public_session.id,
+        "call-1",
+        "extract",
+        "2026-07-15T00:00:00.000+00:00",
+    )
+
+    async def fail_publish(_session_id, _record):
+        raise ConnectionError("browser disconnected")
+
+    runtime.set_web_transport(store, fail_publish)
+
+    result = await runtime.interrupt_web_session(web_session_id=public_session.id)
+
+    assert result.stopped_tool_call_ids == ["call-1"]
+    detail = store.get_session(public_session.id)
+    assert detail is not None
+    assert detail.tool_runs[0].status == "stopped"
+    assert [record.event["value"]["status"] for record in detail.events] == ["stopped"]
+    assert "Live public event publish failed" in caplog.text
 
 
 @pytest.mark.asyncio
@@ -2633,6 +2984,91 @@ async def test_async_live_publisher_failure_keeps_tool_terminal_and_yields_respo
 
 
 @pytest.mark.asyncio
+async def test_unrelated_tool_cancellation_is_projected_as_failure(tmp_path: Path) -> None:
+    store = WebSessionStore(tmp_path / "sessions.sqlite")
+    public_session = store.create_session("system cancellation")
+    internal_session_id = "internal-navigation-session"
+    store.save_agentscope_session_mapping(
+        public_session.id,
+        agent_id="navigation-data-agent",
+        agentscope_session_id=internal_session_id,
+    )
+    runtime = _runtime(workspace_root=tmp_path)
+    runtime.set_web_session_store(store)
+    middleware = DataPilotToolOutcomeMiddleware(internal_session_id, runtime)
+    tool_call = ToolCallBlock(id="call-system-cancel", name="extract", input="{}")
+
+    async def handler(**_kwargs):
+        raise asyncio.CancelledError("worker shutdown")
+        yield  # pragma: no cover
+
+    with pytest.raises(asyncio.CancelledError):
+        async for _ in middleware.on_acting(
+            SimpleNamespace(),
+            {"tool_call": tool_call},
+            handler,
+        ):
+            pass
+
+    detail = store.get_session(public_session.id)
+    assert detail is not None
+    assert [(row.tool_call_id, row.status) for row in detail.tool_runs] == [
+        ("call-system-cancel", "failure")
+    ]
+    assert [record.event["value"]["status"] for record in detail.events] == ["failure"]
+
+
+@pytest.mark.asyncio
+async def test_explicit_stop_is_idempotent_ignores_late_tool_outcome_and_allows_continuation(
+    tmp_path: Path,
+) -> None:
+    message_bus = FakeAgentScopeMessageBus()
+    chat_run_registry = FakeChatRunRegistry()
+    runtime = _runtime(chat_run_registry=chat_run_registry, message_bus=message_bus)
+    store = WebSessionStore(tmp_path / "sessions.sqlite")
+    public_session = store.create_session("repeat stop")
+    internal_session_id = "router-session"
+    store.save_agentscope_session_mapping(
+        public_session.id,
+        agent_id="main-router-agent",
+        agentscope_session_id=internal_session_id,
+    )
+    store.start_tool_run(
+        public_session.id,
+        "call-1",
+        "extract",
+        "2026-07-15T00:00:00.000+00:00",
+    )
+    runtime.set_web_session_store(store)
+
+    first = await runtime.interrupt_web_session(web_session_id=public_session.id)
+    second = await runtime.interrupt_web_session(web_session_id=public_session.id)
+    late = await runtime.finish_public_tool(
+        internal_session_id,
+        tool_call_id="call-1",
+        status="success",
+        summary="late success",
+        error_type=None,
+    )
+
+    assert first.stopped_tool_call_ids == ["call-1"]
+    assert second.stopped_tool_call_ids == []
+    assert late is None
+    detail = store.get_session(public_session.id)
+    assert detail is not None
+    assert [(row.tool_call_id, row.status) for row in detail.tool_runs] == [
+        ("call-1", "stopped")
+    ]
+    assert [record.event["value"]["status"] for record in detail.events] == ["stopped"]
+
+    await runtime.submit_user_message(web_session_id=public_session.id, message="继续处理")
+
+    assert chat_run_registry.spawns[-1]["session_id"] == internal_session_id
+    assert runtime.run_cancellation(internal_session_id) is not None
+    await chat_run_registry.drain()
+
+
+@pytest.mark.asyncio
 async def test_submit_turn_appends_user_message_calls_runtime_and_returns_turn_id(tmp_path: Path) -> None:
     store = WebSessionStore(tmp_path / "sessions.sqlite")
     runtime = FakeAgentScopeRuntime(turn_id="turn_agentscope_1")
@@ -2715,17 +3151,26 @@ async def test_interrupt_returns_false_without_runtime_interrupt(tmp_path: Path)
     manager = AgentScopeWebSessionManager(store=store, runtime=FakeAgentScopeRuntime())
     session = await manager.create_session("处理 20270605")
 
-    assert await manager.interrupt(session.id) is False
+    assert await manager.interrupt(session.id) == InterruptResponse(
+        interrupted=False,
+        stopped_tool_call_ids=[],
+    )
 
 
 @pytest.mark.asyncio
 async def test_interrupt_delegates_to_runtime_interrupt(tmp_path: Path) -> None:
     store = WebSessionStore(tmp_path / "sessions.sqlite")
-    runtime = InterruptingAgentScopeRuntime(interrupted=True)
+    runtime = InterruptingAgentScopeRuntime(
+        interrupted=True,
+        stopped_tool_call_ids=["call-public-1"],
+    )
     manager = AgentScopeWebSessionManager(store=store, runtime=runtime)
     session = await manager.create_session("处理 20270605")
 
-    assert await manager.interrupt(session.id) is True
+    assert await manager.interrupt(session.id) == InterruptResponse(
+        interrupted=True,
+        stopped_tool_call_ids=["call-public-1"],
+    )
     assert runtime.interrupts == [session.id]
 
 
