@@ -265,6 +265,27 @@ def event_types(events: list[Any]) -> list[str]:
     return [str(getattr(event, "type", type(event).__name__)).upper() for event in events]
 
 
+def schema_names(schemas: list[dict[str, Any]]) -> set[str]:
+    return {
+        schema["function"]["name"]
+        for schema in schemas
+    }
+
+
+def latest_tool_result_json(messages: list[Msg]) -> dict[str, Any]:
+    for message in reversed(messages):
+        blocks = message.get_content_blocks("tool_result")
+        if not blocks:
+            continue
+        output = blocks[-1].output
+        if isinstance(output, str):
+            return json.loads(output)
+        return json.loads(
+            "".join(block.text for block in output if isinstance(block, TextBlock))
+        )
+    raise AssertionError("scripted model expected a prior tool result")
+
+
 def tool_call_names(agent: Agent) -> list[str]:
     return [
         block.name
