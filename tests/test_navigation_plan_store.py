@@ -763,6 +763,57 @@ def test_controlled_handoff_recovery_preserves_audit_and_unblocks_replacement(tm
     )
 
 
+def test_controlled_handoff_recovery_rejects_a_non_current_attempt(tmp_path: Path):
+    repo, task = stores_with_task(tmp_path, web_session_id="web-owner")
+    plan = _activate_owned(
+        repo,
+        task,
+        "extract_sync",
+        1,
+        valid_extract_plan(),
+        expected_web_session_id="web-owner",
+        expected_agentscope_session_id=task.agentscope_session_id,
+    )
+    timestamp = datetime.now(UTC).isoformat()
+    with sqlite3.connect(repo.db_path) as connection:
+        connection.execute(
+            """INSERT INTO navigation_human_decision_handoffs (
+                   plan_id, step_id, task_id, decision_key, decision_json,
+                   status, delivery_status, created_at, updated_at
+               ) VALUES (?, 'prepare', ?, 'decision', '{}',
+                         'recovery_required', 'recovery_required', ?, ?)""",
+            (plan.plan_id, task.task_id, timestamp, timestamp),
+        )
+    task_store = SqliteNavigationTaskStore(repo.db_path)
+    task_store.create_task_attempt(
+        request="process B",
+        target="20260711",
+        date="20260711",
+        segments=["segment-b"],
+        scene_mode=None,
+        dry_run=True,
+        web_session_id="web-owner",
+        agentscope_session_id=task.agentscope_session_id,
+    )
+    before_handoff = repo.get_human_decision_handoff(plan.plan_id, "prepare")
+    before_plan = repo.get(plan.plan_id)
+    before_step = repo.get_current_step(plan.plan_id)
+    before_task = task_store.get_task(task.task_id)
+
+    with pytest.raises(PermissionError, match="session mismatch"):
+        repo.quarantine_human_decision_handoff(
+            plan.plan_id,
+            "prepare",
+            expected_web_session_id="web-owner",
+            reason="operator requested recovery",
+        )
+
+    assert repo.get_human_decision_handoff(plan.plan_id, "prepare") == before_handoff
+    assert repo.get(plan.plan_id) == before_plan
+    assert repo.get_current_step(plan.plan_id) == before_step
+    assert task_store.get_task(task.task_id) == before_task
+
+
 @pytest.mark.parametrize("delivery_status", ["pending", "delivering", "delivered", "quarantined"])
 def test_controlled_handoff_recovery_rejects_non_recovery_states(
     tmp_path: Path, delivery_status: str

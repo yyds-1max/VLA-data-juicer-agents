@@ -27,6 +27,7 @@ from vla_data_juicer_agents.navigation.plan_models import (
 from vla_data_juicer_agents.navigation.task_state import NavigationTask, utc_now
 from vla_data_juicer_agents.navigation.schema import initialize_navigation_schema
 from vla_data_juicer_agents.navigation.task_store import (
+    NavigationTaskNotCurrentError,
     SqliteNavigationTaskStore,
     authorize_navigation_task_write,
     navigation_targets_overlap,
@@ -772,12 +773,16 @@ class SqliteNavigationPlanRepository:
         connection = self._connect()
         try:
             connection.execute("BEGIN IMMEDIATE")
-            self._authorize_plan_write(
-                connection,
-                plan_id,
-                expected_web_session_id=expected_web_session_id,
-                expected_agentscope_session_id=expected_agentscope_session_id,
-            )
+            try:
+                self._authorize_plan_write(
+                    connection,
+                    plan_id,
+                    expected_web_session_id=expected_web_session_id,
+                    expected_agentscope_session_id=expected_agentscope_session_id,
+                )
+            except NavigationTaskNotCurrentError:
+                connection.rollback()
+                return StepClaimOutcome.NOT_CLAIMABLE
             candidate = connection.execute(
                 """
                 SELECT steps.status, tasks.task_id, tasks.dry_run, tasks.date,
@@ -799,29 +804,6 @@ class SqliteNavigationPlanRepository:
             ):
                 connection.rollback()
                 return StepClaimOutcome.NOT_CLAIMABLE
-
-            if (
-                expected_web_session_id is not None
-                or expected_agentscope_session_id is not None
-            ):
-                current_attempt = connection.execute(
-                    """SELECT task_id
-                       FROM navigation_tasks
-                       WHERE created_by_web_session_id IS ?
-                         AND agentscope_session_id IS ?
-                       ORDER BY created_at DESC, rowid DESC
-                       LIMIT 1""",
-                    (
-                        expected_web_session_id,
-                        expected_agentscope_session_id,
-                    ),
-                ).fetchone()
-                if (
-                    current_attempt is None
-                    or current_attempt["task_id"] != candidate["task_id"]
-                ):
-                    connection.rollback()
-                    return StepClaimOutcome.NOT_CLAIMABLE
 
             locking_actions = {
                 capability.tool_name
@@ -917,6 +899,7 @@ class SqliteNavigationPlanRepository:
     ) -> bool:
         """Atomically expose one pending external step as waiting for the user."""
         with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
             self._authorize_plan_write(
                 connection,
                 plan_id,
@@ -1678,7 +1661,8 @@ class SqliteNavigationPlanRepository:
             connection.execute("BEGIN IMMEDIATE")
             row = connection.execute(
                 """SELECT handoffs.status, handoffs.delivery_status,
-                          handoffs.task_id, tasks.created_by_web_session_id
+                          handoffs.task_id, tasks.created_by_web_session_id,
+                          tasks.agentscope_session_id
                    FROM navigation_human_decision_handoffs AS handoffs
                    JOIN navigation_tasks AS tasks ON tasks.task_id = handoffs.task_id
                    WHERE handoffs.plan_id = ? AND handoffs.step_id = ?""",
@@ -1690,6 +1674,12 @@ class SqliteNavigationPlanRepository:
                 raise ActivePlanExecutionConflict(
                     "human handoff does not belong to the requested Web session"
                 )
+            authorize_navigation_task_write(
+                connection,
+                row["task_id"],
+                expected_web_session_id=expected_web_session_id,
+                expected_agentscope_session_id=row["agentscope_session_id"],
+            )
             if (
                 row["status"] != "recovery_required"
                 or row["delivery_status"] != "recovery_required"

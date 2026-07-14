@@ -119,14 +119,18 @@ class NavigationTaskStateRevisionError(RuntimeError):
     pass
 
 
+class NavigationTaskNotCurrentError(PermissionError):
+    pass
+
+
 def authorize_navigation_task_write(
     connection: sqlite3.Connection,
     task_id: str,
     *,
-    expected_web_session_id: str,
-    expected_agentscope_session_id: str,
+    expected_web_session_id: str | None,
+    expected_agentscope_session_id: str | None,
 ) -> None:
-    """Reject writes to an owned task unless the exact durable session is supplied."""
+    """Fence writes to the newest task for one exact durable session pair."""
     if connection.execute(
         "SELECT 1 FROM sqlite_master WHERE type='table' AND name='navigation_tasks'"
     ).fetchone() is None:
@@ -139,9 +143,20 @@ def authorize_navigation_task_write(
     if row is None:
         return
     durable = (row["created_by_web_session_id"], row["agentscope_session_id"])
-    if durable == (expected_web_session_id, expected_agentscope_session_id):
-        return
-    raise PermissionError("navigation task session mismatch")
+    expected = (expected_web_session_id, expected_agentscope_session_id)
+    if durable != expected:
+        raise PermissionError("navigation task session mismatch")
+    current = connection.execute(
+        """SELECT task_id
+           FROM navigation_tasks
+           WHERE created_by_web_session_id IS ?
+             AND agentscope_session_id IS ?
+           ORDER BY created_at DESC, rowid DESC
+           LIMIT 1""",
+        expected,
+    ).fetchone()
+    if current is None or current["task_id"] != task_id:
+        raise NavigationTaskNotCurrentError("navigation task session mismatch")
 
 
 class SqliteNavigationTaskStore:
@@ -378,14 +393,32 @@ class SqliteNavigationTaskStore:
         self, task_id: str, *, expected_state_revision: int,
         expected_web_session_id: str | None, expected_agentscope_session_id: str | None,
     ) -> bool:
-        with self._connect() as connection:
+        connection = self._connect()
+        try:
+            connection.execute("BEGIN IMMEDIATE")
+            try:
+                authorize_navigation_task_write(
+                    connection,
+                    task_id,
+                    expected_web_session_id=expected_web_session_id,
+                    expected_agentscope_session_id=expected_agentscope_session_id,
+                )
+            except PermissionError:
+                connection.rollback()
+                return False
             cursor = connection.execute(
                 """DELETE FROM navigation_tasks WHERE task_id=? AND state_revision=?
                 AND created_by_web_session_id IS ? AND agentscope_session_id IS ?""",
                 (task_id, expected_state_revision, expected_web_session_id,
                  expected_agentscope_session_id),
             )
-        return cursor.rowcount == 1
+            connection.commit()
+            return cursor.rowcount == 1
+        except Exception:
+            connection.rollback()
+            raise
+        finally:
+            connection.close()
 
     def _insert_task(self, connection: sqlite3.Connection, task: NavigationTask) -> None:
         connection.execute(

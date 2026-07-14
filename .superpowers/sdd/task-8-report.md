@@ -107,3 +107,24 @@ acceptance is a later, separately approved operation.
 - `tests/test_web_agentscope_session.py`
 - `docs/navigation-plan-server-acceptance.md`
 - `.superpowers/sdd/task-8-report.md`
+
+## Final Current-Attempt Fence Remediation
+
+Final whole-branch review found that a planning toolkit captured for Attempt A
+could still write after the same Web/AgentScope pair created a newer,
+different-target Attempt B. The shared authorization helper verified A's stored
+session identity but did not reselect the pair's current Attempt.
+
+TDD regressions now cover captured inspection, guidance, both submission tools,
+submission audit/activation, human-decision TOCTOU, controlled handoff recovery,
+evidence cleanup, and task-start compensation. Every attempt-bound write now
+runs the shared exact-pair/current-task fence under `BEGIN IMMEDIATE`, ordered by
+`created_at DESC, rowid DESC`. Stale public tool paths return bounded session
+mismatch/False results and leave task, observation, evidence, audit, Plan,
+ledger, outbox, and handoff state unchanged. Exact retry of the same current
+Attempt and wrong/omitted-identity behavior remain compatible.
+
+Remediation verification: focused navigation modules `219 passed`; full Python
+suite `770 passed` with the same pre-existing warning; compileall and diff check
+passed; all three final dead-reference searches returned no matches. No frontend
+files changed, so the frontend suite/build was not rerun for this remediation.

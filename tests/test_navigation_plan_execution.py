@@ -1227,6 +1227,194 @@ def test_old_wrapper_cannot_claim_after_same_session_creates_new_current_attempt
     assert plan_store.get_current_step(plan.plan_id)["step"]["status"] == "pending"
 
 
+def test_human_decision_write_rechecks_current_attempt_after_preflight(
+    monkeypatch,
+    tmp_path,
+):
+    settings = NavigationSettings(
+        vladatasets_root=tmp_path / "datasets",
+        processing_root=tmp_path / "processing",
+    )
+    source = "NoobScenes/params/observed/sensors"
+    (settings.processing_root / source).mkdir(parents=True)
+    db_path = tmp_path / "navigation.sqlite"
+    task_store = SqliteNavigationTaskStore(db_path)
+    owner, agent = "web-owner", "web-owner-agent"
+    task = _create_task(
+        task_store,
+        date="20260710",
+        segments=["segment-a"],
+        scene_mode="out",
+        dry_run=True,
+        web_session_id=owner,
+        agentscope_session_id=agent,
+    )
+    evidence_store = FileNavigationEvidenceStore(tmp_path / "evidence")
+    observation = SqliteNavigationObservationStore(db_path).append(
+        task.task_id,
+        "calibration_inventory",
+        [CalibrationInventoryObservation(sensor_sources=[source])],
+        [],
+        evidence_store,
+        expected_web_session_id=owner,
+        expected_agentscope_session_id=agent,
+    )
+    plan_store = SqliteNavigationPlanRepository(db_path)
+    plan = _activate_plan(
+        plan_store,
+        task,
+        "finish_processing",
+        observation.revision,
+        finish_plan(source),
+        expected_web_session_id=owner,
+        expected_agentscope_session_id=agent,
+    )
+    assert plan_execution.prepare_plan_human_decision(
+        task=task,
+        plan_store=plan_store,
+        evidence_store=evidence_store,
+        settings=settings,
+        plan_id=plan.plan_id,
+        step_id="confirm",
+        expected_web_session_id=owner,
+        expected_agentscope_session_id=agent,
+    ) is None
+    before_plan = plan_store.get(plan.plan_id)
+    before_step = plan_store.get_current_step(plan.plan_id)
+    before_task = task_store.get_task(task.task_id)
+    original_stage = plan_store.stage_human_decision_handoff
+    created = []
+
+    def create_new_attempt_then_stage(*args, **kwargs):
+        created.append(
+            task_store.create_task_attempt(
+                request="process B",
+                target="20260711",
+                date="20260711",
+                segments=["segment-b"],
+                scene_mode=None,
+                dry_run=True,
+                web_session_id=owner,
+                agentscope_session_id=agent,
+            ).task
+        )
+        return original_stage(*args, **kwargs)
+
+    monkeypatch.setattr(
+        plan_store,
+        "stage_human_decision_handoff",
+        create_new_attempt_then_stage,
+    )
+
+    result = plan_execution.submit_plan_human_decision(
+        plan_store=plan_store,
+        evidence_store=evidence_store,
+        plan_id=plan.plan_id,
+        step_id="confirm",
+        decision={"action": "confirm", "request_id": "decision-1"},
+        expected_web_session_id=owner,
+        expected_agentscope_session_id=agent,
+    )
+
+    assert result is False
+    assert len(created) == 1
+    assert task_store.find_by_session(
+        web_session_id=owner,
+        agentscope_session_id=agent,
+    ).task_id == created[0].task_id
+    assert plan_store.get_human_decision_handoff(plan.plan_id, "confirm") is None
+    assert plan_store.get_staged_step_result(plan.plan_id, "confirm") is None
+    assert plan_store.get(plan.plan_id) == before_plan
+    assert plan_store.get_current_step(plan.plan_id) == before_step
+    assert task_store.get_task(task.task_id) == before_task
+
+
+def test_human_decision_retry_cleans_evidence_when_attempt_changes_before_write(
+    monkeypatch,
+    tmp_path,
+):
+    settings = NavigationSettings(
+        vladatasets_root=tmp_path / "datasets",
+        processing_root=tmp_path / "processing",
+    )
+    source = "NoobScenes/params/observed/sensors"
+    source_path = settings.processing_root / source
+    source_path.mkdir(parents=True)
+    db_path = tmp_path / "navigation.sqlite"
+    task_store = SqliteNavigationTaskStore(db_path)
+    owner, agent = "web-owner", "web-owner-agent"
+    task = _create_task(
+        task_store,
+        date="20260710",
+        segments=["segment-a"],
+        scene_mode="out",
+        dry_run=True,
+        web_session_id=owner,
+        agentscope_session_id=agent,
+    )
+    evidence_store = FileNavigationEvidenceStore(tmp_path / "evidence")
+    observation = SqliteNavigationObservationStore(db_path).append(
+        task.task_id,
+        "calibration_inventory",
+        [CalibrationInventoryObservation(sensor_sources=[source])],
+        [],
+        evidence_store,
+        expected_web_session_id=owner,
+        expected_agentscope_session_id=agent,
+    )
+    plan_store = SqliteNavigationPlanRepository(db_path)
+    plan = _activate_plan(
+        plan_store,
+        task,
+        "finish_processing",
+        observation.revision,
+        finish_plan(source),
+        expected_web_session_id=owner,
+        expected_agentscope_session_id=agent,
+    )
+    arguments = {
+        "task": task,
+        "plan_store": plan_store,
+        "evidence_store": evidence_store,
+        "settings": settings,
+        "plan_id": plan.plan_id,
+        "step_id": "confirm",
+        "expected_web_session_id": owner,
+        "expected_agentscope_session_id": agent,
+    }
+    assert plan_execution.prepare_plan_human_decision(**arguments) is None
+    before_step = plan_store.get_current_step(plan.plan_id)
+    source_path.rmdir()
+    original_write = evidence_store.write
+    created = []
+
+    def create_new_attempt_then_write(*args, **kwargs):
+        created.append(
+            task_store.create_task_attempt(
+                request="process B",
+                target="20260711",
+                date="20260711",
+                segments=["segment-b"],
+                scene_mode=None,
+                dry_run=True,
+                web_session_id=owner,
+                agentscope_session_id=agent,
+            ).task
+        )
+        return original_write(*args, **kwargs)
+
+    monkeypatch.setattr(evidence_store, "write", create_new_attempt_then_write)
+
+    result = plan_execution.prepare_plan_human_decision(**arguments)
+
+    assert result is not None
+    assert result["error_type"] == "navigation_task_session_mismatch"
+    assert len(created) == 1
+    assert plan_store.get_current_step(plan.plan_id) == before_step
+    assert plan_store.get_human_decision_handoff(plan.plan_id, "confirm") is None
+    assert list((evidence_store.root / task.task_id).rglob("*.json")) == []
+
+
 def test_superseded_plan_cannot_claim_pending_step(tmp_path):
     services = build_services(tmp_path)
     old_plan = services.plan

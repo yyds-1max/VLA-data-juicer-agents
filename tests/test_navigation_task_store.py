@@ -694,6 +694,46 @@ def test_new_task_cleanup_delete_is_state_revision_cas(monkeypatch, tmp_path: Pa
     assert store.get_task(created.task_id) == updated
 
 
+def test_new_task_cleanup_cannot_delete_an_attempt_after_a_newer_one_exists(
+    tmp_path: Path,
+):
+    store = SqliteNavigationTaskStore(tmp_path / "tasks.sqlite")
+    old = store.create_task_attempt(
+        request="Process A",
+        target="20270623",
+        date="20270623",
+        segments=None,
+        scene_mode=None,
+        dry_run=False,
+        web_session_id="web-owner",
+        agentscope_session_id="as-owner",
+    ).task
+    current = store.create_task_attempt(
+        request="Process B",
+        target="20270624",
+        date="20270624",
+        segments=None,
+        scene_mode=None,
+        dry_run=False,
+        web_session_id="web-owner",
+        agentscope_session_id="as-owner",
+    ).task
+
+    deleted = store.delete_task_if_current(
+        old.task_id,
+        expected_state_revision=old.state_revision,
+        expected_web_session_id="web-owner",
+        expected_agentscope_session_id="as-owner",
+    )
+
+    assert deleted is False
+    assert store.get_task(old.task_id) == old
+    assert store.find_by_session(
+        web_session_id="web-owner",
+        agentscope_session_id="as-owner",
+    ).task_id == current.task_id
+
+
 def test_incompatible_navigation_schema_requires_reset_without_mutation(
     tmp_path: Path,
 ):

@@ -125,6 +125,14 @@ def _compact_error(error_type: str, message: str, **details: Any) -> dict[str, A
     return result
 
 
+def _session_mismatch_error() -> dict[str, Any]:
+    return _compact_error(
+        "navigation_task_session_mismatch",
+        "The bound navigation task is no longer the current attempt for this session.",
+        next_action="inspect_current_navigation_task",
+    )
+
+
 def _calibration_source_path(
     selected_sensor_source: str,
     settings: NavigationSettings,
@@ -359,12 +367,22 @@ def _record_changed_preconditions(
         failure,
         f"Input precondition changed before {step.step_id}",
     )
-    plan_store.mark_needs_replan(
-        plan.plan_id,
-        "input_precondition_changed",
-        expected_web_session_id=expected_web_session_id,
-        expected_agentscope_session_id=expected_agentscope_session_id,
-    )
+    try:
+        transitioned = plan_store.mark_needs_replan(
+            plan.plan_id,
+            "input_precondition_changed",
+            expected_web_session_id=expected_web_session_id,
+            expected_agentscope_session_id=expected_agentscope_session_id,
+        )
+    except PermissionError:
+        evidence_store.delete(task.task_id, descriptor.ref)
+        return _session_mismatch_error()
+    except Exception:
+        evidence_store.delete(task.task_id, descriptor.ref)
+        raise
+    if not transitioned:
+        evidence_store.delete(task.task_id, descriptor.ref)
+        return _terminal_error(plan_store, plan.plan_id)
     return _compact_error(
         "input_precondition_changed",
         "A concrete input required by the accepted plan changed before execution.",
@@ -572,6 +590,7 @@ def _finalize_staged_result(
     result_ref = staged.result_ref
     if result_ref is None:
         return _result_finalize_retry_error()
+    wrote_evidence = False
     try:
         if not evidence_store.exists(task.task_id, result_ref):
             evidence_store.write(
@@ -583,13 +602,22 @@ def _finalize_staged_result(
                 f"Execution result for {step.step_id}",
                 ref=result_ref,
             )
+            wrote_evidence = True
         if not plan_store.attach_staged_result_evidence(
             plan.plan_id, step.step_id, result_ref,
             expected_web_session_id=expected_web_session_id,
             expected_agentscope_session_id=expected_agentscope_session_id,
         ):
+            if wrote_evidence:
+                evidence_store.delete(task.task_id, result_ref)
             return _result_finalize_retry_error()
+    except PermissionError:
+        if wrote_evidence:
+            evidence_store.delete(task.task_id, result_ref)
+        return _session_mismatch_error()
     except Exception:
+        if wrote_evidence:
+            evidence_store.delete(task.task_id, result_ref)
         return _result_finalize_retry_error()
     try:
         finalized = plan_store.finalize_staged_step(
@@ -722,11 +750,7 @@ def _invoke_plan_step(
             agentscope_session_id=expected_agentscope_session_id,
             task_id=task.task_id,
         ) is None:
-            return _compact_error(
-                "navigation_task_session_mismatch",
-                "The bound navigation task is no longer the current attempt for this session.",
-                next_action="inspect_current_navigation_task",
-            )
+            return _session_mismatch_error()
         return _terminal_error(plan_store, plan.plan_id)
 
     try:
@@ -895,19 +919,27 @@ def prepare_plan_human_decision(
                 precondition_failure,
                 f"Input precondition changed before {step.step_id} retry",
             )
-            anchored = plan_store.mark_human_decision_recovery_required(
-                plan.plan_id,
-                step.step_id,
-                reason_code="input_precondition_changed",
-                request_anchor={
-                    "plan_id": plan.plan_id,
-                    "request_state": "waiting_user",
-                    "step_id": step.step_id,
-                },
-                expected_web_session_id=expected_web_session_id,
-                expected_agentscope_session_id=expected_agentscope_session_id,
-            )
+            try:
+                anchored = plan_store.mark_human_decision_recovery_required(
+                    plan.plan_id,
+                    step.step_id,
+                    reason_code="input_precondition_changed",
+                    request_anchor={
+                        "plan_id": plan.plan_id,
+                        "request_state": "waiting_user",
+                        "step_id": step.step_id,
+                    },
+                    expected_web_session_id=expected_web_session_id,
+                    expected_agentscope_session_id=expected_agentscope_session_id,
+                )
+            except PermissionError:
+                evidence_store.delete(durable_task.task_id, descriptor.ref)
+                return _session_mismatch_error()
+            except Exception:
+                evidence_store.delete(durable_task.task_id, descriptor.ref)
+                raise
             if not anchored:
+                evidence_store.delete(durable_task.task_id, descriptor.ref)
                 return _terminal_error(plan_store, plan.plan_id)
             return _compact_error(
                 "input_precondition_changed",
@@ -929,13 +961,17 @@ def prepare_plan_human_decision(
         )
     if waiting_user:
         return None
-    if not plan_store.mark_waiting_user(
-        plan.plan_id,
-        step.step_id,
-        step.action,
-        expected_web_session_id=expected_web_session_id,
-        expected_agentscope_session_id=expected_agentscope_session_id,
-    ):
+    try:
+        marked_waiting = plan_store.mark_waiting_user(
+            plan.plan_id,
+            step.step_id,
+            step.action,
+            expected_web_session_id=expected_web_session_id,
+            expected_agentscope_session_id=expected_agentscope_session_id,
+        )
+    except PermissionError:
+        return _session_mismatch_error()
+    if not marked_waiting:
         return _terminal_error(plan_store, plan.plan_id)
     return None
 
@@ -1002,17 +1038,20 @@ def submit_plan_human_decision(
         dependencies = plan_store.dependency_statuses(plan_id, list(step.depends_on))
         if any(dependencies.get(dependency) != "completed" for dependency in step.depends_on):
             return False
-    outcome = plan_store.stage_human_decision_handoff(
-        plan_id,
-        step_id,
-        decision_key=decision_key,
-        decision=normalized_decision,
-        target_status="completed" if payload["ok"] else "failed",
-        full_result=payload,
-        result_summary=_result_summary(payload),
-        expected_web_session_id=expected_web_session_id,
-        expected_agentscope_session_id=expected_agentscope_session_id,
-    )
+    try:
+        outcome = plan_store.stage_human_decision_handoff(
+            plan_id,
+            step_id,
+            decision_key=decision_key,
+            decision=normalized_decision,
+            target_status="completed" if payload["ok"] else "failed",
+            full_result=payload,
+            result_summary=_result_summary(payload),
+            expected_web_session_id=expected_web_session_id,
+            expected_agentscope_session_id=expected_agentscope_session_id,
+        )
+    except PermissionError:
+        return False
     if outcome == "conflict":
         return False
     if plan_store.get_staged_step_result(plan_id, step_id) is None:

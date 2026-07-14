@@ -959,6 +959,105 @@ def test_new_attempt_for_same_session_revokes_all_tools_from_previous_attempt(
     assert services.plan_store.get_active_for_task(task_b.task_id) is None
 
 
+def test_new_attempt_fences_every_mutating_tool_from_captured_planning_toolkit(
+    tmp_path,
+):
+    services, task_a, built = _resolver_services_from_complete(tmp_path)
+    tools_a = {
+        tool.name: tool
+        for tool in resolve_navigation_agent_tools(
+            services=services,
+            agentscope_session_id="as-session-1",
+            web_session_id="as-session-1",
+            cancellation=None,
+        )
+    }
+    context = _decode_tool_payload(
+        asyncio.run(tools_a["get_navigation_task_context_tool"]())
+    )
+    task_b = services.task_store.create_task_attempt(
+        request="process a different navigation target",
+        target="20260711/20260711_120000",
+        date="20260711",
+        segments=["20260711_120000"],
+        scene_mode=None,
+        dry_run=True,
+        web_session_id="as-session-1",
+        agentscope_session_id="as-session-1",
+    ).task
+
+    def durable_rows():
+        with sqlite3.connect(services.task_store.db_path) as connection:
+            tables = [
+                row[0]
+                for row in connection.execute(
+                    "SELECT name FROM sqlite_master "
+                    "WHERE type = 'table' AND name LIKE 'navigation_%' "
+                    "ORDER BY name"
+                )
+            ]
+            return {
+                table: connection.execute(
+                    f'SELECT * FROM "{table}" ORDER BY rowid'
+                ).fetchall()
+                for table in tables
+            }
+
+    def evidence_files():
+        return {
+            str(path.relative_to(services.evidence_store.root)): path.read_bytes()
+            for path in services.evidence_store.root.rglob("*")
+            if path.is_file()
+        }
+
+    durable_before = durable_rows()
+    evidence_before = evidence_files()
+
+    extract = _decode_tool_payload(
+        asyncio.run(
+            tools_a["submit_extract_sync_plan_tool"](
+                planning_context_revision=context["planning_context_revision"],
+                plan=valid_extract_plan_payload(built),
+            )
+        )
+    )
+    finish = _decode_tool_payload(
+        asyncio.run(
+            tools_a["submit_finish_processing_plan_tool"](
+                planning_context_revision=context["planning_context_revision"],
+                plan={},
+            )
+        )
+    )
+    inspection = _decode_tool_payload(
+        asyncio.run(tools_a["inspect_navigation_artifact_state_tool"]())
+    )
+    guidance = _decode_tool_payload(
+        asyncio.run(
+            tools_a["record_navigation_user_guidance_tool"](
+                text="stale guidance must not be recorded",
+                scene_mode="out",
+            )
+        )
+    )
+
+    assert extract["ok"] is False
+    assert extract["error_type"] == "submission_audit_failed"
+    assert finish["ok"] is False
+    assert finish["error_type"] == "submission_audit_failed"
+    assert inspection["ok"] is False
+    assert inspection["error_type"] == "permission_error"
+    assert guidance["ok"] is False
+    assert guidance["error_type"] == "navigation_task_session_mismatch"
+    assert durable_rows() == durable_before
+    assert evidence_files() == evidence_before
+    assert services.task_store.find_by_session(
+        web_session_id="as-session-1",
+        agentscope_session_id="as-session-1",
+    ).task_id == task_b.task_id
+    assert services.plan_store.get_active_for_task(task_a.task_id) is None
+
+
 def test_exact_attempt_retry_keeps_the_same_current_task_authorized(tmp_path):
     services = build_navigation_services(tmp_path)
     arguments = {

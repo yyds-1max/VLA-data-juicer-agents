@@ -177,7 +177,7 @@ Remove task/profile/segment/attempt backfill and table-rebuild migrations that e
 
 - [ ] **Step 4: Implement `create_task_attempt` and immutable session identity**
 
-`create_task_attempt` uses one `BEGIN IMMEDIATE` transaction: select the exact Web/AgentScope/date/segments/target tuple and return it as `created=False`, otherwise insert. The composite unique replay index closes concurrent handoff races without forbidding a different later target in the same session. `find_by_session` returns the newest attempt for the exact verified pair. `authorize_navigation_task_write` compares only `created_by_web_session_id` and `agentscope_session_id`; there is no `latest_web_session_id` and no rebind operation.
+`create_task_attempt` uses one `BEGIN IMMEDIATE` transaction: select the exact Web/AgentScope/date/segments/target tuple and return it as `created=False`, otherwise insert. The composite unique replay index closes concurrent handoff races without forbidding a different later target in the same session. `find_by_session` returns the newest attempt for the exact verified pair. Every attempt-bound write runs under `BEGIN IMMEDIATE`; `authorize_navigation_task_write` verifies the exact `created_by_web_session_id`/`agentscope_session_id` pair and reselects that pair's newest row by `created_at DESC, rowid DESC`, rejecting a captured older Attempt before any durable or evidence mutation. There is no `latest_web_session_id` and no rebind operation.
 
 - [ ] **Step 5: Introduce the narrow running-writer query**
 
