@@ -297,6 +297,15 @@ function applyDataPilotCustomEvent(
   envelope: PublicEventEnvelope,
   event: CustomEvent,
 ): void {
+  if (event.name === "datapilot_run_terminal") {
+    if (state.currentReplyId) {
+      return;
+    }
+    state.phase = state.phase === "interrupting" && hasRunningTool(state)
+      ? "interrupting"
+      : "idle";
+    return;
+  }
   if (event.name === "datapilot_tool_terminal") {
     projectTerminalTool(state, envelope, event);
     return;

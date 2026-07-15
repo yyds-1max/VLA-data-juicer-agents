@@ -73,8 +73,26 @@ class CreateTurnRequest(BaseModel):
         return message
 
 
+class CreateSessionRequest(CreateTurnRequest):
+    creation_id: str = Field(
+        min_length=14,
+        max_length=128,
+        pattern=r"^local-create-[A-Za-z0-9-]+$",
+    )
+
+
+class SubmitTurnRequest(CreateTurnRequest):
+    message_id: str = Field(
+        min_length=8,
+        max_length=128,
+        pattern=r"^local-[A-Za-z0-9-]+$",
+    )
+
+
 class CreateTurnResponse(BaseModel):
     turn_id: str
+    replayed: bool = False
+    terminal: bool = False
 
 
 class InterruptResponse(BaseModel):

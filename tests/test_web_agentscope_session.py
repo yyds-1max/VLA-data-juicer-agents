@@ -2,6 +2,7 @@ import asyncio
 import hashlib
 import json
 import sqlite3
+import threading
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from types import SimpleNamespace
@@ -50,7 +51,11 @@ from vla_data_juicer_agents.runtime.agentscope_prompts import navigation_agent_p
 from vla_data_juicer_agents.runtime.navigation_tool_surface import (
     NavigationToolSurfaceMiddleware,
 )
-from vla_data_juicer_agents.web.agent_session import AgentScopeWebSessionManager
+from vla_data_juicer_agents.web.agent_session import (
+    AgentScopeWebSessionManager,
+    TurnSubmissionPending,
+    TurnSubmissionResult,
+)
 from vla_data_juicer_agents.web.app import create_app
 from vla_data_juicer_agents.web.event_stream import SessionEventBus
 from vla_data_juicer_agents.web.schemas import (
@@ -67,9 +72,19 @@ class FakeAgentScopeRuntime:
         self.turn_id = turn_id
         self.submissions: list[dict[str, str]] = []
 
-    async def submit_user_message(self, *, web_session_id: str, message: str) -> str:
+    async def submit_user_message(
+        self,
+        *,
+        web_session_id: str,
+        message: str,
+        message_id: str | None = None,
+        turn_id: str | None = None,
+        on_admitted=None,
+    ) -> str:
         self.submissions.append({"web_session_id": web_session_id, "message": message})
-        return self.turn_id
+        if on_admitted is not None:
+            on_admitted()
+        return turn_id or self.turn_id
 
 
 class StoreAwareAgentScopeRuntime(FakeAgentScopeRuntime):
@@ -86,7 +101,15 @@ class StoreAwareAgentScopeRuntime(FakeAgentScopeRuntime):
         self.web_event_publisher = publisher
 
 class RejectingAgentScopeRuntime(FakeAgentScopeRuntime):
-    async def submit_user_message(self, *, web_session_id: str, message: str) -> str:
+    async def submit_user_message(
+        self,
+        *,
+        web_session_id: str,
+        message: str,
+        message_id: str | None = None,
+        turn_id: str | None = None,
+        on_admitted=None,
+    ) -> str:
         self.submissions.append({"web_session_id": web_session_id, "message": message})
         raise RuntimeError("turn rejected")
 
@@ -1625,6 +1648,95 @@ async def test_runtime_persists_web_to_agentscope_session_mapping(tmp_path: Path
         agentscope_session_id,
     )
 
+
+@pytest.mark.asyncio
+async def test_standalone_ensure_rejects_deletion_before_agentscope_upsert(
+    tmp_path: Path,
+) -> None:
+    store = WebSessionStore(tmp_path / "ensure-deleting.sqlite")
+    web_session = store.create_session("deleting before ensure")
+    store.begin_session_deletion(web_session.id)
+    storage = FakeAgentScopeStorage()
+    runtime = _runtime(storage=storage, chat_run_registry=FakeChatRunRegistry())
+    runtime.set_web_session_store(store)
+
+    with pytest.raises(RuntimeError, match="session deletion is pending"):
+        await runtime.ensure_web_session(
+            web_session.id,
+            agent_id="navigation-data-agent",
+            model="qwen-navigation",
+        )
+
+    assert storage.sessions == []
+
+
+@pytest.mark.asyncio
+async def test_standalone_ensure_warm_cache_rechecks_deletion_fence(
+    tmp_path: Path,
+) -> None:
+    store = WebSessionStore(tmp_path / "warm-ensure-deleting.sqlite")
+    web_session = store.create_session("warm cache before deletion")
+    storage = FakeAgentScopeStorage()
+    runtime = _runtime(storage=storage, chat_run_registry=FakeChatRunRegistry())
+    runtime.set_web_session_store(store)
+    cached_session_id = await runtime.ensure_web_session(
+        web_session.id,
+        agent_id="navigation-data-agent",
+        model="qwen-navigation",
+    )
+    assert runtime.web_sessions[web_session.id] == (
+        "navigation-data-agent",
+        cached_session_id,
+    )
+
+    store.begin_session_deletion(web_session.id)
+
+    with pytest.raises(RuntimeError, match="session deletion is pending"):
+        await runtime.ensure_web_session(
+            web_session.id,
+            agent_id="navigation-data-agent",
+            model="qwen-navigation",
+        )
+
+    assert len(storage.sessions) == 1
+
+
+@pytest.mark.asyncio
+async def test_mapping_store_failure_does_not_delete_unproven_upsert_session(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class RecordingSessionService:
+        def __init__(self) -> None:
+            self.deleted: list[str] = []
+
+        async def delete_session(self, _user_id, _agent_id, session_id):
+            self.deleted.append(session_id)
+            return True
+
+    store = WebSessionStore(tmp_path / "mapping-write-failure.sqlite")
+    web_session = store.create_session("mapping write failure")
+    storage = FakeAgentScopeStorage()
+    runtime = _runtime(storage=storage, chat_run_registry=FakeChatRunRegistry())
+    session_service = RecordingSessionService()
+    runtime.app.state.session_service = session_service
+    runtime.set_web_session_store(store)
+
+    def fail_mapping(*_args, **_kwargs) -> None:
+        raise sqlite3.OperationalError("mapping store unavailable")
+
+    monkeypatch.setattr(store, "save_agentscope_session_mapping", fail_mapping)
+
+    with pytest.raises(sqlite3.OperationalError, match="mapping store unavailable"):
+        await runtime.ensure_web_session(
+            web_session.id,
+            agent_id="navigation-data-agent",
+            model="qwen-navigation",
+        )
+
+    assert len(storage.sessions) == 1
+    assert session_service.deleted == []
+
 def test_store_lists_all_agent_mappings_for_one_web_session(tmp_path: Path) -> None:
     store = WebSessionStore(tmp_path / "sessions.sqlite")
     first_session = store.create_session("first")
@@ -1924,6 +2036,70 @@ async def test_runtime_interrupt_web_session_cancels_background_registry_keys_on
         (MessageBusKeys.task_cancel_channel(), {"task_id": "shared-task"}),
         (MessageBusKeys.task_cancel_channel(), {"task_id": "bg-task-2"}),
     ]
+
+
+@pytest.mark.asyncio
+async def test_explicit_stop_releases_expired_turn_after_dead_owner_barrier(
+    tmp_path: Path,
+) -> None:
+    bus = AdmissionSharedBus()
+    runtime = _runtime(message_bus=bus)
+    store = WebSessionStore(tmp_path / "dead-owner-explicit-stop.sqlite")
+    session = store.create_session("dead owner")
+    internal_session_id = f"{session.id}__main-router-agent"
+    store.save_agentscope_session_mapping(
+        session.id,
+        agent_id="main-router-agent",
+        agentscope_session_id=internal_session_id,
+    )
+    store.begin_execution_generation(session.id)
+    store.claim_user_message(
+        session.id,
+        "local-dead-owner",
+        "run",
+        runtime_id="dead-runtime",
+        turn_id="turn_dead_owner",
+        ttl_seconds=30.0,
+    )
+    store.commit_user_message(
+        session.id,
+        "local-dead-owner",
+        "run",
+        runtime_id="dead-runtime",
+        ttl_seconds=30.0,
+    )
+    with sqlite3.connect(store.db_path) as connection:
+        connection.execute(
+            "UPDATE session_turn_admissions SET expires_at = 100 WHERE message_id = ?",
+            ("local-dead-owner",),
+        )
+    published = []
+    runtime.set_web_transport(store, lambda _session_id, record: published.append(record))
+
+    await runtime.start_stop_coordinator()
+    try:
+        result = await runtime.interrupt_web_session(web_session_id=session.id)
+    finally:
+        await runtime.stop_stop_coordinator()
+
+    assert result.interrupted is True
+    assert store.user_message_turn_status(session.id, "local-dead-owner") == "terminal"
+    terminal = [
+        record
+        for record in store.list_public_events(session.id)
+        if record.event.get("name") == "datapilot_run_terminal"
+    ]
+    assert len(terminal) == 1
+    assert terminal[0].event["value"]["status"] == "stopped"
+    assert terminal[0] in published
+    assert store.claim_user_message(
+        session.id,
+        "local-after-dead-owner",
+        "continue",
+        runtime_id="runtime-2",
+        turn_id="turn_after_dead_owner",
+        ttl_seconds=30.0,
+    ) == "claimed"
 
 
 @pytest.mark.asyncio
@@ -2715,12 +2891,12 @@ async def test_http_turn_response_waits_for_run_boundary_admission(
         transport=httpx.ASGITransport(app=app),
         base_url="http://test",
     ) as client:
-        created = await client.post("/api/sessions", json={"message": "start"})
+        created = await client.post("/api/sessions", json={"message": "start", "creation_id": "local-create-http-admission"})
         session_id = created.json()["session"]["id"]
         request = asyncio.create_task(
             client.post(
                 f"/api/sessions/{session_id}/turns",
-                json={"message": "start"},
+                json={"message": "start", "message_id": "local-http-admission-1"},
             )
         )
         await service.run_started.wait()
@@ -2731,12 +2907,308 @@ async def test_http_turn_response_waits_for_run_boundary_admission(
         service.allow_boundary.set()
         await service.boundary_entered.wait()
         response = await request
+        messages_after_admission = app.state.store.get_session(session_id).messages
         service.finish_run.set()
         await registry.drain()
 
     assert responded_before_admission is False
     assert messages_before_admission == []
     assert response.status_code == 200
+    assert [message.id for message in messages_after_admission] == [
+        "local-http-admission-1"
+    ]
+
+
+@pytest.mark.asyncio
+async def test_exact_message_commit_failure_blocks_model_handler(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    registry = AdmissionTaskRegistry()
+    service = BoundaryAdmissionChatService()
+    runtime = _runtime(chat_run_registry=None)
+    agentscope_app = FastAPI()
+    agentscope_app.state.chat_run_registry = registry
+    agentscope_app.state.chat_service = service
+    runtime.app = agentscope_app
+    service.runtime = runtime
+    app = create_app(
+        working_dir=str(tmp_path / "workspace"),
+        db_path=tmp_path / "failed-exact-commit.sqlite",
+        agentscope_runtime=runtime,
+    )
+
+    def fail_commit(*_args, **_kwargs):
+        raise sqlite3.OperationalError("exact message commit failed")
+
+    monkeypatch.setattr(app.state.store, "commit_user_message", fail_commit)
+
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app, raise_app_exceptions=False),
+        base_url="http://test",
+    ) as client:
+        created = await client.post("/api/sessions", json={"message": "start", "creation_id": "local-create-failed-commit"})
+        session_id = created.json()["session"]["id"]
+        request = asyncio.create_task(
+            client.post(
+                f"/api/sessions/{session_id}/turns",
+                json={
+                    "message": "must not execute",
+                    "message_id": "local-failed-exact-commit",
+                },
+            )
+        )
+        await service.run_started.wait()
+        service.allow_boundary.set()
+        response = await request
+        await registry.drain()
+
+    assert response.status_code == 500
+    assert service.boundary_entered.is_set() is False
+    assert service.runs == []
+    detail = app.state.store.get_session(session_id)
+    assert detail is not None
+    assert detail.messages == []
+    assert detail.events == []
+
+
+@pytest.mark.asyncio
+async def test_admitted_turn_heartbeat_failure_cancels_live_handler(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    registry = AdmissionTaskRegistry()
+    service = BoundaryAdmissionChatService()
+    runtime = _runtime(chat_run_registry=None)
+    runtime.app.state.chat_run_registry = registry
+    runtime.app.state.chat_service = service
+    runtime.admission_renew_interval_seconds = 0.01
+    service.runtime = runtime
+    store = WebSessionStore(tmp_path / "turn-heartbeat-failure.sqlite")
+    session = store.create_session("heartbeat failure")
+    manager = AgentScopeWebSessionManager(store=store, runtime=runtime)
+    service.allow_boundary.set()
+
+    result = await manager.submit_turn(
+        session.id,
+        "must cancel",
+        message_id="local-heartbeat-failure",
+    )
+    assert isinstance(result, TurnSubmissionResult)
+    await service.boundary_entered.wait()
+
+    def fail_renew(*_args, **_kwargs):
+        raise sqlite3.OperationalError("execution heartbeat unavailable")
+
+    monkeypatch.setattr(store, "renew_user_message", fail_renew)
+    await asyncio.wait_for(registry.drain(), timeout=0.5)
+    for _ in range(50):
+        detail = store.get_session(session.id)
+        if detail and any(
+            event.event.get("name") == "datapilot_run_terminal"
+            for event in detail.events
+        ):
+            break
+        await asyncio.sleep(0.01)
+
+    assert service.finish_run.is_set() is False
+    assert store.user_message_turn_status(
+        session.id,
+        "local-heartbeat-failure",
+    ) == "terminal"
+    detail = store.get_session(session.id)
+    assert detail is not None
+    terminal = [
+        event
+        for event in detail.events
+        if event.event.get("name") == "datapilot_run_terminal"
+    ]
+    assert len(terminal) == 1
+    assert terminal[0].event["value"]["status"] == "stopped"
+
+
+@pytest.mark.asyncio
+async def test_turn_fence_waits_for_real_background_worker_quiescence(
+    tmp_path: Path,
+) -> None:
+    class BackgroundWorkerChatService(BoundaryAdmissionChatService):
+        def __init__(self) -> None:
+            super().__init__()
+            self.worker_started = threading.Event()
+            self.release_worker = threading.Event()
+            self.background_tasks: list[asyncio.Task] = []
+
+        async def run(self, *, user_id, session_id, agent_id, input_msg):
+            self.run_started.set()
+            await self.allow_boundary.wait()
+            middleware = DataPilotRunBoundaryMiddleware(session_id, self.runtime)
+
+            async def handler(**_kwargs):
+                cancellation = current_cancellation()
+                assert cancellation is not None
+                worker_token = cancellation.reserve_worker()
+                await self.runtime.start_public_tool(
+                    session_id,
+                    tool_call_id="call-background-worker",
+                    tool_name="extract_and_sync",
+                )
+
+                def work() -> None:
+                    try:
+                        self.worker_started.set()
+                        assert self.release_worker.wait(timeout=2.0)
+                    finally:
+                        cancellation.finish_worker(worker_token)
+
+                async def finish_background_tool() -> None:
+                    worker_task = asyncio.create_task(asyncio.to_thread(work))
+                    try:
+                        await asyncio.shield(worker_task)
+                    finally:
+                        await self.runtime.finish_public_tool(
+                            session_id,
+                            tool_call_id="call-background-worker",
+                            status="success",
+                            summary="done",
+                            error_type=None,
+                        )
+
+                self.background_tasks.append(asyncio.create_task(finish_background_tool()))
+                self.boundary_entered.set()
+                yield ReplyStartEvent(
+                    session_id=session_id,
+                    reply_id="background-reply",
+                    name="MainRouterAgent",
+                )
+
+            async for _event in middleware.on_reply(
+                SimpleNamespace(name="MainRouterAgent"),
+                {"inputs": input_msg},
+                handler,
+            ):
+                pass
+            await super(BoundaryAdmissionChatService, self).run(
+                user_id=user_id,
+                session_id=session_id,
+                agent_id=agent_id,
+                input_msg=input_msg,
+            )
+
+    registry = AdmissionTaskRegistry()
+    service = BackgroundWorkerChatService()
+    runtime = _runtime(chat_run_registry=None)
+    runtime.app.state.chat_run_registry = registry
+    runtime.app.state.chat_service = service
+    service.runtime = runtime
+    service.allow_boundary.set()
+    store = WebSessionStore(tmp_path / "turn-background-quiescence.sqlite")
+    session = store.create_session("background quiescence")
+    manager = AgentScopeWebSessionManager(store=store, runtime=runtime)
+
+    first = await manager.submit_turn(
+        session.id,
+        "first",
+        message_id="local-background-first",
+    )
+    assert isinstance(first, TurnSubmissionResult)
+    await asyncio.to_thread(service.worker_started.wait, 0.5)
+    await registry.drain()
+
+    assert store.user_message_turn_status(
+        session.id,
+        "local-background-first",
+    ) == "admitted"
+    with pytest.raises(RuntimeError, match="still active"):
+        await manager.submit_turn(
+            session.id,
+            "second",
+            message_id="local-background-second",
+        )
+
+    service.release_worker.set()
+    await asyncio.gather(*service.background_tasks)
+    for _ in range(50):
+        if store.user_message_turn_status(
+            session.id,
+            "local-background-first",
+        ) == "terminal":
+            break
+        await asyncio.sleep(0.01)
+
+    assert store.user_message_turn_status(
+        session.id,
+        "local-background-first",
+    ) == "terminal"
+    second = await manager.submit_turn(
+        session.id,
+        "second",
+        message_id="local-background-second",
+    )
+    assert isinstance(second, TurnSubmissionResult)
+
+
+@pytest.mark.asyncio
+async def test_session_snapshot_does_not_unlock_expired_possibly_live_turn(
+    tmp_path: Path,
+) -> None:
+    runtime = _runtime()
+    app = create_app(
+        working_dir=str(tmp_path / "workspace"),
+        db_path=tmp_path / "snapshot-recovers-turn.sqlite",
+        agentscope_runtime=runtime,
+    )
+    store = app.state.store
+    session = store.create_session("recover crashed turn")
+    message_id = "local-snapshot-recovery"
+    turn_id = "turn_snapshot_recovery"
+    store.claim_user_message(
+        session.id,
+        message_id,
+        "run",
+        runtime_id=runtime.runtime_id,
+        turn_id=turn_id,
+        ttl_seconds=30.0,
+    )
+    store.commit_user_message(
+        session.id,
+        message_id,
+        "run",
+        runtime_id=runtime.runtime_id,
+        ttl_seconds=30.0,
+    )
+    reply_start = ReplyStartEvent(
+        session_id=f"{session.id}__main-router-agent",
+        reply_id="crashed-reply",
+        name="MainRouterAgent",
+    ).model_dump(mode="json")
+    store.append_public_event(
+        session.id,
+        hashlib.sha256(b"crashed-reply-start").hexdigest(),
+        reply_start,
+    )
+    with sqlite3.connect(store.db_path) as connection:
+        connection.execute(
+            "UPDATE session_turn_admissions SET expires_at = 100 WHERE message_id = ?",
+            (message_id,),
+        )
+
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app),
+        base_url="http://test",
+    ) as client:
+        async with app.state.bus.subscribe(session.id) as queue:
+            response = await client.get(f"/api/sessions/{session.id}")
+            with pytest.raises(TimeoutError):
+                await asyncio.wait_for(queue.get(), timeout=0.05)
+
+    assert response.status_code == 200
+    terminal_events = [
+        event
+        for event in response.json()["session"]["events"]
+        if event["event"].get("name") == "datapilot_run_terminal"
+    ]
+    assert terminal_events == []
+    assert store.user_message_turn_status(session.id, message_id) == "admitted"
 
 
 @pytest.mark.asyncio
@@ -2911,6 +3383,71 @@ async def test_owner_publish_failure_cancels_run_and_rejects_submission(
     assert store.current_execution_generation(session.id) == 0
     assert detail is not None
     assert detail.messages == []
+
+
+@pytest.mark.asyncio
+async def test_delete_rereads_mappings_after_remote_quiescence(
+    tmp_path: Path,
+) -> None:
+    class RecordingSessionService:
+        def __init__(self) -> None:
+            self.deleted: list[tuple[str, str]] = []
+
+        async def delete_session(self, _user_id, agent_id, session_id):
+            self.deleted.append((agent_id, session_id))
+            return True
+
+    class NavigationControl:
+        def delete_control_state_for_web_session(self, _web_session_id: str) -> None:
+            return None
+
+    store = WebSessionStore(tmp_path / "delete-late-mapping.sqlite")
+    session = store.create_session("delete late mapping")
+    store.save_agentscope_session_mapping(
+        session.id,
+        agent_id="main-router-agent",
+        agentscope_session_id="router-session",
+    )
+    runtime = _runtime(
+        chat_run_registry=FakeChatRunRegistry(),
+        message_bus=FakeAgentScopeMessageBus(),
+    )
+    session_service = RecordingSessionService()
+    runtime.app.state.session_service = session_service
+    runtime._navigation_services = lambda: NavigationControl()
+    runtime.set_web_session_store(store)
+    runtime.stop_coordinator = SimpleNamespace(started=True)
+
+    async def quiesce_then_publish_late_mapping(*, web_session_id: str):
+        assert web_session_id == session.id
+        # Simulate a legacy/external writer that bypassed the new store fence and
+        # committed while distributed cancellation was reaching quiescence.
+        with sqlite3.connect(store.db_path) as connection:
+            connection.execute(
+                """
+                INSERT INTO agentscope_sessions (
+                    web_session_id, agent_id, agentscope_session_id,
+                    active, updated_at
+                ) VALUES (?, ?, ?, 1, ?)
+                """,
+                (
+                    session.id,
+                    "late-navigation-agent",
+                    "late-navigation-session",
+                    "2026-07-15T00:00:00.000+00:00",
+                ),
+            )
+        return InterruptResponse(interrupted=True)
+
+    runtime._interrupt_web_session_serialized = quiesce_then_publish_late_mapping
+
+    deleted = await runtime.delete_web_session(session.id)
+
+    assert deleted is True
+    assert set(session_service.deleted) == {
+        ("main-router-agent", "router-session"),
+        ("late-navigation-agent", "late-navigation-session"),
+    }
 
 
 @pytest.mark.asyncio
@@ -4923,13 +5460,116 @@ async def test_submit_turn_appends_user_message_calls_runtime_and_returns_turn_i
     manager = AgentScopeWebSessionManager(store=store, runtime=runtime)
     session = await manager.create_session("处理 20270605")
 
-    turn_id = await manager.submit_turn(session.id, "开始处理")
+    turn_id = await manager.submit_turn(
+        session.id,
+        "开始处理",
+        message_id="local-message-1",
+    )
 
-    assert turn_id == "turn_agentscope_1"
+    assert isinstance(turn_id, TurnSubmissionResult)
+    assert turn_id.turn_id.startswith("turn_")
+    assert turn_id.replayed is False
     assert runtime.submissions == [{"web_session_id": session.id, "message": "开始处理"}]
     detail = store.get_session(session.id)
     assert detail is not None
+    assert detail.messages[0].id == "local-message-1"
     assert [(message.role, message.content) for message in detail.messages] == [("user", "开始处理")]
+
+
+@pytest.mark.asyncio
+async def test_submit_turn_duplicate_message_id_is_409_style_without_second_run(
+    tmp_path: Path,
+) -> None:
+    store = WebSessionStore(tmp_path / "duplicate-message.sqlite")
+    runtime = FakeAgentScopeRuntime(turn_id="turn_agentscope_1")
+    manager = AgentScopeWebSessionManager(store=store, runtime=runtime)
+    session = await manager.create_session("duplicate message")
+
+    first_turn_id = await manager.submit_turn(
+        session.id,
+        "same text",
+        message_id="local-duplicate-1",
+    )
+    replayed_turn_id = await manager.submit_turn(
+        session.id,
+        "same text",
+        message_id="local-duplicate-1",
+    )
+
+    assert isinstance(first_turn_id, TurnSubmissionResult)
+    assert isinstance(replayed_turn_id, TurnSubmissionResult)
+    assert replayed_turn_id.turn_id == first_turn_id.turn_id
+    assert replayed_turn_id.replayed is True
+    assert len(runtime.submissions) == 1
+    store.finish_user_message_turn_with_event(
+        session.id,
+        "local-duplicate-1",
+        turn_id=first_turn_id.turn_id,
+        terminal_status="success",
+    )
+    terminal_replay = await manager.submit_turn(
+        session.id,
+        "same text",
+        message_id="local-duplicate-1",
+    )
+    assert isinstance(terminal_replay, TurnSubmissionResult)
+    assert terminal_replay.replayed is True
+    assert terminal_replay.terminal is True
+    assert len(runtime.submissions) == 1
+    detail = store.get_session(session.id)
+    assert detail is not None
+    assert [message.id for message in detail.messages] == ["local-duplicate-1"]
+
+
+@pytest.mark.asyncio
+async def test_submit_turn_live_duplicate_is_explicitly_pending_without_second_run(
+    tmp_path: Path,
+) -> None:
+    store = WebSessionStore(tmp_path / "pending-message.sqlite")
+    runtime = FakeAgentScopeRuntime()
+    manager = AgentScopeWebSessionManager(store=store, runtime=runtime)
+    session = await manager.create_session("pending message")
+    store.claim_user_message(
+        session.id,
+        "local-pending-1",
+        "same request",
+        runtime_id="other-runtime",
+        turn_id="turn_pending",
+        ttl_seconds=30.0,
+    )
+
+    with pytest.raises(TurnSubmissionPending):
+        await manager.submit_turn(
+            session.id,
+            "same request",
+            message_id="local-pending-1",
+        )
+
+    assert runtime.submissions == []
+
+
+@pytest.mark.asyncio
+async def test_submit_turn_same_message_id_with_different_content_is_conflict(
+    tmp_path: Path,
+) -> None:
+    store = WebSessionStore(tmp_path / "conflicting-message.sqlite")
+    runtime = FakeAgentScopeRuntime()
+    manager = AgentScopeWebSessionManager(store=store, runtime=runtime)
+    session = await manager.create_session("conflicting message")
+    await manager.submit_turn(
+        session.id,
+        "original",
+        message_id="local-content-conflict",
+    )
+
+    with pytest.raises(RuntimeError, match="different content"):
+        await manager.submit_turn(
+            session.id,
+            "changed",
+            message_id="local-content-conflict",
+        )
+
+    assert len(runtime.submissions) == 1
 
 
 @pytest.mark.asyncio
@@ -4963,12 +5603,31 @@ async def test_submit_turn_rejection_does_not_append_user_message(tmp_path: Path
     session = await manager.create_session("处理 20270605")
 
     with pytest.raises(RuntimeError, match="turn rejected"):
-        await manager.submit_turn(session.id, "开始处理")
+        await manager.submit_turn(
+            session.id,
+            "开始处理",
+            message_id="local-retry-after-rejection",
+        )
 
     assert runtime.submissions == [{"web_session_id": session.id, "message": "开始处理"}]
     detail = store.get_session(session.id)
     assert detail is not None
     assert detail.messages == []
+
+    accepted = FakeAgentScopeRuntime(turn_id="turn-retry")
+    manager._runtime = accepted
+    retry_turn_id = await manager.submit_turn(
+        session.id,
+        "开始处理",
+        message_id="local-retry-after-rejection",
+    )
+    assert isinstance(retry_turn_id, TurnSubmissionResult)
+    assert retry_turn_id.turn_id.startswith("turn_")
+    detail = store.get_session(session.id)
+    assert detail is not None
+    assert [message.id for message in detail.messages] == [
+        "local-retry-after-rejection"
+    ]
 
 
 @pytest.mark.asyncio

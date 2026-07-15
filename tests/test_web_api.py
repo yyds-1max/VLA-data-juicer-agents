@@ -180,7 +180,7 @@ def make_deletion_client(
 def test_create_session_returns_title(tmp_path: Path):
     client = make_client(tmp_path)
 
-    response = client.post("/api/sessions", json={"message": "处理 20270605 的室外导航数据"})
+    response = client.post("/api/sessions", json={"message": "处理 20270605 的室外导航数据", "creation_id": "local-create-api-1"})
 
     assert response.status_code == 200
     body = response.json()
@@ -189,14 +189,53 @@ def test_create_session_returns_title(tmp_path: Path):
     assert FakeController.created[0].started is True
 
 
+def test_create_session_replays_same_client_creation_id(tmp_path: Path):
+    client = make_client(tmp_path)
+    payload = {
+        "message": "处理 20270605 的室外导航数据",
+        "creation_id": "local-create-lost-response",
+    }
+
+    first = client.post("/api/sessions", json=payload)
+    replay = client.post("/api/sessions", json=payload)
+    conflict = client.post(
+        "/api/sessions",
+        json={
+            "message": "different first intent",
+            "creation_id": payload["creation_id"],
+        },
+    )
+
+    assert first.status_code == 200
+    assert replay.status_code == 200
+    assert replay.json()["session"] == first.json()["session"]
+    assert conflict.status_code == 409
+    assert len(client.get("/api/sessions").json()["sessions"]) == 1
+
+
 def test_submit_turn_returns_turn_id(tmp_path: Path):
     client = make_client(tmp_path)
     session_id = _create_session(client)
 
-    response = client.post(f"/api/sessions/{session_id}/turns", json={"message": "开始处理"})
+    response = client.post(
+        f"/api/sessions/{session_id}/turns",
+        json={"message": "开始处理", "message_id": "local-api-message-1"},
+    )
 
     assert response.status_code == 200
     assert response.json()["turn_id"].startswith("turn_")
+
+
+def test_submit_turn_rejects_non_public_message_id(tmp_path: Path):
+    client = make_client(tmp_path)
+    session_id = _create_session(client)
+
+    response = client.post(
+        f"/api/sessions/{session_id}/turns",
+        json={"message": "开始处理", "message_id": "private/session/id"},
+    )
+
+    assert response.status_code == 422
 
 
 def test_create_app_accepts_positional_configuration(tmp_path: Path):
@@ -283,9 +322,19 @@ def test_create_app_uses_agentscope_session_manager_when_runtime_present(tmp_pat
             self.config = SimpleNamespace(agentscope_mount_path="/api/agentscope")
             self.submitted = []
 
-        async def submit_user_message(self, *, web_session_id: str, message: str) -> str:
+        async def submit_user_message(
+            self,
+            *,
+            web_session_id: str,
+            message: str,
+            message_id: str | None = None,
+            turn_id: str | None = None,
+            on_admitted=None,
+        ) -> str:
             self.submitted.append((web_session_id, message))
-            return "turn-agent-1"
+            if on_admitted is not None:
+                on_admitted()
+            return turn_id or "turn-agent-1"
 
     runtime = FakeRuntime()
     FakeController.created = []
@@ -298,12 +347,48 @@ def test_create_app_uses_agentscope_session_manager_when_runtime_present(tmp_pat
     client = TestClient(app)
 
     session_id = _create_session(client)
-    response = client.post(f"/api/sessions/{session_id}/turns", json={"message": "开始处理"})
+    response = client.post(
+        f"/api/sessions/{session_id}/turns",
+        json={"message": "开始处理", "message_id": "local-runtime-message-1"},
+    )
 
     assert response.status_code == 200
-    assert response.json()["turn_id"] == "turn-agent-1"
+    assert response.json()["turn_id"].startswith("turn_")
     assert FakeController.created == []
     assert runtime.submitted == [(session_id, "开始处理")]
+
+    replay = client.post(
+        f"/api/sessions/{session_id}/turns",
+        json={"message": "开始处理", "message_id": "local-runtime-message-1"},
+    )
+    assert replay.status_code == 200
+    assert replay.json()["turn_id"] == response.json()["turn_id"]
+    assert runtime.submitted == [(session_id, "开始处理")]
+
+    app.state.store.finish_user_message_turn_with_event(
+        session_id,
+        "local-runtime-message-1",
+        turn_id=response.json()["turn_id"],
+        terminal_status="success",
+    )
+
+    app.state.store.claim_user_message(
+        session_id,
+        "local-runtime-pending-1",
+        "still pending",
+        runtime_id="other-runtime",
+        turn_id="turn_pending",
+        ttl_seconds=30.0,
+    )
+    pending = client.post(
+        f"/api/sessions/{session_id}/turns",
+        json={
+            "message": "still pending",
+            "message_id": "local-runtime-pending-1",
+        },
+    )
+    assert pending.status_code == 409
+    assert pending.json()["detail"]["code"] == "turn_submission_pending"
 
 
 def test_create_app_requires_runtime_without_explicit_test_controller(tmp_path: Path):
@@ -452,7 +537,10 @@ def test_submit_turn_runtime_error_returns_409(tmp_path: Path):
     client = TestClient(app)
     session_id = _create_session(client)
 
-    response = client.post(f"/api/sessions/{session_id}/turns", json={"message": "开始处理"})
+    response = client.post(
+        f"/api/sessions/{session_id}/turns",
+        json={"message": "开始处理", "message_id": "local-error-message-1"},
+    )
 
     assert response.status_code == 409
     assert response.json()["detail"] == "A session turn is already active."
@@ -543,7 +631,7 @@ async def test_session_stream_does_not_receive_other_session_events(tmp_path: Pa
 
 def test_list_sessions_returns_session_records(tmp_path: Path):
     client = make_client(tmp_path)
-    client.post("/api/sessions", json={"message": "处理 20270605 的室外导航数据"})
+    client.post("/api/sessions", json={"message": "处理 20270605 的室外导航数据", "creation_id": "local-create-api-2"})
 
     response = client.get("/api/sessions")
 
@@ -557,7 +645,10 @@ def test_get_session_returns_persisted_messages_after_turn_submission(tmp_path: 
     client = make_client(tmp_path)
     session_id = _create_session(client)
 
-    turn_response = client.post(f"/api/sessions/{session_id}/turns", json={"message": "开始处理"})
+    turn_response = client.post(
+        f"/api/sessions/{session_id}/turns",
+        json={"message": "开始处理", "message_id": "local-stream-message-1"},
+    )
     detail_response = client.get(f"/api/sessions/{session_id}")
 
     assert turn_response.status_code == 200
@@ -837,7 +928,10 @@ async def test_interrupt_error_boundary_does_not_swallow_base_exceptions(
 def test_turn_and_interrupt_unknown_active_session_return_404(tmp_path: Path):
     client = make_client(tmp_path)
 
-    turn_response = client.post("/api/sessions/missing/turns", json={"message": "开始处理"})
+    turn_response = client.post(
+        "/api/sessions/missing/turns",
+        json={"message": "开始处理", "message_id": "local-missing-message-1"},
+    )
     interrupt_response = client.post("/api/sessions/missing/interrupt")
 
     assert turn_response.status_code == 404
@@ -1078,7 +1172,10 @@ def test_agentscope_delete_retry_accepts_already_absent_earlier_mapping(tmp_path
     runtime.bootstrapped = True
     submit_while_partially_deleted = client.post(
         f"/api/sessions/{session_id}/turns",
-        json={"message": "must remain fenced"},
+        json={
+            "message": "must remain fenced",
+            "message_id": "local-fenced-message-1",
+        },
     )
 
     assert first.status_code == 409
@@ -1429,7 +1526,7 @@ def test_create_app_treats_empty_model_env_as_none(tmp_path: Path, monkeypatch):
     app = create_app(db_path=tmp_path / "sessions.sqlite", controller_factory=FakeController)
     client = TestClient(app)
 
-    client.post("/api/sessions", json={"message": "处理 20270605 的室外导航数据"})
+    client.post("/api/sessions", json={"message": "处理 20270605 的室外导航数据", "creation_id": "local-create-api-3"})
 
     assert FakeController.created[0].kwargs["model"] is None
 
@@ -1509,7 +1606,7 @@ def test_navigation_sync_image_route_rejects_unsafe_sequence(tmp_path: Path, mon
 
 
 def _create_session(client: TestClient) -> str:
-    response = client.post("/api/sessions", json={"message": "处理 20270605 的室外导航数据"})
+    response = client.post("/api/sessions", json={"message": "处理 20270605 的室外导航数据", "creation_id": "local-create-helper"})
     return response.json()["session"]["id"]
 
 

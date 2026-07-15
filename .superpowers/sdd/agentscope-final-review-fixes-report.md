@@ -567,3 +567,104 @@ code changes.
 - Frontend production build: passed (Vite 1626 modules transformed).
 - Python `compileall`: passed.
 - `git diff --check`: passed.
+
+## Round 6: draft ordering, deletion mapping fence, and owner cleanup
+
+Baseline: `7a4c469`
+
+### Draft creation is optimistic before SSE and HTTP
+
+The active-session path inserted a local user row before its request, but the first
+message of a draft-created session still started SSE and awaited HTTP before appending
+the user row. A fast `REPLY_START` could therefore place the assistant first.
+
+The draft path now appends one uniquely identified optimistic user message immediately
+after activating the created session and before opening SSE or calling HTTP. Success
+does not append it again. Failure removes only the exact session/message pair, and the
+existing lifecycle, request ownership, and draft-revision guards prevent a stale
+failure from touching another session or overwriting a newer edit. Deterministic tests
+cover SSE-before-HTTP ordering and rollback while preserving a newer draft.
+
+### Deletion fences mapping publication and re-reads after quiescence
+
+Delete initially read AgentScope mappings before distributed Stop. A navigation
+handoff could publish another mapping during cancellation, after which the destructive
+phase reused the stale list and left an internal orphan.
+
+`save_agentscope_session_mapping()` now takes a SQLite `BEGIN IMMEDIATE` lock and
+atomically rejects a deletion marker. The only exception is a matching, unexpired
+admission ticket owned by the same runtime: that submit started before deletion, so
+delete is already waiting for its ticket and must allow it to finish publishing the
+mapping. Expired tickets, mismatched runtime identities, and missing tickets are all
+rejected. The ticket and runtime identity are carried from HTTP admission through
+AgentScope ensure/upsert. If an unadmitted mapping publication fails after upsert, the
+runtime restores its in-memory mapping. It deliberately does not delete the internal
+AgentScope session because ownership of a deterministic pre-existing ID is not proven.
+
+After admission tickets drain and remote owners quiesce, delete takes a fresh mapping
+snapshot immediately before SessionService deletion. This is defense-in-depth for an
+older or external writer that bypassed the supported store API. Tests cover direct
+rejection, an actual SQLite write-lock race, a gated pre-delete upsert, and a mapping
+injected during remote quiescence. Session deletion still does not touch datasets or
+processing artifacts.
+
+### Acknowledged remote tombstones stop heartbeating
+
+A remote owner retained its pending-stop cancellation lease after writing its ACK.
+The heartbeat therefore kept publishing an obsolete generation owner until TTL and
+could accumulate unnecessary work across repeated stops.
+
+Owner leases now expose a post-ACK callback. Only after the applied ACK is durably
+written does the runtime remove that exact generation/lease object when it has no
+foreground or tool references, then refresh the registry immediately. An active
+successor lease is identity-distinct and remains registered. The deterministic shared-
+bus test proves the stopped owner field disappears, does not return on heartbeat, and
+the successor remains uncancelled.
+
+### Exact turn identity, durable replay, and multi-client execution fencing
+
+Every turn now carries a validated client-generated `local-*` message ID. The durable
+admission row binds that ID to the session, content, deterministic turn ID, runtime,
+pending/admitted/terminal state, and lease. Same-ID replay never starts a second model
+run; different content conflicts; a different ID cannot enter while the session has an
+active turn. Terminal status and the public run-terminal event commit atomically.
+
+The browser keeps an exact retry record in tab-scoped `sessionStorage`, validates its
+shape/content and 24-hour lifetime, and removes it only when the expected message ID
+still owns the entry. Reload, hide/reopen, and session switching restore the same
+optimistic row and draft ownership. Authoritative snapshots/terminals retire the exact
+entry without treating identical text as identity. Malformed 2xx responses remain
+ambiguous and retain the retry ID. Session creation similarly uses a persisted
+`local-create-*` key and a deterministic backend session identity, so a lost creation
+response replays the existing session instead of creating an orphan.
+
+### Real worker quiescence remains part of the active-turn fence
+
+Foreground ChatService completion is no longer sufficient to terminate a user turn.
+The terminal callback retains the exact cancellation lease and waits for AgentScope
+owners, public ToolOffload references, and registered real worker threads to become
+quiescent. Execution-heartbeat failure first cancels the cooperative
+`CancellationContext`, then cancels the asyncio task. A durable running public tool is
+also included in the store's admission busy check, preventing a second client from
+bypassing the frontend while background side effects remain active.
+
+Lease expiry is intentionally fail-closed: a missed heartbeat does not prove that a
+paused process or detached worker stopped, so GET/stream/retry no longer writes a false
+failure terminal or releases the fence. An explicit Stop freezes the generation owner
+set, obtains the distributed quiescence barrier where owners exist, and writes a
+`stopped` user-turn terminal. The dead-owner path is also deterministic: after the
+owner registry has expired, explicit Stop closes the admitted row and permits a
+successor; passive TTL recovery never does.
+
+The frontend no longer lets a late terminal for an older user turn clear a newer
+wakeup reply. Successful run terminals do not mutate active reply ownership, and
+failure/stopped recovery only converges an ownerless reply state.
+
+### Final Round 6 verification
+
+- Affected backend suites: `272 passed, 1 warning`.
+- Full backend: `994 passed, 1 warning` (the existing Starlette deprecation warning).
+- Full frontend: `214 passed` across 8 files.
+- Frontend production build and TypeScript compilation: passed (Vite 1627 modules).
+- Python `compileall`: passed.
+- `git diff --check`: passed.

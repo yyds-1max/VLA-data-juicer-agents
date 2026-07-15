@@ -103,6 +103,9 @@ class _CancellationLease:
     foreground_refs: int = 1
     tool_call_ids: set[str] = field(default_factory=set)
     quiescent: asyncio.Event = field(default_factory=asyncio.Event)
+    owner_publication_suppressed: bool = False
+    on_admitted: Any = None
+    admission_callback_completed: bool = False
 
     def sync_quiescence(self) -> None:
         if self.foreground_refs == 0 and not self.tool_call_ids:
@@ -118,6 +121,11 @@ class _CancellationLease:
             return False
         remaining = max(0.0, deadline - asyncio.get_running_loop().time())
         return await self.cancellation.wait_for_quiescence(timeout=remaining)
+
+    async def wait_until_quiescent(self) -> None:
+        """Keep a durable turn fenced until all owned work has really exited."""
+        await self.quiescent.wait()
+        await self.cancellation.wait_for_quiescence()
 
 
 class _StopAwareMessageBus:
@@ -566,7 +574,82 @@ class AgentScopeRuntime:
         )
         return record
 
-    async def ensure_web_session(self, web_session_id: str, *, agent_id: str, model: str) -> str:
+    async def ensure_web_session(
+        self,
+        web_session_id: str,
+        *,
+        agent_id: str,
+        model: str,
+        admission_ticket: str | None = None,
+    ) -> str:
+        if self.web_session_store is None:
+            return await self._ensure_web_session_with_ticket(
+                web_session_id,
+                agent_id=agent_id,
+                model=model,
+                admission_ticket=admission_ticket,
+            )
+        if admission_ticket is not None:
+            # Nested callers reuse the durable lease already claimed by their
+            # outer admission boundary; do not claim or renew a second lease.
+            return await self._ensure_web_session_with_ticket(
+                web_session_id,
+                agent_id=agent_id,
+                model=model,
+                admission_ticket=admission_ticket,
+            )
+
+        owned_ticket, _baseline = self.web_session_store.claim_session_run_admission(
+            web_session_id,
+            runtime_id=self.runtime_id,
+            ttl_seconds=self.admission_lease_ttl_seconds,
+        )
+        ensure_task = asyncio.create_task(
+            self._ensure_web_session_with_ticket(
+                web_session_id,
+                agent_id=agent_id,
+                model=model,
+                admission_ticket=owned_ticket,
+            ),
+            name=f"datapilot-session-ensure:{web_session_id}",
+        )
+        heartbeat_task = asyncio.create_task(
+            self._heartbeat_session_run_admission(web_session_id, owned_ticket),
+            name=f"datapilot-session-ensure-heartbeat:{web_session_id}",
+        )
+        try:
+            done, _pending = await asyncio.wait(
+                {ensure_task, heartbeat_task},
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+            if ensure_task in done:
+                return ensure_task.result()
+            await asyncio.sleep(0)
+            if ensure_task.done():
+                return ensure_task.result()
+            heartbeat_error = heartbeat_task.exception()
+            ensure_task.cancel()
+            await asyncio.gather(ensure_task, return_exceptions=True)
+            raise RuntimeError("AgentScope session ensure lease renewal failed") from (
+                heartbeat_error
+                or RuntimeError("session ensure heartbeat exited unexpectedly")
+            )
+        finally:
+            heartbeat_task.cancel()
+            await asyncio.gather(heartbeat_task, return_exceptions=True)
+            if not ensure_task.done():
+                ensure_task.cancel()
+                await asyncio.gather(ensure_task, return_exceptions=True)
+            await self._release_session_run_admission(web_session_id, owned_ticket)
+
+    async def _ensure_web_session_with_ticket(
+        self,
+        web_session_id: str,
+        *,
+        agent_id: str,
+        model: str,
+        admission_ticket: str | None,
+    ) -> str:
         existing = self.web_sessions.get(web_session_id)
         if existing and existing[0] == agent_id:
             return existing[1]
@@ -574,7 +657,12 @@ class AgentScopeRuntime:
         persisted = self._load_web_session_mapping(web_session_id, agent_id=agent_id)
         if persisted and persisted[0] == agent_id:
             self.web_sessions[web_session_id] = persisted
-            self._save_web_session_mapping(web_session_id, agent_id, persisted[1])
+            self._save_web_session_mapping(
+                web_session_id,
+                agent_id,
+                persisted[1],
+                admission_ticket=admission_ticket,
+            )
             return persisted[1]
 
         session_id = f"{web_session_id}__{agent_id}"
@@ -593,14 +681,35 @@ class AgentScopeRuntime:
             ),
             session_id=session_id,
         )
+        previous_mapping = self.web_sessions.get(web_session_id)
         self.web_sessions[web_session_id] = (agent_id, session.id)
-        self._save_web_session_mapping(web_session_id, agent_id, session.id)
+        try:
+            self._save_web_session_mapping(
+                web_session_id,
+                agent_id,
+                session.id,
+                admission_ticket=admission_ticket,
+            )
+        except Exception as mapping_error:
+            if previous_mapping is None:
+                self.web_sessions.pop(web_session_id, None)
+            else:
+                self.web_sessions[web_session_id] = previous_mapping
+            raise
         return session.id
 
-    async def submit_user_message(self, *, web_session_id: str, message: str) -> str:
+    async def submit_user_message(
+        self,
+        *,
+        web_session_id: str,
+        message: str,
+        message_id: str | None = None,
+        turn_id: str | None = None,
+        on_admitted: Any = None,
+    ) -> str:
         await self.ensure_bootstrapped()
 
-        turn_id = f"turn_{uuid4()}"
+        turn_id = turn_id or f"turn_{uuid4()}"
         agent_id = self._agent_id_for_user_message(web_session_id=web_session_id)
         model = (
             self.config.navigation_model
@@ -613,6 +722,8 @@ class AgentScopeRuntime:
             model=model,
             message=message,
             turn_id=turn_id,
+            message_id=message_id,
+            on_admitted=on_admitted,
         )
         return turn_id
 
@@ -723,6 +834,8 @@ class AgentScopeRuntime:
         model: str,
         message: str,
         turn_id: str | None = None,
+        message_id: str | None = None,
+        on_admitted: Any = None,
     ) -> str:
         admission_ticket: str | None = None
         admission_baseline: tuple[int, int | None] | None = None
@@ -744,7 +857,10 @@ class AgentScopeRuntime:
                     model=model,
                     message=message,
                     turn_id=turn_id,
+                    message_id=message_id,
+                    admission_ticket=admission_ticket,
                     admission_baseline=admission_baseline,
+                    on_admitted=on_admitted,
                 ),
                 name=f"datapilot-admission:{web_session_id}",
             )
@@ -847,13 +963,17 @@ class AgentScopeRuntime:
         model: str,
         message: str,
         turn_id: str | None = None,
+        message_id: str | None = None,
+        admission_ticket: str | None = None,
         admission_baseline: tuple[int, int | None] | None = None,
+        on_admitted: Any = None,
     ) -> str:
         chat_service = self.app.state.chat_service
         session_id = await self.ensure_web_session(
             web_session_id,
             agent_id=agent_id,
             model=model,
+            admission_ticket=admission_ticket,
         )
         if agent_id == self.config.navigation_agent_id:
             anchor = self._navigation_durable_state_anchor(
@@ -882,6 +1002,7 @@ class AgentScopeRuntime:
             lease.admission_baseline = admission_baseline
             lease.admitted = False
             lease.admission_future = admission_future
+            lease.on_admitted = on_admitted
 
         if self.stop_coordinator is not None and self.stop_coordinator.started:
             try:
@@ -927,11 +1048,13 @@ class AgentScopeRuntime:
         except Exception:
             self.clear_run_cancellation(session_id, cancellation)
             raise
-        if turn_id is not None:
+        if turn_id is not None and on_admitted is None:
             self._attach_user_turn_terminal(
                 task,
                 web_session_id=web_session_id,
                 turn_id=turn_id,
+                message_id=message_id,
+                lease=lease,
             )
         add_done_callback = getattr(task, "add_done_callback", None)
         if admission_future is not None and callable(add_done_callback):
@@ -955,6 +1078,21 @@ class AgentScopeRuntime:
                 cancellation.cancel()
                 await asyncio.gather(task, return_exceptions=True)
                 raise
+        if turn_id is not None and on_admitted is not None:
+            self._attach_user_turn_terminal(
+                task,
+                web_session_id=web_session_id,
+                turn_id=turn_id,
+                message_id=message_id,
+                lease=lease,
+            )
+        if message_id is not None and self.web_session_store is not None:
+            self._attach_user_message_execution_heartbeat(
+                task,
+                web_session_id=web_session_id,
+                message_id=message_id,
+                cancellation=cancellation,
+            )
         return session_id
 
     def _attach_user_turn_terminal(
@@ -963,6 +1101,8 @@ class AgentScopeRuntime:
         *,
         web_session_id: str,
         turn_id: str,
+        message_id: str | None = None,
+        lease: _CancellationLease,
     ) -> None:
         add_done_callback = getattr(task, "add_done_callback", None)
         if not callable(add_done_callback):
@@ -977,7 +1117,9 @@ class AgentScopeRuntime:
                 self._record_user_turn_terminal(
                     web_session_id=web_session_id,
                     turn_id=turn_id,
+                    message_id=message_id,
                     status=status,
+                    lease=lease,
                 ),
                 name=f"datapilot-run-terminal:{turn_id}",
             )
@@ -987,6 +1129,49 @@ class AgentScopeRuntime:
         # Registering this callback afterwards guarantees the registry entry is
         # gone before the public terminal is persisted and published.
         add_done_callback(record_after_registry_cleanup)
+
+    def _attach_user_message_execution_heartbeat(
+        self,
+        task: Any,
+        *,
+        web_session_id: str,
+        message_id: str,
+        cancellation: CancellationContext,
+    ) -> None:
+        add_done_callback = getattr(task, "add_done_callback", None)
+        if not callable(add_done_callback):
+            return
+
+        async def heartbeat() -> None:
+            while True:
+                await asyncio.sleep(self.admission_renew_interval_seconds)
+                self.web_session_store.renew_user_message(
+                    web_session_id,
+                    message_id,
+                    runtime_id=self.runtime_id,
+                    ttl_seconds=self.admission_lease_ttl_seconds,
+                )
+
+        heartbeat_task = asyncio.create_task(
+            heartbeat(),
+            name=f"datapilot-turn-heartbeat:{message_id}",
+        )
+
+        def stop_heartbeat(_completed: asyncio.Task) -> None:
+            heartbeat_task.cancel()
+
+        add_done_callback(stop_heartbeat)
+        def handle_heartbeat_failure(completed: asyncio.Task) -> None:
+            try:
+                completed.result()
+            except asyncio.CancelledError:
+                return
+            except Exception:  # pylint: disable=broad-except
+                _logger.exception("Failed to renew DataPilot turn execution lease")
+                cancellation.cancel()
+                task.cancel()
+
+        heartbeat_task.add_done_callback(handle_heartbeat_failure)
 
     @staticmethod
     def _log_run_terminal_failure(task: asyncio.Task) -> None:
@@ -1002,20 +1187,35 @@ class AgentScopeRuntime:
         *,
         web_session_id: str,
         turn_id: str,
+        message_id: str | None,
         status: str,
+        lease: _CancellationLease,
     ) -> Any | None:
         if self.web_session_store is None:
             return None
-        event = CustomEvent(
-            name="datapilot_run_terminal",
-            value={"turn_id": turn_id, "status": status},
-        ).model_dump(mode="json")
-        identity = f"run-terminal:{web_session_id}:{turn_id}"
-        record = self.web_session_store.append_public_event(
-            web_session_id,
-            hashlib.sha256(identity.encode("utf-8")).hexdigest(),
-            event,
-        )
+        # The foreground AgentScope task can finish while ToolOffload work and
+        # shielded ``to_thread`` plan workers are still producing side effects.
+        # Keep the exact-message admission authoritative until both the runtime
+        # tool lease and the real worker registrations have reached quiescence.
+        await lease.wait_until_quiescent()
+        if message_id is not None:
+            record = self.web_session_store.finish_user_message_turn_with_event(
+                web_session_id,
+                message_id,
+                turn_id=turn_id,
+                terminal_status=status,
+            )
+        else:
+            event = CustomEvent(
+                name="datapilot_run_terminal",
+                value={"turn_id": turn_id, "status": status},
+            ).model_dump(mode="json")
+            identity = f"run-terminal:{web_session_id}:{turn_id}"
+            record = self.web_session_store.append_public_event(
+                web_session_id,
+                hashlib.sha256(identity.encode("utf-8")).hexdigest(),
+                event,
+            )
         await self._publish_public_record(web_session_id, record)
         return record
 
@@ -1035,6 +1235,11 @@ class AgentScopeRuntime:
         web_session_id: str,
     ) -> InterruptResponse:
         mappings = self._all_web_session_mappings(web_session_id)
+        active_user_turns = (
+            self.web_session_store.admitted_user_message_turns(web_session_id)
+            if self.web_session_store is not None
+            else []
+        )
         if not mappings and self.web_session_store is None:
             return InterruptResponse(interrupted=False)
 
@@ -1049,7 +1254,7 @@ class AgentScopeRuntime:
             and self.stop_coordinator is not None
             and self.stop_coordinator.started
         )
-        interrupted = bool(mappings)
+        interrupted = bool(mappings or active_user_turns)
         expected_owners: dict[str, dict[str, Any]] | None = None
         if coordinator_active:
             assert stop_request is not None
@@ -1163,6 +1368,20 @@ class AgentScopeRuntime:
                 )
             for _agent_id, agentscope_session_id in mappings:
                 self.discard_run_cancellations(agentscope_session_id)
+            for message_id, turn_id in active_user_turns:
+                try:
+                    records.append(
+                        self.web_session_store.finish_user_message_turn_with_event(
+                            web_session_id,
+                            message_id,
+                            turn_id=turn_id,
+                            terminal_status="stopped",
+                        )
+                    )
+                except RuntimeError:
+                    # A normal completion callback may win after the owner
+                    # barrier. Its terminal is already the authoritative one.
+                    continue
             if interrupted or stopped:
                 resolution = self._append_human_decision_resolution(
                     web_session_id,
@@ -1291,6 +1510,13 @@ class AgentScopeRuntime:
                         "AgentScope session cancellation failed"
                     ) from cancellation_failures[0]
 
+            # Re-read only after admissions and every owner have quiesced. The
+            # deletion fence rejects supported mapping writers, while this final
+            # snapshot also covers a mapping committed by an older/external writer
+            # during cancellation so its AgentScope session is not orphaned.
+            mappings = self.web_session_store.list_agentscope_session_mappings(
+                web_session_id
+            )
             session_service = self.app.state.session_service
             for mapping in mappings:
                 await session_service.delete_session(
@@ -1391,6 +1617,11 @@ class AgentScopeRuntime:
             ):
                 cancellation.cancel()
                 raise RuntimeError("execution admission was fenced by stop")
+        except asyncio.CancelledError:
+            future = lease.admission_future
+            if future is not None and not future.done():
+                future.cancel()
+            raise
         except Exception as exc:
             future = lease.admission_future
             if future is not None and not future.done():
@@ -1399,6 +1630,22 @@ class AgentScopeRuntime:
                     if isinstance(exc, RuntimeError)
                     else RuntimeError("AgentScope run admission failed")
                 )
+            raise
+        try:
+            if lease.on_admitted is not None and not lease.admission_callback_completed:
+                admitted_result = lease.on_admitted()
+                if inspect.isawaitable(admitted_result):
+                    await admitted_result
+                lease.admission_callback_completed = True
+        except asyncio.CancelledError:
+            future = lease.admission_future
+            if future is not None and not future.done():
+                future.cancel()
+            raise
+        except Exception as exc:
+            future = lease.admission_future
+            if future is not None and not future.done():
+                future.set_exception(exc)
             raise
         future = lease.admission_future
         if future is not None and not future.done():
@@ -1463,11 +1710,90 @@ class AgentScopeRuntime:
                 cancellation=lease.cancellation,
                 tool_call_ids=frozenset(lease.tool_call_ids),
                 wait_for_quiescence=lease.wait_for_quiescence,
+                publish_owner=not lease.owner_publication_suppressed,
+                suppress_for_ack=lambda session_id=agentscope_session_id,
+                item=lease,
+                generation=lease.generation: self._suppress_run_cancellation_owner(
+                    session_id,
+                    item,
+                    generation,
+                ),
+                restore_after_ack_failure=lambda session_id=agentscope_session_id,
+                item=lease,
+                generation=lease.generation: self._restore_run_cancellation_owner(
+                    session_id,
+                    item,
+                    generation,
+                ),
+                on_acknowledged=lambda session_id=agentscope_session_id,
+                item=lease,
+                generation=lease.generation: self._discard_acknowledged_run_cancellation(
+                    session_id,
+                    item,
+                    generation,
+                ),
             )
             for agentscope_session_id, leases in self._run_cancellations.items()
             for lease in leases
             if lease.generation is not None
         ]
+
+    def _suppress_run_cancellation_owner(
+        self,
+        agentscope_session_id: str,
+        lease: _CancellationLease,
+        generation: int,
+    ) -> bool:
+        current = self._run_cancellations.get(agentscope_session_id, [])
+        if (
+            not any(candidate is lease for candidate in current)
+            or lease.generation != generation
+            or lease.foreground_refs != 0
+            or lease.tool_call_ids
+        ):
+            return False
+        lease.owner_publication_suppressed = True
+        return True
+
+    def _restore_run_cancellation_owner(
+        self,
+        agentscope_session_id: str,
+        lease: _CancellationLease,
+        generation: int,
+    ) -> None:
+        if (
+            any(
+                candidate is lease
+                for candidate in self._run_cancellations.get(
+                    agentscope_session_id,
+                    [],
+                )
+            )
+            and lease.generation == generation
+        ):
+            lease.owner_publication_suppressed = False
+
+    def _discard_acknowledged_run_cancellation(
+        self,
+        agentscope_session_id: str,
+        acknowledged: _CancellationLease,
+        generation: int,
+    ) -> None:
+        leases = self._run_cancellations.get(agentscope_session_id, [])
+        remaining = [
+            lease
+            for lease in leases
+            if not (
+                lease is acknowledged
+                and lease.generation == generation
+                and lease.foreground_refs == 0
+                and not lease.tool_call_ids
+            )
+        ]
+        if remaining:
+            self._run_cancellations[agentscope_session_id] = remaining
+        else:
+            self._run_cancellations.pop(agentscope_session_id, None)
 
     def release_tool_cancellation(
         self,
@@ -2491,12 +2817,20 @@ class AgentScopeRuntime:
         web_session_id: str,
         agent_id: str,
         agentscope_session_id: str,
+        *,
+        admission_ticket: str | None = None,
     ) -> None:
         if self.web_session_store is None:
             return
         save_mapping = getattr(self.web_session_store, "save_agentscope_session_mapping", None)
         if callable(save_mapping):
-            save_mapping(web_session_id, agent_id=agent_id, agentscope_session_id=agentscope_session_id)
+            save_mapping(
+                web_session_id,
+                agent_id=agent_id,
+                agentscope_session_id=agentscope_session_id,
+                admission_ticket=admission_ticket,
+                runtime_id=self.runtime_id,
+            )
 
     def _restore_web_session_mapping(
         self,

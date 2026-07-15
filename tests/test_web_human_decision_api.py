@@ -17,9 +17,19 @@ class FakeAgentScopeRuntime:
         self.decisions: list[tuple[str, dict]] = []
         self.recoveries: list[tuple[str, dict]] = []
 
-    async def submit_user_message(self, *, web_session_id: str, message: str) -> str:
+    async def submit_user_message(
+        self,
+        *,
+        web_session_id: str,
+        message: str,
+        message_id: str | None = None,
+        turn_id: str | None = None,
+        on_admitted=None,
+    ) -> str:
         self.messages.append((web_session_id, message))
-        return "turn-agent-1"
+        if on_admitted is not None:
+            on_admitted()
+        return turn_id or "turn-agent-1"
 
     async def submit_human_decision(self, *, web_session_id: str, decision: dict) -> bool:
         self.decisions.append((web_session_id, decision))
@@ -48,7 +58,13 @@ def _client(tmp_path, runtime: FakeAgentScopeRuntime) -> TestClient:
 
 
 def _create_session(client: TestClient) -> str:
-    response = client.post("/api/sessions", json={"message": "处理导航数据"})
+    response = client.post(
+        "/api/sessions",
+        json={
+            "message": "处理导航数据",
+            "creation_id": "local-create-human-decision",
+        },
+    )
     assert response.status_code == 200
     return response.json()["session"]["id"]
 

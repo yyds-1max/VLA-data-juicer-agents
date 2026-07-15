@@ -7,6 +7,7 @@ import {
   createSession,
   deleteSession,
   getSession,
+  isAmbiguousTurnSubmissionError,
   interruptTurn,
   listSessions,
   recoverHumanDecision,
@@ -24,6 +25,16 @@ import { MessageList } from "./MessageList";
 import { SessionHeader } from "./SessionHeader";
 import { SessionHistoryPanel } from "./SessionHistoryPanel";
 import { currentViewport, visibleFloatingOffset, visibleWindowOffset } from "./floatingPosition";
+import {
+  readSessionCreationOutbox,
+  readTurnOutbox,
+  removeSessionCreationOutbox,
+  removeTurnOutbox,
+  writeSessionCreationOutbox,
+  writeTurnOutbox,
+  type AmbiguousTurnRetry,
+  type SessionCreationRetry,
+} from "./turnOutbox";
 
 type DragState = {
   pointerId: number;
@@ -97,6 +108,8 @@ export function DataPilotWindow() {
   const requestInFlightRef = useRef<SubmitAdmission | null>(null);
   const activeSubmitRequestIdRef = useRef(0);
   const activeSubmitQueueRef = useRef(new Map<number, ActiveSubmitRequest>());
+  const ambiguousTurnRetriesRef = useRef(new Map<string, AmbiguousTurnRetry>());
+  const sessionCreationRetryRef = useRef<SessionCreationRetry | null>(null);
   const deletedSessionIdsRef = useRef(new Set<string>());
   const reconnectStateRef = useRef<{ sessionId: string | null; attempts: number }>({
     sessionId: null,
@@ -105,6 +118,35 @@ export function DataPilotWindow() {
   const humanDecisionRecoveryRequestRef = useRef(0);
   const dragRef = useRef<DragState | null>(null);
   const windowOffset = useMemo(() => visibleWindowOffset(floatingOffset, viewport), [floatingOffset, viewport]);
+
+  const rememberTurnRetry = useCallback((sessionId: string, retry: AmbiguousTurnRetry) => {
+    ambiguousTurnRetriesRef.current.set(sessionId, retry);
+    writeTurnOutbox(sessionId, retry);
+  }, []);
+
+  const discardTurnRetry = useCallback((sessionId: string, expectedMessageId?: string) => {
+    const retry = ambiguousTurnRetriesRef.current.get(sessionId);
+    if (expectedMessageId && retry?.userMessage.id !== expectedMessageId) {
+      return;
+    }
+    ambiguousTurnRetriesRef.current.delete(sessionId);
+    removeTurnOutbox(sessionId, expectedMessageId ?? retry?.userMessage.id);
+  }, []);
+
+  const rememberSessionCreationRetry = useCallback((retry: SessionCreationRetry) => {
+    sessionCreationRetryRef.current = retry;
+    writeSessionCreationOutbox(retry);
+  }, []);
+
+  const discardSessionCreationRetry = useCallback((expectedCreationId?: string) => {
+    const retry = sessionCreationRetryRef.current;
+    if (expectedCreationId && retry?.creationId !== expectedCreationId) {
+      removeSessionCreationOutbox(expectedCreationId);
+      return;
+    }
+    sessionCreationRetryRef.current = null;
+    removeSessionCreationOutbox(expectedCreationId ?? retry?.creationId);
+  }, []);
 
   const handleComposerDraftChange = useCallback((message: string) => {
     composerDraftRevisionRef.current += 1;
@@ -188,6 +230,24 @@ export function DataPilotWindow() {
 
   const observeSubmittedRunTerminal = useCallback(
     (sessionId: string, sequence: number, event: AgentEvent) => {
+      if (event.type === EventType.CUSTOM) {
+        const terminal = event as CustomEvent;
+        const messageId = terminal.value.message_id;
+        const retry = ambiguousTurnRetriesRef.current.get(sessionId);
+        if (
+          terminal.name === "datapilot_run_terminal" &&
+          typeof messageId === "string" &&
+          retry?.userMessage.id === messageId
+        ) {
+          discardTurnRetry(sessionId, retry.userMessage.id);
+          if (
+            composerDraftRevisionRef.current === retry.draftRevision &&
+            composerDraftRef.current.trim() === retry.content
+          ) {
+            replaceComposerDraft("");
+          }
+        }
+      }
       const request = requestInFlightRef.current;
       if (
         !request ||
@@ -210,7 +270,26 @@ export function DataPilotWindow() {
         releaseSubmitAdmission(request);
       }
     },
-    [releaseSubmitAdmission],
+    [discardTurnRetry, releaseSubmitAdmission, replaceComposerDraft],
+  );
+
+  const retireAuthoritativeAmbiguousRetry = useCallback(
+    (session: Awaited<ReturnType<typeof getSession>>) => {
+      const retry = ambiguousTurnRetriesRef.current.get(session.id);
+      if (
+        retry &&
+        session.messages.some((message) => message.id === retry.userMessage.id)
+      ) {
+        discardTurnRetry(session.id, retry.userMessage.id);
+        if (
+          composerDraftRevisionRef.current === retry.draftRevision &&
+          composerDraftRef.current.trim() === retry.content
+        ) {
+          replaceComposerDraft("");
+        }
+      }
+    },
+    [discardTurnRetry, replaceComposerDraft],
   );
 
   const observeSubmittedSnapshot = useCallback(
@@ -381,6 +460,7 @@ export function DataPilotWindow() {
             return;
           }
           observeSubmittedSnapshot(detail);
+          retireAuthoritativeAmbiguousRetry(detail);
           datapilotStore.getState().refreshActiveSession(detail);
         } catch (error) {
           if (!isCurrentLease(lease)) {
@@ -415,6 +495,7 @@ export function DataPilotWindow() {
       observeSubmittedReplyStart,
       observeSubmittedRunTerminal,
       observeSubmittedSnapshot,
+      retireAuthoritativeAmbiguousRetry,
     ],
   );
   startEventStreamRef.current = startEventStream;
@@ -432,6 +513,18 @@ export function DataPilotWindow() {
   }, [invalidateEventLifecycle, invalidateSubmitAdmission]);
 
   useEffect(() => {
+    if (!open || mode !== "draft_new_session" || currentSessionId) {
+      return;
+    }
+    const retry = sessionCreationRetryRef.current ?? readSessionCreationOutbox();
+    if (!retry) return;
+    sessionCreationRetryRef.current = retry;
+    if (composerDraftRef.current === "") {
+      replaceComposerDraft(retry.content);
+    }
+  }, [currentSessionId, mode, open, replaceComposerDraft]);
+
+  useEffect(() => {
     if (!open || mode !== "active_session" || !currentSessionId) {
       if (!open) {
         invalidateSubmitAdmission();
@@ -444,11 +537,30 @@ export function DataPilotWindow() {
 
     let cancelled = false;
     const sessionId = currentSessionId;
+    const existingRetry = ambiguousTurnRetriesRef.current.get(sessionId);
+    const recoveredRetry = existingRetry ?? readTurnOutbox(sessionId);
+    if (recoveredRetry) {
+      const retry = composerDraftRef.current === ""
+        ? { ...recoveredRetry, draftRevision: composerDraftRevisionRef.current }
+        : recoveredRetry;
+      ambiguousTurnRetriesRef.current.set(sessionId, retry);
+      if (
+        !datapilotStore.getState().conversation.messages.some(
+          (message) => message.id === retry.userMessage.id,
+        )
+      ) {
+        datapilotStore.getState().appendUserMessage(retry.userMessage);
+      }
+      if (composerDraftRef.current === "") {
+        replaceComposerDraft(retry.content);
+      }
+    }
     startEventStream(sessionId, lifecycleGenerationRef.current);
 
     void getSession(sessionId)
       .then((detail) => {
         if (!cancelled) {
+          retireAuthoritativeAmbiguousRetry(detail);
           datapilotStore.getState().refreshActiveSession(detail);
         }
       })
@@ -471,6 +583,7 @@ export function DataPilotWindow() {
     mode,
     open,
     replaceComposerDraft,
+    retireAuthoritativeAmbiguousRetry,
     startEventStream,
   ]);
 
@@ -541,6 +654,7 @@ export function DataPilotWindow() {
 
   const handleNewSession = () => {
     invalidateSubmitAdmission();
+    discardSessionCreationRetry();
     replaceComposerDraft("");
     draftRequestGenerationRef.current += 1;
     selectionGenerationRef.current += 1;
@@ -599,6 +713,7 @@ export function DataPilotWindow() {
   const handleDeleteHistory = async (session: SessionRecord) => {
     try {
       await deleteSession(session.id);
+      discardTurnRetry(session.id);
       deletedSessionIdsRef.current.add(session.id);
       const cancelledSelection = selectionTargetRef.current === session.id;
       if (cancelledSelection) {
@@ -634,7 +749,17 @@ export function DataPilotWindow() {
     const requestGeneration = draftRequestGenerationRef.current + 1;
     draftRequestGenerationRef.current = requestGeneration;
     const lifecycleGeneration = lifecycleGenerationRef.current;
+    const previousCreationRetry =
+      sessionCreationRetryRef.current ?? readSessionCreationOutbox();
+    if (previousCreationRetry && previousCreationRetry.content !== message) {
+      discardSessionCreationRetry(previousCreationRetry.creationId);
+    }
+    const creationRetry = previousCreationRetry?.content === message
+      ? previousCreationRetry
+      : { content: message, creationId: createLocalCreationId() };
+    rememberSessionCreationRetry(creationRetry);
     let createdSessionId: string | null = null;
+    let optimisticUserMessage: ReturnType<typeof localUserMessage> | null = null;
     const ownsDraftIntent = () => {
       const state = datapilotStore.getState();
       return (
@@ -660,7 +785,8 @@ export function DataPilotWindow() {
       );
     };
     try {
-      const session = await createSession(message);
+      const session = await createSession(message, creationRetry.creationId);
+      discardSessionCreationRetry(creationRetry.creationId);
       if (!ownsDraftIntent()) {
         return;
       }
@@ -669,14 +795,28 @@ export function DataPilotWindow() {
       submission.afterSequence = 0;
       const store = datapilotStore.getState();
       store.setActiveSession(session);
-      const userMessage = localUserMessage(session.id, message);
+      optimisticUserMessage = localUserMessage(session.id, message);
+      rememberTurnRetry(session.id, {
+        content: message,
+        userMessage: optimisticUserMessage,
+        draftRevision: composerDraftRevisionRef.current,
+      });
+      datapilotStore.getState().appendUserMessage(optimisticUserMessage);
       startEventStream(session.id, lifecycleGeneration);
-      submission.turnId = await submitTurn(session.id, message);
+      const turnResult = normalizeSubmitTurnResult(await submitTurn(
+        session.id,
+        message,
+        optimisticUserMessage.id,
+      ));
+      submission.turnId = turnResult.turnId;
       if (!ownsCreatedSession()) {
         return;
       }
-      datapilotStore.getState().appendUserMessage(userMessage);
+      discardTurnRetry(session.id, optimisticUserMessage.id);
       submission.accepted = true;
+      if (turnResult.replayed && turnResult.terminal) {
+        releaseSubmitAdmission(submission);
+      }
       if (
         submission.replyStarted ||
         (submission.turnId !== null &&
@@ -687,6 +827,38 @@ export function DataPilotWindow() {
     } catch (error) {
       if (!(createdSessionId ? ownsCreatedSession() : ownsDraftIntent())) {
         return;
+      }
+      if (!createdSessionId && isAmbiguousTurnSubmissionError(error)) {
+        rememberSessionCreationRetry(creationRetry);
+        restoreUneditedSubmittedDraft(submission);
+        releaseSubmitAdmission(submission);
+        console.error("DataPilot session creation outcome is ambiguous", error);
+        return;
+      }
+      if (
+        createdSessionId &&
+        optimisticUserMessage &&
+        isAmbiguousTurnSubmissionError(error)
+      ) {
+        rememberTurnRetry(createdSessionId, {
+          content: message,
+          userMessage: optimisticUserMessage,
+          draftRevision: composerDraftRevisionRef.current,
+        });
+        restoreUneditedSubmittedDraft(submission);
+        releaseSubmitAdmission(submission);
+        console.error("DataPilot draft turn outcome is ambiguous", error);
+        return;
+      }
+      if (createdSessionId && optimisticUserMessage) {
+        discardTurnRetry(createdSessionId, optimisticUserMessage.id);
+        datapilotStore.getState().removeOptimisticUserMessage(
+          createdSessionId,
+          optimisticUserMessage.id,
+        );
+      }
+      if (!createdSessionId) {
+        discardSessionCreationRetry(creationRetry.creationId);
       }
       restoreUneditedSubmittedDraft(submission);
       releaseSubmitAdmission(submission);
@@ -719,25 +891,48 @@ export function DataPilotWindow() {
       releaseSubmitAdmission(submission);
       return;
     }
+    const retry = ambiguousTurnRetriesRef.current.get(sessionId);
+    if (retry && retry.content !== message) {
+      discardTurnRetry(sessionId, retry.userMessage.id);
+    }
+    const retryMessage = retry?.content === message ? retry.userMessage : null;
     const request: ActiveSubmitRequest = {
       id: activeSubmitRequestIdRef.current + 1,
       sessionId,
       generation: lifecycleGenerationRef.current,
-      userMessage: localUserMessage(sessionId, message),
+      userMessage: retryMessage ?? localUserMessage(sessionId, message),
       outcome: "pending",
     };
+    rememberTurnRetry(sessionId, {
+      content: message,
+      userMessage: request.userMessage,
+      draftRevision: composerDraftRevisionRef.current,
+    });
     activeSubmitRequestIdRef.current = request.id;
     activeSubmitQueueRef.current.set(request.id, request);
-    datapilotStore.getState().appendUserMessage(request.userMessage);
+    if (
+      !datapilotStore.getState().conversation.messages.some(
+        (candidate) => candidate.id === request.userMessage.id,
+      )
+    ) {
+      datapilotStore.getState().appendUserMessage(request.userMessage);
+    }
     try {
-      submission.turnId = await submitTurn(sessionId, message);
+      const turnResult = normalizeSubmitTurnResult(
+        await submitTurn(sessionId, message, request.userMessage.id),
+      );
+      submission.turnId = turnResult.turnId;
       submission.accepted = true;
+      if (ambiguousTurnRetriesRef.current.get(sessionId)?.userMessage.id === request.userMessage.id) {
+        discardTurnRetry(sessionId, request.userMessage.id);
+      }
       const current = activeSubmitQueueRef.current.get(request.id);
       if (current === request) {
         request.outcome = "success";
         flushActiveSubmitQueue();
       }
       if (
+        (turnResult.replayed && turnResult.terminal) ||
         submission.replyStarted ||
         (submission.turnId !== null &&
           submission.terminalTurnIds.has(submission.turnId))
@@ -747,6 +942,26 @@ export function DataPilotWindow() {
     } catch (error) {
       const owned = ownsActiveSubmitRequest(request);
       const current = activeSubmitQueueRef.current.get(request.id);
+      if (isAmbiguousTurnSubmissionError(error)) {
+        if (current === request) {
+          request.outcome = "success";
+          flushActiveSubmitQueue();
+        }
+        if (owned) {
+          rememberTurnRetry(sessionId, {
+            content: message,
+            userMessage: request.userMessage,
+            draftRevision: composerDraftRevisionRef.current,
+          });
+          restoreUneditedSubmittedDraft(submission);
+          console.error("DataPilot active turn outcome is ambiguous", error);
+        }
+        releaseSubmitAdmission(submission);
+        return;
+      }
+      if (ambiguousTurnRetriesRef.current.get(sessionId)?.userMessage.id === request.userMessage.id) {
+        discardTurnRetry(sessionId, request.userMessage.id);
+      }
       if (current === request) {
         request.outcome = "failure";
         request.error = error;
@@ -1106,4 +1321,20 @@ function createLocalId(): string {
       ? crypto.randomUUID()
       : `${Date.now()}-${Math.random().toString(16).slice(2)}`;
   return `local-${suffix}`;
+}
+
+function createLocalCreationId(): string {
+  const suffix =
+    typeof crypto !== "undefined" && "randomUUID" in crypto
+      ? crypto.randomUUID()
+      : `${Date.now()}-${Math.random().toString(16).slice(2)}`;
+  return `local-create-${suffix}`;
+}
+
+function normalizeSubmitTurnResult(
+  result: string | { turnId: string; replayed: boolean; terminal: boolean },
+): { turnId: string; replayed: boolean; terminal: boolean } {
+  return typeof result === "string"
+    ? { turnId: result, replayed: false, terminal: false }
+    : result;
 }

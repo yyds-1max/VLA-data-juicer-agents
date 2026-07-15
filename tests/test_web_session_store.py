@@ -3,6 +3,7 @@ from datetime import UTC, datetime, timedelta
 from hashlib import sha256
 from pathlib import Path
 import sqlite3
+from threading import Event
 
 import pytest
 
@@ -777,3 +778,322 @@ def test_store_keeps_agentscope_mappings_and_human_decisions_internal(tmp_path: 
         reply_id="reply-1",
         tool_call_id="call-1",
     )
+
+
+def test_store_rejects_agentscope_mapping_save_after_deletion_fence(
+    tmp_path: Path,
+) -> None:
+    store = WebSessionStore(tmp_path / "sessions.sqlite")
+    session = store.create_session(title="deleting session")
+    store.begin_session_deletion(session.id)
+
+    with pytest.raises(RuntimeError, match="session deletion is pending"):
+        store.save_agentscope_session_mapping(
+            session.id,
+            agent_id="late-navigation-agent",
+            agentscope_session_id="late-navigation-session",
+        )
+
+    assert store.list_agentscope_session_mappings(session.id) == []
+
+
+def test_concurrent_mapping_save_observes_uncommitted_deletion_winner(
+    tmp_path: Path,
+) -> None:
+    deleter = WebSessionStore(tmp_path / "mapping-delete-race.sqlite")
+    session = deleter.create_session(title="mapping/delete race")
+    submitter = WebSessionStore(deleter.db_path)
+    save_started = Event()
+
+    def save_mapping() -> None:
+        save_started.set()
+        submitter.save_agentscope_session_mapping(
+            session.id,
+            agent_id="late-navigation-agent",
+            agentscope_session_id="late-navigation-session",
+        )
+
+    with sqlite3.connect(deleter.db_path, timeout=30.0) as deletion_connection:
+        deletion_connection.execute("BEGIN IMMEDIATE")
+        deletion_connection.execute(
+            "INSERT INTO session_deletions (session_id, started_at) VALUES (?, ?)",
+            (session.id, "2026-07-15T00:00:00.000+00:00"),
+        )
+        with ThreadPoolExecutor(max_workers=1) as executor:
+            future = executor.submit(save_mapping)
+            assert save_started.wait(timeout=1.0)
+            deletion_connection.commit()
+            with pytest.raises(RuntimeError, match="session deletion is pending"):
+                future.result(timeout=1.0)
+
+    assert submitter.list_agentscope_session_mappings(session.id) == []
+
+
+def test_deleting_session_allows_only_matching_live_admission_mapping(
+    tmp_path: Path,
+) -> None:
+    store = WebSessionStore(tmp_path / "ticket-aware-mapping.sqlite")
+
+    live = store.create_session(title="live admission")
+    live_ticket, _ = store.claim_session_run_admission(
+        live.id,
+        runtime_id="owner-runtime",
+        ttl_seconds=30.0,
+    )
+    store.begin_session_deletion(live.id)
+    store.save_agentscope_session_mapping(
+        live.id,
+        agent_id="main-router-agent",
+        agentscope_session_id="live-router-session",
+        admission_ticket=live_ticket,
+        runtime_id="owner-runtime",
+    )
+    assert [
+        mapping.agentscope_session_id
+        for mapping in store.list_agentscope_session_mappings(live.id)
+    ] == ["live-router-session"]
+
+    stolen = store.create_session(title="stolen admission")
+    stolen_ticket, _ = store.claim_session_run_admission(
+        stolen.id,
+        runtime_id="owner-runtime",
+        ttl_seconds=30.0,
+    )
+    store.begin_session_deletion(stolen.id)
+    with pytest.raises(RuntimeError, match="session deletion is pending"):
+        store.save_agentscope_session_mapping(
+            stolen.id,
+            agent_id="main-router-agent",
+            agentscope_session_id="stolen-router-session",
+            admission_ticket=stolen_ticket,
+            runtime_id="intruder-runtime",
+        )
+
+    expired = store.create_session(title="expired admission")
+    expired_ticket, _ = store.claim_session_run_admission(
+        expired.id,
+        runtime_id="owner-runtime",
+        ttl_seconds=1.0,
+        now=100.0,
+    )
+    store.begin_session_deletion(expired.id)
+    with pytest.raises(RuntimeError, match="session deletion is pending"):
+        store.save_agentscope_session_mapping(
+            expired.id,
+            agent_id="main-router-agent",
+            agentscope_session_id="expired-router-session",
+            admission_ticket=expired_ticket,
+            runtime_id="owner-runtime",
+        )
+
+    assert store.list_agentscope_session_mappings(stolen.id) == []
+    assert store.list_agentscope_session_mappings(expired.id) == []
+
+
+def test_crashed_turn_reservation_expires_for_same_id_retry_and_delete_cleanup(
+    tmp_path: Path,
+) -> None:
+    store = WebSessionStore(tmp_path / "turn-reservation-crash.sqlite")
+    session = store.create_session(title="turn reservation crash")
+    store.claim_user_message(
+        session.id,
+        "local-crash-retry",
+        "retry me",
+        runtime_id="crashed-runtime",
+        turn_id="turn-crash-retry",
+        ttl_seconds=5.0,
+        now=100.0,
+    )
+
+    assert store.claim_user_message(
+        session.id,
+        "local-crash-retry",
+        "retry me",
+        runtime_id="retry-runtime",
+        turn_id="turn-crash-retry",
+        ttl_seconds=5.0,
+        now=104.9,
+    ) == "pending"
+
+    store.claim_user_message(
+        session.id,
+        "local-crash-retry",
+        "retry me",
+        runtime_id="retry-runtime",
+        turn_id="turn-crash-retry",
+        ttl_seconds=5.0,
+        now=105.0,
+    )
+    with sqlite3.connect(store.db_path) as connection:
+        owner = connection.execute(
+            "SELECT runtime_id FROM session_turn_admissions WHERE message_id = ?",
+            ("local-crash-retry",),
+        ).fetchone()
+    assert owner == ("retry-runtime",)
+
+    store.delete_session(session.id)
+    with sqlite3.connect(store.db_path) as connection:
+        count = connection.execute(
+            "SELECT COUNT(*) FROM session_turn_admissions",
+        ).fetchone()
+    assert count == (0,)
+
+
+def test_user_turn_terminal_event_insert_failure_rolls_back_status(
+    tmp_path: Path,
+) -> None:
+    store = WebSessionStore(tmp_path / "turn-terminal-rollback.sqlite")
+    session = store.create_session(title="terminal rollback")
+    store.claim_user_message(
+        session.id,
+        "local-terminal-rollback",
+        "run",
+        runtime_id="runtime-1",
+        turn_id="turn_terminal_rollback",
+        ttl_seconds=30.0,
+    )
+    store.commit_user_message(
+        session.id,
+        "local-terminal-rollback",
+        "run",
+        runtime_id="runtime-1",
+        ttl_seconds=30.0,
+    )
+    with sqlite3.connect(store.db_path) as connection:
+        connection.execute(
+            """
+            CREATE TRIGGER fail_turn_terminal_insert
+            BEFORE INSERT ON public_events
+            BEGIN
+                SELECT RAISE(ABORT, 'injected terminal insert failure');
+            END
+            """
+        )
+
+    with pytest.raises(sqlite3.IntegrityError, match="injected terminal insert failure"):
+        store.finish_user_message_turn_with_event(
+            session.id,
+            "local-terminal-rollback",
+            turn_id="turn_terminal_rollback",
+            terminal_status="success",
+        )
+
+    assert store.user_message_turn_status(
+        session.id,
+        "local-terminal-rollback",
+    ) == "admitted"
+    assert store.list_public_events(session.id) == []
+
+
+def test_expired_admitted_turn_stays_fenced_without_owner_quiescence(
+    tmp_path: Path,
+) -> None:
+    store = WebSessionStore(tmp_path / "turn-expiry-fail-closed.sqlite")
+    session = store.create_session(title="expired owner may still be live")
+    message_id = "local-expired-live-owner"
+    store.claim_user_message(
+        session.id,
+        message_id,
+        "run",
+        runtime_id="runtime-1",
+        turn_id="turn_expired_live_owner",
+        ttl_seconds=30.0,
+    )
+    store.commit_user_message(
+        session.id,
+        message_id,
+        "run",
+        runtime_id="runtime-1",
+        ttl_seconds=30.0,
+    )
+    with sqlite3.connect(store.db_path) as connection:
+        connection.execute(
+            "UPDATE session_turn_admissions SET expires_at = 100 WHERE message_id = ?",
+            (message_id,),
+        )
+
+    assert store.recover_expired_user_message_turns(session.id, now=101.0) == []
+    assert store.user_message_turn_status(session.id, message_id) == "admitted"
+    assert store.list_public_events(session.id) == []
+    assert store.claim_user_message(
+        session.id,
+        "local-successor",
+        "must not overlap",
+        runtime_id="runtime-2",
+        turn_id="turn_successor",
+        ttl_seconds=30.0,
+    ) == "busy"
+
+
+def test_session_turn_fence_rejects_distinct_id_until_terminal(
+    tmp_path: Path,
+) -> None:
+    store = WebSessionStore(tmp_path / "session-turn-fence.sqlite")
+    session = store.create_session(title="session turn fence")
+    assert store.claim_user_message(
+        session.id,
+        "local-first-turn",
+        "first",
+        runtime_id="runtime-1",
+        turn_id="turn_first",
+        ttl_seconds=30.0,
+    ) == "claimed"
+    assert store.claim_user_message(
+        session.id,
+        "local-second-turn",
+        "second",
+        runtime_id="runtime-2",
+        turn_id="turn_second",
+        ttl_seconds=30.0,
+    ) == "busy"
+    store.commit_user_message(
+        session.id,
+        "local-first-turn",
+        "first",
+        runtime_id="runtime-1",
+        ttl_seconds=30.0,
+    )
+    assert store.claim_user_message(
+        session.id,
+        "local-second-turn",
+        "second",
+        runtime_id="runtime-2",
+        turn_id="turn_second",
+        ttl_seconds=30.0,
+    ) == "busy"
+    store.finish_user_message_turn_with_event(
+        session.id,
+        "local-first-turn",
+        turn_id="turn_first",
+        terminal_status="success",
+    )
+    assert store.claim_user_message(
+        session.id,
+        "local-second-turn",
+        "second",
+        runtime_id="runtime-2",
+        turn_id="turn_second",
+        ttl_seconds=30.0,
+    ) == "claimed"
+
+
+def test_running_public_tool_keeps_session_turn_fenced_after_foreground_terminal(
+    tmp_path: Path,
+) -> None:
+    store = WebSessionStore(tmp_path / "running-tool-turn-fence.sqlite")
+    session = store.create_session(title="running tool turn fence")
+    store.start_tool_run(
+        session.id,
+        "call-running",
+        "extract_and_sync",
+        "2026-07-15T00:00:00.000+00:00",
+    )
+
+    assert store.claim_user_message(
+        session.id,
+        "local-after-running-tool",
+        "must wait",
+        runtime_id="runtime-2",
+        turn_id="turn_after_running_tool",
+        ttl_seconds=30.0,
+    ) == "busy"

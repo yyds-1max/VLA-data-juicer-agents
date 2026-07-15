@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+import logging
 import time
 from collections.abc import Awaitable, Callable, Iterable
 from contextlib import suppress
@@ -10,6 +11,12 @@ from dataclasses import dataclass
 from typing import Any
 
 from vla_data_juicer_agents.core.cancellation import CancellationContext
+
+_logger = logging.getLogger(__name__)
+
+
+class _AmbiguousAppliedAckWriteError(RuntimeError):
+    """The ACK write may be durable, but its result could not be reconciled."""
 
 
 @dataclass(frozen=True)
@@ -19,6 +26,10 @@ class OwnerLease:
     cancellation: CancellationContext
     tool_call_ids: frozenset[str]
     wait_for_quiescence: Callable[[float], Awaitable[bool]] | None = None
+    publish_owner: bool = True
+    suppress_for_ack: Callable[[], bool] | None = None
+    restore_after_ack_failure: Callable[[], None] | None = None
+    on_acknowledged: Callable[[], None] | None = None
 
 
 class StopCoordinator:
@@ -80,9 +91,12 @@ class StopCoordinator:
                 self.REQUEST_CHANNEL,
                 on_ready=ready.set,
             ):
-                task = asyncio.create_task(self._handle_request(payload))
+                task = asyncio.create_task(
+                    self._handle_request(payload),
+                    name=f"datapilot-stop-handler-{self.runtime_id}",
+                )
                 self._handler_tasks.add(task)
-                task.add_done_callback(self._handler_tasks.discard)
+                task.add_done_callback(self._handler_task_done)
 
         self._subscriber_task = asyncio.create_task(
             subscribe_loop(),
@@ -123,6 +137,15 @@ class StopCoordinator:
         self._subscriber_task = None
         self._handler_tasks.clear()
 
+    def _handler_task_done(self, task: asyncio.Task) -> None:
+        self._handler_tasks.discard(task)
+        try:
+            task.result()
+        except asyncio.CancelledError:
+            return
+        except Exception:  # pylint: disable=broad-except
+            _logger.exception("Stop request handler failed")
+
     async def refresh_owners(self) -> None:
         async with self._refresh_lock:
             await self._refresh_owners_serialized()
@@ -131,7 +154,7 @@ class StopCoordinator:
         now = time.time()
         current: set[tuple[str, str]] = set()
         for lease in self._owner_leases():
-            if lease.generation < 0:
+            if lease.generation < 0 or not lease.publish_owner:
                 continue
             namespace = self.owner_namespace(lease.agentscope_session_id)
             field = f"{self.runtime_id}:{lease.generation}"
@@ -270,6 +293,7 @@ class StopCoordinator:
             return
 
         leases = list(self._owner_leases())
+        grouped: dict[str, list[tuple[str, int]]] = {}
         for owner in expected:
             if not isinstance(owner, dict) or owner.get("runtime_id") != self.runtime_id:
                 continue
@@ -282,17 +306,26 @@ class StopCoordinator:
                 generation = int(generation)
             except (TypeError, ValueError):
                 continue
+            grouped.setdefault(session_id, []).append((ack_field, generation))
+
+        for session_id, frozen in grouped.items():
             # Owner refresh publishes the admitted generation before it
             # removes the baseline generation. A requester can therefore
             # freeze either field (or both), while the process can still hold
-            # both an old pending-stop tombstone and a newer active lease. An
-            # ACK for the frozen field must cover the complete successor union,
-            # not stop at the first exact-generation match.
+            # both an old pending-stop tombstone and a newer active lease. All
+            # frozen fields for one runtime/session form one acknowledgement
+            # group; pruning the union after only its first field would make
+            # the remaining fields impossible to ACK.
+            oldest_frozen_generation = min(generation for _field, generation in frozen)
             matching = [
                 lease
                 for lease in leases
                 if lease.agentscope_session_id == session_id
-                and generation <= lease.generation <= target_generation
+                and lease.generation <= target_generation
+                and (
+                    oldest_frozen_generation <= lease.generation
+                    or not lease.publish_owner
+                )
             ]
             if not matching:
                 continue
@@ -303,21 +336,105 @@ class StopCoordinator:
             )
             if not all(quiescent):
                 continue
+            async with self._refresh_lock:
+                prepared: list[OwnerLease] = []
+                try:
+                    for lease in matching:
+                        if (
+                            lease.suppress_for_ack is not None
+                            and not lease.suppress_for_ack()
+                        ):
+                            raise RuntimeError(
+                                "stop owner became active before acknowledgement"
+                            )
+                        prepared.append(lease)
+                    # Heartbeat uses the same lock. Remove every quiescent
+                    # matching owner before the applied ACK can be observed.
+                    await self._refresh_owners_serialized()
+                except Exception:
+                    for lease in prepared:
+                        if lease.restore_after_ack_failure is not None:
+                            lease.restore_after_ack_failure()
+                    with suppress(Exception):
+                        await self._refresh_owners_serialized()
+                    raise
+
+                acknowledged_fields: list[str] = []
+                try:
+                    for ack_field, generation in frozen:
+                        await self._write_applied_ack(
+                            request_id=request_id,
+                            ack_field=ack_field,
+                            agentscope_session_id=session_id,
+                            generation=generation,
+                        )
+                        acknowledged_fields.append(ack_field)
+                except _AmbiguousAppliedAckWriteError:
+                    # registry_set may already be visible to the requester even
+                    # though this process could not read it back. Re-publishing
+                    # the owner after an applied ACK is therefore unsafe. Keep
+                    # the exact quiescent union suppressed so a later replay can
+                    # reconcile the ACK and invoke on_acknowledged.
+                    raise
+                except Exception:
+                    # With no visible field, the group can safely return to
+                    # normal owner publication. After a partial write, keep
+                    # the complete union suppressed: the requester resends
+                    # only missing fields, and suppressed older leases remain
+                    # matchable until the group converges.
+                    if not acknowledged_fields:
+                        for lease in prepared:
+                            if lease.restore_after_ack_failure is not None:
+                                lease.restore_after_ack_failure()
+                        await self._refresh_owners_serialized()
+                    raise
+
+                for lease in matching:
+                    if lease.on_acknowledged is not None:
+                        lease.on_acknowledged()
+
+    async def _write_applied_ack(
+        self,
+        *,
+        request_id: str,
+        ack_field: str,
+        agentscope_session_id: str,
+        generation: int,
+    ) -> None:
+        ack_namespace = self.ack_namespace(request_id)
+        payload = json.dumps(
+            {
+                "status": "applied",
+                "runtime_id": self.runtime_id,
+                "agentscope_session_id": agentscope_session_id,
+                "generation": generation,
+                "quiescent_at": time.time(),
+            },
+            sort_keys=True,
+        )
+        try:
             await self._bus.registry_set(
-                self.ack_namespace(request_id),
+                ack_namespace,
                 ack_field,
-                json.dumps(
-                    {
-                        "status": "applied",
-                        "runtime_id": self.runtime_id,
-                        "agentscope_session_id": session_id,
-                        "generation": generation,
-                        "quiescent_at": time.time(),
-                    },
-                    sort_keys=True,
-                ),
+                payload,
                 ttl_secs=max(30, int(self.ack_timeout * 4)),
             )
+            return
+        except Exception as write_error:
+            deadline = asyncio.get_running_loop().time() + self.ack_timeout
+            while True:
+                try:
+                    acknowledgements = await self._bus.registry_getall(ack_namespace)
+                except Exception:
+                    if asyncio.get_running_loop().time() >= deadline:
+                        raise _AmbiguousAppliedAckWriteError(
+                            "applied ACK write outcome could not be reconciled"
+                        ) from write_error
+                    await asyncio.sleep(self.retry_interval)
+                    continue
+                if self._ack_is_applied(acknowledgements.get(ack_field)):
+                    return
+                raise write_error
 
     async def _wait_for_lease(self, lease: OwnerLease) -> bool:
         if lease.wait_for_quiescence is not None:

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import hashlib
 import re
 import sqlite3
 import time
@@ -24,6 +25,7 @@ from vla_data_juicer_agents.web.schemas import (
 WEB_SCHEMA_GENERATION = "agentscope-native-events-v1"
 WEB_CONTROL_TABLES = (
     "session_run_admissions",
+    "session_turn_admissions",
     "session_deletions",
     "session_stop_requests",
     "tool_execution_provenance",
@@ -231,6 +233,23 @@ class WebSessionStore:
         )
         connection.execute(
             """
+            CREATE TABLE IF NOT EXISTS session_turn_admissions (
+                session_id TEXT NOT NULL,
+                message_id TEXT NOT NULL UNIQUE,
+                content TEXT NOT NULL,
+                runtime_id TEXT NOT NULL,
+                status TEXT NOT NULL CHECK(status IN ('pending', 'admitted', 'terminal')),
+                terminal_status TEXT NULL,
+                turn_id TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                expires_at REAL NOT NULL,
+                PRIMARY KEY (session_id, message_id),
+                FOREIGN KEY (session_id) REFERENCES sessions(id)
+            )
+            """
+        )
+        connection.execute(
+            """
             CREATE TABLE IF NOT EXISTS tool_execution_provenance (
                 session_id TEXT NOT NULL,
                 tool_call_id TEXT NOT NULL,
@@ -271,15 +290,41 @@ class WebSessionStore:
             """
         )
 
-    def create_session(self, title: str) -> SessionRecord:
+    def create_session(
+        self,
+        title: str,
+        *,
+        creation_id: str | None = None,
+    ) -> SessionRecord:
         timestamp = _now()
+        session_id = (
+            "session_"
+            + hashlib.sha256(creation_id.encode("utf-8")).hexdigest()[:32]
+            if creation_id is not None
+            else f"session_{uuid4().hex}"
+        )
         record = SessionRecord(
-            id=f"session_{uuid4().hex}",
+            id=session_id,
             title=title,
             created_at=timestamp,
             updated_at=timestamp,
         )
         with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            existing = connection.execute(
+                """
+                SELECT id, title, created_at, updated_at
+                FROM sessions WHERE id = ?
+                """,
+                (session_id,),
+            ).fetchone()
+            if existing is not None:
+                persisted = self._session_from_row(existing)
+                if persisted.title != title:
+                    raise sqlite3.IntegrityError(
+                        "creation_id was submitted with a different first message"
+                    )
+                return persisted
             connection.execute(
                 """
                 INSERT INTO sessions (id, title, created_at, updated_at)
@@ -353,17 +398,31 @@ class WebSessionStore:
             last_sequence=events[-1].sequence if events else 0,
         )
 
-    def append_message(self, session_id: str, *, role: MessageRole, content: str) -> ChatMessageRecord:
+    def append_message(
+        self,
+        session_id: str,
+        *,
+        role: MessageRole,
+        content: str,
+        message_id: str | None = None,
+    ) -> ChatMessageRecord:
         timestamp = _now()
         record = ChatMessageRecord(
-            id=f"message_{uuid4().hex}",
+            id=message_id or f"message_{uuid4().hex}",
             session_id=session_id,
             role=role,
             content=content,
             created_at=timestamp,
         )
         with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
             self._require_session(connection, session_id)
+            deleting = connection.execute(
+                "SELECT 1 FROM session_deletions WHERE session_id = ?",
+                (session_id,),
+            ).fetchone()
+            if deleting is not None:
+                raise RuntimeError("session deletion is pending")
             connection.execute(
                 """
                 INSERT INTO messages (id, session_id, role, content, created_at)
@@ -373,6 +432,341 @@ class WebSessionStore:
             )
             self._touch_session(connection, session_id, timestamp)
         return record
+
+    def claim_user_message(
+        self,
+        session_id: str,
+        message_id: str,
+        content: str,
+        *,
+        runtime_id: str,
+        turn_id: str,
+        ttl_seconds: float,
+        now: float | None = None,
+    ) -> Literal["claimed", "pending", "admitted", "orphaned", "busy"]:
+        if ttl_seconds <= 0:
+            raise ValueError("turn admission lease ttl_seconds must be positive")
+        timestamp = _now()
+        now_seconds = time.time() if now is None else now
+        with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            self._require_session(connection, session_id)
+            deleting = connection.execute(
+                "SELECT 1 FROM session_deletions WHERE session_id = ?",
+                (session_id,),
+            ).fetchone()
+            if deleting is not None:
+                raise RuntimeError("session deletion is pending")
+            existing = connection.execute(
+                """
+                SELECT session_id, content, status, expires_at
+                FROM session_turn_admissions
+                WHERE message_id = ?
+                """,
+                (message_id,),
+            ).fetchone()
+            if existing is not None:
+                if existing[0] != session_id or existing[1] != content:
+                    raise sqlite3.IntegrityError(
+                        "message_id was submitted with different content"
+                    )
+                if existing[2] == "terminal":
+                    return "admitted"
+                if existing[2] == "admitted":
+                    return (
+                        "orphaned"
+                        if float(existing[3]) <= now_seconds
+                        else "admitted"
+                    )
+                if float(existing[3]) > now_seconds:
+                    return "pending"
+                connection.execute(
+                    "DELETE FROM session_turn_admissions WHERE message_id = ?",
+                    (message_id,),
+                )
+            connection.execute(
+                """
+                DELETE FROM session_turn_admissions
+                WHERE status = 'pending' AND expires_at <= ?
+                """,
+                (now_seconds,),
+            )
+            busy = connection.execute(
+                """
+                SELECT 1 FROM session_turn_admissions
+                WHERE session_id = ? AND status IN ('pending', 'admitted')
+                UNION ALL
+                SELECT 1 FROM public_tool_runs
+                WHERE session_id = ? AND status = 'running'
+                LIMIT 1
+                """,
+                (session_id, session_id),
+            ).fetchone()
+            if busy is not None:
+                return "busy"
+            connection.execute(
+                """
+                INSERT INTO session_turn_admissions (
+                    session_id, message_id, content, runtime_id, status,
+                    turn_id, created_at, expires_at
+                ) VALUES (?, ?, ?, ?, 'pending', ?, ?, ?)
+                """,
+                (
+                    session_id,
+                    message_id,
+                    content,
+                    runtime_id,
+                    turn_id,
+                    timestamp,
+                    now_seconds + ttl_seconds,
+                ),
+            )
+        return "claimed"
+
+    def user_message_turn_id(self, session_id: str, message_id: str) -> str | None:
+        with self._connect() as connection:
+            row = connection.execute(
+                """
+                SELECT turn_id FROM session_turn_admissions
+                WHERE session_id = ? AND message_id = ?
+                """,
+                (session_id, message_id),
+            ).fetchone()
+        return str(row[0]) if row is not None else None
+
+    def user_message_turn_status(self, session_id: str, message_id: str) -> str | None:
+        with self._connect() as connection:
+            row = connection.execute(
+                """
+                SELECT status FROM session_turn_admissions
+                WHERE session_id = ? AND message_id = ?
+                """,
+                (session_id, message_id),
+            ).fetchone()
+        return str(row[0]) if row is not None else None
+
+    def admitted_user_message_turns(self, session_id: str) -> list[tuple[str, str]]:
+        """Return exact turns whose execution fence is still authoritative."""
+        with self._connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT message_id, turn_id
+                FROM session_turn_admissions
+                WHERE session_id = ? AND status = 'admitted'
+                ORDER BY created_at, message_id
+                """,
+                (session_id,),
+            ).fetchall()
+        return [(str(message_id), str(turn_id)) for message_id, turn_id in rows]
+
+    def renew_user_message(
+        self,
+        session_id: str,
+        message_id: str,
+        *,
+        runtime_id: str,
+        ttl_seconds: float,
+        now: float | None = None,
+    ) -> None:
+        if ttl_seconds <= 0:
+            raise ValueError("turn admission lease ttl_seconds must be positive")
+        now_seconds = time.time() if now is None else now
+        with self._connect() as connection:
+            cursor = connection.execute(
+                """
+                UPDATE session_turn_admissions
+                SET expires_at = ?
+                WHERE session_id = ? AND message_id = ? AND runtime_id = ?
+                  AND status IN ('pending', 'admitted')
+                  AND expires_at > ?
+                """,
+                (
+                    now_seconds + ttl_seconds,
+                    session_id,
+                    message_id,
+                    runtime_id,
+                    now_seconds,
+                ),
+            )
+        if cursor.rowcount == 0:
+            raise RuntimeError("user message admission lease was lost")
+
+    def commit_user_message(
+        self,
+        session_id: str,
+        message_id: str,
+        content: str,
+        *,
+        runtime_id: str,
+        ttl_seconds: float,
+    ) -> ChatMessageRecord:
+        if ttl_seconds <= 0:
+            raise ValueError("turn admission lease ttl_seconds must be positive")
+        timestamp = _now()
+        record = ChatMessageRecord(
+            id=message_id,
+            session_id=session_id,
+            role="user",
+            content=content,
+            created_at=timestamp,
+        )
+        with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            claim = connection.execute(
+                """
+                SELECT 1 FROM session_turn_admissions
+                WHERE session_id = ? AND message_id = ? AND content = ?
+                  AND runtime_id = ? AND status = 'pending' AND expires_at > ?
+                """,
+                (session_id, message_id, content, runtime_id, time.time()),
+            ).fetchone()
+            if claim is None:
+                raise RuntimeError("user message admission is missing")
+            connection.execute(
+                """
+                INSERT INTO messages (id, session_id, role, content, created_at)
+                VALUES (?, ?, ?, ?, ?)
+                """,
+                (record.id, record.session_id, record.role, record.content, record.created_at),
+            )
+            connection.execute(
+                """
+                UPDATE session_turn_admissions
+                SET status = 'admitted', expires_at = ?
+                WHERE session_id = ? AND message_id = ?
+                """,
+                (time.time() + ttl_seconds, session_id, message_id),
+            )
+            self._touch_session(connection, session_id, timestamp)
+        return record
+
+    def release_user_message(
+        self,
+        session_id: str,
+        message_id: str,
+        content: str,
+        *,
+        runtime_id: str,
+    ) -> bool:
+        with self._connect() as connection:
+            cursor = connection.execute(
+                """
+                DELETE FROM session_turn_admissions
+                WHERE session_id = ? AND message_id = ? AND content = ?
+                  AND runtime_id = ? AND status = 'pending'
+                """,
+                (session_id, message_id, content, runtime_id),
+            )
+        return cursor.rowcount > 0
+
+    def finish_user_message_turn_with_event(
+        self,
+        session_id: str,
+        message_id: str,
+        *,
+        turn_id: str,
+        terminal_status: Literal["success", "failure", "stopped"],
+        expired_before: float | None = None,
+    ) -> PublicEventRecord:
+        event = {
+            "id": f"event_{uuid4().hex}",
+            "created_at": _now(),
+            "type": "custom",
+            "name": "datapilot_run_terminal",
+            "value": {
+                "turn_id": turn_id,
+                "message_id": message_id,
+                "status": terminal_status,
+            },
+        }
+        event_json = json.dumps(event, ensure_ascii=False)
+        dedupe_key = hashlib.sha256(
+            f"run-terminal:{session_id}:{turn_id}".encode("utf-8")
+        ).hexdigest()
+        timestamp = _now()
+        with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            self._require_session(connection, session_id)
+            duplicate = connection.execute(
+                """
+                SELECT id, session_id, sequence, dedupe_key, event_json, created_at
+                FROM public_events
+                WHERE session_id = ? AND dedupe_key = ?
+                """,
+                (session_id, dedupe_key),
+            ).fetchone()
+            if duplicate is not None:
+                return self._public_event_from_row(duplicate)
+            expiry_clause = " AND expires_at <= ?" if expired_before is not None else ""
+            parameters: tuple[Any, ...] = (
+                (terminal_status, session_id, message_id, expired_before)
+                if expired_before is not None
+                else (terminal_status, session_id, message_id)
+            )
+            updated = connection.execute(
+                f"""
+                UPDATE session_turn_admissions
+                SET status = 'terminal', terminal_status = ?
+                WHERE session_id = ? AND message_id = ?
+                  AND status = 'admitted'
+                  {expiry_clause}
+                """,
+                parameters,
+            )
+            if updated.rowcount == 0:
+                raise RuntimeError("admitted user turn is unavailable")
+            sequence = int(
+                connection.execute(
+                    """
+                    SELECT COALESCE(MAX(sequence), 0) + 1
+                    FROM public_events
+                    WHERE session_id = ?
+                    """,
+                    (session_id,),
+                ).fetchone()[0]
+            )
+            record = PublicEventRecord(
+                id=f"event_{uuid4().hex}",
+                session_id=session_id,
+                sequence=sequence,
+                dedupe_key=dedupe_key,
+                event=event,
+                created_at=timestamp,
+            )
+            connection.execute(
+                """
+                INSERT INTO public_events (
+                    id, session_id, sequence, dedupe_key, event_json, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    record.id,
+                    record.session_id,
+                    record.sequence,
+                    record.dedupe_key,
+                    event_json,
+                    record.created_at,
+                ),
+            )
+            self._touch_session(connection, session_id, timestamp)
+        return record
+
+    def recover_expired_user_message_turns(
+        self,
+        session_id: str,
+        *,
+        now: float | None = None,
+    ) -> list[PublicEventRecord]:
+        """Do not infer execution quiescence from a missed heartbeat.
+
+        The row remains admitted (and therefore keeps the per-session fence)
+        until the owning cancellation lease reaches real agent/tool/worker
+        quiescence.  A user-initiated Stop performs the distributed owner/ACK
+        barrier when automatic ownership can no longer be proven.
+        """
+        del now
+        del session_id
+        return []
 
     def append_public_event(
         self,
@@ -1316,6 +1710,10 @@ class WebSessionStore:
                 (session_id,),
             )
             connection.execute(
+                "DELETE FROM session_turn_admissions WHERE session_id = ?",
+                (session_id,),
+            )
+            connection.execute(
                 "DELETE FROM agentscope_sessions WHERE web_session_id = ?", (session_id,)
             )
             cursor = connection.execute("DELETE FROM sessions WHERE id = ?", (session_id,))
@@ -1328,10 +1726,38 @@ class WebSessionStore:
         *,
         agent_id: str,
         agentscope_session_id: str,
+        admission_ticket: str | None = None,
+        runtime_id: str | None = None,
     ) -> None:
         timestamp = _now()
         with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
             self._require_session(connection, web_session_id)
+            deleting = connection.execute(
+                "SELECT 1 FROM session_deletions WHERE session_id = ?",
+                (web_session_id,),
+            ).fetchone()
+            if deleting is not None:
+                admitted = None
+                if admission_ticket is not None and runtime_id is not None:
+                    admitted = connection.execute(
+                        """
+                        SELECT 1
+                        FROM session_run_admissions
+                        WHERE session_id = ?
+                          AND ticket_id = ?
+                          AND runtime_id = ?
+                          AND expires_at > ?
+                        """,
+                        (
+                            web_session_id,
+                            admission_ticket,
+                            runtime_id,
+                            time.time(),
+                        ),
+                    ).fetchone()
+                if admitted is None:
+                    raise RuntimeError("session deletion is pending")
             connection.execute(
                 "UPDATE agentscope_sessions SET active = 0 WHERE web_session_id = ?",
                 (web_session_id,),

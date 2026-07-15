@@ -12,6 +12,7 @@ import {
   getSyncImages,
   getSyncImageUrl,
   interruptTurn,
+  isAmbiguousTurnSubmissionError,
   listSessions,
   recoverHumanDecision,
   submitHumanDecision,
@@ -42,6 +43,7 @@ vi.mock("../api/client", () => ({
   getSession: vi.fn(),
   submitTurn: vi.fn(),
   interruptTurn: vi.fn(),
+  isAmbiguousTurnSubmissionError: (error: unknown) => error instanceof TypeError,
   submitHumanDecision: vi.fn(),
   recoverHumanDecision: vi.fn(),
   streamSessionEvents: vi.fn(),
@@ -57,6 +59,7 @@ const apiMocks = vi.mocked({
   getSession,
   submitTurn,
   interruptTurn,
+  isAmbiguousTurnSubmissionError,
   submitHumanDecision,
   recoverHumanDecision,
   streamSessionEvents,
@@ -321,6 +324,8 @@ async function renderAppWithDashboardSettled() {
 
 beforeEach(() => {
   vi.clearAllMocks();
+  window.localStorage.clear();
+  window.sessionStorage.clear();
   resetNavigationDatasetSummaryCache();
   Object.defineProperty(window, "innerWidth", { configurable: true, writable: true, value: 1280 });
   Object.defineProperty(window, "innerHeight", { configurable: true, writable: true, value: 900 });
@@ -1782,12 +1787,148 @@ test("submitting the first draft message creates a session, opens events, submit
   });
   fireEvent.click(screen.getByRole("button", { name: "Send message" }));
 
-  expect(apiMocks.createSession).toHaveBeenCalledWith("清洗 VLA 数据");
-  await waitFor(() => expect(apiMocks.submitTurn).toHaveBeenCalledWith("session-created", "清洗 VLA 数据"));
+  expect(apiMocks.createSession).toHaveBeenCalledWith(
+    "清洗 VLA 数据",
+    expect.stringMatching(/^local-create-/),
+  );
+  await waitFor(() =>
+    expect(apiMocks.submitTurn).toHaveBeenCalledWith(
+      "session-created",
+      "清洗 VLA 数据",
+      expect.stringMatching(/^local-/),
+    ),
+  );
   expect(apiMocks.streamSessionEvents).toHaveBeenCalledWith("session-created", 0, expect.any(AbortSignal));
   expect(datapilotStore.getState().mode).toBe("active_session");
   expect(screen.getByText("清洗 VLA 数据")).toBeVisible();
   expect(screen.queryByText("开始一个任务")).not.toBeInTheDocument();
+});
+
+test("draft submit appends its unique user message before SSE can overtake HTTP", async () => {
+  const submission = deferred<string>();
+  const streamedStart = deferred<PublicEventEnvelope>();
+  apiMocks.submitTurn.mockReturnValue(submission.promise);
+  apiMocks.streamSessionEvents.mockImplementation((_sessionId, _cursor, signal) =>
+    (async function* () {
+      yield await streamedStart.promise;
+      await waitForAbort(signal);
+    })(),
+  );
+  await renderAppWithDashboardSettled();
+
+  fireEvent.click(screen.getByRole("button", { name: "Open DataPilot" }));
+  fireEvent.change(screen.getByPlaceholderText("我们要做什么？"), {
+    target: { value: "首条草稿消息" },
+  });
+  fireEvent.click(screen.getByRole("button", { name: "Send message" }));
+  await waitFor(() =>
+    expect(apiMocks.submitTurn).toHaveBeenCalledWith(
+      "session-created",
+      "首条草稿消息",
+      expect.stringMatching(/^local-/),
+    ),
+  );
+
+  const optimisticMessageId = datapilotStore.getState().conversation.messages[0]?.id;
+  expect(optimisticMessageId).toMatch(/^local-/);
+  expect(datapilotStore.getState().conversation.messages.map((message) => message.role)).toEqual([
+    "user",
+  ]);
+
+  streamedStart.resolve(
+    publicEnvelope(
+      1,
+      {
+        id: "draft-reply-before-http",
+        created_at: "2026-06-26T00:00:01Z",
+        type: EventType.REPLY_START,
+        session_id: "session-created",
+        reply_id: "draft-reply-before-http",
+        name: "DataPilot",
+        role: "assistant",
+      },
+      "session-created",
+    ),
+  );
+  await waitFor(() =>
+    expect(datapilotStore.getState().conversation.messages.map((message) => message.role)).toEqual([
+      "user",
+      "assistant",
+    ]),
+  );
+  expect(datapilotStore.getState().conversation.messages[0]?.id).toBe(optimisticMessageId);
+
+  submission.resolve("draft-turn-1");
+  await act(async () => {
+    await submission.promise;
+    await Promise.resolve();
+  });
+  expect(datapilotStore.getState().conversation.messages.map((message) => message.id)).toEqual([
+    optimisticMessageId,
+    "draft-reply-before-http",
+  ]);
+});
+
+test("draft optimistic user survives a higher-sequence snapshot before HTTP", async () => {
+  const submission = deferred<string>();
+  const snapshot = deferred<SessionDetail>();
+  apiMocks.submitTurn.mockReturnValue(submission.promise);
+  apiMocks.getSession.mockReturnValue(snapshot.promise);
+  await renderAppWithDashboardSettled();
+
+  fireEvent.click(screen.getByRole("button", { name: "Open DataPilot" }));
+  fireEvent.change(screen.getByPlaceholderText("我们要做什么？"), {
+    target: { value: "快照竞态首条消息" },
+  });
+  fireEvent.click(screen.getByRole("button", { name: "Send message" }));
+  await waitFor(() =>
+    expect(apiMocks.submitTurn).toHaveBeenCalledWith(
+      "session-created",
+      "快照竞态首条消息",
+      expect.stringMatching(/^local-/),
+    ),
+  );
+  await waitFor(() => expect(apiMocks.getSession).toHaveBeenCalledWith("session-created"));
+  const optimisticMessageId = datapilotStore.getState().conversation.messages[0]?.id;
+  expect(optimisticMessageId).toMatch(/^local-/);
+
+  snapshot.resolve({
+    ...emptySessionDetail("session-created", 1),
+    events: [
+      publicEnvelope(
+        1,
+        {
+          id: "snapshot-reply-before-http",
+          created_at: "2026-06-26T00:00:01Z",
+          type: EventType.REPLY_START,
+          session_id: "session-created",
+          reply_id: "snapshot-reply-before-http",
+          name: "DataPilot",
+          role: "assistant",
+        },
+        "session-created",
+      ),
+    ],
+  });
+  await act(async () => {
+    await snapshot.promise;
+    await Promise.resolve();
+  });
+
+  expect(datapilotStore.getState().conversation.messages.map((message) => message.id)).toEqual([
+    optimisticMessageId,
+    "snapshot-reply-before-http",
+  ]);
+
+  submission.resolve("draft-turn-snapshot");
+  await act(async () => {
+    await submission.promise;
+    await Promise.resolve();
+  });
+  expect(datapilotStore.getState().conversation.messages.map((message) => message.id)).toEqual([
+    optimisticMessageId,
+    "snapshot-reply-before-http",
+  ]);
 });
 
 test("closing while draft session creation is pending ignores the late created session", async () => {
@@ -1799,7 +1940,10 @@ test("closing while draft session creation is pending ignores the late created s
     target: { value: "迟到的创建" },
   });
   fireEvent.click(screen.getByRole("button", { name: "Send message" }));
-  await waitFor(() => expect(apiMocks.createSession).toHaveBeenCalledWith("迟到的创建"));
+  await waitFor(() => expect(apiMocks.createSession).toHaveBeenCalledWith(
+    "迟到的创建",
+    expect.stringMatching(/^local-create-/),
+  ));
 
   fireEvent.click(screen.getByRole("button", { name: "Close DataPilot" }));
   creation.resolve({
@@ -1835,7 +1979,10 @@ test("unmount while draft session creation is pending ignores the late created s
     target: { value: "卸载后的创建" },
   });
   fireEvent.click(screen.getByRole("button", { name: "Send message" }));
-  await waitFor(() => expect(apiMocks.createSession).toHaveBeenCalledWith("卸载后的创建"));
+  await waitFor(() => expect(apiMocks.createSession).toHaveBeenCalledWith(
+    "卸载后的创建",
+    expect.stringMatching(/^local-create-/),
+  ));
 
   rendered.unmount();
   creation.resolve({
@@ -1864,7 +2011,10 @@ test("starting a new draft invalidates an older pending session creation", async
     target: { value: "旧草稿" },
   });
   fireEvent.click(screen.getByRole("button", { name: "Send message" }));
-  await waitFor(() => expect(apiMocks.createSession).toHaveBeenCalledWith("旧草稿"));
+  await waitFor(() => expect(apiMocks.createSession).toHaveBeenCalledWith(
+    "旧草稿",
+    expect.stringMatching(/^local-create-/),
+  ));
 
   fireEvent.click(screen.getByRole("button", { name: "New session" }));
   creation.resolve({
@@ -1906,7 +2056,13 @@ test("draft submit is synchronously latched while session creation is pending", 
     updated_at: "2026-06-26T02:00:00Z",
   });
   await waitFor(() => expect(datapilotStore.getState().currentSessionId).toBe("session-first"));
-  await waitFor(() => expect(apiMocks.submitTurn).toHaveBeenCalledWith("session-first", "first"));
+  await waitFor(() =>
+    expect(apiMocks.submitTurn).toHaveBeenCalledWith(
+      "session-first",
+      "first",
+      expect.stringMatching(/^local-/),
+    ),
+  );
   expect(apiMocks.submitTurn).toHaveBeenCalledTimes(1);
   expect(screen.getByPlaceholderText("继续描述任务…")).toHaveValue("second");
 });
@@ -1928,12 +2084,56 @@ test("failed draft submit does not append a local user message", async () => {
   });
   fireEvent.click(screen.getByRole("button", { name: "Send message" }));
 
-  await waitFor(() => expect(apiMocks.submitTurn).toHaveBeenCalledWith("session-created", "会失败的任务"));
+  await waitFor(() =>
+    expect(apiMocks.submitTurn).toHaveBeenCalledWith(
+      "session-created",
+      "会失败的任务",
+      expect.stringMatching(/^local-/),
+    ),
+  );
   await waitFor(() => expect(datapilotStore.getState().mode).toBe("draft_new_session"));
   expect(datapilotStore.getState().conversation.messages).toEqual([]);
   expect(screen.queryByText("会失败的任务")).not.toBeInTheDocument();
   expect(screen.getByPlaceholderText("我们要做什么？")).toHaveValue("会失败的任务");
   expect(activeSignal?.aborted).toBe(true);
+  expect(consoleError).toHaveBeenCalledWith("Failed to submit DataPilot draft turn", expect.any(Error));
+  consoleError.mockRestore();
+});
+
+test("failed draft submit rolls back its exact optimistic message and preserves a newer draft", async () => {
+  const consoleError = vi.spyOn(console, "error").mockImplementation(() => undefined);
+  const submission = deferred<string>();
+  apiMocks.submitTurn.mockReturnValue(submission.promise);
+  await renderAppWithDashboardSettled();
+
+  fireEvent.click(screen.getByRole("button", { name: "Open DataPilot" }));
+  fireEvent.change(screen.getByPlaceholderText("我们要做什么？"), {
+    target: { value: "会回滚的首条消息" },
+  });
+  fireEvent.click(screen.getByRole("button", { name: "Send message" }));
+  await waitFor(() =>
+    expect(apiMocks.submitTurn).toHaveBeenCalledWith(
+      "session-created",
+      "会回滚的首条消息",
+      expect.stringMatching(/^local-/),
+    ),
+  );
+
+  const optimisticMessageId = datapilotStore.getState().conversation.messages[0]?.id;
+  expect(optimisticMessageId).toMatch(/^local-/);
+  expect(screen.getByText("会回滚的首条消息")).toBeVisible();
+  const activeComposer = screen.getByPlaceholderText("继续描述任务…");
+  fireEvent.change(activeComposer, { target: { value: "用户后来编辑的新草稿" } });
+
+  submission.reject(new Error("submit failed"));
+  await waitFor(() => expect(datapilotStore.getState().mode).toBe("draft_new_session"));
+  expect(datapilotStore.getState().conversation.messages).toEqual([]);
+  expect(
+    datapilotStore.getState().conversation.messages.some(
+      (message) => message.id === optimisticMessageId,
+    ),
+  ).toBe(false);
+  expect(screen.getByPlaceholderText("我们要做什么？")).toHaveValue("用户后来编辑的新草稿");
   expect(consoleError).toHaveBeenCalledWith("Failed to submit DataPilot draft turn", expect.any(Error));
   consoleError.mockRestore();
 });
@@ -1973,7 +2173,13 @@ test("failed active submit removes only its optimistic user message and restores
   });
   fireEvent.click(screen.getByRole("button", { name: "Send message" }));
 
-  await waitFor(() => expect(apiMocks.submitTurn).toHaveBeenCalledWith("session-1", "会失败的继续任务"));
+  await waitFor(() =>
+    expect(apiMocks.submitTurn).toHaveBeenCalledWith(
+      "session-1",
+      "会失败的继续任务",
+      expect.stringMatching(/^local-/),
+    ),
+  );
   const messagesBeforeRejection = datapilotStore.getState().conversation.messages;
   expect(messagesBeforeRejection).toHaveLength(2);
   expect(messagesBeforeRejection[0]?.id).toBe("persisted-same-text");
@@ -1986,6 +2192,439 @@ test("failed active submit removes only its optimistic user message and restores
   expect(datapilotStore.getState().conversation.messages[0]?.id).toBe("persisted-same-text");
   expect(screen.getByPlaceholderText("继续描述任务…")).toHaveValue("会失败的继续任务");
   expect(consoleError).toHaveBeenCalledWith("Failed to submit DataPilot active turn", expect.any(Error));
+  consoleError.mockRestore();
+});
+
+test("ambiguous active submit keeps its optimistic row and retries with the same message id", async () => {
+  const consoleError = vi.spyOn(console, "error").mockImplementation(() => undefined);
+  apiMocks.submitTurn
+    .mockRejectedValueOnce(new TypeError("network response lost"))
+    .mockResolvedValueOnce({ turnId: "turn-replayed", replayed: true, terminal: true });
+  datapilotStore.setState({
+    open: true,
+    mode: "active_session",
+    currentSessionId: "session-1",
+    previousActiveSessionId: null,
+    sessions: [
+      {
+        id: "session-1",
+        title: "Existing session",
+        created_at: "2026-06-26T00:00:00Z",
+        updated_at: "2026-06-26T00:00:00Z",
+      },
+    ],
+    conversation: createAgentConversation(),
+  });
+
+  await renderAppWithDashboardSettled();
+  const composer = screen.getByPlaceholderText("继续描述任务…");
+  fireEvent.change(composer, { target: { value: "精确重试" } });
+  fireEvent.click(screen.getByRole("button", { name: "Send message" }));
+
+  await waitFor(() => expect(apiMocks.submitTurn).toHaveBeenCalledTimes(1));
+  const firstMessageId = apiMocks.submitTurn.mock.calls[0]?.[2];
+  await waitFor(() => expect(composer).toHaveValue("精确重试"));
+  expect(datapilotStore.getState().conversation.messages.map((item) => item.id)).toEqual([
+    firstMessageId,
+  ]);
+
+  fireEvent.click(screen.getByRole("button", { name: "Send message" }));
+  await waitFor(() => expect(apiMocks.submitTurn).toHaveBeenCalledTimes(2));
+  expect(apiMocks.submitTurn.mock.calls[1]).toEqual([
+    "session-1",
+    "精确重试",
+    firstMessageId,
+  ]);
+  expect(datapilotStore.getState().conversation.messages).toHaveLength(1);
+  await waitFor(() =>
+    expect(screen.getByRole("button", { name: "Send message" })).toBeEnabled(),
+  );
+  consoleError.mockRestore();
+});
+
+test("ambiguous first turn keeps the created session and retries its exact message id", async () => {
+  const consoleError = vi.spyOn(console, "error").mockImplementation(() => undefined);
+  apiMocks.submitTurn
+    .mockRejectedValueOnce(new TypeError("network response lost"))
+    .mockResolvedValueOnce({ turnId: "turn-replayed", replayed: true, terminal: true });
+
+  await renderAppWithDashboardSettled();
+  fireEvent.click(screen.getByRole("button", { name: "Open DataPilot" }));
+  fireEvent.change(screen.getByPlaceholderText("我们要做什么？"), {
+    target: { value: "首条精确重试" },
+  });
+  fireEvent.click(screen.getByRole("button", { name: "Send message" }));
+
+  await waitFor(() => expect(apiMocks.submitTurn).toHaveBeenCalledTimes(1));
+  const firstMessageId = apiMocks.submitTurn.mock.calls[0]?.[2];
+  const activeComposer = await screen.findByPlaceholderText("继续描述任务…");
+  await waitFor(() => expect(activeComposer).toHaveValue("首条精确重试"));
+  expect(datapilotStore.getState().currentSessionId).toBe("session-created");
+
+  fireEvent.click(screen.getByRole("button", { name: "Send message" }));
+  await waitFor(() => expect(apiMocks.submitTurn).toHaveBeenCalledTimes(2));
+  expect(apiMocks.submitTurn.mock.calls[1]).toEqual([
+    "session-created",
+    "首条精确重试",
+    firstMessageId,
+  ]);
+  expect(datapilotStore.getState().conversation.messages).toHaveLength(1);
+  await waitFor(() =>
+    expect(screen.getByRole("button", { name: "Send message" })).toBeEnabled(),
+  );
+  consoleError.mockRestore();
+});
+
+test("a lost create response retries the first intent with the same creation id", async () => {
+  const consoleError = vi.spyOn(console, "error").mockImplementation(() => undefined);
+  apiMocks.createSession
+    .mockRejectedValueOnce(new TypeError("create response lost"))
+    .mockResolvedValueOnce({
+      id: "session-created-once",
+      title: "Create once",
+      created_at: "2026-07-15T00:00:00Z",
+      updated_at: "2026-07-15T00:00:00Z",
+    });
+  apiMocks.submitTurn.mockResolvedValueOnce({
+    turnId: "turn-created-once",
+    replayed: false,
+    terminal: false,
+  });
+
+  await renderAppWithDashboardSettled();
+  fireEvent.click(screen.getByRole("button", { name: "Open DataPilot" }));
+  const composer = screen.getByPlaceholderText("我们要做什么？");
+  fireEvent.change(composer, { target: { value: "只创建一个会话" } });
+  fireEvent.click(screen.getByRole("button", { name: "Send message" }));
+
+  await waitFor(() => expect(apiMocks.createSession).toHaveBeenCalledTimes(1));
+  const creationId = apiMocks.createSession.mock.calls[0]?.[1];
+  expect(creationId).toMatch(/^local-create-/);
+  await waitFor(() => expect(composer).toHaveValue("只创建一个会话"));
+
+  fireEvent.click(screen.getByRole("button", { name: "Send message" }));
+
+  await waitFor(() => expect(apiMocks.createSession).toHaveBeenCalledTimes(2));
+  expect(apiMocks.createSession.mock.calls[1]).toEqual(["只创建一个会话", creationId]);
+  await waitFor(() => expect(datapilotStore.getState().currentSessionId).toBe("session-created-once"));
+  consoleError.mockRestore();
+});
+
+test("reload during an ambiguous pending turn restores and reuses its durable outbox id", async () => {
+  const consoleError = vi.spyOn(console, "error").mockImplementation(() => undefined);
+  apiMocks.submitTurn.mockRejectedValueOnce(new TypeError("network response lost"));
+  datapilotStore.setState({
+    open: true,
+    mode: "active_session",
+    currentSessionId: "session-1",
+    previousActiveSessionId: null,
+    sessions: [
+      {
+        id: "session-1",
+        title: "Existing session",
+        created_at: "2026-06-26T00:00:00Z",
+        updated_at: "2026-06-26T00:00:00Z",
+      },
+    ],
+    conversation: createAgentConversation(),
+  });
+  const firstRender = await renderAppWithDashboardSettled();
+  fireEvent.change(screen.getByPlaceholderText("继续描述任务…"), {
+    target: { value: "刷新后精确重试" },
+  });
+  fireEvent.click(screen.getByRole("button", { name: "Send message" }));
+  await waitFor(() => expect(apiMocks.submitTurn).toHaveBeenCalledTimes(1));
+  const originalMessageId = apiMocks.submitTurn.mock.calls[0]?.[2];
+  await waitFor(() =>
+    expect(screen.getByPlaceholderText("继续描述任务…")).toHaveValue("刷新后精确重试"),
+  );
+  firstRender.unmount();
+
+  datapilotStore.setState({
+    open: true,
+    mode: "active_session",
+    currentSessionId: "session-1",
+    previousActiveSessionId: null,
+    conversation: createAgentConversation(),
+  });
+  apiMocks.submitTurn.mockResolvedValueOnce({
+    turnId: "turn-recovered",
+    replayed: true,
+    terminal: true,
+  });
+  await renderAppWithDashboardSettled();
+
+  const restoredComposer = screen.getByPlaceholderText("继续描述任务…");
+  await waitFor(() => expect(restoredComposer).toHaveValue("刷新后精确重试"));
+  expect(datapilotStore.getState().conversation.messages.map((item) => item.id)).toEqual([
+    originalMessageId,
+  ]);
+  fireEvent.click(screen.getByRole("button", { name: "Send message" }));
+  await waitFor(() => expect(apiMocks.submitTurn).toHaveBeenCalledTimes(2));
+  expect(apiMocks.submitTurn.mock.calls[1]).toEqual([
+    "session-1",
+    "刷新后精确重试",
+    originalMessageId,
+  ]);
+  consoleError.mockRestore();
+});
+
+test("reload rebases recovered draft ownership so an exact snapshot clears the draft and outbox", async () => {
+  const consoleError = vi.spyOn(console, "error").mockImplementation(() => undefined);
+  apiMocks.submitTurn.mockRejectedValueOnce(new TypeError("network response lost"));
+  datapilotStore.setState({
+    open: true,
+    mode: "active_session",
+    currentSessionId: "session-1",
+    previousActiveSessionId: null,
+    sessions: [{
+      id: "session-1",
+      title: "Existing session",
+      created_at: "2026-06-26T00:00:00Z",
+      updated_at: "2026-06-26T00:00:00Z",
+    }],
+    conversation: createAgentConversation(),
+  });
+  const firstRender = await renderAppWithDashboardSettled();
+  fireEvent.change(screen.getByPlaceholderText("继续描述任务…"), {
+    target: { value: "刷新后等待权威快照" },
+  });
+  fireEvent.click(screen.getByRole("button", { name: "Send message" }));
+  await waitFor(() => expect(apiMocks.submitTurn).toHaveBeenCalledTimes(1));
+  const messageId = apiMocks.submitTurn.mock.calls[0]?.[2] as string;
+  await waitFor(() =>
+    expect(screen.getByPlaceholderText("继续描述任务…")).toHaveValue("刷新后等待权威快照"),
+  );
+  firstRender.unmount();
+
+  datapilotStore.setState({
+    open: true,
+    mode: "active_session",
+    currentSessionId: "session-1",
+    previousActiveSessionId: null,
+    conversation: createAgentConversation(),
+  });
+  apiMocks.getSession.mockResolvedValue({
+    ...emptySessionDetail("session-1"),
+    messages: [{
+      id: messageId,
+      session_id: "session-1",
+      role: "user",
+      content: "刷新后等待权威快照",
+      created_at: "2026-07-15T00:00:00Z",
+    }],
+  });
+  await renderAppWithDashboardSettled();
+
+  const composer = screen.getByPlaceholderText("继续描述任务…");
+  await waitFor(() => expect(composer).toHaveValue(""));
+  expect(window.sessionStorage.getItem("datapilot-turn-outbox:session-1")).toBeNull();
+  fireEvent.change(composer, { target: { value: "刷新后等待权威快照" } });
+  fireEvent.click(screen.getByRole("button", { name: "Send message" }));
+  await waitFor(() => expect(apiMocks.submitTurn).toHaveBeenCalledTimes(2));
+  expect(apiMocks.submitTurn.mock.calls[1]?.[2]).not.toBe(messageId);
+  consoleError.mockRestore();
+});
+
+test("reload rebases recovered draft ownership so an exact terminal clears it", async () => {
+  const consoleError = vi.spyOn(console, "error").mockImplementation(() => undefined);
+  apiMocks.submitTurn.mockRejectedValueOnce(new TypeError("network response lost"));
+  datapilotStore.setState({
+    open: true,
+    mode: "active_session",
+    currentSessionId: "session-1",
+    previousActiveSessionId: null,
+    sessions: [{
+      id: "session-1",
+      title: "Existing session",
+      created_at: "2026-06-26T00:00:00Z",
+      updated_at: "2026-06-26T00:00:00Z",
+    }],
+    conversation: createAgentConversation(),
+  });
+  const firstRender = await renderAppWithDashboardSettled();
+  fireEvent.change(screen.getByPlaceholderText("继续描述任务…"), {
+    target: { value: "刷新后等待终态" },
+  });
+  fireEvent.click(screen.getByRole("button", { name: "Send message" }));
+  await waitFor(() => expect(apiMocks.submitTurn).toHaveBeenCalledTimes(1));
+  const messageId = apiMocks.submitTurn.mock.calls[0]?.[2] as string;
+  await waitFor(() =>
+    expect(screen.getByPlaceholderText("继续描述任务…")).toHaveValue("刷新后等待终态"),
+  );
+  firstRender.unmount();
+
+  datapilotStore.setState({
+    open: true,
+    mode: "active_session",
+    currentSessionId: "session-1",
+    previousActiveSessionId: null,
+    conversation: createAgentConversation(),
+  });
+  apiMocks.streamSessionEvents.mockImplementation((_sessionId, _afterSequence, signal) =>
+    eventStream([
+      publicEnvelope(1, {
+        id: "terminal-recovered",
+        created_at: "2026-07-15T00:00:01Z",
+        type: EventType.CUSTOM,
+        name: "datapilot_run_terminal",
+        value: { turn_id: "turn-recovered", message_id: messageId, status: "failure" },
+      }),
+    ], signal),
+  );
+  await renderAppWithDashboardSettled();
+
+  await waitFor(() =>
+    expect(screen.getByPlaceholderText("继续描述任务…")).toHaveValue(""),
+  );
+  expect(window.sessionStorage.getItem("datapilot-turn-outbox:session-1")).toBeNull();
+  consoleError.mockRestore();
+});
+
+test("closing and reopening before authority restores the in-memory ambiguous retry", async () => {
+  const consoleError = vi.spyOn(console, "error").mockImplementation(() => undefined);
+  apiMocks.submitTurn.mockRejectedValueOnce(new TypeError("network response lost"));
+  datapilotStore.setState({
+    open: true,
+    mode: "active_session",
+    currentSessionId: "session-1",
+    previousActiveSessionId: null,
+    sessions: [{
+      id: "session-1",
+      title: "Existing session",
+      created_at: "2026-06-26T00:00:00Z",
+      updated_at: "2026-06-26T00:00:00Z",
+    }],
+    conversation: createAgentConversation(),
+  });
+  await renderAppWithDashboardSettled();
+  fireEvent.change(screen.getByPlaceholderText("继续描述任务…"), {
+    target: { value: "关闭后仍需精确重试" },
+  });
+  fireEvent.click(screen.getByRole("button", { name: "Send message" }));
+  await waitFor(() => expect(apiMocks.submitTurn).toHaveBeenCalledTimes(1));
+  const messageId = apiMocks.submitTurn.mock.calls[0]?.[2];
+  await waitFor(() =>
+    expect(screen.getByPlaceholderText("继续描述任务…")).toHaveValue("关闭后仍需精确重试"),
+  );
+
+  fireEvent.click(screen.getByRole("button", { name: "Close DataPilot" }));
+  fireEvent.click(screen.getByRole("button", { name: "Open DataPilot" }));
+
+  const composer = await screen.findByPlaceholderText("继续描述任务…");
+  await waitFor(() => expect(composer).toHaveValue("关闭后仍需精确重试"));
+  expect(datapilotStore.getState().conversation.messages.map((message) => message.id)).toContain(
+    messageId,
+  );
+  consoleError.mockRestore();
+});
+
+test("switching away and back before authority restores the in-memory ambiguous retry", async () => {
+  const consoleError = vi.spyOn(console, "error").mockImplementation(() => undefined);
+  apiMocks.submitTurn.mockRejectedValueOnce(new TypeError("network response lost"));
+  const sessionA = {
+    id: "session-a",
+    title: "Session A",
+    created_at: "2026-06-26T00:00:00Z",
+    updated_at: "2026-06-26T00:00:00Z",
+  };
+  const sessionB = { ...sessionA, id: "session-b", title: "Session B" };
+  apiMocks.listSessions.mockResolvedValue([sessionA, sessionB]);
+  apiMocks.getSession.mockImplementation((sessionId) =>
+    Promise.resolve(emptySessionDetail(sessionId)),
+  );
+  datapilotStore.setState({
+    open: true,
+    mode: "active_session",
+    currentSessionId: "session-a",
+    previousActiveSessionId: null,
+    sessions: [sessionA, sessionB],
+    conversation: createAgentConversation(),
+  });
+  await renderAppWithDashboardSettled();
+  fireEvent.change(screen.getByPlaceholderText("继续描述任务…"), {
+    target: { value: "切走后仍需精确重试" },
+  });
+  fireEvent.click(screen.getByRole("button", { name: "Send message" }));
+  await waitFor(() => expect(apiMocks.submitTurn).toHaveBeenCalledTimes(1));
+  const messageId = apiMocks.submitTurn.mock.calls[0]?.[2];
+  await waitFor(() =>
+    expect(screen.getByPlaceholderText("继续描述任务…")).toHaveValue("切走后仍需精确重试"),
+  );
+
+  fireEvent.click(screen.getByRole("button", { name: "History" }));
+  fireEvent.click(await screen.findByRole("button", { name: "Open session Session B" }));
+  await waitFor(() => expect(datapilotStore.getState().currentSessionId).toBe("session-b"));
+  fireEvent.click(screen.getByRole("button", { name: "History" }));
+  fireEvent.click(await screen.findByRole("button", { name: "Open session Session A" }));
+
+  await waitFor(() => expect(datapilotStore.getState().currentSessionId).toBe("session-a"));
+  await waitFor(() =>
+    expect(screen.getByPlaceholderText("继续描述任务…")).toHaveValue("切走后仍需精确重试"),
+  );
+  expect(datapilotStore.getState().conversation.messages.map((message) => message.id)).toContain(
+    messageId,
+  );
+  consoleError.mockRestore();
+});
+
+test("authoritative exact snapshot retires ambiguous outbox before a later identical intent", async () => {
+  const consoleError = vi.spyOn(console, "error").mockImplementation(() => undefined);
+  apiMocks.submitTurn.mockRejectedValueOnce(new TypeError("network response lost"));
+  datapilotStore.setState({
+    open: true,
+    mode: "active_session",
+    currentSessionId: "session-1",
+    previousActiveSessionId: null,
+    sessions: [
+      {
+        id: "session-1",
+        title: "Existing session",
+        created_at: "2026-06-26T00:00:00Z",
+        updated_at: "2026-06-26T00:00:00Z",
+      },
+    ],
+    conversation: createAgentConversation(),
+  });
+  await renderAppWithDashboardSettled();
+  fireEvent.change(screen.getByPlaceholderText("继续描述任务…"), {
+    target: { value: "相同但新的意图" },
+  });
+  fireEvent.click(screen.getByRole("button", { name: "Send message" }));
+  await waitFor(() => expect(apiMocks.submitTurn).toHaveBeenCalledTimes(1));
+  const admittedMessageId = apiMocks.submitTurn.mock.calls[0]?.[2] as string;
+  await waitFor(() =>
+    expect(screen.getByPlaceholderText("继续描述任务…")).toHaveValue("相同但新的意图"),
+  );
+
+  apiMocks.getSession.mockResolvedValue({
+    id: "session-1",
+    title: "Existing session",
+    created_at: "2026-06-26T00:00:00Z",
+    updated_at: "2026-06-26T00:00:01Z",
+    messages: [
+      {
+        id: admittedMessageId,
+        session_id: "session-1",
+        role: "user",
+        content: "相同但新的意图",
+        created_at: "2026-06-26T00:00:01Z",
+      },
+    ],
+    events: [],
+    tool_runs: [],
+    last_sequence: 0,
+  });
+  act(() => datapilotStore.getState().setOpen(false));
+  act(() => datapilotStore.getState().setOpen(true));
+  const composer = await screen.findByPlaceholderText("继续描述任务…");
+  await waitFor(() => expect(composer).toHaveValue(""));
+
+  apiMocks.submitTurn.mockResolvedValueOnce("turn-new-intent");
+  fireEvent.change(composer, { target: { value: "相同但新的意图" } });
+  fireEvent.click(screen.getByRole("button", { name: "Send message" }));
+  await waitFor(() => expect(apiMocks.submitTurn).toHaveBeenCalledTimes(2));
+  expect(apiMocks.submitTurn.mock.calls[1]?.[2]).not.toBe(admittedMessageId);
   consoleError.mockRestore();
 });
 
@@ -2052,7 +2691,13 @@ test("late active submit response cannot append into a restored session", async 
     target: { value: "只属于 A 的消息" },
   });
   fireEvent.click(screen.getByRole("button", { name: "Send message" }));
-  await waitFor(() => expect(apiMocks.submitTurn).toHaveBeenCalledWith("session-a", "只属于 A 的消息"));
+  await waitFor(() =>
+    expect(apiMocks.submitTurn).toHaveBeenCalledWith(
+      "session-a",
+      "只属于 A 的消息",
+      expect.stringMatching(/^local-/),
+    ),
+  );
 
   fireEvent.click(screen.getByRole("button", { name: "History" }));
   fireEvent.click(await screen.findByRole("button", { name: "Open session Session B" }));
@@ -2113,7 +2758,13 @@ test("a stale rejection cannot remove messages or restore a draft in another ses
     target: { value: "A 的待定消息" },
   });
   fireEvent.click(screen.getByRole("button", { name: "Send message" }));
-  await waitFor(() => expect(apiMocks.submitTurn).toHaveBeenCalledWith("session-a", "A 的待定消息"));
+  await waitFor(() =>
+    expect(apiMocks.submitTurn).toHaveBeenCalledWith(
+      "session-a",
+      "A 的待定消息",
+      expect.stringMatching(/^local-/),
+    ),
+  );
   expect(datapilotStore.getState().conversation.messages).toHaveLength(1);
   expect(datapilotStore.getState().conversation.messages[0]?.id).toMatch(/^local-/);
 
@@ -2165,7 +2816,13 @@ test("late active submit response cannot append after deleting its session", asy
     target: { value: "删除后不得出现" },
   });
   fireEvent.click(screen.getByRole("button", { name: "Send message" }));
-  await waitFor(() => expect(apiMocks.submitTurn).toHaveBeenCalledWith("session-a", "删除后不得出现"));
+  await waitFor(() =>
+    expect(apiMocks.submitTurn).toHaveBeenCalledWith(
+      "session-a",
+      "删除后不得出现",
+      expect.stringMatching(/^local-/),
+    ),
+  );
 
   fireEvent.click(screen.getByRole("button", { name: "History" }));
   fireEvent.click(await screen.findByRole("button", { name: "Delete session Session A" }));
@@ -2200,7 +2857,13 @@ test("an active submit appends optimistically and HTTP success does not duplicat
     target: { value: "合法迟到消息" },
   });
   fireEvent.click(screen.getByRole("button", { name: "Send message" }));
-  await waitFor(() => expect(apiMocks.submitTurn).toHaveBeenCalledWith("session-a", "合法迟到消息"));
+  await waitFor(() =>
+    expect(apiMocks.submitTurn).toHaveBeenCalledWith(
+      "session-a",
+      "合法迟到消息",
+      expect.stringMatching(/^local-/),
+    ),
+  );
   expect(screen.getByText("合法迟到消息")).toBeVisible();
   expect(datapilotStore.getState().conversation.messages).toHaveLength(1);
   const optimisticMessageId = datapilotStore.getState().conversation.messages[0]?.id;
@@ -2234,7 +2897,12 @@ test("active submit is synchronously latched while request admission is pending"
   fireEvent.click(screen.getByRole("button", { name: "Send message" }));
   fireEvent.change(input, { target: { value: "第二条" } });
   fireEvent.click(screen.getByRole("button", { name: "Send message" }));
-  expect(apiMocks.submitTurn).toHaveBeenNthCalledWith(1, "session-a", "第一条");
+  expect(apiMocks.submitTurn).toHaveBeenNthCalledWith(
+    1,
+    "session-a",
+    "第一条",
+    expect.stringMatching(/^local-/),
+  );
   expect(apiMocks.submitTurn).toHaveBeenCalledTimes(1);
   expect(input).toHaveValue("第二条");
 
@@ -2282,7 +2950,11 @@ test("active submit is synchronously latched while request admission is pending"
   });
   fireEvent.click(screen.getByRole("button", { name: "Send message" }));
   expect(apiMocks.submitTurn).toHaveBeenCalledTimes(2);
-  expect(apiMocks.submitTurn).toHaveBeenLastCalledWith("session-a", "第二条");
+  expect(apiMocks.submitTurn).toHaveBeenLastCalledWith(
+    "session-a",
+    "第二条",
+    expect.stringMatching(/^local-/),
+  );
 });
 
 test("REPLY_START arriving before the submit response releases admission after HTTP accepts", async () => {
@@ -2454,7 +3126,13 @@ test("reopening an active session opens its SSE stream before submitting the tur
   });
   fireEvent.click(screen.getByRole("button", { name: "Send message" }));
 
-  await waitFor(() => expect(apiMocks.submitTurn).toHaveBeenCalledWith("session-1", "恢复后继续"));
+  await waitFor(() =>
+    expect(apiMocks.submitTurn).toHaveBeenCalledWith(
+      "session-1",
+      "恢复后继续",
+      expect.stringMatching(/^local-/),
+    ),
+  );
   expect(calls).toEqual(["stream:session-1:0", "stream:session-1:0", "submit:session-1"]);
 });
 
@@ -2783,7 +3461,13 @@ test("selecting any saved session restores it as writable active_session", async
     target: { value: "继续执行" },
   });
   fireEvent.click(screen.getByRole("button", { name: "Send message" }));
-  await waitFor(() => expect(apiMocks.submitTurn).toHaveBeenCalledWith("saved-1", "继续执行"));
+  await waitFor(() =>
+    expect(apiMocks.submitTurn).toHaveBeenCalledWith(
+      "saved-1",
+      "继续执行",
+      expect.stringMatching(/^local-/),
+    ),
+  );
 });
 
 test("reselecting the current history session replaces its stream", async () => {
@@ -2971,7 +3655,11 @@ test("submitting the first draft creates a writable SDK conversation", async () 
   fireEvent.click(screen.getByRole("button", { name: "Send message" }));
 
   await waitFor(() =>
-    expect(apiMocks.submitTurn).toHaveBeenCalledWith("session-created", "清洗 VLA 数据"),
+    expect(apiMocks.submitTurn).toHaveBeenCalledWith(
+      "session-created",
+      "清洗 VLA 数据",
+      expect.stringMatching(/^local-/),
+    ),
   );
   expect(datapilotStore.getState().mode).toBe("active_session");
   expect(datapilotStore.getState().conversation.messages[0]).toMatchObject({
@@ -3175,7 +3863,13 @@ test("stop keeps the draft editable and submits it after the terminating REPLY_E
   const send = await screen.findByRole("button", { name: "Send message" });
   expect(input).toHaveValue("保留并继续");
   fireEvent.click(send);
-  await waitFor(() => expect(apiMocks.submitTurn).toHaveBeenCalledWith("session-1", "保留并继续"));
+  await waitFor(() =>
+    expect(apiMocks.submitTurn).toHaveBeenCalledWith(
+      "session-1",
+      "保留并继续",
+      expect.stringMatching(/^local-/),
+    ),
+  );
 });
 
 test("running Composer shows a square stop button", () => {

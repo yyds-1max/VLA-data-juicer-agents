@@ -9,6 +9,7 @@ import {
   getSyncImageUrl,
   getSyncImages,
   interruptTurn,
+  isAmbiguousTurnSubmissionError,
   listSessions,
   recoverHumanDecision,
   submitHumanDecision,
@@ -70,10 +71,10 @@ describe("api client", () => {
     const record = session();
     const fetchMock = mockFetchJson({ session: record });
 
-    await expect(createSession("hello")).resolves.toEqual(record);
+    await expect(createSession("hello", "local-create-1")).resolves.toEqual(record);
     expect(fetchMock).toHaveBeenCalledWith("/api/sessions", {
       method: "POST",
-      body: JSON.stringify({ message: "hello" }),
+      body: JSON.stringify({ message: "hello", creation_id: "local-create-1" }),
       headers: { "content-type": "application/json" },
     });
   });
@@ -99,14 +100,101 @@ describe("api client", () => {
   });
 
   it("encodes the session id and posts a submitted turn message", async () => {
-    const fetchMock = mockFetchJson({ turn_id: "turn-1" });
+    const fetchMock = mockFetchJson({
+      turn_id: "turn-1",
+      replayed: false,
+      terminal: false,
+    });
 
-    await expect(submitTurn("session/with space", "next")).resolves.toBe("turn-1");
+    await expect(
+      submitTurn("session/with space", "next", "local-message-1"),
+    ).resolves.toEqual({ turnId: "turn-1", replayed: false, terminal: false });
     expect(fetchMock).toHaveBeenCalledWith("/api/sessions/session%2Fwith%20space/turns", {
       method: "POST",
-      body: JSON.stringify({ message: "next" }),
+      body: JSON.stringify({ message: "next", message_id: "local-message-1" }),
       headers: { "content-type": "application/json" },
     });
+  });
+
+  it("classifies an explicit pending exact turn as ambiguous and retryable", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn().mockResolvedValue({
+        ok: false,
+        status: 409,
+        statusText: "Conflict",
+        text: () =>
+          Promise.resolve(
+            JSON.stringify({
+              detail: {
+                code: "turn_submission_pending",
+                message: "turn submission is still pending",
+              },
+            }),
+          ),
+      }),
+    );
+
+    const error = await submitTurn("session-1", "same", "local-pending-1").catch(
+      (caught) => caught,
+    );
+
+    expect(error).toMatchObject({
+      status: 409,
+      code: "turn_submission_pending",
+    });
+    expect(isAmbiguousTurnSubmissionError(error)).toBe(true);
+    expect(isAmbiguousTurnSubmissionError(new TypeError("network lost"))).toBe(true);
+  });
+
+  it("classifies transient HTTP and success-body decode failures as ambiguous turns", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn().mockResolvedValue({
+        ok: false,
+        status: 502,
+        statusText: "Bad Gateway",
+        text: () => Promise.resolve("upstream response lost"),
+      }),
+    );
+    const gatewayError = await submitTurn(
+      "session-1",
+      "same",
+      "local-gateway-1",
+    ).catch((caught) => caught);
+    expect(isAmbiguousTurnSubmissionError(gatewayError)).toBe(true);
+
+    vi.stubGlobal(
+      "fetch",
+      vi.fn().mockResolvedValue({
+        ok: true,
+        status: 200,
+        statusText: "OK",
+        json: () => Promise.reject(new SyntaxError("truncated JSON")),
+      }),
+    );
+    const decodeError = await submitTurn(
+      "session-1",
+      "same",
+      "local-decode-1",
+    ).catch((caught) => caught);
+    expect(isAmbiguousTurnSubmissionError(decodeError)).toBe(true);
+  });
+
+  it.each([
+    ["missing turn id", { replayed: false, terminal: false }],
+    ["empty turn id", { turn_id: "", replayed: false, terminal: false }],
+    ["non-boolean replayed", { turn_id: "turn-1", replayed: "false", terminal: false }],
+    ["missing terminal", { turn_id: "turn-1", replayed: false }],
+  ])("rejects a malformed successful turn response as ambiguous: %s", async (_name, body) => {
+    mockFetchJson(body);
+
+    const error = await submitTurn("session-1", "same", "local-malformed-1").catch(
+      (caught) => caught,
+    );
+
+    expect(error).toBeInstanceOf(SyntaxError);
+    expect(isAmbiguousTurnSubmissionError(error)).toBe(true);
   });
 
   it("encodes the session id and posts an interrupt request", async () => {

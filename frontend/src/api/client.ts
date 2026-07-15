@@ -42,21 +42,76 @@ async function responseErrorMessage(response: Response): Promise<string> {
   return text;
 }
 
+export class ApiResponseError extends Error {
+  constructor(
+    message: string,
+    readonly status: number,
+    readonly code: string | null = null,
+  ) {
+    super(message);
+    this.name = "ApiResponseError";
+  }
+}
+
+async function responseError(response: Response): Promise<ApiResponseError> {
+  const fallback = `${response.status} ${response.statusText}`;
+  const text = await response.text();
+  if (!text) {
+    return new ApiResponseError(fallback, response.status);
+  }
+  try {
+    const parsed = JSON.parse(text) as { detail?: unknown };
+    const detail = parsed?.detail;
+    if (typeof detail === "string") {
+      return new ApiResponseError(detail, response.status);
+    }
+    if (detail && typeof detail === "object") {
+      const value = detail as { code?: unknown; message?: unknown };
+      return new ApiResponseError(
+        typeof value.message === "string" ? value.message : JSON.stringify(detail),
+        response.status,
+        typeof value.code === "string" ? value.code : null,
+      );
+    }
+  } catch {
+    return new ApiResponseError(text, response.status);
+  }
+  return new ApiResponseError(text, response.status);
+}
+
+export function isAmbiguousTurnSubmissionError(error: unknown): boolean {
+  return (
+    error instanceof TypeError ||
+    error instanceof SyntaxError ||
+    (error instanceof ApiResponseError &&
+      (error.code === "turn_submission_pending" ||
+        error.status === 408 ||
+        error.status === 429 ||
+        error.status >= 500))
+  );
+}
+
+export type SubmitTurnResult = {
+  turnId: string;
+  replayed: boolean;
+  terminal: boolean;
+};
+
 async function requestJson<T>(url: string, init?: RequestInit): Promise<T> {
   const response = await fetch(url, {
     ...init,
     headers: { "content-type": "application/json", ...(init?.headers ?? {}) },
   });
   if (!response.ok) {
-    throw new Error(await responseErrorMessage(response));
+    throw await responseError(response);
   }
   return (await response.json()) as T;
 }
 
-export async function createSession(message: string): Promise<SessionRecord> {
+export async function createSession(message: string, creationId: string): Promise<SessionRecord> {
   const data = await requestJson<{ session: SessionRecord }>("/api/sessions", {
     method: "POST",
-    body: JSON.stringify({ message }),
+    body: JSON.stringify({ message, creation_id: creationId }),
   });
   return data.session;
 }
@@ -84,12 +139,31 @@ export async function deleteSession(sessionId: string): Promise<void> {
   }
 }
 
-export async function submitTurn(sessionId: string, message: string): Promise<string> {
-  const data = await requestJson<{ turn_id: string }>(`${sessionPath(sessionId)}/turns`, {
+export async function submitTurn(
+  sessionId: string,
+  message: string,
+  messageId: string,
+): Promise<SubmitTurnResult | string> {
+  const data = await requestJson<unknown>(`${sessionPath(sessionId)}/turns`, {
     method: "POST",
-    body: JSON.stringify({ message }),
+    body: JSON.stringify({ message, message_id: messageId }),
   });
-  return data.turn_id;
+  if (
+    !data ||
+    typeof data !== "object" ||
+    typeof (data as Record<string, unknown>).turn_id !== "string" ||
+    !(data as Record<string, unknown>).turn_id ||
+    typeof (data as Record<string, unknown>).replayed !== "boolean" ||
+    typeof (data as Record<string, unknown>).terminal !== "boolean"
+  ) {
+    throw new SyntaxError("Malformed successful turn submission response");
+  }
+  const response = data as { turn_id: string; replayed: boolean; terminal: boolean };
+  return {
+    turnId: response.turn_id,
+    replayed: response.replayed,
+    terminal: response.terminal,
+  };
 }
 
 export async function interruptTurn(sessionId: string): Promise<boolean> {

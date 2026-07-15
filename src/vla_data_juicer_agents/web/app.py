@@ -4,6 +4,7 @@ import asyncio
 import inspect
 import logging
 import os
+import sqlite3
 from collections.abc import Callable
 from contextlib import asynccontextmanager, suppress
 from pathlib import Path
@@ -19,11 +20,16 @@ from vla_data_juicer_agents.navigation.dataset_catalog import (
     scan_navigation_dataset,
     scan_navigation_date,
 )
-from vla_data_juicer_agents.web.agent_session import AgentScopeWebSessionManager
+from vla_data_juicer_agents.web.agent_session import (
+    AgentScopeWebSessionManager,
+    TurnSessionBusy,
+    TurnSubmissionPending,
+    TurnSubmissionResult,
+)
 from vla_data_juicer_agents.web.event_stream import SessionEventBus
 from vla_data_juicer_agents.web.schemas import (
+    CreateSessionRequest,
     CreateSessionResponse,
-    CreateTurnRequest,
     CreateTurnResponse,
     HumanDecisionRequest,
     HumanDecisionRecoveryRequest,
@@ -31,6 +37,7 @@ from vla_data_juicer_agents.web.schemas import (
     HumanDecisionResponse,
     InterruptResponse,
     PublicEventRecord,
+    SubmitTurnRequest,
 )
 from vla_data_juicer_agents.web.session_store import WebSessionStore
 from vla_data_juicer_agents.web.sse import iter_sse
@@ -96,6 +103,10 @@ def _create_app_for_manager(
 
     manager = manager_builder(store, publish_session_event)
 
+    async def recover_expired_turns(session_id: str) -> None:
+        for record in store.recover_expired_user_message_turns(session_id):
+            await bus.publish(session_id, record)
+
     @asynccontextmanager
     async def lifespan(_parent_app: FastAPI):
         if agentscope_runtime is None:
@@ -144,8 +155,16 @@ def _create_app_for_manager(
         app.mount(agentscope_runtime.config.agentscope_mount_path, agentscope_runtime.app)
 
     @app.post("/api/sessions", response_model=CreateSessionResponse)
-    async def create_session(request: CreateTurnRequest) -> CreateSessionResponse:
-        session = await _maybe_await(manager.create_session(request.message))
+    async def create_session(request: CreateSessionRequest) -> CreateSessionResponse:
+        try:
+            session = await _maybe_await(
+                manager.create_session(
+                    request.message,
+                    creation_id=request.creation_id,
+                )
+            )
+        except (RuntimeError, sqlite3.IntegrityError) as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
         return CreateSessionResponse(session=session)
 
     @app.get("/api/sessions")
@@ -154,6 +173,7 @@ def _create_app_for_manager(
 
     @app.get("/api/sessions/{session_id}")
     async def get_session(session_id: str) -> dict[str, dict[str, Any]]:
+        await recover_expired_turns(session_id)
         session = store.get_session(session_id)
         if session is None:
             raise HTTPException(status_code=404, detail="Session not found")
@@ -201,16 +221,34 @@ def _create_app_for_manager(
             _raise_navigation_http_error(exc)
 
     @app.post("/api/sessions/{session_id}/turns", response_model=CreateTurnResponse)
-    async def submit_turn(session_id: str, request: CreateTurnRequest) -> CreateTurnResponse:
+    async def submit_turn(session_id: str, request: SubmitTurnRequest) -> CreateTurnResponse:
+        await recover_expired_turns(session_id)
         try:
-            turn_id = await _maybe_await(manager.submit_turn(session_id, request.message))
+            turn_id = await _maybe_await(
+                manager.submit_turn(
+                    session_id,
+                    request.message,
+                    message_id=request.message_id,
+                )
+            )
         except KeyError as exc:
             raise HTTPException(status_code=404, detail="Session not found") from exc
+        except (TurnSubmissionPending, TurnSessionBusy) as exc:
+            raise HTTPException(
+                status_code=409,
+                detail={"code": exc.code, "message": str(exc)},
+            ) from exc
         except RuntimeError as exc:
             raise HTTPException(status_code=409, detail=str(exc)) from exc
         if turn_submitted is not None:
             await _maybe_await(turn_submitted(session_id, manager, store, bus))
-        return CreateTurnResponse(turn_id=turn_id)
+        if isinstance(turn_id, TurnSubmissionResult):
+            return CreateTurnResponse(
+                turn_id=turn_id.turn_id,
+                replayed=turn_id.replayed,
+                terminal=turn_id.terminal,
+            )
+        return CreateTurnResponse(turn_id=turn_id, replayed=False, terminal=False)
 
     @app.post("/api/sessions/{session_id}/interrupt", response_model=InterruptResponse)
     async def interrupt(session_id: str) -> InterruptResponse:
@@ -284,6 +322,7 @@ def _create_app_for_manager(
         session_id: str,
         after_sequence: int = 0,
     ) -> StreamingResponse:
+        await recover_expired_turns(session_id)
         if store.get_session(session_id) is None:
             raise HTTPException(status_code=404, detail="Session not found")
         return StreamingResponse(

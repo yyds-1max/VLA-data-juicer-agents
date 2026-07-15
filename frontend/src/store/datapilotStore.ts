@@ -93,6 +93,10 @@ export function createDataPilotStore() {
         }
         if (session.last_sequence === state.conversation.lastSequence) {
           const conversation = cloneConversation(state.conversation);
+          conversation.messages = conversationFromDetailPreservingOptimistic(
+            session,
+            state.conversation,
+          ).messages;
           mergeAuthoritativeToolRuns(conversation, session.tool_runs);
           return {
             sessions: upsertSession(state.sessions, session),
@@ -101,7 +105,10 @@ export function createDataPilotStore() {
         }
         return {
           sessions: upsertSession(state.sessions, session),
-          conversation: conversationFromDetail(session),
+          conversation: conversationFromDetailPreservingOptimistic(
+            session,
+            state.conversation,
+          ),
         };
       }),
 
@@ -189,6 +196,41 @@ function conversationFromDetail(session: SessionDetail): AgentConversationState 
     toolRuns: session.tool_runs,
     lastSequence: session.last_sequence,
   });
+}
+
+function conversationFromDetailPreservingOptimistic(
+  session: SessionDetail,
+  current: AgentConversationState,
+): AgentConversationState {
+  const rebuilt = conversationFromDetail(session);
+  const optimistic = current.messages.filter(
+    (message) => message.role === "user" && message.id.startsWith("local-"),
+  );
+  if (optimistic.length === 0) {
+    return rebuilt;
+  }
+
+  for (const message of optimistic) {
+    if (rebuilt.messages.some((candidate) => candidate.id === message.id)) {
+      continue;
+    }
+
+    const currentIndex = current.messages.findIndex(
+      (candidate) => candidate.id === message.id,
+    );
+    let insertionIndex = 0;
+    for (let index = currentIndex - 1; index >= 0; index -= 1) {
+      const anchorIndex = rebuilt.messages.findIndex(
+        (candidate) => candidate.id === current.messages[index].id,
+      );
+      if (anchorIndex >= 0) {
+        insertionIndex = anchorIndex + 1;
+        break;
+      }
+    }
+    rebuilt.messages.splice(insertionIndex, 0, structuredClone(message));
+  }
+  return rebuilt;
 }
 
 function cloneConversation(conversation: AgentConversationState): AgentConversationState {

@@ -909,7 +909,7 @@ describe("DataPilot conversation store", () => {
     });
   });
 
-  it("merges equal-sequence tool rows without rebuilding local messages or cleared HITL", () => {
+  it("merges equal-sequence authoritative messages and tools while preserving optimistic rows and cleared HITL", () => {
     const store = createDataPilotStore();
     const decisionEvent = {
       ...envelope(
@@ -960,7 +960,10 @@ describe("DataPilot conversation store", () => {
     );
 
     const conversation = store.getState().conversation;
-    expect(conversation.messages.map((message) => message.id)).toEqual(["local-user"]);
+    expect(conversation.messages.map((message) => message.id)).toEqual([
+      "local-user",
+      "server-user",
+    ]);
     expect(conversation.pendingHumanDecision).toBeNull();
     expect(conversation.toolRuns["call-1"]).toMatchObject({
       status: "failure",
@@ -969,6 +972,58 @@ describe("DataPilot conversation store", () => {
     expect(conversation.toolRuns["call-2"]).toMatchObject({ status: "running" });
     expect(conversation.toolRuns["call-3"]).toMatchObject({ status: "success" });
     expect(conversation.lastSequence).toBe(5);
+  });
+
+  it("shows another tab's exact user message at the same event cursor", () => {
+    const store = createDataPilotStore();
+    store.getState().restoreSession(sessionDetail({ last_sequence: 0 }));
+
+    store.getState().refreshActiveSession(
+      sessionDetail({
+        messages: [
+          userRecord(
+            "local-other-tab-message",
+            "submitted elsewhere",
+            "2026-07-15T08:00:06.000Z",
+          ),
+        ],
+        last_sequence: 0,
+      }),
+    );
+
+    expect(store.getState().conversation.messages.map((message) => message.id)).toEqual([
+      "local-other-tab-message",
+    ]);
+  });
+
+  it("does not let an uncorrelated late run terminal clear a newly started reply", () => {
+    const restored = restoreAgentConversation({
+      messages: [],
+      events: [
+        envelope(1, {
+          id: "reply-start",
+          created_at: CREATED_AT,
+          type: EventType.REPLY_START,
+          session_id: "session-1",
+            reply_id: "new-wakeup-reply",
+          name: "DataPilot",
+          role: "assistant",
+        }),
+        envelope(
+          2,
+          custom("datapilot_run_terminal", {
+            turn_id: "turn-crashed",
+            message_id: "local-crashed",
+            status: "failure",
+          }),
+        ),
+      ],
+      toolRuns: [],
+      lastSequence: 2,
+    });
+
+    expect(restored.currentReplyId).toBe("new-wakeup-reply");
+    expect(restored.phase).toBe("streaming");
   });
 
   it("does not roll back conversation state from a lower-sequence snapshot", () => {
@@ -1055,6 +1110,80 @@ describe("DataPilot conversation store", () => {
     expect(store.getState().conversation.messages[1].content).toContainEqual(
       expect.objectContaining({ type: "text", text: "complete reply" }),
     );
+  });
+
+  it("preserves an unreconciled optimistic user across a higher-sequence snapshot", () => {
+    const store = createDataPilotStore();
+    store.getState().restoreSession(sessionDetail({ last_sequence: 0 }));
+    store.getState().appendUserMessage(
+      userRecord(
+        "local-optimistic",
+        "first draft request",
+        "2026-07-15T08:00:01.000Z",
+      ),
+    );
+
+    store.getState().refreshActiveSession(
+      sessionDetail({
+        messages: [],
+        events: [
+          timedEnvelope(1, replyStart("reply-fast"), "2026-07-15T08:00:02.000Z"),
+        ],
+        last_sequence: 1,
+      }),
+    );
+
+    expect(store.getState().conversation.messages.map((message) => message.id)).toEqual([
+      "local-optimistic",
+      "reply-fast",
+    ]);
+  });
+
+  it("reconciles an optimistic user only with its exact authoritative message id", () => {
+    const store = createDataPilotStore();
+    store.getState().restoreSession(sessionDetail({ last_sequence: 0 }));
+    store.getState().appendUserMessage(
+      userRecord("local-exact", "same request", "2026-07-15T08:00:01.000Z"),
+    );
+
+    store.getState().refreshActiveSession(
+      sessionDetail({
+        messages: [
+          userRecord("local-exact", "same request", "2026-07-15T08:00:02.000Z"),
+        ],
+        last_sequence: 1,
+      }),
+    );
+
+    expect(store.getState().conversation.messages.map((message) => message.id)).toEqual([
+      "local-exact",
+    ]);
+  });
+
+  it("does not reconcile another tab's same-text message with the local optimistic id", () => {
+    const store = createDataPilotStore();
+    store.getState().restoreSession(sessionDetail({ last_sequence: 0 }));
+    store.getState().appendUserMessage(
+      userRecord("local-this-tab", "identical text", "2026-07-15T08:00:01.000Z"),
+    );
+
+    store.getState().refreshActiveSession(
+      sessionDetail({
+        messages: [
+          userRecord("local-other-tab", "identical text", "2026-07-15T08:00:02.000Z"),
+        ],
+        events: [
+          timedEnvelope(1, replyStart("reply-other-tab"), "2026-07-15T08:00:03.000Z"),
+        ],
+        last_sequence: 1,
+      }),
+    );
+
+    expect(store.getState().conversation.messages.map((message) => message.id)).toEqual([
+      "local-this-tab",
+      "local-other-tab",
+      "reply-other-tab",
+    ]);
   });
 });
 

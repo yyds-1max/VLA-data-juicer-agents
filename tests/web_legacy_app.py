@@ -45,10 +45,16 @@ class WebSessionManager:
         self._controllers: dict[str, Any] = {}
         self._lock = threading.RLock()
 
-    def create_session(self, first_message: str) -> SessionRecord:
+    def create_session(
+        self,
+        first_message: str,
+        *,
+        creation_id: str | None = None,
+    ) -> SessionRecord:
         with self._lock:
             session = self._store.create_session(
-                title=generate_session_title(first_message)
+                title=generate_session_title(first_message),
+                creation_id=creation_id,
             )
             try:
                 controller = self._controller_factory(
@@ -66,11 +72,22 @@ class WebSessionManager:
         with self._lock:
             return self._controllers[session_id]
 
-    def submit_turn(self, session_id: str, message: str) -> str:
+    def submit_turn(
+        self,
+        session_id: str,
+        message: str,
+        *,
+        message_id: str | None = None,
+    ) -> str:
         with self._lock:
             controller = self.get_controller(session_id)
             controller.submit_turn(message)
-            self._store.append_message(session_id, role="user", content=message)
+            self._store.append_message(
+                session_id,
+                role="user",
+                content=message,
+                message_id=message_id,
+            )
             return f"turn_{uuid4().hex}"
 
     def interrupt(self, session_id: str) -> bool:

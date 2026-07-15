@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 from collections import defaultdict
 from types import SimpleNamespace
 
@@ -689,6 +690,76 @@ async def test_stop_ack_converges_when_refresh_snapshot_contains_old_and_new_own
 
 
 @pytest.mark.asyncio
+async def test_runtime_owner_acks_old_and_new_frozen_fields_as_one_union(
+    tmp_path,
+) -> None:
+    bus = SharedBus()
+    store = WebSessionStore(tmp_path / "runtime-old-new-owner.sqlite")
+    public_session = store.create_session("runtime old/new frozen owners")
+    internal_session_id = "session-1"
+    store.save_agentscope_session_mapping(
+        public_session.id,
+        agent_id="main-router-agent",
+        agentscope_session_id=internal_session_id,
+    )
+    old_generation = store.begin_execution_generation(public_session.id)
+    stop_request = store.begin_or_resume_stop_request(public_session.id)
+    owner_runtime = _runtime(bus, "owner")
+    owner_runtime.set_web_session_store(WebSessionStore(store.db_path))
+    old = CancellationContext()
+    new = CancellationContext()
+    owner_runtime.register_run_cancellation(
+        internal_session_id,
+        old,
+        generation=old_generation,
+    )
+    owner_runtime.clear_run_cancellation(internal_session_id, old)
+    owner_runtime.register_run_cancellation(
+        internal_session_id,
+        new,
+        generation=old_generation + 1,
+    )
+    new_lease = owner_runtime._run_cancellations[internal_session_id][-1]
+    new_lease.foreground_refs = 0
+    new_lease.sync_quiescence()
+    requester = StopCoordinator(
+        bus,
+        lambda: [],
+        runtime_id="requester",
+        ack_timeout=0.15,
+        retry_interval=0.01,
+    )
+    await owner_runtime.start_stop_coordinator()
+    await requester.start()
+    try:
+        expected = await requester.snapshot_expected_owners(
+            [internal_session_id],
+            old_generation + 1,
+        )
+        assert sorted(owner["generation"] for owner in expected.values()) == [
+            old_generation,
+            old_generation + 1,
+        ]
+
+        acknowledged = await requester.request_and_wait(
+            request_id=stop_request.request_id,
+            target_generation=old_generation + 1,
+            agentscope_session_ids=[internal_session_id],
+            expected_owners=expected,
+        )
+
+        assert acknowledged == 2
+        assert internal_session_id not in owner_runtime._run_cancellations
+        acknowledgements = await bus.registry_getall(
+            StopCoordinator.ack_namespace(stop_request.request_id)
+        )
+        assert set(acknowledgements) == set(expected)
+    finally:
+        await requester.stop()
+        await owner_runtime.stop_stop_coordinator()
+
+
+@pytest.mark.asyncio
 async def test_stop_ack_converges_when_only_old_owner_generation_was_frozen() -> None:
     bus = SharedBus()
     old_cancellation = CancellationContext()
@@ -718,6 +789,471 @@ async def test_stop_ack_converges_when_only_old_owner_generation_was_frozen() ->
         assert new_cancellation.cancelled is True
     finally:
         await requester.stop()
+        await owner.stop()
+
+
+@pytest.mark.asyncio
+async def test_ack_prunes_quiescent_pending_stop_lease_but_preserves_successor(
+    tmp_path,
+) -> None:
+    bus = SharedBus()
+    store = WebSessionStore(tmp_path / "ack-prunes-owner.sqlite")
+    public_session = store.create_session("ack owner cleanup")
+    internal_session_id = "session-1"
+    store.save_agentscope_session_mapping(
+        public_session.id,
+        agent_id="main-router-agent",
+        agentscope_session_id=internal_session_id,
+    )
+    stopped_generation = store.begin_execution_generation(public_session.id)
+    stop_request = store.begin_or_resume_stop_request(public_session.id)
+    assert stop_request.generation == stopped_generation
+
+    owner_runtime = _runtime(bus, "owner")
+    owner_runtime.set_web_session_store(WebSessionStore(store.db_path))
+    stopped = CancellationContext()
+    successor = CancellationContext()
+    owner_runtime.register_run_cancellation(
+        internal_session_id,
+        stopped,
+        generation=stopped_generation,
+    )
+    # A pending stop deliberately retains this otherwise-quiescent lease until
+    # the remote handler has durably published its acknowledgement.
+    owner_runtime.clear_run_cancellation(internal_session_id, stopped)
+    owner_runtime.register_run_cancellation(
+        internal_session_id,
+        successor,
+        generation=stopped_generation + 1,
+    )
+    requester = StopCoordinator(
+        bus,
+        lambda: [],
+        runtime_id="requester",
+        ack_timeout=0.2,
+        retry_interval=0.01,
+    )
+    assert owner_runtime.stop_coordinator is not None
+    await owner_runtime.start_stop_coordinator()
+    await requester.start()
+    try:
+        expected = await requester.snapshot_expected_owners(
+            [internal_session_id],
+            stopped_generation,
+        )
+        assert [entry["generation"] for entry in expected.values()] == [
+            stopped_generation
+        ]
+
+        await requester.request_and_wait(
+            request_id=stop_request.request_id,
+            target_generation=stopped_generation,
+            agentscope_session_ids=[internal_session_id],
+            expected_owners=expected,
+        )
+
+        remaining = owner_runtime._run_cancellations[internal_session_id]
+        assert [lease.cancellation for lease in remaining] == [successor]
+        assert stopped.cancelled is True
+        assert successor.cancelled is False
+        namespace = StopCoordinator.owner_namespace(internal_session_id)
+        assert set(await bus.registry_getall(namespace)) == {
+            f"owner:{stopped_generation + 1}"
+        }
+
+        # A later heartbeat must not resurrect the acknowledged tombstone.
+        await owner_runtime.stop_coordinator.refresh_owners()
+        assert set(await bus.registry_getall(namespace)) == {
+            f"owner:{stopped_generation + 1}"
+        }
+    finally:
+        await requester.stop()
+        await owner_runtime.stop_stop_coordinator()
+
+
+@pytest.mark.asyncio
+async def test_applied_ack_is_not_visible_before_stale_owner_field_is_removed(
+    tmp_path,
+) -> None:
+    class GatedOwnerDeleteBus(SharedBus):
+        def __init__(self) -> None:
+            super().__init__()
+            self.gate_owner_delete = False
+            self.owner_delete_started = asyncio.Event()
+            self.allow_owner_delete = asyncio.Event()
+
+        async def registry_del(self, namespace, field):
+            if self.gate_owner_delete and namespace.startswith("datapilot:stop:owners:"):
+                self.owner_delete_started.set()
+                await self.allow_owner_delete.wait()
+            await super().registry_del(namespace, field)
+
+    bus = GatedOwnerDeleteBus()
+    store = WebSessionStore(tmp_path / "ack-owner-order.sqlite")
+    public_session = store.create_session("ack owner ordering")
+    internal_session_id = "session-1"
+    store.save_agentscope_session_mapping(
+        public_session.id,
+        agent_id="main-router-agent",
+        agentscope_session_id=internal_session_id,
+    )
+    generation = store.begin_execution_generation(public_session.id)
+    stop_request = store.begin_or_resume_stop_request(public_session.id)
+    owner_runtime = _runtime(bus, "owner")
+    owner_runtime.set_web_session_store(WebSessionStore(store.db_path))
+    stopped = CancellationContext()
+    owner_runtime.register_run_cancellation(
+        internal_session_id,
+        stopped,
+        generation=generation,
+    )
+    owner_runtime.clear_run_cancellation(internal_session_id, stopped)
+    requester = StopCoordinator(
+        bus,
+        lambda: [],
+        runtime_id="requester",
+        ack_timeout=0.3,
+        retry_interval=0.01,
+    )
+    await owner_runtime.start_stop_coordinator()
+    await requester.start()
+    request_task: asyncio.Task | None = None
+    try:
+        expected = await requester.snapshot_expected_owners(
+            [internal_session_id],
+            generation,
+        )
+        bus.gate_owner_delete = True
+        request_task = asyncio.create_task(
+            requester.request_and_wait(
+                request_id=stop_request.request_id,
+                target_generation=generation,
+                agentscope_session_ids=[internal_session_id],
+                expected_owners=expected,
+            )
+        )
+        await asyncio.wait_for(bus.owner_delete_started.wait(), timeout=0.2)
+        await asyncio.sleep(0.03)
+
+        assert request_task.done() is False
+
+        bus.allow_owner_delete.set()
+        assert await request_task == 1
+    finally:
+        bus.allow_owner_delete.set()
+        if request_task is not None:
+            await asyncio.gather(request_task, return_exceptions=True)
+        await requester.stop()
+        await owner_runtime.stop_stop_coordinator()
+
+
+@pytest.mark.asyncio
+async def test_owner_refresh_failure_cannot_publish_applied_ack_first(
+    tmp_path,
+) -> None:
+    class FailFirstOwnerDeleteBus(SharedBus):
+        def __init__(self) -> None:
+            super().__init__()
+            self.fail_owner_delete = False
+            self.owner_delete_failed = asyncio.Event()
+
+        async def registry_del(self, namespace, field):
+            if self.fail_owner_delete and namespace.startswith("datapilot:stop:owners:"):
+                self.fail_owner_delete = False
+                self.owner_delete_failed.set()
+                raise ConnectionError("owner registry delete unavailable")
+            await super().registry_del(namespace, field)
+
+    bus = FailFirstOwnerDeleteBus()
+    store = WebSessionStore(tmp_path / "ack-owner-refresh-failure.sqlite")
+    public_session = store.create_session("ack owner refresh failure")
+    internal_session_id = "session-1"
+    store.save_agentscope_session_mapping(
+        public_session.id,
+        agent_id="main-router-agent",
+        agentscope_session_id=internal_session_id,
+    )
+    generation = store.begin_execution_generation(public_session.id)
+    stop_request = store.begin_or_resume_stop_request(public_session.id)
+    owner_runtime = _runtime(bus, "owner")
+    owner_runtime.set_web_session_store(WebSessionStore(store.db_path))
+    stopped = CancellationContext()
+    owner_runtime.register_run_cancellation(
+        internal_session_id,
+        stopped,
+        generation=generation,
+    )
+    owner_runtime.clear_run_cancellation(internal_session_id, stopped)
+    requester = StopCoordinator(
+        bus,
+        lambda: [],
+        runtime_id="requester",
+        ack_timeout=0.3,
+        retry_interval=0.02,
+    )
+    await owner_runtime.start_stop_coordinator()
+    await requester.start()
+    request_task: asyncio.Task | None = None
+    try:
+        expected = await requester.snapshot_expected_owners(
+            [internal_session_id],
+            generation,
+        )
+        bus.fail_owner_delete = True
+        request_task = asyncio.create_task(
+            requester.request_and_wait(
+                request_id=stop_request.request_id,
+                target_generation=generation,
+                agentscope_session_ids=[internal_session_id],
+                expected_owners=expected,
+            )
+        )
+        await asyncio.wait_for(bus.owner_delete_failed.wait(), timeout=0.2)
+
+        assert await bus.registry_getall(
+            StopCoordinator.ack_namespace(stop_request.request_id)
+        ) == {}
+        assert request_task.done() is False
+
+        assert await request_task == 1
+    finally:
+        if request_task is not None:
+            await asyncio.gather(request_task, return_exceptions=True)
+        await requester.stop()
+        await owner_runtime.stop_stop_coordinator()
+
+
+@pytest.mark.asyncio
+async def test_ack_write_then_raise_reconciles_after_handler_lookup_failure(
+    tmp_path,
+) -> None:
+    class AmbiguousAckBus(SharedBus):
+        def __init__(self) -> None:
+            super().__init__()
+            self.ack_writer_task: asyncio.Task | None = None
+            self.fail_writer_lookup_once = False
+
+        async def registry_set(self, namespace, field, value, *, ttl_secs=None):
+            await super().registry_set(
+                namespace,
+                field,
+                value,
+                ttl_secs=ttl_secs,
+            )
+            if namespace.startswith("datapilot:stop:acks:") and self.ack_writer_task is None:
+                self.ack_writer_task = asyncio.current_task()
+                self.fail_writer_lookup_once = True
+                raise ConnectionError("ACK response lost after write")
+
+        async def registry_getall(self, namespace):
+            if (
+                namespace.startswith("datapilot:stop:acks:")
+                and self.fail_writer_lookup_once
+                and asyncio.current_task() is self.ack_writer_task
+            ):
+                self.fail_writer_lookup_once = False
+                raise ConnectionError("handler ACK lookup unavailable once")
+            return await super().registry_getall(namespace)
+
+    bus = AmbiguousAckBus()
+    store = WebSessionStore(tmp_path / "ambiguous-ack.sqlite")
+    public_session = store.create_session("ambiguous ack")
+    internal_session_id = "session-1"
+    store.save_agentscope_session_mapping(
+        public_session.id,
+        agent_id="main-router-agent",
+        agentscope_session_id=internal_session_id,
+    )
+    generation = store.begin_execution_generation(public_session.id)
+    stop_request = store.begin_or_resume_stop_request(public_session.id)
+    owner_runtime = _runtime(bus, "owner")
+    owner_runtime.set_web_session_store(WebSessionStore(store.db_path))
+    stopped = CancellationContext()
+    owner_runtime.register_run_cancellation(
+        internal_session_id,
+        stopped,
+        generation=generation,
+    )
+    owner_runtime.clear_run_cancellation(internal_session_id, stopped)
+    requester = StopCoordinator(
+        bus,
+        lambda: [],
+        runtime_id="requester",
+        ack_timeout=0.3,
+        retry_interval=0.005,
+    )
+    await owner_runtime.start_stop_coordinator()
+    await requester.start()
+    try:
+        expected = await requester.snapshot_expected_owners(
+            [internal_session_id],
+            generation,
+        )
+
+        assert await requester.request_and_wait(
+            request_id=stop_request.request_id,
+            target_generation=generation,
+            agentscope_session_ids=[internal_session_id],
+            expected_owners=expected,
+        ) == 1
+        for _ in range(30):
+            if internal_session_id not in owner_runtime._run_cancellations:
+                break
+            await asyncio.sleep(0.01)
+
+        assert internal_session_id not in owner_runtime._run_cancellations
+        assert bus.fail_writer_lookup_once is False
+    finally:
+        await requester.stop()
+        await owner_runtime.stop_stop_coordinator()
+
+
+@pytest.mark.asyncio
+async def test_ambiguous_ack_stays_suppressed_until_replay_prunes_exact_owner(
+    tmp_path,
+) -> None:
+    class LongWriterLookupOutageBus(SharedBus):
+        def __init__(self) -> None:
+            super().__init__()
+            self.ack_writer_task: asyncio.Task | None = None
+            self.fail_writer_lookups = True
+            self.writer_lookup_failed = asyncio.Event()
+
+        async def registry_set(self, namespace, field, value, *, ttl_secs=None):
+            await super().registry_set(
+                namespace,
+                field,
+                value,
+                ttl_secs=ttl_secs,
+            )
+            if namespace.startswith("datapilot:stop:acks:") and self.ack_writer_task is None:
+                self.ack_writer_task = asyncio.current_task()
+                raise ConnectionError("ACK response lost after durable write")
+
+        async def registry_getall(self, namespace):
+            if (
+                namespace.startswith("datapilot:stop:acks:")
+                and self.fail_writer_lookups
+                and asyncio.current_task() is self.ack_writer_task
+            ):
+                self.writer_lookup_failed.set()
+                raise ConnectionError("handler ACK lookup remains unavailable")
+            return await super().registry_getall(namespace)
+
+    bus = LongWriterLookupOutageBus()
+    store = WebSessionStore(tmp_path / "long-ambiguous-ack.sqlite")
+    public_session = store.create_session("long ambiguous ack")
+    internal_session_id = "session-1"
+    store.save_agentscope_session_mapping(
+        public_session.id,
+        agent_id="main-router-agent",
+        agentscope_session_id=internal_session_id,
+    )
+    generation = store.begin_execution_generation(public_session.id)
+    stop_request = store.begin_or_resume_stop_request(public_session.id)
+    owner_runtime = _runtime(bus, "owner")
+    owner_runtime.set_web_session_store(WebSessionStore(store.db_path))
+    stopped = CancellationContext()
+    owner_runtime.register_run_cancellation(
+        internal_session_id,
+        stopped,
+        generation=generation,
+    )
+    owner_runtime.clear_run_cancellation(internal_session_id, stopped)
+    requester = StopCoordinator(
+        bus,
+        lambda: [],
+        runtime_id="requester",
+        ack_timeout=0.2,
+        retry_interval=0.005,
+    )
+    assert owner_runtime.stop_coordinator is not None
+    owner_runtime.stop_coordinator.ack_timeout = 0.03
+    owner_runtime.stop_coordinator.retry_interval = 0.005
+    await owner_runtime.start_stop_coordinator()
+    await requester.start()
+    try:
+        expected = await requester.snapshot_expected_owners(
+            [internal_session_id],
+            generation,
+        )
+        namespace = StopCoordinator.owner_namespace(internal_session_id)
+
+        assert await requester.request_and_wait(
+            request_id=stop_request.request_id,
+            target_generation=generation,
+            agentscope_session_ids=[internal_session_id],
+            expected_owners=expected,
+        ) == 1
+        await asyncio.wait_for(bus.writer_lookup_failed.wait(), timeout=0.2)
+        for _ in range(50):
+            if not owner_runtime.stop_coordinator._handler_tasks:
+                break
+            await asyncio.sleep(0.005)
+
+        assert owner_runtime.stop_coordinator._handler_tasks == set()
+        assert set(await bus.registry_getall(namespace)) == set()
+        remaining = owner_runtime._run_cancellations[internal_session_id]
+        assert len(remaining) == 1
+        assert remaining[0].owner_publication_suppressed is True
+        await owner_runtime.stop_coordinator.refresh_owners()
+        assert set(await bus.registry_getall(namespace)) == set()
+
+        bus.fail_writer_lookups = False
+        assert await requester.request_and_wait(
+            request_id=stop_request.request_id,
+            target_generation=generation,
+            agentscope_session_ids=[internal_session_id],
+            expected_owners=expected,
+        ) == 1
+        for _ in range(50):
+            if internal_session_id not in owner_runtime._run_cancellations:
+                break
+            await asyncio.sleep(0.005)
+
+        assert internal_session_id not in owner_runtime._run_cancellations
+        assert set(await bus.registry_getall(namespace)) == set()
+    finally:
+        await requester.stop()
+        await owner_runtime.stop_stop_coordinator()
+
+
+@pytest.mark.asyncio
+async def test_handler_task_failure_is_consumed_and_logged(caplog) -> None:
+    class FailingHandlerCoordinator(StopCoordinator):
+        async def _handle_request(self, payload) -> None:
+            del payload
+            raise ConnectionError("handler transport failed")
+
+    bus = SharedBus()
+    owner = FailingHandlerCoordinator(
+        bus,
+        lambda: [],
+        runtime_id="owner",
+    )
+    await owner.start()
+    try:
+        with caplog.at_level(
+            logging.ERROR,
+            logger="vla_data_juicer_agents.runtime.stop_coordinator",
+        ):
+            await bus.publish(StopCoordinator.REQUEST_CHANNEL, {"request_id": "failure"})
+            for _ in range(20):
+                await asyncio.sleep(0)
+                if any(
+                    record.message == "Stop request handler failed"
+                    for record in caplog.records
+                ) and not owner._handler_tasks:
+                    break
+
+        assert owner._handler_tasks == set()
+        assert any(
+            record.message == "Stop request handler failed"
+            and isinstance(record.exc_info[1], ConnectionError)
+            for record in caplog.records
+            if record.exc_info is not None
+        )
+    finally:
         await owner.stop()
 
 
