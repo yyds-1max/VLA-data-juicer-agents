@@ -144,58 +144,56 @@ export function applyPublicEvent(
   }
   if (event.type === EventType.REPLY_START) {
     const start = event as ReplyStartEvent;
-    if (!state.currentReplyId && stringValue(start.reply_id)) {
+    if (stringValue(start.reply_id) && !replyMessage(state, start.reply_id)) {
       startReply(state, start);
     }
-  } else if (isReplyScopedEvent(event) && !state.currentReplyId) {
-    return;
-  } else if (!eventBelongsToCurrentReply(state, event)) {
-    state.lastSequence = envelope.sequence;
-    return;
-  } else if (event.type === EventType.REPLY_END) {
-    const message = currentReply(state);
-    if (message) {
-      appendEvent(message, event);
+  } else if (isReplyScopedEvent(event)) {
+    const replyId = stringValue(event.reply_id);
+    const message = activeReplyMessage(state, replyId);
+    const ownsLegacyCurrentReply = Boolean(
+      replyId && !message && state.currentReplyId === replyId,
+    );
+    if (!message && !ownsLegacyCurrentReply) {
+      // Preserve the existing missing-start recovery behavior while allowing
+      // stale/foreign reply events to advance past a known active reply.
+      if (hasActiveReply(state)) {
+        state.lastSequence = envelope.sequence;
+      }
+      return;
     }
-    state.currentReplyId = null;
-    state.phase = state.phase === "interrupting" && hasRunningTool(state)
-      ? "interrupting"
-      : "idle";
+    if (event.type === EventType.REPLY_END) {
+      if (message) {
+        appendEvent(message, event);
+      }
+      state.currentReplyId = latestActiveReplyId(state);
+      settleReplyPhase(state);
+    } else if (!message) {
+      // Compatibility for pre-SDK in-memory state that only carried the
+      // current reply id. There is no message to reduce into, but the event is
+      // still owned and must advance the public cursor.
+    } else if (event.type === EventType.CUSTOM) {
+      applyDataPilotCustomEvent(state, envelope, event as CustomEvent);
+    } else {
+      appendEvent(message, event);
+      if (event.type === EventType.TOOL_CALL_START) {
+        projectRunningTool(state, envelope, event as ToolCallStartEvent);
+      } else if (event.type === EventType.REQUIRE_EXTERNAL_EXECUTION) {
+        projectExternalDecision(state, event as RequireExternalExecutionEvent);
+      } else if (event.type === EventType.EXTERNAL_EXECUTION_RESULT) {
+        clearExternalDecision(state, event as ExternalExecutionResultEvent);
+      }
+    }
   } else if (event.type === EventType.CUSTOM) {
     applyDataPilotCustomEvent(state, envelope, event as CustomEvent);
-  } else {
-    const message = currentReply(state);
-    if (message) {
-      appendEvent(message, event);
-    }
-    if (event.type === EventType.TOOL_CALL_START) {
-      projectRunningTool(state, envelope, event as ToolCallStartEvent);
-    } else if (event.type === EventType.REQUIRE_EXTERNAL_EXECUTION) {
-      projectExternalDecision(state, event as RequireExternalExecutionEvent);
-    } else if (event.type === EventType.EXTERNAL_EXECUTION_RESULT) {
-      clearExternalDecision(state, event as ExternalExecutionResultEvent);
-    }
   }
 
   state.lastSequence = envelope.sequence;
 }
 
-function isReplyScopedEvent(event: AgentEvent): boolean {
-  return "reply_id" in event;
-}
-
-function eventBelongsToCurrentReply(
-  state: AgentConversationState,
+function isReplyScopedEvent(
   event: AgentEvent,
-): boolean {
-  if (!("reply_id" in event)) {
-    return true;
-  }
-  return Boolean(
-    state.currentReplyId &&
-      stringValue(event.reply_id) &&
-      event.reply_id === state.currentReplyId,
-  );
+): event is AgentEvent & { reply_id: unknown } {
+  return "reply_id" in event;
 }
 
 export function markConversationInterrupting(state: AgentConversationState): void {
@@ -246,20 +244,57 @@ function startReply(state: AgentConversationState, event: ReplyStartEvent): void
     }),
   );
   state.currentReplyId = event.reply_id;
-  state.phase = "streaming";
+  if (state.phase !== "interrupting") {
+    state.phase = "streaming";
+  }
 }
 
-function currentReply(state: AgentConversationState): Msg | undefined {
-  if (!state.currentReplyId) {
-    return undefined;
-  }
+function replyMessage(state: AgentConversationState, replyId: string): Msg | undefined {
   for (let index = state.messages.length - 1; index >= 0; index -= 1) {
     const message = state.messages[index];
-    if (message.role === "assistant" && message.id === state.currentReplyId) {
+    if (message.role === "assistant" && message.id === replyId) {
       return message;
     }
   }
   return undefined;
+}
+
+function activeReplyMessage(
+  state: AgentConversationState,
+  replyId: unknown,
+): Msg | undefined {
+  const normalizedReplyId = stringValue(replyId);
+  if (!normalizedReplyId) {
+    return undefined;
+  }
+  const message = replyMessage(state, normalizedReplyId);
+  return message && !message.finished_at ? message : undefined;
+}
+
+function latestActiveReplyId(state: AgentConversationState): string | null {
+  for (let index = state.messages.length - 1; index >= 0; index -= 1) {
+    const message = state.messages[index];
+    if (message.role === "assistant" && !message.finished_at) {
+      return message.id;
+    }
+  }
+  return null;
+}
+
+function hasActiveReply(state: AgentConversationState): boolean {
+  return latestActiveReplyId(state) !== null || state.currentReplyId !== null;
+}
+
+function settleReplyPhase(state: AgentConversationState): void {
+  if (hasActiveReply(state)) {
+    if (state.phase !== "interrupting") {
+      state.phase = "streaming";
+    }
+    return;
+  }
+  state.phase = state.phase === "interrupting" && hasRunningTool(state)
+    ? "interrupting"
+    : "idle";
 }
 
 function persistedMessage(message: ChatMessageRecord): Msg | null {
@@ -298,7 +333,7 @@ function applyDataPilotCustomEvent(
   event: CustomEvent,
 ): void {
   if (event.name === "datapilot_run_terminal") {
-    if (state.currentReplyId) {
+    if (hasActiveReply(state)) {
       return;
     }
     state.phase = state.phase === "interrupting" && hasRunningTool(state)
@@ -368,7 +403,7 @@ function projectTerminalTool(
   };
   if (
     state.phase === "interrupting" &&
-    !state.currentReplyId &&
+    !hasActiveReply(state) &&
     !hasRunningTool(state)
   ) {
     state.phase = "idle";

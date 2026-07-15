@@ -278,15 +278,74 @@ describe("AgentScope conversation reduction", () => {
     expect(state.lastSequence).toBe(2);
   });
 
-  it("rejects a second reply start while a different reply is active", () => {
+  it("reduces interleaved replies into separate public DataPilot messages", () => {
     const state = createAgentConversation();
     applyPublicEvent(state, envelope(1, replyStart("reply-1")));
-
     applyPublicEvent(state, envelope(2, replyStart("reply-2")));
+    applyPublicEvent(state, envelope(3, textStart("reply-2", "block-2")));
+    applyPublicEvent(state, envelope(4, textDelta("reply-2", "block-2", "导航处理中")));
+    applyPublicEvent(state, envelope(5, textStart("reply-1", "block-1")));
+    applyPublicEvent(state, envelope(6, textDelta("reply-1", "block-1", "任务已转交")));
 
-    expect(state.messages.map((message) => message.id)).toEqual(["reply-1"]);
+    expect(state.messages.map((message) => message.id)).toEqual(["reply-1", "reply-2"]);
+    expect(state.messages).toMatchObject([
+      { name: "DataPilot", content: [{ type: "text", text: "任务已转交" }] },
+      { name: "DataPilot", content: [{ type: "text", text: "导航处理中" }] },
+    ]);
+    expect(state.currentReplyId).toBe("reply-2");
+    expect(state.phase).toBe("streaming");
+    expect(state.lastSequence).toBe(6);
+
+    applyPublicEvent(state, envelope(7, replyEnd("reply-2")));
     expect(state.currentReplyId).toBe("reply-1");
-    expect(state.lastSequence).toBe(2);
+    expect(state.phase).toBe("streaming");
+
+    applyPublicEvent(state, envelope(8, replyEnd("reply-1")));
+    expect(state.currentReplyId).toBeNull();
+    expect(state.phase).toBe("idle");
+  });
+
+  it("keeps interrupting until every interleaved reply has ended", () => {
+    const state = createAgentConversation();
+    applyPublicEvent(state, envelope(1, replyStart("reply-1")));
+    applyPublicEvent(state, envelope(2, replyStart("reply-2")));
+    markConversationInterrupting(state);
+
+    applyPublicEvent(state, envelope(3, replyEnd("reply-2")));
+    expect(state.currentReplyId).toBe("reply-1");
+    expect(state.phase).toBe("interrupting");
+
+    applyPublicEvent(state, envelope(4, replyEnd("reply-1")));
+    expect(state.currentReplyId).toBeNull();
+    expect(state.phase).toBe("idle");
+  });
+
+  it("restores interleaved replies without exposing internal agent identities", () => {
+    const restored = restoreAgentConversation({
+      messages: [],
+      events: [
+        envelope(1, replyStart("router-reply")),
+        envelope(2, replyStart("navigation-reply")),
+        envelope(3, textStart("navigation-reply", "navigation-block")),
+        envelope(4, textDelta("navigation-reply", "navigation-block", "开始检查数据")),
+        envelope(5, textStart("router-reply", "router-block")),
+        envelope(6, textDelta("router-reply", "router-block", "任务已启动")),
+        envelope(7, replyEnd("router-reply")),
+      ],
+      toolRuns: [],
+      lastSequence: 7,
+    });
+
+    expect(restored.messages).toMatchObject([
+      { id: "router-reply", name: "DataPilot", content: [{ text: "任务已启动" }] },
+      {
+        id: "navigation-reply",
+        name: "DataPilot",
+        content: [{ text: "开始检查数据" }],
+      },
+    ]);
+    expect(restored.currentReplyId).toBe("navigation-reply");
+    expect(restored.phase).toBe("streaming");
   });
 
   it("rejects tool and HITL projections owned by another reply", () => {
@@ -302,6 +361,37 @@ describe("AgentScope conversation reduction", () => {
     expect(state.toolRuns).toEqual({});
     expect(state.pendingHumanDecision).toBeNull();
     expect(state.lastSequence).toBe(3);
+  });
+
+  it("routes tool and HITL projections to a registered concurrent reply", () => {
+    const state = createAgentConversation();
+    applyPublicEvent(state, envelope(1, replyStart("router-reply")));
+    applyPublicEvent(state, envelope(2, replyStart("navigation-reply")));
+    applyPublicEvent(
+      state,
+      envelope(3, toolCallStart("navigation-reply", "navigation-call", "inspect_navigation")),
+    );
+    applyPublicEvent(
+      state,
+      envelope(
+        4,
+        requireDecision("navigation-reply", "navigation-decision", validDecisionInput()),
+      ),
+    );
+
+    expect(state.messages[0].content).toEqual([]);
+    expect(state.messages[1].content).toContainEqual(
+      expect.objectContaining({ type: "tool_call", id: "navigation-call" }),
+    );
+    expect(state.toolRuns["navigation-call"]).toMatchObject({
+      tool_name: "inspect_navigation",
+      status: "running",
+    });
+    expect(state.pendingHumanDecision).toMatchObject({
+      replyId: "navigation-reply",
+      toolCallId: "navigation-decision",
+    });
+    expect(state.lastSequence).toBe(4);
   });
 
   it.each(["success", "failure", "stopped"] as const)(
