@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import base64
+import binascii
 import json
 import hashlib
 import re
@@ -335,17 +337,73 @@ class WebSessionStore:
         return record
 
     def list_sessions(self, limit: int = 20) -> list[SessionRecord]:
+        sessions, _next_cursor = self.list_sessions_page(limit=limit)
+        return sessions
+
+    def list_sessions_page(
+        self,
+        *,
+        limit: int = 20,
+        cursor: str | None = None,
+    ) -> tuple[list[SessionRecord], str | None]:
+        if limit < 1 or limit > 100:
+            raise ValueError("session page limit must be between 1 and 100")
+        boundary = self._decode_session_cursor(cursor) if cursor is not None else None
         with self._connect() as connection:
-            rows = connection.execute(
-                """
-                SELECT id, title, created_at, updated_at
-                FROM sessions
-                ORDER BY updated_at DESC, rowid DESC
-                LIMIT ?
-                """,
-                (limit,),
-            ).fetchall()
-        return [self._session_from_row(row) for row in rows]
+            if boundary is None:
+                rows = connection.execute(
+                    """
+                    SELECT id, title, created_at, updated_at, rowid
+                    FROM sessions
+                    ORDER BY updated_at DESC, rowid DESC
+                    LIMIT ?
+                    """,
+                    (limit + 1,),
+                ).fetchall()
+            else:
+                updated_at, row_id = boundary
+                rows = connection.execute(
+                    """
+                    SELECT id, title, created_at, updated_at, rowid
+                    FROM sessions
+                    WHERE updated_at < ? OR (updated_at = ? AND rowid < ?)
+                    ORDER BY updated_at DESC, rowid DESC
+                    LIMIT ?
+                    """,
+                    (updated_at, updated_at, row_id, limit + 1),
+                ).fetchall()
+        visible = rows[:limit]
+        next_cursor = (
+            self._encode_session_cursor(str(visible[-1][3]), int(visible[-1][4]))
+            if len(rows) > limit and visible
+            else None
+        )
+        return [self._session_from_row(row) for row in visible], next_cursor
+
+    @staticmethod
+    def _encode_session_cursor(updated_at: str, row_id: int) -> str:
+        payload = json.dumps([updated_at, row_id], separators=(",", ":")).encode()
+        return base64.urlsafe_b64encode(payload).decode().rstrip("=")
+
+    @staticmethod
+    def _decode_session_cursor(cursor: str) -> tuple[str, int]:
+        try:
+            padding = "=" * (-len(cursor) % 4)
+            value = json.loads(base64.urlsafe_b64decode(cursor + padding))
+            if (
+                not isinstance(value, list)
+                or len(value) != 2
+                or not isinstance(value[0], str)
+                or not isinstance(value[1], int)
+                or isinstance(value[1], bool)
+                or value[1] < 1
+                or value[1] > 2**63 - 1
+            ):
+                raise ValueError
+            datetime.fromisoformat(value[0])
+            return value[0], value[1]
+        except (ValueError, TypeError, json.JSONDecodeError, binascii.Error) as exc:
+            raise ValueError("invalid session cursor") from exc
 
     def get_session(self, session_id: str) -> SessionDetail | None:
         with self._connect() as connection:
@@ -545,19 +603,25 @@ class WebSessionStore:
             ).fetchone()
         return str(row[0]) if row is not None else None
 
-    def admitted_user_message_turns(self, session_id: str) -> list[tuple[str, str]]:
+    def admitted_user_message_turns(
+        self,
+        session_id: str,
+    ) -> list[tuple[str, str, str]]:
         """Return exact turns whose execution fence is still authoritative."""
         with self._connect() as connection:
             rows = connection.execute(
                 """
-                SELECT message_id, turn_id
+                SELECT message_id, turn_id, runtime_id
                 FROM session_turn_admissions
                 WHERE session_id = ? AND status = 'admitted'
                 ORDER BY created_at, message_id
                 """,
                 (session_id,),
             ).fetchall()
-        return [(str(message_id), str(turn_id)) for message_id, turn_id in rows]
+        return [
+            (str(message_id), str(turn_id), str(runtime_id))
+            for message_id, turn_id, runtime_id in rows
+        ]
 
     def renew_user_message(
         self,

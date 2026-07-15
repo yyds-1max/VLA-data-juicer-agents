@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import inspect
 import json
 import logging
@@ -46,6 +47,14 @@ def create_app(
         controller_factory=controller_factory,
         **kwargs,
     )
+
+
+def _session_cursor(row_id: object) -> str:
+    payload = json.dumps(
+        ["2026-06-26T10:00:00+08:00", row_id],
+        separators=(",", ":"),
+    ).encode()
+    return base64.urlsafe_b64encode(payload).decode().rstrip("=")
 
 
 class FakeController:
@@ -210,7 +219,94 @@ def test_create_session_replays_same_client_creation_id(tmp_path: Path):
     assert replay.status_code == 200
     assert replay.json()["session"] == first.json()["session"]
     assert conflict.status_code == 409
+    assert conflict.json()["detail"] == {
+        "code": "session_creation_conflict",
+        "message": "This session creation request conflicts with an existing request.",
+    }
     assert len(client.get("/api/sessions").json()["sessions"]) == 1
+
+
+def test_unexpected_public_endpoint_error_does_not_expose_internal_identity(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    client = make_client(tmp_path)
+    internal_identity = "agent=router-secret session=as-secret user=alice-secret"
+
+    def fail_list_sessions_page(*, limit, cursor):
+        del limit, cursor
+        raise RuntimeError(internal_identity)
+
+    monkeypatch.setattr(
+        client.app.state.store,
+        "list_sessions_page",
+        fail_list_sessions_page,
+    )
+    safe_client = TestClient(client.app, raise_server_exceptions=False)
+
+    response = safe_client.get("/api/sessions")
+
+    assert response.status_code == 500
+    assert response.json() == {
+        "detail": {
+            "code": "internal_error",
+            "message": "DataPilot could not complete this request.",
+        }
+    }
+    assert internal_identity not in response.text
+
+
+def test_session_history_cursor_reaches_more_than_default_page(tmp_path: Path):
+    client = make_client(tmp_path)
+    store = client.app.state.store
+    created = [store.create_session(f"history {index:02d}") for index in range(27)]
+
+    seen: list[str] = []
+    cursor = None
+    while True:
+        query = "?limit=7"
+        if cursor is not None:
+            query += f"&cursor={cursor}"
+        response = client.get(f"/api/sessions{query}")
+        assert response.status_code == 200
+        payload = response.json()
+        seen.extend(session["id"] for session in payload["sessions"])
+        cursor = payload["next_cursor"]
+        if cursor is None:
+            break
+
+    assert seen == [session.id for session in reversed(created)]
+    assert len(set(seen)) == 27
+
+
+@pytest.mark.parametrize("limit", [0, 101])
+def test_session_history_rejects_limit_outside_public_bounds(
+    tmp_path: Path,
+    limit: int,
+) -> None:
+    client = make_client(tmp_path)
+
+    response = client.get("/api/sessions", params={"limit": limit})
+
+    assert response.status_code == 400
+    assert response.json() == {"detail": "Invalid session page"}
+
+
+@pytest.mark.parametrize("row_id", [True, 2**63], ids=["bool", "above-sqlite-int64"])
+def test_session_history_rejects_unsafe_cursor_row_id(
+    tmp_path: Path,
+    row_id: object,
+) -> None:
+    app_client = make_client(tmp_path)
+    client = TestClient(app_client.app, raise_server_exceptions=False)
+
+    response = client.get(
+        "/api/sessions",
+        params={"cursor": _session_cursor(row_id)},
+    )
+
+    assert response.status_code == 400
+    assert response.json() == {"detail": "Invalid session page"}
 
 
 def test_submit_turn_returns_turn_id(tmp_path: Path):
@@ -543,7 +639,10 @@ def test_submit_turn_runtime_error_returns_409(tmp_path: Path):
     )
 
     assert response.status_code == 409
-    assert response.json()["detail"] == "A session turn is already active."
+    assert response.json()["detail"] == {
+        "code": "turn_submission_failed",
+        "message": "DataPilot could not submit this turn. Please retry.",
+    }
 
 
 def test_session_stream_returns_404_for_unknown_session(tmp_path: Path):

@@ -1240,6 +1240,9 @@ class AgentScopeRuntime:
             if self.web_session_store is not None
             else []
         )
+        admitted_runtime_ids = {
+            runtime_id for _message_id, _turn_id, runtime_id in active_user_turns
+        }
         if not mappings and self.web_session_store is None:
             return InterruptResponse(interrupted=False)
 
@@ -1255,28 +1258,48 @@ class AgentScopeRuntime:
             and self.stop_coordinator.started
         )
         interrupted = bool(mappings or active_user_turns)
+        detail = (
+            self.web_session_store.get_session(web_session_id)
+            if self.web_session_store is not None
+            else None
+        )
+        require_owner = bool(
+            active_user_turns
+            or (
+                detail is not None
+                and any(row.status == "running" for row in detail.tool_runs)
+            )
+        )
         expected_owners: dict[str, dict[str, Any]] | None = None
         if coordinator_active:
             assert stop_request is not None
             assert self.stop_coordinator is not None
-            detail = self.web_session_store.get_session(web_session_id)
-            require_owner = bool(
-                detail is not None
-                and any(row.status == "running" for row in detail.tool_runs)
-            )
-            expected_owners = await self.stop_coordinator.snapshot_expected_owners(
-                [session_id for _agent_id, session_id in mappings],
-                stop_request.generation,
-            )
+            try:
+                expected_owners = await self.stop_coordinator.snapshot_expected_owners(
+                    [session_id for _agent_id, session_id in mappings],
+                    stop_request.generation,
+                    required_runtime_ids=admitted_runtime_ids,
+                )
+            except TimeoutError as exc:
+                raise RuntimeError(
+                    "explicit stop owner acknowledgement failed"
+                ) from exc
+            if not self.stop_coordinator.healthy:
+                raise RuntimeError("explicit stop coordinator is unhealthy")
 
-        local_cancellations = {
-            lease.cancellation
+        local_leases = {
+            id(lease): lease
             for _agent_id, agentscope_session_id in mappings
             for lease in self._run_cancellations.get(agentscope_session_id, [])
             if stop_request is None
             or lease.generation is None
             or lease.generation <= stop_request.generation
         }
+        if not coordinator_active and active_user_turns and (
+            admitted_runtime_ids != {self.runtime_id} or not local_leases
+        ):
+            raise RuntimeError("explicit stop owner acknowledgement failed")
+
         local_failures: list[Exception] = []
         for _agent_id, agentscope_session_id in mappings:
             try:
@@ -1319,11 +1342,17 @@ class AgentScopeRuntime:
                     "explicit stop owner acknowledgement failed"
                 ) from exc
         else:
-            if local_cancellations:
+            if active_user_turns:
+                leases_done = await asyncio.gather(
+                    *(lease.wait_for_quiescence(10.0) for lease in local_leases.values())
+                )
+                if not all(leases_done):
+                    raise RuntimeError("explicit stop owner did not quiesce")
+            elif local_leases:
                 workers_done = await asyncio.gather(
                     *(
-                        cancellation.wait_for_workers(timeout=10.0)
-                        for cancellation in local_cancellations
+                        lease.cancellation.wait_for_workers(timeout=10.0)
+                        for lease in local_leases.values()
                     )
                 )
                 if not all(workers_done):
@@ -1368,7 +1397,7 @@ class AgentScopeRuntime:
                 )
             for _agent_id, agentscope_session_id in mappings:
                 self.discard_run_cancellations(agentscope_session_id)
-            for message_id, turn_id in active_user_turns:
+            for message_id, turn_id, _runtime_id in active_user_turns:
                 try:
                     records.append(
                         self.web_session_store.finish_user_message_turn_with_event(
@@ -1490,7 +1519,10 @@ class AgentScopeRuntime:
                 self.stop_coordinator is not None
                 and self.stop_coordinator.started
             )
-            if coordinator_active:
+            requires_quiescence_proof = bool(
+                self.web_session_store.admitted_user_message_turns(web_session_id)
+            )
+            if coordinator_active or requires_quiescence_proof:
                 # Do not destroy AgentScope or navigation state until every
                 # frozen remote owner has acknowledged actual quiescence.
                 await self._interrupt_web_session_serialized(

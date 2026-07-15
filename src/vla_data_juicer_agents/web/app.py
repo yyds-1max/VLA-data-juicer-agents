@@ -10,8 +10,8 @@ from contextlib import asynccontextmanager, suppress
 from pathlib import Path
 from typing import Any
 
-from fastapi import FastAPI, HTTPException, Response
-from fastapi.responses import FileResponse, StreamingResponse
+from fastapi import FastAPI, HTTPException, Request, Response
+from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 
 from vla_data_juicer_agents.navigation.dataset_catalog import (
@@ -46,6 +46,26 @@ logger = logging.getLogger(__name__)
 SESSION_DELETE_ERROR = {
     "code": "session_delete_failed",
     "message": "DataPilot could not delete this session. Please retry.",
+}
+SESSION_CREATION_CONFLICT = {
+    "code": "session_creation_conflict",
+    "message": "This session creation request conflicts with an existing request.",
+}
+TURN_SUBMISSION_ERROR = {
+    "code": "turn_submission_failed",
+    "message": "DataPilot could not submit this turn. Please retry.",
+}
+HUMAN_DECISION_ERROR = {
+    "code": "human_decision_failed",
+    "message": "DataPilot could not apply this human decision.",
+}
+HUMAN_DECISION_RECOVERY_ERROR = {
+    "code": "human_decision_recovery_failed",
+    "message": "DataPilot could not recover this human decision handoff.",
+}
+INTERNAL_ERROR = {
+    "code": "internal_error",
+    "message": "DataPilot could not complete this request.",
 }
 
 
@@ -151,6 +171,16 @@ def _create_app_for_manager(
     app.state.bus = bus
     app.state.agentscope_runtime = agentscope_runtime
 
+    @app.exception_handler(Exception)
+    async def safe_unexpected_error(request: Request, exc: Exception) -> JSONResponse:
+        logger.exception(
+            "Unexpected DataPilot API failure: method=%s path=%s",
+            request.method,
+            request.url.path,
+            exc_info=(type(exc), exc, exc.__traceback__),
+        )
+        return JSONResponse(status_code=500, content={"detail": INTERNAL_ERROR})
+
     if agentscope_runtime is not None:
         app.mount(agentscope_runtime.config.agentscope_mount_path, agentscope_runtime.app)
 
@@ -164,12 +194,29 @@ def _create_app_for_manager(
                 )
             )
         except (RuntimeError, sqlite3.IntegrityError) as exc:
-            raise HTTPException(status_code=409, detail=str(exc)) from exc
+            logger.exception("DataPilot session creation conflict")
+            raise HTTPException(
+                status_code=409,
+                detail=SESSION_CREATION_CONFLICT,
+            ) from exc
         return CreateSessionResponse(session=session)
 
     @app.get("/api/sessions")
-    async def list_sessions() -> dict[str, list[dict[str, Any]]]:
-        return {"sessions": [session.model_dump() for session in store.list_sessions()]}
+    async def list_sessions(
+        limit: int = 20,
+        cursor: str | None = None,
+    ) -> dict[str, Any]:
+        try:
+            sessions, next_cursor = store.list_sessions_page(
+                limit=limit,
+                cursor=cursor,
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail="Invalid session page") from exc
+        return {
+            "sessions": [session.model_dump() for session in sessions],
+            "next_cursor": next_cursor,
+        }
 
     @app.get("/api/sessions/{session_id}")
     async def get_session(session_id: str) -> dict[str, dict[str, Any]]:
@@ -234,12 +281,18 @@ def _create_app_for_manager(
         except KeyError as exc:
             raise HTTPException(status_code=404, detail="Session not found") from exc
         except (TurnSubmissionPending, TurnSessionBusy) as exc:
+            message = (
+                "Turn submission is still pending."
+                if isinstance(exc, TurnSubmissionPending)
+                else "Another turn is still active for this session."
+            )
             raise HTTPException(
                 status_code=409,
-                detail={"code": exc.code, "message": str(exc)},
+                detail={"code": exc.code, "message": message},
             ) from exc
         except RuntimeError as exc:
-            raise HTTPException(status_code=409, detail=str(exc)) from exc
+            logger.exception("DataPilot turn submission failed")
+            raise HTTPException(status_code=409, detail=TURN_SUBMISSION_ERROR) from exc
         if turn_submitted is not None:
             await _maybe_await(turn_submitted(session_id, manager, store, bus))
         if isinstance(turn_id, TurnSubmissionResult):
@@ -288,7 +341,8 @@ def _create_app_for_manager(
         except KeyError as exc:
             raise HTTPException(status_code=404, detail="Session not found") from exc
         except RuntimeError as exc:
-            raise HTTPException(status_code=409, detail=str(exc)) from exc
+            logger.exception("DataPilot human decision failed")
+            raise HTTPException(status_code=409, detail=HUMAN_DECISION_ERROR) from exc
         if not accepted:
             raise HTTPException(status_code=409, detail="Human decision was not accepted")
         return HumanDecisionResponse(accepted=True)
@@ -314,7 +368,11 @@ def _create_app_for_manager(
         except KeyError as exc:
             raise HTTPException(status_code=404, detail="Session not found") from exc
         except (RuntimeError, ValueError) as exc:
-            raise HTTPException(status_code=409, detail=str(exc)) from exc
+            logger.exception("DataPilot human decision recovery failed")
+            raise HTTPException(
+                status_code=409,
+                detail=HUMAN_DECISION_RECOVERY_ERROR,
+            ) from exc
         return HumanDecisionRecoveryResponse.model_validate(result)
 
     @app.get("/api/sessions/{session_id}/stream")
@@ -368,5 +426,11 @@ async def _maybe_await(value: Any) -> Any:
 
 def _raise_navigation_http_error(exc: ValueError | FileNotFoundError) -> None:
     if isinstance(exc, ValueError):
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
-    raise HTTPException(status_code=404, detail=str(exc)) from exc
+        raise HTTPException(
+            status_code=400,
+            detail="Invalid navigation dataset request",
+        ) from exc
+    raise HTTPException(
+        status_code=404,
+        detail="Navigation dataset resource not found",
+    ) from exc

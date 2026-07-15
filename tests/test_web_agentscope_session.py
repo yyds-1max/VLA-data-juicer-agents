@@ -2039,11 +2039,12 @@ async def test_runtime_interrupt_web_session_cancels_background_registry_keys_on
 
 
 @pytest.mark.asyncio
-async def test_explicit_stop_releases_expired_turn_after_dead_owner_barrier(
+async def test_explicit_stop_of_remote_chat_turn_requires_owner_ack_before_terminal(
     tmp_path: Path,
 ) -> None:
     bus = AdmissionSharedBus()
     runtime = _runtime(message_bus=bus)
+    owner = _runtime(message_bus=bus)
     store = WebSessionStore(tmp_path / "dead-owner-explicit-stop.sqlite")
     session = store.create_session("dead owner")
     internal_session_id = f"{session.id}__main-router-agent"
@@ -2052,12 +2053,12 @@ async def test_explicit_stop_releases_expired_turn_after_dead_owner_barrier(
         agent_id="main-router-agent",
         agentscope_session_id=internal_session_id,
     )
-    store.begin_execution_generation(session.id)
+    generation = store.begin_execution_generation(session.id)
     store.claim_user_message(
         session.id,
         "local-dead-owner",
         "run",
-        runtime_id="dead-runtime",
+        runtime_id=owner.runtime_id,
         turn_id="turn_dead_owner",
         ttl_seconds=30.0,
     )
@@ -2065,7 +2066,7 @@ async def test_explicit_stop_releases_expired_turn_after_dead_owner_barrier(
         session.id,
         "local-dead-owner",
         "run",
-        runtime_id="dead-runtime",
+        runtime_id=owner.runtime_id,
         ttl_seconds=30.0,
     )
     with sqlite3.connect(store.db_path) as connection:
@@ -2075,11 +2076,41 @@ async def test_explicit_stop_releases_expired_turn_after_dead_owner_barrier(
         )
     published = []
     runtime.set_web_transport(store, lambda _session_id, record: published.append(record))
+    owner.set_web_session_store(WebSessionStore(store.db_path))
 
     await runtime.start_stop_coordinator()
     try:
+        with pytest.raises(RuntimeError, match="owner acknowledgement"):
+            await runtime.interrupt_web_session(web_session_id=session.id)
+
+        assert store.user_message_turn_status(session.id, "local-dead-owner") == "admitted"
+        assert [
+            record
+            for record in store.list_public_events(session.id)
+            if record.event.get("name") == "datapilot_run_terminal"
+        ] == []
+
+        cancellation = CancellationContext()
+        owner.register_run_cancellation(
+            internal_session_id,
+            cancellation,
+            generation=generation,
+        )
+
+        async def finish_remote_chat() -> None:
+            while not cancellation.cancelled:
+                await asyncio.sleep(0)
+            owner.clear_run_cancellation(internal_session_id, cancellation)
+
+        remote_chat = asyncio.create_task(finish_remote_chat())
+        await owner.start_stop_coordinator()
+        assert owner.stop_coordinator is not None
+        await owner.stop_coordinator.refresh_owners()
+
         result = await runtime.interrupt_web_session(web_session_id=session.id)
+        await remote_chat
     finally:
+        await owner.stop_stop_coordinator()
         await runtime.stop_stop_coordinator()
 
     assert result.interrupted is True

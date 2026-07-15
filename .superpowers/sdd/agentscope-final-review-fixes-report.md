@@ -113,6 +113,7 @@ public tool_call_id remains unchanged.
 - TypeScript `npx tsc --noEmit`: passed.
 - Python `compileall`: passed.
 - `git diff --check`: passed.
+
 - Static scans retain no WebSocket/openSessionEvents transport and no public
   backgrounded terminal state.
 
@@ -651,10 +652,10 @@ bypassing the frontend while background side effects remain active.
 Lease expiry is intentionally fail-closed: a missed heartbeat does not prove that a
 paused process or detached worker stopped, so GET/stream/retry no longer writes a false
 failure terminal or releases the fence. An explicit Stop freezes the generation owner
-set, obtains the distributed quiescence barrier where owners exist, and writes a
-`stopped` user-turn terminal. The dead-owner path is also deterministic: after the
-owner registry has expired, explicit Stop closes the admitted row and permits a
-successor; passive TTL recovery never does.
+set and obtains the distributed quiescence barrier before it can write a `stopped`
+user-turn terminal. Passive TTL expiry never releases the fence. Round 7 further
+tightens explicit Stop so an admitted turn also requires positive owner/quiescence
+proof.
 
 The frontend no longer lets a late terminal for an older user turn clear a newer
 wakeup reply. Successful run terminals do not mutate active reply ownership, and
@@ -668,3 +669,82 @@ failure/stopped recovery only converges an ownerless reply state.
 - Frontend production build and TypeScript compilation: passed (Vite 1627 modules).
 - Python `compileall`: passed.
 - `git diff --check`: passed.
+
+## Round 7: coordinator health, complete history, safe errors, and UI ownership
+
+Baseline: `2479f0d`
+
+### Stop health and owner proof fail closed
+
+The coordinator heartbeat previously exited permanently after one transient registry
+failure. It now isolates failures, marks owner publication unhealthy, retries with
+bounded exponential backoff, and reports healthy only while publication, subscriber,
+and heartbeat tasks are all live. Owner snapshot read failures also make health
+untruthful until a successful refresh restores it.
+
+An admitted user turn now requires the same owner proof as a running public tool.
+Production Stop freezes owners before cancellation and refuses to write a stopped
+terminal when the coordinator is unhealthy or the owner set is unknown. Delete uses
+the same barrier and cannot call AgentScope SessionService or navigation cleanup before
+quiescence is proven. A retry succeeds only after the owner returns and ACKs. This
+strengthens the earlier Round 6 dead-owner description: passive expiry and an empty
+owner registry are not quiescence proof for an admitted turn; they remain fenced.
+
+The proof is also identity-specific: every durable admitted turn retains its runtime
+ID, and the frozen snapshot must contain every required runtime before cancellation
+begins. An unrelated live owner can no longer substitute for a missing admitted-turn
+owner. The recovery test restores the missing owner and proves the retry still waits
+for both the restored owner and the unrelated frozen owner before writing `stopped`.
+The coordinator-disabled fallback performs the same identity and local-lease preflight
+before any local or official AgentScope cancellation, so a rejected Stop/Delete retry
+does not first disturb an unrelated local execution.
+
+### Cursor-paginated session history
+
+Session history uses an opaque keyset cursor over `updated_at DESC, rowid DESC`, with
+bounded pages of 1–100 records and a default of 20. The cursor validates ISO timestamp
+shape and a non-boolean SQLite signed-64-bit positive row ID before SQL binding.
+Invalid limits and cursors return a stable public 400 instead of an overflow or raw
+database error.
+
+The client follows every cursor, rejects repeated/cyclic cursors, and deduplicates a
+session that overlaps adjacent pages. The existing history panel therefore receives
+the complete ordered result; tests traverse 27 records and prove the oldest remains
+available for both opening and deletion.
+
+### Public HTTP errors contain no internal identities
+
+Session creation, turn submission, human-decision submission/recovery, navigation
+dataset endpoints, and the unexpected-exception boundary now return stable public
+codes/messages. Raw runtime exceptions containing private user, agent, or AgentScope
+session identities are logged with traceback but never serialized into the response.
+Known pending/busy conflicts retain their public machine codes.
+
+### Cross-session request ownership is exact
+
+A deterministic turn rejection now removes its optimistic row using the original
+`session_id + message_id` even when a lifecycle switch already cleared the active
+request queue. Retry/outbox cleanup remains exact, while draft restoration still
+requires the old request to own the currently visible session, so another session's
+messages and draft are untouched.
+
+Stop requests carry an identity, session ID, lifecycle generation, and stable execution
+correlation. The correlation is the reply ID and does not change when tools start or
+finish within that reply. A response can mark interrupting only if all four dimensions
+still match. Tests independently cover A/B/A response ordering, same-session lifecycle
+replacement, old-reply/new-reply replacement, and legal tool-set changes within one
+reply.
+
+### Round 7 review and verification
+
+- Backend, frontend, pagination, and exact-owner task reviews: Spec approved and
+  quality approved after the stable-correlation, cursor-boundary, runtime-identity,
+  and fallback-preflight fix loops.
+- Affected backend suites: `293 passed, 1 warning`.
+- Full backend: `1015 passed, 1 warning` (the existing Starlette deprecation warning).
+- Full frontend: `225 passed` across 9 files.
+- Frontend production build and TypeScript compilation: passed (Vite 1627 modules).
+- Python `compileall`: passed.
+- `git diff --check`: passed.
+- Exact-owner mutation check: bypassing the required-runtime subset made both the Stop
+  and Delete regressions fail; restoring it returned both to green.

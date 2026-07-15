@@ -59,6 +59,69 @@ class SharedBus:
         return dict(self.registries[namespace])
 
 
+@pytest.mark.asyncio
+async def test_owner_heartbeat_recovers_after_transient_registry_failure() -> None:
+    class TransientHeartbeatBus(SharedBus):
+        def __init__(self) -> None:
+            super().__init__()
+            self.fail_next_owner_write = False
+            self.failure_observed = asyncio.Event()
+            self.allow_recovery = asyncio.Event()
+            self.recovery_observed = asyncio.Event()
+
+        async def registry_set(self, namespace, field, value, *, ttl_secs=None):
+            if (
+                namespace.startswith(StopCoordinator._OWNER_PREFIX)
+                and self.fail_next_owner_write
+            ):
+                self.fail_next_owner_write = False
+                self.failure_observed.set()
+                raise ConnectionError("transient owner registry failure")
+            if self.failure_observed.is_set():
+                await self.allow_recovery.wait()
+                self.recovery_observed.set()
+            await super().registry_set(
+                namespace,
+                field,
+                value,
+                ttl_secs=ttl_secs,
+            )
+
+    bus = TransientHeartbeatBus()
+    cancellation = CancellationContext()
+    coordinator = StopCoordinator(
+        bus,
+        lambda: [OwnerLease("session-1", 1, cancellation, frozenset())],
+        runtime_id="owner",
+        heartbeat_interval=0.005,
+        retry_interval=0.005,
+    )
+
+    await coordinator.start()
+    try:
+        assert coordinator.healthy is True
+        bus.fail_next_owner_write = True
+        await asyncio.wait_for(bus.failure_observed.wait(), timeout=0.2)
+        await asyncio.sleep(0)
+
+        assert coordinator.healthy is False
+        assert coordinator._heartbeat_task is not None
+        assert coordinator._heartbeat_task.done() is False
+
+        bus.allow_recovery.set()
+        await asyncio.wait_for(bus.recovery_observed.wait(), timeout=0.2)
+        for _ in range(20):
+            await asyncio.sleep(0)
+            if coordinator.healthy:
+                break
+
+        assert coordinator.healthy is True
+        assert coordinator._heartbeat_task.done() is False
+    finally:
+        bus.allow_recovery.set()
+        await coordinator.stop()
+
+
 def _runtime(
     bus: SharedBus,
     runtime_id: str,
@@ -265,6 +328,495 @@ async def test_delete_waits_for_every_remote_owner_and_timeout_is_retryable(
         await requester.stop_stop_coordinator()
         for owner in reversed(owners):
             await owner.stop_stop_coordinator()
+
+
+@pytest.mark.asyncio
+async def test_delete_of_remote_chat_turn_has_no_destructive_phase_without_owner_proof(
+    tmp_path,
+) -> None:
+    class OwnerReadFailureBus(SharedBus):
+        def __init__(self) -> None:
+            super().__init__()
+            self.fail_owner_reads = False
+
+        async def registry_getall(self, namespace: str) -> dict[str, str]:
+            if self.fail_owner_reads and namespace.startswith(
+                StopCoordinator._OWNER_PREFIX
+            ):
+                raise ConnectionError("owner registry unavailable")
+            return await super().registry_getall(namespace)
+
+    class SessionService:
+        def __init__(self) -> None:
+            self.calls: list[tuple[str, str, str]] = []
+
+        async def delete_session(self, user_id, agent_id, session_id):
+            self.calls.append((user_id, agent_id, session_id))
+            return True
+
+    class NavigationControl:
+        def __init__(self) -> None:
+            self.deleted: list[str] = []
+
+        def delete_control_state_for_web_session(self, web_session_id: str) -> None:
+            self.deleted.append(web_session_id)
+
+    bus = OwnerReadFailureBus()
+    service = SessionService()
+    navigation = NavigationControl()
+    store = WebSessionStore(tmp_path / "delete-remote-chat.sqlite")
+    session = store.create_session("remote chat")
+    internal_session_id = "remote-chat-session"
+    store.save_agentscope_session_mapping(
+        session.id,
+        agent_id="main-router-agent",
+        agentscope_session_id=internal_session_id,
+    )
+    generation = store.begin_execution_generation(session.id)
+    store.claim_user_message(
+        session.id,
+        "local-remote-chat",
+        "keep running",
+        runtime_id="remote-runtime",
+        turn_id="turn_remote_chat",
+        ttl_seconds=30.0,
+    )
+    store.commit_user_message(
+        session.id,
+        "local-remote-chat",
+        "keep running",
+        runtime_id="remote-runtime",
+        ttl_seconds=30.0,
+    )
+
+    requester = _runtime(bus, "requester", session_service=service)
+    requester.set_web_session_store(WebSessionStore(store.db_path))
+    requester._navigation_services = lambda: navigation
+    owner = _runtime(bus, "remote-runtime")
+    owner.set_web_session_store(WebSessionStore(store.db_path))
+
+    await requester.start_stop_coordinator()
+    try:
+        assert requester.stop_coordinator is not None
+        bus.fail_owner_reads = True
+        with pytest.raises(ConnectionError, match="owner registry unavailable"):
+            await requester.delete_web_session(session.id)
+        assert requester.stop_coordinator.healthy is False
+        assert service.calls == []
+        assert navigation.deleted == []
+
+        bus.fail_owner_reads = False
+        with pytest.raises(RuntimeError, match="owner acknowledgement"):
+            await requester.delete_web_session(session.id)
+        assert requester.stop_coordinator.healthy is True
+
+        assert service.calls == []
+        assert navigation.deleted == []
+        assert store.get_session(session.id) is not None
+        assert store.user_message_turn_status(session.id, "local-remote-chat") == "admitted"
+
+        cancellation = CancellationContext()
+        owner.register_run_cancellation(
+            internal_session_id,
+            cancellation,
+            generation=generation,
+        )
+
+        async def finish_remote_chat() -> None:
+            while not cancellation.cancelled:
+                await asyncio.sleep(0)
+            owner.clear_run_cancellation(internal_session_id, cancellation)
+
+        remote_chat = asyncio.create_task(finish_remote_chat())
+        await owner.start_stop_coordinator()
+        assert owner.stop_coordinator is not None
+        await owner.stop_coordinator.refresh_owners()
+
+        assert await requester.delete_web_session(session.id) is True
+        assert service.calls == [
+            ("alice", "main-router-agent", internal_session_id)
+        ]
+        assert navigation.deleted == [session.id]
+        await remote_chat
+    finally:
+        await owner.stop_stop_coordinator()
+        await requester.stop_stop_coordinator()
+
+
+@pytest.mark.asyncio
+async def test_stop_requires_owner_for_exact_admitted_runtime(tmp_path) -> None:
+    bus = SharedBus()
+    store = WebSessionStore(tmp_path / "exact-admitted-stop-owner.sqlite")
+    session = store.create_session("exact admitted stop owner")
+    internal_session_id = "shared-chat-session"
+    store.save_agentscope_session_mapping(
+        session.id,
+        agent_id="main-router-agent",
+        agentscope_session_id=internal_session_id,
+    )
+    generation = store.begin_execution_generation(session.id)
+    store.claim_user_message(
+        session.id,
+        "message-a",
+        "keep running on runtime A",
+        runtime_id="runtime-a",
+        turn_id="turn-a",
+        ttl_seconds=30.0,
+    )
+    store.commit_user_message(
+        session.id,
+        "message-a",
+        "keep running on runtime A",
+        runtime_id="runtime-a",
+        ttl_seconds=30.0,
+    )
+
+    requester = _runtime(bus, "requester")
+    unrelated_owner = _runtime(bus, "runtime-b")
+    requester.set_web_session_store(WebSessionStore(store.db_path))
+    unrelated_owner.set_web_session_store(WebSessionStore(store.db_path))
+    cancellation = CancellationContext()
+    unrelated_owner.register_run_cancellation(
+        internal_session_id,
+        cancellation,
+        generation=generation,
+    )
+    allow_unrelated_owner_to_finish = asyncio.Event()
+    allow_unrelated_owner_to_finish.set()
+
+    async def finish_unrelated_owner() -> None:
+        while not cancellation.cancelled:
+            await asyncio.sleep(0)
+        await allow_unrelated_owner_to_finish.wait()
+        unrelated_owner.clear_run_cancellation(internal_session_id, cancellation)
+
+    unrelated_owner_task = asyncio.create_task(finish_unrelated_owner())
+    admitted_owner = None
+    admitted_owner_task = None
+    admitted_cancellation = None
+
+    await unrelated_owner.start_stop_coordinator()
+    await requester.start_stop_coordinator()
+    try:
+        assert requester.stop_coordinator is not None
+        requester.stop_coordinator.ack_timeout = 0.5
+        requester.stop_coordinator.retry_interval = 0.01
+        assert unrelated_owner.stop_coordinator is not None
+        await unrelated_owner.stop_coordinator.refresh_owners()
+
+        with pytest.raises(RuntimeError, match="owner acknowledgement"):
+            await requester.interrupt_web_session(web_session_id=session.id)
+
+        assert store.user_message_turn_status(session.id, "message-a") == "admitted"
+        assert [
+            record
+            for record in store.list_public_events(session.id)
+            if record.event.get("name") == "datapilot_run_terminal"
+        ] == []
+
+        allow_unrelated_owner_to_finish.clear()
+        admitted_owner = _runtime(bus, "runtime-a")
+        admitted_owner.set_web_session_store(WebSessionStore(store.db_path))
+        admitted_cancellation = CancellationContext()
+        admitted_owner.register_run_cancellation(
+            internal_session_id,
+            admitted_cancellation,
+            generation=generation,
+        )
+
+        async def finish_admitted_owner() -> None:
+            assert admitted_owner is not None
+            assert admitted_cancellation is not None
+            while not admitted_cancellation.cancelled:
+                await asyncio.sleep(0)
+            admitted_owner.clear_run_cancellation(
+                internal_session_id,
+                admitted_cancellation,
+            )
+
+        admitted_owner_task = asyncio.create_task(finish_admitted_owner())
+        await admitted_owner.start_stop_coordinator()
+        assert admitted_owner.stop_coordinator is not None
+        await admitted_owner.stop_coordinator.refresh_owners()
+
+        retry = asyncio.create_task(
+            requester.interrupt_web_session(web_session_id=session.id)
+        )
+        for _ in range(50):
+            if cancellation.cancelled and admitted_cancellation.cancelled:
+                break
+            await asyncio.sleep(0.01)
+        assert cancellation.cancelled is True
+        assert admitted_cancellation.cancelled is True
+        await admitted_owner_task
+        assert retry.done() is False
+
+        allow_unrelated_owner_to_finish.set()
+        result = await retry
+        await unrelated_owner_task
+
+        assert result.interrupted is True
+        assert store.user_message_turn_status(session.id, "message-a") == "terminal"
+        terminal = [
+            record
+            for record in store.list_public_events(session.id)
+            if record.event.get("name") == "datapilot_run_terminal"
+        ]
+        assert len(terminal) == 1
+        assert terminal[0].event["value"]["status"] == "stopped"
+    finally:
+        allow_unrelated_owner_to_finish.set()
+        cancellation.cancel()
+        if admitted_cancellation is not None:
+            admitted_cancellation.cancel()
+        await asyncio.gather(unrelated_owner_task, return_exceptions=True)
+        if admitted_owner_task is not None:
+            await asyncio.gather(admitted_owner_task, return_exceptions=True)
+        unrelated_owner.clear_run_cancellation(internal_session_id, cancellation)
+        if admitted_owner is not None and admitted_cancellation is not None:
+            admitted_owner.clear_run_cancellation(
+                internal_session_id,
+                admitted_cancellation,
+            )
+            await admitted_owner.stop_stop_coordinator()
+        await requester.stop_stop_coordinator()
+        await unrelated_owner.stop_stop_coordinator()
+
+
+@pytest.mark.asyncio
+async def test_delete_requires_owner_for_exact_admitted_runtime(tmp_path) -> None:
+    class SessionService:
+        def __init__(self) -> None:
+            self.calls: list[tuple[str, str, str]] = []
+
+        async def delete_session(self, user_id, agent_id, session_id):
+            self.calls.append((user_id, agent_id, session_id))
+            return True
+
+    class NavigationControl:
+        def __init__(self) -> None:
+            self.deleted: list[str] = []
+
+        def delete_control_state_for_web_session(self, web_session_id: str) -> None:
+            self.deleted.append(web_session_id)
+
+    bus = SharedBus()
+    service = SessionService()
+    navigation = NavigationControl()
+    store = WebSessionStore(tmp_path / "exact-admitted-delete-owner.sqlite")
+    session = store.create_session("exact admitted delete owner")
+    internal_session_id = "shared-chat-session"
+    store.save_agentscope_session_mapping(
+        session.id,
+        agent_id="main-router-agent",
+        agentscope_session_id=internal_session_id,
+    )
+    generation = store.begin_execution_generation(session.id)
+    store.claim_user_message(
+        session.id,
+        "message-a",
+        "keep running on runtime A",
+        runtime_id="runtime-a",
+        turn_id="turn-a",
+        ttl_seconds=30.0,
+    )
+    store.commit_user_message(
+        session.id,
+        "message-a",
+        "keep running on runtime A",
+        runtime_id="runtime-a",
+        ttl_seconds=30.0,
+    )
+
+    requester = _runtime(bus, "requester", session_service=service)
+    unrelated_owner = _runtime(bus, "runtime-b")
+    requester.set_web_session_store(WebSessionStore(store.db_path))
+    requester._navigation_services = lambda: navigation
+    unrelated_owner.set_web_session_store(WebSessionStore(store.db_path))
+    cancellation = CancellationContext()
+    unrelated_owner.register_run_cancellation(
+        internal_session_id,
+        cancellation,
+        generation=generation,
+    )
+
+    async def finish_unrelated_owner() -> None:
+        while not cancellation.cancelled:
+            await asyncio.sleep(0)
+        unrelated_owner.clear_run_cancellation(internal_session_id, cancellation)
+
+    unrelated_owner_task = asyncio.create_task(finish_unrelated_owner())
+
+    await unrelated_owner.start_stop_coordinator()
+    await requester.start_stop_coordinator()
+    try:
+        assert unrelated_owner.stop_coordinator is not None
+        await unrelated_owner.stop_coordinator.refresh_owners()
+
+        with pytest.raises(RuntimeError, match="owner acknowledgement"):
+            await requester.delete_web_session(session.id)
+
+        assert service.calls == []
+        assert navigation.deleted == []
+        assert store.get_session(session.id) is not None
+        assert store.user_message_turn_status(session.id, "message-a") == "admitted"
+    finally:
+        cancellation.cancel()
+        await asyncio.gather(unrelated_owner_task, return_exceptions=True)
+        unrelated_owner.clear_run_cancellation(internal_session_id, cancellation)
+        await requester.stop_stop_coordinator()
+        await unrelated_owner.stop_stop_coordinator()
+
+
+@pytest.mark.asyncio
+async def test_stop_fallback_proves_exact_local_owner_before_cancellation(tmp_path) -> None:
+    class RecordingChatService:
+        def __init__(self) -> None:
+            self.calls: list[tuple[str, str, str]] = []
+
+        async def interrupt(self, user_id, session_id, agent_id):
+            self.calls.append((user_id, session_id, agent_id))
+
+    bus = SharedBus()
+    store = WebSessionStore(tmp_path / "fallback-exact-stop-owner.sqlite")
+    session = store.create_session("fallback exact stop owner")
+    chat_session_id = "runtime-a-chat-session"
+    unrelated_session_id = "runtime-b-unrelated-session"
+    for agent_id, internal_session_id in (
+        ("main-router-agent", chat_session_id),
+        ("navigation-data-agent", unrelated_session_id),
+    ):
+        store.save_agentscope_session_mapping(
+            session.id,
+            agent_id=agent_id,
+            agentscope_session_id=internal_session_id,
+        )
+    generation = store.begin_execution_generation(session.id)
+    store.claim_user_message(
+        session.id,
+        "message-a",
+        "runtime A is still running",
+        runtime_id="runtime-a",
+        turn_id="turn-a",
+        ttl_seconds=30.0,
+    )
+    store.commit_user_message(
+        session.id,
+        "message-a",
+        "runtime A is still running",
+        runtime_id="runtime-a",
+        ttl_seconds=30.0,
+    )
+
+    runtime = _runtime(bus, "runtime-b")
+    chat_service = RecordingChatService()
+    runtime.app.state.chat_service = chat_service
+    runtime.set_web_session_store(WebSessionStore(store.db_path))
+    unrelated_cancellation = CancellationContext()
+    runtime.register_run_cancellation(
+        unrelated_session_id,
+        unrelated_cancellation,
+        generation=generation,
+    )
+
+    try:
+        with pytest.raises(RuntimeError, match="owner acknowledgement"):
+            await runtime.interrupt_web_session(web_session_id=session.id)
+
+        assert unrelated_cancellation.cancelled is False
+        assert chat_service.calls == []
+        assert store.user_message_turn_status(session.id, "message-a") == "admitted"
+    finally:
+        runtime.clear_run_cancellation(
+            unrelated_session_id,
+            unrelated_cancellation,
+        )
+
+
+@pytest.mark.asyncio
+async def test_delete_fallback_proves_exact_local_owner_before_cleanup(tmp_path) -> None:
+    class RecordingChatService:
+        def __init__(self) -> None:
+            self.interrupts: list[tuple[str, str, str]] = []
+
+        async def interrupt(self, user_id, session_id, agent_id):
+            self.interrupts.append((user_id, session_id, agent_id))
+
+    class SessionService:
+        def __init__(self) -> None:
+            self.deleted: list[tuple[str, str, str]] = []
+
+        async def delete_session(self, user_id, agent_id, session_id):
+            self.deleted.append((user_id, agent_id, session_id))
+            return True
+
+    class NavigationControl:
+        def __init__(self) -> None:
+            self.deleted: list[str] = []
+
+        def delete_control_state_for_web_session(self, web_session_id: str) -> None:
+            self.deleted.append(web_session_id)
+
+    bus = SharedBus()
+    store = WebSessionStore(tmp_path / "fallback-exact-delete-owner.sqlite")
+    session = store.create_session("fallback exact delete owner")
+    chat_session_id = "runtime-a-chat-session"
+    unrelated_session_id = "runtime-b-unrelated-session"
+    for agent_id, internal_session_id in (
+        ("main-router-agent", chat_session_id),
+        ("navigation-data-agent", unrelated_session_id),
+    ):
+        store.save_agentscope_session_mapping(
+            session.id,
+            agent_id=agent_id,
+            agentscope_session_id=internal_session_id,
+        )
+    generation = store.begin_execution_generation(session.id)
+    store.claim_user_message(
+        session.id,
+        "message-a",
+        "runtime A is still running",
+        runtime_id="runtime-a",
+        turn_id="turn-a",
+        ttl_seconds=30.0,
+    )
+    store.commit_user_message(
+        session.id,
+        "message-a",
+        "runtime A is still running",
+        runtime_id="runtime-a",
+        ttl_seconds=30.0,
+    )
+
+    service = SessionService()
+    navigation = NavigationControl()
+    runtime = _runtime(bus, "runtime-b", session_service=service)
+    chat_service = RecordingChatService()
+    runtime.app.state.chat_service = chat_service
+    runtime._navigation_services = lambda: navigation
+    runtime.set_web_session_store(WebSessionStore(store.db_path))
+    unrelated_cancellation = CancellationContext()
+    runtime.register_run_cancellation(
+        unrelated_session_id,
+        unrelated_cancellation,
+        generation=generation,
+    )
+
+    try:
+        with pytest.raises(RuntimeError, match="owner acknowledgement"):
+            await runtime.delete_web_session(session.id)
+
+        assert unrelated_cancellation.cancelled is False
+        assert chat_service.interrupts == []
+        assert service.deleted == []
+        assert navigation.deleted == []
+        assert store.get_session(session.id) is not None
+        assert store.user_message_turn_status(session.id, "message-a") == "admitted"
+    finally:
+        runtime.clear_run_cancellation(
+            unrelated_session_id,
+            unrelated_cancellation,
+        )
 
 
 @pytest.mark.asyncio

@@ -97,6 +97,11 @@ export type SubmitTurnResult = {
   terminal: boolean;
 };
 
+type SessionHistoryPage = {
+  sessions: SessionRecord[];
+  next_cursor?: string | null;
+};
+
 async function requestJson<T>(url: string, init?: RequestInit): Promise<T> {
   const response = await fetch(url, {
     ...init,
@@ -117,8 +122,35 @@ export async function createSession(message: string, creationId: string): Promis
 }
 
 export async function listSessions(): Promise<SessionRecord[]> {
-  const data = await requestJson<{ sessions: SessionRecord[] }>("/api/sessions");
-  return data.sessions;
+  const sessions: SessionRecord[] = [];
+  const seenSessionIds = new Set<string>();
+  const seenCursors = new Set<string>();
+  let cursor: string | null = null;
+  do {
+    const path: string = cursor === null
+      ? "/api/sessions"
+      : `/api/sessions?cursor=${encodeURIComponent(cursor)}`;
+    const data: SessionHistoryPage = await requestJson<SessionHistoryPage>(path);
+    if (!Array.isArray(data.sessions)) {
+      throw new SyntaxError("Invalid session-history response");
+    }
+    for (const session of data.sessions) {
+      if (!seenSessionIds.has(session.id)) {
+        seenSessionIds.add(session.id);
+        sessions.push(session);
+      }
+    }
+    const nextCursor: string | null = data.next_cursor ?? null;
+    if (nextCursor !== null && typeof nextCursor !== "string") {
+      throw new SyntaxError("Invalid session-history cursor");
+    }
+    if (nextCursor !== null && seenCursors.has(nextCursor)) {
+      throw new SyntaxError("Repeated session-history cursor");
+    }
+    if (nextCursor !== null) seenCursors.add(nextCursor);
+    cursor = nextCursor;
+  } while (cursor !== null);
+  return sessions;
 }
 
 export async function getSession(sessionId: string): Promise<SessionDetail> {

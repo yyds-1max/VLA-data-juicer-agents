@@ -68,6 +68,7 @@ class StopCoordinator:
         self._registered_fields: set[tuple[str, str]] = set()
         self._started = False
         self._refresh_lock = asyncio.Lock()
+        self._owner_registry_healthy = False
 
     @classmethod
     def owner_namespace(cls, agentscope_session_id: str) -> str:
@@ -80,6 +81,18 @@ class StopCoordinator:
     @property
     def started(self) -> bool:
         return self._started
+
+    @property
+    def healthy(self) -> bool:
+        """Whether owner publication and both coordinator loops are live."""
+        return bool(
+            self._started
+            and self._owner_registry_healthy
+            and self._subscriber_task is not None
+            and not self._subscriber_task.done()
+            and self._heartbeat_task is not None
+            and not self._heartbeat_task.done()
+        )
 
     async def start(self) -> None:
         if self._started:
@@ -136,6 +149,7 @@ class StopCoordinator:
         self._heartbeat_task = None
         self._subscriber_task = None
         self._handler_tasks.clear()
+        self._owner_registry_healthy = False
 
     def _handler_task_done(self, task: asyncio.Task) -> None:
         self._handler_tasks.discard(task)
@@ -147,8 +161,16 @@ class StopCoordinator:
             _logger.exception("Stop request handler failed")
 
     async def refresh_owners(self) -> None:
-        async with self._refresh_lock:
-            await self._refresh_owners_serialized()
+        try:
+            async with self._refresh_lock:
+                await self._refresh_owners_serialized()
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            self._owner_registry_healthy = False
+            raise
+        else:
+            self._owner_registry_healthy = True
 
     async def _refresh_owners_serialized(self) -> None:
         now = time.time()
@@ -237,18 +259,59 @@ class StopCoordinator:
         self,
         agentscope_session_ids: list[str],
         target_generation: int,
+        *,
+        required_runtime_ids: Iterable[str] = (),
     ) -> dict[str, dict[str, Any]]:
         """Freeze the owner set before any cancellation can release a lease."""
         await self.refresh_owners()
-        return await self._snapshot_expected_owners(
-            agentscope_session_ids,
-            target_generation,
-        )
+        try:
+            expected = await self._snapshot_expected_owners(
+                agentscope_session_ids,
+                target_generation,
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            self._owner_registry_healthy = False
+            raise
+        self._owner_registry_healthy = True
+        required = frozenset(required_runtime_ids)
+        available = {
+            str(owner["runtime_id"])
+            for owner in expected.values()
+            if "runtime_id" in owner
+        }
+        if not required.issubset(available):
+            raise TimeoutError(
+                "no live owner available for admitted runtime acknowledgement"
+            )
+        return expected
 
     async def _heartbeat_loop(self) -> None:
+        consecutive_failures = 0
         while True:
-            await asyncio.sleep(self.heartbeat_interval)
-            await self.refresh_owners()
+            delay = (
+                self.heartbeat_interval
+                if consecutive_failures == 0
+                else min(
+                    max(self.retry_interval, self.heartbeat_interval)
+                    * (2 ** min(consecutive_failures - 1, 8)),
+                    max(self.heartbeat_interval, self.owner_ttl / 2),
+                )
+            )
+            await asyncio.sleep(delay)
+            try:
+                await self.refresh_owners()
+            except asyncio.CancelledError:
+                raise
+            except Exception:  # pylint: disable=broad-except
+                consecutive_failures += 1
+                _logger.exception(
+                    "Stop owner heartbeat failed; retrying",
+                    extra={"runtime_id": self.runtime_id},
+                )
+            else:
+                consecutive_failures = 0
 
     async def _snapshot_expected_owners(
         self,

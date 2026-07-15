@@ -38,7 +38,10 @@ class FakeAgentScopeRuntime:
     async def recover_human_decision_handoff(self, *, web_session_id: str, recovery: dict):
         self.recoveries.append((web_session_id, recovery))
         if recovery["reason"] == "illegal":
-            raise RuntimeError("handoff is not recovery_required")
+            raise RuntimeError(
+                "handoff is not recovery_required for "
+                "agent=router-secret session=as-secret user=alice-secret"
+            )
         return {
             "recovered": True,
             "plan_id": recovery["plan_id"],
@@ -173,6 +176,50 @@ def test_human_decision_runtime_rejection_returns_409(tmp_path) -> None:
     assert response.json()["detail"] == "Human decision was not accepted"
 
 
+def test_turn_and_human_decision_failures_do_not_expose_internal_identity(
+    tmp_path,
+) -> None:
+    runtime = FakeAgentScopeRuntime()
+    client = _client(tmp_path, runtime)
+    session_id = _create_session(client)
+    internal_identity = "agent=router-secret session=as-secret user=alice-secret"
+
+    async def fail_turn(**_kwargs):
+        raise RuntimeError(internal_identity)
+
+    async def fail_decision(**_kwargs):
+        raise RuntimeError(internal_identity)
+
+    runtime.submit_user_message = fail_turn
+    turn = client.post(
+        f"/api/sessions/{session_id}/turns",
+        json={"message": "run", "message_id": "local-secret-boundary"},
+    )
+    runtime.submit_human_decision = fail_decision
+    decision = client.post(
+        f"/api/sessions/{session_id}/human-decisions",
+        json={
+            "action": "stop",
+            "request_id": "request-secret-boundary",
+            "tool_call_id": "tool-secret-boundary",
+            "reply_id": "reply-secret-boundary",
+        },
+    )
+
+    assert turn.status_code == 409
+    assert turn.json()["detail"] == {
+        "code": "turn_submission_failed",
+        "message": "DataPilot could not submit this turn. Please retry.",
+    }
+    assert decision.status_code == 409
+    assert decision.json()["detail"] == {
+        "code": "human_decision_failed",
+        "message": "DataPilot could not apply this human decision.",
+    }
+    assert internal_identity not in turn.text
+    assert internal_identity not in decision.text
+
+
 def test_human_decision_unknown_session_returns_404(tmp_path) -> None:
     runtime = FakeAgentScopeRuntime()
     client = _client(tmp_path, runtime)
@@ -244,4 +291,11 @@ def test_human_decision_recovery_validation_ownership_and_state_errors(tmp_path)
         },
     )
     assert conflict.status_code == 409
-    assert "recovery_required" in conflict.json()["detail"]
+    assert conflict.json()["detail"] == {
+        "code": "human_decision_recovery_failed",
+        "message": "DataPilot could not recover this human decision handoff.",
+    }
+    assert "recovery_required" not in conflict.text
+    assert "router-secret" not in conflict.text
+    assert "as-secret" not in conflict.text
+    assert "alice-secret" not in conflict.text

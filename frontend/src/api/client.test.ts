@@ -89,6 +89,123 @@ describe("api client", () => {
     });
   });
 
+  it("follows session-history cursors until every page is loaded", async () => {
+    const first = Array.from({ length: 20 }, (_, index) => session({ id: `session-${index}` }));
+    const oldest = Array.from({ length: 7 }, (_, index) => session({ id: `session-${index + 20}` }));
+    const fetchMock = vi.fn()
+      .mockResolvedValueOnce({
+        ok: true,
+        status: 200,
+        statusText: "OK",
+        json: () => Promise.resolve({ sessions: first, next_cursor: "opaque cursor" }),
+      })
+      .mockResolvedValueOnce({
+        ok: true,
+        status: 200,
+        statusText: "OK",
+        json: () => Promise.resolve({ sessions: oldest, next_cursor: null }),
+      });
+    vi.stubGlobal("fetch", fetchMock);
+
+    await expect(listSessions()).resolves.toEqual([...first, ...oldest]);
+    expect(fetchMock).toHaveBeenNthCalledWith(1, "/api/sessions", {
+      headers: { "content-type": "application/json" },
+    });
+    expect(fetchMock).toHaveBeenNthCalledWith(
+      2,
+      "/api/sessions?cursor=opaque%20cursor",
+      { headers: { "content-type": "application/json" } },
+    );
+  });
+
+  it("deduplicates a session repeated across adjacent cursor pages", async () => {
+    const repeated = session({ id: "session-overlap" });
+    const fetchMock = vi.fn()
+      .mockResolvedValueOnce({
+        ok: true,
+        status: 200,
+        statusText: "OK",
+        json: () => Promise.resolve({
+          sessions: [session({ id: "session-new" }), repeated],
+          next_cursor: "next-page",
+        }),
+      })
+      .mockResolvedValueOnce({
+        ok: true,
+        status: 200,
+        statusText: "OK",
+        json: () => Promise.resolve({
+          sessions: [repeated, session({ id: "session-old" })],
+          next_cursor: null,
+        }),
+      });
+    vi.stubGlobal("fetch", fetchMock);
+
+    await expect(listSessions()).resolves.toEqual([
+      session({ id: "session-new" }),
+      repeated,
+      session({ id: "session-old" }),
+    ]);
+  });
+
+  it("rejects a repeated session-history cursor after a bounded number of requests", async () => {
+    const fetchMock = vi.fn()
+      .mockResolvedValueOnce({
+        ok: true,
+        status: 200,
+        statusText: "OK",
+        json: () => Promise.resolve({ sessions: [], next_cursor: "repeat" }),
+      })
+      .mockResolvedValueOnce({
+        ok: true,
+        status: 200,
+        statusText: "OK",
+        json: () => Promise.resolve({ sessions: [], next_cursor: "repeat" }),
+      })
+      .mockResolvedValueOnce({
+        ok: true,
+        status: 200,
+        statusText: "OK",
+        json: () => Promise.resolve({ sessions: [], next_cursor: null }),
+      });
+    vi.stubGlobal("fetch", fetchMock);
+
+    await expect(listSessions()).rejects.toThrow(SyntaxError);
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+  });
+
+  it("rejects a cyclic session-history cursor after a bounded number of requests", async () => {
+    const fetchMock = vi.fn()
+      .mockResolvedValueOnce({
+        ok: true,
+        status: 200,
+        statusText: "OK",
+        json: () => Promise.resolve({ sessions: [], next_cursor: "cursor-a" }),
+      })
+      .mockResolvedValueOnce({
+        ok: true,
+        status: 200,
+        statusText: "OK",
+        json: () => Promise.resolve({ sessions: [], next_cursor: "cursor-b" }),
+      })
+      .mockResolvedValueOnce({
+        ok: true,
+        status: 200,
+        statusText: "OK",
+        json: () => Promise.resolve({ sessions: [], next_cursor: "cursor-a" }),
+      })
+      .mockResolvedValueOnce({
+        ok: true,
+        status: 200,
+        statusText: "OK",
+        json: () => Promise.resolve({ sessions: [], next_cursor: null }),
+      });
+    vi.stubGlobal("fetch", fetchMock);
+
+    await expect(listSessions()).rejects.toThrow(SyntaxError);
+    expect(fetchMock).toHaveBeenCalledTimes(3);
+  });
+
   it("encodes the session id when getting session detail", async () => {
     const sessionDetail = detail({ id: "session/with space" });
     const fetchMock = mockFetchJson({ session: sessionDetail });

@@ -17,7 +17,10 @@ import {
 } from "../../api/client";
 import type { PendingHumanDecision, SessionRecord } from "../../api/types";
 import { datapilotStore } from "../../store/datapilotStore";
-import { hasActiveExecution } from "../../store/agentConversation";
+import {
+  hasActiveExecution,
+  type AgentConversationState,
+} from "../../store/agentConversation";
 import { Composer } from "./Composer";
 import { DraftNewSessionView } from "./DraftNewSessionView";
 import { HumanDecisionDialog } from "./HumanDecisionDialog";
@@ -57,6 +60,13 @@ type ActiveSubmitRequest = {
   userMessage: ReturnType<typeof localUserMessage>;
   outcome: "pending" | "success" | "failure";
   error?: unknown;
+};
+
+type StopRequestToken = {
+  id: number;
+  sessionId: string;
+  generation: number;
+  executionCorrelation: string | null;
 };
 
 type SubmitAdmission = {
@@ -108,6 +118,8 @@ export function DataPilotWindow() {
   const requestInFlightRef = useRef<SubmitAdmission | null>(null);
   const activeSubmitRequestIdRef = useRef(0);
   const activeSubmitQueueRef = useRef(new Map<number, ActiveSubmitRequest>());
+  const stopRequestIdRef = useRef(0);
+  const activeStopRequestRef = useRef<StopRequestToken | null>(null);
   const ambiguousTurnRetriesRef = useRef(new Map<string, AmbiguousTurnRetry>());
   const sessionCreationRetryRef = useRef<SessionCreationRetry | null>(null);
   const deletedSessionIdsRef = useRef(new Set<string>());
@@ -609,6 +621,7 @@ export function DataPilotWindow() {
 
   useEffect(() => {
     setStopRequestPending(false);
+    activeStopRequestRef.current = null;
   }, [currentSessionId]);
 
   useEffect(() => {
@@ -962,6 +975,10 @@ export function DataPilotWindow() {
       if (ambiguousTurnRetriesRef.current.get(sessionId)?.userMessage.id === request.userMessage.id) {
         discardTurnRetry(sessionId, request.userMessage.id);
       }
+      datapilotStore.getState().removeOptimisticUserMessage(
+        sessionId,
+        request.userMessage.id,
+      );
       if (current === request) {
         request.outcome = "failure";
         request.error = error;
@@ -980,17 +997,36 @@ export function DataPilotWindow() {
     }
 
     const sessionId = currentSessionId;
+    const token: StopRequestToken = {
+      id: stopRequestIdRef.current + 1,
+      sessionId,
+      generation: lifecycleGenerationRef.current,
+      executionCorrelation: currentExecutionCorrelation(conversation),
+    };
+    stopRequestIdRef.current = token.id;
+    activeStopRequestRef.current = token;
     setStopRequestPending(true);
     try {
       const interrupted = await interruptTurn(sessionId);
-      const state = datapilotStore.getState();
-      if (interrupted && state.currentSessionId === sessionId) {
-        state.markInterrupting();
-        setStopRequestPending(false);
-      } else {
-        setStopRequestPending(false);
+      if (activeStopRequestRef.current !== token) {
+        return;
       }
+      const state = datapilotStore.getState();
+      if (
+        interrupted &&
+        lifecycleGenerationRef.current === token.generation &&
+        state.currentSessionId === token.sessionId &&
+        currentExecutionCorrelation(state.conversation) === token.executionCorrelation
+      ) {
+        state.markInterrupting();
+      }
+      activeStopRequestRef.current = null;
+      setStopRequestPending(false);
     } catch (error) {
+      if (activeStopRequestRef.current !== token) {
+        return;
+      }
+      activeStopRequestRef.current = null;
       setStopRequestPending(false);
       console.error("Failed to interrupt DataPilot turn", error);
     }
@@ -1313,6 +1349,10 @@ function localUserMessage(sessionId: string, content: string) {
     content,
     created_at: new Date().toISOString(),
   };
+}
+
+function currentExecutionCorrelation(conversation: AgentConversationState): string | null {
+  return conversation.currentReplyId;
 }
 
 function createLocalId(): string {

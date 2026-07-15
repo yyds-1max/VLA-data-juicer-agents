@@ -2,6 +2,8 @@ from concurrent.futures import ThreadPoolExecutor
 from datetime import UTC, datetime, timedelta
 from hashlib import sha256
 from pathlib import Path
+import base64
+import json
 import sqlite3
 from threading import Event
 
@@ -21,6 +23,14 @@ SCHEMA_GENERATION = "agentscope-native-events-v1"
 
 def _digest(value: str) -> str:
     return sha256(value.encode()).hexdigest()
+
+
+def _session_cursor(row_id: object) -> str:
+    payload = json.dumps(
+        ["2026-06-26T10:00:00+08:00", row_id],
+        separators=(",", ":"),
+    ).encode()
+    return base64.urlsafe_b64encode(payload).decode().rstrip("=")
 
 
 def _create_legacy_web_schema(db_path: Path) -> None:
@@ -165,6 +175,50 @@ def test_store_creates_session_and_lists_recent(tmp_path: Path):
     session = store.create_session(title="处理 20270605 的室外导航数据")
 
     assert store.list_sessions() == [session]
+
+
+def test_store_session_cursor_paginates_stably_without_duplicates(tmp_path: Path):
+    store = WebSessionStore(tmp_path / "session-pagination.sqlite")
+    created = [store.create_session(title=f"session {index:02d}") for index in range(27)]
+
+    seen = []
+    cursor = None
+    while True:
+        page, cursor = store.list_sessions_page(limit=7, cursor=cursor)
+        seen.extend(page)
+        if cursor is None:
+            break
+
+    assert [session.id for session in seen] == [session.id for session in reversed(created)]
+    assert len({session.id for session in seen}) == 27
+    with pytest.raises(ValueError, match="session cursor"):
+        store.list_sessions_page(limit=7, cursor="not-a-valid-cursor")
+
+
+@pytest.mark.parametrize("limit", [0, 101])
+def test_store_session_page_rejects_limit_outside_public_bounds(
+    tmp_path: Path,
+    limit: int,
+) -> None:
+    store = WebSessionStore(tmp_path / "session-pagination-limit.sqlite")
+
+    with pytest.raises(ValueError, match="session page limit"):
+        store.list_sessions_page(limit=limit)
+
+
+@pytest.mark.parametrize(
+    "row_id",
+    [False, True, 0, -1, 2**63],
+    ids=["false", "true", "zero", "negative", "above-sqlite-int64"],
+)
+def test_store_session_cursor_rejects_invalid_row_id(
+    tmp_path: Path,
+    row_id: object,
+) -> None:
+    store = WebSessionStore(tmp_path / "session-pagination-cursor.sqlite")
+
+    with pytest.raises(ValueError, match="invalid session cursor"):
+        store.list_sessions_page(limit=7, cursor=_session_cursor(row_id))
 
 
 def test_store_persists_transcript(tmp_path: Path):

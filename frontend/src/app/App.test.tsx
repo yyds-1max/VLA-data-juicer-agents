@@ -2791,6 +2791,70 @@ test("a stale rejection cannot remove messages or restore a draft in another ses
   expect(screen.getByPlaceholderText("继续描述任务…")).toHaveValue("");
 });
 
+test("deterministic rejection removes its exact optimistic row after an A/B/A lifecycle reset", async () => {
+  const consoleError = vi.spyOn(console, "error").mockImplementation(() => undefined);
+  const submission = deferred<string>();
+  apiMocks.submitTurn.mockReturnValue(submission.promise);
+  const sessionA = {
+    id: "session-a",
+    title: "Session A",
+    created_at: "2026-06-26T01:00:00Z",
+    updated_at: "2026-06-26T02:00:00Z",
+  };
+  const sessionB = { ...sessionA, id: "session-b", title: "Session B" };
+  apiMocks.listSessions.mockResolvedValue([sessionA, sessionB]);
+  apiMocks.getSession.mockImplementation((sessionId) =>
+    Promise.resolve(emptySessionDetail(sessionId)),
+  );
+  datapilotStore.setState({
+    open: true,
+    mode: "active_session",
+    currentSessionId: "session-a",
+    sessions: [sessionA, sessionB],
+    conversation: createAgentConversation(),
+  });
+  await renderAppWithDashboardSettled();
+
+  fireEvent.change(screen.getByPlaceholderText("继续描述任务…"), {
+    target: { value: "A 的确定失败消息" },
+  });
+  fireEvent.click(screen.getByRole("button", { name: "Send message" }));
+  await waitFor(() => expect(apiMocks.submitTurn).toHaveBeenCalledTimes(1));
+  const messageId = apiMocks.submitTurn.mock.calls[0]?.[2] as string;
+  expect(window.sessionStorage.getItem("datapilot-turn-outbox:session-a")).not.toBeNull();
+
+  fireEvent.click(screen.getByRole("button", { name: "History" }));
+  fireEvent.click(await screen.findByRole("button", { name: "Open session Session B" }));
+  await waitFor(() => expect(datapilotStore.getState().currentSessionId).toBe("session-b"));
+  fireEvent.click(screen.getByRole("button", { name: "History" }));
+  fireEvent.click(await screen.findByRole("button", { name: "Open session Session A" }));
+  await waitFor(() => expect(datapilotStore.getState().currentSessionId).toBe("session-a"));
+  await waitFor(() =>
+    expect(datapilotStore.getState().conversation.messages.map((message) => message.id)).toContain(
+      messageId,
+    ),
+  );
+  const composer = screen.getByPlaceholderText("继续描述任务…");
+  fireEvent.change(composer, { target: { value: "A 的更新草稿" } });
+
+  submission.reject(new Error("deterministic rejection after lifecycle reset"));
+  await act(async () => {
+    try {
+      await submission.promise;
+    } catch {
+      // The component owns the expected rejection.
+    }
+    await Promise.resolve();
+  });
+
+  expect(datapilotStore.getState().conversation.messages.map((message) => message.id)).not.toContain(
+    messageId,
+  );
+  expect(window.sessionStorage.getItem("datapilot-turn-outbox:session-a")).toBeNull();
+  expect(composer).toHaveValue("A 的更新草稿");
+  consoleError.mockRestore();
+});
+
 test("late active submit response cannot append after deleting its session", async () => {
   const submission = deferred<string>();
   apiMocks.submitTurn.mockReturnValue(submission.promise);
@@ -3810,6 +3874,241 @@ test("stop response cannot strand interrupt pending when terminal arrived first"
   });
 
   expect(await screen.findByRole("button", { name: "Send message" })).toBeEnabled();
+});
+
+test("a late stop response for A cannot clear B's newer pending stop", async () => {
+  const stopA = deferred<boolean>();
+  const stopB = deferred<boolean>();
+  apiMocks.interruptTurn
+    .mockReturnValueOnce(stopA.promise)
+    .mockReturnValueOnce(stopB.promise);
+  datapilotStore.setState({
+    open: true,
+    mode: "active_session",
+    currentSessionId: "session-a",
+    sessions: [],
+    conversation: {
+      ...createAgentConversation(),
+      phase: "streaming",
+      currentReplyId: "reply-a-old",
+    },
+  });
+  await renderAppWithDashboardSettled();
+  fireEvent.click(screen.getByRole("button", { name: "Stop current run" }));
+  await waitFor(() => expect(apiMocks.interruptTurn).toHaveBeenCalledWith("session-a"));
+
+  act(() => {
+    datapilotStore.setState({
+      currentSessionId: "session-b",
+      conversation: {
+        ...createAgentConversation(),
+        phase: "streaming",
+        currentReplyId: "reply-b-current",
+      },
+    });
+  });
+  const stopBButton = await screen.findByRole("button", { name: "Stop current run" });
+  fireEvent.click(stopBButton);
+  await waitFor(() => expect(apiMocks.interruptTurn).toHaveBeenCalledWith("session-b"));
+  expect(screen.getByRole("button", { name: "Interrupt requested" })).toBeDisabled();
+
+  await act(async () => {
+    stopA.resolve(true);
+    await stopA.promise;
+  });
+
+  expect(datapilotStore.getState().currentSessionId).toBe("session-b");
+  expect(datapilotStore.getState().conversation.phase).toBe("streaming");
+  expect(screen.getByRole("button", { name: "Interrupt requested" })).toBeDisabled();
+
+  await act(async () => {
+    stopB.resolve(true);
+    await stopB.promise;
+  });
+  expect(datapilotStore.getState().conversation.phase).toBe("interrupting");
+});
+
+test("an A/B/A lifecycle reset prevents A's old stop response from interrupting A's new reply", async () => {
+  const stopA = deferred<boolean>();
+  apiMocks.interruptTurn.mockReturnValueOnce(stopA.promise);
+  datapilotStore.setState({
+    open: true,
+    mode: "active_session",
+    currentSessionId: "session-a",
+    sessions: [],
+    conversation: {
+      ...createAgentConversation(),
+      phase: "streaming",
+      currentReplyId: "reply-a-old",
+    },
+  });
+  await renderAppWithDashboardSettled();
+  fireEvent.click(screen.getByRole("button", { name: "Stop current run" }));
+  await waitFor(() => expect(apiMocks.interruptTurn).toHaveBeenCalledWith("session-a"));
+
+  act(() => {
+    datapilotStore.setState({
+      currentSessionId: "session-b",
+      conversation: {
+        ...createAgentConversation(),
+        phase: "streaming",
+        currentReplyId: "reply-b",
+      },
+    });
+  });
+  await waitFor(() => expect(datapilotStore.getState().currentSessionId).toBe("session-b"));
+  act(() => {
+    datapilotStore.setState({
+      currentSessionId: "session-a",
+      conversation: {
+        ...createAgentConversation(),
+        phase: "streaming",
+        currentReplyId: "reply-a-new",
+      },
+    });
+  });
+  await waitFor(() =>
+    expect(screen.getByRole("button", { name: "Stop current run" })).toBeEnabled(),
+  );
+
+  await act(async () => {
+    stopA.resolve(true);
+    await stopA.promise;
+  });
+
+  expect(datapilotStore.getState().currentSessionId).toBe("session-a");
+  expect(datapilotStore.getState().conversation.currentReplyId).toBe("reply-a-new");
+  expect(datapilotStore.getState().conversation.phase).toBe("streaming");
+  expect(screen.getByRole("button", { name: "Stop current run" })).toBeEnabled();
+});
+
+test("same-session lifecycle generation change rejects an old stop response", async () => {
+  const stop = deferred<boolean>();
+  apiMocks.interruptTurn.mockReturnValueOnce(stop.promise);
+  datapilotStore.setState({
+    open: true,
+    mode: "active_session",
+    currentSessionId: "session-a",
+    sessions: [],
+    conversation: {
+      ...createAgentConversation(),
+      phase: "streaming",
+      currentReplyId: "reply-same-session",
+    },
+  });
+  await renderAppWithDashboardSettled();
+  fireEvent.click(screen.getByRole("button", { name: "Stop current run" }));
+  await waitFor(() => expect(apiMocks.interruptTurn).toHaveBeenCalledWith("session-a"));
+
+  act(() => datapilotStore.getState().setOpen(false));
+  fireEvent.click(screen.getByRole("button", { name: "Open DataPilot" }));
+  await waitFor(() =>
+    expect(screen.getByRole("button", { name: "Interrupt requested" })).toBeDisabled(),
+  );
+
+  await act(async () => {
+    stop.resolve(true);
+    await stop.promise;
+  });
+
+  expect(datapilotStore.getState().currentSessionId).toBe("session-a");
+  expect(datapilotStore.getState().conversation.currentReplyId).toBe("reply-same-session");
+  expect(datapilotStore.getState().conversation.phase).toBe("streaming");
+  expect(screen.getByRole("button", { name: "Stop current run" })).toBeEnabled();
+});
+
+test("same-lifecycle reply change rejects an old stop response by execution correlation", async () => {
+  const stop = deferred<boolean>();
+  apiMocks.interruptTurn.mockReturnValueOnce(stop.promise);
+  datapilotStore.setState({
+    open: true,
+    mode: "active_session",
+    currentSessionId: "session-a",
+    sessions: [],
+    conversation: {
+      ...createAgentConversation(),
+      phase: "streaming",
+      currentReplyId: "reply-old",
+    },
+  });
+  await renderAppWithDashboardSettled();
+  fireEvent.click(screen.getByRole("button", { name: "Stop current run" }));
+  await waitFor(() => expect(apiMocks.interruptTurn).toHaveBeenCalledWith("session-a"));
+
+  act(() => {
+    datapilotStore.setState({
+      conversation: {
+        ...createAgentConversation(),
+        phase: "streaming",
+        currentReplyId: "reply-new",
+      },
+    });
+  });
+  await waitFor(() =>
+    expect(datapilotStore.getState().conversation.currentReplyId).toBe("reply-new"),
+  );
+
+  await act(async () => {
+    stop.resolve(true);
+    await stop.promise;
+  });
+
+  expect(datapilotStore.getState().conversation.currentReplyId).toBe("reply-new");
+  expect(datapilotStore.getState().conversation.phase).toBe("streaming");
+  expect(screen.getByRole("button", { name: "Stop current run" })).toBeEnabled();
+});
+
+test("same reply remains the same execution when its running tool set changes", async () => {
+  const stop = deferred<boolean>();
+  apiMocks.interruptTurn.mockReturnValueOnce(stop.promise);
+  datapilotStore.setState({
+    open: true,
+    mode: "active_session",
+    currentSessionId: "session-a",
+    sessions: [],
+    conversation: {
+      ...createAgentConversation(),
+      phase: "streaming",
+      currentReplyId: "reply-stable",
+    },
+  });
+  await renderAppWithDashboardSettled();
+  fireEvent.click(screen.getByRole("button", { name: "Stop current run" }));
+  await waitFor(() => expect(apiMocks.interruptTurn).toHaveBeenCalledWith("session-a"));
+
+  act(() => {
+    datapilotStore.setState((state) => ({
+      conversation: {
+        ...state.conversation,
+        toolRuns: {
+          "call-started-while-stop-pending": {
+            session_id: "session-a",
+            tool_call_id: "call-started-while-stop-pending",
+            tool_name: "extract",
+            status: "running",
+            summary: "",
+            error_type: null,
+            started_at: "2026-06-26T00:00:01Z",
+            finished_at: null,
+          },
+        },
+      },
+    }));
+  });
+  await waitFor(() =>
+    expect(datapilotStore.getState().conversation.toolRuns).toHaveProperty(
+      "call-started-while-stop-pending",
+    ),
+  );
+
+  await act(async () => {
+    stop.resolve(true);
+    await stop.promise;
+  });
+
+  expect(datapilotStore.getState().conversation.currentReplyId).toBe("reply-stable");
+  expect(datapilotStore.getState().conversation.phase).toBe("interrupting");
+  expect(screen.getByRole("button", { name: "Interrupt requested" })).toBeDisabled();
 });
 
 test("stop keeps the draft editable and submits it after the terminating REPLY_END", async () => {
