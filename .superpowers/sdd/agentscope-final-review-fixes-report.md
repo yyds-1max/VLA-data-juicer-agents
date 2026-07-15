@@ -748,3 +748,39 @@ reply.
 - `git diff --check`: passed.
 - Exact-owner mutation check: bypassing the required-runtime subset made both the Stop
   and Delete regressions fail; restoring it returned both to green.
+
+## Round 8: subscriber recovery and admission health fencing
+
+Baseline: `de10329`
+
+The StopCoordinator request subscriber no longer exits permanently when Redis
+subscription setup or iteration fails. It clears subscriber readiness immediately,
+keeps the task alive, and re-subscribes with bounded exponential backoff. Health is
+truthful only while owner publication, heartbeat, the subscriber task, and the current
+subscription readiness are all live; a successful re-subscription restores health.
+
+Every launch boundary now refreshes owner publication and then requires full
+coordinator health. Standalone session ensure fails before AgentScope upsert or mapping
+publication, and normal submit fails before run spawn when the subscriber is down. At
+the distributed ChatService boundary, generation advancement moved behind the async
+refresh-and-health proof. The proof and SQLite generation write have no intervening
+await, so a subscriber failure during the refresh cannot leave a false accepted
+generation. The middleware retains its synchronous fallback for sinks without the
+async completion hook, and accepted executions still advance exactly once.
+
+Tests force subscriber death before ensure, before submit, between initial preflight
+and the run boundary, and while the boundary owner refresh is blocked. The two boundary
+mutations previously advanced generation from 0 to 1; both now leave generation at 0,
+with no public message or AgentScope run side effect. Re-subscription recovery then
+accepts a fresh submit. Stop and Delete remain fail-closed without destructive cleanup.
+
+### Round 8 verification
+
+- Initial focused RED: `4 failed, 1 passed`.
+- Boundary-race REDs: both exposed generation `1` where `0` was required.
+- Affected backend suites: `316 passed, 1 warning`.
+- Full backend: `1021 passed, 1 warning` (the existing Starlette deprecation warning).
+- Final P0/P1 review: CLEAN; Spec approved and quality approved (`17` critical
+  regressions and `178` tests across the two affected files passed in review).
+- Python `compileall`: passed.
+- `git diff --check`: passed.

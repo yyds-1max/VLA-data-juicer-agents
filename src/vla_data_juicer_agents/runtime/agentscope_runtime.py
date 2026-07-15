@@ -582,6 +582,7 @@ class AgentScopeRuntime:
         model: str,
         admission_ticket: str | None = None,
     ) -> str:
+        await self._require_stop_coordinator_admission_health()
         if self.web_session_store is None:
             return await self._ensure_web_session_with_ticket(
                 web_session_id,
@@ -697,6 +698,17 @@ class AgentScopeRuntime:
                 self.web_sessions[web_session_id] = previous_mapping
             raise
         return session.id
+
+    async def _require_stop_coordinator_admission_health(self) -> None:
+        coordinator = self.stop_coordinator
+        if coordinator is None or not coordinator.started:
+            return
+        try:
+            await coordinator.refresh_owners()
+        except Exception as exc:
+            raise RuntimeError("AgentScope run owner publication failed") from exc
+        if not coordinator.healthy:
+            raise RuntimeError("AgentScope run admission coordinator is unhealthy")
 
     async def submit_user_message(
         self,
@@ -1008,14 +1020,12 @@ class AgentScopeRuntime:
             try:
                 # A submit is not launchable until its baseline owner is
                 # visible to Stop; do not rely on the heartbeat interval.
-                await self.stop_coordinator.refresh_owners()
-            except Exception as exc:
+                await self._require_stop_coordinator_admission_health()
+            except Exception:
                 self.clear_run_cancellation(session_id, cancellation)
                 with suppress(Exception):
                     await self.stop_coordinator.refresh_owners()
-                raise RuntimeError(
-                    "AgentScope run owner publication failed"
-                ) from exc
+                raise
 
         async def run_with_cancellation() -> None:
             try:
@@ -1615,6 +1625,12 @@ class AgentScopeRuntime:
             agentscope_session_id,
             cancellation,
         )
+        if (
+            self.stop_coordinator is not None
+            and self.stop_coordinator.started
+            and not self.stop_coordinator.healthy
+        ):
+            raise RuntimeError("AgentScope run admission coordinator is unhealthy")
         if not lease.admitted:
             lease.generation = self.web_session_store.begin_execution_generation(
                 public_session_id,
@@ -1638,7 +1654,11 @@ class AgentScopeRuntime:
         )
         try:
             if self.stop_coordinator is not None and self.stop_coordinator.started:
-                await self.stop_coordinator.refresh_owners()
+                await self._require_stop_coordinator_admission_health()
+            self.admit_user_execution_generation(
+                agentscope_session_id,
+                cancellation,
+            )
             public_session_id = self._public_session_id(agentscope_session_id)
             if (
                 public_session_id is not None

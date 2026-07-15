@@ -69,6 +69,7 @@ class StopCoordinator:
         self._started = False
         self._refresh_lock = asyncio.Lock()
         self._owner_registry_healthy = False
+        self._subscriber_ready = False
 
     @classmethod
     def owner_namespace(cls, agentscope_session_id: str) -> str:
@@ -88,6 +89,7 @@ class StopCoordinator:
         return bool(
             self._started
             and self._owner_registry_healthy
+            and self._subscriber_ready
             and self._subscriber_task is not None
             and not self._subscriber_task.done()
             and self._heartbeat_task is not None
@@ -100,16 +102,44 @@ class StopCoordinator:
         ready = asyncio.Event()
 
         async def subscribe_loop() -> None:
-            async for payload in self._bus.subscribe(
-                self.REQUEST_CHANNEL,
-                on_ready=ready.set,
-            ):
-                task = asyncio.create_task(
-                    self._handle_request(payload),
-                    name=f"datapilot-stop-handler-{self.runtime_id}",
-                )
-                self._handler_tasks.add(task)
-                task.add_done_callback(self._handler_task_done)
+            consecutive_failures = 0
+            while True:
+                self._subscriber_ready = False
+
+                def mark_ready() -> None:
+                    nonlocal consecutive_failures
+                    consecutive_failures = 0
+                    self._subscriber_ready = True
+                    ready.set()
+
+                try:
+                    async for payload in self._bus.subscribe(
+                        self.REQUEST_CHANNEL,
+                        on_ready=mark_ready,
+                    ):
+                        task = asyncio.create_task(
+                            self._handle_request(payload),
+                            name=f"datapilot-stop-handler-{self.runtime_id}",
+                        )
+                        self._handler_tasks.add(task)
+                        task.add_done_callback(self._handler_task_done)
+                    raise RuntimeError("Stop request subscription exited unexpectedly")
+                except asyncio.CancelledError:
+                    self._subscriber_ready = False
+                    raise
+                except Exception:  # pylint: disable=broad-except
+                    self._subscriber_ready = False
+                    consecutive_failures += 1
+                    _logger.exception(
+                        "Stop request subscription failed; retrying",
+                        extra={"runtime_id": self.runtime_id},
+                    )
+                    delay = min(
+                        max(self.retry_interval, 0.001)
+                        * (2 ** min(consecutive_failures - 1, 8)),
+                        max(self.retry_interval, self.owner_ttl / 2),
+                    )
+                    await asyncio.sleep(delay)
 
         self._subscriber_task = asyncio.create_task(
             subscribe_loop(),
@@ -125,6 +155,7 @@ class StopCoordinator:
 
     async def stop(self) -> None:
         self._started = False
+        self._subscriber_ready = False
         for task in (self._heartbeat_task, self._subscriber_task):
             if task is not None:
                 task.cancel()
@@ -150,6 +181,7 @@ class StopCoordinator:
         self._subscriber_task = None
         self._handler_tasks.clear()
         self._owner_registry_healthy = False
+        self._subscriber_ready = False
 
     def _handler_task_done(self, task: asyncio.Task) -> None:
         self._handler_tasks.discard(task)

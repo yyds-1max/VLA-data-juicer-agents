@@ -457,6 +457,48 @@ class AdmissionSharedBus:
         return dict(self.registries.get(namespace, {}))
 
 
+class RecoveringAdmissionSubscriberBus(AdmissionSharedBus):
+    def __init__(self) -> None:
+        super().__init__()
+        self.break_subscription = asyncio.Event()
+        self.subscription_failed = asyncio.Event()
+        self.allow_resubscribe = asyncio.Event()
+        self.resubscribed = asyncio.Event()
+        self.subscribe_attempts = 0
+        self.gate_owner_refresh = False
+        self.owner_refresh_started = asyncio.Event()
+        self.allow_owner_refresh = asyncio.Event()
+
+    async def subscribe(self, key: str, *, on_ready=None):
+        self.subscribe_attempts += 1
+        if self.subscribe_attempts > 1:
+            await self.allow_resubscribe.wait()
+            if on_ready is not None:
+                on_ready()
+            self.resubscribed.set()
+            async for payload in super().subscribe(key):
+                yield payload
+            return
+
+        if on_ready is not None:
+            on_ready()
+        await self.break_subscription.wait()
+        self.subscription_failed.set()
+        raise ConnectionError("stop subscriber connection lost")
+        yield  # pragma: no cover
+
+    async def registry_set(self, namespace, field, value, *, ttl_secs=None):
+        if self.gate_owner_refresh and namespace.startswith("datapilot:stop:owners:"):
+            self.owner_refresh_started.set()
+            await self.allow_owner_refresh.wait()
+        await super().registry_set(
+            namespace,
+            field,
+            value,
+            ttl_secs=ttl_secs,
+        )
+
+
 def _agentscope_config(**overrides) -> AgentScopeRuntimeConfig:
     values = {
         "user_id": "alice",
@@ -3414,6 +3456,246 @@ async def test_owner_publish_failure_cancels_run_and_rejects_submission(
     assert store.current_execution_generation(session.id) == 0
     assert detail is not None
     assert detail.messages == []
+
+
+@pytest.mark.asyncio
+async def test_dead_stop_subscriber_rejects_standalone_ensure_before_upsert(
+    tmp_path: Path,
+) -> None:
+    bus = RecoveringAdmissionSubscriberBus()
+    storage = FakeAgentScopeStorage()
+    runtime = _runtime(storage=storage, message_bus=bus)
+    store = WebSessionStore(tmp_path / "subscriber-dead-ensure.sqlite")
+    session = store.create_session("subscriber dead ensure")
+    runtime.set_web_session_store(store)
+    assert runtime.stop_coordinator is not None
+    runtime.stop_coordinator.retry_interval = 0.005
+    await runtime.start_stop_coordinator()
+    try:
+        bus.break_subscription.set()
+        await asyncio.wait_for(bus.subscription_failed.wait(), timeout=0.2)
+        await asyncio.sleep(0)
+
+        with pytest.raises(RuntimeError, match="coordinator is unhealthy"):
+            await runtime.ensure_web_session(
+                session.id,
+                agent_id=runtime.config.main_router_agent_id,
+                model=runtime.config.router_model,
+            )
+
+        assert storage.sessions == []
+        assert runtime.web_sessions == {}
+        assert store.list_agentscope_session_mappings(session.id) == []
+        assert store.current_execution_generation(session.id) == 0
+        assert store.get_session(session.id).messages == []
+    finally:
+        bus.allow_resubscribe.set()
+        await runtime.stop_stop_coordinator()
+
+
+@pytest.mark.asyncio
+async def test_dead_stop_subscriber_rejects_submit_then_recovery_accepts(
+    tmp_path: Path,
+) -> None:
+    bus = RecoveringAdmissionSubscriberBus()
+    storage = FakeAgentScopeStorage()
+    registry = AdmissionTaskRegistry()
+    service = BoundaryAdmissionChatService()
+    runtime = _runtime(
+        storage=storage,
+        chat_run_registry=None,
+        message_bus=bus,
+    )
+    runtime.app.state.chat_run_registry = registry
+    runtime.app.state.chat_service = service
+    service.runtime = runtime
+    store = WebSessionStore(tmp_path / "subscriber-dead-submit.sqlite")
+    session = store.create_session("subscriber dead submit")
+    manager = AgentScopeWebSessionManager(store=store, runtime=runtime)
+    assert runtime.stop_coordinator is not None
+    runtime.stop_coordinator.retry_interval = 0.005
+    await runtime.start_stop_coordinator()
+    try:
+        # If admission is accidentally allowed, let the run terminate so this
+        # regression fails promptly instead of hanging at the boundary.
+        service.allow_boundary.set()
+        service.finish_run.set()
+        bus.break_subscription.set()
+        await asyncio.wait_for(bus.subscription_failed.wait(), timeout=0.2)
+        await asyncio.sleep(0)
+
+        with pytest.raises(RuntimeError, match="coordinator is unhealthy"):
+            await manager.submit_turn(session.id, "must reject")
+
+        assert storage.sessions == []
+        assert registry.tasks == {}
+        assert store.current_execution_generation(session.id) == 0
+        assert store.get_session(session.id).messages == []
+
+        bus.allow_resubscribe.set()
+        await asyncio.wait_for(bus.resubscribed.wait(), timeout=0.2)
+        assert runtime.stop_coordinator.healthy is True
+        service.allow_boundary.set()
+        service.finish_run.set()
+
+        turn_id = await manager.submit_turn(session.id, "accept after recovery")
+        await registry.drain()
+
+        assert turn_id.startswith("turn_")
+        assert len(storage.sessions) == 1
+        assert len(service.runs) == 1
+        assert store.current_execution_generation(session.id) == 1
+    finally:
+        bus.allow_resubscribe.set()
+        service.allow_boundary.set()
+        service.finish_run.set()
+        await registry.drain()
+        await runtime.stop_stop_coordinator()
+
+
+@pytest.mark.asyncio
+async def test_subscriber_death_between_preflight_and_boundary_keeps_generation_zero(
+    tmp_path: Path,
+) -> None:
+    bus = RecoveringAdmissionSubscriberBus()
+    registry = AdmissionTaskRegistry()
+    service = BoundaryAdmissionChatService()
+    runtime = _runtime(chat_run_registry=None, message_bus=bus)
+    runtime.app.state.chat_run_registry = registry
+    runtime.app.state.chat_service = service
+    service.runtime = runtime
+    store = WebSessionStore(tmp_path / "subscriber-dies-at-boundary.sqlite")
+    session = store.create_session("subscriber dies at boundary")
+    manager = AgentScopeWebSessionManager(store=store, runtime=runtime)
+    assert runtime.stop_coordinator is not None
+    runtime.stop_coordinator.retry_interval = 0.005
+    await runtime.start_stop_coordinator()
+
+    submission = asyncio.create_task(manager.submit_turn(session.id, "race"))
+    try:
+        await asyncio.wait_for(service.run_started.wait(), timeout=0.2)
+        bus.break_subscription.set()
+        await asyncio.wait_for(bus.subscription_failed.wait(), timeout=0.2)
+        await asyncio.sleep(0)
+        service.allow_boundary.set()
+        service.finish_run.set()
+
+        result = (await asyncio.gather(submission, return_exceptions=True))[0]
+        await registry.drain()
+
+        assert store.current_execution_generation(session.id) == 0
+        assert isinstance(result, RuntimeError)
+        assert "coordinator is unhealthy" in str(result)
+        assert store.get_session(session.id).messages == []
+        assert service.runs == []
+    finally:
+        bus.allow_resubscribe.set()
+        service.allow_boundary.set()
+        service.finish_run.set()
+        await asyncio.gather(submission, return_exceptions=True)
+        await registry.drain()
+        await runtime.stop_stop_coordinator()
+
+
+@pytest.mark.asyncio
+async def test_subscriber_death_during_boundary_refresh_keeps_generation_zero(
+    tmp_path: Path,
+) -> None:
+    bus = RecoveringAdmissionSubscriberBus()
+    registry = AdmissionTaskRegistry()
+    service = BoundaryAdmissionChatService()
+    runtime = _runtime(chat_run_registry=None, message_bus=bus)
+    runtime.app.state.chat_run_registry = registry
+    runtime.app.state.chat_service = service
+    service.runtime = runtime
+    store = WebSessionStore(tmp_path / "subscriber-dies-during-refresh.sqlite")
+    session = store.create_session("subscriber dies during refresh")
+    manager = AgentScopeWebSessionManager(store=store, runtime=runtime)
+    assert runtime.stop_coordinator is not None
+    runtime.stop_coordinator.retry_interval = 0.005
+    await runtime.start_stop_coordinator()
+
+    submission = asyncio.create_task(manager.submit_turn(session.id, "refresh race"))
+    try:
+        await asyncio.wait_for(service.run_started.wait(), timeout=0.2)
+        bus.gate_owner_refresh = True
+        service.allow_boundary.set()
+        await asyncio.wait_for(bus.owner_refresh_started.wait(), timeout=0.2)
+        bus.break_subscription.set()
+        await asyncio.wait_for(bus.subscription_failed.wait(), timeout=0.2)
+        bus.allow_owner_refresh.set()
+        service.finish_run.set()
+
+        result = (await asyncio.gather(submission, return_exceptions=True))[0]
+        await registry.drain()
+
+        assert store.current_execution_generation(session.id) == 0
+        assert isinstance(result, RuntimeError)
+        assert "coordinator is unhealthy" in str(result)
+        assert store.get_session(session.id).messages == []
+        assert service.runs == []
+    finally:
+        bus.allow_owner_refresh.set()
+        bus.allow_resubscribe.set()
+        service.allow_boundary.set()
+        service.finish_run.set()
+        await asyncio.gather(submission, return_exceptions=True)
+        await registry.drain()
+        await runtime.stop_stop_coordinator()
+
+
+@pytest.mark.asyncio
+async def test_dead_stop_subscriber_keeps_stop_and_delete_fail_closed(
+    tmp_path: Path,
+) -> None:
+    class RecordingSessionService:
+        def __init__(self) -> None:
+            self.deleted: list[str] = []
+
+        async def delete_session(self, _user_id, _agent_id, session_id):
+            self.deleted.append(session_id)
+            return True
+
+    class NavigationControl:
+        def __init__(self) -> None:
+            self.deleted: list[str] = []
+
+        def delete_control_state_for_web_session(self, web_session_id: str) -> None:
+            self.deleted.append(web_session_id)
+
+    bus = RecoveringAdmissionSubscriberBus()
+    runtime = _runtime(message_bus=bus)
+    service = RecordingSessionService()
+    navigation = NavigationControl()
+    runtime.app.state.session_service = service
+    runtime._navigation_services = lambda: navigation
+    store = WebSessionStore(tmp_path / "subscriber-dead-stop-delete.sqlite")
+    session = store.create_session("subscriber dead stop delete")
+    store.save_agentscope_session_mapping(
+        session.id,
+        agent_id=runtime.config.main_router_agent_id,
+        agentscope_session_id=f"{session.id}__main-router-agent",
+    )
+    runtime.set_web_session_store(store)
+    assert runtime.stop_coordinator is not None
+    runtime.stop_coordinator.retry_interval = 0.005
+    await runtime.start_stop_coordinator()
+    try:
+        bus.break_subscription.set()
+        await asyncio.wait_for(bus.subscription_failed.wait(), timeout=0.2)
+        await asyncio.sleep(0)
+
+        with pytest.raises(RuntimeError, match="coordinator is unhealthy"):
+            await runtime.interrupt_web_session(web_session_id=session.id)
+        with pytest.raises(RuntimeError, match="coordinator is unhealthy"):
+            await runtime.delete_web_session(session.id)
+
+        assert store.get_session(session.id) is not None
+        assert service.deleted == []
+        assert navigation.deleted == []
+    finally:
+        bus.allow_resubscribe.set()
+        await runtime.stop_stop_coordinator()
 
 
 @pytest.mark.asyncio

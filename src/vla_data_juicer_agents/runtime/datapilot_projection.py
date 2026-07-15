@@ -243,10 +243,10 @@ class DataPilotRunBoundaryMiddleware(MiddlewareBase):
             )
             if is_user_input and callable(admit_generation):
                 # ChatService has acquired its distributed session-run lock
-                # before invoking middleware.  Advancing the public generation
-                # here therefore means both local spawn and distributed run
-                # admission succeeded; idle wakeups never clear the stop fence.
-                admit_generation(self._session_id, cancellation)
+                # before invoking middleware. The async completion hook first
+                # proves Stop can receive requests, then advances the public
+                # generation without another scheduling point. Idle wakeups
+                # never clear the stop fence.
                 complete_admission = getattr(
                     self._sink,
                     "complete_user_execution_admission",
@@ -254,6 +254,8 @@ class DataPilotRunBoundaryMiddleware(MiddlewareBase):
                 )
                 if callable(complete_admission):
                     await complete_admission(self._session_id, cancellation)
+                else:
+                    admit_generation(self._session_id, cancellation)
             async with cancellation.track_agent(self._session_id):
                 with bind_cancellation(cancellation):
                     async for item in next_handler(**input_kwargs):

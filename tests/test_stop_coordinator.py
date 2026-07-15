@@ -59,6 +59,65 @@ class SharedBus:
         return dict(self.registries[namespace])
 
 
+class RecoveringSubscriberBus(SharedBus):
+    def __init__(self) -> None:
+        super().__init__()
+        self.break_subscription = asyncio.Event()
+        self.subscription_failed = asyncio.Event()
+        self.allow_resubscribe = asyncio.Event()
+        self.resubscribed = asyncio.Event()
+        self.subscribe_attempts = 0
+
+    async def subscribe(self, key: str, *, on_ready=None):
+        self.subscribe_attempts += 1
+        if self.subscribe_attempts > 1:
+            await self.allow_resubscribe.wait()
+            if on_ready is not None:
+                on_ready()
+            self.resubscribed.set()
+            async for payload in super().subscribe(key):
+                yield payload
+            return
+
+        if on_ready is not None:
+            on_ready()
+        await self.break_subscription.wait()
+        self.subscription_failed.set()
+        raise ConnectionError("stop subscriber connection lost")
+        yield  # pragma: no cover
+
+
+@pytest.mark.asyncio
+async def test_subscriber_recovers_and_health_tracks_resubscription() -> None:
+    bus = RecoveringSubscriberBus()
+    coordinator = StopCoordinator(
+        bus,
+        lambda: [],
+        runtime_id="subscriber-owner",
+        heartbeat_interval=0.005,
+        retry_interval=0.005,
+    )
+
+    await coordinator.start()
+    try:
+        assert coordinator.healthy is True
+        bus.break_subscription.set()
+        await asyncio.wait_for(bus.subscription_failed.wait(), timeout=0.2)
+        await asyncio.sleep(0)
+
+        assert coordinator.healthy is False
+        assert coordinator._subscriber_task is not None
+        assert coordinator._subscriber_task.done() is False
+
+        bus.allow_resubscribe.set()
+        await asyncio.wait_for(bus.resubscribed.wait(), timeout=0.2)
+        assert coordinator.healthy is True
+        assert bus.subscribe_attempts == 2
+    finally:
+        bus.allow_resubscribe.set()
+        await coordinator.stop()
+
+
 @pytest.mark.asyncio
 async def test_owner_heartbeat_recovers_after_transient_registry_failure() -> None:
     class TransientHeartbeatBus(SharedBus):
