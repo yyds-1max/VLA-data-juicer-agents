@@ -1,12 +1,22 @@
 import { Composer } from "./Composer";
 
 type DraftNewSessionViewProps = {
+  message: string;
   running?: boolean;
+  submitting?: boolean;
+  onMessageChange: (message: string) => void;
   onSubmit: (message: string) => void;
   onInterrupt?: () => void;
 };
 
-export function DraftNewSessionView({ running = false, onSubmit, onInterrupt }: DraftNewSessionViewProps) {
+export function DraftNewSessionView({
+  message,
+  running = false,
+  submitting = false,
+  onMessageChange,
+  onSubmit,
+  onInterrupt,
+}: DraftNewSessionViewProps) {
   return (
     <div
       data-datapilot-scroll-area="true"
@@ -20,7 +30,10 @@ export function DraftNewSessionView({ running = false, onSubmit, onInterrupt }: 
       </div>
       <Composer
         placeholder="我们要做什么？"
+        message={message}
         running={running}
+        submitting={submitting}
+        onMessageChange={onMessageChange}
         onSubmit={onSubmit}
         onInterrupt={onInterrupt}
       />

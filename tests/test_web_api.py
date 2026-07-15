@@ -18,13 +18,34 @@ from vla_data_juicer_agents.navigation.task_store import SqliteNavigationTaskSto
 from vla_data_juicer_agents.core.cancellation import CancellationContext
 from vla_data_juicer_agents.runtime.agentscope_config import AgentScopeRuntimeConfig
 from vla_data_juicer_agents.runtime.agentscope_runtime import AgentScopeRuntime
-from vla_data_juicer_agents.web.app import (
+import vla_data_juicer_agents.web.app as web_app_module
+from vla_data_juicer_agents.web.app import create_app as create_production_app
+from web_legacy_app import (
     _consume_turn_result_when_idle,
     _create_logged_task,
     _drain_controller_events,
-    create_app,
+    create_legacy_test_app,
 )
 from vla_data_juicer_agents.web.schemas import PublicEventRecord
+
+
+def create_app(
+    *args,
+    agentscope_runtime=None,
+    controller_factory=None,
+    **kwargs,
+):
+    if agentscope_runtime is not None or controller_factory is None:
+        return create_production_app(
+            *args,
+            agentscope_runtime=agentscope_runtime,
+            **kwargs,
+        )
+    return create_legacy_test_app(
+        *args,
+        controller_factory=controller_factory,
+        **kwargs,
+    )
 
 
 class FakeController:
@@ -180,7 +201,12 @@ def test_submit_turn_returns_turn_id(tmp_path: Path):
 
 def test_create_app_accepts_positional_configuration(tmp_path: Path):
     FakeController.created = []
-    app = create_app(str(tmp_path / ".djx"), "qwen-positional", tmp_path / "sessions.sqlite", FakeController)
+    app = create_app(
+        str(tmp_path / ".djx"),
+        "qwen-positional",
+        tmp_path / "sessions.sqlite",
+        controller_factory=FakeController,
+    )
     client = TestClient(app)
 
     session_id = _create_session(client)
@@ -217,9 +243,19 @@ def test_create_app_enters_agentscope_sub_app_lifespan(tmp_path: Path):
         events.append("shutdown")
 
     sub_app = FastAPI(lifespan=lifespan)
+
+    async def start_stop_coordinator():
+        assert sub_app.state.ready is True
+        events.append("stop-coordinator-start")
+
+    async def stop_stop_coordinator():
+        events.append("stop-coordinator-stop")
+
     runtime = SimpleNamespace(
         app=sub_app,
         config=SimpleNamespace(agentscope_mount_path="/api/agentscope"),
+        start_stop_coordinator=start_stop_coordinator,
+        stop_stop_coordinator=stop_stop_coordinator,
     )
     app = create_app(
         working_dir=str(tmp_path / ".djx"),
@@ -230,9 +266,14 @@ def test_create_app_enters_agentscope_sub_app_lifespan(tmp_path: Path):
 
     with TestClient(app):
         assert sub_app.state.ready is True
-        assert events == ["startup"]
+        assert events == ["startup", "stop-coordinator-start"]
 
-    assert events == ["startup", "shutdown"]
+    assert events == [
+        "startup",
+        "stop-coordinator-start",
+        "stop-coordinator-stop",
+        "shutdown",
+    ]
 
 
 def test_create_app_uses_agentscope_session_manager_when_runtime_present(tmp_path: Path):
@@ -265,7 +306,23 @@ def test_create_app_uses_agentscope_session_manager_when_runtime_present(tmp_pat
     assert runtime.submitted == [(session_id, "开始处理")]
 
 
-def test_create_app_keeps_legacy_controller_when_agentscope_runtime_missing(tmp_path: Path):
+def test_create_app_requires_runtime_without_explicit_test_controller(tmp_path: Path):
+    with pytest.raises(RuntimeError, match="AgentScope runtime"):
+        create_app(
+            working_dir=str(tmp_path / ".djx"),
+            db_path=tmp_path / "sessions.sqlite",
+        )
+
+
+def test_production_app_module_has_no_legacy_controller_construction_or_drain() -> None:
+    source = inspect.getsource(web_app_module)
+
+    assert "from vla_data_juicer_agents.web.session_manager import" not in source
+    assert "controller_factory" not in source
+    assert "_drain_controller_events" not in source
+
+
+def test_create_app_keeps_explicit_legacy_test_controller_adapter(tmp_path: Path):
     FakeController.created = []
     app = create_app(
         working_dir=str(tmp_path / ".djx"),

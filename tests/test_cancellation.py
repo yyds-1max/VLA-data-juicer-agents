@@ -126,6 +126,67 @@ def test_cancel_handles_loop_close_during_scheduling(monkeypatch) -> None:
     asyncio.run(exercise())
 
 
+def test_worker_quiescence_waits_for_actual_thread_exit_after_async_cancel() -> None:
+    async def exercise() -> None:
+        cancellation = CancellationContext()
+        worker_started = threading.Event()
+        release_worker = threading.Event()
+        worker_exited = threading.Event()
+
+        async def invoke_worker() -> None:
+            worker_token = cancellation.reserve_worker()
+
+            def blocking_worker() -> None:
+                worker_started.set()
+                try:
+                    release_worker.wait()
+                finally:
+                    worker_exited.set()
+                    cancellation.finish_worker(worker_token)
+
+            await asyncio.to_thread(blocking_worker)
+
+        task = asyncio.create_task(invoke_worker())
+        assert await asyncio.to_thread(worker_started.wait, 1)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+        assert await cancellation.wait_for_workers(timeout=0.01) is False
+        assert worker_exited.is_set() is False
+        release_worker.set()
+        assert await cancellation.wait_for_workers(timeout=1) is True
+        assert worker_exited.is_set() is True
+
+    asyncio.run(exercise())
+
+
+def test_full_quiescence_waits_for_tracked_agent_cleanup() -> None:
+    async def exercise() -> None:
+        cancellation = CancellationContext()
+        started = asyncio.Event()
+        cleanup_release = asyncio.Event()
+
+        async def agent_run() -> None:
+            async with cancellation.track_agent("agent"):
+                started.set()
+                try:
+                    await asyncio.Future()
+                except asyncio.CancelledError:
+                    await cleanup_release.wait()
+
+        task = asyncio.create_task(agent_run())
+        await started.wait()
+        cancellation.cancel()
+
+        assert await cancellation.wait_for_quiescence(timeout=0.01) is False
+        cleanup_release.set()
+        await task
+        assert await cancellation.wait_for_quiescence(timeout=1) is True
+
+    asyncio.run(exercise())
+
+
 def test_run_command_can_be_cancelled_promptly() -> None:
     cancellation = CancellationContext()
     timer = threading.Timer(0.2, cancellation.cancel)

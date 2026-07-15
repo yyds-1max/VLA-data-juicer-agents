@@ -14,7 +14,7 @@ from agentscope.event import (
     ReplyEndEvent,
     ReplyStartEvent,
 )
-from agentscope.message import Msg, ToolCallBlock, ToolCallState, ToolResultState
+from agentscope.message import Msg, ToolCallBlock, ToolCallState, ToolResultState, UserMsg
 from agentscope.permission import PermissionBehavior, PermissionContext
 from agentscope.tool import ToolResponse
 
@@ -537,6 +537,60 @@ async def test_runtime_submit_user_message_starts_navigation_requests_with_main_
     assert run["agent_id"] == "main-router-agent"
     assert run["message"].name == "user"
     assert _message_text(run["message"]) == "同步 rosbag db3 odom 和 gridmap 数据"
+
+
+@pytest.mark.asyncio
+async def test_runtime_publishes_turn_terminal_after_registry_cleanup_on_pre_reply_failure(
+    tmp_path: Path,
+) -> None:
+    class TaskRegistry:
+        def __init__(self) -> None:
+            self.tasks: dict[str, asyncio.Task] = {}
+
+        def spawn(self, coroutine, *, session_id):
+            task = asyncio.create_task(coroutine)
+            self.tasks[session_id] = task
+
+            def cleanup(completed: asyncio.Task) -> None:
+                if self.tasks.get(session_id) is completed:
+                    self.tasks.pop(session_id, None)
+
+            task.add_done_callback(cleanup)
+            return task
+
+        def get(self, session_id):
+            return self.tasks.get(session_id)
+
+    class FailingBeforeReplyChatService:
+        async def run(self, **_kwargs) -> None:
+            raise RuntimeError("model failed before reply")
+
+    store = WebSessionStore(tmp_path / "sessions.sqlite")
+    public_session = store.create_session("early failure")
+    registry = TaskRegistry()
+    runtime = _runtime(chat_run_registry=None)
+    runtime.app.state.chat_run_registry = registry
+    runtime.app.state.chat_service = FailingBeforeReplyChatService()
+    runtime.set_web_session_store(store)
+
+    turn_id = await runtime.submit_user_message(
+        web_session_id=public_session.id,
+        message="fail before reply",
+    )
+    internal_session_id = f"{public_session.id}__main-router-agent"
+    task = registry.get(internal_session_id)
+    assert task is not None
+    await asyncio.gather(task, return_exceptions=True)
+    for _ in range(10):
+        if store.get_session(public_session.id).events:
+            break
+        await asyncio.sleep(0)
+
+    assert registry.get(internal_session_id) is None
+    terminal = store.get_session(public_session.id).events[-1].event
+    assert terminal["type"] == "CUSTOM"
+    assert terminal["name"] == "datapilot_run_terminal"
+    assert terminal["value"] == {"turn_id": turn_id, "status": "failure"}
 
 
 @pytest.mark.asyncio
@@ -1936,10 +1990,10 @@ async def test_runtime_interrupt_durable_stop_failure_does_not_publish_stopped(
     published = []
     runtime.set_web_transport(store, lambda *_args: published.append(_args))
 
-    def fail_stop(_session_id: str, _terminal_event_factory):
+    def fail_stop(_session_id: str, _request_id: str, _terminal_event_factory):
         raise sqlite3.OperationalError("disk full")
 
-    store.stop_open_tool_runs_with_terminal_events = fail_stop
+    store.complete_stop_request_with_terminal_events = fail_stop
 
     with pytest.raises(sqlite3.OperationalError, match="disk full"):
         await runtime.interrupt_web_session(web_session_id=public_session.id)
@@ -2072,7 +2126,9 @@ async def test_explicit_stop_serializes_real_middleware_cancellation_as_stopped(
         )
 
     assert status_during_stop == "running"
-    assert consumer_done_during_stop is False
+    # The pending-stop barrier lets the cancelled owner finish and release its
+    # lease before the stopped transaction; this quiescence is now required.
+    assert consumer_done_during_stop is True
     assert isinstance(stop_result, InterruptResponse)
     assert stop_result.stopped_tool_call_ids == ["call-race"]
     assert isinstance(cancellation_result, asyncio.CancelledError)
@@ -2166,7 +2222,7 @@ async def test_explicit_stop_serializes_real_tool_response_as_stopped(
         )
 
     assert status_during_stop == "running"
-    assert consumer_done_during_stop is False
+    assert consumer_done_during_stop is True
     assert stop_result.stopped_tool_call_ids == ["call-race"]
     assert isinstance(yielded, asyncio.CancelledError)
     detail = store.get_session(public_session.id)
@@ -2180,7 +2236,7 @@ async def test_explicit_stop_serializes_real_tool_response_as_stopped(
 
 
 @pytest.mark.asyncio
-async def test_failed_remote_stop_releases_real_cancellation_outcome_as_failure(
+async def test_failed_remote_stop_keeps_pending_ledger_running_for_retry(
     tmp_path: Path,
 ) -> None:
     remote_entered = asyncio.Event()
@@ -2256,8 +2312,9 @@ async def test_failed_remote_stop_releases_real_cancellation_outcome_as_failure(
     assert isinstance(cancellation_result, asyncio.CancelledError)
     detail = store.get_session(public_session.id)
     assert detail is not None
-    assert detail.tool_runs[0].status == "failure"
-    assert [record.event["value"]["status"] for record in detail.events] == ["failure"]
+    assert detail.tool_runs[0].status == "running"
+    assert detail.events == []
+    assert store.stop_request_is_pending(public_session.id, 0) is True
 
 
 @pytest.mark.asyncio
@@ -2494,6 +2551,167 @@ async def test_runtime_submit_user_message_duplicate_active_run_preserves_cancel
 
     assert runtime.run_cancellation(session_id) is active_cancellation
     await chat_run_registry.drain()
+
+
+@pytest.mark.asyncio
+async def test_rejected_turn_does_not_clear_stopped_generation_or_admit_stale_wakeup(
+    tmp_path: Path,
+) -> None:
+    store = WebSessionStore(tmp_path / "sessions.sqlite")
+    public_session = store.create_session("stopped duplicate admission")
+    internal_session_id = f"{public_session.id}__main-router-agent"
+    store.save_agentscope_session_mapping(
+        public_session.id,
+        agent_id="main-router-agent",
+        agentscope_session_id=internal_session_id,
+    )
+    store.begin_execution_generation(public_session.id)
+    store.stop_open_tool_runs_with_terminal_events(
+        public_session.id,
+        lambda _row: pytest.fail("no running tool should require an event"),
+    )
+    chat_run_registry = FakeChatRunRegistry(reject_duplicate_active=True)
+    chat_run_registry.active_session_ids.add(internal_session_id)
+    runtime = _runtime(chat_run_registry=chat_run_registry)
+    runtime.set_web_session_store(store)
+
+    with pytest.raises(RuntimeError, match="already active"):
+        await runtime.submit_user_message(
+            web_session_id=public_session.id,
+            message="should not be admitted",
+        )
+
+    assert store.execution_generation_is_stopped(public_session.id) is True
+    middleware = DataPilotRunBoundaryMiddleware(internal_session_id, runtime)
+    model_calls = 0
+
+    async def handler(**_kwargs):
+        nonlocal model_calls
+        model_calls += 1
+        yield ReplyStartEvent(
+            session_id=internal_session_id,
+            reply_id="unexpected-reply",
+            name="MainRouterAgent",
+        )
+
+    suppressed = [
+        item
+        async for item in middleware.on_reply(
+            SimpleNamespace(name="MainRouterAgent"),
+            {"inputs": None},
+            handler,
+        )
+    ]
+
+    assert model_calls == 0
+    assert len(suppressed) == 1
+    assert isinstance(suppressed[0], Msg)
+
+    # A later retry clears the boundary only after it reaches middleware.
+    chat_run_registry.active_session_ids.discard(internal_session_id)
+    await runtime.submit_user_message(
+        web_session_id=public_session.id,
+        message="accepted retry",
+    )
+    assert store.execution_generation_is_stopped(public_session.id) is True
+    admitted = [
+        item
+        async for item in middleware.on_reply(
+            SimpleNamespace(name="MainRouterAgent"),
+            {"inputs": UserMsg(name="user", content="accepted retry")},
+            handler,
+        )
+    ]
+    assert model_calls == 1
+    assert isinstance(admitted[0], ReplyStartEvent)
+    assert store.execution_generation_is_stopped(public_session.id) is False
+    await chat_run_registry.drain()
+
+
+@pytest.mark.asyncio
+async def test_accepted_user_run_advances_stopped_generation_once_at_run_boundary(
+    tmp_path: Path,
+) -> None:
+    store = WebSessionStore(tmp_path / "sessions.sqlite")
+    public_session = store.create_session("accepted admission")
+    internal_session_id = f"{public_session.id}__main-router-agent"
+    store.save_agentscope_session_mapping(
+        public_session.id,
+        agent_id="main-router-agent",
+        agentscope_session_id=internal_session_id,
+    )
+    store.begin_execution_generation(public_session.id)
+    store.stop_open_tool_runs_with_terminal_events(
+        public_session.id,
+        lambda _row: pytest.fail("no running tool should require an event"),
+    )
+    chat_run_registry = FakeChatRunRegistry()
+    runtime = _runtime(chat_run_registry=chat_run_registry)
+    runtime.set_web_session_store(store)
+    begin_calls: list[str] = []
+    original_begin = store.begin_execution_generation
+
+    def record_begin(session_id: str) -> int:
+        begin_calls.append(session_id)
+        return original_begin(session_id)
+
+    store.begin_execution_generation = record_begin  # type: ignore[method-assign]
+
+    await runtime.submit_user_message(
+        web_session_id=public_session.id,
+        message="continue",
+    )
+
+    # Local registry admission alone must not clear the durable stop fence.
+    assert store.execution_generation_is_stopped(public_session.id) is True
+    cancellation = runtime.run_cancellation(internal_session_id)
+    assert cancellation is not None
+    middleware = DataPilotRunBoundaryMiddleware(internal_session_id, runtime)
+
+    async def handler(**_kwargs):
+        # Re-entry for the same admitted lease is idempotent.
+        runtime.admit_user_execution_generation(
+            internal_session_id,
+            cancellation,
+        )
+        yield ReplyStartEvent(
+            session_id=internal_session_id,
+            reply_id="accepted-reply",
+            name="MainRouterAgent",
+        )
+
+    yielded = [
+        item
+        async for item in middleware.on_reply(
+            SimpleNamespace(name="MainRouterAgent"),
+            {"inputs": UserMsg(name="user", content="continue")},
+            handler,
+        )
+    ]
+
+    assert isinstance(yielded[0], ReplyStartEvent)
+    assert begin_calls == [public_session.id]
+    assert store.execution_generation_is_stopped(public_session.id) is False
+
+    async def wakeup_handler(**_kwargs):
+        yield ReplyStartEvent(
+            session_id=internal_session_id,
+            reply_id="wakeup-reply",
+            name="MainRouterAgent",
+        )
+
+    wakeup = [
+        item
+        async for item in middleware.on_reply(
+            SimpleNamespace(name="MainRouterAgent"),
+            {"inputs": None},
+            wakeup_handler,
+        )
+    ]
+    assert isinstance(wakeup[0], ReplyStartEvent)
+    assert begin_calls == [public_session.id]
+    await chat_run_registry.drain()
+
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("tool_state", [ToolCallState.SUBMITTED, "submitted"])
@@ -3959,8 +4177,19 @@ async def test_stopped_generation_suppresses_restart_wakeup_until_new_user_turn(
     assert len(suppressed) == 1
     assert isinstance(suppressed[0], Msg)
 
-    store.begin_execution_generation(public_session.id)
-    resumed = [
+    admitted = [
+        item
+        async for item in middleware.on_reply(
+            SimpleNamespace(name="MainRouterAgent"),
+            {"inputs": UserMsg(name="user", content="continue after restart")},
+            handler,
+        )
+    ]
+    assert model_calls == 1
+    assert isinstance(admitted[0], ReplyStartEvent)
+    assert store.execution_generation_is_stopped(public_session.id) is False
+
+    resumed_wakeup = [
         item
         async for item in middleware.on_reply(
             SimpleNamespace(name="MainRouterAgent"),
@@ -3968,9 +4197,50 @@ async def test_stopped_generation_suppresses_restart_wakeup_until_new_user_turn(
             handler,
         )
     ]
-    assert model_calls == 1
-    assert isinstance(resumed[0], ReplyStartEvent)
+    assert model_calls == 2
+    assert isinstance(resumed_wakeup[0], ReplyStartEvent)
     assert restarted.run_cancellation(internal_session_id) is None
+
+
+@pytest.mark.asyncio
+async def test_pending_stop_generation_suppresses_wakeup_before_ack(tmp_path: Path) -> None:
+    store = WebSessionStore(tmp_path / "sessions.sqlite")
+    public_session = store.create_session("pending stop wake fence")
+    internal_session_id = "pending-stop-session"
+    store.save_agentscope_session_mapping(
+        public_session.id,
+        agent_id="main-router-agent",
+        agentscope_session_id=internal_session_id,
+    )
+    store.begin_execution_generation(public_session.id)
+    request = store.begin_or_resume_stop_request(public_session.id)
+    runtime = _runtime(chat_run_registry=FakeChatRunRegistry())
+    runtime.set_web_session_store(store)
+    middleware = DataPilotRunBoundaryMiddleware(internal_session_id, runtime)
+    model_calls = 0
+
+    async def handler(**_kwargs):
+        nonlocal model_calls
+        model_calls += 1
+        yield ReplyStartEvent(
+            session_id=internal_session_id,
+            reply_id="unexpected",
+            name="MainRouterAgent",
+        )
+
+    yielded = [
+        item
+        async for item in middleware.on_reply(
+            SimpleNamespace(name="MainRouterAgent"),
+            {"inputs": None},
+            handler,
+        )
+    ]
+
+    assert request.status == "pending"
+    assert model_calls == 0
+    assert len(yielded) == 1
+    assert isinstance(yielded[0], Msg)
 
 
 @pytest.mark.asyncio

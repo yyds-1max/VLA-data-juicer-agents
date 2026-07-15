@@ -14,6 +14,16 @@ from vla_data_juicer_agents.core.cancellation import (
     bind_cancellation,
     current_cancellation,
 )
+
+
+def _consume_detached_worker_result(task: asyncio.Task) -> None:
+    """Retrieve a shielded worker result after its cancelled awaiter exits."""
+    try:
+        task.result()
+    except (asyncio.CancelledError, Exception):
+        # The durable plan ledger owns the worker outcome.  This callback only
+        # prevents an unobserved-task warning after the requester is gone.
+        return
 from vla_data_juicer_agents.navigation.config import NavigationSettings
 from vla_data_juicer_agents.navigation.evidence_store import FileNavigationEvidenceStore
 from vla_data_juicer_agents.navigation.execution_tools import (
@@ -1176,20 +1186,42 @@ def build_plan_bound_execution_tools(
             # the event loop.  Plan steps can run subprocesses for minutes, so
             # keep the orchestration body in a worker while sharing the same
             # cancellation token (asyncio.to_thread copies contextvars).
-            return await asyncio.to_thread(
-                _invoke_plan_step,
-                bound_task=task,
-                plan_id=plan_id,
-                step_id=step_id,
-                action=action,
-                function=function,
-                plan_store=plan_store,
-                evidence_store=evidence_store,
-                settings=settings,
-                cancellation=cancellation,
-                expected_web_session_id=web_session_id,
-                expected_agentscope_session_id=agentscope_session_id,
+            active_cancellation = cancellation or current_cancellation()
+            worker_token = (
+                active_cancellation.reserve_worker()
+                if active_cancellation is not None
+                else None
             )
+
+            def run_in_worker() -> dict[str, Any]:
+                try:
+                    return _invoke_plan_step(
+                        bound_task=task,
+                        plan_id=plan_id,
+                        step_id=step_id,
+                        action=action,
+                        function=function,
+                        plan_store=plan_store,
+                        evidence_store=evidence_store,
+                        settings=settings,
+                        cancellation=cancellation,
+                        expected_web_session_id=web_session_id,
+                        expected_agentscope_session_id=agentscope_session_id,
+                    )
+                finally:
+                    if active_cancellation is not None and worker_token is not None:
+                        active_cancellation.finish_worker(worker_token)
+
+            # Keep the queued executor job alive if AgentScope cancels its async
+            # wrapper before a saturated pool can start the worker.  The real
+            # worker must eventually enter its finally block and release the
+            # quiescence token; cancelling the queued future would leak it.
+            worker_task = asyncio.create_task(asyncio.to_thread(run_in_worker))
+            try:
+                return await asyncio.shield(worker_task)
+            except asyncio.CancelledError:
+                worker_task.add_done_callback(_consume_detached_worker_result)
+                raise
 
         invoke.__name__ = f"{action}_tool"
         invoke.__doc__ = (

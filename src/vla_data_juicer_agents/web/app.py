@@ -1,14 +1,13 @@
 from __future__ import annotations
 
 import asyncio
-import hashlib
 import inspect
 import logging
 import os
+from collections.abc import Callable
 from contextlib import asynccontextmanager, suppress
 from pathlib import Path
 from typing import Any
-from uuid import uuid4
 
 from fastapi import FastAPI, HTTPException, Response
 from fastapi.responses import FileResponse, StreamingResponse
@@ -20,7 +19,6 @@ from vla_data_juicer_agents.navigation.dataset_catalog import (
     scan_navigation_dataset,
     scan_navigation_date,
 )
-from vla_data_juicer_agents.tui.controller import SessionController
 from vla_data_juicer_agents.web.agent_session import AgentScopeWebSessionManager
 from vla_data_juicer_agents.web.event_stream import SessionEventBus
 from vla_data_juicer_agents.web.schemas import (
@@ -34,7 +32,6 @@ from vla_data_juicer_agents.web.schemas import (
     InterruptResponse,
     PublicEventRecord,
 )
-from vla_data_juicer_agents.web.session_manager import ControllerFactory, WebSessionManager
 from vla_data_juicer_agents.web.session_store import WebSessionStore
 from vla_data_juicer_agents.web.sse import iter_sse
 
@@ -49,7 +46,6 @@ def create_app(
     working_dir: str | None = None,
     model: str | None = None,
     db_path: str | Path | None = None,
-    controller_factory: ControllerFactory = SessionController,
     frontend_dist: str | Path | None = None,
     agentscope_runtime: Any | None = None,
     sse_heartbeat_seconds: float = 15.0,
@@ -61,6 +57,36 @@ def create_app(
     if frontend_dist is None:
         frontend_dist = os.environ.get("VLA_DATA_AGENT_WEB_FRONTEND_DIST") or None
 
+    if agentscope_runtime is None:
+        raise RuntimeError(
+            "AgentScope runtime is required for the production Web application"
+        )
+
+    return _create_app_for_manager(
+        working_dir=working_dir,
+        db_path=db_path,
+        frontend_dist=frontend_dist,
+        agentscope_runtime=agentscope_runtime,
+        sse_heartbeat_seconds=sse_heartbeat_seconds,
+        manager_builder=lambda store, publish: AgentScopeWebSessionManager(
+            store=store,
+            runtime=agentscope_runtime,
+            event_callback=publish,
+        ),
+    )
+
+
+def _create_app_for_manager(
+    *,
+    working_dir: str,
+    db_path: str | Path | None,
+    frontend_dist: str | Path | None,
+    agentscope_runtime: Any | None,
+    sse_heartbeat_seconds: float,
+    manager_builder: Callable[[WebSessionStore, Callable[..., Any]], Any],
+    turn_submitted: Callable[[str, Any, WebSessionStore, SessionEventBus], Any]
+    | None = None,
+) -> FastAPI:
     database_path = Path(db_path) if db_path is not None else Path(working_dir) / "sessions.sqlite"
     store = WebSessionStore(database_path)
     bus = SessionEventBus()
@@ -68,19 +94,7 @@ def create_app(
     async def publish_session_event(session_id: str, event: PublicEventRecord) -> None:
         await bus.publish(session_id, event)
 
-    if agentscope_runtime is None:
-        manager = WebSessionManager(
-            store=store,
-            working_dir=working_dir,
-            model=model,
-            controller_factory=controller_factory,
-        )
-    else:
-        manager = AgentScopeWebSessionManager(
-            store=store,
-            runtime=agentscope_runtime,
-            event_callback=publish_session_event,
-        )
+    manager = manager_builder(store, publish_session_event)
 
     @asynccontextmanager
     async def lifespan(_parent_app: FastAPI):
@@ -89,6 +103,18 @@ def create_app(
             return
 
         async with agentscope_runtime.app.router.lifespan_context(agentscope_runtime.app):
+            start_stop_coordinator = getattr(
+                agentscope_runtime,
+                "start_stop_coordinator",
+                None,
+            )
+            stop_stop_coordinator = getattr(
+                agentscope_runtime,
+                "stop_stop_coordinator",
+                None,
+            )
+            if callable(start_stop_coordinator):
+                await start_stop_coordinator()
             recovery_loop = getattr(agentscope_runtime, "run_agent_wakeup_recovery_loop", None)
             recovery_task = (
                 asyncio.create_task(
@@ -105,6 +131,8 @@ def create_app(
                     recovery_task.cancel()
                     with suppress(asyncio.CancelledError):
                         await recovery_task
+                if callable(stop_stop_coordinator):
+                    await stop_stop_coordinator()
 
     app = FastAPI(title="DataPilot Web API", lifespan=lifespan)
     app.state.store = store
@@ -180,11 +208,8 @@ def create_app(
             raise HTTPException(status_code=404, detail="Session not found") from exc
         except RuntimeError as exc:
             raise HTTPException(status_code=409, detail=str(exc)) from exc
-        if agentscope_runtime is None:
-            _create_logged_task(
-                _drain_controller_events(session_id, manager, store, bus),
-                name=f"controller-events:{session_id}",
-            )
+        if turn_submitted is not None:
+            await _maybe_await(turn_submitted(session_id, manager, store, bus))
         return CreateTurnResponse(turn_id=turn_id)
 
     @app.post("/api/sessions/{session_id}/interrupt", response_model=InterruptResponse)
@@ -302,100 +327,7 @@ async def _maybe_await(value: Any) -> Any:
     return value
 
 
-def _create_logged_task(coroutine: Any, *, name: str) -> asyncio.Task:
-    task = asyncio.create_task(coroutine, name=name)
-    task.add_done_callback(_log_background_task_failure)
-    return task
-
-
-def _log_background_task_failure(task: asyncio.Task) -> None:
-    try:
-        task.result()
-    except asyncio.CancelledError:
-        return
-    except Exception:
-        logger.exception("Background task failed: %s", task.get_name())
-
-
 def _raise_navigation_http_error(exc: ValueError | FileNotFoundError) -> None:
     if isinstance(exc, ValueError):
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     raise HTTPException(status_code=404, detail=str(exc)) from exc
-
-
-async def _drain_controller_events(
-    session_id: str,
-    manager: WebSessionManager,
-    store: WebSessionStore,
-    bus: SessionEventBus,
-) -> None:
-    try:
-        controller = manager.get_controller(session_id)
-    except KeyError:
-        return
-
-    persisted_final_texts: set[str] = set()
-
-    async def drain_once() -> None:
-        for event in controller.drain_events():
-            record = store.append_public_event(
-                session_id,
-                hashlib.sha256(uuid4().bytes).hexdigest(),
-                event,
-            )
-            try:
-                await bus.publish(session_id, record)
-            except Exception:  # pylint: disable=broad-except
-                logger.warning(
-                    "Live controller event publish failed; persisted replay remains "
-                    "available: session_id=%s sequence=%s",
-                    session_id,
-                    record.sequence,
-                    exc_info=True,
-                )
-            text = _final_event_text(event)
-            if text is not None and text not in persisted_final_texts:
-                store.append_message(session_id, role="assistant", content=text)
-                persisted_final_texts.add(text)
-
-    drained_to_completion = False
-    try:
-        while controller.is_running:
-            await drain_once()
-            await asyncio.sleep(0.03)
-
-        await drain_once()
-        drained_to_completion = True
-    finally:
-        result = await _consume_turn_result_when_idle(controller)
-        if drained_to_completion and result is not None:
-            text = getattr(result, "text", None)
-            if isinstance(text, str) and text and text not in persisted_final_texts:
-                store.append_message(session_id, role="assistant", content=text)
-                persisted_final_texts.add(text)
-
-
-def _final_event_text(event: dict[str, Any]) -> str | None:
-    if event.get("type") != "final":
-        return None
-    payload = event.get("payload")
-    if not isinstance(payload, dict):
-        return None
-    text = payload.get("text")
-    return text if isinstance(text, str) and text else None
-
-
-async def _consume_turn_result_when_idle(controller: Any) -> Any | None:
-    while getattr(controller, "is_running", False):
-        await asyncio.sleep(0.03)
-    return _consume_turn_result(controller)
-
-
-def _consume_turn_result(controller: Any) -> Any | None:
-    consume_turn_result = getattr(controller, "consume_turn_result", None)
-    if not callable(consume_turn_result):
-        return None
-    try:
-        return consume_turn_result()
-    except RuntimeError:
-        return None

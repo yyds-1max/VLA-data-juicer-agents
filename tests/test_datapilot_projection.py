@@ -18,6 +18,8 @@ from agentscope.event import (
     ThinkingBlockDeltaEvent,
     ThinkingBlockEndEvent,
     ThinkingBlockStartEvent,
+    ToolCallDeltaEvent,
+    ToolCallEndEvent,
     ToolCallStartEvent,
     ToolResultDataDeltaEvent,
     ToolResultEndEvent,
@@ -150,6 +152,88 @@ def test_sanitize_agent_event_publicizes_agent_name_without_explicit_identity_se
 
     assert public["name"] == "DataPilot"
     assert "session_id" not in public
+
+
+@pytest.mark.asyncio
+async def test_reply_projection_preserves_native_correlation_ids_byte_for_byte():
+    private = "internal-nav-session"
+    reply_id = f"reply-{private}"
+    block_id = f"block-{private}"
+    tool_call_id = f"call-{private}"
+    source_events = [
+        ReplyStartEvent(
+            id=f"event-start-{private}",
+            session_id=private,
+            reply_id=reply_id,
+            name="navigation-data-agent",
+        ),
+        TextBlockDeltaEvent(
+            id=f"event-text-delta-{private}",
+            reply_id=reply_id,
+            block_id=block_id,
+            delta=f"content-{private}",
+        ),
+        ToolCallStartEvent(
+            id=f"event-tool-start-{private}",
+            reply_id=reply_id,
+            tool_call_id=tool_call_id,
+            tool_call_name=f"extract-{private}",
+        ),
+        ToolCallDeltaEvent(
+            id=f"event-tool-delta-{private}",
+            reply_id=reply_id,
+            tool_call_id=tool_call_id,
+            delta=f'{{"path":"{private}"}}',
+        ),
+        ToolCallEndEvent(
+            id=f"event-tool-end-{private}",
+            reply_id=reply_id,
+            tool_call_id=tool_call_id,
+        ),
+        ReplyEndEvent(
+            id=f"event-reply-end-{private}",
+            session_id=private,
+            reply_id=reply_id,
+        ),
+    ]
+    sink = RecordingSink()
+    middleware = DataPilotReplyProjectionMiddleware(private, sink)
+
+    async def handler(**_kwargs: Any):
+        for event in source_events:
+            yield event
+
+    yielded = [
+        event
+        async for event in middleware.on_reply(
+            SimpleNamespace(name="navigation-data-agent"),
+            {},
+            handler,
+        )
+    ]
+
+    assert yielded == source_events
+    assert [event["id"] for event in sink.events] == [event.id for event in source_events]
+    assert [event["reply_id"] for event in sink.events] == [reply_id] * len(source_events)
+    assert [
+        event["tool_call_id"]
+        for event in sink.events
+        if event["type"].startswith("TOOL_CALL_")
+    ] == [tool_call_id, tool_call_id, tool_call_id]
+    text_delta = next(
+        event for event in sink.events if event["type"] == "TEXT_BLOCK_DELTA"
+    )
+    assert text_delta["block_id"] == block_id
+    assert text_delta["delta"] == "content-DataPilot"
+    tool_start = next(
+        event for event in sink.events if event["type"] == "TOOL_CALL_START"
+    )
+    tool_delta = next(
+        event for event in sink.events if event["type"] == "TOOL_CALL_DELTA"
+    )
+    assert tool_start["tool_call_name"] == "extract-DataPilot"
+    assert tool_delta["delta"] == '{"path":"DataPilot"}'
+    assert all("session_id" not in event for event in sink.events)
 
 
 @pytest.mark.asyncio

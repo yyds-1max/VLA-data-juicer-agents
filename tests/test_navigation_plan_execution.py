@@ -565,6 +565,55 @@ async def test_plan_bound_worker_observes_shared_cancellation_after_async_wrappe
 
 
 @pytest.mark.asyncio
+async def test_queued_plan_worker_releases_quiescence_after_outer_task_cancel(
+    monkeypatch,
+    tmp_path,
+):
+    services = build_services(tmp_path)
+    cancellation = CancellationContext()
+    blocker_started = Event()
+    release_blocker = Event()
+    queued_worker_started = Event()
+    loop = asyncio.get_running_loop()
+    executor = ThreadPoolExecutor(max_workers=1)
+    loop.set_default_executor(executor)
+
+    def occupy_only_thread() -> None:
+        blocker_started.set()
+        release_blocker.wait()
+
+    def queued_invoke(**_kwargs):
+        queued_worker_started.set()
+        return {"status": "completed"}
+
+    blocker = loop.run_in_executor(None, occupy_only_thread)
+    while not blocker_started.is_set():
+        await asyncio.sleep(0)
+    monkeypatch.setattr(plan_execution, "_invoke_plan_step", queued_invoke)
+    tool = services.tools(cancellation=cancellation)[
+        "extract_and_sync_navigation_data_tool"
+    ]
+
+    async def invoke() -> None:
+        async with cancellation.track_agent("queued-agent"):
+            await tool(plan_id=services.plan.plan_id, step_id="sync")
+
+    task = asyncio.create_task(invoke())
+    await asyncio.sleep(0)
+    await asyncio.sleep(0)
+    cancellation.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    assert queued_worker_started.is_set() is False
+    assert await cancellation.wait_for_workers(timeout=0.01) is False
+    release_blocker.set()
+    await blocker
+    assert await cancellation.wait_for_workers(timeout=1) is True
+    executor.shutdown(wait=True)
+
+
+@pytest.mark.asyncio
 async def test_production_offloaded_worker_keeps_cancellation_lease_after_reply_cleanup(
     monkeypatch,
     tmp_path,

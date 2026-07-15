@@ -7,7 +7,7 @@ from collections.abc import AsyncGenerator, Callable
 from typing import Any, Literal
 
 from agentscope.event import EventBase
-from agentscope.message import AssistantMsg, TextBlock, ToolResultState
+from agentscope.message import AssistantMsg, Msg, TextBlock, ToolResultState
 from agentscope.middleware import MiddlewareBase
 from agentscope.tool import ToolResponse
 
@@ -30,6 +30,7 @@ SUPPRESSED_THINKING_EVENTS = {
 }
 SUPPRESSED_PUBLIC_EVENTS = SUPPRESSED_TOOL_RESULT_EVENTS | SUPPRESSED_THINKING_EVENTS
 _AGENT_NAMED_EVENT_TYPES = {"REPLY_START", "EXCEED_MAX_ITERS"}
+_PUBLIC_CORRELATION_FIELDS = {"id", "reply_id", "block_id", "tool_call_id"}
 
 
 def _event_type(event: dict[str, Any]) -> str:
@@ -61,6 +62,7 @@ def _strip_internal_identity(
     *,
     private_identities: set[str],
     public_name: str,
+    preserve_string: bool = False,
 ) -> Any:
     if isinstance(value, dict):
         return {
@@ -72,6 +74,9 @@ def _strip_internal_identity(
                 item,
                 private_identities=private_identities,
                 public_name=public_name,
+                preserve_string=(
+                    key in _PUBLIC_CORRELATION_FIELDS and isinstance(item, str)
+                ),
             )
             for key, item in value.items()
             if not _is_private_identity_field(key)
@@ -86,6 +91,8 @@ def _strip_internal_identity(
             for item in value
         ]
     if isinstance(value, str):
+        if preserve_string:
+            return value
         return _replace_private_identities(value, private_identities, public_name)
     return value
 
@@ -218,6 +225,28 @@ class DataPilotRunBoundaryMiddleware(MiddlewareBase):
             cancellation,
         )
         try:
+            admit_generation = getattr(
+                self._sink,
+                "admit_user_execution_generation",
+                None,
+            )
+            inputs = input_kwargs.get("inputs")
+            is_user_input = (
+                isinstance(inputs, Msg) and inputs.role == "user"
+            ) or (
+                isinstance(inputs, list)
+                and bool(inputs)
+                and all(
+                    isinstance(item, Msg) and item.role == "user"
+                    for item in inputs
+                )
+            )
+            if is_user_input and callable(admit_generation):
+                # ChatService has acquired its distributed session-run lock
+                # before invoking middleware.  Advancing the public generation
+                # here therefore means both local spawn and distributed run
+                # admission succeeded; idle wakeups never clear the stop fence.
+                admit_generation(self._session_id, cancellation)
             async with cancellation.track_agent(self._session_id):
                 with bind_cancellation(cancellation):
                     async for item in next_handler(**input_kwargs):

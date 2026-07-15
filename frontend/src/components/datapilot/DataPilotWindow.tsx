@@ -1,5 +1,6 @@
 import type { CSSProperties, PointerEvent, WheelEvent } from "react";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { EventType, type AgentEvent, type CustomEvent } from "@agentscope-ai/agentscope/event";
 import { useStore } from "zustand";
 
 import {
@@ -47,6 +48,17 @@ type ActiveSubmitRequest = {
   error?: unknown;
 };
 
+type SubmitAdmission = {
+  sessionId: string | null;
+  afterSequence: number;
+  originalDraft: string;
+  draftRevision: number;
+  accepted: boolean;
+  replyStarted: boolean;
+  turnId: string | null;
+  terminalTurnIds: Set<string>;
+};
+
 export function DataPilotWindow() {
   const open = useStore(datapilotStore, (state) => state.open);
   const mode = useStore(datapilotStore, (state) => state.mode);
@@ -64,6 +76,8 @@ export function DataPilotWindow() {
   const [recoveringHumanDecision, setRecoveringHumanDecision] = useState(false);
   const [humanDecisionRecoveryError, setHumanDecisionRecoveryError] = useState("");
   const [stopRequestPending, setStopRequestPending] = useState(false);
+  const [composerDraft, setComposerDraft] = useState("");
+  const [submitting, setSubmitting] = useState(false);
   const [viewport, setViewport] = useState(() => ({
     width: typeof window === "undefined" ? 1280 : window.innerWidth,
     height: typeof window === "undefined" ? 900 : window.innerHeight,
@@ -78,6 +92,9 @@ export function DataPilotWindow() {
   const selectionGenerationRef = useRef(0);
   const selectionTargetRef = useRef<string | null>(null);
   const draftRequestGenerationRef = useRef(0);
+  const composerDraftRef = useRef("");
+  const composerDraftRevisionRef = useRef(0);
+  const requestInFlightRef = useRef<SubmitAdmission | null>(null);
   const activeSubmitRequestIdRef = useRef(0);
   const activeSubmitQueueRef = useRef(new Map<number, ActiveSubmitRequest>());
   const deletedSessionIdsRef = useRef(new Set<string>());
@@ -88,6 +105,142 @@ export function DataPilotWindow() {
   const humanDecisionRecoveryRequestRef = useRef(0);
   const dragRef = useRef<DragState | null>(null);
   const windowOffset = useMemo(() => visibleWindowOffset(floatingOffset, viewport), [floatingOffset, viewport]);
+
+  const handleComposerDraftChange = useCallback((message: string) => {
+    composerDraftRevisionRef.current += 1;
+    composerDraftRef.current = message;
+    setComposerDraft(message);
+  }, []);
+
+  const replaceComposerDraft = useCallback((message: string) => {
+    composerDraftRef.current = message;
+    setComposerDraft(message);
+  }, []);
+
+  const acquireSubmitAdmission = useCallback(
+    (message: string, sessionId: string | null) => {
+      if (requestInFlightRef.current) {
+        return null;
+      }
+      const originalDraft = composerDraftRef.current;
+      const request: SubmitAdmission = {
+        sessionId,
+        afterSequence: datapilotStore.getState().conversation.lastSequence,
+        originalDraft,
+        draftRevision: composerDraftRevisionRef.current,
+        accepted: false,
+        replyStarted: false,
+        turnId: null,
+        terminalTurnIds: new Set<string>(),
+      };
+      requestInFlightRef.current = request;
+      setSubmitting(true);
+      if (originalDraft.trim() === message) {
+        replaceComposerDraft("");
+      }
+      return request;
+    },
+    [replaceComposerDraft],
+  );
+
+  const releaseSubmitAdmission = useCallback((request: SubmitAdmission) => {
+    if (requestInFlightRef.current !== request) {
+      return;
+    }
+    requestInFlightRef.current = null;
+    setSubmitting(false);
+  }, []);
+
+  const invalidateSubmitAdmission = useCallback((updateState = true) => {
+    requestInFlightRef.current = null;
+    if (updateState) {
+      setSubmitting(false);
+    }
+  }, []);
+
+  const restoreUneditedSubmittedDraft = useCallback((request: SubmitAdmission) => {
+    if (
+      composerDraftRef.current === "" &&
+      composerDraftRevisionRef.current === request.draftRevision
+    ) {
+      replaceComposerDraft(request.originalDraft);
+    }
+  }, [replaceComposerDraft]);
+
+  const observeSubmittedReplyStart = useCallback(
+    (sessionId: string, sequence: number, type: string) => {
+      const request = requestInFlightRef.current;
+      if (
+        !request ||
+        request.sessionId !== sessionId ||
+        sequence <= request.afterSequence ||
+        type !== EventType.REPLY_START
+      ) {
+        return;
+      }
+      request.replyStarted = true;
+      if (request.accepted) {
+        releaseSubmitAdmission(request);
+      }
+    },
+    [releaseSubmitAdmission],
+  );
+
+  const observeSubmittedRunTerminal = useCallback(
+    (sessionId: string, sequence: number, event: AgentEvent) => {
+      const request = requestInFlightRef.current;
+      if (
+        !request ||
+        request.sessionId !== sessionId ||
+        sequence <= request.afterSequence ||
+        event.type !== EventType.CUSTOM
+      ) {
+        return;
+      }
+      const custom = event as CustomEvent;
+      if (custom.name !== "datapilot_run_terminal") {
+        return;
+      }
+      const terminalTurnId = custom.value.turn_id;
+      if (typeof terminalTurnId !== "string" || !terminalTurnId) {
+        return;
+      }
+      request.terminalTurnIds.add(terminalTurnId);
+      if (request.accepted && request.turnId === terminalTurnId) {
+        releaseSubmitAdmission(request);
+      }
+    },
+    [releaseSubmitAdmission],
+  );
+
+  const observeSubmittedSnapshot = useCallback(
+    (session: Awaited<ReturnType<typeof getSession>>) => {
+      const request = requestInFlightRef.current;
+      if (!request || request.sessionId !== session.id) {
+        return;
+      }
+      let expectedSequence = request.afterSequence + 1;
+      for (const event of [...session.events].sort((left, right) => left.sequence - right.sequence)) {
+        if (event.sequence < expectedSequence) {
+          continue;
+        }
+        if (event.sequence !== expectedSequence) {
+          break;
+        }
+        expectedSequence += 1;
+        if (event.event.type !== EventType.REPLY_START) {
+          observeSubmittedRunTerminal(session.id, event.sequence, event.event);
+          continue;
+        }
+        request.replyStarted = true;
+        if (request.accepted) {
+          releaseSubmitAdmission(request);
+        }
+        break;
+      }
+    },
+    [observeSubmittedRunTerminal, releaseSubmitAdmission],
+  );
 
   const clearReconnectTimer = useCallback(() => {
     if (reconnectTimerRef.current === null) {
@@ -197,6 +350,10 @@ export function DataPilotWindow() {
             const beforeCursor = datapilotStore.getState().conversation.lastSequence;
             datapilotStore.getState().applyEvent(event);
             const afterCursor = datapilotStore.getState().conversation.lastSequence;
+            if (afterCursor >= event.sequence) {
+              observeSubmittedReplyStart(sessionId, event.sequence, event.event.type);
+              observeSubmittedRunTerminal(sessionId, event.sequence, event.event);
+            }
             if (event.sequence > beforeCursor && afterCursor === beforeCursor) {
               replayRequired = true;
               controller.abort();
@@ -221,6 +378,7 @@ export function DataPilotWindow() {
           if (!isCurrentLease(lease)) {
             return;
           }
+          observeSubmittedSnapshot(detail);
           datapilotStore.getState().refreshActiveSession(detail);
         } catch (error) {
           if (!isCurrentLease(lease)) {
@@ -249,7 +407,13 @@ export function DataPilotWindow() {
         }, reconnectDelay);
       })();
     },
-    [invalidateEventLifecycle, isCurrentLease],
+    [
+      invalidateEventLifecycle,
+      isCurrentLease,
+      observeSubmittedReplyStart,
+      observeSubmittedRunTerminal,
+      observeSubmittedSnapshot,
+    ],
   );
   startEventStreamRef.current = startEventStream;
 
@@ -257,15 +421,20 @@ export function DataPilotWindow() {
     mountedRef.current = true;
     return () => {
       mountedRef.current = false;
+      invalidateSubmitAdmission(false);
       draftRequestGenerationRef.current += 1;
       selectionGenerationRef.current += 1;
       selectionTargetRef.current = null;
       invalidateEventLifecycle();
     };
-  }, [invalidateEventLifecycle]);
+  }, [invalidateEventLifecycle, invalidateSubmitAdmission]);
 
   useEffect(() => {
     if (!open || mode !== "active_session" || !currentSessionId) {
+      if (!open) {
+        invalidateSubmitAdmission();
+        replaceComposerDraft("");
+      }
       invalidateEventLifecycle();
       reconnectStateRef.current = { sessionId: null, attempts: 0 };
       return undefined;
@@ -293,13 +462,35 @@ export function DataPilotWindow() {
         invalidateEventLifecycle();
       }
     };
-  }, [currentSessionId, invalidateEventLifecycle, mode, open, startEventStream]);
+  }, [
+    currentSessionId,
+    invalidateEventLifecycle,
+    invalidateSubmitAdmission,
+    mode,
+    open,
+    replaceComposerDraft,
+    startEventStream,
+  ]);
 
   useEffect(() => {
     if (conversation.phase === "idle") {
       setStopRequestPending(false);
     }
   }, [conversation.phase]);
+
+  useEffect(() => {
+    if (conversation.phase !== "streaming") {
+      return;
+    }
+    const request = requestInFlightRef.current;
+    if (!request || request.sessionId !== currentSessionId) {
+      return;
+    }
+    request.replyStarted = true;
+    if (request.accepted) {
+      releaseSubmitAdmission(request);
+    }
+  }, [conversation.phase, currentSessionId, releaseSubmitAdmission]);
 
   useEffect(() => {
     setStopRequestPending(false);
@@ -347,6 +538,8 @@ export function DataPilotWindow() {
   };
 
   const handleNewSession = () => {
+    invalidateSubmitAdmission();
+    replaceComposerDraft("");
     draftRequestGenerationRef.current += 1;
     selectionGenerationRef.current += 1;
     selectionTargetRef.current = null;
@@ -356,6 +549,7 @@ export function DataPilotWindow() {
   };
 
   const handleSelectHistory = async (session: SessionRecord) => {
+    invalidateSubmitAdmission();
     draftRequestGenerationRef.current += 1;
     const previousState = datapilotStore.getState();
     const previousMode = previousState.mode;
@@ -385,6 +579,7 @@ export function DataPilotWindow() {
       }
       selectionTargetRef.current = null;
       datapilotStore.getState().restoreSession(detail);
+      replaceComposerDraft("");
       setHistoryOpen(false);
       startEventStream(session.id, lifecycleGeneration);
     } catch (error) {
@@ -411,6 +606,8 @@ export function DataPilotWindow() {
       const store = datapilotStore.getState();
       store.setSessions(store.sessions.filter((item) => item.id !== session.id));
       if (store.currentSessionId === session.id) {
+        invalidateSubmitAdmission();
+        replaceComposerDraft("");
         invalidateEventLifecycle();
         store.enterDraft();
         setHistoryOpen(false);
@@ -428,6 +625,10 @@ export function DataPilotWindow() {
   };
 
   const handleDraftSubmit = async (message: string) => {
+    const submission = acquireSubmitAdmission(message, null);
+    if (!submission) {
+      return;
+    }
     const requestGeneration = draftRequestGenerationRef.current + 1;
     draftRequestGenerationRef.current = requestGeneration;
     const lifecycleGeneration = lifecycleGenerationRef.current;
@@ -462,19 +663,31 @@ export function DataPilotWindow() {
         return;
       }
       createdSessionId = session.id;
+      submission.sessionId = session.id;
+      submission.afterSequence = 0;
       const store = datapilotStore.getState();
       store.setActiveSession(session);
       const userMessage = localUserMessage(session.id, message);
       startEventStream(session.id, lifecycleGeneration);
-      await submitTurn(session.id, message);
+      submission.turnId = await submitTurn(session.id, message);
       if (!ownsCreatedSession()) {
         return;
       }
       datapilotStore.getState().appendUserMessage(userMessage);
+      submission.accepted = true;
+      if (
+        submission.replyStarted ||
+        (submission.turnId !== null &&
+          submission.terminalTurnIds.has(submission.turnId))
+      ) {
+        releaseSubmitAdmission(submission);
+      }
     } catch (error) {
       if (!(createdSessionId ? ownsCreatedSession() : ownsDraftIntent())) {
         return;
       }
+      restoreUneditedSubmittedDraft(submission);
+      releaseSubmitAdmission(submission);
       invalidateEventLifecycle();
       datapilotStore.getState().enterDraft();
       console.error("Failed to submit DataPilot draft turn", error);
@@ -487,6 +700,10 @@ export function DataPilotWindow() {
     }
 
     const sessionId = currentSessionId;
+    const submission = acquireSubmitAdmission(message, sessionId);
+    if (!submission) {
+      return;
+    }
     startEventStream(sessionId, lifecycleGenerationRef.current);
     const state = datapilotStore.getState();
     if (
@@ -496,6 +713,8 @@ export function DataPilotWindow() {
       state.currentSessionId !== sessionId ||
       deletedSessionIdsRef.current.has(sessionId)
     ) {
+      restoreUneditedSubmittedDraft(submission);
+      releaseSubmitAdmission(submission);
       return;
     }
     const request: ActiveSubmitRequest = {
@@ -508,11 +727,19 @@ export function DataPilotWindow() {
     activeSubmitRequestIdRef.current = request.id;
     activeSubmitQueueRef.current.set(request.id, request);
     try {
-      await submitTurn(sessionId, message);
+      submission.turnId = await submitTurn(sessionId, message);
+      submission.accepted = true;
       const current = activeSubmitQueueRef.current.get(request.id);
       if (current === request) {
         request.outcome = "success";
         flushActiveSubmitQueue();
+      }
+      if (
+        submission.replyStarted ||
+        (submission.turnId !== null &&
+          submission.terminalTurnIds.has(submission.turnId))
+      ) {
+        releaseSubmitAdmission(submission);
       }
     } catch (error) {
       const current = activeSubmitQueueRef.current.get(request.id);
@@ -521,6 +748,8 @@ export function DataPilotWindow() {
         request.error = error;
         flushActiveSubmitQueue();
       }
+      restoreUneditedSubmittedDraft(submission);
+      releaseSubmitAdmission(submission);
     }
   };
 
@@ -766,7 +995,14 @@ export function DataPilotWindow() {
         />
       ) : null}
       {mode === "draft_new_session" ? (
-        <DraftNewSessionView running={running} onSubmit={handleDraftSubmit} onInterrupt={handleInterrupt} />
+        <DraftNewSessionView
+          message={composerDraft}
+          running={running}
+          submitting={submitting}
+          onMessageChange={handleComposerDraftChange}
+          onSubmit={handleDraftSubmit}
+          onInterrupt={handleInterrupt}
+        />
       ) : mode === "active_session" ? (
         <div className="flex min-h-0 flex-1 flex-col bg-console-panel">
           <MessageList messages={conversation.messages} toolRuns={conversation.toolRuns} />
@@ -784,8 +1020,11 @@ export function DataPilotWindow() {
             <div className="border-t border-console-line p-3 sm:p-4">
               <Composer
                 placeholder="继续描述任务…"
+                message={composerDraft}
                 running={running}
+                submitting={submitting}
                 interrupting={interrupting || stopRequestPending}
+                onMessageChange={handleComposerDraftChange}
                 onSubmit={handleActiveSubmit}
                 onInterrupt={handleInterrupt}
               />

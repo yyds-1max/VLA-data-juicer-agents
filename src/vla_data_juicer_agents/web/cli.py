@@ -34,7 +34,10 @@ def build_parser() -> argparse.ArgumentParser:
 def _agentscope_runtime_from_env(working_dir: str):
     enabled = os.environ.get("VLA_AGENT_ENABLE_AGENTSCOPE")
     if enabled is not None and enabled.strip().lower() in {"0", "false"}:
-        return None
+        raise RuntimeError(
+            "AgentScope cannot be disabled for the Web application; "
+            "remove VLA_AGENT_ENABLE_AGENTSCOPE or set it to 1"
+        )
 
     from vla_data_juicer_agents.runtime.agentscope_config import AgentScopeRuntimeConfig
     from vla_data_juicer_agents.runtime.agentscope_runtime import create_agentscope_runtime

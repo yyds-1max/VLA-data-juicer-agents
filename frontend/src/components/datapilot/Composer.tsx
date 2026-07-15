@@ -1,17 +1,27 @@
-import { useState, type FormEvent } from "react";
+import type { FormEvent } from "react";
 import { ArrowUp, LoaderCircle, Paperclip, Square } from "lucide-react";
 
 type ComposerProps = {
   placeholder: string;
+  message: string;
   running?: boolean;
+  submitting?: boolean;
   interrupting?: boolean;
+  onMessageChange: (message: string) => void;
   onSubmit: (message: string) => void;
   onInterrupt?: () => void;
 };
 
-export function Composer({ placeholder, running = false, interrupting = false, onSubmit, onInterrupt }: ComposerProps) {
-  const [message, setMessage] = useState("");
-
+export function Composer({
+  placeholder,
+  message,
+  running = false,
+  submitting = false,
+  interrupting = false,
+  onMessageChange,
+  onSubmit,
+  onInterrupt,
+}: ComposerProps) {
   const handleSubmit = (event: FormEvent<HTMLFormElement>) => {
     event.preventDefault();
 
@@ -22,6 +32,9 @@ export function Composer({ placeholder, running = false, interrupting = false, o
       onInterrupt?.();
       return;
     }
+    if (submitting) {
+      return;
+    }
 
     const trimmed = message.trim();
     if (!trimmed) {
@@ -29,7 +42,6 @@ export function Composer({ placeholder, running = false, interrupting = false, o
     }
 
     onSubmit(trimmed);
-    setMessage("");
   };
 
   return (
@@ -45,17 +57,18 @@ export function Composer({ placeholder, running = false, interrupting = false, o
       </span>
       <input
         value={message}
-        onChange={(event) => setMessage(event.target.value)}
+        onChange={(event) => onMessageChange(event.target.value)}
         placeholder={placeholder}
         className="min-w-0 flex-1 bg-transparent text-sm text-console-text outline-none placeholder:text-console-muted"
       />
       <button
         type="submit"
         aria-label={interrupting ? "Interrupt requested" : running ? "Stop current run" : "Send message"}
-        disabled={interrupting}
+        disabled={interrupting || submitting}
+        aria-busy={submitting || undefined}
         className="flex h-9 w-9 shrink-0 items-center justify-center rounded-lg bg-console-text text-white transition hover:bg-slate-800 focus:outline-none focus:ring-2 focus:ring-console-cyan focus:ring-offset-2 focus:ring-offset-console-bg"
       >
-        {interrupting ? (
+        {interrupting || submitting ? (
           <LoaderCircle className="h-5 w-5 animate-spin" aria-hidden="true" />
         ) : running ? (
           <Square className="h-3.5 w-3.5 fill-current" aria-hidden="true" />

@@ -2,7 +2,7 @@ import "@testing-library/jest-dom/vitest";
 import { act, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { EventType } from "@agentscope-ai/agentscope/event";
 import { AssistantMsg, UserMsg } from "@agentscope-ai/agentscope/message";
-import { StrictMode } from "react";
+import { StrictMode, useState } from "react";
 
 import {
   createSession,
@@ -1885,12 +1885,9 @@ test("starting a new draft invalidates an older pending session creation", async
   expect(screen.getByPlaceholderText("我们要做什么？")).toHaveValue("");
 });
 
-test("an older draft creation cannot overwrite a newer successful creation", async () => {
+test("draft submit is synchronously latched while session creation is pending", async () => {
   const firstCreation = deferred<Awaited<ReturnType<typeof createSession>>>();
-  const secondCreation = deferred<Awaited<ReturnType<typeof createSession>>>();
-  apiMocks.createSession
-    .mockReturnValueOnce(firstCreation.promise)
-    .mockReturnValueOnce(secondCreation.promise);
+  apiMocks.createSession.mockReturnValue(firstCreation.promise);
   await renderAppWithDashboardSettled();
   fireEvent.click(screen.getByRole("button", { name: "Open DataPilot" }));
   const input = screen.getByPlaceholderText("我们要做什么？");
@@ -1899,35 +1896,19 @@ test("an older draft creation cannot overwrite a newer successful creation", asy
   fireEvent.click(screen.getByRole("button", { name: "Send message" }));
   fireEvent.change(input, { target: { value: "second" } });
   fireEvent.click(screen.getByRole("button", { name: "Send message" }));
-  expect(apiMocks.createSession).toHaveBeenCalledTimes(2);
+  expect(apiMocks.createSession).toHaveBeenCalledTimes(1);
+  expect(input).toHaveValue("second");
 
-  secondCreation.resolve({
-    id: "session-newer",
-    title: "Newer",
+  firstCreation.resolve({
+    id: "session-first",
+    title: "First",
     created_at: "2026-06-26T02:00:00Z",
     updated_at: "2026-06-26T02:00:00Z",
   });
-  await waitFor(() => expect(datapilotStore.getState().currentSessionId).toBe("session-newer"));
-  await waitFor(() => expect(apiMocks.submitTurn).toHaveBeenCalledWith("session-newer", "second"));
-
-  firstCreation.resolve({
-    id: "session-older",
-    title: "Older",
-    created_at: "2026-06-26T01:00:00Z",
-    updated_at: "2026-06-26T01:00:00Z",
-  });
-  await act(async () => {
-    await firstCreation.promise;
-    await Promise.resolve();
-  });
-
-  expect(datapilotStore.getState().currentSessionId).toBe("session-newer");
-  expect(apiMocks.streamSessionEvents).not.toHaveBeenCalledWith(
-    "session-older",
-    expect.any(Number),
-    expect.any(AbortSignal),
-  );
-  expect(apiMocks.submitTurn).not.toHaveBeenCalledWith("session-older", "first");
+  await waitFor(() => expect(datapilotStore.getState().currentSessionId).toBe("session-first"));
+  await waitFor(() => expect(apiMocks.submitTurn).toHaveBeenCalledWith("session-first", "first"));
+  expect(apiMocks.submitTurn).toHaveBeenCalledTimes(1);
+  expect(screen.getByPlaceholderText("继续描述任务…")).toHaveValue("second");
 });
 
 test("failed draft submit does not append a local user message", async () => {
@@ -1951,6 +1932,7 @@ test("failed draft submit does not append a local user message", async () => {
   await waitFor(() => expect(datapilotStore.getState().mode).toBe("draft_new_session"));
   expect(datapilotStore.getState().conversation.messages).toEqual([]);
   expect(screen.queryByText("会失败的任务")).not.toBeInTheDocument();
+  expect(screen.getByPlaceholderText("我们要做什么？")).toHaveValue("会失败的任务");
   expect(activeSignal?.aborted).toBe(true);
   expect(consoleError).toHaveBeenCalledWith("Failed to submit DataPilot draft turn", expect.any(Error));
   consoleError.mockRestore();
@@ -1985,6 +1967,34 @@ test("failed active submit does not append a local user message", async () => {
   expect(datapilotStore.getState().conversation.messages).toEqual([]);
   expect(screen.queryByText("会失败的继续任务")).not.toBeInTheDocument();
   expect(consoleError).toHaveBeenCalledWith("Failed to submit DataPilot active turn", expect.any(Error));
+  consoleError.mockRestore();
+});
+
+test("failed active submit preserves a newer edited draft instead of restoring sent text", async () => {
+  const consoleError = vi.spyOn(console, "error").mockImplementation(() => undefined);
+  const submission = deferred<string>();
+  apiMocks.submitTurn.mockReturnValue(submission.promise);
+  datapilotStore.setState({
+    open: true,
+    mode: "active_session",
+    currentSessionId: "session-1",
+    conversation: createAgentConversation(),
+  });
+  await renderAppWithDashboardSettled();
+  const input = screen.getByPlaceholderText("继续描述任务…");
+
+  fireEvent.change(input, { target: { value: "原始任务" } });
+  fireEvent.click(screen.getByRole("button", { name: "Send message" }));
+  fireEvent.change(input, { target: { value: "用户的新草稿" } });
+  submission.reject(new Error("submit failed"));
+
+  await waitFor(() =>
+    expect(consoleError).toHaveBeenCalledWith(
+      "Failed to submit DataPilot active turn",
+      expect.any(Error),
+    ),
+  );
+  expect(input).toHaveValue("用户的新草稿");
   consoleError.mockRestore();
 });
 
@@ -2108,12 +2118,9 @@ test("a pending active submit appends once when its session still owns the respo
   expect(datapilotStore.getState().conversation.messages).toHaveLength(1);
 });
 
-test("concurrent active submits append in submission order when responses finish out of order", async () => {
+test("active submit is synchronously latched while request admission is pending", async () => {
   const firstSubmission = deferred<string>();
-  const secondSubmission = deferred<string>();
-  apiMocks.submitTurn
-    .mockReturnValueOnce(firstSubmission.promise)
-    .mockReturnValueOnce(secondSubmission.promise);
+  apiMocks.submitTurn.mockReturnValue(firstSubmission.promise);
   apiMocks.getSession.mockResolvedValue(emptySessionDetail("session-a"));
   datapilotStore.setState({
     open: true,
@@ -2130,22 +2137,184 @@ test("concurrent active submits append in submission order when responses finish
   fireEvent.change(input, { target: { value: "第二条" } });
   fireEvent.click(screen.getByRole("button", { name: "Send message" }));
   expect(apiMocks.submitTurn).toHaveBeenNthCalledWith(1, "session-a", "第一条");
-  expect(apiMocks.submitTurn).toHaveBeenNthCalledWith(2, "session-a", "第二条");
-
-  secondSubmission.resolve("turn-2");
-  await act(async () => {
-    await secondSubmission.promise;
-    await Promise.resolve();
-  });
-  expect(datapilotStore.getState().conversation.messages).toEqual([]);
+  expect(apiMocks.submitTurn).toHaveBeenCalledTimes(1);
+  expect(input).toHaveValue("第二条");
 
   firstSubmission.resolve("turn-1");
-  const firstMessage = await screen.findByText("第一条");
-  const secondMessage = screen.getByText("第二条");
-  expect(
-    firstMessage.compareDocumentPosition(secondMessage) & Node.DOCUMENT_POSITION_FOLLOWING,
-  ).toBeTruthy();
-  expect(datapilotStore.getState().conversation.messages).toHaveLength(2);
+  await screen.findByText("第一条");
+  expect(screen.queryByText("第二条")).not.toBeInTheDocument();
+  expect(datapilotStore.getState().conversation.messages).toHaveLength(1);
+  expect(input).toHaveValue("第二条");
+  expect(screen.getByRole("button", { name: "Send message" })).toBeDisabled();
+  fireEvent.click(screen.getByRole("button", { name: "Send message" }));
+  expect(apiMocks.submitTurn).toHaveBeenCalledTimes(1);
+
+  act(() => {
+    datapilotStore.getState().applyEvent(
+      publicEnvelope(
+        1,
+        {
+          id: "reply-start-1",
+          created_at: "2026-06-26T00:00:01Z",
+          type: EventType.REPLY_START,
+          session_id: "session-a",
+          reply_id: "reply-1",
+          name: "DataPilot",
+          role: "assistant",
+        },
+        "session-a",
+      ),
+    );
+  });
+  expect(screen.getByRole("button", { name: "Stop current run" })).toBeEnabled();
+  act(() => {
+    datapilotStore.getState().applyEvent(
+      publicEnvelope(
+        2,
+        {
+          id: "reply-end-1",
+          created_at: "2026-06-26T00:00:02Z",
+          type: EventType.REPLY_END,
+          session_id: "session-a",
+          reply_id: "reply-1",
+        },
+        "session-a",
+      ),
+    );
+  });
+  fireEvent.click(screen.getByRole("button", { name: "Send message" }));
+  expect(apiMocks.submitTurn).toHaveBeenCalledTimes(2);
+  expect(apiMocks.submitTurn).toHaveBeenLastCalledWith("session-a", "第二条");
+});
+
+test("REPLY_START arriving before the submit response releases admission after HTTP accepts", async () => {
+  const submission = deferred<string>();
+  const streamedStart = deferred<PublicEventEnvelope>();
+  apiMocks.submitTurn.mockReturnValue(submission.promise);
+  apiMocks.streamSessionEvents.mockImplementation((_sessionId, _cursor, signal) =>
+    (async function* () {
+      yield await streamedStart.promise;
+      await waitForAbort(signal);
+    })(),
+  );
+  datapilotStore.setState({
+    open: true,
+    mode: "active_session",
+    currentSessionId: "session-a",
+    conversation: createAgentConversation(),
+  });
+  await renderAppWithDashboardSettled();
+  const input = screen.getByPlaceholderText("继续描述任务…");
+
+  fireEvent.change(input, { target: { value: "第一条" } });
+  fireEvent.click(screen.getByRole("button", { name: "Send message" }));
+  streamedStart.resolve(
+    publicEnvelope(
+      1,
+      {
+        id: "reply-start-before-http",
+        created_at: "2026-06-26T00:00:01Z",
+        type: EventType.REPLY_START,
+        session_id: "session-a",
+        reply_id: "reply-before-http",
+        name: "DataPilot",
+        role: "assistant",
+      },
+      "session-a",
+    ),
+  );
+
+  await waitFor(() =>
+    expect(screen.getByRole("button", { name: "Stop current run" })).toBeDisabled(),
+  );
+  submission.resolve("turn-1");
+  await waitFor(() =>
+    expect(screen.getByRole("button", { name: "Stop current run" })).toBeEnabled(),
+  );
+
+  act(() => {
+    datapilotStore.getState().applyEvent(
+      publicEnvelope(
+        2,
+        {
+          id: "reply-end-before-http",
+          created_at: "2026-06-26T00:00:02Z",
+          type: EventType.REPLY_END,
+          session_id: "session-a",
+          reply_id: "reply-before-http",
+        },
+        "session-a",
+      ),
+    );
+  });
+  fireEvent.change(input, { target: { value: "第二条" } });
+  fireEvent.click(screen.getByRole("button", { name: "Send message" }));
+  expect(apiMocks.submitTurn).toHaveBeenCalledTimes(2);
+});
+
+test("a matching authoritative run terminal releases admission when no reply starts", async () => {
+  const firstTerminal = deferred<PublicEventEnvelope>();
+  const matchingTerminal = deferred<PublicEventEnvelope>();
+  apiMocks.submitTurn.mockResolvedValue("turn-accepted");
+  apiMocks.streamSessionEvents.mockImplementation((_sessionId, _cursor, signal) =>
+    (async function* () {
+      yield await firstTerminal.promise;
+      yield await matchingTerminal.promise;
+      await waitForAbort(signal);
+    })(),
+  );
+  datapilotStore.setState({
+    open: true,
+    mode: "active_session",
+    currentSessionId: "session-a",
+    conversation: createAgentConversation(),
+  });
+  await renderAppWithDashboardSettled();
+  const input = screen.getByPlaceholderText("继续描述任务…");
+
+  fireEvent.change(input, { target: { value: "第一条" } });
+  fireEvent.click(screen.getByRole("button", { name: "Send message" }));
+  await waitFor(() => expect(apiMocks.submitTurn).toHaveBeenCalledTimes(1));
+  expect(screen.getByRole("button", { name: "Send message" })).toBeDisabled();
+
+  firstTerminal.resolve(
+    publicEnvelope(
+      1,
+      {
+        id: "run-terminal-other",
+        created_at: "2026-06-26T00:00:01Z",
+        type: EventType.CUSTOM,
+        name: "datapilot_run_terminal",
+        value: { turn_id: "turn-other", status: "failure" },
+      },
+      "session-a",
+    ),
+  );
+  await act(async () => {
+    await firstTerminal.promise;
+    await Promise.resolve();
+  });
+  expect(screen.getByRole("button", { name: "Send message" })).toBeDisabled();
+
+  matchingTerminal.resolve(
+    publicEnvelope(
+      2,
+      {
+        id: "run-terminal-accepted",
+        created_at: "2026-06-26T00:00:02Z",
+        type: EventType.CUSTOM,
+        name: "datapilot_run_terminal",
+        value: { turn_id: "turn-accepted", status: "failure" },
+      },
+      "session-a",
+    ),
+  );
+  await waitFor(() =>
+    expect(screen.getByRole("button", { name: "Send message" })).toBeEnabled(),
+  );
+  fireEvent.change(input, { target: { value: "第二条" } });
+  fireEvent.click(screen.getByRole("button", { name: "Send message" }));
+  expect(apiMocks.submitTurn).toHaveBeenCalledTimes(2);
 });
 
 test("reopening an active session opens its SSE stream before submitting the turn", async () => {
@@ -2908,7 +3077,16 @@ test("stop keeps the draft editable and submits it after the terminating REPLY_E
 test("running Composer shows a square stop button", () => {
   const onInterrupt = vi.fn();
 
-  render(<Composer placeholder="我们要做什么？" running onSubmit={vi.fn()} onInterrupt={onInterrupt} />);
+  render(
+    <Composer
+      placeholder="我们要做什么？"
+      message=""
+      running
+      onMessageChange={vi.fn()}
+      onSubmit={vi.fn()}
+      onInterrupt={onInterrupt}
+    />,
+  );
 
   const stopButton = screen.getByRole("button", { name: "Stop current run" });
   expect(stopButton.querySelector("svg")).toBeInTheDocument();
@@ -2924,8 +3102,10 @@ test("interrupting Composer shows a spinning circle button without visible text"
   render(
     <Composer
       placeholder="我们要做什么？"
+      message=""
       running
       interrupting
+      onMessageChange={vi.fn()}
       onSubmit={vi.fn()}
       onInterrupt={onInterrupt}
     />,
@@ -2942,7 +3122,22 @@ test("interrupting Composer shows a spinning circle button without visible text"
 test("Composer trims messages, clears after submit, and ignores empty input", () => {
   const onSubmit = vi.fn();
 
-  render(<Composer placeholder="我们要做什么？" onSubmit={onSubmit} />);
+  function ControlledComposer() {
+    const [message, setMessage] = useState("");
+    return (
+      <Composer
+        placeholder="我们要做什么？"
+        message={message}
+        onMessageChange={setMessage}
+        onSubmit={(submitted) => {
+          onSubmit(submitted);
+          setMessage("");
+        }}
+      />
+    );
+  }
+
+  render(<ControlledComposer />);
 
   const input = screen.getByPlaceholderText("我们要做什么？");
   fireEvent.change(input, { target: { value: "   " } });

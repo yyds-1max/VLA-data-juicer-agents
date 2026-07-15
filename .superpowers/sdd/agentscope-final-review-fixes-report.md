@@ -294,3 +294,174 @@ Default, positional, and keyword max-count calls all delegate correctly.
 - Python `compileall`: passed.
 - `git diff --check`: passed.
 - No frontend files changed in round 3.
+
+## Round 4 whole-branch review fixes
+
+Baseline: `958005d`
+
+Five findings were reproduced before production changes. The root-cause checkpoint
+included the exact AgentScope 2.0.4 cancellation chain and was approved before the
+larger cross-process stop protocol was implemented.
+
+### Rejected turn admission cannot clear a stopped generation
+
+Root cause: `_start_agent_run()` advanced the public execution generation before
+`ChatRunRegistry.spawn()`. A duplicate-active rejection therefore cleared the durable
+stop fence even though no new user turn was admitted. A later `inputs=None` wakeup
+could call the model and publish a reply.
+
+GREEN: generation admission moved into `DataPilotRunBoundaryMiddleware`, which runs
+after both local registry spawn and AgentScope's distributed session-run lock. Only a
+fresh user `Msg` (or non-empty all-user list) advances the generation. Idle wakeups do
+not. The generation is attached to the already registered cancellation lease and is
+idempotent for middleware re-entry. Tests cover rejection, retry, restart, accepted
+exactly once, and wakeup suppression.
+
+### Native AgentScope correlation fields remain byte-identical
+
+Root cause: recursive identity sanitization rewrote every string, including native
+`id`, `reply_id`, `block_id`, and `tool_call_id`. Tool native events could therefore
+use a different ID from the canonical public ledger terminal.
+
+GREEN: sanitization is field-aware. The four public correlation fields are preserved
+byte-for-byte; `session_id` remains private; agent names and semantic content such as
+tool name and delta text remain sanitized. Native start/delta/end events with an
+adversarial private-identity substring now reduce with the terminal snapshot into one
+tool row rather than an orphan.
+
+### Cross-process Stop waits for owner worker quiescence
+
+Official AgentScope evidence: `ChatService.interrupt()` publishes and returns;
+`CancelDispatcher` cancels a process-local chat task and explicitly does not cancel
+background work; background task cancellation calls `asyncio_task.cancel()` and also
+returns without awaiting completion. Redis publish confirms only the PUBLISH command.
+The official session-run lock cannot prove background completion because background
+tasks do not hold it.
+
+This was unsafe for production plan tools: their body runs in `asyncio.to_thread`, and
+their subprocess exits cooperatively through the project `CancellationContext`. A Stop
+handled by runtime A could not see runtime B's in-memory token, yet the old code wrote
+`stopped` immediately after fire-and-forget AgentScope cancellation.
+
+GREEN adds a project-owned `StopCoordinator` without patching AgentScope:
+
+- every Web worker subscribes after the AgentScope message bus is live and removes its
+  owner records during lifespan shutdown;
+- generation-aware owner records use AgentScope's generic Redis registry API and
+  heartbeat timestamps; ACK identity binds runtime, AgentScope session, and generation;
+- a durable SQLite pending request gives each Web session/generation a stable request
+  ID, blocks a new generation, and prevents a racing success/failure terminal;
+- Pub/Sub requests are idempotently resent for missing ACKs; all owners across every
+  mapped session must ACK; timeout fails closed and leaves the public ledger running;
+- `CancellationContext.reserve_worker()` registers the worker before `to_thread` is
+  submitted. Only the actual synchronous worker's `finally` calls `finish_worker()`.
+  An async wrapper `CancelledError` cannot create a false quiescence signal;
+- an owner writes an applied ACK only after setting its cooperative token and every
+  tracked worker has actually returned. The requester then performs stopped ledger
+  rows, canonical terminal events, stopped generation, and request completion in one
+  `BEGIN IMMEDIATE` transaction;
+- official AgentScope interrupt/task cancellation remains defense-in-depth after the
+  project ACK, but is not treated as proof of completion.
+
+Deterministic shared-bus tests use separate requester and owner runtimes. Before the
+owner worker exits, the HTTP task remains pending and SQLite stays `running` with zero
+terminal events. A non-cooperative worker times out without a false stopped result;
+after the worker exits, retry reuses the same request ID and commits exactly one
+`stopped` terminal. Separate tests require the complete multi-mapping owner ACK union.
+
+Public tool cards continue to use only `running`, `success`, `failure`, and the
+user-requested `stopped` state. No background-transfer status was introduced.
+
+### Submit admission is synchronously latched without losing later draft edits
+
+Root cause: the Composer cleared its local input, but DataPilotWindow had no synchronous
+request-admission latch before the SSE-derived running state. A second edited message
+could be submitted while the first HTTP promise was pending. Draft mode created an
+orphan persisted session; active mode sent a request the backend later rejected.
+
+GREEN: draft creation and active turns share one synchronous ref latch plus explicit
+submitting UI state. The input remains editable. The submitted text is cleared only
+when it still owns the draft, later edits are preserved, and failure restores the
+original only when the user has not replaced it. HTTP acceptance remains latched
+through the HTTP-to-`REPLY_START` gap, including the reverse event-before-response
+race. Close, new/select/delete session, and unmount invalidate stale ownership. The
+two old tests that explicitly permitted concurrent draft/active submits now enforce a
+single request.
+
+### Production Web startup cannot fall back to the legacy controller
+
+Root cause: `VLA_AGENT_ENABLE_AGENTSCOPE=0|false` returned `None`, and `create_app()`
+silently built `WebSessionManager(SessionController)`, bypassing the SDK projection and
+privacy boundaries described by the production README.
+
+GREEN: the CLI rejects the obsolete disable setting and always constructs AgentScope.
+The production app factory fails closed when neither an AgentScope runtime nor an
+explicit test controller adapter is supplied. Fake-controller Web API tests and the
+independent TUI remain supported; the production default has no legacy controller.
+
+### Round 4 verification
+
+- Full backend: `942 passed, 1 warning` (the existing Starlette deprecation warning).
+- Full frontend: `181 passed`.
+- Frontend production build: passed (Vite 1626 modules transformed).
+- Python `compileall`: passed.
+- `git diff --check`: passed.
+- Final Web/AgentScope/Stop focused verification: `234 passed, 1 warning`.
+
+### Round 4 pre-commit independent review fixes
+
+The first independent pre-commit review found five paths not covered by the initial
+GREEN tests. Each was reproduced and fixed before commit.
+
+1. A Stop ACK originally waited for worker threads but not the tracked AgentScope task
+   or lease cleanup. `CancellationContext` now exposes separate agent and worker
+   quiescence, while the runtime lease exposes foreground/tool-reference quiescence.
+   The owner captures the target lease, sets its token, and waits for all three before
+   ACK. A no-worker task with deliberately gated cleanup keeps the requester pending.
+2. A same-process owner could disappear before the requester refreshed Redis. The
+   requester now freezes the complete expected owner snapshot before any cancellation;
+   the coordinator handles local and remote owners through the same loopback protocol.
+   Pending requests retain a quiescent lease tombstone until completion, allowing a
+   timed-out request to converge on retry with the same request ID.
+3. A pending stop initially blocked new user generations and tool outcomes but not an
+   already queued wakeup. `should_suppress_wakeup()` now treats both pending and
+   completed current-generation stops as fenced. Pending ACK and timeout tests prove
+   `inputs=None` performs zero model calls.
+4. An HTTP-accepted turn that failed before `REPLY_START` could leave the frontend
+   latch set forever. Every accepted user turn now persists and publishes a sanitized
+   `datapilot_run_terminal` custom event after ChatRunRegistry cleanup, with exact
+   `turn_id` and `success|failure|stopped`. The frontend releases only for its matching
+   session/turn and supports terminal-before-HTTP ordering; unrelated terminals do not
+   release admission.
+5. Although the production default failed closed, the first patch still kept the
+   legacy controller adapter inside the production factory. Production `create_app()`
+   now unconditionally requires AgentScope and contains no controller factory, legacy
+   manager, or drain path. The legacy manager and drain live only in
+   `tests/web_legacy_app.py`; the production `web/session_manager.py` was deleted. The
+   independent TUI remains unchanged.
+
+Review-driven quiescence initially exposed a lock cycle: Stop held the tool-outcome
+lock while waiting for a lease whose cancellation path needed that lock to observe the
+pending barrier and release. The corrected sequence durably creates the pending stop
+and freezes owners first, then waits for ACK without the outcome lock. Racing outcomes
+enter normally, are rejected by the pending barrier, and release their lease. Stop
+uses a separate per-session lock to serialize concurrent requests and takes the
+outcome lock only for the final short atomic stopped transaction. The former hanging
+race test and its success/remote-failure variants now finish in under one second.
+
+A second independent pass found one executor-queue edge. The first worker-lifecycle
+patch reserved its token before `asyncio.to_thread`, but cancellation could cancel a
+queued executor future before the thread ever started, leaking the token forever.
+The production wrapper now creates a strongly referenced worker task and awaits it
+through `asyncio.shield`. Cancellation still returns immediately to AgentScope, while
+the queued job remains alive, eventually observes the already-cancelled context, and
+releases its token in the real worker `finally`. Detached results are explicitly
+retrieved. Quiescence-event waits now poll their thread-safe Events asynchronously
+rather than consuming another slot in the same potentially saturated executor. A
+single-thread saturated-executor test proves cancel-before-start first remains
+non-quiescent, then converges after the blocker releases; existing normal and
+cancel-after-start plan tests remain green.
+
+The final independent re-review reported no actionable findings and ran an additional
+`82 passed` targeted verification over the queued-worker lifecycle, stop lock,
+pending fence, and ACK protocol.

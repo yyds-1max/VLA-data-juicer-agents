@@ -22,6 +22,7 @@ from vla_data_juicer_agents.web.schemas import (
 
 WEB_SCHEMA_GENERATION = "agentscope-native-events-v1"
 WEB_CONTROL_TABLES = (
+    "session_stop_requests",
     "tool_execution_provenance",
     "session_execution_boundaries",
     "human_decision_consumptions",
@@ -44,6 +45,14 @@ class AgentScopeSessionMapping:
     web_session_id: str
     agent_id: str
     agentscope_session_id: str
+
+
+@dataclass(frozen=True)
+class StopRequest:
+    session_id: str
+    generation: int
+    request_id: str
+    status: Literal["pending", "complete"]
 
 
 class WebSessionStore:
@@ -177,6 +186,20 @@ class WebSessionStore:
                 generation INTEGER NOT NULL DEFAULT 0,
                 stopped_generation INTEGER,
                 updated_at TEXT NOT NULL,
+                FOREIGN KEY (session_id) REFERENCES sessions(id)
+            )
+            """
+        )
+        connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS session_stop_requests (
+                session_id TEXT NOT NULL,
+                generation INTEGER NOT NULL,
+                request_id TEXT NOT NULL UNIQUE,
+                status TEXT NOT NULL CHECK (status IN ('pending', 'complete')),
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                PRIMARY KEY (session_id, generation),
                 FOREIGN KEY (session_id) REFERENCES sessions(id)
             )
             """
@@ -496,6 +519,16 @@ class WebSessionStore:
         with self._connect() as connection:
             connection.execute("BEGIN IMMEDIATE")
             self._require_session(connection, session_id)
+            pending = connection.execute(
+                """
+                SELECT 1 FROM session_stop_requests
+                WHERE session_id = ? AND status = 'pending'
+                LIMIT 1
+                """,
+                (session_id,),
+            ).fetchone()
+            if pending is not None:
+                raise RuntimeError("stop request is pending")
             connection.execute(
                 """
                 INSERT INTO session_execution_boundaries (
@@ -515,6 +548,80 @@ class WebSessionStore:
         assert row is not None
         return int(row[0])
 
+    def current_execution_generation(self, session_id: str) -> int:
+        with self._connect() as connection:
+            self._require_session(connection, session_id)
+            row = connection.execute(
+                """
+                SELECT generation FROM session_execution_boundaries
+                WHERE session_id = ?
+                """,
+                (session_id,),
+            ).fetchone()
+        return int(row[0]) if row is not None else 0
+
+    def begin_or_resume_stop_request(self, session_id: str) -> StopRequest:
+        timestamp = _now()
+        with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            self._require_session(connection, session_id)
+            connection.execute(
+                """
+                INSERT INTO session_execution_boundaries (
+                    session_id, generation, stopped_generation, updated_at
+                ) VALUES (?, 0, NULL, ?)
+                ON CONFLICT(session_id) DO NOTHING
+                """,
+                (session_id, timestamp),
+            )
+            row = connection.execute(
+                """
+                SELECT generation FROM session_execution_boundaries
+                WHERE session_id = ?
+                """,
+                (session_id,),
+            ).fetchone()
+            generation = int(row[0]) if row is not None else 0
+            existing = connection.execute(
+                """
+                SELECT request_id, status FROM session_stop_requests
+                WHERE session_id = ? AND generation = ?
+                """,
+                (session_id, generation),
+            ).fetchone()
+            if existing is None:
+                request_id = f"stop_{uuid4().hex}"
+                connection.execute(
+                    """
+                    INSERT INTO session_stop_requests (
+                        session_id, generation, request_id, status,
+                        created_at, updated_at
+                    ) VALUES (?, ?, ?, 'pending', ?, ?)
+                    """,
+                    (session_id, generation, request_id, timestamp, timestamp),
+                )
+                status = "pending"
+            else:
+                request_id = str(existing[0])
+                status = str(existing[1])
+        return StopRequest(
+            session_id=session_id,
+            generation=generation,
+            request_id=request_id,
+            status=status,
+        )
+
+    def stop_request_is_pending(self, session_id: str, generation: int) -> bool:
+        with self._connect() as connection:
+            row = connection.execute(
+                """
+                SELECT status FROM session_stop_requests
+                WHERE session_id = ? AND generation = ?
+                """,
+                (session_id, generation),
+            ).fetchone()
+        return bool(row is not None and row[0] == "pending")
+
     def execution_generation_is_stopped(self, session_id: str) -> bool:
         with self._connect() as connection:
             row = connection.execute(
@@ -526,6 +633,28 @@ class WebSessionStore:
                 (session_id,),
             ).fetchone()
         return bool(row is not None and row[1] is not None and row[0] == row[1])
+
+    def execution_generation_is_fenced(self, session_id: str) -> bool:
+        with self._connect() as connection:
+            row = connection.execute(
+                """
+                SELECT boundary.generation, boundary.stopped_generation,
+                       stop.status
+                FROM session_execution_boundaries AS boundary
+                LEFT JOIN session_stop_requests AS stop
+                  ON stop.session_id = boundary.session_id
+                 AND stop.generation = boundary.generation
+                WHERE boundary.session_id = ?
+                """,
+                (session_id,),
+            ).fetchone()
+        return bool(
+            row is not None
+            and (
+                (row[1] is not None and row[0] == row[1])
+                or row[2] == "pending"
+            )
+        )
 
     def finish_tool_run(
         self,
@@ -541,6 +670,8 @@ class WebSessionStore:
         finished_at = _now()
         with self._connect() as connection:
             connection.execute("BEGIN IMMEDIATE")
+            if self._pending_stop_for_current_generation(connection, session_id):
+                return None
             cursor = connection.execute(
                 """
                 UPDATE public_tool_runs
@@ -577,6 +708,8 @@ class WebSessionStore:
         with self._connect() as connection:
             connection.execute("BEGIN IMMEDIATE")
             self._require_session(connection, session_id)
+            if self._pending_stop_for_current_generation(connection, session_id):
+                return None
             cursor = connection.execute(
                 """
                 UPDATE public_tool_runs
@@ -680,6 +813,8 @@ class WebSessionStore:
             [PublicToolRun],
             tuple[str, dict[str, Any]],
         ],
+        *,
+        stop_request_id: str | None = None,
     ) -> tuple[list[PublicToolRun], list[PublicEventRecord]]:
         """Stop every running tool and append its terminal event atomically."""
         finished_at = _now()
@@ -696,6 +831,20 @@ class WebSessionStore:
                 (session_id,),
             ).fetchone()
             generation = int(generation_row[0]) if generation_row is not None else 0
+            if stop_request_id is not None:
+                request_row = connection.execute(
+                    """
+                    SELECT generation, status FROM session_stop_requests
+                    WHERE session_id = ? AND request_id = ?
+                    """,
+                    (session_id, stop_request_id),
+                ).fetchone()
+                if request_row is None:
+                    raise RuntimeError("stop request does not exist")
+                if int(request_row[0]) != generation:
+                    raise RuntimeError("stop request generation changed")
+                if request_row[1] == "complete":
+                    return [], []
             connection.execute(
                 """
                 INSERT INTO tool_execution_provenance (
@@ -752,8 +901,6 @@ class WebSessionStore:
                 """,
                 (session_id, finished_at),
             )
-            if not stopped:
-                return [], []
             sequence = int(
                 connection.execute(
                     """
@@ -796,8 +943,51 @@ class WebSessionStore:
                 )
                 records.append(record)
                 sequence += 1
+            if stop_request_id is not None:
+                connection.execute(
+                    """
+                    UPDATE session_stop_requests
+                    SET status = 'complete', updated_at = ?
+                    WHERE session_id = ? AND request_id = ? AND status = 'pending'
+                    """,
+                    (finished_at, session_id, stop_request_id),
+                )
             self._touch_session(connection, session_id, finished_at)
         return stopped, records
+
+    def complete_stop_request_with_terminal_events(
+        self,
+        session_id: str,
+        request_id: str,
+        terminal_event_factory: Callable[
+            [PublicToolRun],
+            tuple[str, dict[str, Any]],
+        ],
+    ) -> tuple[list[PublicToolRun], list[PublicEventRecord]]:
+        return self.stop_open_tool_runs_with_terminal_events(
+            session_id,
+            terminal_event_factory,
+            stop_request_id=request_id,
+        )
+
+    @staticmethod
+    def _pending_stop_for_current_generation(
+        connection: sqlite3.Connection,
+        session_id: str,
+    ) -> bool:
+        row = connection.execute(
+            """
+            SELECT 1
+            FROM session_stop_requests AS stop
+            JOIN session_execution_boundaries AS boundary
+              ON boundary.session_id = stop.session_id
+             AND boundary.generation = stop.generation
+            WHERE stop.session_id = ? AND stop.status = 'pending'
+            LIMIT 1
+            """,
+            (session_id,),
+        ).fetchone()
+        return row is not None
 
     def mark_human_decision_consumed(
         self,
@@ -869,6 +1059,10 @@ class WebSessionStore:
             connection.execute("DELETE FROM public_tool_runs WHERE session_id = ?", (session_id,))
             connection.execute(
                 "DELETE FROM tool_execution_provenance WHERE session_id = ?",
+                (session_id,),
+            )
+            connection.execute(
+                "DELETE FROM session_stop_requests WHERE session_id = ?",
                 (session_id,),
             )
             connection.execute(

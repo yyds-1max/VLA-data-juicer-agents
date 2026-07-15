@@ -335,6 +335,46 @@ describe("AgentScope conversation reduction", () => {
     },
   );
 
+  it("keeps one tool row when native and terminal IDs contain private identity text", () => {
+    const privateIdentity = "internal-nav-session";
+    const replyId = `reply-${privateIdentity}`;
+    const toolCallId = `call-${privateIdentity}`;
+    const restored = restoreAgentConversation({
+      messages: [],
+      events: [
+        envelope(1, replyStart(replyId)),
+        envelope(2, toolCallStart(replyId, toolCallId, "extract")),
+        envelope(
+          3,
+          custom("datapilot_tool_terminal", {
+            tool_call_id: toolCallId,
+            status: "success",
+            summary: "done",
+            error_type: null,
+          }),
+        ),
+        envelope(4, replyEnd(replyId)),
+      ],
+      toolRuns: [
+        toolRun({
+          tool_call_id: toolCallId,
+          status: "success",
+          summary: "done",
+          finished_at: CREATED_AT,
+        }),
+      ],
+      lastSequence: 4,
+    });
+
+    expect(Object.keys(restored.toolRuns)).toEqual([toolCallId]);
+    expect(restored.toolRuns[toolCallId]).toMatchObject({
+      tool_call_id: toolCallId,
+      status: "success",
+    });
+    expect(restored.messages).toHaveLength(1);
+    expect(restored.messages[0]).toMatchObject({ id: replyId });
+  });
+
   it.each([
     { tool_call_id: "call-1", status: "running" },
     { tool_call_id: "call-1", status: "unknown" },

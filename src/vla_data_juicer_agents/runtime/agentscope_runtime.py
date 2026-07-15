@@ -62,6 +62,7 @@ from vla_data_juicer_agents.runtime.datapilot_projection import (
 from vla_data_juicer_agents.runtime.navigation_tool_surface import (
     NavigationToolSurfaceMiddleware,
 )
+from vla_data_juicer_agents.runtime.stop_coordinator import OwnerLease, StopCoordinator
 from vla_data_juicer_agents.web.schemas import InterruptResponse
 
 _WAKEUP_RECOVERY_INTERVAL_SECS = 5.0
@@ -98,6 +99,22 @@ class _CancellationLease:
     generation: int | None = None
     foreground_refs: int = 1
     tool_call_ids: set[str] = field(default_factory=set)
+    quiescent: asyncio.Event = field(default_factory=asyncio.Event)
+
+    def sync_quiescence(self) -> None:
+        if self.foreground_refs == 0 and not self.tool_call_ids:
+            self.quiescent.set()
+        else:
+            self.quiescent.clear()
+
+    async def wait_for_quiescence(self, timeout: float) -> bool:
+        deadline = asyncio.get_running_loop().time() + timeout
+        try:
+            await asyncio.wait_for(self.quiescent.wait(), timeout=timeout)
+        except TimeoutError:
+            return False
+        remaining = max(0.0, deadline - asyncio.get_running_loop().time())
+        return await self.cancellation.wait_for_quiescence(timeout=remaining)
 
 
 class _StopAwareMessageBus:
@@ -162,11 +179,35 @@ class AgentScopeRuntime:
     _active_human_decision_claims: set[str] = field(default_factory=set)
     _run_cancellations: dict[str, list[_CancellationLease]] = field(default_factory=dict)
     _tool_outcome_locks: dict[str, asyncio.Lock] = field(default_factory=dict)
+    _stop_locks: dict[str, asyncio.Lock] = field(default_factory=dict)
     recovery_metrics: AgentScopeRecoveryMetrics = field(default_factory=AgentScopeRecoveryMetrics)
     bootstrapped: bool = False
+    runtime_id: str = field(default_factory=lambda: uuid4().hex)
+    stop_coordinator: StopCoordinator | None = field(default=None, init=False)
 
     def __post_init__(self) -> None:
         self._bootstrap_lock = asyncio.Lock()
+        required_bus_methods = (
+            "publish",
+            "subscribe",
+            "registry_set",
+            "registry_del",
+            "registry_getall",
+        )
+        if all(callable(getattr(self.message_bus, name, None)) for name in required_bus_methods):
+            self.stop_coordinator = StopCoordinator(
+                self.message_bus,
+                self._stop_owner_leases,
+                runtime_id=self.runtime_id,
+            )
+
+    async def start_stop_coordinator(self) -> None:
+        if self.stop_coordinator is not None:
+            await self.stop_coordinator.start()
+
+    async def stop_stop_coordinator(self) -> None:
+        if self.stop_coordinator is not None:
+            await self.stop_coordinator.stop()
 
     async def ensure_bootstrapped(self) -> None:
         if self.bootstrapped:
@@ -359,13 +400,15 @@ class AgentScopeRuntime:
             public_session_id,
             tool_call_id,
         )
-        return status == "stopped"
+        return status == "stopped" or self.web_session_store.execution_generation_is_fenced(
+            public_session_id
+        )
 
     def should_suppress_wakeup(self, agentscope_session_id: str) -> bool:
         public_session_id = self._public_session_id(agentscope_session_id)
         if public_session_id is None or self.web_session_store is None:
             return False
-        return self.web_session_store.execution_generation_is_stopped(
+        return self.web_session_store.execution_generation_is_fenced(
             public_session_id
         )
 
@@ -418,6 +461,13 @@ class AgentScopeRuntime:
         if lock is None:
             lock = asyncio.Lock()
             self._tool_outcome_locks[public_session_id] = lock
+        return lock
+
+    def _stop_lock(self, public_session_id: str) -> asyncio.Lock:
+        lock = self._stop_locks.get(public_session_id)
+        if lock is None:
+            lock = asyncio.Lock()
+            self._stop_locks[public_session_id] = lock
         return lock
 
     def _public_session_id(self, agentscope_session_id: str) -> str | None:
@@ -544,6 +594,7 @@ class AgentScopeRuntime:
     async def submit_user_message(self, *, web_session_id: str, message: str) -> str:
         await self.ensure_bootstrapped()
 
+        turn_id = f"turn_{uuid4()}"
         agent_id = self._agent_id_for_user_message(web_session_id=web_session_id)
         model = (
             self.config.navigation_model
@@ -555,8 +606,9 @@ class AgentScopeRuntime:
             agent_id=agent_id,
             model=model,
             message=message,
+            turn_id=turn_id,
         )
-        return f"turn_{uuid4()}"
+        return turn_id
 
     def _agent_id_for_user_message(self, *, web_session_id: str) -> str:
         mapped = self._web_session_mapping(web_session_id)
@@ -664,6 +716,7 @@ class AgentScopeRuntime:
         agent_id: str,
         model: str,
         message: str,
+        turn_id: str | None = None,
     ) -> str:
         chat_service = self.app.state.chat_service
         session_id = await self.ensure_web_session(
@@ -671,9 +724,6 @@ class AgentScopeRuntime:
             agent_id=agent_id,
             model=model,
         )
-        generation = None
-        if self.web_session_store is not None:
-            generation = self.web_session_store.begin_execution_generation(web_session_id)
         if agent_id == self.config.navigation_agent_id:
             anchor = self._navigation_durable_state_anchor(
                 session_id,
@@ -688,7 +738,6 @@ class AgentScopeRuntime:
         self.register_run_cancellation(
             session_id,
             cancellation,
-            generation=generation,
         )
 
         async def run_with_cancellation() -> None:
@@ -705,13 +754,94 @@ class AgentScopeRuntime:
                 self.clear_run_cancellation(session_id, cancellation)
 
         try:
-            self._spawn_chat_run(run_with_cancellation(), session_id=session_id)
+            task = self._spawn_chat_run(
+                run_with_cancellation(),
+                session_id=session_id,
+            )
         except Exception:
             self.clear_run_cancellation(session_id, cancellation)
             raise
+        if turn_id is not None:
+            self._attach_user_turn_terminal(
+                task,
+                web_session_id=web_session_id,
+                turn_id=turn_id,
+            )
         return session_id
 
+    def _attach_user_turn_terminal(
+        self,
+        task: Any,
+        *,
+        web_session_id: str,
+        turn_id: str,
+    ) -> None:
+        add_done_callback = getattr(task, "add_done_callback", None)
+        if not callable(add_done_callback):
+            return
+
+        def record_after_registry_cleanup(completed: asyncio.Task) -> None:
+            if completed.cancelled():
+                status = "stopped"
+            else:
+                status = "failure" if completed.exception() is not None else "success"
+            record_task = completed.get_loop().create_task(
+                self._record_user_turn_terminal(
+                    web_session_id=web_session_id,
+                    turn_id=turn_id,
+                    status=status,
+                ),
+                name=f"datapilot-run-terminal:{turn_id}",
+            )
+            record_task.add_done_callback(self._log_run_terminal_failure)
+
+        # AgentScope's registry installs its cleanup callback inside spawn().
+        # Registering this callback afterwards guarantees the registry entry is
+        # gone before the public terminal is persisted and published.
+        add_done_callback(record_after_registry_cleanup)
+
+    @staticmethod
+    def _log_run_terminal_failure(task: asyncio.Task) -> None:
+        try:
+            task.result()
+        except asyncio.CancelledError:
+            return
+        except Exception:  # pylint: disable=broad-except
+            _logger.exception("Failed to persist DataPilot run terminal")
+
+    async def _record_user_turn_terminal(
+        self,
+        *,
+        web_session_id: str,
+        turn_id: str,
+        status: str,
+    ) -> Any | None:
+        if self.web_session_store is None:
+            return None
+        event = CustomEvent(
+            name="datapilot_run_terminal",
+            value={"turn_id": turn_id, "status": status},
+        ).model_dump(mode="json")
+        identity = f"run-terminal:{web_session_id}:{turn_id}"
+        record = self.web_session_store.append_public_event(
+            web_session_id,
+            hashlib.sha256(identity.encode("utf-8")).hexdigest(),
+            event,
+        )
+        await self._publish_public_record(web_session_id, record)
+        return record
+
     async def interrupt_web_session(
+        self,
+        *,
+        web_session_id: str,
+    ) -> InterruptResponse:
+        async with self._stop_lock(web_session_id):
+            return await self._interrupt_web_session_serialized(
+                web_session_id=web_session_id,
+            )
+
+    async def _interrupt_web_session_serialized(
         self,
         *,
         web_session_id: str,
@@ -720,58 +850,113 @@ class AgentScopeRuntime:
         if not mappings and self.web_session_store is None:
             return InterruptResponse(interrupted=False)
 
-        records = []
-        async with self._tool_outcome_lock(web_session_id):
-            interrupted = bool(mappings)
+        stop_request = (
+            self.web_session_store.begin_or_resume_stop_request(web_session_id)
+            if self.web_session_store is not None
+            else None
+        )
+        coordinator_active = bool(
+            stop_request is not None
+            and self.stop_coordinator is not None
+            and self.stop_coordinator.started
+        )
+        interrupted = bool(mappings)
+        if coordinator_active:
+            assert stop_request is not None
+            assert self.stop_coordinator is not None
+            detail = self.web_session_store.get_session(web_session_id)
+            require_owner = bool(
+                detail is not None
+                and any(row.status == "running" for row in detail.tool_runs)
+            )
+            expected_owners = await self.stop_coordinator.snapshot_expected_owners(
+                [session_id for _agent_id, session_id in mappings],
+                stop_request.generation,
+            )
+            try:
+                await self.stop_coordinator.request_and_wait(
+                    request_id=stop_request.request_id,
+                    target_generation=stop_request.generation,
+                    agentscope_session_ids=[
+                        session_id for _agent_id, session_id in mappings
+                    ],
+                    require_owner=require_owner,
+                    expected_owners=expected_owners,
+                )
+            except TimeoutError as exc:
+                raise RuntimeError(
+                    "explicit stop owner acknowledgement failed"
+                ) from exc
+        else:
+            local_cancellations = {
+                lease.cancellation
+                for _agent_id, agentscope_session_id in mappings
+                for lease in self._run_cancellations.get(agentscope_session_id, [])
+                if stop_request is None
+                or lease.generation is None
+                or lease.generation <= stop_request.generation
+            }
             for _agent_id, agentscope_session_id in mappings:
                 interrupted = (
                     self.cancel_run_cancellations(agentscope_session_id)
                     or interrupted
                 )
-
-            failures: list[Exception] = []
-            chat_service = self.app.state.chat_service
-            for agent_id, agentscope_session_id in mappings:
-                try:
-                    await chat_service.interrupt(
-                        self.config.user_id,
-                        agentscope_session_id,
-                        agent_id,
+            if local_cancellations:
+                workers_done = await asyncio.gather(
+                    *(
+                        cancellation.wait_for_workers(timeout=10.0)
+                        for cancellation in local_cancellations
                     )
-                except LookupError:
-                    # Historical mappings can outlive an AgentScope session.
+                )
+                if not all(workers_done):
+                    raise RuntimeError("explicit stop worker did not quiesce")
+
+        failures: list[Exception] = []
+        chat_service = self.app.state.chat_service
+        for agent_id, agentscope_session_id in mappings:
+            try:
+                await chat_service.interrupt(
+                    self.config.user_id,
+                    agentscope_session_id,
+                    agent_id,
+                )
+            except LookupError:
+                # Historical mappings can outlive an AgentScope session.
+                continue
+            except Exception as exc:  # pylint: disable=broad-except
+                failures.append(exc)
+
+        cancelled_task_ids: set[str] = set()
+        for _agent_id, agentscope_session_id in mappings:
+            try:
+                tasks = await self.message_bus.registry_getall(
+                    MessageBusKeys.bg_tasks(agentscope_session_id),
+                )
+            except Exception as exc:  # pylint: disable=broad-except
+                failures.append(exc)
+                continue
+            for task_id in tasks:
+                if task_id in cancelled_task_ids:
                     continue
+                cancelled_task_ids.add(task_id)
+                try:
+                    await self.message_bus.publish(
+                        MessageBusKeys.task_cancel_channel(),
+                        {"task_id": task_id},
+                    )
                 except Exception as exc:  # pylint: disable=broad-except
                     failures.append(exc)
 
-            cancelled_task_ids: set[str] = set()
+        if failures:
+            raise RuntimeError("explicit stop cancellation failed") from failures[0]
+
+        if self.web_session_store is None:
             for _agent_id, agentscope_session_id in mappings:
-                try:
-                    tasks = await self.message_bus.registry_getall(
-                        MessageBusKeys.bg_tasks(agentscope_session_id),
-                    )
-                except Exception as exc:  # pylint: disable=broad-except
-                    failures.append(exc)
-                    continue
-                for task_id in tasks:
-                    if task_id in cancelled_task_ids:
-                        continue
-                    cancelled_task_ids.add(task_id)
-                    try:
-                        await self.message_bus.publish(
-                            MessageBusKeys.task_cancel_channel(),
-                            {"task_id": task_id},
-                        )
-                    except Exception as exc:  # pylint: disable=broad-except
-                        failures.append(exc)
+                self.discard_run_cancellations(agentscope_session_id)
+            return InterruptResponse(interrupted=interrupted)
 
-            if failures:
-                raise RuntimeError("explicit stop cancellation failed") from failures[0]
-
-            if self.web_session_store is None:
-                for _agent_id, agentscope_session_id in mappings:
-                    self.discard_run_cancellations(agentscope_session_id)
-                return InterruptResponse(interrupted=interrupted)
+        records = []
+        async with self._tool_outcome_lock(web_session_id):
             def terminal_event(row: Any) -> tuple[str, dict[str, Any]]:
                 event = CustomEvent(
                     name="datapilot_tool_terminal",
@@ -787,12 +972,21 @@ class AgentScopeRuntime:
                 )
                 return hashlib.sha256(identity.encode("utf-8")).hexdigest(), event
 
-            stopped, records = (
-                self.web_session_store.stop_open_tool_runs_with_terminal_events(
-                    web_session_id,
-                    terminal_event,
+            if stop_request is None:
+                stopped, records = (
+                    self.web_session_store.stop_open_tool_runs_with_terminal_events(
+                        web_session_id,
+                        terminal_event,
+                    )
                 )
-            )
+            else:
+                stopped, records = (
+                    self.web_session_store.complete_stop_request_with_terminal_events(
+                        web_session_id,
+                        stop_request.request_id,
+                        terminal_event,
+                    )
+                )
             for _agent_id, agentscope_session_id in mappings:
                 self.discard_run_cancellations(agentscope_session_id)
             if interrupted or stopped:
@@ -868,6 +1062,7 @@ class AgentScopeRuntime:
         for lease in leases:
             if lease.cancellation is cancellation:
                 lease.foreground_refs += 1
+                lease.sync_quiescence()
                 if generation is not None:
                     lease.generation = generation
                 return
@@ -889,6 +1084,41 @@ class AgentScopeRuntime:
             None,
         )
 
+    def admit_user_execution_generation(
+        self,
+        agentscope_session_id: str,
+        cancellation: CancellationContext,
+    ) -> int | None:
+        """Advance a stopped boundary after AgentScope admits a user run.
+
+        The run-boundary middleware calls this only for ``UserMsg`` inputs,
+        after ChatService owns the distributed session-run lock.  A lease keeps
+        the operation idempotent if middleware is re-entered for the same run.
+        """
+        public_session_id = self._public_session_id(agentscope_session_id)
+        if public_session_id is None or self.web_session_store is None:
+            return None
+        lease = next(
+            (
+                item
+                for item in self._run_cancellations.get(
+                    agentscope_session_id,
+                    [],
+                )
+                if item.cancellation is cancellation
+            ),
+            None,
+        )
+        if lease is None:
+            raise RuntimeError(
+                "AgentScope user run must register cancellation before admission"
+            )
+        if lease.generation is None:
+            lease.generation = self.web_session_store.begin_execution_generation(
+                public_session_id
+            )
+        return lease.generation
+
     def retain_tool_cancellation(
         self,
         agentscope_session_id: str,
@@ -906,7 +1136,31 @@ class AgentScopeRuntime:
                 foreground_refs=0,
             )
             leases.append(lease)
+        if lease.generation is None:
+            public_session_id = self._public_session_id(agentscope_session_id)
+            current_generation = getattr(
+                self.web_session_store,
+                "current_execution_generation",
+                None,
+            )
+            if public_session_id is not None and callable(current_generation):
+                lease.generation = current_generation(public_session_id)
         lease.tool_call_ids.add(tool_call_id)
+        lease.sync_quiescence()
+
+    def _stop_owner_leases(self) -> list[OwnerLease]:
+        return [
+            OwnerLease(
+                agentscope_session_id=agentscope_session_id,
+                generation=lease.generation,
+                cancellation=lease.cancellation,
+                tool_call_ids=frozenset(lease.tool_call_ids),
+                wait_for_quiescence=lease.wait_for_quiescence,
+            )
+            for agentscope_session_id, leases in self._run_cancellations.items()
+            for lease in leases
+            if lease.generation is not None
+        ]
 
     def release_tool_cancellation(
         self,
@@ -917,6 +1171,7 @@ class AgentScopeRuntime:
         for lease in self._run_cancellations.get(agentscope_session_id, []):
             if lease.cancellation is cancellation:
                 lease.tool_call_ids.discard(tool_call_id)
+                lease.sync_quiescence()
                 break
         self._prune_run_cancellations(agentscope_session_id)
 
@@ -943,14 +1198,28 @@ class AgentScopeRuntime:
         for lease in self._run_cancellations.get(agentscope_session_id, []):
             if lease.cancellation is cancellation:
                 lease.foreground_refs = max(0, lease.foreground_refs - 1)
+                lease.sync_quiescence()
                 break
         self._prune_run_cancellations(agentscope_session_id)
 
     def _prune_run_cancellations(self, agentscope_session_id: str) -> None:
+        public_session_id = self._public_session_id(agentscope_session_id)
+
+        def pending_stop(lease: _CancellationLease) -> bool:
+            return bool(
+                public_session_id is not None
+                and self.web_session_store is not None
+                and lease.generation is not None
+                and self.web_session_store.stop_request_is_pending(
+                    public_session_id,
+                    lease.generation,
+                )
+            )
+
         leases = [
             lease
             for lease in self._run_cancellations.get(agentscope_session_id, [])
-            if lease.foreground_refs > 0 or lease.tool_call_ids
+            if lease.foreground_refs > 0 or lease.tool_call_ids or pending_stop(lease)
         ]
         if leases:
             self._run_cancellations[agentscope_session_id] = leases
@@ -1589,13 +1858,13 @@ class AgentScopeRuntime:
 
         return _HumanDecisionClaim(release_local)
 
-    def _spawn_chat_run(self, run_coroutine: Any, *, session_id: str) -> None:
+    def _spawn_chat_run(self, run_coroutine: Any, *, session_id: str) -> Any:
         chat_run_registry = getattr(self.app.state, "chat_run_registry", None)
         if chat_run_registry is None:
             run_coroutine.close()
             raise RuntimeError("AgentScope chat_run_registry is not initialized")
         try:
-            chat_run_registry.spawn(run_coroutine, session_id=session_id)
+            return chat_run_registry.spawn(run_coroutine, session_id=session_id)
         except Exception:
             run_coroutine.close()
             raise

@@ -397,6 +397,63 @@ def test_execution_stop_boundary_survives_restart_and_new_generation_clears_it(
         ).fetchone() == (0,)
 
 
+def test_pending_stop_is_durable_retryable_and_blocks_generation_and_tool_outcome(
+    tmp_path: Path,
+) -> None:
+    store = WebSessionStore(tmp_path / "sessions.sqlite")
+    session = store.create_session("durable pending stop")
+    generation = store.begin_execution_generation(session.id)
+    store.start_tool_run(session.id, "call-1", "extract", "2026-07-15T00:00:00Z")
+
+    first = store.begin_or_resume_stop_request(session.id)
+    restarted = WebSessionStore(store.db_path)
+    retry = restarted.begin_or_resume_stop_request(session.id)
+
+    assert first == retry
+    assert first.generation == generation
+    assert restarted.stop_request_is_pending(session.id, generation) is True
+    with pytest.raises(RuntimeError, match="stop request is pending"):
+        restarted.begin_execution_generation(session.id)
+    assert restarted.finish_tool_run(
+        session.id,
+        "call-1",
+        status="success",
+    ) is None
+    detail = restarted.get_session(session.id)
+    assert detail is not None
+    assert detail.tool_runs[0].status == "running"
+
+
+def test_complete_stop_request_atomically_stops_tools_and_is_idempotent(tmp_path: Path) -> None:
+    store = WebSessionStore(tmp_path / "sessions.sqlite")
+    session = store.create_session("complete durable stop")
+    store.begin_execution_generation(session.id)
+    store.start_tool_run(session.id, "call-1", "extract", "2026-07-15T00:00:00Z")
+    request = store.begin_or_resume_stop_request(session.id)
+
+    stopped, records = store.complete_stop_request_with_terminal_events(
+        session.id,
+        request.request_id,
+        lambda row: (
+            _digest(f"stop:{row.tool_call_id}"),
+            {
+                "name": "datapilot_tool_terminal",
+                "value": {"tool_call_id": row.tool_call_id, "status": "stopped"},
+            },
+        ),
+    )
+    repeated = store.complete_stop_request_with_terminal_events(
+        session.id,
+        request.request_id,
+        lambda _row: pytest.fail("completed stop must not emit again"),
+    )
+
+    assert [row.status for row in stopped] == ["stopped"]
+    assert len(records) == 1
+    assert repeated == ([], [])
+    assert store.execution_generation_is_stopped(session.id) is True
+    assert store.stop_request_is_pending(session.id, request.generation) is False
+
 def test_existing_v1_schema_adds_stop_boundary_table_without_resetting_sessions(
     tmp_path: Path,
 ):

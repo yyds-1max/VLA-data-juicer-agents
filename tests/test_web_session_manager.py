@@ -2,8 +2,8 @@ from pathlib import Path
 
 import pytest
 
-from vla_data_juicer_agents.web.session_manager import WebSessionManager
 from vla_data_juicer_agents.web.session_store import WebSessionStore
+from web_legacy_app import WebSessionManager
 
 
 class FakeController:
