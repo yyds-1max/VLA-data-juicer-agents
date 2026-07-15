@@ -4,8 +4,6 @@ import os
 import sys
 from types import SimpleNamespace
 
-import pytest
-
 from vla_data_juicer_agents.web.cli import _agentscope_runtime_from_env, main
 
 
@@ -13,11 +11,7 @@ def test_main_sets_env_and_delegates_to_uvicorn(monkeypatch):
     calls = []
     fake_uvicorn = SimpleNamespace(run=lambda *args, **kwargs: calls.append((args, kwargs)))
     monkeypatch.setitem(sys.modules, "uvicorn", fake_uvicorn)
-    monkeypatch.delenv("VLA_AGENT_ENABLE_AGENTSCOPE", raising=False)
-    monkeypatch.setattr(
-        "vla_data_juicer_agents.web.cli._agentscope_runtime_from_env",
-        lambda _working_dir: SimpleNamespace(),
-    )
+    monkeypatch.setenv("VLA_AGENT_ENABLE_AGENTSCOPE", "0")
     monkeypatch.delenv("VLA_DATA_AGENT_WEB_WORKING_DIR", raising=False)
     monkeypatch.delenv("VLA_DATA_AGENT_WEB_MODEL", raising=False)
     monkeypatch.delenv("VLA_DATA_AGENT_WEB_FRONTEND_DIST", raising=False)
@@ -61,11 +55,7 @@ def test_main_clears_stale_model_env_when_model_not_passed(monkeypatch):
     calls = []
     fake_uvicorn = SimpleNamespace(run=lambda *args, **kwargs: calls.append((args, kwargs)))
     monkeypatch.setitem(sys.modules, "uvicorn", fake_uvicorn)
-    monkeypatch.delenv("VLA_AGENT_ENABLE_AGENTSCOPE", raising=False)
-    monkeypatch.setattr(
-        "vla_data_juicer_agents.web.cli._agentscope_runtime_from_env",
-        lambda _working_dir: SimpleNamespace(),
-    )
+    monkeypatch.setenv("VLA_AGENT_ENABLE_AGENTSCOPE", "0")
     monkeypatch.delenv("VLA_DATA_AGENT_WEB_WORKING_DIR", raising=False)
     monkeypatch.setenv("VLA_DATA_AGENT_WEB_MODEL", "stale-model")
     monkeypatch.setenv("VLA_DATA_AGENT_WEB_FRONTEND_DIST", "stale-dist")
@@ -79,11 +69,10 @@ def test_main_clears_stale_model_env_when_model_not_passed(monkeypatch):
     assert "VLA_DATA_AGENT_WEB_FRONTEND_DIST" not in os.environ
 
 
-def test_agentscope_runtime_from_env_rejects_legacy_disable_switch(monkeypatch):
+def test_agentscope_runtime_from_env_returns_none_when_disabled(monkeypatch):
     monkeypatch.setenv("VLA_AGENT_ENABLE_AGENTSCOPE", " FALSE ")
 
-    with pytest.raises(RuntimeError, match="AgentScope"):
-        _agentscope_runtime_from_env("/tmp/djx")
+    assert _agentscope_runtime_from_env("/tmp/djx") is None
 
 
 def test_main_returns_nonzero_with_clear_agentscope_config_error(monkeypatch, capsys):

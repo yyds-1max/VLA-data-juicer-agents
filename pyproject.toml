@@ -9,7 +9,7 @@ description = "LLM-backed navigation data processing agents for VLA data workflo
 readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
-    "agentscope==2.0.4",
+    "agentscope==2.0.1",
     "apscheduler>=3.10",
     "fastapi>=0.115",
     "openai>=1.0",

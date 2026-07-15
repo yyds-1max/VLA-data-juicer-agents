@@ -1,10 +1,10 @@
-import type { AgentEvent } from "@agentscope-ai/agentscope/event";
-
+export type SessionStatus = "draft" | "active" | "historical";
 export type MessageRole = "user" | "assistant" | "system";
 
 export interface SessionRecord {
   id: string;
   title: string;
+  status: SessionStatus;
   created_at: string;
   updated_at: string;
 }
@@ -17,33 +17,25 @@ export interface ChatMessageRecord {
   created_at: string;
 }
 
-export interface PublicEventEnvelope {
+export interface TimelineEventRecord extends AgentEvent {
   id: string;
   session_id: string;
-  sequence: number;
-  dedupe_key: string;
-  event: AgentEvent;
+  seq: number;
   created_at: string;
-}
-
-export type PublicToolStatus = "running" | "success" | "failure" | "stopped";
-
-export interface PublicToolRun {
-  session_id: string;
-  tool_call_id: string;
-  tool_name: string;
-  status: PublicToolStatus;
-  summary: string;
-  error_type: string | null;
-  started_at: string;
-  finished_at: string | null;
 }
 
 export interface SessionDetail extends SessionRecord {
   messages: ChatMessageRecord[];
-  events: PublicEventEnvelope[];
-  tool_runs: PublicToolRun[];
-  last_sequence: number;
+  events?: TimelineEventRecord[];
+}
+
+export interface AgentEvent {
+  type: string;
+  source?: string | null;
+  run_id?: string | null;
+  parent_run_id?: string | null;
+  timestamp?: string | null;
+  payload: Record<string, unknown>;
 }
 
 export type HumanDecisionAction = "confirm" | "stop" | "guide";
@@ -54,7 +46,6 @@ export interface PendingHumanDecision {
   requestId: string;
   decisionType: string;
   summary: string;
-  options?: string[];
   planId?: string;
   stepId?: string;
   recoveryRequired?: boolean;

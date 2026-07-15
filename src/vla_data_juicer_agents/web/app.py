@@ -4,14 +4,12 @@ import asyncio
 import inspect
 import logging
 import os
-import sqlite3
-from collections.abc import Callable
 from contextlib import asynccontextmanager, suppress
 from pathlib import Path
 from typing import Any
 
-from fastapi import FastAPI, HTTPException, Request, Response
-from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
+from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
+from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 
 from vla_data_juicer_agents.navigation.dataset_catalog import (
@@ -20,62 +18,32 @@ from vla_data_juicer_agents.navigation.dataset_catalog import (
     scan_navigation_dataset,
     scan_navigation_date,
 )
-from vla_data_juicer_agents.web.agent_session import (
-    AgentScopeWebSessionManager,
-    TurnSessionBusy,
-    TurnSubmissionPending,
-    TurnSubmissionResult,
-)
+from vla_data_juicer_agents.tui.controller import SessionController
 from vla_data_juicer_agents.web.event_stream import SessionEventBus
 from vla_data_juicer_agents.web.schemas import (
-    CreateSessionRequest,
     CreateSessionResponse,
+    CreateTurnRequest,
     CreateTurnResponse,
     HumanDecisionRequest,
     HumanDecisionRecoveryRequest,
     HumanDecisionRecoveryResponse,
     HumanDecisionResponse,
     InterruptResponse,
-    PublicEventRecord,
-    SubmitTurnRequest,
 )
+from vla_data_juicer_agents.web.agent_session import AgentScopeWebSessionManager
+from vla_data_juicer_agents.web.session_manager import ControllerFactory, WebSessionManager
 from vla_data_juicer_agents.web.session_store import WebSessionStore
-from vla_data_juicer_agents.web.sse import iter_sse
 
 logger = logging.getLogger(__name__)
-SESSION_DELETE_ERROR = {
-    "code": "session_delete_failed",
-    "message": "DataPilot could not delete this session. Please retry.",
-}
-SESSION_CREATION_CONFLICT = {
-    "code": "session_creation_conflict",
-    "message": "This session creation request conflicts with an existing request.",
-}
-TURN_SUBMISSION_ERROR = {
-    "code": "turn_submission_failed",
-    "message": "DataPilot could not submit this turn. Please retry.",
-}
-HUMAN_DECISION_ERROR = {
-    "code": "human_decision_failed",
-    "message": "DataPilot could not apply this human decision.",
-}
-HUMAN_DECISION_RECOVERY_ERROR = {
-    "code": "human_decision_recovery_failed",
-    "message": "DataPilot could not recover this human decision handoff.",
-}
-INTERNAL_ERROR = {
-    "code": "internal_error",
-    "message": "DataPilot could not complete this request.",
-}
 
 
 def create_app(
     working_dir: str | None = None,
     model: str | None = None,
     db_path: str | Path | None = None,
+    controller_factory: ControllerFactory = SessionController,
     frontend_dist: str | Path | None = None,
     agentscope_runtime: Any | None = None,
-    sse_heartbeat_seconds: float = 15.0,
 ) -> FastAPI:
     if working_dir is None:
         working_dir = os.environ.get("VLA_DATA_AGENT_WEB_WORKING_DIR", "./.djx")
@@ -84,48 +52,26 @@ def create_app(
     if frontend_dist is None:
         frontend_dist = os.environ.get("VLA_DATA_AGENT_WEB_FRONTEND_DIST") or None
 
-    if agentscope_runtime is None:
-        raise RuntimeError(
-            "AgentScope runtime is required for the production Web application"
-        )
-
-    return _create_app_for_manager(
-        working_dir=working_dir,
-        db_path=db_path,
-        frontend_dist=frontend_dist,
-        agentscope_runtime=agentscope_runtime,
-        sse_heartbeat_seconds=sse_heartbeat_seconds,
-        manager_builder=lambda store, publish: AgentScopeWebSessionManager(
-            store=store,
-            runtime=agentscope_runtime,
-            event_callback=publish,
-        ),
-    )
-
-
-def _create_app_for_manager(
-    *,
-    working_dir: str,
-    db_path: str | Path | None,
-    frontend_dist: str | Path | None,
-    agentscope_runtime: Any | None,
-    sse_heartbeat_seconds: float,
-    manager_builder: Callable[[WebSessionStore, Callable[..., Any]], Any],
-    turn_submitted: Callable[[str, Any, WebSessionStore, SessionEventBus], Any]
-    | None = None,
-) -> FastAPI:
     database_path = Path(db_path) if db_path is not None else Path(working_dir) / "sessions.sqlite"
     store = WebSessionStore(database_path)
     bus = SessionEventBus()
 
-    async def publish_session_event(session_id: str, event: PublicEventRecord) -> None:
+    async def publish_session_event(session_id: str, event: dict[str, Any]) -> None:
         await bus.publish(session_id, event)
 
-    manager = manager_builder(store, publish_session_event)
-
-    async def recover_expired_turns(session_id: str) -> None:
-        for record in store.recover_expired_user_message_turns(session_id):
-            await bus.publish(session_id, record)
+    if agentscope_runtime is None:
+        manager = WebSessionManager(
+            store=store,
+            working_dir=working_dir,
+            model=model,
+            controller_factory=controller_factory,
+        )
+    else:
+        manager = AgentScopeWebSessionManager(
+            store=store,
+            runtime=agentscope_runtime,
+            event_callback=publish_session_event,
+        )
 
     @asynccontextmanager
     async def lifespan(_parent_app: FastAPI):
@@ -134,18 +80,6 @@ def _create_app_for_manager(
             return
 
         async with agentscope_runtime.app.router.lifespan_context(agentscope_runtime.app):
-            start_stop_coordinator = getattr(
-                agentscope_runtime,
-                "start_stop_coordinator",
-                None,
-            )
-            stop_stop_coordinator = getattr(
-                agentscope_runtime,
-                "stop_stop_coordinator",
-                None,
-            )
-            if callable(start_stop_coordinator):
-                await start_stop_coordinator()
             recovery_loop = getattr(agentscope_runtime, "run_agent_wakeup_recovery_loop", None)
             recovery_task = (
                 asyncio.create_task(
@@ -162,8 +96,6 @@ def _create_app_for_manager(
                     recovery_task.cancel()
                     with suppress(asyncio.CancelledError):
                         await recovery_task
-                if callable(stop_stop_coordinator):
-                    await stop_stop_coordinator()
 
     app = FastAPI(title="DataPilot Web API", lifespan=lifespan)
     app.state.store = store
@@ -171,73 +103,24 @@ def _create_app_for_manager(
     app.state.bus = bus
     app.state.agentscope_runtime = agentscope_runtime
 
-    @app.exception_handler(Exception)
-    async def safe_unexpected_error(request: Request, exc: Exception) -> JSONResponse:
-        logger.exception(
-            "Unexpected DataPilot API failure: method=%s path=%s",
-            request.method,
-            request.url.path,
-            exc_info=(type(exc), exc, exc.__traceback__),
-        )
-        return JSONResponse(status_code=500, content={"detail": INTERNAL_ERROR})
-
     if agentscope_runtime is not None:
         app.mount(agentscope_runtime.config.agentscope_mount_path, agentscope_runtime.app)
 
     @app.post("/api/sessions", response_model=CreateSessionResponse)
-    async def create_session(request: CreateSessionRequest) -> CreateSessionResponse:
-        try:
-            session = await _maybe_await(
-                manager.create_session(
-                    request.message,
-                    creation_id=request.creation_id,
-                )
-            )
-        except (RuntimeError, sqlite3.IntegrityError) as exc:
-            logger.exception("DataPilot session creation conflict")
-            raise HTTPException(
-                status_code=409,
-                detail=SESSION_CREATION_CONFLICT,
-            ) from exc
+    async def create_session(request: CreateTurnRequest) -> CreateSessionResponse:
+        session = await _maybe_await(manager.create_session(request.message))
         return CreateSessionResponse(session=session)
 
     @app.get("/api/sessions")
-    async def list_sessions(
-        limit: int = 20,
-        cursor: str | None = None,
-    ) -> dict[str, Any]:
-        try:
-            sessions, next_cursor = store.list_sessions_page(
-                limit=limit,
-                cursor=cursor,
-            )
-        except ValueError as exc:
-            raise HTTPException(status_code=400, detail="Invalid session page") from exc
-        return {
-            "sessions": [session.model_dump() for session in sessions],
-            "next_cursor": next_cursor,
-        }
+    async def list_sessions() -> dict[str, list[dict[str, Any]]]:
+        return {"sessions": [session.model_dump() for session in store.list_sessions()]}
 
     @app.get("/api/sessions/{session_id}")
     async def get_session(session_id: str) -> dict[str, dict[str, Any]]:
-        await recover_expired_turns(session_id)
         session = store.get_session(session_id)
         if session is None:
             raise HTTPException(status_code=404, detail="Session not found")
         return {"session": session.model_dump()}
-
-    @app.delete("/api/sessions/{session_id}", status_code=204)
-    async def delete_session(session_id: str) -> Response:
-        try:
-            session = store.get_session(session_id)
-            if session is not None:
-                await _maybe_await(manager.delete_session(session_id))
-        except Exception as exc:  # pylint: disable=broad-except
-            logger.exception("DataPilot session deletion failed: session_id=%s", session_id)
-            raise HTTPException(status_code=409, detail=SESSION_DELETE_ERROR) from exc
-        if session is None:
-            raise HTTPException(status_code=404, detail="Session not found")
-        return Response(status_code=204)
 
     @app.get("/api/navigation/datasets/summary")
     async def navigation_dataset_summary() -> dict[str, Any]:
@@ -268,63 +151,32 @@ def _create_app_for_manager(
             _raise_navigation_http_error(exc)
 
     @app.post("/api/sessions/{session_id}/turns", response_model=CreateTurnResponse)
-    async def submit_turn(session_id: str, request: SubmitTurnRequest) -> CreateTurnResponse:
-        await recover_expired_turns(session_id)
+    async def submit_turn(session_id: str, request: CreateTurnRequest) -> CreateTurnResponse:
         try:
-            turn_id = await _maybe_await(
-                manager.submit_turn(
-                    session_id,
-                    request.message,
-                    message_id=request.message_id,
-                )
-            )
+            turn_id = await _maybe_await(manager.submit_turn(session_id, request.message))
         except KeyError as exc:
             raise HTTPException(status_code=404, detail="Session not found") from exc
-        except (TurnSubmissionPending, TurnSessionBusy) as exc:
-            message = (
-                "Turn submission is still pending."
-                if isinstance(exc, TurnSubmissionPending)
-                else "Another turn is still active for this session."
-            )
-            raise HTTPException(
-                status_code=409,
-                detail={"code": exc.code, "message": message},
-            ) from exc
         except RuntimeError as exc:
-            logger.exception("DataPilot turn submission failed")
-            raise HTTPException(status_code=409, detail=TURN_SUBMISSION_ERROR) from exc
-        if turn_submitted is not None:
-            await _maybe_await(turn_submitted(session_id, manager, store, bus))
-        if isinstance(turn_id, TurnSubmissionResult):
-            return CreateTurnResponse(
-                turn_id=turn_id.turn_id,
-                replayed=turn_id.replayed,
-                terminal=turn_id.terminal,
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        if agentscope_runtime is None:
+            _create_logged_task(
+                _drain_controller_events(session_id, manager, store, bus),
+                name=f"controller-events:{session_id}",
             )
-        return CreateTurnResponse(turn_id=turn_id, replayed=False, terminal=False)
+        else:
+            _create_logged_task(
+                manager.forward_events_until_idle(session_id),
+                name=f"agentscope-events:{session_id}",
+            )
+        return CreateTurnResponse(turn_id=turn_id)
 
     @app.post("/api/sessions/{session_id}/interrupt", response_model=InterruptResponse)
     async def interrupt(session_id: str) -> InterruptResponse:
         try:
-            result = await _maybe_await(manager.interrupt(session_id))
+            interrupted = await _maybe_await(manager.interrupt(session_id))
         except KeyError as exc:
             raise HTTPException(status_code=404, detail="Session not found") from exc
-        except Exception as exc:  # pylint: disable=broad-except
-            logger.exception("DataPilot session stop failed")
-            raise HTTPException(
-                status_code=503,
-                detail="Session stop failed; retry the request",
-            ) from exc
-        if isinstance(result, InterruptResponse):
-            return result
-        interrupted = getattr(result, "interrupted", None)
-        stopped_tool_call_ids = getattr(result, "stopped_tool_call_ids", None)
-        if isinstance(interrupted, bool):
-            return InterruptResponse(
-                interrupted=interrupted,
-                stopped_tool_call_ids=list(stopped_tool_call_ids or ()),
-            )
-        return InterruptResponse(interrupted=bool(result))
+        return InterruptResponse(interrupted=interrupted)
 
     @app.post("/api/sessions/{session_id}/human-decisions", response_model=HumanDecisionResponse)
     async def submit_human_decision(
@@ -341,10 +193,14 @@ def _create_app_for_manager(
         except KeyError as exc:
             raise HTTPException(status_code=404, detail="Session not found") from exc
         except RuntimeError as exc:
-            logger.exception("DataPilot human decision failed")
-            raise HTTPException(status_code=409, detail=HUMAN_DECISION_ERROR) from exc
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
         if not accepted:
             raise HTTPException(status_code=409, detail="Human decision was not accepted")
+        if agentscope_runtime is not None:
+            _create_logged_task(
+                manager.forward_events_until_idle(session_id),
+                name=f"agentscope-events:{session_id}",
+            )
         return HumanDecisionResponse(accepted=True)
 
     @app.post(
@@ -368,35 +224,23 @@ def _create_app_for_manager(
         except KeyError as exc:
             raise HTTPException(status_code=404, detail="Session not found") from exc
         except (RuntimeError, ValueError) as exc:
-            logger.exception("DataPilot human decision recovery failed")
-            raise HTTPException(
-                status_code=409,
-                detail=HUMAN_DECISION_RECOVERY_ERROR,
-            ) from exc
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
         return HumanDecisionRecoveryResponse.model_validate(result)
 
-    @app.get("/api/sessions/{session_id}/stream")
-    async def session_stream(
-        session_id: str,
-        after_sequence: int = 0,
-    ) -> StreamingResponse:
-        await recover_expired_turns(session_id)
-        if store.get_session(session_id) is None:
-            raise HTTPException(status_code=404, detail="Session not found")
-        return StreamingResponse(
-            iter_sse(
-                store,
-                bus,
-                session_id,
-                after_sequence,
-                heartbeat_seconds=sse_heartbeat_seconds,
-            ),
-            media_type="text/event-stream",
-            headers={
-                "Cache-Control": "no-cache",
-                "X-Accel-Buffering": "no",
-            },
-        )
+    @app.websocket("/api/sessions/{session_id}/events")
+    async def session_events(websocket: WebSocket, session_id: str) -> None:
+        await websocket.accept()
+        if agentscope_runtime is not None:
+            _create_logged_task(
+                manager.forward_events_until_idle(session_id),
+                name=f"agentscope-events-ws:{session_id}",
+            )
+        try:
+            async with bus.subscribe(session_id) as queue:
+                while True:
+                    await websocket.send_json(await queue.get())
+        except WebSocketDisconnect:
+            return
 
     if frontend_dist is not None:
         frontend_path = Path(frontend_dist)
@@ -424,13 +268,87 @@ async def _maybe_await(value: Any) -> Any:
     return value
 
 
+def _create_logged_task(coroutine: Any, *, name: str) -> asyncio.Task:
+    task = asyncio.create_task(coroutine, name=name)
+    task.add_done_callback(_log_background_task_failure)
+    return task
+
+
+def _log_background_task_failure(task: asyncio.Task) -> None:
+    try:
+        task.result()
+    except asyncio.CancelledError:
+        return
+    except Exception:
+        logger.exception("Background task failed: %s", task.get_name())
+
+
 def _raise_navigation_http_error(exc: ValueError | FileNotFoundError) -> None:
     if isinstance(exc, ValueError):
-        raise HTTPException(
-            status_code=400,
-            detail="Invalid navigation dataset request",
-        ) from exc
-    raise HTTPException(
-        status_code=404,
-        detail="Navigation dataset resource not found",
-    ) from exc
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+
+async def _drain_controller_events(
+    session_id: str,
+    manager: WebSessionManager,
+    store: WebSessionStore,
+    bus: SessionEventBus,
+) -> None:
+    try:
+        controller = manager.get_controller(session_id)
+    except KeyError:
+        return
+
+    persisted_final_texts: set[str] = set()
+
+    async def drain_once() -> None:
+        for event in controller.drain_events():
+            store.append_timeline_event(session_id, event)
+            await bus.publish(session_id, event)
+            text = _final_event_text(event)
+            if text is not None and text not in persisted_final_texts:
+                store.append_message(session_id, role="assistant", content=text)
+                persisted_final_texts.add(text)
+
+    drained_to_completion = False
+    try:
+        while controller.is_running:
+            await drain_once()
+            await asyncio.sleep(0.03)
+
+        await drain_once()
+        drained_to_completion = True
+    finally:
+        result = await _consume_turn_result_when_idle(controller)
+        if drained_to_completion and result is not None:
+            text = getattr(result, "text", None)
+            if isinstance(text, str) and text and text not in persisted_final_texts:
+                store.append_message(session_id, role="assistant", content=text)
+                persisted_final_texts.add(text)
+
+
+def _final_event_text(event: dict[str, Any]) -> str | None:
+    if event.get("type") != "final":
+        return None
+    payload = event.get("payload")
+    if not isinstance(payload, dict):
+        return None
+    text = payload.get("text")
+    return text if isinstance(text, str) and text else None
+
+
+async def _consume_turn_result_when_idle(controller: Any) -> Any | None:
+    while getattr(controller, "is_running", False):
+        await asyncio.sleep(0.03)
+    return _consume_turn_result(controller)
+
+
+def _consume_turn_result(controller: Any) -> Any | None:
+    consume_turn_result = getattr(controller, "consume_turn_result", None)
+    if not callable(consume_turn_result):
+        return None
+    try:
+        return consume_turn_result()
+    except RuntimeError:
+        return None

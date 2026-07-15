@@ -16,20 +16,12 @@ class FakeAgentScopeRuntime:
         self.messages: list[tuple[str, str]] = []
         self.decisions: list[tuple[str, dict]] = []
         self.recoveries: list[tuple[str, dict]] = []
+        self.events: list[dict] = []
+        self.subscriptions: list[str] = []
 
-    async def submit_user_message(
-        self,
-        *,
-        web_session_id: str,
-        message: str,
-        message_id: str | None = None,
-        turn_id: str | None = None,
-        on_admitted=None,
-    ) -> str:
+    async def submit_user_message(self, *, web_session_id: str, message: str) -> str:
         self.messages.append((web_session_id, message))
-        if on_admitted is not None:
-            on_admitted()
-        return turn_id or "turn-agent-1"
+        return "turn-agent-1"
 
     async def submit_human_decision(self, *, web_session_id: str, decision: dict) -> bool:
         self.decisions.append((web_session_id, decision))
@@ -38,10 +30,7 @@ class FakeAgentScopeRuntime:
     async def recover_human_decision_handoff(self, *, web_session_id: str, recovery: dict):
         self.recoveries.append((web_session_id, recovery))
         if recovery["reason"] == "illegal":
-            raise RuntimeError(
-                "handoff is not recovery_required for "
-                "agent=router-secret session=as-secret user=alice-secret"
-            )
+            raise RuntimeError("handoff is not recovery_required")
         return {
             "recovered": True,
             "plan_id": recovery["plan_id"],
@@ -50,6 +39,12 @@ class FakeAgentScopeRuntime:
             "task_status": "needs_replan",
             "next_action": "submit_complete_plan",
         }
+
+    async def subscribe_web_session_events(self, *, web_session_id: str):
+        self.subscriptions.append(web_session_id)
+        for event in self.events:
+            yield event
+
 
 def _client(tmp_path, runtime: FakeAgentScopeRuntime) -> TestClient:
     app = create_app(
@@ -61,13 +56,7 @@ def _client(tmp_path, runtime: FakeAgentScopeRuntime) -> TestClient:
 
 
 def _create_session(client: TestClient) -> str:
-    response = client.post(
-        "/api/sessions",
-        json={
-            "message": "处理导航数据",
-            "creation_id": "local-create-human-decision",
-        },
-    )
+    response = client.post("/api/sessions", json={"message": "处理导航数据"})
     assert response.status_code == 200
     return response.json()["session"]["id"]
 
@@ -107,6 +96,36 @@ def test_plan_bound_human_decision_ids_are_forwarded_to_runtime(tmp_path) -> Non
 
     assert response.status_code == 200
     assert runtime.decisions == [(session_id, payload)]
+
+
+def test_human_decision_confirm_drains_agentscope_events(tmp_path) -> None:
+    runtime = FakeAgentScopeRuntime()
+    runtime.events = [
+        {
+            "type": "final",
+            "source": "NavigationDataAgent",
+            "payload": {"text": "继续处理完成"},
+        }
+    ]
+    client = _client(tmp_path, runtime)
+    session_id = _create_session(client)
+
+    response = client.post(
+        f"/api/sessions/{session_id}/human-decisions",
+        json={
+            "action": "confirm",
+            "request_id": "request-1",
+            "tool_call_id": "tool-call-1",
+            "reply_id": "reply-1",
+        },
+    )
+
+    assert response.status_code == 200
+    assert runtime.subscriptions == [session_id]
+    detail = client.get(f"/api/sessions/{session_id}").json()["session"]
+    assert [(message["role"], message["content"]) for message in detail["messages"]] == [
+        ("assistant", "继续处理完成")
+    ]
 
 
 def test_human_decision_guide_preserves_structured_text_payload(tmp_path) -> None:
@@ -174,50 +193,6 @@ def test_human_decision_runtime_rejection_returns_409(tmp_path) -> None:
 
     assert response.status_code == 409
     assert response.json()["detail"] == "Human decision was not accepted"
-
-
-def test_turn_and_human_decision_failures_do_not_expose_internal_identity(
-    tmp_path,
-) -> None:
-    runtime = FakeAgentScopeRuntime()
-    client = _client(tmp_path, runtime)
-    session_id = _create_session(client)
-    internal_identity = "agent=router-secret session=as-secret user=alice-secret"
-
-    async def fail_turn(**_kwargs):
-        raise RuntimeError(internal_identity)
-
-    async def fail_decision(**_kwargs):
-        raise RuntimeError(internal_identity)
-
-    runtime.submit_user_message = fail_turn
-    turn = client.post(
-        f"/api/sessions/{session_id}/turns",
-        json={"message": "run", "message_id": "local-secret-boundary"},
-    )
-    runtime.submit_human_decision = fail_decision
-    decision = client.post(
-        f"/api/sessions/{session_id}/human-decisions",
-        json={
-            "action": "stop",
-            "request_id": "request-secret-boundary",
-            "tool_call_id": "tool-secret-boundary",
-            "reply_id": "reply-secret-boundary",
-        },
-    )
-
-    assert turn.status_code == 409
-    assert turn.json()["detail"] == {
-        "code": "turn_submission_failed",
-        "message": "DataPilot could not submit this turn. Please retry.",
-    }
-    assert decision.status_code == 409
-    assert decision.json()["detail"] == {
-        "code": "human_decision_failed",
-        "message": "DataPilot could not apply this human decision.",
-    }
-    assert internal_identity not in turn.text
-    assert internal_identity not in decision.text
 
 
 def test_human_decision_unknown_session_returns_404(tmp_path) -> None:
@@ -291,11 +266,4 @@ def test_human_decision_recovery_validation_ownership_and_state_errors(tmp_path)
         },
     )
     assert conflict.status_code == 409
-    assert conflict.json()["detail"] == {
-        "code": "human_decision_recovery_failed",
-        "message": "DataPilot could not recover this human decision handoff.",
-    }
-    assert "recovery_required" not in conflict.text
-    assert "router-secret" not in conflict.text
-    assert "as-secret" not in conflict.text
-    assert "alice-secret" not in conflict.text
+    assert "recovery_required" in conflict.json()["detail"]

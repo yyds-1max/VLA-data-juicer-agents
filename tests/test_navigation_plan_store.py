@@ -1197,11 +1197,7 @@ def test_cross_phase_activation_replaces_the_whole_active_plan_atomically(tmp_pa
 
 @pytest.mark.parametrize(
     ("current_status", "expected_activity"),
-    [
-        ("pending", "execution"),
-        ("failed", "failed_recovery"),
-        ("needs_replan", "failed_recovery"),
-    ],
+    [("pending", "execution"), ("failed", "planning"), ("needs_replan", "planning")],
 )
 def test_execution_snapshot_reads_task_plan_and_ledger_in_one_state(
     tmp_path: Path,
@@ -1241,47 +1237,6 @@ def test_execution_snapshot_reads_task_plan_and_ledger_in_one_state(
     assert snapshot.current["step"]["status"] == current_status
     assert snapshot.overview.current_step_id == "prepare"
     assert snapshot.activity == expected_activity
-
-
-def test_execution_snapshot_prefers_handoff_recovery_over_failed_recovery(tmp_path: Path):
-    repo, task = stores_with_task(
-        tmp_path,
-        web_session_id="web-owner",
-        agentscope_session_id="web-owner__agent",
-    )
-    plan = _activate_owned(
-        repo,
-        task,
-        "finish_processing",
-        1,
-        valid_finish_plan(),
-        expected_web_session_id="web-owner",
-        expected_agentscope_session_id="web-owner__agent",
-    )
-    assert repo.mark_waiting_user(
-        plan.plan_id,
-        "confirm",
-        "confirm_navigation_calibration_params",
-        expected_web_session_id="web-owner",
-        expected_agentscope_session_id="web-owner__agent",
-    )
-    assert repo.mark_human_decision_recovery_required(
-        plan.plan_id,
-        "confirm",
-        reason_code="ambiguous_delivery_state",
-        request_anchor={"plan_id": plan.plan_id, "step_id": "confirm"},
-        expected_web_session_id="web-owner",
-        expected_agentscope_session_id="web-owner__agent",
-    )
-
-    snapshot = repo.read_execution_snapshot(
-        web_session_id="web-owner",
-        agentscope_session_id="web-owner__agent",
-        task_id=task.task_id,
-    )
-
-    assert snapshot is not None
-    assert snapshot.activity == "recovery_required"
 
 
 @pytest.mark.parametrize("in_flight_status", ["running", "waiting_user"])
@@ -1505,48 +1460,6 @@ def test_current_step_returns_its_stored_decision_refs(tmp_path: Path):
 
     assert current["step"]["step_id"] == "sync"
     assert current["decision_refs"] == ["sensor_bindings"]
-
-
-def test_repository_identifies_current_and_historical_step_result_refs(tmp_path: Path):
-    repo, task = stores_with_task(tmp_path)
-    plan = _activate_owned(repo, task, "extract_sync", 1, valid_extract_plan())
-    assert repo.claim_step(
-        plan.plan_id,
-        "prepare",
-        "prepare_raw_data",
-        expected_web_session_id=task.created_by_web_session_id,
-        expected_agentscope_session_id=task.agentscope_session_id,
-    ) is StepClaimOutcome.CLAIMED
-    staged = repo.stage_step_result(
-        plan.plan_id,
-        "prepare",
-        expected_action="prepare_raw_data",
-        target_status="failed",
-        full_result={"ok": False, "message": "failed"},
-        result_summary={"ok": False, "side_effect_state": "partial_or_unknown"},
-        expected_web_session_id=task.created_by_web_session_id,
-        expected_agentscope_session_id=task.agentscope_session_id,
-    )
-
-    assert repo.is_step_result_ref(task.task_id, staged.result_ref) is True
-    assert repo.finalize_staged_step(
-        plan.plan_id,
-        "prepare",
-        expected_action="prepare_raw_data",
-        expected_web_session_id=task.created_by_web_session_id,
-        expected_agentscope_session_id=task.agentscope_session_id,
-    )
-    replacement = _activate_owned(
-        repo,
-        task,
-        "extract_sync",
-        2,
-        valid_extract_plan(),
-    )
-    assert replacement.plan_id != plan.plan_id
-    assert repo.get(plan.plan_id).status == "superseded"
-    assert repo.is_step_result_ref(task.task_id, staged.result_ref) is True
-    assert repo.is_step_result_ref(task.task_id, "ordinary-observation-ref") is False
 
 
 def test_ledger_reads_reject_non_execution_status(tmp_path: Path):

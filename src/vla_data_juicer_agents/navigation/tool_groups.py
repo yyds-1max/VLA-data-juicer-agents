@@ -4,9 +4,7 @@ from typing import Literal, Mapping, Sequence
 from agentscope.tool import ToolBase
 
 
-NavigationActivity = Literal[
-    "planning", "execution", "failed_recovery", "recovery_required"
-]
+NavigationActivity = Literal["planning", "execution", "recovery_required"]
 
 NAVIGATION_EVIDENCE_READ = "navigation_evidence_read"
 NAVIGATION_INVESTIGATION = "navigation_investigation"
@@ -72,7 +70,6 @@ _FIXED_TOOL_GROUP_BY_NAME = {
     "submit_finish_processing_plan_tool": NAVIGATION_PLAN_AUTHORING,
     "get_plan_execution_overview_tool": NAVIGATION_EXECUTION_STATE,
     "get_current_plan_step_tool": NAVIGATION_EXECUTION_STATE,
-    "read_navigation_step_result_tool": NAVIGATION_DIAGNOSTICS,
 }
 
 _FIXED_GROUP_NAMES = (
@@ -81,7 +78,6 @@ _FIXED_GROUP_NAMES = (
     NAVIGATION_ARTIFACT_CHECKS,
     NAVIGATION_PLAN_AUTHORING,
     NAVIGATION_EXECUTION_STATE,
-    NAVIGATION_DIAGNOSTICS,
 )
 
 
@@ -123,13 +119,6 @@ class NavigationToolSurfacePolicy:
             NAVIGATION_EVIDENCE_READ,
             NAVIGATION_ARTIFACT_CHECKS,
             NAVIGATION_EXECUTION_STATE,
-            NAVIGATION_DIAGNOSTICS,
-        ),
-        "failed_recovery": (
-            NAVIGATION_EVIDENCE_READ,
-            NAVIGATION_ARTIFACT_CHECKS,
-            NAVIGATION_EXECUTION_STATE,
-            NAVIGATION_PLAN_AUTHORING,
             NAVIGATION_DIAGNOSTICS,
         ),
     }

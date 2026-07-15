@@ -5,9 +5,9 @@ from typing import Any, Literal
 from pydantic import BaseModel, Field, field_validator
 
 
+SessionStatus = Literal["draft", "active", "historical"]
 MessageRole = Literal["user", "assistant", "system"]
 HumanDecisionAction = Literal["confirm", "stop", "guide"]
-ToolRunStatus = Literal["running", "success", "failure", "stopped"]
 
 
 def generate_session_title(message: str, *, limit: int = 30) -> str:
@@ -18,6 +18,7 @@ def generate_session_title(message: str, *, limit: int = 30) -> str:
 class SessionRecord(BaseModel):
     id: str
     title: str
+    status: SessionStatus
     created_at: str
     updated_at: str
 
@@ -30,31 +31,22 @@ class ChatMessageRecord(BaseModel):
     created_at: str
 
 
-class PublicEventRecord(BaseModel):
+class TimelineEventRecord(BaseModel):
     id: str
     session_id: str
-    sequence: int
-    dedupe_key: str = Field(pattern=r"^[0-9a-f]{64}$")
-    event: dict[str, Any]
+    seq: int
+    type: str
+    source: str | None = None
+    run_id: str | None = None
+    parent_run_id: str | None = None
+    timestamp: str | None = None
+    payload: dict[str, Any] = Field(default_factory=dict)
     created_at: str
-
-
-class PublicToolRun(BaseModel):
-    session_id: str
-    tool_call_id: str
-    tool_name: str
-    status: ToolRunStatus
-    summary: str = ""
-    error_type: str | None = None
-    started_at: str
-    finished_at: str | None = None
 
 
 class SessionDetail(SessionRecord):
     messages: list[ChatMessageRecord] = Field(default_factory=list)
-    events: list[PublicEventRecord] = Field(default_factory=list)
-    tool_runs: list[PublicToolRun] = Field(default_factory=list)
-    last_sequence: int = 0
+    events: list[TimelineEventRecord] = Field(default_factory=list)
 
 
 class CreateSessionResponse(BaseModel):
@@ -73,31 +65,12 @@ class CreateTurnRequest(BaseModel):
         return message
 
 
-class CreateSessionRequest(CreateTurnRequest):
-    creation_id: str = Field(
-        min_length=14,
-        max_length=128,
-        pattern=r"^local-create-[A-Za-z0-9-]+$",
-    )
-
-
-class SubmitTurnRequest(CreateTurnRequest):
-    message_id: str = Field(
-        min_length=8,
-        max_length=128,
-        pattern=r"^local-[A-Za-z0-9-]+$",
-    )
-
-
 class CreateTurnResponse(BaseModel):
     turn_id: str
-    replayed: bool = False
-    terminal: bool = False
 
 
 class InterruptResponse(BaseModel):
     interrupted: bool
-    stopped_tool_call_ids: list[str] = Field(default_factory=list)
 
 
 class HumanDecisionRequest(BaseModel):
@@ -108,14 +81,6 @@ class HumanDecisionRequest(BaseModel):
     tool_call_id: str = Field(max_length=512)
     reply_id: str = Field(max_length=512)
     text: str | None = Field(default=None, max_length=4000, validate_default=True)
-
-    @field_validator("request_id")
-    @classmethod
-    def request_id_must_not_be_empty(cls, value: str) -> str:
-        request_id = value.strip()
-        if not request_id:
-            raise ValueError("request_id must not be empty")
-        return request_id
 
     @field_validator("text")
     @classmethod

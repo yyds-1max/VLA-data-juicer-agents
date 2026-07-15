@@ -1,41 +1,29 @@
 import "@testing-library/jest-dom/vitest";
 import { act, fireEvent, render, screen, waitFor } from "@testing-library/react";
-import { EventType } from "@agentscope-ai/agentscope/event";
-import { AssistantMsg, UserMsg } from "@agentscope-ai/agentscope/message";
-import { StrictMode, useState } from "react";
 
 import {
   createSession,
-  deleteSession,
   getNavigationDatasetSummary,
   getSession,
   getSyncImages,
   getSyncImageUrl,
   interruptTurn,
-  isAmbiguousTurnSubmissionError,
   listSessions,
+  openSessionEvents,
   recoverHumanDecision,
   submitHumanDecision,
   submitTurn,
-  streamSessionEvents,
 } from "../api/client";
-import type {
-  PendingHumanDecision,
-  PublicEventEnvelope,
-  PublicToolRun,
-  SessionDetail,
-} from "../api/types";
+import type { PendingHumanDecision } from "../api/types";
 import { Composer } from "../components/datapilot/Composer";
-import { DataPilotWindow } from "../components/datapilot/DataPilotWindow";
-import { MessageList } from "../components/datapilot/MessageList";
+import { formatActiveText, MessageList } from "../components/datapilot/MessageList";
 import { resetNavigationDatasetSummaryCache } from "../features/console/navigationDatasetSummaryCache";
-import { createAgentConversation } from "../store/agentConversation";
+import { createEmptyRunState } from "../store/eventReducer";
 import { datapilotStore } from "../store/datapilotStore";
 import { App } from "./App";
 
 vi.mock("../api/client", () => ({
   createSession: vi.fn(),
-  deleteSession: vi.fn(),
   getNavigationDatasetSummary: vi.fn(),
   getSyncImages: vi.fn(),
   getSyncImageUrl: vi.fn(),
@@ -43,15 +31,13 @@ vi.mock("../api/client", () => ({
   getSession: vi.fn(),
   submitTurn: vi.fn(),
   interruptTurn: vi.fn(),
-  isAmbiguousTurnSubmissionError: (error: unknown) => error instanceof TypeError,
   submitHumanDecision: vi.fn(),
   recoverHumanDecision: vi.fn(),
-  streamSessionEvents: vi.fn(),
+  openSessionEvents: vi.fn(),
 }));
 
 const apiMocks = vi.mocked({
   createSession,
-  deleteSession,
   getNavigationDatasetSummary,
   getSyncImages,
   getSyncImageUrl,
@@ -59,100 +45,18 @@ const apiMocks = vi.mocked({
   getSession,
   submitTurn,
   interruptTurn,
-  isAmbiguousTurnSubmissionError,
   submitHumanDecision,
   recoverHumanDecision,
-  streamSessionEvents,
+  openSessionEvents,
 });
 
-async function waitForAbort(signal: AbortSignal): Promise<void> {
-  if (signal.aborted) return;
-  await new Promise<void>((resolve) => signal.addEventListener("abort", () => resolve(), { once: true }));
-}
+type TestTimelineItem = ReturnType<typeof createEmptyRunState>["timeline"][number] & {
+  createdAt: string;
+  sequence: number;
+};
 
-function waitingEventStream(signal: AbortSignal): AsyncGenerator<PublicEventEnvelope> {
-  return (async function* () {
-    await waitForAbort(signal);
-  })();
-}
-
-function eventStream(
-  events: PublicEventEnvelope[],
-  signal: AbortSignal,
-): AsyncGenerator<PublicEventEnvelope> {
-  return (async function* () {
-    for (const event of events) yield event;
-    await waitForAbort(signal);
-  })();
-}
-
-function replayedAssistantReply(text: string): PublicEventEnvelope[] {
-  const event = (
-    sequence: number,
-    payload: PublicEventEnvelope["event"],
-  ): PublicEventEnvelope => ({
-    id: `event-${sequence}`,
-    session_id: "session-1",
-    sequence,
-    dedupe_key: String(sequence).padStart(64, "0"),
-    created_at: `2026-06-26T00:00:0${sequence}Z`,
-    event: payload,
-  });
-
-  return [
-    event(1, {
-      id: "reply-start",
-      created_at: "2026-06-26T00:00:01Z",
-      type: EventType.REPLY_START,
-      session_id: "session-1",
-      reply_id: "reply-1",
-      name: "DataPilot",
-      role: "assistant",
-    }),
-    event(2, {
-      id: "text-start",
-      created_at: "2026-06-26T00:00:02Z",
-      type: EventType.TEXT_BLOCK_START,
-      reply_id: "reply-1",
-      block_id: "block-1",
-    }),
-    event(3, {
-      id: "text-delta",
-      created_at: "2026-06-26T00:00:03Z",
-      type: EventType.TEXT_BLOCK_DELTA,
-      reply_id: "reply-1",
-      block_id: "block-1",
-      delta: text,
-    }),
-  ];
-}
-
-function publicEnvelope(
-  sequence: number,
-  event: PublicEventEnvelope["event"],
-  sessionId = "session-1",
-): PublicEventEnvelope {
-  return {
-    id: `event-${sequence}`,
-    session_id: sessionId,
-    sequence,
-    dedupe_key: String(sequence).padStart(64, "0"),
-    created_at: `2026-06-26T00:00:${String(sequence).padStart(2, "0")}Z`,
-    event,
-  };
-}
-
-function emptySessionDetail(sessionId: string, lastSequence = 0): SessionDetail {
-  return {
-    id: sessionId,
-    title: sessionId,
-    created_at: "2026-06-26T00:00:00Z",
-    updated_at: "2026-06-26T00:00:00Z",
-    messages: [],
-    events: [],
-    tool_runs: [],
-    last_sequence: lastSequence,
-  };
+function activeSocket(close: () => void = vi.fn()): WebSocket {
+  return { close, addEventListener: vi.fn(), readyState: WebSocket.OPEN } as unknown as WebSocket;
 }
 
 function deferred<T>() {
@@ -176,88 +80,6 @@ function pendingDecision(overrides: Partial<PendingHumanDecision> = {}): Pending
   };
 }
 
-test("MessageList keeps owned tool rows with their reply and appends only orphans", () => {
-  const toolRuns: Record<string, PublicToolRun> = {
-    "call-1": {
-      session_id: "session-1",
-      tool_call_id: "call-1",
-      tool_name: "extract_navigation_data",
-      status: "success",
-      summary: "first reply tool",
-      error_type: null,
-      started_at: "2026-06-26T00:00:01Z",
-      finished_at: "2026-06-26T00:00:02Z",
-    },
-    orphan: {
-      session_id: "session-1",
-      tool_call_id: "orphan",
-      tool_name: "orphan_tool",
-      status: "running",
-      summary: "unowned",
-      error_type: null,
-      started_at: "2026-06-26T00:00:03Z",
-      finished_at: null,
-    },
-  };
-
-  render(
-    <MessageList
-      messages={[
-        AssistantMsg({
-          id: "reply-1",
-          name: "DataPilot",
-          content: [
-            { type: "text", id: "text-1", text: "first reply" },
-            {
-              type: "tool_call",
-              id: "call-1",
-              name: "extract_navigation_data",
-              input: "{}",
-              state: "finished",
-            },
-          ],
-        }),
-        AssistantMsg({ id: "reply-2", name: "DataPilot", content: "second reply" }),
-      ]}
-      toolRuns={toolRuns}
-    />,
-  );
-
-  const firstReply = screen.getByText("first reply");
-  const ownedTool = screen.getByText("extract_navigation_data · first reply tool");
-  const secondReply = screen.getByText("second reply");
-  const orphanTool = screen.getByText("orphan_tool · unowned");
-
-  expect(firstReply.compareDocumentPosition(ownedTool) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
-  expect(ownedTool.compareDocumentPosition(secondReply) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
-  expect(secondReply.compareDocumentPosition(orphanTool) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
-});
-
-test("MessageList never renders thinking blocks from legacy or malicious snapshots", () => {
-  render(
-    <MessageList
-      messages={[
-        AssistantMsg({
-          id: "reply-thinking",
-          name: "DataPilot",
-          content: [
-            {
-              type: "thinking",
-              id: "private-thought",
-              thinking: "private chain of thought",
-            },
-            { type: "text", id: "public-answer", text: "public answer" },
-          ],
-        }),
-      ]}
-      toolRuns={{}}
-    />,
-  );
-
-  expect(screen.queryByText("private chain of thought")).not.toBeInTheDocument();
-  expect(screen.getByText("public answer")).toBeVisible();
-});
-
 function setOpenActiveSessionWithPendingDecision(
   decision: PendingHumanDecision,
   options: { sessionId?: string; title?: string } = {},
@@ -275,18 +97,20 @@ function setOpenActiveSessionWithPendingDecision(
         title,
         created_at: "2026-06-26T00:00:00Z",
         updated_at: "2026-06-26T00:00:00Z",
+        status: "active",
       },
     ],
-    conversation: {
-      ...createAgentConversation(),
-      messages: [
-        AssistantMsg({
-          id: "message-1",
-          name: "private-agent-name",
-          content: "准备继续。",
-          created_at: "2026-06-26T00:01:00Z",
-        }),
-      ],
+    messages: [
+      {
+        id: "message-1",
+        session_id: sessionId,
+        role: "assistant",
+        content: "准备继续。",
+        created_at: "2026-06-26T00:01:00Z",
+      },
+    ],
+    run: {
+      ...createEmptyRunState(),
       pendingHumanDecision: decision,
     },
   });
@@ -324,8 +148,6 @@ async function renderAppWithDashboardSettled() {
 
 beforeEach(() => {
   vi.clearAllMocks();
-  window.localStorage.clear();
-  window.sessionStorage.clear();
   resetNavigationDatasetSummaryCache();
   Object.defineProperty(window, "innerWidth", { configurable: true, writable: true, value: 1280 });
   Object.defineProperty(window, "innerHeight", { configurable: true, writable: true, value: 900 });
@@ -334,6 +156,7 @@ beforeEach(() => {
     title: "Clean VLA data",
     created_at: "2026-06-26T01:00:00Z",
     updated_at: "2026-06-26T01:00:00Z",
+    status: "active",
   });
   apiMocks.listSessions.mockResolvedValue([]);
   apiMocks.getSession.mockResolvedValue({
@@ -341,15 +164,12 @@ beforeEach(() => {
     title: "历史任务",
     created_at: "2026-06-25T01:00:00Z",
     updated_at: "2026-06-25T02:00:00Z",
+    status: "historical",
     messages: [],
-    events: [],
-    tool_runs: [],
-    last_sequence: 0,
   });
   apiMocks.submitTurn.mockResolvedValue("turn-1");
   apiMocks.interruptTurn.mockResolvedValue(true);
   apiMocks.submitHumanDecision.mockResolvedValue(true);
-  apiMocks.deleteSession.mockResolvedValue(undefined);
   apiMocks.recoverHumanDecision.mockResolvedValue({
     recovered: true,
     plan_id: "plan-1",
@@ -358,9 +178,7 @@ beforeEach(() => {
     task_status: "needs_replan",
     next_action: "submit_complete_plan",
   });
-  apiMocks.streamSessionEvents.mockImplementation((_sessionId, _afterSequence, signal) =>
-    waitingEventStream(signal),
-  );
+  apiMocks.openSessionEvents.mockReturnValue(activeSocket());
   apiMocks.getNavigationDatasetSummary.mockResolvedValue({
     totals: {
       date_count: 1,
@@ -453,7 +271,8 @@ beforeEach(() => {
     currentSessionId: null,
     previousActiveSessionId: null,
     sessions: [],
-    conversation: createAgentConversation(),
+    messages: [],
+    run: createEmptyRunState(),
     floatingOffset: { x: 0, y: 0 },
   });
 });
@@ -1047,26 +866,16 @@ test("DataPilot window keeps wheel scrolling inside the dialog", async () => {
         title: "Existing session",
         created_at: "2026-06-26T00:00:00Z",
         updated_at: "2026-06-26T00:00:00Z",
+        status: "active",
       },
     ],
-    conversation: {
-      ...createAgentConversation(),
-      messages: Array.from({ length: 12 }, (_, index) =>
-        index % 2 === 0
-          ? UserMsg({
-              id: `message-${index}`,
-              name: "private-user-name",
-              content: `消息 ${index}`,
-              created_at: `2026-06-26T00:${String(index).padStart(2, "0")}:00Z`,
-            })
-          : AssistantMsg({
-              id: `message-${index}`,
-              name: "private-agent-name",
-              content: `消息 ${index}`,
-              created_at: `2026-06-26T00:${String(index).padStart(2, "0")}:00Z`,
-            }),
-      ),
-    },
+    messages: Array.from({ length: 12 }, (_, index) => ({
+      id: `message-${index}`,
+      session_id: "session-1",
+      role: index % 2 === 0 ? ("user" as const) : ("assistant" as const),
+      content: `消息 ${index}`,
+      created_at: `2026-06-26T00:${String(index).padStart(2, "0")}:00Z`,
+    })),
   });
   await renderAppWithDashboardSettled();
 
@@ -1108,7 +917,7 @@ test("opens DataPilot draft window from the floating button", async () => {
   expect(screen.queryByText("VLA 主智能体")).not.toBeInTheDocument();
 });
 
-test("active session renders SDK messages with fixed public identities and tool runs", async () => {
+test("active session renders messages and does not render draft start content", async () => {
   datapilotStore.setState({
     open: true,
     mode: "active_session",
@@ -1120,65 +929,26 @@ test("active session renders SDK messages with fixed public identities and tool 
         title: "Existing session",
         created_at: "2026-06-26T00:00:00Z",
         updated_at: "2026-06-26T00:00:00Z",
+        status: "active",
       },
     ],
-    conversation: {
-      ...createAgentConversation(),
-      messages: [
-        UserMsg({ name: "private-user", content: "清洗已有数据" }),
-        AssistantMsg({ name: "private-agent", content: "已开始处理" }),
-      ],
-      toolRuns: {
-        "call-1": {
-          session_id: "session-1",
-          tool_call_id: "call-1",
-          tool_name: "extract_navigation_data",
-          status: "failure",
-          summary: "输入无效",
-          error_type: "invalid_input",
-          started_at: "2026-06-26T00:00:01Z",
-          finished_at: "2026-06-26T00:00:02Z",
-        },
+    messages: [
+      {
+        id: "message-1",
+        session_id: "session-1",
+        role: "user",
+        content: "清洗已有数据",
+        created_at: "2026-06-26T00:01:00Z",
       },
-    },
+    ],
   });
 
   await renderAppWithDashboardSettled();
 
+  expect(screen.getByRole("dialog", { name: "DataPilot" })).toBeVisible();
   expect(screen.getByText("清洗已有数据")).toBeVisible();
-  expect(screen.getByText("已开始处理")).toBeVisible();
-  expect(screen.getByText("You")).toBeVisible();
-  expect(screen.getAllByText("DataPilot").some((element) => element.matches("article div"))).toBe(true);
-  expect(screen.queryByText("private-user")).not.toBeInTheDocument();
-  expect(screen.queryByText("private-agent")).not.toBeInTheDocument();
-  expect(screen.getByText("extract_navigation_data · 输入无效")).toBeVisible();
   expect(screen.getByPlaceholderText("继续描述任务…")).toBeVisible();
-});
-
-test("tool cards render only the four public statuses and never a backgrounded label", () => {
-  const toolRuns = Object.fromEntries(
-    (["running", "success", "failure", "stopped"] as const).map((status, index) => [
-      `call-${status}`,
-      {
-        session_id: "session-1",
-        tool_call_id: `call-${status}`,
-        tool_name: `tool_${status}`,
-        status,
-        summary: "",
-        error_type: null,
-        started_at: `2026-06-26T00:00:0${index}Z`,
-        finished_at: status === "running" ? null : `2026-06-26T00:00:1${index}Z`,
-      },
-    ]),
-  );
-
-  render(<MessageList messages={[]} toolRuns={toolRuns} />);
-
-  expect(screen.getByText("正在调用")).toBeVisible();
-  expect(screen.getByText("成功")).toBeVisible();
-  expect(screen.getByText("失败")).toBeVisible();
-  expect(screen.getByText("已停止")).toBeVisible();
-  expect(screen.queryByText("已转后台")).not.toBeInTheDocument();
+  expect(screen.queryByText("开始一个任务")).not.toBeInTheDocument();
 });
 
 test("pending human decision shows dialog, hides Composer, submits confirm payload, and clears only after success", async () => {
@@ -1200,11 +970,11 @@ test("pending human decision shows dialog, hides Composer, submits confirm paylo
     tool_call_id: "tool-call-1",
     reply_id: "reply-1",
   });
-  expect(datapilotStore.getState().conversation.pendingHumanDecision).toEqual(pendingDecision());
+  expect(datapilotStore.getState().run.pendingHumanDecision).toEqual(pendingDecision());
 
   submitDecision.resolve(true);
 
-  await waitFor(() => expect(datapilotStore.getState().conversation.pendingHumanDecision).toBeNull());
+  await waitFor(() => expect(datapilotStore.getState().run.pendingHumanDecision).toBeNull());
   expect(screen.queryByRole("dialog", { name: "需要确认" })).not.toBeInTheDocument();
   expect(screen.getByPlaceholderText("继续描述任务…")).toBeVisible();
 });
@@ -1276,7 +1046,7 @@ test("controlled recovery never submits normally and clears only after success",
     step_id: "confirm",
     reason: "operator confirmed abandoned delivery",
   });
-  expect(datapilotStore.getState().conversation.pendingHumanDecision).not.toBeNull();
+  expect(datapilotStore.getState().run.pendingHumanDecision).not.toBeNull();
 
   recovery.resolve({
     recovered: true,
@@ -1286,7 +1056,7 @@ test("controlled recovery never submits normally and clears only after success",
     task_status: "needs_replan",
     next_action: "submit_complete_plan",
   });
-  await waitFor(() => expect(datapilotStore.getState().conversation.pendingHumanDecision).toBeNull());
+  await waitFor(() => expect(datapilotStore.getState().run.pendingHumanDecision).toBeNull());
 });
 
 test("controlled recovery failure retains the dialog and surfaces backend detail", async () => {
@@ -1308,7 +1078,7 @@ test("controlled recovery failure retains the dialog and surfaces backend detail
   fireEvent.click(screen.getByRole("button", { name: "隔离并重新规划" }));
 
   expect(await screen.findByRole("alert")).toHaveTextContent("only a recovery_required");
-  expect(datapilotStore.getState().conversation.pendingHumanDecision).not.toBeNull();
+  expect(datapilotStore.getState().run.pendingHumanDecision).not.toBeNull();
   expect(screen.getByRole("button", { name: "隔离并重新规划" })).toBeVisible();
 });
 
@@ -1344,7 +1114,68 @@ test("recovery completion from session A cannot clear session B", async () => {
 
   await waitFor(() => expect(screen.getByText("Session B recovery")).toBeVisible());
   expect(datapilotStore.getState().currentSessionId).toBe("session-b");
-  expect(datapilotStore.getState().conversation.pendingHumanDecision?.summary).toBe("Session B recovery");
+  expect(datapilotStore.getState().run.pendingHumanDecision?.summary).toBe("Session B recovery");
+});
+
+test("stale recovery A cannot inject errors or re-enable in-flight B in the same session", async () => {
+  const recoveryA = deferred<Awaited<ReturnType<typeof recoverHumanDecision>>>();
+  const recoveryB = deferred<Awaited<ReturnType<typeof recoverHumanDecision>>>();
+  apiMocks.recoverHumanDecision
+    .mockReturnValueOnce(recoveryA.promise)
+    .mockReturnValueOnce(recoveryB.promise);
+  vi.spyOn(console, "error").mockImplementation(() => undefined);
+  setOpenActiveSessionWithPendingDecision(
+    pendingDecision({
+      planId: "plan-a",
+      stepId: "confirm-a",
+      recoveryRequired: true,
+      submissionDisabled: true,
+    }),
+  );
+  await renderAppWithDashboardSettled();
+  fireEvent.change(screen.getByLabelText("恢复原因"), { target: { value: "recover A" } });
+  fireEvent.click(screen.getByRole("button", { name: "隔离并重新规划" }));
+
+  await act(async () => {
+    datapilotStore.getState().applyEvent({
+      type: "human_decision_required",
+      source: "NavigationDataAgent",
+      run_id: "as-session",
+      payload: {
+        reply_id: "reply-b",
+        tool_call_id: "tool-b",
+        request_id: "plan-b:confirm-b",
+        plan_id: "plan-b",
+        step_id: "confirm-b",
+        summary: "Recovery B",
+        recovery_required: true,
+        submission_disabled: true,
+      },
+    });
+  });
+  fireEvent.change(screen.getByLabelText("恢复原因"), { target: { value: "recover B" } });
+  fireEvent.click(screen.getByRole("button", { name: "隔离并重新规划" }));
+  expect(screen.getByRole("button", { name: "隔离并重新规划" })).toBeDisabled();
+
+  await act(async () => {
+    recoveryA.reject(new Error("stale A failure"));
+    try {
+      await recoveryA.promise;
+    } catch {
+      // Expected stale failure.
+    }
+  });
+
+  expect(screen.queryByRole("alert")).not.toBeInTheDocument();
+  expect(screen.getByRole("button", { name: "隔离并重新规划" })).toBeDisabled();
+  recoveryB.resolve({
+    recovered: true,
+    plan_id: "plan-b",
+    step_id: "confirm-b",
+    handoff_status: "quarantined",
+    task_status: "needs_replan",
+    next_action: "submit_complete_plan",
+  });
 });
 
 test("pending human decision remains when submitHumanDecision is rejected or not accepted", async () => {
@@ -1357,15 +1188,67 @@ test("pending human decision remains when submitHumanDecision is rejected or not
   fireEvent.click(screen.getByRole("button", { name: "确认" }));
 
   await waitFor(() => expect(apiMocks.submitHumanDecision).toHaveBeenCalledTimes(1));
-  expect(datapilotStore.getState().conversation.pendingHumanDecision).toEqual(pendingDecision());
+  expect(datapilotStore.getState().run.pendingHumanDecision).toEqual(pendingDecision());
   expect(screen.getByRole("dialog", { name: "需要确认" })).toBeVisible();
 
   fireEvent.click(screen.getByRole("button", { name: "停止" }));
 
   await waitFor(() => expect(apiMocks.submitHumanDecision).toHaveBeenCalledTimes(2));
-  expect(datapilotStore.getState().conversation.pendingHumanDecision).toEqual(pendingDecision());
+  expect(datapilotStore.getState().run.pendingHumanDecision).toEqual(pendingDecision());
   expect(consoleError).toHaveBeenCalledWith("Failed to submit human decision", expect.any(Error));
   consoleError.mockRestore();
+});
+
+test("resolving an older human decision submission does not clear a newer pending decision", async () => {
+  const submitDecision = deferred<boolean>();
+  apiMocks.submitHumanDecision.mockReturnValue(submitDecision.promise);
+  setOpenActiveSessionWithPendingDecision(pendingDecision());
+
+  await renderAppWithDashboardSettled();
+
+  fireEvent.click(screen.getByRole("button", { name: "确认" }));
+
+  await act(async () => {
+    datapilotStore.getState().applyEvent({
+      type: "human_decision_required",
+      source: "navigation.workflow",
+      run_id: "run-2",
+      parent_run_id: null,
+      timestamp: "2026-06-26T00:02:00.000Z",
+      payload: {
+        reply_id: "reply-2",
+        tool_call_id: "tool-call-2",
+        request_id: "request-2",
+        summary: "第二个确认请求。",
+      },
+    });
+  });
+
+  await waitFor(() => expect(screen.getByText("第二个确认请求。")).toBeVisible());
+  expect(datapilotStore.getState().run.pendingHumanDecision).toEqual({
+    replyId: "reply-2",
+    toolCallId: "tool-call-2",
+    requestId: "request-2",
+    decisionType: "other",
+    summary: "第二个确认请求。",
+  });
+
+  await act(async () => {
+    submitDecision.resolve(true);
+    await submitDecision.promise;
+  });
+
+  await waitFor(() =>
+    expect(datapilotStore.getState().run.pendingHumanDecision).toEqual({
+      replyId: "reply-2",
+      toolCallId: "tool-call-2",
+      requestId: "request-2",
+      decisionType: "other",
+      summary: "第二个确认请求。",
+    }),
+  );
+  expect(screen.getByRole("dialog", { name: "需要确认" })).toBeVisible();
+  expect(screen.queryByPlaceholderText("继续描述任务…")).not.toBeInTheDocument();
 });
 
 test("resolving a human decision from session A does not clear same-id pending in session B", async () => {
@@ -1393,7 +1276,7 @@ test("resolving a human decision from session A does not clear same-id pending i
 
   await waitFor(() => expect(screen.getByText("Session B 里的确认。")).toBeVisible());
   expect(datapilotStore.getState().currentSessionId).toBe("session-b");
-  expect(datapilotStore.getState().conversation.pendingHumanDecision).toEqual(
+  expect(datapilotStore.getState().run.pendingHumanDecision).toEqual(
     pendingDecision({ summary: "Session B 里的确认。" }),
   );
 
@@ -1403,78 +1286,12 @@ test("resolving a human decision from session A does not clear same-id pending i
   });
 
   await waitFor(() =>
-    expect(datapilotStore.getState().conversation.pendingHumanDecision).toEqual(
+    expect(datapilotStore.getState().run.pendingHumanDecision).toEqual(
       pendingDecision({ summary: "Session B 里的确认。" }),
     ),
   );
   expect(screen.getByRole("dialog", { name: "需要确认" })).toBeVisible();
   expect(screen.queryByPlaceholderText("继续描述任务…")).not.toBeInTheDocument();
-});
-
-
-test("an SSE public envelope reduces into the SDK conversation", async () => {
-  const events: PublicEventEnvelope[] = [
-    {
-      id: "event-1",
-      session_id: "session-1",
-      sequence: 1,
-      dedupe_key: "1".padStart(64, "0"),
-      created_at: "2026-06-26T00:00:00Z",
-      event: {
-        id: "reply-start",
-        created_at: "2026-06-26T00:00:00Z",
-        type: EventType.REPLY_START,
-        session_id: "private-session",
-        reply_id: "reply-1",
-        name: "private-agent",
-        role: "assistant",
-      },
-    },
-    {
-      id: "event-2",
-      session_id: "session-1",
-      sequence: 2,
-      dedupe_key: "2".padStart(64, "0"),
-      created_at: "2026-06-26T00:00:01Z",
-      event: {
-        id: "text-start",
-        created_at: "2026-06-26T00:00:01Z",
-        type: EventType.TEXT_BLOCK_START,
-        reply_id: "reply-1",
-        block_id: "block-1",
-      },
-    },
-    {
-      id: "event-3",
-      session_id: "session-1",
-      sequence: 3,
-      dedupe_key: "3".padStart(64, "0"),
-      created_at: "2026-06-26T00:00:02Z",
-      event: {
-        id: "text-delta",
-        created_at: "2026-06-26T00:00:02Z",
-        type: EventType.TEXT_BLOCK_DELTA,
-        reply_id: "reply-1",
-        block_id: "block-1",
-        delta: "实时回复",
-      },
-    },
-  ];
-  apiMocks.streamSessionEvents.mockImplementation((_sessionId, _afterSequence, signal) =>
-    eventStream(events, signal),
-  );
-  datapilotStore.setState({
-    open: true,
-    mode: "active_session",
-    currentSessionId: "session-1",
-    previousActiveSessionId: null,
-    sessions: [],
-    conversation: createAgentConversation(),
-  });
-  await renderAppWithDashboardSettled();
-
-  expect(await screen.findByText("实时回复")).toBeVisible();
-  await waitFor(() => expect(datapilotStore.getState().conversation.lastSequence).toBe(3));
 });
 
 test("History button lists sessions in a lightweight panel", async () => {
@@ -1484,6 +1301,7 @@ test("History button lists sessions in a lightweight panel", async () => {
       title: "历史任务",
       created_at: "2026-06-25T01:00:00Z",
       updated_at: "2026-06-25T02:00:00Z",
+      status: "historical",
     },
   ]);
 
@@ -1494,7 +1312,7 @@ test("History button lists sessions in a lightweight panel", async () => {
 
   expect(apiMocks.listSessions).toHaveBeenCalledTimes(1);
   expect(screen.queryByRole("button", { name: "Add context" })).not.toBeInTheDocument();
-  expect(await screen.findByRole("button", { name: "Open session 历史任务" })).toBeVisible();
+  expect(await screen.findByRole("button", { name: /历史任务/ })).toBeVisible();
   expect(screen.getByText("2026-06-25 02:00")).toBeVisible();
   expect(screen.queryByText(/last message|summary|继续任务|pending/i)).not.toBeInTheDocument();
 });
@@ -1509,12 +1327,9 @@ test("close hides the window and restores the floating button", async () => {
   await waitFor(() => expect(screen.queryByRole("dialog", { name: "DataPilot" })).not.toBeInTheDocument());
 });
 
-test("closing the DataPilot window aborts the active event stream", async () => {
-  let activeSignal: AbortSignal | undefined;
-  apiMocks.streamSessionEvents.mockImplementation((_sessionId, _afterSequence, signal) => {
-    activeSignal = signal;
-    return waitingEventStream(signal);
-  });
+test("closing the DataPilot window closes the active event stream", async () => {
+  const close = vi.fn();
+  apiMocks.openSessionEvents.mockReturnValue(activeSocket(close));
   datapilotStore.setState({
     open: true,
     mode: "active_session",
@@ -1526,6 +1341,7 @@ test("closing the DataPilot window aborts the active event stream", async () => 
         title: "Existing session",
         created_at: "2026-06-26T00:00:00Z",
         updated_at: "2026-06-26T00:00:00Z",
+        status: "active",
       },
     ],
   });
@@ -1535,186 +1351,11 @@ test("closing the DataPilot window aborts the active event stream", async () => 
     target: { value: "继续清洗" },
   });
   fireEvent.click(screen.getByRole("button", { name: "Send message" }));
-  await waitFor(() => expect(apiMocks.streamSessionEvents).toHaveBeenCalledWith("session-1", 0, expect.any(AbortSignal)));
+  await waitFor(() => expect(apiMocks.openSessionEvents).toHaveBeenCalledWith("session-1", expect.any(Function)));
 
   fireEvent.click(screen.getByRole("button", { name: "Close DataPilot" }));
 
-  await waitFor(() => expect(activeSignal?.aborted).toBe(true));
-});
-
-test("unmount aborts the selected session stream", async () => {
-  let activeSignal: AbortSignal | undefined;
-  apiMocks.streamSessionEvents.mockImplementation((_sessionId, _afterSequence, signal) => {
-    activeSignal = signal;
-    return waitingEventStream(signal);
-  });
-  datapilotStore.setState({
-    open: true,
-    mode: "active_session",
-    currentSessionId: "session-1",
-    conversation: createAgentConversation(),
-  });
-
-  const rendered = await renderAppWithDashboardSettled();
-  await waitFor(() => expect(activeSignal).toBeDefined());
-  rendered.unmount();
-
-  expect(activeSignal?.aborted).toBe(true);
-});
-
-test("switching selected sessions aborts A before opening B and resumes each current cursor", async () => {
-  const order: string[] = [];
-  apiMocks.getSession.mockImplementation(async (sessionId) => ({
-    id: sessionId,
-    title: sessionId,
-    created_at: "2026-06-26T00:00:00Z",
-    updated_at: "2026-06-26T00:00:00Z",
-    messages: [],
-    events: [],
-    tool_runs: [],
-    last_sequence: datapilotStore.getState().conversation.lastSequence,
-  }));
-  apiMocks.streamSessionEvents.mockImplementation((sessionId, afterSequence, signal) => {
-    order.push(`open:${sessionId}:${afterSequence}`);
-    signal.addEventListener("abort", () => order.push(`abort:${sessionId}`), { once: true });
-    return waitingEventStream(signal);
-  });
-  datapilotStore.setState({
-    open: true,
-    mode: "active_session",
-    currentSessionId: "session-a",
-    sessions: [],
-    conversation: { ...createAgentConversation(), lastSequence: 4 },
-  });
-  await renderAppWithDashboardSettled();
-  await waitFor(() => expect(order).toEqual(["open:session-a:4"]));
-
-  act(() => {
-    datapilotStore.setState({
-      currentSessionId: "session-b",
-      conversation: { ...createAgentConversation(), lastSequence: 7 },
-    });
-  });
-
-  await waitFor(() =>
-    expect(order).toEqual(["open:session-a:4", "abort:session-a", "open:session-b:7"]),
-  );
-  expect(apiMocks.streamSessionEvents).toHaveBeenCalledTimes(2);
-});
-
-test("a sequence gap aborts the stream and reconnects from the unadvanced cursor", async () => {
-  const signals: AbortSignal[] = [];
-  const gap = publicEnvelope(3, {
-    id: "gap-reply-start",
-    created_at: "2026-06-26T00:00:03Z",
-    type: EventType.REPLY_START,
-    session_id: "session-1",
-    reply_id: "reply-gap",
-    name: "DataPilot",
-    role: "assistant",
-  });
-  apiMocks.streamSessionEvents.mockImplementation((_sessionId, _cursor, signal) => {
-    signals.push(signal);
-    return signals.length === 1 ? eventStream([gap], signal) : waitingEventStream(signal);
-  });
-  apiMocks.getSession.mockResolvedValue(emptySessionDetail("session-1", 1));
-  datapilotStore.setState({
-    open: true,
-    mode: "active_session",
-    currentSessionId: "session-1",
-    conversation: { ...createAgentConversation(), lastSequence: 1 },
-  });
-
-  await renderAppWithDashboardSettled();
-
-  await waitFor(() => expect(signals[0]?.aborted).toBe(true));
-  await waitFor(() => expect(apiMocks.getSession).toHaveBeenCalledTimes(2));
-  await waitFor(() => expect(apiMocks.streamSessionEvents).toHaveBeenCalledTimes(2));
-  expect(apiMocks.streamSessionEvents).toHaveBeenNthCalledWith(
-    2,
-    "session-1",
-    1,
-    expect.any(AbortSignal),
-  );
-  expect(datapilotStore.getState().conversation.lastSequence).toBe(1);
-});
-
-test("an ownerless continuation triggers snapshot repair before reconnect", async () => {
-  const initialSnapshot = deferred<ReturnType<typeof emptySessionDetail>>();
-  const ownerless = publicEnvelope(1, {
-    id: "ownerless-delta",
-    created_at: "2026-06-26T00:00:01Z",
-    type: EventType.TEXT_BLOCK_DELTA,
-    reply_id: "missing-reply-start",
-    block_id: "block-1",
-    delta: "must replay",
-  });
-  const repaired = {
-    ...emptySessionDetail("session-1", 3),
-    events: replayedAssistantReply("snapshot repaired"),
-  };
-  const signals: AbortSignal[] = [];
-  apiMocks.getSession
-    .mockImplementationOnce(() => initialSnapshot.promise)
-    .mockResolvedValue(repaired);
-  apiMocks.streamSessionEvents.mockImplementation((_sessionId, _cursor, signal) => {
-    signals.push(signal);
-    return signals.length === 1 ? eventStream([ownerless], signal) : waitingEventStream(signal);
-  });
-  datapilotStore.setState({
-    open: true,
-    mode: "active_session",
-    currentSessionId: "session-1",
-    conversation: createAgentConversation(),
-  });
-
-  await renderAppWithDashboardSettled();
-
-  await waitFor(() => expect(signals[0]?.aborted).toBe(true));
-  expect(await screen.findByText("snapshot repaired")).toBeVisible();
-  await waitFor(() => expect(apiMocks.streamSessionEvents).toHaveBeenCalledTimes(2));
-  expect(apiMocks.streamSessionEvents).toHaveBeenNthCalledWith(
-    2,
-    "session-1",
-    3,
-    expect.any(AbortSignal),
-  );
-  initialSnapshot.resolve(repaired);
-});
-
-test("a consumed wrong-owner event advances normally without forcing replay", async () => {
-  let signal: AbortSignal | undefined;
-  const wrongOwner = publicEnvelope(2, {
-    id: "wrong-owner-delta",
-    created_at: "2026-06-26T00:00:02Z",
-    type: EventType.TEXT_BLOCK_DELTA,
-    reply_id: "reply-other",
-    block_id: "block-1",
-    delta: "ignored",
-  });
-  apiMocks.streamSessionEvents.mockImplementation((_sessionId, _cursor, nextSignal) => {
-    signal = nextSignal;
-    return eventStream([wrongOwner], nextSignal);
-  });
-  apiMocks.getSession.mockResolvedValue(emptySessionDetail("session-1", 1));
-  datapilotStore.setState({
-    open: true,
-    mode: "active_session",
-    currentSessionId: "session-1",
-    conversation: {
-      ...createAgentConversation(),
-      phase: "streaming",
-      currentReplyId: "reply-1",
-      lastSequence: 1,
-    },
-  });
-
-  await renderAppWithDashboardSettled();
-
-  await waitFor(() => expect(datapilotStore.getState().conversation.lastSequence).toBe(2));
-  expect(signal?.aborted).toBe(false);
-  expect(apiMocks.streamSessionEvents).toHaveBeenCalledTimes(1);
-  expect(apiMocks.getSession).toHaveBeenCalledTimes(1);
+  await waitFor(() => expect(close).toHaveBeenCalledTimes(1));
 });
 
 test("new session enters draft mode without creating a session", async () => {
@@ -1729,6 +1370,7 @@ test("new session enters draft mode without creating a session", async () => {
         title: "Existing session",
         created_at: "2026-06-26T00:00:00Z",
         updated_at: "2026-06-26T00:00:00Z",
+        status: "active",
       },
     ],
   });
@@ -1745,12 +1387,9 @@ test("new session enters draft mode without creating a session", async () => {
   expect(screen.getByText("开始一个任务")).toBeVisible();
 });
 
-test("new session aborts the active event stream", async () => {
-  let activeSignal: AbortSignal | undefined;
-  apiMocks.streamSessionEvents.mockImplementation((_sessionId, _afterSequence, signal) => {
-    activeSignal = signal;
-    return waitingEventStream(signal);
-  });
+test("new session closes the active event stream", async () => {
+  const close = vi.fn();
+  apiMocks.openSessionEvents.mockReturnValue(activeSocket(close));
   datapilotStore.setState({
     open: true,
     mode: "active_session",
@@ -1762,6 +1401,7 @@ test("new session aborts the active event stream", async () => {
         title: "Existing session",
         created_at: "2026-06-26T00:00:00Z",
         updated_at: "2026-06-26T00:00:00Z",
+        status: "active",
       },
     ],
   });
@@ -1771,11 +1411,11 @@ test("new session aborts the active event stream", async () => {
     target: { value: "继续清洗" },
   });
   fireEvent.click(screen.getByRole("button", { name: "Send message" }));
-  await waitFor(() => expect(apiMocks.streamSessionEvents).toHaveBeenCalledWith("session-1", 0, expect.any(AbortSignal)));
+  await waitFor(() => expect(apiMocks.openSessionEvents).toHaveBeenCalledWith("session-1", expect.any(Function)));
 
   fireEvent.click(screen.getByRole("button", { name: "New session" }));
 
-  expect(activeSignal?.aborted).toBe(true);
+  expect(close).toHaveBeenCalledTimes(1);
 });
 
 test("submitting the first draft message creates a session, opens events, submits turn, and shows the user message", async () => {
@@ -1787,293 +1427,18 @@ test("submitting the first draft message creates a session, opens events, submit
   });
   fireEvent.click(screen.getByRole("button", { name: "Send message" }));
 
-  expect(apiMocks.createSession).toHaveBeenCalledWith(
-    "清洗 VLA 数据",
-    expect.stringMatching(/^local-create-/),
-  );
-  await waitFor(() =>
-    expect(apiMocks.submitTurn).toHaveBeenCalledWith(
-      "session-created",
-      "清洗 VLA 数据",
-      expect.stringMatching(/^local-/),
-    ),
-  );
-  expect(apiMocks.streamSessionEvents).toHaveBeenCalledWith("session-created", 0, expect.any(AbortSignal));
+  expect(apiMocks.createSession).toHaveBeenCalledWith("清洗 VLA 数据");
+  await waitFor(() => expect(apiMocks.submitTurn).toHaveBeenCalledWith("session-created", "清洗 VLA 数据"));
+  expect(apiMocks.openSessionEvents).toHaveBeenCalledWith("session-created", expect.any(Function));
   expect(datapilotStore.getState().mode).toBe("active_session");
   expect(screen.getByText("清洗 VLA 数据")).toBeVisible();
   expect(screen.queryByText("开始一个任务")).not.toBeInTheDocument();
 });
 
-test("draft submit appends its unique user message before SSE can overtake HTTP", async () => {
-  const submission = deferred<string>();
-  const streamedStart = deferred<PublicEventEnvelope>();
-  apiMocks.submitTurn.mockReturnValue(submission.promise);
-  apiMocks.streamSessionEvents.mockImplementation((_sessionId, _cursor, signal) =>
-    (async function* () {
-      yield await streamedStart.promise;
-      await waitForAbort(signal);
-    })(),
-  );
-  await renderAppWithDashboardSettled();
-
-  fireEvent.click(screen.getByRole("button", { name: "Open DataPilot" }));
-  fireEvent.change(screen.getByPlaceholderText("我们要做什么？"), {
-    target: { value: "首条草稿消息" },
-  });
-  fireEvent.click(screen.getByRole("button", { name: "Send message" }));
-  await waitFor(() =>
-    expect(apiMocks.submitTurn).toHaveBeenCalledWith(
-      "session-created",
-      "首条草稿消息",
-      expect.stringMatching(/^local-/),
-    ),
-  );
-
-  const optimisticMessageId = datapilotStore.getState().conversation.messages[0]?.id;
-  expect(optimisticMessageId).toMatch(/^local-/);
-  expect(datapilotStore.getState().conversation.messages.map((message) => message.role)).toEqual([
-    "user",
-  ]);
-
-  streamedStart.resolve(
-    publicEnvelope(
-      1,
-      {
-        id: "draft-reply-before-http",
-        created_at: "2026-06-26T00:00:01Z",
-        type: EventType.REPLY_START,
-        session_id: "session-created",
-        reply_id: "draft-reply-before-http",
-        name: "DataPilot",
-        role: "assistant",
-      },
-      "session-created",
-    ),
-  );
-  await waitFor(() =>
-    expect(datapilotStore.getState().conversation.messages.map((message) => message.role)).toEqual([
-      "user",
-      "assistant",
-    ]),
-  );
-  expect(datapilotStore.getState().conversation.messages[0]?.id).toBe(optimisticMessageId);
-
-  submission.resolve("draft-turn-1");
-  await act(async () => {
-    await submission.promise;
-    await Promise.resolve();
-  });
-  expect(datapilotStore.getState().conversation.messages.map((message) => message.id)).toEqual([
-    optimisticMessageId,
-    "draft-reply-before-http",
-  ]);
-});
-
-test("draft optimistic user survives a higher-sequence snapshot before HTTP", async () => {
-  const submission = deferred<string>();
-  const snapshot = deferred<SessionDetail>();
-  apiMocks.submitTurn.mockReturnValue(submission.promise);
-  apiMocks.getSession.mockReturnValue(snapshot.promise);
-  await renderAppWithDashboardSettled();
-
-  fireEvent.click(screen.getByRole("button", { name: "Open DataPilot" }));
-  fireEvent.change(screen.getByPlaceholderText("我们要做什么？"), {
-    target: { value: "快照竞态首条消息" },
-  });
-  fireEvent.click(screen.getByRole("button", { name: "Send message" }));
-  await waitFor(() =>
-    expect(apiMocks.submitTurn).toHaveBeenCalledWith(
-      "session-created",
-      "快照竞态首条消息",
-      expect.stringMatching(/^local-/),
-    ),
-  );
-  await waitFor(() => expect(apiMocks.getSession).toHaveBeenCalledWith("session-created"));
-  const optimisticMessageId = datapilotStore.getState().conversation.messages[0]?.id;
-  expect(optimisticMessageId).toMatch(/^local-/);
-
-  snapshot.resolve({
-    ...emptySessionDetail("session-created", 1),
-    events: [
-      publicEnvelope(
-        1,
-        {
-          id: "snapshot-reply-before-http",
-          created_at: "2026-06-26T00:00:01Z",
-          type: EventType.REPLY_START,
-          session_id: "session-created",
-          reply_id: "snapshot-reply-before-http",
-          name: "DataPilot",
-          role: "assistant",
-        },
-        "session-created",
-      ),
-    ],
-  });
-  await act(async () => {
-    await snapshot.promise;
-    await Promise.resolve();
-  });
-
-  expect(datapilotStore.getState().conversation.messages.map((message) => message.id)).toEqual([
-    optimisticMessageId,
-    "snapshot-reply-before-http",
-  ]);
-
-  submission.resolve("draft-turn-snapshot");
-  await act(async () => {
-    await submission.promise;
-    await Promise.resolve();
-  });
-  expect(datapilotStore.getState().conversation.messages.map((message) => message.id)).toEqual([
-    optimisticMessageId,
-    "snapshot-reply-before-http",
-  ]);
-});
-
-test("closing while draft session creation is pending ignores the late created session", async () => {
-  const creation = deferred<Awaited<ReturnType<typeof createSession>>>();
-  apiMocks.createSession.mockReturnValue(creation.promise);
-  await renderAppWithDashboardSettled();
-  fireEvent.click(screen.getByRole("button", { name: "Open DataPilot" }));
-  fireEvent.change(screen.getByPlaceholderText("我们要做什么？"), {
-    target: { value: "迟到的创建" },
-  });
-  fireEvent.click(screen.getByRole("button", { name: "Send message" }));
-  await waitFor(() => expect(apiMocks.createSession).toHaveBeenCalledWith(
-    "迟到的创建",
-    expect.stringMatching(/^local-create-/),
-  ));
-
-  fireEvent.click(screen.getByRole("button", { name: "Close DataPilot" }));
-  creation.resolve({
-    id: "late-session",
-    title: "Late session",
-    created_at: "2026-06-26T01:00:00Z",
-    updated_at: "2026-06-26T01:00:00Z",
-  });
-  await act(async () => {
-    await creation.promise;
-    await Promise.resolve();
-  });
-
-  expect(datapilotStore.getState().open).toBe(false);
-  expect(datapilotStore.getState().mode).toBe("draft_new_session");
-  expect(datapilotStore.getState().currentSessionId).toBeNull();
-  expect(apiMocks.streamSessionEvents).not.toHaveBeenCalled();
-  expect(apiMocks.submitTurn).not.toHaveBeenCalled();
-  await waitFor(() => expect(screen.queryByRole("dialog", { name: "DataPilot" })).not.toBeInTheDocument());
-});
-
-test("unmount while draft session creation is pending ignores the late created session", async () => {
-  const creation = deferred<Awaited<ReturnType<typeof createSession>>>();
-  apiMocks.createSession.mockReturnValue(creation.promise);
-  datapilotStore.setState({
-    open: true,
-    mode: "draft_new_session",
-    currentSessionId: null,
-    conversation: createAgentConversation(),
-  });
-  const rendered = render(<DataPilotWindow />);
-  fireEvent.change(screen.getByPlaceholderText("我们要做什么？"), {
-    target: { value: "卸载后的创建" },
-  });
-  fireEvent.click(screen.getByRole("button", { name: "Send message" }));
-  await waitFor(() => expect(apiMocks.createSession).toHaveBeenCalledWith(
-    "卸载后的创建",
-    expect.stringMatching(/^local-create-/),
-  ));
-
-  rendered.unmount();
-  creation.resolve({
-    id: "unmounted-session",
-    title: "Unmounted session",
-    created_at: "2026-06-26T01:00:00Z",
-    updated_at: "2026-06-26T01:00:00Z",
-  });
-  await act(async () => {
-    await creation.promise;
-    await Promise.resolve();
-  });
-
-  expect(datapilotStore.getState().mode).toBe("draft_new_session");
-  expect(datapilotStore.getState().currentSessionId).toBeNull();
-  expect(apiMocks.streamSessionEvents).not.toHaveBeenCalled();
-  expect(apiMocks.submitTurn).not.toHaveBeenCalled();
-});
-
-test("starting a new draft invalidates an older pending session creation", async () => {
-  const creation = deferred<Awaited<ReturnType<typeof createSession>>>();
-  apiMocks.createSession.mockReturnValue(creation.promise);
-  await renderAppWithDashboardSettled();
-  fireEvent.click(screen.getByRole("button", { name: "Open DataPilot" }));
-  fireEvent.change(screen.getByPlaceholderText("我们要做什么？"), {
-    target: { value: "旧草稿" },
-  });
-  fireEvent.click(screen.getByRole("button", { name: "Send message" }));
-  await waitFor(() => expect(apiMocks.createSession).toHaveBeenCalledWith(
-    "旧草稿",
-    expect.stringMatching(/^local-create-/),
-  ));
-
-  fireEvent.click(screen.getByRole("button", { name: "New session" }));
-  creation.resolve({
-    id: "superseded-session",
-    title: "Superseded",
-    created_at: "2026-06-26T01:00:00Z",
-    updated_at: "2026-06-26T01:00:00Z",
-  });
-  await act(async () => {
-    await creation.promise;
-    await Promise.resolve();
-  });
-
-  expect(datapilotStore.getState().mode).toBe("draft_new_session");
-  expect(datapilotStore.getState().currentSessionId).toBeNull();
-  expect(apiMocks.streamSessionEvents).not.toHaveBeenCalled();
-  expect(apiMocks.submitTurn).not.toHaveBeenCalled();
-  expect(screen.getByPlaceholderText("我们要做什么？")).toHaveValue("");
-});
-
-test("draft submit is synchronously latched while session creation is pending", async () => {
-  const firstCreation = deferred<Awaited<ReturnType<typeof createSession>>>();
-  apiMocks.createSession.mockReturnValue(firstCreation.promise);
-  await renderAppWithDashboardSettled();
-  fireEvent.click(screen.getByRole("button", { name: "Open DataPilot" }));
-  const input = screen.getByPlaceholderText("我们要做什么？");
-
-  fireEvent.change(input, { target: { value: "first" } });
-  fireEvent.click(screen.getByRole("button", { name: "Send message" }));
-  fireEvent.change(input, { target: { value: "second" } });
-  fireEvent.click(screen.getByRole("button", { name: "Send message" }));
-  expect(apiMocks.createSession).toHaveBeenCalledTimes(1);
-  expect(input).toHaveValue("second");
-
-  firstCreation.resolve({
-    id: "session-first",
-    title: "First",
-    created_at: "2026-06-26T02:00:00Z",
-    updated_at: "2026-06-26T02:00:00Z",
-  });
-  await waitFor(() => expect(datapilotStore.getState().currentSessionId).toBe("session-first"));
-  await waitFor(() =>
-    expect(apiMocks.submitTurn).toHaveBeenCalledWith(
-      "session-first",
-      "first",
-      expect.stringMatching(/^local-/),
-    ),
-  );
-  expect(apiMocks.submitTurn).toHaveBeenCalledTimes(1);
-  expect(screen.getByPlaceholderText("继续描述任务…")).toHaveValue("second");
-});
-
 test("failed draft submit does not append a local user message", async () => {
   const consoleError = vi.spyOn(console, "error").mockImplementation(() => undefined);
-  let activeSignal: AbortSignal | undefined;
-  apiMocks.streamSessionEvents.mockImplementation((_sessionId, _afterSequence, signal) => {
-    activeSignal = signal;
-    return waitingEventStream(signal);
-  });
+  const close = vi.fn();
+  apiMocks.openSessionEvents.mockReturnValue(activeSocket(close));
   apiMocks.submitTurn.mockRejectedValue(new Error("submit failed"));
 
   await renderAppWithDashboardSettled();
@@ -2084,64 +1449,18 @@ test("failed draft submit does not append a local user message", async () => {
   });
   fireEvent.click(screen.getByRole("button", { name: "Send message" }));
 
-  await waitFor(() =>
-    expect(apiMocks.submitTurn).toHaveBeenCalledWith(
-      "session-created",
-      "会失败的任务",
-      expect.stringMatching(/^local-/),
-    ),
-  );
+  await waitFor(() => expect(apiMocks.submitTurn).toHaveBeenCalledWith("session-created", "会失败的任务"));
   await waitFor(() => expect(datapilotStore.getState().mode).toBe("draft_new_session"));
-  expect(datapilotStore.getState().conversation.messages).toEqual([]);
+  expect(datapilotStore.getState().messages).toEqual([]);
   expect(screen.queryByText("会失败的任务")).not.toBeInTheDocument();
-  expect(screen.getByPlaceholderText("我们要做什么？")).toHaveValue("会失败的任务");
-  expect(activeSignal?.aborted).toBe(true);
+  expect(close).toHaveBeenCalledTimes(1);
   expect(consoleError).toHaveBeenCalledWith("Failed to submit DataPilot draft turn", expect.any(Error));
   consoleError.mockRestore();
 });
 
-test("failed draft submit rolls back its exact optimistic message and preserves a newer draft", async () => {
+test("failed active submit does not append a local user message", async () => {
   const consoleError = vi.spyOn(console, "error").mockImplementation(() => undefined);
-  const submission = deferred<string>();
-  apiMocks.submitTurn.mockReturnValue(submission.promise);
-  await renderAppWithDashboardSettled();
-
-  fireEvent.click(screen.getByRole("button", { name: "Open DataPilot" }));
-  fireEvent.change(screen.getByPlaceholderText("我们要做什么？"), {
-    target: { value: "会回滚的首条消息" },
-  });
-  fireEvent.click(screen.getByRole("button", { name: "Send message" }));
-  await waitFor(() =>
-    expect(apiMocks.submitTurn).toHaveBeenCalledWith(
-      "session-created",
-      "会回滚的首条消息",
-      expect.stringMatching(/^local-/),
-    ),
-  );
-
-  const optimisticMessageId = datapilotStore.getState().conversation.messages[0]?.id;
-  expect(optimisticMessageId).toMatch(/^local-/);
-  expect(screen.getByText("会回滚的首条消息")).toBeVisible();
-  const activeComposer = screen.getByPlaceholderText("继续描述任务…");
-  fireEvent.change(activeComposer, { target: { value: "用户后来编辑的新草稿" } });
-
-  submission.reject(new Error("submit failed"));
-  await waitFor(() => expect(datapilotStore.getState().mode).toBe("draft_new_session"));
-  expect(datapilotStore.getState().conversation.messages).toEqual([]);
-  expect(
-    datapilotStore.getState().conversation.messages.some(
-      (message) => message.id === optimisticMessageId,
-    ),
-  ).toBe(false);
-  expect(screen.getByPlaceholderText("我们要做什么？")).toHaveValue("用户后来编辑的新草稿");
-  expect(consoleError).toHaveBeenCalledWith("Failed to submit DataPilot draft turn", expect.any(Error));
-  consoleError.mockRestore();
-});
-
-test("failed active submit removes only its optimistic user message and restores an unedited draft", async () => {
-  const consoleError = vi.spyOn(console, "error").mockImplementation(() => undefined);
-  const submission = deferred<string>();
-  apiMocks.submitTurn.mockReturnValue(submission.promise);
+  apiMocks.submitTurn.mockRejectedValue(new Error("submit failed"));
   datapilotStore.setState({
     open: true,
     mode: "active_session",
@@ -2153,18 +1472,10 @@ test("failed active submit removes only its optimistic user message and restores
         title: "Existing session",
         created_at: "2026-06-26T00:00:00Z",
         updated_at: "2026-06-26T00:00:00Z",
+        status: "active",
       },
     ],
-    conversation: {
-      ...createAgentConversation(),
-      messages: [
-        UserMsg({
-          id: "persisted-same-text",
-          name: "You",
-          content: "会失败的继续任务",
-        }),
-      ],
-    },
+    messages: [],
   });
 
   await renderAppWithDashboardSettled();
@@ -2173,995 +1484,18 @@ test("failed active submit removes only its optimistic user message and restores
   });
   fireEvent.click(screen.getByRole("button", { name: "Send message" }));
 
-  await waitFor(() =>
-    expect(apiMocks.submitTurn).toHaveBeenCalledWith(
-      "session-1",
-      "会失败的继续任务",
-      expect.stringMatching(/^local-/),
-    ),
-  );
-  const messagesBeforeRejection = datapilotStore.getState().conversation.messages;
-  expect(messagesBeforeRejection).toHaveLength(2);
-  expect(messagesBeforeRejection[0]?.id).toBe("persisted-same-text");
-  expect(messagesBeforeRejection[1]?.id).toMatch(/^local-/);
-  expect(screen.getByPlaceholderText("继续描述任务…")).toHaveValue("");
-
-  submission.reject(new Error("submit failed"));
-
-  await waitFor(() => expect(datapilotStore.getState().conversation.messages).toHaveLength(1));
-  expect(datapilotStore.getState().conversation.messages[0]?.id).toBe("persisted-same-text");
-  expect(screen.getByPlaceholderText("继续描述任务…")).toHaveValue("会失败的继续任务");
+  await waitFor(() => expect(apiMocks.submitTurn).toHaveBeenCalledWith("session-1", "会失败的继续任务"));
+  expect(datapilotStore.getState().messages).toEqual([]);
+  expect(screen.queryByText("会失败的继续任务")).not.toBeInTheDocument();
   expect(consoleError).toHaveBeenCalledWith("Failed to submit DataPilot active turn", expect.any(Error));
   consoleError.mockRestore();
 });
 
-test("ambiguous active submit keeps its optimistic row and retries with the same message id", async () => {
-  const consoleError = vi.spyOn(console, "error").mockImplementation(() => undefined);
-  apiMocks.submitTurn
-    .mockRejectedValueOnce(new TypeError("network response lost"))
-    .mockResolvedValueOnce({ turnId: "turn-replayed", replayed: true, terminal: true });
-  datapilotStore.setState({
-    open: true,
-    mode: "active_session",
-    currentSessionId: "session-1",
-    previousActiveSessionId: null,
-    sessions: [
-      {
-        id: "session-1",
-        title: "Existing session",
-        created_at: "2026-06-26T00:00:00Z",
-        updated_at: "2026-06-26T00:00:00Z",
-      },
-    ],
-    conversation: createAgentConversation(),
-  });
-
-  await renderAppWithDashboardSettled();
-  const composer = screen.getByPlaceholderText("继续描述任务…");
-  fireEvent.change(composer, { target: { value: "精确重试" } });
-  fireEvent.click(screen.getByRole("button", { name: "Send message" }));
-
-  await waitFor(() => expect(apiMocks.submitTurn).toHaveBeenCalledTimes(1));
-  const firstMessageId = apiMocks.submitTurn.mock.calls[0]?.[2];
-  await waitFor(() => expect(composer).toHaveValue("精确重试"));
-  expect(datapilotStore.getState().conversation.messages.map((item) => item.id)).toEqual([
-    firstMessageId,
-  ]);
-
-  fireEvent.click(screen.getByRole("button", { name: "Send message" }));
-  await waitFor(() => expect(apiMocks.submitTurn).toHaveBeenCalledTimes(2));
-  expect(apiMocks.submitTurn.mock.calls[1]).toEqual([
-    "session-1",
-    "精确重试",
-    firstMessageId,
-  ]);
-  expect(datapilotStore.getState().conversation.messages).toHaveLength(1);
-  await waitFor(() =>
-    expect(screen.getByRole("button", { name: "Send message" })).toBeEnabled(),
-  );
-  consoleError.mockRestore();
-});
-
-test("ambiguous first turn keeps the created session and retries its exact message id", async () => {
-  const consoleError = vi.spyOn(console, "error").mockImplementation(() => undefined);
-  apiMocks.submitTurn
-    .mockRejectedValueOnce(new TypeError("network response lost"))
-    .mockResolvedValueOnce({ turnId: "turn-replayed", replayed: true, terminal: true });
-
-  await renderAppWithDashboardSettled();
-  fireEvent.click(screen.getByRole("button", { name: "Open DataPilot" }));
-  fireEvent.change(screen.getByPlaceholderText("我们要做什么？"), {
-    target: { value: "首条精确重试" },
-  });
-  fireEvent.click(screen.getByRole("button", { name: "Send message" }));
-
-  await waitFor(() => expect(apiMocks.submitTurn).toHaveBeenCalledTimes(1));
-  const firstMessageId = apiMocks.submitTurn.mock.calls[0]?.[2];
-  const activeComposer = await screen.findByPlaceholderText("继续描述任务…");
-  await waitFor(() => expect(activeComposer).toHaveValue("首条精确重试"));
-  expect(datapilotStore.getState().currentSessionId).toBe("session-created");
-
-  fireEvent.click(screen.getByRole("button", { name: "Send message" }));
-  await waitFor(() => expect(apiMocks.submitTurn).toHaveBeenCalledTimes(2));
-  expect(apiMocks.submitTurn.mock.calls[1]).toEqual([
-    "session-created",
-    "首条精确重试",
-    firstMessageId,
-  ]);
-  expect(datapilotStore.getState().conversation.messages).toHaveLength(1);
-  await waitFor(() =>
-    expect(screen.getByRole("button", { name: "Send message" })).toBeEnabled(),
-  );
-  consoleError.mockRestore();
-});
-
-test("a lost create response retries the first intent with the same creation id", async () => {
-  const consoleError = vi.spyOn(console, "error").mockImplementation(() => undefined);
-  apiMocks.createSession
-    .mockRejectedValueOnce(new TypeError("create response lost"))
-    .mockResolvedValueOnce({
-      id: "session-created-once",
-      title: "Create once",
-      created_at: "2026-07-15T00:00:00Z",
-      updated_at: "2026-07-15T00:00:00Z",
-    });
-  apiMocks.submitTurn.mockResolvedValueOnce({
-    turnId: "turn-created-once",
-    replayed: false,
-    terminal: false,
-  });
-
-  await renderAppWithDashboardSettled();
-  fireEvent.click(screen.getByRole("button", { name: "Open DataPilot" }));
-  const composer = screen.getByPlaceholderText("我们要做什么？");
-  fireEvent.change(composer, { target: { value: "只创建一个会话" } });
-  fireEvent.click(screen.getByRole("button", { name: "Send message" }));
-
-  await waitFor(() => expect(apiMocks.createSession).toHaveBeenCalledTimes(1));
-  const creationId = apiMocks.createSession.mock.calls[0]?.[1];
-  expect(creationId).toMatch(/^local-create-/);
-  await waitFor(() => expect(composer).toHaveValue("只创建一个会话"));
-
-  fireEvent.click(screen.getByRole("button", { name: "Send message" }));
-
-  await waitFor(() => expect(apiMocks.createSession).toHaveBeenCalledTimes(2));
-  expect(apiMocks.createSession.mock.calls[1]).toEqual(["只创建一个会话", creationId]);
-  await waitFor(() => expect(datapilotStore.getState().currentSessionId).toBe("session-created-once"));
-  consoleError.mockRestore();
-});
-
-test("reload during an ambiguous pending turn restores and reuses its durable outbox id", async () => {
-  const consoleError = vi.spyOn(console, "error").mockImplementation(() => undefined);
-  apiMocks.submitTurn.mockRejectedValueOnce(new TypeError("network response lost"));
-  datapilotStore.setState({
-    open: true,
-    mode: "active_session",
-    currentSessionId: "session-1",
-    previousActiveSessionId: null,
-    sessions: [
-      {
-        id: "session-1",
-        title: "Existing session",
-        created_at: "2026-06-26T00:00:00Z",
-        updated_at: "2026-06-26T00:00:00Z",
-      },
-    ],
-    conversation: createAgentConversation(),
-  });
-  const firstRender = await renderAppWithDashboardSettled();
-  fireEvent.change(screen.getByPlaceholderText("继续描述任务…"), {
-    target: { value: "刷新后精确重试" },
-  });
-  fireEvent.click(screen.getByRole("button", { name: "Send message" }));
-  await waitFor(() => expect(apiMocks.submitTurn).toHaveBeenCalledTimes(1));
-  const originalMessageId = apiMocks.submitTurn.mock.calls[0]?.[2];
-  await waitFor(() =>
-    expect(screen.getByPlaceholderText("继续描述任务…")).toHaveValue("刷新后精确重试"),
-  );
-  firstRender.unmount();
-
-  datapilotStore.setState({
-    open: true,
-    mode: "active_session",
-    currentSessionId: "session-1",
-    previousActiveSessionId: null,
-    conversation: createAgentConversation(),
-  });
-  apiMocks.submitTurn.mockResolvedValueOnce({
-    turnId: "turn-recovered",
-    replayed: true,
-    terminal: true,
-  });
-  await renderAppWithDashboardSettled();
-
-  const restoredComposer = screen.getByPlaceholderText("继续描述任务…");
-  await waitFor(() => expect(restoredComposer).toHaveValue("刷新后精确重试"));
-  expect(datapilotStore.getState().conversation.messages.map((item) => item.id)).toEqual([
-    originalMessageId,
-  ]);
-  fireEvent.click(screen.getByRole("button", { name: "Send message" }));
-  await waitFor(() => expect(apiMocks.submitTurn).toHaveBeenCalledTimes(2));
-  expect(apiMocks.submitTurn.mock.calls[1]).toEqual([
-    "session-1",
-    "刷新后精确重试",
-    originalMessageId,
-  ]);
-  consoleError.mockRestore();
-});
-
-test("reload rebases recovered draft ownership so an exact snapshot clears the draft and outbox", async () => {
-  const consoleError = vi.spyOn(console, "error").mockImplementation(() => undefined);
-  apiMocks.submitTurn.mockRejectedValueOnce(new TypeError("network response lost"));
-  datapilotStore.setState({
-    open: true,
-    mode: "active_session",
-    currentSessionId: "session-1",
-    previousActiveSessionId: null,
-    sessions: [{
-      id: "session-1",
-      title: "Existing session",
-      created_at: "2026-06-26T00:00:00Z",
-      updated_at: "2026-06-26T00:00:00Z",
-    }],
-    conversation: createAgentConversation(),
-  });
-  const firstRender = await renderAppWithDashboardSettled();
-  fireEvent.change(screen.getByPlaceholderText("继续描述任务…"), {
-    target: { value: "刷新后等待权威快照" },
-  });
-  fireEvent.click(screen.getByRole("button", { name: "Send message" }));
-  await waitFor(() => expect(apiMocks.submitTurn).toHaveBeenCalledTimes(1));
-  const messageId = apiMocks.submitTurn.mock.calls[0]?.[2] as string;
-  await waitFor(() =>
-    expect(screen.getByPlaceholderText("继续描述任务…")).toHaveValue("刷新后等待权威快照"),
-  );
-  firstRender.unmount();
-
-  datapilotStore.setState({
-    open: true,
-    mode: "active_session",
-    currentSessionId: "session-1",
-    previousActiveSessionId: null,
-    conversation: createAgentConversation(),
-  });
-  apiMocks.getSession.mockResolvedValue({
-    ...emptySessionDetail("session-1"),
-    messages: [{
-      id: messageId,
-      session_id: "session-1",
-      role: "user",
-      content: "刷新后等待权威快照",
-      created_at: "2026-07-15T00:00:00Z",
-    }],
-  });
-  await renderAppWithDashboardSettled();
-
-  const composer = screen.getByPlaceholderText("继续描述任务…");
-  await waitFor(() => expect(composer).toHaveValue(""));
-  expect(window.sessionStorage.getItem("datapilot-turn-outbox:session-1")).toBeNull();
-  fireEvent.change(composer, { target: { value: "刷新后等待权威快照" } });
-  fireEvent.click(screen.getByRole("button", { name: "Send message" }));
-  await waitFor(() => expect(apiMocks.submitTurn).toHaveBeenCalledTimes(2));
-  expect(apiMocks.submitTurn.mock.calls[1]?.[2]).not.toBe(messageId);
-  consoleError.mockRestore();
-});
-
-test("reload rebases recovered draft ownership so an exact terminal clears it", async () => {
-  const consoleError = vi.spyOn(console, "error").mockImplementation(() => undefined);
-  apiMocks.submitTurn.mockRejectedValueOnce(new TypeError("network response lost"));
-  datapilotStore.setState({
-    open: true,
-    mode: "active_session",
-    currentSessionId: "session-1",
-    previousActiveSessionId: null,
-    sessions: [{
-      id: "session-1",
-      title: "Existing session",
-      created_at: "2026-06-26T00:00:00Z",
-      updated_at: "2026-06-26T00:00:00Z",
-    }],
-    conversation: createAgentConversation(),
-  });
-  const firstRender = await renderAppWithDashboardSettled();
-  fireEvent.change(screen.getByPlaceholderText("继续描述任务…"), {
-    target: { value: "刷新后等待终态" },
-  });
-  fireEvent.click(screen.getByRole("button", { name: "Send message" }));
-  await waitFor(() => expect(apiMocks.submitTurn).toHaveBeenCalledTimes(1));
-  const messageId = apiMocks.submitTurn.mock.calls[0]?.[2] as string;
-  await waitFor(() =>
-    expect(screen.getByPlaceholderText("继续描述任务…")).toHaveValue("刷新后等待终态"),
-  );
-  firstRender.unmount();
-
-  datapilotStore.setState({
-    open: true,
-    mode: "active_session",
-    currentSessionId: "session-1",
-    previousActiveSessionId: null,
-    conversation: createAgentConversation(),
-  });
-  apiMocks.streamSessionEvents.mockImplementation((_sessionId, _afterSequence, signal) =>
-    eventStream([
-      publicEnvelope(1, {
-        id: "terminal-recovered",
-        created_at: "2026-07-15T00:00:01Z",
-        type: EventType.CUSTOM,
-        name: "datapilot_run_terminal",
-        value: { turn_id: "turn-recovered", message_id: messageId, status: "failure" },
-      }),
-    ], signal),
-  );
-  await renderAppWithDashboardSettled();
-
-  await waitFor(() =>
-    expect(screen.getByPlaceholderText("继续描述任务…")).toHaveValue(""),
-  );
-  expect(window.sessionStorage.getItem("datapilot-turn-outbox:session-1")).toBeNull();
-  consoleError.mockRestore();
-});
-
-test("closing and reopening before authority restores the in-memory ambiguous retry", async () => {
-  const consoleError = vi.spyOn(console, "error").mockImplementation(() => undefined);
-  apiMocks.submitTurn.mockRejectedValueOnce(new TypeError("network response lost"));
-  datapilotStore.setState({
-    open: true,
-    mode: "active_session",
-    currentSessionId: "session-1",
-    previousActiveSessionId: null,
-    sessions: [{
-      id: "session-1",
-      title: "Existing session",
-      created_at: "2026-06-26T00:00:00Z",
-      updated_at: "2026-06-26T00:00:00Z",
-    }],
-    conversation: createAgentConversation(),
-  });
-  await renderAppWithDashboardSettled();
-  fireEvent.change(screen.getByPlaceholderText("继续描述任务…"), {
-    target: { value: "关闭后仍需精确重试" },
-  });
-  fireEvent.click(screen.getByRole("button", { name: "Send message" }));
-  await waitFor(() => expect(apiMocks.submitTurn).toHaveBeenCalledTimes(1));
-  const messageId = apiMocks.submitTurn.mock.calls[0]?.[2];
-  await waitFor(() =>
-    expect(screen.getByPlaceholderText("继续描述任务…")).toHaveValue("关闭后仍需精确重试"),
-  );
-
-  fireEvent.click(screen.getByRole("button", { name: "Close DataPilot" }));
-  fireEvent.click(screen.getByRole("button", { name: "Open DataPilot" }));
-
-  const composer = await screen.findByPlaceholderText("继续描述任务…");
-  await waitFor(() => expect(composer).toHaveValue("关闭后仍需精确重试"));
-  expect(datapilotStore.getState().conversation.messages.map((message) => message.id)).toContain(
-    messageId,
-  );
-  consoleError.mockRestore();
-});
-
-test("switching away and back before authority restores the in-memory ambiguous retry", async () => {
-  const consoleError = vi.spyOn(console, "error").mockImplementation(() => undefined);
-  apiMocks.submitTurn.mockRejectedValueOnce(new TypeError("network response lost"));
-  const sessionA = {
-    id: "session-a",
-    title: "Session A",
-    created_at: "2026-06-26T00:00:00Z",
-    updated_at: "2026-06-26T00:00:00Z",
-  };
-  const sessionB = { ...sessionA, id: "session-b", title: "Session B" };
-  apiMocks.listSessions.mockResolvedValue([sessionA, sessionB]);
-  apiMocks.getSession.mockImplementation((sessionId) =>
-    Promise.resolve(emptySessionDetail(sessionId)),
-  );
-  datapilotStore.setState({
-    open: true,
-    mode: "active_session",
-    currentSessionId: "session-a",
-    previousActiveSessionId: null,
-    sessions: [sessionA, sessionB],
-    conversation: createAgentConversation(),
-  });
-  await renderAppWithDashboardSettled();
-  fireEvent.change(screen.getByPlaceholderText("继续描述任务…"), {
-    target: { value: "切走后仍需精确重试" },
-  });
-  fireEvent.click(screen.getByRole("button", { name: "Send message" }));
-  await waitFor(() => expect(apiMocks.submitTurn).toHaveBeenCalledTimes(1));
-  const messageId = apiMocks.submitTurn.mock.calls[0]?.[2];
-  await waitFor(() =>
-    expect(screen.getByPlaceholderText("继续描述任务…")).toHaveValue("切走后仍需精确重试"),
-  );
-
-  fireEvent.click(screen.getByRole("button", { name: "History" }));
-  fireEvent.click(await screen.findByRole("button", { name: "Open session Session B" }));
-  await waitFor(() => expect(datapilotStore.getState().currentSessionId).toBe("session-b"));
-  fireEvent.click(screen.getByRole("button", { name: "History" }));
-  fireEvent.click(await screen.findByRole("button", { name: "Open session Session A" }));
-
-  await waitFor(() => expect(datapilotStore.getState().currentSessionId).toBe("session-a"));
-  await waitFor(() =>
-    expect(screen.getByPlaceholderText("继续描述任务…")).toHaveValue("切走后仍需精确重试"),
-  );
-  expect(datapilotStore.getState().conversation.messages.map((message) => message.id)).toContain(
-    messageId,
-  );
-  consoleError.mockRestore();
-});
-
-test("authoritative exact snapshot retires ambiguous outbox before a later identical intent", async () => {
-  const consoleError = vi.spyOn(console, "error").mockImplementation(() => undefined);
-  apiMocks.submitTurn.mockRejectedValueOnce(new TypeError("network response lost"));
-  datapilotStore.setState({
-    open: true,
-    mode: "active_session",
-    currentSessionId: "session-1",
-    previousActiveSessionId: null,
-    sessions: [
-      {
-        id: "session-1",
-        title: "Existing session",
-        created_at: "2026-06-26T00:00:00Z",
-        updated_at: "2026-06-26T00:00:00Z",
-      },
-    ],
-    conversation: createAgentConversation(),
-  });
-  await renderAppWithDashboardSettled();
-  fireEvent.change(screen.getByPlaceholderText("继续描述任务…"), {
-    target: { value: "相同但新的意图" },
-  });
-  fireEvent.click(screen.getByRole("button", { name: "Send message" }));
-  await waitFor(() => expect(apiMocks.submitTurn).toHaveBeenCalledTimes(1));
-  const admittedMessageId = apiMocks.submitTurn.mock.calls[0]?.[2] as string;
-  await waitFor(() =>
-    expect(screen.getByPlaceholderText("继续描述任务…")).toHaveValue("相同但新的意图"),
-  );
-
-  apiMocks.getSession.mockResolvedValue({
-    id: "session-1",
-    title: "Existing session",
-    created_at: "2026-06-26T00:00:00Z",
-    updated_at: "2026-06-26T00:00:01Z",
-    messages: [
-      {
-        id: admittedMessageId,
-        session_id: "session-1",
-        role: "user",
-        content: "相同但新的意图",
-        created_at: "2026-06-26T00:00:01Z",
-      },
-    ],
-    events: [],
-    tool_runs: [],
-    last_sequence: 0,
-  });
-  act(() => datapilotStore.getState().setOpen(false));
-  act(() => datapilotStore.getState().setOpen(true));
-  const composer = await screen.findByPlaceholderText("继续描述任务…");
-  await waitFor(() => expect(composer).toHaveValue(""));
-
-  apiMocks.submitTurn.mockResolvedValueOnce("turn-new-intent");
-  fireEvent.change(composer, { target: { value: "相同但新的意图" } });
-  fireEvent.click(screen.getByRole("button", { name: "Send message" }));
-  await waitFor(() => expect(apiMocks.submitTurn).toHaveBeenCalledTimes(2));
-  expect(apiMocks.submitTurn.mock.calls[1]?.[2]).not.toBe(admittedMessageId);
-  consoleError.mockRestore();
-});
-
-test("failed active submit preserves a newer edited draft instead of restoring sent text", async () => {
-  const consoleError = vi.spyOn(console, "error").mockImplementation(() => undefined);
-  const submission = deferred<string>();
-  apiMocks.submitTurn.mockReturnValue(submission.promise);
-  datapilotStore.setState({
-    open: true,
-    mode: "active_session",
-    currentSessionId: "session-1",
-    conversation: createAgentConversation(),
-  });
-  await renderAppWithDashboardSettled();
-  const input = screen.getByPlaceholderText("继续描述任务…");
-
-  fireEvent.change(input, { target: { value: "原始任务" } });
-  fireEvent.click(screen.getByRole("button", { name: "Send message" }));
-  expect(datapilotStore.getState().conversation.messages).toHaveLength(1);
-  expect(datapilotStore.getState().conversation.messages[0]?.id).toMatch(/^local-/);
-  fireEvent.change(input, { target: { value: "用户的新草稿" } });
-  submission.reject(new Error("submit failed"));
-
-  await waitFor(() =>
-    expect(consoleError).toHaveBeenCalledWith(
-      "Failed to submit DataPilot active turn",
-      expect.any(Error),
-    ),
-  );
-  expect(input).toHaveValue("用户的新草稿");
-  expect(datapilotStore.getState().conversation.messages).toEqual([]);
-  consoleError.mockRestore();
-});
-
-test("late active submit response cannot append into a restored session", async () => {
-  const submission = deferred<string>();
-  apiMocks.submitTurn.mockReturnValue(submission.promise);
-  apiMocks.listSessions.mockResolvedValue([
-    {
-      id: "session-b",
-      title: "Session B",
-      created_at: "2026-06-26T01:00:00Z",
-      updated_at: "2026-06-26T02:00:00Z",
-    },
-  ]);
-  apiMocks.getSession.mockImplementation((sessionId) =>
-    Promise.resolve(emptySessionDetail(sessionId)),
-  );
-  const opened: string[] = [];
-  apiMocks.streamSessionEvents.mockImplementation((sessionId, _cursor, signal) => {
-    opened.push(sessionId);
-    return waitingEventStream(signal);
-  });
-  datapilotStore.setState({
-    open: true,
-    mode: "active_session",
-    currentSessionId: "session-a",
-    sessions: [],
-    conversation: createAgentConversation(),
-  });
-  await renderAppWithDashboardSettled();
-
-  fireEvent.change(screen.getByPlaceholderText("继续描述任务…"), {
-    target: { value: "只属于 A 的消息" },
-  });
-  fireEvent.click(screen.getByRole("button", { name: "Send message" }));
-  await waitFor(() =>
-    expect(apiMocks.submitTurn).toHaveBeenCalledWith(
-      "session-a",
-      "只属于 A 的消息",
-      expect.stringMatching(/^local-/),
-    ),
-  );
-
-  fireEvent.click(screen.getByRole("button", { name: "History" }));
-  fireEvent.click(await screen.findByRole("button", { name: "Open session Session B" }));
-  await waitFor(() => expect(datapilotStore.getState().currentSessionId).toBe("session-b"));
-  const streamsBeforeLateResponse = [...opened];
-
-  submission.resolve("turn-a");
-  await act(async () => {
-    await submission.promise;
-    await Promise.resolve();
-  });
-
-  expect(datapilotStore.getState().mode).toBe("active_session");
-  expect(datapilotStore.getState().currentSessionId).toBe("session-b");
-  expect(datapilotStore.getState().conversation.messages).toEqual([]);
-  expect(screen.queryByText("只属于 A 的消息")).not.toBeInTheDocument();
-  expect(opened).toEqual(streamsBeforeLateResponse);
-});
-
-test("a stale rejection cannot remove messages or restore a draft in another session", async () => {
-  const submission = deferred<string>();
-  apiMocks.submitTurn.mockReturnValue(submission.promise);
-  apiMocks.listSessions.mockResolvedValue([
-    {
-      id: "session-b",
-      title: "Session B",
-      created_at: "2026-06-26T01:00:00Z",
-      updated_at: "2026-06-26T02:00:00Z",
-    },
-  ]);
-  apiMocks.getSession.mockImplementation((sessionId) => {
-    if (sessionId !== "session-b") {
-      return Promise.resolve(emptySessionDetail(sessionId));
-    }
-    return Promise.resolve({
-      ...emptySessionDetail("session-b"),
-      messages: [
-        {
-          id: "session-b-user",
-          session_id: "session-b",
-          role: "user",
-          content: "B 已有消息",
-          created_at: "2026-06-26T00:00:01Z",
-        },
-      ],
-    });
-  });
-  datapilotStore.setState({
-    open: true,
-    mode: "active_session",
-    currentSessionId: "session-a",
-    sessions: [],
-    conversation: createAgentConversation(),
-  });
-  await renderAppWithDashboardSettled();
-
-  fireEvent.change(screen.getByPlaceholderText("继续描述任务…"), {
-    target: { value: "A 的待定消息" },
-  });
-  fireEvent.click(screen.getByRole("button", { name: "Send message" }));
-  await waitFor(() =>
-    expect(apiMocks.submitTurn).toHaveBeenCalledWith(
-      "session-a",
-      "A 的待定消息",
-      expect.stringMatching(/^local-/),
-    ),
-  );
-  expect(datapilotStore.getState().conversation.messages).toHaveLength(1);
-  expect(datapilotStore.getState().conversation.messages[0]?.id).toMatch(/^local-/);
-
-  fireEvent.click(screen.getByRole("button", { name: "History" }));
-  fireEvent.click(await screen.findByRole("button", { name: "Open session Session B" }));
-  await waitFor(() => expect(datapilotStore.getState().currentSessionId).toBe("session-b"));
-  expect(screen.getByText("B 已有消息")).toBeVisible();
-  expect(screen.getByPlaceholderText("继续描述任务…")).toHaveValue("");
-
-  submission.reject(new Error("late failure from session A"));
-  await act(async () => {
-    try {
-      await submission.promise;
-    } catch {
-      // The component owns the expected rejection.
-    }
-    await Promise.resolve();
-  });
-
-  expect(datapilotStore.getState().currentSessionId).toBe("session-b");
-  expect(datapilotStore.getState().conversation.messages.map((message) => message.id)).toEqual([
-    "session-b-user",
-  ]);
-  expect(screen.getByPlaceholderText("继续描述任务…")).toHaveValue("");
-});
-
-test("deterministic rejection removes its exact optimistic row after an A/B/A lifecycle reset", async () => {
-  const consoleError = vi.spyOn(console, "error").mockImplementation(() => undefined);
-  const submission = deferred<string>();
-  apiMocks.submitTurn.mockReturnValue(submission.promise);
-  const sessionA = {
-    id: "session-a",
-    title: "Session A",
-    created_at: "2026-06-26T01:00:00Z",
-    updated_at: "2026-06-26T02:00:00Z",
-  };
-  const sessionB = { ...sessionA, id: "session-b", title: "Session B" };
-  apiMocks.listSessions.mockResolvedValue([sessionA, sessionB]);
-  apiMocks.getSession.mockImplementation((sessionId) =>
-    Promise.resolve(emptySessionDetail(sessionId)),
-  );
-  datapilotStore.setState({
-    open: true,
-    mode: "active_session",
-    currentSessionId: "session-a",
-    sessions: [sessionA, sessionB],
-    conversation: createAgentConversation(),
-  });
-  await renderAppWithDashboardSettled();
-
-  fireEvent.change(screen.getByPlaceholderText("继续描述任务…"), {
-    target: { value: "A 的确定失败消息" },
-  });
-  fireEvent.click(screen.getByRole("button", { name: "Send message" }));
-  await waitFor(() => expect(apiMocks.submitTurn).toHaveBeenCalledTimes(1));
-  const messageId = apiMocks.submitTurn.mock.calls[0]?.[2] as string;
-  expect(window.sessionStorage.getItem("datapilot-turn-outbox:session-a")).not.toBeNull();
-
-  fireEvent.click(screen.getByRole("button", { name: "History" }));
-  fireEvent.click(await screen.findByRole("button", { name: "Open session Session B" }));
-  await waitFor(() => expect(datapilotStore.getState().currentSessionId).toBe("session-b"));
-  fireEvent.click(screen.getByRole("button", { name: "History" }));
-  fireEvent.click(await screen.findByRole("button", { name: "Open session Session A" }));
-  await waitFor(() => expect(datapilotStore.getState().currentSessionId).toBe("session-a"));
-  await waitFor(() =>
-    expect(datapilotStore.getState().conversation.messages.map((message) => message.id)).toContain(
-      messageId,
-    ),
-  );
-  const composer = screen.getByPlaceholderText("继续描述任务…");
-  fireEvent.change(composer, { target: { value: "A 的更新草稿" } });
-
-  submission.reject(new Error("deterministic rejection after lifecycle reset"));
-  await act(async () => {
-    try {
-      await submission.promise;
-    } catch {
-      // The component owns the expected rejection.
-    }
-    await Promise.resolve();
-  });
-
-  expect(datapilotStore.getState().conversation.messages.map((message) => message.id)).not.toContain(
-    messageId,
-  );
-  expect(window.sessionStorage.getItem("datapilot-turn-outbox:session-a")).toBeNull();
-  expect(composer).toHaveValue("A 的更新草稿");
-  consoleError.mockRestore();
-});
-
-test("late active submit response cannot append after deleting its session", async () => {
-  const submission = deferred<string>();
-  apiMocks.submitTurn.mockReturnValue(submission.promise);
-  apiMocks.listSessions.mockResolvedValue([
-    {
-      id: "session-a",
-      title: "Session A",
-      created_at: "2026-06-26T01:00:00Z",
-      updated_at: "2026-06-26T02:00:00Z",
-    },
-  ]);
-  apiMocks.getSession.mockResolvedValue(emptySessionDetail("session-a"));
-  datapilotStore.setState({
-    open: true,
-    mode: "active_session",
-    currentSessionId: "session-a",
-    sessions: [],
-    conversation: createAgentConversation(),
-  });
-  await renderAppWithDashboardSettled();
-
-  fireEvent.change(screen.getByPlaceholderText("继续描述任务…"), {
-    target: { value: "删除后不得出现" },
-  });
-  fireEvent.click(screen.getByRole("button", { name: "Send message" }));
-  await waitFor(() =>
-    expect(apiMocks.submitTurn).toHaveBeenCalledWith(
-      "session-a",
-      "删除后不得出现",
-      expect.stringMatching(/^local-/),
-    ),
-  );
-
-  fireEvent.click(screen.getByRole("button", { name: "History" }));
-  fireEvent.click(await screen.findByRole("button", { name: "Delete session Session A" }));
-  await waitFor(() => expect(datapilotStore.getState().mode).toBe("draft_new_session"));
-
-  submission.resolve("turn-a");
-  await act(async () => {
-    await submission.promise;
-    await Promise.resolve();
-  });
-
-  expect(datapilotStore.getState().mode).toBe("draft_new_session");
-  expect(datapilotStore.getState().currentSessionId).toBeNull();
-  expect(datapilotStore.getState().conversation.messages).toEqual([]);
-  expect(screen.queryByText("删除后不得出现")).not.toBeInTheDocument();
-});
-
-test("an active submit appends optimistically and HTTP success does not duplicate it", async () => {
-  const submission = deferred<string>();
-  apiMocks.submitTurn.mockReturnValue(submission.promise);
-  apiMocks.getSession.mockResolvedValue(emptySessionDetail("session-a"));
-  datapilotStore.setState({
-    open: true,
-    mode: "active_session",
-    currentSessionId: "session-a",
-    sessions: [],
-    conversation: createAgentConversation(),
-  });
-  await renderAppWithDashboardSettled();
-
-  fireEvent.change(screen.getByPlaceholderText("继续描述任务…"), {
-    target: { value: "合法迟到消息" },
-  });
-  fireEvent.click(screen.getByRole("button", { name: "Send message" }));
-  await waitFor(() =>
-    expect(apiMocks.submitTurn).toHaveBeenCalledWith(
-      "session-a",
-      "合法迟到消息",
-      expect.stringMatching(/^local-/),
-    ),
-  );
-  expect(screen.getByText("合法迟到消息")).toBeVisible();
-  expect(datapilotStore.getState().conversation.messages).toHaveLength(1);
-  const optimisticMessageId = datapilotStore.getState().conversation.messages[0]?.id;
-  expect(optimisticMessageId).toMatch(/^local-/);
-
-  submission.resolve("turn-a");
-  await act(async () => {
-    await submission.promise;
-    await Promise.resolve();
-  });
-  expect(datapilotStore.getState().conversation.messages.map((message) => message.id)).toEqual([
-    optimisticMessageId,
-  ]);
-});
-
-test("active submit is synchronously latched while request admission is pending", async () => {
-  const firstSubmission = deferred<string>();
-  apiMocks.submitTurn.mockReturnValue(firstSubmission.promise);
-  apiMocks.getSession.mockResolvedValue(emptySessionDetail("session-a"));
-  datapilotStore.setState({
-    open: true,
-    mode: "active_session",
-    currentSessionId: "session-a",
-    sessions: [],
-    conversation: createAgentConversation(),
-  });
-  await renderAppWithDashboardSettled();
-  const input = screen.getByPlaceholderText("继续描述任务…");
-
-  fireEvent.change(input, { target: { value: "第一条" } });
-  fireEvent.click(screen.getByRole("button", { name: "Send message" }));
-  fireEvent.change(input, { target: { value: "第二条" } });
-  fireEvent.click(screen.getByRole("button", { name: "Send message" }));
-  expect(apiMocks.submitTurn).toHaveBeenNthCalledWith(
-    1,
-    "session-a",
-    "第一条",
-    expect.stringMatching(/^local-/),
-  );
-  expect(apiMocks.submitTurn).toHaveBeenCalledTimes(1);
-  expect(input).toHaveValue("第二条");
-
-  firstSubmission.resolve("turn-1");
-  await screen.findByText("第一条");
-  expect(screen.queryByText("第二条")).not.toBeInTheDocument();
-  expect(datapilotStore.getState().conversation.messages).toHaveLength(1);
-  expect(input).toHaveValue("第二条");
-  expect(screen.getByRole("button", { name: "Send message" })).toBeDisabled();
-  fireEvent.click(screen.getByRole("button", { name: "Send message" }));
-  expect(apiMocks.submitTurn).toHaveBeenCalledTimes(1);
-
-  act(() => {
-    datapilotStore.getState().applyEvent(
-      publicEnvelope(
-        1,
-        {
-          id: "reply-start-1",
-          created_at: "2026-06-26T00:00:01Z",
-          type: EventType.REPLY_START,
-          session_id: "session-a",
-          reply_id: "reply-1",
-          name: "DataPilot",
-          role: "assistant",
-        },
-        "session-a",
-      ),
-    );
-  });
-  expect(screen.getByRole("button", { name: "Stop current run" })).toBeEnabled();
-  act(() => {
-    datapilotStore.getState().applyEvent(
-      publicEnvelope(
-        2,
-        {
-          id: "reply-end-1",
-          created_at: "2026-06-26T00:00:02Z",
-          type: EventType.REPLY_END,
-          session_id: "session-a",
-          reply_id: "reply-1",
-        },
-        "session-a",
-      ),
-    );
-  });
-  fireEvent.click(screen.getByRole("button", { name: "Send message" }));
-  expect(apiMocks.submitTurn).toHaveBeenCalledTimes(2);
-  expect(apiMocks.submitTurn).toHaveBeenLastCalledWith(
-    "session-a",
-    "第二条",
-    expect.stringMatching(/^local-/),
-  );
-});
-
-test("REPLY_START arriving before the submit response releases admission after HTTP accepts", async () => {
-  const submission = deferred<string>();
-  const streamedStart = deferred<PublicEventEnvelope>();
-  apiMocks.submitTurn.mockReturnValue(submission.promise);
-  apiMocks.streamSessionEvents.mockImplementation((_sessionId, _cursor, signal) =>
-    (async function* () {
-      yield await streamedStart.promise;
-      await waitForAbort(signal);
-    })(),
-  );
-  datapilotStore.setState({
-    open: true,
-    mode: "active_session",
-    currentSessionId: "session-a",
-    conversation: createAgentConversation(),
-  });
-  await renderAppWithDashboardSettled();
-  const input = screen.getByPlaceholderText("继续描述任务…");
-
-  fireEvent.change(input, { target: { value: "第一条" } });
-  fireEvent.click(screen.getByRole("button", { name: "Send message" }));
-  streamedStart.resolve(
-    publicEnvelope(
-      1,
-      {
-        id: "reply-start-before-http",
-        created_at: "2026-06-26T00:00:01Z",
-        type: EventType.REPLY_START,
-        session_id: "session-a",
-        reply_id: "reply-before-http",
-        name: "DataPilot",
-        role: "assistant",
-      },
-      "session-a",
-    ),
-  );
-
-  await waitFor(() =>
-    expect(screen.getByRole("button", { name: "Stop current run" })).toBeDisabled(),
-  );
-  expect(datapilotStore.getState().conversation.messages.map((message) => message.role)).toEqual([
-    "user",
-    "assistant",
-  ]);
-  expect(datapilotStore.getState().conversation.messages[0]?.id).toMatch(/^local-/);
-  expect(datapilotStore.getState().conversation.messages[1]?.id).toBe("reply-before-http");
-  submission.resolve("turn-1");
-  await waitFor(() =>
-    expect(screen.getByRole("button", { name: "Stop current run" })).toBeEnabled(),
-  );
-
-  act(() => {
-    datapilotStore.getState().applyEvent(
-      publicEnvelope(
-        2,
-        {
-          id: "reply-end-before-http",
-          created_at: "2026-06-26T00:00:02Z",
-          type: EventType.REPLY_END,
-          session_id: "session-a",
-          reply_id: "reply-before-http",
-        },
-        "session-a",
-      ),
-    );
-  });
-  fireEvent.change(input, { target: { value: "第二条" } });
-  fireEvent.click(screen.getByRole("button", { name: "Send message" }));
-  expect(apiMocks.submitTurn).toHaveBeenCalledTimes(2);
-});
-
-test("a matching authoritative run terminal releases admission when no reply starts", async () => {
-  const firstTerminal = deferred<PublicEventEnvelope>();
-  const matchingTerminal = deferred<PublicEventEnvelope>();
-  apiMocks.submitTurn.mockResolvedValue("turn-accepted");
-  apiMocks.streamSessionEvents.mockImplementation((_sessionId, _cursor, signal) =>
-    (async function* () {
-      yield await firstTerminal.promise;
-      yield await matchingTerminal.promise;
-      await waitForAbort(signal);
-    })(),
-  );
-  datapilotStore.setState({
-    open: true,
-    mode: "active_session",
-    currentSessionId: "session-a",
-    conversation: createAgentConversation(),
-  });
-  await renderAppWithDashboardSettled();
-  const input = screen.getByPlaceholderText("继续描述任务…");
-
-  fireEvent.change(input, { target: { value: "第一条" } });
-  fireEvent.click(screen.getByRole("button", { name: "Send message" }));
-  await waitFor(() => expect(apiMocks.submitTurn).toHaveBeenCalledTimes(1));
-  expect(screen.getByRole("button", { name: "Send message" })).toBeDisabled();
-
-  firstTerminal.resolve(
-    publicEnvelope(
-      1,
-      {
-        id: "run-terminal-other",
-        created_at: "2026-06-26T00:00:01Z",
-        type: EventType.CUSTOM,
-        name: "datapilot_run_terminal",
-        value: { turn_id: "turn-other", status: "failure" },
-      },
-      "session-a",
-    ),
-  );
-  await act(async () => {
-    await firstTerminal.promise;
-    await Promise.resolve();
-  });
-  expect(screen.getByRole("button", { name: "Send message" })).toBeDisabled();
-
-  matchingTerminal.resolve(
-    publicEnvelope(
-      2,
-      {
-        id: "run-terminal-accepted",
-        created_at: "2026-06-26T00:00:02Z",
-        type: EventType.CUSTOM,
-        name: "datapilot_run_terminal",
-        value: { turn_id: "turn-accepted", status: "failure" },
-      },
-      "session-a",
-    ),
-  );
-  await waitFor(() =>
-    expect(screen.getByRole("button", { name: "Send message" })).toBeEnabled(),
-  );
-  fireEvent.change(input, { target: { value: "第二条" } });
-  fireEvent.click(screen.getByRole("button", { name: "Send message" }));
-  expect(apiMocks.submitTurn).toHaveBeenCalledTimes(2);
-});
-
-test("reopening an active session opens its SSE stream before submitting the turn", async () => {
+test("reopening an active session opens events before submitting the turn", async () => {
   const calls: string[] = [];
-  apiMocks.streamSessionEvents.mockImplementation((sessionId, afterSequence, signal) => {
-    calls.push(`stream:${sessionId}:${afterSequence}`);
-    return waitingEventStream(signal);
+  apiMocks.openSessionEvents.mockImplementation((sessionId) => {
+    calls.push(`open:${sessionId}`);
+    return activeSocket();
   });
   apiMocks.submitTurn.mockImplementation(async (sessionId) => {
     calls.push(`submit:${sessionId}`);
@@ -3178,6 +1512,7 @@ test("reopening an active session opens its SSE stream before submitting the tur
         title: "Existing session",
         created_at: "2026-06-26T00:00:00Z",
         updated_at: "2026-06-26T00:00:00Z",
+        status: "active",
       },
     ],
   });
@@ -3190,23 +1525,18 @@ test("reopening an active session opens its SSE stream before submitting the tur
   });
   fireEvent.click(screen.getByRole("button", { name: "Send message" }));
 
-  await waitFor(() =>
-    expect(apiMocks.submitTurn).toHaveBeenCalledWith(
-      "session-1",
-      "恢复后继续",
-      expect.stringMatching(/^local-/),
-    ),
-  );
-  expect(calls).toEqual(["stream:session-1:0", "stream:session-1:0", "submit:session-1"]);
+  await waitFor(() => expect(apiMocks.submitTurn).toHaveBeenCalledWith("session-1", "恢复后继续"));
+  expect(calls).toEqual(["open:session-1", "open:session-1", "submit:session-1"]);
 });
 
-test("reopening an active session refreshes replayed assistant events from the backend", async () => {
+test("reopening an active session refreshes persisted messages from the backend", async () => {
   apiMocks.getSession
     .mockResolvedValueOnce({
       id: "session-1",
       title: "Existing session",
       created_at: "2026-06-26T00:00:00Z",
       updated_at: "2026-06-26T00:01:00Z",
+      status: "active",
       messages: [
         {
           id: "message-1",
@@ -3216,15 +1546,13 @@ test("reopening an active session refreshes replayed assistant events from the b
           created_at: "2026-06-26T00:01:00Z",
         },
       ],
-      events: [],
-      tool_runs: [],
-      last_sequence: 0,
     })
     .mockResolvedValueOnce({
       id: "session-1",
       title: "Existing session",
       created_at: "2026-06-26T00:00:00Z",
       updated_at: "2026-06-26T00:03:00Z",
+      status: "active",
       messages: [
         {
           id: "message-1",
@@ -3233,10 +1561,14 @@ test("reopening an active session refreshes replayed assistant events from the b
           content: "清洗已有数据",
           created_at: "2026-06-26T00:01:00Z",
         },
+        {
+          id: "message-2",
+          session_id: "session-1",
+          role: "assistant",
+          content: "后台完成后的助手回复",
+          created_at: "2026-06-26T00:03:00Z",
+        },
       ],
-      events: replayedAssistantReply("后台完成后的助手回复"),
-      tool_runs: [],
-      last_sequence: 3,
     });
   datapilotStore.setState({
     open: true,
@@ -3249,12 +1581,18 @@ test("reopening an active session refreshes replayed assistant events from the b
         title: "Existing session",
         created_at: "2026-06-26T00:00:00Z",
         updated_at: "2026-06-26T00:00:00Z",
+        status: "active",
       },
     ],
-    conversation: {
-      ...createAgentConversation(),
-      messages: [UserMsg({ name: "You", content: "清洗已有数据" })],
-    },
+    messages: [
+      {
+        id: "message-1",
+        session_id: "session-1",
+        role: "user",
+        content: "清洗已有数据",
+        created_at: "2026-06-26T00:01:00Z",
+      },
+    ],
   });
 
   await renderAppWithDashboardSettled();
@@ -3266,21 +1604,16 @@ test("reopening an active session refreshes replayed assistant events from the b
   expect(screen.getByText("后台完成后的助手回复")).toBeVisible();
 });
 
-test("reopening an active session starts a new selected stream without submitting", async () => {
-  const signals: AbortSignal[] = [];
-  apiMocks.streamSessionEvents.mockImplementation((_sessionId, _afterSequence, signal) => {
-    signals.push(signal);
-    return waitingEventStream(signal);
-  });
+test("reopening an active session reopens the event stream before another turn is submitted", async () => {
+  const close = vi.fn();
+  apiMocks.openSessionEvents.mockReturnValue(activeSocket(close));
   apiMocks.getSession.mockResolvedValue({
     id: "session-1",
     title: "Existing session",
     created_at: "2026-06-26T00:00:00Z",
     updated_at: "2026-06-26T00:00:00Z",
+    status: "active",
     messages: [],
-    events: [],
-    tool_runs: [],
-    last_sequence: 0,
   });
   datapilotStore.setState({
     open: true,
@@ -3293,36 +1626,50 @@ test("reopening an active session starts a new selected stream without submittin
         title: "Existing session",
         created_at: "2026-06-26T00:00:00Z",
         updated_at: "2026-06-26T00:00:00Z",
+        status: "active",
       },
     ],
   });
 
   await renderAppWithDashboardSettled();
-  await waitFor(() => expect(apiMocks.streamSessionEvents).toHaveBeenCalledWith("session-1", 0, expect.any(AbortSignal)));
+  await waitFor(() => expect(apiMocks.openSessionEvents).toHaveBeenCalledWith("session-1", expect.any(Function)));
   fireEvent.click(screen.getByRole("button", { name: "Close DataPilot" }));
-  await waitFor(() => expect(signals[0]?.aborted).toBe(true));
+  await waitFor(() => expect(close).toHaveBeenCalledTimes(1));
   fireEvent.click(screen.getByRole("button", { name: "Open DataPilot" }));
 
-  await waitFor(() => expect(apiMocks.streamSessionEvents).toHaveBeenCalledTimes(2));
-  expect(apiMocks.streamSessionEvents).toHaveBeenLastCalledWith("session-1", 0, expect.any(AbortSignal));
+  await waitFor(() => expect(apiMocks.openSessionEvents).toHaveBeenCalledTimes(2));
+  expect(apiMocks.openSessionEvents).toHaveBeenLastCalledWith("session-1", expect.any(Function));
   expect(apiMocks.submitTurn).not.toHaveBeenCalled();
 });
 
-test("an ended selected stream refreshes the snapshot and reconnects from its current cursor", async () => {
-  apiMocks.streamSessionEvents
-    .mockImplementationOnce(async function* () {
-      return;
-    })
-    .mockImplementation((_sessionId, _afterSequence, signal) => waitingEventStream(signal));
+test("event stream close refreshes the active session and reconnects", async () => {
+  let closeHandler: (() => void) | undefined;
+  const addEventListener = vi.fn((type: string, handler: () => void) => {
+    if (type === "close") {
+      closeHandler = handler;
+    }
+  });
+  apiMocks.openSessionEvents.mockReturnValue({
+    close: vi.fn(),
+    addEventListener,
+    readyState: WebSocket.OPEN,
+  } as unknown as WebSocket);
   apiMocks.getSession.mockResolvedValue({
     id: "session-1",
     title: "Existing session",
     created_at: "2026-06-26T00:00:00Z",
     updated_at: "2026-06-26T00:00:00Z",
-    messages: [],
-    events: replayedAssistantReply("断线期间完成的回复"),
-    tool_runs: [],
-    last_sequence: 3,
+    status: "active",
+    messages: [
+      {
+        id: "message-1",
+        session_id: "session-1",
+        role: "assistant",
+        content: "断线期间完成的回复",
+        created_at: "2026-06-26T00:01:00Z",
+      },
+    ],
+    events: [],
   });
   datapilotStore.setState({
     open: true,
@@ -3335,402 +1682,632 @@ test("an ended selected stream refreshes the snapshot and reconnects from its cu
         title: "Existing session",
         created_at: "2026-06-26T00:00:00Z",
         updated_at: "2026-06-26T00:00:00Z",
+        status: "active",
       },
     ],
   });
 
   await renderAppWithDashboardSettled();
-  await waitFor(() => expect(apiMocks.streamSessionEvents).toHaveBeenCalledTimes(1));
+  await waitFor(() => expect(apiMocks.openSessionEvents).toHaveBeenCalledTimes(1));
+  await waitFor(() => expect(closeHandler).toBeDefined());
+
+  await act(async () => {
+    closeHandler?.();
+  });
+
   await waitFor(() => expect(screen.getByText("断线期间完成的回复")).toBeVisible());
-  await waitFor(() => expect(apiMocks.streamSessionEvents).toHaveBeenCalledTimes(2));
-  expect(apiMocks.streamSessionEvents).toHaveBeenLastCalledWith(
-    "session-1",
-    3,
-    expect.any(AbortSignal),
-  );
+  await waitFor(() => expect(apiMocks.openSessionEvents).toHaveBeenCalledTimes(2));
 });
 
-test("a retryable selected-stream error reconnects once from the preserved cursor", async () => {
-  const consoleError = vi.spyOn(console, "error").mockImplementation(() => undefined);
-  apiMocks.streamSessionEvents
-    .mockImplementationOnce(async function* () {
-      throw new Error("temporary disconnect");
-    })
-    .mockImplementation((_sessionId, _afterSequence, signal) => waitingEventStream(signal));
-  apiMocks.getSession.mockResolvedValue({
+test("opening a history session does not reconnect the event stream", async () => {
+  datapilotStore.setState({
+    open: false,
+    mode: "history_session",
+    currentSessionId: "history-1",
+    previousActiveSessionId: null,
+    sessions: [
+      {
+        id: "history-1",
+        title: "历史任务",
+        created_at: "2026-06-25T01:00:00Z",
+        updated_at: "2026-06-25T02:00:00Z",
+        status: "historical",
+      },
+    ],
+    messages: [
+      {
+        id: "history-message-1",
+        session_id: "history-1",
+        role: "assistant",
+        content: "历史助手回复",
+        created_at: "2026-06-25T01:02:00Z",
+      },
+    ],
+  });
+
+  await renderAppWithDashboardSettled();
+  fireEvent.click(screen.getByRole("button", { name: "Open DataPilot" }));
+
+  expect(apiMocks.getSession).not.toHaveBeenCalled();
+  expect(apiMocks.openSessionEvents).not.toHaveBeenCalled();
+  expect(screen.getByText("历史助手回复")).toBeVisible();
+});
+
+test("stale active session refreshes do not overwrite draft mode", async () => {
+  let resolveSession: (value: Awaited<ReturnType<typeof getSession>>) => void = () => undefined;
+  apiMocks.getSession.mockReturnValue(
+    new Promise((resolve) => {
+      resolveSession = resolve;
+    }),
+  );
+  datapilotStore.setState({
+    open: true,
+    mode: "active_session",
+    currentSessionId: "session-1",
+    previousActiveSessionId: null,
+    sessions: [
+      {
+        id: "session-1",
+        title: "Existing session",
+        created_at: "2026-06-26T00:00:00Z",
+        updated_at: "2026-06-26T00:00:00Z",
+        status: "active",
+      },
+    ],
+  });
+
+  await renderAppWithDashboardSettled();
+  await waitFor(() => expect(apiMocks.getSession).toHaveBeenCalledWith("session-1"));
+  fireEvent.click(screen.getByRole("button", { name: "New session" }));
+  resolveSession({
     id: "session-1",
     title: "Existing session",
     created_at: "2026-06-26T00:00:00Z",
-    updated_at: "2026-06-26T00:00:00Z",
-    messages: [],
-    events: [],
-    tool_runs: [],
-    last_sequence: 5,
-  });
-  datapilotStore.setState({
-    open: true,
-    mode: "active_session",
-    currentSessionId: "session-1",
-    conversation: { ...createAgentConversation(), lastSequence: 5 },
+    updated_at: "2026-06-26T00:03:00Z",
+    status: "active",
+    messages: [
+      {
+        id: "message-2",
+        session_id: "session-1",
+        role: "assistant",
+        content: "过期刷新不应出现",
+        created_at: "2026-06-26T00:03:00Z",
+      },
+    ],
   });
 
-  await renderAppWithDashboardSettled();
-
-  await waitFor(() => expect(apiMocks.streamSessionEvents).toHaveBeenCalledTimes(2));
-  expect(apiMocks.streamSessionEvents).toHaveBeenNthCalledWith(
-    2,
-    "session-1",
-    5,
-    expect.any(AbortSignal),
-  );
-  expect(consoleError).toHaveBeenCalledWith(
-    "DataPilot event stream failed",
-    expect.any(Error),
-  );
-  consoleError.mockRestore();
+  await waitFor(() => expect(datapilotStore.getState().mode).toBe("draft_new_session"));
+  expect(datapilotStore.getState().currentSessionId).toBeNull();
+  expect(screen.getByText("开始一个任务")).toBeVisible();
+  expect(screen.queryByText("过期刷新不应出现")).not.toBeInTheDocument();
 });
 
-test("unmount invalidates a stream while its reconnect snapshot is pending", async () => {
-  const reconnectSnapshot = deferred<ReturnType<typeof emptySessionDetail>>();
-  let endedSignal: AbortSignal | undefined;
-  apiMocks.streamSessionEvents.mockImplementation((_sessionId, _cursor, signal) => {
-    endedSignal = signal;
-    return (async function* () {
-      return;
-    })();
-  });
-  apiMocks.getSession
-    .mockResolvedValueOnce(emptySessionDetail("session-1"))
-    .mockReturnValueOnce(reconnectSnapshot.promise);
-  datapilotStore.setState({
-    open: true,
-    mode: "active_session",
-    currentSessionId: "session-1",
-    conversation: createAgentConversation(),
-  });
-
-  const rendered = render(<DataPilotWindow />);
-  await waitFor(() => expect(apiMocks.getSession).toHaveBeenCalledTimes(2));
-  rendered.unmount();
-
-  expect(endedSignal?.aborted).toBe(true);
-  reconnectSnapshot.resolve(emptySessionDetail("session-1"));
-  await act(async () => {
-    await reconnectSnapshot.promise;
-    await new Promise((resolve) => window.setTimeout(resolve, 350));
-  });
-  expect(apiMocks.streamSessionEvents).toHaveBeenCalledTimes(1);
-});
-
-test("unmount cancels an already queued reconnect timer and its ended lease", async () => {
-  vi.useFakeTimers();
-  try {
-    let endedSignal: AbortSignal | undefined;
-    apiMocks.streamSessionEvents.mockImplementation((_sessionId, _cursor, signal) => {
-      endedSignal = signal;
-      return (async function* () {
-        return;
-      })();
-    });
-    apiMocks.getSession.mockResolvedValue(emptySessionDetail("session-1"));
-    datapilotStore.setState({
-      open: true,
-      mode: "active_session",
-      currentSessionId: "session-1",
-      conversation: createAgentConversation(),
-    });
-
-    const rendered = render(<DataPilotWindow />);
-    await act(async () => {
-      for (let index = 0; index < 6; index += 1) await Promise.resolve();
-    });
-    expect(vi.getTimerCount()).toBeGreaterThan(0);
-    rendered.unmount();
-
-    expect(endedSignal?.aborted).toBe(true);
-    await act(async () => {
-      await vi.runAllTimersAsync();
-    });
-    expect(apiMocks.streamSessionEvents).toHaveBeenCalledTimes(1);
-  } finally {
-    vi.useRealTimers();
-  }
-});
-
-test("StrictMode leaves exactly one selected-session lease alive", async () => {
-  const signals: AbortSignal[] = [];
-  apiMocks.streamSessionEvents.mockImplementation((_sessionId, _cursor, signal) => {
-    signals.push(signal);
-    return waitingEventStream(signal);
-  });
-  apiMocks.getSession.mockResolvedValue(emptySessionDetail("session-1"));
-  datapilotStore.setState({
-    open: true,
-    mode: "active_session",
-    currentSessionId: "session-1",
-    conversation: createAgentConversation(),
-  });
-
-  const rendered = render(
-    <StrictMode>
-      <DataPilotWindow />
-    </StrictMode>,
-  );
-  await waitFor(() => expect(signals.length).toBeGreaterThanOrEqual(2));
-
-  expect(signals.filter((signal) => !signal.aborted)).toHaveLength(1);
-  expect(signals.at(-1)?.aborted).toBe(false);
-  rendered.unmount();
-  expect(signals.at(-1)?.aborted).toBe(true);
-});
-
-
-test("selecting any saved session restores it as writable active_session", async () => {
+test("selecting a history session restores persisted messages and hides active controls", async () => {
   apiMocks.listSessions.mockResolvedValue([
     {
-      id: "saved-1",
-      title: "保存任务",
+      id: "history-1",
+      title: "历史任务",
       created_at: "2026-06-25T01:00:00Z",
       updated_at: "2026-06-25T02:00:00Z",
+      status: "historical",
     },
   ]);
   apiMocks.getSession.mockResolvedValue({
-    id: "saved-1",
-    title: "保存任务",
+    id: "history-1",
+    title: "历史任务",
     created_at: "2026-06-25T01:00:00Z",
     updated_at: "2026-06-25T02:00:00Z",
+    status: "historical",
     messages: [
       {
-        id: "user-1",
-        session_id: "saved-1",
+        id: "history-message-1",
+        session_id: "history-1",
         role: "user",
-        content: "上一轮任务",
+        content: "历史用户消息",
+        created_at: "2026-06-25T01:01:00Z",
+      },
+      {
+        id: "history-message-2",
+        session_id: "history-1",
+        role: "assistant",
+        content: "历史助手回复",
+        created_at: "2026-06-25T01:02:00Z",
+      },
+    ],
+  });
+
+  await renderAppWithDashboardSettled();
+
+  fireEvent.click(screen.getByRole("button", { name: "Open DataPilot" }));
+  fireEvent.click(screen.getByRole("button", { name: "History" }));
+  fireEvent.click(await screen.findByRole("button", { name: /历史任务/ }));
+
+  await waitFor(() => expect(apiMocks.getSession).toHaveBeenCalledWith("history-1"));
+  expect(datapilotStore.getState().mode).toBe("history_session");
+  expect(screen.getByText("历史用户消息")).toBeVisible();
+  expect(screen.getByText("历史助手回复")).toBeVisible();
+  expect(screen.queryByPlaceholderText("继续描述任务…")).not.toBeInTheDocument();
+  expect(screen.queryByText("继续任务")).not.toBeInTheDocument();
+});
+
+test("selecting an active session from history restores active controls and can submit another turn", async () => {
+  apiMocks.listSessions.mockResolvedValue([
+    {
+      id: "active-1",
+      title: "活跃任务",
+      created_at: "2026-06-25T01:00:00Z",
+      updated_at: "2026-06-25T02:00:00Z",
+      status: "active",
+    },
+  ]);
+  apiMocks.getSession.mockResolvedValue({
+    id: "active-1",
+    title: "活跃任务",
+    created_at: "2026-06-25T01:00:00Z",
+    updated_at: "2026-06-25T02:00:00Z",
+    status: "active",
+    messages: [
+      {
+        id: "active-message-1",
+        session_id: "active-1",
+        role: "user",
+        content: "上一轮用户消息",
         created_at: "2026-06-25T01:01:00Z",
       },
     ],
-    events: [],
-    tool_runs: [],
-    last_sequence: 0,
   });
+
   await renderAppWithDashboardSettled();
 
   fireEvent.click(screen.getByRole("button", { name: "Open DataPilot" }));
   fireEvent.click(screen.getByRole("button", { name: "History" }));
-  fireEvent.click(await screen.findByRole("button", { name: "Open session 保存任务" }));
+  fireEvent.click(await screen.findByRole("button", { name: /活跃任务/ }));
 
-  await waitFor(() => expect(apiMocks.getSession).toHaveBeenCalledWith("saved-1"));
+  await waitFor(() => expect(apiMocks.getSession).toHaveBeenCalledWith("active-1"));
   expect(datapilotStore.getState().mode).toBe("active_session");
-  expect(screen.getByText("上一轮任务")).toBeVisible();
+  expect(screen.getByText("上一轮用户消息")).toBeVisible();
+
   fireEvent.change(screen.getByPlaceholderText("继续描述任务…"), {
-    target: { value: "继续执行" },
-  });
-  fireEvent.click(screen.getByRole("button", { name: "Send message" }));
-  await waitFor(() =>
-    expect(apiMocks.submitTurn).toHaveBeenCalledWith(
-      "saved-1",
-      "继续执行",
-      expect.stringMatching(/^local-/),
-    ),
-  );
-});
-
-test("reselecting the current history session replaces its stream", async () => {
-  const signals: AbortSignal[] = [];
-  apiMocks.listSessions.mockResolvedValue([
-    {
-      id: "session-a",
-      title: "Session A",
-      created_at: "2026-06-25T01:00:00Z",
-      updated_at: "2026-06-25T02:00:00Z",
-    },
-  ]);
-  apiMocks.getSession.mockResolvedValue(emptySessionDetail("session-a"));
-  apiMocks.streamSessionEvents.mockImplementation((_sessionId, _cursor, signal) => {
-    signals.push(signal);
-    return waitingEventStream(signal);
-  });
-  datapilotStore.setState({
-    open: true,
-    mode: "active_session",
-    currentSessionId: "session-a",
-    sessions: [],
-    conversation: createAgentConversation(),
-  });
-  await renderAppWithDashboardSettled();
-  await waitFor(() => expect(apiMocks.streamSessionEvents).toHaveBeenCalledTimes(1));
-
-  fireEvent.click(screen.getByRole("button", { name: "History" }));
-  fireEvent.click(await screen.findByRole("button", { name: "Open session Session A" }));
-
-  await waitFor(() => expect(apiMocks.streamSessionEvents).toHaveBeenCalledTimes(2));
-  expect(signals[0]?.aborted).toBe(true);
-  expect(signals[1]?.aborted).toBe(false);
-  expect(datapilotStore.getState().currentSessionId).toBe("session-a");
-});
-
-test("rapid history selections keep only the latest response and stream", async () => {
-  const sessionB = deferred<ReturnType<typeof emptySessionDetail>>();
-  const sessionC = deferred<ReturnType<typeof emptySessionDetail>>();
-  apiMocks.listSessions.mockResolvedValue([
-    {
-      id: "session-b",
-      title: "Session B",
-      created_at: "2026-06-25T01:00:00Z",
-      updated_at: "2026-06-25T02:00:00Z",
-    },
-    {
-      id: "session-c",
-      title: "Session C",
-      created_at: "2026-06-25T01:00:00Z",
-      updated_at: "2026-06-25T02:00:00Z",
-    },
-  ]);
-  apiMocks.getSession.mockImplementation((sessionId) =>
-    sessionId === "session-b" ? sessionB.promise : sessionC.promise,
-  );
-  const opened: string[] = [];
-  apiMocks.streamSessionEvents.mockImplementation((sessionId, _cursor, signal) => {
-    opened.push(sessionId);
-    return waitingEventStream(signal);
-  });
-  await renderAppWithDashboardSettled();
-  fireEvent.click(screen.getByRole("button", { name: "Open DataPilot" }));
-  fireEvent.click(screen.getByRole("button", { name: "History" }));
-
-  fireEvent.click(await screen.findByRole("button", { name: "Open session Session B" }));
-  fireEvent.click(screen.getByRole("button", { name: "Open session Session C" }));
-  sessionC.resolve(emptySessionDetail("session-c", 4));
-
-  await waitFor(() => expect(datapilotStore.getState().currentSessionId).toBe("session-c"));
-  expect(opened).toEqual(["session-c"]);
-
-  sessionB.resolve(emptySessionDetail("session-b", 2));
-  await act(async () => {
-    await sessionB.promise;
-    await Promise.resolve();
-  });
-
-  expect(datapilotStore.getState().currentSessionId).toBe("session-c");
-  expect(opened).toEqual(["session-c"]);
-});
-
-test("deleting a session while its history snapshot is pending prevents resurrection", async () => {
-  const sessionB = deferred<ReturnType<typeof emptySessionDetail>>();
-  apiMocks.listSessions.mockResolvedValue([
-    {
-      id: "session-b",
-      title: "Session B",
-      created_at: "2026-06-25T01:00:00Z",
-      updated_at: "2026-06-25T02:00:00Z",
-    },
-  ]);
-  apiMocks.getSession.mockImplementation((sessionId) =>
-    sessionId === "session-b"
-      ? sessionB.promise
-      : Promise.resolve(emptySessionDetail("session-a")),
-  );
-  const opened: string[] = [];
-  const signals: AbortSignal[] = [];
-  apiMocks.streamSessionEvents.mockImplementation((sessionId, _cursor, signal) => {
-    opened.push(sessionId);
-    signals.push(signal);
-    return waitingEventStream(signal);
-  });
-  datapilotStore.setState({
-    open: true,
-    mode: "active_session",
-    currentSessionId: "session-a",
-    sessions: [],
-    conversation: createAgentConversation(),
-  });
-  await renderAppWithDashboardSettled();
-  await waitFor(() => expect(opened).toEqual(["session-a"]));
-  fireEvent.click(screen.getByRole("button", { name: "History" }));
-
-  fireEvent.click(await screen.findByRole("button", { name: "Open session Session B" }));
-  await waitFor(() => expect(signals[0]?.aborted).toBe(true));
-  fireEvent.click(screen.getByRole("button", { name: "Delete session Session B" }));
-  await waitFor(() => expect(apiMocks.deleteSession).toHaveBeenCalledWith("session-b"));
-  await waitFor(() => expect(opened).toEqual(["session-a", "session-a"]));
-  sessionB.resolve(emptySessionDetail("session-b"));
-  await act(async () => {
-    await sessionB.promise;
-    await Promise.resolve();
-  });
-
-  expect(datapilotStore.getState().mode).toBe("active_session");
-  expect(datapilotStore.getState().currentSessionId).toBe("session-a");
-  expect(opened).toEqual(["session-a", "session-a"]);
-  expect(signals[1]?.aborted).toBe(false);
-});
-
-test("deleting history stops propagation and removes it only after a successful 204", async () => {
-  const deletion = deferred<void>();
-  apiMocks.deleteSession.mockReturnValue(deletion.promise);
-  apiMocks.listSessions.mockResolvedValue([
-    {
-      id: "saved-1",
-      title: "保存任务",
-      created_at: "2026-06-25T01:00:00Z",
-      updated_at: "2026-06-25T02:00:00Z",
-    },
-  ]);
-  let activeSignal: AbortSignal | undefined;
-  apiMocks.streamSessionEvents.mockImplementation((_sessionId, _afterSequence, signal) => {
-    activeSignal = signal;
-    return waitingEventStream(signal);
-  });
-  datapilotStore.setState({
-    open: true,
-    mode: "active_session",
-    currentSessionId: "saved-1",
-    sessions: [],
-    conversation: createAgentConversation(),
-  });
-  await renderAppWithDashboardSettled();
-  await waitFor(() => expect(activeSignal).toBeDefined());
-  apiMocks.getSession.mockClear();
-
-  fireEvent.click(screen.getByRole("button", { name: "History" }));
-  const deleteButton = await screen.findByRole("button", { name: "Delete session 保存任务" });
-  fireEvent.click(deleteButton);
-
-  expect(apiMocks.deleteSession).toHaveBeenCalledWith("saved-1");
-  expect(apiMocks.getSession).not.toHaveBeenCalled();
-  expect(screen.getByText("保存任务")).toBeVisible();
-  expect(datapilotStore.getState().sessions.map((session) => session.id)).toContain("saved-1");
-  expect(activeSignal?.aborted).toBe(false);
-
-  deletion.resolve();
-
-  await waitFor(() => expect(screen.queryByText("保存任务")).not.toBeInTheDocument());
-  expect(datapilotStore.getState().mode).toBe("draft_new_session");
-  expect(datapilotStore.getState().currentSessionId).toBeNull();
-  expect(datapilotStore.getState().sessions.map((session) => session.id)).not.toContain("saved-1");
-  expect(activeSignal?.aborted).toBe(true);
-});
-
-test("submitting the first draft creates a writable SDK conversation", async () => {
-  await renderAppWithDashboardSettled();
-  fireEvent.click(screen.getByRole("button", { name: "Open DataPilot" }));
-  fireEvent.change(screen.getByPlaceholderText("我们要做什么？"), {
-    target: { value: "  清洗 VLA 数据  " },
+    target: { value: "继续上一轮任务" },
   });
   fireEvent.click(screen.getByRole("button", { name: "Send message" }));
 
-  await waitFor(() =>
-    expect(apiMocks.submitTurn).toHaveBeenCalledWith(
-      "session-created",
-      "清洗 VLA 数据",
-      expect.stringMatching(/^local-/),
-    ),
-  );
-  expect(datapilotStore.getState().mode).toBe("active_session");
-  expect(datapilotStore.getState().conversation.messages[0]).toMatchObject({
-    role: "user",
-    name: "You",
+  await waitFor(() => expect(apiMocks.submitTurn).toHaveBeenCalledWith("active-1", "继续上一轮任务"));
+  expect(screen.getByText("继续上一轮任务")).toBeVisible();
+});
+
+test("selecting a history session closes the active event stream before loading details", async () => {
+  const close = vi.fn(() => calls.push("close"));
+  const calls: string[] = [];
+  apiMocks.openSessionEvents.mockReturnValue(activeSocket(close));
+  apiMocks.listSessions.mockResolvedValue([
+    {
+      id: "history-1",
+      title: "历史任务",
+      created_at: "2026-06-25T01:00:00Z",
+      updated_at: "2026-06-25T02:00:00Z",
+      status: "historical",
+    },
+  ]);
+  apiMocks.getSession.mockImplementation(async (sessionId) => {
+    calls.push(`get:${sessionId}`);
+    return {
+      id: "history-1",
+      title: "历史任务",
+      created_at: "2026-06-25T01:00:00Z",
+      updated_at: "2026-06-25T02:00:00Z",
+      status: "historical",
+      messages: [],
+    };
   });
-  expect(screen.getByText("清洗 VLA 数据")).toBeVisible();
+  datapilotStore.setState({
+    open: true,
+    mode: "active_session",
+    currentSessionId: "session-1",
+    previousActiveSessionId: null,
+    sessions: [
+      {
+        id: "session-1",
+        title: "Existing session",
+        created_at: "2026-06-26T00:00:00Z",
+        updated_at: "2026-06-26T00:00:00Z",
+        status: "active",
+      },
+    ],
+  });
+
+  await renderAppWithDashboardSettled();
+  fireEvent.change(screen.getByPlaceholderText("继续描述任务…"), {
+    target: { value: "先打开流" },
+  });
+  fireEvent.click(screen.getByRole("button", { name: "Send message" }));
+  await waitFor(() => expect(apiMocks.openSessionEvents).toHaveBeenCalledWith("session-1", expect.any(Function)));
+
+  fireEvent.click(screen.getByRole("button", { name: "History" }));
+  fireEvent.click(await screen.findByRole("button", { name: /历史任务/ }));
+
+  await waitFor(() => expect(apiMocks.getSession).toHaveBeenCalledWith("history-1"));
+  expect(calls.slice(-2)).toEqual(["close", "get:history-1"]);
+});
+
+test("message list keeps earlier timeline output before later user messages", () => {
+  const run = createEmptyRunState();
+  run.timeline = [
+    {
+      kind: "assistant",
+      source: "main",
+      text: "较早的助手输出",
+      runId: "run-1",
+      parentRunId: null,
+      createdAt: "2026-06-26T00:02:00Z",
+      sequence: 1,
+    } as typeof run.timeline[number] & { createdAt: string; sequence: number },
+  ];
+
+  render(
+    <MessageList
+      messages={[
+        {
+          id: "message-1",
+          session_id: "session-1",
+          role: "user",
+          content: "较新的用户消息",
+          created_at: "2026-06-26T00:03:00Z",
+        },
+      ]}
+      run={run}
+    />,
+  );
+
+  const text = screen.getByText("较早的助手输出").compareDocumentPosition(screen.getByText("较新的用户消息"));
+  expect(text & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+});
+
+test("message list follows new content when the user is already at the bottom", () => {
+  const firstMessages = [
+    {
+      id: "message-1",
+      session_id: "session-1",
+      role: "user" as const,
+      content: "第一条消息",
+      created_at: "2026-06-26T00:01:00Z",
+    },
+  ];
+  const { container, rerender } = render(<MessageList messages={firstMessages} run={createEmptyRunState()} />);
+  const scrollArea = container.querySelector<HTMLElement>("[data-datapilot-scroll-area='true']");
+  expect(scrollArea).not.toBeNull();
+  Object.defineProperty(scrollArea, "scrollHeight", { configurable: true, value: 900 });
+  Object.defineProperty(scrollArea, "clientHeight", { configurable: true, value: 300 });
+  scrollArea!.scrollTop = 600;
+  fireEvent.scroll(scrollArea!);
+
+  Object.defineProperty(scrollArea, "scrollHeight", { configurable: true, value: 1100 });
+  rerender(
+    <MessageList
+      messages={[
+        ...firstMessages,
+        {
+          id: "message-2",
+          session_id: "session-1",
+          role: "assistant" as const,
+          content: "新的助手回复",
+          created_at: "2026-06-26T00:02:00Z",
+        },
+      ]}
+      run={createEmptyRunState()}
+    />,
+  );
+
+  expect(scrollArea?.scrollTop).toBe(1100);
+});
+
+test("message list does not jump down when the user is reading older content", () => {
+  const firstMessages = [
+    {
+      id: "message-1",
+      session_id: "session-1",
+      role: "user" as const,
+      content: "第一条消息",
+      created_at: "2026-06-26T00:01:00Z",
+    },
+  ];
+  const { container, rerender } = render(<MessageList messages={firstMessages} run={createEmptyRunState()} />);
+  const scrollArea = container.querySelector<HTMLElement>("[data-datapilot-scroll-area='true']");
+  expect(scrollArea).not.toBeNull();
+  Object.defineProperty(scrollArea, "scrollHeight", { configurable: true, value: 900 });
+  Object.defineProperty(scrollArea, "clientHeight", { configurable: true, value: 300 });
+  scrollArea!.scrollTop = 200;
+  fireEvent.scroll(scrollArea!);
+
+  Object.defineProperty(scrollArea, "scrollHeight", { configurable: true, value: 1100 });
+  rerender(
+    <MessageList
+      messages={[
+        ...firstMessages,
+        {
+          id: "message-2",
+          session_id: "session-1",
+          role: "assistant" as const,
+          content: "新的助手回复",
+          created_at: "2026-06-26T00:02:00Z",
+        },
+      ]}
+      run={createEmptyRunState()}
+    />,
+  );
+
+  expect(scrollArea?.scrollTop).toBe(200);
+});
+
+test("timeline assistant output does not hide unmatched persisted assistant messages", () => {
+  const run = createEmptyRunState();
+  run.timeline = [
+    {
+      kind: "assistant",
+      source: "agentscope",
+      text: "实时流式回复",
+      runId: "run-1",
+      parentRunId: null,
+      createdAt: "2026-06-26T00:02:00Z",
+      sequence: 1,
+    },
+  ] as TestTimelineItem[];
+
+  render(
+    <MessageList
+      messages={[
+        {
+          id: "message-1",
+          session_id: "session-1",
+          role: "assistant",
+          content: "只存在于持久化消息里的旧回复",
+          created_at: "2026-06-26T00:01:00Z",
+        },
+      ]}
+      run={run}
+    />,
+  );
+
+  expect(screen.getByText("只存在于持久化消息里的旧回复")).toBeVisible();
+  expect(screen.getByText("实时流式回复")).toBeVisible();
+});
+
+test("completed child run renders tool calls as compact rows while folding reasoning", () => {
+  const run = createEmptyRunState();
+  run.timeline = [
+    {
+      kind: "reasoning",
+      source: "navigation.plan",
+      text: "检查数据目录",
+      runId: "plan-run",
+      parentRunId: "main-run",
+      createdAt: "2026-06-26T00:02:00Z",
+      sequence: 1,
+    },
+    {
+      kind: "tool",
+      source: "navigation.plan",
+      text: "已调用工具 read_file 0.0s",
+      status: "completed",
+      runId: "plan-run",
+      parentRunId: "main-run",
+      createdAt: "2026-06-26T00:02:01Z",
+      sequence: 2,
+    },
+    {
+      kind: "tool",
+      source: "navigation.plan",
+      text: "已调用工具 read_file 0.0s",
+      status: "completed",
+      runId: "plan-run",
+      parentRunId: "main-run",
+      createdAt: "2026-06-26T00:02:02Z",
+      sequence: 3,
+    },
+    {
+      kind: "tool",
+      source: "navigation.plan",
+      text: "已调用工具 exec_command 0.0s",
+      status: "completed",
+      runId: "plan-run",
+      parentRunId: "main-run",
+      createdAt: "2026-06-26T00:02:03Z",
+      sequence: 4,
+    },
+  ] as TestTimelineItem[];
+
+  render(<MessageList messages={[]} run={run} />);
+
+  const summary = screen.getByRole("button", { name: /记录了 1 条进展/ });
+  expect(summary).toBeVisible();
+  expect(summary).toHaveAttribute("aria-expanded", "false");
+  expect(screen.queryByText("检查数据目录")).not.toBeInTheDocument();
+  expect(screen.getByText("已调用工具 exec_command 0.0s")).toBeVisible();
+  expect(screen.getAllByText("已调用工具 read_file 0.0s")).toHaveLength(2);
+
+  fireEvent.click(summary);
+
+  expect(summary).toHaveAttribute("aria-expanded", "true");
+  expect(screen.getByText("检查数据目录")).toBeVisible();
+});
+
+test("active child run details remain visible and are not folded", () => {
+  const run = createEmptyRunState();
+  run.activeAgents["plan-run"] = {
+    source: "navigation.plan",
+    runId: "plan-run",
+    parentRunId: "main-run",
+    startedAt: Date.parse("2026-06-26T00:02:00Z"),
+  };
+  run.timeline = [
+    {
+      kind: "reasoning",
+      source: "navigation.plan",
+      text: "正在判断导航数据类型",
+      runId: "plan-run",
+      parentRunId: "main-run",
+      createdAt: "2026-06-26T00:02:00Z",
+      sequence: 1,
+    },
+    {
+      kind: "tool",
+      source: "navigation.plan",
+      text: "已调用工具 classify_navigation_dataset_tool 0.0s",
+      status: "completed",
+      runId: "plan-run",
+      parentRunId: "main-run",
+      createdAt: "2026-06-26T00:02:01Z",
+      sequence: 2,
+    },
+  ] as TestTimelineItem[];
+
+  render(<MessageList messages={[]} run={run} />);
+
+  expect(screen.getByText("正在判断导航数据类型")).toBeVisible();
+  expect(screen.getByText("已调用工具 classify_navigation_dataset_tool 0.0s")).toBeVisible();
+  expect(screen.queryByRole("button", { name: /完成了 1 个工具/ })).not.toBeInTheDocument();
+});
+
+test("active run text includes elapsed seconds while waiting", () => {
+  expect(formatActiveText("[Executor] 正在运行 extract_and_sync_navigation_data_tool", 1_000, 6_200)).toBe(
+    "[Executor] 正在运行 extract_and_sync_navigation_data_tool +5s",
+  );
+  expect(formatActiveText("", 1_000, 6_200)).toBe("");
+});
+
+test("completed tool row keeps chronological position before later messages", () => {
+  const run = createEmptyRunState();
+  run.timeline = [
+    {
+      kind: "tool",
+      source: "navigation.executor",
+      text: "已调用工具 exec_command 0.0s",
+      status: "completed",
+      runId: "executor-run",
+      parentRunId: "workflow-run",
+      createdAt: "2026-06-26T00:02:00Z",
+      sequence: 1,
+    },
+  ] as TestTimelineItem[];
+
+  render(
+    <MessageList
+      messages={[
+        {
+          id: "message-1",
+          session_id: "session-1",
+          role: "user",
+          content: "稍后的用户消息",
+          created_at: "2026-06-26T00:03:00Z",
+        },
+      ]}
+      run={run}
+    />,
+  );
+
+  const position = screen
+    .getByText("已调用工具 exec_command 0.0s")
+    .compareDocumentPosition(screen.getByText("稍后的用户消息"));
+  expect(position & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+});
+
+test("completed child run folds child assistant final output into summary details", () => {
+  const run = createEmptyRunState();
+  run.timeline = [
+    {
+      kind: "reasoning",
+      source: "navigation.executor",
+      text: "整理执行结论",
+      runId: "executor-run",
+      parentRunId: "workflow-run",
+      createdAt: "2026-06-26T00:02:00Z",
+      sequence: 1,
+    },
+    {
+      kind: "assistant",
+      source: "navigation.executor",
+      text: "子任务已完成：导航数据可继续清洗。",
+      runId: "executor-run",
+      parentRunId: "workflow-run",
+      createdAt: "2026-06-26T00:02:01Z",
+      sequence: 2,
+    },
+  ] as TestTimelineItem[];
+
+  render(<MessageList messages={[]} run={run} />);
+
+  const summary = screen.getByRole("button", { name: /记录了 1 条进展/ });
+  expect(summary).toBeVisible();
+  expect(screen.queryByText("子任务已完成：导航数据可继续清洗。")).not.toBeInTheDocument();
+
+  fireEvent.click(summary);
+
+  expect(screen.getByText("整理执行结论")).toBeVisible();
+  expect(screen.getByText("子任务已完成：导航数据可继续清洗。")).toBeVisible();
+});
+
+test("main assistant output remains a DataPilot timeline bubble and is not folded", () => {
+  const run = createEmptyRunState();
+  run.timeline = [
+    {
+      kind: "assistant",
+      source: "main",
+      text: "这是 DataPilot 的最终回复。",
+      runId: "main-run",
+      parentRunId: null,
+      createdAt: "2026-06-26T00:02:00Z",
+      sequence: 1,
+    },
+  ] as TestTimelineItem[];
+
+  render(<MessageList messages={[]} run={run} />);
+
+  expect(screen.getByText("这是 DataPilot 的最终回复。")).toBeVisible();
+  expect(screen.getByText("DataPilot")).toBeVisible();
+  expect(screen.queryByRole("button")).not.toBeInTheDocument();
+});
+
+test("agentscope router assistant output remains a DataPilot timeline bubble and is not folded", () => {
+  const run = createEmptyRunState();
+  run.timeline = [
+    {
+      kind: "assistant",
+      source: "agentscope",
+      text: "你好！我是 MainRouterAgent，VLA 数据 juicer 会话的主路由代理。",
+      runId: "router-run",
+      parentRunId: null,
+      createdAt: "2026-06-26T00:02:00Z",
+      sequence: 1,
+    },
+  ] as TestTimelineItem[];
+
+  render(<MessageList messages={[]} run={run} />);
+
+  expect(screen.getByText("你好！我是 MainRouterAgent，VLA 数据 juicer 会话的主路由代理。")).toBeVisible();
+  expect(screen.getByText("DataPilot")).toBeVisible();
+  expect(screen.queryByRole("button", { name: /完成了子任务/ })).not.toBeInTheDocument();
+});
+
+test("tool calls render as compact timeline text instead of collapsible cards", () => {
+  const run = createEmptyRunState();
+  run.timeline = [
+    {
+      kind: "tool",
+      source: "navigation.executor",
+      text: "已调用工具 prepare_raw_data 2.0s",
+      status: "completed",
+      runId: "executor-run",
+      parentRunId: "workflow-run",
+      createdAt: "2026-06-26T00:02:00Z",
+      sequence: 1,
+    },
+  ] as TestTimelineItem[];
+
+  const { container } = render(<MessageList messages={[]} run={run} />);
+
+  expect(screen.getByText("已调用工具 prepare_raw_data 2.0s")).toBeVisible();
+  expect(screen.queryByRole("button", { name: /工具|tool|完成/ })).not.toBeInTheDocument();
+  expect(container.querySelector('[data-status="success"]')).toHaveClass("text-emerald-600");
 });
 
 test("running stop interrupts the current turn without leaving active mode", async () => {
@@ -3745,13 +2322,10 @@ test("running stop interrupts the current turn without leaving active mode", asy
         title: "Existing session",
         created_at: "2026-06-26T00:00:00Z",
         updated_at: "2026-06-26T00:00:00Z",
+        status: "active",
       },
     ],
-    conversation: {
-      ...createAgentConversation(),
-      phase: "streaming",
-      currentReplyId: "reply-1",
-    },
+    run: { ...createEmptyRunState(), running: true, activeText: "[Main] 正在思考" },
   });
 
   await renderAppWithDashboardSettled();
@@ -3761,429 +2335,12 @@ test("running stop interrupts the current turn without leaving active mode", asy
   await waitFor(() => expect(apiMocks.interruptTurn).toHaveBeenCalledWith("session-1"));
   expect(datapilotStore.getState().mode).toBe("active_session");
   expect(datapilotStore.getState().currentSessionId).toBe("session-1");
-  expect(datapilotStore.getState().conversation.phase).toBe("interrupting");
-});
-
-test("background running tool remains stoppable after REPLY_END and resumes send only at terminal", async () => {
-  datapilotStore.setState({
-    open: true,
-    mode: "active_session",
-    currentSessionId: "session-1",
-    previousActiveSessionId: null,
-    sessions: [],
-    conversation: {
-      ...createAgentConversation(),
-      phase: "idle",
-      currentReplyId: null,
-      toolRuns: {
-        "call-background": {
-          session_id: "session-1",
-          tool_call_id: "call-background",
-          tool_name: "extract",
-          status: "running",
-          summary: "",
-          error_type: null,
-          started_at: "2026-06-26T00:00:00Z",
-          finished_at: null,
-        },
-      },
-    },
-  });
-  await renderAppWithDashboardSettled();
-
-  const input = screen.getByPlaceholderText("继续描述任务…");
-  fireEvent.change(input, { target: { value: "保留草稿" } });
-  fireEvent.click(screen.getByRole("button", { name: "Stop current run" }));
-
-  await waitFor(() => expect(apiMocks.interruptTurn).toHaveBeenCalledWith("session-1"));
-  expect(apiMocks.submitTurn).not.toHaveBeenCalled();
-  expect(input).toHaveValue("保留草稿");
-  expect(screen.getByRole("button", { name: "Interrupt requested" })).toBeDisabled();
-
-  act(() => {
-    datapilotStore.getState().applyEvent({
-      id: "event-stopped",
-      session_id: "session-1",
-      sequence: 1,
-      dedupe_key: "stopped".padStart(64, "0"),
-      created_at: "2026-06-26T00:00:01Z",
-      event: {
-        id: "terminal-stopped",
-        created_at: "2026-06-26T00:00:01Z",
-        type: EventType.CUSTOM,
-        name: "datapilot_tool_terminal",
-        value: {
-          tool_call_id: "call-background",
-          status: "stopped",
-          summary: "已由用户停止",
-        },
-      },
-    });
-  });
-
-  expect(await screen.findByRole("button", { name: "Send message" })).toBeEnabled();
-  expect(input).toHaveValue("保留草稿");
-});
-
-test("stop response cannot strand interrupt pending when terminal arrived first", async () => {
-  const interrupt = deferred<boolean>();
-  apiMocks.interruptTurn.mockReturnValue(interrupt.promise);
-  datapilotStore.setState({
-    open: true,
-    mode: "active_session",
-    currentSessionId: "session-1",
-    sessions: [],
-    conversation: {
-      ...createAgentConversation(),
-      toolRuns: {
-        "call-race": {
-          session_id: "session-1",
-          tool_call_id: "call-race",
-          tool_name: "extract",
-          status: "running",
-          summary: "",
-          error_type: null,
-          started_at: "2026-06-26T00:00:00Z",
-          finished_at: null,
-        },
-      },
-    },
-  });
-  await renderAppWithDashboardSettled();
-  fireEvent.click(screen.getByRole("button", { name: "Stop current run" }));
-
-  act(() => {
-    datapilotStore.getState().applyEvent({
-      id: "event-race-stopped",
-      session_id: "session-1",
-      sequence: 1,
-      dedupe_key: "race-stopped".padStart(64, "0"),
-      created_at: "2026-06-26T00:00:01Z",
-      event: {
-        id: "race-stopped",
-        created_at: "2026-06-26T00:00:01Z",
-        type: EventType.CUSTOM,
-        name: "datapilot_tool_terminal",
-        value: { tool_call_id: "call-race", status: "stopped" },
-      },
-    });
-  });
-  await act(async () => {
-    interrupt.resolve(true);
-    await interrupt.promise;
-  });
-
-  expect(await screen.findByRole("button", { name: "Send message" })).toBeEnabled();
-});
-
-test("a late stop response for A cannot clear B's newer pending stop", async () => {
-  const stopA = deferred<boolean>();
-  const stopB = deferred<boolean>();
-  apiMocks.interruptTurn
-    .mockReturnValueOnce(stopA.promise)
-    .mockReturnValueOnce(stopB.promise);
-  datapilotStore.setState({
-    open: true,
-    mode: "active_session",
-    currentSessionId: "session-a",
-    sessions: [],
-    conversation: {
-      ...createAgentConversation(),
-      phase: "streaming",
-      currentReplyId: "reply-a-old",
-    },
-  });
-  await renderAppWithDashboardSettled();
-  fireEvent.click(screen.getByRole("button", { name: "Stop current run" }));
-  await waitFor(() => expect(apiMocks.interruptTurn).toHaveBeenCalledWith("session-a"));
-
-  act(() => {
-    datapilotStore.setState({
-      currentSessionId: "session-b",
-      conversation: {
-        ...createAgentConversation(),
-        phase: "streaming",
-        currentReplyId: "reply-b-current",
-      },
-    });
-  });
-  const stopBButton = await screen.findByRole("button", { name: "Stop current run" });
-  fireEvent.click(stopBButton);
-  await waitFor(() => expect(apiMocks.interruptTurn).toHaveBeenCalledWith("session-b"));
-  expect(screen.getByRole("button", { name: "Interrupt requested" })).toBeDisabled();
-
-  await act(async () => {
-    stopA.resolve(true);
-    await stopA.promise;
-  });
-
-  expect(datapilotStore.getState().currentSessionId).toBe("session-b");
-  expect(datapilotStore.getState().conversation.phase).toBe("streaming");
-  expect(screen.getByRole("button", { name: "Interrupt requested" })).toBeDisabled();
-
-  await act(async () => {
-    stopB.resolve(true);
-    await stopB.promise;
-  });
-  expect(datapilotStore.getState().conversation.phase).toBe("interrupting");
-});
-
-test("an A/B/A lifecycle reset prevents A's old stop response from interrupting A's new reply", async () => {
-  const stopA = deferred<boolean>();
-  apiMocks.interruptTurn.mockReturnValueOnce(stopA.promise);
-  datapilotStore.setState({
-    open: true,
-    mode: "active_session",
-    currentSessionId: "session-a",
-    sessions: [],
-    conversation: {
-      ...createAgentConversation(),
-      phase: "streaming",
-      currentReplyId: "reply-a-old",
-    },
-  });
-  await renderAppWithDashboardSettled();
-  fireEvent.click(screen.getByRole("button", { name: "Stop current run" }));
-  await waitFor(() => expect(apiMocks.interruptTurn).toHaveBeenCalledWith("session-a"));
-
-  act(() => {
-    datapilotStore.setState({
-      currentSessionId: "session-b",
-      conversation: {
-        ...createAgentConversation(),
-        phase: "streaming",
-        currentReplyId: "reply-b",
-      },
-    });
-  });
-  await waitFor(() => expect(datapilotStore.getState().currentSessionId).toBe("session-b"));
-  act(() => {
-    datapilotStore.setState({
-      currentSessionId: "session-a",
-      conversation: {
-        ...createAgentConversation(),
-        phase: "streaming",
-        currentReplyId: "reply-a-new",
-      },
-    });
-  });
-  await waitFor(() =>
-    expect(screen.getByRole("button", { name: "Stop current run" })).toBeEnabled(),
-  );
-
-  await act(async () => {
-    stopA.resolve(true);
-    await stopA.promise;
-  });
-
-  expect(datapilotStore.getState().currentSessionId).toBe("session-a");
-  expect(datapilotStore.getState().conversation.currentReplyId).toBe("reply-a-new");
-  expect(datapilotStore.getState().conversation.phase).toBe("streaming");
-  expect(screen.getByRole("button", { name: "Stop current run" })).toBeEnabled();
-});
-
-test("same-session lifecycle generation change rejects an old stop response", async () => {
-  const stop = deferred<boolean>();
-  apiMocks.interruptTurn.mockReturnValueOnce(stop.promise);
-  datapilotStore.setState({
-    open: true,
-    mode: "active_session",
-    currentSessionId: "session-a",
-    sessions: [],
-    conversation: {
-      ...createAgentConversation(),
-      phase: "streaming",
-      currentReplyId: "reply-same-session",
-    },
-  });
-  await renderAppWithDashboardSettled();
-  fireEvent.click(screen.getByRole("button", { name: "Stop current run" }));
-  await waitFor(() => expect(apiMocks.interruptTurn).toHaveBeenCalledWith("session-a"));
-
-  act(() => datapilotStore.getState().setOpen(false));
-  fireEvent.click(screen.getByRole("button", { name: "Open DataPilot" }));
-  await waitFor(() =>
-    expect(screen.getByRole("button", { name: "Interrupt requested" })).toBeDisabled(),
-  );
-
-  await act(async () => {
-    stop.resolve(true);
-    await stop.promise;
-  });
-
-  expect(datapilotStore.getState().currentSessionId).toBe("session-a");
-  expect(datapilotStore.getState().conversation.currentReplyId).toBe("reply-same-session");
-  expect(datapilotStore.getState().conversation.phase).toBe("streaming");
-  expect(screen.getByRole("button", { name: "Stop current run" })).toBeEnabled();
-});
-
-test("same-lifecycle reply change rejects an old stop response by execution correlation", async () => {
-  const stop = deferred<boolean>();
-  apiMocks.interruptTurn.mockReturnValueOnce(stop.promise);
-  datapilotStore.setState({
-    open: true,
-    mode: "active_session",
-    currentSessionId: "session-a",
-    sessions: [],
-    conversation: {
-      ...createAgentConversation(),
-      phase: "streaming",
-      currentReplyId: "reply-old",
-    },
-  });
-  await renderAppWithDashboardSettled();
-  fireEvent.click(screen.getByRole("button", { name: "Stop current run" }));
-  await waitFor(() => expect(apiMocks.interruptTurn).toHaveBeenCalledWith("session-a"));
-
-  act(() => {
-    datapilotStore.setState({
-      conversation: {
-        ...createAgentConversation(),
-        phase: "streaming",
-        currentReplyId: "reply-new",
-      },
-    });
-  });
-  await waitFor(() =>
-    expect(datapilotStore.getState().conversation.currentReplyId).toBe("reply-new"),
-  );
-
-  await act(async () => {
-    stop.resolve(true);
-    await stop.promise;
-  });
-
-  expect(datapilotStore.getState().conversation.currentReplyId).toBe("reply-new");
-  expect(datapilotStore.getState().conversation.phase).toBe("streaming");
-  expect(screen.getByRole("button", { name: "Stop current run" })).toBeEnabled();
-});
-
-test("same reply remains the same execution when its running tool set changes", async () => {
-  const stop = deferred<boolean>();
-  apiMocks.interruptTurn.mockReturnValueOnce(stop.promise);
-  datapilotStore.setState({
-    open: true,
-    mode: "active_session",
-    currentSessionId: "session-a",
-    sessions: [],
-    conversation: {
-      ...createAgentConversation(),
-      phase: "streaming",
-      currentReplyId: "reply-stable",
-    },
-  });
-  await renderAppWithDashboardSettled();
-  fireEvent.click(screen.getByRole("button", { name: "Stop current run" }));
-  await waitFor(() => expect(apiMocks.interruptTurn).toHaveBeenCalledWith("session-a"));
-
-  act(() => {
-    datapilotStore.setState((state) => ({
-      conversation: {
-        ...state.conversation,
-        toolRuns: {
-          "call-started-while-stop-pending": {
-            session_id: "session-a",
-            tool_call_id: "call-started-while-stop-pending",
-            tool_name: "extract",
-            status: "running",
-            summary: "",
-            error_type: null,
-            started_at: "2026-06-26T00:00:01Z",
-            finished_at: null,
-          },
-        },
-      },
-    }));
-  });
-  await waitFor(() =>
-    expect(datapilotStore.getState().conversation.toolRuns).toHaveProperty(
-      "call-started-while-stop-pending",
-    ),
-  );
-
-  await act(async () => {
-    stop.resolve(true);
-    await stop.promise;
-  });
-
-  expect(datapilotStore.getState().conversation.currentReplyId).toBe("reply-stable");
-  expect(datapilotStore.getState().conversation.phase).toBe("interrupting");
-  expect(screen.getByRole("button", { name: "Interrupt requested" })).toBeDisabled();
-});
-
-test("stop keeps the draft editable and submits it after the terminating REPLY_END", async () => {
-  const interrupt = deferred<boolean>();
-  apiMocks.interruptTurn.mockReturnValue(interrupt.promise);
-  datapilotStore.setState({
-    open: true,
-    mode: "active_session",
-    currentSessionId: "session-1",
-    sessions: [],
-    conversation: {
-      ...createAgentConversation(),
-      phase: "streaming",
-      currentReplyId: "reply-1",
-    },
-  });
-  await renderAppWithDashboardSettled();
-
-  const input = screen.getByPlaceholderText("继续描述任务…");
-  fireEvent.change(input, { target: { value: "停止后继续" } });
-  fireEvent.click(screen.getByRole("button", { name: "Stop current run" }));
-
-  expect(screen.getByRole("button", { name: "Interrupt requested" })).toBeDisabled();
-  expect(input).not.toBeDisabled();
-  fireEvent.change(input, { target: { value: "保留并继续" } });
-  expect(input).toHaveValue("保留并继续");
-
-  await act(async () => {
-    interrupt.resolve(true);
-    await interrupt.promise;
-  });
-  expect(screen.getByRole("button", { name: "Interrupt requested" })).toBeDisabled();
-
-  act(() => {
-    datapilotStore.getState().applyEvent({
-      id: "event-end",
-      session_id: "session-1",
-      sequence: 1,
-      dedupe_key: "end".padStart(64, "0"),
-      created_at: "2026-06-26T00:00:01Z",
-      event: {
-        id: "reply-end",
-        created_at: "2026-06-26T00:00:01Z",
-        type: EventType.REPLY_END,
-        session_id: "session-1",
-        reply_id: "reply-1",
-      },
-    });
-  });
-
-  const send = await screen.findByRole("button", { name: "Send message" });
-  expect(input).toHaveValue("保留并继续");
-  fireEvent.click(send);
-  await waitFor(() =>
-    expect(apiMocks.submitTurn).toHaveBeenCalledWith(
-      "session-1",
-      "保留并继续",
-      expect.stringMatching(/^local-/),
-    ),
-  );
 });
 
 test("running Composer shows a square stop button", () => {
   const onInterrupt = vi.fn();
 
-  render(
-    <Composer
-      placeholder="我们要做什么？"
-      message=""
-      running
-      onMessageChange={vi.fn()}
-      onSubmit={vi.fn()}
-      onInterrupt={onInterrupt}
-    />,
-  );
+  render(<Composer placeholder="我们要做什么？" running onSubmit={vi.fn()} onInterrupt={onInterrupt} />);
 
   const stopButton = screen.getByRole("button", { name: "Stop current run" });
   expect(stopButton.querySelector("svg")).toBeInTheDocument();
@@ -4199,10 +2356,8 @@ test("interrupting Composer shows a spinning circle button without visible text"
   render(
     <Composer
       placeholder="我们要做什么？"
-      message=""
       running
       interrupting
-      onMessageChange={vi.fn()}
       onSubmit={vi.fn()}
       onInterrupt={onInterrupt}
     />,
@@ -4219,22 +2374,7 @@ test("interrupting Composer shows a spinning circle button without visible text"
 test("Composer trims messages, clears after submit, and ignores empty input", () => {
   const onSubmit = vi.fn();
 
-  function ControlledComposer() {
-    const [message, setMessage] = useState("");
-    return (
-      <Composer
-        placeholder="我们要做什么？"
-        message={message}
-        onMessageChange={setMessage}
-        onSubmit={(submitted) => {
-          onSubmit(submitted);
-          setMessage("");
-        }}
-      />
-    );
-  }
-
-  render(<ControlledComposer />);
+  render(<Composer placeholder="我们要做什么？" onSubmit={onSubmit} />);
 
   const input = screen.getByPlaceholderText("我们要做什么？");
   fireEvent.change(input, { target: { value: "   " } });

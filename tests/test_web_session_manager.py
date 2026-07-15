@@ -2,8 +2,8 @@ from pathlib import Path
 
 import pytest
 
+from vla_data_juicer_agents.web.session_manager import WebSessionManager
 from vla_data_juicer_agents.web.session_store import WebSessionStore
-from web_legacy_app import WebSessionManager
 
 
 class FakeController:
@@ -77,10 +77,16 @@ def test_interrupt_requests_controller_interrupt(tmp_path: Path):
     assert manager.get_controller(session.id).interrupts == 1
 
 
-def test_manager_has_no_historical_or_read_only_session_transition(tmp_path: Path):
+def test_mark_historical_updates_store_and_removes_controller(tmp_path: Path):
     store = WebSessionStore(tmp_path / "sessions.sqlite")
     manager = WebSessionManager(store=store, working_dir=str(tmp_path), controller_factory=FakeController)
-    assert not hasattr(manager, "mark_historical")
+    session = manager.create_session("处理 20270605")
+
+    manager.mark_historical(session.id)
+
+    assert store.get_session(session.id).status == "historical"
+    with pytest.raises(KeyError):
+        manager.get_controller(session.id)
 
 
 def test_create_session_rolls_back_when_controller_start_fails(tmp_path: Path):

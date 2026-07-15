@@ -1,42 +1,15 @@
 from __future__ import annotations
 
 import asyncio
-from collections.abc import Callable
-import hashlib
 import inspect
-import sqlite3
-from dataclasses import dataclass
+from collections.abc import Callable
 from typing import Any
 from uuid import uuid4
 
-from vla_data_juicer_agents.web.schemas import (
-    InterruptResponse,
-    PublicEventRecord,
-    SessionRecord,
-    generate_session_title,
-)
+from vla_data_juicer_agents.web.schemas import SessionRecord, generate_session_title
 from vla_data_juicer_agents.web.session_store import WebSessionStore
 
-
-class TurnSubmissionPending(RuntimeError):
-    """The same exact client request is still owned by a live submitter."""
-
-    code = "turn_submission_pending"
-
-
-class TurnSessionBusy(RuntimeError):
-    """A different exact turn still owns the session execution slot."""
-
-    code = "turn_session_busy"
-
-
-@dataclass(frozen=True)
-class TurnSubmissionResult:
-    turn_id: str
-    replayed: bool
-    terminal: bool
-
-EventCallback = Callable[[str, PublicEventRecord], Any]
+EventCallback = Callable[[str, dict[str, Any]], Any]
 
 
 class AgentScopeWebSessionManager:
@@ -50,180 +23,32 @@ class AgentScopeWebSessionManager:
         self._store = store
         self._runtime = runtime
         self._event_callback = event_callback
-        set_transport = getattr(self._runtime, "set_web_transport", None)
-        if callable(set_transport):
-            set_transport(self._store, self._event_callback)
-        else:
-            set_store = getattr(self._runtime, "set_web_session_store", None)
-            if callable(set_store):
-                set_store(self._store)
+        self._forward_locks: dict[str, asyncio.Lock] = {}
+        set_store = getattr(self._runtime, "set_web_session_store", None)
+        if callable(set_store):
+            set_store(self._store)
 
-    async def create_session(
-        self,
-        first_message: str,
-        *,
-        creation_id: str | None = None,
-    ) -> SessionRecord:
-        return self._store.create_session(
-            title=generate_session_title(first_message),
-            creation_id=creation_id,
-        )
+    async def create_session(self, first_message: str) -> SessionRecord:
+        return self._store.create_session(title=generate_session_title(first_message))
 
-    async def submit_turn(
-        self,
-        session_id: str,
-        message: str,
-        *,
-        message_id: str | None = None,
-    ) -> str | TurnSubmissionResult:
+    async def submit_turn(self, session_id: str, message: str) -> str:
         if self._store.get_session(session_id) is None:
             raise KeyError(session_id)
 
-        runtime_id = str(getattr(self._runtime, "runtime_id", "web-session-manager"))
-        admission_ttl = float(
-            getattr(self._runtime, "admission_lease_ttl_seconds", 30.0)
-        )
-        admission_renew_interval = float(
-            getattr(self._runtime, "admission_renew_interval_seconds", 5.0)
-        )
-        durable_turn_id = (
-            "turn_"
-            + hashlib.sha256(f"{session_id}:{message_id}".encode("utf-8")).hexdigest()[:32]
-            if message_id is not None
-            else None
-        )
-        if message_id is not None:
-            try:
-                claim_status = self._store.claim_user_message(
-                    session_id,
-                    message_id,
-                    message,
-                    runtime_id=runtime_id,
-                    turn_id=durable_turn_id,
-                    ttl_seconds=admission_ttl,
-                )
-            except sqlite3.IntegrityError as exc:
-                raise RuntimeError(str(exc)) from exc
-            if claim_status == "orphaned":
-                # Lease expiry is only evidence that heartbeats are currently
-                # unavailable.  A paused process or detached worker can still
-                # be producing side effects, so expiry alone must never write
-                # a terminal or release the session execution fence.
-                claim_status = "admitted"
-            if claim_status == "admitted":
-                replay_turn_id = self._store.user_message_turn_id(
-                    session_id,
-                    message_id,
-                )
-                if replay_turn_id is None:
-                    raise RuntimeError("admitted turn identity is unavailable")
-                return TurnSubmissionResult(
-                    turn_id=replay_turn_id,
-                    replayed=True,
-                    terminal=(
-                        self._store.user_message_turn_status(session_id, message_id)
-                        == "terminal"
-                    ),
-                )
-            if claim_status == "pending":
-                raise TurnSubmissionPending("turn submission is still pending")
-            if claim_status == "busy":
-                raise TurnSessionBusy("another turn is still active for this session")
-        message_committed = False
-
-        def commit_message() -> None:
-            nonlocal message_committed
-            if message_id is None or message_committed:
-                return
-            self._store.commit_user_message(
-                session_id,
-                message_id,
-                message,
-                runtime_id=runtime_id,
-                ttl_seconds=admission_ttl,
-            )
-            message_committed = True
-
-        async def heartbeat_message_admission() -> None:
-            while True:
-                await asyncio.sleep(admission_renew_interval)
-                self._store.renew_user_message(
-                    session_id,
-                    message_id,
-                    runtime_id=runtime_id,
-                    ttl_seconds=admission_ttl,
-                )
-
-        heartbeat_task = (
-            asyncio.create_task(
-                heartbeat_message_admission(),
-                name=f"datapilot-message-admission:{message_id}",
-            )
-            if message_id is not None
-            else None
-        )
-
-        try:
-            turn_id = await self._runtime.submit_user_message(
-                web_session_id=session_id,
-                message=message,
-                message_id=message_id,
-                turn_id=durable_turn_id,
-                on_admitted=commit_message if message_id is not None else None,
-            )
-        except BaseException:
-            if message_id is not None:
-                self._store.release_user_message(
-                    session_id,
-                    message_id,
-                    message,
-                    runtime_id=runtime_id,
-                )
-            raise
-        finally:
-            if heartbeat_task is not None:
-                heartbeat_task.cancel()
-                await asyncio.gather(heartbeat_task, return_exceptions=True)
-        if message_id is None:
-            self._store.append_message(session_id, role="user", content=message)
-        elif not message_committed:
-            commit_message()
-        if message_id is not None:
-            return TurnSubmissionResult(
-                turn_id=durable_turn_id,
-                replayed=False,
-                terminal=False,
-            )
+        turn_id = await self._runtime.submit_user_message(web_session_id=session_id, message=message)
+        self._store.append_message(session_id, role="user", content=message)
         if isinstance(turn_id, str):
             return turn_id
         return f"turn_{uuid4().hex}"
 
-    async def interrupt(self, session_id: str) -> InterruptResponse:
+    async def interrupt(self, session_id: str) -> bool:
         if self._store.get_session(session_id) is None:
             raise KeyError(session_id)
 
         interrupt_web_session = getattr(self._runtime, "interrupt_web_session", None)
         if interrupt_web_session is None:
-            return InterruptResponse(interrupted=False)
-        result = await interrupt_web_session(web_session_id=session_id)
-        if isinstance(result, InterruptResponse):
-            return result
-        interrupted = getattr(result, "interrupted", None)
-        stopped_tool_call_ids = getattr(result, "stopped_tool_call_ids", None)
-        if isinstance(interrupted, bool):
-            return InterruptResponse(
-                interrupted=interrupted,
-                stopped_tool_call_ids=list(stopped_tool_call_ids or ()),
-            )
-        return InterruptResponse(interrupted=bool(result))
-
-    async def delete_session(self, session_id: str) -> None:
-        if self._store.get_session(session_id) is None:
-            raise KeyError(session_id)
-        deleted = await self._runtime.delete_web_session(session_id)
-        if not deleted:
-            raise RuntimeError("AgentScope Web session deletion failed")
-        self._store.delete_session(session_id)
+            return False
+        return bool(await interrupt_web_session(web_session_id=session_id))
 
     async def submit_human_decision(self, session_id: str, decision: dict[str, Any]) -> bool:
         if self._store.get_session(session_id) is None:
@@ -246,3 +71,58 @@ class AgentScopeWebSessionManager:
             raise RuntimeError("Human decision recovery is not supported")
         result = await recover(web_session_id=session_id, recovery=recovery)
         return dict(result)
+
+    async def forward_events_until_idle(self, session_id: str) -> None:
+        async with self._forward_lock(session_id):
+            await self._forward_events_until_idle_unlocked(session_id)
+
+    def _forward_lock(self, session_id: str) -> asyncio.Lock:
+        lock = self._forward_locks.get(session_id)
+        if lock is None:
+            lock = asyncio.Lock()
+            self._forward_locks[session_id] = lock
+        return lock
+
+    async def _forward_events_until_idle_unlocked(self, session_id: str) -> None:
+        subscribe_events = getattr(self._runtime, "subscribe_web_session_events", None)
+        if subscribe_events is None:
+            return
+
+        seen_subscription_keys: set[object] = set()
+        while True:
+            before_key = self._runtime_subscription_key(session_id)
+            if before_key in seen_subscription_keys:
+                return
+            seen_subscription_keys.add(before_key)
+
+            persisted_final_texts: set[str] = set()
+            async for event in subscribe_events(web_session_id=session_id):
+                self._store.append_timeline_event(session_id, event)
+                if self._event_callback is not None:
+                    callback_result = self._event_callback(session_id, event)
+                    if inspect.isawaitable(callback_result):
+                        await callback_result
+                text = _final_event_text(event)
+                if text is not None and text not in persisted_final_texts:
+                    self._store.append_message(session_id, role="assistant", content=text)
+                    persisted_final_texts.add(text)
+
+            after_key = self._runtime_subscription_key(session_id)
+            if after_key == before_key:
+                return
+
+    def _runtime_subscription_key(self, session_id: str) -> object:
+        subscription_key = getattr(self._runtime, "web_session_subscription_key", None)
+        if not callable(subscription_key):
+            return None
+        return subscription_key(web_session_id=session_id)
+
+
+def _final_event_text(event: dict[str, Any]) -> str | None:
+    if event.get("type") != "final":
+        return None
+    payload = event.get("payload")
+    if not isinstance(payload, dict):
+        return None
+    text = payload.get("text")
+    return text if isinstance(text, str) and text else None

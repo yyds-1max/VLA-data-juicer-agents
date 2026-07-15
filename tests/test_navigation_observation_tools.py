@@ -352,39 +352,6 @@ def test_read_observation_evidence_default_ref_pages_by_character_budget(tmp_pat
     assert len(json.dumps(second, ensure_ascii=False, separators=(",", ":"))) <= 5_500
 
 
-def test_read_observation_evidence_rejects_reserved_fields_and_strips_nested_identity(
-    tmp_path,
-):
-    tools, _, evidence_store = _tools(tmp_path)
-    descriptor = evidence_store.write(
-        "nav-observe-1",
-        1,
-        "reserved_identity",
-        "inspect_reserved_identity_tool",
-        {
-            "result_ref": "must-not-be-visible",
-            "nested": {"result_ref": "nested-secret", "safe": "visible"},
-        },
-        "reserved identity",
-    )
-
-    full = _invoke_tool(
-        tools["read_observation_evidence_tool"],
-        {"ref": descriptor.ref},
-    )
-    reserved = _invoke_tool(
-        tools["read_observation_evidence_tool"],
-        {"ref": descriptor.ref, "fields": ["result_ref"]},
-    )
-
-    assert full == {"data": {"nested": {"safe": "visible"}}, "next_cursor": None}
-    assert "result_ref" not in json.dumps(full)
-    assert reserved == {
-        "ok": False,
-        "error_type": "navigation_evidence_request_invalid",
-    }
-
-
 def test_repeated_inspections_paginate_evidence_and_context_by_character_budget(tmp_path):
     tools, _, _ = _tools(tmp_path)
     for _ in range(30):

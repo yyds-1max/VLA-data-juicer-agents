@@ -1,39 +1,27 @@
 from __future__ import annotations
 
 import asyncio
-import hashlib
-import inspect
 import json
 import logging
 import re
 from contextlib import suppress
 from dataclasses import dataclass, field
-from datetime import UTC, datetime
+from types import SimpleNamespace
 from typing import Any
 from uuid import uuid4
 
 import agentscope.app
-from agentscope.app.message_bus import MessageBusKeys, RedisMessageBus
+from agentscope.app.message_bus import RedisMessageBus
 from agentscope.app.storage import ChatModelConfig, RedisStorage, SessionConfig
 from agentscope.app.workspace_manager import LocalWorkspaceManager
-from agentscope.event import CustomEvent, ExternalExecutionResultEvent
-from agentscope.message import (
-    HintBlock,
-    TextBlock,
-    ToolCallState,
-    ToolResultBlock,
-    ToolResultState,
-    UserMsg,
-)
+from agentscope.event import ExternalExecutionResultEvent
+from agentscope.message import TextBlock, ToolCallState, ToolResultBlock, ToolResultState, UserMsg
 from agentscope.permission import PermissionBehavior, PermissionDecision
 from agentscope.tool import ToolBase, ToolChunk
-from pydantic import ValidationError
 
-from vla_data_juicer_agents.core.cancellation import (
-    CancellationContext,
-    bind_cancellation,
-    current_cancellation,
-)
+from vla_data_juicer_agents.adapters.agentscope import AgentScopeEventAdapter
+from vla_data_juicer_agents.core.cancellation import CancellationContext, bind_cancellation
+from vla_data_juicer_agents.core.events import CallbackEventSink, EventEmitter
 from vla_data_juicer_agents.navigation.agent_tools import resolve_navigation_agent_tools
 from vla_data_juicer_agents.navigation.config import NavigationSettings
 from vla_data_juicer_agents.navigation.plan_execution import (
@@ -53,18 +41,12 @@ from vla_data_juicer_agents.navigation.task_entry import (
 from vla_data_juicer_agents.navigation.task_store import normalize_segments
 from vla_data_juicer_agents.runtime.agentscope_bootstrap import bootstrap_agentscope_records
 from vla_data_juicer_agents.runtime.agentscope_config import AgentScopeRuntimeConfig
-from vla_data_juicer_agents.runtime.datapilot_projection import (
-    DataPilotReplyProjectionMiddleware,
-    DataPilotRunBoundaryMiddleware,
-    DataPilotToolOutcomeMiddleware,
-    sanitize_agent_event,
-)
 from vla_data_juicer_agents.runtime.navigation_tool_surface import (
     NavigationToolSurfaceMiddleware,
 )
-from vla_data_juicer_agents.runtime.stop_coordinator import OwnerLease, StopCoordinator
-from vla_data_juicer_agents.web.schemas import InterruptResponse
 
+_EVENT_STARTUP_GRACE_SECS = 1.0
+_EVENT_IDLE_POLL_SECS = 0.03
 _WAKEUP_RECOVERY_INTERVAL_SECS = 5.0
 _WAKEUP_RECOVERY_RETRY_DELAYS = (0.2, 1.0)
 _HUMAN_DECISION_TOOL_NAMES = {
@@ -94,90 +76,6 @@ class NavigationDataBusyError(RuntimeError):
 
 
 @dataclass
-class _CancellationLease:
-    cancellation: CancellationContext
-    generation: int | None = None
-    admission_baseline: tuple[int, int | None] | None = None
-    admitted: bool = True
-    admission_future: asyncio.Future[None] | None = None
-    foreground_refs: int = 1
-    tool_call_ids: set[str] = field(default_factory=set)
-    quiescent: asyncio.Event = field(default_factory=asyncio.Event)
-    owner_publication_suppressed: bool = False
-    on_admitted: Any = None
-    admission_callback_completed: bool = False
-
-    def sync_quiescence(self) -> None:
-        if self.foreground_refs == 0 and not self.tool_call_ids:
-            self.quiescent.set()
-        else:
-            self.quiescent.clear()
-
-    async def wait_for_quiescence(self, timeout: float) -> bool:
-        deadline = asyncio.get_running_loop().time() + timeout
-        try:
-            await asyncio.wait_for(self.quiescent.wait(), timeout=timeout)
-        except TimeoutError:
-            return False
-        remaining = max(0.0, deadline - asyncio.get_running_loop().time())
-        return await self.cancellation.wait_for_quiescence(timeout=remaining)
-
-    async def wait_until_quiescent(self) -> None:
-        """Keep a durable turn fenced until all owned work has really exited."""
-        await self.quiescent.wait()
-        await self.cancellation.wait_for_quiescence()
-
-
-class _StopAwareMessageBus:
-    """Filter stopped ToolOffload results at AgentScope's inbox drain seam."""
-
-    def __init__(self, wrapped: Any, runtime_provider: Any) -> None:
-        self._wrapped = wrapped
-        self._runtime_provider = runtime_provider
-
-    def __getattr__(self, name: str) -> Any:
-        return getattr(self._wrapped, name)
-
-    async def __aenter__(self) -> "_StopAwareMessageBus":
-        await self._wrapped.__aenter__()
-        return self
-
-    async def __aexit__(
-        self,
-        exc_type: type[BaseException] | None,
-        exc_value: BaseException | None,
-        traceback: Any,
-    ) -> None:
-        await self._wrapped.__aexit__(exc_type, exc_value, traceback)
-
-    async def queue_drain(
-        self,
-        key: str,
-        max_count: int = 100,
-    ) -> list[tuple[str, dict[str, Any]]]:
-        entries = await self._wrapped.queue_drain(key, max_count=max_count)
-        inbox_prefix = MessageBusKeys.inbox("")
-        if not key.startswith(inbox_prefix):
-            return entries
-        runtime = self._runtime_provider()
-        if runtime is None:
-            return entries
-        agentscope_session_id = key[len(inbox_prefix) :]
-        try:
-            return runtime.filter_stopped_tool_hints(
-                agentscope_session_id,
-                entries,
-            )
-        except Exception:  # pylint: disable=broad-except
-            _logger.warning(
-                "Stopped ToolOffload inbox filtering failed open: session_id=%s",
-                agentscope_session_id,
-                exc_info=True,
-            )
-            return entries
-
-
-@dataclass
 class AgentScopeRuntime:
     config: AgentScopeRuntimeConfig
     storage: Any
@@ -185,43 +83,15 @@ class AgentScopeRuntime:
     workspace_manager: Any
     app: Any
     web_sessions: dict[str, tuple[str, str]] = field(default_factory=dict)
+    event_cursors: dict[str, str | None] = field(default_factory=dict)
     web_session_store: Any | None = None
-    web_event_publisher: Any | None = None
     _active_human_decision_claims: set[str] = field(default_factory=set)
-    _run_cancellations: dict[str, list[_CancellationLease]] = field(default_factory=dict)
-    _tool_outcome_locks: dict[str, asyncio.Lock] = field(default_factory=dict)
-    _stop_locks: dict[str, asyncio.Lock] = field(default_factory=dict)
+    _run_cancellations: dict[str, CancellationContext] = field(default_factory=dict)
     recovery_metrics: AgentScopeRecoveryMetrics = field(default_factory=AgentScopeRecoveryMetrics)
     bootstrapped: bool = False
-    runtime_id: str = field(default_factory=lambda: uuid4().hex)
-    admission_lease_ttl_seconds: float = 30.0
-    admission_renew_interval_seconds: float = 5.0
-    admission_release_retry_delays: tuple[float, ...] = (0.0, 0.05, 0.2)
-    stop_coordinator: StopCoordinator | None = field(default=None, init=False)
 
     def __post_init__(self) -> None:
         self._bootstrap_lock = asyncio.Lock()
-        required_bus_methods = (
-            "publish",
-            "subscribe",
-            "registry_set",
-            "registry_del",
-            "registry_getall",
-        )
-        if all(callable(getattr(self.message_bus, name, None)) for name in required_bus_methods):
-            self.stop_coordinator = StopCoordinator(
-                self.message_bus,
-                self._stop_owner_leases,
-                runtime_id=self.runtime_id,
-            )
-
-    async def start_stop_coordinator(self) -> None:
-        if self.stop_coordinator is not None:
-            await self.stop_coordinator.start()
-
-    async def stop_stop_coordinator(self) -> None:
-        if self.stop_coordinator is not None:
-            await self.stop_coordinator.stop()
 
     async def ensure_bootstrapped(self) -> None:
         if self.bootstrapped:
@@ -236,421 +106,10 @@ class AgentScopeRuntime:
     def set_web_session_store(self, store: Any) -> None:
         self.web_session_store = store
 
-    def set_web_transport(self, store: Any, publisher: Any | None) -> None:
-        self.web_session_store = store
-        self.web_event_publisher = publisher
+    def web_session_subscription_key(self, *, web_session_id: str) -> tuple[str, str] | None:
+        return self._web_session_mapping(web_session_id)
 
-    def projection_private_identities(
-        self,
-        web_session_id: str | None = None,
-    ) -> set[str]:
-        identities = {
-            "MainRouterAgent",
-            self.config.main_router_agent_id,
-            "NavigationDataAgent",
-            self.config.navigation_agent_id,
-            self.config.user_id,
-        }
-        for agent_id, session_id in self.web_sessions.values():
-            identities.update((agent_id, session_id))
-        list_mappings = getattr(
-            self.web_session_store,
-            "list_agentscope_session_mappings",
-            None,
-        )
-        list_all_mappings = getattr(
-            self.web_session_store,
-            "list_all_agentscope_session_mappings",
-            None,
-        )
-        if web_session_id is None and callable(list_all_mappings):
-            for mapping in list_all_mappings():
-                identities.update(
-                    (mapping.agent_id, mapping.agentscope_session_id)
-                )
-        elif callable(list_mappings):
-            web_session_ids = (
-                [web_session_id]
-                if web_session_id is not None
-                else list(self.web_sessions)
-            )
-            for mapped_web_session_id in web_session_ids:
-                for mapping in list_mappings(mapped_web_session_id):
-                    identities.update(
-                        (mapping.agent_id, mapping.agentscope_session_id)
-                    )
-        return identities
-
-    def _sanitize_public_tool_outcome(
-        self,
-        public_session_id: str,
-        summary: str,
-        error_type: str | None,
-    ) -> tuple[str, str | None]:
-        try:
-            identities = self.projection_private_identities(public_session_id)
-        except Exception:  # pylint: disable=broad-except
-            _logger.exception("Public tool outcome identity lookup failed closed")
-            return "Tool execution details unavailable.", "public_sanitization_failed"
-        event = sanitize_agent_event(
-            {"summary": summary, "error_type": error_type},
-            private_identities=identities,
-        )
-        sanitized_summary = str(event.get("summary", ""))
-        sanitized_error = event.get("error_type")
-        if error_type is not None and error_type in identities:
-            sanitized_error = "private_runtime_identity"
-        elif sanitized_error is not None:
-            sanitized_error = str(sanitized_error)
-        return sanitized_summary, sanitized_error
-
-    async def project_agent_event(
-        self,
-        agentscope_session_id: str,
-        *,
-        dedupe_key: str,
-        event: dict[str, Any],
-    ) -> Any | None:
-        public_session_id = self._public_session_id(agentscope_session_id)
-        if public_session_id is None:
-            return None
-        record = self.web_session_store.append_public_event(
-            public_session_id,
-            dedupe_key,
-            event,
-        )
-        await self._publish_public_record(public_session_id, record)
-        return record
-
-    async def start_public_tool(
-        self,
-        agentscope_session_id: str,
-        *,
-        tool_call_id: str,
-        tool_name: str,
-    ) -> Any | None:
-        public_session_id = self._public_session_id(agentscope_session_id)
-        if public_session_id is None:
-            return None
-        tool_run = self.web_session_store.start_tool_run(
-            public_session_id,
-            tool_call_id,
-            tool_name,
-            datetime.now(UTC).isoformat(timespec="milliseconds"),
-        )
-        cancellation = current_cancellation()
-        if cancellation is not None:
-            self.retain_tool_cancellation(
-                agentscope_session_id,
-                tool_call_id,
-                cancellation,
-            )
-        return tool_run
-
-    async def finish_public_tool(
-        self,
-        agentscope_session_id: str,
-        *,
-        tool_call_id: str,
-        status: str,
-        summary: str,
-        error_type: str | None,
-    ) -> Any | None:
-        cancellation = current_cancellation()
-        try:
-            public_session_id = self._public_session_id(agentscope_session_id)
-            if public_session_id is None:
-                return None
-            async with self._tool_outcome_lock(public_session_id):
-                summary, error_type = self._sanitize_public_tool_outcome(
-                    public_session_id,
-                    summary,
-                    error_type,
-                )
-                identity = f"tool-terminal:{agentscope_session_id}:{tool_call_id}:{status}"
-
-                def terminal_event(tool_run: Any) -> tuple[str, dict[str, Any]]:
-                    event = CustomEvent(
-                        name="datapilot_tool_terminal",
-                        value={
-                            "tool_call_id": tool_run.tool_call_id,
-                            "status": tool_run.status,
-                            "summary": tool_run.summary,
-                            "error_type": tool_run.error_type,
-                        },
-                    ).model_dump(mode="json")
-                    return hashlib.sha256(identity.encode("utf-8")).hexdigest(), event
-
-                result = self.web_session_store.finish_tool_run_with_terminal_event(
-                    public_session_id,
-                    tool_call_id,
-                    status=status,
-                    summary=summary,
-                    error_type=error_type,
-                    terminal_event_factory=terminal_event,
-                )
-                if result is None:
-                    return None
-                tool_run, record = result
-            await self._publish_public_record(public_session_id, record)
-            return tool_run
-        finally:
-            if cancellation is not None:
-                self.release_tool_cancellation(
-                    agentscope_session_id,
-                    tool_call_id,
-                    cancellation,
-                )
-
-    def should_suppress_tool_delivery(
-        self,
-        agentscope_session_id: str,
-        tool_call_id: str,
-    ) -> bool:
-        public_session_id = self._public_session_id(agentscope_session_id)
-        if public_session_id is None or self.web_session_store is None:
-            return False
-        status = self.web_session_store.tool_run_status(
-            public_session_id,
-            tool_call_id,
-        )
-        return status == "stopped" or self.web_session_store.execution_generation_is_fenced(
-            public_session_id
-        )
-
-    def should_suppress_wakeup(self, agentscope_session_id: str) -> bool:
-        public_session_id = self._public_session_id(agentscope_session_id)
-        if public_session_id is None or self.web_session_store is None:
-            return False
-        return self.web_session_store.execution_generation_is_fenced(
-            public_session_id
-        )
-
-    def filter_stopped_tool_hints(
-        self,
-        agentscope_session_id: str,
-        entries: list[tuple[str, dict[str, Any]]],
-    ) -> list[tuple[str, dict[str, Any]]]:
-        public_session_id = self._public_session_id(agentscope_session_id)
-        if public_session_id is None or self.web_session_store is None:
-            return entries
-        retained: list[tuple[str, dict[str, Any]]] = []
-        for entry_id, payload in entries:
-            try:
-                hint = HintBlock.model_validate(payload)
-            except ValidationError:  # AgentScope Inbox owns canonical validation.
-                retained.append((entry_id, payload))
-                continue
-            source = hint.source
-            try:
-                source_payload = json.loads(source) if isinstance(source, str) else None
-            except json.JSONDecodeError:
-                source_payload = None
-            if not (
-                isinstance(source_payload, dict)
-                and set(source_payload) == {"label", "sublabel"}
-                and source_payload.get("label") == "tool_output"
-                and isinstance(source_payload.get("sublabel"), str)
-            ):
-                retained.append((entry_id, payload))
-                continue
-            sublabel = source_payload["sublabel"]
-            suppressed = (
-                self.web_session_store.tool_delivery_sublabel_is_suppressed(
-                    public_session_id,
-                    sublabel,
-                )
-            )
-            if suppressed:
-                _logger.info(
-                    "Dropped stopped ToolOffload inbox result: session_id=%s",
-                    agentscope_session_id,
-                )
-            else:
-                retained.append((entry_id, payload))
-        return retained
-
-    def _tool_outcome_lock(self, public_session_id: str) -> asyncio.Lock:
-        lock = self._tool_outcome_locks.get(public_session_id)
-        if lock is None:
-            lock = asyncio.Lock()
-            self._tool_outcome_locks[public_session_id] = lock
-        return lock
-
-    def _stop_lock(self, public_session_id: str) -> asyncio.Lock:
-        lock = self._stop_locks.get(public_session_id)
-        if lock is None:
-            lock = asyncio.Lock()
-            self._stop_locks[public_session_id] = lock
-        return lock
-
-    def _public_session_id(self, agentscope_session_id: str) -> str | None:
-        if self.web_session_store is None:
-            return None
-        get_mapping = getattr(
-            self.web_session_store,
-            "get_agentscope_session_mapping_by_agentscope_session",
-            None,
-        )
-        if callable(get_mapping):
-            mapping = get_mapping(agentscope_session_id)
-            if mapping is not None:
-                return mapping.web_session_id
-        for web_session_id, (_agent_id, session_id) in self.web_sessions.items():
-            if session_id == agentscope_session_id:
-                return web_session_id
-        return None
-
-    async def _publish_public_record(self, session_id: str, record: Any) -> None:
-        if self.web_event_publisher is None:
-            return
-        try:
-            result = self.web_event_publisher(session_id, record)
-            if inspect.isawaitable(result):
-                await result
-        except Exception:  # pylint: disable=broad-except
-            _logger.warning(
-                "Live public event publish failed; persisted replay remains "
-                "available: session_id=%s sequence=%s",
-                session_id,
-                getattr(record, "sequence", None),
-                exc_info=True,
-            )
-
-    async def _record_human_decision_resolution(
-        self,
-        web_session_id: str,
-        *,
-        request_id: str | None = None,
-        all_pending: bool = False,
-        reason: str,
-    ) -> Any | None:
-        record = self._append_human_decision_resolution(
-            web_session_id,
-            request_id=request_id,
-            all_pending=all_pending,
-            reason=reason,
-        )
-        if record is not None:
-            await self._publish_public_record(web_session_id, record)
-        return record
-
-    def _append_human_decision_resolution(
-        self,
-        web_session_id: str,
-        *,
-        request_id: str | None = None,
-        all_pending: bool = False,
-        reason: str,
-    ) -> Any | None:
-        if self.web_session_store is None:
-            return None
-        value: dict[str, Any] = {"reason": reason}
-        if all_pending:
-            value["all"] = True
-            public_identity = "all"
-        else:
-            normalized_request_id = (request_id or "").strip()
-            if not normalized_request_id:
-                raise ValueError("human decision resolution requires request_id")
-            value["request_id"] = normalized_request_id
-            public_identity = normalized_request_id
-        event = CustomEvent(
-            name="datapilot_human_decision_resolved",
-            value=value,
-        ).model_dump(mode="json")
-        event = sanitize_agent_event(
-            event,
-            private_identities=self.projection_private_identities(),
-        )
-        identity = (
-            f"human-decision-resolved:{web_session_id}:"
-            f"{public_identity}:{reason}"
-        )
-        record = self.web_session_store.append_public_event(
-            web_session_id,
-            hashlib.sha256(identity.encode("utf-8")).hexdigest(),
-            event,
-        )
-        return record
-
-    async def ensure_web_session(
-        self,
-        web_session_id: str,
-        *,
-        agent_id: str,
-        model: str,
-        admission_ticket: str | None = None,
-    ) -> str:
-        await self._require_stop_coordinator_admission_health()
-        if self.web_session_store is None:
-            return await self._ensure_web_session_with_ticket(
-                web_session_id,
-                agent_id=agent_id,
-                model=model,
-                admission_ticket=admission_ticket,
-            )
-        if admission_ticket is not None:
-            # Nested callers reuse the durable lease already claimed by their
-            # outer admission boundary; do not claim or renew a second lease.
-            return await self._ensure_web_session_with_ticket(
-                web_session_id,
-                agent_id=agent_id,
-                model=model,
-                admission_ticket=admission_ticket,
-            )
-
-        owned_ticket, _baseline = self.web_session_store.claim_session_run_admission(
-            web_session_id,
-            runtime_id=self.runtime_id,
-            ttl_seconds=self.admission_lease_ttl_seconds,
-        )
-        ensure_task = asyncio.create_task(
-            self._ensure_web_session_with_ticket(
-                web_session_id,
-                agent_id=agent_id,
-                model=model,
-                admission_ticket=owned_ticket,
-            ),
-            name=f"datapilot-session-ensure:{web_session_id}",
-        )
-        heartbeat_task = asyncio.create_task(
-            self._heartbeat_session_run_admission(web_session_id, owned_ticket),
-            name=f"datapilot-session-ensure-heartbeat:{web_session_id}",
-        )
-        try:
-            done, _pending = await asyncio.wait(
-                {ensure_task, heartbeat_task},
-                return_when=asyncio.FIRST_COMPLETED,
-            )
-            if ensure_task in done:
-                return ensure_task.result()
-            await asyncio.sleep(0)
-            if ensure_task.done():
-                return ensure_task.result()
-            heartbeat_error = heartbeat_task.exception()
-            ensure_task.cancel()
-            await asyncio.gather(ensure_task, return_exceptions=True)
-            raise RuntimeError("AgentScope session ensure lease renewal failed") from (
-                heartbeat_error
-                or RuntimeError("session ensure heartbeat exited unexpectedly")
-            )
-        finally:
-            heartbeat_task.cancel()
-            await asyncio.gather(heartbeat_task, return_exceptions=True)
-            if not ensure_task.done():
-                ensure_task.cancel()
-                await asyncio.gather(ensure_task, return_exceptions=True)
-            await self._release_session_run_admission(web_session_id, owned_ticket)
-
-    async def _ensure_web_session_with_ticket(
-        self,
-        web_session_id: str,
-        *,
-        agent_id: str,
-        model: str,
-        admission_ticket: str | None,
-    ) -> str:
+    async def ensure_web_session(self, web_session_id: str, *, agent_id: str, model: str) -> str:
         existing = self.web_sessions.get(web_session_id)
         if existing and existing[0] == agent_id:
             return existing[1]
@@ -658,12 +117,7 @@ class AgentScopeRuntime:
         persisted = self._load_web_session_mapping(web_session_id, agent_id=agent_id)
         if persisted and persisted[0] == agent_id:
             self.web_sessions[web_session_id] = persisted
-            self._save_web_session_mapping(
-                web_session_id,
-                agent_id,
-                persisted[1],
-                admission_ticket=admission_ticket,
-            )
+            self._save_web_session_mapping(web_session_id, agent_id, persisted[1])
             return persisted[1]
 
         session_id = f"{web_session_id}__{agent_id}"
@@ -682,46 +136,13 @@ class AgentScopeRuntime:
             ),
             session_id=session_id,
         )
-        previous_mapping = self.web_sessions.get(web_session_id)
         self.web_sessions[web_session_id] = (agent_id, session.id)
-        try:
-            self._save_web_session_mapping(
-                web_session_id,
-                agent_id,
-                session.id,
-                admission_ticket=admission_ticket,
-            )
-        except Exception as mapping_error:
-            if previous_mapping is None:
-                self.web_sessions.pop(web_session_id, None)
-            else:
-                self.web_sessions[web_session_id] = previous_mapping
-            raise
+        self._save_web_session_mapping(web_session_id, agent_id, session.id)
         return session.id
 
-    async def _require_stop_coordinator_admission_health(self) -> None:
-        coordinator = self.stop_coordinator
-        if coordinator is None or not coordinator.started:
-            return
-        try:
-            await coordinator.refresh_owners()
-        except Exception as exc:
-            raise RuntimeError("AgentScope run owner publication failed") from exc
-        if not coordinator.healthy:
-            raise RuntimeError("AgentScope run admission coordinator is unhealthy")
-
-    async def submit_user_message(
-        self,
-        *,
-        web_session_id: str,
-        message: str,
-        message_id: str | None = None,
-        turn_id: str | None = None,
-        on_admitted: Any = None,
-    ) -> str:
+    async def submit_user_message(self, *, web_session_id: str, message: str) -> str:
         await self.ensure_bootstrapped()
 
-        turn_id = turn_id or f"turn_{uuid4()}"
         agent_id = self._agent_id_for_user_message(web_session_id=web_session_id)
         model = (
             self.config.navigation_model
@@ -733,11 +154,8 @@ class AgentScopeRuntime:
             agent_id=agent_id,
             model=model,
             message=message,
-            turn_id=turn_id,
-            message_id=message_id,
-            on_admitted=on_admitted,
         )
-        return turn_id
+        return f"turn_{uuid4()}"
 
     def _agent_id_for_user_message(self, *, web_session_id: str) -> str:
         mapped = self._web_session_mapping(web_session_id)
@@ -845,148 +263,15 @@ class AgentScopeRuntime:
         agent_id: str,
         model: str,
         message: str,
-        turn_id: str | None = None,
-        message_id: str | None = None,
-        on_admitted: Any = None,
-    ) -> str:
-        admission_ticket: str | None = None
-        admission_baseline: tuple[int, int | None] | None = None
-        if self.web_session_store is not None:
-            admission_ticket, admission_baseline = (
-                self.web_session_store.claim_session_run_admission(
-                    web_session_id,
-                    runtime_id=self.runtime_id,
-                    ttl_seconds=self.admission_lease_ttl_seconds,
-                )
-            )
-        run_task: asyncio.Task | None = None
-        heartbeat_task: asyncio.Task | None = None
-        try:
-            run_task = asyncio.create_task(
-                self._start_agent_run_with_ticket(
-                    web_session_id=web_session_id,
-                    agent_id=agent_id,
-                    model=model,
-                    message=message,
-                    turn_id=turn_id,
-                    message_id=message_id,
-                    admission_ticket=admission_ticket,
-                    admission_baseline=admission_baseline,
-                    on_admitted=on_admitted,
-                ),
-                name=f"datapilot-admission:{web_session_id}",
-            )
-            if admission_ticket is None:
-                return await run_task
-            heartbeat_task = asyncio.create_task(
-                self._heartbeat_session_run_admission(
-                    web_session_id,
-                    admission_ticket,
-                ),
-                name=f"datapilot-admission-heartbeat:{web_session_id}",
-            )
-            done, _pending = await asyncio.wait(
-                {run_task, heartbeat_task},
-                return_when=asyncio.FIRST_COMPLETED,
-            )
-            # Boundary admission is the authoritative HTTP ACK. If both tasks
-            # complete in the same loop turn, maintenance failure must not
-            # reverse a successful admission and invite duplicate execution.
-            if run_task in done:
-                return run_task.result()
-            if heartbeat_task in done:
-                heartbeat_error = heartbeat_task.exception()
-                # Admission_future may have been resolved in this same loop
-                # turn. Give its waiter one scheduling opportunity before
-                # deciding that maintenance failed pre-admission.
-                await asyncio.sleep(0)
-                if run_task.done():
-                    return run_task.result()
-                run_task.cancel()
-                await asyncio.gather(run_task, return_exceptions=True)
-                raise RuntimeError("AgentScope run admission lease renewal failed") from (
-                    heartbeat_error
-                    or RuntimeError("admission heartbeat exited unexpectedly")
-                )
-            return run_task.result()
-        finally:
-            if heartbeat_task is not None:
-                heartbeat_task.cancel()
-                await asyncio.gather(heartbeat_task, return_exceptions=True)
-            if run_task is not None and not run_task.done():
-                run_task.cancel()
-                await asyncio.gather(run_task, return_exceptions=True)
-            if admission_ticket is not None:
-                await self._release_session_run_admission(
-                    web_session_id,
-                    admission_ticket,
-                )
-
-    async def _heartbeat_session_run_admission(
-        self,
-        web_session_id: str,
-        admission_ticket: str,
-    ) -> None:
-        while True:
-            await asyncio.sleep(self.admission_renew_interval_seconds)
-            self.web_session_store.renew_session_run_admission(
-                web_session_id,
-                admission_ticket,
-                runtime_id=self.runtime_id,
-                ttl_seconds=self.admission_lease_ttl_seconds,
-            )
-
-    async def _release_session_run_admission(
-        self,
-        web_session_id: str,
-        admission_ticket: str,
-    ) -> bool:
-        failure: Exception | None = None
-        for delay in self.admission_release_retry_delays:
-            if delay:
-                await asyncio.sleep(delay)
-            try:
-                self.web_session_store.release_session_run_admission(
-                    web_session_id,
-                    admission_ticket,
-                )
-                return True
-            except Exception as exc:  # pylint: disable=broad-except
-                failure = exc
-        # Admission success/failure is already authoritative. Reversing it here
-        # can duplicate a live run or hide its real exception. The expiring
-        # lease remains a conservative delete fence until crash recovery reaps
-        # it, so log the maintenance failure without changing the result.
-        _logger.error(
-            "AgentScope run admission lease release failed; awaiting expiry",
-            exc_info=(
-                type(failure),
-                failure,
-                failure.__traceback__,
-            ) if failure is not None else None,
-        )
-        return False
-
-    async def _start_agent_run_with_ticket(
-        self,
-        *,
-        web_session_id: str,
-        agent_id: str,
-        model: str,
-        message: str,
-        turn_id: str | None = None,
-        message_id: str | None = None,
-        admission_ticket: str | None = None,
-        admission_baseline: tuple[int, int | None] | None = None,
-        on_admitted: Any = None,
     ) -> str:
         chat_service = self.app.state.chat_service
         session_id = await self.ensure_web_session(
             web_session_id,
             agent_id=agent_id,
             model=model,
-            admission_ticket=admission_ticket,
         )
+        tail_cursor = await self._event_log_tail_cursor(session_id)
+
         if agent_id == self.config.navigation_agent_id:
             anchor = self._navigation_durable_state_anchor(
                 session_id,
@@ -998,34 +283,8 @@ class AgentScopeRuntime:
             )
 
         cancellation = CancellationContext()
-        admission_future: asyncio.Future[None] | None = None
-        if self.web_session_store is not None and admission_baseline is None:
-            admission_baseline = self.web_session_store.execution_boundary_snapshot(
-                web_session_id
-            )
-        self.register_run_cancellation(
-            session_id,
-            cancellation,
-            generation=(admission_baseline[0] if admission_baseline else None),
-        )
-        lease = self._run_cancellation_lease(session_id, cancellation)
-        if admission_baseline is not None:
-            admission_future = asyncio.get_running_loop().create_future()
-            lease.admission_baseline = admission_baseline
-            lease.admitted = False
-            lease.admission_future = admission_future
-            lease.on_admitted = on_admitted
-
-        if self.stop_coordinator is not None and self.stop_coordinator.started:
-            try:
-                # A submit is not launchable until its baseline owner is
-                # visible to Stop; do not rely on the heartbeat interval.
-                await self._require_stop_coordinator_admission_health()
-            except Exception:
-                self.clear_run_cancellation(session_id, cancellation)
-                with suppress(Exception):
-                    await self.stop_coordinator.refresh_owners()
-                raise
+        previous_cancellation = self.run_cancellation(session_id)
+        self.register_run_cancellation(session_id, cancellation)
 
         async def run_with_cancellation() -> None:
             try:
@@ -1039,876 +298,60 @@ class AgentScopeRuntime:
                         )
             finally:
                 self.clear_run_cancellation(session_id, cancellation)
-                if (
-                    self.stop_coordinator is not None
-                    and self.stop_coordinator.started
-                ):
-                    try:
-                        await self.stop_coordinator.refresh_owners()
-                    except Exception:  # pylint: disable=broad-except
-                        _logger.exception(
-                            "Failed to remove completed AgentScope run owner"
-                        )
 
         try:
-            task = self._spawn_chat_run(
-                run_with_cancellation(),
-                session_id=session_id,
-            )
+            self._spawn_chat_run(run_with_cancellation(), session_id=session_id)
         except Exception:
-            self.clear_run_cancellation(session_id, cancellation)
+            if previous_cancellation is not None:
+                self.register_run_cancellation(session_id, previous_cancellation)
+            else:
+                self.clear_run_cancellation(session_id, cancellation)
             raise
-        if turn_id is not None and on_admitted is None:
-            self._attach_user_turn_terminal(
-                task,
-                web_session_id=web_session_id,
-                turn_id=turn_id,
-                message_id=message_id,
-                lease=lease,
-            )
-        add_done_callback = getattr(task, "add_done_callback", None)
-        if admission_future is not None and callable(add_done_callback):
-            def reject_unadmitted(completed: asyncio.Task) -> None:
-                if admission_future.done():
-                    return
-                if completed.cancelled():
-                    error = RuntimeError(
-                        "AgentScope run was stopped before admission"
-                    )
-                else:
-                    error = completed.exception() or RuntimeError(
-                        "AgentScope run exited before admission"
-                    )
-                admission_future.set_exception(error)
-
-            add_done_callback(reject_unadmitted)
+        if tail_cursor is not None:
             try:
-                await admission_future
-            except asyncio.CancelledError:
-                cancellation.cancel()
-                await asyncio.gather(task, return_exceptions=True)
-                raise
-        if turn_id is not None and on_admitted is not None:
-            self._attach_user_turn_terminal(
-                task,
-                web_session_id=web_session_id,
-                turn_id=turn_id,
-                message_id=message_id,
-                lease=lease,
-            )
-        if message_id is not None and self.web_session_store is not None:
-            self._attach_user_message_execution_heartbeat(
-                task,
-                web_session_id=web_session_id,
-                message_id=message_id,
-                cancellation=cancellation,
-            )
+                self._remember_event_cursor(session_id, tail_cursor)
+            except Exception:
+                _logger.exception(
+                    "AgentScope event cursor persistence failed after run spawn; "
+                    "the accepted run remains authoritative: session_id=%s cursor=%s",
+                    session_id,
+                    tail_cursor,
+                )
         return session_id
 
-    def _attach_user_turn_terminal(
-        self,
-        task: Any,
-        *,
-        web_session_id: str,
-        turn_id: str,
-        message_id: str | None = None,
-        lease: _CancellationLease,
-    ) -> None:
-        add_done_callback = getattr(task, "add_done_callback", None)
-        if not callable(add_done_callback):
-            return
+    async def interrupt_web_session(self, *, web_session_id: str) -> bool:
+        mapped = self._web_session_mapping(web_session_id)
+        if mapped is None:
+            return False
 
-        def record_after_registry_cleanup(completed: asyncio.Task) -> None:
-            if completed.cancelled():
-                status = "stopped"
-            else:
-                status = "failure" if completed.exception() is not None else "success"
-            record_task = completed.get_loop().create_task(
-                self._record_user_turn_terminal(
-                    web_session_id=web_session_id,
-                    turn_id=turn_id,
-                    message_id=message_id,
-                    status=status,
-                    lease=lease,
-                ),
-                name=f"datapilot-run-terminal:{turn_id}",
-            )
-            record_task.add_done_callback(self._log_run_terminal_failure)
+        _agent_id, agentscope_session_id = mapped
+        interrupted = False
+        cancellation = self.run_cancellation(agentscope_session_id)
+        if cancellation is not None:
+            interrupted = cancellation.cancel() or interrupted
 
-        # AgentScope's registry installs its cleanup callback inside spawn().
-        # Registering this callback afterwards guarantees the registry entry is
-        # gone before the public terminal is persisted and published.
-        add_done_callback(record_after_registry_cleanup)
-
-    def _attach_user_message_execution_heartbeat(
-        self,
-        task: Any,
-        *,
-        web_session_id: str,
-        message_id: str,
-        cancellation: CancellationContext,
-    ) -> None:
-        add_done_callback = getattr(task, "add_done_callback", None)
-        if not callable(add_done_callback):
-            return
-
-        async def heartbeat() -> None:
-            while True:
-                await asyncio.sleep(self.admission_renew_interval_seconds)
-                self.web_session_store.renew_user_message(
-                    web_session_id,
-                    message_id,
-                    runtime_id=self.runtime_id,
-                    ttl_seconds=self.admission_lease_ttl_seconds,
-                )
-
-        heartbeat_task = asyncio.create_task(
-            heartbeat(),
-            name=f"datapilot-turn-heartbeat:{message_id}",
-        )
-
-        def stop_heartbeat(_completed: asyncio.Task) -> None:
-            heartbeat_task.cancel()
-
-        add_done_callback(stop_heartbeat)
-        def handle_heartbeat_failure(completed: asyncio.Task) -> None:
-            try:
-                completed.result()
-            except asyncio.CancelledError:
-                return
-            except Exception:  # pylint: disable=broad-except
-                _logger.exception("Failed to renew DataPilot turn execution lease")
-                cancellation.cancel()
-                task.cancel()
-
-        heartbeat_task.add_done_callback(handle_heartbeat_failure)
-
-    @staticmethod
-    def _log_run_terminal_failure(task: asyncio.Task) -> None:
-        try:
-            task.result()
-        except asyncio.CancelledError:
-            return
-        except Exception:  # pylint: disable=broad-except
-            _logger.exception("Failed to persist DataPilot run terminal")
-
-    async def _record_user_turn_terminal(
-        self,
-        *,
-        web_session_id: str,
-        turn_id: str,
-        message_id: str | None,
-        status: str,
-        lease: _CancellationLease,
-    ) -> Any | None:
-        if self.web_session_store is None:
-            return None
-        # The foreground AgentScope task can finish while ToolOffload work and
-        # shielded ``to_thread`` plan workers are still producing side effects.
-        # Keep the exact-message admission authoritative until both the runtime
-        # tool lease and the real worker registrations have reached quiescence.
-        await lease.wait_until_quiescent()
-        if message_id is not None:
-            record = self.web_session_store.finish_user_message_turn_with_event(
-                web_session_id,
-                message_id,
-                turn_id=turn_id,
-                terminal_status=status,
-            )
-        else:
-            event = CustomEvent(
-                name="datapilot_run_terminal",
-                value={"turn_id": turn_id, "status": status},
-            ).model_dump(mode="json")
-            identity = f"run-terminal:{web_session_id}:{turn_id}"
-            record = self.web_session_store.append_public_event(
-                web_session_id,
-                hashlib.sha256(identity.encode("utf-8")).hexdigest(),
-                event,
-            )
-        await self._publish_public_record(web_session_id, record)
-        return record
-
-    async def interrupt_web_session(
-        self,
-        *,
-        web_session_id: str,
-    ) -> InterruptResponse:
-        async with self._stop_lock(web_session_id):
-            return await self._interrupt_web_session_serialized(
-                web_session_id=web_session_id,
-            )
-
-    async def _interrupt_web_session_serialized(
-        self,
-        *,
-        web_session_id: str,
-    ) -> InterruptResponse:
-        mappings = self._all_web_session_mappings(web_session_id)
-        active_user_turns = (
-            self.web_session_store.admitted_user_message_turns(web_session_id)
-            if self.web_session_store is not None
-            else []
-        )
-        admitted_runtime_ids = {
-            runtime_id for _message_id, _turn_id, runtime_id in active_user_turns
-        }
-        if not mappings and self.web_session_store is None:
-            return InterruptResponse(interrupted=False)
-
-        stop_request = (
-            self.web_session_store.begin_or_resume_stop_request(web_session_id)
-            if self.web_session_store is not None
-            else None
-        )
-        coordinator_active = bool(
-            stop_request is not None
-            and stop_request.status == "pending"
-            and self.stop_coordinator is not None
-            and self.stop_coordinator.started
-        )
-        interrupted = bool(mappings or active_user_turns)
-        detail = (
-            self.web_session_store.get_session(web_session_id)
-            if self.web_session_store is not None
-            else None
-        )
-        require_owner = bool(
-            active_user_turns
-            or (
-                detail is not None
-                and any(row.status == "running" for row in detail.tool_runs)
-            )
-        )
-        expected_owners: dict[str, dict[str, Any]] | None = None
-        if coordinator_active:
-            assert stop_request is not None
-            assert self.stop_coordinator is not None
-            try:
-                expected_owners = await self.stop_coordinator.snapshot_expected_owners(
-                    [session_id for _agent_id, session_id in mappings],
-                    stop_request.generation,
-                    required_runtime_ids=admitted_runtime_ids,
-                )
-            except TimeoutError as exc:
-                raise RuntimeError(
-                    "explicit stop owner acknowledgement failed"
-                ) from exc
-            if not self.stop_coordinator.healthy:
-                raise RuntimeError("explicit stop coordinator is unhealthy")
-
-        local_leases = {
-            id(lease): lease
-            for _agent_id, agentscope_session_id in mappings
-            for lease in self._run_cancellations.get(agentscope_session_id, [])
-            if stop_request is None
-            or lease.generation is None
-            or lease.generation <= stop_request.generation
-        }
-        if not coordinator_active and active_user_turns and (
-            admitted_runtime_ids != {self.runtime_id} or not local_leases
-        ):
-            raise RuntimeError("explicit stop owner acknowledgement failed")
-
-        local_failures: list[Exception] = []
-        for _agent_id, agentscope_session_id in mappings:
-            try:
-                interrupted = (
-                    self.cancel_run_cancellations(agentscope_session_id)
-                    or interrupted
-                )
-            except Exception as exc:  # pylint: disable=broad-except
-                local_failures.append(exc)
-
-        # Freeze the owner barrier before cancellation can release a lease,
-        # then issue AgentScope's official cancellations before waiting for the
-        # barrier. Pure-async background tools release their lease only from
-        # the cancelled task's finally block.
-        official_failure: Exception | None = None
-        try:
-            await self._request_official_web_session_cancellation(mappings)
-        except Exception as exc:  # pylint: disable=broad-except
-            official_failure = exc
-        if local_failures:
-            raise RuntimeError("explicit stop cancellation failed") from local_failures[0]
-        if official_failure is not None:
-            raise official_failure
-
-        if coordinator_active:
-            assert stop_request is not None
-            assert self.stop_coordinator is not None
-            try:
-                await self.stop_coordinator.request_and_wait(
-                    request_id=stop_request.request_id,
-                    target_generation=stop_request.generation,
-                    agentscope_session_ids=[
-                        session_id for _agent_id, session_id in mappings
-                    ],
-                    require_owner=require_owner,
-                    expected_owners=expected_owners,
-                )
-            except TimeoutError as exc:
-                raise RuntimeError(
-                    "explicit stop owner acknowledgement failed"
-                ) from exc
-        else:
-            if active_user_turns:
-                leases_done = await asyncio.gather(
-                    *(lease.wait_for_quiescence(10.0) for lease in local_leases.values())
-                )
-                if not all(leases_done):
-                    raise RuntimeError("explicit stop owner did not quiesce")
-            elif local_leases:
-                workers_done = await asyncio.gather(
-                    *(
-                        lease.cancellation.wait_for_workers(timeout=10.0)
-                        for lease in local_leases.values()
-                    )
-                )
-                if not all(workers_done):
-                    raise RuntimeError("explicit stop worker did not quiesce")
-
-        if self.web_session_store is None:
-            for _agent_id, agentscope_session_id in mappings:
-                self.discard_run_cancellations(agentscope_session_id)
-            return InterruptResponse(interrupted=interrupted)
-
-        records = []
-        async with self._tool_outcome_lock(web_session_id):
-            def terminal_event(row: Any) -> tuple[str, dict[str, Any]]:
-                event = CustomEvent(
-                    name="datapilot_tool_terminal",
-                    value={
-                        "tool_call_id": row.tool_call_id,
-                        "status": "stopped",
-                        "summary": "已由用户停止",
-                    },
-                ).model_dump(mode="json")
-                identity = (
-                    f"explicit-stop-tool-terminal:{web_session_id}:"
-                    f"{row.tool_call_id}:stopped"
-                )
-                return hashlib.sha256(identity.encode("utf-8")).hexdigest(), event
-
-            if stop_request is None:
-                stopped, records = (
-                    self.web_session_store.stop_open_tool_runs_with_terminal_events(
-                        web_session_id,
-                        terminal_event,
-                    )
-                )
-            else:
-                stopped, records = (
-                    self.web_session_store.complete_stop_request_with_terminal_events(
-                        web_session_id,
-                        stop_request.request_id,
-                        terminal_event,
-                    )
-                )
-            for _agent_id, agentscope_session_id in mappings:
-                self.discard_run_cancellations(agentscope_session_id)
-            for message_id, turn_id, _runtime_id in active_user_turns:
-                try:
-                    records.append(
-                        self.web_session_store.finish_user_message_turn_with_event(
-                            web_session_id,
-                            message_id,
-                            turn_id=turn_id,
-                            terminal_status="stopped",
-                        )
-                    )
-                except RuntimeError:
-                    # A normal completion callback may win after the owner
-                    # barrier. Its terminal is already the authoritative one.
-                    continue
-            if interrupted or stopped:
-                resolution = self._append_human_decision_resolution(
-                    web_session_id,
-                    all_pending=True,
-                    reason="stopped",
-                )
-                if resolution is not None:
-                    records.append(resolution)
-        for record in records:
-            await self._publish_public_record(web_session_id, record)
-        return InterruptResponse(
-            interrupted=interrupted or bool(stopped),
-            stopped_tool_call_ids=[row.tool_call_id for row in stopped],
-        )
-
-    async def _request_official_web_session_cancellation(
-        self,
-        mappings: list[tuple[str, str]],
-    ) -> None:
-        failures: list[Exception] = []
-        chat_service = self.app.state.chat_service
-        for agent_id, agentscope_session_id in mappings:
-            try:
-                await chat_service.interrupt(
-                    self.config.user_id,
-                    agentscope_session_id,
-                    agent_id,
-                )
-            except LookupError:
-                # Historical mappings can outlive an AgentScope session.
-                continue
-            except Exception as exc:  # pylint: disable=broad-except
-                failures.append(exc)
-
-        cancelled_task_ids: set[str] = set()
-        for _agent_id, agentscope_session_id in mappings:
-            try:
-                tasks = await self.message_bus.registry_getall(
-                    MessageBusKeys.bg_tasks(agentscope_session_id),
-                )
-            except Exception as exc:  # pylint: disable=broad-except
-                failures.append(exc)
-                continue
-            for task_id in tasks:
-                if task_id in cancelled_task_ids:
-                    continue
-                cancelled_task_ids.add(task_id)
-                try:
-                    await self.message_bus.publish(
-                        MessageBusKeys.task_cancel_channel(),
-                        {"task_id": task_id},
-                    )
-                except Exception as exc:  # pylint: disable=broad-except
-                    failures.append(exc)
-
-        if failures:
-            raise RuntimeError("explicit stop cancellation failed") from failures[0]
-
-    def _all_web_session_mappings(
-        self,
-        web_session_id: str,
-    ) -> list[tuple[str, str]]:
-        mappings: list[tuple[str, str]] = []
-        list_mappings = getattr(
-            self.web_session_store,
-            "list_agentscope_session_mappings",
-            None,
-        )
-        if callable(list_mappings):
-            mappings.extend(
-                (mapping.agent_id, mapping.agentscope_session_id)
-                for mapping in list_mappings(web_session_id)
-            )
-        mapped = self.web_sessions.get(web_session_id)
-        if mapped is not None and mapped not in mappings:
-            mappings.append(mapped)
-        return mappings
-
-    async def delete_web_session(self, web_session_id: str) -> bool:
-        if self.web_session_store is None:
-            raise RuntimeError("Web session store is not configured")
-        async with self._stop_lock(web_session_id):
-            # This durable fence is visible to submitters in every process and
-            # intentionally survives any partial destructive failure. The
-            # manager removes it atomically with the final public session row;
-            # retries are idempotent.
-            self.web_session_store.begin_session_deletion(web_session_id)
-            deadline = asyncio.get_running_loop().time() + 10.0
-            while True:
-                self.web_session_store.reap_expired_session_run_admissions(
-                    web_session_id
-                )
-                if not self.web_session_store.session_run_admission_is_pending(
-                    web_session_id
-                ):
-                    break
-                if asyncio.get_running_loop().time() >= deadline:
-                    raise RuntimeError(
-                        "session run admission did not quiesce before deletion"
-                    )
-                await asyncio.sleep(0.01)
-            mappings = self.web_session_store.list_agentscope_session_mappings(
-                web_session_id
-            )
-            coordinator_active = bool(
-                self.stop_coordinator is not None
-                and self.stop_coordinator.started
-            )
-            requires_quiescence_proof = bool(
-                self.web_session_store.admitted_user_message_turns(web_session_id)
-            )
-            if coordinator_active or requires_quiescence_proof:
-                # Do not destroy AgentScope or navigation state until every
-                # frozen remote owner has acknowledged actual quiescence.
-                await self._interrupt_web_session_serialized(
-                    web_session_id=web_session_id,
-                )
-            else:
-                cancellation_failures: list[Exception] = []
-                for mapping in mappings:
-                    try:
-                        self.cancel_run_cancellations(
-                            mapping.agentscope_session_id
-                        )
-                    except Exception as exc:  # pylint: disable=broad-except
-                        cancellation_failures.append(exc)
-                if cancellation_failures:
-                    raise RuntimeError(
-                        "AgentScope session cancellation failed"
-                    ) from cancellation_failures[0]
-
-            # Re-read only after admissions and every owner have quiesced. The
-            # deletion fence rejects supported mapping writers, while this final
-            # snapshot also covers a mapping committed by an older/external writer
-            # during cancellation so its AgentScope session is not orphaned.
-            mappings = self.web_session_store.list_agentscope_session_mappings(
-                web_session_id
-            )
-            session_service = self.app.state.session_service
-            for mapping in mappings:
-                await session_service.delete_session(
-                    self.config.user_id,
-                    mapping.agent_id,
-                    mapping.agentscope_session_id,
-                )
-            for mapping in mappings:
-                self.discard_run_cancellations(mapping.agentscope_session_id)
-            self._navigation_services().delete_control_state_for_web_session(
-                web_session_id
-            )
-            self.web_sessions.pop(web_session_id, None)
-            return True
+        publish_cancel = getattr(self.message_bus, "session_publish_cancel", None)
+        if callable(publish_cancel):
+            await publish_cancel(agentscope_session_id)
+            interrupted = True
+        return interrupted
 
     def register_run_cancellation(
         self,
         agentscope_session_id: str,
         cancellation: CancellationContext,
-        *,
-        generation: int | None = None,
     ) -> None:
-        leases = self._run_cancellations.setdefault(agentscope_session_id, [])
-        for lease in leases:
-            if lease.cancellation is cancellation:
-                lease.foreground_refs += 1
-                lease.sync_quiescence()
-                if generation is not None:
-                    lease.generation = generation
-                return
-        leases.append(
-            _CancellationLease(
-                cancellation=cancellation,
-                generation=generation,
-            )
-        )
+        self._run_cancellations[agentscope_session_id] = cancellation
 
     def run_cancellation(self, agentscope_session_id: str) -> CancellationContext | None:
-        leases = self._run_cancellations.get(agentscope_session_id, [])
-        return next(
-            (
-                lease.cancellation
-                for lease in reversed(leases)
-                if not lease.cancellation.cancelled
-            ),
-            None,
-        )
-
-    def admit_user_execution_generation(
-        self,
-        agentscope_session_id: str,
-        cancellation: CancellationContext,
-    ) -> int | None:
-        """Advance a stopped boundary after AgentScope admits a user run.
-
-        The run-boundary middleware calls this only for ``UserMsg`` inputs,
-        after ChatService owns the distributed session-run lock.  A lease keeps
-        the operation idempotent if middleware is re-entered for the same run.
-        """
-        public_session_id = self._public_session_id(agentscope_session_id)
-        if public_session_id is None or self.web_session_store is None:
-            return None
-        lease = self._run_cancellation_lease(
-            agentscope_session_id,
-            cancellation,
-        )
-        if (
-            self.stop_coordinator is not None
-            and self.stop_coordinator.started
-            and not self.stop_coordinator.healthy
-        ):
-            raise RuntimeError("AgentScope run admission coordinator is unhealthy")
-        if not lease.admitted:
-            lease.generation = self.web_session_store.begin_execution_generation(
-                public_session_id,
-                expected_boundary=lease.admission_baseline,
-            )
-            lease.admitted = True
-        elif lease.generation is None:
-            lease.generation = self.web_session_store.begin_execution_generation(
-                public_session_id
-            )
-        return lease.generation
-
-    async def complete_user_execution_admission(
-        self,
-        agentscope_session_id: str,
-        cancellation: CancellationContext,
-    ) -> None:
-        lease = self._run_cancellation_lease(
-            agentscope_session_id,
-            cancellation,
-        )
-        try:
-            if self.stop_coordinator is not None and self.stop_coordinator.started:
-                await self._require_stop_coordinator_admission_health()
-            self.admit_user_execution_generation(
-                agentscope_session_id,
-                cancellation,
-            )
-            public_session_id = self._public_session_id(agentscope_session_id)
-            if (
-                public_session_id is not None
-                and self.web_session_store is not None
-                and self.web_session_store.execution_generation_is_fenced(
-                    public_session_id
-                )
-            ):
-                cancellation.cancel()
-                raise RuntimeError("execution admission was fenced by stop")
-        except asyncio.CancelledError:
-            future = lease.admission_future
-            if future is not None and not future.done():
-                future.cancel()
-            raise
-        except Exception as exc:
-            future = lease.admission_future
-            if future is not None and not future.done():
-                future.set_exception(
-                    exc
-                    if isinstance(exc, RuntimeError)
-                    else RuntimeError("AgentScope run admission failed")
-                )
-            raise
-        try:
-            if lease.on_admitted is not None and not lease.admission_callback_completed:
-                admitted_result = lease.on_admitted()
-                if inspect.isawaitable(admitted_result):
-                    await admitted_result
-                lease.admission_callback_completed = True
-        except asyncio.CancelledError:
-            future = lease.admission_future
-            if future is not None and not future.done():
-                future.cancel()
-            raise
-        except Exception as exc:
-            future = lease.admission_future
-            if future is not None and not future.done():
-                future.set_exception(exc)
-            raise
-        future = lease.admission_future
-        if future is not None and not future.done():
-            future.set_result(None)
-
-    def _run_cancellation_lease(
-        self,
-        agentscope_session_id: str,
-        cancellation: CancellationContext,
-    ) -> _CancellationLease:
-        lease = next(
-            (
-                item
-                for item in self._run_cancellations.get(
-                    agentscope_session_id,
-                    [],
-                )
-                if item.cancellation is cancellation
-            ),
-            None,
-        )
-        if lease is None:
-            raise RuntimeError(
-                "AgentScope user run must register cancellation before admission"
-            )
-        return lease
-
-    def retain_tool_cancellation(
-        self,
-        agentscope_session_id: str,
-        tool_call_id: str,
-        cancellation: CancellationContext,
-    ) -> None:
-        leases = self._run_cancellations.setdefault(agentscope_session_id, [])
-        lease = next(
-            (item for item in leases if item.cancellation is cancellation),
-            None,
-        )
-        if lease is None:
-            lease = _CancellationLease(
-                cancellation=cancellation,
-                foreground_refs=0,
-            )
-            leases.append(lease)
-        if lease.generation is None:
-            public_session_id = self._public_session_id(agentscope_session_id)
-            current_generation = getattr(
-                self.web_session_store,
-                "current_execution_generation",
-                None,
-            )
-            if public_session_id is not None and callable(current_generation):
-                lease.generation = current_generation(public_session_id)
-        lease.tool_call_ids.add(tool_call_id)
-        lease.sync_quiescence()
-
-    def _stop_owner_leases(self) -> list[OwnerLease]:
-        return [
-            OwnerLease(
-                agentscope_session_id=agentscope_session_id,
-                generation=lease.generation,
-                cancellation=lease.cancellation,
-                tool_call_ids=frozenset(lease.tool_call_ids),
-                wait_for_quiescence=lease.wait_for_quiescence,
-                publish_owner=not lease.owner_publication_suppressed,
-                suppress_for_ack=lambda session_id=agentscope_session_id,
-                item=lease,
-                generation=lease.generation: self._suppress_run_cancellation_owner(
-                    session_id,
-                    item,
-                    generation,
-                ),
-                restore_after_ack_failure=lambda session_id=agentscope_session_id,
-                item=lease,
-                generation=lease.generation: self._restore_run_cancellation_owner(
-                    session_id,
-                    item,
-                    generation,
-                ),
-                on_acknowledged=lambda session_id=agentscope_session_id,
-                item=lease,
-                generation=lease.generation: self._discard_acknowledged_run_cancellation(
-                    session_id,
-                    item,
-                    generation,
-                ),
-            )
-            for agentscope_session_id, leases in self._run_cancellations.items()
-            for lease in leases
-            if lease.generation is not None
-        ]
-
-    def _suppress_run_cancellation_owner(
-        self,
-        agentscope_session_id: str,
-        lease: _CancellationLease,
-        generation: int,
-    ) -> bool:
-        current = self._run_cancellations.get(agentscope_session_id, [])
-        if (
-            not any(candidate is lease for candidate in current)
-            or lease.generation != generation
-            or lease.foreground_refs != 0
-            or lease.tool_call_ids
-        ):
-            return False
-        lease.owner_publication_suppressed = True
-        return True
-
-    def _restore_run_cancellation_owner(
-        self,
-        agentscope_session_id: str,
-        lease: _CancellationLease,
-        generation: int,
-    ) -> None:
-        if (
-            any(
-                candidate is lease
-                for candidate in self._run_cancellations.get(
-                    agentscope_session_id,
-                    [],
-                )
-            )
-            and lease.generation == generation
-        ):
-            lease.owner_publication_suppressed = False
-
-    def _discard_acknowledged_run_cancellation(
-        self,
-        agentscope_session_id: str,
-        acknowledged: _CancellationLease,
-        generation: int,
-    ) -> None:
-        leases = self._run_cancellations.get(agentscope_session_id, [])
-        remaining = [
-            lease
-            for lease in leases
-            if not (
-                lease is acknowledged
-                and lease.generation == generation
-                and lease.foreground_refs == 0
-                and not lease.tool_call_ids
-            )
-        ]
-        if remaining:
-            self._run_cancellations[agentscope_session_id] = remaining
-        else:
-            self._run_cancellations.pop(agentscope_session_id, None)
-
-    def release_tool_cancellation(
-        self,
-        agentscope_session_id: str,
-        tool_call_id: str,
-        cancellation: CancellationContext,
-    ) -> None:
-        for lease in self._run_cancellations.get(agentscope_session_id, []):
-            if lease.cancellation is cancellation:
-                lease.tool_call_ids.discard(tool_call_id)
-                lease.sync_quiescence()
-                break
-        self._prune_run_cancellations(agentscope_session_id)
-
-    def cancel_run_cancellations(self, agentscope_session_id: str) -> bool:
-        cancelled = False
-        failures: list[Exception] = []
-        for lease in self._run_cancellations.get(agentscope_session_id, []):
-            try:
-                cancelled = lease.cancellation.cancel() or cancelled
-            except Exception as exc:  # pylint: disable=broad-except
-                failures.append(exc)
-        if failures:
-            raise RuntimeError("AgentScope cancellation lease failed") from failures[0]
-        return cancelled
-
-    def discard_run_cancellations(self, agentscope_session_id: str) -> None:
-        self._run_cancellations.pop(agentscope_session_id, None)
+        return self._run_cancellations.get(agentscope_session_id)
 
     def clear_run_cancellation(
         self,
         agentscope_session_id: str,
         cancellation: CancellationContext,
     ) -> None:
-        for lease in self._run_cancellations.get(agentscope_session_id, []):
-            if lease.cancellation is cancellation:
-                lease.foreground_refs = max(0, lease.foreground_refs - 1)
-                lease.sync_quiescence()
-                break
-        self._prune_run_cancellations(agentscope_session_id)
-
-    def _prune_run_cancellations(self, agentscope_session_id: str) -> None:
-        public_session_id = self._public_session_id(agentscope_session_id)
-
-        def pending_stop(lease: _CancellationLease) -> bool:
-            return bool(
-                public_session_id is not None
-                and self.web_session_store is not None
-                and lease.generation is not None
-                and self.web_session_store.stop_request_is_pending(
-                    public_session_id,
-                    lease.generation,
-                )
-            )
-
-        leases = [
-            lease
-            for lease in self._run_cancellations.get(agentscope_session_id, [])
-            if lease.foreground_refs > 0 or lease.tool_call_ids or pending_stop(lease)
-        ]
-        if leases:
-            self._run_cancellations[agentscope_session_id] = leases
-        else:
+        if self._run_cancellations.get(agentscope_session_id) is cancellation:
             self._run_cancellations.pop(agentscope_session_id, None)
 
     def record_navigation_handoff(self, payload: dict[str, Any]) -> None:
@@ -2033,17 +476,6 @@ class AgentScopeRuntime:
 
         claim_handoff = False
         try:
-            if self._is_human_decision_consumed(
-                agentscope_session_id=agentscope_session_id,
-                reply_id=decision["reply_id"],
-                tool_call_id=decision["tool_call_id"],
-            ):
-                await self._record_human_decision_resolution(
-                    web_session_id,
-                    request_id=decision.get("request_id"),
-                    reason="submitted",
-                )
-                return True
             if plan_store is not None:
                 existing = plan_store.get_human_decision_handoff(plan_id, step_id)
                 if existing is not None and existing.status == "quarantined":
@@ -2065,11 +497,6 @@ class AgentScopeRuntime:
                     self._mark_human_decision_consumed(
                         agentscope_session_id=agentscope_session_id,
                         decision=decision,
-                    )
-                    await self._record_human_decision_resolution(
-                        web_session_id,
-                        request_id=decision.get("request_id"),
-                        reason="submitted",
                     )
                     return True
                 if existing is not None:
@@ -2097,11 +524,6 @@ class AgentScopeRuntime:
                         self._mark_human_decision_consumed(
                             agentscope_session_id=agentscope_session_id,
                             decision=decision,
-                        )
-                        await self._record_human_decision_resolution(
-                            web_session_id,
-                            request_id=decision.get("request_id"),
-                            reason="submitted",
                         )
                         return True
                     if external_state not in {"submitted", "consumed"}:
@@ -2164,11 +586,6 @@ class AgentScopeRuntime:
                         agentscope_session_id=agentscope_session_id,
                         decision=decision,
                     )
-                    await self._record_human_decision_resolution(
-                        web_session_id,
-                        request_id=decision.get("request_id"),
-                        reason="submitted",
-                    )
                     return True
                 if delivery == "recovery_required":
                     raise RuntimeError(
@@ -2189,22 +606,26 @@ class AgentScopeRuntime:
                 output=json.dumps(_human_decision_tool_output(pending_tool_name, decision), ensure_ascii=False),
                 state=ToolResultState.SUCCESS,
             )
-            handoff_identity = (
-                f"navigation-human-handoff:{plan_id}:{step_id}:{decision_key}"
-                if plan_bound_handoff
-                else _human_continuation_identity(
-                    agentscope_session_id,
-                    pending_tool_name,
-                    decision,
-                )
-            )
             input_msg = ExternalExecutionResultEvent(
-                id=handoff_identity,
-                metadata={"idempotency_key": handoff_identity},
+                id=(
+                    f"navigation-human-handoff:{plan_id}:{step_id}:{decision_key}"
+                    if plan_bound_handoff
+                    else uuid4().hex
+                ),
+                metadata=(
+                    {
+                        "idempotency_key": (
+                            f"navigation-human-handoff:{plan_id}:{step_id}:{decision_key}"
+                        )
+                    }
+                    if plan_bound_handoff
+                    else {}
+                ),
                 reply_id=decision["reply_id"],
                 execution_results=[result],
             )
             cancellation = CancellationContext()
+            previous_cancellation = self.run_cancellation(agentscope_session_id)
             self.register_run_cancellation(agentscope_session_id, cancellation)
 
             async def run_with_claim() -> None:
@@ -2318,7 +739,13 @@ class AgentScopeRuntime:
                         expected_web_session_id=web_session_id,
                         expected_agentscope_session_id=agentscope_session_id,
                     )
-                self.clear_run_cancellation(agentscope_session_id, cancellation)
+                if previous_cancellation is not None:
+                    self.register_run_cancellation(
+                        agentscope_session_id,
+                        previous_cancellation,
+                    )
+                else:
+                    self.clear_run_cancellation(agentscope_session_id, cancellation)
                 raise
             if not plan_bound_handoff:
                 self._mark_human_decision_consumed(
@@ -2326,11 +753,6 @@ class AgentScopeRuntime:
                     decision=decision,
                 )
             claim_handoff = True
-            await self._record_human_decision_resolution(
-                web_session_id,
-                request_id=decision.get("request_id"),
-                reason="submitted",
-            )
             return True
         finally:
             if not claim_handoff:
@@ -2543,13 +965,13 @@ class AgentScopeRuntime:
 
         return _HumanDecisionClaim(release_local)
 
-    def _spawn_chat_run(self, run_coroutine: Any, *, session_id: str) -> Any:
+    def _spawn_chat_run(self, run_coroutine: Any, *, session_id: str) -> None:
         chat_run_registry = getattr(self.app.state, "chat_run_registry", None)
         if chat_run_registry is None:
             run_coroutine.close()
             raise RuntimeError("AgentScope chat_run_registry is not initialized")
         try:
-            return chat_run_registry.spawn(run_coroutine, session_id=session_id)
+            chat_run_registry.spawn(run_coroutine, session_id=session_id)
         except Exception:
             run_coroutine.close()
             raise
@@ -2685,29 +1107,17 @@ class AgentScopeRuntime:
             if record is None:
                 return False
 
-        cancellation = CancellationContext()
-        self.register_run_cancellation(session_id, cancellation)
-
-        async def run_with_cancellation() -> None:
-            try:
-                async with cancellation.track_agent(session_id):
-                    with bind_cancellation(cancellation):
-                        await self.app.state.chat_service.run(
-                            user_id=user_id,
-                            session_id=session_id,
-                            agent_id=agent_id,
-                            input_msg=None,
-                        )
-            finally:
-                self.clear_run_cancellation(session_id, cancellation)
-
         try:
             self._spawn_chat_run(
-                run_with_cancellation(),
+                self.app.state.chat_service.run(
+                    user_id=user_id,
+                    session_id=session_id,
+                    agent_id=agent_id,
+                    input_msg=None,
+                ),
                 session_id=session_id,
             )
         except RuntimeError:
-            self.clear_run_cancellation(session_id, cancellation)
             _logger.debug(
                 "AgentScope wakeup recovery skipped duplicate run: "
                 "session_id=%s source=%s",
@@ -2818,6 +1228,215 @@ class AgentScopeRuntime:
                 return agent_id
         return None
 
+    async def _event_log_tail_cursor(self, agentscope_session_id: str) -> str | None:
+        read_events = getattr(self.message_bus, "session_read_events", None)
+        if read_events is None:
+            return None
+        entries = await read_events(
+            agentscope_session_id,
+            since=self._event_cursor(agentscope_session_id),
+        )
+        if not entries:
+            return None
+        return entries[-1][0]
+
+    async def subscribe_web_session_events(self, *, web_session_id: str):
+        mapped = self._web_session_mapping(web_session_id)
+        if mapped is None:
+            return
+
+        agent_id, agentscope_session_id = mapped
+        translated_events: asyncio.Queue[dict[str, Any]] = asyncio.Queue()
+        live_events: asyncio.Queue[dict[str, Any] | None] = asyncio.Queue()
+        live_ready = asyncio.Event()
+        scope = EventEmitter(CallbackEventSink(translated_events.put_nowait)).scope(
+            "agentscope",
+            run_id=agentscope_session_id,
+        )
+        adapter = AgentScopeEventAdapter(
+            scope,
+            emit_text_events=True,
+            emit_final_events=True,
+        )
+        seen_entry_ids: set[str] = set()
+        seen_pending_decision_states: dict[tuple[str, str], str] = {}
+        saw_event = False
+        saw_reply_end = False
+        saw_running = False
+        startup_deadline = asyncio.get_running_loop().time() + _EVENT_STARTUP_GRACE_SECS
+        events_key = _session_events_key(self.message_bus, agentscope_session_id)
+
+        async def feed_live_events() -> None:
+            try:
+                async for event in self.message_bus.subscribe(
+                    events_key,
+                    on_ready=live_ready.set,
+                ):
+                    await live_events.put(event)
+            finally:
+                await live_events.put(None)
+
+        feeder_task = asyncio.create_task(
+            feed_live_events(),
+            name=f"agentscope-web-events:{agentscope_session_id}",
+        )
+
+        def accept_raw_event(raw_event: dict[str, Any]) -> list[dict[str, Any]]:
+            adapter.accept(_to_attribute_event(_strip_internal_event_fields(raw_event)))
+            events = []
+            while not translated_events.empty():
+                event = translated_events.get_nowait()
+                payload = event.get("payload")
+                if (
+                    event.get("type") == "human_decision_required"
+                    and isinstance(payload, dict)
+                    and isinstance(payload.get("plan_id"), str)
+                    and isinstance(payload.get("step_id"), str)
+                ):
+                    event = _enrich_plan_human_decision_event(
+                        event,
+                        plan_store=self._navigation_plan_store(),
+                    )
+                    if event is None:
+                        continue
+                    enriched_payload = event.get("payload")
+                    if (
+                        isinstance(enriched_payload, dict)
+                        and enriched_payload.get("recovery_required") is True
+                    ):
+                        enriched_payload["submission_disabled"] = True
+                        enriched_payload["recovery_endpoint"] = (
+                            f"/api/sessions/{web_session_id}/human-decisions/recovery"
+                        )
+                events.append(event)
+            return events
+
+        def should_emit_human_decision(event: dict[str, Any] | None) -> bool:
+            identity = _human_decision_event_key(event)
+            if not identity:
+                return event is not None
+            payload = event.get("payload") if event is not None else None
+            state = (
+                "recovery_required"
+                if isinstance(payload, dict) and payload.get("recovery_required") is True
+                else "normal"
+            )
+            previous = seen_pending_decision_states.get(identity)
+            if previous == state or (
+                previous == "recovery_required" and state == "normal"
+            ):
+                return False
+            seen_pending_decision_states[identity] = state
+            return True
+
+        try:
+            with suppress(TimeoutError):
+                await asyncio.wait_for(live_ready.wait(), timeout=_EVENT_STARTUP_GRACE_SECS)
+
+            pending_event = await self._pending_human_decision_event(
+                web_session_id=web_session_id,
+                agent_id=agent_id,
+                agentscope_session_id=agentscope_session_id,
+            )
+            if pending_event is not None and should_emit_human_decision(pending_event):
+                yield pending_event
+
+            cursor = self._event_cursor(agentscope_session_id)
+            for entry_id, raw_event in await self.message_bus.session_read_events(
+                agentscope_session_id,
+                since=cursor,
+            ):
+                if not self._is_new_event(agentscope_session_id, entry_id):
+                    continue
+                seen_entry_ids.add(entry_id)
+                saw_event = True
+                if _raw_event_type(raw_event) == "REPLY_END":
+                    saw_reply_end = True
+                for event in accept_raw_event(raw_event):
+                    decision_key = (
+                        _human_decision_event_key(event)
+                        if event.get("type") == "human_decision_required"
+                        else ""
+                    )
+                    if decision_key:
+                        if not should_emit_human_decision(event):
+                            continue
+                    yield event
+                self._remember_event_cursor(
+                    agentscope_session_id,
+                    entry_id,
+                )
+
+            while True:
+                running = bool(await self.message_bus.session_is_running(agentscope_session_id))
+                local_running = self._is_local_agent_run_active(agentscope_session_id)
+                saw_running = saw_running or running or local_running
+
+                live_feed_finished = False
+                try:
+                    raw_event = await asyncio.wait_for(
+                        live_events.get(),
+                        timeout=_EVENT_IDLE_POLL_SECS,
+                    )
+                except TimeoutError:
+                    raw_event = None
+                else:
+                    if raw_event is None:
+                        live_feed_finished = True
+                    else:
+                        entry_id = _raw_event_entry_id(raw_event)
+                        if entry_id and entry_id in seen_entry_ids:
+                            continue
+                        if entry_id:
+                            if not self._is_new_event(agentscope_session_id, entry_id):
+                                continue
+                            seen_entry_ids.add(entry_id)
+                        saw_event = True
+                        if _raw_event_type(raw_event) == "REPLY_END":
+                            saw_reply_end = True
+                        for event in accept_raw_event(raw_event):
+                            decision_key = (
+                                _human_decision_event_key(event)
+                                if event.get("type") == "human_decision_required"
+                                else ""
+                            )
+                            if decision_key:
+                                if not should_emit_human_decision(event):
+                                    continue
+                            yield event
+                        if entry_id:
+                            self._remember_event_cursor(
+                                agentscope_session_id,
+                                entry_id,
+                            )
+                        continue
+
+                pending_event = await self._pending_human_decision_event(
+                    web_session_id=web_session_id,
+                    agent_id=agent_id,
+                    agentscope_session_id=agentscope_session_id,
+                )
+                if pending_event is not None and should_emit_human_decision(pending_event):
+                    saw_event = True
+                    yield pending_event
+                    continue
+                if live_feed_finished:
+                    break
+
+                now = asyncio.get_running_loop().time()
+                if running or local_running:
+                    continue
+                if saw_reply_end:
+                    break
+                if saw_event and saw_running:
+                    break
+                if now >= startup_deadline:
+                    break
+        finally:
+            feeder_task.cancel()
+            with suppress(asyncio.CancelledError):
+                await feeder_task
+
     def _is_local_agent_run_active(self, agentscope_session_id: str) -> bool:
         if self.run_cancellation(agentscope_session_id) is not None:
             return True
@@ -2827,6 +1446,31 @@ class AgentScopeRuntime:
             return False
         task = get_task(agentscope_session_id)
         return bool(task is not None and not task.done())
+
+    def _is_new_event(self, agentscope_session_id: str, entry_id: str) -> bool:
+        cursor = self._event_cursor(agentscope_session_id)
+        return cursor is None or _stream_id_is_newer(entry_id, cursor)
+
+    def _remember_event_cursor(
+        self,
+        agentscope_session_id: str,
+        entry_id: str,
+    ) -> None:
+        if self._is_new_event(agentscope_session_id, entry_id):
+            self._save_web_session_event_cursor(agentscope_session_id, entry_id)
+            self.event_cursors[agentscope_session_id] = entry_id
+
+    def _event_cursor(self, agentscope_session_id: str) -> str | None:
+        cursor = self.event_cursors.get(agentscope_session_id)
+        if cursor is not None:
+            return cursor
+        mapping = self._web_session_mapping_for_agentscope_session(agentscope_session_id)
+        if mapping is None:
+            return None
+        _agent_id, _session_id, persisted_cursor = mapping
+        if persisted_cursor:
+            self.event_cursors[agentscope_session_id] = persisted_cursor
+        return persisted_cursor
 
     def _web_session_mapping(self, web_session_id: str) -> tuple[str, str] | None:
         mapped = self.web_sessions.get(web_session_id)
@@ -2864,25 +1508,35 @@ class AgentScopeRuntime:
             return None
         return mapping.agent_id, mapping.agentscope_session_id
 
+    def _web_session_mapping_for_agentscope_session(
+        self,
+        agentscope_session_id: str,
+    ) -> tuple[str, str, str | None] | None:
+        if self.web_session_store is None:
+            return None
+        get_mapping = getattr(
+            self.web_session_store,
+            "get_agentscope_session_mapping_by_agentscope_session",
+            None,
+        )
+        if not callable(get_mapping):
+            return None
+        mapping = get_mapping(agentscope_session_id)
+        if mapping is None:
+            return None
+        return mapping.agent_id, mapping.agentscope_session_id, mapping.event_cursor
+
     def _save_web_session_mapping(
         self,
         web_session_id: str,
         agent_id: str,
         agentscope_session_id: str,
-        *,
-        admission_ticket: str | None = None,
     ) -> None:
         if self.web_session_store is None:
             return
         save_mapping = getattr(self.web_session_store, "save_agentscope_session_mapping", None)
         if callable(save_mapping):
-            save_mapping(
-                web_session_id,
-                agent_id=agent_id,
-                agentscope_session_id=agentscope_session_id,
-                admission_ticket=admission_ticket,
-                runtime_id=self.runtime_id,
-            )
+            save_mapping(web_session_id, agent_id=agent_id, agentscope_session_id=agentscope_session_id)
 
     def _restore_web_session_mapping(
         self,
@@ -2915,6 +1569,91 @@ class AgentScopeRuntime:
                 agent_id,
                 agentscope_session_id,
             )
+
+    def _save_web_session_event_cursor(self, agentscope_session_id: str, cursor: str) -> None:
+        if self.web_session_store is None:
+            return
+        save_cursor = getattr(self.web_session_store, "save_agentscope_event_cursor", None)
+        if callable(save_cursor):
+            save_cursor(agentscope_session_id, cursor)
+
+    async def _pending_human_decision_event(
+        self,
+        *,
+        web_session_id: str,
+        agent_id: str,
+        agentscope_session_id: str,
+    ) -> dict[str, Any] | None:
+        get_session = getattr(self.storage, "get_session", None)
+        if get_session is None:
+            return None
+        record = await get_session(self.config.user_id, agent_id, agentscope_session_id)
+        if record is None:
+            return None
+        state = getattr(record, "state", None)
+        reply_id = getattr(state, "reply_id", None)
+        if not reply_id:
+            return None
+        for message in getattr(state, "context", []) or []:
+            for tool_call in _tool_call_blocks(message):
+                if (
+                    getattr(tool_call, "name", None) in _HUMAN_DECISION_TOOL_NAMES
+                    and _state_value(getattr(tool_call, "state", None))
+                    == ToolCallState.SUBMITTED.value
+                ):
+                    payload = _human_decision_payload_from_tool_call(
+                        tool_call,
+                        plan_store=self._navigation_plan_store(),
+                    )
+                    if payload is None:
+                        tool_input = _tool_call_input(tool_call)
+                        plan_id = tool_input.get("plan_id")
+                        step_id = tool_input.get("step_id")
+                        if isinstance(plan_id, str) and isinstance(step_id, str):
+                            handoff = self._navigation_plan_store().get_human_decision_handoff(
+                                plan_id, step_id
+                            )
+                            if handoff is not None and handoff.status == "quarantined":
+                                self._mark_human_decision_consumed(
+                                    agentscope_session_id=agentscope_session_id,
+                                    decision={
+                                        "reply_id": reply_id,
+                                        "tool_call_id": str(getattr(tool_call, "id", "")),
+                                        "action": "quarantined",
+                                        "request_id": f"{plan_id}:{step_id}",
+                                    },
+                                )
+                        continue
+                    claim_key = _human_decision_claim_key(
+                        agentscope_session_id,
+                        {
+                            "reply_id": reply_id,
+                            "tool_call_id": getattr(tool_call, "id", ""),
+                        },
+                    )
+                    if self._is_human_decision_consumed(
+                        agentscope_session_id=agentscope_session_id,
+                        reply_id=reply_id,
+                        tool_call_id=getattr(tool_call, "id", ""),
+                    ):
+                        continue
+                    if await self._is_human_decision_claim_active(claim_key):
+                        continue
+                    payload["reply_id"] = reply_id
+                    payload["tool_call_id"] = getattr(tool_call, "id", "")
+                    if payload.get("recovery_required") is True:
+                        payload["submission_disabled"] = True
+                        payload["recovery_endpoint"] = (
+                            f"/api/sessions/{web_session_id}/human-decisions/recovery"
+                        )
+                    return {
+                        "type": "human_decision_required",
+                        "source": "NavigationDataAgent",
+                        "run_id": agentscope_session_id,
+                        "parent_run_id": None,
+                        "payload": payload,
+                    }
+        return None
 
     async def _is_human_decision_claim_active(self, claim_key: str) -> bool:
         if claim_key in self._active_human_decision_claims:
@@ -2964,6 +1703,16 @@ class AgentScopeRuntime:
         )
 
 
+def _to_attribute_event(value: Any) -> Any:
+    if isinstance(value, dict):
+        return SimpleNamespace(
+            **{key: _to_attribute_event(item) for key, item in value.items()}
+        )
+    if isinstance(value, list):
+        return [_to_attribute_event(item) for item in value]
+    return value
+
+
 class _HumanDecisionClaim:
     def __init__(self, release_callback: Any) -> None:
         self._release_callback = release_callback
@@ -3007,28 +1756,6 @@ def _human_decision_claim_key(agentscope_session_id: str, decision: dict[str, An
         "vla:human-decision:"
         f"{agentscope_session_id}:{decision['reply_id']}:{decision['tool_call_id']}"
     )
-
-
-def _human_continuation_identity(
-    agentscope_session_id: str,
-    tool_name: str,
-    decision: dict[str, Any],
-) -> str:
-    canonical = json.dumps(
-        {
-            "agentscope_session_id": agentscope_session_id,
-            "tool_name": tool_name,
-            "reply_id": decision.get("reply_id"),
-            "tool_call_id": decision.get("tool_call_id"),
-            "action": decision.get("action"),
-            "text": decision.get("text"),
-            "request_id": decision.get("request_id"),
-        },
-        ensure_ascii=False,
-        sort_keys=True,
-        separators=(",", ":"),
-    )
-    return f"human-handoff:{hashlib.sha256(canonical.encode('utf-8')).hexdigest()}"
 
 
 def _durable_plan_decision(decision: dict[str, Any]) -> dict[str, Any]:
@@ -3117,6 +1844,39 @@ def _human_decision_payload_from_tool_call(
     }
 
 
+def _enrich_plan_human_decision_event(
+    event: dict[str, Any],
+    *,
+    plan_store: SqliteNavigationPlanRepository,
+) -> dict[str, Any] | None:
+    payload = event.get("payload")
+    if not isinstance(payload, dict):
+        return event
+    plan_id = payload.get("plan_id")
+    step_id = payload.get("step_id")
+    if not isinstance(plan_id, str) or not isinstance(step_id, str):
+        return event
+    handoff = plan_store.get_human_decision_handoff(plan_id, step_id)
+    if handoff is not None and handoff.status == "quarantined":
+        return None
+    metadata = _human_decision_payload_from_tool_call(
+        SimpleNamespace(
+            name="request_human_decision",
+            input={"plan_id": plan_id, "step_id": step_id},
+        ),
+        plan_store=plan_store,
+    )
+    if metadata is None:
+        return event
+    enriched = dict(event)
+    enriched["payload"] = {
+        **metadata,
+        "reply_id": payload.get("reply_id", ""),
+        "tool_call_id": payload.get("tool_call_id", ""),
+    }
+    return enriched
+
+
 def _human_decision_tool_output(tool_name: str, decision: dict[str, Any]) -> dict[str, Any]:
     output = {
         "action": decision["action"],
@@ -3173,6 +1933,32 @@ def _is_calibration_confirmation_decision(decision: dict[str, Any]) -> bool:
     )
 
 
+def _human_decision_event_key(
+    event: dict[str, Any] | None,
+) -> tuple[str, str] | None:
+    if event is None:
+        return None
+    payload = event.get("payload")
+    if not isinstance(payload, dict):
+        return None
+    reply_id = payload.get("reply_id")
+    tool_call_id = payload.get("tool_call_id")
+    if not isinstance(reply_id, str) or not reply_id:
+        return None
+    if not isinstance(tool_call_id, str) or not tool_call_id:
+        return None
+    return reply_id, tool_call_id
+
+
+def _session_events_key(message_bus: Any, session_id: str) -> str:
+    template = getattr(
+        message_bus,
+        "_SESSION_EVENTS_KEY",
+        "agentscope:session:events:{sid}",
+    )
+    return str(template).format(sid=session_id)
+
+
 async def _retry_async(
     operation_factory: Any,
     *,
@@ -3217,6 +2003,37 @@ def _session_id_from_inbox_key(key: str, template: str) -> str | None:
     end = len(key) - len(suffix) if suffix else len(key)
     session_id = key[len(prefix):end]
     return session_id or None
+
+
+def _strip_internal_event_fields(event: dict[str, Any]) -> dict[str, Any]:
+    return {key: value for key, value in event.items() if key != "_entry_id"}
+
+
+def _raw_event_entry_id(event: dict[str, Any]) -> str | None:
+    entry_id = event.get("_entry_id")
+    return entry_id if isinstance(entry_id, str) and entry_id else None
+
+
+def _raw_event_type(event: dict[str, Any]) -> str:
+    event_type = event.get("type")
+    return str(event_type) if event_type is not None else ""
+
+
+def _stream_id_is_newer(entry_id: str, cursor: str) -> bool:
+    entry_parts = _stream_id_parts(entry_id)
+    cursor_parts = _stream_id_parts(cursor)
+    if entry_parts is None or cursor_parts is None:
+        return entry_id > cursor
+    return entry_parts > cursor_parts
+
+
+def _stream_id_parts(entry_id: str) -> tuple[int, int] | None:
+    try:
+        first, second = entry_id.split("-", 1)
+        return int(first), int(second)
+    except ValueError:
+        return None
+
 
 def _web_session_id_from_agentscope_session(session_id: str, *, agent_id: str) -> str:
     suffix = f"__{agent_id}"
@@ -3612,28 +2429,22 @@ def build_extra_agent_middlewares_factory(
         agent_id: str,
         session_id: str,
     ) -> list[Any]:
+        if agent_id != config.navigation_agent_id:
+            return []
         if runtime is None:
             raise RuntimeError("navigation runtime is unavailable")
-        middlewares: list[Any] = [
-            DataPilotRunBoundaryMiddleware(session_id, runtime),
-            DataPilotReplyProjectionMiddleware(session_id, runtime),
-            DataPilotToolOutcomeMiddleware(session_id, runtime),
-        ]
-        if agent_id != config.navigation_agent_id:
-            return middlewares
         web_session_id = _web_session_id_from_agentscope_session(
             session_id,
             agent_id=config.navigation_agent_id,
         )
-        middlewares.append(
+        return [
             NavigationToolSurfaceMiddleware(
                 services=runtime._navigation_services(),
                 web_session_id=web_session_id,
                 agentscope_session_id=session_id,
                 cancellation=runtime.run_cancellation(session_id),
             )
-        )
-        return middlewares
+        ]
 
     return extra_agent_middlewares
 
@@ -3641,15 +2452,11 @@ def build_extra_agent_middlewares_factory(
 def create_agentscope_runtime(config: AgentScopeRuntimeConfig) -> AgentScopeRuntime:
     redis_kwargs = config.redis_connection_kwargs()
     storage = RedisStorage(**redis_kwargs)
-    redis_message_bus = RedisMessageBus(**redis_kwargs)
+    message_bus = RedisMessageBus(**redis_kwargs)
     workspace_manager = LocalWorkspaceManager(
         basedir=str(config.workspace_root / "agentscope-workspaces"),
     )
     runtime_holder: dict[str, AgentScopeRuntime] = {}
-    message_bus = _StopAwareMessageBus(
-        redis_message_bus,
-        lambda: runtime_holder.get("runtime"),
-    )
 
     async def extra_agent_tools(user_id: str, agent_id: str, session_id: str) -> list[Any]:
         runtime = runtime_holder.get("runtime")

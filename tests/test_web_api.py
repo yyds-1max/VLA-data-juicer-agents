@@ -1,13 +1,11 @@
 from __future__ import annotations
 
 import asyncio
-import base64
 import inspect
-import json
 import logging
-import sqlite3
 import time
 from contextlib import asynccontextmanager
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -15,46 +13,12 @@ import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
-from vla_data_juicer_agents.navigation.task_store import SqliteNavigationTaskStore
-from vla_data_juicer_agents.core.cancellation import CancellationContext
-from vla_data_juicer_agents.runtime.agentscope_config import AgentScopeRuntimeConfig
-from vla_data_juicer_agents.runtime.agentscope_runtime import AgentScopeRuntime
-import vla_data_juicer_agents.web.app as web_app_module
-from vla_data_juicer_agents.web.app import create_app as create_production_app
-from web_legacy_app import (
+from vla_data_juicer_agents.web.app import (
     _consume_turn_result_when_idle,
     _create_logged_task,
     _drain_controller_events,
-    create_legacy_test_app,
+    create_app,
 )
-from vla_data_juicer_agents.web.schemas import PublicEventRecord
-
-
-def create_app(
-    *args,
-    agentscope_runtime=None,
-    controller_factory=None,
-    **kwargs,
-):
-    if agentscope_runtime is not None or controller_factory is None:
-        return create_production_app(
-            *args,
-            agentscope_runtime=agentscope_runtime,
-            **kwargs,
-        )
-    return create_legacy_test_app(
-        *args,
-        controller_factory=controller_factory,
-        **kwargs,
-    )
-
-
-def _session_cursor(row_id: object) -> str:
-    payload = json.dumps(
-        ["2026-06-26T10:00:00+08:00", row_id],
-        separators=(",", ":"),
-    ).encode()
-    return base64.urlsafe_b64encode(payload).decode().rstrip("=")
 
 
 class FakeController:
@@ -112,84 +76,10 @@ def make_client(tmp_path: Path) -> TestClient:
     return TestClient(app)
 
 
-class RecordingSessionService:
-    def __init__(self, *, fail_on_session: str | None = None) -> None:
-        self.calls: list[tuple[str, str, str]] = []
-        self.fail_on_session = fail_on_session
-
-    async def delete_session(self, user_id: str, agent_id: str, session_id: str) -> bool:
-        self.calls.append((user_id, agent_id, session_id))
-        if session_id == self.fail_on_session:
-            raise RuntimeError(f"delete failed for {agent_id} / {session_id}")
-        return True
-
-
-class FailOnceSessionService:
-    def __init__(self) -> None:
-        self.calls: list[tuple[str, str, str]] = []
-        self.deleted_sessions: set[str] = set()
-        self.failed_once = False
-
-    async def delete_session(self, user_id: str, agent_id: str, session_id: str) -> bool:
-        self.calls.append((user_id, agent_id, session_id))
-        if session_id in self.deleted_sessions:
-            return False
-        if session_id == "worker-session" and not self.failed_once:
-            self.failed_once = True
-            raise RuntimeError("AgentScope deletion failed once")
-        self.deleted_sessions.add(session_id)
-        return True
-
-
-class IdempotentSessionService:
-    def __init__(self) -> None:
-        self.calls: list[tuple[str, str, str]] = []
-        self.deleted_sessions: set[str] = set()
-
-    async def delete_session(self, user_id: str, agent_id: str, session_id: str) -> bool:
-        self.calls.append((user_id, agent_id, session_id))
-        if session_id in self.deleted_sessions:
-            return False
-        self.deleted_sessions.add(session_id)
-        return True
-
-
-def make_deletion_client(
-    tmp_path: Path,
-    session_service: (
-        RecordingSessionService | FailOnceSessionService | IdempotentSessionService
-    ),
-) -> tuple[TestClient, AgentScopeRuntime]:
-    agentscope_app = FastAPI()
-    agentscope_app.state.session_service = session_service
-    runtime = AgentScopeRuntime(
-        config=AgentScopeRuntimeConfig(
-            user_id="delete-user",
-            redis_url="redis://localhost:6379/0",
-            workspace_root=tmp_path / "workspace",
-            dashscope_api_key="test-key",
-            dashscope_base_url=None,
-            default_model="qwen-test",
-            router_model="qwen-test",
-            navigation_model="qwen-test",
-        ),
-        storage=object(),
-        message_bus=object(),
-        workspace_manager=object(),
-        app=agentscope_app,
-    )
-    app = create_app(
-        working_dir=str(tmp_path / "workspace"),
-        db_path=tmp_path / "sessions.sqlite",
-        agentscope_runtime=runtime,
-    )
-    return TestClient(app), runtime
-
-
 def test_create_session_returns_title(tmp_path: Path):
     client = make_client(tmp_path)
 
-    response = client.post("/api/sessions", json={"message": "处理 20270605 的室外导航数据", "creation_id": "local-create-api-1"})
+    response = client.post("/api/sessions", json={"message": "处理 20270605 的室外导航数据"})
 
     assert response.status_code == 200
     body = response.json()
@@ -198,150 +88,19 @@ def test_create_session_returns_title(tmp_path: Path):
     assert FakeController.created[0].started is True
 
 
-def test_create_session_replays_same_client_creation_id(tmp_path: Path):
-    client = make_client(tmp_path)
-    payload = {
-        "message": "处理 20270605 的室外导航数据",
-        "creation_id": "local-create-lost-response",
-    }
-
-    first = client.post("/api/sessions", json=payload)
-    replay = client.post("/api/sessions", json=payload)
-    conflict = client.post(
-        "/api/sessions",
-        json={
-            "message": "different first intent",
-            "creation_id": payload["creation_id"],
-        },
-    )
-
-    assert first.status_code == 200
-    assert replay.status_code == 200
-    assert replay.json()["session"] == first.json()["session"]
-    assert conflict.status_code == 409
-    assert conflict.json()["detail"] == {
-        "code": "session_creation_conflict",
-        "message": "This session creation request conflicts with an existing request.",
-    }
-    assert len(client.get("/api/sessions").json()["sessions"]) == 1
-
-
-def test_unexpected_public_endpoint_error_does_not_expose_internal_identity(
-    tmp_path: Path,
-    monkeypatch,
-) -> None:
-    client = make_client(tmp_path)
-    internal_identity = "agent=router-secret session=as-secret user=alice-secret"
-
-    def fail_list_sessions_page(*, limit, cursor):
-        del limit, cursor
-        raise RuntimeError(internal_identity)
-
-    monkeypatch.setattr(
-        client.app.state.store,
-        "list_sessions_page",
-        fail_list_sessions_page,
-    )
-    safe_client = TestClient(client.app, raise_server_exceptions=False)
-
-    response = safe_client.get("/api/sessions")
-
-    assert response.status_code == 500
-    assert response.json() == {
-        "detail": {
-            "code": "internal_error",
-            "message": "DataPilot could not complete this request.",
-        }
-    }
-    assert internal_identity not in response.text
-
-
-def test_session_history_cursor_reaches_more_than_default_page(tmp_path: Path):
-    client = make_client(tmp_path)
-    store = client.app.state.store
-    created = [store.create_session(f"history {index:02d}") for index in range(27)]
-
-    seen: list[str] = []
-    cursor = None
-    while True:
-        query = "?limit=7"
-        if cursor is not None:
-            query += f"&cursor={cursor}"
-        response = client.get(f"/api/sessions{query}")
-        assert response.status_code == 200
-        payload = response.json()
-        seen.extend(session["id"] for session in payload["sessions"])
-        cursor = payload["next_cursor"]
-        if cursor is None:
-            break
-
-    assert seen == [session.id for session in reversed(created)]
-    assert len(set(seen)) == 27
-
-
-@pytest.mark.parametrize("limit", [0, 101])
-def test_session_history_rejects_limit_outside_public_bounds(
-    tmp_path: Path,
-    limit: int,
-) -> None:
-    client = make_client(tmp_path)
-
-    response = client.get("/api/sessions", params={"limit": limit})
-
-    assert response.status_code == 400
-    assert response.json() == {"detail": "Invalid session page"}
-
-
-@pytest.mark.parametrize("row_id", [True, 2**63], ids=["bool", "above-sqlite-int64"])
-def test_session_history_rejects_unsafe_cursor_row_id(
-    tmp_path: Path,
-    row_id: object,
-) -> None:
-    app_client = make_client(tmp_path)
-    client = TestClient(app_client.app, raise_server_exceptions=False)
-
-    response = client.get(
-        "/api/sessions",
-        params={"cursor": _session_cursor(row_id)},
-    )
-
-    assert response.status_code == 400
-    assert response.json() == {"detail": "Invalid session page"}
-
-
 def test_submit_turn_returns_turn_id(tmp_path: Path):
     client = make_client(tmp_path)
     session_id = _create_session(client)
 
-    response = client.post(
-        f"/api/sessions/{session_id}/turns",
-        json={"message": "开始处理", "message_id": "local-api-message-1"},
-    )
+    response = client.post(f"/api/sessions/{session_id}/turns", json={"message": "开始处理"})
 
     assert response.status_code == 200
     assert response.json()["turn_id"].startswith("turn_")
 
 
-def test_submit_turn_rejects_non_public_message_id(tmp_path: Path):
-    client = make_client(tmp_path)
-    session_id = _create_session(client)
-
-    response = client.post(
-        f"/api/sessions/{session_id}/turns",
-        json={"message": "开始处理", "message_id": "private/session/id"},
-    )
-
-    assert response.status_code == 422
-
-
 def test_create_app_accepts_positional_configuration(tmp_path: Path):
     FakeController.created = []
-    app = create_app(
-        str(tmp_path / ".djx"),
-        "qwen-positional",
-        tmp_path / "sessions.sqlite",
-        controller_factory=FakeController,
-    )
+    app = create_app(str(tmp_path / ".djx"), "qwen-positional", tmp_path / "sessions.sqlite", FakeController)
     client = TestClient(app)
 
     session_id = _create_session(client)
@@ -378,19 +137,9 @@ def test_create_app_enters_agentscope_sub_app_lifespan(tmp_path: Path):
         events.append("shutdown")
 
     sub_app = FastAPI(lifespan=lifespan)
-
-    async def start_stop_coordinator():
-        assert sub_app.state.ready is True
-        events.append("stop-coordinator-start")
-
-    async def stop_stop_coordinator():
-        events.append("stop-coordinator-stop")
-
     runtime = SimpleNamespace(
         app=sub_app,
         config=SimpleNamespace(agentscope_mount_path="/api/agentscope"),
-        start_stop_coordinator=start_stop_coordinator,
-        stop_stop_coordinator=stop_stop_coordinator,
     )
     app = create_app(
         working_dir=str(tmp_path / ".djx"),
@@ -401,14 +150,9 @@ def test_create_app_enters_agentscope_sub_app_lifespan(tmp_path: Path):
 
     with TestClient(app):
         assert sub_app.state.ready is True
-        assert events == ["startup", "stop-coordinator-start"]
+        assert events == ["startup"]
 
-    assert events == [
-        "startup",
-        "stop-coordinator-start",
-        "stop-coordinator-stop",
-        "shutdown",
-    ]
+    assert events == ["startup", "shutdown"]
 
 
 def test_create_app_uses_agentscope_session_manager_when_runtime_present(tmp_path: Path):
@@ -418,19 +162,9 @@ def test_create_app_uses_agentscope_session_manager_when_runtime_present(tmp_pat
             self.config = SimpleNamespace(agentscope_mount_path="/api/agentscope")
             self.submitted = []
 
-        async def submit_user_message(
-            self,
-            *,
-            web_session_id: str,
-            message: str,
-            message_id: str | None = None,
-            turn_id: str | None = None,
-            on_admitted=None,
-        ) -> str:
+        async def submit_user_message(self, *, web_session_id: str, message: str) -> str:
             self.submitted.append((web_session_id, message))
-            if on_admitted is not None:
-                on_admitted()
-            return turn_id or "turn-agent-1"
+            return "turn-agent-1"
 
     runtime = FakeRuntime()
     FakeController.created = []
@@ -443,67 +177,15 @@ def test_create_app_uses_agentscope_session_manager_when_runtime_present(tmp_pat
     client = TestClient(app)
 
     session_id = _create_session(client)
-    response = client.post(
-        f"/api/sessions/{session_id}/turns",
-        json={"message": "开始处理", "message_id": "local-runtime-message-1"},
-    )
+    response = client.post(f"/api/sessions/{session_id}/turns", json={"message": "开始处理"})
 
     assert response.status_code == 200
-    assert response.json()["turn_id"].startswith("turn_")
+    assert response.json()["turn_id"] == "turn-agent-1"
     assert FakeController.created == []
     assert runtime.submitted == [(session_id, "开始处理")]
 
-    replay = client.post(
-        f"/api/sessions/{session_id}/turns",
-        json={"message": "开始处理", "message_id": "local-runtime-message-1"},
-    )
-    assert replay.status_code == 200
-    assert replay.json()["turn_id"] == response.json()["turn_id"]
-    assert runtime.submitted == [(session_id, "开始处理")]
 
-    app.state.store.finish_user_message_turn_with_event(
-        session_id,
-        "local-runtime-message-1",
-        turn_id=response.json()["turn_id"],
-        terminal_status="success",
-    )
-
-    app.state.store.claim_user_message(
-        session_id,
-        "local-runtime-pending-1",
-        "still pending",
-        runtime_id="other-runtime",
-        turn_id="turn_pending",
-        ttl_seconds=30.0,
-    )
-    pending = client.post(
-        f"/api/sessions/{session_id}/turns",
-        json={
-            "message": "still pending",
-            "message_id": "local-runtime-pending-1",
-        },
-    )
-    assert pending.status_code == 409
-    assert pending.json()["detail"]["code"] == "turn_submission_pending"
-
-
-def test_create_app_requires_runtime_without_explicit_test_controller(tmp_path: Path):
-    with pytest.raises(RuntimeError, match="AgentScope runtime"):
-        create_app(
-            working_dir=str(tmp_path / ".djx"),
-            db_path=tmp_path / "sessions.sqlite",
-        )
-
-
-def test_production_app_module_has_no_legacy_controller_construction_or_drain() -> None:
-    source = inspect.getsource(web_app_module)
-
-    assert "from vla_data_juicer_agents.web.session_manager import" not in source
-    assert "controller_factory" not in source
-    assert "_drain_controller_events" not in source
-
-
-def test_create_app_keeps_explicit_legacy_test_controller_adapter(tmp_path: Path):
+def test_create_app_keeps_legacy_controller_when_agentscope_runtime_missing(tmp_path: Path):
     FakeController.created = []
     app = create_app(
         working_dir=str(tmp_path / ".djx"),
@@ -633,121 +315,43 @@ def test_submit_turn_runtime_error_returns_409(tmp_path: Path):
     client = TestClient(app)
     session_id = _create_session(client)
 
-    response = client.post(
-        f"/api/sessions/{session_id}/turns",
-        json={"message": "开始处理", "message_id": "local-error-message-1"},
-    )
+    response = client.post(f"/api/sessions/{session_id}/turns", json={"message": "开始处理"})
 
     assert response.status_code == 409
-    assert response.json()["detail"] == {
-        "code": "turn_submission_failed",
-        "message": "DataPilot could not submit this turn. Please retry.",
-    }
+    assert response.json()["detail"] == "A session turn is already active."
 
 
-def test_session_stream_returns_404_for_unknown_session(tmp_path: Path):
+def test_session_events_websocket_receives_background_turn_events(tmp_path: Path):
     client = make_client(tmp_path)
+    session_id = _create_session(client)
 
-    response = client.get("/api/sessions/missing/stream")
+    with client.websocket_connect(f"/api/sessions/{session_id}/events") as websocket:
+        response = client.post(f"/api/sessions/{session_id}/turns", json={"message": "开始处理"})
+        assert response.status_code == 200
+        with ThreadPoolExecutor(max_workers=1) as executor:
+            event = executor.submit(websocket.receive_json).result(timeout=1)
 
-    assert response.status_code == 404
-    assert response.json() == {"detail": "Session not found"}
-
-
-@pytest.mark.asyncio
-async def test_session_stream_is_sse_and_honors_after_sequence(tmp_path: Path) -> None:
-    app = create_app(
-        working_dir=str(tmp_path / ".djx"),
-        db_path=tmp_path / "sessions.sqlite",
-        controller_factory=FakeController,
-    )
-    session = app.state.manager.create_session("stream cursor")
-    first = app.state.store.append_public_event(
-        session.id,
-        "1" * 64,
-        {"type": "first"},
-    )
-    second = app.state.store.append_public_event(
-        session.id,
-        "2" * 64,
-        {"type": "second"},
-    )
-    endpoint = _route_endpoint(app, f"/api/sessions/{{session_id}}/stream")
-
-    response = await endpoint(session.id, after_sequence=first.sequence)
-    frame = await anext(response.body_iterator)
-    await response.body_iterator.aclose()
-
-    assert response.media_type == "text/event-stream"
-    assert response.headers["content-type"].startswith("text/event-stream")
-    assert response.headers["cache-control"] == "no-cache"
-    assert response.headers["x-accel-buffering"] == "no"
-    assert json.loads(frame.removeprefix(b"data: ").removesuffix(b"\n\n"))["id"] == second.id
-
-
-@pytest.mark.asyncio
-async def test_session_stream_emits_heartbeat_comment(tmp_path: Path) -> None:
-    app = create_app(
-        working_dir=str(tmp_path / ".djx"),
-        db_path=tmp_path / "sessions.sqlite",
-        controller_factory=FakeController,
-        sse_heartbeat_seconds=0.01,
-    )
-    session = app.state.manager.create_session("heartbeat")
-    endpoint = _route_endpoint(app, f"/api/sessions/{{session_id}}/stream")
-
-    response = await endpoint(session.id, after_sequence=0)
-    frame = await asyncio.wait_for(anext(response.body_iterator), timeout=1)
-    await response.body_iterator.aclose()
-
-    assert frame == b": heartbeat\n\n"
-
-
-@pytest.mark.asyncio
-async def test_session_stream_does_not_receive_other_session_events(tmp_path: Path) -> None:
-    app = create_app(
-        working_dir=str(tmp_path / ".djx"),
-        db_path=tmp_path / "sessions.sqlite",
-        controller_factory=FakeController,
-        sse_heartbeat_seconds=0.01,
-    )
-    selected = app.state.manager.create_session("selected")
-    other = app.state.manager.create_session("other")
-    other_record = app.state.store.append_public_event(
-        other.id,
-        "3" * 64,
-        {"type": "wrong-session"},
-    )
-    endpoint = _route_endpoint(app, f"/api/sessions/{{session_id}}/stream")
-
-    response = await endpoint(selected.id, after_sequence=0)
-    await app.state.bus.publish(other.id, other_record)
-    frame = await asyncio.wait_for(anext(response.body_iterator), timeout=1)
-    await response.body_iterator.aclose()
-
-    assert frame == b": heartbeat\n\n"
+    assert event["type"] == "final"
+    assert event["payload"]["text"] == "完成: 开始处理"
 
 
 def test_list_sessions_returns_session_records(tmp_path: Path):
     client = make_client(tmp_path)
-    client.post("/api/sessions", json={"message": "处理 20270605 的室外导航数据", "creation_id": "local-create-api-2"})
+    client.post("/api/sessions", json={"message": "处理 20270605 的室外导航数据"})
 
     response = client.get("/api/sessions")
 
     assert response.status_code == 200
     sessions = response.json()["sessions"]
     assert len(sessions) == 1
-    assert set(sessions[0]) == {"id", "title", "created_at", "updated_at"}
+    assert set(sessions[0]) == {"id", "title", "status", "created_at", "updated_at"}
 
 
 def test_get_session_returns_persisted_messages_after_turn_submission(tmp_path: Path):
     client = make_client(tmp_path)
     session_id = _create_session(client)
 
-    turn_response = client.post(
-        f"/api/sessions/{session_id}/turns",
-        json={"message": "开始处理", "message_id": "local-stream-message-1"},
-    )
+    turn_response = client.post(f"/api/sessions/{session_id}/turns", json={"message": "开始处理"})
     detail_response = client.get(f"/api/sessions/{session_id}")
 
     assert turn_response.status_code == 200
@@ -810,52 +414,6 @@ def test_failed_event_drain_consumes_result_after_controller_stops(tmp_path: Pat
     assert [message.content for message in app.state.store.get_session(session.id).messages] == []
 
 
-@pytest.mark.asyncio
-async def test_controller_drain_persists_entire_batch_when_live_publish_fails(
-    tmp_path: Path,
-    caplog,
-) -> None:
-    class FailFirstPublishBus:
-        def __init__(self) -> None:
-            self.published: list[tuple[str, PublicEventRecord]] = []
-
-        async def publish(self, session_id: str, record: PublicEventRecord) -> None:
-            self.published.append((session_id, record))
-            if len(self.published) == 1:
-                raise ConnectionError("browser disconnected")
-
-    app = create_app(
-        working_dir=str(tmp_path / ".djx"),
-        db_path=tmp_path / "sessions.sqlite",
-        controller_factory=FakeController,
-    )
-    session = app.state.manager.create_session("persist the entire batch")
-    controller = FakeController.created[-1]
-    controller._events = [
-        {"type": "reasoning", "payload": {"summary": "first"}},
-        {"type": "reasoning", "payload": {"summary": "second"}},
-    ]
-    controller._result = SimpleNamespace(text="turn complete")
-    bus = FailFirstPublishBus()
-    caplog.set_level(logging.WARNING)
-
-    await _drain_controller_events(session.id, app.state.manager, app.state.store, bus)
-
-    records = app.state.store.list_public_events(session.id)
-    assert all(isinstance(record, PublicEventRecord) for record in records)
-    assert [record.event["payload"]["summary"] for record in records] == [
-        "first",
-        "second",
-    ]
-    assert [record.sequence for _, record in bus.published] == [1, 2]
-    detail = app.state.store.get_session(session.id)
-    assert detail is not None
-    assert [(message.role, message.content) for message in detail.messages] == [
-        ("assistant", "turn complete")
-    ]
-    assert "Live controller event publish failed" in caplog.text
-
-
 def test_cleanup_waits_for_idle_without_timeout_parameter():
     assert "timeout_sec" not in inspect.signature(_consume_turn_result_when_idle).parameters
 
@@ -913,124 +471,13 @@ def test_interrupt_returns_true_for_active_session(tmp_path: Path):
     response = client.post(f"/api/sessions/{session_id}/interrupt")
 
     assert response.status_code == 200
-    assert response.json() == {"interrupted": True, "stopped_tool_call_ids": []}
-
-
-def test_agentscope_interrupt_returns_only_public_stop_fields(tmp_path: Path):
-    class FakeRuntime:
-        def __init__(self) -> None:
-            self.app = FastAPI()
-            self.config = SimpleNamespace(agentscope_mount_path="/api/agentscope")
-
-        async def interrupt_web_session(self, *, web_session_id: str):
-            del web_session_id
-            return SimpleNamespace(
-                interrupted=True,
-                stopped_tool_call_ids=["call-public-1"],
-                agentscope_session_id="private-session-must-not-leak",
-            )
-
-    app = create_app(
-        working_dir=str(tmp_path / ".djx"),
-        db_path=tmp_path / "sessions.sqlite",
-        controller_factory=FakeController,
-        agentscope_runtime=FakeRuntime(),
-    )
-    client = TestClient(app)
-    session_id = _create_session(client)
-
-    response = client.post(f"/api/sessions/{session_id}/interrupt")
-
-    assert response.status_code == 200
-    assert response.json() == {
-        "interrupted": True,
-        "stopped_tool_call_ids": ["call-public-1"],
-    }
-    assert "private-session-must-not-leak" not in response.text
-
-
-@pytest.mark.parametrize(
-    "error",
-    [
-        OSError("private durable path /internal/stop"),
-        sqlite3.OperationalError("private table internal_tool_runs"),
-        RuntimeError("private runtime internal-agent"),
-        ValueError("private terminal internal-as-session"),
-    ],
-)
-def test_agentscope_interrupt_failure_is_logged_retryable_and_non_sensitive(
-    tmp_path: Path,
-    error: Exception,
-    caplog: pytest.LogCaptureFixture,
-):
-    class FailingRuntime:
-        def __init__(self) -> None:
-            self.app = FastAPI()
-            self.config = SimpleNamespace(agentscope_mount_path="/api/agentscope")
-
-        async def interrupt_web_session(self, *, web_session_id: str):
-            del web_session_id
-            raise error
-
-    app = create_app(
-        working_dir=str(tmp_path / ".djx"),
-        db_path=tmp_path / "sessions.sqlite",
-        controller_factory=FakeController,
-        agentscope_runtime=FailingRuntime(),
-    )
-    client = TestClient(app, raise_server_exceptions=False)
-    session_id = _create_session(client)
-
-    with caplog.at_level(logging.ERROR, logger="vla_data_juicer_agents.web.app"):
-        response = client.post(f"/api/sessions/{session_id}/interrupt")
-
-    assert response.status_code == 503
-    assert response.json() == {"detail": "Session stop failed; retry the request"}
-    assert "private" not in response.text
-    assert "internal" not in response.text
-    assert session_id not in response.text
-    assert "DataPilot session stop failed" in caplog.text
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize("error", [asyncio.CancelledError(), KeyboardInterrupt()])
-async def test_interrupt_error_boundary_does_not_swallow_base_exceptions(
-    tmp_path: Path,
-    error: BaseException,
-):
-    class FailingRuntime:
-        def __init__(self) -> None:
-            self.app = FastAPI()
-            self.config = SimpleNamespace(agentscope_mount_path="/api/agentscope")
-
-        async def interrupt_web_session(self, *, web_session_id: str):
-            del web_session_id
-            raise error
-
-    app = create_app(
-        working_dir=str(tmp_path / ".djx"),
-        db_path=tmp_path / "sessions.sqlite",
-        controller_factory=FakeController,
-        agentscope_runtime=FailingRuntime(),
-    )
-    session = app.state.store.create_session("stop")
-    endpoint = next(
-        route.endpoint
-        for route in app.routes
-        if getattr(route, "path", None) == "/api/sessions/{session_id}/interrupt"
-    )
-
-    with pytest.raises(type(error)):
-        await endpoint(session.id)
+    assert response.json() == {"interrupted": True}
 
 
 def test_turn_and_interrupt_unknown_active_session_return_404(tmp_path: Path):
     client = make_client(tmp_path)
 
-    turn_response = client.post(
-        "/api/sessions/missing/turns",
-        json={"message": "开始处理", "message_id": "local-missing-message-1"},
-    )
+    turn_response = client.post("/api/sessions/missing/turns", json={"message": "开始处理"})
     interrupt_response = client.post("/api/sessions/missing/interrupt")
 
     assert turn_response.status_code == 404
@@ -1043,566 +490,6 @@ def test_get_unknown_session_returns_404(tmp_path: Path):
     response = client.get("/api/sessions/missing")
 
     assert response.status_code == 404
-
-
-def test_delete_session_removes_only_control_state_and_preserves_artifact_bytes(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-):
-    datasets = tmp_path / "VLADatasets"
-    monkeypatch.setenv("VLA_VLADATASETS_ROOT", str(datasets))
-    raw_artifact = datasets / "raw_data" / "20270623" / "clip-a" / "raw.db3"
-    sync_artifact = (
-        datasets / "raw_data" / "20270623" / "clip-a" / "sync_data" / "frame.jpg"
-    )
-    clip_artifact = datasets / "clip_data" / "20270623" / "clip-a" / "clip.db3"
-    finish_artifact = datasets / "finish_data" / "20270623" / "clip-a" / "result.bin"
-    for path, payload in (
-        (raw_artifact, b"raw"),
-        (sync_artifact, b"sync"),
-        (clip_artifact, b"clip"),
-        (finish_artifact, b"finish"),
-    ):
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_bytes(payload)
-
-    service = RecordingSessionService()
-    client, runtime = make_deletion_client(tmp_path, service)
-    session_id = _create_session(client)
-    runtime.web_session_store.save_agentscope_session_mapping(
-        session_id,
-        agent_id="worker-agent",
-        agentscope_session_id="inactive-worker-session",
-    )
-    runtime.web_session_store.save_agentscope_session_mapping(
-        session_id,
-        agent_id="navigation-data-agent",
-        agentscope_session_id="active-navigation-session",
-    )
-    navigation_store = SqliteNavigationTaskStore(
-        runtime.config.workspace_root / "navigation-tasks.sqlite"
-    )
-    task = navigation_store.create_task_attempt(
-        request="process",
-        target="20270623",
-        date="20270623",
-        segments=["clip-a"],
-        scene_mode="out",
-        dry_run=False,
-        web_session_id=session_id,
-        agentscope_session_id="active-navigation-session",
-    ).task
-    evidence = (
-        runtime.config.workspace_root
-        / "navigation-evidence"
-        / task.task_id
-        / "1"
-        / "e.json"
-    )
-    evidence.parent.mkdir(parents=True)
-    evidence.write_bytes(b"control evidence")
-
-    response = client.delete(f"/api/sessions/{session_id}")
-
-    assert response.status_code == 204
-    assert runtime.web_session_store.get_session(session_id) is None
-    assert navigation_store.find_by_web_session(session_id) == []
-    assert not evidence.exists()
-    assert raw_artifact.read_bytes() == b"raw"
-    assert sync_artifact.read_bytes() == b"sync"
-    assert clip_artifact.read_bytes() == b"clip"
-    assert finish_artifact.read_bytes() == b"finish"
-    assert service.calls == [
-        ("delete-user", "navigation-data-agent", "active-navigation-session"),
-        ("delete-user", "worker-agent", "inactive-worker-session"),
-    ]
-    assert client.delete(f"/api/sessions/{session_id}").status_code == 404
-
-
-def test_delete_cancels_every_retained_lease_before_first_agentscope_delete(
-    tmp_path: Path,
-):
-    cancellations = [CancellationContext(), CancellationContext()]
-
-    class AllCancelledBeforeDeleteService(RecordingSessionService):
-        async def delete_session(self, user_id, agent_id, session_id):
-            assert all(item.cancelled for item in cancellations)
-            return await super().delete_session(user_id, agent_id, session_id)
-
-    service = AllCancelledBeforeDeleteService()
-    client, runtime = make_deletion_client(tmp_path, service)
-    session_id = _create_session(client)
-    mappings = [
-        ("navigation-data-agent", "navigation-session"),
-        ("worker-agent", "worker-session"),
-    ]
-    for (agent_id, agentscope_session_id), cancellation in zip(
-        mappings,
-        cancellations,
-        strict=True,
-    ):
-        runtime.web_session_store.save_agentscope_session_mapping(
-            session_id,
-            agent_id=agent_id,
-            agentscope_session_id=agentscope_session_id,
-        )
-        runtime.register_run_cancellation(agentscope_session_id, cancellation)
-
-    response = client.delete(f"/api/sessions/{session_id}")
-
-    assert response.status_code == 204
-    assert all(item.cancelled for item in cancellations)
-    assert runtime.web_session_store.get_session(session_id) is None
-
-
-def test_delete_cancel_failure_attempts_remaining_leases_before_safe_abort(
-    tmp_path: Path,
-):
-    class FailingCancellation(CancellationContext):
-        def cancel(self) -> bool:
-            raise RuntimeError("private cancel failure identity")
-
-    service = RecordingSessionService()
-    client, runtime = make_deletion_client(tmp_path, service)
-    session_id = _create_session(client)
-    mappings = [
-        ("navigation-data-agent", "private-cancel-failure"),
-        ("worker-agent", "worker-session"),
-    ]
-    for agent_id, agentscope_session_id in mappings:
-        runtime.web_session_store.save_agentscope_session_mapping(
-            session_id,
-            agent_id=agent_id,
-            agentscope_session_id=agentscope_session_id,
-        )
-    same_session_remaining = CancellationContext()
-    other_mapping_remaining = CancellationContext()
-    runtime.register_run_cancellation(
-        "private-cancel-failure",
-        FailingCancellation(),
-    )
-    runtime.register_run_cancellation(
-        "private-cancel-failure",
-        same_session_remaining,
-    )
-    runtime.register_run_cancellation("worker-session", other_mapping_remaining)
-
-    response = client.delete(f"/api/sessions/{session_id}")
-
-    assert response.status_code == 409
-    assert response.json() == {
-        "detail": {
-            "code": "session_delete_failed",
-            "message": "DataPilot could not delete this session. Please retry.",
-        }
-    }
-    assert "private-cancel-failure" not in response.text
-    assert "private cancel failure identity" not in response.text
-    assert same_session_remaining.cancelled is True
-    assert other_mapping_remaining.cancelled is True
-    assert service.calls == []
-    assert runtime.web_session_store.get_session(session_id) is not None
-
-
-def test_agentscope_delete_failure_keeps_public_and_navigation_control_state(tmp_path: Path):
-    service = RecordingSessionService(fail_on_session="internal-as-session")
-    client, runtime = make_deletion_client(tmp_path, service)
-    session_id = _create_session(client)
-    runtime.web_session_store.save_agentscope_session_mapping(
-        session_id,
-        agent_id="navigation-data-agent",
-        agentscope_session_id="navigation-session",
-    )
-    runtime.web_session_store.save_agentscope_session_mapping(
-        session_id,
-        agent_id="internal-agent",
-        agentscope_session_id="internal-as-session",
-    )
-    navigation_store = SqliteNavigationTaskStore(
-        runtime.config.workspace_root / "navigation-tasks.sqlite"
-    )
-    task = navigation_store.create_task_attempt(
-        request="process",
-        target="20270623",
-        date="20270623",
-        segments=None,
-        scene_mode=None,
-        dry_run=True,
-        web_session_id=session_id,
-        agentscope_session_id="navigation-session",
-    ).task
-
-    response = client.delete(f"/api/sessions/{session_id}")
-
-    assert response.status_code == 409
-    assert response.json() == {
-        "detail": {
-            "code": "session_delete_failed",
-            "message": "DataPilot could not delete this session. Please retry.",
-        }
-    }
-    assert "internal-agent" not in response.text
-    assert "internal-as-session" not in response.text
-    assert runtime.web_session_store.get_session(session_id) is not None
-    assert [item.task_id for item in navigation_store.find_by_web_session(session_id)] == [
-        task.task_id
-    ]
-
-
-def test_agentscope_delete_retry_accepts_already_absent_earlier_mapping(tmp_path: Path):
-    service = FailOnceSessionService()
-    client, runtime = make_deletion_client(tmp_path, service)
-    session_id = _create_session(client)
-    runtime.web_session_store.save_agentscope_session_mapping(
-        session_id,
-        agent_id="navigation-data-agent",
-        agentscope_session_id="navigation-session",
-    )
-    runtime.web_session_store.save_agentscope_session_mapping(
-        session_id,
-        agent_id="worker-agent",
-        agentscope_session_id="worker-session",
-    )
-
-    generation_before_delete = runtime.web_session_store.current_execution_generation(
-        session_id
-    )
-    first = client.delete(f"/api/sessions/{session_id}")
-    runtime.bootstrapped = True
-    submit_while_partially_deleted = client.post(
-        f"/api/sessions/{session_id}/turns",
-        json={
-            "message": "must remain fenced",
-            "message_id": "local-fenced-message-1",
-        },
-    )
-
-    assert first.status_code == 409
-    assert submit_while_partially_deleted.status_code == 409
-    assert runtime.web_session_store.current_execution_generation(session_id) == (
-        generation_before_delete
-    )
-    second = client.delete(f"/api/sessions/{session_id}")
-    assert second.status_code == 204
-    assert runtime.web_session_store.get_session(session_id) is None
-    assert service.calls == [
-        ("delete-user", "navigation-data-agent", "navigation-session"),
-        ("delete-user", "worker-agent", "worker-session"),
-        ("delete-user", "navigation-data-agent", "navigation-session"),
-        ("delete-user", "worker-agent", "worker-session"),
-    ]
-
-
-@pytest.mark.parametrize(
-    "error",
-    [
-        OSError("private evidence path /raw/internal"),
-        sqlite3.OperationalError("private table internal_control"),
-        RuntimeError("private runtime internal-agent"),
-        ValueError("private task internal-as-session"),
-    ],
-)
-def test_delete_error_boundary_returns_stable_non_sensitive_response(
-    tmp_path: Path,
-    error: Exception,
-):
-    client = make_client(tmp_path)
-    session_id = _create_session(client)
-
-    def fail_delete(_session_id: str) -> None:
-        raise error
-
-    client.app.state.manager.delete_session = fail_delete
-
-    response = client.delete(f"/api/sessions/{session_id}")
-
-    assert response.status_code == 409
-    assert response.json() == {
-        "detail": {
-            "code": "session_delete_failed",
-            "message": "DataPilot could not delete this session. Please retry.",
-        }
-    }
-    assert "private" not in response.text
-    assert "internal" not in response.text
-
-
-def test_delete_preflight_database_failure_uses_stable_logged_error_boundary(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-    caplog: pytest.LogCaptureFixture,
-):
-    client = make_client(tmp_path)
-    session_id = _create_session(client)
-
-    def fail_preflight(_session_id: str):
-        raise sqlite3.OperationalError(
-            "preflight failed for internal-agent / internal-as-session"
-        )
-
-    monkeypatch.setattr(client.app.state.store, "get_session", fail_preflight)
-
-    with caplog.at_level(logging.ERROR, logger="vla_data_juicer_agents.web.app"):
-        response = client.delete(f"/api/sessions/{session_id}")
-
-    assert response.status_code == 409
-    assert response.json() == {
-        "detail": {
-            "code": "session_delete_failed",
-            "message": "DataPilot could not delete this session. Please retry.",
-        }
-    }
-    assert "internal-agent" not in response.text
-    assert "internal-as-session" not in response.text
-    assert "DataPilot session deletion failed" in caplog.text
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize("error", [asyncio.CancelledError(), KeyboardInterrupt()])
-async def test_delete_error_boundary_does_not_swallow_base_exceptions(
-    tmp_path: Path,
-    error: BaseException,
-):
-    app = create_app(
-        working_dir=str(tmp_path / ".djx"),
-        db_path=tmp_path / "sessions.sqlite",
-        controller_factory=FakeController,
-    )
-    session = app.state.manager.create_session("delete")
-
-    async def fail_delete(_session_id: str) -> None:
-        raise error
-
-    app.state.manager.delete_session = fail_delete
-    endpoint = next(
-        route.endpoint
-        for route in app.routes
-        if getattr(route, "path", None) == "/api/sessions/{session_id}"
-        and "DELETE" in getattr(route, "methods", set())
-    )
-
-    with pytest.raises(type(error)):
-        await endpoint(session.id)
-
-
-def test_evidence_root_symlink_failure_preserves_raw_navigation_and_public_state(
-    tmp_path: Path,
-):
-    raw_artifact = tmp_path / "raw_data" / "clip" / "raw.db3"
-    raw_artifact.parent.mkdir(parents=True)
-    raw_artifact.write_bytes(b"raw")
-    service = IdempotentSessionService()
-    client, runtime = make_deletion_client(tmp_path, service)
-    session_id = _create_session(client)
-    runtime.web_session_store.save_agentscope_session_mapping(
-        session_id,
-        agent_id="navigation-data-agent",
-        agentscope_session_id="navigation-session",
-    )
-    navigation_store = SqliteNavigationTaskStore(
-        runtime.config.workspace_root / "navigation-tasks.sqlite"
-    )
-    task = navigation_store.create_task_attempt(
-        request="process",
-        target="20270623",
-        date="20270623",
-        segments=None,
-        scene_mode=None,
-        dry_run=True,
-        web_session_id=session_id,
-        agentscope_session_id="navigation-session",
-    ).task
-    evidence_root = runtime.config.workspace_root / "navigation-evidence"
-    evidence_root.parent.mkdir(parents=True, exist_ok=True)
-    evidence_root.symlink_to(raw_artifact.parent, target_is_directory=True)
-
-    response = client.delete(f"/api/sessions/{session_id}")
-
-    assert response.status_code == 409
-    assert response.json()["detail"]["code"] == "session_delete_failed"
-    assert runtime.web_session_store.get_session(session_id) is not None
-    assert navigation_store.get_task(task.task_id) is not None
-    assert raw_artifact.read_bytes() == b"raw"
-
-
-def test_delete_api_bad_task_id_preserves_evidence_navigation_and_public_rows(
-    tmp_path: Path,
-):
-    service = IdempotentSessionService()
-    client, runtime = make_deletion_client(tmp_path, service)
-    session_id = _create_session(client)
-    runtime.web_session_store.save_agentscope_session_mapping(
-        session_id,
-        agent_id="navigation-data-agent",
-        agentscope_session_id="navigation-session",
-    )
-    navigation_store = SqliteNavigationTaskStore(
-        runtime.config.workspace_root / "navigation-tasks.sqlite"
-    )
-    with sqlite3.connect(navigation_store.db_path) as connection:
-        connection.execute(
-            """INSERT INTO navigation_tasks (
-                   task_id, request, target, date, segments_json, segments_key,
-                   scene_mode, dry_run, guidance_revision, state_revision, status,
-                   accepted_plan_phase, created_by_web_session_id,
-                   agentscope_session_id, schema_version, created_at, updated_at
-               ) VALUES ('bad id', 'unsafe', 'target', '20270623', NULL,
-                         '__all__', NULL, 1, 0, 1, 'active', NULL, ?,
-                         'navigation-session', 3, 'now', 'now')""",
-            (session_id,),
-        )
-    evidence = (
-        runtime.config.workspace_root
-        / "navigation-evidence"
-        / "bad id"
-        / "payload.json"
-    )
-    evidence.parent.mkdir(parents=True)
-    evidence.write_bytes(b"must remain")
-
-    response = client.delete(f"/api/sessions/{session_id}")
-
-    assert response.status_code == 409
-    assert response.json()["detail"]["code"] == "session_delete_failed"
-    assert evidence.read_bytes() == b"must remain"
-    with sqlite3.connect(navigation_store.db_path) as connection:
-        assert connection.execute(
-            "SELECT COUNT(*) FROM navigation_tasks WHERE task_id = 'bad id'"
-        ).fetchone()[0] == 1
-    assert runtime.web_session_store.get_session(session_id) is not None
-
-
-def test_navigation_db_failure_after_evidence_delete_retries_safely(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-):
-    service = IdempotentSessionService()
-    client, runtime = make_deletion_client(tmp_path, service)
-    session_id = _create_session(client)
-    runtime.web_session_store.save_agentscope_session_mapping(
-        session_id,
-        agent_id="navigation-data-agent",
-        agentscope_session_id="navigation-session",
-    )
-    services = runtime._navigation_services()
-    task = services.task_store.create_task_attempt(
-        request="process",
-        target="20270623",
-        date="20270623",
-        segments=None,
-        scene_mode=None,
-        dry_run=True,
-        web_session_id=session_id,
-        agentscope_session_id="navigation-session",
-    ).task
-    evidence = (
-        runtime.config.workspace_root
-        / "navigation-evidence"
-        / task.task_id
-        / "e.json"
-    )
-    evidence.parent.mkdir(parents=True)
-    evidence.write_bytes(b"evidence")
-    original_connect = services.task_store._connect
-    fail_transaction = True
-
-    class InjectedFailureConnection:
-        def __init__(self, connection):
-            self.connection = connection
-
-        def execute(self, sql: str, parameters=()):
-            if (
-                fail_transaction
-                and 'DELETE FROM "navigation_human_decision_handoffs"' in sql
-            ):
-                raise sqlite3.OperationalError("internal navigation table")
-            return self.connection.execute(sql, parameters)
-
-        def __enter__(self):
-            self.connection.__enter__()
-            return self
-
-        def __exit__(self, exc_type, exc, traceback):
-            return self.connection.__exit__(exc_type, exc, traceback)
-
-        def __getattr__(self, name: str):
-            return getattr(self.connection, name)
-
-    def injected_connect():
-        return InjectedFailureConnection(original_connect())
-
-    monkeypatch.setattr(runtime, "_navigation_services", lambda: services)
-    monkeypatch.setattr(services.task_store, "_connect", injected_connect)
-
-    first = client.delete(f"/api/sessions/{session_id}")
-
-    assert first.status_code == 409
-    assert first.json()["detail"]["code"] == "session_delete_failed"
-    assert "internal navigation table" not in first.text
-    assert not evidence.exists()
-    assert services.task_store.get_task(task.task_id) is not None
-    assert runtime.web_session_store.get_session(session_id) is not None
-
-    fail_transaction = False
-    second = client.delete(f"/api/sessions/{session_id}")
-
-    assert second.status_code == 204
-    assert runtime.web_session_store.get_session(session_id) is None
-
-
-def test_public_db_failure_after_dependencies_delete_retries_safely(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-):
-    service = IdempotentSessionService()
-    client, runtime = make_deletion_client(tmp_path, service)
-    session_id = _create_session(client)
-    runtime.web_session_store.save_agentscope_session_mapping(
-        session_id,
-        agent_id="navigation-data-agent",
-        agentscope_session_id="navigation-session",
-    )
-    navigation_store = SqliteNavigationTaskStore(
-        runtime.config.workspace_root / "navigation-tasks.sqlite"
-    )
-    task = navigation_store.create_task_attempt(
-        request="process",
-        target="20270623",
-        date="20270623",
-        segments=None,
-        scene_mode=None,
-        dry_run=True,
-        web_session_id=session_id,
-        agentscope_session_id="navigation-session",
-    ).task
-    original_delete = runtime.web_session_store.delete_session
-    failed_once = False
-
-    def fail_public_once(web_session_id: str) -> None:
-        nonlocal failed_once
-        if not failed_once:
-            failed_once = True
-            raise sqlite3.OperationalError(
-                "public db failed for internal-agent / internal-as-session"
-            )
-        original_delete(web_session_id)
-
-    monkeypatch.setattr(runtime.web_session_store, "delete_session", fail_public_once)
-
-    first = client.delete(f"/api/sessions/{session_id}")
-    second = client.delete(f"/api/sessions/{session_id}")
-
-    assert first.status_code == 409
-    assert first.json()["detail"]["code"] == "session_delete_failed"
-    assert "internal-agent" not in first.text
-    assert "internal-as-session" not in first.text
-    assert navigation_store.get_task(task.task_id) is None
-    assert second.status_code == 204
-    assert runtime.web_session_store.get_session(session_id) is None
-    assert service.calls == [
-        ("delete-user", "navigation-data-agent", "navigation-session"),
-        ("delete-user", "navigation-data-agent", "navigation-session"),
-    ]
 
 
 def test_create_app_reads_working_dir_and_model_from_env(tmp_path: Path, monkeypatch):
@@ -1625,7 +512,7 @@ def test_create_app_treats_empty_model_env_as_none(tmp_path: Path, monkeypatch):
     app = create_app(db_path=tmp_path / "sessions.sqlite", controller_factory=FakeController)
     client = TestClient(app)
 
-    client.post("/api/sessions", json={"message": "处理 20270605 的室外导航数据", "creation_id": "local-create-api-3"})
+    client.post("/api/sessions", json={"message": "处理 20270605 的室外导航数据"})
 
     assert FakeController.created[0].kwargs["model"] is None
 
@@ -1705,12 +592,8 @@ def test_navigation_sync_image_route_rejects_unsafe_sequence(tmp_path: Path, mon
 
 
 def _create_session(client: TestClient) -> str:
-    response = client.post("/api/sessions", json={"message": "处理 20270605 的室外导航数据", "creation_id": "local-create-helper"})
+    response = client.post("/api/sessions", json={"message": "处理 20270605 的室外导航数据"})
     return response.json()["session"]["id"]
-
-
-def _route_endpoint(app: FastAPI, path: str):
-    return next(route.endpoint for route in app.routes if getattr(route, "path", None) == path)
 
 
 def _write_dataset_metadata(clip_dir: Path) -> None:

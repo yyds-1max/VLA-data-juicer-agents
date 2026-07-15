@@ -22,19 +22,6 @@ EVIDENCE_READ_MAX_CHARS = 5_500
 _REF_PREFIX = "nav-evidence:"
 _SAFE_TASK_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]*$")
 _EVIDENCE_ID = re.compile(r"^[0-9a-f]{32}$")
-_RESERVED_IDENTITY_FIELDS = frozenset({"result_ref"})
-
-
-def strip_reserved_identity_fields(payload: Any) -> Any:
-    if isinstance(payload, dict):
-        return {
-            key: strip_reserved_identity_fields(value)
-            for key, value in payload.items()
-            if str(key).lower() not in _RESERVED_IDENTITY_FIELDS
-        }
-    if isinstance(payload, list):
-        return [strip_reserved_identity_fields(value) for value in payload]
-    return payload
 
 
 class FileNavigationEvidenceStore:
@@ -140,9 +127,7 @@ class FileNavigationEvidenceStore:
         if not path.is_file():
             raise KeyError(ref)
 
-        payload = strip_reserved_identity_fields(
-            json.loads(path.read_text(encoding="utf-8"))
-        )
+        payload = json.loads(path.read_text(encoding="utf-8"))
         selected = self._select_fields(payload, fields)
         data, next_cursor = self._paginate(
             selected,

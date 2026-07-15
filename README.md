@@ -88,33 +88,6 @@ The conversational Agent requires normal LLM settings such as `DASHSCOPE_API_KEY
 
 ## DataPilot web UI
 
-The production DataPilot Web runtime requires AgentScope 2.0.4, pinned as the exact
-Python dependency `agentscope==2.0.4`, and a reachable Redis service. Redis holds
-AgentScope's durable execution state; the Web server does not support a non-AgentScope
-fallback mode in production. Configure the Redis URL before using the bundled service
-script:
-
-```bash
-export VLA_AGENT_REDIS_URL=redis://127.0.0.1:6379/0
-./scripts/run_web.sh start
-```
-
-After upgrading to this version, the first server start (or the following restart)
-automatically advances the development Web schema generation and resets the Web
-session metadata and test sessions in `.djx/sessions.sqlite`:
-
-```bash
-export VLA_AGENT_REDIS_URL=redis://127.0.0.1:6379/0
-./scripts/run_web.sh restart
-```
-
-This development metadata reset is intentionally not a compatibility migration. It
-only recreates the allowlisted Web control-plane tables. It never removes VLA
-dataset roots, `raw/sync/clip/finish` data, or any processing output. Likewise,
-deleting one conversation removes its AgentScope and Web/navigation control state
-(including that task's dedicated `navigation-evidence/<task-id>` directory), but
-never deletes an existing dataset or processing artifact.
-
 For server use, run the bundled web script from the repository root. It builds the frontend, starts
 the backend with `frontend/dist` mounted, and records a PID/log under `.djx`:
 
@@ -158,16 +131,13 @@ Override settings with environment variables when needed:
 HOST=0.0.0.0 PORT=8765 VLA_VLADATASETS_ROOT=/media/heying/hy_data1/VLADatasets ./scripts/run_web.sh start
 ```
 
-For local frontend development, first export the same Redis URL, then run the backend
-API from the repository root:
+For local frontend development, run the backend API from the repository root:
 
 ```bash
-export VLA_AGENT_REDIS_URL=redis://127.0.0.1:6379/0
 vla-data-agent-web --host 127.0.0.1 --port 8765 --working-dir ./.djx
 ```
 
-Then run the frontend dev server from `frontend`. Vite proxies `/api` traffic to the
-backend:
+Then run the frontend dev server from `frontend`. Vite proxies `/api` and WebSocket traffic to the backend:
 
 ```bash
 npm run dev
@@ -181,19 +151,6 @@ npm run build
 cd ..
 vla-data-agent-web --host 127.0.0.1 --port 8765 --working-dir ./.djx --frontend-dist frontend/dist
 ```
-
-All saved conversations remain writable: selecting a historical conversation lets
-the user continue sending messages with its durable AgentScope context. The browser
-opens `/api/sessions/{id}/stream` only for the currently selected conversation and
-resumes its public event sequence after reconnecting; unselected conversations do
-not keep browser streams open and do not control background execution.
-
-Public tool terminal states are exactly `success`, `failure`, and `stopped`. A tool
-uses `stopped` only after an explicit user stop; background execution by itself is
-not a separate terminal state. A background tool remains stoppable after its first
-reply ends. Once an explicit stop succeeds, late results from that stopped execution
-are durably fenced and cannot enqueue a wakeup or produce another assistant reply;
-the next user message starts a new execution generation normally.
 
 Frontend verification commands:
 

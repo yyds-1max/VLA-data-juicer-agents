@@ -23,7 +23,6 @@ from vla_data_juicer_agents.navigation.plan_models import (
     FinishProcessingPlanInput,
     NavigationPlanRecord,
     PlanSubmissionAttempt,
-    SideEffectState,
 )
 from vla_data_juicer_agents.navigation.task_state import NavigationTask, utc_now
 from vla_data_juicer_agents.navigation.schema import initialize_navigation_schema
@@ -136,9 +135,7 @@ class NavigationExecutionSnapshot:
     dependency_statuses: dict[str, ExecutionStatus]
     staged_result: StagedStepResult | None
     handoff: HumanDecisionHandoff | None
-    activity: Literal[
-        "planning", "execution", "failed_recovery", "recovery_required"
-    ]
+    activity: Literal["planning", "execution", "recovery_required"]
 
 
 class SqliteNavigationPlanRepository:
@@ -551,17 +548,9 @@ class SqliteNavigationPlanRepository:
             plan_row = connection.execute(
                 """SELECT plans.*
                    FROM navigation_plans AS plans
-                   JOIN navigation_tasks AS tasks ON tasks.task_id = plans.task_id
                    WHERE plans.task_id = ?
                      AND plans.phase = ?
-                     AND (
-                         plans.status = 'active'
-                         OR (
-                             plans.status = 'invalidated'
-                             AND tasks.status = 'needs_replan'
-                         )
-                     )
-                   ORDER BY plans.plan_revision DESC
+                     AND plans.status = 'active'
                    LIMIT 1""",
                 (
                     task.task_id,
@@ -687,13 +676,9 @@ class SqliteNavigationPlanRepository:
                 if handoff_row is not None:
                     handoff = self._handoff_from_row(handoff_row)
             current_status = ((current or {}).get("step") or {}).get("status")
-            activity: Literal[
-                "planning", "execution", "failed_recovery", "recovery_required"
-            ]
+            activity: Literal["planning", "execution", "recovery_required"]
             if handoff is not None and handoff.status == "recovery_required":
                 activity = "recovery_required"
-            elif current_status in {"failed", "needs_replan"}:
-                activity = "failed_recovery"
             elif current_status in {"pending", "running", "waiting_user"}:
                 activity = "execution"
             else:
@@ -1043,24 +1028,6 @@ class SqliteNavigationPlanRepository:
         }
         self._ensure_within_limit(payload, label="current step")
         return payload
-
-    def is_step_result_ref(self, task_id: str, result_ref: str) -> bool:
-        """Classify staged or durable execution evidence without decoding its ref."""
-        if not isinstance(task_id, str) or not isinstance(result_ref, str):
-            return False
-        with self._connect() as connection:
-            row = connection.execute(
-                """SELECT 1
-                   FROM navigation_task_steps
-                   WHERE task_id = ? AND result_ref = ?
-                   UNION ALL
-                   SELECT 1
-                   FROM navigation_step_result_outbox
-                   WHERE task_id = ? AND result_ref = ?
-                   LIMIT 1""",
-                (task_id, result_ref, task_id, result_ref),
-            ).fetchone()
-        return row is not None
 
     def claim_step(
         self,
@@ -1525,7 +1492,6 @@ class SqliteNavigationPlanRepository:
         step_id: str,
         reason: str,
         *, expected_action: str,
-        side_effect_state: SideEffectState = "partial_or_unknown",
         expected_web_session_id: str | None = None,
         expected_agentscope_session_id: str | None = None,
     ) -> bool:
@@ -1575,14 +1541,6 @@ class SqliteNavigationPlanRepository:
                     "recover or acknowledge the human handoff first"
                 )
             timestamp = utc_now()
-            recovery_summary = self._canonical_json(
-                {
-                    "ok": False,
-                    "error_type": "step_recovery_requires_replan",
-                    "message": reason[:800],
-                    "side_effect_state": side_effect_state,
-                }
-            )
             connection.execute(
                 """
                 UPDATE navigation_plans
@@ -1594,14 +1552,10 @@ class SqliteNavigationPlanRepository:
             connection.execute(
                 """
                 UPDATE navigation_task_steps
-                SET status = 'needs_replan', finished_at = ?,
-                    result_summary_json = CASE
-                        WHEN step_id = ? THEN ?
-                        ELSE result_summary_json
-                    END
+                SET status = 'needs_replan', finished_at = ?
                 WHERE plan_id = ? AND status != 'completed'
                 """,
-                (timestamp, step_id, recovery_summary, plan_id),
+                (timestamp, plan_id),
             )
             connection.execute(
                 """
@@ -2144,15 +2098,10 @@ class SqliteNavigationPlanRepository:
 
     def mark_needs_replan(
         self, plan_id: str, reason: str, *,
-        result_summary: dict[str, Any] | None = None,
-        step_id: str | None = None,
-        result_ref: str | None = None,
         expected_web_session_id: str | None = None,
         expected_agentscope_session_id: str | None = None,
     ) -> bool:
         """Invalidate one active plan and its unfinished ledger in one transaction."""
-        if (step_id is None) != (result_ref is None):
-            raise ValueError("step_id and result_ref must be provided together")
         connection = self._connect()
         try:
             connection.execute("BEGIN IMMEDIATE")
@@ -2171,16 +2120,6 @@ class SqliteNavigationPlanRepository:
                     "cannot mark a navigation plan needs-replan with in-flight work"
                 )
             timestamp = utc_now()
-            canonical_summary = (
-                self._canonical_json(result_summary)
-                if result_summary is not None
-                else None
-            )
-            if result_summary is not None:
-                self._ensure_within_limit(
-                    result_summary,
-                    label="needs-replan result summary",
-                )
             connection.execute(
                 """
                 UPDATE navigation_plans
@@ -2192,22 +2131,10 @@ class SqliteNavigationPlanRepository:
             connection.execute(
                 """
                 UPDATE navigation_task_steps
-                SET status = 'needs_replan', finished_at = ?,
-                    result_summary_json = COALESCE(?, result_summary_json),
-                    result_ref = CASE
-                        WHEN ? IS NOT NULL AND step_id = ? THEN ?
-                        ELSE result_ref
-                    END
+                SET status = 'needs_replan', finished_at = ?
                 WHERE plan_id = ? AND status != 'completed'
                 """,
-                (
-                    timestamp,
-                    canonical_summary,
-                    step_id,
-                    step_id,
-                    result_ref,
-                    plan_id,
-                ),
+                (timestamp, plan_id),
             )
             connection.execute(
                 """

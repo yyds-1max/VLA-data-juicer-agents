@@ -1,5 +1,4 @@
 import asyncio
-import json
 from types import SimpleNamespace
 
 import pytest
@@ -359,14 +358,7 @@ def test_direct_terminal_state_is_derived_from_durable_ledger(
                 status="completed" if task_status == "completed" else "active",
             ),
             get_execution_overview=lambda _plan_id: overview,
-            get_current_step=lambda _plan_id: None
-            if current_step is None
-            else {
-                "step": {
-                    "step_id": current_step,
-                    "result_ref": "internal-step-result-ref",
-                }
-            },
+            get_current_step=lambda _plan_id: None if current_step is None else {"step": {"step_id": current_step}},
         ),
     )
 
@@ -378,7 +370,6 @@ def test_direct_terminal_state_is_derived_from_durable_ledger(
 
     assert result["status"] == expected_status
     assert result["ok"] is ok
-    assert "result_ref" not in json.dumps(result)
 
 
 def test_direct_terminal_treats_completed_dry_run_ledger_as_success(tmp_path):

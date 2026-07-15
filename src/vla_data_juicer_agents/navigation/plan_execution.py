@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import asyncio
 import json
 import hashlib
 from pathlib import Path
@@ -14,16 +13,6 @@ from vla_data_juicer_agents.core.cancellation import (
     bind_cancellation,
     current_cancellation,
 )
-
-
-def _consume_detached_worker_result(task: asyncio.Task) -> None:
-    """Retrieve a shielded worker result after its cancelled awaiter exits."""
-    try:
-        task.result()
-    except (asyncio.CancelledError, Exception):
-        # The durable plan ledger owns the worker outcome.  This callback only
-        # prevents an unobserved-task warning after the requester is gone.
-        return
 from vla_data_juicer_agents.navigation.config import NavigationSettings
 from vla_data_juicer_agents.navigation.evidence_store import FileNavigationEvidenceStore
 from vla_data_juicer_agents.navigation.execution_tools import (
@@ -49,7 +38,6 @@ from vla_data_juicer_agents.navigation.plan_models import (
     ExtractSyncPlanInput,
     FinishProcessingPlanInput,
     NavigationPlanRecord,
-    SideEffectState,
 )
 from vla_data_juicer_agents.navigation.plan_store import (
     ActivePlanExecutionConflict,
@@ -111,7 +99,7 @@ def _bounded_result_payload(payload: dict[str, Any], *, action: str) -> tuple[di
     return {
         "ok": False,
         "tool_name": action[:200],
-        "message": "Processing returned an oversized result; the bounded digest is retained and manual recovery is required.",
+        "message": "Processing returned an oversized result; the bounded digest is retained and replanning is required.",
         "details": {
             "error_type": "processing_result_oversized",
             "sha256": hashlib.sha256(canonical.encode("utf-8")).hexdigest(),
@@ -383,14 +371,6 @@ def _record_changed_preconditions(
         transitioned = plan_store.mark_needs_replan(
             plan.plan_id,
             "input_precondition_changed",
-            result_summary={
-                "ok": False,
-                "error_type": "input_precondition_changed",
-                "message": "A concrete input required by the accepted plan changed before execution.",
-                "side_effect_state": "not_started",
-            },
-            step_id=step.step_id,
-            result_ref=descriptor.ref,
             expected_web_session_id=expected_web_session_id,
             expected_agentscope_session_id=expected_agentscope_session_id,
         )
@@ -406,7 +386,7 @@ def _record_changed_preconditions(
     return _compact_error(
         "input_precondition_changed",
         "A concrete input required by the accepted plan changed before execution.",
-        result_available=True,
+        result_ref=descriptor.ref,
         missing_input_count=failure["missing_input_count"],
         next_action="submit_complete_plan",
     )
@@ -554,42 +534,21 @@ def _result_payload(result: Any) -> dict[str, Any]:
     raise TypeError(f"navigation processing action returned unsupported result: {type(result)!r}")
 
 
-def _side_effect_state(*, invoked: bool, ok: bool) -> SideEffectState:
-    if not invoked:
-        return "not_started"
-    return "completed" if ok else "partial_or_unknown"
-
-
-def _result_summary(
-    payload: dict[str, Any],
-    *,
-    invoked: bool,
-) -> dict[str, Any]:
+def _result_summary(payload: dict[str, Any]) -> dict[str, Any]:
     details = payload.get("details") if isinstance(payload.get("details"), dict) else {}
     error_type = details.get("error_type") or payload.get("error_type")
-    ok = bool(payload.get("ok"))
     return {
-        "ok": ok,
+        "ok": bool(payload.get("ok")),
         "tool_name": str(payload.get("tool_name", ""))[:200],
         "message": str(payload.get("message", ""))[:800],
         "error_type": str(error_type)[:200] if error_type else None,
         "produced_path_count": len(payload.get("produced_paths") or []),
-        "side_effect_state": _side_effect_state(invoked=invoked, ok=ok),
     }
 
 
 def _next_action(plan_store: SqliteNavigationPlanRepository, plan_id: str) -> str | None:
     current = plan_store.get_current_step(plan_id)
     return current["step"]["action"] if current is not None else None
-
-
-def _failed_recovery_next_action(result_summary: Any) -> str:
-    if (
-        isinstance(result_summary, dict)
-        and result_summary.get("side_effect_state") == "not_started"
-    ):
-        return "submit_complete_plan"
-    return "manual_recovery"
 
 
 def _terminal_error(
@@ -599,9 +558,7 @@ def _terminal_error(
     current = plan_store.get_current_step(plan_id)
     status = (current or {}).get("step", {}).get("status")
     next_action = (
-        _failed_recovery_next_action(
-            ((current or {}).get("step") or {}).get("result_summary")
-        )
+        "submit_complete_plan"
         if status in {"failed", "needs_replan"}
         else "manual_recovery"
         if status == "running"
@@ -637,8 +594,8 @@ def _finalize_staged_result(
     if staged is None:
         return _compact_error(
             "step_recovery_requires_replan",
-            "The running step has no durable staged result. Manual recovery is required; the underlying action will not be rerun automatically.",
-            next_action="manual_recovery",
+            "The running step has no durable staged result. Replan or perform manual recovery; the underlying action will not be rerun automatically.",
+            next_action="submit_complete_plan",
         )
     result_ref = staged.result_ref
     if result_ref is None:
@@ -689,11 +646,11 @@ def _finalize_staged_result(
         "plan_id": plan.plan_id,
         "step_id": step.step_id,
         "status": staged.target_status,
-        "result_available": True,
+        "result_ref": result_ref,
         "next_action": (
             _next_action(plan_store, plan.plan_id)
             if staged.target_status == "completed"
-            else _failed_recovery_next_action(staged.result_summary)
+            else "submit_complete_plan"
         ),
     }
     if len(_canonical_json(response)) > MAX_EXECUTION_READ_CHARS:
@@ -766,7 +723,7 @@ def _invoke_plan_step(
             return _compact_error(
                 "step_recovery_requires_replan",
                 "The running step has no durable staged result. It was moved to needs_replan and will not be rerun automatically.",
-                next_action="manual_recovery",
+                next_action="submit_complete_plan",
             )
         return _terminal_error(plan_store, plan.plan_id)
     precondition_failure = verify_plan_step_preconditions(
@@ -809,7 +766,6 @@ def _invoke_plan_step(
             return _session_mismatch_error()
         return _terminal_error(plan_store, plan.plan_id)
 
-    invoked = False
     try:
         arguments = resolve_step_arguments(
             task=task,
@@ -820,7 +776,6 @@ def _invoke_plan_step(
         with bind_cancellation(active_cancellation):
             if active_cancellation is not None:
                 active_cancellation.raise_if_cancelled()
-            invoked = True
             payload = _result_payload(function(**arguments))
     except TurnCancelled:
         payload = {
@@ -836,7 +791,7 @@ def _invoke_plan_step(
                 expected_action=step.action,
                 target_status="failed",
                 full_result=payload,
-                result_summary=_result_summary(payload, invoked=invoked),
+                result_summary=_result_summary(payload),
                 expected_web_session_id=expected_web_session_id,
                 expected_agentscope_session_id=expected_agentscope_session_id,
             )
@@ -862,7 +817,6 @@ def _invoke_plan_step(
                 step.step_id,
                 "cancellation result could not be staged",
                 expected_action=step.action,
-                side_effect_state=_side_effect_state(invoked=invoked, ok=False),
                 expected_web_session_id=expected_web_session_id,
                 expected_agentscope_session_id=expected_agentscope_session_id,
             )
@@ -879,7 +833,7 @@ def _invoke_plan_step(
         }
 
     payload, oversized = _bounded_result_payload(payload, action=action)
-    summary = _result_summary(payload, invoked=invoked)
+    summary = _result_summary(payload)
     terminal_status = "completed" if summary["ok"] else "failed"
     try:
         plan_store.stage_step_result(
@@ -898,16 +852,13 @@ def _invoke_plan_step(
             step.step_id,
             "processing result could not be staged after underlying execution",
             expected_action=step.action,
-            side_effect_state=_side_effect_state(invoked=invoked, ok=False),
             expected_web_session_id=expected_web_session_id,
             expected_agentscope_session_id=expected_agentscope_session_id,
         )
         return _compact_error(
             "step_recovery_requires_replan",
             "The underlying action finished but its result could not be staged. The step was moved to needs_replan and will not be rerun automatically.",
-            next_action=_failed_recovery_next_action(
-                {"side_effect_state": _side_effect_state(invoked=invoked, ok=False)}
-            ),
+            next_action="submit_complete_plan",
         )
     response = _finalize_staged_result(
         task=task,
@@ -929,7 +880,7 @@ def _invoke_plan_step(
             expected_agentscope_session_id=expected_agentscope_session_id,
         )
         response["status"] = "needs_replan"
-        response["next_action"] = "manual_recovery"
+        response["next_action"] = "submit_complete_plan"
     return response
 
 
@@ -1012,7 +963,7 @@ def prepare_plan_human_decision(
             return _compact_error(
                 "input_precondition_changed",
                 "A concrete input changed while the human decision request was waiting; audited recovery is required before replanning.",
-                result_available=True,
+                result_ref=descriptor.ref,
                 missing_input_count=precondition_failure["missing_input_count"],
                 recovery_required=True,
                 next_action="quarantine_human_decision_handoff",
@@ -1114,7 +1065,7 @@ def submit_plan_human_decision(
             decision=normalized_decision,
             target_status="completed" if payload["ok"] else "failed",
             full_result=payload,
-            result_summary=_result_summary(payload, invoked=False),
+            result_summary=_result_summary(payload),
             expected_web_session_id=expected_web_session_id,
             expected_agentscope_session_id=expected_agentscope_session_id,
         )
@@ -1181,47 +1132,20 @@ def build_plan_bound_execution_tools(
     tools: list[ToolBase] = []
 
     def make_invoke(action: str, function: Callable[..., Any]):
-        async def invoke(plan_id: str, step_id: str) -> dict[str, Any]:
-            # AgentScope's FunctionTool calls synchronous functions directly on
-            # the event loop.  Plan steps can run subprocesses for minutes, so
-            # keep the orchestration body in a worker while sharing the same
-            # cancellation token (asyncio.to_thread copies contextvars).
-            active_cancellation = cancellation or current_cancellation()
-            worker_token = (
-                active_cancellation.reserve_worker()
-                if active_cancellation is not None
-                else None
+        def invoke(plan_id: str, step_id: str) -> dict[str, Any]:
+            return _invoke_plan_step(
+                bound_task=task,
+                plan_id=plan_id,
+                step_id=step_id,
+                action=action,
+                function=function,
+                plan_store=plan_store,
+                evidence_store=evidence_store,
+                settings=settings,
+                cancellation=cancellation,
+                expected_web_session_id=web_session_id,
+                expected_agentscope_session_id=agentscope_session_id,
             )
-
-            def run_in_worker() -> dict[str, Any]:
-                try:
-                    return _invoke_plan_step(
-                        bound_task=task,
-                        plan_id=plan_id,
-                        step_id=step_id,
-                        action=action,
-                        function=function,
-                        plan_store=plan_store,
-                        evidence_store=evidence_store,
-                        settings=settings,
-                        cancellation=cancellation,
-                        expected_web_session_id=web_session_id,
-                        expected_agentscope_session_id=agentscope_session_id,
-                    )
-                finally:
-                    if active_cancellation is not None and worker_token is not None:
-                        active_cancellation.finish_worker(worker_token)
-
-            # Keep the queued executor job alive if AgentScope cancels its async
-            # wrapper before a saturated pool can start the worker.  The real
-            # worker must eventually enter its finally block and release the
-            # quiescence token; cancelling the queued future would leak it.
-            worker_task = asyncio.create_task(asyncio.to_thread(run_in_worker))
-            try:
-                return await asyncio.shield(worker_task)
-            except asyncio.CancelledError:
-                worker_task.add_done_callback(_consume_detached_worker_result)
-                raise
 
         invoke.__name__ = f"{action}_tool"
         invoke.__doc__ = (

@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import json
-import re
 import sqlite3
 from pathlib import Path
 from typing import Any
@@ -24,24 +23,6 @@ from vla_data_juicer_agents.navigation.task_state import (
     TaskAttemptCreation,
     utc_now,
 )
-
-
-_SAFE_TASK_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]*$")
-_CONTROL_CHILD_TABLES = (
-    "navigation_step_result_outbox",
-    "navigation_human_decision_handoffs",
-    "navigation_evidence",
-    "navigation_plan_submission_attempts",
-    "navigation_task_steps",
-    "navigation_plans",
-    "navigation_observation_revisions",
-)
-
-
-def validate_navigation_task_id(task_id: str) -> str:
-    if not isinstance(task_id, str) or _SAFE_TASK_ID.fullmatch(task_id) is None:
-        raise ValueError("task_id contains unsupported path characters")
-    return task_id
 
 
 def _json_dump(value: Any) -> str | None:
@@ -272,47 +253,6 @@ class SqliteNavigationTaskStore:
                 (web_session_id, agentscope_session_id),
             ).fetchone()
         return self._task_from_row(row) if row is not None else None
-
-    def find_by_web_session(self, web_session_id: str) -> list[NavigationTask]:
-        with self._connect() as connection:
-            rows = connection.execute(
-                """SELECT * FROM navigation_tasks
-                   WHERE created_by_web_session_id = ?
-                   ORDER BY created_at, rowid""",
-                (web_session_id,),
-            ).fetchall()
-        return [self._task_from_row(row) for row in rows]
-
-    def delete_control_state_for_web_session(self, web_session_id: str) -> list[str]:
-        connection = self._connect()
-        try:
-            connection.execute("BEGIN IMMEDIATE")
-            rows = connection.execute(
-                """SELECT task_id FROM navigation_tasks
-                   WHERE created_by_web_session_id = ?
-                   ORDER BY created_at, rowid""",
-                (web_session_id,),
-            ).fetchall()
-            task_ids = [str(row["task_id"]) for row in rows]
-            for task_id in task_ids:
-                validate_navigation_task_id(task_id)
-            for task_id in task_ids:
-                for table in _CONTROL_CHILD_TABLES:
-                    connection.execute(
-                        f'DELETE FROM "{table}" WHERE task_id = ?',
-                        (task_id,),
-                    )
-                connection.execute(
-                    "DELETE FROM navigation_tasks WHERE task_id = ?",
-                    (task_id,),
-                )
-            connection.commit()
-            return task_ids
-        except Exception:
-            connection.rollback()
-            raise
-        finally:
-            connection.close()
 
     def find_running_target_writer(
         self,

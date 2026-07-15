@@ -5,9 +5,6 @@ from typing import Annotated, Any, Literal
 from pydantic import BaseModel, ConfigDict, Field
 
 
-SideEffectState = Literal["not_started", "completed", "partial_or_unknown"]
-
-
 class StrictModel(BaseModel):
     model_config = ConfigDict(extra="forbid")
 

@@ -7,10 +7,7 @@ from agentscope.message import TextBlock, ToolResultState
 from agentscope.middleware import MiddlewareBase
 from agentscope.tool import ToolGroup, ToolResponse
 
-from vla_data_juicer_agents.core.cancellation import (
-    CancellationContext,
-    current_cancellation,
-)
+from vla_data_juicer_agents.core.cancellation import CancellationContext
 from vla_data_juicer_agents.navigation.agent_tools import (
     resolve_navigation_tool_surface,
 )
@@ -47,7 +44,7 @@ class NavigationToolSurfaceMiddleware(MiddlewareBase):
                 services=self._services,
                 web_session_id=self._web_session_id,
                 agentscope_session_id=self._agentscope_session_id,
-                cancellation=self._cancellation or current_cancellation(),
+                cancellation=self._cancellation,
             )
             if surface is None:
                 raise LookupError("missing authorized navigation attempt")

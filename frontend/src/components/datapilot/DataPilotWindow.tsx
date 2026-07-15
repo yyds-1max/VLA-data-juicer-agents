@@ -1,26 +1,19 @@
 import type { CSSProperties, PointerEvent, WheelEvent } from "react";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { EventType, type AgentEvent, type CustomEvent } from "@agentscope-ai/agentscope/event";
 import { useStore } from "zustand";
 
 import {
   createSession,
-  deleteSession,
   getSession,
-  isAmbiguousTurnSubmissionError,
   interruptTurn,
   listSessions,
+  openSessionEvents,
   recoverHumanDecision,
   submitHumanDecision,
   submitTurn,
-  streamSessionEvents,
 } from "../../api/client";
 import type { PendingHumanDecision, SessionRecord } from "../../api/types";
 import { datapilotStore } from "../../store/datapilotStore";
-import {
-  hasActiveExecution,
-  type AgentConversationState,
-} from "../../store/agentConversation";
 import { Composer } from "./Composer";
 import { DraftNewSessionView } from "./DraftNewSessionView";
 import { HumanDecisionDialog } from "./HumanDecisionDialog";
@@ -28,16 +21,6 @@ import { MessageList } from "./MessageList";
 import { SessionHeader } from "./SessionHeader";
 import { SessionHistoryPanel } from "./SessionHistoryPanel";
 import { currentViewport, visibleFloatingOffset, visibleWindowOffset } from "./floatingPosition";
-import {
-  readSessionCreationOutbox,
-  readTurnOutbox,
-  removeSessionCreationOutbox,
-  removeTurnOutbox,
-  writeSessionCreationOutbox,
-  writeTurnOutbox,
-  type AmbiguousTurnRetry,
-  type SessionCreationRetry,
-} from "./turnOutbox";
 
 type DragState = {
   pointerId: number;
@@ -47,48 +30,16 @@ type DragState = {
   originY: number;
 };
 
-type StreamLease = {
-  sessionId: string;
-  generation: number;
-  controller: AbortController;
-};
-
-type ActiveSubmitRequest = {
-  id: number;
-  sessionId: string;
-  generation: number;
-  userMessage: ReturnType<typeof localUserMessage>;
-  outcome: "pending" | "success" | "failure";
-  error?: unknown;
-};
-
-type StopRequestToken = {
-  id: number;
-  sessionId: string;
-  generation: number;
-  executionCorrelation: string | null;
-};
-
-type SubmitAdmission = {
-  sessionId: string | null;
-  afterSequence: number;
-  originalDraft: string;
-  draftRevision: number;
-  accepted: boolean;
-  replyStarted: boolean;
-  turnId: string | null;
-  terminalTurnIds: Set<string>;
-};
-
 export function DataPilotWindow() {
   const open = useStore(datapilotStore, (state) => state.open);
   const mode = useStore(datapilotStore, (state) => state.mode);
   const currentSessionId = useStore(datapilotStore, (state) => state.currentSessionId);
   const sessions = useStore(datapilotStore, (state) => state.sessions);
-  const conversation = useStore(datapilotStore, (state) => state.conversation);
-  const running = hasActiveExecution(conversation);
-  const interrupting = conversation.phase === "interrupting";
-  const pendingHumanDecision = conversation.pendingHumanDecision;
+  const messages = useStore(datapilotStore, (state) => state.messages);
+  const run = useStore(datapilotStore, (state) => state.run);
+  const running = useStore(datapilotStore, (state) => state.run.running);
+  const interrupting = useStore(datapilotStore, (state) => state.run.interrupting);
+  const pendingHumanDecision = useStore(datapilotStore, (state) => state.run.pendingHumanDecision);
   const floatingOffset = useStore(datapilotStore, (state) => state.floatingOffset);
   const setFloatingOffset = useStore(datapilotStore, (state) => state.setFloatingOffset);
   const [historyOpen, setHistoryOpen] = useState(false);
@@ -96,242 +47,15 @@ export function DataPilotWindow() {
   const [closing, setClosing] = useState(false);
   const [recoveringHumanDecision, setRecoveringHumanDecision] = useState(false);
   const [humanDecisionRecoveryError, setHumanDecisionRecoveryError] = useState("");
-  const [stopRequestPending, setStopRequestPending] = useState(false);
-  const [composerDraft, setComposerDraft] = useState("");
-  const [submitting, setSubmitting] = useState(false);
   const [viewport, setViewport] = useState(() => ({
     width: typeof window === "undefined" ? 1280 : window.innerWidth,
     height: typeof window === "undefined" ? 900 : window.innerHeight,
   }));
-  const streamRef = useRef<StreamLease | null>(null);
-  const startEventStreamRef = useRef<(sessionId: string, generation: number) => void>(
-    () => undefined,
-  );
+  const socketRef = useRef<{ sessionId: string; socket: WebSocket } | null>(null);
   const reconnectTimerRef = useRef<number | null>(null);
-  const lifecycleGenerationRef = useRef(0);
-  const mountedRef = useRef(false);
-  const selectionGenerationRef = useRef(0);
-  const selectionTargetRef = useRef<string | null>(null);
-  const draftRequestGenerationRef = useRef(0);
-  const composerDraftRef = useRef("");
-  const composerDraftRevisionRef = useRef(0);
-  const requestInFlightRef = useRef<SubmitAdmission | null>(null);
-  const activeSubmitRequestIdRef = useRef(0);
-  const activeSubmitQueueRef = useRef(new Map<number, ActiveSubmitRequest>());
-  const stopRequestIdRef = useRef(0);
-  const activeStopRequestRef = useRef<StopRequestToken | null>(null);
-  const ambiguousTurnRetriesRef = useRef(new Map<string, AmbiguousTurnRetry>());
-  const sessionCreationRetryRef = useRef<SessionCreationRetry | null>(null);
-  const deletedSessionIdsRef = useRef(new Set<string>());
-  const reconnectStateRef = useRef<{ sessionId: string | null; attempts: number }>({
-    sessionId: null,
-    attempts: 0,
-  });
   const humanDecisionRecoveryRequestRef = useRef(0);
   const dragRef = useRef<DragState | null>(null);
   const windowOffset = useMemo(() => visibleWindowOffset(floatingOffset, viewport), [floatingOffset, viewport]);
-
-  const rememberTurnRetry = useCallback((sessionId: string, retry: AmbiguousTurnRetry) => {
-    ambiguousTurnRetriesRef.current.set(sessionId, retry);
-    writeTurnOutbox(sessionId, retry);
-  }, []);
-
-  const discardTurnRetry = useCallback((sessionId: string, expectedMessageId?: string) => {
-    const retry = ambiguousTurnRetriesRef.current.get(sessionId);
-    if (expectedMessageId && retry?.userMessage.id !== expectedMessageId) {
-      return;
-    }
-    ambiguousTurnRetriesRef.current.delete(sessionId);
-    removeTurnOutbox(sessionId, expectedMessageId ?? retry?.userMessage.id);
-  }, []);
-
-  const rememberSessionCreationRetry = useCallback((retry: SessionCreationRetry) => {
-    sessionCreationRetryRef.current = retry;
-    writeSessionCreationOutbox(retry);
-  }, []);
-
-  const discardSessionCreationRetry = useCallback((expectedCreationId?: string) => {
-    const retry = sessionCreationRetryRef.current;
-    if (expectedCreationId && retry?.creationId !== expectedCreationId) {
-      removeSessionCreationOutbox(expectedCreationId);
-      return;
-    }
-    sessionCreationRetryRef.current = null;
-    removeSessionCreationOutbox(expectedCreationId ?? retry?.creationId);
-  }, []);
-
-  const handleComposerDraftChange = useCallback((message: string) => {
-    composerDraftRevisionRef.current += 1;
-    composerDraftRef.current = message;
-    setComposerDraft(message);
-  }, []);
-
-  const replaceComposerDraft = useCallback((message: string) => {
-    composerDraftRef.current = message;
-    setComposerDraft(message);
-  }, []);
-
-  const acquireSubmitAdmission = useCallback(
-    (message: string, sessionId: string | null) => {
-      if (requestInFlightRef.current) {
-        return null;
-      }
-      const originalDraft = composerDraftRef.current;
-      const request: SubmitAdmission = {
-        sessionId,
-        afterSequence: datapilotStore.getState().conversation.lastSequence,
-        originalDraft,
-        draftRevision: composerDraftRevisionRef.current,
-        accepted: false,
-        replyStarted: false,
-        turnId: null,
-        terminalTurnIds: new Set<string>(),
-      };
-      requestInFlightRef.current = request;
-      setSubmitting(true);
-      if (originalDraft.trim() === message) {
-        replaceComposerDraft("");
-      }
-      return request;
-    },
-    [replaceComposerDraft],
-  );
-
-  const releaseSubmitAdmission = useCallback((request: SubmitAdmission) => {
-    if (requestInFlightRef.current !== request) {
-      return;
-    }
-    requestInFlightRef.current = null;
-    setSubmitting(false);
-  }, []);
-
-  const invalidateSubmitAdmission = useCallback((updateState = true) => {
-    requestInFlightRef.current = null;
-    if (updateState) {
-      setSubmitting(false);
-    }
-  }, []);
-
-  const restoreUneditedSubmittedDraft = useCallback((request: SubmitAdmission) => {
-    if (
-      composerDraftRef.current === "" &&
-      composerDraftRevisionRef.current === request.draftRevision
-    ) {
-      replaceComposerDraft(request.originalDraft);
-    }
-  }, [replaceComposerDraft]);
-
-  const observeSubmittedReplyStart = useCallback(
-    (sessionId: string, sequence: number, type: string) => {
-      const request = requestInFlightRef.current;
-      if (
-        !request ||
-        request.sessionId !== sessionId ||
-        sequence <= request.afterSequence ||
-        type !== EventType.REPLY_START
-      ) {
-        return;
-      }
-      request.replyStarted = true;
-      if (request.accepted) {
-        releaseSubmitAdmission(request);
-      }
-    },
-    [releaseSubmitAdmission],
-  );
-
-  const observeSubmittedRunTerminal = useCallback(
-    (sessionId: string, sequence: number, event: AgentEvent) => {
-      if (event.type === EventType.CUSTOM) {
-        const terminal = event as CustomEvent;
-        const messageId = terminal.value.message_id;
-        const retry = ambiguousTurnRetriesRef.current.get(sessionId);
-        if (
-          terminal.name === "datapilot_run_terminal" &&
-          typeof messageId === "string" &&
-          retry?.userMessage.id === messageId
-        ) {
-          discardTurnRetry(sessionId, retry.userMessage.id);
-          if (
-            composerDraftRevisionRef.current === retry.draftRevision &&
-            composerDraftRef.current.trim() === retry.content
-          ) {
-            replaceComposerDraft("");
-          }
-        }
-      }
-      const request = requestInFlightRef.current;
-      if (
-        !request ||
-        request.sessionId !== sessionId ||
-        sequence <= request.afterSequence ||
-        event.type !== EventType.CUSTOM
-      ) {
-        return;
-      }
-      const custom = event as CustomEvent;
-      if (custom.name !== "datapilot_run_terminal") {
-        return;
-      }
-      const terminalTurnId = custom.value.turn_id;
-      if (typeof terminalTurnId !== "string" || !terminalTurnId) {
-        return;
-      }
-      request.terminalTurnIds.add(terminalTurnId);
-      if (request.accepted && request.turnId === terminalTurnId) {
-        releaseSubmitAdmission(request);
-      }
-    },
-    [discardTurnRetry, releaseSubmitAdmission, replaceComposerDraft],
-  );
-
-  const retireAuthoritativeAmbiguousRetry = useCallback(
-    (session: Awaited<ReturnType<typeof getSession>>) => {
-      const retry = ambiguousTurnRetriesRef.current.get(session.id);
-      if (
-        retry &&
-        session.messages.some((message) => message.id === retry.userMessage.id)
-      ) {
-        discardTurnRetry(session.id, retry.userMessage.id);
-        if (
-          composerDraftRevisionRef.current === retry.draftRevision &&
-          composerDraftRef.current.trim() === retry.content
-        ) {
-          replaceComposerDraft("");
-        }
-      }
-    },
-    [discardTurnRetry, replaceComposerDraft],
-  );
-
-  const observeSubmittedSnapshot = useCallback(
-    (session: Awaited<ReturnType<typeof getSession>>) => {
-      const request = requestInFlightRef.current;
-      if (!request || request.sessionId !== session.id) {
-        return;
-      }
-      let expectedSequence = request.afterSequence + 1;
-      for (const event of [...session.events].sort((left, right) => left.sequence - right.sequence)) {
-        if (event.sequence < expectedSequence) {
-          continue;
-        }
-        if (event.sequence !== expectedSequence) {
-          break;
-        }
-        expectedSequence += 1;
-        if (event.event.type !== EventType.REPLY_START) {
-          observeSubmittedRunTerminal(session.id, event.sequence, event.event);
-          continue;
-        }
-        request.replyStarted = true;
-        if (request.accepted) {
-          releaseSubmitAdmission(request);
-        }
-        break;
-      }
-    },
-    [observeSubmittedRunTerminal, releaseSubmitAdmission],
-  );
 
   const clearReconnectTimer = useCallback(() => {
     if (reconnectTimerRef.current === null) {
@@ -341,238 +65,76 @@ export function DataPilotWindow() {
     reconnectTimerRef.current = null;
   }, []);
 
-  const invalidateEventLifecycle = useCallback(() => {
-    lifecycleGenerationRef.current += 1;
-    activeSubmitQueueRef.current.clear();
+  const refreshSessionSnapshot = useCallback(async (sessionId: string) => {
+    try {
+      const detail = await getSession(sessionId);
+      datapilotStore.getState().refreshActiveSession(detail);
+    } catch (error) {
+      console.error("Failed to refresh DataPilot active session", error);
+    }
+  }, []);
+
+  const closeSocket = useCallback(() => {
     clearReconnectTimer();
-    const active = streamRef.current;
-    streamRef.current = null;
-    active?.controller.abort();
+    const socket = socketRef.current?.socket;
+    socketRef.current = null;
+    socket?.close();
   }, [clearReconnectTimer]);
 
-  const ownsActiveSubmitRequest = useCallback((request: ActiveSubmitRequest) => {
-    const state = datapilotStore.getState();
-    return (
-      mountedRef.current &&
-      activeSubmitQueueRef.current.get(request.id) === request &&
-      lifecycleGenerationRef.current === request.generation &&
-      state.open &&
-      state.mode === "active_session" &&
-      state.currentSessionId === request.sessionId &&
-      !deletedSessionIdsRef.current.has(request.sessionId)
-    );
-  }, []);
-
-  const flushActiveSubmitQueue = useCallback(() => {
-    for (const [requestId, request] of activeSubmitQueueRef.current) {
-      if (request.outcome === "pending") {
-        break;
-      }
-      const owned = ownsActiveSubmitRequest(request);
-      activeSubmitQueueRef.current.delete(requestId);
-      if (!owned) {
-        continue;
-      }
-      if (request.outcome === "failure") {
-        datapilotStore.getState().removeOptimisticUserMessage(
-          request.sessionId,
-          request.userMessage.id,
-        );
-        console.error("Failed to submit DataPilot active turn", request.error);
-      }
+  useEffect(() => {
+    if (!open || mode !== "active_session") {
+      closeSocket();
     }
-  }, [ownsActiveSubmitRequest]);
+  }, [closeSocket, mode, open]);
 
-  const isCurrentLease = useCallback((lease: StreamLease) => {
-    const state = datapilotStore.getState();
-    return (
-      mountedRef.current &&
-      lifecycleGenerationRef.current === lease.generation &&
-      streamRef.current === lease &&
-      state.open &&
-      state.mode === "active_session" &&
-      state.currentSessionId === lease.sessionId &&
-      !deletedSessionIdsRef.current.has(lease.sessionId)
-    );
-  }, []);
+  useEffect(() => closeSocket, [closeSocket]);
 
-  const startEventStream = useCallback(
-    (sessionId: string, expectedGeneration: number) => {
-      const state = datapilotStore.getState();
-      if (
-        !mountedRef.current ||
-        lifecycleGenerationRef.current !== expectedGeneration ||
-        !state.open ||
-        state.mode !== "active_session" ||
-        state.currentSessionId !== sessionId ||
-        deletedSessionIdsRef.current.has(sessionId)
-      ) {
-        return;
-      }
-      const active = streamRef.current;
-      if (active?.sessionId === sessionId) {
+  const openEvents = useCallback(
+    (sessionId: string) => {
+      if (socketRef.current?.sessionId === sessionId && isActiveSocket(socketRef.current.socket)) {
         return;
       }
 
-      if (active) {
-        invalidateEventLifecycle();
-      }
-      if (reconnectStateRef.current.sessionId !== sessionId) {
-        reconnectStateRef.current = { sessionId, attempts: 0 };
-      }
-      const controller = new AbortController();
-      const lease: StreamLease = {
+      closeSocket();
+      clearReconnectTimer();
+      const socket = openSessionEvents(sessionId, (event) => datapilotStore.getState().applyEvent(event));
+      socketRef.current = {
         sessionId,
-        generation: lifecycleGenerationRef.current,
-        controller,
+        socket,
       };
-      streamRef.current = lease;
 
-      void (async () => {
-        const afterSequence = datapilotStore.getState().conversation.lastSequence;
-        let replayRequired = false;
-        try {
-          for await (const event of streamSessionEvents(
-            sessionId,
-            afterSequence,
-            controller.signal,
-          )) {
-            if (!isCurrentLease(lease)) {
-              return;
-            }
-            const beforeCursor = datapilotStore.getState().conversation.lastSequence;
-            datapilotStore.getState().applyEvent(event);
-            const afterCursor = datapilotStore.getState().conversation.lastSequence;
-            if (afterCursor >= event.sequence) {
-              observeSubmittedReplyStart(sessionId, event.sequence, event.event.type);
-              observeSubmittedRunTerminal(sessionId, event.sequence, event.event);
-            }
-            if (event.sequence > beforeCursor && afterCursor === beforeCursor) {
-              replayRequired = true;
-              controller.abort();
-              break;
-            }
-            if (afterCursor > beforeCursor) {
-              reconnectStateRef.current.attempts = 0;
-            }
-          }
-        } catch (error) {
-          if (isCurrentLease(lease) && !controller.signal.aborted && !replayRequired) {
-            console.error("DataPilot event stream failed", error);
-          }
-        }
-
-        if (!isCurrentLease(lease)) {
+      const handleDisconnect = () => {
+        if (socketRef.current?.socket !== socket) {
           return;
         }
-        const cursorBeforeRefresh = datapilotStore.getState().conversation.lastSequence;
-        try {
-          const detail = await getSession(sessionId);
-          if (!isCurrentLease(lease)) {
-            return;
-          }
-          observeSubmittedSnapshot(detail);
-          retireAuthoritativeAmbiguousRetry(detail);
-          datapilotStore.getState().refreshActiveSession(detail);
-        } catch (error) {
-          if (!isCurrentLease(lease)) {
-            return;
-          }
-          console.error("Failed to refresh DataPilot active session", error);
-        }
-        if (!isCurrentLease(lease)) {
-          return;
-        }
-        if (datapilotStore.getState().conversation.lastSequence > cursorBeforeRefresh) {
-          reconnectStateRef.current.attempts = 0;
-        }
-        reconnectStateRef.current.attempts += 1;
-        const reconnectDelay = Math.min(
-          250 * 2 ** (reconnectStateRef.current.attempts - 1),
-          5_000,
-        );
+        socketRef.current = null;
+        void refreshSessionSnapshot(sessionId);
         reconnectTimerRef.current = window.setTimeout(() => {
           reconnectTimerRef.current = null;
-          if (isCurrentLease(lease)) {
-            controller.abort();
-            streamRef.current = null;
-            startEventStreamRef.current(lease.sessionId, lease.generation);
+          const state = datapilotStore.getState();
+          if (state.open && state.mode === "active_session" && state.currentSessionId === sessionId) {
+            openEvents(sessionId);
           }
-        }, reconnectDelay);
-      })();
+        }, 100);
+      };
+      socket.addEventListener("close", handleDisconnect);
+      socket.addEventListener("error", handleDisconnect);
     },
-    [
-      invalidateEventLifecycle,
-      isCurrentLease,
-      observeSubmittedReplyStart,
-      observeSubmittedRunTerminal,
-      observeSubmittedSnapshot,
-      retireAuthoritativeAmbiguousRetry,
-    ],
+    [clearReconnectTimer, closeSocket, refreshSessionSnapshot],
   );
-  startEventStreamRef.current = startEventStream;
-
-  useEffect(() => {
-    mountedRef.current = true;
-    return () => {
-      mountedRef.current = false;
-      invalidateSubmitAdmission(false);
-      draftRequestGenerationRef.current += 1;
-      selectionGenerationRef.current += 1;
-      selectionTargetRef.current = null;
-      invalidateEventLifecycle();
-    };
-  }, [invalidateEventLifecycle, invalidateSubmitAdmission]);
-
-  useEffect(() => {
-    if (!open || mode !== "draft_new_session" || currentSessionId) {
-      return;
-    }
-    const retry = sessionCreationRetryRef.current ?? readSessionCreationOutbox();
-    if (!retry) return;
-    sessionCreationRetryRef.current = retry;
-    if (composerDraftRef.current === "") {
-      replaceComposerDraft(retry.content);
-    }
-  }, [currentSessionId, mode, open, replaceComposerDraft]);
 
   useEffect(() => {
     if (!open || mode !== "active_session" || !currentSessionId) {
-      if (!open) {
-        invalidateSubmitAdmission();
-        replaceComposerDraft("");
-      }
-      invalidateEventLifecycle();
-      reconnectStateRef.current = { sessionId: null, attempts: 0 };
-      return undefined;
+      return;
     }
 
     let cancelled = false;
     const sessionId = currentSessionId;
-    const existingRetry = ambiguousTurnRetriesRef.current.get(sessionId);
-    const recoveredRetry = existingRetry ?? readTurnOutbox(sessionId);
-    if (recoveredRetry) {
-      const retry = composerDraftRef.current === ""
-        ? { ...recoveredRetry, draftRevision: composerDraftRevisionRef.current }
-        : recoveredRetry;
-      ambiguousTurnRetriesRef.current.set(sessionId, retry);
-      if (
-        !datapilotStore.getState().conversation.messages.some(
-          (message) => message.id === retry.userMessage.id,
-        )
-      ) {
-        datapilotStore.getState().appendUserMessage(retry.userMessage);
-      }
-      if (composerDraftRef.current === "") {
-        replaceComposerDraft(retry.content);
-      }
-    }
-    startEventStream(sessionId, lifecycleGenerationRef.current);
+    openEvents(sessionId);
 
     void getSession(sessionId)
       .then((detail) => {
         if (!cancelled) {
-          retireAuthoritativeAmbiguousRetry(detail);
           datapilotStore.getState().refreshActiveSession(detail);
         }
       })
@@ -584,45 +146,8 @@ export function DataPilotWindow() {
 
     return () => {
       cancelled = true;
-      if (streamRef.current?.sessionId === sessionId) {
-        invalidateEventLifecycle();
-      }
     };
-  }, [
-    currentSessionId,
-    invalidateEventLifecycle,
-    invalidateSubmitAdmission,
-    mode,
-    open,
-    replaceComposerDraft,
-    retireAuthoritativeAmbiguousRetry,
-    startEventStream,
-  ]);
-
-  useEffect(() => {
-    if (conversation.phase === "idle") {
-      setStopRequestPending(false);
-    }
-  }, [conversation.phase]);
-
-  useEffect(() => {
-    if (conversation.phase !== "streaming") {
-      return;
-    }
-    const request = requestInFlightRef.current;
-    if (!request || request.sessionId !== currentSessionId) {
-      return;
-    }
-    request.replyStarted = true;
-    if (request.accepted) {
-      releaseSubmitAdmission(request);
-    }
-  }, [conversation.phase, currentSessionId, releaseSubmitAdmission]);
-
-  useEffect(() => {
-    setStopRequestPending(false);
-    activeStopRequestRef.current = null;
-  }, [currentSessionId]);
+  }, [currentSessionId, mode, open, openEvents]);
 
   useEffect(() => {
     if (open) {
@@ -666,216 +191,33 @@ export function DataPilotWindow() {
   };
 
   const handleNewSession = () => {
-    invalidateSubmitAdmission();
-    discardSessionCreationRetry();
-    replaceComposerDraft("");
-    draftRequestGenerationRef.current += 1;
-    selectionGenerationRef.current += 1;
-    selectionTargetRef.current = null;
-    invalidateEventLifecycle();
+    closeSocket();
     setHistoryOpen(false);
     datapilotStore.getState().enterDraft();
   };
 
   const handleSelectHistory = async (session: SessionRecord) => {
-    invalidateSubmitAdmission();
-    draftRequestGenerationRef.current += 1;
-    const previousState = datapilotStore.getState();
-    const previousMode = previousState.mode;
-    const previousSessionId = previousState.currentSessionId;
-    const selectionGeneration = selectionGenerationRef.current + 1;
-    selectionGenerationRef.current = selectionGeneration;
-    selectionTargetRef.current = session.id;
-    invalidateEventLifecycle();
-    const lifecycleGeneration = lifecycleGenerationRef.current;
-    const ownsSelection = () => {
-      const state = datapilotStore.getState();
-      return (
-        mountedRef.current &&
-        selectionGenerationRef.current === selectionGeneration &&
-        selectionTargetRef.current === session.id &&
-        lifecycleGenerationRef.current === lifecycleGeneration &&
-        !deletedSessionIdsRef.current.has(session.id) &&
-        state.open &&
-        state.mode === previousMode &&
-        state.currentSessionId === previousSessionId
-      );
-    };
-    try {
-      const detail = await getSession(session.id);
-      if (!ownsSelection()) {
-        return;
-      }
-      selectionTargetRef.current = null;
-      datapilotStore.getState().restoreSession(detail);
-      replaceComposerDraft("");
-      setHistoryOpen(false);
-      startEventStream(session.id, lifecycleGeneration);
-    } catch (error) {
-      if (!ownsSelection()) {
-        return;
-      }
-      selectionTargetRef.current = null;
-      if (previousMode === "active_session" && previousSessionId) {
-        startEventStream(previousSessionId, lifecycleGeneration);
-      }
-      console.error("Failed to restore DataPilot session", error);
+    closeSocket();
+    const detail = await getSession(session.id);
+    if (detail.status === "active") {
+      datapilotStore.getState().restoreActiveSession(detail, detail.messages);
+    } else {
+      datapilotStore.getState().restoreHistory(detail, detail.messages);
     }
-  };
-
-  const handleDeleteHistory = async (session: SessionRecord) => {
-    try {
-      await deleteSession(session.id);
-      discardTurnRetry(session.id);
-      deletedSessionIdsRef.current.add(session.id);
-      const cancelledSelection = selectionTargetRef.current === session.id;
-      if (cancelledSelection) {
-        selectionGenerationRef.current += 1;
-        selectionTargetRef.current = null;
-      }
-      const store = datapilotStore.getState();
-      store.setSessions(store.sessions.filter((item) => item.id !== session.id));
-      if (store.currentSessionId === session.id) {
-        invalidateSubmitAdmission();
-        replaceComposerDraft("");
-        invalidateEventLifecycle();
-        store.enterDraft();
-        setHistoryOpen(false);
-      } else if (
-        cancelledSelection &&
-        store.open &&
-        store.mode === "active_session" &&
-        store.currentSessionId
-      ) {
-        startEventStream(store.currentSessionId, lifecycleGenerationRef.current);
-      }
-    } catch (error) {
-      console.error("Failed to delete DataPilot session", error);
-    }
+    setHistoryOpen(false);
   };
 
   const handleDraftSubmit = async (message: string) => {
-    const submission = acquireSubmitAdmission(message, null);
-    if (!submission) {
-      return;
-    }
-    const requestGeneration = draftRequestGenerationRef.current + 1;
-    draftRequestGenerationRef.current = requestGeneration;
-    const lifecycleGeneration = lifecycleGenerationRef.current;
-    const previousCreationRetry =
-      sessionCreationRetryRef.current ?? readSessionCreationOutbox();
-    if (previousCreationRetry && previousCreationRetry.content !== message) {
-      discardSessionCreationRetry(previousCreationRetry.creationId);
-    }
-    const creationRetry = previousCreationRetry?.content === message
-      ? previousCreationRetry
-      : { content: message, creationId: createLocalCreationId() };
-    rememberSessionCreationRetry(creationRetry);
-    let createdSessionId: string | null = null;
-    let optimisticUserMessage: ReturnType<typeof localUserMessage> | null = null;
-    const ownsDraftIntent = () => {
-      const state = datapilotStore.getState();
-      return (
-        mountedRef.current &&
-        draftRequestGenerationRef.current === requestGeneration &&
-        lifecycleGenerationRef.current === lifecycleGeneration &&
-        state.open &&
-        state.mode === "draft_new_session" &&
-        state.currentSessionId === null
-      );
-    };
-    const ownsCreatedSession = () => {
-      const state = datapilotStore.getState();
-      return Boolean(
-        createdSessionId &&
-          mountedRef.current &&
-          draftRequestGenerationRef.current === requestGeneration &&
-          lifecycleGenerationRef.current === lifecycleGeneration &&
-          state.open &&
-          state.mode === "active_session" &&
-          state.currentSessionId === createdSessionId &&
-          !deletedSessionIdsRef.current.has(createdSessionId),
-      );
-    };
     try {
-      const session = await createSession(message, creationRetry.creationId);
-      discardSessionCreationRetry(creationRetry.creationId);
-      if (!ownsDraftIntent()) {
-        return;
-      }
-      createdSessionId = session.id;
-      submission.sessionId = session.id;
-      submission.afterSequence = 0;
+      const session = await createSession(message);
       const store = datapilotStore.getState();
       store.setActiveSession(session);
-      optimisticUserMessage = localUserMessage(session.id, message);
-      rememberTurnRetry(session.id, {
-        content: message,
-        userMessage: optimisticUserMessage,
-        draftRevision: composerDraftRevisionRef.current,
-      });
-      datapilotStore.getState().appendUserMessage(optimisticUserMessage);
-      startEventStream(session.id, lifecycleGeneration);
-      const turnResult = normalizeSubmitTurnResult(await submitTurn(
-        session.id,
-        message,
-        optimisticUserMessage.id,
-      ));
-      submission.turnId = turnResult.turnId;
-      if (!ownsCreatedSession()) {
-        return;
-      }
-      discardTurnRetry(session.id, optimisticUserMessage.id);
-      submission.accepted = true;
-      if (turnResult.replayed && turnResult.terminal) {
-        releaseSubmitAdmission(submission);
-      }
-      if (
-        submission.replyStarted ||
-        (submission.turnId !== null &&
-          submission.terminalTurnIds.has(submission.turnId))
-      ) {
-        releaseSubmitAdmission(submission);
-      }
+      const userMessage = localUserMessage(session.id, message);
+      openEvents(session.id);
+      await submitTurn(session.id, message);
+      datapilotStore.getState().appendUserMessage(userMessage);
     } catch (error) {
-      if (!(createdSessionId ? ownsCreatedSession() : ownsDraftIntent())) {
-        return;
-      }
-      if (!createdSessionId && isAmbiguousTurnSubmissionError(error)) {
-        rememberSessionCreationRetry(creationRetry);
-        restoreUneditedSubmittedDraft(submission);
-        releaseSubmitAdmission(submission);
-        console.error("DataPilot session creation outcome is ambiguous", error);
-        return;
-      }
-      if (
-        createdSessionId &&
-        optimisticUserMessage &&
-        isAmbiguousTurnSubmissionError(error)
-      ) {
-        rememberTurnRetry(createdSessionId, {
-          content: message,
-          userMessage: optimisticUserMessage,
-          draftRevision: composerDraftRevisionRef.current,
-        });
-        restoreUneditedSubmittedDraft(submission);
-        releaseSubmitAdmission(submission);
-        console.error("DataPilot draft turn outcome is ambiguous", error);
-        return;
-      }
-      if (createdSessionId && optimisticUserMessage) {
-        discardTurnRetry(createdSessionId, optimisticUserMessage.id);
-        datapilotStore.getState().removeOptimisticUserMessage(
-          createdSessionId,
-          optimisticUserMessage.id,
-        );
-      }
-      if (!createdSessionId) {
-        discardSessionCreationRetry(creationRetry.creationId);
-      }
-      restoreUneditedSubmittedDraft(submission);
-      releaseSubmitAdmission(submission);
-      invalidateEventLifecycle();
+      closeSocket();
       datapilotStore.getState().enterDraft();
       console.error("Failed to submit DataPilot draft turn", error);
     }
@@ -886,149 +228,31 @@ export function DataPilotWindow() {
       return;
     }
 
-    const sessionId = currentSessionId;
-    const submission = acquireSubmitAdmission(message, sessionId);
-    if (!submission) {
-      return;
-    }
-    startEventStream(sessionId, lifecycleGenerationRef.current);
-    const state = datapilotStore.getState();
-    if (
-      !mountedRef.current ||
-      !state.open ||
-      state.mode !== "active_session" ||
-      state.currentSessionId !== sessionId ||
-      deletedSessionIdsRef.current.has(sessionId)
-    ) {
-      restoreUneditedSubmittedDraft(submission);
-      releaseSubmitAdmission(submission);
-      return;
-    }
-    const retry = ambiguousTurnRetriesRef.current.get(sessionId);
-    if (retry && retry.content !== message) {
-      discardTurnRetry(sessionId, retry.userMessage.id);
-    }
-    const retryMessage = retry?.content === message ? retry.userMessage : null;
-    const request: ActiveSubmitRequest = {
-      id: activeSubmitRequestIdRef.current + 1,
-      sessionId,
-      generation: lifecycleGenerationRef.current,
-      userMessage: retryMessage ?? localUserMessage(sessionId, message),
-      outcome: "pending",
-    };
-    rememberTurnRetry(sessionId, {
-      content: message,
-      userMessage: request.userMessage,
-      draftRevision: composerDraftRevisionRef.current,
-    });
-    activeSubmitRequestIdRef.current = request.id;
-    activeSubmitQueueRef.current.set(request.id, request);
-    if (
-      !datapilotStore.getState().conversation.messages.some(
-        (candidate) => candidate.id === request.userMessage.id,
-      )
-    ) {
-      datapilotStore.getState().appendUserMessage(request.userMessage);
-    }
     try {
-      const turnResult = normalizeSubmitTurnResult(
-        await submitTurn(sessionId, message, request.userMessage.id),
-      );
-      submission.turnId = turnResult.turnId;
-      submission.accepted = true;
-      if (ambiguousTurnRetriesRef.current.get(sessionId)?.userMessage.id === request.userMessage.id) {
-        discardTurnRetry(sessionId, request.userMessage.id);
-      }
-      const current = activeSubmitQueueRef.current.get(request.id);
-      if (current === request) {
-        request.outcome = "success";
-        flushActiveSubmitQueue();
-      }
-      if (
-        (turnResult.replayed && turnResult.terminal) ||
-        submission.replyStarted ||
-        (submission.turnId !== null &&
-          submission.terminalTurnIds.has(submission.turnId))
-      ) {
-        releaseSubmitAdmission(submission);
-      }
+      const userMessage = localUserMessage(currentSessionId, message);
+      openEvents(currentSessionId);
+      await submitTurn(currentSessionId, message);
+      datapilotStore.getState().appendUserMessage(userMessage);
     } catch (error) {
-      const owned = ownsActiveSubmitRequest(request);
-      const current = activeSubmitQueueRef.current.get(request.id);
-      if (isAmbiguousTurnSubmissionError(error)) {
-        if (current === request) {
-          request.outcome = "success";
-          flushActiveSubmitQueue();
-        }
-        if (owned) {
-          rememberTurnRetry(sessionId, {
-            content: message,
-            userMessage: request.userMessage,
-            draftRevision: composerDraftRevisionRef.current,
-          });
-          restoreUneditedSubmittedDraft(submission);
-          console.error("DataPilot active turn outcome is ambiguous", error);
-        }
-        releaseSubmitAdmission(submission);
-        return;
-      }
-      if (ambiguousTurnRetriesRef.current.get(sessionId)?.userMessage.id === request.userMessage.id) {
-        discardTurnRetry(sessionId, request.userMessage.id);
-      }
-      datapilotStore.getState().removeOptimisticUserMessage(
-        sessionId,
-        request.userMessage.id,
-      );
-      if (current === request) {
-        request.outcome = "failure";
-        request.error = error;
-        flushActiveSubmitQueue();
-      }
-      if (owned) {
-        restoreUneditedSubmittedDraft(submission);
-      }
-      releaseSubmitAdmission(submission);
+      console.error("Failed to submit DataPilot active turn", error);
     }
   };
 
   const handleInterrupt = async () => {
-    if (!currentSessionId || stopRequestPending || interrupting) {
+    if (!currentSessionId) {
       return;
     }
 
-    const sessionId = currentSessionId;
-    const token: StopRequestToken = {
-      id: stopRequestIdRef.current + 1,
-      sessionId,
-      generation: lifecycleGenerationRef.current,
-      executionCorrelation: currentExecutionCorrelation(conversation),
-    };
-    stopRequestIdRef.current = token.id;
-    activeStopRequestRef.current = token;
-    setStopRequestPending(true);
-    try {
-      const interrupted = await interruptTurn(sessionId);
-      if (activeStopRequestRef.current !== token) {
-        return;
-      }
-      const state = datapilotStore.getState();
-      if (
-        interrupted &&
-        lifecycleGenerationRef.current === token.generation &&
-        state.currentSessionId === token.sessionId &&
-        currentExecutionCorrelation(state.conversation) === token.executionCorrelation
-      ) {
-        state.markInterrupting();
-      }
-      activeStopRequestRef.current = null;
-      setStopRequestPending(false);
-    } catch (error) {
-      if (activeStopRequestRef.current !== token) {
-        return;
-      }
-      activeStopRequestRef.current = null;
-      setStopRequestPending(false);
-      console.error("Failed to interrupt DataPilot turn", error);
+    const interrupted = await interruptTurn(currentSessionId);
+    if (interrupted) {
+      datapilotStore.getState().applyEvent({
+        type: "interrupt_requested",
+        source: "main",
+        run_id: currentSessionId,
+        parent_run_id: null,
+        timestamp: new Date().toISOString(),
+        payload: {},
+      });
     }
   };
 
@@ -1097,7 +321,7 @@ export function DataPilotWindow() {
         return (
           humanDecisionRecoveryRequestRef.current === requestToken &&
           state.currentSessionId === sessionId &&
-          samePendingHumanDecision(state.conversation.pendingHumanDecision, decision)
+          samePendingHumanDecision(state.run.pendingHumanDecision, decision)
         );
       };
       setRecoveringHumanDecision(true);
@@ -1247,22 +471,14 @@ export function DataPilotWindow() {
         <SessionHistoryPanel
           sessions={sessions}
           onSelect={handleSelectHistory}
-          onDelete={handleDeleteHistory}
           onClose={() => setHistoryOpen(false)}
         />
       ) : null}
       {mode === "draft_new_session" ? (
-        <DraftNewSessionView
-          message={composerDraft}
-          running={running}
-          submitting={submitting}
-          onMessageChange={handleComposerDraftChange}
-          onSubmit={handleDraftSubmit}
-          onInterrupt={handleInterrupt}
-        />
+        <DraftNewSessionView running={running} onSubmit={handleDraftSubmit} onInterrupt={handleInterrupt} />
       ) : mode === "active_session" ? (
         <div className="flex min-h-0 flex-1 flex-col bg-console-panel">
-          <MessageList messages={conversation.messages} toolRuns={conversation.toolRuns} />
+          <MessageList messages={messages} run={run} />
           <HumanDecisionDialog
             key={`${currentSessionId ?? ""}:${pendingHumanDecision?.replyId ?? ""}:${pendingHumanDecision?.toolCallId ?? ""}`}
             decision={pendingHumanDecision}
@@ -1277,18 +493,17 @@ export function DataPilotWindow() {
             <div className="border-t border-console-line p-3 sm:p-4">
               <Composer
                 placeholder="继续描述任务…"
-                message={composerDraft}
                 running={running}
-                submitting={submitting}
-                interrupting={interrupting || stopRequestPending}
-                onMessageChange={handleComposerDraftChange}
+                interrupting={interrupting}
                 onSubmit={handleActiveSubmit}
                 onInterrupt={handleInterrupt}
               />
             </div>
           )}
         </div>
-      ) : null}
+      ) : (
+        <MessageList messages={messages} run={run} />
+      )}
     </section>
   );
 }
@@ -1351,10 +566,6 @@ function localUserMessage(sessionId: string, content: string) {
   };
 }
 
-function currentExecutionCorrelation(conversation: AgentConversationState): string | null {
-  return conversation.currentReplyId;
-}
-
 function createLocalId(): string {
   const suffix =
     typeof crypto !== "undefined" && "randomUUID" in crypto
@@ -1363,18 +574,6 @@ function createLocalId(): string {
   return `local-${suffix}`;
 }
 
-function createLocalCreationId(): string {
-  const suffix =
-    typeof crypto !== "undefined" && "randomUUID" in crypto
-      ? crypto.randomUUID()
-      : `${Date.now()}-${Math.random().toString(16).slice(2)}`;
-  return `local-create-${suffix}`;
-}
-
-function normalizeSubmitTurnResult(
-  result: string | { turnId: string; replayed: boolean; terminal: boolean },
-): { turnId: string; replayed: boolean; terminal: boolean } {
-  return typeof result === "string"
-    ? { turnId: result, replayed: false, terminal: false }
-    : result;
+function isActiveSocket(socket: WebSocket): boolean {
+  return socket.readyState === WebSocket.CONNECTING || socket.readyState === WebSocket.OPEN;
 }

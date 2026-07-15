@@ -4,26 +4,16 @@ import asyncio
 import inspect
 import json
 import sqlite3
-import time
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path
-from threading import Barrier, Event
+from threading import Barrier
 from types import SimpleNamespace
 
 import pytest
-from agentscope.app.middleware import ToolOffloadMiddleware
-from agentscope.app.message_bus import MessageBusKeys
-from agentscope.message import ToolCallBlock
-from agentscope.tool import Toolkit
 
 import vla_data_juicer_agents.navigation.plan_execution as plan_execution
-import vla_data_juicer_agents.navigation.plan_models as plan_models
-from vla_data_juicer_agents.core.cancellation import (
-    CancellationContext,
-    TurnCancelled,
-    bind_cancellation,
-)
+from vla_data_juicer_agents.core.cancellation import CancellationContext, TurnCancelled
 from vla_data_juicer_agents.navigation.config import NavigationSettings
 from vla_data_juicer_agents.navigation.evidence_store import FileNavigationEvidenceStore
 from vla_data_juicer_agents.navigation.models import ToolResult
@@ -48,13 +38,9 @@ from vla_data_juicer_agents.navigation.plan_store import (
 from vla_data_juicer_agents.navigation.task_state import NavigationTask
 from vla_data_juicer_agents.navigation.task_store import SqliteNavigationTaskStore
 from vla_data_juicer_agents.runtime.agentscope_runtime import (
-    AgentScopeRuntime,
+    _enrich_plan_human_decision_event,
     _human_decision_payload_from_tool_call,
 )
-from vla_data_juicer_agents.runtime.datapilot_projection import (
-    DataPilotToolOutcomeMiddleware,
-)
-from vla_data_juicer_agents.web.session_store import WebSessionStore
 
 
 def _decode_tool_payload(payload):
@@ -85,21 +71,6 @@ def call_tool(tool, **arguments):
         return _decode_tool_payload(payload)
 
     return asyncio.run(_call())
-
-
-def stored_step_result_ref(
-    plan_store: SqliteNavigationPlanRepository,
-    plan_id: str,
-    step_id: str,
-) -> str:
-    with sqlite3.connect(plan_store.db_path) as connection:
-        row = connection.execute(
-            """SELECT result_ref FROM navigation_task_steps
-               WHERE plan_id = ? AND step_id = ?""",
-            (plan_id, step_id),
-        ).fetchone()
-    assert row is not None and isinstance(row[0], str)
-    return row[0]
 
 
 def ok_result(tool_name: str, *, blob: str = "") -> ToolResult:
@@ -392,9 +363,6 @@ def test_extract_wrapper_loads_canonical_topics_from_plan(monkeypatch, tmp_path)
     )
 
     assert result["ok"] is True
-    assert result["side_effect_state"] == "completed"
-    assert result["result_available"] is True
-    assert "result_ref" not in json.dumps(result)
     assert captured == {
         "date": services.task.date,
         "segments": services.task.segments,
@@ -419,329 +387,6 @@ def test_plan_bound_tools_expose_only_ids_and_all_remaining_distinct_actions(tmp
         assert set(tool.input_schema["properties"]) == {"plan_id", "step_id"}
         assert set(tool.input_schema["required"]) == {"plan_id", "step_id"}
         assert tool.input_schema["additionalProperties"] is False
-
-
-@pytest.mark.asyncio
-async def test_plan_bound_processing_tool_yields_to_offload_timeout_and_event_loop(
-    monkeypatch,
-    tmp_path,
-):
-    """Exercise the production-created FunctionTool, not an async fake tool."""
-    services = build_services(tmp_path)
-
-    def blocking_extract(**_kwargs):
-        time.sleep(0.08)
-        return ok_result("extract_and_sync_navigation_data")
-
-    monkeypatch.setattr(
-        plan_execution,
-        "extract_and_sync_navigation_data",
-        blocking_extract,
-    )
-    tool = services.tools()["extract_and_sync_navigation_data_tool"]
-    registered = asyncio.Event()
-    heartbeat = asyncio.Event()
-
-    class BackgroundManager:
-        async def register_task(self, **_kwargs):
-            registered.set()
-            return "background-plan-tool"
-
-    class MessageBus:
-        async def queue_push(self, *_args, **_kwargs):
-            return "entry"
-
-        async def publish(self, *_args, **_kwargs):
-            return None
-
-    agent = SimpleNamespace(
-        name="NavigationDataAgent",
-        state=SimpleNamespace(session_id=services.task.agentscope_session_id),
-        toolkit=Toolkit(tools=[tool]),
-    )
-    middleware = ToolOffloadMiddleware(
-        bg_manager=BackgroundManager(),
-        message_bus=MessageBus(),
-        user_id="test-user",
-        agent_id="navigation-agent",
-        timeout_secs=0.01,
-    )
-    tool_call = ToolCallBlock(
-        id="call-plan-sync",
-        name=tool.name,
-        input=json.dumps(
-            {"plan_id": services.plan.plan_id, "step_id": "sync"}
-        ),
-    )
-
-    async def next_handler(**_kwargs):
-        result = await tool(
-            plan_id=services.plan.plan_id,
-            step_id="sync",
-        )
-        if hasattr(result, "__aiter__"):
-            async for item in result:
-                yield item
-        else:
-            yield result
-
-    async def pulse():
-        await asyncio.sleep(0.02)
-        heartbeat.set()
-
-    pulse_task = asyncio.create_task(pulse())
-    started = asyncio.get_running_loop().time()
-    stream = middleware.on_acting(
-        agent,
-        {"tool_call": tool_call},
-        next_handler,
-    )
-    await anext(stream)
-    elapsed = asyncio.get_running_loop().time() - started
-
-    assert elapsed < 0.06
-    assert registered.is_set()
-    await pulse_task
-    assert heartbeat.is_set()
-    assert asyncio.get_running_loop().time() - started < 0.06
-    await stream.aclose()
-
-
-@pytest.mark.asyncio
-async def test_plan_bound_worker_observes_shared_cancellation_after_async_wrapper_cancel(
-    monkeypatch,
-    tmp_path,
-):
-    services = build_services(tmp_path)
-    cancellation = CancellationContext()
-    worker_started = Event()
-    worker_stopped = Event()
-
-    def cancellable_extract(**_kwargs):
-        worker_started.set()
-        try:
-            while True:
-                active = plan_execution.current_cancellation()
-                assert active is cancellation
-                active.raise_if_cancelled()
-                time.sleep(0.005)
-        finally:
-            worker_stopped.set()
-
-    monkeypatch.setattr(
-        plan_execution,
-        "extract_and_sync_navigation_data",
-        cancellable_extract,
-    )
-    tool = services.tools(cancellation=cancellation)[
-        "extract_and_sync_navigation_data_tool"
-    ]
-
-    async def invoke():
-        async with cancellation.track_agent("as-test"):
-            await tool(plan_id=services.plan.plan_id, step_id="sync")
-
-    task = asyncio.create_task(invoke())
-    assert await asyncio.to_thread(worker_started.wait, 1)
-    started = asyncio.get_running_loop().time()
-    assert cancellation.cancel() is True
-    with pytest.raises(asyncio.CancelledError):
-        await task
-    assert await asyncio.to_thread(worker_stopped.wait, 1)
-    assert asyncio.get_running_loop().time() - started < 0.5
-
-    snapshot = None
-    for _ in range(100):
-        snapshot = services.plan_store.read_execution_snapshot(
-            web_session_id=services.task.created_by_web_session_id,
-            agentscope_session_id=services.task.agentscope_session_id,
-            task_id=services.task.task_id,
-        )
-        if snapshot is not None and snapshot.overview.steps[0].status != "running":
-            break
-        await asyncio.sleep(0.005)
-    assert snapshot is not None
-    assert snapshot.overview.steps[0].status == "failed"
-
-
-@pytest.mark.asyncio
-async def test_queued_plan_worker_releases_quiescence_after_outer_task_cancel(
-    monkeypatch,
-    tmp_path,
-):
-    services = build_services(tmp_path)
-    cancellation = CancellationContext()
-    blocker_started = Event()
-    release_blocker = Event()
-    queued_worker_started = Event()
-    loop = asyncio.get_running_loop()
-    executor = ThreadPoolExecutor(max_workers=1)
-    loop.set_default_executor(executor)
-
-    def occupy_only_thread() -> None:
-        blocker_started.set()
-        release_blocker.wait()
-
-    def queued_invoke(**_kwargs):
-        queued_worker_started.set()
-        return {"status": "completed"}
-
-    blocker = loop.run_in_executor(None, occupy_only_thread)
-    while not blocker_started.is_set():
-        await asyncio.sleep(0)
-    monkeypatch.setattr(plan_execution, "_invoke_plan_step", queued_invoke)
-    tool = services.tools(cancellation=cancellation)[
-        "extract_and_sync_navigation_data_tool"
-    ]
-
-    async def invoke() -> None:
-        async with cancellation.track_agent("queued-agent"):
-            await tool(plan_id=services.plan.plan_id, step_id="sync")
-
-    task = asyncio.create_task(invoke())
-    await asyncio.sleep(0)
-    await asyncio.sleep(0)
-    cancellation.cancel()
-    with pytest.raises(asyncio.CancelledError):
-        await task
-
-    assert queued_worker_started.is_set() is False
-    assert await cancellation.wait_for_workers(timeout=0.01) is False
-    release_blocker.set()
-    await blocker
-    assert await cancellation.wait_for_workers(timeout=1) is True
-    executor.shutdown(wait=True)
-
-
-@pytest.mark.asyncio
-async def test_production_offloaded_worker_keeps_cancellation_lease_after_reply_cleanup(
-    monkeypatch,
-    tmp_path,
-):
-    services = build_services(tmp_path)
-    worker_started = Event()
-    worker_stopped = Event()
-
-    def cancellable_extract(**_kwargs):
-        worker_started.set()
-        try:
-            while True:
-                active = plan_execution.current_cancellation()
-                assert active is not None
-                active.raise_if_cancelled()
-                time.sleep(0.005)
-        finally:
-            worker_stopped.set()
-
-    monkeypatch.setattr(
-        plan_execution,
-        "extract_and_sync_navigation_data",
-        cancellable_extract,
-    )
-
-    class BackgroundManager:
-        task: asyncio.Task | None = None
-
-        async def register_task(self, *, asyncio_task, **_kwargs):
-            self.task = asyncio_task
-            return "background-plan-tool"
-
-    class MessageBus:
-        def __init__(self, manager):
-            self.manager = manager
-
-        async def registry_getall(self, _key):
-            return {"background-plan-tool": "registered"}
-
-        async def publish(self, key, payload):
-            if key == MessageBusKeys.task_cancel_channel() and (
-                payload.get("task_id") == "background-plan-tool"
-                and self.manager.task is not None
-            ):
-                self.manager.task.cancel()
-
-        async def queue_push(self, *_args, **_kwargs):
-            return "entry"
-
-    class ChatService:
-        async def interrupt(self, *_args):
-            return None
-
-    manager = BackgroundManager()
-    message_bus = MessageBus(manager)
-    config = SimpleNamespace(
-        user_id="alice",
-        main_router_agent_id="main-router-agent",
-        navigation_agent_id="navigation-data-agent",
-    )
-    runtime = AgentScopeRuntime(
-        config=config,
-        storage=None,
-        message_bus=message_bus,
-        workspace_manager=None,
-        app=SimpleNamespace(state=SimpleNamespace(chat_service=ChatService())),
-        bootstrapped=True,
-    )
-    store = WebSessionStore(tmp_path / "web.sqlite")
-    public_session = store.create_session("production cancellation lease")
-    internal_session_id = services.task.agentscope_session_id
-    store.save_agentscope_session_mapping(
-        public_session.id,
-        agent_id=config.navigation_agent_id,
-        agentscope_session_id=internal_session_id,
-    )
-    runtime.set_web_session_store(store)
-    cancellation = CancellationContext()
-    runtime.register_run_cancellation(internal_session_id, cancellation)
-    tool = services.tools(cancellation=cancellation)[
-        "extract_and_sync_navigation_data_tool"
-    ]
-    agent = SimpleNamespace(
-        name="NavigationDataAgent",
-        state=SimpleNamespace(session_id=internal_session_id),
-        toolkit=Toolkit(tools=[tool]),
-    )
-    tool_call = ToolCallBlock(
-        id="call-plan-sync",
-        name=tool.name,
-        input=json.dumps({"plan_id": services.plan.plan_id, "step_id": "sync"}),
-    )
-    offload = ToolOffloadMiddleware(
-        bg_manager=manager,
-        message_bus=message_bus,
-        user_id="alice",
-        agent_id=config.navigation_agent_id,
-        timeout_secs=0.01,
-    )
-    outcome = DataPilotToolOutcomeMiddleware(internal_session_id, runtime)
-
-    async def invoke_tool(**_kwargs):
-        yield await tool(plan_id=services.plan.plan_id, step_id="sync")
-
-    async def outcome_chain(**kwargs):
-        async for item in outcome.on_acting(agent, kwargs, invoke_tool):
-            yield item
-
-    try:
-        with bind_cancellation(cancellation):
-            stream = offload.on_acting(
-                agent,
-                {"tool_call": tool_call},
-                outcome_chain,
-            )
-            await anext(stream)
-        assert await asyncio.to_thread(worker_started.wait, 1)
-
-        runtime.clear_run_cancellation(internal_session_id, cancellation)
-        await runtime.interrupt_web_session(web_session_id=public_session.id)
-
-        assert await asyncio.to_thread(worker_stopped.wait, 0.5)
-        assert cancellation.cancelled is True
-    finally:
-        cancellation.cancel()
-        await asyncio.to_thread(worker_stopped.wait, 1)
-        if manager.task is not None:
-            await asyncio.gather(manager.task, return_exceptions=True)
 
 
 @pytest.mark.parametrize(
@@ -819,40 +464,6 @@ def test_execution_gate_rejects_unmet_dependency_without_invoking(monkeypatch, t
     assert invoked == []
 
 
-def test_post_claim_argument_failure_is_not_misclassified_as_invoked(
-    monkeypatch,
-    tmp_path,
-):
-    services = build_services(tmp_path)
-    invoked = []
-    monkeypatch.setattr(
-        plan_execution,
-        "verify_plan_step_preconditions",
-        lambda **_kwargs: None,
-    )
-    monkeypatch.setattr(
-        plan_execution,
-        "resolve_step_arguments",
-        lambda **_kwargs: (_ for _ in ()).throw(ValueError("argument resolution failed")),
-    )
-    monkeypatch.setattr(
-        plan_execution,
-        "extract_and_sync_navigation_data",
-        lambda **kwargs: invoked.append(kwargs) or ok_result("extract_and_sync_navigation_data"),
-    )
-
-    result = call_tool(
-        services.tools()["extract_and_sync_navigation_data_tool"],
-        plan_id=services.plan.plan_id,
-        step_id="sync",
-    )
-
-    assert result["status"] == "failed"
-    assert result["error_type"] == "processing_exception"
-    assert result["side_effect_state"] == "not_started"
-    assert invoked == []
-
-
 def test_changed_input_precondition_records_evidence_without_artifact_reconciliation(
     monkeypatch,
     tmp_path,
@@ -879,23 +490,12 @@ def test_changed_input_precondition_records_evidence_without_artifact_reconcilia
     assert result["ok"] is False
     assert result["error_type"] == "input_precondition_changed"
     assert result["next_action"] == "submit_complete_plan"
-    assert result["result_available"] is True
-    assert "result_ref" not in json.dumps(result)
+    assert result["result_ref"]
     assert len(json.dumps(result, ensure_ascii=False)) <= 4000
     assert invoked == []
     assert services.plan_store.get(services.plan.plan_id).status == "invalidated"
     assert services.plan_store.get_current_step(services.plan.plan_id)["step"]["status"] == "needs_replan"
-    snapshot = services.plan_store.read_execution_snapshot(
-        web_session_id=services.task.created_by_web_session_id,
-        agentscope_session_id=services.task.agentscope_session_id,
-        task_id=services.task.task_id,
-    )
-    assert snapshot is not None
-    assert snapshot.activity == "failed_recovery"
-    assert snapshot.current["step"]["result_summary"]["side_effect_state"] == "not_started"
-    internal_ref = snapshot.current["step"]["result_ref"]
-    assert isinstance(internal_ref, str)
-    evidence = services.evidence_store.read(services.task.task_id, internal_ref)
+    evidence = services.evidence_store.read(services.task.task_id, result["result_ref"])
     assert evidence["data"]["missing_inputs"]
 
 
@@ -1022,14 +622,11 @@ def test_gridmap_step_rejects_drift_in_exact_observed_inputs(
 
     assert result["ok"] is False
     assert result["error_type"] == "input_precondition_changed"
-    assert result["result_available"] is True
-    assert "result_ref" not in json.dumps(result)
+    assert result["result_ref"]
     assert invoked == []
     assert plan_store.get(plan.plan_id).status == "invalidated"
     assert plan_store.get_current_step(plan.plan_id)["step"]["status"] == "needs_replan"
-    internal_ref = plan_store.get_current_step(plan.plan_id)["step"]["result_ref"]
-    assert isinstance(internal_ref, str)
-    evidence = evidence_store.read(task.task_id, internal_ref)
+    evidence = evidence_store.read(task.task_id, result["result_ref"])
     expected_missing = gridmap_dir if removed_input == "gridmap_json" else removed
     assert str(expected_missing) in evidence["data"]["missing_inputs"]
 
@@ -1336,8 +933,7 @@ def test_waiting_human_decision_retry_enters_audited_recovery_when_input_drifts(
     assert retry_permission.behavior.value == "deny"
     assert denied is not None
     assert denied["error_type"] == "input_precondition_changed"
-    assert denied["result_available"] is True
-    assert "result_ref" not in json.dumps(denied)
+    assert denied["result_ref"]
     assert denied["recovery_required"] is True
     handoff = plan_store.get_human_decision_handoff(plan.plan_id, "confirm")
     assert handoff is not None
@@ -1351,13 +947,8 @@ def test_waiting_human_decision_retry_enters_audited_recovery_when_input_drifts(
     }
     assert plan_store.get(plan.plan_id).status == "active"
     assert plan_store.get_current_step(plan.plan_id)["step"]["status"] == "waiting_user"
-    evidence_files = list((evidence_store.root / task.task_id).rglob("*.json"))
-    matching_payloads = [
-        json.loads(path.read_text(encoding="utf-8"))
-        for path in evidence_files
-        if "missing_inputs" in json.loads(path.read_text(encoding="utf-8"))
-    ]
-    assert any(str(source_path) in payload["missing_inputs"] for payload in matching_payloads)
+    evidence = evidence_store.read(task.task_id, denied["result_ref"])
+    assert str(source_path) in evidence["data"]["missing_inputs"]
 
     recovered = plan_store.quarantine_human_decision_handoff(
         plan.plan_id,
@@ -2603,7 +2194,7 @@ def test_underlying_exception_stages_failure_and_retry_only_finalizes(
     assert first["error_type"] == "result_finalize_retry_required"
     assert second["ok"] is False
     assert second["error_type"] == "processing_exception"
-    assert second["next_action"] == "manual_recovery"
+    assert second["next_action"] == "submit_complete_plan"
     assert len(invoked) == 1
 
 
@@ -2631,11 +2222,8 @@ def test_processing_result_recursively_redacts_secrets_before_outbox_and_evidenc
         plan_id=services.plan.plan_id,
         step_id="sync",
     )
-    assert result["result_available"] is True
-    assert "result_ref" not in json.dumps(result)
     payload = services.evidence_store.read(
-        services.task.task_id,
-        stored_step_result_ref(services.plan_store, services.plan.plan_id, "sync"),
+        services.task.task_id, result["result_ref"]
     )["data"]
 
     assert payload["details"] == {
@@ -2665,8 +2253,6 @@ def test_oversized_processing_result_is_bounded_and_moves_to_needs_replan(
 
     assert result["error_type"] == "processing_result_oversized"
     assert result["status"] == "needs_replan"
-    assert result["result_available"] is True
-    assert "result_ref" not in json.dumps(result)
     assert len(json.dumps(result)) <= 4000
     assert services.plan_store.get(services.plan.plan_id).status == "invalidated"
     assert services.plan_store.get_current_step(services.plan.plan_id)["step"]["status"] == "needs_replan"
@@ -2696,7 +2282,7 @@ def test_running_step_without_staged_result_transitions_to_needs_replan(
     result = call_tool(tool, plan_id=services.plan.plan_id, step_id="sync")
 
     assert result["error_type"] == "step_recovery_requires_replan"
-    assert result["next_action"] == "manual_recovery"
+    assert result["next_action"] == "submit_complete_plan"
     assert invoked == []
     assert services.plan_store.get(services.plan.plan_id).status == "invalidated"
     assert services.plan_store.get_current_step(services.plan.plan_id)["step"]["status"] == "needs_replan"
@@ -2720,15 +2306,11 @@ def test_failed_step_is_recorded_exactly_once_and_duplicate_does_not_reinvoke(
     second = call_tool(tool, plan_id=services.plan.plan_id, step_id="sync")
 
     assert first["ok"] is False
-    assert first["result_available"] is True
-    assert "result_ref" not in json.dumps(first)
-    assert first["next_action"] == "manual_recovery"
+    assert first["next_action"] == "submit_complete_plan"
     assert second["error_type"] == "step_already_terminal"
-    assert second["next_action"] == "manual_recovery"
+    assert second["next_action"] == "submit_complete_plan"
     assert len(invoked) == 1
-    current = services.plan_store.get_current_step(services.plan.plan_id)["step"]
-    assert current["status"] == "failed"
-    assert current["result_summary"]["side_effect_state"] == "partial_or_unknown"
+    assert services.plan_store.get_current_step(services.plan.plan_id)["step"]["status"] == "failed"
 
 
 def test_failed_step_does_not_infer_artifact_state_and_exposes_no_fresh_execution_tools(
@@ -2768,7 +2350,6 @@ def test_failed_step_does_not_infer_artifact_state_and_exposes_no_fresh_executio
         )
     }
     assert result["status"] == "failed"
-    assert result["side_effect_state"] == "partial_or_unknown"
     assert stored.accepted_plan_phase == "extract_sync"
     assert stored.status.value == "failed"
     assert fresh == {}
@@ -2962,19 +2543,8 @@ def test_cancelled_result_finalize_failure_is_recoverable_without_reinvoking(
 
     assert recovered["status"] == "failed"
     assert recovered["error_type"] == "turn_cancelled"
-    assert recovered["side_effect_state"] == "partial_or_unknown"
-    assert recovered["result_available"] is True
-    assert "result_ref" not in json.dumps(recovered)
-    assert recovered["next_action"] == "manual_recovery"
+    assert recovered["next_action"] == "submit_complete_plan"
     assert len(invoked) == 1
-
-
-def test_side_effect_state_literal_has_only_conservative_states():
-    assert set(plan_models.SideEffectState.__args__) == {
-        "not_started",
-        "completed",
-        "partial_or_unknown",
-    }
 
 
 def test_resolve_finish_arguments_are_derived_from_task_decisions_and_settings(tmp_path):
@@ -3205,6 +2775,21 @@ def test_plan_bound_human_decision_waits_and_transitions_ledger_exactly_once(
         ),
         plan_store=plan_store,
     )
+    live_event = _enrich_plan_human_decision_event(
+        {
+            "type": "human_decision_required",
+            "payload": {
+                "reply_id": "reply-1",
+                "tool_call_id": "call-1",
+                "plan_id": plan.plan_id,
+                "step_id": "confirm",
+                "decision_type": "other",
+                "request_id": "",
+                "summary": "",
+            },
+        },
+        plan_store=plan_store,
+    )
     first = plan_execution.submit_plan_human_decision(
         plan_store=plan_store,
         evidence_store=evidence_store,
@@ -3234,6 +2819,11 @@ def test_plan_bound_human_decision_waits_and_transitions_ledger_exactly_once(
         ),
         "plan_id": plan.plan_id,
         "step_id": "confirm",
+    }
+    assert live_event["payload"] == {
+        **metadata,
+        "reply_id": "reply-1",
+        "tool_call_id": "call-1",
     }
     assert first is True
     assert duplicate is True

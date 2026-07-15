@@ -1131,9 +1131,7 @@ async def test_failed_ledger_step_has_no_executable_wrapper_after_restart(
     assert fresh_start == 2
     fresh_names = schema_names(model.invocations[fresh_start].tools)
     assert "prepare_raw_data_tool" not in fresh_names
-    assert "submit_extract_sync_plan_tool" not in fresh_names
-    assert "submit_finish_processing_plan_tool" not in fresh_names
-    assert "read_navigation_step_result_tool" in fresh_names
+    assert "submit_extract_sync_plan_tool" in fresh_names
     assert processing_spy.calls == [("prepare_raw_data", 1)]
     current = services.plan_store.get_current_step(plan.plan_id)
     assert current["step"]["status"] == "failed"
