@@ -300,6 +300,16 @@ def test_navigation_guidance_excludes_operator_acceptance_runbook():
         assert topic in acceptance
 
 
+def test_navigation_guidance_recommends_default_calibration_but_requires_confirmation():
+    guidance = GUIDANCE_PATH.read_text(encoding="utf-8")
+
+    assert "`NoobScenes/params/20260529_go2w/sensors`" in guidance
+    assert "recommend" in guidance
+    assert "`requires_user_confirmation` true" in guidance
+    assert "Never choose a calibration profile merely because" in guidance
+    assert "do not silently substitute another profile" in guidance
+
+
 def test_server_acceptance_requires_safe_execution_mode_and_attended_gui_boundary():
     acceptance = SERVER_ACCEPTANCE_PATH.read_text(encoding="utf-8")
 
