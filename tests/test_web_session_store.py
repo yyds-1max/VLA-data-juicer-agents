@@ -1,4 +1,5 @@
 from concurrent.futures import ThreadPoolExecutor
+from datetime import UTC, datetime, timedelta
 from hashlib import sha256
 from pathlib import Path
 import sqlite3
@@ -422,6 +423,141 @@ def test_pending_stop_is_durable_retryable_and_blocks_generation_and_tool_outcom
     detail = restarted.get_session(session.id)
     assert detail is not None
     assert detail.tool_runs[0].status == "running"
+
+
+def test_run_admission_ticket_and_delete_fence_are_mutually_exclusive(
+    tmp_path: Path,
+) -> None:
+    first = WebSessionStore(tmp_path / "admission-delete.sqlite")
+    session = first.create_session("admission/delete exclusion")
+    second = WebSessionStore(first.db_path)
+
+    ticket, baseline = first.claim_session_run_admission(session.id)
+    assert baseline == (0, None)
+    second.begin_session_deletion(session.id)
+    assert second.session_run_admission_is_pending(session.id) is True
+    with pytest.raises(RuntimeError, match="session deletion is pending"):
+        second.claim_session_run_admission(session.id)
+
+    first.release_session_run_admission(session.id, ticket)
+    assert second.session_run_admission_is_pending(session.id) is False
+    with pytest.raises(RuntimeError, match="session deletion is pending"):
+        first.claim_session_run_admission(session.id)
+
+
+def test_restart_delete_reaps_only_expired_run_admission_lease(
+    tmp_path: Path,
+) -> None:
+    first = WebSessionStore(tmp_path / "expired-admission.sqlite")
+    session = first.create_session("expired admission")
+    ticket, _baseline = first.claim_session_run_admission(
+        session.id,
+        runtime_id="crashed-runtime",
+        ttl_seconds=5.0,
+        now=100.0,
+    )
+    restarted = WebSessionStore(first.db_path)
+    restarted.begin_session_deletion(session.id)
+
+    assert restarted.reap_expired_session_run_admissions(
+        session.id,
+        now=104.9,
+    ) == 0
+    assert restarted.session_run_admission_is_pending(session.id) is True
+    assert restarted.reap_expired_session_run_admissions(
+        session.id,
+        now=105.0,
+    ) == 1
+    assert restarted.session_run_admission_is_pending(session.id) is False
+    assert ticket.startswith("admission_")
+
+
+def test_live_run_admission_renewal_prevents_delete_reap(
+    tmp_path: Path,
+) -> None:
+    submitter = WebSessionStore(tmp_path / "live-admission.sqlite")
+    session = submitter.create_session("live admission")
+    ticket, _baseline = submitter.claim_session_run_admission(
+        session.id,
+        runtime_id="live-runtime",
+        ttl_seconds=5.0,
+        now=100.0,
+    )
+    deleter = WebSessionStore(submitter.db_path)
+    deleter.begin_session_deletion(session.id)
+
+    submitter.renew_session_run_admission(
+        session.id,
+        ticket,
+        runtime_id="live-runtime",
+        ttl_seconds=5.0,
+        now=104.0,
+    )
+    assert deleter.reap_expired_session_run_admissions(
+        session.id,
+        now=106.0,
+    ) == 0
+    assert deleter.session_run_admission_is_pending(session.id) is True
+
+    submitter.release_session_run_admission(session.id, ticket)
+    assert deleter.session_run_admission_is_pending(session.id) is False
+
+
+def test_restarted_store_reaps_expired_admission_ticket_before_deletion(
+    tmp_path: Path,
+) -> None:
+    db_path = tmp_path / "expired-admission.sqlite"
+    crashed = WebSessionStore(db_path)
+    session = crashed.create_session("expired admission")
+    claimed_at = datetime(2026, 7, 15, tzinfo=UTC)
+
+    crashed.claim_session_run_admission(
+        session.id,
+        runtime_id="runtime-that-crashed",
+        ttl_seconds=0.05,
+        now=claimed_at,
+    )
+
+    restarted = WebSessionStore(db_path)
+    restarted.reap_expired_session_run_admissions(
+        session.id,
+        now=claimed_at + timedelta(milliseconds=51),
+    )
+    restarted.begin_session_deletion(session.id)
+
+    assert restarted.session_run_admission_is_pending(session.id) is False
+    assert restarted.session_deletion_is_pending(session.id) is True
+
+
+def test_renewed_admission_ticket_is_not_reaped_at_its_original_expiry(
+    tmp_path: Path,
+) -> None:
+    db_path = tmp_path / "renewed-admission.sqlite"
+    owner = WebSessionStore(db_path)
+    session = owner.create_session("renewed admission")
+    claimed_at = datetime(2026, 7, 15, tzinfo=UTC)
+    ticket, _baseline = owner.claim_session_run_admission(
+        session.id,
+        runtime_id="live-runtime",
+        ttl_seconds=0.05,
+        now=claimed_at,
+    )
+    owner.renew_session_run_admission(
+        session.id,
+        ticket,
+        ttl_seconds=0.05,
+        now=claimed_at + timedelta(milliseconds=40),
+    )
+
+    deleter = WebSessionStore(db_path)
+    deleter.reap_expired_session_run_admissions(
+        session.id,
+        now=claimed_at + timedelta(milliseconds=60),
+    )
+
+    assert deleter.session_run_admission_is_pending(session.id) is True
+    owner.release_session_run_admission(session.id, ticket)
+    assert deleter.session_run_admission_is_pending(session.id) is False
 
 
 def test_complete_stop_request_atomically_stops_tools_and_is_idempotent(tmp_path: Path) -> None:

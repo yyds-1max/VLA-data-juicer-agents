@@ -247,6 +247,13 @@ class DataPilotRunBoundaryMiddleware(MiddlewareBase):
                 # here therefore means both local spawn and distributed run
                 # admission succeeded; idle wakeups never clear the stop fence.
                 admit_generation(self._session_id, cancellation)
+                complete_admission = getattr(
+                    self._sink,
+                    "complete_user_execution_admission",
+                    None,
+                )
+                if callable(complete_admission):
+                    await complete_admission(self._session_id, cancellation)
             async with cancellation.track_agent(self._session_id):
                 with bind_cancellation(cancellation):
                     async for item in next_handler(**input_kwargs):

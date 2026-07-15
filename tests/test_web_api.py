@@ -1071,10 +1071,22 @@ def test_agentscope_delete_retry_accepts_already_absent_earlier_mapping(tmp_path
         agentscope_session_id="worker-session",
     )
 
+    generation_before_delete = runtime.web_session_store.current_execution_generation(
+        session_id
+    )
     first = client.delete(f"/api/sessions/{session_id}")
-    second = client.delete(f"/api/sessions/{session_id}")
+    runtime.bootstrapped = True
+    submit_while_partially_deleted = client.post(
+        f"/api/sessions/{session_id}/turns",
+        json={"message": "must remain fenced"},
+    )
 
     assert first.status_code == 409
+    assert submit_while_partially_deleted.status_code == 409
+    assert runtime.web_session_store.current_execution_generation(session_id) == (
+        generation_before_delete
+    )
+    second = client.delete(f"/api/sessions/{session_id}")
     assert second.status_code == 204
     assert runtime.web_session_store.get_session(session_id) is None
     assert service.calls == [

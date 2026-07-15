@@ -282,9 +282,11 @@ export function DataPilotWindow() {
       if (!owned) {
         continue;
       }
-      if (request.outcome === "success") {
-        datapilotStore.getState().appendUserMessage(request.userMessage);
-      } else {
+      if (request.outcome === "failure") {
+        datapilotStore.getState().removeOptimisticUserMessage(
+          request.sessionId,
+          request.userMessage.id,
+        );
         console.error("Failed to submit DataPilot active turn", request.error);
       }
     }
@@ -726,6 +728,7 @@ export function DataPilotWindow() {
     };
     activeSubmitRequestIdRef.current = request.id;
     activeSubmitQueueRef.current.set(request.id, request);
+    datapilotStore.getState().appendUserMessage(request.userMessage);
     try {
       submission.turnId = await submitTurn(sessionId, message);
       submission.accepted = true;
@@ -742,13 +745,16 @@ export function DataPilotWindow() {
         releaseSubmitAdmission(submission);
       }
     } catch (error) {
+      const owned = ownsActiveSubmitRequest(request);
       const current = activeSubmitQueueRef.current.get(request.id);
       if (current === request) {
         request.outcome = "failure";
         request.error = error;
         flushActiveSubmitQueue();
       }
-      restoreUneditedSubmittedDraft(submission);
+      if (owned) {
+        restoreUneditedSubmittedDraft(submission);
+      }
       releaseSubmitAdmission(submission);
     }
   };

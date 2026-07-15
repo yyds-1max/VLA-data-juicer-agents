@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import re
 import sqlite3
+import time
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
@@ -22,6 +23,8 @@ from vla_data_juicer_agents.web.schemas import (
 
 WEB_SCHEMA_GENERATION = "agentscope-native-events-v1"
 WEB_CONTROL_TABLES = (
+    "session_run_admissions",
+    "session_deletions",
     "session_stop_requests",
     "tool_execution_provenance",
     "session_execution_boundaries",
@@ -200,6 +203,28 @@ class WebSessionStore:
                 created_at TEXT NOT NULL,
                 updated_at TEXT NOT NULL,
                 PRIMARY KEY (session_id, generation),
+                FOREIGN KEY (session_id) REFERENCES sessions(id)
+            )
+            """
+        )
+        connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS session_deletions (
+                session_id TEXT PRIMARY KEY,
+                started_at TEXT NOT NULL,
+                FOREIGN KEY (session_id) REFERENCES sessions(id)
+            )
+            """
+        )
+        connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS session_run_admissions (
+                session_id TEXT NOT NULL,
+                ticket_id TEXT NOT NULL UNIQUE,
+                runtime_id TEXT NOT NULL,
+                started_at TEXT NOT NULL,
+                expires_at REAL NOT NULL,
+                PRIMARY KEY (session_id, ticket_id),
                 FOREIGN KEY (session_id) REFERENCES sessions(id)
             )
             """
@@ -514,11 +539,61 @@ class WebSessionStore:
             ).fetchone()
         return bool(row is not None and row[0])
 
-    def begin_execution_generation(self, session_id: str) -> int:
+    def execution_boundary_snapshot(self, session_id: str) -> tuple[int, int | None]:
+        with self._connect() as connection:
+            self._require_session(connection, session_id)
+            deleting = connection.execute(
+                "SELECT 1 FROM session_deletions WHERE session_id = ?",
+                (session_id,),
+            ).fetchone()
+            if deleting is not None:
+                raise RuntimeError("session deletion is pending")
+            row = connection.execute(
+                """
+                SELECT generation, stopped_generation
+                FROM session_execution_boundaries
+                WHERE session_id = ?
+                """,
+                (session_id,),
+            ).fetchone()
+        if row is None:
+            return 0, None
+        return int(row[0]), None if row[1] is None else int(row[1])
+
+    def begin_execution_generation(
+        self,
+        session_id: str,
+        *,
+        expected_boundary: tuple[int, int | None] | None = None,
+    ) -> int:
         timestamp = _now()
         with self._connect() as connection:
             connection.execute("BEGIN IMMEDIATE")
             self._require_session(connection, session_id)
+            deleting = connection.execute(
+                "SELECT 1 FROM session_deletions WHERE session_id = ?",
+                (session_id,),
+            ).fetchone()
+            if deleting is not None:
+                raise RuntimeError("session deletion is pending")
+            boundary = connection.execute(
+                """
+                SELECT generation, stopped_generation
+                FROM session_execution_boundaries
+                WHERE session_id = ?
+                """,
+                (session_id,),
+            ).fetchone()
+            actual_boundary = (
+                (0, None)
+                if boundary is None
+                else (
+                    int(boundary[0]),
+                    None if boundary[1] is None else int(boundary[1]),
+                )
+            )
+            if expected_boundary is not None and actual_boundary != expected_boundary:
+                raise RuntimeError("execution admission was invalidated by stop")
             pending = connection.execute(
                 """
                 SELECT 1 FROM session_stop_requests
@@ -547,6 +622,169 @@ class WebSessionStore:
             ).fetchone()
         assert row is not None
         return int(row[0])
+
+    def begin_session_deletion(self, session_id: str) -> None:
+        timestamp = _now()
+        with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            self._require_session(connection, session_id)
+            connection.execute(
+                """
+                INSERT INTO session_deletions (session_id, started_at)
+                VALUES (?, ?)
+                ON CONFLICT(session_id) DO NOTHING
+                """,
+                (session_id, timestamp),
+            )
+
+    def session_run_admission_is_pending(self, session_id: str) -> bool:
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT 1 FROM session_run_admissions WHERE session_id = ? LIMIT 1",
+                (session_id,),
+            ).fetchone()
+        return row is not None
+
+    def claim_session_run_admission(
+        self,
+        session_id: str,
+        *,
+        runtime_id: str = "local-runtime",
+        ttl_seconds: float = 30.0,
+        now: datetime | float | None = None,
+    ) -> tuple[str, tuple[int, int | None]]:
+        if ttl_seconds <= 0:
+            raise ValueError("admission lease ttl_seconds must be positive")
+        ticket_id = f"admission_{uuid4().hex}"
+        timestamp = _now()
+        now_seconds = self._lease_time_seconds(now)
+        with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            self._require_session(connection, session_id)
+            deleting = connection.execute(
+                "SELECT 1 FROM session_deletions WHERE session_id = ?",
+                (session_id,),
+            ).fetchone()
+            if deleting is not None:
+                raise RuntimeError("session deletion is pending")
+            boundary = connection.execute(
+                """
+                SELECT generation, stopped_generation
+                FROM session_execution_boundaries
+                WHERE session_id = ?
+                """,
+                (session_id,),
+            ).fetchone()
+            baseline = (
+                (0, None)
+                if boundary is None
+                else (
+                    int(boundary[0]),
+                    None if boundary[1] is None else int(boundary[1]),
+                )
+            )
+            connection.execute(
+                """
+                INSERT INTO session_run_admissions (
+                    session_id, ticket_id, runtime_id, started_at, expires_at
+                ) VALUES (?, ?, ?, ?, ?)
+                """,
+                (
+                    session_id,
+                    ticket_id,
+                    runtime_id,
+                    timestamp,
+                    now_seconds + ttl_seconds,
+                ),
+            )
+        return ticket_id, baseline
+
+    def renew_session_run_admission(
+        self,
+        session_id: str,
+        ticket_id: str,
+        *,
+        ttl_seconds: float,
+        runtime_id: str | None = None,
+        now: datetime | float | None = None,
+    ) -> None:
+        if ttl_seconds <= 0:
+            raise ValueError("admission lease ttl_seconds must be positive")
+        now_seconds = self._lease_time_seconds(now)
+        with self._connect() as connection:
+            if runtime_id is None:
+                cursor = connection.execute(
+                    """
+                    UPDATE session_run_admissions
+                    SET expires_at = ?
+                    WHERE session_id = ? AND ticket_id = ?
+                    """,
+                    (now_seconds + ttl_seconds, session_id, ticket_id),
+                )
+            else:
+                cursor = connection.execute(
+                    """
+                    UPDATE session_run_admissions
+                    SET expires_at = ?
+                    WHERE session_id = ? AND ticket_id = ? AND runtime_id = ?
+                    """,
+                    (
+                        now_seconds + ttl_seconds,
+                        session_id,
+                        ticket_id,
+                        runtime_id,
+                    ),
+                )
+            if cursor.rowcount != 1:
+                raise RuntimeError("session run admission lease was lost")
+
+    def reap_expired_session_run_admissions(
+        self,
+        session_id: str,
+        *,
+        now: datetime | float | None = None,
+    ) -> int:
+        now_seconds = self._lease_time_seconds(now)
+        with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            cursor = connection.execute(
+                """
+                DELETE FROM session_run_admissions
+                WHERE session_id = ? AND expires_at <= ?
+                """,
+                (session_id, now_seconds),
+            )
+        return cursor.rowcount
+
+    @staticmethod
+    def _lease_time_seconds(value: datetime | float | None) -> float:
+        if value is None:
+            return time.time()
+        if isinstance(value, datetime):
+            return value.timestamp()
+        return float(value)
+
+    def release_session_run_admission(
+        self,
+        session_id: str,
+        ticket_id: str,
+    ) -> None:
+        with self._connect() as connection:
+            connection.execute(
+                """
+                DELETE FROM session_run_admissions
+                WHERE session_id = ? AND ticket_id = ?
+                """,
+                (session_id, ticket_id),
+            )
+
+    def session_deletion_is_pending(self, session_id: str) -> bool:
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT 1 FROM session_deletions WHERE session_id = ?",
+                (session_id,),
+            ).fetchone()
+        return row is not None
 
     def current_execution_generation(self, session_id: str) -> int:
         with self._connect() as connection:
@@ -1067,6 +1305,14 @@ class WebSessionStore:
             )
             connection.execute(
                 "DELETE FROM session_execution_boundaries WHERE session_id = ?",
+                (session_id,),
+            )
+            connection.execute(
+                "DELETE FROM session_deletions WHERE session_id = ?",
+                (session_id,),
+            )
+            connection.execute(
+                "DELETE FROM session_run_admissions WHERE session_id = ?",
                 (session_id,),
             )
             connection.execute(

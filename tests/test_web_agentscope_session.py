@@ -2,10 +2,12 @@ import asyncio
 import hashlib
 import json
 import sqlite3
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
+import httpx
 from agentscope.app.message_bus import MessageBusKeys
 from agentscope.event import (
     CustomEvent,
@@ -17,6 +19,7 @@ from agentscope.event import (
 from agentscope.message import Msg, ToolCallBlock, ToolCallState, ToolResultState, UserMsg
 from agentscope.permission import PermissionBehavior, PermissionContext
 from agentscope.tool import ToolResponse
+from fastapi import FastAPI
 
 from vla_data_juicer_agents.core.cancellation import CancellationContext, current_cancellation
 from vla_data_juicer_agents.navigation.observation_store import SqliteNavigationObservationStore
@@ -48,6 +51,7 @@ from vla_data_juicer_agents.runtime.navigation_tool_surface import (
     NavigationToolSurfaceMiddleware,
 )
 from vla_data_juicer_agents.web.agent_session import AgentScopeWebSessionManager
+from vla_data_juicer_agents.web.app import create_app
 from vla_data_juicer_agents.web.event_stream import SessionEventBus
 from vla_data_juicer_agents.web.schemas import (
     HumanDecisionRequest,
@@ -327,6 +331,109 @@ class FakeChatRunRegistry:
             self.active_session_ids.discard(spawn["session_id"])
 
 
+class AdmissionTaskRegistry:
+    """Task registry that exposes the real owner task to admission-race tests."""
+
+    def __init__(self) -> None:
+        self.tasks: dict[str, asyncio.Task] = {}
+        self.spawned_tasks: list[asyncio.Task] = []
+
+    def spawn(self, coroutine, *, session_id):
+        task = asyncio.create_task(coroutine)
+        self.tasks[session_id] = task
+        self.spawned_tasks.append(task)
+
+        def cleanup(completed: asyncio.Task) -> None:
+            if self.tasks.get(session_id) is completed:
+                self.tasks.pop(session_id, None)
+
+        task.add_done_callback(cleanup)
+        return task
+
+    async def drain(self) -> None:
+        await asyncio.gather(*self.spawned_tasks, return_exceptions=True)
+
+
+class BoundaryAdmissionChatService(FakeChatService):
+    """Drive the real run-boundary middleware after a deterministic gate."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.runtime = None
+        self.run_started = asyncio.Event()
+        self.allow_boundary = asyncio.Event()
+        self.boundary_entered = asyncio.Event()
+        self.finish_run = asyncio.Event()
+
+    async def run(self, *, user_id, session_id, agent_id, input_msg):
+        self.run_started.set()
+        await self.allow_boundary.wait()
+        middleware = DataPilotRunBoundaryMiddleware(session_id, self.runtime)
+
+        async def handler(**_kwargs):
+            self.boundary_entered.set()
+            yield ReplyStartEvent(
+                session_id=session_id,
+                reply_id="admitted-reply",
+                name="MainRouterAgent",
+            )
+            await self.finish_run.wait()
+
+        async for _event in middleware.on_reply(
+            SimpleNamespace(name="MainRouterAgent"),
+            {"inputs": input_msg},
+            handler,
+        ):
+            pass
+        await super().run(
+            user_id=user_id,
+            session_id=session_id,
+            agent_id=agent_id,
+            input_msg=input_msg,
+        )
+
+
+class AdmissionSharedBus:
+    def __init__(self) -> None:
+        self.registries: dict[str, dict[str, str]] = {}
+        self.subscribers: dict[str, list[asyncio.Queue]] = {}
+        self.fail_owner_publish = False
+
+    async def publish(self, key: str, payload: dict) -> None:
+        for queue in list(self.subscribers.get(key, [])):
+            await queue.put(dict(payload))
+
+    async def subscribe(self, key: str, *, on_ready=None):
+        queue: asyncio.Queue = asyncio.Queue()
+        self.subscribers.setdefault(key, []).append(queue)
+        if on_ready is not None:
+            on_ready()
+        try:
+            while True:
+                yield await queue.get()
+        finally:
+            self.subscribers[key].remove(queue)
+
+    async def registry_set(
+        self,
+        namespace: str,
+        field: str,
+        value: str,
+        *,
+        ttl_secs: int | None = None,
+    ) -> None:
+        del ttl_secs
+        if self.fail_owner_publish and namespace.startswith("datapilot:stop:owners:"):
+            raise ConnectionError("owner registry unavailable")
+        self.registries.setdefault(namespace, {})[field] = value
+
+    async def registry_del(self, namespace: str, field: str) -> None:
+        self.registries.setdefault(namespace, {}).pop(field, None)
+
+    async def registry_getall(self, namespace: str) -> dict[str, str]:
+        return dict(self.registries.get(namespace, {}))
+
+
 def _agentscope_config(**overrides) -> AgentScopeRuntimeConfig:
     values = {
         "user_id": "alice",
@@ -573,14 +680,14 @@ async def test_runtime_publishes_turn_terminal_after_registry_cleanup_on_pre_rep
     runtime.app.state.chat_service = FailingBeforeReplyChatService()
     runtime.set_web_session_store(store)
 
-    turn_id = await runtime.submit_user_message(
-        web_session_id=public_session.id,
-        message="fail before reply",
-    )
+    with pytest.raises(RuntimeError, match="model failed before reply"):
+        await runtime.submit_user_message(
+            web_session_id=public_session.id,
+            message="fail before reply",
+        )
     internal_session_id = f"{public_session.id}__main-router-agent"
     task = registry.get(internal_session_id)
-    assert task is not None
-    await asyncio.gather(task, return_exceptions=True)
+    assert task is None
     for _ in range(10):
         if store.get_session(public_session.id).events:
             break
@@ -590,7 +697,8 @@ async def test_runtime_publishes_turn_terminal_after_registry_cleanup_on_pre_rep
     terminal = store.get_session(public_session.id).events[-1].event
     assert terminal["type"] == "CUSTOM"
     assert terminal["name"] == "datapilot_run_terminal"
-    assert terminal["value"] == {"turn_id": turn_id, "status": "failure"}
+    assert terminal["value"]["turn_id"].startswith("turn_")
+    assert terminal["value"]["status"] == "failure"
 
 
 @pytest.mark.asyncio
@@ -2554,6 +2662,564 @@ async def test_runtime_submit_user_message_duplicate_active_run_preserves_cancel
 
 
 @pytest.mark.asyncio
+async def test_submit_user_message_waits_until_run_boundary_admits_the_turn(
+    tmp_path: Path,
+) -> None:
+    """A returned turn id is an admission ACK, not merely a local spawn ACK."""
+    registry = AdmissionTaskRegistry()
+    service = BoundaryAdmissionChatService()
+    runtime = _runtime(chat_run_registry=None)
+    runtime.app.state.chat_run_registry = registry
+    runtime.app.state.chat_service = service
+    service.runtime = runtime
+    store = WebSessionStore(tmp_path / "admission-await.sqlite")
+    session = store.create_session("admission await")
+    runtime.set_web_session_store(store)
+
+    submission = asyncio.create_task(
+        runtime.submit_user_message(web_session_id=session.id, message="start")
+    )
+    await service.run_started.wait()
+    await asyncio.sleep(0)
+    returned_before_admission = submission.done()
+
+    service.allow_boundary.set()
+    await service.boundary_entered.wait()
+    turn_id = await submission
+    service.finish_run.set()
+    await registry.drain()
+
+    assert returned_before_admission is False
+    assert turn_id.startswith("turn_")
+
+
+@pytest.mark.asyncio
+async def test_http_turn_response_waits_for_run_boundary_admission(
+    tmp_path: Path,
+) -> None:
+    registry = AdmissionTaskRegistry()
+    service = BoundaryAdmissionChatService()
+    runtime = _runtime(chat_run_registry=None)
+    agentscope_app = FastAPI()
+    agentscope_app.state.chat_run_registry = registry
+    agentscope_app.state.chat_service = service
+    runtime.app = agentscope_app
+    service.runtime = runtime
+    app = create_app(
+        working_dir=str(tmp_path / "workspace"),
+        db_path=tmp_path / "http-admission.sqlite",
+        agentscope_runtime=runtime,
+    )
+
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app),
+        base_url="http://test",
+    ) as client:
+        created = await client.post("/api/sessions", json={"message": "start"})
+        session_id = created.json()["session"]["id"]
+        request = asyncio.create_task(
+            client.post(
+                f"/api/sessions/{session_id}/turns",
+                json={"message": "start"},
+            )
+        )
+        await service.run_started.wait()
+        await asyncio.sleep(0)
+        responded_before_admission = request.done()
+        messages_before_admission = app.state.store.get_session(session_id).messages
+
+        service.allow_boundary.set()
+        await service.boundary_entered.wait()
+        response = await request
+        service.finish_run.set()
+        await registry.drain()
+
+    assert responded_before_admission is False
+    assert messages_before_admission == []
+    assert response.status_code == 200
+
+
+@pytest.mark.asyncio
+async def test_admission_owner_is_published_before_submit_is_accepted(
+    tmp_path: Path,
+) -> None:
+    bus = AdmissionSharedBus()
+    registry = AdmissionTaskRegistry()
+    service = BoundaryAdmissionChatService()
+    runtime = _runtime(chat_run_registry=None, message_bus=bus)
+    runtime.app.state.chat_run_registry = registry
+    runtime.app.state.chat_service = service
+    service.runtime = runtime
+    store = WebSessionStore(tmp_path / "admission-owner.sqlite")
+    session = store.create_session("owner before accept")
+    manager = AgentScopeWebSessionManager(store=store, runtime=runtime)
+    assert runtime.stop_coordinator is not None
+    await runtime.start_stop_coordinator()
+
+    submission = asyncio.create_task(manager.submit_turn(session.id, "start"))
+    try:
+        await service.run_started.wait()
+        await asyncio.sleep(0)
+        namespace = f"datapilot:stop:owners:{session.id}__main-router-agent"
+        owners_before_boundary = await bus.registry_getall(namespace)
+        accepted_before_boundary = submission.done()
+
+        service.allow_boundary.set()
+        await service.boundary_entered.wait()
+        await submission
+        service.finish_run.set()
+        await registry.drain()
+    finally:
+        service.allow_boundary.set()
+        service.finish_run.set()
+        await asyncio.gather(submission, return_exceptions=True)
+        await registry.drain()
+        await runtime.stop_stop_coordinator()
+
+    assert owners_before_boundary
+    assert accepted_before_boundary is False
+
+
+@pytest.mark.asyncio
+async def test_stop_before_admission_rejects_turn_and_keeps_stop_fence(
+    tmp_path: Path,
+) -> None:
+    bus = AdmissionSharedBus()
+    registry = AdmissionTaskRegistry()
+    service = BoundaryAdmissionChatService()
+    runtime = _runtime(chat_run_registry=None, message_bus=bus)
+    runtime.app.state.chat_run_registry = registry
+    runtime.app.state.chat_service = service
+    service.runtime = runtime
+    store = WebSessionStore(tmp_path / "stop-before-admission.sqlite")
+    session = store.create_session("stop before admission")
+    manager = AgentScopeWebSessionManager(store=store, runtime=runtime)
+    assert runtime.stop_coordinator is not None
+    runtime.stop_coordinator.retry_interval = 0.01
+    await runtime.start_stop_coordinator()
+
+    submission = asyncio.create_task(manager.submit_turn(session.id, "start"))
+    try:
+        await service.run_started.wait()
+        stop_result = await runtime.interrupt_web_session(web_session_id=session.id)
+        service.allow_boundary.set()
+        service.finish_run.set()
+        submission_result = (await asyncio.gather(submission, return_exceptions=True))[0]
+        await registry.drain()
+    finally:
+        service.allow_boundary.set()
+        service.finish_run.set()
+        await asyncio.gather(submission, return_exceptions=True)
+        await registry.drain()
+        await runtime.stop_stop_coordinator()
+
+    detail = store.get_session(session.id)
+    assert stop_result.interrupted is True
+    assert isinstance(submission_result, RuntimeError)
+    assert detail is not None
+    assert detail.messages == []
+    assert store.execution_generation_is_fenced(session.id) is True
+
+
+@pytest.mark.asyncio
+async def test_stop_while_submit_is_blocked_in_session_upsert_rejects_stale_admission(
+    tmp_path: Path,
+) -> None:
+    class GatedStorage(FakeAgentScopeStorage):
+        def __init__(self) -> None:
+            super().__init__()
+            self.upsert_started = asyncio.Event()
+            self.allow_upsert = asyncio.Event()
+
+        async def upsert_session(self, *args, **kwargs):
+            self.upsert_started.set()
+            await self.allow_upsert.wait()
+            return await super().upsert_session(*args, **kwargs)
+
+    bus = AdmissionSharedBus()
+    storage = GatedStorage()
+    registry = AdmissionTaskRegistry()
+    service = BoundaryAdmissionChatService()
+    runtime = _runtime(storage=storage, chat_run_registry=None, message_bus=bus)
+    runtime.app.state.chat_run_registry = registry
+    runtime.app.state.chat_service = service
+    service.runtime = runtime
+    store = WebSessionStore(tmp_path / "stop-during-upsert.sqlite")
+    session = store.create_session("stop during upsert")
+    manager = AgentScopeWebSessionManager(store=store, runtime=runtime)
+    assert runtime.stop_coordinator is not None
+    await runtime.start_stop_coordinator()
+
+    submission = asyncio.create_task(manager.submit_turn(session.id, "start"))
+    try:
+        await asyncio.wait_for(storage.upsert_started.wait(), timeout=0.3)
+        stopped = await runtime.interrupt_web_session(web_session_id=session.id)
+        assert store.execution_generation_is_fenced(session.id) is True
+
+        storage.allow_upsert.set()
+        service.allow_boundary.set()
+        service.finish_run.set()
+        submit_result = (await asyncio.gather(submission, return_exceptions=True))[0]
+        await registry.drain()
+
+        detail = store.get_session(session.id)
+        assert stopped.interrupted is False
+        assert isinstance(submit_result, RuntimeError)
+        assert store.execution_generation_is_fenced(session.id) is True
+        assert detail is not None
+        assert detail.messages == []
+    finally:
+        storage.allow_upsert.set()
+        service.allow_boundary.set()
+        service.finish_run.set()
+        await asyncio.gather(submission, return_exceptions=True)
+        await registry.drain()
+        await runtime.stop_stop_coordinator()
+
+
+@pytest.mark.asyncio
+async def test_owner_publish_failure_cancels_run_and_rejects_submission(
+    tmp_path: Path,
+) -> None:
+    bus = AdmissionSharedBus()
+    registry = AdmissionTaskRegistry()
+    service = BoundaryAdmissionChatService()
+    runtime = _runtime(chat_run_registry=None, message_bus=bus)
+    runtime.app.state.chat_run_registry = registry
+    runtime.app.state.chat_service = service
+    service.runtime = runtime
+    store = WebSessionStore(tmp_path / "owner-publish-failure.sqlite")
+    session = store.create_session("owner publish failure")
+    manager = AgentScopeWebSessionManager(store=store, runtime=runtime)
+    assert runtime.stop_coordinator is not None
+    await runtime.start_stop_coordinator()
+    bus.fail_owner_publish = True
+
+    submission = asyncio.create_task(manager.submit_turn(session.id, "start"))
+    await asyncio.sleep(0)
+    await asyncio.sleep(0)
+    service.allow_boundary.set()
+    service.finish_run.set()
+    result = (await asyncio.gather(submission, return_exceptions=True))[0]
+    await registry.drain()
+    bus.fail_owner_publish = False
+    await runtime.stop_stop_coordinator()
+
+    detail = store.get_session(session.id)
+    assert isinstance(result, RuntimeError)
+    assert registry.tasks == {}
+    assert store.current_execution_generation(session.id) == 0
+    assert detail is not None
+    assert detail.messages == []
+
+
+@pytest.mark.asyncio
+async def test_delete_waits_for_submit_blocked_in_agentscope_session_upsert(
+    tmp_path: Path,
+) -> None:
+    class GatedStorage(FakeAgentScopeStorage):
+        def __init__(self) -> None:
+            super().__init__()
+            self.upsert_started = asyncio.Event()
+            self.allow_upsert = asyncio.Event()
+
+        async def upsert_session(self, *args, **kwargs):
+            self.upsert_started.set()
+            await self.allow_upsert.wait()
+            return await super().upsert_session(*args, **kwargs)
+
+    class RecordingSessionService:
+        def __init__(self) -> None:
+            self.deleted: list[str] = []
+
+        async def delete_session(self, _user_id, _agent_id, session_id):
+            self.deleted.append(session_id)
+            return True
+
+    class NavigationControl:
+        def delete_control_state_for_web_session(self, _web_session_id: str) -> None:
+            return None
+
+    bus = AdmissionSharedBus()
+    storage = GatedStorage()
+    registry = AdmissionTaskRegistry()
+    service = BoundaryAdmissionChatService()
+    session_service = RecordingSessionService()
+    runtime = _runtime(storage=storage, chat_run_registry=None, message_bus=bus)
+    runtime.app.state.chat_run_registry = registry
+    runtime.app.state.chat_service = service
+    runtime.app.state.session_service = session_service
+    runtime._navigation_services = lambda: NavigationControl()
+    runtime.admission_lease_ttl_seconds = 0.05
+    runtime.admission_renew_interval_seconds = 0.01
+    service.runtime = runtime
+    store = WebSessionStore(tmp_path / "delete-during-upsert.sqlite")
+    session = store.create_session("delete during upsert")
+    manager = AgentScopeWebSessionManager(store=store, runtime=runtime)
+    assert runtime.stop_coordinator is not None
+    await runtime.start_stop_coordinator()
+
+    submission = asyncio.create_task(manager.submit_turn(session.id, "start"))
+    deletion: asyncio.Task | None = None
+    try:
+        await asyncio.wait_for(storage.upsert_started.wait(), timeout=0.3)
+        deletion = asyncio.create_task(manager.delete_session(session.id))
+        for _ in range(30):
+            if store.session_deletion_is_pending(session.id):
+                break
+            await asyncio.sleep(0.01)
+        await asyncio.sleep(0.08)
+        assert store.session_deletion_is_pending(session.id) is True
+        assert deletion.done() is False
+        assert session_service.deleted == []
+
+        storage.allow_upsert.set()
+        service.allow_boundary.set()
+        service.finish_run.set()
+        submit_result = (await asyncio.gather(submission, return_exceptions=True))[0]
+        await deletion
+        await registry.drain()
+
+        assert isinstance(submit_result, RuntimeError)
+        assert store.get_session(session.id) is None
+        assert len(storage.sessions) == 1
+        assert session_service.deleted == [storage.sessions[0]["id"]]
+    finally:
+        storage.allow_upsert.set()
+        service.allow_boundary.set()
+        service.finish_run.set()
+        await asyncio.gather(submission, return_exceptions=True)
+        if deletion is not None:
+            await asyncio.gather(deletion, return_exceptions=True)
+        await registry.drain()
+        await runtime.stop_stop_coordinator()
+
+
+@pytest.mark.asyncio
+async def test_admission_renew_failure_cancels_submit_and_allows_retry(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class GatedStorage(FakeAgentScopeStorage):
+        def __init__(self) -> None:
+            super().__init__()
+            self.upsert_started = asyncio.Event()
+            self.allow_upsert = asyncio.Event()
+
+        async def upsert_session(self, *args, **kwargs):
+            self.upsert_started.set()
+            await self.allow_upsert.wait()
+            return await super().upsert_session(*args, **kwargs)
+
+    storage = GatedStorage()
+    registry = AdmissionTaskRegistry()
+    service = BoundaryAdmissionChatService()
+    runtime = _runtime(storage=storage, chat_run_registry=None)
+    runtime.app.state.chat_run_registry = registry
+    runtime.app.state.chat_service = service
+    runtime.admission_lease_ttl_seconds = 0.1
+    runtime.admission_renew_interval_seconds = 0.01
+    service.runtime = runtime
+    store = WebSessionStore(tmp_path / "renew-failure.sqlite")
+    session = store.create_session("renew failure")
+    manager = AgentScopeWebSessionManager(store=store, runtime=runtime)
+    original_renew = store.renew_session_run_admission
+    renew_calls = 0
+
+    def fail_first_renew(*args, **kwargs):
+        nonlocal renew_calls
+        renew_calls += 1
+        if renew_calls == 1:
+            raise sqlite3.OperationalError("renew transport failed")
+        return original_renew(*args, **kwargs)
+
+    monkeypatch.setattr(store, "renew_session_run_admission", fail_first_renew)
+
+    first = asyncio.create_task(manager.submit_turn(session.id, "first"))
+    await asyncio.wait_for(storage.upsert_started.wait(), timeout=0.3)
+    first_result = (await asyncio.gather(first, return_exceptions=True))[0]
+
+    assert isinstance(first_result, RuntimeError)
+    assert "lease renewal failed" in str(first_result)
+    assert store.session_run_admission_is_pending(session.id) is False
+    assert storage.sessions == []
+
+    storage.allow_upsert.set()
+    service.allow_boundary.set()
+    service.finish_run.set()
+    turn_id = await manager.submit_turn(session.id, "retry")
+    await registry.drain()
+
+    detail = store.get_session(session.id)
+    assert turn_id.startswith("turn_")
+    assert detail is not None
+    assert [message.content for message in detail.messages] == ["retry"]
+
+
+@pytest.mark.asyncio
+async def test_transient_admission_release_failure_retries_before_return(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    registry = AdmissionTaskRegistry()
+    service = BoundaryAdmissionChatService()
+    runtime = _runtime(chat_run_registry=None)
+    runtime.app.state.chat_run_registry = registry
+    runtime.app.state.chat_service = service
+    runtime.admission_release_retry_delays = (0.0, 0.0)
+    service.runtime = runtime
+    service.allow_boundary.set()
+    service.finish_run.set()
+    store = WebSessionStore(tmp_path / "release-retry.sqlite")
+    session = store.create_session("release retry")
+    manager = AgentScopeWebSessionManager(store=store, runtime=runtime)
+    original_release = store.release_session_run_admission
+    release_calls = 0
+
+    def fail_first_release(*args, **kwargs):
+        nonlocal release_calls
+        release_calls += 1
+        if release_calls == 1:
+            raise sqlite3.OperationalError("release transport failed")
+        return original_release(*args, **kwargs)
+
+    monkeypatch.setattr(store, "release_session_run_admission", fail_first_release)
+
+    turn_id = await manager.submit_turn(session.id, "start")
+    await registry.drain()
+
+    assert turn_id.startswith("turn_")
+    assert release_calls == 2
+    assert store.session_run_admission_is_pending(session.id) is False
+
+
+@pytest.mark.asyncio
+async def test_successful_admission_wins_same_tick_heartbeat_failure(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runtime = _runtime()
+    store = WebSessionStore(tmp_path / "same-tick-heartbeat.sqlite")
+    session = store.create_session("same tick heartbeat")
+    runtime.set_web_session_store(store)
+
+    async def admitted_run(**_kwargs) -> str:
+        await asyncio.sleep(0)
+        return "admitted-session"
+
+    async def failed_heartbeat(*_args, **_kwargs) -> None:
+        raise sqlite3.OperationalError("renew failed after admission")
+
+    monkeypatch.setattr(runtime, "_start_agent_run_with_ticket", admitted_run)
+    monkeypatch.setattr(
+        runtime,
+        "_heartbeat_session_run_admission",
+        failed_heartbeat,
+    )
+
+    result = await runtime._start_agent_run(
+        web_session_id=session.id,
+        agent_id="main-router-agent",
+        model="qwen-test",
+        message="start",
+    )
+
+    assert result == "admitted-session"
+    assert store.session_run_admission_is_pending(session.id) is False
+
+
+@pytest.mark.asyncio
+async def test_successful_admission_is_not_reversed_by_permanent_release_failure(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    registry = AdmissionTaskRegistry()
+    service = BoundaryAdmissionChatService()
+    runtime = _runtime(chat_run_registry=None)
+    runtime.app.state.chat_run_registry = registry
+    runtime.app.state.chat_service = service
+    runtime.admission_lease_ttl_seconds = 0.05
+    runtime.admission_release_retry_delays = (0.0, 0.0)
+    service.runtime = runtime
+    service.allow_boundary.set()
+    service.finish_run.set()
+    store = WebSessionStore(tmp_path / "release-exhausted.sqlite")
+    session = store.create_session("release exhausted")
+    manager = AgentScopeWebSessionManager(store=store, runtime=runtime)
+
+    def fail_release(*_args, **_kwargs):
+        raise sqlite3.OperationalError("release remained unavailable")
+
+    monkeypatch.setattr(store, "release_session_run_admission", fail_release)
+
+    turn_id = await manager.submit_turn(session.id, "start")
+    await registry.drain()
+
+    assert turn_id.startswith("turn_")
+    assert len(service.runs) == 1
+    assert store.current_execution_generation(session.id) == 1
+    assert store.session_run_admission_is_pending(session.id) is True
+    assert store.reap_expired_session_run_admissions(
+        session.id,
+        now=datetime.now(UTC) + timedelta(seconds=1),
+    ) == 1
+
+
+@pytest.mark.asyncio
+async def test_reentered_run_boundary_commits_execution_generation_exactly_once(
+    tmp_path: Path,
+) -> None:
+    store = WebSessionStore(tmp_path / "admission-exactly-once.sqlite")
+    session = store.create_session("exactly once")
+    internal_session_id = f"{session.id}__main-router-agent"
+    store.save_agentscope_session_mapping(
+        session.id,
+        agent_id="main-router-agent",
+        agentscope_session_id=internal_session_id,
+    )
+    runtime = _runtime()
+    runtime.set_web_session_store(store)
+    cancellation = CancellationContext()
+    runtime.register_run_cancellation(internal_session_id, cancellation)
+    middleware = DataPilotRunBoundaryMiddleware(internal_session_id, runtime)
+    begin_calls: list[str] = []
+    original_begin = store.begin_execution_generation
+
+    def record_begin(
+        session_id: str,
+        *,
+        expected_boundary: tuple[int, int | None] | None = None,
+    ) -> int:
+        begin_calls.append(session_id)
+        return original_begin(
+            session_id,
+            expected_boundary=expected_boundary,
+        )
+
+    store.begin_execution_generation = record_begin  # type: ignore[method-assign]
+
+    async def handler(**_kwargs):
+        yield ReplyStartEvent(
+            session_id=internal_session_id,
+            reply_id="same-run-reply",
+            name="MainRouterAgent",
+        )
+
+    for _ in range(2):
+        async for _event in middleware.on_reply(
+            SimpleNamespace(name="MainRouterAgent"),
+            {"inputs": UserMsg(name="user", content="same admitted turn")},
+            handler,
+        ):
+            pass
+
+    runtime.clear_run_cancellation(internal_session_id, cancellation)
+
+    assert begin_calls == [session.id]
+    assert store.current_execution_generation(session.id) == 1
+
+
+@pytest.mark.asyncio
 async def test_rejected_turn_does_not_clear_stopped_generation_or_admit_stale_wakeup(
     tmp_path: Path,
 ) -> None:
@@ -2651,9 +3317,16 @@ async def test_accepted_user_run_advances_stopped_generation_once_at_run_boundar
     begin_calls: list[str] = []
     original_begin = store.begin_execution_generation
 
-    def record_begin(session_id: str) -> int:
+    def record_begin(
+        session_id: str,
+        *,
+        expected_boundary: tuple[int, int | None] | None = None,
+    ) -> int:
         begin_calls.append(session_id)
-        return original_begin(session_id)
+        return original_begin(
+            session_id,
+            expected_boundary=expected_boundary,
+        )
 
     store.begin_execution_generation = record_begin  # type: ignore[method-assign]
 

@@ -56,6 +56,7 @@ class StopCoordinator:
         self._handler_tasks: set[asyncio.Task] = set()
         self._registered_fields: set[tuple[str, str]] = set()
         self._started = False
+        self._refresh_lock = asyncio.Lock()
 
     @classmethod
     def owner_namespace(cls, agentscope_session_id: str) -> str:
@@ -123,6 +124,10 @@ class StopCoordinator:
         self._handler_tasks.clear()
 
     async def refresh_owners(self) -> None:
+        async with self._refresh_lock:
+            await self._refresh_owners_serialized()
+
+    async def _refresh_owners_serialized(self) -> None:
         now = time.time()
         current: set[tuple[str, str]] = set()
         for lease in self._owner_leases():
@@ -140,15 +145,25 @@ class StopCoordinator:
                 },
                 sort_keys=True,
             )
-            await self._bus.registry_set(
-                namespace,
-                field,
-                value,
-                ttl_secs=max(1, int(self.owner_ttl * 2)),
-            )
+            try:
+                await self._bus.registry_set(
+                    namespace,
+                    field,
+                    value,
+                    ttl_secs=max(1, int(self.owner_ttl * 2)),
+                )
+            except Exception:
+                # A timed-out Redis write may have reached the server. Remove
+                # that possible ghost field before reporting publication
+                # failure to admission.
+                with suppress(Exception):
+                    await self._bus.registry_del(namespace, field)
+                raise
             current.add((namespace, field))
+            self._registered_fields.add((namespace, field))
         for namespace, field in self._registered_fields - current:
             await self._bus.registry_del(namespace, field)
+            self._registered_fields.discard((namespace, field))
         self._registered_fields = current
 
     async def request_and_wait(
@@ -267,12 +282,17 @@ class StopCoordinator:
                 generation = int(generation)
             except (TypeError, ValueError):
                 continue
+            # Owner refresh publishes the admitted generation before it
+            # removes the baseline generation. A requester can therefore
+            # freeze either field (or both), while the process can still hold
+            # both an old pending-stop tombstone and a newer active lease. An
+            # ACK for the frozen field must cover the complete successor union,
+            # not stop at the first exact-generation match.
             matching = [
                 lease
                 for lease in leases
                 if lease.agentscope_session_id == session_id
-                and lease.generation == generation
-                and lease.generation <= target_generation
+                and generation <= lease.generation <= target_generation
             ]
             if not matching:
                 continue

@@ -1938,9 +1938,10 @@ test("failed draft submit does not append a local user message", async () => {
   consoleError.mockRestore();
 });
 
-test("failed active submit does not append a local user message", async () => {
+test("failed active submit removes only its optimistic user message and restores an unedited draft", async () => {
   const consoleError = vi.spyOn(console, "error").mockImplementation(() => undefined);
-  apiMocks.submitTurn.mockRejectedValue(new Error("submit failed"));
+  const submission = deferred<string>();
+  apiMocks.submitTurn.mockReturnValue(submission.promise);
   datapilotStore.setState({
     open: true,
     mode: "active_session",
@@ -1954,7 +1955,16 @@ test("failed active submit does not append a local user message", async () => {
         updated_at: "2026-06-26T00:00:00Z",
       },
     ],
-    conversation: createAgentConversation(),
+    conversation: {
+      ...createAgentConversation(),
+      messages: [
+        UserMsg({
+          id: "persisted-same-text",
+          name: "You",
+          content: "会失败的继续任务",
+        }),
+      ],
+    },
   });
 
   await renderAppWithDashboardSettled();
@@ -1964,8 +1974,17 @@ test("failed active submit does not append a local user message", async () => {
   fireEvent.click(screen.getByRole("button", { name: "Send message" }));
 
   await waitFor(() => expect(apiMocks.submitTurn).toHaveBeenCalledWith("session-1", "会失败的继续任务"));
-  expect(datapilotStore.getState().conversation.messages).toEqual([]);
-  expect(screen.queryByText("会失败的继续任务")).not.toBeInTheDocument();
+  const messagesBeforeRejection = datapilotStore.getState().conversation.messages;
+  expect(messagesBeforeRejection).toHaveLength(2);
+  expect(messagesBeforeRejection[0]?.id).toBe("persisted-same-text");
+  expect(messagesBeforeRejection[1]?.id).toMatch(/^local-/);
+  expect(screen.getByPlaceholderText("继续描述任务…")).toHaveValue("");
+
+  submission.reject(new Error("submit failed"));
+
+  await waitFor(() => expect(datapilotStore.getState().conversation.messages).toHaveLength(1));
+  expect(datapilotStore.getState().conversation.messages[0]?.id).toBe("persisted-same-text");
+  expect(screen.getByPlaceholderText("继续描述任务…")).toHaveValue("会失败的继续任务");
   expect(consoleError).toHaveBeenCalledWith("Failed to submit DataPilot active turn", expect.any(Error));
   consoleError.mockRestore();
 });
@@ -1985,6 +2004,8 @@ test("failed active submit preserves a newer edited draft instead of restoring s
 
   fireEvent.change(input, { target: { value: "原始任务" } });
   fireEvent.click(screen.getByRole("button", { name: "Send message" }));
+  expect(datapilotStore.getState().conversation.messages).toHaveLength(1);
+  expect(datapilotStore.getState().conversation.messages[0]?.id).toMatch(/^local-/);
   fireEvent.change(input, { target: { value: "用户的新草稿" } });
   submission.reject(new Error("submit failed"));
 
@@ -1995,6 +2016,7 @@ test("failed active submit preserves a newer edited draft instead of restoring s
     ),
   );
   expect(input).toHaveValue("用户的新草稿");
+  expect(datapilotStore.getState().conversation.messages).toEqual([]);
   consoleError.mockRestore();
 });
 
@@ -2050,6 +2072,74 @@ test("late active submit response cannot append into a restored session", async 
   expect(opened).toEqual(streamsBeforeLateResponse);
 });
 
+test("a stale rejection cannot remove messages or restore a draft in another session", async () => {
+  const submission = deferred<string>();
+  apiMocks.submitTurn.mockReturnValue(submission.promise);
+  apiMocks.listSessions.mockResolvedValue([
+    {
+      id: "session-b",
+      title: "Session B",
+      created_at: "2026-06-26T01:00:00Z",
+      updated_at: "2026-06-26T02:00:00Z",
+    },
+  ]);
+  apiMocks.getSession.mockImplementation((sessionId) => {
+    if (sessionId !== "session-b") {
+      return Promise.resolve(emptySessionDetail(sessionId));
+    }
+    return Promise.resolve({
+      ...emptySessionDetail("session-b"),
+      messages: [
+        {
+          id: "session-b-user",
+          session_id: "session-b",
+          role: "user",
+          content: "B 已有消息",
+          created_at: "2026-06-26T00:00:01Z",
+        },
+      ],
+    });
+  });
+  datapilotStore.setState({
+    open: true,
+    mode: "active_session",
+    currentSessionId: "session-a",
+    sessions: [],
+    conversation: createAgentConversation(),
+  });
+  await renderAppWithDashboardSettled();
+
+  fireEvent.change(screen.getByPlaceholderText("继续描述任务…"), {
+    target: { value: "A 的待定消息" },
+  });
+  fireEvent.click(screen.getByRole("button", { name: "Send message" }));
+  await waitFor(() => expect(apiMocks.submitTurn).toHaveBeenCalledWith("session-a", "A 的待定消息"));
+  expect(datapilotStore.getState().conversation.messages).toHaveLength(1);
+  expect(datapilotStore.getState().conversation.messages[0]?.id).toMatch(/^local-/);
+
+  fireEvent.click(screen.getByRole("button", { name: "History" }));
+  fireEvent.click(await screen.findByRole("button", { name: "Open session Session B" }));
+  await waitFor(() => expect(datapilotStore.getState().currentSessionId).toBe("session-b"));
+  expect(screen.getByText("B 已有消息")).toBeVisible();
+  expect(screen.getByPlaceholderText("继续描述任务…")).toHaveValue("");
+
+  submission.reject(new Error("late failure from session A"));
+  await act(async () => {
+    try {
+      await submission.promise;
+    } catch {
+      // The component owns the expected rejection.
+    }
+    await Promise.resolve();
+  });
+
+  expect(datapilotStore.getState().currentSessionId).toBe("session-b");
+  expect(datapilotStore.getState().conversation.messages.map((message) => message.id)).toEqual([
+    "session-b-user",
+  ]);
+  expect(screen.getByPlaceholderText("继续描述任务…")).toHaveValue("");
+});
+
 test("late active submit response cannot append after deleting its session", async () => {
   const submission = deferred<string>();
   apiMocks.submitTurn.mockReturnValue(submission.promise);
@@ -2093,7 +2183,7 @@ test("late active submit response cannot append after deleting its session", asy
   expect(screen.queryByText("删除后不得出现")).not.toBeInTheDocument();
 });
 
-test("a pending active submit appends once when its session still owns the response", async () => {
+test("an active submit appends optimistically and HTTP success does not duplicate it", async () => {
   const submission = deferred<string>();
   apiMocks.submitTurn.mockReturnValue(submission.promise);
   apiMocks.getSession.mockResolvedValue(emptySessionDetail("session-a"));
@@ -2111,11 +2201,19 @@ test("a pending active submit appends once when its session still owns the respo
   });
   fireEvent.click(screen.getByRole("button", { name: "Send message" }));
   await waitFor(() => expect(apiMocks.submitTurn).toHaveBeenCalledWith("session-a", "合法迟到消息"));
-  expect(datapilotStore.getState().conversation.messages).toEqual([]);
+  expect(screen.getByText("合法迟到消息")).toBeVisible();
+  expect(datapilotStore.getState().conversation.messages).toHaveLength(1);
+  const optimisticMessageId = datapilotStore.getState().conversation.messages[0]?.id;
+  expect(optimisticMessageId).toMatch(/^local-/);
 
   submission.resolve("turn-a");
-  await waitFor(() => expect(screen.getByText("合法迟到消息")).toBeVisible());
-  expect(datapilotStore.getState().conversation.messages).toHaveLength(1);
+  await act(async () => {
+    await submission.promise;
+    await Promise.resolve();
+  });
+  expect(datapilotStore.getState().conversation.messages.map((message) => message.id)).toEqual([
+    optimisticMessageId,
+  ]);
 });
 
 test("active submit is synchronously latched while request admission is pending", async () => {
@@ -2227,6 +2325,12 @@ test("REPLY_START arriving before the submit response releases admission after H
   await waitFor(() =>
     expect(screen.getByRole("button", { name: "Stop current run" })).toBeDisabled(),
   );
+  expect(datapilotStore.getState().conversation.messages.map((message) => message.role)).toEqual([
+    "user",
+    "assistant",
+  ]);
+  expect(datapilotStore.getState().conversation.messages[0]?.id).toMatch(/^local-/);
+  expect(datapilotStore.getState().conversation.messages[1]?.id).toBe("reply-before-http");
   submission.resolve("turn-1");
   await waitFor(() =>
     expect(screen.getByRole("button", { name: "Stop current run" })).toBeEnabled(),

@@ -465,3 +465,105 @@ cancel-after-start plan tests remain green.
 The final independent re-review reported no actionable findings and ran an additional
 `82 passed` targeted verification over the queued-worker lifecycle, stop lock,
 pending fence, and ACK protocol.
+
+## Round 5: admission, official cancellation, delete quiescence, and UI ordering
+
+Baseline: `da7ca44`
+
+### HTTP acceptance now proves durable AgentScope run admission
+
+The local ChatRunRegistry spawn was not a sufficient admission acknowledgement. A
+request could return HTTP 200 before the run-boundary middleware acquired AgentScope's
+distributed session-run lock, while its cancellation lease still had no generation or
+owner record. Stop in that interval could miss the run, complete, and then have the
+old run advance the generation and clear the fence.
+
+GREEN uses a durable two-stage admission ticket. The store claims it before any
+AgentScope session ensure/upsert, atomically snapshots the
+`(generation, stopped_generation)` boundary, and records runtime ownership plus an
+expiring lease. Before spawn, the runtime attaches that baseline generation to its
+cancellation lease and synchronously refreshes the coordinator owner registry.
+Failure to publish the owner rejects without spawning. At the real user-input run
+boundary, the store atomically compares the baseline and advances the generation
+exactly once. The runtime immediately republishes the admitted generation, rechecks
+the durable fence, and only then resolves the admission future awaited by
+`_start_agent_run()` and the HTTP endpoint. A heartbeat renews slow pre-admission
+work; loss of that lease before admission cancels and rejects the run. Stop-before-
+admission cancels the tracked run and leaves the stopped boundary intact; a stale
+boundary CAS cannot clear it. Tests cover runtime and HTTP waiting, pre-heartbeat
+owner visibility, Stop-before-admission, owner publication failure, slow upsert,
+heartbeat failure, crash expiry/reaping, and middleware re-entry.
+
+### Official AgentScope cancellation precedes the owner ACK wait
+
+Round 4 correctly treated project ACK as the quiescence proof, but issued AgentScope's
+official background-task cancellation only after that proof. A pure-async offloaded
+tool can release its retained tool lease only from its official task's `finally`, so
+that ordering deadlocked until the requester timed out.
+
+GREEN freezes the expected owner set first, applies all local cooperative tokens, then
+attempts every ChatService interrupt and deduplicated AgentScope background-task cancel
+before waiting for the frozen ACK set. Official cancellation is still not itself an
+ACK; the owner must observe the lease's real cleanup and write the applied ACK. Any
+local or official cancellation transport failure remains fail-closed and retryable. A
+deterministic pure-async task test proves the official cancel occurs before owner ACK
+and the stopped ledger commits only after task cleanup.
+
+### Delete reuses the distributed quiescence barrier
+
+Deletion previously cancelled only leases visible in the HTTP process and could call
+AgentScope SessionService plus navigation cleanup while another worker process was
+still executing. Delete now holds the same per-Web-session stop lock and, whenever the
+coordinator is live, completes the durable Stop/owner-ACK barrier before its first
+destructive operation. A durable deletion marker blocks new admission claims, waits
+for live pre-admission tickets, reaps only expired crash tickets, and then re-reads all
+AgentScope mappings before deletion. This closes the late-upsert orphan race. ACK
+timeout or a partial destructive failure preserves the marker and makes retry
+idempotent; the public session is removed only after remote quiescence and mapped
+session cleanup complete. A completed durable stop is not needlessly re-coordinated
+on retry. Tests cover multiple remote owners, gated upsert, mapping re-read, partial
+failure, and restart reaping. Dataset and processing artifacts remain outside session
+deletion and are unchanged.
+
+### Active-turn user messages are optimistic but ownership-safe
+
+The frontend used to append the local user row only after HTTP success. An AgentScope
+`REPLY_START` SSE event could therefore render an assistant row first. Active submit
+now inserts its uniquely identified optimistic user row synchronously before calling
+the HTTP API; success performs no second insertion. Failure removes only that exact
+`{session_id, message_id}` row. Draft restoration is allowed only while the same
+request still owns the session lifecycle and admission, so a late rejection from a
+previous session cannot remove a restored message or overwrite the new session's
+draft. Five deterministic tests cover reverse SSE/HTTP order, exact rollback among
+identical text, edited-draft preservation, success dedupe, and cross-session rejection.
+
+### Round 5 independent review fixes
+
+Independent review found and test-first closed additional race windows:
+
+1. A Stop request frozen at an older generation could ACK while a same-session
+   successor owner was already active. Owner handling now cancels and waits for the
+   complete frozen-through-target generation union, including an exact tombstone plus
+   newer active lease, before ACK. Owner refresh is serialized, and a Redis write that
+   raises after mutation removes its possible ghost record best-effort.
+2. Admission-ticket release and heartbeat completion could race an already successful
+   admission. The admission result is authoritative when both complete in the same
+   event-loop turn. A permanent post-admission release error is logged and leaves the
+   conservative expiring ticket for later reaping rather than reversing the accepted
+   turn or causing a second model run.
+3. Delete and session upsert are serialized by the durable admission/deletion state,
+   not process-local timing. A delete waits for renewed live tickets and reads mappings
+   again only after they drain, so a session created by an in-flight submit cannot be
+   orphaned.
+
+The final independent re-review reported no remaining actionable findings and made no
+code changes.
+
+### Round 5 verification
+
+- Affected backend suites: `235 passed, 1 warning`.
+- Full backend: `965 passed, 1 warning` (the existing Starlette deprecation warning).
+- Full frontend: `182 passed`.
+- Frontend production build: passed (Vite 1626 modules transformed).
+- Python `compileall`: passed.
+- `git diff --check`: passed.

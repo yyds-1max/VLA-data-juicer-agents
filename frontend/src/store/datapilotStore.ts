@@ -35,6 +35,7 @@ export interface DataPilotStoreState {
   refreshActiveSession: (session: SessionDetail) => void;
   restoreSession: (session: SessionDetail) => void;
   appendUserMessage: (message: ChatMessageRecord) => void;
+  removeOptimisticUserMessage: (expectedSessionId: string, messageId: string) => void;
   applyEvent: (event: PublicEventEnvelope) => void;
   markInterrupting: () => void;
   clearPendingHumanDecision: (
@@ -117,6 +118,25 @@ export function createDataPilotStore() {
       set((state) => {
         const conversation = cloneConversation(state.conversation);
         appendPersistedMessage(conversation, message);
+        return { conversation };
+      }),
+
+    removeOptimisticUserMessage: (expectedSessionId, messageId) =>
+      set((state) => {
+        if (
+          state.mode !== "active_session" ||
+          state.currentSessionId !== expectedSessionId
+        ) {
+          return {};
+        }
+        const messageIndex = state.conversation.messages.findIndex(
+          (message) => message.id === messageId && message.role === "user",
+        );
+        if (messageIndex < 0) {
+          return {};
+        }
+        const conversation = cloneConversation(state.conversation);
+        conversation.messages.splice(messageIndex, 1);
         return { conversation };
       }),
 

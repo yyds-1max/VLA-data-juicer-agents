@@ -97,6 +97,9 @@ class NavigationDataBusyError(RuntimeError):
 class _CancellationLease:
     cancellation: CancellationContext
     generation: int | None = None
+    admission_baseline: tuple[int, int | None] | None = None
+    admitted: bool = True
+    admission_future: asyncio.Future[None] | None = None
     foreground_refs: int = 1
     tool_call_ids: set[str] = field(default_factory=set)
     quiescent: asyncio.Event = field(default_factory=asyncio.Event)
@@ -183,6 +186,9 @@ class AgentScopeRuntime:
     recovery_metrics: AgentScopeRecoveryMetrics = field(default_factory=AgentScopeRecoveryMetrics)
     bootstrapped: bool = False
     runtime_id: str = field(default_factory=lambda: uuid4().hex)
+    admission_lease_ttl_seconds: float = 30.0
+    admission_renew_interval_seconds: float = 5.0
+    admission_release_retry_delays: tuple[float, ...] = (0.0, 0.05, 0.2)
     stop_coordinator: StopCoordinator | None = field(default=None, init=False)
 
     def __post_init__(self) -> None:
@@ -718,6 +724,131 @@ class AgentScopeRuntime:
         message: str,
         turn_id: str | None = None,
     ) -> str:
+        admission_ticket: str | None = None
+        admission_baseline: tuple[int, int | None] | None = None
+        if self.web_session_store is not None:
+            admission_ticket, admission_baseline = (
+                self.web_session_store.claim_session_run_admission(
+                    web_session_id,
+                    runtime_id=self.runtime_id,
+                    ttl_seconds=self.admission_lease_ttl_seconds,
+                )
+            )
+        run_task: asyncio.Task | None = None
+        heartbeat_task: asyncio.Task | None = None
+        try:
+            run_task = asyncio.create_task(
+                self._start_agent_run_with_ticket(
+                    web_session_id=web_session_id,
+                    agent_id=agent_id,
+                    model=model,
+                    message=message,
+                    turn_id=turn_id,
+                    admission_baseline=admission_baseline,
+                ),
+                name=f"datapilot-admission:{web_session_id}",
+            )
+            if admission_ticket is None:
+                return await run_task
+            heartbeat_task = asyncio.create_task(
+                self._heartbeat_session_run_admission(
+                    web_session_id,
+                    admission_ticket,
+                ),
+                name=f"datapilot-admission-heartbeat:{web_session_id}",
+            )
+            done, _pending = await asyncio.wait(
+                {run_task, heartbeat_task},
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+            # Boundary admission is the authoritative HTTP ACK. If both tasks
+            # complete in the same loop turn, maintenance failure must not
+            # reverse a successful admission and invite duplicate execution.
+            if run_task in done:
+                return run_task.result()
+            if heartbeat_task in done:
+                heartbeat_error = heartbeat_task.exception()
+                # Admission_future may have been resolved in this same loop
+                # turn. Give its waiter one scheduling opportunity before
+                # deciding that maintenance failed pre-admission.
+                await asyncio.sleep(0)
+                if run_task.done():
+                    return run_task.result()
+                run_task.cancel()
+                await asyncio.gather(run_task, return_exceptions=True)
+                raise RuntimeError("AgentScope run admission lease renewal failed") from (
+                    heartbeat_error
+                    or RuntimeError("admission heartbeat exited unexpectedly")
+                )
+            return run_task.result()
+        finally:
+            if heartbeat_task is not None:
+                heartbeat_task.cancel()
+                await asyncio.gather(heartbeat_task, return_exceptions=True)
+            if run_task is not None and not run_task.done():
+                run_task.cancel()
+                await asyncio.gather(run_task, return_exceptions=True)
+            if admission_ticket is not None:
+                await self._release_session_run_admission(
+                    web_session_id,
+                    admission_ticket,
+                )
+
+    async def _heartbeat_session_run_admission(
+        self,
+        web_session_id: str,
+        admission_ticket: str,
+    ) -> None:
+        while True:
+            await asyncio.sleep(self.admission_renew_interval_seconds)
+            self.web_session_store.renew_session_run_admission(
+                web_session_id,
+                admission_ticket,
+                runtime_id=self.runtime_id,
+                ttl_seconds=self.admission_lease_ttl_seconds,
+            )
+
+    async def _release_session_run_admission(
+        self,
+        web_session_id: str,
+        admission_ticket: str,
+    ) -> bool:
+        failure: Exception | None = None
+        for delay in self.admission_release_retry_delays:
+            if delay:
+                await asyncio.sleep(delay)
+            try:
+                self.web_session_store.release_session_run_admission(
+                    web_session_id,
+                    admission_ticket,
+                )
+                return True
+            except Exception as exc:  # pylint: disable=broad-except
+                failure = exc
+        # Admission success/failure is already authoritative. Reversing it here
+        # can duplicate a live run or hide its real exception. The expiring
+        # lease remains a conservative delete fence until crash recovery reaps
+        # it, so log the maintenance failure without changing the result.
+        _logger.error(
+            "AgentScope run admission lease release failed; awaiting expiry",
+            exc_info=(
+                type(failure),
+                failure,
+                failure.__traceback__,
+            ) if failure is not None else None,
+        )
+        return False
+
+    async def _start_agent_run_with_ticket(
+        self,
+        *,
+        web_session_id: str,
+        agent_id: str,
+        model: str,
+        message: str,
+        turn_id: str | None = None,
+        admission_baseline: tuple[int, int | None] | None = None,
+    ) -> str:
         chat_service = self.app.state.chat_service
         session_id = await self.ensure_web_session(
             web_session_id,
@@ -735,10 +866,35 @@ class AgentScopeRuntime:
             )
 
         cancellation = CancellationContext()
+        admission_future: asyncio.Future[None] | None = None
+        if self.web_session_store is not None and admission_baseline is None:
+            admission_baseline = self.web_session_store.execution_boundary_snapshot(
+                web_session_id
+            )
         self.register_run_cancellation(
             session_id,
             cancellation,
+            generation=(admission_baseline[0] if admission_baseline else None),
         )
+        lease = self._run_cancellation_lease(session_id, cancellation)
+        if admission_baseline is not None:
+            admission_future = asyncio.get_running_loop().create_future()
+            lease.admission_baseline = admission_baseline
+            lease.admitted = False
+            lease.admission_future = admission_future
+
+        if self.stop_coordinator is not None and self.stop_coordinator.started:
+            try:
+                # A submit is not launchable until its baseline owner is
+                # visible to Stop; do not rely on the heartbeat interval.
+                await self.stop_coordinator.refresh_owners()
+            except Exception as exc:
+                self.clear_run_cancellation(session_id, cancellation)
+                with suppress(Exception):
+                    await self.stop_coordinator.refresh_owners()
+                raise RuntimeError(
+                    "AgentScope run owner publication failed"
+                ) from exc
 
         async def run_with_cancellation() -> None:
             try:
@@ -752,6 +908,16 @@ class AgentScopeRuntime:
                         )
             finally:
                 self.clear_run_cancellation(session_id, cancellation)
+                if (
+                    self.stop_coordinator is not None
+                    and self.stop_coordinator.started
+                ):
+                    try:
+                        await self.stop_coordinator.refresh_owners()
+                    except Exception:  # pylint: disable=broad-except
+                        _logger.exception(
+                            "Failed to remove completed AgentScope run owner"
+                        )
 
         try:
             task = self._spawn_chat_run(
@@ -767,6 +933,28 @@ class AgentScopeRuntime:
                 web_session_id=web_session_id,
                 turn_id=turn_id,
             )
+        add_done_callback = getattr(task, "add_done_callback", None)
+        if admission_future is not None and callable(add_done_callback):
+            def reject_unadmitted(completed: asyncio.Task) -> None:
+                if admission_future.done():
+                    return
+                if completed.cancelled():
+                    error = RuntimeError(
+                        "AgentScope run was stopped before admission"
+                    )
+                else:
+                    error = completed.exception() or RuntimeError(
+                        "AgentScope run exited before admission"
+                    )
+                admission_future.set_exception(error)
+
+            add_done_callback(reject_unadmitted)
+            try:
+                await admission_future
+            except asyncio.CancelledError:
+                cancellation.cancel()
+                await asyncio.gather(task, return_exceptions=True)
+                raise
         return session_id
 
     def _attach_user_turn_terminal(
@@ -857,10 +1045,12 @@ class AgentScopeRuntime:
         )
         coordinator_active = bool(
             stop_request is not None
+            and stop_request.status == "pending"
             and self.stop_coordinator is not None
             and self.stop_coordinator.started
         )
         interrupted = bool(mappings)
+        expected_owners: dict[str, dict[str, Any]] | None = None
         if coordinator_active:
             assert stop_request is not None
             assert self.stop_coordinator is not None
@@ -873,6 +1063,42 @@ class AgentScopeRuntime:
                 [session_id for _agent_id, session_id in mappings],
                 stop_request.generation,
             )
+
+        local_cancellations = {
+            lease.cancellation
+            for _agent_id, agentscope_session_id in mappings
+            for lease in self._run_cancellations.get(agentscope_session_id, [])
+            if stop_request is None
+            or lease.generation is None
+            or lease.generation <= stop_request.generation
+        }
+        local_failures: list[Exception] = []
+        for _agent_id, agentscope_session_id in mappings:
+            try:
+                interrupted = (
+                    self.cancel_run_cancellations(agentscope_session_id)
+                    or interrupted
+                )
+            except Exception as exc:  # pylint: disable=broad-except
+                local_failures.append(exc)
+
+        # Freeze the owner barrier before cancellation can release a lease,
+        # then issue AgentScope's official cancellations before waiting for the
+        # barrier. Pure-async background tools release their lease only from
+        # the cancelled task's finally block.
+        official_failure: Exception | None = None
+        try:
+            await self._request_official_web_session_cancellation(mappings)
+        except Exception as exc:  # pylint: disable=broad-except
+            official_failure = exc
+        if local_failures:
+            raise RuntimeError("explicit stop cancellation failed") from local_failures[0]
+        if official_failure is not None:
+            raise official_failure
+
+        if coordinator_active:
+            assert stop_request is not None
+            assert self.stop_coordinator is not None
             try:
                 await self.stop_coordinator.request_and_wait(
                     request_id=stop_request.request_id,
@@ -888,19 +1114,6 @@ class AgentScopeRuntime:
                     "explicit stop owner acknowledgement failed"
                 ) from exc
         else:
-            local_cancellations = {
-                lease.cancellation
-                for _agent_id, agentscope_session_id in mappings
-                for lease in self._run_cancellations.get(agentscope_session_id, [])
-                if stop_request is None
-                or lease.generation is None
-                or lease.generation <= stop_request.generation
-            }
-            for _agent_id, agentscope_session_id in mappings:
-                interrupted = (
-                    self.cancel_run_cancellations(agentscope_session_id)
-                    or interrupted
-                )
             if local_cancellations:
                 workers_done = await asyncio.gather(
                     *(
@@ -910,45 +1123,6 @@ class AgentScopeRuntime:
                 )
                 if not all(workers_done):
                     raise RuntimeError("explicit stop worker did not quiesce")
-
-        failures: list[Exception] = []
-        chat_service = self.app.state.chat_service
-        for agent_id, agentscope_session_id in mappings:
-            try:
-                await chat_service.interrupt(
-                    self.config.user_id,
-                    agentscope_session_id,
-                    agent_id,
-                )
-            except LookupError:
-                # Historical mappings can outlive an AgentScope session.
-                continue
-            except Exception as exc:  # pylint: disable=broad-except
-                failures.append(exc)
-
-        cancelled_task_ids: set[str] = set()
-        for _agent_id, agentscope_session_id in mappings:
-            try:
-                tasks = await self.message_bus.registry_getall(
-                    MessageBusKeys.bg_tasks(agentscope_session_id),
-                )
-            except Exception as exc:  # pylint: disable=broad-except
-                failures.append(exc)
-                continue
-            for task_id in tasks:
-                if task_id in cancelled_task_ids:
-                    continue
-                cancelled_task_ids.add(task_id)
-                try:
-                    await self.message_bus.publish(
-                        MessageBusKeys.task_cancel_channel(),
-                        {"task_id": task_id},
-                    )
-                except Exception as exc:  # pylint: disable=broad-except
-                    failures.append(exc)
-
-        if failures:
-            raise RuntimeError("explicit stop cancellation failed") from failures[0]
 
         if self.web_session_store is None:
             for _agent_id, agentscope_session_id in mappings:
@@ -1004,6 +1178,49 @@ class AgentScopeRuntime:
             stopped_tool_call_ids=[row.tool_call_id for row in stopped],
         )
 
+    async def _request_official_web_session_cancellation(
+        self,
+        mappings: list[tuple[str, str]],
+    ) -> None:
+        failures: list[Exception] = []
+        chat_service = self.app.state.chat_service
+        for agent_id, agentscope_session_id in mappings:
+            try:
+                await chat_service.interrupt(
+                    self.config.user_id,
+                    agentscope_session_id,
+                    agent_id,
+                )
+            except LookupError:
+                # Historical mappings can outlive an AgentScope session.
+                continue
+            except Exception as exc:  # pylint: disable=broad-except
+                failures.append(exc)
+
+        cancelled_task_ids: set[str] = set()
+        for _agent_id, agentscope_session_id in mappings:
+            try:
+                tasks = await self.message_bus.registry_getall(
+                    MessageBusKeys.bg_tasks(agentscope_session_id),
+                )
+            except Exception as exc:  # pylint: disable=broad-except
+                failures.append(exc)
+                continue
+            for task_id in tasks:
+                if task_id in cancelled_task_ids:
+                    continue
+                cancelled_task_ids.add(task_id)
+                try:
+                    await self.message_bus.publish(
+                        MessageBusKeys.task_cancel_channel(),
+                        {"task_id": task_id},
+                    )
+                except Exception as exc:  # pylint: disable=broad-except
+                    failures.append(exc)
+
+        if failures:
+            raise RuntimeError("explicit stop cancellation failed") from failures[0]
+
     def _all_web_session_mappings(
         self,
         web_session_id: str,
@@ -1027,29 +1244,67 @@ class AgentScopeRuntime:
     async def delete_web_session(self, web_session_id: str) -> bool:
         if self.web_session_store is None:
             raise RuntimeError("Web session store is not configured")
-        mappings = self.web_session_store.list_agentscope_session_mappings(web_session_id)
-        session_service = self.app.state.session_service
-        cancellation_failures: list[Exception] = []
-        for mapping in mappings:
-            try:
-                self.cancel_run_cancellations(mapping.agentscope_session_id)
-            except Exception as exc:  # pylint: disable=broad-except
-                cancellation_failures.append(exc)
-        if cancellation_failures:
-            raise RuntimeError("AgentScope session cancellation failed") from (
-                cancellation_failures[0]
+        async with self._stop_lock(web_session_id):
+            # This durable fence is visible to submitters in every process and
+            # intentionally survives any partial destructive failure. The
+            # manager removes it atomically with the final public session row;
+            # retries are idempotent.
+            self.web_session_store.begin_session_deletion(web_session_id)
+            deadline = asyncio.get_running_loop().time() + 10.0
+            while True:
+                self.web_session_store.reap_expired_session_run_admissions(
+                    web_session_id
+                )
+                if not self.web_session_store.session_run_admission_is_pending(
+                    web_session_id
+                ):
+                    break
+                if asyncio.get_running_loop().time() >= deadline:
+                    raise RuntimeError(
+                        "session run admission did not quiesce before deletion"
+                    )
+                await asyncio.sleep(0.01)
+            mappings = self.web_session_store.list_agentscope_session_mappings(
+                web_session_id
             )
-        for mapping in mappings:
-            await session_service.delete_session(
-                self.config.user_id,
-                mapping.agent_id,
-                mapping.agentscope_session_id,
+            coordinator_active = bool(
+                self.stop_coordinator is not None
+                and self.stop_coordinator.started
             )
-        for mapping in mappings:
-            self.discard_run_cancellations(mapping.agentscope_session_id)
-        self._navigation_services().delete_control_state_for_web_session(web_session_id)
-        self.web_sessions.pop(web_session_id, None)
-        return True
+            if coordinator_active:
+                # Do not destroy AgentScope or navigation state until every
+                # frozen remote owner has acknowledged actual quiescence.
+                await self._interrupt_web_session_serialized(
+                    web_session_id=web_session_id,
+                )
+            else:
+                cancellation_failures: list[Exception] = []
+                for mapping in mappings:
+                    try:
+                        self.cancel_run_cancellations(
+                            mapping.agentscope_session_id
+                        )
+                    except Exception as exc:  # pylint: disable=broad-except
+                        cancellation_failures.append(exc)
+                if cancellation_failures:
+                    raise RuntimeError(
+                        "AgentScope session cancellation failed"
+                    ) from cancellation_failures[0]
+
+            session_service = self.app.state.session_service
+            for mapping in mappings:
+                await session_service.delete_session(
+                    self.config.user_id,
+                    mapping.agent_id,
+                    mapping.agentscope_session_id,
+                )
+            for mapping in mappings:
+                self.discard_run_cancellations(mapping.agentscope_session_id)
+            self._navigation_services().delete_control_state_for_web_session(
+                web_session_id
+            )
+            self.web_sessions.pop(web_session_id, None)
+            return True
 
     def register_run_cancellation(
         self,
@@ -1098,6 +1353,62 @@ class AgentScopeRuntime:
         public_session_id = self._public_session_id(agentscope_session_id)
         if public_session_id is None or self.web_session_store is None:
             return None
+        lease = self._run_cancellation_lease(
+            agentscope_session_id,
+            cancellation,
+        )
+        if not lease.admitted:
+            lease.generation = self.web_session_store.begin_execution_generation(
+                public_session_id,
+                expected_boundary=lease.admission_baseline,
+            )
+            lease.admitted = True
+        elif lease.generation is None:
+            lease.generation = self.web_session_store.begin_execution_generation(
+                public_session_id
+            )
+        return lease.generation
+
+    async def complete_user_execution_admission(
+        self,
+        agentscope_session_id: str,
+        cancellation: CancellationContext,
+    ) -> None:
+        lease = self._run_cancellation_lease(
+            agentscope_session_id,
+            cancellation,
+        )
+        try:
+            if self.stop_coordinator is not None and self.stop_coordinator.started:
+                await self.stop_coordinator.refresh_owners()
+            public_session_id = self._public_session_id(agentscope_session_id)
+            if (
+                public_session_id is not None
+                and self.web_session_store is not None
+                and self.web_session_store.execution_generation_is_fenced(
+                    public_session_id
+                )
+            ):
+                cancellation.cancel()
+                raise RuntimeError("execution admission was fenced by stop")
+        except Exception as exc:
+            future = lease.admission_future
+            if future is not None and not future.done():
+                future.set_exception(
+                    exc
+                    if isinstance(exc, RuntimeError)
+                    else RuntimeError("AgentScope run admission failed")
+                )
+            raise
+        future = lease.admission_future
+        if future is not None and not future.done():
+            future.set_result(None)
+
+    def _run_cancellation_lease(
+        self,
+        agentscope_session_id: str,
+        cancellation: CancellationContext,
+    ) -> _CancellationLease:
         lease = next(
             (
                 item
@@ -1113,11 +1424,7 @@ class AgentScopeRuntime:
             raise RuntimeError(
                 "AgentScope user run must register cancellation before admission"
             )
-        if lease.generation is None:
-            lease.generation = self.web_session_store.begin_execution_generation(
-                public_session_id
-            )
-        return lease.generation
+        return lease
 
     def retain_tool_cancellation(
         self,
