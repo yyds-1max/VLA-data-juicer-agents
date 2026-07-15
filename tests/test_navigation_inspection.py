@@ -40,6 +40,14 @@ def test_topic_candidate_inspection_does_not_select_final_params():
     payload = result.model_dump(mode="json")
     assert "/rs32_lidar_points" in result.available_topics
     assert result.suggested_role_names["lidar"] == ["/rs32_lidar_points"]
+    lidar_route = next(
+        route
+        for route in result.routes
+        if route.role == "lidar" and route.topic == "/rs32_lidar_points"
+    )
+    assert lidar_route.extracted_dir == "rs32_lidar_points"
+    assert lidar_route.output_dir == "r32_rslidar_points"
+    assert lidar_route.sync_reference_eligible is True
     assert "topic_whitelist" not in payload
     assert "topic_map" not in payload
     assert "query_dir" not in payload

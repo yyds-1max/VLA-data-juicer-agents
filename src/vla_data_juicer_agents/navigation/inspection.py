@@ -13,8 +13,9 @@ from vla_data_juicer_agents.navigation.observation_models import (
     SensorCandidatesObservation,
     SensorRoleCandidate,
     TopicCandidatesObservation,
+    TopicRouteCandidate,
 )
-from vla_data_juicer_agents.navigation.profiles import topics_for_role
+from vla_data_juicer_agents.navigation.profiles import topic_route, topics_for_role
 
 
 DATE_RE = re.compile(r"^[0-9]{8}$")
@@ -139,6 +140,57 @@ def _topic_type_map(selected_segments: list[SegmentInspection]) -> dict[str, str
     }
 
 
+def _candidate_roles(topic: str, message_type: str | None, topic_names: set[str]) -> list[tuple[str, float]]:
+    known_roles = [
+        role
+        for role in ("fisheye_front", "lidar", "odom", "ins", "gridmap")
+        if topic in topics_for_role(topic_names, role)
+    ]
+    if known_roles:
+        return [(role, 1.0) for role in known_roles]
+
+    type_name = message_type or ""
+    topic_lower = topic.lower()
+    if "CompressedImage" in type_name or type_name.endswith("/Image"):
+        return [("fisheye_front", 0.5)]
+    if "PointCloud2" in type_name:
+        return [("lidar", 0.8)]
+    if "Odometry" in type_name:
+        return [("odom", 0.9)]
+    if type_name.endswith("/Ins") or topic.endswith("/Ins"):
+        return [("ins", 0.8)]
+    if "gridmap" in topic_lower or "grid_map" in topic_lower:
+        return [("gridmap", 0.7)]
+    return []
+
+
+def _sensor_candidates(topic_types: dict[str, str | None]) -> list[SensorRoleCandidate]:
+    topic_names = set(topic_types)
+    candidates: list[SensorRoleCandidate] = []
+    for topic in sorted(topic_names):
+        message_type = topic_types[topic]
+        roles = _candidate_roles(topic, message_type, topic_names)
+        for role, confidence in roles:
+            candidates.append(
+                SensorRoleCandidate(
+                    role=role,
+                    topic=topic,
+                    message_type=message_type,
+                    confidence=confidence,
+                )
+            )
+            if role in {"odom", "ins"}:
+                candidates.append(
+                    SensorRoleCandidate(
+                        role="localization",
+                        topic=topic,
+                        message_type=message_type,
+                        confidence=confidence,
+                    )
+                )
+    return candidates
+
+
 def inspect_navigation_sensor_candidates(
     date: str,
     segments: list[str] | None = None,
@@ -147,31 +199,7 @@ def inspect_navigation_sensor_candidates(
     inspection = inspect_raw_date(date, settings=settings)
     selected_segments = _select_inspection_segments(inspection, segments)
     topic_types = _topic_type_map(selected_segments)
-    topic_names = set(topic_types)
-    candidates: list[SensorRoleCandidate] = []
-    role_topics: dict[str, list[str]] = {}
-    for role in ("fisheye_front", "lidar", "odom", "ins"):
-        matches = sorted(topics_for_role(topic_names, role))
-        role_topics[role] = matches
-        candidates.extend(
-            SensorRoleCandidate(
-                role=role,
-                topic=topic,
-                message_type=topic_types.get(topic),
-                confidence=1.0,
-            )
-            for topic in matches
-        )
-    candidates.extend(
-        SensorRoleCandidate(
-            role="localization",
-            topic=topic,
-            message_type=topic_types.get(topic),
-            confidence=1.0,
-        )
-        for topic in sorted({*role_topics["odom"], *role_topics["ins"]})
-    )
-    return SensorCandidatesObservation(candidates=candidates)
+    return SensorCandidatesObservation(candidates=_sensor_candidates(topic_types))
 
 
 def inspect_navigation_topic_candidates(
@@ -181,24 +209,33 @@ def inspect_navigation_topic_candidates(
 ) -> TopicCandidatesObservation:
     inspection = inspect_raw_date(date, settings=settings)
     selected_segments = _select_inspection_segments(inspection, segments)
-    topic_names = {
-        topic.name
-        for segment in selected_segments
-        for topic in segment.topics
-    }
+    topic_types = _topic_type_map(selected_segments)
+    candidates = _sensor_candidates(topic_types)
+    topic_names = set(topic_types)
     suggested_role_names = {
-        role: sorted(topics_for_role(topic_names, role))
-        for role in ("fisheye_front", "lidar", "odom", "ins")
+        role: sorted({candidate.topic for candidate in candidates if candidate.role == role})
+        for role in ("fisheye_front", "lidar", "odom", "ins", "localization", "gridmap")
     }
-    suggested_role_names["localization"] = sorted(
-        {
-            *suggested_role_names["odom"],
-            *suggested_role_names["ins"],
-        }
-    )
+    routes = []
+    for candidate in candidates:
+        extracted_dir, output_dir = topic_route(
+            candidate.topic,
+            candidate.role,
+            message_type=candidate.message_type,
+        )
+        routes.append(
+            TopicRouteCandidate(
+                role=candidate.role,
+                topic=candidate.topic,
+                extracted_dir=extracted_dir,
+                output_dir=output_dir,
+                sync_reference_eligible=candidate.role in {"lidar", "gridmap"},
+            )
+        )
     return TopicCandidatesObservation(
         available_topics=sorted(topic_names),
         suggested_role_names=suggested_role_names,
+        routes=routes,
     )
 
 
@@ -207,10 +244,11 @@ def inspect_navigation_calibration_inventory(
 ) -> CalibrationInventoryObservation:
     settings = settings or NavigationSettings()
     params_root = settings.processing_root / "NoobScenes" / "params"
+    required_files = ("fisheye_front.json", "r32_rslidar_points.json")
     sources = sorted(
         path.relative_to(settings.processing_root).as_posix()
         for path in params_root.glob("*/sensors")
-        if path.is_dir()
+        if path.is_dir() and all((path / name).is_file() for name in required_files)
     )
     return CalibrationInventoryObservation(sensor_sources=sources)
 
@@ -349,4 +387,15 @@ def inspect_runtime_assets(settings: NavigationSettings | None = None) -> dict:
             "cjl_with_gridmap": (pt_project / "2_othermethod_cjl.py").exists(),
             "cjl_0525_with_gridmap": (pt_project / "2_othermethod_cjl_0525.py").exists(),
         },
+        "noobscene_localization_variants": {
+            "ins": (settings.processing_root / "NoobScenes" / "main_smart.py").exists(),
+            "odom": (
+                settings.processing_root / "NoobScenes" / "main_smart_odom.py"
+            ).exists(),
+        },
+        "speed_direction_variants": {
+            "ins": (pt_project / "4_speed_direction_Ins.py").exists(),
+            "odom": (pt_project / "4_speed_direction_odom.py").exists(),
+        },
+        "scene_environment_affects_execution": False,
     }

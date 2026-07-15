@@ -219,10 +219,11 @@ def resolve_step_arguments(
             "finish_temp_path": finish_temp,
             "finish_path": finish_path,
             "projection_variant": step.variant,
+            "localization_source": plan.decisions.localization.source,
             **common,
         }
     if action == "validate_navigation_outputs":
-        return {"date": task.date, **common}
+        return {"date": task.date, "segments": task.segments, **common}
     raise ValueError(f"unsupported navigation plan action: {action}")
 
 
@@ -270,12 +271,35 @@ def verify_plan_step_preconditions(
         )
         require_segments(input_root)
     elif action in {_EXTERNAL_ACTION, "assemble_finish_temp"}:
-        require(Path(arguments["selected_sensor_source"]))
+        sensor_source = Path(arguments["selected_sensor_source"])
+        require(sensor_source)
         if action == "assemble_finish_temp":
-            require_segments(
-                settings.clip_data_root / task.date,
-                suffix=("sync_data",),
+            require(sensor_source / "fisheye_front.json")
+            require(sensor_source / "r32_rslidar_points.json")
+            clip_date_root = settings.clip_data_root / task.date
+            require_segments(clip_date_root, suffix=("sync_data",))
+            segment_names = task.segments or (
+                sorted(path.name for path in clip_date_root.iterdir() if path.is_dir())
+                if clip_date_root.is_dir()
+                else []
             )
+            for segment_name in segment_names:
+                sync_root = clip_date_root / segment_name / "sync_data"
+                if not sync_root.is_dir():
+                    continue
+                if not any(
+                    all(
+                        child.is_dir()
+                        and any(path.is_file() for path in child.iterdir())
+                        for child in (
+                            sequence / "fisheye_front",
+                            sequence / "r32_rslidar_points",
+                        )
+                    )
+                    for sequence in sync_root.iterdir()
+                    if sequence.is_dir()
+                ):
+                    missing.append(sync_root)
     elif action == "prepare_gridmap_for_projection":
         observation = SqliteNavigationObservationStore(
             plan_store.db_path,
@@ -337,6 +361,35 @@ def verify_plan_step_preconditions(
     }:
         if not task.dry_run:
             require(Path(arguments["finish_temp_path"]))
+        if action == "run_noobscene_preprocessing":
+            noobscene_root = settings.processing_root / "NoobScenes"
+            localization_source = arguments["localization_source"]
+            require(
+                noobscene_root
+                / ("main_smart.py" if localization_source == "ins" else "main_smart_odom.py")
+            )
+            if localization_source == "odom":
+                require(noobscene_root / "include" / "1_odom_convert.py")
+                require(noobscene_root / "include" / "2_resize.py")
+        elif action == "run_projection_and_trajectory":
+            pt_project = settings.processing_root / "2_pt_project"
+            localization_source = arguments["localization_source"]
+            require(
+                pt_project
+                / (
+                    "4_speed_direction_Ins.py"
+                    if localization_source == "ins"
+                    else "4_speed_direction_odom.py"
+                )
+            )
+            require(
+                pt_project
+                / (
+                    "2_othermethod_cjl.py"
+                    if localization_source == "ins"
+                    else "2_othermethod_cjl_0525.py"
+                )
+            )
 
     if not missing:
         return None

@@ -15,24 +15,58 @@ class DecisionBase(StrictModel):
 
 
 class SensorBindingDecision(DecisionBase):
-    bindings: dict[Literal["fisheye_front", "lidar", "odom", "ins", "localization"], str]
+    bindings: dict[
+        Literal["fisheye_front", "lidar", "odom", "ins", "localization", "gridmap"],
+        str,
+    ] = Field(
+        description=(
+            "Model-selected sensor role to full observed ROS topic name. Bind localization "
+            "to the selected native Ins topic, or to the exact odom topic when Ins is absent."
+        )
+    )
 
 
 class TopicSelectionDecision(DecisionBase):
-    topic_whitelist: list[str] = Field(min_length=1)
-    topic_map: dict[str, str] = Field(min_length=1)
-    query_dir: str
+    topic_whitelist: list[str] = Field(
+        min_length=1,
+        description=(
+            "Full observed ROS topic names to extract. Select the bound front fisheye, "
+            "lidar, and localization topic, plus a selected gridmap topic when applicable."
+        ),
+    )
+    topic_map: dict[str, str] = Field(
+        min_length=1,
+        description=(
+            "Mapping from extracted tmp_dir child names to canonical sync_data child names, "
+            "for example rs32_lidar_points -> r32_rslidar_points. Use observed topic routes."
+        ),
+    )
+    query_dir: str = Field(
+        min_length=1,
+        description=(
+            "One relative tmp_dir child name used as the timestamp reference, for example "
+            "rs32_lidar_points. Never provide a ROS topic or filesystem path."
+        ),
+    )
 
 
 class TimeSyncDecision(DecisionBase):
-    reference_sensor: str
+    reference_sensor: str = Field(
+        description=(
+            "A bound sensor role whose observed extracted_dir equals topic_selection.query_dir; "
+            "normally lidar, or gridmap when an extracted gridmap stream is selected."
+        )
+    )
     method: Literal["nearest_timestamp"]
-    tolerance_ms: int = Field(gt=0, le=1000)
 
 
 class LocalizationDecision(DecisionBase):
-    source: Literal["odom", "ins"]
-    conversion: Literal["odom_to_ins", "none"]
+    source: Literal["odom", "ins"] = Field(
+        description="Observed localization representation selected for finish processing."
+    )
+    conversion: Literal["odom_to_ins", "none"] = Field(
+        description="Use odom_to_ins for odom input and none for native Ins input."
+    )
 
 
 class GridmapDecision(DecisionBase):

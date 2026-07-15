@@ -179,7 +179,8 @@ def test_run_noobscene_preprocessing_skips_odom_conversion_for_native_ins(tmp_pa
     assert any("0_creat_box.py" in shell for shell in shells)
     assert not any("1_odom_convert.py" in shell for shell in shells)
     assert not any("2_resize.py" in shell for shell in shells)
-    assert any("main_smart_odom.py" in shell for shell in shells)
+    assert any("main_smart.py" in shell for shell in shells)
+    assert not any("main_smart_odom.py" in shell for shell in shells)
 
 
 @pytest.mark.parametrize(
@@ -248,6 +249,8 @@ def test_assemble_finish_temp_copies_only_server_finish_inputs_and_selected_sens
     sensor_source = processing_root / "NoobScenes" / "params" / "20260529_go2w" / "sensors"
     sensor_source.mkdir(parents=True)
     (sensor_source / "calib.json").write_text("{}", encoding="utf-8")
+    (sensor_source / "fisheye_front.json").write_text("{}", encoding="utf-8")
+    (sensor_source / "r32_rslidar_points.json").write_text("{}", encoding="utf-8")
     settings = NavigationSettings(vladatasets_root=root, processing_root=processing_root)
 
     result = assemble_finish_temp(
@@ -271,10 +274,15 @@ def test_assemble_finish_temp_uses_validated_selected_sensor_source(tmp_path):
     root = tmp_path / "VLADatasets"
     processing_root = tmp_path / "processing"
     clip = root / "clip_data" / "20270605" / "segment-a" / "sync_data" / "clip-a"
-    (clip / "fisheye_front").mkdir(parents=True)
+    for child_name in ("fisheye_front", "r32_rslidar_points"):
+        child = clip / child_name
+        child.mkdir(parents=True)
+        (child / "data.txt").write_text(child_name, encoding="utf-8")
     selected = processing_root / "NoobScenes" / "params" / "selected" / "sensors"
     selected.mkdir(parents=True)
     (selected / "calib.json").write_text('{"selected": true}', encoding="utf-8")
+    (selected / "fisheye_front.json").write_text("{}", encoding="utf-8")
+    (selected / "r32_rslidar_points.json").write_text("{}", encoding="utf-8")
     settings = NavigationSettings(vladatasets_root=root, processing_root=processing_root)
 
     result = assemble_finish_temp(
@@ -302,6 +310,8 @@ def test_confirm_navigation_calibration_params_reports_sensor_source(tmp_path):
     processing_root = tmp_path / "processing"
     sensor_source = processing_root / "NoobScenes" / "params" / "20260409_U" / "sensors"
     sensor_source.mkdir(parents=True)
+    (sensor_source / "fisheye_front.json").write_text("{}", encoding="utf-8")
+    (sensor_source / "r32_rslidar_points.json").write_text("{}", encoding="utf-8")
     settings = NavigationSettings(
         vladatasets_root=tmp_path / "VLADatasets",
         processing_root=processing_root,
@@ -326,6 +336,8 @@ def test_confirm_navigation_calibration_params_rejects_unconfirmed_input(tmp_pat
     processing_root = tmp_path / "processing"
     sensor_source = processing_root / "NoobScenes" / "params" / "20260529_go2w" / "sensors"
     sensor_source.mkdir(parents=True)
+    (sensor_source / "fisheye_front.json").write_text("{}", encoding="utf-8")
+    (sensor_source / "r32_rslidar_points.json").write_text("{}", encoding="utf-8")
     settings = NavigationSettings(
         vladatasets_root=tmp_path / "VLADatasets",
         processing_root=processing_root,
@@ -583,7 +595,7 @@ def test_projection_python_steps_dry_run_use_data_runtime_setup(tmp_path):
     assert any("exec \"$AGENT_DATA_PYTHON\" main.py --data_root" in shell for shell in shells)
     assert any("/processing/2_pt_project/0_img2world.py" in shell for shell in shells)
     assert any("/processing/2_pt_project/4_speed_direction_odom.py" in shell for shell in shells)
-    assert any("/processing/2_pt_project/2_othermethod_cjl.py" in shell for shell in shells)
+    assert any("/processing/2_pt_project/2_othermethod_cjl_0525.py" in shell for shell in shells)
     assert any("/processing/2_pt_project/3_move_dir.py" in shell for shell in shells)
     for shell in shells:
         if "$AGENT_DATA_PYTHON" in shell or "./bin/main" in shell:
@@ -610,7 +622,7 @@ def test_projection_and_trajectory_uses_explicit_0525_projection_variant(tmp_pat
     assert not any(shell.endswith("./bin/main") for shell in shells)
 
 
-def test_projection_and_trajectory_uses_explicit_projection_variant_script_choice(tmp_path):
+def test_projection_and_trajectory_uses_native_ins_scripts(tmp_path):
     root = tmp_path / "VLADatasets"
     finish_temp = root / "finish_data" / "20270605_temp"
     settings = NavigationSettings(vladatasets_root=root, processing_root=Path("/processing"))
@@ -618,20 +630,26 @@ def test_projection_and_trajectory_uses_explicit_projection_variant_script_choic
     result = run_projection_and_trajectory(
         finish_temp,
         root / "finish_data" / "20270605",
-        projection_variant="cjl_0525_with_gridmap",
+        projection_variant="cjl_with_gridmap",
+        localization_source="ins",
         settings=settings,
         dry_run=True,
     )
 
     shells = [_command_text(record.command) for record in result.commands]
-    assert result.details["projection_variant"] == "cjl_0525_with_gridmap"
-    assert any("/processing/2_pt_project/2_othermethod_cjl_0525.py" in shell for shell in shells)
+    assert result.details["projection_variant"] == "cjl_with_gridmap"
+    assert result.details["localization_source"] == "ins"
+    assert any("/processing/2_pt_project/4_speed_direction_Ins.py" in shell for shell in shells)
+    assert any("/processing/2_pt_project/2_othermethod_cjl.py" in shell for shell in shells)
 
 
 def test_validate_navigation_outputs_checks_grid_map(tmp_path):
     root = tmp_path / "VLADatasets"
     final = root / "finish_data" / "20270605"
     (final / "20260605_152856" / "clip_a" / "grid_map").mkdir(parents=True)
+    (final / "20260605_152856" / "clip_a" / "grid_map" / "map.json").write_text(
+        "{}", encoding="utf-8"
+    )
     settings = NavigationSettings(vladatasets_root=root)
 
     result = validate_navigation_outputs("20270605", settings=settings, dry_run=False)

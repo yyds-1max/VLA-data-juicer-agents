@@ -220,7 +220,9 @@ def build_services(
                 RuntimeAssetsObservation(
                     pcd_gridmap_tool_available=True,
                     manual_annotation_gui_available=True,
-                    projection_variants={"cjl_with_gridmap": True},
+                    projection_variants={"cjl_0525_with_gridmap": True},
+                    noobscene_localization_variants={"odom": True},
+                    speed_direction_variants={"odom": True},
                 ),
             ),
             (
@@ -296,18 +298,17 @@ def valid_extract_plan_payload(services: Services) -> dict:
                     "/localization/odom",
                 ],
                 "topic_map": {
-                    "/camera/front/image": "fisheye_front",
-                    "/lidar/points": "lidar",
-                    "/localization/odom": "odom",
+                    "camera": "fisheye_front",
+                    "lidar": "r32_rslidar_points",
+                    "localization": "odom",
                 },
-                "query_dir": "/data/query",
+                "query_dir": "lidar",
                 "reason": "Selected only observed topics.",
                 "evidence_refs": [refs["topic_candidates"]],
             },
             "time_sync": {
                 "reference_sensor": "lidar",
                 "method": "nearest_timestamp",
-                "tolerance_ms": 50,
                 "reason": "Lidar is the measured reference stream.",
                 "evidence_refs": [refs["raw_metadata"]],
             },
@@ -369,11 +370,38 @@ def valid_finish_plan_payload(services: Services) -> dict:
                 "decision_refs": ["calibration"],
             },
             {
+                "step_id": "assemble_finish",
+                "action": "assemble_finish_temp",
+                "variant": "default",
+                "arguments": {},
+                "depends_on": ["confirm_calibration"],
+                "failure_policy": "stop",
+                "decision_refs": ["calibration"],
+            },
+            {
+                "step_id": "preprocess",
+                "action": "run_noobscene_preprocessing",
+                "variant": "default",
+                "arguments": {},
+                "depends_on": ["assemble_finish"],
+                "failure_policy": "stop",
+                "decision_refs": ["localization"],
+            },
+            {
+                "step_id": "initial_annotation",
+                "action": "run_initial_annotation_gui",
+                "variant": "human_gui",
+                "arguments": {},
+                "depends_on": ["preprocess"],
+                "failure_policy": "stop",
+                "decision_refs": ["calibration"],
+            },
+            {
                 "step_id": "tracking",
                 "action": "run_tracking",
                 "variant": "default",
                 "arguments": {},
-                "depends_on": ["confirm_calibration"],
+                "depends_on": ["initial_annotation"],
                 "failure_policy": "stop",
                 "decision_refs": ["localization"],
             },
@@ -389,7 +417,7 @@ def valid_finish_plan_payload(services: Services) -> dict:
             {
                 "step_id": "projection",
                 "action": "run_projection_and_trajectory",
-                "variant": "cjl_with_gridmap",
+                "variant": "cjl_0525_with_gridmap",
                 "arguments": {},
                 "depends_on": ["prepare_gridmap"],
                 "failure_policy": "stop",
@@ -677,18 +705,6 @@ def test_gui_runtime_unavailable_blocks_submission_but_available_runtime_succeed
 ):
     services = build_services(tmp_path, "finish_processing")
     payload = valid_finish_plan_payload(services)
-    payload["steps"].insert(
-        1,
-        {
-            "step_id": "initial_annotation",
-            "action": "run_initial_annotation_gui",
-            "variant": "human_gui",
-            "arguments": {},
-            "depends_on": ["confirm_calibration"],
-            "failure_policy": "stop",
-            "decision_refs": ["calibration"],
-        },
-    )
     available = services.observation_store.latest(services.task.task_id)
     assert available is not None
     unavailable = available.model_copy(
@@ -716,8 +732,8 @@ def test_gui_runtime_unavailable_blocks_submission_but_available_runtime_succeed
             for issue in blocked["errors"]
             if issue["code"] == "runtime_action_unavailable"
         )
-    ) == PlanValidationIssue(
-        path="plan.steps.1.action",
+        ) == PlanValidationIssue(
+            path="plan.steps.3.action",
         code="runtime_action_unavailable",
         message="Manual annotation GUI is unavailable in observed runtime assets",
         allowed_values=[
@@ -738,7 +754,7 @@ def test_gui_runtime_unavailable_blocks_submission_but_available_runtime_succeed
     accepted = call_submit_finish(services, payload)
 
     assert accepted["ok"] is True
-    assert accepted["step_count"] == 6
+    assert accepted["step_count"] == 8
 
 
 def test_audit_failure_prevents_activation_and_returns_stable_internal_failure(

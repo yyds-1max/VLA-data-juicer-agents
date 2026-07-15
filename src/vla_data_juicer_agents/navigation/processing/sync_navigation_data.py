@@ -9,6 +9,7 @@ import shutil
 import math
 import multiprocessing
 import json
+from pathlib import Path
 
 # 默认话题映射表；运行时可通过 --topic_map 或 --topic_map_file 覆盖。
 DEFAULT_TOPIC_MAP = {
@@ -20,6 +21,7 @@ DEFAULT_TOPIC_MAP = {
     "lidar_points":"r32_rslidar_points",  
     "sport_odom":"odom"
 }
+SYNC_TOLERANCE_SECONDS = 0.1
 
 
 def _load_json_dict(value, label):
@@ -46,6 +48,40 @@ def string2time(name):
     """
     (time, _) = os.path.splitext(name)
     return float(time)
+
+
+def resolve_query_path(tmp_data_path, query_dir):
+    query_component = Path(query_dir)
+    if query_component.is_absolute() or len(query_component.parts) != 1 or query_dir in {".", ".."}:
+        raise ValueError(
+            "query_dir must be one relative child directory under tmp_dir, "
+            f"got {query_dir!r}"
+        )
+    query_path = Path(tmp_data_path) / query_component
+    if not query_path.is_dir():
+        available = sorted(path.name for path in Path(tmp_data_path).iterdir() if path.is_dir())
+        raise FileNotFoundError(
+            f"query_dir {query_dir!r} is not present under {tmp_data_path}; "
+            f"available directories: {available}"
+        )
+    return query_path
+
+
+def timestamped_file_names(directory):
+    names = sorted(path.name for path in Path(directory).iterdir() if path.is_file() and not path.name.startswith("."))
+    if not names:
+        raise ValueError(f"no timestamped files found in {directory}")
+    invalid = []
+    for name in names:
+        try:
+            string2time(name)
+        except ValueError:
+            invalid.append(name)
+    if invalid:
+        raise ValueError(
+            f"non-timestamp filenames found in {directory}: {invalid[:5]}"
+        )
+    return names
 
 def get_seq_name(seq_index, opt):
     """根据是否提供 sequence_prefix 决定 sequence 目录名"""
@@ -87,15 +123,29 @@ def sync_data(opt, active_topic_map=None):
     tmp_data_path = os.path.join(data_path, "tmp_dir")
     # 同步后的数据存储目录
     sync_data_path = os.path.join(data_path, output_dir)
-    if not os.path.exists(sync_data_path):
-        os.makedirs(sync_data_path)
-    # 获取当前目录下的所有文件夹(不包含要查询的文件夹)
-    search_dir_list = os.listdir(tmp_data_path)
+    available_search_dirs = {
+        path.name for path in Path(tmp_data_path).iterdir() if path.is_dir()
+    }
+    search_dir_list = sorted(active_topic_map)
+    missing_search_dirs = sorted(set(search_dir_list) - available_search_dirs)
+    if missing_search_dirs:
+        raise FileNotFoundError(
+            "topic_map references directories that are missing under tmp_dir: "
+            f"{missing_search_dirs}; available directories: {sorted(available_search_dirs)}"
+        )
+    if query_dir not in active_topic_map:
+        raise ValueError(
+            f"query_dir {query_dir!r} must be one of the topic_map source directories: "
+            f"{search_dir_list}"
+        )
 
     # 获取要查询的文件夹下的所有文件，并进行排序
-    query_file_names = os.listdir(os.path.join(tmp_data_path, query_dir))
-    query_file_names = np.array(sorted(query_file_names))
+    query_path = resolve_query_path(tmp_data_path, query_dir)
+    query_file_names = np.array(timestamped_file_names(query_path))
     query_file_times = np.array(list(map(string2time, query_file_names)))
+
+    if not os.path.exists(sync_data_path):
+        os.makedirs(sync_data_path)
 
     query_file_indexs = np.arange(len(query_file_names))
 
@@ -103,8 +153,8 @@ def sync_data(opt, active_topic_map=None):
     search_file_names = {}
     # 遍历所有要同步的文件夹
     for search_dir in search_dir_list:
-        cur_search_file_names = os.listdir(os.path.join(tmp_data_path, search_dir))
-        cur_search_file_names = np.array(sorted(cur_search_file_names))
+        search_path = os.path.join(tmp_data_path, search_dir)
+        cur_search_file_names = np.array(timestamped_file_names(search_path))
         cur_search_file_times = np.array(list(map(string2time, cur_search_file_names)))
 
         search_file_names[search_dir] = cur_search_file_names
@@ -112,7 +162,10 @@ def sync_data(opt, active_topic_map=None):
 
         for i, query_file_time in enumerate(query_file_times):
             min_del_time_index = np.argmin(abs(query_file_time - cur_search_file_times))
-            if abs(cur_search_file_times[min_del_time_index] - query_file_time) > 0.1:  # 0.05
+            if (
+                abs(cur_search_file_times[min_del_time_index] - query_file_time)
+                > SYNC_TOLERANCE_SECONDS
+            ):
                 query_file_indexs[i] = -1
             cur_search_file_index.append(min_del_time_index)
 

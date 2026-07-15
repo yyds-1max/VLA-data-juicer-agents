@@ -134,11 +134,38 @@ def _finish_plan(evidence):
                 "decision_refs": ["calibration"],
             },
             {
+                "step_id": "assemble_finish",
+                "action": "assemble_finish_temp",
+                "variant": "default",
+                "arguments": {},
+                "depends_on": ["confirm_calibration"],
+                "failure_policy": "stop",
+                "decision_refs": ["calibration"],
+            },
+            {
+                "step_id": "preprocess",
+                "action": "run_noobscene_preprocessing",
+                "variant": "default",
+                "arguments": {},
+                "depends_on": ["assemble_finish"],
+                "failure_policy": "stop",
+                "decision_refs": ["localization"],
+            },
+            {
+                "step_id": "initial_annotation",
+                "action": "run_initial_annotation_gui",
+                "variant": "human_gui",
+                "arguments": {},
+                "depends_on": ["preprocess"],
+                "failure_policy": "stop",
+                "decision_refs": ["calibration"],
+            },
+            {
                 "step_id": "tracking",
                 "action": "run_tracking",
                 "variant": "default",
                 "arguments": {},
-                "depends_on": ["confirm_calibration"],
+                "depends_on": ["initial_annotation"],
                 "failure_policy": "stop",
                 "decision_refs": ["localization"],
             },
@@ -154,7 +181,7 @@ def _finish_plan(evidence):
             {
                 "step_id": "projection",
                 "action": "run_projection_and_trajectory",
-                "variant": "cjl_with_gridmap",
+                "variant": "cjl_0525_with_gridmap",
                 "arguments": {},
                 "depends_on": ["prepare_gridmap"],
                 "failure_policy": "stop",
@@ -174,21 +201,36 @@ def _finish_plan(evidence):
 
 
 def _write_finish_inputs(settings):
-    sync_gridmap = (
-        settings.clip_data_root / DATE / SEGMENT / "sync_data" / "clip-1" / "grid_map"
-    )
+    sync_clip = settings.clip_data_root / DATE / SEGMENT / "sync_data" / "clip-1"
+    sync_gridmap = sync_clip / "grid_map"
     sync_gridmap.mkdir(parents=True, exist_ok=True)
     (sync_gridmap / "map.json").write_text("{}", encoding="utf-8")
-    (settings.processing_root / "NoobScenes" / "params" / "selected" / "sensors").mkdir(
+    for dirname in ("fisheye_front", "r32_rslidar_points"):
+        sensor_dir = sync_clip / dirname
+        sensor_dir.mkdir(parents=True, exist_ok=True)
+        (sensor_dir / "1000.000000.data").write_text("data", encoding="utf-8")
+    sensors = settings.processing_root / "NoobScenes" / "params" / "selected" / "sensors"
+    sensors.mkdir(
         parents=True,
         exist_ok=True,
     )
+    (sensors / "fisheye_front.json").write_text("{}", encoding="utf-8")
+    (sensors / "r32_rslidar_points.json").write_text("{}", encoding="utf-8")
     converter = settings.processing_root / "NoobScenes" / "include" / "1_odom_convert.py"
     converter.parent.mkdir(parents=True, exist_ok=True)
     converter.write_text("# converter", encoding="utf-8")
-    projection = settings.processing_root / "2_pt_project" / "2_othermethod_cjl.py"
+    (settings.processing_root / "NoobScenes" / "main_smart_odom.py").write_text(
+        "# odom", encoding="utf-8"
+    )
+    projection = settings.processing_root / "2_pt_project" / "2_othermethod_cjl_0525.py"
     projection.parent.mkdir(parents=True, exist_ok=True)
     projection.write_text("# projection", encoding="utf-8")
+    (projection.parent / "4_speed_direction_odom.py").write_text(
+        "# odom speed", encoding="utf-8"
+    )
+    gen_box = settings.processing_root / "0_1th_box" / "gen_box.py"
+    gen_box.parent.mkdir(parents=True, exist_ok=True)
+    gen_box.write_text("# annotation", encoding="utf-8")
 
 
 def _handoff_arguments(request: str):
@@ -196,7 +238,7 @@ def _handoff_arguments(request: str):
         "request": request,
         "target": DATE,
         "date": DATE,
-        "scene_mode": "unknown",
+        "scene_mode": "outdoor" if "室外" in request else "unknown",
         "clips": [SEGMENT],
         "reason": "concrete navigation processing request",
         "missing_fields": [],
@@ -391,9 +433,9 @@ async def test_raw_only_router_and_navigation_agents_submit_and_execute_canonica
             "/sport_odom",
         ],
         "topic_map": {
-            "/cam_video4/csi_cam/image_raw/compressed": "fisheye_front",
-            "/rs32_lidar_points": "lidar",
-            "/sport_odom": "odom",
+            "cam_video4": "fisheye_front",
+            "rs32_lidar_points": "r32_rslidar_points",
+            "sport_odom": "odom",
         },
         "query_dir": "rs32_lidar_points",
         "settings": services.settings,
@@ -528,7 +570,7 @@ async def test_new_session_agent_distrusts_sync_claim_and_inspects_before_finish
         storage,
         registry,
         "web-new",
-        "同步已完成，请继续处理",
+        "同步已完成，请继续处理，数据为室外场景",
     )
     assert new.task_id != old.task_id
     assert services.observation_store.latest(new.task_id) is None
@@ -550,7 +592,7 @@ async def test_new_session_agent_distrusts_sync_claim_and_inspects_before_finish
     )
     model.enqueue_text("当前事实支持 finish-processing Plan。")
 
-    events = await run_reply(agent, "同步已完成，请继续处理。")
+    events = await run_reply(agent, "同步已完成，请继续处理，数据为室外场景。")
 
     calls = tool_call_names(agent)
     assert calls == [

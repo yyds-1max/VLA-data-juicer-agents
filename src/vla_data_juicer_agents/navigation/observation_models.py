@@ -36,10 +36,18 @@ class TopicMeasurement(StrictModel):
 
 
 class SensorRoleCandidate(StrictModel):
-    role: Literal["fisheye_front", "lidar", "odom", "ins", "localization"]
+    role: Literal["fisheye_front", "lidar", "odom", "ins", "localization", "gridmap"]
     topic: str
     message_type: str | None = None
     confidence: float = Field(ge=0.0, le=1.0)
+
+
+class TopicRouteCandidate(StrictModel):
+    role: Literal["fisheye_front", "lidar", "odom", "ins", "localization", "gridmap"]
+    topic: str
+    extracted_dir: str
+    output_dir: str
+    sync_reference_eligible: bool = False
 
 
 class RawMetadataObservation(StrictModel):
@@ -57,6 +65,7 @@ class TopicCandidatesObservation(StrictModel):
     kind: Literal["topic_candidates"] = "topic_candidates"
     available_topics: list[str]
     suggested_role_names: dict[str, list[str]]
+    routes: list[TopicRouteCandidate] = Field(default_factory=list)
 
 
 class ArtifactStateObservation(StrictModel):
@@ -76,6 +85,9 @@ class RuntimeAssetsObservation(StrictModel):
     pcd_gridmap_tool_available: bool
     manual_annotation_gui_available: bool
     projection_variants: dict[str, bool]
+    noobscene_localization_variants: dict[str, bool] = Field(default_factory=dict)
+    speed_direction_variants: dict[str, bool] = Field(default_factory=dict)
+    scene_environment_affects_execution: bool = False
 
 
 class CalibrationInventoryObservation(StrictModel):

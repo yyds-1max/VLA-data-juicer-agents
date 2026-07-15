@@ -400,9 +400,15 @@ def build_navigation_observation_tools(
                 argument_model = argument_models.get(capability.argument_model or "")
                 if argument_model is None:
                     raise KeyError(f"action parameter contract is unavailable: {action_id}")
+                variant_descriptions = []
+                for variant in variants:
+                    description = {"id": variant.id}
+                    if variant.notes:
+                        description["notes"] = variant.notes
+                    variant_descriptions.append(description)
                 return {
                     "action_id": capability.tool_name,
-                    "variants": [{"id": variant.id} for variant in variants],
+                    "variants": variant_descriptions,
                     "parameter_contract": argument_model.model_json_schema(),
                     "preconditions": {
                         variant.id: variant.selectors

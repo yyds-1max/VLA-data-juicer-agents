@@ -220,9 +220,9 @@ def _extract_plan(evidence_by_kind):
                     "/sport_odom",
                 ],
                 "topic_map": {
-                    "/cam_video4/csi_cam/image_raw/compressed": "fisheye_front",
-                    "/rs32_lidar_points": "lidar",
-                    "/sport_odom": "odom",
+                    "cam_video4": "fisheye_front",
+                    "rs32_lidar_points": "r32_rslidar_points",
+                    "sport_odom": "odom",
                 },
                 "query_dir": "rs32_lidar_points",
                 "reason": "Use only observed topics.",
@@ -231,7 +231,6 @@ def _extract_plan(evidence_by_kind):
             "time_sync": {
                 "reference_sensor": "lidar",
                 "method": "nearest_timestamp",
-                "tolerance_ms": 50,
                 "reason": "Use lidar as the model-selected reference.",
                 "evidence_refs": [evidence_by_kind["raw_metadata"]],
             },

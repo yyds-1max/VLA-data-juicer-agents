@@ -245,6 +245,8 @@ def test_finish_inventory_tools_report_only_measured_candidates(tmp_path):
     processing_root = tmp_path / "processing"
     sensor_dir = processing_root / "NoobScenes" / "params" / "20260529_go2w" / "sensors"
     sensor_dir.mkdir(parents=True)
+    (sensor_dir / "fisheye_front.json").write_text("{}", encoding="utf-8")
+    (sensor_dir / "r32_rslidar_points.json").write_text("{}", encoding="utf-8")
     converter = processing_root / "NoobScenes" / "include" / "1_odom_convert.py"
     converter.parent.mkdir(parents=True, exist_ok=True)
     converter.write_text("# converter\n", encoding="utf-8")
@@ -313,6 +315,12 @@ def test_cognitive_tools_bind_task_paginate_evidence_and_describe_requested_acti
         "locks_navigation_target",
         "supports_dry_run",
     }
+
+    extract_action = _invoke_tool(
+        tools["describe_processing_action_tool"],
+        {"action_id": "extract_and_sync_navigation_data"},
+    )
+    assert "extracted_dir-to-output_dir" in extract_action["variants"][0]["notes"]
 
     finish_action = _invoke_tool(
         tools["describe_processing_action_tool"],

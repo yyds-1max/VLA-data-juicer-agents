@@ -113,10 +113,10 @@ def test_catalog_tool_returns_json_serializable_payload():
     assert list_navigation_tool_capabilities_tool.name == "list_navigation_tool_capabilities_tool"
 
 
-def test_v2_catalog_exposes_factual_observation_capabilities():
+def test_v3_catalog_exposes_factual_observation_capabilities():
     capabilities = _capability_by_stage()
 
-    assert CAPABILITY_CATALOG_REVISION == "navigation-capabilities-v2"
+    assert CAPABILITY_CATALOG_REVISION == "navigation-capabilities-v3"
     assert capabilities["inspect_navigation_sensor_candidates"].phase == "extract_sync"
     assert capabilities["inspect_navigation_sensor_candidates"].declared_output_kinds == ["sensor_candidates"]
     assert capabilities["inspect_navigation_topic_candidates"].phase == "extract_sync"

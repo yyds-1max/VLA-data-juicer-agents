@@ -7,7 +7,8 @@ from types import SimpleNamespace
 import pytest
 from agentscope.app._service._chat import ChatService
 from agentscope.app.storage import ChatModelConfig, SessionConfig
-from agentscope.message import UserMsg
+from agentscope.event import ExternalExecutionResultEvent
+from agentscope.message import ToolResultBlock, ToolResultState, UserMsg
 from agentscope.skill import Skill
 from agentscope.tool import FunctionTool, ToolGroup, Toolkit
 
@@ -253,18 +254,27 @@ def _minimal_finish_plan(evidence: dict[str, str]) -> dict:
             "calibration": {
                 "mode": "selected_profile",
                 "selected_sensor_source": "NoobScenes/params/selected/sensors",
-                "requires_user_confirmation": False,
-                "reason": "Use the already selected observed profile.",
+                "requires_user_confirmation": True,
+                "reason": "Confirm the observed profile before use.",
                 "evidence_refs": [evidence["calibration_inventory"]],
             },
         },
         "steps": [
             {
+                "step_id": "confirm_calibration",
+                "action": "confirm_navigation_calibration_params",
+                "variant": "default",
+                "arguments": {},
+                "depends_on": [],
+                "failure_policy": "stop",
+                "decision_refs": ["calibration"],
+            },
+            {
                 "step_id": "validate_outputs",
                 "action": "validate_navigation_outputs",
                 "variant": "expect_gridmap",
                 "arguments": {},
-                "depends_on": [],
+                "depends_on": ["confirm_calibration"],
                 "failure_policy": "stop",
                 "decision_refs": ["gridmap"],
             },
@@ -697,7 +707,7 @@ async def test_failed_plan_submission_keeps_planning_surface_in_same_reply(
     monkeypatch,
     tmp_path,
 ):
-    config, session_id, built, services, storage, _bus, service = (
+    config, session_id, built, services, storage, bus, service = (
         await _real_chat_service_case(
             monkeypatch,
             tmp_path,
@@ -793,7 +803,7 @@ async def test_restart_rebuilds_execution_surface_over_stale_planning_cache(
     monkeypatch,
     tmp_path,
 ):
-    config, session_id, built, services, storage, _bus, service = (
+    config, session_id, built, services, storage, bus, service = (
         await _real_chat_service_case(
             monkeypatch,
             tmp_path,
@@ -897,7 +907,7 @@ async def test_later_same_session_finish_plan_executes_and_closes_task(
     monkeypatch,
     tmp_path,
 ):
-    config, session_id, built, services, storage, _bus, service = (
+    config, session_id, built, services, storage, bus, service = (
         await _real_chat_service_case(
             monkeypatch,
             tmp_path,
@@ -938,6 +948,15 @@ async def test_later_same_session_finish_plan_executes_and_closes_task(
     first_persisted_state = storage.updated_state
 
     _write_finish_inputs(services.settings)
+    final_gridmap = (
+        services.settings.finish_data_root
+        / built.task.date
+        / built.task.segments[0]
+        / "clip-1"
+        / "grid_map"
+    )
+    final_gridmap.mkdir(parents=True, exist_ok=True)
+    (final_gridmap / "map.json").write_text("{}", encoding="utf-8")
     second_run_start = len(model.invocations)
     model.enqueue_tool(
         "record_navigation_user_guidance_tool",
@@ -964,19 +983,69 @@ async def test_later_same_session_finish_plan_executes_and_closes_task(
         },
     )
     model.enqueue_tool(
-        "validate_navigation_outputs_tool",
+        "request_human_decision",
         lambda messages: {
             "plan_id": latest_tool_result_json(messages)["plan_id"],
-            "step_id": "validate_outputs",
+            "step_id": "confirm_calibration",
         },
     )
-    model.enqueue_text("finish validation 完成，任务已闭合。")
 
     await service._run_impl(
         config.user_id,
         session_id,
         config.navigation_agent_id,
         UserMsg(name="user", content="继续，室外场景，完成 finish processing。"),
+    )
+
+    finish_plan = services.plan_store.get_active_for_task(built.task.task_id)
+    assert finish_plan is not None
+    assert plan_execution.submit_plan_human_decision(
+        plan_store=services.plan_store,
+        evidence_store=services.evidence_store,
+        plan_id=finish_plan.plan_id,
+        step_id="confirm_calibration",
+        decision={"action": "confirm"},
+        expected_web_session_id=built.task.created_by_web_session_id,
+        expected_agentscope_session_id=built.task.agentscope_session_id,
+    ) is True
+    decision_event = next(
+        event
+        for event in reversed(bus.events)
+        if event.get("type") == "REQUIRE_EXTERNAL_EXECUTION"
+    )
+    pending_tool_call = decision_event["tool_calls"][0]
+    external_result = ExternalExecutionResultEvent(
+        reply_id=decision_event["reply_id"],
+        execution_results=[
+            ToolResultBlock(
+                id=pending_tool_call["id"],
+                name="request_human_decision",
+                output=json.dumps(
+                    {
+                        "action": "confirm",
+                        "text": "",
+                        "request_id": "",
+                    },
+                    ensure_ascii=False,
+                ),
+                state=ToolResultState.SUCCESS,
+            )
+        ],
+    )
+
+    model.enqueue_tool(
+        "validate_navigation_outputs_tool",
+        {
+            "plan_id": finish_plan.plan_id,
+            "step_id": "validate_outputs",
+        },
+    )
+    model.enqueue_text("finish validation 完成，任务已闭合。")
+    await service._run_impl(
+        config.user_id,
+        session_id,
+        config.navigation_agent_id,
+        external_result,
     )
 
     assert first_persisted_state is not storage.updated_state
@@ -998,7 +1067,18 @@ async def test_later_same_session_finish_plan_executes_and_closes_task(
         } <= names
         assert EXECUTION_TOOL_NAMES.isdisjoint(names)
         assert GENERIC_OR_RESET_TOOL_NAMES.isdisjoint(names)
-    finish_execution_index = finish_submission_index + 1
+    human_decision_index = _invocation_index_for_tool(
+        model,
+        "request_human_decision",
+        start=finish_submission_index + 1,
+    )
+    human_decision_names = schema_names(model.invocations[human_decision_index].tools)
+    assert "request_human_decision" in human_decision_names
+    finish_execution_index = _invocation_index_for_tool(
+        model,
+        "validate_navigation_outputs_tool",
+        start=human_decision_index + 1,
+    )
     after_finish_index = finish_execution_index + 1
     finish_execution_names = schema_names(
         model.invocations[finish_execution_index].tools

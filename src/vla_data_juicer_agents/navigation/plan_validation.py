@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from collections.abc import Iterable, Sequence
+from pathlib import PurePosixPath
 from typing import Any
 
 from pydantic import BaseModel, ValidationError
@@ -27,6 +28,7 @@ from vla_data_juicer_agents.navigation.plan_models import (
     PlanValidationReport,
 )
 from vla_data_juicer_agents.navigation.planning_context import PLAN_REQUIRED_OBSERVATIONS
+from vla_data_juicer_agents.navigation.profiles import topic_route
 from vla_data_juicer_agents.navigation.task_state import NavigationTask
 
 MAX_PUBLIC_PLAN_VALIDATION_ISSUES = 8
@@ -286,8 +288,11 @@ def _validate_extract_references(
             )
 
     selection = plan.decisions.topic_selection
+    selected_topics = set(selection.topic_whitelist)
+    has_unobserved_selected_topic = False
     for index, topic in enumerate(selection.topic_whitelist):
         if topic not in available_topics:
+            has_unobserved_selected_topic = True
             errors.append(
                 _plan_issue(
                     f"plan.decisions.topic_selection.topic_whitelist.{index}",
@@ -296,28 +301,8 @@ def _validate_extract_references(
                     allowed_topics,
                 )
             )
-    binding_roles = sorted(plan.decisions.sensor_bindings.bindings)
-    for topic, role in selection.topic_map.items():
-        path = f"plan.decisions.topic_selection.topic_map.{topic}"
-        if topic not in available_topics:
-            errors.append(
-                _plan_issue(
-                    path,
-                    "unobserved_topic",
-                    "Selected topic was not observed",
-                    allowed_topics,
-                )
-            )
-        if role not in plan.decisions.sensor_bindings.bindings:
-            errors.append(
-                _plan_issue(
-                    path,
-                    "unknown_sensor_role",
-                    "Mapped sensor role does not exist",
-                    binding_roles,
-                )
-            )
 
+    binding_roles = sorted(plan.decisions.sensor_bindings.bindings)
     reference = plan.decisions.time_sync.reference_sensor
     if reference not in plan.decisions.sensor_bindings.bindings:
         errors.append(
@@ -328,6 +313,125 @@ def _validate_extract_references(
                 binding_roles,
             )
         )
+    if has_unobserved_selected_topic:
+        return errors
+
+    raw_message_types = (
+        {measurement.topic: measurement.message_type for measurement in raw.topics}
+        if raw is not None
+        else {}
+    )
+    observed_routes = {
+        (route.topic, route.role): (route.extracted_dir, route.output_dir)
+        for route in topics.routes
+    } if topics is not None else {}
+
+    def selected_route(role: str, topic: str) -> tuple[str, str]:
+        observed = observed_routes.get((topic, role))
+        if observed is not None:
+            return observed
+        return topic_route(
+            topic,
+            role,
+            message_type=raw_message_types.get(topic),
+        )
+
+    expected_map: dict[str, str] = {}
+    bound_topics = set(plan.decisions.sensor_bindings.bindings.values())
+    for role, topic in plan.decisions.sensor_bindings.bindings.items():
+        if topic not in selected_topics:
+            errors.append(
+                _plan_issue(
+                    f"plan.decisions.sensor_bindings.bindings.{role}",
+                    "binding_topic_not_selected",
+                    "Bound sensor topic is missing from topic_whitelist",
+                    selection.topic_whitelist,
+                )
+            )
+            continue
+        extracted_dir, output_dir = selected_route(role, topic)
+        previous = expected_map.get(extracted_dir)
+        if previous is not None and previous != output_dir:
+            errors.append(
+                _plan_issue(
+                    f"plan.decisions.sensor_bindings.bindings.{role}",
+                    "conflicting_topic_route",
+                    "Selected bindings require conflicting outputs for one extracted directory",
+                    [previous, output_dir],
+                )
+            )
+        expected_map[extracted_dir] = output_dir
+
+    for index, topic in enumerate(selection.topic_whitelist):
+        if topic in available_topics and topic not in bound_topics:
+            errors.append(
+                _plan_issue(
+                    f"plan.decisions.topic_selection.topic_whitelist.{index}",
+                    "unbound_selected_topic",
+                    "Every extracted topic must be justified by a selected sensor binding",
+                    sorted(bound_topics),
+                )
+            )
+
+    allowed_routes = [f"{source}->{target}" for source, target in expected_map.items()]
+    for extracted_dir, output_dir in selection.topic_map.items():
+        path = f"plan.decisions.topic_selection.topic_map.{extracted_dir}"
+        expected_output = expected_map.get(extracted_dir)
+        if expected_output is None:
+            errors.append(
+                _plan_issue(
+                    path,
+                    "unknown_extracted_topic_dir",
+                    "topic_map key is not an extracted directory for a selected binding",
+                    allowed_routes,
+                )
+            )
+        elif output_dir != expected_output:
+            errors.append(
+                _plan_issue(
+                    path,
+                    "invalid_sync_output_dir",
+                    "topic_map value is not the canonical output directory for this topic",
+                    [expected_output],
+                )
+            )
+    for extracted_dir, output_dir in expected_map.items():
+        if extracted_dir not in selection.topic_map:
+            errors.append(
+                _plan_issue(
+                    f"plan.decisions.topic_selection.topic_map.{extracted_dir}",
+                    "missing_topic_route",
+                    "Selected binding is missing its extracted-to-output directory mapping",
+                    [output_dir],
+                )
+            )
+
+    if reference in plan.decisions.sensor_bindings.bindings:
+        reference_topic = plan.decisions.sensor_bindings.bindings[reference]
+        expected_query_dir, _ = selected_route(reference, reference_topic)
+        query_path = PurePosixPath(selection.query_dir)
+        if (
+            query_path.is_absolute()
+            or selection.query_dir in {".", ".."}
+            or len(query_path.parts) != 1
+        ):
+            errors.append(
+                _plan_issue(
+                    "plan.decisions.topic_selection.query_dir",
+                    "invalid_query_dir",
+                    "query_dir must be one relative tmp_dir child name, not a path or ROS topic",
+                    [expected_query_dir],
+                )
+            )
+        elif selection.query_dir != expected_query_dir:
+            errors.append(
+                _plan_issue(
+                    "plan.decisions.topic_selection.query_dir",
+                    "query_dir_reference_mismatch",
+                    "query_dir does not match the extracted directory of reference_sensor",
+                    [expected_query_dir],
+                )
+            )
     return errors
 
 
@@ -379,6 +483,35 @@ def _validate_finish_references(
                 "The observed odom-to-ins converter is unavailable",
             )
         )
+
+    if runtime is not None:
+        localization_source = localization_decision.source
+        if not runtime.noobscene_localization_variants.get(localization_source, False):
+            errors.append(
+                _plan_issue(
+                    "plan.decisions.localization.source",
+                    "noobscene_localization_variant_unavailable",
+                    "The selected localization-specific NoobScenes script is unavailable",
+                    [
+                        source
+                        for source, available in runtime.noobscene_localization_variants.items()
+                        if available
+                    ],
+                )
+            )
+        if not runtime.speed_direction_variants.get(localization_source, False):
+            errors.append(
+                _plan_issue(
+                    "plan.decisions.localization.source",
+                    "speed_direction_variant_unavailable",
+                    "The selected localization-specific speed/direction script is unavailable",
+                    [
+                        source
+                        for source, available in runtime.speed_direction_variants.items()
+                        if available
+                    ],
+                )
+            )
 
     gridmap_decision = plan.decisions.gridmap
     source_observed = {
@@ -438,15 +571,12 @@ def _validate_finish_references(
                 ),
             )
         )
-    if (
-        calibration_decision.mode == "hardcoded_with_user_confirmation"
-        and not calibration_decision.requires_user_confirmation
-    ):
+    if not calibration_decision.requires_user_confirmation:
         errors.append(
             _plan_issue(
                 "plan.decisions.calibration.requires_user_confirmation",
                 "calibration_confirmation_required",
-                "Hardcoded calibration requires user confirmation",
+                "Selected calibration always requires explicit user confirmation",
                 ["true"],
             )
         )
@@ -504,6 +634,20 @@ def _validate_finish_references(
                     ),
                 )
             )
+        if step.action == "run_projection_and_trajectory":
+            expected_projection_variant = {
+                "ins": "cjl_with_gridmap",
+                "odom": "cjl_0525_with_gridmap",
+            }[localization_decision.source]
+            if step.variant != expected_projection_variant:
+                errors.append(
+                    _plan_issue(
+                        f"plan.steps.{index}.variant",
+                        "projection_localization_mismatch",
+                        "Projection variant does not match the selected localization pipeline",
+                        [expected_projection_variant],
+                    )
+                )
     return errors
 
 
@@ -675,11 +819,56 @@ def _validate_dependencies(
 
 def _validate_finish_business_order(
     plan: FinishProcessingPlanInput,
+    observation: NavigationObservationRevision,
 ) -> list[PlanValidationIssue]:
     errors: list[PlanValidationIssue] = []
     positions: dict[str, int] = {}
     for index, step in enumerate(plan.steps):
         positions.setdefault(step.action, index)
+
+    artifact = _payload_of_type(observation, ArtifactStateObservation)
+    final_outputs_complete = bool(
+        artifact
+        and artifact.snapshot.final_outputs_exist
+        and artifact.snapshot.final_grid_map_exists
+    )
+    full_pipeline = [
+        "confirm_navigation_calibration_params",
+        "assemble_finish_temp",
+        "run_noobscene_preprocessing",
+        "run_initial_annotation_gui",
+        "run_tracking",
+        "prepare_gridmap_for_projection",
+        "run_projection_and_trajectory",
+        "validate_navigation_outputs",
+    ]
+    required_actions = ["validate_navigation_outputs"] if final_outputs_complete else full_pipeline
+    missing_actions = [action for action in required_actions if action not in positions]
+    if missing_actions:
+        errors.append(
+            _plan_issue(
+                "plan.steps",
+                "incomplete_finish_pipeline",
+                (
+                    "Finish Plan is missing required actions for the observed artifact state"
+                ),
+                missing_actions,
+            )
+        )
+
+    present_pipeline = [action for action in full_pipeline if action in positions]
+    if any(
+        positions[earlier] >= positions[later]
+        for earlier, later in zip(present_pipeline, present_pipeline[1:])
+    ):
+        errors.append(
+            _plan_issue(
+                "plan.steps",
+                "invalid_finish_pipeline_order",
+                "Finish processing actions must follow the canonical business order",
+                full_pipeline,
+            )
+        )
 
     confirmation = positions.get("confirm_navigation_calibration_params")
     if plan.decisions.calibration.requires_user_confirmation and confirmation is None:
@@ -776,6 +965,15 @@ def validate_navigation_plan(
                 missing,
             )
         )
+    if phase == "finish_processing" and task.scene_mode not in {"in", "out"}:
+        errors.append(
+            _plan_issue(
+                "task.scene_mode",
+                "missing_scene_mode",
+                "Indoor/outdoor must be asked and recorded before finish planning",
+                ["in", "out"],
+            )
+        )
     for kind in required:
         payload_type = _REQUIRED_PAYLOAD_TYPES[kind]
         if not any(isinstance(payload, payload_type) for payload in observation.payloads):
@@ -815,5 +1013,5 @@ def validate_navigation_plan(
     # Stages 5 and 6: dependency graph followed by navigation business order.
     errors.extend(_validate_dependencies(plan))
     if isinstance(plan, FinishProcessingPlanInput):
-        errors.extend(_validate_finish_business_order(plan))
+        errors.extend(_validate_finish_business_order(plan, observation))
     return _report(errors)

@@ -53,15 +53,14 @@ def _stored_extract_plan() -> ExtractSyncPlanInput:
                 },
                 "topic_selection": {
                     "topic_whitelist": ["/camera", "/lidar", "/odom"],
-                    "topic_map": {"/camera": "fisheye_front", "/lidar": "lidar", "/odom": "odom"},
-                    "query_dir": "/query",
+                    "topic_map": {"camera": "fisheye_front", "lidar": "r32_rslidar_points", "odom": "odom"},
+                    "query_dir": "lidar",
                     "reason": "observed",
                     "evidence_refs": ["evidence:topics"],
                 },
                 "time_sync": {
                     "reference_sensor": "lidar",
                     "method": "nearest_timestamp",
-                    "tolerance_ms": 50,
                     "reason": "observed",
                     "evidence_refs": ["evidence:timing"],
                 },

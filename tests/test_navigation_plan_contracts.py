@@ -29,18 +29,17 @@ def valid_extract_plan_payload() -> dict:
             "topic_selection": {
                 "topic_whitelist": ["/camera/front/image", "/lidar/points", "/localization/odom"],
                 "topic_map": {
-                    "/camera/front/image": "fisheye_front",
-                    "/lidar/points": "lidar",
-                    "/localization/odom": "odom",
+                    "camera": "fisheye_front",
+                    "lidar": "r32_rslidar_points",
+                    "localization": "odom",
                 },
-                "query_dir": "/data/query",
+                "query_dir": "lidar",
                 "reason": "All selected topics were observed.",
                 "evidence_refs": ["evidence:topics"],
             },
             "time_sync": {
                 "reference_sensor": "lidar",
                 "method": "nearest_timestamp",
-                "tolerance_ms": 50,
                 "reason": "Lidar timestamps cover the selected streams.",
                 "evidence_refs": ["evidence:timing"],
             },
@@ -112,7 +111,7 @@ def valid_finish_plan_payload() -> dict:
             {
                 "step_id": "projection",
                 "action": "run_projection_and_trajectory",
-                "variant": "cjl_with_gridmap",
+                "variant": "cjl_0525_with_gridmap",
                 "arguments": {},
                 "depends_on": ["prepare_gridmap"],
                 "failure_policy": "stop",
@@ -120,6 +119,14 @@ def valid_finish_plan_payload() -> dict:
             },
         ],
     }
+
+
+def test_time_sync_tolerance_is_not_model_authored():
+    payload = valid_extract_plan_payload()
+    payload["decisions"]["time_sync"]["tolerance_ms"] = 50
+
+    with pytest.raises(ValidationError):
+        ExtractSyncPlanInput.model_validate(payload)
 
 
 def test_extract_plan_has_one_source_for_topic_and_sync_decisions():
@@ -189,7 +196,7 @@ def test_plan_record_and_submission_attempt_round_trip_strict_contracts():
         task_id="nav-1",
         phase="extract_sync",
         plan_revision=1,
-        contract_version="navigation-plan-v2",
+        contract_version="navigation-plan-v3",
         observation_revision=2,
         status="active",
         plan=valid_extract_plan_payload(),

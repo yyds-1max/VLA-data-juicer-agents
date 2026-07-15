@@ -17,6 +17,8 @@ from vla_data_juicer_agents.navigation.subprocess_runner import run_command
 PROCESSING_SCRIPT_ROOT = Path(__file__).resolve().parent / "processing"
 REPOSITORY_EXTRACT_SCRIPT = PROCESSING_SCRIPT_ROOT / "extract_ros2_bag.py"
 REPOSITORY_SYNC_SCRIPT = PROCESSING_SCRIPT_ROOT / "sync_navigation_data.py"
+SYNC_TOLERANCE_MS = 100
+REQUIRED_CALIBRATION_FILES = ("fisheye_front.json", "r32_rslidar_points.json")
 
 
 def _validate_date(date: str) -> str:
@@ -170,6 +172,14 @@ def _validated_sensor_source(
     if not source.is_relative_to(processing_root):
         raise ValueError("selected_sensor_source must resolve under processing_root")
     return source
+
+
+def _missing_calibration_files(sensor_source: Path) -> list[Path]:
+    return [
+        sensor_source / name
+        for name in REQUIRED_CALIBRATION_FILES
+        if not (sensor_source / name).is_file()
+    ]
 
 
 def _transform_gridmap_payload(payload: Any) -> Any:
@@ -533,7 +543,14 @@ def extract_and_sync_navigation_data(
             if not sync_root.exists():
                 continue
             sync_clips = sorted(path for path in sync_root.iterdir() if path.is_dir())
-            if not any(all((clip / child_name).is_dir() for child_name in expected_sync_dirs) for clip in sync_clips):
+            if not any(
+                all(
+                    (clip / child_name).is_dir()
+                    and any(path.is_file() for path in (clip / child_name).iterdir())
+                    for child_name in expected_sync_dirs
+                )
+                for clip in sync_clips
+            ):
                 missing_sync_topic_dirs.append(str(sync_root))
 
     ok = _commands_ok(commands) and not missing_sync_data and not missing_sync_topic_dirs
@@ -552,6 +569,7 @@ def extract_and_sync_navigation_data(
             "extract_topics": effective_topic_whitelist,
             "sync_topic_map": effective_topic_map,
             "query_dir": effective_query_dir,
+            "tolerance_ms": SYNC_TOLERANCE_MS,
             "script_source": "repository",
             "missing_sync_data": [str(path) for path in missing_sync_data],
             "missing_sync_topic_dirs": missing_sync_topic_dirs,
@@ -580,7 +598,15 @@ def assemble_finish_temp(
         settings,
         selected_sensor_source,
     )
+    if not dry_run:
+        missing_calibration_files = _missing_calibration_files(sensor_source)
+        if missing_calibration_files:
+            raise FileNotFoundError(
+                "Selected calibration profile is incomplete: "
+                f"{[str(path) for path in missing_calibration_files]}"
+            )
     copied_clips: list[str] = []
+    incomplete_clips: list[str] = []
 
     for segment in selected:
         sync_root = clip_date_root / segment / "sync_data"
@@ -606,21 +632,29 @@ def assemble_finish_temp(
                 shutil.copytree(sensor_source, dst_clip / "sensors", dirs_exist_ok=True)
             for child_name in ("fisheye_front", "r32_rslidar_points"):
                 src_child = src_clip / child_name
-                if src_child.exists():
+                if src_child.is_dir() and any(path.is_file() for path in src_child.iterdir()):
                     shutil.copytree(src_child, dst_clip / child_name, dirs_exist_ok=True)
+                else:
+                    incomplete_clips.append(str(src_clip))
 
     if not dry_run:
         samples_date_root.mkdir(parents=True, exist_ok=True)
 
+    ok = dry_run or (bool(copied_clips) and not incomplete_clips)
     return ToolResult(
-        ok=True,
+        ok=ok,
         tool_name="assemble_finish_temp",
-        message=f"Assembled {len(copied_clips)} clips into finish temp layout.",
+        message=(
+            f"Assembled {len(copied_clips)} clips into finish temp layout."
+            if ok
+            else "Finish inputs are missing non-empty fisheye or lidar directories."
+        ),
         produced_paths=[finish_temp],
         details={
             "date": date,
             "selected_segments": selected,
             "copied_clips": copied_clips,
+            "incomplete_clips": sorted(set(incomplete_clips)),
             "sensor_source": str(sensor_source),
             "dry_run": dry_run,
         },
@@ -641,6 +675,9 @@ def confirm_navigation_calibration_params(
         settings,
         selected_sensor_source,
     )
+    missing_calibration_files = (
+        [] if dry_run else _missing_calibration_files(sensor_source)
+    )
     finish_temp = settings.finish_data_root / f"{date}_temp"
     target_copy_path = finish_temp / "samples" / date / "<clip>" / "sensors"
     confirmation_prompt = (
@@ -651,12 +688,21 @@ def confirm_navigation_calibration_params(
         "如果需要更换参数，请先在服务器对应参数文件或代码中修改。"
         "我没有权利替你修改该文件。"
     )
-    confirmed = user_confirmation == "确认"
+    confirmed = user_confirmation == "确认" and not missing_calibration_files
+    if missing_calibration_files:
+        result_message = (
+            "所选标定参数目录不完整，缺少文件："
+            + ", ".join(str(path) for path in missing_calibration_files)
+        )
+        error_type = "incomplete_calibration_profile"
+    else:
+        result_message = confirmation_prompt
+        error_type = None if confirmed else "calibration_params_not_confirmed"
 
     return ToolResult(
         ok=confirmed,
         tool_name="confirm_navigation_calibration_params",
-        message=confirmation_prompt,
+        message=result_message,
         produced_paths=[],
         details={
             "date": date,
@@ -667,8 +713,11 @@ def confirm_navigation_calibration_params(
             "requires_user_confirmation": True,
             "user_confirmation": user_confirmation,
             "confirmed": confirmed,
+            "missing_calibration_files": [
+                str(path) for path in missing_calibration_files
+            ],
             "confirmation_prompt": confirmation_prompt,
-            "error_type": None if confirmed else "calibration_params_not_confirmed",
+            "error_type": error_type,
             "dry_run": dry_run,
         },
     )
@@ -785,6 +834,9 @@ def run_noobscene_preprocessing(
             },
         )
 
+    noobscene_main = (
+        "./main_smart.py" if native_ins_policy else "./main_smart_odom.py"
+    )
     commands = [
         run_command(
             python_data_command(
@@ -822,7 +874,7 @@ def run_noobscene_preprocessing(
 
         commands.append(
             run_command(
-                python_data_command(settings.runtime, "./main_smart_odom.py"),
+                python_data_command(settings.runtime, noobscene_main),
                 cwd=noobscene_root,
                 dry_run=dry_run,
             )
@@ -864,6 +916,9 @@ def run_noobscene_preprocessing(
             "dry_run": dry_run,
             "localization_source": localization_source,
             "localization_conversion": localization_conversion,
+            "noobscene_main": (
+                "main_smart.py" if native_ins_policy else "main_smart_odom.py"
+            ),
         },
     )
 
@@ -918,10 +973,22 @@ def run_tracking(
 def _projection_variant_from_execution_args(
     *,
     projection_variant: str | None,
+    localization_source: str,
 ) -> str:
-    if projection_variant not in {None, ""}:
-        return projection_variant
-    return "cjl_with_gridmap"
+    expected_variant = {
+        "ins": "cjl_with_gridmap",
+        "odom": "cjl_0525_with_gridmap",
+    }.get(localization_source)
+    if expected_variant is None:
+        raise ValueError("localization_source must be one of: ins, odom")
+    if projection_variant in {None, ""}:
+        return expected_variant
+    if projection_variant != expected_variant:
+        raise ValueError(
+            "projection_variant does not match localization_source: "
+            f"expected {expected_variant} for {localization_source}"
+        )
+    return projection_variant
 
 
 def _trajectory_script_for_projection_variant(projection_variant: str) -> tuple[str, str]:
@@ -938,6 +1005,7 @@ def run_projection_and_trajectory(
     finish_temp_path: str | Path,
     finish_path: str | Path,
     projection_variant: str | None = None,
+    localization_source: str = "odom",
     settings: NavigationSettings | None = None,
     dry_run: bool = False,
 ) -> ToolResult:
@@ -947,9 +1015,15 @@ def run_projection_and_trajectory(
     pt_project = settings.processing_root / "2_pt_project"
     selected_projection_variant = _projection_variant_from_execution_args(
         projection_variant=projection_variant,
+        localization_source=localization_source,
     )
     trajectory_script, effective_projection_variant = _trajectory_script_for_projection_variant(
         selected_projection_variant
+    )
+    speed_direction_script = (
+        "4_speed_direction_Ins.py"
+        if localization_source == "ins"
+        else "4_speed_direction_odom.py"
     )
     commands = [
         run_command(
@@ -963,7 +1037,7 @@ def run_projection_and_trajectory(
             dry_run=dry_run,
         ),
         run_command(
-            python_data_command(settings.runtime, pt_project / "4_speed_direction_odom.py", [root]),
+            python_data_command(settings.runtime, pt_project / speed_direction_script, [root]),
             cwd=pt_project,
             dry_run=dry_run,
         ),
@@ -1004,30 +1078,50 @@ def run_projection_and_trajectory(
             "dry_run": dry_run,
             "projection_variant": effective_projection_variant,
             "trajectory_script": trajectory_script,
+            "localization_source": localization_source,
+            "speed_direction_script": speed_direction_script,
         },
     )
 
 
 def validate_navigation_outputs(
     date: str,
+    segments: list[str] | None = None,
     settings: NavigationSettings | None = None,
     dry_run: bool = False,
 ) -> ToolResult:
     date = _validate_date(date)
     settings = settings or NavigationSettings()
     final = settings.finish_data_root / date
-    if dry_run or not final.exists():
-        grid_map_dirs = []
-    else:
-        grid_map_dirs = sorted(
-            clip / "grid_map"
-            for segment in final.iterdir()
-            if segment.is_dir() and segment.name != "samples"
-            for clip in segment.iterdir()
-            if clip.is_dir() and (clip / "grid_map").is_dir()
+    selected_segments = (
+        list(segments)
+        if segments is not None
+        else sorted(
+            path.name
+            for path in final.iterdir()
+            if path.is_dir() and path.name != "samples"
         )
+        if final.exists()
+        else []
+    )
+    grid_map_dirs = []
+    complete_segments = []
+    if not dry_run and final.exists():
+        for segment_name in selected_segments:
+            segment_path = final / segment_name
+            segment_grid_maps = sorted(
+                clip / "grid_map"
+                for clip in segment_path.iterdir()
+                if clip.is_dir()
+                and (clip / "grid_map").is_dir()
+                and any((clip / "grid_map").glob("*.json"))
+            ) if segment_path.is_dir() else []
+            grid_map_dirs.extend(segment_grid_maps)
+            if segment_grid_maps:
+                complete_segments.append(segment_name)
     exists = final.exists()
-    has_grid_map = bool(grid_map_dirs)
+    missing_segments = sorted(set(selected_segments) - set(complete_segments))
+    has_grid_map = bool(selected_segments) and not missing_segments
     ok = dry_run or (exists and has_grid_map)
     missing_label = "grid_map" if exists and not has_grid_map else str(final)
     return ToolResult(
@@ -1038,6 +1132,8 @@ def validate_navigation_outputs(
         details={
             "exists": exists,
             "has_grid_map": has_grid_map,
+            "selected_segments": selected_segments,
+            "missing_grid_map_segments": missing_segments,
             "checked_outputs": ["finish_data", "grid_map"],
             "dry_run": dry_run,
         },

@@ -33,9 +33,30 @@ def _all_selected_segments_exist(root: Path, segments: list[str]) -> bool:
 
 def _all_selected_segments_have_grid_map(root: Path, segments: list[str]) -> bool:
     return bool(segments) and all(
-        any(path.is_dir() for path in (root / segment).glob("*/grid_map"))
+        any(
+            path.is_dir() and any(child.is_file() for child in path.glob("*.json"))
+            for path in (root / segment).glob("*/grid_map")
+        )
         for segment in segments
     )
+
+
+def _has_complete_sync_sequence(sync_root: Path) -> bool:
+    if not sync_root.is_dir():
+        return False
+    for sequence in sync_root.iterdir():
+        if not sequence.is_dir():
+            continue
+        required_dirs = (
+            sequence / "fisheye_front",
+            sequence / "r32_rslidar_points",
+        )
+        if all(
+            directory.is_dir() and any(path.is_file() for path in directory.iterdir())
+            for directory in required_dirs
+        ):
+            return True
+    return False
 
 
 def build_navigation_artifact_snapshot(
@@ -62,7 +83,7 @@ def build_navigation_artifact_snapshot(
 
     sync_roots = {segment: clip_date / segment / "sync_data" for segment in selected}
     sync_data_by_segment = {
-        segment: sync_root.exists()
+        segment: _has_complete_sync_sequence(sync_root)
         for segment, sync_root in sync_roots.items()
     }
     sync_exists = bool(sync_data_by_segment) and all(sync_data_by_segment.values())

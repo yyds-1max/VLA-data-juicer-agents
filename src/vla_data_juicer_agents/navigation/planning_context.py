@@ -216,6 +216,7 @@ def _minimal_fact_summary(
         elif payload.kind == "topic_candidates":
             facts[payload.kind] = {
                 "available_topic_count": len(payload.available_topics),
+                "route_count": len(payload.routes),
                 "suggested_role_count": len(payload.suggested_role_names),
                 "suggested_topic_assignment_count": sum(
                     len(topics) for topics in payload.suggested_role_names.values()
@@ -248,6 +249,19 @@ def _minimal_fact_summary(
                 "available_projection_variant_count": sum(
                     bool(available)
                     for available in payload.projection_variants.values()
+                ),
+                "available_noobscene_localization_variants": sorted(
+                    source
+                    for source, available in payload.noobscene_localization_variants.items()
+                    if available
+                ),
+                "available_speed_direction_variants": sorted(
+                    source
+                    for source, available in payload.speed_direction_variants.items()
+                    if available
+                ),
+                "scene_environment_affects_execution": (
+                    payload.scene_environment_affects_execution
                 ),
             }
         elif payload.kind == "calibration_inventory":

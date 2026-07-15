@@ -48,18 +48,17 @@ def valid_extract_plan(*, decision_ref: str = "sensor_bindings") -> ExtractSyncP
                         "/localization/odom",
                     ],
                     "topic_map": {
-                        "/camera/front/image": "fisheye_front",
-                        "/lidar/points": "lidar",
-                        "/localization/odom": "odom",
+                        "camera": "fisheye_front",
+                        "lidar": "r32_rslidar_points",
+                        "localization": "odom",
                     },
-                    "query_dir": "/data/query",
+                    "query_dir": "lidar",
                     "reason": "All selected topics were observed.",
                     "evidence_refs": ["evidence:topics"],
                 },
                 "time_sync": {
                     "reference_sensor": "lidar",
                     "method": "nearest_timestamp",
-                    "tolerance_ms": 50,
                     "reason": "Lidar timestamps cover the selected streams.",
                     "evidence_refs": ["evidence:timing"],
                 },
@@ -155,6 +154,30 @@ def stores_with_task(
         agentscope_session_id=agentscope_session_id,
     ).task
     return SqliteNavigationPlanRepository(db_path), task
+
+
+def test_v2_extract_plan_with_model_tolerance_loads_under_fixed_policy(tmp_path: Path):
+    repo, task = stores_with_task(tmp_path)
+    record = _activate_owned(repo, task, "extract_sync", 1, valid_extract_plan())
+    legacy_payload = record.plan.model_dump(mode="json")
+    legacy_payload["decisions"]["time_sync"]["tolerance_ms"] = 50
+    with sqlite3.connect(repo.db_path) as connection:
+        connection.execute(
+            """UPDATE navigation_plans
+               SET contract_version = ?, plan_json = ?
+               WHERE plan_id = ?""",
+            (
+                "navigation-plan-v2",
+                json.dumps(legacy_payload),
+                record.plan_id,
+            ),
+        )
+
+    loaded = repo.get(record.plan_id)
+
+    assert loaded is not None
+    assert loaded.contract_version == "navigation-plan-v2"
+    assert "tolerance_ms" not in loaded.plan.decisions.time_sync.model_fields_set
 
 
 def attempt_with_extract_plan(

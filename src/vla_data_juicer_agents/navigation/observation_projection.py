@@ -69,6 +69,7 @@ def compact_observation_payload(
         projection = {
             "kind": kind,
             "available_topic_count": len(payload.available_topics),
+            "route_count": len(payload.routes),
             "suggested_role_counts": {
                 role: len(topics)
                 for role, topics in sorted(payload.suggested_role_names.items())
@@ -76,6 +77,16 @@ def compact_observation_payload(
             "available_topics_preview": [
                 preview_string(topic)
                 for topic in payload.available_topics[:preview_items]
+            ],
+            "routes_preview": [
+                {
+                    "role": route.role,
+                    "topic": preview_string(route.topic),
+                    "extracted_dir": route.extracted_dir,
+                    "output_dir": route.output_dir,
+                    "sync_reference_eligible": route.sync_reference_eligible,
+                }
+                for route in payload.routes[:preview_items]
             ],
         }
     elif kind == "artifact_state":
@@ -123,6 +134,19 @@ def compact_observation_payload(
                 preview_string(variant)
                 for variant in available_variants[:preview_items]
             ],
+            "available_noobscene_localization_variants": sorted(
+                source
+                for source, available in payload.noobscene_localization_variants.items()
+                if available
+            ),
+            "available_speed_direction_variants": sorted(
+                source
+                for source, available in payload.speed_direction_variants.items()
+                if available
+            ),
+            "scene_environment_affects_execution": (
+                payload.scene_environment_affects_execution
+            ),
         }
     elif kind == "calibration_inventory":
         projection = {

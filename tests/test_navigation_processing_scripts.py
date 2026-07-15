@@ -59,6 +59,10 @@ def test_sync_script_requires_explicit_topic_map():
         sync_navigation_data.resolve_topic_map(None, None)
 
 
+def test_sync_tolerance_is_fixed_to_company_standard():
+    assert sync_navigation_data.SYNC_TOLERANCE_SECONDS == 0.1
+
+
 def test_sync_data_renames_copied_files_to_timestamps(tmp_path):
     data_path = tmp_path / "clip"
     for dirname in ("cam_video5", "lidar_points", "sport_odom"):
@@ -137,7 +141,9 @@ def test_extract_and_sync_non_dry_run_writes_topic_config_files(tmp_path, monkey
     def fake_run_command(command, cwd=None, dry_run=False, timeout_seconds=None):
         sync_root = root / "clip_data" / "20270605" / segment / "sync_data" / "clip_a"
         for dirname in topic_map.values():
-            (sync_root / dirname).mkdir(parents=True, exist_ok=True)
+            sensor_dir = sync_root / dirname
+            sensor_dir.mkdir(parents=True, exist_ok=True)
+            (sensor_dir / "1000.000000.data").write_text("data", encoding="utf-8")
         return CommandRecord(command=command, cwd=cwd, dry_run=dry_run, return_code=0)
 
     monkeypatch.setattr("vla_data_juicer_agents.navigation.execution_tools.run_command", fake_run_command)
@@ -155,6 +161,25 @@ def test_extract_and_sync_non_dry_run_writes_topic_config_files(tmp_path, monkey
     assert result.ok is True
     assert json.loads((config_dir / "topic_whitelist.json").read_text(encoding="utf-8")) == topic_whitelist
     assert json.loads((config_dir / "topic_map.json").read_text(encoding="utf-8")) == topic_map
+    assert result.details["tolerance_ms"] == 100
+    assert all("--tolerance_ms" not in record.command for record in result.commands)
+
+
+def test_sync_script_rejects_absolute_query_dir(tmp_path):
+    tmp_dir = tmp_path / "clip" / "tmp_dir"
+    (tmp_dir / "rs32_lidar_points").mkdir(parents=True)
+
+    with pytest.raises(ValueError, match="relative child directory"):
+        sync_navigation_data.resolve_query_path(tmp_dir, "/raw/segment")
+
+
+def test_sync_script_rejects_non_timestamp_query_files(tmp_path):
+    query_dir = tmp_path / "rs32_lidar_points"
+    query_dir.mkdir()
+    (query_dir / "metadata.yaml").write_text("metadata", encoding="utf-8")
+
+    with pytest.raises(ValueError, match="non-timestamp filenames"):
+        sync_navigation_data.timestamped_file_names(query_dir)
 
 
 def test_save_odometry_preserves_legacy_schema(tmp_path):

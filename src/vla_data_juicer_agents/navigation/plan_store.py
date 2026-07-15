@@ -38,7 +38,7 @@ from vla_data_juicer_agents.navigation.planning_context import (
 )
 
 
-PLAN_CONTRACT_VERSION = "navigation-plan-v2"
+PLAN_CONTRACT_VERSION = "navigation-plan-v3"
 MAX_EXECUTION_READ_CHARS = 4000
 MAX_RESULT_OUTBOX_CHARS = 262_144
 MAX_HUMAN_DECISION_CHARS = 16_384
@@ -2346,6 +2346,14 @@ class SqliteNavigationPlanRepository:
             if row["phase"] == "extract_sync"
             else FinishProcessingPlanInput
         )
+        plan_payload = json.loads(row["plan_json"])
+        if (
+            row["contract_version"] == "navigation-plan-v2"
+            and row["phase"] == "extract_sync"
+        ):
+            time_sync = plan_payload.get("decisions", {}).get("time_sync")
+            if isinstance(time_sync, dict):
+                time_sync.pop("tolerance_ms", None)
         return NavigationPlanRecord(
             plan_id=row["plan_id"],
             task_id=row["task_id"],
@@ -2354,7 +2362,7 @@ class SqliteNavigationPlanRepository:
             contract_version=row["contract_version"],
             observation_revision=row["observation_revision"],
             status=row["status"],
-            plan=plan_model.model_validate_json(row["plan_json"]),
+            plan=plan_model.model_validate(plan_payload),
             created_at=row["created_at"],
         )
 

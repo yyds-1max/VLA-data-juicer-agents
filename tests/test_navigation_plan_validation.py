@@ -157,8 +157,10 @@ def finish_observation(
                 manual_annotation_gui_available=True,
                 projection_variants={
                     "cjl_with_gridmap": True,
-                    "cjl_0525_with_gridmap": False,
+                    "cjl_0525_with_gridmap": True,
                 },
+                noobscene_localization_variants={"odom": True, "ins": True},
+                speed_direction_variants={"odom": True, "ins": True},
             ),
             CalibrationInventoryObservation(sensor_sources=["fisheye_front"]),
             LocalizationSourcesObservation(
@@ -205,18 +207,17 @@ def valid_extract_plan_payload() -> dict:
                     "/localization/odom",
                 ],
                 "topic_map": {
-                    "/camera/front/image": "fisheye_front",
-                    "/lidar/points": "lidar",
-                    "/localization/odom": "odom",
+                    "camera": "fisheye_front",
+                    "lidar": "r32_rslidar_points",
+                    "localization": "odom",
                 },
-                "query_dir": "/data/query",
+                "query_dir": "lidar",
                 "reason": "All selected topics were observed.",
                 "evidence_refs": ["evidence:topics"],
             },
             "time_sync": {
                 "reference_sensor": "lidar",
                 "method": "nearest_timestamp",
-                "tolerance_ms": 50,
                 "reason": "Lidar timestamps cover the selected streams.",
                 "evidence_refs": ["evidence:timing"],
             },
@@ -277,11 +278,38 @@ def valid_finish_plan_payload() -> dict:
                 "decision_refs": ["calibration"],
             },
             {
+                "step_id": "assemble_finish",
+                "action": "assemble_finish_temp",
+                "variant": "default",
+                "arguments": {},
+                "depends_on": ["confirm_calibration"],
+                "failure_policy": "stop",
+                "decision_refs": ["calibration"],
+            },
+            {
+                "step_id": "preprocess",
+                "action": "run_noobscene_preprocessing",
+                "variant": "default",
+                "arguments": {},
+                "depends_on": ["assemble_finish"],
+                "failure_policy": "stop",
+                "decision_refs": ["localization"],
+            },
+            {
+                "step_id": "initial_annotation",
+                "action": "run_initial_annotation_gui",
+                "variant": "human_gui",
+                "arguments": {},
+                "depends_on": ["preprocess"],
+                "failure_policy": "stop",
+                "decision_refs": ["calibration"],
+            },
+            {
                 "step_id": "tracking",
                 "action": "run_tracking",
                 "variant": "default",
                 "arguments": {},
-                "depends_on": ["confirm_calibration"],
+                "depends_on": ["initial_annotation"],
                 "failure_policy": "stop",
                 "decision_refs": ["localization"],
             },
@@ -297,7 +325,7 @@ def valid_finish_plan_payload() -> dict:
             {
                 "step_id": "projection",
                 "action": "run_projection_and_trajectory",
-                "variant": "cjl_with_gridmap",
+                "variant": "cjl_0525_with_gridmap",
                 "arguments": {},
                 "depends_on": ["prepare_gridmap"],
                 "failure_policy": "stop",
@@ -361,6 +389,60 @@ def test_valid_complete_plans_accept_evidence_from_current_or_earlier_revisions(
     assert validate_finish().ok is True
 
 
+def test_finish_plan_requires_recorded_scene_mode_without_using_it_for_routing():
+    plan = FinishProcessingPlanInput.model_validate(valid_finish_plan_payload())
+    report = validate_navigation_plan(
+        task=finish_task().model_copy(update={"scene_mode": None}),
+        observation=finish_observation(),
+        plan=plan,
+        evidence=finish_evidence(),
+        capabilities=list_navigation_tool_capabilities(),
+    )
+
+    assert "missing_scene_mode" in issue_codes(report)
+
+
+def test_odom_projection_variant_cannot_select_native_ins_pipeline():
+    payload = valid_finish_plan_payload()
+    projection = next(
+        step
+        for step in payload["steps"]
+        if step["action"] == "run_projection_and_trajectory"
+    )
+    projection["variant"] = "cjl_with_gridmap"
+
+    report = validate_finish(payload)
+
+    assert "projection_localization_mismatch" in issue_codes(report)
+
+
+def test_selected_calibration_profile_still_requires_confirmation():
+    payload = valid_finish_plan_payload()
+    payload["decisions"]["calibration"].update(
+        {"mode": "selected_profile", "requires_user_confirmation": False}
+    )
+
+    report = validate_finish(payload)
+
+    assert "calibration_confirmation_required" in issue_codes(report)
+
+
+def test_incomplete_finish_pipeline_is_rejected_when_final_outputs_are_absent():
+    payload = valid_finish_plan_payload()
+    payload["steps"] = [
+        step for step in payload["steps"] if step["action"] != "run_noobscene_preprocessing"
+    ]
+    annotation = next(
+        step for step in payload["steps"] if step["action"] == "run_initial_annotation_gui"
+    )
+    annotation["depends_on"] = ["assemble_finish"]
+
+    report = validate_finish(payload)
+
+    issue = next(issue for issue in report.errors if issue.code == "incomplete_finish_pipeline")
+    assert issue.allowed_values == ["run_noobscene_preprocessing"]
+
+
 def test_time_sync_reference_must_name_an_observed_bound_sensor_role():
     payload = valid_extract_plan_payload()
     payload["decisions"]["time_sync"]["reference_sensor"] = "gps"
@@ -420,6 +502,39 @@ def test_selected_topics_must_exist_in_measured_observations():
             "/localization/odom",
         ],
     ) in report.errors
+
+
+def test_topic_map_must_use_extracted_to_canonical_directory_routes():
+    payload = valid_extract_plan_payload()
+    payload["decisions"]["topic_selection"]["topic_map"] = {
+        "/camera/front/image": "fisheye_front",
+        "/lidar/points": "lidar",
+        "/localization/odom": "odom",
+    }
+
+    report = validate_extract(payload)
+
+    assert "unknown_extracted_topic_dir" in issue_codes(report)
+    assert "missing_topic_route" in issue_codes(report)
+
+
+@pytest.mark.parametrize("query_dir", ["/data/query", "../lidar", "/lidar/points"])
+def test_query_dir_must_be_one_relative_extracted_directory(query_dir: str):
+    payload = valid_extract_plan_payload()
+    payload["decisions"]["topic_selection"]["query_dir"] = query_dir
+
+    report = validate_extract(payload)
+
+    assert "invalid_query_dir" in issue_codes(report)
+
+
+def test_query_dir_must_match_reference_sensor_route():
+    payload = valid_extract_plan_payload()
+    payload["decisions"]["topic_selection"]["query_dir"] = "camera"
+
+    report = validate_extract(payload)
+
+    assert "query_dir_reference_mismatch" in issue_codes(report)
 
 
 @pytest.mark.parametrize(
@@ -484,7 +599,11 @@ def test_gridmap_source_must_match_observations_capability_and_selected_variant(
 ):
     payload = valid_finish_plan_payload()
     payload["decisions"]["gridmap"]["source"] = source
-    payload["steps"][2]["variant"] = variant
+    next(
+        step
+        for step in payload["steps"]
+        if step["action"] == "prepare_gridmap_for_projection"
+    )["variant"] = variant
 
     report = validate_finish(payload, observation=observation)
 
@@ -715,18 +834,6 @@ def test_manual_annotation_action_requires_observed_gui_runtime_asset():
 
 def test_manual_annotation_action_is_valid_when_gui_runtime_asset_is_available():
     payload = valid_finish_plan_payload()
-    payload["steps"].insert(
-        1,
-        {
-            "step_id": "initial_annotation",
-            "action": "run_initial_annotation_gui",
-            "variant": "human_gui",
-            "arguments": {},
-            "depends_on": ["confirm_calibration"],
-            "failure_policy": "stop",
-            "decision_refs": ["calibration"],
-        },
-    )
 
     assert validate_finish(payload).ok is True
 

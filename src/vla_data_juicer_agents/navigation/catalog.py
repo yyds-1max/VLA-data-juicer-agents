@@ -9,7 +9,7 @@ from pydantic import BaseModel, Field
 CapabilityStatus = Literal["available", "planned", "placeholder", "deprecated"]
 ToolEffect = Literal["read", "write", "execute", "external"]
 CapabilityPhase = Literal["extract_sync", "finish_processing"]
-CAPABILITY_CATALOG_REVISION = "navigation-capabilities-v2"
+CAPABILITY_CATALOG_REVISION = "navigation-capabilities-v3"
 
 
 class ToolVariantCapability(BaseModel):
@@ -133,8 +133,9 @@ NAVIGATION_TOOL_CAPABILITIES: tuple[ToolCapability, ...] = (
             ToolVariantCapability(
                 id="explicit_topic_params",
                 notes=(
-                    "Use topic_whitelist, topic_map, and query_dir inferred from sensor-role bindings. "
-                    "Select this variant only from observed runtime capability evidence."
+                    "The model fills full ROS topics in topic_whitelist, extracted_dir-to-output_dir "
+                    "routes in topic_map, and one relative extracted query_dir matching the selected "
+                    "reference sensor. Use observed sensor bindings and topic-route evidence."
                 ),
             ),
         ],
@@ -173,7 +174,15 @@ NAVIGATION_TOOL_CAPABILITIES: tuple[ToolCapability, ...] = (
         tool_name="run_noobscene_preprocessing",
         stage_kind="run_noobscene_preprocessing",
         effects="execute",
-        variants=[ToolVariantCapability(id="default")],
+        variants=[
+            ToolVariantCapability(
+                id="default",
+                notes=(
+                    "Execution selects main_smart.py for native Ins or "
+                    "main_smart_odom.py plus odom conversion/resize for odom."
+                ),
+            )
+        ],
         supports_dry_run=True,
         executor_agent_allowed=True,
         locks_navigation_target=True,
@@ -237,11 +246,13 @@ NAVIGATION_TOOL_CAPABILITIES: tuple[ToolCapability, ...] = (
         variants=[
             ToolVariantCapability(
                 id="cjl_with_gridmap",
-                notes="Run the standard CJL projection script with gridmap inputs; use as the default projection strategy when no evidence selects another script.",
+                selectors={"localization_source": ["ins"]},
+                notes="Native Ins pipeline: use Ins speed/direction and the standard CJL trajectory script.",
             ),
             ToolVariantCapability(
                 id="cjl_0525_with_gridmap",
-                notes="Run the CJL 0525 projection script with gridmap inputs when observed evidence explicitly selects it.",
+                selectors={"localization_source": ["odom"]},
+                notes="Odom pipeline: use odom speed/direction and the CJL 0525 trajectory script.",
             ),
         ],
         supports_dry_run=True,

@@ -151,19 +151,23 @@ def extract_plan(*, two_steps: bool = False) -> ExtractSyncPlanInput:
                     "evidence_refs": ["evidence:sensors"],
                 },
                 "topic_selection": {
-                    "topic_whitelist": ["/camera/front/image", "/lidar/points"],
+                    "topic_whitelist": [
+                        "/camera/front/image",
+                        "/lidar/points",
+                        "/localization/odom",
+                    ],
                     "topic_map": {
-                        "/camera/front/image": "fisheye_front",
-                        "/lidar/points": "r32_rslidar_points",
+                        "camera": "fisheye_front",
+                        "lidar": "r32_rslidar_points",
+                        "localization": "odom",
                     },
-                    "query_dir": "r32_rslidar_points",
+                    "query_dir": "lidar",
                     "reason": "observed",
                     "evidence_refs": ["evidence:topics"],
                 },
                 "time_sync": {
                     "reference_sensor": "lidar",
                     "method": "nearest_timestamp",
-                    "tolerance_ms": 50,
                     "reason": "observed",
                     "evidence_refs": ["evidence:timing"],
                 },
