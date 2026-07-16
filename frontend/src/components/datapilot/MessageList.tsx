@@ -4,6 +4,7 @@ import type { ChatMessageRecord } from "../../api/types";
 import type { ActiveAgent, ActiveTool, RunState, TimelineItem } from "../../store/eventReducer";
 import { cn } from "../../lib/utils";
 import { AgentRunSummary, ToolStatusDot, type AgentRunTimelineItem } from "./AgentRunSummary";
+import { ReActActivityCard } from "./ReActActivityCard";
 
 type MessageListProps = {
   messages: ChatMessageRecord[];
@@ -81,6 +82,8 @@ export function MessageList({ messages, run }: MessageListProps) {
               <MessageBubble key={entry.key} message={entry.message} />
             ) : entry.type === "agent-run-summary" ? (
               <AgentRunSummary key={entry.key} source={entry.source} items={entry.items} />
+            ) : entry.item.kind === "activity" ? (
+              <ReActActivityCard key={entry.key} item={entry.item} />
             ) : entry.item.kind === "tool" ? (
               <ToolLine key={entry.key} item={entry.item} />
             ) : (
@@ -239,6 +242,9 @@ function chronologicalEntries(messages: ChatMessageRecord[], timeline: TimelineI
 }
 
 function isChildTimelineItem(item: TimelineItem): boolean {
+  if (item.kind === "activity") {
+    return false;
+  }
   return !isPrimaryConversationSource(item.source);
 }
 

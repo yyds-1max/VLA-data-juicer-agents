@@ -283,6 +283,97 @@ describe("eventReducer", () => {
     expect(state.activeText).toBe("正在思考");
   });
 
+  it("merges activity snapshots and deltas into one ReAct timeline card", () => {
+    const state = createEmptyRunState();
+
+    applyAgentEvent(state, event("turn_pending", "main"));
+    expect(state.activeText).toBe("正在思考");
+
+    applyAgentEvent(
+      state,
+      event("activity_snapshot", "agentscope", {
+        activity_id: "activity-1",
+        title: "正在处理导航数据",
+        status: "running",
+        steps: [
+          {
+            id: "step-1",
+            sequence: 1,
+            status: "reasoning",
+            observation: "发现已有处理方案。",
+            analysis: "需要确认当前步骤。",
+            action: "读取当前计划步骤。",
+          },
+        ],
+      }),
+    );
+
+    expect(state.timeline).toHaveLength(1);
+    expect(state.timeline[0]).toMatchObject({
+      kind: "activity",
+      activityId: "activity-1",
+      activityStatus: "running",
+      activitySteps: [{ id: "step-1", status: "reasoning" }],
+    });
+    expect(state.running).toBe(true);
+    expect(state.activeText).toBe("");
+
+    applyAgentEvent(
+      state,
+      event("activity_delta", "agentscope", {
+        activity_id: "activity-1",
+        status: "running",
+        step: {
+          id: "step-1",
+          sequence: 1,
+          status: "completed",
+          observation: "已确认当前计划步骤。",
+          analysis: "需要确认当前步骤。",
+          action: "读取当前计划步骤。",
+        },
+      }),
+    );
+    applyAgentEvent(
+      state,
+      event("activity_delta", "agentscope", {
+        activity_id: "activity-1",
+        status: "completed",
+      }),
+    );
+
+    expect(state.timeline).toHaveLength(1);
+    expect(state.timeline[0]).toMatchObject({
+      activityStatus: "completed",
+      activitySteps: [{ id: "step-1", status: "completed", observation: "已确认当前计划步骤。" }],
+    });
+    expect(state.running).toBe(false);
+  });
+
+  it("keeps the exact public tool name visible while an activity is running", () => {
+    const state = createEmptyRunState();
+    applyAgentEvent(
+      state,
+      event("activity_snapshot", "agentscope", {
+        activity_id: "activity-1",
+        title: "正在处理导航数据",
+        status: "running",
+        steps: [],
+      }),
+    );
+    applyAgentEvent(
+      state,
+      event("tool_start", "agentscope", {
+        call_id: "call-1",
+        tool: "get_current_plan_step_tool",
+      }),
+    );
+
+    expect(state.activeText).toBe("正在调用工具 get_current_plan_step_tool");
+    expect(state.activeTools["run-1\u0000call-1"]).toMatchObject({
+      tool: "get_current_plan_step_tool",
+    });
+  });
+
   it("creates compact tool completion text without args JSON", () => {
     const state = createEmptyRunState();
 

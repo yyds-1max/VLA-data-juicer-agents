@@ -1,6 +1,15 @@
 import type { AgentEvent, PendingHumanDecision } from "../api/types";
 
-export type TimelineKind = "reasoning" | "tool" | "agent" | "assistant" | "system";
+export type TimelineKind = "activity" | "reasoning" | "tool" | "agent" | "assistant" | "system";
+
+export interface ActivityStep {
+  id: string;
+  sequence: number;
+  status: string;
+  observation?: string;
+  analysis?: string;
+  action?: string;
+}
 
 export interface TimelineItem {
   kind: TimelineKind;
@@ -9,6 +18,10 @@ export interface TimelineItem {
   status?: string;
   runId?: string | null;
   parentRunId?: string | null;
+  activityId?: string;
+  activityTitle?: string;
+  activityStatus?: string;
+  activitySteps?: ActivityStep[];
 }
 
 export interface ActiveAgent {
@@ -67,6 +80,19 @@ export function applyAgentEvent(state: RunState, event: AgentEvent): void {
   const payload = event.payload ?? {};
   const label = sourceLabel(source);
 
+  if (type === "turn_pending") {
+    state.running = true;
+    state.interrupting = false;
+    state.activeText = "正在思考";
+    state.activeStartedAt = timestampMs(event.timestamp);
+    return;
+  }
+
+  if (type === "turn_submission_failed") {
+    refreshRunningText(state);
+    return;
+  }
+
   if (type === "agent_start") {
     const startedAt = timestampMs(event.timestamp);
     if (runId) {
@@ -90,6 +116,49 @@ export function applyAgentEvent(state: RunState, event: AgentEvent): void {
         parentRunId,
       });
     }
+    return;
+  }
+
+  if (type === "activity_snapshot" || type === "activity_delta") {
+    const activityId = normalizeText(payload.activity_id) || normalizeText(payload.activityId);
+    if (!activityId) {
+      return;
+    }
+    const existing = findActivityItem(state, activityId);
+    const title =
+      normalizeText(payload.title) || existing?.activityTitle || existing?.text || "正在处理请求";
+    const status = normalizeText(payload.status) || existing?.activityStatus || "running";
+    const incomingSteps = activitySteps(payload.steps);
+    const incomingStep = activityStep(payload.step);
+    const steps = incomingSteps.length > 0
+      ? incomingSteps
+      : mergeActivityStep(existing?.activitySteps ?? [], incomingStep);
+
+    if (existing) {
+      existing.text = title;
+      existing.status = status;
+      existing.activityTitle = title;
+      existing.activityStatus = status;
+      existing.activitySteps = steps;
+    } else {
+      state.timeline.push({
+        kind: "activity",
+        source,
+        text: title,
+        status,
+        runId,
+        parentRunId,
+        activityId,
+        activityTitle: title,
+        activityStatus: status,
+        activitySteps: steps,
+      });
+    }
+
+    state.interrupting = false;
+    state.activeText = "";
+    state.activeStartedAt = null;
+    refreshRunningText(state);
     return;
   }
 
@@ -274,6 +343,56 @@ function findAssistantItem(state: RunState, source: string, runId: string): Time
   return undefined;
 }
 
+function findActivityItem(state: RunState, activityId: string): TimelineItem | undefined {
+  return state.timeline.find(
+    (item) => item.kind === "activity" && item.activityId === activityId,
+  );
+}
+
+function activitySteps(value: unknown): ActivityStep[] {
+  if (!Array.isArray(value)) {
+    return [];
+  }
+  return value.map(activityStep).filter((step): step is ActivityStep => step !== null);
+}
+
+function activityStep(value: unknown): ActivityStep | null {
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    return null;
+  }
+  const record = value as Record<string, unknown>;
+  const id = normalizeText(record.id);
+  if (!id) {
+    return null;
+  }
+  const rawSequence = record.sequence;
+  const sequence = typeof rawSequence === "number" && Number.isFinite(rawSequence) ? rawSequence : 0;
+  const observation = normalizeText(record.observation);
+  const analysis = normalizeText(record.analysis) || normalizeText(record.reasoning);
+  const action = normalizeText(record.action);
+  return {
+    id,
+    sequence,
+    status: normalizeText(record.status) || "reasoning",
+    ...(observation ? { observation } : {}),
+    ...(analysis ? { analysis } : {}),
+    ...(action ? { action } : {}),
+  };
+}
+
+function mergeActivityStep(steps: ActivityStep[], incoming: ActivityStep | null): ActivityStep[] {
+  if (!incoming) {
+    return steps;
+  }
+  const existingIndex = steps.findIndex((step) => step.id === incoming.id);
+  if (existingIndex < 0) {
+    return [...steps, incoming].sort((left, right) => left.sequence - right.sequence);
+  }
+  const next = [...steps];
+  next[existingIndex] = { ...next[existingIndex], ...incoming };
+  return next;
+}
+
 function refreshRunningText(state: RunState): void {
   const activeTool = Object.values(state.activeTools)[0];
   if (activeTool) {
@@ -288,6 +407,16 @@ function refreshRunningText(state: RunState): void {
     state.running = true;
     state.activeText = thinkingText(activeAgent.source, sourceLabel(activeAgent.source));
     state.activeStartedAt = activeAgent.startedAt;
+    return;
+  }
+
+  const activeActivity = [...state.timeline]
+    .reverse()
+    .find((item) => item.kind === "activity" && item.activityStatus === "running");
+  if (activeActivity) {
+    state.running = true;
+    state.activeText = "";
+    state.activeStartedAt = null;
     return;
   }
 

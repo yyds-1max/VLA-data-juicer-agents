@@ -2812,9 +2812,80 @@ async def test_runtime_subscribe_web_session_events_replays_dedupes_and_finishes
     assert message_bus.read_sessions == ["as-session-1"]
     assert message_bus.subscribe_keys == ["agentscope:session:events:as-session-1"]
     assert [(event["type"], event["payload"]) for event in events] == [
-        ("assistant_delta", {"delta": "处理"}),
         ("final", {"text": "处理"}),
     ]
+
+
+@pytest.mark.asyncio
+async def test_runtime_projects_public_activity_and_tool_name_without_internal_payloads() -> None:
+    message_bus = FakeAgentScopeMessageBus(
+        replay_events=[
+            (
+                "1-0",
+                {
+                    "type": "TEXT_BLOCK_DELTA",
+                    "delta": (
+                        'Activity: {"observation":"发现已有处理方案。",'
+                        '"analysis":"需要确认当前步骤。",'
+                        '"action":"读取当前计划步骤。"}\n'
+                    ),
+                },
+            ),
+            (
+                "2-0",
+                {
+                    "type": "TOOL_RESULT_START",
+                    "tool_call_id": "call-1",
+                    "tool_call_name": "get_current_plan_step_tool",
+                },
+            ),
+            (
+                "3-0",
+                {
+                    "type": "TOOL_RESULT_TEXT_DELTA",
+                    "tool_call_id": "call-1",
+                    "delta": '{"path":"/media/internal/plan.json","secret":"hidden"}',
+                },
+            ),
+            (
+                "4-0",
+                {"type": "TOOL_RESULT_END", "tool_call_id": "call-1", "state": "success"},
+            ),
+            ("5-0", {"type": "TEXT_BLOCK_DELTA", "delta": "当前步骤已确认。"}),
+            ("6-0", {"type": "REPLY_END"}),
+        ],
+        running_states=[False, False],
+    )
+    runtime = _runtime(message_bus=message_bus)
+    runtime.web_sessions["web-1"] = ("navigation-data-agent", "as-session-1")
+
+    events = [
+        event
+        async for event in runtime.subscribe_web_session_events(web_session_id="web-1")
+    ]
+
+    assert [event["type"] for event in events] == [
+        "activity_snapshot",
+        "tool_start",
+        "activity_delta",
+        "tool_end",
+        "activity_delta",
+        "activity_delta",
+        "final",
+    ]
+    assert events[1]["payload"] == {
+        "tool": "get_current_plan_step_tool",
+        "call_id": "call-1",
+    }
+    assert events[3]["payload"] == {
+        "tool": "get_current_plan_step_tool",
+        "call_id": "call-1",
+        "status": "completed",
+    }
+    serialized = json.dumps(events, ensure_ascii=False)
+    assert "/media/internal" not in serialized
+    assert '"secret"' not in serialized
+    assert events[-1]["payload"] == {"text": "当前步骤已确认。"}
 
 
 @pytest.mark.asyncio
@@ -2837,7 +2908,6 @@ async def test_runtime_subscribe_web_session_events_waits_for_delayed_first_even
     ]
 
     assert [(event["type"], event["payload"]) for event in events] == [
-        ("assistant_delta", {"delta": "迟到事件"}),
         ("final", {"text": "迟到事件"}),
     ]
 
@@ -2875,11 +2945,9 @@ async def test_runtime_event_cursor_skips_previous_turn_replay_for_same_agentsco
 
     assert message_bus.read_since == [None, "2-0"]
     assert [(event["type"], event["payload"]) for event in first_events] == [
-        ("assistant_delta", {"delta": "旧"}),
         ("final", {"text": "旧"}),
     ]
     assert [(event["type"], event["payload"]) for event in second_events] == [
-        ("assistant_delta", {"delta": "新"}),
         ("final", {"text": "新"}),
     ]
 
@@ -2913,7 +2981,6 @@ async def test_runtime_event_cursor_persists_across_runtime_restart(tmp_path: Pa
     ]
 
     assert [(event["type"], event["payload"]) for event in first_events] == [
-        ("assistant_delta", {"delta": "旧"}),
         ("final", {"text": "旧"}),
     ]
     assert store.get_agentscope_session_mapping(web_session.id).event_cursor == "2-0"
@@ -2933,7 +3000,6 @@ async def test_runtime_event_cursor_persists_across_runtime_restart(tmp_path: Pa
 
     assert message_bus.read_since == [None, "2-0"]
     assert [(event["type"], event["payload"]) for event in second_events] == [
-        ("assistant_delta", {"delta": "新"}),
         ("final", {"text": "新"}),
     ]
 

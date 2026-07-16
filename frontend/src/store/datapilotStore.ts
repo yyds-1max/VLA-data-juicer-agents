@@ -36,6 +36,7 @@ export interface DataPilotStoreState {
   restoreActiveSession: (session: SessionDetail | SessionRecord, messages?: ChatMessageRecord[]) => void;
   restoreHistory: (session: SessionDetail | SessionRecord, messages?: ChatMessageRecord[]) => void;
   appendUserMessage: (message: ChatMessageRecord) => void;
+  discardLocalMessage: (messageId: string) => void;
   applyEvent: (event: AgentEvent) => void;
   clearPendingHumanDecision: (
     expectedDecision: PendingHumanDecision,
@@ -116,6 +117,13 @@ export function createDataPilotStore() {
     appendUserMessage: (message) =>
       set((state) => ({
         messages: [...state.messages, message],
+      })),
+
+    discardLocalMessage: (messageId) =>
+      set((state) => ({
+        messages: state.messages.filter(
+          (message) => message.id !== messageId || !isLocalMessageId(message.id),
+        ),
       })),
 
     applyEvent: (event) =>
@@ -212,7 +220,12 @@ function compareMessages(
 
 function cloneRunState(run: RunState): RunState {
   return {
-    timeline: run.timeline.map((item) => ({ ...item })),
+    timeline: run.timeline.map((item) => ({
+      ...item,
+      ...(item.activitySteps
+        ? { activitySteps: item.activitySteps.map((step) => ({ ...step })) }
+        : {}),
+    })),
     activeAgents: Object.fromEntries(
       Object.entries(run.activeAgents).map(([key, agent]) => [key, { ...agent }]),
     ),

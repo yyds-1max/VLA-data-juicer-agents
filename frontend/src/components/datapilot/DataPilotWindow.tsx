@@ -213,9 +213,10 @@ export function DataPilotWindow() {
       const store = datapilotStore.getState();
       store.setActiveSession(session);
       const userMessage = localUserMessage(session.id, message);
+      store.appendUserMessage(userMessage);
+      store.applyEvent(localTurnEvent("turn_pending", session.id));
       openEvents(session.id);
       await submitTurn(session.id, message);
-      datapilotStore.getState().appendUserMessage(userMessage);
     } catch (error) {
       closeSocket();
       datapilotStore.getState().enterDraft();
@@ -228,12 +229,16 @@ export function DataPilotWindow() {
       return;
     }
 
+    const store = datapilotStore.getState();
+    const userMessage = localUserMessage(currentSessionId, message);
+    store.appendUserMessage(userMessage);
+    store.applyEvent(localTurnEvent("turn_pending", currentSessionId));
     try {
-      const userMessage = localUserMessage(currentSessionId, message);
       openEvents(currentSessionId);
       await submitTurn(currentSessionId, message);
-      datapilotStore.getState().appendUserMessage(userMessage);
     } catch (error) {
+      datapilotStore.getState().discardLocalMessage(userMessage.id);
+      datapilotStore.getState().applyEvent(localTurnEvent("turn_submission_failed", currentSessionId));
       console.error("Failed to submit DataPilot active turn", error);
     }
   };
@@ -563,6 +568,17 @@ function localUserMessage(sessionId: string, content: string) {
     role: "user" as const,
     content,
     created_at: new Date().toISOString(),
+  };
+}
+
+function localTurnEvent(type: "turn_pending" | "turn_submission_failed", sessionId: string) {
+  return {
+    type,
+    source: "main",
+    run_id: sessionId,
+    parent_run_id: null,
+    timestamp: new Date().toISOString(),
+    payload: {},
   };
 }
 

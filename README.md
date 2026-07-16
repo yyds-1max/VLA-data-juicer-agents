@@ -143,6 +143,34 @@ Then run the frontend dev server from `frontend`. Vite proxies `/api` and WebSoc
 npm run dev
 ```
 
+### User-facing agent activity events
+
+The Web conversation exposes a product-safe ReAct projection rather than raw
+model reasoning. AgentScope's event log remains the internal diagnostic source;
+the Web adapter emits:
+
+- `activity_snapshot` to create an updateable observation/reasoning/action card;
+- `activity_delta` to upsert a step or complete, fail, interrupt, or pause it;
+- `tool_start` with the exact tool name and opaque call ID, but no arguments;
+- `tool_end` with the exact tool name, call ID, and status, but no raw result;
+- `final` for the separate assistant answer after processing.
+
+Before a tool call, agents produce one single-line public update:
+
+```text
+Activity: {"observation":"已确认的环境事实","analysis":"面向用户的简短判断依据","action":"下一步业务动作"}
+```
+
+The adapter removes this line from assistant text, validates and bounds all
+three fields, and falls back to a deterministic business-level tool
+presentation when it is missing or rejected. Hidden thinking blocks and
+pre-tool narration do not enter the Web event stream; public activity and tool
+events additionally exclude tool arguments/results, internal paths, prompts,
+and agent names. The frontend shows `正在思考` immediately,
+updates one expanded ReAct card in place, displays running tools such as
+`正在调用工具 get_current_plan_step_tool +8s`, and automatically collapses the
+activity after completion while keeping the final answer separate.
+
 For an integrated demo/server, build the frontend first and let the backend serve it:
 
 ```bash

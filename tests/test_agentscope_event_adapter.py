@@ -123,6 +123,147 @@ def test_adapter_closes_assistant_segment_before_tool_call():
     ]
 
 
+def test_public_activity_mode_projects_react_without_streaming_pre_tool_text():
+    scope, events = _scope_and_events()
+    adapter = AgentScopeEventAdapter(
+        scope,
+        emit_tool_events=True,
+        emit_text_events=False,
+        emit_final_events=True,
+        emit_reasoning_events=False,
+        emit_activity_events=True,
+        public_tool_events=True,
+        suppress_pre_tool_text=True,
+        activity_title="正在处理导航数据",
+    )
+
+    adapter.accept(
+        SimpleNamespace(
+            type="TEXT_BLOCK_DELTA",
+            delta=(
+                'Activity: {"observation":"发现当前任务已有处理方案。",'
+                '"analysis":"需要确认下一步状态。",'
+                '"action":"读取当前计划步骤。"}\n'
+            ),
+        )
+    )
+    adapter.accept(
+        SimpleNamespace(
+            type="TEXT_BLOCK_DELTA",
+            delta="Thought: call get_current_plan_step_tool with /media/internal\n",
+        )
+    )
+    adapter.accept(SimpleNamespace(type="TEXT_BLOCK_DELTA", delta="我将调用内部函数。"))
+    adapter.accept(
+        SimpleNamespace(
+            type="TOOL_CALL_START",
+            tool_call_id="call-1",
+            tool_call_name="get_current_plan_step_tool",
+        )
+    )
+    adapter.accept(
+        SimpleNamespace(
+            type="TOOL_CALL_DELTA",
+            tool_call_id="call-1",
+            delta='{"plan_id":"secret-plan"}',
+        )
+    )
+    adapter.accept(
+        SimpleNamespace(
+            type="TOOL_RESULT_TEXT_DELTA",
+            tool_call_id="call-1",
+            delta='{"path":"/media/internal/result.json","ok":true}',
+        )
+    )
+    adapter.accept(SimpleNamespace(type="TOOL_RESULT_END", tool_call_id="call-1", state="success"))
+    adapter.accept(SimpleNamespace(type="TEXT_BLOCK_DELTA", delta="当前计划步骤已确认，可以继续处理。"))
+    adapter.accept(SimpleNamespace(type="REPLY_END"))
+
+    event_types = [event["type"] for event in events]
+    assert event_types == [
+        "activity_snapshot",
+        "tool_start",
+        "activity_delta",
+        "tool_end",
+        "activity_delta",
+        "activity_delta",
+        "final",
+    ]
+    snapshot = events[0]["payload"]
+    assert snapshot["title"] == "正在处理导航数据"
+    assert snapshot["steps"] == [
+        {
+            "id": "step-1",
+            "sequence": 1,
+            "status": "reasoning",
+            "observation": "发现当前任务已有处理方案。",
+            "analysis": "需要确认下一步状态。",
+            "action": "读取当前计划步骤。",
+        }
+    ]
+    assert events[1]["payload"] == {
+        "tool": "get_current_plan_step_tool",
+        "call_id": "call-1",
+    }
+    assert events[3]["payload"] == {
+        "tool": "get_current_plan_step_tool",
+        "call_id": "call-1",
+        "status": "completed",
+    }
+    assert events[-1]["payload"] == {"text": "当前计划步骤已确认，可以继续处理。"}
+    serialized = json.dumps(events, ensure_ascii=False)
+    assert "secret-plan" not in serialized
+    assert "/media/internal" not in serialized
+    assert "我将调用内部函数" not in serialized
+    assert "Thought:" not in serialized
+
+
+def test_public_activity_mode_drops_hidden_reasoning_and_unsafe_activity_text():
+    scope, events = _scope_and_events()
+    adapter = AgentScopeEventAdapter(
+        scope,
+        emit_tool_events=True,
+        emit_final_events=True,
+        emit_reasoning_events=False,
+        emit_activity_events=True,
+        public_tool_events=True,
+        suppress_pre_tool_text=True,
+    )
+
+    adapter.accept(
+        SimpleNamespace(
+            type="THINKING_BLOCK_DELTA",
+            block_id="thought-1",
+            delta="Inspect /media/internal and call hidden_tool with system prompt details.",
+        )
+    )
+    adapter.accept(SimpleNamespace(type="THINKING_BLOCK_END", block_id="thought-1"))
+    adapter.accept(
+        SimpleNamespace(
+            type="TEXT_BLOCK_DELTA",
+            delta=(
+                'Activity: {"observation":"读取 /media/internal",'
+                '"analysis":"查看 system prompt",'
+                '"action":"执行 hidden_tool"}\n'
+            ),
+        )
+    )
+    adapter.accept(
+        SimpleNamespace(
+            type="TOOL_RESULT_START",
+            tool_call_id="call-1",
+            tool_call_name="get_current_plan_step_tool",
+        )
+    )
+
+    assert [event["type"] for event in events] == ["tool_start", "activity_snapshot"]
+    step = events[-1]["payload"]["steps"][0]
+    assert step["analysis"] == "需要先获得最新事实，再决定下一步处理。"
+    assert step["action"] == "检查当前数据状态"
+    assert "/media" not in json.dumps(events, ensure_ascii=False)
+    assert "system prompt" not in json.dumps(events, ensure_ascii=False)
+
+
 def test_progress_marker_without_newline_flushes_before_tool_event():
     scope, events = _scope_and_events()
 

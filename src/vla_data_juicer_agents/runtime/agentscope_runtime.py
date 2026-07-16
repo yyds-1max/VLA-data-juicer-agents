@@ -20,6 +20,7 @@ from agentscope.permission import PermissionBehavior, PermissionDecision
 from agentscope.tool import ToolBase, ToolChunk
 
 from vla_data_juicer_agents.adapters.agentscope import AgentScopeEventAdapter
+from vla_data_juicer_agents.capabilities.session.runtime import SessionToolRuntime
 from vla_data_juicer_agents.core.cancellation import CancellationContext, bind_cancellation
 from vla_data_juicer_agents.core.events import CallbackEventSink, EventEmitter
 from vla_data_juicer_agents.navigation.agent_tools import resolve_navigation_agent_tools
@@ -1249,14 +1250,27 @@ class AgentScopeRuntime:
         translated_events: asyncio.Queue[dict[str, Any]] = asyncio.Queue()
         live_events: asyncio.Queue[dict[str, Any] | None] = asyncio.Queue()
         live_ready = asyncio.Event()
-        scope = EventEmitter(CallbackEventSink(translated_events.put_nowait)).scope(
+        scope = EventEmitter(
+            CallbackEventSink(translated_events.put_nowait),
+            event_transform=SessionToolRuntime.redact_event,
+        ).scope(
             "agentscope",
             run_id=agentscope_session_id,
         )
         adapter = AgentScopeEventAdapter(
             scope,
-            emit_text_events=True,
+            emit_tool_events=True,
+            emit_text_events=False,
             emit_final_events=True,
+            emit_reasoning_events=False,
+            emit_activity_events=True,
+            public_tool_events=True,
+            suppress_pre_tool_text=True,
+            activity_title=(
+                "正在处理导航数据"
+                if agent_id == self.config.navigation_agent_id
+                else "正在分析请求"
+            ),
         )
         seen_entry_ids: set[str] = set()
         seen_pending_decision_states: dict[tuple[str, str], str] = {}
