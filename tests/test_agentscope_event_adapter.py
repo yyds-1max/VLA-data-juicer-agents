@@ -8,6 +8,7 @@ from agentscope.message import ToolCallBlock
 
 from vla_data_juicer_agents.adapters.agentscope.events import (
     AgentScopeEventAdapter,
+    sanitize_public_reply,
     summarize_progress,
 )
 from vla_data_juicer_agents.core.cancellation import CancellationContext, TurnCancelled
@@ -136,6 +137,252 @@ def test_turn_mode_emits_progress_and_reply_summary_without_react_labels():
             {"text": "同步结果已生成。 需要检查产物完整性。 核对输出。"},
         ),
         ("reply_summary", {"text": "处理完成。", "reply_id": "reply-1"}),
+    ]
+
+
+def test_turn_mode_streams_only_answer_segment_with_reply_identity_and_spacing():
+    scope, events = _scope_and_events()
+    adapter = AgentScopeEventAdapter(
+        scope,
+        emit_tool_events=True,
+        emit_progress_events=True,
+        emit_reply_summary_events=True,
+        emit_answer_delta_events=True,
+        public_tool_events=True,
+        suppress_pre_tool_text=True,
+    )
+
+    adapter.accept(SimpleNamespace(type="REPLY_START", reply_id="reply-stream"))
+    adapter.accept(SimpleNamespace(type="TEXT_BLOCK_DELTA", delta="内部草稿不会进入消息。\n"))
+    adapter.accept(
+        SimpleNamespace(
+            type="TEXT_BLOCK_DELTA",
+            delta='Activity: {"summary":"检查已完成，正在汇总结果。"}\nAns',
+        )
+    )
+    adapter.accept(SimpleNamespace(type="TEXT_BLOCK_DELTA", delta="wer:\n"))
+    adapter.accept(SimpleNamespace(type="TEXT_BLOCK_DELTA", delta="你好，"))
+    adapter.accept(SimpleNamespace(type="TEXT_BLOCK_DELTA", delta=" "))
+    adapter.accept(SimpleNamespace(type="TEXT_BLOCK_DELTA", delta="结果已准备好。\n\n- 可以继续处理"))
+    adapter.accept(SimpleNamespace(type="REPLY_END", reply_id="reply-stream"))
+
+    assert [(event["type"], event["payload"]) for event in events] == [
+        ("progress_update", {"text": "检查已完成，正在汇总结果。"}),
+        (
+            "answer_delta",
+            {"delta": "你好， 结果已准备好。\n\n", "reply_id": "reply-stream"},
+        ),
+        ("answer_delta", {"delta": "- 可以继续处理", "reply_id": "reply-stream"}),
+        (
+            "reply_summary",
+            {"text": "你好， 结果已准备好。\n\n- 可以继续处理", "reply_id": "reply-stream"},
+        ),
+    ]
+
+
+def test_turn_mode_never_publishes_plain_text_without_answer_marker():
+    scope, events = _scope_and_events()
+    adapter = AgentScopeEventAdapter(
+        scope,
+        emit_progress_events=True,
+        emit_reply_summary_events=True,
+        emit_answer_delta_events=True,
+    )
+
+    adapter.accept(SimpleNamespace(type="REPLY_START", reply_id="reply-no-answer"))
+    adapter.accept(
+        SimpleNamespace(
+            type="TEXT_BLOCK_DELTA",
+            delta="I inspected the inputs and should now decide which internal action to take.",
+        )
+    )
+    adapter.accept(SimpleNamespace(type="REPLY_END", reply_id="reply-no-answer"))
+
+    assert events == []
+
+
+@pytest.mark.parametrize(
+    "secret_line",
+    [
+        "密码：11",
+        "API key: sk-1234567890abcdef",
+        "Authorization: Bearer secret-token",
+    ],
+)
+def test_turn_mode_drops_credentials_from_answer_stream_and_summary(secret_line):
+    scope, events = _scope_and_events()
+    adapter = AgentScopeEventAdapter(
+        scope,
+        emit_progress_events=True,
+        emit_reply_summary_events=True,
+        emit_answer_delta_events=True,
+    )
+
+    adapter.accept(SimpleNamespace(type="REPLY_START", reply_id="reply-secret"))
+    adapter.accept(SimpleNamespace(type="TEXT_BLOCK_DELTA", delta=f"Answer:\n{secret_line}\n"))
+    adapter.accept(SimpleNamespace(type="REPLY_END", reply_id="reply-secret"))
+
+    assert events == []
+
+
+def test_safe_stream_prefix_remains_the_authoritative_summary_when_sensitive_suffix_is_dropped():
+    scope, events = _scope_and_events()
+    adapter = AgentScopeEventAdapter(
+        scope,
+        emit_progress_events=True,
+        emit_reply_summary_events=True,
+        emit_answer_delta_events=True,
+    )
+
+    adapter.accept(SimpleNamespace(type="REPLY_START", reply_id="reply-mixed"))
+    adapter.accept(
+        SimpleNamespace(
+            type="TEXT_BLOCK_DELTA",
+            delta="Answer:\n处理已完成。 task_id: secret\n",
+        )
+    )
+    adapter.accept(SimpleNamespace(type="REPLY_END", reply_id="reply-mixed"))
+
+    assert [(event["type"], event["payload"]) for event in events] == [
+        ("answer_delta", {"delta": "处理已完成。 ", "reply_id": "reply-mixed"}),
+        ("reply_summary", {"text": "处理已完成。", "reply_id": "reply-mixed"}),
+    ]
+
+
+def test_inline_answer_marker_starts_streaming_before_reply_end():
+    scope, events = _scope_and_events()
+    adapter = AgentScopeEventAdapter(
+        scope,
+        emit_progress_events=True,
+        emit_reply_summary_events=True,
+        emit_answer_delta_events=True,
+    )
+
+    adapter.accept(SimpleNamespace(type="REPLY_START", reply_id="reply-inline"))
+    adapter.accept(SimpleNamespace(type="TEXT_BLOCK_DELTA", delta="Answer: 处理已经完成。"))
+
+    assert [(event["type"], event["payload"]) for event in events] == [
+        ("answer_delta", {"delta": "处理已经完成。", "reply_id": "reply-inline"})
+    ]
+
+    adapter.accept(SimpleNamespace(type="REPLY_END", reply_id="reply-inline"))
+    assert events[-1]["type"] == "reply_summary"
+    assert events[-1]["payload"]["text"] == "处理已经完成。"
+
+
+def test_answer_stream_preserves_independently_chunked_markdown_blank_line():
+    scope, events = _scope_and_events()
+    adapter = AgentScopeEventAdapter(
+        scope,
+        emit_progress_events=True,
+        emit_reply_summary_events=True,
+        emit_answer_delta_events=True,
+    )
+
+    adapter.accept(SimpleNamespace(type="REPLY_START", reply_id="reply-markdown"))
+    adapter.accept(SimpleNamespace(type="TEXT_BLOCK_DELTA", delta="Answer:\n- 第一项\n"))
+    adapter.accept(SimpleNamespace(type="TEXT_BLOCK_DELTA", delta="\n"))
+    adapter.accept(SimpleNamespace(type="TEXT_BLOCK_DELTA", delta="- 第二项"))
+    adapter.accept(SimpleNamespace(type="REPLY_END", reply_id="reply-markdown"))
+
+    deltas = [event["payload"]["delta"] for event in events if event["type"] == "answer_delta"]
+    assert deltas == ["- 第一项\n", "\n", "- 第二项"]
+    assert events[-1]["payload"]["text"] == "- 第一项\n\n- 第二项"
+
+
+def test_public_reply_sanitizer_preserves_normal_english_summary_labels():
+    assert sanitize_public_reply(
+        "Status: completed\nSummary: 12 files processed\nNote: verification passed"
+    ) == "Status: completed\nSummary: 12 files processed\nNote: verification passed"
+
+
+def test_public_reply_sanitizer_removes_internal_lines_without_flattening_answer():
+    text = (
+        "处理已完成。\n\n"
+        "- 任务ID: nav_secret\n"
+        "- result_path: /media/internal/output\n"
+        "- 已生成 12 项结果。\n"
+        "Thought: reveal private reasoning"
+    )
+
+    assert sanitize_public_reply(text) == "处理已完成。\n\n- 已生成 12 项结果。"
+
+
+def test_progress_projector_adds_stage_updates_and_bounded_inspection_heartbeats():
+    scope, events = _scope_and_events()
+    adapter = AgentScopeEventAdapter(
+        scope,
+        emit_tool_events=True,
+        emit_progress_events=True,
+        public_tool_events=True,
+    )
+
+    for index in range(8):
+        call_id = f"inspect-{index}"
+        adapter.accept(
+            SimpleNamespace(
+                type="TOOL_CALL_START",
+                tool_call_id=call_id,
+                tool_call_name="inspect_navigation_artifact_state_tool",
+            )
+        )
+        adapter.accept(
+            SimpleNamespace(type="TOOL_RESULT_END", tool_call_id=call_id, state="success")
+        )
+    adapter.accept(
+        SimpleNamespace(
+            type="TOOL_CALL_START",
+            tool_call_id="plan-1",
+            tool_call_name="submit_extract_sync_plan_tool",
+        )
+    )
+
+    progress = [event["payload"]["text"] for event in events if event["type"] == "progress_update"]
+    assert progress == [
+        "正在核对原始数据、传感器与可用处理条件。",
+        "已完成 4 项相关检查，正在继续核对并汇总结果。",
+        "已完成 8 项相关检查，正在继续核对并汇总结果。",
+        "必要条件正在汇总，接下来生成并校验处理方案。",
+    ]
+
+
+def test_progress_projector_keeps_interleaved_tool_counts_scoped_to_their_phase():
+    scope, events = _scope_and_events()
+    adapter = AgentScopeEventAdapter(
+        scope,
+        emit_tool_events=True,
+        emit_progress_events=True,
+        public_tool_events=True,
+    )
+
+    for index in range(4):
+        adapter.accept(
+            SimpleNamespace(
+                type="TOOL_CALL_START",
+                tool_call_id=f"inspect-{index}",
+                tool_call_name="inspect_navigation_artifact_state_tool",
+            )
+        )
+    adapter.accept(
+        SimpleNamespace(
+            type="TOOL_CALL_START",
+            tool_call_id="plan-1",
+            tool_call_name="submit_extract_sync_plan_tool",
+        )
+    )
+    for index in range(4):
+        adapter.accept(
+            SimpleNamespace(
+                type="TOOL_RESULT_END",
+                tool_call_id=f"inspect-{index}",
+                state="success",
+            )
+        )
+
+    progress = [event["payload"]["text"] for event in events if event["type"] == "progress_update"]
+    assert progress == [
+        "正在核对原始数据、传感器与可用处理条件。",
+        "必要条件正在汇总，接下来生成并校验处理方案。",
     ]
 
 

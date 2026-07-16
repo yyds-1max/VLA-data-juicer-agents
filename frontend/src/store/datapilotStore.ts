@@ -414,22 +414,25 @@ function applyLiveEvent(run: RunState, event: AgentEvent): void {
 }
 
 function applyEventAndMark(run: RunState, event: AgentEvent | TimelineEventRecord, key: string): void {
-  const timelineLength = run.timeline.length;
+  const existingItems = new Set(run.timeline);
   applyAgentEvent(run, event);
   run.appliedEventKeys[key] = true;
-  stampNewTimelineItems(run, event, timelineLength);
+  stampNewTimelineItems(run, event, existingItems);
 }
 
 function stampNewTimelineItems(
   run: RunState,
   event: AgentEvent | TimelineEventRecord,
-  timelineLength: number,
+  existingItems: Set<RunState["timeline"][number]>,
 ): void {
   const record = event as Partial<TimelineEventRecord>;
   const createdAt = event.timestamp || record.created_at || new Date().toISOString();
   const sequence = typeof record.seq === "number" ? record.seq : timelineSequence;
-  for (let index = timelineLength; index < run.timeline.length; index += 1) {
-    const item = run.timeline[index] as OrderedTimelineItem;
+  for (const candidate of run.timeline) {
+    if (existingItems.has(candidate)) {
+      continue;
+    }
+    const item = candidate as OrderedTimelineItem;
     item.createdAt = createdAt;
     item.sequence = sequence;
     if (typeof record.seq !== "number") {

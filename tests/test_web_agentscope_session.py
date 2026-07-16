@@ -3228,6 +3228,44 @@ async def test_runtime_event_cursor_persists_across_runtime_restart(tmp_path: Pa
 
 
 @pytest.mark.asyncio
+async def test_turn_event_subscription_rebuilds_open_reply_state_before_cursor() -> None:
+    message_bus = FakeAgentScopeMessageBus(
+        replay_events=[
+            ("1-0", {"type": "REPLY_START", "reply_id": "reply-1"}),
+            ("2-0", {"type": "TEXT_BLOCK_DELTA", "reply_id": "reply-1", "delta": "Answer:\n前缀"}),
+            ("3-0", {"type": "TEXT_BLOCK_DELTA", "reply_id": "reply-1", "delta": "后缀。"}),
+            ("4-0", {"type": "REPLY_END", "reply_id": "reply-1"}),
+        ],
+    )
+    runtime = _runtime(message_bus=message_bus)
+    runtime.event_cursors["as-session-1"] = "2-0"
+
+    batches = [
+        batch
+        async for batch in runtime.subscribe_agentscope_session_event_batches(
+            web_session_id="web-1",
+            agent_id="navigation-data-agent",
+            agentscope_session_id="as-session-1",
+            continuous=False,
+            turn_events=True,
+        )
+    ]
+    projected = [event for batch in batches for event in batch.events]
+
+    assert message_bus.read_since == [None, "2-0"]
+    assert [(event["type"], event["payload"]) for event in projected] == [
+        (
+            "answer_delta",
+            {"delta": "前缀后缀。", "reply_id": "reply-1"},
+        ),
+        (
+            "reply_summary",
+            {"text": "前缀后缀。", "reply_id": "reply-1"},
+        ),
+    ]
+
+
+@pytest.mark.asyncio
 async def test_create_session_creates_compatible_record_and_persists(tmp_path: Path) -> None:
     store = WebSessionStore(tmp_path / "sessions.sqlite")
     manager = AgentScopeWebSessionManager(store=store, runtime=FakeAgentScopeRuntime())

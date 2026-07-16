@@ -1501,6 +1501,7 @@ class AgentScopeRuntime:
                 emit_activity_events=not turn_events,
                 emit_progress_events=turn_events,
                 emit_reply_summary_events=turn_events,
+                emit_answer_delta_events=turn_events,
                 public_tool_events=True,
                 suppress_pre_tool_text=True,
                 activity_title=(
@@ -1608,6 +1609,37 @@ class AgentScopeRuntime:
                 reply_id=_raw_reply_id(raw_event),
             )
 
+        async def rebuild_open_reply_adapter(cursor: str | None) -> None:
+            """Silently replay the open reply prefix so parser state survives restart."""
+            if cursor is None:
+                return
+            open_reply: list[dict[str, Any]] = []
+            for entry_id, raw_event in await self.message_bus.session_read_events(
+                agentscope_session_id,
+                since=None,
+            ):
+                if _stream_id_is_newer(entry_id, cursor):
+                    break
+                raw_type = _raw_event_type(raw_event)
+                if raw_type == "REPLY_START":
+                    open_reply = [raw_event]
+                    continue
+                if not open_reply:
+                    continue
+                open_reply.append(raw_event)
+                if raw_type == "REPLY_END":
+                    open_reply = []
+            if not open_reply:
+                return
+            for raw_event in open_reply:
+                accept_raw_event(raw_event)
+            _logger.info(
+                "Rebuilt AgentScope reply adapter state: session_id=%s cursor=%s events=%d",
+                agentscope_session_id,
+                cursor,
+                len(open_reply),
+            )
+
         try:
             if continuous:
                 await live_ready.wait()
@@ -1619,6 +1651,8 @@ class AgentScopeRuntime:
                     )
 
             cursor = self._event_cursor(agentscope_session_id)
+            if turn_events:
+                await rebuild_open_reply_adapter(cursor)
             for entry_id, raw_event in await self.message_bus.session_read_events(
                 agentscope_session_id,
                 since=cursor,

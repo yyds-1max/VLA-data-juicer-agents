@@ -2356,6 +2356,101 @@ test("agentscope router assistant output remains a DataPilot timeline bubble and
   expect(screen.queryByRole("button", { name: /完成了子任务/ })).not.toBeInTheDocument();
 });
 
+test("separate reply streams in one durable turn render as separate DataPilot bubbles", () => {
+  const run = createEmptyRunState();
+  run.timeline = [
+    {
+      kind: "assistant",
+      source: "agentscope",
+      text: "第一轮流式回复",
+      runId: "shared-session",
+      turnId: "turn-1",
+      replyId: "reply-1",
+      createdAt: "2026-06-26T00:02:00Z",
+      sequence: 1,
+    },
+    {
+      kind: "assistant",
+      source: "agentscope",
+      text: "第二轮流式回复",
+      runId: "shared-session",
+      turnId: "turn-1",
+      replyId: "reply-2",
+      createdAt: "2026-06-26T00:02:01Z",
+      sequence: 2,
+    },
+  ] as TestTimelineItem[];
+
+  render(
+    <MessageList
+      messages={[]}
+      turns={[
+        {
+          id: "turn-1",
+          web_session_id: "session-1",
+          origin: "system",
+          status: "running",
+          started_at: "2026-06-26T00:02:00Z",
+          finished_at: null,
+          final_message_id: null,
+        },
+      ]}
+      run={run}
+    />,
+  );
+
+  expect(screen.getByText("第一轮流式回复")).toBeVisible();
+  expect(screen.getByText("第二轮流式回复")).toBeVisible();
+});
+
+test("persisted final message replaces its live final by message id", () => {
+  const run = createEmptyRunState();
+  run.timeline = [
+    {
+      kind: "assistant",
+      source: "agentscope",
+      text: "流式终态副本",
+      status: "final",
+      runId: "shared-session",
+      turnId: "turn-1",
+      replyId: "reply-1",
+      finalMessageId: "message-final",
+      createdAt: "2026-06-26T00:02:01Z",
+      sequence: 1,
+    },
+  ] as TestTimelineItem[];
+
+  render(
+    <MessageList
+      messages={[
+        {
+          id: "message-final",
+          session_id: "session-1",
+          turn_id: "turn-1",
+          role: "assistant",
+          content: "持久化最终回复",
+          created_at: "2026-06-26T00:02:01Z",
+        },
+      ]}
+      turns={[
+        {
+          id: "turn-1",
+          web_session_id: "session-1",
+          origin: "system",
+          status: "completed",
+          started_at: "2026-06-26T00:02:00Z",
+          finished_at: "2026-06-26T00:02:01Z",
+          final_message_id: "message-final",
+        },
+      ]}
+      run={run}
+    />,
+  );
+
+  expect(screen.getByText("持久化最终回复")).toBeVisible();
+  expect(screen.queryByText("流式终态副本")).not.toBeInTheDocument();
+});
+
 test("completed tool calls remain compact rows inside the folded process", () => {
   const run = createEmptyRunState();
   run.timeline = [

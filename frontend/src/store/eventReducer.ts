@@ -23,6 +23,9 @@ export interface TimelineItem {
   activityStatus?: string;
   activitySteps?: ActivityStep[];
   turnId?: string | null;
+  replyId?: string;
+  replyKey?: string;
+  finalMessageId?: string;
   callId?: string;
   tool?: string;
   toolPhase?: "running" | "background" | "completed" | "failed" | "interrupted";
@@ -87,6 +90,8 @@ export function applyAgentEvent(state: RunState, event: AgentEvent): void {
   const parentRunId = normalizeNullableText(event.parent_run_id);
   const payload = event.payload ?? {};
   const turnId = normalizeNullableText(event.turn_id);
+  const replyId = normalizeText(payload.reply_id) || normalizeText(payload.replyId);
+  const replyKey = replyId ? streamReplyKey(turnId, runId, replyId) : "";
   const label = sourceLabel(source);
   const eventTimestamp = event.timestamp ?? (event as AgentEvent & { created_at?: string }).created_at;
 
@@ -118,8 +123,18 @@ export function applyAgentEvent(state: RunState, event: AgentEvent): void {
 
   if (type === "progress_update") {
     const text = normalizeText(payload.text);
+    if (replyKey) {
+      removeAssistantDraft(state, replyKey);
+    }
     if (text) {
-      state.timeline.push({ kind: "progress", source: "main", text, turnId });
+      state.timeline.push({
+        kind: "progress",
+        source: "main",
+        text,
+        turnId,
+        replyId,
+        replyKey,
+      });
     }
     return;
   }
@@ -353,12 +368,22 @@ export function applyAgentEvent(state: RunState, event: AgentEvent): void {
     return;
   }
 
-  if (type === "assistant_delta") {
-    const delta = normalizeText(payload.delta);
-    if (!delta) {
+  if (type === "answer_reset") {
+    if (replyKey) {
+      removeAssistantDraft(state, replyKey);
+    }
+    return;
+  }
+
+  if (type === "answer_delta" || type === "assistant_delta") {
+    const delta = typeof payload.delta === "string" ? payload.delta : "";
+    if (delta.length === 0) {
       return;
     }
-    const candidate = findAssistantItem(state, source, runId, turnId);
+    const candidate = findAssistantItem(state, source, runId, turnId, replyId);
+    if (candidate?.status === "final" && replyKey) {
+      return;
+    }
     const existing = candidate?.status === "final" ? undefined : candidate;
     if (existing) {
       existing.text += delta;
@@ -370,6 +395,8 @@ export function applyAgentEvent(state: RunState, event: AgentEvent): void {
         runId,
         parentRunId,
         turnId,
+        ...(replyId ? { replyId } : {}),
+        ...(replyKey ? { replyKey } : {}),
       });
     }
     state.running = true;
@@ -386,10 +413,11 @@ export function applyAgentEvent(state: RunState, event: AgentEvent): void {
   }
 
   if (type === "final") {
-    const text = normalizeText(payload.text);
-    if (text) {
+    const text = typeof payload.text === "string" ? payload.text : "";
+    const finalMessageId = normalizeText(payload.message_id) || normalizeText(payload.messageId);
+    if (text.trim()) {
       const existing = turnId || runId
-        ? findAssistantItem(state, source, runId, turnId)
+        ? findAssistantItem(state, source, runId, turnId, replyId)
         : undefined;
       if (!turnId && existing?.status === "final") {
         return;
@@ -397,6 +425,9 @@ export function applyAgentEvent(state: RunState, event: AgentEvent): void {
       if (existing) {
         existing.text = text;
         existing.status = "final";
+        if (replyId) existing.replyId = replyId;
+        if (replyKey) existing.replyKey = replyKey;
+        if (finalMessageId) existing.finalMessageId = finalMessageId;
       } else {
         state.timeline.push({
           kind: "assistant",
@@ -406,6 +437,9 @@ export function applyAgentEvent(state: RunState, event: AgentEvent): void {
           parentRunId,
           turnId,
           status: "final",
+          ...(replyId ? { replyId } : {}),
+          ...(replyKey ? { replyKey } : {}),
+          ...(finalMessageId ? { finalMessageId } : {}),
         });
       }
     }
@@ -434,7 +468,18 @@ function findAssistantItem(
   source: string,
   runId: string,
   turnId: string | null,
+  replyId = "",
 ): TimelineItem | undefined {
+  if (replyId) {
+    const key = streamReplyKey(turnId, runId, replyId);
+    for (let index = state.timeline.length - 1; index >= 0; index -= 1) {
+      const item = state.timeline[index];
+      if (item.kind === "assistant" && timelineReplyKey(item) === key) {
+        return item;
+      }
+    }
+    return undefined;
+  }
   for (let index = state.timeline.length - 1; index >= 0; index -= 1) {
     const item = state.timeline[index];
     if (item.kind !== "assistant" || item.source !== source) {
@@ -457,6 +502,24 @@ function findAssistantItem(
     }
   }
   return undefined;
+}
+
+function removeAssistantDraft(state: RunState, replyKey: string): void {
+  state.timeline = state.timeline.filter(
+    (item) =>
+      item.kind !== "assistant" || timelineReplyKey(item) !== replyKey || item.status === "final",
+  );
+}
+
+function streamReplyKey(turnId: string | null | undefined, runId: string | null | undefined, replyId: string): string {
+  return `${turnId ?? ""}\u0000${runId ?? ""}\u0000${replyId}`;
+}
+
+function timelineReplyKey(item: TimelineItem): string {
+  if (item.replyKey) {
+    return item.replyKey;
+  }
+  return item.replyId ? streamReplyKey(item.turnId, item.runId, item.replyId) : "";
 }
 
 function findToolItem(

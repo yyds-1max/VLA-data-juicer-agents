@@ -21,6 +21,10 @@ _ACTIVITY_MARKER_RE = re.compile(
     r"^\s*(?:Activity|活动)\s*[:：]\s*(?P<payload>.+?)\s*$",
     flags=re.IGNORECASE | re.DOTALL,
 )
+_ANSWER_MARKER_RE = re.compile(
+    r"^\s*(?:Answer|回答)\s*[:：]\s*(?P<text>.*)$",
+    flags=re.IGNORECASE | re.DOTALL,
+)
 _PRIVATE_TRACE_MARKER_RE = re.compile(
     r"^\s*(?:Thought|Observation|Analysis|Action|Final Answer|"
     r"内部思考|原始观察|动作参数|工具参数)\s*[:：]",
@@ -37,6 +41,23 @@ _UNSAFE_PUBLIC_TEXT_RE = re.compile(
     r"```|<\/?(?:think|tool|system)\b|"
     r"\b[a-z][a-z0-9]*agent\b|agentscope|"
     r"\b(?:api[_-]?key|password|authorization|bearer\s+[a-z0-9._-]+)\b"
+    r")",
+    flags=re.IGNORECASE,
+)
+_UNSAFE_PUBLIC_REPLY_LINE_RE = re.compile(
+    r"(?:"
+    r"任务\s*ID|task[_ -]?id|plan[_ -]?id|call[_ -]?id|run[_ -]?id|"
+    r"\b[a-z][a-z0-9_]*_tool\b|"
+    r"^\s*[-*]?\s*[\"']?(?:reply_id|step_id|activity_id|session_id|agent_id|"
+    r"tool_call_id|parent_run_id|request_id|origin_key|ledger_state|"
+    r"internal_task_id)[\"']?\s*[:：]|"
+    r"/(?:media|home|users?|var|tmp|opt|srv)/|[a-z]:\\|"
+    r"system\s+prompt|developer\s+message|chain[- ]of[- ]thought|agentscope|"
+    r"(?:password|passwd|api[_ -]?key|access[_ -]?token|authorization|"
+    r"credential|secret|密码|口令|密钥|令牌)\s*[:：=]|"
+    r"bearer\s+[a-z0-9._~+/-]+|\bsk-[a-z0-9_-]{8,}\b|"
+    r"根据(?:系统|指导)|我应该|让我(?:向用户|来)|当前状态显示|"
+    r"(?:内部|专门的).{0,12}(?:代理|智能体)"
     r")",
     flags=re.IGNORECASE,
 )
@@ -182,6 +203,47 @@ _DEFAULT_TOOL_PRESENTATION = _ToolPresentation(
     "这一步处理已经结束。",
 )
 
+_TOOL_PHASES: dict[str, str] = {
+    "start_navigation_data_task": "setup",
+    "get_navigation_task_context_tool": "setup",
+    "list_observation_evidence_tool": "inspection",
+    "read_observation_evidence_tool": "inspection",
+    "describe_processing_action_tool": "inspection",
+    "record_navigation_user_guidance_tool": "planning",
+    "submit_extract_sync_plan_tool": "planning",
+    "submit_finish_processing_plan_tool": "planning",
+    "get_plan_execution_overview_tool": "silent_execution_state",
+    "get_current_plan_step_tool": "silent_execution_state",
+    "prepare_raw_data_tool": "preparation",
+    "extract_and_sync_navigation_data_tool": "extract_sync",
+    "assemble_finish_temp_tool": "finish_assembly",
+    "run_noobscene_preprocessing_tool": "finish_assembly",
+    "request_human_decision": "human_decision",
+    "run_initial_annotation_gui_tool": "annotation",
+    "run_tracking_tool": "tracking",
+    "prepare_gridmap_for_projection_tool": "projection",
+    "run_projection_and_trajectory_tool": "projection",
+    "validate_navigation_outputs_tool": "verification",
+}
+_PHASE_START_TEXT: dict[str, str] = {
+    "setup": "正在确认任务范围并建立处理上下文。",
+    "inspection": "正在核对原始数据、传感器与可用处理条件。",
+    "planning": "必要条件正在汇总，接下来生成并校验处理方案。",
+    "preparation": "正在准备后续处理所需的原始数据。",
+    "extract_sync": "正在提取并同步导航数据，这一步可能需要一些时间。",
+    "finish_assembly": "正在整理后续处理所需的中间数据。",
+    "human_decision": "继续执行前需要确认会影响处理结果的关键选择。",
+    "annotation": "正在生成并检查初始标注结果。",
+    "tracking": "正在计算轨迹与跟踪结果。",
+    "projection": "正在生成投影与轨迹结果。",
+    "verification": "主要处理已经结束，正在核对输出完整性。",
+    "generic": "正在执行下一阶段处理并核对结果。",
+}
+_PHASE_FAILURE_TEXT: dict[str, str] = {
+    "planning": "处理方案未通过校验，正在根据反馈调整后重试。",
+    "generic": "当前步骤未能完成，正在判断是否需要调整方案。",
+}
+
 
 class PublicActivityProjector:
     """Project internal ReAct events into a bounded user-facing activity stream."""
@@ -313,6 +375,14 @@ class PublicProgressProjector:
     def __init__(self, scope: EventScope) -> None:
         self._scope = scope
         self._last_text = ""
+        self._phase = ""
+        self._phase_completed: dict[str, int] = {}
+        self._heartbeat_completed: dict[str, int] = {}
+        self._explicit_update_covers_next_start = False
+        self._active_calls: dict[str, str] = {}
+        self._background_calls: set[str] = set()
+        self._terminal_calls: set[str] = set()
+        self._failed_phases: set[str] = set()
 
     def record_public_update(self, payload: dict[str, str]) -> None:
         summary = _public_text(payload.get("summary", ""))
@@ -328,26 +398,95 @@ class PublicProgressProjector:
             )
         if not summary or summary == self._last_text:
             return
-        self._last_text = summary
-        self._scope.emit("progress_update", text=summary)
+        self._emit(summary)
+        self._explicit_update_covers_next_start = True
+        if self._phase:
+            self._heartbeat_completed[self._phase] = self._phase_completed.get(
+                self._phase,
+                0,
+            )
 
     def record_legacy_progress(self, summary: str) -> None:
         self.record_public_update({"summary": summary})
 
-    def tool_started(self, _call_id: str, _tool_name: str) -> None:
-        return
+    def tool_started(self, call_id: str, tool_name: str) -> None:
+        if not call_id or call_id in self._active_calls or call_id in self._terminal_calls:
+            return
+        phase = _tool_phase(tool_name)
+        self._active_calls[call_id] = phase
+        if phase == "silent_execution_state":
+            return
+        if phase != self._phase:
+            self._phase = phase
+            self._failed_phases.discard(phase)
+            if self._explicit_update_covers_next_start:
+                self._explicit_update_covers_next_start = False
+            else:
+                self._emit(_PHASE_START_TEXT.get(phase, _PHASE_START_TEXT["generic"]))
+        elif self._explicit_update_covers_next_start:
+            self._explicit_update_covers_next_start = False
 
-    def tool_finished(self, _call_id: str, _tool_name: str, _status: str) -> None:
-        return
+    def tool_finished(self, call_id: str, tool_name: str, status: str) -> None:
+        if not call_id or call_id in self._terminal_calls:
+            return
+        phase = self._active_calls.pop(call_id, None) or _tool_phase(tool_name)
+        was_background = call_id in self._background_calls
+        self._background_calls.discard(call_id)
+        self._terminal_calls.add(call_id)
+        if phase == "silent_execution_state":
+            return
+        if was_background and status == "completed":
+            self._emit("后台处理已经完成，正在继续核对处理结果。")
+            return
+        if status == "interrupted":
+            self._emit("当前处理已经停止，正在保留已完成的状态。")
+            return
+        if status == "failed":
+            if phase not in self._failed_phases:
+                self._failed_phases.add(phase)
+                self._emit(_PHASE_FAILURE_TEXT.get(phase, _PHASE_FAILURE_TEXT["generic"]))
+            return
+        completed = self._phase_completed.get(phase, 0) + 1
+        self._phase_completed[phase] = completed
+        heartbeat = self._heartbeat_completed.get(phase, 0)
+        if phase == self._phase and completed - heartbeat >= 4:
+            self._heartbeat_completed[phase] = completed
+            self._emit(
+                f"已完成 {completed} 项相关检查，正在继续核对并汇总结果。"
+            )
 
-    def tool_background(self, _call_id: str, _tool_name: str) -> None:
-        return
+    def tool_background(self, call_id: str, tool_name: str) -> None:
+        if not call_id or call_id in self._terminal_calls:
+            return
+        self._active_calls.setdefault(call_id, _tool_phase(tool_name))
+        if call_id in self._background_calls:
+            return
+        self._background_calls.add(call_id)
+        self._emit("数据处理仍在后台运行，完成后会自动继续核对结果。")
 
     def waiting_for_user(self) -> None:
-        return
+        self._emit("继续执行前需要你确认关键处理选项。")
+
+    def background_resolved(self, call_id: str, tool_name: str, status: str) -> None:
+        if call_id in self._active_calls or call_id in self._background_calls:
+            self.tool_finished(call_id, tool_name, status)
+            return
+        if status == "completed":
+            self._emit("后台处理已经完成，正在继续核对处理结果。")
+        elif status == "interrupted":
+            self._emit("后台处理已经停止，正在保留已完成的状态。")
+        else:
+            self._emit("后台处理未能完成，正在核对失败状态和可恢复步骤。")
 
     def finish(self, _status: str = "completed") -> None:
         return
+
+    def _emit(self, text: str) -> None:
+        safe_text = _public_text(text)
+        if not safe_text or safe_text == self._last_text:
+            return
+        self._last_text = safe_text
+        self._scope.emit("progress_update", text=safe_text)
 
 
 def _tool_presentation(tool_name: str) -> _ToolPresentation:
@@ -357,11 +496,43 @@ def _tool_presentation(tool_name: str) -> _ToolPresentation:
     return _DEFAULT_TOOL_PRESENTATION
 
 
+def _tool_phase(tool_name: str) -> str:
+    normalized = tool_name.strip()
+    if normalized in _TOOL_PHASES:
+        return _TOOL_PHASES[normalized]
+    if normalized.startswith("inspect_navigation_"):
+        return "inspection"
+    return "generic"
+
+
 def _public_text(value: object) -> str:
     normalized = re.sub(r"\s+", " ", _text(value)).strip()
     if not normalized or _UNSAFE_PUBLIC_TEXT_RE.search(normalized):
         return ""
     return normalized[:_PUBLIC_TEXT_LIMIT].rstrip()
+
+
+def sanitize_public_reply(value: object, *, fallback: str = "") -> str:
+    """Remove internal/meta lines before reply text enters a public event."""
+    lines: list[str] = []
+    previous_blank = False
+    for raw_line in _text(value).replace("\r\n", "\n").replace("\r", "\n").split("\n"):
+        stripped = raw_line.strip()
+        if not stripped:
+            if lines and not previous_blank:
+                lines.append("")
+            previous_blank = True
+            continue
+        if _UNSAFE_PUBLIC_REPLY_LINE_RE.search(stripped):
+            continue
+        if _PRIVATE_TRACE_MARKER_RE.match(stripped):
+            continue
+        lines.append(raw_line.rstrip())
+        previous_blank = False
+    while lines and not lines[-1]:
+        lines.pop()
+    rendered = "\n".join(lines).strip()
+    return rendered or fallback
 
 
 def _activity_payload(text: str) -> dict[str, str]:
@@ -402,6 +573,7 @@ class AgentScopeEventAdapter:
         activity_title: str = "正在分析并处理请求",
         background_status_resolver: Callable[[str, str], str] | None = None,
         emit_reply_summary_events: bool = False,
+        emit_answer_delta_events: bool = False,
     ) -> None:
         self._scope = scope
         self._emit_tool_events = emit_tool_events
@@ -409,6 +581,7 @@ class AgentScopeEventAdapter:
         self._emit_final_events = emit_final_events
         self._emit_reasoning_events = emit_reasoning_events
         self._emit_reply_summary_events = emit_reply_summary_events
+        self._emit_answer_delta_events = emit_answer_delta_events
         self._public_tool_events = public_tool_events
         self._suppress_pre_tool_text = suppress_pre_tool_text
         self._thinking: dict[str, list[str]] = {}
@@ -423,8 +596,13 @@ class AgentScopeEventAdapter:
         self._progress_filter = ProgressSummaryFilter(
             scope,
             activity_projector=self._activity_projector,
+            answer_only=emit_answer_delta_events,
         )
         self._reply_text: list[str] = []
+        self._current_reply_id = ""
+        self._answer_stream_buffer = ""
+        self._answer_stream_emitted = False
+        self._safe_answer_parts: list[str] = []
         self._background_tools: dict[str, str] = {}
         self._background_status_resolver = background_status_resolver
 
@@ -433,7 +611,12 @@ class AgentScopeEventAdapter:
         block_id = _text(getattr(event, "block_id", ""))
         call_id = _text(getattr(event, "tool_call_id", ""))
 
-        if event_type == "THINKING_BLOCK_DELTA":
+        if event_type == "REPLY_START":
+            self._current_reply_id = _text(getattr(event, "reply_id", ""))
+            self._answer_stream_buffer = ""
+            self._answer_stream_emitted = False
+            self._safe_answer_parts.clear()
+        elif event_type == "THINKING_BLOCK_DELTA":
             self._thinking.setdefault(block_id, []).append(_text(getattr(event, "delta", "")))
         elif event_type == "THINKING_BLOCK_END":
             summary = summarize_progress("".join(self._thinking.pop(block_id, [])))
@@ -498,6 +681,7 @@ class AgentScopeEventAdapter:
         if state.started:
             return
         if self._suppress_pre_tool_text:
+            self._retract_answer_stream()
             self._discard_reply_segment()
         else:
             self._flush_reply_segment()
@@ -532,40 +716,111 @@ class AgentScopeEventAdapter:
         rendered = self._progress_filter.consume_text_delta(delta)
         if not rendered:
             return
-        if self._emit_text_events:
+        if self._emit_answer_delta_events:
+            self._buffer_answer_delta(rendered)
+        elif self._emit_text_events:
             self._scope.emit("assistant_delta", delta=rendered)
         self._reply_text.append(rendered)
 
     def _handle_reply_end(self, reply_id: str = "") -> None:
         if not self._emit_text_events and not self._emit_final_events and self._activity_projector is None:
             return
-        self._flush_reply_segment(reply_id=reply_id)
+        self._flush_reply_segment(reply_id=reply_id or self._current_reply_id)
+        self._current_reply_id = ""
 
     def _flush_reply_segment(self, *, reply_id: str = "") -> None:
         if not self._emit_text_events and not self._emit_final_events and self._activity_projector is None:
             return
         rendered = self._progress_filter.flush()
         if rendered:
-            if self._emit_text_events:
+            if self._emit_answer_delta_events:
+                self._buffer_answer_delta(rendered)
+            elif self._emit_text_events:
                 self._scope.emit("assistant_delta", delta=rendered)
             self._reply_text.append(rendered)
-        if (self._emit_final_events or self._emit_reply_summary_events) and self._reply_text:
+        self._flush_answer_delta_buffer()
+        summary_source = (
+            "".join(self._safe_answer_parts)
+            if self._emit_answer_delta_events
+            else self._progress_filter.summary_text() or "".join(self._reply_text)
+        )
+        summary = sanitize_public_reply(summary_source)
+        if (self._emit_final_events or self._emit_reply_summary_events) and summary:
             if self._activity_projector is not None:
                 self._activity_projector.finish(
                     "background" if self._background_tools else "completed"
                 )
             event_type = "reply_summary" if self._emit_reply_summary_events else "final"
-            payload = {"text": "".join(self._reply_text)}
+            payload = {"text": summary}
             if reply_id:
                 payload["reply_id"] = reply_id
             self._scope.emit(event_type, **payload)
         self._reply_text.clear()
+        self._safe_answer_parts.clear()
+        self._progress_filter.reset_segment()
 
     def _discard_reply_segment(self) -> None:
         rendered = self._progress_filter.flush()
         if rendered:
             self._reply_text.append(rendered)
         self._reply_text.clear()
+        self._safe_answer_parts.clear()
+        self._progress_filter.reset_segment()
+
+    def _buffer_answer_delta(self, rendered: str) -> None:
+        """Emit only complete, sanitized public sentences/lines while preserving spacing."""
+        self._answer_stream_buffer += rendered
+        while True:
+            match = re.search(r"[.!?。！？]\s*|\n", self._answer_stream_buffer)
+            if match is None:
+                return
+            end = match.end()
+            chunk = self._answer_stream_buffer[:end]
+            self._answer_stream_buffer = self._answer_stream_buffer[end:]
+            self._emit_safe_answer_chunk(chunk)
+
+    def _flush_answer_delta_buffer(self) -> None:
+        if not self._answer_stream_buffer:
+            return
+        chunk = self._answer_stream_buffer
+        self._answer_stream_buffer = ""
+        self._emit_safe_answer_chunk(chunk)
+
+    def _emit_safe_answer_chunk(self, chunk: str) -> None:
+        if not self._emit_answer_delta_events or not chunk:
+            return
+        if not chunk.strip():
+            if self._answer_stream_emitted:
+                payload: dict[str, str] = {"delta": chunk}
+                if self._current_reply_id:
+                    payload["reply_id"] = self._current_reply_id
+                self._scope.emit("answer_delta", **payload)
+                self._safe_answer_parts.append(chunk)
+            return
+        safe = sanitize_public_reply(chunk)
+        if not safe:
+            return
+        leading = chunk[: len(chunk) - len(chunk.lstrip())]
+        trailing = chunk[len(chunk.rstrip()) :]
+        delta = f"{leading}{safe}{trailing}"
+        payload: dict[str, str] = {"delta": delta}
+        if self._current_reply_id:
+            payload["reply_id"] = self._current_reply_id
+        self._scope.emit("answer_delta", **payload)
+        self._answer_stream_emitted = True
+        self._safe_answer_parts.append(delta)
+
+    def _retract_answer_stream(self) -> None:
+        self._answer_stream_buffer = ""
+        if (
+            not self._emit_answer_delta_events
+            or not self._current_reply_id
+            or not self._answer_stream_emitted
+        ):
+            return
+        self._scope.emit("answer_reset", reply_id=self._current_reply_id)
+        self._answer_stream_emitted = False
+        self._safe_answer_parts.clear()
 
     @staticmethod
     def _tool_status(state: object, result_text: str = "") -> str:
@@ -597,6 +852,12 @@ class AgentScopeEventAdapter:
                 call_id=call_id,
                 status=status,
             )
+        if self._activity_projector is not None:
+            resolver = getattr(self._activity_projector, "background_resolved", None)
+            if callable(resolver):
+                resolver(call_id, tool_name, status)
+            else:
+                self._activity_projector.tool_finished(call_id, tool_name, status)
 
     def _handle_require_external_execution(self, event: object) -> None:
         reply_id = _text(getattr(event, "reply_id", ""))
@@ -617,17 +878,21 @@ class AgentScopeEventAdapter:
 
 
 class ProgressSummaryFilter:
-    """Convert public progress marker text into reasoning events."""
+    """Separate public progress metadata from a safe final-answer segment."""
 
     def __init__(
         self,
         scope: EventScope,
         *,
         activity_projector: PublicActivityProjector | None = None,
+        answer_only: bool = False,
     ) -> None:
         self._scope = scope
         self._activity_projector = activity_projector
+        self._answer_only = answer_only
+        self._answer_mode = False
         self._buffer = ""
+        self._summary_parts: list[str] = []
 
     def consume_text_delta(self, delta: object) -> str:
         self._buffer += _text(delta)
@@ -637,8 +902,20 @@ class ProgressSummaryFilter:
             rendered = self._consume_line(line)
             if rendered is not None:
                 output.append(rendered + "\n")
-        if self._buffer and not self._could_be_progress_line(self._buffer):
-            output.append(self._buffer)
+                self._summary_parts.append("\n")
+        if self._answer_only and not self._answer_mode:
+            answer_match = _ANSWER_MARKER_RE.match(self._buffer)
+            if answer_match is not None:
+                self._summary_parts.clear()
+                self._answer_mode = True
+                self._buffer = ""
+                rendered = self._consume_plain_text(answer_match.group("text"))
+                if rendered:
+                    output.append(rendered)
+        if self._buffer and not self._could_be_marker_line(self._buffer):
+            rendered = self._consume_plain_text(self._buffer)
+            if rendered is not None:
+                output.append(rendered)
             self._buffer = ""
         return "".join(output)
 
@@ -653,6 +930,14 @@ class ProgressSummaryFilter:
         rendered = self._consume_line(buffered)
         return "" if rendered is None else rendered
 
+    def summary_text(self) -> str:
+        return "".join(self._summary_parts)
+
+    def reset_segment(self) -> None:
+        self._buffer = ""
+        self._summary_parts.clear()
+        self._answer_mode = False
+
     def _consume_line(self, line: str) -> str | None:
         activity_match = _ACTIVITY_MARKER_RE.match(line)
         if activity_match is not None:
@@ -665,7 +950,14 @@ class ProgressSummaryFilter:
             return None
         match = _PROGRESS_MARKER_RE.match(line)
         if match is None:
-            return line
+            answer_match = _ANSWER_MARKER_RE.match(line)
+            if answer_match is not None:
+                if self._answer_only and not self._answer_mode:
+                    self._summary_parts.clear()
+                self._answer_mode = True
+                answer_text = answer_match.group("text")
+                return self._consume_plain_text(answer_text)
+            return self._consume_plain_text(line)
         summary = summarize_progress(match.group("summary"))
         if summary:
             if self._activity_projector is not None:
@@ -674,12 +966,18 @@ class ProgressSummaryFilter:
                 self._scope.emit("reasoning", summary=summary)
         return None
 
+    def _consume_plain_text(self, text: str) -> str | None:
+        self._summary_parts.append(text)
+        if not self._answer_only or self._answer_mode:
+            return text
+        return None
+
     @staticmethod
     def _is_progress_line(line: str) -> bool:
         return bool(_PROGRESS_MARKER_RE.match(line) or _ACTIVITY_MARKER_RE.match(line))
 
     @staticmethod
-    def _could_be_progress_line(line: str) -> bool:
+    def _could_be_marker_line(line: str) -> bool:
         stripped = line.lstrip()
         if not stripped:
             return True
@@ -692,6 +990,7 @@ class ProgressSummaryFilter:
             "final answer:", "final answer：", "内部思考:", "内部思考：",
             "原始观察:", "原始观察：", "动作参数:", "动作参数：",
             "工具参数:", "工具参数：",
+            "answer:", "answer：", "回答:", "回答：",
         )
         normalized = stripped.lower()
         return any(marker.startswith(normalized) or normalized.startswith(marker) for marker in markers)

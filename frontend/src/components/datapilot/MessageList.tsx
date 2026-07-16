@@ -276,11 +276,18 @@ function TurnConversation({
   const items = run.timeline.filter(
     (item) => item.turnId === turn.id && ["progress", "tool", "activity"].includes(item.kind),
   );
-  const liveFinal = [...run.timeline]
-    .reverse()
-    .find((item) => item.turnId === turn.id && item.kind === "assistant");
-
-  const liveFinalIsPersisted = assistantMessages.some((message) => message.content === liveFinal?.text);
+  const liveReplies = run.timeline.filter(
+    (item) => item.turnId === turn.id && item.kind === "assistant",
+  );
+  const unpersistedLiveReplies = liveReplies.filter((item) => {
+    if (item.finalMessageId) {
+      return !assistantMessages.some((message) => message.id === item.finalMessageId);
+    }
+    if (item.status === "final") {
+      return !assistantMessages.some((message) => message.content === item.text);
+    }
+    return true;
+  });
   const showDisclosure = items.length > 0 || turn.origin === "user" || turn.status === "running" || turn.status === "waiting";
 
   return (
@@ -288,9 +295,12 @@ function TurnConversation({
       {userMessages.map((message) => <MessageBubble key={message.id} message={message} />)}
       {showDisclosure ? <ProcessingDisclosure turn={turn} items={items} /> : null}
       {assistantMessages.map((message) => <MessageBubble key={message.id} message={message} />)}
-      {liveFinal && !liveFinalIsPersisted ? (
-        <AssistantBubble text={liveFinal.text} />
-      ) : null}
+      {unpersistedLiveReplies.map((item, index) => (
+        <AssistantBubble
+          key={item.replyKey ?? `${item.runId ?? item.source}:${item.replyId ?? index}`}
+          text={item.text}
+        />
+      ))}
     </div>
   );
 }

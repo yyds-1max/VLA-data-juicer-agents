@@ -104,6 +104,270 @@ def test_store_persists_timeline_events(tmp_path: Path):
     assert detail.events[1].type == "tool_end"
 
 
+def test_projected_answer_stream_is_persisted_and_reconciled_by_reply_id(tmp_path: Path):
+    store = WebSessionStore(tmp_path / "sessions.sqlite")
+    session = store.create_session(title="streamed answer")
+    submission = store.begin_user_turn(session.id, "请汇总结果")
+    turn_id = submission.turn.id
+    store.save_agentscope_session_mapping(
+        session.id,
+        agent_id="main-router-agent",
+        agentscope_session_id="as-router",
+        active_turn_id=turn_id,
+    )
+    store.register_pending_reply(
+        turn_id=turn_id,
+        agentscope_session_id="as-router",
+        agent_id="main-router-agent",
+        source="user",
+    )
+    store.append_projected_event_batch(
+        web_session_id=session.id,
+        agentscope_session_id="as-router",
+        entry_id="1-0",
+        raw_event_type="REPLY_START",
+        reply_id="reply-1",
+        events=[],
+    )
+    delta = store.append_projected_event_batch(
+        web_session_id=session.id,
+        agentscope_session_id="as-router",
+        entry_id="2-0",
+        raw_event_type="TEXT_BLOCK_DELTA",
+        reply_id="reply-1",
+        events=[
+            {
+                "type": "answer_delta",
+                "source": "agentscope",
+                "run_id": "as-router",
+                "payload": {"delta": "结果已准备好。", "reply_id": "reply-1"},
+            }
+        ],
+    )
+    final = store.append_projected_event_batch(
+        web_session_id=session.id,
+        agentscope_session_id="as-router",
+        entry_id="3-0",
+        raw_event_type="REPLY_END",
+        reply_id="reply-1",
+        events=[
+            {
+                "type": "reply_summary",
+                "source": "agentscope",
+                "run_id": "as-router",
+                "payload": {"text": "结果已准备好。", "reply_id": "reply-1"},
+            }
+        ],
+    )
+
+    assert delta[0].payload == {"delta": "结果已准备好。", "reply_id": "reply-1"}
+    final_event = next(event for event in final if event.type == "final")
+    detail = store.get_session(session.id)
+    assert detail is not None
+    assert final_event.payload["reply_id"] == "reply-1"
+    assert final_event.payload["message_id"] == detail.turns[0].final_message_id
+    assert [message.content for message in detail.messages if message.role == "assistant"] == [
+        "结果已准备好。"
+    ]
+    assert store.append_projected_event_batch(
+        web_session_id=session.id,
+        agentscope_session_id="as-router",
+        entry_id="3-0",
+        raw_event_type="REPLY_END",
+        reply_id="reply-1",
+        events=[],
+    ) == []
+
+
+def test_intermediate_stream_is_reset_when_reply_remains_blocked(tmp_path: Path):
+    store = WebSessionStore(tmp_path / "sessions.sqlite")
+    session = store.create_session(title="background stream")
+    submission = store.begin_user_turn(session.id, "处理数据")
+    turn_id = submission.turn.id
+    store.save_agentscope_session_mapping(
+        session.id,
+        agent_id="navigation-data-agent",
+        agentscope_session_id="as-navigation",
+        active_turn_id=turn_id,
+    )
+    store.register_pending_reply(
+        turn_id=turn_id,
+        agentscope_session_id="as-navigation",
+        agent_id="navigation-data-agent",
+        source="user",
+    )
+    store.append_projected_event_batch(
+        web_session_id=session.id,
+        agentscope_session_id="as-navigation",
+        entry_id="1-0",
+        raw_event_type="REPLY_START",
+        reply_id="reply-1",
+        events=[],
+    )
+    store.append_projected_event_batch(
+        web_session_id=session.id,
+        agentscope_session_id="as-navigation",
+        entry_id="2-0",
+        raw_event_type="TOOL_RESULT_END",
+        reply_id="reply-1",
+        events=[
+            {
+                "type": "tool_background",
+                "source": "agentscope",
+                "run_id": "as-navigation",
+                "payload": {"tool": "extract_tool", "call_id": "call-1"},
+            },
+            {
+                "type": "answer_delta",
+                "source": "agentscope",
+                "run_id": "as-navigation",
+                "payload": {"delta": "暂时汇总。", "reply_id": "reply-1"},
+            },
+        ],
+    )
+    records = store.append_projected_event_batch(
+        web_session_id=session.id,
+        agentscope_session_id="as-navigation",
+        entry_id="3-0",
+        raw_event_type="REPLY_END",
+        reply_id="reply-1",
+        events=[
+            {
+                "type": "reply_summary",
+                "source": "agentscope",
+                "run_id": "as-navigation",
+                "payload": {"text": "后台处理仍在继续。"},
+            }
+        ],
+    )
+
+    assert [record.type for record in records] == ["answer_reset", "progress_update"]
+    assert records[0].payload == {"reply_id": "reply-1"}
+    assert records[1].payload == {"text": "后台处理仍在继续。", "reply_id": "reply-1"}
+
+
+def test_empty_public_reply_fails_and_closes_turn_instead_of_leaving_it_running(tmp_path: Path):
+    store = WebSessionStore(tmp_path / "sessions.sqlite")
+    session = store.create_session(title="empty reply")
+    submission = store.begin_user_turn(session.id, "请处理")
+    turn_id = submission.turn.id
+    store.save_agentscope_session_mapping(
+        session.id,
+        agent_id="main-router-agent",
+        agentscope_session_id="as-router",
+        active_turn_id=turn_id,
+    )
+    store.register_pending_reply(
+        turn_id=turn_id,
+        agentscope_session_id="as-router",
+        agent_id="main-router-agent",
+        source="user",
+    )
+    store.append_projected_event_batch(
+        web_session_id=session.id,
+        agentscope_session_id="as-router",
+        entry_id="1-0",
+        raw_event_type="REPLY_START",
+        reply_id="reply-empty",
+        events=[],
+    )
+
+    records = store.append_projected_event_batch(
+        web_session_id=session.id,
+        agentscope_session_id="as-router",
+        entry_id="2-0",
+        raw_event_type="REPLY_END",
+        reply_id="reply-empty",
+        events=[],
+    )
+
+    detail = store.get_session(session.id)
+    assert detail is not None
+    assert [record.type for record in records] == ["final", "turn_state"]
+    assert records[0].payload == {
+        "text": "本轮处理已结束，但未能生成可安全展示的回复。请重试。",
+        "message_id": detail.turns[0].final_message_id,
+        "reply_id": "reply-empty",
+    }
+    assert detail.turns[0].status == "failed"
+    assert detail.messages[-1].content == records[0].payload["text"]
+
+
+def test_empty_summary_resets_existing_stream_before_safe_failure_final(tmp_path: Path):
+    store = WebSessionStore(tmp_path / "sessions.sqlite")
+    session = store.create_session(title="unsafe reply")
+    submission = store.begin_user_turn(session.id, "请处理")
+    turn_id = submission.turn.id
+    store.save_agentscope_session_mapping(
+        session.id,
+        agent_id="main-router-agent",
+        agentscope_session_id="as-router",
+        active_turn_id=turn_id,
+    )
+    store.register_pending_reply(
+        turn_id=turn_id,
+        agentscope_session_id="as-router",
+        agent_id="main-router-agent",
+        source="user",
+    )
+    store.append_projected_event_batch(
+        web_session_id=session.id,
+        agentscope_session_id="as-router",
+        entry_id="1-0",
+        raw_event_type="REPLY_START",
+        reply_id="reply-unsafe",
+        events=[],
+    )
+    store.append_projected_event_batch(
+        web_session_id=session.id,
+        agentscope_session_id="as-router",
+        entry_id="2-0",
+        raw_event_type="TEXT_BLOCK_DELTA",
+        reply_id="reply-unsafe",
+        events=[
+            {
+                "type": "answer_delta",
+                "source": "agentscope",
+                "run_id": "as-router",
+                "payload": {"delta": "临时安全前缀。", "reply_id": "reply-unsafe"},
+            }
+        ],
+    )
+
+    records = store.append_projected_event_batch(
+        web_session_id=session.id,
+        agentscope_session_id="as-router",
+        entry_id="3-0",
+        raw_event_type="REPLY_END",
+        reply_id="reply-unsafe",
+        events=[],
+    )
+
+    assert [record.type for record in records] == ["answer_reset", "final", "turn_state"]
+    assert records[-1].payload["status"] == "failed"
+
+
+def test_controller_complete_turn_uses_sanitized_text_and_message_identity(tmp_path: Path):
+    store = WebSessionStore(tmp_path / "sessions.sqlite")
+    session = store.create_session(title="controller final")
+    submission = store.begin_user_turn(session.id, "请处理")
+
+    records = store.complete_turn(
+        submission.turn.id,
+        "处理完成。\n- task_id: secret\n- 已生成结果。",
+    )
+
+    detail = store.get_session(session.id)
+    assert detail is not None
+    final = records[0]
+    assert final.type == "final"
+    assert final.payload == {
+        "text": "处理完成。\n- 已生成结果。",
+        "message_id": detail.turns[0].final_message_id,
+    }
+    assert detail.messages[-1].content == "处理完成。\n- 已生成结果。"
+
+
 def test_store_commits_projected_batch_final_and_cursor_atomically_and_idempotently(
     tmp_path: Path,
 ):

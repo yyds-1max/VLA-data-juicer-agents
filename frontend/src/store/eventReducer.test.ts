@@ -656,9 +656,147 @@ describe("eventReducer", () => {
       "第二轮完成",
     ]);
   });
+
+  it("preserves answer delta whitespace and groups strictly by reply id", () => {
+    const state = createEmptyRunState();
+    const metadata = { run_id: "session-run", turn_id: "turn-1" };
+
+    applyAgentEvent(state, event("answer_delta", "agentscope", { delta: "你好", reply_id: "reply-1" }, metadata));
+    applyAgentEvent(state, event("answer_delta", "agentscope", { delta: " ", reply_id: "reply-1" }, metadata));
+    applyAgentEvent(state, event("answer_delta", "agentscope", { delta: "world\n\n- item", reply_id: "reply-1" }, metadata));
+    applyAgentEvent(state, event("answer_delta", "agentscope", { delta: "第二轮", reply_id: "reply-2" }, metadata));
+
+    expect(state.timeline.filter((item) => item.kind === "assistant")).toMatchObject([
+      { text: "你好 world\n\n- item", replyId: "reply-1", turnId: "turn-1" },
+      { text: "第二轮", replyId: "reply-2", turnId: "turn-1" },
+    ]);
+
+    applyAgentEvent(
+      state,
+      event(
+        "final",
+        "agentscope",
+        { text: "第二轮完成", reply_id: "reply-2", message_id: "message-2" },
+        metadata,
+      ),
+    );
+    expect(state.timeline.filter((item) => item.kind === "assistant")[1]).toMatchObject({
+      text: "第二轮完成",
+      status: "final",
+      replyId: "reply-2",
+      finalMessageId: "message-2",
+    });
+  });
+
+  it("retracts an intermediate answer when the reply becomes progress", () => {
+    const state = createEmptyRunState();
+    const metadata = { run_id: "session-run", turn_id: "turn-1" };
+
+    applyAgentEvent(state, event("answer_delta", "agentscope", { delta: "临时回答", reply_id: "reply-1" }, metadata));
+    applyAgentEvent(state, event("answer_reset", "agentscope", { reply_id: "reply-1" }, metadata));
+    applyAgentEvent(state, event("progress_update", "agentscope", { text: "后台处理仍在继续。", reply_id: "reply-1" }, metadata));
+
+    expect(state.timeline.some((item) => item.kind === "assistant")).toBe(false);
+    expect(state.timeline.at(-1)).toMatchObject({
+      kind: "progress",
+      text: "后台处理仍在继续。",
+      replyId: "reply-1",
+    });
+  });
+
+  it("ignores a late delta after the same reply has reached final", () => {
+    const state = createEmptyRunState();
+    const metadata = { run_id: "router-session", turn_id: "turn-1" };
+
+    applyAgentEvent(
+      state,
+      event(
+        "final",
+        "agentscope",
+        { text: "权威最终回复", reply_id: "reply-1", message_id: "message-1" },
+        metadata,
+      ),
+    );
+    applyAgentEvent(
+      state,
+      event("answer_delta", "agentscope", { delta: "迟到的旧分片", reply_id: "reply-1" }, metadata),
+    );
+
+    expect(state.timeline.filter((item) => item.kind === "assistant")).toMatchObject([
+      {
+        text: "权威最终回复",
+        status: "final",
+        replyId: "reply-1",
+        finalMessageId: "message-1",
+      },
+    ]);
+  });
+
+  it("keeps identical reply ids isolated across AgentScope runs", () => {
+    const state = createEmptyRunState();
+    const router = { run_id: "router-session", turn_id: "turn-1" };
+    const navigation = { run_id: "navigation-session", turn_id: "turn-1" };
+
+    applyAgentEvent(
+      state,
+      event("answer_delta", "agentscope", { delta: "路由回复", reply_id: "reply-1" }, router),
+    );
+    applyAgentEvent(
+      state,
+      event("answer_delta", "agentscope", { delta: "导航回复", reply_id: "reply-1" }, navigation),
+    );
+    applyAgentEvent(
+      state,
+      event("answer_reset", "agentscope", { reply_id: "reply-1" }, router),
+    );
+
+    expect(state.timeline.filter((item) => item.kind === "assistant")).toMatchObject([
+      {
+        text: "导航回复",
+        runId: "navigation-session",
+        replyId: "reply-1",
+      },
+    ]);
+  });
 });
 
 describe("datapilotStore", () => {
+  it("stamps replacement progress after retracting a draft in the same reducer event", () => {
+    const store = createDataPilotStore();
+    store.getState().setActiveSession(session());
+    store.getState().applyEvent(
+      event(
+        "answer_delta",
+        "agentscope",
+        { delta: "临时回答", reply_id: "reply-1" },
+        {
+          run_id: "as-session",
+          turn_id: "turn-1",
+          timestamp: "2026-06-26T00:01:00.000Z",
+        },
+      ),
+    );
+    store.getState().applyEvent(
+      event(
+        "progress_update",
+        "agentscope",
+        { text: "后台处理仍在继续。", reply_id: "reply-1" },
+        {
+          run_id: "as-session",
+          turn_id: "turn-1",
+          timestamp: "2026-06-26T00:02:00.000Z",
+        },
+      ),
+    );
+
+    const progress = store.getState().run.timeline.find((item) => item.kind === "progress");
+    expect(progress).toMatchObject({
+      text: "后台处理仍在继续。",
+      createdAt: "2026-06-26T00:02:00.000Z",
+    });
+    expect(typeof progress?.sequence).toBe("number");
+  });
+
   it("applies a persisted recovery upgrade even when timeline identity is unchanged", () => {
     const store = createDataPilotStore();
     store.getState().setActiveSession(session());

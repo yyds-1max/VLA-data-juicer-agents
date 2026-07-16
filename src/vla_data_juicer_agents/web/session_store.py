@@ -7,6 +7,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from uuid import uuid4
 
+from vla_data_juicer_agents.adapters.agentscope.events import sanitize_public_reply
 from vla_data_juicer_agents.web.schemas import (
     ChatMessageRecord,
     MessageRole,
@@ -19,6 +20,9 @@ from vla_data_juicer_agents.web.schemas import (
 
 def _now() -> str:
     return datetime.now(UTC).isoformat(timespec="milliseconds")
+
+
+_SAFE_PUBLIC_REPLY_FAILURE = "本轮处理已结束，但未能生成可安全展示的回复。请重试。"
 
 
 @dataclass(frozen=True)
@@ -881,10 +885,24 @@ class WebSessionStore:
                 if duplicate_origin is not None:
                     continue
                 payload = event.get("payload")
-                safe_payload = payload if isinstance(payload, dict) else {}
+                safe_payload = dict(payload) if isinstance(payload, dict) else {}
                 event_type = str(event.get("type", ""))
+                event_reply_id = _optional_text(safe_payload.get("reply_id")) or reply_id
+                if event_type in {"answer_delta", "answer_reset"} and event_reply_id:
+                    safe_payload["reply_id"] = event_reply_id
+                if event_type == "answer_delta":
+                    raw_delta = safe_payload.get("delta")
+                    if not isinstance(raw_delta, str) or not raw_delta:
+                        continue
+                    if raw_delta.strip():
+                        safe_delta = sanitize_public_reply(raw_delta)
+                        if not safe_delta:
+                            continue
+                        leading = raw_delta[: len(raw_delta) - len(raw_delta.lstrip())]
+                        trailing = raw_delta[len(raw_delta.rstrip()) :]
+                        safe_payload["delta"] = f"{leading}{safe_delta}{trailing}"
                 if turn_id is not None and event_type in {"reply_summary", "final"}:
-                    reply_summary = _optional_text(safe_payload.get("text"))
+                    reply_summary = sanitize_public_reply(safe_payload.get("text")) or None
                     continue
                 if self._duplicate_terminal_tool_event(
                     connection,
@@ -903,7 +921,7 @@ class WebSessionStore:
                 if duplicate is not None:
                     continue
 
-                public_event = dict(event)
+                public_event = {**event, "payload": safe_payload}
                 public_event["turn_id"] = turn_id
                 record = self._insert_timeline_event(
                     connection,
@@ -1058,11 +1076,62 @@ class WebSessionStore:
                 ).fetchone()
                 waiting = turn_status_row is not None and turn_status_row["status"] == "waiting"
                 summary_origin = f"agentscope:{agentscope_session_id}:{entry_id}:summary"
+                streamed_reply = (
+                    connection.execute(
+                        """
+                        SELECT 1 FROM timeline_events
+                        WHERE session_id = ? AND turn_id = ? AND type = 'answer_delta'
+                          AND json_extract(payload_json, '$.reply_id') = ?
+                        LIMIT 1
+                        """,
+                        (web_session_id, turn_id, reply_id),
+                    ).fetchone()
+                    if reply_id
+                    else None
+                )
+                safe_reply_failed = not reply_summary and blockers == 0 and not waiting
+                if safe_reply_failed:
+                    reply_summary = _SAFE_PUBLIC_REPLY_FAILURE
+                    if reply_id is not None:
+                        connection.execute(
+                            """
+                            UPDATE agentscope_turn_replies
+                            SET summary_text = ?, updated_at = ?
+                            WHERE turn_id = ? AND agentscope_session_id = ? AND reply_id = ?
+                            """,
+                            (
+                                reply_summary,
+                                timestamp,
+                                turn_id,
+                                agentscope_session_id,
+                                reply_id,
+                            ),
+                        )
                 if reply_summary and connection.execute(
                     "SELECT 1 FROM timeline_events WHERE origin_key = ?",
                     (summary_origin,),
                 ).fetchone() is None:
                     if blockers > 0 or waiting:
+                        if streamed_reply is not None:
+                            reset_origin = (
+                                f"agentscope:{agentscope_session_id}:{entry_id}:answer-reset"
+                            )
+                            inserted.append(
+                                self._insert_timeline_event(
+                                    connection,
+                                    session_id=web_session_id,
+                                    turn_id=turn_id,
+                                    event={
+                                        "type": "answer_reset",
+                                        "source": "agentscope",
+                                        "run_id": agentscope_session_id,
+                                        "timestamp": timestamp,
+                                        "payload": {"reply_id": reply_id},
+                                    },
+                                    created_at=timestamp,
+                                    origin_key=reset_origin,
+                                )
+                            )
                         inserted.append(
                             self._insert_timeline_event(
                                 connection,
@@ -1073,13 +1142,37 @@ class WebSessionStore:
                                     "source": "agentscope",
                                     "run_id": agentscope_session_id,
                                     "timestamp": timestamp,
-                                    "payload": {"text": reply_summary},
+                                    "payload": {
+                                        "text": reply_summary,
+                                        **({"reply_id": reply_id} if reply_id else {}),
+                                    },
                                 },
                                 created_at=timestamp,
                                 origin_key=summary_origin,
                             )
                         )
                     else:
+                        terminal_status = "failed" if safe_reply_failed else "completed"
+                        if streamed_reply is not None and safe_reply_failed:
+                            reset_origin = (
+                                f"agentscope:{agentscope_session_id}:{entry_id}:answer-reset"
+                            )
+                            inserted.append(
+                                self._insert_timeline_event(
+                                    connection,
+                                    session_id=web_session_id,
+                                    turn_id=turn_id,
+                                    event={
+                                        "type": "answer_reset",
+                                        "source": "agentscope",
+                                        "run_id": agentscope_session_id,
+                                        "timestamp": timestamp,
+                                        "payload": {"reply_id": reply_id},
+                                    },
+                                    created_at=timestamp,
+                                    origin_key=reset_origin,
+                                )
+                            )
                         final_message_id = f"message_{uuid4().hex}"
                         connection.execute(
                             """
@@ -1105,7 +1198,11 @@ class WebSessionStore:
                                     "source": "agentscope",
                                     "run_id": agentscope_session_id,
                                     "timestamp": timestamp,
-                                    "payload": {"text": reply_summary},
+                                    "payload": {
+                                        "text": reply_summary,
+                                        "message_id": final_message_id,
+                                        **({"reply_id": reply_id} if reply_id else {}),
+                                    },
                                 },
                                 created_at=timestamp,
                                 origin_key=summary_origin,
@@ -1114,10 +1211,10 @@ class WebSessionStore:
                         connection.execute(
                             """
                             UPDATE web_turns
-                            SET status = 'completed', finished_at = ?, final_message_id = ?
+                            SET status = ?, finished_at = ?, final_message_id = ?
                             WHERE id = ?
                             """,
-                            (timestamp, final_message_id, turn_id),
+                            (terminal_status, timestamp, final_message_id, turn_id),
                         )
                         connection.execute(
                             "UPDATE agentscope_sessions SET active_turn_id = NULL WHERE active_turn_id = ?",
@@ -1134,12 +1231,15 @@ class WebSessionStore:
                                     "run_id": agentscope_session_id,
                                     "timestamp": timestamp,
                                     "payload": {
-                                        "status": "completed",
+                                        "status": terminal_status,
                                         "finished_at": timestamp,
                                     },
                                 },
                                 created_at=timestamp,
-                                origin_key=f"agentscope:{agentscope_session_id}:{entry_id}:completed",
+                                origin_key=(
+                                    f"agentscope:{agentscope_session_id}:{entry_id}:"
+                                    f"{terminal_status}"
+                                ),
                             )
                         )
 
@@ -1801,6 +1901,10 @@ class WebSessionStore:
 
     def complete_turn(self, turn_id: str, text: str) -> list[TimelineEventRecord]:
         timestamp = _now()
+        safe_text = sanitize_public_reply(text)
+        terminal_status = "completed" if safe_text else "failed"
+        if not safe_text:
+            safe_text = _SAFE_PUBLIC_REPLY_FAILURE
         with self._connect() as connection:
             connection.execute("BEGIN IMMEDIATE")
             turn = connection.execute(
@@ -1817,7 +1921,7 @@ class WebSessionStore:
                 INSERT INTO messages (id, session_id, turn_id, role, content, created_at)
                 VALUES (?, ?, ?, 'assistant', ?, ?)
                 """,
-                (message_id, turn["web_session_id"], turn_id, text, timestamp),
+                (message_id, turn["web_session_id"], turn_id, safe_text, timestamp),
             )
             final = self._insert_timeline_event(
                 connection,
@@ -1826,7 +1930,7 @@ class WebSessionStore:
                 event={
                     "type": "final",
                     "timestamp": timestamp,
-                    "payload": {"text": text},
+                    "payload": {"text": safe_text, "message_id": message_id},
                 },
                 created_at=timestamp,
                 origin_key=f"controller:{turn_id}:final",
@@ -1834,10 +1938,10 @@ class WebSessionStore:
             connection.execute(
                 """
                 UPDATE web_turns
-                SET status = 'completed', finished_at = ?, final_message_id = ?
+                SET status = ?, finished_at = ?, final_message_id = ?
                 WHERE id = ?
                 """,
-                (timestamp, message_id, turn_id),
+                (terminal_status, timestamp, message_id, turn_id),
             )
             connection.execute(
                 "UPDATE agentscope_sessions SET active_turn_id = NULL WHERE active_turn_id = ?",
@@ -1854,10 +1958,10 @@ class WebSessionStore:
                 event={
                     "type": "turn_state",
                     "timestamp": timestamp,
-                    "payload": {"status": "completed", "finished_at": timestamp},
+                    "payload": {"status": terminal_status, "finished_at": timestamp},
                 },
                 created_at=timestamp,
-                origin_key=f"controller:{turn_id}:completed",
+                origin_key=f"controller:{turn_id}:{terminal_status}",
             )
         return [final, state]
 
