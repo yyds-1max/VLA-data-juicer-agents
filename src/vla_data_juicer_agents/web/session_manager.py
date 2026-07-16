@@ -4,7 +4,6 @@ import threading
 from collections.abc import Callable
 from pathlib import Path
 from typing import Any
-from uuid import uuid4
 
 from vla_data_juicer_agents.tui.controller import SessionController
 from vla_data_juicer_agents.web.schemas import SessionRecord, generate_session_title
@@ -52,13 +51,20 @@ class WebSessionManager:
     def submit_turn(self, session_id: str, message: str) -> str:
         with self._lock:
             controller = self.get_controller(session_id)
-            controller.submit_turn(message)
-            self._store.append_message(session_id, role="user", content=message)
-            return f"turn_{uuid4().hex}"
+            submission = self._store.begin_user_turn(session_id, message)
+            try:
+                controller.submit_turn(message)
+            except Exception:
+                self._store.abort_initial_turn(submission.turn.id)
+                raise
+            return submission.turn.id
 
     def interrupt(self, session_id: str) -> bool:
         with self._lock:
-            return self.get_controller(session_id).request_interrupt()
+            interrupted = self.get_controller(session_id).request_interrupt()
+            if interrupted:
+                self._store.interrupt_active_turn(session_id)
+            return interrupted
 
     def mark_historical(self, session_id: str) -> None:
         with self._lock:

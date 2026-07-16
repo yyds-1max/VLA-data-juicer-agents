@@ -26,7 +26,7 @@ _PRIVATE_TRACE_MARKER_RE = re.compile(
     r"内部思考|原始观察|动作参数|工具参数)\s*[:：]",
     flags=re.IGNORECASE,
 )
-_PUBLIC_ACTIVITY_FIELDS = ("observation", "analysis", "action")
+_PUBLIC_ACTIVITY_FIELDS = ("summary", "observation", "analysis", "action")
 _PUBLIC_TEXT_LIMIT = 240
 _UNSAFE_PUBLIC_TEXT_RE = re.compile(
     r"(?:"
@@ -197,6 +197,8 @@ class PublicActivityProjector:
         self._tool_steps: dict[str, dict[str, Any]] = {}
 
     def record_public_update(self, payload: dict[str, str]) -> None:
+        if payload.get("summary") and not payload.get("analysis"):
+            payload = {**payload, "analysis": payload["summary"]}
         fields = {field: _public_text(payload.get(field, "")) for field in _PUBLIC_ACTIVITY_FIELDS}
         if not any(fields.values()):
             return
@@ -305,6 +307,49 @@ class PublicActivityProjector:
         self._scope.emit(event_type, **payload)
 
 
+class PublicProgressProjector:
+    """Emit compact user-facing progress paragraphs without ReAct labels."""
+
+    def __init__(self, scope: EventScope) -> None:
+        self._scope = scope
+        self._last_text = ""
+
+    def record_public_update(self, payload: dict[str, str]) -> None:
+        summary = _public_text(payload.get("summary", ""))
+        if not summary:
+            summary = " ".join(
+                value
+                for value in (
+                    _public_text(payload.get("observation", "")),
+                    _public_text(payload.get("analysis", "")),
+                    _public_text(payload.get("action", "")),
+                )
+                if value
+            )
+        if not summary or summary == self._last_text:
+            return
+        self._last_text = summary
+        self._scope.emit("progress_update", text=summary)
+
+    def record_legacy_progress(self, summary: str) -> None:
+        self.record_public_update({"summary": summary})
+
+    def tool_started(self, _call_id: str, _tool_name: str) -> None:
+        return
+
+    def tool_finished(self, _call_id: str, _tool_name: str, _status: str) -> None:
+        return
+
+    def tool_background(self, _call_id: str, _tool_name: str) -> None:
+        return
+
+    def waiting_for_user(self) -> None:
+        return
+
+    def finish(self, _status: str = "completed") -> None:
+        return
+
+
 def _tool_presentation(tool_name: str) -> _ToolPresentation:
     for pattern, presentation in _TOOL_PRESENTATIONS:
         if pattern.search(tool_name):
@@ -328,6 +373,7 @@ def _activity_payload(text: str) -> dict[str, str]:
         return {}
     analysis = payload.get("analysis", payload.get("reasoning", ""))
     values = {
+        "summary": payload.get("summary", ""),
         "observation": payload.get("observation", ""),
         "analysis": analysis,
         "action": payload.get("action", payload.get("next_action", "")),
@@ -350,22 +396,27 @@ class AgentScopeEventAdapter:
         emit_final_events: bool = False,
         emit_reasoning_events: bool = True,
         emit_activity_events: bool = False,
+        emit_progress_events: bool = False,
         public_tool_events: bool = False,
         suppress_pre_tool_text: bool = False,
         activity_title: str = "正在分析并处理请求",
         background_status_resolver: Callable[[str, str], str] | None = None,
+        emit_reply_summary_events: bool = False,
     ) -> None:
         self._scope = scope
         self._emit_tool_events = emit_tool_events
         self._emit_text_events = emit_text_events
         self._emit_final_events = emit_final_events
         self._emit_reasoning_events = emit_reasoning_events
+        self._emit_reply_summary_events = emit_reply_summary_events
         self._public_tool_events = public_tool_events
         self._suppress_pre_tool_text = suppress_pre_tool_text
         self._thinking: dict[str, list[str]] = {}
         self._tools: dict[str, _ToolState] = {}
         self._activity_projector = (
-            PublicActivityProjector(scope, title=activity_title)
+            PublicProgressProjector(scope)
+            if emit_progress_events
+            else PublicActivityProjector(scope, title=activity_title)
             if emit_activity_events
             else None
         )
@@ -391,7 +442,7 @@ class AgentScopeEventAdapter:
         elif event_type == "TEXT_BLOCK_DELTA":
             self._handle_text_delta(getattr(event, "delta", ""))
         elif event_type == "REPLY_END":
-            self._handle_reply_end()
+            self._handle_reply_end(_text(getattr(event, "reply_id", "")))
         elif event_type == "TOOL_CALL_START":
             state = self._tools.setdefault(call_id, _ToolState())
             state.name = _text(getattr(event, "tool_call_name", "")) or state.name
@@ -485,12 +536,12 @@ class AgentScopeEventAdapter:
             self._scope.emit("assistant_delta", delta=rendered)
         self._reply_text.append(rendered)
 
-    def _handle_reply_end(self) -> None:
+    def _handle_reply_end(self, reply_id: str = "") -> None:
         if not self._emit_text_events and not self._emit_final_events and self._activity_projector is None:
             return
-        self._flush_reply_segment()
+        self._flush_reply_segment(reply_id=reply_id)
 
-    def _flush_reply_segment(self) -> None:
+    def _flush_reply_segment(self, *, reply_id: str = "") -> None:
         if not self._emit_text_events and not self._emit_final_events and self._activity_projector is None:
             return
         rendered = self._progress_filter.flush()
@@ -498,12 +549,16 @@ class AgentScopeEventAdapter:
             if self._emit_text_events:
                 self._scope.emit("assistant_delta", delta=rendered)
             self._reply_text.append(rendered)
-        if self._emit_final_events and self._reply_text:
+        if (self._emit_final_events or self._emit_reply_summary_events) and self._reply_text:
             if self._activity_projector is not None:
                 self._activity_projector.finish(
                     "background" if self._background_tools else "completed"
                 )
-            self._scope.emit("final", text="".join(self._reply_text))
+            event_type = "reply_summary" if self._emit_reply_summary_events else "final"
+            payload = {"text": "".join(self._reply_text)}
+            if reply_id:
+                payload["reply_id"] = reply_id
+            self._scope.emit(event_type, **payload)
         self._reply_text.clear()
 
     def _discard_reply_segment(self) -> None:

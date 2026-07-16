@@ -1,52 +1,38 @@
 import { useCallback, useEffect, useLayoutEffect, useRef, useState } from "react";
 
-import type { ChatMessageRecord } from "../../api/types";
-import type { ActiveAgent, ActiveTool, RunState, TimelineItem } from "../../store/eventReducer";
+import type { ChatMessageRecord, TurnRecord } from "../../api/types";
+import type { RunState, TimelineItem } from "../../store/eventReducer";
 import { cn } from "../../lib/utils";
-import { AgentRunSummary, ToolStatusDot, type AgentRunTimelineItem } from "./AgentRunSummary";
-import { ReActActivityCard } from "./ReActActivityCard";
+import { ProcessingDisclosure } from "./ProcessingDisclosure";
 
 type MessageListProps = {
   messages: ChatMessageRecord[];
+  turns?: TurnRecord[];
   run: RunState;
 };
 
 const STICKY_BOTTOM_THRESHOLD = 24;
 
-type OrderedTimelineItem = AgentRunTimelineItem;
-
-type MessageEntry = {
-  type: "message";
-  key: string;
-  timestamp: number;
-  sequence: number;
-  message: ChatMessageRecord;
-};
-
-type TimelineEntry = {
-  type: "timeline";
-  key: string;
-  timestamp: number;
-  sequence: number;
-  item: OrderedTimelineItem;
-};
-
-type AgentRunSummaryEntry = {
-  type: "agent-run-summary";
-  key: string;
-  timestamp: number;
-  sequence: number;
-  source: string;
-  items: OrderedTimelineItem[];
-};
-
-type ChronologicalEntry = MessageEntry | TimelineEntry;
-type RenderEntry = ChronologicalEntry | AgentRunSummaryEntry;
-
-export function MessageList({ messages, run }: MessageListProps) {
-  const visibleMessages = filterMessagesCoveredByTimeline(messages, run);
-  const hasContent = visibleMessages.length > 0 || run.timeline.length > 0 || Boolean(run.activeText);
-  const entries = renderEntries(visibleMessages, run);
+export function MessageList({ messages, turns = [], run }: MessageListProps) {
+  const durableTurnIds = new Set(turns.map((turn) => turn.id));
+  const legacy = synthesizeLegacyTurns(
+    messages.filter((message) => !message.turn_id || !durableTurnIds.has(message.turn_id)),
+    {
+      ...run,
+      timeline: run.timeline.filter((item) => !item.turnId || !durableTurnIds.has(item.turnId)),
+    },
+  );
+  const durableTimeline = run.timeline.filter(
+    (item) => item.turnId && durableTurnIds.has(item.turnId),
+  );
+  const displayTurns = mergeDisplayTurns(turns, legacy.turns);
+  const remappedLegacyMessages = new Map(legacy.messages.map((message) => [message.id, message]));
+  const displayMessages = messages.map((message) => remappedLegacyMessages.get(message.id) ?? message);
+  const displayRun = {
+    ...run,
+    timeline: [...durableTimeline, ...legacy.run.timeline].sort(compareTimelineItems),
+  };
+  const hasContent = displayMessages.length > 0 || displayRun.timeline.length > 0 || displayTurns.length > 0 || Boolean(run.activeText);
   const now = useActiveNow(run.activeText ? run.activeStartedAt : null);
   const activeText = formatActiveText(run.activeText, run.activeStartedAt, now);
   const scrollAreaRef = useRef<HTMLDivElement | null>(null);
@@ -76,20 +62,18 @@ export function MessageList({ messages, run }: MessageListProps) {
       onScroll={handleScroll}
     >
       {hasContent ? (
-        <>
-          {entries.map((entry) =>
-            entry.type === "message" ? (
-              <MessageBubble key={entry.key} message={entry.message} />
-            ) : entry.type === "agent-run-summary" ? (
-              <AgentRunSummary key={entry.key} source={entry.source} items={entry.items} />
-            ) : entry.item.kind === "activity" ? (
-              <ReActActivityCard key={entry.key} item={entry.item} />
-            ) : entry.item.kind === "tool" ? (
-              <ToolLine key={entry.key} item={entry.item} />
-            ) : (
-              <TimelineBubble key={entry.key} item={entry.item} />
-            ),
-          )}
+        displayTurns.length > 0 ? (
+          <>
+            {displayTurns.map((turn) => (
+              <TurnConversation
+                key={turn.id}
+                turn={turn}
+                messages={displayMessages}
+                run={displayRun}
+              />
+            ))}
+          </>
+        ) : <>
           {activeText ? (
             <div className="mr-auto flex max-w-[92%] items-center gap-2 px-2 py-1 text-xs text-console-muted">
               {activeText}
@@ -105,29 +89,219 @@ export function MessageList({ messages, run }: MessageListProps) {
   );
 }
 
-function filterMessagesCoveredByTimeline(messages: ChatMessageRecord[], run: RunState): ChatMessageRecord[] {
-  const assistantTextCounts = new Map<string, number>();
-  for (const item of run.timeline) {
-    if (item.kind !== "assistant") {
+function synthesizeLegacyTurns(
+  messages: ChatMessageRecord[],
+  run: RunState,
+): { turns: TurnRecord[]; messages: ChatMessageRecord[]; run: RunState } {
+  const turns: TurnRecord[] = [];
+  const mappedMessages: ChatMessageRecord[] = [];
+  const mappedTimeline: TimelineItem[] = [];
+  let currentTurnId = "";
+
+  const createTurn = (origin: TurnRecord["origin"], startedAt: string, id?: string) => {
+    currentTurnId = id ?? `legacy:system:${turns.length + 1}`;
+    turns.push({
+      id: currentTurnId,
+      web_session_id: messages[0]?.session_id ?? "legacy",
+      origin,
+      status: "running",
+      started_at: startedAt,
+      finished_at: null,
+      final_message_id: null,
+    });
+    return currentTurnId;
+  };
+
+  const ensureOpenTurn = (startedAt: string) => {
+    const current = turns.find((turn) => turn.id === currentTurnId);
+    if (current && (current.status === "running" || current.status === "waiting")) return currentTurnId;
+    currentTurnId = `legacy:system:${turns.length + 1}`;
+    return createTurn("system", startedAt, currentTurnId);
+  };
+
+  const entries = [
+    ...messages.map((message, index) => ({
+      type: "message" as const,
+      timestamp: timestampMs(message.created_at),
+      sequence: index,
+      message,
+    })),
+    ...run.timeline.map((item, index) => ({
+      type: "timeline" as const,
+      timestamp: timestampMs(item.createdAt),
+      sequence: messages.length + index,
+      item,
+    })),
+  ].sort((left, right) => left.timestamp - right.timestamp || left.sequence - right.sequence);
+
+  for (const entry of entries) {
+    const createdAt = entry.type === "message"
+      ? entry.message.created_at
+      : entry.item.createdAt ?? new Date(entry.timestamp).toISOString();
+    if (entry.type === "message") {
+      const message = entry.message;
+      if (message.turn_id) {
+        currentTurnId = message.turn_id;
+        if (!turns.some((turn) => turn.id === currentTurnId)) {
+          createTurn(message.role === "user" ? "user" : "system", createdAt, currentTurnId);
+        }
+        mappedMessages.push(message);
+        if (message.role === "assistant") {
+          finishLegacyTurn(turns, currentTurnId, "completed", createdAt, message.id);
+        }
+        continue;
+      }
+      if (message.role === "user") {
+        createTurn("user", createdAt, `legacy:${message.id}`);
+      } else {
+        ensureOpenTurn(createdAt);
+      }
+      mappedMessages.push({ ...message, turn_id: currentTurnId });
+      if (message.role === "assistant") {
+        finishLegacyTurn(turns, currentTurnId, "completed", createdAt, message.id);
+      }
       continue;
     }
-    assistantTextCounts.set(item.text, (assistantTextCounts.get(item.text) ?? 0) + 1);
-  }
-  if (assistantTextCounts.size === 0) {
-    return messages;
+
+    const original = entry.item;
+    if (original.turnId) {
+      currentTurnId = original.turnId;
+      if (!turns.some((turn) => turn.id === currentTurnId)) {
+        createTurn("system", createdAt, currentTurnId);
+      }
+      const item = normalizeLegacyTimelineItem(original, currentTurnId, entry.timestamp);
+      mappedTimeline.push(item);
+      if (item.kind === "assistant") {
+        finishLegacyTurn(turns, currentTurnId, "completed", createdAt);
+      }
+      continue;
+    }
+    ensureOpenTurn(createdAt);
+    const item = normalizeLegacyTimelineItem(original, currentTurnId, entry.timestamp);
+    mappedTimeline.push(item);
+    if (item.kind === "assistant") {
+      finishLegacyTurn(turns, currentTurnId, "completed", createdAt);
+    } else if (item.kind === "activity" && item.activityStatus && item.activityStatus !== "running") {
+      const status = item.activityStatus === "failed"
+        ? "failed"
+        : item.activityStatus === "interrupted"
+        ? "interrupted"
+        : "completed";
+      finishLegacyTurn(turns, currentTurnId, status, createdAt);
+    }
   }
 
-  return messages.filter((message) => {
-    if (message.role !== "assistant") {
-      return true;
+  const hasActiveLegacyWork = run.running || Object.keys(run.activeAgents).length > 0 || Object.keys(run.activeTools).length > 0;
+  for (const turn of turns) {
+    if (turn.status !== "running") continue;
+    const isLast = turn.id === turns.at(-1)?.id;
+    if (!isLast || !hasActiveLegacyWork) {
+      const lastItem = [...mappedTimeline].reverse().find((item) => item.turnId === turn.id);
+      const lastMessage = [...mappedMessages].reverse().find((message) => message.turn_id === turn.id);
+      finishLegacyTurn(
+        turns,
+        turn.id,
+        "completed",
+        lastItem?.createdAt ?? lastMessage?.created_at ?? turn.started_at,
+      );
     }
-    const count = assistantTextCounts.get(message.content) ?? 0;
-    if (count <= 0) {
-      return true;
-    }
-    assistantTextCounts.set(message.content, count - 1);
-    return false;
-  });
+  }
+  return { turns, messages: mappedMessages, run: { ...run, timeline: mappedTimeline } };
+}
+
+function normalizeLegacyTimelineItem(item: TimelineItem, turnId: string, timestamp: number): TimelineItem {
+  if (item.kind === "reasoning") {
+    return { ...item, kind: "progress", turnId };
+  }
+  if (item.kind !== "tool") {
+    return { ...item, turnId };
+  }
+  const tool = item.tool ?? legacyToolName(item.text);
+  const phase = item.toolPhase ?? legacyToolPhase(item.status, item.text);
+  const durationMs = legacyToolDurationMs(item.text);
+  const finishedAt = item.finishedAt ?? timestamp;
+  return {
+    ...item,
+    turnId,
+    tool,
+    toolPhase: phase,
+    callId: item.callId ?? `legacy:${item.runId ?? item.source}:${timestamp}`,
+    startedAt: item.startedAt ?? Math.max(finishedAt - durationMs, 0),
+    finishedAt: phase === "running" || phase === "background" ? undefined : finishedAt,
+  };
+}
+
+function finishLegacyTurn(
+  turns: TurnRecord[],
+  turnId: string,
+  status: TurnRecord["status"],
+  finishedAt: string,
+  finalMessageId?: string,
+) {
+  const turn = turns.find((candidate) => candidate.id === turnId);
+  if (!turn) return;
+  turn.status = status;
+  turn.finished_at = finishedAt;
+  if (finalMessageId) turn.final_message_id = finalMessageId;
+}
+
+function mergeDisplayTurns(durable: TurnRecord[], legacy: TurnRecord[]): TurnRecord[] {
+  const byId = new Map<string, TurnRecord>();
+  for (const turn of legacy) byId.set(turn.id, turn);
+  for (const turn of durable) byId.set(turn.id, turn);
+  return [...byId.values()].sort((left, right) => left.started_at.localeCompare(right.started_at));
+}
+
+function compareTimelineItems(left: TimelineItem, right: TimelineItem): number {
+  const time = timestampMs(left.createdAt) - timestampMs(right.createdAt);
+  if (time !== 0) return time;
+  return (left.sequence ?? 0) - (right.sequence ?? 0);
+}
+
+function TurnConversation({
+  turn,
+  messages,
+  run,
+}: {
+  turn: TurnRecord;
+  messages: ChatMessageRecord[];
+  run: RunState;
+}) {
+  const userMessages = messages.filter(
+    (message) => message.role === "user" && message.turn_id === turn.id,
+  );
+  const assistantMessages = messages.filter(
+    (message) => message.turn_id === turn.id && message.role === "assistant",
+  );
+  const items = run.timeline.filter(
+    (item) => item.turnId === turn.id && ["progress", "tool", "activity"].includes(item.kind),
+  );
+  const liveFinal = [...run.timeline]
+    .reverse()
+    .find((item) => item.turnId === turn.id && item.kind === "assistant");
+
+  const liveFinalIsPersisted = assistantMessages.some((message) => message.content === liveFinal?.text);
+  const showDisclosure = items.length > 0 || turn.origin === "user" || turn.status === "running" || turn.status === "waiting";
+
+  return (
+    <div className="contents">
+      {userMessages.map((message) => <MessageBubble key={message.id} message={message} />)}
+      {showDisclosure ? <ProcessingDisclosure turn={turn} items={items} /> : null}
+      {assistantMessages.map((message) => <MessageBubble key={message.id} message={message} />)}
+      {liveFinal && !liveFinalIsPersisted ? (
+        <AssistantBubble text={liveFinal.text} />
+      ) : null}
+    </div>
+  );
+}
+
+function AssistantBubble({ text }: { text: string }) {
+  return (
+    <article className="mr-auto max-w-[88%] rounded-lg border border-console-line bg-console-panel px-3 py-2 text-sm leading-6 text-console-text shadow-sm">
+      <div className="mb-1 text-[11px] font-medium text-console-muted">DataPilot</div>
+      <p className="whitespace-pre-wrap break-words">{text}</p>
+    </article>
+  );
 }
 
 function isScrolledNearBottom(element: HTMLElement) {
@@ -161,111 +335,6 @@ function useActiveNow(startedAt: number | null): number {
   return now;
 }
 
-function renderEntries(messages: ChatMessageRecord[], run: RunState): RenderEntry[] {
-  const entries = chronologicalEntries(messages, run.timeline);
-  const childGroups = completedChildGroups(entries, run);
-  const emittedGroups = new Set<string>();
-
-  return entries.flatMap((entry): RenderEntry[] => {
-    if (entry.type !== "timeline" || !isChildTimelineItem(entry.item)) {
-      return [entry];
-    }
-    if (entry.item.kind === "tool") {
-      return [entry];
-    }
-
-    const groupKey = childRunKey(entry.item);
-    const group = childGroups.get(groupKey);
-    if (!group) {
-      return [entry];
-    }
-    if (emittedGroups.has(groupKey)) {
-      return [];
-    }
-
-    emittedGroups.add(groupKey);
-    return [
-      {
-        type: "agent-run-summary",
-        key: `agent-run-summary-${groupKey}`,
-        timestamp: entry.timestamp,
-        sequence: entry.sequence,
-        source: group[0]?.item.source ?? entry.item.source,
-        items: group.map((item) => item.item),
-      },
-    ];
-  });
-}
-
-function completedChildGroups(entries: ChronologicalEntry[], run: RunState): Map<string, TimelineEntry[]> {
-  const groups = new Map<string, TimelineEntry[]>();
-
-  for (const entry of entries) {
-    if (
-      entry.type !== "timeline" ||
-      !isChildTimelineItem(entry.item) ||
-      entry.item.kind === "tool" ||
-      isChildRunActive(entry.item, run)
-    ) {
-      continue;
-    }
-
-    const groupKey = childRunKey(entry.item);
-    const group = groups.get(groupKey) ?? [];
-    group.push(entry);
-    groups.set(groupKey, group);
-  }
-
-  return groups;
-}
-
-function chronologicalEntries(messages: ChatMessageRecord[], timeline: TimelineItem[]): ChronologicalEntry[] {
-  return [
-    ...messages.map((message, index) => ({
-      type: "message" as const,
-      key: message.id,
-      timestamp: timestampMs(message.created_at),
-      sequence: index,
-      message,
-    })),
-    ...timeline.map((item, index) => {
-      const orderedItem = item as OrderedTimelineItem;
-      return {
-        type: "timeline" as const,
-        key: `${orderedItem.kind}-${orderedItem.runId ?? "run"}-${orderedItem.sequence ?? index}`,
-        timestamp: timestampMs(orderedItem.createdAt),
-        sequence: messages.length + (orderedItem.sequence ?? index),
-        item: orderedItem,
-      };
-    }),
-  ].sort((left, right) => left.timestamp - right.timestamp || left.sequence - right.sequence);
-}
-
-function isChildTimelineItem(item: TimelineItem): boolean {
-  if (item.kind === "activity") {
-    return false;
-  }
-  return !isPrimaryConversationSource(item.source);
-}
-
-function isChildRunActive(item: TimelineItem, run: RunState): boolean {
-  return (
-    Object.values(run.activeAgents).some((agent) => activeMatchesItem(agent, item)) ||
-    Object.values(run.activeTools).some((tool) => activeMatchesItem(tool, item))
-  );
-}
-
-function activeMatchesItem(active: ActiveAgent | ActiveTool, item: TimelineItem): boolean {
-  if (item.runId && active.runId === item.runId) {
-    return true;
-  }
-  return active.source === item.source;
-}
-
-function childRunKey(item: TimelineItem): string {
-  return item.runId ? `run:${item.runId}` : `source:${item.source}`;
-}
-
 function timestampMs(value: string | undefined): number {
   if (!value) {
     return Date.now();
@@ -294,43 +363,22 @@ function MessageBubble({ message }: { message: ChatMessageRecord }) {
   );
 }
 
-function TimelineBubble({ item }: { item: TimelineItem }) {
-  const showSource = !isPrimaryConversationSource(item.source);
-
-  return (
-    <article className="mr-auto max-w-[92%] rounded-lg border border-console-line bg-console-panel px-3 py-2 text-sm leading-6 text-console-text shadow-sm">
-      <div className="mb-1 flex items-center gap-2 text-[11px] font-medium text-console-muted">
-        <span>{item.kind === "assistant" ? "DataPilot" : item.kind}</span>
-        {showSource ? <span className="truncate font-normal">{item.source}</span> : null}
-      </div>
-      {item.kind === "tool" ? (
-        <div className="flex min-w-0 items-center gap-2 whitespace-pre-wrap break-words">
-          <ToolStatusDot status={item.status} />
-          <span className="min-w-0 break-words">{item.text}</span>
-        </div>
-      ) : (
-        <p className="whitespace-pre-wrap break-words">{item.text}</p>
-      )}
-    </article>
-  );
+function legacyToolName(text: string): string {
+  const match = text.match(/(?:正在调用工具|正在调用|已调用工具|已调用|工具)\s+([^\s+]+)/);
+  return match?.[1] ?? text;
 }
 
-function ToolLine({ item }: { item: TimelineItem }) {
-  return (
-    <div className="mr-auto flex max-w-[92%] items-center gap-2 px-2 py-1 text-xs text-console-muted">
-      <ToolStatusDot status={item.status} />
-      <span className="min-w-0 break-words">{item.text}</span>
-    </div>
-  );
+function legacyToolPhase(status: string | undefined, text: string): NonNullable<TimelineItem["toolPhase"]> {
+  if (status === "running" || status === "background" || status === "completed" || status === "failed" || status === "interrupted") {
+    return status;
+  }
+  if (/失败/.test(text)) return "failed";
+  if (/停止|中断/.test(text)) return "interrupted";
+  if (/正在/.test(text)) return "running";
+  return "completed";
 }
 
-function isPrimaryConversationSource(source: string): boolean {
-  const normalized = source.trim().toLowerCase();
-  return (
-    normalized === "" ||
-    normalized === "main" ||
-    normalized === "agentscope" ||
-    normalized === "main-router-agent" ||
-    normalized === "mainrouteragent"
-  );
+function legacyToolDurationMs(text: string): number {
+  const match = text.match(/(\d+(?:\.\d+)?)s\s*$/);
+  return match ? Number.parseFloat(match[1]) * 1000 : 0;
 }

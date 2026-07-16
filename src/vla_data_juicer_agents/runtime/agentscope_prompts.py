@@ -12,12 +12,13 @@ NAVIGATION_AGENT_GUIDANCE_PATH = (
 
 PUBLIC_ACTIVITY_PROTOCOL = """
 User-facing activity protocol:
-- Before every tool call, emit exactly one single-line JSON activity update:
-  Activity: {"observation":"a concise established fact","analysis":"a brief user-facing rationale","action":"the next business action"}
-- Use the user's language for all three values while keeping the literal marker and JSON keys in English.
-- `observation` states only facts already learned from the environment. `analysis` explains why the next step is useful without exposing private chain-of-thought. `action` states what will happen next in business language.
+- When a user-visible fact, current judgment, or next business action materially changes, emit one single-line JSON activity update:
+  Activity: {"summary":"a concise user-facing statement of the current finding and what happens next"}
+- Use the user's language for `summary` while keeping the literal marker and JSON key in English.
+- Do not repeat an Activity line for mechanical checks that do not change what the user needs to know.
+- Explain only the useful conclusion and next action. Never expose private chain-of-thought.
 - Do not include agent names, tool or function names, tool arguments, identifiers, prompts, code symbols, paths, credentials, or raw tool results in an Activity line.
-- Activity lines are progress metadata, not part of the final answer. Do not output Thought, Observation, Analysis, Action, or similar free-form trace labels outside this schema.
+- Activity lines are progress metadata, not part of the final answer. Do not output Thought, Observation, Analysis, Action, or similar free-form trace labels.
 """.strip()
 
 

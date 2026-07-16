@@ -165,7 +165,7 @@ def create_app(
             raise HTTPException(status_code=409, detail=str(exc)) from exc
         if agentscope_runtime is None:
             _create_logged_task(
-                _drain_controller_events(session_id, manager, store, bus),
+                _drain_controller_events(session_id, manager, store, bus, turn_id=turn_id),
                 name=f"controller-events:{session_id}",
             )
         elif getattr(manager, "event_bridge", None) is None:
@@ -299,6 +299,7 @@ async def _drain_controller_events(
     manager: WebSessionManager,
     store: WebSessionStore,
     bus: SessionEventBus,
+    turn_id: str | None = None,
 ) -> None:
     try:
         controller = manager.get_controller(session_id)
@@ -309,12 +310,15 @@ async def _drain_controller_events(
 
     async def drain_once() -> None:
         for event in controller.drain_events():
-            store.append_timeline_event(session_id, event)
-            await bus.publish(session_id, event)
             text = _final_event_text(event)
-            if text is not None and text not in persisted_final_texts:
-                store.append_message(session_id, role="assistant", content=text)
+            if text is not None and text not in persisted_final_texts and turn_id is not None:
+                for record in store.complete_turn(turn_id, text):
+                    await bus.publish(session_id, record.model_dump(mode="json"))
                 persisted_final_texts.add(text)
+                continue
+            turn_event = {**event, "turn_id": turn_id}
+            record = store.append_timeline_event(session_id, turn_event)
+            await bus.publish(session_id, record.model_dump(mode="json"))
 
     drained_to_completion = False
     try:
@@ -329,7 +333,11 @@ async def _drain_controller_events(
         if drained_to_completion and result is not None:
             text = getattr(result, "text", None)
             if isinstance(text, str) and text and text not in persisted_final_texts:
-                store.append_message(session_id, role="assistant", content=text)
+                if turn_id is None:
+                    store.append_message(session_id, role="assistant", content=text)
+                else:
+                    for record in store.complete_turn(turn_id, text):
+                        await bus.publish(session_id, record.model_dump(mode="json"))
                 persisted_final_texts.add(text)
 
 

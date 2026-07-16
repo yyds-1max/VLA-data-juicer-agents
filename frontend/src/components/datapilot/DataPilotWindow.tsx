@@ -36,8 +36,9 @@ export function DataPilotWindow() {
   const currentSessionId = useStore(datapilotStore, (state) => state.currentSessionId);
   const sessions = useStore(datapilotStore, (state) => state.sessions);
   const messages = useStore(datapilotStore, (state) => state.messages);
+  const turns = useStore(datapilotStore, (state) => state.turns);
   const run = useStore(datapilotStore, (state) => state.run);
-  const running = useStore(datapilotStore, (state) => state.run.running);
+  const runRunning = useStore(datapilotStore, (state) => state.run.running);
   const interrupting = useStore(datapilotStore, (state) => state.run.interrupting);
   const pendingHumanDecision = useStore(datapilotStore, (state) => state.run.pendingHumanDecision);
   const floatingOffset = useStore(datapilotStore, (state) => state.floatingOffset);
@@ -56,6 +57,9 @@ export function DataPilotWindow() {
   const humanDecisionRecoveryRequestRef = useRef(0);
   const dragRef = useRef<DragState | null>(null);
   const windowOffset = useMemo(() => visibleWindowOffset(floatingOffset, viewport), [floatingOffset, viewport]);
+  const running = runRunning || turns.some(
+    (turn) => turn.status === "running" || turn.status === "waiting",
+  );
 
   const clearReconnectTimer = useCallback(() => {
     if (reconnectTimerRef.current === null) {
@@ -212,11 +216,13 @@ export function DataPilotWindow() {
       const session = await createSession(message);
       const store = datapilotStore.getState();
       store.setActiveSession(session);
-      const userMessage = localUserMessage(session.id, message);
+      const localTurnId = createLocalTurnId();
+      const userMessage = localUserMessage(session.id, message, localTurnId);
       store.appendUserMessage(userMessage);
-      store.applyEvent(localTurnEvent("turn_pending", session.id));
+      store.applyEvent(localTurnEvent("turn_start", session.id, localTurnId));
       openEvents(session.id);
-      await submitTurn(session.id, message);
+      const turnId = await submitTurn(session.id, message);
+      datapilotStore.getState().adoptTurnId(localTurnId, turnId);
     } catch (error) {
       closeSocket();
       datapilotStore.getState().enterDraft();
@@ -230,15 +236,20 @@ export function DataPilotWindow() {
     }
 
     const store = datapilotStore.getState();
-    const userMessage = localUserMessage(currentSessionId, message);
+    const localTurnId = createLocalTurnId();
+    const userMessage = localUserMessage(currentSessionId, message, localTurnId);
     store.appendUserMessage(userMessage);
-    store.applyEvent(localTurnEvent("turn_pending", currentSessionId));
+    store.applyEvent(localTurnEvent("turn_start", currentSessionId, localTurnId));
     try {
       openEvents(currentSessionId);
-      await submitTurn(currentSessionId, message);
+      const turnId = await submitTurn(currentSessionId, message);
+      datapilotStore.getState().adoptTurnId(localTurnId, turnId);
     } catch (error) {
       datapilotStore.getState().discardLocalMessage(userMessage.id);
-      datapilotStore.getState().applyEvent(localTurnEvent("turn_submission_failed", currentSessionId));
+      datapilotStore.getState().discardLocalTurn(localTurnId);
+      datapilotStore.getState().applyEvent(
+        localTurnEvent("turn_submission_failed", currentSessionId, localTurnId),
+      );
       console.error("Failed to submit DataPilot active turn", error);
     }
   };
@@ -483,7 +494,7 @@ export function DataPilotWindow() {
         <DraftNewSessionView running={running} onSubmit={handleDraftSubmit} onInterrupt={handleInterrupt} />
       ) : mode === "active_session" ? (
         <div className="flex min-h-0 flex-1 flex-col bg-console-panel">
-          <MessageList messages={messages} run={run} />
+          <MessageList messages={messages} turns={turns} run={run} />
           <HumanDecisionDialog
             key={`${currentSessionId ?? ""}:${pendingHumanDecision?.replyId ?? ""}:${pendingHumanDecision?.toolCallId ?? ""}`}
             decision={pendingHumanDecision}
@@ -507,7 +518,7 @@ export function DataPilotWindow() {
           )}
         </div>
       ) : (
-        <MessageList messages={messages} run={run} />
+        <MessageList messages={messages} turns={turns} run={run} />
       )}
     </section>
   );
@@ -561,25 +572,36 @@ function scrollAreaForWheel(target: Node, root: HTMLElement) {
   return root.querySelector<HTMLElement>("[data-datapilot-scroll-area='true']");
 }
 
-function localUserMessage(sessionId: string, content: string) {
+function localUserMessage(sessionId: string, content: string, turnId?: string) {
   return {
     id: createLocalId(),
     session_id: sessionId,
     role: "user" as const,
     content,
     created_at: new Date().toISOString(),
+    turn_id: turnId ?? null,
   };
 }
 
-function localTurnEvent(type: "turn_pending" | "turn_submission_failed", sessionId: string) {
+function localTurnEvent(
+  type: "turn_start" | "turn_submission_failed",
+  sessionId: string,
+  turnId: string,
+) {
+  const timestamp = new Date().toISOString();
   return {
     type,
     source: "main",
     run_id: sessionId,
     parent_run_id: null,
-    timestamp: new Date().toISOString(),
-    payload: {},
+    timestamp,
+    turn_id: turnId,
+    payload: type === "turn_start" ? { status: "running", started_at: timestamp } : {},
   };
+}
+
+function createLocalTurnId(): string {
+  return createLocalId().replace(/^local-/, "local-turn-");
 }
 
 function createLocalId(): string {

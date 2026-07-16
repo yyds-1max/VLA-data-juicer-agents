@@ -7,8 +7,6 @@ import time
 from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any
-from uuid import uuid4
-
 from vla_data_juicer_agents.web.schemas import SessionRecord, generate_session_title
 from vla_data_juicer_agents.web.session_store import WebSessionStore
 
@@ -48,6 +46,12 @@ class AgentScopeEventBridge:
 
     async def start(self) -> None:
         self._stopping = False
+        stale_reply_count = self._store.reconcile_stale_reply_leases()
+        if stale_reply_count:
+            logger.warning(
+                "Released stale AgentScope reply leases during bridge startup: count=%d",
+                stale_reply_count,
+            )
         await self._reconcile_background_tools()
         for mapping in self._store.list_agentscope_session_mappings():
             await self.ensure_mapping(
@@ -174,6 +178,8 @@ class AgentScopeEventBridge:
                             agentscope_session_id=agentscope_session_id,
                             entry_id=batch.entry_id,
                             events=list(batch.events),
+                            raw_event_type=batch.raw_event_type,
+                            reply_id=getattr(batch, "reply_id", None),
                         )
                         remember_cursor = getattr(self._runtime, "_remember_event_cursor", None)
                         if callable(remember_cursor):
@@ -245,6 +251,10 @@ class AgentScopeEventBridge:
         if inspect.isawaitable(result):
             await result
 
+    async def publish_records(self, session_id: str, records: list[Any]) -> None:
+        for record in records:
+            await self._publish(session_id, record.model_dump(mode="json"))
+
 
 class AgentScopeWebSessionManager:
     def __init__(
@@ -280,12 +290,24 @@ class AgentScopeWebSessionManager:
     async def submit_turn(self, session_id: str, message: str) -> str:
         if self._store.get_session(session_id) is None:
             raise KeyError(session_id)
-
-        turn_id = await self._runtime.submit_user_message(web_session_id=session_id, message=message)
-        self._store.append_message(session_id, role="user", content=message)
-        if isinstance(turn_id, str):
-            return turn_id
-        return f"turn_{uuid4().hex}"
+        submission = self._store.begin_user_turn(session_id, message)
+        try:
+            submit_message = self._runtime.submit_user_message
+            parameters = inspect.signature(submit_message).parameters
+            if "turn_id" in parameters:
+                await submit_message(
+                    web_session_id=session_id,
+                    message=message,
+                    turn_id=submission.turn.id,
+                )
+            else:
+                await submit_message(web_session_id=session_id, message=message)
+        except Exception:
+            self._store.abort_initial_turn(submission.turn.id)
+            raise
+        for event in submission.events:
+            await self._publish_record(session_id, event)
+        return submission.turn.id
 
     async def interrupt(self, session_id: str) -> bool:
         if self._store.get_session(session_id) is None:
@@ -294,7 +316,11 @@ class AgentScopeWebSessionManager:
         interrupt_web_session = getattr(self._runtime, "interrupt_web_session", None)
         if interrupt_web_session is None:
             return False
-        return bool(await interrupt_web_session(web_session_id=session_id))
+        interrupted = bool(await interrupt_web_session(web_session_id=session_id))
+        if interrupted:
+            for event in self._store.interrupt_active_turn(session_id):
+                await self._publish_record(session_id, event)
+        return interrupted
 
     async def submit_human_decision(self, session_id: str, decision: dict[str, Any]) -> bool:
         if self._store.get_session(session_id) is None:
@@ -303,7 +329,25 @@ class AgentScopeWebSessionManager:
         submit_decision = getattr(self._runtime, "submit_human_decision", None)
         if submit_decision is None:
             return False
-        return bool(await submit_decision(web_session_id=session_id, decision=decision))
+        resumed = self._store.resume_active_turn(session_id)
+        try:
+            accepted = bool(await submit_decision(web_session_id=session_id, decision=decision))
+        except Exception:
+            self._store.restore_waiting_turn(session_id)
+            raise
+        if not accepted:
+            self._store.restore_waiting_turn(session_id)
+        if accepted:
+            for event in resumed:
+                await self._publish_record(session_id, event)
+        return accepted
+
+    async def _publish_record(self, session_id: str, record: Any) -> None:
+        if self._event_callback is None:
+            return
+        result = self._event_callback(session_id, record.model_dump(mode="json"))
+        if inspect.isawaitable(result):
+            await result
 
     async def recover_human_decision_handoff(
         self,

@@ -75,6 +75,7 @@ class AgentScopeProjectedEventBatch:
     events: tuple[dict[str, Any], ...]
     raw_event_type: str
     projected_at_monotonic: float
+    reply_id: str | None = None
 
 
 @dataclass(frozen=True)
@@ -186,8 +187,16 @@ class AgentScopeRuntime:
                 agentscope_session_id=agentscope_session_id,
             )
 
-    async def submit_user_message(self, *, web_session_id: str, message: str) -> str:
+    async def submit_user_message(
+        self,
+        *,
+        web_session_id: str,
+        message: str,
+        turn_id: str | None = None,
+    ) -> str:
         await self.ensure_bootstrapped()
+
+        authoritative_turn_id = turn_id or f"turn_{uuid4().hex}"
 
         agent_id = self._agent_id_for_user_message(web_session_id=web_session_id)
         model = (
@@ -200,8 +209,9 @@ class AgentScopeRuntime:
             agent_id=agent_id,
             model=model,
             message=message,
+            turn_id=authoritative_turn_id,
         )
-        return f"turn_{uuid4()}"
+        return authoritative_turn_id
 
     def _agent_id_for_user_message(self, *, web_session_id: str) -> str:
         mapped = self._web_session_mapping(web_session_id)
@@ -216,6 +226,8 @@ class AgentScopeRuntime:
         message: str,
     ) -> NavigationTaskStartResult:
         await self.ensure_bootstrapped()
+
+        active_turn_id = self._active_turn_id(web_session_id)
 
         entry = parse_navigation_task_entry(message)
         services = self._navigation_services()
@@ -270,6 +282,7 @@ class AgentScopeRuntime:
                 agent_id=self.config.navigation_agent_id,
                 model=self.config.navigation_model,
                 message=message,
+                turn_id=active_turn_id,
             )
         except Exception as entry_error:
             try:
@@ -309,6 +322,7 @@ class AgentScopeRuntime:
         agent_id: str,
         model: str,
         message: str,
+        turn_id: str | None = None,
     ) -> str:
         chat_service = self.app.state.chat_service
         session_id = await self.ensure_web_session(
@@ -317,6 +331,19 @@ class AgentScopeRuntime:
             model=model,
         )
         tail_cursor = await self._event_log_tail_cursor(session_id)
+        pending_reply_id: str | None = None
+        if turn_id is not None and self.web_session_store is not None:
+            self.web_session_store.bind_agentscope_session_to_turn(
+                web_session_id=web_session_id,
+                agentscope_session_id=session_id,
+                turn_id=turn_id,
+            )
+            pending_reply_id = self.web_session_store.register_pending_reply(
+                turn_id=turn_id,
+                agentscope_session_id=session_id,
+                agent_id=agent_id,
+                source="user" if message else "resume",
+            )
 
         if agent_id == self.config.navigation_agent_id:
             anchor = self._navigation_durable_state_anchor(
@@ -342,12 +369,19 @@ class AgentScopeRuntime:
                             agent_id=agent_id,
                             input_msg=UserMsg(name="user", content=message),
                         )
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                await self._settle_failed_reply(pending_reply_id)
+                raise
             finally:
                 self.clear_run_cancellation(session_id, cancellation)
 
         try:
             self._spawn_chat_run(run_with_cancellation(), session_id=session_id)
         except Exception:
+            if pending_reply_id is not None and self.web_session_store is not None:
+                self.web_session_store.discard_pending_reply(pending_reply_id)
             if previous_cancellation is not None:
                 self.register_run_cancellation(session_id, previous_cancellation)
             else:
@@ -365,21 +399,48 @@ class AgentScopeRuntime:
                 )
         return session_id
 
+    def _active_turn_id(self, web_session_id: str) -> str | None:
+        if self.web_session_store is None:
+            return None
+        active = self.web_session_store.get_active_turn(web_session_id)
+        return active.id if active is not None else None
+
+    async def _settle_failed_reply(self, lease_id: str | None) -> None:
+        if lease_id is None or self.web_session_store is None:
+            return
+        records = self.web_session_store.fail_reply_lease(lease_id)
+        if not records:
+            return
+        bridge_publish = getattr(self.web_event_bridge, "publish_records", None)
+        if callable(bridge_publish):
+            await bridge_publish(records[0].session_id, records)
+
     async def interrupt_web_session(self, *, web_session_id: str) -> bool:
-        mapped = self._web_session_mapping(web_session_id)
-        if mapped is None:
+        session_ids: list[str] = []
+        active_turn_id = self._active_turn_id(web_session_id)
+        if self.web_session_store is not None and active_turn_id is not None:
+            session_ids = [
+                mapping.agentscope_session_id
+                for mapping in self.web_session_store.list_agentscope_session_mappings()
+                if mapping.web_session_id == web_session_id
+                and mapping.active_turn_id == active_turn_id
+            ]
+        if not session_ids:
+            mapped = self._web_session_mapping(web_session_id)
+            if mapped is not None:
+                session_ids = [mapped[1]]
+        if not session_ids:
             return False
 
-        _agent_id, agentscope_session_id = mapped
         interrupted = False
-        cancellation = self.run_cancellation(agentscope_session_id)
-        if cancellation is not None:
-            interrupted = cancellation.cancel() or interrupted
-
         publish_cancel = getattr(self.message_bus, "session_publish_cancel", None)
-        if callable(publish_cancel):
-            await publish_cancel(agentscope_session_id)
-            interrupted = True
+        for agentscope_session_id in dict.fromkeys(session_ids):
+            cancellation = self.run_cancellation(agentscope_session_id)
+            if cancellation is not None:
+                interrupted = cancellation.cancel() or interrupted
+            if callable(publish_cancel):
+                await publish_cancel(agentscope_session_id)
+                interrupted = True
         return interrupted
 
     def register_run_cancellation(
@@ -748,6 +809,15 @@ class AgentScopeRuntime:
             cancellation = CancellationContext()
             previous_cancellation = self.run_cancellation(agentscope_session_id)
             self.register_run_cancellation(agentscope_session_id, cancellation)
+            pending_reply_id: str | None = None
+            active_turn_id = self._active_turn_id(web_session_id)
+            if active_turn_id is not None and self.web_session_store is not None:
+                pending_reply_id = self.web_session_store.register_pending_reply(
+                    turn_id=active_turn_id,
+                    agentscope_session_id=agentscope_session_id,
+                    agent_id=agent_id,
+                    source="human-decision",
+                )
 
             async def run_with_claim() -> None:
                 run_error: Exception | None = None
@@ -842,6 +912,11 @@ class AgentScopeRuntime:
                         )
                     if run_error is not None:
                         raise run_error
+                except asyncio.CancelledError:
+                    raise
+                except Exception:
+                    await self._settle_failed_reply(pending_reply_id)
+                    raise
                 finally:
                     self.clear_run_cancellation(agentscope_session_id, cancellation)
                     await claim.release()
@@ -850,6 +925,8 @@ class AgentScopeRuntime:
             try:
                 self._spawn_chat_run(run_coroutine, session_id=agentscope_session_id)
             except Exception:
+                if pending_reply_id is not None and self.web_session_store is not None:
+                    self.web_session_store.discard_pending_reply(pending_reply_id)
                 if plan_bound_handoff:
                     plan_store.finish_human_decision_delivery(
                         plan_id,
@@ -1228,17 +1305,44 @@ class AgentScopeRuntime:
             if record is None:
                 return False
 
-        try:
-            self._spawn_chat_run(
-                self.app.state.chat_service.run(
+        pending_reply_id: str | None = None
+        mapping = (
+            self.web_session_store.get_agentscope_session_mapping_by_agentscope_session(
+                session_id
+            )
+            if self.web_session_store is not None
+            else None
+        )
+        if mapping is not None and mapping.active_turn_id is not None:
+            pending_reply_id = self.web_session_store.register_pending_reply(
+                turn_id=mapping.active_turn_id,
+                agentscope_session_id=session_id,
+                agent_id=agent_id,
+                source=source,
+            )
+
+        async def run_recovered_session() -> None:
+            try:
+                await self.app.state.chat_service.run(
                     user_id=user_id,
                     session_id=session_id,
                     agent_id=agent_id,
                     input_msg=None,
-                ),
+                )
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                await self._settle_failed_reply(pending_reply_id)
+                raise
+
+        try:
+            self._spawn_chat_run(
+                run_recovered_session(),
                 session_id=session_id,
             )
         except RuntimeError:
+            if pending_reply_id is not None and self.web_session_store is not None:
+                self.web_session_store.discard_pending_reply(pending_reply_id)
             _logger.debug(
                 "AgentScope wakeup recovery skipped duplicate run: "
                 "session_id=%s source=%s",
@@ -1369,6 +1473,7 @@ class AgentScopeRuntime:
         agentscope_session_id: str,
         continuous: bool = True,
         on_ready: Any | None = None,
+        turn_events: bool = True,
     ):
         """Project one mapped AgentScope event stream into replay-safe batches."""
         translated_events: asyncio.Queue[dict[str, Any]] = asyncio.Queue()
@@ -1391,9 +1496,11 @@ class AgentScopeRuntime:
                 scope,
                 emit_tool_events=True,
                 emit_text_events=False,
-                emit_final_events=True,
+                emit_final_events=not turn_events,
                 emit_reasoning_events=False,
-                emit_activity_events=True,
+                emit_activity_events=not turn_events,
+                emit_progress_events=turn_events,
+                emit_reply_summary_events=turn_events,
                 public_tool_events=True,
                 suppress_pre_tool_text=True,
                 activity_title=(
@@ -1498,6 +1605,7 @@ class AgentScopeRuntime:
                 events=tuple(projected),
                 raw_event_type=_raw_event_type(raw_event),
                 projected_at_monotonic=time.monotonic(),
+                reply_id=_raw_reply_id(raw_event),
             )
 
         try:
@@ -1589,6 +1697,7 @@ class AgentScopeRuntime:
             agent_id=agent_id,
             agentscope_session_id=agentscope_session_id,
             continuous=False,
+            turn_events=False,
         ):
             for event in batch.events:
                 if (
@@ -2183,6 +2292,11 @@ def _raw_event_entry_id(event: dict[str, Any]) -> str | None:
 def _raw_event_type(event: dict[str, Any]) -> str:
     event_type = event.get("type")
     return str(event_type) if event_type is not None else ""
+
+
+def _raw_reply_id(event: dict[str, Any]) -> str | None:
+    reply_id = event.get("reply_id")
+    return reply_id if isinstance(reply_id, str) and reply_id else None
 
 
 def _stream_id_is_newer(entry_id: str, cursor: str) -> bool:

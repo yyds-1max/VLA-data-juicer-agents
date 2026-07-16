@@ -272,6 +272,7 @@ beforeEach(() => {
     previousActiveSessionId: null,
     sessions: [],
     messages: [],
+    turns: [],
     run: createEmptyRunState(),
     floatingOffset: { x: 0, y: 0 },
   });
@@ -2072,7 +2073,74 @@ test("timeline assistant output does not hide unmatched persisted assistant mess
   expect(screen.getByText("实时流式回复")).toBeVisible();
 });
 
-test("completed child run renders tool calls as compact rows while folding reasoning", () => {
+test("durable turns do not hide legacy messages from before the migration", () => {
+  render(
+    <MessageList
+      messages={[
+        {
+          id: "legacy-user",
+          session_id: "session-1",
+          role: "user",
+          content: "迁移前的请求",
+          created_at: "2026-06-26T00:01:00Z",
+        },
+        {
+          id: "legacy-assistant",
+          session_id: "session-1",
+          role: "assistant",
+          content: "迁移前的回复",
+          created_at: "2026-06-26T00:01:05Z",
+        },
+        {
+          id: "new-user",
+          session_id: "session-1",
+          turn_id: "turn-new",
+          role: "user",
+          content: "迁移后的请求",
+          created_at: "2026-06-26T00:02:00Z",
+        },
+      ]}
+      turns={[
+        {
+          id: "turn-new",
+          web_session_id: "session-1",
+          origin: "user",
+          status: "running",
+          started_at: "2026-06-26T00:02:00Z",
+          finished_at: null,
+          final_message_id: null,
+        },
+      ]}
+      run={createEmptyRunState()}
+    />,
+  );
+
+  expect(screen.getByText("迁移前的请求")).toBeVisible();
+  expect(screen.getByText("迁移前的回复")).toBeVisible();
+  expect(screen.getByText("迁移后的请求")).toBeVisible();
+});
+
+test("message with a turn id remains visible while turn metadata is rolling out", () => {
+  render(
+    <MessageList
+      messages={[
+        {
+          id: "rolling-user",
+          session_id: "session-1",
+          turn_id: "turn-not-in-snapshot",
+          role: "user",
+          content: "滚动部署中的请求",
+          created_at: "2026-06-26T00:02:00Z",
+        },
+      ]}
+      run={createEmptyRunState()}
+    />,
+  );
+
+  expect(screen.getByText("滚动部署中的请求")).toBeVisible();
+});
+
+test("completed legacy run folds its processing disclosure and keeps tool rows available", () => {
   const run = createEmptyRunState();
   run.timeline = [
     {
@@ -2118,17 +2186,17 @@ test("completed child run renders tool calls as compact rows while folding reaso
 
   render(<MessageList messages={[]} run={run} />);
 
-  const summary = screen.getByRole("button", { name: /记录了 1 条进展/ });
+  const summary = screen.getByRole("button", { name: /已处理 3s/ });
   expect(summary).toBeVisible();
   expect(summary).toHaveAttribute("aria-expanded", "false");
   expect(screen.queryByText("检查数据目录")).not.toBeInTheDocument();
-  expect(screen.getByText("已调用工具 exec_command 0.0s")).toBeVisible();
-  expect(screen.getAllByText("已调用工具 read_file 0.0s")).toHaveLength(2);
 
   fireEvent.click(summary);
 
   expect(summary).toHaveAttribute("aria-expanded", "true");
   expect(screen.getByText("检查数据目录")).toBeVisible();
+  expect(screen.getByText("已调用 exec_command 0.0s")).toBeVisible();
+  expect(screen.getAllByText("已调用 read_file 0.0s")).toHaveLength(2);
 });
 
 test("active child run details remain visible and are not folded", () => {
@@ -2163,9 +2231,9 @@ test("active child run details remain visible and are not folded", () => {
 
   render(<MessageList messages={[]} run={run} />);
 
+  expect(screen.getByRole("button", { name: /正在处理/ })).toHaveAttribute("aria-expanded", "true");
   expect(screen.getByText("正在判断导航数据类型")).toBeVisible();
-  expect(screen.getByText("已调用工具 classify_navigation_dataset_tool 0.0s")).toBeVisible();
-  expect(screen.queryByRole("button", { name: /完成了 1 个工具/ })).not.toBeInTheDocument();
+  expect(screen.getByText("已调用 classify_navigation_dataset_tool 0.0s")).toBeVisible();
 });
 
 test("active run text includes elapsed seconds while waiting", () => {
@@ -2205,13 +2273,12 @@ test("completed tool row keeps chronological position before later messages", ()
     />,
   );
 
-  const position = screen
-    .getByText("已调用工具 exec_command 0.0s")
-    .compareDocumentPosition(screen.getByText("稍后的用户消息"));
+  const completedProcess = screen.getAllByRole("button", { name: /已处理 0s/ })[0];
+  const position = completedProcess.compareDocumentPosition(screen.getByText("稍后的用户消息"));
   expect(position & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
 });
 
-test("completed child run folds child assistant final output into summary details", () => {
+test("completed legacy run keeps final output visible below the folded process", () => {
   const run = createEmptyRunState();
   run.timeline = [
     {
@@ -2236,14 +2303,15 @@ test("completed child run folds child assistant final output into summary detail
 
   render(<MessageList messages={[]} run={run} />);
 
-  const summary = screen.getByRole("button", { name: /记录了 1 条进展/ });
+  const summary = screen.getByRole("button", { name: /已处理 1s/ });
   expect(summary).toBeVisible();
-  expect(screen.queryByText("子任务已完成：导航数据可继续清洗。")).not.toBeInTheDocument();
+  expect(summary).toHaveAttribute("aria-expanded", "false");
+  expect(screen.getByText("子任务已完成：导航数据可继续清洗。")).toBeVisible();
+  expect(screen.queryByText("整理执行结论")).not.toBeInTheDocument();
 
   fireEvent.click(summary);
 
   expect(screen.getByText("整理执行结论")).toBeVisible();
-  expect(screen.getByText("子任务已完成：导航数据可继续清洗。")).toBeVisible();
 });
 
 test("main assistant output remains a DataPilot timeline bubble and is not folded", () => {
@@ -2288,7 +2356,7 @@ test("agentscope router assistant output remains a DataPilot timeline bubble and
   expect(screen.queryByRole("button", { name: /完成了子任务/ })).not.toBeInTheDocument();
 });
 
-test("tool calls render as compact timeline text instead of collapsible cards", () => {
+test("completed tool calls remain compact rows inside the folded process", () => {
   const run = createEmptyRunState();
   run.timeline = [
     {
@@ -2305,8 +2373,10 @@ test("tool calls render as compact timeline text instead of collapsible cards", 
 
   const { container } = render(<MessageList messages={[]} run={run} />);
 
-  expect(screen.getByText("已调用工具 prepare_raw_data 2.0s")).toBeVisible();
-  expect(screen.queryByRole("button", { name: /工具|tool|完成/ })).not.toBeInTheDocument();
+  const disclosure = screen.getByRole("button", { name: /已处理 0s/ });
+  expect(disclosure).toHaveAttribute("aria-expanded", "false");
+  fireEvent.click(disclosure);
+  expect(screen.getByText("已调用 prepare_raw_data 2.0s")).toBeVisible();
   expect(container.querySelector('[data-status="success"]')).toHaveClass("text-emerald-600");
 });
 
@@ -2335,6 +2405,41 @@ test("running stop interrupts the current turn without leaving active mode", asy
   await waitFor(() => expect(apiMocks.interruptTurn).toHaveBeenCalledWith("session-1"));
   expect(datapilotStore.getState().mode).toBe("active_session");
   expect(datapilotStore.getState().currentSessionId).toBe("session-1");
+});
+
+test("durable running turn keeps the composer locked during handoff gaps", async () => {
+  datapilotStore.setState({
+    open: true,
+    mode: "active_session",
+    currentSessionId: "session-1",
+    previousActiveSessionId: null,
+    sessions: [
+      {
+        id: "session-1",
+        title: "Existing session",
+        created_at: "2026-06-26T00:00:00Z",
+        updated_at: "2026-06-26T00:00:00Z",
+        status: "active",
+      },
+    ],
+    turns: [
+      {
+        id: "turn-running",
+        web_session_id: "session-1",
+        origin: "user",
+        status: "running",
+        started_at: "2026-06-26T00:01:00Z",
+        finished_at: null,
+        final_message_id: null,
+      },
+    ],
+    run: createEmptyRunState(),
+  });
+
+  await renderAppWithDashboardSettled();
+
+  expect(screen.getByRole("button", { name: "Stop current run" })).toBeVisible();
+  expect(screen.queryByRole("button", { name: "Send message" })).not.toBeInTheDocument();
 });
 
 test("running Composer shows a square stop button", () => {

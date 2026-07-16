@@ -7,6 +7,7 @@ import type {
   SessionDetail,
   SessionRecord,
   TimelineEventRecord,
+  TurnRecord,
 } from "../api/types";
 import { applyAgentEvent, createEmptyRunState, type RunState } from "./eventReducer";
 
@@ -25,6 +26,7 @@ export interface DataPilotStoreState {
   previousActiveSessionId: string | null;
   sessions: SessionRecord[];
   messages: ChatMessageRecord[];
+  turns: TurnRecord[];
   run: RunState;
   floatingOffset: { x: number; y: number };
   setOpen: (open: boolean) => void;
@@ -37,6 +39,8 @@ export interface DataPilotStoreState {
   restoreHistory: (session: SessionDetail | SessionRecord, messages?: ChatMessageRecord[]) => void;
   appendUserMessage: (message: ChatMessageRecord) => void;
   discardLocalMessage: (messageId: string) => void;
+  discardLocalTurn: (turnId: string) => void;
+  adoptTurnId: (localTurnId: string, turnId: string) => void;
   applyEvent: (event: AgentEvent) => void;
   clearPendingHumanDecision: (
     expectedDecision: PendingHumanDecision,
@@ -54,6 +58,7 @@ export function createDataPilotStore() {
     previousActiveSessionId: null,
     sessions: [],
     messages: [],
+    turns: [],
     run: createEmptyRunState(),
     floatingOffset: { x: 0, y: 0 },
 
@@ -70,6 +75,7 @@ export function createDataPilotStore() {
         previousActiveSessionId:
           state.mode === "active_session" ? state.currentSessionId : state.previousActiveSessionId,
         messages: [],
+        turns: [],
         run: createEmptyRunState(),
       })),
 
@@ -90,6 +96,7 @@ export function createDataPilotStore() {
         return {
           sessions: upsertSession(state.sessions, session),
           messages: mergeMessages(state.messages, session.messages),
+          turns: mergeTurns(state.turns, session.turns ?? []),
           ...(session.events?.length ? { run: mergeRunFromEvents(state.run, session.events) } : {}),
         };
       }),
@@ -101,6 +108,7 @@ export function createDataPilotStore() {
         previousActiveSessionId: null,
         sessions: upsertSession(state.sessions, session),
         messages: [...(messages ?? ("messages" in session ? session.messages : []))],
+        turns: "turns" in session ? [...(session.turns ?? [])] : [],
         run: runFromEvents("events" in session ? (session.events ?? []) : []),
       })),
 
@@ -111,6 +119,7 @@ export function createDataPilotStore() {
         previousActiveSessionId: null,
         sessions: upsertSession(state.sessions, session),
         messages: [...(messages ?? ("messages" in session ? session.messages : []))],
+        turns: "turns" in session ? [...(session.turns ?? [])] : [],
         run: runFromEvents("events" in session ? (session.events ?? []) : []),
       })),
 
@@ -126,11 +135,26 @@ export function createDataPilotStore() {
         ),
       })),
 
+    discardLocalTurn: (turnId) =>
+      set((state) => ({
+        turns: state.turns.filter((turn) => turn.id !== turnId),
+        run: removeRunTurn(state.run, turnId),
+      })),
+
+    adoptTurnId: (localTurnId, turnId) =>
+      set((state) => ({
+        messages: state.messages.map((message) =>
+          message.turn_id === localTurnId ? { ...message, turn_id: turnId } : message,
+        ),
+        turns: mergeAdoptedTurn(state.turns, localTurnId, turnId),
+        run: remapRunTurnId(state.run, localTurnId, turnId),
+      })),
+
     applyEvent: (event) =>
       set((state) => {
         const run = cloneRunState(state.run);
         applyLiveEvent(run, event);
-        return { run };
+        return { run, turns: applyTurnEvent(state.turns, event, state.currentSessionId) };
       }),
 
     clearPendingHumanDecision: (expectedDecision, expectedSessionId) =>
@@ -232,7 +256,6 @@ function cloneRunState(run: RunState): RunState {
     activeTools: Object.fromEntries(
       Object.entries(run.activeTools).map(([key, tool]) => [key, { ...tool }]),
     ),
-    finalRunIds: { ...run.finalRunIds },
     pendingHumanDecision: run.pendingHumanDecision ? { ...run.pendingHumanDecision } : null,
     activeText: run.activeText,
     activeStartedAt: run.activeStartedAt,
@@ -240,6 +263,91 @@ function cloneRunState(run: RunState): RunState {
     interrupting: run.interrupting,
     appliedEventKeys: { ...run.appliedEventKeys },
   };
+}
+
+function mergeTurns(existing: TurnRecord[], persisted: TurnRecord[]): TurnRecord[] {
+  const byId = new Map(existing.map((turn) => [turn.id, turn]));
+  for (const turn of persisted) {
+    byId.set(turn.id, turn);
+  }
+  return [...byId.values()].sort((left, right) => left.started_at.localeCompare(right.started_at));
+}
+
+function applyTurnEvent(
+  turns: TurnRecord[],
+  event: AgentEvent,
+  sessionId: string | null,
+): TurnRecord[] {
+  const turnId = typeof event.turn_id === "string" ? event.turn_id : "";
+  if (!turnId || (event.type !== "turn_start" && event.type !== "turn_state")) {
+    return turns;
+  }
+  const payload = event.payload ?? {};
+  const existing = turns.find((turn) => turn.id === turnId);
+  const status = typeof payload.status === "string" ? payload.status as TurnRecord["status"] : existing?.status ?? "running";
+  const startedAt = typeof payload.started_at === "string"
+    ? payload.started_at
+    : existing?.started_at ?? event.timestamp ?? new Date().toISOString();
+  const finishedAt = typeof payload.finished_at === "string"
+    ? payload.finished_at
+    : existing?.finished_at ?? null;
+  const next: TurnRecord = {
+    id: turnId,
+    web_session_id: existing?.web_session_id ?? sessionId ?? "",
+    origin: existing?.origin ?? "user",
+    status,
+    started_at: startedAt,
+    finished_at: finishedAt,
+    final_message_id: existing?.final_message_id ?? null,
+  };
+  return mergeTurns(turns, [next]);
+}
+
+function mergeAdoptedTurn(turns: TurnRecord[], localId: string, serverId: string): TurnRecord[] {
+  const local = turns.find((turn) => turn.id === localId);
+  const server = turns.find((turn) => turn.id === serverId);
+  const remaining = turns.filter((turn) => turn.id !== localId && turn.id !== serverId);
+  if (!local && !server) {
+    return turns;
+  }
+  const merged = {
+    ...(local ?? server)!,
+    ...(server ?? {}),
+    id: serverId,
+    started_at: [local?.started_at, server?.started_at].filter(Boolean).sort()[0]!,
+  };
+  return mergeTurns(remaining, [merged]);
+}
+
+function remapRunTurnId(run: RunState, localId: string, serverId: string): RunState {
+  const next = cloneRunState(run);
+  let keptInitialProgress = false;
+  next.timeline = next.timeline
+    .map((item) => item.turnId === localId ? { ...item, turnId: serverId } : item)
+    .filter((item) => {
+      if (item.turnId !== serverId || item.kind !== "progress" || item.text !== "正在理解你的请求") {
+        return true;
+      }
+      if (keptInitialProgress) return false;
+      keptInitialProgress = true;
+      return true;
+    });
+  next.activeTools = Object.fromEntries(
+    Object.entries(next.activeTools).map(([key, tool]) => [
+      key.replace(`${localId}\u0000`, `${serverId}\u0000`),
+      tool.turnId === localId ? { ...tool, turnId: serverId } : tool,
+    ]),
+  );
+  return next;
+}
+
+function removeRunTurn(run: RunState, turnId: string): RunState {
+  const next = cloneRunState(run);
+  next.timeline = next.timeline.filter((item) => item.turnId !== turnId);
+  next.activeTools = Object.fromEntries(
+    Object.entries(next.activeTools).filter(([, tool]) => tool.turnId !== turnId),
+  );
+  return next;
 }
 
 function runFromEvents(events: TimelineEventRecord[]): RunState {
@@ -297,7 +405,12 @@ function stringField(value: unknown): string {
 }
 
 function applyLiveEvent(run: RunState, event: AgentEvent): void {
-  applyEventAndMark(run, event, liveEventKey(event));
+  const record = event as AgentEvent & { id?: string; seq?: number };
+  if (record.id || typeof record.seq === "number") {
+    applyEventIfNew(run, event);
+  } else {
+    applyEventAndMark(run, event, liveEventKey(event));
+  }
 }
 
 function applyEventAndMark(run: RunState, event: AgentEvent | TimelineEventRecord, key: string): void {

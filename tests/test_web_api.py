@@ -180,7 +180,11 @@ def test_create_app_uses_agentscope_session_manager_when_runtime_present(tmp_pat
     response = client.post(f"/api/sessions/{session_id}/turns", json={"message": "开始处理"})
 
     assert response.status_code == 200
-    assert response.json()["turn_id"] == "turn-agent-1"
+    turn_id = response.json()["turn_id"]
+    assert turn_id.startswith("turn_")
+    detail = client.get(f"/api/sessions/{session_id}").json()["session"]
+    assert detail["turns"][0]["id"] == turn_id
+    assert detail["messages"][0]["turn_id"] == turn_id
     assert FakeController.created == []
     assert runtime.submitted == [(session_id, "开始处理")]
 

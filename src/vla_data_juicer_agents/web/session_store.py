@@ -13,6 +13,7 @@ from vla_data_juicer_agents.web.schemas import (
     SessionDetail,
     SessionRecord,
     TimelineEventRecord,
+    TurnRecord,
 )
 
 
@@ -26,6 +27,7 @@ class AgentScopeSessionMapping:
     agent_id: str
     agentscope_session_id: str
     event_cursor: str | None = None
+    active_turn_id: str | None = None
 
 
 @dataclass(frozen=True)
@@ -34,6 +36,14 @@ class UnresolvedBackgroundTool:
     agentscope_session_id: str
     tool: str
     call_id: str
+    turn_id: str | None = None
+
+
+@dataclass(frozen=True)
+class TurnSubmission:
+    turn: TurnRecord
+    message: ChatMessageRecord
+    events: tuple[TimelineEventRecord, ...]
 
 
 class WebSessionStore:
@@ -66,10 +76,12 @@ class WebSessionStore:
                 CREATE TABLE IF NOT EXISTS messages (
                     id TEXT PRIMARY KEY,
                     session_id TEXT NOT NULL,
+                    turn_id TEXT,
                     role TEXT NOT NULL,
                     content TEXT NOT NULL,
                     created_at TEXT NOT NULL,
-                    FOREIGN KEY (session_id) REFERENCES sessions(id)
+                    FOREIGN KEY (session_id) REFERENCES sessions(id),
+                    FOREIGN KEY (turn_id) REFERENCES web_turns(id)
                 )
                 """
             )
@@ -78,6 +90,7 @@ class WebSessionStore:
                 CREATE TABLE IF NOT EXISTS timeline_events (
                     id TEXT PRIMARY KEY,
                     session_id TEXT NOT NULL,
+                    turn_id TEXT,
                     seq INTEGER NOT NULL,
                     origin_key TEXT,
                     type TEXT NOT NULL,
@@ -87,10 +100,27 @@ class WebSessionStore:
                     timestamp TEXT,
                     payload_json TEXT NOT NULL,
                     created_at TEXT NOT NULL,
-                    FOREIGN KEY (session_id) REFERENCES sessions(id)
+                    FOREIGN KEY (session_id) REFERENCES sessions(id),
+                    FOREIGN KEY (turn_id) REFERENCES web_turns(id)
                 )
                 """
             )
+            connection.execute(
+                """
+                CREATE TABLE IF NOT EXISTS web_turns (
+                    id TEXT PRIMARY KEY,
+                    web_session_id TEXT NOT NULL,
+                    origin TEXT NOT NULL,
+                    status TEXT NOT NULL,
+                    started_at TEXT NOT NULL,
+                    finished_at TEXT,
+                    final_message_id TEXT,
+                    FOREIGN KEY (web_session_id) REFERENCES sessions(id),
+                    FOREIGN KEY (final_message_id) REFERENCES messages(id)
+                )
+                """
+            )
+            self._migrate_turn_columns(connection)
             self._migrate_timeline_events_schema(connection)
             connection.execute(
                 """
@@ -107,15 +137,38 @@ class WebSessionStore:
             )
             connection.execute(
                 """
+                CREATE UNIQUE INDEX IF NOT EXISTS idx_web_turns_one_active
+                ON web_turns (web_session_id)
+                WHERE status IN ('running', 'waiting')
+                """
+            )
+            connection.execute(
+                """
+                CREATE UNIQUE INDEX IF NOT EXISTS idx_timeline_events_turn_final
+                ON timeline_events (turn_id)
+                WHERE turn_id IS NOT NULL AND type = 'final'
+                """
+            )
+            connection.execute(
+                """
+                CREATE UNIQUE INDEX IF NOT EXISTS idx_messages_turn_assistant
+                ON messages (turn_id)
+                WHERE turn_id IS NOT NULL AND role = 'assistant'
+                """
+            )
+            connection.execute(
+                """
                 CREATE TABLE IF NOT EXISTS agentscope_sessions (
                     web_session_id TEXT NOT NULL,
                     agent_id TEXT NOT NULL,
                     agentscope_session_id TEXT NOT NULL,
                     event_cursor TEXT,
                     active INTEGER NOT NULL DEFAULT 1,
+                    active_turn_id TEXT,
                     updated_at TEXT NOT NULL,
                     PRIMARY KEY (web_session_id, agent_id),
-                    FOREIGN KEY (web_session_id) REFERENCES sessions(id)
+                    FOREIGN KEY (web_session_id) REFERENCES sessions(id),
+                    FOREIGN KEY (active_turn_id) REFERENCES web_turns(id)
                 )
                 """
             )
@@ -133,6 +186,47 @@ class WebSessionStore:
                 """
             )
             self._migrate_agentscope_sessions_schema(connection)
+            self._migrate_agentscope_turn_column(connection)
+            connection.execute(
+                """
+                CREATE TABLE IF NOT EXISTS agentscope_turn_replies (
+                    id TEXT PRIMARY KEY,
+                    turn_id TEXT NOT NULL,
+                    agentscope_session_id TEXT NOT NULL,
+                    agent_id TEXT NOT NULL,
+                    reply_id TEXT,
+                    source TEXT NOT NULL,
+                    status TEXT NOT NULL,
+                    summary_text TEXT,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    FOREIGN KEY (turn_id) REFERENCES web_turns(id)
+                )
+                """
+            )
+            connection.execute(
+                """
+                CREATE UNIQUE INDEX IF NOT EXISTS idx_turn_replies_reply
+                ON agentscope_turn_replies (agentscope_session_id, reply_id)
+                WHERE reply_id IS NOT NULL
+                """
+            )
+            connection.execute(
+                """
+                CREATE TABLE IF NOT EXISTS agentscope_turn_tools (
+                    turn_id TEXT NOT NULL,
+                    agentscope_session_id TEXT NOT NULL,
+                    call_id TEXT NOT NULL,
+                    tool TEXT NOT NULL,
+                    status TEXT NOT NULL,
+                    started_at TEXT NOT NULL,
+                    finished_at TEXT,
+                    updated_at TEXT NOT NULL,
+                    PRIMARY KEY (turn_id, agentscope_session_id, call_id),
+                    FOREIGN KEY (turn_id) REFERENCES web_turns(id)
+                )
+                """
+            )
             connection.execute(
                 """
                 CREATE INDEX IF NOT EXISTS idx_agentscope_sessions_agentscope_id
@@ -148,6 +242,29 @@ class WebSessionStore:
         }
         if columns and "origin_key" not in columns:
             connection.execute("ALTER TABLE timeline_events ADD COLUMN origin_key TEXT")
+
+    @staticmethod
+    def _migrate_turn_columns(connection: sqlite3.Connection) -> None:
+        message_columns = {
+            row["name"] for row in connection.execute("PRAGMA table_info(messages)").fetchall()
+        }
+        if message_columns and "turn_id" not in message_columns:
+            connection.execute("ALTER TABLE messages ADD COLUMN turn_id TEXT")
+        event_columns = {
+            row["name"]
+            for row in connection.execute("PRAGMA table_info(timeline_events)").fetchall()
+        }
+        if event_columns and "turn_id" not in event_columns:
+            connection.execute("ALTER TABLE timeline_events ADD COLUMN turn_id TEXT")
+
+    @staticmethod
+    def _migrate_agentscope_turn_column(connection: sqlite3.Connection) -> None:
+        columns = {
+            row["name"]
+            for row in connection.execute("PRAGMA table_info(agentscope_sessions)").fetchall()
+        }
+        if columns and "active_turn_id" not in columns:
+            connection.execute("ALTER TABLE agentscope_sessions ADD COLUMN active_turn_id TEXT")
 
     def _migrate_agentscope_sessions_schema(self, connection: sqlite3.Connection) -> None:
         columns = connection.execute("PRAGMA table_info(agentscope_sessions)").fetchall()
@@ -165,6 +282,7 @@ class WebSessionStore:
                 agentscope_session_id TEXT NOT NULL,
                 event_cursor TEXT,
                 active INTEGER NOT NULL DEFAULT 1,
+                active_turn_id TEXT,
                 updated_at TEXT NOT NULL,
                 PRIMARY KEY (web_session_id, agent_id),
                 FOREIGN KEY (web_session_id) REFERENCES sessions(id)
@@ -179,9 +297,10 @@ class WebSessionStore:
                 agentscope_session_id,
                 event_cursor,
                 active,
+                active_turn_id,
                 updated_at
             )
-            SELECT web_session_id, agent_id, agentscope_session_id, event_cursor, 1, updated_at
+            SELECT web_session_id, agent_id, agentscope_session_id, event_cursor, 1, NULL, updated_at
             FROM agentscope_sessions_legacy
             """
         )
@@ -219,6 +338,123 @@ class WebSessionStore:
             ).fetchall()
         return [self._session_from_row(row) for row in rows]
 
+    def begin_user_turn(self, session_id: str, message: str) -> TurnSubmission:
+        """Create the authoritative user turn, message and public start event atomically."""
+        timestamp = _now()
+        turn = TurnRecord(
+            id=f"turn_{uuid4().hex}",
+            web_session_id=session_id,
+            origin="user",
+            status="running",
+            started_at=timestamp,
+        )
+        message_record = ChatMessageRecord(
+            id=f"message_{uuid4().hex}",
+            session_id=session_id,
+            turn_id=turn.id,
+            role="user",
+            content=message,
+            created_at=timestamp,
+        )
+        with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            if connection.execute(
+                "SELECT 1 FROM sessions WHERE id = ?",
+                (session_id,),
+            ).fetchone() is None:
+                raise KeyError(session_id)
+            if connection.execute(
+                """
+                SELECT 1 FROM web_turns
+                WHERE web_session_id = ? AND status IN ('running', 'waiting')
+                """,
+                (session_id,),
+            ).fetchone() is not None:
+                raise RuntimeError("the session already has an active turn")
+            connection.execute(
+                """
+                INSERT INTO web_turns (
+                    id, web_session_id, origin, status, started_at, finished_at, final_message_id
+                ) VALUES (?, ?, 'user', 'running', ?, NULL, NULL)
+                """,
+                (turn.id, session_id, timestamp),
+            )
+            connection.execute(
+                """
+                INSERT INTO messages (id, session_id, turn_id, role, content, created_at)
+                VALUES (?, ?, ?, 'user', ?, ?)
+                """,
+                (message_record.id, session_id, turn.id, message, timestamp),
+            )
+            event = self._insert_timeline_event(
+                connection,
+                session_id=session_id,
+                turn_id=turn.id,
+                event={
+                    "type": "turn_start",
+                    "timestamp": timestamp,
+                    "payload": {"status": "running", "started_at": timestamp},
+                },
+                created_at=timestamp,
+            )
+            connection.execute(
+                "UPDATE sessions SET updated_at = ? WHERE id = ?",
+                (timestamp, session_id),
+            )
+        return TurnSubmission(turn=turn, message=message_record, events=(event,))
+
+    def abort_initial_turn(self, turn_id: str) -> None:
+        """Compensate a rejected initial spawn without leaving visible transcript data."""
+        with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            row = connection.execute(
+                "SELECT web_session_id, final_message_id FROM web_turns WHERE id = ?",
+                (turn_id,),
+            ).fetchone()
+            if row is None:
+                return
+            connection.execute(
+                "UPDATE agentscope_sessions SET active_turn_id = NULL WHERE active_turn_id = ?",
+                (turn_id,),
+            )
+            connection.execute("DELETE FROM agentscope_turn_tools WHERE turn_id = ?", (turn_id,))
+            connection.execute("DELETE FROM agentscope_turn_replies WHERE turn_id = ?", (turn_id,))
+            connection.execute("DELETE FROM timeline_events WHERE turn_id = ?", (turn_id,))
+            connection.execute("DELETE FROM messages WHERE turn_id = ?", (turn_id,))
+            connection.execute("DELETE FROM web_turns WHERE id = ?", (turn_id,))
+
+    def get_active_turn(self, web_session_id: str) -> TurnRecord | None:
+        with self._connect() as connection:
+            row = connection.execute(
+                """
+                SELECT id, web_session_id, origin, status, started_at, finished_at,
+                       final_message_id
+                FROM web_turns
+                WHERE web_session_id = ? AND status IN ('running', 'waiting')
+                ORDER BY started_at DESC LIMIT 1
+                """,
+                (web_session_id,),
+            ).fetchone()
+        return self._turn_from_row(row) if row is not None else None
+
+    def reconcile_stale_reply_leases(self) -> int:
+        """Release pre-restart pending/running leases so a recovered run can take over."""
+        timestamp = _now()
+        with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            cursor = connection.execute(
+                """
+                UPDATE agentscope_turn_replies
+                SET status = 'interrupted', updated_at = ?
+                WHERE status IN ('pending', 'running')
+                  AND turn_id IN (
+                      SELECT id FROM web_turns WHERE status IN ('running', 'waiting')
+                  )
+                """,
+                (timestamp,),
+            )
+        return max(cursor.rowcount, 0)
+
     def get_session(self, session_id: str) -> SessionDetail | None:
         with self._connect() as connection:
             session_row = connection.execute(
@@ -234,7 +470,7 @@ class WebSessionStore:
 
             message_rows = connection.execute(
                 """
-                SELECT id, session_id, role, content, created_at
+                SELECT id, session_id, turn_id, role, content, created_at
                 FROM messages
                 WHERE session_id = ?
                 ORDER BY created_at ASC, rowid ASC
@@ -243,11 +479,21 @@ class WebSessionStore:
             ).fetchall()
             event_rows = connection.execute(
                 """
-                SELECT id, session_id, seq, type, source, run_id, parent_run_id,
+                SELECT id, session_id, turn_id, seq, type, source, run_id, parent_run_id,
                        timestamp, payload_json, created_at
                 FROM timeline_events
                 WHERE session_id = ?
                 ORDER BY seq ASC, rowid ASC
+                """,
+                (session_id,),
+            ).fetchall()
+            turn_rows = connection.execute(
+                """
+                SELECT id, web_session_id, origin, status, started_at, finished_at,
+                       final_message_id
+                FROM web_turns
+                WHERE web_session_id = ?
+                ORDER BY started_at ASC, rowid ASC
                 """,
                 (session_id,),
             ).fetchall()
@@ -257,9 +503,17 @@ class WebSessionStore:
             **session.model_dump(),
             messages=[self._message_from_row(row) for row in message_rows],
             events=[self._timeline_event_from_row(row) for row in event_rows],
+            turns=[self._turn_from_row(row) for row in turn_rows],
         )
 
-    def append_message(self, session_id: str, *, role: MessageRole, content: str) -> ChatMessageRecord:
+    def append_message(
+        self,
+        session_id: str,
+        *,
+        role: MessageRole,
+        content: str,
+        turn_id: str | None = None,
+    ) -> ChatMessageRecord:
         timestamp = _now()
         record = ChatMessageRecord(
             id=f"message_{uuid4().hex}",
@@ -267,6 +521,7 @@ class WebSessionStore:
             role=role,
             content=content,
             created_at=timestamp,
+            turn_id=turn_id,
         )
         with self._connect() as connection:
             exists = connection.execute(
@@ -281,10 +536,17 @@ class WebSessionStore:
                 raise KeyError(session_id)
             connection.execute(
                 """
-                INSERT INTO messages (id, session_id, role, content, created_at)
-                VALUES (?, ?, ?, ?, ?)
+                INSERT INTO messages (id, session_id, turn_id, role, content, created_at)
+                VALUES (?, ?, ?, ?, ?, ?)
                 """,
-                (record.id, record.session_id, record.role, record.content, record.created_at),
+                (
+                    record.id,
+                    record.session_id,
+                    record.turn_id,
+                    record.role,
+                    record.content,
+                    record.created_at,
+                ),
             )
             connection.execute(
                 """
@@ -301,7 +563,9 @@ class WebSessionStore:
         payload = event.get("payload")
         safe_payload = payload if isinstance(payload, dict) else {}
         record_id = f"event_{uuid4().hex}"
+        turn_id = _optional_text(event.get("turn_id"))
         with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
             exists = connection.execute(
                 """
                 SELECT 1
@@ -335,6 +599,7 @@ class WebSessionStore:
                 INSERT INTO timeline_events (
                     id,
                     session_id,
+                    turn_id,
                     seq,
                     type,
                     source,
@@ -344,11 +609,12 @@ class WebSessionStore:
                     payload_json,
                     created_at
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     record_id,
                     session_id,
+                    turn_id,
                     seq,
                     str(event.get("type", "")),
                     _optional_text(event.get("source")),
@@ -379,7 +645,63 @@ class WebSessionStore:
             timestamp=_optional_text(event.get("timestamp")),
             payload=safe_payload,
             created_at=timestamp,
+            turn_id=turn_id,
         )
+
+    def _insert_timeline_event(
+        self,
+        connection: sqlite3.Connection,
+        *,
+        session_id: str,
+        turn_id: str | None,
+        event: dict,
+        created_at: str,
+        origin_key: str | None = None,
+    ) -> TimelineEventRecord:
+        payload = event.get("payload")
+        safe_payload = payload if isinstance(payload, dict) else {}
+        seq = int(
+            connection.execute(
+                "SELECT COALESCE(MAX(seq), 0) + 1 FROM timeline_events WHERE session_id = ?",
+                (session_id,),
+            ).fetchone()[0]
+        )
+        record = TimelineEventRecord(
+            id=f"event_{uuid4().hex}",
+            session_id=session_id,
+            turn_id=turn_id,
+            seq=seq,
+            type=str(event.get("type", "")),
+            source=_optional_text(event.get("source")),
+            run_id=_optional_text(event.get("run_id")),
+            parent_run_id=_optional_text(event.get("parent_run_id")),
+            timestamp=_optional_text(event.get("timestamp")),
+            payload=safe_payload,
+            created_at=created_at,
+        )
+        connection.execute(
+            """
+            INSERT INTO timeline_events (
+                id, session_id, turn_id, seq, origin_key, type, source, run_id,
+                parent_run_id, timestamp, payload_json, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                record.id,
+                session_id,
+                turn_id,
+                seq,
+                origin_key,
+                record.type,
+                record.source,
+                record.run_id,
+                record.parent_run_id,
+                record.timestamp,
+                json.dumps(safe_payload, ensure_ascii=False),
+                created_at,
+            ),
+        )
+        return record
 
     def append_projected_event_batch(
         self,
@@ -388,16 +710,14 @@ class WebSessionStore:
         agentscope_session_id: str,
         entry_id: str,
         events: list[dict],
+        raw_event_type: str | None = None,
+        reply_id: str | None = None,
     ) -> list[TimelineEventRecord]:
-        """Persist one AgentScope event projection and cursor atomically.
-
-        One AgentScope event can project to several public events.  The
-        origin key makes every projected item replay-safe while the cursor is
-        advanced only after the full batch and any final message are durable.
-        """
+        """Persist projection, turn state, final message and cursor atomically."""
         timestamp = _now()
         inserted: list[TimelineEventRecord] = []
         with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
             exists = connection.execute(
                 "SELECT 1 FROM sessions WHERE id = ?",
                 (web_session_id,),
@@ -406,7 +726,7 @@ class WebSessionStore:
                 raise KeyError(web_session_id)
             mapping = connection.execute(
                 """
-                SELECT 1
+                SELECT agent_id, active_turn_id
                 FROM agentscope_sessions
                 WHERE web_session_id = ? AND agentscope_session_id = ?
                 """,
@@ -415,16 +735,141 @@ class WebSessionStore:
             if mapping is None:
                 raise KeyError((web_session_id, agentscope_session_id))
 
-            next_seq = int(
+            turn_id = _optional_text(mapping["active_turn_id"])
+            known_reply = (
                 connection.execute(
                     """
-                    SELECT COALESCE(MAX(seq), 0) + 1
-                    FROM timeline_events
-                    WHERE session_id = ?
+                    SELECT replies.turn_id, turns.status
+                    FROM agentscope_turn_replies AS replies
+                    JOIN web_turns AS turns ON turns.id = replies.turn_id
+                    WHERE replies.agentscope_session_id = ? AND replies.reply_id = ?
+                    ORDER BY replies.updated_at DESC, replies.rowid DESC LIMIT 1
+                    """,
+                    (agentscope_session_id, reply_id),
+                ).fetchone()
+                if reply_id is not None
+                else None
+            )
+            if known_reply is not None and known_reply["status"] in {
+                "completed",
+                "failed",
+                "interrupted",
+            }:
+                connection.execute(
+                    """
+                    UPDATE agentscope_sessions
+                    SET event_cursor = ?, updated_at = ?
+                    WHERE web_session_id = ? AND agentscope_session_id = ?
+                    """,
+                    (entry_id, timestamp, web_session_id, agentscope_session_id),
+                )
+                return []
+            if turn_id is None and known_reply is not None:
+                turn_id = _optional_text(known_reply["turn_id"])
+            if turn_id is None:
+                active_turn = connection.execute(
+                    """
+                    SELECT id FROM web_turns
+                    WHERE web_session_id = ? AND status IN ('running', 'waiting')
+                    ORDER BY started_at DESC LIMIT 1
                     """,
                     (web_session_id,),
-                ).fetchone()[0]
-            )
+                ).fetchone()
+                turn_id = _optional_text(active_turn["id"]) if active_turn is not None else None
+            if turn_id is None and raw_event_type == "REPLY_START":
+                turn_id = f"turn_{uuid4().hex}"
+                connection.execute(
+                    """
+                    INSERT INTO web_turns (
+                        id, web_session_id, origin, status, started_at, finished_at,
+                        final_message_id
+                    ) VALUES (?, ?, 'system', 'running', ?, NULL, NULL)
+                    """,
+                    (turn_id, web_session_id, timestamp),
+                )
+                turn_start_origin = (
+                    f"agentscope:{agentscope_session_id}:{entry_id}:turn-start"
+                )
+                if connection.execute(
+                    "SELECT 1 FROM timeline_events WHERE origin_key = ?",
+                    (turn_start_origin,),
+                ).fetchone() is None:
+                    inserted.append(
+                        self._insert_timeline_event(
+                            connection,
+                            session_id=web_session_id,
+                            turn_id=turn_id,
+                            event={
+                                "type": "turn_start",
+                                "source": "agentscope",
+                                "run_id": agentscope_session_id,
+                                "timestamp": timestamp,
+                                "payload": {"status": "running", "started_at": timestamp},
+                            },
+                            created_at=timestamp,
+                            origin_key=turn_start_origin,
+                        )
+                    )
+            if turn_id is not None:
+                connection.execute(
+                    """
+                    UPDATE agentscope_sessions
+                    SET active_turn_id = ?, updated_at = ?
+                    WHERE web_session_id = ? AND agentscope_session_id = ?
+                    """,
+                    (turn_id, timestamp, web_session_id, agentscope_session_id),
+                )
+
+            if turn_id is not None and raw_event_type == "REPLY_START":
+                pending = connection.execute(
+                    """
+                    SELECT id FROM agentscope_turn_replies
+                    WHERE turn_id = ? AND agentscope_session_id = ? AND status = 'pending'
+                    ORDER BY updated_at DESC, rowid DESC LIMIT 1
+                    """,
+                    (turn_id, agentscope_session_id),
+                ).fetchone()
+                if pending is not None:
+                    connection.execute(
+                        """
+                        UPDATE agentscope_turn_replies
+                        SET reply_id = COALESCE(?, reply_id), status = 'running', updated_at = ?
+                        WHERE id = ?
+                        """,
+                        (reply_id, timestamp, pending["id"]),
+                    )
+                    connection.execute(
+                        """
+                        UPDATE agentscope_turn_replies
+                        SET status = 'interrupted', updated_at = ?
+                        WHERE turn_id = ? AND agentscope_session_id = ?
+                          AND status = 'pending' AND id <> ?
+                        """,
+                        (timestamp, turn_id, agentscope_session_id, pending["id"]),
+                    )
+                elif reply_id is not None:
+                    connection.execute(
+                        """
+                        INSERT INTO agentscope_turn_replies (
+                            id, turn_id, agentscope_session_id, agent_id, reply_id,
+                            source, status, summary_text, created_at, updated_at
+                        ) VALUES (?, ?, ?, ?, ?, 'event', 'running', NULL, ?, ?)
+                        ON CONFLICT(agentscope_session_id, reply_id)
+                        WHERE reply_id IS NOT NULL DO UPDATE SET
+                            status = 'running', updated_at = excluded.updated_at
+                        """,
+                        (
+                            f"reply_run_{uuid4().hex}",
+                            turn_id,
+                            agentscope_session_id,
+                            mapping["agent_id"],
+                            reply_id,
+                            timestamp,
+                            timestamp,
+                        ),
+                    )
+
+            reply_summary: str | None = None
             for projection_index, event in enumerate(events):
                 origin_key = (
                     f"agentscope:{agentscope_session_id}:{entry_id}:{projection_index}"
@@ -437,11 +882,15 @@ class WebSessionStore:
                     continue
                 payload = event.get("payload")
                 safe_payload = payload if isinstance(payload, dict) else {}
+                event_type = str(event.get("type", ""))
+                if turn_id is not None and event_type in {"reply_summary", "final"}:
+                    reply_summary = _optional_text(safe_payload.get("text"))
+                    continue
                 if self._duplicate_terminal_tool_event(
                     connection,
                     session_id=web_session_id,
                     run_id=_optional_text(event.get("run_id")),
-                    event_type=str(event.get("type", "")),
+                    event_type=event_type,
                     payload=safe_payload,
                 ):
                     continue
@@ -454,53 +903,245 @@ class WebSessionStore:
                 if duplicate is not None:
                     continue
 
-                record_id = f"event_{uuid4().hex}"
-                connection.execute(
-                    """
-                    INSERT INTO timeline_events (
-                        id, session_id, seq, origin_key, type, source, run_id,
-                        parent_run_id, timestamp, payload_json, created_at
-                    )
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                    """,
-                    (
-                        record_id,
-                        web_session_id,
-                        next_seq,
-                        origin_key,
-                        str(event.get("type", "")),
-                        _optional_text(event.get("source")),
-                        _optional_text(event.get("run_id")),
-                        _optional_text(event.get("parent_run_id")),
-                        _optional_text(event.get("timestamp")),
-                        json.dumps(safe_payload, ensure_ascii=False),
-                        timestamp,
-                    ),
-                )
-                record = TimelineEventRecord(
-                    id=record_id,
+                public_event = dict(event)
+                public_event["turn_id"] = turn_id
+                record = self._insert_timeline_event(
+                    connection,
                     session_id=web_session_id,
-                    seq=next_seq,
-                    type=str(event.get("type", "")),
-                    source=_optional_text(event.get("source")),
-                    run_id=_optional_text(event.get("run_id")),
-                    parent_run_id=_optional_text(event.get("parent_run_id")),
-                    timestamp=_optional_text(event.get("timestamp")),
-                    payload=safe_payload,
+                    turn_id=turn_id,
+                    event=public_event,
                     created_at=timestamp,
+                    origin_key=origin_key,
                 )
                 inserted.append(record)
-                next_seq += 1
+                if turn_id is None:
+                    final_text = _final_event_text(event)
+                    if final_text is not None:
+                        connection.execute(
+                            """
+                            INSERT INTO messages (id, session_id, turn_id, role, content, created_at)
+                            VALUES (?, ?, NULL, 'assistant', ?, ?)
+                            """,
+                            (f"message_{uuid4().hex}", web_session_id, final_text, timestamp),
+                        )
 
-                final_text = _final_event_text(event)
-                if final_text is not None:
+                if turn_id is not None and event_type in {
+                    "tool_start",
+                    "tool_background",
+                    "tool_end",
+                }:
+                    call_id = _optional_text(safe_payload.get("call_id"))
+                    tool = _optional_text(safe_payload.get("tool")) or "unknown_tool"
+                    if call_id is not None:
+                        status = (
+                            "running"
+                            if event_type == "tool_start"
+                            else "background"
+                            if event_type == "tool_background"
+                            else _terminal_tool_status(safe_payload.get("status"))
+                        )
+                        connection.execute(
+                            """
+                            INSERT INTO agentscope_turn_tools (
+                                turn_id, agentscope_session_id, call_id, tool, status,
+                                started_at, finished_at, updated_at
+                            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                            ON CONFLICT(turn_id, agentscope_session_id, call_id) DO UPDATE SET
+                                tool = excluded.tool,
+                                status = CASE
+                                    WHEN agentscope_turn_tools.status IN (
+                                        'completed', 'failed', 'interrupted'
+                                    ) THEN agentscope_turn_tools.status
+                                    ELSE excluded.status
+                                END,
+                                finished_at = COALESCE(
+                                    agentscope_turn_tools.finished_at,
+                                    excluded.finished_at
+                                ),
+                                updated_at = excluded.updated_at
+                            """,
+                            (
+                                turn_id,
+                                agentscope_session_id,
+                                call_id,
+                                tool,
+                                status,
+                                timestamp,
+                                timestamp if status in {"completed", "failed", "interrupted"} else None,
+                                timestamp,
+                            ),
+                        )
+
+                if turn_id is not None and event_type == "human_decision_required":
+                    connection.execute(
+                        "UPDATE web_turns SET status = 'waiting' WHERE id = ?",
+                        (turn_id,),
+                    )
                     connection.execute(
                         """
-                        INSERT INTO messages (id, session_id, role, content, created_at)
-                        VALUES (?, ?, 'assistant', ?, ?)
+                        UPDATE agentscope_turn_replies
+                        SET status = 'waiting', updated_at = ?
+                        WHERE turn_id = ? AND agentscope_session_id = ?
+                          AND status = 'running'
                         """,
-                        (f"message_{uuid4().hex}", web_session_id, final_text, timestamp),
+                        (timestamp, turn_id, agentscope_session_id),
                     )
+                    state_origin = f"agentscope:{agentscope_session_id}:{entry_id}:waiting"
+                    if connection.execute(
+                        "SELECT 1 FROM timeline_events WHERE origin_key = ?",
+                        (state_origin,),
+                    ).fetchone() is None:
+                        inserted.append(
+                            self._insert_timeline_event(
+                                connection,
+                                session_id=web_session_id,
+                                turn_id=turn_id,
+                                event={
+                                    "type": "turn_state",
+                                    "source": "agentscope",
+                                    "run_id": agentscope_session_id,
+                                    "timestamp": timestamp,
+                                    "payload": {"status": "waiting"},
+                                },
+                                created_at=timestamp,
+                                origin_key=state_origin,
+                            )
+                        )
+
+            if turn_id is not None and raw_event_type == "REPLY_END":
+                if reply_id is not None:
+                    connection.execute(
+                        """
+                        UPDATE agentscope_turn_replies
+                        SET status = 'ended', summary_text = COALESCE(?, summary_text),
+                            updated_at = ?
+                        WHERE turn_id = ? AND agentscope_session_id = ? AND reply_id = ?
+                        """,
+                        (reply_summary, timestamp, turn_id, agentscope_session_id, reply_id),
+                    )
+                else:
+                    running = connection.execute(
+                        """
+                        SELECT id FROM agentscope_turn_replies
+                        WHERE turn_id = ? AND agentscope_session_id = ?
+                          AND status IN ('running', 'waiting')
+                        ORDER BY updated_at DESC, rowid DESC LIMIT 1
+                        """,
+                        (turn_id, agentscope_session_id),
+                    ).fetchone()
+                    if running is not None:
+                        connection.execute(
+                            """
+                            UPDATE agentscope_turn_replies
+                            SET status = 'ended', summary_text = COALESCE(?, summary_text),
+                                updated_at = ? WHERE id = ?
+                            """,
+                            (reply_summary, timestamp, running["id"]),
+                        )
+
+                blockers = int(
+                    connection.execute(
+                        """
+                        SELECT
+                            (SELECT COUNT(*) FROM agentscope_turn_replies
+                             WHERE turn_id = ? AND status IN ('pending', 'running', 'waiting'))
+                            +
+                            (SELECT COUNT(*) FROM agentscope_turn_tools
+                             WHERE turn_id = ? AND status IN ('running', 'background'))
+                        """,
+                        (turn_id, turn_id),
+                    ).fetchone()[0]
+                )
+                turn_status_row = connection.execute(
+                    "SELECT status FROM web_turns WHERE id = ?",
+                    (turn_id,),
+                ).fetchone()
+                waiting = turn_status_row is not None and turn_status_row["status"] == "waiting"
+                summary_origin = f"agentscope:{agentscope_session_id}:{entry_id}:summary"
+                if reply_summary and connection.execute(
+                    "SELECT 1 FROM timeline_events WHERE origin_key = ?",
+                    (summary_origin,),
+                ).fetchone() is None:
+                    if blockers > 0 or waiting:
+                        inserted.append(
+                            self._insert_timeline_event(
+                                connection,
+                                session_id=web_session_id,
+                                turn_id=turn_id,
+                                event={
+                                    "type": "progress_update",
+                                    "source": "agentscope",
+                                    "run_id": agentscope_session_id,
+                                    "timestamp": timestamp,
+                                    "payload": {"text": reply_summary},
+                                },
+                                created_at=timestamp,
+                                origin_key=summary_origin,
+                            )
+                        )
+                    else:
+                        final_message_id = f"message_{uuid4().hex}"
+                        connection.execute(
+                            """
+                            INSERT INTO messages (
+                                id, session_id, turn_id, role, content, created_at
+                            ) VALUES (?, ?, ?, 'assistant', ?, ?)
+                            """,
+                            (
+                                final_message_id,
+                                web_session_id,
+                                turn_id,
+                                reply_summary,
+                                timestamp,
+                            ),
+                        )
+                        inserted.append(
+                            self._insert_timeline_event(
+                                connection,
+                                session_id=web_session_id,
+                                turn_id=turn_id,
+                                event={
+                                    "type": "final",
+                                    "source": "agentscope",
+                                    "run_id": agentscope_session_id,
+                                    "timestamp": timestamp,
+                                    "payload": {"text": reply_summary},
+                                },
+                                created_at=timestamp,
+                                origin_key=summary_origin,
+                            )
+                        )
+                        connection.execute(
+                            """
+                            UPDATE web_turns
+                            SET status = 'completed', finished_at = ?, final_message_id = ?
+                            WHERE id = ?
+                            """,
+                            (timestamp, final_message_id, turn_id),
+                        )
+                        connection.execute(
+                            "UPDATE agentscope_sessions SET active_turn_id = NULL WHERE active_turn_id = ?",
+                            (turn_id,),
+                        )
+                        inserted.append(
+                            self._insert_timeline_event(
+                                connection,
+                                session_id=web_session_id,
+                                turn_id=turn_id,
+                                event={
+                                    "type": "turn_state",
+                                    "source": "agentscope",
+                                    "run_id": agentscope_session_id,
+                                    "timestamp": timestamp,
+                                    "payload": {
+                                        "status": "completed",
+                                        "finished_at": timestamp,
+                                    },
+                                },
+                                created_at=timestamp,
+                                origin_key=f"agentscope:{agentscope_session_id}:{entry_id}:completed",
+                            )
+                        )
 
             connection.execute(
                 """
@@ -552,7 +1193,7 @@ class WebSessionStore:
         with self._connect() as connection:
             rows = connection.execute(
                 """
-                SELECT session_id, run_id, type, payload_json
+                SELECT session_id, turn_id, run_id, type, payload_json
                 FROM timeline_events
                 WHERE type IN ('tool_background', 'tool_end')
                 ORDER BY session_id ASC, seq ASC
@@ -582,6 +1223,7 @@ class WebSessionStore:
                     agentscope_session_id=run_id,
                     tool=tool,
                     call_id=call_id,
+                    turn_id=_optional_text(row["turn_id"]),
                 )
         return list(unresolved.values())
 
@@ -605,6 +1247,7 @@ class WebSessionStore:
             "status": status,
         }
         with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
             duplicate_origin = connection.execute(
                 "SELECT 1 FROM timeline_events WHERE origin_key = ?",
                 (origin_key,),
@@ -643,13 +1286,14 @@ class WebSessionStore:
             connection.execute(
                 """
                 INSERT INTO timeline_events (
-                    id, session_id, seq, origin_key, type, source, run_id,
+                    id, session_id, turn_id, seq, origin_key, type, source, run_id,
                     parent_run_id, timestamp, payload_json, created_at
-                ) VALUES (?, ?, ?, ?, 'tool_end', 'agentscope', ?, NULL, ?, ?, ?)
+                ) VALUES (?, ?, ?, ?, ?, 'tool_end', 'agentscope', ?, NULL, ?, ?, ?)
                 """,
                 (
                     record_id,
                     background.web_session_id,
+                    background.turn_id,
                     next_seq,
                     origin_key,
                     background.agentscope_session_id,
@@ -658,6 +1302,22 @@ class WebSessionStore:
                     timestamp,
                 ),
             )
+            if background.turn_id is not None:
+                connection.execute(
+                    """
+                    UPDATE agentscope_turn_tools
+                    SET status = ?, finished_at = ?, updated_at = ?
+                    WHERE turn_id = ? AND agentscope_session_id = ? AND call_id = ?
+                    """,
+                    (
+                        status,
+                        timestamp,
+                        timestamp,
+                        background.turn_id,
+                        background.agentscope_session_id,
+                        background.call_id,
+                    ),
+                )
             connection.execute(
                 "UPDATE sessions SET updated_at = ? WHERE id = ?",
                 (timestamp, background.web_session_id),
@@ -673,6 +1333,7 @@ class WebSessionStore:
             timestamp=timestamp,
             payload=payload,
             created_at=timestamp,
+            turn_id=background.turn_id,
         )
 
     def mark_human_decision_consumed(
@@ -749,9 +1410,19 @@ class WebSessionStore:
 
     def delete_session(self, session_id: str) -> None:
         with self._connect() as connection:
+            connection.execute("DELETE FROM agentscope_sessions WHERE web_session_id = ?", (session_id,))
+            connection.execute(
+                "DELETE FROM agentscope_turn_tools WHERE turn_id IN (SELECT id FROM web_turns WHERE web_session_id = ?)",
+                (session_id,),
+            )
+            connection.execute(
+                "DELETE FROM agentscope_turn_replies WHERE turn_id IN (SELECT id FROM web_turns WHERE web_session_id = ?)",
+                (session_id,),
+            )
+            connection.execute("UPDATE web_turns SET final_message_id = NULL WHERE web_session_id = ?", (session_id,))
             connection.execute("DELETE FROM messages WHERE session_id = ?", (session_id,))
             connection.execute("DELETE FROM timeline_events WHERE session_id = ?", (session_id,))
-            connection.execute("DELETE FROM agentscope_sessions WHERE web_session_id = ?", (session_id,))
+            connection.execute("DELETE FROM web_turns WHERE web_session_id = ?", (session_id,))
             cursor = connection.execute("DELETE FROM sessions WHERE id = ?", (session_id,))
             if cursor.rowcount == 0:
                 raise KeyError(session_id)
@@ -762,6 +1433,7 @@ class WebSessionStore:
         *,
         agent_id: str,
         agentscope_session_id: str,
+        active_turn_id: str | None = None,
     ) -> None:
         timestamp = _now()
         with self._connect() as connection:
@@ -791,9 +1463,10 @@ class WebSessionStore:
                     agentscope_session_id,
                     event_cursor,
                     active,
+                    active_turn_id,
                     updated_at
                 )
-                VALUES (?, ?, ?, NULL, 1, ?)
+                VALUES (?, ?, ?, NULL, 1, ?, ?)
                 ON CONFLICT(web_session_id, agent_id) DO UPDATE SET
                     agent_id = excluded.agent_id,
                     agentscope_session_id = excluded.agentscope_session_id,
@@ -803,10 +1476,390 @@ class WebSessionStore:
                         ELSE NULL
                     END,
                     active = 1,
+                    active_turn_id = COALESCE(excluded.active_turn_id, agentscope_sessions.active_turn_id),
                     updated_at = excluded.updated_at
                 """,
-                (web_session_id, agent_id, agentscope_session_id, timestamp),
+                (
+                    web_session_id,
+                    agent_id,
+                    agentscope_session_id,
+                    active_turn_id,
+                    timestamp,
+                ),
             )
+
+    def bind_agentscope_session_to_turn(
+        self,
+        *,
+        web_session_id: str,
+        agentscope_session_id: str,
+        turn_id: str,
+    ) -> None:
+        timestamp = _now()
+        with self._connect() as connection:
+            cursor = connection.execute(
+                """
+                UPDATE agentscope_sessions
+                SET active_turn_id = ?, updated_at = ?
+                WHERE web_session_id = ? AND agentscope_session_id = ?
+                """,
+                (turn_id, timestamp, web_session_id, agentscope_session_id),
+            )
+            if cursor.rowcount == 0:
+                raise KeyError((web_session_id, agentscope_session_id))
+
+    def register_pending_reply(
+        self,
+        *,
+        turn_id: str,
+        agentscope_session_id: str,
+        agent_id: str,
+        source: str,
+    ) -> str:
+        timestamp = _now()
+        lease_id = f"reply_run_{uuid4().hex}"
+        with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            existing = connection.execute(
+                """
+                SELECT id FROM agentscope_turn_replies
+                WHERE turn_id = ? AND agentscope_session_id = ? AND status = 'pending'
+                ORDER BY updated_at DESC, rowid DESC LIMIT 1
+                """,
+                (turn_id, agentscope_session_id),
+            ).fetchone()
+            if existing is not None:
+                connection.execute(
+                    """
+                    UPDATE agentscope_turn_replies
+                    SET agent_id = ?, source = ?, updated_at = ?
+                    WHERE id = ?
+                    """,
+                    (agent_id, source, timestamp, existing["id"]),
+                )
+                return str(existing["id"])
+            connection.execute(
+                """
+                INSERT INTO agentscope_turn_replies (
+                    id, turn_id, agentscope_session_id, agent_id, reply_id, source,
+                    status, summary_text, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, NULL, ?, 'pending', NULL, ?, ?)
+                """,
+                (
+                    lease_id,
+                    turn_id,
+                    agentscope_session_id,
+                    agent_id,
+                    source,
+                    timestamp,
+                    timestamp,
+                ),
+            )
+        return lease_id
+
+    def discard_pending_reply(self, lease_id: str) -> None:
+        with self._connect() as connection:
+            connection.execute(
+                "DELETE FROM agentscope_turn_replies WHERE id = ? AND status = 'pending'",
+                (lease_id,),
+            )
+
+    def fail_reply_lease(self, lease_id: str) -> list[TimelineEventRecord]:
+        """Settle an asynchronously failed run and fail its turn when nothing can continue it."""
+        timestamp = _now()
+        with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            reply = connection.execute(
+                """
+                SELECT replies.turn_id, turns.web_session_id, turns.status
+                FROM agentscope_turn_replies AS replies
+                JOIN web_turns AS turns ON turns.id = replies.turn_id
+                WHERE replies.id = ?
+                """,
+                (lease_id,),
+            ).fetchone()
+            if reply is None:
+                return []
+            connection.execute(
+                """
+                UPDATE agentscope_turn_replies
+                SET status = 'failed', updated_at = ?
+                WHERE id = ? AND status IN ('pending', 'running', 'waiting')
+                """,
+                (timestamp, lease_id),
+            )
+            if reply["status"] in {"completed", "failed", "interrupted"}:
+                return []
+            blockers = int(
+                connection.execute(
+                    """
+                    SELECT
+                        (SELECT COUNT(*) FROM agentscope_turn_replies
+                         WHERE turn_id = ? AND status IN ('pending', 'running', 'waiting'))
+                        +
+                        (SELECT COUNT(*) FROM agentscope_turn_tools
+                         WHERE turn_id = ? AND status IN ('running', 'background'))
+                    """,
+                    (reply["turn_id"], reply["turn_id"]),
+                ).fetchone()[0]
+            )
+            if blockers > 0:
+                return []
+            connection.execute(
+                """
+                UPDATE web_turns
+                SET status = 'failed', finished_at = ?
+                WHERE id = ? AND status IN ('running', 'waiting')
+                """,
+                (timestamp, reply["turn_id"]),
+            )
+            connection.execute(
+                "UPDATE agentscope_sessions SET active_turn_id = NULL WHERE active_turn_id = ?",
+                (reply["turn_id"],),
+            )
+            record = self._insert_timeline_event(
+                connection,
+                session_id=reply["web_session_id"],
+                turn_id=reply["turn_id"],
+                event={
+                    "type": "turn_state",
+                    "source": "agentscope",
+                    "timestamp": timestamp,
+                    "payload": {"status": "failed", "finished_at": timestamp},
+                },
+                created_at=timestamp,
+                origin_key=f"reply-failed:{lease_id}",
+            )
+            connection.execute(
+                "UPDATE sessions SET updated_at = ? WHERE id = ?",
+                (timestamp, reply["web_session_id"]),
+            )
+        return [record]
+
+    def resume_active_turn(self, web_session_id: str) -> list[TimelineEventRecord]:
+        timestamp = _now()
+        with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            row = connection.execute(
+                """
+                SELECT id FROM web_turns
+                WHERE web_session_id = ? AND status = 'waiting'
+                ORDER BY started_at DESC LIMIT 1
+                """,
+                (web_session_id,),
+            ).fetchone()
+            if row is None:
+                return []
+            turn_id = row["id"]
+            connection.execute(
+                "UPDATE web_turns SET status = 'running' WHERE id = ?",
+                (turn_id,),
+            )
+            connection.execute(
+                """
+                UPDATE agentscope_turn_replies
+                SET status = 'running', updated_at = ?
+                WHERE turn_id = ? AND status = 'waiting'
+                """,
+                (timestamp, turn_id),
+            )
+            record = self._insert_timeline_event(
+                connection,
+                session_id=web_session_id,
+                turn_id=turn_id,
+                event={
+                    "type": "turn_state",
+                    "timestamp": timestamp,
+                    "payload": {"status": "running"},
+                },
+                created_at=timestamp,
+                origin_key=f"turn-resume:{turn_id}:{timestamp}",
+            )
+        return [record]
+
+    def restore_waiting_turn(self, web_session_id: str) -> None:
+        timestamp = _now()
+        with self._connect() as connection:
+            row = connection.execute(
+                """
+                SELECT id FROM web_turns
+                WHERE web_session_id = ? AND status = 'running'
+                ORDER BY started_at DESC LIMIT 1
+                """,
+                (web_session_id,),
+            ).fetchone()
+            if row is None:
+                return
+            connection.execute(
+                "UPDATE web_turns SET status = 'waiting' WHERE id = ?",
+                (row["id"],),
+            )
+            connection.execute(
+                """
+                UPDATE agentscope_turn_replies
+                SET status = 'waiting', updated_at = ?
+                WHERE turn_id = ? AND status = 'running'
+                """,
+                (timestamp, row["id"]),
+            )
+
+    def interrupt_active_turn(self, web_session_id: str) -> list[TimelineEventRecord]:
+        timestamp = _now()
+        records: list[TimelineEventRecord] = []
+        with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            row = connection.execute(
+                """
+                SELECT id FROM web_turns
+                WHERE web_session_id = ? AND status IN ('running', 'waiting')
+                ORDER BY started_at DESC LIMIT 1
+                """,
+                (web_session_id,),
+            ).fetchone()
+            if row is None:
+                return []
+            turn_id = row["id"]
+            tools = connection.execute(
+                """
+                SELECT agentscope_session_id, call_id, tool
+                FROM agentscope_turn_tools
+                WHERE turn_id = ? AND status IN ('running', 'background')
+                ORDER BY started_at ASC, rowid ASC
+                """,
+                (turn_id,),
+            ).fetchall()
+            for tool in tools:
+                connection.execute(
+                    """
+                    UPDATE agentscope_turn_tools
+                    SET status = 'interrupted', finished_at = ?, updated_at = ?
+                    WHERE turn_id = ? AND agentscope_session_id = ? AND call_id = ?
+                    """,
+                    (
+                        timestamp,
+                        timestamp,
+                        turn_id,
+                        tool["agentscope_session_id"],
+                        tool["call_id"],
+                    ),
+                )
+                records.append(
+                    self._insert_timeline_event(
+                        connection,
+                        session_id=web_session_id,
+                        turn_id=turn_id,
+                        event={
+                            "type": "tool_end",
+                            "source": "agentscope",
+                            "run_id": tool["agentscope_session_id"],
+                            "timestamp": timestamp,
+                            "payload": {
+                                "tool": tool["tool"],
+                                "call_id": tool["call_id"],
+                                "status": "interrupted",
+                            },
+                        },
+                        created_at=timestamp,
+                        origin_key=f"turn-interrupt:{turn_id}:tool:{tool['agentscope_session_id']}:{tool['call_id']}",
+                    )
+                )
+            connection.execute(
+                """
+                UPDATE agentscope_turn_replies
+                SET status = 'interrupted', updated_at = ?
+                WHERE turn_id = ? AND status IN ('pending', 'running', 'waiting')
+                """,
+                (timestamp, turn_id),
+            )
+            connection.execute(
+                """
+                UPDATE web_turns
+                SET status = 'interrupted', finished_at = ?
+                WHERE id = ?
+                """,
+                (timestamp, turn_id),
+            )
+            connection.execute(
+                "UPDATE agentscope_sessions SET active_turn_id = NULL WHERE active_turn_id = ?",
+                (turn_id,),
+            )
+            records.append(
+                self._insert_timeline_event(
+                    connection,
+                    session_id=web_session_id,
+                    turn_id=turn_id,
+                    event={
+                        "type": "turn_state",
+                        "timestamp": timestamp,
+                        "payload": {"status": "interrupted", "finished_at": timestamp},
+                    },
+                    created_at=timestamp,
+                    origin_key=f"turn-interrupt:{turn_id}:state",
+                )
+            )
+        return records
+
+    def complete_turn(self, turn_id: str, text: str) -> list[TimelineEventRecord]:
+        timestamp = _now()
+        with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            turn = connection.execute(
+                "SELECT web_session_id, status FROM web_turns WHERE id = ?",
+                (turn_id,),
+            ).fetchone()
+            if turn is None:
+                raise KeyError(turn_id)
+            if turn["status"] in {"completed", "failed", "interrupted"}:
+                return []
+            message_id = f"message_{uuid4().hex}"
+            connection.execute(
+                """
+                INSERT INTO messages (id, session_id, turn_id, role, content, created_at)
+                VALUES (?, ?, ?, 'assistant', ?, ?)
+                """,
+                (message_id, turn["web_session_id"], turn_id, text, timestamp),
+            )
+            final = self._insert_timeline_event(
+                connection,
+                session_id=turn["web_session_id"],
+                turn_id=turn_id,
+                event={
+                    "type": "final",
+                    "timestamp": timestamp,
+                    "payload": {"text": text},
+                },
+                created_at=timestamp,
+                origin_key=f"controller:{turn_id}:final",
+            )
+            connection.execute(
+                """
+                UPDATE web_turns
+                SET status = 'completed', finished_at = ?, final_message_id = ?
+                WHERE id = ?
+                """,
+                (timestamp, message_id, turn_id),
+            )
+            connection.execute(
+                "UPDATE agentscope_sessions SET active_turn_id = NULL WHERE active_turn_id = ?",
+                (turn_id,),
+            )
+            connection.execute(
+                "UPDATE sessions SET updated_at = ? WHERE id = ?",
+                (timestamp, turn["web_session_id"]),
+            )
+            state = self._insert_timeline_event(
+                connection,
+                session_id=turn["web_session_id"],
+                turn_id=turn_id,
+                event={
+                    "type": "turn_state",
+                    "timestamp": timestamp,
+                    "payload": {"status": "completed", "finished_at": timestamp},
+                },
+                created_at=timestamp,
+                origin_key=f"controller:{turn_id}:completed",
+            )
+        return [final, state]
 
     def restore_agentscope_session_mapping(
         self,
@@ -843,7 +1896,7 @@ class WebSessionStore:
         with self._connect() as connection:
             row = connection.execute(
                 """
-                SELECT web_session_id, agent_id, agentscope_session_id, event_cursor
+                SELECT web_session_id, agent_id, agentscope_session_id, event_cursor, active_turn_id
                 FROM agentscope_sessions
                 WHERE web_session_id = ? AND active = 1
                 ORDER BY active DESC, updated_at DESC
@@ -857,7 +1910,7 @@ class WebSessionStore:
         with self._connect() as connection:
             rows = connection.execute(
                 """
-                SELECT web_session_id, agent_id, agentscope_session_id, event_cursor
+                SELECT web_session_id, agent_id, agentscope_session_id, event_cursor, active_turn_id
                 FROM agentscope_sessions
                 ORDER BY web_session_id ASC, rowid ASC
                 """
@@ -872,7 +1925,7 @@ class WebSessionStore:
         with self._connect() as connection:
             row = connection.execute(
                 """
-                SELECT web_session_id, agent_id, agentscope_session_id, event_cursor
+                SELECT web_session_id, agent_id, agentscope_session_id, event_cursor, active_turn_id
                 FROM agentscope_sessions
                 WHERE web_session_id = ? AND agent_id = ?
                 """,
@@ -887,7 +1940,7 @@ class WebSessionStore:
         with self._connect() as connection:
             row = connection.execute(
                 """
-                SELECT web_session_id, agent_id, agentscope_session_id, event_cursor
+                SELECT web_session_id, agent_id, agentscope_session_id, event_cursor, active_turn_id
                 FROM agentscope_sessions
                 WHERE agentscope_session_id = ?
                 """,
@@ -975,6 +2028,7 @@ class WebSessionStore:
             role=row["role"],
             content=row["content"],
             created_at=row["created_at"],
+            turn_id=row["turn_id"] if "turn_id" in row.keys() else None,
         )
 
     @staticmethod
@@ -994,6 +2048,19 @@ class WebSessionStore:
             timestamp=row["timestamp"],
             payload=payload if isinstance(payload, dict) else {},
             created_at=row["created_at"],
+            turn_id=row["turn_id"] if "turn_id" in row.keys() else None,
+        )
+
+    @staticmethod
+    def _turn_from_row(row: sqlite3.Row) -> TurnRecord:
+        return TurnRecord(
+            id=row["id"],
+            web_session_id=row["web_session_id"],
+            origin=row["origin"],
+            status=row["status"],
+            started_at=row["started_at"],
+            finished_at=row["finished_at"],
+            final_message_id=row["final_message_id"],
         )
 
     @staticmethod
@@ -1003,6 +2070,7 @@ class WebSessionStore:
             agent_id=row["agent_id"],
             agentscope_session_id=row["agentscope_session_id"],
             event_cursor=row["event_cursor"],
+            active_turn_id=row["active_turn_id"],
         )
 
 
@@ -1018,3 +2086,8 @@ def _final_event_text(event: dict) -> str | None:
         return None
     text = payload.get("text")
     return text if isinstance(text, str) and text else None
+
+
+def _terminal_tool_status(value: object) -> str:
+    status = _optional_text(value)
+    return status if status in {"completed", "failed", "interrupted"} else "failed"

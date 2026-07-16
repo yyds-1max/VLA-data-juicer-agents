@@ -408,6 +408,32 @@ describe("eventReducer", () => {
     expect(state.timeline[0].text).not.toContain("{");
   });
 
+  it("never renders ok false as a completed tool even when status says completed", () => {
+    const state = createEmptyRunState();
+    applyAgentEvent(
+      state,
+      event("tool_start", "agentscope", {
+        call_id: "call-failed",
+        tool: "prepare_raw_data_tool",
+      }),
+    );
+    applyAgentEvent(
+      state,
+      event("tool_end", "agentscope", {
+        call_id: "call-failed",
+        tool: "prepare_raw_data_tool",
+        status: "completed",
+        ok: false,
+      }),
+    );
+
+    expect(state.timeline[0]).toMatchObject({
+      kind: "tool",
+      status: "failed",
+      toolPhase: "failed",
+    });
+  });
+
   it("keeps a background tool active until its real terminal event", () => {
     const state = createEmptyRunState();
     applyAgentEvent(
@@ -434,8 +460,10 @@ describe("eventReducer", () => {
       tool: "extract_and_sync_navigation_data_tool",
       phase: "background",
     });
-    expect(state.activeText).toBe("后台执行工具 extract_and_sync_navigation_data_tool");
-    expect(state.timeline.filter((item) => item.kind === "tool")).toEqual([]);
+    expect(state.activeText).toBe("正在调用工具 extract_and_sync_navigation_data_tool");
+    expect(state.timeline.filter((item) => item.kind === "tool")).toMatchObject([
+      { tool: "extract_and_sync_navigation_data_tool", toolPhase: "background" },
+    ]);
 
     applyAgentEvent(
       state,
@@ -552,7 +580,7 @@ describe("eventReducer", () => {
     applyAgentEvent(state, event("final", "main", { text: "first answer" }, { run_id: "final-run" }));
     applyAgentEvent(state, event("final", "main", { text: "duplicate answer" }, { run_id: "final-run" }));
 
-    expect(state.timeline.filter((item) => item.kind === "assistant")).toEqual([
+    expect(state.timeline.filter((item) => item.kind === "assistant")).toMatchObject([
       {
         kind: "assistant",
         source: "main",
@@ -585,7 +613,7 @@ describe("eventReducer", () => {
     expect(state.running).toBe(true);
     expect(state.activeText).toBe("");
     expect(state.activeStartedAt).toBeNull();
-    expect(state.timeline.filter((item) => item.kind === "assistant")).toEqual([
+    expect(state.timeline.filter((item) => item.kind === "assistant")).toMatchObject([
       {
         kind: "assistant",
         source: "main",
@@ -597,7 +625,7 @@ describe("eventReducer", () => {
 
     applyAgentEvent(state, event("final", "main", { text: "你好，我是 DataPilot。" }, { run_id: "stream-run" }));
 
-    expect(state.timeline.filter((item) => item.kind === "assistant")).toEqual([
+    expect(state.timeline.filter((item) => item.kind === "assistant")).toMatchObject([
       {
         kind: "assistant",
         source: "main",
@@ -892,7 +920,10 @@ describe("datapilotStore", () => {
       }),
     );
 
-    expect(store.getState().run.timeline).toMatchObject([{ kind: "assistant", text: "开始检查。" }]);
+    expect(store.getState().run.timeline).toMatchObject([
+      { kind: "assistant", text: "开始检查。" },
+      { kind: "tool", tool: "prepare_raw_data", toolPhase: "running" },
+    ]);
     expect(store.getState().run.running).toBe(true);
     expect(store.getState().run.activeText).toBe("正在调用工具 prepare_raw_data");
   });

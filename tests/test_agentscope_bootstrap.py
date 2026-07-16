@@ -77,7 +77,8 @@ def test_main_router_prompt_is_triage_only_and_handles_handoff_truthfully():
         assert artifact_or_stage_rule not in prompt
 
     assert "mock" not in prompt.lower()
-    assert 'Activity: {"observation":' in prompt
+    assert 'Activity: {"summary":' in prompt
+    assert "Do not output Thought, Observation, Analysis, Action" in prompt
     assert "private chain-of-thought" in prompt
     assert "tool or function names" in prompt
 
@@ -145,7 +146,8 @@ def test_navigation_agent_prompt_requires_model_directed_investigation_and_plans
     assert "继续执行 plus" not in prompt
     assert "You are NavigationDataAgent" not in prompt
     assert "mock" not in prompt.lower()
-    assert 'Activity: {"observation":' in prompt
+    assert 'Activity: {"summary":' in prompt
+    assert "Do not output Thought, Observation, Analysis, Action" in prompt
     assert "progress metadata, not part of the final answer" in prompt
 
 

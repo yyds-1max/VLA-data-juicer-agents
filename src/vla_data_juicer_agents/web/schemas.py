@@ -8,6 +8,8 @@ from pydantic import BaseModel, Field, field_validator
 SessionStatus = Literal["draft", "active", "historical"]
 MessageRole = Literal["user", "assistant", "system"]
 HumanDecisionAction = Literal["confirm", "stop", "guide"]
+TurnOrigin = Literal["user", "system"]
+TurnStatus = Literal["running", "waiting", "completed", "failed", "interrupted"]
 
 
 def generate_session_title(message: str, *, limit: int = 30) -> str:
@@ -29,6 +31,7 @@ class ChatMessageRecord(BaseModel):
     role: MessageRole
     content: str
     created_at: str
+    turn_id: str | None = None
 
 
 class TimelineEventRecord(BaseModel):
@@ -42,11 +45,23 @@ class TimelineEventRecord(BaseModel):
     timestamp: str | None = None
     payload: dict[str, Any] = Field(default_factory=dict)
     created_at: str
+    turn_id: str | None = None
+
+
+class TurnRecord(BaseModel):
+    id: str
+    web_session_id: str
+    origin: TurnOrigin
+    status: TurnStatus
+    started_at: str
+    finished_at: str | None = None
+    final_message_id: str | None = None
 
 
 class SessionDetail(SessionRecord):
     messages: list[ChatMessageRecord] = Field(default_factory=list)
     events: list[TimelineEventRecord] = Field(default_factory=list)
+    turns: list[TurnRecord] = Field(default_factory=list)
 
 
 class CreateSessionResponse(BaseModel):
@@ -116,4 +131,5 @@ class AgentEvent(BaseModel):
     run_id: str | None = None
     parent_run_id: str | None = None
     timestamp: str | None = None
+    turn_id: str | None = None
     payload: dict[str, Any] = Field(default_factory=dict)

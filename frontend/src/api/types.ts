@@ -1,5 +1,17 @@
 export type SessionStatus = "draft" | "active" | "historical";
 export type MessageRole = "user" | "assistant" | "system";
+export type TurnOrigin = "user" | "system";
+export type TurnStatus = "running" | "waiting" | "completed" | "failed" | "interrupted";
+
+export interface TurnRecord {
+  id: string;
+  web_session_id: string;
+  origin: TurnOrigin;
+  status: TurnStatus;
+  started_at: string;
+  finished_at: string | null;
+  final_message_id: string | null;
+}
 
 export interface SessionRecord {
   id: string;
@@ -15,6 +27,7 @@ export interface ChatMessageRecord {
   role: MessageRole;
   content: string;
   created_at: string;
+  turn_id?: string | null;
 }
 
 export interface TimelineEventRecord extends AgentEvent {
@@ -27,6 +40,7 @@ export interface TimelineEventRecord extends AgentEvent {
 export interface SessionDetail extends SessionRecord {
   messages: ChatMessageRecord[];
   events?: TimelineEventRecord[];
+  turns?: TurnRecord[];
 }
 
 export interface AgentEvent {
@@ -35,6 +49,7 @@ export interface AgentEvent {
   run_id?: string | null;
   parent_run_id?: string | null;
   timestamp?: string | null;
+  turn_id?: string | null;
   payload: Record<string, unknown>;
 }
 

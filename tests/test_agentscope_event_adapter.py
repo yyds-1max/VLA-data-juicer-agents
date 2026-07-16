@@ -99,6 +99,46 @@ def test_adapter_can_emit_text_delta_and_final_from_raw_agentscope_events():
     ]
 
 
+def test_turn_mode_emits_progress_and_reply_summary_without_react_labels():
+    scope, events = _scope_and_events()
+    adapter = AgentScopeEventAdapter(
+        scope,
+        emit_tool_events=True,
+        emit_progress_events=True,
+        emit_reply_summary_events=True,
+        public_tool_events=True,
+        suppress_pre_tool_text=True,
+    )
+
+    adapter.accept(
+        SimpleNamespace(
+            type="TEXT_BLOCK_DELTA",
+            delta='Activity: {"summary":"已确认原始数据，接下来开始提取。"}\n',
+        )
+    )
+    adapter.accept(
+        SimpleNamespace(
+            type="TEXT_BLOCK_DELTA",
+            delta=(
+                'Activity: {"observation":"同步结果已生成。",'
+                '"analysis":"需要检查产物完整性。",'
+                '"action":"核对输出。"}\n'
+            ),
+        )
+    )
+    adapter.accept(SimpleNamespace(type="TEXT_BLOCK_DELTA", delta="处理完成。"))
+    adapter.accept(SimpleNamespace(type="REPLY_END", reply_id="reply-1"))
+
+    assert [(event["type"], event["payload"]) for event in events] == [
+        ("progress_update", {"text": "已确认原始数据，接下来开始提取。"}),
+        (
+            "progress_update",
+            {"text": "同步结果已生成。 需要检查产物完整性。 核对输出。"},
+        ),
+        ("reply_summary", {"text": "处理完成。", "reply_id": "reply-1"}),
+    ]
+
+
 def test_adapter_closes_assistant_segment_before_tool_call():
     scope, events = _scope_and_events()
     adapter = AgentScopeEventAdapter(

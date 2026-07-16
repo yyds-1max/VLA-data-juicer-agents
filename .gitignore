@@ -69,6 +69,7 @@ sessions.sqlite
 # Codex
 .superpowers
 .worktrees/
+.artifacts/
 
 # OS and editor files
 .DS_Store

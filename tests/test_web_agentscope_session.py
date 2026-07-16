@@ -689,6 +689,79 @@ async def test_runtime_start_navigation_agent_task_switches_mapping_and_spawns_n
 
 
 @pytest.mark.asyncio
+async def test_runtime_router_and_navigation_runs_inherit_the_authoritative_turn(
+    tmp_path: Path,
+) -> None:
+    store = WebSessionStore(tmp_path / "sessions.sqlite")
+    web_session = store.create_session("处理导航数据")
+    submission = store.begin_user_turn(web_session.id, "处理 20270605 的室外数据")
+    chat_run_registry = FakeChatRunRegistry()
+    runtime = _runtime(
+        chat_run_registry=chat_run_registry,
+        workspace_root=tmp_path / "workspace",
+    )
+    runtime.set_web_session_store(store)
+
+    await runtime.submit_user_message(
+        web_session_id=web_session.id,
+        message="处理 20270605 的室外数据",
+        turn_id=submission.turn.id,
+    )
+    await chat_run_registry.drain()
+    await runtime.start_navigation_agent_task(
+        web_session_id=web_session.id,
+        message=agentscope_runtime_module._navigation_handoff_message(
+            request="处理 20270605 的室外数据",
+            target="20270605",
+            date="20270605",
+            scene_mode="out",
+            clips=[],
+            reason="用户请求导航处理",
+            response_language="Chinese",
+        ),
+    )
+
+    mappings = store.list_agentscope_session_mappings()
+    assert [mapping.agent_id for mapping in mappings] == [
+        "main-router-agent",
+        "navigation-data-agent",
+    ]
+    assert {mapping.active_turn_id for mapping in mappings} == {submission.turn.id}
+    await chat_run_registry.drain()
+
+
+@pytest.mark.asyncio
+async def test_runtime_async_run_failure_marks_authoritative_turn_failed(
+    tmp_path: Path,
+) -> None:
+    class FailingChatService(FakeChatService):
+        async def run(self, *, user_id, session_id, agent_id, input_msg):
+            raise RuntimeError("model transport failed")
+
+    store = WebSessionStore(tmp_path / "sessions.sqlite")
+    web_session = store.create_session("failing run")
+    submission = store.begin_user_turn(web_session.id, "处理数据")
+    chat_run_registry = FakeChatRunRegistry()
+    runtime = _runtime(chat_run_registry=chat_run_registry, workspace_root=tmp_path / "workspace")
+    runtime.app.state.chat_service = FailingChatService()
+    runtime.set_web_session_store(store)
+
+    await runtime.submit_user_message(
+        web_session_id=web_session.id,
+        message="处理数据",
+        turn_id=submission.turn.id,
+    )
+    with pytest.raises(RuntimeError, match="model transport failed"):
+        await chat_run_registry.drain()
+
+    detail = store.get_session(web_session.id)
+    assert detail is not None
+    assert detail.turns[0].status == "failed"
+    assert detail.events[-1].type == "turn_state"
+    assert detail.events[-1].payload["status"] == "failed"
+
+
+@pytest.mark.asyncio
 async def test_runtime_submit_user_message_routes_to_active_navigation_agent_after_handoff(
     tmp_path: Path,
 ) -> None:
@@ -1638,6 +1711,40 @@ async def test_runtime_interrupt_web_session_cancels_registered_context() -> Non
     assert cancellation.cancelled is True
     assert message_bus.cancelled_sessions == ["as-session-1"]
     assert runtime.web_sessions["web-1"] == ("navigation-data-agent", "as-session-1")
+
+
+@pytest.mark.asyncio
+async def test_runtime_interrupt_cancels_every_mapping_bound_to_the_active_turn(
+    tmp_path: Path,
+) -> None:
+    store = WebSessionStore(tmp_path / "sessions.sqlite")
+    session = store.create_session("multi agent turn")
+    submission = store.begin_user_turn(session.id, "处理导航数据")
+    for agent_id, agentscope_session_id in (
+        ("main-router-agent", "as-router"),
+        ("navigation-data-agent", "as-navigation"),
+    ):
+        store.save_agentscope_session_mapping(
+            session.id,
+            agent_id=agent_id,
+            agentscope_session_id=agentscope_session_id,
+            active_turn_id=submission.turn.id,
+        )
+    message_bus = FakeAgentScopeMessageBus()
+    runtime = _runtime(chat_run_registry=FakeChatRunRegistry(), message_bus=message_bus)
+    runtime.set_web_session_store(store)
+    runtime.web_sessions[session.id] = ("navigation-data-agent", "as-navigation")
+    router_cancellation = CancellationContext()
+    navigation_cancellation = CancellationContext()
+    runtime.register_run_cancellation("as-router", router_cancellation)
+    runtime.register_run_cancellation("as-navigation", navigation_cancellation)
+
+    interrupted = await runtime.interrupt_web_session(web_session_id=session.id)
+
+    assert interrupted is True
+    assert router_cancellation.cancelled is True
+    assert navigation_cancellation.cancelled is True
+    assert message_bus.cancelled_sessions == ["as-router", "as-navigation"]
 
 
 def test_runtime_retains_cancellation_until_background_operation_finishes() -> None:
@@ -3132,7 +3239,7 @@ async def test_create_session_creates_compatible_record_and_persists(tmp_path: P
     assert session.title == "处理 20270605 的室外导航数据，并进行 dry-ru"
     detail = store.get_session(session.id)
     assert detail is not None
-    assert detail.model_dump(exclude={"messages", "events"}) == session.model_dump()
+    assert detail.model_dump(exclude={"messages", "events", "turns"}) == session.model_dump()
     assert detail.messages == []
     assert detail.events == []
 
@@ -3155,10 +3262,12 @@ async def test_submit_turn_appends_user_message_calls_runtime_and_returns_turn_i
 
     turn_id = await manager.submit_turn(session.id, "开始处理")
 
-    assert turn_id == "turn_agentscope_1"
+    assert turn_id.startswith("turn_")
     assert runtime.submissions == [{"web_session_id": session.id, "message": "开始处理"}]
     detail = store.get_session(session.id)
     assert detail is not None
+    assert detail.turns[0].id == turn_id
+    assert detail.messages[0].turn_id == turn_id
     assert [(message.role, message.content) for message in detail.messages] == [("user", "开始处理")]
 
 

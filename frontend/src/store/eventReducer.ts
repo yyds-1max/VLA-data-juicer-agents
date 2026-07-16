@@ -1,6 +1,6 @@
 import type { AgentEvent, PendingHumanDecision } from "../api/types";
 
-export type TimelineKind = "activity" | "reasoning" | "tool" | "agent" | "assistant" | "system";
+export type TimelineKind = "activity" | "progress" | "reasoning" | "tool" | "agent" | "assistant" | "system";
 
 export interface ActivityStep {
   id: string;
@@ -22,6 +22,14 @@ export interface TimelineItem {
   activityTitle?: string;
   activityStatus?: string;
   activitySteps?: ActivityStep[];
+  turnId?: string | null;
+  callId?: string;
+  tool?: string;
+  toolPhase?: "running" | "background" | "completed" | "failed" | "interrupted";
+  startedAt?: number;
+  finishedAt?: number;
+  createdAt?: string;
+  sequence?: number;
 }
 
 export interface ActiveAgent {
@@ -39,13 +47,13 @@ export interface ActiveTool {
   parentRunId: string | null;
   startedAt: number;
   phase: "running" | "background";
+  turnId: string | null;
 }
 
 export interface RunState {
   timeline: TimelineItem[];
   activeAgents: Record<string, ActiveAgent>;
   activeTools: Record<string, ActiveTool>;
-  finalRunIds: Record<string, true>;
   pendingHumanDecision: PendingHumanDecision | null;
   activeText: string;
   activeStartedAt: number | null;
@@ -59,7 +67,6 @@ export function createEmptyRunState(): RunState {
     timeline: [],
     activeAgents: {},
     activeTools: {},
-    finalRunIds: {},
     pendingHumanDecision: null,
     activeText: "",
     activeStartedAt: null,
@@ -79,13 +86,49 @@ export function applyAgentEvent(state: RunState, event: AgentEvent): void {
   const runId = normalizeText(event.run_id);
   const parentRunId = normalizeNullableText(event.parent_run_id);
   const payload = event.payload ?? {};
+  const turnId = normalizeNullableText(event.turn_id);
   const label = sourceLabel(source);
+  const eventTimestamp = event.timestamp ?? (event as AgentEvent & { created_at?: string }).created_at;
+
+  if (type === "turn_start") {
+    const exists = state.timeline.some(
+      (item) => item.kind === "progress" && item.turnId === turnId && item.text === "正在理解你的请求",
+    );
+    if (!exists) {
+      state.timeline.push({
+        kind: "progress",
+        source: "main",
+        text: "正在理解你的请求",
+        turnId,
+      });
+    }
+    state.running = true;
+    state.interrupting = false;
+    return;
+  }
+
+  if (type === "turn_state") {
+    const status = normalizeText(payload.status);
+    state.running = status === "running";
+    if (status && status !== "running" && status !== "waiting") {
+      state.interrupting = false;
+    }
+    return;
+  }
+
+  if (type === "progress_update") {
+    const text = normalizeText(payload.text);
+    if (text) {
+      state.timeline.push({ kind: "progress", source: "main", text, turnId });
+    }
+    return;
+  }
 
   if (type === "turn_pending") {
     state.running = true;
     state.interrupting = false;
     state.activeText = "正在思考";
-    state.activeStartedAt = timestampMs(event.timestamp);
+    state.activeStartedAt = timestampMs(eventTimestamp);
     return;
   }
 
@@ -95,10 +138,7 @@ export function applyAgentEvent(state: RunState, event: AgentEvent): void {
   }
 
   if (type === "agent_start") {
-    const startedAt = timestampMs(event.timestamp);
-    if (runId) {
-      delete state.finalRunIds[runId];
-    }
+    const startedAt = timestampMs(eventTimestamp);
     state.activeAgents[agentKey(runId, source)] = { source, runId, parentRunId, startedAt };
     state.running = true;
     state.activeText = thinkingText(source, label);
@@ -170,18 +210,34 @@ export function applyAgentEvent(state: RunState, event: AgentEvent): void {
     }
 
     const tool = normalizeText(payload.tool) || "unknown_tool";
-    state.activeTools[toolKey(runId, callId)] = {
+    const key = toolKey(turnId, runId, callId);
+    const startedAt = timestampMs(eventTimestamp);
+    state.activeTools[key] = {
       source,
       tool,
       callId,
       runId,
       parentRunId,
-      startedAt: timestampMs(event.timestamp),
+      startedAt,
       phase: "running",
+      turnId,
     };
+    state.timeline.push({
+      kind: "tool",
+      source,
+      text: tool,
+      status: "running",
+      runId,
+      parentRunId,
+      turnId,
+      callId,
+      tool,
+      toolPhase: "running",
+      startedAt,
+    });
     state.running = true;
     state.activeText = `正在调用工具 ${tool}`;
-    state.activeStartedAt = state.activeTools[toolKey(runId, callId)].startedAt;
+    state.activeStartedAt = startedAt;
     return;
   }
 
@@ -190,7 +246,7 @@ export function applyAgentEvent(state: RunState, event: AgentEvent): void {
     if (!callId) {
       return;
     }
-    const key = toolKey(runId, callId);
+    const key = toolKey(turnId, runId, callId);
     const existing = state.activeTools[key];
     const tool = normalizeText(payload.tool) || existing?.tool || "unknown_tool";
     state.activeTools[key] = {
@@ -199,18 +255,24 @@ export function applyAgentEvent(state: RunState, event: AgentEvent): void {
       callId,
       runId,
       parentRunId,
-      startedAt: existing?.startedAt ?? timestampMs(event.timestamp),
+      startedAt: existing?.startedAt ?? timestampMs(eventTimestamp),
       phase: "background",
+      turnId,
     };
+    const toolItem = findToolItem(state, turnId, runId, callId);
+    if (toolItem) {
+      toolItem.status = "background";
+      toolItem.toolPhase = "background";
+    }
     state.running = true;
-    state.activeText = `后台执行工具 ${tool}`;
+    state.activeText = `正在调用工具 ${tool}`;
     state.activeStartedAt = state.activeTools[key].startedAt;
     return;
   }
 
   if (type === "tool_end") {
     const callId = normalizeText(payload.call_id) || normalizeText(payload.callId);
-    const key = toolKey(runId, callId);
+    const key = toolKey(turnId, runId, callId);
     const active = state.activeTools[key];
     if (active) {
       delete state.activeTools[key];
@@ -218,15 +280,34 @@ export function applyAgentEvent(state: RunState, event: AgentEvent): void {
 
     const tool = normalizeText(payload.tool) || active?.tool || "unknown_tool";
     const status = toolStatus(payload);
-    const elapsed = elapsedSeconds(active?.startedAt, event.timestamp);
-    state.timeline.push({
-      kind: "tool",
-      source,
-      text: toolCompletionText(status, tool, elapsed),
-      status,
-      runId,
-      parentRunId,
-    });
+    const finishedAt = timestampMs(eventTimestamp);
+    const existingTool = findToolItem(state, turnId, runId, callId);
+    if (existingTool) {
+      existingTool.text = toolCompletionText(
+        status,
+        tool,
+        elapsedSeconds(existingTool.startedAt, eventTimestamp),
+      );
+      existingTool.status = status;
+      existingTool.tool = tool;
+      existingTool.toolPhase = terminalToolPhase(status);
+      existingTool.finishedAt = finishedAt;
+    } else {
+      state.timeline.push({
+        kind: "tool",
+        source,
+        text: tool,
+        status,
+        runId,
+        parentRunId,
+        turnId,
+        callId,
+        tool,
+        toolPhase: terminalToolPhase(status),
+        startedAt: active?.startedAt ?? finishedAt,
+        finishedAt,
+      });
+    }
     refreshRunningText(state);
     return;
   }
@@ -277,11 +358,8 @@ export function applyAgentEvent(state: RunState, event: AgentEvent): void {
     if (!delta) {
       return;
     }
-    const startsNewReply = Boolean(runId && state.finalRunIds[runId]);
-    if (startsNewReply) {
-      delete state.finalRunIds[runId];
-    }
-    const existing = startsNewReply ? undefined : findAssistantItem(state, source, runId);
+    const candidate = findAssistantItem(state, source, runId, turnId);
+    const existing = candidate?.status === "final" ? undefined : candidate;
     if (existing) {
       existing.text += delta;
     } else {
@@ -291,6 +369,7 @@ export function applyAgentEvent(state: RunState, event: AgentEvent): void {
         text: delta,
         runId,
         parentRunId,
+        turnId,
       });
     }
     state.running = true;
@@ -307,18 +386,17 @@ export function applyAgentEvent(state: RunState, event: AgentEvent): void {
   }
 
   if (type === "final") {
-    if (runId) {
-      if (state.finalRunIds[runId]) {
-        return;
-      }
-      state.finalRunIds[runId] = true;
-    }
-
     const text = normalizeText(payload.text);
     if (text) {
-      const existing = runId ? findAssistantItem(state, source, runId) : undefined;
+      const existing = turnId || runId
+        ? findAssistantItem(state, source, runId, turnId)
+        : undefined;
+      if (!turnId && existing?.status === "final") {
+        return;
+      }
       if (existing) {
         existing.text = text;
+        existing.status = "final";
       } else {
         state.timeline.push({
           kind: "assistant",
@@ -326,6 +404,8 @@ export function applyAgentEvent(state: RunState, event: AgentEvent): void {
           text,
           runId,
           parentRunId,
+          turnId,
+          status: "final",
         });
       }
     }
@@ -349,10 +429,21 @@ export function applyAgentEvent(state: RunState, event: AgentEvent): void {
   });
 }
 
-function findAssistantItem(state: RunState, source: string, runId: string): TimelineItem | undefined {
+function findAssistantItem(
+  state: RunState,
+  source: string,
+  runId: string,
+  turnId: string | null,
+): TimelineItem | undefined {
   for (let index = state.timeline.length - 1; index >= 0; index -= 1) {
     const item = state.timeline[index];
     if (item.kind !== "assistant" || item.source !== source) {
+      continue;
+    }
+    if (turnId) {
+      if (item.turnId === turnId) {
+        return item;
+      }
       continue;
     }
     if (runId) {
@@ -366,6 +457,21 @@ function findAssistantItem(state: RunState, source: string, runId: string): Time
     }
   }
   return undefined;
+}
+
+function findToolItem(
+  state: RunState,
+  turnId: string | null,
+  runId: string,
+  callId: string,
+): TimelineItem | undefined {
+  return state.timeline.find(
+    (item) =>
+      item.kind === "tool" &&
+      item.callId === callId &&
+      item.runId === runId &&
+      item.turnId === turnId,
+  );
 }
 
 function findActivityItem(state: RunState, activityId: string): TimelineItem | undefined {
@@ -422,9 +528,7 @@ function refreshRunningText(state: RunState): void {
   const activeTool = Object.values(state.activeTools)[0];
   if (activeTool) {
     state.running = true;
-    state.activeText = activeTool.phase === "background"
-      ? `后台执行工具 ${activeTool.tool}`
-      : `正在调用工具 ${activeTool.tool}`;
+    state.activeText = `正在调用工具 ${activeTool.tool}`;
     state.activeStartedAt = activeTool.startedAt;
     return;
   }
@@ -542,11 +646,17 @@ function isAgentScopeRouterSource(source: string): boolean {
 }
 
 function toolStatus(payload: Record<string, unknown>): string {
+  if (payload.ok === false) {
+    return "failed";
+  }
   const status = normalizeText(payload.status);
-  if (status) {
+  if (status === "completed" || status === "failed" || status === "interrupted") {
     return status;
   }
-  return payload.ok === false ? "failed" : "completed";
+  if (payload.ok === true) {
+    return "completed";
+  }
+  return "failed";
 }
 
 function toolCompletionText(status: string, tool: string, elapsed: number): string {
@@ -579,8 +689,15 @@ function agentKey(runId: string, source: string): string {
   return runId || source || "main";
 }
 
-function toolKey(runId: string, callId: string): string {
-  return `${runId}\u0000${callId}`;
+function toolKey(turnId: string | null, runId: string, callId: string): string {
+  return turnId ? `${turnId}\u0000${runId}\u0000${callId}` : `${runId}\u0000${callId}`;
+}
+
+function terminalToolPhase(status: string): TimelineItem["toolPhase"] {
+  if (status === "completed" || status === "interrupted") {
+    return status;
+  }
+  return "failed";
 }
 
 function normalizeNullableText(value: unknown): string | null {
