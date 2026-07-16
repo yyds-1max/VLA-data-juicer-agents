@@ -38,6 +38,7 @@ export interface ActiveTool {
   runId: string;
   parentRunId: string | null;
   startedAt: number;
+  phase: "running" | "background";
 }
 
 export interface RunState {
@@ -176,10 +177,34 @@ export function applyAgentEvent(state: RunState, event: AgentEvent): void {
       runId,
       parentRunId,
       startedAt: timestampMs(event.timestamp),
+      phase: "running",
     };
     state.running = true;
     state.activeText = `正在调用工具 ${tool}`;
     state.activeStartedAt = state.activeTools[toolKey(runId, callId)].startedAt;
+    return;
+  }
+
+  if (type === "tool_background") {
+    const callId = normalizeText(payload.call_id) || normalizeText(payload.callId);
+    if (!callId) {
+      return;
+    }
+    const key = toolKey(runId, callId);
+    const existing = state.activeTools[key];
+    const tool = normalizeText(payload.tool) || existing?.tool || "unknown_tool";
+    state.activeTools[key] = {
+      source,
+      tool,
+      callId,
+      runId,
+      parentRunId,
+      startedAt: existing?.startedAt ?? timestampMs(event.timestamp),
+      phase: "background",
+    };
+    state.running = true;
+    state.activeText = `后台执行工具 ${tool}`;
+    state.activeStartedAt = state.activeTools[key].startedAt;
     return;
   }
 
@@ -397,7 +422,9 @@ function refreshRunningText(state: RunState): void {
   const activeTool = Object.values(state.activeTools)[0];
   if (activeTool) {
     state.running = true;
-    state.activeText = `正在调用工具 ${activeTool.tool}`;
+    state.activeText = activeTool.phase === "background"
+      ? `后台执行工具 ${activeTool.tool}`
+      : `正在调用工具 ${activeTool.tool}`;
     state.activeStartedAt = activeTool.startedAt;
     return;
   }
@@ -440,6 +467,9 @@ function clearMatchingActiveRun(state: RunState, runId: string, source: string):
   }
 
   for (const [key, tool] of Object.entries(state.activeTools)) {
+    if (tool.phase === "background") {
+      continue;
+    }
     if (tool.runId === runId || (!tool.runId && tool.source === source)) {
       delete state.activeTools[key];
     }

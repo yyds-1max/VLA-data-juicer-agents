@@ -27,6 +27,7 @@ def test_from_env_reads_required_values_and_defaults(monkeypatch, tmp_path):
     assert config.main_router_agent_id == "main-router-agent"
     assert config.navigation_agent_id == "navigation-data-agent"
     assert config.agentscope_mount_path == "/api/agentscope"
+    assert config.tool_background_threshold_secs == 10.0
 
 
 def test_from_env_uses_separate_router_and_navigation_models(monkeypatch, tmp_path):
@@ -48,6 +49,30 @@ def test_from_env_uses_separate_router_and_navigation_models(monkeypatch, tmp_pa
     assert config.router_model == "qwen-router"
     assert config.navigation_model == "qwen-navigation"
     assert config.agentscope_mount_path == "/agentscope"
+
+
+def test_from_env_reads_tool_background_threshold(monkeypatch, tmp_path):
+    monkeypatch.setenv("DASHSCOPE_API_KEY", "test-key")
+    monkeypatch.setenv("VLA_AGENT_MODEL", "qwen-default")
+    monkeypatch.setenv("VLA_AGENT_TOOL_BACKGROUND_THRESHOLD_SECS", "12.5")
+
+    config = AgentScopeRuntimeConfig.from_env(workspace_root=tmp_path)
+
+    assert config.tool_background_threshold_secs == 12.5
+
+
+@pytest.mark.parametrize("value", ["0", "-1", "invalid"])
+def test_from_env_rejects_invalid_tool_background_threshold(
+    monkeypatch,
+    tmp_path,
+    value,
+):
+    monkeypatch.setenv("DASHSCOPE_API_KEY", "test-key")
+    monkeypatch.setenv("VLA_AGENT_MODEL", "qwen-default")
+    monkeypatch.setenv("VLA_AGENT_TOOL_BACKGROUND_THRESHOLD_SECS", value)
+
+    with pytest.raises(ValueError, match="positive number"):
+        AgentScopeRuntimeConfig.from_env(workspace_root=tmp_path)
 
 
 def test_from_env_requires_dashscope_api_key(monkeypatch):

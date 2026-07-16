@@ -18,6 +18,8 @@ source .venv/bin/activate
 pip install -e ".[dev]"
 export DASHSCOPE_API_KEY="sk-..."
 export VLA_AGENT_MODEL="qwen3.5-plus"
+# Optional; long AgentScope tools move to background after 10 seconds by default.
+export VLA_AGENT_TOOL_BACKGROUND_THRESHOLD_SECS="10"
 ```
 
 The Agent runtime stays on Python 3.12 with AgentScope and native DashScope/Qwen model support. Legacy ROS2/CUDA/GUI/tracking scripts run in a separate subprocess runtime:

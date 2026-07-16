@@ -4,10 +4,11 @@ import asyncio
 import inspect
 import json
 import sqlite3
+import time
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path
-from threading import Barrier
+from threading import Barrier, Event, Timer
 from types import SimpleNamespace
 
 import pytest
@@ -391,6 +392,43 @@ def test_plan_bound_tools_expose_only_ids_and_all_remaining_distinct_actions(tmp
         assert set(tool.input_schema["properties"]) == {"plan_id", "step_id"}
         assert set(tool.input_schema["required"]) == {"plan_id", "step_id"}
         assert tool.input_schema["additionalProperties"] is False
+
+
+@pytest.mark.asyncio
+async def test_plan_bound_execution_tool_does_not_block_event_loop(monkeypatch, tmp_path):
+    services = build_services(tmp_path)
+    started = Event()
+    release = Event()
+
+    def blocking_extract(**_kwargs):
+        started.set()
+        release.wait(timeout=1)
+        return ok_result("extract_and_sync_navigation_data")
+
+    monkeypatch.setattr(
+        plan_execution,
+        "extract_and_sync_navigation_data",
+        blocking_extract,
+    )
+    tool = services.tools()["extract_and_sync_navigation_data_tool"]
+    timer = Timer(0.25, release.set)
+    timer.start()
+    started_at = time.monotonic()
+    try:
+        invocation = asyncio.create_task(
+            tool(plan_id=services.plan.plan_id, step_id="sync")
+        )
+        while not started.is_set():
+            await asyncio.sleep(0)
+        await asyncio.sleep(0.02)
+        heartbeat_elapsed = time.monotonic() - started_at
+        result = _decode_tool_payload(await invocation)
+    finally:
+        release.set()
+        timer.cancel()
+
+    assert heartbeat_elapsed < 0.15
+    assert result["ok"] is True
 
 
 @pytest.mark.parametrize(

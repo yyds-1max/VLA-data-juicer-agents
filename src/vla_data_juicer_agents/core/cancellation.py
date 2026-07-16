@@ -3,7 +3,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import threading
-from collections.abc import AsyncIterator, Iterator
+from collections.abc import AsyncIterator, Callable, Iterator
 from contextlib import asynccontextmanager, contextmanager
 from contextvars import ContextVar
 from typing import Any
@@ -21,6 +21,8 @@ class CancellationContext:
         self._cancelled = threading.Event()
         self._lock = threading.RLock()
         self._agents: dict[object, tuple[asyncio.Task[Any], asyncio.AbstractEventLoop]] = {}
+        self._background_operations: set[object] = set()
+        self._background_idle_callbacks: list[Callable[[], None]] = []
 
     @property
     def cancelled(self) -> bool:
@@ -46,6 +48,50 @@ class CancellationContext:
             except RuntimeError:
                 _logger.debug("Event loop closed while scheduling task cancellation")
         return True
+
+    @property
+    def has_background_operations(self) -> bool:
+        with self._lock:
+            return bool(self._background_operations)
+
+    def begin_background_operation(self) -> object:
+        """Retain this cancellation context until external work really stops."""
+        token = object()
+        with self._lock:
+            self._background_operations.add(token)
+        try:
+            self.raise_if_cancelled()
+        except BaseException:
+            self.end_background_operation(token)
+            raise
+        return token
+
+    def end_background_operation(self, token: object) -> None:
+        callbacks: list[Callable[[], None]] = []
+        with self._lock:
+            if token not in self._background_operations:
+                return
+            self._background_operations.remove(token)
+            if not self._background_operations:
+                callbacks = self._background_idle_callbacks
+                self._background_idle_callbacks = []
+        for callback in callbacks:
+            callback()
+
+    @contextmanager
+    def track_background_operation(self) -> Iterator[None]:
+        token = self.begin_background_operation()
+        try:
+            yield
+        finally:
+            self.end_background_operation(token)
+
+    def when_background_idle(self, callback: Callable[[], None]) -> None:
+        with self._lock:
+            if self._background_operations:
+                self._background_idle_callbacks.append(callback)
+                return
+        callback()
 
     @asynccontextmanager
     async def track_agent(self, agent: Any) -> AsyncIterator[None]:

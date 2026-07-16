@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import re
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import Any
 from uuid import uuid4
@@ -253,6 +254,17 @@ class PublicActivityProjector:
         self._pending_step = None
         self._emit_step(step)
 
+    def tool_background(self, call_id: str, tool_name: str) -> None:
+        step = self._tool_steps.pop(call_id, None)
+        if step is None:
+            self.tool_started(call_id, tool_name)
+            step = self._tool_steps.pop(call_id)
+        step = dict(step)
+        step["status"] = "background"
+        step.setdefault("observation", "这一步已转入后台，完成后会继续处理结果。")
+        self._pending_step = None
+        self._emit_step(step, activity_status="background")
+
     def waiting_for_user(self) -> None:
         step = self._pending_step
         if step is None:
@@ -341,6 +353,7 @@ class AgentScopeEventAdapter:
         public_tool_events: bool = False,
         suppress_pre_tool_text: bool = False,
         activity_title: str = "正在分析并处理请求",
+        background_status_resolver: Callable[[str, str], str] | None = None,
     ) -> None:
         self._scope = scope
         self._emit_tool_events = emit_tool_events
@@ -361,6 +374,8 @@ class AgentScopeEventAdapter:
             activity_projector=self._activity_projector,
         )
         self._reply_text: list[str] = []
+        self._background_tools: dict[str, str] = {}
+        self._background_status_resolver = background_status_resolver
 
     def accept(self, event: object) -> None:
         event_type = _event_type(event)
@@ -397,24 +412,34 @@ class AgentScopeEventAdapter:
             state = self._tools.pop(call_id, _ToolState())
             if state.started:
                 result_text = "".join(state.result)
+                status = self._tool_status(getattr(event, "state", "success"), result_text)
                 payload = {
                     "tool": state.name,
                     "call_id": call_id,
-                    "status": self._tool_status(getattr(event, "state", "success"), result_text),
+                    "status": status,
                 }
                 if self._emit_tool_events:
-                    if not self._public_tool_events:
-                        payload["summary"] = summarize_progress(result_text)
-                        error_type = _result_payload_error_type(result_text)
-                        if error_type:
-                            payload["error_type"] = error_type
-                    self._scope.emit("tool_end", **payload)
-                if self._activity_projector is not None:
+                    if status == "background":
+                        self._scope.emit("tool_background", **payload)
+                    else:
+                        if not self._public_tool_events:
+                            payload["summary"] = summarize_progress(result_text)
+                            error_type = _result_payload_error_type(result_text)
+                            if error_type:
+                                payload["error_type"] = error_type
+                        self._scope.emit("tool_end", **payload)
+                if status == "background":
+                    self._background_tools[call_id] = state.name
+                    if self._activity_projector is not None:
+                        self._activity_projector.tool_background(call_id, state.name)
+                elif self._activity_projector is not None:
                     self._activity_projector.tool_finished(
                         call_id,
                         state.name,
                         str(payload["status"]),
                     )
+        elif event_type == "HINT_BLOCK":
+            self._handle_hint_block(event)
         elif event_type == "REQUIRE_EXTERNAL_EXECUTION":
             self._handle_require_external_execution(event)
 
@@ -475,7 +500,9 @@ class AgentScopeEventAdapter:
             self._reply_text.append(rendered)
         if self._emit_final_events and self._reply_text:
             if self._activity_projector is not None:
-                self._activity_projector.finish("completed")
+                self._activity_projector.finish(
+                    "background" if self._background_tools else "completed"
+                )
             self._scope.emit("final", text="".join(self._reply_text))
         self._reply_text.clear()
 
@@ -487,6 +514,8 @@ class AgentScopeEventAdapter:
 
     @staticmethod
     def _tool_status(state: object, result_text: str = "") -> str:
+        if _is_background_placeholder(result_text):
+            return "background"
         value = getattr(state, "value", state)
         normalized = _text(value).lower()
         if normalized == "interrupted":
@@ -494,6 +523,25 @@ class AgentScopeEventAdapter:
         if normalized in {"success", "completed"} and not _result_payload_failed(result_text):
             return "completed"
         return "failed"
+
+    def _handle_hint_block(self, event: object) -> None:
+        identity = _background_hint_identity(getattr(event, "source", None))
+        if identity is None:
+            return
+        tool_name, call_id = identity
+        status = _background_hint_status(getattr(event, "hint", ""))
+        if status is None and self._background_status_resolver is not None:
+            status = self._background_status_resolver(tool_name, call_id)
+        if status not in {"completed", "failed", "interrupted"}:
+            status = "failed"
+        self._background_tools.pop(call_id, None)
+        if self._emit_tool_events:
+            self._scope.emit(
+                "tool_end",
+                tool=tool_name,
+                call_id=call_id,
+                status=status,
+            )
 
     def _handle_require_external_execution(self, event: object) -> None:
         reply_id = _text(getattr(event, "reply_id", ""))
@@ -619,6 +667,91 @@ def _result_payload_error_type(result_text: str) -> str:
     if not error_type and isinstance(payload.get("details"), dict):
         error_type = payload["details"].get("error_type")
     return error_type.strip() if isinstance(error_type, str) else ""
+
+
+def _is_background_placeholder(result_text: str) -> bool:
+    normalized = result_text.lower()
+    return (
+        "<system-reminder>" in normalized
+        and "running in background" in normalized
+        and "you will be notified automatically" in normalized
+    ) or (
+        "<system-reminder>" in normalized
+        and "running in background" in normalized
+        and "for over" in normalized
+    )
+
+
+def _background_hint_identity(source: object) -> tuple[str, str] | None:
+    if not isinstance(source, str):
+        return None
+    try:
+        payload = json.loads(source)
+    except json.JSONDecodeError:
+        return None
+    if not isinstance(payload, dict) or payload.get("label") != "tool_output":
+        return None
+    sublabel = payload.get("sublabel")
+    if not isinstance(sublabel, str) or " · " not in sublabel:
+        return None
+    tool_name, call_id = sublabel.rsplit(" · ", 1)
+    tool_name = tool_name.strip()
+    call_id = call_id.strip()
+    if not tool_name or not call_id:
+        return None
+    return tool_name, call_id
+
+
+def _background_hint_status(hint: object) -> str | None:
+    text = _hint_text(hint)
+    payload = _embedded_result_payload(text)
+    if isinstance(payload, dict):
+        if payload.get("ok") is False:
+            error_type = payload.get("error_type")
+            if not error_type and isinstance(payload.get("details"), dict):
+                error_type = payload["details"].get("error_type")
+            return "interrupted" if error_type == "turn_cancelled" else "failed"
+        if payload.get("ok") is True:
+            return "completed"
+        status = payload.get("status")
+        if status in {"completed", "failed", "interrupted"}:
+            return str(status)
+    if "has completed with no output" in text.lower():
+        return "completed"
+    return None
+
+
+def _hint_text(hint: object) -> str:
+    if isinstance(hint, str):
+        return hint
+    if not isinstance(hint, list):
+        return ""
+    parts: list[str] = []
+    for block in hint:
+        if isinstance(block, dict):
+            value = block.get("text")
+        else:
+            value = getattr(block, "text", None)
+        if isinstance(value, str):
+            parts.append(value)
+    return "".join(parts)
+
+
+def _embedded_result_payload(text: str) -> dict[str, Any] | None:
+    marker = "Result:\n\n"
+    start = text.find(marker)
+    if start < 0:
+        return None
+    candidate = text[start + len(marker) :]
+    end = candidate.rfind("</system-notification>")
+    if end >= 0:
+        candidate = candidate[:end]
+    candidate = candidate.strip()
+    try:
+        payload = json.loads(candidate)
+    except json.JSONDecodeError:
+        return None
+    return payload if isinstance(payload, dict) else None
 
 
 def _external_tool_input(value: object) -> dict[str, Any]:

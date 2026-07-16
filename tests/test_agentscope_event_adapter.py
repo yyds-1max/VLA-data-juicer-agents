@@ -445,6 +445,124 @@ def test_tool_result_success_with_false_ok_payload_maps_failed():
     assert "Tracking failed." in events[-1]["payload"]["summary"]
 
 
+def test_offloaded_tool_placeholder_emits_background_not_completed():
+    scope, events = _scope_and_events()
+    adapter = AgentScopeEventAdapter(
+        scope,
+        emit_tool_events=True,
+        emit_final_events=True,
+        emit_activity_events=True,
+        public_tool_events=True,
+    )
+    placeholder = (
+        "<system-reminder>Tool 'extract_and_sync_navigation_data_tool' is "
+        "running in background (id=bg-1) for over 10.0s.</system-reminder>"
+    )
+
+    adapter.accept(
+        SimpleNamespace(
+            type="TOOL_RESULT_START",
+            tool_call_id="call-1",
+            tool_call_name="extract_and_sync_navigation_data_tool",
+        )
+    )
+    adapter.accept(
+        SimpleNamespace(
+            type="TOOL_RESULT_TEXT_DELTA",
+            tool_call_id="call-1",
+            delta=placeholder,
+        )
+    )
+    adapter.accept(SimpleNamespace(type="TOOL_RESULT_END", tool_call_id="call-1", state="success"))
+    adapter.accept(SimpleNamespace(type="TEXT_BLOCK_DELTA", delta="任务已转入后台。"))
+    adapter.accept(SimpleNamespace(type="REPLY_END"))
+
+    assert [event["type"] for event in events] == [
+        "tool_start",
+        "activity_snapshot",
+        "tool_background",
+        "activity_delta",
+        "activity_delta",
+        "final",
+    ]
+    assert events[2]["payload"] == {
+        "tool": "extract_and_sync_navigation_data_tool",
+        "call_id": "call-1",
+        "status": "background",
+    }
+    assert events[-2]["payload"]["status"] == "background"
+
+
+@pytest.mark.parametrize(("ok", "status"), [(True, "completed"), (False, "failed")])
+def test_background_hint_emits_real_terminal_status_with_original_call_id(ok, status):
+    scope, events = _scope_and_events()
+    adapter = AgentScopeEventAdapter(scope, public_tool_events=True)
+    result = json.dumps({"ok": ok, "status": status}, ensure_ascii=False)
+
+    adapter.accept(
+        SimpleNamespace(
+            type="HINT_BLOCK",
+            source=json.dumps(
+                {
+                    "label": "tool_output",
+                    "sublabel": "extract_and_sync_navigation_data_tool · call-1",
+                }
+            ),
+            hint=(
+                "<system-notification>Tool "
+                "'extract_and_sync_navigation_data_tool' running in background "
+                f"(id=call-1) has completed.\n\nResult:\n\n{result}"
+                "</system-notification>"
+            ),
+        )
+    )
+
+    assert events == [
+        {
+            **events[0],
+            "type": "tool_end",
+            "payload": {
+                "tool": "extract_and_sync_navigation_data_tool",
+                "call_id": "call-1",
+                "status": status,
+            },
+        }
+    ]
+
+
+def test_unparseable_background_hint_uses_durable_status_resolver():
+    scope, events = _scope_and_events()
+    resolutions = []
+    adapter = AgentScopeEventAdapter(
+        scope,
+        public_tool_events=True,
+        background_status_resolver=lambda tool, call_id: resolutions.append(
+            (tool, call_id)
+        )
+        or "failed",
+    )
+
+    adapter.accept(
+        SimpleNamespace(
+            type="HINT_BLOCK",
+            source=json.dumps(
+                {
+                    "label": "tool_output",
+                    "sublabel": "extract_and_sync_navigation_data_tool · call-1",
+                }
+            ),
+            hint="background result could not be decoded",
+        )
+    )
+
+    assert resolutions == [("extract_and_sync_navigation_data_tool", "call-1")]
+    assert events[0]["payload"] == {
+        "tool": "extract_and_sync_navigation_data_tool",
+        "call_id": "call-1",
+        "status": "failed",
+    }
+
+
 def test_tool_result_end_includes_error_type_from_full_json_details():
     scope, events = _scope_and_events()
     adapter = AgentScopeEventAdapter(scope)

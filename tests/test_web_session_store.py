@@ -104,6 +104,119 @@ def test_store_persists_timeline_events(tmp_path: Path):
     assert detail.events[1].type == "tool_end"
 
 
+def test_store_commits_projected_batch_final_and_cursor_atomically_and_idempotently(
+    tmp_path: Path,
+):
+    store = WebSessionStore(tmp_path / "sessions.sqlite")
+    session = store.create_session(title="background wakeup")
+    store.save_agentscope_session_mapping(
+        session.id,
+        agent_id="navigation-data-agent",
+        agentscope_session_id="as-navigation",
+    )
+    events = [
+        {
+            "type": "activity_delta",
+            "source": "agentscope",
+            "run_id": "as-navigation",
+            "payload": {"activity_id": "activity-1", "status": "completed"},
+        },
+        {
+            "type": "final",
+            "source": "agentscope",
+            "run_id": "as-navigation",
+            "payload": {"text": "后台任务已经完成。"},
+        },
+    ]
+
+    first = store.append_projected_event_batch(
+        web_session_id=session.id,
+        agentscope_session_id="as-navigation",
+        entry_id="9-0",
+        events=events,
+    )
+    second = store.append_projected_event_batch(
+        web_session_id=session.id,
+        agentscope_session_id="as-navigation",
+        entry_id="9-0",
+        events=events,
+    )
+
+    detail = store.get_session(session.id)
+    mapping = store.get_agentscope_session_mapping(session.id)
+    assert [event.type for event in first] == ["activity_delta", "final"]
+    assert second == []
+    assert detail is not None
+    assert [event.type for event in detail.events] == ["activity_delta", "final"]
+    assert [(message.role, message.content) for message in detail.messages] == [
+        ("assistant", "后台任务已经完成。")
+    ]
+    assert mapping is not None
+    assert mapping.event_cursor == "9-0"
+
+
+def test_store_lists_all_agentscope_mappings_for_bridge_recovery(tmp_path: Path):
+    store = WebSessionStore(tmp_path / "sessions.sqlite")
+    session = store.create_session(title="mapping recovery")
+    store.save_agentscope_session_mapping(
+        session.id,
+        agent_id="main-router-agent",
+        agentscope_session_id="as-main",
+    )
+    store.save_agentscope_session_mapping(
+        session.id,
+        agent_id="navigation-data-agent",
+        agentscope_session_id="as-navigation",
+    )
+
+    mappings = store.list_agentscope_session_mappings()
+
+    assert [mapping.agentscope_session_id for mapping in mappings] == [
+        "as-main",
+        "as-navigation",
+    ]
+
+
+def test_store_reconciles_orphaned_background_tool_once(tmp_path: Path):
+    store = WebSessionStore(tmp_path / "sessions.sqlite")
+    session = store.create_session(title="background reconciliation")
+    store.save_agentscope_session_mapping(
+        session.id,
+        agent_id="navigation-data-agent",
+        agentscope_session_id="as-navigation",
+    )
+    store.append_projected_event_batch(
+        web_session_id=session.id,
+        agentscope_session_id="as-navigation",
+        entry_id="10-0",
+        events=[
+            {
+                "type": "tool_background",
+                "source": "agentscope",
+                "run_id": "as-navigation",
+                "payload": {
+                    "tool": "extract_and_sync_navigation_data_tool",
+                    "call_id": "call-background",
+                    "status": "background",
+                },
+            }
+        ],
+    )
+
+    unresolved = store.list_unresolved_background_tools()
+    first = store.append_background_tool_reconciliation(unresolved[0], status="failed")
+    second = store.append_background_tool_reconciliation(unresolved[0], status="failed")
+
+    assert first is not None
+    assert first.payload == {
+        "tool": "extract_and_sync_navigation_data_tool",
+        "call_id": "call-background",
+        "status": "failed",
+    }
+    assert second is None
+    assert store.list_unresolved_background_tools() == []
+
+
 def test_store_deduplicates_human_decision_required_events(tmp_path: Path):
     store = WebSessionStore(tmp_path / "sessions.sqlite")
     session = store.create_session(title="处理 20270605 的室外导航数据")

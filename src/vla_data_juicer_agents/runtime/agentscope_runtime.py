@@ -4,8 +4,10 @@ import asyncio
 import json
 import logging
 import re
+import time
 from contextlib import suppress
 from dataclasses import dataclass, field
+from functools import partial
 from types import SimpleNamespace
 from typing import Any
 from uuid import uuid4
@@ -18,6 +20,7 @@ from agentscope.event import ExternalExecutionResultEvent
 from agentscope.message import TextBlock, ToolCallState, ToolResultBlock, ToolResultState, UserMsg
 from agentscope.permission import PermissionBehavior, PermissionDecision
 from agentscope.tool import ToolBase, ToolChunk
+from agentscope.app.middleware import ToolOffloadMiddleware
 
 from vla_data_juicer_agents.adapters.agentscope import AgentScopeEventAdapter
 from vla_data_juicer_agents.capabilities.session.runtime import SessionToolRuntime
@@ -67,6 +70,14 @@ class AgentScopeRecoveryMetrics:
 
 
 @dataclass(frozen=True)
+class AgentScopeProjectedEventBatch:
+    entry_id: str
+    events: tuple[dict[str, Any], ...]
+    raw_event_type: str
+    projected_at_monotonic: float
+
+
+@dataclass(frozen=True)
 class NavigationTaskStartResult:
     task_id: str
     agentscope_session_id: str
@@ -86,6 +97,7 @@ class AgentScopeRuntime:
     web_sessions: dict[str, tuple[str, str]] = field(default_factory=dict)
     event_cursors: dict[str, str | None] = field(default_factory=dict)
     web_session_store: Any | None = None
+    web_event_bridge: Any | None = None
     _active_human_decision_claims: set[str] = field(default_factory=set)
     _run_cancellations: dict[str, CancellationContext] = field(default_factory=dict)
     recovery_metrics: AgentScopeRecoveryMetrics = field(default_factory=AgentScopeRecoveryMetrics)
@@ -107,18 +119,31 @@ class AgentScopeRuntime:
     def set_web_session_store(self, store: Any) -> None:
         self.web_session_store = store
 
+    def set_web_event_bridge(self, bridge: Any | None) -> None:
+        self.web_event_bridge = bridge
+
     def web_session_subscription_key(self, *, web_session_id: str) -> tuple[str, str] | None:
         return self._web_session_mapping(web_session_id)
 
     async def ensure_web_session(self, web_session_id: str, *, agent_id: str, model: str) -> str:
         existing = self.web_sessions.get(web_session_id)
         if existing and existing[0] == agent_id:
+            await self._ensure_web_event_bridge_mapping(
+                web_session_id=web_session_id,
+                agent_id=agent_id,
+                agentscope_session_id=existing[1],
+            )
             return existing[1]
 
         persisted = self._load_web_session_mapping(web_session_id, agent_id=agent_id)
         if persisted and persisted[0] == agent_id:
             self.web_sessions[web_session_id] = persisted
             self._save_web_session_mapping(web_session_id, agent_id, persisted[1])
+            await self._ensure_web_event_bridge_mapping(
+                web_session_id=web_session_id,
+                agent_id=agent_id,
+                agentscope_session_id=persisted[1],
+            )
             return persisted[1]
 
         session_id = f"{web_session_id}__{agent_id}"
@@ -139,7 +164,27 @@ class AgentScopeRuntime:
         )
         self.web_sessions[web_session_id] = (agent_id, session.id)
         self._save_web_session_mapping(web_session_id, agent_id, session.id)
+        await self._ensure_web_event_bridge_mapping(
+            web_session_id=web_session_id,
+            agent_id=agent_id,
+            agentscope_session_id=session.id,
+        )
         return session.id
+
+    async def _ensure_web_event_bridge_mapping(
+        self,
+        *,
+        web_session_id: str,
+        agent_id: str,
+        agentscope_session_id: str,
+    ) -> None:
+        ensure_mapping = getattr(self.web_event_bridge, "ensure_mapping", None)
+        if callable(ensure_mapping):
+            await ensure_mapping(
+                web_session_id=web_session_id,
+                agent_id=agent_id,
+                agentscope_session_id=agentscope_session_id,
+            )
 
     async def submit_user_message(self, *, web_session_id: str, message: str) -> str:
         await self.ensure_bootstrapped()
@@ -352,8 +397,83 @@ class AgentScopeRuntime:
         agentscope_session_id: str,
         cancellation: CancellationContext,
     ) -> None:
-        if self._run_cancellations.get(agentscope_session_id) is cancellation:
-            self._run_cancellations.pop(agentscope_session_id, None)
+        if self._run_cancellations.get(agentscope_session_id) is not cancellation:
+            return
+        if cancellation.has_background_operations:
+            cancellation.when_background_idle(
+                lambda: self.clear_run_cancellation(
+                    agentscope_session_id,
+                    cancellation,
+                ),
+            )
+            return
+        self._run_cancellations.pop(agentscope_session_id, None)
+
+    def reconcile_background_tool_status(
+        self,
+        *,
+        web_session_id: str,
+        agentscope_session_id: str,
+        tool: str,
+    ) -> str:
+        """Resolve an orphaned public background state from the durable ledger.
+
+        A process restart cannot prove that an in-memory worker is still alive.
+        Completed/failed staged results and ledger steps are authoritative; an
+        un-staged running claim is conservatively invalidated for replanning.
+        """
+        action = tool.removesuffix("_tool")
+        try:
+            plan_store = self._navigation_plan_store()
+            snapshot = plan_store.read_execution_snapshot(
+                web_session_id=web_session_id,
+                agentscope_session_id=agentscope_session_id,
+            )
+        except Exception:
+            _logger.exception(
+                "Background tool reconciliation ledger read failed: "
+                "web_session_id=%s agentscope_session_id=%s tool=%s",
+                web_session_id,
+                agentscope_session_id,
+                tool,
+            )
+            return "failed"
+        if snapshot is None or snapshot.overview is None:
+            return "failed"
+        matching_step = next(
+            (step for step in snapshot.overview.steps if step.action == action),
+            None,
+        )
+        if matching_step is None:
+            return "failed"
+        if snapshot.staged_result is not None and (
+            snapshot.staged_result.step_id == matching_step.step_id
+        ):
+            return snapshot.staged_result.target_status
+        if matching_step.status == "completed":
+            return "completed"
+        if matching_step.status in {"failed", "needs_replan"}:
+            return "failed"
+        if matching_step.status == "running" and snapshot.active_plan is not None:
+            try:
+                plan_store.recover_running_step_without_result(
+                    snapshot.active_plan.plan_id,
+                    matching_step.step_id,
+                    "service restarted while a background tool had no durable result",
+                    expected_action=matching_step.action,
+                    expected_web_session_id=web_session_id,
+                    expected_agentscope_session_id=agentscope_session_id,
+                )
+            except Exception:
+                _logger.exception(
+                    "Background tool reconciliation could not invalidate an "
+                    "unresolved running claim: web_session_id=%s "
+                    "agentscope_session_id=%s tool=%s",
+                    web_session_id,
+                    agentscope_session_id,
+                    tool,
+                )
+        return "failed"
 
     def record_navigation_handoff(self, payload: dict[str, Any]) -> None:
         _logger.info("Navigation handoff: %s", payload)
@@ -1241,53 +1361,69 @@ class AgentScopeRuntime:
             return None
         return entries[-1][0]
 
-    async def subscribe_web_session_events(self, *, web_session_id: str):
-        mapped = self._web_session_mapping(web_session_id)
-        if mapped is None:
-            return
-
-        agent_id, agentscope_session_id = mapped
+    async def subscribe_agentscope_session_event_batches(
+        self,
+        *,
+        web_session_id: str,
+        agent_id: str,
+        agentscope_session_id: str,
+        continuous: bool = True,
+        on_ready: Any | None = None,
+    ):
+        """Project one mapped AgentScope event stream into replay-safe batches."""
         translated_events: asyncio.Queue[dict[str, Any]] = asyncio.Queue()
         live_events: asyncio.Queue[dict[str, Any] | None] = asyncio.Queue()
         live_ready = asyncio.Event()
-        scope = EventEmitter(
-            CallbackEventSink(translated_events.put_nowait),
-            event_transform=SessionToolRuntime.redact_event,
-        ).scope(
-            "agentscope",
-            run_id=agentscope_session_id,
-        )
-        adapter = AgentScopeEventAdapter(
-            scope,
-            emit_tool_events=True,
-            emit_text_events=False,
-            emit_final_events=True,
-            emit_reasoning_events=False,
-            emit_activity_events=True,
-            public_tool_events=True,
-            suppress_pre_tool_text=True,
-            activity_title=(
-                "正在处理导航数据"
-                if agent_id == self.config.navigation_agent_id
-                else "正在分析请求"
-            ),
-        )
+        adapter: AgentScopeEventAdapter | None = None
         seen_entry_ids: set[str] = set()
         seen_pending_decision_states: dict[tuple[str, str], str] = {}
-        saw_event = False
-        saw_reply_end = False
-        saw_running = False
-        startup_deadline = asyncio.get_running_loop().time() + _EVENT_STARTUP_GRACE_SECS
         events_key = _session_events_key(self.message_bus, agentscope_session_id)
+
+        def new_adapter() -> AgentScopeEventAdapter:
+            scope = EventEmitter(
+                CallbackEventSink(translated_events.put_nowait),
+                event_transform=SessionToolRuntime.redact_event,
+            ).scope(
+                "agentscope",
+                run_id=agentscope_session_id,
+            )
+            return AgentScopeEventAdapter(
+                scope,
+                emit_tool_events=True,
+                emit_text_events=False,
+                emit_final_events=True,
+                emit_reasoning_events=False,
+                emit_activity_events=True,
+                public_tool_events=True,
+                suppress_pre_tool_text=True,
+                activity_title=(
+                    "正在处理导航数据"
+                    if agent_id == self.config.navigation_agent_id
+                    else "正在分析请求"
+                ),
+                background_status_resolver=lambda tool, _call_id: (
+                    self.reconcile_background_tool_status(
+                        web_session_id=web_session_id,
+                        agentscope_session_id=agentscope_session_id,
+                        tool=tool,
+                    )
+                ),
+            )
 
         async def feed_live_events() -> None:
             try:
+                def mark_ready() -> None:
+                    live_ready.set()
+                    if callable(on_ready):
+                        on_ready()
+
                 async for event in self.message_bus.subscribe(
                     events_key,
-                    on_ready=live_ready.set,
+                    on_ready=mark_ready,
                 ):
                     await live_events.put(event)
             finally:
+                live_ready.set()
                 await live_events.put(None)
 
         feeder_task = asyncio.create_task(
@@ -1296,6 +1432,9 @@ class AgentScopeRuntime:
         )
 
         def accept_raw_event(raw_event: dict[str, Any]) -> list[dict[str, Any]]:
+            nonlocal adapter
+            if adapter is None or _raw_event_type(raw_event) == "REPLY_START":
+                adapter = new_adapter()
             adapter.accept(_to_attribute_event(_strip_internal_event_fields(raw_event)))
             events = []
             while not translated_events.empty():
@@ -1343,17 +1482,33 @@ class AgentScopeRuntime:
             seen_pending_decision_states[identity] = state
             return True
 
-        try:
-            with suppress(TimeoutError):
-                await asyncio.wait_for(live_ready.wait(), timeout=_EVENT_STARTUP_GRACE_SECS)
-
-            pending_event = await self._pending_human_decision_event(
-                web_session_id=web_session_id,
-                agent_id=agent_id,
-                agentscope_session_id=agentscope_session_id,
+        def project(entry_id: str, raw_event: dict[str, Any]) -> AgentScopeProjectedEventBatch:
+            projected = []
+            for event in accept_raw_event(raw_event):
+                decision_key = (
+                    _human_decision_event_key(event)
+                    if event.get("type") == "human_decision_required"
+                    else ""
+                )
+                if decision_key and not should_emit_human_decision(event):
+                    continue
+                projected.append(event)
+            return AgentScopeProjectedEventBatch(
+                entry_id=entry_id,
+                events=tuple(projected),
+                raw_event_type=_raw_event_type(raw_event),
+                projected_at_monotonic=time.monotonic(),
             )
-            if pending_event is not None and should_emit_human_decision(pending_event):
-                yield pending_event
+
+        try:
+            if continuous:
+                await live_ready.wait()
+            else:
+                with suppress(TimeoutError):
+                    await asyncio.wait_for(
+                        live_ready.wait(),
+                        timeout=_EVENT_STARTUP_GRACE_SECS,
+                    )
 
             cursor = self._event_cursor(agentscope_session_id)
             for entry_id, raw_event in await self.message_bus.session_read_events(
@@ -1363,93 +1518,90 @@ class AgentScopeRuntime:
                 if not self._is_new_event(agentscope_session_id, entry_id):
                     continue
                 seen_entry_ids.add(entry_id)
-                saw_event = True
-                if _raw_event_type(raw_event) == "REPLY_END":
-                    saw_reply_end = True
-                for event in accept_raw_event(raw_event):
-                    decision_key = (
-                        _human_decision_event_key(event)
-                        if event.get("type") == "human_decision_required"
-                        else ""
-                    )
-                    if decision_key:
-                        if not should_emit_human_decision(event):
-                            continue
-                    yield event
-                self._remember_event_cursor(
-                    agentscope_session_id,
-                    entry_id,
-                )
+                batch = project(entry_id, raw_event)
+                yield batch
+                if not continuous and batch.raw_event_type == "REPLY_END":
+                    return
 
             while True:
-                running = bool(await self.message_bus.session_is_running(agentscope_session_id))
-                local_running = self._is_local_agent_run_active(agentscope_session_id)
-                saw_running = saw_running or running or local_running
-
-                live_feed_finished = False
-                try:
-                    raw_event = await asyncio.wait_for(
-                        live_events.get(),
-                        timeout=_EVENT_IDLE_POLL_SECS,
+                raw_event = await live_events.get()
+                if raw_event is None:
+                    break
+                entry_id = _raw_event_entry_id(raw_event)
+                if not entry_id:
+                    _logger.warning(
+                        "AgentScope live event missing replay entry id: session_id=%s type=%s",
+                        agentscope_session_id,
+                        _raw_event_type(raw_event),
                     )
-                except TimeoutError:
-                    raw_event = None
-                else:
-                    if raw_event is None:
-                        live_feed_finished = True
-                    else:
-                        entry_id = _raw_event_entry_id(raw_event)
-                        if entry_id and entry_id in seen_entry_ids:
-                            continue
-                        if entry_id:
-                            if not self._is_new_event(agentscope_session_id, entry_id):
-                                continue
-                            seen_entry_ids.add(entry_id)
-                        saw_event = True
-                        if _raw_event_type(raw_event) == "REPLY_END":
-                            saw_reply_end = True
-                        for event in accept_raw_event(raw_event):
-                            decision_key = (
-                                _human_decision_event_key(event)
-                                if event.get("type") == "human_decision_required"
-                                else ""
-                            )
-                            if decision_key:
-                                if not should_emit_human_decision(event):
-                                    continue
-                            yield event
-                        if entry_id:
-                            self._remember_event_cursor(
-                                agentscope_session_id,
-                                entry_id,
-                            )
-                        continue
-
-                pending_event = await self._pending_human_decision_event(
-                    web_session_id=web_session_id,
-                    agent_id=agent_id,
-                    agentscope_session_id=agentscope_session_id,
-                )
-                if pending_event is not None and should_emit_human_decision(pending_event):
-                    saw_event = True
-                    yield pending_event
                     continue
-                if live_feed_finished:
-                    break
-
-                now = asyncio.get_running_loop().time()
-                if running or local_running:
+                if entry_id in seen_entry_ids:
                     continue
-                if saw_reply_end:
-                    break
-                if saw_event and saw_running:
-                    break
-                if now >= startup_deadline:
-                    break
+                if not self._is_new_event(agentscope_session_id, entry_id):
+                    continue
+                seen_entry_ids.add(entry_id)
+                batch = project(entry_id, raw_event)
+                yield batch
+                if not continuous and batch.raw_event_type == "REPLY_END":
+                    return
         finally:
             feeder_task.cancel()
             with suppress(asyncio.CancelledError):
                 await feeder_task
+
+    async def subscribe_web_session_events(self, *, web_session_id: str):
+        mapped = self._web_session_mapping(web_session_id)
+        if mapped is None:
+            return
+        agent_id, agentscope_session_id = mapped
+        seen_pending_states: dict[tuple[str, str], str] = {}
+
+        def should_emit_pending(event: dict[str, Any] | None) -> bool:
+            identity = _human_decision_event_key(event)
+            if not identity:
+                return event is not None
+            payload = event.get("payload")
+            state = (
+                "recovery_required"
+                if isinstance(payload, dict) and payload.get("recovery_required") is True
+                else "normal"
+            )
+            previous = seen_pending_states.get(identity)
+            if previous == state or (previous == "recovery_required" and state == "normal"):
+                return False
+            seen_pending_states[identity] = state
+            return True
+
+        async def pending_update() -> dict[str, Any] | None:
+            event = await self._pending_human_decision_event(
+                web_session_id=web_session_id,
+                agent_id=agent_id,
+                agentscope_session_id=agentscope_session_id,
+            )
+            if not should_emit_pending(event):
+                return None
+            return event
+
+        if (pending := await pending_update()) is not None:
+            yield pending
+        async for batch in self.subscribe_agentscope_session_event_batches(
+            web_session_id=web_session_id,
+            agent_id=agent_id,
+            agentscope_session_id=agentscope_session_id,
+            continuous=False,
+        ):
+            for event in batch.events:
+                if (
+                    event.get("type") == "human_decision_required"
+                    and not should_emit_pending(event)
+                ):
+                    continue
+                yield event
+            self._remember_event_cursor(agentscope_session_id, batch.entry_id)
+            if (pending := await pending_update()) is not None:
+                yield pending
+        if (pending := await pending_update()) is not None:
+            yield pending
 
     def _is_local_agent_run_active(self, agentscope_session_id: str) -> bool:
         if self.run_cancellation(agentscope_session_id) is not None:
@@ -2464,6 +2616,16 @@ def build_extra_agent_middlewares_factory(
 
 
 def create_agentscope_runtime(config: AgentScopeRuntimeConfig) -> AgentScopeRuntime:
+    # AgentScope 2.0.1 constructs its standard offload middleware inside
+    # ChatService.run and does not expose this setting through create_app.
+    # Bind the pinned standard middleware constructor here instead of
+    # modifying the installed dependency.
+    from agentscope.app._service import _chat as agentscope_chat_service
+
+    agentscope_chat_service.ToolOffloadMiddleware = partial(
+        ToolOffloadMiddleware,
+        timeout_secs=config.tool_background_threshold_secs,
+    )
     redis_kwargs = config.redis_connection_kwargs()
     storage = RedisStorage(**redis_kwargs)
     message_bus = RedisMessageBus(**redis_kwargs)

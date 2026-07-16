@@ -33,6 +33,19 @@ def _bool_env(name: str, *, default: bool = False) -> bool:
     raise ValueError(f"{name} must be a boolean")
 
 
+def _positive_float_env(name: str, *, default: float) -> float:
+    value = _env(name)
+    if value is None:
+        return default
+    try:
+        parsed = float(value)
+    except ValueError as exc:
+        raise ValueError(f"{name} must be a positive number") from exc
+    if parsed <= 0:
+        raise ValueError(f"{name} must be a positive number")
+    return parsed
+
+
 @dataclass(frozen=True)
 class AgentScopeRuntimeConfig:
     user_id: str
@@ -48,6 +61,7 @@ class AgentScopeRuntimeConfig:
     navigation_agent_id: str = "navigation-data-agent"
     agentscope_mount_path: str = "/api/agentscope"
     navigation_dry_run: bool = False
+    tool_background_threshold_secs: float = 10.0
 
     def redis_connection_kwargs(self) -> dict[str, str | int | None]:
         parsed = urlparse(self.redis_url)
@@ -103,4 +117,8 @@ class AgentScopeRuntimeConfig:
             navigation_model=navigation_model_env or default_model,
             agentscope_mount_path=_env("VLA_AGENTSCOPE_MOUNT_PATH") or "/api/agentscope",
             navigation_dry_run=_bool_env("VLA_AGENT_NAVIGATION_DRY_RUN"),
+            tool_background_threshold_secs=_positive_float_env(
+                "VLA_AGENT_TOOL_BACKGROUND_THRESHOLD_SECS",
+                default=10.0,
+            ),
         )

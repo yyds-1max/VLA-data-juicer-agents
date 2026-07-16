@@ -408,6 +408,56 @@ describe("eventReducer", () => {
     expect(state.timeline[0].text).not.toContain("{");
   });
 
+  it("keeps a background tool active until its real terminal event", () => {
+    const state = createEmptyRunState();
+    applyAgentEvent(
+      state,
+      event("tool_start", "agentscope", {
+        call_id: "call-1",
+        tool: "extract_and_sync_navigation_data_tool",
+      }),
+    );
+    applyAgentEvent(
+      state,
+      event("tool_background", "agentscope", {
+        call_id: "call-1",
+        tool: "extract_and_sync_navigation_data_tool",
+        status: "background",
+      }),
+    );
+    applyAgentEvent(
+      state,
+      event("final", "agentscope", { text: "任务已转入后台。" }),
+    );
+
+    expect(state.activeTools["run-1\u0000call-1"]).toMatchObject({
+      tool: "extract_and_sync_navigation_data_tool",
+      phase: "background",
+    });
+    expect(state.activeText).toBe("后台执行工具 extract_and_sync_navigation_data_tool");
+    expect(state.timeline.filter((item) => item.kind === "tool")).toEqual([]);
+
+    applyAgentEvent(
+      state,
+      event(
+        "tool_end",
+        "agentscope",
+        {
+          call_id: "call-1",
+          tool: "extract_and_sync_navigation_data_tool",
+          status: "completed",
+        },
+        { timestamp: "2026-06-26T00:00:35.000Z" },
+      ),
+    );
+
+    expect(state.activeTools).toEqual({});
+    expect(state.timeline.find((item) => item.kind === "tool")).toMatchObject({
+      status: "completed",
+      text: "已调用工具 extract_and_sync_navigation_data_tool 35.0s",
+    });
+  });
+
   it("preserves child source and summary for folding", () => {
     const state = createEmptyRunState();
 

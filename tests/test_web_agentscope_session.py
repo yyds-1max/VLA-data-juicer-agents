@@ -115,6 +115,41 @@ class SwitchingEventingAgentScopeRuntime(FakeAgentScopeRuntime):
             }
 
 
+class PersistentBatchEventingRuntime(FakeAgentScopeRuntime):
+    def __init__(self) -> None:
+        super().__init__()
+        self.queue: asyncio.Queue[object] = asyncio.Queue()
+        self.subscriptions = 0
+        self.cursors: list[tuple[str, str]] = []
+
+    def set_web_session_store(self, store) -> None:
+        self.web_session_store = store
+
+    def set_web_event_bridge(self, bridge) -> None:
+        self.web_event_bridge = bridge
+
+    def _remember_event_cursor(self, session_id: str, cursor: str) -> None:
+        self.cursors.append((session_id, cursor))
+
+    async def subscribe_agentscope_session_event_batches(
+        self,
+        *,
+        web_session_id: str,
+        agent_id: str,
+        agentscope_session_id: str,
+        continuous: bool,
+        on_ready,
+    ):
+        del web_session_id, agent_id, agentscope_session_id, continuous
+        self.subscriptions += 1
+        on_ready()
+        while True:
+            batch = await self.queue.get()
+            if batch is None:
+                return
+            yield batch
+
+
 class RejectingAgentScopeRuntime(FakeAgentScopeRuntime):
     async def submit_user_message(self, *, web_session_id: str, message: str) -> str:
         self.submissions.append({"web_session_id": web_session_id, "message": message})
@@ -1605,6 +1640,87 @@ async def test_runtime_interrupt_web_session_cancels_registered_context() -> Non
     assert runtime.web_sessions["web-1"] == ("navigation-data-agent", "as-session-1")
 
 
+def test_runtime_retains_cancellation_until_background_operation_finishes() -> None:
+    runtime = _runtime(
+        chat_run_registry=FakeChatRunRegistry(),
+        message_bus=FakeAgentScopeMessageBus(),
+    )
+    cancellation = CancellationContext()
+    runtime.register_run_cancellation("as-session-1", cancellation)
+
+    with cancellation.track_background_operation():
+        runtime.clear_run_cancellation("as-session-1", cancellation)
+        assert runtime.run_cancellation("as-session-1") is cancellation
+
+    assert runtime.run_cancellation("as-session-1") is None
+
+
+def test_runtime_reconciles_unknown_running_background_tool_as_failed() -> None:
+    recovered: list[tuple] = []
+    step = SimpleNamespace(
+        action="extract_and_sync_navigation_data",
+        step_id="extract_sync",
+        status="running",
+    )
+    snapshot = SimpleNamespace(
+        overview=SimpleNamespace(steps=[step]),
+        staged_result=None,
+        active_plan=SimpleNamespace(plan_id="plan-1"),
+    )
+    plan_store = SimpleNamespace(
+        read_execution_snapshot=lambda **_kwargs: snapshot,
+        recover_running_step_without_result=lambda *args, **kwargs: recovered.append(
+            (args, kwargs)
+        ),
+    )
+    runtime = _runtime(
+        chat_run_registry=FakeChatRunRegistry(),
+        message_bus=FakeAgentScopeMessageBus(),
+    )
+    runtime._navigation_plan_store = lambda: plan_store
+
+    status = runtime.reconcile_background_tool_status(
+        web_session_id="web-1",
+        agentscope_session_id="as-session-1",
+        tool="extract_and_sync_navigation_data_tool",
+    )
+
+    assert status == "failed"
+    assert recovered[0][0][:2] == ("plan-1", "extract_sync")
+    assert recovered[0][1]["expected_action"] == "extract_and_sync_navigation_data"
+
+
+def test_runtime_reconciles_staged_background_result_from_durable_status() -> None:
+    step = SimpleNamespace(
+        action="extract_and_sync_navigation_data",
+        step_id="extract_sync",
+        status="running",
+    )
+    snapshot = SimpleNamespace(
+        overview=SimpleNamespace(steps=[step]),
+        staged_result=SimpleNamespace(
+            step_id="extract_sync",
+            target_status="completed",
+        ),
+        active_plan=SimpleNamespace(plan_id="plan-1"),
+    )
+    runtime = _runtime(
+        chat_run_registry=FakeChatRunRegistry(),
+        message_bus=FakeAgentScopeMessageBus(),
+    )
+    runtime._navigation_plan_store = lambda: SimpleNamespace(
+        read_execution_snapshot=lambda **_kwargs: snapshot,
+    )
+
+    status = runtime.reconcile_background_tool_status(
+        web_session_id="web-1",
+        agentscope_session_id="as-session-1",
+        tool="extract_and_sync_navigation_data_tool",
+    )
+
+    assert status == "completed"
+
+
 @pytest.mark.asyncio
 async def test_runtime_start_agent_run_registers_binds_and_cleans_cancellation() -> None:
     chat_run_registry = FakeChatRunRegistry()
@@ -3067,6 +3183,83 @@ async def test_forward_events_until_idle_publishes_runtime_events(tmp_path: Path
 
     assert runtime.subscriptions == [session.id]
     assert published == [(session.id, event)]
+
+
+@pytest.mark.asyncio
+async def test_persistent_event_bridge_projects_wakeup_run_after_first_reply_end(
+    tmp_path: Path,
+) -> None:
+    published: list[tuple[str, dict]] = []
+    published_both = asyncio.Event()
+
+    async def publish(session_id: str, event: dict) -> None:
+        published.append((session_id, event))
+        if len(published) == 2:
+            published_both.set()
+
+    store = WebSessionStore(tmp_path / "sessions.sqlite")
+    runtime = PersistentBatchEventingRuntime()
+    manager = AgentScopeWebSessionManager(
+        store=store,
+        runtime=runtime,
+        event_callback=publish,
+    )
+    session = await manager.create_session("background wakeup")
+    store.save_agentscope_session_mapping(
+        session.id,
+        agent_id="navigation-data-agent",
+        agentscope_session_id="as-navigation",
+    )
+    assert manager.event_bridge is not None
+
+    await manager.event_bridge.start()
+    try:
+        runtime.queue.put_nowait(
+            SimpleNamespace(
+                entry_id="1-0",
+                raw_event_type="REPLY_END",
+                events=(
+                    {
+                        "type": "final",
+                        "source": "agentscope",
+                        "run_id": "as-navigation",
+                        "payload": {"text": "工具正在后台执行。"},
+                    },
+                ),
+            )
+        )
+        runtime.queue.put_nowait(
+            SimpleNamespace(
+                entry_id="2-0",
+                raw_event_type="REPLY_END",
+                events=(
+                    {
+                        "type": "final",
+                        "source": "agentscope",
+                        "run_id": "as-navigation",
+                        "payload": {"text": "后台工具已完成，产物检查通过。"},
+                    },
+                ),
+            )
+        )
+        await published_both.wait()
+        await manager.forward_events_until_idle(session.id)
+        await manager.forward_events_until_idle(session.id)
+    finally:
+        await manager.event_bridge.stop()
+
+    detail = store.get_session(session.id)
+    assert detail is not None
+    assert [message.content for message in detail.messages] == [
+        "工具正在后台执行。",
+        "后台工具已完成，产物检查通过。",
+    ]
+    assert [event.payload["text"] for event in detail.events] == [
+        "工具正在后台执行。",
+        "后台工具已完成，产物检查通过。",
+    ]
+    assert runtime.subscriptions == 1
+    assert runtime.cursors == [("as-navigation", "1-0"), ("as-navigation", "2-0")]
 
 
 @pytest.mark.asyncio

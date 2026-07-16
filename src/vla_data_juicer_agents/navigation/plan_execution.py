@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import json
 import hashlib
 from pathlib import Path
@@ -1185,20 +1186,36 @@ def build_plan_bound_execution_tools(
     tools: list[ToolBase] = []
 
     def make_invoke(action: str, function: Callable[..., Any]):
-        def invoke(plan_id: str, step_id: str) -> dict[str, Any]:
-            return _invoke_plan_step(
-                bound_task=task,
-                plan_id=plan_id,
-                step_id=step_id,
-                action=action,
-                function=function,
-                plan_store=plan_store,
-                evidence_store=evidence_store,
-                settings=settings,
-                cancellation=cancellation,
-                expected_web_session_id=web_session_id,
-                expected_agentscope_session_id=agentscope_session_id,
+        async def invoke(plan_id: str, step_id: str) -> dict[str, Any]:
+            active_cancellation = cancellation or current_cancellation()
+            background_token = (
+                active_cancellation.begin_background_operation()
+                if active_cancellation is not None
+                else None
             )
+            thread_task = asyncio.create_task(
+                asyncio.to_thread(
+                    _invoke_plan_step,
+                    bound_task=task,
+                    plan_id=plan_id,
+                    step_id=step_id,
+                    action=action,
+                    function=function,
+                    plan_store=plan_store,
+                    evidence_store=evidence_store,
+                    settings=settings,
+                    cancellation=active_cancellation,
+                    expected_web_session_id=web_session_id,
+                    expected_agentscope_session_id=agentscope_session_id,
+                )
+            )
+            if active_cancellation is not None and background_token is not None:
+                thread_task.add_done_callback(
+                    lambda _task: active_cancellation.end_background_operation(
+                        background_token,
+                    ),
+                )
+            return await asyncio.shield(thread_task)
 
         invoke.__name__ = f"{action}_tool"
         invoke.__doc__ = (

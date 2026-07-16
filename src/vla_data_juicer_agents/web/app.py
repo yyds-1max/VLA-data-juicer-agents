@@ -80,6 +80,9 @@ def create_app(
             return
 
         async with agentscope_runtime.app.router.lifespan_context(agentscope_runtime.app):
+            event_bridge = getattr(manager, "event_bridge", None)
+            if event_bridge is not None:
+                await event_bridge.start()
             recovery_loop = getattr(agentscope_runtime, "run_agent_wakeup_recovery_loop", None)
             recovery_task = (
                 asyncio.create_task(
@@ -96,6 +99,8 @@ def create_app(
                     recovery_task.cancel()
                     with suppress(asyncio.CancelledError):
                         await recovery_task
+                if event_bridge is not None:
+                    await event_bridge.stop()
 
     app = FastAPI(title="DataPilot Web API", lifespan=lifespan)
     app.state.store = store
@@ -163,7 +168,7 @@ def create_app(
                 _drain_controller_events(session_id, manager, store, bus),
                 name=f"controller-events:{session_id}",
             )
-        else:
+        elif getattr(manager, "event_bridge", None) is None:
             _create_logged_task(
                 manager.forward_events_until_idle(session_id),
                 name=f"agentscope-events:{session_id}",
@@ -196,7 +201,7 @@ def create_app(
             raise HTTPException(status_code=409, detail=str(exc)) from exc
         if not accepted:
             raise HTTPException(status_code=409, detail="Human decision was not accepted")
-        if agentscope_runtime is not None:
+        if agentscope_runtime is not None and getattr(manager, "event_bridge", None) is None:
             _create_logged_task(
                 manager.forward_events_until_idle(session_id),
                 name=f"agentscope-events:{session_id}",
@@ -230,7 +235,7 @@ def create_app(
     @app.websocket("/api/sessions/{session_id}/events")
     async def session_events(websocket: WebSocket, session_id: str) -> None:
         await websocket.accept()
-        if agentscope_runtime is not None:
+        if agentscope_runtime is not None and getattr(manager, "event_bridge", None) is None:
             _create_logged_task(
                 manager.forward_events_until_idle(session_id),
                 name=f"agentscope-events-ws:{session_id}",
