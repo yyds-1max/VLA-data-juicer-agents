@@ -2189,7 +2189,7 @@ test("completed legacy run folds its processing disclosure and keeps tool rows a
   const summary = screen.getByRole("button", { name: /已处理 3s/ });
   expect(summary).toBeVisible();
   expect(summary).toHaveAttribute("aria-expanded", "false");
-  expect(screen.queryByText("检查数据目录")).not.toBeInTheDocument();
+  expect(screen.getByText("检查数据目录")).not.toBeVisible();
 
   fireEvent.click(summary);
 
@@ -2307,7 +2307,7 @@ test("completed legacy run keeps final output visible below the folded process",
   expect(summary).toBeVisible();
   expect(summary).toHaveAttribute("aria-expanded", "false");
   expect(screen.getByText("子任务已完成：导航数据可继续清洗。")).toBeVisible();
-  expect(screen.queryByText("整理执行结论")).not.toBeInTheDocument();
+  expect(screen.getByText("整理执行结论")).not.toBeVisible();
 
   fireEvent.click(summary);
 

@@ -22,6 +22,8 @@ export interface TimelineItem {
   activityTitle?: string;
   activityStatus?: string;
   activitySteps?: ActivityStep[];
+  progressId?: string;
+  progressPhase?: "streaming" | "completed";
   turnId?: string | null;
   replyId?: string;
   replyKey?: string;
@@ -63,6 +65,7 @@ export interface RunState {
   running: boolean;
   interrupting: boolean;
   appliedEventKeys: Record<string, true>;
+  terminalProgress: Record<string, true>;
 }
 
 export function createEmptyRunState(): RunState {
@@ -76,6 +79,7 @@ export function createEmptyRunState(): RunState {
     running: false,
     interrupting: false,
     appliedEventKeys: {},
+    terminalProgress: {},
   };
 }
 
@@ -135,6 +139,59 @@ export function applyAgentEvent(state: RunState, event: AgentEvent): void {
         replyId,
         replyKey,
       });
+    }
+    return;
+  }
+
+  if (type === "progress_start") {
+    // A start is intentionally not rendered until the first safe delta arrives.
+    // This keeps the initial placeholder visible and lets an end-before-start
+    // tombstone remain authoritative during snapshot/WebSocket races.
+    return;
+  }
+
+  if (type === "progress_delta") {
+    const progressId = normalizeText(payload.progress_id) || normalizeText(payload.progressId);
+    const delta = typeof payload.delta === "string" ? payload.delta : "";
+    if (!progressId || !delta) {
+      return;
+    }
+    if (replyKey) {
+      removeAssistantDraft(state, replyKey);
+    }
+    const key = progressKey(turnId, runId, progressId);
+    const terminal = state.terminalProgress[key] === true;
+    const existing = findProgressItem(state, turnId, runId, progressId);
+    if (existing) {
+      existing.text += delta;
+      if (!terminal && existing.progressPhase !== "completed") {
+        existing.progressPhase = "streaming";
+      }
+    } else {
+      state.timeline.push({
+        kind: "progress",
+        source: "main",
+        text: delta,
+        turnId,
+        runId,
+        replyId,
+        replyKey,
+        progressId,
+        progressPhase: terminal ? "completed" : "streaming",
+      });
+    }
+    return;
+  }
+
+  if (type === "progress_end") {
+    const progressId = normalizeText(payload.progress_id) || normalizeText(payload.progressId);
+    if (!progressId) {
+      return;
+    }
+    state.terminalProgress[progressKey(turnId, runId, progressId)] = true;
+    const existing = findProgressItem(state, turnId, runId, progressId);
+    if (existing) {
+      existing.progressPhase = "completed";
     }
     return;
   }
@@ -502,6 +559,29 @@ function findAssistantItem(
     }
   }
   return undefined;
+}
+
+function findProgressItem(
+  state: RunState,
+  turnId: string | null,
+  runId: string,
+  progressId: string,
+): TimelineItem | undefined {
+  return state.timeline.find(
+    (item) =>
+      item.kind === "progress" &&
+      item.turnId === turnId &&
+      item.runId === runId &&
+      item.progressId === progressId,
+  );
+}
+
+function progressKey(
+  turnId: string | null | undefined,
+  runId: string | null | undefined,
+  progressId: string,
+): string {
+  return `${turnId ?? ""}\u0000${runId ?? ""}\u0000${progressId}`;
 }
 
 function removeAssistantDraft(state: RunState, replyKey: string): void {

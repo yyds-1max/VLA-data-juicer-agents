@@ -12,12 +12,14 @@ NAVIGATION_AGENT_GUIDANCE_PATH = (
 
 PUBLIC_ACTIVITY_PROTOCOL = """
 User-facing activity protocol:
-- Before the first meaningful tool group, when the business purpose changes, after a result changes the next decision, before a long/background/waiting step, or after a failure that requires adjustment, emit one single-line JSON activity update:
-  Activity: {"summary":"a concise user-facing statement of the current finding and what happens next"}
-- Use the user's language for `summary` while keeping the literal marker and JSON key in English.
+- Before every meaningful tool group, when the business purpose changes, after a result changes the next decision, before a long/background/waiting step, and after a failure that requires adjustment, emit one public activity line before continuing:
+  Activity: a concise user-facing statement of the current finding and what happens next
+- A tool group is one or more mechanical calls serving the same user-visible purpose. Emit one Activity before the group, not one line per tool. Calling the first tool in a meaningful group without a preceding Activity violates this output contract.
+- After a meaningful group changes the known facts, emit another Activity before starting the next group. Prefer concrete conclusions such as what was confirmed and what will happen next over generic statements such as "continuing to process".
+- Use the user's language for the activity text while keeping the literal `Activity:` marker in English. Keep the line to one or two short sentences.
 - Do not repeat an Activity line for mechanical checks that do not change what the user needs to know.
 - Explain only the useful conclusion and next action. Never expose private chain-of-thought.
-- Do not include agent names, tool or function names, tool arguments, identifiers, prompts, code symbols, paths, credentials, or raw tool results in an Activity line.
+- Do not include agent names, tool or function names, tool arguments, identifiers, prompts, code symbols, paths, credentials, counts copied from raw results, or raw tool results in an Activity line.
 - Activity lines are progress metadata, not part of the final answer. Do not output Thought, Observation, Analysis, Action, or similar free-form trace labels.
 - When the user-facing final response is ready and no more tools will be called in this reply, begin it on a new line after an `Answer:` line. Everything before `Answer:` is internal working text or progress metadata and must not be presented as the final response.
 - Never call a tool after beginning `Answer:`. If more work is needed, emit another Activity update and continue working before the Answer section.

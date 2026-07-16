@@ -104,6 +104,96 @@ def test_store_persists_timeline_events(tmp_path: Path):
     assert detail.events[1].type == "tool_end"
 
 
+def test_projected_progress_stream_is_durable_and_idempotent(tmp_path: Path):
+    store = WebSessionStore(tmp_path / "sessions.sqlite")
+    session = store.create_session(title="streamed progress")
+    submission = store.begin_user_turn(session.id, "处理数据")
+    turn_id = submission.turn.id
+    store.save_agentscope_session_mapping(
+        session.id,
+        agent_id="navigation-data-agent",
+        agentscope_session_id="as-navigation",
+        active_turn_id=turn_id,
+    )
+    store.register_pending_reply(
+        turn_id=turn_id,
+        agentscope_session_id="as-navigation",
+        agent_id="navigation-data-agent",
+        source="user",
+    )
+    store.append_projected_event_batch(
+        web_session_id=session.id,
+        agentscope_session_id="as-navigation",
+        entry_id="1-0",
+        raw_event_type="REPLY_START",
+        reply_id="reply-1",
+        events=[],
+    )
+    projected = [
+        {
+            "type": "progress_start",
+            "source": "agentscope",
+            "run_id": "as-navigation",
+            "payload": {
+                "progress_id": "progress-1",
+                "reply_id": "reply-1",
+            },
+        },
+        {
+            "type": "progress_delta",
+            "source": "agentscope",
+            "run_id": "as-navigation",
+            "payload": {
+                "progress_id": "progress-1",
+                "delta": "已确认原始数据，",
+                "reply_id": "reply-1",
+            },
+        },
+        {
+            "type": "progress_end",
+            "source": "agentscope",
+            "run_id": "as-navigation",
+            "payload": {
+                "progress_id": "progress-1",
+                "reply_id": "reply-1",
+            },
+        },
+    ]
+
+    first = store.append_projected_event_batch(
+        web_session_id=session.id,
+        agentscope_session_id="as-navigation",
+        entry_id="2-0",
+        raw_event_type="TEXT_BLOCK_DELTA",
+        reply_id="reply-1",
+        events=projected,
+    )
+    duplicate = store.append_projected_event_batch(
+        web_session_id=session.id,
+        agentscope_session_id="as-navigation",
+        entry_id="2-0",
+        raw_event_type="TEXT_BLOCK_DELTA",
+        reply_id="reply-1",
+        events=projected,
+    )
+
+    assert [record.type for record in first] == [
+        "progress_start",
+        "progress_delta",
+        "progress_end",
+    ]
+    assert all(record.turn_id == turn_id for record in first)
+    assert all(record.payload["reply_id"] == "reply-1" for record in first)
+    assert duplicate == []
+    detail = store.get_session(session.id)
+    assert detail is not None
+    assert [event.type for event in detail.events[-3:]] == [
+        "progress_start",
+        "progress_delta",
+        "progress_end",
+    ]
+
+
 def test_projected_answer_stream_is_persisted_and_reconciled_by_reply_id(tmp_path: Path):
     store = WebSessionStore(tmp_path / "sessions.sqlite")
     session = store.create_session(title="streamed answer")

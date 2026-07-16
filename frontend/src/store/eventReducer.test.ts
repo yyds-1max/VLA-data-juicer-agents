@@ -64,6 +64,122 @@ function pendingDecision(overrides: Record<string, unknown> = {}) {
 }
 
 describe("eventReducer", () => {
+  it("streams public progress into one timeline paragraph by progress id", () => {
+    const state = createEmptyRunState();
+    const metadata = { run_id: "navigation-session", turn_id: "turn-1" };
+
+    applyAgentEvent(state, event("progress_start", "agentscope", { progress_id: "progress-1" }, metadata));
+    applyAgentEvent(
+      state,
+      event(
+        "progress_delta",
+        "agentscope",
+        { progress_id: "progress-1", delta: "已确认原始数据，" },
+        metadata,
+      ),
+    );
+    applyAgentEvent(
+      state,
+      event(
+        "progress_delta",
+        "agentscope",
+        { progress_id: "progress-1", delta: "接下来开始提取。" },
+        metadata,
+      ),
+    );
+
+    expect(state.timeline.filter((item) => item.kind === "progress")).toMatchObject([
+      {
+        text: "已确认原始数据，接下来开始提取。",
+        progressId: "progress-1",
+        progressPhase: "streaming",
+        turnId: "turn-1",
+        runId: "navigation-session",
+      },
+    ]);
+
+    applyAgentEvent(state, event("progress_end", "agentscope", { progress_id: "progress-1" }, metadata));
+    expect(state.timeline[0]).toMatchObject({
+      text: "已确认原始数据，接下来开始提取。",
+      progressPhase: "completed",
+    });
+  });
+
+  it("ignores duplicate progress starts and accepts a recovered delta without start", () => {
+    const state = createEmptyRunState();
+    const metadata = { run_id: "navigation-session", turn_id: "turn-1" };
+
+    applyAgentEvent(state, event("progress_start", "agentscope", { progress_id: "progress-1" }, metadata));
+    applyAgentEvent(state, event("progress_start", "agentscope", { progress_id: "progress-1" }, metadata));
+    applyAgentEvent(
+      state,
+      event(
+        "progress_delta",
+        "agentscope",
+        { progress_id: "progress-2", delta: "恢复后的公开进展。" },
+        metadata,
+      ),
+    );
+
+    expect(state.timeline.filter((item) => item.kind === "progress")).toHaveLength(1);
+    expect(state.timeline.at(-1)).toMatchObject({
+      progressId: "progress-2",
+      text: "恢复后的公开进展。",
+    });
+  });
+
+  it("keeps progress terminal when end arrives before start or an older delta arrives late", () => {
+    const state = createEmptyRunState();
+    const metadata = { run_id: "navigation-session", turn_id: "turn-1" };
+
+    applyAgentEvent(state, event("progress_end", "agentscope", { progress_id: "progress-1" }, metadata));
+    applyAgentEvent(state, event("progress_start", "agentscope", { progress_id: "progress-1" }, metadata));
+    applyAgentEvent(
+      state,
+      event(
+        "progress_delta",
+        "agentscope",
+        { progress_id: "progress-1", delta: "第一段。" },
+        metadata,
+      ),
+    );
+    applyAgentEvent(
+      state,
+      event(
+        "progress_delta",
+        "agentscope",
+        { progress_id: "progress-1", delta: "迟到的第二段。" },
+        metadata,
+      ),
+    );
+
+    expect(state.timeline).toMatchObject([
+      {
+        text: "第一段。迟到的第二段。",
+        progressPhase: "completed",
+      },
+    ]);
+  });
+
+  it("does not let late progress reopen a completed turn", () => {
+    const state = createEmptyRunState();
+    const metadata = { run_id: "navigation-session", turn_id: "turn-1" };
+
+    applyAgentEvent(state, event("turn_state", "agentscope", { status: "completed" }, metadata));
+    applyAgentEvent(state, event("progress_start", "agentscope", { progress_id: "progress-1" }, metadata));
+    applyAgentEvent(
+      state,
+      event(
+        "progress_delta",
+        "agentscope",
+        { progress_id: "progress-1", delta: "较早的进展。" },
+        metadata,
+      ),
+    );
+
+    expect(state.running).toBe(false);
+  });
+
   it("captures a pending human decision and pauses active run text", () => {
     const state = createEmptyRunState();
 

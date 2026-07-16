@@ -262,6 +262,7 @@ function cloneRunState(run: RunState): RunState {
     running: run.running,
     interrupting: run.interrupting,
     appliedEventKeys: { ...run.appliedEventKeys },
+    terminalProgress: { ...run.terminalProgress },
   };
 }
 
@@ -346,6 +347,11 @@ function removeRunTurn(run: RunState, turnId: string): RunState {
   next.timeline = next.timeline.filter((item) => item.turnId !== turnId);
   next.activeTools = Object.fromEntries(
     Object.entries(next.activeTools).filter(([, tool]) => tool.turnId !== turnId),
+  );
+  next.terminalProgress = Object.fromEntries(
+    Object.entries(next.terminalProgress).filter(
+      ([key]) => !key.startsWith(`${turnId}\u0000`),
+    ),
   );
   return next;
 }

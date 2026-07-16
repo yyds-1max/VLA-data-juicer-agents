@@ -52,27 +52,84 @@ export function ProcessingDisclosure({ turn, items }: ProcessingDisclosureProps)
         )}
       </button>
 
-      {expanded ? (
-        <div id={contentId} className="space-y-3 py-3 text-sm leading-6">
-          {visibleItems.map((item, index) =>
-            item.kind === "tool" ? (
-              <ToolProgressLine key={toolItemKey(item, index)} item={item} now={now} />
-            ) : item.kind === "progress" ? (
-              <p key={`progress-${index}`} className="whitespace-pre-wrap break-words">
-                {item.text}
+      <div
+        id={contentId}
+        hidden={!expanded}
+        className="space-y-3 py-3 text-sm leading-6"
+      >
+        {visibleItems.map((item, index) =>
+          item.kind === "tool" ? (
+            <ToolProgressLine key={toolItemKey(item, index)} item={item} now={now} />
+          ) : item.kind === "progress" ? (
+            <ProgressParagraph
+              key={item.progressId
+                ? `progress-${item.runId ?? ""}-${item.progressId}`
+                : `progress-${index}`}
+              item={item}
+              animate={active}
+            />
+          ) : item.kind === "activity" ? (
+            legacyActivityParagraphs(item).map((text, textIndex) => (
+              <p key={`legacy-${index}-${textIndex}`} className="whitespace-pre-wrap break-words">
+                {text}
               </p>
-            ) : item.kind === "activity" ? (
-              legacyActivityParagraphs(item).map((text, textIndex) => (
-                <p key={`legacy-${index}-${textIndex}`} className="whitespace-pre-wrap break-words">
-                  {text}
-                </p>
-              ))
-            ) : null,
-          )}
-        </div>
-      ) : null}
+            ))
+          ) : null,
+        )}
+      </div>
     </section>
   );
+}
+
+function ProgressParagraph({ item, animate }: { item: TimelineItem; animate: boolean }) {
+  const characters = Array.from(item.text);
+  const animateOnMountRef = useRef(
+    animate && Boolean(item.progressId) && isRecentProgress(item.createdAt),
+  );
+  const [visibleCount, setVisibleCount] = useState(
+    animateOnMountRef.current ? 0 : characters.length,
+  );
+
+  useEffect(() => {
+    const reducedMotion = typeof window !== "undefined" &&
+      typeof window.matchMedia === "function" &&
+      window.matchMedia("(prefers-reduced-motion: reduce)").matches;
+    if (!animate || !animateOnMountRef.current || reducedMotion) {
+      setVisibleCount(characters.length);
+      return undefined;
+    }
+    if (visibleCount >= characters.length) {
+      return undefined;
+    }
+    const timer = window.setInterval(() => {
+      setVisibleCount((count) => Math.min(count + 2, characters.length));
+    }, 25);
+    return () => window.clearInterval(timer);
+  }, [animate, characters.length, visibleCount]);
+
+  const visibleText = characters.slice(0, visibleCount).join("");
+  return (
+    <p
+      className="whitespace-pre-wrap break-words"
+      data-progress-id={item.progressId}
+    >
+      <span
+        aria-hidden={visibleCount < characters.length ? "true" : undefined}
+        role={visibleCount >= characters.length ? "status" : undefined}
+        aria-live={visibleCount >= characters.length ? "polite" : undefined}
+      >
+        {visibleText}
+      </span>
+    </p>
+  );
+}
+
+function isRecentProgress(createdAt: string | undefined): boolean {
+  if (!createdAt) return true;
+  const timestamp = Date.parse(createdAt);
+  if (Number.isNaN(timestamp)) return false;
+  const age = Date.now() - timestamp;
+  return age >= -60_000 && age <= 5_000;
 }
 
 function ToolProgressLine({ item, now }: { item: TimelineItem; now: number }) {

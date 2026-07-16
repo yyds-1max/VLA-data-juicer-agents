@@ -1,5 +1,5 @@
 import "@testing-library/jest-dom/vitest";
-import { fireEvent, render, screen } from "@testing-library/react";
+import { act, fireEvent, render, screen } from "@testing-library/react";
 import { describe, expect, test, vi } from "vitest";
 
 import type { TurnRecord } from "../../api/types";
@@ -21,6 +21,36 @@ function turn(status: TurnRecord["status"], finishedAt: string | null = null): T
 }
 
 describe("ProcessingDisclosure", () => {
+  test("reveals a newly arrived safe progress paragraph incrementally", () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date("2026-07-16T04:00:12.000Z"));
+    const text = "已确认原始数据，接下来开始提取。";
+    const items: TimelineItem[] = [
+      {
+        kind: "progress",
+        source: "main",
+        text,
+        progressId: "progress-1",
+        progressPhase: "completed",
+        runId: "navigation-session",
+        turnId: "turn-1",
+        createdAt: "2026-07-16T04:00:12.000Z",
+      },
+    ];
+
+    const { container } = render(<ProcessingDisclosure turn={turn("running")} items={items} />);
+
+    const paragraph = container.querySelector<HTMLElement>('[data-progress-id="progress-1"]')!;
+    expect(paragraph.textContent).toBe("");
+    act(() => vi.advanceTimersByTime(50));
+    expect(paragraph.textContent?.length).toBeGreaterThan(0);
+    expect(paragraph.textContent).not.toBe(text);
+    act(() => vi.advanceTimersByTime(1000));
+    expect(paragraph).toHaveTextContent(text);
+    expect(screen.getByRole("status")).toHaveTextContent(text);
+    vi.useRealTimers();
+  });
+
   test("shows natural progress and keeps background tools in the calling state", () => {
     vi.useFakeTimers();
     vi.setSystemTime(new Date("2026-07-16T04:00:12.000Z"));
@@ -107,6 +137,37 @@ describe("ProcessingDisclosure", () => {
     );
 
     expect(button).toHaveAttribute("aria-expanded", "false");
-    expect(screen.queryByText("准备调用处理工具。")).not.toBeInTheDocument();
+    expect(screen.getByText("准备调用处理工具。")).not.toBeVisible();
+  });
+
+  test("does not replay progress animation after folding and reopening", () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date("2026-07-16T04:00:12.000Z"));
+    const text = "已确认数据范围，接下来生成处理方案。";
+    const items: TimelineItem[] = [
+      {
+        kind: "progress",
+        source: "main",
+        text,
+        progressId: "progress-1",
+        progressPhase: "completed",
+        runId: "navigation-session",
+        turnId: "turn-1",
+        createdAt: "2026-07-16T04:00:12.000Z",
+      },
+    ];
+    const { container } = render(
+      <ProcessingDisclosure turn={turn("running")} items={items} />,
+    );
+    const button = screen.getByRole("button", { name: /正在处理/ });
+    const paragraph = container.querySelector<HTMLElement>('[data-progress-id="progress-1"]')!;
+    act(() => vi.advanceTimersByTime(1000));
+    expect(paragraph).toHaveTextContent(text);
+
+    fireEvent.click(button);
+    fireEvent.click(button);
+
+    expect(paragraph).toHaveTextContent(text);
+    vi.useRealTimers();
   });
 });

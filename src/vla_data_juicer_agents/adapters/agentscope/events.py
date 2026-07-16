@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import re
 from collections.abc import Callable
@@ -21,6 +22,10 @@ _ACTIVITY_MARKER_RE = re.compile(
     r"^\s*(?:Activity|活动)\s*[:：]\s*(?P<payload>.+?)\s*$",
     flags=re.IGNORECASE | re.DOTALL,
 )
+_PUBLIC_PROGRESS_BOUNDARY_RE = re.compile(
+    r".*?(?:[，；。！？]|[,;.!?](?:\s+|$))",
+    re.DOTALL,
+)
 _ANSWER_MARKER_RE = re.compile(
     r"^\s*(?:Answer|回答)\s*[:：]\s*(?P<text>.*)$",
     flags=re.IGNORECASE | re.DOTALL,
@@ -35,12 +40,21 @@ _PUBLIC_TEXT_LIMIT = 240
 _UNSAFE_PUBLIC_TEXT_RE = re.compile(
     r"(?:"
     r"system\s+prompt|developer\s+message|chain[- ]of[- ]thought|"
-    r"tool[_ -]?call|call[_ -]?id|run[_ -]?id|parent[_ -]?run|"
+    r"tool[_ -]?call|(?:task|plan|step|reply|session|agent|activity|request|"
+    r"origin|call|run|tool[_ -]?call|parent[_ -]?run)[_ -]?id|"
+    r"(?:任务|计划|步骤|回复|会话|代理|活动|请求)\s*(?:ID|标识)|"
+    r"\b(?:nav|turn|session|reply|plan|task|call|run|step|activity|request)"
+    r"_[a-z0-9_-]{8,}\b|"
+    r"\b[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-"
+    r"[0-9a-f]{12}\b|\b[0-9a-f]{24,64}\b|"
     r"\b[a-z][a-z0-9_]*_tool\b|"
     r"/(?:media|home|users?|var|tmp|opt|srv)/|[a-z]:\\|"
     r"```|<\/?(?:think|tool|system)\b|"
     r"\b[a-z][a-z0-9]*agent\b|agentscope|"
-    r"\b(?:api[_-]?key|password|authorization|bearer\s+[a-z0-9._-]+)\b"
+    r"\b(?:api[_ -]?key|password|passwd|authorization|credential|secret|"
+    r"access[_ -]?token)\b|bearer\s+[a-z0-9._~+/-]+|"
+    r"\bsk-[a-z0-9_-]{8,}\b|"
+    r"(?:密码|口令|密钥|令牌)\s*(?:[:：=]|是|为)"
     r")",
     flags=re.IGNORECASE,
 )
@@ -372,17 +386,22 @@ class PublicActivityProjector:
 class PublicProgressProjector:
     """Emit compact user-facing progress paragraphs without ReAct labels."""
 
-    def __init__(self, scope: EventScope) -> None:
+    def __init__(
+        self,
+        scope: EventScope,
+        *,
+        reply_id_provider: Callable[[], str] | None = None,
+    ) -> None:
         self._scope = scope
+        self._reply_id_provider = reply_id_provider or (lambda: "")
         self._last_text = ""
         self._phase = ""
-        self._phase_completed: dict[str, int] = {}
-        self._heartbeat_completed: dict[str, int] = {}
         self._explicit_update_covers_next_start = False
         self._active_calls: dict[str, str] = {}
         self._background_calls: set[str] = set()
         self._terminal_calls: set[str] = set()
         self._failed_phases: set[str] = set()
+        self._stream_sequence = 0
 
     def record_public_update(self, payload: dict[str, str]) -> None:
         summary = _public_text(payload.get("summary", ""))
@@ -398,16 +417,39 @@ class PublicProgressProjector:
             )
         if not summary or summary == self._last_text:
             return
-        self._emit(summary)
-        self._explicit_update_covers_next_start = True
-        if self._phase:
-            self._heartbeat_completed[self._phase] = self._phase_completed.get(
-                self._phase,
-                0,
-            )
+        self._emit_public_stream(summary)
 
     def record_legacy_progress(self, summary: str) -> None:
         self.record_public_update({"summary": summary})
+
+    def _emit_public_stream(self, safe_text: str) -> None:
+        """Emit a pre-validated line in renderable chunks; never accepts raw tokens."""
+        self._stream_sequence += 1
+        reply_id = self._reply_id_provider().strip()
+        namespace = f"{reply_id or 'replyless'}:{self._stream_sequence}"
+        digest = hashlib.sha256(namespace.encode("utf-8")).hexdigest()[:24]
+        progress_id = f"progress-{digest}"
+        identity = {"progress_id": progress_id}
+        if reply_id:
+            identity["reply_id"] = reply_id
+        fragments: list[str] = []
+        remaining = safe_text
+        while True:
+            match = _PUBLIC_PROGRESS_BOUNDARY_RE.match(remaining)
+            if match is None:
+                break
+            fragments.append(match.group(0))
+            remaining = remaining[match.end():]
+        if remaining:
+            fragments.append(remaining)
+        if not fragments:
+            return
+        self._scope.emit("progress_start", **identity)
+        for fragment in fragments:
+            self._scope.emit("progress_delta", **identity, delta=fragment)
+        self._scope.emit("progress_end", **identity)
+        self._last_text = safe_text
+        self._explicit_update_covers_next_start = True
 
     def tool_started(self, call_id: str, tool_name: str) -> None:
         if not call_id or call_id in self._active_calls or call_id in self._terminal_calls:
@@ -446,14 +488,6 @@ class PublicProgressProjector:
                 self._failed_phases.add(phase)
                 self._emit(_PHASE_FAILURE_TEXT.get(phase, _PHASE_FAILURE_TEXT["generic"]))
             return
-        completed = self._phase_completed.get(phase, 0) + 1
-        self._phase_completed[phase] = completed
-        heartbeat = self._heartbeat_completed.get(phase, 0)
-        if phase == self._phase and completed - heartbeat >= 4:
-            self._heartbeat_completed[phase] = completed
-            self._emit(
-                f"已完成 {completed} 项相关检查，正在继续核对并汇总结果。"
-            )
 
     def tool_background(self, call_id: str, tool_name: str) -> None:
         if not call_id or call_id in self._terminal_calls:
@@ -586,8 +620,12 @@ class AgentScopeEventAdapter:
         self._suppress_pre_tool_text = suppress_pre_tool_text
         self._thinking: dict[str, list[str]] = {}
         self._tools: dict[str, _ToolState] = {}
+        self._current_reply_id = ""
         self._activity_projector = (
-            PublicProgressProjector(scope)
+            PublicProgressProjector(
+                scope,
+                reply_id_provider=lambda: self._current_reply_id,
+            )
             if emit_progress_events
             else PublicActivityProjector(scope, title=activity_title)
             if emit_activity_events
@@ -599,7 +637,6 @@ class AgentScopeEventAdapter:
             answer_only=emit_answer_delta_events,
         )
         self._reply_text: list[str] = []
-        self._current_reply_id = ""
         self._answer_stream_buffer = ""
         self._answer_stream_emitted = False
         self._safe_answer_parts: list[str] = []
@@ -942,9 +979,14 @@ class ProgressSummaryFilter:
         activity_match = _ACTIVITY_MARKER_RE.match(line)
         if activity_match is not None:
             if self._activity_projector is not None:
-                payload = _activity_payload(activity_match.group("payload"))
+                raw_payload = activity_match.group("payload")
+                payload = _activity_payload(raw_payload)
                 if payload:
                     self._activity_projector.record_public_update(payload)
+                elif raw_payload and not raw_payload.lstrip().startswith("{"):
+                    self._activity_projector.record_public_update(
+                        {"summary": raw_payload}
+                    )
             return None
         if self._activity_projector is not None and _PRIVATE_TRACE_MARKER_RE.match(line):
             return None
