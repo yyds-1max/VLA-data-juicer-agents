@@ -159,6 +159,19 @@ def test_policy_rejects_a_missing_required_group_definition():
         NavigationToolSurfacePolicy.resolve("planning", all_groups)
 
 
+def test_policy_hides_every_tool_while_the_current_step_is_running():
+    surface = NavigationToolSurfacePolicy.resolve(
+        "execution",
+        _all_groups(),
+        current_step_status="running",
+    )
+
+    assert surface.waiting_for_running_step is True
+    assert surface.groups == ()
+    assert surface.active_group_names == ()
+    assert surface.flatten_active_tools() == []
+
+
 def test_surface_flattens_tools_in_group_order():
     first = _tool("first_tool")
     second = _tool("second_tool")

@@ -46,6 +46,7 @@ from vla_data_juicer_agents.runtime.navigation_tool_surface import (
     NavigationToolSurfaceSyncError,
 )
 from vla_data_juicer_agents.navigation.plan_models import ExtractSyncPlanInput
+from vla_data_juicer_agents.navigation.plan_store import StepClaimOutcome
 from vla_data_juicer_agents.navigation.tool_groups import (
     NAVIGATION_ARTIFACT_CHECKS,
     NAVIGATION_DIAGNOSTICS,
@@ -1103,6 +1104,45 @@ async def test_later_same_session_finish_plan_executes_and_closes_task(
     )
     assert services.plan_store.get_active_for_task(built.task.task_id) is None
     assert model.compact_event_count == 0
+    model.assert_exhausted()
+
+
+@pytest.mark.asyncio
+async def test_running_step_ends_reply_without_polling_model(
+    monkeypatch,
+    tmp_path,
+):
+    config, session_id, built, services, storage, _bus, service = (
+        await _real_chat_service_case(
+            monkeypatch,
+            tmp_path,
+            web_session_id="web-background-wait",
+        )
+    )
+    plan = _activate_extract_plan(services, built)
+    first_step = plan.plan.steps[0]
+    assert services.plan_store.claim_step(
+        plan.plan_id,
+        first_step.step_id,
+        first_step.action,
+        expected_web_session_id=built.task.created_by_web_session_id,
+        expected_agentscope_session_id=built.task.agentscope_session_id,
+    ) is StepClaimOutcome.CLAIMED
+    model = ScriptedChatModel()
+    _patch_assembly(monkeypatch, model)
+
+    await service._run_impl(
+        config.user_id,
+        session_id,
+        config.navigation_agent_id,
+        UserMsg(name="user", content="后台步骤仍在运行"),
+    )
+
+    assert model.invocations == []
+    assert storage.updated_state.tool_context.activated_groups == []
+    current = services.plan_store.get_current_step(plan.plan_id)
+    assert current["step"]["step_id"] == first_step.step_id
+    assert current["step"]["status"] == "running"
     model.assert_exhausted()
 
 

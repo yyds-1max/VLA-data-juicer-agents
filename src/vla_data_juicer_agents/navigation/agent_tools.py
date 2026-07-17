@@ -166,6 +166,7 @@ def _execution_state_tools(
         return current
 
     def get_plan_execution_overview_tool(plan_id: str) -> dict[str, Any]:
+        """Read execution state to select or recover work; never poll a running step."""
         current = authorized_snapshot(plan_id)
         if current is None or current.overview is None:
             return {"ok": False, "error_type": "inactive_navigation_plan"}
@@ -176,6 +177,7 @@ def _execution_state_tools(
         )
 
     def get_current_plan_step_tool(plan_id: str) -> dict[str, Any] | None:
+        """Read the actionable current step; never poll a step already marked running."""
         current = authorized_snapshot(plan_id)
         if current is None:
             return {"ok": False, "error_type": "inactive_navigation_plan"}
@@ -335,7 +337,19 @@ def resolve_navigation_tool_surface(
         web_session_id=web_session_id,
         agentscope_session_id=agentscope_session_id,
     )
-    return NavigationToolSurfacePolicy.resolve(snapshot.activity, groups)
+    current_step_status: str | None = None
+    if snapshot.current is not None:
+        current_step = snapshot.current.get("step")
+        if isinstance(current_step, dict) and isinstance(
+            current_step.get("status"),
+            str,
+        ):
+            current_step_status = current_step["status"]
+    return NavigationToolSurfacePolicy.resolve(
+        snapshot.activity,
+        groups,
+        current_step_status=current_step_status,
+    )
 
 
 def resolve_navigation_agent_tools(

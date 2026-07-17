@@ -285,6 +285,49 @@ async def test_reasoning_resolves_fresh_surface_on_every_call(
 
 
 @pytest.mark.asyncio
+async def test_reasoning_stops_without_model_call_while_step_is_running(
+    monkeypatch,
+    record,
+    generic_tools,
+    agent_state,
+):
+    waiting = NavigationToolSurface(
+        activity="execution",
+        groups=(),
+        active_group_names=(),
+        waiting_for_running_step=True,
+    )
+    resolver = SequenceResolver(waiting)
+    middleware = _middleware(monkeypatch, resolver)
+    agent_state.reply_id = "reply-1"
+    agent = _agent(record, generic_tools, agent_state, middleware)
+    handler_calls = 0
+
+    async def must_not_call_model(**_kwargs):
+        nonlocal handler_calls
+        handler_calls += 1
+        yield "unexpected"
+
+    events = [
+        event
+        async for event in middleware.on_reasoning(
+            agent,
+            {"tool_choice": None},
+            must_not_call_model,
+        )
+    ]
+
+    assert handler_calls == 0
+    assert resolver.calls == 1
+    assert len(events) == 1
+    assert events[0].role == "assistant"
+    assert "resume automatically" in events[0].content[0].text
+    assert [group.name for group in agent.toolkit.tool_groups] == ["basic"]
+    assert agent.toolkit.tool_groups[0].tools == []
+    assert agent.state.tool_context.activated_groups == []
+
+
+@pytest.mark.asyncio
 async def test_terminal_tool_response_refreshes_before_it_is_yielded(
     monkeypatch,
     record,

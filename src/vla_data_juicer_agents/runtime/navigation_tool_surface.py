@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from agentscope.agent import Agent
-from agentscope.message import TextBlock, ToolResultState
+from agentscope.message import AssistantMsg, TextBlock, ToolResultState
 from agentscope.middleware import MiddlewareBase
 from agentscope.tool import ToolGroup, ToolResponse
 
@@ -38,7 +38,7 @@ class NavigationToolSurfaceMiddleware(MiddlewareBase):
         agent.toolkit.tool_groups[:] = [ToolGroup(name="basic")]
         agent.state.tool_context.activated_groups[:] = []
 
-    def _synchronize(self, agent: Agent) -> None:
+    def _synchronize(self, agent: Agent) -> bool:
         try:
             surface = resolve_navigation_tool_surface(
                 services=self._services,
@@ -48,6 +48,9 @@ class NavigationToolSurfaceMiddleware(MiddlewareBase):
             )
             if surface is None:
                 raise LookupError("missing authorized navigation attempt")
+            if surface.waiting_for_running_step:
+                self._clear(agent)
+                return True
             groups = [
                 ToolGroup(
                     name=definition.name,
@@ -61,6 +64,7 @@ class NavigationToolSurfaceMiddleware(MiddlewareBase):
             agent.state.tool_context.activated_groups[:] = list(
                 surface.active_group_names
             )
+            return False
         except Exception as error:
             self._clear(agent)
             raise NavigationToolSurfaceSyncError(
@@ -73,7 +77,16 @@ class NavigationToolSurfaceMiddleware(MiddlewareBase):
             yield item
 
     async def on_reasoning(self, agent, input_kwargs, next_handler):
-        self._synchronize(agent)
+        if self._synchronize(agent):
+            yield AssistantMsg(
+                id=agent.state.reply_id,
+                name=agent.name,
+                content=(
+                    "Background navigation processing is still running; "
+                    "the session will resume automatically after completion."
+                ),
+            )
+            return
         async for item in next_handler(**input_kwargs):
             yield item
 

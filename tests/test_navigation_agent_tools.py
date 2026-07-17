@@ -712,6 +712,33 @@ def test_grouped_surface_resolves_execution_catalog(tmp_path):
         execution.group(NAVIGATION_PLAN_AUTHORING)
 
 
+def test_grouped_surface_hides_polling_tools_while_step_is_running(tmp_path):
+    services, task, built = _resolver_services_from_complete(tmp_path)
+    active = services.plan_store.activate(
+        task,
+        "extract_sync",
+        4,
+        ExtractSyncPlanInput.model_validate(valid_extract_plan_payload(built)),
+        expected_web_session_id="as-session-1",
+        expected_agentscope_session_id="as-session-1",
+    )
+    first_step = active.plan.steps[0]
+    assert services.plan_store.claim_step(
+        active.plan_id,
+        first_step.step_id,
+        first_step.action,
+        expected_web_session_id="as-session-1",
+        expected_agentscope_session_id="as-session-1",
+    ) is StepClaimOutcome.CLAIMED
+
+    waiting = _surface(services, "as-session-1")
+
+    assert waiting is not None
+    assert waiting.activity == "execution"
+    assert waiting.waiting_for_running_step is True
+    assert waiting.flatten_active_tools() == []
+
+
 def test_grouped_surface_hides_execution_actions_during_recovery(tmp_path):
     services, task, built = _resolver_services_from_complete(
         tmp_path,

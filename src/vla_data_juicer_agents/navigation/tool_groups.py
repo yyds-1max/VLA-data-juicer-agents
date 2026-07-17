@@ -37,6 +37,7 @@ class NavigationToolSurface:
     activity: NavigationActivity
     groups: tuple[NavigationToolGroupDefinition, ...]
     active_group_names: tuple[str, ...]
+    waiting_for_running_step: bool = False
 
     def group(self, name: str) -> NavigationToolGroupDefinition:
         for group in self.groups:
@@ -128,7 +129,16 @@ class NavigationToolSurfacePolicy:
         cls,
         activity: NavigationActivity,
         groups_by_name: Mapping[str, NavigationToolGroupDefinition],
+        *,
+        current_step_status: str | None = None,
     ) -> NavigationToolSurface:
+        if activity == "execution" and current_step_status == "running":
+            return NavigationToolSurface(
+                activity=activity,
+                groups=(),
+                active_group_names=(),
+                waiting_for_running_step=True,
+            )
         try:
             group_names = cls._GROUP_NAMES_BY_ACTIVITY[activity]
         except KeyError as exc:

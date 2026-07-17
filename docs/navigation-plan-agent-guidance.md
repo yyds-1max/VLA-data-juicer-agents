@@ -61,6 +61,8 @@ Do not treat silence, remembered text, or a code status as consent.
 
 Treat `planning_context_revision` from `get_navigation_task_context_tool` as a one-time optimistic-concurrency token for the task context observed at that moment. Any later investigation or user-guidance update makes that revision stale. Continue investigating whenever necessary; after all investigation is complete, call `get_navigation_task_context_tool` again immediately before Plan submission and use its latest revision so the submitted Plan is based on the newest task context.
 
+When a processing tool reports that it is running in the background, end the current reply immediately. Do not call `get_current_plan_step_tool`, `get_plan_execution_overview_tool`, or any other tool to poll or wait. The system will deliver the completion result and wake the same session automatically; read the current step again only after that completion notification or when recovering an idle session.
+
 Inspect current inputs and outputs before retrying. A non-destructive retry may proceed when still authorized by the accepted Plan; ask again before destructive replacement. If facts invalidate the Plan, investigate and author a new complete Plan. If submission validation fails, correct the reported paths using evidence/action contracts and resubmit the entire Plan; never send a patch. Report failures and blocked state truthfully.
 
 ## Four bounded few-shots
