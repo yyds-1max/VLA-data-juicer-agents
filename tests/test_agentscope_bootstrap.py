@@ -90,6 +90,22 @@ def test_main_router_prompt_is_triage_only_and_handles_handoff_truthfully():
     assert "Do not output Thought, Observation, Analysis, Action" in prompt
     assert "private chain-of-thought" in prompt
     assert "tool or function names" in prompt
+    assert "`Answer:` is a presentation-channel marker" in prompt
+    assert "does not mean that the overall task or conversation is complete" in prompt
+    assert "ordinary conversation, capability answers, clarification questions" in prompt
+    assert "Whenever this reply yields control back to the user" in prompt
+    assert "even if a later turn may call tools" in prompt
+    assert "ask one short clarifying question as an `Answer:` message" in prompt
+
+
+def test_all_agent_prompts_define_answer_as_the_persistent_chat_channel():
+    for prompt in (main_router_prompt(), navigation_agent_prompt()):
+        assert "Activity lines are transient progress metadata" in prompt
+        assert "every persistent assistant chat message" in prompt
+        assert "requests for missing information" in prompt
+        assert "partial or stage results, and final results" in prompt
+        assert "put a question to the user after `Answer:`" in prompt
+        assert "Never call a tool after beginning `Answer:` in the same reply" in prompt
 
 
 def test_router_handoff_schema_omits_dry_run():
@@ -158,7 +174,8 @@ def test_navigation_agent_prompt_requires_model_directed_investigation_and_plans
     assert "Activity: a concise user-facing statement" in prompt
     assert "without a preceding Activity violates this output contract" in prompt
     assert "Do not output Thought, Observation, Analysis, Action" in prompt
-    assert "progress metadata, not part of the final answer" in prompt
+    assert "transient progress metadata shown in the processing disclosure" in prompt
+    assert "not persistent assistant chat messages" in prompt
 
 
 def test_navigation_agent_prompt_states_system_managed_phase_transitions():
