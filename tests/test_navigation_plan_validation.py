@@ -20,6 +20,7 @@ from vla_data_juicer_agents.navigation.observation_models import (
     SensorRoleCandidate,
     TopicCandidatesObservation,
     TopicMeasurement,
+    TopicRouteCandidate,
 )
 from vla_data_juicer_agents.navigation.plan_models import (
     ExtractSyncPlanInput,
@@ -119,6 +120,27 @@ def extract_observation() -> NavigationObservationRevision:
                     "lidar": ["/lidar/points"],
                     "odom": ["/localization/odom"],
                 },
+                routes=[
+                    TopicRouteCandidate(
+                        role="fisheye_front",
+                        topic="/camera/front/image",
+                        extracted_dir="camera",
+                        output_dir="fisheye_front",
+                    ),
+                    TopicRouteCandidate(
+                        role="lidar",
+                        topic="/lidar/points",
+                        extracted_dir="lidar",
+                        output_dir="r32_rslidar_points",
+                        sync_reference_eligible=True,
+                    ),
+                    TopicRouteCandidate(
+                        role="odom",
+                        topic="/localization/odom",
+                        extracted_dir="localization",
+                        output_dir="odom",
+                    ),
+                ],
             ),
         ],
     )
@@ -455,6 +477,106 @@ def test_time_sync_reference_must_name_an_observed_bound_sensor_role():
         message="Referenced sensor role does not exist",
         allowed_values=["fisheye_front", "lidar", "odom"],
     )
+
+
+@pytest.mark.parametrize(
+    ("reference_sensor", "query_dir"),
+    [
+        ("fisheye_front", "camera"),
+        ("odom", "localization"),
+    ],
+)
+def test_time_sync_reference_must_be_lidar_or_gridmap(
+    reference_sensor: str,
+    query_dir: str,
+):
+    payload = valid_extract_plan_payload()
+    payload["decisions"]["time_sync"]["reference_sensor"] = reference_sensor
+    payload["decisions"]["topic_selection"]["query_dir"] = query_dir
+
+    report = validate_extract(payload)
+
+    assert PlanValidationIssue(
+        path="plan.decisions.time_sync.reference_sensor",
+        code="sync_reference_not_eligible",
+        message="Synchronization reference must be an observed eligible lidar or gridmap route",
+        allowed_values=["gridmap", "lidar"],
+    ) in report.errors
+
+
+def test_time_sync_reference_requires_observed_eligibility_flag():
+    observation = extract_observation()
+    topic_candidates = next(
+        payload
+        for payload in observation.payloads
+        if isinstance(payload, TopicCandidatesObservation)
+    )
+    topic_candidates.routes = [
+        route.model_copy(update={"sync_reference_eligible": False})
+        if route.role == "lidar"
+        else route
+        for route in topic_candidates.routes
+    ]
+
+    report = validate_extract(observation=observation)
+
+    assert "sync_reference_not_eligible" in issue_codes(report)
+
+
+def test_observed_gridmap_route_can_be_the_time_sync_reference():
+    observation = extract_observation()
+    raw = next(
+        payload
+        for payload in observation.payloads
+        if isinstance(payload, RawMetadataObservation)
+    )
+    raw.topics.append(
+        TopicMeasurement(
+            topic="/gridmap",
+            message_type="grid_map_msgs/msg/GridMap",
+            message_count=100,
+        )
+    )
+    sensors = next(
+        payload
+        for payload in observation.payloads
+        if isinstance(payload, SensorCandidatesObservation)
+    )
+    sensors.candidates.append(
+        SensorRoleCandidate(
+            role="gridmap",
+            topic="/gridmap",
+            message_type="grid_map_msgs/msg/GridMap",
+            confidence=1.0,
+        )
+    )
+    topics = next(
+        payload
+        for payload in observation.payloads
+        if isinstance(payload, TopicCandidatesObservation)
+    )
+    topics.available_topics.append("/gridmap")
+    topics.suggested_role_names["gridmap"] = ["/gridmap"]
+    topics.routes.append(
+        TopicRouteCandidate(
+            role="gridmap",
+            topic="/gridmap",
+            extracted_dir="gridmap",
+            output_dir="grid_map",
+            sync_reference_eligible=True,
+        )
+    )
+
+    payload = valid_extract_plan_payload()
+    payload["decisions"]["sensor_bindings"]["bindings"]["gridmap"] = "/gridmap"
+    payload["decisions"]["topic_selection"]["topic_whitelist"].append("/gridmap")
+    payload["decisions"]["topic_selection"]["topic_map"]["gridmap"] = "grid_map"
+    payload["decisions"]["topic_selection"]["query_dir"] = "gridmap"
+    payload["decisions"]["time_sync"]["reference_sensor"] = "gridmap"
+
+    report = validate_extract(payload, observation=observation)
+
+    assert report.ok is True
 
 
 def test_unknown_evidence_ref_is_rejected_at_its_decision_path():

@@ -321,10 +321,23 @@ def _validate_extract_references(
         if raw is not None
         else {}
     )
-    observed_routes = {
-        (route.topic, route.role): (route.extracted_dir, route.output_dir)
-        for route in topics.routes
-    } if topics is not None else {}
+    observed_routes = (
+        {
+            (route.topic, route.role): (route.extracted_dir, route.output_dir)
+            for route in topics.routes
+        }
+        if topics is not None
+        else {}
+    )
+    eligible_sync_reference_routes = (
+        {
+            (route.topic, route.role)
+            for route in topics.routes
+            if route.sync_reference_eligible
+        }
+        if topics is not None
+        else set()
+    )
 
     def selected_route(role: str, topic: str) -> tuple[str, str]:
         observed = observed_routes.get((topic, role))
@@ -335,6 +348,21 @@ def _validate_extract_references(
             role,
             message_type=raw_message_types.get(topic),
         )
+
+    if reference in plan.decisions.sensor_bindings.bindings:
+        reference_topic = plan.decisions.sensor_bindings.bindings[reference]
+        if (
+            reference not in {"lidar", "gridmap"}
+            or (reference_topic, reference) not in eligible_sync_reference_routes
+        ):
+            errors.append(
+                _plan_issue(
+                    "plan.decisions.time_sync.reference_sensor",
+                    "sync_reference_not_eligible",
+                    "Synchronization reference must be an observed eligible lidar or gridmap route",
+                    ["lidar", "gridmap"],
+                )
+            )
 
     expected_map: dict[str, str] = {}
     bound_topics = set(plan.decisions.sensor_bindings.bindings.values())

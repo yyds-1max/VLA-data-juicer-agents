@@ -24,6 +24,7 @@ from vla_data_juicer_agents.navigation.observation_models import (
     SensorRoleCandidate,
     TopicCandidatesObservation,
     TopicMeasurement,
+    TopicRouteCandidate,
 )
 from vla_data_juicer_agents.navigation.observation_store import (
     SqliteNavigationObservationStore,
@@ -201,6 +202,27 @@ def build_services(
                         "lidar": ["/lidar/points"],
                         "odom": ["/localization/odom"],
                     },
+                    routes=[
+                        TopicRouteCandidate(
+                            role="fisheye_front",
+                            topic="/camera/front/image",
+                            extracted_dir="camera",
+                            output_dir="fisheye_front",
+                        ),
+                        TopicRouteCandidate(
+                            role="lidar",
+                            topic="/lidar/points",
+                            extracted_dir="lidar",
+                            output_dir="r32_rslidar_points",
+                            sync_reference_eligible=True,
+                        ),
+                        TopicRouteCandidate(
+                            role="odom",
+                            topic="/localization/odom",
+                            extracted_dir="localization",
+                            output_dir="odom",
+                        ),
+                    ],
                 ),
             ),
         ]

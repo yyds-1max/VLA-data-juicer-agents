@@ -29,7 +29,7 @@ TOPIC_OUTPUT_MAP = {
     "/r32_rslidar_points": ("r32_rslidar_points", "r32_rslidar_points"),
     "/sport_odom": ("sport_odom", "odom"),
     "/utlidar/robot_odom_systime": ("utlidar", "odom"),
-    "/drivers/ins/Ins": ("Ins", "ins"),
+    "/drivers/ins/Ins": ("Ins", "Ins"),
     "/grid_map": ("grid_map", "grid_map"),
     "/gridmap": ("gridmap", "grid_map"),
 }
@@ -38,7 +38,7 @@ ROLE_OUTPUT_DIR = {
     "fisheye_front": "fisheye_front",
     "lidar": "r32_rslidar_points",
     "odom": "odom",
-    "ins": "ins",
+    "ins": "Ins",
     "gridmap": "grid_map",
 }
 
@@ -63,7 +63,7 @@ def extracted_dir_for_topic(topic: str) -> str:
 def output_dir_for_role(role: str, *, message_type: str | None = None) -> str:
     """Return the canonical sync_data directory for a selected sensor role."""
     if role == "localization":
-        return "odom" if message_type and "Odometry" in message_type else "ins"
+        return "odom" if message_type and "Odometry" in message_type else "Ins"
     try:
         return ROLE_OUTPUT_DIR[role]
     except KeyError as error:
