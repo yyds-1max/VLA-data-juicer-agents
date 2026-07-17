@@ -877,6 +877,51 @@ describe("eventReducer", () => {
 });
 
 describe("datapilotStore", () => {
+  it("atomically claims a DataPilot invocation once", () => {
+    const store = createDataPilotStore();
+
+    expect(store.getState().launchDataPilotRequest("invocation-1", "处理导航数据")).toBe(true);
+    expect(store.getState().claimDataPilotInvocation("invocation-1")).toBe(true);
+    expect(store.getState().claimDataPilotInvocation("invocation-1")).toBe(false);
+    expect(store.getState().pendingInvocation).toMatchObject({
+      invocationId: "invocation-1",
+      status: "submitting",
+    });
+    expect(store.getState().open).toBe(true);
+  });
+
+  it("preserves the created session when retrying a failed invocation", () => {
+    const store = createDataPilotStore();
+    store.getState().launchDataPilotRequest("invocation-1", "处理导航数据");
+    store.getState().claimDataPilotInvocation("invocation-1");
+    store.getState().setDataPilotInvocationSession("invocation-1", "session-1");
+    store.getState().failDataPilotInvocation("invocation-1", "提交失败");
+
+    expect(store.getState().retryDataPilotInvocation("invocation-1")).toBe(true);
+    expect(store.getState().pendingInvocation).toEqual({
+      invocationId: "invocation-1",
+      message: "处理导航数据",
+      sessionId: "session-1",
+      status: "queued",
+      error: undefined,
+    });
+  });
+
+  it("keeps the known running session while viewing history", () => {
+    const store = createDataPilotStore();
+    store.getState().setActiveSession(session({ id: "session-running" }));
+    store.getState().applyEvent(
+      event("turn_start", "main", { status: "running" }, { turn_id: "turn-running" }),
+    );
+
+    store.getState().restoreHistory(
+      sessionDetail({ id: "session-history", status: "historical" }),
+    );
+
+    expect(store.getState().mode).toBe("history_session");
+    expect(store.getState().knownRunningSessionId).toBe("session-running");
+  });
+
   it("stamps replacement progress after retracting a draft in the same reducer event", () => {
     const store = createDataPilotStore();
     store.getState().setActiveSession(session());

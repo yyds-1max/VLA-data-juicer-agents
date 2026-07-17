@@ -13,7 +13,7 @@ import {
   submitTurn,
 } from "../../api/client";
 import type { PendingHumanDecision, SessionRecord } from "../../api/types";
-import { datapilotStore } from "../../store/datapilotStore";
+import { datapilotStore, type DataPilotInvocation } from "../../store/datapilotStore";
 import { Composer } from "./Composer";
 import { DraftNewSessionView } from "./DraftNewSessionView";
 import { HumanDecisionDialog } from "./HumanDecisionDialog";
@@ -38,6 +38,7 @@ export function DataPilotWindow() {
   const messages = useStore(datapilotStore, (state) => state.messages);
   const turns = useStore(datapilotStore, (state) => state.turns);
   const run = useStore(datapilotStore, (state) => state.run);
+  const pendingInvocation = useStore(datapilotStore, (state) => state.pendingInvocation);
   const runRunning = useStore(datapilotStore, (state) => state.run.running);
   const interrupting = useStore(datapilotStore, (state) => state.run.interrupting);
   const pendingHumanDecision = useStore(datapilotStore, (state) => state.run.pendingHumanDecision);
@@ -211,23 +212,132 @@ export function DataPilotWindow() {
     setHistoryOpen(false);
   };
 
-  const handleDraftSubmit = async (message: string) => {
+  const submitNewSessionMessage = useCallback(async (
+    message: string,
+    options: { invocationId?: string; sessionId?: string } = {},
+  ) => {
+    let sessionId = options.sessionId;
+    let localTurnId: string | null = null;
+    let userMessageId: string | null = null;
     try {
-      const session = await createSession(message);
+      if (sessionId) {
+        const state = datapilotStore.getState();
+        if (state.mode !== "active_session" || state.currentSessionId !== sessionId) {
+          const detail = await getSession(sessionId);
+          datapilotStore.getState().restoreActiveSession(detail, detail.messages);
+        }
+      } else {
+        const session = await createSession(message);
+        sessionId = session.id;
+        datapilotStore.getState().setActiveSession(session);
+        if (options.invocationId) {
+          datapilotStore.getState().setDataPilotInvocationSession(options.invocationId, sessionId);
+        }
+      }
+
       const store = datapilotStore.getState();
-      store.setActiveSession(session);
-      const localTurnId = createLocalTurnId();
-      const userMessage = localUserMessage(session.id, message, localTurnId);
+      localTurnId = createLocalTurnId();
+      const userMessage = localUserMessage(sessionId, message, localTurnId);
+      userMessageId = userMessage.id;
       store.appendUserMessage(userMessage);
-      store.applyEvent(localTurnEvent("turn_start", session.id, localTurnId));
-      openEvents(session.id);
-      const turnId = await submitTurn(session.id, message);
+      store.applyEvent(localTurnEvent("turn_start", sessionId, localTurnId));
+      openEvents(sessionId);
+      const turnId = await submitTurn(sessionId, message);
       datapilotStore.getState().adoptTurnId(localTurnId, turnId);
+      if (options.invocationId) {
+        datapilotStore.getState().completeDataPilotInvocation(options.invocationId);
+      }
+      return true;
     } catch (error) {
-      closeSocket();
-      datapilotStore.getState().enterDraft();
-      console.error("Failed to submit DataPilot draft turn", error);
+      const store = datapilotStore.getState();
+      if (userMessageId) {
+        store.discardLocalMessage(userMessageId);
+      }
+      if (localTurnId) {
+        store.discardLocalTurn(localTurnId);
+        store.applyEvent(localTurnEvent("turn_submission_failed", sessionId ?? "", localTurnId));
+      }
+      if (options.invocationId) {
+        store.failDataPilotInvocation(
+          options.invocationId,
+          `${sessionId ? "提交失败" : "创建会话失败"}：${errorMessage(error)}`,
+        );
+      } else if (!sessionId) {
+        closeSocket();
+        store.enterDraft();
+      }
+      console.error("Failed to submit DataPilot new-session turn", error);
+      return false;
     }
+  }, [closeSocket, openEvents]);
+
+  const refreshKnownRunningSession = useCallback(async () => {
+    const state = datapilotStore.getState();
+    const candidateSessionId =
+      state.knownRunningSessionId ??
+      (state.mode === "active_session" ? state.currentSessionId : state.previousActiveSessionId);
+    if (!candidateSessionId) {
+      return false;
+    }
+
+    const localRunning =
+      state.knownRunningSessionId === candidateSessionId ||
+      (state.currentSessionId === candidateSessionId && (
+        state.run.running ||
+        state.turns.some((turn) => turn.status === "running" || turn.status === "waiting")
+      ));
+    try {
+      const detail = await getSession(candidateSessionId);
+      const detailRunning = (detail.turns ?? []).some(
+        (turn) => turn.status === "running" || turn.status === "waiting",
+      );
+      if (detailRunning) {
+        datapilotStore.getState().restoreActiveSession(detail, detail.messages);
+        openEvents(candidateSessionId);
+        return true;
+      }
+      datapilotStore.getState().updateKnownRunningSession(candidateSessionId, false);
+      if (
+        datapilotStore.getState().mode === "active_session" &&
+        datapilotStore.getState().currentSessionId === candidateSessionId
+      ) {
+        datapilotStore.getState().refreshActiveSession(detail);
+      }
+      return false;
+    } catch (error) {
+      console.error("Failed to refresh DataPilot before shortcut submission", error);
+      return localRunning;
+    }
+  }, [openEvents]);
+
+  const processDataPilotInvocation = useCallback(async (invocation: DataPilotInvocation) => {
+    if (!datapilotStore.getState().claimDataPilotInvocation(invocation.invocationId)) {
+      return;
+    }
+
+    if (!invocation.sessionId && await refreshKnownRunningSession()) {
+      datapilotStore.getState().blockDataPilotInvocation(
+        invocation.invocationId,
+        "当前任务正在执行，请等待完成或停止后再发起。",
+      );
+      return;
+    }
+
+    await submitNewSessionMessage(invocation.message, {
+      invocationId: invocation.invocationId,
+      sessionId: invocation.sessionId,
+    });
+  }, [refreshKnownRunningSession, submitNewSessionMessage]);
+
+  useEffect(() => {
+    if (!pendingInvocation || pendingInvocation.status !== "queued") {
+      return;
+    }
+    void processDataPilotInvocation(pendingInvocation);
+  }, [pendingInvocation, processDataPilotInvocation]);
+
+  const handleDraftSubmit = async (message: string) => {
+    await submitNewSessionMessage(message);
   };
 
   const handleActiveSubmit = async (message: string) => {
@@ -483,6 +593,18 @@ export function DataPilotWindow() {
       onWheelCapture={handleWheelCapture}
     >
       <SessionHeader onHistory={handleHistory} onNewSession={handleNewSession} onDragStart={handleDragStart} />
+      {pendingInvocation?.error ? (
+        <div
+          role="status"
+          className={`border-b px-4 py-2 text-sm ${
+            pendingInvocation.status === "blocked"
+              ? "border-amber-200 bg-amber-50 text-amber-800"
+              : "border-rose-200 bg-rose-50 text-rose-700"
+          }`}
+        >
+          {pendingInvocation.error}
+        </div>
+      ) : null}
       {historyOpen ? (
         <SessionHistoryPanel
           sessions={sessions}
@@ -614,4 +736,8 @@ function createLocalId(): string {
 
 function isActiveSocket(socket: WebSocket): boolean {
   return socket.readyState === WebSocket.CONNECTING || socket.readyState === WebSocket.OPEN;
+}
+
+function errorMessage(error: unknown): string {
+  return error instanceof Error && error.message.trim() ? error.message : "请稍后重试";
 }

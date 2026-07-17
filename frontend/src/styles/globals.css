@@ -39,6 +39,16 @@
   }
 }
 
+@keyframes navigation-dialog-attention-a {
+  0%, 48%, 100% { outline-color: transparent; }
+  24%, 72% { outline-color: rgba(71, 85, 105, 0.72); }
+}
+
+@keyframes navigation-dialog-attention-b {
+  0%, 48%, 100% { outline-color: transparent; }
+  24%, 72% { outline-color: rgba(71, 85, 105, 0.72); }
+}
+
 :root {
   color-scheme: light;
   font-family:

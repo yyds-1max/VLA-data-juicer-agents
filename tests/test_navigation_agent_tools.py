@@ -399,6 +399,44 @@ def test_navigation_handoff_tool_uses_explicit_date_not_clip_prefix_for_task_ent
     assert payload["segments"] == ["20260605_152856"]
 
 
+def test_shortcut_style_request_preserves_date_and_clips_in_router_handoff():
+    runtime = FakeNavigationHandoffRuntime()
+    tool = NavigationHandoffTool(runtime=runtime, web_session_id="web-shortcut")
+    request = "\n".join(
+        [
+            "请处理导航数据。",
+            "",
+            "数据日期：20270605",
+            "指定 clips：",
+            "- 20260605_152856",
+            "- 20260605_160012",
+            "",
+            "请先检查当前实际产物状态，再根据检查结果决定从哪一步开始。",
+        ]
+    )
+
+    result = asyncio.run(
+        tool(
+            request=request,
+            target="20270605",
+            date="20270605",
+            clips=["20260605_152856", "20260605_160012"],
+            reason="用户通过数据管理页请求处理指定 clips",
+            missing_fields=[],
+            confidence="high",
+            response_language="Chinese",
+        )
+    )
+
+    assert result.state is ToolResultState.SUCCESS
+    assert runtime.records[-1]["date"] == "20270605"
+    assert runtime.records[-1]["clips"] == ["20260605_152856", "20260605_160012"]
+    structured = runtime.started[0]["message"].split("Structured handoff JSON:", 1)[1]
+    payload = json.loads(structured)
+    assert payload["date"] == "20270605"
+    assert payload["segments"] == ["20260605_152856", "20260605_160012"]
+
+
 def test_navigation_handoff_message_includes_structured_json_for_task_entry():
     message = runtime_module._navigation_handoff_message(
         request="处理 20270605 的导航数据",

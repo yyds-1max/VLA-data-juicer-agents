@@ -16,6 +16,7 @@ import {
   type LucideIcon,
 } from "lucide-react";
 import { Fragment, type MouseEvent, type KeyboardEvent, type PointerEvent as ReactPointerEvent, useEffect, useMemo, useRef, useState } from "react";
+import { useStore } from "zustand";
 
 import { getSyncImages, getSyncImageUrl } from "../../../api/client";
 import type {
@@ -27,7 +28,13 @@ import type {
 import { ConsoleButton } from "../../../components/console/ConsoleButton";
 import { ConsoleCard } from "../../../components/console/ConsoleCard";
 import { StatusTag } from "../../../components/console/StatusTag";
+import { datapilotStore } from "../../../store/datapilotStore";
 import type { StatusTone } from "../consoleTypes";
+import { NavigationDataPilotDialog } from "../components/NavigationDataPilotDialog";
+import {
+  buildNavigationDatasetRequest,
+  type NavigationDatasetSelection,
+} from "../navigationDataPilotRequest";
 import { useNavigationDatasetSummary } from "../navigationDatasetSummaryCache";
 
 type DataManagementPageProps = {
@@ -119,49 +126,41 @@ function ProcessOverview() {
   ];
 
   return (
-    <ConsoleCard>
-      <div data-testid="navigation-process-overview">
-        <div className="mb-4 flex flex-col gap-2 sm:flex-row sm:items-end sm:justify-between">
-          <div>
-            <h2 className="text-base font-semibold text-console-text">流程概览</h2>
-            <p className="mt-1 text-sm text-console-muted">raw_data 已采集 {"->"} tmp_dir 已拆解 {"->"} sync_data 已同步</p>
-          </div>
-          <span className="w-fit rounded-md border border-emerald-200 bg-emerald-50 px-2 py-1 text-xs font-medium text-emerald-700">主流程</span>
-        </div>
+    <section
+      className="border-b border-console-line bg-console-panel px-3 py-4 sm:px-4"
+      data-testid="navigation-process-overview"
+    >
+      <div className="flex flex-col gap-3 lg:flex-row lg:items-center">
+        <h2 className="shrink-0 text-sm font-semibold text-console-text">处理流程</h2>
         <ol
           aria-label="导航数据处理流程"
-          className="relative grid gap-3 md:grid-cols-3 md:gap-6"
+          className="flex min-w-0 flex-1 flex-wrap items-center gap-x-3 gap-y-2"
           data-testid="navigation-process-stepper"
         >
-          <div
-            aria-hidden="true"
-            className="pointer-events-none absolute left-[16%] right-[16%] top-5 hidden h-px bg-gradient-to-r from-console-cyan/30 via-console-line to-emerald-300/60 md:block"
-          />
           {steps.map((step, index) => {
             const Icon = step.icon;
 
             return (
-              <li
-                key={step.name}
-                className="relative flex min-w-0 items-center gap-3 py-1 md:flex-col md:items-center md:text-center"
-                data-testid="navigation-process-step"
-              >
-                <div className="z-10 flex h-10 w-10 shrink-0 items-center justify-center rounded-full border border-console-cyan/30 bg-console-panel text-console-cyan shadow-sm">
-                  <Icon aria-hidden="true" className="h-4 w-4" />
-                </div>
-                <div className="min-w-0">
-                  <div className="flex items-center gap-2 md:justify-center">
-                    <span className="text-xs font-semibold text-console-cyan">{index + 1}</span>
-                    <p className="truncate text-sm font-semibold text-console-text">{step.name}</p>
-                  </div>
-                  <p className="mt-0.5 text-xs text-console-muted">{step.state}</p>
-                </div>
-              </li>
+              <Fragment key={step.name}>
+                <li
+                  className="flex min-w-0 items-center gap-2 text-sm"
+                  data-testid="navigation-process-step"
+                >
+                  <span className="flex h-8 w-8 shrink-0 items-center justify-center rounded-full border border-console-cyan/25 bg-blue-50/70 text-console-cyan">
+                    <Icon aria-hidden="true" className="h-4 w-4" />
+                  </span>
+                  <span className="font-medium text-console-text">{step.name}</span>
+                  <span className="text-console-muted">{step.state}</span>
+                </li>
+                {index < steps.length - 1 ? (
+                  <ChevronRight aria-hidden="true" className="h-4 w-4 shrink-0 text-console-muted/70" />
+                ) : null}
+              </Fragment>
             );
           })}
         </ol>
       </div>
-    </ConsoleCard>
+    </section>
   );
 }
 
@@ -240,12 +239,12 @@ function ClipRows({
 
   return (
     <tr>
-      <td colSpan={9} className="bg-console-panel2/50 px-4 py-4">
+      <td colSpan={8} className="bg-console-panel2/45 px-3 py-0">
         {clips.length === 0 ? (
-          <div className="rounded-lg border border-console-line bg-console-panel px-4 py-5 text-sm text-console-muted">该日期暂无 clip 明细。</div>
+          <div className="border-b border-console-line px-4 py-5 text-sm text-console-muted">该日期暂无 clip 明细。</div>
         ) : (
           <div
-            className={`console-soft-scrollbar max-h-80 overflow-auto rounded-lg border border-console-line bg-console-panel ${
+            className={`console-soft-scrollbar max-h-80 overflow-auto ${
               clipScrollbar.isVerticalScrollbarNear ? "is-scrollbar-vertical-near" : ""
             } ${clipScrollbar.isHorizontalScrollbarNear ? "is-scrollbar-horizontal-near" : ""}`}
             data-testid="navigation-clip-scroll"
@@ -255,7 +254,7 @@ function ClipRows({
           >
             <table className="w-full min-w-[980px] text-left text-sm">
               <thead className="text-xs text-console-muted">
-                <tr className="border-b border-console-line bg-console-panel2/70">
+                <tr className="border-b border-console-line bg-transparent">
                   <th className="py-2 pl-3 pr-3 font-medium">clip 名称</th>
                   <th className="py-2 pr-3 font-medium">时长</th>
                   <th className="py-2 pr-3 font-medium">topic 摘要</th>
@@ -275,7 +274,7 @@ function ClipRows({
                   return (
                     <tr
                       key={`${clip.date}-${clip.clip}`}
-                      className={`border-b border-console-line/70 last:border-b-0 ${
+                      className={`border-b border-console-line/70 bg-console-panel/70 last:border-b-0 ${
                         isHighlighted ? "bg-console-cyan/10 ring-1 ring-inset ring-console-cyan/25" : ""
                       }`}
                     >
@@ -321,23 +320,27 @@ function DatasetTable({
   highlightedClip,
   onToggleDate,
   onViewSyncImages,
+  onOpenDataPilot,
 }: {
   dates: NavigationDateSummary[];
   expandedDate: string | null;
   highlightedClip: string | null;
   onToggleDate: (date: string) => void;
   onViewSyncImages: (clip: NavigationClipSummary, opener: HTMLElement) => void;
+  onOpenDataPilot: () => void;
 }) {
   const datasetScrollbar = useScrollbarProximity();
 
   return (
-    <ConsoleCard>
-      <div className="mb-4 flex items-start justify-between gap-3">
-        <div>
-          <h2 className="text-base font-semibold text-console-text">导航数据集</h2>
-          <p className="mt-1 text-sm text-console-muted">按日期查看 raw_data、tmp_dir 与 sync_data 处理状态</p>
-        </div>
-        <StatusTag tone="info">{formatCount(dates.length)} 个日期</StatusTag>
+    <section className="overflow-hidden rounded-lg border border-console-line bg-console-panel shadow-sm">
+      <div className="flex flex-col items-start justify-between gap-3 border-b border-console-line px-4 py-3 sm:flex-row sm:items-center">
+        <p className="text-sm text-console-muted">
+          共 <span className="font-semibold text-console-text">{formatCount(dates.length)}</span> 个日期批次
+        </p>
+        <ConsoleButton variant="primary" onClick={onOpenDataPilot}>
+          <Bot aria-hidden="true" className="h-4 w-4" />
+          交给 DataPilot
+        </ConsoleButton>
       </div>
       <div
         className={`console-soft-scrollbar max-h-[62vh] overflow-auto pb-3 ${
@@ -348,43 +351,56 @@ function DatasetTable({
         onPointerLeave={datasetScrollbar.onPointerLeave}
         onPointerMove={datasetScrollbar.onPointerMove}
       >
-        <table className="w-full min-w-[1040px] text-left text-sm">
+        <table className="w-full min-w-[980px] text-left text-sm">
           <thead className="text-xs text-console-muted">
-            <tr className="border-b border-console-line">
-              <th className="py-2 pr-3 font-medium">日期</th>
+            <tr className="border-b border-console-line bg-console-panel2/70">
+              <th className="py-3 pl-4 pr-3 font-medium">日期</th>
               <th className="py-2 pr-3 font-medium">clip 数</th>
               <th className="py-2 pr-3 font-medium">总时长</th>
               <th className="py-2 pr-3 font-medium">raw 消息</th>
               <th className="py-2 pr-3 font-medium">已拆解 clip</th>
               <th className="py-2 pr-3 font-medium">同步 clip 数</th>
               <th className="py-2 pr-3 font-medium">同步图像帧</th>
-              <th className="py-2 pr-3 font-medium">状态</th>
-              <th className="py-2 pr-3 font-medium">展开</th>
+              <th className="py-2 pr-4 font-medium">状态</th>
             </tr>
           </thead>
           <tbody>
-            {dates.map((date) => {
+            {dates.length === 0 ? (
+              <tr>
+                <td colSpan={8} className="px-4 py-10 text-center text-sm text-console-muted">
+                  <Layers3 aria-hidden="true" className="mx-auto mb-3 h-6 w-6" />
+                  暂无匹配的导航数据集。
+                </td>
+              </tr>
+            ) : dates.map((date) => {
               const isExpanded = expandedDate === date.date;
               const ExpandIcon = isExpanded ? ChevronDown : ChevronRight;
 
               return (
                 <Fragment key={date.date}>
-                  <tr className="border-b border-console-line/70">
-                    <td className="py-3 pr-3 font-medium text-console-text">{date.date}</td>
+                  <tr className={`border-b border-console-line/70 transition-colors hover:bg-console-panel2/55 ${isExpanded ? "bg-blue-50/35" : ""}`}>
+                    <td className="py-3 pl-3 pr-3 font-medium text-console-text">
+                      <div className="flex items-center gap-2">
+                        <button
+                          aria-expanded={isExpanded}
+                          aria-label={`${isExpanded ? "收起" : "展开"} ${date.date}`}
+                          className="flex h-7 w-7 shrink-0 items-center justify-center rounded-md text-console-muted transition hover:bg-console-panel2 hover:text-console-cyan focus:outline-none focus:ring-2 focus:ring-console-cyan"
+                          onClick={() => onToggleDate(date.date)}
+                          type="button"
+                        >
+                          <ExpandIcon aria-hidden="true" className="h-4 w-4" />
+                        </button>
+                        <span>{date.date}</span>
+                      </div>
+                    </td>
                     <td className="py-3 pr-3 text-console-muted">{formatCount(date.clip_count)}</td>
                     <td className="py-3 pr-3 text-console-muted">{formatDuration(date.total_duration_ns)}</td>
                     <td className="py-3 pr-3 text-console-muted">{formatCount(date.raw_message_count)}</td>
                     <td className="py-3 pr-3 text-console-muted">{formatCount(date.extracted_clip_count)}</td>
                     <td className="py-3 pr-3 text-console-muted">{formatCount(date.synced_clip_count)}</td>
                     <td className="py-3 pr-3 text-console-muted">{formatCount(date.sync_frame_counts.image)}</td>
-                    <td className="py-3 pr-3">
+                    <td className="py-3 pr-4">
                       <StatusCell status={date.status} />
-                    </td>
-                    <td className="py-3 pr-3">
-                      <ConsoleButton className="h-8 px-2 text-xs" aria-label={`${isExpanded ? "收起" : "展开"} ${date.date}`} onClick={() => onToggleDate(date.date)}>
-                        <ExpandIcon aria-hidden="true" className="h-4 w-4" />
-                        {isExpanded ? "收起" : "展开"}
-                      </ConsoleButton>
                     </td>
                   </tr>
                   {isExpanded ? <ClipRows clips={date.clips ?? []} highlightedClip={highlightedClip} onViewSyncImages={onViewSyncImages} /> : null}
@@ -394,7 +410,7 @@ function DatasetTable({
           </tbody>
         </table>
       </div>
-    </ConsoleCard>
+    </section>
   );
 }
 
@@ -471,7 +487,7 @@ function SelectMenu<T extends string>({
   );
 }
 
-function DataSurfaceTabs({
+function DataSurfaceSwitch({
   activeSurface,
   onChange,
 }: {
@@ -479,9 +495,18 @@ function DataSurfaceTabs({
   onChange: (surface: DataSurface) => void;
 }) {
   return (
-    <div className="flex flex-wrap gap-2" role="tablist" aria-label="数据类型">
+    <div
+      className="relative grid h-10 w-[15rem] grid-cols-2 rounded-lg bg-console-panel2 p-1 ring-1 ring-inset ring-console-line"
+      role="tablist"
+      aria-label="数据类型"
+    >
+      <span
+        aria-hidden="true"
+        className={`pointer-events-none absolute bottom-1 left-1 top-1 w-[calc(50%_-_0.25rem)] rounded-md border border-console-line/80 bg-console-panel shadow-sm transition-transform duration-200 ease-out ${
+          activeSurface === "robotic_arm" ? "translate-x-full" : "translate-x-0"
+        }`}
+      />
       {dataSurfaces.map((surface) => {
-        const Icon = surface.icon;
         const active = activeSurface === surface.id;
 
         return (
@@ -490,14 +515,11 @@ function DataSurfaceTabs({
             type="button"
             role="tab"
             aria-selected={active}
-            className={`inline-flex h-10 items-center gap-2 rounded-lg border px-4 text-sm font-semibold transition focus:outline-none focus:ring-2 focus:ring-console-cyan ${
-              active
-                ? "border-console-cyan bg-blue-50 text-console-cyan shadow-sm"
-                : "border-console-line bg-console-panel text-console-muted hover:border-console-cyan/40 hover:bg-console-panel2 hover:text-console-text"
+            className={`relative z-10 inline-flex h-8 items-center justify-center rounded-md px-3 text-sm font-semibold transition focus:outline-none focus-visible:ring-2 focus-visible:ring-slate-300 ${
+              active ? "text-console-text" : "text-console-muted hover:text-console-text"
             }`}
             onClick={() => onChange(surface.id)}
           >
-            <Icon aria-hidden="true" className="h-4 w-4" />
             {surface.label}
           </button>
         );
@@ -803,7 +825,10 @@ export function DataManagementPage({ onPlaceholderAction }: DataManagementPagePr
   const [highlightedClip, setHighlightedClip] = useState<{ date: string; clip: string } | null>(null);
   const [expandedDate, setExpandedDate] = useState<string | null>(null);
   const [syncImageClip, setSyncImageClip] = useState<NavigationClipSummary | null>(null);
+  const [dataPilotDialogOpen, setDataPilotDialogOpen] = useState(false);
+  const [activeInvocationId, setActiveInvocationId] = useState<string | null>(null);
   const { summary: datasetSummary, loading, error } = useNavigationDatasetSummary();
+  const pendingInvocation = useStore(datapilotStore, (state) => state.pendingInvocation);
   const syncImageOpenerRef = useRef<HTMLElement | null>(null);
 
   const totals = datasetSummary?.totals;
@@ -849,6 +874,28 @@ export function DataManagementPage({ onPlaceholderAction }: DataManagementPagePr
     });
   }, [dates, matchingClipDate, searchQuery, statusFilter]);
   const effectiveExpandedDate = matchingClipDate?.date ?? expandedDate;
+  const activeInvocation =
+    activeInvocationId && pendingInvocation?.invocationId === activeInvocationId
+      ? pendingInvocation
+      : null;
+  const submittingToDataPilot =
+    activeInvocation?.status === "queued" || activeInvocation?.status === "submitting";
+  const dataPilotInvocationError =
+    activeInvocation?.status === "failed" || activeInvocation?.status === "blocked"
+      ? activeInvocation.error ?? "提交失败，请重试。"
+      : null;
+
+  useEffect(() => {
+    if (!activeInvocationId || pendingInvocation?.invocationId !== activeInvocationId) {
+      return;
+    }
+    if (pendingInvocation.status !== "submitted") {
+      return;
+    }
+    setDataPilotDialogOpen(false);
+    setActiveInvocationId(null);
+    datapilotStore.getState().clearDataPilotInvocation(activeInvocationId);
+  }, [activeInvocationId, pendingInvocation]);
 
   function handleToggleDate(date: string) {
     setExpandedDate((currentDate) => (currentDate === date ? null : date));
@@ -880,16 +927,60 @@ export function DataManagementPage({ onPlaceholderAction }: DataManagementPagePr
     setExpandedDate(date);
   }
 
+  function handleOpenDataPilotDialog() {
+    setDataPilotDialogOpen(true);
+  }
+
+  function handleCancelDataPilotDialog() {
+    if (activeInvocationId) {
+      datapilotStore.getState().clearDataPilotInvocation(activeInvocationId);
+    }
+    setActiveInvocationId(null);
+    setDataPilotDialogOpen(false);
+  }
+
+  function handleDataPilotSelectionChange() {
+    if (
+      activeInvocationId &&
+      pendingInvocation?.invocationId === activeInvocationId &&
+      (pendingInvocation.status === "failed" || pendingInvocation.status === "blocked")
+    ) {
+      datapilotStore.getState().clearDataPilotInvocation(activeInvocationId);
+      setActiveInvocationId(null);
+    }
+  }
+
+  function handleConfirmDataPilot(selection: NavigationDatasetSelection) {
+    const message = buildNavigationDatasetRequest(selection);
+    if (
+      activeInvocationId &&
+      pendingInvocation?.invocationId === activeInvocationId &&
+      pendingInvocation.message === message &&
+      (pendingInvocation.status === "failed" || pendingInvocation.status === "blocked")
+    ) {
+      datapilotStore.getState().retryDataPilotInvocation(activeInvocationId);
+      return;
+    }
+
+    if (activeInvocationId) {
+      datapilotStore.getState().clearDataPilotInvocation(activeInvocationId);
+    }
+    const invocationId = createInvocationId();
+    if (datapilotStore.getState().launchDataPilotRequest(invocationId, message)) {
+      setActiveInvocationId(invocationId);
+    }
+  }
+
   return (
-    <section className="mx-auto max-w-7xl space-y-4 px-4 py-6 md:px-6">
+    <section className="mx-auto max-w-7xl space-y-3 px-4 py-5 md:px-6">
       <div className="space-y-4">
-        <DataSurfaceTabs activeSurface={activeSurface} onChange={setActiveSurface} />
+        <DataSurfaceSwitch activeSurface={activeSurface} onChange={setActiveSurface} />
         <div className="flex flex-col gap-3 lg:flex-row lg:items-center">
           <div className="flex flex-wrap gap-2">
             <SelectMenu label="全部场景" options={sceneOptions} value={sceneFilter} onChange={setSceneFilter} />
             <SelectMenu label="全部状态" options={statusOptions} value={statusFilter} onChange={setStatusFilter} />
           </div>
-          <div className="relative min-w-0 flex-1">
+          <div className="relative w-full min-w-0 sm:w-96 sm:flex-none">
             <Search aria-hidden="true" className="pointer-events-none absolute left-3 top-1/2 h-4 w-4 -translate-y-1/2 text-console-muted" />
             <input
               className="h-10 w-full rounded-lg border border-console-line bg-console-panel px-9 text-sm text-console-text shadow-sm outline-none transition placeholder:text-console-muted focus:border-console-cyan focus:ring-2 focus:ring-console-cyan/20"
@@ -934,7 +1025,7 @@ export function DataManagementPage({ onPlaceholderAction }: DataManagementPagePr
       {activeSurface === "navigation" ? (
         <>
           <div
-            className="flex flex-wrap items-center gap-x-4 gap-y-2 bg-transparent text-console-muted"
+            className="flex flex-wrap items-center gap-x-4 gap-y-2 border-y border-console-line bg-transparent px-1 py-3 text-console-muted"
             data-testid="navigation-summary-strip"
           >
             <SummaryStat icon={Database} label="日期批次" value={formatCount(totals?.date_count ?? 0)} />
@@ -950,11 +1041,6 @@ export function DataManagementPage({ onPlaceholderAction }: DataManagementPagePr
             <ConsoleCard className="py-8 text-center text-sm text-console-muted">正在加载导航数据集...</ConsoleCard>
           ) : error ? (
             <ConsoleCard className="border-rose-200 bg-rose-50/60 py-8 text-center text-sm text-rose-700">{error}</ConsoleCard>
-          ) : visibleDates.length === 0 ? (
-            <ConsoleCard className="py-8 text-center text-sm text-console-muted">
-              <Layers3 aria-hidden="true" className="mx-auto mb-3 h-6 w-6 text-console-muted" />
-              暂无匹配的导航数据集。
-            </ConsoleCard>
           ) : (
             <DatasetTable
               dates={visibleDates}
@@ -962,6 +1048,7 @@ export function DataManagementPage({ onPlaceholderAction }: DataManagementPagePr
               highlightedClip={highlightedClip?.clip ?? (searchQuery.trim().length > 8 ? searchQuery.trim() : null)}
               onToggleDate={handleToggleDate}
               onViewSyncImages={handleViewSyncImages}
+              onOpenDataPilot={handleOpenDataPilotDialog}
             />
           )}
         </>
@@ -970,6 +1057,22 @@ export function DataManagementPage({ onPlaceholderAction }: DataManagementPagePr
       )}
 
       <SyncImageDrawer clip={syncImageClip} onClose={handleCloseSyncImages} />
+      <NavigationDataPilotDialog
+        dates={dates}
+        error={dataPilotInvocationError}
+        open={dataPilotDialogOpen}
+        submitting={submittingToDataPilot}
+        onCancel={handleCancelDataPilotDialog}
+        onConfirm={handleConfirmDataPilot}
+        onSelectionChange={handleDataPilotSelectionChange}
+      />
     </section>
   );
+}
+
+function createInvocationId(): string {
+  if (typeof crypto !== "undefined" && "randomUUID" in crypto) {
+    return `navigation-${crypto.randomUUID()}`;
+  }
+  return `navigation-${Date.now()}-${Math.random().toString(16).slice(2)}`;
 }

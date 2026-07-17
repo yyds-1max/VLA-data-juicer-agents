@@ -12,6 +12,21 @@ import type {
 import { applyAgentEvent, createEmptyRunState, type RunState } from "./eventReducer";
 
 export type SessionMode = "draft_new_session" | "active_session" | "history_session";
+export type DataPilotInvocationStatus =
+  | "queued"
+  | "submitting"
+  | "submitted"
+  | "failed"
+  | "blocked";
+
+export interface DataPilotInvocation {
+  invocationId: string;
+  message: string;
+  status: DataPilotInvocationStatus;
+  sessionId?: string;
+  error?: string;
+}
+
 type OrderedTimelineItem = RunState["timeline"][number] & {
   createdAt?: string;
   sequence?: number;
@@ -24,10 +39,12 @@ export interface DataPilotStoreState {
   mode: SessionMode;
   currentSessionId: string | null;
   previousActiveSessionId: string | null;
+  knownRunningSessionId: string | null;
   sessions: SessionRecord[];
   messages: ChatMessageRecord[];
   turns: TurnRecord[];
   run: RunState;
+  pendingInvocation: DataPilotInvocation | null;
   floatingOffset: { x: number; y: number };
   setOpen: (open: boolean) => void;
   setFloatingOffset: (offset: { x: number; y: number }) => void;
@@ -41,6 +58,15 @@ export interface DataPilotStoreState {
   discardLocalMessage: (messageId: string) => void;
   discardLocalTurn: (turnId: string) => void;
   adoptTurnId: (localTurnId: string, turnId: string) => void;
+  launchDataPilotRequest: (invocationId: string, message: string) => boolean;
+  claimDataPilotInvocation: (invocationId: string) => boolean;
+  setDataPilotInvocationSession: (invocationId: string, sessionId: string) => void;
+  completeDataPilotInvocation: (invocationId: string) => void;
+  failDataPilotInvocation: (invocationId: string, error: string) => void;
+  blockDataPilotInvocation: (invocationId: string, error: string) => void;
+  retryDataPilotInvocation: (invocationId: string) => boolean;
+  clearDataPilotInvocation: (invocationId?: string) => void;
+  updateKnownRunningSession: (sessionId: string, running: boolean) => void;
   applyEvent: (event: AgentEvent) => void;
   clearPendingHumanDecision: (
     expectedDecision: PendingHumanDecision,
@@ -51,15 +77,17 @@ export interface DataPilotStoreState {
 export type DataPilotStore = ReturnType<typeof createDataPilotStore>;
 
 export function createDataPilotStore() {
-  return createStore<DataPilotStoreState>((set) => ({
+  return createStore<DataPilotStoreState>((set, get) => ({
     open: false,
     mode: "draft_new_session",
     currentSessionId: null,
     previousActiveSessionId: null,
+    knownRunningSessionId: null,
     sessions: [],
     messages: [],
     turns: [],
     run: createEmptyRunState(),
+    pendingInvocation: null,
     floatingOffset: { x: 0, y: 0 },
 
     setOpen: (open) => set({ open }),
@@ -85,6 +113,9 @@ export function createDataPilotStore() {
         currentSessionId: session.id,
         previousActiveSessionId: null,
         sessions: upsertSession(state.sessions, session),
+        messages: [],
+        turns: [],
+        run: createEmptyRunState(),
       })),
 
     refreshActiveSession: (session) =>
@@ -93,24 +124,44 @@ export function createDataPilotStore() {
           return {};
         }
 
+        const turns = mergeTurns(state.turns, session.turns ?? []);
+        const run = session.events?.length ? mergeRunFromEvents(state.run, session.events) : state.run;
+        const running = session.turns
+          ? hasRunningTurn(session.turns)
+          : run.running || hasRunningTurn(turns);
         return {
           sessions: upsertSession(state.sessions, session),
           messages: mergeMessages(state.messages, session.messages),
-          turns: mergeTurns(state.turns, session.turns ?? []),
-          ...(session.events?.length ? { run: mergeRunFromEvents(state.run, session.events) } : {}),
+          turns,
+          ...(run !== state.run ? { run } : {}),
+          knownRunningSessionId: running
+            ? session.id
+            : state.knownRunningSessionId === session.id
+              ? null
+              : state.knownRunningSessionId,
         };
       }),
 
     restoreActiveSession: (session, messages) =>
-      set((state) => ({
-        mode: "active_session",
-        currentSessionId: session.id,
-        previousActiveSessionId: null,
-        sessions: upsertSession(state.sessions, session),
-        messages: [...(messages ?? ("messages" in session ? session.messages : []))],
-        turns: "turns" in session ? [...(session.turns ?? [])] : [],
-        run: runFromEvents("events" in session ? (session.events ?? []) : []),
-      })),
+      set((state) => {
+        const turns = "turns" in session ? [...(session.turns ?? [])] : [];
+        const run = runFromEvents("events" in session ? (session.events ?? []) : []);
+        const running = hasRunningTurn(turns) || run.running;
+        return {
+          mode: "active_session",
+          currentSessionId: session.id,
+          previousActiveSessionId: null,
+          sessions: upsertSession(state.sessions, session),
+          messages: [...(messages ?? ("messages" in session ? session.messages : []))],
+          turns,
+          run,
+          knownRunningSessionId: running
+            ? session.id
+            : state.knownRunningSessionId === session.id
+              ? null
+              : state.knownRunningSessionId,
+        };
+      }),
 
     restoreHistory: (session, messages) =>
       set((state) => ({
@@ -150,11 +201,123 @@ export function createDataPilotStore() {
         run: remapRunTurnId(state.run, localTurnId, turnId),
       })),
 
+    launchDataPilotRequest: (invocationId, message) => {
+      const current = get().pendingInvocation;
+      if (current?.status === "queued" || current?.status === "submitting") {
+        set({ open: true });
+        return false;
+      }
+      set({
+        open: true,
+        pendingInvocation: { invocationId, message, status: "queued" },
+      });
+      return true;
+    },
+
+    claimDataPilotInvocation: (invocationId) => {
+      const current = get().pendingInvocation;
+      if (current?.invocationId !== invocationId || current.status !== "queued") {
+        return false;
+      }
+      set({ pendingInvocation: { ...current, status: "submitting", error: undefined } });
+      return true;
+    },
+
+    setDataPilotInvocationSession: (invocationId, sessionId) =>
+      set((state) =>
+        state.pendingInvocation?.invocationId === invocationId
+          ? { pendingInvocation: { ...state.pendingInvocation, sessionId } }
+          : {},
+      ),
+
+    completeDataPilotInvocation: (invocationId) =>
+      set((state) =>
+        state.pendingInvocation?.invocationId === invocationId
+          ? {
+              pendingInvocation: {
+                ...state.pendingInvocation,
+                status: "submitted",
+                error: undefined,
+              },
+            }
+          : {},
+      ),
+
+    failDataPilotInvocation: (invocationId, error) =>
+      set((state) =>
+        state.pendingInvocation?.invocationId === invocationId
+          ? {
+              pendingInvocation: {
+                ...state.pendingInvocation,
+                status: "failed",
+                error,
+              },
+            }
+          : {},
+      ),
+
+    blockDataPilotInvocation: (invocationId, error) =>
+      set((state) =>
+        state.pendingInvocation?.invocationId === invocationId
+          ? {
+              pendingInvocation: {
+                ...state.pendingInvocation,
+                status: "blocked",
+                error,
+              },
+            }
+          : {},
+      ),
+
+    retryDataPilotInvocation: (invocationId) => {
+      const current = get().pendingInvocation;
+      if (
+        current?.invocationId !== invocationId ||
+        (current.status !== "failed" && current.status !== "blocked")
+      ) {
+        return false;
+      }
+      set({
+        open: true,
+        pendingInvocation: { ...current, status: "queued", error: undefined },
+      });
+      return true;
+    },
+
+    clearDataPilotInvocation: (invocationId) =>
+      set((state) => {
+        if (invocationId && state.pendingInvocation?.invocationId !== invocationId) {
+          return {};
+        }
+        return { pendingInvocation: null };
+      }),
+
+    updateKnownRunningSession: (sessionId, running) =>
+      set((state) => ({
+        knownRunningSessionId: running
+          ? sessionId
+          : state.knownRunningSessionId === sessionId
+            ? null
+            : state.knownRunningSessionId,
+      })),
+
     applyEvent: (event) =>
       set((state) => {
         const run = cloneRunState(state.run);
         applyLiveEvent(run, event);
-        return { run, turns: applyTurnEvent(state.turns, event, state.currentSessionId) };
+        const turns = applyTurnEvent(state.turns, event, state.currentSessionId);
+        const running = run.running || hasRunningTurn(turns);
+        return {
+          run,
+          turns,
+          knownRunningSessionId: state.currentSessionId
+            ? running
+              ? state.currentSessionId
+              : state.knownRunningSessionId === state.currentSessionId
+                ? null
+                : state.knownRunningSessionId
+            : state.knownRunningSessionId,
+        };
       }),
 
     clearPendingHumanDecision: (expectedDecision, expectedSessionId) =>
@@ -173,6 +336,10 @@ export function createDataPilotStore() {
 }
 
 export const datapilotStore = createDataPilotStore();
+
+function hasRunningTurn(turns: TurnRecord[]): boolean {
+  return turns.some((turn) => turn.status === "running" || turn.status === "waiting");
+}
 
 function upsertSession(sessions: SessionRecord[], session: SessionRecord): SessionRecord[] {
   const next = sessions.filter((item) => item.id !== session.id);
