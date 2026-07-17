@@ -242,7 +242,9 @@ export function DataPilotWindow() {
       store.appendUserMessage(userMessage);
       store.applyEvent(localTurnEvent("turn_start", sessionId, localTurnId));
       openEvents(sessionId);
-      const turnId = await submitTurn(sessionId, message);
+      const turnId = options.invocationId
+        ? await submitTurn(sessionId, message, options.invocationId)
+        : await submitTurn(sessionId, message);
       datapilotStore.getState().adoptTurnId(localTurnId, turnId);
       if (options.invocationId) {
         datapilotStore.getState().completeDataPilotInvocation(options.invocationId);

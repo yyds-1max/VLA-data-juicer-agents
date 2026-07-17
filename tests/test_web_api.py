@@ -98,6 +98,41 @@ def test_submit_turn_returns_turn_id(tmp_path: Path):
     assert response.json()["turn_id"].startswith("turn_")
 
 
+def test_submit_turn_replays_same_invocation_without_resubmitting(tmp_path: Path):
+    client = make_client(tmp_path)
+    session_id = _create_session(client)
+    payload = {"message": "开始处理", "invocation_id": "navigation-request-1"}
+
+    first = client.post(f"/api/sessions/{session_id}/turns", json=payload)
+    replay = client.post(f"/api/sessions/{session_id}/turns", json=payload)
+
+    assert first.status_code == 200
+    assert replay.status_code == 200
+    assert replay.json()["turn_id"] == first.json()["turn_id"]
+    assert FakeController.created[0].submitted == ["开始处理"]
+    detail = client.get(f"/api/sessions/{session_id}").json()["session"]
+    assert len(detail["turns"]) == 1
+    assert [message["content"] for message in detail["messages"]].count("开始处理") == 1
+
+
+def test_submit_turn_same_invocation_always_returns_original_turn(tmp_path: Path):
+    client = make_client(tmp_path)
+    session_id = _create_session(client)
+
+    first = client.post(
+        f"/api/sessions/{session_id}/turns",
+        json={"message": "开始处理", "invocation_id": "navigation-request-1"},
+    )
+    replay = client.post(
+        f"/api/sessions/{session_id}/turns",
+        json={"message": "这条消息不会被再次执行", "invocation_id": "navigation-request-1"},
+    )
+
+    assert replay.status_code == 200
+    assert replay.json()["turn_id"] == first.json()["turn_id"]
+    assert FakeController.created[0].submitted == ["开始处理"]
+
+
 def test_create_app_accepts_positional_configuration(tmp_path: Path):
     FakeController.created = []
     app = create_app(str(tmp_path / ".djx"), "qwen-positional", tmp_path / "sessions.sqlite", FakeController)

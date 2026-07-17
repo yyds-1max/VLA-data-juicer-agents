@@ -407,7 +407,13 @@ test("data management sends selected clips through a new visible DataPilot sessi
     "请先检查当前实际产物状态，再根据检查结果决定从哪一步开始。",
   ].join("\n");
   await waitFor(() => expect(apiMocks.createSession).toHaveBeenCalledWith(message));
-  await waitFor(() => expect(apiMocks.submitTurn).toHaveBeenCalledWith("session-created", message));
+  await waitFor(() =>
+    expect(apiMocks.submitTurn).toHaveBeenCalledWith(
+      "session-created",
+      message,
+      expect.stringMatching(/^navigation-/),
+    ),
+  );
   await waitFor(() => expect(screen.queryByRole("dialog", { name: "交给 DataPilot" })).not.toBeInTheDocument());
   expect(datapilotStore.getState().open).toBe(true);
   expect(datapilotStore.getState().messages).toEqual([
@@ -585,7 +591,12 @@ test("data management shortcut retries submit in the session it already created"
   fireEvent.click(screen.getByRole("button", { name: "确定" }));
 
   await waitFor(() => expect(apiMocks.submitTurn).toHaveBeenCalledTimes(2));
-  expect(apiMocks.submitTurn).toHaveBeenLastCalledWith("session-created", expect.stringContaining("- clip_a"));
+  expect(apiMocks.submitTurn).toHaveBeenLastCalledWith(
+    "session-created",
+    expect.stringContaining("- clip_a"),
+    expect.stringMatching(/^navigation-/),
+  );
+  expect(apiMocks.submitTurn.mock.calls[1][2]).toBe(apiMocks.submitTurn.mock.calls[0][2]);
   expect(apiMocks.createSession).toHaveBeenCalledTimes(1);
   await waitFor(() => expect(screen.queryByRole("dialog", { name: "交给 DataPilot" })).not.toBeInTheDocument());
   consoleError.mockRestore();
@@ -624,7 +635,14 @@ test("changing selection after a failed shortcut creates a new invocation and se
   fireEvent.click(screen.getByRole("button", { name: "确定" }));
 
   await waitFor(() => expect(apiMocks.createSession).toHaveBeenCalledTimes(2));
-  await waitFor(() => expect(apiMocks.submitTurn).toHaveBeenLastCalledWith("session-changed", expect.any(String)));
+  await waitFor(() =>
+    expect(apiMocks.submitTurn).toHaveBeenLastCalledWith(
+      "session-changed",
+      expect.any(String),
+      expect.stringMatching(/^navigation-/),
+    ),
+  );
+  expect(apiMocks.submitTurn.mock.calls[1][2]).not.toBe(apiMocks.submitTurn.mock.calls[0][2]);
   expect(apiMocks.createSession).toHaveBeenLastCalledWith(
     expect.not.stringContaining("指定 clips："),
   );

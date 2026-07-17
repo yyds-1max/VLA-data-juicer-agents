@@ -156,6 +156,17 @@ class RejectingAgentScopeRuntime(FakeAgentScopeRuntime):
         raise RuntimeError("turn rejected")
 
 
+class DelayedAgentScopeRuntime(FakeAgentScopeRuntime):
+    def __init__(self) -> None:
+        super().__init__()
+        self.release = asyncio.Event()
+
+    async def submit_user_message(self, *, web_session_id: str, message: str) -> str:
+        self.submissions.append({"web_session_id": web_session_id, "message": message})
+        await self.release.wait()
+        return self.turn_id
+
+
 class InterruptingAgentScopeRuntime(FakeAgentScopeRuntime):
     def __init__(self, turn_id: str = "turn_runtime_1", interrupted: bool = True) -> None:
         super().__init__(turn_id=turn_id)
@@ -3298,15 +3309,57 @@ async def test_submit_turn_appends_user_message_calls_runtime_and_returns_turn_i
     manager = AgentScopeWebSessionManager(store=store, runtime=runtime)
     session = await manager.create_session("处理 20270605")
 
-    turn_id = await manager.submit_turn(session.id, "开始处理")
+    submission = await manager.submit_turn(session.id, "开始处理")
 
-    assert turn_id.startswith("turn_")
+    assert submission.turn.id.startswith("turn_")
+    assert submission.created is True
     assert runtime.submissions == [{"web_session_id": session.id, "message": "开始处理"}]
     detail = store.get_session(session.id)
     assert detail is not None
-    assert detail.turns[0].id == turn_id
-    assert detail.messages[0].turn_id == turn_id
+    assert detail.turns[0].id == submission.turn.id
+    assert detail.messages[0].turn_id == submission.turn.id
     assert [(message.role, message.content) for message in detail.messages] == [("user", "开始处理")]
+
+
+@pytest.mark.asyncio
+async def test_submit_turn_reuses_invocation_without_calling_runtime_twice(tmp_path: Path) -> None:
+    store = WebSessionStore(tmp_path / "sessions.sqlite")
+    runtime = FakeAgentScopeRuntime()
+    manager = AgentScopeWebSessionManager(store=store, runtime=runtime)
+    session = await manager.create_session("处理 20270605")
+
+    first = await manager.submit_turn(session.id, "开始处理", "invocation-1")
+    replay = await manager.submit_turn(session.id, "开始处理", "invocation-1")
+
+    assert replay.turn.id == first.turn.id
+    assert first.created is True
+    assert replay.created is False
+    assert runtime.submissions == [{"web_session_id": session.id, "message": "开始处理"}]
+
+
+@pytest.mark.asyncio
+async def test_concurrent_invocation_replay_waits_for_initial_runtime_submission(tmp_path: Path) -> None:
+    store = WebSessionStore(tmp_path / "sessions.sqlite")
+    runtime = DelayedAgentScopeRuntime()
+    manager = AgentScopeWebSessionManager(store=store, runtime=runtime)
+    session = await manager.create_session("处理 20270605")
+
+    first_task = asyncio.create_task(
+        manager.submit_turn(session.id, "开始处理", "invocation-1")
+    )
+    await asyncio.sleep(0)
+    replay_task = asyncio.create_task(
+        manager.submit_turn(session.id, "开始处理", "invocation-1")
+    )
+    await asyncio.sleep(0)
+
+    assert replay_task.done() is False
+    runtime.release.set()
+    first, replay = await asyncio.gather(first_task, replay_task)
+
+    assert replay.turn.id == first.turn.id
+    assert replay.created is False
+    assert runtime.submissions == [{"web_session_id": session.id, "message": "开始处理"}]
 
 
 @pytest.mark.asyncio

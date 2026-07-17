@@ -104,6 +104,20 @@ describe("api client", () => {
     });
   });
 
+  it("includes an invocation id when submitting an idempotent turn", async () => {
+    const fetchMock = mockFetchJson({ turn_id: "turn-1" });
+
+    await expect(submitTurn("session-1", "next", "navigation-request-1")).resolves.toBe("turn-1");
+    expect(fetchMock).toHaveBeenCalledWith("/api/sessions/session-1/turns", {
+      method: "POST",
+      body: JSON.stringify({
+        message: "next",
+        invocation_id: "navigation-request-1",
+      }),
+      headers: { "content-type": "application/json" },
+    });
+  });
+
   it("encodes the session id and posts an interrupt request", async () => {
     const fetchMock = mockFetchJson({ interrupted: true });
 

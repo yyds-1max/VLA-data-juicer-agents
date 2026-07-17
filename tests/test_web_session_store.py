@@ -1,3 +1,5 @@
+import sqlite3
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import pytest
@@ -30,6 +32,11 @@ def test_turn_request_rejects_empty_message():
         assert "message must not be empty" in str(exc)
     else:
         raise AssertionError("expected validation error")
+
+
+def test_turn_request_rejects_empty_invocation_id():
+    with pytest.raises(ValueError, match="invocation_id must not be empty"):
+        CreateTurnRequest(message="处理数据", invocation_id="   ")
 
 
 def test_session_record_serializes_status():
@@ -772,6 +779,96 @@ def test_store_rejects_second_active_turn_and_can_abort_initial_submission(tmp_p
     assert detail.turns == []
     assert detail.messages == []
     assert detail.events == []
+
+
+def test_store_replays_same_invocation_before_active_turn_conflict(tmp_path: Path):
+    store = WebSessionStore(tmp_path / "sessions.sqlite")
+    session = store.create_session(title="idempotent turn")
+
+    first = store.begin_user_turn(
+        session.id,
+        "开始处理",
+        invocation_id="navigation-request-1",
+    )
+    replay = store.begin_user_turn(
+        session.id,
+        "开始处理",
+        invocation_id="navigation-request-1",
+    )
+
+    assert first.created is True
+    assert replay.created is False
+    assert replay.turn.id == first.turn.id
+    assert replay.message.id == first.message.id
+    assert replay.events == ()
+    detail = store.get_session(session.id)
+    assert detail is not None
+    assert len(detail.turns) == 1
+    assert len(detail.messages) == 1
+    assert len(detail.events) == 1
+
+
+def test_store_serializes_concurrent_replays_of_same_invocation(tmp_path: Path):
+    store = WebSessionStore(tmp_path / "sessions.sqlite")
+    session = store.create_session(title="concurrent idempotent turn")
+
+    def submit():
+        return store.begin_user_turn(
+            session.id,
+            "开始处理",
+            invocation_id="navigation-request-1",
+        )
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        submissions = list(executor.map(lambda _index: submit(), range(2)))
+
+    assert len({submission.turn.id for submission in submissions}) == 1
+    assert sorted(submission.created for submission in submissions) == [False, True]
+    detail = store.get_session(session.id)
+    assert detail is not None
+    assert len(detail.turns) == 1
+    assert len(detail.messages) == 1
+
+
+def test_store_migrates_invocation_id_for_existing_database(tmp_path: Path):
+    db_path = tmp_path / "legacy.sqlite"
+    with sqlite3.connect(db_path) as connection:
+        connection.execute(
+            """
+            CREATE TABLE sessions (
+                id TEXT PRIMARY KEY,
+                title TEXT NOT NULL,
+                status TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            )
+            """
+        )
+        connection.execute(
+            """
+            CREATE TABLE web_turns (
+                id TEXT PRIMARY KEY,
+                web_session_id TEXT NOT NULL,
+                origin TEXT NOT NULL,
+                status TEXT NOT NULL,
+                started_at TEXT NOT NULL,
+                finished_at TEXT,
+                final_message_id TEXT
+            )
+            """
+        )
+
+    store = WebSessionStore(db_path)
+    session = store.create_session(title="migrated")
+    first = store.begin_user_turn(session.id, "开始处理", invocation_id="request-1")
+    replay = store.begin_user_turn(session.id, "开始处理", invocation_id="request-1")
+
+    with sqlite3.connect(db_path) as connection:
+        columns = {row[1] for row in connection.execute("PRAGMA table_info(web_turns)")}
+        indexes = {row[1] for row in connection.execute("PRAGMA index_list(web_turns)")}
+    assert "invocation_id" in columns
+    assert "idx_web_turns_session_invocation" in indexes
+    assert replay.turn.id == first.turn.id
 
 
 def test_system_reply_start_creates_turn_and_reply_without_active_user_turn(tmp_path: Path):

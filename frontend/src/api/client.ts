@@ -71,10 +71,17 @@ export async function getSession(sessionId: string): Promise<SessionDetail> {
   return data.session;
 }
 
-export async function submitTurn(sessionId: string, message: string): Promise<string> {
+export async function submitTurn(
+  sessionId: string,
+  message: string,
+  invocationId?: string,
+): Promise<string> {
   const data = await requestJson<{ turn_id: string }>(`${sessionPath(sessionId)}/turns`, {
     method: "POST",
-    body: JSON.stringify({ message }),
+    body: JSON.stringify({
+      message,
+      ...(invocationId ? { invocation_id: invocationId } : {}),
+    }),
   });
   return data.turn_id;
 }

@@ -22,6 +22,7 @@ from vla_data_juicer_agents.tui.controller import SessionController
 from vla_data_juicer_agents.web.event_stream import SessionEventBus
 from vla_data_juicer_agents.web.schemas import (
     CreateSessionResponse,
+    CreateSessionRequest,
     CreateTurnRequest,
     CreateTurnResponse,
     HumanDecisionRequest,
@@ -112,7 +113,7 @@ def create_app(
         app.mount(agentscope_runtime.config.agentscope_mount_path, agentscope_runtime.app)
 
     @app.post("/api/sessions", response_model=CreateSessionResponse)
-    async def create_session(request: CreateTurnRequest) -> CreateSessionResponse:
+    async def create_session(request: CreateSessionRequest) -> CreateSessionResponse:
         session = await _maybe_await(manager.create_session(request.message))
         return CreateSessionResponse(session=session)
 
@@ -158,17 +159,20 @@ def create_app(
     @app.post("/api/sessions/{session_id}/turns", response_model=CreateTurnResponse)
     async def submit_turn(session_id: str, request: CreateTurnRequest) -> CreateTurnResponse:
         try:
-            turn_id = await _maybe_await(manager.submit_turn(session_id, request.message))
+            submission = await _maybe_await(
+                manager.submit_turn(session_id, request.message, request.invocation_id)
+            )
         except KeyError as exc:
             raise HTTPException(status_code=404, detail="Session not found") from exc
         except RuntimeError as exc:
             raise HTTPException(status_code=409, detail=str(exc)) from exc
-        if agentscope_runtime is None:
+        turn_id = submission.turn.id
+        if submission.created and agentscope_runtime is None:
             _create_logged_task(
                 _drain_controller_events(session_id, manager, store, bus, turn_id=turn_id),
                 name=f"controller-events:{session_id}",
             )
-        elif getattr(manager, "event_bridge", None) is None:
+        elif submission.created and getattr(manager, "event_bridge", None) is None:
             _create_logged_task(
                 manager.forward_events_until_idle(session_id),
                 name=f"agentscope-events:{session_id}",

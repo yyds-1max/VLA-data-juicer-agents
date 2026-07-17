@@ -68,7 +68,7 @@ class CreateSessionResponse(BaseModel):
     session: SessionRecord
 
 
-class CreateTurnRequest(BaseModel):
+class CreateSessionRequest(BaseModel):
     message: str
 
     @field_validator("message")
@@ -78,6 +78,20 @@ class CreateTurnRequest(BaseModel):
         if not message:
             raise ValueError("message must not be empty")
         return message
+
+
+class CreateTurnRequest(CreateSessionRequest):
+    invocation_id: str | None = Field(default=None, max_length=200)
+
+    @field_validator("invocation_id")
+    @classmethod
+    def invocation_id_must_not_be_empty(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        invocation_id = value.strip()
+        if not invocation_id:
+            raise ValueError("invocation_id must not be empty")
+        return invocation_id
 
 
 class CreateTurnResponse(BaseModel):

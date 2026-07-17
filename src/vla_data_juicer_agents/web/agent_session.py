@@ -8,7 +8,7 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any
 from vla_data_juicer_agents.web.schemas import SessionRecord, generate_session_title
-from vla_data_juicer_agents.web.session_store import WebSessionStore
+from vla_data_juicer_agents.web.session_store import TurnSubmission, WebSessionStore
 
 EventCallback = Callable[[str, dict[str, Any]], Any]
 logger = logging.getLogger(__name__)
@@ -268,6 +268,7 @@ class AgentScopeWebSessionManager:
         self._runtime = runtime
         self._event_callback = event_callback
         self._forward_locks: dict[str, asyncio.Lock] = {}
+        self._submit_locks: dict[str, asyncio.Lock] = {}
         set_store = getattr(self._runtime, "set_web_session_store", None)
         if callable(set_store):
             set_store(self._store)
@@ -287,27 +288,38 @@ class AgentScopeWebSessionManager:
     async def create_session(self, first_message: str) -> SessionRecord:
         return self._store.create_session(title=generate_session_title(first_message))
 
-    async def submit_turn(self, session_id: str, message: str) -> str:
-        if self._store.get_session(session_id) is None:
-            raise KeyError(session_id)
-        submission = self._store.begin_user_turn(session_id, message)
-        try:
-            submit_message = self._runtime.submit_user_message
-            parameters = inspect.signature(submit_message).parameters
-            if "turn_id" in parameters:
-                await submit_message(
-                    web_session_id=session_id,
-                    message=message,
-                    turn_id=submission.turn.id,
-                )
-            else:
-                await submit_message(web_session_id=session_id, message=message)
-        except Exception:
-            self._store.abort_initial_turn(submission.turn.id)
-            raise
-        for event in submission.events:
-            await self._publish_record(session_id, event)
-        return submission.turn.id
+    async def submit_turn(
+        self,
+        session_id: str,
+        message: str,
+        invocation_id: str | None = None,
+    ) -> TurnSubmission:
+        submit_lock = self._submit_locks.setdefault(session_id, asyncio.Lock())
+        async with submit_lock:
+            submission = self._store.begin_user_turn(
+                session_id,
+                message,
+                invocation_id=invocation_id,
+            )
+            if not submission.created:
+                return submission
+            try:
+                submit_message = self._runtime.submit_user_message
+                parameters = inspect.signature(submit_message).parameters
+                if "turn_id" in parameters:
+                    await submit_message(
+                        web_session_id=session_id,
+                        message=message,
+                        turn_id=submission.turn.id,
+                    )
+                else:
+                    await submit_message(web_session_id=session_id, message=message)
+            except Exception:
+                self._store.abort_initial_turn(submission.turn.id)
+                raise
+            for event in submission.events:
+                await self._publish_record(session_id, event)
+            return submission
 
     async def interrupt(self, session_id: str) -> bool:
         if self._store.get_session(session_id) is None:

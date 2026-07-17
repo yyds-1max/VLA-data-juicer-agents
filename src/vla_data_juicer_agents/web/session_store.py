@@ -48,6 +48,7 @@ class TurnSubmission:
     turn: TurnRecord
     message: ChatMessageRecord
     events: tuple[TimelineEventRecord, ...]
+    created: bool = True
 
 
 class WebSessionStore:
@@ -114,6 +115,7 @@ class WebSessionStore:
                 CREATE TABLE IF NOT EXISTS web_turns (
                     id TEXT PRIMARY KEY,
                     web_session_id TEXT NOT NULL,
+                    invocation_id TEXT,
                     origin TEXT NOT NULL,
                     status TEXT NOT NULL,
                     started_at TEXT NOT NULL,
@@ -144,6 +146,13 @@ class WebSessionStore:
                 CREATE UNIQUE INDEX IF NOT EXISTS idx_web_turns_one_active
                 ON web_turns (web_session_id)
                 WHERE status IN ('running', 'waiting')
+                """
+            )
+            connection.execute(
+                """
+                CREATE UNIQUE INDEX IF NOT EXISTS idx_web_turns_session_invocation
+                ON web_turns (web_session_id, invocation_id)
+                WHERE invocation_id IS NOT NULL
                 """
             )
             connection.execute(
@@ -260,6 +269,11 @@ class WebSessionStore:
         }
         if event_columns and "turn_id" not in event_columns:
             connection.execute("ALTER TABLE timeline_events ADD COLUMN turn_id TEXT")
+        turn_columns = {
+            row["name"] for row in connection.execute("PRAGMA table_info(web_turns)").fetchall()
+        }
+        if turn_columns and "invocation_id" not in turn_columns:
+            connection.execute("ALTER TABLE web_turns ADD COLUMN invocation_id TEXT")
 
     @staticmethod
     def _migrate_agentscope_turn_column(connection: sqlite3.Connection) -> None:
@@ -342,7 +356,13 @@ class WebSessionStore:
             ).fetchall()
         return [self._session_from_row(row) for row in rows]
 
-    def begin_user_turn(self, session_id: str, message: str) -> TurnSubmission:
+    def begin_user_turn(
+        self,
+        session_id: str,
+        message: str,
+        *,
+        invocation_id: str | None = None,
+    ) -> TurnSubmission:
         """Create the authoritative user turn, message and public start event atomically."""
         timestamp = _now()
         turn = TurnRecord(
@@ -367,6 +387,35 @@ class WebSessionStore:
                 (session_id,),
             ).fetchone() is None:
                 raise KeyError(session_id)
+            if invocation_id is not None:
+                existing_turn_row = connection.execute(
+                    """
+                    SELECT id, web_session_id, origin, status, started_at, finished_at,
+                           final_message_id
+                    FROM web_turns
+                    WHERE web_session_id = ? AND invocation_id = ?
+                    """,
+                    (session_id, invocation_id),
+                ).fetchone()
+                if existing_turn_row is not None:
+                    existing_message_row = connection.execute(
+                        """
+                        SELECT id, session_id, turn_id, role, content, created_at
+                        FROM messages
+                        WHERE turn_id = ? AND role = 'user'
+                        ORDER BY created_at ASC, rowid ASC
+                        LIMIT 1
+                        """,
+                        (existing_turn_row["id"],),
+                    ).fetchone()
+                    if existing_message_row is None:
+                        raise RuntimeError("idempotent turn is missing its user message")
+                    return TurnSubmission(
+                        turn=self._turn_from_row(existing_turn_row),
+                        message=self._message_from_row(existing_message_row),
+                        events=(),
+                        created=False,
+                    )
             if connection.execute(
                 """
                 SELECT 1 FROM web_turns
@@ -378,10 +427,11 @@ class WebSessionStore:
             connection.execute(
                 """
                 INSERT INTO web_turns (
-                    id, web_session_id, origin, status, started_at, finished_at, final_message_id
-                ) VALUES (?, ?, 'user', 'running', ?, NULL, NULL)
+                    id, web_session_id, invocation_id, origin, status, started_at,
+                    finished_at, final_message_id
+                ) VALUES (?, ?, ?, 'user', 'running', ?, NULL, NULL)
                 """,
-                (turn.id, session_id, timestamp),
+                (turn.id, session_id, invocation_id, timestamp),
             )
             connection.execute(
                 """

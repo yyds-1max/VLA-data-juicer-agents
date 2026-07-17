@@ -7,7 +7,7 @@ from typing import Any
 
 from vla_data_juicer_agents.tui.controller import SessionController
 from vla_data_juicer_agents.web.schemas import SessionRecord, generate_session_title
-from vla_data_juicer_agents.web.session_store import WebSessionStore
+from vla_data_juicer_agents.web.session_store import TurnSubmission, WebSessionStore
 
 
 ControllerFactory = Callable[..., Any]
@@ -48,16 +48,27 @@ class WebSessionManager:
         with self._lock:
             return self._controllers[session_id]
 
-    def submit_turn(self, session_id: str, message: str) -> str:
+    def submit_turn(
+        self,
+        session_id: str,
+        message: str,
+        invocation_id: str | None = None,
+    ) -> TurnSubmission:
         with self._lock:
-            controller = self.get_controller(session_id)
-            submission = self._store.begin_user_turn(session_id, message)
+            submission = self._store.begin_user_turn(
+                session_id,
+                message,
+                invocation_id=invocation_id,
+            )
+            if not submission.created:
+                return submission
             try:
+                controller = self.get_controller(session_id)
                 controller.submit_turn(message)
             except Exception:
                 self._store.abort_initial_turn(submission.turn.id)
                 raise
-            return submission.turn.id
+            return submission
 
     def interrupt(self, session_id: str) -> bool:
         with self._lock:
