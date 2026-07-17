@@ -44,16 +44,18 @@ const dates: NavigationDateSummary[] = [
 ];
 
 function DialogHarness({
+  availableDates = dates,
   submitting = false,
   onConfirm = vi.fn(),
 }: {
+  availableDates?: NavigationDateSummary[];
   submitting?: boolean;
   onConfirm?: (selection: NavigationDatasetSelection) => void;
 }) {
   const [open, setOpen] = useState(true);
   return (
     <NavigationDataPilotDialog
-      dates={dates}
+      dates={availableDates}
       open={open}
       submitting={submitting}
       onCancel={() => setOpen(false)}
@@ -63,6 +65,11 @@ function DialogHarness({
   );
 }
 
+function selectDate(date: string) {
+  fireEvent.click(screen.getByRole("button", { name: "数据日期" }));
+  fireEvent.click(screen.getByRole("option", { name: new RegExp(date) }));
+}
+
 describe("NavigationDataPilotDialog", () => {
   it("starts empty, supports partial clips, and clears clips when the date changes", () => {
     const onConfirm = vi.fn();
@@ -70,7 +77,7 @@ describe("NavigationDataPilotDialog", () => {
 
     const confirm = screen.getByRole("button", { name: "确定" });
     expect(confirm).toBeDisabled();
-    fireEvent.change(screen.getByLabelText("数据日期"), { target: { value: "20270605" } });
+    selectDate("20270605");
     expect(confirm).toBeDisabled();
 
     fireEvent.click(screen.getByRole("checkbox", { name: "clip_a" }));
@@ -82,14 +89,14 @@ describe("NavigationDataPilotDialog", () => {
       clips: ["clip_a"],
     });
 
-    fireEvent.change(screen.getByLabelText("数据日期"), { target: { value: "20270606" } });
+    selectDate("20270606");
     expect(confirm).toBeDisabled();
   });
 
   it("maps selecting every clip to a whole-date selection", () => {
     const onConfirm = vi.fn();
     render(<DialogHarness onConfirm={onConfirm} />);
-    fireEvent.change(screen.getByLabelText("数据日期"), { target: { value: "20270605" } });
+    selectDate("20270605");
     fireEvent.click(screen.getByRole("checkbox", { name: "全选" }));
     fireEvent.click(screen.getByRole("button", { name: "确定" }));
 
@@ -119,6 +126,25 @@ describe("NavigationDataPilotDialog", () => {
   it("does not use a blue focus ring on the close button", () => {
     render(<DialogHarness />);
     expect(screen.getByRole("button", { name: "关闭数据选择" }).className).not.toContain("ring-console-cyan");
+  });
+
+  it("keeps a stable dialog size and scrolls long date and clip lists internally", () => {
+    const manyDates = Array.from({ length: 40 }, (_, index) => ({
+      ...dates[0],
+      date: `2027${String(index + 1).padStart(4, "0")}`,
+    }));
+    render(<DialogHarness availableDates={manyDates} />);
+
+    const dialog = screen.getByTestId("navigation-datapilot-dialog");
+    expect(dialog.className).toContain("h-[min(35rem,calc(100vh-2rem))]");
+
+    fireEvent.click(screen.getByRole("button", { name: "数据日期" }));
+    expect(screen.getAllByRole("option")).toHaveLength(40);
+    expect(screen.getByTestId("navigation-date-list")).toHaveClass("h-full", "overflow-y-auto");
+
+    fireEvent.click(screen.getByRole("option", { name: /20270001/ }));
+    expect(dialog.className).toContain("h-[min(35rem,calc(100vh-2rem))]");
+    expect(screen.getByRole("checkbox", { name: "clip_a" }).closest("div")).toHaveClass("overflow-y-auto");
   });
 
   it("disables confirmation and cancellation while submitting without changing labels", () => {

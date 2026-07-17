@@ -80,6 +80,11 @@ function pendingDecision(overrides: Partial<PendingHumanDecision> = {}): Pending
   };
 }
 
+function chooseNavigationDate(date: string) {
+  fireEvent.click(screen.getByRole("button", { name: "数据日期" }));
+  fireEvent.click(screen.getByRole("option", { name: new RegExp(date) }));
+}
+
 function setOpenActiveSessionWithPendingDecision(
   decision: PendingHumanDecision,
   options: { sessionId?: string; title?: string } = {},
@@ -388,7 +393,7 @@ test("data management sends selected clips through a new visible DataPilot sessi
 
   const confirm = screen.getByRole("button", { name: "确定" });
   expect(confirm).toBeDisabled();
-  fireEvent.change(screen.getByLabelText("数据日期"), { target: { value: "20270515" } });
+  chooseNavigationDate("20270515");
   fireEvent.click(screen.getByRole("checkbox", { name: "clip_a" }));
   fireEvent.click(confirm);
 
@@ -418,7 +423,7 @@ test("data management shortcut claims a double click only once", async () => {
   await renderAppWithDashboardSettled();
   fireEvent.click(screen.getByRole("button", { name: "数据管理" }));
   fireEvent.click(await screen.findByRole("button", { name: "交给 DataPilot" }));
-  fireEvent.change(screen.getByLabelText("数据日期"), { target: { value: "20270515" } });
+  chooseNavigationDate("20270515");
   fireEvent.click(screen.getByRole("checkbox", { name: "全选" }));
 
   const confirm = screen.getByRole("button", { name: "确定" });
@@ -468,7 +473,7 @@ test("data management shortcut opens DataPilot but does not submit while its kno
   await renderAppWithDashboardSettled();
   fireEvent.click(screen.getByRole("button", { name: "数据管理" }));
   fireEvent.click(await screen.findByRole("button", { name: "交给 DataPilot" }));
-  fireEvent.change(screen.getByLabelText("数据日期"), { target: { value: "20270515" } });
+  chooseNavigationDate("20270515");
   fireEvent.click(screen.getByRole("checkbox", { name: "全选" }));
   fireEvent.click(screen.getByRole("button", { name: "确定" }));
 
@@ -523,7 +528,7 @@ test("data management shortcut still blocks a running session after viewing hist
   await renderAppWithDashboardSettled();
   fireEvent.click(screen.getByRole("button", { name: "数据管理" }));
   fireEvent.click(await screen.findByRole("button", { name: "交给 DataPilot" }));
-  fireEvent.change(screen.getByLabelText("数据日期"), { target: { value: "20270515" } });
+  chooseNavigationDate("20270515");
   fireEvent.click(screen.getByRole("checkbox", { name: "全选" }));
   fireEvent.click(screen.getByRole("button", { name: "确定" }));
 
@@ -550,7 +555,7 @@ test("data management shortcut fails closed when a known running session cannot 
   await renderAppWithDashboardSettled();
   fireEvent.click(screen.getByRole("button", { name: "数据管理" }));
   fireEvent.click(await screen.findByRole("button", { name: "交给 DataPilot" }));
-  fireEvent.change(screen.getByLabelText("数据日期"), { target: { value: "20270515" } });
+  chooseNavigationDate("20270515");
   fireEvent.click(screen.getByRole("checkbox", { name: "全选" }));
   fireEvent.click(screen.getByRole("button", { name: "确定" }));
 
@@ -572,7 +577,7 @@ test("data management shortcut retries submit in the session it already created"
   await renderAppWithDashboardSettled();
   fireEvent.click(screen.getByRole("button", { name: "数据管理" }));
   fireEvent.click(await screen.findByRole("button", { name: "交给 DataPilot" }));
-  fireEvent.change(screen.getByLabelText("数据日期"), { target: { value: "20270515" } });
+  chooseNavigationDate("20270515");
   fireEvent.click(screen.getByRole("checkbox", { name: "clip_a" }));
   fireEvent.click(screen.getByRole("button", { name: "确定" }));
 
@@ -610,7 +615,7 @@ test("changing selection after a failed shortcut creates a new invocation and se
   await renderAppWithDashboardSettled();
   fireEvent.click(screen.getByRole("button", { name: "数据管理" }));
   fireEvent.click(await screen.findByRole("button", { name: "交给 DataPilot" }));
-  fireEvent.change(screen.getByLabelText("数据日期"), { target: { value: "20270515" } });
+  chooseNavigationDate("20270515");
   fireEvent.click(screen.getByRole("checkbox", { name: "clip_a" }));
   fireEvent.click(screen.getByRole("button", { name: "确定" }));
   expect(await screen.findByRole("alert")).toHaveTextContent("提交失败");
