@@ -768,7 +768,7 @@ def test_tool_result_emits_paired_start_and_end_with_result_state():
     ]
 
 
-def test_require_external_execution_emits_human_decision_required():
+def test_legacy_request_human_decision_event_is_still_supported():
     scope, events = _scope_and_events()
     adapter = AgentScopeEventAdapter(scope)
     tool_input = {
@@ -820,7 +820,7 @@ def test_plan_bound_external_decision_preserves_only_plan_and_step_metadata():
             tool_calls=[
                 ToolCallBlock(
                     id="decision-1",
-                    name="request_human_decision",
+                    name="confirm_navigation_calibration_params_tool",
                     input=json.dumps({"plan_id": "plan-1", "step_id": "confirm"}),
                 )
             ],
@@ -838,7 +838,7 @@ def test_plan_bound_external_decision_preserves_only_plan_and_step_metadata():
     }
 
 
-def test_removed_calibration_external_tool_is_ignored():
+def test_plan_bound_calibration_tool_ignores_removed_raw_argument_schema():
     scope, events = _scope_and_events()
     adapter = AgentScopeEventAdapter(scope)
 

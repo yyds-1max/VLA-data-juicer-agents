@@ -473,7 +473,7 @@ def _plan_bound_human_runtime(tmp_path: Path, chat_run_registry: FakeChatRunRegi
         _agentscope_session_record(
             reply_id="reply-1",
             tool_call_id="confirm-1",
-            tool_name="request_human_decision",
+            tool_name="confirm_navigation_calibration_params_tool",
             tool_input={"plan_id": plan.plan_id, "step_id": "confirm"},
         )
     )
@@ -1950,7 +1950,7 @@ async def test_runtime_submit_human_decision_spawns_external_execution_result_ev
 
 
 @pytest.mark.asyncio
-async def test_runtime_submit_human_decision_resumes_calibration_request_human_decision() -> None:
+async def test_runtime_submit_human_decision_resumes_legacy_request_human_decision() -> None:
     chat_run_registry = FakeChatRunRegistry()
     storage = FakeAgentScopeStorage()
     storage.session_records[("alice", "navigation-data-agent", "as-session-1")] = (
@@ -2894,7 +2894,7 @@ async def test_plan_bound_human_decision_live_and_pending_paths_are_deduplicated
                     "tool_calls": [
                         {
                             "id": "confirm-1",
-                            "name": "request_human_decision",
+                            "name": "confirm_navigation_calibration_params_tool",
                             "input": json.dumps(
                                 {"plan_id": plan.plan_id, "step_id": "confirm"}
                             ),

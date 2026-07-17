@@ -108,7 +108,7 @@ EXECUTION_STATE_SCHEMA_NAMES = {
 EXECUTION_ACTION_SCHEMA_NAMES = {
     "prepare_raw_data_tool",
     "extract_and_sync_navigation_data_tool",
-    "request_human_decision",
+    "confirm_navigation_calibration_params_tool",
     "assemble_finish_temp_tool",
     "run_noobscene_preprocessing_tool",
     "run_initial_annotation_gui_tool",
@@ -499,11 +499,7 @@ def _actual_navigation_surfaces(tmp_path):
 
 def test_execution_schema_denylist_matches_catalog_and_external_schema():
     catalog_action_schemas = {
-        (
-            "request_human_decision"
-            if capability.tool_name == "confirm_navigation_calibration_params"
-            else f"{capability.tool_name}_tool"
-        )
+        f"{capability.tool_name}_tool"
         for capability in list_navigation_tool_capabilities()
         if capability.executor_agent_allowed
     }

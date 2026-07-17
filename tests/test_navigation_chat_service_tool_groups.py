@@ -70,7 +70,7 @@ EXECUTION_TOOL_NAMES = {
     "get_plan_execution_overview_tool",
     "prepare_raw_data_tool",
     "extract_and_sync_navigation_data_tool",
-    "request_human_decision",
+    "confirm_navigation_calibration_params_tool",
     "assemble_finish_temp_tool",
     "run_noobscene_preprocessing_tool",
     "run_initial_annotation_gui_tool",
@@ -168,11 +168,7 @@ def _generic_toolkit_with_skill_group() -> Toolkit:
 
 def test_execution_denylist_matches_catalog_and_real_external_schema():
     catalog_action_schemas = {
-        (
-            "request_human_decision"
-            if capability.tool_name == "confirm_navigation_calibration_params"
-            else f"{capability.tool_name}_tool"
-        )
+        f"{capability.tool_name}_tool"
         for capability in list_navigation_tool_capabilities()
         if capability.executor_agent_allowed
     }
@@ -983,7 +979,7 @@ async def test_later_same_session_finish_plan_executes_and_closes_task(
         },
     )
     model.enqueue_tool(
-        "request_human_decision",
+        "confirm_navigation_calibration_params_tool",
         lambda messages: {
             "plan_id": latest_tool_result_json(messages)["plan_id"],
             "step_id": "confirm_calibration",
@@ -1019,7 +1015,7 @@ async def test_later_same_session_finish_plan_executes_and_closes_task(
         execution_results=[
             ToolResultBlock(
                 id=pending_tool_call["id"],
-                name="request_human_decision",
+                name="confirm_navigation_calibration_params_tool",
                 output=json.dumps(
                     {
                         "action": "confirm",
@@ -1069,11 +1065,11 @@ async def test_later_same_session_finish_plan_executes_and_closes_task(
         assert GENERIC_OR_RESET_TOOL_NAMES.isdisjoint(names)
     human_decision_index = _invocation_index_for_tool(
         model,
-        "request_human_decision",
+        "confirm_navigation_calibration_params_tool",
         start=finish_submission_index + 1,
     )
     human_decision_names = schema_names(model.invocations[human_decision_index].tools)
-    assert "request_human_decision" in human_decision_names
+    assert "confirm_navigation_calibration_params_tool" in human_decision_names
     finish_execution_index = _invocation_index_for_tool(
         model,
         "validate_navigation_outputs_tool",

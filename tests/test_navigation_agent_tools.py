@@ -145,7 +145,7 @@ def _decode_tool_payload(payload):
 def test_plan_bound_human_decision_tool_exposes_only_plan_and_step_ids():
     tool = PlanBoundHumanDecisionTool()
 
-    assert tool.name == "request_human_decision"
+    assert tool.name == "confirm_navigation_calibration_params_tool"
     assert set(tool.input_schema["properties"]) == {"plan_id", "step_id"}
     assert tool.input_schema["required"] == ["plan_id", "step_id"]
     assert tool.input_schema["additionalProperties"] is False
@@ -1066,6 +1066,7 @@ def test_activity_resolver_recovers_active_plan_and_only_remaining_actions(tmp_p
         *remaining,
     }
     assert not any(name.startswith("submit_") for name in names)
+    assert "confirm_navigation_calibration_params_tool" not in names
     assert "request_human_decision" not in names
 
 

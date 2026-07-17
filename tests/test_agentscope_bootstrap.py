@@ -128,6 +128,9 @@ def test_navigation_agent_prompt_requires_model_directed_investigation_and_plans
         "which investigation tools",
         "processing stage",
         "decisions, steps, variants, and business parameters",
+        "one-time optimistic-concurrency token",
+        "Any later investigation or user-guidance update",
+        "immediately before submitting a Plan",
         "complete strict JSON Plan",
         "resubmit the whole Plan",
         "After a complete Plan is accepted",
@@ -155,7 +158,7 @@ def test_navigation_agent_prompt_requires_model_directed_investigation_and_plans
     for retained_contract in [
         "plan-and-execute",
         "ReAct",
-        "request_human_decision",
+        "confirm_navigation_calibration_params_tool",
         "Do not ask the user to type",
         "confirm/stop/guidance",
         "GUI can block",
@@ -164,7 +167,7 @@ def test_navigation_agent_prompt_requires_model_directed_investigation_and_plans
         "cancelled",
     ]:
         assert retained_contract in prompt
-    assert "confirm_navigation_calibration_params_tool" not in prompt
+    assert "request_human_decision" not in prompt
     assert "Plan-Agent workflow" not in prompt
     assert "user_confirmation" not in prompt
     assert "exactly `确认`" not in prompt
@@ -277,7 +280,7 @@ async def test_bootstrap_agentscope_records_upserts_credential_and_agents():
     assert all("mock" not in record.data.system_prompt.lower() for record in agent_records)
     assert "plan-and-execute" in agent_records[1].data.system_prompt
     assert "ReAct" in agent_records[1].data.system_prompt
-    assert "request_human_decision" in agent_records[1].data.system_prompt
+    assert "confirm_navigation_calibration_params_tool" in agent_records[1].data.system_prompt
     assert "Do not ask the user to type" in agent_records[1].data.system_prompt
 
 

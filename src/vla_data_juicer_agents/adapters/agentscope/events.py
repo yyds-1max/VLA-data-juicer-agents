@@ -76,6 +76,8 @@ _UNSAFE_PUBLIC_REPLY_LINE_RE = re.compile(
     flags=re.IGNORECASE,
 )
 _HUMAN_DECISION_TOOL_NAMES = {
+    "confirm_navigation_calibration_params_tool",
+    # Compatibility for AgentScope replies persisted before the tool was renamed.
     "request_human_decision",
 }
 
@@ -232,6 +234,7 @@ _TOOL_PHASES: dict[str, str] = {
     "extract_and_sync_navigation_data_tool": "extract_sync",
     "assemble_finish_temp_tool": "finish_assembly",
     "run_noobscene_preprocessing_tool": "finish_assembly",
+    "confirm_navigation_calibration_params_tool": "human_decision",
     "request_human_decision": "human_decision",
     "run_initial_annotation_gui_tool": "annotation",
     "run_tracking_tool": "tracking",
@@ -904,6 +907,8 @@ class AgentScopeEventAdapter:
                 continue
             tool_input = _external_tool_input(getattr(tool_call, "input", {}))
             payload = _human_decision_payload(tool_name, tool_input)
+            if payload is None:
+                continue
             if self._activity_projector is not None:
                 self._activity_projector.waiting_for_user()
             self._scope.emit(
@@ -1162,7 +1167,10 @@ def _external_tool_input(value: object) -> dict[str, Any]:
     return {}
 
 
-def _human_decision_payload(tool_name: str, tool_input: dict[str, Any]) -> dict[str, str]:
+def _human_decision_payload(
+    tool_name: str,
+    tool_input: dict[str, Any],
+) -> dict[str, str] | None:
     decision_type = tool_input.get("decision_type")
     if not isinstance(decision_type, str) or not decision_type:
         decision_type = "other"
@@ -1178,4 +1186,7 @@ def _human_decision_payload(tool_name: str, tool_input: dict[str, Any]) -> dict[
     if isinstance(plan_id, str) and isinstance(step_id, str):
         payload["plan_id"] = plan_id
         payload["step_id"] = step_id
+    elif tool_name == "confirm_navigation_calibration_params_tool":
+        # The canonical plan-bound confirmation tool accepts only plan and step IDs.
+        return None
     return payload

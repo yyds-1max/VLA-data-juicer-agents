@@ -802,7 +802,7 @@ def test_finish_plan_execution_permission_does_not_infer_phase_from_artifacts(tm
         )
     }
     permission = asyncio.run(
-        tools["request_human_decision"].check_permissions(
+        tools["confirm_navigation_calibration_params_tool"].check_permissions(
             {"plan_id": plan.plan_id, "step_id": "confirm"},
             None,
         )
@@ -862,7 +862,7 @@ def test_human_decision_permission_fails_closed_when_sensor_input_disappears(tmp
             web_session_id=task.created_by_web_session_id,
             agentscope_session_id=task.agentscope_session_id,
         )
-        if candidate.name == "request_human_decision"
+        if candidate.name == "confirm_navigation_calibration_params_tool"
     )
     source_path.rmdir()
 
@@ -950,7 +950,7 @@ def test_waiting_human_decision_retry_enters_audited_recovery_when_input_drifts(
             web_session_id=owner,
             agentscope_session_id=agent,
         )
-        if tool.name == "request_human_decision"
+        if tool.name == "confirm_navigation_calibration_params_tool"
     )
 
     first_permission = asyncio.run(
@@ -1112,7 +1112,7 @@ def test_captured_human_decision_tool_denies_existing_recovery_without_mutation(
             web_session_id=task.created_by_web_session_id,
             agentscope_session_id=task.agentscope_session_id,
         )
-        if tool.name == "request_human_decision"
+        if tool.name == "confirm_navigation_calibration_params_tool"
     )
     first_permission = asyncio.run(
         request_tool.check_permissions(
@@ -2793,7 +2793,7 @@ def test_plan_bound_human_decision_waits_and_transitions_ledger_exactly_once(
         )
     }
     assert set(tools) == {
-        "request_human_decision",
+        "confirm_navigation_calibration_params_tool",
         "assemble_finish_temp_tool",
         "run_noobscene_preprocessing_tool",
         "run_initial_annotation_gui_tool",
@@ -2802,7 +2802,7 @@ def test_plan_bound_human_decision_waits_and_transitions_ledger_exactly_once(
         "run_projection_and_trajectory_tool",
         "validate_navigation_outputs_tool",
     }
-    request_tool = tools["request_human_decision"]
+    request_tool = tools["confirm_navigation_calibration_params_tool"]
 
     permission = asyncio.run(
         request_tool.check_permissions(
@@ -2812,7 +2812,7 @@ def test_plan_bound_human_decision_waits_and_transitions_ledger_exactly_once(
     )
     metadata = _human_decision_payload_from_tool_call(
         SimpleNamespace(
-            name="request_human_decision",
+            name="confirm_navigation_calibration_params_tool",
             input={"plan_id": plan.plan_id, "step_id": "confirm"},
         ),
         plan_store=plan_store,

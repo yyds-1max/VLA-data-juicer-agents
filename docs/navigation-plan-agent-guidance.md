@@ -37,6 +37,7 @@ Existence is not completeness. Check the requested segment inventory and validat
 - If an extracted gridmap already exists, inspect and reuse it when valid. If the platform has no recorded gridmap but synchronized lidar point clouds exist, select generation from PCD. Do not claim PCD/gridmap availability before extract/sync outputs contain the required files.
 - Select calibration from the camera/platform calibration inventory and current evidence. For the current deployment, recommend `NoobScenes/params/20260529_go2w/sensors` by default when that exact source is present in the observed inventory. Present it as the current business default, set calibration `mode` to `selected_profile`, keep `requires_user_confirmation` true, and ask the user to confirm it before execution.
 - Never choose a calibration profile merely because its directory name is newest, is lexicographically last, or resembles the data date. If the current default is absent, do not silently substitute another profile: list the observed candidates and ask the user which one to use. Every selected calibration profile still requires explicit user confirmation before copying.
+- In an accepted Plan, execute the `confirm_navigation_calibration_params` action through its matching `confirm_navigation_calibration_params_tool`, passing only the current `plan_id` and `step_id`. The tool performs the external human-decision handoff; do not invent or call a differently named confirmation tool.
 - Choose evidence-backed localization, gridmap, and calibration decisions, then ordered preparation, human-decision, annotation, tracking, projection, and validation steps as the observed case requires.
 - Unless artifact inspection already proves both final outputs and non-empty final gridmaps are complete, include the full finish chain in business order: calibration confirmation, finish assembly, NoobScenes preprocessing, initial annotation, tracking, gridmap preparation, projection/trajectory, and final validation. Do not skip unseen work merely because an action is optional in the schema.
 - Treat GUI work as bounded human-in-the-loop execution. Verify final outputs and validation markers after execution.
@@ -57,6 +58,8 @@ Ask the user when:
 Do not treat silence, remembered text, or a code status as consent.
 
 ## Failure/retry behavior
+
+Treat `planning_context_revision` from `get_navigation_task_context_tool` as a one-time optimistic-concurrency token for the task context observed at that moment. Any later investigation or user-guidance update makes that revision stale. Continue investigating whenever necessary; after all investigation is complete, call `get_navigation_task_context_tool` again immediately before Plan submission and use its latest revision so the submitted Plan is based on the newest task context.
 
 Inspect current inputs and outputs before retrying. A non-destructive retry may proceed when still authorized by the accepted Plan; ask again before destructive replacement. If facts invalidate the Plan, investigate and author a new complete Plan. If submission validation fails, correct the reported paths using evidence/action contracts and resubmit the entire Plan; never send a patch. Report failures and blocked state truthfully.
 

@@ -54,6 +54,8 @@ _EVENT_IDLE_POLL_SECS = 0.03
 _WAKEUP_RECOVERY_INTERVAL_SECS = 5.0
 _WAKEUP_RECOVERY_RETRY_DELAYS = (0.2, 1.0)
 _HUMAN_DECISION_TOOL_NAMES = {
+    "confirm_navigation_calibration_params_tool",
+    # Compatibility for human-decision calls persisted before the tool was renamed.
     "request_human_decision",
 }
 _logger = logging.getLogger(__name__)
@@ -2170,7 +2172,7 @@ def _enrich_plan_human_decision_event(
         return None
     metadata = _human_decision_payload_from_tool_call(
         SimpleNamespace(
-            name="request_human_decision",
+            name="confirm_navigation_calibration_params_tool",
             input={"plan_id": plan_id, "step_id": step_id},
         ),
         plan_store=plan_store,

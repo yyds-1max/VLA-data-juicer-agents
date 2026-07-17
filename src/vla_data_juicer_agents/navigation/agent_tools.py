@@ -74,9 +74,10 @@ _GROUP_DESCRIPTIONS = {
 
 
 class PlanBoundHumanDecisionTool(ToolBase):
-    name = "request_human_decision"
+    name = "confirm_navigation_calibration_params_tool"
     description = (
-        "Pause the current immutable navigation-plan step; provide only plan_id and step_id."
+        "Execute the matching confirm_navigation_calibration_params step by requesting "
+        "human confirmation; provide only plan_id and step_id."
     )
     input_schema = {
         "type": "object",
