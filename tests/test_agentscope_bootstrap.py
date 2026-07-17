@@ -53,6 +53,14 @@ def test_main_router_prompt_is_triage_only_and_handles_handoff_truthfully():
     assert "start_navigation_data_task" in prompt
     for preserved in ["request", "target", "date", "clips", "scene_mode", "response_language"]:
         assert preserved in prompt
+    for required_handoff_field in NavigationHandoffTool.input_schema["required"]:
+        assert required_handoff_field in prompt
+    assert "all required fields exactly once" in prompt
+    assert "The only optional fields are clips and scene_mode" in prompt
+    assert "use clips, never segments" in prompt
+    assert "set missing_fields to []" in prompt
+    assert "set confidence to medium or high" in prompt
+    assert "always include a concise reason" in prompt
     assert "`ok: true` and `started: true`" in prompt
     assert "`ok: false`" in prompt
     assert "never claim" in prompt.lower()
