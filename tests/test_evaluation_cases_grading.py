@@ -18,6 +18,7 @@ from vla_data_juicer_agents.evaluation.models import (
     CaseRunObservation,
     EvaluationCase,
     EvaluationStatus,
+    GradingCheck,
     TokenUsage,
     ToolCallObservation,
 )
@@ -195,6 +196,13 @@ def test_reports_keep_full_local_result_out_of_compact_baseline(tmp_path: Path):
         case_id=case.id,
         suite=case.suite,
         status=EvaluationStatus.FAIL,
+        checks=[
+            GradingCheck(
+                name="handoff.request",
+                passed=False,
+                message="handoff request mismatch",
+            ),
+        ],
         observation=observation,
         error_message="model behavior failed at /private/tmp/case with sk-supersecret123",
         metrics={"model_calls": 1, "tool_calls": 0, "total_tokens": 15},
@@ -226,6 +234,14 @@ def test_reports_keep_full_local_result_out_of_compact_baseline(tmp_path: Path):
     assert "完整事件-不可进入baseline" not in baseline_text
     assert "完整请求-不可进入baseline" not in baseline_text
     baseline = json.loads(baseline_text)
+    assert baseline["schema_version"] == 2
+    assert baseline["summary"]["case_count"] == 1
+    assert baseline["summary"]["stability_counts"]["SINGLE_SAMPLE"] == 1
+    assert baseline["case_summaries"][0]["stability_status"] == "SINGLE_SAMPLE"
+    assert baseline["case_summaries"][0]["failure_signatures"] == {
+        "handoff.request": 1,
+    }
+    assert baseline["results"][0]["failure_signatures"] == ["handoff.request"]
     assert "response" not in baseline["results"][0]
     assert "trace" not in baseline["results"][0]
     assert baseline["results"][0]["metrics"]["response_chars"] == len(secret_response)

@@ -47,6 +47,21 @@ def build_parser() -> argparse.ArgumentParser:
     run.add_argument("--repeat", type=int, default=1)
     run.add_argument("--output-dir", type=Path, default=None)
     run.add_argument("--write-baseline", action="store_true")
+
+    compare = subparsers.add_parser(
+        "compare",
+        help="Compare a candidate run with a compact baseline.",
+    )
+    compare.add_argument("--baseline", type=Path, required=True)
+    compare.add_argument("--candidate", type=Path, required=True)
+    compare.add_argument("--output-dir", type=Path, default=None)
+
+    promote = subparsers.add_parser(
+        "promote",
+        help="Promote an audited aggregate report without calling a model.",
+    )
+    promote.add_argument("--input", dest="input_path", type=Path, required=True)
+    promote.add_argument("--suite", default=DEFAULT_SUITE)
     return parser
 
 
@@ -231,15 +246,10 @@ def _finalize_metadata(
     cases: Sequence[Any],
     results: Sequence[Any],
 ) -> None:
+    from .cases import cases_sha256
     from vla_data_juicer_agents.runtime.agentscope_prompts import main_router_prompt
 
-    case_payload = json.dumps(
-        [_model_dump(case) for case in cases],
-        ensure_ascii=False,
-        sort_keys=True,
-        separators=(",", ":"),
-    )
-    metadata["cases_sha256"] = hashlib.sha256(case_payload.encode("utf-8")).hexdigest()
+    metadata["cases_sha256"] = cases_sha256(cases)
     metadata["prompt_sha256"] = hashlib.sha256(
         main_router_prompt().encode("utf-8"),
     ).hexdigest()
@@ -268,6 +278,10 @@ def _write_reports(
 
     write_aggregate_report(results, output_dir / "aggregate.json", run_metadata=metadata)
     if baseline_dir is not None:
+        if any(_status_value(result) == "ERROR" for result in results):
+            raise ValueError(
+                "baseline was not written because the run contains ERROR results",
+            )
         baseline_dir.mkdir(parents=True, exist_ok=True)
         write_baseline_reports(
             results,
@@ -296,11 +310,41 @@ def _select_cases(cases: list[Any], case_id: str | None) -> list[Any]:
 
 
 def _print_summary(results: Sequence[Any], output_dir: Path) -> None:
+    from .stability import summarize_results
+
     for result in results:
         case_id = getattr(result, "case_id", "unknown")
         attempt = getattr(result, "repeat_index", "?")
         print(f"{_status_value(result):7} {case_id} (attempt {attempt})")
+    print("Case stability:")
+    for summary in summarize_results(results):
+        passed = summary.status_counts["PASS"]
+        print(
+            f"{summary.stability_status.value:13} {summary.case_id} "
+            f"({passed}/{summary.attempts} PASS, rate={summary.pass_rate:.3f})",
+        )
     print(f"Evaluation artifacts: {output_dir}")
+
+
+def _compare_command(args: argparse.Namespace) -> int:
+    from .comparison import (
+        compare_report_files,
+        comparison_exit_code,
+        write_comparison_reports,
+    )
+
+    comparison = compare_report_files(args.baseline, args.candidate)
+    output_dir = args.output_dir or args.candidate.resolve().parent
+    json_path, markdown_path = write_comparison_reports(comparison, output_dir)
+    for case in comparison["cases"]:
+        print(
+            f"{case['verdict']:9} {case['case_id']} "
+            f"({case['baseline']['pass_rate']:.3f} -> "
+            f"{case['candidate']['pass_rate']:.3f})",
+        )
+    print(f"Comparison JSON: {json_path}")
+    print(f"Comparison Markdown: {markdown_path}")
+    return comparison_exit_code(comparison)
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -308,6 +352,26 @@ def main(argv: list[str] | None = None) -> int:
     repo_root = _repository_root()
     cases_root = args.cases_root or repo_root / "evals" / "cases"
     try:
+        if args.command == "promote":
+            from .promotion import promote_baseline
+
+            promoted = promote_baseline(
+                args.input_path,
+                suite=args.suite,
+                repo_root=repo_root,
+                cases_root=cases_root,
+            )
+            print(
+                f"Promoted {promoted.attempt_count} attempt(s) across "
+                f"{promoted.case_count} case(s).",
+            )
+            print(f"Baseline JSON: {promoted.json_path}")
+            print(f"Baseline Markdown: {promoted.markdown_path}")
+            return 0
+
+        if args.command == "compare":
+            return _compare_command(args)
+
         cases = _load_cases(cases_root, args.suite)
         if args.command == "validate":
             print(f"Validated {len(cases)} case(s) in suite {args.suite!r}.")
@@ -315,6 +379,10 @@ def main(argv: list[str] | None = None) -> int:
 
         if args.repeat <= 0:
             raise ValueError("--repeat must be a positive integer")
+        if args.case_id is not None and args.write_baseline:
+            raise ValueError(
+                "--write-baseline requires a complete suite; remove --case",
+            )
         cases = _select_cases(cases, args.case_id)
         run_id = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ") + "-" + uuid.uuid4().hex[:8]
         output_dir = args.output_dir or repo_root / ".artifacts" / "evaluation" / run_id

@@ -7,6 +7,11 @@ import re
 from typing import Any, Iterable
 
 from vla_data_juicer_agents.evaluation.models import CaseResult
+from vla_data_juicer_agents.evaluation.stability import (
+    StabilityStatus,
+    failure_signatures,
+    summarize_results,
+)
 
 
 _SECRET_PATTERN = re.compile(
@@ -26,16 +31,40 @@ def _status_counts(results: list[CaseResult]) -> dict[str, int]:
     return {status: counts.get(status, 0) for status in ("PASS", "FAIL", "TIMEOUT", "ERROR")}
 
 
+def _summary_payload(results: list[CaseResult]) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+    case_summaries = [
+        summary.model_dump(mode="json")
+        for summary in summarize_results(results)
+    ]
+    stability_counts = Counter(
+        summary["stability_status"] for summary in case_summaries
+    )
+    return (
+        {
+            "total": len(results),
+            "case_count": len(case_summaries),
+            "status_counts": _status_counts(results),
+            "stability_counts": {
+                status.value: stability_counts[status.value]
+                for status in StabilityStatus
+            },
+        },
+        case_summaries,
+    )
+
+
 def build_aggregate_report(
     results: Iterable[CaseResult],
     *,
     run_metadata: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     materialized = list(results)
+    summary, case_summaries = _summary_payload(materialized)
     return {
-        "schema_version": 1,
+        "schema_version": 2,
         "run_metadata": dict(run_metadata or {}),
-        "summary": {"total": len(materialized), "status_counts": _status_counts(materialized)},
+        "summary": summary,
+        "case_summaries": case_summaries,
         "results": [result.model_dump(mode="json") for result in materialized],
     }
 
@@ -67,6 +96,7 @@ def build_baseline_report(
     run_metadata: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     materialized = list(results)
+    summary, case_summaries = _summary_payload(materialized)
     baseline_results: list[dict[str, Any]] = []
     for result in materialized:
         observation = result.observation
@@ -80,6 +110,7 @@ def build_baseline_report(
             "status": result.status.value,
             "metrics": result.metrics,
             "failure_reasons": failures,
+            "failure_signatures": list(failure_signatures(result)),
             "error_type": result.error_type,
         }
         if observation is not None:
@@ -101,13 +132,14 @@ def build_baseline_report(
         "tool_schema_sha256",
     }
     return {
-        "schema_version": 1,
+        "schema_version": 2,
         "run_metadata": {
             key: value
             for key, value in dict(run_metadata or {}).items()
             if key in allowed_metadata
         },
-        "summary": {"total": len(materialized), "status_counts": _status_counts(materialized)},
+        "summary": summary,
+        "case_summaries": case_summaries,
         "results": baseline_results,
     }
 
@@ -135,11 +167,33 @@ def _baseline_markdown(report: dict[str, Any]) -> str:
         f"- Prompt SHA-256: `{metadata.get('prompt_sha256') or '—'}`",
         f"- Tool Schema SHA-256: `{tool_hashes}`",
         "",
-        "## Results",
+        "## Stability",
         "",
-        "| Case | Repeat | Status | Model calls | Tool calls | Tokens | Failure reasons |",
-        "| --- | ---: | --- | ---: | ---: | ---: | --- |",
+        "| Case | Attempts | Stability | Pass rate | PASS | FAIL | TIMEOUT | ERROR | Failure signatures |",
+        "| --- | ---: | --- | ---: | ---: | ---: | ---: | ---: | --- |",
     ]
+    for case in report.get("case_summaries", []):
+        counts_by_status = case["status_counts"]
+        signatures = "; ".join(
+            f"{name} ×{count}"
+            for name, count in case.get("failure_signatures", {}).items()
+        ) or "—"
+        signatures = signatures.replace("|", "\\|").replace("\n", " ")
+        lines.append(
+            f"| {case['case_id']} | {case['attempts']} | {case['stability_status']} | "
+            f"{case['pass_rate']:.3f} | {counts_by_status.get('PASS', 0)} | "
+            f"{counts_by_status.get('FAIL', 0)} | {counts_by_status.get('TIMEOUT', 0)} | "
+            f"{counts_by_status.get('ERROR', 0)} | {signatures} |",
+        )
+    lines.extend(
+        [
+            "",
+            "## Results",
+            "",
+            "| Case | Repeat | Status | Model calls | Tool calls | Tokens | Failure reasons |",
+            "| --- | ---: | --- | ---: | ---: | ---: | --- |",
+        ],
+    )
     for result in report["results"]:
         metrics = result.get("metrics", {})
         reasons = "; ".join(result.get("failure_reasons", [])) or "—"

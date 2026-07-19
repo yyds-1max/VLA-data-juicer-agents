@@ -37,6 +37,12 @@ vla-agent-eval run --suite router-smoke
 vla-agent-eval run --suite router-smoke --case router_shortcut_preserves_scope --repeat 3
 ```
 
+Repeated runs include a per-case stability summary in stdout and
+`aggregate.json`: `SINGLE_SAMPLE`, `STABLE_PASS`, `STABLE_FAIL`, `FLAKY`,
+`TIMEOUT`, or `ERROR`. The summary also records pass rate, failure-signature
+counts, and min/median/max latency and token metrics. These labels are
+descriptive; three attempts do not imply statistical significance.
+
 Raw, sanitized artifacts are written to
 `.artifacts/evaluation/<run-id>/` by default. Override this for a disposable run
 with `--output-dir PATH`. To refresh the compact, commit-safe JSON and Markdown
@@ -45,6 +51,40 @@ summaries under `evals/baselines/`, add `--write-baseline`:
 ```bash
 vla-agent-eval run --suite router-smoke --write-baseline
 ```
+
+`--write-baseline` requires the complete suite and refuses to replace the
+baseline when a run contains an infrastructure `ERROR`. A model `FAIL` remains
+a valid baseline result. Prefer the audited promotion workflow below for
+repeated real-model runs.
+
+Compare an existing baseline with a candidate aggregate:
+
+```bash
+vla-agent-eval compare \
+  --baseline evals/baselines/router-smoke.json \
+  --candidate .artifacts/evaluation/<run-id>/aggregate.json
+```
+
+Comparison requires the same suite, cases, model configuration, and AgentScope
+version. Git, prompt, and tool-schema hashes may differ and are reported as the
+changed variables. The command writes `comparison.json` and `comparison.md`
+beside the candidate by default. Its exit code is `0` for no regression, `1`
+for a behavioral regression or candidate timeout, and `2` for incompatible
+reports, invalid input, or candidate infrastructure errors.
+
+After reviewing a complete run, promote it without another model call:
+
+```bash
+vla-agent-eval promote \
+  --input .artifacts/evaluation/<run-id>/aggregate.json \
+  --suite router-smoke
+```
+
+Promotion requires a clean worktree, the current HEAD commit and case hash, a
+complete suite with consecutive attempts, and no `ERROR` results. It writes the
+JSON and Markdown baseline through temporary files. The recommended workflow is
+to commit evaluation code first, run and compare on that clean commit, then
+commit only the promoted baseline update.
 
 Exit codes are `0` when all attempts pass, `1` when any attempt is `FAIL` or
 `TIMEOUT`, and `2` for invalid configuration, provider failures, or evaluation
@@ -55,8 +95,11 @@ infrastructure errors.
 Evaluation cases score observable outcomes and safety invariants, not a fixed
 tool-call script. Full model responses and event traces remain in the ignored
 artifact directory; committed baselines contain only sanitized metadata,
-metrics, statuses, hashes, and failure reasons. Thinking events, credentials,
-and absolute workspace paths must never be persisted.
+metrics, statuses, hashes, failure signatures, and sanitized failure reasons.
+Report Schema v2 adds case stability summaries; comparison remains compatible
+with the original v1 baseline. Thinking events, credentials, absolute workspace
+paths, complete responses, and tool payloads must never enter a baseline or
+comparison report.
 
 A model `FAIL` is a valid baseline result. Do not change an agent prompt, tool,
 router, or business behavior while implementing or refreshing the evaluation

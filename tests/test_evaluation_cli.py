@@ -5,6 +5,8 @@ from pathlib import Path
 import subprocess
 from types import SimpleNamespace
 
+import pytest
+
 from vla_data_juicer_agents.evaluation import cli
 from vla_data_juicer_agents.evaluation.models import (
     CaseResult,
@@ -46,6 +48,31 @@ def _result(status: EvaluationStatus, *, repeat_index: int = 1) -> CaseResult:
         repeat_index=repeat_index,
         status=status,
     )
+
+
+def _comparison_report(status: str) -> dict:
+    counts = {name: int(name == status) for name in ("PASS", "FAIL", "TIMEOUT", "ERROR")}
+    return {
+        "schema_version": 2,
+        "run_metadata": {
+            "suite": "router-smoke",
+            "cases_sha256": "cases",
+            "model": "qwen-test",
+            "model_parameters": {"parallel_tool_calls": False},
+            "agentscope_version": "2.0.1",
+        },
+        "case_summaries": [
+            {
+                "case_id": "router_test",
+                "suite": "router-smoke",
+                "attempts": 1,
+                "stability_status": "ERROR" if status == "ERROR" else "SINGLE_SAMPLE",
+                "status_counts": counts,
+                "pass_rate": float(status == "PASS"),
+                "failure_signatures": {},
+            },
+        ],
+    }
 
 
 def test_validate_only_loads_cases_and_never_runs_worker(monkeypatch, capsys) -> None:
@@ -117,6 +144,134 @@ def test_run_returns_two_for_infrastructure_error(monkeypatch, tmp_path: Path) -
     monkeypatch.setattr(cli, "_run_metadata", lambda **kwargs: {})
 
     assert cli.main(["run", "--output-dir", str(tmp_path)]) == 2
+
+
+def test_print_summary_includes_case_stability(capsys, tmp_path: Path) -> None:
+    cli._print_summary(
+        [
+            _result(EvaluationStatus.PASS, repeat_index=1),
+            _result(EvaluationStatus.FAIL, repeat_index=2),
+        ],
+        tmp_path,
+    )
+
+    output = capsys.readouterr().out
+    assert "Case stability:" in output
+    assert "FLAKY" in output
+    assert "1/2 PASS" in output
+
+
+def test_partial_case_cannot_overwrite_full_baseline(monkeypatch, tmp_path: Path) -> None:
+    monkeypatch.setattr(cli, "_load_cases", lambda root, suite: [_case()])
+    monkeypatch.setattr(
+        cli,
+        "_run_worker",
+        lambda **kwargs: (_ for _ in ()).throw(AssertionError("worker must not run")),
+    )
+
+    code = cli.main(
+        [
+            "run",
+            "--case",
+            "router_test",
+            "--write-baseline",
+            "--output-dir",
+            str(tmp_path),
+        ],
+    )
+
+    assert code == 2
+
+
+def test_error_run_writes_aggregate_but_preserves_existing_baseline(tmp_path: Path) -> None:
+    baseline_dir = tmp_path / "baselines"
+    baseline_dir.mkdir()
+    json_path = baseline_dir / "router-smoke.json"
+    markdown_path = baseline_dir / "router-smoke.md"
+    json_path.write_text("existing-json\n", encoding="utf-8")
+    markdown_path.write_text("existing-markdown\n", encoding="utf-8")
+
+    with pytest.raises(ValueError, match="contains ERROR"):
+        cli._write_reports(
+            results=[_result(EvaluationStatus.ERROR)],
+            metadata={"schema_version": 1},
+            output_dir=tmp_path / "run",
+            baseline_dir=baseline_dir,
+            suite="router-smoke",
+        )
+
+    assert (tmp_path / "run" / "aggregate.json").is_file()
+    assert json_path.read_text(encoding="utf-8") == "existing-json\n"
+    assert markdown_path.read_text(encoding="utf-8") == "existing-markdown\n"
+
+
+def test_compare_command_writes_reports_and_returns_regression_exit_code(
+    tmp_path: Path,
+) -> None:
+    baseline = tmp_path / "baseline.json"
+    candidate_dir = tmp_path / "candidate"
+    candidate_dir.mkdir()
+    candidate = candidate_dir / "aggregate.json"
+    baseline.write_text(json.dumps(_comparison_report("PASS")), encoding="utf-8")
+    candidate.write_text(json.dumps(_comparison_report("FAIL")), encoding="utf-8")
+
+    code = cli.main(
+        [
+            "compare",
+            "--baseline",
+            str(baseline),
+            "--candidate",
+            str(candidate),
+        ],
+    )
+
+    assert code == 1
+    assert (candidate_dir / "comparison.json").is_file()
+    assert (candidate_dir / "comparison.md").is_file()
+
+
+def test_compare_command_returns_two_for_candidate_error(tmp_path: Path) -> None:
+    baseline = tmp_path / "baseline.json"
+    candidate = tmp_path / "aggregate.json"
+    baseline.write_text(json.dumps(_comparison_report("FAIL")), encoding="utf-8")
+    candidate.write_text(json.dumps(_comparison_report("ERROR")), encoding="utf-8")
+
+    assert cli.main(
+        [
+            "compare",
+            "--baseline",
+            str(baseline),
+            "--candidate",
+            str(candidate),
+        ],
+    ) == 2
+
+
+def test_promote_command_delegates_without_loading_or_running_cases(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    aggregate = tmp_path / "aggregate.json"
+    aggregate.write_text("{}", encoding="utf-8")
+    monkeypatch.setattr(
+        cli,
+        "_load_cases",
+        lambda *_args: (_ for _ in ()).throw(AssertionError("cases loaded in CLI")),
+    )
+    promoted = SimpleNamespace(
+        attempt_count=9,
+        case_count=3,
+        json_path=tmp_path / "router-smoke.json",
+        markdown_path=tmp_path / "router-smoke.md",
+    )
+    monkeypatch.setattr(
+        "vla_data_juicer_agents.evaluation.promotion.promote_baseline",
+        lambda *args, **kwargs: promoted,
+    )
+
+    assert cli.main(
+        ["promote", "--input", str(aggregate), "--suite", "router-smoke"],
+    ) == 0
 
 
 def test_worker_subprocess_uses_json_files_and_not_secret_arguments(

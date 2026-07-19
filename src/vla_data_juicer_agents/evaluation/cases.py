@@ -1,7 +1,10 @@
 from __future__ import annotations
 
+import hashlib
+import json
 from pathlib import Path
 import re
+from typing import Sequence
 
 import yaml
 from pydantic import ValidationError
@@ -56,3 +59,15 @@ def load_suite(cases_root: str | Path, suite: str) -> list[EvaluationCase]:
 
 def load_default_suite(suite: str) -> list[EvaluationCase]:
     return load_suite(default_cases_root(), suite)
+
+
+def cases_sha256(cases: Sequence[EvaluationCase]) -> str:
+    """Return the canonical hash used to anchor a report to exact cases."""
+
+    payload = json.dumps(
+        [case.model_dump(mode="json") for case in cases],
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
