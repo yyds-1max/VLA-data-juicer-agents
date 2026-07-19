@@ -242,6 +242,7 @@ def test_reports_keep_full_local_result_out_of_compact_baseline(tmp_path: Path):
         "handoff.request": 1,
     }
     assert baseline["results"][0]["failure_signatures"] == ["handoff.request"]
+    assert "failure_reasons" not in baseline["results"][0]
     assert "response" not in baseline["results"][0]
     assert "trace" not in baseline["results"][0]
     assert baseline["results"][0]["metrics"]["response_chars"] == len(secret_response)
@@ -249,7 +250,8 @@ def test_reports_keep_full_local_result_out_of_compact_baseline(tmp_path: Path):
     assert "run_id" not in baseline["run_metadata"]
     assert "started_at" not in baseline["run_metadata"]
     markdown = markdown_path.read_text(encoding="utf-8")
-    assert "model behavior failed" in markdown
+    assert "model behavior failed" not in markdown
+    assert "handoff.request" in markdown
     assert "abc123" in markdown
     assert "deadbeef" in markdown
     assert "toolhash" in markdown

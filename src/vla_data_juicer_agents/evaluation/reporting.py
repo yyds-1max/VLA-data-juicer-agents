@@ -3,7 +3,6 @@ from __future__ import annotations
 import json
 from collections import Counter
 from pathlib import Path
-import re
 from typing import Any, Iterable
 
 from vla_data_juicer_agents.evaluation.models import CaseResult
@@ -12,18 +11,6 @@ from vla_data_juicer_agents.evaluation.stability import (
     failure_signatures,
     summarize_results,
 )
-
-
-_SECRET_PATTERN = re.compile(
-    r"(?i)(?:bearer\s+)?(?<![a-z0-9])(?:sk-[a-z0-9_-]{8,}|dashscope[-_a-z0-9]{8,})",
-)
-_ABSOLUTE_PATH_PATTERN = re.compile(r"(?<![A-Za-z0-9_.-])/(?:[^\s|:;]+/)*[^\s|:;]*")
-
-
-def _safe_failure_reason(value: str) -> str:
-    redacted = _SECRET_PATTERN.sub("[REDACTED]", value)
-    redacted = _ABSOLUTE_PATH_PATTERN.sub("[PATH]", redacted)
-    return redacted[:500]
 
 
 def _status_counts(results: list[CaseResult]) -> dict[str, int]:
@@ -100,16 +87,12 @@ def build_baseline_report(
     baseline_results: list[dict[str, Any]] = []
     for result in materialized:
         observation = result.observation
-        failures = [_safe_failure_reason(check.message) for check in result.checks if not check.passed]
-        if result.error_message:
-            failures.append(_safe_failure_reason(result.error_message))
         compact: dict[str, Any] = {
             "case_id": result.case_id,
             "suite": result.suite,
             "repeat_index": result.repeat_index,
             "status": result.status.value,
             "metrics": result.metrics,
-            "failure_reasons": failures,
             "failure_signatures": list(failure_signatures(result)),
             "error_type": result.error_type,
         }
@@ -190,18 +173,18 @@ def _baseline_markdown(report: dict[str, Any]) -> str:
             "",
             "## Results",
             "",
-            "| Case | Repeat | Status | Model calls | Tool calls | Tokens | Failure reasons |",
+            "| Case | Repeat | Status | Model calls | Tool calls | Tokens | Failure signatures |",
             "| --- | ---: | --- | ---: | ---: | ---: | --- |",
         ],
     )
     for result in report["results"]:
         metrics = result.get("metrics", {})
-        reasons = "; ".join(result.get("failure_reasons", [])) or "—"
-        reasons = reasons.replace("|", "\\|").replace("\n", " ")
+        signatures = "; ".join(result.get("failure_signatures", [])) or "—"
+        signatures = signatures.replace("|", "\\|").replace("\n", " ")
         lines.append(
             f"| {result['case_id']} | {result['repeat_index']} | {result['status']} | "
             f"{metrics.get('model_calls', 0)} | {metrics.get('tool_calls', 0)} | "
-            f"{metrics.get('total_tokens', 0)} | {reasons} |",
+            f"{metrics.get('total_tokens', 0)} | {signatures} |",
         )
     return "\n".join(lines) + "\n"
 
