@@ -1,41 +1,262 @@
 {
+  "case_summaries": [
+    {
+      "attempts": 3,
+      "case_id": "router_capability_no_handoff",
+      "duration_ms": {
+        "max": 3786,
+        "median": 3599,
+        "min": 2947
+      },
+      "failure_signatures": {},
+      "input_tokens": {
+        "max": 9313,
+        "median": 9313,
+        "min": 9313
+      },
+      "output_tokens": {
+        "max": 121,
+        "median": 118,
+        "min": 114
+      },
+      "pass_rate": 1.0,
+      "stability_status": "STABLE_PASS",
+      "status_counts": {
+        "ERROR": 0,
+        "FAIL": 0,
+        "PASS": 3,
+        "TIMEOUT": 0
+      },
+      "suite": "router-smoke",
+      "total_tokens": {
+        "max": 9434,
+        "median": 9431,
+        "min": 9427
+      }
+    },
+    {
+      "attempts": 3,
+      "case_id": "router_missing_target_clarifies",
+      "duration_ms": {
+        "max": 2801,
+        "median": 2678,
+        "min": 2402
+      },
+      "failure_signatures": {
+        "response.length": 2,
+        "response.question": 3
+      },
+      "input_tokens": {
+        "max": 9316,
+        "median": 9316,
+        "min": 9316
+      },
+      "output_tokens": {
+        "max": 90,
+        "median": 88,
+        "min": 63
+      },
+      "pass_rate": 0.0,
+      "stability_status": "STABLE_FAIL",
+      "status_counts": {
+        "ERROR": 0,
+        "FAIL": 3,
+        "PASS": 0,
+        "TIMEOUT": 0
+      },
+      "suite": "router-smoke",
+      "total_tokens": {
+        "max": 9406,
+        "median": 9404,
+        "min": 9379
+      }
+    },
+    {
+      "attempts": 3,
+      "case_id": "router_shortcut_preserves_scope",
+      "duration_ms": {
+        "max": 13978,
+        "median": 7755,
+        "min": 5690
+      },
+      "failure_signatures": {
+        "handoff.count": 2,
+        "handoff.request": 1,
+        "limits.tool_calls": 2,
+        "response.length": 1,
+        "tools.allowed": 3,
+        "tools.count.start_navigation_data_task": 2,
+        "tools.safety": 3
+      },
+      "input_tokens": {
+        "max": 28873,
+        "median": 18943,
+        "min": 9385
+      },
+      "output_tokens": {
+        "max": 666,
+        "median": 332,
+        "min": 274
+      },
+      "pass_rate": 0.0,
+      "stability_status": "STABLE_FAIL",
+      "status_counts": {
+        "ERROR": 0,
+        "FAIL": 3,
+        "PASS": 0,
+        "TIMEOUT": 0
+      },
+      "suite": "router-smoke",
+      "total_tokens": {
+        "max": 29539,
+        "median": 19275,
+        "min": 9659
+      }
+    }
+  ],
   "results": [
     {
       "case_id": "router_capability_no_handoff",
       "error_type": null,
-      "failure_reasons": [],
+      "failure_signatures": [],
       "metrics": {
-        "duration_ms": 3584,
-        "event_count": 41,
+        "duration_ms": 3786,
+        "event_count": 43,
         "handoff_count": 0,
-        "input_tokens": 9311,
+        "input_tokens": 9313,
         "model_calls": 1,
-        "output_tokens": 116,
-        "response_chars": 224,
+        "output_tokens": 118,
+        "response_chars": 226,
         "tool_calls": 0,
-        "total_tokens": 9427
+        "total_tokens": 9431
       },
       "repeat_index": 1,
       "status": "PASS",
       "suite": "router-smoke"
     },
     {
+      "case_id": "router_capability_no_handoff",
+      "error_type": null,
+      "failure_signatures": [],
+      "metrics": {
+        "duration_ms": 2947,
+        "event_count": 40,
+        "handoff_count": 0,
+        "input_tokens": 9313,
+        "model_calls": 1,
+        "output_tokens": 114,
+        "response_chars": 222,
+        "tool_calls": 0,
+        "total_tokens": 9427
+      },
+      "repeat_index": 2,
+      "status": "PASS",
+      "suite": "router-smoke"
+    },
+    {
+      "case_id": "router_capability_no_handoff",
+      "error_type": null,
+      "failure_signatures": [],
+      "metrics": {
+        "duration_ms": 3599,
+        "event_count": 42,
+        "handoff_count": 0,
+        "input_tokens": 9313,
+        "model_calls": 1,
+        "output_tokens": 121,
+        "response_chars": 231,
+        "tool_calls": 0,
+        "total_tokens": 9434
+      },
+      "repeat_index": 3,
+      "status": "PASS",
+      "suite": "router-smoke"
+    },
+    {
       "case_id": "router_missing_target_clarifies",
       "error_type": null,
-      "failure_reasons": [
-        "response did not contain a question",
-        "response length 122 exceeded 120"
+      "failure_signatures": [
+        "response.question"
       ],
       "metrics": {
-        "duration_ms": 2441,
+        "duration_ms": 2402,
         "event_count": 27,
         "handoff_count": 0,
-        "input_tokens": 9314,
+        "input_tokens": 9316,
         "model_calls": 1,
-        "output_tokens": 70,
-        "response_chars": 122,
+        "output_tokens": 63,
+        "response_chars": 108,
         "tool_calls": 0,
-        "total_tokens": 9384
+        "total_tokens": 9379
+      },
+      "repeat_index": 1,
+      "status": "FAIL",
+      "suite": "router-smoke"
+    },
+    {
+      "case_id": "router_missing_target_clarifies",
+      "error_type": null,
+      "failure_signatures": [
+        "response.length",
+        "response.question"
+      ],
+      "metrics": {
+        "duration_ms": 2801,
+        "event_count": 35,
+        "handoff_count": 0,
+        "input_tokens": 9316,
+        "model_calls": 1,
+        "output_tokens": 90,
+        "response_chars": 157,
+        "tool_calls": 0,
+        "total_tokens": 9406
+      },
+      "repeat_index": 2,
+      "status": "FAIL",
+      "suite": "router-smoke"
+    },
+    {
+      "case_id": "router_missing_target_clarifies",
+      "error_type": null,
+      "failure_signatures": [
+        "response.length",
+        "response.question"
+      ],
+      "metrics": {
+        "duration_ms": 2678,
+        "event_count": 33,
+        "handoff_count": 0,
+        "input_tokens": 9316,
+        "model_calls": 1,
+        "output_tokens": 88,
+        "response_chars": 155,
+        "tool_calls": 0,
+        "total_tokens": 9404
+      },
+      "repeat_index": 3,
+      "status": "FAIL",
+      "suite": "router-smoke"
+    },
+    {
+      "case_id": "router_shortcut_preserves_scope",
+      "error_type": null,
+      "failure_signatures": [
+        "handoff.count",
+        "limits.tool_calls",
+        "tools.allowed",
+        "tools.count.start_navigation_data_task",
+        "tools.safety"
+      ],
+      "metrics": {
+        "duration_ms": 7755,
+        "event_count": 84,
+        "handoff_count": 0,
+        "input_tokens": 18943,
+        "model_calls": 2,
+        "output_tokens": 332,
+        "response_chars": 102,
+        "tool_calls": 2,
+        "total_tokens": 19275
       },
       "repeat_index": 1,
       "status": "FAIL",
@@ -44,21 +265,49 @@
     {
       "case_id": "router_shortcut_preserves_scope",
       "error_type": null,
-      "failure_reasons": [
-        "handoff request did not exactly match the expected value"
+      "failure_signatures": [
+        "handoff.count",
+        "tools.allowed",
+        "tools.count.start_navigation_data_task",
+        "tools.safety"
       ],
       "metrics": {
-        "duration_ms": 7369,
-        "event_count": 90,
-        "handoff_count": 1,
-        "input_tokens": 19051,
-        "model_calls": 2,
-        "output_tokens": 313,
-        "response_chars": 206,
+        "duration_ms": 5690,
+        "event_count": 41,
+        "handoff_count": 0,
+        "input_tokens": 9385,
+        "model_calls": 1,
+        "output_tokens": 274,
+        "response_chars": 64,
         "tool_calls": 1,
-        "total_tokens": 19364
+        "total_tokens": 9659
       },
-      "repeat_index": 1,
+      "repeat_index": 2,
+      "status": "FAIL",
+      "suite": "router-smoke"
+    },
+    {
+      "case_id": "router_shortcut_preserves_scope",
+      "error_type": null,
+      "failure_signatures": [
+        "handoff.request",
+        "limits.tool_calls",
+        "response.length",
+        "tools.allowed",
+        "tools.safety"
+      ],
+      "metrics": {
+        "duration_ms": 13978,
+        "event_count": 167,
+        "handoff_count": 1,
+        "input_tokens": 28873,
+        "model_calls": 3,
+        "output_tokens": 666,
+        "response_chars": 439,
+        "tool_calls": 2,
+        "total_tokens": 29539
+      },
+      "repeat_index": 3,
       "status": "FAIL",
       "suite": "router-smoke"
     }
@@ -66,7 +315,7 @@
   "run_metadata": {
     "agentscope_version": "2.0.1",
     "cases_sha256": "a1b71a7b975a1b8e29bca8fcfbef6a98a5171b71b605301c7dc2c9226c7dcbe3",
-    "git_commit": "bd5b3ac08469a6d9bd463fb0820ca41bf85a9502",
+    "git_commit": "b639c16978505378c61cbc1b20e7fa07f01bc5d2",
     "model": "qwen3.5-plus",
     "model_parameters": {
       "parallel_tool_calls": false
@@ -77,14 +326,23 @@
       "bb6af219a260b1f2dd6504437da2945cf72772e622dd0006c52bd602e02b3ee1"
     ]
   },
-  "schema_version": 1,
+  "schema_version": 2,
   "summary": {
-    "status_counts": {
+    "case_count": 3,
+    "stability_counts": {
       "ERROR": 0,
-      "FAIL": 2,
-      "PASS": 1,
+      "FLAKY": 0,
+      "SINGLE_SAMPLE": 0,
+      "STABLE_FAIL": 2,
+      "STABLE_PASS": 1,
       "TIMEOUT": 0
     },
-    "total": 3
+    "status_counts": {
+      "ERROR": 0,
+      "FAIL": 6,
+      "PASS": 3,
+      "TIMEOUT": 0
+    },
+    "total": 9
   }
 }
