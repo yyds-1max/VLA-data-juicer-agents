@@ -4,7 +4,8 @@ Total: 9 — PASS 3, FAIL 6, TIMEOUT 0, ERROR 0
 
 ## Version anchors
 
-- Git commit: `b639c16978505378c61cbc1b20e7fa07f01bc5d2`
+- Git commit: `fd311752d949a7e5997ad35e20e702e47f6d9d83`
+- Evaluation contract: `2`
 - Model: `qwen3.5-plus`
 - Model parameters: `{"parallel_tool_calls": false}`
 - AgentScope: `2.0.1`
@@ -16,20 +17,20 @@ Total: 9 — PASS 3, FAIL 6, TIMEOUT 0, ERROR 0
 
 | Case | Attempts | Stability | Pass rate | PASS | FAIL | TIMEOUT | ERROR | Failure signatures |
 | --- | ---: | --- | ---: | ---: | ---: | ---: | ---: | --- |
-| router_capability_no_handoff | 3 | STABLE_PASS | 1.000 | 3 | 0 | 0 | 0 | — |
-| router_missing_target_clarifies | 3 | STABLE_FAIL | 0.000 | 0 | 3 | 0 | 0 | response.length ×2; response.question ×3 |
-| router_shortcut_preserves_scope | 3 | STABLE_FAIL | 0.000 | 0 | 3 | 0 | 0 | handoff.count ×2; handoff.request ×1; limits.tool_calls ×2; response.length ×1; tools.allowed ×3; tools.count.start_navigation_data_task ×2; tools.safety ×3 |
+| router_capability_no_handoff | 3 | FLAKY | 0.667 | 2 | 1 | 0 | 0 | response.language ×1; response.required_group.0 ×1 |
+| router_missing_target_clarifies | 3 | FLAKY | 0.333 | 1 | 2 | 0 | 0 | response.question ×2 |
+| router_shortcut_preserves_scope | 3 | STABLE_FAIL | 0.000 | 0 | 3 | 0 | 0 | handoff.count ×3; response.language ×3; tools.allowed ×3; tools.count.start_navigation_data_task ×3; tools.safety ×3 |
 
 ## Results
 
 | Case | Repeat | Status | Model calls | Tool calls | Tokens | Failure signatures |
 | --- | ---: | --- | ---: | ---: | ---: | --- |
-| router_capability_no_handoff | 1 | PASS | 1 | 0 | 9431 | — |
-| router_capability_no_handoff | 2 | PASS | 1 | 0 | 9427 | — |
-| router_capability_no_handoff | 3 | PASS | 1 | 0 | 9434 | — |
-| router_missing_target_clarifies | 1 | FAIL | 1 | 0 | 9379 | response.question |
-| router_missing_target_clarifies | 2 | FAIL | 1 | 0 | 9406 | response.length; response.question |
-| router_missing_target_clarifies | 3 | FAIL | 1 | 0 | 9404 | response.length; response.question |
-| router_shortcut_preserves_scope | 1 | FAIL | 2 | 2 | 19275 | handoff.count; limits.tool_calls; tools.allowed; tools.count.start_navigation_data_task; tools.safety |
-| router_shortcut_preserves_scope | 2 | FAIL | 1 | 1 | 9659 | handoff.count; tools.allowed; tools.count.start_navigation_data_task; tools.safety |
-| router_shortcut_preserves_scope | 3 | FAIL | 3 | 2 | 29539 | handoff.request; limits.tool_calls; response.length; tools.allowed; tools.safety |
+| router_capability_no_handoff | 1 | FAIL | 1 | 0 | 9438 | response.language; response.required_group.0 |
+| router_capability_no_handoff | 2 | PASS | 1 | 0 | 9436 | — |
+| router_capability_no_handoff | 3 | PASS | 1 | 0 | 9422 | — |
+| router_missing_target_clarifies | 1 | PASS | 1 | 0 | 9376 | — |
+| router_missing_target_clarifies | 2 | FAIL | 1 | 0 | 9385 | response.question |
+| router_missing_target_clarifies | 3 | FAIL | 1 | 0 | 9384 | response.question |
+| router_shortcut_preserves_scope | 1 | FAIL | 1 | 1 | 9617 | handoff.count; response.language; tools.allowed; tools.count.start_navigation_data_task; tools.safety |
+| router_shortcut_preserves_scope | 2 | FAIL | 1 | 1 | 9565 | handoff.count; response.language; tools.allowed; tools.count.start_navigation_data_task; tools.safety |
+| router_shortcut_preserves_scope | 3 | FAIL | 1 | 1 | 9627 | handoff.count; response.language; tools.allowed; tools.count.start_navigation_data_task; tools.safety |
