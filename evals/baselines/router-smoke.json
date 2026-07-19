@@ -1,0 +1,90 @@
+{
+  "results": [
+    {
+      "case_id": "router_capability_no_handoff",
+      "error_type": null,
+      "failure_reasons": [],
+      "metrics": {
+        "duration_ms": 3584,
+        "event_count": 41,
+        "handoff_count": 0,
+        "input_tokens": 9311,
+        "model_calls": 1,
+        "output_tokens": 116,
+        "response_chars": 224,
+        "tool_calls": 0,
+        "total_tokens": 9427
+      },
+      "repeat_index": 1,
+      "status": "PASS",
+      "suite": "router-smoke"
+    },
+    {
+      "case_id": "router_missing_target_clarifies",
+      "error_type": null,
+      "failure_reasons": [
+        "response did not contain a question",
+        "response length 122 exceeded 120"
+      ],
+      "metrics": {
+        "duration_ms": 2441,
+        "event_count": 27,
+        "handoff_count": 0,
+        "input_tokens": 9314,
+        "model_calls": 1,
+        "output_tokens": 70,
+        "response_chars": 122,
+        "tool_calls": 0,
+        "total_tokens": 9384
+      },
+      "repeat_index": 1,
+      "status": "FAIL",
+      "suite": "router-smoke"
+    },
+    {
+      "case_id": "router_shortcut_preserves_scope",
+      "error_type": null,
+      "failure_reasons": [
+        "handoff request did not exactly match the expected value"
+      ],
+      "metrics": {
+        "duration_ms": 7369,
+        "event_count": 90,
+        "handoff_count": 1,
+        "input_tokens": 19051,
+        "model_calls": 2,
+        "output_tokens": 313,
+        "response_chars": 206,
+        "tool_calls": 1,
+        "total_tokens": 19364
+      },
+      "repeat_index": 1,
+      "status": "FAIL",
+      "suite": "router-smoke"
+    }
+  ],
+  "run_metadata": {
+    "agentscope_version": "2.0.1",
+    "cases_sha256": "a1b71a7b975a1b8e29bca8fcfbef6a98a5171b71b605301c7dc2c9226c7dcbe3",
+    "git_commit": "bd5b3ac08469a6d9bd463fb0820ca41bf85a9502",
+    "model": "qwen3.5-plus",
+    "model_parameters": {
+      "parallel_tool_calls": false
+    },
+    "prompt_sha256": "ffcc4e2bc4431ff0b3d4a544ca0898b0ab16354823f8e681b360e6aa1873893f",
+    "schema_version": 1,
+    "tool_schema_sha256": [
+      "bb6af219a260b1f2dd6504437da2945cf72772e622dd0006c52bd602e02b3ee1"
+    ]
+  },
+  "schema_version": 1,
+  "summary": {
+    "status_counts": {
+      "ERROR": 0,
+      "FAIL": 2,
+      "PASS": 1,
+      "TIMEOUT": 0
+    },
+    "total": 3
+  }
+}

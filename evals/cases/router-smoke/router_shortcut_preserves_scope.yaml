@@ -1,0 +1,52 @@
+schema_version: 1
+id: router_shortcut_preserves_scope
+suite: router-smoke
+entrypoint: router
+tags: [router, handoff, data-management-shortcut, scope]
+conversation:
+  - role: user
+    content: |-
+      请处理导航数据。
+
+      数据日期：20260710
+      指定 clips：
+      - 20260710_120000
+      - 20260710_120100
+
+      请先检查当前实际产物状态，再根据检查结果决定从哪一步开始。
+limits:
+  max_model_calls: 3
+  max_tool_calls: 1
+  timeout_seconds: 180
+expectations:
+  tools:
+    allowed_calls: [start_navigation_data_task]
+    required_counts:
+      start_navigation_data_task: 1
+    handoff_count: 1
+    handoff:
+      request: |-
+        请处理导航数据。
+
+        数据日期：20260710
+        指定 clips：
+        - 20260710_120000
+        - 20260710_120100
+
+        请先检查当前实际产物状态，再根据检查结果决定从哪一步开始。
+      target: "20260710"
+      date: "20260710"
+      clips: ["20260710_120000", "20260710_120100"]
+      response_language: Chinese
+      missing_fields: []
+      allowed_confidence: [medium, high]
+      forbidden_fields: [segments]
+  response:
+    language: Chinese
+    required_any_groups: []
+    forbidden_terms:
+      - MainRouterAgent
+      - NavigationDataAgent
+      - start_navigation_data_task
+    require_question: false
+    max_chars: 300

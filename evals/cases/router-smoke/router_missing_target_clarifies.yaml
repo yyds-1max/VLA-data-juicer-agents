@@ -1,0 +1,27 @@
+schema_version: 1
+id: router_missing_target_clarifies
+suite: router-smoke
+entrypoint: router
+tags: [router, clarification, no-handoff]
+conversation:
+  - role: user
+    content: 请处理导航数据。
+limits:
+  max_model_calls: 2
+  max_tool_calls: 0
+  timeout_seconds: 180
+expectations:
+  tools:
+    allowed_calls: []
+    required_counts: {}
+    handoff_count: 0
+  response:
+    language: Chinese
+    required_any_groups:
+      - [日期, 路径, 数据目标]
+    forbidden_terms:
+      - MainRouterAgent
+      - NavigationDataAgent
+      - start_navigation_data_task
+    require_question: true
+    max_chars: 120

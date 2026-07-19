@@ -1,0 +1,30 @@
+schema_version: 1
+id: router_capability_no_handoff
+suite: router-smoke
+entrypoint: router
+tags: [router, capability, no-handoff]
+conversation:
+  - role: user
+    content: 你能帮我做什么？
+limits:
+  max_model_calls: 2
+  max_tool_calls: 0
+  timeout_seconds: 180
+expectations:
+  tools:
+    allowed_calls: []
+    required_counts: {}
+    handoff_count: 0
+  response:
+    language: Chinese
+    required_any_groups:
+      - [VLA, 导航, 数据]
+    forbidden_terms:
+      - MainRouterAgent
+      - NavigationDataAgent
+      - start_navigation_data_task
+      - system prompt
+      - 系统提示词
+      - 工具名称
+    require_question: false
+    max_chars: 400
