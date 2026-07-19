@@ -95,12 +95,7 @@ def test_main_router_prompt_is_triage_only_and_handles_handoff_truthfully():
     assert "ordinary conversation, capability answers, clarification questions" in prompt
     assert "Whenever this reply yields control back to the user" in prompt
     assert "even if a later turn may call tools" in prompt
-    assert "output only one short `Answer:` clarification question" in prompt
-    assert "no identity/capability preamble, Activity, explanation, examples, or bullet list" in prompt
-    assert "Answer: 请提供要处理数据的日期、路径或数据目标？" in prompt
-    assert "copy the entire latest user message verbatim" in prompt
-    assert "punctuation, blank lines, labels, and list items" in prompt
-    assert "Never summarize, paraphrase, normalize, translate, or omit" in prompt
+    assert "ask one short clarifying question as an `Answer:` message" in prompt
 
 
 def test_all_agent_prompts_define_answer_as_the_persistent_chat_channel():

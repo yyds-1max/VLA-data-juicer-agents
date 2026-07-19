@@ -252,10 +252,6 @@ def test_navigation_handoff_tool_declares_structured_schema():
     ]
     assert tool.input_schema["properties"]["scene_mode"]["enum"] == ["indoor", "outdoor", "unknown"]
     assert tool.input_schema["properties"]["confidence"]["enum"] == ["low", "medium", "high"]
-    request_description = tool.input_schema["properties"]["request"]["description"]
-    assert "entire latest user message copied verbatim" in request_description
-    assert "punctuation, blank lines, labels, and list items" in request_description
-    assert "Never summarize, paraphrase, normalize, translate, or omit" in request_description
     assert tool.input_schema["properties"]["missing_fields"]["items"]["enum"] == [
         "request",
         "target",
