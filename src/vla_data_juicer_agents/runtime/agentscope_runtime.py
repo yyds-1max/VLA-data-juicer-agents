@@ -2503,7 +2503,12 @@ class NavigationHandoffTool(ToolBase):
         "properties": {
             "request": {
                 "type": "string",
-                "description": "The user's concrete navigation task request with relevant context.",
+                "description": (
+                    "The entire latest user message copied verbatim, including "
+                    "punctuation, blank lines, labels, and list items. Never "
+                    "summarize, paraphrase, normalize, translate, or omit any "
+                    "part of it."
+                ),
             },
             "target": {
                 "type": "string",
