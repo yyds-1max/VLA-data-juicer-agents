@@ -130,7 +130,7 @@ class TraceRecorder:
     def sanitized_events(self) -> tuple[dict[str, Any], ...]:
         """Return a deep-copied trace redacted again after stream reassembly."""
 
-        events = [self.redact(event) for event in self.events]
+        events = deepcopy(self.events)
         streams: dict[tuple[str, str, str], list[int]] = {}
         for index, event in enumerate(events):
             key = self._stream_key(event)
@@ -151,7 +151,7 @@ class TraceRecorder:
                     replacement = redacted[cursor : cursor + len(chunk)]
                     cursor += len(replacement)
                 events[index]["delta"] = replacement
-        return tuple(events)
+        return tuple(self.redact(event) for event in events)
 
     def _public_final_text(self, events: Sequence[Mapping[str, Any]]) -> str:
         projected: list[dict[str, Any]] = []
@@ -201,13 +201,13 @@ class TraceRecorder:
         event_type = str(event.get("type", "")).upper()
         if event_type.startswith(_THINKING_EVENT_PREFIX):
             return
-        clean = self.redact(dict(event))
-        self.events.append(clean)
+        raw = deepcopy(dict(event))
+        self.events.append(raw)
 
         if event_type == "TOOL_CALL_START":
             call = {
-                "id": str(clean.get("tool_call_id", "")),
-                "name": str(clean.get("tool_call_name", "")),
+                "id": str(raw.get("tool_call_id", "")),
+                "name": str(raw.get("tool_call_name", "")),
                 "input": "",
                 "result": "",
             }
@@ -219,15 +219,15 @@ class TraceRecorder:
             if call["name"] not in _EVALUATION_ALLOWED_TOOLS:
                 self.record_forbidden_call(call_id=call["id"], name=call["name"])
         elif event_type == "TOOL_CALL_DELTA":
-            call_id = str(clean.get("tool_call_id", ""))
+            call_id = str(raw.get("tool_call_id", ""))
             call = self._tool_calls_by_id.get(call_id)
             if call is not None:
-                call["input"] += str(clean.get("delta", ""))
+                call["input"] += str(raw.get("delta", ""))
         elif event_type == "TOOL_RESULT_TEXT_DELTA":
-            call_id = str(clean.get("tool_call_id", ""))
+            call_id = str(raw.get("tool_call_id", ""))
             call = self._tool_calls_by_id.get(call_id)
             if call is not None:
-                call["result"] += str(clean.get("delta", ""))
+                call["result"] += str(raw.get("delta", ""))
 
     def record_model_call(
         self,

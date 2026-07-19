@@ -52,9 +52,10 @@ def test_trace_drops_thinking_and_projects_only_public_answer(tmp_path):
     recorder.accept_event({"type": "REPLY_END", "reply_id": "reply-1"})
 
     assert len(recorder.events) == 4
-    serialized = str(recorder.events)
+    snapshot = recorder.sanitized_snapshot()
+    serialized = str(snapshot["events"])
     assert "private reasoning" not in serialized
-    assert recorder.events[2]["api_key"] == "[REDACTED]"
+    assert snapshot["events"][2]["api_key"] == "[REDACTED]"
     assert recorder.final_text == "处理完成。"
     assert recorder.redact("eval-navigation-task-eval-case") == (
         "eval-navigation-task-eval-case"
@@ -102,6 +103,7 @@ def test_snapshot_redacts_sensitive_values_split_across_stream_deltas(tmp_path):
     snapshot = recorder.sanitized_snapshot()
     serialized = str(snapshot)
     assert "/Users/sfy/private/data" not in serialized
+    assert "sfy/private/data" not in serialized
     assert "sk-abcdefghijklmnop" not in serialized
     assert "[PATH]" in serialized
     assert "[REDACTED]" in serialized
