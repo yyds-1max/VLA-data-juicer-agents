@@ -6,6 +6,11 @@ production prompt, tool schemas, AgentScope host, and a real DashScope model. It
 does **not** require Redis, FastAPI, the frontend, or navigation processing
 scripts.
 
+The case Schema v1 intentionally supports exactly one `router` user turn.
+`navigation`, `end_to_end`, and multi-turn conversations require separate
+execution semantics, side-effect simulators, and graders; they are rejected at
+validation time instead of being silently approximated by this runner.
+
 ## Environment
 
 Export a DashScope credential and the same router model used by the deployed
@@ -72,6 +77,13 @@ beside the candidate by default. Its exit code is `0` for no regression, `1`
 for a behavioral regression or candidate timeout, and `2` for incompatible
 reports, invalid input, or candidate infrastructure errors.
 
+Comparison also requires the same evaluation contract version. Contract v2
+grades the final public answer produced by the same event projection used by
+the Web turn stream, rather than concatenating every model text delta. It also
+redacts secrets and absolute paths again after streamed tool/text fields have
+been reassembled. Historical reports without a contract anchor are treated as
+contract v1 and are intentionally incompatible with contract v2 runs.
+
 After reviewing a complete run, promote it without another model call:
 
 ```bash
@@ -95,11 +107,11 @@ infrastructure errors.
 Evaluation cases score observable outcomes and safety invariants, not a fixed
 tool-call script. Full model responses and event traces remain in the ignored
 artifact directory; committed baselines contain only sanitized metadata,
-metrics, statuses, hashes, failure signatures, and sanitized failure reasons.
-Report Schema v2 adds case stability summaries; comparison remains compatible
-with the original v1 baseline. Thinking events, credentials, absolute workspace
-paths, complete responses, and tool payloads must never enter a baseline or
-comparison report.
+metrics, statuses, hashes, and failure signatures.
+Report Schema v2 adds case stability summaries. The parser still reads v1
+reports, while comparison requires matching evaluation contract versions.
+Thinking events, credentials, absolute workspace paths, complete responses, and
+tool payloads must never enter a baseline or comparison report.
 
 A model `FAIL` is a valid baseline result. Do not change an agent prompt, tool,
 router, or business behavior while implementing or refreshing the evaluation

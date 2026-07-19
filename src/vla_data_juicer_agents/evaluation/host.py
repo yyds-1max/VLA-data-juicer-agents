@@ -486,15 +486,16 @@ class EvaluationHost:
     def snapshot(self, *, session_id: str) -> HostRunResult:
         """Return the sanitized trace collected so far, including after failures."""
 
+        snapshot = self.recorder.sanitized_snapshot()
         return HostRunResult(
             session_id=session_id,
-            events=tuple(self.recorder.events),
-            model_calls=tuple(self.recorder.model_calls),
-            tool_calls=tuple(self.recorder.tool_calls),
-            forbidden_calls=tuple(self.recorder.forbidden_calls),
-            handoffs=tuple(self.recorder.handoffs),
-            final_text=self.recorder.final_text,
-            token_usage=self.recorder.token_usage,
+            events=tuple(snapshot["events"]),
+            model_calls=tuple(snapshot["model_calls"]),
+            tool_calls=tuple(snapshot["tool_calls"]),
+            forbidden_calls=tuple(snapshot["forbidden_calls"]),
+            handoffs=tuple(snapshot["handoffs"]),
+            final_text=str(snapshot["final_text"]),
+            token_usage=dict(snapshot["token_usage"]),
         )
 
 

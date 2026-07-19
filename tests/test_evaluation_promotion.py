@@ -66,6 +66,7 @@ def _write_aggregate(
         "schema_version": schema_version,
         "run_metadata": {
             "suite": "router-smoke",
+            "evaluation_contract_version": 2,
             "repeat": repeat,
             "git_commit": commit,
             "cases_sha256": cases_hash or promotion.cases_sha256(cases),
@@ -142,6 +143,7 @@ def test_promotes_complete_run_atomically_without_model(
     [
         ("stale", "HEAD"),
         ("hash", "cases_sha256"),
+        ("contract", "evaluation_contract_version"),
         ("partial", "complete suite"),
         ("error", "ERROR"),
     ],
@@ -158,11 +160,17 @@ def test_rejects_stale_hash_partial_and_error_runs(
         kwargs["commit"] = "old123"
     elif mutation == "hash":
         kwargs["cases_hash"] = "stale-cases"
+    elif mutation == "contract":
+        aggregate = _write_aggregate(tmp_path, cases_root)
+        raw = json.loads(aggregate.read_text(encoding="utf-8"))
+        raw["run_metadata"]["evaluation_contract_version"] = 1
+        aggregate.write_text(json.dumps(raw), encoding="utf-8")
     elif mutation == "partial":
         kwargs["included_ids"] = ("case_a",)
     elif mutation == "error":
         kwargs["statuses"] = {("case_a", 1): EvaluationStatus.ERROR}
-    aggregate = _write_aggregate(tmp_path, cases_root, **kwargs)
+    if mutation != "contract":
+        aggregate = _write_aggregate(tmp_path, cases_root, **kwargs)
 
     with pytest.raises(promotion.PromotionError, match=message):
         promotion.promote_baseline(

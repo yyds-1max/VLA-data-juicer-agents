@@ -75,7 +75,7 @@ class EvaluationCase(StrictModel):
     schema_version: Literal[1]
     id: str = Field(pattern=r"^[a-z][a-z0-9_-]*$")
     suite: str = Field(pattern=r"^[a-z][a-z0-9_-]*$")
-    entrypoint: Literal["router", "navigation", "end_to_end"]
+    entrypoint: Literal["router"]
     tags: list[str] = Field(default_factory=list)
     conversation: list[ConversationTurn] = Field(min_length=1)
     limits: CaseLimits = Field(default_factory=CaseLimits)
@@ -83,8 +83,10 @@ class EvaluationCase(StrictModel):
 
     @model_validator(mode="after")
     def validate_conversation(self) -> "EvaluationCase":
-        if self.conversation[-1].role != "user":
-            raise ValueError("the last conversation turn must be a user turn")
+        if len(self.conversation) != 1 or self.conversation[0].role != "user":
+            raise ValueError(
+                "evaluation case schema v1 supports exactly one user conversation turn",
+            )
         return self
 
 

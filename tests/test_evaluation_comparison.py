@@ -20,6 +20,7 @@ from vla_data_juicer_agents.evaluation.comparison import (
 def _metadata(**overrides: object) -> dict[str, object]:
     metadata: dict[str, object] = {
         "suite": "router-smoke",
+        "evaluation_contract_version": 2,
         "cases_sha256": "cases-v1",
         "model": "qwen-test",
         "model_parameters": {"parallel_tool_calls": False},
@@ -234,6 +235,7 @@ def test_compare_v1_to_v2_reports_improvement_and_version_changes():
     ("field", "candidate_value"),
     [
         ("suite", "other-suite"),
+        ("evaluation_contract_version", 1),
         ("cases_sha256", "other-cases"),
         ("model", "other-model"),
         ("model_parameters", {"parallel_tool_calls": True}),

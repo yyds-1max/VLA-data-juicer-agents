@@ -9,11 +9,15 @@ from collections.abc import AsyncGenerator, Awaitable, Callable, Mapping, Sequen
 from copy import deepcopy
 from dataclasses import dataclass, field
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 from agentscope.message import TextBlock, ToolResultState
 from agentscope.middleware import MiddlewareBase
 from agentscope.tool import ToolResponse
+
+from vla_data_juicer_agents.adapters.agentscope.events import AgentScopeEventAdapter
+from vla_data_juicer_agents.core.events import CallbackEventSink, EventEmitter
 
 
 _SECRET_KEY_PARTS = (
@@ -29,8 +33,19 @@ _SECRET_KEY_PARTS = (
 _API_KEY_PATTERN = re.compile(
     r"(?i)(?:bearer\s+)?(?<![a-z0-9])(?:sk-[a-z0-9_-]{12,}|dashscope[-_a-z0-9]{12,})",
 )
+_POSIX_ABSOLUTE_PATH_PATTERN = re.compile(
+    r"(?<![A-Za-z0-9_.-])/(?:Users|home|private|tmp|var|opt|srv|media)"
+    r"(?:/[^\s\"'<>|,;:)}\]]*)*",
+    flags=re.IGNORECASE,
+)
+_WINDOWS_ABSOLUTE_PATH_PATTERN = re.compile(
+    r"(?<![A-Za-z0-9_.-])[A-Za-z]:\\[^\s\"'<>|,;)}\]]+",
+)
 _THINKING_EVENT_PREFIX = "THINKING"
 _EVALUATION_ALLOWED_TOOLS = frozenset({"start_navigation_data_task"})
+_STREAM_DELTA_TYPES = frozenset(
+    {"TEXT_BLOCK_DELTA", "TOOL_CALL_DELTA", "TOOL_RESULT_TEXT_DELTA"},
+)
 
 
 def schema_hash(tools: Sequence[Mapping[str, Any]]) -> str:
@@ -96,8 +111,89 @@ class TraceRecorder:
             for path in sorted(self.sensitive_paths, key=len, reverse=True):
                 if path:
                     text = text.replace(path, "[WORKSPACE]")
-            return _API_KEY_PATTERN.sub("[REDACTED]", text)
+            text = _API_KEY_PATTERN.sub("[REDACTED]", text)
+            text = _POSIX_ABSOLUTE_PATH_PATTERN.sub("[PATH]", text)
+            return _WINDOWS_ABSOLUTE_PATH_PATTERN.sub("[PATH]", text)
         return deepcopy(value)
+
+    @staticmethod
+    def _stream_key(event: Mapping[str, Any]) -> tuple[str, str, str] | None:
+        event_type = str(event.get("type", "")).upper()
+        if event_type not in _STREAM_DELTA_TYPES:
+            return None
+        if event_type == "TEXT_BLOCK_DELTA":
+            identity = str(event.get("block_id") or event.get("reply_id") or "")
+        else:
+            identity = str(event.get("tool_call_id") or "")
+        return event_type, identity, "delta"
+
+    def sanitized_events(self) -> tuple[dict[str, Any], ...]:
+        """Return a deep-copied trace redacted again after stream reassembly."""
+
+        events = [self.redact(event) for event in self.events]
+        streams: dict[tuple[str, str, str], list[int]] = {}
+        for index, event in enumerate(events):
+            key = self._stream_key(event)
+            if key is not None:
+                streams.setdefault(key, []).append(index)
+
+        for indices in streams.values():
+            chunks = [str(events[index].get("delta", "")) for index in indices]
+            joined = "".join(chunks)
+            redacted = str(self.redact(joined))
+            if redacted == joined:
+                continue
+            cursor = 0
+            for position, (index, chunk) in enumerate(zip(indices, chunks, strict=True)):
+                if position == len(indices) - 1:
+                    replacement = redacted[cursor:]
+                else:
+                    replacement = redacted[cursor : cursor + len(chunk)]
+                    cursor += len(replacement)
+                events[index]["delta"] = replacement
+        return tuple(events)
+
+    def _public_final_text(self, events: Sequence[Mapping[str, Any]]) -> str:
+        projected: list[dict[str, Any]] = []
+        scope = EventEmitter(CallbackEventSink(projected.append)).scope(
+            "evaluation",
+            run_id="evaluation-public-reply",
+        )
+        adapter = AgentScopeEventAdapter(
+            scope,
+            emit_tool_events=True,
+            emit_text_events=False,
+            emit_final_events=False,
+            emit_reasoning_events=False,
+            emit_progress_events=True,
+            emit_reply_summary_events=True,
+            emit_answer_delta_events=True,
+            public_tool_events=True,
+            suppress_pre_tool_text=True,
+        )
+        for event in events:
+            adapter.accept(SimpleNamespace(**dict(event)))
+        summaries = [
+            event.get("payload", {}).get("text", "")
+            for event in projected
+            if event.get("type") == "reply_summary"
+            and isinstance(event.get("payload"), Mapping)
+        ]
+        return str(self.redact(summaries[-1] if summaries else ""))
+
+    def sanitized_snapshot(self) -> dict[str, Any]:
+        """Build the only trace representation that may leave this process."""
+
+        events = self.sanitized_events()
+        return {
+            "events": events,
+            "model_calls": tuple(self.redact(self.model_calls)),
+            "tool_calls": tuple(self.redact(self.tool_calls)),
+            "forbidden_calls": tuple(self.redact(self.forbidden_calls)),
+            "handoffs": tuple(self.redact(self.handoffs)),
+            "final_text": self._public_final_text(events),
+            "token_usage": dict(self.token_usage),
+        }
 
     def accept_event(self, event: Mapping[str, Any]) -> None:
         """Record one AgentScope event, excluding all thinking events."""
@@ -157,11 +253,7 @@ class TraceRecorder:
 
     @property
     def final_text(self) -> str:
-        return "".join(
-            str(event.get("delta", ""))
-            for event in self.events
-            if str(event.get("type", "")).upper() == "TEXT_BLOCK_DELTA"
-        )
+        return self._public_final_text(self.sanitized_events())
 
     @property
     def token_usage(self) -> dict[str, int]:

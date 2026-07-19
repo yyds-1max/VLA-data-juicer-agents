@@ -106,6 +106,7 @@ def build_baseline_report(
         baseline_results.append(compact)
     allowed_metadata = {
         "schema_version",
+        "evaluation_contract_version",
         "git_commit",
         "model",
         "model_parameters",
@@ -141,6 +142,9 @@ def _baseline_markdown(report: dict[str, Any]) -> str:
         "## Version anchors",
         "",
         f"- Git commit: `{metadata.get('git_commit') or '—'}`",
+        "- Evaluation contract: `"
+        + str(metadata.get("evaluation_contract_version", 1))
+        + "`",
         f"- Model: `{metadata.get('model') or '—'}`",
         "- Model parameters: `"
         + json.dumps(metadata.get("model_parameters", {}), sort_keys=True)

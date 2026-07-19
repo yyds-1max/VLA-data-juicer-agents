@@ -15,6 +15,7 @@ from vla_data_juicer_agents.evaluation.cases import (
     default_cases_root,
     load_suite,
 )
+from vla_data_juicer_agents.evaluation.contract import EVALUATION_CONTRACT_VERSION
 from vla_data_juicer_agents.evaluation.models import (
     CaseResult,
     EvaluationCase,
@@ -103,6 +104,10 @@ def _validate_complete_run(
     if metadata.get("suite") != suite:
         raise PromotionError(
             f"aggregate suite {metadata.get('suite')!r} does not match {suite!r}",
+        )
+    if metadata.get("evaluation_contract_version", 1) != EVALUATION_CONTRACT_VERSION:
+        raise PromotionError(
+            "aggregate evaluation_contract_version does not match the current evaluator",
         )
     repeat = metadata.get("repeat")
     if isinstance(repeat, bool) or not isinstance(repeat, int) or repeat < 1:

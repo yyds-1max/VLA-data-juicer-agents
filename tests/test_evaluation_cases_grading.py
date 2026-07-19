@@ -55,6 +55,37 @@ def test_case_schema_rejects_unknown_fields():
         EvaluationCase.model_validate(raw)
 
 
+@pytest.mark.parametrize("entrypoint", ["navigation", "end_to_end"])
+def test_v1_case_schema_rejects_unimplemented_entrypoints(entrypoint):
+    raw = _cases()["router_capability_no_handoff"].model_dump(mode="python")
+    raw["entrypoint"] = entrypoint
+
+    with pytest.raises(ValidationError, match="literal_error"):
+        EvaluationCase.model_validate(raw)
+
+
+@pytest.mark.parametrize(
+    "conversation",
+    [
+        [
+            {"role": "assistant", "content": "请提供日期。"},
+            {"role": "user", "content": "20260710"},
+        ],
+        [
+            {"role": "user", "content": "请处理导航数据。"},
+            {"role": "user", "content": "日期是 20260710。"},
+        ],
+        [{"role": "assistant", "content": "请提供日期。"}],
+    ],
+)
+def test_v1_case_schema_rejects_conversation_history(conversation):
+    raw = _cases()["router_capability_no_handoff"].model_dump(mode="python")
+    raw["conversation"] = conversation
+
+    with pytest.raises(ValidationError, match="exactly one user conversation turn"):
+        EvaluationCase.model_validate(raw)
+
+
 def test_loader_rejects_duplicate_ids(tmp_path: Path):
     suite_dir = tmp_path / SUITE
     suite_dir.mkdir()
@@ -215,6 +246,7 @@ def test_reports_keep_full_local_result_out_of_compact_baseline(tmp_path: Path):
         tmp_path / "baseline.md",
         run_metadata={
             "git_commit": "abc123",
+            "evaluation_contract_version": 2,
             "model": "qwen-test",
             "model_parameters": {"parallel_tool_calls": False},
             "agentscope_version": "2.0.1",
@@ -247,12 +279,14 @@ def test_reports_keep_full_local_result_out_of_compact_baseline(tmp_path: Path):
     assert "trace" not in baseline["results"][0]
     assert baseline["results"][0]["metrics"]["response_chars"] == len(secret_response)
     assert baseline["run_metadata"]["prompt_sha256"] == "deadbeef"
+    assert baseline["run_metadata"]["evaluation_contract_version"] == 2
     assert "run_id" not in baseline["run_metadata"]
     assert "started_at" not in baseline["run_metadata"]
     markdown = markdown_path.read_text(encoding="utf-8")
     assert "model behavior failed" not in markdown
     assert "handoff.request" in markdown
     assert "abc123" in markdown
+    assert "Evaluation contract: `2`" in markdown
     assert "deadbeef" in markdown
     assert "toolhash" in markdown
     assert "/private/tmp/case" not in markdown

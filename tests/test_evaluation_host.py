@@ -20,7 +20,7 @@ def _model_factory(model):
     return lambda *_args, **_kwargs: model
 
 
-def test_trace_drops_thinking_and_redacts_secrets_and_workspace(tmp_path):
+def test_trace_drops_thinking_and_projects_only_public_answer(tmp_path):
     recorder = TraceRecorder.for_workspace(tmp_path)
 
     recorder.accept_event(
@@ -30,23 +30,117 @@ def test_trace_drops_thinking_and_redacts_secrets_and_workspace(tmp_path):
         },
     )
     recorder.accept_event(
+        {"type": "REPLY_START", "reply_id": "reply-1"},
+    )
+    recorder.accept_event(
         {
             "type": "TEXT_BLOCK_DELTA",
-            "delta": f"Answer: {tmp_path}/case sk-abcdefghijklmnopqrstuvwxyz",
+            "reply_id": "reply-1",
+            "block_id": "text-1",
+            "delta": "内部草稿不会展示。\nActivity: 正在检查数据。\nAns",
+        },
+    )
+    recorder.accept_event(
+        {
+            "type": "TEXT_BLOCK_DELTA",
+            "reply_id": "reply-1",
+            "block_id": "text-1",
+            "delta": "wer:\n处理完成。",
             "api_key": "never-store-this",
         },
     )
+    recorder.accept_event({"type": "REPLY_END", "reply_id": "reply-1"})
 
-    assert len(recorder.events) == 1
+    assert len(recorder.events) == 4
     serialized = str(recorder.events)
     assert "private reasoning" not in serialized
-    assert str(tmp_path) not in serialized
-    assert "abcdefghijklmnopqrstuvwxyz" not in serialized
-    assert recorder.events[0]["api_key"] == "[REDACTED]"
-    assert "[WORKSPACE]" in recorder.final_text
+    assert recorder.events[2]["api_key"] == "[REDACTED]"
+    assert recorder.final_text == "处理完成。"
     assert recorder.redact("eval-navigation-task-eval-case") == (
         "eval-navigation-task-eval-case"
     )
+
+
+def test_snapshot_redacts_sensitive_values_split_across_stream_deltas(tmp_path):
+    recorder = TraceRecorder.for_workspace(tmp_path)
+    recorder.accept_event(
+        {
+            "type": "TOOL_CALL_START",
+            "tool_call_id": "call-1",
+            "tool_call_name": "Bash",
+        },
+    )
+    recorder.accept_event(
+        {
+            "type": "TOOL_CALL_DELTA",
+            "tool_call_id": "call-1",
+            "delta": '{"command":"ls /Users/sfy/private',
+        },
+    )
+    recorder.accept_event(
+        {
+            "type": "TOOL_CALL_DELTA",
+            "tool_call_id": "call-1",
+            "delta": '/data"}',
+        },
+    )
+    recorder.accept_event(
+        {
+            "type": "TOOL_RESULT_TEXT_DELTA",
+            "tool_call_id": "call-1",
+            "delta": "sk-abcdefgh",
+        },
+    )
+    recorder.accept_event(
+        {
+            "type": "TOOL_RESULT_TEXT_DELTA",
+            "tool_call_id": "call-1",
+            "delta": "ijklmnop",
+        },
+    )
+
+    snapshot = recorder.sanitized_snapshot()
+    serialized = str(snapshot)
+    assert "/Users/sfy/private/data" not in serialized
+    assert "sk-abcdefghijklmnop" not in serialized
+    assert "[PATH]" in serialized
+    assert "[REDACTED]" in serialized
+    assert "[PATH]" in snapshot["tool_calls"][0]["input"]
+    assert "[REDACTED]" in snapshot["tool_calls"][0]["result"]
+
+    snapshot["tool_calls"][0]["input"] = "mutated"
+    assert recorder.tool_calls[0]["input"] != "mutated"
+
+
+def test_public_reply_projection_retracts_text_before_tool_call():
+    recorder = TraceRecorder()
+    for event in (
+        {"type": "REPLY_START", "reply_id": "reply-1"},
+        {
+            "type": "TEXT_BLOCK_DELTA",
+            "reply_id": "reply-1",
+            "block_id": "text-1",
+            "delta": "Answer: 这段会被撤回。",
+        },
+        {
+            "type": "TOOL_CALL_START",
+            "reply_id": "reply-1",
+            "tool_call_id": "call-1",
+            "tool_call_name": "start_navigation_data_task",
+        },
+        {"type": "REPLY_END", "reply_id": "reply-1"},
+        {"type": "REPLY_START", "reply_id": "reply-2"},
+        {
+            "type": "TEXT_BLOCK_DELTA",
+            "reply_id": "reply-2",
+            "block_id": "text-2",
+            "delta": "Activity: 正在汇总。\nAnswer: 最终公开回答。",
+        },
+        {"type": "REPLY_END", "reply_id": "reply-2"},
+    ):
+        recorder.accept_event(event)
+
+    assert recorder.final_text == "最终公开回答。"
 
 
 @pytest.mark.asyncio
@@ -82,7 +176,7 @@ async def test_host_uses_production_assembly_and_records_visible_tools(tmp_path)
     assert session_record.config.chat_model_config.parameters == {
         "parallel_tool_calls": False,
     }
-    assert result.final_text == "Answer:\n我是 DataPilot。"
+    assert result.final_text == "我是 DataPilot。"
     assert len(result.model_calls) == 1
     model_call = result.model_calls[0]
     assert model_call["model_name"] == "offline-scripted-qwen"

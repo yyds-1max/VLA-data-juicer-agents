@@ -223,12 +223,15 @@ def _git_commit(repo_root: Path) -> str | None:
 
 
 def _run_metadata(*, repo_root: Path, suite: str, repeat: int, run_id: str) -> dict[str, Any]:
+    from .contract import EVALUATION_CONTRACT_VERSION
+
     try:
         agentscope_version = version("agentscope")
     except PackageNotFoundError:
         agentscope_version = None
     return {
         "schema_version": 1,
+        "evaluation_contract_version": EVALUATION_CONTRACT_VERSION,
         "run_id": run_id,
         "suite": suite,
         "repeat": repeat,

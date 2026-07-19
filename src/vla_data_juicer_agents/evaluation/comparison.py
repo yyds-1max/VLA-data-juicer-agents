@@ -19,6 +19,7 @@ from typing import Any
 
 _COMPATIBILITY_FIELDS = (
     "suite",
+    "evaluation_contract_version",
     "cases_sha256",
     "model",
     "model_parameters",
@@ -376,6 +377,8 @@ def normalize_report(payload: Mapping[str, Any]) -> NormalizedReport:
 def _compatibility_value(report: NormalizedReport, field: str) -> Any:
     if field == "suite":
         return report.suite
+    if field == "evaluation_contract_version":
+        return report.metadata.get(field, 1)
     return report.metadata.get(field)
 
 

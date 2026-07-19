@@ -10,8 +10,10 @@ import pytest
 from vla_data_juicer_agents.evaluation import cli
 from vla_data_juicer_agents.evaluation.models import (
     CaseResult,
+    CaseRunObservation,
     EvaluationCase,
     EvaluationStatus,
+    ToolCallObservation,
 )
 
 
@@ -56,6 +58,7 @@ def _comparison_report(status: str) -> dict:
         "schema_version": 2,
         "run_metadata": {
             "suite": "router-smoke",
+            "evaluation_contract_version": 2,
             "cases_sha256": "cases",
             "model": "qwen-test",
             "model_parameters": {"parallel_tool_calls": False},
@@ -306,6 +309,35 @@ def test_worker_subprocess_uses_json_files_and_not_secret_arguments(
     assert "DASHSCOPE_API_KEY" not in request
     assert "output_dir" not in request
     assert "sk-test-secret-that-must-not-leak" not in request_path.read_text(encoding="utf-8")
+
+
+def test_worker_result_persistence_applies_final_recursive_redaction(tmp_path: Path) -> None:
+    from vla_data_juicer_agents.evaluation.worker import _write_result
+
+    destination = tmp_path / "attempt-1" / "worker-result.json"
+    result = CaseResult(
+        case_id="router_test",
+        suite="router-smoke",
+        status=EvaluationStatus.FAIL,
+        error_message="provider mentioned sk-abcdefghijklmnop",
+        observation=CaseRunObservation(
+            final_response="检查 /Users/sfy/private/data",
+            tool_calls=[
+                ToolCallObservation(
+                    name="Bash",
+                    arguments={"command": "ls /Users/sfy/private/data"},
+                ),
+            ],
+        ),
+    )
+
+    _write_result(destination, result)
+
+    persisted = destination.read_text(encoding="utf-8")
+    assert "/Users/sfy/private/data" not in persisted
+    assert "sk-abcdefghijklmnop" not in persisted
+    assert "[PATH]" in persisted
+    assert "[REDACTED]" in persisted
 
 
 def test_worker_timeout_becomes_timeout_result(monkeypatch, tmp_path: Path) -> None:

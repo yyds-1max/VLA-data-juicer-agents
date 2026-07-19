@@ -158,7 +158,10 @@ def _redacted_error(error: BaseException, request: dict[str, Any]) -> str:
 
 def _write_result(path: Path, result: CaseResult) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(result.model_dump_json(indent=2) + "\n", encoding="utf-8")
+    recorder = TraceRecorder.for_workspace(path.parent)
+    sanitized = recorder.redact(result.model_dump(mode="json"))
+    persisted = CaseResult.model_validate(sanitized)
+    path.write_text(persisted.model_dump_json(indent=2) + "\n", encoding="utf-8")
 
 
 def main(argv: list[str] | None = None) -> int:
