@@ -12,6 +12,7 @@ import {
   openSessionEvents,
   recoverHumanDecision,
   submitHumanDecision,
+  submitInteractionResponse,
   submitTurn,
 } from "./client";
 import type {
@@ -69,6 +70,18 @@ describe("api client", () => {
     expect(fetchMock).toHaveBeenCalledWith("/api/sessions", {
       method: "POST",
       body: JSON.stringify({ message: "hello" }),
+      headers: { "content-type": "application/json" },
+    });
+  });
+
+  it("marks a shortcut-created session with an explicit entrypoint", async () => {
+    const record = session({ contract_version: 1 });
+    const fetchMock = mockFetchJson({ session: record });
+
+    await expect(createSession("处理导航数据", "data_management_shortcut")).resolves.toEqual(record);
+    expect(fetchMock).toHaveBeenCalledWith("/api/sessions", {
+      method: "POST",
+      body: JSON.stringify({ message: "处理导航数据", entrypoint: "data_management_shortcut" }),
       headers: { "content-type": "application/json" },
     });
   });
@@ -166,6 +179,28 @@ describe("api client", () => {
     await expect(recoverHumanDecision("session/with space", payload)).resolves.toEqual(recovered);
     expect(fetchMock).toHaveBeenCalledWith(
       "/api/sessions/session%2Fwith%20space/human-decisions/recovery",
+      {
+        method: "POST",
+        body: JSON.stringify(payload),
+        headers: { "content-type": "application/json" },
+      },
+    );
+  });
+
+  it("posts a versioned interaction response to the encoded v1 endpoint", async () => {
+    const fetchMock = mockFetchJson({ accepted: true, turn_id: "turn-interaction-1" });
+    const payload = {
+      option_id: "confirm",
+      interaction_revision: 3,
+      expected_task_revision: 8,
+      idempotency_key: "interaction-request-1",
+    };
+
+    await expect(
+      submitInteractionResponse("session/with space", "interaction/1", payload),
+    ).resolves.toEqual({ accepted: true, turn_id: "turn-interaction-1" });
+    expect(fetchMock).toHaveBeenCalledWith(
+      "/api/sessions/session%2Fwith%20space/interactions/interaction%2F1/responses",
       {
         method: "POST",
         body: JSON.stringify(payload),

@@ -1,6 +1,15 @@
 import type { AgentEvent, PendingHumanDecision } from "../api/types";
 
-export type TimelineKind = "activity" | "progress" | "reasoning" | "tool" | "agent" | "assistant" | "system";
+export type TimelineKind =
+  | "activity"
+  | "progress"
+  | "reasoning"
+  | "tool"
+  | "action"
+  | "interaction"
+  | "agent"
+  | "assistant"
+  | "system";
 
 export interface ActivityStep {
   id: string;
@@ -24,6 +33,14 @@ export interface TimelineItem {
   activitySteps?: ActivityStep[];
   progressId?: string;
   progressPhase?: "streaming" | "completed";
+  progressPhaseName?: string;
+  actionRef?: string;
+  actionCode?: string;
+  actionDisplayName?: string;
+  actionPhase?: string;
+  actionPhaseInstanceId?: string;
+  actionStatus?: "running" | "completed" | "failed" | "interrupted";
+  interactionId?: string;
   turnId?: string | null;
   replyId?: string;
   replyKey?: string;
@@ -144,14 +161,40 @@ export function applyAgentEvent(state: RunState, event: AgentEvent): void {
   }
 
   if (type === "progress_start") {
-    // A start is intentionally not rendered until the first safe delta arrives.
-    // This keeps the initial placeholder visible and lets an end-before-start
-    // tombstone remain authoritative during snapshot/WebSocket races.
+    const summary = normalizeText(payload.summary);
+    if (summary) {
+      const phase = normalizeText(payload.phase);
+      state.timeline.push({
+        kind: "progress",
+        source: "main",
+        text: summary,
+        turnId,
+        progressPhaseName: phase,
+        progressPhase: state.terminalProgress[publicProgressKey(turnId, phase)]
+          ? "completed"
+          : "streaming",
+      });
+    }
     return;
   }
 
   if (type === "progress_delta") {
     const progressId = normalizeText(payload.progress_id) || normalizeText(payload.progressId);
+    const summary = normalizeText(payload.summary);
+    if (!progressId && summary) {
+      const phase = normalizeText(payload.phase);
+      state.timeline.push({
+        kind: "progress",
+        source: "main",
+        text: summary,
+        turnId,
+        progressPhaseName: phase,
+        progressPhase: state.terminalProgress[publicProgressKey(turnId, phase)]
+          ? "completed"
+          : "streaming",
+      });
+      return;
+    }
     const delta = typeof payload.delta === "string" ? payload.delta : "";
     if (!progressId || !delta) {
       return;
@@ -186,12 +229,130 @@ export function applyAgentEvent(state: RunState, event: AgentEvent): void {
   if (type === "progress_end") {
     const progressId = normalizeText(payload.progress_id) || normalizeText(payload.progressId);
     if (!progressId) {
+      const phase = normalizeText(payload.phase);
+      state.terminalProgress[publicProgressKey(turnId, phase)] = true;
+      for (const item of state.timeline) {
+        if (
+          item.kind === "progress" &&
+          item.turnId === turnId &&
+          (!phase || item.progressPhaseName === phase)
+        ) {
+          item.progressPhase = "completed";
+        }
+      }
       return;
     }
     state.terminalProgress[progressKey(turnId, runId, progressId)] = true;
     const existing = findProgressItem(state, turnId, runId, progressId);
     if (existing) {
       existing.progressPhase = "completed";
+    }
+    return;
+  }
+
+  if (type === "action_start" || type === "action_end") {
+    const actionRef = normalizeText(payload.action_ref) || normalizeText(payload.actionRef);
+    if (!actionRef) {
+      return;
+    }
+    const phaseInstanceId =
+      normalizeText(payload.phase_instance_id) || normalizeText(payload.phaseInstanceId);
+    const existing = findPublicActionItem(state, turnId, actionRef, phaseInstanceId);
+    const actionStatus = publicActionStatus(type, payload);
+    const displayName =
+      normalizeText(payload.display_name) || normalizeText(payload.displayName) || "处理数据";
+    const next: TimelineItem = {
+      kind: "action",
+      source: "main",
+      text: displayName,
+      turnId,
+      actionRef,
+      actionCode: normalizeText(payload.action_code) || normalizeText(payload.actionCode),
+      actionDisplayName: displayName,
+      actionPhase: normalizeText(payload.phase),
+      actionPhaseInstanceId: phaseInstanceId,
+      actionStatus,
+      status: actionStatus,
+    };
+    if (existing) {
+      Object.assign(existing, next);
+    } else {
+      state.timeline.push(next);
+    }
+    if (type === "action_start") {
+      state.running = true;
+      state.interrupting = false;
+      state.activeText = "";
+      state.activeStartedAt = null;
+    }
+    return;
+  }
+
+  if (type === "interaction_required") {
+    const interactionId =
+      normalizeText(payload.interaction_id) || normalizeText(payload.interactionId) ||
+      normalizeText(payload.interaction_ref) || normalizeText(payload.interactionRef);
+    const text = normalizeText(payload.summary) || normalizeText(payload.title) || "等待你的选择";
+    if (!interactionId) {
+      return;
+    }
+    const existing = state.timeline.find(
+      (item) => item.kind === "interaction" && item.interactionId === interactionId,
+    );
+    const next: TimelineItem = {
+      kind: "interaction",
+      source: "main",
+      text,
+      status: "waiting",
+      interactionId,
+      turnId,
+    };
+    if (existing) Object.assign(existing, next);
+    else state.timeline.push(next);
+    state.running = false;
+    state.interrupting = false;
+    state.activeText = "";
+    state.activeStartedAt = null;
+    return;
+  }
+
+  if (type === "interaction_resolved") {
+    const interactionId =
+      normalizeText(payload.interaction_id) || normalizeText(payload.interactionId) ||
+      normalizeText(payload.interaction_ref) || normalizeText(payload.interactionRef);
+    if (!interactionId) {
+      return;
+    }
+    const existing = state.timeline.find(
+      (item) => item.kind === "interaction" && item.interactionId === interactionId,
+    );
+    const text = normalizeText(payload.result_label) || normalizeText(payload.resultLabel) || "已提交选择";
+    if (existing) {
+      existing.text = text;
+      existing.status = "completed";
+    } else {
+      state.timeline.push({
+        kind: "interaction",
+        source: "main",
+        text,
+        status: "completed",
+        interactionId,
+        turnId,
+      });
+    }
+    return;
+  }
+
+  if (type === "warning" || type === "error") {
+    const text = normalizeText(payload.text) || normalizeText(payload.message);
+    if (text) {
+      state.timeline.push({
+        kind: "progress",
+        source: "main",
+        text,
+        status: type,
+        turnId,
+      });
     }
     return;
   }
@@ -576,12 +737,40 @@ function findProgressItem(
   );
 }
 
+function findPublicActionItem(
+  state: RunState,
+  turnId: string | null,
+  actionRef: string,
+  phaseInstanceId: string,
+): TimelineItem | undefined {
+  for (let index = state.timeline.length - 1; index >= 0; index -= 1) {
+    const item = state.timeline[index];
+    if (item.kind !== "action" || item.turnId !== turnId || item.actionRef !== actionRef) continue;
+    if (!phaseInstanceId || (item.actionPhaseInstanceId ?? "") === phaseInstanceId) return item;
+  }
+  return undefined;
+}
+
+function publicActionStatus(
+  type: "action_start" | "action_end",
+  payload: Record<string, unknown>,
+): NonNullable<TimelineItem["actionStatus"]> {
+  if (type === "action_start") return "running";
+  const status = normalizeText(payload.status);
+  if (status === "failed" || status === "interrupted") return status;
+  return "completed";
+}
+
 function progressKey(
   turnId: string | null | undefined,
   runId: string | null | undefined,
   progressId: string,
 ): string {
   return `${turnId ?? ""}\u0000${runId ?? ""}\u0000${progressId}`;
+}
+
+function publicProgressKey(turnId: string | null | undefined, phase: string): string {
+  return `${turnId ?? ""}\u0000public-phase\u0000${phase || "generic"}`;
 }
 
 function removeAssistantDraft(state: RunState, replyKey: string): void {

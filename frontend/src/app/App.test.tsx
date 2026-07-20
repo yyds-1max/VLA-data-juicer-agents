@@ -274,11 +274,14 @@ beforeEach(() => {
     open: false,
     mode: "draft_new_session",
     currentSessionId: null,
+    currentContractVersion: 0,
     previousActiveSessionId: null,
     knownRunningSessionId: null,
     sessions: [],
     messages: [],
     turns: [],
+    tasks: [],
+    pendingInteraction: null,
     run: createEmptyRunState(),
     pendingInvocation: null,
     floatingOffset: { x: 0, y: 0 },
@@ -404,7 +407,10 @@ test("data management sends selected clips through a new visible DataPilot sessi
     "指定 clips：",
     "- clip_a",
   ].join("\n");
-  await waitFor(() => expect(apiMocks.createSession).toHaveBeenCalledWith(message));
+  await waitFor(() => expect(apiMocks.createSession).toHaveBeenCalledWith(
+    message,
+    "data_management_shortcut",
+  ));
   await waitFor(() =>
     expect(apiMocks.submitTurn).toHaveBeenCalledWith(
       "session-created",
@@ -643,6 +649,7 @@ test("changing selection after a failed shortcut creates a new invocation and se
   expect(apiMocks.submitTurn.mock.calls[1][2]).not.toBe(apiMocks.submitTurn.mock.calls[0][2]);
   expect(apiMocks.createSession).toHaveBeenLastCalledWith(
     expect.not.stringContaining("指定 clips："),
+    "data_management_shortcut",
   );
   consoleError.mockRestore();
 });
@@ -2771,6 +2778,134 @@ test("running stop interrupts the current turn without leaving active mode", asy
   expect(datapilotStore.getState().currentSessionId).toBe("session-1");
 });
 
+test("contract-v1 Stop immediately releases the Composer while preserving its draft", async () => {
+  apiMocks.getSession.mockResolvedValue({
+    id: "session-1",
+    title: "V1 session",
+    contract_version: 1,
+    created_at: "2026-06-26T00:00:00Z",
+    updated_at: "2026-06-26T00:02:00Z",
+    status: "active",
+    messages: [{
+      id: "message-stop-final",
+      session_id: "session-1",
+      role: "assistant",
+      content: "当前运行已停止，任务可以稍后继续。",
+      created_at: "2026-06-26T00:02:00Z",
+      turn_id: "turn-running",
+    }],
+    events: [],
+    turns: [{
+      id: "turn-running",
+      web_session_id: "session-1",
+      origin: "user",
+      status: "completed",
+      started_at: "2026-06-26T00:01:00Z",
+      finished_at: "2026-06-26T00:02:00Z",
+      final_message_id: "message-stop-final",
+    }],
+    tasks: [{
+      task_ref: "NAV-A1B2",
+      domain: "navigation_data",
+      status: "paused",
+      phase: "数据准备",
+      state_revision: 2,
+      started_at: "2026-06-26T00:01:00Z",
+      updated_at: "2026-06-26T00:02:00Z",
+    }],
+    pending_interaction: null,
+  });
+  datapilotStore.setState({
+    open: true,
+    mode: "active_session",
+    currentSessionId: "session-1",
+    currentContractVersion: 1,
+    previousActiveSessionId: null,
+    sessions: [
+      {
+        id: "session-1",
+        title: "V1 session",
+        contract_version: 1,
+        created_at: "2026-06-26T00:00:00Z",
+        updated_at: "2026-06-26T00:00:00Z",
+        status: "active",
+      },
+    ],
+    turns: [{
+      id: "turn-running",
+      web_session_id: "session-1",
+      origin: "user",
+      status: "running",
+      started_at: "2026-06-26T00:01:00Z",
+      finished_at: null,
+      final_message_id: null,
+    }],
+    run: { ...createEmptyRunState(), running: true },
+  });
+  await renderAppWithDashboardSettled();
+
+  const input = screen.getByPlaceholderText("继续描述任务…");
+  fireEvent.change(input, { target: { value: "停止后继续询问" } });
+  fireEvent.click(screen.getByRole("button", { name: "Stop current run" }));
+
+  await waitFor(() => expect(screen.getByRole("button", { name: "Send message" })).toBeVisible());
+  expect(input).toHaveValue("停止后继续询问");
+  expect(datapilotStore.getState().turns[0].status).toBe("completed");
+  expect(datapilotStore.getState().tasks[0].status).toBe("paused");
+});
+
+test("contract-v1 blocking interaction replaces the Composer and keeps the task strip visible", async () => {
+  datapilotStore.setState({
+    open: true,
+    mode: "active_session",
+    currentSessionId: "session-1",
+    currentContractVersion: 1,
+    previousActiveSessionId: null,
+    sessions: [{
+      id: "session-1",
+      title: "V1 session",
+      contract_version: 1,
+      created_at: "2026-06-26T00:00:00Z",
+      updated_at: "2026-06-26T00:00:00Z",
+      status: "active",
+    }],
+    tasks: [{
+      task_ref: "nav-A7K2",
+      domain: "navigation",
+      status: "waiting_user",
+      phase: "确认标定参数 60%",
+      state_revision: 3,
+      started_at: "2026-06-26T00:00:00Z",
+      updated_at: "2026-06-26T00:01:00Z",
+      count: { done: 3, total: 8, unit: "个数据段" },
+    }],
+    pendingInteraction: {
+      interaction_id: "interaction-1",
+      task_ref: "nav-A7K2",
+      kind: "high_risk_confirmation",
+      blocking: true,
+      risk: "high",
+      title: "确认标定参数",
+      summary: "确认后继续执行。",
+      options: [
+        { option_id: "confirm", label: "确认执行", tone: "danger" },
+        { option_id: "reject", label: "返回修改" },
+      ],
+      interaction_revision: 1,
+      expected_task_revision: 3,
+      expires_at: "2099-01-01T00:00:00Z",
+    },
+  });
+  await renderAppWithDashboardSettled();
+
+  expect(screen.getByRole("heading", { name: "确认标定参数" })).toBeVisible();
+  expect(screen.getByText("导航任务 nav-A7K2")).toBeVisible();
+  expect(screen.queryByPlaceholderText("继续描述任务…")).not.toBeInTheDocument();
+  expect(screen.queryByRole("button", { name: "Send message" })).not.toBeInTheDocument();
+  expect(screen.queryByRole("progressbar")).not.toBeInTheDocument();
+  expect(screen.getByRole("dialog", { name: "DataPilot" })).not.toHaveTextContent(/[%％]/);
+});
+
 test("durable running turn keeps the composer locked during handoff gaps", async () => {
   datapilotStore.setState({
     open: true,
@@ -2819,6 +2954,18 @@ test("running Composer shows a square stop button", () => {
   expect(onInterrupt).toHaveBeenCalledTimes(1);
 });
 
+test("running Composer preserves its draft when requesting Stop", () => {
+  const onInterrupt = vi.fn();
+  render(<Composer placeholder="继续描述任务…" running onSubmit={vi.fn()} onInterrupt={onInterrupt} />);
+
+  const input = screen.getByPlaceholderText("继续描述任务…");
+  fireEvent.change(input, { target: { value: "停止后继续问这个问题" } });
+  fireEvent.click(screen.getByRole("button", { name: "Stop current run" }));
+
+  expect(onInterrupt).toHaveBeenCalledTimes(1);
+  expect(input).toHaveValue("停止后继续问这个问题");
+});
+
 test("interrupting Composer shows a spinning circle button without visible text", () => {
   const onInterrupt = vi.fn();
 
@@ -2833,7 +2980,7 @@ test("interrupting Composer shows a spinning circle button without visible text"
   );
 
   const stopButton = screen.getByRole("button", { name: "Interrupt requested" });
-  expect(stopButton.querySelector("svg")).toHaveClass("animate-spin");
+  expect(stopButton.querySelector("svg")).toHaveClass("motion-safe:animate-spin");
   expect(screen.queryByText(/中断中|Interrupt requested/)).not.toBeInTheDocument();
 
   fireEvent.click(stopButton);

@@ -2,12 +2,30 @@ from __future__ import annotations
 
 import sqlite3
 import json
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from dataclasses import dataclass
 from pathlib import Path
 from uuid import uuid4
 
 from vla_data_juicer_agents.adapters.agentscope.events import sanitize_public_reply
+from vla_data_juicer_agents.web.contract_models import (
+    AuthorizedFinalCommit,
+    ContractConflictError,
+    ConversationAgentSession,
+    InteractionConsumption,
+    InteractionRecord,
+    ResourceLease,
+    ResponseAuthority,
+    RuntimeOutboxItem,
+    TaskBinding,
+    TaskBindingCreation,
+    TaskFocus,
+    TurnRun,
+)
+from vla_data_juicer_agents.web.migrations import (
+    apply_pending_migrations,
+    prepare_migration_ledger,
+)
 from vla_data_juicer_agents.web.schemas import (
     ChatMessageRecord,
     MessageRole,
@@ -65,6 +83,7 @@ class WebSessionStore:
 
     def _init_schema(self) -> None:
         with self._connect() as connection:
+            prepare_migration_ledger(connection)
             connection.execute(
                 """
                 CREATE TABLE IF NOT EXISTS sessions (
@@ -246,6 +265,7 @@ class WebSessionStore:
                 ON agentscope_sessions (agentscope_session_id)
                 """
             )
+            apply_pending_migrations(connection, applied_at=_now())
 
     @staticmethod
     def _migrate_timeline_events_schema(connection: sqlite3.Connection) -> None:
@@ -324,7 +344,9 @@ class WebSessionStore:
         )
         connection.execute("DROP TABLE agentscope_sessions_legacy")
 
-    def create_session(self, title: str) -> SessionRecord:
+    def create_session(self, title: str, *, contract_version: int = 0) -> SessionRecord:
+        if contract_version not in {0, 1}:
+            raise ValueError("contract_version must be 0 or 1")
         timestamp = _now()
         record = SessionRecord(
             id=f"session_{uuid4().hex}",
@@ -332,14 +354,23 @@ class WebSessionStore:
             status="active",
             created_at=timestamp,
             updated_at=timestamp,
+            contract_version=contract_version,
         )
         with self._connect() as connection:
             connection.execute(
                 """
-                INSERT INTO sessions (id, title, status, created_at, updated_at)
-                VALUES (?, ?, ?, ?, ?)
+                INSERT INTO sessions (
+                    id, title, status, created_at, updated_at, contract_version
+                ) VALUES (?, ?, ?, ?, ?, ?)
                 """,
-                (record.id, record.title, record.status, record.created_at, record.updated_at),
+                (
+                    record.id,
+                    record.title,
+                    record.status,
+                    record.created_at,
+                    record.updated_at,
+                    record.contract_version,
+                ),
             )
         return record
 
@@ -347,7 +378,7 @@ class WebSessionStore:
         with self._connect() as connection:
             rows = connection.execute(
                 """
-                SELECT id, title, status, created_at, updated_at
+                SELECT id, title, status, created_at, updated_at, contract_version
                 FROM sessions
                 ORDER BY updated_at DESC, rowid DESC
                 LIMIT ?
@@ -355,6 +386,16 @@ class WebSessionStore:
                 (limit,),
             ).fetchall()
         return [self._session_from_row(row) for row in rows]
+
+    def get_session_contract_version(self, session_id: str) -> int:
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT contract_version FROM sessions WHERE id = ?",
+                (session_id,),
+            ).fetchone()
+        if row is None:
+            raise KeyError(session_id)
+        return int(row["contract_version"])
 
     def begin_user_turn(
         self,
@@ -382,10 +423,11 @@ class WebSessionStore:
         )
         with self._connect() as connection:
             connection.execute("BEGIN IMMEDIATE")
-            if connection.execute(
-                "SELECT 1 FROM sessions WHERE id = ?",
+            session_row = connection.execute(
+                "SELECT contract_version FROM sessions WHERE id = ?",
                 (session_id,),
-            ).fetchone() is None:
+            ).fetchone()
+            if session_row is None:
                 raise KeyError(session_id)
             if invocation_id is not None:
                 existing_turn_row = connection.execute(
@@ -440,6 +482,13 @@ class WebSessionStore:
                 """,
                 (message_record.id, session_id, turn.id, message, timestamp),
             )
+            if int(session_row["contract_version"]) == 1:
+                self._insert_response_authority(
+                    connection,
+                    turn_id=turn.id,
+                    producer="router",
+                    timestamp=timestamp,
+                )
             event = self._insert_timeline_event(
                 connection,
                 session_id=session_id,
@@ -471,6 +520,14 @@ class WebSessionStore:
                 "UPDATE agentscope_sessions SET active_turn_id = NULL WHERE active_turn_id = ?",
                 (turn_id,),
             )
+            connection.execute(
+                "UPDATE conversation_agent_sessions SET active_turn_id = NULL WHERE active_turn_id = ?",
+                (turn_id,),
+            )
+            connection.execute("DELETE FROM turn_runs WHERE turn_id = ?", (turn_id,))
+            connection.execute(
+                "DELETE FROM turn_response_authority WHERE turn_id = ?", (turn_id,)
+            )
             connection.execute("DELETE FROM agentscope_turn_tools WHERE turn_id = ?", (turn_id,))
             connection.execute("DELETE FROM agentscope_turn_replies WHERE turn_id = ?", (turn_id,))
             connection.execute("DELETE FROM timeline_events WHERE turn_id = ?", (turn_id,))
@@ -488,6 +545,18 @@ class WebSessionStore:
                 ORDER BY started_at DESC LIMIT 1
                 """,
                 (web_session_id,),
+            ).fetchone()
+        return self._turn_from_row(row) if row is not None else None
+
+    def get_turn(self, turn_id: str) -> TurnRecord | None:
+        with self._connect() as connection:
+            row = connection.execute(
+                """
+                SELECT id, web_session_id, origin, status, started_at, finished_at,
+                       final_message_id
+                FROM web_turns WHERE id = ?
+                """,
+                (turn_id,),
             ).fetchone()
         return self._turn_from_row(row) if row is not None else None
 
@@ -513,7 +582,7 @@ class WebSessionStore:
         with self._connect() as connection:
             session_row = connection.execute(
                 """
-                SELECT id, title, status, created_at, updated_at
+                SELECT id, title, status, created_at, updated_at, contract_version
                 FROM sessions
                 WHERE id = ?
                 """,
@@ -757,6 +826,119 @@ class WebSessionStore:
         )
         return record
 
+    def _finalize_v1_interaction_turn(
+        self,
+        connection: sqlite3.Connection,
+        *,
+        web_session_id: str,
+        turn_id: str,
+        agentscope_session_id: str,
+        producer: str,
+        reply_id: str | None,
+        payload: dict,
+        timestamp: str,
+        origin_key: str,
+    ) -> list[TimelineEventRecord]:
+        """End the prompt Turn while the specialist remains resumable."""
+        turn = connection.execute(
+            "SELECT status FROM web_turns WHERE id = ? AND web_session_id = ?",
+            (turn_id, web_session_id),
+        ).fetchone()
+        if turn is None or turn["status"] not in {"running", "waiting"}:
+            return []
+        authority = connection.execute(
+            "SELECT * FROM turn_response_authority WHERE turn_id = ?",
+            (turn_id,),
+        ).fetchone()
+        if (
+            authority is None
+            or authority["producer"] != producer
+            or authority["lease_state"] != "open"
+            or authority["final_message_id"] is not None
+        ):
+            raise ContractConflictError(
+                "response_authority_mismatch",
+                "interaction prompt producer no longer owns this turn",
+            )
+        safe_text = sanitize_public_reply(
+            payload.get("summary") or payload.get("title") or "继续前需要你的选择。"
+        ) or "继续前需要你的选择。"
+        message_id = f"message_{uuid4().hex}"
+        connection.execute(
+            """
+            INSERT INTO messages (id, session_id, turn_id, role, content, created_at)
+            VALUES (?, ?, ?, 'assistant', ?, ?)
+            """,
+            (message_id, web_session_id, turn_id, safe_text, timestamp),
+        )
+        final = self._insert_timeline_event(
+            connection,
+            session_id=web_session_id,
+            turn_id=turn_id,
+            event={
+                "type": "final",
+                "timestamp": timestamp,
+                "payload": {"text": safe_text, "message_id": message_id},
+            },
+            created_at=timestamp,
+            origin_key=f"{origin_key}:interaction-final",
+        )
+        connection.execute(
+            """
+            UPDATE web_turns
+            SET status = 'completed', finished_at = ?, final_message_id = ?
+            WHERE id = ? AND status IN ('running', 'waiting')
+            """,
+            (timestamp, message_id, turn_id),
+        )
+        connection.execute(
+            """
+            UPDATE turn_response_authority
+            SET lease_state = 'closed', final_message_id = ?, updated_at = ?
+            WHERE turn_id = ? AND producer = ? AND generation = ?
+              AND lease_state = 'open' AND final_message_id IS NULL
+            """,
+            (
+                message_id,
+                timestamp,
+                turn_id,
+                producer,
+                int(authority["generation"]),
+            ),
+        )
+        if reply_id is not None:
+            connection.execute(
+                """
+                UPDATE agentscope_turn_replies
+                SET status = 'waiting', updated_at = ?
+                WHERE turn_id = ? AND agentscope_session_id = ? AND reply_id = ?
+                  AND status IN ('pending', 'running', 'waiting')
+                """,
+                (timestamp, turn_id, agentscope_session_id, reply_id),
+            )
+        connection.execute(
+            """
+            UPDATE conversation_agent_sessions
+            SET active_turn_id = NULL, updated_at = ?
+            WHERE web_session_id = ? AND agentscope_session_id = ?
+              AND active_turn_id = ?
+            """,
+            (timestamp, web_session_id, agentscope_session_id, turn_id),
+        )
+        state = self._insert_timeline_event(
+            connection,
+            session_id=web_session_id,
+            turn_id=turn_id,
+            event={
+                "type": "turn_state",
+                "timestamp": timestamp,
+                "payload": {"status": "completed", "finished_at": timestamp},
+            },
+            created_at=timestamp,
+            origin_key=f"{origin_key}:interaction-completed",
+        )
+        return [final, state]
+
     def append_projected_event_batch(
         self,
         *,
@@ -766,26 +948,38 @@ class WebSessionStore:
         events: list[dict],
         raw_event_type: str | None = None,
         reply_id: str | None = None,
+        allow_system_turn_defer: bool = True,
     ) -> list[TimelineEventRecord]:
         """Persist projection, turn state, final message and cursor atomically."""
         timestamp = _now()
         inserted: list[TimelineEventRecord] = []
         with self._connect() as connection:
             connection.execute("BEGIN IMMEDIATE")
-            exists = connection.execute(
-                "SELECT 1 FROM sessions WHERE id = ?",
+            session_row = connection.execute(
+                "SELECT contract_version FROM sessions WHERE id = ?",
                 (web_session_id,),
             ).fetchone()
-            if exists is None:
+            if session_row is None:
                 raise KeyError(web_session_id)
             mapping = connection.execute(
                 """
-                SELECT agent_id, active_turn_id
+                SELECT agent_id, active_turn_id, NULL AS agent_role, NULL AS task_id
                 FROM agentscope_sessions
                 WHERE web_session_id = ? AND agentscope_session_id = ?
                 """,
                 (web_session_id, agentscope_session_id),
             ).fetchone()
+            v1_mapping = False
+            if mapping is None and int(session_row["contract_version"]) == 1:
+                mapping = connection.execute(
+                    """
+                    SELECT agent_id, active_turn_id, agent_role, task_id
+                    FROM conversation_agent_sessions
+                    WHERE web_session_id = ? AND agentscope_session_id = ?
+                    """,
+                    (web_session_id, agentscope_session_id),
+                ).fetchone()
+                v1_mapping = mapping is not None
             if mapping is None:
                 raise KeyError((web_session_id, agentscope_session_id))
 
@@ -810,8 +1004,8 @@ class WebSessionStore:
                 "interrupted",
             }:
                 connection.execute(
-                    """
-                    UPDATE agentscope_sessions
+                    f"""
+                    UPDATE {'conversation_agent_sessions' if v1_mapping else 'agentscope_sessions'}
                     SET event_cursor = ?, updated_at = ?
                     WHERE web_session_id = ? AND agentscope_session_id = ?
                     """,
@@ -829,8 +1023,76 @@ class WebSessionStore:
                     """,
                     (web_session_id,),
                 ).fetchone()
+                if active_turn is not None and v1_mapping:
+                    active_authority = connection.execute(
+                        """
+                        SELECT producer, lease_state FROM turn_response_authority
+                        WHERE turn_id = ?
+                        """,
+                        (active_turn["id"],),
+                    ).fetchone()
+                    if (
+                        active_authority is not None
+                        and active_authority["lease_state"] == "open"
+                        and active_authority["producer"] != mapping["agent_role"]
+                    ):
+                        if not allow_system_turn_defer:
+                            raise ContractConflictError(
+                                "system_turn_deferred",
+                                "background update is waiting for the active user turn",
+                            )
+                        outbox_id = f"outbox_{uuid4().hex}"
+                        self._insert_outbox(
+                            connection,
+                            outbox_id=outbox_id,
+                            kind="system_turn",
+                            aggregate_type="agentscope_event",
+                            aggregate_id=f"{agentscope_session_id}:{entry_id}",
+                            web_session_id=web_session_id,
+                            task_id=_optional_text(mapping["task_id"]),
+                            turn_id=None,
+                            payload={
+                                "agentscope_session_id": agentscope_session_id,
+                                "entry_id": entry_id,
+                                "events": events,
+                                "raw_event_type": raw_event_type,
+                                "reply_id": reply_id,
+                            },
+                            idempotency_key=(
+                                f"system_turn:{agentscope_session_id}:{entry_id}"
+                            ),
+                            available_at=timestamp,
+                            timestamp=timestamp,
+                        )
+                        connection.execute(
+                            """
+                            UPDATE conversation_agent_sessions
+                            SET event_cursor = ?, updated_at = ?
+                            WHERE web_session_id = ? AND agentscope_session_id = ?
+                            """,
+                            (
+                                entry_id,
+                                timestamp,
+                                web_session_id,
+                                agentscope_session_id,
+                            ),
+                        )
+                        return []
                 turn_id = _optional_text(active_turn["id"]) if active_turn is not None else None
-            if turn_id is None and raw_event_type == "REPLY_START":
+            v1_system_attention = v1_mapping and any(
+                str(event.get("type") or "") in {"final", "interaction_required"}
+                or (
+                    str(event.get("type") or "") == "task_state_updated"
+                    and isinstance(event.get("payload"), dict)
+                    and event["payload"].get("status")
+                    in {"completed", "failed", "needs_replan", "waiting_user"}
+                )
+                for event in events
+            )
+            if turn_id is None and (
+                (raw_event_type == "REPLY_START" and not v1_mapping)
+                or v1_system_attention
+            ):
                 turn_id = f"turn_{uuid4().hex}"
                 connection.execute(
                     """
@@ -841,6 +1103,37 @@ class WebSessionStore:
                     """,
                     (turn_id, web_session_id, timestamp),
                 )
+                if v1_mapping:
+                    self._insert_response_authority(
+                        connection,
+                        turn_id=turn_id,
+                        producer=str(mapping["agent_role"]),
+                        timestamp=timestamp,
+                    )
+                    if reply_id is not None:
+                        connection.execute(
+                            """
+                            INSERT INTO agentscope_turn_replies (
+                                id, turn_id, agentscope_session_id, agent_id,
+                                reply_id, source, status, summary_text,
+                                created_at, updated_at
+                            ) VALUES (?, ?, ?, ?, ?, 'event', 'waiting', NULL, ?, ?)
+                            ON CONFLICT(agentscope_session_id, reply_id)
+                            WHERE reply_id IS NOT NULL DO UPDATE SET
+                                turn_id = excluded.turn_id,
+                                status = 'waiting',
+                                updated_at = excluded.updated_at
+                            """,
+                            (
+                                f"reply_run_{uuid4().hex}",
+                                turn_id,
+                                agentscope_session_id,
+                                mapping["agent_id"],
+                                reply_id,
+                                timestamp,
+                                timestamp,
+                            ),
+                        )
                 turn_start_origin = (
                     f"agentscope:{agentscope_session_id}:{entry_id}:turn-start"
                 )
@@ -855,8 +1148,10 @@ class WebSessionStore:
                             turn_id=turn_id,
                             event={
                                 "type": "turn_start",
-                                "source": "agentscope",
-                                "run_id": agentscope_session_id,
+                                **({} if v1_mapping else {
+                                    "source": "agentscope",
+                                    "run_id": agentscope_session_id,
+                                }),
                                 "timestamp": timestamp,
                                 "payload": {"status": "running", "started_at": timestamp},
                             },
@@ -866,8 +1161,8 @@ class WebSessionStore:
                     )
             if turn_id is not None:
                 connection.execute(
-                    """
-                    UPDATE agentscope_sessions
+                    f"""
+                    UPDATE {'conversation_agent_sessions' if v1_mapping else 'agentscope_sessions'}
                     SET active_turn_id = ?, updated_at = ?
                     WHERE web_session_id = ? AND agentscope_session_id = ?
                     """,
@@ -924,6 +1219,7 @@ class WebSessionStore:
                     )
 
             reply_summary: str | None = None
+            background_update_only = False
             for projection_index, event in enumerate(events):
                 origin_key = (
                     f"agentscope:{agentscope_session_id}:{entry_id}:{projection_index}"
@@ -937,6 +1233,8 @@ class WebSessionStore:
                 payload = event.get("payload")
                 safe_payload = dict(payload) if isinstance(payload, dict) else {}
                 event_type = str(event.get("type", ""))
+                if event_type == "task_state_updated" and safe_payload.get("status") == "active":
+                    background_update_only = True
                 event_reply_id = _optional_text(safe_payload.get("reply_id")) or reply_id
                 if event_type in {"answer_delta", "answer_reset"} and event_reply_id:
                     safe_payload["reply_id"] = event_reply_id
@@ -982,6 +1280,20 @@ class WebSessionStore:
                     origin_key=origin_key,
                 )
                 inserted.append(record)
+                if v1_mapping and turn_id is not None and event_type == "interaction_required":
+                    inserted.extend(
+                        self._finalize_v1_interaction_turn(
+                            connection,
+                            web_session_id=web_session_id,
+                            turn_id=turn_id,
+                            agentscope_session_id=agentscope_session_id,
+                            producer=str(mapping["agent_role"]),
+                            reply_id=reply_id,
+                            payload=safe_payload,
+                            timestamp=timestamp,
+                            origin_key=origin_key,
+                        )
+                    )
                 if turn_id is None:
                     final_text = _final_event_text(event)
                     if final_text is not None:
@@ -1139,6 +1451,66 @@ class WebSessionStore:
                     if reply_id
                     else None
                 )
+                turn_origin_row = connection.execute(
+                    "SELECT origin FROM web_turns WHERE id = ?",
+                    (turn_id,),
+                ).fetchone()
+                if (
+                    v1_mapping
+                    and turn_origin_row is not None
+                    and turn_origin_row["origin"] == "system"
+                    and background_update_only
+                    and reply_summary is None
+                    and blockers == 0
+                ):
+                    connection.execute(
+                        """
+                        UPDATE web_turns SET status = 'completed', finished_at = ?
+                        WHERE id = ?
+                        """,
+                        (timestamp, turn_id),
+                    )
+                    connection.execute(
+                        """
+                        UPDATE turn_response_authority
+                        SET lease_state = 'closed', updated_at = ?
+                        WHERE turn_id = ? AND lease_state = 'open'
+                        """,
+                        (timestamp, turn_id),
+                    )
+                    connection.execute(
+                        """
+                        UPDATE conversation_agent_sessions
+                        SET active_turn_id = NULL, event_cursor = ?, updated_at = ?
+                        WHERE web_session_id = ? AND agentscope_session_id = ?
+                        """,
+                        (entry_id, timestamp, web_session_id, agentscope_session_id),
+                    )
+                    inserted.append(
+                        self._insert_timeline_event(
+                            connection,
+                            session_id=web_session_id,
+                            turn_id=turn_id,
+                            event={
+                                "type": "turn_state",
+                                "timestamp": timestamp,
+                                "payload": {
+                                    "status": "completed",
+                                    "finished_at": timestamp,
+                                },
+                            },
+                            created_at=timestamp,
+                            origin_key=(
+                                f"agentscope:{agentscope_session_id}:{entry_id}:"
+                                "background-update-completed"
+                            ),
+                        )
+                    )
+                    connection.execute(
+                        "UPDATE sessions SET updated_at = ? WHERE id = ?",
+                        (timestamp, web_session_id),
+                    )
+                    return inserted
                 safe_reply_failed = not reply_summary and blockers == 0 and not waiting
                 if safe_reply_failed:
                     reply_summary = _SAFE_PUBLIC_REPLY_FAILURE
@@ -1203,6 +1575,36 @@ class WebSessionStore:
                         )
                     else:
                         terminal_status = "failed" if safe_reply_failed else "completed"
+                        authority_generation: int | None = None
+                        if v1_mapping:
+                            producer = str(mapping["agent_role"])
+                            authority_row = connection.execute(
+                                """
+                                SELECT * FROM turn_response_authority WHERE turn_id = ?
+                                """,
+                                (turn_id,),
+                            ).fetchone()
+                            if (
+                                authority_row is None
+                                or authority_row["producer"] != producer
+                                or authority_row["lease_state"] != "open"
+                                or authority_row["final_message_id"] is not None
+                            ):
+                                connection.execute(
+                                    """
+                                    UPDATE conversation_agent_sessions
+                                    SET event_cursor = ?, updated_at = ?
+                                    WHERE web_session_id = ? AND agentscope_session_id = ?
+                                    """,
+                                    (
+                                        entry_id,
+                                        timestamp,
+                                        web_session_id,
+                                        agentscope_session_id,
+                                    ),
+                                )
+                                return inserted
+                            authority_generation = int(authority_row["generation"])
                         if streamed_reply is not None and safe_reply_failed:
                             reset_origin = (
                                 f"agentscope:{agentscope_session_id}:{entry_id}:answer-reset"
@@ -1245,13 +1647,19 @@ class WebSessionStore:
                                 turn_id=turn_id,
                                 event={
                                     "type": "final",
-                                    "source": "agentscope",
-                                    "run_id": agentscope_session_id,
+                                    **({} if v1_mapping else {
+                                        "source": "agentscope",
+                                        "run_id": agentscope_session_id,
+                                    }),
                                     "timestamp": timestamp,
                                     "payload": {
                                         "text": reply_summary,
                                         "message_id": final_message_id,
-                                        **({"reply_id": reply_id} if reply_id else {}),
+                                        **(
+                                            {"reply_id": reply_id}
+                                            if reply_id and not v1_mapping
+                                            else {}
+                                        ),
                                     },
                                 },
                                 created_at=timestamp,
@@ -1266,8 +1674,25 @@ class WebSessionStore:
                             """,
                             (terminal_status, timestamp, final_message_id, turn_id),
                         )
+                        if v1_mapping:
+                            connection.execute(
+                                """
+                                UPDATE turn_response_authority
+                                SET lease_state = 'closed', final_message_id = ?, updated_at = ?
+                                WHERE turn_id = ? AND producer = ? AND generation = ?
+                                  AND lease_state = 'open' AND final_message_id IS NULL
+                                """,
+                                (
+                                    final_message_id,
+                                    timestamp,
+                                    turn_id,
+                                    mapping["agent_role"],
+                                    authority_generation,
+                                ),
+                            )
                         connection.execute(
-                            "UPDATE agentscope_sessions SET active_turn_id = NULL WHERE active_turn_id = ?",
+                            f"UPDATE {'conversation_agent_sessions' if v1_mapping else 'agentscope_sessions'} "
+                            "SET active_turn_id = NULL WHERE active_turn_id = ?",
                             (turn_id,),
                         )
                         inserted.append(
@@ -1277,8 +1702,10 @@ class WebSessionStore:
                                 turn_id=turn_id,
                                 event={
                                     "type": "turn_state",
-                                    "source": "agentscope",
-                                    "run_id": agentscope_session_id,
+                                    **({} if v1_mapping else {
+                                        "source": "agentscope",
+                                        "run_id": agentscope_session_id,
+                                    }),
                                     "timestamp": timestamp,
                                     "payload": {
                                         "status": terminal_status,
@@ -1294,8 +1721,8 @@ class WebSessionStore:
                         )
 
             connection.execute(
-                """
-                UPDATE agentscope_sessions
+                f"""
+                UPDATE {'conversation_agent_sessions' if v1_mapping else 'agentscope_sessions'}
                 SET event_cursor = ?, updated_at = ?
                 WHERE web_session_id = ? AND agentscope_session_id = ?
                 """,
@@ -1560,6 +1987,48 @@ class WebSessionStore:
 
     def delete_session(self, session_id: str) -> None:
         with self._connect() as connection:
+            connection.execute(
+                "DELETE FROM interactions WHERE web_session_id = ?", (session_id,)
+            )
+            connection.execute(
+                "DELETE FROM runtime_outbox WHERE web_session_id = ?", (session_id,)
+            )
+            connection.execute(
+                """
+                DELETE FROM runtime_resource_leases
+                WHERE task_id IN (
+                    SELECT task_id FROM conversation_task_bindings WHERE web_session_id = ?
+                )
+                """,
+                (session_id,),
+            )
+            connection.execute(
+                "DELETE FROM conversation_task_focus WHERE web_session_id = ?", (session_id,)
+            )
+            connection.execute(
+                """
+                DELETE FROM turn_runs WHERE turn_id IN (
+                    SELECT id FROM web_turns WHERE web_session_id = ?
+                )
+                """,
+                (session_id,),
+            )
+            connection.execute(
+                """
+                DELETE FROM turn_response_authority WHERE turn_id IN (
+                    SELECT id FROM web_turns WHERE web_session_id = ?
+                )
+                """,
+                (session_id,),
+            )
+            connection.execute(
+                "DELETE FROM conversation_agent_sessions WHERE web_session_id = ?",
+                (session_id,),
+            )
+            connection.execute(
+                "DELETE FROM conversation_task_bindings WHERE web_session_id = ?",
+                (session_id,),
+            )
             connection.execute("DELETE FROM agentscope_sessions WHERE web_session_id = ?", (session_id,))
             connection.execute(
                 "DELETE FROM agentscope_turn_tools WHERE turn_id IN (SELECT id FROM web_turns WHERE web_session_id = ?)",
@@ -1721,9 +2190,11 @@ class WebSessionStore:
             connection.execute("BEGIN IMMEDIATE")
             reply = connection.execute(
                 """
-                SELECT replies.turn_id, turns.web_session_id, turns.status
+                SELECT replies.turn_id, turns.web_session_id, turns.status,
+                       sessions.contract_version
                 FROM agentscope_turn_replies AS replies
                 JOIN web_turns AS turns ON turns.id = replies.turn_id
+                JOIN sessions ON sessions.id = turns.web_session_id
                 WHERE replies.id = ?
                 """,
                 (lease_id,),
@@ -1755,6 +2226,116 @@ class WebSessionStore:
             )
             if blockers > 0:
                 return []
+            if int(reply["contract_version"]) == 1:
+                authority_row = connection.execute(
+                    "SELECT * FROM turn_response_authority WHERE turn_id = ?",
+                    (reply["turn_id"],),
+                ).fetchone()
+                if authority_row is not None and authority_row["lease_state"] != "open":
+                    return []
+                generation = (
+                    int(authority_row["generation"])
+                    if authority_row is not None
+                    and authority_row["producer"] == "system_controller"
+                    else int(authority_row["generation"]) + 1
+                    if authority_row is not None
+                    else 0
+                )
+                if authority_row is None:
+                    connection.execute(
+                        """
+                        INSERT INTO turn_response_authority (
+                            turn_id, producer, generation, lease_state,
+                            final_message_id, created_at, updated_at
+                        ) VALUES (?, 'system_controller', ?, 'open', NULL, ?, ?)
+                        """,
+                        (reply["turn_id"], generation, timestamp, timestamp),
+                    )
+                else:
+                    connection.execute(
+                        """
+                        UPDATE turn_response_authority
+                        SET producer = 'system_controller', generation = ?, updated_at = ?
+                        WHERE turn_id = ? AND lease_state = 'open'
+                          AND final_message_id IS NULL
+                        """,
+                        (generation, timestamp, reply["turn_id"]),
+                    )
+                message_id = f"message_{uuid4().hex}"
+                connection.execute(
+                    """
+                    INSERT INTO messages (
+                        id, session_id, turn_id, role, content, created_at
+                    ) VALUES (?, ?, ?, 'assistant', ?, ?)
+                    """,
+                    (
+                        message_id,
+                        reply["web_session_id"],
+                        reply["turn_id"],
+                        _SAFE_PUBLIC_REPLY_FAILURE,
+                        timestamp,
+                    ),
+                )
+                final = self._insert_timeline_event(
+                    connection,
+                    session_id=reply["web_session_id"],
+                    turn_id=reply["turn_id"],
+                    event={
+                        "type": "final",
+                        "timestamp": timestamp,
+                        "payload": {
+                            "text": _SAFE_PUBLIC_REPLY_FAILURE,
+                            "message_id": message_id,
+                        },
+                    },
+                    created_at=timestamp,
+                    origin_key=f"reply-failed:{lease_id}:final",
+                )
+                connection.execute(
+                    """
+                    UPDATE web_turns
+                    SET status = 'failed', finished_at = ?, final_message_id = ?
+                    WHERE id = ? AND status IN ('running', 'waiting')
+                    """,
+                    (timestamp, message_id, reply["turn_id"]),
+                )
+                connection.execute(
+                    """
+                    UPDATE turn_response_authority
+                    SET lease_state = 'closed', final_message_id = ?, updated_at = ?
+                    WHERE turn_id = ? AND producer = 'system_controller'
+                      AND generation = ? AND lease_state = 'open'
+                      AND final_message_id IS NULL
+                    """,
+                    (message_id, timestamp, reply["turn_id"], generation),
+                )
+                connection.execute(
+                    "UPDATE conversation_agent_sessions "
+                    "SET active_turn_id = NULL, updated_at = ? WHERE active_turn_id = ?",
+                    (timestamp, reply["turn_id"]),
+                )
+                connection.execute(
+                    "UPDATE agentscope_sessions "
+                    "SET active_turn_id = NULL, updated_at = ? WHERE active_turn_id = ?",
+                    (timestamp, reply["turn_id"]),
+                )
+                state = self._insert_timeline_event(
+                    connection,
+                    session_id=reply["web_session_id"],
+                    turn_id=reply["turn_id"],
+                    event={
+                        "type": "turn_state",
+                        "timestamp": timestamp,
+                        "payload": {"status": "failed", "finished_at": timestamp},
+                    },
+                    created_at=timestamp,
+                    origin_key=f"reply-failed:{lease_id}:state",
+                )
+                connection.execute(
+                    "UPDATE sessions SET updated_at = ? WHERE id = ?",
+                    (timestamp, reply["web_session_id"]),
+                )
+                return [final, state]
             connection.execute(
                 """
                 UPDATE web_turns
@@ -2116,6 +2697,1673 @@ class WebSessionStore:
             if result.rowcount == 0:
                 raise KeyError(agentscope_session_id)
 
+    # Contract v1 storage primitives. Legacy AgentScope mappings above remain unchanged.
+
+    def save_conversation_agent_session(
+        self,
+        web_session_id: str,
+        *,
+        agent_role: str,
+        agent_id: str,
+        agentscope_session_id: str,
+        task_id: str | None = None,
+    ) -> ConversationAgentSession:
+        if agent_role not in {"router", "navigation"}:
+            raise ValueError("agent_role must be router or navigation")
+        if (agent_role == "router") != (task_id is None):
+            raise ValueError("router sessions cannot have task_id; navigation sessions require it")
+        timestamp = _now()
+        record_id = f"conversation_agent_session_{uuid4().hex}"
+        with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            self._require_contract_v1(connection, web_session_id)
+            existing = connection.execute(
+                """
+                SELECT * FROM conversation_agent_sessions
+                WHERE web_session_id = ? AND agent_role = ?
+                  AND ((task_id IS NULL AND ? IS NULL) OR task_id = ?)
+                """,
+                (web_session_id, agent_role, task_id, task_id),
+            ).fetchone()
+            if existing is not None:
+                if (
+                    existing["agent_id"] != agent_id
+                    or existing["agentscope_session_id"] != agentscope_session_id
+                ):
+                    raise ContractConflictError(
+                        "agent_session_conflict",
+                        "the conversation agent session is already bound",
+                        current=self._conversation_agent_session_from_row(existing),
+                    )
+                return self._conversation_agent_session_from_row(existing)
+            connection.execute(
+                """
+                INSERT INTO conversation_agent_sessions (
+                    id, web_session_id, agent_role, agent_id, agentscope_session_id,
+                    task_id, event_cursor, active_turn_id, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, NULL, NULL, ?, ?)
+                """,
+                (
+                    record_id,
+                    web_session_id,
+                    agent_role,
+                    agent_id,
+                    agentscope_session_id,
+                    task_id,
+                    timestamp,
+                    timestamp,
+                ),
+            )
+            row = connection.execute(
+                "SELECT * FROM conversation_agent_sessions WHERE id = ?", (record_id,)
+            ).fetchone()
+        assert row is not None
+        return self._conversation_agent_session_from_row(row)
+
+    def get_conversation_agent_session(
+        self,
+        web_session_id: str,
+        *,
+        agent_role: str,
+        task_id: str | None = None,
+    ) -> ConversationAgentSession | None:
+        with self._connect() as connection:
+            row = connection.execute(
+                """
+                SELECT * FROM conversation_agent_sessions
+                WHERE web_session_id = ? AND agent_role = ?
+                  AND ((task_id IS NULL AND ? IS NULL) OR task_id = ?)
+                """,
+                (web_session_id, agent_role, task_id, task_id),
+            ).fetchone()
+        return self._conversation_agent_session_from_row(row) if row is not None else None
+
+    def get_conversation_agent_session_by_agentscope_session(
+        self, agentscope_session_id: str
+    ) -> ConversationAgentSession | None:
+        with self._connect() as connection:
+            row = connection.execute(
+                """
+                SELECT * FROM conversation_agent_sessions
+                WHERE agentscope_session_id = ?
+                """,
+                (agentscope_session_id,),
+            ).fetchone()
+        return self._conversation_agent_session_from_row(row) if row is not None else None
+
+    def list_conversation_agent_sessions(
+        self, web_session_id: str | None = None
+    ) -> list[ConversationAgentSession]:
+        with self._connect() as connection:
+            if web_session_id is None:
+                rows = connection.execute(
+                    "SELECT * FROM conversation_agent_sessions ORDER BY created_at, rowid"
+                ).fetchall()
+            else:
+                rows = connection.execute(
+                    """
+                    SELECT * FROM conversation_agent_sessions
+                    WHERE web_session_id = ? ORDER BY created_at, rowid
+                    """,
+                    (web_session_id,),
+                ).fetchall()
+        return [self._conversation_agent_session_from_row(row) for row in rows]
+
+    def save_conversation_event_cursor(
+        self, agentscope_session_id: str, cursor: str
+    ) -> None:
+        timestamp = _now()
+        with self._connect() as connection:
+            result = connection.execute(
+                """
+                UPDATE conversation_agent_sessions
+                SET event_cursor = ?, updated_at = ? WHERE agentscope_session_id = ?
+                """,
+                (cursor, timestamp, agentscope_session_id),
+            )
+            if result.rowcount == 0:
+                raise KeyError(agentscope_session_id)
+
+    def bind_conversation_agent_session_to_turn(
+        self, agentscope_session_id: str, turn_id: str | None
+    ) -> ConversationAgentSession:
+        timestamp = _now()
+        with self._connect() as connection:
+            result = connection.execute(
+                """
+                UPDATE conversation_agent_sessions
+                SET active_turn_id = ?, updated_at = ? WHERE agentscope_session_id = ?
+                """,
+                (turn_id, timestamp, agentscope_session_id),
+            )
+            if result.rowcount == 0:
+                raise KeyError(agentscope_session_id)
+            row = connection.execute(
+                """
+                SELECT * FROM conversation_agent_sessions
+                WHERE agentscope_session_id = ?
+                """,
+                (agentscope_session_id,),
+            ).fetchone()
+        assert row is not None
+        return self._conversation_agent_session_from_row(row)
+
+    def create_task_binding(
+        self,
+        web_session_id: str,
+        *,
+        task_id: str,
+        task_ref: str,
+        navigation_session_id: str,
+        domain: str = "navigation",
+        navigation_agent_id: str = "navigation-data-agent",
+        scope: dict | None = None,
+        outbox_payload: dict | None = None,
+        outbox_idempotency_key: str | None = None,
+    ) -> TaskBindingCreation:
+        timestamp = _now()
+        agent_session_id = f"conversation_agent_session_{uuid4().hex}"
+        outbox_id = f"outbox_{uuid4().hex}"
+        outbox_key = outbox_idempotency_key or f"navigation_start:{task_id}"
+        scope_json = json.dumps(scope or {}, ensure_ascii=False, sort_keys=True)
+        payload = dict(outbox_payload or {})
+        payload.setdefault("task_ref", task_ref)
+        with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            self._require_contract_v1(connection, web_session_id)
+            existing = connection.execute(
+                "SELECT * FROM conversation_task_bindings WHERE task_id = ?",
+                (task_id,),
+            ).fetchone()
+            if existing is not None:
+                binding = self._task_binding_from_row(existing)
+                navigation = connection.execute(
+                    """
+                    SELECT * FROM conversation_agent_sessions
+                    WHERE task_id = ? AND agent_role = 'navigation'
+                    """,
+                    (task_id,),
+                ).fetchone()
+                focus = connection.execute(
+                    "SELECT * FROM conversation_task_focus WHERE web_session_id = ?",
+                    (web_session_id,),
+                ).fetchone()
+                outbox = connection.execute(
+                    "SELECT * FROM runtime_outbox WHERE idempotency_key = ?",
+                    (outbox_key,),
+                ).fetchone()
+                if (
+                    binding.web_session_id != web_session_id
+                    or binding.task_ref != task_ref
+                    or binding.domain != domain
+                    or navigation is None
+                    or navigation["agentscope_session_id"] != navigation_session_id
+                    or focus is None
+                    or outbox is None
+                ):
+                    raise ContractConflictError(
+                        "task_binding_conflict",
+                        "task_id is already bound with different contract data",
+                        current=binding,
+                    )
+                return TaskBindingCreation(
+                    binding=binding,
+                    focus=self._task_focus_from_row(focus),
+                    navigation_session=self._conversation_agent_session_from_row(navigation),
+                    outbox=self._outbox_from_row(outbox),
+                    created=False,
+                )
+            try:
+                connection.execute(
+                    """
+                    INSERT INTO conversation_task_bindings (
+                        task_id, web_session_id, task_ref, navigation_session_id,
+                        domain, status, slot_state, state_revision, scope_json,
+                        latest_public_update, created_at, updated_at, terminal_at
+                    ) VALUES (?, ?, ?, ?, ?, 'active', 'open', 0, ?, NULL, ?, ?, NULL)
+                    """,
+                    (
+                        task_id,
+                        web_session_id,
+                        task_ref,
+                        navigation_session_id,
+                        domain,
+                        scope_json,
+                        timestamp,
+                        timestamp,
+                    ),
+                )
+                connection.execute(
+                    """
+                    INSERT INTO conversation_agent_sessions (
+                        id, web_session_id, agent_role, agent_id, agentscope_session_id,
+                        task_id, event_cursor, active_turn_id, created_at, updated_at
+                    ) VALUES (?, ?, 'navigation', ?, ?, ?, NULL, NULL, ?, ?)
+                    """,
+                    (
+                        agent_session_id,
+                        web_session_id,
+                        navigation_agent_id,
+                        navigation_session_id,
+                        task_id,
+                        timestamp,
+                        timestamp,
+                    ),
+                )
+                connection.execute(
+                    """
+                    INSERT INTO conversation_task_focus (
+                        web_session_id, task_id, generation, updated_at
+                    ) VALUES (?, ?, 1, ?)
+                    ON CONFLICT(web_session_id) DO UPDATE SET
+                        task_id = excluded.task_id,
+                        generation = conversation_task_focus.generation + 1,
+                        updated_at = excluded.updated_at
+                    """,
+                    (web_session_id, task_id, timestamp),
+                )
+                self._insert_outbox(
+                    connection,
+                    outbox_id=outbox_id,
+                    kind="navigation_start",
+                    aggregate_type="task",
+                    aggregate_id=task_id,
+                    web_session_id=web_session_id,
+                    task_id=task_id,
+                    turn_id=(
+                        str(payload["origin_turn_id"])
+                        if isinstance(payload.get("origin_turn_id"), str)
+                        else None
+                    ),
+                    payload=payload,
+                    idempotency_key=outbox_key,
+                    available_at=timestamp,
+                    timestamp=timestamp,
+                )
+            except sqlite3.IntegrityError as exc:
+                open_task = connection.execute(
+                    """
+                    SELECT * FROM conversation_task_bindings
+                    WHERE web_session_id = ? AND slot_state = 'open'
+                    """,
+                    (web_session_id,),
+                ).fetchone()
+                if open_task is not None:
+                    raise ContractConflictError(
+                        "open_task_slot_occupied",
+                        "the session already has an open navigation task",
+                        current=self._task_binding_from_row(open_task),
+                    ) from exc
+                raise ContractConflictError(
+                    "task_binding_conflict", str(exc)
+                ) from exc
+            binding_row = connection.execute(
+                "SELECT * FROM conversation_task_bindings WHERE task_id = ?", (task_id,)
+            ).fetchone()
+            focus_row = connection.execute(
+                "SELECT * FROM conversation_task_focus WHERE web_session_id = ?",
+                (web_session_id,),
+            ).fetchone()
+            navigation_row = connection.execute(
+                "SELECT * FROM conversation_agent_sessions WHERE id = ?", (agent_session_id,)
+            ).fetchone()
+            outbox_row = connection.execute(
+                "SELECT * FROM runtime_outbox WHERE outbox_id = ?", (outbox_id,)
+            ).fetchone()
+        assert all(row is not None for row in (binding_row, focus_row, navigation_row, outbox_row))
+        return TaskBindingCreation(
+            binding=self._task_binding_from_row(binding_row),
+            focus=self._task_focus_from_row(focus_row),
+            navigation_session=self._conversation_agent_session_from_row(navigation_row),
+            outbox=self._outbox_from_row(outbox_row),
+            created=True,
+        )
+
+    def get_task_binding_by_ref(
+        self, web_session_id: str, task_ref: str
+    ) -> TaskBinding | None:
+        with self._connect() as connection:
+            row = connection.execute(
+                """
+                SELECT * FROM conversation_task_bindings
+                WHERE web_session_id = ? AND task_ref = ?
+                """,
+                (web_session_id, task_ref),
+            ).fetchone()
+        return self._task_binding_from_row(row) if row is not None else None
+
+    def get_task_binding(self, task_id: str) -> TaskBinding | None:
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT * FROM conversation_task_bindings WHERE task_id = ?",
+                (task_id,),
+            ).fetchone()
+        return self._task_binding_from_row(row) if row is not None else None
+
+    def get_focused_task_binding(self, web_session_id: str) -> TaskBinding | None:
+        with self._connect() as connection:
+            row = connection.execute(
+                """
+                SELECT bindings.*
+                FROM conversation_task_focus AS focus
+                JOIN conversation_task_bindings AS bindings ON bindings.task_id = focus.task_id
+                WHERE focus.web_session_id = ?
+                """,
+                (web_session_id,),
+            ).fetchone()
+        return self._task_binding_from_row(row) if row is not None else None
+
+    def get_task_focus(self, web_session_id: str) -> TaskFocus | None:
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT * FROM conversation_task_focus WHERE web_session_id = ?",
+                (web_session_id,),
+            ).fetchone()
+        return self._task_focus_from_row(row) if row is not None else None
+
+    def focus_task(self, web_session_id: str, *, task_id: str) -> TaskFocus:
+        timestamp = _now()
+        with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            binding = connection.execute(
+                """
+                SELECT 1 FROM conversation_task_bindings
+                WHERE web_session_id = ? AND task_id = ?
+                """,
+                (web_session_id, task_id),
+            ).fetchone()
+            if binding is None:
+                raise KeyError((web_session_id, task_id))
+            connection.execute(
+                """
+                INSERT INTO conversation_task_focus (
+                    web_session_id, task_id, generation, updated_at
+                ) VALUES (?, ?, 1, ?)
+                ON CONFLICT(web_session_id) DO UPDATE SET
+                    task_id = excluded.task_id,
+                    generation = conversation_task_focus.generation + 1,
+                    updated_at = excluded.updated_at
+                """,
+                (web_session_id, task_id, timestamp),
+            )
+            row = connection.execute(
+                "SELECT * FROM conversation_task_focus WHERE web_session_id = ?",
+                (web_session_id,),
+            ).fetchone()
+        assert row is not None
+        return self._task_focus_from_row(row)
+
+    def list_task_bindings(self, web_session_id: str) -> list[TaskBinding]:
+        with self._connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT * FROM conversation_task_bindings
+                WHERE web_session_id = ? ORDER BY created_at DESC, rowid DESC
+                """,
+                (web_session_id,),
+            ).fetchall()
+        return [self._task_binding_from_row(row) for row in rows]
+
+    def update_task_binding(
+        self,
+        task_id: str,
+        *,
+        expected_revision: int,
+        status: str,
+        slot_state: str | None = None,
+        scope: dict | None = None,
+        latest_public_update: str | None = None,
+    ) -> TaskBinding:
+        if slot_state is not None and slot_state not in {"open", "closed"}:
+            raise ValueError("slot_state must be open or closed")
+        timestamp = _now()
+        with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            current_row = connection.execute(
+                "SELECT * FROM conversation_task_bindings WHERE task_id = ?", (task_id,)
+            ).fetchone()
+            if current_row is None:
+                raise KeyError(task_id)
+            current = self._task_binding_from_row(current_row)
+            if current.state_revision != expected_revision:
+                raise ContractConflictError(
+                    "task_revision_mismatch",
+                    "task revision does not match",
+                    current=current,
+                )
+            next_slot = slot_state or current.slot_state
+            next_scope = current.scope if scope is None else scope
+            terminal_at = timestamp if next_slot == "closed" else None
+            connection.execute(
+                """
+                UPDATE conversation_task_bindings
+                SET status = ?, slot_state = ?, state_revision = state_revision + 1,
+                    scope_json = ?, latest_public_update = ?, updated_at = ?, terminal_at = ?
+                WHERE task_id = ? AND state_revision = ?
+                """,
+                (
+                    status,
+                    next_slot,
+                    json.dumps(next_scope, ensure_ascii=False, sort_keys=True),
+                    latest_public_update,
+                    timestamp,
+                    terminal_at,
+                    task_id,
+                    expected_revision,
+                ),
+            )
+            row = connection.execute(
+                "SELECT * FROM conversation_task_bindings WHERE task_id = ?", (task_id,)
+            ).fetchone()
+        assert row is not None
+        return self._task_binding_from_row(row)
+
+    def mark_task_binding_terminal(
+        self,
+        task_id: str,
+        *,
+        expected_revision: int,
+        status: str,
+        latest_public_update: str | None = None,
+    ) -> TaskBinding:
+        return self.update_task_binding(
+            task_id,
+            expected_revision=expected_revision,
+            status=status,
+            slot_state="closed",
+            latest_public_update=latest_public_update,
+        )
+
+    def create_turn_run(
+        self,
+        *,
+        run_id: str,
+        turn_id: str,
+        producer: str,
+        status: str = "running",
+        task_id: str | None = None,
+        parent_run_id: str | None = None,
+        agentscope_session_id: str | None = None,
+    ) -> TurnRun:
+        timestamp = _now()
+        with self._connect() as connection:
+            connection.execute(
+                """
+                INSERT INTO turn_runs (
+                    run_id, turn_id, task_id, producer, parent_run_id,
+                    agentscope_session_id, status, created_at, updated_at, finished_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, NULL)
+                """,
+                (
+                    run_id,
+                    turn_id,
+                    task_id,
+                    producer,
+                    parent_run_id,
+                    agentscope_session_id,
+                    status,
+                    timestamp,
+                    timestamp,
+                ),
+            )
+            row = connection.execute(
+                "SELECT * FROM turn_runs WHERE run_id = ?", (run_id,)
+            ).fetchone()
+        assert row is not None
+        return self._turn_run_from_row(row)
+
+    def update_turn_run(self, run_id: str, *, status: str) -> TurnRun:
+        timestamp = _now()
+        finished_at = timestamp if status in {"completed", "failed", "interrupted"} else None
+        with self._connect() as connection:
+            result = connection.execute(
+                """
+                UPDATE turn_runs SET status = ?, updated_at = ?, finished_at = ?
+                WHERE run_id = ?
+                """,
+                (status, timestamp, finished_at, run_id),
+            )
+            if result.rowcount == 0:
+                raise KeyError(run_id)
+            row = connection.execute(
+                "SELECT * FROM turn_runs WHERE run_id = ?", (run_id,)
+            ).fetchone()
+        assert row is not None
+        return self._turn_run_from_row(row)
+
+    def get_latest_turn_run(
+        self,
+        turn_id: str,
+        *,
+        producer: str | None = None,
+    ) -> TurnRun | None:
+        with self._connect() as connection:
+            if producer is None:
+                row = connection.execute(
+                    """
+                    SELECT * FROM turn_runs WHERE turn_id = ?
+                    ORDER BY created_at DESC, rowid DESC LIMIT 1
+                    """,
+                    (turn_id,),
+                ).fetchone()
+            else:
+                row = connection.execute(
+                    """
+                    SELECT * FROM turn_runs WHERE turn_id = ? AND producer = ?
+                    ORDER BY created_at DESC, rowid DESC LIMIT 1
+                    """,
+                    (turn_id, producer),
+                ).fetchone()
+        return self._turn_run_from_row(row) if row is not None else None
+
+    def initialize_response_authority(
+        self, turn_id: str, *, producer: str = "router"
+    ) -> ResponseAuthority:
+        timestamp = _now()
+        with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            turn = connection.execute(
+                """
+                SELECT sessions.contract_version
+                FROM web_turns JOIN sessions ON sessions.id = web_turns.web_session_id
+                WHERE web_turns.id = ?
+                """,
+                (turn_id,),
+            ).fetchone()
+            if turn is None:
+                raise KeyError(turn_id)
+            if int(turn["contract_version"]) != 1:
+                raise ContractConflictError(
+                    "contract_version_mismatch", "response authority requires contract v1"
+                )
+            existing = connection.execute(
+                "SELECT * FROM turn_response_authority WHERE turn_id = ?", (turn_id,)
+            ).fetchone()
+            if existing is not None:
+                record = self._response_authority_from_row(existing)
+                if record.producer != producer:
+                    raise ContractConflictError(
+                        "authority_already_initialized",
+                        "response authority is already initialized",
+                        current=record,
+                    )
+                return record
+            self._insert_response_authority(
+                connection, turn_id=turn_id, producer=producer, timestamp=timestamp
+            )
+            row = connection.execute(
+                "SELECT * FROM turn_response_authority WHERE turn_id = ?", (turn_id,)
+            ).fetchone()
+        assert row is not None
+        return self._response_authority_from_row(row)
+
+    def get_response_authority(self, turn_id: str) -> ResponseAuthority | None:
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT * FROM turn_response_authority WHERE turn_id = ?", (turn_id,)
+            ).fetchone()
+        return self._response_authority_from_row(row) if row is not None else None
+
+    def handover_response_authority(
+        self,
+        turn_id: str,
+        *,
+        expected_producer: str,
+        expected_generation: int,
+        new_producer: str = "navigation",
+    ) -> ResponseAuthority:
+        return self._transfer_response_authority(
+            turn_id,
+            expected_producer=expected_producer,
+            expected_generation=expected_generation,
+            new_producer=new_producer,
+        )
+
+    def handover_response_authority_with_outbox(
+        self,
+        turn_id: str,
+        *,
+        expected_producer: str,
+        expected_generation: int,
+        new_producer: str,
+        kind: str,
+        aggregate_type: str,
+        aggregate_id: str,
+        payload: dict,
+        idempotency_key: str,
+        web_session_id: str,
+        task_id: str | None,
+    ) -> tuple[ResponseAuthority, RuntimeOutboxItem]:
+        """Atomically transfer reply ownership and record the accepted wakeup."""
+        timestamp = _now()
+        outbox_id = f"outbox_{uuid4().hex}"
+        with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            cursor = connection.execute(
+                """
+                UPDATE turn_response_authority
+                SET producer = ?, generation = generation + 1, updated_at = ?
+                WHERE turn_id = ? AND producer = ? AND generation = ?
+                  AND lease_state = 'open' AND final_message_id IS NULL
+                """,
+                (
+                    new_producer,
+                    timestamp,
+                    turn_id,
+                    expected_producer,
+                    expected_generation,
+                ),
+            )
+            authority_row = connection.execute(
+                "SELECT * FROM turn_response_authority WHERE turn_id = ?",
+                (turn_id,),
+            ).fetchone()
+            if authority_row is None:
+                raise KeyError(turn_id)
+            if cursor.rowcount == 0:
+                raise ContractConflictError(
+                    "response_authority_mismatch",
+                    "response authority is stale or already closed",
+                    current=self._response_authority_from_row(authority_row),
+                )
+            self._insert_outbox(
+                connection,
+                outbox_id=outbox_id,
+                kind=kind,
+                aggregate_type=aggregate_type,
+                aggregate_id=aggregate_id,
+                web_session_id=web_session_id,
+                task_id=task_id,
+                turn_id=turn_id,
+                payload=payload,
+                idempotency_key=idempotency_key,
+                available_at=timestamp,
+                timestamp=timestamp,
+            )
+            outbox_row = connection.execute(
+                "SELECT * FROM runtime_outbox WHERE outbox_id = ?",
+                (outbox_id,),
+            ).fetchone()
+        assert outbox_row is not None
+        return (
+            self._response_authority_from_row(authority_row),
+            self._outbox_from_row(outbox_row),
+        )
+
+    def takeover_response_authority(
+        self,
+        turn_id: str,
+        *,
+        expected_producer: str,
+        expected_generation: int,
+    ) -> ResponseAuthority:
+        return self._transfer_response_authority(
+            turn_id,
+            expected_producer=expected_producer,
+            expected_generation=expected_generation,
+            new_producer="system_controller",
+        )
+
+    def _transfer_response_authority(
+        self,
+        turn_id: str,
+        *,
+        expected_producer: str,
+        expected_generation: int,
+        new_producer: str,
+    ) -> ResponseAuthority:
+        timestamp = _now()
+        with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            cursor = connection.execute(
+                """
+                UPDATE turn_response_authority
+                SET producer = ?, generation = generation + 1, updated_at = ?
+                WHERE turn_id = ? AND producer = ? AND generation = ?
+                  AND lease_state = 'open' AND final_message_id IS NULL
+                """,
+                (
+                    new_producer,
+                    timestamp,
+                    turn_id,
+                    expected_producer,
+                    expected_generation,
+                ),
+            )
+            row = connection.execute(
+                "SELECT * FROM turn_response_authority WHERE turn_id = ?", (turn_id,)
+            ).fetchone()
+            if row is None:
+                raise KeyError(turn_id)
+            if cursor.rowcount == 0:
+                raise ContractConflictError(
+                    "response_authority_mismatch",
+                    "response authority is stale or already closed",
+                    current=self._response_authority_from_row(row),
+                )
+        return self._response_authority_from_row(row)
+
+    def commit_authorized_final(
+        self,
+        turn_id: str,
+        *,
+        producer: str,
+        response_generation: int,
+        text: str,
+        terminal_status: str = "completed",
+    ) -> AuthorizedFinalCommit:
+        if terminal_status not in {"completed", "failed"}:
+            raise ValueError("terminal_status must be completed or failed")
+        timestamp = _now()
+        safe_text = sanitize_public_reply(text)
+        if not safe_text:
+            safe_text = _SAFE_PUBLIC_REPLY_FAILURE
+            terminal_status = "failed"
+        with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            authority_row = connection.execute(
+                "SELECT * FROM turn_response_authority WHERE turn_id = ?", (turn_id,)
+            ).fetchone()
+            if authority_row is None:
+                raise KeyError(turn_id)
+            authority = self._response_authority_from_row(authority_row)
+            if (
+                authority.producer != producer
+                or authority.generation != response_generation
+                or authority.lease_state != "open"
+                or authority.final_message_id is not None
+            ):
+                raise ContractConflictError(
+                    "response_authority_mismatch",
+                    "final reply producer is stale or the turn is already closed",
+                    current=authority,
+                )
+            turn = connection.execute(
+                "SELECT web_session_id, status FROM web_turns WHERE id = ?", (turn_id,)
+            ).fetchone()
+            if turn is None:
+                raise KeyError(turn_id)
+            if turn["status"] not in {"running", "waiting"}:
+                raise ContractConflictError(
+                    "turn_not_open", "the turn cannot accept a final reply"
+                )
+            message_id = f"message_{uuid4().hex}"
+            connection.execute(
+                """
+                INSERT INTO messages (id, session_id, turn_id, role, content, created_at)
+                VALUES (?, ?, ?, 'assistant', ?, ?)
+                """,
+                (message_id, turn["web_session_id"], turn_id, safe_text, timestamp),
+            )
+            final = self._insert_timeline_event(
+                connection,
+                session_id=turn["web_session_id"],
+                turn_id=turn_id,
+                event={
+                    "type": "final",
+                    "timestamp": timestamp,
+                    "payload": {"text": safe_text, "message_id": message_id},
+                },
+                created_at=timestamp,
+                origin_key=f"contract-v1:{turn_id}:{response_generation}:final",
+            )
+            connection.execute(
+                """
+                UPDATE web_turns
+                SET status = ?, finished_at = ?, final_message_id = ? WHERE id = ?
+                """,
+                (terminal_status, timestamp, message_id, turn_id),
+            )
+            connection.execute(
+                """
+                UPDATE turn_response_authority
+                SET lease_state = 'closed', final_message_id = ?, updated_at = ?
+                WHERE turn_id = ? AND producer = ? AND generation = ?
+                  AND lease_state = 'open' AND final_message_id IS NULL
+                """,
+                (message_id, timestamp, turn_id, producer, response_generation),
+            )
+            connection.execute(
+                "UPDATE conversation_agent_sessions "
+                "SET active_turn_id = NULL, updated_at = ? WHERE active_turn_id = ?",
+                (timestamp, turn_id),
+            )
+            connection.execute(
+                "UPDATE agentscope_sessions "
+                "SET active_turn_id = NULL, updated_at = ? WHERE active_turn_id = ?",
+                (timestamp, turn_id),
+            )
+            state = self._insert_timeline_event(
+                connection,
+                session_id=turn["web_session_id"],
+                turn_id=turn_id,
+                event={
+                    "type": "turn_state",
+                    "timestamp": timestamp,
+                    "payload": {"status": terminal_status, "finished_at": timestamp},
+                },
+                created_at=timestamp,
+                origin_key=f"contract-v1:{turn_id}:{response_generation}:{terminal_status}",
+            )
+            connection.execute(
+                "UPDATE sessions SET updated_at = ? WHERE id = ?",
+                (timestamp, turn["web_session_id"]),
+            )
+        return AuthorizedFinalCommit(
+            message=ChatMessageRecord(
+                id=message_id,
+                session_id=turn["web_session_id"],
+                turn_id=turn_id,
+                role="assistant",
+                content=safe_text,
+                created_at=timestamp,
+            ),
+            events=(final, state),
+            terminal_status=terminal_status,
+        )
+
+    def create_interaction(
+        self,
+        web_session_id: str,
+        *,
+        task_ref: str,
+        kind: str,
+        blocking: bool,
+        risk: str,
+        title: str,
+        options: list[dict],
+        expected_task_revision: int,
+        private_payload: dict | None = None,
+        summary: str | None = None,
+        origin_turn_id: str | None = None,
+        expires_at: str | None = None,
+        interaction_id: str | None = None,
+    ) -> InteractionRecord:
+        if not title.strip():
+            raise ValueError("interaction title must not be empty")
+        option_ids = [item.get("option_id") or item.get("id") for item in options]
+        if not options or any(not isinstance(value, str) or not value for value in option_ids):
+            raise ValueError("every interaction option requires a non-empty string id")
+        if len(set(option_ids)) != len(option_ids):
+            raise ValueError("interaction option ids must be unique")
+        normalized_options = [
+            {
+                **{key: value for key, value in item.items() if key != "id"},
+                "option_id": option_id,
+            }
+            for item, option_id in zip(options, option_ids, strict=True)
+        ]
+        timestamp = _now()
+        interaction_id = interaction_id or f"interaction_{uuid4().hex}"
+        with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            binding_row = connection.execute(
+                """
+                SELECT * FROM conversation_task_bindings
+                WHERE web_session_id = ? AND task_ref = ?
+                """,
+                (web_session_id, task_ref),
+            ).fetchone()
+            if binding_row is None:
+                raise KeyError((web_session_id, task_ref))
+            binding = self._task_binding_from_row(binding_row)
+            existing = connection.execute(
+                "SELECT * FROM interactions WHERE interaction_id = ?", (interaction_id,)
+            ).fetchone()
+            if existing is not None:
+                return self._interaction_from_row(existing)
+            connection.execute(
+                """
+                INSERT INTO interactions (
+                    interaction_id, web_session_id, task_id, task_ref, origin_turn_id,
+                    kind, blocking, risk, title, summary, options_json, status,
+                    private_payload_json, revision, expected_task_revision, expires_at, response_json,
+                    idempotency_key, created_at, updated_at, resolved_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'open', ?, 1, ?, ?, NULL,
+                          NULL, ?, ?, NULL)
+                """,
+                (
+                    interaction_id,
+                    web_session_id,
+                    binding.task_id,
+                    task_ref,
+                    origin_turn_id,
+                    kind,
+                    int(blocking),
+                    risk,
+                    title.strip(),
+                    summary,
+                    json.dumps(normalized_options, ensure_ascii=False, sort_keys=True),
+                    json.dumps(private_payload or {}, ensure_ascii=False, sort_keys=True),
+                    expected_task_revision,
+                    expires_at,
+                    timestamp,
+                    timestamp,
+                ),
+            )
+            row = connection.execute(
+                "SELECT * FROM interactions WHERE interaction_id = ?", (interaction_id,)
+            ).fetchone()
+        assert row is not None
+        return self._interaction_from_row(row)
+
+    def get_interaction(self, interaction_id: str) -> InteractionRecord | None:
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT * FROM interactions WHERE interaction_id = ?", (interaction_id,)
+            ).fetchone()
+        return self._interaction_from_row(row) if row is not None else None
+
+    def get_open_interaction(self, web_session_id: str) -> InteractionRecord | None:
+        with self._connect() as connection:
+            row = connection.execute(
+                """
+                SELECT * FROM interactions
+                WHERE web_session_id = ? AND status = 'open'
+                ORDER BY created_at DESC, rowid DESC LIMIT 1
+                """,
+                (web_session_id,),
+            ).fetchone()
+        return self._interaction_from_row(row) if row is not None else None
+
+    def consume_interaction(
+        self,
+        interaction_id: str,
+        *,
+        interaction_revision: int,
+        expected_task_revision: int,
+        idempotency_key: str,
+        option_id: str | None = None,
+        option_ids: list[str] | None = None,
+        navigation_db_path: str | Path | None = None,
+    ) -> InteractionConsumption:
+        if not idempotency_key:
+            raise ValueError("idempotency_key must not be empty")
+        selected = list(option_ids or ([] if option_id is None else [option_id]))
+        if not selected or len(set(selected)) != len(selected):
+            raise ValueError("one or more unique option ids are required")
+        timestamp = _now()
+        with self._connect() as connection:
+            if navigation_db_path is not None:
+                connection.execute(
+                    "ATTACH DATABASE ? AS navigation_contract",
+                    (str(navigation_db_path),),
+                )
+            connection.execute("BEGIN IMMEDIATE")
+            row = connection.execute(
+                "SELECT * FROM interactions WHERE interaction_id = ?", (interaction_id,)
+            ).fetchone()
+            if row is None:
+                raise KeyError(interaction_id)
+            current = self._interaction_from_row(row)
+            if current.idempotency_key == idempotency_key and current.status == "resolved":
+                return InteractionConsumption(interaction=current, created=False)
+            duplicate_key = connection.execute(
+                """
+                SELECT * FROM interactions
+                WHERE idempotency_key = ? AND interaction_id <> ?
+                """,
+                (idempotency_key, interaction_id),
+            ).fetchone()
+            if duplicate_key is not None:
+                raise ContractConflictError(
+                    "interaction_idempotency_conflict",
+                    "idempotency key was used for another interaction",
+                    current=self._interaction_from_row(duplicate_key),
+                )
+            if current.status != "open":
+                raise ContractConflictError(
+                    "interaction_not_open", "interaction is no longer open", current=current
+                )
+            if current.expires_at is not None and current.expires_at <= timestamp:
+                connection.execute(
+                    """
+                    UPDATE interactions SET status = 'expired', revision = revision + 1,
+                        updated_at = ? WHERE interaction_id = ?
+                    """,
+                    (timestamp, interaction_id),
+                )
+                expired_row = connection.execute(
+                    "SELECT * FROM interactions WHERE interaction_id = ?", (interaction_id,)
+                ).fetchone()
+                connection.commit()
+                raise ContractConflictError(
+                    "interaction_expired",
+                    "interaction has expired",
+                    current=self._interaction_from_row(expired_row),
+                )
+            if (
+                current.revision != interaction_revision
+                or current.expected_task_revision != expected_task_revision
+            ):
+                raise ContractConflictError(
+                    "interaction_revision_mismatch",
+                    "interaction or task revision does not match",
+                    current=current,
+                )
+            if navigation_db_path is not None:
+                task_revision = connection.execute(
+                    """
+                    SELECT state_revision, created_by_web_session_id
+                    FROM navigation_contract.navigation_tasks
+                    WHERE task_id = ?
+                    """,
+                    (current.task_id,),
+                ).fetchone()
+                if (
+                    task_revision is None
+                    or task_revision["created_by_web_session_id"] != current.web_session_id
+                    or int(task_revision["state_revision"]) != expected_task_revision
+                ):
+                    raise ContractConflictError(
+                        "task_revision_mismatch",
+                        "navigation task changed before the interaction was consumed",
+                        current=current,
+                    )
+            allowed = {
+                str(option.get("option_id") or option.get("id"))
+                for option in current.options
+            }
+            if any(value not in allowed for value in selected):
+                raise ContractConflictError(
+                    "invalid_interaction_option",
+                    "one or more selected options are not available",
+                    current=current,
+                )
+            if current.kind != "multi_select" and len(selected) != 1:
+                raise ContractConflictError(
+                    "invalid_interaction_selection_count",
+                    "this interaction accepts exactly one option",
+                    current=current,
+                )
+            response = {"option_ids": selected}
+            connection.execute(
+                """
+                UPDATE interactions
+                SET status = 'resolved', revision = revision + 1, response_json = ?,
+                    idempotency_key = ?, updated_at = ?, resolved_at = ?
+                WHERE interaction_id = ? AND status = 'open' AND revision = ?
+                """,
+                (
+                    json.dumps(response, ensure_ascii=False, sort_keys=True),
+                    idempotency_key,
+                    timestamp,
+                    timestamp,
+                    interaction_id,
+                    interaction_revision,
+                ),
+            )
+            connection.execute(
+                """
+                UPDATE conversation_task_focus
+                SET task_id = ?, generation = generation + 1, updated_at = ?
+                WHERE web_session_id = ?
+                """,
+                (current.task_id, timestamp, current.web_session_id),
+            )
+            resolved_row = connection.execute(
+                "SELECT * FROM interactions WHERE interaction_id = ?", (interaction_id,)
+            ).fetchone()
+        assert resolved_row is not None
+        return InteractionConsumption(
+            interaction=self._interaction_from_row(resolved_row), created=True
+        )
+
+    def create_interaction_turn(
+        self,
+        interaction_id: str,
+        *,
+        content: str,
+        invocation_id: str | None = None,
+    ) -> TurnSubmission:
+        timestamp = _now()
+        with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            interaction_row = connection.execute(
+                "SELECT * FROM interactions WHERE interaction_id = ?", (interaction_id,)
+            ).fetchone()
+            if interaction_row is None:
+                raise KeyError(interaction_id)
+            interaction = self._interaction_from_row(interaction_row)
+            if interaction.status != "resolved":
+                raise ContractConflictError(
+                    "interaction_not_resolved",
+                    "only a resolved interaction can create a turn",
+                    current=interaction,
+                )
+            turn_invocation = invocation_id or f"interaction:{interaction_id}:{interaction.revision}"
+            existing_turn = connection.execute(
+                """
+                SELECT id, web_session_id, origin, status, started_at, finished_at,
+                       final_message_id FROM web_turns
+                WHERE web_session_id = ? AND invocation_id = ?
+                """,
+                (interaction.web_session_id, turn_invocation),
+            ).fetchone()
+            if existing_turn is not None:
+                message_row = connection.execute(
+                    """
+                    SELECT id, session_id, turn_id, role, content, created_at
+                    FROM messages WHERE turn_id = ? AND role = 'user' LIMIT 1
+                    """,
+                    (existing_turn["id"],),
+                ).fetchone()
+                assert message_row is not None
+                return TurnSubmission(
+                    turn=self._turn_from_row(existing_turn),
+                    message=self._message_from_row(message_row),
+                    events=(),
+                    created=False,
+                )
+            if connection.execute(
+                """
+                SELECT 1 FROM web_turns
+                WHERE web_session_id = ? AND status IN ('running', 'waiting')
+                """,
+                (interaction.web_session_id,),
+            ).fetchone() is not None:
+                raise ContractConflictError(
+                    "active_turn_exists", "the session already has an active turn"
+                )
+            turn = TurnRecord(
+                id=f"turn_{uuid4().hex}",
+                web_session_id=interaction.web_session_id,
+                origin="interaction",
+                status="running",
+                started_at=timestamp,
+            )
+            message = ChatMessageRecord(
+                id=f"message_{uuid4().hex}",
+                session_id=interaction.web_session_id,
+                turn_id=turn.id,
+                role="user",
+                content=content,
+                created_at=timestamp,
+            )
+            connection.execute(
+                """
+                INSERT INTO web_turns (
+                    id, web_session_id, invocation_id, origin, status, started_at,
+                    finished_at, final_message_id
+                ) VALUES (?, ?, ?, 'interaction', 'running', ?, NULL, NULL)
+                """,
+                (turn.id, turn.web_session_id, turn_invocation, timestamp),
+            )
+            connection.execute(
+                """
+                INSERT INTO messages (id, session_id, turn_id, role, content, created_at)
+                VALUES (?, ?, ?, 'user', ?, ?)
+                """,
+                (message.id, message.session_id, turn.id, content, timestamp),
+            )
+            self._insert_response_authority(
+                connection, turn_id=turn.id, producer="navigation", timestamp=timestamp
+            )
+            self._insert_outbox(
+                connection,
+                outbox_id=f"outbox_{uuid4().hex}",
+                kind="navigation_resume",
+                aggregate_type="interaction",
+                aggregate_id=interaction_id,
+                web_session_id=interaction.web_session_id,
+                task_id=interaction.task_id,
+                turn_id=turn.id,
+                payload={
+                    "interaction_id": interaction_id,
+                    "option_ids": list((interaction.response or {}).get("option_ids") or []),
+                },
+                idempotency_key=f"navigation_resume:{interaction_id}:{interaction.revision}",
+                available_at=timestamp,
+                timestamp=timestamp,
+            )
+            event = self._insert_timeline_event(
+                connection,
+                session_id=turn.web_session_id,
+                turn_id=turn.id,
+                event={
+                    "type": "turn_start",
+                    "timestamp": timestamp,
+                    "payload": {"status": "running", "started_at": timestamp},
+                },
+                created_at=timestamp,
+                origin_key=f"interaction:{interaction_id}:turn-start",
+            )
+            connection.execute(
+                "UPDATE sessions SET updated_at = ? WHERE id = ?",
+                (timestamp, turn.web_session_id),
+            )
+        return TurnSubmission(turn=turn, message=message, events=(event,), created=True)
+
+    def enqueue_outbox(
+        self,
+        *,
+        kind: str,
+        aggregate_type: str,
+        aggregate_id: str,
+        payload: dict,
+        idempotency_key: str,
+        web_session_id: str | None = None,
+        task_id: str | None = None,
+        turn_id: str | None = None,
+        available_at: str | None = None,
+    ) -> RuntimeOutboxItem:
+        if not idempotency_key:
+            raise ValueError("idempotency_key must not be empty")
+        timestamp = _now()
+        available_at = available_at or timestamp
+        outbox_id = f"outbox_{uuid4().hex}"
+        with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            existing = connection.execute(
+                "SELECT * FROM runtime_outbox WHERE idempotency_key = ?",
+                (idempotency_key,),
+            ).fetchone()
+            if existing is not None:
+                return self._outbox_from_row(existing)
+            self._insert_outbox(
+                connection,
+                outbox_id=outbox_id,
+                kind=kind,
+                aggregate_type=aggregate_type,
+                aggregate_id=aggregate_id,
+                web_session_id=web_session_id,
+                task_id=task_id,
+                turn_id=turn_id,
+                payload=payload,
+                idempotency_key=idempotency_key,
+                available_at=available_at,
+                timestamp=timestamp,
+            )
+            row = connection.execute(
+                "SELECT * FROM runtime_outbox WHERE outbox_id = ?", (outbox_id,)
+            ).fetchone()
+        assert row is not None
+        return self._outbox_from_row(row)
+
+    def claim_outbox(
+        self,
+        *,
+        worker_id: str,
+        kinds: list[str] | None = None,
+        limit: int = 1,
+        lease_seconds: int = 60,
+    ) -> list[RuntimeOutboxItem]:
+        if limit < 1:
+            return []
+        timestamp = _now()
+        lease_expires_at = (datetime.now(UTC) + timedelta(seconds=lease_seconds)).isoformat(
+            timespec="milliseconds"
+        )
+        with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            parameters: list[object] = [timestamp, timestamp]
+            kind_clause = ""
+            if kinds:
+                placeholders = ", ".join("?" for _ in kinds)
+                kind_clause = f" AND kind IN ({placeholders})"
+                parameters.extend(kinds)
+            parameters.append(limit)
+            rows = connection.execute(
+                f"""
+                SELECT outbox_id FROM runtime_outbox
+                WHERE available_at <= ?
+                  AND (status = 'pending' OR (status = 'claimed' AND lease_expires_at <= ?))
+                  {kind_clause}
+                ORDER BY available_at ASC, created_at ASC
+                LIMIT ?
+                """,
+                parameters,
+            ).fetchall()
+            ids = [row["outbox_id"] for row in rows]
+            for outbox_id in ids:
+                connection.execute(
+                    """
+                    UPDATE runtime_outbox
+                    SET status = 'claimed', claimed_by = ?, lease_expires_at = ?,
+                        attempts = attempts + 1, updated_at = ?
+                    WHERE outbox_id = ?
+                    """,
+                    (worker_id, lease_expires_at, timestamp, outbox_id),
+                )
+            claimed = [
+                connection.execute(
+                    "SELECT * FROM runtime_outbox WHERE outbox_id = ?", (outbox_id,)
+                ).fetchone()
+                for outbox_id in ids
+            ]
+        return [self._outbox_from_row(row) for row in claimed if row is not None]
+
+    def claim_outbox_item(
+        self,
+        outbox_id: str,
+        *,
+        worker_id: str,
+        lease_seconds: int = 60,
+    ) -> RuntimeOutboxItem:
+        timestamp = _now()
+        lease_expires_at = (datetime.now(UTC) + timedelta(seconds=lease_seconds)).isoformat(
+            timespec="milliseconds"
+        )
+        with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            current = connection.execute(
+                "SELECT * FROM runtime_outbox WHERE outbox_id = ?", (outbox_id,)
+            ).fetchone()
+            if current is None:
+                raise KeyError(outbox_id)
+            if current["status"] == "completed":
+                return self._outbox_from_row(current)
+            if current["status"] == "claimed" and current["lease_expires_at"] > timestamp:
+                raise ContractConflictError(
+                    "outbox_claim_mismatch",
+                    "outbox item is already claimed",
+                    current=self._outbox_from_row(current),
+                )
+            connection.execute(
+                """
+                UPDATE runtime_outbox
+                SET status = 'claimed', claimed_by = ?, lease_expires_at = ?,
+                    attempts = attempts + 1, updated_at = ?
+                WHERE outbox_id = ?
+                """,
+                (worker_id, lease_expires_at, timestamp, outbox_id),
+            )
+            row = connection.execute(
+                "SELECT * FROM runtime_outbox WHERE outbox_id = ?", (outbox_id,)
+            ).fetchone()
+        assert row is not None
+        return self._outbox_from_row(row)
+
+    def complete_outbox(
+        self,
+        outbox_id: str,
+        *,
+        worker_id: str,
+        success: bool = True,
+        error: str | None = None,
+        retry_at: str | None = None,
+    ) -> RuntimeOutboxItem:
+        timestamp = _now()
+        if success:
+            status = "completed"
+            completed_at = timestamp
+            claimed_by: str | None = None
+            lease_expires_at: str | None = None
+        elif retry_at is not None:
+            status = "pending"
+            completed_at = None
+            claimed_by = None
+            lease_expires_at = None
+        else:
+            status = "failed"
+            completed_at = timestamp
+            claimed_by = None
+            lease_expires_at = None
+        with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            current = connection.execute(
+                "SELECT * FROM runtime_outbox WHERE outbox_id = ?", (outbox_id,)
+            ).fetchone()
+            if current is None:
+                raise KeyError(outbox_id)
+            if current["status"] == "completed":
+                return self._outbox_from_row(current)
+            if current["status"] != "claimed" or current["claimed_by"] != worker_id:
+                raise ContractConflictError(
+                    "outbox_claim_mismatch",
+                    "outbox item is not claimed by this worker",
+                    current=self._outbox_from_row(current),
+                )
+            connection.execute(
+                """
+                UPDATE runtime_outbox
+                SET status = ?, available_at = COALESCE(?, available_at), claimed_by = ?,
+                    lease_expires_at = ?, last_error = ?, updated_at = ?, completed_at = ?
+                WHERE outbox_id = ?
+                """,
+                (
+                    status,
+                    retry_at,
+                    claimed_by,
+                    lease_expires_at,
+                    error,
+                    timestamp,
+                    completed_at,
+                    outbox_id,
+                ),
+            )
+            row = connection.execute(
+                "SELECT * FROM runtime_outbox WHERE outbox_id = ?", (outbox_id,)
+            ).fetchone()
+        assert row is not None
+        return self._outbox_from_row(row)
+
+    def get_outbox(self, outbox_id: str) -> RuntimeOutboxItem | None:
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT * FROM runtime_outbox WHERE outbox_id = ?", (outbox_id,)
+            ).fetchone()
+        return self._outbox_from_row(row) if row is not None else None
+
+    def get_outbox_by_idempotency_key(self, idempotency_key: str) -> RuntimeOutboxItem | None:
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT * FROM runtime_outbox WHERE idempotency_key = ?",
+                (idempotency_key,),
+            ).fetchone()
+        return self._outbox_from_row(row) if row is not None else None
+
+    def transfer_waiting_reply_to_turn(
+        self,
+        *,
+        agentscope_session_id: str,
+        reply_id: str,
+        turn_id: str,
+    ) -> None:
+        """Move the paused specialist reply lease onto an Interaction Turn."""
+        timestamp = _now()
+        with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            target = connection.execute(
+                """
+                SELECT turns.status, turns.origin, authority.producer, authority.lease_state
+                FROM web_turns AS turns
+                JOIN turn_response_authority AS authority ON authority.turn_id = turns.id
+                WHERE turns.id = ?
+                """,
+                (turn_id,),
+            ).fetchone()
+            if (
+                target is None
+                or target["origin"] != "interaction"
+                or target["status"] not in {"running", "waiting"}
+                or target["producer"] != "navigation"
+                or target["lease_state"] != "open"
+            ):
+                raise ContractConflictError(
+                    "interaction_turn_not_open",
+                    "interaction turn cannot receive the specialist reply",
+                )
+            cursor = connection.execute(
+                """
+                UPDATE agentscope_turn_replies
+                SET turn_id = ?, status = 'pending', summary_text = NULL, updated_at = ?
+                WHERE agentscope_session_id = ? AND reply_id = ?
+                  AND status IN ('waiting', 'ended', 'failed', 'pending', 'running')
+                """,
+                (turn_id, timestamp, agentscope_session_id, reply_id),
+            )
+            if cursor.rowcount != 1:
+                raise ContractConflictError(
+                    "interaction_reply_unavailable",
+                    "the specialist reply can no longer be resumed",
+                )
+
+    def acquire_resource_lease(
+        self,
+        resource_key: str,
+        *,
+        owner_id: str,
+        kind: str,
+        lease_seconds: int,
+        task_id: str | None = None,
+        run_id: str | None = None,
+    ) -> ResourceLease:
+        timestamp = _now()
+        expires_at = (datetime.now(UTC) + timedelta(seconds=lease_seconds)).isoformat(
+            timespec="milliseconds"
+        )
+        lease_id = f"resource_lease_{uuid4().hex}"
+        with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            existing = connection.execute(
+                "SELECT * FROM runtime_resource_leases WHERE resource_key = ?",
+                (resource_key,),
+            ).fetchone()
+            if existing is not None and existing["expires_at"] <= timestamp:
+                connection.execute(
+                    "DELETE FROM runtime_resource_leases WHERE lease_id = ?",
+                    (existing["lease_id"],),
+                )
+                existing = None
+            if existing is not None:
+                lease = self._resource_lease_from_row(existing)
+                if lease.owner_id == owner_id:
+                    connection.execute(
+                        """
+                        UPDATE runtime_resource_leases
+                        SET expires_at = ?, updated_at = ? WHERE lease_id = ?
+                        """,
+                        (expires_at, timestamp, lease.lease_id),
+                    )
+                    renewed = connection.execute(
+                        "SELECT * FROM runtime_resource_leases WHERE lease_id = ?",
+                        (lease.lease_id,),
+                    ).fetchone()
+                    return self._resource_lease_from_row(renewed)
+                raise ContractConflictError(
+                    "resource_lease_unavailable",
+                    "resource is leased by another owner",
+                    current=lease,
+                )
+            connection.execute(
+                """
+                INSERT INTO runtime_resource_leases (
+                    lease_id, resource_key, owner_id, task_id, run_id, kind,
+                    expires_at, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    lease_id,
+                    resource_key,
+                    owner_id,
+                    task_id,
+                    run_id,
+                    kind,
+                    expires_at,
+                    timestamp,
+                    timestamp,
+                ),
+            )
+            row = connection.execute(
+                "SELECT * FROM runtime_resource_leases WHERE lease_id = ?", (lease_id,)
+            ).fetchone()
+        assert row is not None
+        return self._resource_lease_from_row(row)
+
+    def release_resource_lease(self, lease_id: str, *, owner_id: str) -> bool:
+        with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            current = connection.execute(
+                "SELECT * FROM runtime_resource_leases WHERE lease_id = ?", (lease_id,)
+            ).fetchone()
+            if current is None:
+                return False
+            if current["owner_id"] != owner_id:
+                raise ContractConflictError(
+                    "resource_lease_owner_mismatch",
+                    "resource lease is owned by another worker",
+                    current=self._resource_lease_from_row(current),
+                )
+            connection.execute(
+                "DELETE FROM runtime_resource_leases WHERE lease_id = ?", (lease_id,)
+            )
+        return True
+
+    @staticmethod
+    def _insert_response_authority(
+        connection: sqlite3.Connection,
+        *,
+        turn_id: str,
+        producer: str,
+        timestamp: str,
+    ) -> None:
+        connection.execute(
+            """
+            INSERT INTO turn_response_authority (
+                turn_id, producer, generation, lease_state, final_message_id,
+                created_at, updated_at
+            ) VALUES (?, ?, 1, 'open', NULL, ?, ?)
+            """,
+            (turn_id, producer, timestamp, timestamp),
+        )
+
+    @staticmethod
+    def _insert_outbox(
+        connection: sqlite3.Connection,
+        *,
+        outbox_id: str,
+        kind: str,
+        aggregate_type: str,
+        aggregate_id: str,
+        web_session_id: str | None,
+        task_id: str | None,
+        turn_id: str | None,
+        payload: dict,
+        idempotency_key: str,
+        available_at: str,
+        timestamp: str,
+    ) -> None:
+        connection.execute(
+            """
+            INSERT INTO runtime_outbox (
+                outbox_id, kind, aggregate_type, aggregate_id, web_session_id,
+                task_id, turn_id, payload_json, status, idempotency_key,
+                available_at, claimed_by, lease_expires_at, attempts, last_error,
+                created_at, updated_at, completed_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?, NULL, NULL, 0,
+                      NULL, ?, ?, NULL)
+            """,
+            (
+                outbox_id,
+                kind,
+                aggregate_type,
+                aggregate_id,
+                web_session_id,
+                task_id,
+                turn_id,
+                json.dumps(payload, ensure_ascii=False, sort_keys=True),
+                idempotency_key,
+                available_at,
+                timestamp,
+                timestamp,
+            ),
+        )
+
+    @staticmethod
+    def _require_contract_v1(
+        connection: sqlite3.Connection, web_session_id: str
+    ) -> None:
+        row = connection.execute(
+            "SELECT contract_version FROM sessions WHERE id = ?", (web_session_id,)
+        ).fetchone()
+        if row is None:
+            raise KeyError(web_session_id)
+        if int(row["contract_version"]) != 1:
+            raise ContractConflictError(
+                "contract_version_mismatch", "operation requires contract v1"
+            )
+
     def _duplicate_human_decision_event(
         self,
         connection: sqlite3.Connection,
@@ -2172,6 +4420,7 @@ class WebSessionStore:
             status=row["status"],
             created_at=row["created_at"],
             updated_at=row["updated_at"],
+            contract_version=int(row["contract_version"]),
         )
 
     @staticmethod
@@ -2225,6 +4474,160 @@ class WebSessionStore:
             agentscope_session_id=row["agentscope_session_id"],
             event_cursor=row["event_cursor"],
             active_turn_id=row["active_turn_id"],
+        )
+
+    @staticmethod
+    def _conversation_agent_session_from_row(
+        row: sqlite3.Row,
+    ) -> ConversationAgentSession:
+        return ConversationAgentSession(
+            id=row["id"],
+            web_session_id=row["web_session_id"],
+            agent_role=row["agent_role"],
+            agent_id=row["agent_id"],
+            agentscope_session_id=row["agentscope_session_id"],
+            task_id=row["task_id"],
+            event_cursor=row["event_cursor"],
+            active_turn_id=row["active_turn_id"],
+            created_at=row["created_at"],
+            updated_at=row["updated_at"],
+        )
+
+    @staticmethod
+    def _task_binding_from_row(row: sqlite3.Row) -> TaskBinding:
+        try:
+            scope = json.loads(row["scope_json"])
+        except (TypeError, json.JSONDecodeError):
+            scope = {}
+        return TaskBinding(
+            task_id=row["task_id"],
+            web_session_id=row["web_session_id"],
+            task_ref=row["task_ref"],
+            navigation_session_id=row["navigation_session_id"],
+            domain=row["domain"],
+            status=row["status"],
+            slot_state=row["slot_state"],
+            state_revision=int(row["state_revision"]),
+            scope=scope if isinstance(scope, dict) else {},
+            latest_public_update=row["latest_public_update"],
+            created_at=row["created_at"],
+            updated_at=row["updated_at"],
+            terminal_at=row["terminal_at"],
+        )
+
+    @staticmethod
+    def _task_focus_from_row(row: sqlite3.Row) -> TaskFocus:
+        return TaskFocus(
+            web_session_id=row["web_session_id"],
+            task_id=row["task_id"],
+            generation=int(row["generation"]),
+            updated_at=row["updated_at"],
+        )
+
+    @staticmethod
+    def _turn_run_from_row(row: sqlite3.Row) -> TurnRun:
+        return TurnRun(
+            run_id=row["run_id"],
+            turn_id=row["turn_id"],
+            task_id=row["task_id"],
+            producer=row["producer"],
+            parent_run_id=row["parent_run_id"],
+            agentscope_session_id=row["agentscope_session_id"],
+            status=row["status"],
+            created_at=row["created_at"],
+            updated_at=row["updated_at"],
+            finished_at=row["finished_at"],
+        )
+
+    @staticmethod
+    def _response_authority_from_row(row: sqlite3.Row) -> ResponseAuthority:
+        return ResponseAuthority(
+            turn_id=row["turn_id"],
+            producer=row["producer"],
+            generation=int(row["generation"]),
+            lease_state=row["lease_state"],
+            final_message_id=row["final_message_id"],
+            created_at=row["created_at"],
+            updated_at=row["updated_at"],
+        )
+
+    @staticmethod
+    def _interaction_from_row(row: sqlite3.Row) -> InteractionRecord:
+        try:
+            options = json.loads(row["options_json"])
+        except (TypeError, json.JSONDecodeError):
+            options = []
+        try:
+            response = json.loads(row["response_json"]) if row["response_json"] else None
+        except (TypeError, json.JSONDecodeError):
+            response = None
+        try:
+            private_payload = json.loads(row["private_payload_json"])
+        except (TypeError, json.JSONDecodeError):
+            private_payload = {}
+        return InteractionRecord(
+            interaction_id=row["interaction_id"],
+            web_session_id=row["web_session_id"],
+            task_id=row["task_id"],
+            task_ref=row["task_ref"],
+            origin_turn_id=row["origin_turn_id"],
+            kind=row["kind"],
+            blocking=bool(row["blocking"]),
+            risk=row["risk"],
+            title=row["title"],
+            summary=row["summary"],
+            options=tuple(options if isinstance(options, list) else []),
+            private_payload=private_payload if isinstance(private_payload, dict) else {},
+            status=row["status"],
+            revision=int(row["revision"]),
+            expected_task_revision=int(row["expected_task_revision"]),
+            expires_at=row["expires_at"],
+            response=response if isinstance(response, dict) else None,
+            idempotency_key=row["idempotency_key"],
+            created_at=row["created_at"],
+            updated_at=row["updated_at"],
+            resolved_at=row["resolved_at"],
+        )
+
+    @staticmethod
+    def _outbox_from_row(row: sqlite3.Row) -> RuntimeOutboxItem:
+        try:
+            payload = json.loads(row["payload_json"])
+        except (TypeError, json.JSONDecodeError):
+            payload = {}
+        return RuntimeOutboxItem(
+            outbox_id=row["outbox_id"],
+            kind=row["kind"],
+            aggregate_type=row["aggregate_type"],
+            aggregate_id=row["aggregate_id"],
+            web_session_id=row["web_session_id"],
+            task_id=row["task_id"],
+            turn_id=row["turn_id"],
+            payload=payload if isinstance(payload, dict) else {},
+            status=row["status"],
+            idempotency_key=row["idempotency_key"],
+            available_at=row["available_at"],
+            claimed_by=row["claimed_by"],
+            lease_expires_at=row["lease_expires_at"],
+            attempts=int(row["attempts"]),
+            last_error=row["last_error"],
+            created_at=row["created_at"],
+            updated_at=row["updated_at"],
+            completed_at=row["completed_at"],
+        )
+
+    @staticmethod
+    def _resource_lease_from_row(row: sqlite3.Row) -> ResourceLease:
+        return ResourceLease(
+            lease_id=row["lease_id"],
+            resource_key=row["resource_key"],
+            owner_id=row["owner_id"],
+            task_id=row["task_id"],
+            run_id=row["run_id"],
+            kind=row["kind"],
+            expires_at=row["expires_at"],
+            created_at=row["created_at"],
+            updated_at=row["updated_at"],
         )
 
 

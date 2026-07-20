@@ -1,12 +1,14 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import logging
 import re
 import time
 from contextlib import suppress
 from dataclasses import dataclass, field
+from datetime import UTC, datetime, timedelta
 from functools import partial
 from types import SimpleNamespace
 from typing import Any
@@ -43,10 +45,27 @@ from vla_data_juicer_agents.navigation.task_entry import (
     parse_navigation_task_entry,
 )
 from vla_data_juicer_agents.navigation.task_store import normalize_segments
+from vla_data_juicer_agents.navigation.task_state import NavigationTaskStatus
 from vla_data_juicer_agents.runtime.agentscope_bootstrap import bootstrap_agentscope_records
 from vla_data_juicer_agents.runtime.agentscope_config import AgentScopeRuntimeConfig
 from vla_data_juicer_agents.runtime.navigation_tool_surface import (
     NavigationToolSurfaceMiddleware,
+)
+from vla_data_juicer_agents.runtime.public_contract import (
+    ActionSignalV1,
+    ArtifactSignalV1,
+    FinalSignalV1,
+    InteractionOptionV1,
+    ProgressSignalV1,
+    RequestInputSignalV1,
+    SpecialistSignalProjector,
+    final_fallback,
+    sanitize_final_text,
+    sanitize_progress_text,
+)
+from vla_data_juicer_agents.runtime.single_agent import (
+    RouterContractV1Middleware,
+    router_v1_tools,
 )
 
 _EVENT_STARTUP_GRACE_SECS = 1.0
@@ -58,7 +77,38 @@ _HUMAN_DECISION_TOOL_NAMES = {
     # Compatibility for human-decision calls persisted before the tool was renamed.
     "request_human_decision",
 }
+_BACKGROUND_TOOL_ALLOWLIST = frozenset(
+    {
+        "prepare_raw_data_tool",
+        "extract_and_sync_navigation_data_tool",
+        "assemble_finish_temp_tool",
+        "run_noobscene_preprocessing_tool",
+        "run_initial_annotation_gui_tool",
+        "run_tracking_tool",
+        "prepare_gridmap_for_projection_tool",
+        "run_projection_and_trajectory_tool",
+        "validate_navigation_outputs_tool",
+    }
+)
 _logger = logging.getLogger(__name__)
+
+
+class DataPilotToolOffloadMiddleware(ToolOffloadMiddleware):
+    """Allow background execution only for durable plan-bound actions."""
+
+    async def on_acting(self, agent: Any, input_kwargs: dict, next_handler: Any):
+        tool_call = input_kwargs["tool_call"]
+        tool_input = _tool_call_input(tool_call)
+        plan_bound = all(
+            isinstance(tool_input.get(key), str) and tool_input[key].strip()
+            for key in ("plan_id", "step_id")
+        )
+        if tool_call.name not in _BACKGROUND_TOOL_ALLOWLIST or not plan_bound:
+            async for item in next_handler(**input_kwargs):
+                yield item
+            return
+        async for item in super().on_acting(agent, input_kwargs, next_handler):
+            yield item
 
 
 @dataclass
@@ -103,6 +153,10 @@ class AgentScopeRuntime:
     web_event_bridge: Any | None = None
     _active_human_decision_claims: set[str] = field(default_factory=set)
     _run_cancellations: dict[str, CancellationContext] = field(default_factory=dict)
+    _router_terminal_sessions: set[str] = field(default_factory=set)
+    _specialist_projectors: dict[str, SpecialistSignalProjector] = field(default_factory=dict)
+    _specialist_sequences: dict[str, int] = field(default_factory=dict)
+    _projected_tool_names: dict[tuple[str, str], str] = field(default_factory=dict)
     recovery_metrics: AgentScopeRecoveryMetrics = field(default_factory=AgentScopeRecoveryMetrics)
     bootstrapped: bool = False
 
@@ -128,7 +182,23 @@ class AgentScopeRuntime:
     def web_session_subscription_key(self, *, web_session_id: str) -> tuple[str, str] | None:
         return self._web_session_mapping(web_session_id)
 
-    async def ensure_web_session(self, web_session_id: str, *, agent_id: str, model: str) -> str:
+    async def ensure_web_session(
+        self,
+        web_session_id: str,
+        *,
+        agent_id: str,
+        model: str,
+        task_id: str | None = None,
+        preallocated_session_id: str | None = None,
+    ) -> str:
+        if self._is_contract_v1(web_session_id):
+            return await self._ensure_contract_v1_agent_session(
+                web_session_id=web_session_id,
+                agent_id=agent_id,
+                model=model,
+                task_id=task_id,
+                preallocated_session_id=preallocated_session_id,
+            )
         existing = self.web_sessions.get(web_session_id)
         if existing and existing[0] == agent_id:
             await self._ensure_web_event_bridge_mapping(
@@ -167,6 +237,67 @@ class AgentScopeRuntime:
         )
         self.web_sessions[web_session_id] = (agent_id, session.id)
         self._save_web_session_mapping(web_session_id, agent_id, session.id)
+        await self._ensure_web_event_bridge_mapping(
+            web_session_id=web_session_id,
+            agent_id=agent_id,
+            agentscope_session_id=session.id,
+        )
+        return session.id
+
+    async def _ensure_contract_v1_agent_session(
+        self,
+        *,
+        web_session_id: str,
+        agent_id: str,
+        model: str,
+        task_id: str | None,
+        preallocated_session_id: str | None,
+    ) -> str:
+        if self.web_session_store is None:
+            raise RuntimeError("contract v1 requires the Web session store")
+        kind = "router" if agent_id == self.config.main_router_agent_id else "navigation"
+        get_mapping = getattr(self.web_session_store, "get_conversation_agent_session", None)
+        mapping = (
+            get_mapping(web_session_id, agent_role=kind, task_id=task_id)
+            if callable(get_mapping)
+            else None
+        )
+        session_id = (
+            str(mapping.agentscope_session_id)
+            if mapping is not None
+            else preallocated_session_id
+            or (
+                f"{web_session_id}__{agent_id}"
+                if kind == "router"
+                else f"{web_session_id}__task_{uuid4().hex}__{agent_id}"
+            )
+        )
+        session = await self.storage.upsert_session(
+            self.config.user_id,
+            agent_id,
+            config=SessionConfig(
+                workspace_id=f"workspace-{web_session_id}",
+                name=web_session_id,
+                chat_model_config=ChatModelConfig(
+                    type="dashscope_chat",
+                    credential_id=self.config.credential_id,
+                    model=model,
+                    parameters={"parallel_tool_calls": False},
+                ),
+            ),
+            session_id=session_id,
+        )
+        save_mapping = getattr(self.web_session_store, "save_conversation_agent_session", None)
+        if callable(save_mapping):
+            save_mapping(
+                web_session_id,
+                agent_role=kind,
+                agent_id=agent_id,
+                agentscope_session_id=session.id,
+                task_id=task_id,
+            )
+        if kind == "router":
+            self.web_sessions[web_session_id] = (agent_id, session.id)
         await self._ensure_web_event_bridge_mapping(
             web_session_id=web_session_id,
             agent_id=agent_id,
@@ -216,10 +347,18 @@ class AgentScopeRuntime:
         return authoritative_turn_id
 
     def _agent_id_for_user_message(self, *, web_session_id: str) -> str:
+        if self._is_contract_v1(web_session_id):
+            return self.config.main_router_agent_id
         mapped = self._web_session_mapping(web_session_id)
         if mapped is not None and mapped[0] == self.config.navigation_agent_id:
             return self.config.navigation_agent_id
         return self.config.main_router_agent_id
+
+    def _is_contract_v1(self, web_session_id: str) -> bool:
+        if self.web_session_store is None:
+            return False
+        getter = getattr(self.web_session_store, "get_session_contract_version", None)
+        return bool(callable(getter) and getter(web_session_id) == 1)
 
     async def start_navigation_agent_task(
         self,
@@ -317,6 +456,852 @@ class AgentScopeRuntime:
             agentscope_session_id=session_id,
         )
 
+    async def start_navigation_agent_task_v1(
+        self,
+        *,
+        web_session_id: str,
+        router_session_id: str,
+        request: str,
+        target: str,
+        date: str,
+        clips: list[str],
+        scene_mode: str | None,
+        reason: str,
+        response_language: str,
+    ) -> dict[str, str]:
+        """Durably create and delegate one task-scoped Navigation session."""
+        if not self._is_contract_v1(web_session_id):
+            raise RuntimeError("single-agent contract is not enabled for this session")
+        if not re.fullmatch(r"[0-9]{8}", date.strip()):
+            raise NavigationTaskEntryError("date must be a YYYYMMDD dataset date")
+        if not target.strip():
+            raise NavigationTaskEntryError("target is required")
+        if self.web_session_store is None:
+            raise RuntimeError("Web session store is unavailable")
+        active_turn_id = self._active_turn_id(web_session_id)
+        if active_turn_id is None:
+            raise RuntimeError("navigation delegation requires an active turn")
+
+        task_id = f"nav_{uuid4().hex}"
+        task_ref = f"DP-{uuid4().hex[:12].upper()}"
+        navigation_session_id = (
+            f"{web_session_id}__task_{uuid4().hex}__{self.config.navigation_agent_id}"
+        )
+        create_binding = getattr(self.web_session_store, "create_task_binding", None)
+        if not callable(create_binding):
+            raise RuntimeError("contract v1 task binding store is unavailable")
+        binding_creation = create_binding(
+            web_session_id,
+            task_id=task_id,
+            task_ref=task_ref,
+            navigation_session_id=navigation_session_id,
+            domain="navigation",
+            navigation_agent_id=self.config.navigation_agent_id,
+            scope={
+                "date": date.strip(),
+                "clips": list(clips),
+                "scene_mode": scene_mode or "unknown",
+            },
+            outbox_payload={
+                "origin_turn_id": active_turn_id,
+                "request": request,
+                "target": target,
+                "date": date.strip(),
+                "clips": list(clips),
+                "scene_mode": scene_mode or "unknown",
+                "reason": reason,
+                "response_language": response_language,
+                "navigation_session_id": navigation_session_id,
+            },
+        )
+        binding = binding_creation.binding
+        outbox_worker = f"navigation-start:{task_id}"
+        claimed_outbox = None
+        services = self._navigation_services()
+        normalized_scene = (
+            "in" if scene_mode == "indoor" else "out" if scene_mode == "outdoor" else None
+        )
+        try:
+            claimed_outbox = self.web_session_store.claim_outbox_item(
+                binding_creation.outbox.outbox_id,
+                worker_id=outbox_worker,
+                lease_seconds=300,
+            )
+            writer = services.task_store.find_running_target_writer(
+                date=date.strip(),
+                segments=clips,
+            )
+            if writer is not None:
+                raise NavigationDataBusyError(
+                    "an overlapping navigation data writer is already running"
+                )
+            creation = services.task_store.create_task_attempt(
+                task_id=task_id,
+                request=request,
+                target=target,
+                date=date.strip(),
+                segments=clips,
+                scene_mode=normalized_scene,
+                dry_run=self.config.navigation_dry_run,
+                web_session_id=web_session_id,
+                agentscope_session_id=navigation_session_id,
+            )
+            await self.ensure_web_session(
+                web_session_id,
+                agent_id=self.config.navigation_agent_id,
+                model=self.config.navigation_model,
+                task_id=task_id,
+                preallocated_session_id=navigation_session_id,
+            )
+            handover = getattr(self.web_session_store, "handover_response_authority", None)
+            authority = self.web_session_store.get_response_authority(active_turn_id)
+            if not callable(handover) or authority is None:
+                raise RuntimeError("turn response authority handover is unavailable")
+            handover(
+                active_turn_id,
+                expected_producer="router",
+                expected_generation=authority.generation,
+                new_producer="navigation",
+            )
+            navigation_request = _navigation_handoff_message(
+                request=request,
+                target=target,
+                date=date.strip(),
+                scene_mode=scene_mode or "unknown",
+                clips=clips,
+                reason=reason,
+                response_language=response_language,
+            )
+            await self._start_agent_run(
+                web_session_id=web_session_id,
+                agent_id=self.config.navigation_agent_id,
+                model=self.config.navigation_model,
+                message=navigation_request,
+                turn_id=active_turn_id,
+                task_id=task_id,
+                agentscope_session_id=navigation_session_id,
+            )
+            await self._publish_v1_task_state(
+                web_session_id=web_session_id,
+                task_id=task_id,
+                turn_id=active_turn_id,
+            )
+            self.web_session_store.complete_outbox(
+                claimed_outbox.outbox_id,
+                worker_id=outbox_worker,
+            )
+        except Exception as exc:
+            if claimed_outbox is not None:
+                self.web_session_store.complete_outbox(
+                    claimed_outbox.outbox_id,
+                    worker_id=outbox_worker,
+                    success=False,
+                    error=type(exc).__name__,
+                )
+            await self._handle_v1_delegation_failure(
+                web_session_id=web_session_id,
+                turn_id=active_turn_id,
+                task_id=task_id,
+                router_session_id=router_session_id,
+                response_language=response_language,
+            )
+            raise
+        self._router_terminal_sessions.add(router_session_id)
+        return {
+            "task_id": creation.task.task_id,
+            "task_ref": str(_record_value(binding, "task_ref", task_ref)),
+            "agentscope_session_id": navigation_session_id,
+        }
+
+    async def continue_navigation_agent_task_v1(
+        self,
+        *,
+        web_session_id: str,
+        router_session_id: str,
+        task_ref: str,
+        original_user_message: str,
+        intent: str,
+        response_language: str,
+        expected_task_revision: int,
+    ) -> dict[str, str]:
+        binding, task = self._owned_v1_task(web_session_id, task_ref)
+        if task.state_revision != expected_task_revision:
+            raise RuntimeError("task state revision changed; refresh before continuing")
+        if task.status in {
+            NavigationTaskStatus.COMPLETED,
+            NavigationTaskStatus.CANCELLED,
+            NavigationTaskStatus.SUPERSEDED,
+        }:
+            raise RuntimeError("the navigation task is already terminal")
+        if intent == "resume" and task.status not in {
+            NavigationTaskStatus.PAUSED,
+            NavigationTaskStatus.PAUSING,
+            NavigationTaskStatus.WAITING_USER,
+            NavigationTaskStatus.NEEDS_REPLAN,
+            NavigationTaskStatus.ACTIVE,
+        }:
+            raise RuntimeError("the navigation task cannot be resumed from its current state")
+
+        task_id = str(_record_value(binding, "task_id"))
+        navigation_session_id = str(_record_value(binding, "navigation_session_id"))
+        active_turn_id = self._active_turn_id(web_session_id)
+        if active_turn_id is None:
+            raise RuntimeError("navigation continuation requires an active turn")
+        handover = getattr(
+            self.web_session_store,
+            "handover_response_authority_with_outbox",
+            None,
+        )
+        authority = self.web_session_store.get_response_authority(active_turn_id)
+        if not callable(handover) or authority is None:
+            raise RuntimeError("turn response authority handover is unavailable")
+        _, outbox = handover(
+            active_turn_id,
+            expected_producer="router",
+            expected_generation=authority.generation,
+            new_producer="navigation",
+            kind="navigation_continue",
+            aggregate_type="navigation_task",
+            aggregate_id=task_id,
+            payload={
+                "original_user_message": original_user_message,
+                "intent": intent,
+                "response_language": response_language,
+                "navigation_session_id": navigation_session_id,
+                "task_ref": task_ref,
+                "accepted_task_revision": expected_task_revision,
+            },
+            idempotency_key=f"navigation_continue:{active_turn_id}:{task_id}",
+            web_session_id=web_session_id,
+            task_id=task_id,
+        )
+        outbox_worker = f"navigation-continue:{active_turn_id}:{id(self)}"
+        claimed_outbox = None
+        try:
+            claimed_outbox = self.web_session_store.claim_outbox_item(
+                outbox.outbox_id,
+                worker_id=outbox_worker,
+                lease_seconds=300,
+            )
+            if task.status in {
+                NavigationTaskStatus.PAUSED,
+                NavigationTaskStatus.PAUSING,
+                NavigationTaskStatus.WAITING_USER,
+                NavigationTaskStatus.NEEDS_REPLAN,
+            }:
+                task = self._navigation_task_store().update_task_for_session(
+                    task_id,
+                    web_session_id=web_session_id,
+                    agentscope_session_id=navigation_session_id,
+                    expected_state_revision=task.state_revision,
+                    status=NavigationTaskStatus.ACTIVE,
+                )
+            focus = getattr(self.web_session_store, "focus_task", None)
+            if callable(focus):
+                focus(web_session_id, task_id=task_id)
+            if _record_value(binding, "status") != "active":
+                binding = self.web_session_store.update_task_binding(
+                    task_id,
+                    expected_revision=int(_record_value(binding, "state_revision", 0)),
+                    status="active",
+                    latest_public_update="继续处理任务。",
+                )
+            await self._start_agent_run(
+                web_session_id=web_session_id,
+                agent_id=self.config.navigation_agent_id,
+                model=self.config.navigation_model,
+                message=original_user_message,
+                turn_id=active_turn_id,
+                task_id=task_id,
+                agentscope_session_id=navigation_session_id,
+            )
+            await self._publish_v1_task_state(
+                web_session_id=web_session_id,
+                task_id=task_id,
+                turn_id=active_turn_id,
+            )
+            self.web_session_store.complete_outbox(
+                claimed_outbox.outbox_id,
+                worker_id=outbox_worker,
+            )
+        except Exception as exc:
+            if claimed_outbox is not None:
+                self.web_session_store.complete_outbox(
+                    claimed_outbox.outbox_id,
+                    worker_id=outbox_worker,
+                    success=False,
+                    error=type(exc).__name__,
+                )
+            await self._handle_v1_delegation_failure(
+                web_session_id=web_session_id,
+                turn_id=active_turn_id,
+                task_id=task_id,
+                router_session_id=router_session_id,
+                response_language=response_language,
+                operation="continue",
+            )
+            raise
+        self._router_terminal_sessions.add(router_session_id)
+        return {"task_id": task_id, "task_ref": task_ref}
+
+    async def control_navigation_agent_task_v1(
+        self,
+        *,
+        web_session_id: str,
+        router_session_id: str,
+        task_ref: str,
+        action: str,
+        response_language: str,
+        expected_task_revision: int,
+    ) -> dict[str, str]:
+        binding, task = self._owned_v1_task(web_session_id, task_ref)
+        if task.state_revision != expected_task_revision:
+            raise RuntimeError("task state revision changed; refresh before controlling it")
+        task_id = str(_record_value(binding, "task_id"))
+        navigation_session_id = str(_record_value(binding, "navigation_session_id"))
+        active_turn_id = self._active_turn_id(web_session_id)
+        if active_turn_id is None:
+            raise RuntimeError("task control requires an active turn")
+        self.web_session_store.bind_conversation_agent_session_to_turn(
+            navigation_session_id,
+            active_turn_id,
+        )
+        target_status = (
+            NavigationTaskStatus.PAUSING if action == "stop" else NavigationTaskStatus.CANCELLING
+        )
+        terminal_status = (
+            NavigationTaskStatus.PAUSED if action == "stop" else NavigationTaskStatus.CANCELLED
+        )
+        updated = self._navigation_task_store().update_task_for_session(
+            task_id,
+            web_session_id=web_session_id,
+            agentscope_session_id=navigation_session_id,
+            expected_state_revision=task.state_revision,
+            status=target_status,
+        )
+        update_binding = getattr(self.web_session_store, "update_task_binding", None)
+        if callable(update_binding):
+            binding = update_binding(
+                task_id,
+                expected_revision=int(_record_value(binding, "state_revision", 0)),
+                status=target_status.value,
+                latest_public_update=(
+                    "正在安全停止当前处理。"
+                    if action == "stop"
+                    else "正在安全取消任务。"
+                ),
+            )
+        cancellation = self.run_cancellation(navigation_session_id)
+        if cancellation is not None:
+            cancellation.cancel()
+        publish_cancel = getattr(self.message_bus, "session_publish_cancel", None)
+        if callable(publish_cancel):
+            await publish_cancel(navigation_session_id)
+        if cancellation is None or not cancellation.has_background_operations:
+            updated = self._navigation_task_store().update_task_for_session(
+                task_id,
+                web_session_id=web_session_id,
+                agentscope_session_id=navigation_session_id,
+                expected_state_revision=updated.state_revision,
+                status=terminal_status,
+            )
+            if action == "cancel":
+                release = getattr(self.web_session_store, "mark_task_binding_terminal", None)
+                if callable(release):
+                    release(
+                        task_id,
+                        expected_revision=int(_record_value(binding, "state_revision", 0)),
+                        status=terminal_status.value,
+                        latest_public_update="任务已取消。",
+                    )
+            else:
+                if callable(update_binding):
+                    update_binding(
+                        task_id,
+                        expected_revision=int(_record_value(binding, "state_revision", 0)),
+                        status=terminal_status.value,
+                        latest_public_update="当前处理已停止。",
+                    )
+        elif cancellation is not None:
+            control_loop = asyncio.get_running_loop()
+            cancellation.when_background_idle(
+                lambda: self._finalize_and_publish_navigation_control_v1(
+                    task_id=task_id,
+                    web_session_id=web_session_id,
+                    navigation_session_id=navigation_session_id,
+                    action=action,
+                    loop=control_loop,
+                )
+            )
+        await self._publish_v1_task_state(
+            web_session_id=web_session_id,
+            task_id=task_id,
+            turn_id=active_turn_id,
+        )
+        await self._commit_system_controller_final(
+            turn_id=active_turn_id,
+            text=(
+                "已停止当前处理，你可以继续补充要求或稍后恢复。"
+                if action == "stop" and _is_chinese(response_language)
+                else "The current run has been stopped. You can adjust or resume it later."
+                if action == "stop"
+                else "已取消该任务。"
+                if _is_chinese(response_language)
+                else "The task has been cancelled."
+            ),
+        )
+        self._router_terminal_sessions.add(router_session_id)
+        return {"task_id": task_id, "task_ref": task_ref, "status": updated.status.value}
+
+    def _finalize_navigation_control_v1(
+        self,
+        *,
+        task_id: str,
+        web_session_id: str,
+        navigation_session_id: str,
+        action: str,
+    ) -> None:
+        """Close a pausing/cancelling task once retained side effects are safe."""
+        target = (
+            NavigationTaskStatus.PAUSED
+            if action == "stop"
+            else NavigationTaskStatus.CANCELLED
+        )
+        task = self._navigation_task_store().get_task(task_id)
+        expected = {
+            NavigationTaskStatus.PAUSING
+            if action == "stop"
+            else NavigationTaskStatus.CANCELLING
+        }
+        if task is not None and task.status in expected:
+            task = self._navigation_task_store().update_task_for_session(
+                task_id,
+                web_session_id=web_session_id,
+                agentscope_session_id=navigation_session_id,
+                expected_state_revision=task.state_revision,
+                status=target,
+            )
+        if self.web_session_store is None:
+            return
+        binding = self.web_session_store.get_task_binding(task_id)
+        if binding is None or binding.slot_state != "open":
+            return
+        if action == "cancel":
+            self.web_session_store.mark_task_binding_terminal(
+                task_id,
+                expected_revision=binding.state_revision,
+                status=target.value,
+                latest_public_update="任务已取消。",
+            )
+        else:
+            self.web_session_store.update_task_binding(
+                task_id,
+                expected_revision=binding.state_revision,
+                status=target.value,
+                latest_public_update="当前处理已停止。",
+            )
+
+    def _finalize_and_publish_navigation_control_v1(
+        self,
+        *,
+        task_id: str,
+        web_session_id: str,
+        navigation_session_id: str,
+        action: str,
+        loop: asyncio.AbstractEventLoop,
+    ) -> None:
+        self._finalize_navigation_control_v1(
+            task_id=task_id,
+            web_session_id=web_session_id,
+            navigation_session_id=navigation_session_id,
+            action=action,
+        )
+        if loop.is_closed():
+            return
+        loop.call_soon_threadsafe(
+            asyncio.create_task,
+            self._publish_v1_task_state(
+                web_session_id=web_session_id,
+                task_id=task_id,
+                turn_id=None,
+            ),
+        )
+
+    def _owned_v1_task(self, web_session_id: str, task_ref: str) -> tuple[Any, Any]:
+        if self.web_session_store is None:
+            raise RuntimeError("Web session store is unavailable")
+        getter = getattr(self.web_session_store, "get_task_binding_by_ref", None)
+        binding = getter(web_session_id=web_session_id, task_ref=task_ref) if callable(getter) else None
+        if binding is None:
+            raise RuntimeError("the task reference is unavailable in this conversation")
+        task_id = str(_record_value(binding, "task_id"))
+        task = self._navigation_task_store().get_task(task_id)
+        if task is None or task.created_by_web_session_id != web_session_id:
+            raise RuntimeError("the navigation task is unavailable")
+        return binding, task
+
+    def consume_router_terminal_tool(self, *, router_session_id: str, tool_name: str) -> bool:
+        if router_session_id not in self._router_terminal_sessions:
+            return False
+        self._router_terminal_sessions.discard(router_session_id)
+        return True
+
+    def safe_router_tool_error(self, error: Exception, *, action: str) -> dict[str, Any]:
+        message = str(error)
+        known = (
+            "revision" in message
+            or "already" in message
+            or "requires" in message
+            or "unavailable" in message
+            or isinstance(error, (NavigationTaskEntryError, NavigationDataBusyError))
+        )
+        return {
+            "ok": False,
+            "started": False,
+            "error_type": f"navigation_{action}_rejected" if known else "navigation_runtime_error",
+            "message": message[:240] if known else "DataPilot 暂时无法执行该任务操作，请稍后重试。",
+        }
+
+    def router_context_envelope(self, web_session_id: str) -> dict[str, Any]:
+        """Build a bounded, volatile Router context without specialist history."""
+        if not self._is_contract_v1(web_session_id) or self.web_session_store is None:
+            return {"contract_version": 0}
+        focus_getter = getattr(self.web_session_store, "get_focused_task_binding", None)
+        list_getter = getattr(self.web_session_store, "list_task_bindings", None)
+        focus_record = focus_getter(web_session_id) if callable(focus_getter) else None
+        focus_state_getter = getattr(self.web_session_store, "get_task_focus", None)
+        focus_state = focus_state_getter(web_session_id) if callable(focus_state_getter) else None
+        focus_generation = int(_record_value(focus_state, "generation", 0) or 0)
+        focused = self._task_summary(focus_record, max_chars=1200) if focus_record else None
+        binding_records = (
+            list_getter(web_session_id)[:8]
+            if callable(list_getter)
+            else []
+        )
+        attention = []
+        focused_ref = _record_value(focus_record, "task_ref") if focus_record else None
+        for record in binding_records:
+            if _record_value(record, "task_ref") == focused_ref:
+                continue
+            summary = self._task_summary(record, max_chars=300)
+            if summary is not None:
+                attention.append(summary)
+            if len(attention) >= 3:
+                break
+        interaction = self.pending_interaction_snapshot(web_session_id)
+        if interaction is not None:
+            interaction = _bounded_mapping(interaction, 600)
+        latest = str((focused or {}).get("latest_public_update") or "")[:500]
+        revision_source = json.dumps(
+            {
+                "focus_generation": focus_generation,
+                "focused_revision": (focused or {}).get("state_revision"),
+                "interaction_revision": (interaction or {}).get("interaction_revision"),
+                "latest": latest,
+            },
+            ensure_ascii=False,
+            sort_keys=True,
+        )
+        envelope: dict[str, Any] = {
+            "contract_version": 1,
+            "context_revision": hashlib.sha256(revision_source.encode("utf-8")).hexdigest()[:16],
+            "focus_generation": focus_generation,
+            "focused_task_ref": focused_ref,
+            "focused_task_summary": focused,
+            "pending_interaction_summary": interaction,
+            "latest_public_update": latest or None,
+            "attention_tasks": attention,
+        }
+        # The individual budgets above normally keep this below 4k. If labels or
+        # target text are unusually large, shed attention and optional prose first.
+        while len(json.dumps(envelope, ensure_ascii=False)) > 4000 and envelope["attention_tasks"]:
+            envelope["attention_tasks"].pop()
+        if len(json.dumps(envelope, ensure_ascii=False)) > 4000:
+            envelope["latest_public_update"] = None
+        if len(json.dumps(envelope, ensure_ascii=False)) > 4000 and focused is not None:
+            envelope["focused_task_summary"] = _bounded_mapping(focused, 700)
+        return envelope
+
+    def session_task_snapshots(self, web_session_id: str) -> list[dict[str, Any]]:
+        if not self._is_contract_v1(web_session_id) or self.web_session_store is None:
+            return []
+        list_getter = getattr(self.web_session_store, "list_task_bindings", None)
+        records = list_getter(web_session_id)[:20] if callable(list_getter) else []
+        return [
+            summary
+            for record in records
+            if (summary := self._task_summary(record, max_chars=1600)) is not None
+        ]
+
+    async def _publish_v1_task_state(
+        self,
+        *,
+        web_session_id: str,
+        task_id: str,
+        turn_id: str | None,
+    ) -> None:
+        if self.web_session_store is None:
+            return
+        binding = self.web_session_store.get_task_binding(task_id)
+        summary = self._task_summary(binding, max_chars=1200) if binding is not None else None
+        if summary is None:
+            return
+        record = self.web_session_store.append_timeline_event(
+            web_session_id,
+            {
+                "type": "task_state_updated",
+                "turn_id": turn_id,
+                "payload": summary,
+            },
+        )
+        publish = getattr(self.web_event_bridge, "publish_records", None)
+        if callable(publish):
+            await publish(web_session_id, [record])
+
+    def pending_interaction_snapshot(self, web_session_id: str) -> dict[str, Any] | None:
+        if self.web_session_store is None:
+            return None
+        getter = getattr(self.web_session_store, "get_open_interaction", None)
+        interaction = getter(web_session_id=web_session_id) if callable(getter) else None
+        if interaction is None:
+            return None
+        options = _record_value(interaction, "options", [])
+        if isinstance(options, str):
+            try:
+                options = json.loads(options)
+            except json.JSONDecodeError:
+                options = []
+        return {
+            "interaction_id": _record_value(interaction, "interaction_id"),
+            "task_ref": _record_value(interaction, "task_ref"),
+            "kind": _record_value(interaction, "kind"),
+            "blocking": bool(_record_value(interaction, "blocking", False)),
+            "risk": _record_value(interaction, "risk", "normal"),
+            "title": _safe_context_text(_record_value(interaction, "title", ""), 120),
+            "summary": _safe_context_text(_record_value(interaction, "summary", ""), 400),
+            "options": options if isinstance(options, list) else [],
+            "interaction_revision": int(_record_value(interaction, "revision", 1)),
+            "expected_task_revision": int(_record_value(interaction, "expected_task_revision", 0)),
+            "expires_at": _record_value(interaction, "expires_at"),
+        }
+
+    def _create_v1_interaction(
+        self,
+        *,
+        web_session_id: str,
+        turn_id: str,
+        task_id: str,
+        task_ref: str,
+        task_revision: int,
+        raw_payload: dict[str, Any],
+    ) -> dict[str, Any]:
+        decision_type = str(raw_payload.get("decision_type") or "confirmation")
+        calibration = decision_type == "camera_params"
+        identity = {
+            key: raw_payload.get(key)
+            for key in ("request_id", "reply_id", "tool_call_id", "plan_id", "step_id")
+            if raw_payload.get(key) is not None
+        }
+        identity.update({"task_id": task_id, "turn_id": turn_id})
+        interaction_digest = hashlib.sha256(
+            json.dumps(identity, ensure_ascii=False, sort_keys=True).encode("utf-8")
+        ).hexdigest()[:24]
+        interaction = {
+            "interaction_id": f"interaction_{interaction_digest}",
+            "web_session_id": web_session_id,
+            "turn_id": turn_id,
+            "task_id": task_id,
+            "task_ref": task_ref,
+            "kind": "calibration_preview" if calibration else "high_risk_confirmation",
+            "blocking": True,
+            "risk": "high",
+            "title": "确认标定参数" if calibration else "确认关键操作",
+            "summary": sanitize_progress_text(raw_payload.get("summary"))
+            or "继续前需要你的明确确认。",
+            "options": [
+                {"option_id": "confirm", "label": "确认并继续", "destructive": True},
+                {"option_id": "reject", "label": "停止", "destructive": False},
+                {"option_id": "adjust", "label": "返回修改", "destructive": False},
+            ],
+            "interaction_revision": 1,
+            "expected_task_revision": task_revision,
+            "expires_at": None,
+        }
+        creator = getattr(self.web_session_store, "create_interaction", None)
+        if callable(creator):
+            creator(
+                web_session_id,
+                interaction_id=interaction["interaction_id"],
+                task_ref=task_ref,
+                kind=interaction["kind"],
+                blocking=interaction["blocking"],
+                risk=interaction["risk"],
+                title=interaction["title"],
+                summary=interaction["summary"],
+                options=interaction["options"],
+                expected_task_revision=task_revision,
+                origin_turn_id=(
+                    None if turn_id.startswith("background:") else turn_id
+                ),
+                expires_at=interaction["expires_at"],
+                private_payload={
+                    key: raw_payload.get(key)
+                    for key in (
+                        "request_id",
+                        "reply_id",
+                        "tool_call_id",
+                        "plan_id",
+                        "step_id",
+                    )
+                    if raw_payload.get(key) is not None
+                },
+            )
+        return interaction
+
+    def _task_summary(self, binding: Any, *, max_chars: int) -> dict[str, Any] | None:
+        task_id = _record_value(binding, "task_id")
+        if not isinstance(task_id, str):
+            return None
+        task = self._navigation_task_store().get_task(task_id)
+        if task is None:
+            return None
+        status = task.status.value
+        phase = task.accepted_plan_phase or (
+            "waiting_input" if status == "waiting_user" else "preparing"
+        )
+        wait_cause = {
+            "waiting_user": "等待你补充信息或作出选择",
+            "paused": "任务已暂停",
+            "pausing": "正在安全停止",
+            "needs_replan": "现有方案需要调整",
+            "cancelling": "正在安全取消",
+        }.get(status)
+        available_actions = {
+            "active": ["stop", "cancel"],
+            "waiting_user": ["provide_input", "cancel"],
+            "paused": ["resume", "cancel"],
+            "pausing": ["cancel"],
+            "needs_replan": ["adjust", "cancel"],
+        }.get(status, [])
+        latest = _record_value(binding, "latest_public_update")
+        safe_clips = [
+            safe
+            for clip in list(task.segments or [])
+            if (safe := _safe_context_text(sanitize_progress_text(clip), 160))
+        ]
+        summary = {
+            "task_ref": _record_value(binding, "task_ref"),
+            "domain": "navigation",
+            "target": {
+                "date": task.date,
+                "clips": safe_clips,
+                "scene_mode": task.scene_mode,
+            },
+            "status": status,
+            "phase": phase,
+            "wait_cause": wait_cause,
+            "latest_public_update": _safe_context_text(latest or "", 500) or None,
+            "available_actions": available_actions,
+            "state_revision": task.state_revision,
+            "started_at": task.created_at,
+            "updated_at": task.updated_at,
+        }
+        return _bounded_mapping(summary, max_chars)
+
+    async def _handle_v1_delegation_failure(
+        self,
+        *,
+        web_session_id: str,
+        turn_id: str,
+        task_id: str,
+        router_session_id: str,
+        response_language: str,
+        operation: str = "start",
+    ) -> None:
+        task = self._navigation_task_store().get_task(task_id)
+        binding = self.web_session_store.get_task_binding(task_id)
+        if task is not None and task.status not in {
+            NavigationTaskStatus.COMPLETED,
+            NavigationTaskStatus.FAILED,
+            NavigationTaskStatus.CANCELLED,
+            NavigationTaskStatus.SUPERSEDED,
+        }:
+            task = self._navigation_task_store().update_task_for_session(
+                task_id,
+                web_session_id=web_session_id,
+                agentscope_session_id=(
+                    binding.navigation_session_id if binding is not None else None
+                ),
+                expected_state_revision=task.state_revision,
+                status=(
+                    NavigationTaskStatus.FAILED
+                    if operation == "start"
+                    else NavigationTaskStatus.NEEDS_REPLAN
+                ),
+            )
+        release = getattr(self.web_session_store, "mark_task_binding_terminal", None)
+        if callable(release):
+            if binding is not None and binding.slot_state == "open":
+                if operation == "start":
+                    release(
+                        task_id,
+                        expected_revision=binding.state_revision,
+                        status="failed",
+                        latest_public_update="任务未能安全启动。",
+                    )
+                else:
+                    self.web_session_store.update_task_binding(
+                        task_id,
+                        expected_revision=binding.state_revision,
+                        status="needs_replan",
+                        latest_public_update="任务未能安全继续，状态已保留。",
+                    )
+        text = (
+            "导航数据任务未能安全启动，请稍后重试。"
+            if operation == "start" and _is_chinese(response_language)
+            else "导航数据任务未能安全继续，任务状态已保留。"
+            if _is_chinese(response_language)
+            else "The navigation task could not be started safely. Please try again."
+            if operation == "start"
+            else "The navigation task could not continue safely; its state was preserved."
+        )
+        await self._publish_v1_task_state(
+            web_session_id=web_session_id,
+            task_id=task_id,
+            turn_id=turn_id,
+        )
+        await self._commit_system_controller_final(turn_id=turn_id, text=text)
+        self._router_terminal_sessions.add(router_session_id)
+
+    async def _commit_system_controller_final(self, *, turn_id: str, text: str) -> None:
+        if self.web_session_store is None:
+            return
+        takeover = getattr(self.web_session_store, "takeover_response_authority", None)
+        commit = getattr(self.web_session_store, "commit_authorized_final", None)
+        if not callable(takeover) or not callable(commit):
+            return
+        current = self.web_session_store.get_response_authority(turn_id)
+        if current is None or current.lease_state != "open":
+            return
+        authority = (
+            current
+            if current.producer == "system_controller"
+            else takeover(
+                turn_id,
+                expected_producer=current.producer,
+                expected_generation=current.generation,
+            )
+        )
+        committed = commit(
+            turn_id,
+            producer="system_controller",
+            response_generation=authority.generation,
+            text=text,
+        )
+        publish = getattr(self.web_event_bridge, "publish_records", None)
+        if callable(publish):
+            await publish(committed.message.session_id, list(committed.events))
+
     async def _start_agent_run(
         self,
         *,
@@ -325,27 +1310,63 @@ class AgentScopeRuntime:
         model: str,
         message: str,
         turn_id: str | None = None,
+        task_id: str | None = None,
+        agentscope_session_id: str | None = None,
     ) -> str:
         chat_service = self.app.state.chat_service
         session_id = await self.ensure_web_session(
             web_session_id,
             agent_id=agent_id,
             model=model,
+            task_id=task_id,
+            preallocated_session_id=agentscope_session_id,
         )
         tail_cursor = await self._event_log_tail_cursor(session_id)
         pending_reply_id: str | None = None
+        internal_run_id: str | None = None
         if turn_id is not None and self.web_session_store is not None:
-            self.web_session_store.bind_agentscope_session_to_turn(
-                web_session_id=web_session_id,
-                agentscope_session_id=session_id,
-                turn_id=turn_id,
+            bind_v1 = getattr(
+                self.web_session_store,
+                "bind_conversation_agent_session_to_turn",
+                None,
             )
+            if self._is_contract_v1(web_session_id) and callable(bind_v1):
+                bind_v1(session_id, turn_id)
+            else:
+                self.web_session_store.bind_agentscope_session_to_turn(
+                    web_session_id=web_session_id,
+                    agentscope_session_id=session_id,
+                    turn_id=turn_id,
+                )
             pending_reply_id = self.web_session_store.register_pending_reply(
                 turn_id=turn_id,
                 agentscope_session_id=session_id,
                 agent_id=agent_id,
                 source="user" if message else "resume",
             )
+            if self._is_contract_v1(web_session_id):
+                producer = (
+                    "navigation"
+                    if agent_id == self.config.navigation_agent_id
+                    else "router"
+                )
+                parent = (
+                    self.web_session_store.get_latest_turn_run(
+                        turn_id,
+                        producer="router",
+                    )
+                    if producer == "navigation"
+                    else None
+                )
+                internal_run_id = f"turn_run_{uuid4().hex}"
+                self.web_session_store.create_turn_run(
+                    run_id=internal_run_id,
+                    turn_id=turn_id,
+                    producer=producer,
+                    task_id=task_id,
+                    parent_run_id=parent.run_id if parent is not None else None,
+                    agentscope_session_id=session_id,
+                )
 
         if agent_id == self.config.navigation_agent_id:
             anchor = self._navigation_durable_state_anchor(
@@ -372,10 +1393,33 @@ class AgentScopeRuntime:
                             input_msg=UserMsg(name="user", content=message),
                         )
             except asyncio.CancelledError:
+                if internal_run_id is not None and self.web_session_store is not None:
+                    self.web_session_store.update_turn_run(
+                        internal_run_id,
+                        status="interrupted",
+                    )
                 raise
             except Exception:
+                if internal_run_id is not None and self.web_session_store is not None:
+                    self.web_session_store.update_turn_run(
+                        internal_run_id,
+                        status="failed",
+                    )
+                if task_id is not None and self._is_contract_v1(web_session_id):
+                    await self._mark_v1_navigation_run_failed(
+                        web_session_id=web_session_id,
+                        task_id=task_id,
+                        navigation_session_id=session_id,
+                        turn_id=turn_id,
+                    )
                 await self._settle_failed_reply(pending_reply_id)
                 raise
+            else:
+                if internal_run_id is not None and self.web_session_store is not None:
+                    self.web_session_store.update_turn_run(
+                        internal_run_id,
+                        status="completed",
+                    )
             finally:
                 self.clear_run_cancellation(session_id, cancellation)
 
@@ -384,6 +1428,11 @@ class AgentScopeRuntime:
         except Exception:
             if pending_reply_id is not None and self.web_session_store is not None:
                 self.web_session_store.discard_pending_reply(pending_reply_id)
+            if internal_run_id is not None and self.web_session_store is not None:
+                self.web_session_store.update_turn_run(
+                    internal_run_id,
+                    status="failed",
+                )
             if previous_cancellation is not None:
                 self.register_run_cancellation(session_id, previous_cancellation)
             else:
@@ -417,9 +1466,123 @@ class AgentScopeRuntime:
         if callable(bridge_publish):
             await bridge_publish(records[0].session_id, records)
 
+    async def _mark_v1_navigation_run_failed(
+        self,
+        *,
+        web_session_id: str,
+        task_id: str,
+        navigation_session_id: str,
+        turn_id: str | None,
+    ) -> None:
+        task = self._navigation_task_store().get_task(task_id)
+        terminal = {
+            NavigationTaskStatus.COMPLETED,
+            NavigationTaskStatus.FAILED,
+            NavigationTaskStatus.CANCELLED,
+            NavigationTaskStatus.SUPERSEDED,
+        }
+        if task is not None and task.status not in terminal:
+            task = self._navigation_task_store().update_task_for_session(
+                task_id,
+                web_session_id=web_session_id,
+                agentscope_session_id=navigation_session_id,
+                expected_state_revision=task.state_revision,
+                status=NavigationTaskStatus.FAILED,
+            )
+        if self.web_session_store is not None:
+            binding = self.web_session_store.get_task_binding(task_id)
+            if binding is not None and binding.slot_state == "open":
+                self.web_session_store.mark_task_binding_terminal(
+                    task_id,
+                    expected_revision=binding.state_revision,
+                    status="failed",
+                    latest_public_update="任务运行异常，已安全结束。",
+                )
+        await self._publish_v1_task_state(
+            web_session_id=web_session_id,
+            task_id=task_id,
+            turn_id=turn_id,
+        )
+
     async def interrupt_web_session(self, *, web_session_id: str) -> bool:
         session_ids: list[str] = []
         active_turn_id = self._active_turn_id(web_session_id)
+        if (
+            active_turn_id is not None
+            and self._is_contract_v1(web_session_id)
+            and self.web_session_store is not None
+        ):
+            navigation_mapping = next(
+                (
+                    mapping
+                    for mapping in self.web_session_store.list_conversation_agent_sessions(
+                        web_session_id
+                    )
+                    if mapping.agent_role == "navigation"
+                    and mapping.active_turn_id == active_turn_id
+                    and mapping.task_id is not None
+                ),
+                None,
+            )
+            authority = self.web_session_store.get_response_authority(active_turn_id)
+            if navigation_mapping is not None and authority is not None:
+                task = self._navigation_task_store().get_task(navigation_mapping.task_id)
+                binding = self.web_session_store.get_task_binding(navigation_mapping.task_id)
+                if task is not None and binding is not None:
+                    if task.status not in {
+                        NavigationTaskStatus.PAUSING,
+                        NavigationTaskStatus.PAUSED,
+                    }:
+                        task = self._navigation_task_store().update_task_for_session(
+                            task.task_id,
+                            web_session_id=web_session_id,
+                            agentscope_session_id=navigation_mapping.agentscope_session_id,
+                            expected_state_revision=task.state_revision,
+                            status=NavigationTaskStatus.PAUSING,
+                        )
+                    if binding.status not in {"pausing", "paused"}:
+                        binding = self.web_session_store.update_task_binding(
+                            binding.task_id,
+                            expected_revision=binding.state_revision,
+                            status="pausing",
+                            latest_public_update="正在安全停止当前处理。",
+                        )
+                    cancellation = self.run_cancellation(
+                        navigation_mapping.agentscope_session_id
+                    )
+                    if cancellation is not None:
+                        cancellation.cancel()
+                    publish_cancel = getattr(self.message_bus, "session_publish_cancel", None)
+                    if callable(publish_cancel):
+                        await publish_cancel(navigation_mapping.agentscope_session_id)
+                    if cancellation is None or not cancellation.has_background_operations:
+                        self._finalize_navigation_control_v1(
+                            task_id=task.task_id,
+                            web_session_id=web_session_id,
+                            navigation_session_id=navigation_mapping.agentscope_session_id,
+                            action="stop",
+                        )
+                    else:
+                        control_loop = asyncio.get_running_loop()
+                        cancellation.when_background_idle(
+                            lambda: self._finalize_and_publish_navigation_control_v1(
+                                task_id=task.task_id,
+                                web_session_id=web_session_id,
+                                navigation_session_id=navigation_mapping.agentscope_session_id,
+                                action="stop",
+                                loop=control_loop,
+                            )
+                        )
+                    await self._publish_v1_task_state(
+                        web_session_id=web_session_id,
+                        task_id=task.task_id,
+                        turn_id=active_turn_id,
+                    )
+                    await self._commit_system_controller_final(
+                        turn_id=active_turn_id,
+                        text="已停止当前处理，你可以继续补充要求或稍后恢复。",
+                    )
+                    return True
         if self.web_session_store is not None and active_turn_id is not None:
             session_ids = [
                 mapping.agentscope_session_id
@@ -427,6 +1590,14 @@ class AgentScopeRuntime:
                 if mapping.web_session_id == web_session_id
                 and mapping.active_turn_id == active_turn_id
             ]
+            if self._is_contract_v1(web_session_id):
+                session_ids.extend(
+                    mapping.agentscope_session_id
+                    for mapping in self.web_session_store.list_conversation_agent_sessions(
+                        web_session_id
+                    )
+                    if mapping.active_turn_id == active_turn_id
+                )
         if not session_ids:
             mapped = self._web_session_mapping(web_session_id)
             if mapped is not None:
@@ -612,7 +1783,230 @@ class AgentScopeRuntime:
             web_session_id=web_session_id,
         )
 
-    async def submit_human_decision(self, *, web_session_id: str, decision: dict[str, Any]) -> bool:
+    def interaction_task_revision_v1(self, *, web_session_id: str, task_id: str) -> int:
+        task = self._navigation_task_store().get_task(task_id)
+        if task is None or task.created_by_web_session_id != web_session_id:
+            raise RuntimeError("interaction task is unavailable")
+        return task.state_revision
+
+    def interaction_navigation_db_path_v1(self) -> str:
+        return str(self._navigation_task_store().db_path)
+
+    async def submit_interaction_response_v1(
+        self,
+        *,
+        web_session_id: str,
+        interaction: Any,
+        option_ids: list[str],
+        turn_id: str,
+    ) -> bool:
+        """Resume the task-scoped specialist directly after a durable UI choice."""
+        if not self._is_contract_v1(web_session_id) or self.web_session_store is None:
+            raise RuntimeError("structured interactions require contract v1")
+        if _record_value(interaction, "web_session_id") != web_session_id:
+            raise RuntimeError("interaction does not belong to this conversation")
+        task_id = str(_record_value(interaction, "task_id", ""))
+        binding = self.web_session_store.get_task_binding(task_id)
+        if binding is None:
+            raise RuntimeError("interaction task is unavailable")
+        navigation_session_id = binding.navigation_session_id
+        private_payload = dict(_record_value(interaction, "private_payload", {}) or {})
+        selected = option_ids[0] if option_ids else ""
+        action = {
+            "confirm": "confirm",
+            "reject": "stop",
+            "adjust": "guide",
+        }.get(selected)
+        if action is None:
+            raise RuntimeError("interaction option is not supported by this specialist")
+        required = ("request_id", "tool_call_id", "reply_id")
+        if any(not isinstance(private_payload.get(key), str) for key in required):
+            await self._commit_system_controller_final(
+                turn_id=turn_id,
+                text="当前选择无法安全恢复，请重新发起任务操作。",
+            )
+            return False
+        transfer_reply = getattr(
+            self.web_session_store,
+            "transfer_waiting_reply_to_turn",
+            None,
+        )
+        if not callable(transfer_reply):
+            raise RuntimeError("interaction reply transfer is unavailable")
+        transfer_reply(
+            agentscope_session_id=navigation_session_id,
+            reply_id=str(private_payload["reply_id"]),
+            turn_id=turn_id,
+        )
+        self.web_session_store.bind_conversation_agent_session_to_turn(
+            navigation_session_id,
+            turn_id,
+        )
+        decision = {
+            key: private_payload[key]
+            for key in ("request_id", "tool_call_id", "reply_id", "plan_id", "step_id")
+            if isinstance(private_payload.get(key), str)
+        }
+        decision["action"] = action
+        if action == "guide":
+            decision["text"] = "请返回修改当前方案，不要执行当前参数。"
+        accepted = await self.submit_human_decision(
+            web_session_id=web_session_id,
+            decision=decision,
+            agentscope_session_id_override=navigation_session_id,
+        )
+        if not accepted:
+            await self._commit_system_controller_final(
+                turn_id=turn_id,
+                text="该选择未能继续执行，请根据最新任务状态重试。",
+            )
+            return False
+        task = self._navigation_task_store().get_task(task_id)
+        if task is not None and task.status == NavigationTaskStatus.WAITING_USER:
+            resumed_status = (
+                NavigationTaskStatus.PAUSED
+                if action == "stop"
+                else NavigationTaskStatus.ACTIVE
+            )
+            self._navigation_task_store().update_task_for_session(
+                task_id,
+                web_session_id=web_session_id,
+                agentscope_session_id=navigation_session_id,
+                expected_state_revision=task.state_revision,
+                status=resumed_status,
+            )
+        if binding.slot_state == "open":
+            self.web_session_store.update_task_binding(
+                task_id,
+                expected_revision=binding.state_revision,
+                status="paused" if action == "stop" else "active",
+                latest_public_update=(
+                    "已按你的选择停止当前处理。"
+                    if action == "stop"
+                    else "已收到你的选择，继续处理。"
+                ),
+            )
+        self.web_session_store.focus_task(web_session_id, task_id=task_id)
+        await self._publish_v1_task_state(
+            web_session_id=web_session_id,
+            task_id=task_id,
+            turn_id=turn_id,
+        )
+        return True
+
+    async def deliver_interaction_response_v1(self, interaction_id: str) -> bool:
+        """Claim and durably deliver one resolved interaction response."""
+        if self.web_session_store is None:
+            raise RuntimeError("Web session store is unavailable")
+        interaction = self.web_session_store.get_interaction(interaction_id)
+        if interaction is None:
+            raise RuntimeError("interaction is unavailable")
+        outbox = self.web_session_store.get_outbox_by_idempotency_key(
+            f"navigation_resume:{interaction_id}:{interaction.revision}"
+        )
+        if outbox is None:
+            raise RuntimeError("interaction resume outbox is unavailable")
+        if outbox.status == "completed":
+            return True
+        if outbox.status == "failed":
+            return False
+        worker_id = f"interaction-resume:{interaction_id}:{id(self)}"
+        claimed = self.web_session_store.claim_outbox_item(
+            outbox.outbox_id,
+            worker_id=worker_id,
+            lease_seconds=120,
+        )
+        return await self._process_claimed_interaction_resume_v1(
+            claimed,
+            worker_id=worker_id,
+        )
+
+    async def _process_claimed_interaction_resume_v1(
+        self,
+        item: Any,
+        *,
+        worker_id: str,
+    ) -> bool:
+        try:
+            interaction_id = str(item.payload.get("interaction_id") or "")
+            interaction = self.web_session_store.get_interaction(interaction_id)
+            option_ids = list(item.payload.get("option_ids") or [])
+            if interaction is None or not option_ids or not item.turn_id:
+                raise RuntimeError("interaction resume payload is incomplete")
+            accepted = await self.submit_interaction_response_v1(
+                web_session_id=str(item.web_session_id or ""),
+                interaction=interaction,
+                option_ids=[str(value) for value in option_ids],
+                turn_id=str(item.turn_id),
+            )
+            self.web_session_store.complete_outbox(
+                item.outbox_id,
+                worker_id=worker_id,
+                success=accepted,
+                error=None if accepted else "interaction_not_accepted",
+            )
+            return accepted
+        except Exception as exc:
+            exhausted = int(_record_value(item, "attempts", 0)) >= 3
+            retry_at = (
+                None
+                if exhausted
+                else (datetime.now(UTC) + timedelta(seconds=1)).isoformat(
+                    timespec="milliseconds"
+                )
+            )
+            self.web_session_store.complete_outbox(
+                item.outbox_id,
+                worker_id=worker_id,
+                success=False,
+                error=type(exc).__name__,
+                retry_at=retry_at,
+            )
+            if exhausted and item.task_id and item.web_session_id and item.turn_id:
+                task = self._navigation_task_store().get_task(item.task_id)
+                binding = self.web_session_store.get_task_binding(item.task_id)
+                if task is not None and task.status not in {
+                    NavigationTaskStatus.COMPLETED,
+                    NavigationTaskStatus.CANCELLED,
+                    NavigationTaskStatus.FAILED,
+                    NavigationTaskStatus.SUPERSEDED,
+                }:
+                    self._navigation_task_store().update_task_for_session(
+                        task.task_id,
+                        web_session_id=item.web_session_id,
+                        agentscope_session_id=(
+                            binding.navigation_session_id
+                            if binding is not None
+                            else None
+                        ),
+                        expected_state_revision=task.state_revision,
+                        status=NavigationTaskStatus.NEEDS_REPLAN,
+                    )
+                if binding is not None and binding.slot_state == "open":
+                    self.web_session_store.update_task_binding(
+                        binding.task_id,
+                        expected_revision=binding.state_revision,
+                        status="needs_replan",
+                        latest_public_update="该选择未能恢复任务，需要重新规划。",
+                    )
+                await self._publish_v1_task_state(
+                    web_session_id=item.web_session_id,
+                    task_id=item.task_id,
+                    turn_id=item.turn_id,
+                )
+                await self._commit_system_controller_final(
+                    turn_id=item.turn_id,
+                    text="该选择未能安全恢复，任务状态已保留，请重新调整。",
+                )
+            raise
+
+    async def submit_human_decision(
+        self,
+        *,
+        web_session_id: str,
+        decision: dict[str, Any],
+        agentscope_session_id_override: str | None = None,
+    ) -> bool:
         plan_id = decision.get("plan_id")
         step_id = decision.get("step_id")
         plan_bound_handoff = isinstance(plan_id, str) and isinstance(step_id, str)
@@ -636,7 +2030,11 @@ class AgentScopeRuntime:
                         "Web session"
                     )
                 durable_agentscope_session_id = task.agentscope_session_id
-        mapped = self._web_session_mapping(web_session_id)
+        mapped = (
+            (self.config.navigation_agent_id, agentscope_session_id_override)
+            if agentscope_session_id_override is not None
+            else self._web_session_mapping(web_session_id)
+        )
         if mapped is None:
             if (
                 plan_store is not None
@@ -1274,6 +2672,7 @@ class AgentScopeRuntime:
             now = loop.time()
             event_loop_lag_seconds = max(0.0, now - expected_wakeup)
             try:
+                await self.recover_contract_v1_outbox_once()
                 await self.record_recovery_diagnostics_once(
                     event_loop_lag_seconds=event_loop_lag_seconds,
                 )
@@ -1283,6 +2682,351 @@ class AgentScopeRuntime:
                 _logger.exception("AgentScope wakeup recovery loop failed.")
             expected_wakeup = loop.time() + interval_secs
             await asyncio.sleep(interval_secs)
+
+    async def recover_contract_v1_outbox_once(self, *, max_count: int = 16) -> int:
+        """Recover accepted navigation starts left between saga boundaries."""
+        if self.web_session_store is None:
+            return 0
+        recovered_controls = await self._recover_contract_v1_control_states_once()
+        worker_id = f"contract-v1-recovery:{id(self)}"
+        items = self.web_session_store.claim_outbox(
+            worker_id=worker_id,
+            kinds=[
+                "navigation_start",
+                "navigation_continue",
+                "navigation_resume",
+                "system_turn",
+            ],
+            limit=max_count,
+            lease_seconds=300,
+        )
+        recovered = recovered_controls
+        for item in items:
+            try:
+                if item.kind == "navigation_resume":
+                    if await self._process_claimed_interaction_resume_v1(
+                        item,
+                        worker_id=worker_id,
+                    ):
+                        recovered += 1
+                    continue
+                if item.kind == "system_turn":
+                    if item.web_session_id is None:
+                        raise RuntimeError("deferred System Turn has no Web session")
+                    if self.web_session_store.get_active_turn(item.web_session_id) is not None:
+                        retry_at = (datetime.now(UTC) + timedelta(seconds=1)).isoformat(
+                            timespec="milliseconds"
+                        )
+                        self.web_session_store.complete_outbox(
+                            item.outbox_id,
+                            worker_id=worker_id,
+                            success=False,
+                            error="system_turn_deferred",
+                            retry_at=retry_at,
+                        )
+                        continue
+                    records = self.web_session_store.append_projected_event_batch(
+                        web_session_id=item.web_session_id,
+                        agentscope_session_id=str(
+                            item.payload.get("agentscope_session_id") or ""
+                        ),
+                        entry_id=str(item.payload.get("entry_id") or ""),
+                        events=list(item.payload.get("events") or []),
+                        raw_event_type=item.payload.get("raw_event_type"),
+                        reply_id=item.payload.get("reply_id"),
+                        allow_system_turn_defer=False,
+                    )
+                    publish = getattr(self.web_event_bridge, "publish_records", None)
+                    if callable(publish) and records:
+                        await publish(item.web_session_id, records)
+                    self.web_session_store.complete_outbox(
+                        item.outbox_id,
+                        worker_id=worker_id,
+                    )
+                    recovered += 1
+                    continue
+                if item.kind == "navigation_continue":
+                    binding = self.web_session_store.get_task_binding(
+                        str(item.task_id or "")
+                    )
+                    if binding is None or not item.turn_id:
+                        raise RuntimeError("navigation continuation binding is unavailable")
+                    authority = self.web_session_store.get_response_authority(item.turn_id)
+                    if authority is None:
+                        raise RuntimeError("navigation continuation authority is unavailable")
+                    if authority.lease_state == "closed":
+                        self.web_session_store.complete_outbox(
+                            item.outbox_id,
+                            worker_id=worker_id,
+                        )
+                        recovered += 1
+                        continue
+                    if authority.producer != "navigation":
+                        raise RuntimeError("navigation continuation lost response authority")
+                    task = self._navigation_task_store().get_task(binding.task_id)
+                    if task is None:
+                        raise RuntimeError("navigation continuation task is unavailable")
+                    if task.status in {
+                        NavigationTaskStatus.PAUSED,
+                        NavigationTaskStatus.PAUSING,
+                        NavigationTaskStatus.WAITING_USER,
+                        NavigationTaskStatus.NEEDS_REPLAN,
+                    }:
+                        task = self._navigation_task_store().update_task_for_session(
+                            task.task_id,
+                            web_session_id=binding.web_session_id,
+                            agentscope_session_id=binding.navigation_session_id,
+                            expected_state_revision=task.state_revision,
+                            status=NavigationTaskStatus.ACTIVE,
+                        )
+                    if binding.status != "active":
+                        binding = self.web_session_store.update_task_binding(
+                            binding.task_id,
+                            expected_revision=binding.state_revision,
+                            status="active",
+                            latest_public_update="继续处理任务。",
+                        )
+                    await self.ensure_web_session(
+                        binding.web_session_id,
+                        agent_id=self.config.navigation_agent_id,
+                        model=self.config.navigation_model,
+                        task_id=binding.task_id,
+                        preallocated_session_id=binding.navigation_session_id,
+                    )
+                    existing_run = self.web_session_store.get_latest_turn_run(
+                        item.turn_id,
+                        producer="navigation",
+                    )
+                    local_active = self._is_local_agent_run_active(
+                        binding.navigation_session_id
+                    )
+                    if (
+                        existing_run is not None
+                        and existing_run.status == "running"
+                        and not local_active
+                    ):
+                        self.web_session_store.update_turn_run(
+                            existing_run.run_id,
+                            status="interrupted",
+                        )
+                        existing_run = None
+                    if existing_run is None or existing_run.status in {
+                        "failed",
+                        "interrupted",
+                    }:
+                        await self._start_agent_run(
+                            web_session_id=binding.web_session_id,
+                            agent_id=self.config.navigation_agent_id,
+                            model=self.config.navigation_model,
+                            message=str(
+                                item.payload.get("original_user_message")
+                                or "继续当前导航数据任务"
+                            ),
+                            turn_id=item.turn_id,
+                            task_id=binding.task_id,
+                            agentscope_session_id=binding.navigation_session_id,
+                        )
+                    await self._publish_v1_task_state(
+                        web_session_id=binding.web_session_id,
+                        task_id=binding.task_id,
+                        turn_id=item.turn_id,
+                    )
+                    self.web_session_store.complete_outbox(
+                        item.outbox_id,
+                        worker_id=worker_id,
+                    )
+                    recovered += 1
+                    continue
+                binding = self.web_session_store.get_task_binding(str(item.task_id or ""))
+                payload = dict(item.payload)
+                if binding is None:
+                    raise RuntimeError("navigation binding is unavailable")
+                turn_id = str(payload.get("origin_turn_id") or "")
+                authority = self.web_session_store.get_response_authority(turn_id)
+                if authority is None:
+                    raise RuntimeError("origin turn authority is unavailable")
+                task = self._navigation_task_store().get_task(binding.task_id)
+                if task is None:
+                    date = str(payload.get("date") or "")
+                    target = str(payload.get("target") or "")
+                    request = str(payload.get("request") or "")
+                    if not re.fullmatch(r"[0-9]{8}", date) or not target or not request:
+                        raise RuntimeError("navigation start payload is incomplete")
+                    scene_mode = payload.get("scene_mode")
+                    normalized_scene = (
+                        "in"
+                        if scene_mode == "indoor"
+                        else "out"
+                        if scene_mode == "outdoor"
+                        else None
+                    )
+                    task = self._navigation_task_store().create_task_attempt(
+                        task_id=binding.task_id,
+                        request=request,
+                        target=target,
+                        date=date,
+                        segments=list(payload.get("clips") or []),
+                        scene_mode=normalized_scene,
+                        dry_run=self.config.navigation_dry_run,
+                        web_session_id=binding.web_session_id,
+                        agentscope_session_id=binding.navigation_session_id,
+                    ).task
+                await self.ensure_web_session(
+                    binding.web_session_id,
+                    agent_id=self.config.navigation_agent_id,
+                    model=self.config.navigation_model,
+                    task_id=binding.task_id,
+                    preallocated_session_id=binding.navigation_session_id,
+                )
+                if authority.lease_state == "closed":
+                    self.web_session_store.complete_outbox(
+                        item.outbox_id,
+                        worker_id=worker_id,
+                    )
+                    recovered += 1
+                    continue
+                if authority.producer == "router":
+                    authority = self.web_session_store.handover_response_authority(
+                        turn_id,
+                        expected_producer="router",
+                        expected_generation=authority.generation,
+                        new_producer="navigation",
+                    )
+                if authority.producer != "navigation":
+                    raise RuntimeError("origin turn authority cannot be recovered")
+                existing_run = self.web_session_store.get_latest_turn_run(
+                    turn_id,
+                    producer="navigation",
+                )
+                if (
+                    existing_run is not None
+                    and existing_run.status == "running"
+                    and not self._is_local_agent_run_active(binding.navigation_session_id)
+                ):
+                    self.web_session_store.update_turn_run(
+                        existing_run.run_id,
+                        status="interrupted",
+                    )
+                    existing_run = None
+                if existing_run is None:
+                    message = _navigation_handoff_message(
+                        request=str(payload["request"]),
+                        target=str(payload["target"]),
+                        date=str(payload["date"]),
+                        scene_mode=str(payload.get("scene_mode") or "unknown"),
+                        clips=list(payload.get("clips") or []),
+                        reason=str(payload.get("reason") or "恢复已接受的任务"),
+                        response_language=str(payload.get("response_language") or "Chinese"),
+                    )
+                    await self._start_agent_run(
+                        web_session_id=binding.web_session_id,
+                        agent_id=self.config.navigation_agent_id,
+                        model=self.config.navigation_model,
+                        message=message,
+                        turn_id=turn_id,
+                        task_id=binding.task_id,
+                        agentscope_session_id=binding.navigation_session_id,
+                    )
+                elif existing_run.status in {"failed", "interrupted"}:
+                    raise RuntimeError("previous navigation start did not survive restart")
+                self.web_session_store.complete_outbox(
+                    item.outbox_id,
+                    worker_id=worker_id,
+                )
+                recovered += 1
+            except Exception as exc:
+                _logger.exception(
+                    "Contract v1 outbox recovery failed: kind=%s outbox_id=%s",
+                    item.kind,
+                    item.outbox_id,
+                )
+                if item.kind != "navigation_resume":
+                    self.web_session_store.complete_outbox(
+                        item.outbox_id,
+                        worker_id=worker_id,
+                        success=False,
+                        error=type(exc).__name__,
+                    )
+                if (
+                    item.kind in {"navigation_start", "navigation_continue"}
+                    and item.task_id
+                    and item.web_session_id
+                    and item.turn_id
+                ):
+                    await self._handle_v1_delegation_failure(
+                        web_session_id=item.web_session_id,
+                        turn_id=item.turn_id,
+                        task_id=item.task_id,
+                        router_session_id="recovery",
+                        response_language="Chinese",
+                        operation=(
+                            "continue"
+                            if item.kind == "navigation_continue"
+                            else "start"
+                        ),
+                    )
+        return recovered
+
+    async def _recover_contract_v1_control_states_once(self) -> int:
+        """Settle process-local Stop/Cancel callbacks that were lost on restart."""
+        if self.web_session_store is None:
+            return 0
+        recovered = 0
+        for mapping in self.web_session_store.list_conversation_agent_sessions():
+            if mapping.agent_role != "navigation" or mapping.task_id is None:
+                continue
+            if self._is_local_agent_run_active(mapping.agentscope_session_id):
+                continue
+            task = self._navigation_task_store().get_task(mapping.task_id)
+            if task is None or task.status not in {
+                NavigationTaskStatus.PAUSING,
+                NavigationTaskStatus.CANCELLING,
+                NavigationTaskStatus.PAUSED,
+                NavigationTaskStatus.CANCELLED,
+            }:
+                continue
+            if (
+                task.status in {
+                    NavigationTaskStatus.PAUSED,
+                    NavigationTaskStatus.CANCELLED,
+                }
+                and mapping.active_turn_id is None
+            ):
+                continue
+            action = (
+                "stop"
+                if task.status in {
+                    NavigationTaskStatus.PAUSING,
+                    NavigationTaskStatus.PAUSED,
+                }
+                else "cancel"
+            )
+            if task.status in {
+                NavigationTaskStatus.PAUSING,
+                NavigationTaskStatus.CANCELLING,
+            }:
+                self._finalize_navigation_control_v1(
+                    task_id=task.task_id,
+                    web_session_id=mapping.web_session_id,
+                    navigation_session_id=mapping.agentscope_session_id,
+                    action=action,
+                )
+            await self._publish_v1_task_state(
+                web_session_id=mapping.web_session_id,
+                task_id=task.task_id,
+                turn_id=mapping.active_turn_id,
+            )
+            if mapping.active_turn_id is not None:
+                await self._commit_system_controller_final(
+                    turn_id=mapping.active_turn_id,
+                    text=(
+                        "已停止当前处理，你可以继续补充要求或稍后恢复。"
+                        if action == "stop"
+                        else "已取消该任务。"
+                    ),
+                )
+            recovered += 1
+        return recovered
 
     def _record_redis_retry(self, exc: BaseException, _attempt: int) -> None:
         if _looks_like_timeout_error(exc):
@@ -1433,6 +3177,19 @@ class AgentScopeRuntime:
 
     def _agent_id_for_agentscope_session(self, agentscope_session_id: str) -> str | None:
         if self.web_session_store is not None:
+            get_v1_mapping = getattr(
+                self.web_session_store,
+                "get_conversation_agent_session_by_agentscope_session",
+                None,
+            )
+            v1_mapping = (
+                get_v1_mapping(agentscope_session_id)
+                if callable(get_v1_mapping)
+                else None
+            )
+            v1_agent_id = _record_value(v1_mapping, "agent_id")
+            if isinstance(v1_agent_id, str) and v1_agent_id:
+                return v1_agent_id
             get_mapping = getattr(
                 self.web_session_store,
                 "get_agentscope_session_mapping_by_agentscope_session",
@@ -1454,6 +3211,27 @@ class AgentScopeRuntime:
             if agentscope_session_id.endswith(f"__{agent_id}"):
                 return agent_id
         return None
+
+    def web_session_id_for_agentscope_session(
+        self,
+        agentscope_session_id: str,
+        *,
+        agent_id: str,
+    ) -> str:
+        if self.web_session_store is not None:
+            getter = getattr(
+                self.web_session_store,
+                "get_conversation_agent_session_by_agentscope_session",
+                None,
+            )
+            mapping = getter(agentscope_session_id) if callable(getter) else None
+            web_session_id = _record_value(mapping, "web_session_id")
+            if isinstance(web_session_id, str) and web_session_id:
+                return web_session_id
+        return _web_session_id_from_agentscope_session(
+            agentscope_session_id,
+            agent_id=agent_id,
+        )
 
     async def _event_log_tail_cursor(self, agentscope_session_id: str) -> str | None:
         read_events = getattr(self.message_bus, "session_read_events", None)
@@ -1693,6 +3471,359 @@ class AgentScopeRuntime:
             with suppress(asyncio.CancelledError):
                 await feeder_task
 
+    def project_contract_v1_event_batch(
+        self,
+        *,
+        web_session_id: str,
+        agentscope_session_id: str,
+        entry_id: str,
+        events: tuple[dict[str, Any], ...] | list[dict[str, Any]],
+    ) -> tuple[dict[str, Any], ...]:
+        """Convert private AgentScope projections to the contract-v1 allowlist."""
+        if not self._is_contract_v1(web_session_id) or self.web_session_store is None:
+            return tuple(events)
+        mapping_getter = getattr(
+            self.web_session_store,
+            "get_conversation_agent_session_by_agentscope_session",
+            None,
+        )
+        mapping = mapping_getter(agentscope_session_id) if callable(mapping_getter) else None
+        kind = str(_record_value(mapping, "agent_role", "router"))
+        task_id = _record_value(mapping, "task_id")
+        mapped_turn_id = _record_value(mapping, "active_turn_id")
+        turn_id = (
+            mapped_turn_id
+            if isinstance(mapped_turn_id, str)
+            else f"background:{entry_id}"
+        )
+        authority_getter = getattr(self.web_session_store, "get_response_authority", None)
+        authority = (
+            authority_getter(turn_id)
+            if callable(authority_getter) and isinstance(mapped_turn_id, str)
+            else None
+        )
+        if callable(authority_getter) and isinstance(mapped_turn_id, str) and (
+            authority is None
+            or authority.lease_state != "open"
+            or authority.producer != kind
+        ):
+            # A previous producer may still emit buffered deltas after handover or
+            # finalization. They are private audit noise, never public timeline data.
+            return ()
+        turn_getter = getattr(self.web_session_store, "get_turn", None)
+        turn_record = (
+            turn_getter(mapped_turn_id)
+            if callable(turn_getter) and isinstance(mapped_turn_id, str)
+            else None
+        )
+        background_system_turn = (
+            _record_value(turn_record, "origin") == "system"
+            or (kind == "navigation" and not isinstance(mapped_turn_id, str))
+        )
+        binding = None
+        task_ref = None
+        task = None
+        if isinstance(task_id, str):
+            binding_getter = getattr(self.web_session_store, "get_task_binding", None)
+            binding = binding_getter(task_id=task_id) if callable(binding_getter) else None
+            task_ref = _record_value(binding, "task_ref")
+            task = self._navigation_task_store().get_task(task_id)
+
+        projected: list[dict[str, Any]] = []
+        projector = self._specialist_projectors.setdefault(
+            agentscope_session_id,
+            SpecialistSignalProjector(),
+        )
+        for index, event in enumerate(events):
+            event_type = str(event.get("type") or "")
+            payload = event.get("payload") if isinstance(event.get("payload"), dict) else {}
+            if background_system_turn and event_type in {
+                "progress_start",
+                "progress_delta",
+                "progress_end",
+                "tool_start",
+                "tool_background",
+                "tool_end",
+                "answer_delta",
+                "answer_reset",
+            }:
+                continue
+            if kind == "router" or not isinstance(task_id, str) or not isinstance(task_ref, str):
+                public = self._project_router_v1_event(event_type, payload)
+                if public is not None:
+                    projected.append(public)
+                continue
+            sequence = self._specialist_sequences.get(agentscope_session_id, 0) + 1
+            self._specialist_sequences[agentscope_session_id] = sequence
+            common = {
+                "version": 1,
+                "signal_id": f"{entry_id}:{index}",
+                "sequence": sequence,
+                "web_session_id": web_session_id,
+                "turn_id": turn_id,
+                "task_id": task_id,
+                "run_id": agentscope_session_id,
+            }
+            signals: list[Any] = []
+            if event_type in {"progress_start", "progress_delta", "progress_end"}:
+                operation = {
+                    "progress_start": "start",
+                    "progress_delta": "append",
+                    "progress_end": "finish",
+                }[event_type]
+                signals.append(
+                    ProgressSignalV1(
+                        **common,
+                        kind="progress",
+                        operation=operation,
+                        phase="generic",
+                        text=payload.get("delta") or payload.get("text"),
+                        status="completed" if operation == "finish" else "running",
+                    )
+                )
+            elif event_type in {"tool_start", "tool_background", "tool_end"}:
+                call_id = str(payload.get("call_id") or "")
+                tool_name = str(payload.get("tool") or "")
+                if call_id and tool_name:
+                    self._projected_tool_names[(agentscope_session_id, call_id)] = tool_name
+                elif call_id:
+                    tool_name = self._projected_tool_names.get(
+                        (agentscope_session_id, call_id),
+                        "unknown",
+                    )
+                if call_id and event_type != "tool_background":
+                    status = (
+                        "running"
+                        if event_type == "tool_start"
+                        else _public_terminal_status(payload.get("status"))
+                    )
+                    signals.append(
+                        ActionSignalV1(
+                            **common,
+                            kind="action",
+                            operation="start" if event_type == "tool_start" else "finish",
+                            tool_name=tool_name or "unknown",
+                            call_id=call_id,
+                            status=status,
+                        )
+                    )
+            elif event_type == "human_decision_required":
+                if task is not None and task.status != NavigationTaskStatus.WAITING_USER:
+                    task = self._navigation_task_store().update_task_for_session(
+                        task_id,
+                        web_session_id=web_session_id,
+                        agentscope_session_id=str(_record_value(binding, "navigation_session_id")),
+                        expected_state_revision=task.state_revision,
+                        status=NavigationTaskStatus.WAITING_USER,
+                    )
+                if binding is not None and _record_value(binding, "status") != "waiting_user":
+                    binding = self.web_session_store.update_task_binding(
+                        task_id,
+                        expected_revision=int(_record_value(binding, "state_revision", 0)),
+                        status="waiting_user",
+                        latest_public_update="等待你作出选择。",
+                    )
+                interaction = self._create_v1_interaction(
+                    web_session_id=web_session_id,
+                    turn_id=turn_id,
+                    task_id=task_id,
+                    task_ref=task_ref,
+                    task_revision=task.state_revision if task is not None else 0,
+                    raw_payload=payload,
+                )
+                signals.append(
+                    RequestInputSignalV1(
+                        **common,
+                        kind="request_input",
+                        interaction_ref=str(interaction["interaction_id"]),
+                        interaction_kind=str(interaction["kind"]),
+                        blocking=bool(interaction["blocking"]),
+                        risk=str(interaction["risk"]),
+                        title=str(interaction["title"]),
+                        summary=str(interaction["summary"]),
+                        options=tuple(
+                            InteractionOptionV1(**option)
+                            for option in interaction["options"]
+                        ),
+                        interaction_revision=int(interaction["interaction_revision"]),
+                        expected_task_revision=int(interaction["expected_task_revision"]),
+                        expires_at=interaction.get("expires_at"),
+                    )
+                )
+                task_snapshot = self._task_summary(binding, max_chars=1000)
+                if task_snapshot is not None:
+                    projected.append(
+                        {
+                            "contract_version": 1,
+                            "type": "task_state_updated",
+                            "payload": task_snapshot,
+                        }
+                    )
+            elif event_type in {"reply_summary", "final"}:
+                if task is not None:
+                    task = self._sync_task_state_on_specialist_final_v1(
+                        web_session_id=web_session_id,
+                        task=task,
+                        binding=binding,
+                    )
+                status = task.status.value if task is not None else "active"
+                if background_system_turn and status == "active":
+                    summary = self._task_summary(binding, max_chars=1000) or {
+                        "task_ref": task_ref,
+                        "status": "active",
+                    }
+                    projected.append(
+                        {
+                            "contract_version": 1,
+                            "type": "task_state_updated",
+                            "payload": summary,
+                        }
+                    )
+                    continue
+                task_snapshot = self._task_summary(binding, max_chars=1000)
+                if task_snapshot is not None:
+                    projected.append(
+                        {
+                            "contract_version": 1,
+                            "type": "task_state_updated",
+                            "payload": task_snapshot,
+                        }
+                    )
+                signals.append(
+                    FinalSignalV1(
+                        **common,
+                        kind="final",
+                        text=str(payload.get("text") or ""),
+                        task_status=status,
+                    )
+                )
+            elif event_type in {"answer_delta", "answer_reset"}:
+                delta = sanitize_final_text(payload.get("delta") or "")
+                if event_type == "answer_reset" or delta:
+                    projected.append(
+                        {
+                            "contract_version": 1,
+                            "type": event_type,
+                            "payload": {"delta": delta} if delta else {},
+                        }
+                    )
+            for signal in signals:
+                for public_event in projector.project(signal, task_ref=task_ref):
+                    public_payload = dict(public_event.payload)
+                    if public_event.task_ref:
+                        public_payload["task_ref"] = public_event.task_ref
+                    projected.append(
+                        {
+                            "contract_version": 1,
+                            "type": public_event.type,
+                            "payload": public_payload,
+                        }
+                    )
+        return tuple(projected)
+
+    def _sync_task_state_on_specialist_final_v1(
+        self,
+        *,
+        web_session_id: str,
+        task: Any,
+        binding: Any,
+    ) -> Any:
+        cancellation = self.run_cancellation(str(_record_value(binding, "navigation_session_id")))
+        if cancellation is not None and cancellation.has_background_operations:
+            return task
+        current_status = str(getattr(task.status, "value", task.status))
+        if current_status in {
+            NavigationTaskStatus.PAUSED.value,
+            NavigationTaskStatus.PAUSING.value,
+            NavigationTaskStatus.CANCELLED.value,
+            NavigationTaskStatus.CANCELLING.value,
+        }:
+            return task
+        try:
+            anchor = self._navigation_durable_state_anchor(
+                str(_record_value(binding, "navigation_session_id")),
+                web_session_id=web_session_id,
+            )
+        except AttributeError:
+            # Lightweight projection-only adapters need not provide the durable
+            # Navigation repositories used by the production runtime.
+            return task
+        execution = str(anchor.get("execution_status") or "")
+        target_status: NavigationTaskStatus | None = None
+        if execution == "completed":
+            target_status = (
+                NavigationTaskStatus.COMPLETED
+                if task.accepted_plan_phase == "finish_processing"
+                else NavigationTaskStatus.WAITING_USER
+            )
+        elif execution == "waiting_user":
+            target_status = NavigationTaskStatus.WAITING_USER
+        elif execution in {"failed", "needs_replan"}:
+            target_status = NavigationTaskStatus.NEEDS_REPLAN
+        if target_status is None or task.status == target_status:
+            return task
+        task = self._navigation_task_store().update_task_for_session(
+            task.task_id,
+            web_session_id=web_session_id,
+            agentscope_session_id=str(_record_value(binding, "navigation_session_id")),
+            expected_state_revision=task.state_revision,
+            status=target_status,
+        )
+        current_binding = self.web_session_store.get_task_binding(task.task_id)
+        if current_binding is not None and current_binding.slot_state == "open":
+            summary = {
+                NavigationTaskStatus.COMPLETED: "任务已完成。",
+                NavigationTaskStatus.WAITING_USER: "等待你决定下一步。",
+                NavigationTaskStatus.NEEDS_REPLAN: "当前方案需要调整。",
+            }[target_status]
+            if target_status == NavigationTaskStatus.COMPLETED:
+                self.web_session_store.mark_task_binding_terminal(
+                    task.task_id,
+                    expected_revision=current_binding.state_revision,
+                    status=target_status.value,
+                    latest_public_update=summary,
+                )
+            else:
+                self.web_session_store.update_task_binding(
+                    task.task_id,
+                    expected_revision=current_binding.state_revision,
+                    status=target_status.value,
+                    latest_public_update=summary,
+                )
+        return task
+
+    @staticmethod
+    def _project_router_v1_event(
+        event_type: str,
+        payload: dict[str, Any],
+    ) -> dict[str, Any] | None:
+        if event_type in {"tool_start", "tool_background", "tool_end", "reasoning"}:
+            return None
+        if event_type in {"progress_start", "progress_end"}:
+            return {"contract_version": 1, "type": event_type, "payload": {}}
+        if event_type == "progress_delta":
+            text = sanitize_progress_text(payload.get("delta") or payload.get("text") or "")
+            return (
+                {"contract_version": 1, "type": "progress_delta", "payload": {"delta": text}}
+                if text
+                else None
+            )
+        if event_type in {"answer_delta", "answer_reset"}:
+            text = sanitize_final_text(payload.get("delta") or "")
+            return {
+                "contract_version": 1,
+                "type": event_type,
+                "payload": {"delta": text} if text else {},
+            }
+        if event_type in {"reply_summary", "final"}:
+            text = sanitize_final_text(payload.get("text") or "")
+            return {
+                "contract_version": 1,
+                "type": "final",
+                "payload": {"text": text or "本轮处理已结束，请继续告诉我你的需要。"},
+            }
+        return None
+
     async def subscribe_web_session_events(self, *, web_session_id: str):
         mapped = self._web_session_mapping(web_session_id)
         if mapped is None:
@@ -1825,6 +3956,22 @@ class AgentScopeRuntime:
     ) -> tuple[str, str, str | None] | None:
         if self.web_session_store is None:
             return None
+        get_v1_mapping = getattr(
+            self.web_session_store,
+            "get_conversation_agent_session_by_agentscope_session",
+            None,
+        )
+        v1_mapping = (
+            get_v1_mapping(agentscope_session_id)
+            if callable(get_v1_mapping)
+            else None
+        )
+        if v1_mapping is not None:
+            return (
+                str(_record_value(v1_mapping, "agent_id")),
+                str(_record_value(v1_mapping, "agentscope_session_id")),
+                _record_value(v1_mapping, "event_cursor"),
+            )
         get_mapping = getattr(
             self.web_session_store,
             "get_agentscope_session_mapping_by_agentscope_session",
@@ -1884,6 +4031,20 @@ class AgentScopeRuntime:
     def _save_web_session_event_cursor(self, agentscope_session_id: str, cursor: str) -> None:
         if self.web_session_store is None:
             return
+        save_v1_cursor = getattr(
+            self.web_session_store,
+            "save_conversation_event_cursor",
+            None,
+        )
+        if callable(save_v1_cursor):
+            mapping_getter = getattr(
+                self.web_session_store,
+                "get_conversation_agent_session_by_agentscope_session",
+                None,
+            )
+            if callable(mapping_getter) and mapping_getter(agentscope_session_id) is not None:
+                save_v1_cursor(agentscope_session_id=agentscope_session_id, cursor=cursor)
+                return
         save_cursor = getattr(self.web_session_store, "save_agentscope_event_cursor", None)
         if callable(save_cursor):
             save_cursor(agentscope_session_id, cursor)
@@ -2490,6 +4651,60 @@ def _resolve_response_language(explicit: str | None, request: str) -> str:
     return "English"
 
 
+def _record_value(record: Any, key: str, default: Any = None) -> Any:
+    if record is None:
+        return default
+    if isinstance(record, dict):
+        return record.get(key, default)
+    return getattr(record, key, default)
+
+
+def _safe_context_text(value: Any, limit: int) -> str:
+    text = " ".join(str(value or "").split())
+    # Router context is public-domain metadata, never a channel for local paths
+    # or credentials. Replace instead of attempting to preserve partial secrets.
+    text = re.sub(r"(?:/[A-Za-z0-9_.-]+){2,}", "[路径已隐藏]", text)
+    text = re.sub(
+        r"(?i)\b(?:bearer\s+|api[_-]?key\s*[:=]\s*)[A-Za-z0-9._-]+",
+        "[凭据已隐藏]",
+        text,
+    )
+    return text[:limit]
+
+
+def _bounded_mapping(value: dict[str, Any], max_chars: int) -> dict[str, Any]:
+    rendered = json.dumps(value, ensure_ascii=False, separators=(",", ":"))
+    if len(rendered) <= max_chars:
+        return value
+    bounded = dict(value)
+    for key in ("latest_public_update", "wait_cause"):
+        if len(json.dumps(bounded, ensure_ascii=False)) <= max_chars:
+            break
+        bounded[key] = None
+    target = bounded.get("target")
+    if len(json.dumps(bounded, ensure_ascii=False)) > max_chars and isinstance(target, dict):
+        bounded["target"] = {
+            "date": target.get("date"),
+            "clips": list(target.get("clips") or [])[:3],
+            "scene_mode": target.get("scene_mode"),
+        }
+    return bounded
+
+
+def _is_chinese(language: str) -> bool:
+    normalized = str(language or "").strip().lower()
+    return normalized in {"zh", "zh-cn", "chinese", "中文", "汉语"} or "chinese" in normalized
+
+
+def _public_terminal_status(value: Any) -> str:
+    normalized = str(getattr(value, "value", value) or "").lower()
+    if normalized in {"completed", "success", "succeeded"}:
+        return "completed"
+    if normalized in {"interrupted", "cancelled", "canceled"}:
+        return "interrupted"
+    return "failed"
+
+
 class NavigationHandoffTool(ToolBase):
     name = "start_navigation_data_task"
     description = (
@@ -2724,6 +4939,13 @@ def build_extra_agent_tools_factory(
                 _session_id,
                 agent_id=config.main_router_agent_id,
             )
+            is_contract_v1 = getattr(runtime, "_is_contract_v1", None)
+            if callable(is_contract_v1) and is_contract_v1(web_session_id):
+                return router_v1_tools(
+                    runtime=runtime,
+                    web_session_id=web_session_id,
+                    router_session_id=_session_id,
+                )
             return [
                 NavigationHandoffTool(
                     runtime=runtime,
@@ -2745,14 +4967,36 @@ def build_extra_agent_middlewares_factory(
         agent_id: str,
         session_id: str,
     ) -> list[Any]:
+        if runtime is None:
+            if agent_id == config.navigation_agent_id:
+                raise RuntimeError("navigation runtime is unavailable")
+            return []
+        resolve_web_session = getattr(
+            runtime,
+            "web_session_id_for_agentscope_session",
+            None,
+        )
+        web_session_id = (
+            resolve_web_session(session_id, agent_id=agent_id)
+            if callable(resolve_web_session)
+            else _web_session_id_from_agentscope_session(
+                session_id,
+                agent_id=agent_id,
+            )
+        )
+        if agent_id == config.main_router_agent_id:
+            is_contract_v1 = getattr(runtime, "_is_contract_v1", None)
+            if callable(is_contract_v1) and is_contract_v1(web_session_id):
+                return [
+                    RouterContractV1Middleware(
+                        runtime=runtime,
+                        web_session_id=web_session_id,
+                        router_session_id=session_id,
+                    )
+                ]
+            return []
         if agent_id != config.navigation_agent_id:
             return []
-        if runtime is None:
-            raise RuntimeError("navigation runtime is unavailable")
-        web_session_id = _web_session_id_from_agentscope_session(
-            session_id,
-            agent_id=config.navigation_agent_id,
-        )
         return [
             NavigationToolSurfaceMiddleware(
                 services=runtime._navigation_services(),
@@ -2773,7 +5017,7 @@ def create_agentscope_runtime(config: AgentScopeRuntimeConfig) -> AgentScopeRunt
     from agentscope.app._service import _chat as agentscope_chat_service
 
     agentscope_chat_service.ToolOffloadMiddleware = partial(
-        ToolOffloadMiddleware,
+        DataPilotToolOffloadMiddleware,
         timeout_secs=config.tool_background_threshold_secs,
     )
     redis_kwargs = config.redis_connection_kwargs()

@@ -2,13 +2,13 @@ from __future__ import annotations
 
 from typing import Any, Literal
 
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field, field_validator, model_serializer, model_validator
 
 
 SessionStatus = Literal["draft", "active", "historical"]
 MessageRole = Literal["user", "assistant", "system"]
 HumanDecisionAction = Literal["confirm", "stop", "guide"]
-TurnOrigin = Literal["user", "system"]
+TurnOrigin = Literal["user", "system", "interaction"]
 TurnStatus = Literal["running", "waiting", "completed", "failed", "interrupted"]
 
 
@@ -23,6 +23,24 @@ class SessionRecord(BaseModel):
     status: SessionStatus
     created_at: str
     updated_at: str
+    contract_version: Literal[0, 1] = 0
+
+    @model_serializer(mode="wrap")
+    def serialize_by_contract(self, handler: Any) -> dict[str, Any]:
+        data = handler(self)
+        if self.contract_version == 0:
+            data.pop("contract_version", None)
+            data.pop("tasks", None)
+            data.pop("pending_interaction", None)
+        else:
+            for event in data.get("events", []):
+                if not isinstance(event, dict):
+                    continue
+                event["contract_version"] = 1
+                event.pop("source", None)
+                event.pop("run_id", None)
+                event.pop("parent_run_id", None)
+        return data
 
 
 class ChatMessageRecord(BaseModel):
@@ -62,6 +80,8 @@ class SessionDetail(SessionRecord):
     messages: list[ChatMessageRecord] = Field(default_factory=list)
     events: list[TimelineEventRecord] = Field(default_factory=list)
     turns: list[TurnRecord] = Field(default_factory=list)
+    tasks: list[dict[str, Any]] = Field(default_factory=list)
+    pending_interaction: dict[str, Any] | None = None
 
 
 class CreateSessionResponse(BaseModel):
@@ -70,6 +90,7 @@ class CreateSessionResponse(BaseModel):
 
 class CreateSessionRequest(BaseModel):
     message: str
+    entrypoint: Literal["chat", "data_management_shortcut"] = "chat"
 
     @field_validator("message")
     @classmethod
@@ -81,6 +102,7 @@ class CreateSessionRequest(BaseModel):
 
 
 class CreateTurnRequest(CreateSessionRequest):
+    entrypoint: Literal["chat"] = "chat"
     invocation_id: str | None = Field(default=None, max_length=200)
 
     @field_validator("invocation_id")
@@ -100,6 +122,36 @@ class CreateTurnResponse(BaseModel):
 
 class InterruptResponse(BaseModel):
     interrupted: bool
+
+
+class InteractionResponseRequest(BaseModel):
+    option_id: str | None = Field(default=None, min_length=1, max_length=200)
+    option_ids: list[str] | None = Field(default=None, min_length=1, max_length=100)
+    interaction_revision: int = Field(ge=1)
+    expected_task_revision: int = Field(ge=0)
+    idempotency_key: str = Field(min_length=1, max_length=200)
+
+    @field_validator("option_ids")
+    @classmethod
+    def option_ids_must_be_unique(cls, value: list[str] | None) -> list[str] | None:
+        if value is None:
+            return None
+        normalized = [item.strip() for item in value]
+        if any(not item for item in normalized) or len(set(normalized)) != len(normalized):
+            raise ValueError("option_ids must be non-empty and unique")
+        return normalized
+
+    @model_validator(mode="after")
+    def validate_selection(self) -> "InteractionResponseRequest":
+        if (self.option_id is None) == (self.option_ids is None):
+            raise ValueError("provide exactly one of option_id or option_ids")
+        return self
+
+
+class InteractionResponse(BaseModel):
+    accepted: bool
+    turn_id: str | None = None
+    session: SessionDetail | None = None
 
 
 class HumanDecisionRequest(BaseModel):

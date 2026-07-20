@@ -2,18 +2,19 @@ import { useCallback, useEffect, useLayoutEffect, useRef, useState } from "react
 
 import type { ChatMessageRecord, TurnRecord } from "../../api/types";
 import type { RunState, TimelineItem } from "../../store/eventReducer";
-import { cn } from "../../lib/utils";
+import { cn, withoutPercentages } from "../../lib/utils";
 import { ProcessingDisclosure } from "./ProcessingDisclosure";
 
 type MessageListProps = {
   messages: ChatMessageRecord[];
   turns?: TurnRecord[];
   run: RunState;
+  contractVersion?: 0 | 1;
 };
 
 const STICKY_BOTTOM_THRESHOLD = 24;
 
-export function MessageList({ messages, turns = [], run }: MessageListProps) {
+export function MessageList({ messages, turns = [], run, contractVersion = 0 }: MessageListProps) {
   const durableTurnIds = new Set(turns.map((turn) => turn.id));
   const legacy = synthesizeLegacyTurns(
     messages.filter((message) => !message.turn_id || !durableTurnIds.has(message.turn_id)),
@@ -34,7 +35,7 @@ export function MessageList({ messages, turns = [], run }: MessageListProps) {
   };
   const hasContent = displayMessages.length > 0 || displayRun.timeline.length > 0 || displayTurns.length > 0 || Boolean(run.activeText);
   const now = useActiveNow(run.activeText ? run.activeStartedAt : null);
-  const activeText = formatActiveText(run.activeText, run.activeStartedAt, now);
+  const activeText = contractVersion === 1 ? "" : formatActiveText(run.activeText, run.activeStartedAt, now);
   const scrollAreaRef = useRef<HTMLDivElement | null>(null);
   const shouldStickToBottomRef = useRef(true);
 
@@ -70,6 +71,7 @@ export function MessageList({ messages, turns = [], run }: MessageListProps) {
                 turn={turn}
                 messages={displayMessages}
                 run={displayRun}
+                contractVersion={contractVersion}
               />
             ))}
           </>
@@ -262,10 +264,12 @@ function TurnConversation({
   turn,
   messages,
   run,
+  contractVersion,
 }: {
   turn: TurnRecord;
   messages: ChatMessageRecord[];
   run: RunState;
+  contractVersion: 0 | 1;
 }) {
   const userMessages = messages.filter(
     (message) => message.role === "user" && message.turn_id === turn.id,
@@ -274,7 +278,7 @@ function TurnConversation({
     (message) => message.turn_id === turn.id && message.role === "assistant",
   );
   const items = run.timeline.filter(
-    (item) => item.turnId === turn.id && ["progress", "tool", "activity"].includes(item.kind),
+    (item) => item.turnId === turn.id && ["progress", "tool", "activity", "action", "interaction"].includes(item.kind),
   );
   const liveReplies = run.timeline.filter(
     (item) => item.turnId === turn.id && item.kind === "assistant",
@@ -292,24 +296,32 @@ function TurnConversation({
 
   return (
     <div className="contents">
-      {userMessages.map((message) => <MessageBubble key={message.id} message={message} />)}
-      {showDisclosure ? <ProcessingDisclosure turn={turn} items={items} /> : null}
-      {assistantMessages.map((message) => <MessageBubble key={message.id} message={message} />)}
+      {userMessages.map((message) => <MessageBubble key={message.id} message={message} contractVersion={contractVersion} />)}
+      {showDisclosure ? (
+        <ProcessingDisclosure
+          turn={turn}
+          items={items}
+          contractVersion={contractVersion}
+          hasAnswer={assistantMessages.length > 0 || liveReplies.length > 0}
+        />
+      ) : null}
+      {assistantMessages.map((message) => <MessageBubble key={message.id} message={message} contractVersion={contractVersion} />)}
       {unpersistedLiveReplies.map((item, index) => (
         <AssistantBubble
           key={item.replyKey ?? `${item.runId ?? item.source}:${item.replyId ?? index}`}
           text={item.text}
+          contractVersion={contractVersion}
         />
       ))}
     </div>
   );
 }
 
-function AssistantBubble({ text }: { text: string }) {
+function AssistantBubble({ text, contractVersion }: { text: string; contractVersion: 0 | 1 }) {
   return (
     <article className="mr-auto max-w-[88%] rounded-lg border border-console-line bg-console-panel px-3 py-2 text-sm leading-6 text-console-text shadow-sm">
       <div className="mb-1 text-[11px] font-medium text-console-muted">DataPilot</div>
-      <p className="whitespace-pre-wrap break-words">{text}</p>
+      <p className="whitespace-pre-wrap break-words">{contractVersion === 1 ? withoutPercentages(text) : text}</p>
     </article>
   );
 }
@@ -353,7 +365,7 @@ function timestampMs(value: string | undefined): number {
   return Number.isNaN(parsed) ? Date.now() : parsed;
 }
 
-function MessageBubble({ message }: { message: ChatMessageRecord }) {
+function MessageBubble({ message, contractVersion }: { message: ChatMessageRecord; contractVersion: 0 | 1 }) {
   const isUser = message.role === "user";
 
   return (
@@ -366,9 +378,11 @@ function MessageBubble({ message }: { message: ChatMessageRecord }) {
       )}
     >
       <div className="mb-1 text-[11px] font-medium text-console-muted">
-        {isUser ? "You" : message.role === "assistant" ? "DataPilot" : "System"}
+        {isUser ? "You" : contractVersion === 1 ? "DataPilot" : message.role === "assistant" ? "DataPilot" : "System"}
       </div>
-      <p className="whitespace-pre-wrap break-words">{message.content}</p>
+      <p className="whitespace-pre-wrap break-words">
+        {contractVersion === 1 && !isUser ? withoutPercentages(message.content) : message.content}
+      </p>
     </article>
   );
 }

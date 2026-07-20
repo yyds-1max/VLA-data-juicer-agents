@@ -4,22 +4,27 @@ import { useStore } from "zustand";
 
 import {
   createSession,
+  ApiResponseError,
   getSession,
   interruptTurn,
   listSessions,
   openSessionEvents,
   recoverHumanDecision,
   submitHumanDecision,
+  submitInteractionResponse,
   submitTurn,
 } from "../../api/client";
-import type { PendingHumanDecision, SessionRecord } from "../../api/types";
+import type { PendingHumanDecision, PendingInteraction, SessionDetail, SessionRecord } from "../../api/types";
+import { withoutPercentages } from "../../lib/utils";
 import { datapilotStore, type DataPilotInvocation } from "../../store/datapilotStore";
 import { Composer } from "./Composer";
 import { DraftNewSessionView } from "./DraftNewSessionView";
 import { HumanDecisionDialog } from "./HumanDecisionDialog";
+import { InteractionPanel } from "./InteractionPanel";
 import { MessageList } from "./MessageList";
 import { SessionHeader } from "./SessionHeader";
 import { SessionHistoryPanel } from "./SessionHistoryPanel";
+import { TaskStrip } from "./TaskStrip";
 import { currentViewport, visibleFloatingOffset, visibleWindowOffset } from "./floatingPosition";
 
 type DragState = {
@@ -34,9 +39,12 @@ export function DataPilotWindow() {
   const open = useStore(datapilotStore, (state) => state.open);
   const mode = useStore(datapilotStore, (state) => state.mode);
   const currentSessionId = useStore(datapilotStore, (state) => state.currentSessionId);
+  const contractVersion = useStore(datapilotStore, (state) => state.currentContractVersion);
   const sessions = useStore(datapilotStore, (state) => state.sessions);
   const messages = useStore(datapilotStore, (state) => state.messages);
   const turns = useStore(datapilotStore, (state) => state.turns);
+  const tasks = useStore(datapilotStore, (state) => state.tasks);
+  const pendingInteraction = useStore(datapilotStore, (state) => state.pendingInteraction);
   const run = useStore(datapilotStore, (state) => state.run);
   const pendingInvocation = useStore(datapilotStore, (state) => state.pendingInvocation);
   const runRunning = useStore(datapilotStore, (state) => state.run.running);
@@ -49,6 +57,8 @@ export function DataPilotWindow() {
   const [closing, setClosing] = useState(false);
   const [recoveringHumanDecision, setRecoveringHumanDecision] = useState(false);
   const [humanDecisionRecoveryError, setHumanDecisionRecoveryError] = useState("");
+  const [submittingInteraction, setSubmittingInteraction] = useState(false);
+  const [interactionError, setInteractionError] = useState("");
   const [viewport, setViewport] = useState(() => ({
     width: typeof window === "undefined" ? 1280 : window.innerWidth,
     height: typeof window === "undefined" ? 900 : window.innerHeight,
@@ -56,11 +66,23 @@ export function DataPilotWindow() {
   const socketRef = useRef<{ sessionId: string; socket: WebSocket } | null>(null);
   const reconnectTimerRef = useRef<number | null>(null);
   const humanDecisionRecoveryRequestRef = useRef(0);
+  const composerInputRef = useRef<HTMLInputElement | null>(null);
+  const previousInteractionRef = useRef<PendingInteraction | null>(null);
   const dragRef = useRef<DragState | null>(null);
   const windowOffset = useMemo(() => visibleWindowOffset(floatingOffset, viewport), [floatingOffset, viewport]);
   const running = runRunning || turns.some(
     (turn) => turn.status === "running" || turn.status === "waiting",
   );
+
+  useEffect(() => {
+    const previous = previousInteractionRef.current;
+    previousInteractionRef.current = pendingInteraction;
+    if (previous && !pendingInteraction) {
+      window.requestAnimationFrame(() => composerInputRef.current?.focus());
+    }
+    setSubmittingInteraction(false);
+    setInteractionError("");
+  }, [pendingInteraction]);
 
   const clearReconnectTimer = useCallback(() => {
     if (reconnectTimerRef.current === null) {
@@ -227,7 +249,9 @@ export function DataPilotWindow() {
           datapilotStore.getState().restoreActiveSession(detail, detail.messages);
         }
       } else {
-        const session = await createSession(message);
+        const session = options.invocationId
+          ? await createSession(message, "data_management_shortcut")
+          : await createSession(message);
         sessionId = session.id;
         datapilotStore.getState().setActiveSession(session);
         if (options.invocationId) {
@@ -292,6 +316,8 @@ export function DataPilotWindow() {
       const detail = await getSession(candidateSessionId);
       const detailRunning = (detail.turns ?? []).some(
         (turn) => turn.status === "running" || turn.status === "waiting",
+      ) || (detail.tasks ?? []).some(
+        (task) => !["cancelled", "completed", "failed", "superseded"].includes(task.status),
       );
       if (detailRunning) {
         datapilotStore.getState().restoreActiveSession(detail, detail.messages);
@@ -373,6 +399,11 @@ export function DataPilotWindow() {
 
     const interrupted = await interruptTurn(currentSessionId);
     if (interrupted) {
+      if (contractVersion === 1) {
+        const detail = await getSession(currentSessionId);
+        datapilotStore.getState().restoreActiveSession(detail, detail.messages);
+        return;
+      }
       datapilotStore.getState().applyEvent({
         type: "interrupt_requested",
         source: "main",
@@ -415,6 +446,45 @@ export function DataPilotWindow() {
     },
     [currentSessionId, pendingHumanDecision],
   );
+
+  const handleInteractionResponse = useCallback(async (optionIds: string[]) => {
+    if (!currentSessionId || !pendingInteraction || optionIds.length === 0) return;
+    const sessionId = currentSessionId;
+    const interaction = pendingInteraction;
+    setSubmittingInteraction(true);
+    setInteractionError("");
+    try {
+      const result = await submitInteractionResponse(sessionId, interaction.interaction_id, {
+        ...(optionIds.length === 1 ? { option_id: optionIds[0] } : { option_ids: optionIds }),
+        interaction_revision: interaction.interaction_revision,
+        expected_task_revision: interaction.expected_task_revision,
+        idempotency_key: createIdempotencyKey(),
+      });
+      if (result.session) {
+        datapilotStore.getState().refreshActiveSession(result.session);
+      } else if (result.accepted) {
+        datapilotStore.getState().applyEvent({
+          type: "interaction_resolved",
+          timestamp: new Date().toISOString(),
+          turn_id: result.turn_id ?? null,
+          payload: {
+            interaction_id: interaction.interaction_id,
+            result_label: selectedInteractionLabel(interaction, optionIds),
+          },
+        });
+      }
+    } catch (error) {
+      const snapshot = interactionConflictSnapshot(error);
+      if (snapshot) datapilotStore.getState().refreshActiveSession(snapshot);
+      setInteractionError(
+        error instanceof ApiResponseError && error.status === 409
+          ? "任务状态已更新，请根据最新状态重新选择。"
+          : errorMessage(error),
+      );
+    } finally {
+      setSubmittingInteraction(false);
+    }
+  }, [currentSessionId, pendingInteraction]);
 
   useEffect(() => {
     humanDecisionRecoveryRequestRef.current += 1;
@@ -581,7 +651,7 @@ export function DataPilotWindow() {
     <section
       role="dialog"
       aria-label="DataPilot"
-      className={`fixed bottom-3 right-3 z-[80] flex h-[min(640px,calc(100vh-1.5rem))] w-[calc(100vw-1.5rem)] max-w-[500px] origin-bottom-right flex-col overflow-hidden rounded-lg border border-console-line bg-console-panel shadow-[0_24px_70px_rgba(23,32,46,0.20)] sm:bottom-5 sm:right-5 sm:h-[min(680px,calc(100vh-2.5rem))] sm:w-[min(500px,calc(100vw-2.5rem))] ${
+      className={`fixed bottom-3 right-3 z-[80] flex h-[min(640px,calc(100vh-1.5rem))] w-[calc(100vw-1.5rem)] max-w-[500px] origin-bottom-right flex-col overflow-hidden rounded-lg border border-console-line bg-console-panel shadow-[0_24px_70px_rgba(23,32,46,0.20)] motion-reduce:animate-none sm:bottom-5 sm:right-5 sm:h-[min(680px,calc(100vh-2.5rem))] sm:w-[min(500px,calc(100vw-2.5rem))] ${
         closing ? "animate-[datapilot-window-out_160ms_ease-in_forwards]" : "animate-[datapilot-window-in_180ms_ease-out]"
       }`}
       style={{
@@ -597,7 +667,6 @@ export function DataPilotWindow() {
       <SessionHeader onHistory={handleHistory} onNewSession={handleNewSession} onDragStart={handleDragStart} />
       {pendingInvocation?.error ? (
         <div
-          role="status"
           className={`border-b px-4 py-2 text-sm ${
             pendingInvocation.status === "blocked"
               ? "border-amber-200 bg-amber-50 text-amber-800"
@@ -618,10 +687,13 @@ export function DataPilotWindow() {
         <DraftNewSessionView running={running} onSubmit={handleDraftSubmit} onInterrupt={handleInterrupt} />
       ) : mode === "active_session" ? (
         <div className="flex min-h-0 flex-1 flex-col bg-console-panel">
-          <MessageList messages={messages} turns={turns} run={run} />
+          <div className="sr-only" aria-live="polite" aria-atomic="true">
+            {liveAnnouncement(pendingInteraction, tasks)}
+          </div>
+          <MessageList messages={messages} turns={turns} run={run} contractVersion={contractVersion} />
           <HumanDecisionDialog
             key={`${currentSessionId ?? ""}:${pendingHumanDecision?.replyId ?? ""}:${pendingHumanDecision?.toolCallId ?? ""}`}
-            decision={pendingHumanDecision}
+            decision={pendingInteraction ? null : pendingHumanDecision}
             onConfirm={() => handleHumanDecision("confirm")}
             onStop={() => handleHumanDecision("stop")}
             onGuide={(text) => handleHumanDecision("guide", text)}
@@ -629,9 +701,20 @@ export function DataPilotWindow() {
             recovering={recoveringHumanDecision}
             recoveryError={humanDecisionRecoveryError || undefined}
           />
-          {pendingHumanDecision ? null : (
-            <div className="border-t border-console-line p-3 sm:p-4">
+          {contractVersion === 1 ? <TaskStrip tasks={tasks} /> : null}
+          {pendingInteraction ? (
+            <InteractionPanel
+              key={`${pendingInteraction.interaction_id}:${pendingInteraction.interaction_revision}`}
+              interaction={pendingInteraction}
+              submitting={submittingInteraction}
+              error={interactionError || undefined}
+              onSubmit={handleInteractionResponse}
+            />
+          ) : null}
+          {pendingHumanDecision || pendingInteraction?.blocking ? null : (
+            <div className={`${contractVersion === 1 && tasks.length > 0 ? "" : "border-t border-console-line"} p-3 sm:p-4`}>
               <Composer
+                ref={composerInputRef}
                 placeholder="继续描述任务…"
                 running={running}
                 interrupting={interrupting}
@@ -642,7 +725,7 @@ export function DataPilotWindow() {
           )}
         </div>
       ) : (
-        <MessageList messages={messages} turns={turns} run={run} />
+        <MessageList messages={messages} turns={turns} run={run} contractVersion={contractVersion} />
       )}
     </section>
   );
@@ -734,6 +817,59 @@ function createLocalId(): string {
       ? crypto.randomUUID()
       : `${Date.now()}-${Math.random().toString(16).slice(2)}`;
   return `local-${suffix}`;
+}
+
+function createIdempotencyKey(): string {
+  const suffix =
+    typeof crypto !== "undefined" && "randomUUID" in crypto
+      ? crypto.randomUUID()
+      : `${Date.now()}-${Math.random().toString(16).slice(2)}`;
+  return `interaction-${suffix}`;
+}
+
+function selectedInteractionLabel(interaction: PendingInteraction, optionIds: string[]): string {
+  const labels = optionIds.flatMap((optionId) => {
+    const option = interaction.options.find((candidate) => candidate.option_id === optionId);
+    return option ? [option.label] : [];
+  });
+  return labels.length > 0 ? `已选择：${labels.join("、")}` : "已提交选择";
+}
+
+function interactionConflictSnapshot(error: unknown): SessionDetail | null {
+  if (!(error instanceof ApiResponseError) || error.status !== 409) return null;
+  const body = asRecord(error.body);
+  const detail = asRecord(body?.detail);
+  const session = asRecord(body?.session) ?? asRecord(detail?.session);
+  return session && typeof session.id === "string" && Array.isArray(session.messages)
+    ? session as unknown as SessionDetail
+    : null;
+}
+
+function asRecord(value: unknown): Record<string, unknown> | null {
+  return value && typeof value === "object" && !Array.isArray(value)
+    ? value as Record<string, unknown>
+    : null;
+}
+
+function liveAnnouncement(
+  interaction: PendingInteraction | null,
+  tasks: ReturnType<typeof datapilotStore.getState>["tasks"],
+): string {
+  if (interaction) return withoutPercentages(interaction.title || interaction.summary);
+  const task = tasks.find((candidate) =>
+    !["cancelled", "completed", "failed", "superseded"].includes(candidate.status),
+  ) ?? tasks[0];
+  if (!task) return "";
+  const status = task.status === "waiting_user"
+    ? "等待输入"
+    : task.status === "completed"
+    ? "任务已完成"
+    : task.status === "failed"
+    ? "任务失败"
+    : task.status === "paused"
+    ? "任务已暂停"
+    : "任务状态已更新";
+  return task.phase ? `${status}：${withoutPercentages(task.phase)}` : status;
 }
 
 function isActiveSocket(socket: WebSocket): boolean {

@@ -49,7 +49,9 @@ checkpoints/
 *.safetensors
 
 # Project-local docs and agent working notes
-docs/
+!docs/
+docs/*
+!docs/datapilot-contract-v1-operations.md
 docs/2026-07-17-navigation-agent-deferred-issues.md
 
 # 数据

@@ -21,7 +21,63 @@ function turn(status: TurnRecord["status"], finishedAt: string | null = null): T
 }
 
 describe("ProcessingDisclosure", () => {
-  test("reveals a newly arrived safe progress paragraph incrementally", () => {
+  test("delays an empty v1 process for 400ms and suppresses a short direct answer", () => {
+    vi.useFakeTimers();
+    const items: TimelineItem[] = [
+      { kind: "progress", source: "main", text: "正在理解你的请求", turnId: "turn-1" },
+    ];
+    const { rerender } = render(
+      <ProcessingDisclosure turn={turn("running")} items={items} contractVersion={1} />,
+    );
+    expect(screen.queryByRole("button", { name: "正在处理" })).not.toBeInTheDocument();
+    act(() => vi.advanceTimersByTime(399));
+    expect(screen.queryByRole("button", { name: "正在处理" })).not.toBeInTheDocument();
+    rerender(
+      <ProcessingDisclosure
+        turn={turn("completed", "2026-07-16T04:00:00.300Z")}
+        items={items}
+        contractVersion={1}
+      />,
+    );
+    act(() => vi.advanceTimersByTime(1));
+    expect(screen.queryByRole("button")).not.toBeInTheDocument();
+    vi.useRealTimers();
+  });
+
+  test("shows v1 public actions immediately and never renders raw tools or percentages", () => {
+    const items: TimelineItem[] = [
+      { kind: "progress", source: "main", text: "已完成 50% 的数据", turnId: "turn-1" },
+      {
+        kind: "action",
+        source: "main",
+        text: "同步数据",
+        actionRef: "action-1",
+        actionDisplayName: "同步数据 75%",
+        actionStatus: "running",
+        turnId: "turn-1",
+      },
+      {
+        kind: "tool",
+        source: "navigation-data-agent",
+        text: "internal_sync_tool",
+        tool: "internal_sync_tool",
+        callId: "call-secret",
+        toolPhase: "running",
+        turnId: "turn-1",
+      },
+    ];
+    const { container } = render(
+      <ProcessingDisclosure turn={turn("running")} items={items} contractVersion={1} />,
+    );
+    expect(screen.getByRole("button", { name: "正在处理" })).toBeVisible();
+    expect(screen.getByText("已完成的数据")).toBeVisible();
+    expect(screen.getByText("正在同步数据")).toBeVisible();
+    expect(container).not.toHaveTextContent("internal_sync_tool");
+    expect(container).not.toHaveTextContent(/[%％]/);
+    expect(container.querySelector("[data-tool-call]")).toBeNull();
+  });
+
+  test("renders real streamed progress without a client-side typewriter", () => {
     vi.useFakeTimers();
     vi.setSystemTime(new Date("2026-07-16T04:00:12.000Z"));
     const text = "已确认原始数据，接下来开始提取。";
@@ -41,13 +97,7 @@ describe("ProcessingDisclosure", () => {
     const { container } = render(<ProcessingDisclosure turn={turn("running")} items={items} />);
 
     const paragraph = container.querySelector<HTMLElement>('[data-progress-id="progress-1"]')!;
-    expect(paragraph.textContent).toBe("");
-    act(() => vi.advanceTimersByTime(50));
-    expect(paragraph.textContent?.length).toBeGreaterThan(0);
-    expect(paragraph.textContent).not.toBe(text);
-    act(() => vi.advanceTimersByTime(1000));
     expect(paragraph).toHaveTextContent(text);
-    expect(screen.getByRole("status")).toHaveTextContent(text);
     vi.useRealTimers();
   });
 
@@ -140,7 +190,7 @@ describe("ProcessingDisclosure", () => {
     expect(screen.getByText("准备调用处理工具。")).not.toBeVisible();
   });
 
-  test("does not replay progress animation after folding and reopening", () => {
+  test("keeps progress intact after folding and reopening", () => {
     vi.useFakeTimers();
     vi.setSystemTime(new Date("2026-07-16T04:00:12.000Z"));
     const text = "已确认数据范围，接下来生成处理方案。";
@@ -161,7 +211,6 @@ describe("ProcessingDisclosure", () => {
     );
     const button = screen.getByRole("button", { name: /正在处理/ });
     const paragraph = container.querySelector<HTMLElement>('[data-progress-id="progress-1"]')!;
-    act(() => vi.advanceTimersByTime(1000));
     expect(paragraph).toHaveTextContent(text);
 
     fireEvent.click(button);

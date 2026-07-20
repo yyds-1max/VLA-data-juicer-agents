@@ -29,7 +29,7 @@ class WebSessionManager:
         self._controllers: dict[str, Any] = {}
         self._lock = threading.RLock()
 
-    def create_session(self, first_message: str) -> SessionRecord:
+    def create_session(self, first_message: str, entrypoint: str = "chat") -> SessionRecord:
         with self._lock:
             session = self._store.create_session(title=generate_session_title(first_message))
             try:

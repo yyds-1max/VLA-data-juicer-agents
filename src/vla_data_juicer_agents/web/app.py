@@ -30,7 +30,10 @@ from vla_data_juicer_agents.web.schemas import (
     HumanDecisionRecoveryResponse,
     HumanDecisionResponse,
     InterruptResponse,
+    InteractionResponse,
+    InteractionResponseRequest,
 )
+from vla_data_juicer_agents.web.contract_models import ContractConflictError
 from vla_data_juicer_agents.web.agent_session import AgentScopeWebSessionManager
 from vla_data_juicer_agents.web.session_manager import ControllerFactory, WebSessionManager
 from vla_data_juicer_agents.web.session_store import WebSessionStore
@@ -114,7 +117,9 @@ def create_app(
 
     @app.post("/api/sessions", response_model=CreateSessionResponse)
     async def create_session(request: CreateSessionRequest) -> CreateSessionResponse:
-        session = await _maybe_await(manager.create_session(request.message))
+        session = await _maybe_await(
+            manager.create_session(request.message, request.entrypoint)
+        )
         return CreateSessionResponse(session=session)
 
     @app.get("/api/sessions")
@@ -123,7 +128,8 @@ def create_app(
 
     @app.get("/api/sessions/{session_id}")
     async def get_session(session_id: str) -> dict[str, dict[str, Any]]:
-        session = store.get_session(session_id)
+        get_detail = getattr(manager, "get_session_detail", None)
+        session = get_detail(session_id) if callable(get_detail) else store.get_session(session_id)
         if session is None:
             raise HTTPException(status_code=404, detail="Session not found")
         return {"session": session.model_dump()}
@@ -186,6 +192,48 @@ def create_app(
         except KeyError as exc:
             raise HTTPException(status_code=404, detail="Session not found") from exc
         return InterruptResponse(interrupted=interrupted)
+
+    @app.post(
+        "/api/sessions/{session_id}/interactions/{interaction_id}/responses",
+        response_model=InteractionResponse,
+    )
+    async def submit_interaction_response(
+        session_id: str,
+        interaction_id: str,
+        request: InteractionResponseRequest,
+    ) -> InteractionResponse:
+        submit_response = getattr(manager, "submit_interaction_response", None)
+        if submit_response is None:
+            raise HTTPException(status_code=409, detail="Structured interactions are not supported")
+        try:
+            result = await _maybe_await(
+                submit_response(
+                    session_id,
+                    interaction_id,
+                    request.model_dump(exclude_none=True),
+                )
+            )
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail="Session or interaction not found") from exc
+        except ContractConflictError as exc:
+            get_detail = getattr(manager, "get_session_detail", None)
+            snapshot = get_detail(session_id) if callable(get_detail) else store.get_session(session_id)
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "code": exc.code,
+                    "message": str(exc),
+                    "session": snapshot.model_dump() if snapshot is not None else None,
+                },
+            ) from exc
+        except (RuntimeError, ValueError) as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        if agentscope_runtime is not None and getattr(manager, "event_bridge", None) is None:
+            _create_logged_task(
+                manager.forward_events_until_idle(session_id),
+                name=f"agentscope-events:{session_id}",
+            )
+        return InteractionResponse.model_validate(result)
 
     @app.post("/api/sessions/{session_id}/human-decisions", response_model=HumanDecisionResponse)
     async def submit_human_decision(

@@ -3,20 +3,41 @@ import { ChevronDown, ChevronRight } from "lucide-react";
 
 import type { TurnRecord } from "../../api/types";
 import type { TimelineItem } from "../../store/eventReducer";
+import { withoutPercentages } from "../../lib/utils";
 import { ToolStatusDot } from "./AgentRunSummary";
 
 type ProcessingDisclosureProps = {
   turn: TurnRecord;
   items: TimelineItem[];
+  contractVersion?: 0 | 1;
+  hasAnswer?: boolean;
 };
 
-export function ProcessingDisclosure({ turn, items }: ProcessingDisclosureProps) {
+export function ProcessingDisclosure({
+  turn,
+  items,
+  contractVersion = 0,
+  hasAnswer = false,
+}: ProcessingDisclosureProps) {
   const active = turn.status === "running" || turn.status === "waiting";
-  const visibleItems = visibleProcessingItems(items);
+  const visibleItems = visibleProcessingItems(items, contractVersion);
+  const meaningful = visibleItems.some((item) => !isInitialProgress(item));
+  const [delayElapsed, setDelayElapsed] = useState(contractVersion === 0);
+  const shouldRender = meaningful || (active && !hasAnswer && delayElapsed);
   const [expanded, setExpanded] = useState(active);
   const previousStatusRef = useRef(turn.status);
   const terminalAutoCollapsedRef = useRef(!active);
-  const now = useNow(active || items.some(isActiveTool));
+  const now = useNow(active || visibleItems.some(isActiveLegacyTool));
+
+  useEffect(() => {
+    if (contractVersion === 0 || meaningful || !active) {
+      if (contractVersion === 0 || meaningful) setDelayElapsed(true);
+      return undefined;
+    }
+    setDelayElapsed(false);
+    const timer = window.setTimeout(() => setDelayElapsed(true), 400);
+    return () => window.clearTimeout(timer);
+  }, [active, contractVersion, meaningful, turn.id]);
 
   useEffect(() => {
     if (previousStatusRef.current !== turn.status && !active && !terminalAutoCollapsedRef.current) {
@@ -30,21 +51,29 @@ export function ProcessingDisclosure({ turn, items }: ProcessingDisclosureProps)
     previousStatusRef.current = turn.status;
     terminalAutoCollapsedRef.current = !active;
     setExpanded(active);
-  }, [turn.id]);
+  }, [active, turn.id]);
+
+  if (!shouldRender) return null;
 
   const duration = formatDuration(turnDurationMs(turn, now));
   const contentId = `processing-${turn.id}`;
+  const title = turnTitle(turn.status);
 
   return (
-    <section className="mr-auto w-full max-w-[94%] text-console-text" data-turn-id={turn.id}>
+    <section
+      className="mr-auto w-full max-w-[94%] text-console-text"
+      data-turn-id={contractVersion === 0 ? turn.id : undefined}
+    >
       <button
         type="button"
+        aria-label={contractVersion === 1 ? title : `${title} ${duration}`}
         aria-expanded={expanded}
         aria-controls={contentId}
         onClick={() => setExpanded((value) => !value)}
-        className="flex w-full items-center gap-1.5 border-b border-console-line/80 py-2 text-left text-sm text-console-muted transition hover:text-console-text focus:outline-none focus-visible:ring-2 focus-visible:ring-console-cyan/60"
+        className="flex w-full items-center gap-1.5 border-b border-console-line/80 py-2 text-left text-sm text-console-muted transition motion-reduce:transition-none hover:text-console-text focus:outline-none focus-visible:ring-2 focus-visible:ring-console-cyan/60"
       >
-        <span>{turnTitle(turn.status, duration)}</span>
+        <span>{title}</span>
+        <span aria-hidden="true">{duration}</span>
         {expanded ? (
           <ChevronDown className="h-4 w-4" aria-hidden="true" />
         ) : (
@@ -52,95 +81,74 @@ export function ProcessingDisclosure({ turn, items }: ProcessingDisclosureProps)
         )}
       </button>
 
-      <div
-        id={contentId}
-        hidden={!expanded}
-        className="space-y-3 py-3 text-sm leading-6"
-      >
-        {visibleItems.map((item, index) =>
-          item.kind === "tool" ? (
-            <ToolProgressLine key={toolItemKey(item, index)} item={item} now={now} />
-          ) : item.kind === "progress" ? (
-            <ProgressParagraph
-              key={item.progressId
-                ? `progress-${item.runId ?? ""}-${item.progressId}`
-                : `progress-${index}`}
-              item={item}
-              animate={active}
-            />
-          ) : item.kind === "activity" ? (
-            legacyActivityParagraphs(item).map((text, textIndex) => (
+      <div id={contentId} hidden={!expanded} className="space-y-3 py-3 text-sm leading-6">
+        {visibleItems.map((item, index) => {
+          if (item.kind === "tool" && contractVersion === 0) {
+            return <LegacyToolLine key={legacyToolItemKey(item, index)} item={item} now={now} />;
+          }
+          if (item.kind === "action") {
+            return <PublicActionLine key={publicActionItemKey(item, index)} item={item} />;
+          }
+          if (item.kind === "progress") {
+            return (
+              <p
+                key={item.progressId ? `progress-${item.progressId}` : `progress-${index}`}
+                className="whitespace-pre-wrap break-words"
+                data-progress-id={item.progressId}
+              >
+                {contractVersion === 1 ? withoutPercentages(item.text) : item.text}
+              </p>
+            );
+          }
+          if (item.kind === "interaction") {
+            return (
+              <div key={`interaction-${item.interactionId ?? index}`} className="flex items-center gap-2 text-xs text-console-muted">
+                <ToolStatusDot status={item.status === "completed" ? "completed" : "running"} />
+                <span>{withoutPercentages(item.text)}</span>
+              </div>
+            );
+          }
+          if (item.kind === "activity" && contractVersion === 0) {
+            return legacyActivityParagraphs(item).map((text, textIndex) => (
               <p key={`legacy-${index}-${textIndex}`} className="whitespace-pre-wrap break-words">
                 {text}
               </p>
-            ))
-          ) : null,
-        )}
+            ));
+          }
+          return null;
+        })}
       </div>
     </section>
   );
 }
 
-function ProgressParagraph({ item, animate }: { item: TimelineItem; animate: boolean }) {
-  const characters = Array.from(item.text);
-  const animateOnMountRef = useRef(
-    animate && Boolean(item.progressId) && isRecentProgress(item.createdAt),
-  );
-  const [visibleCount, setVisibleCount] = useState(
-    animateOnMountRef.current ? 0 : characters.length,
-  );
-
-  useEffect(() => {
-    const reducedMotion = typeof window !== "undefined" &&
-      typeof window.matchMedia === "function" &&
-      window.matchMedia("(prefers-reduced-motion: reduce)").matches;
-    if (!animate || !animateOnMountRef.current || reducedMotion) {
-      setVisibleCount(characters.length);
-      return undefined;
-    }
-    if (visibleCount >= characters.length) {
-      return undefined;
-    }
-    const timer = window.setInterval(() => {
-      setVisibleCount((count) => Math.min(count + 2, characters.length));
-    }, 25);
-    return () => window.clearInterval(timer);
-  }, [animate, characters.length, visibleCount]);
-
-  const visibleText = characters.slice(0, visibleCount).join("");
+function PublicActionLine({ item }: { item: TimelineItem }) {
+  const status = item.actionStatus ?? "running";
+  const label = withoutPercentages(item.actionDisplayName || "处理数据");
+  const prefix = status === "completed"
+    ? "已完成"
+    : status === "failed"
+    ? "失败"
+    : status === "interrupted"
+    ? "已停止"
+    : "正在";
   return (
-    <p
-      className="whitespace-pre-wrap break-words"
-      data-progress-id={item.progressId}
-    >
-      <span
-        aria-hidden={visibleCount < characters.length ? "true" : undefined}
-        role={visibleCount >= characters.length ? "status" : undefined}
-        aria-live={visibleCount >= characters.length ? "polite" : undefined}
-      >
-        {visibleText}
-      </span>
-    </p>
+    <div className="flex min-w-0 items-center gap-2 text-xs text-console-muted" data-public-action={item.actionRef}>
+      <ToolStatusDot status={status} />
+      <span className="min-w-0 break-words">{prefix}{label}</span>
+    </div>
   );
 }
 
-function isRecentProgress(createdAt: string | undefined): boolean {
-  if (!createdAt) return true;
-  const timestamp = Date.parse(createdAt);
-  if (Number.isNaN(timestamp)) return false;
-  const age = Date.now() - timestamp;
-  return age >= -60_000 && age <= 5_000;
-}
-
-function ToolProgressLine({ item, now }: { item: TimelineItem; now: number }) {
-  const phase = item.toolPhase ?? normalizedToolPhase(item.status);
+function LegacyToolLine({ item, now }: { item: TimelineItem; now: number }) {
+  const phase = item.toolPhase ?? normalizedLegacyToolPhase(item.status);
   const tool = item.tool ?? item.text;
   const startedAt = item.startedAt ?? now;
   const finishedAt = item.finishedAt ?? now;
   const elapsedMs = Math.max((phase === "running" || phase === "background" ? now : finishedAt) - startedAt, 0);
   const elapsed = phase === "running" || phase === "background"
     ? `+${Math.floor(elapsedMs / 1000)}s`
-    : formatPreciseDuration(elapsedMs);
+    : `${(elapsedMs / 1000).toFixed(1)}s`;
   const text = phase === "running" || phase === "background"
     ? `正在调用 ${tool} ${elapsed}`
     : phase === "completed"
@@ -157,12 +165,12 @@ function ToolProgressLine({ item, now }: { item: TimelineItem; now: number }) {
   );
 }
 
-function turnTitle(status: TurnRecord["status"], duration: string): string {
-  if (status === "waiting") return `等待确认 ${duration}`;
-  if (status === "completed") return `已处理 ${duration}`;
-  if (status === "interrupted") return `已停止 ${duration}`;
-  if (status === "failed") return `处理异常 ${duration}`;
-  return `正在处理 ${duration}`;
+function turnTitle(status: TurnRecord["status"]): string {
+  if (status === "waiting") return "等待确认";
+  if (status === "completed") return "已处理";
+  if (status === "interrupted") return "已停止";
+  if (status === "failed") return "处理异常";
+  return "正在处理";
 }
 
 function turnDurationMs(turn: TurnRecord, now: number): number {
@@ -179,10 +187,6 @@ function formatDuration(milliseconds: number): string {
   return minutes > 0 ? `${minutes}m ${remaining}s` : `${remaining}s`;
 }
 
-function formatPreciseDuration(milliseconds: number): string {
-  return `${(milliseconds / 1000).toFixed(1)}s`;
-}
-
 function useNow(active: boolean): number {
   const [now, setNow] = useState(() => Date.now());
   useEffect(() => {
@@ -194,16 +198,17 @@ function useNow(active: boolean): number {
   return now;
 }
 
-function isActiveTool(item: TimelineItem): boolean {
+function isActiveLegacyTool(item: TimelineItem): boolean {
   return item.kind === "tool" && (item.toolPhase === "running" || item.toolPhase === "background");
 }
 
-function visibleProcessingItems(items: TimelineItem[]): TimelineItem[] {
-  const hasSubstantiveUpdate = items.some((item) => !isInitialProgress(item));
-  if (hasSubstantiveUpdate) {
-    return items.filter((item) => !isInitialProgress(item));
-  }
-  const initialProgress = items.find(isInitialProgress);
+function visibleProcessingItems(items: TimelineItem[], contractVersion: 0 | 1): TimelineItem[] {
+  const allowed = contractVersion === 1
+    ? items.filter((item) => ["progress", "action", "interaction"].includes(item.kind))
+    : items;
+  const hasSubstantiveUpdate = allowed.some((item) => !isInitialProgress(item));
+  if (hasSubstantiveUpdate) return allowed.filter((item) => !isInitialProgress(item));
+  const initialProgress = allowed.find(isInitialProgress);
   return initialProgress ? [initialProgress] : [];
 }
 
@@ -211,7 +216,7 @@ function isInitialProgress(item: TimelineItem): boolean {
   return item.kind === "progress" && item.text === "正在理解你的请求";
 }
 
-function normalizedToolPhase(status: string | undefined): NonNullable<TimelineItem["toolPhase"]> {
+function normalizedLegacyToolPhase(status: string | undefined): NonNullable<TimelineItem["toolPhase"]> {
   if (status === "completed" || status === "interrupted" || status === "background") return status;
   if (status === "running") return "running";
   return "failed";
@@ -223,6 +228,10 @@ function legacyActivityParagraphs(item: TimelineItem): string[] {
     .filter(Boolean);
 }
 
-function toolItemKey(item: TimelineItem, index: number): string {
+function legacyToolItemKey(item: TimelineItem, index: number): string {
   return `${item.turnId ?? "legacy"}:${item.runId ?? "run"}:${item.callId ?? index}`;
+}
+
+function publicActionItemKey(item: TimelineItem, index: number): string {
+  return `${item.turnId ?? "turn"}:${item.actionPhaseInstanceId ?? "phase"}:${item.actionRef ?? index}`;
 }

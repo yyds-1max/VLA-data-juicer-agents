@@ -105,6 +105,31 @@ describe("eventReducer", () => {
     });
   });
 
+  it("accepts coalesced contract-v1 progress summaries without private stream ids", () => {
+    const state = createEmptyRunState();
+    const metadata = { run_id: null, turn_id: "turn-v1", contract_version: 1 as const };
+    applyAgentEvent(state, event("progress_start", "", {
+      phase: "extract",
+      summary: "开始提取导航数据。",
+      task_ref: "task-REF123",
+    }, metadata));
+    applyAgentEvent(state, event("progress_delta", "", {
+      phase: "extract",
+      summary: "已确认数据范围，继续处理。",
+      task_ref: "task-REF123",
+    }, metadata));
+    applyAgentEvent(state, event("progress_end", "", {
+      phase: "extract",
+      status: "completed",
+      task_ref: "task-REF123",
+    }, metadata));
+
+    expect(state.timeline).toMatchObject([
+      { kind: "progress", text: "开始提取导航数据。", progressPhase: "completed" },
+      { kind: "progress", text: "已确认数据范围，继续处理。", progressPhase: "completed" },
+    ]);
+  });
+
   it("ignores duplicate progress starts and accepts a recovered delta without start", () => {
     const state = createEmptyRunState();
     const metadata = { run_id: "navigation-session", turn_id: "turn-1" };
@@ -1314,5 +1339,93 @@ describe("datapilotStore", () => {
     ]);
     expect(store.getState().run.running).toBe(true);
     expect(store.getState().run.activeText).toBe("正在调用工具 prepare_raw_data");
+  });
+
+  it("updates a public action in place without projecting raw tool metadata", () => {
+    const state = createEmptyRunState();
+    const metadata = { turn_id: "turn-v1", run_id: null, source: null };
+    applyAgentEvent(state, event("action_start", "", {
+      action_ref: "action-public-1",
+      action_code: "inspect_artifacts",
+      display_name: "检查数据产物",
+      phase: "检查",
+      phase_instance_id: "phase-1",
+      tool: "secret_internal_tool",
+      call_id: "secret-call-id",
+    }, metadata));
+    applyAgentEvent(state, event("action_end", "", {
+      action_ref: "action-public-1",
+      display_name: "检查数据产物",
+      phase_instance_id: "phase-1",
+      status: "completed",
+    }, metadata));
+
+    expect(state.timeline).toHaveLength(1);
+    expect(state.timeline[0]).toMatchObject({
+      kind: "action",
+      actionRef: "action-public-1",
+      actionDisplayName: "检查数据产物",
+      actionStatus: "completed",
+    });
+    expect(state.timeline[0]).not.toHaveProperty("tool");
+    expect(state.timeline[0]).not.toHaveProperty("callId");
+  });
+
+  it("restores contract-v1 task and interaction snapshots and applies their public events", () => {
+    const store = createDataPilotStore();
+    store.getState().restoreActiveSession(sessionDetail({
+      contract_version: 1,
+      tasks: [{
+        task_ref: "nav-A7K2",
+        domain: "navigation",
+        status: "active",
+        phase: "提取数据",
+        state_revision: 2,
+        started_at: "2026-06-26T00:00:00Z",
+        updated_at: "2026-06-26T00:01:00Z",
+      }],
+      pending_interaction: null,
+    }));
+    store.getState().applyEvent(event("task_state_updated", "", {
+      task_ref: "nav-A7K2",
+      status: "waiting_user",
+      phase: "确认标定参数",
+      state_revision: 3,
+      count: { done: 3, total: 8, unit: "个数据段" },
+    }, { source: null, run_id: null }));
+    store.getState().applyEvent(event("interaction_required", "", {
+      interaction_ref: "interaction-1",
+      task_ref: "nav-A7K2",
+      kind: "calibration_preview",
+      blocking: true,
+      risk: "high",
+      title: "确认标定参数",
+      summary: "确认后继续。",
+      options: [{ option_id: "confirm", label: "确认", destructive: true }],
+      interaction_revision: 1,
+      expected_task_revision: 3,
+      expires_at: null,
+    }, { source: null, run_id: null }));
+
+    expect(store.getState().currentContractVersion).toBe(1);
+    expect(store.getState().tasks[0]).toMatchObject({
+      task_ref: "nav-A7K2",
+      status: "waiting_user",
+      state_revision: 3,
+      count: { done: 3, total: 8, unit: "个数据段" },
+    });
+    expect(store.getState().pendingInteraction).toMatchObject({
+      interaction_id: "interaction-1",
+      blocking: true,
+      kind: "calibration_preview",
+      expires_at: null,
+      options: [{ option_id: "confirm", label: "确认", destructive: true }],
+    });
+
+    store.getState().applyEvent(event("interaction_resolved", "", {
+      interaction_ref: "interaction-1",
+      result_label: "已确认",
+    }, { source: null, run_id: null }));
+    expect(store.getState().pendingInteraction).toBeNull();
   });
 });

@@ -3,6 +3,7 @@ from __future__ import annotations
 import os
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Literal
 from urllib.parse import unquote, urlparse
 
 
@@ -62,6 +63,7 @@ class AgentScopeRuntimeConfig:
     agentscope_mount_path: str = "/api/agentscope"
     navigation_dry_run: bool = False
     tool_background_threshold_secs: float = 10.0
+    datapilot_single_agent_mode: Literal["off", "shortcut", "new_sessions"] = "new_sessions"
 
     def redis_connection_kwargs(self) -> dict[str, str | int | None]:
         parsed = urlparse(self.redis_url)
@@ -87,6 +89,17 @@ class AgentScopeRuntimeConfig:
             "password": unquote(parsed.password) if parsed.password else None,
         }
 
+    def contract_version_for_entrypoint(self, entrypoint: str) -> int:
+        """Choose the immutable conversation contract for a new Web session."""
+        if self.datapilot_single_agent_mode == "new_sessions":
+            return 1
+        if (
+            self.datapilot_single_agent_mode == "shortcut"
+            and entrypoint == "data_management_shortcut"
+        ):
+            return 1
+        return 0
+
     @classmethod
     def from_env(cls, workspace_root: str | Path | None = None) -> AgentScopeRuntimeConfig:
         dashscope_api_key = _required_env("DASHSCOPE_API_KEY")
@@ -106,6 +119,15 @@ class AgentScopeRuntimeConfig:
             or "./.djx"
         )
 
+        single_agent_mode = (
+            _env("VLA_DATAPILOT_SINGLE_AGENT_MODE") or "new_sessions"
+        ).lower()
+        if single_agent_mode not in {"off", "shortcut", "new_sessions"}:
+            raise ValueError(
+                "VLA_DATAPILOT_SINGLE_AGENT_MODE must be one of: "
+                "off, shortcut, new_sessions"
+            )
+
         return cls(
             user_id=_env("VLA_AGENT_USER_ID") or "default",
             redis_url=_env("VLA_AGENT_REDIS_URL") or "redis://localhost:6379/0",
@@ -121,4 +143,5 @@ class AgentScopeRuntimeConfig:
                 "VLA_AGENT_TOOL_BACKGROUND_THRESHOLD_SECS",
                 default=10.0,
             ),
+            datapilot_single_agent_mode=single_agent_mode,
         )

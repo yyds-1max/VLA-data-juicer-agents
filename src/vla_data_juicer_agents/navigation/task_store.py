@@ -178,6 +178,7 @@ class SqliteNavigationTaskStore:
     def create_task_attempt(
         self,
         *,
+        task_id: str | None = None,
         request: str,
         target: str,
         date: str,
@@ -214,7 +215,7 @@ class SqliteNavigationTaskStore:
 
             timestamp = utc_now()
             task = NavigationTask(
-                task_id=f"nav_{uuid4().hex}",
+                task_id=task_id or f"nav_{uuid4().hex}",
                 request=request,
                 target=target,
                 date=date,

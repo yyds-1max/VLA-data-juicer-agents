@@ -59,6 +59,12 @@ class AgentScopeEventBridge:
                 agent_id=mapping.agent_id,
                 agentscope_session_id=mapping.agentscope_session_id,
             )
+        for mapping in self._store.list_conversation_agent_sessions():
+            await self.ensure_mapping(
+                web_session_id=mapping.web_session_id,
+                agent_id=mapping.agent_id,
+                agentscope_session_id=mapping.agentscope_session_id,
+            )
 
     async def _reconcile_background_tools(self) -> None:
         resolver = getattr(self._runtime, "reconcile_background_tool_status", None)
@@ -86,7 +92,7 @@ class AgentScopeEventBridge:
             )
             await self._publish(
                 background.web_session_id,
-                record.model_dump(mode="json"),
+                _public_event_record(self._store, background.web_session_id, record),
             )
 
     async def stop(self) -> None:
@@ -105,6 +111,7 @@ class AgentScopeEventBridge:
             for mapping in self._store.list_agentscope_session_mappings()
             if mapping.web_session_id == web_session_id
         ]
+        mappings.extend(self._store.list_conversation_agent_sessions(web_session_id))
         for mapping in mappings:
             await self.ensure_mapping(
                 web_session_id=mapping.web_session_id,
@@ -173,11 +180,26 @@ class AgentScopeEventBridge:
                     ):
                         if not ready.is_set():
                             ready.set()
+                        projected_events = list(batch.events)
+                        contract_projector = getattr(
+                            self._runtime,
+                            "project_contract_v1_event_batch",
+                            None,
+                        )
+                        if callable(contract_projector):
+                            projected_events = list(
+                                contract_projector(
+                                    web_session_id=web_session_id,
+                                    agentscope_session_id=agentscope_session_id,
+                                    entry_id=batch.entry_id,
+                                    events=batch.events,
+                                )
+                            )
                         records = self._store.append_projected_event_batch(
                             web_session_id=web_session_id,
                             agentscope_session_id=agentscope_session_id,
                             entry_id=batch.entry_id,
-                            events=list(batch.events),
+                            events=projected_events,
                             raw_event_type=batch.raw_event_type,
                             reply_id=getattr(batch, "reply_id", None),
                         )
@@ -186,7 +208,7 @@ class AgentScopeEventBridge:
                             remember_cursor(agentscope_session_id, batch.entry_id)
                         self.metrics.last_cursor = batch.entry_id
                         self.metrics.projected_events += len(records)
-                        duplicate_count = max(0, len(batch.events) - len(records))
+                        duplicate_count = max(0, len(projected_events) - len(records))
                         self.metrics.duplicate_events += duplicate_count
                         projected_at = getattr(
                             batch,
@@ -213,7 +235,10 @@ class AgentScopeEventBridge:
                             self.metrics.unprocessed_events,
                         )
                         for record in records:
-                            await self._publish(web_session_id, record.model_dump(mode="json"))
+                            await self._publish(
+                                web_session_id,
+                                _public_event_record(self._store, web_session_id, record),
+                            )
                     if subscription_ready.is_set() and not ready.is_set():
                         ready.set()
                 except asyncio.CancelledError:
@@ -253,7 +278,10 @@ class AgentScopeEventBridge:
 
     async def publish_records(self, session_id: str, records: list[Any]) -> None:
         for record in records:
-            await self._publish(session_id, record.model_dump(mode="json"))
+            await self._publish(
+                session_id,
+                _public_event_record(self._store, session_id, record),
+            )
 
 
 class AgentScopeWebSessionManager:
@@ -285,8 +313,26 @@ class AgentScopeWebSessionManager:
         if callable(set_bridge):
             set_bridge(self.event_bridge)
 
-    async def create_session(self, first_message: str) -> SessionRecord:
-        return self._store.create_session(title=generate_session_title(first_message))
+    async def create_session(
+        self,
+        first_message: str,
+        entrypoint: str = "chat",
+    ) -> SessionRecord:
+        config = getattr(self._runtime, "config", None)
+        resolver = getattr(config, "contract_version_for_entrypoint", None)
+        contract_version = int(resolver(entrypoint)) if callable(resolver) else 0
+        return self._store.create_session(
+            title=generate_session_title(first_message),
+            contract_version=contract_version,
+        )
+
+    def get_session_detail(self, session_id: str):
+        detail = self._store.get_session(session_id)
+        if detail is None or detail.contract_version == 0:
+            return detail
+        detail.tasks = self._runtime.session_task_snapshots(session_id)
+        detail.pending_interaction = self._runtime.pending_interaction_snapshot(session_id)
+        return detail
 
     async def submit_turn(
         self,
@@ -335,8 +381,13 @@ class AgentScopeWebSessionManager:
         return interrupted
 
     async def submit_human_decision(self, session_id: str, decision: dict[str, Any]) -> bool:
-        if self._store.get_session(session_id) is None:
+        detail = self._store.get_session(session_id)
+        if detail is None:
             raise KeyError(session_id)
+        if detail.contract_version == 1:
+            raise RuntimeError(
+                "contract v1 decisions must use the structured interaction endpoint"
+            )
 
         submit_decision = getattr(self._runtime, "submit_human_decision", None)
         if submit_decision is None:
@@ -354,10 +405,171 @@ class AgentScopeWebSessionManager:
                 await self._publish_record(session_id, event)
         return accepted
 
+    async def submit_interaction_response(
+        self,
+        session_id: str,
+        interaction_id: str,
+        response: dict[str, Any],
+    ) -> dict[str, Any]:
+        detail = self._store.get_session(session_id)
+        if detail is None:
+            raise KeyError(session_id)
+        if detail.contract_version != 1:
+            raise RuntimeError("structured interactions require contract v1")
+        interaction = self._store.get_interaction(interaction_id)
+        if interaction is None or interaction.web_session_id != session_id:
+            raise KeyError(interaction_id)
+        idempotent_replay = (
+            interaction.status == "resolved"
+            and interaction.idempotency_key == str(response["idempotency_key"])
+        )
+        current_revision = self._runtime.interaction_task_revision_v1(
+            web_session_id=session_id,
+            task_id=interaction.task_id,
+        )
+        if (
+            not idempotent_replay
+            and current_revision != int(response["expected_task_revision"])
+        ):
+            from vla_data_juicer_agents.web.contract_models import ContractConflictError
+
+            raise ContractConflictError(
+                "task_revision_mismatch",
+                "task revision does not match",
+                current=self.get_session_detail(session_id),
+            )
+        selected = list(response.get("option_ids") or [response.get("option_id")])
+        navigation_db_resolver = getattr(
+            self._runtime,
+            "interaction_navigation_db_path_v1",
+            None,
+        )
+        navigation_db_path = (
+            navigation_db_resolver() if callable(navigation_db_resolver) else None
+        )
+        consumption = self._store.consume_interaction(
+            interaction_id,
+            interaction_revision=int(response["interaction_revision"]),
+            expected_task_revision=int(response["expected_task_revision"]),
+            idempotency_key=str(response["idempotency_key"]),
+            option_id=response.get("option_id"),
+            option_ids=response.get("option_ids"),
+            navigation_db_path=navigation_db_path,
+        )
+        labels = {
+            str(option.get("option_id")): str(option.get("label") or option.get("option_id"))
+            for option in consumption.interaction.options
+        }
+        content = "已选择：" + "、".join(labels.get(item, item) for item in selected)
+        submission = self._store.create_interaction_turn(
+            interaction_id,
+            content=content,
+        )
+        if submission.created:
+            for event in submission.events:
+                await self._publish_record(session_id, event)
+            resolved = self._store.append_timeline_event(
+                session_id,
+                {
+                    "type": "interaction_resolved",
+                    "turn_id": submission.turn.id,
+                    "payload": {
+                        "interaction_id": interaction_id,
+                        "task_ref": consumption.interaction.task_ref,
+                        "result_label": "、".join(labels.get(item, item) for item in selected),
+                    },
+                },
+            )
+            await self._publish_record(session_id, resolved)
+        deliver = getattr(self._runtime, "deliver_interaction_response_v1", None)
+        if callable(deliver):
+            accepted = bool(await deliver(interaction_id))
+        else:
+            outbox = self._store.get_outbox_by_idempotency_key(
+                f"navigation_resume:{interaction_id}:{consumption.interaction.revision}"
+            )
+            if outbox is None:
+                raise RuntimeError("interaction resume outbox is unavailable")
+            if outbox.status == "completed":
+                accepted = True
+            elif outbox.status == "failed":
+                accepted = False
+            else:
+                worker_id = f"interaction-manager:{interaction_id}"
+                claimed = self._store.claim_outbox_item(
+                    outbox.outbox_id,
+                    worker_id=worker_id,
+                    lease_seconds=120,
+                )
+                try:
+                    accepted = bool(
+                        await self._runtime.submit_interaction_response_v1(
+                            web_session_id=session_id,
+                            interaction=consumption.interaction,
+                            option_ids=selected,
+                            turn_id=submission.turn.id,
+                        )
+                    )
+                except Exception:
+                    self._store.complete_outbox(
+                        claimed.outbox_id,
+                        worker_id=worker_id,
+                        success=False,
+                        error="interaction_resume_failed",
+                    )
+                    await self._settle_interaction_delivery_failure(
+                        session_id,
+                        submission.turn.id,
+                    )
+                    raise
+                self._store.complete_outbox(
+                    claimed.outbox_id,
+                    worker_id=worker_id,
+                    success=accepted,
+                    error=None if accepted else "interaction_not_accepted",
+                )
+                if not accepted:
+                    await self._settle_interaction_delivery_failure(
+                        session_id,
+                        submission.turn.id,
+                    )
+        return {
+            "accepted": accepted,
+            "turn_id": submission.turn.id,
+            "session": self.get_session_detail(session_id),
+        }
+
+    async def _settle_interaction_delivery_failure(
+        self,
+        session_id: str,
+        turn_id: str,
+    ) -> None:
+        authority = self._store.get_response_authority(turn_id)
+        if authority is None or authority.lease_state != "open":
+            return
+        if authority.producer != "system_controller":
+            authority = self._store.takeover_response_authority(
+                turn_id,
+                expected_producer=authority.producer,
+                expected_generation=authority.generation,
+            )
+        committed = self._store.commit_authorized_final(
+            turn_id,
+            producer="system_controller",
+            response_generation=authority.generation,
+            text="该选择未能继续执行，请根据最新任务状态重试。",
+            terminal_status="failed",
+        )
+        for event in committed.events:
+            await self._publish_record(session_id, event)
+
     async def _publish_record(self, session_id: str, record: Any) -> None:
         if self._event_callback is None:
             return
-        result = self._event_callback(session_id, record.model_dump(mode="json"))
+        result = self._event_callback(
+            session_id,
+            _public_event_record(self._store, session_id, record),
+        )
         if inspect.isawaitable(result):
             await result
 
@@ -431,3 +643,14 @@ def _final_event_text(event: dict[str, Any]) -> str | None:
         return None
     text = payload.get("text")
     return text if isinstance(text, str) and text else None
+
+
+def _public_event_record(store: WebSessionStore, session_id: str, record: Any) -> dict[str, Any]:
+    event = record.model_dump(mode="json")
+    if store.get_session_contract_version(session_id) != 1:
+        return event
+    event["contract_version"] = 1
+    event.pop("source", None)
+    event.pop("run_id", None)
+    event.pop("parent_run_id", None)
+    return event

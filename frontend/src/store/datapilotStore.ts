@@ -3,9 +3,11 @@ import { createStore } from "zustand/vanilla";
 import type {
   AgentEvent,
   ChatMessageRecord,
+  PendingInteraction,
   PendingHumanDecision,
   SessionDetail,
   SessionRecord,
+  TaskSnapshot,
   TimelineEventRecord,
   TurnRecord,
 } from "../api/types";
@@ -38,11 +40,14 @@ export interface DataPilotStoreState {
   open: boolean;
   mode: SessionMode;
   currentSessionId: string | null;
+  currentContractVersion: 0 | 1;
   previousActiveSessionId: string | null;
   knownRunningSessionId: string | null;
   sessions: SessionRecord[];
   messages: ChatMessageRecord[];
   turns: TurnRecord[];
+  tasks: TaskSnapshot[];
+  pendingInteraction: PendingInteraction | null;
   run: RunState;
   pendingInvocation: DataPilotInvocation | null;
   floatingOffset: { x: number; y: number };
@@ -81,11 +86,14 @@ export function createDataPilotStore() {
     open: false,
     mode: "draft_new_session",
     currentSessionId: null,
+    currentContractVersion: 0,
     previousActiveSessionId: null,
     knownRunningSessionId: null,
     sessions: [],
     messages: [],
     turns: [],
+    tasks: [],
+    pendingInteraction: null,
     run: createEmptyRunState(),
     pendingInvocation: null,
     floatingOffset: { x: 0, y: 0 },
@@ -100,10 +108,13 @@ export function createDataPilotStore() {
       set((state) => ({
         mode: "draft_new_session",
         currentSessionId: null,
+        currentContractVersion: 0,
         previousActiveSessionId:
           state.mode === "active_session" ? state.currentSessionId : state.previousActiveSessionId,
         messages: [],
         turns: [],
+        tasks: [],
+        pendingInteraction: null,
         run: createEmptyRunState(),
       })),
 
@@ -111,10 +122,13 @@ export function createDataPilotStore() {
       set((state) => ({
         mode: "active_session",
         currentSessionId: session.id,
+        currentContractVersion: session.contract_version ?? 0,
         previousActiveSessionId: null,
         sessions: upsertSession(state.sessions, session),
         messages: [],
         turns: [],
+        tasks: [],
+        pendingInteraction: null,
         run: createEmptyRunState(),
       })),
 
@@ -126,13 +140,18 @@ export function createDataPilotStore() {
 
         const turns = mergeTurns(state.turns, session.turns ?? []);
         const run = session.events?.length ? mergeRunFromEvents(state.run, session.events) : state.run;
-        const running = session.turns
+        const running = (session.turns
           ? hasRunningTurn(session.turns)
-          : run.running || hasRunningTurn(turns);
+          : run.running || hasRunningTurn(turns)) || hasOpenTask(session.tasks ?? state.tasks);
         return {
           sessions: upsertSession(state.sessions, session),
           messages: mergeMessages(state.messages, session.messages),
           turns,
+          currentContractVersion: session.contract_version ?? state.currentContractVersion,
+          tasks: session.tasks ? mergeTasks(state.tasks, session.tasks) : state.tasks,
+          pendingInteraction: session.pending_interaction !== undefined
+            ? session.pending_interaction
+            : state.pendingInteraction,
           ...(run !== state.run ? { run } : {}),
           knownRunningSessionId: running
             ? session.id
@@ -146,14 +165,21 @@ export function createDataPilotStore() {
       set((state) => {
         const turns = "turns" in session ? [...(session.turns ?? [])] : [];
         const run = runFromEvents("events" in session ? (session.events ?? []) : []);
-        const running = hasRunningTurn(turns) || run.running;
+        const running = hasRunningTurn(turns) || run.running || hasOpenTask(
+          "tasks" in session ? (session.tasks ?? []) : [],
+        );
         return {
           mode: "active_session",
           currentSessionId: session.id,
+          currentContractVersion: session.contract_version ?? 0,
           previousActiveSessionId: null,
           sessions: upsertSession(state.sessions, session),
           messages: [...(messages ?? ("messages" in session ? session.messages : []))],
           turns,
+          tasks: "tasks" in session ? [...(session.tasks ?? [])] : [],
+          pendingInteraction: "pending_interaction" in session
+            ? (session.pending_interaction ?? null)
+            : null,
           run,
           knownRunningSessionId: running
             ? session.id
@@ -167,10 +193,15 @@ export function createDataPilotStore() {
       set((state) => ({
         mode: "history_session",
         currentSessionId: session.id,
+        currentContractVersion: session.contract_version ?? 0,
         previousActiveSessionId: null,
         sessions: upsertSession(state.sessions, session),
         messages: [...(messages ?? ("messages" in session ? session.messages : []))],
         turns: "turns" in session ? [...(session.turns ?? [])] : [],
+        tasks: "tasks" in session ? [...(session.tasks ?? [])] : [],
+        pendingInteraction: "pending_interaction" in session
+          ? (session.pending_interaction ?? null)
+          : null,
         run: runFromEvents("events" in session ? (session.events ?? []) : []),
       })),
 
@@ -306,10 +337,14 @@ export function createDataPilotStore() {
         const run = cloneRunState(state.run);
         applyLiveEvent(run, event);
         const turns = applyTurnEvent(state.turns, event, state.currentSessionId);
-        const running = run.running || hasRunningTurn(turns);
+        const tasks = applyTaskEvent(state.tasks, event);
+        const pendingInteraction = applyInteractionEvent(state.pendingInteraction, event);
+        const running = run.running || hasRunningTurn(turns) || hasOpenTask(tasks);
         return {
           run,
           turns,
+          tasks,
+          pendingInteraction,
           knownRunningSessionId: state.currentSessionId
             ? running
               ? state.currentSessionId
@@ -339,6 +374,170 @@ export const datapilotStore = createDataPilotStore();
 
 function hasRunningTurn(turns: TurnRecord[]): boolean {
   return turns.some((turn) => turn.status === "running" || turn.status === "waiting");
+}
+
+function hasOpenTask(tasks: TaskSnapshot[]): boolean {
+  return tasks.some(
+    (task) => !["cancelled", "completed", "failed", "superseded"].includes(task.status),
+  );
+}
+
+function applyTaskEvent(tasks: TaskSnapshot[], event: AgentEvent): TaskSnapshot[] {
+  if (event.type !== "task_state_updated") return tasks;
+  const payload = recordValue(event.payload?.task) ?? event.payload ?? {};
+  const taskRef = textValue(payload.task_ref) || textValue(payload.taskRef);
+  if (!taskRef) return tasks;
+  const existing = tasks.find((task) => task.task_ref === taskRef);
+  const status = navigationTaskStatus(payload.status) ?? existing?.status;
+  if (!status) return tasks;
+  const now = event.timestamp ?? new Date().toISOString();
+  const countRecord = recordValue(payload.count);
+  const count = countRecord
+    ? {
+        done: numberValue(countRecord.done),
+        total: numberValue(countRecord.total),
+        unit: textValue(countRecord.unit),
+      }
+    : existing?.count;
+  const next: TaskSnapshot = {
+    task_ref: taskRef,
+    domain: textValue(payload.domain) || existing?.domain || "navigation",
+    status,
+    phase: optionalText(payload.phase, existing?.phase),
+    waiting_reason: optionalText(payload.waiting_reason ?? payload.waitingReason, existing?.waiting_reason),
+    wait_cause: optionalText(payload.wait_cause ?? payload.waitCause, existing?.wait_cause),
+    latest_public_update: optionalText(
+      payload.latest_public_update ?? payload.latestPublicUpdate,
+      existing?.latest_public_update,
+    ),
+    available_actions: stringArray(payload.available_actions ?? payload.availableActions)
+      ?? existing?.available_actions,
+    state_revision: numberValue(
+      payload.state_revision ?? payload.stateRevision,
+      existing?.state_revision ?? 0,
+    ),
+    started_at: textValue(payload.started_at ?? payload.startedAt) || existing?.started_at || now,
+    updated_at: textValue(payload.updated_at ?? payload.updatedAt) || now,
+    ...(count && count.total > 0 ? { count } : {}),
+  };
+  return mergeTasks(tasks, [next]);
+}
+
+function applyInteractionEvent(
+  pending: PendingInteraction | null,
+  event: AgentEvent,
+): PendingInteraction | null {
+  if (event.type === "interaction_resolved") {
+    const interactionId = textValue(
+      event.payload?.interaction_id ?? event.payload?.interactionId ??
+      event.payload?.interaction_ref ?? event.payload?.interactionRef,
+    );
+    if (!interactionId) return pending;
+    return pending?.interaction_id === interactionId ? null : pending;
+  }
+  if (event.type !== "interaction_required") return pending;
+  const payload = recordValue(event.payload?.interaction) ?? event.payload ?? {};
+  const interactionId = textValue(
+    payload.interaction_id ?? payload.interactionId ?? payload.interaction_ref ?? payload.interactionRef,
+  );
+  const taskRef = textValue(payload.task_ref ?? payload.taskRef);
+  const kind = interactionKind(payload.kind);
+  const risk = interactionRisk(payload.risk);
+  const options = interactionOptions(payload.options);
+  if (!interactionId || !taskRef || !kind || !risk || options.length === 0) return pending;
+  return {
+    interaction_id: interactionId,
+    task_ref: taskRef,
+    kind,
+    blocking: payload.blocking === true,
+    risk,
+    title: textValue(payload.title) || "需要你的选择",
+    summary: textValue(payload.summary),
+    options,
+    interaction_revision: numberValue(
+      payload.interaction_revision ?? payload.interactionRevision,
+    ),
+    expected_task_revision: numberValue(
+      payload.expected_task_revision ?? payload.expectedTaskRevision,
+    ),
+    expires_at: optionalText(payload.expires_at ?? payload.expiresAt) ?? null,
+  };
+}
+
+function mergeTasks(existing: TaskSnapshot[], incoming: TaskSnapshot[]): TaskSnapshot[] {
+  const byRef = new Map(existing.map((task) => [task.task_ref, task]));
+  for (const task of incoming) byRef.set(task.task_ref, task);
+  return [...byRef.values()].sort((left, right) => right.updated_at.localeCompare(left.updated_at));
+}
+
+function recordValue(value: unknown): Record<string, unknown> | null {
+  return value && typeof value === "object" && !Array.isArray(value)
+    ? value as Record<string, unknown>
+    : null;
+}
+
+function textValue(value: unknown): string {
+  return typeof value === "string" ? value.trim() : "";
+}
+
+function optionalText(value: unknown, fallback?: string | null): string | null | undefined {
+  if (value === null) return null;
+  const text = textValue(value);
+  return text || fallback;
+}
+
+function numberValue(value: unknown, fallback = 0): number {
+  return typeof value === "number" && Number.isFinite(value) ? value : fallback;
+}
+
+function stringArray(value: unknown): string[] | undefined {
+  if (!Array.isArray(value)) return undefined;
+  return value.map(textValue).filter(Boolean);
+}
+
+function navigationTaskStatus(value: unknown): TaskSnapshot["status"] | undefined {
+  const status = textValue(value);
+  return [
+    "active", "waiting_user", "pausing", "paused", "cancelling", "cancelled",
+    "completed", "failed", "needs_replan", "superseded",
+  ].includes(status) ? status as TaskSnapshot["status"] : undefined;
+}
+
+function interactionKind(value: unknown): PendingInteraction["kind"] | undefined {
+  const kind = textValue(value);
+  return [
+    "high_risk_confirmation", "single_select", "multi_select", "calibration_preview",
+    "calibration_confirmation",
+  ].includes(kind) ? kind as PendingInteraction["kind"] : undefined;
+}
+
+function interactionRisk(value: unknown): PendingInteraction["risk"] | undefined {
+  const risk = textValue(value);
+  return ["low", "medium", "high"].includes(risk)
+    ? risk as PendingInteraction["risk"]
+    : undefined;
+}
+
+function interactionOptions(value: unknown): PendingInteraction["options"] {
+  if (!Array.isArray(value)) return [];
+  return value.flatMap((candidate) => {
+    const option = recordValue(candidate);
+    const optionId = textValue(option?.option_id ?? option?.optionId);
+    const label = textValue(option?.label);
+    if (!optionId || !label) return [];
+    const tone = textValue(option?.tone);
+    const description = textValue(option?.description);
+    const destructive = option?.destructive === true;
+    return [{
+      option_id: optionId,
+      label,
+      ...(description ? { description } : {}),
+      ...(destructive ? { destructive: true } : {}),
+      ...(["default", "primary", "danger"].includes(tone)
+        ? { tone: tone as "default" | "primary" | "danger" }
+        : {}),
+    }];
+  });
 }
 
 function upsertSession(sessions: SessionRecord[], session: SessionRecord): SessionRecord[] {

@@ -1,6 +1,7 @@
 export type SessionStatus = "draft" | "active" | "historical";
+export type SessionEntrypoint = "chat" | "data_management_shortcut";
 export type MessageRole = "user" | "assistant" | "system";
-export type TurnOrigin = "user" | "system";
+export type TurnOrigin = "user" | "system" | "interaction";
 export type TurnStatus = "running" | "waiting" | "completed" | "failed" | "interrupted";
 
 export interface TurnRecord {
@@ -17,6 +18,7 @@ export interface SessionRecord {
   id: string;
   title: string;
   status: SessionStatus;
+  contract_version?: 0 | 1;
   created_at: string;
   updated_at: string;
 }
@@ -41,16 +43,101 @@ export interface SessionDetail extends SessionRecord {
   messages: ChatMessageRecord[];
   events?: TimelineEventRecord[];
   turns?: TurnRecord[];
+  tasks?: TaskSnapshot[];
+  pending_interaction?: PendingInteraction | null;
 }
 
 export interface AgentEvent {
   type: string;
+  contract_version?: 0 | 1;
   source?: string | null;
   run_id?: string | null;
   parent_run_id?: string | null;
   timestamp?: string | null;
   turn_id?: string | null;
   payload: Record<string, unknown>;
+}
+
+export type NavigationTaskStatus =
+  | "active"
+  | "waiting_user"
+  | "pausing"
+  | "paused"
+  | "cancelling"
+  | "cancelled"
+  | "completed"
+  | "failed"
+  | "needs_replan"
+  | "superseded";
+
+export interface TaskCount {
+  done: number;
+  total: number;
+  unit: string;
+}
+
+/** Public, contract-v1 task projection. Internal task/session/run ids must never be added here. */
+export interface TaskSnapshot {
+  task_ref: string;
+  domain: string;
+  status: NavigationTaskStatus;
+  phase?: string | null;
+  waiting_reason?: string | null;
+  wait_cause?: string | null;
+  latest_public_update?: string | null;
+  available_actions?: string[];
+  state_revision: number;
+  started_at: string;
+  updated_at: string;
+  count?: TaskCount | null;
+}
+
+export type InteractionKind =
+  | "high_risk_confirmation"
+  | "single_select"
+  | "multi_select"
+  | "calibration_preview"
+  /** Transitional alias accepted from early contract-v1 snapshots. */
+  | "calibration_confirmation";
+
+export type InteractionRisk = "low" | "medium" | "high";
+
+export interface InteractionOption {
+  option_id: string;
+  label: string;
+  description?: string | null;
+  destructive?: boolean;
+  tone?: "default" | "primary" | "danger";
+}
+
+/** Public, durable contract-v1 interaction projection. */
+export interface PendingInteraction {
+  interaction_id: string;
+  task_ref: string;
+  kind: InteractionKind;
+  blocking: boolean;
+  risk: InteractionRisk;
+  title: string;
+  summary: string;
+  options: InteractionOption[];
+  interaction_revision: number;
+  expected_task_revision: number;
+  expires_at: string | null;
+}
+
+export interface InteractionResponsePayload {
+  option_id?: string;
+  option_ids?: string[];
+  interaction_revision: number;
+  expected_task_revision: number;
+  idempotency_key: string;
+}
+
+export interface InteractionResponseResult {
+  accepted: boolean;
+  turn_id?: string;
+  interaction?: PendingInteraction | null;
+  session?: SessionDetail;
 }
 
 export type HumanDecisionAction = "confirm" | "stop" | "guide";

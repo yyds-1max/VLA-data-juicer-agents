@@ -1,4 +1,4 @@
-import { useState, type FormEvent } from "react";
+import { forwardRef, useState, type FormEvent } from "react";
 import { ArrowUp, LoaderCircle, Paperclip, Square } from "lucide-react";
 
 type ComposerProps = {
@@ -9,7 +9,10 @@ type ComposerProps = {
   onInterrupt?: () => void;
 };
 
-export function Composer({ placeholder, running = false, interrupting = false, onSubmit, onInterrupt }: ComposerProps) {
+export const Composer = forwardRef<HTMLInputElement, ComposerProps>(function Composer(
+  { placeholder, running = false, interrupting = false, onSubmit, onInterrupt },
+  ref,
+) {
   const [message, setMessage] = useState("");
 
   const handleSubmit = (event: FormEvent<HTMLFormElement>) => {
@@ -44,6 +47,7 @@ export function Composer({ placeholder, running = false, interrupting = false, o
         <Paperclip className="h-4 w-4" aria-hidden="true" />
       </span>
       <input
+        ref={ref}
         value={message}
         onChange={(event) => setMessage(event.target.value)}
         placeholder={placeholder}
@@ -53,10 +57,10 @@ export function Composer({ placeholder, running = false, interrupting = false, o
         type="submit"
         aria-label={interrupting ? "Interrupt requested" : running ? "Stop current run" : "Send message"}
         disabled={interrupting}
-        className="flex h-9 w-9 shrink-0 items-center justify-center rounded-lg bg-console-text text-white transition hover:bg-slate-800 focus:outline-none focus:ring-2 focus:ring-console-cyan focus:ring-offset-2 focus:ring-offset-console-bg"
+        className="flex h-9 w-9 shrink-0 items-center justify-center rounded-lg bg-console-text text-white transition motion-reduce:transition-none hover:bg-slate-800 focus:outline-none focus:ring-2 focus:ring-console-cyan focus:ring-offset-2 focus:ring-offset-console-bg"
       >
         {interrupting ? (
-          <LoaderCircle className="h-5 w-5 animate-spin" aria-hidden="true" />
+          <LoaderCircle className="h-5 w-5 motion-safe:animate-spin" aria-hidden="true" />
         ) : running ? (
           <Square className="h-3.5 w-3.5 fill-current" aria-hidden="true" />
         ) : (
@@ -65,4 +69,4 @@ export function Composer({ placeholder, running = false, interrupting = false, o
       </button>
     </form>
   );
-}
+});

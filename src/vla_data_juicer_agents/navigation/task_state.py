@@ -19,6 +19,9 @@ def utc_now() -> str:
 class NavigationTaskStatus(StrEnum):
     ACTIVE = "active"
     WAITING_USER = "waiting_user"
+    PAUSING = "pausing"
+    PAUSED = "paused"
+    CANCELLING = "cancelling"
     COMPLETED = "completed"
     FAILED = "failed"
     CANCELLED = "cancelled"
