@@ -410,8 +410,6 @@ def test_shortcut_style_request_preserves_date_and_clips_in_router_handoff():
             "指定 clips：",
             "- 20260605_152856",
             "- 20260605_160012",
-            "",
-            "请先检查当前实际产物状态，再根据检查结果决定从哪一步开始。",
         ]
     )
 

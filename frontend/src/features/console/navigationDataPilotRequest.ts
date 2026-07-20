@@ -18,6 +18,5 @@ export function buildNavigationDatasetRequest(selection: NavigationDatasetSelect
     lines.push("指定 clips：", ...clips.map((clip) => `- ${clip}`));
   }
 
-  lines.push("", "请先检查当前实际产物状态，再根据检查结果决定从哪一步开始。");
   return lines.join("\n");
 }

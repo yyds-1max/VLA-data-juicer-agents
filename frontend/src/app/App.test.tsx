@@ -403,8 +403,6 @@ test("data management sends selected clips through a new visible DataPilot sessi
     "数据日期：20270515",
     "指定 clips：",
     "- clip_a",
-    "",
-    "请先检查当前实际产物状态，再根据检查结果决定从哪一步开始。",
   ].join("\n");
   await waitFor(() => expect(apiMocks.createSession).toHaveBeenCalledWith(message));
   await waitFor(() =>
