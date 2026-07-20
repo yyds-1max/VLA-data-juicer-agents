@@ -41,6 +41,7 @@ def test_load_router_smoke_suite_with_strict_versioned_schema():
     assert set(cases) == {
         "router_capability_no_handoff",
         "router_missing_target_clarifies",
+        "router_shortcut_current_template",
         "router_shortcut_preserves_scope",
     }
     assert all(case.schema_version == 1 for case in cases.values())
@@ -159,8 +160,12 @@ def test_missing_target_case_requires_short_chinese_question_and_no_handoff():
     assert "response.question" in failed_names
 
 
-def test_shortcut_case_requires_exact_single_handoff():
-    case = _cases()["router_shortcut_preserves_scope"]
+@pytest.mark.parametrize(
+    "case_id",
+    ["router_shortcut_preserves_scope", "router_shortcut_current_template"],
+)
+def test_shortcut_cases_require_exact_single_handoff(case_id):
+    case = _cases()[case_id]
     expected = case.expectations.tools.handoff
     assert expected is not None
     payload = {
@@ -198,6 +203,15 @@ def test_shortcut_case_requires_exact_single_handoff():
     failed_names = {check.name for check in failing.checks if not check.passed}
     assert "handoff.clips" in failed_names
     assert "handoff.forbidden_fields" in failed_names
+
+
+def test_current_shortcut_case_matches_template_without_artifact_hint():
+    case = _cases()["router_shortcut_current_template"]
+    expected = case.expectations.tools.handoff
+
+    assert expected is not None
+    assert case.conversation[0].content == expected.request
+    assert "请先检查当前实际产物状态" not in expected.request
 
 
 def test_case_result_distinguishes_timeout_and_error():
