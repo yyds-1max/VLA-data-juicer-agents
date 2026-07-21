@@ -9,17 +9,14 @@ import {
   interruptTurn,
   listSessions,
   openSessionEvents,
-  recoverHumanDecision,
-  submitHumanDecision,
   submitInteractionResponse,
   submitTurn,
 } from "../../api/client";
-import type { PendingHumanDecision, PendingInteraction, SessionDetail, SessionRecord } from "../../api/types";
+import type { PendingInteraction, SessionDetail, SessionRecord } from "../../api/types";
 import { withoutPercentages } from "../../lib/utils";
 import { datapilotStore, type DataPilotInvocation } from "../../store/datapilotStore";
 import { Composer } from "./Composer";
 import { DraftNewSessionView } from "./DraftNewSessionView";
-import { HumanDecisionDialog } from "./HumanDecisionDialog";
 import { InteractionPanel } from "./InteractionPanel";
 import { MessageList } from "./MessageList";
 import { SessionHeader } from "./SessionHeader";
@@ -39,7 +36,6 @@ export function DataPilotWindow() {
   const open = useStore(datapilotStore, (state) => state.open);
   const mode = useStore(datapilotStore, (state) => state.mode);
   const currentSessionId = useStore(datapilotStore, (state) => state.currentSessionId);
-  const contractVersion = useStore(datapilotStore, (state) => state.currentContractVersion);
   const sessions = useStore(datapilotStore, (state) => state.sessions);
   const messages = useStore(datapilotStore, (state) => state.messages);
   const turns = useStore(datapilotStore, (state) => state.turns);
@@ -49,14 +45,11 @@ export function DataPilotWindow() {
   const pendingInvocation = useStore(datapilotStore, (state) => state.pendingInvocation);
   const runRunning = useStore(datapilotStore, (state) => state.run.running);
   const interrupting = useStore(datapilotStore, (state) => state.run.interrupting);
-  const pendingHumanDecision = useStore(datapilotStore, (state) => state.run.pendingHumanDecision);
   const floatingOffset = useStore(datapilotStore, (state) => state.floatingOffset);
   const setFloatingOffset = useStore(datapilotStore, (state) => state.setFloatingOffset);
   const [historyOpen, setHistoryOpen] = useState(false);
   const [rendered, setRendered] = useState(open);
   const [closing, setClosing] = useState(false);
-  const [recoveringHumanDecision, setRecoveringHumanDecision] = useState(false);
-  const [humanDecisionRecoveryError, setHumanDecisionRecoveryError] = useState("");
   const [submittingInteraction, setSubmittingInteraction] = useState(false);
   const [interactionError, setInteractionError] = useState("");
   const [viewport, setViewport] = useState(() => ({
@@ -65,7 +58,6 @@ export function DataPilotWindow() {
   }));
   const socketRef = useRef<{ sessionId: string; socket: WebSocket } | null>(null);
   const reconnectTimerRef = useRef<number | null>(null);
-  const humanDecisionRecoveryRequestRef = useRef(0);
   const composerInputRef = useRef<HTMLInputElement | null>(null);
   const previousInteractionRef = useRef<PendingInteraction | null>(null);
   const dragRef = useRef<DragState | null>(null);
@@ -236,7 +228,11 @@ export function DataPilotWindow() {
 
   const submitNewSessionMessage = useCallback(async (
     message: string,
-    options: { invocationId?: string; sessionId?: string } = {},
+    options: {
+      invocationId?: string;
+      sessionId?: string;
+      requestContext?: DataPilotInvocation["requestContext"];
+    } = {},
   ) => {
     let sessionId = options.sessionId;
     let localTurnId: string | null = null;
@@ -250,7 +246,7 @@ export function DataPilotWindow() {
         }
       } else {
         const session = options.invocationId
-          ? await createSession(message, "data_management_shortcut")
+          ? await createSession(message, "data_management_shortcut", options.requestContext)
           : await createSession(message);
         sessionId = session.id;
         datapilotStore.getState().setActiveSession(session);
@@ -264,7 +260,7 @@ export function DataPilotWindow() {
       const userMessage = localUserMessage(sessionId, message, localTurnId);
       userMessageId = userMessage.id;
       store.appendUserMessage(userMessage);
-      store.applyEvent(localTurnEvent("turn_start", sessionId, localTurnId));
+      store.applyEvent(localTurnEvent("turn_start", localTurnId));
       openEvents(sessionId);
       const turnId = options.invocationId
         ? await submitTurn(sessionId, message, options.invocationId)
@@ -281,7 +277,7 @@ export function DataPilotWindow() {
       }
       if (localTurnId) {
         store.discardLocalTurn(localTurnId);
-        store.applyEvent(localTurnEvent("turn_submission_failed", sessionId ?? "", localTurnId));
+        store.applyEvent(localTurnEvent("turn_submission_failed", localTurnId));
       }
       if (options.invocationId) {
         store.failDataPilotInvocation(
@@ -354,6 +350,7 @@ export function DataPilotWindow() {
     await submitNewSessionMessage(invocation.message, {
       invocationId: invocation.invocationId,
       sessionId: invocation.sessionId,
+      requestContext: invocation.requestContext,
     });
   }, [refreshKnownRunningSession, submitNewSessionMessage]);
 
@@ -377,7 +374,7 @@ export function DataPilotWindow() {
     const localTurnId = createLocalTurnId();
     const userMessage = localUserMessage(currentSessionId, message, localTurnId);
     store.appendUserMessage(userMessage);
-    store.applyEvent(localTurnEvent("turn_start", currentSessionId, localTurnId));
+    store.applyEvent(localTurnEvent("turn_start", localTurnId));
     try {
       openEvents(currentSessionId);
       const turnId = await submitTurn(currentSessionId, message);
@@ -386,7 +383,7 @@ export function DataPilotWindow() {
       datapilotStore.getState().discardLocalMessage(userMessage.id);
       datapilotStore.getState().discardLocalTurn(localTurnId);
       datapilotStore.getState().applyEvent(
-        localTurnEvent("turn_submission_failed", currentSessionId, localTurnId),
+        localTurnEvent("turn_submission_failed", localTurnId),
       );
       console.error("Failed to submit DataPilot active turn", error);
     }
@@ -399,53 +396,10 @@ export function DataPilotWindow() {
 
     const interrupted = await interruptTurn(currentSessionId);
     if (interrupted) {
-      if (contractVersion === 1) {
-        const detail = await getSession(currentSessionId);
-        datapilotStore.getState().restoreActiveSession(detail, detail.messages);
-        return;
-      }
-      datapilotStore.getState().applyEvent({
-        type: "interrupt_requested",
-        source: "main",
-        run_id: currentSessionId,
-        parent_run_id: null,
-        timestamp: new Date().toISOString(),
-        payload: {},
-      });
+      const detail = await getSession(currentSessionId);
+      datapilotStore.getState().restoreActiveSession(detail, detail.messages);
     }
   };
-
-  const handleHumanDecision = useCallback(
-    async (action: "confirm" | "stop" | "guide", text?: string) => {
-      if (!currentSessionId || !pendingHumanDecision) {
-        return;
-      }
-
-      const sessionId = currentSessionId;
-      const decision = pendingHumanDecision;
-      if (decision.recoveryRequired || decision.submissionDisabled) {
-        return;
-      }
-
-      try {
-        const accepted = await submitHumanDecision(sessionId, {
-          action,
-          request_id: decision.requestId,
-          tool_call_id: decision.toolCallId,
-          reply_id: decision.replyId,
-          ...(decision.planId ? { plan_id: decision.planId } : {}),
-          ...(decision.stepId ? { step_id: decision.stepId } : {}),
-          ...(text ? { text } : {}),
-        });
-        if (accepted) {
-          datapilotStore.getState().clearPendingHumanDecision(decision, sessionId);
-        }
-      } catch (error) {
-        console.error("Failed to submit human decision", error);
-      }
-    },
-    [currentSessionId, pendingHumanDecision],
-  );
 
   const handleInteractionResponse = useCallback(async (optionIds: string[]) => {
     if (!currentSessionId || !pendingInteraction || optionIds.length === 0) return;
@@ -465,6 +419,7 @@ export function DataPilotWindow() {
       } else if (result.accepted) {
         datapilotStore.getState().applyEvent({
           type: "interaction_resolved",
+          contract_version: 1,
           timestamp: new Date().toISOString(),
           turn_id: result.turn_id ?? null,
           payload: {
@@ -485,70 +440,6 @@ export function DataPilotWindow() {
       setSubmittingInteraction(false);
     }
   }, [currentSessionId, pendingInteraction]);
-
-  useEffect(() => {
-    humanDecisionRecoveryRequestRef.current += 1;
-    setRecoveringHumanDecision(false);
-    setHumanDecisionRecoveryError("");
-  }, [
-    currentSessionId,
-    pendingHumanDecision?.replyId,
-    pendingHumanDecision?.toolCallId,
-    pendingHumanDecision?.recoveryRequired,
-  ]);
-
-  const handleHumanDecisionRecovery = useCallback(
-    async (reason: string) => {
-      const planId = pendingHumanDecision?.planId;
-      const stepId = pendingHumanDecision?.stepId;
-      if (
-        !currentSessionId ||
-        !pendingHumanDecision?.recoveryRequired ||
-        !planId ||
-        !stepId ||
-        !reason.trim()
-      ) {
-        return;
-      }
-      const sessionId = currentSessionId;
-      const decision = pendingHumanDecision;
-      const requestToken = humanDecisionRecoveryRequestRef.current + 1;
-      humanDecisionRecoveryRequestRef.current = requestToken;
-      const isCurrentRequest = () => {
-        const state = datapilotStore.getState();
-        return (
-          humanDecisionRecoveryRequestRef.current === requestToken &&
-          state.currentSessionId === sessionId &&
-          samePendingHumanDecision(state.run.pendingHumanDecision, decision)
-        );
-      };
-      setRecoveringHumanDecision(true);
-      setHumanDecisionRecoveryError("");
-      try {
-        const result = await recoverHumanDecision(sessionId, {
-          action: "quarantine_and_replan",
-          plan_id: planId,
-          step_id: stepId,
-          reason: reason.trim(),
-        });
-        if (result.recovered) {
-          datapilotStore.getState().clearPendingHumanDecision(decision, sessionId);
-        }
-      } catch (error) {
-        if (isCurrentRequest()) {
-          setHumanDecisionRecoveryError(
-            error instanceof Error ? error.message : "受控恢复失败，请重试。",
-          );
-        }
-        console.error("Failed to recover human decision", error);
-      } finally {
-        if (isCurrentRequest()) {
-          setRecoveringHumanDecision(false);
-        }
-      }
-    },
-    [currentSessionId, pendingHumanDecision],
-  );
 
   const handleDragStart = useCallback((event: PointerEvent<HTMLElement>) => {
     const target = event.target;
@@ -690,18 +581,8 @@ export function DataPilotWindow() {
           <div className="sr-only" aria-live="polite" aria-atomic="true">
             {liveAnnouncement(pendingInteraction, tasks)}
           </div>
-          <MessageList messages={messages} turns={turns} run={run} contractVersion={contractVersion} />
-          <HumanDecisionDialog
-            key={`${currentSessionId ?? ""}:${pendingHumanDecision?.replyId ?? ""}:${pendingHumanDecision?.toolCallId ?? ""}`}
-            decision={pendingInteraction ? null : pendingHumanDecision}
-            onConfirm={() => handleHumanDecision("confirm")}
-            onStop={() => handleHumanDecision("stop")}
-            onGuide={(text) => handleHumanDecision("guide", text)}
-            onRecover={handleHumanDecisionRecovery}
-            recovering={recoveringHumanDecision}
-            recoveryError={humanDecisionRecoveryError || undefined}
-          />
-          {contractVersion === 1 ? <TaskStrip tasks={tasks} /> : null}
+          <MessageList messages={messages} turns={turns} run={run} />
+          <TaskStrip tasks={tasks} />
           {pendingInteraction ? (
             <InteractionPanel
               key={`${pendingInteraction.interaction_id}:${pendingInteraction.interaction_revision}`}
@@ -711,8 +592,8 @@ export function DataPilotWindow() {
               onSubmit={handleInteractionResponse}
             />
           ) : null}
-          {pendingHumanDecision || pendingInteraction?.blocking ? null : (
-            <div className={`${contractVersion === 1 && tasks.length > 0 ? "" : "border-t border-console-line"} p-3 sm:p-4`}>
+          {pendingInteraction?.blocking ? null : (
+            <div className={`${tasks.length > 0 ? "" : "border-t border-console-line"} p-3 sm:p-4`}>
               <Composer
                 ref={composerInputRef}
                 placeholder="继续描述任务…"
@@ -725,26 +606,9 @@ export function DataPilotWindow() {
           )}
         </div>
       ) : (
-        <MessageList messages={messages} turns={turns} run={run} contractVersion={contractVersion} />
+        <MessageList messages={messages} turns={turns} run={run} />
       )}
     </section>
-  );
-}
-
-function samePendingHumanDecision(
-  left: PendingHumanDecision | null,
-  right: PendingHumanDecision,
-): boolean {
-  return Boolean(
-    left &&
-      left.replyId === right.replyId &&
-      left.toolCallId === right.toolCallId &&
-      left.requestId === right.requestId &&
-      left.planId === right.planId &&
-      left.stepId === right.stepId &&
-      left.recoveryRequired === right.recoveryRequired &&
-      left.submissionDisabled === right.submissionDisabled &&
-      left.recoveryEndpoint === right.recoveryEndpoint,
   );
 }
 
@@ -792,15 +656,12 @@ function localUserMessage(sessionId: string, content: string, turnId?: string) {
 
 function localTurnEvent(
   type: "turn_start" | "turn_submission_failed",
-  sessionId: string,
   turnId: string,
 ) {
   const timestamp = new Date().toISOString();
   return {
     type,
-    source: "main",
-    run_id: sessionId,
-    parent_run_id: null,
+    contract_version: 1 as const,
     timestamp,
     turn_id: turnId,
     payload: type === "turn_start" ? { status: "running", started_at: timestamp } : {},

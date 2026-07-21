@@ -1,0 +1,33 @@
+schema_version: 2
+id: router_waiting_rejects_postprocessing
+suite: datapilot-v1
+entrypoint: router
+tags: [v1, router, waiting-user, reject-postprocessing, continue, normal-close]
+runtime_setup:
+  focused_task:
+    task_ref: DP-EVAL-WAITING-REJECT
+    status: waiting_user
+    dataset_date: "20270605"
+    selection:
+      kind: selected_clips
+      clips: ["20260605_152856"]
+    wait_cause: 等待确认是否继续后处理；拒绝时由导航任务正常收尾
+conversation:
+  - role: user
+    content: 不继续后处理了，就到这里正常收尾。
+limits:
+  max_model_calls: 1
+  max_tool_calls: 1
+  timeout_seconds: 180
+expectations:
+  tools:
+    allowed_calls: [continue_navigation_data_task]
+    required_counts:
+      continue_navigation_data_task: 1
+    handoff_count: 1
+    handoff:
+      operation: continue
+      status: active
+      forbidden_fields: [request, task_ref_input, revision, intent, task_id, run_id]
+  response:
+    forbidden_terms: [MainRouterAgent, NavigationDataAgent, start_navigation_data_task, continue_navigation_data_task, control_navigation_data_task, task_id, run_id, call_id, system prompt, 系统提示词]

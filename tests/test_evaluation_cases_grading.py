@@ -29,10 +29,15 @@ from vla_data_juicer_agents.evaluation.reporting import (
 
 
 SUITE = "router-smoke"
+V1_SUITE = "datapilot-v1"
 
 
 def _cases() -> dict[str, EvaluationCase]:
     return {case.id: case for case in load_suite(default_cases_root(), SUITE)}
+
+
+def _v1_cases() -> dict[str, EvaluationCase]:
+    return {case.id: case for case in load_suite(default_cases_root(), V1_SUITE)}
 
 
 def test_load_router_smoke_suite_with_strict_versioned_schema():
@@ -46,6 +51,45 @@ def test_load_router_smoke_suite_with_strict_versioned_schema():
     }
     assert all(case.schema_version == 1 for case in cases.values())
     assert all(case.entrypoint == "router" for case in cases.values())
+
+
+def test_load_datapilot_v1_suite_without_rewriting_historical_suite():
+    cases = _v1_cases()
+
+    assert set(cases) == {
+        "router_active_unrelated_direct",
+        "router_capability_direct",
+        "router_clarify_date_preserves_selected_clip_multiturn",
+        "router_missing_date_clarifies",
+        "router_new_task_conflict_direct",
+        "router_resume_paused",
+        "router_shortcut_trusted_context_exact_scope",
+        "router_start_date_all_clips",
+        "router_start_selected_multiple_clips",
+        "router_start_selected_cross_date_prefix",
+        "router_status_query_direct",
+        "router_continue_waiting_task",
+        "router_control_stop",
+        "router_control_cancel",
+        "router_start_then_stop_multiturn",
+        "router_navigation_never_uses_generic_tools",
+        "router_waiting_rejects_postprocessing",
+    }
+    assert all(case.schema_version == 2 for case in cases.values())
+    assert len(cases["router_start_then_stop_multiturn"].conversation) == 2
+    assert len(
+        cases["router_clarify_date_preserves_selected_clip_multiturn"].conversation,
+    ) == 2
+    assert cases["router_continue_waiting_task"].runtime_setup is not None
+    shortcut_setup = cases[
+        "router_shortcut_trusted_context_exact_scope"
+    ].runtime_setup
+    assert shortcut_setup is not None
+    assert shortcut_setup.request_context is not None
+    assert shortcut_setup.request_context.selection == {
+        "kind": "selected_clips",
+        "clips": ["20260605_152856", "route_A_07"],
+    }
 
 
 def test_case_schema_rejects_unknown_fields():
@@ -84,6 +128,16 @@ def test_v1_case_schema_rejects_conversation_history(conversation):
     raw["conversation"] = conversation
 
     with pytest.raises(ValidationError, match="exactly one user conversation turn"):
+        EvaluationCase.model_validate(raw)
+
+
+def test_v2_case_schema_accepts_user_multiturn_and_rejects_seeded_assistant_turns():
+    case = _v1_cases()["router_start_then_stop_multiturn"]
+    assert [turn.role for turn in case.conversation] == ["user", "user"]
+
+    raw = case.model_dump(mode="python")
+    raw["conversation"].insert(1, {"role": "assistant", "content": "已启动。"})
+    with pytest.raises(ValidationError, match="assistant turns are produced by the host"):
         EvaluationCase.model_validate(raw)
 
 
@@ -203,6 +257,173 @@ def test_shortcut_cases_require_exact_single_handoff(case_id):
     failed_names = {check.name for check in failing.checks if not check.passed}
     assert "handoff.clips" in failed_names
     assert "handoff.forbidden_fields" in failed_names
+
+
+@pytest.mark.parametrize(
+    ("case_id", "payload"),
+    [
+        (
+            "router_start_date_all_clips",
+            {
+                "operation": "start",
+                "scope_source": "interpreted_user_text",
+                "dataset_date": "20270605",
+                "selection": {"kind": "all_clips"},
+            },
+        ),
+        (
+            "router_start_selected_cross_date_prefix",
+            {
+                "operation": "start",
+                "scope_source": "interpreted_user_text",
+                "dataset_date": "20270605",
+                "selection": {
+                    "kind": "selected_clips",
+                    "clips": ["20260605_152856"],
+                },
+            },
+        ),
+        (
+            "router_start_selected_multiple_clips",
+            {
+                "operation": "start",
+                "scope_source": "interpreted_user_text",
+                "dataset_date": "20270605",
+                "selection": {
+                    "kind": "selected_clips",
+                    "clips": [
+                        "20260605_152856",
+                        "20260605_153012",
+                        "route_A_07",
+                    ],
+                },
+            },
+        ),
+        (
+            "router_clarify_date_preserves_selected_clip_multiturn",
+            {
+                "operation": "start",
+                "scope_source": "interpreted_user_text",
+                "dataset_date": "20270605",
+                "selection": {
+                    "kind": "selected_clips",
+                    "clips": ["20260605_152856"],
+                },
+            },
+        ),
+        (
+            "router_shortcut_trusted_context_exact_scope",
+            {
+                "operation": "start",
+                "scope_source": "request_context",
+                "dataset_date": "20270605",
+                "selection": {
+                    "kind": "selected_clips",
+                    "clips": ["20260605_152856", "route_A_07"],
+                },
+            },
+        ),
+        (
+            "router_continue_waiting_task",
+            {"operation": "continue", "status": "active"},
+        ),
+        (
+            "router_waiting_rejects_postprocessing",
+            {"operation": "continue", "status": "active"},
+        ),
+        (
+            "router_resume_paused",
+            {"operation": "continue", "status": "active"},
+        ),
+        (
+            "router_control_stop",
+            {"operation": "stop", "status": "pausing"},
+        ),
+        (
+            "router_control_cancel",
+            {"operation": "cancel", "status": "cancelling"},
+        ),
+    ],
+)
+def test_datapilot_v1_cases_grade_production_operation_payloads(case_id, payload):
+    case = _v1_cases()[case_id]
+    tool_name = next(iter(case.expectations.tools.required_counts))
+    final_response = (
+        "请提供数据目录日期（YYYYMMDD）？"
+        if case_id == "router_clarify_date_preserves_selected_clip_multiturn"
+        else ""
+    )
+    result = grade_case(
+        case,
+        CaseRunObservation(
+            final_response=final_response,
+            tool_calls=[ToolCallObservation(name=tool_name, arguments=payload)],
+            handoffs=[payload],
+            model_calls=1,
+        ),
+    )
+
+    assert result.status is EvaluationStatus.PASS
+
+
+@pytest.mark.parametrize(
+    ("case_id", "response"),
+    [
+        (
+            "router_status_query_direct",
+            "当前任务仍在处理中，正处于准备阶段。",
+        ),
+        (
+            "router_active_unrelated_direct",
+            "机器学习是让模型从数据中发现规律并用于预测的方法。",
+        ),
+        (
+            "router_new_task_conflict_direct",
+            "当前任务仍在处理，请先等待它完成或取消，再创建新任务。",
+        ),
+    ],
+)
+def test_datapilot_v1_contextual_direct_answers_are_strictly_tool_free(
+    case_id,
+    response,
+):
+    case = _v1_cases()[case_id]
+    passing = grade_case(
+        case,
+        CaseRunObservation(final_response=response, model_calls=1),
+    )
+    assert passing.status is EvaluationStatus.PASS
+
+    failing = grade_case(
+        case,
+        CaseRunObservation(
+            final_response=response,
+            tool_calls=[
+                ToolCallObservation(
+                    name="start_navigation_data_task",
+                    arguments={},
+                ),
+            ],
+            model_calls=1,
+        ),
+    )
+    assert failing.status is EvaluationStatus.FAIL
+    failed_names = {check.name for check in failing.checks if not check.passed}
+    assert {"tools.allowed", "limits.tool_calls"} <= failed_names
+
+
+def test_runtime_setup_rejects_mixed_focused_task_and_trusted_request_context():
+    case = _v1_cases()["router_shortcut_trusted_context_exact_scope"]
+    raw = case.model_dump(mode="python")
+    raw["runtime_setup"]["focused_task"] = {
+        "task_ref": "DP-EVAL-FOCUSED",
+        "status": "active",
+        "dataset_date": "20270605",
+        "selection": {"kind": "all_clips"},
+    }
+
+    with pytest.raises(ValidationError, match="cannot be seeded together"):
+        EvaluationCase.model_validate(raw)
 
 
 def test_current_shortcut_case_matches_template_without_artifact_hint():

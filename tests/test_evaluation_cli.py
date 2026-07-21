@@ -78,6 +78,14 @@ def _comparison_report(status: str) -> dict:
     }
 
 
+@pytest.mark.parametrize("command", ["validate", "run"])
+def test_cli_defaults_to_datapilot_v1_suite(command):
+    args = cli.build_parser().parse_args([command])
+
+    assert cli.DEFAULT_SUITE == "datapilot-v1"
+    assert args.suite == "datapilot-v1"
+
+
 def test_validate_only_loads_cases_and_never_runs_worker(monkeypatch, capsys) -> None:
     monkeypatch.setattr(cli, "_load_cases", lambda root, suite: [_case()])
     monkeypatch.setattr(

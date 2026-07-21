@@ -4,7 +4,7 @@ import sqlite3
 from collections.abc import Callable
 
 
-LATEST_SCHEMA_VERSION = 1
+LATEST_SCHEMA_VERSION = 2
 
 
 class UnsupportedSchemaVersionError(RuntimeError):
@@ -62,7 +62,6 @@ def _migration_001_single_agent_contract(connection: sqlite3.Connection) -> None
         if "contract_version" not in session_columns
         else ""
     )
-
     # Keep the legacy-table alteration, all V1 sidecars, and the ledger insert
     # in the same transaction.  ``executescript`` commits any transaction that
     # predates the script, so BEGIN must live inside this script as well.
@@ -249,6 +248,29 @@ def _migration_001_single_agent_contract(connection: sqlite3.Connection) -> None
     )
 
 
+def _migration_002_private_turn_request_context(connection: sqlite3.Connection) -> None:
+    connection.executescript(
+        """
+        BEGIN IMMEDIATE;
+
+        CREATE TABLE IF NOT EXISTS pending_session_request_contexts (
+            web_session_id TEXT PRIMARY KEY,
+            context_json TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            FOREIGN KEY (web_session_id) REFERENCES sessions(id)
+        );
+
+        CREATE TABLE IF NOT EXISTS turn_request_contexts (
+            turn_id TEXT PRIMARY KEY,
+            context_json TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            FOREIGN KEY (turn_id) REFERENCES web_turns(id)
+        );
+        """
+    )
+
+
 _MIGRATIONS: tuple[tuple[int, str, Callable[[sqlite3.Connection], None]], ...] = (
     (1, "single_agent_contract_v1", _migration_001_single_agent_contract),
+    (2, "private_turn_request_context_v1", _migration_002_private_turn_request_context),
 )

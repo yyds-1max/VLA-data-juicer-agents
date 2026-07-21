@@ -24,7 +24,6 @@ def _config(tmp_path: Path) -> AgentScopeRuntimeConfig:
         default_model="test-model",
         router_model="router-model",
         navigation_model="navigation-model",
-        datapilot_single_agent_mode="new_sessions",
     )
 
 
@@ -168,11 +167,18 @@ async def test_navigation_continue_handover_outbox_recovers_a_stranded_run(
         web_session_id=session.id,
     )
     _complete_outbox(store, creation.outbox.outbox_id)
-    paused = task_store.update_task_for_session(
+    pausing = task_store.update_task_for_session(
         task.task_id,
         web_session_id=session.id,
         agentscope_session_id=creation.binding.navigation_session_id,
         expected_state_revision=task.state_revision,
+        status=NavigationTaskStatus.PAUSING,
+    )
+    paused = task_store.update_task_for_session(
+        task.task_id,
+        web_session_id=session.id,
+        agentscope_session_id=creation.binding.navigation_session_id,
+        expected_state_revision=pausing.state_revision,
         status=NavigationTaskStatus.PAUSED,
     )
     binding = store.update_task_binding(

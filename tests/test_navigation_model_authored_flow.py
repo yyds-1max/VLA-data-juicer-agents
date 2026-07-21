@@ -25,7 +25,6 @@ from vla_data_juicer_agents.navigation.models import ToolResult
 from vla_data_juicer_agents.navigation.task_state import NavigationTaskStatus
 from vla_data_juicer_agents.runtime.agentscope_runtime import (
     AgentScopeRuntime,
-    NavigationHandoffTool,
 )
 
 
@@ -233,42 +232,21 @@ def _write_finish_inputs(settings):
     gen_box.write_text("# annotation", encoding="utf-8")
 
 
-def _handoff_arguments(request: str):
-    return {
-        "request": request,
-        "target": DATE,
-        "date": DATE,
-        "scene_mode": "outdoor" if "室外" in request else "unknown",
-        "clips": [SEGMENT],
-        "reason": "concrete navigation processing request",
-        "missing_fields": [],
-        "confidence": "high",
-        "response_language": "Chinese",
-    }
-
-
-async def _router_handoff(runtime, storage, registry, web_session_id, request):
-    model = ScriptedChatModel()
-    model.enqueue_tool("start_navigation_data_task", _handoff_arguments(request))
-    model.enqueue_text("导航数据任务已启动。")
-    agent = build_agent(
-        storage.agents[runtime.config.main_router_agent_id],
-        model,
-        [NavigationHandoffTool(runtime=runtime, web_session_id=web_session_id)],
-    )
-    events = await run_reply(agent, request)
-    await registry.drain()
-    model.assert_exhausted()
-    assert "TOOL_RESULT_END" in event_types(events)
-    assert "REPLY_END" in event_types(events)
-    assert text_deltas(events) == "导航数据任务已启动。"
-    agentscope_session_id = runtime.web_sessions[web_session_id][1]
-    task = runtime._navigation_task_store().find_by_session(
+async def _create_navigation_attempt(runtime, web_session_id, request):
+    """Create the specialist fixture without exercising the removed Router V0 path."""
+    await runtime.ensure_bootstrapped()
+    agentscope_session_id = f"{web_session_id}__navigation-data-agent"
+    task = runtime._navigation_task_store().create_task_attempt(
+        request=request,
+        target=DATE,
+        date=DATE,
+        segments=[SEGMENT],
+        scene_mode="out" if "室外" in request else None,
+        dry_run=runtime.config.navigation_dry_run,
         web_session_id=web_session_id,
         agentscope_session_id=agentscope_session_id,
-    )
-    assert task is not None
-    return task, agentscope_session_id, events, model
+    ).task
+    return task, agentscope_session_id
 
 
 def _direct_flat_navigation_agent(runtime, storage, web_session_id, session_id):
@@ -379,12 +357,8 @@ async def test_raw_only_router_and_navigation_agents_submit_and_execute_canonica
 ):
     tmp_path, _data_root, _processing_root = navigation_environment
     runtime, storage, registry = await build_runtime(tmp_path, dry_run=True)
-    task, session_id, _router_events, _router_model = await _router_handoff(
-        runtime,
-        storage,
-        registry,
-        "web-raw",
-        "处理这批导航数据",
+    task, session_id = await _create_navigation_attempt(
+        runtime, "web-raw", "处理这批导航数据"
     )
     services = runtime._navigation_services()
     assert services.observation_store.latest(task.task_id) is None
@@ -452,12 +426,8 @@ async def test_same_session_agent_asks_before_finish_then_reinspects_after_user_
 ):
     tmp_path, _data_root, _processing_root = navigation_environment
     runtime, storage, registry = await build_runtime(tmp_path, dry_run=True)
-    task, session_id, *_ = await _router_handoff(
-        runtime,
-        storage,
-        registry,
-        "web-same",
-        "处理这批导航数据",
+    task, session_id = await _create_navigation_attempt(
+        runtime, "web-same", "处理这批导航数据"
     )
     services = runtime._navigation_services()
     agent, model = _direct_flat_navigation_agent(
@@ -565,12 +535,8 @@ async def test_new_session_agent_distrusts_sync_claim_and_inspects_before_finish
     )
     _write_finish_inputs(services.settings)
 
-    new, session_id, *_ = await _router_handoff(
-        runtime,
-        storage,
-        registry,
-        "web-new",
-        "同步已完成，请继续处理，数据为室外场景",
+    new, session_id = await _create_navigation_attempt(
+        runtime, "web-new", "同步已完成，请继续处理，数据为室外场景"
     )
     assert new.task_id != old.task_id
     assert services.observation_store.latest(new.task_id) is None
@@ -638,12 +604,8 @@ async def test_deleted_products_make_new_session_agent_choose_extract_again(
     shutil.rmtree(services.settings.clip_data_root / DATE)
     shutil.rmtree(services.settings.finish_data_root / DATE)
 
-    current, session_id, *_ = await _router_handoff(
-        runtime,
-        storage,
-        registry,
-        "web-rerun",
-        "同步已完成，请继续处理",
+    current, session_id = await _create_navigation_attempt(
+        runtime, "web-rerun", "同步已完成，请继续处理"
     )
     agent, model = _direct_flat_navigation_agent(
         runtime, storage, "web-rerun", session_id

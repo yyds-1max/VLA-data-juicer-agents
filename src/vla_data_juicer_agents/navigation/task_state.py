@@ -29,6 +29,99 @@ class NavigationTaskStatus(StrEnum):
     SUPERSEDED = "superseded"
 
 
+TERMINAL_NAVIGATION_TASK_STATUSES = frozenset(
+    {
+        NavigationTaskStatus.COMPLETED,
+        NavigationTaskStatus.FAILED,
+        NavigationTaskStatus.CANCELLED,
+        NavigationTaskStatus.SUPERSEDED,
+    }
+)
+
+
+# This is the single authority for durable Navigation Task state changes.  It is
+# intentionally stricter than the UI action list: recovery code and model tools
+# must obey the same state machine as interactive requests.
+NAVIGATION_TASK_STATUS_TRANSITIONS: dict[
+    NavigationTaskStatus,
+    frozenset[NavigationTaskStatus],
+] = {
+    NavigationTaskStatus.ACTIVE: frozenset(
+        {
+            NavigationTaskStatus.WAITING_USER,
+            NavigationTaskStatus.PAUSING,
+            NavigationTaskStatus.CANCELLING,
+            NavigationTaskStatus.COMPLETED,
+            NavigationTaskStatus.FAILED,
+            NavigationTaskStatus.NEEDS_REPLAN,
+        }
+    ),
+    NavigationTaskStatus.WAITING_USER: frozenset(
+        {
+            NavigationTaskStatus.ACTIVE,
+            NavigationTaskStatus.CANCELLING,
+            NavigationTaskStatus.COMPLETED,
+        }
+    ),
+    NavigationTaskStatus.PAUSING: frozenset(
+        {
+            NavigationTaskStatus.PAUSED,
+            NavigationTaskStatus.CANCELLING,
+            NavigationTaskStatus.FAILED,
+        }
+    ),
+    NavigationTaskStatus.PAUSED: frozenset(
+        {
+            NavigationTaskStatus.ACTIVE,
+            NavigationTaskStatus.CANCELLING,
+        }
+    ),
+    NavigationTaskStatus.CANCELLING: frozenset(
+        {
+            NavigationTaskStatus.CANCELLED,
+            NavigationTaskStatus.FAILED,
+        }
+    ),
+    NavigationTaskStatus.NEEDS_REPLAN: frozenset(
+        {
+            NavigationTaskStatus.ACTIVE,
+            NavigationTaskStatus.CANCELLING,
+            NavigationTaskStatus.FAILED,
+        }
+    ),
+    NavigationTaskStatus.COMPLETED: frozenset(),
+    NavigationTaskStatus.FAILED: frozenset(),
+    NavigationTaskStatus.CANCELLED: frozenset(),
+    NavigationTaskStatus.SUPERSEDED: frozenset(),
+}
+
+
+class NavigationTaskTransitionError(RuntimeError):
+    def __init__(
+        self,
+        current: NavigationTaskStatus,
+        target: NavigationTaskStatus,
+    ) -> None:
+        self.current = current
+        self.target = target
+        super().__init__(
+            f"illegal navigation task status transition: {current.value} -> {target.value}"
+        )
+
+
+def validate_navigation_task_status_transition(
+    current: NavigationTaskStatus | str,
+    target: NavigationTaskStatus | str,
+) -> NavigationTaskStatus:
+    current_status = NavigationTaskStatus(current)
+    target_status = NavigationTaskStatus(target)
+    if current_status == target_status:
+        return target_status
+    if target_status not in NAVIGATION_TASK_STATUS_TRANSITIONS[current_status]:
+        raise NavigationTaskTransitionError(current_status, target_status)
+    return target_status
+
+
 class NavigationArtifactSnapshot(BaseModel):
     date: str
     segments: list[str] | None = None

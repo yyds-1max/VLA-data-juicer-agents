@@ -969,12 +969,12 @@ def test_async_reply_failure_closes_turn_when_no_other_work_can_continue(tmp_pat
 
     records = store.fail_reply_lease(lease_id)
 
-    assert [record.type for record in records] == ["turn_state"]
-    assert records[0].payload["status"] == "failed"
+    assert [record.type for record in records] == ["final", "turn_state"]
+    assert records[-1].payload["status"] == "failed"
     detail = store.get_session(session.id)
     assert detail is not None
     assert detail.turns[0].status == "failed"
-    assert detail.turns[0].final_message_id is None
+    assert detail.turns[0].final_message_id is not None
     assert store.get_agentscope_session_mapping(session.id).active_turn_id is None
 
 
@@ -1053,20 +1053,29 @@ def test_store_lists_all_agentscope_mappings_for_bridge_recovery(tmp_path: Path)
 def test_store_reconciles_orphaned_background_tool_once(tmp_path: Path):
     store = WebSessionStore(tmp_path / "sessions.sqlite")
     session = store.create_session(title="background reconciliation")
-    store.save_agentscope_session_mapping(
+    turn = store.begin_user_turn(session.id, "处理导航数据").turn
+    binding = store.create_task_binding(
         session.id,
-        agent_id="navigation-data-agent",
-        agentscope_session_id="as-navigation",
-    )
+        task_id="task-private-background",
+        task_ref="DP-BACKGROUND",
+        navigation_session_id="as-navigation",
+    ).binding
+    store.bind_conversation_agent_session_to_turn(binding.navigation_session_id, turn.id)
     store.append_projected_event_batch(
         web_session_id=session.id,
         agentscope_session_id="as-navigation",
         entry_id="10-0",
-        events=[
+        events=[],
+        private_events=[
+            {
+                "type": "tool_start",
+                "payload": {
+                    "tool": "extract_and_sync_navigation_data_tool",
+                    "call_id": "call-background",
+                },
+            },
             {
                 "type": "tool_background",
-                "source": "agentscope",
-                "run_id": "as-navigation",
                 "payload": {
                     "tool": "extract_and_sync_navigation_data_tool",
                     "call_id": "call-background",
@@ -1080,14 +1089,12 @@ def test_store_reconciles_orphaned_background_tool_once(tmp_path: Path):
     first = store.append_background_tool_reconciliation(unresolved[0], status="failed")
     second = store.append_background_tool_reconciliation(unresolved[0], status="failed")
 
-    assert first is not None
-    assert first.payload == {
-        "tool": "extract_and_sync_navigation_data_tool",
-        "call_id": "call-background",
-        "status": "failed",
-    }
+    assert first is None
     assert second is None
     assert store.list_unresolved_background_tools() == []
+    detail = store.get_session(session.id)
+    assert detail is not None
+    assert "extract_and_sync_navigation_data_tool" not in detail.model_dump_json()
 
 
 def test_store_deduplicates_human_decision_required_events(tmp_path: Path):

@@ -101,7 +101,7 @@ class ActionSignalV1(_SignalBase):
     operation: Literal["start", "finish"]
     tool_name: str = Field(min_length=1, max_length=200)
     call_id: str = Field(min_length=1, max_length=512)
-    status: Literal["running", "completed", "failed", "interrupted"] = "running"
+    status: Literal["running", "background", "completed", "failed", "interrupted"] = "running"
     message: str | None = Field(default=None, max_length=8_000)
     done: int | None = Field(default=None, ge=0)
     total: int | None = Field(default=None, gt=0)

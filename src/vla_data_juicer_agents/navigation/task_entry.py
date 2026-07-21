@@ -9,13 +9,27 @@ from pydantic import BaseModel, ConfigDict, Field, ValidationError
 _STRUCTURED_HANDOFF_MARKER = "Structured handoff JSON:"
 
 
+class AllClipsSelection(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    kind: Literal["all_clips"]
+
+
+class SelectedClipsSelection(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    kind: Literal["selected_clips"]
+    clips: list[str] = Field(min_length=1, max_length=200)
+
+
 class NavigationTaskEntry(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     request: str
-    target: str
-    date: str = Field(pattern=r"^[0-9]{8}$")
-    segments: list[str] | None = None
+    dataset_date: str = Field(pattern=r"^[0-9]{8}$")
+    selection: AllClipsSelection | SelectedClipsSelection = Field(
+        discriminator="kind",
+    )
     scene_mode: Literal["in", "out"] | None = None
     response_language: str
 

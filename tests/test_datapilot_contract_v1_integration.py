@@ -15,7 +15,7 @@ from vla_data_juicer_agents.web.schemas import SessionDetail
 from vla_data_juicer_agents.web.session_store import WebSessionStore
 
 
-def _config(tmp_path, *, mode: str) -> AgentScopeRuntimeConfig:
+def _config(tmp_path) -> AgentScopeRuntimeConfig:
     return AgentScopeRuntimeConfig(
         user_id="test-user",
         redis_url="redis://localhost:6379/0",
@@ -25,48 +25,97 @@ def _config(tmp_path, *, mode: str) -> AgentScopeRuntimeConfig:
         default_model="test-model",
         router_model="router-model",
         navigation_model="navigation-model",
-        datapilot_single_agent_mode=mode,  # type: ignore[arg-type]
     )
 
 
-@pytest.mark.parametrize(
-    ("mode", "entrypoint", "expected"),
-    [
-        ("off", "chat", 0),
-        ("off", "data_management_shortcut", 0),
-        ("shortcut", "chat", 0),
-        ("shortcut", "data_management_shortcut", 1),
-        ("new_sessions", "chat", 1),
-        ("new_sessions", "data_management_shortcut", 1),
-    ],
-)
-def test_session_contract_is_selected_once_from_mode_and_entrypoint(
+@pytest.mark.parametrize("entrypoint", ["chat", "data_management_shortcut"])
+def test_all_new_sessions_use_contract_v1(
     tmp_path,
-    mode: str,
     entrypoint: str,
-    expected: int,
 ) -> None:
-    config = _config(tmp_path, mode=mode)
-    assert config.contract_version_for_entrypoint(entrypoint) == expected
+    config = _config(tmp_path)
 
     runtime = _ContractRuntime(config=config)
     app = create_app(
         working_dir=str(tmp_path / ".djx"),
-        db_path=tmp_path / f"{mode}-{entrypoint}.sqlite",
+        db_path=tmp_path / f"{entrypoint}.sqlite",
         agentscope_runtime=runtime,
     )
+    payload: dict[str, Any] = {"message": "处理导航数据", "entrypoint": entrypoint}
+    if entrypoint == "data_management_shortcut":
+        payload["request_context"] = {
+            "kind": "navigation_dataset_selection_v1",
+            "dataset_date": "20260720",
+            "selection": {"kind": "all_clips"},
+        }
     with TestClient(app) as client:
-        response = client.post(
-            "/api/sessions",
-            json={"message": "处理导航数据", "entrypoint": entrypoint},
-        )
+        response = client.post("/api/sessions", json=payload)
 
     assert response.status_code == 200
     session_id = response.json()["session"]["id"]
-    assert app.state.store.get_session_contract_version(session_id) == expected
+    assert app.state.store.get_session_contract_version(session_id) == 1
 
 
-def test_session_detail_serializer_keeps_v1_snapshot_and_hides_v1_fields_for_v0() -> None:
+def test_shortcut_requires_private_scope_and_chat_rejects_it(tmp_path) -> None:
+    runtime = _ContractRuntime(config=_config(tmp_path))
+    app = create_app(
+        working_dir=str(tmp_path / ".djx"),
+        db_path=tmp_path / "scope-validation.sqlite",
+        agentscope_runtime=runtime,
+    )
+    context = {
+        "kind": "navigation_dataset_selection_v1",
+        "dataset_date": "20260720",
+        "selection": {
+            "kind": "selected_clips",
+            "clips": ["20260605_152856"],
+        },
+    }
+    with TestClient(app) as client:
+        missing = client.post(
+            "/api/sessions",
+            json={"message": "处理选中数据", "entrypoint": "data_management_shortcut"},
+        )
+        unexpected = client.post(
+            "/api/sessions",
+            json={"message": "处理选中数据", "entrypoint": "chat", "request_context": context},
+        )
+
+    assert missing.status_code == 422
+    assert unexpected.status_code == 422
+
+
+def test_shortcut_rejects_scope_that_exceeds_router_envelope_budget(tmp_path) -> None:
+    runtime = _ContractRuntime(config=_config(tmp_path))
+    app = create_app(
+        working_dir=str(tmp_path / ".djx"),
+        db_path=tmp_path / "oversized-scope.sqlite",
+        agentscope_runtime=runtime,
+    )
+    context = {
+        "kind": "navigation_dataset_selection_v1",
+        "dataset_date": "20260720",
+        "selection": {
+            "kind": "selected_clips",
+            "clips": [f"20260605_{index:06d}" for index in range(200)],
+        },
+    }
+
+    with TestClient(app) as client:
+        response = client.post(
+            "/api/sessions",
+            json={
+                "message": "处理选中数据",
+                "entrypoint": "data_management_shortcut",
+                "request_context": context,
+            },
+        )
+
+    assert response.status_code == 422
+    assert "Router context budget" in response.text
+
+
+def test_session_detail_serializer_always_exposes_v1_snapshot() -> None:
     common: dict[str, Any] = {
         "id": "session-public",
         "title": "导航任务",
@@ -81,14 +130,9 @@ def test_session_detail_serializer_keeps_v1_snapshot_and_hides_v1_fields_for_v0(
     }
 
     v1 = SessionDetail(contract_version=1, **common).model_dump(mode="json")
-    v0 = SessionDetail(contract_version=0, **common).model_dump(mode="json")
-
     assert v1["contract_version"] == 1
     assert v1["tasks"] == common["tasks"]
     assert v1["pending_interaction"] == common["pending_interaction"]
-    assert "contract_version" not in v0
-    assert "tasks" not in v0
-    assert "pending_interaction" not in v0
 
 
 def test_router_context_envelope_is_bounded_and_excludes_specialist_internals(tmp_path) -> None:
@@ -133,7 +177,7 @@ def test_router_context_envelope_is_bounded_and_excludes_specialist_internals(tm
     )
     store = _EnvelopeStore(binding=binding, interaction=interaction)
     runtime = AgentScopeRuntime(
-        config=_config(tmp_path, mode="new_sessions"),
+        config=_config(tmp_path),
         storage=None,
         message_bus=None,
         workspace_manager=None,
@@ -211,7 +255,7 @@ def test_late_router_final_is_ignored_after_navigation_receives_authority(tmp_pa
 
 
 def test_interaction_api_is_idempotent_and_resumes_navigation_without_router(tmp_path) -> None:
-    runtime = _ContractRuntime(config=_config(tmp_path, mode="shortcut"))
+    runtime = _ContractRuntime(config=_config(tmp_path))
     app = create_app(
         working_dir=str(tmp_path / ".djx"),
         db_path=tmp_path / "interaction.sqlite",
@@ -248,7 +292,7 @@ def test_interaction_api_is_idempotent_and_resumes_navigation_without_router(tmp
 
 
 def test_interaction_revision_conflict_returns_latest_v1_snapshot(tmp_path) -> None:
-    runtime = _ContractRuntime(config=_config(tmp_path, mode="shortcut"))
+    runtime = _ContractRuntime(config=_config(tmp_path))
     app = create_app(
         working_dir=str(tmp_path / ".djx"),
         db_path=tmp_path / "revision-conflict.sqlite",
@@ -307,7 +351,7 @@ def test_runtime_public_projection_has_no_private_metadata_or_percentage(tmp_pat
         binding=binding,
     )
     runtime = AgentScopeRuntime(
-        config=_config(tmp_path, mode="new_sessions"),
+        config=_config(tmp_path),
         storage=None,
         message_bus=None,
         workspace_manager=None,
@@ -380,6 +424,10 @@ class _EnvelopeStore:
     @staticmethod
     def get_session_contract_version(_session_id: str) -> int:
         return 1
+
+    @staticmethod
+    def get_active_turn(_session_id: str) -> None:
+        return None
 
     def get_focused_task_binding(self, _session_id: str) -> Any:
         return self.binding
@@ -483,6 +531,11 @@ def _create_interaction_fixture(
         json={
             "message": "处理导航数据",
             "entrypoint": "data_management_shortcut",
+            "request_context": {
+                "kind": "navigation_dataset_selection_v1",
+                "dataset_date": "20260720",
+                "selection": {"kind": "all_clips"},
+            },
         },
     )
     assert created.status_code == 200

@@ -32,6 +32,7 @@ import { datapilotStore } from "../../../store/datapilotStore";
 import type { StatusTone } from "../consoleTypes";
 import { NavigationDataPilotDialog } from "../components/NavigationDataPilotDialog";
 import {
+  buildNavigationDatasetRequestContext,
   buildNavigationDatasetRequest,
   type NavigationDatasetSelection,
 } from "../navigationDataPilotRequest";
@@ -952,6 +953,7 @@ export function DataManagementPage({ onPlaceholderAction }: DataManagementPagePr
 
   function handleConfirmDataPilot(selection: NavigationDatasetSelection) {
     const message = buildNavigationDatasetRequest(selection);
+    const requestContext = buildNavigationDatasetRequestContext(selection);
     if (
       activeInvocationId &&
       pendingInvocation?.invocationId === activeInvocationId &&
@@ -966,7 +968,7 @@ export function DataManagementPage({ onPlaceholderAction }: DataManagementPagePr
       datapilotStore.getState().clearDataPilotInvocation(activeInvocationId);
     }
     const invocationId = createInvocationId();
-    if (datapilotStore.getState().launchDataPilotRequest(invocationId, message)) {
+    if (datapilotStore.getState().launchDataPilotRequest(invocationId, message, requestContext)) {
       setActiveInvocationId(invocationId);
     }
   }

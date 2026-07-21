@@ -1,8 +1,16 @@
 from __future__ import annotations
 
+import json
 from typing import Any, Literal
 
-from pydantic import BaseModel, Field, field_validator, model_serializer, model_validator
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    field_validator,
+    model_serializer,
+    model_validator,
+)
 
 
 SessionStatus = Literal["draft", "active", "historical"]
@@ -10,6 +18,7 @@ MessageRole = Literal["user", "assistant", "system"]
 HumanDecisionAction = Literal["confirm", "stop", "guide"]
 TurnOrigin = Literal["user", "system", "interaction"]
 TurnStatus = Literal["running", "waiting", "completed", "failed", "interrupted"]
+_MAX_REQUEST_CONTEXT_BYTES = 3_000
 
 
 def generate_session_title(message: str, *, limit: int = 30) -> str:
@@ -23,23 +32,18 @@ class SessionRecord(BaseModel):
     status: SessionStatus
     created_at: str
     updated_at: str
-    contract_version: Literal[0, 1] = 0
+    contract_version: Literal[1] = 1
 
     @model_serializer(mode="wrap")
     def serialize_by_contract(self, handler: Any) -> dict[str, Any]:
         data = handler(self)
-        if self.contract_version == 0:
-            data.pop("contract_version", None)
-            data.pop("tasks", None)
-            data.pop("pending_interaction", None)
-        else:
-            for event in data.get("events", []):
-                if not isinstance(event, dict):
-                    continue
-                event["contract_version"] = 1
-                event.pop("source", None)
-                event.pop("run_id", None)
-                event.pop("parent_run_id", None)
+        for event in data.get("events", []):
+            if not isinstance(event, dict):
+                continue
+            event["contract_version"] = 1
+            event.pop("source", None)
+            event.pop("run_id", None)
+            event.pop("parent_run_id", None)
         return data
 
 
@@ -88,9 +92,65 @@ class CreateSessionResponse(BaseModel):
     session: SessionRecord
 
 
+class AllClipsSelectionV1(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    kind: Literal["all_clips"]
+
+
+class SelectedClipsSelectionV1(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    kind: Literal["selected_clips"]
+    clips: list[str] = Field(min_length=1, max_length=200)
+
+    @field_validator("clips")
+    @classmethod
+    def clips_must_be_safe_unique_components(cls, value: list[str]) -> list[str]:
+        normalized = [clip.strip() for clip in value]
+        if any(
+            not clip
+            or clip in {".", ".."}
+            or "/" in clip
+            or "\\" in clip
+            or "\r" in clip
+            or "\n" in clip
+            or len(clip) > 200
+            for clip in normalized
+        ):
+            raise ValueError("clips must be safe non-empty path components")
+        if len(set(normalized)) != len(normalized):
+            raise ValueError("clips must be unique")
+        return normalized
+
+
+NavigationClipSelectionV1 = AllClipsSelectionV1 | SelectedClipsSelectionV1
+
+
+class NavigationDatasetSelectionContextV1(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    kind: Literal["navigation_dataset_selection_v1"]
+    dataset_date: str = Field(pattern=r"^[0-9]{8}$")
+    selection: NavigationClipSelectionV1 = Field(discriminator="kind")
+
+    @model_validator(mode="after")
+    def must_fit_router_envelope_budget(self) -> "NavigationDatasetSelectionContextV1":
+        encoded = json.dumps(
+            self.model_dump(mode="json"),
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+        if len(encoded) > _MAX_REQUEST_CONTEXT_BYTES:
+            raise ValueError("request_context is too large for the Router context budget")
+        return self
+
+
 class CreateSessionRequest(BaseModel):
     message: str
     entrypoint: Literal["chat", "data_management_shortcut"] = "chat"
+    request_context: NavigationDatasetSelectionContextV1 | None = None
 
     @field_validator("message")
     @classmethod
@@ -99,6 +159,14 @@ class CreateSessionRequest(BaseModel):
         if not message:
             raise ValueError("message must not be empty")
         return message
+
+    @model_validator(mode="after")
+    def shortcut_context_matches_entrypoint(self) -> "CreateSessionRequest":
+        if self.entrypoint == "data_management_shortcut" and self.request_context is None:
+            raise ValueError("data_management_shortcut requires request_context")
+        if self.entrypoint == "chat" and self.request_context is not None:
+            raise ValueError("request_context is only accepted for data_management_shortcut")
+        return self
 
 
 class CreateTurnRequest(CreateSessionRequest):

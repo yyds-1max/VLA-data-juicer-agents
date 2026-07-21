@@ -80,15 +80,22 @@ def grade_case(
     if expected_tools.handoff is not None and len(handoffs) == 1:
         payload = handoffs[0]
         expected = expected_tools.handoff
-        for field in (
-            "request",
-            "target",
-            "date",
-            "clips",
-            "response_language",
-            "missing_fields",
-        ):
+        fields = (
+            ("operation", "scope_source", "dataset_date", "selection", "status")
+            if expected.operation is not None
+            else (
+                "request",
+                "target",
+                "date",
+                "clips",
+                "response_language",
+                "missing_fields",
+            )
+        )
+        for field in fields:
             wanted = getattr(expected, field)
+            if wanted is None:
+                continue
             actual = payload.get(field)
             checks.append(
                 _check(
@@ -98,15 +105,19 @@ def grade_case(
                     f"handoff {field} did not exactly match the expected value",
                 ),
             )
-        confidence = payload.get("confidence")
-        checks.append(
-            _check(
-                "handoff.confidence",
-                confidence in expected.allowed_confidence,
-                "handoff confidence was acceptable",
-                f"handoff confidence {confidence!r} was not one of {expected.allowed_confidence}",
-            ),
-        )
+        if expected.operation is None:
+            confidence = payload.get("confidence")
+            checks.append(
+                _check(
+                    "handoff.confidence",
+                    confidence in expected.allowed_confidence,
+                    "handoff confidence was acceptable",
+                    (
+                        f"handoff confidence {confidence!r} was not one of "
+                        f"{expected.allowed_confidence}"
+                    ),
+                ),
+            )
         forbidden = sorted(field for field in expected.forbidden_fields if field in payload)
         checks.append(
             _check(

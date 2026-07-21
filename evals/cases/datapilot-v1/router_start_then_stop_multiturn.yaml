@@ -1,0 +1,33 @@
+schema_version: 2
+id: router_start_then_stop_multiturn
+suite: datapilot-v1
+entrypoint: router
+tags: [v1, router, multi-turn, start, stop, unique-final]
+conversation:
+  - role: user
+    content: 请处理 20270605 的导航数据。
+  - role: user
+    content: 先停一下当前处理。
+limits:
+  max_model_calls: 2
+  max_tool_calls: 2
+  timeout_seconds: 180
+expectations:
+  tools:
+    allowed_calls: [start_navigation_data_task, control_navigation_data_task]
+    required_counts:
+      start_navigation_data_task: 1
+      control_navigation_data_task: 1
+    handoff_count: 2
+  response:
+    forbidden_terms:
+      - MainRouterAgent
+      - NavigationDataAgent
+      - start_navigation_data_task
+      - control_navigation_data_task
+      - continue_navigation_data_task
+      - task_id
+      - run_id
+      - call_id
+      - system prompt
+      - 系统提示词

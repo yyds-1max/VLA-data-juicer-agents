@@ -109,15 +109,20 @@ async def _execute(request: dict[str, Any]) -> CaseResult:
         raise ValueError(
             f"the first evaluation milestone only supports router cases, got {case.entrypoint!r}",
         )
-    message = case.conversation[-1].content
+    messages = [turn.content for turn in case.conversation]
     started = time.monotonic()
     web_session_id = f"eval-{case.id}-{attempt}"
     host = EvaluationHost(
         config=config,
         workspace_root=workspace_root,
+        runtime_setup=(
+            case.runtime_setup.model_dump(mode="json")
+            if case.runtime_setup is not None
+            else None
+        ),
     )
     try:
-        host_result = await host.run(message, web_session_id=web_session_id)
+        host_result = await host.run(messages, web_session_id=web_session_id)
     except Exception as exc:
         duration_ms = max(0, round((time.monotonic() - started) * 1000))
         observation = _to_observation(

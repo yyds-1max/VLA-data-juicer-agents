@@ -208,6 +208,32 @@ def test_action_projection_never_exposes_tool_call_run_agent_or_internal_task() 
     assert "%" not in dumped
 
 
+def test_background_action_finishes_as_transferred_without_exposing_tool() -> None:
+    projector = SpecialistSignalProjector()
+    projector.project(
+        _action(
+            "extract_and_sync_navigation_data_tool",
+            call_id="call-private-background",
+        ),
+        task_ref=TASK_REF,
+    )
+
+    event = projector.project(
+        _action(
+            "extract_and_sync_navigation_data_tool",
+            operation="finish",
+            status="background",
+            call_id="call-private-background",
+            signal_id="sig-background-finish",
+        ),
+        task_ref=TASK_REF,
+    )[0]
+
+    assert event.type == "action_end"
+    assert event.payload["status"] == "background"
+    assert "extract_and_sync_navigation_data_tool" not in event.model_dump_json()
+
+
 def test_grouped_actions_share_a_public_reference_and_unknown_names_do_not_leak() -> None:
     projector = SpecialistSignalProjector()
     first = projector.project(

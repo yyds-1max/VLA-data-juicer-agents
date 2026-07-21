@@ -1,5 +1,17 @@
 export type SessionStatus = "draft" | "active" | "historical";
 export type SessionEntrypoint = "chat" | "data_management_shortcut";
+
+export type NavigationClipSelection =
+  | { kind: "all_clips" }
+  | { kind: "selected_clips"; clips: string[] };
+
+export type NavigationDatasetSelectionContext = {
+  kind: "navigation_dataset_selection_v1";
+  dataset_date: string;
+  selection: NavigationClipSelection;
+};
+
+export type SessionRequestContext = NavigationDatasetSelectionContext;
 export type MessageRole = "user" | "assistant" | "system";
 export type TurnOrigin = "user" | "system" | "interaction";
 export type TurnStatus = "running" | "waiting" | "completed" | "failed" | "interrupted";
@@ -18,7 +30,7 @@ export interface SessionRecord {
   id: string;
   title: string;
   status: SessionStatus;
-  contract_version?: 0 | 1;
+  contract_version: 1;
   created_at: string;
   updated_at: string;
 }
@@ -41,18 +53,15 @@ export interface TimelineEventRecord extends AgentEvent {
 
 export interface SessionDetail extends SessionRecord {
   messages: ChatMessageRecord[];
-  events?: TimelineEventRecord[];
-  turns?: TurnRecord[];
-  tasks?: TaskSnapshot[];
-  pending_interaction?: PendingInteraction | null;
+  events: TimelineEventRecord[];
+  turns: TurnRecord[];
+  tasks: TaskSnapshot[];
+  pending_interaction: PendingInteraction | null;
 }
 
 export interface AgentEvent {
   type: string;
-  contract_version?: 0 | 1;
-  source?: string | null;
-  run_id?: string | null;
-  parent_run_id?: string | null;
+  contract_version: 1;
   timestamp?: string | null;
   turn_id?: string | null;
   payload: Record<string, unknown>;
@@ -80,6 +89,9 @@ export interface TaskCount {
 export interface TaskSnapshot {
   task_ref: string;
   domain: string;
+  dataset_date: string;
+  selection: NavigationClipSelection;
+  scene_mode: string | null;
   status: NavigationTaskStatus;
   phase?: string | null;
   waiting_reason?: string | null;
@@ -138,47 +150,6 @@ export interface InteractionResponseResult {
   turn_id?: string;
   interaction?: PendingInteraction | null;
   session?: SessionDetail;
-}
-
-export type HumanDecisionAction = "confirm" | "stop" | "guide";
-
-export interface PendingHumanDecision {
-  replyId: string;
-  toolCallId: string;
-  requestId: string;
-  decisionType: string;
-  summary: string;
-  planId?: string;
-  stepId?: string;
-  recoveryRequired?: boolean;
-  submissionDisabled?: boolean;
-  recoveryEndpoint?: string;
-}
-
-export interface HumanDecisionPayload {
-  action: HumanDecisionAction;
-  request_id: string;
-  tool_call_id: string;
-  reply_id: string;
-  plan_id?: string;
-  step_id?: string;
-  text?: string;
-}
-
-export interface HumanDecisionRecoveryRequest {
-  action: "quarantine_and_replan";
-  plan_id: string;
-  step_id: string;
-  reason: string;
-}
-
-export interface HumanDecisionRecoveryResponse {
-  recovered: true;
-  plan_id: string;
-  step_id: string;
-  handoff_status: "quarantined";
-  task_status: "needs_replan";
-  next_action: "submit_complete_plan";
 }
 
 export type NavigationDatasetStatus = "raw_only" | "extracted" | "synced" | "error";

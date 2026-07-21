@@ -1,0 +1,35 @@
+schema_version: 2
+id: router_clarify_date_preserves_selected_clip_multiturn
+suite: datapilot-v1
+entrypoint: router
+tags: [v1, router, multi-turn, clarification, selected-clips, scope-no-expansion]
+conversation:
+  - role: user
+    content: 处理 clip 20260605_152856 的导航数据。
+  - role: user
+    content: 日期是 20270605。
+limits:
+  max_model_calls: 2
+  max_tool_calls: 1
+  timeout_seconds: 180
+expectations:
+  tools:
+    allowed_calls: [start_navigation_data_task]
+    required_counts:
+      start_navigation_data_task: 1
+    handoff_count: 1
+    handoff:
+      operation: start
+      scope_source: interpreted_user_text
+      dataset_date: "20270605"
+      selection:
+        kind: selected_clips
+        clips: ["20260605_152856"]
+      forbidden_fields: [request, target, date, clips, segments, reason, response_language, task_id, run_id]
+  response:
+    language: Chinese
+    required_any_groups:
+      - [日期, YYYYMMDD]
+    forbidden_terms: [MainRouterAgent, NavigationDataAgent, start_navigation_data_task, continue_navigation_data_task, control_navigation_data_task, task_id, run_id, call_id, system prompt, 系统提示词]
+    require_question: true
+    max_chars: 120

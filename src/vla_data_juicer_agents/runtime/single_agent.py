@@ -9,20 +9,46 @@ from agentscope.middleware import MiddlewareBase
 from agentscope.permission import PermissionBehavior, PermissionDecision
 from agentscope.tool import ToolBase, ToolChunk
 
+from vla_data_juicer_agents.runtime.agentscope_prompts import main_router_v1_prompt
 
-_ROUTER_V1_GUIDANCE = """
-DataPilot conversation contract v1 (authoritative):
-- Every ordinary user message is handled by you first, even while a navigation task is active.
-- Use the injected RouterContextEnvelope as volatile authoritative context. Never repeat its JSON or internal metadata to the user.
-- Answer ordinary conversation and unrelated questions directly without changing the focused task.
-- Ask one short clarification question when a concrete navigation request lacks a date or target.
-- Use start_navigation_data_task only to create a concrete navigation task.
-- Use continue_navigation_data_task for task input, adjustment, continuation, or resume. Preserve original_user_message exactly.
-- Use control_navigation_data_task for an explicit stop or cancel intent.
-- Never invent task references or state revisions; copy them exactly from RouterContextEnvelope.
-- A successful start/continue/control call transfers response ownership to the runtime or specialist. End immediately after the tool result. Do not produce an Answer, acknowledgement, summary, or another model call.
-- If a nonterminal navigation task already occupies the session, do not start a second task.
-""".strip()
+
+_SCOPE_SELECTION_SCHEMA = {
+    "oneOf": [
+        {
+            "type": "object",
+            "properties": {
+                "kind": {"type": "string", "const": "all_clips"},
+            },
+            "required": ["kind"],
+            "additionalProperties": False,
+        },
+        {
+            "type": "object",
+            "properties": {
+                "kind": {"type": "string", "const": "selected_clips"},
+                "clips": {
+                    "type": "array",
+                    "items": {
+                        "type": "string",
+                        "minLength": 1,
+                        "maxLength": 200,
+                        "pattern": "^(?!\\.{1,2}$)[^/\\\\\\r\\n]+$",
+                    },
+                    "minItems": 1,
+                    "maxItems": 200,
+                    "uniqueItems": True,
+                },
+            },
+            "required": ["kind", "clips"],
+            "additionalProperties": False,
+        },
+    ],
+    "discriminator": {"propertyName": "kind"},
+    "description": (
+        "The user-selectable task scope. Use all_clips when no clips were "
+        "specified. Internal segments and sequences are never selectable."
+    ),
+}
 
 
 def _tool_chunk(payload: dict[str, Any], *, ok: bool = True) -> ToolChunk:
@@ -31,6 +57,58 @@ def _tool_chunk(payload: dict[str, Any], *, ok: bool = True) -> ToolChunk:
         state=ToolResultState.SUCCESS if ok else ToolResultState.ERROR,
         metadata=payload,
     )
+
+
+def _router_tool_success(
+    *,
+    operation: str,
+    result: dict[str, Any],
+    default_status: str,
+) -> dict[str, Any]:
+    task_ref = str(result.get("task_ref") or "") or None
+    status = str(result.get("status") or default_status)
+    latest_task = result.get("latest_task")
+    if not isinstance(latest_task, dict):
+        latest_task = {
+            "task_ref": task_ref,
+            "status": status,
+        }
+    return {
+        "ok": True,
+        "operation": operation,
+        "accepted": True,
+        "task_ref": task_ref,
+        "status": status,
+        "error": None,
+        "latest_task": latest_task,
+    }
+
+
+def _router_tool_failure(
+    *,
+    operation: str,
+    payload: dict[str, Any],
+) -> dict[str, Any]:
+    error = payload.get("error")
+    if not isinstance(error, dict):
+        error = {
+            "code": str(
+                payload.get("error_type")
+                or payload.get("code")
+                or "navigation_runtime_error"
+            ),
+            "message": str(payload.get("message") or "DataPilot 暂时无法执行该任务操作。"),
+            "retryable": bool(payload.get("retryable", False)),
+        }
+    return {
+        "ok": False,
+        "operation": str(payload.get("operation") or operation),
+        "accepted": False,
+        "task_ref": payload.get("task_ref"),
+        "status": payload.get("status"),
+        "error": error,
+        "latest_task": payload.get("latest_task"),
+    }
 
 
 class RouterContractV1Middleware(MiddlewareBase):
@@ -42,10 +120,14 @@ class RouterContractV1Middleware(MiddlewareBase):
         self._router_session_id = router_session_id
 
     async def on_system_prompt(self, agent: Any, current_prompt: str) -> str:
-        envelope = self._runtime.router_context_envelope(self._web_session_id)
+        del agent, current_prompt
+        envelope = self._runtime.router_context_envelope(
+            self._web_session_id,
+            router_session_id=self._router_session_id,
+        )
         rendered = json.dumps(envelope, ensure_ascii=False, separators=(",", ":"))
         return (
-            f"{current_prompt}\n\n{_ROUTER_V1_GUIDANCE}\n\n"
+            f"{main_router_v1_prompt()}\n\n"
             f"RouterContextEnvelope (volatile; do not quote):\n{rendered}"
         )
 
@@ -107,128 +189,109 @@ class _RouterToolBase(ToolBase):
 class StartNavigationDataTaskV1Tool(_RouterToolBase):
     name = "start_navigation_data_task"
     description = (
-        "Create one concrete navigation data task. Use only when date and target "
-        "are known and no nonterminal navigation task already occupies the conversation."
+        "Create one navigation task for a YYYYMMDD dataset date and either all_clips "
+        "or selected_clips. Scene mode is optional and must not block start."
     )
     input_schema = {
         "type": "object",
         "properties": {
-            "request": {"type": "string"},
-            "target": {"type": "string"},
-            "date": {"type": "string", "pattern": "^[0-9]{8}$"},
+            "scope_source": {
+                "type": "string",
+                "enum": ["request_context", "interpreted_user_text"],
+                "description": (
+                    "Use request_context only for an exact trusted scope injected by "
+                    "the runtime with kind navigation_dataset_selection_v1; otherwise "
+                    "use interpreted_user_text."
+                ),
+            },
+            "dataset_date": {
+                "type": "string",
+                "pattern": "^[0-9]{8}$",
+                "description": "Navigation dataset date in YYYYMMDD form.",
+            },
+            "selection": _SCOPE_SELECTION_SCHEMA,
             "scene_mode": {
                 "type": "string",
-                "enum": ["indoor", "outdoor", "unknown"],
+                "enum": ["indoor", "outdoor"],
+                "description": (
+                    "Optional scene context. Omit it when the user or trusted request "
+                    "context did not explicitly provide indoor/outdoor information."
+                ),
             },
-            "clips": {"type": "array", "items": {"type": "string"}},
-            "reason": {"type": "string"},
-            "missing_fields": {"type": "array", "items": {"type": "string"}},
-            "confidence": {"type": "string", "enum": ["medium", "high"]},
-            "response_language": {"type": "string"},
         },
-        "required": [
-            "request",
-            "target",
-            "date",
-            "reason",
-            "missing_fields",
-            "confidence",
-            "response_language",
-        ],
+        "required": ["scope_source", "dataset_date", "selection"],
         "additionalProperties": False,
     }
 
     async def __call__(
         self,
-        request: str,
-        target: str,
-        date: str,
-        reason: str,
-        missing_fields: list[str],
-        confidence: str,
-        response_language: str,
-        clips: list[str] | None = None,
+        scope_source: str,
+        dataset_date: str,
+        selection: dict[str, Any],
         scene_mode: str | None = None,
     ) -> ToolChunk:
-        if missing_fields:
-            return _tool_chunk(
-                {"ok": False, "started": False, "message": "任务信息仍不完整。"},
-                ok=False,
-            )
         try:
             result = await self._runtime.start_navigation_agent_task_v1(
                 web_session_id=self._web_session_id,
                 router_session_id=self._router_session_id,
-                request=request,
-                target=target,
-                date=date,
-                clips=list(clips or []),
+                scope_source=scope_source,
+                dataset_date=dataset_date,
+                selection=dict(selection),
                 scene_mode=scene_mode,
-                reason=reason,
-                response_language=response_language,
             )
         except Exception as exc:
             return _tool_chunk(
-                self._runtime.safe_router_tool_error(exc, action="start"),
+                _router_tool_failure(
+                    operation="start",
+                    payload=self._runtime.safe_router_tool_error(
+                        exc,
+                        action="start",
+                        web_session_id=self._web_session_id,
+                    ),
+                ),
                 ok=False,
             )
-        return _tool_chunk(
-            {"ok": True, "started": True, "task_ref": result["task_ref"]}
-        )
+        return _tool_chunk(_router_tool_success(operation="start", result=result, default_status="active"))
 
 
 class ContinueNavigationDataTaskV1Tool(_RouterToolBase):
     name = "continue_navigation_data_task"
     description = (
-        "Continue the focused navigation task with the user's exact message. "
-        "Use for providing input, adjusting, continuing, or resuming."
+        "Continue the focused task using the current user turn and authoritative "
+        "runtime context. The model supplies no task identity, revision, or user text."
     )
     input_schema = {
         "type": "object",
-        "properties": {
-            "task_ref": {"type": "string"},
-            "original_user_message": {"type": "string"},
-            "intent": {
-                "type": "string",
-                "enum": ["provide_input", "adjust", "continue", "resume"],
-            },
-            "response_language": {"type": "string"},
-            "expected_task_revision": {"type": "integer", "minimum": 0},
-        },
-        "required": [
-            "task_ref",
-            "original_user_message",
-            "intent",
-            "response_language",
-            "expected_task_revision",
-        ],
+        "properties": {},
+        "required": [],
         "additionalProperties": False,
     }
 
-    async def __call__(
-        self,
-        task_ref: str,
-        original_user_message: str,
-        intent: str,
-        response_language: str,
-        expected_task_revision: int,
-    ) -> ToolChunk:
+    async def __call__(self) -> ToolChunk:
         try:
             result = await self._runtime.continue_navigation_agent_task_v1(
                 web_session_id=self._web_session_id,
                 router_session_id=self._router_session_id,
-                task_ref=task_ref,
-                original_user_message=original_user_message,
-                intent=intent,
-                response_language=response_language,
-                expected_task_revision=expected_task_revision,
             )
         except Exception as exc:
             return _tool_chunk(
-                self._runtime.safe_router_tool_error(exc, action="continue"),
+                _router_tool_failure(
+                    operation="continue",
+                    payload=self._runtime.safe_router_tool_error(
+                        exc,
+                        action="continue",
+                        web_session_id=self._web_session_id,
+                    ),
+                ),
                 ok=False,
             )
-        return _tool_chunk({"ok": True, "continued": True, "task_ref": result["task_ref"]})
+        return _tool_chunk(
+            _router_tool_success(
+                operation="continue",
+                result=result,
+                default_status="active",
+            )
+        )
 
 
 class ControlNavigationDataTaskV1Tool(_RouterToolBase):
@@ -237,42 +300,38 @@ class ControlNavigationDataTaskV1Tool(_RouterToolBase):
     input_schema = {
         "type": "object",
         "properties": {
-            "task_ref": {"type": "string"},
             "action": {"type": "string", "enum": ["stop", "cancel"]},
-            "response_language": {"type": "string"},
-            "expected_task_revision": {"type": "integer", "minimum": 0},
         },
-        "required": [
-            "task_ref",
-            "action",
-            "response_language",
-            "expected_task_revision",
-        ],
+        "required": ["action"],
         "additionalProperties": False,
     }
 
-    async def __call__(
-        self,
-        task_ref: str,
-        action: str,
-        response_language: str,
-        expected_task_revision: int,
-    ) -> ToolChunk:
+    async def __call__(self, action: str) -> ToolChunk:
         try:
             result = await self._runtime.control_navigation_agent_task_v1(
                 web_session_id=self._web_session_id,
                 router_session_id=self._router_session_id,
-                task_ref=task_ref,
                 action=action,
-                response_language=response_language,
-                expected_task_revision=expected_task_revision,
             )
         except Exception as exc:
             return _tool_chunk(
-                self._runtime.safe_router_tool_error(exc, action=action),
+                _router_tool_failure(
+                    operation=action,
+                    payload=self._runtime.safe_router_tool_error(
+                        exc,
+                        action=action,
+                        web_session_id=self._web_session_id,
+                    ),
+                ),
                 ok=False,
             )
-        return _tool_chunk({"ok": True, "task_ref": result["task_ref"], "status": result["status"]})
+        return _tool_chunk(
+            _router_tool_success(
+                operation=action,
+                result=result,
+                default_status="paused" if action == "stop" else "cancelled",
+            )
+        )
 
 
 def router_v1_tools(

@@ -5,8 +5,6 @@ from types import SimpleNamespace
 
 import pytest
 
-from agentscope.message import ToolResultState
-
 from vla_data_juicer_agents.navigation import agent_tools as agent_tools_module
 from vla_data_juicer_agents.navigation.config import NavigationSettings
 from vla_data_juicer_agents.navigation.agent_tools import (
@@ -53,7 +51,6 @@ from vla_data_juicer_agents.navigation.task_state import (
 from vla_data_juicer_agents.runtime import agentscope_runtime as runtime_module
 from vla_data_juicer_agents.runtime.agentscope_config import AgentScopeRuntimeConfig
 from vla_data_juicer_agents.runtime.agentscope_runtime import (
-    NavigationHandoffTool,
     build_extra_agent_middlewares_factory,
     build_extra_agent_tools_factory,
     create_agentscope_runtime,
@@ -61,6 +58,7 @@ from vla_data_juicer_agents.runtime.agentscope_runtime import (
 from vla_data_juicer_agents.runtime.navigation_tool_surface import (
     NavigationToolSurfaceMiddleware,
 )
+from vla_data_juicer_agents.runtime.single_agent import RouterContractV1Middleware
 
 
 PLANNING_TOOL_NAMES = {
@@ -89,20 +87,8 @@ EXECUTION_OBSERVATION_TOOL_NAMES = {
 }
 
 
-class FakeNavigationHandoffRuntime:
-    def __init__(self) -> None:
-        self.started: list[dict[str, str]] = []
-        self.records: list[dict] = []
-
-    async def start_navigation_agent_task(self, *, web_session_id: str, message: str) -> str:
-        self.started.append({"web_session_id": web_session_id, "message": message})
-        return SimpleNamespace(
-            task_id="nav-test-1",
-            agentscope_session_id="navigation-session",
-        )
-
-    def record_navigation_handoff(self, payload: dict) -> None:
-        self.records.append(payload)
+class FakeRouterRuntime:
+    pass
 
 
 def _config(tmp_path) -> AgentScopeRuntimeConfig:
@@ -116,10 +102,6 @@ def _config(tmp_path) -> AgentScopeRuntimeConfig:
         router_model="qwen-router",
         navigation_model="qwen-navigation",
     )
-
-
-def _text(chunk) -> str:
-    return chunk.content[0].text
 
 
 def _decode_tool_payload(payload):
@@ -151,9 +133,9 @@ def test_plan_bound_human_decision_tool_exposes_only_plan_and_step_ids():
     assert tool.input_schema["additionalProperties"] is False
 
 
-def test_navigation_extra_tools_are_empty_but_router_handoff_is_unchanged(tmp_path):
+def test_navigation_extra_tools_are_empty_but_router_surface_is_v1_only(tmp_path):
     config = _config(tmp_path)
-    runtime = FakeNavigationHandoffRuntime()
+    runtime = FakeRouterRuntime()
     runtime._navigation_tools_for_session = lambda **_kwargs: [
         SimpleNamespace(name="legacy_navigation_tool")
     ]
@@ -167,7 +149,11 @@ def test_navigation_extra_tools_are_empty_but_router_handoff_is_unchanged(tmp_pa
     )
 
     assert navigation_tools == []
-    assert {tool.name for tool in router_tools} == {"start_navigation_data_task"}
+    assert {tool.name for tool in router_tools} == {
+        "start_navigation_data_task",
+        "continue_navigation_data_task",
+        "control_navigation_data_task",
+    }
 
 
 def test_navigation_middleware_factory_binds_exact_session_and_runtime(tmp_path):
@@ -197,16 +183,15 @@ def test_navigation_middleware_factory_binds_exact_session_and_runtime(tmp_path)
     assert middleware._web_session_id == "web-1"
     assert middleware._agentscope_session_id == "web-1__navigation-data-agent"
     assert middleware._cancellation is cancellation
-    assert (
-        asyncio.run(
-            factory(
-                "alice",
-                config.main_router_agent_id,
-                "web-1__main-router-agent",
-            )
+    router_middlewares = asyncio.run(
+        factory(
+            "alice",
+            config.main_router_agent_id,
+            "web-1__main-router-agent",
         )
-        == []
     )
+    assert len(router_middlewares) == 1
+    assert isinstance(router_middlewares[0], RouterContractV1Middleware)
 
 
 def test_navigation_middleware_factory_fails_closed_without_runtime(tmp_path):
@@ -223,226 +208,12 @@ def test_navigation_middleware_factory_fails_closed_without_runtime(tmp_path):
         )
 
 
-def test_navigation_handoff_tool_declares_structured_schema():
-    tool = NavigationHandoffTool(
-        runtime=FakeNavigationHandoffRuntime(),
-        web_session_id="web-1",
-    )
-
-    assert set(tool.input_schema["properties"]) == {
-        "request",
-        "target",
-        "date",
-        "scene_mode",
-        "clips",
-        "reason",
-        "missing_fields",
-        "confidence",
-        "response_language",
-    }
-    assert "dry_run" not in tool.input_schema["properties"]
-    assert tool.input_schema["required"] == [
-        "request",
-        "target",
-        "date",
-        "reason",
-        "missing_fields",
-        "confidence",
-        "response_language",
-    ]
-    assert tool.input_schema["properties"]["scene_mode"]["enum"] == ["indoor", "outdoor", "unknown"]
-    assert tool.input_schema["properties"]["confidence"]["enum"] == ["low", "medium", "high"]
-    assert tool.input_schema["properties"]["missing_fields"]["items"]["enum"] == [
-        "request",
-        "target",
-        "date",
-        "clips",
-        "other",
-    ]
-
-
-def test_navigation_handoff_tool_rejects_missing_fields_without_starting_navigation():
-    runtime = FakeNavigationHandoffRuntime()
-    tool = NavigationHandoffTool(runtime=runtime, web_session_id="web-1")
-
-    result = asyncio.run(
-        tool(
-            request="处理导航数据",
-            target="20270605",
-            date="20270605",
-            scene_mode="unknown",
-            reason="用户想处理导航数据",
-            missing_fields=["scene_mode"],
-            confidence="high",
-            response_language="Chinese",
-        )
-    )
-
-    assert result.state is ToolResultState.ERROR
-    assert "missing_fields" in _text(result)
-    assert runtime.started == []
-    assert runtime.records[-1]["started"] is False
-    assert runtime.records[-1]["missing_fields"] == ["scene_mode"]
-
-
-def test_navigation_handoff_tool_rejects_low_confidence_without_starting_navigation():
-    runtime = FakeNavigationHandoffRuntime()
-    tool = NavigationHandoffTool(runtime=runtime, web_session_id="web-1")
-
-    result = asyncio.run(
-        tool(
-            request="你能处理导航数据吗",
-            target="",
-            date="",
-            scene_mode="",
-            reason="用户只是询问能力",
-            missing_fields=[],
-            confidence="low",
-            response_language="Chinese",
-        )
-    )
-
-    assert result.state is ToolResultState.ERROR
-    assert "confidence" in _text(result)
-    assert runtime.started == []
-    assert runtime.records[-1]["started"] is False
-    assert runtime.records[-1]["confidence"] == "low"
-
-
-def test_navigation_handoff_tool_rejects_unsupported_confidence_without_starting_navigation():
-    runtime = FakeNavigationHandoffRuntime()
-    tool = NavigationHandoffTool(runtime=runtime, web_session_id="web-1")
-
-    result = asyncio.run(
-        tool(
-            request="处理 20270605 的室外导航数据",
-            target="20270605",
-            date="20270605",
-            scene_mode="outdoor",
-            reason="用户看起来想处理导航数据",
-            missing_fields=[],
-            confidence="unknown",
-            response_language="Chinese",
-        )
-    )
-
-    assert result.state is ToolResultState.ERROR
-    assert "confidence" in _text(result)
-    assert runtime.started == []
-    assert runtime.records[-1]["started"] is False
-    assert runtime.records[-1]["confidence"] == "unknown"
-
-
-def test_navigation_handoff_tool_starts_navigation_with_structured_context():
-    runtime = FakeNavigationHandoffRuntime()
-    tool = NavigationHandoffTool(runtime=runtime, web_session_id="web-1")
-
-    result = asyncio.run(
-        tool(
-            request="处理 20270605 的室外导航数据",
-            target="20270605",
-            date="20270605",
-            scene_mode="outdoor",
-            clips=[],
-            reason="用户给出了日期和室外场景并要求处理导航数据",
-            missing_fields=[],
-            confidence="high",
-            response_language="Chinese",
-        )
-    )
-
-    assert result.state is ToolResultState.SUCCESS
-    result_payload = json.loads(_text(result))
-    assert result_payload == result.metadata
-    assert result_payload == {
-        "ok": True,
-        "started": True,
-        "task_id": "nav-test-1",
-        "message": "导航数据任务已启动。",
-    }
-    assert runtime.started[0]["web_session_id"] == "web-1"
-    message = runtime.started[0]["message"]
-    assert "导航数据处理请求：" in message
-    assert "用户原始请求: 处理 20270605 的室外导航数据" in message
-    assert "处理目标: 20270605" in message
-    assert "场景模式: outdoor" in message
-    assert "clips: all" in message
-    assert "转交原因: 用户给出了日期和室外场景并要求处理导航数据" in message
-    assert "回复语言: Chinese" in message
-    assert "请始终使用中文回复用户。" in message
-
-
-def test_navigation_handoff_tool_uses_explicit_date_not_clip_prefix_for_task_entry():
-    runtime = FakeNavigationHandoffRuntime()
-    tool = NavigationHandoffTool(runtime=runtime, web_session_id="web-1")
-
-    asyncio.run(
-        tool(
-            request="处理导航数据，指定 clip 为 20260605_152856",
-            target="20260605_152856",
-            date="20270605",
-            scene_mode="outdoor",
-            clips=["20260605_152856"],
-            reason="用户给出了数据日期、室外场景和指定 clip",
-            missing_fields=[],
-            confidence="high",
-            response_language="Chinese",
-        )
-    )
-
-    message = runtime.started[0]["message"]
-    json_text = message.split("Structured handoff JSON:", 1)[1].strip()
-    payload = json.loads(json_text)
-
-    assert payload["date"] == "20270605"
-    assert payload["target"] == "20260605_152856"
-    assert payload["segments"] == ["20260605_152856"]
-
-
-def test_shortcut_style_request_preserves_date_and_clips_in_router_handoff():
-    runtime = FakeNavigationHandoffRuntime()
-    tool = NavigationHandoffTool(runtime=runtime, web_session_id="web-shortcut")
-    request = "\n".join(
-        [
-            "请处理导航数据。",
-            "",
-            "数据日期：20270605",
-            "指定 clips：",
-            "- 20260605_152856",
-            "- 20260605_160012",
-        ]
-    )
-
-    result = asyncio.run(
-        tool(
-            request=request,
-            target="20270605",
-            date="20270605",
-            clips=["20260605_152856", "20260605_160012"],
-            reason="用户通过数据管理页请求处理指定 clips",
-            missing_fields=[],
-            confidence="high",
-            response_language="Chinese",
-        )
-    )
-
-    assert result.state is ToolResultState.SUCCESS
-    assert runtime.records[-1]["date"] == "20270605"
-    assert runtime.records[-1]["clips"] == ["20260605_152856", "20260605_160012"]
-    structured = runtime.started[0]["message"].split("Structured handoff JSON:", 1)[1]
-    payload = json.loads(structured)
-    assert payload["date"] == "20270605"
-    assert payload["segments"] == ["20260605_152856", "20260605_160012"]
-
-
 def test_navigation_handoff_message_includes_structured_json_for_task_entry():
     message = runtime_module._navigation_handoff_message(
         request="处理 20270605 的导航数据",
-        target="20270605",
         date="20270605",
         scene_mode="outdoor",
         clips=["20260605_152856"],
-        reason="用户要处理导航数据",
         response_language="Chinese",
     )
 
@@ -451,10 +222,12 @@ def test_navigation_handoff_message_includes_structured_json_for_task_entry():
 
     assert payload == {
         "request": "处理 20270605 的导航数据",
-        "target": "20270605",
-        "date": "20270605",
+        "dataset_date": "20270605",
+        "selection": {
+            "kind": "selected_clips",
+            "clips": ["20260605_152856"],
+        },
         "scene_mode": "out",
-        "segments": ["20260605_152856"],
         "response_language": "Chinese",
     }
 
@@ -462,114 +235,21 @@ def test_navigation_handoff_message_includes_structured_json_for_task_entry():
 def test_navigation_handoff_message_prefers_task_date_over_clip_prefix_date():
     message = runtime_module._navigation_handoff_message(
         request="请帮我处理一下20270605的导航数据，室外数据。只处理20260605_152856就可以。",
-        target="20260605_152856",
         date="20270605",
         scene_mode="outdoor",
         clips=["20260605_152856"],
-        reason="用户给出了日期、室外场景和指定 clip",
         response_language="Chinese",
     )
 
     json_text = message.split("Structured handoff JSON:", 1)[1].strip()
     payload = json.loads(json_text)
 
-    assert payload["date"] == "20270605"
-    assert payload["target"] == "20260605_152856"
-    assert payload["segments"] == ["20260605_152856"]
-
-
-def test_navigation_handoff_tool_records_observability_payload():
-    runtime = FakeNavigationHandoffRuntime()
-    tool = NavigationHandoffTool(runtime=runtime, web_session_id="web-1")
-
-    asyncio.run(
-        tool(
-            request="处理 20270605 clip_001 的室内导航数据",
-            target="20270605",
-            date="20270605",
-            scene_mode="indoor",
-            clips=["clip_001"],
-            reason="用户明确指定日期、clip 和室内场景",
-            missing_fields=[],
-            confidence="medium",
-            response_language="Chinese",
-        )
-    )
-
-    assert runtime.records == [
-        {
-            "web_session_id": "web-1",
-            "request": "处理 20270605 clip_001 的室内导航数据",
-            "target": "20270605",
-            "date": "20270605",
-            "scene_mode": "indoor",
-            "clips": ["clip_001"],
-            "reason": "用户明确指定日期、clip 和室内场景",
-            "missing_fields": [],
-            "confidence": "medium",
-            "response_language": "Chinese",
-            "ok": True,
-            "started": True,
-            "task_id": "nav-test-1",
-        }
-    ]
-
-
-def test_navigation_handoff_tool_returns_authoritative_busy_json():
-    class BusyRuntime(FakeNavigationHandoffRuntime):
-        async def start_navigation_agent_task(self, **_kwargs):
-            raise runtime_module.NavigationDataBusyError("busy")
-
-    tool = NavigationHandoffTool(runtime=BusyRuntime(), web_session_id="web-1")
-
-    result = asyncio.run(
-        tool(
-            request="处理 20270605 的导航数据",
-            target="20270605",
-            date="20270605",
-            reason="用户请求处理",
-            missing_fields=[],
-            confidence="high",
-            response_language="Chinese",
-        )
-    )
-
-    assert result.state is ToolResultState.ERROR
-    assert json.loads(_text(result)) == result.metadata == {
-        "ok": False,
-        "started": False,
-        "error_type": "navigation_data_busy",
-        "message": "该目标当前有正在运行的数据写入操作。",
+    assert payload["dataset_date"] == "20270605"
+    assert payload["selection"] == {
+        "kind": "selected_clips",
+        "clips": ["20260605_152856"],
     }
-
-
-def test_navigation_handoff_tool_bounds_unknown_start_failure(caplog):
-    class FailingRuntime(FakeNavigationHandoffRuntime):
-        async def start_navigation_agent_task(self, **_kwargs):
-            raise RuntimeError("secret internal failure")
-
-    tool = NavigationHandoffTool(runtime=FailingRuntime(), web_session_id="web-1")
-
-    result = asyncio.run(
-        tool(
-            request="处理 20270605 的导航数据",
-            target="20270605",
-            date="20270605",
-            reason="用户请求处理",
-            missing_fields=[],
-            confidence="high",
-            response_language="Chinese",
-        )
-    )
-
-    payload = json.loads(_text(result))
-    assert result.state is ToolResultState.ERROR
-    assert payload == result.metadata
-    assert payload["ok"] is False
-    assert payload["started"] is False
-    assert payload["error_type"] == "navigation_start_failed"
-    assert "secret internal failure" not in _text(result)
-    assert "correlation_id=" in caplog.text
+    assert "segments" not in payload
 
 
 def test_create_agentscope_runtime_wires_navigation_factories(monkeypatch, tmp_path):
@@ -616,16 +296,22 @@ def test_create_agentscope_runtime_wires_navigation_factories(monkeypatch, tmp_p
     )
 
     router_session_id = "web-1__main-router-agent"
-    assert asyncio.run(
+    router_middlewares = asyncio.run(
         middlewares_factory("alice", config.main_router_agent_id, router_session_id)
-    ) == []
+    )
+    assert len(router_middlewares) == 1
+    assert isinstance(router_middlewares[0], RouterContractV1Middleware)
     router_tool_names = {
         tool.name
         for tool in asyncio.run(
             tools_factory("alice", config.main_router_agent_id, router_session_id)
         )
     }
-    assert router_tool_names == {"start_navigation_data_task"}
+    assert router_tool_names == {
+        "start_navigation_data_task",
+        "continue_navigation_data_task",
+        "control_navigation_data_task",
+    }
 
     unknown_agent_id = "unknown-agent"
     unknown_session_id = "web-1__unknown-agent"

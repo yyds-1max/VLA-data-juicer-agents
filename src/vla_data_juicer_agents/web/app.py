@@ -18,7 +18,6 @@ from vla_data_juicer_agents.navigation.dataset_catalog import (
     scan_navigation_dataset,
     scan_navigation_date,
 )
-from vla_data_juicer_agents.tui.controller import SessionController
 from vla_data_juicer_agents.web.event_stream import SessionEventBus
 from vla_data_juicer_agents.web.schemas import (
     CreateSessionResponse,
@@ -35,7 +34,6 @@ from vla_data_juicer_agents.web.schemas import (
 )
 from vla_data_juicer_agents.web.contract_models import ContractConflictError
 from vla_data_juicer_agents.web.agent_session import AgentScopeWebSessionManager
-from vla_data_juicer_agents.web.session_manager import ControllerFactory, WebSessionManager
 from vla_data_juicer_agents.web.session_store import WebSessionStore
 
 logger = logging.getLogger(__name__)
@@ -45,10 +43,14 @@ def create_app(
     working_dir: str | None = None,
     model: str | None = None,
     db_path: str | Path | None = None,
-    controller_factory: ControllerFactory = SessionController,
     frontend_dist: str | Path | None = None,
     agentscope_runtime: Any | None = None,
 ) -> FastAPI:
+    if agentscope_runtime is None:
+        raise RuntimeError(
+            "DataPilot Web requires an AgentScope runtime; "
+            "the legacy controller runtime is unsupported"
+        )
     if working_dir is None:
         working_dir = os.environ.get("VLA_DATA_AGENT_WEB_WORKING_DIR", "./.djx")
     if model is None:
@@ -63,26 +65,14 @@ def create_app(
     async def publish_session_event(session_id: str, event: dict[str, Any]) -> None:
         await bus.publish(session_id, event)
 
-    if agentscope_runtime is None:
-        manager = WebSessionManager(
-            store=store,
-            working_dir=working_dir,
-            model=model,
-            controller_factory=controller_factory,
-        )
-    else:
-        manager = AgentScopeWebSessionManager(
-            store=store,
-            runtime=agentscope_runtime,
-            event_callback=publish_session_event,
-        )
+    manager = AgentScopeWebSessionManager(
+        store=store,
+        runtime=agentscope_runtime,
+        event_callback=publish_session_event,
+    )
 
     @asynccontextmanager
     async def lifespan(_parent_app: FastAPI):
-        if agentscope_runtime is None:
-            yield
-            return
-
         async with agentscope_runtime.app.router.lifespan_context(agentscope_runtime.app):
             event_bridge = getattr(manager, "event_bridge", None)
             if event_bridge is not None:
@@ -112,13 +102,18 @@ def create_app(
     app.state.bus = bus
     app.state.agentscope_runtime = agentscope_runtime
 
-    if agentscope_runtime is not None:
-        app.mount(agentscope_runtime.config.agentscope_mount_path, agentscope_runtime.app)
+    app.mount(agentscope_runtime.config.agentscope_mount_path, agentscope_runtime.app)
 
     @app.post("/api/sessions", response_model=CreateSessionResponse)
     async def create_session(request: CreateSessionRequest) -> CreateSessionResponse:
         session = await _maybe_await(
-            manager.create_session(request.message, request.entrypoint)
+            manager.create_session(
+                request.message,
+                request.entrypoint,
+                request.request_context.model_dump(mode="json")
+                if request.request_context is not None
+                else None,
+            )
         )
         return CreateSessionResponse(session=session)
 
@@ -173,12 +168,7 @@ def create_app(
         except RuntimeError as exc:
             raise HTTPException(status_code=409, detail=str(exc)) from exc
         turn_id = submission.turn.id
-        if submission.created and agentscope_runtime is None:
-            _create_logged_task(
-                _drain_controller_events(session_id, manager, store, bus, turn_id=turn_id),
-                name=f"controller-events:{session_id}",
-            )
-        elif submission.created and getattr(manager, "event_bridge", None) is None:
+        if submission.created and getattr(manager, "event_bridge", None) is None:
             _create_logged_task(
                 manager.forward_events_until_idle(session_id),
                 name=f"agentscope-events:{session_id}",
@@ -228,7 +218,7 @@ def create_app(
             ) from exc
         except (RuntimeError, ValueError) as exc:
             raise HTTPException(status_code=409, detail=str(exc)) from exc
-        if agentscope_runtime is not None and getattr(manager, "event_bridge", None) is None:
+        if getattr(manager, "event_bridge", None) is None:
             _create_logged_task(
                 manager.forward_events_until_idle(session_id),
                 name=f"agentscope-events:{session_id}",
@@ -253,7 +243,7 @@ def create_app(
             raise HTTPException(status_code=409, detail=str(exc)) from exc
         if not accepted:
             raise HTTPException(status_code=409, detail="Human decision was not accepted")
-        if agentscope_runtime is not None and getattr(manager, "event_bridge", None) is None:
+        if getattr(manager, "event_bridge", None) is None:
             _create_logged_task(
                 manager.forward_events_until_idle(session_id),
                 name=f"agentscope-events:{session_id}",
@@ -287,7 +277,7 @@ def create_app(
     @app.websocket("/api/sessions/{session_id}/events")
     async def session_events(websocket: WebSocket, session_id: str) -> None:
         await websocket.accept()
-        if agentscope_runtime is not None and getattr(manager, "event_bridge", None) is None:
+        if getattr(manager, "event_bridge", None) is None:
             _create_logged_task(
                 manager.forward_events_until_idle(session_id),
                 name=f"agentscope-events-ws:{session_id}",
@@ -344,76 +334,3 @@ def _raise_navigation_http_error(exc: ValueError | FileNotFoundError) -> None:
     if isinstance(exc, ValueError):
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     raise HTTPException(status_code=404, detail=str(exc)) from exc
-
-
-async def _drain_controller_events(
-    session_id: str,
-    manager: WebSessionManager,
-    store: WebSessionStore,
-    bus: SessionEventBus,
-    turn_id: str | None = None,
-) -> None:
-    try:
-        controller = manager.get_controller(session_id)
-    except KeyError:
-        return
-
-    persisted_final_texts: set[str] = set()
-
-    async def drain_once() -> None:
-        for event in controller.drain_events():
-            text = _final_event_text(event)
-            if text is not None and text not in persisted_final_texts and turn_id is not None:
-                for record in store.complete_turn(turn_id, text):
-                    await bus.publish(session_id, record.model_dump(mode="json"))
-                persisted_final_texts.add(text)
-                continue
-            turn_event = {**event, "turn_id": turn_id}
-            record = store.append_timeline_event(session_id, turn_event)
-            await bus.publish(session_id, record.model_dump(mode="json"))
-
-    drained_to_completion = False
-    try:
-        while controller.is_running:
-            await drain_once()
-            await asyncio.sleep(0.03)
-
-        await drain_once()
-        drained_to_completion = True
-    finally:
-        result = await _consume_turn_result_when_idle(controller)
-        if drained_to_completion and result is not None:
-            text = getattr(result, "text", None)
-            if isinstance(text, str) and text and text not in persisted_final_texts:
-                if turn_id is None:
-                    store.append_message(session_id, role="assistant", content=text)
-                else:
-                    for record in store.complete_turn(turn_id, text):
-                        await bus.publish(session_id, record.model_dump(mode="json"))
-                persisted_final_texts.add(text)
-
-
-def _final_event_text(event: dict[str, Any]) -> str | None:
-    if event.get("type") != "final":
-        return None
-    payload = event.get("payload")
-    if not isinstance(payload, dict):
-        return None
-    text = payload.get("text")
-    return text if isinstance(text, str) and text else None
-
-
-async def _consume_turn_result_when_idle(controller: Any) -> Any | None:
-    while getattr(controller, "is_running", False):
-        await asyncio.sleep(0.03)
-    return _consume_turn_result(controller)
-
-
-def _consume_turn_result(controller: Any) -> Any | None:
-    consume_turn_result = getattr(controller, "consume_turn_result", None)
-    if not callable(consume_turn_result):
-        return None
-    try:
-        return consume_turn_result()
-    except RuntimeError:
-        return None

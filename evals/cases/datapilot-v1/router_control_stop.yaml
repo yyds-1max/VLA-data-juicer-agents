@@ -1,0 +1,29 @@
+schema_version: 2
+id: router_control_stop
+suite: datapilot-v1
+entrypoint: router
+tags: [v1, router, control, stop]
+runtime_setup:
+  focused_task:
+    task_ref: DP-EVAL-ACTIVE
+    status: active
+    dataset_date: "20270605"
+conversation:
+  - role: user
+    content: 先停一下当前处理。
+limits:
+  max_model_calls: 1
+  max_tool_calls: 1
+  timeout_seconds: 180
+expectations:
+  tools:
+    allowed_calls: [control_navigation_data_task]
+    required_counts:
+      control_navigation_data_task: 1
+    handoff_count: 1
+    handoff:
+      operation: stop
+      status: pausing
+      forbidden_fields: [task_ref_input, revision, task_id, run_id]
+  response:
+    forbidden_terms: [MainRouterAgent, NavigationDataAgent, start_navigation_data_task, continue_navigation_data_task, control_navigation_data_task, task_id, run_id, call_id, system prompt, 系统提示词]

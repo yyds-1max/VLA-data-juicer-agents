@@ -1,15 +1,32 @@
 # Local agent evaluations
 
 This directory contains versioned, outcome-based evaluation cases and sanitized
-baseline summaries. The first milestone evaluates `MainRouterAgent` with the
-production prompt, tool schemas, AgentScope host, and a real DashScope model. It
-does **not** require Redis, FastAPI, the frontend, or navigation processing
-scripts.
+baseline summaries. The default `datapilot-v1` suite evaluates the production
+DataPilot Router V1 prompt, RouterContextEnvelope middleware, and exact
+`start_navigation_data_task`, `continue_navigation_data_task`, and
+`control_navigation_data_task` schemas. The host records accepted routing
+operations but never starts navigation processing, so it does **not** require
+Redis, FastAPI, the frontend, or navigation processing scripts.
 
-The case Schema v1 intentionally supports exactly one `router` user turn.
-`navigation`, `end_to_end`, and multi-turn conversations require separate
-execution semantics, side-effect simulators, and graders; they are rejected at
-validation time instead of being silently approximated by this runner.
+Case Schema v2 supports one or more Router user turns and one optional safe
+runtime setup: either a focused-task snapshot or a trusted shortcut
+`request_context`. Assistant turns are always produced by the host; fixtures
+cannot inject them. The trusted context is exposed only through the production
+RouterContextEnvelope shape and its date/clip scope is enforced exactly by the
+evaluation runtime. Navigation and end-to-end execution still require a
+separate specialist simulator and are rejected rather than silently
+approximated. Schema v1 and the `router-smoke` cases/baseline remain untouched as
+historical artifacts. They are not the CLI default and are not a DataPilot V1
+release gate.
+
+The V1 suite covers capability answers, missing-date clarification, date-only
+all-clips routing, single and multiple selected clips, clip/date prefix
+independence, trusted shortcut scope, a two-turn date clarification that must
+retain the selected clip, status queries, unrelated questions during an active
+task, waiting-user continuation and normal close after rejecting
+post-processing, paused-task resume, stop/cancel, occupied task-slot conflicts,
+and the navigation generic-tool prohibition. Exact scope, allowed tool sets,
+tool-call counts, and implementation-detail leakage are deterministic gates.
 
 ## Environment
 
@@ -32,14 +49,15 @@ request JSON, traces, or baseline reports.
 Validate case schemas and grader configuration without calling a model:
 
 ```bash
-vla-agent-eval validate --suite router-smoke
+vla-agent-eval validate
+# Equivalent: vla-agent-eval validate --suite datapilot-v1
 ```
 
 Run all cases once, or select/repeat a case:
 
 ```bash
-vla-agent-eval run --suite router-smoke
-vla-agent-eval run --suite router-smoke --case router_shortcut_preserves_scope --repeat 3
+vla-agent-eval run
+vla-agent-eval run --case router_start_selected_cross_date_prefix --repeat 3
 ```
 
 Repeated runs include a per-case stability summary in stdout and
@@ -54,7 +72,7 @@ with `--output-dir PATH`. To refresh the compact, commit-safe JSON and Markdown
 summaries under `evals/baselines/`, add `--write-baseline`:
 
 ```bash
-vla-agent-eval run --suite router-smoke --write-baseline
+vla-agent-eval run --suite datapilot-v1 --write-baseline
 ```
 
 `--write-baseline` requires the complete suite and refuses to replace the
@@ -66,7 +84,7 @@ Compare an existing baseline with a candidate aggregate:
 
 ```bash
 vla-agent-eval compare \
-  --baseline evals/baselines/router-smoke.json \
+  --baseline evals/baselines/datapilot-v1.json \
   --candidate .artifacts/evaluation/<run-id>/aggregate.json
 ```
 
@@ -89,7 +107,7 @@ After reviewing a complete run, promote it without another model call:
 ```bash
 vla-agent-eval promote \
   --input .artifacts/evaluation/<run-id>/aggregate.json \
-  --suite router-smoke
+  --suite datapilot-v1
 ```
 
 Promotion requires a clean worktree, the current HEAD commit and case hash, a
@@ -117,3 +135,9 @@ A model `FAIL` is a valid baseline result. Do not change an agent prompt, tool,
 router, or business behavior while implementing or refreshing the evaluation
 baseline. Record the failure first, then address it in a separate optimization
 change and compare against the same cases.
+
+No `datapilot-v1` baseline is committed until the suite is run with the real
+deployed Router model and the resulting artifacts pass the existing safety
+audit. Deterministic scripted host tests cover the V1 schemas, scope preservation,
+single-call terminal handover, multi-turn context reuse, generic-tool blocking,
+and trace redaction without pretending to be a real-model quality baseline.

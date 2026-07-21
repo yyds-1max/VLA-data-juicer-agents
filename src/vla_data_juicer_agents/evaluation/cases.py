@@ -64,8 +64,26 @@ def load_default_suite(suite: str) -> list[EvaluationCase]:
 def cases_sha256(cases: Sequence[EvaluationCase]) -> str:
     """Return the canonical hash used to anchor a report to exact cases."""
 
+    canonical_cases: list[dict] = []
+    for case in cases:
+        payload = case.model_dump(mode="json")
+        if case.schema_version == 1:
+            # Schema v1 is frozen. New optional v2 model fields must not change
+            # the hash of the historical router-smoke cases/baseline.
+            payload.pop("runtime_setup", None)
+            handoff = payload["expectations"]["tools"].get("handoff")
+            if isinstance(handoff, dict):
+                for field in (
+                    "operation",
+                    "scope_source",
+                    "dataset_date",
+                    "selection",
+                    "status",
+                ):
+                    handoff.pop(field, None)
+        canonical_cases.append(payload)
     payload = json.dumps(
-        [case.model_dump(mode="json") for case in cases],
+        canonical_cases,
         ensure_ascii=False,
         sort_keys=True,
         separators=(",", ":"),

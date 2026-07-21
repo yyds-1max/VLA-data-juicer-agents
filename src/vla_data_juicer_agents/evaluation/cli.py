@@ -13,7 +13,7 @@ from typing import Any, Iterable, Sequence
 import uuid
 
 
-DEFAULT_SUITE = "router-smoke"
+DEFAULT_SUITE = "datapilot-v1"
 DEFAULT_TIMEOUT_SECONDS = 180.0
 WORKER_MODULE = "vla_data_juicer_agents.evaluation.worker"
 
@@ -250,11 +250,11 @@ def _finalize_metadata(
     results: Sequence[Any],
 ) -> None:
     from .cases import cases_sha256
-    from vla_data_juicer_agents.runtime.agentscope_prompts import main_router_prompt
+    from vla_data_juicer_agents.runtime.agentscope_prompts import main_router_v1_prompt
 
     metadata["cases_sha256"] = cases_sha256(cases)
     metadata["prompt_sha256"] = hashlib.sha256(
-        main_router_prompt().encode("utf-8"),
+        main_router_v1_prompt().encode("utf-8"),
     ).hexdigest()
     schema_hashes: set[str] = set()
     for result in results:

@@ -4,13 +4,15 @@
 
 Products normally depend on one another in this order:
 
-`raw acquisition -> prepared/extracted data -> per-segment sync_data -> finish temporary data -> annotation -> tracking -> projection -> final outputs + validation markers`
+`raw acquisition -> prepared/extracted data -> per-clip sync_data (containing internally generated segments/sequences) -> finish temporary data -> annotation -> tracking -> projection -> final outputs + validation markers`
 
-Existence is not completeness. Check the requested segment inventory and validation evidence at each dependency boundary before relying on a downstream product.
+The task-selection granularity is clips. A segment or sequence is generated inside a clip by synchronization and is never a selectable task input or a substitute clip identifier. Do not narrow, split, or redirect a task based on an internal segment/sequence name.
+
+Existence is not completeness. Check the requested clip inventory and validation evidence at each dependency boundary before relying on a downstream product.
 
 ## Recommended investigation order
 
-1. Confirm the requested date/path and selected segment inventory.
+1. Confirm the requested date/path and selected clip inventory. Treat internal segment/sequence names only as product evidence inside those clips.
 2. Inspect raw, prepared, sync, finish, final, and validation product facts in dependency order.
 3. If work remains before sync, inspect only the topic, timestamp, sensor-role, and runtime facts needed to plan it.
 4. If sync is complete and later work remains, first confirm continuation and needed user inputs, then inspect localization, gridmap, calibration, and runtime facts.
@@ -18,8 +20,8 @@ Existence is not completeness. Check the requested segment inventory and validat
 
 ## Common extract-sync work
 
-- Establish raw availability and segment coverage; prepare raw layout when required.
-- Inspect ROS topics/types/counts/timing and sensor-role candidates. Identify the actual front-fisheye camera topic, lidar topic, and localization source from the selected segments; do not infer them from the date or platform name alone.
+- Establish raw availability and clip coverage; prepare raw layout when required.
+- Inspect ROS topics/types/counts/timing and sensor-role candidates. Identify the actual front-fisheye camera topic, lidar topic, and localization source from the selected clips; do not infer them from the date or platform name alone.
 - Front-fisheye recordings commonly use `/cam_video4/csi_cam/image_raw/compressed` or `/cam_video5/csi_cam/image_raw/compressed`. Lidar commonly uses `/lidar_points`, `/rs32_lidar_points`, or `/r32_rslidar_points`. Treat these as known aliases, not an exhaustive list; use message types and evidence when another observed name is plausible.
 - Prefer a native Ins topic such as `/drivers/ins/Ins` for localization when present and supported. Otherwise select the exact observed odom topic, commonly `/utlidar/robot_odom_systime` or `/sport_odom`; later finish processing normally requires `odom_to_ins` conversion, while native Ins uses no conversion.
 - Select only topics justified by the chosen bindings. Do not add every observed topic to the extraction whitelist merely because it exists.
@@ -27,7 +29,7 @@ Existence is not completeness. Check the requested segment inventory and validat
 - Fill `query_dir` with exactly one relative extracted directory under `tmp_dir`, never a ROS topic or filesystem path. It must be the extracted directory of `time_sync.reference_sensor`. Lidar is normally the reference because of its low frame rate; an observed extracted gridmap stream may be selected when the data actually contains one.
 - Synchronization uses the company-standard nearest-timestamp tolerance of 100 ms. This is a fixed system policy, not a model-authored Plan parameter.
 - Choose ordered extract/sync steps, supported variants, parameters, dependencies, and failure policies.
-- Execute only the accepted Plan, then inspect the selected segment outputs and synchronization quality.
+- Execute only the accepted Plan, then inspect the selected clip outputs, including their internally generated segment/sequence products, and synchronization quality.
 
 ## Common finish-processing work
 
@@ -69,7 +71,7 @@ Inspect current inputs and outputs before retrying. A non-destructive retry may 
 
 ### Few-shot 1: user claims sync is complete, but products are missing
 
-- Observation: current artifact inspection finds one requested segment without `sync_data` or its validation evidence.
+- Observation: current artifact inspection finds one requested clip without complete `sync_data` or its validation evidence.
 - Criteria: the statement is guidance, not product proof; downstream work lacks a dependency.
 - Next: inspect raw/topic/sensor/timing facts and, if supported, submit a complete extract-sync Plan.
 

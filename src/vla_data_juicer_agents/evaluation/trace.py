@@ -42,7 +42,13 @@ _WINDOWS_ABSOLUTE_PATH_PATTERN = re.compile(
     r"(?<![A-Za-z0-9_.-])[A-Za-z]:\\[^\s\"'<>|,;)}\]]+",
 )
 _THINKING_EVENT_PREFIX = "THINKING"
-_EVALUATION_ALLOWED_TOOLS = frozenset({"start_navigation_data_task"})
+_EVALUATION_ALLOWED_TOOLS = frozenset(
+    {
+        "start_navigation_data_task",
+        "continue_navigation_data_task",
+        "control_navigation_data_task",
+    },
+)
 _STREAM_DELTA_TYPES = frozenset(
     {"TEXT_BLOCK_DELTA", "TOOL_CALL_DELTA", "TOOL_RESULT_TEXT_DELTA"},
 )

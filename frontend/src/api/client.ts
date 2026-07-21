@@ -1,8 +1,5 @@
 import type {
   AgentEvent,
-  HumanDecisionPayload,
-  HumanDecisionRecoveryRequest,
-  HumanDecisionRecoveryResponse,
   InteractionResponsePayload,
   InteractionResponseResult,
   NavigationDatasetSummary,
@@ -11,6 +8,7 @@ import type {
   SessionDetail,
   SessionEntrypoint,
   SessionRecord,
+  SessionRequestContext,
 } from "./types";
 
 function sessionPath(sessionId: string): string {
@@ -64,12 +62,17 @@ async function requestJson<T>(url: string, init?: RequestInit): Promise<T> {
   return (await response.json()) as T;
 }
 
-export async function createSession(message: string, entrypoint?: SessionEntrypoint): Promise<SessionRecord> {
+export async function createSession(
+  message: string,
+  entrypoint?: SessionEntrypoint,
+  requestContext?: SessionRequestContext,
+): Promise<SessionRecord> {
   const data = await requestJson<{ session: SessionRecord }>("/api/sessions", {
     method: "POST",
     body: JSON.stringify({
       message,
       ...(entrypoint ? { entrypoint } : {}),
+      ...(requestContext ? { request_context: requestContext } : {}),
     }),
   });
   return data.session;
@@ -105,30 +108,6 @@ export async function interruptTurn(sessionId: string): Promise<boolean> {
     method: "POST",
   });
   return data.interrupted;
-}
-
-export async function submitHumanDecision(
-  sessionId: string,
-  payload: HumanDecisionPayload,
-): Promise<boolean> {
-  const data = await requestJson<{ accepted: boolean }>(`${sessionPath(sessionId)}/human-decisions`, {
-    method: "POST",
-    body: JSON.stringify(payload),
-  });
-  return data.accepted;
-}
-
-export async function recoverHumanDecision(
-  sessionId: string,
-  payload: HumanDecisionRecoveryRequest,
-): Promise<HumanDecisionRecoveryResponse> {
-  return requestJson<HumanDecisionRecoveryResponse>(
-    `${sessionPath(sessionId)}/human-decisions/recovery`,
-    {
-      method: "POST",
-      body: JSON.stringify(payload),
-    },
-  );
 }
 
 export async function submitInteractionResponse(

@@ -24,17 +24,98 @@ class CaseLimits(StrictModel):
 
 
 class ExpectedHandoff(StrictModel):
-    request: str
-    target: str
-    date: str = Field(pattern=r"^[0-9]{8}$")
+    # Contract-v1 historical handoff fields. They remain readable so the
+    # frozen router-smoke artifacts can still be inspected and compared.
+    request: str | None = None
+    target: str | None = None
+    date: str | None = Field(default=None, pattern=r"^[0-9]{8}$")
     clips: list[str] = Field(default_factory=list)
-    response_language: str
+    response_language: str | None = None
     missing_fields: list[str] = Field(default_factory=list)
     allowed_confidence: list[Literal["medium", "high"]] = Field(
         default_factory=lambda: ["medium", "high"],
         min_length=1,
     )
+    # DataPilot session contract v1 operation fields.
+    operation: Literal["start", "continue", "stop", "cancel"] | None = None
+    scope_source: Literal["request_context", "interpreted_user_text"] | None = None
+    dataset_date: str | None = Field(default=None, pattern=r"^[0-9]{8}$")
+    selection: dict[str, Any] | None = None
+    status: str | None = None
     forbidden_fields: list[str] = Field(default_factory=list)
+
+    @model_validator(mode="after")
+    def validate_contract_shape(self) -> "ExpectedHandoff":
+        if self.operation is None:
+            if None in (self.request, self.target, self.date, self.response_language):
+                raise ValueError("historical handoff expectations require legacy fields")
+            return self
+        if self.operation == "start":
+            if self.scope_source is None or self.dataset_date is None or self.selection is None:
+                raise ValueError(
+                    "start operation expectations require scope_source, dataset_date, and selection",
+                )
+            kind = self.selection.get("kind")
+            clips = self.selection.get("clips")
+            if kind == "all_clips" and set(self.selection) == {"kind"}:
+                return self
+            if (
+                kind == "selected_clips"
+                and set(self.selection) == {"kind", "clips"}
+                and isinstance(clips, list)
+                and clips
+                and all(isinstance(item, str) and item for item in clips)
+                and len(set(clips)) == len(clips)
+            ):
+                return self
+            raise ValueError("start selection must be all_clips or non-empty selected_clips")
+        return self
+
+
+class FocusedTaskSetup(StrictModel):
+    task_ref: str = "DP-EVAL-FOCUSED"
+    status: Literal["active", "waiting_user", "paused", "needs_replan"]
+    dataset_date: str = Field(default="20260718", pattern=r"^[0-9]{8}$")
+    selection: dict[str, Any] = Field(default_factory=lambda: {"kind": "all_clips"})
+    wait_cause: str | None = None
+
+
+class TrustedRequestContextSetup(StrictModel):
+    kind: Literal["navigation_dataset_selection_v1"]
+    dataset_date: str = Field(pattern=r"^[0-9]{8}$")
+    selection: dict[str, Any]
+
+    @model_validator(mode="after")
+    def validate_selection(self) -> "TrustedRequestContextSetup":
+        kind = self.selection.get("kind")
+        clips = self.selection.get("clips")
+        if kind == "all_clips" and set(self.selection) == {"kind"}:
+            return self
+        if (
+            kind == "selected_clips"
+            and set(self.selection) == {"kind", "clips"}
+            and isinstance(clips, list)
+            and clips
+            and all(isinstance(item, str) and item for item in clips)
+            and len(set(clips)) == len(clips)
+        ):
+            return self
+        raise ValueError(
+            "trusted request context selection must be all_clips or non-empty selected_clips",
+        )
+
+
+class EvaluationRuntimeSetup(StrictModel):
+    focused_task: FocusedTaskSetup | None = None
+    request_context: TrustedRequestContextSetup | None = None
+
+    @model_validator(mode="after")
+    def validate_exclusive_setup(self) -> "EvaluationRuntimeSetup":
+        if self.focused_task is not None and self.request_context is not None:
+            raise ValueError(
+                "focused_task and request_context cannot be seeded together",
+            )
+        return self
 
 
 class ToolExpectations(StrictModel):
@@ -72,20 +153,32 @@ class CaseExpectations(StrictModel):
 
 
 class EvaluationCase(StrictModel):
-    schema_version: Literal[1]
+    schema_version: Literal[1, 2]
     id: str = Field(pattern=r"^[a-z][a-z0-9_-]*$")
     suite: str = Field(pattern=r"^[a-z][a-z0-9_-]*$")
     entrypoint: Literal["router"]
     tags: list[str] = Field(default_factory=list)
     conversation: list[ConversationTurn] = Field(min_length=1)
+    runtime_setup: EvaluationRuntimeSetup | None = None
     limits: CaseLimits = Field(default_factory=CaseLimits)
     expectations: CaseExpectations
 
     @model_validator(mode="after")
     def validate_conversation(self) -> "EvaluationCase":
-        if len(self.conversation) != 1 or self.conversation[0].role != "user":
+        if self.schema_version == 1 and (
+            len(self.conversation) != 1 or self.conversation[0].role != "user"
+        ):
             raise ValueError(
                 "evaluation case schema v1 supports exactly one user conversation turn",
+            )
+        if self.schema_version == 1 and self.runtime_setup is not None:
+            raise ValueError("evaluation case schema v1 does not support runtime_setup")
+        if self.schema_version == 2 and any(
+            turn.role != "user" for turn in self.conversation
+        ):
+            raise ValueError(
+                "evaluation case schema v2 conversations contain user turns only; "
+                "assistant turns are produced by the host",
             )
         return self
 

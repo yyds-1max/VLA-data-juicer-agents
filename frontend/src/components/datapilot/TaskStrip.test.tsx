@@ -11,6 +11,9 @@ describe("TaskStrip", () => {
     const task: TaskSnapshot = {
       task_ref: "nav-A7K2",
       domain: "navigation",
+      dataset_date: "20270605",
+      selection: { kind: "all_clips" },
+      scene_mode: null,
       status: "active",
       phase: "同步进度 50%",
       state_revision: 4,

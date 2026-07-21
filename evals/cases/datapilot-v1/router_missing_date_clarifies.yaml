@@ -1,0 +1,34 @@
+schema_version: 2
+id: router_missing_date_clarifies
+suite: datapilot-v1
+entrypoint: router
+tags: [v1, router, clarification]
+conversation:
+  - role: user
+    content: 请处理导航数据。
+limits:
+  max_model_calls: 1
+  max_tool_calls: 0
+  timeout_seconds: 180
+expectations:
+  tools:
+    allowed_calls: []
+    required_counts: {}
+    handoff_count: 0
+  response:
+    language: Chinese
+    required_any_groups:
+      - [日期, YYYYMMDD]
+    forbidden_terms:
+      - MainRouterAgent
+      - NavigationDataAgent
+      - start_navigation_data_task
+      - continue_navigation_data_task
+      - control_navigation_data_task
+      - task_id
+      - run_id
+      - call_id
+      - system prompt
+      - 系统提示词
+    require_question: true
+    max_chars: 120

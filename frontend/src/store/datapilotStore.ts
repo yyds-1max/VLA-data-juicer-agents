@@ -4,9 +4,9 @@ import type {
   AgentEvent,
   ChatMessageRecord,
   PendingInteraction,
-  PendingHumanDecision,
   SessionDetail,
   SessionRecord,
+  SessionRequestContext,
   TaskSnapshot,
   TimelineEventRecord,
   TurnRecord,
@@ -24,6 +24,7 @@ export type DataPilotInvocationStatus =
 export interface DataPilotInvocation {
   invocationId: string;
   message: string;
+  requestContext: SessionRequestContext;
   status: DataPilotInvocationStatus;
   sessionId?: string;
   error?: string;
@@ -40,7 +41,6 @@ export interface DataPilotStoreState {
   open: boolean;
   mode: SessionMode;
   currentSessionId: string | null;
-  currentContractVersion: 0 | 1;
   previousActiveSessionId: string | null;
   knownRunningSessionId: string | null;
   sessions: SessionRecord[];
@@ -63,7 +63,11 @@ export interface DataPilotStoreState {
   discardLocalMessage: (messageId: string) => void;
   discardLocalTurn: (turnId: string) => void;
   adoptTurnId: (localTurnId: string, turnId: string) => void;
-  launchDataPilotRequest: (invocationId: string, message: string) => boolean;
+  launchDataPilotRequest: (
+    invocationId: string,
+    message: string,
+    requestContext: SessionRequestContext,
+  ) => boolean;
   claimDataPilotInvocation: (invocationId: string) => boolean;
   setDataPilotInvocationSession: (invocationId: string, sessionId: string) => void;
   completeDataPilotInvocation: (invocationId: string) => void;
@@ -73,10 +77,6 @@ export interface DataPilotStoreState {
   clearDataPilotInvocation: (invocationId?: string) => void;
   updateKnownRunningSession: (sessionId: string, running: boolean) => void;
   applyEvent: (event: AgentEvent) => void;
-  clearPendingHumanDecision: (
-    expectedDecision: PendingHumanDecision,
-    expectedSessionId: string | null,
-  ) => void;
 }
 
 export type DataPilotStore = ReturnType<typeof createDataPilotStore>;
@@ -86,7 +86,6 @@ export function createDataPilotStore() {
     open: false,
     mode: "draft_new_session",
     currentSessionId: null,
-    currentContractVersion: 0,
     previousActiveSessionId: null,
     knownRunningSessionId: null,
     sessions: [],
@@ -108,7 +107,6 @@ export function createDataPilotStore() {
       set((state) => ({
         mode: "draft_new_session",
         currentSessionId: null,
-        currentContractVersion: 0,
         previousActiveSessionId:
           state.mode === "active_session" ? state.currentSessionId : state.previousActiveSessionId,
         messages: [],
@@ -122,7 +120,6 @@ export function createDataPilotStore() {
       set((state) => ({
         mode: "active_session",
         currentSessionId: session.id,
-        currentContractVersion: session.contract_version ?? 0,
         previousActiveSessionId: null,
         sessions: upsertSession(state.sessions, session),
         messages: [],
@@ -147,7 +144,6 @@ export function createDataPilotStore() {
           sessions: upsertSession(state.sessions, session),
           messages: mergeMessages(state.messages, session.messages),
           turns,
-          currentContractVersion: session.contract_version ?? state.currentContractVersion,
           tasks: session.tasks ? mergeTasks(state.tasks, session.tasks) : state.tasks,
           pendingInteraction: session.pending_interaction !== undefined
             ? session.pending_interaction
@@ -171,7 +167,6 @@ export function createDataPilotStore() {
         return {
           mode: "active_session",
           currentSessionId: session.id,
-          currentContractVersion: session.contract_version ?? 0,
           previousActiveSessionId: null,
           sessions: upsertSession(state.sessions, session),
           messages: [...(messages ?? ("messages" in session ? session.messages : []))],
@@ -193,7 +188,6 @@ export function createDataPilotStore() {
       set((state) => ({
         mode: "history_session",
         currentSessionId: session.id,
-        currentContractVersion: session.contract_version ?? 0,
         previousActiveSessionId: null,
         sessions: upsertSession(state.sessions, session),
         messages: [...(messages ?? ("messages" in session ? session.messages : []))],
@@ -232,7 +226,7 @@ export function createDataPilotStore() {
         run: remapRunTurnId(state.run, localTurnId, turnId),
       })),
 
-    launchDataPilotRequest: (invocationId, message) => {
+    launchDataPilotRequest: (invocationId, message, requestContext) => {
       const current = get().pendingInvocation;
       if (current?.status === "queued" || current?.status === "submitting") {
         set({ open: true });
@@ -240,7 +234,7 @@ export function createDataPilotStore() {
       }
       set({
         open: true,
-        pendingInvocation: { invocationId, message, status: "queued" },
+        pendingInvocation: { invocationId, message, requestContext, status: "queued" },
       });
       return true;
     },
@@ -334,14 +328,16 @@ export function createDataPilotStore() {
 
     applyEvent: (event) =>
       set((state) => {
-        const run = cloneRunState(state.run);
+        const reconciled = reconcileOptimisticTurn(state.messages, state.turns, state.run, event);
+        const run = cloneRunState(reconciled.run);
         applyLiveEvent(run, event);
-        const turns = applyTurnEvent(state.turns, event, state.currentSessionId);
+        const turns = applyTurnEvent(reconciled.turns, event, state.currentSessionId);
         const tasks = applyTaskEvent(state.tasks, event);
         const pendingInteraction = applyInteractionEvent(state.pendingInteraction, event);
         const running = run.running || hasRunningTurn(turns) || hasOpenTask(tasks);
         return {
           run,
+          messages: reconciled.messages,
           turns,
           tasks,
           pendingInteraction,
@@ -353,19 +349,6 @@ export function createDataPilotStore() {
                 : state.knownRunningSessionId
             : state.knownRunningSessionId,
         };
-      }),
-
-    clearPendingHumanDecision: (expectedDecision, expectedSessionId) =>
-      set((state) => {
-        if (
-          state.currentSessionId !== expectedSessionId ||
-          !samePendingHumanDecision(state.run.pendingHumanDecision, expectedDecision)
-        ) {
-          return {};
-        }
-        const run = cloneRunState(state.run);
-        run.pendingHumanDecision = null;
-        return { run };
       }),
   }));
 }
@@ -389,7 +372,9 @@ function applyTaskEvent(tasks: TaskSnapshot[], event: AgentEvent): TaskSnapshot[
   if (!taskRef) return tasks;
   const existing = tasks.find((task) => task.task_ref === taskRef);
   const status = navigationTaskStatus(payload.status) ?? existing?.status;
-  if (!status) return tasks;
+  const datasetDate = textValue(payload.dataset_date ?? payload.datasetDate) || existing?.dataset_date;
+  const selection = navigationClipSelection(payload.selection) ?? existing?.selection;
+  if (!status || !datasetDate || !selection) return tasks;
   const now = event.timestamp ?? new Date().toISOString();
   const countRecord = recordValue(payload.count);
   const count = countRecord
@@ -402,6 +387,9 @@ function applyTaskEvent(tasks: TaskSnapshot[], event: AgentEvent): TaskSnapshot[
   const next: TaskSnapshot = {
     task_ref: taskRef,
     domain: textValue(payload.domain) || existing?.domain || "navigation",
+    dataset_date: datasetDate,
+    selection,
+    scene_mode: optionalText(payload.scene_mode ?? payload.sceneMode, existing?.scene_mode) ?? null,
     status,
     phase: optionalText(payload.phase, existing?.phase),
     waiting_reason: optionalText(payload.waiting_reason ?? payload.waitingReason, existing?.waiting_reason),
@@ -501,6 +489,15 @@ function navigationTaskStatus(value: unknown): TaskSnapshot["status"] | undefine
     "active", "waiting_user", "pausing", "paused", "cancelling", "cancelled",
     "completed", "failed", "needs_replan", "superseded",
   ].includes(status) ? status as TaskSnapshot["status"] : undefined;
+}
+
+function navigationClipSelection(value: unknown): TaskSnapshot["selection"] | undefined {
+  const selection = recordValue(value);
+  const kind = textValue(selection?.kind);
+  if (kind === "all_clips") return { kind };
+  if (kind !== "selected_clips") return undefined;
+  const clips = stringArray(selection?.clips);
+  return clips && clips.length > 0 ? { kind, clips } : undefined;
 }
 
 function interactionKind(value: unknown): PendingInteraction["kind"] | undefined {
@@ -610,21 +607,7 @@ function compareMessages(
 
 function cloneRunState(run: RunState): RunState {
   return {
-    timeline: run.timeline.map((item) => ({
-      ...item,
-      ...(item.activitySteps
-        ? { activitySteps: item.activitySteps.map((step) => ({ ...step })) }
-        : {}),
-    })),
-    activeAgents: Object.fromEntries(
-      Object.entries(run.activeAgents).map(([key, agent]) => [key, { ...agent }]),
-    ),
-    activeTools: Object.fromEntries(
-      Object.entries(run.activeTools).map(([key, tool]) => [key, { ...tool }]),
-    ),
-    pendingHumanDecision: run.pendingHumanDecision ? { ...run.pendingHumanDecision } : null,
-    activeText: run.activeText,
-    activeStartedAt: run.activeStartedAt,
+    timeline: run.timeline.map((item) => ({ ...item })),
     running: run.running,
     interrupting: run.interrupting,
     appliedEventKeys: { ...run.appliedEventKeys },
@@ -686,6 +669,37 @@ function mergeAdoptedTurn(turns: TurnRecord[], localId: string, serverId: string
   return mergeTurns(remaining, [merged]);
 }
 
+function reconcileOptimisticTurn(
+  messages: ChatMessageRecord[],
+  turns: TurnRecord[],
+  run: RunState,
+  event: AgentEvent,
+): { messages: ChatMessageRecord[]; turns: TurnRecord[]; run: RunState } {
+  const serverTurnId = typeof event.turn_id === "string" ? event.turn_id : "";
+  if (event.type !== "turn_start" || !serverTurnId || serverTurnId.startsWith("local-turn-")) {
+    return { messages, turns, run };
+  }
+  if (turns.some((turn) => turn.id === serverTurnId)) {
+    return { messages, turns, run };
+  }
+
+  // A WebSocket turn_start can beat the POST /turns response. There can be only
+  // one locally submitted user Turn, so adopt it immediately and avoid rendering
+  // a second empty ProcessingDisclosure during that race.
+  const candidates = turns.filter(
+    (turn) => turn.id.startsWith("local-turn-") && turn.origin === "user" && turn.status === "running",
+  );
+  if (candidates.length !== 1) return { messages, turns, run };
+  const localTurnId = candidates[0].id;
+  return {
+    messages: messages.map((message) =>
+      message.turn_id === localTurnId ? { ...message, turn_id: serverTurnId } : message,
+    ),
+    turns: mergeAdoptedTurn(turns, localTurnId, serverTurnId),
+    run: remapRunTurnId(run, localTurnId, serverTurnId),
+  };
+}
+
 function remapRunTurnId(run: RunState, localId: string, serverId: string): RunState {
   const next = cloneRunState(run);
   let keptInitialProgress = false;
@@ -699,21 +713,12 @@ function remapRunTurnId(run: RunState, localId: string, serverId: string): RunSt
       keptInitialProgress = true;
       return true;
     });
-  next.activeTools = Object.fromEntries(
-    Object.entries(next.activeTools).map(([key, tool]) => [
-      key.replace(`${localId}\u0000`, `${serverId}\u0000`),
-      tool.turnId === localId ? { ...tool, turnId: serverId } : tool,
-    ]),
-  );
   return next;
 }
 
 function removeRunTurn(run: RunState, turnId: string): RunState {
   const next = cloneRunState(run);
   next.timeline = next.timeline.filter((item) => item.turnId !== turnId);
-  next.activeTools = Object.fromEntries(
-    Object.entries(next.activeTools).filter(([, tool]) => tool.turnId !== turnId),
-  );
   next.terminalProgress = Object.fromEntries(
     Object.entries(next.terminalProgress).filter(
       ([key]) => !key.startsWith(`${turnId}\u0000`),
@@ -741,39 +746,17 @@ function mergeRunFromEvents(run: RunState, events: TimelineEventRecord[]): RunSt
 function applyEventIfNew(run: RunState, event: AgentEvent | TimelineEventRecord): void {
   const record = event as Partial<TimelineEventRecord>;
   const persistedKey = persistedEventKey(record);
-  const recoveryUpgrade = isPendingHumanDecisionRecoveryUpgrade(run, event);
-  if (persistedKey && run.appliedEventKeys[persistedKey] && !recoveryUpgrade) {
+  if (persistedKey && run.appliedEventKeys[persistedKey]) {
     return;
   }
   const liveKey = liveEventKey(event);
-  if (run.appliedEventKeys[liveKey] && !recoveryUpgrade) {
+  if (run.appliedEventKeys[liveKey]) {
     if (persistedKey) {
       run.appliedEventKeys[persistedKey] = true;
     }
     return;
   }
   applyEventAndMark(run, event, persistedKey ?? liveKey);
-}
-
-function isPendingHumanDecisionRecoveryUpgrade(
-  run: RunState,
-  event: AgentEvent | TimelineEventRecord,
-): boolean {
-  const current = run.pendingHumanDecision;
-  if (!current || current.recoveryRequired || event.type !== "human_decision_required") {
-    return false;
-  }
-  const payload = event.payload ?? {};
-  if (!(payload.recovery_required === true || payload.recoveryRequired === true)) {
-    return false;
-  }
-  const replyId = stringField(payload.reply_id) || stringField(payload.replyId);
-  const toolCallId = stringField(payload.tool_call_id) || stringField(payload.toolCallId);
-  return current.replyId === replyId && current.toolCallId === toolCallId;
-}
-
-function stringField(value: unknown): string {
-  return typeof value === "string" ? value.trim() : "";
 }
 
 function applyLiveEvent(run: RunState, event: AgentEvent): void {
@@ -816,9 +799,7 @@ function stampNewTimelineItems(
 function liveEventKey(event: AgentEvent | TimelineEventRecord): string {
   return `live:${[
     event.type,
-    event.source ?? "",
-    event.run_id ?? "",
-    event.parent_run_id ?? "",
+    event.turn_id ?? "",
     event.timestamp ?? "",
     stableStringify(event.payload ?? {}),
   ].join("\u0001")}`;
@@ -846,26 +827,4 @@ function stableStringify(value: unknown): string {
     .sort()
     .map((key) => `${JSON.stringify(key)}:${stableStringify(record[key])}`)
     .join(",")}}`;
-}
-
-function samePendingHumanDecision(
-  left: PendingHumanDecision | null,
-  right: PendingHumanDecision | null,
-): boolean {
-  if (!left || !right) {
-    return false;
-  }
-
-  return (
-    left.replyId === right.replyId &&
-    left.toolCallId === right.toolCallId &&
-    left.requestId === right.requestId &&
-    left.decisionType === right.decisionType &&
-    left.summary === right.summary &&
-    left.planId === right.planId &&
-    left.stepId === right.stepId &&
-    left.recoveryRequired === right.recoveryRequired &&
-    left.submissionDisabled === right.submissionDisabled &&
-    left.recoveryEndpoint === right.recoveryEndpoint
-  );
 }

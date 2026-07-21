@@ -23,6 +23,14 @@ class FakeAgentScopeRuntime:
         self.messages.append((web_session_id, message))
         return "turn-agent-1"
 
+    @staticmethod
+    def session_task_snapshots(_session_id: str) -> list[dict]:
+        return []
+
+    @staticmethod
+    def pending_interaction_snapshot(_session_id: str) -> None:
+        return None
+
     async def submit_human_decision(self, *, web_session_id: str, decision: dict) -> bool:
         self.decisions.append((web_session_id, decision))
         return self.accept_decision
@@ -61,7 +69,7 @@ def _create_session(client: TestClient) -> str:
     return response.json()["session"]["id"]
 
 
-def test_human_decision_confirm_is_accepted_and_forwarded(tmp_path) -> None:
+def test_legacy_human_decision_confirm_is_rejected_without_forwarding(tmp_path) -> None:
     runtime = FakeAgentScopeRuntime()
     client = _client(tmp_path, runtime)
     session_id = _create_session(client)
@@ -74,12 +82,12 @@ def test_human_decision_confirm_is_accepted_and_forwarded(tmp_path) -> None:
 
     response = client.post(f"/api/sessions/{session_id}/human-decisions", json=payload)
 
-    assert response.status_code == 200
-    assert response.json() == {"accepted": True}
-    assert runtime.decisions == [(session_id, payload)]
+    assert response.status_code == 409
+    assert "structured interaction endpoint" in response.json()["detail"]
+    assert runtime.decisions == []
 
 
-def test_plan_bound_human_decision_ids_are_forwarded_to_runtime(tmp_path) -> None:
+def test_legacy_plan_bound_human_decision_is_rejected(tmp_path) -> None:
     runtime = FakeAgentScopeRuntime()
     client = _client(tmp_path, runtime)
     session_id = _create_session(client)
@@ -94,11 +102,11 @@ def test_plan_bound_human_decision_ids_are_forwarded_to_runtime(tmp_path) -> Non
 
     response = client.post(f"/api/sessions/{session_id}/human-decisions", json=payload)
 
-    assert response.status_code == 200
-    assert runtime.decisions == [(session_id, payload)]
+    assert response.status_code == 409
+    assert runtime.decisions == []
 
 
-def test_human_decision_confirm_drains_agentscope_events(tmp_path) -> None:
+def test_legacy_human_decision_does_not_drain_agentscope_events(tmp_path) -> None:
     runtime = FakeAgentScopeRuntime()
     runtime.events = [
         {
@@ -120,15 +128,13 @@ def test_human_decision_confirm_drains_agentscope_events(tmp_path) -> None:
         },
     )
 
-    assert response.status_code == 200
-    assert runtime.subscriptions == [session_id]
+    assert response.status_code == 409
+    assert runtime.subscriptions == []
     detail = client.get(f"/api/sessions/{session_id}").json()["session"]
-    assert [(message["role"], message["content"]) for message in detail["messages"]] == [
-        ("assistant", "继续处理完成")
-    ]
+    assert detail["messages"] == []
 
 
-def test_human_decision_guide_preserves_structured_text_payload(tmp_path) -> None:
+def test_legacy_human_decision_guide_is_rejected(tmp_path) -> None:
     runtime = FakeAgentScopeRuntime()
     client = _client(tmp_path, runtime)
     session_id = _create_session(client)
@@ -144,16 +150,8 @@ def test_human_decision_guide_preserves_structured_text_payload(tmp_path) -> Non
         },
     )
 
-    assert response.status_code == 200
-    assert response.json() == {"accepted": True}
-    assert runtime.decisions[0][0] == session_id
-    assert runtime.decisions[0][1] == {
-        "action": "guide",
-        "request_id": "camera-1",
-        "tool_call_id": "tool-1",
-        "reply_id": "reply-1",
-        "text": "请改用另一组外参",
-    }
+    assert response.status_code == 409
+    assert runtime.decisions == []
 
 
 def test_human_decision_guide_requires_text(tmp_path) -> None:
@@ -176,7 +174,7 @@ def test_human_decision_guide_requires_text(tmp_path) -> None:
     assert runtime.decisions == []
 
 
-def test_human_decision_runtime_rejection_returns_409(tmp_path) -> None:
+def test_legacy_human_decision_rejection_does_not_call_runtime(tmp_path) -> None:
     runtime = FakeAgentScopeRuntime(accept_decision=False)
     client = _client(tmp_path, runtime)
     session_id = _create_session(client)
@@ -192,7 +190,8 @@ def test_human_decision_runtime_rejection_returns_409(tmp_path) -> None:
     )
 
     assert response.status_code == 409
-    assert response.json()["detail"] == "Human decision was not accepted"
+    assert "structured interaction endpoint" in response.json()["detail"]
+    assert runtime.decisions == []
 
 
 def test_human_decision_unknown_session_returns_404(tmp_path) -> None:
@@ -213,7 +212,7 @@ def test_human_decision_unknown_session_returns_404(tmp_path) -> None:
     assert response.json()["detail"] == "Session not found"
 
 
-def test_human_decision_recovery_contract_and_forwarding(tmp_path) -> None:
+def test_legacy_human_decision_recovery_is_rejected_without_forwarding(tmp_path) -> None:
     runtime = FakeAgentScopeRuntime()
     client = _client(tmp_path, runtime)
     session_id = _create_session(client)
@@ -228,16 +227,9 @@ def test_human_decision_recovery_contract_and_forwarding(tmp_path) -> None:
         f"/api/sessions/{session_id}/human-decisions/recovery", json=payload
     )
 
-    assert response.status_code == 200
-    assert response.json() == {
-        "recovered": True,
-        "plan_id": "plan-1",
-        "step_id": "confirm",
-        "handoff_status": "quarantined",
-        "task_status": "needs_replan",
-        "next_action": "submit_complete_plan",
-    }
-    assert runtime.recoveries == [(session_id, payload)]
+    assert response.status_code == 409
+    assert "structured interaction endpoint" in response.json()["detail"]
+    assert runtime.recoveries == []
 
 
 def test_human_decision_recovery_validation_ownership_and_state_errors(tmp_path) -> None:
@@ -266,4 +258,5 @@ def test_human_decision_recovery_validation_ownership_and_state_errors(tmp_path)
         },
     )
     assert conflict.status_code == 409
-    assert "recovery_required" in conflict.json()["detail"]
+    assert "structured interaction endpoint" in conflict.json()["detail"]
+    assert runtime.recoveries == []

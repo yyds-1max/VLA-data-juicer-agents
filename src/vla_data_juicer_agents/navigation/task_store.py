@@ -20,8 +20,10 @@ from vla_data_juicer_agents.navigation.task_state import (
     NavigationRunningWriter,
     NavigationTask,
     NavigationTaskStatus,
+    NavigationTaskTransitionError,
     TaskAttemptCreation,
     utc_now,
+    validate_navigation_task_status_transition,
 )
 
 
@@ -369,6 +371,15 @@ class SqliteNavigationTaskStore:
                 raise NavigationTaskStateRevisionError(
                     "navigation task state revision changed"
                 )
+            if "status" in changes:
+                requested_status = validate_navigation_task_status_transition(
+                    current.status,
+                    changes["status"],
+                )
+                changes["status"] = requested_status
+                if requested_status == current.status and set(changes) == {"status"}:
+                    connection.commit()
+                    return current
             task = self._merged_task(current, changes)
             self._update_task(connection, task)
             connection.commit()

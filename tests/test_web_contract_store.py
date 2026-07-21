@@ -7,7 +7,10 @@ import pytest
 
 from vla_data_juicer_agents.web.contract_models import ContractConflictError
 from vla_data_juicer_agents.web.migrations import UnsupportedSchemaVersionError
-from vla_data_juicer_agents.web.session_store import WebSessionStore
+from vla_data_juicer_agents.web.session_store import (
+    UnsupportedLegacySessionError,
+    WebSessionStore,
+)
 
 
 def _v1_store(tmp_path: Path) -> tuple[WebSessionStore, str]:
@@ -26,19 +29,24 @@ def _binding(store: WebSessionStore, session_id: str):
     )
 
 
-def test_explicit_migration_is_idempotent_and_preserves_legacy_sessions(tmp_path: Path):
+def test_explicit_migration_is_idempotent_and_new_sessions_are_v1_only(tmp_path: Path):
     db_path = tmp_path / "sessions.sqlite"
     store = WebSessionStore(db_path)
-    legacy = store.create_session("legacy")
+    session = store.create_session("contract v1")
 
     reopened = WebSessionStore(db_path)
 
-    assert reopened.get_session_contract_version(legacy.id) == 0
+    assert reopened.get_session_contract_version(session.id) == 1
+    with pytest.raises(ValueError, match="contract_version must be 1"):
+        reopened.create_session("legacy", contract_version=0)
     with sqlite3.connect(db_path) as connection:
-        assert connection.execute("SELECT version FROM schema_migrations").fetchall() == [(1,)]
+        assert connection.execute("SELECT version FROM schema_migrations").fetchall() == [
+            (1,),
+            (2,),
+        ]
         with pytest.raises(sqlite3.IntegrityError, match="contract_version is immutable"):
             connection.execute(
-                "UPDATE sessions SET contract_version = 1 WHERE id = ?", (legacy.id,)
+                "UPDATE sessions SET contract_version = 0 WHERE id = ?", (session.id,)
             )
 
 
@@ -53,7 +61,7 @@ def test_unknown_newer_schema_version_is_rejected_before_base_schema_changes(tmp
             """
         )
         connection.execute(
-            "INSERT INTO schema_migrations VALUES (2, 'future', '2026-07-20T00:00:00Z')"
+            "INSERT INTO schema_migrations VALUES (3, 'future', '2026-07-20T00:00:00Z')"
         )
 
     with pytest.raises(UnsupportedSchemaVersionError):
@@ -63,6 +71,23 @@ def test_unknown_newer_schema_version_is_rejected_before_base_schema_changes(tmp
         assert connection.execute(
             "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'sessions'"
         ).fetchone() is None
+
+
+def test_contract_v0_rows_require_explicit_development_reset(tmp_path: Path):
+    db_path = tmp_path / "sessions.sqlite"
+    WebSessionStore(db_path)
+    with sqlite3.connect(db_path) as connection:
+        connection.execute("DROP TRIGGER trg_sessions_contract_version_immutable")
+        connection.execute(
+            """
+            INSERT INTO sessions (
+                id, title, status, created_at, updated_at, contract_version
+            ) VALUES ('legacy', 'legacy', 'active', 'now', 'now', 0)
+            """
+        )
+
+    with pytest.raises(UnsupportedLegacySessionError, match="contract v0"):
+        WebSessionStore(db_path)
 
 
 def test_contract_migration_rolls_back_legacy_column_when_sidecar_creation_fails(

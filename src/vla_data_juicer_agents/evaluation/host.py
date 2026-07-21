@@ -5,7 +5,7 @@ from __future__ import annotations
 import asyncio
 import inspect
 from collections import defaultdict
-from collections.abc import AsyncGenerator, Callable, Mapping
+from collections.abc import AsyncGenerator, Callable, Mapping, Sequence
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from pathlib import Path
@@ -33,9 +33,9 @@ from vla_data_juicer_agents.runtime.agentscope_bootstrap import (
     bootstrap_agentscope_records,
 )
 from vla_data_juicer_agents.runtime.agentscope_config import AgentScopeRuntimeConfig
-from vla_data_juicer_agents.runtime.agentscope_runtime import (
-    NavigationHandoffTool,
-    NavigationTaskStartResult,
+from vla_data_juicer_agents.runtime.single_agent import (
+    RouterContractV1Middleware,
+    router_v1_tools,
 )
 
 from .trace import EvaluationSafetyMiddleware, TraceMiddleware, TraceRecorder
@@ -340,28 +340,249 @@ class InMemoryMessageBus(MessageBus):
         return await super().session_publish_event(session_id, event)
 
 
-class RecordingHandoffRuntime:
-    """NavigationHandoffTool target that records but never starts an agent."""
+class RecordingRouterRuntime:
+    """Side-effect-free target for the production Router V1 tool surface."""
 
-    def __init__(self, recorder: TraceRecorder, *, web_session_id: str) -> None:
+    def __init__(
+        self,
+        recorder: TraceRecorder,
+        *,
+        web_session_id: str,
+        router_session_id: str,
+        runtime_setup: Mapping[str, Any] | None = None,
+    ) -> None:
         self.recorder = recorder
         self.web_session_id = web_session_id
-        self.navigation_messages: list[str] = []
+        self.router_session_id = router_session_id
+        self.operations: list[dict[str, Any]] = []
+        self._terminal_tools: set[str] = set()
+        self._context_revision = 0
+        setup = dict(runtime_setup or {})
+        focused = setup.get("focused_task")
+        self.focused_task = dict(focused) if isinstance(focused, Mapping) else None
+        request_context = setup.get("request_context")
+        self.request_context = (
+            dict(request_context) if isinstance(request_context, Mapping) else None
+        )
 
-    async def start_navigation_agent_task(
+    @staticmethod
+    def _available_actions(status: str) -> list[str]:
+        return {
+            "active": ["stop", "cancel"],
+            "waiting_user": ["provide_input", "cancel"],
+            "paused": ["resume", "cancel"],
+            "pausing": ["cancel"],
+            "needs_replan": ["adjust", "cancel"],
+        }.get(status, [])
+
+    def _focused_summary(self) -> dict[str, Any] | None:
+        if self.focused_task is None:
+            return None
+        status = str(self.focused_task.get("status") or "active")
+        selection = self.focused_task.get("selection")
+        clips = (
+            list(selection.get("clips") or [])
+            if isinstance(selection, Mapping)
+            and selection.get("kind") == "selected_clips"
+            else []
+        )
+        return {
+            "task_ref": str(self.focused_task.get("task_ref") or "DP-EVAL-FOCUSED"),
+            "domain": "navigation",
+            "dataset_date": str(self.focused_task.get("dataset_date") or "20260718"),
+            "selection": (
+                {"kind": "selected_clips", "clips": clips}
+                if clips
+                else {"kind": "all_clips"}
+            ),
+            "scene_mode": self.focused_task.get("scene_mode"),
+            "status": status,
+            "phase": "waiting_input" if status == "waiting_user" else "preparing",
+            "wait_cause": self.focused_task.get("wait_cause"),
+            "latest_public_update": None,
+            "available_actions": self._available_actions(status),
+            "state_revision": self._context_revision,
+        }
+
+    def router_context_envelope(
+        self,
+        web_session_id: str,
+        *,
+        router_session_id: str | None = None,
+    ) -> dict[str, Any]:
+        del router_session_id
+        if web_session_id != self.web_session_id:
+            raise ValueError("evaluation session identity mismatch")
+        focused = self._focused_summary()
+        return {
+            "contract_version": 1,
+            "context_revision": self._context_revision,
+            "focus_generation": int(focused is not None),
+            "focused_task_ref": (focused or {}).get("task_ref"),
+            "focused_task_summary": focused,
+            "pending_interaction_summary": None,
+            "latest_public_update": None,
+            "attention_tasks": [],
+            "request_context": self.request_context,
+        }
+
+    async def start_navigation_agent_task_v1(
         self,
         *,
         web_session_id: str,
-        message: str,
-    ) -> NavigationTaskStartResult:
-        self.navigation_messages.append(message)
-        return NavigationTaskStartResult(
-            task_id=f"eval-navigation-task-{web_session_id}",
-            agentscope_session_id=f"{web_session_id}__navigation-data-agent",
-        )
+        router_session_id: str,
+        scope_source: str,
+        dataset_date: str,
+        selection: dict[str, Any],
+        scene_mode: str | None,
+    ) -> dict[str, Any]:
+        self._assert_identity(web_session_id, router_session_id)
+        if self.focused_task is not None:
+            raise RuntimeError("an evaluation task already occupies the task slot")
+        if self.request_context is not None:
+            if scope_source != "request_context":
+                raise RuntimeError(
+                    "trusted shortcut scope must be used without reinterpretation",
+                )
+            expected_scope = {
+                "dataset_date": self.request_context.get("dataset_date"),
+                "selection": self.request_context.get("selection"),
+            }
+            supplied_scope = {
+                "dataset_date": dataset_date,
+                "selection": selection,
+            }
+            if supplied_scope != expected_scope:
+                raise RuntimeError(
+                    "navigation scope does not match the trusted shortcut selection",
+                )
+        elif scope_source == "request_context":
+            raise RuntimeError("the evaluation turn has no trusted request context")
+        payload = {
+            "ok": True,
+            "operation": "start",
+            "accepted": True,
+            "started": True,
+            "task_ref": "DP-EVALUATION",
+            "scope_source": scope_source,
+            "dataset_date": dataset_date,
+            "selection": dict(selection),
+        }
+        if scene_mode is not None:
+            payload["scene_mode"] = scene_mode
+        self.focused_task = {
+            "task_ref": payload["task_ref"],
+            "status": "active",
+            "dataset_date": dataset_date,
+            "selection": dict(selection),
+            "scene_mode": scene_mode,
+        }
+        self._context_revision += 1
+        self._record("start_navigation_data_task", payload)
+        self.request_context = None
+        return payload
 
-    def record_navigation_handoff(self, payload: Mapping[str, Any]) -> None:
+    def begin_user_turn(self, turn_index: int) -> None:
+        """Mirror the production rule that shortcut context belongs to one Turn."""
+
+        if turn_index > 0:
+            self.request_context = None
+
+    async def continue_navigation_agent_task_v1(
+        self,
+        *,
+        web_session_id: str,
+        router_session_id: str,
+    ) -> dict[str, Any]:
+        self._assert_identity(web_session_id, router_session_id)
+        if self.focused_task is None:
+            raise RuntimeError("the evaluation has no focused task to continue")
+        status = str(self.focused_task.get("status") or "")
+        if status not in {"waiting_user", "paused", "needs_replan"}:
+            raise RuntimeError(f"the evaluation task cannot continue from {status}")
+        payload = {
+            "ok": True,
+            "operation": "continue",
+            "accepted": True,
+            "task_ref": str(self.focused_task.get("task_ref") or "DP-EVALUATION"),
+            "status": "active",
+        }
+        if self.focused_task is not None:
+            self.focused_task["status"] = "active"
+        self._context_revision += 1
+        self._record("continue_navigation_data_task", payload)
+        return payload
+
+    async def control_navigation_agent_task_v1(
+        self,
+        *,
+        web_session_id: str,
+        router_session_id: str,
+        action: str,
+    ) -> dict[str, Any]:
+        self._assert_identity(web_session_id, router_session_id)
+        if self.focused_task is None:
+            raise RuntimeError("the evaluation has no focused task to control")
+        current_status = str(self.focused_task.get("status") or "")
+        if action == "stop" and current_status != "active":
+            raise RuntimeError(f"the evaluation task cannot stop from {current_status}")
+        payload = {
+            "ok": True,
+            "operation": action,
+            "accepted": True,
+            "task_ref": str(self.focused_task.get("task_ref") or "DP-EVALUATION"),
+            "status": "pausing" if action == "stop" else "cancelling",
+        }
+        if self.focused_task is not None:
+            self.focused_task["status"] = payload["status"]
+        self._context_revision += 1
+        self._record("control_navigation_data_task", payload)
+        return payload
+
+    @staticmethod
+    def safe_router_tool_error(
+        error: Exception,
+        *,
+        action: str,
+        web_session_id: str | None = None,
+    ) -> dict[str, Any]:
+        del error, web_session_id
+        return {
+            "ok": False,
+            "operation": action,
+            "accepted": False,
+            "error": {
+                "code": "evaluation_runtime_error",
+                "message": "The evaluation routing action was not accepted.",
+                "retryable": False,
+            },
+        }
+
+    def consume_router_terminal_tool(
+        self,
+        *,
+        router_session_id: str,
+        tool_name: str,
+    ) -> bool:
+        self._assert_router_session(router_session_id)
+        if tool_name not in self._terminal_tools:
+            return False
+        self._terminal_tools.remove(tool_name)
+        return True
+
+    def _record(self, tool_name: str, payload: dict[str, Any]) -> None:
+        self.operations.append(dict(payload))
+        self._terminal_tools.add(tool_name)
         self.recorder.record_handoff(payload)
+
+    def _assert_identity(self, web_session_id: str, router_session_id: str) -> None:
+        if web_session_id != self.web_session_id:
+            raise ValueError("evaluation web session identity mismatch")
+        self._assert_router_session(router_session_id)
+
+    def _assert_router_session(self, router_session_id: str) -> None:
+        if router_session_id != self.router_session_id:
+            raise ValueError("evaluation router session identity mismatch")
 
 
 @dataclass(frozen=True)
@@ -385,10 +606,12 @@ class EvaluationHost:
         config: AgentScopeRuntimeConfig,
         workspace_root: str | Path,
         model_factory: Callable[..., Any] | None = None,
+        runtime_setup: Mapping[str, Any] | None = None,
     ) -> None:
         self.config = config
         self.workspace_root = Path(workspace_root)
         self.model_factory = model_factory
+        self.runtime_setup = dict(runtime_setup or {})
         self.recorder = TraceRecorder.for_workspace(self.workspace_root)
         self.storage = InMemoryStorage()
         self.message_bus = InMemoryMessageBus(self.recorder)
@@ -397,7 +620,7 @@ class EvaluationHost:
         )
         self.background_task_manager = BackgroundTaskManager()
         self.scheduler_manager = SchedulerManager(self.storage, self.message_bus)
-        self._handoff_runtime: RecordingHandoffRuntime | None = None
+        self._router_runtime: RecordingRouterRuntime | None = None
 
     async def _extra_tools(
         self,
@@ -410,26 +633,45 @@ class EvaluationHost:
         web_session_id = session_id.removesuffix(
             f"__{self.config.main_router_agent_id}",
         )
-        self._handoff_runtime = RecordingHandoffRuntime(
-            self.recorder,
-            web_session_id=web_session_id,
-        )
-        return [
-            NavigationHandoffTool(
-                runtime=self._handoff_runtime,
+        if self._router_runtime is None:
+            self._router_runtime = RecordingRouterRuntime(
+                self.recorder,
                 web_session_id=web_session_id,
-            ),
-        ]
+                router_session_id=session_id,
+                runtime_setup=self.runtime_setup,
+            )
+        elif self._router_runtime.web_session_id != web_session_id:
+            raise RuntimeError("one EvaluationHost may evaluate only one web session")
+        return router_v1_tools(
+            runtime=self._router_runtime,
+            web_session_id=web_session_id,
+            router_session_id=session_id,
+        )
 
     async def _extra_middlewares(
         self,
         _user_id: str,
         agent_id: str,
-        _session_id: str,
+        session_id: str,
     ) -> list[Any]:
         if agent_id != self.config.main_router_agent_id:
             return []
+        web_session_id = session_id.removesuffix(
+            f"__{self.config.main_router_agent_id}",
+        )
+        if self._router_runtime is None:
+            self._router_runtime = RecordingRouterRuntime(
+                self.recorder,
+                web_session_id=web_session_id,
+                router_session_id=session_id,
+                runtime_setup=self.runtime_setup,
+            )
         return [
+            RouterContractV1Middleware(
+                runtime=self._router_runtime,
+                web_session_id=web_session_id,
+                router_session_id=session_id,
+            ),
             TraceMiddleware(self.recorder),
             EvaluationSafetyMiddleware(self.recorder),
         ]
@@ -439,7 +681,12 @@ class EvaluationHost:
         value = self.model_factory(*args, **kwargs)
         return await value if inspect.isawaitable(value) else value
 
-    async def run(self, message: str, *, web_session_id: str = "eval") -> HostRunResult:
+    async def run(
+        self,
+        message: str | Sequence[str],
+        *,
+        web_session_id: str = "eval",
+    ) -> HostRunResult:
         await bootstrap_agentscope_records(self.storage, self.config)
         session_id = f"{web_session_id}__{self.config.main_router_agent_id}"
         await self.storage.upsert_session(
@@ -471,12 +718,18 @@ class EvaluationHost:
         if self.model_factory is not None:
             chat_service_module.get_model = self._injected_get_model
         try:
-            await service._run_impl(
-                self.config.user_id,
-                session_id,
-                self.config.main_router_agent_id,
-                UserMsg(name="user", content=message),
-            )
+            messages = [message] if isinstance(message, str) else list(message)
+            if not messages:
+                raise ValueError("evaluation conversation must contain a user message")
+            for turn_index, content in enumerate(messages):
+                if self._router_runtime is not None:
+                    self._router_runtime.begin_user_turn(turn_index)
+                await service._run_impl(
+                    self.config.user_id,
+                    session_id,
+                    self.config.main_router_agent_id,
+                    UserMsg(name="user", content=content),
+                )
         finally:
             chat_service_module.get_model = original_get_model
             await self.workspace_manager.__aexit__(None, None, None)
@@ -506,6 +759,7 @@ async def run_router_case(
     workspace_root: str | Path,
     web_session_id: str = "eval",
     model_factory: Callable[..., Any] | None = None,
+    runtime_setup: Mapping[str, Any] | None = None,
 ) -> HostRunResult:
     """Run one isolated router turn using production AgentScope assembly."""
 
@@ -513,5 +767,6 @@ async def run_router_case(
         config=config,
         workspace_root=workspace_root,
         model_factory=model_factory,
+        runtime_setup=runtime_setup,
     )
     return await host.run(message, web_session_id=web_session_id)

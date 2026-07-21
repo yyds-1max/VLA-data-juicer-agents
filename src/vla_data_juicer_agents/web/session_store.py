@@ -2,9 +2,11 @@ from __future__ import annotations
 
 import sqlite3
 import json
+import logging
 from datetime import UTC, datetime, timedelta
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Any
 from uuid import uuid4
 
 from vla_data_juicer_agents.adapters.agentscope.events import sanitize_public_reply
@@ -41,6 +43,82 @@ def _now() -> str:
 
 
 _SAFE_PUBLIC_REPLY_FAILURE = "本轮处理已结束，但未能生成可安全展示的回复。请重试。"
+_BACKGROUND_TURN_REPLY = "任务已转入后台继续处理，完成后会自动通知你。"
+_OPEN_TASK_STATUS_REPLY = "任务状态仍为处理中，后续状态会继续更新。"
+_NAVIGATION_DATASET_SELECTION_CONTEXT = "navigation_dataset_selection_v1"
+_MAX_REQUEST_CONTEXT_BYTES = 3_000
+_logger = logging.getLogger(__name__)
+
+
+def _open_task_turn_reply(status: str, *, background_tools: int = 0) -> str:
+    return {
+        "waiting_user": "继续处理前需要你的补充或确认。",
+        "pausing": "正在安全停止当前处理，任务状态会继续更新。",
+        "paused": "当前处理已停止，任务状态已保留。",
+        "cancelling": "正在安全取消任务，任务状态会继续更新。",
+        "needs_replan": "当前方案需要调整，任务状态已保留。",
+    }.get(
+        status,
+        _BACKGROUND_TURN_REPLY if background_tools > 0 else _OPEN_TASK_STATUS_REPLY,
+    )
+
+
+def _normalize_turn_request_context(value: dict[str, Any]) -> dict[str, Any]:
+    if not isinstance(value, dict):
+        raise ValueError("request_context must be an object")
+    if value.get("kind") != _NAVIGATION_DATASET_SELECTION_CONTEXT:
+        raise ValueError("unsupported request_context kind")
+    date = value.get("dataset_date")
+    if not isinstance(date, str) or len(date) != 8 or not date.isdigit():
+        raise ValueError("request_context dataset_date must be YYYYMMDD")
+    selection = value.get("selection")
+    if not isinstance(selection, dict):
+        raise ValueError("request_context selection must be an object")
+    selection_kind = selection.get("kind")
+    if selection_kind == "all_clips":
+        normalized_selection: dict[str, Any] = {"kind": "all_clips"}
+    elif selection_kind == "selected_clips":
+        clips = selection.get("clips")
+        if not isinstance(clips, list) or not clips or len(clips) > 200:
+            raise ValueError("selected_clips requires between 1 and 200 clips")
+        normalized_clips: list[str] = []
+        for clip in clips:
+            if not isinstance(clip, str):
+                raise ValueError("request_context clips must be strings")
+            normalized = clip.strip()
+            if (
+                not normalized
+                or normalized in {".", ".."}
+                or "/" in normalized
+                or "\\" in normalized
+                or "\r" in normalized
+                or "\n" in normalized
+                or len(normalized) > 200
+            ):
+                raise ValueError("request_context clips must be safe path components")
+            normalized_clips.append(normalized)
+        if len(set(normalized_clips)) != len(normalized_clips):
+            raise ValueError("request_context clips must be unique")
+        normalized_selection = {
+            "kind": "selected_clips",
+            "clips": normalized_clips,
+        }
+    else:
+        raise ValueError("unsupported request_context selection kind")
+    normalized_context = {
+        "kind": _NAVIGATION_DATASET_SELECTION_CONTEXT,
+        "dataset_date": date,
+        "selection": normalized_selection,
+    }
+    encoded = json.dumps(
+        normalized_context,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    if len(encoded.encode("utf-8")) > _MAX_REQUEST_CONTEXT_BYTES:
+        raise ValueError("request_context is too large")
+    return normalized_context
 
 
 @dataclass(frozen=True)
@@ -67,6 +145,10 @@ class TurnSubmission:
     message: ChatMessageRecord
     events: tuple[TimelineEventRecord, ...]
     created: bool = True
+
+
+class UnsupportedLegacySessionError(RuntimeError):
+    """Raised when a pre-contract-v1 session database requires a development reset."""
 
 
 class WebSessionStore:
@@ -266,6 +348,16 @@ class WebSessionStore:
                 """
             )
             apply_pending_migrations(connection, applied_at=_now())
+            legacy_count = int(
+                connection.execute(
+                    "SELECT COUNT(*) FROM sessions WHERE contract_version <> 1"
+                ).fetchone()[0]
+            )
+            if legacy_count:
+                raise UnsupportedLegacySessionError(
+                    "sessions database contains contract v0 sessions; back up and reset "
+                    "the development sessions database before starting this v1-only service"
+                )
 
     @staticmethod
     def _migrate_timeline_events_schema(connection: sqlite3.Connection) -> None:
@@ -344,9 +436,9 @@ class WebSessionStore:
         )
         connection.execute("DROP TABLE agentscope_sessions_legacy")
 
-    def create_session(self, title: str, *, contract_version: int = 0) -> SessionRecord:
-        if contract_version not in {0, 1}:
-            raise ValueError("contract_version must be 0 or 1")
+    def create_session(self, title: str, *, contract_version: int = 1) -> SessionRecord:
+        if contract_version != 1:
+            raise ValueError("contract_version must be 1")
         timestamp = _now()
         record = SessionRecord(
             id=f"session_{uuid4().hex}",
@@ -403,6 +495,7 @@ class WebSessionStore:
         message: str,
         *,
         invocation_id: str | None = None,
+        request_context: dict[str, Any] | None = None,
     ) -> TurnSubmission:
         """Create the authoritative user turn, message and public start event atomically."""
         timestamp = _now()
@@ -420,6 +513,11 @@ class WebSessionStore:
             role="user",
             content=message,
             created_at=timestamp,
+        )
+        supplied_context = (
+            _normalize_turn_request_context(request_context)
+            if request_context is not None
+            else None
         )
         with self._connect() as connection:
             connection.execute("BEGIN IMMEDIATE")
@@ -452,6 +550,20 @@ class WebSessionStore:
                     ).fetchone()
                     if existing_message_row is None:
                         raise RuntimeError("idempotent turn is missing its user message")
+                    if supplied_context is not None:
+                        existing_context_row = connection.execute(
+                            "SELECT context_json FROM turn_request_contexts WHERE turn_id = ?",
+                            (existing_turn_row["id"],),
+                        ).fetchone()
+                        existing_context = (
+                            json.loads(existing_context_row["context_json"])
+                            if existing_context_row is not None
+                            else None
+                        )
+                        if existing_context != supplied_context:
+                            raise RuntimeError(
+                                "idempotent turn request_context does not match"
+                            )
                     return TurnSubmission(
                         turn=self._turn_from_row(existing_turn_row),
                         message=self._message_from_row(existing_message_row),
@@ -482,6 +594,41 @@ class WebSessionStore:
                 """,
                 (message_record.id, session_id, turn.id, message, timestamp),
             )
+            pending_context_row = connection.execute(
+                """
+                SELECT context_json FROM pending_session_request_contexts
+                WHERE web_session_id = ?
+                """,
+                (session_id,),
+            ).fetchone()
+            pending_context = (
+                json.loads(pending_context_row["context_json"])
+                if pending_context_row is not None
+                else None
+            )
+            if (
+                supplied_context is not None
+                and pending_context is not None
+                and supplied_context != pending_context
+            ):
+                raise RuntimeError("pending request_context does not match the turn")
+            resolved_context = supplied_context or pending_context
+            if resolved_context is not None:
+                connection.execute(
+                    """
+                    INSERT INTO turn_request_contexts (turn_id, context_json, created_at)
+                    VALUES (?, ?, ?)
+                    """,
+                    (
+                        turn.id,
+                        json.dumps(resolved_context, ensure_ascii=False, sort_keys=True),
+                        timestamp,
+                    ),
+                )
+                connection.execute(
+                    "DELETE FROM pending_session_request_contexts WHERE web_session_id = ?",
+                    (session_id,),
+                )
             if int(session_row["contract_version"]) == 1:
                 self._insert_response_authority(
                     connection,
@@ -505,6 +652,74 @@ class WebSessionStore:
                 (timestamp, session_id),
             )
         return TurnSubmission(turn=turn, message=message_record, events=(event,))
+
+    def save_pending_request_context(
+        self,
+        web_session_id: str,
+        context: dict[str, Any],
+    ) -> None:
+        """Persist trusted shortcut scope privately until the first user Turn."""
+        normalized = _normalize_turn_request_context(context)
+        encoded = json.dumps(normalized, ensure_ascii=False, sort_keys=True)
+        timestamp = _now()
+        with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            session = connection.execute(
+                "SELECT contract_version FROM sessions WHERE id = ?",
+                (web_session_id,),
+            ).fetchone()
+            if session is None:
+                raise KeyError(web_session_id)
+            if int(session["contract_version"]) != 1:
+                raise RuntimeError("request_context requires contract v1")
+            existing = connection.execute(
+                """
+                SELECT context_json FROM pending_session_request_contexts
+                WHERE web_session_id = ?
+                """,
+                (web_session_id,),
+            ).fetchone()
+            if existing is not None:
+                if json.loads(existing["context_json"]) != normalized:
+                    raise RuntimeError("pending request_context cannot be replaced")
+                return
+            first_turn = connection.execute(
+                "SELECT 1 FROM web_turns WHERE web_session_id = ? LIMIT 1",
+                (web_session_id,),
+            ).fetchone()
+            if first_turn is not None:
+                raise RuntimeError("pending request_context must be saved before the first turn")
+            connection.execute(
+                """
+                INSERT INTO pending_session_request_contexts (
+                    web_session_id, context_json, created_at
+                ) VALUES (?, ?, ?)
+                """,
+                (web_session_id, encoded, timestamp),
+            )
+
+    def get_turn_user_message(self, turn_id: str) -> str | None:
+        with self._connect() as connection:
+            row = connection.execute(
+                """
+                SELECT content FROM messages
+                WHERE turn_id = ? AND role = 'user'
+                ORDER BY created_at ASC, rowid ASC LIMIT 1
+                """,
+                (turn_id,),
+            ).fetchone()
+        return str(row["content"]) if row is not None else None
+
+    def get_turn_request_context(self, turn_id: str) -> dict[str, Any] | None:
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT context_json FROM turn_request_contexts WHERE turn_id = ?",
+                (turn_id,),
+            ).fetchone()
+        if row is None:
+            return None
+        value = json.loads(row["context_json"])
+        return dict(value) if isinstance(value, dict) else None
 
     def abort_initial_turn(self, turn_id: str) -> None:
         """Compensate a rejected initial spawn without leaving visible transcript data."""
@@ -530,6 +745,7 @@ class WebSessionStore:
             )
             connection.execute("DELETE FROM agentscope_turn_tools WHERE turn_id = ?", (turn_id,))
             connection.execute("DELETE FROM agentscope_turn_replies WHERE turn_id = ?", (turn_id,))
+            connection.execute("DELETE FROM turn_request_contexts WHERE turn_id = ?", (turn_id,))
             connection.execute("DELETE FROM timeline_events WHERE turn_id = ?", (turn_id,))
             connection.execute("DELETE FROM messages WHERE turn_id = ?", (turn_id,))
             connection.execute("DELETE FROM web_turns WHERE id = ?", (turn_id,))
@@ -946,11 +1162,13 @@ class WebSessionStore:
         agentscope_session_id: str,
         entry_id: str,
         events: list[dict],
+        private_events: list[dict] | tuple[dict, ...] | None = None,
         raw_event_type: str | None = None,
         reply_id: str | None = None,
         allow_system_turn_defer: bool = True,
     ) -> list[TimelineEventRecord]:
-        """Persist projection, turn state, final message and cursor atomically."""
+        """Persist private lifecycle, public projection and cursor atomically."""
+        private_events = list(private_events or ())
         timestamp = _now()
         inserted: list[TimelineEventRecord] = []
         with self._connect() as connection:
@@ -1055,6 +1273,7 @@ class WebSessionStore:
                                 "agentscope_session_id": agentscope_session_id,
                                 "entry_id": entry_id,
                                 "events": events,
+                                "private_events": private_events,
                                 "raw_event_type": raw_event_type,
                                 "reply_id": reply_id,
                             },
@@ -1167,6 +1386,13 @@ class WebSessionStore:
                     WHERE web_session_id = ? AND agentscope_session_id = ?
                     """,
                     (turn_id, timestamp, web_session_id, agentscope_session_id),
+                )
+                self._record_private_tool_events(
+                    connection,
+                    turn_id=turn_id,
+                    agentscope_session_id=agentscope_session_id,
+                    events=private_events,
+                    timestamp=timestamp,
                 )
 
             if turn_id is not None and raw_event_type == "REPLY_START":
@@ -1419,19 +1645,27 @@ class WebSessionStore:
                             (reply_summary, timestamp, running["id"]),
                         )
 
+                private_tool_counts = connection.execute(
+                    """
+                    SELECT
+                        SUM(CASE WHEN status IN ('running', 'background') THEN 1 ELSE 0 END),
+                        SUM(CASE WHEN status = 'background' THEN 1 ELSE 0 END)
+                    FROM agentscope_turn_tools WHERE turn_id = ?
+                    """,
+                    (turn_id,),
+                ).fetchone()
+                unresolved_tools = int(private_tool_counts[0] or 0)
+                background_tools = int(private_tool_counts[1] or 0)
                 blockers = int(
                     connection.execute(
                         """
                         SELECT
                             (SELECT COUNT(*) FROM agentscope_turn_replies
                              WHERE turn_id = ? AND status IN ('pending', 'running', 'waiting'))
-                            +
-                            (SELECT COUNT(*) FROM agentscope_turn_tools
-                             WHERE turn_id = ? AND status IN ('running', 'background'))
                         """,
-                        (turn_id, turn_id),
+                        (turn_id,),
                     ).fetchone()[0]
-                )
+                ) + unresolved_tools
                 turn_status_row = connection.execute(
                     "SELECT status FROM web_turns WHERE id = ?",
                     (turn_id,),
@@ -1455,11 +1689,83 @@ class WebSessionStore:
                     "SELECT origin FROM web_turns WHERE id = ?",
                     (turn_id,),
                 ).fetchone()
+                binding_status_row = (
+                    connection.execute(
+                        """
+                        SELECT status, slot_state FROM conversation_task_bindings
+                        WHERE task_id = ?
+                        """,
+                        (mapping["task_id"],),
+                    ).fetchone()
+                    if v1_mapping and mapping["task_id"] is not None
+                    else connection.execute(
+                        """
+                        SELECT status, slot_state FROM conversation_task_bindings
+                        WHERE web_session_id = ? AND slot_state = 'open'
+                        ORDER BY updated_at DESC, rowid DESC LIMIT 1
+                        """,
+                        (web_session_id,),
+                    ).fetchone()
+                    if v1_mapping
+                    else None
+                )
+                open_task_status = (
+                    str(binding_status_row["status"])
+                    if binding_status_row is not None
+                    and binding_status_row["slot_state"] == "open"
+                    else None
+                )
+                if (
+                    v1_mapping
+                    and turn_origin_row is not None
+                    and turn_origin_row["origin"] == "user"
+                    and reply_summary is None
+                    and open_task_status is not None
+                    and (background_tools > 0 or blockers == 0)
+                ):
+                    turn_reply = _open_task_turn_reply(
+                        open_task_status,
+                        background_tools=background_tools,
+                    )
+                    if open_task_status == "active" and background_tools == 0:
+                        _logger.warning(
+                            "Navigation User Turn ended with an open active task but no "
+                            "durable background-tool ledger: web_session_id=%s turn_id=%s "
+                            "agentscope_session_id=%s",
+                            web_session_id,
+                            turn_id,
+                            agentscope_session_id,
+                        )
+                    inserted.extend(
+                        self._finalize_v1_background_turn(
+                            connection,
+                            web_session_id=web_session_id,
+                            turn_id=turn_id,
+                            agentscope_session_id=agentscope_session_id,
+                            producer=str(mapping["agent_role"]),
+                            entry_id=entry_id,
+                            timestamp=timestamp,
+                            text=turn_reply,
+                        )
+                    )
+                    connection.execute(
+                        """
+                        UPDATE conversation_agent_sessions
+                        SET event_cursor = ?, updated_at = ?
+                        WHERE web_session_id = ? AND agentscope_session_id = ?
+                        """,
+                        (entry_id, timestamp, web_session_id, agentscope_session_id),
+                    )
+                    connection.execute(
+                        "UPDATE sessions SET updated_at = ? WHERE id = ?",
+                        (timestamp, web_session_id),
+                    )
+                    return inserted
                 if (
                     v1_mapping
                     and turn_origin_row is not None
                     and turn_origin_row["origin"] == "system"
-                    and background_update_only
+                    and (background_update_only or open_task_status is not None)
                     and reply_summary is None
                     and blockers == 0
                 ):
@@ -1735,6 +2041,166 @@ class WebSessionStore:
         return inserted
 
     @staticmethod
+    def _record_private_tool_events(
+        connection: sqlite3.Connection,
+        *,
+        turn_id: str,
+        agentscope_session_id: str,
+        events: list[dict],
+        timestamp: str,
+    ) -> None:
+        """Update the private tool ledger before any public projection is used."""
+        for event in events:
+            event_type = str(event.get("type") or "")
+            if event_type not in {"tool_start", "tool_background", "tool_end"}:
+                continue
+            payload = event.get("payload")
+            if not isinstance(payload, dict):
+                continue
+            call_id = _optional_text(payload.get("call_id"))
+            if call_id is None:
+                continue
+            tool = _optional_text(payload.get("tool")) or "unknown_tool"
+            status = (
+                "running"
+                if event_type == "tool_start"
+                else "background"
+                if event_type == "tool_background"
+                else _terminal_tool_status(payload.get("status"))
+            )
+            finished_at = (
+                timestamp if status in {"completed", "failed", "interrupted"} else None
+            )
+            connection.execute(
+                """
+                INSERT INTO agentscope_turn_tools (
+                    turn_id, agentscope_session_id, call_id, tool, status,
+                    started_at, finished_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(turn_id, agentscope_session_id, call_id) DO UPDATE SET
+                    tool = CASE
+                        WHEN excluded.tool = 'unknown_tool'
+                        THEN agentscope_turn_tools.tool
+                        ELSE excluded.tool
+                    END,
+                    status = CASE
+                        WHEN agentscope_turn_tools.status IN (
+                            'completed', 'failed', 'interrupted'
+                        ) THEN agentscope_turn_tools.status
+                        ELSE excluded.status
+                    END,
+                    finished_at = COALESCE(
+                        agentscope_turn_tools.finished_at,
+                        excluded.finished_at
+                    ),
+                    updated_at = excluded.updated_at
+                """,
+                (
+                    turn_id,
+                    agentscope_session_id,
+                    call_id,
+                    tool,
+                    status,
+                    timestamp,
+                    finished_at,
+                    timestamp,
+                ),
+            )
+
+    def _finalize_v1_background_turn(
+        self,
+        connection: sqlite3.Connection,
+        *,
+        web_session_id: str,
+        turn_id: str,
+        agentscope_session_id: str,
+        producer: str,
+        entry_id: str,
+        timestamp: str,
+        text: str = _BACKGROUND_TURN_REPLY,
+    ) -> list[TimelineEventRecord]:
+        authority = connection.execute(
+            "SELECT * FROM turn_response_authority WHERE turn_id = ?",
+            (turn_id,),
+        ).fetchone()
+        if (
+            authority is None
+            or authority["producer"] != producer
+            or authority["lease_state"] != "open"
+            or authority["final_message_id"] is not None
+        ):
+            return []
+        final_message_id = f"message_{uuid4().hex}"
+        connection.execute(
+            """
+            INSERT INTO messages (id, session_id, turn_id, role, content, created_at)
+            VALUES (?, ?, ?, 'assistant', ?, ?)
+            """,
+            (
+                final_message_id,
+                web_session_id,
+                turn_id,
+                text,
+                timestamp,
+            ),
+        )
+        connection.execute(
+            """
+            UPDATE web_turns
+            SET status = 'completed', finished_at = ?, final_message_id = ?
+            WHERE id = ? AND status IN ('running', 'waiting')
+            """,
+            (timestamp, final_message_id, turn_id),
+        )
+        connection.execute(
+            """
+            UPDATE turn_response_authority
+            SET lease_state = 'closed', final_message_id = ?, updated_at = ?
+            WHERE turn_id = ? AND producer = ? AND generation = ?
+              AND lease_state = 'open' AND final_message_id IS NULL
+            """,
+            (
+                final_message_id,
+                timestamp,
+                turn_id,
+                producer,
+                int(authority["generation"]),
+            ),
+        )
+        connection.execute(
+            """
+            UPDATE conversation_agent_sessions SET active_turn_id = NULL
+            WHERE active_turn_id = ? AND agentscope_session_id = ?
+            """,
+            (turn_id, agentscope_session_id),
+        )
+        final = self._insert_timeline_event(
+            connection,
+            session_id=web_session_id,
+            turn_id=turn_id,
+            event={
+                "type": "final",
+                "timestamp": timestamp,
+                "payload": {"text": text, "message_id": final_message_id},
+            },
+            created_at=timestamp,
+            origin_key=f"agentscope:{agentscope_session_id}:{entry_id}:background-final",
+        )
+        state = self._insert_timeline_event(
+            connection,
+            session_id=web_session_id,
+            turn_id=turn_id,
+            event={
+                "type": "turn_state",
+                "timestamp": timestamp,
+                "payload": {"status": "completed", "finished_at": timestamp},
+            },
+            created_at=timestamp,
+            origin_key=f"agentscope:{agentscope_session_id}:{entry_id}:background-completed",
+        )
+        return [final, state]
+
+    @staticmethod
     def _duplicate_terminal_tool_event(
         connection: sqlite3.Connection,
         *,
@@ -1768,6 +2234,16 @@ class WebSessionStore:
     def list_unresolved_background_tools(self) -> list[UnresolvedBackgroundTool]:
         """Return background calls that have no durable public terminal event."""
         with self._connect() as connection:
+            private_rows = connection.execute(
+                """
+                SELECT turns.web_session_id, tools.turn_id,
+                       tools.agentscope_session_id, tools.tool, tools.call_id
+                FROM agentscope_turn_tools AS tools
+                JOIN web_turns AS turns ON turns.id = tools.turn_id
+                WHERE tools.status = 'background'
+                ORDER BY tools.started_at ASC, tools.rowid ASC
+                """
+            ).fetchall()
             rows = connection.execute(
                 """
                 SELECT session_id, turn_id, run_id, type, payload_json
@@ -1776,7 +2252,20 @@ class WebSessionStore:
                 ORDER BY session_id ASC, seq ASC
                 """
             ).fetchall()
-        unresolved: dict[tuple[str, str, str], UnresolvedBackgroundTool] = {}
+        unresolved: dict[tuple[str, str, str], UnresolvedBackgroundTool] = {
+            (
+                row["web_session_id"],
+                row["agentscope_session_id"],
+                row["call_id"],
+            ): UnresolvedBackgroundTool(
+                web_session_id=row["web_session_id"],
+                agentscope_session_id=row["agentscope_session_id"],
+                tool=row["tool"],
+                call_id=row["call_id"],
+                turn_id=row["turn_id"],
+            )
+            for row in private_rows
+        }
         for row in rows:
             run_id = _optional_text(row["run_id"])
             if run_id is None:
@@ -1825,6 +2314,35 @@ class WebSessionStore:
         }
         with self._connect() as connection:
             connection.execute("BEGIN IMMEDIATE")
+            session = connection.execute(
+                "SELECT contract_version FROM sessions WHERE id = ?",
+                (background.web_session_id,),
+            ).fetchone()
+            if session is None:
+                raise KeyError(background.web_session_id)
+            if int(session["contract_version"]) == 1:
+                if background.turn_id is not None:
+                    connection.execute(
+                        """
+                        UPDATE agentscope_turn_tools
+                        SET status = ?, finished_at = ?, updated_at = ?
+                        WHERE turn_id = ? AND agentscope_session_id = ? AND call_id = ?
+                          AND status IN ('running', 'background')
+                        """,
+                        (
+                            status,
+                            timestamp,
+                            timestamp,
+                            background.turn_id,
+                            background.agentscope_session_id,
+                            background.call_id,
+                        ),
+                    )
+                connection.execute(
+                    "UPDATE sessions SET updated_at = ? WHERE id = ?",
+                    (timestamp, background.web_session_id),
+                )
+                return None
             duplicate_origin = connection.execute(
                 "SELECT 1 FROM timeline_events WHERE origin_key = ?",
                 (origin_key,),
@@ -1988,6 +2506,10 @@ class WebSessionStore:
     def delete_session(self, session_id: str) -> None:
         with self._connect() as connection:
             connection.execute(
+                "DELETE FROM pending_session_request_contexts WHERE web_session_id = ?",
+                (session_id,),
+            )
+            connection.execute(
                 "DELETE FROM interactions WHERE web_session_id = ?", (session_id,)
             )
             connection.execute(
@@ -2036,6 +2558,10 @@ class WebSessionStore:
             )
             connection.execute(
                 "DELETE FROM agentscope_turn_replies WHERE turn_id IN (SELECT id FROM web_turns WHERE web_session_id = ?)",
+                (session_id,),
+            )
+            connection.execute(
+                "DELETE FROM turn_request_contexts WHERE turn_id IN (SELECT id FROM web_turns WHERE web_session_id = ?)",
                 (session_id,),
             )
             connection.execute("UPDATE web_turns SET final_message_id = NULL WHERE web_session_id = ?", (session_id,))
@@ -2227,6 +2753,19 @@ class WebSessionStore:
             if blockers > 0:
                 return []
             if int(reply["contract_version"]) == 1:
+                open_task = connection.execute(
+                    """
+                    SELECT status FROM conversation_task_bindings
+                    WHERE web_session_id = ? AND slot_state = 'open'
+                    ORDER BY updated_at DESC, rowid DESC LIMIT 1
+                    """,
+                    (reply["web_session_id"],),
+                ).fetchone()
+                failure_text = (
+                    _open_task_turn_reply(str(open_task["status"]))
+                    if open_task is not None
+                    else _SAFE_PUBLIC_REPLY_FAILURE
+                )
                 authority_row = connection.execute(
                     "SELECT * FROM turn_response_authority WHERE turn_id = ?",
                     (reply["turn_id"],),
@@ -2272,7 +2811,7 @@ class WebSessionStore:
                         message_id,
                         reply["web_session_id"],
                         reply["turn_id"],
-                        _SAFE_PUBLIC_REPLY_FAILURE,
+                        failure_text,
                         timestamp,
                     ),
                 )
@@ -2284,7 +2823,7 @@ class WebSessionStore:
                         "type": "final",
                         "timestamp": timestamp,
                         "payload": {
-                            "text": _SAFE_PUBLIC_REPLY_FAILURE,
+                            "text": failure_text,
                             "message_id": message_id,
                         },
                     },
@@ -3456,8 +3995,8 @@ class WebSessionStore:
             raise ValueError("terminal_status must be completed or failed")
         timestamp = _now()
         safe_text = sanitize_public_reply(text)
-        if not safe_text:
-            safe_text = _SAFE_PUBLIC_REPLY_FAILURE
+        safe_reply_failed = not safe_text
+        if safe_reply_failed:
             terminal_status = "failed"
         with self._connect() as connection:
             connection.execute("BEGIN IMMEDIATE")
@@ -3483,6 +4022,20 @@ class WebSessionStore:
             ).fetchone()
             if turn is None:
                 raise KeyError(turn_id)
+            if safe_reply_failed:
+                open_task = connection.execute(
+                    """
+                    SELECT status FROM conversation_task_bindings
+                    WHERE web_session_id = ? AND slot_state = 'open'
+                    ORDER BY updated_at DESC, rowid DESC LIMIT 1
+                    """,
+                    (turn["web_session_id"],),
+                ).fetchone()
+                safe_text = (
+                    _open_task_turn_reply(str(open_task["status"]))
+                    if open_task is not None
+                    else _SAFE_PUBLIC_REPLY_FAILURE
+                )
             if turn["status"] not in {"running", "waiting"}:
                 raise ContractConflictError(
                     "turn_not_open", "the turn cannot accept a final reply"

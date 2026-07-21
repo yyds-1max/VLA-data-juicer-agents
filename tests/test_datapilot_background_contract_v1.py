@@ -36,7 +36,6 @@ def _config(tmp_path: Path) -> AgentScopeRuntimeConfig:
         default_model="test-model",
         router_model="router-model",
         navigation_model="navigation-model",
-        datapilot_single_agent_mode="new_sessions",
     )
 
 
@@ -451,6 +450,10 @@ async def test_cancel_closes_navigation_task_slot(tmp_path: Path) -> None:
         task_store=task_store,
         message_bus=message_bus,
     )
+    runtime.router_context_envelope(
+        session.id,
+        router_session_id=router_mapping.agentscope_session_id,
+    )
     transitions: list[NavigationTaskStatus] = []
     update_task = task_store.update_task_for_session
 
@@ -463,10 +466,7 @@ async def test_cancel_closes_navigation_task_slot(tmp_path: Path) -> None:
     result = await runtime.control_navigation_agent_task_v1(
         web_session_id=session.id,
         router_session_id=router_mapping.agentscope_session_id,
-        task_ref=binding.task_ref,
         action="cancel",
-        response_language="zh-CN",
-        expected_task_revision=task.state_revision,
     )
 
     cancelled_task = task_store.get_task(task.task_id)

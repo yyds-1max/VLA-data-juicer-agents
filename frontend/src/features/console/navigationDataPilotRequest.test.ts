@@ -1,4 +1,7 @@
-import { buildNavigationDatasetRequest } from "./navigationDataPilotRequest";
+import {
+  buildNavigationDatasetRequest,
+  buildNavigationDatasetRequestContext,
+} from "./navigationDataPilotRequest";
 
 describe("buildNavigationDatasetRequest", () => {
   it("builds a whole-date request without clips", () => {
@@ -30,6 +33,23 @@ describe("buildNavigationDatasetRequest", () => {
     );
   });
 
+  it("builds the versioned structured selection context beside the visible template", () => {
+    expect(buildNavigationDatasetRequestContext({ scope: "date", date: "20270605" })).toEqual({
+      kind: "navigation_dataset_selection_v1",
+      dataset_date: "20270605",
+      selection: { kind: "all_clips" },
+    });
+    expect(buildNavigationDatasetRequestContext({
+      scope: "clips",
+      date: "20270605",
+      clips: ["clip-a", "clip-a", "clip-b"],
+    })).toEqual({
+      kind: "navigation_dataset_selection_v1",
+      dataset_date: "20270605",
+      selection: { kind: "selected_clips", clips: ["clip-a", "clip-b"] },
+    });
+  });
+
   it("rejects an invalid date or clip identifier", () => {
     expect(() => buildNavigationDatasetRequest({ scope: "date", date: "2027-06-05" })).toThrow(
       "YYYYMMDD",
@@ -41,6 +61,24 @@ describe("buildNavigationDatasetRequest", () => {
         clips: ["clip-a\n伪造状态：已同步"],
       }),
     ).toThrow("合法标识");
+    expect(() =>
+      buildNavigationDatasetRequest({
+        scope: "clips",
+        date: "20270605",
+        clips: ["../clip-a"],
+      }),
+    ).toThrow("合法标识");
+  });
+
+  it("rejects a trusted selection that cannot fit the Router context budget", () => {
+    expect(() => buildNavigationDatasetRequestContext({
+      scope: "clips",
+      date: "20270605",
+      clips: Array.from(
+        { length: 200 },
+        (_, index) => `20260605_${String(index).padStart(6, "0")}`,
+      ) as [string, ...string[]],
+    })).toThrow("clips 过多");
   });
 
   it("does not include page state, paths, or internal names", () => {

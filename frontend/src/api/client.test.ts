@@ -10,16 +10,11 @@ import {
   interruptTurn,
   listSessions,
   openSessionEvents,
-  recoverHumanDecision,
-  submitHumanDecision,
   submitInteractionResponse,
   submitTurn,
 } from "./client";
 import type {
   AgentEvent,
-  HumanDecisionPayload,
-  HumanDecisionRecoveryRequest,
-  HumanDecisionRecoveryResponse,
   NavigationDatasetSummary,
   NavigationSyncImageListing,
   SessionDetail,
@@ -31,6 +26,7 @@ function session(overrides: Partial<SessionRecord> = {}): SessionRecord {
     id: "session-1",
     title: "Active",
     status: "active",
+    contract_version: 1,
     created_at: "2026-06-26T00:00:00Z",
     updated_at: "2026-06-26T00:00:00Z",
     ...overrides,
@@ -41,6 +37,10 @@ function detail(overrides: Partial<SessionDetail> = {}): SessionDetail {
   return {
     ...session(),
     messages: [],
+    events: [],
+    turns: [],
+    tasks: [],
+    pending_interaction: null,
     ...overrides,
   };
 }
@@ -78,10 +78,19 @@ describe("api client", () => {
     const record = session({ contract_version: 1 });
     const fetchMock = mockFetchJson({ session: record });
 
-    await expect(createSession("处理导航数据", "data_management_shortcut")).resolves.toEqual(record);
+    const requestContext = {
+      kind: "navigation_dataset_selection_v1" as const,
+      dataset_date: "20270605",
+      selection: { kind: "selected_clips" as const, clips: ["clip-a"] },
+    };
+    await expect(createSession("处理导航数据", "data_management_shortcut", requestContext)).resolves.toEqual(record);
     expect(fetchMock).toHaveBeenCalledWith("/api/sessions", {
       method: "POST",
-      body: JSON.stringify({ message: "处理导航数据", entrypoint: "data_management_shortcut" }),
+      body: JSON.stringify({
+        message: "处理导航数据",
+        entrypoint: "data_management_shortcut",
+        request_context: requestContext,
+      }),
       headers: { "content-type": "application/json" },
     });
   });
@@ -141,52 +150,6 @@ describe("api client", () => {
     });
   });
 
-  it("encodes the session id and posts a human decision payload", async () => {
-    const fetchMock = mockFetchJson({ accepted: true });
-    const payload: HumanDecisionPayload = {
-      action: "guide",
-      request_id: "request-1",
-      tool_call_id: "tool-call-1",
-      reply_id: "reply-1",
-      text: "请先汇总风险再继续。",
-    };
-
-    await expect(submitHumanDecision("session/with space", payload)).resolves.toBe(true);
-    expect(fetchMock).toHaveBeenCalledWith("/api/sessions/session%2Fwith%20space/human-decisions", {
-      method: "POST",
-      body: JSON.stringify(payload),
-      headers: { "content-type": "application/json" },
-    });
-  });
-
-  it("posts the exact controlled recovery payload and returns its anchor", async () => {
-    const recovered: HumanDecisionRecoveryResponse = {
-      recovered: true,
-      plan_id: "plan-1",
-      step_id: "confirm",
-      handoff_status: "quarantined",
-      task_status: "needs_replan",
-      next_action: "submit_complete_plan",
-    };
-    const fetchMock = mockFetchJson(recovered);
-    const payload: HumanDecisionRecoveryRequest = {
-      action: "quarantine_and_replan",
-      plan_id: "plan-1",
-      step_id: "confirm",
-      reason: "operator confirmed abandoned delivery",
-    };
-
-    await expect(recoverHumanDecision("session/with space", payload)).resolves.toEqual(recovered);
-    expect(fetchMock).toHaveBeenCalledWith(
-      "/api/sessions/session%2Fwith%20space/human-decisions/recovery",
-      {
-        method: "POST",
-        body: JSON.stringify(payload),
-        headers: { "content-type": "application/json" },
-      },
-    );
-  });
-
   it("posts a versioned interaction response to the encoded v1 endpoint", async () => {
     const fetchMock = mockFetchJson({ accepted: true, turn_id: "turn-interaction-1" });
     const payload = {
@@ -207,18 +170,6 @@ describe("api client", () => {
         headers: { "content-type": "application/json" },
       },
     );
-  });
-
-  it("surfaces controlled recovery conflict detail", async () => {
-    mockFetchJson({ detail: "handoff is not recovery_required" }, false);
-    await expect(
-      recoverHumanDecision("session-1", {
-        action: "quarantine_and_replan",
-        plan_id: "plan-1",
-        step_id: "confirm",
-        reason: "recover",
-      }),
-    ).rejects.toMatchObject({ message: "handoff is not recovery_required" });
   });
 
   it("throws useful detail from non-ok JSON error responses", async () => {
@@ -255,7 +206,11 @@ describe("api client", () => {
       string,
       (message: MessageEvent<string>) => void,
     ];
-    const event: AgentEvent = { type: "token", payload: { text: "hello" } };
+    const event: AgentEvent = {
+      type: "progress_start",
+      contract_version: 1,
+      payload: { summary: "hello" },
+    };
     onMessage(new MessageEvent("message", { data: JSON.stringify(event) }));
 
     expect(onEvent).toHaveBeenCalledWith(event);

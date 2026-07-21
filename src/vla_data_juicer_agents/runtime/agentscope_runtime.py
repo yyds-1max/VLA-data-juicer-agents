@@ -5,6 +5,7 @@ import hashlib
 import json
 import logging
 import re
+import sqlite3
 import time
 from contextlib import suppress
 from dataclasses import dataclass, field
@@ -41,11 +42,13 @@ from vla_data_juicer_agents.navigation.services import (
 )
 from vla_data_juicer_agents.navigation.task_entry import (
     NavigationTaskEntryError,
-    _structured_handoff_payload_from_message,
-    parse_navigation_task_entry,
 )
 from vla_data_juicer_agents.navigation.task_store import normalize_segments
-from vla_data_juicer_agents.navigation.task_state import NavigationTaskStatus
+from vla_data_juicer_agents.navigation.task_state import (
+    NavigationTaskStatus,
+    NavigationTaskTransitionError,
+    validate_navigation_task_status_transition,
+)
 from vla_data_juicer_agents.runtime.agentscope_bootstrap import bootstrap_agentscope_records
 from vla_data_juicer_agents.runtime.agentscope_config import AgentScopeRuntimeConfig
 from vla_data_juicer_agents.runtime.navigation_tool_surface import (
@@ -57,6 +60,7 @@ from vla_data_juicer_agents.runtime.public_contract import (
     FinalSignalV1,
     InteractionOptionV1,
     ProgressSignalV1,
+    PublicActionRegistry,
     RequestInputSignalV1,
     SpecialistSignalProjector,
     final_fallback,
@@ -130,12 +134,6 @@ class AgentScopeProjectedEventBatch:
     reply_id: str | None = None
 
 
-@dataclass(frozen=True)
-class NavigationTaskStartResult:
-    task_id: str
-    agentscope_session_id: str
-
-
 class NavigationDataBusyError(RuntimeError):
     """Raised when an overlapping navigation writer is already running."""
 
@@ -154,9 +152,12 @@ class AgentScopeRuntime:
     _active_human_decision_claims: set[str] = field(default_factory=set)
     _run_cancellations: dict[str, CancellationContext] = field(default_factory=dict)
     _router_terminal_sessions: set[str] = field(default_factory=set)
+    _router_run_contexts: dict[tuple[str, str], dict[str, Any]] = field(default_factory=dict)
     _specialist_projectors: dict[str, SpecialistSignalProjector] = field(default_factory=dict)
     _specialist_sequences: dict[str, int] = field(default_factory=dict)
     _projected_tool_names: dict[tuple[str, str], str] = field(default_factory=dict)
+    _specialist_phases: dict[str, str] = field(default_factory=dict)
+    _public_action_registry: PublicActionRegistry = field(default_factory=PublicActionRegistry)
     recovery_metrics: AgentScopeRecoveryMetrics = field(default_factory=AgentScopeRecoveryMetrics)
     bootstrapped: bool = False
 
@@ -191,58 +192,15 @@ class AgentScopeRuntime:
         task_id: str | None = None,
         preallocated_session_id: str | None = None,
     ) -> str:
-        if self._is_contract_v1(web_session_id):
-            return await self._ensure_contract_v1_agent_session(
-                web_session_id=web_session_id,
-                agent_id=agent_id,
-                model=model,
-                task_id=task_id,
-                preallocated_session_id=preallocated_session_id,
-            )
-        existing = self.web_sessions.get(web_session_id)
-        if existing and existing[0] == agent_id:
-            await self._ensure_web_event_bridge_mapping(
-                web_session_id=web_session_id,
-                agent_id=agent_id,
-                agentscope_session_id=existing[1],
-            )
-            return existing[1]
-
-        persisted = self._load_web_session_mapping(web_session_id, agent_id=agent_id)
-        if persisted and persisted[0] == agent_id:
-            self.web_sessions[web_session_id] = persisted
-            self._save_web_session_mapping(web_session_id, agent_id, persisted[1])
-            await self._ensure_web_event_bridge_mapping(
-                web_session_id=web_session_id,
-                agent_id=agent_id,
-                agentscope_session_id=persisted[1],
-            )
-            return persisted[1]
-
-        session_id = f"{web_session_id}__{agent_id}"
-        session = await self.storage.upsert_session(
-            self.config.user_id,
-            agent_id,
-            config=SessionConfig(
-                workspace_id=f"workspace-{web_session_id}",
-                name=web_session_id,
-                chat_model_config=ChatModelConfig(
-                    type="dashscope_chat",
-                    credential_id=self.config.credential_id,
-                    model=model,
-                    parameters={"parallel_tool_calls": False},
-                ),
-            ),
-            session_id=session_id,
-        )
-        self.web_sessions[web_session_id] = (agent_id, session.id)
-        self._save_web_session_mapping(web_session_id, agent_id, session.id)
-        await self._ensure_web_event_bridge_mapping(
+        if not self._is_contract_v1(web_session_id):
+            raise RuntimeError("only contract v1 Web sessions are supported")
+        return await self._ensure_contract_v1_agent_session(
             web_session_id=web_session_id,
             agent_id=agent_id,
-            agentscope_session_id=session.id,
+            model=model,
+            task_id=task_id,
+            preallocated_session_id=preallocated_session_id,
         )
-        return session.id
 
     async def _ensure_contract_v1_agent_session(
         self,
@@ -347,11 +305,7 @@ class AgentScopeRuntime:
         return authoritative_turn_id
 
     def _agent_id_for_user_message(self, *, web_session_id: str) -> str:
-        if self._is_contract_v1(web_session_id):
-            return self.config.main_router_agent_id
-        mapped = self._web_session_mapping(web_session_id)
-        if mapped is not None and mapped[0] == self.config.navigation_agent_id:
-            return self.config.navigation_agent_id
+        del web_session_id
         return self.config.main_router_agent_id
 
     def _is_contract_v1(self, web_session_id: str) -> bool:
@@ -360,127 +314,83 @@ class AgentScopeRuntime:
         getter = getattr(self.web_session_store, "get_session_contract_version", None)
         return bool(callable(getter) and getter(web_session_id) == 1)
 
-    async def start_navigation_agent_task(
-        self,
-        *,
-        web_session_id: str,
-        message: str,
-    ) -> NavigationTaskStartResult:
-        await self.ensure_bootstrapped()
-
-        active_turn_id = self._active_turn_id(web_session_id)
-
-        entry = parse_navigation_task_entry(message)
-        services = self._navigation_services()
-        previous_mapping = self._web_session_mapping(web_session_id)
-        if (
-            previous_mapping is not None
-            and previous_mapping[0] == self.config.navigation_agent_id
-        ):
-            existing = services.task_store.find_by_session(
-                web_session_id=web_session_id,
-                agentscope_session_id=previous_mapping[1],
-            )
-            if (
-                existing is not None
-                and existing.target == entry.target
-                and existing.date == entry.date
-                and existing.segments == normalize_segments(entry.segments)
-            ):
-                return NavigationTaskStartResult(
-                    task_id=existing.task_id,
-                    agentscope_session_id=previous_mapping[1],
-                )
-        writer = services.task_store.find_running_target_writer(
-            date=entry.date,
-            segments=entry.segments,
-        )
-        if writer is not None:
-            raise NavigationDataBusyError(
-                "an overlapping navigation data writer is already running"
-            )
-
-        creation = None
-        session_id: str | None = None
-        try:
-            session_id = await self.ensure_web_session(
-                web_session_id,
-                agent_id=self.config.navigation_agent_id,
-                model=self.config.navigation_model,
-            )
-            creation = services.task_store.create_task_attempt(
-                request=entry.request,
-                target=entry.target,
-                date=entry.date,
-                segments=entry.segments,
-                scene_mode=entry.scene_mode,
-                dry_run=self.config.navigation_dry_run,
-                web_session_id=web_session_id,
-                agentscope_session_id=session_id,
-            )
-            await self._start_agent_run(
-                web_session_id=web_session_id,
-                agent_id=self.config.navigation_agent_id,
-                model=self.config.navigation_model,
-                message=message,
-                turn_id=active_turn_id,
-            )
-        except Exception as entry_error:
-            try:
-                self._restore_web_session_mapping(web_session_id, previous_mapping)
-            except Exception as compensation_error:
-                entry_error.add_note(
-                    "navigation entry session-mapping compensation failed: "
-                    f"{compensation_error!r}"
-                )
-            if creation is not None and creation.created and session_id is not None:
-                try:
-                    deleted = services.task_store.delete_task_if_current(
-                        creation.task.task_id,
-                        expected_state_revision=creation.task.state_revision,
-                        expected_web_session_id=web_session_id,
-                        expected_agentscope_session_id=session_id,
-                    )
-                    if not deleted:
-                        entry_error.add_note(
-                            "navigation attempt compensation skipped: task changed"
-                        )
-                except Exception as compensation_error:
-                    entry_error.add_note(
-                        "navigation attempt compensation failed: "
-                        f"{compensation_error!r}"
-                    )
-            raise
-        return NavigationTaskStartResult(
-            task_id=creation.task.task_id,
-            agentscope_session_id=session_id,
-        )
-
     async def start_navigation_agent_task_v1(
         self,
         *,
         web_session_id: str,
         router_session_id: str,
-        request: str,
-        target: str,
-        date: str,
-        clips: list[str],
+        scope_source: str,
+        dataset_date: str,
+        selection: dict[str, Any],
         scene_mode: str | None,
-        reason: str,
-        response_language: str,
-    ) -> dict[str, str]:
+    ) -> dict[str, Any]:
         """Durably create and delegate one task-scoped Navigation session."""
         if not self._is_contract_v1(web_session_id):
             raise RuntimeError("single-agent contract is not enabled for this session")
-        if not re.fullmatch(r"[0-9]{8}", date.strip()):
+        if not re.fullmatch(r"[0-9]{8}", dataset_date.strip()):
             raise NavigationTaskEntryError("date must be a YYYYMMDD dataset date")
-        if not target.strip():
-            raise NavigationTaskEntryError("target is required")
         if self.web_session_store is None:
             raise RuntimeError("Web session store is unavailable")
         active_turn_id = self._active_turn_id(web_session_id)
         if active_turn_id is None:
             raise RuntimeError("navigation delegation requires an active turn")
+        get_message = getattr(self.web_session_store, "get_turn_user_message", None)
+        get_context = getattr(self.web_session_store, "get_turn_request_context", None)
+        if not callable(get_message) or not callable(get_context):
+            raise RuntimeError("private turn request context is unavailable")
+        request = str(get_message(active_turn_id) or "").strip()
+        if not request:
+            raise NavigationTaskEntryError("the current user request is unavailable")
+        request_context = get_context(active_turn_id)
+        if scope_source not in {"request_context", "interpreted_user_text"}:
+            raise NavigationTaskEntryError("unsupported navigation scope source")
+        if request_context is not None:
+            if scope_source != "request_context":
+                raise NavigationTaskEntryError(
+                    "trusted shortcut scope must be used without reinterpretation"
+                )
+            expected_scope = {
+                "dataset_date": request_context.get("dataset_date"),
+                "selection": request_context.get("selection"),
+            }
+            supplied_scope = {
+                "dataset_date": dataset_date.strip(),
+                "selection": selection,
+            }
+            if supplied_scope != expected_scope:
+                raise NavigationTaskEntryError(
+                    "navigation scope does not match the trusted shortcut selection"
+                )
+        elif scope_source == "request_context":
+            raise NavigationTaskEntryError("the current turn has no trusted request context")
+        selection_kind = str(selection.get("kind") or "")
+        if selection_kind == "all_clips":
+            clips: list[str] = []
+        elif selection_kind == "selected_clips":
+            raw_clips = selection.get("clips")
+            if not isinstance(raw_clips, list) or not raw_clips:
+                raise NavigationTaskEntryError("selected_clips requires at least one clip")
+            clips = normalize_segments(raw_clips) or []
+            if len(clips) != len(raw_clips):
+                raise NavigationTaskEntryError("clip selection contains invalid values")
+            if any(
+                clip in {".", ".."}
+                or "/" in clip
+                or "\\" in clip
+                or "\r" in clip
+                or "\n" in clip
+                or len(clip) > 200
+                for clip in clips
+            ):
+                raise NavigationTaskEntryError("clip selection contains unsafe values")
+            if len(set(clips)) != len(clips):
+                raise NavigationTaskEntryError("clip selection contains duplicates")
+        else:
+            raise NavigationTaskEntryError("unsupported navigation clip selection")
+        date = dataset_date.strip()
+        target = "navigation_data"
+        reason = "用户要求处理指定范围的导航数据"
+        response_language = _resolve_response_language(None, request)
 
         task_id = f"nav_{uuid4().hex}"
         task_ref = f"DP-{uuid4().hex[:12].upper()}"
@@ -517,6 +427,8 @@ class AgentScopeRuntime:
         binding = binding_creation.binding
         outbox_worker = f"navigation-start:{task_id}"
         claimed_outbox = None
+        creation = None
+        run_started = False
         services = self._navigation_services()
         normalized_scene = (
             "in" if scene_mode == "indoor" else "out" if scene_mode == "outdoor" else None
@@ -565,11 +477,9 @@ class AgentScopeRuntime:
             )
             navigation_request = _navigation_handoff_message(
                 request=request,
-                target=target,
                 date=date.strip(),
                 scene_mode=scene_mode or "unknown",
                 clips=clips,
-                reason=reason,
                 response_language=response_language,
             )
             await self._start_agent_run(
@@ -581,36 +491,72 @@ class AgentScopeRuntime:
                 task_id=task_id,
                 agentscope_session_id=navigation_session_id,
             )
-            await self._publish_v1_task_state(
-                web_session_id=web_session_id,
-                task_id=task_id,
-                turn_id=active_turn_id,
-            )
-            self.web_session_store.complete_outbox(
-                claimed_outbox.outbox_id,
-                worker_id=outbox_worker,
-            )
+            run_started = True
         except Exception as exc:
-            if claimed_outbox is not None:
-                self.web_session_store.complete_outbox(
-                    claimed_outbox.outbox_id,
-                    worker_id=outbox_worker,
-                    success=False,
-                    error=type(exc).__name__,
+            if run_started:
+                _logger.exception(
+                    "Navigation start notification failed after the run was spawned; "
+                    "the running task remains authoritative: task_id=%s",
+                    task_id,
                 )
-            await self._handle_v1_delegation_failure(
-                web_session_id=web_session_id,
-                turn_id=active_turn_id,
-                task_id=task_id,
-                router_session_id=router_session_id,
-                response_language=response_language,
-            )
-            raise
+            else:
+                if claimed_outbox is not None:
+                    try:
+                        self.web_session_store.complete_outbox(
+                            claimed_outbox.outbox_id,
+                            worker_id=outbox_worker,
+                            success=False,
+                            error=type(exc).__name__,
+                        )
+                    except Exception:
+                        _logger.exception(
+                            "Failed to record rejected Navigation start outbox: task_id=%s",
+                            task_id,
+                        )
+                await self._handle_v1_delegation_failure(
+                    web_session_id=web_session_id,
+                    turn_id=active_turn_id,
+                    task_id=task_id,
+                    router_session_id=router_session_id,
+                    response_language=response_language,
+                )
+                raise
+        if run_started:
+            try:
+                await self._publish_v1_task_state(
+                    web_session_id=web_session_id,
+                    task_id=task_id,
+                    turn_id=active_turn_id,
+                )
+            except Exception:
+                _logger.exception(
+                    "Navigation start TaskStrip notification failed: task_id=%s",
+                    task_id,
+                )
+            if claimed_outbox is not None:
+                try:
+                    self.web_session_store.complete_outbox(
+                        claimed_outbox.outbox_id,
+                        worker_id=outbox_worker,
+                    )
+                except Exception:
+                    _logger.exception(
+                        "Navigation start outbox completion will be recovered: task_id=%s",
+                        task_id,
+                    )
         self._router_terminal_sessions.add(router_session_id)
+        if creation is None:
+            raise RuntimeError("navigation task creation did not complete")
         return {
+            "ok": True,
+            "operation": "start",
+            "accepted": True,
             "task_id": creation.task.task_id,
             "task_ref": str(_record_value(binding, "task_ref", task_ref)),
             "agentscope_session_id": navigation_session_id,
+            "status": creation.task.status.value,
+            "error": None,
+            "latest_task": self._task_summary(binding, max_chars=1200),
         }
 
     async def continue_navigation_agent_task_v1(
@@ -618,35 +564,70 @@ class AgentScopeRuntime:
         *,
         web_session_id: str,
         router_session_id: str,
-        task_ref: str,
-        original_user_message: str,
-        intent: str,
-        response_language: str,
-        expected_task_revision: int,
-    ) -> dict[str, str]:
-        binding, task = self._owned_v1_task(web_session_id, task_ref)
-        if task.state_revision != expected_task_revision:
-            raise RuntimeError("task state revision changed; refresh before continuing")
-        if task.status in {
-            NavigationTaskStatus.COMPLETED,
-            NavigationTaskStatus.CANCELLED,
-            NavigationTaskStatus.SUPERSEDED,
-        }:
-            raise RuntimeError("the navigation task is already terminal")
-        if intent == "resume" and task.status not in {
-            NavigationTaskStatus.PAUSED,
-            NavigationTaskStatus.PAUSING,
-            NavigationTaskStatus.WAITING_USER,
-            NavigationTaskStatus.NEEDS_REPLAN,
-            NavigationTaskStatus.ACTIVE,
-        }:
-            raise RuntimeError("the navigation task cannot be resumed from its current state")
-
-        task_id = str(_record_value(binding, "task_id"))
-        navigation_session_id = str(_record_value(binding, "navigation_session_id"))
+    ) -> dict[str, Any]:
+        if self.web_session_store is None:
+            raise RuntimeError("Web session store is unavailable")
         active_turn_id = self._active_turn_id(web_session_id)
         if active_turn_id is None:
             raise RuntimeError("navigation continuation requires an active turn")
+        snapshot = self._router_task_snapshot(
+            web_session_id=web_session_id,
+            router_session_id=router_session_id,
+            turn_id=active_turn_id,
+        )
+        task_id = str(snapshot["task_id"])
+        task_ref = str(snapshot["task_ref"])
+        binding = self.web_session_store.get_task_binding(task_id)
+        if (
+            binding is None
+            or binding.web_session_id != web_session_id
+            or binding.task_ref != task_ref
+            or binding.slot_state != "open"
+        ):
+            raise RuntimeError(
+                "stale_context: focused task binding changed; refresh the task revision"
+            )
+        navigation_session_id = str(_record_value(binding, "navigation_session_id"))
+        task = self._navigation_task_store().get_task(task_id)
+        if task is None or task.created_by_web_session_id != web_session_id:
+            raise RuntimeError("the focused navigation task is unavailable")
+        if task.state_revision != snapshot.get("task_revision"):
+            raise RuntimeError(
+                "stale_context: navigation task revision changed; refresh before continuing"
+            )
+        if task.status == NavigationTaskStatus.ACTIVE:
+            raise RuntimeError(
+                "the navigation task is already running; stop it before changing its instructions"
+            )
+        if task.status not in {
+            NavigationTaskStatus.PAUSED,
+            NavigationTaskStatus.WAITING_USER,
+            NavigationTaskStatus.NEEDS_REPLAN,
+        }:
+            raise RuntimeError("the navigation task cannot be continued from its current state")
+        get_message = getattr(self.web_session_store, "get_turn_user_message", None)
+        if not callable(get_message):
+            raise RuntimeError("private user message store is unavailable")
+        original_user_message = str(get_message(active_turn_id) or "").strip()
+        if not original_user_message:
+            raise RuntimeError("the current user message is unavailable")
+        response_language = _resolve_response_language(None, original_user_message)
+        intent = {
+            NavigationTaskStatus.PAUSED: "resume",
+            NavigationTaskStatus.WAITING_USER: "supplement",
+            NavigationTaskStatus.NEEDS_REPLAN: "adjust",
+        }[task.status]
+        previous_status = task.status
+        # Consume the exact durable revision before authority changes.  This
+        # prevents a stale Router tool call from mutating task state or creating
+        # an outbox command in the sessions database.
+        task = self._navigation_task_store().update_task_for_session(
+            task_id,
+            web_session_id=web_session_id,
+            agentscope_session_id=navigation_session_id,
+            expected_state_revision=task.state_revision,
+            guidance_revision=task.guidance_revision + 1,
+        )
         handover = getattr(
             self.web_session_store,
             "handover_response_authority_with_outbox",
@@ -669,7 +650,8 @@ class AgentScopeRuntime:
                 "response_language": response_language,
                 "navigation_session_id": navigation_session_id,
                 "task_ref": task_ref,
-                "accepted_task_revision": expected_task_revision,
+                "accepted_task_revision": task.state_revision,
+                "previous_task_status": previous_status.value,
             },
             idempotency_key=f"navigation_continue:{active_turn_id}:{task_id}",
             web_session_id=web_session_id,
@@ -677,35 +659,16 @@ class AgentScopeRuntime:
         )
         outbox_worker = f"navigation-continue:{active_turn_id}:{id(self)}"
         claimed_outbox = None
+        run_started = False
         try:
             claimed_outbox = self.web_session_store.claim_outbox_item(
                 outbox.outbox_id,
                 worker_id=outbox_worker,
                 lease_seconds=300,
             )
-            if task.status in {
-                NavigationTaskStatus.PAUSED,
-                NavigationTaskStatus.PAUSING,
-                NavigationTaskStatus.WAITING_USER,
-                NavigationTaskStatus.NEEDS_REPLAN,
-            }:
-                task = self._navigation_task_store().update_task_for_session(
-                    task_id,
-                    web_session_id=web_session_id,
-                    agentscope_session_id=navigation_session_id,
-                    expected_state_revision=task.state_revision,
-                    status=NavigationTaskStatus.ACTIVE,
-                )
             focus = getattr(self.web_session_store, "focus_task", None)
             if callable(focus):
                 focus(web_session_id, task_id=task_id)
-            if _record_value(binding, "status") != "active":
-                binding = self.web_session_store.update_task_binding(
-                    task_id,
-                    expected_revision=int(_record_value(binding, "state_revision", 0)),
-                    status="active",
-                    latest_public_update="继续处理任务。",
-                )
             await self._start_agent_run(
                 web_session_id=web_session_id,
                 agent_id=self.config.navigation_agent_id,
@@ -715,23 +678,39 @@ class AgentScopeRuntime:
                 task_id=task_id,
                 agentscope_session_id=navigation_session_id,
             )
-            await self._publish_v1_task_state(
+            run_started = True
+            task = self._navigation_task_store().update_task_for_session(
+                task_id,
                 web_session_id=web_session_id,
-                task_id=task_id,
-                turn_id=active_turn_id,
+                agentscope_session_id=navigation_session_id,
+                expected_state_revision=task.state_revision,
+                status=NavigationTaskStatus.ACTIVE,
             )
-            self.web_session_store.complete_outbox(
-                claimed_outbox.outbox_id,
-                worker_id=outbox_worker,
-            )
+            if _record_value(binding, "status") != "active":
+                binding = self.web_session_store.update_task_binding(
+                    task_id,
+                    expected_revision=int(_record_value(binding, "state_revision", 0)),
+                    status="active",
+                    latest_public_update="继续处理任务。",
+                )
         except Exception as exc:
             if claimed_outbox is not None:
-                self.web_session_store.complete_outbox(
-                    claimed_outbox.outbox_id,
-                    worker_id=outbox_worker,
-                    success=False,
-                    error=type(exc).__name__,
-                )
+                try:
+                    self.web_session_store.complete_outbox(
+                        claimed_outbox.outbox_id,
+                        worker_id=outbox_worker,
+                        success=False,
+                        error=type(exc).__name__,
+                    )
+                except Exception:
+                    _logger.exception(
+                        "Failed to record rejected Navigation continuation outbox: task_id=%s",
+                        task_id,
+                    )
+            if run_started:
+                cancellation = self.run_cancellation(navigation_session_id)
+                if cancellation is not None:
+                    cancellation.cancel()
             await self._handle_v1_delegation_failure(
                 web_session_id=web_session_id,
                 turn_id=active_turn_id,
@@ -741,50 +720,158 @@ class AgentScopeRuntime:
                 operation="continue",
             )
             raise
+        try:
+            await self._publish_v1_task_state(
+                web_session_id=web_session_id,
+                task_id=task_id,
+                turn_id=active_turn_id,
+            )
+        except Exception:
+            _logger.exception(
+                "Navigation continuation TaskStrip notification failed: task_id=%s",
+                task_id,
+            )
+        if claimed_outbox is not None:
+            try:
+                self.web_session_store.complete_outbox(
+                    claimed_outbox.outbox_id,
+                    worker_id=outbox_worker,
+                )
+            except Exception:
+                _logger.exception(
+                    "Navigation continuation outbox completion will be recovered: task_id=%s",
+                    task_id,
+                )
         self._router_terminal_sessions.add(router_session_id)
-        return {"task_id": task_id, "task_ref": task_ref}
+        latest_binding = self.web_session_store.get_task_binding(task_id) or binding
+        return {
+            "ok": True,
+            "operation": "continue",
+            "accepted": True,
+            "task_id": task_id,
+            "task_ref": task_ref,
+            "status": task.status.value,
+            "error": None,
+            "latest_task": self._task_summary(latest_binding, max_chars=1200),
+        }
 
     async def control_navigation_agent_task_v1(
         self,
         *,
         web_session_id: str,
         router_session_id: str,
-        task_ref: str,
         action: str,
-        response_language: str,
-        expected_task_revision: int,
-    ) -> dict[str, str]:
-        binding, task = self._owned_v1_task(web_session_id, task_ref)
-        if task.state_revision != expected_task_revision:
-            raise RuntimeError("task state revision changed; refresh before controlling it")
-        task_id = str(_record_value(binding, "task_id"))
-        navigation_session_id = str(_record_value(binding, "navigation_session_id"))
+    ) -> dict[str, Any]:
+        if action not in {"stop", "cancel"}:
+            raise RuntimeError("unsupported navigation task control action")
+        if self.web_session_store is None:
+            raise RuntimeError("Web session store is unavailable")
         active_turn_id = self._active_turn_id(web_session_id)
         if active_turn_id is None:
             raise RuntimeError("task control requires an active turn")
+        snapshot = self._router_task_snapshot(
+            web_session_id=web_session_id,
+            router_session_id=router_session_id,
+            turn_id=active_turn_id,
+        )
+        task_ref = str(snapshot["task_ref"])
+        binding = self.web_session_store.get_task_binding(str(snapshot["task_id"]))
+        if (
+            binding is None
+            or binding.web_session_id != web_session_id
+            or binding.task_ref != task_ref
+            or binding.slot_state != "open"
+        ):
+            raise RuntimeError(
+                "stale_context: focused task binding changed; refresh the task revision"
+            )
+        task = self._navigation_task_store().get_task(binding.task_id)
+        if task is None or task.state_revision != snapshot.get("task_revision"):
+            raise RuntimeError(
+                "stale_context: navigation task revision changed; refresh before controlling it"
+            )
+        task_id = str(_record_value(binding, "task_id"))
+        navigation_session_id = str(_record_value(binding, "navigation_session_id"))
         self.web_session_store.bind_conversation_agent_session_to_turn(
             navigation_session_id,
             active_turn_id,
         )
-        target_status = (
-            NavigationTaskStatus.PAUSING if action == "stop" else NavigationTaskStatus.CANCELLING
+        get_message = getattr(self.web_session_store, "get_turn_user_message", None)
+        response_language = _resolve_response_language(
+            None,
+            str(get_message(active_turn_id) or "") if callable(get_message) else "",
         )
+        terminal = {
+            NavigationTaskStatus.COMPLETED,
+            NavigationTaskStatus.FAILED,
+            NavigationTaskStatus.SUPERSEDED,
+        }
+        if task.status in terminal:
+            raise RuntimeError("the navigation task is already terminal")
+        if action == "stop":
+            if task.status in {NavigationTaskStatus.CANCELLING, NavigationTaskStatus.CANCELLED}:
+                raise RuntimeError("the navigation task is already being cancelled")
+            if task.status in {
+                NavigationTaskStatus.WAITING_USER,
+                NavigationTaskStatus.NEEDS_REPLAN,
+            }:
+                await self._publish_v1_task_state(
+                    web_session_id=web_session_id,
+                    task_id=task_id,
+                    turn_id=active_turn_id,
+                )
+                await self._commit_system_controller_final(
+                    turn_id=active_turn_id,
+                    text=(
+                        "当前没有正在运行的处理，任务状态已保留。"
+                        if _is_chinese(response_language)
+                        else "No processing run is active; the task state has been preserved."
+                    ),
+                )
+                self._router_terminal_sessions.add(router_session_id)
+                return {
+                    "ok": True,
+                    "operation": action,
+                    "accepted": True,
+                    "task_id": task_id,
+                    "task_ref": task_ref,
+                    "status": task.status.value,
+                    "error": None,
+                    "latest_task": self._task_summary(binding, max_chars=1200),
+                }
+            target_status = NavigationTaskStatus.PAUSING
+            already_requested = task.status in {
+                NavigationTaskStatus.PAUSING,
+                NavigationTaskStatus.PAUSED,
+            }
+        else:
+            target_status = NavigationTaskStatus.CANCELLING
+            already_requested = task.status in {
+                NavigationTaskStatus.CANCELLING,
+                NavigationTaskStatus.CANCELLED,
+            }
         terminal_status = (
             NavigationTaskStatus.PAUSED if action == "stop" else NavigationTaskStatus.CANCELLED
         )
-        updated = self._navigation_task_store().update_task_for_session(
-            task_id,
-            web_session_id=web_session_id,
-            agentscope_session_id=navigation_session_id,
-            expected_state_revision=task.state_revision,
-            status=target_status,
-        )
+        updated = task
+        if not already_requested:
+            updated = self._navigation_task_store().update_task_for_session(
+                task_id,
+                web_session_id=web_session_id,
+                agentscope_session_id=navigation_session_id,
+                expected_state_revision=task.state_revision,
+                status=target_status,
+            )
         update_binding = getattr(self.web_session_store, "update_task_binding", None)
-        if callable(update_binding):
+        if (
+            callable(update_binding)
+            and binding.slot_state == "open"
+            and binding.status != updated.status.value
+        ):
             binding = update_binding(
                 task_id,
                 expected_revision=int(_record_value(binding, "state_revision", 0)),
-                status=target_status.value,
+                status=updated.status.value,
                 latest_public_update=(
                     "正在安全停止当前处理。"
                     if action == "stop"
@@ -792,12 +879,15 @@ class AgentScopeRuntime:
                 ),
             )
         cancellation = self.run_cancellation(navigation_session_id)
-        if cancellation is not None:
+        if cancellation is not None and not already_requested:
             cancellation.cancel()
         publish_cancel = getattr(self.message_bus, "session_publish_cancel", None)
-        if callable(publish_cancel):
+        if callable(publish_cancel) and not already_requested:
             await publish_cancel(navigation_session_id)
-        if cancellation is None or not cancellation.has_background_operations:
+        if (
+            updated.status in {NavigationTaskStatus.PAUSING, NavigationTaskStatus.CANCELLING}
+            and (cancellation is None or not cancellation.has_background_operations)
+        ):
             updated = self._navigation_task_store().update_task_for_session(
                 task_id,
                 web_session_id=web_session_id,
@@ -822,7 +912,13 @@ class AgentScopeRuntime:
                         status=terminal_status.value,
                         latest_public_update="当前处理已停止。",
                     )
-        elif cancellation is not None:
+        elif (
+            cancellation is not None
+            and updated.status in {
+                NavigationTaskStatus.PAUSING,
+                NavigationTaskStatus.CANCELLING,
+            }
+        ):
             control_loop = asyncio.get_running_loop()
             cancellation.when_background_idle(
                 lambda: self._finalize_and_publish_navigation_control_v1(
@@ -851,7 +947,17 @@ class AgentScopeRuntime:
             ),
         )
         self._router_terminal_sessions.add(router_session_id)
-        return {"task_id": task_id, "task_ref": task_ref, "status": updated.status.value}
+        latest_binding = self.web_session_store.get_task_binding(task_id) or binding
+        return {
+            "ok": True,
+            "operation": action,
+            "accepted": True,
+            "task_id": task_id,
+            "task_ref": task_ref,
+            "status": updated.status.value,
+            "error": None,
+            "latest_task": self._task_summary(latest_binding, max_chars=1200),
+        }
 
     def _finalize_navigation_control_v1(
         self,
@@ -944,9 +1050,17 @@ class AgentScopeRuntime:
         if router_session_id not in self._router_terminal_sessions:
             return False
         self._router_terminal_sessions.discard(router_session_id)
+        for key in [key for key in self._router_run_contexts if key[0] == router_session_id]:
+            self._router_run_contexts.pop(key, None)
         return True
 
-    def safe_router_tool_error(self, error: Exception, *, action: str) -> dict[str, Any]:
+    def safe_router_tool_error(
+        self,
+        error: Exception,
+        *,
+        action: str,
+        web_session_id: str | None = None,
+    ) -> dict[str, Any]:
         message = str(error)
         known = (
             "revision" in message
@@ -955,17 +1069,62 @@ class AgentScopeRuntime:
             or "unavailable" in message
             or isinstance(error, (NavigationTaskEntryError, NavigationDataBusyError))
         )
+        code = (
+            "stale_context"
+            if "stale_context" in message or "revision" in message
+            else "task_already_running"
+            if "already running" in message
+            else "operation_rejected"
+            if known
+            else "runtime_error"
+        )
+        latest_task = None
+        if web_session_id is not None and known and self.web_session_store is not None:
+            focus_getter = getattr(
+                self.web_session_store,
+                "get_focused_task_binding",
+                None,
+            )
+            try:
+                focused_binding = (
+                    focus_getter(web_session_id) if callable(focus_getter) else None
+                )
+                latest_task = (
+                    self._task_summary(focused_binding, max_chars=1200)
+                    if focused_binding is not None
+                    else None
+                )
+            except Exception:
+                _logger.exception(
+                    "Failed to attach the latest safe task snapshot to a Router error"
+                )
         return {
             "ok": False,
-            "started": False,
-            "error_type": f"navigation_{action}_rejected" if known else "navigation_runtime_error",
-            "message": message[:240] if known else "DataPilot 暂时无法执行该任务操作，请稍后重试。",
+            "operation": action,
+            "accepted": False,
+            "task_ref": (latest_task or {}).get("task_ref"),
+            "status": "rejected",
+            "error": {
+                "code": code,
+                "message": (
+                    message[:240]
+                    if known
+                    else "DataPilot 暂时无法执行该任务操作，请稍后重试。"
+                ),
+                "retryable": code in {"stale_context", "runtime_error"},
+            },
+            "latest_task": latest_task,
         }
 
-    def router_context_envelope(self, web_session_id: str) -> dict[str, Any]:
+    def router_context_envelope(
+        self,
+        web_session_id: str,
+        *,
+        router_session_id: str | None = None,
+    ) -> dict[str, Any]:
         """Build a bounded, volatile Router context without specialist history."""
         if not self._is_contract_v1(web_session_id) or self.web_session_store is None:
-            return {"contract_version": 0}
+            raise RuntimeError("RouterContextEnvelope requires a contract v1 session")
         focus_getter = getattr(self.web_session_store, "get_focused_task_binding", None)
         list_getter = getattr(self.web_session_store, "list_task_bindings", None)
         focus_record = focus_getter(web_session_id) if callable(focus_getter) else None
@@ -991,6 +1150,27 @@ class AgentScopeRuntime:
         interaction = self.pending_interaction_snapshot(web_session_id)
         if interaction is not None:
             interaction = _bounded_mapping(interaction, 600)
+        active_turn_id = self._active_turn_id(web_session_id)
+        request_context = None
+        get_request_context = getattr(
+            self.web_session_store,
+            "get_turn_request_context",
+            None,
+        )
+        if active_turn_id is not None and callable(get_request_context):
+            raw_request_context = get_request_context(active_turn_id)
+            if isinstance(raw_request_context, dict):
+                raw_selection = raw_request_context.get("selection")
+                if isinstance(raw_selection, dict):
+                    selection_kind = raw_selection.get("kind")
+                    selection = {"kind": selection_kind}
+                    if selection_kind == "selected_clips":
+                        selection["clips"] = list(raw_selection.get("clips") or [])
+                    request_context = {
+                        "kind": raw_request_context.get("kind"),
+                        "dataset_date": raw_request_context.get("dataset_date"),
+                        "selection": selection,
+                    }
         latest = str((focused or {}).get("latest_public_update") or "")[:500]
         revision_source = json.dumps(
             {
@@ -998,6 +1178,7 @@ class AgentScopeRuntime:
                 "focused_revision": (focused or {}).get("state_revision"),
                 "interaction_revision": (interaction or {}).get("interaction_revision"),
                 "latest": latest,
+                "request_context": request_context,
             },
             ensure_ascii=False,
             sort_keys=True,
@@ -1011,6 +1192,7 @@ class AgentScopeRuntime:
             "pending_interaction_summary": interaction,
             "latest_public_update": latest or None,
             "attention_tasks": attention,
+            "request_context": request_context,
         }
         # The individual budgets above normally keep this below 4k. If labels or
         # target text are unusually large, shed attention and optional prose first.
@@ -1020,7 +1202,45 @@ class AgentScopeRuntime:
             envelope["latest_public_update"] = None
         if len(json.dumps(envelope, ensure_ascii=False)) > 4000 and focused is not None:
             envelope["focused_task_summary"] = _bounded_mapping(focused, 700)
+        if len(json.dumps(envelope, ensure_ascii=False)) > 4000:
+            raise RuntimeError("RouterContextEnvelope exceeds the 4000 character budget")
+        if router_session_id is not None:
+            if active_turn_id is None:
+                raise RuntimeError("router context requires an active turn")
+            for key in [
+                key for key in self._router_run_contexts if key[0] == router_session_id
+            ]:
+                self._router_run_contexts.pop(key, None)
+            self._router_run_contexts[(router_session_id, active_turn_id)] = {
+                "web_session_id": web_session_id,
+                "turn_id": active_turn_id,
+                "task_id": _record_value(focus_record, "task_id"),
+                "task_ref": focused_ref,
+                "task_revision": (focused or {}).get("state_revision"),
+                "focus_generation": focus_generation,
+                "context_revision": envelope["context_revision"],
+            }
         return envelope
+
+    def _router_task_snapshot(
+        self,
+        *,
+        web_session_id: str,
+        router_session_id: str,
+        turn_id: str,
+    ) -> dict[str, Any]:
+        snapshot = self._router_run_contexts.get((router_session_id, turn_id))
+        if snapshot is None or snapshot.get("web_session_id") != web_session_id:
+            raise RuntimeError(
+                "stale_context: Router run context is unavailable; refresh the task revision"
+            )
+        if not isinstance(snapshot.get("task_id"), str) or not isinstance(
+            snapshot.get("task_ref"), str
+        ):
+            raise RuntimeError(
+                "stale_context: Router run had no focused task; refresh the task revision"
+            )
+        return snapshot
 
     def session_task_snapshots(self, web_session_id: str) -> list[dict[str, Any]]:
         if not self._is_contract_v1(web_session_id) or self.web_session_store is None:
@@ -1166,8 +1386,28 @@ class AgentScopeRuntime:
         if task is None:
             return None
         status = task.status.value
-        phase = task.accepted_plan_phase or (
-            "waiting_input" if status == "waiting_user" else "preparing"
+        phase = (
+            "等待确认"
+            if status == "waiting_user"
+            else "正在安全停止"
+            if status == "pausing"
+            else "已暂停"
+            if status == "paused"
+            else "正在取消"
+            if status == "cancelling"
+            else "需要调整方案"
+            if status == "needs_replan"
+            else "已完成"
+            if status == "completed"
+            else "处理失败"
+            if status == "failed"
+            else "已取消"
+            if status == "cancelled"
+            else "提取并同步"
+            if task.accepted_plan_phase == "extract_sync"
+            else "后处理"
+            if task.accepted_plan_phase == "finish_processing"
+            else "检查数据"
         )
         wait_cause = {
             "waiting_user": "等待你补充信息或作出选择",
@@ -1189,14 +1429,23 @@ class AgentScopeRuntime:
             for clip in list(task.segments or [])
             if (safe := _safe_context_text(sanitize_progress_text(clip), 160))
         ]
+        selection = (
+            {"kind": "selected_clips", "clips": safe_clips}
+            if safe_clips
+            else {"kind": "all_clips"}
+        )
         summary = {
             "task_ref": _record_value(binding, "task_ref"),
             "domain": "navigation",
-            "target": {
-                "date": task.date,
-                "clips": safe_clips,
-                "scene_mode": task.scene_mode,
-            },
+            "dataset_date": task.date,
+            "selection": selection,
+            "scene_mode": (
+                "indoor"
+                if task.scene_mode == "in"
+                else "outdoor"
+                if task.scene_mode == "out"
+                else None
+            ),
             "status": status,
             "phase": phase,
             "wait_cause": wait_cause,
@@ -1220,12 +1469,7 @@ class AgentScopeRuntime:
     ) -> None:
         task = self._navigation_task_store().get_task(task_id)
         binding = self.web_session_store.get_task_binding(task_id)
-        if task is not None and task.status not in {
-            NavigationTaskStatus.COMPLETED,
-            NavigationTaskStatus.FAILED,
-            NavigationTaskStatus.CANCELLED,
-            NavigationTaskStatus.SUPERSEDED,
-        }:
+        if operation == "start" and task is not None and task.status == NavigationTaskStatus.ACTIVE:
             task = self._navigation_task_store().update_task_for_session(
                 task_id,
                 web_session_id=web_session_id,
@@ -1233,11 +1477,7 @@ class AgentScopeRuntime:
                     binding.navigation_session_id if binding is not None else None
                 ),
                 expected_state_revision=task.state_revision,
-                status=(
-                    NavigationTaskStatus.FAILED
-                    if operation == "start"
-                    else NavigationTaskStatus.NEEDS_REPLAN
-                ),
+                status=NavigationTaskStatus.FAILED,
             )
         release = getattr(self.web_session_store, "mark_task_binding_terminal", None)
         if callable(release):
@@ -1253,7 +1493,7 @@ class AgentScopeRuntime:
                     self.web_session_store.update_task_binding(
                         task_id,
                         expected_revision=binding.state_revision,
-                        status="needs_replan",
+                        status=(task.status.value if task is not None else binding.status),
                         latest_public_update="任务未能安全继续，状态已保留。",
                     )
         text = (
@@ -1475,13 +1715,12 @@ class AgentScopeRuntime:
         turn_id: str | None,
     ) -> None:
         task = self._navigation_task_store().get_task(task_id)
-        terminal = {
-            NavigationTaskStatus.COMPLETED,
-            NavigationTaskStatus.FAILED,
-            NavigationTaskStatus.CANCELLED,
-            NavigationTaskStatus.SUPERSEDED,
-        }
-        if task is not None and task.status not in terminal:
+        if task is not None and task.status in {
+            NavigationTaskStatus.ACTIVE,
+            NavigationTaskStatus.PAUSING,
+            NavigationTaskStatus.CANCELLING,
+            NavigationTaskStatus.NEEDS_REPLAN,
+        }:
             task = self._navigation_task_store().update_task_for_session(
                 task_id,
                 web_session_id=web_session_id,
@@ -1491,7 +1730,12 @@ class AgentScopeRuntime:
             )
         if self.web_session_store is not None:
             binding = self.web_session_store.get_task_binding(task_id)
-            if binding is not None and binding.slot_state == "open":
+            if (
+                task is not None
+                and task.status == NavigationTaskStatus.FAILED
+                and binding is not None
+                and binding.slot_state == "open"
+            ):
                 self.web_session_store.mark_task_binding_terminal(
                     task_id,
                     expected_revision=binding.state_revision,
@@ -1528,11 +1772,17 @@ class AgentScopeRuntime:
             if navigation_mapping is not None and authority is not None:
                 task = self._navigation_task_store().get_task(navigation_mapping.task_id)
                 binding = self.web_session_store.get_task_binding(navigation_mapping.task_id)
-                if task is not None and binding is not None:
-                    if task.status not in {
+                if (
+                    task is not None
+                    and binding is not None
+                    and task.status
+                    in {
+                        NavigationTaskStatus.ACTIVE,
                         NavigationTaskStatus.PAUSING,
                         NavigationTaskStatus.PAUSED,
-                    }:
+                    }
+                ):
+                    if task.status == NavigationTaskStatus.ACTIVE:
                         task = self._navigation_task_store().update_task_for_session(
                             task.task_id,
                             web_session_id=web_session_id,
@@ -1709,9 +1959,6 @@ class AgentScopeRuntime:
                 )
         return "failed"
 
-    def record_navigation_handoff(self, payload: dict[str, Any]) -> None:
-        _logger.info("Navigation handoff: %s", payload)
-
     def _navigation_services(self) -> NavigationServices:
         return build_navigation_services(self.config.workspace_root)
 
@@ -1754,6 +2001,22 @@ class AgentScopeRuntime:
             if phase_hint is not None
             else None
         )
+        if plan is None and phase_hint is not None:
+            # A completed accepted plan is still the durable execution anchor.
+            # `get_active` intentionally excludes it, so recovery must read the
+            # latest accepted phase rather than interpreting absence as running.
+            with sqlite3.connect(services.plan_store.db_path) as connection:
+                row = connection.execute(
+                    """
+                    SELECT plan_id FROM navigation_plans
+                    WHERE task_id = ? AND phase = ?
+                      AND status IN ('active', 'completed')
+                    ORDER BY updated_at DESC, rowid DESC LIMIT 1
+                    """,
+                    (task.task_id, phase_hint),
+                ).fetchone()
+            if row is not None:
+                plan = services.plan_store.get(str(row[0]))
         current = services.plan_store.get_current_step(plan.plan_id) if plan is not None else None
         return {
             "task_attempt_id": task.task_id,
@@ -1864,28 +2127,40 @@ class AgentScopeRuntime:
         task = self._navigation_task_store().get_task(task_id)
         if task is not None and task.status == NavigationTaskStatus.WAITING_USER:
             resumed_status = (
-                NavigationTaskStatus.PAUSED
+                NavigationTaskStatus.CANCELLING
                 if action == "stop"
                 else NavigationTaskStatus.ACTIVE
             )
-            self._navigation_task_store().update_task_for_session(
+            task = self._navigation_task_store().update_task_for_session(
                 task_id,
                 web_session_id=web_session_id,
                 agentscope_session_id=navigation_session_id,
                 expected_state_revision=task.state_revision,
                 status=resumed_status,
             )
+            if action == "stop":
+                task = self._navigation_task_store().update_task_for_session(
+                    task_id,
+                    web_session_id=web_session_id,
+                    agentscope_session_id=navigation_session_id,
+                    expected_state_revision=task.state_revision,
+                    status=NavigationTaskStatus.CANCELLED,
+                )
         if binding.slot_state == "open":
-            self.web_session_store.update_task_binding(
-                task_id,
-                expected_revision=binding.state_revision,
-                status="paused" if action == "stop" else "active",
-                latest_public_update=(
-                    "已按你的选择停止当前处理。"
-                    if action == "stop"
-                    else "已收到你的选择，继续处理。"
-                ),
-            )
+            if action == "stop":
+                self.web_session_store.mark_task_binding_terminal(
+                    task_id,
+                    expected_revision=binding.state_revision,
+                    status="cancelled",
+                    latest_public_update="已按你的选择取消任务。",
+                )
+            else:
+                self.web_session_store.update_task_binding(
+                    task_id,
+                    expected_revision=binding.state_revision,
+                    status="active",
+                    latest_public_update="已收到你的选择，继续处理。",
+                )
         self.web_session_store.focus_task(web_session_id, task_id=task_id)
         await self._publish_v1_task_state(
             web_session_id=web_session_id,
@@ -1965,13 +2240,8 @@ class AgentScopeRuntime:
             if exhausted and item.task_id and item.web_session_id and item.turn_id:
                 task = self._navigation_task_store().get_task(item.task_id)
                 binding = self.web_session_store.get_task_binding(item.task_id)
-                if task is not None and task.status not in {
-                    NavigationTaskStatus.COMPLETED,
-                    NavigationTaskStatus.CANCELLED,
-                    NavigationTaskStatus.FAILED,
-                    NavigationTaskStatus.SUPERSEDED,
-                }:
-                    self._navigation_task_store().update_task_for_session(
+                if task is not None and task.status == NavigationTaskStatus.ACTIVE:
+                    task = self._navigation_task_store().update_task_for_session(
                         task.task_id,
                         web_session_id=item.web_session_id,
                         agentscope_session_id=(
@@ -1986,8 +2256,8 @@ class AgentScopeRuntime:
                     self.web_session_store.update_task_binding(
                         binding.task_id,
                         expected_revision=binding.state_revision,
-                        status="needs_replan",
-                        latest_public_update="该选择未能恢复任务，需要重新规划。",
+                        status=(task.status.value if task is not None else binding.status),
+                        latest_public_update="该选择未能恢复任务，原状态已保留。",
                     )
                 await self._publish_v1_task_state(
                     web_session_id=item.web_session_id,
@@ -2702,6 +2972,7 @@ class AgentScopeRuntime:
         )
         recovered = recovered_controls
         for item in items:
+            accepted_execution = False
             try:
                 if item.kind == "navigation_resume":
                     if await self._process_claimed_interaction_resume_v1(
@@ -2732,6 +3003,7 @@ class AgentScopeRuntime:
                         ),
                         entry_id=str(item.payload.get("entry_id") or ""),
                         events=list(item.payload.get("events") or []),
+                        private_events=list(item.payload.get("private_events") or []),
                         raw_event_type=item.payload.get("raw_event_type"),
                         reply_id=item.payload.get("reply_id"),
                         allow_system_turn_defer=False,
@@ -2755,6 +3027,7 @@ class AgentScopeRuntime:
                     if authority is None:
                         raise RuntimeError("navigation continuation authority is unavailable")
                     if authority.lease_state == "closed":
+                        accepted_execution = True
                         self.web_session_store.complete_outbox(
                             item.outbox_id,
                             worker_id=worker_id,
@@ -2766,26 +3039,6 @@ class AgentScopeRuntime:
                     task = self._navigation_task_store().get_task(binding.task_id)
                     if task is None:
                         raise RuntimeError("navigation continuation task is unavailable")
-                    if task.status in {
-                        NavigationTaskStatus.PAUSED,
-                        NavigationTaskStatus.PAUSING,
-                        NavigationTaskStatus.WAITING_USER,
-                        NavigationTaskStatus.NEEDS_REPLAN,
-                    }:
-                        task = self._navigation_task_store().update_task_for_session(
-                            task.task_id,
-                            web_session_id=binding.web_session_id,
-                            agentscope_session_id=binding.navigation_session_id,
-                            expected_state_revision=task.state_revision,
-                            status=NavigationTaskStatus.ACTIVE,
-                        )
-                    if binding.status != "active":
-                        binding = self.web_session_store.update_task_binding(
-                            binding.task_id,
-                            expected_revision=binding.state_revision,
-                            status="active",
-                            latest_public_update="继续处理任务。",
-                        )
                     await self.ensure_web_session(
                         binding.web_session_id,
                         agent_id=self.config.navigation_agent_id,
@@ -2825,6 +3078,36 @@ class AgentScopeRuntime:
                             turn_id=item.turn_id,
                             task_id=binding.task_id,
                             agentscope_session_id=binding.navigation_session_id,
+                        )
+                        existing_run = None
+                    run_is_active = existing_run is None or (
+                        existing_run.status == "running"
+                        and self._is_local_agent_run_active(
+                            binding.navigation_session_id
+                        )
+                    )
+                    accepted_execution = run_is_active or (
+                        existing_run is not None
+                        and existing_run.status == "completed"
+                    )
+                    if run_is_active and task.status in {
+                        NavigationTaskStatus.PAUSED,
+                        NavigationTaskStatus.WAITING_USER,
+                        NavigationTaskStatus.NEEDS_REPLAN,
+                    }:
+                        task = self._navigation_task_store().update_task_for_session(
+                            task.task_id,
+                            web_session_id=binding.web_session_id,
+                            agentscope_session_id=binding.navigation_session_id,
+                            expected_state_revision=task.state_revision,
+                            status=NavigationTaskStatus.ACTIVE,
+                        )
+                    if task.status == NavigationTaskStatus.ACTIVE and binding.status != "active":
+                        binding = self.web_session_store.update_task_binding(
+                            binding.task_id,
+                            expected_revision=binding.state_revision,
+                            status="active",
+                            latest_public_update="继续处理任务。",
                         )
                     await self._publish_v1_task_state(
                         web_session_id=binding.web_session_id,
@@ -2879,6 +3162,7 @@ class AgentScopeRuntime:
                     preallocated_session_id=binding.navigation_session_id,
                 )
                 if authority.lease_state == "closed":
+                    accepted_execution = True
                     self.web_session_store.complete_outbox(
                         item.outbox_id,
                         worker_id=worker_id,
@@ -2911,11 +3195,9 @@ class AgentScopeRuntime:
                 if existing_run is None:
                     message = _navigation_handoff_message(
                         request=str(payload["request"]),
-                        target=str(payload["target"]),
                         date=str(payload["date"]),
                         scene_mode=str(payload.get("scene_mode") or "unknown"),
                         clips=list(payload.get("clips") or []),
-                        reason=str(payload.get("reason") or "恢复已接受的任务"),
                         response_language=str(payload.get("response_language") or "Chinese"),
                     )
                     await self._start_agent_run(
@@ -2927,6 +3209,9 @@ class AgentScopeRuntime:
                         task_id=binding.task_id,
                         agentscope_session_id=binding.navigation_session_id,
                     )
+                    accepted_execution = True
+                elif existing_run.status in {"running", "completed"}:
+                    accepted_execution = True
                 elif existing_run.status in {"failed", "interrupted"}:
                     raise RuntimeError("previous navigation start did not survive restart")
                 self.web_session_store.complete_outbox(
@@ -2940,6 +3225,26 @@ class AgentScopeRuntime:
                     item.kind,
                     item.outbox_id,
                 )
+                if accepted_execution:
+                    try:
+                        retry_at = (
+                            datetime.now(UTC) + timedelta(seconds=1)
+                        ).isoformat(timespec="milliseconds")
+                        self.web_session_store.complete_outbox(
+                            item.outbox_id,
+                            worker_id=worker_id,
+                            success=False,
+                            error=type(exc).__name__,
+                            retry_at=retry_at,
+                        )
+                    except Exception:
+                        _logger.exception(
+                            "Accepted Navigation execution outbox will be retried: "
+                            "kind=%s outbox_id=%s",
+                            item.kind,
+                            item.outbox_id,
+                        )
+                    continue
                 if item.kind != "navigation_resume":
                     self.web_session_store.complete_outbox(
                         item.outbox_id,
@@ -3481,7 +3786,7 @@ class AgentScopeRuntime:
     ) -> tuple[dict[str, Any], ...]:
         """Convert private AgentScope projections to the contract-v1 allowlist."""
         if not self._is_contract_v1(web_session_id) or self.web_session_store is None:
-            return tuple(events)
+            raise RuntimeError("public event projection requires a contract v1 session")
         mapping_getter = getattr(
             self.web_session_store,
             "get_conversation_agent_session_by_agentscope_session",
@@ -3534,6 +3839,35 @@ class AgentScopeRuntime:
             agentscope_session_id,
             SpecialistSignalProjector(),
         )
+        forward_phase_hints: dict[int, str] = {}
+        phase_boundaries = {
+            "progress_start",
+            "progress_delta",
+            "progress_end",
+            "progress_update",
+            "tool_start",
+            "tool_background",
+            "tool_end",
+        }
+        for progress_index, candidate in enumerate(events):
+            if candidate.get("type") != "progress_update":
+                continue
+            for following in events[progress_index + 1 :]:
+                following_type = str(following.get("type") or "")
+                if following_type == "tool_start":
+                    following_payload = (
+                        following.get("payload")
+                        if isinstance(following.get("payload"), dict)
+                        else {}
+                    )
+                    tool_name = str(following_payload.get("tool") or "")
+                    if tool_name:
+                        forward_phase_hints[progress_index] = (
+                            self._public_action_registry.resolve(tool_name).phase
+                        )
+                    break
+                if following_type in phase_boundaries:
+                    break
         for index, event in enumerate(events):
             event_type = str(event.get("type") or "")
             payload = event.get("payload") if isinstance(event.get("payload"), dict) else {}
@@ -3541,6 +3875,7 @@ class AgentScopeRuntime:
                 "progress_start",
                 "progress_delta",
                 "progress_end",
+                "progress_update",
                 "tool_start",
                 "tool_background",
                 "tool_end",
@@ -3565,18 +3900,54 @@ class AgentScopeRuntime:
                 "run_id": agentscope_session_id,
             }
             signals: list[Any] = []
-            if event_type in {"progress_start", "progress_delta", "progress_end"}:
+            if event_type in {
+                "progress_start",
+                "progress_delta",
+                "progress_end",
+                "progress_update",
+            }:
                 operation = {
                     "progress_start": "start",
                     "progress_delta": "append",
                     "progress_end": "finish",
+                    "progress_update": "append",
                 }[event_type]
+                requested_phase = str(payload.get("phase") or "")
+                allowed_phases = {
+                    "setup",
+                    "inspection",
+                    "planning",
+                    "preparation",
+                    "extract_sync",
+                    "finish_assembly",
+                    "human_decision",
+                    "annotation",
+                    "tracking",
+                    "projection",
+                    "verification",
+                    "generic",
+                }
+                phase = (
+                    requested_phase
+                    if requested_phase in allowed_phases
+                    else (
+                        forward_phase_hints.get(index)
+                        or self._specialist_phases.get(agentscope_session_id)
+                        or (
+                            "extract_sync"
+                            if getattr(task, "accepted_plan_phase", None) == "extract_sync"
+                            else "finish_assembly"
+                            if getattr(task, "accepted_plan_phase", None) == "finish_processing"
+                            else "inspection"
+                        )
+                    )
+                )
                 signals.append(
                     ProgressSignalV1(
                         **common,
                         kind="progress",
                         operation=operation,
-                        phase="generic",
+                        phase=phase,
                         text=payload.get("delta") or payload.get("text"),
                         status="completed" if operation == "finish" else "running",
                     )
@@ -3591,24 +3962,32 @@ class AgentScopeRuntime:
                         (agentscope_session_id, call_id),
                         "unknown",
                     )
-                if call_id and event_type != "tool_background":
+                if tool_name:
+                    self._specialist_phases[agentscope_session_id] = (
+                        self._public_action_registry.resolve(tool_name).phase
+                    )
+                if call_id:
                     status = (
                         "running"
                         if event_type == "tool_start"
+                        else "background"
+                        if event_type == "tool_background"
                         else _public_terminal_status(payload.get("status"))
                     )
                     signals.append(
                         ActionSignalV1(
                             **common,
                             kind="action",
-                            operation="start" if event_type == "tool_start" else "finish",
+                            operation=(
+                                "start" if event_type == "tool_start" else "finish"
+                            ),
                             tool_name=tool_name or "unknown",
                             call_id=call_id,
                             status=status,
                         )
                     )
             elif event_type == "human_decision_required":
-                if task is not None and task.status != NavigationTaskStatus.WAITING_USER:
+                if task is not None and task.status == NavigationTaskStatus.ACTIVE:
                     task = self._navigation_task_store().update_task_for_session(
                         task_id,
                         web_session_id=web_session_id,
@@ -3762,6 +4141,16 @@ class AgentScopeRuntime:
             target_status = NavigationTaskStatus.NEEDS_REPLAN
         if target_status is None or task.status == target_status:
             return task
+        try:
+            validate_navigation_task_status_transition(task.status, target_status)
+        except NavigationTaskTransitionError:
+            _logger.warning(
+                "Ignoring stale specialist final state transition: task_id=%s current=%s target=%s",
+                task.task_id,
+                task.status.value,
+                target_status.value,
+            )
+            return task
         task = self._navigation_task_store().update_task_for_session(
             task.task_id,
             web_session_id=web_session_id,
@@ -3801,10 +4190,14 @@ class AgentScopeRuntime:
             return None
         if event_type in {"progress_start", "progress_end"}:
             return {"contract_version": 1, "type": event_type, "payload": {}}
-        if event_type == "progress_delta":
+        if event_type in {"progress_delta", "progress_update"}:
             text = sanitize_progress_text(payload.get("delta") or payload.get("text") or "")
             return (
-                {"contract_version": 1, "type": "progress_delta", "payload": {"delta": text}}
+                {
+                    "contract_version": 1,
+                    "type": "progress_delta",
+                    "payload": {"delta": text},
+                }
                 if text
                 else None
             )
@@ -3983,50 +4376,6 @@ class AgentScopeRuntime:
         if mapping is None:
             return None
         return mapping.agent_id, mapping.agentscope_session_id, mapping.event_cursor
-
-    def _save_web_session_mapping(
-        self,
-        web_session_id: str,
-        agent_id: str,
-        agentscope_session_id: str,
-    ) -> None:
-        if self.web_session_store is None:
-            return
-        save_mapping = getattr(self.web_session_store, "save_agentscope_session_mapping", None)
-        if callable(save_mapping):
-            save_mapping(web_session_id, agent_id=agent_id, agentscope_session_id=agentscope_session_id)
-
-    def _restore_web_session_mapping(
-        self,
-        web_session_id: str,
-        previous_mapping: tuple[str, str] | None,
-    ) -> None:
-        if previous_mapping is None:
-            self.web_sessions.pop(web_session_id, None)
-            agent_id = None
-            agentscope_session_id = None
-        else:
-            self.web_sessions[web_session_id] = previous_mapping
-            agent_id, agentscope_session_id = previous_mapping
-        if self.web_session_store is None:
-            return
-        restore_mapping = getattr(
-            self.web_session_store,
-            "restore_agentscope_session_mapping",
-            None,
-        )
-        if callable(restore_mapping):
-            restore_mapping(
-                web_session_id,
-                agent_id=agent_id,
-                agentscope_session_id=agentscope_session_id,
-            )
-        elif previous_mapping is not None:
-            self._save_web_session_mapping(
-                web_session_id,
-                agent_id,
-                agentscope_session_id,
-            )
 
     def _save_web_session_event_cursor(self, agentscope_session_id: str, cursor: str) -> None:
         if self.web_session_store is None:
@@ -4519,71 +4868,12 @@ def _web_session_id_from_agentscope_session(session_id: str, *, agent_id: str) -
     return session_id
 
 
-def _handoff_chunk(payload: dict[str, Any], *, state: ToolResultState) -> ToolChunk:
-    text = json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
-    return ToolChunk(
-        content=[TextBlock(text=text)],
-        state=state,
-        metadata=payload,
-    )
-
-
-def _handoff_error(
-    message: str,
-    *,
-    error_type: str = "invalid_navigation_handoff",
-) -> ToolChunk:
-    return _handoff_chunk(
-        {
-            "ok": False,
-            "started": False,
-            "error_type": error_type,
-            "message": message,
-        },
-        state=ToolResultState.ERROR,
-    )
-
-
-def _date_from_navigation_target(target: str) -> str | None:
-    stripped = target.strip()
-    if re.fullmatch(r"[0-9]{8}", stripped):
-        return stripped
-    match = re.search(r"(?<![0-9])([0-9]{8})(?![0-9])", stripped)
-    if match is None:
-        return None
-    return match.group(1)
-
-
-def _dates_from_text(text: str) -> list[str]:
-    return re.findall(r"(?<![0-9])([0-9]{8})(?![0-9])", text)
-
-
-def _clip_prefix_dates(clips: list[str]) -> set[str]:
-    return {
-        match.group(1)
-        for clip in clips
-        if (match := re.match(r"^([0-9]{8})[_-]", clip.strip()))
-    }
-
-
-def _navigation_handoff_date(*, request: str, target: str, clips: list[str]) -> str | None:
-    target_date = _date_from_navigation_target(target)
-    request_dates = _dates_from_text(request)
-    clip_dates = _clip_prefix_dates(clips)
-    non_clip_request_dates = [date for date in request_dates if date not in clip_dates]
-    if non_clip_request_dates:
-        return non_clip_request_dates[0]
-    return target_date or (request_dates[0] if request_dates else None)
-
-
 def _navigation_handoff_message(
     *,
     request: str,
-    target: str,
     date: str,
     scene_mode: str | None,
     clips: list[str],
-    reason: str,
     response_language: str | None,
 ) -> str:
     clip_text = ", ".join(clips) if clips else "all"
@@ -4591,8 +4881,12 @@ def _navigation_handoff_message(
     scene_mode_text = scene_mode or "unknown"
     payload = {
         "request": request,
-        "target": target,
-        "date": date,
+        "dataset_date": date,
+        "selection": (
+            {"kind": "selected_clips", "clips": clips}
+            if clips
+            else {"kind": "all_clips"}
+        ),
         "scene_mode": {
             "indoor": "in",
             "in": "in",
@@ -4601,7 +4895,6 @@ def _navigation_handoff_message(
             "out": "out",
             "室外": "out",
         }.get(scene_mode or ""),
-        "segments": clips or None,
         "response_language": language,
     }
     structured_lines = [
@@ -4613,10 +4906,9 @@ def _navigation_handoff_message(
             [
                 "导航数据处理请求：",
                 f"- 用户原始请求: {request}",
-                f"- 处理目标: {target}",
+                f"- 数据日期: {date}",
                 f"- 场景模式: {scene_mode_text}",
                 f"- clips: {clip_text}",
-                f"- 转交原因: {reason}",
                 f"- 回复语言: {language}",
                 "请始终使用中文回复用户。",
                 *structured_lines,
@@ -4626,10 +4918,9 @@ def _navigation_handoff_message(
         [
             "Navigation data processing request:",
             f"- request: {request}",
-            f"- target: {target}",
+            f"- dataset_date: {date}",
             f"- scene_mode: {scene_mode_text}",
             f"- clips: {clip_text}",
-            f"- reason: {reason}",
             f"- response_language: {language}",
             f"Always respond to the user in {language}.",
             *structured_lines,
@@ -4681,12 +4972,15 @@ def _bounded_mapping(value: dict[str, Any], max_chars: int) -> dict[str, Any]:
         if len(json.dumps(bounded, ensure_ascii=False)) <= max_chars:
             break
         bounded[key] = None
-    target = bounded.get("target")
-    if len(json.dumps(bounded, ensure_ascii=False)) > max_chars and isinstance(target, dict):
-        bounded["target"] = {
-            "date": target.get("date"),
-            "clips": list(target.get("clips") or [])[:3],
-            "scene_mode": target.get("scene_mode"),
+    selection = bounded.get("selection")
+    if (
+        len(json.dumps(bounded, ensure_ascii=False)) > max_chars
+        and isinstance(selection, dict)
+        and selection.get("kind") == "selected_clips"
+    ):
+        bounded["selection"] = {
+            "kind": "selected_clips",
+            "clips": list(selection.get("clips") or [])[:3],
         }
     return bounded
 
@@ -4705,227 +4999,6 @@ def _public_terminal_status(value: Any) -> str:
     return "failed"
 
 
-class NavigationHandoffTool(ToolBase):
-    name = "start_navigation_data_task"
-    description = (
-        "Start the dedicated VLA navigation data processing agent after you "
-        "have determined that the user wants to begin a concrete navigation "
-        "data task. Do not use this for capability questions or ordinary "
-        "conversation."
-    )
-    input_schema = {
-        "type": "object",
-        "properties": {
-            "request": {
-                "type": "string",
-                "description": "The user's concrete navigation task request with relevant context.",
-            },
-            "target": {
-                "type": "string",
-                "description": "The concrete date, path, or dataset target to process.",
-            },
-            "date": {
-                "type": "string",
-                "description": (
-                    "The navigation dataset date in YYYYMMDD format. This is the "
-                    "directory date under raw_data/clip_data/finish_data. Do not "
-                    "derive it from clip name prefixes when the user's requested "
-                    "dataset date is different."
-                ),
-            },
-            "scene_mode": {
-                "type": "string",
-                "enum": ["indoor", "outdoor", "unknown"],
-                "description": (
-                    "Optional indoor/outdoor context. Use unknown or omit the field "
-                    "when scene mode is not available; missing or unknown scene mode "
-                    "must not block extract/sync."
-                ),
-            },
-            "clips": {
-                "type": "array",
-                "items": {"type": "string"},
-                "description": (
-                    "Optional specific clips to process. Omit or use an empty "
-                    "array when the user did not specify clips."
-                ),
-            },
-            "reason": {
-                "type": "string",
-                "description": "Brief reason why this should be handed off to the navigation data agent.",
-            },
-            "missing_fields": {
-                "type": "array",
-                "items": {
-                    "type": "string",
-                    "enum": ["request", "target", "date", "clips", "other"],
-                },
-                "description": (
-                    "Fields that are still missing. Do not include scene_mode; only "
-                    "date/path/target style gaps should block handoff."
-                ),
-            },
-            "confidence": {
-                "type": "string",
-                "enum": ["low", "medium", "high"],
-                "description": "Confidence that this is a concrete navigation data processing task.",
-            },
-            "response_language": {
-                "type": "string",
-                "description": "The language the user is using and expects for responses, such as Chinese or English.",
-            },
-        },
-        "required": [
-            "request",
-            "target",
-            "date",
-            "reason",
-            "missing_fields",
-            "confidence",
-            "response_language",
-        ],
-        "additionalProperties": False,
-    }
-    is_concurrency_safe = False
-    is_read_only = False
-    is_external_tool = False
-
-    def __init__(self, *, runtime: AgentScopeRuntime, web_session_id: str) -> None:
-        self._runtime = runtime
-        self._web_session_id = web_session_id
-
-    async def check_permissions(
-        self,
-        tool_input: dict[str, Any],
-        context: object,
-    ) -> PermissionDecision:
-        return PermissionDecision(
-            behavior=PermissionBehavior.ALLOW,
-            message="Navigation handoff is allowed.",
-        )
-
-    async def __call__(
-        self,
-        request: str,
-        target: str,
-        date: str,
-        reason: str,
-        missing_fields: list[str],
-        confidence: str,
-        response_language: str | None = None,
-        clips: list[str] | None = None,
-        scene_mode: str | None = None,
-    ) -> ToolChunk:
-        normalized_clips = list(clips or [])
-        normalized_language = _resolve_response_language(response_language, request)
-        normalized_scene_mode = scene_mode if scene_mode in {"indoor", "outdoor"} else "unknown"
-        payload = {
-            "web_session_id": self._web_session_id,
-            "request": request,
-            "target": target,
-            "date": date,
-            "scene_mode": normalized_scene_mode,
-            "clips": normalized_clips,
-            "reason": reason,
-            "missing_fields": list(missing_fields),
-            "confidence": confidence,
-            "response_language": normalized_language,
-            "ok": False,
-            "started": False,
-        }
-
-        if confidence not in {"medium", "high"}:
-            self._record_handoff(payload)
-            return _handoff_error(
-                "Navigation handoff rejected because confidence must be medium or high.",
-            )
-        if missing_fields:
-            self._record_handoff(payload)
-            return _handoff_error(
-                "Navigation handoff rejected because missing_fields is not empty.",
-            )
-        if not target.strip():
-            self._record_handoff(payload)
-            return _handoff_error("Navigation handoff rejected because target is missing.")
-        if not re.fullmatch(r"[0-9]{8}", date.strip()):
-            self._record_handoff(payload)
-            return _handoff_error(
-                "Navigation handoff rejected because date must be a YYYYMMDD dataset date.",
-            )
-
-        navigation_request = _navigation_handoff_message(
-            request=request,
-            target=target,
-            date=date.strip(),
-            scene_mode=normalized_scene_mode,
-            clips=normalized_clips,
-            reason=reason,
-            response_language=normalized_language,
-        )
-        try:
-            started = await self._runtime.start_navigation_agent_task(
-                web_session_id=self._web_session_id,
-                message=navigation_request,
-            )
-        except NavigationTaskEntryError as error:
-            result = _handoff_error(str(error))
-            payload["error_type"] = "invalid_navigation_handoff"
-            self._record_handoff(payload)
-            return result
-        except NavigationDataBusyError:
-            message = (
-                "该目标当前有正在运行的数据写入操作。"
-                if normalized_language == "Chinese"
-                else "This target currently has a running data-writing action."
-            )
-            payload["error_type"] = "navigation_data_busy"
-            self._record_handoff(payload)
-            return _handoff_error(message, error_type="navigation_data_busy")
-        except Exception:
-            correlation_id = uuid4().hex
-            _logger.exception(
-                "Navigation handoff start failed; correlation_id=%s",
-                correlation_id,
-            )
-            message = (
-                f"导航数据任务启动失败。关联 ID: {correlation_id}"
-                if normalized_language == "Chinese"
-                else f"Navigation data task failed to start. Correlation ID: {correlation_id}"
-            )
-            payload["error_type"] = "navigation_start_failed"
-            payload["correlation_id"] = correlation_id
-            self._record_handoff(payload)
-            return _handoff_error(message, error_type="navigation_start_failed")
-
-        result_payload = {
-            "ok": True,
-            "started": True,
-            "task_id": started.task_id,
-            "message": (
-                "导航数据任务已启动。"
-                if normalized_language == "Chinese"
-                else "Navigation data task started."
-            ),
-        }
-        payload.update(
-            {
-                "ok": True,
-                "started": True,
-                "task_id": started.task_id,
-            }
-        )
-        self._record_handoff(payload)
-        return _handoff_chunk(
-            result_payload,
-            state=ToolResultState.SUCCESS,
-        )
-
-    def _record_handoff(self, payload: dict[str, Any]) -> None:
-        record = getattr(self._runtime, "record_navigation_handoff", None)
-        if callable(record):
-            record(payload)
-
-
 def build_extra_agent_tools_factory(
     config: AgentScopeRuntimeConfig,
     *,
@@ -4939,19 +5012,11 @@ def build_extra_agent_tools_factory(
                 _session_id,
                 agent_id=config.main_router_agent_id,
             )
-            is_contract_v1 = getattr(runtime, "_is_contract_v1", None)
-            if callable(is_contract_v1) and is_contract_v1(web_session_id):
-                return router_v1_tools(
-                    runtime=runtime,
-                    web_session_id=web_session_id,
-                    router_session_id=_session_id,
-                )
-            return [
-                NavigationHandoffTool(
-                    runtime=runtime,
-                    web_session_id=web_session_id,
-                )
-            ]
+            return router_v1_tools(
+                runtime=runtime,
+                web_session_id=web_session_id,
+                router_session_id=_session_id,
+            )
         return []
 
     return extra_agent_tools
@@ -4985,16 +5050,13 @@ def build_extra_agent_middlewares_factory(
             )
         )
         if agent_id == config.main_router_agent_id:
-            is_contract_v1 = getattr(runtime, "_is_contract_v1", None)
-            if callable(is_contract_v1) and is_contract_v1(web_session_id):
-                return [
-                    RouterContractV1Middleware(
-                        runtime=runtime,
-                        web_session_id=web_session_id,
-                        router_session_id=session_id,
-                    )
-                ]
-            return []
+            return [
+                RouterContractV1Middleware(
+                    runtime=runtime,
+                    web_session_id=web_session_id,
+                    router_session_id=session_id,
+                )
+            ]
         if agent_id != config.navigation_agent_id:
             return []
         return [

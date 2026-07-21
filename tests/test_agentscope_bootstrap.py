@@ -5,10 +5,10 @@ import pytest
 from vla_data_juicer_agents.runtime.agentscope_bootstrap import bootstrap_agentscope_records
 from vla_data_juicer_agents.runtime.agentscope_config import AgentScopeRuntimeConfig
 from vla_data_juicer_agents.runtime.agentscope_prompts import (
-    main_router_prompt,
+    main_router_v1_prompt,
     navigation_agent_prompt,
 )
-from vla_data_juicer_agents.runtime.agentscope_runtime import NavigationHandoffTool
+from vla_data_juicer_agents.runtime.single_agent import StartNavigationDataTaskV1Tool
 
 
 class FakeStorage:
@@ -40,30 +40,26 @@ def _config(**overrides) -> AgentScopeRuntimeConfig:
     return AgentScopeRuntimeConfig(**values)
 
 
-def test_main_router_prompt_is_triage_only_and_handles_handoff_truthfully():
-    prompt = main_router_prompt()
+def test_main_router_prompt_is_v1_triage_and_handles_delegation_truthfully():
+    prompt = main_router_v1_prompt()
 
     assert prompt.startswith("You are DataPilot")
-    assert "我是 DataPilot，一个 VLA 数据处理助手" in prompt
     assert "Do not reveal internal agent names" in prompt
-    assert "Ordinary conversation" in prompt
-    assert "Capability questions" in prompt
-    assert "concrete navigation-processing request" in prompt
-    assert "date, path, or dataset target" in prompt
+    assert "ordinary conversation" in prompt
+    assert "capability questions" in prompt
     assert "start_navigation_data_task" in prompt
-    for preserved in ["request", "target", "date", "clips", "scene_mode", "response_language"]:
+    for preserved in ["dataset_date", "selection", "clips"]:
         assert preserved in prompt
-    for required_handoff_field in NavigationHandoffTool.input_schema["required"]:
+    for required_handoff_field in StartNavigationDataTaskV1Tool.input_schema["required"]:
         assert required_handoff_field in prompt
-    assert "all required fields exactly once" in prompt
-    assert "The only optional fields are clips and scene_mode" in prompt
-    assert "use clips, never segments" in prompt
-    assert "set missing_fields to []" in prompt
-    assert "set confidence to medium or high" in prompt
-    assert "always include a concise reason" in prompt
-    assert "`ok: true` and `started: true`" in prompt
-    assert "`ok: false`" in prompt
-    assert "never claim" in prompt.lower()
+    assert "all_clips" in prompt
+    assert "selected_clips" in prompt
+    assert "No clip list means all clips" in prompt
+    assert "Never ask for or accept an internal segment or sequence" in prompt
+    assert "Scene mode is optional" in prompt
+    assert "continue_navigation_data_task has no model-authored arguments" in prompt
+    assert "control_navigation_data_task accepts only `action`" in prompt
+    assert "End immediately after the tool result" in prompt
     assert "shell" in prompt.lower()
     assert "You are MainRouterAgent" not in prompt
     assert "route to NavigationDataAgent" not in prompt
@@ -85,34 +81,38 @@ def test_main_router_prompt_is_triage_only_and_handles_handoff_truthfully():
         assert artifact_or_stage_rule not in prompt
 
     assert "mock" not in prompt.lower()
-    assert "Activity: a concise user-facing statement" in prompt
-    assert "without a preceding Activity violates this output contract" in prompt
+    assert "routing actions do not produce Activity lines" in prompt
     assert "Do not output Thought, Observation, Analysis, Action" in prompt
     assert "private chain-of-thought" in prompt
-    assert "tool or function names" in prompt
-    assert "`Answer:` is a presentation-channel marker" in prompt
-    assert "does not mean that the overall task or conversation is complete" in prompt
-    assert "ordinary conversation, capability answers, clarification questions" in prompt
-    assert "Whenever this reply yields control back to the user" in prompt
-    assert "even if a later turn may call tools" in prompt
-    assert "ask one short clarifying question as an `Answer:` message" in prompt
+    assert "tool names" in prompt
+    assert "persistent user-visible Router message after an `Answer:` line" in prompt
+    assert "ask exactly one short clarification question" in prompt
 
 
-def test_all_agent_prompts_define_answer_as_the_persistent_chat_channel():
-    for prompt in (main_router_prompt(), navigation_agent_prompt()):
-        assert "Activity lines are transient progress metadata" in prompt
-        assert "every persistent assistant chat message" in prompt
-        assert "requests for missing information" in prompt
-        assert "partial or stage results, and final results" in prompt
-        assert "put a question to the user after `Answer:`" in prompt
-        assert "Never call a tool after beginning `Answer:` in the same reply" in prompt
+def test_agent_prompts_define_answer_as_the_persistent_chat_channel():
+    router_prompt = main_router_v1_prompt()
+    navigation_prompt = navigation_agent_prompt()
+    assert "persistent user-visible Router message after an `Answer:` line" in router_prompt
+    assert "never call a tool after beginning it" in router_prompt
+    assert "Activity lines are transient progress metadata" in navigation_prompt
+    assert "every persistent assistant chat message" in navigation_prompt
+    assert "Never call a tool after beginning `Answer:` in the same reply" in navigation_prompt
 
 
-def test_router_handoff_schema_omits_dry_run():
-    schema = NavigationHandoffTool.input_schema
+def test_router_start_schema_omits_dry_run_and_model_restatements():
+    schema = StartNavigationDataTaskV1Tool.input_schema
 
     assert "dry_run" not in schema["properties"]
     assert "dry_run" not in schema["required"]
+    for removed in [
+        "request",
+        "target",
+        "reason",
+        "missing_fields",
+        "confidence",
+        "response_language",
+    ]:
+        assert removed not in schema["properties"]
     assert _config().navigation_dry_run is False
 
 

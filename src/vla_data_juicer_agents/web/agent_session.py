@@ -200,6 +200,7 @@ class AgentScopeEventBridge:
                             agentscope_session_id=agentscope_session_id,
                             entry_id=batch.entry_id,
                             events=projected_events,
+                            private_events=batch.events,
                             raw_event_type=batch.raw_event_type,
                             reply_id=getattr(batch, "reply_id", None),
                         )
@@ -317,19 +318,29 @@ class AgentScopeWebSessionManager:
         self,
         first_message: str,
         entrypoint: str = "chat",
+        request_context: dict[str, Any] | None = None,
     ) -> SessionRecord:
-        config = getattr(self._runtime, "config", None)
-        resolver = getattr(config, "contract_version_for_entrypoint", None)
-        contract_version = int(resolver(entrypoint)) if callable(resolver) else 0
-        return self._store.create_session(
+        del entrypoint
+        session = self._store.create_session(
             title=generate_session_title(first_message),
-            contract_version=contract_version,
+            contract_version=1,
         )
+        if request_context is not None:
+            save_context = getattr(self._store, "save_pending_request_context", None)
+            if not callable(save_context):
+                self._store.delete_session(session.id)
+                raise RuntimeError("turn request context store is unavailable")
+            save_context(session.id, request_context)
+        return session
 
     def get_session_detail(self, session_id: str):
         detail = self._store.get_session(session_id)
-        if detail is None or detail.contract_version == 0:
+        if detail is None:
             return detail
+        if detail.contract_version != 1:
+            raise RuntimeError(
+                "legacy sessions are unsupported; reset the sessions database"
+            )
         detail.tasks = self._runtime.session_task_snapshots(session_id)
         detail.pending_interaction = self._runtime.pending_interaction_snapshot(session_id)
         return detail
@@ -384,26 +395,11 @@ class AgentScopeWebSessionManager:
         detail = self._store.get_session(session_id)
         if detail is None:
             raise KeyError(session_id)
-        if detail.contract_version == 1:
-            raise RuntimeError(
-                "contract v1 decisions must use the structured interaction endpoint"
-            )
-
-        submit_decision = getattr(self._runtime, "submit_human_decision", None)
-        if submit_decision is None:
-            return False
-        resumed = self._store.resume_active_turn(session_id)
-        try:
-            accepted = bool(await submit_decision(web_session_id=session_id, decision=decision))
-        except Exception:
-            self._store.restore_waiting_turn(session_id)
-            raise
-        if not accepted:
-            self._store.restore_waiting_turn(session_id)
-        if accepted:
-            for event in resumed:
-                await self._publish_record(session_id, event)
-        return accepted
+        del decision
+        raise RuntimeError(
+            "the legacy human-decision endpoint is unavailable; "
+            "use the structured interaction endpoint"
+        )
 
     async def submit_interaction_response(
         self,
@@ -580,11 +576,11 @@ class AgentScopeWebSessionManager:
     ) -> dict[str, Any]:
         if self._store.get_session(session_id) is None:
             raise KeyError(session_id)
-        recover = getattr(self._runtime, "recover_human_decision_handoff", None)
-        if recover is None:
-            raise RuntimeError("Human decision recovery is not supported")
-        result = await recover(web_session_id=session_id, recovery=recovery)
-        return dict(result)
+        del recovery
+        raise RuntimeError(
+            "the legacy human-decision recovery endpoint is unavailable; "
+            "use the structured interaction endpoint"
+        )
 
     async def forward_events_until_idle(self, session_id: str) -> None:
         if self.event_bridge is not None:
@@ -648,7 +644,7 @@ def _final_event_text(event: dict[str, Any]) -> str | None:
 def _public_event_record(store: WebSessionStore, session_id: str, record: Any) -> dict[str, Any]:
     event = record.model_dump(mode="json")
     if store.get_session_contract_version(session_id) != 1:
-        return event
+        raise RuntimeError("public event projection requires a contract v1 session")
     event["contract_version"] = 1
     event.pop("source", None)
     event.pop("run_id", None)

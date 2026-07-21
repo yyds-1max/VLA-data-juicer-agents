@@ -28,7 +28,6 @@ def _config(tmp_path: Path) -> AgentScopeRuntimeConfig:
         default_model="test-model",
         router_model="router-model",
         navigation_model="navigation-model",
-        datapilot_single_agent_mode="new_sessions",
     )
 
 

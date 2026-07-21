@@ -1,0 +1,31 @@
+schema_version: 2
+id: router_active_unrelated_direct
+suite: datapilot-v1
+entrypoint: router
+tags: [v1, router, active-task, unrelated-question, direct-answer, no-tool]
+runtime_setup:
+  focused_task:
+    task_ref: DP-EVAL-ACTIVE-QA
+    status: active
+    dataset_date: "20270605"
+    selection:
+      kind: all_clips
+conversation:
+  - role: user
+    content: 顺便用一句话解释什么是机器学习，不要调整当前任务。
+limits:
+  max_model_calls: 1
+  max_tool_calls: 0
+  timeout_seconds: 180
+expectations:
+  tools:
+    allowed_calls: []
+    required_counts: {}
+    handoff_count: 0
+  response:
+    language: Chinese
+    required_any_groups:
+      - [机器学习]
+      - [数据, 模型]
+    forbidden_terms: [MainRouterAgent, NavigationDataAgent, start_navigation_data_task, continue_navigation_data_task, control_navigation_data_task, task_id, run_id, call_id, system prompt, 系统提示词]
+    max_chars: 320

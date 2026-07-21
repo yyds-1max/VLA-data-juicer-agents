@@ -28,8 +28,6 @@ def test_from_env_reads_required_values_and_defaults(monkeypatch, tmp_path):
     assert config.navigation_agent_id == "navigation-data-agent"
     assert config.agentscope_mount_path == "/api/agentscope"
     assert config.tool_background_threshold_secs == 10.0
-    assert config.datapilot_single_agent_mode == "new_sessions"
-    assert config.contract_version_for_entrypoint("chat") == 1
 
 
 def test_from_env_uses_separate_router_and_navigation_models(monkeypatch, tmp_path):
