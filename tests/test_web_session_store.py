@@ -877,7 +877,6 @@ def test_v1_navigation_await_user_final_ignores_parent_router_blockers(
         raw_event_type="REPLY_END",
         reply_id="navigation-reply",
         events=[
-            {"type": "answer_reset", "payload": {}},
             {
                 "type": "task_state_updated",
                 "payload": {
@@ -900,12 +899,11 @@ def test_v1_navigation_await_user_final_ignores_parent_router_blockers(
     final_authority = store.get_response_authority(turn.id)
     assert detail is not None
     assert [record.type for record in records] == [
-        "answer_reset",
         "task_state_updated",
         "final",
         "turn_state",
     ]
-    assert [record.type for record in records].count("answer_reset") == 1
+    assert all(record.type != "answer_reset" for record in records)
     assert all(record.type != "progress_update" for record in records)
     assert detail.messages[-1].role == "assistant"
     assert detail.messages[-1].content == prompt

@@ -2408,3 +2408,28 @@ test("Composer trims messages, clears after submit, and ignores empty input", ()
   expect(onSubmit).toHaveBeenCalledWith("清洗 VLA 数据");
   expect(input).toHaveValue("");
 });
+
+test("Composer submits with Enter and keeps Shift+Enter for multiline input", () => {
+  const onSubmit = vi.fn();
+  render(<Composer placeholder="我们要做什么？" onSubmit={onSubmit} />);
+
+  const input = screen.getByPlaceholderText("我们要做什么？");
+  fireEvent.change(input, { target: { value: "第一行\n第二行" } });
+  fireEvent.keyDown(input, { key: "Enter", shiftKey: true });
+  expect(onSubmit).not.toHaveBeenCalled();
+
+  fireEvent.keyDown(input, { key: "Enter" });
+  expect(onSubmit).toHaveBeenCalledWith("第一行\n第二行");
+  expect(input).toHaveValue("");
+});
+
+test("Composer grows with content but caps its visible height", () => {
+  render(<Composer placeholder="我们要做什么？" onSubmit={vi.fn()} />);
+
+  const input = screen.getByPlaceholderText("我们要做什么？") as HTMLTextAreaElement;
+  Object.defineProperty(input, "scrollHeight", { configurable: true, value: 240 });
+  fireEvent.change(input, { target: { value: "多行\n内容\n继续\n增长\n直到上限" } });
+
+  expect(input.style.height).toBe("132px");
+  expect(input.style.overflowY).toBe("auto");
+});

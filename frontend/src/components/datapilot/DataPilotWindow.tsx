@@ -58,7 +58,7 @@ export function DataPilotWindow() {
   }));
   const socketRef = useRef<{ sessionId: string; socket: WebSocket } | null>(null);
   const reconnectTimerRef = useRef<number | null>(null);
-  const composerInputRef = useRef<HTMLInputElement | null>(null);
+  const composerInputRef = useRef<HTMLTextAreaElement | null>(null);
   const previousInteractionRef = useRef<PendingInteraction | null>(null);
   const dragRef = useRef<DragState | null>(null);
   const windowOffset = useMemo(() => visibleWindowOffset(floatingOffset, viewport), [floatingOffset, viewport]);
@@ -600,7 +600,7 @@ export function DataPilotWindow() {
             />
           ) : null}
           {pendingInteraction?.blocking ? null : (
-            <div className={`${tasks.length > 0 ? "" : "border-t border-console-line"} p-3 sm:p-4`}>
+            <div className="relative z-30 shrink-0 bg-transparent px-3 pb-3 pt-2 sm:px-4 sm:pb-4">
               <Composer
                 ref={composerInputRef}
                 placeholder="继续描述任务…"

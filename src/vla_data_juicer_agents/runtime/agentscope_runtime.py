@@ -1303,6 +1303,8 @@ class AgentScopeRuntime:
                 options = json.loads(options)
             except json.JSONDecodeError:
                 options = []
+        if isinstance(options, tuple):
+            options = list(options)
         return {
             "interaction_id": _record_value(interaction, "interaction_id"),
             "task_ref": _record_value(interaction, "task_ref"),
@@ -4045,7 +4047,11 @@ class AgentScopeRuntime:
                         entry_id,
                     )
                     continue
-                disposition = AwaitUserDispositionV1.model_validate(payload)
+                disposition_payload = dict(payload)
+                public_prefix = sanitize_final_text(
+                    disposition_payload.pop("_public_prefix", "")
+                )
+                disposition = AwaitUserDispositionV1.model_validate(disposition_payload)
                 task, binding, public_prompt = (
                     self._apply_navigation_await_user_disposition_v1(
                         web_session_id=web_session_id,
@@ -4070,7 +4076,10 @@ class AgentScopeRuntime:
                     FinalSignalV1(
                         **common,
                         kind="final",
-                        text=public_prompt,
+                        text=_compose_await_user_final_text(
+                            public_prefix,
+                            public_prompt,
+                        ),
                         task_status=NavigationTaskStatus.WAITING_USER.value,
                     )
                 )
@@ -5421,6 +5430,20 @@ def _bounded_mapping(value: dict[str, Any], max_chars: int) -> dict[str, Any]:
             "clips": list(selection.get("clips") or [])[:3],
         }
     return bounded
+
+
+def _compose_await_user_final_text(public_prefix: str, public_prompt: str) -> str:
+    """Fold a safe streamed summary and the wait question into one final."""
+    prefix = sanitize_final_text(public_prefix)
+    prompt = sanitize_final_text(public_prompt)
+    if not prefix:
+        return prompt
+    if not prompt:
+        return prefix
+    compact_prefix = " ".join(prefix.split())
+    compact_prompt = " ".join(prompt.split())
+    combined = prefix if compact_prompt in compact_prefix else f"{prefix}\n\n{prompt}"
+    return combined[:40_000].rstrip()
 
 
 def _is_chinese(language: str) -> bool:

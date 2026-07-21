@@ -1369,7 +1369,7 @@ def test_tool_call_after_await_user_invalidates_terminal_disposition() -> None:
     assert not any(event["type"] == "turn_disposition" for event in events)
 
 
-def test_await_user_supersedes_accidentally_streamed_answer_in_same_reply() -> None:
+def test_await_user_preserves_safe_stream_as_part_of_the_same_final() -> None:
     scope, events = _scope_and_events()
     adapter = AgentScopeEventAdapter(
         scope,
@@ -1382,7 +1382,7 @@ def test_await_user_supersedes_accidentally_streamed_answer_in_same_reply() -> N
     adapter.accept(
         SimpleNamespace(
             type="TEXT_BLOCK_DELTA",
-            delta="Answer:\n这条问题不应成为另一个 final。\n",
+            delta="Answer:\n已核对已有产物，拆解同步已经完成。\n",
         )
     )
     adapter.accept(
@@ -1401,7 +1401,40 @@ def test_await_user_supersedes_accidentally_streamed_answer_in_same_reply() -> N
 
     assert [event["type"] for event in events] == [
         "answer_delta",
-        "answer_reset",
         "turn_disposition",
     ]
     assert not any(event["type"] == "reply_summary" for event in events)
+    assert events[-1]["payload"]["_public_prefix"] == (
+        "已核对已有产物，拆解同步已经完成。"
+    )
+
+
+def test_malformed_await_user_retracts_a_preceding_safe_stream() -> None:
+    scope, events = _scope_and_events()
+    adapter = AgentScopeEventAdapter(
+        scope,
+        emit_reply_summary_events=True,
+        emit_answer_delta_events=True,
+        emit_progress_events=True,
+    )
+
+    adapter.accept(SimpleNamespace(type="REPLY_START", reply_id="reply-bad-after-answer"))
+    adapter.accept(
+        SimpleNamespace(
+            type="TEXT_BLOCK_DELTA",
+            delta="Answer:\n已完成检查，等待你的选择。\n",
+        )
+    )
+    adapter.accept(
+        SimpleNamespace(
+            type="TEXT_BLOCK_DELTA",
+            delta='AwaitUser: {"kind":"await_user","public_prompt":"请选择。"}',
+        )
+    )
+    adapter.accept(SimpleNamespace(type="REPLY_END", reply_id="reply-bad-after-answer"))
+
+    assert [event["type"] for event in events] == [
+        "answer_delta",
+        "answer_reset",
+        "invalid_turn_disposition",
+    ]

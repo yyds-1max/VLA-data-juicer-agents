@@ -812,10 +812,31 @@ class AgentScopeEventAdapter:
         if invalid_disposition:
             disposition = {"_invalid": True}
         if disposition is not None:
-            # A terminal control outcome supersedes any accidentally streamed
-            # Answer text from the same model reply. Reset it before publishing
-            # the one authoritative wait prompt through the runtime.
-            self._retract_answer_stream()
+            if disposition.get("_invalid"):
+                # A malformed control marker is not a trustworthy boundary.
+                # Retract any preceding draft so ambiguous protocol text can
+                # never become the durable user-facing response.
+                self._retract_answer_stream()
+            else:
+                if rendered:
+                    if self._emit_answer_delta_events:
+                        self._buffer_answer_delta(rendered)
+                    elif self._emit_text_events:
+                        self._scope.emit("assistant_delta", delta=rendered)
+                    self._reply_text.append(rendered)
+                self._flush_answer_delta_buffer()
+                summary_source = (
+                    "".join(self._safe_answer_parts)
+                    or self._progress_filter.summary_text()
+                    or "".join(self._reply_text)
+                )
+                public_prefix = sanitize_public_reply(summary_source)
+                if public_prefix:
+                    # This is private adapter metadata, not model-authored
+                    # control data. Runtime folds it into the same unique final
+                    # as public_prompt so a safe streamed status report does not
+                    # disappear when the task yields for user input.
+                    disposition["_public_prefix"] = public_prefix
             self._answer_stream_buffer = ""
             self._reply_text.clear()
             self._safe_answer_parts.clear()

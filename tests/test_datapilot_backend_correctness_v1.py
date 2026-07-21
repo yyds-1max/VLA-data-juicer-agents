@@ -367,6 +367,10 @@ def test_navigation_await_user_disposition_durably_yields_active_task(
                     "requested_fields": ["scene_mode"],
                     "response_channel": "router_text",
                     "public_prompt": "继续处理前，请告诉我这是室内还是室外数据。",
+                    "_public_prefix": (
+                        "已核对已有产物，拆解同步已经完成。\n"
+                        "继续处理前，请告诉我这是室内还是室外数据。"
+                    ),
                 },
             },
         ),
@@ -388,7 +392,10 @@ def test_navigation_await_user_disposition_durably_yields_active_task(
     ]
     assert projected[0]["payload"]["status"] == "waiting_user"
     assert projected[1]["payload"] == {
-        "text": "继续处理前，请告诉我这是室内还是室外数据。",
+        "text": (
+            "已核对已有产物，拆解同步已经完成。\n"
+            "继续处理前，请告诉我这是室内还是室外数据。"
+        ),
         "task_status": "waiting_user",
         "task_ref": binding.task_ref,
     }

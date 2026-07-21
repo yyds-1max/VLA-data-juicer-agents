@@ -37,6 +37,18 @@ describe("InteractionPanel", () => {
     expect(screen.queryByRole("button", { name: /关闭/ })).not.toBeInTheDocument();
   });
 
+  test("renders the explanation and choices as separate floating surfaces", () => {
+    const { container } = render(
+      <InteractionPanel interaction={interaction()} onSubmit={vi.fn()} />,
+    );
+
+    const content = container.querySelector('[data-interaction-surface="content"]');
+    const options = container.querySelector('[data-interaction-surface="options"]');
+    expect(content).toBeVisible();
+    expect(options).toBeVisible();
+    expect(content?.contains(options)).toBe(false);
+  });
+
   test("collects multi-select options before explicit submission", () => {
     const onSubmit = vi.fn();
     render(

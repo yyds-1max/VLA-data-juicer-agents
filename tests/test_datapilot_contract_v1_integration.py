@@ -263,6 +263,12 @@ def test_interaction_api_is_idempotent_and_resumes_navigation_without_router(tmp
     )
     with TestClient(app) as client:
         session_id, interaction_id = _create_interaction_fixture(client, app, runtime)
+        snapshot = client.get(f"/api/sessions/{session_id}")
+        assert snapshot.status_code == 200
+        assert snapshot.json()["session"]["pending_interaction"]["options"] == [
+            {"option_id": "confirm", "label": "确认"},
+            {"option_id": "reject", "label": "拒绝"},
+        ]
         payload = {
             "option_id": "confirm",
             "interaction_revision": 1,

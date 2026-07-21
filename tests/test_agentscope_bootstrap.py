@@ -100,7 +100,9 @@ def test_agent_prompts_define_answer_as_the_persistent_chat_channel():
     assert "every persistent assistant chat message" in navigation_prompt
     assert "Never call a tool after beginning `Answer:` in the same reply" in navigation_prompt
     assert "AwaitUser:" in navigation_prompt
-    assert "Do not emit `Answer:` and `AwaitUser:` in the same reply" in navigation_prompt
+    assert "one concise, user-facing status summary" in navigation_prompt
+    assert "one streamed, persistent assistant message" in navigation_prompt
+    assert "it never creates a second final" in navigation_prompt
     assert "AwaitUser:" not in router_prompt
 
 
