@@ -4,6 +4,8 @@ import asyncio
 from types import SimpleNamespace
 from typing import Any
 
+from jsonschema import Draft202012Validator
+
 from vla_data_juicer_agents.runtime.agentscope_prompts import main_router_v1_prompt
 from vla_data_juicer_agents.runtime.single_agent import (
     ContinueNavigationDataTaskV1Tool,
@@ -82,14 +84,55 @@ def test_router_v1_start_schema_uses_one_canonical_scope_contract() -> None:
     ]
     assert schema["properties"]["dataset_date"]["pattern"] == "^[0-9]{8}$"
     assert schema["properties"]["scene_mode"]["enum"] == ["indoor", "outdoor"]
-    selections = schema["properties"]["selection"]["oneOf"]
-    assert selections[0]["properties"]["kind"]["const"] == "all_clips"
-    assert selections[1]["properties"]["kind"]["const"] == "selected_clips"
-    assert selections[1]["properties"]["clips"]["minItems"] == 1
-    assert selections[1]["properties"]["clips"]["maxItems"] == 200
-    assert schema["properties"]["selection"]["discriminator"] == {
-        "propertyName": "kind"
+    selection = schema["properties"]["selection"]
+    assert selection["type"] == "object"
+    assert "oneOf" not in selection
+    assert "discriminator" not in selection
+    assert selection["properties"]["kind"]["enum"] == [
+        "all_clips",
+        "selected_clips",
+    ]
+    assert selection["properties"]["clips"]["minItems"] == 1
+    assert selection["properties"]["clips"]["maxItems"] == 200
+    assert selection["required"] == ["kind"]
+
+
+def test_router_v1_start_schema_accepts_native_selection_objects_not_json_strings() -> None:
+    validator = Draft202012Validator(StartNavigationDataTaskV1Tool.input_schema)
+    common = {
+        "scope_source": "interpreted_user_text",
+        "dataset_date": "20270605",
     }
+
+    assert list(
+        validator.iter_errors(
+            {
+                **common,
+                "selection": {
+                    "kind": "selected_clips",
+                    "clips": ["20260605_152856"],
+                },
+            },
+        ),
+    ) == []
+    assert list(
+        validator.iter_errors(
+            {**common, "selection": {"kind": "all_clips"}},
+        ),
+    ) == []
+    string_errors = list(
+        validator.iter_errors(
+            {
+                **common,
+                "selection": (
+                    '{"kind":"selected_clips",'
+                    '"clips":["20260605_152856"]}'
+                ),
+            },
+        ),
+    )
+    assert len(string_errors) == 1
+    assert "is not of type 'object'" in string_errors[0].message
 
 
 def test_router_prompt_preserves_scope_across_one_unresolved_clarification() -> None:
@@ -109,6 +152,10 @@ def test_router_prompt_treats_cross_date_clip_prefix_as_opaque() -> None:
     assert "Never reject, correct, or clarify a scope solely because" in prompt
     assert "Do not derive either value from the other" in prompt
     assert "Do not use naming conventions to pre-validate clip existence" in prompt
+    assert "native JSON object" in prompt
+    assert "never change `dataset_date`, switch `selected_clips` to `all_clips`" in prompt
+    assert "A serialization failure is not" in prompt
+    assert "permission to reinterpret the request" in prompt
 
 
 def test_router_v1_continue_and_control_schemas_do_not_expose_runtime_identity() -> None:

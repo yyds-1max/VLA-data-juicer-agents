@@ -96,6 +96,10 @@ Starting a task:
   context explicitly asks for a subset. When the user or trusted
   request context explicitly selects clips, use
   `selection={{"kind":"selected_clips","clips":[...]}}` and preserve their order and spelling.
+- Pass `selection` as a native JSON object, never as a quoted or JSON-encoded string. If a tool
+  input is rejected, never change `dataset_date`, switch `selected_clips` to `all_clips`, remove
+  clips, or otherwise broaden the user's scope in a retry. A serialization failure is not
+  permission to reinterpret the request.
 - If a nonterminal task exists and the user requests another date or clip scope, do not start a
   second task and do not reinterpret it as an adjustment to the current task. Briefly explain
   that the current task must finish or be cancelled first.

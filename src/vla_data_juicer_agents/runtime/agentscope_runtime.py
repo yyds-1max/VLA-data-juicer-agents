@@ -365,6 +365,10 @@ class AgentScopeRuntime:
             raise NavigationTaskEntryError("the current turn has no trusted request context")
         selection_kind = str(selection.get("kind") or "")
         if selection_kind == "all_clips":
+            if "clips" in selection:
+                raise NavigationTaskEntryError(
+                    "all_clips selection must not include a clips field"
+                )
             clips: list[str] = []
         elif selection_kind == "selected_clips":
             raw_clips = selection.get("clips")

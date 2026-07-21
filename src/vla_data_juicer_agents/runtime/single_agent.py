@@ -13,42 +13,33 @@ from vla_data_juicer_agents.runtime.agentscope_prompts import main_router_v1_pro
 
 
 _SCOPE_SELECTION_SCHEMA = {
-    "oneOf": [
-        {
-            "type": "object",
-            "properties": {
-                "kind": {"type": "string", "const": "all_clips"},
-            },
-            "required": ["kind"],
-            "additionalProperties": False,
+    "type": "object",
+    "properties": {
+        "kind": {
+            "type": "string",
+            "enum": ["all_clips", "selected_clips"],
         },
-        {
-            "type": "object",
-            "properties": {
-                "kind": {"type": "string", "const": "selected_clips"},
-                "clips": {
-                    "type": "array",
-                    "items": {
-                        "type": "string",
-                        "minLength": 1,
-                        "maxLength": 200,
-                        "pattern": "^(?!\\.{1,2}$)[^/\\\\\\r\\n]+$",
-                    },
-                    "minItems": 1,
-                    "maxItems": 200,
-                    "uniqueItems": True,
-                },
+        "clips": {
+            "type": "array",
+            "items": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 200,
+                "pattern": "^(?!\\.{1,2}$)[^/\\\\\\r\\n]+$",
             },
-            "required": ["kind", "clips"],
-            "additionalProperties": False,
+            "minItems": 1,
+            "maxItems": 200,
+            "uniqueItems": True,
         },
-    ],
-    "discriminator": {"propertyName": "kind"},
+    },
+    "required": ["kind"],
+    "additionalProperties": False,
     "description": (
-        "The user-selectable task scope. Use all_clips when no clips were "
-        "specified. Treat every clip string as an opaque identifier: a date-like "
-        "prefix does not have to match dataset_date. Internal segments and "
-        "sequences are never selectable."
+        "A native JSON object, never a JSON-encoded string. Use kind=all_clips "
+        "without clips when no clips were specified. Use kind=selected_clips "
+        "with a non-empty clips array for an explicit subset. Treat every clip "
+        "string as an opaque identifier: a date-like prefix does not have to "
+        "match dataset_date. Internal segments and sequences are never selectable."
     ),
 }
 

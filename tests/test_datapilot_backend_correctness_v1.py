@@ -649,6 +649,41 @@ async def test_plain_text_cross_date_clip_is_an_opaque_identifier(tmp_path: Path
 
 
 @pytest.mark.asyncio
+async def test_all_clips_cannot_smuggle_or_broaden_a_selected_clip_scope(
+    tmp_path: Path,
+) -> None:
+    store = WebSessionStore(tmp_path / "sessions.sqlite")
+    task_store = SqliteNavigationTaskStore(tmp_path / "navigation.sqlite")
+    session = store.create_session("禁止扩大范围")
+    store.begin_user_turn(
+        session.id,
+        "只处理 20270605 下的 20260605_152856。",
+    )
+    runtime = _runtime(tmp_path, store, task_store)
+    _install_start_stubs(runtime, task_store)
+
+    with pytest.raises(
+        NavigationTaskEntryError,
+        match="all_clips selection must not include a clips field",
+    ):
+        await runtime.start_navigation_agent_task_v1(
+            web_session_id=session.id,
+            router_session_id="router-broadened-scope",
+            scope_source="interpreted_user_text",
+            dataset_date="20270605",
+            selection={
+                "kind": "all_clips",
+                "clips": ["20260605_152856"],
+            },
+            scene_mode=None,
+        )
+
+    assert store.list_task_bindings(session.id) == []
+    with sqlite3.connect(task_store.db_path) as connection:
+        assert connection.execute("SELECT COUNT(*) FROM navigation_tasks").fetchone()[0] == 0
+
+
+@pytest.mark.asyncio
 async def test_continue_rejects_router_snapshot_that_became_stale_without_writes(
     tmp_path: Path,
 ) -> None:
