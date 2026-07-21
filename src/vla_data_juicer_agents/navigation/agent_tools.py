@@ -54,6 +54,7 @@ _FIXED_TOOL_NAMES_BY_ACTIVITY = {
     "planning": _OBSERVATION_FIXED_TOOL_NAMES
     | {
         "record_navigation_user_guidance_tool",
+        "complete_navigation_task_tool",
         "submit_extract_sync_plan_tool",
         "submit_finish_processing_plan_tool",
     },
@@ -212,6 +213,7 @@ def build_navigation_tool_groups(
                 store=services.task_store,
                 observation_store=services.observation_store,
                 evidence_store=services.evidence_store,
+                plan_store=services.plan_store,
                 session_id=agentscope_session_id,
                 web_session_id=web_session_id,
                 settings=services.settings,

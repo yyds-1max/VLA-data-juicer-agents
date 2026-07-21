@@ -804,6 +804,102 @@ async def test_control_rejects_router_snapshot_that_became_stale_without_writes(
         ).fetchone()[0] == 1  # only the original navigation_start binding outbox
 
 
+@pytest.mark.asyncio
+async def test_stop_rejects_waiting_user_instead_of_accepting_a_noop(tmp_path: Path) -> None:
+    store = WebSessionStore(tmp_path / "sessions.sqlite")
+    task_store = SqliteNavigationTaskStore(tmp_path / "navigation.sqlite")
+    session = store.create_session("等待后处理选择")
+    binding = store.create_task_binding(
+        session.id,
+        task_id="task-waiting-stop",
+        task_ref="DP-WAITING-STOP",
+        navigation_session_id="navigation-waiting-stop",
+    ).binding
+    active = task_store.create_task_attempt(
+        task_id=binding.task_id,
+        request="处理导航数据",
+        target="navigation_data",
+        date="20260720",
+        segments=["clip-a"],
+        scene_mode=None,
+        dry_run=False,
+        web_session_id=session.id,
+        agentscope_session_id=binding.navigation_session_id,
+    ).task
+    waiting = _update_status(task_store, active, NavigationTaskStatus.WAITING_USER)
+    binding = store.update_task_binding(
+        binding.task_id,
+        expected_revision=binding.state_revision,
+        status="waiting_user",
+        latest_public_update="等待确认是否继续后处理。",
+    )
+    turn = store.begin_user_turn(session.id, "先这样，不用继续了。").turn
+    runtime = _runtime(tmp_path, store, task_store)
+    runtime.router_context_envelope(
+        session.id,
+        router_session_id="router-private-waiting-stop",
+    )
+
+    with pytest.raises(RuntimeError, match="no running operation to stop"):
+        await runtime.control_navigation_agent_task_v1(
+            web_session_id=session.id,
+            router_session_id="router-private-waiting-stop",
+            action="stop",
+        )
+
+    current = task_store.get_task(waiting.task_id)
+    current_binding = store.get_task_binding(binding.task_id)
+    authority = store.get_response_authority(turn.id)
+    assert current is not None and current.status == NavigationTaskStatus.WAITING_USER
+    assert current_binding is not None and current_binding.status == "waiting_user"
+    assert authority is not None and authority.producer == "router"
+    assert [message for message in store.get_session(session.id).messages if message.role == "assistant"] == []
+
+
+def test_specialist_completion_releases_open_binding(tmp_path: Path) -> None:
+    store = WebSessionStore(tmp_path / "sessions.sqlite")
+    task_store = SqliteNavigationTaskStore(tmp_path / "navigation.sqlite")
+    session = store.create_session("正常收尾")
+    binding = store.create_task_binding(
+        session.id,
+        task_id="task-normal-close",
+        task_ref="DP-NORMAL-CLOSE",
+        navigation_session_id="navigation-normal-close",
+    ).binding
+    active = task_store.create_task_attempt(
+        task_id=binding.task_id,
+        request="处理导航数据",
+        target="navigation_data",
+        date="20260720",
+        segments=["clip-a"],
+        scene_mode=None,
+        dry_run=False,
+        web_session_id=session.id,
+        agentscope_session_id=binding.navigation_session_id,
+    ).task
+    completed = task_store.update_task_for_session(
+        active.task_id,
+        web_session_id=session.id,
+        agentscope_session_id=binding.navigation_session_id,
+        expected_state_revision=active.state_revision,
+        status=NavigationTaskStatus.COMPLETED,
+    )
+    runtime = _runtime(tmp_path, store, task_store)
+
+    synced = runtime._sync_task_state_on_specialist_final_v1(
+        web_session_id=session.id,
+        task=completed,
+        binding=binding,
+    )
+
+    current_binding = store.get_task_binding(binding.task_id)
+    assert synced.status == NavigationTaskStatus.COMPLETED
+    assert current_binding is not None
+    assert current_binding.status == "completed"
+    assert current_binding.slot_state == "closed"
+    assert current_binding.latest_public_update == "已按你的选择完成当前任务。"
+
+
 def test_stale_router_error_returns_latest_safe_task_summary(tmp_path: Path) -> None:
     store = WebSessionStore(tmp_path / "sessions.sqlite")
     task_store = SqliteNavigationTaskStore(tmp_path / "navigation.sqlite")

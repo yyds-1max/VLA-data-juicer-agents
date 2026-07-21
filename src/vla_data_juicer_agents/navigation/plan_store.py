@@ -516,6 +516,23 @@ class SqliteNavigationPlanRepository:
             ).fetchone()
         return self._record_from_row(row) if row is not None else None
 
+    def get_latest_accepted_for_task(self, task_id: str) -> NavigationPlanRecord | None:
+        """Return the newest active/completed Plan for the task's accepted phase."""
+        with self._connect() as connection:
+            row = connection.execute(
+                """SELECT plans.*
+                   FROM navigation_tasks AS tasks
+                   JOIN navigation_plans AS plans
+                     ON plans.task_id = tasks.task_id
+                    AND plans.phase = tasks.accepted_plan_phase
+                   WHERE tasks.task_id = ?
+                     AND plans.status IN ('active', 'completed')
+                   ORDER BY plans.updated_at DESC, plans.rowid DESC
+                   LIMIT 1""",
+                (task_id,),
+            ).fetchone()
+        return self._record_from_row(row) if row is not None else None
+
     def read_execution_snapshot(
         self,
         *,

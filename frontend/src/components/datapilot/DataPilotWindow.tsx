@@ -581,8 +581,15 @@ export function DataPilotWindow() {
           <div className="sr-only" aria-live="polite" aria-atomic="true">
             {liveAnnouncement(pendingInteraction, tasks)}
           </div>
-          <MessageList messages={messages} turns={turns} run={run} />
-          <TaskStrip tasks={tasks} />
+          <div className="relative flex min-h-0 flex-1">
+            <MessageList
+              messages={messages}
+              turns={turns}
+              run={run}
+              hasTaskOverlay={tasks.length > 0}
+            />
+            <TaskStrip tasks={tasks} />
+          </div>
           {pendingInteraction ? (
             <InteractionPanel
               key={`${pendingInteraction.interaction_id}:${pendingInteraction.interaction_revision}`}

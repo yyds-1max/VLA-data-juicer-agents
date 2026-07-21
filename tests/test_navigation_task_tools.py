@@ -1,6 +1,7 @@
 import asyncio
 import json
 from pathlib import Path
+from types import SimpleNamespace
 
 from vla_data_juicer_agents.navigation.services import build_navigation_services
 from vla_data_juicer_agents.navigation.task_tools import build_navigation_task_tools
@@ -48,6 +49,7 @@ def _bound_tools(tmp_path: Path):
             store=services.task_store,
             observation_store=services.observation_store,
             evidence_store=services.evidence_store,
+            plan_store=services.plan_store,
             session_id="agent-session",
             web_session_id="web-session",
             bound_task=task,
@@ -63,6 +65,7 @@ def test_unbound_task_exposes_no_model_facing_lifecycle_tools(tmp_path: Path):
         store=services.task_store,
         observation_store=services.observation_store,
         evidence_store=services.evidence_store,
+        plan_store=services.plan_store,
         session_id="agent-session",
         web_session_id="web-session",
     )
@@ -75,7 +78,10 @@ def test_bound_task_tool_schema_contains_only_guidance_and_optional_scene_mode(
 ):
     _services, _task, tools = _bound_tools(tmp_path)
 
-    assert set(tools) == {"record_navigation_user_guidance_tool"}
+    assert set(tools) == {
+        "record_navigation_user_guidance_tool",
+        "complete_navigation_task_tool",
+    }
     schema = tools["record_navigation_user_guidance_tool"].input_schema
     assert set(schema["properties"]) == {"text", "scene_mode"}
     assert schema["required"] == ["text"]
@@ -84,6 +90,54 @@ def test_bound_task_tool_schema_contains_only_guidance_and_optional_scene_mode(
         "in",
         "out",
     }
+    assert tools["complete_navigation_task_tool"].input_schema == {
+        "type": "object",
+        "properties": {},
+        "required": [],
+        "additionalProperties": False,
+    }
+
+
+def test_completion_requires_a_verified_extract_sync_boundary(tmp_path: Path):
+    _services, _task, tools = _bound_tools(tmp_path)
+
+    result = _call(tools["complete_navigation_task_tool"])
+
+    assert result["ok"] is False
+    assert result["error_type"] == "navigation_task_not_ready_to_complete"
+
+
+def test_completion_closes_task_and_retains_extract_sync_products(
+    tmp_path: Path,
+    monkeypatch,
+):
+    services, task, tools = _bound_tools(tmp_path)
+    accepted = services.task_store.update_task_for_session(
+        task.task_id,
+        web_session_id="web-session",
+        agentscope_session_id="agent-session",
+        expected_state_revision=task.state_revision,
+        accepted_plan_phase="extract_sync",
+    )
+    monkeypatch.setattr(
+        services.plan_store,
+        "get_latest_accepted_for_task",
+        lambda _task_id: SimpleNamespace(status="completed"),
+    )
+
+    result = _call(tools["complete_navigation_task_tool"])
+
+    assert result == {
+        "ok": True,
+        "status": "completed",
+        "completed_stage": "extract_sync",
+        "retained_products": True,
+    }
+    stored = services.task_store.get_task(task.task_id)
+    assert stored is not None
+    assert stored.status.value == "completed"
+    assert stored.accepted_plan_phase == "extract_sync"
+    assert stored.state_revision == accepted.state_revision + 1
 
 
 def test_bound_task_tool_records_guidance_without_lifecycle_or_phase_selection(
@@ -120,6 +174,7 @@ def test_guidance_rejects_stale_session_without_mutation(tmp_path: Path):
             store=services.task_store,
             observation_store=services.observation_store,
             evidence_store=services.evidence_store,
+            plan_store=services.plan_store,
             session_id="stale-agent-session",
             web_session_id="web-session",
             bound_task=task,

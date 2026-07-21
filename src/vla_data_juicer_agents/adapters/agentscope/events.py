@@ -226,6 +226,7 @@ _TOOL_PHASES: dict[str, str] = {
     "read_observation_evidence_tool": "inspection",
     "describe_processing_action_tool": "inspection",
     "record_navigation_user_guidance_tool": "planning",
+    "complete_navigation_task_tool": "verification",
     "submit_extract_sync_plan_tool": "planning",
     "submit_finish_processing_plan_tool": "planning",
     "get_plan_execution_overview_tool": "silent_execution_state",

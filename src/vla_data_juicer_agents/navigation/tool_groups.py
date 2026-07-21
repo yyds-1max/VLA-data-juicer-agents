@@ -67,6 +67,7 @@ _FIXED_TOOL_GROUP_BY_NAME = {
     "get_navigation_task_context_tool": NAVIGATION_PLAN_AUTHORING,
     "describe_processing_action_tool": NAVIGATION_PLAN_AUTHORING,
     "record_navigation_user_guidance_tool": NAVIGATION_PLAN_AUTHORING,
+    "complete_navigation_task_tool": NAVIGATION_PLAN_AUTHORING,
     "submit_extract_sync_plan_tool": NAVIGATION_PLAN_AUTHORING,
     "submit_finish_processing_plan_tool": NAVIGATION_PLAN_AUTHORING,
     "get_plan_execution_overview_tool": NAVIGATION_EXECUTION_STATE,

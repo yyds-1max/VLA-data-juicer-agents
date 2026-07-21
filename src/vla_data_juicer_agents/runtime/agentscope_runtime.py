@@ -819,30 +819,10 @@ class AgentScopeRuntime:
                 NavigationTaskStatus.WAITING_USER,
                 NavigationTaskStatus.NEEDS_REPLAN,
             }:
-                await self._publish_v1_task_state(
-                    web_session_id=web_session_id,
-                    task_id=task_id,
-                    turn_id=active_turn_id,
+                raise RuntimeError(
+                    "the navigation task has no running operation to stop; "
+                    "answer its pending request through continuation or cancel the task"
                 )
-                await self._commit_system_controller_final(
-                    turn_id=active_turn_id,
-                    text=(
-                        "当前没有正在运行的处理，任务状态已保留。"
-                        if _is_chinese(response_language)
-                        else "No processing run is active; the task state has been preserved."
-                    ),
-                )
-                self._router_terminal_sessions.add(router_session_id)
-                return {
-                    "ok": True,
-                    "operation": action,
-                    "accepted": True,
-                    "task_id": task_id,
-                    "task_ref": task_ref,
-                    "status": task.status.value,
-                    "error": None,
-                    "latest_task": self._task_summary(binding, max_chars=1200),
-                }
             target_status = NavigationTaskStatus.PAUSING
             already_requested = task.status in {
                 NavigationTaskStatus.PAUSING,
@@ -4115,6 +4095,16 @@ class AgentScopeRuntime:
         if cancellation is not None and cancellation.has_background_operations:
             return task
         current_status = str(getattr(task.status, "value", task.status))
+        if current_status == NavigationTaskStatus.COMPLETED.value:
+            current_binding = self.web_session_store.get_task_binding(task.task_id)
+            if current_binding is not None and current_binding.slot_state == "open":
+                self.web_session_store.mark_task_binding_terminal(
+                    task.task_id,
+                    expected_revision=current_binding.state_revision,
+                    status=NavigationTaskStatus.COMPLETED.value,
+                    latest_public_update="已按你的选择完成当前任务。",
+                )
+            return task
         if current_status in {
             NavigationTaskStatus.PAUSED.value,
             NavigationTaskStatus.PAUSING.value,

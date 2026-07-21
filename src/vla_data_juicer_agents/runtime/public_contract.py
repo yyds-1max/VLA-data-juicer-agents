@@ -232,6 +232,7 @@ _ACTION_DEFINITIONS = (
     PublicActionDefinition("read_observation_evidence_tool", "read_evidence", "汇总检查依据", ActionVisibility.GROUPED, "evidence_read", "inspection"),
     PublicActionDefinition("describe_processing_action_tool", "review_capability", "核对处理条件", ActionVisibility.GROUPED, "capability_review", "inspection"),
     PublicActionDefinition("record_navigation_user_guidance_tool", "record_preferences", "记录处理要求", ActionVisibility.GROUPED, "planning", "planning"),
+    PublicActionDefinition("complete_navigation_task_tool", "complete_task", "完成导航数据任务", ActionVisibility.SILENT, "task_state", "verification"),
     PublicActionDefinition("submit_extract_sync_plan_tool", "prepare_plan", "生成并校验处理方案", ActionVisibility.VISIBLE, "planning", "planning"),
     PublicActionDefinition("submit_finish_processing_plan_tool", "prepare_plan", "生成并校验处理方案", ActionVisibility.VISIBLE, "planning", "planning"),
     PublicActionDefinition("prepare_raw_data_tool", "prepare_data", "准备原始数据", ActionVisibility.VISIBLE, "preparation", "preparation"),

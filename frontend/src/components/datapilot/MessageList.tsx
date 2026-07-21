@@ -9,11 +9,12 @@ type MessageListProps = {
   messages: ChatMessageRecord[];
   turns?: TurnRecord[];
   run: RunState;
+  hasTaskOverlay?: boolean;
 };
 
 const STICKY_BOTTOM_THRESHOLD = 24;
 
-export function MessageList({ messages, turns = [], run }: MessageListProps) {
+export function MessageList({ messages, turns = [], run, hasTaskOverlay = false }: MessageListProps) {
   const displayTurns = [...turns].sort((left, right) => left.started_at.localeCompare(right.started_at));
   const turnIds = new Set(displayTurns.map((turn) => turn.id));
   // Contract v1 welcomes may intentionally be session-scoped instead of Turn-scoped.
@@ -40,7 +41,10 @@ export function MessageList({ messages, turns = [], run }: MessageListProps) {
     <div
       ref={scrollAreaRef}
       data-datapilot-scroll-area="true"
-      className="flex min-h-0 flex-1 flex-col gap-3 overflow-y-auto overscroll-contain bg-console-panel2/45 px-4 py-4 sm:px-5"
+      className={cn(
+        "flex min-h-0 flex-1 flex-col gap-3 overflow-y-auto overscroll-contain bg-console-panel2/45 px-4 py-4 sm:px-5",
+        hasTaskOverlay && "pb-20",
+      )}
       onScroll={handleScroll}
     >
       {hasContent ? (

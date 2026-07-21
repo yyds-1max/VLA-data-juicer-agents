@@ -14,7 +14,7 @@ runtime_setup:
     wait_cause: 等待确认是否继续后处理；拒绝时由导航任务正常收尾
 conversation:
   - role: user
-    content: 不继续后处理了，就到这里正常收尾。
+    content: 先这样，不用继续了。
 limits:
   max_model_calls: 1
   max_tool_calls: 1

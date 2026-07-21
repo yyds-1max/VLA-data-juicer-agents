@@ -75,6 +75,7 @@ PLANNING_TOOL_NAMES = {
     "read_observation_evidence_tool",
     "describe_processing_action_tool",
     "record_navigation_user_guidance_tool",
+    "complete_navigation_task_tool",
     "submit_extract_sync_plan_tool",
     "submit_finish_processing_plan_tool",
 }
@@ -1386,6 +1387,7 @@ def test_activity_resolver_fresh_attempt_exposes_all_planning_tools_without_muta
         "read_observation_evidence_tool",
         "describe_processing_action_tool",
         "record_navigation_user_guidance_tool",
+        "complete_navigation_task_tool",
         "submit_extract_sync_plan_tool",
         "submit_finish_processing_plan_tool",
     }

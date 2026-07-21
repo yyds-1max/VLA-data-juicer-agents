@@ -1093,6 +1093,23 @@ def test_activate_plan_and_ledger_is_atomic(tmp_path: Path):
     assert after.state_revision > before.state_revision
 
 
+def test_latest_accepted_plan_remains_available_after_completion(tmp_path: Path):
+    repo, task = stores_with_task(tmp_path)
+    record = _activate_owned(repo, task, "extract_sync", 3, valid_extract_plan())
+
+    assert repo.get_latest_accepted_for_task(task.task_id).plan_id == record.plan_id
+    with sqlite3.connect(repo.db_path) as connection:
+        connection.execute(
+            "UPDATE navigation_plans SET status = 'completed' WHERE plan_id = ?",
+            (record.plan_id,),
+        )
+
+    completed = repo.get_latest_accepted_for_task(task.task_id)
+    assert completed is not None
+    assert completed.plan_id == record.plan_id
+    assert completed.status == "completed"
+
+
 def test_failed_activation_does_not_supersede_active_plan(
     tmp_path: Path,
     monkeypatch,
