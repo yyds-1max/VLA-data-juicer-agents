@@ -101,6 +101,16 @@ def test_router_prompt_preserves_scope_across_one_unresolved_clarification() -> 
     assert "Default to all clips only" in prompt
 
 
+def test_router_prompt_treats_cross_date_clip_prefix_as_opaque() -> None:
+    prompt = main_router_v1_prompt()
+
+    assert "A clip ID is an opaque child-directory" in prompt
+    assert "dataset date `20270605` with clip `20260605_152856` is valid" in prompt
+    assert "Never reject, correct, or clarify a scope solely because" in prompt
+    assert "Do not derive either value from the other" in prompt
+    assert "Do not use naming conventions to pre-validate clip existence" in prompt
+
+
 def test_router_v1_continue_and_control_schemas_do_not_expose_runtime_identity() -> None:
     continue_schema = ContinueNavigationDataTaskV1Tool.input_schema
     control_schema = ControlNavigationDataTaskV1Tool.input_schema
@@ -257,3 +267,6 @@ def test_navigation_guidance_uses_clips_as_the_only_selectable_granularity() -> 
     assert "never a selectable task input" in guidance
     assert "requested clip inventory" in guidance
     assert "selected clip inventory" in guidance
+    assert "opaque child-directory name" in guidance
+    assert "different date-like prefix" in guidance
+    assert "Never rewrite, reject, or redirect" in guidance

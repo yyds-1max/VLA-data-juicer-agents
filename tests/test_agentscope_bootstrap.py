@@ -55,6 +55,8 @@ def test_main_router_prompt_is_v1_triage_and_handles_delegation_truthfully():
     assert "all_clips" in prompt
     assert "selected_clips" in prompt
     assert "No clip list means all clips" in prompt
+    assert "A clip ID is an opaque child-directory" in prompt
+    assert "20270605` with clip `20260605_152856` is valid" in prompt
     assert "Never ask for or accept an internal segment or sequence" in prompt
     assert "Scene mode is optional" in prompt
     assert "continue_navigation_data_task has no model-authored arguments" in prompt

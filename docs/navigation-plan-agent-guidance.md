@@ -8,11 +8,13 @@ Products normally depend on one another in this order:
 
 The task-selection granularity is clips. A segment or sequence is generated inside a clip by synchronization and is never a selectable task input or a substitute clip identifier. Do not narrow, split, or redirect a task based on an internal segment/sequence name.
 
+The dataset date names the storage directory. Treat each requested clip ID as an opaque child-directory name: it may contain a different date-like prefix when a dataset was copied or renamed while metadata-backed clip names were preserved. Never rewrite, reject, or redirect a requested clip from that prefix. Verify the exact clip under the requested dataset date; only report it missing when current inventory inspection cannot find that exact pair.
+
 Existence is not completeness. Check the requested clip inventory and validation evidence at each dependency boundary before relying on a downstream product.
 
 ## Recommended investigation order
 
-1. Confirm the requested date/path and selected clip inventory. Treat internal segment/sequence names only as product evidence inside those clips.
+1. Confirm the requested dataset directory and exact selected clip inventory without inferring a date from clip names. Treat internal segment/sequence names only as product evidence inside those clips.
 2. Inspect raw, prepared, sync, finish, final, and validation product facts in dependency order.
 3. If work remains before sync, inspect only the topic, timestamp, sensor-role, and runtime facts needed to plan it.
 4. If sync is complete and later work remains, first confirm continuation and needed user inputs, then inspect localization, gridmap, calibration, and runtime facts.

@@ -615,6 +615,40 @@ async def test_plain_text_date_only_starts_all_clips_without_scene_mode(tmp_path
 
 
 @pytest.mark.asyncio
+async def test_plain_text_cross_date_clip_is_an_opaque_identifier(tmp_path: Path) -> None:
+    store = WebSessionStore(tmp_path / "sessions.sqlite")
+    task_store = SqliteNavigationTaskStore(tmp_path / "navigation.sqlite")
+    session = store.create_session("复制数据的原始 clip 名")
+    store.begin_user_turn(
+        session.id,
+        "确认处理 20270605，这一天有 20260605_152856，只处理这个 clip。",
+    )
+    runtime = _runtime(tmp_path, store, task_store)
+    _install_start_stubs(runtime, task_store)
+
+    result = await runtime.start_navigation_agent_task_v1(
+        web_session_id=session.id,
+        router_session_id="router-cross-date-clip",
+        scope_source="interpreted_user_text",
+        dataset_date="20270605",
+        selection={
+            "kind": "selected_clips",
+            "clips": ["20260605_152856"],
+        },
+        scene_mode=None,
+    )
+
+    task = task_store.get_task(result["task_id"])
+    assert task is not None
+    assert task.date == "20270605"
+    assert task.segments == ["20260605_152856"]
+    assert result["latest_task"]["selection"] == {
+        "kind": "selected_clips",
+        "clips": ["20260605_152856"],
+    }
+
+
+@pytest.mark.asyncio
 async def test_continue_rejects_router_snapshot_that_became_stale_without_writes(
     tmp_path: Path,
 ) -> None:

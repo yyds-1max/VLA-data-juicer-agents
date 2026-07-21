@@ -46,7 +46,9 @@ _SCOPE_SELECTION_SCHEMA = {
     "discriminator": {"propertyName": "kind"},
     "description": (
         "The user-selectable task scope. Use all_clips when no clips were "
-        "specified. Internal segments and sequences are never selectable."
+        "specified. Treat every clip string as an opaque identifier: a date-like "
+        "prefix does not have to match dataset_date. Internal segments and "
+        "sequences are never selectable."
     ),
 }
 
@@ -190,7 +192,9 @@ class StartNavigationDataTaskV1Tool(_RouterToolBase):
     name = "start_navigation_data_task"
     description = (
         "Create one navigation task for a YYYYMMDD dataset date and either all_clips "
-        "or selected_clips. Scene mode is optional and must not block start."
+        "or selected_clips. Dataset date selects the storage directory; clip IDs are "
+        "opaque and their date-like prefixes may differ. Scene mode is optional and "
+        "must not block start."
     )
     input_schema = {
         "type": "object",
@@ -207,7 +211,10 @@ class StartNavigationDataTaskV1Tool(_RouterToolBase):
             "dataset_date": {
                 "type": "string",
                 "pattern": "^[0-9]{8}$",
-                "description": "Navigation dataset date in YYYYMMDD form.",
+                "description": (
+                    "Navigation dataset storage-directory date in YYYYMMDD form. "
+                    "Do not derive it from or compare it with clip ID prefixes."
+                ),
             },
             "selection": _SCOPE_SELECTION_SCHEMA,
             "scene_mode": {
