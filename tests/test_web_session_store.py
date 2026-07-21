@@ -765,6 +765,162 @@ def test_router_handoff_reply_stays_progress_until_navigation_reply_finishes(
     assert detail.turns[0].status == "completed"
 
 
+def test_v1_navigation_await_user_final_ignores_parent_router_blockers(
+    tmp_path: Path,
+) -> None:
+    store = WebSessionStore(tmp_path / "sessions.sqlite")
+    session = store.create_session(title="navigation awaits user")
+    turn = store.begin_user_turn(session.id, "检查已有产物后继续").turn
+    router_session_id = "as-router-await-user"
+    navigation_session_id = "as-navigation-await-user"
+
+    store.save_conversation_agent_session(
+        session.id,
+        agent_role="router",
+        agent_id="main-router-agent",
+        agentscope_session_id=router_session_id,
+    )
+    store.bind_conversation_agent_session_to_turn(router_session_id, turn.id)
+    binding = store.create_task_binding(
+        session.id,
+        task_id="task-await-user-final",
+        task_ref="DP-AWAIT-FINAL",
+        navigation_session_id=navigation_session_id,
+    ).binding
+    store.bind_conversation_agent_session_to_turn(navigation_session_id, turn.id)
+
+    store.register_pending_reply(
+        turn_id=turn.id,
+        agentscope_session_id=router_session_id,
+        agent_id="main-router-agent",
+        source="user",
+    )
+    store.append_projected_event_batch(
+        web_session_id=session.id,
+        agentscope_session_id=router_session_id,
+        entry_id="router-start",
+        raw_event_type="REPLY_START",
+        reply_id="router-reply",
+        events=[],
+    )
+    # Router's delegation call starts before authority is handed to Navigation.
+    # Its late ToolResult/ReplyEnd is intentionally rejected after handover, so
+    # these private parent rows can remain running and must not block the owner.
+    store.append_projected_event_batch(
+        web_session_id=session.id,
+        agentscope_session_id=router_session_id,
+        entry_id="router-tool-start",
+        raw_event_type="TOOL_CALL_START",
+        reply_id="router-reply",
+        events=[],
+        private_events=[
+            {
+                "type": "tool_start",
+                "payload": {
+                    "tool": "start_navigation_data_task",
+                    "call_id": "router-handoff-call",
+                },
+            }
+        ],
+    )
+    authority = store.get_response_authority(turn.id)
+    assert authority is not None
+    store.handover_response_authority(
+        turn.id,
+        expected_producer="router",
+        expected_generation=authority.generation,
+        new_producer="navigation",
+    )
+
+    store.register_pending_reply(
+        turn_id=turn.id,
+        agentscope_session_id=navigation_session_id,
+        agent_id="navigation-data-agent",
+        source="handoff",
+    )
+    store.append_projected_event_batch(
+        web_session_id=session.id,
+        agentscope_session_id=navigation_session_id,
+        entry_id="navigation-start",
+        raw_event_type="REPLY_START",
+        reply_id="navigation-reply",
+        events=[],
+    )
+    store.append_projected_event_batch(
+        web_session_id=session.id,
+        agentscope_session_id=navigation_session_id,
+        entry_id="navigation-delta",
+        raw_event_type="TEXT_BLOCK_DELTA",
+        reply_id="navigation-reply",
+        events=[
+            {
+                "type": "answer_delta",
+                "payload": {
+                    "delta": "已完成产物检查，",
+                    "reply_id": "navigation-reply",
+                },
+            }
+        ],
+    )
+    binding = store.update_task_binding(
+        binding.task_id,
+        expected_revision=binding.state_revision,
+        status="waiting_user",
+        latest_public_update="等待你补充场景模式。",
+    )
+
+    prompt = "继续处理前，请告诉我这是室内还是室外数据。"
+    records = store.append_projected_event_batch(
+        web_session_id=session.id,
+        agentscope_session_id=navigation_session_id,
+        entry_id="navigation-await-user",
+        raw_event_type="REPLY_END",
+        reply_id="navigation-reply",
+        events=[
+            {"type": "answer_reset", "payload": {}},
+            {
+                "type": "task_state_updated",
+                "payload": {
+                    "task_ref": binding.task_ref,
+                    "status": "waiting_user",
+                },
+            },
+            {
+                "type": "final",
+                "payload": {
+                    "text": prompt,
+                    "task_ref": binding.task_ref,
+                    "task_status": "waiting_user",
+                },
+            },
+        ],
+    )
+
+    detail = store.get_session(session.id)
+    final_authority = store.get_response_authority(turn.id)
+    assert detail is not None
+    assert [record.type for record in records] == [
+        "answer_reset",
+        "task_state_updated",
+        "final",
+        "turn_state",
+    ]
+    assert [record.type for record in records].count("answer_reset") == 1
+    assert all(record.type != "progress_update" for record in records)
+    assert detail.messages[-1].role == "assistant"
+    assert detail.messages[-1].content == prompt
+    assert detail.turns[0].status == "completed"
+    assert detail.turns[0].final_message_id == detail.messages[-1].id
+    assert final_authority is not None
+    assert final_authority.lease_state == "closed"
+    assert final_authority.final_message_id == detail.messages[-1].id
+    assert store.get_active_turn(session.id) is None
+    assert all(
+        mapping.active_turn_id is None
+        for mapping in store.list_conversation_agent_sessions(session.id)
+    )
+
+
 def test_store_rejects_second_active_turn_and_can_abort_initial_submission(tmp_path: Path):
     store = WebSessionStore(tmp_path / "sessions.sqlite")
     session = store.create_session(title="turn lifecycle")

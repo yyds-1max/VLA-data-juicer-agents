@@ -1679,27 +1679,59 @@ class WebSessionStore:
                             (reply_summary, timestamp, running["id"]),
                         )
 
-                private_tool_counts = connection.execute(
-                    """
-                    SELECT
-                        SUM(CASE WHEN status IN ('running', 'background') THEN 1 ELSE 0 END),
-                        SUM(CASE WHEN status = 'background' THEN 1 ELSE 0 END)
-                    FROM agentscope_turn_tools WHERE turn_id = ?
-                    """,
-                    (turn_id,),
-                ).fetchone()
-                unresolved_tools = int(private_tool_counts[0] or 0)
-                background_tools = int(private_tool_counts[1] or 0)
-                blockers = int(
-                    connection.execute(
+                if v1_mapping:
+                    # Contract v1 transfers response authority between producers.
+                    # A parent Router reply/tool can legitimately remain open in
+                    # the private ledger after Navigation owns the Turn, because
+                    # its late terminal events are rejected by the authority gate.
+                    # Only the authoritative producer's own work may block its
+                    # final; otherwise an AwaitUser final is downgraded to a
+                    # progress update and the Turn can never close.
+                    private_tool_counts = connection.execute(
                         """
                         SELECT
-                            (SELECT COUNT(*) FROM agentscope_turn_replies
-                             WHERE turn_id = ? AND status IN ('pending', 'running', 'waiting'))
+                            SUM(CASE WHEN status IN ('running', 'background')
+                                     THEN 1 ELSE 0 END),
+                            SUM(CASE WHEN status = 'background' THEN 1 ELSE 0 END)
+                        FROM agentscope_turn_tools
+                        WHERE turn_id = ? AND agentscope_session_id = ?
+                        """,
+                        (turn_id, agentscope_session_id),
+                    ).fetchone()
+                    pending_reply_count = int(
+                        connection.execute(
+                            """
+                            SELECT COUNT(*) FROM agentscope_turn_replies
+                            WHERE turn_id = ? AND agentscope_session_id = ?
+                              AND status IN ('pending', 'running', 'waiting')
+                            """,
+                            (turn_id, agentscope_session_id),
+                        ).fetchone()[0]
+                    )
+                else:
+                    private_tool_counts = connection.execute(
+                        """
+                        SELECT
+                            SUM(CASE WHEN status IN ('running', 'background')
+                                     THEN 1 ELSE 0 END),
+                            SUM(CASE WHEN status = 'background' THEN 1 ELSE 0 END)
+                        FROM agentscope_turn_tools WHERE turn_id = ?
                         """,
                         (turn_id,),
-                    ).fetchone()[0]
-                ) + unresolved_tools
+                    ).fetchone()
+                    pending_reply_count = int(
+                        connection.execute(
+                            """
+                            SELECT COUNT(*) FROM agentscope_turn_replies
+                            WHERE turn_id = ?
+                              AND status IN ('pending', 'running', 'waiting')
+                            """,
+                            (turn_id,),
+                        ).fetchone()[0]
+                    )
+                unresolved_tools = int(private_tool_counts[0] or 0)
+                background_tools = int(private_tool_counts[1] or 0)
+                blockers = pending_reply_count + unresolved_tools
                 turn_status_row = connection.execute(
                     "SELECT status FROM web_turns WHERE id = ?",
                     (turn_id,),
