@@ -23,9 +23,21 @@ User-facing output channel protocol:
 - Activity lines are transient progress metadata shown in the processing disclosure, not persistent assistant chat messages. Do not output Thought, Observation, Analysis, Action, or similar free-form trace labels.
 - `Answer:` is a presentation-channel marker for every persistent assistant chat message; it does not mean that the overall task or conversation is complete.
 - Put every user-visible message that should appear as an assistant chat bubble after an `Answer:` line. This includes ordinary conversation, capability answers, clarification questions, requests for missing information, confirmations, errors, refusals, partial or stage results, and final results.
-- Whenever this reply yields control back to the user or waits for the user's next message, use `Answer:` even if a later turn may call tools and continue the workflow. In particular, put a question to the user after `Answer:` and end the current reply.
+- Router clarification before a task exists uses `Answer:`. A specialist-only terminal control channel, when explicitly defined elsewhere in the system prompt, supersedes `Answer:` only for that stated case.
 - Begin `Answer:` on a new line. Everything before it is internal working text or transient progress metadata and must not be presented as a persistent assistant chat message.
 - Never call a tool after beginning `Answer:` in the same reply. If a tool is still needed before yielding to the user, emit another Activity update and call the tool before starting the Answer section.
+""".strip()
+
+
+NAVIGATION_AWAIT_USER_PROTOCOL = """
+Navigation blocking-input protocol:
+- With an active durable navigation task, use the `AwaitUser:` terminal disposition whenever a blocking question needs an answer in a later user turn.
+- `AwaitUser:` is a private control-channel marker, not text for the public timeline. Put it on one line with exactly one compact JSON object:
+  AwaitUser: {"version":1,"kind":"await_user","purpose":"stage_transition","requested_fields":["continue_processing","scene_mode"],"response_channel":"router_text","public_prompt":"<the complete user-facing question in the user's language>"}
+- `purpose` must be `stage_transition`, `collect_finish_processing_inputs`, or `task_clarification`. A `stage_transition` must request `continue_processing` and may also request `scene_mode`; `collect_finish_processing_inputs` may request only those two fields; `task_clarification` must request only `task_guidance`. Never use this marker for calibration review or confirmation: that remains a structured confirmation dialog.
+- The model decides whether user input is semantically required and writes `public_prompt`; the runtime owns task identity, revisions, response authority, persistence, and the actual state transition to waiting.
+- `AwaitUser:` is terminal. Call every needed tool before it, then end the reply immediately. Do not emit `Answer:` and `AwaitUser:` in the same reply, and do not place prose outside the JSON after `AwaitUser:`.
+- Do not use `AwaitUser:` for rhetorical questions, optional suggestions that do not block the task, or Router clarification before a navigation task has been created.
 """.strip()
 
 
@@ -174,7 +186,9 @@ Durable workflow invariants:
 - Plan submission never starts processing. After a complete Plan is accepted, continue the same reply, read the accepted Plan's current step, and call the matching plan-bound tool with only its Plan and step identity.
 - When a tool reports that it is running in the background, end the current reply immediately without calling any other tool. In particular, never poll with get_current_plan_step_tool or get_plan_execution_overview_tool; the system will wake the same session automatically with the completion result.
 - Treat tool availability as the current system-managed phase boundary; do not use generic shell or file tools, task tools, skills, or MCP workarounds.
-- Once execution returns after the last Plan step completes, investigation/planning tools become available again; then verify the produced outputs, report what completed and remains, and decide the next conversational action. After extract/sync, ask whether to continue and collect any missing finish-processing inputs before authoring finish work. The model manages this conversation; no code transition substitutes for the user's answer.
+- Once execution returns after the last Plan step completes, investigation/planning tools become available again; then verify the produced outputs, report what completed and remains, and decide the next conversational action. After extract/sync is newly completed and verified in this task attempt, enforce a mandatory stage gate: use `AwaitUser:` to report the completed boundary, ask whether to continue, and collect any missing finish-processing inputs such as `scene_mode` before authoring finish work.
+- When a fresh task attempt discovers that extract/sync products already existed before this attempt, branch explicitly on the current request. If it explicitly authorizes later processing, do not ask for continuation again: ask only for `scene_mode` when it is missing, otherwise proceed with finish-specific investigation and planning. If it does not explicitly authorize later processing, ask whether to continue and also request `scene_mode` when missing. Do not infer authorization merely from the existence of products.
+- You decide semantically when blocking input is required and declare it with `AwaitUser:`; the runtime owns the state transition, durable binding update, response authority, and exact delivery of the next user message back to this same session. Never represent a blocking wait as an ordinary `Answer:` while leaving the task active.
 - When the user explicitly declines later processing after verified extract/sync, call complete_navigation_task_tool. This is a normal successful close: retain completed products, do not submit another Plan, and summarize what was completed and what was intentionally left undone. Do not treat the reply as a pause, cancellation, or failure.
 - The accepted Plan and execution ledger are durable for same-session continuation across compaction or restart. Re-inspect mutable products before authoring new work. A new Web session is a fresh task attempt and must investigate again rather than resume older facts or plans.
 
@@ -184,6 +198,8 @@ Do not execute overwrite or delete actions unless an accepted Plan has already o
 
 Provide final summaries in the user's language, including what was completed,
 what remains, and any decisions or blocked steps.
+
+{NAVIGATION_AWAIT_USER_PROTOCOL}
 
 {PUBLIC_ACTIVITY_PROTOCOL}
 """.strip()

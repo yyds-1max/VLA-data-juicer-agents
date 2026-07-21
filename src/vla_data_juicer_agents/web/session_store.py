@@ -1298,6 +1298,40 @@ class WebSessionStore:
                         )
                         return []
                 turn_id = _optional_text(active_turn["id"]) if active_turn is not None else None
+            if v1_mapping and turn_id is not None:
+                authority_row = connection.execute(
+                    """
+                    SELECT producer, lease_state, final_message_id
+                    FROM turn_response_authority WHERE turn_id = ?
+                    """,
+                    (turn_id,),
+                ).fetchone()
+                if (
+                    authority_row is None
+                    or authority_row["producer"] != mapping["agent_role"]
+                    or authority_row["lease_state"] != "open"
+                    or authority_row["final_message_id"] is not None
+                ):
+                    # Re-check authority inside the same write transaction that
+                    # would publish the events. Runtime's earlier check is only
+                    # an optimization and cannot close this race by itself.
+                    # Do not feed stale producer tools into the operative Run
+                    # ledger: blockers are turn-wide, so a late tool_start could
+                    # otherwise prevent the current producer from finalizing.
+                    connection.execute(
+                        """
+                        UPDATE conversation_agent_sessions
+                        SET event_cursor = ?, updated_at = ?
+                        WHERE web_session_id = ? AND agentscope_session_id = ?
+                        """,
+                        (
+                            entry_id,
+                            timestamp,
+                            web_session_id,
+                            agentscope_session_id,
+                        ),
+                    )
+                    return []
             v1_system_attention = v1_mapping and any(
                 str(event.get("type") or "") in {"final", "interaction_required"}
                 or (
@@ -3329,6 +3363,23 @@ class WebSessionStore:
                 (agentscope_session_id,),
             ).fetchone()
         return self._conversation_agent_session_from_row(row) if row is not None else None
+
+    def get_agentscope_reply_turn_id(
+        self,
+        agentscope_session_id: str,
+        reply_id: str,
+    ) -> str | None:
+        """Return the durable owner Turn for a reply before runtime side effects."""
+        with self._connect() as connection:
+            row = connection.execute(
+                """
+                SELECT turn_id FROM agentscope_turn_replies
+                WHERE agentscope_session_id = ? AND reply_id = ?
+                ORDER BY updated_at DESC, rowid DESC LIMIT 1
+                """,
+                (agentscope_session_id, reply_id),
+            ).fetchone()
+        return _optional_text(row["turn_id"]) if row is not None else None
 
     def list_conversation_agent_sessions(
         self, web_session_id: str | None = None

@@ -1179,3 +1179,229 @@ def test_asyncio_timeout_preserves_timeout_error_and_emits_interrupted_end():
         ("agent_start", {}),
         ("agent_end", {"status": "interrupted"}),
     ]
+
+
+def test_await_user_marker_becomes_private_turn_disposition_on_reply_end() -> None:
+    scope, events = _scope_and_events()
+    adapter = AgentScopeEventAdapter(
+        scope,
+        emit_tool_events=True,
+        emit_reply_summary_events=True,
+        emit_answer_delta_events=True,
+        emit_progress_events=True,
+    )
+
+    adapter.accept(SimpleNamespace(type="REPLY_START", reply_id="reply-wait"))
+    adapter.accept(
+        SimpleNamespace(
+            type="TEXT_BLOCK_DELTA",
+            delta=(
+                'AwaitUser: {"version":1,"kind":"await_user",'
+                '"purpose":"collect_finish_processing_inputs",'
+                '"requested_fields":["scene_mode"],'
+                '"response_channel":"router_text",'
+                '"public_prompt":"继续处理前，请告诉我这是室内还是室外数据。"}'
+            ),
+        )
+    )
+    assert events == []
+
+    adapter.accept(SimpleNamespace(type="REPLY_END", reply_id="reply-wait"))
+
+    dispositions = [event for event in events if event["type"] == "turn_disposition"]
+    assert len(dispositions) == 1
+    assert dispositions[0]["payload"] == {
+        "version": 1,
+        "kind": "await_user",
+        "purpose": "collect_finish_processing_inputs",
+        "requested_fields": ["scene_mode"],
+        "response_channel": "router_text",
+        "public_prompt": "继续处理前，请告诉我这是室内还是室外数据。",
+    }
+    assert not any(event["type"] in {"answer_delta", "reply_summary"} for event in events)
+
+
+def test_valid_await_user_marker_survives_every_transport_split() -> None:
+    marker = (
+        'AwaitUser: {"version":1,"kind":"await_user",'
+        '"purpose":"collect_finish_processing_inputs",'
+        '"requested_fields":["scene_mode"],'
+        '"response_channel":"router_text",'
+        '"public_prompt":"请补充场景模式。"}'
+    )
+    for split_at in range(len(marker) + 1):
+        scope, events = _scope_and_events()
+        adapter = AgentScopeEventAdapter(
+            scope,
+            emit_reply_summary_events=True,
+            emit_answer_delta_events=True,
+            emit_progress_events=True,
+        )
+        adapter.accept(SimpleNamespace(type="REPLY_START", reply_id="reply-wait"))
+        adapter.accept(
+            SimpleNamespace(type="TEXT_BLOCK_DELTA", delta=marker[:split_at])
+        )
+        adapter.accept(
+            SimpleNamespace(type="TEXT_BLOCK_DELTA", delta=marker[split_at:])
+        )
+        adapter.accept(SimpleNamespace(type="REPLY_END", reply_id="reply-wait"))
+
+        assert [event["type"] for event in events] == ["turn_disposition"], split_at
+
+
+def test_malformed_await_user_marker_never_enters_public_answer_stream() -> None:
+    scope, events = _scope_and_events()
+    adapter = AgentScopeEventAdapter(
+        scope,
+        emit_reply_summary_events=True,
+        emit_answer_delta_events=True,
+        emit_progress_events=True,
+    )
+
+    adapter.accept(SimpleNamespace(type="REPLY_START", reply_id="reply-bad-wait"))
+    adapter.accept(
+        SimpleNamespace(
+            type="TEXT_BLOCK_DELTA",
+            delta='AwaitUser: {"kind":"await_user","requested_fields":[]}',
+        )
+    )
+    adapter.accept(SimpleNamespace(type="REPLY_END", reply_id="reply-bad-wait"))
+
+    assert [(event["type"], event["payload"]) for event in events] == [
+        ("invalid_turn_disposition", {}),
+    ]
+
+
+def test_await_user_cannot_replace_structured_calibration_confirmation() -> None:
+    scope, events = _scope_and_events()
+    adapter = AgentScopeEventAdapter(
+        scope,
+        emit_reply_summary_events=True,
+        emit_answer_delta_events=True,
+        emit_progress_events=True,
+    )
+    adapter.accept(SimpleNamespace(type="REPLY_START", reply_id="reply-calibration"))
+    adapter.accept(
+        SimpleNamespace(
+            type="TEXT_BLOCK_DELTA",
+            delta=(
+                'AwaitUser: {"version":1,"kind":"await_user",'
+                '"purpose":"collect_finish_processing_inputs",'
+                '"requested_fields":["task_guidance"],'
+                '"response_channel":"router_text",'
+                '"public_prompt":"请确认标定参数。"}'
+            ),
+        )
+    )
+    adapter.accept(SimpleNamespace(type="REPLY_END", reply_id="reply-calibration"))
+
+    assert [(event["type"], event["payload"]) for event in events] == [
+        ("invalid_turn_disposition", {}),
+    ]
+
+
+@pytest.mark.parametrize(
+    "delta",
+    [
+        'AwaitUser = {"kind":"await_user"}',
+        'Answer: AwaitUser = {"kind":"await_user"}',
+        '- AwaitUser = {"kind":"await_user"}',
+        '```json AwaitUser = {"kind":"await_user"}```',
+    ],
+)
+def test_suspicious_await_user_syntax_fails_closed(delta: str) -> None:
+    for split_at in range(len(delta) + 1):
+        scope, events = _scope_and_events()
+        adapter = AgentScopeEventAdapter(
+            scope,
+            emit_reply_summary_events=True,
+            emit_answer_delta_events=True,
+            emit_progress_events=True,
+        )
+
+        adapter.accept(SimpleNamespace(type="REPLY_START", reply_id="reply-bad-wait"))
+        adapter.accept(
+            SimpleNamespace(type="TEXT_BLOCK_DELTA", delta=delta[:split_at])
+        )
+        adapter.accept(
+            SimpleNamespace(type="TEXT_BLOCK_DELTA", delta=delta[split_at:])
+        )
+        adapter.accept(SimpleNamespace(type="REPLY_END", reply_id="reply-bad-wait"))
+
+        assert [(event["type"], event["payload"]) for event in events] == [
+            ("invalid_turn_disposition", {}),
+        ], split_at
+        assert "AwaitUser" not in json.dumps(events, ensure_ascii=False)
+
+
+def test_tool_call_after_await_user_invalidates_terminal_disposition() -> None:
+    scope, events = _scope_and_events()
+    adapter = AgentScopeEventAdapter(
+        scope,
+        emit_tool_events=True,
+        emit_reply_summary_events=True,
+        emit_answer_delta_events=True,
+        emit_progress_events=True,
+    )
+
+    adapter.accept(SimpleNamespace(type="REPLY_START", reply_id="reply-wait-then-tool"))
+    adapter.accept(
+        SimpleNamespace(
+            type="TEXT_BLOCK_DELTA",
+            delta=(
+                'AwaitUser: {"version":1,"kind":"await_user",'
+                '"purpose":"task_clarification",'
+                '"requested_fields":["task_guidance"],'
+                '"response_channel":"router_text",'
+                '"public_prompt":"请补充任务要求。"}'
+            ),
+        )
+    )
+    adapter.accept(
+        SimpleNamespace(
+            type="TOOL_CALL_START",
+            tool_call_id="call-after-wait",
+            tool_call_name="inspect_navigation_artifact_state_tool",
+        )
+    )
+    adapter.accept(SimpleNamespace(type="REPLY_END", reply_id="reply-wait-then-tool"))
+
+    assert not any(event["type"] == "turn_disposition" for event in events)
+
+
+def test_await_user_supersedes_accidentally_streamed_answer_in_same_reply() -> None:
+    scope, events = _scope_and_events()
+    adapter = AgentScopeEventAdapter(
+        scope,
+        emit_reply_summary_events=True,
+        emit_answer_delta_events=True,
+        emit_progress_events=True,
+    )
+
+    adapter.accept(SimpleNamespace(type="REPLY_START", reply_id="reply-answer-and-wait"))
+    adapter.accept(
+        SimpleNamespace(
+            type="TEXT_BLOCK_DELTA",
+            delta="Answer:\n这条问题不应成为另一个 final。\n",
+        )
+    )
+    adapter.accept(
+        SimpleNamespace(
+            type="TEXT_BLOCK_DELTA",
+            delta=(
+                'AwaitUser: {"version":1,"kind":"await_user",'
+                '"purpose":"task_clarification",'
+                '"requested_fields":["task_guidance"],'
+                '"response_channel":"router_text",'
+                '"public_prompt":"请补充任务要求。"}'
+            ),
+        )
+    )
+    adapter.accept(SimpleNamespace(type="REPLY_END", reply_id="reply-answer-and-wait"))
+
+    assert [event["type"] for event in events] == [
+        "answer_delta",
+        "answer_reset",
+        "turn_disposition",
+    ]
+    assert not any(event["type"] == "reply_summary" for event in events)

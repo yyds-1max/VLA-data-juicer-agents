@@ -11,6 +11,7 @@ from typing import Any
 from uuid import uuid4
 
 from vla_data_juicer_agents.core.events import EventScope
+from vla_data_juicer_agents.core.turn_disposition import AwaitUserDispositionV1
 
 
 _SENTENCE_RE = re.compile(r".*?[.!?。！？]")
@@ -28,6 +29,18 @@ _PUBLIC_PROGRESS_BOUNDARY_RE = re.compile(
 )
 _ANSWER_MARKER_RE = re.compile(
     r"^\s*(?:Answer|回答)\s*[:：]\s*(?P<text>.*)$",
+    flags=re.IGNORECASE | re.DOTALL,
+)
+_AWAIT_USER_MARKER_RE = re.compile(
+    r"^\s*AwaitUser\s*[:：]\s*(?P<payload>\{.*\})\s*$",
+    flags=re.IGNORECASE | re.DOTALL,
+)
+_AWAIT_USER_PREFIX_RE = re.compile(
+    r"^\s*AwaitUser\s*[:：]",
+    flags=re.IGNORECASE,
+)
+_AWAIT_USER_SUSPECT_RE = re.compile(
+    r"\bAwait\s*User\b",
     flags=re.IGNORECASE | re.DOTALL,
 )
 _PRIVATE_TRACE_MARKER_RE = re.compile(
@@ -80,6 +93,16 @@ _HUMAN_DECISION_TOOL_NAMES = {
     # Compatibility for AgentScope replies persisted before the tool was renamed.
     "request_human_decision",
 }
+
+
+def _await_user_has_only_control_prefix(prefix: str) -> bool:
+    candidate = prefix.strip()
+    answer = re.match(r"^(?:Answer|回答)\s*[:：]\s*", candidate, re.IGNORECASE)
+    if answer is not None:
+        candidate = candidate[answer.end() :]
+    candidate = re.sub(r"^(?:```(?:json)?\s*)", "", candidate, flags=re.IGNORECASE)
+    candidate = re.sub(r"^(?:[-*>#]+\s*)", "", candidate)
+    return not candidate.strip()
 
 
 def _event_type(event: object) -> str:
@@ -721,11 +744,15 @@ class AgentScopeEventAdapter:
     def _emit_tool_start(self, call_id: str, state: _ToolState) -> None:
         if state.started:
             return
+        # AwaitUser is a terminal disposition. A later tool call invalidates a
+        # prematurely emitted marker instead of applying a stale wait at REPLY_END.
+        self._progress_filter.discard_turn_disposition()
         if self._suppress_pre_tool_text:
             self._retract_answer_stream()
             self._discard_reply_segment()
         else:
             self._flush_reply_segment()
+        self._progress_filter.discard_turn_disposition()
         state.started = True
         if self._emit_tool_events:
             payload = {"tool": state.name, "call_id": call_id}
@@ -766,13 +793,34 @@ class AgentScopeEventAdapter:
     def _handle_reply_end(self, reply_id: str = "") -> None:
         if not self._emit_text_events and not self._emit_final_events and self._activity_projector is None:
             return
-        self._flush_reply_segment(reply_id=reply_id or self._current_reply_id)
+        disposition = self._flush_reply_segment(
+            reply_id=reply_id or self._current_reply_id,
+        )
+        if disposition is not None:
+            if disposition.pop("_invalid", False):
+                self._scope.emit("invalid_turn_disposition")
+            else:
+                self._scope.emit("turn_disposition", **disposition)
         self._current_reply_id = ""
 
-    def _flush_reply_segment(self, *, reply_id: str = "") -> None:
+    def _flush_reply_segment(self, *, reply_id: str = "") -> dict[str, Any] | None:
         if not self._emit_text_events and not self._emit_final_events and self._activity_projector is None:
-            return
+            return None
         rendered = self._progress_filter.flush()
+        disposition = self._progress_filter.take_turn_disposition()
+        invalid_disposition = self._progress_filter.take_invalid_turn_disposition()
+        if invalid_disposition:
+            disposition = {"_invalid": True}
+        if disposition is not None:
+            # A terminal control outcome supersedes any accidentally streamed
+            # Answer text from the same model reply. Reset it before publishing
+            # the one authoritative wait prompt through the runtime.
+            self._retract_answer_stream()
+            self._answer_stream_buffer = ""
+            self._reply_text.clear()
+            self._safe_answer_parts.clear()
+            self._progress_filter.reset_segment()
+            return disposition
         if rendered:
             if self._emit_answer_delta_events:
                 self._buffer_answer_delta(rendered)
@@ -799,6 +847,7 @@ class AgentScopeEventAdapter:
         self._reply_text.clear()
         self._safe_answer_parts.clear()
         self._progress_filter.reset_segment()
+        return None
 
     def _discard_reply_segment(self) -> None:
         rendered = self._progress_filter.flush()
@@ -936,9 +985,25 @@ class ProgressSummaryFilter:
         self._answer_mode = False
         self._buffer = ""
         self._summary_parts: list[str] = []
+        self._pending_turn_disposition: dict[str, Any] | None = None
+        self._invalid_turn_disposition = False
+        self._control_scan_tail = ""
 
     def consume_text_delta(self, delta: object) -> str:
-        self._buffer += _text(delta)
+        raw_delta = _text(delta)
+        control_scan = (self._control_scan_tail + raw_delta).rsplit("\n", 1)[-1]
+        suspect = _AWAIT_USER_SUSPECT_RE.search(control_scan)
+        if suspect is not None and not _await_user_has_only_control_prefix(
+            control_scan[: suspect.start()]
+        ):
+            # A malformed control marker may straddle arbitrary transport
+            # chunks. Fail closed and let REPLY_END retract any earlier prefix.
+            self._invalid_turn_disposition = True
+            self._buffer = ""
+            self._control_scan_tail = ""
+            return ""
+        self._control_scan_tail = control_scan[-32:]
+        self._buffer += raw_delta
         output: list[str] = []
         while "\n" in self._buffer:
             line, self._buffer = self._buffer.split("\n", 1)
@@ -948,7 +1013,9 @@ class ProgressSummaryFilter:
                 self._summary_parts.append("\n")
         if self._answer_only and not self._answer_mode:
             answer_match = _ANSWER_MARKER_RE.match(self._buffer)
-            if answer_match is not None:
+            if answer_match is not None and not self._could_be_await_user_control(
+                self._buffer
+            ):
                 self._summary_parts.clear()
                 self._answer_mode = True
                 self._buffer = ""
@@ -976,12 +1043,44 @@ class ProgressSummaryFilter:
     def summary_text(self) -> str:
         return "".join(self._summary_parts)
 
+    def take_turn_disposition(self) -> dict[str, Any] | None:
+        disposition = self._pending_turn_disposition
+        self._pending_turn_disposition = None
+        return disposition
+
+    def discard_turn_disposition(self) -> None:
+        self._pending_turn_disposition = None
+        self._invalid_turn_disposition = False
+        self._control_scan_tail = ""
+
+    def take_invalid_turn_disposition(self) -> bool:
+        invalid = self._invalid_turn_disposition
+        self._invalid_turn_disposition = False
+        return invalid
+
     def reset_segment(self) -> None:
         self._buffer = ""
         self._summary_parts.clear()
         self._answer_mode = False
+        self._control_scan_tail = ""
 
     def _consume_line(self, line: str) -> str | None:
+        await_user_match = _AWAIT_USER_MARKER_RE.match(line)
+        if await_user_match is not None:
+            try:
+                raw_payload = json.loads(await_user_match.group("payload"))
+                disposition = AwaitUserDispositionV1.model_validate(raw_payload)
+            except (json.JSONDecodeError, ValueError):
+                self._invalid_turn_disposition = True
+                return None
+            self._pending_turn_disposition = disposition.model_dump(mode="json")
+            self._invalid_turn_disposition = False
+            return None
+        if _AWAIT_USER_PREFIX_RE.match(line) or _AWAIT_USER_SUSPECT_RE.search(line):
+            # Malformed control data is never allowed to fall through into the
+            # public answer stream. Runtime recovery handles the missing outcome.
+            self._invalid_turn_disposition = True
+            return None
         activity_match = _ACTIVITY_MARKER_RE.match(line)
         if activity_match is not None:
             if self._activity_projector is not None:
@@ -1026,6 +1125,8 @@ class ProgressSummaryFilter:
 
     @staticmethod
     def _could_be_marker_line(line: str) -> bool:
+        if ProgressSummaryFilter._could_be_await_user_control(line):
+            return True
         stripped = line.lstrip()
         if not stripped:
             return True
@@ -1039,9 +1140,29 @@ class ProgressSummaryFilter:
             "原始观察:", "原始观察：", "动作参数:", "动作参数：",
             "工具参数:", "工具参数：",
             "answer:", "answer：", "回答:", "回答：",
+            "awaituser", "answer: awaituser", "answer：awaituser",
+            "回答: awaituser", "回答：awaituser",
+            "```", "```json",
         )
         normalized = stripped.lower()
         return any(marker.startswith(normalized) or normalized.startswith(marker) for marker in markers)
+
+    @staticmethod
+    def _could_be_await_user_control(text: str) -> bool:
+        """Hold ambiguous streaming prefixes until AwaitUser can be ruled out."""
+        candidate = text.lstrip()
+        answer = re.match(r"^(?:Answer|回答)\s*[:：]\s*", candidate, re.IGNORECASE)
+        if answer is not None:
+            candidate = candidate[answer.end() :]
+        candidate = re.sub(r"^(?:```(?:json)?\s*)", "", candidate, flags=re.IGNORECASE)
+        candidate = re.sub(r"^(?:[-*>#]+\s*)", "", candidate)
+        if not candidate.strip():
+            return True
+        compact = re.sub(r"[^a-z]", "", candidate.lower())
+        if not compact:
+            return False
+        marker = "awaituser"
+        return marker.startswith(compact) or compact.startswith(marker)
 
 
 def _result_payload_failed(result_text: str) -> bool:

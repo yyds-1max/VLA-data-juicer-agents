@@ -99,6 +99,21 @@ def test_agent_prompts_define_answer_as_the_persistent_chat_channel():
     assert "Activity lines are transient progress metadata" in navigation_prompt
     assert "every persistent assistant chat message" in navigation_prompt
     assert "Never call a tool after beginning `Answer:` in the same reply" in navigation_prompt
+    assert "AwaitUser:" in navigation_prompt
+    assert "Do not emit `Answer:` and `AwaitUser:` in the same reply" in navigation_prompt
+    assert "AwaitUser:" not in router_prompt
+
+
+def test_navigation_prompt_distinguishes_new_stage_gate_from_existing_products():
+    prompt = navigation_agent_prompt()
+
+    assert "newly completed and verified in this task attempt" in prompt
+    assert "mandatory stage gate" in prompt
+    assert "If it explicitly authorizes later processing" in prompt
+    assert "If it does not explicitly authorize later processing" in prompt
+    assert "do not ask for continuation again" in prompt
+    assert "ask only for `scene_mode` when it is missing" in prompt
+    assert "the runtime owns the state transition" in prompt
 
 
 def test_router_start_schema_omits_dry_run_and_model_restatements():

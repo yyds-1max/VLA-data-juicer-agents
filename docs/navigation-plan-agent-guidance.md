@@ -17,7 +17,7 @@ Existence is not completeness. Check the requested clip inventory and validation
 1. Confirm the requested dataset directory and exact selected clip inventory without inferring a date from clip names. Treat internal segment/sequence names only as product evidence inside those clips.
 2. Inspect raw, prepared, sync, finish, final, and validation product facts in dependency order.
 3. If work remains before sync, inspect only the topic, timestamp, sensor-role, and runtime facts needed to plan it.
-4. If sync is complete and later work remains, first confirm continuation and needed user inputs, then inspect localization, gridmap, calibration, and runtime facts.
+4. For newly produced sync, use the stage gate. For pre-existing sync with explicit continuation, collect only missing inputs. Then inspect finish-specific facts.
 5. Read bounded evidence pages and action contracts only when summaries do not support a decision. Select the stage by choosing one of the two complete-Plan submission tools.
 
 ## Common extract-sync work
@@ -35,7 +35,10 @@ Existence is not completeness. Check the requested clip inventory and validation
 
 ## Common finish-processing work
 
-- Confirm that the user wants to continue and explicitly ask whether the selected data is indoor or outdoor. Record it through `record_navigation_user_guidance_tool` as task `scene_mode` (`in` or `out`); it is currently informational and must not change execution branches yet.
+- Newly produced, verified sync requires terminal `AwaitUser:` for continuation and any missing `scene_mode`.
+- For pre-existing sync, do not reconfirm an explicit current request to continue; await only missing inputs.
+- Record indoor/outdoor through `record_navigation_user_guidance_tool` as informational `scene_mode` (`in` or `out`).
+- End blocking text questions with `AwaitUser:`. The model declares purpose, fields, and public question; Runtime owns identity, revision, authority, and `active -> waiting_user`. Calibration stays with `confirm_navigation_calibration_params_tool` and its dialog.
 - If the user explicitly declines later processing after extract/sync was verified, call `complete_navigation_task_tool` instead of authoring another Plan. This closes the task successfully while retaining every completed extract/sync product. Summarize the completed boundary and the intentionally unperformed finish work; do not describe this choice as a pause, cancellation, or failure.
 - Inspect finish inputs, localization sources/conversions, gridmap sources/preparation, calibration inventory, and relevant runtime assets. A native Ins source normally skips odom conversion. An odom source normally requires the supported odom-to-Ins conversion before consumers that expect Ins-formatted data.
 - Keep the downstream localization pipeline consistent: native Ins uses `main_smart.py`, `4_speed_direction_Ins.py`, and `cjl_with_gridmap`; odom uses conversion/resize, `main_smart_odom.py`, `4_speed_direction_odom.py`, and `cjl_0525_with_gridmap`.
@@ -55,7 +58,8 @@ The model chooses inspection calls, stage, reference sensor, sync policy, sensor
 
 Ask the user when:
 
-- extract/sync has been verified and finish processing could begin;
+- this task attempt has newly completed and verified extract/sync, so the mandatory stage gate is reached;
+- a fresh task finds existing sync products but the current request has not yet authorized finish processing;
 - a required finish input is missing;
 - work would overwrite, delete, or destructively replace products;
 - the accepted Plan reaches a declared calibration or GUI decision.
@@ -81,14 +85,14 @@ Inspect current inputs and outputs before retrying. A non-destructive retry may 
 ### Few-shot 2: new session finds sync complete and finish missing
 
 - Observation: this fresh attempt independently verifies complete sync products and missing finish/final products.
-- Criteria: do not restore the older attempt; finish inputs and finish-specific facts are still required.
-- Next: ask for or confirm continuation and missing inputs, inspect localization/gridmap/calibration facts, then submit a complete finish Plan if supported.
+- Criteria: do not restore the older attempt; an explicit current request to continue already supplies consent.
+- Next: ask only for missing inputs such as `scene_mode` (or ask once for consent if absent), then inspect finish facts and submit a complete Plan if supported.
 
 ### Few-shot 3: extract/sync just completed
 
 - Observation: execution ended and follow-up inspection verifies the selected sync outputs.
 - Criteria: stage completion is not consent to continue.
-- Next: report what completed and remains, ask whether to continue now, and wait for the answer before finish planning.
+- Next: report what completed and remains, emit `AwaitUser:` with `continue_processing` and any missing finish fields, and wait for the answer before finish planning.
 
 ### Few-shot 4: invalid complete Plan
 

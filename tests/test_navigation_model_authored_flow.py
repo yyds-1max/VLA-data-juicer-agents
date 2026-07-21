@@ -446,7 +446,19 @@ async def test_same_session_agent_asks_before_finish_then_reinspects_after_user_
     )
     before = len(tool_call_names(agent))
     model.enqueue_tool("inspect_navigation_artifact_state_tool", {})
-    question = "extract/sync 已核验完成。是否继续 finish processing？"
+    public_question = "extract/sync 已核验完成。是否继续 finish processing？"
+    question = "AwaitUser: " + json.dumps(
+        {
+            "version": 1,
+            "kind": "await_user",
+            "purpose": "stage_transition",
+            "requested_fields": ["continue_processing", "scene_mode"],
+            "response_channel": "router_text",
+            "public_prompt": public_question,
+        },
+        ensure_ascii=False,
+        separators=(",", ":"),
+    )
     model.enqueue_text(question)
     boundary_events = await run_reply(agent, "核验 extract/sync 结果。")
 

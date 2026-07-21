@@ -186,24 +186,53 @@ class AgentScopeEventBridge:
                             "project_contract_v1_event_batch",
                             None,
                         )
-                        if callable(contract_projector):
-                            projected_events = list(
-                                contract_projector(
-                                    web_session_id=web_session_id,
-                                    agentscope_session_id=agentscope_session_id,
-                                    entry_id=batch.entry_id,
-                                    events=batch.events,
+                        transactional_projection = callable(contract_projector)
+                        try:
+                            if callable(contract_projector):
+                                projected_events = list(
+                                    contract_projector(
+                                        web_session_id=web_session_id,
+                                        agentscope_session_id=agentscope_session_id,
+                                        entry_id=batch.entry_id,
+                                        events=batch.events,
+                                        reply_id=getattr(batch, "reply_id", None),
+                                        transactional=True,
+                                    )
                                 )
+                            records = self._store.append_projected_event_batch(
+                                web_session_id=web_session_id,
+                                agentscope_session_id=agentscope_session_id,
+                                entry_id=batch.entry_id,
+                                events=projected_events,
+                                private_events=batch.events,
+                                raw_event_type=batch.raw_event_type,
+                                reply_id=getattr(batch, "reply_id", None),
                             )
-                        records = self._store.append_projected_event_batch(
-                            web_session_id=web_session_id,
-                            agentscope_session_id=agentscope_session_id,
-                            entry_id=batch.entry_id,
-                            events=projected_events,
-                            private_events=batch.events,
-                            raw_event_type=batch.raw_event_type,
-                            reply_id=getattr(batch, "reply_id", None),
-                        )
+                        except Exception:
+                            if transactional_projection:
+                                rollback = getattr(
+                                    self._runtime,
+                                    "rollback_contract_v1_projection_batch",
+                                    None,
+                                )
+                                if callable(rollback):
+                                    rollback(
+                                        agentscope_session_id=agentscope_session_id,
+                                        entry_id=batch.entry_id,
+                                    )
+                            raise
+                        else:
+                            if transactional_projection:
+                                commit = getattr(
+                                    self._runtime,
+                                    "commit_contract_v1_projection_batch",
+                                    None,
+                                )
+                                if callable(commit):
+                                    commit(
+                                        agentscope_session_id=agentscope_session_id,
+                                        entry_id=batch.entry_id,
+                                    )
                         remember_cursor = getattr(self._runtime, "_remember_event_cursor", None)
                         if callable(remember_cursor):
                             remember_cursor(agentscope_session_id, batch.entry_id)

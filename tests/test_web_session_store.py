@@ -1061,6 +1061,14 @@ def test_store_reconciles_orphaned_background_tool_once(tmp_path: Path):
         navigation_session_id="as-navigation",
     ).binding
     store.bind_conversation_agent_session_to_turn(binding.navigation_session_id, turn.id)
+    authority = store.get_response_authority(turn.id)
+    assert authority is not None
+    store.handover_response_authority(
+        turn.id,
+        expected_producer="router",
+        expected_generation=authority.generation,
+        new_producer="navigation",
+    )
     store.append_projected_event_batch(
         web_session_id=session.id,
         agentscope_session_id="as-navigation",
