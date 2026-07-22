@@ -143,8 +143,14 @@ test("keeps an active semantic action expanded beside a safe failure final", asy
   await expect(page.getByText("本轮处理已结束，但未能生成可安全展示的回复。请重试。", {
     exact: true,
   })).toHaveCount(1);
-  await expect(page.getByText(/导航任务 DP-ACTIVE1/)).toBeVisible();
-  await expect(page.getByText("处理中", { exact: true })).toBeVisible();
+  const capsule = page.getByLabel(/导航任务 DP-ACTIVE1，提取并同步，处理中/);
+  const tooltip = page.locator('[role="tooltip"]');
+  await expect(capsule).toBeVisible();
+  await expect(capsule.getByText("处理中", { exact: true })).toBeVisible();
+  await expect(tooltip).toBeHidden();
+  await capsule.focus();
+  await expect(tooltip).toBeVisible();
+  await expect(tooltip.getByText("导航任务 DP-ACTIVE1", { exact: true })).toBeVisible();
 });
 
 test("renders public ReAct progress text with its semantic action", async ({ page }) => {
