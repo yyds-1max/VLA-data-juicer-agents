@@ -157,13 +157,13 @@ def test_public_reply_projection_recovers_unmarked_router_terminal_reply():
             "type": "TEXT_BLOCK_DELTA",
             "reply_id": "reply-unmarked",
             "block_id": "text-unmarked",
-            "delta": "当前任务正在准备中，尚未开始实际处理。",
+            "delta": "当前任务正在准备中。\n- 尚未开始实际处理。",
         },
         {"type": "REPLY_END", "reply_id": "reply-unmarked"},
     ):
         recorder.accept_event(event)
 
-    assert recorder.final_text == "当前任务正在准备中，尚未开始实际处理。"
+    assert recorder.final_text == "当前任务正在准备中。\n- 尚未开始实际处理。"
 
 
 @pytest.mark.asyncio

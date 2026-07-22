@@ -381,7 +381,11 @@ def test_router_mode_recovers_safe_unmarked_text_only_when_reply_ends():
     adapter.accept(
         SimpleNamespace(
             type="TEXT_BLOCK_DELTA",
-            delta="当前任务处于准备阶段，尚未开始实际处理。",
+            delta=(
+                "当前任务处于准备阶段。\n"
+                "- 数据集日期：20270605\n"
+                "- 尚未开始实际处理。"
+            ),
         )
     )
 
@@ -393,14 +397,22 @@ def test_router_mode_recovers_safe_unmarked_text_only_when_reply_ends():
         (
             "answer_delta",
             {
-                "delta": "当前任务处于准备阶段，尚未开始实际处理。",
+                "delta": (
+                    "当前任务处于准备阶段。\n"
+                    "- 数据集日期：20270605\n"
+                    "- 尚未开始实际处理。"
+                ),
                 "reply_id": "reply-unmarked",
             },
         ),
         (
             "reply_summary",
             {
-                "text": "当前任务处于准备阶段，尚未开始实际处理。",
+                "text": (
+                    "当前任务处于准备阶段。\n"
+                    "- 数据集日期：20270605\n"
+                    "- 尚未开始实际处理。"
+                ),
                 "reply_id": "reply-unmarked",
             },
         ),

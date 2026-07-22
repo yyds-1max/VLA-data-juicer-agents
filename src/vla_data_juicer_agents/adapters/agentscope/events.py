@@ -1055,10 +1055,14 @@ class ProgressSummaryFilter:
         output: list[str] = []
         while "\n" in self._buffer:
             line, self._buffer = self._buffer.split("\n", 1)
+            summary_length = len(self._summary_parts)
             rendered = self._consume_line(line)
+            if len(self._summary_parts) > summary_length:
+                # Keep the original line boundary even when answer-only mode is
+                # buffering unmarked Router text for terminal recovery.
+                self._summary_parts.append("\n")
             if rendered is not None:
                 output.append(rendered + "\n")
-                self._summary_parts.append("\n")
         if self._answer_only and not self._answer_mode:
             answer_match = _ANSWER_MARKER_RE.match(self._buffer)
             if answer_match is not None and not self._could_be_await_user_control(
