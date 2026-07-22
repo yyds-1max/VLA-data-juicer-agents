@@ -794,6 +794,66 @@ class WebSessionStore:
             )
         return max(cursor.rowcount, 0)
 
+    def reconcile_terminal_turn_residues(self) -> int:
+        """Close internal leases left open for an already-terminal Web Turn."""
+
+        timestamp = _now()
+        repaired = 0
+        terminal_turns = (
+            "SELECT id FROM web_turns "
+            "WHERE status IN ('completed', 'failed', 'interrupted')"
+        )
+        with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            cursor = connection.execute(
+                f"""
+                UPDATE agentscope_turn_replies
+                SET status = 'interrupted', updated_at = ?
+                WHERE status IN ('pending', 'running', 'waiting')
+                  AND turn_id IN ({terminal_turns})
+                """,
+                (timestamp,),
+            )
+            repaired += max(cursor.rowcount, 0)
+            cursor = connection.execute(
+                f"""
+                UPDATE turn_runs
+                SET status = 'interrupted', updated_at = ?, finished_at = ?
+                WHERE status = 'running' AND turn_id IN ({terminal_turns})
+                """,
+                (timestamp, timestamp),
+            )
+            repaired += max(cursor.rowcount, 0)
+            cursor = connection.execute(
+                f"""
+                UPDATE turn_response_authority
+                SET lease_state = 'closed', updated_at = ?
+                WHERE lease_state = 'open' AND final_message_id IS NULL
+                  AND turn_id IN ({terminal_turns})
+                """,
+                (timestamp,),
+            )
+            repaired += max(cursor.rowcount, 0)
+            cursor = connection.execute(
+                f"""
+                UPDATE conversation_agent_sessions
+                SET active_turn_id = NULL, updated_at = ?
+                WHERE active_turn_id IN ({terminal_turns})
+                """,
+                (timestamp,),
+            )
+            repaired += max(cursor.rowcount, 0)
+            cursor = connection.execute(
+                f"""
+                UPDATE agentscope_sessions
+                SET active_turn_id = NULL, updated_at = ?
+                WHERE active_turn_id IN ({terminal_turns})
+                """,
+                (timestamp,),
+            )
+            repaired += max(cursor.rowcount, 0)
+        return repaired
+
     def get_session(self, session_id: str) -> SessionDetail | None:
         with self._connect() as connection:
             session_row = connection.execute(
@@ -3109,6 +3169,14 @@ class WebSessionStore:
             )
             connection.execute(
                 """
+                UPDATE turn_runs
+                SET status = 'interrupted', updated_at = ?, finished_at = ?
+                WHERE turn_id = ? AND status = 'running'
+                """,
+                (timestamp, timestamp, turn_id),
+            )
+            connection.execute(
+                """
                 UPDATE web_turns
                 SET status = 'interrupted', finished_at = ?
                 WHERE id = ?
@@ -3116,8 +3184,29 @@ class WebSessionStore:
                 (timestamp, turn_id),
             )
             connection.execute(
-                "UPDATE agentscope_sessions SET active_turn_id = NULL WHERE active_turn_id = ?",
-                (turn_id,),
+                """
+                UPDATE turn_response_authority
+                SET lease_state = 'closed', updated_at = ?
+                WHERE turn_id = ? AND lease_state = 'open'
+                  AND final_message_id IS NULL
+                """,
+                (timestamp, turn_id),
+            )
+            connection.execute(
+                """
+                UPDATE conversation_agent_sessions
+                SET active_turn_id = NULL, updated_at = ?
+                WHERE active_turn_id = ?
+                """,
+                (timestamp, turn_id),
+            )
+            connection.execute(
+                """
+                UPDATE agentscope_sessions
+                SET active_turn_id = NULL, updated_at = ?
+                WHERE active_turn_id = ?
+                """,
+                (timestamp, turn_id),
             )
             records.append(
                 self._insert_timeline_event(
@@ -3132,6 +3221,10 @@ class WebSessionStore:
                     created_at=timestamp,
                     origin_key=f"turn-interrupt:{turn_id}:state",
                 )
+            )
+            connection.execute(
+                "UPDATE sessions SET updated_at = ? WHERE id = ?",
+                (timestamp, web_session_id),
             )
         return records
 

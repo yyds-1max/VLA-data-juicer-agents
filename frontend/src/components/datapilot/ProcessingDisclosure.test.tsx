@@ -86,6 +86,59 @@ describe("ProcessingDisclosure", () => {
 
     const paragraph = container.querySelector<HTMLElement>('[data-progress-id="progress-1"]')!;
     expect(paragraph).toHaveTextContent(text);
+    expect(paragraph).not.toHaveClass("datapilot-progress-wave");
+    vi.useRealTimers();
+  });
+
+  test("animates only the latest active progress copy", () => {
+    const items: TimelineItem[] = [
+      {
+        kind: "progress",
+        text: "已完成范围核对。",
+        progressId: "progress-completed",
+        progressPhase: "completed",
+        turnId: "turn-1",
+      },
+      {
+        kind: "progress",
+        text: "正在核对数据范围。",
+        progressId: "progress-active",
+        progressPhase: "streaming",
+        turnId: "turn-1",
+      },
+    ];
+
+    const { container, rerender } = render(
+      <ProcessingDisclosure turn={turn("running")} items={items} />,
+    );
+    const completed = container.querySelector<HTMLElement>('[data-progress-id="progress-completed"]')!;
+    const activeProgress = container.querySelector<HTMLElement>('[data-progress-id="progress-active"]')!;
+
+    expect(completed).not.toHaveClass("datapilot-progress-wave");
+    expect(activeProgress).toHaveClass("datapilot-progress-wave");
+    expect(activeProgress).toHaveAttribute("data-progress-active", "true");
+
+    rerender(
+      <ProcessingDisclosure
+        turn={turn("completed", "2026-07-16T04:00:12.000Z")}
+        items={items}
+      />,
+    );
+    fireEvent.click(screen.getByRole("button", { name: "已处理" }));
+    expect(activeProgress).not.toHaveClass("datapilot-progress-wave");
+  });
+
+  test("animates the delayed understanding placeholder while the turn remains active", () => {
+    vi.useFakeTimers();
+    const items: TimelineItem[] = [
+      { kind: "progress", text: "正在理解你的请求", turnId: "turn-1" },
+    ];
+    render(
+      <ProcessingDisclosure turn={turn("running")} items={items} allowEmptyPlaceholder />,
+    );
+
+    act(() => vi.advanceTimersByTime(400));
+    expect(screen.getByText("正在理解你的请求")).toHaveClass("datapilot-progress-wave");
     vi.useRealTimers();
   });
 

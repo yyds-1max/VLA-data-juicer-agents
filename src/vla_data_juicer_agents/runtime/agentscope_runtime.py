@@ -1572,6 +1572,33 @@ class AgentScopeRuntime:
         if callable(publish):
             await publish(committed.message.session_id, list(committed.events))
 
+    async def _run_chat_service_checked(
+        self,
+        *,
+        user_id: str,
+        session_id: str,
+        agent_id: str,
+        input_msg: Any,
+    ) -> None:
+        """Run an internally supervised AgentScope turn without swallowing errors.
+
+        AgentScope's public ``ChatService.run`` intentionally logs and swallows
+        exceptions so fire-and-forget triggers survive. DataPilot owns a durable
+        Turn/Run lease, so it must observe failures and settle that lease instead.
+        The pinned AgentScope service exposes ``_run_impl`` for this supervised
+        path; lightweight test doubles may only implement ``run``.
+        """
+
+        chat_service = self.app.state.chat_service
+        checked_run = getattr(chat_service, "_run_impl", None)
+        runner = checked_run if callable(checked_run) else getattr(chat_service, "run")
+        await runner(
+            user_id=user_id,
+            session_id=session_id,
+            agent_id=agent_id,
+            input_msg=input_msg,
+        )
+
     async def _start_agent_run(
         self,
         *,
@@ -1583,7 +1610,6 @@ class AgentScopeRuntime:
         task_id: str | None = None,
         agentscope_session_id: str | None = None,
     ) -> str:
-        chat_service = self.app.state.chat_service
         session_id = await self.ensure_web_session(
             web_session_id,
             agent_id=agent_id,
@@ -1656,12 +1682,19 @@ class AgentScopeRuntime:
             try:
                 async with cancellation.track_agent(session_id):
                     with bind_cancellation(cancellation):
-                        await chat_service.run(
+                        run = self._run_chat_service_checked(
                             user_id=self.config.user_id,
                             session_id=session_id,
                             agent_id=agent_id,
                             input_msg=UserMsg(name="user", content=message),
                         )
+                        if agent_id == self.config.main_router_agent_id:
+                            async with asyncio.timeout(
+                                self.config.router_run_timeout_secs
+                            ):
+                                await run
+                        else:
+                            await run
             except asyncio.CancelledError:
                 if internal_run_id is not None and self.web_session_store is not None:
                     self.web_session_store.update_turn_run(
@@ -2526,7 +2559,7 @@ class AgentScopeRuntime:
                     try:
                         async with cancellation.track_agent(agentscope_session_id):
                             with bind_cancellation(cancellation):
-                                await self.app.state.chat_service.run(
+                                await self._run_chat_service_checked(
                                     user_id=self.config.user_id,
                                     session_id=agentscope_session_id,
                                     agent_id=agent_id,
@@ -3434,7 +3467,7 @@ class AgentScopeRuntime:
 
         async def run_recovered_session() -> None:
             try:
-                await self.app.state.chat_service.run(
+                await self._run_chat_service_checked(
                     user_id=user_id,
                     session_id=session_id,
                     agent_id=agent_id,

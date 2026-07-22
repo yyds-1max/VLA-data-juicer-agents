@@ -46,6 +46,20 @@ class AgentScopeEventBridge:
 
     async def start(self) -> None:
         self._stopping = False
+        reconcile_terminal = getattr(
+            self._store,
+            "reconcile_terminal_turn_residues",
+            None,
+        )
+        terminal_residue_count = (
+            int(reconcile_terminal()) if callable(reconcile_terminal) else 0
+        )
+        if terminal_residue_count:
+            logger.warning(
+                "Reconciled internal leases for terminal Web turns during bridge "
+                "startup: count=%d",
+                terminal_residue_count,
+            )
         stale_reply_count = self._store.reconcile_stale_reply_leases()
         if stale_reply_count:
             logger.warning(
@@ -412,13 +426,20 @@ class AgentScopeWebSessionManager:
             raise KeyError(session_id)
 
         interrupt_web_session = getattr(self._runtime, "interrupt_web_session", None)
-        if interrupt_web_session is None:
-            return False
-        interrupted = bool(await interrupt_web_session(web_session_id=session_id))
-        if interrupted:
-            for event in self._store.interrupt_active_turn(session_id):
-                await self._publish_record(session_id, event)
-        return interrupted
+        runtime_interrupted = False
+        if callable(interrupt_web_session):
+            runtime_interrupted = bool(
+                await interrupt_web_session(web_session_id=session_id)
+            )
+        active_turn = self._store.get_active_turn(session_id)
+        records = (
+            self._store.interrupt_active_turn(session_id)
+            if runtime_interrupted or active_turn is not None
+            else []
+        )
+        for event in records:
+            await self._publish_record(session_id, event)
+        return runtime_interrupted or bool(records)
 
     async def submit_human_decision(self, session_id: str, decision: dict[str, Any]) -> bool:
         detail = self._store.get_session(session_id)

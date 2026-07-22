@@ -10,6 +10,7 @@ def test_from_env_reads_required_values_and_defaults(monkeypatch, tmp_path):
     monkeypatch.setenv("VLA_AGENT_MODEL", "qwen-default")
     monkeypatch.delenv("VLA_AGENT_ROUTER_MODEL", raising=False)
     monkeypatch.delenv("VLA_AGENT_NAVIGATION_MODEL", raising=False)
+    monkeypatch.delenv("VLA_AGENT_ROUTER_RUN_TIMEOUT_SECS", raising=False)
     monkeypatch.delenv("VLA_AGENT_WORKSPACE_ROOT", raising=False)
     monkeypatch.delenv("VLA_DATA_AGENT_WEB_WORKING_DIR", raising=False)
 
@@ -28,6 +29,7 @@ def test_from_env_reads_required_values_and_defaults(monkeypatch, tmp_path):
     assert config.navigation_agent_id == "navigation-data-agent"
     assert config.agentscope_mount_path == "/api/agentscope"
     assert config.tool_background_threshold_secs == 10.0
+    assert config.router_run_timeout_secs == 45.0
 
 
 def test_from_env_uses_separate_router_and_navigation_models(monkeypatch, tmp_path):
@@ -61,6 +63,16 @@ def test_from_env_reads_tool_background_threshold(monkeypatch, tmp_path):
     assert config.tool_background_threshold_secs == 12.5
 
 
+def test_from_env_reads_router_run_timeout(monkeypatch, tmp_path):
+    monkeypatch.setenv("DASHSCOPE_API_KEY", "test-key")
+    monkeypatch.setenv("VLA_AGENT_MODEL", "qwen-default")
+    monkeypatch.setenv("VLA_AGENT_ROUTER_RUN_TIMEOUT_SECS", "30")
+
+    config = AgentScopeRuntimeConfig.from_env(workspace_root=tmp_path)
+
+    assert config.router_run_timeout_secs == 30.0
+
+
 @pytest.mark.parametrize("value", ["0", "-1", "invalid"])
 def test_from_env_rejects_invalid_tool_background_threshold(
     monkeypatch,
@@ -70,6 +82,16 @@ def test_from_env_rejects_invalid_tool_background_threshold(
     monkeypatch.setenv("DASHSCOPE_API_KEY", "test-key")
     monkeypatch.setenv("VLA_AGENT_MODEL", "qwen-default")
     monkeypatch.setenv("VLA_AGENT_TOOL_BACKGROUND_THRESHOLD_SECS", value)
+
+    with pytest.raises(ValueError, match="positive number"):
+        AgentScopeRuntimeConfig.from_env(workspace_root=tmp_path)
+
+
+@pytest.mark.parametrize("value", ["0", "-1", "invalid"])
+def test_from_env_rejects_invalid_router_run_timeout(monkeypatch, tmp_path, value):
+    monkeypatch.setenv("DASHSCOPE_API_KEY", "test-key")
+    monkeypatch.setenv("VLA_AGENT_MODEL", "qwen-default")
+    monkeypatch.setenv("VLA_AGENT_ROUTER_RUN_TIMEOUT_SECS", value)
 
     with pytest.raises(ValueError, match="positive number"):
         AgentScopeRuntimeConfig.from_env(workspace_root=tmp_path)

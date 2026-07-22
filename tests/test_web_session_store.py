@@ -1182,6 +1182,112 @@ def test_late_events_from_interrupted_reply_do_not_create_a_system_turn(tmp_path
     assert [message.role for message in detail.messages] == ["user"]
 
 
+def test_contract_v1_interrupt_closes_authority_runs_and_agent_mapping(tmp_path: Path):
+    db_path = tmp_path / "sessions.sqlite"
+    store = WebSessionStore(db_path)
+    session = store.create_session(title="interrupt contract v1", contract_version=1)
+    turn = store.begin_user_turn(session.id, "停止当前请求").turn
+    mapping = store.save_conversation_agent_session(
+        session.id,
+        agent_role="router",
+        agent_id="main-router-agent",
+        agentscope_session_id="as-router-v1",
+    )
+    store.bind_conversation_agent_session_to_turn(mapping.agentscope_session_id, turn.id)
+    store.register_pending_reply(
+        turn_id=turn.id,
+        agentscope_session_id=mapping.agentscope_session_id,
+        agent_id=mapping.agent_id,
+        source="user",
+    )
+    store.create_turn_run(
+        run_id="router-run-v1",
+        turn_id=turn.id,
+        producer="router",
+        agentscope_session_id=mapping.agentscope_session_id,
+    )
+
+    records = store.interrupt_active_turn(session.id)
+
+    assert [record.type for record in records] == ["turn_state"]
+    detail = store.get_session(session.id)
+    assert detail is not None
+    assert detail.turns[0].status == "interrupted"
+    assert store.get_active_turn(session.id) is None
+    authority = store.get_response_authority(turn.id)
+    assert authority is not None
+    assert authority.lease_state == "closed"
+    assert authority.final_message_id is None
+    interrupted_run = store.get_latest_turn_run(turn.id, producer="router")
+    assert interrupted_run is not None
+    assert interrupted_run.status == "interrupted"
+    updated_mapping = store.get_conversation_agent_session_by_agentscope_session(
+        mapping.agentscope_session_id
+    )
+    assert updated_mapping is not None
+    assert updated_mapping.active_turn_id is None
+    with sqlite3.connect(db_path) as connection:
+        reply_status = connection.execute(
+            "SELECT status FROM agentscope_turn_replies WHERE turn_id = ?",
+            (turn.id,),
+        ).fetchone()
+    assert reply_status == ("interrupted",)
+
+
+def test_reconcile_terminal_turn_residues_repairs_pre_fix_interrupt_state(
+    tmp_path: Path,
+):
+    db_path = tmp_path / "sessions.sqlite"
+    store = WebSessionStore(db_path)
+    session = store.create_session(title="stale interrupted turn", contract_version=1)
+    turn = store.begin_user_turn(session.id, "处理导航数据").turn
+    mapping = store.save_conversation_agent_session(
+        session.id,
+        agent_role="router",
+        agent_id="main-router-agent",
+        agentscope_session_id="as-router-stale",
+    )
+    store.bind_conversation_agent_session_to_turn(mapping.agentscope_session_id, turn.id)
+    store.register_pending_reply(
+        turn_id=turn.id,
+        agentscope_session_id=mapping.agentscope_session_id,
+        agent_id=mapping.agent_id,
+        source="user",
+    )
+    store.create_turn_run(
+        run_id="router-run-stale",
+        turn_id=turn.id,
+        producer="router",
+        agentscope_session_id=mapping.agentscope_session_id,
+    )
+    with sqlite3.connect(db_path) as connection:
+        connection.execute(
+            "UPDATE web_turns SET status = 'interrupted', finished_at = 'now' WHERE id = ?",
+            (turn.id,),
+        )
+
+    repaired = store.reconcile_terminal_turn_residues()
+
+    assert repaired >= 4
+    authority = store.get_response_authority(turn.id)
+    assert authority is not None
+    assert authority.lease_state == "closed"
+    repaired_mapping = store.get_conversation_agent_session_by_agentscope_session(
+        mapping.agentscope_session_id
+    )
+    assert repaired_mapping is not None
+    assert repaired_mapping.active_turn_id is None
+    repaired_run = store.get_latest_turn_run(turn.id, producer="router")
+    assert repaired_run is not None
+    assert repaired_run.status == "interrupted"
+    with sqlite3.connect(db_path) as connection:
+        reply_status = connection.execute(
+            "SELECT status FROM agentscope_turn_replies WHERE turn_id = ?",
+            (turn.id,),
+        ).fetchone()
+    assert reply_status == ("interrupted",)
+
+
 def test_store_lists_all_agentscope_mappings_for_bridge_recovery(tmp_path: Path):
     store = WebSessionStore(tmp_path / "sessions.sqlite")
     session = store.create_session(title="mapping recovery")

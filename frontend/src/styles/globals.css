@@ -49,6 +49,11 @@
   24%, 72% { outline-color: rgba(71, 85, 105, 0.72); }
 }
 
+@keyframes datapilot-progress-wave {
+  0%, 20% { background-position: 115% 50%; }
+  58%, 100% { background-position: -15% 50%; }
+}
+
 :root {
   color-scheme: light;
   font-family:
@@ -75,6 +80,36 @@ textarea {
 
 ::selection {
   background: rgba(45, 108, 223, 0.16);
+}
+
+.datapilot-progress-wave {
+  width: fit-content;
+  max-width: 100%;
+  color: #637083;
+  background-image: linear-gradient(
+    100deg,
+    #637083 0%,
+    #637083 42%,
+    #17202e 50%,
+    #637083 58%,
+    #637083 100%
+  );
+  background-position: 115% 50%;
+  background-size: 250% 100%;
+  background-clip: text;
+  -webkit-background-clip: text;
+  -webkit-text-fill-color: transparent;
+  animation: datapilot-progress-wave 5.2s ease-in-out 0.7s infinite;
+  will-change: background-position;
+}
+
+@media (prefers-reduced-motion: reduce), (forced-colors: active) {
+  .datapilot-progress-wave {
+    background: none;
+    -webkit-text-fill-color: currentColor;
+    animation: none;
+    will-change: auto;
+  }
 }
 
 .console-soft-scrollbar {

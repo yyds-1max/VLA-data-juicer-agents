@@ -60,6 +60,7 @@ export function ProcessingDisclosure({
   const duration = formatDuration(turnDurationMs(turn, now));
   const contentId = `processing-${turn.id}`;
   const title = turnTitle(active ? "running" : turn.status);
+  const animatedProgressIndex = activeProgressIndex(visibleItems, active);
 
   return (
     <section
@@ -91,8 +92,12 @@ export function ProcessingDisclosure({
             return (
               <p
                 key={item.progressId ? `progress-${item.progressId}` : `progress-${index}`}
-                className="whitespace-pre-wrap break-words"
+                className={cn(
+                  "whitespace-pre-wrap break-words",
+                  index === animatedProgressIndex && "datapilot-progress-wave",
+                )}
                 data-progress-id={item.progressId}
+                data-progress-active={index === animatedProgressIndex ? "true" : undefined}
               >
                 {withoutPercentages(item.text)}
               </p>
@@ -201,6 +206,15 @@ function visibleProcessingItems(items: TimelineItem[]): TimelineItem[] {
 
 function isInitialProgress(item: TimelineItem): boolean {
   return item.kind === "progress" && item.text === "正在理解你的请求";
+}
+
+function activeProgressIndex(items: TimelineItem[], active: boolean): number {
+  if (!active) return -1;
+  for (let index = items.length - 1; index >= 0; index -= 1) {
+    const item = items[index];
+    if (item.kind === "progress" && item.progressPhase !== "completed") return index;
+  }
+  return -1;
 }
 
 function publicActionItemKey(item: TimelineItem, index: number): string {

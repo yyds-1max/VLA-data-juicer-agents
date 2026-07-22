@@ -351,6 +351,36 @@ class FakeChatService:
                         block.state = ToolCallState.FINISHED
 
 
+class SwallowingFailureChatService:
+    """Match AgentScope ChatService.run: log/swallow while _run_impl raises."""
+
+    def __init__(self) -> None:
+        self.public_runs = 0
+        self.checked_runs = 0
+
+    async def _run_impl(self, *, user_id, session_id, agent_id, input_msg):
+        del user_id, session_id, agent_id, input_msg
+        self.checked_runs += 1
+        raise RuntimeError("provider rate limited")
+
+    async def run(self, **kwargs):
+        self.public_runs += 1
+        try:
+            await self._run_impl(**kwargs)
+        except Exception:
+            return None
+
+
+class BlockingCheckedChatService:
+    def __init__(self) -> None:
+        self.started = asyncio.Event()
+        self.release = asyncio.Event()
+
+    async def _run_impl(self, **_kwargs):
+        self.started.set()
+        await self.release.wait()
+
+
 class FakeChatRunRegistry:
     def __init__(self, *, reject_duplicate_active: bool = False) -> None:
         self.reject_duplicate_active = reject_duplicate_active
@@ -1126,6 +1156,108 @@ async def test_runtime_start_agent_run_registers_binds_and_cleans_cancellation()
 
     assert runtime.run_cancellation(session_id) is None
     assert runtime.app.state.chat_service.seen_cancellations == [cancellation]
+
+
+@pytest.mark.asyncio
+async def test_supervised_agent_run_propagates_chat_service_failure_and_closes_turn(
+    tmp_path: Path,
+) -> None:
+    store = WebSessionStore(tmp_path / "sessions.sqlite")
+    session = store.create_session("模型限流", contract_version=1)
+    turn = store.begin_user_turn(session.id, "处理导航数据").turn
+    storage = FakeAgentScopeStorage()
+    message_bus = FakeAgentScopeMessageBus()
+    registry = FakeChatRunRegistry()
+    chat_service = SwallowingFailureChatService()
+    runtime = AgentScopeRuntime(
+        config=_agentscope_config(workspace_root=tmp_path),
+        storage=storage,
+        message_bus=message_bus,
+        workspace_manager=object(),
+        app=SimpleNamespace(
+            state=SimpleNamespace(
+                chat_service=chat_service,
+                chat_run_registry=registry,
+            )
+        ),
+    )
+    runtime.set_web_session_store(store)
+
+    await runtime.submit_user_message(
+        web_session_id=session.id,
+        message="处理导航数据",
+        turn_id=turn.id,
+    )
+
+    with pytest.raises(RuntimeError, match="provider rate limited"):
+        await registry.drain()
+
+    detail = store.get_session(session.id)
+    assert detail is not None
+    assert detail.turns[0].status == "failed"
+    assert [event.type for event in detail.events].count("final") == 1
+    assert len([message for message in detail.messages if message.role == "assistant"]) == 1
+    assert store.get_active_turn(session.id) is None
+    authority = store.get_response_authority(turn.id)
+    assert authority is not None
+    assert authority.producer == "system_controller"
+    assert authority.lease_state == "closed"
+    run = store.get_latest_turn_run(turn.id, producer="router")
+    assert run is not None
+    assert run.status == "failed"
+    mapping = store.get_conversation_agent_session(
+        session.id,
+        agent_role="router",
+    )
+    assert mapping is not None
+    assert mapping.active_turn_id is None
+    assert chat_service.checked_runs == 1
+    assert chat_service.public_runs == 0
+
+
+@pytest.mark.asyncio
+async def test_router_run_timeout_closes_turn_instead_of_leaving_placeholder(
+    tmp_path: Path,
+) -> None:
+    store = WebSessionStore(tmp_path / "sessions.sqlite")
+    session = store.create_session("模型无响应", contract_version=1)
+    turn = store.begin_user_turn(session.id, "处理导航数据").turn
+    storage = FakeAgentScopeStorage()
+    registry = FakeChatRunRegistry()
+    chat_service = BlockingCheckedChatService()
+    runtime = AgentScopeRuntime(
+        config=_agentscope_config(
+            workspace_root=tmp_path,
+            router_run_timeout_secs=0.01,
+        ),
+        storage=storage,
+        message_bus=FakeAgentScopeMessageBus(),
+        workspace_manager=object(),
+        app=SimpleNamespace(
+            state=SimpleNamespace(
+                chat_service=chat_service,
+                chat_run_registry=registry,
+            )
+        ),
+    )
+    runtime.set_web_session_store(store)
+
+    await runtime.submit_user_message(
+        web_session_id=session.id,
+        message="处理导航数据",
+        turn_id=turn.id,
+    )
+
+    with pytest.raises(TimeoutError):
+        await registry.drain()
+
+    detail = store.get_session(session.id)
+    assert detail is not None
+    assert detail.turns[0].status == "failed"
+    assert [event.type for event in detail.events].count("final") == 1
+    authority = store.get_response_authority(turn.id)
+    assert authority is not None
+    assert authority.lease_state == "closed"
 
 
 @pytest.mark.asyncio
@@ -2915,6 +3047,25 @@ async def test_interrupt_returns_false_without_runtime_interrupt(tmp_path: Path)
     session = await manager.create_session("处理 20270605")
 
     assert await manager.interrupt(session.id) is False
+
+
+@pytest.mark.asyncio
+async def test_interrupt_closes_orphaned_active_turn_without_runtime_handle(
+    tmp_path: Path,
+) -> None:
+    store = WebSessionStore(tmp_path / "sessions.sqlite")
+    manager = AgentScopeWebSessionManager(store=store, runtime=FakeAgentScopeRuntime())
+    session = await manager.create_session("处理 20270605")
+    turn = store.begin_user_turn(session.id, "处理导航数据").turn
+
+    assert await manager.interrupt(session.id) is True
+
+    detail = store.get_session(session.id)
+    assert detail is not None
+    assert detail.turns[0].status == "interrupted"
+    authority = store.get_response_authority(turn.id)
+    assert authority is not None
+    assert authority.lease_state == "closed"
 
 
 @pytest.mark.asyncio

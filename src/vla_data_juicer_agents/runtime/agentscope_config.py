@@ -62,6 +62,7 @@ class AgentScopeRuntimeConfig:
     agentscope_mount_path: str = "/api/agentscope"
     navigation_dry_run: bool = False
     tool_background_threshold_secs: float = 10.0
+    router_run_timeout_secs: float = 45.0
 
     def redis_connection_kwargs(self) -> dict[str, str | int | None]:
         parsed = urlparse(self.redis_url)
@@ -120,5 +121,9 @@ class AgentScopeRuntimeConfig:
             tool_background_threshold_secs=_positive_float_env(
                 "VLA_AGENT_TOOL_BACKGROUND_THRESHOLD_SECS",
                 default=10.0,
+            ),
+            router_run_timeout_secs=_positive_float_env(
+                "VLA_AGENT_ROUTER_RUN_TIMEOUT_SECS",
+                default=45.0,
             ),
         )
