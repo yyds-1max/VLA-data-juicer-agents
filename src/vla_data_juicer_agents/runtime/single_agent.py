@@ -294,7 +294,12 @@ class ContinueNavigationDataTaskV1Tool(_RouterToolBase):
 
 class ControlNavigationDataTaskV1Tool(_RouterToolBase):
     name = "control_navigation_data_task"
-    description = "Stop the current navigation run or cancel the whole navigation task."
+    description = (
+        "Stop the current navigation run or cancel the whole navigation task only when "
+        "the current user message explicitly requests control of that existing task. "
+        "A request to create another task never authorizes stopping or cancelling the "
+        "current task merely to make room."
+    )
     input_schema = {
         "type": "object",
         "properties": {

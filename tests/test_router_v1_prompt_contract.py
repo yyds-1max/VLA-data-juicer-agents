@@ -286,12 +286,21 @@ def test_router_v1_prompt_is_unique_and_covers_routing_state_semantics() -> None
         "Call continue_navigation_data_task",
         "V1 does not support live steering",
         "second task",
+        "first non-whitespace output must be the literal `Answer:`",
+        "A request to create another task is",
+        "never authorization to stop or cancel the current task",
+        "call no task",
         "Use `stop`",
         "Use `cancel`",
+        "Never infer stop or cancel merely to make room",
         "Do not produce `Answer:`",
         "another model call",
     ):
         assert required in prompt
+
+    assert "A request to create another task never authorizes" in (
+        ControlNavigationDataTaskV1Tool.description
+    )
     for removed_field in (
         "`target`",
         "`reason`",
