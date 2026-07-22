@@ -1,6 +1,6 @@
-# DataPilot Contract V1 升级、灰度与回滚手册
+# DataPilot Contract V1 部署、验证与回滚手册
 
-本文档适用于当前的单进程 DataPilot Web/AgentScope 部署。Contract V1 仅决定新建会话采用哪套对话契约；会话创建后，`sessions.contract_version` 不可修改。
+本文档适用于当前的单进程 DataPilot Web/AgentScope 部署。服务只创建和运行 contract v1 会话；`sessions.contract_version=1` 是未来升级边界，不是运行时开关。旧测试会话不迁移，也不能由当前服务继续运行。
 
 > 限制：当前实现不支持多进程或多实例协调。不要让多个 Web/Runtime 进程共享同一份 `sessions.sqlite`、`navigation-tasks.sqlite` 和 AgentScope 运行状态。资源租约和 outbox 的持久化不等于已具备分布式一致性。
 
@@ -8,25 +8,15 @@
 
 ## 1. 配置与数据位置
 
-### 1.1 单一智能体模式
+### 1.1 固定会话契约
 
-```text
-VLA_DATAPILOT_SINGLE_AGENT_MODE=off|shortcut|new_sessions
-```
+`VLA_DATAPILOT_SINGLE_AGENT_MODE` 已删除。普通聊天和数据管理快捷入口都创建 contract v1 会话。快捷入口除可见模板消息外，必须在创建会话时提交 `navigation_dataset_selection_v1` 私有结构化上下文；后端把它绑定到首个 Turn，Router 不得覆盖或扩大该范围。
 
-当前代码在未设置该环境变量时默认使用 `new_sessions`。如果需要执行下文的兼容部署或回滚步骤，必须显式设置为 `off` 或 `shortcut`，不能依赖未配置时的默认值。
+私有快捷上下文按 UTF-8 计最多 `3000` 字节，以保证完整 `RouterContextEnvelope` 不超过 `4000` 字符；前端会在提交前拦截过大的 clip 选择，API 也会以 `422` 拒绝绕过前端的超限请求，不会截断或默默扩大范围。
 
-| 值 | 新建会话的行为 |
-|---|---|
-| `off` | 所有新会话使用 contract v0。 |
-| `shortcut` | 只有数据管理快捷入口创建 contract v1 会话；普通新建聊天仍为 v0。前端必须在创建会话时显式传递 `entrypoint: "data_management_shortcut"`。 |
-| `new_sessions` | 所有新建会话使用 contract v1。 |
+MainRouter 单次受监督 Run 默认硬截止为 `45` 秒，可通过 `VLA_AGENT_ROUTER_RUN_TIMEOUT_SECS` 设置正数秒值。截止或模型服务异常会进入 System Controller 的安全失败收口，关闭 Turn、reply lease 和 response authority；不能让前端无限停留在“正在理解你的请求”。Navigation 的长任务不使用这个 Router 截止时间。
 
-模式在进程启动时从环境变量读取，修改后需重启服务。它不会转换、降级或禁用已有会话：
-
-- 切到 `off` 只会让之后创建的会话使用 v0，已有 v1 会话仍是 v1。
-- 切到 `new_sessions` 不会把已有 v0 会话改成 v1。
-- 数据库触发器会拒绝直接修改 `sessions.contract_version`。
+部署前应重置开发阶段的旧 Web/Navigation/AgentScope 测试状态。不得删除或改写 VLADatasets 原始数据及已有业务产物。
 
 ### 1.2 SQLite 文件
 
@@ -115,31 +105,12 @@ sqlite3 "$BACKUP_DIR/navigation-tasks.logical.sqlite" 'PRAGMA integrity_check;'
 
 ## 3. 发布顺序
 
-### 3.1 `off`：先部署兼容代码
-
-1. 完成第 2 节的停机备份。
-2. 显式设置 `VLA_DATAPILOT_SINGLE_AGENT_MODE=off` 后启动新版本；当前未配置时的默认值是 `new_sessions`。
-3. 启动会自动建立顺序 migration ledger 并应用 `single_agent_contract_v1` migration。如果数据库记录了高于当前二进制支持的 schema version，启动应失败；不要手工删除 ledger 或覆盖高版本结构。
-4. 确认新建会话的 `contract_version=0`，现有 v0 会话可正常加载。
-
-升级时已有会话会因 migration 的默认值保持 `contract_version=0`。对当前开发/测试数据，发布策略是把它们当作历史只读记录：允许查看，不再追加 Turn，也不尝试续接到 v1。
-
-**当前实现的边界：**数据库没有单独的 `historical/read_only` 字段，API 也不会因为会话是 v0 而自动拒绝新 Turn。“历史只读”目前是发布运维策略，必须通过前端入口、访问层或操作约定保证；不要宣称后端已强制只读。
-
-### 3.2 `shortcut`：小流量灰度
-
-1. 设置 `VLA_DATAPILOT_SINGLE_AGENT_MODE=shortcut` 并重启单实例服务。
-2. 从数据管理页快捷入口创建会话，确认请求携带 `entrypoint: "data_management_shortcut"` 且新会话为 v1。
-3. 从普通聊天入口新建会话，确认仍为 v0。
-4. 覆盖直接回答、启动 Navigation、一次结构化 interaction、Stop/Cancel 和断线重连的小流量 smoke。
-5. 持续观察第 4 节中的指标，达到发布窗口约定后再扩大。
-
-### 3.3 `new_sessions`：全部新会话
-
-1. 保留灰度现场备份和观察记录。
-2. 设置 `VLA_DATAPILOT_SINGLE_AGENT_MODE=new_sessions` 并重启服务。
-3. 确认数据管理快捷入口和普通新聊天都创建 v1 会话。
-4. 已有 v0/v1 会话保持原 contract，不做就地转换。
+1. 完成第 2 节的停机备份，并确认服务和恢复循环已停止。
+2. 隔离或重置旧的开发测试会话、Navigation 状态和对应 AgentScope/Redis 状态；保留备份用于诊断，不把旧会话改写为 v1。
+3. 部署代码并启动唯一实例。启动会执行顺序 migration；未知或更高 schema version 必须使启动失败，不要手工删除 ledger 或覆盖结构。
+4. 确认普通聊天和数据管理快捷入口创建的会话都为 `contract_version=1`。
+5. 按顺序验证：快捷入口单 clip、普通文本单 clip（clip 前缀日期与 dataset date 不同）、日期-only 的 all-clips 语义、不提供 scene mode 的后台拆解同步与后续询问、Stop/恢复/Cancel。
+6. 持续观察第 4 节指标。范围扩大、重复 final、任务状态分裂、公开泄露或运行中错误兜底均为停止验收的条件。
 
 可用以下查询核对会话分布：
 
@@ -216,17 +187,15 @@ Contract v1 的公开事件应只包含白名单事件和 `task_ref`，不应返
 - WebSocket 从启动到 final 的完整事件流，包括断线重连后的 snapshot。
 - 服务日志中 `AgentScope event bridge worker failed; reconnecting` 和公开投影校验异常。投影失败会表现为 Bridge 重连，当前没有独立的“脱敏告警计数器”。
 
-一旦抽样发现凭据、绝对路径或内部 ID，立即停止扩量，保留脱敏后的复现条件，并切回 `off`。不要把原始凭据复制到工单或发布群。
+一旦抽样发现凭据、绝对路径或内部 ID，立即停止服务或阻断新请求，并保留脱敏后的复现条件。不要把原始凭据复制到工单或发布群。
 
 ## 5. 回滚
 
-### 5.1 使用当前新版本暂停扩量
+### 5.1 使用当前版本暂停服务
 
-1. 停止新请求，等待安全收尾。
-2. 将 `VLA_DATAPILOT_SINGLE_AGENT_MODE` 切回 `off` 并重启唯一实例。
-3. 核对新建会话为 v0，保留异常 v1 会话作为诊断现场。
-
-这个操作只停止创建新 v1 会话，不会把已有 v1 会话转为 v0。如果故障来自已有 v1 会话，还需在 UI/访问层暂停继续这些会话。
+1. 停止新请求，等待持久工具安全收尾。
+2. 停止唯一实例和恢复循环，保留异常 v1 会话、数据库与脱敏日志作为诊断现场。
+3. 修复并通过硬门禁后再启动；当前版本没有切回 v0 的运行开关。
 
 ### 5.2 回滚到旧二进制
 
@@ -248,11 +217,11 @@ Contract v1 的公开事件应只包含白名单事件和 `task_ref`，不应返
 - 确认是否误用了旧二进制连接新数据库，或数据库来自更高版本环境。
 - 回到匹配该 schema 的代码版本，或恢复升级前备份。
 
-### 快捷入口创建了 v0 会话
+### 快捷入口创建失败或范围不一致
 
-- 核对服务进程看到的 `VLA_DATAPILOT_SINGLE_AGENT_MODE=shortcut`，而不是仅核对 shell 或部署模板。
-- 核对 `POST /api/sessions` 请求中的 `entrypoint` 是 `data_management_shortcut`。后端不会根据消息文本或 `invocation_id` 猜测快捷入口。
-- 不要修改已创建会话的 contract；修正配置后重新建立测试会话。
+- 核对 `POST /api/sessions` 同时携带 `entrypoint: "data_management_shortcut"` 和私有 `request_context.kind: "navigation_dataset_selection_v1"`。
+- 核对 `dataset_date` 与 `selection.kind/clips` 来自数据管理页真实选择；日期与 clip 前缀不要求相同。
+- 后端不会根据模板文本或 `invocation_id` 猜测权威范围。不要修改已创建任务的范围；取消后重新创建。
 
 ### Navigation 已接受，但没有启动或恢复
 
@@ -280,11 +249,11 @@ Contract v1 的公开事件应只包含白名单事件和 `task_ref`，不应返
 
 ## 7. 发布验收记录
 
-每次从 `off` 进入 `shortcut` 或从 `shortcut` 进入 `new_sessions` 时，至少记录：
+每次部署或重新开放真实任务测试时，至少记录：
 
-- 代码版本、当前模式、启动时间和唯一进程证据。
+- 代码版本、启动时间和唯一进程证据。
 - 两份 SQLite 的实际绝对路径（对外工单需脱敏）、checkpoint 结果、备份目录和校验和。
-- `schema_migrations`、contract v0/v1 数量、outbox 状态、authority 异常查询、interaction 409 数量和公开投影抽样结果。
+- `schema_migrations`、contract v1 数量、outbox 状态、authority 异常查询、interaction 409 数量和公开投影抽样结果。
 - 自动化测试和前端构建结果，以及是否完成真实模型 smoke。
 
 不应因为单元/集成测试通过就宣称“真实模型已验证”。真实模型 smoke 必须在目标服务器的实际模型、Redis、数据目录和权限配置下单独执行和记录；未执行时必须明确标注为未验证。

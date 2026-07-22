@@ -53,6 +53,7 @@ checkpoints/
 docs/*
 !docs/datapilot-contract-v1-operations.md
 docs/2026-07-17-navigation-agent-deferred-issues.md
+/DATAPILOT_ROUTING_SINGLE_AGENT_HANDOFF.md
 
 # 数据
 服务器端数据/
