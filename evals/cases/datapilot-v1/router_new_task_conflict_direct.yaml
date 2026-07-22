@@ -26,7 +26,7 @@ expectations:
   response:
     language: Chinese
     required_any_groups:
-      - [当前任务, 现有任务, 正在处理]
+      - [当前任务, 现有任务, 正在处理, 当前已有, 已有任务, 正在进行]
       - [完成, 取消]
     forbidden_terms: [MainRouterAgent, NavigationDataAgent, start_navigation_data_task, continue_navigation_data_task, control_navigation_data_task, task_id, run_id, call_id, system prompt, 系统提示词]
     max_chars: 240
