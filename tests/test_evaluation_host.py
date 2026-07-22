@@ -149,6 +149,23 @@ def test_public_reply_projection_retracts_text_before_tool_call():
     assert recorder.final_text == "最终公开回答。"
 
 
+def test_public_reply_projection_recovers_unmarked_router_terminal_reply():
+    recorder = TraceRecorder()
+    for event in (
+        {"type": "REPLY_START", "reply_id": "reply-unmarked"},
+        {
+            "type": "TEXT_BLOCK_DELTA",
+            "reply_id": "reply-unmarked",
+            "block_id": "text-unmarked",
+            "delta": "当前任务正在准备中，尚未开始实际处理。",
+        },
+        {"type": "REPLY_END", "reply_id": "reply-unmarked"},
+    ):
+        recorder.accept_event(event)
+
+    assert recorder.final_text == "当前任务正在准备中，尚未开始实际处理。"
+
+
 @pytest.mark.asyncio
 async def test_host_uses_production_assembly_and_records_visible_tools(tmp_path):
     config = runtime_config(tmp_path)

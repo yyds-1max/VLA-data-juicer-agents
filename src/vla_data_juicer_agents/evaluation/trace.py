@@ -174,6 +174,9 @@ class TraceRecorder:
             emit_progress_events=True,
             emit_reply_summary_events=True,
             emit_answer_delta_events=True,
+            # The current evaluation entrypoint is MainRouter-only.  Mirror the
+            # production Router's terminal protocol recovery exactly.
+            recover_unmarked_terminal_answer=True,
             public_tool_events=True,
             suppress_pre_tool_text=True,
         )

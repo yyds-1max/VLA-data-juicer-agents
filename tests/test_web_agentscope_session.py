@@ -2681,6 +2681,86 @@ async def test_turn_event_subscription_rebuilds_open_reply_state_before_cursor()
 
 
 @pytest.mark.asyncio
+async def test_turn_event_subscription_recovers_unmarked_router_terminal_reply() -> None:
+    message_bus = FakeAgentScopeMessageBus(
+        replay_events=[
+            ("1-0", {"type": "REPLY_START", "reply_id": "reply-router"}),
+            (
+                "2-0",
+                {
+                    "type": "TEXT_BLOCK_DELTA",
+                    "reply_id": "reply-router",
+                    "delta": "当前任务处于准备阶段，尚未开始实际处理。",
+                },
+            ),
+            ("3-0", {"type": "REPLY_END", "reply_id": "reply-router"}),
+        ],
+    )
+    runtime = _runtime(message_bus=message_bus)
+
+    batches = [
+        batch
+        async for batch in runtime.subscribe_agentscope_session_event_batches(
+            web_session_id="web-1",
+            agent_id="main-router-agent",
+            agentscope_session_id="as-router-1",
+            continuous=False,
+            turn_events=True,
+        )
+    ]
+    projected = [event for batch in batches for event in batch.events]
+
+    assert [(event["type"], event["payload"]) for event in projected] == [
+        (
+            "answer_delta",
+            {
+                "delta": "当前任务处于准备阶段，尚未开始实际处理。",
+                "reply_id": "reply-router",
+            },
+        ),
+        (
+            "reply_summary",
+            {
+                "text": "当前任务处于准备阶段，尚未开始实际处理。",
+                "reply_id": "reply-router",
+            },
+        ),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_turn_event_subscription_keeps_navigation_unmarked_reply_private() -> None:
+    message_bus = FakeAgentScopeMessageBus(
+        replay_events=[
+            ("1-0", {"type": "REPLY_START", "reply_id": "reply-navigation"}),
+            (
+                "2-0",
+                {
+                    "type": "TEXT_BLOCK_DELTA",
+                    "reply_id": "reply-navigation",
+                    "delta": "我需要继续判断下一步调用什么工具。",
+                },
+            ),
+            ("3-0", {"type": "REPLY_END", "reply_id": "reply-navigation"}),
+        ],
+    )
+    runtime = _runtime(message_bus=message_bus)
+
+    batches = [
+        batch
+        async for batch in runtime.subscribe_agentscope_session_event_batches(
+            web_session_id="web-1",
+            agent_id="navigation-data-agent",
+            agentscope_session_id="as-navigation-1",
+            continuous=False,
+            turn_events=True,
+        )
+    ]
+
+    assert [event for batch in batches for event in batch.events] == []
+
+
+@pytest.mark.asyncio
 async def test_create_session_creates_compatible_record_and_persists(tmp_path: Path) -> None:
     store = WebSessionStore(tmp_path / "sessions.sqlite")
     manager = AgentScopeWebSessionManager(store=store, runtime=FakeAgentScopeRuntime())

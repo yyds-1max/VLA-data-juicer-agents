@@ -367,6 +367,102 @@ def test_turn_mode_never_publishes_plain_text_without_answer_marker():
     assert events == []
 
 
+def test_router_mode_recovers_safe_unmarked_text_only_when_reply_ends():
+    scope, events = _scope_and_events()
+    adapter = AgentScopeEventAdapter(
+        scope,
+        emit_progress_events=True,
+        emit_reply_summary_events=True,
+        emit_answer_delta_events=True,
+        recover_unmarked_terminal_answer=True,
+    )
+
+    adapter.accept(SimpleNamespace(type="REPLY_START", reply_id="reply-unmarked"))
+    adapter.accept(
+        SimpleNamespace(
+            type="TEXT_BLOCK_DELTA",
+            delta="当前任务处于准备阶段，尚未开始实际处理。",
+        )
+    )
+
+    assert events == []
+
+    adapter.accept(SimpleNamespace(type="REPLY_END", reply_id="reply-unmarked"))
+
+    assert [(event["type"], event["payload"]) for event in events] == [
+        (
+            "answer_delta",
+            {
+                "delta": "当前任务处于准备阶段，尚未开始实际处理。",
+                "reply_id": "reply-unmarked",
+            },
+        ),
+        (
+            "reply_summary",
+            {
+                "text": "当前任务处于准备阶段，尚未开始实际处理。",
+                "reply_id": "reply-unmarked",
+            },
+        ),
+    ]
+
+
+def test_router_mode_never_recovers_unmarked_text_from_a_tool_reply():
+    scope, events = _scope_and_events()
+    adapter = AgentScopeEventAdapter(
+        scope,
+        emit_tool_events=True,
+        emit_progress_events=True,
+        emit_reply_summary_events=True,
+        emit_answer_delta_events=True,
+        recover_unmarked_terminal_answer=True,
+        suppress_pre_tool_text=True,
+    )
+
+    adapter.accept(SimpleNamespace(type="REPLY_START", reply_id="reply-tool"))
+    adapter.accept(
+        SimpleNamespace(
+            type="TEXT_BLOCK_DELTA",
+            delta="我先说明一下，然后调用任务工具。",
+        )
+    )
+    adapter.accept(
+        SimpleNamespace(
+            type="TOOL_CALL_START",
+            tool_call_id="call-start",
+            tool_call_name="start_navigation_data_task",
+        )
+    )
+    adapter.accept(SimpleNamespace(type="REPLY_END", reply_id="reply-tool"))
+
+    assert not any(
+        event["type"] in {"answer_delta", "reply_summary"}
+        for event in events
+    )
+
+
+def test_router_mode_does_not_recover_an_unsafe_unmarked_reply():
+    scope, events = _scope_and_events()
+    adapter = AgentScopeEventAdapter(
+        scope,
+        emit_progress_events=True,
+        emit_reply_summary_events=True,
+        emit_answer_delta_events=True,
+        recover_unmarked_terminal_answer=True,
+    )
+
+    adapter.accept(SimpleNamespace(type="REPLY_START", reply_id="reply-unsafe"))
+    adapter.accept(
+        SimpleNamespace(
+            type="TEXT_BLOCK_DELTA",
+            delta="task_id: internal-secret",
+        )
+    )
+    adapter.accept(SimpleNamespace(type="REPLY_END", reply_id="reply-unsafe"))
+
+    assert events == []
+
+
 @pytest.mark.parametrize(
     "secret_line",
     [

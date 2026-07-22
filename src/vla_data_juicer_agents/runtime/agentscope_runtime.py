@@ -3680,6 +3680,9 @@ class AgentScopeRuntime:
                 emit_progress_events=turn_events,
                 emit_reply_summary_events=turn_events,
                 emit_answer_delta_events=turn_events,
+                recover_unmarked_terminal_answer=(
+                    turn_events and agent_id == self.config.main_router_agent_id
+                ),
                 public_tool_events=True,
                 suppress_pre_tool_text=True,
                 activity_title=(

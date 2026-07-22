@@ -635,6 +635,7 @@ class AgentScopeEventAdapter:
         background_status_resolver: Callable[[str, str], str] | None = None,
         emit_reply_summary_events: bool = False,
         emit_answer_delta_events: bool = False,
+        recover_unmarked_terminal_answer: bool = False,
     ) -> None:
         self._scope = scope
         self._emit_tool_events = emit_tool_events
@@ -643,6 +644,7 @@ class AgentScopeEventAdapter:
         self._emit_reasoning_events = emit_reasoning_events
         self._emit_reply_summary_events = emit_reply_summary_events
         self._emit_answer_delta_events = emit_answer_delta_events
+        self._recover_unmarked_terminal_answer = recover_unmarked_terminal_answer
         self._public_tool_events = public_tool_events
         self._suppress_pre_tool_text = suppress_pre_tool_text
         self._thinking: dict[str, list[str]] = {}
@@ -667,6 +669,7 @@ class AgentScopeEventAdapter:
         self._answer_stream_buffer = ""
         self._answer_stream_emitted = False
         self._safe_answer_parts: list[str] = []
+        self._reply_had_tool_call = False
         self._background_tools: dict[str, str] = {}
         self._background_status_resolver = background_status_resolver
 
@@ -680,6 +683,7 @@ class AgentScopeEventAdapter:
             self._answer_stream_buffer = ""
             self._answer_stream_emitted = False
             self._safe_answer_parts.clear()
+            self._reply_had_tool_call = False
         elif event_type == "THINKING_BLOCK_DELTA":
             self._thinking.setdefault(block_id, []).append(_text(getattr(event, "delta", "")))
         elif event_type == "THINKING_BLOCK_END":
@@ -691,6 +695,7 @@ class AgentScopeEventAdapter:
         elif event_type == "REPLY_END":
             self._handle_reply_end(_text(getattr(event, "reply_id", "")))
         elif event_type == "TOOL_CALL_START":
+            self._reply_had_tool_call = True
             state = self._tools.setdefault(call_id, _ToolState())
             state.name = _text(getattr(event, "tool_call_name", "")) or state.name
             self._emit_tool_start(call_id, state)
@@ -699,6 +704,7 @@ class AgentScopeEventAdapter:
                 _text(getattr(event, "delta", ""))
             )
         elif event_type == "TOOL_RESULT_START":
+            self._reply_had_tool_call = True
             state = self._tools.setdefault(call_id, _ToolState())
             state.name = _text(getattr(event, "tool_call_name", "")) or state.name
             self._emit_tool_start(call_id, state)
@@ -795,6 +801,7 @@ class AgentScopeEventAdapter:
             return
         disposition = self._flush_reply_segment(
             reply_id=reply_id or self._current_reply_id,
+            terminal=True,
         )
         if disposition is not None:
             if disposition.pop("_invalid", False):
@@ -802,8 +809,14 @@ class AgentScopeEventAdapter:
             else:
                 self._scope.emit("turn_disposition", **disposition)
         self._current_reply_id = ""
+        self._reply_had_tool_call = False
 
-    def _flush_reply_segment(self, *, reply_id: str = "") -> dict[str, Any] | None:
+    def _flush_reply_segment(
+        self,
+        *,
+        reply_id: str = "",
+        terminal: bool = False,
+    ) -> dict[str, Any] | None:
         if not self._emit_text_events and not self._emit_final_events and self._activity_projector is None:
             return None
         rendered = self._progress_filter.flush()
@@ -848,6 +861,20 @@ class AgentScopeEventAdapter:
             elif self._emit_text_events:
                 self._scope.emit("assistant_delta", delta=rendered)
             self._reply_text.append(rendered)
+        if (
+            terminal
+            and self._recover_unmarked_terminal_answer
+            and self._emit_answer_delta_events
+            and not self._reply_had_tool_call
+            and not self._progress_filter.has_answer_marker()
+        ):
+            # Router direct replies are public by contract when no routing tool or
+            # terminal control disposition was produced.  Recover a model that
+            # omitted the presentation marker only after the reply has ended, so
+            # tool-preface prose can never leak while a call is still possible.
+            candidate = sanitize_public_reply(self._progress_filter.summary_text())
+            if candidate:
+                self._emit_safe_answer_chunk(candidate)
         self._flush_answer_delta_buffer()
         summary_source = (
             "".join(self._safe_answer_parts)
@@ -1063,6 +1090,9 @@ class ProgressSummaryFilter:
 
     def summary_text(self) -> str:
         return "".join(self._summary_parts)
+
+    def has_answer_marker(self) -> bool:
+        return self._answer_mode
 
     def take_turn_disposition(self) -> dict[str, Any] | None:
         disposition = self._pending_turn_disposition
