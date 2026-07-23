@@ -310,3 +310,14 @@ clip 确定，必须覆盖其同步后产生的全部内部 segments；历史单
 case 不能替代整条 clip 的真实业务等价验收。来自 macOS 复制的 `._*`
 AppleDouble 文件不属于业务输入，拆包发现与 raw 同源比较均须忽略并报告，不能
 把它们当作 ROS bag。
+
+### M1（2026-07-23，开发中）
+
+- 已完成只读任务级设计并保存
+  `docs/automatic-annotation-m1-plan.md`；
+- 开发基线固定为 `f618c6c`，开发分支为
+  `codex/automatic-annotation-m1`；
+- M1 只实现 `navigation_odom_v1` 的 Web 首帧标注与 Tracking，不提前接入
+  M2 后处理/Fix、M3 智能体或 M4 AI；
+- 系统 Runtime payload、固定 Xvfb、2027 测试数据拆解/同步和真实 Tracking
+  仍受单独服务器 writer 门禁约束。
