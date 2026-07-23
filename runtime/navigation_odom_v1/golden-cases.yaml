@@ -1,4 +1,4 @@
-schema_version: 1
+schema_version: 2
 runtime_id: navigation_odom_v1
 
 samples:
@@ -47,6 +47,19 @@ cases:
     sample_id: nav_20260605_160904_zhigu_wuhan_0
     artifact_root_kind: finish_temp_date
     artifact_scope: "samples/20260605/20260605_160904_zhigu_wuhan_0"
+    role_scopes:
+      legacy:
+        artifact_scope: "samples/20260605/20260605_160904_zhigu_wuhan_0"
+        dataset_date: "20260605"
+        source_clip: "20260605_160904"
+        internal_segment: "20260605_160904_zhigu_wuhan_0"
+        provenance: historical_unattested
+      candidate:
+        artifact_scope: "samples/20270605/20260605_160904_zhigu_wuhan_0"
+        dataset_date: "20270605"
+        source_clip: "20260605_160904"
+        internal_segment: "20260605_160904_zhigu_wuhan_0"
+        provenance: runtime_attested
     root_expectations:
       - modality: initial_annotation_yaml
         relative_pattern: "*.yaml"
@@ -69,6 +82,7 @@ cases:
       - fix
     expected_command_steps:
       - processing_calibration_snapshot
+      - assemble_finish_temp
       - preprocess_create_box
       - preprocess_odom_convert
       - preprocess_resize
@@ -77,6 +91,99 @@ cases:
       - video_prepare
       - initial_annotation
       - tracking
+    document_normalizations:
+      - path_pattern: "*.yaml"
+        selector: '$["paths"]["img2video_mp4"]'
+        strategy: artifact_local_file
+        expected_relative_path: "dog.mp4"
+    dimensions_only_image_patterns:
+      - "tracking_img_*/*"
+    artifact_stage_rules:
+      - path_pattern: "*.yaml"
+        stage: initial_annotation
+      - path_pattern: "tracking_img_*/*"
+        stage: tracking
+      - path_pattern: "img_*.txt"
+        stage: tracking
+    candidate_attestation_required: true
+    legacy_oracle_selection_required: true
+
+  - id: m1_prepare_maps_20260605_160904
+    sample_id: nav_20260605_160904_zhigu_wuhan_0
+    artifact_root_kind: finish_temp_date
+    role_scopes:
+      legacy:
+        scope_kind: prepare_maps
+        artifact_scope: "maps"
+        dataset_date: "20260605"
+        source_clip: "20260605_160904"
+        provenance: historical_unattested
+      candidate:
+        scope_kind: prepare_maps
+        artifact_scope: "maps"
+        dataset_date: "20270605"
+        source_clip: "20260605_160904"
+        provenance: runtime_attested
+    root_expectations:
+      - modality: published_map
+        relative_pattern: "map.png"
+        present: true
+        file_count: 1
+    applicable_stages: [map_publish]
+    excluded_stages: [initial_annotation, tracking, projection, trajectory, publish, fix]
+    expected_command_steps:
+      - processing_calibration_snapshot
+      - assemble_finish_temp
+      - preprocess_create_box
+      - preprocess_odom_convert
+      - preprocess_resize
+      - metadata_generate
+      - map_publish
+      - video_prepare
+      - initial_annotation
+      - tracking
+    artifact_stage_rules:
+      - {path_pattern: "map.png", stage: map_publish}
+    candidate_attestation_required: true
+    legacy_oracle_selection_required: true
+
+  - id: m1_prepare_metadata_20260605_160904
+    sample_id: nav_20260605_160904_zhigu_wuhan_0
+    artifact_root_kind: finish_temp_date
+    role_scopes:
+      legacy:
+        scope_kind: prepare_metadata
+        artifact_scope: "v1.0-trainval"
+        dataset_date: "20260605"
+        source_clip: "20260605_160904"
+        provenance: historical_unattested
+      candidate:
+        scope_kind: prepare_metadata
+        artifact_scope: "v1.0-trainval"
+        dataset_date: "20270605"
+        source_clip: "20260605_160904"
+        provenance: runtime_attested
+    root_expectations:
+      - modality: generated_metadata
+        relative_pattern: "**/*"
+        present: true
+    applicable_stages: [metadata_generate]
+    excluded_stages: [initial_annotation, tracking, projection, trajectory, publish, fix]
+    expected_command_steps:
+      - processing_calibration_snapshot
+      - assemble_finish_temp
+      - preprocess_create_box
+      - preprocess_odom_convert
+      - preprocess_resize
+      - metadata_generate
+      - map_publish
+      - video_prepare
+      - initial_annotation
+      - tracking
+    artifact_stage_rules:
+      - {path_pattern: "**/*", stage: metadata_generate}
+    candidate_attestation_required: true
+    legacy_oracle_selection_required: true
 
   - id: m2_postprocess_20260605_160904
     sample_id: nav_20260605_160904_zhigu_wuhan_0
@@ -132,6 +239,19 @@ cases:
     sample_id: nav_20260623_145550_zhigu_wuhan_0
     artifact_root_kind: finish_temp_date
     artifact_scope: "samples/20260623/20260623_145550_zhigu_wuhan_0"
+    role_scopes:
+      legacy:
+        artifact_scope: "samples/20260623/20260623_145550_zhigu_wuhan_0"
+        dataset_date: "20260623"
+        source_clip: "20260623_145550"
+        internal_segment: "20260623_145550_zhigu_wuhan_0"
+        provenance: historical_unattested
+      candidate:
+        artifact_scope: "samples/20270623/20260623_145550_zhigu_wuhan_0"
+        dataset_date: "20270623"
+        source_clip: "20260623_145550"
+        internal_segment: "20260623_145550_zhigu_wuhan_0"
+        provenance: runtime_attested
     root_expectations:
       - modality: initial_annotation_yaml
         relative_pattern: "*.yaml"
@@ -154,6 +274,7 @@ cases:
       - fix
     expected_command_steps:
       - processing_calibration_snapshot
+      - assemble_finish_temp
       - preprocess_create_box
       - preprocess_odom_convert
       - preprocess_resize
@@ -162,6 +283,309 @@ cases:
       - video_prepare
       - initial_annotation
       - tracking
+    document_normalizations:
+      - path_pattern: "*.yaml"
+        selector: '$["paths"]["img2video_mp4"]'
+        strategy: artifact_local_file
+        expected_relative_path: "dog.mp4"
+    dimensions_only_image_patterns:
+      - "tracking_img_*/*"
+    artifact_stage_rules:
+      - path_pattern: "*.yaml"
+        stage: initial_annotation
+      - path_pattern: "tracking_img_*/*"
+        stage: tracking
+      - path_pattern: "img_*.txt"
+        stage: tracking
+    candidate_attestation_required: true
+    legacy_oracle_selection_required: true
+
+  - id: m1_prepare_maps_20260623_145550
+    sample_id: nav_20260623_145550_zhigu_wuhan_0
+    artifact_root_kind: finish_temp_date
+    role_scopes:
+      legacy:
+        scope_kind: prepare_maps
+        artifact_scope: "maps"
+        dataset_date: "20260623"
+        source_clip: "20260623_145550"
+        provenance: historical_unattested
+      candidate:
+        scope_kind: prepare_maps
+        artifact_scope: "maps"
+        dataset_date: "20270623"
+        source_clip: "20260623_145550"
+        provenance: runtime_attested
+    root_expectations:
+      - modality: published_map
+        relative_pattern: "map.png"
+        present: true
+        file_count: 1
+    applicable_stages: [map_publish]
+    excluded_stages: [initial_annotation, tracking, projection, trajectory, publish, fix]
+    expected_command_steps:
+      - processing_calibration_snapshot
+      - assemble_finish_temp
+      - preprocess_create_box
+      - preprocess_odom_convert
+      - preprocess_resize
+      - metadata_generate
+      - map_publish
+      - video_prepare
+      - initial_annotation
+      - tracking
+    artifact_stage_rules:
+      - {path_pattern: "map.png", stage: map_publish}
+    candidate_attestation_required: true
+    legacy_oracle_selection_required: true
+
+  - id: m1_prepare_metadata_20260623_145550
+    sample_id: nav_20260623_145550_zhigu_wuhan_0
+    artifact_root_kind: finish_temp_date
+    role_scopes:
+      legacy:
+        scope_kind: prepare_metadata
+        artifact_scope: "v1.0-trainval"
+        dataset_date: "20260623"
+        source_clip: "20260623_145550"
+        provenance: historical_unattested
+      candidate:
+        scope_kind: prepare_metadata
+        artifact_scope: "v1.0-trainval"
+        dataset_date: "20270623"
+        source_clip: "20260623_145550"
+        provenance: runtime_attested
+    root_expectations:
+      - modality: generated_metadata
+        relative_pattern: "**/*"
+        present: true
+    applicable_stages: [metadata_generate]
+    excluded_stages: [initial_annotation, tracking, projection, trajectory, publish, fix]
+    expected_command_steps:
+      - processing_calibration_snapshot
+      - assemble_finish_temp
+      - preprocess_create_box
+      - preprocess_odom_convert
+      - preprocess_resize
+      - metadata_generate
+      - map_publish
+      - video_prepare
+      - initial_annotation
+      - tracking
+    artifact_stage_rules:
+      - {path_pattern: "**/*", stage: metadata_generate}
+    candidate_attestation_required: true
+    legacy_oracle_selection_required: true
+
+  - id: m1_tracking_20260623_145550_segment_1
+    artifact_root_kind: finish_temp_date
+    role_scopes:
+      legacy:
+        artifact_scope: "samples/20260623/20260623_145550_zhigu_wuhan_1"
+        dataset_date: "20260623"
+        source_clip: "20260623_145550"
+        internal_segment: "20260623_145550_zhigu_wuhan_1"
+        provenance: historical_unattested
+      candidate:
+        artifact_scope: "samples/20270623/20260623_145550_zhigu_wuhan_1"
+        dataset_date: "20270623"
+        source_clip: "20260623_145550"
+        internal_segment: "20260623_145550_zhigu_wuhan_1"
+        provenance: runtime_attested
+    root_expectations:
+      - {modality: initial_annotation_yaml, relative_pattern: "*.yaml", present: true}
+      - {modality: tracking_images, relative_pattern: "tracking_img_*/*", present: true}
+      - {modality: tracking_points, relative_pattern: "img_*.txt", present: true}
+    applicable_stages: [preprocess, metadata, initial_annotation, tracking]
+    excluded_stages: [projection, trajectory, publish, fix]
+    expected_command_steps:
+      - processing_calibration_snapshot
+      - assemble_finish_temp
+      - preprocess_create_box
+      - preprocess_odom_convert
+      - preprocess_resize
+      - metadata_generate
+      - map_publish
+      - video_prepare
+      - initial_annotation
+      - tracking
+    document_normalizations:
+      - {path_pattern: "*.yaml", selector: '$["paths"]["img2video_mp4"]', strategy: artifact_local_file, expected_relative_path: "dog.mp4"}
+    dimensions_only_image_patterns: ["tracking_img_*/*"]
+    artifact_stage_rules:
+      - {path_pattern: "*.yaml", stage: initial_annotation}
+      - {path_pattern: "tracking_img_*/*", stage: tracking}
+      - {path_pattern: "img_*.txt", stage: tracking}
+    candidate_attestation_required: true
+    legacy_oracle_selection_required: true
+
+  - id: m1_tracking_20260623_145550_segment_2
+    artifact_root_kind: finish_temp_date
+    role_scopes:
+      legacy:
+        artifact_scope: "samples/20260623/20260623_145550_zhigu_wuhan_2"
+        dataset_date: "20260623"
+        source_clip: "20260623_145550"
+        internal_segment: "20260623_145550_zhigu_wuhan_2"
+        provenance: historical_unattested
+      candidate:
+        artifact_scope: "samples/20270623/20260623_145550_zhigu_wuhan_2"
+        dataset_date: "20270623"
+        source_clip: "20260623_145550"
+        internal_segment: "20260623_145550_zhigu_wuhan_2"
+        provenance: runtime_attested
+    root_expectations:
+      - {modality: initial_annotation_yaml, relative_pattern: "*.yaml", present: true}
+      - {modality: tracking_images, relative_pattern: "tracking_img_*/*", present: true}
+      - {modality: tracking_points, relative_pattern: "img_*.txt", present: true}
+    applicable_stages: [preprocess, metadata, initial_annotation, tracking]
+    excluded_stages: [projection, trajectory, publish, fix]
+    expected_command_steps:
+      - processing_calibration_snapshot
+      - assemble_finish_temp
+      - preprocess_create_box
+      - preprocess_odom_convert
+      - preprocess_resize
+      - metadata_generate
+      - map_publish
+      - video_prepare
+      - initial_annotation
+      - tracking
+    document_normalizations:
+      - {path_pattern: "*.yaml", selector: '$["paths"]["img2video_mp4"]', strategy: artifact_local_file, expected_relative_path: "dog.mp4"}
+    dimensions_only_image_patterns: ["tracking_img_*/*"]
+    artifact_stage_rules:
+      - {path_pattern: "*.yaml", stage: initial_annotation}
+      - {path_pattern: "tracking_img_*/*", stage: tracking}
+      - {path_pattern: "img_*.txt", stage: tracking}
+    candidate_attestation_required: true
+    legacy_oracle_selection_required: true
+
+  - id: m1_tracking_20260623_145550_segment_3
+    artifact_root_kind: finish_temp_date
+    role_scopes:
+      legacy:
+        artifact_scope: "samples/20260623/20260623_145550_zhigu_wuhan_3"
+        dataset_date: "20260623"
+        source_clip: "20260623_145550"
+        internal_segment: "20260623_145550_zhigu_wuhan_3"
+        provenance: historical_unattested
+      candidate:
+        artifact_scope: "samples/20270623/20260623_145550_zhigu_wuhan_3"
+        dataset_date: "20270623"
+        source_clip: "20260623_145550"
+        internal_segment: "20260623_145550_zhigu_wuhan_3"
+        provenance: runtime_attested
+    root_expectations:
+      - {modality: initial_annotation_yaml, relative_pattern: "*.yaml", present: true}
+      - {modality: tracking_images, relative_pattern: "tracking_img_*/*", present: true}
+      - {modality: tracking_points, relative_pattern: "img_*.txt", present: true}
+    applicable_stages: [preprocess, metadata, initial_annotation, tracking]
+    excluded_stages: [projection, trajectory, publish, fix]
+    expected_command_steps:
+      - processing_calibration_snapshot
+      - assemble_finish_temp
+      - preprocess_create_box
+      - preprocess_odom_convert
+      - preprocess_resize
+      - metadata_generate
+      - map_publish
+      - video_prepare
+      - initial_annotation
+      - tracking
+    document_normalizations:
+      - {path_pattern: "*.yaml", selector: '$["paths"]["img2video_mp4"]', strategy: artifact_local_file, expected_relative_path: "dog.mp4"}
+    dimensions_only_image_patterns: ["tracking_img_*/*"]
+    artifact_stage_rules:
+      - {path_pattern: "*.yaml", stage: initial_annotation}
+      - {path_pattern: "tracking_img_*/*", stage: tracking}
+      - {path_pattern: "img_*.txt", stage: tracking}
+    candidate_attestation_required: true
+    legacy_oracle_selection_required: true
+
+  - id: m1_tracking_20260623_145550_segment_4
+    artifact_root_kind: finish_temp_date
+    role_scopes:
+      legacy:
+        artifact_scope: "samples/20260623/20260623_145550_zhigu_wuhan_4"
+        dataset_date: "20260623"
+        source_clip: "20260623_145550"
+        internal_segment: "20260623_145550_zhigu_wuhan_4"
+        provenance: historical_unattested
+      candidate:
+        artifact_scope: "samples/20270623/20260623_145550_zhigu_wuhan_4"
+        dataset_date: "20270623"
+        source_clip: "20260623_145550"
+        internal_segment: "20260623_145550_zhigu_wuhan_4"
+        provenance: runtime_attested
+    root_expectations:
+      - {modality: initial_annotation_yaml, relative_pattern: "*.yaml", present: true}
+      - {modality: tracking_images, relative_pattern: "tracking_img_*/*", present: true}
+      - {modality: tracking_points, relative_pattern: "img_*.txt", present: true}
+    applicable_stages: [preprocess, metadata, initial_annotation, tracking]
+    excluded_stages: [projection, trajectory, publish, fix]
+    expected_command_steps:
+      - processing_calibration_snapshot
+      - assemble_finish_temp
+      - preprocess_create_box
+      - preprocess_odom_convert
+      - preprocess_resize
+      - metadata_generate
+      - map_publish
+      - video_prepare
+      - initial_annotation
+      - tracking
+    document_normalizations:
+      - {path_pattern: "*.yaml", selector: '$["paths"]["img2video_mp4"]', strategy: artifact_local_file, expected_relative_path: "dog.mp4"}
+    dimensions_only_image_patterns: ["tracking_img_*/*"]
+    artifact_stage_rules:
+      - {path_pattern: "*.yaml", stage: initial_annotation}
+      - {path_pattern: "tracking_img_*/*", stage: tracking}
+      - {path_pattern: "img_*.txt", stage: tracking}
+    candidate_attestation_required: true
+    legacy_oracle_selection_required: true
+
+  - id: m1_tracking_20260623_145550_segment_5
+    artifact_root_kind: finish_temp_date
+    role_scopes:
+      legacy:
+        artifact_scope: "samples/20260623/20260623_145550_zhigu_wuhan_5"
+        dataset_date: "20260623"
+        source_clip: "20260623_145550"
+        internal_segment: "20260623_145550_zhigu_wuhan_5"
+        provenance: historical_unattested
+      candidate:
+        artifact_scope: "samples/20270623/20260623_145550_zhigu_wuhan_5"
+        dataset_date: "20270623"
+        source_clip: "20260623_145550"
+        internal_segment: "20260623_145550_zhigu_wuhan_5"
+        provenance: runtime_attested
+    root_expectations:
+      - {modality: initial_annotation_yaml, relative_pattern: "*.yaml", present: true}
+      - {modality: tracking_images, relative_pattern: "tracking_img_*/*", present: true}
+      - {modality: tracking_points, relative_pattern: "img_*.txt", present: true}
+    applicable_stages: [preprocess, metadata, initial_annotation, tracking]
+    excluded_stages: [projection, trajectory, publish, fix]
+    expected_command_steps:
+      - processing_calibration_snapshot
+      - assemble_finish_temp
+      - preprocess_create_box
+      - preprocess_odom_convert
+      - preprocess_resize
+      - metadata_generate
+      - map_publish
+      - video_prepare
+      - initial_annotation
+      - tracking
+    document_normalizations:
+      - {path_pattern: "*.yaml", selector: '$["paths"]["img2video_mp4"]', strategy: artifact_local_file, expected_relative_path: "dog.mp4"}
+    dimensions_only_image_patterns: ["tracking_img_*/*"]
+    artifact_stage_rules:
+      - {path_pattern: "*.yaml", stage: initial_annotation}
+      - {path_pattern: "tracking_img_*/*", stage: tracking}
+      - {path_pattern: "img_*.txt", stage: tracking}
+    candidate_attestation_required: true
+    legacy_oracle_selection_required: true
 
   - id: m2_postprocess_20260623_145550
     sample_id: nav_20260623_145550_zhigu_wuhan_0

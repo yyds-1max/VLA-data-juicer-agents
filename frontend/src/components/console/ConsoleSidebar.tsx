@@ -1,23 +1,25 @@
 import { Bot, ChartNoAxesCombined, Database, FlaskConical, GitBranch, PenTool } from "lucide-react";
+import { useNavigate } from "react-router-dom";
 
 import type { ConsolePageId, NavItem } from "../../features/console/consoleTypes";
 import { cn } from "../../lib/utils";
 
 type ConsoleSidebarProps = {
   activePage: ConsolePageId;
-  onChange: (pageId: ConsolePageId) => void;
 };
 
-const navItems: NavItem[] = [
-  { id: "dashboard", label: "闭环仪表盘", group: "概览", icon: ChartNoAxesCombined },
-  { id: "agent", label: "Agent 工作流", group: "流程", icon: GitBranch },
-  { id: "data", label: "数据管理", group: "数据", icon: Database },
-  { id: "annotate", label: "自动标注", group: "标注", icon: PenTool },
-  { id: "model", label: "模型迭代", group: "模型", icon: Bot },
-  { id: "simulation", label: "测试/仿真", group: "验证", icon: FlaskConical },
+export const consoleNavItems: NavItem[] = [
+  { id: "dashboard", label: "闭环仪表盘", group: "概览", icon: ChartNoAxesCombined, path: "/" },
+  { id: "agent", label: "Agent 工作流", group: "流程", icon: GitBranch, path: "/agent" },
+  { id: "data", label: "数据管理", group: "数据", icon: Database, path: "/data" },
+  { id: "annotate", label: "自动标注", group: "标注", icon: PenTool, path: "/annotation/jobs" },
+  { id: "model", label: "模型迭代", group: "模型", icon: Bot, path: "/model" },
+  { id: "simulation", label: "测试/仿真", group: "验证", icon: FlaskConical, path: "/simulation" },
 ];
 
-export function ConsoleSidebar({ activePage, onChange }: ConsoleSidebarProps) {
+export function ConsoleSidebar({ activePage }: ConsoleSidebarProps) {
+  const navigate = useNavigate();
+
   return (
     <aside className="fixed inset-x-0 top-0 z-20 border-b border-console-line bg-console-panel/95 px-4 shadow-sm backdrop-blur md:inset-y-0 md:left-0 md:right-auto md:w-64 md:border-b-0 md:border-r md:px-0 md:shadow-none">
       <div className="flex h-full flex-col">
@@ -37,7 +39,7 @@ export function ConsoleSidebar({ activePage, onChange }: ConsoleSidebarProps) {
 
         <nav className="min-w-0 flex-1 overflow-x-auto border-t border-console-line py-2 md:overflow-y-auto md:border-t-0 md:px-3 md:py-4" aria-label="DataLoop console navigation">
           <ul className="flex gap-2 md:block md:space-y-2">
-            {navItems.map((item) => (
+            {consoleNavItems.map((item) => (
               <li key={item.id} className="md:space-y-1">
                 <div className="hidden px-3 text-[10px] font-medium uppercase tracking-[0.12em] text-console-muted md:block">{item.group}</div>
                 <button
@@ -48,7 +50,7 @@ export function ConsoleSidebar({ activePage, onChange }: ConsoleSidebarProps) {
                     activePage === item.id &&
                       "border-console-line bg-console-panel2 text-console-text shadow-[inset_3px_0_0_#2d6cdf]",
                   )}
-                  onClick={() => onChange(item.id)}
+                  onClick={() => navigate(item.path)}
                 >
                   <item.icon className={cn("h-4 w-4 shrink-0", activePage === item.id && "text-console-cyan")} aria-hidden="true" />
                   <span className="truncate">{item.label}</span>

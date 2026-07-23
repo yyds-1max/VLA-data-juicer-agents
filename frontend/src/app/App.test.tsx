@@ -107,7 +107,7 @@ function mockScrollableElement(element: HTMLElement) {
 }
 
 async function renderAppWithDashboardSettled() {
-  const result = render(<App />);
+  const result = render(<App routerMode="declarative" />);
 
   await waitFor(() => expect(apiMocks.getNavigationDatasetSummary).toHaveBeenCalled());
   await waitFor(() => expect(screen.getByText("3.5 秒")).toBeInTheDocument());
@@ -116,6 +116,7 @@ async function renderAppWithDashboardSettled() {
 }
 
 beforeEach(() => {
+  window.history.replaceState({}, "", "/");
   vi.clearAllMocks();
   resetNavigationDatasetSummaryCache();
   Object.defineProperty(window, "innerWidth", { configurable: true, writable: true, value: 1280 });
@@ -799,7 +800,7 @@ test("navigation dataset summary is reused while switching console pages", async
   expect(apiMocks.getNavigationDatasetSummary).toHaveBeenCalledTimes(1);
 
   fireEvent.click(screen.getByRole("button", { name: "自动标注" }));
-  expect(screen.getByText("视觉检测")).toBeVisible();
+  expect(screen.getByText("自动标注任务")).toBeVisible();
 
   fireEvent.click(screen.getByRole("button", { name: "闭环仪表盘" }));
   expect(await screen.findByText("3.5 秒")).toBeVisible();
@@ -911,17 +912,15 @@ test("data management image drawer ignores listing that resolves after close", a
   expect(screen.queryByText("late.jpg")).not.toBeInTheDocument();
 });
 
-test("annotation page switches pipeline results and review views", async () => {
+test("annotation page replaces fixtures with the real M1 task entry", async () => {
   await renderAppWithDashboardSettled();
 
   fireEvent.click(screen.getByRole("button", { name: "自动标注" }));
-  expect(screen.getByText("视觉检测")).toBeVisible();
-
-  fireEvent.click(screen.getByRole("tab", { name: "标注结果" }));
-  expect(screen.getByText("ANN-82401")).toBeVisible();
-
-  fireEvent.click(screen.getByRole("tab", { name: "人工复核" }));
-  expect(screen.getByText("待复核样本")).toBeVisible();
+  expect(screen.getByText("自动标注任务")).toBeVisible();
+  expect(screen.getByText("从已同步数据开始，完成 Web 首帧标注与 Tracking。")).toBeVisible();
+  expect(screen.queryByText("视觉检测")).not.toBeInTheDocument();
+  expect(window.location.pathname).toBe("/annotation/jobs");
+  expect(await screen.findByText("当前服务器暂不能创建处理任务")).toBeVisible();
 });
 
 test("model iteration page renders versions training and compare tabs", async () => {

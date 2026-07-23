@@ -51,6 +51,14 @@ setup 脚本会选择数据解释器、加载两个 ROS setup，并调整命令/
 `external_runtime`，没有复制进仓库；部署时必须按 manifest 再次核对 setup、
 解释器、包版本和动态库，不能把“已只读审计”误解为“已部署可复制环境”。
 
+M1 writer 还要求安装证据 fail-closed。服务器安装固定
+Xvfb `2:1.20.13-1ubuntu1~20.04.20` 后，必须只读捕获并在受控 manifest 更新中
+登记 `xvfb_deb_package`、`xvfb_server_binary`、`xvfb_launcher`、
+`sandbox_binary` 与 `runtime_dependency_summary` 的 SHA-256、大小和 executable
+bit；部署配置同时显式绑定 deb 与依赖摘要文件。当前仓库 manifest 尚未臆造这些
+服务器安装后摘要，因此在完成该门禁并更新 manifest 前，M1
+`/api/annotation/capabilities` 应返回不可用，writer Job 不得创建。
+
 ## 只读验证
 
 验证提交清单本身：
@@ -101,6 +109,14 @@ vla-nav-runtime-manifest verify-root \
 `run_odom.sh` 内部命令。`run_fix.sh` 对 final 中的每个 segment 调用现有 `_0525`
 Fix 脚本。注释掉的畸变、`cp_ins` 和旧 sensors 路径不属于活动依赖。
 
+只读核对的 `_01/run_odom.sh` 在扫描 `sync_data` 时存在明确的活动业务条件：
+仅把名称匹配 `2025*` 或 `2026*` 的内部 clip 放入 `CLIP_SOURCES`，无匹配项时
+直接退出。M1 为保持冻结脚本语义，遇到其他年份前缀会返回
+`unsupported_runtime_variant`，不会静默扩大处理范围。外层测试数据日期可以是
+2027，但当前验收副本的内部 clip 名仍来自 2026。将来真实内部 clip 改为 2027
+或其他命名时，应先核对并冻结新的业务脚本版本，再建立新的 Runtime 版本或经
+明确批准扩展本 Runtime；不能把该限制当成普通安全正则直接删除。
+
 当前尚不能只凭 Git manifest 完整复原的外部条件包括 GPU/驱动、系统 TBB、
 `libstdc++`、glibc、Tk/X display 和 generated mutable scratch 的初始状态。
 这些条目在 manifest 中明确标记为 `external_runtime` 或 `generated_mutable`，
@@ -114,15 +130,43 @@ M1 Tracking、M2 postprocess 和 M2 Fix 使用独立 case；Fix case 显式包�
 `artifact_scope` 和必要产物：
 
 - `finish_temp_date`：传入该日期的 `finish_temp` 根，case 定位
-  `samples/<date>/<segment>`；
+  `samples/<date>/<segment>`；M1 还分别以严格的根级 case 比较 `maps/` 和
+  `v1.0-trainval/`，不能只比较 segment；
 - `finish_date`：传入 final 日期根，case 定位内部 segment；
 - `staged_sync_segment`：传入 `pcd_to_grid` 的 staging 输出 segment；缺
   gridmap case 还必须通过 `--source-root` 传入原始只读同步 segment，以分别验证
   “输入确实缺少 gridmap”和“输出已生成 gridmap”。
 
-当前命令步骤和 Runtime manifest 哈希仍由 CLI 调用者提供，只能证明“声明值符合
-case”，不能证明命令真实执行。M1/M2 服务器验收必须把这两项自动绑定到系统
-execution ledger 和已验证 manifest，不能依赖人工填写。
+Golden contract v2 的 candidate 命令顺序、Runtime manifest、处理标定和首帧标注
+revision 集合只能通过 `AnnotationStore.runtime_run_attestation(run_ref)` 从已提交的
+`RuntimeRun` 账本投影。CLI 不接受 candidate attestation JSON，也不能用
+`--command-step` 或 `--runtime-manifest-sha256` 为 v2 candidate 自报执行事实；生产
+验收入口必须使用 Store 绑定的比较函数。历史 reference 保持
+`historical_unattested`，不得补造旧执行账本。
+
+M1 的 20260623/20270623 配对按 `_0` 至 `_5` 六个内部 segment 分别登记。历史
+`20260623_temp` 与 `20260623_temp_1` 都含 Tracking 产物，因此比较时必须显式提供
+已核对的 `oracle_ref`；工具不得按目录名、时间或存在性自行挑选 reference。
+
+M1 prepare 在 staging 根产生的业务产物固定分为三类：
+
+- `samples/<date>/<segment>`：逐 segment 严格比较；
+- `maps/`：由 `map_publish` 产生，单独严格比较；
+- `v1.0-trainval/`：由 `metadata_generate` 产生，单独严格比较。
+
+`.runtime/` 是系统私有输入、overlay 和执行账本，不是历史业务 oracle scope，
+不能作为 case 或公开报告的一部分；它仍包含在 prepare artifact hash 中。Store
+绑定根级 case 时会把 staging 顶层严格限制为
+`.runtime/maps/samples/v1.0-trainval`，并验证 `samples` 只包含本 Job 日期且与
+Store 中全部 tracked segments 一一对应。任何额外、缺失、symlink 或未登记的
+根级产物都必须使 attestation 失败；不能用 ignore 或只跑 segment case 绕过。
+
+contract v2 不允许 ignore pattern 或非零数值 tolerance。唯一动态图片策略是
+`tracking_img_*/*` 只比较文件树、数量、格式和尺寸；唯一文档归一化是已登记 YAML
+中的 `paths.img2video_mp4`，且只能替换指向各自 artifact scope 内 `dog.mp4` 的
+精确值。YAML 的其他字节表示（包括键顺序和空白）、`img_*.txt`、其他图片、Schema
+和数值必须严格比较。任何非白名单差异都应立即判为 `DIFFERENT`，报告相对文件、
+字段/数值、阶段和推测原因；不得为通过验收而静默调整算法或放宽比较器。
 
 对公司业务数据进行 oracle/candidate capture、dry-run 或真实处理不属于本地 M0
 自动动作，必须在服务器验收阶段单独批准；capture 时输入必须处于停止写入的稳定

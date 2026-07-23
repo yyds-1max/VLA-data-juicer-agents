@@ -38,10 +38,27 @@ from vla_data_juicer_agents.navigation.plan_store import (
 )
 from vla_data_juicer_agents.navigation.task_state import NavigationTask
 from vla_data_juicer_agents.navigation.task_store import SqliteNavigationTaskStore
+from vla_data_juicer_agents.navigation.writer_lock import (
+    clear_navigation_writer_quarantine,
+    ensure_navigation_writer_quarantine,
+)
 from vla_data_juicer_agents.runtime.agentscope_runtime import (
     _enrich_plan_human_decision_event,
     _human_decision_payload_from_tool_call,
 )
+
+
+@pytest.fixture(autouse=True)
+def _private_navigation_writer_lock(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    lock_root = tmp_path / "writer-lock"
+    lock_root.mkdir(mode=0o700)
+    monkeypatch.setenv(
+        "VLA_NAVIGATION_WRITER_LOCK_PATH",
+        str(lock_root / "navigation.lock"),
+    )
 
 
 def _decode_tool_payload(payload):
@@ -748,6 +765,79 @@ def test_plan_bound_writer_returns_compact_busy_without_invocation(monkeypatch, 
         "retry": "wait_and_reinspect",
     }
     assert invoked == []
+
+
+def test_navigation_plan_writer_is_blocked_by_global_quarantine(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    settings = NavigationSettings(
+        vladatasets_root=tmp_path / "datasets",
+        processing_root=tmp_path / "processing",
+    )
+    date, segment = "20260710", "segment-a"
+    (settings.raw_data_root / date / segment).mkdir(parents=True)
+    database = tmp_path / "navigation.sqlite"
+    task_store = SqliteNavigationTaskStore(database)
+    task = _create_task(
+        task_store,
+        date=date,
+        segments=[segment],
+        scene_mode=None,
+        dry_run=False,
+    )
+    plan_store = SqliteNavigationPlanRepository(database)
+    plan = _activate_plan(
+        plan_store,
+        task,
+        "extract_sync",
+        1,
+        extract_plan(two_steps=True),
+    )
+    invoked: list[dict] = []
+    monkeypatch.setattr(
+        plan_execution,
+        "prepare_raw_data",
+        lambda **kwargs: invoked.append(kwargs)
+        or ok_result("prepare_raw_data"),
+    )
+    lock_path = tmp_path / "writer-lock" / "navigation.lock"
+    ensure_navigation_writer_quarantine(
+        lock_path,
+        recovery_ref="annotation_recovery",
+    )
+    tools = {
+        tool.name: tool
+        for tool in plan_execution.build_plan_bound_execution_tools(
+            task=task,
+            plan_store=plan_store,
+            evidence_store=FileNavigationEvidenceStore(tmp_path / "evidence"),
+            settings=settings,
+            dry_run=False,
+            cancellation=None,
+            web_session_id=task.created_by_web_session_id,
+            agentscope_session_id=task.agentscope_session_id,
+        )
+    }
+
+    result = call_tool(
+        tools["prepare_raw_data_tool"],
+        plan_id=plan.plan_id,
+        step_id="prepare",
+    )
+
+    assert result == {
+        "ok": False,
+        "error_type": "navigation_writer_coordination_unavailable",
+        "message": "Navigation writes require an operator safety check.",
+        "retry": "operator_recovery_required",
+    }
+    assert invoked == []
+    assert plan_store.get_current_step(plan.plan_id)["step"]["status"] == "pending"
+    assert clear_navigation_writer_quarantine(
+        lock_path,
+        all_writer_process_groups_absent=True,
+    )
 
 
 def test_finish_plan_execution_permission_does_not_infer_phase_from_artifacts(tmp_path):

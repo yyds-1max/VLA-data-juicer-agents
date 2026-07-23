@@ -8,10 +8,17 @@ from contextlib import asynccontextmanager, suppress
 from pathlib import Path
 from typing import Any
 
-from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
-from fastapi.responses import FileResponse
+from fastapi import FastAPI, HTTPException, Request, WebSocket, WebSocketDisconnect
+from fastapi.exception_handlers import request_validation_exception_handler
+from fastapi.exceptions import RequestValidationError
+from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 
+from vla_data_juicer_agents.annotation.api import create_annotation_router
+from vla_data_juicer_agents.annotation.application import AnnotationApplicationService
+from vla_data_juicer_agents.annotation.catalog import CalibrationCatalog
+from vla_data_juicer_agents.annotation.store import AnnotationStore
+from vla_data_juicer_agents.annotation.worker import AnnotationWorker
 from vla_data_juicer_agents.navigation.dataset_catalog import (
     list_sync_images,
     resolve_sync_image_path,
@@ -45,6 +52,11 @@ def create_app(
     db_path: str | Path | None = None,
     frontend_dist: str | Path | None = None,
     agentscope_runtime: Any | None = None,
+    annotation_db_path: str | Path | None = None,
+    annotation_runtime: Any | None = None,
+    annotation_work_root: str | Path | None = None,
+    annotation_clip_data_root: str | Path | None = None,
+    annotation_catalog: Any | None = None,
 ) -> FastAPI:
     if agentscope_runtime is None:
         raise RuntimeError(
@@ -60,6 +72,20 @@ def create_app(
 
     database_path = Path(db_path) if db_path is not None else Path(working_dir) / "sessions.sqlite"
     store = WebSessionStore(database_path)
+    annotation_database_path = (
+        Path(annotation_db_path)
+        if annotation_db_path is not None
+        else Path(working_dir) / "annotation.sqlite"
+    )
+    annotation_store = AnnotationStore(annotation_database_path)
+    annotation_worker = AnnotationWorker(annotation_store, annotation_runtime)
+    annotation_service = AnnotationApplicationService(
+        store=annotation_store,
+        worker=annotation_worker,
+        catalog=annotation_catalog or CalibrationCatalog.default(),
+        work_root=annotation_work_root,
+        clip_data_root=annotation_clip_data_root,
+    )
     bus = SessionEventBus()
 
     async def publish_session_event(session_id: str, event: dict[str, Any]) -> None:
@@ -87,7 +113,19 @@ def create_app(
                 else None
             )
             try:
-                yield
+                annotation_worker_task = asyncio.create_task(
+                    annotation_worker.run_forever(),
+                    name="annotation-worker",
+                )
+                try:
+                    yield
+                finally:
+                    await annotation_worker.stop()
+                    # Runtime cancellation owns SIGTERM→SIGKILL and process
+                    # group cleanup. Never abandon an asyncio.to_thread call:
+                    # lifespan closes only after the Worker confirms the
+                    # executing Runtime call has returned.
+                    await annotation_worker_task
             finally:
                 if recovery_task is not None:
                     recovery_task.cancel()
@@ -97,12 +135,35 @@ def create_app(
                     await event_bridge.stop()
 
     app = FastAPI(title="DataPilot Web API", lifespan=lifespan)
+
+    @app.exception_handler(RequestValidationError)
+    async def safe_annotation_validation_error(
+        request: Request,
+        exc: RequestValidationError,
+    ):
+        if request.url.path.startswith("/api/annotation"):
+            return JSONResponse(
+                status_code=422,
+                content={
+                    "detail": {
+                        "code": "invalid_annotation_request",
+                        "message": "The annotation request is invalid.",
+                    }
+                },
+            )
+        return await request_validation_exception_handler(request, exc)
     app.state.store = store
     app.state.manager = manager
     app.state.bus = bus
     app.state.agentscope_runtime = agentscope_runtime
+    app.state.annotation_store = annotation_store
+    app.state.annotation_service = annotation_service
+    app.state.annotation_worker = annotation_worker
 
     app.mount(agentscope_runtime.config.agentscope_mount_path, agentscope_runtime.app)
+    # Extend with concrete routes so every app route retains Starlette's
+    # ``path`` contract (some FastAPI versions add a private include marker).
+    app.router.routes.extend(create_annotation_router(annotation_service).routes)
 
     @app.post("/api/sessions", response_model=CreateSessionResponse)
     async def create_session(request: CreateSessionRequest) -> CreateSessionResponse:
@@ -304,6 +365,23 @@ def create_app(
             if index_path.exists():
                 @app.get("/", include_in_schema=False)
                 async def frontend_index() -> FileResponse:
+                    return FileResponse(index_path)
+
+                @app.get("/agent", include_in_schema=False)
+                @app.get("/data", include_in_schema=False)
+                @app.get("/annotation/jobs", include_in_schema=False)
+                @app.get("/annotation/jobs/{job_ref}", include_in_schema=False)
+                @app.get(
+                    "/annotation/jobs/{job_ref}/segments/{segment_ref}",
+                    include_in_schema=False,
+                )
+                @app.get("/model", include_in_schema=False)
+                @app.get("/simulation", include_in_schema=False)
+                async def frontend_route(
+                    job_ref: str | None = None,
+                    segment_ref: str | None = None,
+                ) -> FileResponse:
+                    del job_ref, segment_ref
                     return FileResponse(index_path)
 
     return app

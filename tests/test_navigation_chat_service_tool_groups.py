@@ -83,6 +83,16 @@ EXECUTION_TOOL_NAMES = {
 GENERIC_OR_RESET_TOOL_NAMES = {"bash", "read", "task", "reset_tools"}
 
 
+@pytest.fixture(autouse=True)
+def _private_navigation_writer_lock(tmp_path, monkeypatch):
+    lock_root = tmp_path / "writer-lock"
+    lock_root.mkdir(mode=0o700)
+    monkeypatch.setenv(
+        "VLA_NAVIGATION_WRITER_LOCK_PATH",
+        str(lock_root / "navigation.lock"),
+    )
+
+
 class ProcessingSpy:
     def __init__(self, model: ScriptedChatModel) -> None:
         self.model = model

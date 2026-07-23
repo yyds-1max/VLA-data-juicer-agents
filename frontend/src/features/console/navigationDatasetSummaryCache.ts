@@ -37,6 +37,10 @@ function loadNavigationDatasetSummary() {
   return pendingSummary;
 }
 
+export function getNavigationDatasetSummaryCached(): Promise<NavigationDatasetSummary> {
+  return loadNavigationDatasetSummary();
+}
+
 export function resetNavigationDatasetSummaryCache() {
   cachedSummary = null;
   pendingSummary = null;

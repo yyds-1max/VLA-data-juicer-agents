@@ -80,6 +80,17 @@ PLANNING_TOOL_NAMES = {
     "submit_finish_processing_plan_tool",
 }
 
+
+@pytest.fixture(autouse=True)
+def _private_navigation_writer_lock(tmp_path, monkeypatch):
+    lock_root = tmp_path / "writer-lock"
+    lock_root.mkdir(mode=0o700)
+    monkeypatch.setenv(
+        "VLA_NAVIGATION_WRITER_LOCK_PATH",
+        str(lock_root / "navigation.lock"),
+    )
+
+
 EXECUTION_OBSERVATION_TOOL_NAMES = {
     "list_observation_evidence_tool",
     "read_observation_evidence_tool",

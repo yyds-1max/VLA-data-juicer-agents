@@ -311,13 +311,20 @@ case 不能替代整条 clip 的真实业务等价验收。来自 macOS 复制�
 AppleDouble 文件不属于业务输入，拆包发现与 raw 同源比较均须忽略并报告，不能
 把它们当作 ROS bag。
 
-### M1（2026-07-23，开发中）
+### M1（2026-07-23，本地实现与回归完成，待服务器验收）
 
-- 已完成只读任务级设计并保存
+- 已完成任务级设计、本地实现和独立代码审计，权威记录为
   `docs/automatic-annotation-m1-plan.md`；
 - 开发基线固定为 `f618c6c`，开发分支为
   `codex/automatic-annotation-m1`；
 - M1 只实现 `navigation_odom_v1` 的 Web 首帧标注与 Tracking，不提前接入
   M2 后处理/Fix、M3 智能体或 M4 AI；
+- 本地门禁为 Python `1369 passed`、前端 `204 passed`、Playwright
+  `7 passed`、Golden `73 passed`、Router suite `17 cases validated`，前端
+  production build、compileall 和 diff-check 均通过；
+- Golden 的 M1 必需范围已覆盖两个门禁 clip 的 `maps/`、`v1.0-trainval/`
+  和全部内部 segments，不允许 candidate 自报路径、宽泛 ignore、非零 tolerance
+  或未登记 normalization；
 - 系统 Runtime payload、固定 Xvfb、2027 测试数据拆解/同步和真实 Tracking
-  仍受单独服务器 writer 门禁约束。
+  仍受单独服务器 writer 门禁约束；尚无真实 candidate/oracle 差异结论，因此
+  M1 尚未冻结，也不能进入 M2。

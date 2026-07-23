@@ -1,6 +1,6 @@
 # 自动标注 M1：Web 首帧标注与 Tracking 开发计划
 
-> 状态：开发中  
+> 状态：本地实现与回归门禁通过，待服务器验收（未冻结）
 > 基线提交：`f618c6c`  
 > 开发分支：`codex/automatic-annotation-m1`  
 > 上位路线：`docs/automatic-annotation-roadmap.md`
@@ -132,9 +132,18 @@ NavigationTrackingRuntime.track(...)
 - 使用固定 Xvfb 无界面运行，不回退 XQuartz。
 - Annotation DB lease 防止重复 claim；系统级 `fcntl` writer lock 同时约束
   Annotation Worker 和现有 Navigation plan execution。
+- writer 协调把运行所有权与恢复隔离分开：`<lock>.active` 只由当前 writer
+  持有并在确认子进程退出后删除；每个未知副作用事件创建独立、append-only 的
+  `<lock>.quarantine.<opaque-ref>`。任一标记存在时，Navigation 与 Annotation
+  writer 都 fail closed。
 - 等待 Web 标注期间不持有 writer lock。
 - 每个 target 完成后提交 checkpoint；retry 只复用哈希仍匹配的完成项。
-- 未知副作用转 `failed/recovery_required`，确认旧进程组消失前不得重跑。
+- 未知副作用转 `failed/recovery_required`，并全局停止所有 Annotation queued
+  claim。恢复必须先完成“全部 Navigation/Annotation writer 进程组已消失”的
+  全局两阶段审计，再用其 completed action ref 对单个 Job 执行 retry/abandon；
+  普通 retry/cancel 不得绕过。全局 action 还要绑定每个 marker 的精确摘要：
+  completion 后清理到一半时，同 action 只可补删原集合的剩余子集；现场一旦
+  出现新 marker，旧 action 必须零删除并要求重新全局确认。
 - cancel 继续使用独立进程组 SIGTERM→SIGKILL，并保留 staging 与审计。
 
 生产 writer 必须显式配置专用 `VLA_ANNOTATION_WORK_ROOT`。任务创建和 Worker
@@ -146,14 +155,25 @@ NavigationTrackingRuntime.track(...)
 Golden v2 分别声明 reference/candidate 日期、clip、内部 segment 和 artifact
 scope，并保持 v1 可读：
 
-- 只允许精确登记的日期 token、artifact root 和
-  `paths.img2video_mp4` selector 归一化；
+- 日期和 artifact root 只通过 reference/candidate 各自登记的 filesystem role
+  scope 做身份映射；结构化文档当前只归一化精确登记的
+  `paths.img2video_mp4` selector。真实产物若出现其他嵌入式日期/root，保持
+  `DIFFERENT` 并先报告，不预设宽泛替换；
 - `tracking_img_*/*` 比较文件树、数量、格式和尺寸，不比较动态 duration/fps
   叠字导致的不稳定 JPEG hash；
 - YAML、`img_*.txt`、其他图片、结构与数值继续严格比较；
+- 每个门禁除逐 segment case 外，还必须分别比较 staging 根的 `maps/` 与
+  `v1.0-trainval/`；`.runtime/` 只受 prepare manifest hash 约束，不作为业务
+  oracle scope。Store 拒绝任何额外或缺失的顶层业务 scope，不能只跑 segment
+  case；
 - candidate 的命令顺序、Runtime manifest、CalibrationSnapshot 和 annotation
   revision-set hash 必须来自 `RuntimeRun`；
 - 历史 reference 标记 `historical_unattested`。
+
+真实 candidate 与 2026 oracle 出现任何非白名单差异时立即停止验收，生成包含
+相对文件、字段/数值 selector、所属阶段和可疑原因的差异报告。未经业务同事确认，
+不得为了通过 Golden 修改业务逻辑、扩大 tolerance、增加 ignore 或新增
+normalization。
 
 主门禁为 `20270605_160904 ↔ 20260605_160904`；第二门禁覆盖
 `20270623_145550` 的全部六个内部 segments。`152930` 用于 Web/recovery
@@ -199,3 +219,39 @@ smoke；`152856` 因历史尺寸不符合当前 resize 链，仅作 provenance �
 只有在无需 XQuartz、Web 可完成全部首帧标注、Tracking 与 legacy 等价、刷新/
 取消/恢复可靠、原始及同步数据未被修改、全量回归通过后，M1 才能冻结并进入
 M2。
+
+## 9. 本地实施结果（2026-07-23）
+
+M1 的本地代码实现、fake-runtime 集成和独立代码审计已经完成：
+
+- Annotation Store、Application Service、公开 API、Worker、Runtime adapter、
+  Legacy YAML、取消/恢复和跨 Navigation/Annotation writer 隔离均已落地；
+- Web Jobs、Job、Segment 工作台和 URL 恢复已替换原自动标注 fixture；
+- Golden registry 共 16 个 case，其中 M1 必需的 11 个 scope 覆盖
+  `20270605_160904` 的 maps、metadata、segment，以及
+  `20270623_145550` 的 maps、metadata 和全部六个 segments；
+- Golden 生产入口只接受 `run_ref`，candidate 根与 scope 必须由
+  AnnotationStore 派生；根级 CLI 等价、差异、输出隔离和脱敏均有端到端测试；
+- 健康 writer、陈旧 active marker、durable quarantine 三态，以及 completion
+  后部分 marker 清理的安全重放均有故障注入测试。
+
+本地最终门禁：
+
+```text
+Python 全量                  1369 passed
+Runtime/锁/API/Plan targeted 183 passed
+前端 Vitest                  204 passed
+前端 Playwright mock E2E     7 passed
+前端 production build        PASS
+Golden 全套                  73 passed
+Golden registry              16 cases validated
+DataPilot Router suite       17 cases validated
+compileall / git diff --check PASS
+独立代码审计                 PASS
+```
+
+以上结果不包含服务器 Runtime payload、固定 Xvfb、真实 GPU/bubblewrap preflight
+或真实数据 writer。尚未运行 `2027 candidate ↔ 2026 oracle`，因此当前没有业务
+产物差异结论，也不能宣称 Tracking 已与 legacy 等价。M1 仍保持“未冻结”；下一步
+只能按 `docs/automatic-annotation-m1-server-acceptance.md` 另行批准并执行服务器
+验收。

@@ -3,8 +3,6 @@ from __future__ import annotations
 import asyncio
 import json
 import hashlib
-import threading
-from contextlib import nullcontext
 from pathlib import Path
 from typing import Any, Callable
 
@@ -52,6 +50,10 @@ from vla_data_juicer_agents.navigation.plan_store import (
 )
 from vla_data_juicer_agents.navigation.task_state import NavigationTask
 from vla_data_juicer_agents.navigation.task_store import SqliteNavigationTaskStore
+from vla_data_juicer_agents.navigation.writer_lock import (
+    NavigationWriterLockError,
+    navigation_writer_lock,
+)
 
 
 _PROCESSING_ACTIONS = {
@@ -66,7 +68,6 @@ _PROCESSING_ACTIONS = {
     "validate_navigation_outputs",
 }
 _EXTERNAL_ACTION = "confirm_navigation_calibration_params"
-_GLOBAL_HEAVY_WRITER_CAPACITY = threading.BoundedSemaphore(1)
 _SENSITIVE_KEYS = {
     "password", "token", "secret", "authorization", "api_key", "cookie"
 }
@@ -1197,12 +1198,7 @@ def build_plan_bound_execution_tools(
                 else None
             )
             def invoke_in_capacity() -> dict[str, Any]:
-                capacity = (
-                    _GLOBAL_HEAVY_WRITER_CAPACITY
-                    if not task.dry_run
-                    else nullcontext()
-                )
-                with capacity:
+                with navigation_writer_lock(enabled=not task.dry_run):
                     return _invoke_plan_step(
                         bound_task=task,
                         plan_id=plan_id,
@@ -1224,7 +1220,17 @@ def build_plan_bound_execution_tools(
                         background_token,
                     ),
                 )
-            return await asyncio.shield(thread_task)
+            try:
+                return await asyncio.shield(thread_task)
+            except NavigationWriterLockError:
+                return {
+                    "ok": False,
+                    "error_type": "navigation_writer_coordination_unavailable",
+                    "message": (
+                        "Navigation writes require an operator safety check."
+                    ),
+                    "retry": "operator_recovery_required",
+                }
 
         invoke.__name__ = f"{action}_tool"
         invoke.__doc__ = (
