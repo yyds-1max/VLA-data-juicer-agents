@@ -1,0 +1,233 @@
+schema_version: 1
+runtime_id: navigation_odom_v1
+
+samples:
+  - id: nav_20260605_160904_zhigu_wuhan_0
+    dataset_date: "20260605"
+    source_clip: "20260605_160904"
+    internal_segment: "20260605_160904_zhigu_wuhan_0"
+    sample_kind: historical_complete
+    contamination_risk: historical_production_read_only
+
+  - id: nav_20260623_145550_zhigu_wuhan_0
+    dataset_date: "20260623"
+    source_clip: "20260623_145550"
+    internal_segment: "20260623_145550_zhigu_wuhan_0"
+    sample_kind: historical_complete
+    contamination_risk: historical_production_read_only
+
+  - id: nav_20260714_104651_zhigu_wuhan_0
+    dataset_date: "20260714"
+    source_clip: "20260714_104651"
+    internal_segment: "20260714_104651_zhigu_wuhan_0"
+    sample_kind: synchronized_input_missing_gridmap
+    contamination_risk: synchronized_input_read_only
+    source_expectations:
+      - modality: fisheye_front
+        relative_pattern: "fisheye_front/*"
+        present: true
+        file_count: 71
+      - modality: rs32_lidar_points
+        relative_pattern: "rs32_lidar_points/*"
+        present: true
+        file_count: 71
+      - modality: odom
+        relative_pattern: "odom/*"
+        present: true
+        file_count: 71
+      - modality: times_json
+        relative_pattern: "times.json"
+        present: true
+      - modality: grid_map
+        relative_pattern: "grid_map/*"
+        present: false
+
+cases:
+  - id: m1_tracking_20260605_160904
+    sample_id: nav_20260605_160904_zhigu_wuhan_0
+    artifact_root_kind: finish_temp_date
+    artifact_scope: "samples/20260605/20260605_160904_zhigu_wuhan_0"
+    root_expectations:
+      - modality: initial_annotation_yaml
+        relative_pattern: "*.yaml"
+        present: true
+      - modality: tracking_images
+        relative_pattern: "tracking_img_*/*"
+        present: true
+      - modality: tracking_points
+        relative_pattern: "img_*.txt"
+        present: true
+    applicable_stages:
+      - preprocess
+      - metadata
+      - initial_annotation
+      - tracking
+    excluded_stages:
+      - projection
+      - trajectory
+      - publish
+      - fix
+    expected_command_steps:
+      - processing_calibration_snapshot
+      - preprocess_create_box
+      - preprocess_odom_convert
+      - preprocess_resize
+      - metadata_generate
+      - map_publish
+      - video_prepare
+      - initial_annotation
+      - tracking
+
+  - id: m2_postprocess_20260605_160904
+    sample_id: nav_20260605_160904_zhigu_wuhan_0
+    artifact_root_kind: finish_date
+    artifact_scope: "20260605_160904_zhigu_wuhan_0"
+    root_expectations:
+      - modality: trajectory
+        relative_pattern: "*_trajectory_five.json"
+        present: true
+    applicable_stages:
+      - projection
+      - world_coordinates
+      - motion
+      - gridmap_transform
+      - trajectory
+      - publish
+    excluded_stages:
+      - initial_annotation
+      - tracking
+      - fix
+    expected_command_steps:
+      - processing_calibration_snapshot
+      - projection
+      - world_coordinates
+      - motion
+      - gridmap_transform
+      - trajectory_0525
+      - publish
+
+  - id: m2_fix_20260605_160904
+    sample_id: nav_20260605_160904_zhigu_wuhan_0
+    artifact_root_kind: finish_date
+    artifact_scope: "20260605_160904_zhigu_wuhan_0"
+    root_expectations:
+      - modality: trajectory_fix
+        relative_pattern: "*_trajectory_fix_five.json"
+        present: true
+    applicable_stages:
+      - fix
+      - review
+    excluded_stages:
+      - preprocess
+      - tracking
+      - projection
+      - publish
+    expected_command_steps:
+      - human_review_boundary
+      - fix_calibration_snapshot
+      - fix_trajectory_0525
+      - review_decision
+
+  - id: m1_tracking_20260623_145550
+    sample_id: nav_20260623_145550_zhigu_wuhan_0
+    artifact_root_kind: finish_temp_date
+    artifact_scope: "samples/20260623/20260623_145550_zhigu_wuhan_0"
+    root_expectations:
+      - modality: initial_annotation_yaml
+        relative_pattern: "*.yaml"
+        present: true
+      - modality: tracking_images
+        relative_pattern: "tracking_img_*/*"
+        present: true
+      - modality: tracking_points
+        relative_pattern: "img_*.txt"
+        present: true
+    applicable_stages:
+      - preprocess
+      - metadata
+      - initial_annotation
+      - tracking
+    excluded_stages:
+      - projection
+      - trajectory
+      - publish
+      - fix
+    expected_command_steps:
+      - processing_calibration_snapshot
+      - preprocess_create_box
+      - preprocess_odom_convert
+      - preprocess_resize
+      - metadata_generate
+      - map_publish
+      - video_prepare
+      - initial_annotation
+      - tracking
+
+  - id: m2_postprocess_20260623_145550
+    sample_id: nav_20260623_145550_zhigu_wuhan_0
+    artifact_root_kind: finish_date
+    artifact_scope: "20260623_145550_zhigu_wuhan_0"
+    root_expectations:
+      - modality: trajectory
+        relative_pattern: "*_trajectory_five.json"
+        present: true
+    applicable_stages:
+      - projection
+      - world_coordinates
+      - motion
+      - gridmap_transform
+      - trajectory
+      - publish
+    excluded_stages:
+      - initial_annotation
+      - tracking
+      - fix
+    expected_command_steps:
+      - processing_calibration_snapshot
+      - projection
+      - world_coordinates
+      - motion
+      - gridmap_transform
+      - trajectory_0525
+      - publish
+
+  - id: m2_fix_20260623_145550
+    sample_id: nav_20260623_145550_zhigu_wuhan_0
+    artifact_root_kind: finish_date
+    artifact_scope: "20260623_145550_zhigu_wuhan_0"
+    root_expectations:
+      - modality: trajectory_fix
+        relative_pattern: "*_trajectory_fix_five.json"
+        present: true
+    applicable_stages:
+      - fix
+      - review
+    excluded_stages:
+      - preprocess
+      - tracking
+      - projection
+      - publish
+    expected_command_steps:
+      - human_review_boundary
+      - fix_calibration_snapshot
+      - fix_trajectory_0525
+      - review_decision
+
+  - id: missing_gridmap_20260714_104651
+    sample_id: nav_20260714_104651_zhigu_wuhan_0
+    artifact_root_kind: staged_sync_segment
+    root_expectations:
+      - modality: grid_map
+        relative_pattern: "grid_map/*"
+        present: true
+    applicable_stages:
+      - gridmap_prepare
+    excluded_stages:
+      - initial_annotation
+      - tracking
+      - projection
+      - trajectory
+      - publish
+      - fix
+    expected_command_steps:
+      - gridmap_prepare

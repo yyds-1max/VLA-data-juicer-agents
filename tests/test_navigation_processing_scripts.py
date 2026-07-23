@@ -36,6 +36,19 @@ def test_extract_script_requires_explicit_topic_whitelist():
         extract_ros2_bag.resolve_topic_whitelist(None, None)
 
 
+def test_extract_script_ignores_macos_appledouble_bag_files(tmp_path):
+    real_bag = tmp_path / "clip" / "sample_0.db3"
+    apple_double_bag = tmp_path / "clip" / "._sample_0.db3"
+    nested_apple_double_bag = (
+        tmp_path / "clip" / "._metadata" / "nested.db3"
+    )
+    for path in (real_bag, apple_double_bag, nested_apple_double_bag):
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(b"fixture")
+
+    assert extract_ros2_bag.discover_bag_paths(tmp_path) == [real_bag]
+
+
 def test_sync_script_resolves_inline_topic_map():
     topic_map = sync_navigation_data.resolve_topic_map(
         json.dumps({"cam_video4": "fisheye_front", "rs32_lidar_points": "r32_rslidar_points"}),

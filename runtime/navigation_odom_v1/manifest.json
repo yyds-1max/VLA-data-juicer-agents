@@ -1,0 +1,812 @@
+{
+  "schema_version": 1,
+  "runtime_id": "navigation_odom_v1",
+  "root_aliases": [
+    "NAVIGATION_ODOM_V1_SOURCE",
+    "NAVIGATION_DATA",
+    "DATA_RUNTIME_ENV",
+    "SYSTEM_RUNTIME"
+  ],
+  "entries": [
+    {
+      "root_alias": "NAVIGATION_ODOM_V1_SOURCE",
+      "relative_path": "run_odom.sh",
+      "kind": "frozen_file",
+      "role": "baseline_entrypoint",
+      "stage": "orchestration",
+      "sha256": "ab67961c4d8180a9ad873d48cce3d1b6b82d116dae33b3328d92e513655694be",
+      "size": 16490,
+      "executable": false
+    },
+    {
+      "root_alias": "NAVIGATION_ODOM_V1_SOURCE",
+      "relative_path": "run_fix.sh",
+      "kind": "frozen_file",
+      "role": "baseline_entrypoint",
+      "stage": "fix",
+      "sha256": "7f16126e61ee9ca9d620f417b38a50ab3efceb1d9b21f93f156c0be766431b54",
+      "size": 4916,
+      "executable": false
+    },
+    {
+      "root_alias": "NAVIGATION_ODOM_V1_SOURCE",
+      "relative_path": "NoobScenes/include/0_creat_box.py",
+      "kind": "frozen_file",
+      "role": "active_runtime",
+      "stage": "preprocess",
+      "sha256": "aa1b5dfe33b3d725908dbef39f41b44c02408f36f7f77d3818b90319dacb46b2",
+      "size": 4260,
+      "executable": true
+    },
+    {
+      "root_alias": "NAVIGATION_ODOM_V1_SOURCE",
+      "relative_path": "NoobScenes/include/1_odom_convert.py",
+      "kind": "frozen_file",
+      "role": "active_runtime",
+      "stage": "preprocess",
+      "sha256": "0428998fa18149ec646103a9beea837518bb4f8ba941ed8da09f34304ae4161b",
+      "size": 4010,
+      "executable": true
+    },
+    {
+      "root_alias": "NAVIGATION_ODOM_V1_SOURCE",
+      "relative_path": "NoobScenes/include/2_resize.py",
+      "kind": "frozen_file",
+      "role": "active_runtime",
+      "stage": "preprocess",
+      "sha256": "4068247392eb0a657ce72a073758dd61a0d316288d121f41bfe149198269c312",
+      "size": 1352,
+      "executable": false
+    },
+    {
+      "root_alias": "NAVIGATION_ODOM_V1_SOURCE",
+      "relative_path": "NoobScenes/main_smart_odom.py",
+      "kind": "frozen_file",
+      "role": "active_runtime",
+      "stage": "metadata",
+      "sha256": "052f8947c1046f41b8991dcfb859d178225b579c8f1ab13158198a32d804359a",
+      "size": 8656,
+      "executable": true
+    },
+    {
+      "root_alias": "NAVIGATION_ODOM_V1_SOURCE",
+      "relative_path": "NoobScenes/include/__init__.py",
+      "kind": "frozen_file",
+      "role": "active_runtime",
+      "stage": "metadata",
+      "sha256": "f632cc9563ad8870f5f1d6a7927b756173efd8f5ae3db0cfc3b1eb1ad3bf5c75",
+      "size": 735,
+      "executable": true
+    },
+    {
+      "root_alias": "NAVIGATION_ODOM_V1_SOURCE",
+      "relative_path": "NoobScenes/include/attribute.py",
+      "kind": "frozen_file",
+      "role": "active_runtime",
+      "stage": "metadata",
+      "sha256": "abba7803eab3b3beb1e04b3dafb7d9c360a507f2196b47372e4146a7723a9205",
+      "size": 1814,
+      "executable": true
+    },
+    {
+      "root_alias": "NAVIGATION_ODOM_V1_SOURCE",
+      "relative_path": "NoobScenes/include/calibrated_sensor.py",
+      "kind": "frozen_file",
+      "role": "active_runtime",
+      "stage": "metadata",
+      "sha256": "d7066d95d3877718b5d450931eb88ccb5b2970b8ad7a8345808206390c6581a5",
+      "size": 3170,
+      "executable": true
+    },
+    {
+      "root_alias": "NAVIGATION_ODOM_V1_SOURCE",
+      "relative_path": "NoobScenes/include/category.py",
+      "kind": "frozen_file",
+      "role": "active_runtime",
+      "stage": "metadata",
+      "sha256": "feed943f9452be3bc03797b350b95f098ef1a336fe3e66a895f0b3e82f452f2d",
+      "size": 2040,
+      "executable": true
+    },
+    {
+      "root_alias": "NAVIGATION_ODOM_V1_SOURCE",
+      "relative_path": "NoobScenes/include/dataset.py",
+      "kind": "frozen_file",
+      "role": "active_runtime",
+      "stage": "metadata",
+      "sha256": "da5536affbcbdb255aa249fb83863532e8a2a883272a8f99460f905604515cb2",
+      "size": 8711,
+      "executable": true
+    },
+    {
+      "root_alias": "NAVIGATION_ODOM_V1_SOURCE",
+      "relative_path": "NoobScenes/include/ego_pose.py",
+      "kind": "frozen_file",
+      "role": "active_runtime",
+      "stage": "metadata",
+      "sha256": "ed8289afce71945eb5fef37e39a9a538d54539a794bb9f9a184740e2f91620dc",
+      "size": 2856,
+      "executable": true
+    },
+    {
+      "root_alias": "NAVIGATION_ODOM_V1_SOURCE",
+      "relative_path": "NoobScenes/include/instance.py",
+      "kind": "frozen_file",
+      "role": "active_runtime",
+      "stage": "metadata",
+      "sha256": "973ab4f640695250960f415f98494ab1c64d07c89507aed3b936a355883feda6",
+      "size": 3792,
+      "executable": true
+    },
+    {
+      "root_alias": "NAVIGATION_ODOM_V1_SOURCE",
+      "relative_path": "NoobScenes/include/lidarseg.py",
+      "kind": "frozen_file",
+      "role": "active_runtime",
+      "stage": "metadata",
+      "sha256": "becf77e87e1bdb0d1482cadac0b60779a99c8b9eca3d758d2b738f2bf3429786",
+      "size": 1283,
+      "executable": true
+    },
+    {
+      "root_alias": "NAVIGATION_ODOM_V1_SOURCE",
+      "relative_path": "NoobScenes/include/log.py",
+      "kind": "frozen_file",
+      "role": "active_runtime",
+      "stage": "metadata",
+      "sha256": "9635bc63d3df2b375659ed7a01da6a96fe8365c64a7012f2b6191fa1750a5c4b",
+      "size": 1395,
+      "executable": true
+    },
+    {
+      "root_alias": "NAVIGATION_ODOM_V1_SOURCE",
+      "relative_path": "NoobScenes/include/map.py",
+      "kind": "frozen_file",
+      "role": "active_runtime",
+      "stage": "metadata",
+      "sha256": "6d2086d4821fdd549e5455ad86a6e9320ae3b354163e13a10e9e377c005abff1",
+      "size": 1409,
+      "executable": true
+    },
+    {
+      "root_alias": "NAVIGATION_ODOM_V1_SOURCE",
+      "relative_path": "NoobScenes/include/sample.py",
+      "kind": "frozen_file",
+      "role": "active_runtime",
+      "stage": "metadata",
+      "sha256": "245f7643c8f0250a02f448c2ca14b1fa1ac8be2f58d29d6d58620dba74f4e80d",
+      "size": 3641,
+      "executable": true
+    },
+    {
+      "root_alias": "NAVIGATION_ODOM_V1_SOURCE",
+      "relative_path": "NoobScenes/include/sample_annotation.py",
+      "kind": "frozen_file",
+      "role": "active_runtime",
+      "stage": "metadata",
+      "sha256": "6d1950a0015b0e5e9a5eefa4df45598e09e7488b45c89a40fe8be896c3514493",
+      "size": 8931,
+      "executable": true
+    },
+    {
+      "root_alias": "NAVIGATION_ODOM_V1_SOURCE",
+      "relative_path": "NoobScenes/include/sample_data.py",
+      "kind": "frozen_file",
+      "role": "active_runtime",
+      "stage": "metadata",
+      "sha256": "134ca707389ebf7af61e2473aff0657049f66db007417f3f90d22a7b4ac3d95f",
+      "size": 5315,
+      "executable": true
+    },
+    {
+      "root_alias": "NAVIGATION_ODOM_V1_SOURCE",
+      "relative_path": "NoobScenes/include/scene.py",
+      "kind": "frozen_file",
+      "role": "active_runtime",
+      "stage": "metadata",
+      "sha256": "f627554401db5838b83cc506420a45c3c10e09e6fe5225abfa9d153329e7c079",
+      "size": 2449,
+      "executable": true
+    },
+    {
+      "root_alias": "NAVIGATION_ODOM_V1_SOURCE",
+      "relative_path": "NoobScenes/include/sensor.py",
+      "kind": "frozen_file",
+      "role": "active_runtime",
+      "stage": "metadata",
+      "sha256": "95b9df4f9ede8d0bccafb309d07944768f866c41d89cb37818637150731892af",
+      "size": 3803,
+      "executable": true
+    },
+    {
+      "root_alias": "NAVIGATION_ODOM_V1_SOURCE",
+      "relative_path": "NoobScenes/include/utils.py",
+      "kind": "frozen_file",
+      "role": "active_runtime",
+      "stage": "metadata",
+      "sha256": "9a3824204af50e83c457c78e4e7e5bfaa46b0a768c9751cffcb880501825170e",
+      "size": 18738,
+      "executable": true
+    },
+    {
+      "root_alias": "NAVIGATION_ODOM_V1_SOURCE",
+      "relative_path": "NoobScenes/include/visibility.py",
+      "kind": "frozen_file",
+      "role": "active_runtime",
+      "stage": "metadata",
+      "sha256": "0eaa06be8bb3d15561ac15c731acb5b00025e0ca23bd07c00f5b4ef49972996d",
+      "size": 1611,
+      "executable": true
+    },
+    {
+      "root_alias": "NAVIGATION_ODOM_V1_SOURCE",
+      "relative_path": "NoobScenes/maps/map.png",
+      "kind": "frozen_file",
+      "role": "active_static_asset",
+      "stage": "metadata",
+      "sha256": "2e4c95c6b1aebcd6e64f3d6f9cf3b46a7b0f7e7664006b5f4720c33840e6423c",
+      "size": 67,
+      "executable": true
+    },
+    {
+      "root_alias": "NAVIGATION_ODOM_V1_SOURCE",
+      "relative_path": "0_1th_box/img2video.py",
+      "kind": "frozen_file",
+      "role": "active_runtime",
+      "stage": "initial_annotation",
+      "sha256": "1657a78281061d69751a7858667b28ef4d0f0388a32a0b76797f2f6d5df95466",
+      "size": 4838,
+      "executable": true
+    },
+    {
+      "root_alias": "NAVIGATION_ODOM_V1_SOURCE",
+      "relative_path": "0_1th_box/gen_box.py",
+      "kind": "frozen_file",
+      "role": "active_runtime_legacy_gui",
+      "stage": "initial_annotation",
+      "sha256": "0dbde9448d8e212364dd0d888f6cb1dce17a9a8465c867ebf13be9f38e39ccab",
+      "size": 9028,
+      "executable": true
+    },
+    {
+      "root_alias": "NAVIGATION_ODOM_V1_SOURCE",
+      "relative_path": "1_onnx_tam/bin/main",
+      "kind": "frozen_file",
+      "role": "active_binary",
+      "stage": "tracking",
+      "sha256": "3bbb8eebd30e72ac1482e6a20858f1c7df5e4561b972a78943f88d7b897647e5",
+      "size": 2853760,
+      "executable": true
+    },
+    {
+      "root_alias": "NAVIGATION_ODOM_V1_SOURCE",
+      "relative_path": "1_onnx_tam/models/etam/image_encoder.onnx",
+      "kind": "frozen_file",
+      "role": "active_model",
+      "stage": "tracking",
+      "sha256": "2819cad0ed718ac2bf79bf95c3ddffd42c0cfe91d0e7a3cecfe2ef3ce0c6c883",
+      "size": 25152722,
+      "executable": true
+    },
+    {
+      "root_alias": "NAVIGATION_ODOM_V1_SOURCE",
+      "relative_path": "1_onnx_tam/models/etam/memory_attention.onnx",
+      "kind": "frozen_file",
+      "role": "active_model",
+      "stage": "tracking",
+      "sha256": "3a89dc84ab3df792b8ae510525afb58557ddfee281461b3284c5b15423f58e5d",
+      "size": 27227790,
+      "executable": true
+    },
+    {
+      "root_alias": "NAVIGATION_ODOM_V1_SOURCE",
+      "relative_path": "1_onnx_tam/models/etam/image_decoder.onnx",
+      "kind": "frozen_file",
+      "role": "active_model",
+      "stage": "tracking",
+      "sha256": "88f98d8de6313daa29b7b6d3a3180c09fffa7b1afb5568611442826e60fd5ecb",
+      "size": 18868844,
+      "executable": true
+    },
+    {
+      "root_alias": "NAVIGATION_ODOM_V1_SOURCE",
+      "relative_path": "1_onnx_tam/models/etam/memory_encoder.onnx",
+      "kind": "frozen_file",
+      "role": "active_model",
+      "stage": "tracking",
+      "sha256": "b6095ef38b00523b69c627011b4940e404df435a5f51e6856dc57d7b69cf448c",
+      "size": 5591647,
+      "executable": true
+    },
+    {
+      "root_alias": "NAVIGATION_ODOM_V1_SOURCE",
+      "relative_path": "1_onnx_tam/CMakeLists.txt",
+      "kind": "frozen_file",
+      "role": "active_build_source",
+      "stage": "tracking_build",
+      "sha256": "5fba1c133e0bd6a29fd9f4929c90ce04eb3a4685f6ade7f9be8017acecf76344",
+      "size": 1850,
+      "executable": true
+    },
+    {
+      "root_alias": "NAVIGATION_ODOM_V1_SOURCE",
+      "relative_path": "1_onnx_tam/include/Model.h",
+      "kind": "frozen_file",
+      "role": "active_build_source",
+      "stage": "tracking_build",
+      "sha256": "947f89d022d710a8f9c4f9b9455293fc108ac4b49f7978f2feabf2a9b5d12632",
+      "size": 3725,
+      "executable": true
+    },
+    {
+      "root_alias": "NAVIGATION_ODOM_V1_SOURCE",
+      "relative_path": "1_onnx_tam/include/SAM2.h",
+      "kind": "frozen_file",
+      "role": "active_build_source",
+      "stage": "tracking_build",
+      "sha256": "5260bb4f277930728fe7873167dc576269fa68d6346c701f2744634e8f549b4a",
+      "size": 3519,
+      "executable": true
+    },
+    {
+      "root_alias": "NAVIGATION_ODOM_V1_SOURCE",
+      "relative_path": "1_onnx_tam/src/SAM2.cpp",
+      "kind": "frozen_file",
+      "role": "active_build_source",
+      "stage": "tracking_build",
+      "sha256": "e148f378ae0d9919217d9b3ca51df84216418e6433ae8e38cf6575d36d1a877b",
+      "size": 32571,
+      "executable": true
+    },
+    {
+      "root_alias": "NAVIGATION_ODOM_V1_SOURCE",
+      "relative_path": "1_onnx_tam/src/main.cpp",
+      "kind": "frozen_file",
+      "role": "active_build_source",
+      "stage": "tracking_build",
+      "sha256": "3aec20b30134bf43a16d2e3f3c2e5b5d7ac0da7cafc67e9885aa5e2f1a5defcf",
+      "size": 4762,
+      "executable": true
+    },
+    {
+      "root_alias": "NAVIGATION_ODOM_V1_SOURCE",
+      "relative_path": "NuscenesAanlysis_smart_pts_project/main.py",
+      "kind": "frozen_file",
+      "role": "active_runtime",
+      "stage": "projection",
+      "sha256": "c387c4c8da711fc6634dd8c49c9aa5ad23490af21d092a527cf5affcf2bcede2",
+      "size": 2804,
+      "executable": true
+    },
+    {
+      "root_alias": "NAVIGATION_ODOM_V1_SOURCE",
+      "relative_path": "NuscenesAanlysis_smart_pts_project/helper.py",
+      "kind": "frozen_file",
+      "role": "active_runtime",
+      "stage": "projection",
+      "sha256": "7f69ef4603331d596f1d389ea5a814c48cea2a2899a9f4d8f4dba1d25b71b7da",
+      "size": 26755,
+      "executable": true
+    },
+    {
+      "root_alias": "NAVIGATION_ODOM_V1_SOURCE",
+      "relative_path": "NuscenesAanlysis_smart_pts_project/tool/__init__.py",
+      "kind": "frozen_file",
+      "role": "active_runtime",
+      "stage": "projection",
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "size": 0,
+      "executable": true
+    },
+    {
+      "root_alias": "NAVIGATION_ODOM_V1_SOURCE",
+      "relative_path": "NuscenesAanlysis_smart_pts_project/tool/cam2pixel_model.py",
+      "kind": "frozen_file",
+      "role": "active_runtime",
+      "stage": "projection",
+      "sha256": "aab64e11a7ce1d9b7fccd107a985678ec93154bec0f42e773de953544fc46e19",
+      "size": 4674,
+      "executable": true
+    },
+    {
+      "root_alias": "NAVIGATION_ODOM_V1_SOURCE",
+      "relative_path": "2_pt_project/0_img2world.py",
+      "kind": "frozen_file",
+      "role": "active_runtime",
+      "stage": "projection",
+      "sha256": "a19663c30ad448e0fc109924c4cacb5a3b419d2c2fd111e32bca02e228c05655",
+      "size": 5941,
+      "executable": true
+    },
+    {
+      "root_alias": "NAVIGATION_ODOM_V1_SOURCE",
+      "relative_path": "2_pt_project/4_speed_direction_odom.py",
+      "kind": "frozen_file",
+      "role": "active_runtime",
+      "stage": "motion",
+      "sha256": "e3eb592c7e7759fa5edcd1e4513c9d7d8d31202c66e8979119d8e647f36d0b5a",
+      "size": 10338,
+      "executable": false
+    },
+    {
+      "root_alias": "NAVIGATION_ODOM_V1_SOURCE",
+      "relative_path": "other_code/pcd_to_grid.py",
+      "kind": "frozen_file",
+      "role": "active_auxiliary",
+      "stage": "gridmap_prepare",
+      "sha256": "f2b8b5d6939af0ef5e78fae20ed3b95c82e0d01e3cc592c480d2453ed5b5ad64",
+      "size": 18936,
+      "executable": false
+    },
+    {
+      "root_alias": "NAVIGATION_ODOM_V1_SOURCE",
+      "relative_path": "other_code/cp_gridmap.py",
+      "kind": "frozen_file",
+      "role": "active_runtime",
+      "stage": "gridmap_transform",
+      "sha256": "77d482808fcb41c499376c4c6ff2e2bcccaae6a5be044f3a41e1ff36726635b9",
+      "size": 4508,
+      "executable": false
+    },
+    {
+      "root_alias": "NAVIGATION_ODOM_V1_SOURCE",
+      "relative_path": "2_pt_project/2_othermethod_cjl_0525.py",
+      "kind": "frozen_file",
+      "role": "active_runtime",
+      "stage": "trajectory",
+      "sha256": "67546c815e690fcdb1647d7a1f63f5dc5b18ac8e9b9d5b103b3050a107c791ab",
+      "size": 29306,
+      "executable": false
+    },
+    {
+      "root_alias": "NAVIGATION_ODOM_V1_SOURCE",
+      "relative_path": "2_pt_project/3_move_dir.py",
+      "kind": "frozen_file",
+      "role": "active_runtime",
+      "stage": "publish",
+      "sha256": "156074580ac1036c5738050148f17d1ea6aa8d738e0450a0fd6464abe3a14f74",
+      "size": 4665,
+      "executable": false
+    },
+    {
+      "root_alias": "NAVIGATION_ODOM_V1_SOURCE",
+      "relative_path": "other_code/fix_trajectory_five_add_SF_odom_gridmap_0525.py",
+      "kind": "frozen_file",
+      "role": "active_runtime_legacy_gui",
+      "stage": "fix",
+      "sha256": "171f67e80d9dd3425bde280d874915739d8d492623311b73e28240f87e73e4bb",
+      "size": 32688,
+      "executable": false
+    },
+    {
+      "root_alias": "NAVIGATION_ODOM_V1_SOURCE",
+      "relative_path": "NoobScenes/params/20260320/sensors/fisheye_front.json",
+      "kind": "frozen_file",
+      "role": "selectable_profile",
+      "stage": "calibration",
+      "sha256": "b5aea58966bb3a616a83cc3f3f7b43903485109cb0f21481c946c3decbe0c6f7",
+      "size": 1046,
+      "executable": false
+    },
+    {
+      "root_alias": "NAVIGATION_ODOM_V1_SOURCE",
+      "relative_path": "NoobScenes/params/20260320/sensors/r32_rslidar_points.json",
+      "kind": "frozen_file",
+      "role": "selectable_profile",
+      "stage": "calibration",
+      "sha256": "f397d51c1d5b7041dd165aef2ad13272ad038c15d514658cd8eb8b5da7a19587",
+      "size": 294,
+      "executable": true
+    },
+    {
+      "root_alias": "NAVIGATION_ODOM_V1_SOURCE",
+      "relative_path": "NoobScenes/params/20260409_U/sensors/fisheye_front.json",
+      "kind": "frozen_file",
+      "role": "selectable_profile",
+      "stage": "fix_calibration",
+      "sha256": "8f708d088129db48a5e83e1578926c8f7c96d11eea8132a94c365ed6ca074e6b",
+      "size": 1045,
+      "executable": false
+    },
+    {
+      "root_alias": "NAVIGATION_ODOM_V1_SOURCE",
+      "relative_path": "NoobScenes/params/20260409_U/sensors/r32_rslidar_points.json",
+      "kind": "frozen_file",
+      "role": "selectable_profile",
+      "stage": "fix_calibration",
+      "sha256": "f397d51c1d5b7041dd165aef2ad13272ad038c15d514658cd8eb8b5da7a19587",
+      "size": 294,
+      "executable": true
+    },
+    {
+      "root_alias": "NAVIGATION_ODOM_V1_SOURCE",
+      "relative_path": "NoobScenes/params/20260529_go2w/sensors/fisheye_front.json",
+      "kind": "frozen_file",
+      "role": "selectable_profile",
+      "stage": "calibration",
+      "sha256": "78e34b91e028974e15b25a994b10ec3ee0845722ca078eef17528b7bac930ce9",
+      "size": 1029,
+      "executable": false
+    },
+    {
+      "root_alias": "NAVIGATION_ODOM_V1_SOURCE",
+      "relative_path": "NoobScenes/params/20260529_go2w/sensors/r32_rslidar_points.json",
+      "kind": "frozen_file",
+      "role": "selectable_profile",
+      "stage": "calibration",
+      "sha256": "f397d51c1d5b7041dd165aef2ad13272ad038c15d514658cd8eb8b5da7a19587",
+      "size": 294,
+      "executable": true
+    },
+    {
+      "root_alias": "NAVIGATION_ODOM_V1_SOURCE",
+      "relative_path": "NoobScenes/samples",
+      "kind": "generated_mutable",
+      "role": "active_dataset_link",
+      "stage": "metadata",
+      "concurrency": "global_serial",
+      "cleanup": "restore_previous_target"
+    },
+    {
+      "root_alias": "NAVIGATION_ODOM_V1_SOURCE",
+      "relative_path": "NoobScenes/v1.0-develop",
+      "kind": "generated_mutable",
+      "role": "generated_metadata",
+      "stage": "metadata",
+      "concurrency": "global_serial",
+      "cleanup": "job_scoped"
+    },
+    {
+      "root_alias": "NAVIGATION_ODOM_V1_SOURCE",
+      "relative_path": "Data/3_param/dog.yaml",
+      "kind": "generated_mutable",
+      "role": "tracking_config_scratch",
+      "stage": "tracking",
+      "concurrency": "global_serial",
+      "cleanup": "job_scoped"
+    },
+    {
+      "root_alias": "NAVIGATION_ODOM_V1_SOURCE",
+      "relative_path": "Data/1_img_output/tracking_img",
+      "kind": "generated_mutable",
+      "role": "tracking_output_scratch",
+      "stage": "tracking",
+      "concurrency": "global_serial",
+      "cleanup": "job_scoped"
+    },
+    {
+      "root_alias": "NAVIGATION_ODOM_V1_SOURCE",
+      "relative_path": "Data/1_img_output/img_points.txt",
+      "kind": "generated_mutable",
+      "role": "tracking_points_scratch",
+      "stage": "tracking",
+      "concurrency": "global_serial",
+      "cleanup": "job_scoped"
+    },
+    {
+      "root_alias": "NAVIGATION_DATA",
+      "relative_path": "finish_data/DATASET_DATE_temp",
+      "kind": "generated_mutable",
+      "role": "job_staging",
+      "stage": "all",
+      "concurrency": "dataset_serial",
+      "cleanup": "retain_on_failure"
+    },
+    {
+      "root_alias": "NAVIGATION_DATA",
+      "relative_path": "finish_data/DATASET_DATE",
+      "kind": "generated_mutable",
+      "role": "published_output",
+      "stage": "publish",
+      "concurrency": "dataset_serial",
+      "cleanup": "retained"
+    },
+    {
+      "root_alias": "DATA_RUNTIME_ENV",
+      "relative_path": "setup_data_runtime.sh",
+      "kind": "external_runtime",
+      "role": "active_environment_setup",
+      "stage": "all",
+      "sha256": "88382e1a0b59c3b3ebda6191299aaa8e60c937284e43d911257cdbda9a5f29a1",
+      "size": 482,
+      "executable": true
+    },
+    {
+      "root_alias": "SYSTEM_RUNTIME",
+      "relative_path": "usr/bin/python3.8",
+      "kind": "external_runtime",
+      "role": "active_python_interpreter",
+      "stage": "all",
+      "version": "3.8.10",
+      "sha256": "298a9e830ed52f36c299427565485d717d1ce0179c0597cc16560513eb780b06",
+      "size": 5490456,
+      "executable": true
+    },
+    {
+      "root_alias": "SYSTEM_RUNTIME",
+      "relative_path": "python/packages/numpy",
+      "kind": "external_runtime",
+      "role": "python_package",
+      "stage": "all",
+      "version": "1.23.5"
+    },
+    {
+      "root_alias": "SYSTEM_RUNTIME",
+      "relative_path": "python/packages/opencv-python",
+      "kind": "external_runtime",
+      "role": "python_package",
+      "stage": "all",
+      "version": "4.12.0.88"
+    },
+    {
+      "root_alias": "SYSTEM_RUNTIME",
+      "relative_path": "python/packages/scipy",
+      "kind": "external_runtime",
+      "role": "python_package",
+      "stage": "all",
+      "version": "1.10.1"
+    },
+    {
+      "root_alias": "SYSTEM_RUNTIME",
+      "relative_path": "python/packages/Pillow",
+      "kind": "external_runtime",
+      "role": "python_package",
+      "stage": "all",
+      "version": "10.0.0"
+    },
+    {
+      "root_alias": "SYSTEM_RUNTIME",
+      "relative_path": "python/packages/PyYAML",
+      "kind": "external_runtime",
+      "role": "python_package",
+      "stage": "all",
+      "version": "6.0.1"
+    },
+    {
+      "root_alias": "SYSTEM_RUNTIME",
+      "relative_path": "python/packages/open3d",
+      "kind": "external_runtime",
+      "role": "python_package",
+      "stage": "all",
+      "version": "0.13.0"
+    },
+    {
+      "root_alias": "SYSTEM_RUNTIME",
+      "relative_path": "python/packages/matplotlib",
+      "kind": "external_runtime",
+      "role": "python_package",
+      "stage": "fix",
+      "version": "3.1.2"
+    },
+    {
+      "root_alias": "SYSTEM_RUNTIME",
+      "relative_path": "python/packages/similaritymeasures",
+      "kind": "external_runtime",
+      "role": "python_package",
+      "stage": "fix",
+      "version": "1.4.0"
+    },
+    {
+      "root_alias": "SYSTEM_RUNTIME",
+      "relative_path": "python/packages/mmcv",
+      "kind": "external_runtime",
+      "role": "python_package",
+      "stage": "all",
+      "version": "2.2.0"
+    },
+    {
+      "root_alias": "SYSTEM_RUNTIME",
+      "relative_path": "python/packages/nuscenes-devkit",
+      "kind": "external_runtime",
+      "role": "python_package",
+      "stage": "metadata",
+      "version": "1.1.11"
+    },
+    {
+      "root_alias": "SYSTEM_RUNTIME",
+      "relative_path": "python/packages/pyquaternion",
+      "kind": "external_runtime",
+      "role": "python_package",
+      "stage": "all",
+      "version": "0.9.9"
+    },
+    {
+      "root_alias": "SYSTEM_RUNTIME",
+      "relative_path": "python/packages/pypcd",
+      "kind": "external_runtime",
+      "role": "python_package",
+      "stage": "gridmap_prepare",
+      "version": "0.1.1"
+    },
+    {
+      "root_alias": "SYSTEM_RUNTIME",
+      "relative_path": "python/packages/numba",
+      "kind": "external_runtime",
+      "role": "python_package_direct_dependency",
+      "stage": "metadata",
+      "version": "0.58.1"
+    },
+    {
+      "root_alias": "SYSTEM_RUNTIME",
+      "relative_path": "libraries/onnxruntime/libonnxruntime.so",
+      "kind": "external_runtime",
+      "role": "tracking_shared_library",
+      "stage": "tracking",
+      "sha256": "e8bff1da05d5a2fce28f709eae14d911ebe442cf5fa9d89d05a588e5b549be80",
+      "size": 23939809,
+      "executable": true
+    },
+    {
+      "root_alias": "SYSTEM_RUNTIME",
+      "relative_path": "platform/cuda",
+      "kind": "external_runtime",
+      "role": "gpu_runtime",
+      "stage": "tracking",
+      "version": "12.6.20240726"
+    },
+    {
+      "root_alias": "SYSTEM_RUNTIME",
+      "relative_path": "platform/ros",
+      "kind": "external_runtime",
+      "role": "ros_runtime",
+      "stage": "tracking_build",
+      "version": "galactic"
+    },
+    {
+      "root_alias": "SYSTEM_RUNTIME",
+      "relative_path": "libraries/yaml-cpp",
+      "kind": "external_runtime",
+      "role": "native_dependency",
+      "stage": "tracking",
+      "version": "0.6"
+    },
+    {
+      "root_alias": "SYSTEM_RUNTIME",
+      "relative_path": "libraries/opencv",
+      "kind": "external_runtime",
+      "role": "native_dependency",
+      "stage": "tracking",
+      "version": "4.2"
+    },
+    {
+      "root_alias": "SYSTEM_RUNTIME",
+      "relative_path": "libraries/tbb",
+      "kind": "external_runtime",
+      "role": "dynamic_dependency_unfrozen",
+      "stage": "tracking",
+      "version": "unfrozen"
+    },
+    {
+      "root_alias": "SYSTEM_RUNTIME",
+      "relative_path": "libraries/libstdcxx",
+      "kind": "external_runtime",
+      "role": "dynamic_dependency_unfrozen",
+      "stage": "tracking",
+      "version": "unfrozen"
+    },
+    {
+      "root_alias": "SYSTEM_RUNTIME",
+      "relative_path": "libraries/glibc",
+      "kind": "external_runtime",
+      "role": "dynamic_dependency_unfrozen",
+      "stage": "tracking",
+      "version": "unfrozen"
+    },
+    {
+      "root_alias": "SYSTEM_RUNTIME",
+      "relative_path": "gui/tk-display",
+      "kind": "external_runtime",
+      "role": "legacy_gui_dependency",
+      "stage": "initial_annotation",
+      "version": "unfrozen"
+    },
+    {
+      "root_alias": "SYSTEM_RUNTIME",
+      "relative_path": "gui/matplotlib-tkagg-display",
+      "kind": "external_runtime",
+      "role": "legacy_gui_dependency",
+      "stage": "fix",
+      "version": "unfrozen"
+    }
+  ]
+}

@@ -469,6 +469,18 @@ def extract_ros2_bag(bag_path, save_root, topic_whitelist=None):
 
     print(f"完成: {bag_path} 共保存 {total} 条消息")
 
+def discover_bag_paths(data_path):
+    """Return ROS bag files while ignoring macOS AppleDouble metadata."""
+
+    root = Path(data_path)
+    return sorted(
+        path
+        for path in root.rglob("*.db3")
+        if path.is_file()
+        and not any(part.startswith("._") for part in path.relative_to(root).parts)
+    )
+
+
 # ==================== 主入口 ====================
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="ROS2 db3 拆包工具（修复自定义消息时间戳）")
@@ -483,7 +495,7 @@ if __name__ == "__main__":
 
     start_time = time.time()
 
-    bag_paths = sorted([str(p) for p in Path(args.data_path).rglob("*.db3")])
+    bag_paths = [str(path) for path in discover_bag_paths(args.data_path)]
     if not bag_paths:
         print("没找到任何 .db3 文件！")
         exit(1)

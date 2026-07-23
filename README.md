@@ -10,6 +10,12 @@ This project builds an AgentScope workflow for the first-stage navigation data p
 
 Stage one intentionally excludes `run_fix.sh`; it is out of scope and is not run by this agent. The first-stage scope covers only `prepare.sh`, `run_U.sh`, and `run_odom.sh`. `gen_box.py` is the only human GUI step.
 
+This describes the current Navigation Agent implementation. The new automatic
+annotation module starts from synchronized artifacts, replaces the legacy GUI in
+M1, and connects three-dimensional review/Fix in M2. Its approved boundaries and
+milestone order are recorded in
+[`docs/automatic-annotation-roadmap.md`](docs/automatic-annotation-roadmap.md).
+
 ## WSL setup
 
 ```bash
