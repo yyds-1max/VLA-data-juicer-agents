@@ -526,17 +526,18 @@ def _tracking_target(
 
 def _sync_input(config: NavigationAnnotationRuntimeConfig, *, with_odom: bool = True) -> Path:
     assert config.clip_data_root is not None
-    sequence = (
+    sync_root = (
         config.clip_data_root
         / "20270605"
         / "20260605_160904"
         / "sync_data"
-        / "20260605_160904_zhigu_wuhan_0"
     )
+    sequence = sync_root / "20260605_160904_zhigu_wuhan_0"
     for modality in ("fisheye_front", "r32_rslidar_points"):
         (sequence / modality).mkdir(parents=True)
     (sequence / "fisheye_front" / "000001.png").write_bytes(_png())
     (sequence / "r32_rslidar_points" / "000001.pcd").write_bytes(b"pcd")
+    (sync_root / "times.json").write_text("{}\n", encoding="utf-8")
     if with_odom:
         (sequence / "odom").mkdir()
         (sequence / "odom" / "000001.json").write_text(
@@ -2400,7 +2401,7 @@ def test_capacity_preflight_rejects_symlinked_clip_ancestor(
     assert error.value.code == "unsafe_runtime_input"
 
 
-def test_capacity_preflight_ignores_only_appledouble_and_rejects_other_entries(
+def test_capacity_preflight_accepts_times_metadata_and_appledouble_only(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -2421,6 +2422,34 @@ def test_capacity_preflight_ignores_only_appledouble_and_rejects_other_entries(
             "20270605",
             ("20260605_160904",),
         )
+    assert error.value.code == "unsafe_runtime_input"
+
+
+@pytest.mark.parametrize("metadata_kind", ["directory", "symlink"])
+def test_capacity_preflight_rejects_unsafe_times_metadata(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    metadata_kind: str,
+) -> None:
+    config = _config(tmp_path)
+    sequence = _sync_input(config)
+    times_path = sequence.parent / "times.json"
+    times_path.unlink()
+    if metadata_kind == "directory":
+        times_path.mkdir()
+    else:
+        outside = tmp_path / "outside-times.json"
+        outside.write_text("{}\n", encoding="utf-8")
+        times_path.symlink_to(outside)
+    adapter = NavigationAnnotationRuntimeAdapter(config)
+    monkeypatch.setattr(adapter, "_require_available", lambda: None)
+
+    with pytest.raises(RuntimeExecutionError) as error:
+        adapter.preflight_capacity(
+            "20270605",
+            ("20260605_160904",),
+        )
+
     assert error.value.code == "unsafe_runtime_input"
 
 

@@ -78,6 +78,7 @@ _DEBIAN_ARCHITECTURE_RE = re.compile(r"^[a-z0-9][a-z0-9-]*$")
 _PLATFORM_VALUE_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9.+_-]*$")
 _REQUIRED_SENSOR_FILES = ("fisheye_front.json", "r32_rslidar_points.json")
 _FIRST_FRAME_SUFFIXES = frozenset({".jpg", ".png"})
+_SYNC_ROOT_METADATA_FILES = frozenset({"times.json"})
 _RUNTIME_SOURCE_ALIAS = "NAVIGATION_ODOM_V1_SOURCE"
 _PREPARATION_ACTIVE_FROZEN_PATHS = (
     "NoobScenes/include/0_creat_box.py",
@@ -2010,6 +2011,13 @@ def _discover_supported_sequences(
         )
         for sequence in sorted(sync_root.iterdir(), key=lambda path: path.name):
             if sequence.name.startswith("._"):
+                continue
+            if sequence.name in _SYNC_ROOT_METADATA_FILES:
+                if not _regular_file(sequence):
+                    raise RuntimeExecutionError(
+                        "unsafe_runtime_input",
+                        "sync_data metadata is not a regular file.",
+                    )
                 continue
             if not _regular_directory(sequence):
                 raise RuntimeExecutionError(
