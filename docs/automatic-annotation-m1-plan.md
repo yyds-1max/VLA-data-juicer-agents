@@ -129,7 +129,8 @@ NavigationTrackingRuntime.track(...)
 - `2_resize.py` 只修改 staging，绝不修改 `clip_data`。
 - 保持冻结的脚本、Tracking binary、ONNX、命令顺序和数值逻辑。
 - 使用 bubblewrap 将冻结 Runtime 只读挂载，并把 job-private `Data` 映射到
-  Tracking 的 legacy 绝对路径。
+  Tracking 的 legacy 绝对路径；`/mnt/data1/.../Data` 只在私有 mount namespace
+  中生成，不在宿主机创建兼容目录。
 - 使用固定 Xvfb 无界面运行，不回退 XQuartz。
 - Annotation DB lease 防止重复 claim；系统级 `fcntl` writer lock 同时约束
   Annotation Worker 和现有 Navigation plan execution。
@@ -237,7 +238,8 @@ M1 的本地代码实现、fake-runtime 集成和独立代码审计已经完成�
   后部分 marker 清理的安全重放均有故障注入测试。
 - 服务器 preflight 后补齐了 Tracking 两份直接配置的 manifest 冻结、binary/
   legacy YAML/`1_odom_convert.py` 内嵌路径证明、双 overlay 精确绑定，以及复制后
-  SHA/size 复核；显式容量余量缺失时 Runtime fail closed；
+  SHA/size 复核；Legacy YAML overlay 由 bubblewrap 在任务 namespace 中创建，
+  不产生宿主目录副作用；显式容量余量缺失时 Runtime fail closed；
 - Web 与停机恢复 CLI 共用 Annotation service/maintenance flock。恢复 CLI
   精确绑定生产 DB 与 writer lock，只以 existing-only 模式打开 DB，拒绝在线
   Worker、错误 scope、DB inode 轮换和新 quarantine 竞态；
@@ -250,8 +252,8 @@ M1 的本地代码实现、fake-runtime 集成和独立代码审计已经完成�
 本地最终门禁：
 
 ```text
-Python 全量                  1494 passed
-Runtime targeted             106 passed
+Python 全量                  1501 passed
+Runtime targeted             113 passed
 Web/Store/恢复 targeted      174 passed
 run_web targeted              25 passed
 前端 Vitest                  204 passed
@@ -281,8 +283,11 @@ compileall / git diff --check PASS
 `extract_sync` 阶段边界，需由用户明确选择“到这里结束”后正常关闭；不能把其
 等待状态误判为拆解/同步失败，也不能用取消整任务代替正常完成。
 
-以上结果不包含服务器 Runtime payload、固定 Xvfb、真实 GPU/bubblewrap preflight
-或真实 M1 writer。尚未运行 `2027 Tracking candidate ↔ 2026 oracle`，因此当前
-只有拆解/同步等价结论，不能宣称 Tracking 已与 legacy 等价。M1 仍保持“未冻结”；
+服务器 Runtime payload 已按 manifest 仅部署 55 个 frozen files，源端与部署端
+均通过 SHA-256、大小和 executable bit 校验；活动 Data Runtime 的 10 个包版本、
+GPU 和 bubblewrap 已复核。Legacy YAML sandbox-only target 的无业务 smoke 也已
+通过，未创建宿主 `/mnt/data1`。以上结果仍不包含固定 Xvfb 的安装/attestation 或
+真实 M1 writer。尚未运行 `2027 Tracking candidate ↔ 2026 oracle`，因此当前只有
+拆解/同步等价结论，不能宣称 Tracking 已与 legacy 等价。M1 仍保持“未冻结”；
 下一步只能按 `docs/automatic-annotation-m1-server-acceptance.md` 另行批准并执行
-Runtime 部署、无界面环境安装和服务器 writer 验收。
+无界面环境安装和服务器 writer 验收。

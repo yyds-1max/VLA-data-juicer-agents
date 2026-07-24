@@ -158,12 +158,15 @@ VLA_RUNTIME_DEPENDENCY_SUMMARY
 - `VLA_TRACKING_BINARY_DATA_ROOT` 是 Tracking binary 内硬编码的 `_01/Data`
   绝对路径对应的 sandbox overlay target；`VLA_TRACKING_LEGACY_DATA_ROOT`
   是 legacy YAML 中 `/mnt/data1/.../Data` 绝对路径对应的另一个 overlay
-  target。两者必须分别显式配置为不同的、已批准的真实绝对目录，不能合并、互设
-  为同一路径或省略其中任一挂载；运行时将同一份 job-private `Data` 分别映射到
-  两个 target。能力检查必须从 manifest 匹配的冻结 binary 只读证明其三个内嵌
-  路径共享该 binary Data root，并证明 YAML 的 intrinsics/extrinsics 共享另一
-  个 Data root；任意路径错配、嵌套或与 work、同步数据、Runtime source 重叠时
-  fail closed；
+  target。两者必须分别显式配置为不同的绝对路径，不能合并、互设为同一路径或
+  省略其中任一挂载；运行时将同一份 job-private `Data` 分别映射到两个 target。
+  binary target 继续要求宿主存在真实、规范的目录；Legacy YAML target
+  是固定的 sandbox-only 逻辑路径，宿主只要求 `/mnt` 是真实、规范的目录，不得创建
+  `/mnt/data1/gh/tracking_1/Data`。bubblewrap 必须先以私有 tmpfs 覆盖 `/mnt`，
+  再仅在任务 namespace 内创建目录并 bind；任务退出后自动消失。能力检查必须从
+  manifest 匹配的冻结 binary 只读证明其三个内嵌路径共享该 binary Data root，
+  并证明 YAML 的 intrinsics/extrinsics 共享另一个 Data root；任意路径错配、
+  嵌套或与 work、同步数据、Runtime source 重叠时 fail closed；
 - `VLA_LEGACY_CLIP_DATA_ROOT` 必须精确匹配 manifest 冻结的
   `NoobScenes/include/1_odom_convert.py` 中 `clip_data` 字面量；只允许把
   job-private 同步输入以只读方式映射到该兼容目标；
@@ -352,11 +355,21 @@ GPU 和安装摘要 preflight。记录 capability 的安全错误码，不把内
 同时验证 bubblewrap 的宿主根和 frozen Runtime 为只读、job staging 为私有可写、
 Tracking binary 的硬编码 `_01/Data` target 与 YAML 的
 `/mnt/data1/.../Data` target 分别映射到同一 job-private scratch、GPU 可见，并
-执行超时与进程组清理 preflight。两个 target 不能合并。超时 preflight 使用独立
+执行超时与进程组清理 preflight。Legacy YAML target 的无业务 smoke 必须在运行
+前后都证明宿主 `/mnt/data1/.../Data` 不存在，沙箱写入只进入临时 job-private
+Data；同事 `_01/Data` 的文件树和摘要保持不变。两个 target 不能合并。超时
+preflight 使用独立
 的无业务副作用测试命令，确认达到已批准的
 `VLA_ANNOTATION_RUNTIME_TIMEOUT_SECONDS` 后，系统按同一
 SIGTERM→SIGKILL 语义清理完整进程组；不得为测试超时而启动真实 Tracking，也不得
 把 timeout 关闭或设为无限。
+
+> 2026-07-24 已使用服务器 bubblewrap `0.4.0-1ubuntu4.1` 完成无业务 smoke：
+> `--ro-bind / /` 后直接 `--dir` 会按预期因只读根失败；使用
+> `--tmpfs /mnt`、逐级 `--dir`、再 bind job-private Data 时成功。测试前后宿主
+> `/mnt/data1` 均不存在，沙箱写入只出现在临时私有目录，临时目录已清理。
+> 本记录只证明 sandbox-only 挂载拓扑，不代表 Xvfb、sandbox 内 GPU、超时、
+> 进程组清理或真实 Tracking 门禁已经通过。
 
 ## 6. 2027 测试数据准备顺序
 

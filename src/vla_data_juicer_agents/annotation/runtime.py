@@ -243,6 +243,7 @@ _LEGACY_YAML_DATA_ROOTS = frozenset(
         Path(DEFAULT_EXTRINSICS_PATH).parent.parent,
     },
 )
+_LEGACY_YAML_SANDBOX_ROOT = Path("/mnt")
 
 
 class RuntimeUnavailableError(RuntimeError):
@@ -951,6 +952,40 @@ def _paths_overlap(left: Path, right: Path) -> bool:
         or left.is_relative_to(right)
         or right.is_relative_to(left)
     )
+
+
+def _safe_sandbox_only_target(path: Path, *, mount_root: Path) -> bool:
+    """Validate a logical bind target without resolving it on the host."""
+
+    if (
+        not path.is_absolute()
+        or not mount_root.is_absolute()
+        or path == mount_root
+    ):
+        return False
+    try:
+        relative = path.relative_to(mount_root)
+    except ValueError:
+        return False
+    return bool(relative.parts) and all(
+        component not in {"", ".", ".."}
+        for component in relative.parts
+    )
+
+
+def _sandbox_only_directory_chain(
+    path: Path,
+    *,
+    mount_root: Path,
+) -> tuple[Path, ...]:
+    if not _safe_sandbox_only_target(path, mount_root=mount_root):
+        raise ValueError("sandbox-only target is unsafe")
+    current = mount_root
+    directories: list[Path] = []
+    for component in path.relative_to(mount_root).parts:
+        current = current / component
+        directories.append(current)
+    return tuple(directories)
 
 
 def _active_payload_permissions_safe(
@@ -2511,23 +2546,29 @@ class _RuntimeBase:
                 "gpu_runtime_unavailable",
                 "The Tracking GPU runtime is unavailable.",
             )
-        overlay_targets = (
+        if _paths_overlap(
             config.tracking_binary_data_root,
             config.legacy_tracking_data_root,
-        )
-        if any(
-            not self._overlay_target_available(path)
-            for path in overlay_targets
+        ):
+            return unavailable(
+                "sandbox_target_conflict",
+                "Tracking sandbox compatibility targets must not overlap.",
+            )
+        if not self._overlay_target_available(
+            config.tracking_binary_data_root,
         ):
             return unavailable(
                 "sandbox_target_unavailable",
                 "A required sandbox overlay target is unavailable.",
             )
-        overlay_identities = tuple(
-            self._overlay_target_identity(path)
-            for path in overlay_targets
+        binary_target_identity = self._overlay_target_identity(
+            config.tracking_binary_data_root,
         )
-        if _paths_overlap(*overlay_identities):
+        legacy_target_identity = config.legacy_tracking_data_root
+        if _paths_overlap(
+            binary_target_identity,
+            legacy_target_identity,
+        ):
             return unavailable(
                 "sandbox_target_conflict",
                 "Tracking sandbox compatibility targets must not overlap.",
@@ -2548,8 +2589,7 @@ class _RuntimeBase:
                 "A protected Runtime root is unavailable.",
             )
         if any(
-            _paths_overlap(target, protected)
-            for target in overlay_identities
+            _paths_overlap(binary_target_identity, protected)
             for protected in protected_roots
         ):
             return unavailable(
@@ -2566,6 +2606,42 @@ class _RuntimeBase:
             return unavailable(
                 "sandbox_target_mismatch",
                 "A sandbox target does not match frozen Runtime evidence.",
+            )
+        if (
+            not _safe_sandbox_only_target(
+                config.legacy_tracking_data_root,
+                mount_root=_LEGACY_YAML_SANDBOX_ROOT,
+            )
+            or not self._overlay_target_available(
+                _LEGACY_YAML_SANDBOX_ROOT,
+            )
+        ):
+            return unavailable(
+                "sandbox_target_unavailable",
+                "A required sandbox-only mount point is unavailable.",
+            )
+        sandbox_root_identity = self._overlay_target_identity(
+            _LEGACY_YAML_SANDBOX_ROOT,
+        )
+        if _paths_overlap(
+            binary_target_identity,
+            sandbox_root_identity,
+        ):
+            return unavailable(
+                "sandbox_target_conflict",
+                "Tracking sandbox compatibility targets must not overlap.",
+            )
+        if any(
+            _paths_overlap(target, protected)
+            for target in (
+                legacy_target_identity,
+                sandbox_root_identity,
+            )
+            for protected in protected_roots
+        ):
+            return unavailable(
+                "sandbox_target_conflict",
+                "A Tracking sandbox target overlaps a protected Runtime root.",
             )
         for required_directory in (
             config.runtime_source_root / "NoobScenes" / "samples",
@@ -2616,6 +2692,9 @@ class _RuntimeBase:
         argv: Sequence[str | Path],
         cwd: Path,
         writable_bindings: Sequence[tuple[Path, Path]] = (),
+        sandbox_only_writable_bindings: Sequence[
+            tuple[Path, Path]
+        ] = (),
         readonly_bindings: Sequence[tuple[Path, Path]] = (),
     ) -> list[str]:
         config = self.config
@@ -2649,6 +2728,7 @@ class _RuntimeBase:
             str(staging),
             str(staging),
         ]
+        resolved_writable_bindings: list[tuple[Path, Path]] = []
         for source, target in writable_bindings:
             source_resolved = self._assert_under(
                 source,
@@ -2660,9 +2740,52 @@ class _RuntimeBase:
                     "unsafe_runtime_path",
                     "Sandbox target must be absolute.",
                 )
-            command.extend(
-                ["--bind", str(source_resolved), str(target)],
+            resolved_writable_bindings.append(
+                (source_resolved, target),
             )
+
+        if len(sandbox_only_writable_bindings) > 1:
+            raise RuntimeExecutionError(
+                "unsafe_runtime_path",
+                "Only the frozen sandbox-only target may be mounted.",
+            )
+        resolved_sandbox_only_bindings: list[tuple[Path, Path]] = []
+        frozen_sandbox_only_target: Path | None = None
+        if sandbox_only_writable_bindings:
+            try:
+                frozen_sandbox_only_target = _legacy_yaml_data_root()
+            except ValueError as exc:
+                raise RuntimeExecutionError(
+                    "unsafe_runtime_path",
+                    "The frozen sandbox-only target is invalid.",
+                ) from exc
+        for source, target in sandbox_only_writable_bindings:
+            source_resolved = self._assert_under(
+                source,
+                staging,
+                label="sandbox-only writable binding",
+            )
+            if (
+                config.legacy_tracking_data_root is None
+                or target != config.legacy_tracking_data_root
+                or target != frozen_sandbox_only_target
+                or not _safe_sandbox_only_target(
+                    target,
+                    mount_root=_LEGACY_YAML_SANDBOX_ROOT,
+                )
+                or not self._overlay_target_available(
+                    _LEGACY_YAML_SANDBOX_ROOT,
+                )
+            ):
+                raise RuntimeExecutionError(
+                    "unsafe_runtime_path",
+                    "Sandbox-only target is unavailable or unregistered.",
+                )
+            resolved_sandbox_only_bindings.append(
+                (source_resolved, target),
+            )
+
+        resolved_readonly_bindings: list[tuple[Path, Path]] = []
         for source, target in readonly_bindings:
             try:
                 source_resolved = source.resolve(strict=True)
@@ -2676,6 +2799,75 @@ class _RuntimeBase:
                     "unsafe_runtime_path",
                     "Sandbox read-only binding is unsafe.",
                 )
+            resolved_readonly_bindings.append(
+                (source_resolved, target),
+            )
+
+        binding_targets = [
+            target
+            for _source, target in (
+                *resolved_writable_bindings,
+                *resolved_sandbox_only_bindings,
+                *resolved_readonly_bindings,
+            )
+        ]
+        if any(
+            _paths_overlap(left, right)
+            for index, left in enumerate(binding_targets)
+            for right in binding_targets[index + 1 :]
+        ):
+            raise RuntimeExecutionError(
+                "unsafe_runtime_path",
+                "Sandbox binding targets must not overlap.",
+            )
+
+        if resolved_sandbox_only_bindings:
+            try:
+                cwd_identity = cwd.resolve(strict=True)
+            except OSError as exc:
+                raise RuntimeExecutionError(
+                    "runtime_path_unavailable",
+                    "Sandbox working directory is unavailable.",
+                ) from exc
+            if (
+                _paths_overlap(_LEGACY_YAML_SANDBOX_ROOT, staging)
+                or _paths_overlap(
+                    _LEGACY_YAML_SANDBOX_ROOT,
+                    cwd_identity,
+                )
+                or any(
+                    _paths_overlap(
+                        _LEGACY_YAML_SANDBOX_ROOT,
+                        target,
+                    )
+                    for _source, target in (
+                        *resolved_writable_bindings,
+                        *resolved_readonly_bindings,
+                    )
+                )
+            ):
+                raise RuntimeExecutionError(
+                    "unsafe_runtime_path",
+                    "Sandbox-only root overlaps another Runtime path.",
+                )
+            command.extend(
+                ["--tmpfs", str(_LEGACY_YAML_SANDBOX_ROOT)],
+            )
+            for directory in _sandbox_only_directory_chain(
+                resolved_sandbox_only_bindings[0][1],
+                mount_root=_LEGACY_YAML_SANDBOX_ROOT,
+            ):
+                command.extend(["--dir", str(directory)])
+            source_resolved, target = resolved_sandbox_only_bindings[0]
+            command.extend(
+                ["--bind", str(source_resolved), str(target)],
+            )
+
+        for source_resolved, target in resolved_writable_bindings:
+            command.extend(
+                ["--bind", str(source_resolved), str(target)],
+            )
+        for source_resolved, target in resolved_readonly_bindings:
             command.extend(
                 ["--ro-bind", str(source_resolved), str(target)],
             )
@@ -2698,6 +2890,9 @@ class _RuntimeBase:
         argv: Sequence[str | Path],
         cwd: Path,
         writable_bindings: Sequence[tuple[Path, Path]] = (),
+        sandbox_only_writable_bindings: Sequence[
+            tuple[Path, Path]
+        ] = (),
         readonly_bindings: Sequence[tuple[Path, Path]] = (),
         error_code: str,
     ) -> None:
@@ -2708,6 +2903,9 @@ class _RuntimeBase:
                     argv=argv,
                     cwd=cwd,
                     writable_bindings=writable_bindings,
+                    sandbox_only_writable_bindings=(
+                        sandbox_only_writable_bindings
+                    ),
                     readonly_bindings=readonly_bindings,
                 ),
                 timeout_seconds=self.config.timeout_seconds,
@@ -3558,6 +3756,8 @@ class NavigationTrackingRuntime(_RuntimeBase):
                             private_data,
                             config.tracking_binary_data_root,
                         ),
+                    ),
+                    sandbox_only_writable_bindings=(
                         (
                             private_data,
                             config.legacy_tracking_data_root,

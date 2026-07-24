@@ -43,8 +43,13 @@ system runtime root
 7. `VLA_TRACKING_BINARY_DATA_ROOT` 与 `VLA_TRACKING_LEGACY_DATA_ROOT`
    是两个不同的 bubblewrap overlay 目标：前者覆盖 Tracking 二进制内嵌的
    `_01/Data`，后者覆盖 Legacy YAML 中的 `/mnt/data1/.../Data`。两者必须显式
-   配置为不同的真实绝对目录，不能合并，也不能把系统专用 Runtime source
-   误当成二进制内嵌路径。Runtime 必须从 manifest 匹配的冻结
+   配置为不同的绝对路径，不能合并，也不能把系统专用 Runtime source
+   误当成二进制内嵌路径。binary target 继续要求宿主存在真实、规范的目录；
+   Legacy YAML target 是固定的 sandbox-only 逻辑路径，不要求且禁止在宿主创建
+   `/mnt/data1/.../Data`。Runtime 只验证宿主 `/mnt` 是真实、规范的目录，
+   然后在每次任务的私有 mount namespace 中通过 `--tmpfs`、`--dir` 和 `--bind`
+   构造 Legacy YAML target；任务结束后该目录随 namespace 消失。Runtime 必须从
+   manifest 匹配的冻结
    `1_onnx_tam/bin/main` 只读扫描 `dog.yaml`、`img_points.txt` 和
    `tracking_img/` 三个内嵌路径并证明同一 Data root；Legacy YAML 目标必须精确
    等于 `DEFAULT_INTRINSICS_PATH` 与 `DEFAULT_EXTRINSICS_PATH` 的共同 Data root。

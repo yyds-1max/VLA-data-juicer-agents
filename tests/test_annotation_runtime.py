@@ -424,7 +424,7 @@ def _config(tmp_path: Path) -> NavigationAnnotationRuntimeConfig:
         package_probe=lambda _names: {},
         gpu_probe=lambda: True,
         overlay_target_probe=lambda path: (
-            path == legacy_data
+            path == runtime_module._LEGACY_YAML_SANDBOX_ROOT
             or runtime_module._safe_absolute_directory(path)
         ),
     )
@@ -720,6 +720,69 @@ def test_runtime_capabilities_require_distinct_absolute_tracking_targets(
     assert conflict.available is False
     assert conflict.reason is not None
     assert conflict.reason.code == "sandbox_target_conflict"
+
+
+def test_runtime_capabilities_keep_legacy_yaml_target_sandbox_only(
+    tmp_path: Path,
+) -> None:
+    config = _config(tmp_path)
+    assert config.legacy_tracking_data_root is not None
+    probed: list[Path] = []
+
+    def probe(path: Path) -> bool:
+        probed.append(path)
+        return (
+            path == runtime_module._LEGACY_YAML_SANDBOX_ROOT
+            or runtime_module._safe_absolute_directory(path)
+        )
+
+    capability = NavigationAnnotationRuntimeAdapter(
+        replace(config, overlay_target_probe=probe),
+    ).capabilities()
+
+    assert capability.available is True
+    assert runtime_module._LEGACY_YAML_SANDBOX_ROOT in probed
+    assert config.tracking_binary_data_root in probed
+    assert config.legacy_tracking_data_root not in probed
+
+
+def test_runtime_capabilities_still_require_binary_target_on_host(
+    tmp_path: Path,
+) -> None:
+    config = _config(tmp_path)
+    assert config.tracking_binary_data_root is not None
+    config.tracking_binary_data_root.rmdir()
+
+    capability = NavigationAnnotationRuntimeAdapter(config).capabilities()
+
+    assert capability.available is False
+    assert capability.reason is not None
+    assert capability.reason.code == "sandbox_target_unavailable"
+
+
+def test_runtime_capabilities_require_safe_legacy_sandbox_root(
+    tmp_path: Path,
+) -> None:
+    config = _config(tmp_path)
+    assert config.legacy_tracking_data_root is not None
+    probed: list[Path] = []
+
+    def probe(path: Path) -> bool:
+        probed.append(path)
+        return (
+            path != runtime_module._LEGACY_YAML_SANDBOX_ROOT
+            and runtime_module._safe_absolute_directory(path)
+        )
+
+    capability = NavigationAnnotationRuntimeAdapter(
+        replace(config, overlay_target_probe=probe),
+    ).capabilities()
+
+    assert capability.available is False
+    assert capability.reason is not None
+    assert capability.reason.code == "sandbox_target_unavailable"
+    assert runtime_module._LEGACY_YAML_SANDBOX_ROOT in probed
+    assert config.legacy_tracking_data_root not in probed
 
 
 def test_runtime_capabilities_reject_nested_and_protected_tracking_targets(
@@ -1235,6 +1298,8 @@ def test_runtime_tracking_targets_are_explicit_environment_configuration(
     configured = NavigationAnnotationRuntimeConfig.from_env()
     assert configured.tracking_binary_data_root == binary_data
     assert configured.legacy_tracking_data_root == yaml_data
+    assert not binary_data.exists()
+    assert not yaml_data.exists()
 
 
 def test_runtime_command_uses_the_approved_timeout(
@@ -1463,6 +1528,158 @@ def test_sandbox_command_uses_fixed_xvfb_and_read_only_host_root(
     assert "--die-with-parent" in shell
     assert "--unshare-net" in shell
     assert "XQuartz" not in shell
+
+
+def test_sandbox_command_creates_legacy_target_only_inside_namespace(
+    tmp_path: Path,
+) -> None:
+    config = _config(tmp_path)
+    adapter = NavigationAnnotationRuntimeAdapter(config)
+    assert config.work_root is not None
+    assert config.runtime_source_root is not None
+    assert config.tracking_binary_data_root is not None
+    assert config.legacy_tracking_data_root is not None
+    staging = (
+        config.work_root
+        / "jobs"
+        / ("job_" + "b" * 32)
+        / "20270605_temp"
+    )
+    private_data = staging / ".runtime" / "runs" / ("run_" + "c" * 32) / "Data"
+    private_data.mkdir(parents=True)
+
+    command = adapter._sandbox_command(
+        staging_root=staging,
+        argv=["./bin/main"],
+        cwd=config.runtime_source_root / "1_onnx_tam",
+        writable_bindings=(
+            (private_data, config.tracking_binary_data_root),
+        ),
+        sandbox_only_writable_bindings=(
+            (private_data, config.legacy_tracking_data_root),
+        ),
+    )
+
+    shell = command[2]
+    ro_root = shell.index("--ro-bind / /")
+    tmpfs = shell.index("--tmpfs /mnt")
+    directory_positions = [
+        shell.index(f"--dir {directory}")
+        for directory in runtime_module._sandbox_only_directory_chain(
+            config.legacy_tracking_data_root,
+            mount_root=runtime_module._LEGACY_YAML_SANDBOX_ROOT,
+        )
+    ]
+    virtual_bind = shell.index(
+        f"--bind {private_data} {config.legacy_tracking_data_root}",
+    )
+    assert ro_root < tmpfs < min(directory_positions)
+    assert directory_positions == sorted(directory_positions)
+    assert max(directory_positions) < virtual_bind
+    assert (
+        shell.count(
+            f"--bind {private_data} {config.legacy_tracking_data_root}",
+        )
+        == 1
+    )
+    assert (
+        shell.count(
+            f"--bind {private_data} {config.tracking_binary_data_root}",
+        )
+        == 1
+    )
+
+
+def test_sandbox_command_rejects_unregistered_sandbox_only_target(
+    tmp_path: Path,
+) -> None:
+    config = _config(tmp_path)
+    adapter = NavigationAnnotationRuntimeAdapter(config)
+    assert config.work_root is not None
+    assert config.runtime_source_root is not None
+    staging = (
+        config.work_root
+        / "jobs"
+        / ("job_" + "d" * 32)
+        / "20270605_temp"
+    )
+    private_data = staging / ".runtime" / "runs" / ("run_" + "e" * 32) / "Data"
+    private_data.mkdir(parents=True)
+
+    with pytest.raises(RuntimeExecutionError) as error:
+        adapter._sandbox_command(
+            staging_root=staging,
+            argv=["./bin/main"],
+            cwd=config.runtime_source_root / "1_onnx_tam",
+            sandbox_only_writable_bindings=(
+                (private_data, Path("/mnt/unregistered/Data")),
+            ),
+        )
+
+    assert error.value.code == "unsafe_runtime_path"
+
+
+def test_sandbox_command_rejects_configured_but_unfrozen_virtual_target(
+    tmp_path: Path,
+) -> None:
+    config = replace(
+        _config(tmp_path),
+        legacy_tracking_data_root=Path("/mnt/arbitrary/Data"),
+    )
+    adapter = NavigationAnnotationRuntimeAdapter(config)
+    assert config.work_root is not None
+    assert config.runtime_source_root is not None
+    staging = (
+        config.work_root
+        / "jobs"
+        / ("job_" + "f" * 32)
+        / "20270605_temp"
+    )
+    private_data = staging / ".runtime" / "runs" / ("run_" + "1" * 32) / "Data"
+    private_data.mkdir(parents=True)
+
+    with pytest.raises(RuntimeExecutionError) as error:
+        adapter._sandbox_command(
+            staging_root=staging,
+            argv=["./bin/main"],
+            cwd=config.runtime_source_root / "1_onnx_tam",
+            sandbox_only_writable_bindings=(
+                (private_data, config.legacy_tracking_data_root),
+            ),
+        )
+
+    assert error.value.code == "unsafe_runtime_path"
+
+
+def test_sandbox_command_rejects_other_binding_under_virtual_root(
+    tmp_path: Path,
+) -> None:
+    config = _config(tmp_path)
+    adapter = NavigationAnnotationRuntimeAdapter(config)
+    assert config.work_root is not None
+    assert config.runtime_source_root is not None
+    assert config.legacy_tracking_data_root is not None
+    staging = (
+        config.work_root
+        / "jobs"
+        / ("job_" + "2" * 32)
+        / "20270605_temp"
+    )
+    private_data = staging / ".runtime" / "runs" / ("run_" + "3" * 32) / "Data"
+    private_data.mkdir(parents=True)
+
+    with pytest.raises(RuntimeExecutionError) as error:
+        adapter._sandbox_command(
+            staging_root=staging,
+            argv=["./bin/main"],
+            cwd=config.runtime_source_root / "1_onnx_tam",
+            writable_bindings=((private_data, Path("/mnt/other")),),
+            sandbox_only_writable_bindings=(
+                (private_data, config.legacy_tracking_data_root),
+            ),
+        )
+
+    assert error.value.code == "unsafe_runtime_path"
 
 
 def test_prepare_copies_inputs_and_preserves_frozen_business_order(
@@ -2046,9 +2263,13 @@ def test_tracking_uses_private_data_overlay_and_commits_checkpoint(
         "master_green_gray_white",
     )
     captured_bindings: list[tuple[Path, Path]] = []
+    captured_sandbox_only_bindings: list[tuple[Path, Path]] = []
 
     def fake_run_checked(**kwargs) -> None:
         captured_bindings.extend(kwargs["writable_bindings"])
+        captured_sandbox_only_bindings.extend(
+            kwargs["sandbox_only_writable_bindings"],
+        )
         output = (
             staging
             / ".runtime"
@@ -2093,7 +2314,10 @@ def test_tracking_uses_private_data_overlay_and_commits_checkpoint(
         / "Data"
     )
     assert (private_data, config.tracking_binary_data_root) in captured_bindings
-    assert (private_data, config.legacy_tracking_data_root) in captured_bindings
+    assert (
+        private_data,
+        config.legacy_tracking_data_root,
+    ) in captured_sandbox_only_bindings
     assert config.tracking_binary_data_root != config.legacy_tracking_data_root
     evidence = CheckpointVerificationRequest(
         job_ref="job_" + "c" * 32,
