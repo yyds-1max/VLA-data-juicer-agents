@@ -644,6 +644,57 @@
     },
     {
       "root_alias": "SYSTEM_RUNTIME",
+      "relative_path": "install/xvfb_2%3a1.20.13-1ubuntu1~20.04.20_amd64.deb",
+      "kind": "external_runtime",
+      "role": "xvfb_deb_package",
+      "stage": "all",
+      "version": "2:1.20.13-1ubuntu1~20.04.20",
+      "sha256": "b671759ad2b8280723b0b55361368dc69c12cb301ea9a6a5e443e4f8d2745a2d",
+      "size": 780884,
+      "executable": false
+    },
+    {
+      "root_alias": "SYSTEM_RUNTIME",
+      "relative_path": "usr/bin/Xvfb",
+      "kind": "external_runtime",
+      "role": "xvfb_server_binary",
+      "stage": "all",
+      "sha256": "d341ff11d9235f85edfd481c884517a80af0ca862350a432f3b22cea624c55a4",
+      "size": 2056648,
+      "executable": true
+    },
+    {
+      "root_alias": "SYSTEM_RUNTIME",
+      "relative_path": "usr/bin/xvfb-run",
+      "kind": "external_runtime",
+      "role": "xvfb_launcher",
+      "stage": "all",
+      "sha256": "48ee444c30fdaaede4cc311644b30e554162e956f949b206858e37eb8ba1ae05",
+      "size": 5701,
+      "executable": true
+    },
+    {
+      "root_alias": "SYSTEM_RUNTIME",
+      "relative_path": "usr/bin/bwrap",
+      "kind": "external_runtime",
+      "role": "sandbox_binary",
+      "stage": "all",
+      "sha256": "af662c55cd85178a58da083220a9348c4a7d3c24333fd0bc7badb18c93392987",
+      "size": 68032,
+      "executable": true
+    },
+    {
+      "root_alias": "SYSTEM_RUNTIME",
+      "relative_path": "install/runtime-dependencies.json",
+      "kind": "external_runtime",
+      "role": "runtime_dependency_summary",
+      "stage": "all",
+      "sha256": "04f79d26200ff993732fd5fb3e184589ec9bb9d5886e154f0f99fe64fd06bb00",
+      "size": 2211,
+      "executable": false
+    },
+    {
+      "root_alias": "SYSTEM_RUNTIME",
       "relative_path": "python/packages/numpy",
       "kind": "external_runtime",
       "role": "python_package",

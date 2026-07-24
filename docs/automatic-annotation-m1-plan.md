@@ -252,8 +252,8 @@ M1 的本地代码实现、fake-runtime 集成和独立代码审计已经完成�
 本地最终门禁：
 
 ```text
-Python 全量                  1501 passed
-Runtime targeted             113 passed
+Python 全量                  1513 passed
+Runtime targeted             125 passed
 Web/Store/恢复 targeted      174 passed
 run_web targeted              25 passed
 前端 Vitest                  204 passed
@@ -286,8 +286,10 @@ compileall / git diff --check PASS
 服务器 Runtime payload 已按 manifest 仅部署 55 个 frozen files，源端与部署端
 均通过 SHA-256、大小和 executable bit 校验；活动 Data Runtime 的 10 个包版本、
 GPU 和 bubblewrap 已复核。Legacy YAML sandbox-only target 的无业务 smoke 也已
-通过，未创建宿主 `/mnt/data1`。以上结果仍不包含固定 Xvfb 的安装/attestation 或
-真实 M1 writer。尚未运行 `2027 Tracking candidate ↔ 2026 oracle`，因此当前只有
-拆解/同步等价结论，不能宣称 Tracking 已与 legacy 等价。M1 仍保持“未冻结”；
-下一步只能按 `docs/automatic-annotation-m1-server-acceptance.md` 另行批准并执行
-无界面环境安装和服务器 writer 验收。
+通过，未创建宿主 `/mnt/data1`。2026-07-24 又安装并登记了固定 Xvfb，捕获五项
+安装证据，并通过 Xvfb、bubblewrap 内 DISPLAY 和沙箱内 GPU 的无业务 smoke；
+系统依赖摘要现在会逐包核对实际 dpkg 版本。以上结果仍不包含真实 M1 writer。
+尚未运行 `2027 Tracking candidate ↔ 2026 oracle`，因此当前只有拆解/同步等价
+结论，不能宣称 Tracking 已与 legacy 等价。M1 仍保持“未冻结”；下一步只能按
+`docs/automatic-annotation-m1-server-acceptance.md` 单独批准并执行服务器 writer
+验收。

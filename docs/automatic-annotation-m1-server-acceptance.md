@@ -142,10 +142,9 @@ VLA_RUNTIME_DEPENDENCY_SUMMARY
   服务 UID 持有且权限精确为 `0700` 的系统专用真实目录；Runtime 不会替操作人
   自动创建或修正权限。它不得位于 `raw_data`、`clip_data`、`finish_data` 或
   同事业务代码目录内；
-- `VLA_ANNOTATION_RUNTIME_TIMEOUT_SECONDS` 必须在验收前显式确认并审批为
-  ASCII 正整数；它表示单条冻结 Runtime 命令的最大执行秒数，应根据本次真实
-  单命令上限决定，本文不猜测生产值。缺失、零、负数或其他格式时 capability
-  必须 fail closed，禁止创建 writer Job；
+- `VLA_ANNOTATION_RUNTIME_TIMEOUT_SECONDS` 已审批为 `21600`，表示单条冻结
+  Runtime 命令最多运行 6 小时。缺失、零、负数或其他格式时 capability 必须
+  fail closed，禁止创建 writer Job；
 - writer lock 必须是绝对路径，父目录归系统服务所有，不得是 symlink；
 - Annotation Runtime 不得使用未配置时的 `/tmp` 兼容默认值；缺少
   `VLA_NAVIGATION_WRITER_LOCK_PATH`、父目录非当前服务所有、父目录可被 group/
@@ -241,6 +240,8 @@ df -B1 "$M1_WORK_ROOT"
 创建 Job 和 Worker 执行前都必须通过 fail-closed capacity preflight；人工等待后
 开始 Tracking 时必须再次计算，不能复用创建任务时的旧结果。先验收较小的
 `160904`；只有它结束并重新核对容量后，才可启动六个内部 segment 的 `145550`。
+`VLA_ANNOTATION_MINIMUM_FREE_BYTES` 已审批为 `107374182400`（100 GiB）。这是
+任务估算之外必须保留的安全余量，不会预分配或直接占用 100 GiB。
 
 ## 4. 污染基线快照
 
@@ -300,19 +301,19 @@ vla-nav-runtime-manifest verify-root \
 
 ### 5.2 Xvfb、bubblewrap 与安装摘要
 
-2026-07-24 只读预检结果：服务器尚未安装 Xvfb，APT 当前候选版本正好是
-`2:1.20.13-1ubuntu1~20.04.20`，本机 APT cache 中没有对应 deb；已安装的
-bubblewrap 为 `0.4.0-1ubuntu4.1`。这只是安装可行性信息，不等于已批准安装，
-也不能替代 deb 下载后的 SHA-256 和安装后证据。
-
-只有在安装审批通过后才安装固定 Xvfb：
+固定版本为：
 
 ```text
 2:1.20.13-1ubuntu1~20.04.20
 ```
 
-安装来源必须是操作人保存的确切 deb；先记录 deb SHA-256，再安装。安装后只读
-捕获：
+2026-07-24 已获得安装审批。APT 模拟结果为新增一个 `xvfb` 包、升级 0、降级
+0、删除 0；随后只安装了上述固定版本，新增磁盘占用约 2.3 MB。APT 下载并用于
+安装的确切 deb 仍保留在 cache，已逐字节复制到系统专用 Runtime 安装证据目录。
+复制前后 SHA-256 一致，`dpkg-deb` 中的 package/version/architecture 与实际
+`dpkg-query` 结果一致。以后重新安装或升级仍须先保存并记录确切 deb 的 SHA-256。
+
+安装后只读捕获：
 
 - Xvfb deb 的 SHA-256、大小和版本；
 - 实际 `/usr/bin/Xvfb`；
@@ -334,6 +335,20 @@ runtime_dependency_summary
 真实哈希只能在服务器安装后只读捕获，再通过单独审核的 manifest 提交加入仓库；
 不得在本地猜测或手填占位哈希。在这五项缺失、文件不匹配或版本不符时，
 `GET /api/annotation/capabilities` 必须返回不可用，禁止创建 writer Job。
+
+本次安装证据为：
+
+| role | SHA-256 | size | executable |
+|---|---|---:|---:|
+| `xvfb_deb_package` | `b671759ad2b8280723b0b55361368dc69c12cb301ea9a6a5e443e4f8d2745a2d` | 780884 | false |
+| `xvfb_server_binary` | `d341ff11d9235f85edfd481c884517a80af0ca862350a432f3b22cea624c55a4` | 2056648 | true |
+| `xvfb_launcher` | `48ee444c30fdaaede4cc311644b30e554162e956f949b206858e37eb8ba1ae05` | 5701 | true |
+| `sandbox_binary` | `af662c55cd85178a58da083220a9348c4a7d3c24333fd0bc7badb18c93392987` | 68032 | true |
+| `runtime_dependency_summary` | `04f79d26200ff993732fd5fb3e184589ec9bb9d5886e154f0f99fe64fd06bb00` | 2211 | false |
+
+依赖摘要列出 18 个稳定排序的系统包及其架构、精确版本。Runtime 不只校验摘要
+文件本身，还严格解析其 Schema，并重新使用 `dpkg-query` 核对每个包的实际版本；
+摘要格式、文件或系统包发生漂移时均 fail closed。
 
 更新 manifest 后重新部署对应 commit，并再次执行完整 Runtime、Python、package、
 GPU 和安装摘要 preflight。记录 capability 的安全错误码，不把内部路径或命令写入
@@ -370,6 +385,11 @@ SIGTERM→SIGKILL 语义清理完整进程组；不得为测试超时而启动�
 > `/mnt/data1` 均不存在，沙箱写入只出现在临时私有目录，临时目录已清理。
 > 本记录只证明 sandbox-only 挂载拓扑，不代表 Xvfb、sandbox 内 GPU、超时、
 > 进程组清理或真实 Tracking 门禁已经通过。
+
+> 2026-07-24 安装固定 Xvfb 后又完成两项无业务 smoke：固定参数启动的 Xvfb
+> 可被 `xdpyinfo` 访问；同一 DISPLAY 进入 bubblewrap 后仍可访问，且沙箱内
+> `nvidia-smi -L` 成功。该结果证明 Xvfb、DISPLAY 和 GPU 在当前无业务沙箱
+> 拓扑中可用，仍不代表真实 Tracking、Golden 或业务算法已经验收。
 
 ## 6. 2027 测试数据准备顺序
 

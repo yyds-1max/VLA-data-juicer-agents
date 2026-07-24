@@ -106,13 +106,14 @@ setup 脚本会选择数据解释器、加载两个 ROS setup，并调整命令/
 `external_runtime`，没有复制进仓库；部署时必须按 manifest 再次核对 setup、
 解释器、包版本和动态库，不能把“已只读审计”误解为“已部署可复制环境”。
 
-M1 writer 还要求安装证据 fail-closed。服务器安装固定
-Xvfb `2:1.20.13-1ubuntu1~20.04.20` 后，必须只读捕获并在受控 manifest 更新中
-登记 `xvfb_deb_package`、`xvfb_server_binary`、`xvfb_launcher`、
+M1 writer 还要求安装证据 fail-closed。2026-07-24 经安装模拟确认不会升级、
+降级或删除已有包后，服务器安装了固定 Xvfb
+`2:1.20.13-1ubuntu1~20.04.20`。仓库 manifest 使用服务器实测字节登记
+`xvfb_deb_package`、`xvfb_server_binary`、`xvfb_launcher`、
 `sandbox_binary` 与 `runtime_dependency_summary` 的 SHA-256、大小和 executable
-bit；部署配置同时显式绑定 deb 与依赖摘要文件。当前仓库 manifest 尚未臆造这些
-服务器安装后摘要，因此在完成该门禁并更新 manifest 前，M1
-`/api/annotation/capabilities` 应返回不可用，writer Job 不得创建。
+bit；部署配置同时显式绑定保存的 deb 与依赖摘要文件。依赖摘要采用严格 JSON
+contract，列出稳定排序的系统包名、架构和版本；capability 会重新查询每个包的
+实际 dpkg 版本，摘要格式错误、文件漂移或包版本漂移均关闭 writer。
 
 ## 只读验证
 

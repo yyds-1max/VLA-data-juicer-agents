@@ -319,7 +319,7 @@ AppleDouble 文件不属于业务输入，拆包发现与 raw 同源比较均须
   `codex/automatic-annotation-m1`；
 - M1 只实现 `navigation_odom_v1` 的 Web 首帧标注与 Tracking，不提前接入
   M2 后处理/Fix、M3 智能体或 M4 AI；
-- 本地门禁为 Python `1501 passed`、前端 `204 passed`、Playwright
+- 本地门禁为 Python `1513 passed`、前端 `204 passed`、Playwright
   `7 passed`、Golden `73 passed`、Router suite `17 cases validated`，前端
   production build、compileall 和 diff-check 均通过；
 - Golden 的 M1 必需范围已覆盖两个门禁 clip 的 `maps/`、`v1.0-trainval/`
@@ -332,6 +332,7 @@ AppleDouble 文件不属于业务输入，拆包发现与 raw 同源比较均须
   compatibility target：只在每个任务的 bubblewrap mount namespace 中创建，
   不要求或修改宿主兼容目录；服务器 bubblewrap 0.4.0 无业务 smoke 已验证写入
   只落入临时 job-private Data，测试前后宿主 `/mnt/data1` 均不存在；
-- 系统 Runtime payload 已部署并验证；固定 Xvfb 和真实 Tracking 仍受单独服务器
-  writer 门禁约束。尚无真实 Tracking candidate/oracle 差异结论，因此 M1
-  尚未冻结，也不能进入 M2。
+- 系统 Runtime payload 已部署并验证；固定 Xvfb 已安装并由五项真实安装证据
+  attestation，Xvfb＋bubblewrap DISPLAY 与沙箱内 GPU 无业务 smoke 已通过。
+  真实 Tracking 仍受单独服务器 writer 门禁约束；尚无 candidate/oracle 差异
+  结论，因此 M1 尚未冻结，也不能进入 M2。

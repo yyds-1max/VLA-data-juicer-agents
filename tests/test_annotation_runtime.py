@@ -168,8 +168,32 @@ def _config(tmp_path: Path) -> NavigationAnnotationRuntimeConfig:
     _executable(xvfb)
     _executable(xvfb_server)
     xvfb_deb.write_bytes(b"frozen-xvfb-deb")
+    system_package_versions = {
+        "bubblewrap": "0.4.0-1ubuntu4.1",
+        "xvfb:amd64": EXPECTED_XVFB_VERSION,
+    }
     dependency_summary.write_text(
-        '{"packages":[]}\n',
+        json.dumps(
+            {
+                "schema_version": 1,
+                "runtime_id": "navigation_odom_v1",
+                "platform": {
+                    "architecture": "amd64",
+                    "distribution": "Ubuntu",
+                    "release": "20.04",
+                },
+                "packages": [
+                    {
+                        "name": name,
+                        "version": version,
+                        "architecture": "amd64",
+                    }
+                    for name, version in system_package_versions.items()
+                ],
+            },
+            sort_keys=True,
+        )
+        + "\n",
         encoding="utf-8",
     )
     manifest = tmp_path / "manifest.json"
@@ -420,7 +444,11 @@ def _config(tmp_path: Path) -> NavigationAnnotationRuntimeConfig:
         writer_lock_path=writer_lock_parent / "navigation.lock",
         minimum_free_bytes=1,
         timeout_seconds=300,
-        version_probe=lambda _package: EXPECTED_XVFB_VERSION,
+        version_probe=lambda package: (
+            EXPECTED_XVFB_VERSION
+            if package == "xvfb"
+            else system_package_versions.get(package, "")
+        ),
         package_probe=lambda _names: {},
         gpu_probe=lambda: True,
         overlay_target_probe=lambda path: (
@@ -447,6 +475,34 @@ def _refresh_frozen_manifest_entry(
         sha256=hashlib.sha256(path.read_bytes()).hexdigest(),
         size=path.stat().st_size,
         executable=bool(path.stat().st_mode & 0o111),
+    )
+    config.manifest_path.write_text(
+        json.dumps(manifest),
+        encoding="utf-8",
+    )
+
+
+def _write_dependency_summary(
+    config: NavigationAnnotationRuntimeConfig,
+    payload: object,
+) -> None:
+    assert config.runtime_dependency_summary_path is not None
+    content = payload if isinstance(payload, str) else json.dumps(payload)
+    config.runtime_dependency_summary_path.write_text(
+        content + ("\n" if not content.endswith("\n") else ""),
+        encoding="utf-8",
+    )
+    manifest = json.loads(config.manifest_path.read_text(encoding="utf-8"))
+    entry = next(
+        item
+        for item in manifest["entries"]
+        if item.get("role") == "runtime_dependency_summary"
+    )
+    content_bytes = config.runtime_dependency_summary_path.read_bytes()
+    entry.update(
+        sha256=hashlib.sha256(content_bytes).hexdigest(),
+        size=len(content_bytes),
+        executable=False,
     )
     config.manifest_path.write_text(
         json.dumps(manifest),
@@ -1505,6 +1561,174 @@ def test_runtime_capabilities_require_installation_attestation(
     assert capability.available is False
     assert capability.reason is not None
     assert capability.reason.code == "runtime_installation_manifest_incomplete"
+
+
+@pytest.mark.parametrize(
+    "mutate",
+    [
+        lambda document: {
+            **document,
+            "schema_version": 2,
+        },
+        lambda document: {
+            **document,
+            "unexpected": True,
+        },
+        lambda document: {
+            **document,
+            "platform": {
+                **document["platform"],
+                "unexpected": "value",
+            },
+        },
+        lambda document: {
+            **document,
+            "packages": [],
+        },
+        lambda document: {
+            **document,
+            "packages": list(reversed(document["packages"])),
+        },
+        lambda document: {
+            **document,
+            "packages": [
+                document["packages"][0],
+                document["packages"][0],
+            ],
+        },
+        lambda document: {
+            **document,
+            "packages": [
+                {
+                    **document["packages"][0],
+                    "unexpected": "value",
+                },
+                *document["packages"][1:],
+            ],
+        },
+        lambda document: {
+            **document,
+            "packages": [
+                {
+                    **document["packages"][0],
+                    "name": "Invalid Package",
+                },
+                *document["packages"][1:],
+            ],
+        },
+    ],
+    ids=(
+        "schema-version",
+        "top-level-shape",
+        "platform-shape",
+        "empty-packages",
+        "unsorted-packages",
+        "duplicate-package",
+        "package-shape",
+        "package-name",
+    ),
+)
+def test_runtime_capabilities_reject_malformed_dependency_summary(
+    tmp_path: Path,
+    mutate,
+) -> None:
+    config = _config(tmp_path)
+    assert config.runtime_dependency_summary_path is not None
+    document = json.loads(
+        config.runtime_dependency_summary_path.read_text(encoding="utf-8"),
+    )
+    _write_dependency_summary(config, mutate(document))
+
+    capability = NavigationAnnotationRuntimeAdapter(config).capabilities()
+
+    assert capability.available is False
+    assert capability.reason is not None
+    assert capability.reason.code == "runtime_dependency_summary_invalid"
+
+
+def test_runtime_capabilities_reject_duplicate_dependency_summary_key(
+    tmp_path: Path,
+) -> None:
+    config = _config(tmp_path)
+    _write_dependency_summary(
+        config,
+        (
+            '{"schema_version":1,"schema_version":1,'
+            '"runtime_id":"navigation_odom_v1",'
+            '"platform":{"architecture":"amd64",'
+            '"distribution":"Ubuntu","release":"20.04"},'
+            '"packages":[{"name":"xvfb:amd64",'
+            f'"version":"{EXPECTED_XVFB_VERSION}",'
+            '"architecture":"amd64"}]}'
+        ),
+    )
+
+    capability = NavigationAnnotationRuntimeAdapter(config).capabilities()
+
+    assert capability.available is False
+    assert capability.reason is not None
+    assert capability.reason.code == "runtime_dependency_summary_invalid"
+
+
+def test_runtime_capabilities_verify_each_system_dependency_version(
+    tmp_path: Path,
+) -> None:
+    config = _config(tmp_path)
+    probed: list[str] = []
+    expected = {
+        "xvfb": EXPECTED_XVFB_VERSION,
+        "bubblewrap": "0.4.0-1ubuntu4.1",
+        "xvfb:amd64": EXPECTED_XVFB_VERSION,
+    }
+
+    def probe(package: str) -> str:
+        probed.append(package)
+        return expected[package]
+
+    capability = NavigationAnnotationRuntimeAdapter(
+        replace(config, version_probe=probe),
+    ).capabilities()
+
+    assert capability.available is True
+    assert probed == ["xvfb", "bubblewrap", "xvfb:amd64"]
+
+
+def test_runtime_capabilities_reject_system_dependency_version_drift(
+    tmp_path: Path,
+) -> None:
+    config = _config(tmp_path)
+
+    def probe(package: str) -> str:
+        if package == "bubblewrap":
+            return "changed"
+        return EXPECTED_XVFB_VERSION
+
+    capability = NavigationAnnotationRuntimeAdapter(
+        replace(config, version_probe=probe),
+    ).capabilities()
+
+    assert capability.available is False
+    assert capability.reason is not None
+    assert capability.reason.code == "system_dependency_mismatch"
+
+
+def test_runtime_capabilities_fail_closed_when_system_probe_fails(
+    tmp_path: Path,
+) -> None:
+    config = _config(tmp_path)
+
+    def probe(package: str) -> str:
+        if package == "bubblewrap":
+            raise OSError("probe failed")
+        return EXPECTED_XVFB_VERSION
+
+    capability = NavigationAnnotationRuntimeAdapter(
+        replace(config, version_probe=probe),
+    ).capabilities()
+
+    assert capability.available is False
+    assert capability.reason is not None
+    assert capability.reason.code == "system_dependency_probe_failed"
 
 
 def test_sandbox_command_uses_fixed_xvfb_and_read_only_host_root(

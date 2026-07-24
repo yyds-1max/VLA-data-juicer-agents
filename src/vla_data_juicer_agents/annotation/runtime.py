@@ -70,6 +70,12 @@ _CLIP_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]*$")
 _IDENTITY_RE = re.compile(
     r"^(?:master|other[0-9]+)_[a-z]+_[a-z]+_[a-z]+$",
 )
+_DEBIAN_PACKAGE_NAME_RE = re.compile(
+    r"^[a-z0-9][a-z0-9+.-]*(?::[a-z0-9][a-z0-9-]*)?$",
+)
+_DEBIAN_PACKAGE_VERSION_RE = re.compile(r"^[A-Za-z0-9.+:~_-]+$")
+_DEBIAN_ARCHITECTURE_RE = re.compile(r"^[a-z0-9][a-z0-9-]*$")
+_PLATFORM_VALUE_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9.+_-]*$")
 _REQUIRED_SENSOR_FILES = ("fisheye_front.json", "r32_rslidar_points.json")
 _FIRST_FRAME_SUFFIXES = frozenset({".jpg", ".png"})
 _RUNTIME_SOURCE_ALIAS = "NAVIGATION_ODOM_V1_SOURCE"
@@ -2177,6 +2183,79 @@ class _RuntimeBase:
         )
         return result.stdout.strip() if result.returncode == 0 else ""
 
+    def _runtime_dependency_packages(
+        self,
+        path: Path,
+        entry: dict[str, object],
+    ) -> tuple[tuple[str, str], ...]:
+        content = _read_stable_regular_bytes(path)
+        metadata = path.stat(follow_symlinks=False)
+        if (
+            len(content) != entry.get("size")
+            or hashlib.sha256(content).hexdigest() != entry.get("sha256")
+            or bool(metadata.st_mode & 0o111)
+            != bool(entry.get("executable"))
+        ):
+            raise ValueError("Runtime dependency summary changed")
+        document = json.loads(
+            content.decode("utf-8"),
+            object_pairs_hook=_manifest_object_without_duplicate_keys,
+        )
+        if (
+            not isinstance(document, dict)
+            or set(document)
+            != {"schema_version", "runtime_id", "platform", "packages"}
+            or type(document["schema_version"]) is not int
+            or document["schema_version"] != 1
+            or document["runtime_id"] != RUNTIME_ID
+        ):
+            raise ValueError("Runtime dependency summary header is invalid")
+        platform = document["platform"]
+        if (
+            not isinstance(platform, dict)
+            or set(platform)
+            != {"architecture", "distribution", "release"}
+            or any(
+                not isinstance(value, str)
+                or _PLATFORM_VALUE_RE.fullmatch(value) is None
+                for value in platform.values()
+            )
+            or _DEBIAN_ARCHITECTURE_RE.fullmatch(
+                str(platform["architecture"]),
+            )
+            is None
+        ):
+            raise ValueError("Runtime dependency platform is invalid")
+        packages = document["packages"]
+        if not isinstance(packages, list) or not packages:
+            raise ValueError("Runtime dependency package set is empty")
+        result: list[tuple[str, str]] = []
+        for package in packages:
+            if (
+                not isinstance(package, dict)
+                or set(package) != {"name", "version", "architecture"}
+            ):
+                raise ValueError("Runtime dependency package is invalid")
+            name = package["name"]
+            version = package["version"]
+            architecture = package["architecture"]
+            if (
+                not isinstance(name, str)
+                or _DEBIAN_PACKAGE_NAME_RE.fullmatch(name) is None
+                or not isinstance(version, str)
+                or _DEBIAN_PACKAGE_VERSION_RE.fullmatch(version) is None
+                or not isinstance(architecture, str)
+                or _DEBIAN_ARCHITECTURE_RE.fullmatch(architecture) is None
+            ):
+                raise ValueError("Runtime dependency package is invalid")
+            result.append((name, version))
+        names = [name for name, _version in result]
+        if names != sorted(names) or len(names) != len(set(names)):
+            raise ValueError(
+                "Runtime dependency packages are not strictly sorted",
+            )
+        return tuple(result)
+
     def _python_package_versions(
         self,
         distributions: tuple[str, ...],
@@ -2493,6 +2572,39 @@ class _RuntimeBase:
             return unavailable(
                 "xvfb_version_mismatch",
                 "The installed Xvfb package does not match the frozen version.",
+            )
+        dependency_summary_entry = external_by_role[
+            "runtime_dependency_summary"
+        ]
+        assert config.runtime_dependency_summary_path is not None
+        try:
+            system_packages = self._runtime_dependency_packages(
+                config.runtime_dependency_summary_path,
+                dependency_summary_entry,
+            )
+        except (OSError, UnicodeError, ValueError, TypeError):
+            return unavailable(
+                "runtime_dependency_summary_invalid",
+                "The installed system dependency summary is invalid.",
+            )
+        try:
+            installed_system_versions = {
+                name: self._version(name)
+                for name, _version in system_packages
+            }
+        except Exception:
+            return unavailable(
+                "system_dependency_probe_failed",
+                "The installed system dependency set cannot be verified.",
+            )
+        if any(
+            installed_system_versions[name] != expected_version
+            for name, expected_version in system_packages
+        ):
+            return unavailable(
+                "system_dependency_mismatch",
+                "The installed system dependencies differ from the frozen "
+                "summary.",
             )
         setup_entry = external_by_role.get("active_environment_setup")
         python_entry = external_by_role.get("active_python_interpreter")
