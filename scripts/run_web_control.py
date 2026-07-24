@@ -42,6 +42,15 @@ _LINUX_BOOT_ID_PATTERN: Final = re.compile(
     rb"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-"
     rb"[0-9a-f]{4}-[0-9a-f]{12}",
 )
+_LINUX_PIDFD_SYSCALLS: Final = {
+    # Linux assigns these pidfd calls the same syscall numbers on the two
+    # production architectures we support.  Keep the allowlist explicit so an
+    # unknown ABI fails closed instead of invoking an unrelated syscall.
+    "aarch64": (434, 424),
+    "arm64": (434, 424),
+    "amd64": (434, 424),
+    "x86_64": (434, 424),
+}
 _PROC_PIDTBSDINFO: Final = 3
 
 
@@ -74,6 +83,72 @@ class _DarwinProcBsdInfo(ctypes.Structure):
 
 class ControlPathError(RuntimeError):
     """A control path cannot be used without following or trusting unsafe state."""
+
+
+def _linux_pidfd_syscall_numbers() -> tuple[int, int]:
+    try:
+        machine = os.uname().machine.lower()
+    except (AttributeError, OSError) as exc:
+        raise ControlPathError(
+            "Linux pidfd signalling is unavailable",
+        ) from exc
+    numbers = _LINUX_PIDFD_SYSCALLS.get(machine)
+    if numbers is None:
+        raise ControlPathError(
+            "Linux pidfd signalling is unavailable",
+        )
+    return numbers
+
+
+def _raw_linux_syscall(number: int, *arguments: object) -> int:
+    try:
+        syscall = ctypes.CDLL(None, use_errno=True).syscall
+    except (AttributeError, OSError) as exc:
+        raise ControlPathError(
+            "Linux pidfd signalling is unavailable",
+        ) from exc
+    syscall.restype = ctypes.c_long
+    ctypes.set_errno(0)
+    result = syscall(ctypes.c_long(number), *arguments)
+    if result == -1:
+        error_number = ctypes.get_errno() or errno.ENOSYS
+        raise OSError(error_number, os.strerror(error_number))
+    return int(result)
+
+
+def _open_linux_pidfd(pid: int) -> int:
+    pidfd_open = getattr(os, "pidfd_open", None)
+    if callable(pidfd_open):
+        return int(pidfd_open(pid))
+    open_number, _send_number = _linux_pidfd_syscall_numbers()
+    return _raw_linux_syscall(
+        open_number,
+        ctypes.c_int(pid),
+        ctypes.c_uint(0),
+    )
+
+
+def _send_linux_pidfd_signal(
+    pid_descriptor: int,
+    signal_number: int,
+) -> None:
+    pidfd_send_signal = getattr(signal, "pidfd_send_signal", None)
+    if callable(pidfd_send_signal):
+        pidfd_send_signal(
+            pid_descriptor,
+            signal_number,
+            None,
+            0,
+        )
+        return
+    _open_number, send_number = _linux_pidfd_syscall_numbers()
+    _raw_linux_syscall(
+        send_number,
+        ctypes.c_int(pid_descriptor),
+        ctypes.c_int(signal_number),
+        ctypes.c_void_p(),
+        ctypes.c_uint(0),
+    )
 
 
 def _read_linux_process_birth_identity(pid: int) -> str | None:
@@ -784,15 +859,8 @@ def _send_instance_signal(
 ) -> int:
     pid_descriptor: int | None = None
     if sys.platform.startswith("linux"):
-        if not hasattr(os, "pidfd_open") or not hasattr(
-            signal,
-            "pidfd_send_signal",
-        ):
-            raise ControlPathError(
-                "Linux pidfd signalling is unavailable",
-            )
         try:
-            pid_descriptor = os.pidfd_open(expected_pid)
+            pid_descriptor = _open_linux_pidfd(expected_pid)
         except ProcessLookupError:
             return STALE_EXIT
         except (OSError, OverflowError) as exc:
@@ -808,11 +876,9 @@ def _send_instance_signal(
         return active_status
     try:
         if pid_descriptor is not None:
-            signal.pidfd_send_signal(
+            _send_linux_pidfd_signal(
                 pid_descriptor,
                 signal_number,
-                None,
-                0,
             )
         else:
             os.kill(expected_pid, signal_number)
