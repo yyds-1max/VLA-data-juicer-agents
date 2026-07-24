@@ -1240,6 +1240,71 @@ def _same_entry(left: os.stat_result, right: os.stat_result) -> bool:
     )
 
 
+def _same_object(left: os.stat_result, right: os.stat_result) -> bool:
+    return (
+        left.st_dev,
+        left.st_ino,
+        stat.S_IFMT(left.st_mode),
+    ) == (
+        right.st_dev,
+        right.st_ino,
+        stat.S_IFMT(right.st_mode),
+    )
+
+
+def _set_private_mode(
+    path: Path,
+    mode: int,
+    *,
+    expect_directory: bool,
+    error_code: str,
+    error_message: str,
+) -> None:
+    """Set owner-only permissions through a no-follow file descriptor."""
+
+    required_flags = ("O_CLOEXEC", "O_NOFOLLOW")
+    if expect_directory:
+        required_flags += ("O_DIRECTORY",)
+    else:
+        required_flags += ("O_NONBLOCK",)
+    if any(not hasattr(os, name) for name in required_flags):
+        raise RuntimeExecutionError(error_code, error_message)
+    flags = os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW
+    flags |= os.O_DIRECTORY if expect_directory else os.O_NONBLOCK
+    descriptor: int | None = None
+    expected_type = stat.S_ISDIR if expect_directory else stat.S_ISREG
+    try:
+        initial = path.lstat()
+        if stat.S_ISLNK(initial.st_mode) or not expected_type(initial.st_mode):
+            raise RuntimeExecutionError(error_code, error_message)
+        descriptor = os.open(path, flags)
+        opened = os.fstat(descriptor)
+        if not expected_type(opened.st_mode) or not _same_object(
+            initial,
+            opened,
+        ):
+            raise RuntimeExecutionError(error_code, error_message)
+        os.fchmod(descriptor, mode)
+        finished = os.fstat(descriptor)
+        current = path.lstat()
+        if (
+            not expected_type(finished.st_mode)
+            or not expected_type(current.st_mode)
+            or not _same_object(opened, finished)
+            or not _same_object(opened, current)
+            or stat.S_IMODE(finished.st_mode) != mode
+            or stat.S_IMODE(current.st_mode) != mode
+        ):
+            raise RuntimeExecutionError(error_code, error_message)
+    except RuntimeExecutionError:
+        raise
+    except (NotImplementedError, OSError) as exc:
+        raise RuntimeExecutionError(error_code, error_message) from exc
+    finally:
+        if descriptor is not None:
+            os.close(descriptor)
+
+
 def _ensure_private_directory(path: Path, *, create: bool = False) -> None:
     if create:
         try:
@@ -1261,7 +1326,13 @@ def _ensure_private_directory(path: Path, *, create: bool = False) -> None:
             "unsafe_runtime_path",
             "A private Runtime path is not a real directory.",
         )
-    path.chmod(0o700, follow_symlinks=False)
+    _set_private_mode(
+        path,
+        0o700,
+        expect_directory=True,
+        error_code="unsafe_runtime_path",
+        error_message="A private Runtime directory could not be secured safely.",
+    )
 
 
 def _ensure_private_directory_chain(
@@ -1299,9 +1370,25 @@ def _harden_private_tree(root: Path) -> None:
                 "A private Runtime tree contains a symlink.",
             )
         if stat.S_ISDIR(metadata.st_mode):
-            path.chmod(0o700, follow_symlinks=False)
+            _set_private_mode(
+                path,
+                0o700,
+                expect_directory=True,
+                error_code="unsafe_runtime_output",
+                error_message=(
+                    "A private Runtime output directory could not be secured safely."
+                ),
+            )
         elif stat.S_ISREG(metadata.st_mode):
-            path.chmod(0o600, follow_symlinks=False)
+            _set_private_mode(
+                path,
+                0o600,
+                expect_directory=False,
+                error_code="unsafe_runtime_output",
+                error_message=(
+                    "A private Runtime output file could not be secured safely."
+                ),
+            )
         else:
             raise RuntimeExecutionError(
                 "unsafe_runtime_output",
@@ -1667,7 +1754,13 @@ def _copy_tree_bytes(source: Path, destination: Path) -> None:
             "A Runtime copy destination parent is unavailable.",
         )
     destination.mkdir(mode=0o700, exist_ok=False)
-    destination.chmod(0o700, follow_symlinks=False)
+    _set_private_mode(
+        destination,
+        0o700,
+        expect_directory=True,
+        error_code="unsafe_runtime_path",
+        error_message="A Runtime copy destination could not be secured safely.",
+    )
     source_descriptor: int | None = None
     destination_descriptor: int | None = None
     try:
@@ -1974,16 +2067,24 @@ def _write_or_reuse_manifest_file(
                 "runtime_input_changed",
                 "A private frozen Runtime input differs from its manifest.",
             )
-        destination.chmod(0o600, follow_symlinks=False)
-        return
-    try:
-        _write_bytes_exclusive(destination, content)
-    except FileExistsError:
-        if not _manifest_file_content_matches(destination, entry):
-            raise RuntimeExecutionError(
-                "runtime_input_changed",
-                "A private frozen Runtime input differs from its manifest.",
-            )
+    else:
+        try:
+            _write_bytes_exclusive(destination, content)
+        except FileExistsError:
+            if not _manifest_file_content_matches(destination, entry):
+                raise RuntimeExecutionError(
+                    "runtime_input_changed",
+                    "A private frozen Runtime input differs from its manifest.",
+                )
+    _set_private_mode(
+        destination,
+        0o600,
+        expect_directory=False,
+        error_code="runtime_input_changed",
+        error_message=(
+            "A private frozen Runtime input could not be secured safely."
+        ),
+    )
     if not _manifest_file_content_matches(destination, entry):
         raise RuntimeExecutionError(
             "runtime_input_changed",
@@ -3225,7 +3326,13 @@ class NavigationAnnotationRuntimeAdapter(_RuntimeBase):
             )
         _ensure_private_directory(run_root, create=True)
         staging_root.mkdir(mode=0o700, exist_ok=False)
-        staging_root.chmod(0o700, follow_symlinks=False)
+        _set_private_mode(
+            staging_root,
+            0o700,
+            expect_directory=True,
+            error_code="unsafe_runtime_path",
+            error_message="The Runtime staging root could not be secured safely.",
+        )
         samples_date_root = _ensure_private_directory_chain(
             staging_root,
             ("samples", request.dataset_date),
@@ -3841,7 +3948,13 @@ class NavigationTrackingRuntime(_RuntimeBase):
                         )
                     img_points.unlink()
                 tracking_img.mkdir(mode=0o700)
-                tracking_img.chmod(0o700, follow_symlinks=False)
+                _set_private_mode(
+                    tracking_img,
+                    0o700,
+                    expect_directory=True,
+                    error_code="unsafe_runtime_path",
+                    error_message="Tracking scratch could not be secured safely.",
+                )
 
                 required_frozen_entries = (
                     self._revalidate_active_frozen_inputs(
@@ -3912,7 +4025,15 @@ class NavigationTrackingRuntime(_RuntimeBase):
                     shutil.move(str(tracking_img), str(output_dir))
                     shutil.move(str(img_points), str(points_path))
                     _harden_private_tree(output_dir)
-                    points_path.chmod(0o600, follow_symlinks=False)
+                    _set_private_mode(
+                        points_path,
+                        0o600,
+                        expect_directory=False,
+                        error_code="unsafe_tracking_output",
+                        error_message=(
+                            "Tracking points could not be secured safely."
+                        ),
+                    )
                     artifact_hash = tracking_checkpoint_artifact_sha256(
                         output_dir,
                         points_path,

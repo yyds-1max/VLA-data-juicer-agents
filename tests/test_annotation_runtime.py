@@ -914,6 +914,166 @@ def test_runtime_capabilities_accept_private_work_root(
     assert capability.available is True
 
 
+def test_private_tree_hardening_does_not_use_path_chmod_no_follow(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    private_root = tmp_path / "private"
+    private_root.mkdir(mode=0o755)
+    payload = private_root / "payload.json"
+    payload.write_text("{}\n", encoding="utf-8")
+    os.chmod(payload, 0o644)
+
+    def unsupported_path_chmod(*_args, **_kwargs) -> None:
+        raise NotImplementedError(
+            "chmod: follow_symlinks unavailable on this platform",
+        )
+
+    monkeypatch.setattr(Path, "chmod", unsupported_path_chmod)
+
+    runtime_module._harden_private_tree(private_root)
+
+    assert stat.S_IMODE(private_root.stat().st_mode) == 0o700
+    assert stat.S_IMODE(payload.stat().st_mode) == 0o600
+
+
+def test_private_mode_rejects_symlink_without_changing_target(
+    tmp_path: Path,
+) -> None:
+    outside = tmp_path / "outside"
+    outside.write_text("outside\n", encoding="utf-8")
+    os.chmod(outside, 0o640)
+    linked = tmp_path / "linked"
+    linked.symlink_to(outside)
+
+    with pytest.raises(RuntimeExecutionError) as error:
+        runtime_module._set_private_mode(
+            linked,
+            0o600,
+            expect_directory=False,
+            error_code="unsafe_runtime_output",
+            error_message="unsafe test entry",
+        )
+
+    assert error.value.code == "unsafe_runtime_output"
+    assert stat.S_IMODE(outside.stat().st_mode) == 0o640
+
+
+def test_private_mode_detects_inode_replacement_and_closes_descriptor(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    target = tmp_path / "payload"
+    target.write_text("original\n", encoding="utf-8")
+    os.chmod(target, 0o640)
+    displaced = tmp_path / "displaced"
+    original_fchmod = os.fchmod
+    descriptors: list[int] = []
+
+    def replace_after_fchmod(descriptor: int, mode: int) -> None:
+        descriptors.append(descriptor)
+        original_fchmod(descriptor, mode)
+        target.rename(displaced)
+        target.write_text("replacement\n", encoding="utf-8")
+
+    monkeypatch.setattr(runtime_module.os, "fchmod", replace_after_fchmod)
+
+    with pytest.raises(RuntimeExecutionError) as error:
+        runtime_module._set_private_mode(
+            target,
+            0o600,
+            expect_directory=False,
+            error_code="unsafe_runtime_output",
+            error_message="unsafe test entry",
+        )
+
+    assert error.value.code == "unsafe_runtime_output"
+    assert descriptors
+    for descriptor in descriptors:
+        with pytest.raises(OSError):
+            os.fstat(descriptor)
+
+
+def test_private_mode_requires_no_follow_platform_support(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    target = tmp_path / "payload"
+    target.write_text("payload\n", encoding="utf-8")
+    monkeypatch.delattr(runtime_module.os, "O_NOFOLLOW")
+
+    with pytest.raises(RuntimeExecutionError) as error:
+        runtime_module._set_private_mode(
+            target,
+            0o600,
+            expect_directory=False,
+            error_code="unsafe_runtime_path",
+            error_message="unsafe test entry",
+        )
+
+    assert error.value.code == "unsafe_runtime_path"
+
+
+def test_private_file_mode_open_is_nonblocking_and_no_follow(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    target = tmp_path / "payload"
+    target.write_text("payload\n", encoding="utf-8")
+    original_open = os.open
+    observed_flags: list[int] = []
+
+    def record_open(path, flags, *args, **kwargs):
+        observed_flags.append(flags)
+        return original_open(path, flags, *args, **kwargs)
+
+    monkeypatch.setattr(runtime_module.os, "open", record_open)
+
+    runtime_module._set_private_mode(
+        target,
+        0o600,
+        expect_directory=False,
+        error_code="unsafe_runtime_path",
+        error_message="unsafe test entry",
+    )
+
+    assert len(observed_flags) == 1
+    assert observed_flags[0] & os.O_NOFOLLOW
+    assert observed_flags[0] & os.O_NONBLOCK
+    assert observed_flags[0] & os.O_CLOEXEC
+
+
+def test_manifest_publish_race_still_hardens_matching_file(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    destination = tmp_path / "manifest-bound.json"
+    content = b'{"runtime":"frozen"}\n'
+    entry = {
+        "size": len(content),
+        "sha256": hashlib.sha256(content).hexdigest(),
+    }
+
+    def race_with_matching_file(path: Path, payload: bytes) -> None:
+        path.write_bytes(payload)
+        os.chmod(path, 0o666)
+        raise FileExistsError(path)
+
+    monkeypatch.setattr(
+        runtime_module,
+        "_write_bytes_exclusive",
+        race_with_matching_file,
+    )
+
+    runtime_module._write_or_reuse_manifest_file(
+        destination,
+        content,
+        entry,
+    )
+
+    assert stat.S_IMODE(destination.stat().st_mode) == 0o600
+
+
 @pytest.mark.parametrize("mode", [0o755, 0o775, 0o777])
 def test_runtime_capabilities_reject_nonprivate_work_root_mode(
     tmp_path: Path,
