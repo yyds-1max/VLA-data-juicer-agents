@@ -143,10 +143,79 @@ def _existing_regular_sqlite_path(db_path: Path) -> Path:
         raise RuntimeError("annotation database is unavailable") from exc
 
 
+def _private_mutable_sqlite_identity(
+    db_path: Path,
+) -> tuple[Path, tuple[int, int]]:
+    """Validate an existing writable Store without creating or chmodding it."""
+
+    if not db_path.is_absolute():
+        raise RuntimeError("annotation database path must be absolute")
+    resolved = _existing_regular_sqlite_path(db_path)
+    if resolved != db_path:
+        raise RuntimeError("annotation database path must be canonical")
+    try:
+        parent_metadata = resolved.parent.lstat()
+    except OSError as exc:
+        raise RuntimeError("annotation database parent is unavailable") from exc
+    if (
+        stat.S_ISLNK(parent_metadata.st_mode)
+        or not stat.S_ISDIR(parent_metadata.st_mode)
+        or parent_metadata.st_uid != os.geteuid()
+        or parent_metadata.st_mode & (stat.S_IWGRP | stat.S_IWOTH)
+    ):
+        raise RuntimeError("annotation database parent is unsafe")
+
+    flags = os.O_RDWR
+    if hasattr(os, "O_CLOEXEC"):
+        flags |= os.O_CLOEXEC
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    descriptor: int | None = None
+    try:
+        descriptor = os.open(resolved, flags)
+        metadata = os.fstat(descriptor)
+        current = resolved.lstat()
+        if (
+            not stat.S_ISREG(metadata.st_mode)
+            or metadata.st_uid != os.geteuid()
+            or metadata.st_mode & (stat.S_IRWXG | stat.S_IRWXO)
+            or current.st_dev != metadata.st_dev
+            or current.st_ino != metadata.st_ino
+        ):
+            raise RuntimeError("annotation database storage is unsafe")
+        identity = (metadata.st_dev, metadata.st_ino)
+    except OSError as exc:
+        raise RuntimeError("annotation database must remain writable") from exc
+    finally:
+        if descriptor is not None:
+            os.close(descriptor)
+
+    for suffix in ("-wal", "-shm"):
+        sidecar = Path(f"{resolved}{suffix}")
+        try:
+            metadata = sidecar.lstat()
+        except FileNotFoundError:
+            continue
+        except OSError as exc:
+            raise RuntimeError(
+                "annotation database sidecar is unavailable",
+            ) from exc
+        if (
+            stat.S_ISLNK(metadata.st_mode)
+            or not stat.S_ISREG(metadata.st_mode)
+            or metadata.st_uid != os.geteuid()
+            or metadata.st_mode & (stat.S_IRWXG | stat.S_IRWXO)
+        ):
+            raise RuntimeError("annotation database sidecar is unsafe")
+    return resolved, identity
+
+
 class AnnotationStore:
     def __init__(self, db_path: Path | str) -> None:
         self.db_path = Path(db_path)
         self._read_only = False
+        self._existing_mutable = False
+        self._bound_db_identity: tuple[int, int] | None = None
         self.deployment_instance = os.environ.get(
             "VLA_DEPLOYMENT_INSTANCE",
             "deployment_unconfigured",
@@ -166,22 +235,56 @@ class AnnotationStore:
         instance = cls.__new__(cls)
         instance.db_path = _existing_regular_sqlite_path(Path(db_path))
         instance._read_only = True
+        instance._existing_mutable = False
+        metadata = instance.db_path.lstat()
+        instance._bound_db_identity = (metadata.st_dev, metadata.st_ino)
         instance.deployment_instance = os.environ.get(
             "VLA_DEPLOYMENT_INSTANCE",
             "deployment_unconfigured",
         )
+        instance._require_current_schema()
+        return instance
+
+    @classmethod
+    def open_existing_mutable(cls, db_path: Path | str) -> "AnnotationStore":
+        """Open the current Store read-write without creating or migrating it."""
+
+        inspected = cls.open_existing_read_only(db_path)
+        resolved, identity = _private_mutable_sqlite_identity(Path(db_path))
+        if identity != inspected._bound_db_identity:
+            raise RuntimeError("annotation database identity changed")
+        instance = cls.__new__(cls)
+        instance.db_path = resolved
+        instance._read_only = False
+        instance._existing_mutable = True
+        instance._bound_db_identity = identity
+        instance.deployment_instance = os.environ.get(
+            "VLA_DEPLOYMENT_INSTANCE",
+            "deployment_unconfigured",
+        )
+        # The read-only inspection above verifies the complete migration ledger
+        # against this exact inode. Recheck through the bound mode=rw path so a
+        # same-inode migration race cannot cross the mutable-open boundary. No
+        # schema initializer is called here.
+        instance._assert_bound_database()
+        instance._require_current_schema()
+        return instance
+
+    @staticmethod
+    def _require_current_schema_on_connection(
+        connection: sqlite3.Connection,
+    ) -> None:
         try:
-            with instance._connect() as connection:
-                versions = [
-                    int(row["version"])
-                    for row in connection.execute(
-                        """
-                        SELECT version
-                        FROM annotation_schema_migrations
-                        ORDER BY version
-                        """,
-                    ).fetchall()
-                ]
+            versions = [
+                int(row["version"])
+                for row in connection.execute(
+                    """
+                    SELECT version
+                    FROM annotation_schema_migrations
+                    ORDER BY version
+                    """,
+                ).fetchall()
+            ]
         except sqlite3.Error as exc:
             raise RuntimeError(
                 "annotation database is not an initialized AnnotationStore",
@@ -191,17 +294,47 @@ class AnnotationStore:
             raise RuntimeError(
                 "annotation database migration ledger is not current",
             )
-        return instance
+
+    def _require_current_schema(self) -> None:
+        with self._connect() as connection:
+            self._require_current_schema_on_connection(connection)
+
+    def _assert_bound_database(self) -> None:
+        expected = self._bound_db_identity
+        if expected is None:
+            return
+        try:
+            metadata = self.db_path.lstat()
+        except OSError as exc:
+            raise RuntimeError("annotation database identity changed") from exc
+        if (
+            stat.S_ISLNK(metadata.st_mode)
+            or not stat.S_ISREG(metadata.st_mode)
+            or (metadata.st_dev, metadata.st_ino) != expected
+        ):
+            raise RuntimeError("annotation database identity changed")
 
     def _connect(self) -> sqlite3.Connection:
+        self._assert_bound_database()
         if self._read_only:
             connection = sqlite3.connect(
                 f"{self.db_path.as_uri()}?mode=ro",
                 timeout=10,
                 uri=True,
             )
+        elif self._existing_mutable:
+            connection = sqlite3.connect(
+                f"{self.db_path.as_uri()}?mode=rw",
+                timeout=10,
+                uri=True,
+            )
         else:
             connection = sqlite3.connect(self.db_path, timeout=10)
+        try:
+            self._assert_bound_database()
+        except BaseException:
+            connection.close()
+            raise
         connection.row_factory = sqlite3.Row
         connection.execute("PRAGMA foreign_keys = ON")
         connection.execute("PRAGMA busy_timeout = 10000")
@@ -223,8 +356,12 @@ class AnnotationStore:
         connection = self._connect()
         try:
             connection.execute("BEGIN IMMEDIATE")
+            self._assert_bound_database()
+            self._require_current_schema_on_connection(connection)
             yield connection
+            self._assert_bound_database()
             connection.commit()
+            self._assert_bound_database()
         except BaseException:
             connection.rollback()
             raise
@@ -1182,15 +1319,18 @@ class AnnotationStore:
         if completed_response is not None:
             current_entries = set(observed_state.marker_entry_sha256s)
             expected_entries = set(expected_marker_entry_sha256s)
-            if not current_entries:
-                return completed_response
             if not current_entries.issubset(expected_entries):
                 # At least one marker belongs to a newer writer incident.
                 # The old action must not delete either old or new state.
-                return completed_response
+                raise AnnotationConflictError(
+                    "global_writer_quarantine_active",
+                    "A newer global writer quarantine requires another safety "
+                    "confirmation.",
+                )
             # Completion committed before a partial marker cleanup. The exact
-            # remaining subset is still owned by this action and can be
-            # removed safely while flock is held.
+            # remaining subset (including an empty subset) is still owned by
+            # this action. Always reacquire flock and recheck that exact
+            # observation before returning or removing markers.
             clearance_expected_sha256 = observed_state.sha256
 
         # Keep flock and the exact marker set until the completion row commits.
@@ -1296,7 +1436,19 @@ class AnnotationStore:
                 "global_quarantine_action_ref": global_quarantine_action_ref,
             }
         )
-        with self._write() as connection:
+        observed_state = navigation_writer_marker_state(writer_lock_path)
+        # Bind the exact marker observation to the writer flock. The body
+        # rejects a non-empty observation before any recovery mutation, so an
+        # exception preserves every captured marker. An empty observation
+        # remains protected until the nested DB transaction has committed.
+        with (
+            navigation_writer_quarantine_clearance(
+                writer_lock_path,
+                expected_marker_state_sha256=observed_state.sha256,
+                all_writer_process_groups_absent=True,
+            ) as marker_state,
+            self._write() as connection,
+        ):
             existing = connection.execute(
                 """
                 SELECT response_json, request_sha256
@@ -1310,6 +1462,12 @@ class AnnotationStore:
                     raise AnnotationConflictError(
                         "idempotency_key_reused",
                         "Idempotency-Key was already used for another recovery request.",
+                    )
+                if marker_state.active_present or marker_state.quarantine_present:
+                    raise AnnotationConflictError(
+                        "global_writer_quarantine_active",
+                        "A newer global writer quarantine requires another safety "
+                        "confirmation.",
                     )
                 return json.loads(existing["response_json"])
             job_id = self._job_id(connection, job_ref)
@@ -1341,12 +1499,11 @@ class AnnotationStore:
                     "global_quarantine_confirmation_required",
                     "Recovery requires a recorded global writer safety confirmation.",
                 )
-            if navigation_writer_quarantine_present(writer_lock_path):
+            if marker_state.active_present or marker_state.quarantine_present:
                 raise AnnotationConflictError(
                     "global_writer_quarantine_active",
                     "A newer global writer quarantine requires another safety "
                     "confirmation.",
-                    current=self._job_projection(connection, job_id),
                 )
             active = connection.execute(
                 """
@@ -2887,6 +3044,7 @@ class AnnotationStore:
                             segment_root=segment_root,
                             yaml_path=yaml_path,
                             identity=identity,
+                            expected_yaml_sha256=rendered_target.sha256,
                         )
                         runtime_targets.append(runtime_target)
                         checkpoint = checkpoints_by_target.get(

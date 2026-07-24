@@ -1,6 +1,7 @@
 # 自动标注 M1：Web 首帧标注与 Tracking 开发计划
 
-> 状态：本地实现与回归门禁通过，待服务器验收（未冻结）
+> 状态：本地实现与回归门禁、服务器测试数据准备通过；待 Runtime/Tracking
+> 服务器验收（未冻结）
 > 基线提交：`f618c6c`  
 > 开发分支：`codex/automatic-annotation-m1`  
 > 上位路线：`docs/automatic-annotation-roadmap.md`
@@ -220,7 +221,7 @@ smoke；`152856` 因历史尺寸不符合当前 resize 链，仅作 provenance �
 取消/恢复可靠、原始及同步数据未被修改、全量回归通过后，M1 才能冻结并进入
 M2。
 
-## 9. 本地实施结果（2026-07-23）
+## 9. 本地实施结果（截至 2026-07-24）
 
 M1 的本地代码实现、fake-runtime 集成和独立代码审计已经完成：
 
@@ -234,12 +235,25 @@ M1 的本地代码实现、fake-runtime 集成和独立代码审计已经完成�
   AnnotationStore 派生；根级 CLI 等价、差异、输出隔离和脱敏均有端到端测试；
 - 健康 writer、陈旧 active marker、durable quarantine 三态，以及 completion
   后部分 marker 清理的安全重放均有故障注入测试。
+- 服务器 preflight 后补齐了 Tracking 两份直接配置的 manifest 冻结、binary/
+  legacy YAML/`1_odom_convert.py` 内嵌路径证明、双 overlay 精确绑定，以及复制后
+  SHA/size 复核；显式容量余量缺失时 Runtime fail closed；
+- Web 与停机恢复 CLI 共用 Annotation service/maintenance flock。恢复 CLI
+  精确绑定生产 DB 与 writer lock，只以 existing-only 模式打开 DB，拒绝在线
+  Worker、错误 scope、DB inode 轮换和新 quarantine 竞态；
+- Tracking 输出开始发布后，文件移动、权限收口、哈希、checkpoint、step 和终态
+  manifest 共同构成恢复边界；任一账本状态不确定时保持 source lease 并转入
+  `recovery_required`，并发取消不能绕过停机 operator 确认；
+- `run_web.sh` 已统一有效 working directory，私有创建 state/working/log 目录；
+  启动配置冲突 fail closed，但 `stop/status/logs` 不受阻断。
 
 本地最终门禁：
 
 ```text
-Python 全量                  1369 passed
-Runtime/锁/API/Plan targeted 183 passed
+Python 全量                  1494 passed
+Runtime targeted             106 passed
+Web/Store/恢复 targeted      174 passed
+run_web targeted              25 passed
 前端 Vitest                  204 passed
 前端 Playwright mock E2E     7 passed
 前端 production build        PASS
@@ -247,11 +261,28 @@ Golden 全套                  73 passed
 Golden registry              16 cases validated
 DataPilot Router suite       17 cases validated
 compileall / git diff --check PASS
-独立代码审计                 PASS
+独立代码审计                 PASS（含服务器 preflight 后 hardening）
 ```
 
+2026-07-24 已完成服务器端 2027 测试副本的数据准备验收：
+
+- `20270605` 下的 `152856`、`152930`、`160904` 以及 `20270623` 下的
+  `145550` 均已通过现有系统完成拆解、同步；
+- 四个 raw DB3 与对应 2026 来源逐文件 SHA-256 一致，`tmp_dir` 文件树、大小和
+  SHA-256 一致；
+- `sync_data` 中的图像、点云、odom 和时间元数据逐文件 SHA-256 一致，
+  `145550` 的全部六个内部 segments 均已覆盖；
+- 2027 同步候选不含历史 2026 目录中的 `grid_map`。这是预期阶段差异：
+  `grid_map` 属于缺失时由后处理生成的产物，不属于拆解/同步，也不进入 M1；
+- 2027 `finish_data` 尚未产生，raw/clip 范围内未发现 symlink 或特殊文件，
+  M1 边界保持成立。
+
+因此“测试数据拆解/同步”前置门已通过。对应 Navigation 任务仍停在已接受的
+`extract_sync` 阶段边界，需由用户明确选择“到这里结束”后正常关闭；不能把其
+等待状态误判为拆解/同步失败，也不能用取消整任务代替正常完成。
+
 以上结果不包含服务器 Runtime payload、固定 Xvfb、真实 GPU/bubblewrap preflight
-或真实数据 writer。尚未运行 `2027 candidate ↔ 2026 oracle`，因此当前没有业务
-产物差异结论，也不能宣称 Tracking 已与 legacy 等价。M1 仍保持“未冻结”；下一步
-只能按 `docs/automatic-annotation-m1-server-acceptance.md` 另行批准并执行服务器
-验收。
+或真实 M1 writer。尚未运行 `2027 Tracking candidate ↔ 2026 oracle`，因此当前
+只有拆解/同步等价结论，不能宣称 Tracking 已与 legacy 等价。M1 仍保持“未冻结”；
+下一步只能按 `docs/automatic-annotation-m1-server-acceptance.md` 另行批准并执行
+Runtime 部署、无界面环境安装和服务器 writer 验收。

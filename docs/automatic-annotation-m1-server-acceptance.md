@@ -1,6 +1,6 @@
 # 自动标注 M1 服务器验收 Runbook
 
-> 状态：待人工批准后执行
+> 状态：2027 测试数据准备已通过；待人工批准 Runtime 部署、Xvfb 与真实 Tracking
 > 适用分支：`codex/automatic-annotation-m1`
 > 上位计划：`docs/automatic-annotation-m1-plan.md`
 > 本文只定义验收步骤，不授权连接、部署、安装或运行服务器 writer。
@@ -95,12 +95,16 @@ git -C "$M1_REPO" branch --show-current
 不要输出 API key、Bearer、完整环境转储或其他凭据：
 
 ```text
+WORKING_DIR
 VLA_DATA_AGENT_WEB_WORKING_DIR
 VLA_ANNOTATION_WORK_ROOT
 VLA_ANNOTATION_MINIMUM_FREE_BYTES
 VLA_ANNOTATION_RUNTIME_TIMEOUT_SECONDS
 VLA_NAVIGATION_WRITER_LOCK_PATH
 VLA_VLADATASETS_ROOT
+VLA_TRACKING_BINARY_DATA_ROOT
+VLA_TRACKING_LEGACY_DATA_ROOT
+VLA_LEGACY_CLIP_DATA_ROOT
 VLA_NAVIGATION_ODOM_V1_SOURCE
 VLA_NAVIGATION_ODOM_V1_MANIFEST
 AGENT_DATA_ENV_SETUP
@@ -114,8 +118,30 @@ VLA_RUNTIME_DEPENDENCY_SUMMARY
 
 核对原则：
 
-- `VLA_ANNOTATION_WORK_ROOT` 必须是系统专用、真实目录，不得位于
-  `raw_data`、`clip_data`、`finish_data` 或同事业务代码目录内；
+- 通过 `scripts/run_web.sh` 启动时，`WORKING_DIR` 是传给 Web CLI
+  `--working-dir` 的权威值；只设置 `VLA_DATA_AGENT_WEB_WORKING_DIR` 时脚本采用
+  该值，两者同时设置时必须逐字相同，否则脚本在构建或启动前 fail closed。
+  `stop`、`status` 和 `logs` 不受该冲突阻断，确保紧急停止和诊断入口始终可用；
+  两者都未设置时才回退到 `STATE_DIR`。脚本以 `umask 077` 创建新的 working、
+  state 和日志目录，但不会 `chmod` 已有目录；已有目录权限不安全时必须停止并
+  由操作人单独处理；
+- `start`、`stop`、`restart` 和 `status` 必须通过
+  `scripts/run_web_control.py` 在稳定的 `/usr` inode 全局锁及 PID 专用 control
+  lock 下串行执行；验收机必须先证明支持对 `/usr` 执行 POSIX exclusive
+  `flock`。PID parent 必须是真实、当前服务用户所有且不可被 group/other 写入的
+  目录；PID/control/instance 文件不得是 symlink、非普通文件、硬链接、其他用户
+  文件或 group/other 可写文件。PID 文件只允许一个大于 1 的规范 ASCII 十进制
+  数，并且必须同时匹配 Web 进程终身持有的 instance token lock 和稳定的系统进程
+  出生标识（Linux 为 boot ID 加 `/proc/<pid>/stat` starttime，macOS 为内核进程
+  start time）；只有通过该实例复验（Linux 上同时使用 pidfd）的 PID 才允许收到
+  TERM/KILL。stale 或复用 PID 只能清理匹配记录，禁止发送信号；旧 instance lock
+  仍被持有时必须保留记录并阻断新启动。内部 lifecycle action 不得只信任环境变量
+  标记，必须校验外层 helper 继承的 anchor、PID parent 和 control lock FD，并在
+  启动 Web 前关闭这三个 control FD；
+- `VLA_ANNOTATION_WORK_ROOT` 必须是绝对、规范、无 symlink ancestor、由当前
+  服务 UID 持有且权限精确为 `0700` 的系统专用真实目录；Runtime 不会替操作人
+  自动创建或修正权限。它不得位于 `raw_data`、`clip_data`、`finish_data` 或
+  同事业务代码目录内；
 - `VLA_ANNOTATION_RUNTIME_TIMEOUT_SECONDS` 必须在验收前显式确认并审批为
   ASCII 正整数；它表示单条冻结 Runtime 命令的最大执行秒数，应根据本次真实
   单命令上限决定，本文不猜测生产值。缺失、零、负数或其他格式时 capability
@@ -129,6 +155,18 @@ VLA_RUNTIME_DEPENDENCY_SUMMARY
   安全标记存在时 capability 必须返回协调不可用，Navigation writer 和
   Annotation claim 均不得调用底层业务动作；
 - `VLA_VLADATASETS_ROOT` 只指向本次已确认的数据根；
+- `VLA_TRACKING_BINARY_DATA_ROOT` 是 Tracking binary 内硬编码的 `_01/Data`
+  绝对路径对应的 sandbox overlay target；`VLA_TRACKING_LEGACY_DATA_ROOT`
+  是 legacy YAML 中 `/mnt/data1/.../Data` 绝对路径对应的另一个 overlay
+  target。两者必须分别显式配置为不同的、已批准的真实绝对目录，不能合并、互设
+  为同一路径或省略其中任一挂载；运行时将同一份 job-private `Data` 分别映射到
+  两个 target。能力检查必须从 manifest 匹配的冻结 binary 只读证明其三个内嵌
+  路径共享该 binary Data root，并证明 YAML 的 intrinsics/extrinsics 共享另一
+  个 Data root；任意路径错配、嵌套或与 work、同步数据、Runtime source 重叠时
+  fail closed；
+- `VLA_LEGACY_CLIP_DATA_ROOT` 必须精确匹配 manifest 冻结的
+  `NoobScenes/include/1_odom_convert.py` 中 `clip_data` 字面量；只允许把
+  job-private 同步输入以只读方式映射到该兼容目标；
 - Python 和 setup 必须是 M0 冻结的活动环境，不使用交互式 SSH 默认 Python；
 - processing calibration 页面只提供 manifest 登记的 `20260320` 和
   `20260529_go2w`，不显示跨数据集推荐；
@@ -138,7 +176,8 @@ VLA_RUNTIME_DEPENDENCY_SUMMARY
 
 停止 Web 服务和 Annotation Worker 后核对：
 
-- `annotation.sqlite` 位于 `VLA_DATA_AGENT_WEB_WORKING_DIR` 下的预期位置；
+- `annotation.sqlite` 位于启动脚本最终传入的有效 `WORKING_DIR` 下；若同时设置
+  `VLA_DATA_AGENT_WEB_WORKING_DIR`，它必须与 `WORKING_DIR` 完全相同；
 - SQLite foreign keys、WAL、busy timeout 和 migration ledger 可用；
 - 数据库版本不超前、不缺迁移；
 - 当前无 `running` RuntimeRun 或未过期 writer lease；
@@ -147,6 +186,35 @@ VLA_RUNTIME_DEPENDENCY_SUMMARY
 可使用 SQLite 的在线备份命令创建带时间戳的独立备份；备份完成后立即执行
 `PRAGMA integrity_check` 并记录 SHA-256。不得直接复制一个仍由 writer 写入的
 WAL 数据库，也不得覆盖上一次备份。
+
+Web 首次启动会在 Annotation DB 同目录创建私有 service/maintenance lock。取得
+lease 的固定顺序为系统根 `/` 目录 inode、Annotation DB 父目录 inode、私有 lock
+文件 inode，三个 flock 都必须持有到 Annotation Worker 完全停止；因此即使同 UID
+进程轮换整个 working directory，也不能为第二个 Web/CLI 建立新的锁域。该保守
+策略把同一主机上的 Annotation lifecycle 全局串行化；任一层不支持 flock 或无法
+安全打开时均 fail closed。异常恢复只允许在 Web 服务和 Annotation Worker 均已
+停止、所有相关进程组已由操作人核实消失后，通过停机运维入口执行；CLI 不创建
+缺失的 maintenance lock，锁缺失或 Web 仍在线时一律 fail closed：
+
+```bash
+"$M1_REPO/.venv/bin/python" -m \
+  vla_data_juicer_agents.annotation.operator_cli \
+  --annotation-db "$VLA_DATA_AGENT_WEB_WORKING_DIR/annotation.sqlite" \
+  --writer-lock "$VLA_NAVIGATION_WRITER_LOCK_PATH" \
+  list-recovery
+```
+
+`clear-global` 必须携带精确确认串
+`all_navigation_annotation_writer_process_groups_absent`，随后
+`confirm-job retry|abandon` 必须携带精确确认串
+`old_process_group_absent`；两步都必须提供 operator/ticket reference 和全新
+Idempotency-Key。不得在服务仍运行时执行，不得跳过 `list-recovery`，不得通过
+删除 marker、编辑 SQLite 或调用未鉴权 Web API 绕过恢复审计。入口只输出安全
+引用、公开状态和安全错误码，不输出绝对路径、内部数据库 ID、命令或私有故障
+详情。CLI 参数必须精确匹配显式
+`VLA_DATA_AGENT_WEB_WORKING_DIR/annotation.sqlite` 和
+`VLA_NAVIGATION_WRITER_LOCK_PATH`；它以 existing-only `mode=rw` 打开 DB，
+不创建、不迁移、不 chmod，并在连接与事务边界持续校验 DB inode。
 
 ### 3.4 work root 与容量
 
@@ -213,7 +281,8 @@ socket、device 或其他特殊文件单独报告。大目录可以使用已审�
 4. 大型 Tracking binary、ONNX、配置和 map 仍保持原业务内容；
 5. 不修改、格式化、重编译、优化或删减业务算法；
 6. 不把同事可变业务目录作为长期 runtime source；
-7. payload 不匹配时停止，不自动选择同级“相似版本”。
+7. payload 目录和文件不得对 group/other 开放写权限；
+8. payload 不匹配时停止，不自动选择同级“相似版本”。
 
 使用仓库验证器核对 frozen source：
 
@@ -227,6 +296,11 @@ vla-nav-runtime-manifest verify-root \
 验证报告只能进入私有 evidence，并确认其中不包含未脱敏绝对路径。
 
 ### 5.2 Xvfb、bubblewrap 与安装摘要
+
+2026-07-24 只读预检结果：服务器尚未安装 Xvfb，APT 当前候选版本正好是
+`2:1.20.13-1ubuntu1~20.04.20`，本机 APT cache 中没有对应 deb；已安装的
+bubblewrap 为 `0.4.0-1ubuntu4.1`。这只是安装可行性信息，不等于已批准安装，
+也不能替代 deb 下载后的 SHA-256 和安装后证据。
 
 只有在安装审批通过后才安装固定 Xvfb：
 
@@ -276,13 +350,20 @@ GPU 和安装摘要 preflight。记录 capability 的安全错误码，不把内
 6. Xvfb 或 DISPLAY preflight 失败时停止，不回退 XQuartz 或桌面 GUI。
 
 同时验证 bubblewrap 的宿主根和 frozen Runtime 为只读、job staging 为私有可写、
-Tracking legacy `Data` 映射到 job-private scratch、GPU 可见，并执行超时与进程组
-清理 preflight。超时 preflight 使用独立的无业务副作用测试命令，确认达到已批准
-的 `VLA_ANNOTATION_RUNTIME_TIMEOUT_SECONDS` 后，系统按同一
+Tracking binary 的硬编码 `_01/Data` target 与 YAML 的
+`/mnt/data1/.../Data` target 分别映射到同一 job-private scratch、GPU 可见，并
+执行超时与进程组清理 preflight。两个 target 不能合并。超时 preflight 使用独立
+的无业务副作用测试命令，确认达到已批准的
+`VLA_ANNOTATION_RUNTIME_TIMEOUT_SECONDS` 后，系统按同一
 SIGTERM→SIGKILL 语义清理完整进程组；不得为测试超时而启动真实 Tracking，也不得
 把 timeout 关闭或设为无限。
 
 ## 6. 2027 测试数据准备顺序
+
+> 2026-07-24 结果：本节前置门已完成并通过。四个 raw DB3、`tmp_dir` 和
+> `sync_data` 的同步阶段业务文件均与对应 2026 来源严格一致；`145550` 的六个
+> 内部 segments 全部覆盖。2027 候选没有历史目录中的 `grid_map`，这是后处理
+> 产物的预期阶段差异，不得为 M1 补生成或复制。2027 `finish_data` 未产生。
 
 拆解、同步不是 M1 业务阶段，但属于服务器验收前置 writer。必须单独批准，并只用
 系统已有的新工具处理以下测试副本：
@@ -335,17 +416,19 @@ SIGTERM→SIGKILL 语义清理完整进程组；不得为测试超时而启动�
   patterns、ignore 或复制 candidate 产物来排除差异；必须由业务确认真正位于
   Tracking 时点的历史 oracle，或另行评审一个 stage-scoped contract。
 
-`20260623_145550` 的历史 `20260623_temp` 和 `20260623_temp_1` 都包含
-Tracking 产物。系统不得根据目录名、mtime、文件数量或“看起来更完整”自动选择。
-在运行六个 segment 的 Golden 前，由 oracle 确认人逐项检查并书面确定权威根，
-记录：
+当前两个门禁 clip 都存在重复历史候选：`20260605_temp` 与
+`20260605_temp1` 均包含 `160904`，`20260623_temp` 与
+`20260623_temp_1` 均包含 `145550` 的六个 segments。系统不得根据目录名、
+mtime、文件数量或“看起来更完整”自动选择。在运行对应 Golden 前，由 oracle
+确认人逐项检查并分别书面确定权威根，记录：
 
 - 两个候选根的只读 fingerprint；
 - 选择理由和确认人；
-- 适用的 `_0…_5` segment；
+- 适用的 clip，以及 `145550` 的 `_0…_5` segments；
 - 随验收证据保存的 opaque `oracle_ref`。
 
-未确认时停止。所有六个 Golden case 都必须显式携带该已确认的 `oracle_ref`。
+未确认时停止。`160904` 与 `145550` 的所有 Golden case 都必须显式携带各自已
+确认的 `oracle_ref`。
 
 同一权威 `finish_temp` 根还必须覆盖 `maps/` 与 `v1.0-trainval/`。这两个目录
 分别使用登记的 `m1_prepare_maps_*`、`m1_prepare_metadata_*` case 比较，不能

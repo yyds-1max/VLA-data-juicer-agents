@@ -8,7 +8,15 @@ ACTION="${1:-start}"
 HOST="${HOST:-0.0.0.0}"
 PORT="${PORT:-8765}"
 STATE_DIR="${STATE_DIR:-${ROOT_DIR}/.djx}"
-WORKING_DIR="${WORKING_DIR:-${STATE_DIR}}"
+WORKING_DIR_WAS_SET=0
+WEB_WORKING_DIR_WAS_SET=0
+if [[ "${WORKING_DIR+x}" == "x" ]]; then
+  WORKING_DIR_WAS_SET=1
+fi
+if [[ "${VLA_DATA_AGENT_WEB_WORKING_DIR+x}" == "x" ]]; then
+  WEB_WORKING_DIR_WAS_SET=1
+fi
+WORKING_DIR="${WORKING_DIR-}"
 PID_FILE="${PID_FILE:-${STATE_DIR}/web.pid}"
 LOG_DIR="${LOG_DIR:-${STATE_DIR}/logs}"
 LOG_FILE="${LOG_FILE:-${LOG_DIR}/web.log}"
@@ -16,6 +24,8 @@ FRONTEND_DIST="${FRONTEND_DIST:-${ROOT_DIR}/frontend/dist}"
 SKIP_FRONTEND_BUILD="${SKIP_FRONTEND_BUILD:-0}"
 VLA_VLADATASETS_ROOT="${VLA_VLADATASETS_ROOT:-/media/heying/hy_data1/VLADatasets}"
 WEB_CMD="${WEB_CMD:-}"
+CONTROL_PYTHON="${RUN_WEB_CONTROL_PYTHON:-}"
+CONTROL_HELPER="${ROOT_DIR}/scripts/run_web_control.py"
 
 usage() {
   cat <<USAGE
@@ -33,13 +43,21 @@ Environment:
   HOST                  Bind host. Default: 0.0.0.0
   PORT                  Bind port. Default: 8765
   VLA_VLADATASETS_ROOT  Dataset root. Default: /media/heying/hy_data1/VLADatasets
-  WORKING_DIR           Web working directory. Default: .djx
+  WORKING_DIR           Authoritative --working-dir value. Default: STATE_DIR
+  VLA_DATA_AGENT_WEB_WORKING_DIR
+                        Used when WORKING_DIR is unset. Must match it when both are set.
   FRONTEND_DIST         Built frontend directory. Default: frontend/dist
   STATE_DIR             State directory for PID and logs. Default: .djx
   PID_FILE              PID file path. Default: .djx/web.pid
+  LOG_DIR               Log directory. Default: STATE_DIR/logs
   LOG_FILE              Log file path. Default: .djx/logs/web.log
   SKIP_FRONTEND_BUILD   Set to 1 to reuse existing frontend/dist.
   WEB_CMD               Override vla-data-agent-web command path.
+  RUN_WEB_CONTROL_PYTHON
+                        Python 3 used for safe PID/control operations.
+
+New WORKING_DIR, STATE_DIR, and LOG_DIR paths are created under umask 077.
+Existing directory permissions are not changed.
 USAGE
 }
 
@@ -62,12 +80,153 @@ resolve_web_cmd() {
   exit 127
 }
 
-is_running() {
-  [[ -f "${PID_FILE}" ]] || return 1
-  local pid
-  pid="$(cat "${PID_FILE}")"
-  [[ -n "${pid}" ]] || return 1
-  kill -0 "${pid}" >/dev/null 2>&1
+resolve_control_python() {
+  if [[ -n "${CONTROL_PYTHON}" ]]; then
+    return
+  fi
+  if [[ -x "${ROOT_DIR}/.venv/bin/python" ]]; then
+    CONTROL_PYTHON="${ROOT_DIR}/.venv/bin/python"
+    return
+  fi
+  if command -v python3 >/dev/null 2>&1; then
+    CONTROL_PYTHON="$(command -v python3)"
+    return
+  fi
+  echo "Python 3 is required for safe Web service lifecycle control." >&2
+  return 127
+}
+
+control_helper() {
+  resolve_control_python
+  "${CONTROL_PYTHON}" "${CONTROL_HELPER}" "$@"
+}
+
+run_locked_control_action() {
+  local internal_action="$1"
+  resolve_control_python
+  "${CONTROL_PYTHON}" "${CONTROL_HELPER}" \
+    with-lock \
+    --pid-file "${PID_FILE}" \
+    -- \
+    bash "${SCRIPT_DIR}/run_web.sh" "${internal_action}"
+}
+
+require_locked_control_action() {
+  if [[ "${VLA_RUN_WEB_CONTROL_LOCKED:-}" != "1" ]]; then
+    echo "Internal Web lifecycle actions require the control lock." >&2
+    return 2
+  fi
+  local verify_status
+  if control_helper verify-lock --pid-file "${PID_FILE}"; then
+    :
+  else
+    verify_status=$?
+    return "${verify_status}"
+  fi
+  local descriptor_name
+  local descriptor
+  for descriptor_name in \
+    VLA_RUN_WEB_ANCHOR_FD \
+    VLA_RUN_WEB_PARENT_FD \
+    VLA_RUN_WEB_CONTROL_FD; do
+    descriptor="${!descriptor_name:-}"
+    if [[ ! "${descriptor}" =~ ^[0-9]+$ ]] || (( descriptor <= 2 )); then
+      echo "Internal Web lifecycle lock capability is invalid." >&2
+      return 2
+    fi
+    eval "exec ${descriptor}>&-"
+    unset "${descriptor_name}"
+  done
+}
+
+read_service_pid() {
+  control_helper read-pid --pid-file "${PID_FILE}"
+}
+
+active_service_pid() {
+  local expected_pid="${1:-}"
+  if [[ -n "${expected_pid}" ]]; then
+    control_helper \
+      active-pid \
+      --pid-file "${PID_FILE}" \
+      --expected-pid "${expected_pid}"
+    return
+  fi
+  control_helper active-pid --pid-file "${PID_FILE}"
+}
+
+write_service_pid() {
+  local pid="$1"
+  control_helper write-pid --pid-file "${PID_FILE}" --pid "${pid}"
+}
+
+remove_service_record() {
+  local expected_pid="$1"
+  control_helper \
+    remove-service \
+    --pid-file "${PID_FILE}" \
+    --expected-pid "${expected_pid}"
+}
+
+prepare_service_start() {
+  control_helper prepare-start --pid-file "${PID_FILE}"
+}
+
+signal_service_instance() {
+  local expected_pid="$1"
+  local signal_name="$2"
+  control_helper \
+    signal-instance \
+    --pid-file "${PID_FILE}" \
+    --expected-pid "${expected_pid}" \
+    --signal "${signal_name}"
+}
+
+remove_stopped_service_record() {
+  local expected_pid="$1"
+  local remove_status
+  if remove_service_record "${expected_pid}"; then
+    return 0
+  else
+    remove_status=$?
+  fi
+  if [[ "${remove_status}" == "3" ]]; then
+    return 0
+  fi
+  echo "PID/instance records changed and were not removed." >&2
+  return 1
+}
+
+resolve_working_directory() {
+  if [[ "${WORKING_DIR_WAS_SET}" == "1" \
+    && "${WEB_WORKING_DIR_WAS_SET}" == "1" \
+    && "${WORKING_DIR}" != "${VLA_DATA_AGENT_WEB_WORKING_DIR-}" ]]; then
+    echo "WORKING_DIR and VLA_DATA_AGENT_WEB_WORKING_DIR must match when both are set." >&2
+    return 2
+  fi
+  if [[ "${WORKING_DIR_WAS_SET}" != "1" ]]; then
+    if [[ "${WEB_WORKING_DIR_WAS_SET}" == "1" ]]; then
+      WORKING_DIR="${VLA_DATA_AGENT_WEB_WORKING_DIR}"
+    else
+      WORKING_DIR="${STATE_DIR}"
+    fi
+  fi
+  if [[ -z "${WORKING_DIR}" ]]; then
+    echo "The effective web working directory must not be empty." >&2
+    return 2
+  fi
+}
+
+prepare_state_directories() {
+  # Apply private creation modes without changing permissions on existing paths.
+  umask 077
+  mkdir -p "${STATE_DIR}" "${LOG_DIR}"
+}
+
+prepare_runtime_directories() {
+  resolve_working_directory
+  prepare_state_directories
+  mkdir -p "${WORKING_DIR}"
 }
 
 build_frontend() {
@@ -82,8 +241,8 @@ build_frontend() {
 
 web_command() {
   resolve_web_cmd
-  export VLA_VLADATASETS_ROOT
-  mkdir -p "${WORKING_DIR}" "${LOG_DIR}"
+  prepare_runtime_directories
+  export VLA_VLADATASETS_ROOT VLA_DATA_AGENT_WEB_WORKING_DIR="${WORKING_DIR}"
   "${WEB_CMD}" \
     --host "${HOST}" \
     --port "${PORT}" \
@@ -92,85 +251,214 @@ web_command() {
 }
 
 start_service() {
-  if is_running; then
-    echo "DataPilot web service is already running with PID $(cat "${PID_FILE}")."
+  local current_pid
+  local current_status
+  if current_pid="$(active_service_pid)"; then
+    echo "DataPilot web service is already running with PID ${current_pid}."
     echo "URL: http://${HOST}:${PORT}"
     return
+  else
+    current_status=$?
+  fi
+  if [[ "${current_status}" != "3" && "${current_status}" != "5" ]]; then
+    return "${current_status}"
+  fi
+  if [[ "${current_status}" == "5" ]]; then
+    local stale_pid
+    local stale_status
+    if stale_pid="$(read_service_pid)"; then
+      if remove_service_record "${stale_pid}"; then
+        :
+      else
+        stale_status=$?
+        echo "Stale Web instance records are still owned; start is blocked." >&2
+        return "${stale_status}"
+      fi
+    else
+      stale_status=$?
+      if [[ "${stale_status}" != "3" ]]; then
+        return "${stale_status}"
+      fi
+    fi
+  fi
+  local prepare_status
+  if prepare_service_start; then
+    :
+  else
+    prepare_status=$?
+    echo "Stale Web instance records are still owned; start is blocked." >&2
+    return "${prepare_status}"
   fi
 
+  resolve_working_directory
   build_frontend
   resolve_web_cmd
-  mkdir -p "${WORKING_DIR}" "${LOG_DIR}"
+  resolve_control_python
+  prepare_runtime_directories
 
   echo "Starting DataPilot web service..."
-  export VLA_VLADATASETS_ROOT
-  nohup "${WEB_CMD}" \
-    --host "${HOST}" \
-    --port "${PORT}" \
-    --working-dir "${WORKING_DIR}" \
-    --frontend-dist "${FRONTEND_DIST}" \
+  export VLA_VLADATASETS_ROOT VLA_DATA_AGENT_WEB_WORKING_DIR="${WORKING_DIR}"
+  nohup "${CONTROL_PYTHON}" "${CONTROL_HELPER}" \
+    hold-instance \
+    --pid-file "${PID_FILE}" \
+    -- \
+    "${WEB_CMD}" \
+      --host "${HOST}" \
+      --port "${PORT}" \
+      --working-dir "${WORKING_DIR}" \
+      --frontend-dist "${FRONTEND_DIST}" \
     >"${LOG_FILE}" 2>&1 &
   local pid=$!
-  echo "${pid}" >"${PID_FILE}"
-
-  sleep 1
-  if ! kill -0 "${pid}" >/dev/null 2>&1; then
-    echo "DataPilot web service failed to start. Log: ${LOG_FILE}" >&2
-    tail -n 80 "${LOG_FILE}" >&2 || true
-    rm -f "${PID_FILE}"
-    exit 1
+  if ! write_service_pid "${pid}"; then
+    echo "The Web service PID could not be recorded safely; stopping the new process." >&2
+    kill -- "${pid}" >/dev/null 2>&1 || true
+    wait "${pid}" >/dev/null 2>&1 || true
+    return 1
   fi
 
-  echo "DataPilot web service started with PID ${pid}."
-  echo "URL: http://${HOST}:${PORT}"
-  echo "Log: ${LOG_FILE}"
+  sleep 1
+  local verified_pid
+  local active_status
+  if verified_pid="$(active_service_pid "${pid}")"; then
+    if [[ "${verified_pid}" == "${pid}" ]]; then
+      echo "DataPilot web service started with PID ${pid}."
+      echo "URL: http://${HOST}:${PORT}"
+      echo "Log: ${LOG_FILE}"
+      return
+    fi
+    active_status=4
+  else
+    active_status=$?
+  fi
+
+  if [[ "${active_status}" != "0" ]]; then
+    echo "DataPilot web service failed to start. Log: ${LOG_FILE}" >&2
+    tail -n 80 "${LOG_FILE}" >&2 || true
+    kill -- "${pid}" >/dev/null 2>&1 || true
+    wait "${pid}" >/dev/null 2>&1 || true
+    local remove_status
+    if remove_service_record "${pid}"; then
+      :
+    else
+      remove_status=$?
+      if [[ "${remove_status}" != "3" ]]; then
+        echo "PID file changed while startup failed; it was not removed." >&2
+      fi
+    fi
+    exit 1
+  fi
 }
 
 stop_service() {
-  if [[ ! -f "${PID_FILE}" ]]; then
+  local pid
+  local active_status
+  if pid="$(active_service_pid)"; then
+    active_status=0
+  else
+    active_status=$?
+  fi
+
+  if [[ "${active_status}" == "3" ]]; then
     echo "DataPilot web service is not running."
     return
   fi
-
-  local pid
-  pid="$(cat "${PID_FILE}")"
-  if [[ -z "${pid}" ]] || ! kill -0 "${pid}" >/dev/null 2>&1; then
-    echo "DataPilot web service is not running. Removing stale PID file."
-    rm -f "${PID_FILE}"
-    return
+  if [[ "${active_status}" == "5" ]]; then
+    if pid="$(read_service_pid)"; then
+      echo "DataPilot web service is not running. Removing stale PID record."
+      remove_stopped_service_record "${pid}"
+      return
+    else
+      active_status=$?
+    fi
+    return "${active_status}"
+  fi
+  if [[ "${active_status}" != "0" ]]; then
+    return "${active_status}"
   fi
 
   echo "Stopping DataPilot web service with PID ${pid}..."
-  kill "${pid}"
+  local signal_status
+  if signal_service_instance "${pid}" "TERM"; then
+    :
+  else
+    signal_status=$?
+    if [[ "${signal_status}" != "3" && "${signal_status}" != "5" ]]; then
+      return "${signal_status}"
+    fi
+  fi
+
   for _ in {1..30}; do
-    if ! kill -0 "${pid}" >/dev/null 2>&1; then
-      rm -f "${PID_FILE}"
-      echo "DataPilot web service stopped."
-      return
+    local verified_pid
+    if verified_pid="$(active_service_pid "${pid}")"; then
+      if [[ "${verified_pid}" != "${pid}" ]]; then
+        echo "Web service instance identity changed while stopping." >&2
+        return 1
+      fi
+    else
+      active_status=$?
+      if [[ "${active_status}" == "3" || "${active_status}" == "5" ]]; then
+        remove_stopped_service_record "${pid}"
+        echo "DataPilot web service stopped."
+        return
+      fi
+      return "${active_status}"
     fi
     sleep 1
   done
 
   echo "Service did not stop after 30 seconds; forcing stop."
-  kill -9 "${pid}" >/dev/null 2>&1 || true
-  rm -f "${PID_FILE}"
-  echo "DataPilot web service stopped."
+  if signal_service_instance "${pid}" "KILL"; then
+    :
+  else
+    signal_status=$?
+    if [[ "${signal_status}" != "3" && "${signal_status}" != "5" ]]; then
+      return "${signal_status}"
+    fi
+  fi
+
+  for _ in {1..50}; do
+    if active_service_pid "${pid}" >/dev/null; then
+      sleep 0.1
+      continue
+    fi
+    active_status=$?
+    if [[ "${active_status}" == "3" || "${active_status}" == "5" ]]; then
+      remove_stopped_service_record "${pid}"
+      echo "DataPilot web service stopped."
+      return
+    fi
+    return "${active_status}"
+  done
+  echo "Web service instance remains active after forced stop." >&2
+  return 1
 }
 
 status_service() {
-  if is_running; then
-    echo "DataPilot web service is running with PID $(cat "${PID_FILE}")."
+  local pid
+  local active_status
+  if pid="$(active_service_pid)"; then
+    echo "DataPilot web service is running with PID ${pid}."
     echo "URL: http://${HOST}:${PORT}"
     return 0
+  else
+    active_status=$?
   fi
-
-  if [[ -f "${PID_FILE}" ]]; then
+  if [[ "${active_status}" == "5" ]]; then
     echo "DataPilot web service is not running. Stale PID file: ${PID_FILE}"
     return 1
+  fi
+  if [[ "${active_status}" != "3" ]]; then
+    return "${active_status}"
   fi
 
   echo "DataPilot web service is not running."
   return 3
+}
+
+locked_restart_service() {
+  resolve_working_directory
+  stop_service
+  start_service
 }
 
 case "${ACTION}" in
@@ -178,24 +466,42 @@ case "${ACTION}" in
     usage
     ;;
   start)
-    start_service
+    resolve_working_directory
+    run_locked_control_action "__control_start"
     ;;
   stop)
-    stop_service
+    run_locked_control_action "__control_stop"
     ;;
   restart)
-    stop_service
-    start_service
+    resolve_working_directory
+    run_locked_control_action "__control_restart"
     ;;
   status)
+    run_locked_control_action "__control_status"
+    ;;
+  __control_start)
+    require_locked_control_action
+    start_service
+    ;;
+  __control_stop)
+    require_locked_control_action
+    stop_service
+    ;;
+  __control_restart)
+    require_locked_control_action
+    locked_restart_service
+    ;;
+  __control_status)
+    require_locked_control_action
     status_service
     ;;
   logs)
-    mkdir -p "${LOG_DIR}"
+    prepare_state_directories
     touch "${LOG_FILE}"
     tail -n 80 -f "${LOG_FILE}"
     ;;
   foreground)
+    resolve_working_directory
     build_frontend
     web_command
     ;;

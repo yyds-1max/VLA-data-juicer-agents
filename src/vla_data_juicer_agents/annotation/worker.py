@@ -334,6 +334,12 @@ class AnnotationWorker:
                     self._cancel_reasons.pop(run["job_ref"], None)
 
     async def _execute_run(self, run: dict[str, Any]) -> None:
+        # True only while a Tracking subprocess has returned published output
+        # that is not yet represented by a durable checkpoint, or while the
+        # completed checkpoint set is being finalized.  Any ordinary failure
+        # in this window has unknown durable side effects and must not become a
+        # Web-retryable/cancellable failure.
+        tracking_ledger_closure_pending = False
         try:
             capacity = await asyncio.to_thread(
                 self.preflight_capacity,
@@ -500,18 +506,28 @@ class AnnotationWorker:
                             target,
                             TrackingTarget(
                                 segment_root=segment_root,
-                                yaml_path=path,
-                                identity=path.stem,
+                                yaml_path=(
+                                    segment_root / rendered_target.filename
+                                ),
+                                identity=Path(
+                                    rendered_target.filename,
+                                ).stem,
+                                expected_yaml_sha256=(
+                                    rendered_target.sha256
+                                ),
                             ),
                         )
-                        for target, path in zip(
+                        for target, rendered_target in zip(
                             segment["targets"],
-                            yaml_paths,
+                            rendered,
                             strict=True,
                         )
                     )
                 runtime_targets.sort(
                     key=lambda item: tracking_target_sort_key(item[2])
+                )
+                attestation_targets = tuple(
+                    item[2] for item in runtime_targets
                 )
                 validation = _plain(
                     await _maybe_await_in_thread(
@@ -519,9 +535,7 @@ class AnnotationWorker:
                         TrackingInputValidationRequest(
                             job_ref=inputs["job_ref"],
                             staging_root=Path(inputs["staging_root"]),
-                            targets=tuple(
-                                item[2] for item in runtime_targets
-                            ),
+                            targets=attestation_targets,
                             expected_runtime_manifest_sha256=inputs[
                                 "expected_runtime_manifest_sha256"
                             ],
@@ -601,6 +615,7 @@ class AnnotationWorker:
                         attempt=run["attempt"],
                         staging_root=Path(inputs["staging_root"]),
                         targets=(runtime_target,),
+                        attestation_targets=attestation_targets,
                         expected_runtime_manifest_sha256=inputs[
                             "expected_runtime_manifest_sha256"
                         ],
@@ -613,6 +628,7 @@ class AnnotationWorker:
                         active_reserved_bytes=run["active_reserved_bytes"],
                     )
                     result = await _maybe_await_in_thread(self.runtime.track, request)
+                    tracking_ledger_closure_pending = True
                     tracked_target = _plain(result)
                     if (
                         tracked_target.get("runtime_manifest_sha256")
@@ -644,6 +660,11 @@ class AnnotationWorker:
                     for step in tracked_target.get("command_steps", []):
                         if step not in command_steps:
                             command_steps.append(step)
+                    tracking_ledger_closure_pending = False
+                # Every output has a committed checkpoint, but the semantic
+                # step, terminal manifest, and Job state still need to commit
+                # as one recoverable ledger closure.
+                tracking_ledger_closure_pending = True
                 await asyncio.to_thread(
                     self.store.finish_runtime_step,
                     run_id=run["run_id"],
@@ -674,9 +695,28 @@ class AnnotationWorker:
                     run_id=run["run_id"],
                     manifest=manifest,
                 )
+                tracking_ledger_closure_pending = False
             else:
                 raise RuntimeError("unsupported annotation runtime run kind")
         except Exception as exc:
+            if (
+                tracking_ledger_closure_pending
+                and not _is_runtime_cancellation(exc)
+            ):
+                from vla_data_juicer_agents.annotation.runtime import (
+                    RuntimeExecutionError,
+                )
+
+                recovery_error = RuntimeExecutionError(
+                    "recovery_required",
+                    "Tracking output ledger closure requires operator recovery.",
+                    private_detail=(
+                        "A Tracking output was published before its durable "
+                        f"ledger closure failed ({type(exc).__name__})."
+                    ),
+                )
+                recovery_error.__cause__ = exc
+                exc = recovery_error
             try:
                 return_code = getattr(exc, "return_code", None)
                 diagnostic_kind = getattr(exc, "diagnostic_kind", "error")
@@ -710,7 +750,7 @@ class AnnotationWorker:
                 self.store.cancellation_requested_for_run,
                 run["run_id"],
             )
-            if cancel_requested:
+            if cancel_requested and not _requires_operator_recovery(exc):
                 await asyncio.to_thread(
                     self.store.complete_cancelled_run,
                     run_id=run["run_id"],
@@ -870,6 +910,20 @@ class CapacityPreflightError(RuntimeError):
     pass
 
 
+def _is_runtime_cancellation(exc: BaseException) -> bool:
+    return (
+        type(exc).__name__ == "RuntimeExecutionError"
+        and getattr(exc, "code", "") == "runtime_cancelled"
+    )
+
+
+def _requires_operator_recovery(exc: BaseException) -> bool:
+    return (
+        type(exc).__name__ == "RuntimeExecutionError"
+        and getattr(exc, "code", "") == "recovery_required"
+    )
+
+
 def _safe_runtime_failure(exc: Exception) -> tuple[str, str, bool]:
     if isinstance(exc, CheckpointMismatchError):
         return (
@@ -896,6 +950,7 @@ def _safe_runtime_failure(exc: Exception) -> tuple[str, str, bool]:
             "runtime_input_changed",
             "runtime_manifest_changed",
             "prepared_staging_changed",
+            "tracking_yaml_changed",
             "unsafe_runtime_input",
             "unsupported_runtime_variant",
             "missing_runtime_input",

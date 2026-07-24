@@ -319,12 +319,15 @@ AppleDouble 文件不属于业务输入，拆包发现与 raw 同源比较均须
   `codex/automatic-annotation-m1`；
 - M1 只实现 `navigation_odom_v1` 的 Web 首帧标注与 Tracking，不提前接入
   M2 后处理/Fix、M3 智能体或 M4 AI；
-- 本地门禁为 Python `1369 passed`、前端 `204 passed`、Playwright
+- 本地门禁为 Python `1494 passed`、前端 `204 passed`、Playwright
   `7 passed`、Golden `73 passed`、Router suite `17 cases validated`，前端
   production build、compileall 和 diff-check 均通过；
 - Golden 的 M1 必需范围已覆盖两个门禁 clip 的 `maps/`、`v1.0-trainval/`
   和全部内部 segments，不允许 candidate 自报路径、宽泛 ignore、非零 tolerance
   或未登记 normalization；
-- 系统 Runtime payload、固定 Xvfb、2027 测试数据拆解/同步和真实 Tracking
-  仍受单独服务器 writer 门禁约束；尚无真实 candidate/oracle 差异结论，因此
-  M1 尚未冻结，也不能进入 M2。
+- 2027 测试数据拆解/同步已于 2026-07-24 通过服务器验收：raw、`tmp_dir`
+  及同步阶段的图像、点云、odom 和时间元数据均与 2026 来源严格一致；历史
+  `grid_map` 是后处理阶段差异，不属于同步或 M1；
+- 系统 Runtime payload、固定 Xvfb 和真实 Tracking 仍受单独服务器 writer
+  门禁约束；尚无真实 Tracking candidate/oracle 差异结论，因此 M1 尚未冻结，
+  也不能进入 M2。

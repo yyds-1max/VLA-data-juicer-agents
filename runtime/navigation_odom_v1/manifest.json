@@ -540,6 +540,26 @@
     },
     {
       "root_alias": "NAVIGATION_ODOM_V1_SOURCE",
+      "relative_path": "Data/3_param/ost.yaml",
+      "kind": "frozen_file",
+      "role": "tracking_compatibility_config",
+      "stage": "tracking",
+      "sha256": "9a1d25967da58715f917736577f2542277f873baea9370eaf0219f6e9e36fa36",
+      "size": 392,
+      "executable": true
+    },
+    {
+      "root_alias": "NAVIGATION_ODOM_V1_SOURCE",
+      "relative_path": "Data/3_param/camera_extrinsics.yaml",
+      "kind": "frozen_file",
+      "role": "tracking_compatibility_config",
+      "stage": "tracking",
+      "sha256": "61672119470f3cd5bac55e7ad93774c3f4b552af2e059909b34ccdd2a43a078c",
+      "size": 341,
+      "executable": true
+    },
+    {
+      "root_alias": "NAVIGATION_ODOM_V1_SOURCE",
       "relative_path": "NoobScenes/samples",
       "kind": "generated_mutable",
       "role": "active_dataset_link",

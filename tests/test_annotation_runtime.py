@@ -60,8 +60,9 @@ def _executable(path: Path, content: bytes = b"#!/bin/sh\nexit 0\n") -> None:
 def _config(tmp_path: Path) -> NavigationAnnotationRuntimeConfig:
     source = tmp_path / "runtime-source"
     work = tmp_path / "work"
-    clip = tmp_path / "clip_data"
-    legacy_data = tmp_path / "legacy-data"
+    clip = tmp_path / "datasets" / "clip_data"
+    binary_data = tmp_path / "embedded-binary-root" / "Data"
+    legacy_data = runtime_module._legacy_yaml_data_root()
     for directory in (
         source / "NoobScenes" / "samples",
         source / "NoobScenes" / "v1.0-develop",
@@ -70,20 +71,47 @@ def _config(tmp_path: Path) -> NavigationAnnotationRuntimeConfig:
         source / "1_onnx_tam",
         work,
         clip,
-        legacy_data,
+        binary_data,
     ):
         directory.mkdir(parents=True, exist_ok=True)
+    work.chmod(0o700)
     (source / "NoobScenes" / "maps").mkdir()
     (source / "NoobScenes" / "maps" / "map.png").write_bytes(_png(1, 1))
-    for filename in (
-        "include/0_creat_box.py",
-        "include/1_odom_convert.py",
-        "include/2_resize.py",
-        "main_smart_odom.py",
-    ):
+    script_contents = {
+        "include/0_creat_box.py": b"# frozen\n",
+        "include/1_odom_convert.py": (
+            f"clip_data = {str(clip)!r}\n".encode("utf-8")
+        ),
+        "include/2_resize.py": b"# frozen\n",
+        "main_smart_odom.py": b"# frozen\n",
+        **{
+            f"include/{filename}": b"# frozen\n"
+            for filename in (
+                "__init__.py",
+                "attribute.py",
+                "calibrated_sensor.py",
+                "category.py",
+                "dataset.py",
+                "ego_pose.py",
+                "instance.py",
+                "lidarseg.py",
+                "log.py",
+                "map.py",
+                "sample.py",
+                "sample_annotation.py",
+                "sample_data.py",
+                "scene.py",
+                "sensor.py",
+                "utils.py",
+                "visibility.py",
+            )
+        },
+    }
+    for filename, content in script_contents.items():
         path = source / "NoobScenes" / filename
         path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text("# frozen\n", encoding="utf-8")
+        path.write_bytes(content)
+    (source / "NoobScenes" / "include" / "1_odom_convert.py").chmod(0o755)
     (source / "0_1th_box" / "img2video.py").write_text(
         "# frozen\n",
         encoding="utf-8",
@@ -93,6 +121,38 @@ def _config(tmp_path: Path) -> NavigationAnnotationRuntimeConfig:
             "{}\n",
             encoding="utf-8",
         )
+    tracking_binary = source / "1_onnx_tam" / "bin" / "main"
+    _executable(
+        tracking_binary,
+        b"\x00".join(
+            (
+                b"fixture-binary",
+                str(binary_data / "3_param" / "dog.yaml").encode("ascii"),
+                str(
+                    binary_data / "1_img_output" / "img_points.txt",
+                ).encode("ascii"),
+                (
+                    str(binary_data / "1_img_output" / "tracking_img") + "/"
+                ).encode("ascii"),
+                b"",
+            ),
+        ),
+    )
+    model_contents = {
+        f"1_onnx_tam/models/etam/{name}.onnx": (
+            f"frozen-{name}\n".encode("ascii")
+        )
+        for name in (
+            "image_encoder",
+            "memory_attention",
+            "image_decoder",
+            "memory_encoder",
+        )
+    }
+    for relative_path, content in model_contents.items():
+        path = source / relative_path
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(content)
     data_python = tmp_path / "python3.8"
     setup = tmp_path / "setup.sh"
     bwrap = tmp_path / "bwrap"
@@ -134,6 +194,125 @@ def _config(tmp_path: Path) -> NavigationAnnotationRuntimeConfig:
                         "size": len(b"# frozen\n"),
                         "executable": False,
                     },
+                    {
+                        "root_alias": "NAVIGATION_ODOM_V1_SOURCE",
+                        "relative_path": "NoobScenes/include/1_odom_convert.py",
+                        "kind": "frozen_file",
+                        "role": "active_runtime",
+                        "stage": "preprocess",
+                        "sha256": hashlib.sha256(
+                            script_contents["include/1_odom_convert.py"],
+                        ).hexdigest(),
+                        "size": len(
+                            script_contents["include/1_odom_convert.py"],
+                        ),
+                        "executable": True,
+                    },
+                    *[
+                        {
+                            "root_alias": "NAVIGATION_ODOM_V1_SOURCE",
+                            "relative_path": f"NoobScenes/{filename}",
+                            "kind": "frozen_file",
+                            "role": "active_runtime",
+                            "stage": (
+                                "preprocess"
+                                if filename
+                                in {
+                                    "include/0_creat_box.py",
+                                    "include/2_resize.py",
+                                }
+                                else "metadata"
+                            ),
+                            "sha256": hashlib.sha256(content).hexdigest(),
+                            "size": len(content),
+                            "executable": False,
+                        }
+                        for filename, content in script_contents.items()
+                        if filename
+                        not in {
+                            "include/1_odom_convert.py",
+                            "main_smart_odom.py",
+                        }
+                    ],
+                    *[
+                        {
+                            "root_alias": "NAVIGATION_ODOM_V1_SOURCE",
+                            "relative_path": relative_path,
+                            "kind": "frozen_file",
+                            "role": role,
+                            "stage": stage,
+                            "sha256": hashlib.sha256(
+                                (source / relative_path).read_bytes(),
+                            ).hexdigest(),
+                            "size": (source / relative_path).stat().st_size,
+                            "executable": False,
+                        }
+                        for relative_path, role, stage in (
+                            (
+                                "NoobScenes/maps/map.png",
+                                "active_static_asset",
+                                "metadata",
+                            ),
+                            (
+                                "0_1th_box/img2video.py",
+                                "active_runtime",
+                                "initial_annotation",
+                            ),
+                        )
+                    ],
+                    {
+                        "root_alias": "NAVIGATION_ODOM_V1_SOURCE",
+                        "relative_path": "1_onnx_tam/bin/main",
+                        "kind": "frozen_file",
+                        "role": "active_binary",
+                        "stage": "tracking",
+                        "sha256": hashlib.sha256(
+                            tracking_binary.read_bytes(),
+                        ).hexdigest(),
+                        "size": tracking_binary.stat().st_size,
+                        "executable": True,
+                    },
+                    *[
+                        {
+                            "root_alias": "NAVIGATION_ODOM_V1_SOURCE",
+                            "relative_path": relative_path,
+                            "kind": "frozen_file",
+                            "role": "active_model",
+                            "stage": "tracking",
+                            "sha256": hashlib.sha256(content).hexdigest(),
+                            "size": len(content),
+                            "executable": False,
+                        }
+                        for relative_path, content in model_contents.items()
+                    ],
+                    *[
+                        {
+                            "root_alias": "NAVIGATION_ODOM_V1_SOURCE",
+                            "relative_path": f"Data/3_param/{filename}",
+                            "kind": "frozen_file",
+                            "role": "tracking_compatibility_config",
+                            "stage": "tracking",
+                            "sha256": hashlib.sha256(
+                                (
+                                    source
+                                    / "Data"
+                                    / "3_param"
+                                    / filename
+                                ).read_bytes(),
+                            ).hexdigest(),
+                            "size": (
+                                source
+                                / "Data"
+                                / "3_param"
+                                / filename
+                            ).stat().st_size,
+                            "executable": False,
+                        }
+                        for filename in (
+                            "ost.yaml",
+                            "camera_extrinsics.yaml",
+                        )
+                    ],
                     {
                         "root_alias": "DATA_RUNTIME_ENV",
                         "relative_path": "setup.sh",
@@ -235,14 +414,57 @@ def _config(tmp_path: Path) -> NavigationAnnotationRuntimeConfig:
         xvfb_path=xvfb_server,
         xvfb_deb_path=xvfb_deb,
         runtime_dependency_summary_path=dependency_summary,
+        tracking_binary_data_root=binary_data,
         legacy_tracking_data_root=legacy_data,
         legacy_clip_data_root=clip,
         writer_lock_path=writer_lock_parent / "navigation.lock",
-        minimum_free_bytes=0,
+        minimum_free_bytes=1,
         timeout_seconds=300,
         version_probe=lambda _package: EXPECTED_XVFB_VERSION,
         package_probe=lambda _names: {},
         gpu_probe=lambda: True,
+        overlay_target_probe=lambda path: (
+            path == legacy_data
+            or runtime_module._safe_absolute_directory(path)
+        ),
+    )
+
+
+def _refresh_frozen_manifest_entry(
+    config: NavigationAnnotationRuntimeConfig,
+    relative_path: str,
+) -> None:
+    assert config.runtime_source_root is not None
+    path = config.runtime_source_root / relative_path
+    manifest = json.loads(config.manifest_path.read_text(encoding="utf-8"))
+    entry = next(
+        item
+        for item in manifest["entries"]
+        if item.get("root_alias") == "NAVIGATION_ODOM_V1_SOURCE"
+        and item.get("relative_path") == relative_path
+    )
+    entry.update(
+        sha256=hashlib.sha256(path.read_bytes()).hexdigest(),
+        size=path.stat().st_size,
+        executable=bool(path.stat().st_mode & 0o111),
+    )
+    config.manifest_path.write_text(
+        json.dumps(manifest),
+        encoding="utf-8",
+    )
+
+
+def _tracking_target(
+    segment_root: Path,
+    yaml_path: Path,
+    identity: str,
+) -> TrackingTarget:
+    content = yaml_path.read_bytes() if yaml_path.is_file() else b"{}\n"
+    return TrackingTarget(
+        segment_root=segment_root,
+        yaml_path=yaml_path,
+        identity=identity,
+        expected_yaml_sha256=hashlib.sha256(content).hexdigest(),
     )
 
 
@@ -335,6 +557,104 @@ def test_runtime_capabilities_fail_closed_and_verify_frozen_payload(
     assert unavailable.reason.code == "runtime_not_configured"
 
 
+@pytest.mark.parametrize(
+    "relative_path",
+    [
+        "NoobScenes/include/0_creat_box.py",
+        "NoobScenes/include/attribute.py",
+        "NoobScenes/maps/map.png",
+        "0_1th_box/img2video.py",
+        "1_onnx_tam/bin/main",
+        "1_onnx_tam/models/etam/image_encoder.onnx",
+        "Data/3_param/ost.yaml",
+    ],
+)
+def test_runtime_capabilities_require_every_active_frozen_input(
+    tmp_path: Path,
+    relative_path: str,
+) -> None:
+    config = _config(tmp_path)
+    manifest = json.loads(config.manifest_path.read_text(encoding="utf-8"))
+    manifest["entries"] = [
+        entry
+        for entry in manifest["entries"]
+        if entry.get("relative_path") != relative_path
+    ]
+    config.manifest_path.write_text(
+        json.dumps(manifest),
+        encoding="utf-8",
+    )
+
+    capability = NavigationAnnotationRuntimeAdapter(config).capabilities()
+
+    assert capability.available is False
+    assert capability.reason is not None
+    assert capability.reason.code == "runtime_manifest_incomplete"
+
+
+@pytest.mark.parametrize(
+    ("relative_path", "field", "wrong_value"),
+    [
+        ("Data/3_param/ost.yaml", "role", "active_runtime"),
+        (
+            "Data/3_param/camera_extrinsics.yaml",
+            "stage",
+            "preprocess",
+        ),
+        ("1_onnx_tam/bin/main", "role", "tracking_compatibility_config"),
+        (
+            "NoobScenes/include/1_odom_convert.py",
+            "stage",
+            "tracking",
+        ),
+        (
+            "NoobScenes/include/attribute.py",
+            "role",
+            "active_static_asset",
+        ),
+        (
+            "NoobScenes/maps/map.png",
+            "stage",
+            "preprocess",
+        ),
+        (
+            "0_1th_box/img2video.py",
+            "stage",
+            "metadata",
+        ),
+        (
+            "1_onnx_tam/models/etam/image_encoder.onnx",
+            "role",
+            "active_runtime",
+        ),
+    ],
+)
+def test_runtime_capabilities_require_exact_frozen_entry_metadata(
+    tmp_path: Path,
+    relative_path: str,
+    field: str,
+    wrong_value: str,
+) -> None:
+    config = _config(tmp_path)
+    manifest = json.loads(config.manifest_path.read_text(encoding="utf-8"))
+    entry = next(
+        item
+        for item in manifest["entries"]
+        if item.get("relative_path") == relative_path
+    )
+    entry[field] = wrong_value
+    config.manifest_path.write_text(
+        json.dumps(manifest),
+        encoding="utf-8",
+    )
+
+    capability = NavigationAnnotationRuntimeAdapter(config).capabilities()
+
+    assert capability.available is False
+    assert capability.reason is not None
+    assert capability.reason.code == "runtime_manifest_incomplete"
+
+
 @pytest.mark.parametrize("timeout_seconds", [None, 0, -1, True])
 def test_runtime_capabilities_require_positive_command_timeout(
     tmp_path: Path,
@@ -350,6 +670,354 @@ def test_runtime_capabilities_require_positive_command_timeout(
     assert capability.available is False
     assert capability.reason is not None
     assert capability.reason.code == "runtime_timeout_not_configured"
+
+
+@pytest.mark.parametrize("minimum_free_bytes", [None, 0, -1, True])
+def test_runtime_capabilities_require_positive_capacity_margin(
+    tmp_path: Path,
+    minimum_free_bytes: object,
+) -> None:
+    config = replace(
+        _config(tmp_path),
+        minimum_free_bytes=minimum_free_bytes,  # type: ignore[arg-type]
+    )
+
+    capability = NavigationAnnotationRuntimeAdapter(config).capabilities()
+
+    assert capability.available is False
+    assert capability.reason is not None
+    assert capability.reason.code == "runtime_capacity_margin_invalid"
+
+
+def test_runtime_capabilities_require_distinct_absolute_tracking_targets(
+    tmp_path: Path,
+) -> None:
+    config = _config(tmp_path)
+
+    missing = NavigationAnnotationRuntimeAdapter(
+        replace(config, tracking_binary_data_root=None),
+    ).capabilities()
+    assert missing.available is False
+    assert missing.reason is not None
+    assert missing.reason.code == "runtime_not_configured"
+
+    relative = NavigationAnnotationRuntimeAdapter(
+        replace(
+            config,
+            tracking_binary_data_root=Path("binary-data"),
+        ),
+    ).capabilities()
+    assert relative.available is False
+    assert relative.reason is not None
+    assert relative.reason.code == "sandbox_target_unavailable"
+
+    conflict = NavigationAnnotationRuntimeAdapter(
+        replace(
+            config,
+            tracking_binary_data_root=config.legacy_tracking_data_root,
+        ),
+    ).capabilities()
+    assert conflict.available is False
+    assert conflict.reason is not None
+    assert conflict.reason.code == "sandbox_target_conflict"
+
+
+def test_runtime_capabilities_reject_nested_and_protected_tracking_targets(
+    tmp_path: Path,
+) -> None:
+    config = _config(tmp_path)
+    parent = tmp_path / "tracking-target"
+    child = parent / "nested"
+    child.mkdir(parents=True)
+
+    nested = NavigationAnnotationRuntimeAdapter(
+        replace(
+            config,
+            tracking_binary_data_root=parent,
+            legacy_tracking_data_root=child,
+        ),
+    ).capabilities()
+    assert nested.available is False
+    assert nested.reason is not None
+    assert nested.reason.code == "sandbox_target_conflict"
+
+    assert config.work_root is not None
+    protected_target = config.work_root / "tracking-target"
+    protected_target.mkdir()
+    protected = NavigationAnnotationRuntimeAdapter(
+        replace(
+            config,
+            tracking_binary_data_root=protected_target,
+        ),
+    ).capabilities()
+    assert protected.available is False
+    assert protected.reason is not None
+    assert protected.reason.code == "sandbox_target_conflict"
+
+
+@pytest.mark.parametrize(
+    "protected_root",
+    ["dataset", "clip", "runtime_source"],
+)
+def test_runtime_capabilities_reject_work_root_overlap(
+    tmp_path: Path,
+    protected_root: str,
+) -> None:
+    config = _config(tmp_path)
+    assert config.clip_data_root is not None
+    assert config.runtime_source_root is not None
+    selected = {
+        "dataset": config.clip_data_root.parent,
+        "clip": config.clip_data_root,
+        "runtime_source": config.runtime_source_root,
+    }[protected_root]
+    selected.chmod(0o700)
+
+    capability = NavigationAnnotationRuntimeAdapter(
+        replace(config, work_root=selected),
+    ).capabilities()
+
+    assert capability.available is False
+    assert capability.reason is not None
+    assert capability.reason.code == "work_root_conflict"
+
+
+def test_runtime_capabilities_accept_private_work_root(
+    tmp_path: Path,
+) -> None:
+    config = _config(tmp_path)
+    assert config.work_root is not None
+    config.work_root.chmod(0o700)
+
+    capability = NavigationAnnotationRuntimeAdapter(config).capabilities()
+
+    assert capability.available is True
+
+
+@pytest.mark.parametrize("mode", [0o755, 0o775, 0o777])
+def test_runtime_capabilities_reject_nonprivate_work_root_mode(
+    tmp_path: Path,
+    mode: int,
+) -> None:
+    config = _config(tmp_path)
+    assert config.work_root is not None
+    config.work_root.chmod(mode)
+
+    capability = NavigationAnnotationRuntimeAdapter(config).capabilities()
+
+    assert capability.available is False
+    assert capability.reason is not None
+    assert capability.reason.code == "work_root_unavailable"
+
+
+def test_runtime_capabilities_reject_noncanonical_work_root(
+    tmp_path: Path,
+) -> None:
+    config = _config(tmp_path)
+    assert config.work_root is not None
+    noncanonical = (
+        config.work_root
+        / ".."
+        / config.work_root.name
+    )
+
+    capability = NavigationAnnotationRuntimeAdapter(
+        replace(config, work_root=noncanonical),
+    ).capabilities()
+
+    assert capability.available is False
+    assert capability.reason is not None
+    assert capability.reason.code == "work_root_unavailable"
+
+
+def test_runtime_capabilities_reject_work_root_with_symlink_ancestor(
+    tmp_path: Path,
+) -> None:
+    config = _config(tmp_path)
+    real_parent = tmp_path / "real-work-parent"
+    real_work_root = real_parent / "work"
+    real_work_root.mkdir(parents=True, mode=0o700)
+    alias_parent = tmp_path / "work-parent-alias"
+    alias_parent.symlink_to(real_parent, target_is_directory=True)
+
+    capability = NavigationAnnotationRuntimeAdapter(
+        replace(config, work_root=alias_parent / "work"),
+    ).capabilities()
+
+    assert capability.available is False
+    assert capability.reason is not None
+    assert capability.reason.code == "work_root_unavailable"
+
+
+def test_runtime_capabilities_reject_wrong_owner_work_root(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = _config(tmp_path)
+    assert config.work_root is not None
+    work_root = config.work_root
+    real_lstat = Path.lstat
+
+    def wrong_owner_lstat(path: Path) -> os.stat_result:
+        metadata = real_lstat(path)
+        if path != work_root:
+            return metadata
+        fields = list(metadata)
+        fields[4] = metadata.st_uid + 1
+        return os.stat_result(fields)
+
+    monkeypatch.setattr(Path, "lstat", wrong_owner_lstat)
+
+    capability = NavigationAnnotationRuntimeAdapter(config).capabilities()
+
+    assert capability.available is False
+    assert capability.reason is not None
+    assert capability.reason.code == "work_root_unavailable"
+
+
+@pytest.mark.parametrize(
+    "unsafe_path",
+    [
+        "source_root",
+        "payload_directory",
+        "overlay_directory",
+        "active_file",
+    ],
+)
+def test_runtime_capabilities_reject_peer_writable_active_payload(
+    tmp_path: Path,
+    unsafe_path: str,
+) -> None:
+    config = _config(tmp_path)
+    assert config.runtime_source_root is not None
+    path = {
+        "source_root": config.runtime_source_root,
+        "payload_directory": (
+            config.runtime_source_root / "1_onnx_tam" / "models"
+        ),
+        "overlay_directory": (
+            config.runtime_source_root / "NoobScenes" / "samples"
+        ),
+        "active_file": (
+            config.runtime_source_root
+            / "1_onnx_tam"
+            / "models"
+            / "etam"
+            / "image_encoder.onnx"
+        ),
+    }[unsafe_path]
+    path.chmod(
+        0o775 if path.is_dir() else 0o664,
+        follow_symlinks=False,
+    )
+
+    capability = NavigationAnnotationRuntimeAdapter(config).capabilities()
+
+    assert capability.available is False
+    assert capability.reason is not None
+    assert capability.reason.code == "runtime_payload_permissions_unsafe"
+
+
+def test_runtime_capabilities_bind_tracking_targets_to_frozen_evidence(
+    tmp_path: Path,
+) -> None:
+    config = _config(tmp_path)
+    arbitrary_binary_target = tmp_path / "arbitrary-binary" / "Data"
+    arbitrary_yaml_target = tmp_path / "arbitrary-yaml" / "Data"
+    arbitrary_clip_target = tmp_path / "arbitrary-clip"
+    for path in (
+        arbitrary_binary_target,
+        arbitrary_yaml_target,
+        arbitrary_clip_target,
+    ):
+        path.mkdir(parents=True)
+
+    for changed in (
+        replace(
+            config,
+            tracking_binary_data_root=arbitrary_binary_target,
+        ),
+        replace(
+            config,
+            legacy_tracking_data_root=arbitrary_yaml_target,
+        ),
+        replace(
+            config,
+            legacy_clip_data_root=arbitrary_clip_target,
+        ),
+    ):
+        capability = NavigationAnnotationRuntimeAdapter(
+            changed,
+        ).capabilities()
+        assert capability.available is False
+        assert capability.reason is not None
+        assert capability.reason.code == "sandbox_target_mismatch"
+
+
+def test_runtime_capabilities_scan_manifest_frozen_embedded_paths(
+    tmp_path: Path,
+) -> None:
+    config = _config(tmp_path)
+    assert config.runtime_source_root is not None
+    other_binary_data = tmp_path / "other-binary-root" / "Data"
+    other_clip_data = tmp_path / "other-clip"
+    other_binary_data.mkdir(parents=True)
+    other_clip_data.mkdir()
+
+    binary = config.runtime_source_root / "1_onnx_tam" / "bin" / "main"
+    binary.write_bytes(
+        b"\x00".join(
+            (
+                str(
+                    other_binary_data / "3_param" / "dog.yaml",
+                ).encode("ascii"),
+                str(
+                    other_binary_data / "1_img_output" / "img_points.txt",
+                ).encode("ascii"),
+                (
+                    str(
+                        other_binary_data
+                        / "1_img_output"
+                        / "tracking_img",
+                    )
+                    + "/"
+                ).encode("ascii"),
+                b"",
+            ),
+        ),
+    )
+    binary.chmod(0o755)
+    _refresh_frozen_manifest_entry(config, "1_onnx_tam/bin/main")
+
+    binary_capability = NavigationAnnotationRuntimeAdapter(
+        config,
+    ).capabilities()
+    assert binary_capability.available is False
+    assert binary_capability.reason is not None
+    assert binary_capability.reason.code == "sandbox_target_mismatch"
+
+    odom_convert = (
+        config.runtime_source_root
+        / "NoobScenes"
+        / "include"
+        / "1_odom_convert.py"
+    )
+    odom_convert.write_text(
+        f"clip_data = {str(other_clip_data)!r}\n",
+        encoding="utf-8",
+    )
+    odom_convert.chmod(0o755)
+    _refresh_frozen_manifest_entry(
+        config,
+        "NoobScenes/include/1_odom_convert.py",
+    )
+
+    clip_capability = NavigationAnnotationRuntimeAdapter(
+        replace(config, tracking_binary_data_root=other_binary_data),
+    ).capabilities()
+    assert clip_capability.available is False
+    assert clip_capability.reason is not None
+    assert clip_capability.reason.code == "sandbox_target_mismatch"
 
 
 def test_runtime_capabilities_require_explicit_safe_writer_lock(
@@ -468,6 +1136,105 @@ def test_runtime_timeout_environment_is_strict_ascii_positive_integer(
     config = NavigationAnnotationRuntimeConfig.from_env()
 
     assert config.timeout_seconds == expected
+
+
+@pytest.mark.parametrize(
+    ("raw_value", "expected"),
+    [
+        (None, None),
+        ("300", 300),
+        ("0", None),
+        ("-1", None),
+        ("+1", None),
+        (" 1", None),
+        ("１", None),
+        ("not-a-number", None),
+    ],
+)
+def test_runtime_capacity_environment_is_strict_ascii_positive_integer(
+    monkeypatch: pytest.MonkeyPatch,
+    raw_value: str | None,
+    expected: int | None,
+) -> None:
+    if raw_value is None:
+        monkeypatch.delenv(
+            "VLA_ANNOTATION_MINIMUM_FREE_BYTES",
+            raising=False,
+        )
+    else:
+        monkeypatch.setenv(
+            "VLA_ANNOTATION_MINIMUM_FREE_BYTES",
+            raw_value,
+        )
+
+    config = NavigationAnnotationRuntimeConfig.from_env()
+
+    assert config.minimum_free_bytes == expected
+
+
+def test_runtime_capacity_margin_is_asserted_before_all_arithmetic(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = replace(_config(tmp_path), minimum_free_bytes=None)
+    adapter = NavigationAnnotationRuntimeAdapter(config)
+    tracking = NavigationTrackingRuntime(config)
+    monkeypatch.setattr(adapter, "_require_available", lambda: None)
+    monkeypatch.setattr(tracking, "_require_available", lambda: None)
+
+    with pytest.raises(AssertionError):
+        adapter.preflight_capacity("20270605", ("clip",))
+    with pytest.raises(AssertionError):
+        adapter.prepare(
+            PreparationRequest(
+                job_ref="job_" + "1" * 32,
+                run_ref="run_" + "2" * 32,
+                attempt=1,
+                dataset_date="20270605",
+                source_clips=("clip",),
+                calibration_snapshot_dir=tmp_path,
+                calibration_snapshot_files=(),
+                calibration_snapshot_sha256="a" * 64,
+            ),
+        )
+    with pytest.raises(AssertionError):
+        tracking.track(
+            TrackingRequest(
+                job_ref="job_" + "1" * 32,
+                run_ref="run_" + "2" * 32,
+                attempt=1,
+                staging_root=tmp_path,
+                targets=(),
+                attestation_targets=(),
+                expected_runtime_manifest_sha256="a" * 64,
+                expected_prepared_artifact_tree_sha256="b" * 64,
+            ),
+        )
+
+
+def test_runtime_tracking_targets_are_explicit_environment_configuration(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv("VLA_TRACKING_BINARY_DATA_ROOT", raising=False)
+    monkeypatch.delenv("VLA_TRACKING_LEGACY_DATA_ROOT", raising=False)
+    missing = NavigationAnnotationRuntimeConfig.from_env()
+    assert missing.tracking_binary_data_root is None
+    assert missing.legacy_tracking_data_root is None
+
+    binary_data = tmp_path / "binary-data"
+    yaml_data = tmp_path / "yaml-data"
+    monkeypatch.setenv(
+        "VLA_TRACKING_BINARY_DATA_ROOT",
+        str(binary_data),
+    )
+    monkeypatch.setenv(
+        "VLA_TRACKING_LEGACY_DATA_ROOT",
+        str(yaml_data),
+    )
+    configured = NavigationAnnotationRuntimeConfig.from_env()
+    assert configured.tracking_binary_data_root == binary_data
+    assert configured.legacy_tracking_data_root == yaml_data
 
 
 def test_runtime_command_uses_the_approved_timeout(
@@ -792,6 +1559,51 @@ def test_prepare_copies_inputs_and_preserves_frozen_business_order(
     for path in result.staging_root.rglob("*"):
         mode = stat.S_IMODE(path.stat(follow_symlinks=False).st_mode)
         assert mode == (0o700 if path.is_dir() else 0o600)
+
+
+@pytest.mark.parametrize(
+    "relative_path",
+    [
+        "NoobScenes/include/attribute.py",
+        "NoobScenes/maps/map.png",
+    ],
+)
+def test_prepare_rechecks_active_payload_around_each_command(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    relative_path: str,
+) -> None:
+    config = _config(tmp_path)
+    _sync_input(config)
+    adapter = NavigationAnnotationRuntimeAdapter(config)
+    assert adapter.capabilities().available is True
+    monkeypatch.setattr(adapter, "_require_available", lambda: None)
+    assert config.runtime_source_root is not None
+    changed = config.runtime_source_root / relative_path
+    command_count = 0
+
+    def replace_active_input(**_kwargs) -> None:
+        nonlocal command_count
+        command_count += 1
+        changed.write_text("# replaced during prepare\n", encoding="utf-8")
+
+    monkeypatch.setattr(adapter, "_run_checked", replace_active_input)
+    job_ref = "job_" + "0" * 32
+
+    with pytest.raises(RuntimeExecutionError) as error:
+        adapter.prepare(
+            PreparationRequest(
+                job_ref=job_ref,
+                run_ref="run_" + "0" * 32,
+                attempt=1,
+                dataset_date="20270605",
+                source_clips=("20260605_160904",),
+                **_calibration_fields(config, job_ref),
+            ),
+        )
+
+    assert error.value.code == "runtime_input_changed"
+    assert command_count == 1
 
 
 def test_prepare_rejects_ins_only_data_instead_of_switching_runtime(
@@ -1225,8 +2037,14 @@ def test_tracking_uses_private_data_overlay_and_commits_checkpoint(
     staging = config.work_root / "jobs" / ("job_" + "c" * 32) / "20270605_temp"  # type: ignore[operator]
     segment = staging / "samples" / "20270605" / "segment_0"
     segment.mkdir(parents=True)
+    (staging / ".runtime").mkdir()
     yaml_path = segment / "master_green_gray_white.yaml"
     yaml_path.write_text("{}\n", encoding="utf-8")
+    target = _tracking_target(
+        segment,
+        yaml_path,
+        "master_green_gray_white",
+    )
     captured_bindings: list[tuple[Path, Path]] = []
 
     def fake_run_checked(**kwargs) -> None:
@@ -1249,17 +2067,17 @@ def test_tracking_uses_private_data_overlay_and_commits_checkpoint(
             run_ref="run_" + "3" * 32,
             attempt=1,
             staging_root=staging,
-            targets=(
-                TrackingTarget(
-                    segment_root=segment,
-                    yaml_path=yaml_path,
-                    identity="master_green_gray_white",
-                ),
-            ),
+            targets=(target,),
+            attestation_targets=(target,),
             expected_runtime_manifest_sha256=hashlib.sha256(
                 config.manifest_path.read_bytes(),
             ).hexdigest(),
-            expected_prepared_artifact_tree_sha256="d" * 64,
+            expected_prepared_artifact_tree_sha256=(
+                runtime_module.prepared_staging_artifact_sha256(
+                    staging,
+                    (target,),
+                )
+            ),
         ),
     )
 
@@ -1274,8 +2092,9 @@ def test_tracking_uses_private_data_overlay_and_commits_checkpoint(
         / ("run_" + "3" * 32)
         / "Data"
     )
-    assert (private_data, config.runtime_source_root / "Data") in captured_bindings  # type: ignore[operator]
+    assert (private_data, config.tracking_binary_data_root) in captured_bindings
     assert (private_data, config.legacy_tracking_data_root) in captured_bindings
+    assert config.tracking_binary_data_root != config.legacy_tracking_data_root
     evidence = CheckpointVerificationRequest(
         job_ref="job_" + "c" * 32,
         staging_root=staging,
@@ -1286,6 +2105,327 @@ def test_tracking_uses_private_data_overlay_and_commits_checkpoint(
     assert runtime.verify_checkpoint(evidence) is True
     result.checkpoints[0].points_path.write_text("changed\n", encoding="utf-8")
     assert runtime.verify_checkpoint(evidence) is False
+
+
+def test_tracking_reuses_exact_private_configs_for_same_run_targets(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = _config(tmp_path)
+    runtime = NavigationTrackingRuntime(config)
+    monkeypatch.setattr(runtime, "_require_available", lambda: None)
+    run_ref = "run_" + "5" * 32
+    staging = (
+        config.work_root
+        / "jobs"
+        / ("job_" + "5" * 32)
+        / "attempts"
+        / run_ref
+        / "20270605_temp"
+    )  # type: ignore[operator]
+    segment = staging / "samples" / "20270605" / "segment_0"
+    segment.mkdir(parents=True)
+    (staging / ".runtime").mkdir()
+    (segment / "000001.png").write_bytes(_png())
+    yaml_contents = {
+        "master_green_gray_white": b"identity: master\n",
+        "other1_green_gray_white": b"identity: other1\n",
+    }
+    targets = tuple(
+        TrackingTarget(
+            segment_root=segment,
+            yaml_path=segment / f"{identity}.yaml",
+            identity=identity,
+            expected_yaml_sha256=hashlib.sha256(content).hexdigest(),
+        )
+        for identity, content in yaml_contents.items()
+    )
+    expected_prepared = runtime_module.prepared_staging_artifact_sha256(
+        staging,
+        targets,
+    )
+    for target in targets:
+        target.yaml_path.write_bytes(yaml_contents[target.identity])
+    execution: list[str] = []
+
+    def fake_run_checked(**kwargs) -> None:
+        private_data = kwargs["writable_bindings"][0][0]
+        execution.append(
+            (private_data / "3_param" / "dog.yaml").read_text(
+                encoding="utf-8",
+            ).strip(),
+        )
+        output = private_data / "1_img_output"
+        (output / "tracking_img" / "000001.png").write_bytes(_png())
+        (output / "img_points.txt").write_text("1 2\n", encoding="utf-8")
+
+    monkeypatch.setattr(runtime, "_run_checked", fake_run_checked)
+    config_inodes: list[tuple[int, int]] = []
+    for target in targets:
+        result = runtime.track(
+            TrackingRequest(
+                job_ref="job_" + "5" * 32,
+                run_ref=run_ref,
+                attempt=1,
+                staging_root=staging,
+                targets=(target,),
+                attestation_targets=targets,
+                expected_runtime_manifest_sha256=hashlib.sha256(
+                    config.manifest_path.read_bytes(),
+                ).hexdigest(),
+                expected_prepared_artifact_tree_sha256=expected_prepared,
+            ),
+        )
+        assert len(result.checkpoints) == 1
+        private_param = (
+            staging / ".runtime" / "runs" / run_ref / "Data" / "3_param"
+        )
+        config_inodes.append(
+            (
+                (private_param / "ost.yaml").stat().st_ino,
+                (private_param / "camera_extrinsics.yaml").stat().st_ino,
+            ),
+        )
+
+    assert execution == ["identity: master", "identity: other1"]
+    assert config_inodes[0] == config_inodes[1]
+    private_param = (
+        staging / ".runtime" / "runs" / run_ref / "Data" / "3_param"
+    )
+    (private_param / "ost.yaml").write_text(
+        "changed: true\n",
+        encoding="utf-8",
+    )
+    with pytest.raises(RuntimeExecutionError) as error:
+        runtime.track(
+            TrackingRequest(
+                job_ref="job_" + "5" * 32,
+                run_ref=run_ref,
+                attempt=1,
+                staging_root=staging,
+                targets=(targets[0],),
+                attestation_targets=targets,
+                expected_runtime_manifest_sha256=hashlib.sha256(
+                    config.manifest_path.read_bytes(),
+                ).hexdigest(),
+                expected_prepared_artifact_tree_sha256=expected_prepared,
+            ),
+        )
+    assert error.value.code == "runtime_input_changed"
+    assert execution == ["identity: master", "identity: other1"]
+
+
+def test_tracking_rejects_yaml_changed_after_render(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = _config(tmp_path)
+    runtime = NavigationTrackingRuntime(config)
+    monkeypatch.setattr(runtime, "_require_available", lambda: None)
+    staging = (
+        config.work_root
+        / "jobs"
+        / ("job_" + "4" * 32)
+        / "20270605_temp"
+    )  # type: ignore[operator]
+    segment = staging / "samples" / "20270605" / "segment_0"
+    segment.mkdir(parents=True)
+    (staging / ".runtime").mkdir()
+    yaml_path = segment / "master_green_gray_white.yaml"
+    yaml_path.write_text("{}\n", encoding="utf-8")
+    target = _tracking_target(
+        segment,
+        yaml_path,
+        "master_green_gray_white",
+    )
+    expected_prepared = runtime_module.prepared_staging_artifact_sha256(
+        staging,
+        (target,),
+    )
+    yaml_path.write_text("changed: true\n", encoding="utf-8")
+    binary_start_count = 0
+
+    def unexpected_run(**_kwargs) -> None:
+        nonlocal binary_start_count
+        binary_start_count += 1
+
+    monkeypatch.setattr(runtime, "_run_checked", unexpected_run)
+
+    with pytest.raises(RuntimeExecutionError) as error:
+        runtime.track(
+            TrackingRequest(
+                job_ref="job_" + "4" * 32,
+                run_ref="run_" + "4" * 32,
+                attempt=1,
+                staging_root=staging,
+                targets=(target,),
+                attestation_targets=(target,),
+                expected_runtime_manifest_sha256=hashlib.sha256(
+                    config.manifest_path.read_bytes(),
+                ).hexdigest(),
+                expected_prepared_artifact_tree_sha256=expected_prepared,
+            ),
+        )
+
+    assert error.value.code == "tracking_yaml_changed"
+    assert binary_start_count == 0
+
+
+@pytest.mark.parametrize(
+    "tamper_kind",
+    ["compatibility_yaml", "binary", "model"],
+)
+def test_tracking_rechecks_frozen_inputs_before_binary_execution(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    tamper_kind: str,
+) -> None:
+    config = _config(tmp_path)
+    assert config.work_root is not None
+    assert config.runtime_source_root is not None
+    runtime = NavigationTrackingRuntime(config)
+    assert runtime.capabilities().available is True
+    monkeypatch.setattr(runtime, "_require_available", lambda: None)
+    staging = (
+        config.work_root
+        / "jobs"
+        / ("job_" + "6" * 32)
+        / "20270605_temp"
+    )
+    segment = staging / "samples" / "20270605" / "segment_0"
+    segment.mkdir(parents=True)
+    yaml_path = segment / "master_green_gray_white.yaml"
+    yaml_path.write_text("{}\n", encoding="utf-8")
+    target = _tracking_target(
+        segment,
+        yaml_path,
+        "master_green_gray_white",
+    )
+    binary_start_count = 0
+
+    if tamper_kind == "compatibility_yaml":
+        source = (
+            config.runtime_source_root / "Data" / "3_param" / "ost.yaml"
+        )
+        replacement_path = source.with_name("ost.replacement")
+        replacement_path.write_text("changed\n", encoding="utf-8")
+        os.replace(replacement_path, source)
+    elif tamper_kind == "binary":
+        source = config.runtime_source_root / "1_onnx_tam/bin/main"
+        replacement_path = source.with_name("main.replacement")
+        replacement_path.write_bytes(b"changed binary")
+        replacement_path.chmod(0o755)
+        os.replace(replacement_path, source)
+    else:
+        source = (
+            config.runtime_source_root
+            / "1_onnx_tam"
+            / "models"
+            / "etam"
+            / "image_encoder.onnx"
+        )
+        replacement_path = source.with_name("image_encoder.replacement")
+        replacement_path.write_bytes(b"changed model")
+        os.replace(replacement_path, source)
+    assert source.is_file()
+    assert source.is_symlink() is False
+
+    def unexpected_run(**_kwargs) -> None:
+        nonlocal binary_start_count
+        binary_start_count += 1
+
+    monkeypatch.setattr(runtime, "_run_checked", unexpected_run)
+
+    with pytest.raises(RuntimeExecutionError) as error:
+        runtime.track(
+            TrackingRequest(
+                job_ref="job_" + "6" * 32,
+                run_ref="run_" + "7" * 32,
+                attempt=1,
+                staging_root=staging,
+                targets=(target,),
+                attestation_targets=(target,),
+                expected_runtime_manifest_sha256=hashlib.sha256(
+                    config.manifest_path.read_bytes(),
+                ).hexdigest(),
+                expected_prepared_artifact_tree_sha256=(
+                    runtime_module.prepared_staging_artifact_sha256(
+                        staging,
+                        (target,),
+                    )
+                ),
+            ),
+        )
+
+    assert error.value.code == "runtime_input_changed"
+    assert binary_start_count == 0
+
+
+def test_tracking_rechecks_active_payload_after_binary_returns(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = _config(tmp_path)
+    runtime = NavigationTrackingRuntime(config)
+    monkeypatch.setattr(runtime, "_require_available", lambda: None)
+    assert config.runtime_source_root is not None
+    staging = (
+        config.work_root
+        / "jobs"
+        / ("job_" + "3" * 32)
+        / "20270605_temp"
+    )  # type: ignore[operator]
+    segment = staging / "samples" / "20270605" / "segment_0"
+    segment.mkdir(parents=True)
+    (staging / ".runtime").mkdir()
+    yaml_path = segment / "master_green_gray_white.yaml"
+    yaml_path.write_text("{}\n", encoding="utf-8")
+    target = _tracking_target(
+        segment,
+        yaml_path,
+        "master_green_gray_white",
+    )
+    expected_prepared = runtime_module.prepared_staging_artifact_sha256(
+        staging,
+        (target,),
+    )
+    model = (
+        config.runtime_source_root
+        / "1_onnx_tam"
+        / "models"
+        / "etam"
+        / "memory_encoder.onnx"
+    )
+
+    def replace_model_after_run(**kwargs) -> None:
+        private_data = kwargs["writable_bindings"][0][0]
+        output = private_data / "1_img_output"
+        (output / "tracking_img" / "000001.png").write_bytes(_png())
+        (output / "img_points.txt").write_text("1 2\n", encoding="utf-8")
+        model.write_bytes(b"replaced during Tracking")
+
+    monkeypatch.setattr(runtime, "_run_checked", replace_model_after_run)
+
+    with pytest.raises(RuntimeExecutionError) as error:
+        runtime.track(
+            TrackingRequest(
+                job_ref="job_" + "3" * 32,
+                run_ref="run_" + "2" * 32,
+                attempt=1,
+                staging_root=staging,
+                targets=(target,),
+                attestation_targets=(target,),
+                expected_runtime_manifest_sha256=hashlib.sha256(
+                    config.manifest_path.read_bytes(),
+                ).hexdigest(),
+                expected_prepared_artifact_tree_sha256=expected_prepared,
+            ),
+        )
+
+    assert error.value.code == "runtime_input_changed"
+    assert not (
+        segment / "tracking_img_master_green_gray_white"
+    ).exists()
 
 
 def _tracking_validation_request(
@@ -1323,10 +2463,10 @@ def test_tracking_revalidates_prepare_tree_before_yaml_and_allows_retry_outputs(
     segment.mkdir(parents=True)
     (staging / ".runtime").mkdir()
     (segment / "000001.png").write_bytes(_png())
-    target = TrackingTarget(
-        segment_root=segment,
-        yaml_path=segment / "master_green_gray_white.yaml",
-        identity="master_green_gray_white",
+    target = _tracking_target(
+        segment,
+        segment / "master_green_gray_white.yaml",
+        "master_green_gray_white",
     )
     request = _tracking_validation_request(config, staging, target)
 
@@ -1375,10 +2515,10 @@ def test_tracking_rejects_prepare_tree_tampering_before_yaml(
     segment.mkdir(parents=True)
     baseline = segment / "000001.png"
     baseline.write_bytes(_png())
-    target = TrackingTarget(
-        segment_root=segment,
-        yaml_path=segment / "master_green_gray_white.yaml",
-        identity="master_green_gray_white",
+    target = _tracking_target(
+        segment,
+        segment / "master_green_gray_white.yaml",
+        "master_green_gray_white",
     )
     request = _tracking_validation_request(config, staging, target)
 
@@ -1413,10 +2553,10 @@ def test_tracking_rejects_runtime_manifest_switch_after_prepare(
     segment = staging / "samples" / "20270605" / "segment_0"
     segment.mkdir(parents=True)
     (segment / "000001.png").write_bytes(_png())
-    target = TrackingTarget(
-        segment_root=segment,
-        yaml_path=segment / "master_green_gray_white.yaml",
-        identity="master_green_gray_white",
+    target = _tracking_target(
+        segment,
+        segment / "master_green_gray_white.yaml",
+        "master_green_gray_white",
     )
     request = _tracking_validation_request(config, staging, target)
 
@@ -1427,6 +2567,47 @@ def test_tracking_rejects_runtime_manifest_switch_after_prepare(
     )
     with pytest.raises(RuntimeExecutionError) as error:
         runtime.validate_tracking_inputs(request)
+    assert error.value.code == "runtime_manifest_changed"
+
+
+def test_tracking_required_entries_are_bound_to_one_stable_manifest_snapshot(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = _config(tmp_path)
+    runtime = NavigationTrackingRuntime(config)
+    original = config.manifest_path.read_bytes()
+    expected = hashlib.sha256(original).hexdigest()
+    swapped_document = json.loads(original)
+    swapped_document["entries"][0]["stage"] = "tracking"
+    swapped = json.dumps(swapped_document).encode("utf-8")
+    real_read = runtime_module._read_stable_regular_bytes
+
+    def swapped_read(path: Path) -> bytes:
+        if path == config.manifest_path:
+            return swapped
+        return real_read(path)
+
+    monkeypatch.setattr(
+        runtime_module,
+        "_read_stable_regular_bytes",
+        swapped_read,
+    )
+
+    with pytest.raises(RuntimeExecutionError) as error:
+        runtime._current_required_frozen_entries(expected)
+
+    assert error.value.code == "runtime_manifest_changed"
+
+
+def test_tracking_required_entries_reject_wrong_expected_manifest_hash(
+    tmp_path: Path,
+) -> None:
+    runtime = NavigationTrackingRuntime(_config(tmp_path))
+
+    with pytest.raises(RuntimeExecutionError) as error:
+        runtime._current_required_frozen_entries("0" * 64)
+
     assert error.value.code == "runtime_manifest_changed"
 
 
@@ -1450,6 +2631,7 @@ def test_tracking_executes_legacy_lexical_segment_and_yaml_order(
         for index in (1, 0)
     ]
     targets: list[TrackingTarget] = []
+    (staging / ".runtime").mkdir(parents=True)
     for segment in segments:
         segment.mkdir(parents=True)
         for identity in [
@@ -1465,10 +2647,10 @@ def test_tracking_executes_legacy_lexical_segment_and_yaml_order(
                 encoding="utf-8",
             )
             targets.append(
-                TrackingTarget(
-                    segment_root=segment,
-                    yaml_path=yaml_path,
-                    identity=identity,
+                _tracking_target(
+                    segment,
+                    yaml_path,
+                    identity,
                 ),
             )
     reversed_targets = tuple(reversed(targets))
@@ -1493,10 +2675,16 @@ def test_tracking_executes_legacy_lexical_segment_and_yaml_order(
             attempt=1,
             staging_root=staging,
             targets=reversed_targets,
+            attestation_targets=reversed_targets,
             expected_runtime_manifest_sha256=hashlib.sha256(
                 config.manifest_path.read_bytes(),
             ).hexdigest(),
-            expected_prepared_artifact_tree_sha256="d" * 64,
+            expected_prepared_artifact_tree_sha256=(
+                runtime_module.prepared_staging_artifact_sha256(
+                    staging,
+                    reversed_targets,
+                )
+            ),
         ),
     )
 
@@ -1533,8 +2721,14 @@ def test_tracking_rechecks_capacity_immediately_before_creating_scratch(
     )  # type: ignore[operator]
     segment = staging / "samples" / "20270605" / "segment_0"
     segment.mkdir(parents=True)
+    (staging / ".runtime").mkdir()
     yaml_path = segment / "master_green_gray_white.yaml"
     yaml_path.write_text("{}\n", encoding="utf-8")
+    target = _tracking_target(
+        segment,
+        yaml_path,
+        "master_green_gray_white",
+    )
     monkeypatch.setattr(
         "vla_data_juicer_agents.annotation.runtime.shutil.disk_usage",
         lambda _path: shutil._ntuple_diskusage(100, 100, 0),
@@ -1547,13 +2741,8 @@ def test_tracking_rechecks_capacity_immediately_before_creating_scratch(
                 run_ref="run_" + "7" * 32,
                 attempt=1,
                 staging_root=staging,
-                targets=(
-                    TrackingTarget(
-                        segment_root=segment,
-                        yaml_path=yaml_path,
-                        identity="master_green_gray_white",
-                    ),
-                ),
+                targets=(target,),
+                attestation_targets=(target,),
                 expected_runtime_manifest_sha256=hashlib.sha256(
                     config.manifest_path.read_bytes(),
                 ).hexdigest(),
@@ -1566,9 +2755,11 @@ def test_tracking_rechecks_capacity_immediately_before_creating_scratch(
     assert not (staging / ".runtime" / "runs").exists()
 
 
-def test_tracking_move_interruption_requires_manual_recovery(
+@pytest.mark.parametrize("failure_point", ("second_move", "harden"))
+def test_tracking_publication_finalization_requires_manual_recovery(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    failure_point: str,
 ) -> None:
     config = _config(tmp_path)
     runtime = NavigationTrackingRuntime(config)
@@ -1576,8 +2767,14 @@ def test_tracking_move_interruption_requires_manual_recovery(
     staging = config.work_root / "jobs" / ("job_" + "1" * 32) / "20270605_temp"  # type: ignore[operator]
     segment = staging / "samples" / "20270605" / "segment_0"
     segment.mkdir(parents=True)
+    (staging / ".runtime").mkdir()
     yaml_path = segment / "master_green_gray_white.yaml"
     yaml_path.write_text("{}\n", encoding="utf-8")
+    target = _tracking_target(
+        segment,
+        yaml_path,
+        "master_green_gray_white",
+    )
     run_ref = "run_" + "a" * 32
 
     def fake_run_checked(**_kwargs) -> None:
@@ -1603,10 +2800,19 @@ def test_tracking_move_interruption_requires_manual_recovery(
             raise OSError("simulated publication interruption")
         return original_move(source, target)
 
-    monkeypatch.setattr(
-        "vla_data_juicer_agents.annotation.runtime.shutil.move",
-        interrupted_move,
-    )
+    if failure_point == "second_move":
+        monkeypatch.setattr(
+            "vla_data_juicer_agents.annotation.runtime.shutil.move",
+            interrupted_move,
+        )
+    else:
+        monkeypatch.setattr(
+            runtime_module,
+            "_harden_private_tree",
+            lambda _path: (_ for _ in ()).throw(
+                OSError("simulated publication hardening failure"),
+            ),
+        )
     with pytest.raises(RuntimeExecutionError) as error:
         runtime.track(
             TrackingRequest(
@@ -1614,22 +2820,25 @@ def test_tracking_move_interruption_requires_manual_recovery(
                 run_ref=run_ref,
                 attempt=1,
                 staging_root=staging,
-                targets=(
-                    TrackingTarget(
-                        segment_root=segment,
-                        yaml_path=yaml_path,
-                        identity="master_green_gray_white",
-                    ),
-                ),
+                targets=(target,),
+                attestation_targets=(target,),
                 expected_runtime_manifest_sha256=hashlib.sha256(
                     config.manifest_path.read_bytes(),
                 ).hexdigest(),
-                expected_prepared_artifact_tree_sha256="d" * 64,
+                expected_prepared_artifact_tree_sha256=(
+                    runtime_module.prepared_staging_artifact_sha256(
+                        staging,
+                        (target,),
+                    )
+                ),
             ),
         )
     assert error.value.code == "recovery_required"
     assert (segment / "tracking_img_master_green_gray_white").is_dir()
-    assert not (segment / "img_master_green_gray_white.txt").exists()
+    assert (
+        (segment / "img_master_green_gray_white.txt").exists()
+        is (failure_point == "harden")
+    )
 
 
 def test_runtime_driver_cancel_reaches_bound_cancellation_context(

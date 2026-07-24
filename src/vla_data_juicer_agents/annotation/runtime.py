@@ -7,6 +7,7 @@ Tracking algorithm.
 
 from __future__ import annotations
 
+import ast
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 import hashlib
@@ -27,12 +28,17 @@ from vla_data_juicer_agents.core.cancellation import (
     bind_cancellation,
     current_cancellation,
 )
+from vla_data_juicer_agents.annotation.legacy_yaml import (
+    DEFAULT_EXTRINSICS_PATH,
+    DEFAULT_INTRINSICS_PATH,
+)
 from vla_data_juicer_agents.navigation.golden.image_headers import (
     ImageHeaderError,
     image_dimensions,
 )
 from vla_data_juicer_agents.navigation.runtime_manifest import (
     load_manifest,
+    validate_manifest,
     verify_root,
 )
 from vla_data_juicer_agents.navigation.subprocess_runner import run_command
@@ -66,6 +72,177 @@ _IDENTITY_RE = re.compile(
 )
 _REQUIRED_SENSOR_FILES = ("fisheye_front.json", "r32_rslidar_points.json")
 _FIRST_FRAME_SUFFIXES = frozenset({".jpg", ".png"})
+_RUNTIME_SOURCE_ALIAS = "NAVIGATION_ODOM_V1_SOURCE"
+_PREPARATION_ACTIVE_FROZEN_PATHS = (
+    "NoobScenes/include/0_creat_box.py",
+    "NoobScenes/include/1_odom_convert.py",
+    "NoobScenes/include/2_resize.py",
+    "NoobScenes/main_smart_odom.py",
+    "NoobScenes/include/__init__.py",
+    "NoobScenes/include/attribute.py",
+    "NoobScenes/include/calibrated_sensor.py",
+    "NoobScenes/include/category.py",
+    "NoobScenes/include/dataset.py",
+    "NoobScenes/include/ego_pose.py",
+    "NoobScenes/include/instance.py",
+    "NoobScenes/include/lidarseg.py",
+    "NoobScenes/include/log.py",
+    "NoobScenes/include/map.py",
+    "NoobScenes/include/sample.py",
+    "NoobScenes/include/sample_annotation.py",
+    "NoobScenes/include/sample_data.py",
+    "NoobScenes/include/scene.py",
+    "NoobScenes/include/sensor.py",
+    "NoobScenes/include/utils.py",
+    "NoobScenes/include/visibility.py",
+    "NoobScenes/maps/map.png",
+    "0_1th_box/img2video.py",
+)
+_TRACKING_ACTIVE_FROZEN_PATHS = (
+    "1_onnx_tam/bin/main",
+    "1_onnx_tam/models/etam/image_encoder.onnx",
+    "1_onnx_tam/models/etam/memory_attention.onnx",
+    "1_onnx_tam/models/etam/image_decoder.onnx",
+    "1_onnx_tam/models/etam/memory_encoder.onnx",
+    "Data/3_param/camera_extrinsics.yaml",
+    "Data/3_param/ost.yaml",
+)
+_REQUIRED_RUNTIME_SOURCE_DIRECTORIES = (
+    "NoobScenes/samples",
+    "NoobScenes/v1.0-develop",
+    "Data",
+)
+_REQUIRED_FROZEN_ENTRY_METADATA = {
+    "NoobScenes/include/0_creat_box.py": (
+        "active_runtime",
+        "preprocess",
+    ),
+    "NoobScenes/include/1_odom_convert.py": (
+        "active_runtime",
+        "preprocess",
+    ),
+    "NoobScenes/include/2_resize.py": (
+        "active_runtime",
+        "preprocess",
+    ),
+    "NoobScenes/main_smart_odom.py": (
+        "active_runtime",
+        "metadata",
+    ),
+    "NoobScenes/include/__init__.py": (
+        "active_runtime",
+        "metadata",
+    ),
+    "NoobScenes/include/attribute.py": (
+        "active_runtime",
+        "metadata",
+    ),
+    "NoobScenes/include/calibrated_sensor.py": (
+        "active_runtime",
+        "metadata",
+    ),
+    "NoobScenes/include/category.py": (
+        "active_runtime",
+        "metadata",
+    ),
+    "NoobScenes/include/dataset.py": (
+        "active_runtime",
+        "metadata",
+    ),
+    "NoobScenes/include/ego_pose.py": (
+        "active_runtime",
+        "metadata",
+    ),
+    "NoobScenes/include/instance.py": (
+        "active_runtime",
+        "metadata",
+    ),
+    "NoobScenes/include/lidarseg.py": (
+        "active_runtime",
+        "metadata",
+    ),
+    "NoobScenes/include/log.py": (
+        "active_runtime",
+        "metadata",
+    ),
+    "NoobScenes/include/map.py": (
+        "active_runtime",
+        "metadata",
+    ),
+    "NoobScenes/include/sample.py": (
+        "active_runtime",
+        "metadata",
+    ),
+    "NoobScenes/include/sample_annotation.py": (
+        "active_runtime",
+        "metadata",
+    ),
+    "NoobScenes/include/sample_data.py": (
+        "active_runtime",
+        "metadata",
+    ),
+    "NoobScenes/include/scene.py": (
+        "active_runtime",
+        "metadata",
+    ),
+    "NoobScenes/include/sensor.py": (
+        "active_runtime",
+        "metadata",
+    ),
+    "NoobScenes/include/utils.py": (
+        "active_runtime",
+        "metadata",
+    ),
+    "NoobScenes/include/visibility.py": (
+        "active_runtime",
+        "metadata",
+    ),
+    "NoobScenes/maps/map.png": (
+        "active_static_asset",
+        "metadata",
+    ),
+    "0_1th_box/img2video.py": (
+        "active_runtime",
+        "initial_annotation",
+    ),
+    "Data/3_param/camera_extrinsics.yaml": (
+        "tracking_compatibility_config",
+        "tracking",
+    ),
+    "Data/3_param/ost.yaml": (
+        "tracking_compatibility_config",
+        "tracking",
+    ),
+    "1_onnx_tam/bin/main": ("active_binary", "tracking"),
+    "1_onnx_tam/models/etam/image_encoder.onnx": (
+        "active_model",
+        "tracking",
+    ),
+    "1_onnx_tam/models/etam/memory_attention.onnx": (
+        "active_model",
+        "tracking",
+    ),
+    "1_onnx_tam/models/etam/image_decoder.onnx": (
+        "active_model",
+        "tracking",
+    ),
+    "1_onnx_tam/models/etam/memory_encoder.onnx": (
+        "active_model",
+        "tracking",
+    ),
+}
+_TRACKING_BINARY_EMBEDDED_SUFFIXES = (
+    "/Data/3_param/dog.yaml",
+    "/Data/1_img_output/img_points.txt",
+    "/Data/1_img_output/tracking_img/",
+)
+_PRINTABLE_C_STRING_RE = re.compile(rb"[\x20-\x7e]{4,}")
+_LEGACY_YAML_DATA_ROOTS = frozenset(
+    {
+        Path(DEFAULT_INTRINSICS_PATH).parent.parent,
+        Path(DEFAULT_EXTRINSICS_PATH).parent.parent,
+    },
+)
 
 
 class RuntimeUnavailableError(RuntimeError):
@@ -231,14 +408,13 @@ class NavigationAnnotationRuntimeConfig:
     runtime_dependency_summary_path: Path | None = None
     dpkg_query_path: Path = Path("/usr/bin/dpkg-query")
     expected_xvfb_version: str = EXPECTED_XVFB_VERSION
-    legacy_tracking_data_root: Path = Path(
-        "/mnt/data1/gh/tracking_1/Data",
-    )
+    tracking_binary_data_root: Path | None = None
+    legacy_tracking_data_root: Path | None = None
     legacy_clip_data_root: Path = Path(
         "/media/heying/hy_data1/VLADatasets/clip_data",
     )
     writer_lock_path: Path | None = None
-    minimum_free_bytes: int = 10 * 1024**3
+    minimum_free_bytes: int | None = None
     timeout_seconds: int | None = None
     version_probe: Callable[[str], str] | None = field(
         default=None,
@@ -255,6 +431,11 @@ class NavigationAnnotationRuntimeConfig:
         repr=False,
         compare=False,
     )
+    overlay_target_probe: Callable[[Path], bool] | None = field(
+        default=None,
+        repr=False,
+        compare=False,
+    )
 
     @classmethod
     def from_env(cls) -> "NavigationAnnotationRuntimeConfig":
@@ -266,6 +447,14 @@ class NavigationAnnotationRuntimeConfig:
 
         vla_root = optional_path("VLA_VLADATASETS_ROOT")
         free_bytes = os.getenv("VLA_ANNOTATION_MINIMUM_FREE_BYTES")
+        minimum_free_bytes = (
+            int(free_bytes)
+            if free_bytes is not None
+            and free_bytes.isascii()
+            and free_bytes.isdigit()
+            and int(free_bytes) > 0
+            else None
+        )
         timeout_value = os.getenv(
             "VLA_ANNOTATION_RUNTIME_TIMEOUT_SECONDS",
         )
@@ -308,11 +497,11 @@ class NavigationAnnotationRuntimeConfig:
             dpkg_query_path=Path(
                 os.getenv("VLA_DPKG_QUERY", "/usr/bin/dpkg-query"),
             ),
-            legacy_tracking_data_root=Path(
-                os.getenv(
-                    "VLA_TRACKING_LEGACY_DATA_ROOT",
-                    "/mnt/data1/gh/tracking_1/Data",
-                ),
+            tracking_binary_data_root=optional_path(
+                "VLA_TRACKING_BINARY_DATA_ROOT",
+            ),
+            legacy_tracking_data_root=optional_path(
+                "VLA_TRACKING_LEGACY_DATA_ROOT",
             ),
             legacy_clip_data_root=Path(
                 os.getenv(
@@ -323,9 +512,7 @@ class NavigationAnnotationRuntimeConfig:
             writer_lock_path=optional_path(
                 "VLA_NAVIGATION_WRITER_LOCK_PATH",
             ),
-            minimum_free_bytes=(
-                int(free_bytes) if free_bytes is not None else 10 * 1024**3
-            ),
+            minimum_free_bytes=minimum_free_bytes,
             timeout_seconds=timeout_seconds,
         )
 
@@ -385,6 +572,7 @@ class TrackingTarget:
     segment_root: Path
     yaml_path: Path
     identity: str
+    expected_yaml_sha256: str
 
 
 @dataclass(frozen=True)
@@ -409,6 +597,7 @@ class TrackingRequest:
     attempt: int
     staging_root: Path
     targets: tuple[TrackingTarget, ...]
+    attestation_targets: tuple[TrackingTarget, ...]
     expected_runtime_manifest_sha256: str
     expected_prepared_artifact_tree_sha256: str
     estimated_input_bytes: int = 0
@@ -510,10 +699,14 @@ def prepared_staging_artifact_sha256(
         if (
             not _IDENTITY_RE.fullmatch(target.identity)
             or target.yaml_path.name != f"{target.identity}.yaml"
+            or not re.fullmatch(
+                r"^[0-9a-f]{64}$",
+                target.expected_yaml_sha256,
+            )
         ):
             raise RuntimeExecutionError(
                 "invalid_runtime_request",
-                "A Tracking target identity is invalid.",
+                "A Tracking target identity or YAML hash is invalid.",
             )
         identity_key = (segment_relative, target.identity)
         if identity_key in identities:
@@ -596,6 +789,233 @@ def _sha256_file(path: Path) -> str:
     return digest.hexdigest()
 
 
+def _read_stable_regular_bytes(path: Path) -> bytes:
+    flags = os.O_RDONLY
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    descriptor = os.open(path, flags)
+    try:
+        opened = os.fstat(descriptor)
+        if not stat.S_ISREG(opened.st_mode):
+            raise OSError("read target is not a regular file")
+        chunks: list[bytes] = []
+        with os.fdopen(descriptor, "rb", closefd=False) as stream:
+            while chunk := stream.read(1024 * 1024):
+                chunks.append(chunk)
+        finished = os.fstat(descriptor)
+        current = path.stat(follow_symlinks=False)
+        if not _same_entry(opened, finished) or not _same_entry(
+            opened,
+            current,
+        ):
+            raise OSError("read target changed while reading")
+    finally:
+        os.close(descriptor)
+    return b"".join(chunks)
+
+
+def _required_frozen_entries(
+    manifest: dict[str, object],
+) -> dict[str, dict[str, object]] | None:
+    entries = manifest.get("entries")
+    if not isinstance(entries, list):
+        return None
+    result: dict[str, dict[str, object]] = {}
+    for entry in entries:
+        if not isinstance(entry, dict):
+            continue
+        relative_path = entry.get("relative_path")
+        if relative_path not in _REQUIRED_FROZEN_ENTRY_METADATA:
+            continue
+        expected_role, expected_stage = _REQUIRED_FROZEN_ENTRY_METADATA[
+            relative_path
+        ]
+        if (
+            entry.get("root_alias") != _RUNTIME_SOURCE_ALIAS
+            or entry.get("kind") != "frozen_file"
+            or entry.get("role") != expected_role
+            or entry.get("stage") != expected_stage
+        ):
+            return None
+        result[relative_path] = entry
+    if set(result) != set(_REQUIRED_FROZEN_ENTRY_METADATA):
+        return None
+    return result
+
+
+def _manifest_object_without_duplicate_keys(
+    pairs: list[tuple[str, object]],
+) -> dict[str, object]:
+    result: dict[str, object] = {}
+    for key, value in pairs:
+        if key in result:
+            raise ValueError("duplicate Runtime manifest key")
+        result[key] = value
+    return result
+
+
+def _read_manifest_frozen_bytes(
+    runtime_source_root: Path,
+    entry: dict[str, object],
+) -> bytes:
+    relative_path = entry["relative_path"]
+    if not isinstance(relative_path, str):
+        raise OSError("manifest path is invalid")
+    path = runtime_source_root / relative_path
+    content = _read_stable_regular_bytes(path)
+    metadata = path.stat(follow_symlinks=False)
+    if (
+        len(content) != entry.get("size")
+        or hashlib.sha256(content).hexdigest() != entry.get("sha256")
+        or bool(metadata.st_mode & 0o111)
+        != bool(entry.get("executable"))
+    ):
+        raise OSError("frozen input differs from manifest")
+    return content
+
+
+def _tracking_binary_embedded_data_root(content: bytes) -> Path:
+    strings = tuple(
+        match.group().decode("ascii")
+        for match in _PRINTABLE_C_STRING_RE.finditer(content)
+    )
+    roots: list[PurePosixPath] = []
+    for suffix in _TRACKING_BINARY_EMBEDDED_SUFFIXES:
+        matches = [
+            value
+            for value in strings
+            if value.startswith("/") and value.endswith(suffix)
+        ]
+        if len(matches) != 1:
+            raise ValueError("Tracking binary path evidence is ambiguous")
+        normalized = matches[0].rstrip("/")
+        embedded_path = PurePosixPath(normalized)
+        if (
+            not embedded_path.is_absolute()
+            or str(embedded_path) != normalized
+        ):
+            raise ValueError("Tracking binary path evidence is unsafe")
+        data_root = embedded_path.parent.parent
+        if data_root.name != "Data":
+            raise ValueError("Tracking binary Data root is invalid")
+        roots.append(data_root)
+    if len(set(roots)) != 1:
+        raise ValueError("Tracking binary paths disagree on the Data root")
+    return Path(str(roots[0]))
+
+
+def _legacy_clip_data_root(content: bytes) -> Path:
+    try:
+        module = ast.parse(content.decode("utf-8"))
+    except (SyntaxError, UnicodeError) as exc:
+        raise ValueError("legacy clip path source cannot be parsed") from exc
+    values: list[str] = []
+    for statement in module.body:
+        if not isinstance(statement, (ast.Assign, ast.AnnAssign)):
+            continue
+        targets = (
+            statement.targets
+            if isinstance(statement, ast.Assign)
+            else [statement.target]
+        )
+        if not any(
+            isinstance(target, ast.Name) and target.id == "clip_data"
+            for target in targets
+        ):
+            continue
+        value = statement.value
+        if isinstance(value, ast.Constant) and isinstance(value.value, str):
+            values.append(value.value)
+        else:
+            raise ValueError("legacy clip path is not a string literal")
+    if len(values) != 1:
+        raise ValueError("legacy clip path evidence is ambiguous")
+    path = Path(values[0])
+    if not path.is_absolute() or str(path) != values[0]:
+        raise ValueError("legacy clip path evidence is unsafe")
+    return path
+
+
+def _legacy_yaml_data_root() -> Path:
+    if len(_LEGACY_YAML_DATA_ROOTS) != 1:
+        raise ValueError("legacy YAML paths disagree on the Data root")
+    root = next(iter(_LEGACY_YAML_DATA_ROOTS))
+    if not root.is_absolute() or root.name != "Data":
+        raise ValueError("legacy YAML Data root is invalid")
+    return root
+
+
+def _paths_overlap(left: Path, right: Path) -> bool:
+    return (
+        left == right
+        or left.is_relative_to(right)
+        or right.is_relative_to(left)
+    )
+
+
+def _active_payload_permissions_safe(
+    runtime_source_root: Path,
+    entries: dict[str, dict[str, object]],
+) -> bool:
+    """Require immutable-by-peer paths for every directly executed input."""
+
+    if not _safe_absolute_directory(runtime_source_root):
+        return False
+    try:
+        resolved_root = runtime_source_root.resolve(strict=True)
+        paths_to_check: set[Path] = {resolved_root}
+        for relative_directory in _REQUIRED_RUNTIME_SOURCE_DIRECTORIES:
+            current = resolved_root
+            for component in PurePosixPath(relative_directory).parts:
+                current = current / component
+                paths_to_check.add(current)
+        for relative_path in entries:
+            relative = PurePosixPath(relative_path)
+            if (
+                relative.is_absolute()
+                or not relative.parts
+                or any(part in {"", ".", ".."} for part in relative.parts)
+            ):
+                return False
+            current = resolved_root
+            for component in relative.parts[:-1]:
+                current = current / component
+                paths_to_check.add(current)
+            payload_file = resolved_root.joinpath(*relative.parts)
+            metadata = payload_file.lstat()
+            if (
+                stat.S_ISLNK(metadata.st_mode)
+                or not stat.S_ISREG(metadata.st_mode)
+                or bool(metadata.st_mode & 0o022)
+            ):
+                return False
+        for directory in paths_to_check:
+            metadata = directory.lstat()
+            if (
+                stat.S_ISLNK(metadata.st_mode)
+                or not stat.S_ISDIR(metadata.st_mode)
+                or bool(metadata.st_mode & 0o022)
+            ):
+                return False
+    except OSError:
+        return False
+    return True
+
+
+def _manifest_file_content_matches(
+    path: Path,
+    entry: dict[str, object],
+) -> bool:
+    try:
+        content = _read_stable_regular_bytes(path)
+    except OSError:
+        return False
+    return (
+        len(content) == entry.get("size")
+        and hashlib.sha256(content).hexdigest() == entry.get("sha256")
+    )
+
+
 def _tree_sha256(
     root: Path,
     *,
@@ -638,6 +1058,33 @@ def _regular_directory(path: Path) -> bool:
     except OSError:
         return False
     return stat.S_ISDIR(metadata.st_mode) and not stat.S_ISLNK(metadata.st_mode)
+
+
+def _safe_absolute_directory(path: Path) -> bool:
+    if not path.is_absolute() or not _regular_directory(path):
+        return False
+    try:
+        return path.resolve(strict=True) == path
+    except OSError:
+        return False
+
+
+def _safe_private_work_root(path: Path) -> bool:
+    if not path.is_absolute():
+        return False
+    try:
+        metadata = path.lstat()
+        canonical_path = path.resolve(strict=True)
+    except OSError:
+        return False
+    return (
+        stat.S_ISDIR(metadata.st_mode)
+        and not stat.S_ISLNK(metadata.st_mode)
+        and canonical_path == path
+        and metadata.st_uid == os.geteuid()
+        and stat.S_IMODE(metadata.st_mode) == 0o700
+        and os.access(path, os.W_OK | os.X_OK)
+    )
 
 
 def _regular_file(path: Path, *, executable: bool = False) -> bool:
@@ -1472,6 +1919,36 @@ def _write_bytes_exclusive(destination: Path, content: bytes) -> None:
         os.close(descriptor)
 
 
+def _write_or_reuse_manifest_file(
+    destination: Path,
+    content: bytes,
+    entry: dict[str, object],
+) -> None:
+    """Publish once, or reuse only the exact manifest-bound private bytes."""
+
+    if destination.exists() or destination.is_symlink():
+        if not _manifest_file_content_matches(destination, entry):
+            raise RuntimeExecutionError(
+                "runtime_input_changed",
+                "A private frozen Runtime input differs from its manifest.",
+            )
+        destination.chmod(0o600, follow_symlinks=False)
+        return
+    try:
+        _write_bytes_exclusive(destination, content)
+    except FileExistsError:
+        if not _manifest_file_content_matches(destination, entry):
+            raise RuntimeExecutionError(
+                "runtime_input_changed",
+                "A private frozen Runtime input differs from its manifest.",
+            )
+    if not _manifest_file_content_matches(destination, entry):
+        raise RuntimeExecutionError(
+            "runtime_input_changed",
+            "A private frozen Runtime input changed while being published.",
+        )
+
+
 def _discover_supported_sequences(
     *,
     config: NavigationAnnotationRuntimeConfig,
@@ -1555,6 +2032,99 @@ class _RuntimeBase:
     ) -> None:
         self.config = config or NavigationAnnotationRuntimeConfig.from_env()
 
+    def _current_runtime_manifest_sha256(self, expected: str) -> str:
+        if not re.fullmatch(r"^[0-9a-f]{64}$", expected):
+            raise RuntimeExecutionError(
+                "invalid_runtime_request",
+                "The expected Runtime manifest hash is invalid.",
+            )
+        try:
+            actual = _sha256_file(self.config.manifest_path)
+        except OSError as exc:
+            raise RuntimeExecutionError(
+                "runtime_manifest_changed",
+                "The frozen Runtime manifest cannot be safely re-read.",
+            ) from exc
+        if actual != expected:
+            raise RuntimeExecutionError(
+                "runtime_manifest_changed",
+                "The frozen Runtime changed after job preparation.",
+            )
+        return actual
+
+    def _current_required_frozen_entries(
+        self,
+        expected_manifest_sha256: str,
+    ) -> dict[str, dict[str, object]]:
+        if not re.fullmatch(
+            r"^[0-9a-f]{64}$",
+            expected_manifest_sha256,
+        ):
+            raise RuntimeExecutionError(
+                "invalid_runtime_request",
+                "The expected Runtime manifest hash is invalid.",
+            )
+        try:
+            content = _read_stable_regular_bytes(self.config.manifest_path)
+        except Exception as exc:
+            raise RuntimeExecutionError(
+                "runtime_manifest_changed",
+                "The frozen Runtime manifest cannot be safely re-read.",
+            ) from exc
+        if hashlib.sha256(content).hexdigest() != expected_manifest_sha256:
+            raise RuntimeExecutionError(
+                "runtime_manifest_changed",
+                "The frozen Runtime changed after job preparation.",
+            )
+        try:
+            document = json.loads(
+                content.decode("utf-8"),
+                object_pairs_hook=_manifest_object_without_duplicate_keys,
+            )
+            manifest = validate_manifest(document)
+        except Exception as exc:
+            raise RuntimeExecutionError(
+                "runtime_manifest_changed",
+                "The frozen Runtime manifest cannot be safely re-read.",
+            ) from exc
+        entries = _required_frozen_entries(manifest)
+        if manifest.get("runtime_id") != RUNTIME_ID or entries is None:
+            raise RuntimeExecutionError(
+                "runtime_manifest_changed",
+                "The frozen Runtime manifest no longer proves required inputs.",
+            )
+        return entries
+
+    def _revalidate_active_frozen_inputs(
+        self,
+        expected_manifest_sha256: str,
+        relative_paths: Sequence[str],
+    ) -> dict[str, dict[str, object]]:
+        entries = self._current_required_frozen_entries(
+            expected_manifest_sha256,
+        )
+        assert self.config.runtime_source_root is not None
+        if not _active_payload_permissions_safe(
+            self.config.runtime_source_root,
+            entries,
+        ):
+            raise RuntimeExecutionError(
+                "runtime_input_changed",
+                "The frozen Runtime payload is writable by an unsafe peer.",
+            )
+        try:
+            for relative_path in relative_paths:
+                _read_manifest_frozen_bytes(
+                    self.config.runtime_source_root,
+                    entries[relative_path],
+                )
+        except (KeyError, OSError) as exc:
+            raise RuntimeExecutionError(
+                "runtime_input_changed",
+                "A frozen Runtime input changed before execution.",
+            ) from exc
+        return entries
+
     def _version(self, package: str) -> str:
         if self.config.version_probe is not None:
             return self.config.version_probe(package).strip()
@@ -1628,6 +2198,16 @@ class _RuntimeBase:
             return False
         return result.returncode == 0 and bool(result.stdout.strip())
 
+    def _overlay_target_available(self, path: Path) -> bool:
+        if self.config.overlay_target_probe is not None:
+            return bool(self.config.overlay_target_probe(path))
+        return _safe_absolute_directory(path)
+
+    def _overlay_target_identity(self, path: Path) -> Path:
+        if self.config.overlay_target_probe is not None:
+            return path
+        return path.resolve(strict=True)
+
     @staticmethod
     def _external_file_matches(path: Path, entry: dict[str, object]) -> bool:
         if not _regular_file(
@@ -1658,6 +2238,8 @@ class _RuntimeBase:
             "clip data root": config.clip_data_root,
             "data Python": config.data_python,
             "data environment": config.data_env_setup,
+            "Tracking binary Data target": config.tracking_binary_data_root,
+            "Tracking YAML Data target": config.legacy_tracking_data_root,
         }
         if any(path is None for path in required_config.values()):
             return unavailable(
@@ -1669,6 +2251,8 @@ class _RuntimeBase:
         assert config.clip_data_root is not None
         assert config.data_python is not None
         assert config.data_env_setup is not None
+        assert config.tracking_binary_data_root is not None
+        assert config.legacy_tracking_data_root is not None
 
         if (
             config.timeout_seconds is None
@@ -1679,6 +2263,15 @@ class _RuntimeBase:
             return unavailable(
                 "runtime_timeout_not_configured",
                 "A positive annotation Runtime command timeout is required.",
+            )
+        if (
+            isinstance(config.minimum_free_bytes, bool)
+            or not isinstance(config.minimum_free_bytes, int)
+            or config.minimum_free_bytes <= 0
+        ):
+            return unavailable(
+                "runtime_capacity_margin_invalid",
+                "A positive annotation Runtime capacity margin is required.",
             )
         if config.writer_lock_path is None:
             return unavailable(
@@ -1704,10 +2297,7 @@ class _RuntimeBase:
                 "runtime_coordination_unavailable",
                 "Navigation writer coordination requires an operator safety check.",
             )
-        if not _regular_directory(config.work_root) or not os.access(
-            config.work_root,
-            os.W_OK | os.X_OK,
-        ):
+        if not _safe_private_work_root(config.work_root):
             return unavailable(
                 "work_root_unavailable",
                 "The dedicated annotation work root is unavailable.",
@@ -1716,6 +2306,34 @@ class _RuntimeBase:
             return unavailable(
                 "clip_data_unavailable",
                 "The synchronized data root is unavailable.",
+            )
+        if not _safe_absolute_directory(config.runtime_source_root):
+            return unavailable(
+                "runtime_source_unavailable",
+                "The frozen Runtime source root is unavailable or unsafe.",
+            )
+        try:
+            work_identity = config.work_root.resolve(strict=True)
+            clip_identity = config.clip_data_root.resolve(strict=True)
+            dataset_identity = config.clip_data_root.parent.resolve(strict=True)
+            source_identity = config.runtime_source_root.resolve(strict=True)
+        except OSError:
+            return unavailable(
+                "runtime_root_unavailable",
+                "A configured Runtime root cannot be safely resolved.",
+            )
+        if any(
+            _paths_overlap(work_identity, protected)
+            for protected in (
+                dataset_identity,
+                clip_identity,
+                source_identity,
+            )
+        ):
+            return unavailable(
+                "work_root_conflict",
+                "The dedicated annotation work root overlaps protected data "
+                "or Runtime source.",
             )
         if not _regular_file(config.data_python, executable=True):
             return unavailable(
@@ -1734,9 +2352,15 @@ class _RuntimeBase:
                     "runtime_manifest_mismatch",
                     "The configured manifest has the wrong runtime identity.",
                 )
+            required_frozen_entries = _required_frozen_entries(manifest)
+            if required_frozen_entries is None:
+                return unavailable(
+                    "runtime_manifest_incomplete",
+                    "The frozen Runtime manifest lacks required Runtime inputs.",
+                )
             mismatches, runtime_errors = verify_root(
                 manifest,
-                root_alias="NAVIGATION_ODOM_V1_SOURCE",
+                root_alias=_RUNTIME_SOURCE_ALIAS,
                 root=config.runtime_source_root,
             )
         except Exception:
@@ -1748,6 +2372,37 @@ class _RuntimeBase:
             return unavailable(
                 "runtime_payload_mismatch",
                 "The deployed Runtime payload does not match its manifest.",
+            )
+        if not _active_payload_permissions_safe(
+            config.runtime_source_root,
+            required_frozen_entries,
+        ):
+            return unavailable(
+                "runtime_payload_permissions_unsafe",
+                "The deployed Runtime payload is writable by an unsafe peer.",
+            )
+        try:
+            embedded_binary_data_root = (
+                _tracking_binary_embedded_data_root(
+                    _read_manifest_frozen_bytes(
+                        config.runtime_source_root,
+                        required_frozen_entries["1_onnx_tam/bin/main"],
+                    ),
+                )
+            )
+            embedded_legacy_clip_data_root = _legacy_clip_data_root(
+                _read_manifest_frozen_bytes(
+                    config.runtime_source_root,
+                    required_frozen_entries[
+                        "NoobScenes/include/1_odom_convert.py"
+                    ],
+                ),
+            )
+            legacy_yaml_data_root = _legacy_yaml_data_root()
+        except (OSError, ValueError):
+            return unavailable(
+                "runtime_payload_mismatch",
+                "The deployed Runtime payload cannot prove its sandbox targets.",
             )
         external_by_role = {
             str(entry["role"]): entry
@@ -1856,18 +2511,77 @@ class _RuntimeBase:
                 "gpu_runtime_unavailable",
                 "The Tracking GPU runtime is unavailable.",
             )
+        overlay_targets = (
+            config.tracking_binary_data_root,
+            config.legacy_tracking_data_root,
+        )
+        if any(
+            not self._overlay_target_available(path)
+            for path in overlay_targets
+        ):
+            return unavailable(
+                "sandbox_target_unavailable",
+                "A required sandbox overlay target is unavailable.",
+            )
+        overlay_identities = tuple(
+            self._overlay_target_identity(path)
+            for path in overlay_targets
+        )
+        if _paths_overlap(*overlay_identities):
+            return unavailable(
+                "sandbox_target_conflict",
+                "Tracking sandbox compatibility targets must not overlap.",
+            )
+        try:
+            protected_roots = tuple(
+                path.resolve(strict=True)
+                for path in (
+                    config.work_root,
+                    config.clip_data_root,
+                    config.runtime_source_root,
+                    config.legacy_clip_data_root,
+                )
+            )
+        except OSError:
+            return unavailable(
+                "sandbox_target_unavailable",
+                "A protected Runtime root is unavailable.",
+            )
+        if any(
+            _paths_overlap(target, protected)
+            for target in overlay_identities
+            for protected in protected_roots
+        ):
+            return unavailable(
+                "sandbox_target_conflict",
+                "A Tracking sandbox target overlaps a protected Runtime root.",
+            )
+        if (
+            config.tracking_binary_data_root
+            != embedded_binary_data_root
+            or config.legacy_tracking_data_root != legacy_yaml_data_root
+            or config.legacy_clip_data_root
+            != embedded_legacy_clip_data_root
+        ):
+            return unavailable(
+                "sandbox_target_mismatch",
+                "A sandbox target does not match frozen Runtime evidence.",
+            )
         for required_directory in (
             config.runtime_source_root / "NoobScenes" / "samples",
             config.runtime_source_root / "NoobScenes" / "v1.0-develop",
             config.runtime_source_root / "Data",
-            config.legacy_tracking_data_root,
-            config.legacy_clip_data_root,
         ):
             if not _regular_directory(required_directory):
                 return unavailable(
                     "sandbox_target_unavailable",
                     "A required sandbox overlay target is unavailable.",
                 )
+        if not self._overlay_target_available(config.legacy_clip_data_root):
+            return unavailable(
+                "sandbox_target_unavailable",
+                "A required sandbox overlay target is unavailable.",
+            )
         return RuntimeCapabilities(available=True)
 
     def _require_available(self) -> None:
@@ -2036,6 +2750,9 @@ class NavigationAnnotationRuntimeAdapter(_RuntimeBase):
         self._require_available()
         config = self.config
         assert config.work_root is not None
+        assert isinstance(config.minimum_free_bytes, int)
+        assert not isinstance(config.minimum_free_bytes, bool)
+        assert config.minimum_free_bytes > 0
         _safe_component(dataset_date, label="dataset_date", pattern=_DATE_RE)
         if (
             not source_clips
@@ -2075,6 +2792,9 @@ class NavigationAnnotationRuntimeAdapter(_RuntimeBase):
         assert config.work_root is not None
         assert config.clip_data_root is not None
         assert config.data_python is not None
+        assert isinstance(config.minimum_free_bytes, int)
+        assert not isinstance(config.minimum_free_bytes, bool)
+        assert config.minimum_free_bytes > 0
         _safe_component(request.job_ref, label="job_ref", pattern=_OPAQUE_REF_RE)
         _safe_component(request.run_ref, label="run_ref", pattern=_OPAQUE_REF_RE)
         if request.attempt < 1:
@@ -2104,6 +2824,17 @@ class NavigationAnnotationRuntimeAdapter(_RuntimeBase):
                 "invalid_runtime_request",
                 "Active capacity reservation cannot be negative.",
             )
+        try:
+            runtime_manifest_sha256 = _sha256_file(config.manifest_path)
+        except OSError as exc:
+            raise RuntimeExecutionError(
+                "runtime_manifest_changed",
+                "The frozen Runtime manifest cannot be safely re-read.",
+            ) from exc
+        self._revalidate_active_frozen_inputs(
+            runtime_manifest_sha256,
+            _PREPARATION_ACTIVE_FROZEN_PATHS,
+        )
 
         staging_root = (
             config.work_root
@@ -2338,6 +3069,10 @@ class NavigationAnnotationRuntimeAdapter(_RuntimeBase):
                     safe_step_code,
                     "started",
                 )
+                self._revalidate_active_frozen_inputs(
+                    runtime_manifest_sha256,
+                    _PREPARATION_ACTIVE_FROZEN_PATHS,
+                )
                 self._run_checked(
                     staging_root=staging_root,
                     argv=argv,
@@ -2354,6 +3089,10 @@ class NavigationAnnotationRuntimeAdapter(_RuntimeBase):
                         else ()
                     ),
                     error_code=error_code,
+                )
+                self._revalidate_active_frozen_inputs(
+                    runtime_manifest_sha256,
+                    _PREPARATION_ACTIVE_FROZEN_PATHS,
                 )
                 if safe_step_code != "metadata_generate":
                     _notify_runtime_step(
@@ -2394,9 +3133,17 @@ class NavigationAnnotationRuntimeAdapter(_RuntimeBase):
                 staging_root,
                 ("maps",),
             )
+            self._revalidate_active_frozen_inputs(
+                runtime_manifest_sha256,
+                _PREPARATION_ACTIVE_FROZEN_PATHS,
+            )
             _copy_file_bytes(
                 noobscene_root / "maps" / "map.png",
                 maps_root / "map.png",
+            )
+            self._revalidate_active_frozen_inputs(
+                runtime_manifest_sha256,
+                _PREPARATION_ACTIVE_FROZEN_PATHS,
             )
             _notify_runtime_step(
                 request.step_observer,
@@ -2408,6 +3155,10 @@ class NavigationAnnotationRuntimeAdapter(_RuntimeBase):
                 request.step_observer,
                 "video_prepare",
                 "started",
+            )
+            self._revalidate_active_frozen_inputs(
+                runtime_manifest_sha256,
+                _PREPARATION_ACTIVE_FROZEN_PATHS,
             )
             self._run_checked(
                 staging_root=staging_root,
@@ -2421,6 +3172,10 @@ class NavigationAnnotationRuntimeAdapter(_RuntimeBase):
                 ],
                 cwd=config.runtime_source_root / "0_1th_box",
                 error_code="video_prepare_failed",
+            )
+            self._revalidate_active_frozen_inputs(
+                runtime_manifest_sha256,
+                _PREPARATION_ACTIVE_FROZEN_PATHS,
             )
 
         _harden_private_tree(staging_root)
@@ -2479,7 +3234,7 @@ class NavigationAnnotationRuntimeAdapter(_RuntimeBase):
                 f"{request.dataset_date}_temp",
             ).as_posix(),
             segments=tuple(prepared_segments),
-            runtime_manifest_sha256=_sha256_file(config.manifest_path),
+            runtime_manifest_sha256=runtime_manifest_sha256,
             input_tree_sha256=input_tree_sha256,
             calibration_snapshot_sha256=(
                 request.calibration_snapshot_sha256
@@ -2489,26 +3244,6 @@ class NavigationAnnotationRuntimeAdapter(_RuntimeBase):
 
 
 class NavigationTrackingRuntime(_RuntimeBase):
-    def _current_runtime_manifest_sha256(self, expected: str) -> str:
-        if not re.fullmatch(r"^[0-9a-f]{64}$", expected):
-            raise RuntimeExecutionError(
-                "invalid_runtime_request",
-                "The expected Runtime manifest hash is invalid.",
-            )
-        try:
-            actual = _sha256_file(self.config.manifest_path)
-        except OSError as exc:
-            raise RuntimeExecutionError(
-                "runtime_manifest_changed",
-                "The frozen Runtime manifest cannot be safely re-read.",
-            ) from exc
-        if actual != expected:
-            raise RuntimeExecutionError(
-                "runtime_manifest_changed",
-                "The frozen Runtime changed after job preparation.",
-            )
-        return actual
-
     def validate_tracking_inputs(
         self,
         request: TrackingInputValidationRequest,
@@ -2534,6 +3269,10 @@ class NavigationTrackingRuntime(_RuntimeBase):
         runtime_manifest_sha256 = self._current_runtime_manifest_sha256(
             request.expected_runtime_manifest_sha256,
         )
+        self._revalidate_active_frozen_inputs(
+            request.expected_runtime_manifest_sha256,
+            _TRACKING_ACTIVE_FROZEN_PATHS,
+        )
 
         prepared_artifact_tree_sha256 = prepared_staging_artifact_sha256(
             staging_root,
@@ -2556,6 +3295,9 @@ class NavigationTrackingRuntime(_RuntimeBase):
         self._require_available()
         config = self.config
         assert config.runtime_source_root is not None
+        assert isinstance(config.minimum_free_bytes, int)
+        assert not isinstance(config.minimum_free_bytes, bool)
+        assert config.minimum_free_bytes > 0
         _safe_component(request.job_ref, label="job_ref", pattern=_OPAQUE_REF_RE)
         _safe_component(request.run_ref, label="run_ref", pattern=_OPAQUE_REF_RE)
         if request.attempt < 1:
@@ -2593,6 +3335,20 @@ class NavigationTrackingRuntime(_RuntimeBase):
                 "no_tracking_targets",
                 "At least one submitted target is required.",
             )
+        if (
+            not request.attestation_targets
+            or len(set(request.targets)) != len(request.targets)
+            or len(set(request.attestation_targets))
+            != len(request.attestation_targets)
+            or not set(request.targets).issubset(
+                set(request.attestation_targets),
+            )
+        ):
+            raise RuntimeExecutionError(
+                "invalid_runtime_request",
+                "Tracking targets must be a unique subset of the full "
+                "attestation target set.",
+            )
         # The job may wait for Web annotation for hours or days, so the
         # successful creation-time reservation is not proof that Tracking can
         # still start.  Recompute immediately before creating scratch.  The
@@ -2620,6 +3376,8 @@ class NavigationTrackingRuntime(_RuntimeBase):
         private_data = (
             staging_root / ".runtime" / "runs" / request.run_ref / "Data"
         )
+        assert config.tracking_binary_data_root is not None
+        assert config.legacy_tracking_data_root is not None
         param_dir = private_data / "3_param"
         output_root = private_data / "1_img_output"
         _ensure_private_directory_chain(
@@ -2633,25 +3391,63 @@ class NavigationTrackingRuntime(_RuntimeBase):
             ),
         )
         _ensure_private_directory(output_root, create=True)
-        for filename in ("ost.yaml", "camera_extrinsics.yaml"):
-            _copy_file_bytes(
-                config.runtime_source_root / "Data" / "3_param" / filename,
-                param_dir / filename,
-            )
 
         checkpoints: list[TrackingCheckpoint] = []
         tracking_root = config.runtime_source_root / "1_onnx_tam"
         with navigation_writer_lock(
             lock_path=self.config.writer_lock_path,
         ):
+            required_frozen_entries = (
+                self._revalidate_active_frozen_inputs(
+                    request.expected_runtime_manifest_sha256,
+                    _TRACKING_ACTIVE_FROZEN_PATHS,
+                )
+            )
+            for filename in ("ost.yaml", "camera_extrinsics.yaml"):
+                relative_path = f"Data/3_param/{filename}"
+                try:
+                    content = _read_manifest_frozen_bytes(
+                        config.runtime_source_root,
+                        required_frozen_entries[relative_path],
+                    )
+                except OSError as exc:
+                    raise RuntimeExecutionError(
+                        "runtime_input_changed",
+                        "A frozen Tracking compatibility input changed "
+                        "before execution.",
+                    ) from exc
+                _write_or_reuse_manifest_file(
+                    param_dir / filename,
+                    content,
+                    required_frozen_entries[relative_path],
+                )
             for target in sorted(
                 request.targets,
                 key=tracking_target_sort_key,
             ):
-                runtime_manifest_sha256 = (
-                    self._current_runtime_manifest_sha256(
-                        request.expected_runtime_manifest_sha256,
+                prepared_artifact_tree_sha256 = (
+                    prepared_staging_artifact_sha256(
+                        staging_root,
+                        request.attestation_targets,
                     )
+                )
+                if (
+                    prepared_artifact_tree_sha256
+                    != request.expected_prepared_artifact_tree_sha256
+                ):
+                    raise RuntimeExecutionError(
+                        "prepared_staging_changed",
+                        "Prepared Runtime artifacts changed before Tracking "
+                        "execution.",
+                    )
+                required_frozen_entries = (
+                    self._revalidate_active_frozen_inputs(
+                        request.expected_runtime_manifest_sha256,
+                        _TRACKING_ACTIVE_FROZEN_PATHS,
+                    )
+                )
+                runtime_manifest_sha256 = (
+                    request.expected_runtime_manifest_sha256
                 )
                 segment_root = self._assert_under(
                     target.segment_root,
@@ -2668,10 +3464,16 @@ class NavigationTrackingRuntime(_RuntimeBase):
                         "missing_tracking_yaml",
                         "A submitted Tracking YAML is unavailable.",
                     )
-                if not _IDENTITY_RE.fullmatch(target.identity):
+                if (
+                    not _IDENTITY_RE.fullmatch(target.identity)
+                    or not re.fullmatch(
+                        r"^[0-9a-f]{64}$",
+                        target.expected_yaml_sha256,
+                    )
+                ):
                     raise RuntimeExecutionError(
                         "invalid_runtime_request",
-                        "Tracking identity is invalid.",
+                        "Tracking identity or YAML hash is invalid.",
                     )
                 dog_yaml = param_dir / "dog.yaml"
                 if dog_yaml.exists() or dog_yaml.is_symlink():
@@ -2692,6 +3494,18 @@ class NavigationTrackingRuntime(_RuntimeBase):
                         )
                     dog_yaml.unlink()
                 _copy_file_bytes(yaml_path, dog_yaml)
+                try:
+                    copied_yaml_sha256 = _sha256_file(dog_yaml)
+                except OSError as exc:
+                    raise RuntimeExecutionError(
+                        "tracking_yaml_changed",
+                        "The submitted Tracking YAML could not be verified.",
+                    ) from exc
+                if copied_yaml_sha256 != target.expected_yaml_sha256:
+                    raise RuntimeExecutionError(
+                        "tracking_yaml_changed",
+                        "The submitted Tracking YAML changed before execution.",
+                    )
                 tracking_img = output_root / "tracking_img"
                 img_points = output_root / "img_points.txt"
                 if tracking_img.exists():
@@ -2711,6 +3525,30 @@ class NavigationTrackingRuntime(_RuntimeBase):
                 tracking_img.mkdir(mode=0o700)
                 tracking_img.chmod(0o700, follow_symlinks=False)
 
+                required_frozen_entries = (
+                    self._revalidate_active_frozen_inputs(
+                        request.expected_runtime_manifest_sha256,
+                        _TRACKING_ACTIVE_FROZEN_PATHS,
+                    )
+                )
+                try:
+                    embedded_data_root = _tracking_binary_embedded_data_root(
+                        _read_manifest_frozen_bytes(
+                            config.runtime_source_root,
+                            required_frozen_entries["1_onnx_tam/bin/main"],
+                        ),
+                    )
+                except (OSError, ValueError) as exc:
+                    raise RuntimeExecutionError(
+                        "runtime_input_changed",
+                        "The frozen Tracking binary changed before execution.",
+                    ) from exc
+                if embedded_data_root != config.tracking_binary_data_root:
+                    raise RuntimeExecutionError(
+                        "runtime_input_changed",
+                        "The frozen Tracking binary no longer proves its "
+                        "sandbox target.",
+                    )
                 self._run_checked(
                     staging_root=staging_root,
                     argv=["./bin/main"],
@@ -2718,7 +3556,7 @@ class NavigationTrackingRuntime(_RuntimeBase):
                     writable_bindings=(
                         (
                             private_data,
-                            config.runtime_source_root / "Data",
+                            config.tracking_binary_data_root,
                         ),
                         (
                             private_data,
@@ -2726,6 +3564,10 @@ class NavigationTrackingRuntime(_RuntimeBase):
                         ),
                     ),
                     error_code="tracking_failed",
+                )
+                self._revalidate_active_frozen_inputs(
+                    request.expected_runtime_manifest_sha256,
+                    _TRACKING_ACTIVE_FROZEN_PATHS,
                 )
                 if not _regular_directory(tracking_img) or not _regular_file(
                     img_points,
@@ -2742,19 +3584,33 @@ class NavigationTrackingRuntime(_RuntimeBase):
                         "Tracking output already exists; verify its checkpoint before retry.",
                     )
                 try:
+                    # Publication and its integrity fingerprint form one
+                    # recovery boundary.  Once either move starts, a later
+                    # chmod/hardening/hash failure may have left authoritative
+                    # output at its final path, so ordinary retry or
+                    # cancellation must not release the source scope.
                     shutil.move(str(tracking_img), str(output_dir))
                     shutil.move(str(img_points), str(points_path))
-                except OSError as exc:
+                    _harden_private_tree(output_dir)
+                    points_path.chmod(0o600, follow_symlinks=False)
+                    artifact_hash = tracking_checkpoint_artifact_sha256(
+                        output_dir,
+                        points_path,
+                    )
+                except Exception as exc:
+                    if (
+                        isinstance(exc, RuntimeExecutionError)
+                        and exc.code == "recovery_required"
+                    ):
+                        raise
                     raise RuntimeExecutionError(
                         "recovery_required",
-                        "Tracking output publication was interrupted; inspect the partial output.",
+                        "Tracking output publication requires operator recovery.",
+                        private_detail=(
+                            "Tracking output publication or integrity "
+                            f"finalization failed ({type(exc).__name__})."
+                        ),
                     ) from exc
-                _harden_private_tree(output_dir)
-                points_path.chmod(0o600, follow_symlinks=False)
-                artifact_hash = tracking_checkpoint_artifact_sha256(
-                    output_dir,
-                    points_path,
-                )
                 checkpoints.append(
                     TrackingCheckpoint(
                         segment_root=segment_root,

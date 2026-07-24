@@ -1,4 +1,6 @@
+import os
 import sqlite3
+import stat
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
@@ -59,6 +61,94 @@ def test_store_creates_session_and_lists_recent(tmp_path: Path):
 
     assert session.status == "active"
     assert recent == [session]
+
+
+def test_store_secures_new_and_existing_sqlite_files(
+    tmp_path: Path,
+) -> None:
+    database = tmp_path / "sessions.sqlite"
+    previous_umask = os.umask(0o022)
+    try:
+        WebSessionStore(database)
+    finally:
+        os.umask(previous_umask)
+    assert stat.S_IMODE(database.stat().st_mode) == 0o600
+
+    with sqlite3.connect(database) as connection:
+        connection.execute("PRAGMA journal_mode = WAL")
+        connection.execute(
+            "INSERT INTO sessions (id, title, status, created_at, updated_at, contract_version) "
+            "VALUES ('mode-check', 'mode-check', 'active', 'now', 'now', 1)",
+        )
+        connection.commit()
+        sidecars = (Path(f"{database}-wal"), Path(f"{database}-shm"))
+        assert all(path.exists() for path in sidecars)
+        for path in (database, *sidecars):
+            path.chmod(0o666)
+
+        WebSessionStore(database)
+
+        for path in (database, *sidecars):
+            assert stat.S_IMODE(path.stat().st_mode) == 0o600
+
+
+def test_store_rejects_shared_writable_database_parent(
+    tmp_path: Path,
+) -> None:
+    shared_parent = tmp_path / "shared-session-state"
+    shared_parent.mkdir()
+    shared_parent.chmod(0o777)
+
+    with pytest.raises(RuntimeError, match="parent is unsafe"):
+        WebSessionStore(shared_parent / "sessions.sqlite")
+
+    assert not (shared_parent / "sessions.sqlite").exists()
+
+
+def test_store_rejects_symlink_database_parent(
+    tmp_path: Path,
+) -> None:
+    private_parent = tmp_path / "private-session-state"
+    private_parent.mkdir(mode=0o700)
+    linked_parent = tmp_path / "linked-session-state"
+    linked_parent.symlink_to(private_parent, target_is_directory=True)
+
+    with pytest.raises(RuntimeError, match="parent is unsafe"):
+        WebSessionStore(linked_parent / "sessions.sqlite")
+
+    assert not (private_parent / "sessions.sqlite").exists()
+
+
+@pytest.mark.parametrize("suffix", ["", "-wal", "-shm"])
+def test_store_rejects_sqlite_symlinks(
+    tmp_path: Path,
+    suffix: str,
+) -> None:
+    database = tmp_path / "sessions.sqlite"
+    if suffix:
+        with sqlite3.connect(database) as connection:
+            connection.execute("CREATE TABLE preexisting (value TEXT)")
+    target = tmp_path / f"symlink-target{suffix or '-main'}"
+    target.write_bytes(b"private")
+    Path(f"{database}{suffix}").symlink_to(target)
+
+    with pytest.raises(RuntimeError, match="regular file"):
+        WebSessionStore(database)
+
+
+@pytest.mark.parametrize("suffix", ["", "-wal", "-shm"])
+def test_store_rejects_sqlite_special_files(
+    tmp_path: Path,
+    suffix: str,
+) -> None:
+    database = tmp_path / "sessions.sqlite"
+    if suffix:
+        with sqlite3.connect(database) as connection:
+            connection.execute("CREATE TABLE preexisting (value TEXT)")
+    os.mkfifo(Path(f"{database}{suffix}"))
+
+    with pytest.raises(RuntimeError, match="regular file"):
+        WebSessionStore(database)
 
 
 def test_store_persists_transcript(tmp_path: Path):

@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import sqlite3
+import threading
 import time
 from contextlib import asynccontextmanager
 from concurrent.futures import ThreadPoolExecutor
@@ -12,6 +14,10 @@ import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
+import vla_data_juicer_agents.web.app as web_app_module
+from vla_data_juicer_agents.annotation.maintenance import (
+    AnnotationServiceOnlineError,
+)
 from vla_data_juicer_agents.web.app import (
     _create_logged_task,
     create_app,
@@ -158,6 +164,47 @@ def test_create_app_fails_closed_without_agentscope_runtime(tmp_path: Path):
     assert not (tmp_path / "sessions.sqlite").exists()
 
 
+def test_conflicting_web_start_does_not_create_or_migrate_session_store(
+    tmp_path: Path,
+):
+    working_dir = tmp_path / ".djx"
+    runtime = FakeAgentScopeRuntime()
+    active_app = create_app(
+        working_dir=str(working_dir),
+        db_path=working_dir / "active-sessions.sqlite",
+        agentscope_runtime=runtime,
+    )
+    new_session_database = working_dir / "new-sessions.sqlite"
+    existing_session_database = working_dir / "existing-sessions.sqlite"
+    with sqlite3.connect(existing_session_database) as connection:
+        connection.execute(
+            "CREATE TABLE preexisting_schema (value TEXT NOT NULL)",
+        )
+        connection.execute(
+            "INSERT INTO preexisting_schema VALUES ('unchanged')",
+        )
+    existing_bytes = existing_session_database.read_bytes()
+
+    try:
+        with pytest.raises(AnnotationServiceOnlineError):
+            create_app(
+                working_dir=str(working_dir),
+                db_path=new_session_database,
+                agentscope_runtime=FakeAgentScopeRuntime(),
+            )
+        with pytest.raises(AnnotationServiceOnlineError):
+            create_app(
+                working_dir=str(working_dir),
+                db_path=existing_session_database,
+                agentscope_runtime=FakeAgentScopeRuntime(),
+            )
+    finally:
+        active_app.state.annotation_maintenance_lease.close()
+
+    assert not new_session_database.exists()
+    assert existing_session_database.read_bytes() == existing_bytes
+
+
 def test_create_app_mounts_agentscope_when_runtime_factory_provided(tmp_path: Path):
     fake_runtime = SimpleNamespace(
         app=FastAPI(),
@@ -200,6 +247,150 @@ def test_create_app_enters_agentscope_sub_app_lifespan(tmp_path: Path):
         assert events == ["startup"]
 
     assert events == ["startup", "shutdown"]
+
+
+def test_web_app_lifespan_is_one_shot_and_releases_maintenance_lease(
+    tmp_path: Path,
+):
+    app = create_app(
+        working_dir=str(tmp_path / ".djx"),
+        db_path=tmp_path / "sessions.sqlite",
+        agentscope_runtime=FakeAgentScopeRuntime(),
+    )
+
+    async def exercise() -> None:
+        async with app.router.lifespan_context(app):
+            assert app.state.annotation_maintenance_lease.closed is False
+
+        assert app.state.annotation_maintenance_lease.closed is True
+        with pytest.raises(RuntimeError, match="can only start once"):
+            async with app.router.lifespan_context(app):
+                pytest.fail("a completed Web app lifespan was restarted")
+
+    asyncio.run(exercise())
+
+
+def test_web_app_rejects_overlapping_lifespan_without_releasing_active_lease(
+    tmp_path: Path,
+):
+    app = create_app(
+        working_dir=str(tmp_path / ".djx"),
+        db_path=tmp_path / "sessions.sqlite",
+        agentscope_runtime=FakeAgentScopeRuntime(),
+    )
+
+    async def exercise() -> None:
+        async with app.router.lifespan_context(app):
+            with pytest.raises(RuntimeError, match="can only start once"):
+                async with app.router.lifespan_context(app):
+                    pytest.fail("overlapping Web app lifespans were accepted")
+            assert app.state.annotation_maintenance_lease.closed is False
+
+        assert app.state.annotation_maintenance_lease.closed is True
+
+    asyncio.run(exercise())
+
+
+def test_lifespan_cancellation_waits_for_worker_thread_before_releasing_lease(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    worker_started = threading.Event()
+    worker_stop_requested = threading.Event()
+    worker_return = threading.Event()
+
+    class BlockingAnnotationWorker:
+        def __init__(self, *_args, **_kwargs) -> None:
+            pass
+
+        async def run_forever(self) -> None:
+            worker_started.set()
+            await asyncio.to_thread(worker_return.wait)
+
+        async def stop(self) -> None:
+            worker_stop_requested.set()
+
+    monkeypatch.setattr(
+        web_app_module,
+        "AnnotationWorker",
+        BlockingAnnotationWorker,
+    )
+    app = create_app(
+        working_dir=str(tmp_path / ".djx"),
+        db_path=tmp_path / "sessions.sqlite",
+        agentscope_runtime=FakeAgentScopeRuntime(),
+    )
+
+    async def exercise() -> None:
+        leave_lifespan = asyncio.Event()
+
+        async def run_lifespan() -> None:
+            async with app.router.lifespan_context(app):
+                await leave_lifespan.wait()
+
+        lifespan_task = asyncio.create_task(run_lifespan())
+        while not worker_started.is_set():
+            await asyncio.sleep(0)
+        leave_lifespan.set()
+        while not worker_stop_requested.is_set():
+            await asyncio.sleep(0)
+
+        lifespan_task.cancel()
+        await asyncio.sleep(0)
+        assert lifespan_task.done() is False
+        assert app.state.annotation_maintenance_lease.closed is False
+
+        lifespan_task.cancel()
+        await asyncio.sleep(0)
+        assert lifespan_task.done() is False
+        assert app.state.annotation_maintenance_lease.closed is False
+
+        worker_return.set()
+        with pytest.raises(asyncio.CancelledError):
+            await lifespan_task
+        assert app.state.annotation_maintenance_lease.closed is True
+
+    asyncio.run(exercise())
+
+
+def test_create_app_releases_maintenance_lease_when_last_spa_route_fails(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    dist = tmp_path / "dist"
+    dist.mkdir()
+    (dist / "index.html").write_text("<!doctype html>", encoding="utf-8")
+    original_get = FastAPI.get
+
+    def fail_on_last_spa_route(self, path, *args, **kwargs):
+        route_decorator = original_get(self, path, *args, **kwargs)
+        if path != "/agent":
+            return route_decorator
+
+        def fail_registration(_endpoint):
+            raise RuntimeError("injected final route registration failure")
+
+        return fail_registration
+
+    with monkeypatch.context() as scoped:
+        scoped.setattr(FastAPI, "get", fail_on_last_spa_route)
+        with pytest.raises(
+            RuntimeError,
+            match="injected final route registration failure",
+        ):
+            create_app(
+                working_dir=str(tmp_path / ".djx"),
+                db_path=tmp_path / "sessions.sqlite",
+                frontend_dist=dist,
+                agentscope_runtime=FakeAgentScopeRuntime(),
+            )
+
+    replacement = create_app(
+        working_dir=str(tmp_path / "replacement-djx"),
+        db_path=tmp_path / "replacement-sessions.sqlite",
+        agentscope_runtime=FakeAgentScopeRuntime(),
+    )
+    replacement.state.annotation_maintenance_lease.close()
 
 
 def test_create_app_uses_agentscope_session_manager_when_runtime_present(tmp_path: Path):
@@ -563,6 +754,53 @@ def test_navigation_sync_image_route_rejects_unsafe_sequence(tmp_path: Path, mon
     response = client.get("/api/navigation/datasets/20270605/clips/clip_a/sync-images/%2E%2E/a.jpeg")
 
     assert response.status_code in {400, 404}
+
+
+def test_navigation_missing_resource_does_not_expose_absolute_path(
+    tmp_path: Path,
+    monkeypatch,
+):
+    root = tmp_path / "private-VLADatasets"
+    monkeypatch.setenv("VLA_VLADATASETS_ROOT", str(root))
+    client = make_client(tmp_path)
+
+    response = client.get(
+        "/api/navigation/datasets/20270605/clips/missing/sync-images",
+    )
+
+    assert response.status_code == 404
+    assert response.json()["detail"] == (
+        "The requested navigation dataset resource was not found."
+    )
+    assert str(root) not in response.text
+
+
+def test_navigation_invalid_request_does_not_echo_private_error(
+    tmp_path: Path,
+    monkeypatch,
+):
+    private_error = f"{tmp_path}/private sk-abcdefghijklmnop"
+
+    def fail_with_private_error(*_args, **_kwargs):
+        raise ValueError(private_error)
+
+    monkeypatch.setattr(
+        web_app_module,
+        "list_sync_images",
+        fail_with_private_error,
+    )
+    client = make_client(tmp_path)
+
+    response = client.get(
+        "/api/navigation/datasets/20270605/clips/missing/sync-images",
+    )
+
+    assert response.status_code == 400
+    assert response.json()["detail"] == (
+        "The navigation dataset request is invalid."
+    )
+    assert str(tmp_path) not in response.text
+    assert "sk-abcdefghijklmnop" not in response.text
 
 
 def _create_session(client: TestClient) -> str:

@@ -35,8 +35,58 @@ system runtime root
 3. wrapper 只可做参数传递、工作目录隔离、锁、状态和审计；不得重写或简化算法。
 4. `2_resize.py` 只能处理 job staging 中的 `finish_temp`，不得原地修改同步产物。
 5. Tracking 仍使用全局配置和输出 scratch 时，整个 Tracking writer 必须全局串行。
-6. `run_fix` 的标定由 Fix 任务显式选择并记录；不得依赖静默 fallback。
-7. 服务器部署、dry-run 和真实单 clip 验收分别需要单独批准。
+6. Tracking 的 `Data/3_param/ost.yaml` 和
+   `Data/3_param/camera_extrinsics.yaml` 是直接运行输入，必须作为
+   `tracking_compatibility_config`、`stage=tracking` 随 payload 原字节冻结；
+   每次启动 Tracking 前，复制到私有 Data 的字节必须再次符合当前受控 manifest
+   的精确 SHA-256 和大小，否则不得执行二进制。
+7. `VLA_TRACKING_BINARY_DATA_ROOT` 与 `VLA_TRACKING_LEGACY_DATA_ROOT`
+   是两个不同的 bubblewrap overlay 目标：前者覆盖 Tracking 二进制内嵌的
+   `_01/Data`，后者覆盖 Legacy YAML 中的 `/mnt/data1/.../Data`。两者必须显式
+   配置为不同的真实绝对目录，不能合并，也不能把系统专用 Runtime source
+   误当成二进制内嵌路径。Runtime 必须从 manifest 匹配的冻结
+   `1_onnx_tam/bin/main` 只读扫描 `dog.yaml`、`img_points.txt` 和
+   `tracking_img/` 三个内嵌路径并证明同一 Data root；Legacy YAML 目标必须精确
+   等于 `DEFAULT_INTRINSICS_PATH` 与 `DEFAULT_EXTRINSICS_PATH` 的共同 Data root。
+   两个 Tracking 目标不得互相嵌套，也不得与 work、同步数据或 Runtime source
+   等受保护根重叠。
+8. `run_fix` 的标定由 Fix 任务显式选择并记录；不得依赖静默 fallback。
+9. 服务器部署、dry-run 和真实单 clip 验收分别需要单独批准。
+
+M1 直接加载的 active frozen 集合必须完整登记且精确匹配：prepare 包括
+`0_creat_box.py`、`1_odom_convert.py`、`2_resize.py`、
+`main_smart_odom.py` 及其 `NoobScenes/include` 导入链、`map.png` 和
+`img2video.py`；Tracking 包括 `bin/main`、四个 `models/etam/*.onnx` 模型以及
+两份 Tracking compatibility YAML。Runtime 不能只在 capability 时验证这些
+文件；每个对应命令启动前和返回后都必须从同一 manifest 字节快照重新核对
+SHA-256、大小和 executable bit。Runtime source、上述文件及其 payload
+祖先目录不得允许 group/other 写入，否则 capability 必须关闭。
+
+`VLA_ANNOTATION_WORK_ROOT` 必须是绝对、规范、无 symlink ancestor、由当前
+服务 UID 持有且权限精确为 `0700` 的独立系统私有目录；Runtime 不会自动创建
+该目录或修正已有权限。它不得与
+`VLA_VLADATASETS_ROOT`（即 `clip_data` 的父目录）、`clip_data` 或 Runtime
+source 相同、互为祖先或互为后代。此门禁在任何 staging 创建或权限收紧前执行，
+避免误配置把同步数据或冻结 payload 当作私有 work tree。
+
+Worker 发布每份 Legacy YAML 时必须把 render 得到的 SHA-256 绑定到
+`TrackingTarget`。每次实际 Tracking 调用都要携带该 Job 的完整 target 集合，
+在 writer lock 内按完整集合重算 prepare artifact hash，并在把本次 YAML 复制到
+私有 `dog.yaml` 后再次核对字节哈希。同一 `run_ref` 的后续 target 可以复用已经
+存在的私有 `ost.yaml` 与 `camera_extrinsics.yaml`，但仅限其字节仍与受控
+manifest 精确一致；任何差异都必须 fail closed。
+
+Tracking 产物从私有 scratch 移入 segment 后，权限收口、产物哈希、checkpoint、
+runtime step 与终态 manifest 构成一个可恢复的账本边界。上述任一动作失败或
+提交结果不确定时，Job 必须进入 `recovery_required` 并继续占用 source scope；
+此时即使并发收到取消请求，也只能经停机 operator 的明确 retry/abandon 决策
+释放，不能作为普通失败自动重试或取消。
+
+冻结 `NoobScenes/include/1_odom_convert.py` 必须以
+`role=active_runtime`、`stage=preprocess` 登记，Runtime 从同一 manifest 校验过的
+脚本 AST 中只读证明 `clip_data` 字面量，`VLA_LEGACY_CLIP_DATA_ROOT` 必须与其精确
+一致。`VLA_ANNOTATION_MINIMUM_FREE_BYTES` 没有默认值；只有显式 ASCII 正整数才
+可用，缺失或其他格式一律关闭 Runtime，容量算术不得先行。
 
 现有 `run_odom.sh`/`run_fix.sh` 在脚本内部调用裸 `python3`，但实际 Data Runtime
 由服务配置先加载 `AGENT_DATA_ENV_SETUP`，再通过 `AGENT_DATA_PYTHON` 显式绑定

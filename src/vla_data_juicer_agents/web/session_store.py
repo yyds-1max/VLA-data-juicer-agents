@@ -1,8 +1,10 @@
 from __future__ import annotations
 
-import sqlite3
 import json
 import logging
+import os
+import sqlite3
+import stat
 from datetime import UTC, datetime, timedelta
 from dataclasses import dataclass
 from pathlib import Path
@@ -48,6 +50,75 @@ _OPEN_TASK_STATUS_REPLY = "任务状态仍为处理中，后续状态会继续�
 _NAVIGATION_DATASET_SELECTION_CONTEXT = "navigation_dataset_selection_v1"
 _MAX_REQUEST_CONTEXT_BYTES = 3_000
 _logger = logging.getLogger(__name__)
+
+
+def _private_session_sqlite_path(path: Path) -> Path:
+    candidate = path if path.is_absolute() else Path.cwd() / path
+    parent = candidate.parent
+    try:
+        parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+        metadata = parent.lstat()
+        canonical_parent = parent.resolve(strict=True)
+    except OSError as exc:
+        raise RuntimeError("session database parent is unavailable") from exc
+    if (
+        stat.S_ISLNK(metadata.st_mode)
+        or not stat.S_ISDIR(metadata.st_mode)
+        or canonical_parent != parent
+        or metadata.st_uid != os.geteuid()
+        or metadata.st_mode & (stat.S_IWGRP | stat.S_IWOTH)
+    ):
+        raise RuntimeError("session database parent is unsafe")
+    return canonical_parent / candidate.name
+
+
+def _secure_session_sqlite_file(path: Path, *, create: bool) -> None:
+    try:
+        existing = path.lstat()
+    except FileNotFoundError:
+        if not create:
+            return
+    except OSError as exc:
+        raise RuntimeError("session database storage is unavailable") from exc
+    else:
+        if stat.S_ISLNK(existing.st_mode) or not stat.S_ISREG(existing.st_mode):
+            raise RuntimeError(
+                "session database storage must be a regular file",
+            )
+
+    flags = os.O_RDWR
+    if create:
+        flags |= os.O_CREAT
+    if hasattr(os, "O_CLOEXEC"):
+        flags |= os.O_CLOEXEC
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    descriptor: int | None = None
+    try:
+        descriptor = os.open(path, flags, 0o600)
+        opened = os.fstat(descriptor)
+        current = path.stat(follow_symlinks=False)
+        if (
+            not stat.S_ISREG(opened.st_mode)
+            or opened.st_uid != os.geteuid()
+            or current.st_dev != opened.st_dev
+            or current.st_ino != opened.st_ino
+        ):
+            raise RuntimeError("session database storage is unsafe")
+        os.fchmod(descriptor, 0o600)
+    except RuntimeError:
+        raise
+    except OSError as exc:
+        raise RuntimeError("session database storage is unsafe") from exc
+    finally:
+        if descriptor is not None:
+            os.close(descriptor)
+
+
+def _secure_session_sqlite_storage(path: Path) -> None:
+    _secure_session_sqlite_file(path, create=True)
+    for suffix in ("-wal", "-shm"):
+        _secure_session_sqlite_file(Path(f"{path}{suffix}"), create=False)
 
 
 def _open_task_turn_reply(status: str, *, background_tools: int = 0) -> str:
@@ -153,9 +224,12 @@ class UnsupportedLegacySessionError(RuntimeError):
 
 class WebSessionStore:
     def __init__(self, db_path: Path | str) -> None:
-        self.db_path = Path(db_path)
-        self.db_path.parent.mkdir(parents=True, exist_ok=True)
-        self._init_schema()
+        self.db_path = _private_session_sqlite_path(Path(db_path))
+        _secure_session_sqlite_storage(self.db_path)
+        try:
+            self._init_schema()
+        finally:
+            _secure_session_sqlite_storage(self.db_path)
 
     def _connect(self) -> sqlite3.Connection:
         connection = sqlite3.connect(self.db_path)

@@ -139,6 +139,39 @@ Override settings with environment variables when needed:
 HOST=0.0.0.0 PORT=8765 VLA_VLADATASETS_ROOT=/media/heying/hy_data1/VLADatasets ./scripts/run_web.sh start
 ```
 
+`WORKING_DIR` is the script's authoritative `--working-dir` value. If it is
+unset, the script adopts `VLA_DATA_AGENT_WEB_WORKING_DIR`; if both variables are
+set, their values must match exactly or `start`, `foreground`, and `restart`
+fail before the frontend build. `stop`, `status`, and `logs` remain available
+under a stale conflicting environment so operators can inspect or stop an
+existing service. When neither is set, `WORKING_DIR` defaults to `STATE_DIR`.
+The PID and log paths remain controlled separately by `STATE_DIR`, `PID_FILE`,
+and `LOG_FILE`.
+
+The script creates new `WORKING_DIR`, `STATE_DIR`, and log directories under
+`umask 077`. It does not change permissions on directories that already exist;
+server operators must make sure an existing Web working directory already meets
+the backend's ownership and permission checks.
+
+Background `start`, `stop`, `restart`, and `status` operations are serialized by
+`scripts/run_web_control.py`. The helper requires the PID-file parent to be a
+real, current-user-owned directory that is not group/other writable, and rejects
+symlinked, non-regular, multiply linked, foreign-owned, or group/other-writable
+PID/control/instance files. A PID record is valid only when it contains one
+canonical decimal PID greater than 1 and matches both the live instance lock
+held by the Web process and its recorded OS process-birth identity (Linux boot
+ID plus `/proc/<pid>/stat` start time, or the macOS kernel process start time).
+Stale or reused PIDs are never signalled; Linux signalling additionally uses a
+pidfd. A stale instance record that is still locked blocks a new start and is
+preserved for operator review. The helper uses an exclusive lock on the stable
+`/usr` directory inode before the per-PID control lock, so concurrent lifecycle
+commands remain serialized even if a state directory is renamed and recreated.
+Its internal lifecycle action also verifies the inherited anchor, PID-parent,
+and control-lock file descriptors rather than trusting an environment marker.
+Those control descriptors are closed before the Web process is launched. The
+server must therefore support POSIX `flock` on `/usr`; verify this during
+deployment preflight.
+
 For local frontend development, run the backend API from the repository root:
 
 ```bash

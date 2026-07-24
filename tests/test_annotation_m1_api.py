@@ -204,6 +204,17 @@ class FakeAnnotationRuntime:
 
     def track(self, request) -> TrackingResult:
         self.track_calls += 1
+        assert request.attestation_targets
+        assert set(request.targets).issubset(
+            set(request.attestation_targets),
+        )
+        for attestation_target in request.attestation_targets:
+            assert (
+                hashlib.sha256(
+                    attestation_target.yaml_path.read_bytes(),
+                ).hexdigest()
+                == attestation_target.expected_yaml_sha256
+            )
         self.tracking_capacity_requests.append(
             (
                 request.estimated_input_bytes,
@@ -2047,13 +2058,14 @@ def test_completed_global_clearance_never_deletes_a_newer_marker(
         writer_lock_path,
         recovery_ref="z_new_recovery",
     )
-    replayed = store.operator_clear_global_writer_quarantine(
-        confirmation="all_navigation_annotation_writer_process_groups_absent",
-        operator_reference="OPS-OLD-PARTIAL-UNLINK",
-        idempotency_key="global-clear-before-new-marker",
-        writer_lock_path=writer_lock_path,
-    )
-    assert replayed["status"] == "global_quarantine_clear_confirmed"
+    with pytest.raises(AnnotationConflictError) as replayed:
+        store.operator_clear_global_writer_quarantine(
+            confirmation="all_navigation_annotation_writer_process_groups_absent",
+            operator_reference="OPS-OLD-PARTIAL-UNLINK",
+            idempotency_key="global-clear-before-new-marker",
+            writer_lock_path=writer_lock_path,
+        )
+    assert replayed.value.code == "global_writer_quarantine_active"
     assert second.is_file()
     assert newer.is_file()
 
@@ -2437,10 +2449,14 @@ def test_tracking_retry_verifies_committed_target_checkpoint(
             super().__init__(work_root)
             self.invocations = 0
             self.identities: list[str] = []
+            self.attestation_sizes: list[int] = []
 
         def track(self, request):
             self.invocations += 1
             self.identities.append(request.targets[0].identity)
+            self.attestation_sizes.append(
+                len(request.attestation_targets),
+            )
             if self.invocations == 2:
                 raise RuntimeExecutionError("tracking_failed", "private failure")
             return super().track(request)
@@ -2509,6 +2525,7 @@ def test_tracking_retry_verifies_committed_target_checkpoint(
         )
 
     assert runtime.invocations == (2 if tamper_checkpoint else 3)
+    assert runtime.attestation_sizes == [2] * runtime.invocations
     assert runtime.identities[0].startswith("master_")
     assert runtime.identities.count(runtime.identities[0]) == 1
     with sqlite3.connect(tmp_path / "annotation.sqlite") as connection:
@@ -2525,6 +2542,114 @@ def test_tracking_retry_verifies_committed_target_checkpoint(
         assert terminal["failure"]["retryable"] is False
     else:
         assert checkpoint_count == 2
+
+
+@pytest.mark.parametrize(
+    ("failure_point", "operator_disposition", "expected_checkpoint_count"),
+    (
+        ("record_checkpoint", "abandon", 0),
+        ("complete_tracking", "retry", 1),
+    ),
+)
+def test_tracking_ledger_closure_failure_requires_operator_recovery(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    failure_point: str,
+    operator_disposition: str,
+    expected_checkpoint_count: int,
+) -> None:
+    client, _runtime = _make_client(tmp_path)
+    store = client.app.state.annotation_store
+    with client:
+        job = _wait_for_status(
+            client,
+            _create_job(
+                client,
+                key=f"{failure_point}-create",
+            )["job_ref"],
+            "waiting_initial_annotation",
+        )
+        if failure_point == "record_checkpoint":
+            monkeypatch.setattr(
+                store,
+                "record_tracking_checkpoint",
+                lambda **_kwargs: (_ for _ in ()).throw(
+                    RuntimeError("simulated checkpoint ledger failure"),
+                ),
+            )
+        else:
+            monkeypatch.setattr(
+                store,
+                "complete_tracking",
+                lambda **_kwargs: (_ for _ in ()).throw(
+                    RuntimeError("simulated terminal ledger failure"),
+                ),
+            )
+
+        _start_single_target_tracking(
+            client,
+            job,
+            key_prefix=failure_point,
+        )
+        failed = _wait_for_status(client, job["job_ref"], "failed")
+        assert failed["failure"]["code"] == "recovery_required"
+        assert failed["failure"]["retryable"] is False
+
+        ordinary_retry = client.post(
+            f"/api/annotation/jobs/{job['job_ref']}/retry",
+            headers={"Idempotency-Key": f"{failure_point}-ordinary-retry"},
+            json={"expected_job_revision": failed["state_revision"]},
+        )
+        assert ordinary_retry.status_code == 409
+        ordinary_cancel = client.post(
+            f"/api/annotation/jobs/{job['job_ref']}/cancel",
+            headers={"Idempotency-Key": f"{failure_point}-ordinary-cancel"},
+            json={"expected_job_revision": failed["state_revision"]},
+        )
+        assert ordinary_cancel.status_code == 409
+        assert (
+            ordinary_cancel.json()["detail"]["code"]
+            == "recovery_confirmation_required"
+        )
+
+    with sqlite3.connect(tmp_path / "annotation.sqlite") as connection:
+        assert connection.execute(
+            "SELECT COUNT(*) FROM tracking_checkpoints",
+        ).fetchone()[0] == expected_checkpoint_count
+
+    writer_lock_path = tmp_path / f"{failure_point}.writer.lock"
+    global_clear = store.operator_clear_global_writer_quarantine(
+        confirmation="all_navigation_annotation_writer_process_groups_absent",
+        operator_reference=f"OPS-{failure_point}",
+        idempotency_key=f"{failure_point}-global-clear",
+        writer_lock_path=writer_lock_path,
+    )
+    recovered = store.operator_confirm_recovery(
+        job_ref=job["job_ref"],
+        expected_job_revision=failed["state_revision"],
+        confirmation="old_process_group_absent",
+        operator_reference=f"OPS-{failure_point}",
+        idempotency_key=f"{failure_point}-operator-recovery",
+        global_quarantine_action_ref=global_clear["action_ref"],
+        writer_lock_path=writer_lock_path,
+        disposition=operator_disposition,
+    )
+    assert recovered["status"] == (
+        "cancelled" if operator_disposition == "abandon" else "tracking"
+    )
+    with sqlite3.connect(tmp_path / "annotation.sqlite") as connection:
+        lease_count = connection.execute(
+            "SELECT COUNT(*) FROM annotation_source_leases",
+        ).fetchone()[0]
+        queued_count = connection.execute(
+            "SELECT COUNT(*) FROM runtime_runs WHERE status = 'queued'",
+        ).fetchone()[0]
+    if operator_disposition == "abandon":
+        assert lease_count == 0
+        assert queued_count == 0
+    else:
+        assert lease_count == 1
+        assert queued_count == 1
 
 
 def test_worker_tracks_legacy_yaml_filename_order_with_other10_before_other2(
@@ -2965,7 +3090,7 @@ def test_prepare_success_racing_with_cancel_does_not_publish(
         ).fetchone()[0] == "cancelled"
 
 
-def test_tracking_success_racing_with_cancel_does_not_publish(
+def test_tracking_success_racing_with_cancel_requires_recovery_after_publish(
     tmp_path: Path,
 ) -> None:
     class SuccessfulTrackingAfterCancel(FakeAnnotationRuntime):
@@ -3030,9 +3155,10 @@ def test_tracking_success_racing_with_cancel_does_not_publish(
         terminal = _wait_for_status(
             client,
             job["job_ref"],
-            "cancelled",
+            "failed",
         )
-        assert terminal["completion_outcome"] == "cancelled_by_user"
+        assert terminal["failure"]["code"] == "recovery_required"
+        assert terminal["failure"]["retryable"] is False
 
     with sqlite3.connect(tmp_path / "annotation.sqlite") as connection:
         assert connection.execute(
@@ -3046,13 +3172,13 @@ def test_tracking_success_racing_with_cancel_does_not_publish(
         ).fetchone()[0] == 0
         assert connection.execute(
             "SELECT COUNT(*) FROM annotation_source_leases",
-        ).fetchone()[0] == 0
+        ).fetchone()[0] == 1
         assert connection.execute(
             """
             SELECT status FROM runtime_runs
             WHERE kind = 'tracking'
             """
-        ).fetchone()[0] == "cancelled"
+        ).fetchone()[0] == "failed"
 
 
 def test_cancelled_running_job_crash_keeps_scope_quarantined(

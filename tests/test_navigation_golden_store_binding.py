@@ -268,6 +268,7 @@ def _insert_committed_run(
                 segment_root=segment_root,
                 yaml_path=yaml_path,
                 identity=identity,
+                expected_yaml_sha256=rendered[0].sha256,
             ),
         ),
     )

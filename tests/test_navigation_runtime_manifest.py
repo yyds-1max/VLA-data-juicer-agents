@@ -84,9 +84,143 @@ def test_checked_in_navigation_odom_manifest_is_valid_and_auditable() -> None:
         "run_odom.sh",
         "run_fix.sh",
         "1_onnx_tam/bin/main",
+        "Data/3_param/camera_extrinsics.yaml",
+        "Data/3_param/ost.yaml",
         "other_code/pcd_to_grid.py",
         "other_code/fix_trajectory_five_add_SF_odom_gridmap_0525.py",
     }.issubset(frozen_paths)
+    required_active_metadata = {
+        "NoobScenes/include/0_creat_box.py": (
+            "active_runtime",
+            "preprocess",
+        ),
+        "NoobScenes/include/1_odom_convert.py": (
+            "active_runtime",
+            "preprocess",
+        ),
+        "NoobScenes/include/2_resize.py": (
+            "active_runtime",
+            "preprocess",
+        ),
+        "NoobScenes/main_smart_odom.py": (
+            "active_runtime",
+            "metadata",
+        ),
+        **{
+            f"NoobScenes/include/{filename}": (
+                "active_runtime",
+                "metadata",
+            )
+            for filename in (
+                "__init__.py",
+                "attribute.py",
+                "calibrated_sensor.py",
+                "category.py",
+                "dataset.py",
+                "ego_pose.py",
+                "instance.py",
+                "lidarseg.py",
+                "log.py",
+                "map.py",
+                "sample.py",
+                "sample_annotation.py",
+                "sample_data.py",
+                "scene.py",
+                "sensor.py",
+                "utils.py",
+                "visibility.py",
+            )
+        },
+        "NoobScenes/maps/map.png": (
+            "active_static_asset",
+            "metadata",
+        ),
+        "0_1th_box/img2video.py": (
+            "active_runtime",
+            "initial_annotation",
+        ),
+        "1_onnx_tam/bin/main": ("active_binary", "tracking"),
+        **{
+            f"1_onnx_tam/models/etam/{name}.onnx": (
+                "active_model",
+                "tracking",
+            )
+            for name in (
+                "image_encoder",
+                "memory_attention",
+                "image_decoder",
+                "memory_encoder",
+            )
+        },
+        "Data/3_param/camera_extrinsics.yaml": (
+            "tracking_compatibility_config",
+            "tracking",
+        ),
+        "Data/3_param/ost.yaml": (
+            "tracking_compatibility_config",
+            "tracking",
+        ),
+    }
+    assert {
+        entry["relative_path"]: (entry["role"], entry["stage"])
+        for entry in entries
+        if entry["relative_path"] in required_active_metadata
+    } == required_active_metadata
+    required_runtime_entries = {
+        entry["relative_path"]: entry
+        for entry in entries
+        if entry["relative_path"]
+        in {
+            "NoobScenes/include/1_odom_convert.py",
+            "1_onnx_tam/bin/main",
+            "Data/3_param/ost.yaml",
+            "Data/3_param/camera_extrinsics.yaml",
+        }
+    }
+    assert {
+        path: (
+            entry["root_alias"],
+            entry["kind"],
+            entry["role"],
+            entry["stage"],
+            entry["sha256"],
+            entry["size"],
+        )
+        for path, entry in required_runtime_entries.items()
+    } == {
+        "NoobScenes/include/1_odom_convert.py": (
+            "NAVIGATION_ODOM_V1_SOURCE",
+            "frozen_file",
+            "active_runtime",
+            "preprocess",
+            "0428998fa18149ec646103a9beea837518bb4f8ba941ed8da09f34304ae4161b",
+            4010,
+        ),
+        "1_onnx_tam/bin/main": (
+            "NAVIGATION_ODOM_V1_SOURCE",
+            "frozen_file",
+            "active_binary",
+            "tracking",
+            "3bbb8eebd30e72ac1482e6a20858f1c7df5e4561b972a78943f88d7b897647e5",
+            2853760,
+        ),
+        "Data/3_param/ost.yaml": (
+            "NAVIGATION_ODOM_V1_SOURCE",
+            "frozen_file",
+            "tracking_compatibility_config",
+            "tracking",
+            "9a1d25967da58715f917736577f2542277f873baea9370eaf0219f6e9e36fa36",
+            392,
+        ),
+        "Data/3_param/camera_extrinsics.yaml": (
+            "NAVIGATION_ODOM_V1_SOURCE",
+            "frozen_file",
+            "tracking_compatibility_config",
+            "tracking",
+            "61672119470f3cd5bac55e7ad93774c3f4b552af2e059909b34ccdd2a43a078c",
+            341,
+        ),
+    }
     assert any(
         entry["kind"] == "generated_mutable"
         and entry.get("concurrency") == "global_serial"
