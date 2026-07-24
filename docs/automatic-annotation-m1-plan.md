@@ -288,7 +288,9 @@ compileall / git diff --check PASS
 GPU 和 bubblewrap 已复核。Legacy YAML sandbox-only target 的无业务 smoke 也已
 通过，未创建宿主 `/mnt/data1`。2026-07-24 又安装并登记了固定 Xvfb，捕获五项
 安装证据，并通过 Xvfb、bubblewrap 内 DISPLAY 和沙箱内 GPU 的无业务 smoke；
-系统依赖摘要现在会逐包核对实际 dpkg 版本。以上结果仍不包含真实 M1 writer。
+系统依赖摘要现在会逐包核对实际 dpkg 版本。提交 `896673f` 同步后，服务器以
+完整正式配置执行的 Runtime capability 已返回 `available=true`，无业务超时与
+后代进程组清理 smoke 也通过。以上结果仍不包含真实 M1 writer。
 尚未运行 `2027 Tracking candidate ↔ 2026 oracle`，因此当前只有拆解/同步等价
 结论，不能宣称 Tracking 已与 legacy 等价。M1 仍保持“未冻结”；下一步只能按
 `docs/automatic-annotation-m1-server-acceptance.md` 单独批准并执行服务器 writer

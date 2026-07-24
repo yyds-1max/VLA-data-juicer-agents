@@ -390,6 +390,13 @@ SIGTERM→SIGKILL 语义清理完整进程组；不得为测试超时而启动�
 > 可被 `xdpyinfo` 访问；同一 DISPLAY 进入 bubblewrap 后仍可访问，且沙箱内
 > `nvidia-smi -L` 成功。该结果证明 Xvfb、DISPLAY 和 GPU 在当前无业务沙箱
 > 拓扑中可用，仍不代表真实 Tracking、Golden 或业务算法已经验收。
+>
+> 安装证据 manifest 随提交 `896673f` 同步到服务器后，Schema 92 项和部署的
+> 55 个 frozen files 再次验证通过；以 Web 服务 UID、正式 Python 和完整 pending
+> 配置执行的直接 capability 探针返回 `available=true`。另用完全无业务的临时
+> Python sleep 进程验证超时清理，包含忽略 SIGTERM 的后代进程组在约 2.1 秒内
+> 完成 TERM→KILL 清理。Web 服务仍保持停止，尚未创建 Annotation Job、运行
+> prepare/Tracking 或写入 `finish_data`。
 
 ## 6. 2027 测试数据准备顺序
 

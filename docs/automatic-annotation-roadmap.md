@@ -334,5 +334,6 @@ AppleDouble 文件不属于业务输入，拆包发现与 raw 同源比较均须
   只落入临时 job-private Data，测试前后宿主 `/mnt/data1` 均不存在；
 - 系统 Runtime payload 已部署并验证；固定 Xvfb 已安装并由五项真实安装证据
   attestation，Xvfb＋bubblewrap DISPLAY 与沙箱内 GPU 无业务 smoke 已通过。
-  真实 Tracking 仍受单独服务器 writer 门禁约束；尚无 candidate/oracle 差异
-  结论，因此 M1 尚未冻结，也不能进入 M2。
+  服务器完整 Runtime capability 和无业务超时/进程组清理 smoke 也已通过。
+  真实 Tracking 仍受单独服务器 writer 门禁约束；尚无 candidate/oracle
+  差异结论，因此 M1 尚未冻结，也不能进入 M2。
