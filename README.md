@@ -102,6 +102,10 @@ the backend with `frontend/dist` mounted, and records a PID/log under `.djx`:
 ```bash
 nvm install
 nvm use
+npm install --global npm@11.16.0
+cd frontend
+npm ci
+cd ..
 ./scripts/run_web.sh start
 ```
 
@@ -112,6 +116,11 @@ absolute `bin` directory; `run_web.sh` prepends it only for the frontend build
 and rejects a mismatched toolchain before invoking npm. Set
 `SKIP_FRONTEND_BUILD=1` only to reuse an already verified `frontend/dist`; that
 path does not require Node.js or npm.
+
+Run `npm ci` on the first deployment and whenever `frontend/package-lock.json`
+changes; `run_web.sh` builds the installed dependency tree but does not install
+packages. The shadcn MCP and shadcn CLI are local development aids and are not
+installed or executed on the server.
 
 The default server URL is:
 

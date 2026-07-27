@@ -1,6 +1,6 @@
 # 自动标注板块总体开发路线
 
-> 状态：已批准；M1 Web 首帧标注与 Tracking 已完成功能冻结，M1.5 前端基础设施迁移开发中
+> 状态：已批准；M1 已完成功能冻结，M1.5 已形成本地冻结候选、待服务器轻量验收
 > 最后更新：2026-07-27
 > 适用范围：导航数据自动标注、后处理、三维轨迹复核/Fix，以及后续可复用的标注领域能力  
 > 优先级：本文件在自动标注范围内优先于 `architecture.md` 中的历史占位描述
@@ -398,13 +398,32 @@ AppleDouble 文件不属于业务输入，拆包发现与 raw 同源比较均须
 - M1.5 只进行前端基础设施迁移，不得修改本次冻结的 Annotation/Tracking 业务
   契约。
 
-### M1.5（2026-07-27，已启动）
+### M1.5（2026-07-27，本地冻结候选）
 
 - 开发基线固定为 `a7315ca`，开发分支为
   `codex/automatic-annotation-m1-5`；
 - 权威任务级计划为 `docs/automatic-annotation-m1-5-plan.md`；
-- 本里程碑只迁移 Node/npm、Tailwind、Radix/shadcn、路由拆包和前端设计系统，
-  不修改 M1 Annotation/Tracking 业务契约，也不运行真实服务器 writer；
-- 服务器非交互 shell 误用 Node `10.19.0` 的问题在本里程碑通过显式 Node
-  版本和构建预检契约解决；
-- 服务器最终只进行确定性依赖安装、生产构建、页面和只读 API smoke。
+- 已固定 Node `24.18.0` / npm `11.16.0`，`run_web.sh` 在构建前精确校验
+  工具链，并支持非交互部署显式绑定用户级 Node `bin`；
+- Tailwind 已迁移到 `4.3.3` 的 Vite plugin 构建路径；旧直接
+  PostCSS/Autoprefixer 配置和 Tailwind JavaScript config 已移除。依赖树中的
+  PostCSS 仅为 Vite/Vitest 的传递开发依赖，不属于旧生产构建路径；
+- 已建立 Radix＋Nova 的 Button、Badge、Alert、Progress、Dialog primitive，
+  现有 Console 组件通过兼容适配层复用；生产依赖不含 shadcn CLI、Base UI、
+  React Aria 或新增字体；
+- 六个 Console 页面均采用路由级懒加载，AppShell、Sidebar 和 DataPilot
+  继续同步加载；最大 JavaScript chunk 为 `376304` 字节，低于 `512000`
+  字节构建门禁；
+- 已在 `1440×900`、`1024×768` 和 `390×844` 检查六个主路由，并修复 Agent
+  工作流手机端 grid 的横向溢出；手机端 DataPilot 浮窗保持非模态且完整位于
+  视口内；
+- 本地最终门禁为 Python `1530 passed`、前端 `218 passed`、Playwright
+  `7 passed`、Router suite `17 cases validated`；production build、
+  compileall 和 diff-check 均通过；
+- 生产依赖审计没有 high/critical，仍有 React Router 6 的 2 个 moderate
+  公告；自动修复会升级到不兼容的 Router 7，因此不在 M1.5 强制升级；
+- Annotation 领域文件只有 Tailwind utility 的机械迁移与 Dialog import
+  合并，API、CAS、revision、Runtime、Router 和后端均未修改，也未运行真实
+  Tracking 或服务器 writer；
+- 服务器轻量验收仍待单独执行。验收只允许确定性 `npm ci`、生产构建、全路由
+  页面、历史 Annotation 只读 API 和 DataPilot smoke，不创建 Job 或写业务数据。

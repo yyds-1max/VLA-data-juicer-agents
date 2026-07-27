@@ -991,6 +991,7 @@ test("agent workflow page selects nodes and keeps execute action placeholder-onl
   fireEvent.click(screen.getByRole("button", { name: "Agent 工作流" }));
   expect(await screen.findByText("节点库")).toBeVisible();
   expect(screen.getByText("工作流画布")).toBeVisible();
+  expect(screen.getByTestId("agent-workflow-grid")).toHaveClass("min-w-0");
   expect(screen.getByRole("button", { name: "数据源接入" })).toHaveAttribute("aria-pressed", "true");
   expect(screen.getByRole("button", { name: "画布节点 数据源接入" })).toHaveAttribute("aria-pressed", "true");
 

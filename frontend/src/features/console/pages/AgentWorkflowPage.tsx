@@ -50,8 +50,11 @@ export function AgentWorkflowPage({ onPlaceholderAction }: AgentWorkflowPageProp
 
   return (
     <section className="mx-auto max-w-7xl space-y-4 px-4 py-6 md:px-6">
-      <div className="grid gap-4 xl:grid-cols-[17rem_1fr_20rem]">
-        <ConsoleCard className="space-y-4">
+      <div
+        className="grid min-w-0 gap-4 xl:grid-cols-[17rem_1fr_20rem]"
+        data-testid="agent-workflow-grid"
+      >
+        <ConsoleCard className="min-w-0 space-y-4">
           <div className="flex items-center justify-between gap-3">
             <div>
               <h2 className="text-base font-semibold text-console-text">节点库</h2>
@@ -88,7 +91,7 @@ export function AgentWorkflowPage({ onPlaceholderAction }: AgentWorkflowPageProp
           </div>
         </ConsoleCard>
 
-        <ConsoleCard className="space-y-4">
+        <ConsoleCard className="min-w-0 space-y-4">
           <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
             <div>
               <h2 className="text-base font-semibold text-console-text">工作流画布</h2>
@@ -139,7 +142,7 @@ export function AgentWorkflowPage({ onPlaceholderAction }: AgentWorkflowPageProp
           </div>
         </ConsoleCard>
 
-        <aside className="space-y-4">
+        <aside className="min-w-0 space-y-4">
           <ConsoleCard>
             <div className="mb-4 flex items-center gap-2">
               <Settings2 aria-hidden="true" className="h-5 w-5 text-console-cyan" />

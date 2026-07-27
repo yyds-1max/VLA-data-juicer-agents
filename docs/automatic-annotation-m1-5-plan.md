@@ -1,6 +1,6 @@
 # 自动标注 M1.5：Tailwind 4 与 Radix/shadcn 设计系统基线
 
-> 状态：已批准，开发中
+> 状态：本地冻结候选，待服务器轻量验收
 > 开始日期：2026-07-27
 > 开发基线：`a7315ca`
 > 开发分支：`codex/automatic-annotation-m1-5`
@@ -352,3 +352,49 @@ M1.5 只有在以下条件全部满足后才能冻结并进入 M2：
 - 本地全量测试、构建和 Router 冻结基线通过；
 - 服务器确定性安装、生产构建和轻量页面验收通过；
 - 代码、文档和本地/服务器工作树干净。
+
+## 12. 本地实施结果
+
+2026-07-27 已完成本地批次 1～7：
+
+- 从 `a7315ca` 创建 `codex/automatic-annotation-m1-5`，没有混入 M2
+  后处理、三维复核或智能体业务；
+- 固定 Node `24.18.0` / npm `11.16.0`，本地所有 npm 门禁均通过
+  `fnm exec --using=24.18.0` 使用冻结工具链执行；
+- `run_web.sh` 增加精确版本预检和 `VLA_FRONTEND_NODE_BIN_DIR`，首次部署或
+  lockfile 变化时仍必须先显式执行 `npm ci`；
+- Tailwind `4.3.3`、`@tailwindcss/vite` `4.3.3` 和
+  `tailwind-merge` `3.6.0` 已固定；旧直接 PostCSS/Autoprefixer 构建配置及
+  Tailwind 3 config 已移除；
+- 建立 Radix＋Nova 的 Button、Badge、Alert、Progress、Dialog 受审查
+  primitive，并以兼容适配层接入现有 Console 组件；
+- shadcn CLI、MCP、Base UI、React Aria 和额外字体均未成为生产依赖；
+- 六个页面完成路由级懒加载；构建门禁限制任一 JavaScript chunk 不得超过
+  `512000` 字节，当前最大 chunk 为 `376304` 字节，Annotation chunk
+  `75547` 字节，CSS `86743` 字节；
+- 真实浏览器覆盖 `1440×900`、`1024×768`、`390×844` 与六个主路由，
+  未发现 Tailwind 迁移后的全局横向溢出；发现并修复 Agent 工作流手机端
+  min-content 溢出，DataPilot 手机浮窗边界正常；
+- Annotation/Tracking、CAS、revision、Runtime、Router 和后端契约未改变，
+  不需要重跑真实 Tracking。
+
+本地门禁结果：
+
+```text
+Python                         1530 passed
+Frontend Vitest                218 passed
+Playwright                     7 passed
+Router suite                   17 cases validated
+Production build               passed
+Largest JavaScript chunk       376304 / 512000 bytes
+Python compileall              passed
+git diff --check               passed
+production npm audit high+     0
+```
+
+生产依赖审计仍报告 React Router 6 的 2 个 moderate 公告；官方自动修复会升级
+到 Router 7，属于破坏性主版本变更，因此本里程碑记录风险但不执行
+`npm audit fix --force`。
+
+剩余批次 8 是单独批准的服务器轻量验收。在该步骤完成前，M1.5 只能称为“本地
+冻结候选”，不能宣布完整冻结或进入 M2 实施。
