@@ -1,18 +1,43 @@
 import type { ReactNode } from "react";
-import { useCallback, useEffect, useRef, useState } from "react";
+import { lazy, Suspense, useCallback, useEffect, useRef, useState } from "react";
 import { Navigate, Route, Routes, useLocation } from "react-router-dom";
 
 import { ConsoleHeader } from "../components/console/ConsoleHeader";
 import { ConsoleSidebar } from "../components/console/ConsoleSidebar";
 import { ConsoleToast } from "../components/console/ConsoleToast";
 import type { ConsolePageId, StatusTone } from "../features/console/consoleTypes";
-import { AgentWorkflowPage } from "../features/console/pages/AgentWorkflowPage";
-import { AnnotationPage } from "../features/console/pages/AnnotationPage";
-import { DataManagementPage } from "../features/console/pages/DataManagementPage";
-import { DashboardPage } from "../features/console/pages/DashboardPage";
-import { ModelIterationPage } from "../features/console/pages/ModelIterationPage";
-import { SimulationPage } from "../features/console/pages/SimulationPage";
 import { cn } from "../lib/utils";
+
+const AgentWorkflowPage = lazy(() =>
+  import("../features/console/pages/AgentWorkflowPage").then(({ AgentWorkflowPage }) => ({
+    default: AgentWorkflowPage,
+  })),
+);
+const AnnotationPage = lazy(() =>
+  import("../features/console/pages/AnnotationPage").then(({ AnnotationPage }) => ({
+    default: AnnotationPage,
+  })),
+);
+const DataManagementPage = lazy(() =>
+  import("../features/console/pages/DataManagementPage").then(({ DataManagementPage }) => ({
+    default: DataManagementPage,
+  })),
+);
+const DashboardPage = lazy(() =>
+  import("../features/console/pages/DashboardPage").then(({ DashboardPage }) => ({
+    default: DashboardPage,
+  })),
+);
+const ModelIterationPage = lazy(() =>
+  import("../features/console/pages/ModelIterationPage").then(({ ModelIterationPage }) => ({
+    default: ModelIterationPage,
+  })),
+);
+const SimulationPage = lazy(() =>
+  import("../features/console/pages/SimulationPage").then(({ SimulationPage }) => ({
+    default: SimulationPage,
+  })),
+);
 
 type AppShellProps = {
   children?: ReactNode;
@@ -42,6 +67,18 @@ const pageCopy: Record<ConsolePageId, { title: string }> = {
   model: { title: "模型迭代" },
   simulation: { title: "测试/仿真" },
 };
+
+function RouteLoadingFallback() {
+  return (
+    <div
+      aria-live="polite"
+      className="flex min-h-[50vh] items-center justify-center px-6 text-sm text-console-muted"
+      role="status"
+    >
+      正在加载页面…
+    </div>
+  );
+}
 
 export function AppShell({ children }: AppShellProps) {
   const location = useLocation();
@@ -106,17 +143,19 @@ export function AppShell({ children }: AppShellProps) {
         )}
       >
         <ConsoleHeader title={activeTitle} />
-        <Routes>
-          <Route path="/" element={<DashboardPage />} />
-          <Route path="/agent" element={<AgentWorkflowPage onPlaceholderAction={showPlaceholderToast} />} />
-          <Route path="/data" element={<DataManagementPage onPlaceholderAction={showPlaceholderToast} />} />
-          <Route path="/annotation/jobs" element={<AnnotationPage />} />
-          <Route path="/annotation/jobs/:jobRef" element={<AnnotationPage />} />
-          <Route path="/annotation/jobs/:jobRef/segments/:segmentRef" element={<AnnotationPage />} />
-          <Route path="/model" element={<ModelIterationPage onPlaceholderAction={showPlaceholderToast} />} />
-          <Route path="/simulation" element={<SimulationPage onPlaceholderAction={showPlaceholderToast} />} />
-          <Route path="*" element={<Navigate to="/" replace />} />
-        </Routes>
+        <Suspense fallback={<RouteLoadingFallback />}>
+          <Routes>
+            <Route path="/" element={<DashboardPage />} />
+            <Route path="/agent" element={<AgentWorkflowPage onPlaceholderAction={showPlaceholderToast} />} />
+            <Route path="/data" element={<DataManagementPage onPlaceholderAction={showPlaceholderToast} />} />
+            <Route path="/annotation/jobs" element={<AnnotationPage />} />
+            <Route path="/annotation/jobs/:jobRef" element={<AnnotationPage />} />
+            <Route path="/annotation/jobs/:jobRef/segments/:segmentRef" element={<AnnotationPage />} />
+            <Route path="/model" element={<ModelIterationPage onPlaceholderAction={showPlaceholderToast} />} />
+            <Route path="/simulation" element={<SimulationPage onPlaceholderAction={showPlaceholderToast} />} />
+            <Route path="*" element={<Navigate to="/" replace />} />
+          </Routes>
+        </Suspense>
       </main>
 
       {children}

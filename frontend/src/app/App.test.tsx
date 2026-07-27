@@ -289,10 +289,22 @@ test("sidebar navigation switches console pages", async () => {
   await renderAppWithDashboardSettled();
 
   fireEvent.click(screen.getByRole("button", { name: "Agent 工作流" }));
-  expect(screen.getByRole("heading", { name: "Agent 工作流" })).toBeVisible();
+  expect(await screen.findByRole("heading", { name: "Agent 工作流" })).toBeVisible();
 
   fireEvent.click(screen.getByRole("button", { name: "测试/仿真" }));
-  expect(screen.getByRole("heading", { name: "测试/仿真" })).toBeVisible();
+  expect(await screen.findByRole("heading", { name: "测试/仿真" })).toBeVisible();
+});
+
+test("direct page deep links keep the console shell eager while the page loads", async () => {
+  window.history.replaceState({}, "", "/model");
+
+  render(<App routerMode="declarative" />);
+
+  expect(screen.getByTestId("console-sidebar")).toBeVisible();
+  expect(screen.getByRole("button", { name: "Open DataPilot" })).toBeVisible();
+  expect(screen.getByRole("button", { name: "模型迭代" })).toHaveAttribute("aria-current", "page");
+  expect(window.location.pathname).toBe("/model");
+  expect(await screen.findByText("当前部署")).toBeVisible();
 });
 
 test("desktop sidebar collapse follows navigation and persists across remounts", async () => {
@@ -316,7 +328,7 @@ test("desktop sidebar collapse follows navigation and persists across remounts",
   expect(screen.getByText("智瀚星途数据处理系统").parentElement).toHaveClass("md:hidden");
 
   fireEvent.click(screen.getByRole("button", { name: "Agent 工作流" }));
-  expect(screen.getByRole("heading", { name: "Agent 工作流" })).toBeVisible();
+  expect(await screen.findByRole("heading", { name: "Agent 工作流" })).toBeVisible();
   expect(sidebar).toHaveAttribute("data-collapsed", "true");
 
   unmount();
@@ -835,7 +847,7 @@ test("navigation dataset summary is reused while switching console pages", async
   expect(apiMocks.getNavigationDatasetSummary).toHaveBeenCalledTimes(1);
 
   fireEvent.click(screen.getByRole("button", { name: "自动标注" }));
-  expect(screen.getByText("自动标注任务")).toBeVisible();
+  expect(await screen.findByText("自动标注任务")).toBeVisible();
 
   fireEvent.click(screen.getByRole("button", { name: "闭环仪表盘" }));
   expect(await screen.findByText("3.5 秒")).toBeVisible();
@@ -951,7 +963,7 @@ test("annotation page replaces fixtures with the real M1 task entry", async () =
   await renderAppWithDashboardSettled();
 
   fireEvent.click(screen.getByRole("button", { name: "自动标注" }));
-  expect(screen.getByText("自动标注任务")).toBeVisible();
+  expect(await screen.findByText("自动标注任务")).toBeVisible();
   expect(screen.getByText("从已同步数据开始，完成 Web 首帧标注与 Tracking。")).toBeVisible();
   expect(screen.queryByText("视觉检测")).not.toBeInTheDocument();
   expect(window.location.pathname).toBe("/annotation/jobs");
@@ -962,8 +974,8 @@ test("model iteration page renders versions training and compare tabs", async ()
   await renderAppWithDashboardSettled();
 
   fireEvent.click(screen.getByRole("button", { name: "模型迭代" }));
+  expect(await screen.findByText("当前部署")).toBeVisible();
   expect(screen.getByText("v47")).toBeVisible();
-  expect(screen.getByText("当前部署")).toBeVisible();
 
   fireEvent.click(screen.getByRole("tab", { name: "训练监控" }));
   expect(screen.getByText("训练损失曲线")).toBeVisible();
@@ -977,7 +989,7 @@ test("agent workflow page selects nodes and keeps execute action placeholder-onl
   await renderAppWithDashboardSettled();
 
   fireEvent.click(screen.getByRole("button", { name: "Agent 工作流" }));
-  expect(screen.getByText("节点库")).toBeVisible();
+  expect(await screen.findByText("节点库")).toBeVisible();
   expect(screen.getByText("工作流画布")).toBeVisible();
   expect(screen.getByRole("button", { name: "数据源接入" })).toHaveAttribute("aria-pressed", "true");
   expect(screen.getByRole("button", { name: "画布节点 数据源接入" })).toHaveAttribute("aria-pressed", "true");
@@ -999,7 +1011,7 @@ test("simulation page switches config running and results views", async () => {
   await renderAppWithDashboardSettled();
 
   fireEvent.click(screen.getByRole("button", { name: "测试/仿真" }));
-  expect(screen.getByText("仿真场景配置")).toBeVisible();
+  expect(await screen.findByText("仿真场景配置")).toBeVisible();
 
   fireEvent.click(screen.getByRole("tab", { name: "运行监控" }));
   expect(screen.getByText("实时任务日志")).toBeVisible();
@@ -1012,7 +1024,7 @@ test("DataPilot opens only from the floating button after console migration", as
   await renderAppWithDashboardSettled();
 
   fireEvent.click(screen.getByRole("button", { name: "测试/仿真" }));
-  fireEvent.click(screen.getByRole("button", { name: "启动仿真" }));
+  fireEvent.click(await screen.findByRole("button", { name: "启动仿真" }));
   expect(screen.queryByRole("dialog", { name: "DataPilot" })).not.toBeInTheDocument();
 
   fireEvent.click(screen.getByRole("button", { name: "Open DataPilot" }));
