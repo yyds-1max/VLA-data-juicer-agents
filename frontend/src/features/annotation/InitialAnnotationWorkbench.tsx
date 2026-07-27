@@ -653,11 +653,11 @@ export function InitialAnnotationWorkbench({
   return (
     <section
       data-testid="annotation-workbench"
-      className="flex min-h-[42rem] min-w-0 flex-col overflow-hidden bg-console-panel lg:h-[min(48rem,calc(100dvh-12rem))] lg:min-h-[38rem] lg:flex-row xl:h-full xl:min-h-0"
+      className="flex min-h-168 min-w-0 flex-col overflow-hidden bg-console-panel lg:h-[min(48rem,calc(100dvh-12rem))] lg:min-h-152 lg:flex-row xl:h-full xl:min-h-0"
     >
       <div
         data-testid="annotation-canvas-region"
-        className="flex min-h-[34rem] min-w-0 flex-1 flex-col bg-slate-950 lg:min-h-0"
+        className="flex min-h-136 min-w-0 flex-1 flex-col bg-slate-950 lg:min-h-0"
       >
         <div className="flex min-h-14 flex-wrap items-center justify-between gap-3 border-b border-slate-700/80 bg-slate-900 px-3 py-2">
           <div className="flex min-w-0 flex-wrap items-center gap-2">
@@ -760,7 +760,7 @@ export function InitialAnnotationWorkbench({
             />
             <svg
               className={cn(
-                "absolute inset-0 h-full w-full touch-none outline-none",
+                "absolute inset-0 h-full w-full touch-none outline-hidden",
                 mode === "box" && "cursor-crosshair",
                 mode === "point" && "cursor-cell",
               )}
@@ -910,7 +910,7 @@ export function InitialAnnotationWorkbench({
 
       <aside
         data-testid="annotation-inspector-region"
-        className="flex min-h-[34rem] w-full shrink-0 flex-col border-t border-console-line bg-console-panel lg:min-h-0 lg:w-[22rem] lg:border-l lg:border-t-0"
+        className="flex min-h-136 w-full shrink-0 flex-col border-t border-console-line bg-console-panel lg:min-h-0 lg:w-88 lg:border-l lg:border-t-0"
         aria-label="目标属性检查器"
       >
         <div className="flex min-h-14 items-center justify-between gap-3 border-b border-console-line px-4 py-2">
@@ -968,7 +968,7 @@ export function InitialAnnotationWorkbench({
                             value={target.bbox?.[fieldIndex] ?? ""}
                             disabled={!canEdit || !target.bbox}
                             min={0}
-                            className="h-8 w-full rounded border border-console-line bg-white px-2 text-xs text-console-text focus:border-console-cyan focus:outline-none"
+                            className="h-8 w-full rounded-sm border border-console-line bg-white px-2 text-xs text-console-text focus:border-console-cyan focus:outline-hidden"
                             onChange={(event) => {
                               if (!target.bbox || !firstFrame) return;
                               const next = [...target.bbox] as [number, number, number, number];
@@ -999,7 +999,7 @@ export function InitialAnnotationWorkbench({
                             value={target.point?.[pointIndex] ?? ""}
                             disabled={!canEdit}
                             min={0}
-                            className="h-8 w-full rounded border border-console-line bg-white px-2 text-xs text-console-text focus:border-console-cyan focus:outline-none"
+                            className="h-8 w-full rounded-sm border border-console-line bg-white px-2 text-xs text-console-text focus:border-console-cyan focus:outline-hidden"
                             onChange={(event) => {
                               if (!firstFrame) return;
                               const next: [number, number] = target.point ? [...target.point] : [0, 0];
@@ -1032,7 +1032,7 @@ export function InitialAnnotationWorkbench({
                               aria-label={`${index === 0 ? "master" : `other${index}`} ${label}`}
                               value={target.colors[field] ?? ""}
                               disabled={!canEdit}
-                              className="h-9 w-full rounded border border-console-line bg-white px-2 text-sm text-console-text focus:border-console-cyan focus:outline-none"
+                              className="h-9 w-full rounded-sm border border-console-line bg-white px-2 text-sm text-console-text focus:border-console-cyan focus:outline-hidden"
                               onChange={(event) => updateTarget(target.target_ref, (current) => ({
                                 ...current,
                                 colors: {

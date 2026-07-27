@@ -109,7 +109,7 @@ export function DataPilotButton() {
       aria-label="Open DataPilot"
       onPointerDown={handlePointerDown}
       onClick={handleClick}
-      className="fixed bottom-5 right-5 z-[80] flex h-14 touch-none cursor-grab items-center gap-3 rounded-full border border-console-line bg-console-text px-4 text-white shadow-[0_18px_42px_rgba(23,32,46,0.18)] transition-[background-color,box-shadow,filter] duration-200 hover:bg-slate-800 hover:shadow-[0_22px_46px_rgba(23,32,46,0.22)] active:cursor-grabbing active:brightness-95 focus:outline-none focus:ring-2 focus:ring-console-cyan focus:ring-offset-2 focus:ring-offset-console-bg"
+      className="fixed bottom-5 right-5 z-80 flex h-14 touch-none cursor-grab items-center gap-3 rounded-full border border-console-line bg-console-text px-4 text-white shadow-[0_18px_42px_rgba(23,32,46,0.18)] transition-[background-color,box-shadow,filter] duration-200 hover:bg-slate-800 hover:shadow-[0_22px_46px_rgba(23,32,46,0.22)] active:cursor-grabbing active:brightness-95 focus:outline-hidden focus:ring-2 focus:ring-console-cyan focus:ring-offset-2 focus:ring-offset-console-bg"
       style={{
         transform: `translate3d(${floatingOffset.x}px, ${floatingOffset.y}px, 0)`,
       }}

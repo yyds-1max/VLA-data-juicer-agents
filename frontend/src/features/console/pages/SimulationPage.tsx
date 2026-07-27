@@ -81,14 +81,14 @@ function ConfigPanel({ onPlaceholderAction }: SimulationPageProps) {
           <div className="grid gap-4 md:grid-cols-2">
             <label className="block space-y-2">
               <span className="text-sm text-console-muted">候选模型</span>
-              <select className="h-10 w-full rounded border border-console-line bg-console-panel2 px-3 text-sm text-console-text" defaultValue="v47">
+              <select className="h-10 w-full rounded-sm border border-console-line bg-console-panel2 px-3 text-sm text-console-text" defaultValue="v47">
                 <option value="v47">v47 candidate</option>
                 <option value="v46">v46 production baseline</option>
               </select>
             </label>
             <label className="block space-y-2">
               <span className="text-sm text-console-muted">场景包</span>
-              <select className="h-10 w-full rounded border border-console-line bg-console-panel2 px-3 text-sm text-console-text" defaultValue="full">
+              <select className="h-10 w-full rounded-sm border border-console-line bg-console-panel2 px-3 text-sm text-console-text" defaultValue="full">
                 <option value="full">DataLoop regression full suite</option>
                 <option value="navigation">Indoor navigation subset</option>
                 <option value="manipulation">Desktop manipulation subset</option>
@@ -109,7 +109,7 @@ function ConfigPanel({ onPlaceholderAction }: SimulationPageProps) {
           <h2 className="text-base font-semibold text-console-text">指标选择</h2>
           <div className="mt-4 grid gap-3 sm:grid-cols-2 lg:grid-cols-4">
             {["成功率", "平均延迟", "碰撞次数", "轨迹稳定性"].map((metric) => (
-              <label key={metric} className="flex items-center gap-3 rounded border border-console-line bg-console-panel2/70 p-3 text-sm text-console-text">
+              <label key={metric} className="flex items-center gap-3 rounded-sm border border-console-line bg-console-panel2/70 p-3 text-sm text-console-text">
                 <input type="checkbox" defaultChecked className="h-4 w-4 accent-console-cyan" />
                 {metric}
               </label>
@@ -121,7 +121,7 @@ function ConfigPanel({ onPlaceholderAction }: SimulationPageProps) {
           <h2 className="text-base font-semibold text-console-text">测试用例库</h2>
           <div className="mt-4 grid gap-3 md:grid-cols-2">
             {simulationReportRows.slice(0, 4).map((row) => (
-              <div key={row.name} className="rounded border border-console-line bg-console-panel2/70 p-3">
+              <div key={row.name} className="rounded-sm border border-console-line bg-console-panel2/70 p-3">
                 <div className="flex items-center justify-between gap-3">
                   <h3 className="text-sm font-semibold text-console-text">{row.name}</h3>
                   <StatusTag tone="info">{row.scene}</StatusTag>
@@ -183,7 +183,7 @@ function RunningPanel() {
             <Gauge aria-hidden="true" className="h-5 w-5 text-console-cyan" />
             <h2 className="text-base font-semibold text-console-text">实时任务日志</h2>
           </div>
-          <div className="rounded border border-console-line bg-console-bg p-3 font-mono text-xs leading-6 text-console-muted">
+          <div className="rounded-sm border border-console-line bg-console-bg p-3 font-mono text-xs leading-6 text-console-muted">
             {runningLogs.map((log) => (
               <div key={log}>{log}</div>
             ))}

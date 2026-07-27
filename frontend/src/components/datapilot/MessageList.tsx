@@ -61,7 +61,7 @@ export function MessageList({ messages, turns = [], run, hasTaskOverlay = false 
           ))}
         </>
       ) : (
-        <div className="mt-auto rounded-lg border border-console-line bg-console-panel px-3 py-3 text-sm text-console-muted shadow-sm">
+        <div className="mt-auto rounded-lg border border-console-line bg-console-panel px-3 py-3 text-sm text-console-muted shadow-xs">
           这个会话还没有消息。
         </div>
       )}
@@ -154,9 +154,9 @@ function isInitialProgress(item: TimelineItem): boolean {
 
 function AssistantBubble({ text }: { text: string }) {
   return (
-    <article className="mr-auto max-w-[88%] rounded-lg border border-console-line bg-console-panel px-3 py-2 text-sm leading-6 text-console-text shadow-sm">
+    <article className="mr-auto max-w-[88%] rounded-lg border border-console-line bg-console-panel px-3 py-2 text-sm leading-6 text-console-text shadow-xs">
       <div className="mb-1 text-[11px] font-medium text-console-muted">DataPilot</div>
-      <p className="whitespace-pre-wrap break-words">{withoutPercentages(text)}</p>
+      <p className="whitespace-pre-wrap wrap-break-word">{withoutPercentages(text)}</p>
     </article>
   );
 }
@@ -166,7 +166,7 @@ function MessageBubble({ message }: { message: ChatMessageRecord }) {
   return (
     <article
       className={cn(
-        "max-w-[88%] rounded-lg border px-3 py-2 text-sm leading-6 shadow-sm",
+        "max-w-[88%] rounded-lg border px-3 py-2 text-sm leading-6 shadow-xs",
         isUser
           ? "ml-auto border-console-cyan/25 bg-blue-50 text-console-text"
           : "mr-auto border-console-line bg-console-panel text-console-text",
@@ -175,7 +175,7 @@ function MessageBubble({ message }: { message: ChatMessageRecord }) {
       <div className="mb-1 text-[11px] font-medium text-console-muted">
         {isUser ? "You" : "DataPilot"}
       </div>
-      <p className="whitespace-pre-wrap break-words">
+      <p className="whitespace-pre-wrap wrap-break-word">
         {isUser ? message.content : withoutPercentages(message.content)}
       </p>
     </article>

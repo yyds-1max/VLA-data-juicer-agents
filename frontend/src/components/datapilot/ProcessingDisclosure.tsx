@@ -72,7 +72,7 @@ export function ProcessingDisclosure({
         aria-expanded={expanded}
         aria-controls={contentId}
         onClick={() => setExpanded((value) => !value)}
-        className="flex w-full items-center gap-1.5 border-b border-console-line/80 py-2 text-left text-sm text-console-muted transition motion-reduce:transition-none hover:text-console-text focus:outline-none focus-visible:ring-2 focus-visible:ring-console-cyan/60"
+        className="flex w-full items-center gap-1.5 border-b border-console-line/80 py-2 text-left text-sm text-console-muted transition motion-reduce:transition-none hover:text-console-text focus:outline-hidden focus-visible:ring-2 focus-visible:ring-console-cyan/60"
       >
         <span>{title}</span>
         <span aria-hidden="true">{duration}</span>
@@ -93,7 +93,7 @@ export function ProcessingDisclosure({
               <p
                 key={item.progressId ? `progress-${item.progressId}` : `progress-${index}`}
                 className={cn(
-                  "whitespace-pre-wrap break-words",
+                  "whitespace-pre-wrap wrap-break-word",
                   index === animatedProgressIndex && "datapilot-progress-wave",
                 )}
                 data-progress-id={item.progressId}
@@ -133,7 +133,7 @@ function PublicActionLine({ item }: { item: TimelineItem }) {
   return (
     <div className="flex min-w-0 items-center gap-2 text-xs text-console-muted" data-public-action={item.actionRef}>
       <ToolStatusDot status={status} />
-      <span className="min-w-0 break-words">{prefix}{label}</span>
+      <span className="min-w-0 wrap-break-word">{prefix}{label}</span>
     </div>
   );
 }

@@ -33,7 +33,7 @@ export function SessionHeader({ onHistory, onNewSession, onDragStart }: SessionH
           aria-label="History"
           onClick={onHistory}
           onPointerDown={(event) => event.stopPropagation()}
-          className="flex h-9 w-9 items-center justify-center rounded-lg text-console-muted transition-[background-color,color,transform] duration-150 hover:bg-console-panel2 hover:text-console-text active:scale-95 focus:outline-none focus:ring-2 focus:ring-console-cyan"
+          className="flex h-9 w-9 items-center justify-center rounded-lg text-console-muted transition-[background-color,color,transform] duration-150 hover:bg-console-panel2 hover:text-console-text active:scale-95 focus:outline-hidden focus:ring-2 focus:ring-console-cyan"
         >
           <History className="h-4 w-4" aria-hidden="true" />
         </button>
@@ -42,7 +42,7 @@ export function SessionHeader({ onHistory, onNewSession, onDragStart }: SessionH
           aria-label="New session"
           onClick={onNewSession}
           onPointerDown={(event) => event.stopPropagation()}
-          className="flex h-9 w-9 items-center justify-center rounded-lg text-console-muted transition-[background-color,color,transform] duration-150 hover:bg-console-panel2 hover:text-console-text active:scale-95 focus:outline-none focus:ring-2 focus:ring-console-cyan"
+          className="flex h-9 w-9 items-center justify-center rounded-lg text-console-muted transition-[background-color,color,transform] duration-150 hover:bg-console-panel2 hover:text-console-text active:scale-95 focus:outline-hidden focus:ring-2 focus:ring-console-cyan"
         >
           <Plus className="h-4 w-4" aria-hidden="true" />
         </button>
@@ -51,7 +51,7 @@ export function SessionHeader({ onHistory, onNewSession, onDragStart }: SessionH
           aria-label="Close DataPilot"
           onClick={() => setOpen(false)}
           onPointerDown={(event) => event.stopPropagation()}
-          className="flex h-9 w-9 items-center justify-center rounded-lg text-console-muted transition-[background-color,color,transform] duration-150 hover:bg-console-panel2 hover:text-console-text active:scale-95 focus:outline-none focus:ring-2 focus:ring-console-cyan"
+          className="flex h-9 w-9 items-center justify-center rounded-lg text-console-muted transition-[background-color,color,transform] duration-150 hover:bg-console-panel2 hover:text-console-text active:scale-95 focus:outline-hidden focus:ring-2 focus:ring-console-cyan"
         >
           <PanelRightClose className="h-4 w-4" aria-hidden="true" />
         </button>

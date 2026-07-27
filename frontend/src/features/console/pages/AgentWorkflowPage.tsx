@@ -71,7 +71,7 @@ export function AgentWorkflowPage({ onPlaceholderAction }: AgentWorkflowPageProp
                   aria-label={node.name}
                   aria-pressed={active}
                   className={cn(
-                    "group w-full cursor-grab rounded-lg border border-console-line bg-console-panel2/80 p-3 text-left transition focus:outline-none focus:ring-2 focus:ring-console-cyan",
+                    "group w-full cursor-grab rounded-lg border border-console-line bg-console-panel2/80 p-3 text-left transition focus:outline-hidden focus:ring-2 focus:ring-console-cyan",
                     active && "border-console-cyan/45 bg-console-panel shadow-[inset_3px_0_0_#2d6cdf]",
                     !active && "hover:border-console-cyan/35 hover:bg-console-panel2",
                   )}
@@ -107,8 +107,8 @@ export function AgentWorkflowPage({ onPlaceholderAction }: AgentWorkflowPageProp
           </div>
 
           <div className="overflow-x-auto rounded-lg border border-console-line bg-console-panel2/70">
-            <div className="relative min-h-[31rem] min-w-[620px]">
-              <div className="absolute inset-0 bg-[linear-gradient(rgba(100,116,139,0.12)_1px,transparent_1px),linear-gradient(90deg,rgba(100,116,139,0.12)_1px,transparent_1px)] bg-[size:32px_32px]" />
+            <div className="relative min-h-124 min-w-[620px]">
+              <div className="absolute inset-0 bg-[linear-gradient(rgba(100,116,139,0.12)_1px,transparent_1px),linear-gradient(90deg,rgba(100,116,139,0.12)_1px,transparent_1px)] bg-size-[32px_32px]" />
               <AgentConnectionCanvas nodes={workflowCoordinates} connections={agentConnections} className="absolute inset-0 h-full w-full" />
               {positionedNodes.map(({ node, x, y }) => {
                 if (!node) {
@@ -124,7 +124,7 @@ export function AgentWorkflowPage({ onPlaceholderAction }: AgentWorkflowPageProp
                     aria-label={`画布节点 ${node.name}`}
                     aria-pressed={active}
                     className={cn(
-                      "absolute w-36 -translate-x-1/2 -translate-y-1/2 rounded-lg border bg-console-panel p-3 text-left shadow-sm transition focus:outline-none focus:ring-2 focus:ring-console-cyan",
+                      "absolute w-36 -translate-x-1/2 -translate-y-1/2 rounded-lg border bg-console-panel p-3 text-left shadow-xs transition focus:outline-hidden focus:ring-2 focus:ring-console-cyan",
                       active ? "border-console-cyan text-console-cyan ring-2 ring-console-cyan/20" : "border-console-line text-console-text hover:border-console-cyan/45",
                     )}
                     style={{ left: `${x}%`, top: `${y}%` }}
@@ -153,11 +153,11 @@ export function AgentWorkflowPage({ onPlaceholderAction }: AgentWorkflowPageProp
                 <p className="mt-2 text-sm leading-6 text-console-muted">{selectedNode.desc}</p>
               </div>
               <div className="grid grid-cols-2 gap-2 text-sm">
-                <div className="rounded border border-console-line bg-console-panel2/70 p-3">
+                <div className="rounded-sm border border-console-line bg-console-panel2/70 p-3">
                   <p className="text-xs text-console-muted">输入</p>
                   <p className="mt-1 font-semibold text-console-text">batch.stream</p>
                 </div>
-                <div className="rounded border border-console-line bg-console-panel2/70 p-3">
+                <div className="rounded-sm border border-console-line bg-console-panel2/70 p-3">
                   <p className="text-xs text-console-muted">输出</p>
                   <p className="mt-1 font-semibold text-console-text">node.result</p>
                 </div>
@@ -177,7 +177,7 @@ export function AgentWorkflowPage({ onPlaceholderAction }: AgentWorkflowPageProp
                 ["连接数量", String(agentConnections.length)],
                 ["状态", "草稿"],
               ].map(([label, value]) => (
-                <div key={label} className="flex items-center justify-between gap-3 rounded border border-console-line bg-console-panel2/70 p-3 text-sm">
+                <div key={label} className="flex items-center justify-between gap-3 rounded-sm border border-console-line bg-console-panel2/70 p-3 text-sm">
                   <span className="text-console-muted">{label}</span>
                   <span className="font-semibold text-console-text">{value}</span>
                 </div>

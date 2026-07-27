@@ -64,7 +64,7 @@ export const Composer = forwardRef<HTMLTextAreaElement, ComposerProps>(function 
   return (
     <form
       onSubmit={handleSubmit}
-      className="flex min-h-14 items-end gap-2 rounded-[18px] border border-console-line/90 bg-console-panel/95 px-2.5 py-2.5 shadow-[0_2px_10px_rgba(23,32,46,0.06)] backdrop-blur-sm transition-[border-color,box-shadow] duration-150 focus-within:border-console-cyan/45 focus-within:shadow-[0_3px_12px_rgba(23,32,46,0.075)] motion-reduce:transition-none"
+      className="flex min-h-14 items-end gap-2 rounded-[18px] border border-console-line/90 bg-console-panel/95 px-2.5 py-2.5 shadow-[0_2px_10px_rgba(23,32,46,0.06)] backdrop-blur-xs transition-[border-color,box-shadow] duration-150 focus-within:border-console-cyan/45 focus-within:shadow-[0_3px_12px_rgba(23,32,46,0.075)] motion-reduce:transition-none"
     >
       <span
         className="flex h-9 w-9 shrink-0 items-center justify-center rounded-xl text-console-muted"
@@ -79,13 +79,13 @@ export const Composer = forwardRef<HTMLTextAreaElement, ComposerProps>(function 
         onChange={(event) => setMessage(event.target.value)}
         onKeyDown={handleKeyDown}
         placeholder={placeholder}
-        className="console-soft-scrollbar my-1 min-h-6 min-w-0 flex-1 resize-none bg-transparent text-sm leading-6 text-console-text outline-none transition-[height] duration-100 placeholder:text-console-muted motion-reduce:transition-none"
+        className="console-soft-scrollbar my-1 min-h-6 min-w-0 flex-1 resize-none bg-transparent text-sm leading-6 text-console-text outline-hidden transition-[height] duration-100 placeholder:text-console-muted motion-reduce:transition-none"
       />
       <button
         type="submit"
         aria-label={interrupting ? "Interrupt requested" : running ? "Stop current run" : "Send message"}
         disabled={interrupting}
-        className="flex h-9 w-9 shrink-0 items-center justify-center rounded-xl bg-console-text text-white transition motion-reduce:transition-none hover:bg-slate-800 focus:outline-none focus:ring-2 focus:ring-console-cyan focus:ring-offset-2 focus:ring-offset-console-bg"
+        className="flex h-9 w-9 shrink-0 items-center justify-center rounded-xl bg-console-text text-white transition motion-reduce:transition-none hover:bg-slate-800 focus:outline-hidden focus:ring-2 focus:ring-console-cyan focus:ring-offset-2 focus:ring-offset-console-bg"
       >
         {interrupting ? (
           <LoaderCircle className="h-5 w-5 motion-safe:animate-spin" aria-hidden="true" />

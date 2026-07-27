@@ -43,7 +43,7 @@ export function TaskStrip({ tasks }: TaskStripProps) {
     >
       <div className="pointer-events-auto relative max-w-[50%]">
         <div
-          className="flex w-max max-w-full cursor-default items-center gap-2 overflow-hidden whitespace-nowrap rounded-full border border-console-line bg-console-panel/95 px-3 py-2 text-xs text-console-text shadow-[0_6px_18px_rgba(23,32,46,0.09)] backdrop-blur-sm outline-none transition-[width,border-color,box-shadow] duration-300 ease-[cubic-bezier(0.22,1,0.36,1)] hover:border-console-cyan/35 hover:shadow-[0_8px_22px_rgba(23,32,46,0.12)] focus-visible:border-console-cyan/50 focus-visible:ring-2 focus-visible:ring-console-cyan/20 motion-reduce:transition-none"
+          className="flex w-max max-w-full cursor-default items-center gap-2 overflow-hidden whitespace-nowrap rounded-full border border-console-line bg-console-panel/95 px-3 py-2 text-xs text-console-text shadow-[0_6px_18px_rgba(23,32,46,0.09)] backdrop-blur-xs outline-hidden transition-[width,border-color,box-shadow] duration-300 ease-[cubic-bezier(0.22,1,0.36,1)] hover:border-console-cyan/35 hover:shadow-[0_8px_22px_rgba(23,32,46,0.12)] focus-visible:border-console-cyan/50 focus-visible:ring-2 focus-visible:ring-console-cyan/20 motion-reduce:transition-none"
           style={capsuleWidth ? { width: `${capsuleWidth}px` } : undefined}
           tabIndex={0}
           aria-label={`导航任务 ${task.task_ref}，${phase}，${presentation.label}`}
@@ -85,9 +85,9 @@ export function TaskStrip({ tasks }: TaskStripProps) {
           </div>
           <dl className="mt-3 grid grid-cols-[56px_minmax(0,1fr)] gap-x-2 gap-y-1.5 text-[11px] leading-4">
             <dt className="text-console-muted">当前阶段</dt>
-            <dd className="min-w-0 break-words text-console-text">{phase}</dd>
+            <dd className="min-w-0 wrap-break-word text-console-text">{phase}</dd>
             <dt className="text-console-muted">处理范围</dt>
-            <dd className="min-w-0 break-words text-console-text">{task.dataset_date} · {selection}</dd>
+            <dd className="min-w-0 wrap-break-word text-console-text">{task.dataset_date} · {selection}</dd>
             {runtime ? (
               <>
                 <dt className="text-console-muted">耗时</dt>
@@ -101,7 +101,7 @@ export function TaskStrip({ tasks }: TaskStripProps) {
               </>
             ) : null}
             <dt className="text-console-muted">最新状态</dt>
-            <dd className="min-w-0 break-words text-console-text">{latestUpdate}</dd>
+            <dd className="min-w-0 wrap-break-word text-console-text">{latestUpdate}</dd>
           </dl>
         </div>
       </div>

@@ -351,7 +351,7 @@ test("data management renders navigation dataset date and clip details", async (
   expect(screen.getByText("原始 clip")).toBeVisible();
   expect(screen.getByText("已同步 clip")).toBeVisible();
   expect(screen.getByTestId("navigation-summary-strip")).toHaveClass("bg-transparent");
-  expect(screen.getByTestId("navigation-summary-strip")).not.toHaveClass("rounded-lg", "border", "shadow-sm");
+  expect(screen.getByTestId("navigation-summary-strip")).not.toHaveClass("rounded-lg", "border", "shadow-xs");
   expect(screen.getByTestId("navigation-summary-strip")).toHaveTextContent("总采集时长3.5 秒");
   expect(screen.getByTestId("navigation-summary-strip")).toHaveTextContent("同步图像帧3");
   expect(screen.getByTestId("navigation-process-overview")).toHaveTextContent("raw_data");
@@ -1038,7 +1038,7 @@ test("DataPilot window remains above the console content", async () => {
 
   const dialog = screen.getByRole("dialog", { name: "DataPilot" });
   expect(dialog.className).toContain("fixed");
-  expect(dialog.className).toContain("z-[80]");
+  expect(dialog.className).toContain("z-80");
 });
 
 test("DataPilot window can be dragged from its title bar", async () => {

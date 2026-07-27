@@ -27,8 +27,8 @@ export function SegmentedTabs<T extends string>({ value, tabs, onChange, idPrefi
             aria-selected={active}
             aria-controls={panelId}
             className={cn(
-              "h-8 rounded-md px-3 text-xs font-medium text-console-muted transition focus:outline-none focus:ring-2 focus:ring-console-cyan",
-              active && "bg-console-panel text-console-text shadow-sm",
+              "h-8 rounded-md px-3 text-xs font-medium text-console-muted transition focus:outline-hidden focus:ring-2 focus:ring-console-cyan",
+              active && "bg-console-panel text-console-text shadow-xs",
               !active && "hover:bg-console-panel hover:text-console-text",
             )}
             onClick={() => {

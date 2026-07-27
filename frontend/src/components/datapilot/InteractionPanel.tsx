@@ -47,7 +47,7 @@ export function InteractionPanel({
     >
       <div
         data-interaction-surface="content"
-        className="rounded-2xl border border-console-line/90 bg-console-panel/95 p-3 shadow-[0_2px_10px_rgba(23,32,46,0.06)] backdrop-blur-sm"
+        className="rounded-2xl border border-console-line/90 bg-console-panel/95 p-3 shadow-[0_2px_10px_rgba(23,32,46,0.06)] backdrop-blur-xs"
       >
         <div className="flex items-start gap-2.5">
           {interaction.risk === "high" ? (
@@ -63,7 +63,7 @@ export function InteractionPanel({
               {withoutPercentages(interaction.title)}
             </h2>
             {interaction.summary ? (
-              <p className="mt-1 whitespace-pre-wrap break-words text-xs leading-5 text-console-muted">
+              <p className="mt-1 whitespace-pre-wrap wrap-break-word text-xs leading-5 text-console-muted">
                 {withoutPercentages(interaction.summary)}
               </p>
             ) : null}
@@ -86,7 +86,7 @@ export function InteractionPanel({
               disabled={submitting || expired}
               onClick={() => choose(option.option_id)}
               className={cn(
-                "flex min-h-11 min-w-[8rem] flex-1 basis-[8.5rem] items-center justify-center gap-2 rounded-xl border px-3 py-2 text-sm font-medium shadow-[0_1px_7px_rgba(23,32,46,0.045)] transition-[border-color,background-color,box-shadow,transform] duration-150 motion-reduce:transition-none focus:outline-none focus-visible:ring-2 focus-visible:ring-console-cyan/60 disabled:cursor-not-allowed disabled:opacity-60",
+                "flex min-h-11 min-w-32 flex-1 basis-34 items-center justify-center gap-2 rounded-xl border px-3 py-2 text-sm font-medium shadow-[0_1px_7px_rgba(23,32,46,0.045)] transition-[border-color,background-color,box-shadow,transform] duration-150 motion-reduce:transition-none focus:outline-hidden focus-visible:ring-2 focus-visible:ring-console-cyan/60 disabled:cursor-not-allowed disabled:opacity-60",
                 option.tone === "danger" || option.destructive
                   ? "border-rose-200 bg-white text-rose-700 hover:border-rose-300 hover:bg-rose-50/70"
                   : option.tone === "primary"
@@ -115,7 +115,7 @@ export function InteractionPanel({
           type="button"
           disabled={selected.length === 0 || submitting || expired}
           onClick={() => onSubmit(selected)}
-          className="mt-2 min-h-11 w-full rounded-xl bg-console-text px-3 py-2 text-sm font-medium text-white shadow-[0_1px_7px_rgba(23,32,46,0.06)] transition motion-reduce:transition-none hover:bg-slate-800 focus:outline-none focus-visible:ring-2 focus-visible:ring-console-cyan/60 disabled:cursor-not-allowed disabled:opacity-50"
+          className="mt-2 min-h-11 w-full rounded-xl bg-console-text px-3 py-2 text-sm font-medium text-white shadow-[0_1px_7px_rgba(23,32,46,0.06)] transition motion-reduce:transition-none hover:bg-slate-800 focus:outline-hidden focus-visible:ring-2 focus-visible:ring-console-cyan/60 disabled:cursor-not-allowed disabled:opacity-50"
         >
           {submitting ? "正在提交…" : "提交选择"}
         </button>

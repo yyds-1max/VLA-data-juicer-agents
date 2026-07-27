@@ -8,7 +8,7 @@ type ConsoleHeaderProps = {
 
 export function ConsoleHeader({ title }: ConsoleHeaderProps) {
   return (
-    <header className="sticky top-[6.75rem] z-10 border-b border-console-line bg-console-bg/92 px-4 py-4 backdrop-blur md:top-0 md:px-6">
+    <header className="sticky top-27 z-10 border-b border-console-line bg-console-bg/92 px-4 py-4 backdrop-blur-sm md:top-0 md:px-6">
       <div className="flex flex-col gap-4 lg:flex-row lg:items-center lg:justify-between">
         <div className="min-w-0">
           <div className="flex flex-wrap items-center gap-2">
@@ -25,20 +25,20 @@ export function ConsoleHeader({ title }: ConsoleHeaderProps) {
               type="search"
               aria-label="搜索数据、模型、任务"
               placeholder="搜索数据、模型、任务..."
-              className="h-10 w-full rounded-lg border border-console-line bg-console-panel py-2 pl-9 pr-3 text-sm text-console-text shadow-sm placeholder:text-console-muted focus:border-console-cyan/60 focus:outline-none focus:ring-2 focus:ring-console-cyan/20"
+              className="h-10 w-full rounded-lg border border-console-line bg-console-panel py-2 pl-9 pr-3 text-sm text-console-text shadow-xs placeholder:text-console-muted focus:border-console-cyan/60 focus:outline-hidden focus:ring-2 focus:ring-console-cyan/20"
             />
           </label>
 
           <button
             type="button"
             aria-label="Notifications"
-            className="relative flex h-10 w-10 shrink-0 items-center justify-center rounded-lg border border-console-line bg-console-panel text-console-muted shadow-sm transition hover:border-console-cyan/40 hover:text-console-cyan focus:outline-none focus:ring-2 focus:ring-console-cyan"
+            className="relative flex h-10 w-10 shrink-0 items-center justify-center rounded-lg border border-console-line bg-console-panel text-console-muted shadow-xs transition hover:border-console-cyan/40 hover:text-console-cyan focus:outline-hidden focus:ring-2 focus:ring-console-cyan"
           >
             <Bell className="h-4 w-4" aria-hidden="true" />
             <span className="absolute right-2.5 top-2.5 h-2 w-2 rounded-full bg-rose-500" aria-hidden="true" />
           </button>
 
-          <div className="flex h-10 shrink-0 items-center gap-2 rounded-lg border border-console-line bg-console-panel px-3 text-sm text-console-muted shadow-sm">
+          <div className="flex h-10 shrink-0 items-center gap-2 rounded-lg border border-console-line bg-console-panel px-3 text-sm text-console-muted shadow-xs">
             <span className="h-2 w-2 rounded-full bg-emerald-600" aria-hidden="true" />
             系统在线
           </div>

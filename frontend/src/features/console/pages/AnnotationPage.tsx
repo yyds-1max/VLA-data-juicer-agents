@@ -261,7 +261,7 @@ function JobRow({
       </p>
       <button
         type="button"
-        className="justify-self-start text-sm font-medium text-console-cyan transition hover:text-blue-700 hover:underline focus:outline-none focus-visible:underline"
+        className="justify-self-start text-sm font-medium text-console-cyan transition hover:text-blue-700 hover:underline focus:outline-hidden focus-visible:underline"
         aria-label={actionLabel ? `${actionLabel} ${job.dataset_date}` : `查看任务 ${job.dataset_date}`}
         onClick={onOpen}
       >
@@ -308,7 +308,7 @@ function JobsSection({
       </div>
       {jobs.length > 0 && (
         <div className="mx-4 mb-3 overflow-x-auto border-y border-console-line">
-          <div className="min-w-[47rem]">
+          <div className="min-w-188">
             <div
               className={`hidden gap-2 border-b border-console-line bg-slate-100/80 px-3 py-1.5 text-[11px] font-medium text-console-muted ${JOB_TABLE_GRID_LARGE_CLASS} lg:grid`}
               data-testid="annotation-job-table-header"
@@ -592,7 +592,7 @@ function JobsPage() {
   const completedJobs = jobs.filter((job) => job.status === "tracked").length;
 
   return (
-    <section className="mx-auto max-w-[90rem] space-y-3 px-3 pb-28 pt-4 md:px-4 lg:px-5">
+    <section className="mx-auto max-w-360 space-y-3 px-3 pb-28 pt-4 md:px-4 lg:px-5">
       <div className="flex flex-col gap-3 sm:flex-row sm:items-start sm:justify-between">
         <div>
           <div className="flex flex-wrap items-center gap-3">
@@ -784,7 +784,7 @@ function JobsPage() {
                               setHistoryPage(1);
                             }}
                             placeholder="搜索 clip 或标定参数"
-                            className="h-10 w-full rounded-lg border border-console-line bg-white pl-10 pr-3 text-sm text-console-text outline-none transition placeholder:text-console-muted focus:border-console-cyan focus:ring-2 focus:ring-console-cyan/15"
+                            className="h-10 w-full rounded-lg border border-console-line bg-white pl-10 pr-3 text-sm text-console-text outline-hidden transition placeholder:text-console-muted focus:border-console-cyan focus:ring-2 focus:ring-console-cyan/15"
                           />
                         </label>
                         <label className="flex min-w-0 items-center gap-2">
@@ -796,7 +796,7 @@ function JobsPage() {
                               setHistoryStatus(event.target.value as "all" | AnnotationJobStatus);
                               setHistoryPage(1);
                             }}
-                            className="h-10 w-full rounded-lg border border-console-line bg-white px-3 text-sm text-console-text outline-none transition focus:border-console-cyan focus:ring-2 focus:ring-console-cyan/15 lg:w-36"
+                            className="h-10 w-full rounded-lg border border-console-line bg-white px-3 text-sm text-console-text outline-hidden transition focus:border-console-cyan focus:ring-2 focus:ring-console-cyan/15 lg:w-36"
                           >
                             <option value="all">全部</option>
                             <option value="tracked">Tracking 已完成</option>
@@ -819,7 +819,7 @@ function JobsPage() {
                                 setHistoryStartDate(event.target.value);
                                 setHistoryPage(1);
                               }}
-                              className="min-w-0 flex-1 bg-transparent text-xs text-console-text outline-none"
+                              className="min-w-0 flex-1 bg-transparent text-xs text-console-text outline-hidden"
                             />
                             <span className="text-console-muted" aria-hidden="true">→</span>
                             <input
@@ -830,14 +830,14 @@ function JobsPage() {
                                 setHistoryEndDate(event.target.value);
                                 setHistoryPage(1);
                               }}
-                              className="min-w-0 flex-1 bg-transparent text-xs text-console-text outline-none"
+                              className="min-w-0 flex-1 bg-transparent text-xs text-console-text outline-hidden"
                             />
                           </div>
                         </div>
                         <button
                           type="button"
                           disabled={!historyFiltersActive}
-                          className="h-10 shrink-0 rounded-lg border border-console-line bg-white px-3.5 text-sm font-medium text-console-text transition hover:bg-console-panel2 focus:outline-none focus-visible:ring-2 focus-visible:ring-console-cyan/20 disabled:cursor-default disabled:opacity-45 disabled:hover:bg-white"
+                          className="h-10 shrink-0 rounded-lg border border-console-line bg-white px-3.5 text-sm font-medium text-console-text transition hover:bg-console-panel2 focus:outline-hidden focus-visible:ring-2 focus-visible:ring-console-cyan/20 disabled:cursor-default disabled:opacity-45 disabled:hover:bg-white"
                           onClick={() => {
                             setHistoryQuery("");
                             setHistoryStatus("all");
@@ -851,7 +851,7 @@ function JobsPage() {
                       </div>
                     <div className="mx-4 mb-3 overflow-hidden border-y border-console-line">
                       <div className="overflow-x-auto">
-                        <div className="min-w-[47rem]">
+                        <div className="min-w-188">
                           <div
                             className={`grid gap-2 border-b border-console-line bg-slate-100/80 px-3 py-1.5 text-[11px] font-medium text-console-muted ${JOB_TABLE_GRID_CLASS}`}
                             data-testid="annotation-history-table-header"
@@ -940,14 +940,14 @@ function JobsPage() {
       >
         <Dialog.Portal>
           <Dialog.Overlay
-            className="fixed inset-0 z-[90] bg-slate-950/35 backdrop-blur-[1px]"
+            className="fixed inset-0 z-90 bg-slate-950/35 backdrop-blur-[1px]"
             data-testid="create-annotation-job-overlay"
             onMouseDown={remindCreateDialog}
           />
           <Dialog.Content
             ref={createDialogRef}
             aria-describedby="create-annotation-job-description"
-            className={`fixed left-1/2 top-1/2 z-[91] flex max-h-[calc(100vh-2rem)] w-[calc(100vw-2rem)] max-w-2xl -translate-x-1/2 -translate-y-1/2 flex-col overflow-hidden rounded-xl border border-console-line bg-console-panel shadow-2xl outline outline-2 outline-offset-2 outline-transparent focus:outline-none ${
+            className={`fixed left-1/2 top-1/2 z-91 flex max-h-[calc(100vh-2rem)] w-[calc(100vw-2rem)] max-w-2xl -translate-x-1/2 -translate-y-1/2 flex-col overflow-hidden rounded-xl border border-console-line bg-console-panel shadow-2xl outline outline-2 outline-offset-2 outline-transparent focus:outline-hidden ${
               createDialogAttention === 1
                 ? "animate-[navigation-dialog-attention-a_760ms_ease-in-out] motion-reduce:animate-none motion-reduce:outline-slate-400"
                 : createDialogAttention === 2
@@ -978,7 +978,7 @@ function JobsPage() {
                 type="button"
                 aria-label="关闭创建任务"
                 disabled={creating}
-                className="flex h-8 w-8 shrink-0 items-center justify-center rounded-lg text-console-muted transition hover:bg-console-panel2 hover:text-console-text focus:outline-none focus-visible:bg-console-panel2 focus-visible:text-console-text disabled:cursor-not-allowed disabled:opacity-40"
+                className="flex h-8 w-8 shrink-0 items-center justify-center rounded-lg text-console-muted transition hover:bg-console-panel2 hover:text-console-text focus:outline-hidden focus-visible:bg-console-panel2 focus-visible:text-console-text disabled:cursor-not-allowed disabled:opacity-40"
                 onClick={() => setShowCreate(false)}
               >
                 <X className="h-4 w-4" aria-hidden="true" />
@@ -993,7 +993,7 @@ function JobsPage() {
                     aria-label="自动标注数据日期"
                     value={selectedDate}
                     disabled={creating}
-                    className="h-10 w-full rounded-lg border border-console-line bg-white px-3 text-sm text-console-text outline-none transition focus:border-console-cyan focus:ring-2 focus:ring-console-cyan/15 disabled:cursor-not-allowed disabled:opacity-60"
+                    className="h-10 w-full rounded-lg border border-console-line bg-white px-3 text-sm text-console-text outline-hidden transition focus:border-console-cyan focus:ring-2 focus:ring-console-cyan/15 disabled:cursor-not-allowed disabled:opacity-60"
                     onChange={(event) => void chooseDate(event.target.value)}
                   >
                     <option value="">请选择已同步日期</option>
@@ -1006,7 +1006,7 @@ function JobsPage() {
                     aria-label="当天处理标定"
                     value={selectedProfile}
                     disabled={creating}
-                    className="h-10 w-full rounded-lg border border-console-line bg-white px-3 text-sm text-console-text outline-none transition focus:border-console-cyan focus:ring-2 focus:ring-console-cyan/15 disabled:cursor-not-allowed disabled:opacity-60"
+                    className="h-10 w-full rounded-lg border border-console-line bg-white px-3 text-sm text-console-text outline-hidden transition focus:border-console-cyan focus:ring-2 focus:ring-console-cyan/15 disabled:cursor-not-allowed disabled:opacity-60"
                     onChange={(event) => {
                       setSelectedProfile(event.target.value);
                       setCreateError("");
@@ -1027,7 +1027,7 @@ function JobsPage() {
                   {availableClips.length > 0 && (
                     <button
                       type="button"
-                      className="text-xs font-medium text-console-cyan hover:text-blue-700 focus:outline-none focus:underline"
+                      className="text-xs font-medium text-console-cyan hover:text-blue-700 focus:outline-hidden focus:underline"
                       onClick={() => setSelectedClips(
                         selectedClips.length === availableClips.length
                           ? []
@@ -1152,7 +1152,7 @@ function SegmentQueue({
                 <button
                   key={segment.segment_ref}
                   type="button"
-                  className={`w-full rounded-md border border-transparent px-2.5 py-2.5 text-left transition focus:outline-none focus:ring-2 focus:ring-console-cyan ${
+                  className={`w-full rounded-md border border-transparent px-2.5 py-2.5 text-left transition focus:outline-hidden focus:ring-2 focus:ring-console-cyan ${
                     currentSegmentRef === segment.segment_ref
                       ? "bg-blue-50 text-console-text shadow-[inset_3px_0_0_#2d6cdf]"
                       : "hover:bg-console-panel2"
@@ -1559,7 +1559,7 @@ function SegmentPage({ jobRef, segmentRef }: { jobRef: string; segmentRef: strin
 
   if (loading || !job || !segment) {
     return (
-      <section className="mx-auto max-w-[96rem] px-4 py-6 md:px-6">
+      <section className="mx-auto max-w-384 px-4 py-6 md:px-6">
         {loading
           ? <PageMessage icon={LoaderCircle} title="正在恢复首帧标注工作台…" />
           : <PageMessage title="无法打开 Segment" detail={error} />}
@@ -1570,7 +1570,7 @@ function SegmentPage({ jobRef, segmentRef }: { jobRef: string; segmentRef: strin
   const status = SEGMENT_STATUS[segment.status];
 
   return (
-    <section className="mx-auto max-w-[110rem] space-y-3 px-3 py-3 md:px-4 xl:flex xl:h-[calc(100dvh-7.5rem)] xl:min-h-[44rem] xl:flex-col xl:overflow-hidden">
+    <section className="mx-auto max-w-[110rem] space-y-3 px-3 py-3 md:px-4 xl:flex xl:h-[calc(100dvh-7.5rem)] xl:min-h-176 xl:flex-col xl:overflow-hidden">
       <DataRouterFlushBlocker
         enabled={Boolean(editable)}
         flush={flushForNavigation}
@@ -1719,10 +1719,10 @@ function SegmentPage({ jobRef, segmentRef }: { jobRef: string; segmentRef: strin
         }}
       >
         <Dialog.Portal>
-          <Dialog.Overlay className="fixed inset-0 z-[90] bg-slate-950/35 backdrop-blur-[1px]" />
+          <Dialog.Overlay className="fixed inset-0 z-90 bg-slate-950/35 backdrop-blur-[1px]" />
           <Dialog.Content
             aria-describedby="skip-segment-description"
-            className="fixed left-1/2 top-1/2 z-[91] w-[calc(100vw-2rem)] max-w-lg -translate-x-1/2 -translate-y-1/2 overflow-hidden rounded-xl border border-console-line bg-console-panel shadow-2xl focus:outline-none"
+            className="fixed left-1/2 top-1/2 z-91 w-[calc(100vw-2rem)] max-w-lg -translate-x-1/2 -translate-y-1/2 overflow-hidden rounded-xl border border-console-line bg-console-panel shadow-2xl focus:outline-hidden"
           >
             <div className="flex items-start justify-between gap-4 border-b border-console-line px-5 py-4">
               <div>
@@ -1735,7 +1735,7 @@ function SegmentPage({ jobRef, segmentRef }: { jobRef: string; segmentRef: strin
                 type="button"
                 aria-label="关闭跳过 Segment"
                 disabled={acting}
-                className="flex h-8 w-8 shrink-0 items-center justify-center rounded-lg text-console-muted transition hover:bg-console-panel2 hover:text-console-text focus:outline-none focus:ring-2 focus:ring-console-cyan disabled:opacity-40"
+                className="flex h-8 w-8 shrink-0 items-center justify-center rounded-lg text-console-muted transition hover:bg-console-panel2 hover:text-console-text focus:outline-hidden focus:ring-2 focus:ring-console-cyan disabled:opacity-40"
                 onClick={() => setShowSkip(false)}
               >
                 <X className="h-4 w-4" aria-hidden="true" />

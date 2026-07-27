@@ -36,7 +36,7 @@ export function ConsoleSidebar({ activePage, collapsed, onCollapsedChange }: Con
       data-testid="console-sidebar"
       data-collapsed={collapsed ? "true" : "false"}
       className={cn(
-        "fixed inset-x-0 top-0 z-20 border-b border-console-line bg-console-panel/95 px-4 shadow-sm backdrop-blur md:inset-y-0 md:left-0 md:right-auto md:border-b-0 md:border-r md:px-0 md:shadow-none md:transition-[width] md:duration-200",
+        "fixed inset-x-0 top-0 z-20 border-b border-console-line bg-console-panel/95 px-4 shadow-xs backdrop-blur-sm md:inset-y-0 md:left-0 md:right-auto md:border-b-0 md:border-r md:px-0 md:shadow-none md:transition-[width] md:duration-200",
         collapsed ? "md:w-20" : "md:w-64",
       )}
     >
@@ -47,7 +47,7 @@ export function ConsoleSidebar({ activePage, collapsed, onCollapsedChange }: Con
             collapsed && "md:justify-center md:px-3",
           )}
         >
-          <div className="flex h-10 w-10 shrink-0 items-center justify-center rounded-lg border border-console-line bg-white p-1.5 shadow-sm">
+          <div className="flex h-10 w-10 shrink-0 items-center justify-center rounded-lg border border-console-line bg-white p-1.5 shadow-xs">
             <img
               src="/brand/wise-explore-favicon.png"
               alt="智瀚星途 logo"
@@ -82,7 +82,7 @@ export function ConsoleSidebar({ activePage, collapsed, onCollapsedChange }: Con
                       type="button"
                       aria-label={collapsed ? "展开侧边栏" : "收起侧边栏"}
                       title={collapsed ? "展开侧边栏" : "收起侧边栏"}
-                      className="flex h-8 w-8 shrink-0 items-center justify-center rounded-md text-console-muted transition hover:bg-console-panel2 hover:text-console-text focus:outline-none focus-visible:bg-console-panel2 focus-visible:text-console-text"
+                      className="flex h-8 w-8 shrink-0 items-center justify-center rounded-md text-console-muted transition hover:bg-console-panel2 hover:text-console-text focus:outline-hidden focus-visible:bg-console-panel2 focus-visible:text-console-text"
                       onClick={() => onCollapsedChange(!collapsed)}
                     >
                       {collapsed ? (
@@ -98,7 +98,7 @@ export function ConsoleSidebar({ activePage, collapsed, onCollapsedChange }: Con
                   aria-current={activePage === item.id ? "page" : undefined}
                   title={collapsed ? item.label : undefined}
                   className={cn(
-                    "flex h-10 w-max min-w-32 shrink-0 items-center gap-2 rounded-lg border border-transparent bg-transparent px-3 text-left text-sm text-console-muted transition hover:bg-console-panel2 hover:text-console-text focus:outline-none focus:ring-2 focus:ring-console-cyan md:w-full",
+                    "flex h-10 w-max min-w-32 shrink-0 items-center gap-2 rounded-lg border border-transparent bg-transparent px-3 text-left text-sm text-console-muted transition hover:bg-console-panel2 hover:text-console-text focus:outline-hidden focus:ring-2 focus:ring-console-cyan md:w-full",
                     collapsed && "md:min-w-0 md:justify-center md:px-0",
                     activePage === item.id &&
                       "border-console-line bg-console-panel2 text-console-text shadow-[inset_3px_0_0_#2d6cdf]",
