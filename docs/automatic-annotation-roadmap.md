@@ -1,6 +1,6 @@
 # 自动标注板块总体开发路线
 
-> 状态：已批准；M1 Web 首帧标注与 Tracking 已完成功能冻结，下一阶段为 M1.5 前端基础设施迁移
+> 状态：已批准；M1 Web 首帧标注与 Tracking 已完成功能冻结，M1.5 前端基础设施迁移开发中
 > 最后更新：2026-07-27
 > 适用范围：导航数据自动标注、后处理、三维轨迹复核/Fix，以及后续可复用的标注领域能力  
 > 优先级：本文件在自动标注范围内优先于 `architecture.md` 中的历史占位描述
@@ -397,3 +397,14 @@ AppleDouble 文件不属于业务输入，拆包发现与 raw 同源比较均须
   版本与确定性安装契约解决；
 - M1.5 只进行前端基础设施迁移，不得修改本次冻结的 Annotation/Tracking 业务
   契约。
+
+### M1.5（2026-07-27，已启动）
+
+- 开发基线固定为 `a7315ca`，开发分支为
+  `codex/automatic-annotation-m1-5`；
+- 权威任务级计划为 `docs/automatic-annotation-m1-5-plan.md`；
+- 本里程碑只迁移 Node/npm、Tailwind、Radix/shadcn、路由拆包和前端设计系统，
+  不修改 M1 Annotation/Tracking 业务契约，也不运行真实服务器 writer；
+- 服务器非交互 shell 误用 Node `10.19.0` 的问题在本里程碑通过显式 Node
+  版本和构建预检契约解决；
+- 服务器最终只进行确定性依赖安装、生产构建、页面和只读 API smoke。
