@@ -390,5 +390,10 @@ AppleDouble 文件不属于业务输入，拆包发现与 raw 同源比较均须
 - 服务器私有 `web.log` 有两条不经 API/UI 暴露的第三方 WebSocket 弃用告警，
   其中包含 Python 包源码路径；公开响应零路径门禁通过，但不声称所有私有日志
   绝对零路径；
+- 功能冻结代码提交为 `01f57b6`；随后的收尾提交只补录部署事实，不改变构建
+  产物。本地与服务器工作树均干净；服务器用 nvm Node `20.20.2` / npm
+  `10.8.2` 构建重启后，前端深链接和 Annotation capability 均为 200，Runtime
+  `available=true`。非交互 shell 默认 Node `10.19.0` 的陷阱由 M1.5 的 Node
+  版本与确定性安装契约解决；
 - M1.5 只进行前端基础设施迁移，不得修改本次冻结的 Annotation/Tracking 业务
   契约。

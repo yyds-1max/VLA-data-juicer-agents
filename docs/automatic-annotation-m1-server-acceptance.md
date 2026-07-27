@@ -824,6 +824,17 @@ PASS。
 - frozen Runtime 和 annotation work root 无 group/other writable 项或 symlink；
   Annotation DB 权限为 `0600`。
 
+功能冻结代码提交为 `01f57b6`；随后的收尾提交只补录部署事实，不改变构建产物。
+本地与服务器分支均为 `codex/automatic-annotation-m1` 且工作树干净。服务器使用用户 nvm 中的
+Node `20.20.2` / npm `10.8.2` 完成 production build 和服务重启；
+`/annotation/jobs` 与 `/api/annotation/capabilities` 均返回 200，公开 capability
+为 `available=true / navigation_odom_v1`。
+
+服务器非交互 shell 默认使用 `/usr/bin/node` `10.19.0` 和 npm `6.14.4`，会在
+TypeScript 解析阶段失败；交互 shell 使用的 nvm Node 才是本次已通过构建的环境。
+因此未来非交互部署不得隐式依赖 shell profile，必须显式激活批准的 Node Runtime。
+Node 版本文件、package `engines` 和确定性安装策略在 M1.5 中统一固化。
+
 服务器私有 `web.log` 当前有两条第三方 WebSocket 弃用告警，告警前缀包含 Python
 包源码绝对路径；该文件不经 API/UI 暴露。因此“公开响应零路径”门禁通过，但
 不能声称“所有私有日志也绝对零路径”。后续若采用后一更强口径，应通过依赖升级

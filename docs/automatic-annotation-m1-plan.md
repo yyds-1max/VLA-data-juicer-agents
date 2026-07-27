@@ -332,6 +332,14 @@ GPU 和 bubblewrap 已复核。Legacy YAML sandbox-only target 的无业务 smok
 - frozen Runtime 与 annotation work root 无 group/other writable 项和 symlink，
   Annotation DB 权限为 `0600`。
 
+功能冻结代码提交为 `01f57b6`；随后的收尾提交只补录部署事实，不改变构建产物。
+本地与服务器均位于 `codex/automatic-annotation-m1` 且工作树干净；服务器使用用户 nvm 中的
+Node `20.20.2` / npm `10.8.2` 完成生产构建并重启，前端深链接和 Annotation
+capability API 均返回 200，公开 capability 为
+`available=true / navigation_odom_v1`。服务器非交互 shell 默认仍指向
+Node `10.19.0`，不能解析当前 TypeScript；后续自动部署必须显式激活已批准的
+Node 环境，M1.5 再将 Node 版本和确定性安装方式固化为仓库契约。
+
 由于 writer 前没有独立保存污染 fingerprint，上述 mtime、结构和 manifest 证据
 只能证明“未发现 M1 后写入”，不能数学证明不存在删除或保留 mtime 的替换。
 私有日志也不满足“所有私有日志绝对零路径”的更强口径；若未来采用该口径，应
