@@ -22,10 +22,13 @@ LOG_DIR="${LOG_DIR:-${STATE_DIR}/logs}"
 LOG_FILE="${LOG_FILE:-${LOG_DIR}/web.log}"
 FRONTEND_DIST="${FRONTEND_DIST:-${ROOT_DIR}/frontend/dist}"
 SKIP_FRONTEND_BUILD="${SKIP_FRONTEND_BUILD:-0}"
+VLA_FRONTEND_NODE_BIN_DIR="${VLA_FRONTEND_NODE_BIN_DIR:-}"
 VLA_VLADATASETS_ROOT="${VLA_VLADATASETS_ROOT:-/media/heying/hy_data1/VLADatasets}"
 WEB_CMD="${WEB_CMD:-}"
 CONTROL_PYTHON="${RUN_WEB_CONTROL_PYTHON:-}"
 CONTROL_HELPER="${ROOT_DIR}/scripts/run_web_control.py"
+REQUIRED_FRONTEND_NODE_VERSION="24.18.0"
+REQUIRED_FRONTEND_NPM_VERSION="11.16.0"
 
 usage() {
   cat <<USAGE
@@ -52,6 +55,9 @@ Environment:
   LOG_DIR               Log directory. Default: STATE_DIR/logs
   LOG_FILE              Log file path. Default: .djx/logs/web.log
   SKIP_FRONTEND_BUILD   Set to 1 to reuse existing frontend/dist.
+  VLA_FRONTEND_NODE_BIN_DIR
+                        Optional directory containing the required Node.js and npm binaries.
+                        It is prepended to PATH only for the frontend build.
   WEB_CMD               Override vla-data-agent-web command path.
   RUN_WEB_CONTROL_PYTHON
                         Python 3 used for safe PID/control operations.
@@ -236,7 +242,52 @@ build_frontend() {
   fi
 
   echo "Building frontend..."
-  (cd "${ROOT_DIR}/frontend" && npm run build)
+  (
+    if [[ -n "${VLA_FRONTEND_NODE_BIN_DIR}" ]]; then
+      if [[ "${VLA_FRONTEND_NODE_BIN_DIR}" != /* ]]; then
+        echo "VLA_FRONTEND_NODE_BIN_DIR must be an absolute directory." >&2
+        return 2
+      fi
+      if [[ ! -d "${VLA_FRONTEND_NODE_BIN_DIR}" ]]; then
+        echo "VLA_FRONTEND_NODE_BIN_DIR is not an existing directory: ${VLA_FRONTEND_NODE_BIN_DIR}" >&2
+        return 2
+      fi
+      if [[ ! -x "${VLA_FRONTEND_NODE_BIN_DIR}/node" \
+        || ! -x "${VLA_FRONTEND_NODE_BIN_DIR}/npm" ]]; then
+        echo "VLA_FRONTEND_NODE_BIN_DIR must contain executable node and npm binaries." >&2
+        return 2
+      fi
+      export PATH="${VLA_FRONTEND_NODE_BIN_DIR}:${PATH}"
+    fi
+
+    local node_version
+    local npm_version
+    if ! command -v node >/dev/null 2>&1; then
+      echo "Node.js ${REQUIRED_FRONTEND_NODE_VERSION} is required to build the frontend." >&2
+      echo "Run 'nvm install' and 'nvm use', or set VLA_FRONTEND_NODE_BIN_DIR." >&2
+      return 127
+    fi
+    if ! command -v npm >/dev/null 2>&1; then
+      echo "npm ${REQUIRED_FRONTEND_NPM_VERSION} is required to build the frontend." >&2
+      echo "Run 'nvm install' and 'nvm use', or set VLA_FRONTEND_NODE_BIN_DIR." >&2
+      return 127
+    fi
+    node_version="$(node --version 2>/dev/null || true)"
+    node_version="${node_version#v}"
+    npm_version="$(npm --version 2>/dev/null || true)"
+    if [[ "${node_version}" != "${REQUIRED_FRONTEND_NODE_VERSION}" \
+      || "${npm_version}" != "${REQUIRED_FRONTEND_NPM_VERSION}" ]]; then
+      echo "Frontend build toolchain mismatch." >&2
+      echo "Required: Node.js ${REQUIRED_FRONTEND_NODE_VERSION}, npm ${REQUIRED_FRONTEND_NPM_VERSION}." >&2
+      echo "Detected: Node.js ${node_version:-unavailable}, npm ${npm_version:-unavailable}." >&2
+      echo "Run 'nvm install' and 'nvm use', or set VLA_FRONTEND_NODE_BIN_DIR." >&2
+      echo "Set SKIP_FRONTEND_BUILD=1 only when reusing a verified existing frontend/dist." >&2
+      return 2
+    fi
+
+    cd "${ROOT_DIR}/frontend"
+    npm run build
+  )
 }
 
 web_command() {

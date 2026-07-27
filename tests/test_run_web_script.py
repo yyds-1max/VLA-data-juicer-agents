@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import os
 import shutil
 import stat
@@ -26,6 +27,7 @@ SCRIPT_ENV_KEYS = (
     "LOG_DIR",
     "LOG_FILE",
     "SKIP_FRONTEND_BUILD",
+    "VLA_FRONTEND_NODE_BIN_DIR",
     "WEB_CMD",
     "RUN_WEB_CONTROL_PYTHON",
     "VLA_RUN_WEB_CONTROL_LOCKED",
@@ -62,6 +64,34 @@ def run_script(
     )
 
 
+def write_fake_frontend_toolchain(
+    bin_dir: Path,
+    *,
+    node_version: str = "24.18.0",
+    npm_version: str = "11.16.0",
+) -> None:
+    bin_dir.mkdir()
+    node = bin_dir / "node"
+    node.write_text(
+        f"#!/bin/sh\nprintf '%s\\n' 'v{node_version}'\n",
+        encoding="utf-8",
+    )
+    node.chmod(0o700)
+    npm = bin_dir / "npm"
+    npm.write_text(
+        (
+            "#!/bin/sh\n"
+            "if [ \"${1:-}\" = \"--version\" ]; then\n"
+            f"  printf '%s\\n' '{npm_version}'\n"
+            "  exit 0\n"
+            "fi\n"
+            "printf '%s|%s\\n' \"$PWD\" \"$*\" >> \"${FAKE_NPM_LOG}\"\n"
+        ),
+        encoding="utf-8",
+    )
+    npm.chmod(0o700)
+
+
 def test_run_web_script_help_documents_service_commands() -> None:
     result = run_script("--help")
 
@@ -70,6 +100,107 @@ def test_run_web_script_help_documents_service_commands() -> None:
     assert "start|stop|restart|status|logs|foreground" in result.stdout
     assert "VLA_VLADATASETS_ROOT" in result.stdout
     assert "VLA_DATA_AGENT_WEB_WORKING_DIR" in result.stdout
+    assert "VLA_FRONTEND_NODE_BIN_DIR" in result.stdout
+
+
+def test_frontend_package_pins_supported_node_and_npm() -> None:
+    package = json.loads(
+        (ROOT / "frontend" / "package.json").read_text(encoding="utf-8"),
+    )
+
+    assert (ROOT / ".nvmrc").read_text(encoding="ascii") == "24.18.0\n"
+    assert package["packageManager"] == "npm@11.16.0"
+    assert package["engines"] == {
+        "node": "24.18.0",
+        "npm": "11.16.0",
+    }
+    assert (
+        ROOT / "frontend" / ".npmrc"
+    ).read_text(encoding="ascii") == "engine-strict=true\n"
+
+
+def test_run_web_script_builds_with_configured_frontend_toolchain(
+    tmp_path: Path,
+) -> None:
+    bin_dir = tmp_path / "node-bin"
+    npm_log = tmp_path / "npm.log"
+    write_fake_frontend_toolchain(bin_dir)
+
+    result = run_script(
+        "foreground",
+        env={
+            "WORKING_DIR": str(tmp_path / "working"),
+            "VLA_FRONTEND_NODE_BIN_DIR": str(bin_dir),
+            "FAKE_NPM_LOG": str(npm_log),
+            "WEB_CMD": TRUE_COMMAND,
+        },
+    )
+
+    assert result.returncode == 0, (result.stdout, result.stderr)
+    assert npm_log.read_text(encoding="utf-8") == (
+        f"{ROOT / 'frontend'}|run build\n"
+    )
+
+
+def test_run_web_script_rejects_frontend_toolchain_version_mismatch(
+    tmp_path: Path,
+) -> None:
+    bin_dir = tmp_path / "node-bin"
+    npm_log = tmp_path / "npm.log"
+    write_fake_frontend_toolchain(
+        bin_dir,
+        node_version="20.20.2",
+        npm_version="10.8.2",
+    )
+
+    result = run_script(
+        "foreground",
+        env={
+            "WORKING_DIR": str(tmp_path / "working"),
+            "VLA_FRONTEND_NODE_BIN_DIR": str(bin_dir),
+            "FAKE_NPM_LOG": str(npm_log),
+            "WEB_CMD": TRUE_COMMAND,
+        },
+    )
+
+    assert result.returncode == 2
+    assert "Frontend build toolchain mismatch" in result.stderr
+    assert "Required: Node.js 24.18.0, npm 11.16.0" in result.stderr
+    assert "Detected: Node.js 20.20.2, npm 10.8.2" in result.stderr
+    assert not npm_log.exists()
+
+
+def test_run_web_script_skip_build_does_not_require_node(
+    tmp_path: Path,
+) -> None:
+    result = run_script(
+        "foreground",
+        env={
+            "WORKING_DIR": str(tmp_path / "working"),
+            "SKIP_FRONTEND_BUILD": "1",
+            "VLA_FRONTEND_NODE_BIN_DIR": str(tmp_path / "missing-node-bin"),
+            "WEB_CMD": TRUE_COMMAND,
+        },
+    )
+
+    assert result.returncode == 0, (result.stdout, result.stderr)
+    assert "Skipping frontend build" in result.stdout
+
+
+def test_run_web_script_requires_absolute_frontend_toolchain_directory(
+    tmp_path: Path,
+) -> None:
+    result = run_script(
+        "foreground",
+        env={
+            "WORKING_DIR": str(tmp_path / "working"),
+            "VLA_FRONTEND_NODE_BIN_DIR": "relative/node-bin",
+            "WEB_CMD": TRUE_COMMAND,
+        },
+    )
+
+    assert result.returncode == 2
+    assert "must be an absolute directory" in result.stderr
 
 
 def test_run_web_script_status_reports_stopped_when_pid_file_is_missing(tmp_path: Path) -> None:

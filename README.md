@@ -100,8 +100,18 @@ For server use, run the bundled web script from the repository root. It builds t
 the backend with `frontend/dist` mounted, and records a PID/log under `.djx`:
 
 ```bash
+nvm install
+nvm use
 ./scripts/run_web.sh start
 ```
+
+Frontend builds are pinned to Node.js `24.18.0` and npm `11.16.0`. The
+repository `.nvmrc` selects the required Node.js version. In a non-interactive
+server environment, set `VLA_FRONTEND_NODE_BIN_DIR` to that installation's
+absolute `bin` directory; `run_web.sh` prepends it only for the frontend build
+and rejects a mismatched toolchain before invoking npm. Set
+`SKIP_FRONTEND_BUILD=1` only to reuse an already verified `frontend/dist`; that
+path does not require Node.js or npm.
 
 The default server URL is:
 
