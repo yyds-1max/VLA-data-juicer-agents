@@ -1,6 +1,6 @@
 # 自动标注 M1.5：Tailwind 4 与 Radix/shadcn 设计系统基线
 
-> 状态：本地冻结候选，待服务器轻量验收
+> 状态：服务器功能验收通过；完整冻结因既有公开路径泄漏暂缓
 > 开始日期：2026-07-27
 > 开发基线：`a7315ca`
 > 开发分支：`codex/automatic-annotation-m1-5`
@@ -396,5 +396,58 @@ production npm audit high+     0
 到 Router 7，属于破坏性主版本变更，因此本里程碑记录风险但不执行
 `npm audit fix --force`。
 
-剩余批次 8 是单独批准的服务器轻量验收。在该步骤完成前，M1.5 只能称为“本地
-冻结候选”，不能宣布完整冻结或进入 M2 实施。
+批次 8 的服务器轻量验收结果记录在下一节。由于验收扩大扫描发现既有公开路径
+泄漏，M1.5 尚不能宣布完整冻结或进入 M2 实施。
+
+## 13. 服务器轻量验收结果
+
+2026-07-27 在公司服务器完成只读和前端部署验收：
+
+- 旧部署为干净的 `a7315ca`，服务停止前记录旧 `dist` tree hash，并把旧
+  `dist` 与 lockfile 保存为可回退副本；
+- 通过完整 Git bundle 把服务器切换到
+  `17325f90bdf83c2cdc4d588e26c49923f3be0fd9`，工作树干净；
+- 用户级安装 Node `24.18.0` / npm `11.16.0`，不修改共享账号默认 Node；
+- `npm ci` 安装 262 个锁定包；顶层依赖与本地一致；
+- 服务器前端测试 `218 passed`，production build 通过，最大 JavaScript
+  chunk `376304 / 512000` 字节；
+- 服务器候选 `dist` tree SHA-256 为
+  `310ec7e7dceff609646178b25eadaf89db3c5df3e308d22c375fc136c3d304ec`，
+  与同提交、同工具链的本地产物一致；
+- 未加载既有 M1 Runtime 配置时，
+  `/api/annotation/capabilities` 按设计返回
+  `processing_runtime_not_configured`；加载冻结配置并以显式
+  `VLA_FRONTEND_NODE_BIN_DIR` 重启后，返回
+  `available=true`、`runtime_id=navigation_odom_v1`；
+- 八条显式 SPA 路由、所有构建 assets、两个历史深链接均为 200；未知路由为
+  404；
+- 历史 tracked Job/Segment、首帧 JPEG/ETag、安全响应头、两项 processing
+  calibration、导航数据摘要和 9 条会话历史均可读；
+- DataPilot 打开、历史、关闭和重新打开正常，保持非模态；未发送消息、未恢复
+  Session、未操作标注，浏览器控制台无错误；
+- 验收日志没有 POST、PUT、DELETE 或致命启动错误；只保留已登记的第三方
+  WebSocket 弃用告警；
+- 验收前后 Annotation、Session、Navigation 三个 SQLite 主文件 SHA-256
+  完全一致，任务/会话状态计数和 lease 均未变化。
+
+服务器部署和 M1.5 前端功能本身通过。但公开响应扩大扫描发现：
+
+```text
+GET /api/navigation/datasets/summary
+→ dates 中 20260403 / recordings / errors[0]
+→ 含服务器绝对路径
+```
+
+该字段由 M1 之前已有的 Navigation dataset catalog 错误字符串生成；
+`a7315ca..17325f9` 没有后端代码变化，因此不是 Tailwind、Radix、路由懒加载或
+服务器部署造成的回归，回滚到旧提交也不会消除。
+
+根据“公开响应不得泄漏绝对路径”的系统原则，不以“既有问题”为由放宽门禁。
+后续应建立一个独立、最小的安全修复：
+
+- dataset summary 只返回稳定的公开错误码和无路径文案；
+- 私有诊断保留在服务器日志或内部审计中；
+- 增加异常 metadata/sync_data 的路径脱敏 API 测试；
+- 回归 Data Management、Router 基线、Python 全量和服务器只读泄漏扫描。
+
+该修复通过前，状态保持“服务器功能验收通过、完整冻结暂缓”。

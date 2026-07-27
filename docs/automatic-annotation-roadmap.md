@@ -1,6 +1,6 @@
 # 自动标注板块总体开发路线
 
-> 状态：已批准；M1 已完成功能冻结，M1.5 已形成本地冻结候选、待服务器轻量验收
+> 状态：已批准；M1 已完成功能冻结，M1.5 服务器功能验收通过、完整冻结暂缓
 > 最后更新：2026-07-27
 > 适用范围：导航数据自动标注、后处理、三维轨迹复核/Fix，以及后续可复用的标注领域能力  
 > 优先级：本文件在自动标注范围内优先于 `architecture.md` 中的历史占位描述
@@ -398,7 +398,7 @@ AppleDouble 文件不属于业务输入，拆包发现与 raw 同源比较均须
 - M1.5 只进行前端基础设施迁移，不得修改本次冻结的 Annotation/Tracking 业务
   契约。
 
-### M1.5（2026-07-27，本地冻结候选）
+### M1.5（2026-07-27，服务器功能验收通过、完整冻结暂缓）
 
 - 开发基线固定为 `a7315ca`，开发分支为
   `codex/automatic-annotation-m1-5`；
@@ -425,5 +425,24 @@ AppleDouble 文件不属于业务输入，拆包发现与 raw 同源比较均须
 - Annotation 领域文件只有 Tailwind utility 的机械迁移与 Dialog import
   合并，API、CAS、revision、Runtime、Router 和后端均未修改，也未运行真实
   Tracking 或服务器 writer；
-- 服务器轻量验收仍待单独执行。验收只允许确定性 `npm ci`、生产构建、全路由
-  页面、历史 Annotation 只读 API 和 DataPilot smoke，不创建 Job 或写业务数据。
+- 服务器已从干净的 `a7315ca` 切换到 `17325f9`，旧 `dist` 和 lockfile 已保留
+  为可回退副本；服务器与本地候选 `dist` tree hash 一致；
+- 用户级 Node `24.18.0` / npm `11.16.0` 安装完成，未修改共享账号默认的
+  Node 20；`npm ci`、前端 `218 passed`、production build 和 bundle gate
+  均通过；
+- `run_web.sh` 的精确版本预检已在真实服务器构建中通过。未加载既有 M1 Runtime
+  配置时 capability 正确 fail closed；加载冻结配置后重启，
+  `navigation_odom_v1 available=true`；
+- 八条显式 SPA 路由、全部 lazy assets、历史 tracked Job/Segment、首帧响应、
+  数据摘要、会话历史和 DataPilot 非模态浮窗均通过只读 smoke；未知路由保持
+  404，浏览器控制台无错误；
+- 重启和浏览器验收前后，Annotation、Session 和 Navigation 三个 SQLite 主文件
+  hash 完全一致；仍为 9 个 cancelled Job、2 个 tracked Job、9 个 active
+  Session，且无 Runtime/Session lease。服务日志没有 POST/PUT/DELETE；
+- 扩大后的公开响应扫描发现一项早于 M1.5 的问题：
+  `/api/navigation/datasets/summary` 中 20260403 的 `recordings` clip
+  `errors[0]` 含绝对路径。M1.5 没有任何后端 diff，回滚不能消除该问题；
+  Annotation、Session 与本次其他抽查响应未发现同类泄漏；
+- 因公开路径泄漏违反系统脱敏原则，M1.5 前端基础设施的部署与功能验收可判通过，
+  但完整冻结暂缓。该问题必须作为独立的小范围安全修复处理并回归后，才能宣布
+  M1.5 完整冻结和开始 M2 实施。
