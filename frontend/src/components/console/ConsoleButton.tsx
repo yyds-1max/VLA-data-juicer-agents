@@ -1,5 +1,7 @@
 import type * as React from "react";
 
+import { Button } from "@/components/ui/button";
+
 import { cn } from "../../lib/utils";
 
 type ConsoleButtonProps = React.ButtonHTMLAttributes<HTMLButtonElement> & {
@@ -22,5 +24,12 @@ function buttonClassForVariant(variant: NonNullable<ConsoleButtonProps["variant"
 }
 
 export function ConsoleButton({ variant = "ghost", className, ...props }: ConsoleButtonProps) {
-  return <button type="button" className={cn(buttonClassForVariant(variant), className)} {...props} />;
+  return (
+    <Button
+      type="button"
+      variant="unstyled"
+      className={cn(buttonClassForVariant(variant), className)}
+      {...props}
+    />
+  );
 }
