@@ -1,7 +1,7 @@
 # 自动标注 M1：Web 首帧标注与 Tracking 开发计划
 
-> 状态：本地实现与回归门禁、服务器测试数据准备通过；待 Runtime/Tracking
-> 服务器验收（未冻结）
+> 状态：已完成并冻结（2026-07-27）；真实 Web/Tracking 功能验收通过，严格
+> Store-bound Golden 未执行，冻结结论不包含 artifact 级数值等价声明
 > 基线提交：`f618c6c`  
 > 开发分支：`codex/automatic-annotation-m1`  
 > 上位路线：`docs/automatic-annotation-roadmap.md`
@@ -218,11 +218,16 @@ smoke；`152856` 因历史尺寸不符合当前 resize 链，仅作 provenance �
 `20270623_145550` 六个 segments；2026 原产物始终只读。固定 Xvfb 安装、
 系统 Runtime payload 部署和 2027 测试日期拆解/同步均是服务器验收前置门。
 
-只有在无需 XQuartz、Web 可完成全部首帧标注、Tracking 与 legacy 等价、刷新/
-取消/恢复可靠、原始及同步数据未被修改、全量回归通过后，M1 才能冻结并进入
-M2。
+原始退出门要求无需 XQuartz、Web 可完成全部首帧标注、Tracking 与 legacy
+等价、刷新/取消/恢复可靠、原始及同步数据未被修改且全量回归通过。实际服务器
+验收期间，用户明确把本轮真实产物判定收窄为对应 clip/segment 的状态一致，不再
+要求执行 11 个 Store-bound Golden case；RuntimeRun、checkpoint 和 manifest
+账本只作为补充观察证据。因此本次 M1 采用“功能冻结”结论：不声称 candidate
+与历史 oracle 已通过 artifact 级数值等价；未来修改 Tracking Runtime、业务
+算法、Legacy YAML 或进入依赖这些数值的发布门时，严格 Golden 仍是硬门禁，
+不能由本次状态级验收替代。
 
-## 9. 本地实施结果（截至 2026-07-24）
+## 9. 实施与验收结果（截至 2026-07-27）
 
 M1 的本地代码实现、fake-runtime 集成和独立代码审计已经完成：
 
@@ -252,11 +257,11 @@ M1 的本地代码实现、fake-runtime 集成和独立代码审计已经完成�
 本地最终门禁：
 
 ```text
-Python 全量                  1513 passed
+Python 全量                  1525 passed
 Runtime targeted             125 passed
 Web/Store/恢复 targeted      174 passed
 run_web targeted              25 passed
-前端 Vitest                  204 passed
+前端 Vitest                  214 passed
 前端 Playwright mock E2E     7 passed
 前端 production build        PASS
 Golden 全套                  73 passed
@@ -289,9 +294,51 @@ GPU 和 bubblewrap 已复核。Legacy YAML sandbox-only target 的无业务 smok
 通过，未创建宿主 `/mnt/data1`。2026-07-24 又安装并登记了固定 Xvfb，捕获五项
 安装证据，并通过 Xvfb、bubblewrap 内 DISPLAY 和沙箱内 GPU 的无业务 smoke；
 系统依赖摘要现在会逐包核对实际 dpkg 版本。提交 `896673f` 同步后，服务器以
-完整正式配置执行的 Runtime capability 已返回 `available=true`，无业务超时与
-后代进程组清理 smoke 也通过。以上结果仍不包含真实 M1 writer。
-尚未运行 `2027 Tracking candidate ↔ 2026 oracle`，因此当前只有拆解/同步等价
-结论，不能宣称 Tracking 已与 legacy 等价。M1 仍保持“未冻结”；下一步只能按
-`docs/automatic-annotation-m1-server-acceptance.md` 单独批准并执行服务器 writer
-验收。
+完整正式配置执行的 Runtime capability 返回 `available=true`，无业务超时与
+后代进程组清理 smoke 也通过。
+
+真实 M1 writer 与 Web 验收结果：
+
+- `20270605 / 20260605_160904` 最终为 `tracked`，1/1 segment 完成；
+- `20270623 / 20260623_145550` 最终为 `tracked`，6/6 segments 完成；
+- 两个任务的 prepare、Tracking run、checkpoint 和终态账本均已落库；
+- 全程不依赖 XQuartz，首帧标注、刷新恢复、显式开始 Tracking 和只读结果页
+  均通过人工验收；
+- `20270605 / 20260605_152930` 覆盖草稿刷新、两标签页 revision CAS、409
+  显式版本选择、另一页面先提交时只保留一个不可变 revision、运行中取消，以及
+  取消后重新创建/释放 scope；
+- 另一页面先提交时，页面持续显示“已在其他页面完成提交。本页内容未再次提交，
+  现已切换到服务器版本。”，并切换为只读；服务器审计确认只有一次
+  `submitted` 动作和一个正式 revision；
+- 取消中的原始 `tracking` segment 作为私有审计事实保留；公开投影回到
+  `submitted`，不会把已取消 Job 继续显示为运行中；
+- 历史 `map.png` 的 1×1 形式由业务同事确认为当前兼容口径，且该文件在后续
+  业务中基本不消费；这项确认不能推广为忽略其他图片或数值差异。
+
+最终服务器只读审计确认：
+
+- Annotation DB `quick_check=ok`；两个 tracked Job 的 run、step、checkpoint、
+  revision 和 manifest 账本自洽，无活动 Runtime lease、marker 或残留
+  Xvfb/bubblewrap/Tracking 进程；
+- 2027 两个测试日期没有 `finish_data`，raw/clip 当前普通文件的最新 mtime 均
+  早于首个 M1 writer，且未发现 symlink 或特殊文件；系统 work root 的 11 个
+  Job 目录与 DB 记录一一对应；
+- frozen Runtime 的 55 个文件和只读业务源目录中的对应文件均通过 manifest
+  校验；公共 Tracking scratch 与历史 oracle 的当前最新 mtime 均早于 M1；
+- 抽查公开成功响应、首帧响应头和错误响应，未发现绝对路径、内部数据库键、
+  内部 segment 名、脚本、工具或参数泄漏；服务器私有 `web.log` 中只有两条
+  第三方 WebSocket 弃用告警包含 Python 包源码路径，日志没有 API/UI 路由，
+  不属于公开响应；
+- frozen Runtime 与 annotation work root 无 group/other writable 项和 symlink，
+  Annotation DB 权限为 `0600`。
+
+由于 writer 前没有独立保存污染 fingerprint，上述 mtime、结构和 manifest 证据
+只能证明“未发现 M1 后写入”，不能数学证明不存在删除或保留 mtime 的替换。
+私有日志也不满足“所有私有日志绝对零路径”的更强口径；若未来采用该口径，应
+通过依赖升级或精确告警策略处理，不得用宽泛日志脱敏破坏诊断信息。
+
+按用户批准的最终验收口径，本轮只要求对应 clip/segment 状态一致。11 个已登记
+的 Store-bound Golden case 没有针对真实 candidate/oracle 执行，故不得把本次
+冻结描述为“Tracking 与 legacy artifact 全量等价”。`recovery_required` 的
+故障注入、checkpoint 校验和停机恢复由本地测试覆盖；服务器没有为了验收而主动
+制造未知副作用事件。

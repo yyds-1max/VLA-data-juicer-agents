@@ -2908,7 +2908,26 @@ def test_running_tracking_cancel_reaches_runtime_and_closes_run(tmp_path: Path):
                 break
             time.sleep(0.01)
         assert runtime_status == "cancelled"
+        projected = second_store.get_job(job["job_ref"])
+        assert projected["status"] == "cancelled"
+        assert projected["counts"]["tracking"] == 0
+        assert projected["counts"]["submitted"] == 1
+        assert projected["segments"][0]["status"] == "submitted"
+        assert (
+            second_store.get_segment(
+                job["job_ref"],
+                segment["segment_ref"],
+            )["status"]
+            == "submitted"
+        )
         with sqlite3.connect(tmp_path / "annotation.sqlite") as connection:
+            assert connection.execute(
+                """
+                SELECT status FROM annotation_segments
+                WHERE segment_ref = ?
+                """,
+                (segment["segment_ref"],),
+            ).fetchone()[0] == "tracking"
             failed_tracking_step = connection.execute(
                 """
                 SELECT return_code, diagnostic_ref

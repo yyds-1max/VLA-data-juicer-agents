@@ -117,6 +117,7 @@ async function renderAppWithDashboardSettled() {
 
 beforeEach(() => {
   window.history.replaceState({}, "", "/");
+  window.localStorage.clear();
   vi.clearAllMocks();
   resetNavigationDatasetSummaryCache();
   Object.defineProperty(window, "innerWidth", { configurable: true, writable: true, value: 1280 });
@@ -292,6 +293,40 @@ test("sidebar navigation switches console pages", async () => {
 
   fireEvent.click(screen.getByRole("button", { name: "测试/仿真" }));
   expect(screen.getByRole("heading", { name: "测试/仿真" })).toBeVisible();
+});
+
+test("desktop sidebar collapse follows navigation and persists across remounts", async () => {
+  const { unmount } = await renderAppWithDashboardSettled();
+
+  const sidebar = screen.getByTestId("console-sidebar");
+  const main = screen.getByTestId("console-main");
+  const collapseButton = screen.getByRole("button", { name: "收起侧边栏" });
+  expect(collapseButton.parentElement).toHaveClass("hidden", "md:flex");
+  expect(collapseButton.className).not.toContain("focus:ring");
+  expect(collapseButton.className).not.toContain("ring-console-cyan");
+
+  fireEvent.click(collapseButton);
+
+  expect(sidebar).toHaveAttribute("data-collapsed", "true");
+  expect(sidebar).toHaveClass("md:w-20");
+  expect(main).toHaveClass("md:ml-20");
+  expect(window.localStorage.getItem("vla-console-sidebar")).toBe("collapsed");
+  expect(screen.getByText("WISEXPLORE").parentElement).toHaveClass("md:hidden");
+  expect(screen.getByRole("button", { name: "闭环仪表盘" }).querySelector("span")).toHaveClass("md:sr-only");
+  expect(screen.getByText("智瀚星途数据处理系统").parentElement).toHaveClass("md:hidden");
+
+  fireEvent.click(screen.getByRole("button", { name: "Agent 工作流" }));
+  expect(screen.getByRole("heading", { name: "Agent 工作流" })).toBeVisible();
+  expect(sidebar).toHaveAttribute("data-collapsed", "true");
+
+  unmount();
+  render(<App routerMode="declarative" />);
+
+  expect(screen.getByTestId("console-sidebar")).toHaveAttribute("data-collapsed", "true");
+  fireEvent.click(screen.getByRole("button", { name: "展开侧边栏" }));
+  expect(screen.getByTestId("console-sidebar")).toHaveAttribute("data-collapsed", "false");
+  expect(screen.getByTestId("console-main")).toHaveClass("md:ml-64");
+  expect(window.localStorage.getItem("vla-console-sidebar")).toBe("expanded");
 });
 
 test("data management renders navigation dataset date and clip details", async () => {

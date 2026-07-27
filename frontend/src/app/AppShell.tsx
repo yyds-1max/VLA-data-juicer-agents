@@ -12,12 +12,27 @@ import { DataManagementPage } from "../features/console/pages/DataManagementPage
 import { DashboardPage } from "../features/console/pages/DashboardPage";
 import { ModelIterationPage } from "../features/console/pages/ModelIterationPage";
 import { SimulationPage } from "../features/console/pages/SimulationPage";
+import { cn } from "../lib/utils";
 
 type AppShellProps = {
   children?: ReactNode;
 };
 
 type ToastState = { message: string; tone: StatusTone } | null;
+
+const CONSOLE_SIDEBAR_STORAGE_KEY = "vla-console-sidebar";
+
+function readInitialSidebarCollapsed(): boolean {
+  if (typeof window === "undefined") {
+    return false;
+  }
+
+  try {
+    return window.localStorage.getItem(CONSOLE_SIDEBAR_STORAGE_KEY) === "collapsed";
+  } catch {
+    return false;
+  }
+}
 
 const pageCopy: Record<ConsolePageId, { title: string }> = {
   dashboard: { title: "闭环仪表盘" },
@@ -30,6 +45,7 @@ const pageCopy: Record<ConsolePageId, { title: string }> = {
 
 export function AppShell({ children }: AppShellProps) {
   const location = useLocation();
+  const [sidebarCollapsed, setSidebarCollapsed] = useState(readInitialSidebarCollapsed);
   const [toast, setToast] = useState<ToastState>(null);
   const toastTimeoutRef = useRef<number | null>(null);
 
@@ -53,6 +69,14 @@ export function AppShell({ children }: AppShellProps) {
     };
   }, []);
 
+  useEffect(() => {
+    try {
+      window.localStorage.setItem(CONSOLE_SIDEBAR_STORAGE_KEY, sidebarCollapsed ? "collapsed" : "expanded");
+    } catch {
+      // Storage can be unavailable in hardened or private browser contexts.
+    }
+  }, [sidebarCollapsed]);
+
   const activePage: ConsolePageId = location.pathname.startsWith("/annotation/jobs")
     ? "annotate"
     : location.pathname.startsWith("/agent")
@@ -68,9 +92,19 @@ export function AppShell({ children }: AppShellProps) {
 
   return (
     <div className="min-h-screen bg-console-bg text-console-text">
-      <ConsoleSidebar activePage={activePage} />
+      <ConsoleSidebar
+        activePage={activePage}
+        collapsed={sidebarCollapsed}
+        onCollapsedChange={setSidebarCollapsed}
+      />
 
-      <main className="relative z-10 pt-28 md:ml-64 md:pt-0">
+      <main
+        data-testid="console-main"
+        className={cn(
+          "relative z-10 pt-28 md:pt-0 md:transition-[margin-left] md:duration-200",
+          sidebarCollapsed ? "md:ml-20" : "md:ml-64",
+        )}
+      >
         <ConsoleHeader title={activeTitle} />
         <Routes>
           <Route path="/" element={<DashboardPage />} />

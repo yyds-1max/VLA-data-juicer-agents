@@ -1,6 +1,7 @@
 # 自动标注 M1 服务器验收 Runbook
 
-> 状态：2027 测试数据准备已通过；待人工批准 Runtime 部署、Xvfb 与真实 Tracking
+> 状态：真实 Web/Tracking 功能验收已完成；按用户批准的状态级口径冻结，
+> 严格 Store-bound Golden 与主动 `recovery_required` 注入未执行
 > 适用分支：`codex/automatic-annotation-m1`
 > 上位计划：`docs/automatic-annotation-m1-plan.md`
 > 本文只定义验收步骤，不授权连接、部署、安装或运行服务器 writer。
@@ -758,3 +759,82 @@ M1 只有同时满足以下条件才能冻结：
 scratch 或历史 oracle。需要清理时，应在新的审批中先解析一个精确的系统私有
 `job_ref/run_ref` 目录、验证其 realpath 和审计归属，再采用可恢复隔离，而不是
 直接删除。
+
+## 12. 2026-07-27 实际验收结论与批准偏差
+
+本节记录实际执行结果。它不改写前述严格 Runbook，也不把未执行的门禁伪装为
+PASS。
+
+### 12.1 已完成
+
+- 固定 Runtime payload、Xvfb、bubblewrap、DISPLAY、GPU、系统依赖摘要和
+  6 小时命令超时已通过部署 preflight；Web capability 在完整配置下可用。
+- `20270605 / 20260605_160904` 完成 Web 首帧标注和 Tracking，最终为
+  `tracked`，1/1 segment 完成。
+- `20270623 / 20260623_145550` 完成六个内部 segments 的 Web 首帧标注和
+  Tracking，最终为 `tracked`，6/6 segments 完成。
+- 两个任务均有 succeeded prepare/Tracking run、artifact manifest 和 durable
+  checkpoint；M1 staging 保留给 M2，没有发布为正式 `finish_data`。
+- `20270605 / 20260605_152930` 覆盖页面刷新、草稿持久化、两标签页 CAS、
+  新 draft 的显式版本选择、另一页面先提交时同步唯一权威 revision、运行中
+  取消，以及取消后 scope 释放。
+- 并发提交审计确认只生成一个不可变 `InitialAnnotationRevision` 和一次
+  `submitted` 动作；后提交页面不覆盖权威版本，并持续显示：
+  “已在其他页面完成提交。本页内容未再次提交，现已切换到服务器版本。”
+- Tracking 中取消后，数据库保留原始 `tracking` 行作为私有审计事实；公开 Job、
+  Segment 和 counts 投影为已取消且无活动 Tracking，不再误导用户。
+- 历史 `map.png` 的 1×1 形式由业务同事确认作为兼容口径；不得据此放宽其他
+  图片、YAML、文本或数值比较。
+
+### 12.2 用户批准的最终验收口径
+
+用户明确要求本轮真实数据只比较对应 clip/segment 的状态是否一致。因此：
+
+- 本次结论是 M1 Web/Tracking **功能冻结**；
+- 第 9 节登记的 11 个 Store-bound Golden case 没有对真实
+  `2027 candidate ↔ 2026 oracle` 执行；
+- 不得声称 Tracking 图片、YAML、`img_*.txt` 或其他 artifact 已通过完整数值/
+  字节等价；
+- 本次偏差只适用于 M1 收尾，不能推广到业务 Runtime、算法、Legacy YAML、
+  M2 后处理或训练数据发布；
+- 后续一旦修改上述业务边界，必须恢复严格 Golden，不得沿用“状态一致”替代。
+
+服务器没有为了验收而主动制造 `recovery_required` 未知副作用。对应 checkpoint
+校验、quarantine、停机 operator 恢复和 retry/abandon 由本地故障注入测试覆盖，
+但没有真实服务器故障注入证据。
+
+### 12.3 最终只读安全与污染审计
+
+- Annotation DB `quick_check=ok`。`160904` 为 `tracked` 1/1、3 个 target
+  checkpoint；`145550` 为 `tracked` 6/6、8 个 checkpoint。两者的
+  prepare/Tracking run、step、revision、checkpoint、manifest 自身哈希以及
+  Runtime/prepare 哈希均自洽。
+- 无 Runtime lease、active/quarantine marker 或 Xvfb、bubblewrap、Tracking
+  残留进程。`152930` 的取消记录保留私有审计事实；所有取消 Job 均有 cancel
+  receipt，scope 仅由两个 tracked Job 继续占用。
+- 2027 两个测试日期均不存在 `finish_data`。raw/clip 当前全部普通文件的最新
+  mtime 早于首个 M1 writer，且无 symlink 或特殊文件；11 个系统 work-root Job
+  目录与 DB 的 11 个 Job 一一对应，无孤儿目录。
+- frozen Runtime 55 项及同事业务源目录中的对应 55 项均通过 manifest 校验。
+  公共 Tracking host scratch 只有 M1 前既有文件，另一个 legacy host target
+  仍不存在；历史 oracle 候选的当前最新 mtime 均早于 M1。
+- 抽查 31 个公开成功响应、15 个首帧响应头和 4 个 404 错误响应，未发现绝对
+  路径、内部数据库键、内部 segment 名、脚本、工具或参数泄漏。日志探测路由
+  均为 404，FastAPI 和前端未暴露服务器日志。
+- frozen Runtime 和 annotation work root 无 group/other writable 项或 symlink；
+  Annotation DB 权限为 `0600`。
+
+服务器私有 `web.log` 当前有两条第三方 WebSocket 弃用告警，告警前缀包含 Python
+包源码绝对路径；该文件不经 API/UI 暴露。因此“公开响应零路径”门禁通过，但
+不能声称“所有私有日志也绝对零路径”。后续若采用后一更强口径，应通过依赖升级
+或精确告警策略处理，不能用宽泛路径替换破坏运维诊断。
+
+writer 前没有保存独立污染 fingerprint，因此当前 mtime、目录结构和 manifest
+证据能支持“未发现 M1 后写入”，但不能数学证明不存在删除或保留 mtime 的替换。
+严格 Store-bound Golden 未执行的证据限制继续适用。
+
+### 12.4 冻结收口
+
+M1 收尾提交必须同时包含最终 UI/状态投影修复、最新全量回归结果、总体路线更新
+和最终只读污染/公开信息审计摘要。服务器部署仍需绑定该明确提交；不得把当前
+功能验收解释为允许在 dirty worktree 上继续叠加 M1.5 或 M2 代码。

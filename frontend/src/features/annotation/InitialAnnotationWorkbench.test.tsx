@@ -136,6 +136,23 @@ beforeEach(() => {
   apiMocks.submitInitialAnnotation.mockResolvedValue(segmentFixture({ status: "submitted" }));
 });
 
+test("renders the canvas and inspector as one integrated studio workspace", () => {
+  render(
+    <InitialAnnotationWorkbench
+      job={job}
+      segment={segmentFixture()}
+      onSegmentUpdated={vi.fn()}
+      onJobRefresh={vi.fn(async () => undefined)}
+    />,
+  );
+
+  const workbench = screen.getByTestId("annotation-workbench");
+  expect(workbench).toContainElement(screen.getByTestId("annotation-canvas-region"));
+  expect(workbench).toContainElement(screen.getByTestId("annotation-inspector-region"));
+  expect(screen.getByRole("complementary", { name: "目标属性检查器" })).toBeVisible();
+  expect(screen.getByText("Segment 01")).toBeVisible();
+});
+
 test("draws an ordered master target with a contract-safe ref and clamps the foreground point", async () => {
   render(
     <InitialAnnotationWorkbench
@@ -796,6 +813,175 @@ test("freezes geometry and attributes while submit waits for the final draft sav
     3,
   ));
   expect(apiMocks.saveAnnotationDraft.mock.calls[0][2].targets[0].bbox).toEqual([11, 10, 20, 20]);
+});
+
+test("synchronizes a stale submit when another tab already submitted the segment", async () => {
+  const target = {
+    target_ref: `target_${"c".repeat(32)}`,
+    bbox: [10, 10, 20, 20] as [number, number, number, number],
+    point: [15, 15] as [number, number],
+    colors: { upper: "green" as const, lower: "gray" as const, shoes: "white" as const },
+  };
+  const submitted = segmentFixture({
+    status: "submitted",
+    state_revision: 6,
+    draft_revision: 2,
+    submitted_revision: 1,
+    draft: { revision: 2, targets: [target] },
+  });
+  apiMocks.submitInitialAnnotation.mockRejectedValue(new AnnotationApiError(
+    "The annotation segment changed; refresh before retrying.",
+    409,
+    {
+      code: "segment_revision_conflict",
+      message: "The annotation segment changed; refresh before retrying.",
+      current: submitted,
+    },
+  ));
+  const onSegmentUpdated = vi.fn();
+  const onJobRefresh = vi.fn(async () => undefined);
+  const onExternalSubmissionResolved = vi.fn();
+
+  render(
+    <InitialAnnotationWorkbench
+      job={job}
+      segment={segmentFixture({
+        status: "draft",
+        state_revision: 4,
+        draft_revision: 2,
+        draft: { revision: 2, targets: [target] },
+      })}
+      onSegmentUpdated={onSegmentUpdated}
+      onJobRefresh={onJobRefresh}
+      onExternalSubmissionResolved={onExternalSubmissionResolved}
+    />,
+  );
+  loadFirstFrame();
+  fireEvent.click(screen.getByRole("button", { name: "提交首帧标注" }));
+
+  await waitFor(() => expect(onExternalSubmissionResolved).toHaveBeenCalledWith(
+    "已在其他页面完成提交。本页内容未再次提交，现已切换到服务器版本。",
+  ));
+  expect(screen.getByText("已载入服务器版本")).toBeVisible();
+  expect(screen.queryByText("The annotation segment changed; refresh before retrying.")).not.toBeInTheDocument();
+  expect(screen.getByRole("button", { name: "提交首帧标注" })).toBeDisabled();
+  expect(apiMocks.submitInitialAnnotation).toHaveBeenCalledTimes(1);
+  expect(onSegmentUpdated).toHaveBeenCalledWith(submitted);
+  expect(onJobRefresh).toHaveBeenCalledTimes(1);
+});
+
+test("discards dirty local edits when the draft save finds an externally submitted segment", async () => {
+  const localTarget = {
+    target_ref: `target_${"e".repeat(32)}`,
+    bbox: [10, 10, 20, 20] as [number, number, number, number],
+    point: [15, 15] as [number, number],
+    colors: { upper: "black" as const, lower: "black" as const, shoes: "black" as const },
+  };
+  const submittedTarget = {
+    ...localTarget,
+    colors: { upper: "black" as const, lower: "gray" as const, shoes: "black" as const },
+  };
+  const submitted = segmentFixture({
+    status: "submitted",
+    state_revision: 6,
+    draft_revision: 3,
+    submitted_revision: 1,
+    draft: { revision: 3, targets: [submittedTarget] },
+  });
+  apiMocks.saveAnnotationDraft.mockRejectedValue(new AnnotationApiError(
+    "The annotation segment changed; refresh before retrying.",
+    409,
+    {
+      code: "segment_revision_conflict",
+      message: "The annotation segment changed; refresh before retrying.",
+      current: submitted,
+    },
+  ));
+  const onSegmentUpdated = vi.fn();
+  const onJobRefresh = vi.fn(async () => {
+    throw new Error("temporary refresh failure");
+  });
+  const onExternalSubmissionResolved = vi.fn();
+
+  render(
+    <InitialAnnotationWorkbench
+      job={job}
+      segment={segmentFixture({
+        status: "draft",
+        state_revision: 4,
+        draft_revision: 2,
+        draft: { revision: 2, targets: [localTarget] },
+      })}
+      onSegmentUpdated={onSegmentUpdated}
+      onJobRefresh={onJobRefresh}
+      onExternalSubmissionResolved={onExternalSubmissionResolved}
+    />,
+  );
+  loadFirstFrame();
+  fireEvent.change(screen.getByLabelText("master bbox x"), { target: { value: "11" } });
+  fireEvent.click(screen.getByRole("button", { name: "提交首帧标注" }));
+
+  await waitFor(() => expect(onExternalSubmissionResolved).toHaveBeenCalledWith(
+    "已在其他页面完成提交。本页内容未再次提交，现已切换到服务器版本。",
+  ));
+  expect(apiMocks.saveAnnotationDraft).toHaveBeenCalledTimes(1);
+  expect(apiMocks.submitInitialAnnotation).not.toHaveBeenCalled();
+  expect(onSegmentUpdated).toHaveBeenCalledWith(submitted);
+  expect(onJobRefresh).toHaveBeenCalledTimes(1);
+  expect(screen.queryByText("检测到并发修改")).not.toBeInTheDocument();
+  expect(screen.queryByRole("button", { name: "保留本地版本" })).not.toBeInTheDocument();
+  expect(screen.getByLabelText("master bbox x")).toHaveValue(10);
+  expect(screen.getByLabelText("master 裤子颜色")).toHaveValue("gray");
+  expect(screen.getByText("已载入服务器版本")).toBeVisible();
+  expect(screen.getByRole("button", { name: "提交首帧标注" })).toBeDisabled();
+});
+
+test("offers an explicit version choice when a stale submit finds a newer draft", async () => {
+  const target = {
+    target_ref: `target_${"d".repeat(32)}`,
+    bbox: [10, 10, 20, 20] as [number, number, number, number],
+    point: [15, 15] as [number, number],
+    colors: { upper: "green" as const, lower: "gray" as const, shoes: "white" as const },
+  };
+  const latestDraft = segmentFixture({
+    status: "draft",
+    state_revision: 6,
+    draft_revision: 3,
+    draft: {
+      revision: 3,
+      targets: [{ ...target, bbox: [12, 10, 20, 20] }],
+    },
+  });
+  apiMocks.submitInitialAnnotation.mockRejectedValue(new AnnotationApiError(
+    "The annotation segment changed; refresh before retrying.",
+    409,
+    {
+      code: "segment_revision_conflict",
+      message: "The annotation segment changed; refresh before retrying.",
+      current: latestDraft,
+    },
+  ));
+
+  render(
+    <InitialAnnotationWorkbench
+      job={job}
+      segment={segmentFixture({
+        status: "draft",
+        state_revision: 4,
+        draft_revision: 2,
+        draft: { revision: 2, targets: [target] },
+      })}
+      onSegmentUpdated={vi.fn()}
+      onJobRefresh={vi.fn(async () => undefined)}
+    />,
+  );
+  loadFirstFrame();
+  fireEvent.click(screen.getByRole("button", { name: "提交首帧标注" }));
+
+  expect(await screen.findByText("检测到并发修改")).toBeVisible();
+  expect(screen.getByRole("button", { name: "使用服务器版本" })).toBeVisible();
+  expect(screen.getByRole("button", { name: "保留本地版本" })).toBeVisible();
+  expect(screen.queryByText("The annotation segment changed; refresh before retrying.")).not.toBeInTheDocument();
 });
 
 test("keeps geometry and submit fail-closed until the decoded image size is verified", () => {

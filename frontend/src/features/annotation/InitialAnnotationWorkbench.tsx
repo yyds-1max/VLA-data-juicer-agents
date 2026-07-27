@@ -1,6 +1,7 @@
 import {
   AlertTriangle,
   BoxSelect,
+  Check,
   ChevronDown,
   ChevronUp,
   CircleDot,
@@ -42,6 +43,7 @@ type WorkbenchProps = {
   segment: AnnotationSegmentDetail;
   onSegmentUpdated: (segment: AnnotationSegmentDetail) => void;
   onJobRefresh: () => Promise<void>;
+  onExternalSubmissionResolved?: (message: string) => void;
   registerFlush?: (flush: () => Promise<boolean>) => void;
 };
 
@@ -67,6 +69,8 @@ type ConflictState = {
 
 const AUTOSAVE_DELAY_MS = 700;
 const HANDLE_DIRECTIONS: HandleDirection[] = ["nw", "n", "ne", "e", "se", "s", "sw", "w"];
+const EXTERNAL_SUBMISSION_MESSAGE =
+  "已在其他页面完成提交。本页内容未再次提交，现已切换到服务器版本。";
 
 function cloneTargets(targets: AnnotationTarget[]): AnnotationTarget[] {
   return targets.map((target) => ({
@@ -174,6 +178,7 @@ export function InitialAnnotationWorkbench({
   segment,
   onSegmentUpdated,
   onJobRefresh,
+  onExternalSubmissionResolved,
   registerFlush,
 }: WorkbenchProps) {
   const firstFrame = segment.first_frame;
@@ -188,6 +193,7 @@ export function InitialAnnotationWorkbench({
   const [imageLoadError, setImageLoadError] = useState(false);
   const [saveState, setSaveState] = useState<"idle" | "dirty" | "saving" | "saved" | "error">("idle");
   const [saveMessage, setSaveMessage] = useState("");
+  const [externalSubmissionResolved, setExternalSubmissionResolved] = useState(false);
   const [conflict, setConflict] = useState<ConflictState | null>(null);
   const [submitting, setSubmitting] = useState(false);
   const conflictRef = useRef<ConflictState | null>(null);
@@ -204,6 +210,7 @@ export function InitialAnnotationWorkbench({
     job.status === "waiting_initial_annotation"
     && !job.cancel_requested
     && (segment.status === "pending_initial_annotation" || segment.status === "draft")
+    && !externalSubmissionResolved
   );
   const canEdit = editable && !submitting && imageSizeValid === true;
 
@@ -217,6 +224,7 @@ export function InitialAnnotationWorkbench({
     lastSavedFingerprintRef.current = targetsFingerprint(nextTargets);
     setSaveState("idle");
     setSaveMessage("");
+    setExternalSubmissionResolved(false);
     conflictRef.current = null;
     setConflict(null);
   }, [segment.segment_ref]);
@@ -229,6 +237,28 @@ export function InitialAnnotationWorkbench({
     () => targets.find((target) => target.target_ref === selectedTargetRef) ?? null,
     [selectedTargetRef, targets],
   );
+
+  const synchronizeExternalSegment = useCallback(async (latest: AnnotationSegmentDetail) => {
+    const nextTargets = cloneTargets(latest.draft?.targets ?? []);
+    segmentRevisionRef.current = latest.state_revision;
+    draftRevisionRef.current = latest.draft_revision;
+    lastSavedFingerprintRef.current = targetsFingerprint(nextTargets);
+    setTargets(nextTargets);
+    targetsRef.current = nextTargets;
+    setSelectedTargetRef(nextTargets[0]?.target_ref ?? null);
+    conflictRef.current = null;
+    setConflict(null);
+    setSaveState("saved");
+    if (latest.status === "submitted") {
+      setSaveMessage("已载入服务器版本");
+      setExternalSubmissionResolved(true);
+      onExternalSubmissionResolved?.(EXTERNAL_SUBMISSION_MESSAGE);
+    } else {
+      setSaveMessage("该 Segment 状态已变化，已同步服务器状态。");
+    }
+    onSegmentUpdated(latest);
+    await onJobRefresh().catch(() => undefined);
+  }, [onExternalSubmissionResolved, onJobRefresh, onSegmentUpdated]);
 
   const performSave = useCallback((snapshot: AnnotationTarget[], bypassConflict = false): Promise<boolean> => {
     if (!editable) return Promise.resolve(true);
@@ -260,23 +290,35 @@ export function InitialAnnotationWorkbench({
         return true;
       } catch (error) {
         if (error instanceof AnnotationApiError && error.status === 409) {
-          const nextConflict = {
-            localTargets: cloneTargets(targetsRef.current),
-            current: segmentFromConflict(error.detail?.current),
-          };
-          conflictRef.current = nextConflict;
-          setConflict(nextConflict);
-          setSaveMessage("服务器上已有更新，请选择保留哪一版。");
+          const latest = segmentFromConflict(error.detail?.current);
+          if (latest && (
+            latest.status === "pending_initial_annotation"
+            || latest.status === "draft"
+          )) {
+            const nextConflict = {
+              localTargets: cloneTargets(targetsRef.current),
+              current: latest,
+            };
+            conflictRef.current = nextConflict;
+            setConflict(nextConflict);
+            setSaveState("error");
+            setSaveMessage("服务器上已有更新，请选择保留哪一版。");
+          } else if (latest) {
+            await synchronizeExternalSegment(latest);
+          } else {
+            setSaveState("error");
+            setSaveMessage("该 Segment 状态已变化，请刷新后重试。");
+          }
         } else {
+          setSaveState("error");
           setSaveMessage(error instanceof Error ? error.message : "草稿保存失败");
         }
-        setSaveState("error");
         return false;
       }
     });
     saveChainRef.current = task.catch(() => false);
     return task;
-  }, [editable, job.job_ref, onSegmentUpdated, segment.segment_ref]);
+  }, [editable, job.job_ref, segment.segment_ref, synchronizeExternalSegment]);
   performSaveRef.current = performSave;
 
   useEffect(() => {
@@ -539,6 +581,7 @@ export function InitialAnnotationWorkbench({
   const submit = async () => {
     setSubmitting(true);
     setSaveMessage("");
+    setExternalSubmissionResolved(false);
     try {
       const saved = await flushDraft();
       if (!saved || conflict || draftRevisionRef.current === null) return;
@@ -555,8 +598,30 @@ export function InitialAnnotationWorkbench({
       setSaveState("saved");
       setSaveMessage("首帧标注已提交");
     } catch (error) {
-      setSaveState("error");
-      setSaveMessage(error instanceof Error ? error.message : "提交失败");
+      if (error instanceof AnnotationApiError && error.status === 409) {
+        const latest = segmentFromConflict(error.detail?.current);
+        if (latest && (
+          latest.status === "pending_initial_annotation"
+          || latest.status === "draft"
+        )) {
+          const nextConflict = {
+            localTargets: cloneTargets(targetsRef.current),
+            current: latest,
+          };
+          conflictRef.current = nextConflict;
+          setConflict(nextConflict);
+          setSaveState("error");
+          setSaveMessage("服务器上已有更新，请选择保留哪一版。");
+        } else if (latest) {
+          await synchronizeExternalSegment(latest);
+        } else {
+          setSaveState("error");
+          setSaveMessage("该 Segment 状态已变化，请刷新后重试。");
+        }
+      } else {
+        setSaveState("error");
+        setSaveMessage(error instanceof Error ? error.message : "提交失败");
+      }
     } finally {
       setSubmitting(false);
     }
@@ -566,6 +631,13 @@ export function InitialAnnotationWorkbench({
   const previewBox = gesture?.kind === "draw" && firstFrame
     ? normalizedBox(gesture.start, gesture.current, firstFrame.width, firstFrame.height)
     : null;
+  const saveStateLabel = saveMessage || {
+    idle: "尚无修改",
+    dirty: "等待自动保存",
+    saving: "正在保存…",
+    saved: "草稿已保存",
+    error: "草稿保存失败",
+  }[saveState];
 
   if (!firstFrame) {
     return (
@@ -579,12 +651,28 @@ export function InitialAnnotationWorkbench({
   }
 
   return (
-    <div className="grid min-h-[42rem] gap-4 xl:grid-cols-[minmax(0,1fr)_21rem]">
-      <ConsoleCard className="flex min-w-0 flex-col p-0">
-        <div className="flex flex-wrap items-center justify-between gap-3 border-b border-console-line p-3">
-          <div className="flex flex-wrap items-center gap-2">
+    <section
+      data-testid="annotation-workbench"
+      className="flex min-h-[42rem] min-w-0 flex-col overflow-hidden bg-console-panel lg:h-[min(48rem,calc(100dvh-12rem))] lg:min-h-[38rem] lg:flex-row xl:h-full xl:min-h-0"
+    >
+      <div
+        data-testid="annotation-canvas-region"
+        className="flex min-h-[34rem] min-w-0 flex-1 flex-col bg-slate-950 lg:min-h-0"
+      >
+        <div className="flex min-h-14 flex-wrap items-center justify-between gap-3 border-b border-slate-700/80 bg-slate-900 px-3 py-2">
+          <div className="flex min-w-0 flex-wrap items-center gap-2">
+            <div className="mr-1 hidden border-r border-slate-700 pr-3 sm:block">
+              <p className="text-xs font-semibold text-white">首帧标注</p>
+              <p className="mt-0.5 text-[11px] text-slate-400">
+                Segment {String(segment.ordinal).padStart(2, "0")}
+              </p>
+            </div>
             <ConsoleButton
               variant={mode === "select" ? "primary" : "ghost"}
+              className={cn(
+                "border-slate-700 bg-slate-900 text-slate-200 shadow-none hover:bg-slate-800",
+                mode === "select" && "border-console-cyan bg-console-cyan text-white hover:bg-blue-700",
+              )}
               onClick={() => setMode("select")}
               disabled={!canEdit}
               aria-pressed={mode === "select"}
@@ -594,6 +682,10 @@ export function InitialAnnotationWorkbench({
             </ConsoleButton>
             <ConsoleButton
               variant={mode === "box" ? "primary" : "ghost"}
+              className={cn(
+                "border-slate-700 bg-slate-900 text-slate-200 shadow-none hover:bg-slate-800",
+                mode === "box" && "border-console-cyan bg-console-cyan text-white hover:bg-blue-700",
+              )}
               onClick={() => setMode("box")}
               disabled={!canEdit}
               aria-pressed={mode === "box"}
@@ -603,6 +695,10 @@ export function InitialAnnotationWorkbench({
             </ConsoleButton>
             <ConsoleButton
               variant={mode === "point" ? "primary" : "ghost"}
+              className={cn(
+                "border-slate-700 bg-slate-900 text-slate-200 shadow-none hover:bg-slate-800",
+                mode === "point" && "border-console-cyan bg-console-cyan text-white hover:bg-blue-700",
+              )}
               onClick={() => setMode("point")}
               disabled={!canEdit || !selectedTarget}
               aria-pressed={mode === "point"}
@@ -611,15 +707,27 @@ export function InitialAnnotationWorkbench({
               前景点
             </ConsoleButton>
           </div>
-          <div className="flex items-center gap-2">
-            <ConsoleButton aria-label="缩小画布" onClick={() => setZoom((value) => Math.max(1, value - 0.25))}>
+          <div className="flex items-center gap-1 rounded-lg border border-slate-700 bg-slate-950/70 p-1">
+            <ConsoleButton
+              className="h-8 border-transparent bg-transparent px-2 text-slate-200 shadow-none hover:border-slate-700 hover:bg-slate-800"
+              aria-label="缩小画布"
+              onClick={() => setZoom((value) => Math.max(1, value - 0.25))}
+            >
               <Minus className="h-4 w-4" aria-hidden="true" />
             </ConsoleButton>
-            <span className="w-14 text-center text-xs text-console-muted">{Math.round(zoom * 100)}%</span>
-            <ConsoleButton aria-label="放大画布" onClick={() => setZoom((value) => Math.min(3, value + 0.25))}>
+            <span className="w-12 text-center text-xs tabular-nums text-slate-300">{Math.round(zoom * 100)}%</span>
+            <ConsoleButton
+              className="h-8 border-transparent bg-transparent px-2 text-slate-200 shadow-none hover:border-slate-700 hover:bg-slate-800"
+              aria-label="放大画布"
+              onClick={() => setZoom((value) => Math.min(3, value + 0.25))}
+            >
               <Plus className="h-4 w-4" aria-hidden="true" />
             </ConsoleButton>
-            <ConsoleButton aria-label="重置缩放" onClick={() => setZoom(1)}>
+            <ConsoleButton
+              className="h-8 border-transparent bg-transparent px-2 text-slate-200 shadow-none hover:border-slate-700 hover:bg-slate-800"
+              aria-label="重置缩放"
+              onClick={() => setZoom(1)}
+            >
               <RotateCcw className="h-4 w-4" aria-hidden="true" />
             </ConsoleButton>
           </div>
@@ -627,10 +735,10 @@ export function InitialAnnotationWorkbench({
 
         <div
           data-annotation-canvas-scroll
-          className="console-soft-scrollbar flex flex-1 items-center overflow-auto bg-slate-950/95 p-4"
+          className="console-soft-scrollbar flex min-h-0 flex-1 items-center overflow-auto bg-slate-950 p-3 sm:p-5"
         >
           <div
-            className="relative mx-auto shrink-0"
+            className="relative mx-auto shrink-0 overflow-hidden bg-black shadow-2xl shadow-black/40"
             style={{ width: `${zoom * 100}%`, maxWidth: zoom === 1 ? "100%" : "none" }}
           >
             <img
@@ -782,35 +890,42 @@ export function InitialAnnotationWorkbench({
           </div>
         </div>
 
-        <div className="flex flex-wrap items-center justify-between gap-2 border-t border-console-line px-3 py-2 text-xs text-console-muted">
-          <span>{firstFrame.width} × {firstFrame.height} · 使用 resize 后首帧坐标</span>
+        <div className="flex min-h-9 flex-wrap items-center justify-between gap-2 border-t border-slate-800 bg-slate-900 px-3 py-2 text-[11px] text-slate-400">
+          <span className="tabular-nums">{firstFrame.width} × {firstFrame.height} · resize 后首帧坐标</span>
           {imageSizeValid === null && (
             <span aria-live="polite">正在加载并校验首帧图片…</span>
           )}
           {imageSizeValid === false && (
-            <span aria-live="assertive" className="font-medium text-rose-700">
+            <span aria-live="assertive" className="font-medium text-rose-300">
               {imageLoadError
                 ? "首帧图片加载失败，请刷新页面重试"
                 : "图片尺寸与元数据不一致，已停止编辑"}
             </span>
           )}
+          {imageSizeValid === true && (
+            <span className="hidden sm:inline">方向键微调 · Shift + 方向键移动 10px</span>
+          )}
         </div>
-      </ConsoleCard>
+      </div>
 
-      <ConsoleCard className="flex min-h-0 flex-col p-0">
-        <div className="border-b border-console-line p-4">
+      <aside
+        data-testid="annotation-inspector-region"
+        className="flex min-h-[34rem] w-full shrink-0 flex-col border-t border-console-line bg-console-panel lg:min-h-0 lg:w-[22rem] lg:border-l lg:border-t-0"
+        aria-label="目标属性检查器"
+      >
+        <div className="flex min-h-14 items-center justify-between gap-3 border-b border-console-line px-4 py-2">
           <div className="flex items-center justify-between gap-3">
             <div>
               <h2 className="text-sm font-semibold text-console-text">目标属性</h2>
-              <p className="mt-1 text-xs text-console-muted">顺序决定 master / otherN</p>
+              <p className="mt-0.5 text-[11px] text-console-muted">顺序决定 master / otherN</p>
             </div>
-            <StatusTag tone={editable ? "info" : "neutral"}>{editable ? "编辑中" : "只读"}</StatusTag>
           </div>
+          <StatusTag tone={editable ? "info" : "neutral"}>{editable ? "编辑中" : "只读"}</StatusTag>
         </div>
 
-        <div className="console-soft-scrollbar min-h-0 flex-1 space-y-3 overflow-y-auto p-3">
+        <div className="console-soft-scrollbar min-h-0 flex-1 space-y-2 overflow-y-auto p-3">
           {targets.length === 0 && (
-            <div className="rounded-lg border border-dashed border-console-line p-5 text-center text-sm text-console-muted">
+            <div className="border border-dashed border-console-line bg-console-panel2/40 p-5 text-center text-sm text-console-muted">
               点击“框选目标”，在首帧上拖出 master 框。
             </div>
           )}
@@ -820,13 +935,13 @@ export function InitialAnnotationWorkbench({
               <div
                 key={target.target_ref}
                 className={cn(
-                  "rounded-lg border bg-console-panel2/70",
-                  isSelected ? "border-console-cyan ring-1 ring-console-cyan/20" : "border-console-line",
+                  "border bg-console-panel",
+                  isSelected ? "border-console-cyan shadow-[inset_3px_0_0_#2d6cdf]" : "border-console-line",
                 )}
               >
                 <button
                   type="button"
-                  className="flex w-full items-center justify-between gap-2 px-3 py-2 text-left"
+                  className="flex min-h-10 w-full items-center justify-between gap-2 px-3 py-2 text-left hover:bg-console-panel2"
                   onClick={() => setSelectedTargetRef(target.target_ref)}
                 >
                   <span className="text-sm font-semibold text-console-text">
@@ -838,7 +953,11 @@ export function InitialAnnotationWorkbench({
                 </button>
 
                 {isSelected && (
-                  <div className="space-y-3 border-t border-console-line p-3">
+                  <div className="space-y-4 border-t border-console-line bg-console-panel2/35 p-3">
+                    <div>
+                      <p className="mb-2 text-[11px] font-semibold uppercase tracking-wide text-console-muted">
+                        边界框
+                      </p>
                     <div className="grid grid-cols-4 gap-2">
                       {(["x", "y", "w", "h"] as const).map((label, fieldIndex) => (
                         <label key={label} className="text-[11px] text-console-muted">
@@ -864,11 +983,16 @@ export function InitialAnnotationWorkbench({
                         </label>
                       ))}
                     </div>
+                    </div>
 
+                    <div>
+                      <p className="mb-2 text-[11px] font-semibold uppercase tracking-wide text-console-muted">
+                        前景点
+                      </p>
                     <div className="grid grid-cols-2 gap-2">
                       {(["x", "y"] as const).map((label, pointIndex) => (
                         <label key={label} className="text-[11px] text-console-muted">
-                          <span className="mb-1 block">前景点 {label}</span>
+                          <span className="mb-1 block uppercase">{label}</span>
                           <input
                             aria-label={`${index === 0 ? "master" : `other${index}`} point ${label}`}
                             type="number"
@@ -890,36 +1014,44 @@ export function InitialAnnotationWorkbench({
                         </label>
                       ))}
                     </div>
+                    </div>
 
-                    {([
-                      ["upper", "上衣颜色"],
-                      ["lower", "裤子颜色"],
-                      ["shoes", "鞋子颜色"],
-                    ] as const).map(([field, label]) => (
-                      <label key={field} className="block text-xs text-console-muted">
-                        <span className="mb-1 block">{label}</span>
-                        <select
-                          aria-label={`${index === 0 ? "master" : `other${index}`} ${label}`}
-                          value={target.colors[field] ?? ""}
-                          disabled={!canEdit}
-                          className="h-9 w-full rounded-lg border border-console-line bg-white px-2 text-sm text-console-text focus:border-console-cyan focus:outline-none"
-                          onChange={(event) => updateTarget(target.target_ref, (current) => ({
-                            ...current,
-                            colors: {
-                              ...current.colors,
-                              [field]: event.target.value || null,
-                            },
-                          }))}
-                        >
-                          <option value="">请选择</option>
-                          {ANNOTATION_COLORS.map((color) => (
-                            <option key={color} value={color}>{color}</option>
-                          ))}
-                        </select>
-                      </label>
-                    ))}
+                    <div>
+                      <p className="mb-2 text-[11px] font-semibold uppercase tracking-wide text-console-muted">
+                        服饰颜色
+                      </p>
+                      <div className="space-y-2">
+                        {([
+                          ["upper", "上衣颜色"],
+                          ["lower", "裤子颜色"],
+                          ["shoes", "鞋子颜色"],
+                        ] as const).map(([field, label]) => (
+                          <label key={field} className="block text-xs text-console-muted">
+                            <span className="mb-1 block">{label}</span>
+                            <select
+                              aria-label={`${index === 0 ? "master" : `other${index}`} ${label}`}
+                              value={target.colors[field] ?? ""}
+                              disabled={!canEdit}
+                              className="h-9 w-full rounded border border-console-line bg-white px-2 text-sm text-console-text focus:border-console-cyan focus:outline-none"
+                              onChange={(event) => updateTarget(target.target_ref, (current) => ({
+                                ...current,
+                                colors: {
+                                  ...current.colors,
+                                  [field]: event.target.value || null,
+                                },
+                              }))}
+                            >
+                              <option value="">请选择</option>
+                              {ANNOTATION_COLORS.map((color) => (
+                                <option key={color} value={color}>{color}</option>
+                              ))}
+                            </select>
+                          </label>
+                        ))}
+                      </div>
+                    </div>
 
-                    <div className="flex gap-2">
+                    <div className="flex gap-2 border-t border-console-line pt-3">
                       <ConsoleButton
                         aria-label={`上移 ${index === 0 ? "master" : `other${index}`}`}
                         disabled={!canEdit || index === 0}
@@ -968,9 +1100,9 @@ export function InitialAnnotationWorkbench({
           })}
         </div>
 
-        <div className="space-y-3 border-t border-console-line p-3">
+        <div className="space-y-3 border-t border-console-line bg-console-panel px-3 py-3">
           {conflict && (
-            <div role="alert" className="rounded-lg border border-amber-200 bg-amber-50 p-3">
+            <div role="alert" className="border border-amber-200 bg-amber-50 p-3">
               <p className="text-xs font-medium text-amber-800">检测到并发修改</p>
               <p className="mt-1 text-xs text-amber-700">不会自动合并几何数据，请明确选择。</p>
               <div className="mt-2 flex gap-2">
@@ -979,20 +1111,20 @@ export function InitialAnnotationWorkbench({
               </div>
             </div>
           )}
-          <div className="flex items-center justify-between gap-2 text-xs">
-            <span aria-live="polite" className={cn(
-              saveState === "error" ? "text-rose-700" : "text-console-muted",
-            )}>
-              {saveMessage || {
-                idle: "尚无修改",
-                dirty: "等待自动保存",
-                saving: "正在保存…",
-                saved: "草稿已保存",
-                error: "草稿保存失败",
-              }[saveState]}
+          <div className="flex min-h-9 items-center justify-between gap-2 text-xs">
+            <span
+              aria-live="polite"
+              className={cn(
+                "inline-flex min-w-0 items-center gap-1.5",
+                saveState === "error" ? "text-rose-700" : "text-console-muted",
+              )}
+            >
+              {saveState === "saved" && <Check className="h-3.5 w-3.5 text-emerald-600" aria-hidden="true" />}
+              <span className="truncate">{saveStateLabel}</span>
             </span>
             <ConsoleButton
               aria-label="立即保存草稿"
+              className="h-8 shrink-0 px-2"
               disabled={!editable || saveState === "saving" || Boolean(conflict)}
               onClick={() => void flushDraft()}
             >
@@ -1013,7 +1145,7 @@ export function InitialAnnotationWorkbench({
             </p>
           )}
         </div>
-      </ConsoleCard>
-    </div>
+      </aside>
+    </section>
   );
 }

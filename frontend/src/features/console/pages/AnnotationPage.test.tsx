@@ -16,6 +16,7 @@ import type {
   NavigationDateSummary,
 } from "../../../api/types";
 import {
+  AnnotationApiError,
   getAnnotationCapabilities,
   getAnnotationJob,
   getAnnotationSegment,
@@ -320,8 +321,186 @@ test("projects an all-skip completion as no processable targets instead of ordin
   );
 
   expect(await screen.findByText("无可处理目标")).toBeVisible();
-  expect(screen.queryByText("已取消")).not.toBeInTheDocument();
+  expect(screen.queryByText("已取消", { selector: "span" })).not.toBeInTheDocument();
   await waitFor(() => expect(apiMocks.listAnnotationJobs).toHaveBeenCalled());
+});
+
+test("prioritizes actionable and running jobs while keeping terminal history visible", async () => {
+  const waiting = jobFixture({
+    job_ref: "job_11111111111111111111111111111111",
+    source_clips: ["waiting_clip"],
+    counts: {
+      total: 3,
+      pending_initial_annotation: 2,
+      draft: 1,
+      submitted: 0,
+      skipped: 0,
+      tracking: 0,
+      tracked: 0,
+    },
+  });
+  const running = jobFixture({
+    job_ref: "job_22222222222222222222222222222222",
+    source_clips: ["running_clip"],
+    status: "tracking",
+    counts: {
+      total: 3,
+      pending_initial_annotation: 0,
+      draft: 0,
+      submitted: 0,
+      skipped: 0,
+      tracking: 3,
+      tracked: 0,
+    },
+  });
+  const failed = jobFixture({
+    job_ref: "job_33333333333333333333333333333333",
+    source_clips: ["failed_clip"],
+    status: "failed",
+  });
+  const tracked = jobFixture({
+    job_ref: "job_44444444444444444444444444444444",
+    source_clips: ["archived_clip"],
+    status: "tracked",
+  });
+  apiMocks.listAnnotationJobs.mockResolvedValue([waiting, running, failed, tracked]);
+
+  render(
+    <MemoryRouter
+      initialEntries={["/annotation/jobs"]}
+      future={{ v7_relativeSplatPath: true, v7_startTransition: true }}
+    >
+      <Routes>
+        <Route path="/annotation/jobs" element={<AnnotationPage />} />
+      </Routes>
+    </MemoryRouter>,
+  );
+
+  expect(await screen.findByRole("heading", { name: "需要我处理" })).toBeVisible();
+  expect(screen.getByRole("heading", { name: "系统运行中" })).toBeVisible();
+  expect(screen.getByRole("heading", { name: "异常任务" })).toBeVisible();
+  expect(screen.getByText("waiting_clip")).toBeVisible();
+  expect(screen.getByText("running_clip")).toBeVisible();
+  expect(screen.getByText("running_clip").closest("[data-testid='annotation-job-row']")).toHaveTextContent("3/3");
+  expect(screen.getByText("failed_clip")).toBeVisible();
+  expect(screen.getByText("archived_clip")).toBeVisible();
+  expect(screen.getAllByText("更新时间")).toHaveLength(4);
+  expect(screen.getAllByText(/2026-07-23/)).toHaveLength(4);
+  const firstHeader = screen.getAllByTestId("annotation-job-table-header")[0];
+  expect(firstHeader).toHaveClass("bg-slate-100/80");
+  const firstTable = firstHeader.parentElement?.parentElement;
+  expect(firstTable).toHaveClass("mx-4", "border-y");
+  expect(firstTable).not.toHaveClass("rounded-lg", "border");
+  expect(screen.getByRole("heading", { name: "需要我处理" }).closest("section")).toHaveClass("rounded-lg");
+  const firstRow = screen.getAllByTestId("annotation-job-row")[0];
+  expect(firstRow).toHaveClass("lg:min-h-11", "py-2");
+  expect(firstRow.children[0]).toHaveClass("text-xs", "font-normal", "text-console-muted");
+  expect(firstRow.children[1].querySelector("p")).toHaveClass("text-xs", "font-normal", "text-console-muted");
+  expect(screen.queryByText(/个 segment 已处理/)).not.toBeInTheDocument();
+  const continueAction = screen.getByRole("button", { name: "继续标注 20270605" });
+  expect(continueAction).toHaveClass("justify-self-start");
+  expect(continueAction).not.toHaveClass("justify-self-end");
+
+  expect(screen.queryByRole("button", { name: /历史任务$/ })).not.toBeInTheDocument();
+  const clearFilters = screen.getByRole("button", { name: "清空筛选" });
+  expect(clearFilters).toBeDisabled();
+  fireEvent.change(screen.getByLabelText("搜索历史任务"), { target: { value: "not-found" } });
+  expect(clearFilters).toBeEnabled();
+  expect(screen.getByText("没有符合当前筛选条件的历史任务。")).toBeVisible();
+  fireEvent.click(clearFilters);
+  expect(screen.getByText("archived_clip")).toBeVisible();
+  fireEvent.change(screen.getByLabelText("历史任务开始日期"), { target: { value: "2027-07-01" } });
+  expect(screen.getByText("没有符合当前筛选条件的历史任务。")).toBeVisible();
+  fireEvent.click(clearFilters);
+  expect(screen.getByText("archived_clip")).toBeVisible();
+});
+
+test("paginates history at five jobs per page", async () => {
+  const historyJobs = Array.from({ length: 6 }, (_, index) => jobFixture({
+    job_ref: `job_${String(index + 1).padStart(32, "0")}`,
+    source_clips: [`history_clip_${index + 1}`],
+    status: "tracked",
+    updated_at: `2026-07-${String(20 + index).padStart(2, "0")}T00:00:00Z`,
+  }));
+  apiMocks.listAnnotationJobs.mockResolvedValue(historyJobs);
+
+  render(
+    <MemoryRouter
+      initialEntries={["/annotation/jobs"]}
+      future={{ v7_relativeSplatPath: true, v7_startTransition: true }}
+    >
+      <Routes>
+        <Route path="/annotation/jobs" element={<AnnotationPage />} />
+      </Routes>
+    </MemoryRouter>,
+  );
+
+  expect(await screen.findByText("history_clip_6")).toBeVisible();
+  expect(screen.getByText("history_clip_2")).toBeVisible();
+  expect(screen.queryByText("history_clip_1")).not.toBeInTheDocument();
+  expect(screen.getByText("共 6 条")).toBeVisible();
+  expect(screen.getByText("5 条/页")).toBeVisible();
+
+  fireEvent.click(screen.getByRole("button", { name: "下一页历史任务" }));
+  expect(screen.getByText("history_clip_1")).toBeVisible();
+  expect(screen.queryByText("history_clip_6")).not.toBeInTheDocument();
+  expect(screen.getByRole("button", { name: "前往历史任务第 2 页" })).toHaveAttribute("aria-current", "page");
+});
+
+test("shows an explicit empty history message when only active jobs exist", async () => {
+  apiMocks.listAnnotationJobs.mockResolvedValue([jobFixture()]);
+
+  render(
+    <MemoryRouter
+      initialEntries={["/annotation/jobs"]}
+      future={{ v7_relativeSplatPath: true, v7_startTransition: true }}
+    >
+      <Routes>
+        <Route path="/annotation/jobs" element={<AnnotationPage />} />
+      </Routes>
+    </MemoryRouter>,
+  );
+
+  expect(await screen.findByText("暂无历史任务")).toBeVisible();
+  expect(screen.queryByLabelText("搜索历史任务")).not.toBeInTheDocument();
+});
+
+test("uses a modal for job creation, avoids a close-button focus ring, and calls attention to outside clicks", async () => {
+  const date = dateFixture("20270605", [clipFixture("20270605", "20260605_160904")]);
+  apiMocks.listAnnotationJobs.mockResolvedValue([]);
+  apiMocks.getNavigationDatasetSummary.mockResolvedValue(datasetFixture([date]));
+  apiMocks.getNavigationDatasetDate.mockResolvedValue(date);
+
+  render(
+    <MemoryRouter
+      initialEntries={["/annotation/jobs"]}
+      future={{ v7_relativeSplatPath: true, v7_startTransition: true }}
+    >
+      <Routes>
+        <Route path="/annotation/jobs" element={<AnnotationPage />} />
+      </Routes>
+    </MemoryRouter>,
+  );
+
+  await screen.findByText("还没有自动标注任务");
+  fireEvent.click(screen.getByRole("button", { name: "新建任务" }));
+  const dialog = screen.getByRole("dialog", { name: "创建导航自动标注任务" });
+  expect(dialog).toBeVisible();
+  const closeButton = screen.getByRole("button", { name: "关闭创建任务" });
+  expect(closeButton.className).not.toContain("ring-console-cyan");
+  expect(document.activeElement).not.toBe(closeButton);
+
+  fireEvent.mouseDown(screen.getByTestId("create-annotation-job-overlay"), { button: 0 });
+  expect(screen.getByRole("dialog", { name: "创建导航自动标注任务" })).toBeVisible();
+  expect(screen.getByTestId("create-annotation-job-dialog").className).toContain("navigation-dialog-attention-a");
+
+  fireEvent.change(screen.getByLabelText("自动标注数据日期"), { target: { value: date.date } });
+  expect(await screen.findByText("20260605_160904")).toBeVisible();
+  fireEvent.keyDown(dialog, { key: "Escape" });
+  expect(screen.getByRole("dialog", { name: "创建导航自动标注任务" })).toBeVisible();
+
+  fireEvent.click(screen.getByRole("button", { name: "取消" }));
+  await waitFor(() => expect(screen.queryByRole("dialog")).not.toBeInTheDocument());
 });
 
 test("does not render technical capability details from the public response", async () => {
@@ -557,6 +736,88 @@ test("keeps the latest segment CAS revisions after submit and reopen on the same
   });
 });
 
+test("keeps the external-submit notice visible after the readonly workbench remounts", async () => {
+  const segmentRef = "segment_34343434343434343434343434343434";
+  const initial = segmentFixture(segmentRef, 1, {
+    draft: {
+      revision: 1,
+      targets: [{
+        target_ref: `target_${"3".repeat(32)}`,
+        bbox: [10, 10, 20, 20],
+        point: [15, 15],
+        colors: { upper: "black", lower: "black", shoes: "black" },
+      }],
+    },
+  });
+  const submitted = segmentFixture(segmentRef, 1, {
+    status: "submitted",
+    state_revision: 3,
+    draft_revision: 2,
+    submitted_revision: 1,
+    draft: {
+      revision: 2,
+      targets: [{
+        target_ref: `target_${"3".repeat(32)}`,
+        bbox: [10, 10, 20, 20],
+        point: [15, 15],
+        colors: { upper: "black", lower: "gray", shoes: "black" },
+      }],
+    },
+  });
+  const initialJob = jobFixture({
+    counts: {
+      total: 1,
+      pending_initial_annotation: 0,
+      draft: 1,
+      submitted: 0,
+      skipped: 0,
+      tracking: 0,
+      tracked: 0,
+    },
+    segments: [initial],
+  });
+  const submittedJob = jobFixture({
+    state_revision: 3,
+    counts: {
+      total: 1,
+      pending_initial_annotation: 0,
+      draft: 0,
+      submitted: 1,
+      skipped: 0,
+      tracking: 0,
+      tracked: 0,
+    },
+    segments: [submitted],
+  });
+  apiMocks.getAnnotationJob
+    .mockResolvedValueOnce(initialJob)
+    .mockResolvedValue(submittedJob);
+  apiMocks.getAnnotationSegment.mockResolvedValue(initial);
+  apiMocks.submitInitialAnnotation.mockRejectedValue(new AnnotationApiError(
+    "The annotation segment changed; refresh before retrying.",
+    409,
+    {
+      code: "segment_revision_conflict",
+      message: "The annotation segment changed; refresh before retrying.",
+      current: submitted,
+    },
+  ));
+
+  renderSegmentRouter(`/annotation/jobs/${initialJob.job_ref}/segments/${segmentRef}`);
+
+  await screen.findByRole("application", { name: "首帧标注画布" });
+  loadPageFirstFrame();
+  fireEvent.click(screen.getByRole("button", { name: "提交首帧标注" }));
+
+  expect(await screen.findByRole("alert")).toHaveTextContent(
+    "已在其他页面完成提交。本页内容未再次提交，现已切换到服务器版本。",
+  );
+  expect(screen.getByLabelText("master 裤子颜色")).toHaveValue("gray");
+  expect(screen.getByRole("button", { name: "提交首帧标注" })).toBeDisabled();
+  expect(apiMocks.submitInitialAnnotation).toHaveBeenCalledTimes(1);
+  expect(screen.queryByText("The annotation segment changed; refresh before retrying.")).not.toBeInTheDocument();
+});
+
 test("submitted segments treat a readonly flush as successful for queue and return navigation", async () => {
   const firstRef = "segment_44444444444444444444444444444444";
   const secondRef = "segment_55555555555555555555555555555555";
@@ -603,13 +864,17 @@ test("submitted segments treat a readonly flush as successful for queue and retu
   await screen.findByRole("application", { name: "首帧标注画布" });
   const compactSelector = screen.getByLabelText("切换 Segment");
   expect(compactSelector).toHaveValue(firstRef);
-  expect(screen.getByRole("heading", { name: "Segment 队列" }).closest("section")).toHaveClass(
+  expect(screen.getByRole("heading", { name: "Segment 队列" }).closest("aside")).toHaveClass(
     "hidden",
-    "xl:block",
+    "xl:flex",
+  );
+  expect(screen.getByTestId("annotation-studio-shell")).toHaveClass(
+    "xl:grid",
+    "xl:grid-cols-[15rem_minmax(0,1fr)]",
   );
   fireEvent.change(compactSelector, { target: { value: secondRef } });
   await waitFor(() => expect(router.state.location.pathname).toContain(secondRef));
-  expect(await screen.findByRole("heading", { name: "Segment 02" })).toBeVisible();
+  expect(await screen.findByText("Segment 02 / 2")).toBeVisible();
 
   fireEvent.click(screen.getByRole("button", { name: "返回自动标注任务" }));
   await waitFor(() => expect(router.state.location.pathname).toBe(
@@ -664,7 +929,7 @@ test("ignores a late segment response after the URL has switched to another segm
   await act(async () => {
     secondResponse.resolve(secondSegment);
   });
-  expect(await screen.findByRole("heading", { name: "Segment 02" })).toBeVisible();
+  expect(await screen.findByText("Segment 02 / 2")).toBeVisible();
   expect(screen.getByLabelText("master bbox x")).toHaveValue(30);
 
   await act(async () => {
@@ -672,7 +937,7 @@ test("ignores a late segment response after the URL has switched to another segm
     await Promise.resolve();
   });
   expect(router.state.location.pathname).toContain(secondRef);
-  expect(screen.getByRole("heading", { name: "Segment 02" })).toBeVisible();
+  expect(screen.getByText("Segment 02 / 2")).toBeVisible();
   expect(screen.getByLabelText("master bbox x")).toHaveValue(30);
 });
 
@@ -898,8 +1163,10 @@ test("explicit refresh invalidates the dataset summary cache and reloads selecte
   fireEvent.change(screen.getByLabelText("自动标注数据日期"), { target: { value: "20270605" } });
   expect(await screen.findByText(firstClip.clip)).toBeVisible();
 
+  fireEvent.click(screen.getByRole("button", { name: "取消" }));
   fireEvent.click(screen.getByRole("button", { name: "刷新自动标注任务" }));
   await waitFor(() => expect(apiMocks.getNavigationDatasetSummary).toHaveBeenCalledTimes(2));
+  fireEvent.click(screen.getByRole("button", { name: "新建任务" }));
   expect(await screen.findByText(refreshedClip.clip)).toBeVisible();
   expect(screen.queryByText(firstClip.clip)).not.toBeInTheDocument();
   expect(apiMocks.getNavigationDatasetDate).toHaveBeenCalledTimes(2);

@@ -3224,7 +3224,12 @@ class AnnotationStore:
             (job_id,),
         ).fetchall()
         segments = [
-            self._segment_projection(connection, row, include_draft=False)
+            self._segment_projection(
+                connection,
+                row,
+                include_draft=False,
+                job_status=str(job["status"]),
+            )
             for row in segment_rows
         ]
         all_statuses = (
@@ -3296,7 +3301,23 @@ class AnnotationStore:
         row: sqlite3.Row,
         *,
         include_draft: bool,
+        job_status: str | None = None,
     ) -> dict[str, Any]:
+        projected_status = str(row["status"])
+        if projected_status == "tracking":
+            resolved_job_status = job_status
+            if resolved_job_status is None:
+                resolved_job_status = str(
+                    self._job_row(connection, int(row["job_id"]))["status"],
+                )
+            # Keep the raw `tracking` row as an audit fact about where runtime
+            # cancellation occurred.  Publicly, however, a terminal cancelled
+            # Job must not look like it still has active segment work.
+            if (
+                resolved_job_status == "cancelled"
+                and row["submitted_revision"] is not None
+            ):
+                projected_status = "submitted"
         frame = {
             "url": (
                 f"/api/annotation/jobs/"
@@ -3312,7 +3333,7 @@ class AnnotationStore:
             "segment_ref": row["segment_ref"],
             "ordinal": int(row["ordinal"]),
             "source_clip": row["source_clip"],
-            "status": row["status"],
+            "status": projected_status,
             "state_revision": int(row["state_revision"]),
             "draft_revision": (
                 int(row["draft_revision"]) if int(row["draft_revision"]) else None

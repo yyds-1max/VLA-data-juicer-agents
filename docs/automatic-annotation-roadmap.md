@@ -1,7 +1,7 @@
 # 自动标注板块总体开发路线
 
-> 状态：已批准，M0 本地基线与活动 Python Runtime 绑定已完成；正式 Runtime 冻结待服务器部署和 Golden 门  
-> 最后更新：2026-07-23  
+> 状态：已批准；M1 Web 首帧标注与 Tracking 已完成功能冻结，下一阶段为 M1.5 前端基础设施迁移
+> 最后更新：2026-07-27
 > 适用范围：导航数据自动标注、后处理、三维轨迹复核/Fix，以及后续可复用的标注领域能力  
 > 优先级：本文件在自动标注范围内优先于 `architecture.md` 中的历史占位描述
 
@@ -12,6 +12,7 @@
 ```text
 M0 契约与 Runtime 基线
 → M1 Web 首帧标注与 Tracking
+→ M1.5 Tailwind 4 与 Radix/shadcn 设计系统基线
 → M2 完整后处理与三维复核/Fix
 → M3 数据管理、仪表盘与智能体接入
 → M4 三维 AI 辅助复核
@@ -22,6 +23,7 @@ M0 契约与 Runtime 基线
 ```text
 docs/automatic-annotation-m0-plan.md
 docs/automatic-annotation-m1-plan.md
+docs/automatic-annotation-m1-5-plan.md
 docs/automatic-annotation-m2-plan.md
 docs/automatic-annotation-m3-plan.md
 docs/automatic-annotation-m4-plan.md
@@ -90,7 +92,9 @@ V1 明确不包含：
 - 路径参数化等机械改动必须与算法改动分离。
 - 任何可能改变业务结果的修改必须单独提出并获得明确批准。
 - 原始数据和 `clip_data` 同步产物不可被后处理或标注工作台原地修改。
-- Golden 等价比较是迁移 Runtime、替换 GUI 和接入 Fix 的硬门禁。
+- Golden 等价比较是迁移 Runtime、替换 GUI 和接入 Fix 的原定严格门禁。M1
+  按用户批准偏差只完成状态级功能冻结，未宣称满足 artifact/数值等价；该偏差
+  不适用于后续 Runtime、业务算法、Legacy YAML、M2 后处理或训练出口变更。
 
 系统专用 Runtime 使用配置驱动的独立服务器目录。仓库保存 wrapper、manifest、比较器和兼容适配器；大型二进制及模型权重不直接提交 Git，但必须登记 SHA-256。未完成 Tracking 公共 scratch 隔离前，不开放并发 writer。
 
@@ -205,7 +209,41 @@ pending
 - 与旧 `gen_box.py` 等价的 Legacy YAML Adapter；
 - 原 Tracking 的安全调用和工作目录隔离。
 
-退出条件：无需 XQuartz，可在 Web 完成首帧标注并获得与旧链路等价的 Tracking 结果。
+原定严格退出条件：无需 XQuartz，可在 Web 完成首帧标注并获得与旧链路等价的
+Tracking 结果。本次实际执行按用户批准偏差采用状态级功能冻结，严格 Golden
+未执行，详见“实际进度与决策记录”的 M1 条目。
+
+### M1.5：Tailwind 4 与 Radix/shadcn 设计系统基线
+
+目标是把前端基础设施迁移与 M2 业务开发分离：
+
+```text
+Tailwind 3 → Tailwind 4
+→ 以 Radix 作为 shadcn primitive 基础
+→ 建立受审查的 components/ui
+→ 全站视觉、交互、响应式和可访问性回归
+→ 冻结设计系统基线
+```
+
+边界：
+
+- M1 冻结基线继续使用 Tailwind 3 和现有 `Console*` 组件；M1.5 开始前不得把
+  shadcn/Tailwind 4 生成脚手架或不兼容全局样式带入生产；
+- shadcn MCP 只作为本地开发辅助，不部署到服务器；
+- shadcn CLI 如需保留，只能作为 `devDependency`，不得成为生产运行依赖；
+- 生成的组件源码进入仓库并逐项审查，不把 shadcn 当作不可控黑盒依赖；
+- 优先复用仓库已有 Radix Dialog、Popover、ScrollArea 和 Tooltip，不再引入
+  Base UI 形成第二套 primitive 体系；
+- shadcn 只承担 Button、Dialog、Tabs、Table、Form、Alert、Badge 等无业务状态
+  primitive；
+- Annotation CAS、revision、Runtime、任务状态、轨迹审核等精确业务逻辑仍位于
+  领域组件和 Application Service；
+- 不实现 gridmap、投影、轨迹、Fix、数据管理联动、智能体接入或 AI 审核；
+- M2 的三维轨迹/视频和 M4 证据查看器继续采用独立路由与懒加载，不并入主页面
+  bundle。
+
+退出条件：Tailwind 4 与 Radix/shadcn 依赖和生成策略明确，现有页面在全站视觉与
+交互回归中无行为退化，设计系统基线冻结，服务器可通过确定性依赖安装和生产构建。
 
 ### M2：完整后处理、三维复核与 Fix
 
@@ -311,7 +349,7 @@ case 不能替代整条 clip 的真实业务等价验收。来自 macOS 复制�
 AppleDouble 文件不属于业务输入，拆包发现与 raw 同源比较均须忽略并报告，不能
 把它们当作 ROS bag。
 
-### M1（2026-07-23，本地实现与回归完成，待服务器验收）
+### M1（2026-07-27，功能冻结）
 
 - 已完成任务级设计、本地实现和独立代码审计，权威记录为
   `docs/automatic-annotation-m1-plan.md`；
@@ -319,7 +357,7 @@ AppleDouble 文件不属于业务输入，拆包发现与 raw 同源比较均须
   `codex/automatic-annotation-m1`；
 - M1 只实现 `navigation_odom_v1` 的 Web 首帧标注与 Tracking，不提前接入
   M2 后处理/Fix、M3 智能体或 M4 AI；
-- 本地门禁为 Python `1513 passed`、前端 `204 passed`、Playwright
+- 本地最终门禁为 Python `1525 passed`、前端 `214 passed`、Playwright
   `7 passed`、Golden `73 passed`、Router suite `17 cases validated`，前端
   production build、compileall 和 diff-check 均通过；
 - Golden 的 M1 必需范围已覆盖两个门禁 clip 的 `maps/`、`v1.0-trainval/`
@@ -333,7 +371,24 @@ AppleDouble 文件不属于业务输入，拆包发现与 raw 同源比较均须
   不要求或修改宿主兼容目录；服务器 bubblewrap 0.4.0 无业务 smoke 已验证写入
   只落入临时 job-private Data，测试前后宿主 `/mnt/data1` 均不存在；
 - 系统 Runtime payload 已部署并验证；固定 Xvfb 已安装并由五项真实安装证据
-  attestation，Xvfb＋bubblewrap DISPLAY 与沙箱内 GPU 无业务 smoke 已通过。
-  服务器完整 Runtime capability 和无业务超时/进程组清理 smoke 也已通过。
-  真实 Tracking 仍受单独服务器 writer 门禁约束；尚无 candidate/oracle
-  差异结论，因此 M1 尚未冻结，也不能进入 M2。
+  attestation，Xvfb＋bubblewrap DISPLAY 与沙箱内 GPU 无业务 smoke 已通过；
+  服务器完整 Runtime capability 和无业务超时/进程组清理 smoke 也已通过；
+- `20270605 / 20260605_160904` 已通过 Web 完成首帧标注和 Tracking，最终
+  `tracked` 1/1；`20270623 / 20260623_145550` 最终 `tracked` 6/6；
+- `152930` 已覆盖刷新、CAS/409、唯一 revision 并发提交、运行中取消和 scope
+  释放；公开状态投影和持久中文提示已完成返修并由用户复核；
+- 用户明确把本轮真实产物验收收窄为对应 clip/segment 状态一致，因此 11 个
+  Store-bound Golden case 未针对真实 candidate/oracle 执行。本次只做 M1
+  功能冻结，不声明 artifact 级数值等价；未来业务 Runtime、算法、Legacy YAML、
+  M2 后处理或训练出口仍受严格 Golden 门禁；
+- 历史 `map.png` 的 1×1 兼容形式已由业务同事确认，不能据此扩大任何 ignore
+  或 normalization；
+- 最终服务器只读审计确认两个 tracked Job 的 DB/Runtime/manifest/checkpoint
+  账本自洽、无活动 lease/marker/子进程、未发现公开路径或内部信息泄漏，也未
+  发现测试日期 raw/clip、历史 oracle、公共 scratch 的 M1 后写入；由于 writer
+  前无独立污染 fingerprint，该结论受 mtime/当前结构证据边界约束；
+- 服务器私有 `web.log` 有两条不经 API/UI 暴露的第三方 WebSocket 弃用告警，
+  其中包含 Python 包源码路径；公开响应零路径门禁通过，但不声称所有私有日志
+  绝对零路径；
+- M1.5 只进行前端基础设施迁移，不得修改本次冻结的 Annotation/Tracking 业务
+  契约。
