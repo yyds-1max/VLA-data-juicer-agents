@@ -47,6 +47,22 @@ _EVALUATION_ALLOWED_TOOLS = frozenset(
         "start_navigation_data_task",
         "continue_navigation_data_task",
         "control_navigation_data_task",
+        "inspect_navigation_raw_metadata_tool",
+        "inspect_navigation_sensor_candidates_tool",
+        "inspect_navigation_topic_candidates_tool",
+        "inspect_navigation_runtime_assets_tool",
+        "inspect_navigation_calibration_inventory_tool",
+        "inspect_navigation_localization_sources_tool",
+        "inspect_navigation_annotation_job_facts_tool",
+        "inspect_navigation_artifact_state_tool",
+        "inspect_navigation_gridmap_artifacts_tool",
+        "get_navigation_task_context_tool",
+        "describe_processing_action_tool",
+        "submit_extract_sync_plan_tool",
+        "submit_finish_processing_plan_tool",
+        "submit_trajectory_review_plan_tool",
+        "prepare_gridmap_for_projection_tool",
+        "open_trajectory_fix_workbench_tool",
     },
 )
 _STREAM_DELTA_TYPES = frozenset(
@@ -174,8 +190,8 @@ class TraceRecorder:
             emit_progress_events=True,
             emit_reply_summary_events=True,
             emit_answer_delta_events=True,
-            # The current evaluation entrypoint is MainRouter-only.  Mirror the
-            # production Router's terminal protocol recovery exactly.
+            # Mirror the production public terminal protocol for both Router
+            # and bounded Navigation specialist evaluation entrypoints.
             recover_unmarked_terminal_answer=True,
             public_tool_events=True,
             suppress_pre_tool_text=True,

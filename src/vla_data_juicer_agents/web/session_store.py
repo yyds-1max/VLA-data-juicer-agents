@@ -3649,7 +3649,10 @@ class WebSessionStore:
         scope: dict | None = None,
         outbox_payload: dict | None = None,
         outbox_idempotency_key: str | None = None,
+        outbox_kind: str = "navigation_start",
     ) -> TaskBindingCreation:
+        if not outbox_kind.strip():
+            raise ValueError("outbox_kind must not be empty")
         timestamp = _now()
         agent_session_id = f"conversation_agent_session_{uuid4().hex}"
         outbox_id = f"outbox_{uuid4().hex}"
@@ -3754,7 +3757,7 @@ class WebSessionStore:
                 self._insert_outbox(
                     connection,
                     outbox_id=outbox_id,
-                    kind="navigation_start",
+                    kind=outbox_kind,
                     aggregate_type="task",
                     aggregate_id=task_id,
                     web_session_id=web_session_id,
@@ -4783,6 +4786,75 @@ class WebSessionStore:
         assert row is not None
         return self._outbox_from_row(row)
 
+    def record_outbox_receipt(
+        self,
+        *,
+        kind: str,
+        aggregate_type: str,
+        aggregate_id: str,
+        payload: dict,
+        idempotency_key: str,
+        web_session_id: str | None = None,
+        task_id: str | None = None,
+    ) -> RuntimeOutboxItem:
+        """Atomically record one completed, idempotent transport receipt."""
+
+        if not kind.strip() or not idempotency_key.strip():
+            raise ValueError("receipt kind and idempotency key must not be empty")
+        timestamp = _now()
+        outbox_id = f"outbox_{uuid4().hex}"
+        with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            existing = connection.execute(
+                "SELECT * FROM runtime_outbox WHERE idempotency_key = ?",
+                (idempotency_key,),
+            ).fetchone()
+            if existing is not None:
+                receipt = self._outbox_from_row(existing)
+                if (
+                    receipt.kind != kind
+                    or receipt.aggregate_type != aggregate_type
+                    or receipt.aggregate_id != aggregate_id
+                    or receipt.web_session_id != web_session_id
+                    or receipt.task_id != task_id
+                    or receipt.turn_id is not None
+                    or receipt.status != "completed"
+                ):
+                    raise ContractConflictError(
+                        "outbox_receipt_conflict",
+                        "idempotency key is already used by another outbox record",
+                        current=receipt,
+                    )
+                return receipt
+            self._insert_outbox(
+                connection,
+                outbox_id=outbox_id,
+                kind=kind,
+                aggregate_type=aggregate_type,
+                aggregate_id=aggregate_id,
+                web_session_id=web_session_id,
+                task_id=task_id,
+                turn_id=None,
+                payload=payload,
+                idempotency_key=idempotency_key,
+                available_at=timestamp,
+                timestamp=timestamp,
+            )
+            connection.execute(
+                """
+                UPDATE runtime_outbox
+                SET status = 'completed', completed_at = ?, updated_at = ?
+                WHERE outbox_id = ?
+                """,
+                (timestamp, timestamp, outbox_id),
+            )
+            row = connection.execute(
+                "SELECT * FROM runtime_outbox WHERE outbox_id = ?",
+                (outbox_id,),
+            ).fetchone()
+        assert row is not None
+        return self._outbox_from_row(row)
+
     def claim_outbox(
         self,
         *,
@@ -4955,6 +5027,44 @@ class WebSessionStore:
                 (idempotency_key,),
             ).fetchone()
         return self._outbox_from_row(row) if row is not None else None
+
+    def list_explicit_linked_fix_recoveries(
+        self,
+        *,
+        limit: int = 20,
+    ) -> list[RuntimeOutboxItem]:
+        """List automatic linked-Fix creations whose turnless wake is unfinished."""
+
+        if limit < 1:
+            return []
+        with self._connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT creation.*
+                FROM runtime_outbox AS creation
+                JOIN conversation_task_bindings AS bindings
+                  ON bindings.task_id = creation.task_id
+                WHERE creation.idempotency_key
+                          GLOB 'navigation_auto_linked_fix:*'
+                  AND creation.kind IN (
+                      'navigation_start',
+                      'navigation_explicit_linked_fix_create'
+                  )
+                  AND bindings.slot_state = 'open'
+                  AND NOT EXISTS (
+                      SELECT 1
+                      FROM runtime_outbox AS wake
+                      WHERE wake.kind =
+                                'navigation_explicit_linked_fix_wake'
+                        AND wake.task_id = creation.task_id
+                        AND wake.status = 'completed'
+                  )
+                ORDER BY creation.created_at, creation.outbox_id
+                LIMIT ?
+                """,
+                (limit,),
+            ).fetchall()
+        return [self._outbox_from_row(row) for row in rows]
 
     def transfer_waiting_reply_to_turn(
         self,

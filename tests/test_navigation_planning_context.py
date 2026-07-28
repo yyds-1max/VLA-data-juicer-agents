@@ -103,7 +103,11 @@ def test_planning_context_is_stage_neutral_and_exposes_only_bounded_facts():
         "evidence_catalog",
         "evidence_next_cursor",
     }
-    assert context.available_stage_ids == ["extract_sync", "finish_processing"]
+    assert context.available_stage_ids == [
+        "extract_sync",
+        "finish_processing",
+        "trajectory_review",
+    ]
     assert context.observation_revision == 3
     assert context.observed_kinds == [
         "artifact_state",
@@ -129,7 +133,11 @@ def test_fresh_attempt_builds_revision_zero_context_with_request_facts():
     assert context.segments == ["20260710_120000"]
     assert context.observation_revision == 0
     assert context.observed_kinds == []
-    assert context.available_stage_ids == ["extract_sync", "finish_processing"]
+    assert context.available_stage_ids == [
+        "extract_sync",
+        "finish_processing",
+        "trajectory_review",
+    ]
     assert context.evidence_catalog == []
     assert context.evidence_next_cursor is None
 

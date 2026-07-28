@@ -22,6 +22,8 @@ export type AnnotationJobStatus =
   | "waiting_initial_annotation"
   | "tracking"
   | "tracked"
+  | "postprocessing"
+  | "annotated"
   | "failed"
   | "cancelled";
 
@@ -31,7 +33,10 @@ export type AnnotationSegmentStatus =
   | "submitted"
   | "skipped"
   | "tracking"
-  | "tracked";
+  | "tracked"
+  | "postprocessing"
+  | "annotated"
+  | "postprocessing_failed";
 
 export type AnnotationTarget = {
   target_ref: string;
@@ -84,6 +89,9 @@ export type AnnotationCounts = {
   skipped: number;
   tracking: number;
   tracked: number;
+  postprocessing?: number;
+  annotated?: number;
+  postprocessing_failed?: number;
 };
 
 export type AnnotationCalibration = {
@@ -140,3 +148,175 @@ export type AnnotationConflictDetail = {
   message: string;
   current?: unknown;
 };
+
+export type TrajectoryReviewStatus =
+  | "pending"
+  | "in_progress"
+  | "returned"
+  | "approved"
+  | "discarded";
+
+export type TrajectoryRevisionSummary = {
+  revision_ref: string;
+  content_sha256: string;
+};
+
+export type FixCalibrationSummary = AnnotationCalibration & {
+  differs_from_processing: boolean;
+  difference_reason: string | null;
+};
+
+export type FixDraftSummary = {
+  revision: number;
+  content_sha256: string;
+  calibration: FixCalibrationSummary;
+};
+
+export type FixRevisionSummary = {
+  revision_ref: string;
+  revision_number: number;
+  source_draft_revision: number;
+  content_sha256: string;
+  created_at: string;
+};
+
+export type CompatibilityPublicationSummary = {
+  fix_revision_ref: string;
+  attempt: number;
+  status: "publishing" | "published" | "failed";
+  content_sha256: string | null;
+  failure: {
+    code: string;
+    error_ref: string | null;
+  } | null;
+  created_at: string;
+};
+
+export type FixRuntimeRunSummary = {
+  status: "queued" | "running" | "failed";
+  failure: {
+    code: string;
+    error_ref: string | null;
+  } | null;
+  created_at: string;
+  updated_at: string;
+};
+
+export type FixFailureSummary = {
+  code: string;
+  message: string;
+  error_ref: string | null;
+  retryable: boolean;
+};
+
+export type TrajectoryReview = {
+  review_ref: string;
+  status: TrajectoryReviewStatus;
+  state_revision: number;
+  job_ref: string;
+  dataset_date: string;
+  source_clip: string;
+  segment_ref: string;
+  segment_ordinal: number;
+  trajectory_revision: TrajectoryRevisionSummary;
+  processing_calibration: AnnotationCalibration;
+  fix_draft: FixDraftSummary | null;
+  fix_revisions: FixRevisionSummary[];
+  active_fix_run: FixRuntimeRunSummary | null;
+  fix_failure: FixFailureSummary | null;
+  latest_publication: CompatibilityPublicationSummary | null;
+  submitted_fix_revision_ref?: string;
+  created_at: string;
+  updated_at: string;
+};
+
+export type TrajectoryPoint = {
+  x: number;
+  y: number;
+};
+
+export type TrajectoryCoordinate =
+  | [number, number]
+  | [number, number, number];
+
+export type TrajectoryEvidenceTarget = {
+  target_ref: string;
+  label: string;
+  position: [number, number] | null;
+  direction: number | null;
+  speed: number | null;
+  color: string[];
+  image_box: [number, number, number, number] | null;
+  trajectory_points: TrajectoryCoordinate[];
+};
+
+export type TrajectoryEvidenceCamera = {
+  url: string;
+  width: number | null;
+  height: number | null;
+};
+
+export type TrajectoryEvidenceGridmap = {
+  url: string;
+  width: number;
+  height: number;
+};
+
+export type TrajectoryEvidenceFrame = {
+  frame_index: number;
+  pass: boolean;
+  camera: TrajectoryEvidenceCamera | null;
+  gridmap: TrajectoryEvidenceGridmap | null;
+  targets: TrajectoryEvidenceTarget[];
+};
+
+export type TrajectoryReviewEvidence = {
+  availability: "available";
+  review_ref: string;
+  trajectory_revision_ref: string;
+  review_state_revision: number;
+  draft_revision: number | null;
+  frame_count: number;
+  frames: TrajectoryEvidenceFrame[];
+  draft_commands: FixCommand[];
+};
+
+export type FixCommand =
+  | {
+      kind: "set_position";
+      frame_index: number;
+      target_ref: string;
+      x: number;
+      y: number;
+    }
+  | {
+      kind: "set_direction";
+      frame_index: number;
+      target_ref: string;
+      direction: number;
+    }
+  | {
+      kind: "set_speed";
+      frame_index: number;
+      target_ref: string;
+      speed: number;
+    }
+  | {
+      kind: "delete_target";
+      frame_index: number;
+      target_ref: string;
+    }
+  | {
+      kind: "add_missing_target";
+      frame_index: number;
+      target_ref: string;
+    }
+  | {
+      kind: "restore_frame";
+      frame_index: number;
+    }
+  | {
+      kind: "toggle_pass";
+      frame_index: number;
+      value: boolean;
+    };

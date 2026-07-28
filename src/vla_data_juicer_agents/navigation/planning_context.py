@@ -28,8 +28,16 @@ from vla_data_juicer_agents.navigation.task_state import NavigationTask
 
 PLANNING_CONTEXT_MAX_CHARS = 5_500
 PLANNING_IDENTITY_MAX_CHARS = 1_600
-NavigationStageId = Literal["extract_sync", "finish_processing"]
-AVAILABLE_STAGE_IDS: list[NavigationStageId] = ["extract_sync", "finish_processing"]
+NavigationStageId = Literal[
+    "extract_sync",
+    "finish_processing",
+    "trajectory_review",
+]
+AVAILABLE_STAGE_IDS: list[NavigationStageId] = [
+    "extract_sync",
+    "finish_processing",
+    "trajectory_review",
+]
 
 
 class NavigationTaskContext(StrictModel):
@@ -62,6 +70,7 @@ PLAN_REQUIRED_OBSERVATIONS: dict[str, tuple[ObservationKind, ...]] = {
         "calibration_inventory",
         "localization_sources",
     ),
+    "trajectory_review": ("annotation_job_facts",),
 }
 
 
@@ -273,6 +282,20 @@ def _minimal_fact_summary(
                 "available_source_count": len(payload.available_sources),
                 "available_sources_preview": list(payload.available_sources),
                 "conversion_available": payload.conversion_available,
+            }
+        elif payload.kind == "annotation_job_facts":
+            facts[payload.kind] = {
+                "job_status": payload.job_status,
+                "segment_count": payload.segment_count,
+                "tracked_count": payload.tracked_count,
+                "skipped_count": payload.skipped_count,
+                "annotated_count": payload.annotated_count,
+                "ready_for_postprocessing": payload.ready_for_postprocessing,
+                "ready_for_trajectory_review": payload.ready_for_trajectory_review,
+                "processing_calibration_snapshot_available": (
+                    payload.processing_calibration_snapshot_available
+                ),
+                "reviews": payload.reviews.model_dump(mode="json"),
             }
         elif payload.kind == "user_guidance":
             facts[payload.kind] = {

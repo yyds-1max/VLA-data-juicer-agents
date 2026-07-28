@@ -4,7 +4,7 @@
 
 Products normally depend on one another in this order:
 
-`raw acquisition -> prepared/extracted data -> per-clip sync_data (containing internally generated segments/sequences) -> finish temporary data -> annotation -> tracking -> projection -> final outputs + validation markers`
+`raw acquisition -> prepared/extracted data -> per-clip sync_data (containing internally generated segments/sequences) -> Web initial annotation -> tracking -> postprocessing/projection -> immutable trajectory revision -> trajectory review/Fix -> approved training-compatible publication`
 
 The task-selection granularity is clips. A segment or sequence is generated inside a clip by synchronization and is never a selectable task input or a substitute clip identifier. Do not narrow, split, or redirect a task based on an internal segment/sequence name.
 
@@ -18,7 +18,12 @@ Existence is not completeness. Check the requested clip inventory and validation
 2. Inspect raw, prepared, sync, finish, final, and validation product facts in dependency order.
 3. If work remains before sync, inspect only the topic, timestamp, sensor-role, and runtime facts needed to plan it.
 4. For newly produced sync, use the stage gate. For pre-existing sync with explicit continuation, collect only missing inputs. Then inspect finish-specific facts.
-5. Read bounded evidence pages and action contracts only when summaries do not support a decision. Select the stage by choosing one of the two complete-Plan submission tools.
+5. Inspect the bounded Annotation Job facts before planning automatic annotation,
+   postprocessing, or trajectory review. Never ask the user or model to pass internal
+   job/review identifiers.
+6. Read bounded evidence pages and action contracts only when summaries do not support a
+   decision. Select the stage by choosing one of the three complete-Plan submission tools:
+   extract/sync, finish processing, or trajectory review.
 
 ## Common extract-sync work
 
@@ -37,22 +42,80 @@ Existence is not completeness. Check the requested clip inventory and validation
 
 - Newly produced, verified sync requires terminal `AwaitUser:` for continuation and any missing `scene_mode`.
 - For pre-existing sync, do not reconfirm an explicit current request to continue; await only missing inputs.
+- DataPilot is the only processing orchestrator. A Web shortcut selects only the dataset date
+  and outer clips; it does not choose scripts, gridmap strategy, trajectory variant, or start
+  Tracking/postprocessing directly.
+- Inspect `annotation_job_facts` before choosing the remaining chain. If a tracked Annotation
+  Job is ready for postprocessing, do not repeat finish assembly, preprocessing, initial
+  annotation, or Tracking. Use its frozen processing calibration snapshot and plan only the
+  remaining gridmap, projection/trajectory, and validation work.
+- When no ready Annotation Job exists, create or reuse the server-bound Annotation workflow
+  through the accepted Plan. Initial annotation is a durable Web-workbench handoff, not a
+  desktop GUI and not geometry carried through chat. The system resumes the same Navigation
+  task after all required segments are submitted and then runs Tracking.
 - Record indoor/outdoor through `record_navigation_user_guidance_tool` as informational `scene_mode` (`in` or `out`).
 - End blocking text questions with `AwaitUser:`. The model supplies purpose, fields, and question; Runtime owns state. A safe, concise `Answer:` summary may precede it and joins the same final. Calibration uses `confirm_navigation_calibration_params_tool`.
 - If the user explicitly declines later processing after extract/sync was verified, call `complete_navigation_task_tool` instead of authoring another Plan. This closes the task successfully while retaining every completed extract/sync product. Summarize the completed boundary and the intentionally unperformed finish work; do not describe this choice as a pause, cancellation, or failure.
 - Inspect finish inputs, localization sources/conversions, gridmap sources/preparation, calibration inventory, and relevant runtime assets. A native Ins source normally skips odom conversion. An odom source normally requires the supported odom-to-Ins conversion before consumers that expect Ins-formatted data.
 - Keep the downstream localization pipeline consistent: native Ins uses `main_smart.py`, `4_speed_direction_Ins.py`, and `cjl_with_gridmap`; odom uses conversion/resize, `main_smart_odom.py`, `4_speed_direction_odom.py`, and `cjl_0525_with_gridmap`.
 - If an extracted gridmap already exists, inspect and reuse it when valid. If the platform has no recorded gridmap but synchronized lidar point clouds exist, select generation from PCD. Do not claim PCD/gridmap availability before extract/sync outputs contain the required files.
-- Select calibration from the camera/platform calibration inventory and current evidence. For the current deployment, recommend `NoobScenes/params/20260529_go2w/sensors` by default when that exact source is present in the observed inventory. Present it as the current business default, set calibration `mode` to `selected_profile`, keep `requires_user_confirmation` true, and ask the user to confirm it before execution.
-- Never choose a calibration profile merely because its directory name is newest, is lexicographically last, or resembles the data date. If the current default is absent, do not silently substitute another profile: list the observed candidates and ask the user which one to use. Every selected calibration profile still requires explicit user confirmation before copying.
+- For a ready tracked Annotation Job, set calibration `mode` to
+  `annotation_snapshot`; the Application Service resolves the frozen content and hash. Do not
+  ask the model or user to repeat its path or profile name.
+- For a new Annotation Job, select calibration only from the observed inventory and obtain the
+  user's choice through the structured product interaction. Never choose a profile merely
+  because its directory name is newest, is lexicographically last, resembles the data date, or
+  was recommended for another dataset. The page has no global recommendation.
 - In an accepted Plan, execute the `confirm_navigation_calibration_params` action through its matching `confirm_navigation_calibration_params_tool`, passing only the current `plan_id` and `step_id`. The tool performs the external human-decision handoff; do not invent or call a differently named confirmation tool.
-- Choose evidence-backed localization, gridmap, and calibration decisions, then ordered preparation, human-decision, annotation, tracking, projection, and validation steps as the observed case requires.
-- Unless artifact inspection already proves both final outputs and non-empty final gridmaps are complete, include the full finish chain in business order: calibration confirmation, finish assembly, NoobScenes preprocessing, initial annotation, tracking, gridmap preparation, projection/trajectory, and final validation. Do not skip unseen work merely because an action is optional in the schema.
-- Treat GUI work as bounded human-in-the-loop execution. Verify final outputs and validation markers after execution.
+- Choose evidence-backed localization, gridmap, and calibration decisions, then ordered
+  preparation, Web annotation handoff, Tracking, projection, and validation steps only as the
+  observed case requires.
+- Unless artifact inspection already proves both final outputs and non-empty final gridmaps are
+  complete, use the Application Service actions. A missing Annotation Job requires, in order,
+  calibration confirmation, `run_annotation_tracking_workflow`,
+  `run_annotation_postprocessing_workflow`, and final validation. A tracked Annotation Job
+  requires only `run_annotation_postprocessing_workflow` and final validation. The Application
+  Service internally maps the accepted localization/gridmap decisions onto the frozen Runtime;
+  do not mix these actions with the legacy finish assembly, desktop GUI, Tracking, gridmap, or
+  projection script actions in a new Plan.
+- Treat Web-workbench activity as durable human-in-the-loop execution. Geometry belongs to the
+  Annotation Application Service, never to chat. Verify final outputs and the existing terminal
+  validation markers after execution; do not invent an additional quality gate.
+
+## Postprocessing completion and trajectory Fix
+
+- A completed finish-processing Plan freezes one immutable trajectory revision for every
+  non-skipped internal segment and creates pending review work. The parent Navigation task is
+  terminal and releases the unique task slot at this boundary.
+- For a normal `postprocessing` request, report completion in one ordinary `Answer:` and ask
+  whether the user wants to continue Fix. This is optional follow-up, so do not use
+  `AwaitUser:` and do not keep or reopen the completed parent task.
+- If the user later explicitly says to continue Fix, the Router creates one linked child task
+  from durable lineage. Do not ask for or restate the date, clips, internal segment names,
+  Annotation refs, or Review refs.
+- If the original requested outcome was `postprocessing_and_fix`, do not ask again. Report that
+  the linked Fix task will continue; the Runtime creates a new child task after closing the
+  postprocessing parent.
+- A trajectory-review Plan contains only the durable Fix-workbench handoff followed by review
+  outcome validation. Fix calibration is selected independently in the workbench. The model
+  must not choose a Fix calibration path, translate edit geometry, or author numerical Fix
+  commands.
+- `approved` and `discarded` are terminal. `returned` returns the same review to the Fix
+  workbench. A new processing result creates a new trajectory revision and review rather than
+  reopening a terminal one.
+- The `pass` trajectory field is preserved business data. It is not an approval state and does
+  not implicitly filter training output.
 
 ## Model/code decision ownership
 
-The model chooses inspection calls, stage, reference sensor, sync policy, sensor/topic bindings, localization, calibration, gridmap, ordered steps, variants, business parameters, dependencies, failure policies, and reasons from facts and action contracts. Code records observations, checks concurrency and authorization, validates a complete Plan, stores it immutably, and executes canonical accepted arguments. Code-derived identifiers, timestamps, output declarations, and ledger status are metadata, not semantic choices.
+The model chooses inspection calls, stage, reference sensor, sync policy,
+sensor/topic bindings, localization, the normalized processing-calibration decision, gridmap,
+trajectory variant, ordered steps, business parameters, dependencies, failure policies, and
+reasons from facts and action contracts. Code records observations, resolves paths and internal
+identifiers, moves data, freezes calibration content, checks concurrency and authorization,
+validates a complete Plan, stores it immutably, and executes canonical accepted arguments.
+Bounding boxes, trajectories, Fix commands, hashes, timestamps, output declarations, and ledger
+status are system/application data rather than conversational payloads.
 
 ## User-confirmation points
 
@@ -62,9 +125,13 @@ Ask the user when:
 - a fresh task finds existing sync products but the current request has not yet authorized finish processing;
 - a required finish input is missing;
 - work would overwrite, delete, or destructively replace products;
-- the accepted Plan reaches a declared calibration or GUI decision.
+- the accepted Plan reaches a declared processing-calibration interaction or Web initial
+  annotation handoff.
 
 Do not treat silence, remembered text, or a code status as consent.
+Do not use `AwaitUser:` for the optional postprocessing-to-Fix question or for Web-workbench
+geometry. Those transitions are represented by the completed parent outcome and durable
+Annotation handoff.
 
 ## Failure/retry behavior
 
@@ -74,7 +141,7 @@ When a processing tool reports that it is running in the background, end the cur
 
 Inspect current inputs and outputs before retrying. A non-destructive retry may proceed when still authorized by the accepted Plan; ask again before destructive replacement. If facts invalidate the Plan, investigate and author a new complete Plan. If submission validation fails, correct the reported paths using evidence/action contracts and resubmit the entire Plan; never send a patch. Report failures and blocked state truthfully.
 
-## Four bounded few-shots
+## Six bounded few-shots
 
 ### Few-shot 1: user claims sync is complete, but products are missing
 
@@ -99,3 +166,21 @@ Inspect current inputs and outputs before retrying. A non-destructive retry may 
 - Observation: validation returns bounded errors for one decision and one step argument.
 - Criteria: the rejected candidate did not replace the accepted Plan; a patch is not a valid submission.
 - Next: inspect the cited evidence/action contract, correct the fields, and resubmit the whole complete JSON Plan.
+
+### Few-shot 5: tracked Annotation Job is ready
+
+- Observation: bounded Annotation facts report `tracked`,
+  `ready_for_postprocessing=true`, and a frozen processing calibration snapshot.
+- Criteria: M1 work is already complete; repeating annotation or Tracking would duplicate
+  writes and may contaminate the result.
+- Next: inspect localization, gridmap, and runtime facts; choose
+  `annotation_snapshot`, the evidence-backed gridmap strategy, and the matching trajectory
+  variant; submit only the remaining finish-processing Plan.
+
+### Few-shot 6: postprocessing completed, Fix was not explicitly requested
+
+- Observation: final validation completed and the durable outcome is
+  `postprocessing_completed_fix_pending`.
+- Criteria: the processing parent is terminal and no task slot is held; Fix is optional.
+- Next: give one ordinary answer that reports completion and asks whether to continue Fix.
+  Do not use `AwaitUser:` and do not create a Fix task until the user explicitly agrees.

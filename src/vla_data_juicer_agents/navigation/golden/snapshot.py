@@ -584,6 +584,16 @@ def _capture_snapshot(
 ) -> GoldenSnapshot:
     if role not in {"legacy", "candidate"}:
         raise GoldenError("Golden role must be legacy or candidate")
+    if (
+        role == "candidate"
+        and case.role_scopes is not None
+        and case.role_scopes.candidate.scope_kind
+        in {"postprocessing_segment", "fix_segment"}
+        and bound_artifact_scope is None
+    ):
+        raise GoldenError(
+            "M2 Golden candidates must be resolved from AnnotationStore",
+        )
     if role == "legacy" and case.legacy_oracle_selection_required:
         if oracle_ref is None:
             raise GoldenError(

@@ -364,6 +364,100 @@ def test_v2_rejects_caller_declared_candidate_runtime_facts(
         )
 
 
+@pytest.mark.parametrize(
+    "scope_kind",
+    ["postprocessing_segment", "fix_segment"],
+)
+def test_v2_m2_scope_requires_internal_segment(scope_kind: str) -> None:
+    payload = _bundle().model_dump(mode="json")
+    candidate = payload["cases"][0]["role_scopes"]["candidate"]
+    candidate["scope_kind"] = scope_kind
+    candidate["internal_segment"] = None
+
+    with pytest.raises(ValueError, match="requires internal_segment"):
+        GoldenCaseBundle.model_validate(payload)
+
+
+@pytest.mark.parametrize(
+    "scope_kind",
+    ["postprocessing_segment", "fix_segment"],
+)
+def test_v2_m2_candidate_cannot_use_a_caller_supplied_attestation(
+    tmp_path: Path,
+    scope_kind: str,
+) -> None:
+    candidate = tmp_path / "candidate"
+    _write_role(candidate, date="20270605", tracking_suffix=b"candidate")
+    payload = _bundle().model_dump(mode="json")
+    payload["cases"][0]["role_scopes"]["legacy"]["scope_kind"] = scope_kind
+    payload["cases"][0]["role_scopes"]["candidate"]["scope_kind"] = scope_kind
+    bundle = GoldenCaseBundle.model_validate(payload)
+
+    with pytest.raises(
+        GoldenError,
+        match="must be resolved from AnnotationStore",
+    ):
+        capture_snapshot(
+            root=candidate,
+            bundle=bundle,
+            case=bundle.cases[0],
+            role="candidate",
+            attestation=_attestation(),
+        )
+
+
+@pytest.mark.parametrize(
+    "scope_kind",
+    ["postprocessing_segment", "fix_segment"],
+)
+def test_v2_m2_candidate_accepts_only_store_bound_scope(
+    tmp_path: Path,
+    scope_kind: str,
+) -> None:
+    baseline = tmp_path / "baseline"
+    candidate = tmp_path / "candidate"
+    _write_role(baseline, date="20260605", tracking_suffix=b"legacy")
+    _write_role(candidate, date="20270605", tracking_suffix=b"candidate")
+    payload = _bundle().model_dump(mode="json")
+    payload["cases"][0]["role_scopes"]["legacy"]["scope_kind"] = scope_kind
+    payload["cases"][0]["role_scopes"]["candidate"]["scope_kind"] = scope_kind
+    bundle = GoldenCaseBundle.model_validate(payload)
+    attestation = _attestation()
+
+    class Store:
+        def golden_candidate_binding(self, **request):
+            return {
+                "source": "annotation_store",
+                "run_ref": request["run_ref"],
+                "dataset_date": request["dataset_date"],
+                "source_clips": [request["source_clip"]],
+                "source_clip": request["source_clip"],
+                "scope_kind": request["scope_kind"],
+                "internal_segment": request["internal_segment"],
+                "staging_root": candidate,
+                "artifact_scope": "samples/20270605/segment_0",
+                "segments": [
+                    {
+                        "source_clip": request["source_clip"],
+                        "internal_segment": request["internal_segment"],
+                        "artifact_scope": "samples/20270605/segment_0",
+                    },
+                ],
+                "attestation": attestation.model_dump(mode="json"),
+            }
+
+    result = compare_roots_from_annotation_store(
+        annotation_store=Store(),
+        candidate_run_ref=attestation.run_ref,
+        baseline_root=baseline,
+        bundle=bundle,
+        case=bundle.cases[0],
+    )
+
+    assert result.business_equivalence is True
+    assert result.candidate_run_ref == attestation.run_ref
+
+
 def test_v2_production_entry_reads_attestation_from_annotation_store(
     tmp_path: Path,
 ) -> None:

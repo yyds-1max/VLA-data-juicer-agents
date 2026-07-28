@@ -79,6 +79,12 @@ def cases_sha256(cases: Sequence[EvaluationCase]) -> str:
                     "dataset_date",
                     "selection",
                     "status",
+                    "requested_outcome",
+                    "phase",
+                    "decision_modes",
+                    "step_actions",
+                    "step_variants",
+                    "linked_fix",
                 ):
                     handoff.pop(field, None)
         canonical_cases.append(payload)

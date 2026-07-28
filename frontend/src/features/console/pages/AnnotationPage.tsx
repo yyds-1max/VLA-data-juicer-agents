@@ -3,19 +3,13 @@ import {
   AlertCircle,
   ArrowLeft,
   Ban,
-  CalendarDays,
   Check,
-  ChevronLeft,
-  ChevronRight,
   CircleCheck,
   CircleDot,
-  History,
   LoaderCircle,
-  Play,
   Plus,
   RefreshCw,
   RotateCcw,
-  Search,
   SkipForward,
   Tags,
   X,
@@ -26,12 +20,19 @@ import {
   useNavigate,
   useParams,
 } from "react-router-dom";
+import { useStore } from "zustand";
 
-import { getNavigationDatasetDate } from "../../../api/client";
 import type { NavigationDateSummary } from "../../../api/types";
 import { ConsoleButton } from "../../../components/console/ConsoleButton";
 import { ConsoleCard } from "../../../components/console/ConsoleCard";
 import { StatusTag } from "../../../components/console/StatusTag";
+import { datapilotStore } from "../../../store/datapilotStore";
+import { NavigationDataPilotDialog } from "../components/NavigationDataPilotDialog";
+import {
+  buildAnnotationProcessingRequest,
+  buildNavigationDatasetRequestContext,
+  type NavigationDatasetSelection,
+} from "../navigationDataPilotRequest";
 import {
   getNavigationDatasetSummaryCached,
   resetNavigationDatasetSummaryCache,
@@ -39,11 +40,9 @@ import {
 import { InitialAnnotationWorkbench } from "../../annotation/InitialAnnotationWorkbench";
 import {
   AnnotationApiError,
-  createAnnotationJob,
   getAnnotationCapabilities,
   getAnnotationJob,
   getAnnotationSegment,
-  getCalibrationProfiles,
   listAnnotationJobs,
   mutateAnnotationJob,
   mutateAnnotationSegment,
@@ -57,13 +56,9 @@ import type {
   AnnotationSegmentDetail,
   AnnotationSegmentSummary,
   AnnotationSegmentStatus,
-  CalibrationProfile,
 } from "../../annotation/types";
 
 const POLL_INTERVAL_MS = 2500;
-const HISTORY_PAGE_SIZE = 5;
-const JOB_TABLE_GRID_CLASS =
-  "grid-cols-[5.5rem_minmax(7rem,1.15fr)_7rem_minmax(7.5rem,1fr)_6.75rem_7.5rem_minmax(3.5rem,.5fr)] xl:grid-cols-[6rem_9.5rem_7rem_15rem_7rem_8rem_3.5rem]";
 const JOB_TABLE_GRID_LARGE_CLASS =
   "lg:grid-cols-[5.5rem_minmax(7rem,1.15fr)_7rem_minmax(7.5rem,1fr)_6.75rem_7.5rem_minmax(3.5rem,.5fr)] xl:grid-cols-[6rem_9.5rem_7rem_15rem_7rem_8rem_3.5rem]";
 
@@ -72,6 +67,8 @@ const JOB_STATUS: Record<AnnotationJobStatus, { label: string; tone: "success" |
   waiting_initial_annotation: { label: "待首帧标注", tone: "warning" },
   tracking: { label: "Tracking 中", tone: "info" },
   tracked: { label: "Tracking 已完成", tone: "success" },
+  postprocessing: { label: "后处理中", tone: "info" },
+  annotated: { label: "已标注", tone: "success" },
   failed: { label: "处理失败", tone: "danger" },
   cancelled: { label: "已取消", tone: "neutral" },
 };
@@ -83,6 +80,9 @@ const SEGMENT_STATUS: Record<AnnotationSegmentStatus, { label: string; tone: "su
   skipped: { label: "已跳过", tone: "neutral" },
   tracking: { label: "Tracking 中", tone: "info" },
   tracked: { label: "已完成", tone: "success" },
+  postprocessing: { label: "后处理中", tone: "info" },
+  annotated: { label: "已标注", tone: "success" },
+  postprocessing_failed: { label: "后处理失败", tone: "danger" },
 };
 
 function safeError(error: unknown, fallback: string): string {
@@ -104,7 +104,12 @@ function formattedTime(timestamp: string): string {
 }
 
 function activeJob(status: AnnotationJobStatus): boolean {
-  return status === "preparing" || status === "waiting_initial_annotation" || status === "tracking";
+  return (
+    status === "preparing"
+    || status === "waiting_initial_annotation"
+    || status === "tracking"
+    || status === "postprocessing"
+  );
 }
 
 function preferMonotonicJob<T extends AnnotationJobSummary>(
@@ -137,6 +142,8 @@ function resolvedSegmentCount(job: Pick<AnnotationJobSummary, "counts">): number
     + job.counts.skipped
     + job.counts.tracking
     + job.counts.tracked
+    + (job.counts.postprocessing ?? 0)
+    + (job.counts.annotated ?? 0)
   );
 }
 
@@ -160,6 +167,9 @@ function countsFromSegments(segments: AnnotationSegmentSummary[]) {
     skipped: segments.filter((item) => item.status === "skipped").length,
     tracking: segments.filter((item) => item.status === "tracking").length,
     tracked: segments.filter((item) => item.status === "tracked").length,
+    postprocessing: segments.filter((item) => item.status === "postprocessing").length,
+    annotated: segments.filter((item) => item.status === "annotated").length,
+    postprocessing_failed: segments.filter((item) => item.status === "postprocessing_failed").length,
   };
 }
 
@@ -343,253 +353,126 @@ function JobsPage() {
   const navigate = useNavigate();
   const [jobs, setJobs] = useState<AnnotationJobSummary[]>([]);
   const [capability, setCapability] = useState<AnnotationCapability | null>(null);
-  const [profiles, setProfiles] = useState<CalibrationProfile[]>([]);
   const [dates, setDates] = useState<NavigationDateSummary[]>([]);
-  const [selectedDate, setSelectedDate] = useState("");
-  const [dateDetail, setDateDetail] = useState<NavigationDateSummary | null>(null);
-  const [selectedClips, setSelectedClips] = useState<string[]>([]);
-  const [selectedProfile, setSelectedProfile] = useState("");
-  const [showCreate, setShowCreate] = useState(false);
-  const [historyQuery, setHistoryQuery] = useState("");
-  const [historyStatus, setHistoryStatus] = useState<"all" | AnnotationJobStatus>("all");
-  const [historyStartDate, setHistoryStartDate] = useState("");
-  const [historyEndDate, setHistoryEndDate] = useState("");
-  const [historyPage, setHistoryPage] = useState(1);
   const [loading, setLoading] = useState(true);
-  const [creating, setCreating] = useState(false);
   const [pageError, setPageError] = useState("");
-  const [createError, setCreateError] = useState("");
-  const [createDialogAttention, setCreateDialogAttention] = useState<0 | 1 | 2>(0);
-  const selectedDateRef = useRef("");
-  const dateRequestGenerationRef = useRef(0);
-  const createDialogRef = useRef<HTMLDivElement | null>(null);
-  const createDialogAttentionTimerRef = useRef<number | null>(null);
-  const createDialogLastAttentionAtRef = useRef(0);
+  const [dialogOpen, setDialogOpen] = useState(false);
+  const [activeInvocationId, setActiveInvocationId] = useState<string | null>(null);
+  const pendingInvocation = useStore(datapilotStore, (state) => state.pendingInvocation);
 
-  useEffect(() => () => {
-    if (createDialogAttentionTimerRef.current !== null) {
-      window.clearTimeout(createDialogAttentionTimerRef.current);
-    }
-  }, []);
+  const activeInvocation =
+    activeInvocationId && pendingInvocation?.invocationId === activeInvocationId
+      ? pendingInvocation
+      : null;
+  const submitting =
+    activeInvocation?.status === "queued" || activeInvocation?.status === "submitting";
+  const invocationError =
+    activeInvocation?.status === "failed" || activeInvocation?.status === "blocked"
+      ? activeInvocation.error ?? "提交失败，请重试。"
+      : null;
 
-  useEffect(() => {
-    if (!showCreate) return;
-    setCreateDialogAttention(0);
-    createDialogLastAttentionAtRef.current = 0;
-  }, [showCreate]);
-
-  const refreshJobs = useCallback(async () => {
-    try {
-      const nextJobs = await listAnnotationJobs();
-      setJobs((current) => mergeMonotonicJobs(current, nextJobs));
-    } catch (requestError) {
-      setPageError(safeError(requestError, "读取自动标注任务失败"));
-    }
-  }, []);
-
-  const refreshJobsAndDatasets = useCallback(async () => {
-    resetNavigationDatasetSummaryCache();
-    const requestedDate = selectedDateRef.current;
-    const dateRequestGeneration = ++dateRequestGenerationRef.current;
-    try {
-      const [
-        nextJobs,
-        nextCapability,
-        nextProfiles,
-        summary,
-        selectedDetail,
-      ] = await Promise.all([
-        listAnnotationJobs(),
-        getAnnotationCapabilities(),
-        getCalibrationProfiles(),
-        getNavigationDatasetSummaryCached(),
-        requestedDate ? getNavigationDatasetDate(requestedDate) : Promise.resolve(null),
-      ]);
-      setJobs((current) => mergeMonotonicJobs(current, nextJobs));
-      setCapability(nextCapability);
-      setProfiles(nextProfiles);
-      setDates(summary.dates.filter((date) => date.synced_clip_count > 0));
-      if (
-        selectedDetail
-        && dateRequestGenerationRef.current === dateRequestGeneration
-        && selectedDateRef.current === requestedDate
-      ) {
-        setDateDetail(selectedDetail);
-        const available = new Set(
-          (selectedDetail.clips ?? [])
-            .filter((clip) => clip.has_sync_data || clip.status === "synced")
-            .map((clip) => clip.clip),
-        );
-        setSelectedClips((current) => current.filter((clip) => available.has(clip)));
-      }
-      setPageError("");
-    } catch (requestError) {
-      setPageError(safeError(requestError, "刷新自动标注数据失败"));
-    }
-  }, []);
-
-  useEffect(() => {
-    let cancelled = false;
-    void Promise.allSettled([
+  const refresh = useCallback(async (invalidateDataset = false) => {
+    if (invalidateDataset) resetNavigationDatasetSummaryCache();
+    const results = await Promise.allSettled([
       listAnnotationJobs(),
       getAnnotationCapabilities(),
-      getCalibrationProfiles(),
       getNavigationDatasetSummaryCached(),
-    ]).then(([jobsResult, capabilityResult, profilesResult, datasetResult]) => {
-      if (cancelled) return;
-      if (jobsResult.status === "fulfilled") {
-        setJobs((current) => mergeMonotonicJobs(current, jobsResult.value));
-      } else {
-        setPageError(safeError(jobsResult.reason, "读取自动标注任务失败"));
-      }
-      setCapability(capabilityResult.status === "fulfilled"
-        ? capabilityResult.value
-        : {
-            available: false,
-            runtime_id: "navigation_odom_v1",
-            reason: { code: "capability_unavailable", message: "暂时无法确认 Runtime 状态。" },
-          });
-      if (profilesResult.status === "fulfilled") setProfiles(profilesResult.value);
-      if (datasetResult.status === "fulfilled") {
-        setDates(datasetResult.value.dates.filter((date) => date.synced_clip_count > 0));
-      }
-      setLoading(false);
-    });
-    return () => {
-      cancelled = true;
-    };
+    ]);
+    const [jobsResult, capabilityResult, datasetResult] = results;
+    if (jobsResult.status === "fulfilled") {
+      setJobs((current) => mergeMonotonicJobs(current, jobsResult.value));
+    } else {
+      setPageError(safeError(jobsResult.reason, "读取自动标注任务失败"));
+    }
+    setCapability(capabilityResult.status === "fulfilled"
+      ? capabilityResult.value
+      : {
+          available: false,
+          runtime_id: "navigation_odom_v1",
+          reason: {
+            code: "capability_unavailable",
+            message: "暂时无法确认处理环境状态。",
+          },
+        });
+    if (datasetResult.status === "fulfilled") {
+      setDates(datasetResult.value.dates.filter((date) => date.synced_clip_count > 0));
+    } else {
+      setPageError((current) => current || safeError(
+        datasetResult.reason,
+        "读取已同步数据失败",
+      ));
+    }
+    setLoading(false);
   }, []);
+
+  useEffect(() => {
+    void refresh(false);
+  }, [refresh]);
 
   useEffect(() => {
     if (!jobs.some((job) => activeJob(job.status))) return;
-    const interval = window.setInterval(() => void refreshJobs(), POLL_INTERVAL_MS);
-    return () => window.clearInterval(interval);
-  }, [jobs, refreshJobs]);
+    const timer = window.setInterval(() => void refresh(false), POLL_INTERVAL_MS);
+    return () => window.clearInterval(timer);
+  }, [jobs, refresh]);
 
-  const chooseDate = async (date: string) => {
-    selectedDateRef.current = date;
-    const requestGeneration = ++dateRequestGenerationRef.current;
-    setSelectedDate(date);
-    setSelectedClips([]);
-    setSelectedProfile("");
-    setDateDetail(null);
-    setCreateError("");
-    if (!date) return;
-    try {
-      const detail = await getNavigationDatasetDate(date);
-      if (
-        dateRequestGenerationRef.current === requestGeneration
-        && selectedDateRef.current === date
-      ) {
-        setDateDetail(detail);
-      }
-    } catch (requestError) {
-      if (
-        dateRequestGenerationRef.current === requestGeneration
-        && selectedDateRef.current === date
-      ) {
-        setCreateError(safeError(requestError, "读取已同步 clip 失败"));
-      }
+  useEffect(() => {
+    if (
+      !activeInvocationId
+      || pendingInvocation?.invocationId !== activeInvocationId
+      || pendingInvocation.status !== "submitted"
+    ) {
+      return;
+    }
+    setDialogOpen(false);
+    setActiveInvocationId(null);
+    datapilotStore.getState().clearDataPilotInvocation(activeInvocationId);
+  }, [activeInvocationId, pendingInvocation]);
+
+  const confirmDataPilot = (selection: NavigationDatasetSelection) => {
+    const message = buildAnnotationProcessingRequest(selection);
+    const requestContext = buildNavigationDatasetRequestContext(selection);
+    if (
+      activeInvocationId
+      && pendingInvocation?.invocationId === activeInvocationId
+      && pendingInvocation.message === message
+      && (pendingInvocation.status === "failed" || pendingInvocation.status === "blocked")
+    ) {
+      datapilotStore.getState().retryDataPilotInvocation(activeInvocationId);
+      return;
+    }
+    if (activeInvocationId) {
+      datapilotStore.getState().clearDataPilotInvocation(activeInvocationId);
+    }
+    const invocationId = createAnnotationInvocationId();
+    if (datapilotStore.getState().launchDataPilotRequest(
+      invocationId,
+      message,
+      requestContext,
+      "annotation_processing_shortcut",
+    )) {
+      setActiveInvocationId(invocationId);
     }
   };
 
-  const availableClips = (dateDetail?.clips ?? []).filter(
-    (clip) => clip.has_sync_data || clip.status === "synced",
-  );
-  const selectedCalibration = profiles.find((profile) => profile.profile_ref === selectedProfile);
-  const createDirty = Boolean(selectedDate || selectedClips.length || selectedProfile);
-  const canCreate = Boolean(
-    capability?.available
-      && selectedDate
-      && selectedClips.length
-      && selectedCalibration
-      && !creating,
-  );
-
-  const create = async () => {
-    if (!selectedCalibration || !canCreate) return;
-    setCreating(true);
-    setCreateError("");
-    try {
-      const job = await createAnnotationJob({
-        dataset_date: selectedDate,
-        source_clips: selectedClips,
-        calibration_profile_ref: selectedCalibration.profile_ref,
-        calibration_content_sha256: selectedCalibration.content_sha256,
-      });
-      navigate(`/annotation/jobs/${encodeURIComponent(job.job_ref)}`);
-    } catch (requestError) {
-      setCreateError(safeError(requestError, "创建自动标注任务失败"));
-    } finally {
-      setCreating(false);
-    }
-  };
-
-  const remindCreateDialog = () => {
-    const now = Date.now();
-    if (now - createDialogLastAttentionAtRef.current < 100) return;
-    createDialogLastAttentionAtRef.current = now;
-    if (createDialogAttentionTimerRef.current !== null) {
-      window.clearTimeout(createDialogAttentionTimerRef.current);
-    }
-    setCreateDialogAttention((current) => current === 1 ? 2 : 1);
-    createDialogAttentionTimerRef.current = window.setTimeout(() => {
-      setCreateDialogAttention(0);
-      createDialogAttentionTimerRef.current = null;
-    }, 1200);
-  };
-
-  const openJob = (jobRef: string) => {
-    navigate(`/annotation/jobs/${encodeURIComponent(jobRef)}`);
-  };
   const waitingJobs = jobs.filter((job) => job.status === "waiting_initial_annotation");
-  const runningJobs = jobs.filter((job) => job.status === "preparing" || job.status === "tracking");
+  const runningJobs = jobs.filter((job) => (
+    job.status === "preparing"
+    || job.status === "tracking"
+    || job.status === "postprocessing"
+  ));
   const failedJobs = jobs.filter((job) => job.status === "failed");
   const historyJobs = jobs
-    .filter((job) => job.status === "tracked" || job.status === "cancelled")
+    .filter((job) => (
+      job.status === "tracked"
+      || job.status === "annotated"
+      || job.status === "cancelled"
+    ))
     .sort((left, right) => right.updated_at.localeCompare(left.updated_at));
-  const normalizedHistoryQuery = historyQuery.trim().toLocaleLowerCase();
-  const historyStartToken = historyStartDate.replace(/-/g, "");
-  const historyEndToken = historyEndDate.replace(/-/g, "");
-  const filteredHistoryJobs = historyJobs.filter((job) => {
-    const matchesStatus = historyStatus === "all" || job.status === historyStatus;
-    const matchesDate = (
-      (!historyStartToken || job.dataset_date >= historyStartToken)
-      && (!historyEndToken || job.dataset_date <= historyEndToken)
-    );
-    const searchable = [
-      ...job.source_clips,
-      job.calibration.label,
-    ].join(" ").toLocaleLowerCase();
-    return matchesStatus
-      && matchesDate
-      && (!normalizedHistoryQuery || searchable.includes(normalizedHistoryQuery));
-  });
-  const historyPageCount = Math.max(1, Math.ceil(filteredHistoryJobs.length / HISTORY_PAGE_SIZE));
-  const currentHistoryPage = Math.min(historyPage, historyPageCount);
-  const pagedHistoryJobs = filteredHistoryJobs.slice(
-    (currentHistoryPage - 1) * HISTORY_PAGE_SIZE,
-    currentHistoryPage * HISTORY_PAGE_SIZE,
-  );
-  const firstVisibleHistoryPage = Math.max(
-    1,
-    Math.min(currentHistoryPage - 2, historyPageCount - 4),
-  );
-  const visibleHistoryPages = Array.from(
-    { length: Math.min(5, historyPageCount) },
-    (_, index) => firstVisibleHistoryPage + index,
-  );
-  const historyFiltersActive = Boolean(
-    normalizedHistoryQuery
-    || historyStatus !== "all"
-    || historyStartDate
-    || historyEndDate,
-  );
   const pendingSegments = waitingJobs.reduce(
     (total, job) => total + job.counts.pending_initial_annotation + job.counts.draft,
     0,
   );
-  const completedJobs = jobs.filter((job) => job.status === "tracked").length;
+  const annotatedJobs = jobs.filter((job) => job.status === "annotated").length;
 
   return (
     <section className="mx-auto max-w-360 space-y-3 px-3 pb-28 pt-4 md:px-4 lg:px-5">
@@ -598,35 +481,34 @@ function JobsPage() {
           <div className="flex flex-wrap items-center gap-3">
             <h2 className="text-xl font-semibold tracking-tight text-console-text">自动标注任务</h2>
             {capability && (
-              <span
-                className={`inline-flex items-center gap-1.5 rounded-full border px-2.5 py-1 text-xs font-medium ${
-                  capability.available
-                    ? "border-emerald-200 bg-emerald-50 text-emerald-700"
-                    : "border-amber-200 bg-amber-50 text-amber-700"
-                }`}
-              >
-                <span className={`h-1.5 w-1.5 rounded-full ${capability.available ? "bg-emerald-500" : "bg-amber-500"}`} />
+              <span className={`inline-flex items-center gap-1.5 rounded-full border px-2.5 py-1 text-xs font-medium ${
+                capability.available
+                  ? "border-emerald-200 bg-emerald-50 text-emerald-700"
+                  : "border-amber-200 bg-amber-50 text-amber-700"
+              }`}>
+                <span className={`h-1.5 w-1.5 rounded-full ${
+                  capability.available ? "bg-emerald-500" : "bg-amber-500"
+                }`} />
                 {capability.available ? "处理环境可用" : "处理环境不可用"}
               </span>
             )}
           </div>
-          <p className="mt-1.5 text-sm text-console-muted">从已同步数据开始，完成 Web 首帧标注与 Tracking。</p>
+          <p className="mt-1.5 text-sm text-console-muted">
+            DataPilot 负责任务调查、规划和后处理；这里用于提交首帧标注。
+          </p>
         </div>
         <div className="flex gap-2">
-          <ConsoleButton onClick={() => void refreshJobsAndDatasets()} aria-label="刷新自动标注任务">
+          <ConsoleButton onClick={() => void refresh(true)} aria-label="刷新标注任务">
             <RefreshCw className="h-4 w-4" aria-hidden="true" />
             刷新
           </ConsoleButton>
           <ConsoleButton
             variant="primary"
-            aria-label="新建任务"
-            onClick={() => {
-              setCreateError("");
-              setShowCreate(true);
-            }}
+            aria-label="交给 DataPilot 处理"
+            onClick={() => setDialogOpen(true)}
           >
             <Plus className="h-4 w-4" aria-hidden="true" />
-            创建任务
+            交给 DataPilot 处理
           </ConsoleButton>
         </div>
       </div>
@@ -636,15 +518,10 @@ function JobsPage() {
           <div className="flex items-start gap-3">
             <AlertCircle className="mt-0.5 h-5 w-5 text-amber-700" aria-hidden="true" />
             <div>
-              <p className="text-sm font-semibold text-amber-800">当前服务器暂不能创建处理任务</p>
+              <p className="text-sm font-semibold text-amber-800">当前处理环境尚未通过预检</p>
               <p className="mt-1 text-sm text-amber-700">
-                处理运行环境尚未通过部署预检，请联系运维人员核对本次部署配置。
+                仍可向 DataPilot 提交范围，由它检查事实并说明阻塞；页面不会直接启动 Runtime。
               </p>
-              {capability.reason?.error_ref && /^[A-Za-z0-9][A-Za-z0-9_-]{15,127}$/.test(capability.reason.error_ref) && (
-                <p className="mt-1 font-mono text-xs text-amber-800">
-                  错误参考：{capability.reason.error_ref}
-                </p>
-              )}
             </div>
           </div>
         </div>
@@ -657,464 +534,98 @@ function JobsPage() {
       )}
 
       {loading ? (
-        <PageMessage icon={LoaderCircle} title="正在读取自动标注任务…" />
+        <PageMessage icon={LoaderCircle} title="正在读取标注任务…" />
       ) : (
         <div className="space-y-3">
-          <div
-            className="grid overflow-hidden rounded-lg border border-console-line bg-console-panel sm:grid-cols-2 lg:grid-cols-4"
-            data-testid="annotation-job-metrics"
-          >
+          <div className="grid overflow-hidden rounded-lg border border-console-line bg-console-panel sm:grid-cols-2 lg:grid-cols-4">
             {[
               { label: "待首帧标注", value: pendingSegments, icon: Tags, color: "text-amber-600" },
               { label: "处理中", value: runningJobs.length, icon: LoaderCircle, color: "text-blue-600" },
               { label: "异常任务", value: failedJobs.length, icon: AlertCircle, color: "text-rose-600" },
-              { label: "最近完成", value: completedJobs, icon: CircleCheck, color: "text-emerald-600" },
+              { label: "已标注", value: annotatedJobs, icon: CircleCheck, color: "text-emerald-600" },
             ].map((metric, index) => (
-              <div
-                key={metric.label}
-                className="relative flex min-h-24 items-center gap-4 px-5 py-4"
-              >
-                {index > 0 && (
-                  <span
-                    className="absolute inset-x-5 top-0 h-px bg-console-line sm:hidden"
-                    aria-hidden="true"
-                  />
-                )}
-                {(index === 1 || index === 3) && (
-                  <span
-                    className="absolute bottom-4 left-0 top-4 hidden w-px bg-console-line sm:block lg:hidden"
-                    aria-hidden="true"
-                  />
-                )}
-                {index >= 2 && (
-                  <span
-                    className="absolute inset-x-5 top-0 hidden h-px bg-console-line sm:block lg:hidden"
-                    aria-hidden="true"
-                  />
-                )}
-                {index > 0 && (
-                  <span
-                    className="absolute bottom-4 left-0 top-4 hidden w-px bg-console-line lg:block"
-                    aria-hidden="true"
-                  />
-                )}
+              <div key={metric.label} className="relative flex min-h-24 items-center gap-4 px-5 py-4">
+                {index > 0 && <span className="absolute bottom-4 left-0 top-4 hidden w-px bg-console-line lg:block" />}
                 <div className="flex h-12 w-12 shrink-0 items-center justify-center rounded-lg bg-console-panel2">
                   <metric.icon className={`h-6 w-6 ${metric.color}`} aria-hidden="true" />
                 </div>
                 <div>
                   <p className="text-sm font-semibold text-console-text">{metric.label}</p>
-                  <p className="mt-0.5 text-[1.7rem] font-semibold leading-none tabular-nums text-console-text">{metric.value}</p>
+                  <p className="mt-0.5 text-[1.7rem] font-semibold leading-none tabular-nums text-console-text">
+                    {metric.value}
+                  </p>
                 </div>
               </div>
             ))}
           </div>
 
-          {jobs.length === 0 ? (
-            <div className="flex min-h-56 flex-col items-center justify-center rounded-lg border border-dashed border-console-line bg-console-panel px-6 text-center">
-              <Tags className="h-8 w-8 text-console-muted" aria-hidden="true" />
-              <h3 className="mt-3 text-base font-semibold text-console-text">还没有自动标注任务</h3>
-              <p className="mt-1 max-w-md text-sm leading-6 text-console-muted">
-                创建任务后，系统会先准备 resize 后首帧，再进入 Web 标注队列。
-              </p>
-              <ConsoleButton
-                className="mt-4"
-                variant="primary"
-                onClick={() => setShowCreate(true)}
-              >
-                <Plus className="h-4 w-4" aria-hidden="true" />
-                创建第一个任务
-              </ConsoleButton>
-            </div>
-          ) : (
-            <>
-              <div className="space-y-2">
-                <JobsSection
-                  title="需要我处理"
-                  jobs={waitingJobs}
-                  empty="当前没有等待人工标注的任务。"
-                  actionLabel="继续标注"
-                  onOpen={openJob}
-                />
-                <JobsSection
-                  title="系统运行中"
-                  jobs={runningJobs}
-                  empty="当前没有运行中的任务。"
-                  onOpen={openJob}
-                />
-              </div>
-
-              {failedJobs.length > 0 && (
-                <JobsSection
-                  title="异常任务"
-                  jobs={failedJobs}
-                  empty=""
-                  actionLabel="查看处理"
-                  onOpen={openJob}
-                />
-              )}
-
-              <section className="overflow-hidden rounded-lg border border-console-line bg-console-panel">
-                <div className="px-4 pt-3">
-                  <span className="flex items-center gap-3">
-                    <History className="h-5 w-5 text-console-muted" aria-hidden="true" />
-                    <span>
-                      <span className="block text-sm font-semibold text-console-text">历史任务</span>
-                      <span className="mt-0.5 block text-xs text-console-muted">
-                        已完成、已取消及无可处理目标的任务，共 {historyJobs.length} 条
-                      </span>
-                    </span>
-                  </span>
-                </div>
-
-                {historyJobs.length === 0 ? (
-                  <div className="mx-4 mb-3 mt-3 border-y border-console-line px-4 py-8 text-center text-sm text-console-muted">
-                    暂无历史任务
-                  </div>
-                ) : (
-                  <>
-                    <div className="flex flex-col gap-3 px-4 py-3 lg:flex-row lg:items-center lg:gap-4">
-                        <label className="relative w-full lg:w-64">
-                          <span className="sr-only">搜索历史任务</span>
-                          <Search className="pointer-events-none absolute left-3.5 top-1/2 h-4 w-4 -translate-y-1/2 text-console-muted" aria-hidden="true" />
-                          <input
-                            aria-label="搜索历史任务"
-                            value={historyQuery}
-                            onChange={(event) => {
-                              setHistoryQuery(event.target.value);
-                              setHistoryPage(1);
-                            }}
-                            placeholder="搜索 clip 或标定参数"
-                            className="h-10 w-full rounded-lg border border-console-line bg-white pl-10 pr-3 text-sm text-console-text outline-hidden transition placeholder:text-console-muted focus:border-console-cyan focus:ring-2 focus:ring-console-cyan/15"
-                          />
-                        </label>
-                        <label className="flex min-w-0 items-center gap-2">
-                          <span className="shrink-0 text-sm font-medium text-console-muted">状态</span>
-                          <select
-                            aria-label="筛选历史任务状态"
-                            value={historyStatus}
-                            onChange={(event) => {
-                              setHistoryStatus(event.target.value as "all" | AnnotationJobStatus);
-                              setHistoryPage(1);
-                            }}
-                            className="h-10 w-full rounded-lg border border-console-line bg-white px-3 text-sm text-console-text outline-hidden transition focus:border-console-cyan focus:ring-2 focus:ring-console-cyan/15 lg:w-36"
-                          >
-                            <option value="all">全部</option>
-                            <option value="tracked">Tracking 已完成</option>
-                            <option value="cancelled">已取消</option>
-                          </select>
-                        </label>
-                        <div className="flex min-w-0 items-center gap-2">
-                          <span className="shrink-0 text-sm font-medium text-console-muted">数据日期</span>
-                          <div
-                            className="flex h-10 min-w-0 items-center gap-2 rounded-lg border border-console-line bg-white px-3 text-sm"
-                            role="group"
-                            aria-label="按数据日期筛选历史任务"
-                          >
-                            <CalendarDays className="h-4 w-4 shrink-0 text-console-muted" aria-hidden="true" />
-                            <input
-                              type="date"
-                              aria-label="历史任务开始日期"
-                              value={historyStartDate}
-                              onChange={(event) => {
-                                setHistoryStartDate(event.target.value);
-                                setHistoryPage(1);
-                              }}
-                              className="min-w-0 flex-1 bg-transparent text-xs text-console-text outline-hidden"
-                            />
-                            <span className="text-console-muted" aria-hidden="true">→</span>
-                            <input
-                              type="date"
-                              aria-label="历史任务结束日期"
-                              value={historyEndDate}
-                              onChange={(event) => {
-                                setHistoryEndDate(event.target.value);
-                                setHistoryPage(1);
-                              }}
-                              className="min-w-0 flex-1 bg-transparent text-xs text-console-text outline-hidden"
-                            />
-                          </div>
-                        </div>
-                        <button
-                          type="button"
-                          disabled={!historyFiltersActive}
-                          className="h-10 shrink-0 rounded-lg border border-console-line bg-white px-3.5 text-sm font-medium text-console-text transition hover:bg-console-panel2 focus:outline-hidden focus-visible:ring-2 focus-visible:ring-console-cyan/20 disabled:cursor-default disabled:opacity-45 disabled:hover:bg-white"
-                          onClick={() => {
-                            setHistoryQuery("");
-                            setHistoryStatus("all");
-                            setHistoryStartDate("");
-                            setHistoryEndDate("");
-                            setHistoryPage(1);
-                          }}
-                        >
-                          清空筛选
-                        </button>
-                      </div>
-                    <div className="mx-4 mb-3 overflow-hidden border-y border-console-line">
-                      <div className="overflow-x-auto">
-                        <div className="min-w-188">
-                          <div
-                            className={`grid gap-2 border-b border-console-line bg-slate-100/80 px-3 py-1.5 text-[11px] font-medium text-console-muted ${JOB_TABLE_GRID_CLASS}`}
-                            data-testid="annotation-history-table-header"
-                          >
-                            <span>数据日期</span>
-                            <span>外层 clips</span>
-                            <span>状态</span>
-                            <span>Segment 进度</span>
-                            <span>处理标定</span>
-                            <span>更新时间</span>
-                            <span>操作</span>
-                          </div>
-                          {pagedHistoryJobs.length > 0 ? (
-                            pagedHistoryJobs.map((job) => (
-                              <JobRow key={job.job_ref} job={job} onOpen={() => openJob(job.job_ref)} />
-                            ))
-                          ) : (
-                            <p className="px-4 py-8 text-center text-sm text-console-muted">
-                              没有符合当前筛选条件的历史任务。
-                            </p>
-                          )}
-                        </div>
-                      </div>
-                      {filteredHistoryJobs.length > 0 && (
-                        <div className="flex min-h-12 items-center justify-end gap-2 border-t border-console-line px-3 py-2">
-                          <span className="mr-1 text-xs tabular-nums text-console-muted">
-                            共 {filteredHistoryJobs.length} 条
-                          </span>
-                          {historyPageCount > 1 && (
-                            <>
-                              <button
-                                type="button"
-                                aria-label="上一页历史任务"
-                                disabled={currentHistoryPage === 1}
-                                className="flex h-8 w-8 items-center justify-center rounded-md border border-console-line text-console-muted transition hover:bg-console-panel2 hover:text-console-text disabled:cursor-not-allowed disabled:opacity-35 disabled:hover:bg-transparent"
-                                onClick={() => setHistoryPage(Math.max(1, currentHistoryPage - 1))}
-                              >
-                                <ChevronLeft className="h-4 w-4" aria-hidden="true" />
-                              </button>
-                              {visibleHistoryPages.map((page) => (
-                                <button
-                                  key={page}
-                                  type="button"
-                                  aria-label={`前往历史任务第 ${page} 页`}
-                                  aria-current={page === currentHistoryPage ? "page" : undefined}
-                                  className={`flex h-8 min-w-8 items-center justify-center rounded-md border px-2 text-sm font-medium transition ${
-                                    page === currentHistoryPage
-                                      ? "border-console-cyan bg-console-cyan text-white"
-                                      : "border-console-line text-console-text hover:bg-console-panel2"
-                                  }`}
-                                  onClick={() => setHistoryPage(page)}
-                                >
-                                  {page}
-                                </button>
-                              ))}
-                              <button
-                                type="button"
-                                aria-label="下一页历史任务"
-                                disabled={currentHistoryPage === historyPageCount}
-                                className="flex h-8 w-8 items-center justify-center rounded-md border border-console-line text-console-muted transition hover:bg-console-panel2 hover:text-console-text disabled:cursor-not-allowed disabled:opacity-35 disabled:hover:bg-transparent"
-                                onClick={() => setHistoryPage(Math.min(historyPageCount, currentHistoryPage + 1))}
-                              >
-                                <ChevronRight className="h-4 w-4" aria-hidden="true" />
-                              </button>
-                            </>
-                          )}
-                          <span className="ml-1 rounded-md border border-console-line bg-white px-2.5 py-1.5 text-xs text-console-muted">
-                            {HISTORY_PAGE_SIZE} 条/页
-                          </span>
-                        </div>
-                      )}
-                    </div>
-                  </>
-                )}
-              </section>
-            </>
-          )}
+          <div className="space-y-2">
+            <JobsSection
+              title="需要我处理"
+              jobs={waitingJobs}
+              empty="当前没有等待人工标注的任务。"
+              actionLabel="继续标注"
+              onOpen={(jobRef) => navigate(`/annotation/jobs/${encodeURIComponent(jobRef)}`)}
+            />
+            <JobsSection
+              title="DataPilot 处理中"
+              jobs={runningJobs}
+              empty="当前没有运行中的处理任务。"
+              onOpen={(jobRef) => navigate(`/annotation/jobs/${encodeURIComponent(jobRef)}`)}
+            />
+            {failedJobs.length > 0 && (
+              <JobsSection
+                title="异常任务"
+                jobs={failedJobs}
+                empty=""
+                actionLabel="查看处理"
+                tone="danger"
+                onOpen={(jobRef) => navigate(`/annotation/jobs/${encodeURIComponent(jobRef)}`)}
+              />
+            )}
+            <JobsSection
+              title="历史任务"
+              jobs={historyJobs}
+              empty="暂无历史任务。"
+              onOpen={(jobRef) => navigate(`/annotation/jobs/${encodeURIComponent(jobRef)}`)}
+            />
+          </div>
         </div>
       )}
 
-      <Dialog.Root
-        open={showCreate}
-        onOpenChange={(nextOpen) => {
-          if (!nextOpen && !creating) setShowCreate(false);
+      <NavigationDataPilotDialog
+        dates={dates}
+        error={invocationError}
+        open={dialogOpen}
+        submitting={submitting}
+        onCancel={() => {
+          if (activeInvocationId) {
+            datapilotStore.getState().clearDataPilotInvocation(activeInvocationId);
+          }
+          setActiveInvocationId(null);
+          setDialogOpen(false);
         }}
-      >
-        <Dialog.Portal>
-          <Dialog.Overlay
-            className="fixed inset-0 z-90 bg-slate-950/35 backdrop-blur-[1px]"
-            data-testid="create-annotation-job-overlay"
-            onMouseDown={remindCreateDialog}
-          />
-          <Dialog.Content
-            ref={createDialogRef}
-            aria-describedby="create-annotation-job-description"
-            className={`fixed left-1/2 top-1/2 z-91 flex max-h-[calc(100vh-2rem)] w-[calc(100vw-2rem)] max-w-2xl -translate-x-1/2 -translate-y-1/2 flex-col overflow-hidden rounded-xl border border-console-line bg-console-panel shadow-2xl outline outline-2 outline-offset-2 outline-transparent focus:outline-hidden ${
-              createDialogAttention === 1
-                ? "animate-[navigation-dialog-attention-a_760ms_ease-in-out] motion-reduce:animate-none motion-reduce:outline-slate-400"
-                : createDialogAttention === 2
-                  ? "animate-[navigation-dialog-attention-b_760ms_ease-in-out] motion-reduce:animate-none motion-reduce:outline-slate-400"
-                  : ""
-            }`}
-            data-testid="create-annotation-job-dialog"
-            onOpenAutoFocus={(event) => {
-              event.preventDefault();
-              createDialogRef.current?.focus({ preventScroll: true });
-            }}
-            onEscapeKeyDown={(event) => {
-              if (createDirty || creating) event.preventDefault();
-            }}
-            onInteractOutside={(event) => {
-              event.preventDefault();
-              remindCreateDialog();
-            }}
-          >
-            <div className="flex items-start justify-between gap-4 border-b border-console-line px-5 py-4">
-              <div>
-                <Dialog.Title className="text-base font-semibold text-console-text">创建导航自动标注任务</Dialog.Title>
-                <Dialog.Description id="create-annotation-job-description" className="mt-1 text-sm text-console-muted">
-                  选择已同步数据和当天处理使用的标定参数。
-                </Dialog.Description>
-              </div>
-              <button
-                type="button"
-                aria-label="关闭创建任务"
-                disabled={creating}
-                className="flex h-8 w-8 shrink-0 items-center justify-center rounded-lg text-console-muted transition hover:bg-console-panel2 hover:text-console-text focus:outline-hidden focus-visible:bg-console-panel2 focus-visible:text-console-text disabled:cursor-not-allowed disabled:opacity-40"
-                onClick={() => setShowCreate(false)}
-              >
-                <X className="h-4 w-4" aria-hidden="true" />
-              </button>
-            </div>
-
-            <div className="console-soft-scrollbar min-h-0 flex-1 space-y-5 overflow-y-auto px-5 py-5">
-              <div className="grid gap-4 sm:grid-cols-2">
-                <label className="text-sm">
-                  <span className="mb-2 block font-semibold text-console-text">数据日期</span>
-                  <select
-                    aria-label="自动标注数据日期"
-                    value={selectedDate}
-                    disabled={creating}
-                    className="h-10 w-full rounded-lg border border-console-line bg-white px-3 text-sm text-console-text outline-hidden transition focus:border-console-cyan focus:ring-2 focus:ring-console-cyan/15 disabled:cursor-not-allowed disabled:opacity-60"
-                    onChange={(event) => void chooseDate(event.target.value)}
-                  >
-                    <option value="">请选择已同步日期</option>
-                    {dates.map((date) => <option key={date.date} value={date.date}>{date.date}</option>)}
-                  </select>
-                </label>
-                <label className="text-sm">
-                  <span className="mb-2 block font-semibold text-console-text">当天处理标定</span>
-                  <select
-                    aria-label="当天处理标定"
-                    value={selectedProfile}
-                    disabled={creating}
-                    className="h-10 w-full rounded-lg border border-console-line bg-white px-3 text-sm text-console-text outline-hidden transition focus:border-console-cyan focus:ring-2 focus:ring-console-cyan/15 disabled:cursor-not-allowed disabled:opacity-60"
-                    onChange={(event) => {
-                      setSelectedProfile(event.target.value);
-                      setCreateError("");
-                    }}
-                  >
-                    <option value="">请选择标定参数</option>
-                    {profiles.map((profile) => (
-                      <option key={profile.profile_ref} value={profile.profile_ref}>{profile.label}</option>
-                    ))}
-                  </select>
-                </label>
-              </div>
-
-              <fieldset disabled={creating}>
-                <legend className="sr-only">外层 clips</legend>
-                <div className="mb-2 flex items-center justify-between gap-3">
-                  <span className="text-sm font-semibold text-console-text">外层 clips</span>
-                  {availableClips.length > 0 && (
-                    <button
-                      type="button"
-                      className="text-xs font-medium text-console-cyan hover:text-blue-700 focus:outline-hidden focus:underline"
-                      onClick={() => setSelectedClips(
-                        selectedClips.length === availableClips.length
-                          ? []
-                          : availableClips.map((clip) => clip.clip),
-                      )}
-                    >
-                      {selectedClips.length === availableClips.length ? "取消全选" : "全选"}
-                    </button>
-                  )}
-                </div>
-                <div className="overflow-hidden rounded-lg border border-console-line">
-                  {!selectedDate ? (
-                    <p className="px-4 py-5 text-sm text-console-muted">请先选择数据日期。</p>
-                  ) : dateDetail === null ? (
-                    <p className="flex items-center gap-2 px-4 py-5 text-sm text-console-muted">
-                      <LoaderCircle className="h-4 w-4 animate-spin" aria-hidden="true" />
-                      正在读取已同步 clips…
-                    </p>
-                  ) : availableClips.length === 0 ? (
-                    <p className="px-4 py-5 text-sm text-console-muted">该日期没有可处理的已同步 clip。</p>
-                  ) : (
-                    <div className="console-soft-scrollbar max-h-52 divide-y divide-console-line overflow-y-auto">
-                      {availableClips.map((clip) => {
-                        const checked = selectedClips.includes(clip.clip);
-                        return (
-                          <label
-                            key={clip.clip}
-                            className="flex cursor-pointer items-center gap-3 px-4 py-3 text-sm text-console-text transition hover:bg-console-panel2/70"
-                          >
-                            <span className={`flex h-4 w-4 shrink-0 items-center justify-center rounded border ${
-                              checked ? "border-console-cyan bg-console-cyan text-white" : "border-console-line bg-white"
-                            }`}>
-                              {checked && <Check className="h-3 w-3" aria-hidden="true" />}
-                            </span>
-                            <input
-                              className="sr-only"
-                              type="checkbox"
-                              aria-label={clip.clip}
-                              checked={checked}
-                              onChange={(event) => setSelectedClips((current) => (
-                                event.target.checked
-                                  ? [...current, clip.clip]
-                                  : current.filter((item) => item !== clip.clip)
-                              ))}
-                            />
-                            <span className="min-w-0 flex-1 truncate" title={clip.clip}>{clip.clip}</span>
-                          </label>
-                        );
-                      })}
-                    </div>
-                  )}
-                </div>
-              </fieldset>
-
-              <div className="rounded-lg border border-console-line bg-console-panel2/60 px-4 py-3">
-                <p className="text-xs font-semibold uppercase tracking-wide text-console-muted">任务摘要</p>
-                <p className="mt-1.5 text-sm text-console-text">
-                  {selectedDate || "未选择日期"} · {selectedClips.length} 个 clip · {selectedCalibration?.label ?? "未选择标定"}
-                </p>
-                <p className="mt-1 text-xs text-console-muted">页面不提供全局推荐，请按当天数据显式选择处理标定。</p>
-              </div>
-
-              {capability && !capability.available && (
-                <div role="status" className="rounded-lg border border-amber-200 bg-amber-50 px-3 py-2 text-sm text-amber-800">
-                  当前处理环境不可用，暂时不能创建任务。
-                </div>
-              )}
-
-              {createError && (
-                <div role="alert" className="rounded-lg border border-rose-200 bg-rose-50 px-3 py-2 text-sm text-rose-700">
-                  {createError}
-                </div>
-              )}
-            </div>
-
-            <div className="flex shrink-0 justify-end gap-2 border-t border-console-line bg-console-panel px-5 py-4">
-              <ConsoleButton disabled={creating} onClick={() => setShowCreate(false)}>取消</ConsoleButton>
-              <ConsoleButton variant="primary" disabled={!canCreate} onClick={() => void create()}>
-                {creating ? <LoaderCircle className="h-4 w-4 animate-spin" aria-hidden="true" /> : <Plus className="h-4 w-4" aria-hidden="true" />}
-                {creating ? "正在创建…" : "创建并准备"}
-              </ConsoleButton>
-            </div>
-          </Dialog.Content>
-        </Dialog.Portal>
-      </Dialog.Root>
+        onConfirm={confirmDataPilot}
+        onSelectionChange={() => {
+          if (
+            activeInvocationId
+            && pendingInvocation?.invocationId === activeInvocationId
+            && (pendingInvocation.status === "failed" || pendingInvocation.status === "blocked")
+          ) {
+            datapilotStore.getState().clearDataPilotInvocation(activeInvocationId);
+            setActiveInvocationId(null);
+          }
+        }}
+      />
     </section>
   );
+}
+
+function createAnnotationInvocationId(): string {
+  if (typeof crypto !== "undefined" && "randomUUID" in crypto) {
+    return `annotation-${crypto.randomUUID()}`;
+  }
+  return `annotation-${Date.now()}-${Math.random().toString(16).slice(2)}`;
 }
 
 function SegmentQueue({
@@ -1190,7 +701,7 @@ function JobActions({
   );
 
   const mutate = async (
-    action: "tracking" | "complete-no-processable-targets" | "cancel" | "retry",
+    action: "complete-no-processable-targets" | "cancel" | "retry",
   ) => {
     setActing(true);
     setError("");
@@ -1214,12 +725,6 @@ function JobActions({
         </div>
       ) : (
         <div className="flex flex-wrap gap-2">
-        {job.ready_for_tracking && (
-          <ConsoleButton variant="primary" disabled={acting} onClick={() => void mutate("tracking")}>
-            <Play className="h-4 w-4" aria-hidden="true" />
-            开始 Tracking
-          </ConsoleButton>
-        )}
         {job.ready_for_no_processable_targets && (
           <ConsoleButton disabled={acting} onClick={() => void mutate("complete-no-processable-targets")}>
             <Ban className="h-4 w-4" aria-hidden="true" />
@@ -1389,8 +894,10 @@ function JobPage({ jobRef }: { jobRef: string }) {
           ) : job.status === "waiting_initial_annotation" ? (
             <PageMessage
               icon={CircleDot}
-              title="请选择一个 Segment 开始标注"
-              detail="全部 Segment 已提交或显式跳过后，回到此页面启动 Tracking。"
+              title={job.ready_for_tracking ? "首帧标注已全部提交" : "请选择一个 Segment 开始标注"}
+              detail={job.ready_for_tracking
+                ? "提交事件已持久保存，DataPilot 将从原任务继续执行 Tracking 和后处理；无需在页面手动启动。"
+                : "完成每个 Segment 的首帧标注；全部提交后，页面会通知 DataPilot 继续处理。"}
             />
           ) : job.status === "tracking" ? (
             <PageMessage
@@ -1399,7 +906,20 @@ function JobPage({ jobRef }: { jobRef: string }) {
               detail="页面可以安全刷新；已完成的 target 会保存 checkpoint。"
             />
           ) : job.status === "tracked" ? (
-            <PageMessage icon={Check} title="Tracking 已完成" detail="M1 产物保留在任务 staging，等待 M2 继续后处理。" />
+            <PageMessage icon={Check} title="Tracking 已完成" detail="DataPilot 会继续调查并执行适合当前数据的后处理方案。" />
+          ) : job.status === "postprocessing" ? (
+            <PageMessage
+              icon={LoaderCircle}
+              title="DataPilot 正在执行后处理"
+              detail="页面可以安全关闭；任务事实和恢复点已持久保存。"
+            />
+          ) : job.status === "annotated" ? (
+            <PageMessage
+              icon={Check}
+              title="后处理已完成"
+              detail="轨迹复核任务已创建，可在“人工复核”中继续 Fix。"
+              action={<ConsoleButton onClick={() => navigate("/annotation/reviews")}>进入人工复核</ConsoleButton>}
+            />
           ) : null}
         </div>
       </div>
@@ -1680,7 +1200,7 @@ function SegmentPage({ jobRef, segmentRef }: { jobRef: string; segmentRef: strin
               <PageMessage
                 icon={SkipForward}
                 title="此 Segment 已显式跳过"
-                detail={segment.skip_reason?.note || "它不会进入 Tracking；Tracking 开始前仍可恢复标注。"}
+                detail={segment.skip_reason?.note || "它不会进入 Tracking；DataPilot 启动 Tracking 前仍可恢复标注。"}
               />
             </div>
           ) : (
@@ -1728,7 +1248,7 @@ function SegmentPage({ jobRef, segmentRef }: { jobRef: string; segmentRef: strin
               <div>
                 <Dialog.Title className="text-base font-semibold text-console-text">跳过此 Segment</Dialog.Title>
                 <Dialog.Description id="skip-segment-description" className="mt-1 text-sm text-console-muted">
-                  跳过后不会进入 Tracking，开始 Tracking 前仍可恢复。
+                  跳过后不会进入 Tracking，DataPilot 启动 Tracking 前仍可恢复。
                 </Dialog.Description>
               </div>
               <button

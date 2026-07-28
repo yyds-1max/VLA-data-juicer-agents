@@ -1,6 +1,6 @@
 # 自动标注板块总体开发路线
 
-> 状态：已批准；M1、M1.5 已完整冻结，下一步进入 M2 任务级规划
+> 状态：已批准；M1、M1.5 已完整冻结，M2 权威任务级计划已建立并进入开发
 > 最后更新：2026-07-28
 > 适用范围：导航数据自动标注、后处理、三维轨迹复核/Fix，以及后续可复用的标注领域能力  
 > 优先级：本文件在自动标注范围内优先于 `architecture.md` 中的历史占位描述
@@ -13,9 +13,9 @@
 M0 契约与 Runtime 基线
 → M1 Web 首帧标注与 Tracking
 → M1.5 Tailwind 4 与 Radix/shadcn 设计系统基线
-→ M2 完整后处理与三维复核/Fix
-→ M3 数据管理、仪表盘与智能体接入
-→ M4 三维 AI 辅助复核
+→ M2 DataPilot 主导的完整后处理与三维人工复核/Fix
+→ M3 数据管理、仪表盘与跨页面状态整合
+→ M4 DataPilot/模型辅助复核与 AI 候选 Fix
 ```
 
 进入每个里程碑前，先根据仓库、服务器和上一个里程碑的实际结果建立当期任务级计划：
@@ -48,10 +48,10 @@ run_U.sh（拆解、同步）
 → NoobScenes preprocessing
 → Web 首帧标注
 → Tracking
-→ 缺少输入 gridmap 时在 staging 中先运行 pcd_to_grid
+→ NavigationDataAgent 调查 localization、gridmap 和已有产物
+→ 选择并校验 gridmap 决策与 trajectory variant
 → 投影、世界坐标、速度和方向
-→ 按原顺序执行 cp_gridmap transform
-→ _0525 轨迹
+→ 按选定的原业务变体执行 gridmap transform 和轨迹生成
 → final 发布
 → 已标注 / 待轨迹复核
 → 人工三维轨迹复核/Fix
@@ -77,6 +77,12 @@ V1 明确不包含：
 ### LLM 与确定性系统的职责边界
 
 - LLM/多模态模型只承担其擅长的语义与认知工作：理解用户意图、识别目标与范围、规划步骤、基于系统返回的事实进行推理、生成面向用户的说明，以及在 M4 中基于受控证据执行三维轨迹辅助审核。
+- DataPilot 是处理任务的唯一对话和编排入口；NavigationDataAgent 负责调查数据并
+  选择规范化领域决策。Web 页面只提供任务快捷入口、人工输入工作台、状态和结果，
+  不形成与智能体并行的第二条处理流水线。
+- 后端不让 LLM 选择脚本路径或拼接命令。LLM 只选择系统公布的
+  `GridmapDecision`、localization 和 trajectory variant；Application Service
+  根据调查证据校验组合，再映射到冻结 Runtime。
 - 数据搬运、格式转换、标识关联、参数精确传递、几何数据读写、状态迁移、并发控制、断点恢复、产物发布和机器可验证的校验全部由确定性系统实现。
 - LLM 不作为 bbox、轨迹、绝对路径、内部 ID、标定内容或工具参数的中转存储，也不依赖自然语言复述保证这些数据的精确性。
 - LLM 的计划必须由 Application Service 和 Runtime Adapter 校验后才能执行；未经系统确认的推断不得成为任务状态或资产状态事实。
@@ -112,7 +118,12 @@ MainRouter
 - MainRouter 继续负责普通文本入口、意图路由、任务委派和控制。
 - NavigationDataAgent 继续负责导航领域调查、规划、执行和恢复。
 - 不新增 AnnotationAgent。
-- 手动页面和智能体最终调用同一个 Annotation Application Service。
+- DataPilot 是所有数据处理任务的唯一所有者；普通 Web 页面不得直接决定或启动
+  Tracking、gridmap、投影、轨迹和后处理。
+- Web 首帧标注与 Fix 页面只承担人工输入；用户提交后由 durable handoff 唤醒
+  原 Navigation Session 或其关联 Fix Task。
+- M1 保留的直接创建 Job、开始 Tracking API 仅作为测试和运维兼容接口，M2
+  普通产品 UI 不再暴露这些动作。
 - 几何标注和轨迹编辑使用专用业务 API，不进入聊天消息或现有选项 Interaction。
 - 前端始终只展示 DataPilot，不暴露内部 Agent、工具名、内部 ID、路径或多次 LLM 调用。
 
@@ -127,8 +138,14 @@ MainRouter
 - `ArtifactManifest`
 - `CalibrationSnapshot`
 - `TrajectoryRevision`
+- `PostprocessingSpec`
 - `FixRevision`
 - `TrajectoryReviewTask`
+- `FixCalibrationSnapshot`
+- `ReviewDecision`
+- `CompatibilityPublication`
+- `WorkflowHandoff`
+- `AnnotationTaskLink`
 - `AIReviewReport`（M4，问题、证据和置信度）
 - `AIProposedFixRevision`（M4，模型生成的隔离候选修正版）
 
@@ -249,28 +266,62 @@ Tailwind 3 → Tailwind 4
 
 交付：
 
-- 从 Tracking 继续完成原 gridmap、投影、速度、方向、轨迹和 final 发布；
+- 在修改 Prompt 和领域工具前建立 Navigation 最小评测入口，并只为自动标注、
+  后处理和轨迹 Fix 补充必要的 Router case；
+- DataPilot 从同步产物或已有 tracked Job 调查数据，选择并校验 gridmap、
+  localization 和 trajectory variant，再完成原投影、速度、方向、轨迹和 final
+  发布；
+- 首帧 Web 工作台提交后的 durable handoff，以及后处理完成后的关联 Fix Task；
 - 独立 TrajectoryReviewTask/FixJob；
 - Web 三维轨迹复核/Fix；
 - 独立 Fix 标定；
 - FixRevision、通过、退回、废弃和训练出口。
 
-退出条件：同步产物可通过 Web 形成经人工批准的 `_trajectory_fix_five.json`。
+后处理与 Fix 的任务边界：
 
-### M3：数据管理、仪表盘与智能体接入
+```text
+后处理完成
+→ AnnotationJob = annotated
+→ 冻结 TrajectoryRevision 并创建 pending ReviewTask
+→ 原 Navigation 处理任务 completed，释放任务槽
+→ DataPilot 询问是否继续 Fix
+→ 用户确认后幂等创建关联 Fix Task
+```
+
+用户在最初请求中已经明确要求完整处理到 Fix 时，系统仍先结束处理任务，再自动
+创建关联 Fix Task，不重复询问。用户暂不处理时，ReviewTask 长期保持 pending，
+不占用任务槽。
+
+自动标注模块保持一个侧栏入口，内部使用 URL 化页面：
+
+```text
+/annotation/jobs
+/annotation/reviews
+/annotation/reviews/{review_ref}
+```
+
+M2 的“人工复核”页只提供人工 Fix 入口，不显示“交给 DataPilot 复核”按钮；
+该模型复核入口在 M4 与置信度和 AI 候选修正一起上线。
+
+退出条件：DataPilot 可从同步或 tracked 事实安全执行到 annotated；用户无需
+XQuartz 即可通过 Web 完成三维人工 Fix、批准并形成
+`_trajectory_fix_five.json`；严格 Golden 和全量回归通过。
+
+### M3：数据管理、仪表盘与跨页面状态整合
 
 交付：
 
 - 数据管理 ingestion 状态与 Annotation 生命周期联合投影；
 - 仪表盘真实标注/复核统计；
-- Navigation 最小评测入口；
-- durable Web 工作台 handoff；
-- NavigationDataAgent 的领域级标注/复核工具；
-- Router 对新增产品意图的小范围评测补充。
+- 日期和 clip 行的标注、结果、复核和已验证版本深链；
+- annotation 状态缓存失效和显式刷新；
+- 历史 `_trajectory_fix_five.json` 的受控批量导入；
+- 同一天或同一外层 clip 的“部分完成”与数量投影。
 
-退出条件：手动入口与聊天入口操作同一种领域任务，前端继续保持单一 DataPilot 体验。
+退出条件：数据管理、仪表盘、标注工作台和人工复核页读取同一事实源，并能稳定
+恢复到同一数据资产。
 
-### M4：三维 AI 辅助复核
+### M4：DataPilot/模型辅助复核与 AI 候选 Fix
 
 交付：
 
@@ -282,6 +333,8 @@ Tailwind 3 → Tailwind 4
   应用到新的 `AIProposedFixRevision`；
 - AI 候选版本与父 revision 的位置、方向、速度、轨迹和证据对比；
 - AI 建议侧栏、证据跳转，以及人工逐项接受、调整、拒绝和误报反馈；
+- 在“人工复核”页上线“交给 DataPilot 复核”按钮；DataPilot 创建受控模型复核
+  请求，不复用 M2 的人工 Fix 入口冒充模型能力；
 - 独立真实模型评测基线。
 
 硬边界：
@@ -455,3 +508,30 @@ AppleDouble 文件不属于业务输入，拆包发现与 raw 同源比较均须
   hash 未变，Runtime capability 仍为 true，服务和工作树正常；
 - M1.5 至此完整冻结。相邻的独立公开 DTO、字段感知输入净化和前端第二道错误
   脱敏属于后续纵深防御候选，不扩大为 M1.5 或 M2 的隐含范围。
+
+### M2（2026-07-28，本地实现完成，待服务器验收）
+
+- 开发基线为 M1.5 冻结提交 `a2d4ccd`，开发分支为
+  `codex/automatic-annotation-m2`；
+- 权威任务级计划为 `docs/automatic-annotation-m2-plan.md`；
+- 已锁定 DataPilot 为处理任务唯一所有者，Web 只提供快捷入口和人工工作台，
+  不建设第二条手动后处理流水线；
+- Navigation 最小评测、领域工具、durable handoff 和 linked Fix Task 从原 M3
+  前移到 M2；M3 收窄为数据管理、仪表盘和跨页面状态整合；
+- M2 的人工复核页不提供模型复核按钮；DataPilot/模型辅助复核、置信度和
+  `AIProposedFixRevision` 保留到 M4；
+- 本地已经完成 Annotation schema v5、Navigation Plan v4 领域迁移、后处理、
+  人工 Fix、异步兼容发布、durable handoff、linked Fix Task、M2 前端和最小
+  评测实现；
+- processing owner 唯一约束、精确 clip scope 复用、迁移完整性安全标记、后处理
+  writer 锁边界、既有 tracked Job owner 绑定，以及 linked Fix 两阶段和 Redis
+  原子幂等恢复均已补充回归；
+- 本地门禁为 Python `1635 passed`、Annotation `284 passed`、前端
+  `238 passed, 8 skipped`、Playwright 全量 `9 passed`、production build 通过，
+  三套评测分别验证 `4 / 17 / 7` 个 case schema；
+- 服务器旧 Navigation `final-v2` 真实库已完成只读副本迁移演练：7 个 task、
+  6 个 Plan、24 个 step、53 个 observation、53 个 evidence 和 10 个
+  submission attempt 除 generation marker 外逐行不变，外键、完整性和安全
+  标记均通过；正式停机迁移仍待执行；
+- 真实模型重复评测、服务器停机迁移、冻结 Runtime writer、严格业务 Golden 和
+  无污染审计尚未执行，因此 M2 仍未冻结，也不能提前进入 M3。

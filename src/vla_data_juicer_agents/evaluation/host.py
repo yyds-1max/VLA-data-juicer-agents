@@ -28,7 +28,14 @@ from agentscope.app.storage._utils import _dump_with_secrets
 from agentscope.app.workspace_manager import LocalWorkspaceManager
 from agentscope.message import Msg, UserMsg
 from agentscope.state import AgentState
+from agentscope.tool import FunctionTool
 
+from vla_data_juicer_agents.navigation.plan_models import (
+    ExtractSyncPlanInput,
+    FinishProcessingPlanInput,
+    TrajectoryReviewPlanInput,
+)
+from vla_data_juicer_agents.navigation.agent_tools import _TrustedNavigationTool
 from vla_data_juicer_agents.runtime.agentscope_bootstrap import (
     bootstrap_agentscope_records,
 )
@@ -36,6 +43,9 @@ from vla_data_juicer_agents.runtime.agentscope_config import AgentScopeRuntimeCo
 from vla_data_juicer_agents.runtime.single_agent import (
     RouterContractV1Middleware,
     router_v1_tools,
+)
+from vla_data_juicer_agents.runtime.agentscope_runtime import (
+    _navigation_handoff_message,
 )
 
 from .trace import EvaluationSafetyMiddleware, TraceMiddleware, TraceRecorder
@@ -366,7 +376,16 @@ class RecordingRouterRuntime:
         )
 
     @staticmethod
-    def _available_actions(status: str) -> list[str]:
+    def _available_actions(
+        status: str,
+        *,
+        completion_outcome: str | None = None,
+    ) -> list[str]:
+        if (
+            status == "completed"
+            and completion_outcome == "postprocessing_completed_fix_pending"
+        ):
+            return ["continue_fix"]
         return {
             "active": ["stop", "cancel"],
             "waiting_user": ["provide_input", "cancel"],
@@ -379,6 +398,7 @@ class RecordingRouterRuntime:
         if self.focused_task is None:
             return None
         status = str(self.focused_task.get("status") or "active")
+        completion_outcome = self.focused_task.get("completion_outcome")
         selection = self.focused_task.get("selection")
         clips = (
             list(selection.get("clips") or [])
@@ -397,10 +417,21 @@ class RecordingRouterRuntime:
             ),
             "scene_mode": self.focused_task.get("scene_mode"),
             "status": status,
-            "phase": "waiting_input" if status == "waiting_user" else "preparing",
+            "phase": (
+                "后处理已完成"
+                if completion_outcome == "postprocessing_completed_fix_pending"
+                else "waiting_input"
+                if status == "waiting_user"
+                else "preparing"
+            ),
             "wait_cause": self.focused_task.get("wait_cause"),
             "latest_public_update": None,
-            "available_actions": self._available_actions(status),
+            "available_actions": self._available_actions(
+                status,
+                completion_outcome=(
+                    str(completion_outcome) if completion_outcome is not None else None
+                ),
+            ),
             "state_revision": self._context_revision,
         }
 
@@ -435,6 +466,7 @@ class RecordingRouterRuntime:
         dataset_date: str,
         selection: dict[str, Any],
         scene_mode: str | None,
+        requested_outcome: str = "auto",
     ) -> dict[str, Any]:
         self._assert_identity(web_session_id, router_session_id)
         if self.focused_task is not None:
@@ -468,6 +500,8 @@ class RecordingRouterRuntime:
             "dataset_date": dataset_date,
             "selection": dict(selection),
         }
+        if requested_outcome != "auto":
+            payload["requested_outcome"] = requested_outcome
         if scene_mode is not None:
             payload["scene_mode"] = scene_mode
         self.focused_task = {
@@ -476,6 +510,7 @@ class RecordingRouterRuntime:
             "dataset_date": dataset_date,
             "selection": dict(selection),
             "scene_mode": scene_mode,
+            "requested_outcome": requested_outcome,
         }
         self._context_revision += 1
         self._record("start_navigation_data_task", payload)
@@ -498,7 +533,12 @@ class RecordingRouterRuntime:
         if self.focused_task is None:
             raise RuntimeError("the evaluation has no focused task to continue")
         status = str(self.focused_task.get("status") or "")
-        if status not in {"waiting_user", "paused", "needs_replan"}:
+        linked_fix = (
+            status == "completed"
+            and self.focused_task.get("completion_outcome")
+            == "postprocessing_completed_fix_pending"
+        )
+        if status not in {"waiting_user", "paused", "needs_replan"} and not linked_fix:
             raise RuntimeError(f"the evaluation task cannot continue from {status}")
         payload = {
             "ok": True,
@@ -507,8 +547,13 @@ class RecordingRouterRuntime:
             "task_ref": str(self.focused_task.get("task_ref") or "DP-EVALUATION"),
             "status": "active",
         }
+        if linked_fix:
+            payload["linked_fix"] = True
         if self.focused_task is not None:
             self.focused_task["status"] = "active"
+            if linked_fix:
+                self.focused_task["requested_outcome"] = "trajectory_fix"
+                self.focused_task.pop("completion_outcome", None)
         self._context_revision += 1
         self._record("continue_navigation_data_task", payload)
         return payload
@@ -585,6 +630,424 @@ class RecordingRouterRuntime:
             raise ValueError("evaluation router session identity mismatch")
 
 
+class RecordingNavigationRuntime:
+    """Safe fact/Plan boundary for a real NavigationDataAgent model turn."""
+
+    _INSPECTION_TOOL_NAMES = (
+        "inspect_navigation_raw_metadata_tool",
+        "inspect_navigation_sensor_candidates_tool",
+        "inspect_navigation_topic_candidates_tool",
+        "inspect_navigation_runtime_assets_tool",
+        "inspect_navigation_calibration_inventory_tool",
+        "inspect_navigation_localization_sources_tool",
+        "inspect_navigation_annotation_job_facts_tool",
+        "inspect_navigation_artifact_state_tool",
+        "inspect_navigation_gridmap_artifacts_tool",
+    )
+
+    def __init__(
+        self,
+        recorder: TraceRecorder,
+        *,
+        runtime_setup: Mapping[str, Any],
+    ) -> None:
+        self.recorder = recorder
+        task = runtime_setup.get("navigation_task")
+        if not isinstance(task, Mapping):
+            raise ValueError("navigation evaluation setup is unavailable")
+        self.task = dict(task)
+        self._context_revision = 1
+        self._completed_kinds: set[str] = set()
+        configured = self.task.get("tool_results")
+        configured_results = dict(configured) if isinstance(configured, Mapping) else {}
+        self._tool_results = self._default_tool_results()
+        for name, payload in configured_results.items():
+            if isinstance(payload, Mapping):
+                self._tool_results[str(name)] = dict(payload)
+        self._submitted_plan: dict[str, Any] | None = None
+
+    def _default_tool_results(self) -> dict[str, dict[str, Any]]:
+        selection = dict(self.task.get("selection") or {"kind": "all_clips"})
+        clips = list(selection.get("clips") or [])
+        date = str(self.task.get("dataset_date") or "20260718")
+        return {
+            "inspect_navigation_raw_metadata_tool": {
+                "kind": "raw_metadata",
+                "segments": clips,
+                "topics": [],
+            },
+            "inspect_navigation_sensor_candidates_tool": {
+                "kind": "sensor_candidates",
+                "candidates": [],
+            },
+            "inspect_navigation_topic_candidates_tool": {
+                "kind": "topic_candidates",
+                "available_topics": [],
+                "suggested_role_names": {},
+                "routes": [],
+            },
+            "inspect_navigation_runtime_assets_tool": {
+                "kind": "runtime_assets",
+                "pcd_gridmap_tool_available": True,
+                "manual_annotation_gui_available": False,
+                "projection_variants": {
+                    "cjl_with_gridmap": True,
+                    "cjl_0525_with_gridmap": True,
+                },
+                "noobscene_localization_variants": {
+                    "odom": True,
+                    "ins": False,
+                },
+                "speed_direction_variants": {
+                    "odom": True,
+                    "ins": False,
+                },
+                "scene_environment_affects_execution": False,
+            },
+            "inspect_navigation_calibration_inventory_tool": {
+                "kind": "calibration_inventory",
+                "sensor_sources": ["frozen_processing_snapshot"],
+            },
+            "inspect_navigation_localization_sources_tool": {
+                "kind": "localization_sources",
+                "available_sources": ["odom"],
+                "conversion_available": True,
+            },
+            "inspect_navigation_annotation_job_facts_tool": {
+                "kind": "annotation_job_facts",
+                "job_status": (
+                    "annotated"
+                    if self.task.get("requested_outcome") == "trajectory_fix"
+                    else "tracked"
+                ),
+                "segment_count": max(1, len(clips)),
+                "tracked_count": max(1, len(clips)),
+                "skipped_count": 0,
+                "annotated_count": (
+                    max(1, len(clips))
+                    if self.task.get("requested_outcome") == "trajectory_fix"
+                    else 0
+                ),
+                "ready_for_postprocessing": (
+                    self.task.get("requested_outcome") != "trajectory_fix"
+                ),
+                "ready_for_trajectory_review": (
+                    self.task.get("requested_outcome") == "trajectory_fix"
+                ),
+                "processing_calibration_snapshot_available": True,
+                "reviews": {
+                    "pending": (
+                        max(1, len(clips))
+                        if self.task.get("requested_outcome") == "trajectory_fix"
+                        else 0
+                    ),
+                    "in_progress": 0,
+                    "returned": 0,
+                    "approved": 0,
+                    "discarded": 0,
+                },
+            },
+            "inspect_navigation_artifact_state_tool": {
+                "kind": "artifact_state",
+                "snapshot": {
+                    "date": date,
+                    "segments": clips or None,
+                    "raw_input_exists": True,
+                    "raw_temp_exists": True,
+                    "sync_data_exists": True,
+                    "sync_data_by_segment": {
+                        clip: True for clip in clips
+                    },
+                    "finish_temp_samples_exists": True,
+                    "final_outputs_exist": (
+                        self.task.get("requested_outcome") == "trajectory_fix"
+                    ),
+                    "final_grid_map_exists": (
+                        self.task.get("requested_outcome") == "trajectory_fix"
+                    ),
+                    "sync_image_samples": [],
+                },
+            },
+            "inspect_navigation_gridmap_artifacts_tool": {
+                "kind": "gridmap_artifacts",
+                "existing_gridmap_paths": ["existing_gridmap"],
+                "pcd_sources": ["synchronized_pointcloud"],
+                "projection_ready": False,
+            },
+        }
+
+    @staticmethod
+    def _kind_for_tool(tool_name: str) -> str:
+        return {
+            "inspect_navigation_raw_metadata_tool": "raw_metadata",
+            "inspect_navigation_sensor_candidates_tool": "sensor_candidates",
+            "inspect_navigation_topic_candidates_tool": "topic_candidates",
+            "inspect_navigation_runtime_assets_tool": "runtime_assets",
+            "inspect_navigation_calibration_inventory_tool": "calibration_inventory",
+            "inspect_navigation_localization_sources_tool": "localization_sources",
+            "inspect_navigation_annotation_job_facts_tool": "annotation_job_facts",
+            "inspect_navigation_artifact_state_tool": "artifact_state",
+            "inspect_navigation_gridmap_artifacts_tool": "gridmap_artifacts",
+        }[tool_name]
+
+    def _inspect(self, tool_name: str) -> dict[str, Any]:
+        self._context_revision += 1
+        self._completed_kinds.add(self._kind_for_tool(tool_name))
+        return dict(self._tool_results[tool_name])
+
+    def _planning_context(self) -> dict[str, Any]:
+        return {
+            "planning_context_revision": f"eval-context-{self._context_revision}",
+            "task": {
+                "dataset_date": self.task["dataset_date"],
+                "selection": dict(self.task["selection"]),
+                "scene_mode": self.task.get("scene_mode"),
+                "requested_outcome": self.task["requested_outcome"],
+            },
+            "completed_kinds": sorted(self._completed_kinds),
+            "allowed_plan_phases": [
+                (
+                    "trajectory_review"
+                    if self.task["requested_outcome"] == "trajectory_fix"
+                    else "finish_processing"
+                ),
+            ],
+        }
+
+    @staticmethod
+    def _plan_summary(
+        *,
+        phase: str,
+        plan: Any,
+    ) -> dict[str, Any]:
+        payload = (
+            plan.model_dump(mode="json")
+            if hasattr(plan, "model_dump")
+            else dict(plan)
+        )
+        decisions = dict(payload.get("decisions") or {})
+        decision_modes: dict[str, str] = {}
+        for name, value in decisions.items():
+            if not isinstance(value, Mapping):
+                continue
+            selected = value.get("mode")
+            if not isinstance(selected, str):
+                selected = value.get("source")
+            if isinstance(selected, str):
+                decision_modes[str(name)] = selected
+        step_actions = [
+            str(step.get("action"))
+            for step in list(payload.get("steps") or [])
+            if isinstance(step, Mapping) and isinstance(step.get("action"), str)
+        ]
+        step_variants = {
+            str(step["action"]): str(step["variant"])
+            for step in list(payload.get("steps") or [])
+            if (
+                isinstance(step, Mapping)
+                and isinstance(step.get("action"), str)
+                and isinstance(step.get("variant"), str)
+            )
+        }
+        return {
+            "operation": "submit_plan",
+            "phase": phase,
+            "decision_modes": decision_modes,
+            "step_actions": step_actions,
+            "step_variants": step_variants,
+        }
+
+    def _submit(
+        self,
+        *,
+        phase: str,
+        planning_context_revision: str,
+        plan: Any,
+    ) -> dict[str, Any]:
+        expected = f"eval-context-{self._context_revision}"
+        if planning_context_revision != expected:
+            return {
+                "ok": False,
+                "error_type": "planning_context_mismatch",
+                "retry": "refresh_context_and_resubmit_complete_plan",
+            }
+        expected_phase = (
+            "trajectory_review"
+            if self.task["requested_outcome"] == "trajectory_fix"
+            else "finish_processing"
+        )
+        if phase != expected_phase:
+            return {
+                "ok": False,
+                "error_type": "unexpected_plan_phase",
+                "allowed_values": [expected_phase],
+            }
+        plan_model = {
+            "extract_sync": ExtractSyncPlanInput,
+            "finish_processing": FinishProcessingPlanInput,
+            "trajectory_review": TrajectoryReviewPlanInput,
+        }[phase]
+        canonical_plan = plan_model.model_validate(plan)
+        summary = self._plan_summary(phase=phase, plan=canonical_plan)
+        self._submitted_plan = summary
+        self.recorder.record_handoff(summary)
+        first_action = summary["step_actions"][0] if summary["step_actions"] else None
+        return {
+            "ok": True,
+            "plan_id": "eval-plan",
+            "plan_revision": 1,
+            "step_count": len(summary["step_actions"]),
+            "status": "active",
+            "next_action": first_action,
+        }
+
+    def tools(self) -> list[Any]:
+        tools: list[Any] = []
+        for tool_name in self._INSPECTION_TOOL_NAMES:
+            def make_inspect_tool(name: str):
+                def inspect_tool() -> dict[str, Any]:
+                    """Inspect current bounded navigation facts for this task."""
+                    return self._inspect(name)
+
+                return inspect_tool
+
+            inspect_tool = make_inspect_tool(tool_name)
+            inspect_tool.__name__ = tool_name
+            tool = FunctionTool(
+                inspect_tool,
+                name=tool_name,
+                is_read_only=True,
+            )
+            tool.input_schema = {
+                "type": "object",
+                "properties": {},
+                "required": [],
+                "additionalProperties": False,
+            }
+            tools.append(tool)
+
+        def get_navigation_task_context_tool() -> dict[str, Any]:
+            """Read the latest task facts and optimistic planning revision."""
+            return self._planning_context()
+
+        def describe_processing_action_tool(action: str) -> dict[str, Any]:
+            """Read the bounded contract for one candidate processing action."""
+            return {
+                "action": action,
+                "available": True,
+                "model_selects_variant": True,
+            }
+
+        def submit_extract_sync_plan_tool(
+            planning_context_revision: str,
+            plan: dict[str, Any],
+        ) -> dict[str, Any]:
+            """Validate one complete extract/sync Plan."""
+            return self._submit(
+                phase="extract_sync",
+                planning_context_revision=planning_context_revision,
+                plan=plan,
+            )
+
+        def submit_finish_processing_plan_tool(
+            planning_context_revision: str,
+            plan: dict[str, Any],
+        ) -> dict[str, Any]:
+            """Validate one complete postprocessing Plan."""
+            return self._submit(
+                phase="finish_processing",
+                planning_context_revision=planning_context_revision,
+                plan=plan,
+            )
+
+        def submit_trajectory_review_plan_tool(
+            planning_context_revision: str,
+            plan: dict[str, Any],
+        ) -> dict[str, Any]:
+            """Validate one complete linked trajectory-review Plan."""
+            return self._submit(
+                phase="trajectory_review",
+                planning_context_revision=planning_context_revision,
+                plan=plan,
+            )
+
+        def _run_first_step(plan_id: str, step_id: str) -> dict[str, Any]:
+            if plan_id != "eval-plan" or self._submitted_plan is None:
+                return {"ok": False, "error_type": "inactive_navigation_plan"}
+            expected_action = self._submitted_plan["step_actions"][0]
+            return {
+                "ok": True,
+                "status": "running_in_background",
+                "step_id": step_id,
+                "action": expected_action,
+            }
+
+        def prepare_gridmap_for_projection_tool(
+            plan_id: str,
+            step_id: str,
+        ) -> dict[str, Any]:
+            """Execute the accepted gridmap preparation step."""
+            return _run_first_step(plan_id, step_id)
+
+        def open_trajectory_fix_workbench_tool(
+            plan_id: str,
+            step_id: str,
+        ) -> dict[str, Any]:
+            """Open the accepted durable human Fix workbench handoff."""
+            return _run_first_step(plan_id, step_id)
+
+        extract_plan_tool = FunctionTool(
+            submit_extract_sync_plan_tool,
+            is_concurrency_safe=False,
+        )
+        finish_plan_tool = FunctionTool(
+            submit_finish_processing_plan_tool,
+            is_concurrency_safe=False,
+        )
+        review_plan_tool = FunctionTool(
+            submit_trajectory_review_plan_tool,
+            is_concurrency_safe=False,
+        )
+        for plan_tool, model in (
+            (extract_plan_tool, ExtractSyncPlanInput),
+            (finish_plan_tool, FinishProcessingPlanInput),
+            (review_plan_tool, TrajectoryReviewPlanInput),
+        ):
+            plan_schema = model.model_json_schema()
+            plan_definitions = plan_schema.pop("$defs", {})
+            plan_tool.input_schema = {
+                "type": "object",
+                "properties": {
+                    "planning_context_revision": {"type": "string"},
+                    "plan": plan_schema,
+                },
+                "required": ["planning_context_revision", "plan"],
+                "additionalProperties": False,
+            }
+            if plan_definitions:
+                plan_tool.input_schema["$defs"] = plan_definitions
+        tools.extend(
+            [
+                FunctionTool(get_navigation_task_context_tool, is_read_only=True),
+                FunctionTool(describe_processing_action_tool, is_read_only=True),
+                extract_plan_tool,
+                finish_plan_tool,
+                review_plan_tool,
+                FunctionTool(
+                    prepare_gridmap_for_projection_tool,
+                    is_concurrency_safe=False,
+                ),
+                FunctionTool(
+                    open_trajectory_fix_workbench_tool,
+                    is_concurrency_safe=False,
+                ),
+            ],
+        )
+        for tool in tools:
+            tool.input_schema["additionalProperties"] = False
+        return [_TrustedNavigationTool(tool) for tool in tools]
+
+
 @dataclass(frozen=True)
 class HostRunResult:
     session_id: str
@@ -607,11 +1070,15 @@ class EvaluationHost:
         workspace_root: str | Path,
         model_factory: Callable[..., Any] | None = None,
         runtime_setup: Mapping[str, Any] | None = None,
+        entrypoint: str = "router",
     ) -> None:
         self.config = config
         self.workspace_root = Path(workspace_root)
         self.model_factory = model_factory
         self.runtime_setup = dict(runtime_setup or {})
+        if entrypoint not in {"router", "navigation"}:
+            raise ValueError(f"unsupported evaluation entrypoint {entrypoint!r}")
+        self.entrypoint = entrypoint
         self.recorder = TraceRecorder.for_workspace(self.workspace_root)
         self.storage = InMemoryStorage()
         self.message_bus = InMemoryMessageBus(self.recorder)
@@ -621,6 +1088,7 @@ class EvaluationHost:
         self.background_task_manager = BackgroundTaskManager()
         self.scheduler_manager = SchedulerManager(self.storage, self.message_bus)
         self._router_runtime: RecordingRouterRuntime | None = None
+        self._navigation_runtime: RecordingNavigationRuntime | None = None
 
     async def _extra_tools(
         self,
@@ -628,25 +1096,34 @@ class EvaluationHost:
         agent_id: str,
         session_id: str,
     ) -> list[Any]:
-        if agent_id != self.config.main_router_agent_id:
-            return []
-        web_session_id = session_id.removesuffix(
-            f"__{self.config.main_router_agent_id}",
-        )
-        if self._router_runtime is None:
-            self._router_runtime = RecordingRouterRuntime(
-                self.recorder,
+        if self.entrypoint == "router":
+            if agent_id != self.config.main_router_agent_id:
+                return []
+            web_session_id = session_id.removesuffix(
+                f"__{self.config.main_router_agent_id}",
+            )
+            if self._router_runtime is None:
+                self._router_runtime = RecordingRouterRuntime(
+                    self.recorder,
+                    web_session_id=web_session_id,
+                    router_session_id=session_id,
+                    runtime_setup=self.runtime_setup,
+                )
+            elif self._router_runtime.web_session_id != web_session_id:
+                raise RuntimeError("one EvaluationHost may evaluate only one web session")
+            return router_v1_tools(
+                runtime=self._router_runtime,
                 web_session_id=web_session_id,
                 router_session_id=session_id,
+            )
+        if agent_id != self.config.navigation_agent_id:
+            return []
+        if self._navigation_runtime is None:
+            self._navigation_runtime = RecordingNavigationRuntime(
+                self.recorder,
                 runtime_setup=self.runtime_setup,
             )
-        elif self._router_runtime.web_session_id != web_session_id:
-            raise RuntimeError("one EvaluationHost may evaluate only one web session")
-        return router_v1_tools(
-            runtime=self._router_runtime,
-            web_session_id=web_session_id,
-            router_session_id=session_id,
-        )
+        return self._navigation_runtime.tools()
 
     async def _extra_middlewares(
         self,
@@ -654,24 +1131,31 @@ class EvaluationHost:
         agent_id: str,
         session_id: str,
     ) -> list[Any]:
-        if agent_id != self.config.main_router_agent_id:
-            return []
-        web_session_id = session_id.removesuffix(
-            f"__{self.config.main_router_agent_id}",
-        )
-        if self._router_runtime is None:
-            self._router_runtime = RecordingRouterRuntime(
-                self.recorder,
-                web_session_id=web_session_id,
-                router_session_id=session_id,
-                runtime_setup=self.runtime_setup,
+        if self.entrypoint == "router":
+            if agent_id != self.config.main_router_agent_id:
+                return []
+            web_session_id = session_id.removesuffix(
+                f"__{self.config.main_router_agent_id}",
             )
+            if self._router_runtime is None:
+                self._router_runtime = RecordingRouterRuntime(
+                    self.recorder,
+                    web_session_id=web_session_id,
+                    router_session_id=session_id,
+                    runtime_setup=self.runtime_setup,
+                )
+            return [
+                RouterContractV1Middleware(
+                    runtime=self._router_runtime,
+                    web_session_id=web_session_id,
+                    router_session_id=session_id,
+                ),
+                TraceMiddleware(self.recorder),
+                EvaluationSafetyMiddleware(self.recorder),
+            ]
+        if agent_id != self.config.navigation_agent_id:
+            return []
         return [
-            RouterContractV1Middleware(
-                runtime=self._router_runtime,
-                web_session_id=web_session_id,
-                router_session_id=session_id,
-            ),
             TraceMiddleware(self.recorder),
             EvaluationSafetyMiddleware(self.recorder),
         ]
@@ -688,17 +1172,27 @@ class EvaluationHost:
         web_session_id: str = "eval",
     ) -> HostRunResult:
         await bootstrap_agentscope_records(self.storage, self.config)
-        session_id = f"{web_session_id}__{self.config.main_router_agent_id}"
+        agent_id = (
+            self.config.main_router_agent_id
+            if self.entrypoint == "router"
+            else self.config.navigation_agent_id
+        )
+        model = (
+            self.config.router_model
+            if self.entrypoint == "router"
+            else self.config.navigation_model
+        )
+        session_id = f"{web_session_id}__{agent_id}"
         await self.storage.upsert_session(
             self.config.user_id,
-            self.config.main_router_agent_id,
+            agent_id,
             SessionConfig(
                 workspace_id=f"workspace-{web_session_id}",
                 name=web_session_id,
                 chat_model_config=ChatModelConfig(
                     type="dashscope_chat",
                     credential_id=self.config.credential_id,
-                    model=self.config.router_model,
+                    model=model,
                     parameters={"parallel_tool_calls": False},
                 ),
             ),
@@ -722,12 +1216,27 @@ class EvaluationHost:
             if not messages:
                 raise ValueError("evaluation conversation must contain a user message")
             for turn_index, content in enumerate(messages):
-                if self._router_runtime is not None:
+                if self.entrypoint == "router" and self._router_runtime is not None:
                     self._router_runtime.begin_user_turn(turn_index)
+                if self.entrypoint == "navigation" and turn_index == 0:
+                    navigation_task = self.runtime_setup.get("navigation_task")
+                    if not isinstance(navigation_task, Mapping):
+                        raise ValueError("navigation evaluation task setup is unavailable")
+                    selection = dict(navigation_task.get("selection") or {})
+                    content = _navigation_handoff_message(
+                        request=content,
+                        date=str(navigation_task.get("dataset_date") or ""),
+                        scene_mode=str(navigation_task.get("scene_mode") or "unknown"),
+                        clips=list(selection.get("clips") or []),
+                        response_language="Chinese",
+                        requested_outcome=str(
+                            navigation_task.get("requested_outcome") or "postprocessing"
+                        ),
+                    )
                 await service._run_impl(
                     self.config.user_id,
                     session_id,
-                    self.config.main_router_agent_id,
+                    agent_id,
                     UserMsg(name="user", content=content),
                 )
         finally:
@@ -768,5 +1277,26 @@ async def run_router_case(
         workspace_root=workspace_root,
         model_factory=model_factory,
         runtime_setup=runtime_setup,
+    )
+    return await host.run(message, web_session_id=web_session_id)
+
+
+async def run_navigation_case(
+    message: str,
+    *,
+    config: AgentScopeRuntimeConfig,
+    workspace_root: str | Path,
+    web_session_id: str = "eval",
+    model_factory: Callable[..., Any] | None = None,
+    runtime_setup: Mapping[str, Any],
+) -> HostRunResult:
+    """Run one isolated NavigationDataAgent turn against bounded fake facts."""
+
+    host = EvaluationHost(
+        config=config,
+        workspace_root=workspace_root,
+        model_factory=model_factory,
+        runtime_setup=runtime_setup,
+        entrypoint="navigation",
     )
     return await host.run(message, web_session_id=web_session_id)

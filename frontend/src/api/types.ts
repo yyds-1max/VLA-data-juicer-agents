@@ -1,5 +1,8 @@
 export type SessionStatus = "draft" | "active" | "historical";
-export type SessionEntrypoint = "chat" | "data_management_shortcut";
+export type SessionEntrypoint =
+  | "chat"
+  | "data_management_shortcut"
+  | "annotation_processing_shortcut";
 
 export type NavigationClipSelection =
   | { kind: "all_clips" }

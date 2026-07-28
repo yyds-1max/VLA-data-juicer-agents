@@ -113,9 +113,13 @@ EXECUTION_ACTION_SCHEMA_NAMES = {
     "run_noobscene_preprocessing_tool",
     "run_initial_annotation_gui_tool",
     "run_tracking_tool",
+    "run_annotation_tracking_workflow_tool",
     "prepare_gridmap_for_projection_tool",
     "run_projection_and_trajectory_tool",
+    "run_annotation_postprocessing_workflow_tool",
     "validate_navigation_outputs_tool",
+    "open_trajectory_fix_workbench_tool",
+    "validate_trajectory_review_outcome_tool",
 }
 
 
@@ -258,7 +262,7 @@ def _extract_plan(evidence_by_kind):
     }
 
 
-def test_navigation_guidance_has_exact_playbook_sections_and_four_bounded_few_shots():
+def test_navigation_guidance_has_exact_playbook_sections_and_six_bounded_few_shots():
     guidance = GUIDANCE_PATH.read_text(encoding="utf-8")
     headings = re.findall(r"^## (.+)$", guidance, flags=re.MULTILINE)
 
@@ -267,20 +271,27 @@ def test_navigation_guidance_has_exact_playbook_sections_and_four_bounded_few_sh
         "Recommended investigation order",
         "Common extract-sync work",
         "Common finish-processing work",
+        "Postprocessing completion and trajectory Fix",
         "Model/code decision ownership",
         "User-confirmation points",
         "Failure/retry behavior",
-        "Four bounded few-shots",
+        "Six bounded few-shots",
     ]
-    assert len(re.findall(r"^### Few-shot \d+: ", guidance, flags=re.MULTILINE)) == 4
+    assert len(re.findall(r"^### Few-shot \d+: ", guidance, flags=re.MULTILINE)) == 6
     for required_case in [
         "user claims sync is complete",
         "new session",
         "extract/sync just completed",
         "invalid complete Plan",
+        "tracked Annotation Job is ready",
+        "postprocessing completed",
     ]:
         assert required_case in guidance
-    assert len(guidance) <= 12_000
+    # M2 adds one complete Plan phase plus the durable Web/Fix handoff
+    # contract. Keep the guidance bounded while allowing those product rules
+    # to remain explicit; the full activity-specific prompt has a separate
+    # token-budget assertion below.
+    assert len(guidance) <= 17_000
 
 
 def test_navigation_guidance_excludes_operator_acceptance_runbook():
@@ -300,14 +311,13 @@ def test_navigation_guidance_excludes_operator_acceptance_runbook():
         assert topic in acceptance
 
 
-def test_navigation_guidance_recommends_default_calibration_but_requires_confirmation():
+def test_navigation_guidance_uses_snapshot_or_explicit_choice_without_global_default():
     guidance = GUIDANCE_PATH.read_text(encoding="utf-8")
 
-    assert "`NoobScenes/params/20260529_go2w/sensors`" in guidance
-    assert "recommend" in guidance
-    assert "`requires_user_confirmation` true" in guidance
-    assert "Never choose a calibration profile merely because" in guidance
-    assert "do not silently substitute another profile" in guidance
+    assert "`NoobScenes/params/20260529_go2w/sensors`" not in guidance
+    assert "`annotation_snapshot`" in guidance
+    assert "page has no global recommendation" in guidance
+    assert "Never choose a profile merely" in guidance
 
 
 def test_server_acceptance_requires_safe_execution_mode_and_attended_gui_boundary():
@@ -538,6 +548,7 @@ def test_actual_grouped_surface_schemas_fit_context_budget(tmp_path):
         "describe_processing_action_tool",
         "submit_extract_sync_plan_tool",
         "submit_finish_processing_plan_tool",
+        "submit_trajectory_review_plan_tool",
     }.isdisjoint(names["execution"])
     assert execution.group(NAVIGATION_EXECUTION_STATE).tools
     assert {

@@ -232,6 +232,7 @@ export function DataPilotWindow() {
       invocationId?: string;
       sessionId?: string;
       requestContext?: DataPilotInvocation["requestContext"];
+      entrypoint?: DataPilotInvocation["entrypoint"];
     } = {},
   ) => {
     let sessionId = options.sessionId;
@@ -246,7 +247,11 @@ export function DataPilotWindow() {
         }
       } else {
         const session = options.invocationId
-          ? await createSession(message, "data_management_shortcut", options.requestContext)
+          ? await createSession(
+              message,
+              options.entrypoint ?? "data_management_shortcut",
+              options.requestContext,
+            )
           : await createSession(message);
         sessionId = session.id;
         datapilotStore.getState().setActiveSession(session);
@@ -351,6 +356,7 @@ export function DataPilotWindow() {
       invocationId: invocation.invocationId,
       sessionId: invocation.sessionId,
       requestContext: invocation.requestContext,
+      entrypoint: invocation.entrypoint,
     });
   }, [refreshKnownRunningSession, submitNewSessionMessage]);
 

@@ -23,8 +23,14 @@ from vla_data_juicer_agents.annotation.maintenance import (
     AnnotationMaintenanceLease,
     acquire_annotation_maintenance,
 )
+from vla_data_juicer_agents.annotation.navigation_gateway import (
+    AnnotationNavigationGateway,
+)
 from vla_data_juicer_agents.annotation.store import AnnotationStore
 from vla_data_juicer_agents.annotation.worker import AnnotationWorker
+from vla_data_juicer_agents.annotation.workflow_coordinator import (
+    AnnotationWorkflowCoordinator,
+)
 from vla_data_juicer_agents.navigation.dataset_catalog import (
     list_sync_images,
     resolve_sync_image_path,
@@ -95,14 +101,53 @@ def create_app(
     try:
         store = WebSessionStore(database_path)
         annotation_store = AnnotationStore(annotation_database_path)
-        annotation_worker = AnnotationWorker(annotation_store, annotation_runtime)
+        from vla_data_juicer_agents.annotation.fix_runtime import (
+            CommandLogFixDraftAdapter,
+            FixCompatibilityPublisher,
+        )
+
+        fix_compatibility_publisher = FixCompatibilityPublisher()
+        annotation_worker = AnnotationWorker(
+            annotation_store,
+            annotation_runtime,
+            fix_publisher=fix_compatibility_publisher,
+        )
         annotation_service = AnnotationApplicationService(
             store=annotation_store,
             worker=annotation_worker,
             catalog=annotation_catalog or CalibrationCatalog.default(),
             work_root=annotation_work_root,
             clip_data_root=annotation_clip_data_root,
+            fix_runtime=CommandLogFixDraftAdapter(),
         )
+        runtime_workspace_root = Path(
+            getattr(
+                getattr(agentscope_runtime, "config", None),
+                "workspace_root",
+                working_dir,
+            )
+        )
+        annotation_gateway = AnnotationNavigationGateway(
+            service=annotation_service,
+            navigation_db_path=runtime_workspace_root
+            / "navigation-tasks.sqlite",
+        )
+        set_annotation_gateway = getattr(
+            agentscope_runtime,
+            "set_annotation_gateway",
+            None,
+        )
+        annotation_coordinator = (
+            AnnotationWorkflowCoordinator(
+                service=annotation_service,
+                agentscope_runtime=agentscope_runtime,
+                navigation_workspace_root=runtime_workspace_root,
+            )
+            if callable(set_annotation_gateway)
+            else None
+        )
+        if callable(set_annotation_gateway):
+            set_annotation_gateway(annotation_gateway)
     except BaseException:
         annotation_maintenance.close()
         raise
@@ -159,9 +204,22 @@ def create_app(
                         annotation_worker.run_forever(),
                         name="annotation-worker",
                     )
+                    annotation_coordinator_task = (
+                        asyncio.create_task(
+                            annotation_coordinator.run_forever(),
+                            name="annotation-workflow-coordinator",
+                        )
+                        if annotation_coordinator is not None
+                        else None
+                    )
                     try:
                         yield
                     finally:
+                        if annotation_coordinator is not None:
+                            await annotation_coordinator.stop()
+                        if annotation_coordinator_task is not None:
+                            with suppress(asyncio.CancelledError):
+                                await annotation_coordinator_task
                         cleanup_task = asyncio.create_task(
                             _stop_and_drain_annotation_worker(
                                 annotation_worker,
@@ -201,6 +259,8 @@ def create_app(
         app.state.annotation_store = annotation_store
         app.state.annotation_service = annotation_service
         app.state.annotation_worker = annotation_worker
+        app.state.annotation_gateway = annotation_gateway
+        app.state.annotation_workflow_coordinator = annotation_coordinator
         app.mount(
             agentscope_runtime.config.agentscope_mount_path,
             agentscope_runtime.app,
@@ -487,10 +547,16 @@ def create_app(
 
                     @app.get("/agent", include_in_schema=False)
                     @app.get("/data", include_in_schema=False)
+                    @app.get("/annotation", include_in_schema=False)
                     @app.get("/annotation/jobs", include_in_schema=False)
                     @app.get("/annotation/jobs/{job_ref}", include_in_schema=False)
                     @app.get(
                         "/annotation/jobs/{job_ref}/segments/{segment_ref}",
+                        include_in_schema=False,
+                    )
+                    @app.get("/annotation/reviews", include_in_schema=False)
+                    @app.get(
+                        "/annotation/reviews/{review_ref}",
                         include_in_schema=False,
                     )
                     @app.get("/model", include_in_schema=False)
@@ -498,8 +564,9 @@ def create_app(
                     async def frontend_route(
                         job_ref: str | None = None,
                         segment_ref: str | None = None,
+                        review_ref: str | None = None,
                     ) -> FileResponse:
-                        del job_ref, segment_ref
+                        del job_ref, segment_ref, review_ref
                         return FileResponse(index_path)
 
         return app

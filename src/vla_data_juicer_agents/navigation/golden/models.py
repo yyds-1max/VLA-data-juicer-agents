@@ -118,6 +118,8 @@ class GoldenRoleScope(StrictModel):
 
     scope_kind: Literal[
         "segment",
+        "postprocessing_segment",
+        "fix_segment",
         "prepare_maps",
         "prepare_metadata",
     ] = "segment"
@@ -144,9 +146,15 @@ class GoldenRoleScope(StrictModel):
 
     @model_validator(mode="after")
     def validate_scope_identity(self) -> "GoldenRoleScope":
-        if self.scope_kind == "segment":
+        if self.scope_kind in {
+            "segment",
+            "postprocessing_segment",
+            "fix_segment",
+        }:
             if self.internal_segment is None:
-                raise ValueError("segment role scope requires internal_segment")
+                raise ValueError(
+                    "segment-like role scope requires internal_segment",
+                )
             return self
         expected_scope = {
             "prepare_maps": "maps",
@@ -354,7 +362,12 @@ class GoldenCaseBundle(StrictModel):
                         "Golden role scope kinds must match",
                     )
                 if (
-                    legacy_scope.scope_kind != "segment"
+                    legacy_scope.scope_kind
+                    not in {
+                        "segment",
+                        "postprocessing_segment",
+                        "fix_segment",
+                    }
                     and case.artifact_root_kind != "finish_temp_date"
                 ):
                     raise ValueError(
@@ -596,6 +609,8 @@ class StoreBoundCandidate(StrictModel):
     source_clip: str = Field(pattern=r"^[A-Za-z0-9][A-Za-z0-9_-]*$")
     scope_kind: Literal[
         "segment",
+        "postprocessing_segment",
+        "fix_segment",
         "prepare_maps",
         "prepare_metadata",
     ] = "segment"
@@ -663,9 +678,15 @@ class StoreBoundCandidate(StrictModel):
             )
         ):
             raise ValueError("bound segment mapping is inconsistent")
-        if self.scope_kind == "segment":
+        if self.scope_kind in {
+            "segment",
+            "postprocessing_segment",
+            "fix_segment",
+        }:
             if self.internal_segment is None:
-                raise ValueError("bound segment scope requires an internal segment")
+                raise ValueError(
+                    "bound segment-like scope requires an internal segment",
+                )
             if self.artifact_scope.replace("\\", "/").split("/")[-1] != (
                 self.internal_segment
             ):

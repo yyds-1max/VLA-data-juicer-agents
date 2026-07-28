@@ -1,4 +1,5 @@
 import {
+  buildAnnotationProcessingRequest,
   buildNavigationDatasetRequest,
   buildNavigationDatasetRequestContext,
 } from "./navigationDataPilotRequest";
@@ -91,5 +92,24 @@ describe("buildNavigationDatasetRequest", () => {
     expect(message).not.toMatch(/待处理|已拆解|已同步/);
     expect(message).not.toMatch(/raw_data|tmp_dir|sync_data|\/[A-Za-z]/);
     expect(message).not.toMatch(/MainRouterAgent|NavigationDataAgent|\bPlan\b|segments/);
+  });
+});
+
+describe("buildAnnotationProcessingRequest", () => {
+  it("makes the requested outcome explicit without choosing scripts or calibration", () => {
+    const message = buildAnnotationProcessingRequest({
+      scope: "clips",
+      date: "20270605",
+      clips: ["20260605_160904"],
+    });
+
+    expect(message).toBe([
+      "请对选中的导航数据执行自动标注并完成后处理。",
+      "",
+      "数据日期：20270605",
+      "指定 clips：",
+      "- 20260605_160904",
+    ].join("\n"));
+    expect(message).not.toMatch(/标定|pcd_to_grid|trajectory_0525|Tracking|segment/);
   });
 });

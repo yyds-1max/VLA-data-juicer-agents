@@ -8,6 +8,9 @@ from typing import Any, Callable
 
 from agentscope.tool import FunctionTool, ToolBase
 
+from vla_data_juicer_agents.navigation.annotation_gateway import (
+    NavigationAnnotationGateway,
+)
 from vla_data_juicer_agents.core.cancellation import (
     CancellationContext,
     TurnCancelled,
@@ -1153,6 +1156,126 @@ def human_decision_key(decision: dict[str, Any]) -> str:
     return hashlib.sha256(_canonical_json(decision).encode("utf-8")).hexdigest()
 
 
+def complete_annotation_workflow_step(
+    *,
+    plan_store: SqliteNavigationPlanRepository,
+    evidence_store: FileNavigationEvidenceStore,
+    navigation_task_id: str,
+    action: str,
+    status: str,
+) -> bool:
+    """Complete one Web/Runtime handoff without exposing Annotation identity."""
+
+    if action not in {
+        "run_annotation_tracking_workflow",
+        "run_annotation_postprocessing_workflow",
+        "open_trajectory_fix_workbench",
+    }:
+        raise ValueError("unsupported Annotation workflow action")
+    task = SqliteNavigationTaskStore(plan_store.db_path).get_task(
+        navigation_task_id
+    )
+    if task is None:
+        return False
+    plan = plan_store.get_latest_accepted_for_task(navigation_task_id)
+    if plan is None or plan.status != "active":
+        if plan is None:
+            return False
+        overview = plan_store.get_execution_overview(plan.plan_id)
+        return any(
+            item.action == action and item.status == "completed"
+            for item in overview.steps
+        )
+    current = plan_store.get_current_step(plan.plan_id)
+    if (
+        current is None
+        or current["step"]["action"] != action
+        or current["step"]["status"] not in {"pending", "waiting_user"}
+    ):
+        overview = plan_store.get_execution_overview(plan.plan_id)
+        completed = any(
+            item.action == action and item.status == "completed"
+            for item in overview.steps
+        )
+        if completed:
+            current_task = SqliteNavigationTaskStore(plan_store.db_path).get_task(
+                navigation_task_id
+            )
+            if (
+                current_task is not None
+                and current_task.status.value == "waiting_user"
+            ):
+                SqliteNavigationTaskStore(
+                    plan_store.db_path
+                ).update_task_for_session(
+                    current_task.task_id,
+                    web_session_id=current_task.created_by_web_session_id,
+                    agentscope_session_id=current_task.agentscope_session_id,
+                    expected_state_revision=current_task.state_revision,
+                    status="active",
+                )
+        return completed
+    step_id = str(current["step"]["step_id"])
+    payload = {
+        "ok": True,
+        "tool_name": action,
+        "message": (
+            "The Web annotation and Tracking handoff completed."
+            if action == "run_annotation_tracking_workflow"
+            else "The plan-bound postprocessing Runtime completed."
+            if action == "run_annotation_postprocessing_workflow"
+            else "The linked trajectory Fix workbench produced a durable update."
+        ),
+        "details": {
+            "workflow_status": status,
+            "identity_source": "durable_task_binding",
+        },
+    }
+    try:
+        plan_store.stage_step_result(
+            plan.plan_id,
+            step_id,
+            expected_action=action,
+            target_status="completed",
+            full_result=payload,
+            result_summary=_result_summary(payload),
+            expected_statuses=("pending", "waiting_user"),
+            expected_web_session_id=task.created_by_web_session_id,
+            expected_agentscope_session_id=task.agentscope_session_id,
+        )
+    except RuntimeError:
+        staged = plan_store.get_staged_step_result(plan.plan_id, step_id)
+        if staged is None:
+            return False
+    result = _finalize_staged_result(
+        task=task,
+        plan=plan,
+        step=_plan_step(plan, step_id),
+        plan_store=plan_store,
+        evidence_store=evidence_store,
+        settings=None,
+        expected_web_session_id=task.created_by_web_session_id,
+        expected_agentscope_session_id=task.agentscope_session_id,
+    )
+    if result.get("status") != "completed":
+        return False
+    current_task = SqliteNavigationTaskStore(plan_store.db_path).get_task(
+        navigation_task_id
+    )
+    if (
+        current_task is not None
+        and current_task.status.value == "waiting_user"
+    ):
+        SqliteNavigationTaskStore(plan_store.db_path).update_task_for_session(
+            current_task.task_id,
+            web_session_id=current_task.created_by_web_session_id,
+            agentscope_session_id=current_task.agentscope_session_id,
+            expected_state_revision=current_task.state_revision,
+            status="active",
+        )
+    return True
+
+
 def build_plan_bound_execution_tools(
     *,
     task: NavigationTask,
@@ -1164,6 +1287,7 @@ def build_plan_bound_execution_tools(
     cancellation: CancellationContext | None,
     web_session_id: str | None = None,
     agentscope_session_id: str | None = None,
+    annotation_gateway: NavigationAnnotationGateway | None = None,
 ) -> list[ToolBase]:
     """Expose only distinct actions remaining in the task's active immutable plan."""
     _ = dry_run  # The durable task is the canonical dry-run authority.
@@ -1188,6 +1312,276 @@ def build_plan_bound_execution_tools(
         remaining_actions.append(ledger_step.action)
 
     tools: list[ToolBase] = []
+
+    def make_annotation_workflow_action(action: str):
+        async def invoke(plan_id: str, step_id: str) -> dict[str, Any]:
+            if annotation_gateway is None:
+                return _compact_error(
+                    "annotation_service_unavailable",
+                    "The Annotation Application Service is not configured.",
+                    next_action="operator_recovery_required",
+                )
+            durable_task, plan, step, snapshot, gate_error = _gate_step(
+                bound_task=task,
+                requested_plan_id=plan_id,
+                requested_step_id=step_id,
+                expected_action=action,
+                plan_store=plan_store,
+                settings=settings,
+                expected_web_session_id=web_session_id,
+                expected_agentscope_session_id=agentscope_session_id,
+            )
+            if gate_error is not None:
+                return gate_error
+            assert durable_task is not None and plan is not None and step is not None
+            assert snapshot is not None
+            if snapshot.staged_result is not None:
+                return _finalize_staged_result(
+                    task=durable_task,
+                    plan=plan,
+                    step=step,
+                    plan_store=plan_store,
+                    evidence_store=evidence_store,
+                    settings=None,
+                    expected_web_session_id=web_session_id,
+                    expected_agentscope_session_id=agentscope_session_id,
+                )
+            current_status = (snapshot.current or {}).get("step", {}).get("status")
+            if current_status == "waiting_user":
+                return {
+                    "ok": True,
+                    "status": "waiting_user",
+                    "message": (
+                        "The durable Annotation workflow is still in progress."
+                    ),
+                    "next_action": "wait_for_workbench",
+                }
+            try:
+                result = dict(
+                    annotation_gateway.begin_annotation_from_plan(
+                        navigation_task_id=durable_task.task_id,
+                        plan_id=plan.plan_id,
+                        step_id=step.step_id,
+                    )
+                    if action == "run_annotation_tracking_workflow"
+                    else annotation_gateway.begin_postprocessing_from_plan(
+                        navigation_task_id=durable_task.task_id,
+                        plan_id=plan.plan_id,
+                        step_id=step.step_id,
+                    )
+                )
+            except Exception:
+                return _compact_error(
+                    "annotation_workflow_start_failed",
+                    "The durable Annotation workflow could not be started safely.",
+                    next_action="inspect_current_navigation_task",
+                )
+            if bool(result.get("completed")):
+                payload = {
+                    "ok": True,
+                    "tool_name": action,
+                    "message": "The durable Annotation workflow is already complete.",
+                    "details": {
+                        "workflow_status": str(result.get("status") or "completed"),
+                    },
+                }
+                plan_store.stage_step_result(
+                    plan.plan_id,
+                    step.step_id,
+                    expected_action=action,
+                    target_status="completed",
+                    full_result=payload,
+                    result_summary=_result_summary(payload),
+                    expected_statuses=("pending",),
+                    expected_web_session_id=web_session_id,
+                    expected_agentscope_session_id=agentscope_session_id,
+                )
+                return _finalize_staged_result(
+                    task=durable_task,
+                    plan=plan,
+                    step=step,
+                    plan_store=plan_store,
+                    evidence_store=evidence_store,
+                    settings=None,
+                    expected_web_session_id=web_session_id,
+                    expected_agentscope_session_id=agentscope_session_id,
+                )
+            marked = plan_store.mark_waiting_user(
+                plan.plan_id,
+                step.step_id,
+                action,
+                expected_web_session_id=web_session_id,
+                expected_agentscope_session_id=agentscope_session_id,
+            )
+            if not marked:
+                return _terminal_error(plan_store, plan.plan_id)
+            current_task = SqliteNavigationTaskStore(plan_store.db_path).get_task(
+                durable_task.task_id
+            )
+            if current_task is not None and current_task.status.value == "active":
+                SqliteNavigationTaskStore(plan_store.db_path).update_task_for_session(
+                    current_task.task_id,
+                    web_session_id=current_task.created_by_web_session_id,
+                    agentscope_session_id=current_task.agentscope_session_id,
+                    expected_state_revision=current_task.state_revision,
+                    status="waiting_user",
+                )
+            return {
+                "ok": True,
+                "status": "waiting_user",
+                "message": (
+                    "Complete the initial annotation in the Web workbench; "
+                    "DataPilot will resume Tracking automatically."
+                    if action == "run_annotation_tracking_workflow"
+                    else (
+                        "The plan-bound postprocessing Runtime is running; "
+                        "DataPilot will resume from its durable completion event."
+                    )
+                ),
+                "next_action": "wait_for_workbench",
+            }
+
+        invoke.__name__ = f"{action}_tool"
+        return invoke
+
+    def make_trajectory_review_action(action: str):
+        async def invoke(plan_id: str, step_id: str) -> dict[str, Any]:
+            if annotation_gateway is None:
+                return _compact_error(
+                    "annotation_service_unavailable",
+                    "The Annotation Application Service is not configured.",
+                    next_action="operator_recovery_required",
+                )
+            durable_task, plan, step, snapshot, gate_error = _gate_step(
+                bound_task=task,
+                requested_plan_id=plan_id,
+                requested_step_id=step_id,
+                expected_action=action,
+                plan_store=plan_store,
+                settings=settings,
+                expected_web_session_id=web_session_id,
+                expected_agentscope_session_id=agentscope_session_id,
+            )
+            if gate_error is not None:
+                return gate_error
+            assert durable_task is not None and plan is not None and step is not None
+            assert snapshot is not None
+            if snapshot.staged_result is not None:
+                return _finalize_staged_result(
+                    task=durable_task,
+                    plan=plan,
+                    step=step,
+                    plan_store=plan_store,
+                    evidence_store=evidence_store,
+                    settings=None,
+                    expected_web_session_id=web_session_id,
+                    expected_agentscope_session_id=agentscope_session_id,
+                )
+            try:
+                result = dict(
+                    annotation_gateway.begin_trajectory_review_from_plan(
+                        navigation_task_id=durable_task.task_id,
+                        plan_id=plan.plan_id,
+                        step_id=step.step_id,
+                    )
+                    if action == "open_trajectory_fix_workbench"
+                    else annotation_gateway.get_trajectory_review_outcome_from_plan(
+                        navigation_task_id=durable_task.task_id,
+                        plan_id=plan.plan_id,
+                        step_id=step.step_id,
+                    )
+                )
+            except Exception:
+                return _compact_error(
+                    "trajectory_review_state_unavailable",
+                    (
+                        "The authoritative trajectory review state could not "
+                        "be read safely."
+                    ),
+                    next_action="inspect_current_navigation_task",
+                )
+
+            current_status = (snapshot.current or {}).get("step", {}).get("status")
+            if bool(result.get("completed")):
+                payload = {
+                    "ok": True,
+                    "tool_name": action,
+                    "message": (
+                        "The linked trajectory review workbench is already complete."
+                        if action == "open_trajectory_fix_workbench"
+                        else "The linked trajectory review reached a terminal human decision."
+                    ),
+                    "details": {
+                        "review_status": str(result.get("status") or "completed"),
+                        "review_count": int(result.get("review_count", 0) or 0),
+                        "counts": dict(result.get("counts") or {}),
+                    },
+                }
+                plan_store.stage_step_result(
+                    plan.plan_id,
+                    step.step_id,
+                    expected_action=action,
+                    target_status="completed",
+                    full_result=payload,
+                    result_summary=_result_summary(payload),
+                    expected_statuses=("pending", "waiting_user"),
+                    expected_web_session_id=web_session_id,
+                    expected_agentscope_session_id=agentscope_session_id,
+                )
+                return _finalize_staged_result(
+                    task=durable_task,
+                    plan=plan,
+                    step=step,
+                    plan_store=plan_store,
+                    evidence_store=evidence_store,
+                    settings=None,
+                    expected_web_session_id=web_session_id,
+                    expected_agentscope_session_id=agentscope_session_id,
+                )
+
+            if current_status == "pending":
+                marked = plan_store.mark_waiting_user(
+                    plan.plan_id,
+                    step.step_id,
+                    action,
+                    expected_web_session_id=web_session_id,
+                    expected_agentscope_session_id=agentscope_session_id,
+                )
+                if not marked:
+                    return _terminal_error(plan_store, plan.plan_id)
+            current_task = SqliteNavigationTaskStore(plan_store.db_path).get_task(
+                durable_task.task_id
+            )
+            if current_task is not None and current_task.status.value == "active":
+                SqliteNavigationTaskStore(plan_store.db_path).update_task_for_session(
+                    current_task.task_id,
+                    web_session_id=current_task.created_by_web_session_id,
+                    agentscope_session_id=current_task.agentscope_session_id,
+                    expected_state_revision=current_task.state_revision,
+                    status="waiting_user",
+                )
+            return {
+                "ok": True,
+                "status": "waiting_user",
+                "message": (
+                    "Complete the linked trajectory Fix and human review in the "
+                    "Web workbench; DataPilot will resume from durable review events."
+                    if action == "open_trajectory_fix_workbench"
+                    else (
+                        "The linked reviews are not all terminal; DataPilot will "
+                        "resume when the Web workbench records another human decision."
+                    )
+                ),
+                "details": {
+                    "review_status": str(result.get("status") or "pending"),
+                    "review_count": int(result.get("review_count", 0) or 0),
+                    "counts": dict(result.get("counts") or {}),
+                },
+                "next_action": "wait_for_workbench",
+            }
+
+        invoke.__name__ = f"{action}_tool"
+        return invoke
 
     def make_invoke(action: str, function: Callable[..., Any]):
         async def invoke(plan_id: str, step_id: str) -> dict[str, Any]:
@@ -1239,6 +1633,37 @@ def build_plan_bound_execution_tools(
         return invoke
 
     for action in remaining_actions:
+        if action in {
+            "run_annotation_tracking_workflow",
+            "run_annotation_postprocessing_workflow",
+        }:
+            workflow_action = make_annotation_workflow_action(action)
+            tool = FunctionTool(
+                workflow_action,
+                name=f"{action}_tool",
+                is_concurrency_safe=False,
+                is_read_only=False,
+            )
+            tool.input_schema["additionalProperties"] = False
+            tools.append(tool)
+            continue
+        if action in {
+            "open_trajectory_fix_workbench",
+            "validate_trajectory_review_outcome",
+        }:
+            trajectory_review_action = make_trajectory_review_action(action)
+            tool = FunctionTool(
+                trajectory_review_action,
+                name=f"{action}_tool",
+                is_concurrency_safe=False,
+                # Both actions mutate durable orchestration state: opening the
+                # workbench enters waiting_user, while validation either
+                # preserves that wait or finalizes the Plan/task outcome.
+                is_read_only=False,
+            )
+            tool.input_schema["additionalProperties"] = False
+            tools.append(tool)
+            continue
         if action == _EXTERNAL_ACTION:
             from vla_data_juicer_agents.navigation.agent_tools import (
                 PlanBoundHumanDecisionTool,

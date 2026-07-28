@@ -30,6 +30,7 @@ from vla_data_juicer_agents.evaluation.reporting import (
 
 SUITE = "router-smoke"
 V1_SUITE = "datapilot-v1"
+M2_SUITE = "navigation-m2"
 
 
 def _cases() -> dict[str, EvaluationCase]:
@@ -38,6 +39,10 @@ def _cases() -> dict[str, EvaluationCase]:
 
 def _v1_cases() -> dict[str, EvaluationCase]:
     return {case.id: case for case in load_suite(default_cases_root(), V1_SUITE)}
+
+
+def _m2_cases() -> dict[str, EvaluationCase]:
+    return {case.id: case for case in load_suite(default_cases_root(), M2_SUITE)}
 
 
 def test_load_router_smoke_suite_with_strict_versioned_schema():
@@ -92,6 +97,32 @@ def test_load_datapilot_v1_suite_without_rewriting_historical_suite():
     }
 
 
+def test_load_navigation_m2_suite_with_router_and_specialist_entrypoints():
+    cases = _m2_cases()
+
+    assert set(cases) == {
+        "router_annotation_processing_shortcut",
+        "router_annotation_processing_and_fix_shortcut",
+        "router_continue_linked_fix",
+        "router_decline_linked_fix",
+        "navigation_postprocessing_existing_gridmap_odom",
+        "navigation_postprocessing_generate_gridmap_odom",
+        "navigation_trajectory_review_handoff",
+    }
+    assert all(case.schema_version == 2 for case in cases.values())
+    assert {
+        case.entrypoint for case in cases.values()
+    } == {"router", "navigation"}
+    pcd_case = cases["navigation_postprocessing_generate_gridmap_odom"]
+    handoff = pcd_case.expectations.tools.handoff
+    assert handoff is not None
+    assert handoff.step_variants == {
+        "prepare_gridmap_for_projection": "generate_from_pcd",
+        "run_projection_and_trajectory": "cjl_0525_with_gridmap",
+        "validate_navigation_outputs": "expect_gridmap",
+    }
+
+
 def test_case_schema_rejects_unknown_fields():
     raw = _cases()["router_capability_no_handoff"].model_dump(mode="python")
     raw["surprise"] = True
@@ -100,12 +131,24 @@ def test_case_schema_rejects_unknown_fields():
         EvaluationCase.model_validate(raw)
 
 
-@pytest.mark.parametrize("entrypoint", ["navigation", "end_to_end"])
+@pytest.mark.parametrize("entrypoint", ["end_to_end"])
 def test_v1_case_schema_rejects_unimplemented_entrypoints(entrypoint):
     raw = _cases()["router_capability_no_handoff"].model_dump(mode="python")
     raw["entrypoint"] = entrypoint
 
     with pytest.raises(ValidationError, match="literal_error"):
+        EvaluationCase.model_validate(raw)
+
+
+def test_navigation_case_schema_requires_navigation_runtime_setup():
+    raw = _cases()["router_capability_no_handoff"].model_dump(mode="python")
+    raw["schema_version"] = 2
+    raw["entrypoint"] = "navigation"
+
+    with pytest.raises(
+        ValidationError,
+        match="require runtime_setup.navigation_task",
+    ):
         EvaluationCase.model_validate(raw)
 
 
@@ -412,6 +455,58 @@ def test_datapilot_v1_contextual_direct_answers_are_strictly_tool_free(
     assert {"tools.allowed", "limits.tool_calls"} <= failed_names
 
 
+def test_navigation_plan_grading_requires_exact_business_variants():
+    case = _m2_cases()["navigation_postprocessing_generate_gridmap_odom"]
+    expected = case.expectations.tools.handoff
+    assert expected is not None
+    payload = {
+        "operation": "submit_plan",
+        "phase": expected.phase,
+        "decision_modes": expected.decision_modes,
+        "step_actions": expected.step_actions,
+        "step_variants": expected.step_variants,
+    }
+    passing = grade_case(
+        case,
+        CaseRunObservation(
+            final_response="后处理计划已验证，系统已开始执行。",
+            tool_calls=[
+                ToolCallObservation(
+                    name="submit_finish_processing_plan_tool",
+                    arguments={},
+                ),
+            ],
+            handoffs=[payload],
+            model_calls=1,
+        ),
+    )
+    assert passing.status is EvaluationStatus.PASS
+
+    wrong_variant = dict(payload)
+    wrong_variant["step_variants"] = {
+        **dict(expected.step_variants or {}),
+        "run_projection_and_trajectory": "cjl_with_gridmap",
+    }
+    failing = grade_case(
+        case,
+        CaseRunObservation(
+            final_response="后处理计划已验证，系统已开始执行。",
+            tool_calls=[
+                ToolCallObservation(
+                    name="submit_finish_processing_plan_tool",
+                    arguments={},
+                ),
+            ],
+            handoffs=[wrong_variant],
+            model_calls=1,
+        ),
+    )
+    assert failing.status is EvaluationStatus.FAIL
+    assert {
+        check.name for check in failing.checks if not check.passed
+    } == {"handoff.step_variants"}
+
+
 def test_runtime_setup_rejects_mixed_focused_task_and_trusted_request_context():
     case = _v1_cases()["router_shortcut_trusted_context_exact_scope"]
     raw = case.model_dump(mode="python")
@@ -422,7 +517,7 @@ def test_runtime_setup_rejects_mixed_focused_task_and_trusted_request_context():
         "selection": {"kind": "all_clips"},
     }
 
-    with pytest.raises(ValidationError, match="cannot be seeded together"):
+    with pytest.raises(ValidationError, match="are exclusive"):
         EvaluationCase.model_validate(raw)
 
 

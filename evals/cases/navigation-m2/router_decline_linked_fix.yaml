@@ -1,0 +1,34 @@
+schema_version: 2
+id: router_decline_linked_fix
+suite: navigation-m2
+entrypoint: router
+tags: [m2, router, decline, linked-fix, completed-parent, no-tool]
+runtime_setup:
+  focused_task:
+    task_ref: DP-EVAL-POSTPROCESSING-DECLINE
+    status: completed
+    dataset_date: "20270623"
+    selection:
+      kind: selected_clips
+      clips: ["20260623_145550"]
+    requested_outcome: postprocessing
+    completion_outcome: postprocessing_completed_fix_pending
+conversation:
+  - role: user
+    content: 暂不 Fix，之后需要时再做。
+limits:
+  max_model_calls: 1
+  max_tool_calls: 0
+  timeout_seconds: 180
+expectations:
+  tools:
+    allowed_calls: []
+    required_counts: {}
+    handoff_count: 0
+  response:
+    language: Chinese
+    required_any_groups:
+      - [好的, 可以, 明白, 暂不, 先不, 不会]
+    forbidden_terms:
+      [MainRouterAgent, NavigationDataAgent, start_navigation_data_task, continue_navigation_data_task, control_navigation_data_task, task_id, run_id, call_id, system prompt, 系统提示词]
+    max_chars: 240

@@ -1,0 +1,48 @@
+schema_version: 2
+id: navigation_trajectory_review_handoff
+suite: navigation-m2
+entrypoint: navigation
+tags: [m2, navigation, linked-fix, trajectory-review, durable-handoff]
+runtime_setup:
+  navigation_task:
+    dataset_date: "20270623"
+    selection:
+      kind: selected_clips
+      clips: ["20260623_145550"]
+    scene_mode: out
+    requested_outcome: trajectory_fix
+conversation:
+  - role: user
+    content: 继续 Fix。
+limits:
+  max_model_calls: 8
+  max_tool_calls: 8
+  timeout_seconds: 300
+expectations:
+  tools:
+    allowed_calls:
+      - inspect_navigation_annotation_job_facts_tool
+      - inspect_navigation_artifact_state_tool
+      - get_navigation_task_context_tool
+      - describe_processing_action_tool
+      - submit_trajectory_review_plan_tool
+      - open_trajectory_fix_workbench_tool
+    required_counts:
+      submit_trajectory_review_plan_tool: 1
+    handoff_count: 1
+    handoff:
+      operation: submit_plan
+      phase: trajectory_review
+      decision_modes:
+        review: human_fix
+      step_actions:
+        - open_trajectory_fix_workbench
+        - validate_trajectory_review_outcome
+      step_variants:
+        open_trajectory_fix_workbench: durable_human_handoff
+        validate_trajectory_review_outcome: approved_or_terminal
+      forbidden_fields: [task_id, job_ref, segment_ref, review_ref, path, command, script]
+  response:
+    language: Chinese
+    forbidden_terms:
+      [task_id, job_ref, segment_ref, review_ref, /media/, run_fix.sh, MainRouterAgent, NavigationDataAgent]

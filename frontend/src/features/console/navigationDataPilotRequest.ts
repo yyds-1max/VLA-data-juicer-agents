@@ -18,6 +18,23 @@ export function buildNavigationDatasetRequest(selection: NavigationDatasetSelect
   return lines.join("\n");
 }
 
+export function buildAnnotationProcessingRequest(
+  selection: NavigationDatasetSelection,
+): string {
+  const { date, clips } = normalizeSelection(selection);
+  const lines = [
+    "请对选中的导航数据执行自动标注并完成后处理。",
+    "",
+    `数据日期：${date}`,
+  ];
+
+  if (selection.scope === "clips") {
+    lines.push("指定 clips：", ...clips.map((clip) => `- ${clip}`));
+  }
+
+  return lines.join("\n");
+}
+
 export function buildNavigationDatasetRequestContext(
   selection: NavigationDatasetSelection,
 ): NavigationDatasetSelectionContext {

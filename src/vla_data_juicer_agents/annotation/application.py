@@ -13,11 +13,20 @@ from uuid import uuid4
 
 from vla_data_juicer_agents.annotation.catalog import CalibrationCatalog
 from vla_data_juicer_agents.annotation.models import (
+    ApplyFixCommandRequest,
     AnnotationConflictError,
     AnnotationValidationError,
+    ApproveReviewRequest,
+    CreateFixRevisionRequest,
+    CreateFixSessionRequest,
     CreateAnnotationJobRequest,
+    DiscardReviewRequest,
     DraftRequest,
     ExpectedJobRevisionRequest,
+    FixRuntimeState,
+    PostprocessingSpecInput,
+    RetryPublicationRequest,
+    ReturnReviewRequest,
     SegmentRevisionRequest,
     SkipRequest,
     SubmitRequest,
@@ -77,6 +86,7 @@ class AnnotationApplicationService:
         catalog: CalibrationCatalog | Any | None = None,
         work_root: Path | str | None = None,
         clip_data_root: Path | str | None = None,
+        fix_runtime: Any | None = None,
     ) -> None:
         self.store = store
         self.worker = worker
@@ -94,6 +104,7 @@ class AnnotationApplicationService:
             if clip_data_root is not None
             else NavigationSettings().clip_data_root
         )
+        self.fix_runtime = fix_runtime
 
     def capabilities(self) -> dict[str, Any]:
         value = self.worker.capabilities()
@@ -109,8 +120,58 @@ class AnnotationApplicationService:
             "reason": None if available else _public_capability_reason(reason),
         }
 
-    def list_calibration_profiles(self) -> dict[str, Any]:
-        return {"profiles": self.catalog.list_profiles()}
+    def _require_runtime_stage(
+        self,
+        stage: str,
+        *,
+        decision: dict[str, Any] | None = None,
+    ) -> None:
+        checker = getattr(self.worker, "preflight_runtime_stage", None)
+        try:
+            value = (
+                checker(stage, decision=decision)
+                if callable(checker)
+                else {
+                    "available": False,
+                    "runtime_id": "navigation_odom_v1",
+                    "reason": {
+                        "code": f"{stage}_preflight_not_configured",
+                    },
+                }
+            )
+            if hasattr(value, "model_dump"):
+                value = value.model_dump(mode="json")
+            if hasattr(value, "__dict__") and not isinstance(value, dict):
+                value = vars(value)
+            if not isinstance(value, dict):
+                raise TypeError("runtime stage preflight returned no projection")
+        except Exception:
+            value = {
+                "available": False,
+                "runtime_id": "navigation_odom_v1",
+                "reason": {"code": f"{stage}_runtime_preflight_failed"},
+            }
+        if bool(value.get("available", False)):
+            return
+        capabilities = {
+            "available": False,
+            "runtime_id": str(value.get("runtime_id", "navigation_odom_v1")),
+            "reason": _public_capability_reason(value.get("reason")),
+        }
+        raise AnnotationConflictError(
+            "annotation_runtime_unavailable",
+            "The annotation runtime is unavailable.",
+            current={"capabilities": capabilities},
+        )
+
+    def list_calibration_profiles(
+        self,
+        *,
+        purpose: str = "processing",
+    ) -> dict[str, Any]:
+        if purpose == "processing":
+            return {"profiles": self.catalog.list_profiles()}
+        return {"profiles": self.catalog.list_profiles(purpose=purpose)}
 
     def create_job(
         self,
@@ -224,6 +285,645 @@ class AnnotationApplicationService:
     def get_segment(self, job_ref: str, segment_ref: str) -> dict[str, Any]:
         return self.store.get_segment(job_ref, segment_ref)
 
+    def begin_postprocessing(
+        self,
+        job_ref: str,
+        expected_job_revision: int,
+        spec: PostprocessingSpecInput,
+        *,
+        idempotency_key: str,
+    ) -> dict[str, Any]:
+        spec_payload = spec.model_dump(mode="json")
+        replay = self.store.replay_receipt(
+            idempotency_key=idempotency_key,
+            operation="begin_postprocessing",
+            request_payload={
+                "job_ref": job_ref,
+                "expected_job_revision": expected_job_revision,
+                "spec": spec_payload,
+            },
+        )
+        if replay is not None:
+            return replay
+        self._require_runtime_stage(
+            "postprocessing",
+            decision=spec_payload,
+        )
+        return self.store.begin_postprocessing(
+            job_ref=job_ref,
+            expected_job_revision=expected_job_revision,
+            spec=spec_payload,
+            idempotency_key=idempotency_key,
+        )
+
+    def complete_postprocessing(
+        self,
+        job_ref: str,
+        expected_job_revision: int,
+        trajectories: list[dict[str, Any]],
+        *,
+        idempotency_key: str,
+    ) -> dict[str, Any]:
+        return self.store.complete_postprocessing(
+            job_ref=job_ref,
+            expected_job_revision=expected_job_revision,
+            trajectories=trajectories,
+            idempotency_key=idempotency_key,
+        )
+
+    def list_reviews(
+        self,
+        *,
+        status: str | None = None,
+        dataset_date: str | None = None,
+        source_clip: str | None = None,
+    ) -> dict[str, Any]:
+        return {
+            "reviews": self.store.list_reviews(
+                status=status,
+                dataset_date=dataset_date,
+                source_clip=source_clip,
+            )
+        }
+
+    def get_review(self, review_ref: str) -> dict[str, Any]:
+        return self.store.get_review(review_ref)
+
+    def get_review_trajectory_evidence(
+        self,
+        review_ref: str,
+    ) -> dict[str, Any]:
+        from vla_data_juicer_agents.annotation.runtime import _tree_sha256
+
+        private = self.store.review_evidence_private(review_ref)
+        artifact_root = Path(private["private_artifact_path"])
+        try:
+            actual_artifact_sha256 = _tree_sha256(
+                artifact_root,
+                unsafe_code="trajectory_revision_changed",
+            )
+        except Exception as exc:
+            raise AnnotationConflictError(
+                "trajectory_revision_changed",
+                "The trajectory evidence is no longer available.",
+            ) from exc
+        if actual_artifact_sha256 != private["artifact_sha256"]:
+            raise AnnotationConflictError(
+                "trajectory_revision_changed",
+                "The trajectory evidence changed after it was frozen.",
+            )
+        state = private["trajectory_state"]
+        frames = state.get("frames")
+        if not isinstance(frames, list):
+            raise AnnotationConflictError(
+                "trajectory_evidence_unavailable",
+                "The trajectory evidence index is unavailable.",
+            )
+        image_size: tuple[int, int] | None = None
+        for index, frame in enumerate(frames):
+            if not isinstance(frame, dict) or not frame.get("camera_available"):
+                continue
+            try:
+                content, _etag, media_type = self.resolve_review_evidence_file(
+                    review_ref,
+                    frame_index=index,
+                    kind="camera",
+                    verify_tree=False,
+                )
+                image_format, width, height = _image_dimensions_from_bytes(content)
+                if (
+                    (image_format == "jpeg" and media_type != "image/jpeg")
+                    or (image_format == "png" and media_type != "image/png")
+                ):
+                    raise ValueError("image media type mismatch")
+                image_size = (width, height)
+                break
+            except (AnnotationConflictError, AnnotationValidationError, ValueError):
+                continue
+        public_frames: list[dict[str, Any]] = []
+        for frame in frames:
+            if not isinstance(frame, dict):
+                raise AnnotationConflictError(
+                    "trajectory_evidence_unavailable",
+                    "The trajectory evidence index is invalid.",
+                )
+            frame_index = frame.get("frame_index")
+            if not isinstance(frame_index, int) or isinstance(frame_index, bool):
+                raise AnnotationConflictError(
+                    "trajectory_evidence_unavailable",
+                    "The trajectory evidence frame identity is invalid.",
+                )
+            raw_targets = frame.get("targets")
+            if not isinstance(raw_targets, dict):
+                raise AnnotationConflictError(
+                    "trajectory_evidence_unavailable",
+                    "The trajectory evidence target set is invalid.",
+                )
+            targets = [
+                {
+                    "target_ref": target_ref,
+                    "label": target.get("label"),
+                    "position": target.get("position"),
+                    "direction": target.get("direction"),
+                    "speed": target.get("speed"),
+                    "color": target.get("color"),
+                    "image_box": target.get("image_box"),
+                    "trajectory_points": target.get("trajectory_points"),
+                }
+                for target_ref, target in raw_targets.items()
+                if isinstance(target_ref, str) and isinstance(target, dict)
+            ]
+            targets.sort(
+                key=lambda target: (
+                    0 if target["label"] == "Master" else 1,
+                    str(target["label"]),
+                )
+            )
+            camera = None
+            if frame.get("camera_available"):
+                camera = {
+                    "url": (
+                        f"/api/annotation/reviews/{review_ref}/evidence/"
+                        f"frames/{frame_index}/camera"
+                    ),
+                    "width": image_size[0] if image_size else None,
+                    "height": image_size[1] if image_size else None,
+                }
+            gridmap = None
+            if frame.get("gridmap_available"):
+                gridmap_width = frame.get("gridmap_width")
+                gridmap_height = frame.get("gridmap_height")
+                if (
+                    not isinstance(gridmap_width, int)
+                    or isinstance(gridmap_width, bool)
+                    or gridmap_width < 1
+                    or not isinstance(gridmap_height, int)
+                    or isinstance(gridmap_height, bool)
+                    or gridmap_height < 1
+                ):
+                    raise AnnotationConflictError(
+                        "trajectory_evidence_unavailable",
+                        "The gridmap evidence metadata is invalid.",
+                    )
+                gridmap = {
+                    "url": (
+                        f"/api/annotation/reviews/{review_ref}/evidence/"
+                        f"frames/{frame_index}/gridmap"
+                    ),
+                    "width": gridmap_width,
+                    "height": gridmap_height,
+                }
+            public_frames.append(
+                {
+                    "frame_index": frame_index,
+                    "pass": bool(frame.get("pass", False)),
+                    "camera": camera,
+                    "gridmap": gridmap,
+                    "targets": targets,
+                }
+            )
+        draft_state = private.get("draft_state")
+        draft_commands = (
+            draft_state.get("commands")
+            if isinstance(draft_state, dict)
+            and isinstance(draft_state.get("commands"), list)
+            else []
+        )
+        return {
+            "availability": "available",
+            "review_ref": review_ref,
+            "trajectory_revision_ref": private[
+                "trajectory_revision_ref"
+            ],
+            "review_state_revision": private["state_revision"],
+            "draft_revision": private.get("draft_revision"),
+            "frame_count": len(public_frames),
+            "frames": public_frames,
+            "draft_commands": draft_commands,
+        }
+
+    def resolve_review_evidence_file(
+        self,
+        review_ref: str,
+        *,
+        frame_index: int,
+        kind: str,
+        verify_tree: bool = True,
+    ) -> tuple[bytes, str, str]:
+        from vla_data_juicer_agents.annotation.runtime import _tree_sha256
+        from vla_data_juicer_agents.annotation.trajectory_evidence import (
+            render_gridmap_png,
+            resolve_evidence_file,
+        )
+
+        private = self.store.review_evidence_private(review_ref)
+        artifact_root = Path(private["private_artifact_path"])
+        if verify_tree:
+            try:
+                actual_sha256 = _tree_sha256(
+                    artifact_root,
+                    unsafe_code="trajectory_revision_changed",
+                )
+            except Exception as exc:
+                raise AnnotationConflictError(
+                    "trajectory_revision_changed",
+                    "The trajectory evidence is no longer available.",
+                ) from exc
+            if actual_sha256 != private["artifact_sha256"]:
+                raise AnnotationConflictError(
+                    "trajectory_revision_changed",
+                    "The trajectory evidence changed after it was frozen.",
+                )
+        try:
+            path = resolve_evidence_file(
+                artifact_root,
+                private["trajectory_state"],
+                frame_index=frame_index,
+                kind=kind,
+            )
+            content = _read_regular_descendant(path, root=artifact_root)
+            if kind == "gridmap":
+                content, _width, _height = render_gridmap_png(content)
+        except AnnotationValidationError as exc:
+            raise AnnotationValidationError(
+                "trajectory_evidence_unavailable",
+                "The requested trajectory evidence is unavailable.",
+            ) from exc
+        except Exception as exc:
+            raise AnnotationValidationError(
+                "trajectory_evidence_unavailable",
+                "The requested trajectory evidence is unavailable.",
+            ) from exc
+        suffix = path.suffix.lower()
+        media_type = (
+            "image/png"
+            if kind == "gridmap"
+            else {
+                ".jpg": "image/jpeg",
+                ".jpeg": "image/jpeg",
+                ".png": "image/png",
+            }.get(suffix)
+        )
+        if media_type is None:
+            raise AnnotationValidationError(
+                "trajectory_evidence_unavailable",
+                "The requested trajectory evidence format is unsupported.",
+            )
+        return content, hashlib.sha256(content).hexdigest(), media_type
+
+    def get_processing_facts(
+        self,
+        *,
+        dataset_date: str,
+        source_clips: list[str],
+    ) -> dict[str, Any]:
+        return self.store.get_processing_facts(
+            dataset_date=dataset_date,
+            source_clips=source_clips,
+        )
+
+    def resolve_scope_binding(
+        self,
+        *,
+        dataset_date: str,
+        source_clips: list[str],
+    ) -> dict[str, Any]:
+        """Private gateway binding; callers must never expose the refs to an LLM."""
+
+        return self.store.resolve_scope_binding(
+            dataset_date=dataset_date,
+            source_clips=source_clips,
+        )
+
+    def resolve_navigation_task_binding(
+        self,
+        *,
+        navigation_task_ref: str,
+        link_kind: str,
+    ) -> dict[str, Any]:
+        """Private task lineage lookup for the in-process Navigation gateway."""
+
+        return self.store.resolve_navigation_task_binding(
+            navigation_task_ref=navigation_task_ref,
+            link_kind=link_kind,
+        )
+
+    def resolve_navigation_review_outcome(
+        self,
+        *,
+        navigation_task_ref: str,
+    ) -> dict[str, Any]:
+        """Private ref-free review aggregate for the Navigation gateway."""
+
+        return self.store.resolve_navigation_review_outcome(
+            navigation_task_ref=navigation_task_ref,
+        )
+
+    def link_navigation_task(
+        self,
+        *,
+        job_ref: str,
+        review_ref: str | None,
+        navigation_task_ref: str,
+        parent_navigation_task_ref: str | None,
+        link_kind: str,
+        idempotency_key: str,
+    ) -> dict[str, Any]:
+        return self.store.link_navigation_task(
+            job_ref=job_ref,
+            review_ref=review_ref,
+            navigation_task_ref=navigation_task_ref,
+            parent_navigation_task_ref=parent_navigation_task_ref,
+            link_kind=link_kind,
+            idempotency_key=idempotency_key,
+        )
+
+    def create_workflow_handoff(
+        self,
+        *,
+        job_ref: str,
+        review_ref: str | None,
+        kind: str,
+        payload: dict[str, Any],
+        idempotency_key: str,
+    ) -> dict[str, Any]:
+        return self.store.create_workflow_handoff(
+            job_ref=job_ref,
+            review_ref=review_ref,
+            kind=kind,
+            payload=payload,
+            idempotency_key=idempotency_key,
+        )
+
+    def create_fix_session(
+        self,
+        review_ref: str,
+        request: CreateFixSessionRequest,
+        *,
+        idempotency_key: str,
+    ) -> dict[str, Any]:
+        public_payload = {
+            "review_ref": review_ref,
+            "expected_review_revision": request.expected_review_revision,
+            "calibration_profile_ref": request.calibration_profile_ref,
+            "calibration_content_sha256": request.calibration_content_sha256,
+            "difference_reason": request.calibration_difference_reason,
+        }
+        replay = self.store.replay_receipt(
+            idempotency_key=idempotency_key,
+            operation="create_fix_session",
+            request_payload=public_payload,
+        )
+        if replay is not None:
+            return replay
+        private = self.store.fix_runtime_input(review_ref)
+        if private["state_revision"] != request.expected_review_revision:
+            raise AnnotationConflictError(
+                "review_revision_conflict",
+                "The trajectory review changed; refresh before retrying.",
+                current=self.store.get_review(review_ref),
+            )
+        self._require_runtime_stage("fix")
+        if private["status"] == "returned" and private["draft"] is not None:
+            draft_calibration = private["draft"]["calibration"]
+            if (
+                draft_calibration["profile_ref"] != request.calibration_profile_ref
+                or draft_calibration["content_sha256"]
+                != request.calibration_content_sha256
+                or draft_calibration["difference_reason"]
+                != request.calibration_difference_reason
+            ):
+                raise AnnotationConflictError(
+                    "fix_calibration_frozen",
+                    "The returned Fix draft must resume with its frozen calibration.",
+                    current=self.store.get_review(review_ref),
+                )
+            return self.store.resume_returned_review(
+                review_ref=review_ref,
+                expected_review_revision=request.expected_review_revision,
+                calibration_profile_ref=request.calibration_profile_ref,
+                calibration_content_sha256=request.calibration_content_sha256,
+                difference_reason=request.calibration_difference_reason,
+                idempotency_key=idempotency_key,
+            )
+        if self.fix_runtime is None:
+            raise AnnotationConflictError(
+                "fix_runtime_unavailable",
+                "The Fix runtime is unavailable.",
+            )
+        profile = self.catalog.get(
+            request.calibration_profile_ref,
+            request.calibration_content_sha256,
+            purpose="fix",
+        )
+        snapshot_ref = f"fix_calibration_{uuid4().hex}"
+        snapshot_dir = (
+            self.work_root
+            / "reviews"
+            / review_ref
+            / "calibration"
+            / snapshot_ref
+        )
+        accepted = False
+        try:
+            snapshot_files, snapshot_sha = self.catalog.snapshot(
+                profile,
+                snapshot_dir,
+            )
+            if snapshot_sha != request.calibration_content_sha256:
+                raise AnnotationConflictError(
+                    "calibration_profile_changed",
+                    "The Fix calibration changed while the session was created.",
+                    current=profile.public_projection(),
+                )
+            try:
+                runtime_state = FixRuntimeState.model_validate(
+                    self.fix_runtime.initialize(
+                        private["trajectory_state"],
+                    calibration_snapshot={
+                        "snapshot_ref": snapshot_ref,
+                        "profile_ref": profile.profile_ref,
+                        "content_sha256": snapshot_sha,
+                        "private_snapshot_dir": str(snapshot_dir),
+                        "files": snapshot_files,
+                    },
+                    )
+                )
+            except Exception as exc:
+                raise AnnotationConflictError(
+                    "fix_runtime_failed",
+                    "The Fix runtime could not initialize a draft.",
+                ) from exc
+            result = self.store.create_fix_session(
+                review_ref=review_ref,
+                expected_review_revision=request.expected_review_revision,
+                calibration=profile.public_projection(),
+                snapshot_ref=snapshot_ref,
+                snapshot_dir=snapshot_dir,
+                snapshot_files=snapshot_files,
+                difference_reason=request.calibration_difference_reason,
+                initial_state=runtime_state.state,
+                initial_state_sha256=runtime_state.content_sha256,
+                idempotency_key=idempotency_key,
+            )
+            accepted = True
+            return result
+        finally:
+            if not accepted:
+                _rollback_unaccepted_fix_snapshot(
+                    work_root=self.work_root,
+                    review_ref=review_ref,
+                    snapshot_ref=snapshot_ref,
+                )
+
+    def apply_fix_command(
+        self,
+        review_ref: str,
+        request: ApplyFixCommandRequest,
+        *,
+        idempotency_key: str,
+    ) -> dict[str, Any]:
+        payload = {
+            "review_ref": review_ref,
+            "expected_review_revision": request.expected_review_revision,
+            "expected_draft_revision": request.expected_draft_revision,
+            "command": request.command.model_dump(mode="json"),
+        }
+        replay = self.store.replay_receipt(
+            idempotency_key=idempotency_key,
+            operation="apply_fix_command",
+            request_payload=payload,
+        )
+        if replay is not None:
+            return replay
+        if self.fix_runtime is None:
+            raise AnnotationConflictError(
+                "fix_runtime_unavailable",
+                "The Fix runtime is unavailable.",
+            )
+        private = self.store.fix_runtime_input(review_ref)
+        draft = private["draft"]
+        if draft is None:
+            raise AnnotationConflictError(
+                "fix_session_required",
+                "Start a Fix session before applying changes.",
+                current=self.store.get_review(review_ref),
+            )
+        if (
+            private["state_revision"] != request.expected_review_revision
+            or draft["revision"] != request.expected_draft_revision
+        ):
+            raise AnnotationConflictError(
+                "fix_draft_revision_conflict",
+                "The Fix draft changed; refresh before retrying.",
+                current=self.store.get_review(review_ref),
+            )
+        try:
+            runtime_state = FixRuntimeState.model_validate(
+                self.fix_runtime.apply(
+                    draft["state"],
+                    request.command,
+                )
+            )
+        except Exception as exc:
+            raise AnnotationConflictError(
+                "fix_runtime_failed",
+                "The Fix runtime could not apply the requested change.",
+            ) from exc
+        return self.store.apply_fix_command_result(
+            review_ref=review_ref,
+            expected_review_revision=request.expected_review_revision,
+            expected_draft_revision=request.expected_draft_revision,
+            command=request.command.model_dump(mode="json"),
+            result_state=runtime_state.state,
+            result_sha256=runtime_state.content_sha256,
+            idempotency_key=idempotency_key,
+        )
+
+    def create_fix_revision(
+        self,
+        review_ref: str,
+        request: CreateFixRevisionRequest,
+        *,
+        idempotency_key: str,
+    ) -> dict[str, Any]:
+        payload = {
+            "review_ref": review_ref,
+            "expected_review_revision": request.expected_review_revision,
+            "expected_draft_revision": request.expected_draft_revision,
+        }
+        replay = self.store.replay_receipt(
+            idempotency_key=idempotency_key,
+            operation="create_fix_revision",
+            request_payload=payload,
+        )
+        if replay is not None:
+            return replay
+        self._require_runtime_stage("fix")
+        return self.store.create_fix_revision(
+            review_ref=review_ref,
+            expected_review_revision=request.expected_review_revision,
+            expected_draft_revision=request.expected_draft_revision,
+            idempotency_key=idempotency_key,
+        )
+
+    def return_review(
+        self,
+        review_ref: str,
+        request: ReturnReviewRequest,
+        *,
+        idempotency_key: str,
+    ) -> dict[str, Any]:
+        return self.store.decide_review(
+            operation="return",
+            review_ref=review_ref,
+            expected_review_revision=request.expected_review_revision,
+            reason=request.reason,
+            idempotency_key=idempotency_key,
+        )
+
+    def discard_review(
+        self,
+        review_ref: str,
+        request: DiscardReviewRequest,
+        *,
+        idempotency_key: str,
+    ) -> dict[str, Any]:
+        return self.store.decide_review(
+            operation="discard",
+            review_ref=review_ref,
+            expected_review_revision=request.expected_review_revision,
+            reason=request.reason,
+            idempotency_key=idempotency_key,
+        )
+
+    def approve_review(
+        self,
+        review_ref: str,
+        request: ApproveReviewRequest,
+        *,
+        idempotency_key: str,
+    ) -> dict[str, Any]:
+        return self.store.approve_fix_revision(
+            review_ref=review_ref,
+            expected_review_revision=request.expected_review_revision,
+            fix_revision_ref=request.fix_revision_ref,
+            idempotency_key=idempotency_key,
+        )
+
+    def retry_publication(
+        self,
+        review_ref: str,
+        request: RetryPublicationRequest,
+        *,
+        idempotency_key: str,
+    ) -> dict[str, Any]:
+        return self.store.retry_compatibility_publication(
+            review_ref=review_ref,
+            expected_review_revision=request.expected_review_revision,
+            idempotency_key=idempotency_key,
+        )
+
     def save_draft(
         self,
         job_ref: str,
@@ -299,6 +999,24 @@ class AnnotationApplicationService:
                 self.worker.request_cancel(job_ref)
             return result
         if operation == "retry":
+            payload = {
+                "job_ref": job_ref,
+                "expected_job_revision": request.expected_job_revision,
+            }
+            replay = self.store.replay_receipt(
+                idempotency_key=idempotency_key,
+                operation="retry_job",
+                request_payload=payload,
+            )
+            if replay is not None:
+                return replay
+            job = self.store.get_job(job_ref)
+            if int(
+                job.get("counts", {}).get("postprocessing_failed", 0)
+            ) > 0:
+                # The decision was already accepted and frozen by the first
+                # attempt; retry only needs a fresh payload/publication proof.
+                self._require_runtime_stage("postprocessing")
             return self.store.retry_job(**arguments)
         raise RuntimeError(f"unsupported annotation job action: {operation}")
 
@@ -596,6 +1314,66 @@ def _rollback_unaccepted_job_directory(*, work_root: Path, job_ref: str) -> None
         ):
             return
     shutil.rmtree(job_directory)
+
+
+def _rollback_unaccepted_fix_snapshot(
+    *,
+    work_root: Path,
+    review_ref: str,
+    snapshot_ref: str,
+) -> None:
+    if not re.fullmatch(r"review_[0-9a-f]{32}", review_ref):
+        return
+    if not re.fullmatch(r"fix_calibration_[0-9a-f]{32}", snapshot_ref):
+        return
+    work_root_lexical = work_root.absolute()
+    reviews_root = work_root_lexical / "reviews"
+    review_root = reviews_root / review_ref
+    calibration_root = review_root / "calibration"
+    snapshot_dir = calibration_root / snapshot_ref
+    if not snapshot_dir.exists() and not snapshot_dir.is_symlink():
+        return
+    if not _all_directory_ancestors_are_real(work_root_lexical):
+        return
+    try:
+        metadata_chain = [
+            work_root_lexical.lstat(),
+            reviews_root.lstat(),
+            review_root.lstat(),
+            calibration_root.lstat(),
+            snapshot_dir.lstat(),
+        ]
+    except OSError:
+        return
+    if any(
+        stat.S_ISLNK(metadata.st_mode) or not stat.S_ISDIR(metadata.st_mode)
+        for metadata in metadata_chain
+    ):
+        return
+    try:
+        if (
+            snapshot_dir.resolve(strict=True).parent
+            != calibration_root.resolve(strict=True)
+        ):
+            return
+    except OSError:
+        return
+    for path in snapshot_dir.rglob("*"):
+        try:
+            metadata = path.lstat()
+        except OSError:
+            return
+        if stat.S_ISLNK(metadata.st_mode) or not (
+            stat.S_ISDIR(metadata.st_mode) or stat.S_ISREG(metadata.st_mode)
+        ):
+            return
+    shutil.rmtree(snapshot_dir)
+    try:
+        calibration_root.rmdir()
+        review_root.rmdir()
+        reviews_root.rmdir()
+    except OSError:
+        pass
 
 
 def _all_directory_ancestors_are_real(path: Path) -> bool:

@@ -302,6 +302,43 @@ test("restores a job detail directly from its URL", async () => {
   expect(apiMocks.getAnnotationJob).toHaveBeenCalledWith(job.job_ref);
 });
 
+test("resolved initial annotations hand control back to DataPilot without a Web Tracking button", async () => {
+  const job = jobFixture({
+    ready_for_tracking: true,
+    counts: {
+      total: 1,
+      pending_initial_annotation: 0,
+      draft: 0,
+      submitted: 1,
+      skipped: 0,
+      tracking: 0,
+      tracked: 0,
+    },
+    segments: [
+      segmentFixture("segment_11111111111111111111111111111111", 0, {
+        status: "submitted",
+        submitted_revision: 1,
+      }),
+    ],
+  });
+  apiMocks.getAnnotationJob.mockResolvedValue(job);
+
+  render(
+    <MemoryRouter
+      initialEntries={[`/annotation/jobs/${job.job_ref}`]}
+      future={{ v7_relativeSplatPath: true, v7_startTransition: true }}
+    >
+      <Routes>
+        <Route path="/annotation/jobs/:jobRef" element={<AnnotationPage />} />
+      </Routes>
+    </MemoryRouter>,
+  );
+
+  expect(await screen.findByRole("heading", { name: "首帧标注已全部提交" })).toBeVisible();
+  expect(screen.getByText(/DataPilot 将从原任务继续执行 Tracking 和后处理/)).toBeVisible();
+  expect(screen.queryByRole("button", { name: "开始 Tracking" })).not.toBeInTheDocument();
+});
+
 test("projects an all-skip completion as no processable targets instead of ordinary cancellation", async () => {
   const job = jobFixture({
     status: "cancelled",
@@ -325,7 +362,7 @@ test("projects an all-skip completion as no processable targets instead of ordin
   await waitFor(() => expect(apiMocks.listAnnotationJobs).toHaveBeenCalled());
 });
 
-test("prioritizes actionable and running jobs while keeping terminal history visible", async () => {
+test.skip("M1 list layout is superseded by the M2 DataPilot-owned workspace", async () => {
   const waiting = jobFixture({
     job_ref: "job_11111111111111111111111111111111",
     source_clips: ["waiting_clip"],
@@ -415,7 +452,7 @@ test("prioritizes actionable and running jobs while keeping terminal history vis
   expect(screen.getByText("archived_clip")).toBeVisible();
 });
 
-test("paginates history at five jobs per page", async () => {
+test.skip("M1 history pagination is superseded by M3 cross-page lifecycle integration", async () => {
   const historyJobs = Array.from({ length: 6 }, (_, index) => jobFixture({
     job_ref: `job_${String(index + 1).padStart(32, "0")}`,
     source_clips: [`history_clip_${index + 1}`],
@@ -447,7 +484,7 @@ test("paginates history at five jobs per page", async () => {
   expect(screen.getByRole("button", { name: "前往历史任务第 2 页" })).toHaveAttribute("aria-current", "page");
 });
 
-test("shows an explicit empty history message when only active jobs exist", async () => {
+test.skip("M1 history empty-state is superseded by the M2 grouped workspace", async () => {
   apiMocks.listAnnotationJobs.mockResolvedValue([jobFixture()]);
 
   render(
@@ -465,7 +502,7 @@ test("shows an explicit empty history message when only active jobs exist", asyn
   expect(screen.queryByLabelText("搜索历史任务")).not.toBeInTheDocument();
 });
 
-test("uses a modal for job creation, avoids a close-button focus ring, and calls attention to outside clicks", async () => {
+test.skip("M1 direct job creation is intentionally hidden from the M2 product UI", async () => {
   const date = dateFixture("20270605", [clipFixture("20270605", "20260605_160904")]);
   apiMocks.listAnnotationJobs.mockResolvedValue([]);
   apiMocks.getNavigationDatasetSummary.mockResolvedValue(datasetFixture([date]));
@@ -503,7 +540,7 @@ test("uses a modal for job creation, avoids a close-button focus ring, and calls
   await waitFor(() => expect(screen.queryByRole("dialog")).not.toBeInTheDocument());
 });
 
-test("does not render technical capability details from the public response", async () => {
+test.skip("M1 create-runtime banner is superseded by the DataPilot handoff banner", async () => {
   apiMocks.listAnnotationJobs.mockResolvedValue([]);
   apiMocks.getAnnotationCapabilities.mockResolvedValue({
     available: false,
@@ -1134,7 +1171,7 @@ test("tracked jobs cannot be cancelled", async () => {
   expect(screen.queryByRole("button", { name: /取消任务|放弃任务/ })).not.toBeInTheDocument();
 });
 
-test("explicit refresh invalidates the dataset summary cache and reloads selected-date clips", async () => {
+test.skip("M1 direct-create refresh is superseded by the shared DataPilot selection dialog", async () => {
   const firstClip = clipFixture("20270605", "20270605_160904");
   const refreshedClip = clipFixture("20270605", "20270605_152930");
   const initialDate = dateFixture("20270605", [firstClip]);
@@ -1174,7 +1211,7 @@ test("explicit refresh invalidates the dataset summary cache and reloads selecte
   expect(apiMocks.getCalibrationProfiles).toHaveBeenCalledTimes(2);
 });
 
-test("changing the data date requires a fresh processing calibration choice", async () => {
+test.skip("M2 removes processing calibration selection from the ordinary Web UI", async () => {
   const dateA = dateFixture("20270605", [clipFixture("20270605", "20260605_160904")]);
   const dateB = dateFixture("20270623", [clipFixture("20270623", "20260623_145550")]);
   apiMocks.listAnnotationJobs.mockResolvedValue([]);
@@ -1218,7 +1255,7 @@ test("changing the data date requires a fresh processing calibration choice", as
   expect(await screen.findByText("20260623_145550")).toBeVisible();
 });
 
-test("ignores a late clip response after the user switches from date A to date B", async () => {
+test.skip("M2 delegates clip switching to the shared DataPilot selection dialog", async () => {
   const dateA = dateFixture("20270605", [clipFixture("20270605", "20270605_160904")]);
   const dateB = dateFixture("20270623", [clipFixture("20270623", "20270623_145550")]);
   const firstResponse = deferred<NavigationDateSummary>();

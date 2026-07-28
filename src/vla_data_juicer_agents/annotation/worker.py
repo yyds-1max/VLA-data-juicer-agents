@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import inspect
+import json
 import logging
 import time
 import threading
@@ -15,6 +17,7 @@ from vla_data_juicer_agents.navigation.writer_lock import (
     NavigationWriterLockError,
     configured_writer_lock_path,
     navigation_writer_coordination_status,
+    navigation_writer_lock,
 )
 
 
@@ -56,6 +59,10 @@ class AnnotationWorker:
         store: AnnotationStore,
         runtime: Any | None = None,
         *,
+        postprocessing_runtime: Any | None = None,
+        postprocessing_publisher: Any | None = None,
+        fix_runtime: Any | None = None,
+        fix_publisher: Any | None = None,
         poll_interval: float = 0.25,
     ) -> None:
         self.store = store
@@ -74,6 +81,66 @@ class AnnotationWorker:
                     error_ref=f"annotation_error_{uuid4().hex}"
                 )
         self.runtime = runtime
+        self.postprocessing_runtime = postprocessing_runtime
+        self.postprocessing_publisher = postprocessing_publisher
+        self.fix_runtime = fix_runtime
+        self.fix_publisher = fix_publisher
+        if (
+            self.postprocessing_runtime is None
+            and getattr(runtime, "config", None) is not None
+        ):
+            try:
+                from vla_data_juicer_agents.annotation.postprocessing_runtime import (
+                    CompatibilityPublisher,
+                    NavigationPostprocessingRuntime,
+                )
+                from vla_data_juicer_agents.navigation.config import (
+                    NavigationSettings,
+                )
+
+                self.postprocessing_runtime = NavigationPostprocessingRuntime(
+                    runtime.config,
+                )
+                self.postprocessing_publisher = (
+                    self.postprocessing_publisher
+                    or CompatibilityPublisher(
+                        NavigationSettings().finish_data_root,
+                    )
+                )
+            except Exception:
+                logger.error(
+                    "M2 postprocessing Runtime configuration failed; "
+                    "postprocessing remains unavailable"
+                )
+                self.postprocessing_runtime = None
+                self.postprocessing_publisher = None
+        if getattr(runtime, "config", None) is not None:
+            if self.fix_runtime is None:
+                try:
+                    from vla_data_juicer_agents.annotation.fix_runtime import (
+                        NavigationFixRuntime,
+                    )
+
+                    self.fix_runtime = NavigationFixRuntime(runtime.config)
+                except Exception:
+                    logger.error(
+                        "M2 Fix Runtime configuration failed; "
+                        "Fix remains unavailable"
+                    )
+                    self.fix_runtime = None
+            if self.fix_publisher is None:
+                try:
+                    from vla_data_juicer_agents.annotation.fix_runtime import (
+                        FixCompatibilityPublisher,
+                    )
+
+                    self.fix_publisher = FixCompatibilityPublisher()
+                except Exception:
+                    logger.error(
+                        "M2 Fix compatibility publisher configuration failed; "
+                        "publication remains unavailable"
+                    )
+                    self.fix_publisher = None
         self.poll_interval = poll_interval
         self.worker_id = f"annotation-worker-{uuid4().hex}"
         self.owner_epoch = _WORKER_PROCESS_EPOCH
@@ -180,6 +247,111 @@ class AnnotationWorker:
             active_reserved_bytes=active_reserved_bytes,
         )
         return _plain(value)
+
+    def preflight_runtime_stage(
+        self,
+        stage: str,
+        *,
+        decision: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        """Fresh, fail-closed M2 payload proof before durable state is created."""
+
+        if stage not in {"postprocessing", "fix"}:
+            raise ValueError("unsupported annotation runtime stage")
+        self.invalidate_capabilities()
+        base = _plain(self.capabilities())
+        if not _capabilities_available(base):
+            return base
+        runtime = (
+            self.postprocessing_runtime
+            if stage == "postprocessing"
+            else self.fix_runtime
+        )
+        if runtime is None or (
+            stage == "postprocessing"
+            and self.postprocessing_publisher is None
+        ):
+            return {
+                "available": False,
+                "runtime_id": "navigation_odom_v1",
+                "reason": {
+                    "code": f"{stage}_runtime_not_configured",
+                    "message": (
+                        f"The M2 {stage} runtime has not completed deployment."
+                    ),
+                },
+            }
+        preflight = getattr(runtime, "preflight", None)
+        if not callable(preflight):
+            return {
+                "available": False,
+                "runtime_id": "navigation_odom_v1",
+                "reason": {
+                    "code": f"{stage}_preflight_not_configured",
+                    "message": (
+                        f"The M2 {stage} runtime cannot prove its frozen payload."
+                    ),
+                },
+            }
+        try:
+            if stage == "postprocessing":
+                if decision is None:
+                    manifest_sha256 = preflight()
+                else:
+                    if not isinstance(decision, dict):
+                        raise ValueError(
+                            "postprocessing preflight requires a normalized decision"
+                        )
+                    manifest_sha256 = preflight(
+                        localization_kind=decision.get("localization_kind"),
+                        gridmap_decision=decision.get("gridmap_decision"),
+                        trajectory_variant=decision.get("trajectory_variant"),
+                    )
+                publisher_preflight = getattr(
+                    self.postprocessing_publisher,
+                    "preflight",
+                    None,
+                )
+                if not callable(publisher_preflight):
+                    raise ValueError(
+                        "postprocessing publisher has no safety preflight"
+                    )
+                publisher_preflight()
+            else:
+                manifest_sha256 = preflight()
+            if (
+                not isinstance(manifest_sha256, str)
+                or len(manifest_sha256) != 64
+                or any(
+                    character not in "0123456789abcdef"
+                    for character in manifest_sha256
+                )
+            ):
+                raise ValueError("runtime preflight returned an invalid proof")
+        except Exception as exc:
+            error_ref = f"annotation_error_{uuid4().hex}"
+            logger.error(
+                "M2 Runtime preflight failed: stage=%s error_ref=%s type=%s",
+                stage,
+                error_ref,
+                type(exc).__name__,
+            )
+            return {
+                "available": False,
+                "runtime_id": "navigation_odom_v1",
+                "reason": {
+                    "code": f"{stage}_runtime_preflight_failed",
+                    "message": (
+                        f"The M2 {stage} frozen payload failed preflight."
+                    ),
+                    "error_ref": error_ref,
+                },
+            }
+        return {
+            "available": True,
+            "runtime_id": str(base.get("runtime_id", "navigation_odom_v1")),
+            "runtime_manifest_sha256": manifest_sha256,
+        }
 
     async def run_forever(self) -> None:
         try:
@@ -294,8 +466,15 @@ class AnnotationWorker:
         self._cancel_runtime(job_ref)
 
     def _cancel_runtime(self, job_ref: str) -> None:
-        cancel = getattr(self.runtime, "cancel", None)
-        if callable(cancel):
+        cancellable_runtimes = (
+            self.runtime,
+            self.postprocessing_runtime,
+            self.fix_runtime,
+        )
+        for runtime in cancellable_runtimes:
+            cancel = getattr(runtime, "cancel", None)
+            if not callable(cancel):
+                continue
             try:
                 cancel(job_ref)
             except Exception:
@@ -340,6 +519,8 @@ class AnnotationWorker:
         # in this window has unknown durable side effects and must not become a
         # Web-retryable/cancellable failure.
         tracking_ledger_closure_pending = False
+        postprocessing_ledger_closure_pending = False
+        publication_ledger_closure_pending = False
         try:
             capacity = await asyncio.to_thread(
                 self.preflight_capacity,
@@ -696,6 +877,544 @@ class AnnotationWorker:
                     manifest=manifest,
                 )
                 tracking_ledger_closure_pending = False
+            elif run["kind"] == "postprocessing":
+                from vla_data_juicer_agents.annotation.postprocessing_runtime import (
+                    PostprocessingRequest,
+                    PostprocessingSegmentInput,
+                    PublicationItem,
+                )
+                from vla_data_juicer_agents.annotation.runtime import (
+                    RuntimeExecutionError,
+                    RuntimeStepEvent,
+                    _sha256_file,
+                    _tree_sha256,
+                )
+                from vla_data_juicer_agents.annotation.trajectory_evidence import (
+                    build_trajectory_revision_state,
+                )
+
+                if (
+                    self.postprocessing_runtime is None
+                    or self.postprocessing_publisher is None
+                ):
+                    raise RuntimeExecutionError(
+                        "annotation_runtime_unavailable",
+                        "The M2 postprocessing Runtime is unavailable.",
+                    )
+                inputs = await asyncio.to_thread(
+                    self.store.postprocessing_inputs,
+                    run["job_id"],
+                )
+                publisher_preflight = getattr(
+                    self.postprocessing_publisher,
+                    "preflight",
+                    None,
+                )
+                if not callable(publisher_preflight):
+                    raise RuntimeExecutionError(
+                        "annotation_runtime_unavailable",
+                        "The M2 publication Runtime is unavailable.",
+                    )
+                await _maybe_await_in_thread(publisher_preflight)
+
+                def observe_postprocessing_step(event: RuntimeStepEvent) -> None:
+                    try:
+                        if event.status == "started":
+                            self.store.start_runtime_step(
+                                run_id=run["run_id"],
+                                safe_step_code=event.safe_step_code,
+                            )
+                        else:
+                            self.store.finish_runtime_step(
+                                run_id=run["run_id"],
+                                safe_step_code=event.safe_step_code,
+                                status=event.status,
+                                return_code=event.return_code,
+                                diagnostic_kind=event.diagnostic_kind,
+                            )
+                    except Exception as exc:
+                        raise RuntimeExecutionError(
+                            "recovery_required",
+                            "Runtime step evidence could not be committed.",
+                        ) from exc
+
+                segment_inputs: list[PostprocessingSegmentInput] = []
+                private_by_ref: dict[str, dict[str, Any]] = {}
+                for segment in inputs["segments"]:
+                    segment_root = Path(segment["private_segment_root"])
+                    tree_sha256 = await asyncio.to_thread(
+                        _tree_sha256,
+                        segment_root,
+                        unsafe_code="tracked_staging_changed",
+                    )
+                    segment_inputs.append(
+                        PostprocessingSegmentInput(
+                            segment_ref=segment["segment_ref"],
+                            source_clip=segment["source_clip"],
+                            private_segment_key=segment[
+                                "private_segment_key"
+                            ],
+                            tracked_segment_root=segment_root,
+                            expected_tree_sha256=tree_sha256,
+                            tracking_identities=tuple(
+                                segment["tracking_identities"]
+                            ),
+                        )
+                    )
+                    private_by_ref[segment["segment_ref"]] = segment
+                spec = inputs["spec"]
+                request = PostprocessingRequest(
+                    job_ref=inputs["job_ref"],
+                    run_ref=run["run_ref"],
+                    attempt=run["attempt"],
+                    dataset_date=inputs["dataset_date"],
+                    tracked_staging_root=Path(
+                        inputs["tracked_staging_root"],
+                    ),
+                    segments=tuple(segment_inputs),
+                    gridmap_decision=spec["gridmap_decision"],
+                    localization_kind=spec["localization_kind"],
+                    trajectory_variant=spec["trajectory_variant"],
+                    expected_runtime_manifest_sha256=inputs[
+                        "runtime_manifest_sha256"
+                    ],
+                    expected_prepared_artifact_tree_sha256=inputs[
+                        "prepared_artifact_tree_sha256"
+                    ],
+                    step_observer=observe_postprocessing_step,
+                )
+                runtime_result = _plain(
+                    await _maybe_await_in_thread(
+                        self.postprocessing_runtime.run,
+                        request,
+                    )
+                )
+                if runtime_result.get("runtime_manifest_sha256") != inputs[
+                    "runtime_manifest_sha256"
+                ]:
+                    raise RuntimeError(
+                        "postprocessing Runtime manifest attestation mismatch"
+                    )
+                candidates = [
+                    _plain(item)
+                    for item in runtime_result.get("trajectories", ())
+                ]
+                expected_refs = [
+                    segment["segment_ref"] for segment in inputs["segments"]
+                ]
+                if [item.get("segment_ref") for item in candidates] != expected_refs:
+                    raise RuntimeError(
+                        "postprocessing Runtime result scope mismatch"
+                    )
+                publication_items: list[PublicationItem] = []
+                for source_clip in dict.fromkeys(
+                    segment["source_clip"] for segment in inputs["segments"]
+                ):
+                    candidate_root = (
+                        Path(runtime_result["final_candidate_root"])
+                        / source_clip
+                    )
+                    publication_items.append(
+                        PublicationItem(
+                            source_clip=source_clip,
+                            candidate_root=candidate_root,
+                            expected_tree_sha256=await asyncio.to_thread(
+                                _tree_sha256,
+                                candidate_root,
+                                unsafe_code="unsafe_runtime_output",
+                            ),
+                        )
+                    )
+                attempt_root = Path(runtime_result["attempt_root"])
+                journal_parent = attempt_root.parent / "publication-journals"
+                journal_parent.mkdir(mode=0o700, exist_ok=True)
+                journal_root = journal_parent / run["run_ref"]
+                journal_root.mkdir(mode=0o700)
+
+                def publish_candidates() -> Any:
+                    with navigation_writer_lock(
+                        lock_path=self._writer_lock_path(),
+                    ):
+                        return self.postprocessing_publisher.publish(
+                            job_ref=inputs["job_ref"],
+                            run_ref=run["run_ref"],
+                            dataset_date=inputs["dataset_date"],
+                            items=tuple(publication_items),
+                            journal_root=journal_root,
+                        )
+
+                publication = _plain(
+                    await asyncio.to_thread(publish_candidates),
+                )
+                postprocessing_ledger_closure_pending = True
+                trajectory_results: list[dict[str, Any]] = []
+                revision_set: list[dict[str, str]] = []
+                for candidate in candidates:
+                    segment_ref = str(candidate["segment_ref"])
+                    private = private_by_ref[segment_ref]
+                    candidate_root = Path(candidate["candidate_segment_root"])
+                    artifact_sha256 = await asyncio.to_thread(
+                        _tree_sha256,
+                        candidate_root,
+                        unsafe_code="unsafe_runtime_output",
+                    )
+                    compatibility_root = (
+                        Path(self.postprocessing_publisher.finish_data_root)
+                        / inputs["dataset_date"]
+                        / private["source_clip"]
+                        / private["private_segment_key"]
+                    )
+                    compatibility_sha256 = await asyncio.to_thread(
+                        _tree_sha256,
+                        compatibility_root,
+                        unsafe_code="publication_target_unsafe",
+                    )
+                    if compatibility_sha256 != artifact_sha256:
+                        raise RuntimeError(
+                            "published postprocessing segment differs from candidate"
+                        )
+                    state = await asyncio.to_thread(
+                        build_trajectory_revision_state,
+                        candidate_root,
+                        target_bindings=private["target_bindings"],
+                    )
+                    state_sha256 = hashlib.sha256(
+                        json.dumps(
+                            state,
+                            ensure_ascii=False,
+                            sort_keys=True,
+                            separators=(",", ":"),
+                        ).encode("utf-8")
+                    ).hexdigest()
+                    trajectory_results.append(
+                        {
+                            "segment_ref": segment_ref,
+                            "state": state,
+                            "content_sha256": state_sha256,
+                            "private_artifact_path": str(candidate_root),
+                            "private_compatibility_path": str(
+                                compatibility_root,
+                            ),
+                            "artifact_sha256": artifact_sha256,
+                            "artifact_manifest_ref": None,
+                        }
+                    )
+                    revision_set.append(
+                        {
+                            "segment_ref": segment_ref,
+                            "annotation_revision_sha256": private[
+                                "annotation_revision_sha256"
+                            ],
+                            "trajectory_sha256": str(
+                                candidate["trajectory_sha256"]
+                            ),
+                            "artifact_sha256": artifact_sha256,
+                        }
+                    )
+                command_steps = list(runtime_result.get("command_steps", ()))
+                manifest = {
+                    "runtime_manifest_sha256": runtime_result[
+                        "runtime_manifest_sha256"
+                    ],
+                    "postprocessing_spec_sha256": spec["content_sha256"],
+                    "plan_sha256": spec["plan_sha256"],
+                    "observations_sha256": spec["observations_sha256"],
+                    "input_tree_sha256": runtime_result["input_tree_sha256"],
+                    "candidate_tree_sha256": runtime_result[
+                        "candidate_tree_sha256"
+                    ],
+                    "command_steps": command_steps,
+                    "revision_set": revision_set,
+                    "publication": {
+                        "source_clips": list(
+                            publication.get(
+                                "committed_source_clips",
+                                (),
+                            )
+                        ),
+                        "journal_sha256": _sha256_file(
+                            Path(publication["journal_path"])
+                        ),
+                    },
+                }
+                await asyncio.to_thread(
+                    self.store.complete_postprocessing_run,
+                    run_id=run["run_id"],
+                    trajectories=trajectory_results,
+                    manifest=manifest,
+                )
+                postprocessing_ledger_closure_pending = False
+            elif run["kind"] == "fix":
+                from vla_data_juicer_agents.annotation.fix_runtime import (
+                    FixRequest,
+                )
+                from vla_data_juicer_agents.annotation.runtime import (
+                    CalibrationSnapshotFile,
+                    RuntimeExecutionError,
+                    RuntimeStepEvent,
+                    _sha256_file,
+                    _tree_sha256,
+                )
+
+                if self.fix_runtime is None:
+                    raise RuntimeExecutionError(
+                        "annotation_runtime_unavailable",
+                        "The M2 Fix Runtime is unavailable.",
+                    )
+                inputs = await asyncio.to_thread(
+                    self.store.fix_run_inputs,
+                    run["run_id"],
+                )
+
+                def observe_fix_step(event: RuntimeStepEvent) -> None:
+                    try:
+                        if event.status == "started":
+                            self.store.start_runtime_step(
+                                run_id=run["run_id"],
+                                safe_step_code=event.safe_step_code,
+                            )
+                        else:
+                            self.store.finish_runtime_step(
+                                run_id=run["run_id"],
+                                safe_step_code=event.safe_step_code,
+                                status=event.status,
+                                return_code=event.return_code,
+                                diagnostic_kind=event.diagnostic_kind,
+                            )
+                    except Exception as exc:
+                        raise RuntimeExecutionError(
+                            "recovery_required",
+                            "Runtime step evidence could not be committed.",
+                        ) from exc
+
+                request = FixRequest(
+                    review_ref=inputs["review_ref"],
+                    run_ref=run["run_ref"],
+                    attempt=run["attempt"],
+                    base_segment_root=Path(
+                        inputs["base_artifact_path"],
+                    ),
+                    expected_base_tree_sha256=inputs[
+                        "base_artifact_sha256"
+                    ],
+                    calibration_snapshot_ref=inputs[
+                        "calibration_snapshot_ref"
+                    ],
+                    calibration_snapshot_dir=Path(
+                        inputs["calibration_snapshot_dir"],
+                    ),
+                    calibration_snapshot_files=tuple(
+                        CalibrationSnapshotFile(
+                            relative_path=str(item["relative_path"]),
+                            size=int(item["size"]),
+                            sha256=str(item["sha256"]),
+                        )
+                        for item in inputs["calibration_snapshot_files"]
+                    ),
+                    calibration_snapshot_sha256=inputs[
+                        "calibration_snapshot_sha256"
+                    ],
+                    target_bindings={
+                        str(key): str(value)
+                        for key, value in inputs["target_bindings"].items()
+                    },
+                    commands=tuple(
+                        dict(command) for command in inputs["commands"]
+                    ),
+                    expected_runtime_manifest_sha256=inputs[
+                        "runtime_manifest_sha256"
+                    ],
+                    step_observer=observe_fix_step,
+                )
+                runtime_result = _plain(
+                    await _maybe_await_in_thread(
+                        self.fix_runtime.run,
+                        request,
+                    )
+                )
+                if runtime_result.get("runtime_manifest_sha256") != inputs[
+                    "runtime_manifest_sha256"
+                ]:
+                    raise RuntimeError(
+                        "Fix Runtime manifest attestation mismatch"
+                    )
+                candidate_root = Path(
+                    runtime_result["candidate_segment_root"],
+                )
+                candidate_tree_sha256 = await asyncio.to_thread(
+                    _tree_sha256,
+                    candidate_root,
+                    unsafe_code="unsafe_runtime_output",
+                )
+                output_path = Path(runtime_result["fix_trajectory_path"])
+                fix_trajectory_sha256 = await asyncio.to_thread(
+                    _sha256_file,
+                    output_path,
+                )
+                if (
+                    fix_trajectory_sha256
+                    != runtime_result["fix_trajectory_sha256"]
+                    or output_path.parent != candidate_root
+                ):
+                    raise RuntimeError("Fix Runtime output attestation mismatch")
+                command_steps = list(
+                    runtime_result.get("command_steps", ()),
+                )
+                manifest = {
+                    "runtime_manifest_sha256": runtime_result[
+                        "runtime_manifest_sha256"
+                    ],
+                    "trajectory_revision_ref": inputs[
+                        "trajectory_revision_ref"
+                    ],
+                    "base_tree_sha256": runtime_result[
+                        "base_tree_sha256"
+                    ],
+                    "calibration_snapshot_sha256": runtime_result[
+                        "calibration_snapshot_sha256"
+                    ],
+                    "draft_sha256": inputs["draft_sha256"],
+                    "command_log_sha256": runtime_result[
+                        "command_log_sha256"
+                    ],
+                    "adapter_sha256": runtime_result["adapter_sha256"],
+                    "candidate_tree_sha256": candidate_tree_sha256,
+                    "fix_trajectory_sha256": fix_trajectory_sha256,
+                    "command_steps": command_steps,
+                    "revision_set": [
+                        {
+                            "review_ref": inputs["review_ref"],
+                            "segment_ref": inputs["segment_ref"],
+                            "planned_revision_ref": inputs[
+                                "planned_revision_ref"
+                            ],
+                            "source_draft_revision": inputs[
+                                "source_draft_revision"
+                            ],
+                        }
+                    ],
+                }
+                await asyncio.to_thread(
+                    self.store.complete_fix_run,
+                    run_id=run["run_id"],
+                    candidate_segment_root=str(candidate_root),
+                    candidate_tree_sha256=candidate_tree_sha256,
+                    fix_trajectory_sha256=fix_trajectory_sha256,
+                    manifest=manifest,
+                )
+            elif run["kind"] == "compatibility_publish":
+                from vla_data_juicer_agents.annotation.models import (
+                    CompatibilityPublicationResult,
+                )
+                from vla_data_juicer_agents.annotation.runtime import (
+                    RuntimeExecutionError,
+                    _ensure_private_directory_chain,
+                    _sha256_file,
+                    _tree_sha256,
+                )
+
+                if self.fix_publisher is None:
+                    raise RuntimeExecutionError(
+                        "annotation_runtime_unavailable",
+                        "The Fix compatibility publisher is unavailable.",
+                    )
+                publish_bound = getattr(
+                    self.fix_publisher,
+                    "publish_bound_revision",
+                    None,
+                )
+                if not callable(publish_bound):
+                    raise RuntimeExecutionError(
+                        "annotation_runtime_unavailable",
+                        "The Fix compatibility publisher is not store-bound.",
+                    )
+                inputs = await asyncio.to_thread(
+                    self.store.compatibility_publication_inputs,
+                    run["run_id"],
+                )
+                writer_lock_path = self._writer_lock_path()
+                if writer_lock_path is None:
+                    raise RuntimeExecutionError(
+                        "annotation_runtime_unavailable",
+                        "The Fix compatibility writer lock is unavailable.",
+                    )
+                candidate_root = Path(
+                    inputs["candidate_segment_root"],
+                )
+                journal_root = _ensure_private_directory_chain(
+                    candidate_root.parent,
+                    (
+                        "publication-journals",
+                        inputs["publication_ref"],
+                    ),
+                )
+                await asyncio.to_thread(
+                    self.store.start_runtime_step,
+                    run_id=run["run_id"],
+                    safe_step_code="fix_compatibility_publish",
+                )
+                raw_publication = await _maybe_await_in_thread(
+                    publish_bound,
+                    review_ref=inputs["review_ref"],
+                    revision_ref=inputs["fix_revision_ref"],
+                    candidate_segment_root=candidate_root,
+                    expected_candidate_tree_sha256=inputs[
+                        "candidate_tree_sha256"
+                    ],
+                    expected_fix_sha256=inputs["fix_content_sha256"],
+                    target_segment_root=Path(
+                        inputs["target_segment_root"],
+                    ),
+                    journal_root=journal_root,
+                    writer_lock_path=writer_lock_path,
+                )
+                publication = CompatibilityPublicationResult.model_validate(
+                    raw_publication,
+                )
+                published_path = Path(publication.private_artifact_path)
+                if (
+                    published_path.parent
+                    != Path(inputs["target_segment_root"])
+                    or await asyncio.to_thread(
+                        _sha256_file,
+                        published_path,
+                    )
+                    != publication.content_sha256
+                    or publication.content_sha256
+                    != inputs["fix_content_sha256"]
+                ):
+                    raise RuntimeError(
+                        "Fix compatibility publication attestation mismatch"
+                    )
+                await asyncio.to_thread(
+                    self.store.finish_runtime_step,
+                    run_id=run["run_id"],
+                    safe_step_code="fix_compatibility_publish",
+                    status="succeeded",
+                    return_code=0,
+                )
+                manifest = {
+                    "fix_revision_ref": inputs["fix_revision_ref"],
+                    "candidate_tree_sha256": inputs[
+                        "candidate_tree_sha256"
+                    ],
+                    "content_sha256": publication.content_sha256,
+                    "journal_tree_sha256": await asyncio.to_thread(
+                        _tree_sha256,
+                        journal_root,
+                        unsafe_code="publication_journal_unsafe",
+                    ),
+                    "command_steps": ["fix_compatibility_publish"],
+                }
+                publication_ledger_closure_pending = True
+                await asyncio.to_thread(
+                    self.store.complete_compatibility_publication,
+                    run_id=run["run_id"],
+                    content_sha256=publication.content_sha256,
+                    private_artifact_path=publication.private_artifact_path,
+                    manifest=manifest,
+                )
+                publication_ledger_closure_pending = False
             else:
                 raise RuntimeError("unsupported annotation runtime run kind")
         except Exception as exc:
@@ -712,6 +1431,42 @@ class AnnotationWorker:
                     "Tracking output ledger closure requires operator recovery.",
                     private_detail=(
                         "A Tracking output was published before its durable "
+                        f"ledger closure failed ({type(exc).__name__})."
+                    ),
+                )
+                recovery_error.__cause__ = exc
+                exc = recovery_error
+            if (
+                publication_ledger_closure_pending
+                and not _is_runtime_cancellation(exc)
+            ):
+                from vla_data_juicer_agents.annotation.runtime import (
+                    RuntimeExecutionError,
+                )
+
+                recovery_error = RuntimeExecutionError(
+                    "recovery_required",
+                    "Published Fix output requires durable ledger recovery.",
+                    private_detail=(
+                        "A Fix compatibility file was published before its "
+                        f"durable ledger closure failed ({type(exc).__name__})."
+                    ),
+                )
+                recovery_error.__cause__ = exc
+                exc = recovery_error
+            if (
+                postprocessing_ledger_closure_pending
+                and not _is_runtime_cancellation(exc)
+            ):
+                from vla_data_juicer_agents.annotation.runtime import (
+                    RuntimeExecutionError,
+                )
+
+                recovery_error = RuntimeExecutionError(
+                    "recovery_required",
+                    "Published postprocessing output requires operator recovery.",
+                    private_detail=(
+                        "Compatibility output was published before its durable "
                         f"ledger closure failed ({type(exc).__name__})."
                     ),
                 )
@@ -881,10 +1636,14 @@ class AnnotationWorker:
             self.request_cancel(run["job_ref"], reason="heartbeat_failed")
 
 
-async def _maybe_await_in_thread(callable_: Any, *args: Any) -> Any:
+async def _maybe_await_in_thread(
+    callable_: Any,
+    *args: Any,
+    **kwargs: Any,
+) -> Any:
     if inspect.iscoroutinefunction(callable_):
-        return await callable_(*args)
-    result = await asyncio.to_thread(callable_, *args)
+        return await callable_(*args, **kwargs)
+    result = await asyncio.to_thread(callable_, *args, **kwargs)
     if inspect.isawaitable(result):
         return await result
     return result
@@ -946,6 +1705,12 @@ def _safe_runtime_failure(exc: Exception) -> tuple[str, str, bool]:
         )
     if class_name == "RuntimeExecutionError":
         error_code = getattr(exc, "code", "")
+        if error_code == "annotation_runtime_unavailable":
+            return (
+                "annotation_runtime_unavailable",
+                "The annotation runtime is unavailable.",
+                True,
+            )
         if error_code in {
             "runtime_input_changed",
             "runtime_manifest_changed",

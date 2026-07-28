@@ -76,9 +76,13 @@ EXECUTION_TOOL_NAMES = {
     "run_noobscene_preprocessing_tool",
     "run_initial_annotation_gui_tool",
     "run_tracking_tool",
+    "run_annotation_tracking_workflow_tool",
     "prepare_gridmap_for_projection_tool",
     "run_projection_and_trajectory_tool",
+    "run_annotation_postprocessing_workflow_tool",
     "validate_navigation_outputs_tool",
+    "open_trajectory_fix_workbench_tool",
+    "validate_trajectory_review_outcome_tool",
 }
 GENERIC_OR_RESET_TOOL_NAMES = {"bash", "read", "task", "reset_tools"}
 

@@ -242,7 +242,7 @@ async def test_bootstrap_injects_navigation_guidance_once_and_never_into_router(
     assert guidance_marker not in router_prompt
     assert navigation_prompt.count(guidance_marker) == 1
     assert navigation_prompt.count("## Product dependency map") == 1
-    assert navigation_prompt.count("## Four bounded few-shots") == 1
+    assert navigation_prompt.count("## Six bounded few-shots") == 1
     assert navigation_prompt.count("### Few-shot 4: invalid complete Plan") == 1
 
 

@@ -216,6 +216,24 @@ class StartNavigationDataTaskV1Tool(_RouterToolBase):
                     "context did not explicitly provide indoor/outdoor information."
                 ),
             },
+            "requested_outcome": {
+                "type": "string",
+                "enum": [
+                    "auto",
+                    "extract_sync",
+                    "postprocessing",
+                    "postprocessing_and_fix",
+                    "trajectory_fix",
+                ],
+                "description": (
+                    "The user's requested product outcome, not an implementation "
+                    "step. Use postprocessing for automatic annotation through "
+                    "trajectory generation, postprocessing_and_fix only when the "
+                    "same request explicitly includes Fix, and trajectory_fix only "
+                    "for an existing completed postprocessing scope."
+                ),
+                "default": "auto",
+            },
         },
         "required": ["scope_source", "dataset_date", "selection"],
         "additionalProperties": False,
@@ -227,6 +245,7 @@ class StartNavigationDataTaskV1Tool(_RouterToolBase):
         dataset_date: str,
         selection: dict[str, Any],
         scene_mode: str | None = None,
+        requested_outcome: str = "auto",
     ) -> ToolChunk:
         try:
             result = await self._runtime.start_navigation_agent_task_v1(
@@ -236,6 +255,7 @@ class StartNavigationDataTaskV1Tool(_RouterToolBase):
                 dataset_date=dataset_date,
                 selection=dict(selection),
                 scene_mode=scene_mode,
+                requested_outcome=requested_outcome,
             )
         except Exception as exc:
             return _tool_chunk(

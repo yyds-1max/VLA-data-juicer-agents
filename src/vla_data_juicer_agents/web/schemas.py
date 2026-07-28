@@ -149,7 +149,11 @@ class NavigationDatasetSelectionContextV1(BaseModel):
 
 class CreateSessionRequest(BaseModel):
     message: str
-    entrypoint: Literal["chat", "data_management_shortcut"] = "chat"
+    entrypoint: Literal[
+        "chat",
+        "data_management_shortcut",
+        "annotation_processing_shortcut",
+    ] = "chat"
     request_context: NavigationDatasetSelectionContextV1 | None = None
 
     @field_validator("message")
@@ -162,10 +166,14 @@ class CreateSessionRequest(BaseModel):
 
     @model_validator(mode="after")
     def shortcut_context_matches_entrypoint(self) -> "CreateSessionRequest":
-        if self.entrypoint == "data_management_shortcut" and self.request_context is None:
-            raise ValueError("data_management_shortcut requires request_context")
+        if (
+            self.entrypoint
+            in {"data_management_shortcut", "annotation_processing_shortcut"}
+            and self.request_context is None
+        ):
+            raise ValueError(f"{self.entrypoint} requires request_context")
         if self.entrypoint == "chat" and self.request_context is not None:
-            raise ValueError("request_context is only accepted for data_management_shortcut")
+            raise ValueError("request_context is only accepted for a trusted shortcut")
         return self
 
 

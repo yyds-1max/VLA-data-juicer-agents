@@ -26,7 +26,10 @@ from vla_data_juicer_agents.annotation.models import (
     AnnotationNotFoundError,
     AnnotationValidationError,
 )
-from vla_data_juicer_agents.annotation.store import AnnotationStore
+from vla_data_juicer_agents.annotation.store import (
+    AnnotationStore,
+    migrate_annotation_store_offline,
+)
 from vla_data_juicer_agents.navigation.writer_lock import (
     NavigationWriterLockError,
     NavigationWriterQuarantinedError,
@@ -136,6 +139,20 @@ def build_parser() -> argparse.ArgumentParser:
     confirm_job.add_argument("--confirmation", required=True)
     confirm_job.add_argument("--operator-reference", required=True)
     confirm_job.add_argument("--idempotency-key", required=True)
+
+    migrate_schema = subparsers.add_parser(
+        "migrate-schema",
+        help=(
+            "Back up and migrate the stopped Annotation database, then run "
+            "foreign-key and integrity checks."
+        ),
+    )
+    migrate_schema.add_argument(
+        "--backup-root",
+        type=Path,
+        required=True,
+        help="New private backup directory beside annotation.sqlite.",
+    )
     return parser
 
 
@@ -242,7 +259,7 @@ def _safe_job_result(job: dict[str, Any]) -> dict[str, Any]:
     if (
         not isinstance(job_ref, str)
         or _JOB_REF.fullmatch(job_ref) is None
-        or status not in {"preparing", "tracking", "cancelled"}
+        or status not in {"preparing", "tracking", "postprocessing", "cancelled"}
         or not isinstance(state_revision, int)
         or isinstance(state_revision, bool)
         or state_revision < 0
@@ -314,8 +331,38 @@ def _execute(args: argparse.Namespace) -> dict[str, Any]:
         annotation_db,
         writer_lock,
     )
+    backup_root: Path | None = None
+    if args.command == "migrate-schema":
+        backup_root = Path(args.backup_root)
+        if (
+            not backup_root.is_absolute()
+            or backup_root.parent != annotation_db.parent
+            or re.fullmatch(
+                r"annotation-migration-backup-[A-Za-z0-9._-]{1,100}",
+                backup_root.name,
+            )
+            is None
+        ):
+            raise _OperatorScopeError(
+                "the annotation migration backup is outside production scope",
+            )
 
-    with acquire_annotation_maintenance(annotation_db):
+    with acquire_annotation_maintenance(annotation_db) as maintenance_lease:
+        if args.command == "migrate-schema":
+            assert backup_root is not None
+            migrated = migrate_annotation_store_offline(
+                annotation_db,
+                backup_root=backup_root,
+                maintenance_lease=maintenance_lease,
+            )
+            return {
+                "status": migrated["status"],
+                "from_version": migrated["from_version"],
+                "to_version": migrated["to_version"],
+                "backup_manifest_sha256": migrated[
+                    "backup_manifest_sha256"
+                ],
+            }
         if args.command == "list-recovery":
             return _list_recovery(
                 annotation_db=annotation_db,

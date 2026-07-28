@@ -75,6 +75,7 @@ def test_router_v1_start_schema_uses_one_canonical_scope_contract() -> None:
         "dataset_date",
         "selection",
         "scene_mode",
+        "requested_outcome",
     }
     assert schema["required"] == ["scope_source", "dataset_date", "selection"]
     assert schema["additionalProperties"] is False
@@ -84,6 +85,13 @@ def test_router_v1_start_schema_uses_one_canonical_scope_contract() -> None:
     ]
     assert schema["properties"]["dataset_date"]["pattern"] == "^[0-9]{8}$"
     assert schema["properties"]["scene_mode"]["enum"] == ["indoor", "outdoor"]
+    assert schema["properties"]["requested_outcome"]["enum"] == [
+        "auto",
+        "extract_sync",
+        "postprocessing",
+        "postprocessing_and_fix",
+        "trajectory_fix",
+    ]
     selection = schema["properties"]["selection"]
     assert selection["type"] == "object"
     assert "oneOf" not in selection
@@ -158,6 +166,16 @@ def test_router_prompt_treats_cross_date_clip_prefix_as_opaque() -> None:
     assert "permission to reinterpret the request" in prompt
 
 
+def test_router_prompt_routes_product_outcome_and_linked_fix_without_new_tools() -> None:
+    prompt = main_router_v1_prompt()
+
+    assert "`postprocessing` for \"自动标注\"" in prompt
+    assert "`postprocessing_and_fix` only when" in prompt
+    assert "Never start a standalone" in prompt
+    assert "completed task exposes `continue_fix`" in prompt
+    assert "never reopens the completed parent" in prompt
+
+
 def test_router_v1_continue_and_control_schemas_do_not_expose_runtime_identity() -> None:
     continue_schema = ContinueNavigationDataTaskV1Tool.input_schema
     control_schema = ControlNavigationDataTaskV1Tool.input_schema
@@ -225,6 +243,7 @@ def test_router_v1_tools_forward_only_the_new_runtime_contract() -> None:
                 "clips": ["clip_a", "clip_b"],
             },
             "scene_mode": "outdoor",
+            "requested_outcome": "auto",
         }
     ]
     assert runtime.continues == [

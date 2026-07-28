@@ -189,9 +189,24 @@ cases:
     sample_id: nav_20260605_160904_zhigu_wuhan_0
     artifact_root_kind: finish_date
     artifact_scope: "20260605_160904_zhigu_wuhan_0"
+    role_scopes:
+      legacy:
+        scope_kind: postprocessing_segment
+        artifact_scope: "20260605_160904_zhigu_wuhan_0"
+        dataset_date: "20260605"
+        source_clip: "20260605_160904"
+        internal_segment: "20260605_160904_zhigu_wuhan_0"
+        provenance: historical_unattested
+      candidate:
+        scope_kind: postprocessing_segment
+        artifact_scope: "20260605_160904_zhigu_wuhan_0"
+        dataset_date: "20270605"
+        source_clip: "20260605_160904"
+        internal_segment: "20260605_160904_zhigu_wuhan_0"
+        provenance: runtime_attested
     root_expectations:
       - modality: trajectory
-        relative_pattern: "*_trajectory_five.json"
+        relative_pattern: "*_trajectory.json"
         present: true
     applicable_stages:
       - projection
@@ -205,18 +220,38 @@ cases:
       - tracking
       - fix
     expected_command_steps:
-      - processing_calibration_snapshot
-      - projection
-      - world_coordinates
-      - motion
-      - gridmap_transform
-      - trajectory_0525
-      - publish
+      - postprocess_input_snapshot
+      - postprocess_metadata
+      - postprocess_gridmap
+      - postprocess_projection
+      - postprocess_world_coordinates
+      - postprocess_speed_direction
+      - postprocess_gridmap_transform
+      - postprocess_trajectory
+      - postprocess_final_candidate
+      - postprocess_validate_outputs
+    candidate_attestation_required: true
+    legacy_oracle_selection_required: true
 
   - id: m2_fix_20260605_160904
     sample_id: nav_20260605_160904_zhigu_wuhan_0
     artifact_root_kind: finish_date
     artifact_scope: "20260605_160904_zhigu_wuhan_0"
+    role_scopes:
+      legacy:
+        scope_kind: fix_segment
+        artifact_scope: "20260605_160904_zhigu_wuhan_0"
+        dataset_date: "20260605"
+        source_clip: "20260605_160904"
+        internal_segment: "20260605_160904_zhigu_wuhan_0"
+        provenance: historical_unattested
+      candidate:
+        scope_kind: fix_segment
+        artifact_scope: "20260605_160904_zhigu_wuhan_0"
+        dataset_date: "20270605"
+        source_clip: "20260605_160904"
+        internal_segment: "20260605_160904_zhigu_wuhan_0"
+        provenance: runtime_attested
     root_expectations:
       - modality: trajectory_fix
         relative_pattern: "*_trajectory_fix_five.json"
@@ -230,10 +265,9 @@ cases:
       - projection
       - publish
     expected_command_steps:
-      - human_review_boundary
-      - fix_calibration_snapshot
-      - fix_trajectory_0525
-      - review_decision
+      - fix_candidate
+    candidate_attestation_required: true
+    legacy_oracle_selection_required: true
 
   - id: m1_tracking_20260623_145550
     sample_id: nav_20260623_145550_zhigu_wuhan_0
@@ -591,9 +625,24 @@ cases:
     sample_id: nav_20260623_145550_zhigu_wuhan_0
     artifact_root_kind: finish_date
     artifact_scope: "20260623_145550_zhigu_wuhan_0"
+    role_scopes:
+      legacy:
+        scope_kind: postprocessing_segment
+        artifact_scope: "20260623_145550_zhigu_wuhan_0"
+        dataset_date: "20260623"
+        source_clip: "20260623_145550"
+        internal_segment: "20260623_145550_zhigu_wuhan_0"
+        provenance: historical_unattested
+      candidate:
+        scope_kind: postprocessing_segment
+        artifact_scope: "20260623_145550_zhigu_wuhan_0"
+        dataset_date: "20270623"
+        source_clip: "20260623_145550"
+        internal_segment: "20260623_145550_zhigu_wuhan_0"
+        provenance: runtime_attested
     root_expectations:
       - modality: trajectory
-        relative_pattern: "*_trajectory_five.json"
+        relative_pattern: "*_trajectory.json"
         present: true
     applicable_stages:
       - projection
@@ -607,18 +656,218 @@ cases:
       - tracking
       - fix
     expected_command_steps:
-      - processing_calibration_snapshot
-      - projection
-      - world_coordinates
-      - motion
-      - gridmap_transform
-      - trajectory_0525
-      - publish
+      - postprocess_input_snapshot
+      - postprocess_metadata
+      - postprocess_gridmap
+      - postprocess_projection
+      - postprocess_world_coordinates
+      - postprocess_speed_direction
+      - postprocess_gridmap_transform
+      - postprocess_trajectory
+      - postprocess_final_candidate
+      - postprocess_validate_outputs
+    candidate_attestation_required: true
+    legacy_oracle_selection_required: true
+
+  - id: m2_postprocess_20260623_145550_segment_1
+    artifact_root_kind: finish_date
+    artifact_scope: "20260623_145550_zhigu_wuhan_1"
+    role_scopes:
+      legacy:
+        scope_kind: postprocessing_segment
+        artifact_scope: "20260623_145550_zhigu_wuhan_1"
+        dataset_date: "20260623"
+        source_clip: "20260623_145550"
+        internal_segment: "20260623_145550_zhigu_wuhan_1"
+        provenance: historical_unattested
+      candidate:
+        scope_kind: postprocessing_segment
+        artifact_scope: "20260623_145550_zhigu_wuhan_1"
+        dataset_date: "20270623"
+        source_clip: "20260623_145550"
+        internal_segment: "20260623_145550_zhigu_wuhan_1"
+        provenance: runtime_attested
+    root_expectations:
+      - {modality: trajectory, relative_pattern: "*_trajectory.json", present: true}
+    applicable_stages: [projection, world_coordinates, motion, gridmap_transform, trajectory, publish]
+    excluded_stages: [initial_annotation, tracking, fix]
+    expected_command_steps:
+      - postprocess_input_snapshot
+      - postprocess_metadata
+      - postprocess_gridmap
+      - postprocess_projection
+      - postprocess_world_coordinates
+      - postprocess_speed_direction
+      - postprocess_gridmap_transform
+      - postprocess_trajectory
+      - postprocess_final_candidate
+      - postprocess_validate_outputs
+    candidate_attestation_required: true
+    legacy_oracle_selection_required: true
+
+  - id: m2_postprocess_20260623_145550_segment_2
+    artifact_root_kind: finish_date
+    artifact_scope: "20260623_145550_zhigu_wuhan_2"
+    role_scopes:
+      legacy:
+        scope_kind: postprocessing_segment
+        artifact_scope: "20260623_145550_zhigu_wuhan_2"
+        dataset_date: "20260623"
+        source_clip: "20260623_145550"
+        internal_segment: "20260623_145550_zhigu_wuhan_2"
+        provenance: historical_unattested
+      candidate:
+        scope_kind: postprocessing_segment
+        artifact_scope: "20260623_145550_zhigu_wuhan_2"
+        dataset_date: "20270623"
+        source_clip: "20260623_145550"
+        internal_segment: "20260623_145550_zhigu_wuhan_2"
+        provenance: runtime_attested
+    root_expectations:
+      - {modality: trajectory, relative_pattern: "*_trajectory.json", present: true}
+    applicable_stages: [projection, world_coordinates, motion, gridmap_transform, trajectory, publish]
+    excluded_stages: [initial_annotation, tracking, fix]
+    expected_command_steps:
+      - postprocess_input_snapshot
+      - postprocess_metadata
+      - postprocess_gridmap
+      - postprocess_projection
+      - postprocess_world_coordinates
+      - postprocess_speed_direction
+      - postprocess_gridmap_transform
+      - postprocess_trajectory
+      - postprocess_final_candidate
+      - postprocess_validate_outputs
+    candidate_attestation_required: true
+    legacy_oracle_selection_required: true
+
+  - id: m2_postprocess_20260623_145550_segment_3
+    artifact_root_kind: finish_date
+    artifact_scope: "20260623_145550_zhigu_wuhan_3"
+    role_scopes:
+      legacy:
+        scope_kind: postprocessing_segment
+        artifact_scope: "20260623_145550_zhigu_wuhan_3"
+        dataset_date: "20260623"
+        source_clip: "20260623_145550"
+        internal_segment: "20260623_145550_zhigu_wuhan_3"
+        provenance: historical_unattested
+      candidate:
+        scope_kind: postprocessing_segment
+        artifact_scope: "20260623_145550_zhigu_wuhan_3"
+        dataset_date: "20270623"
+        source_clip: "20260623_145550"
+        internal_segment: "20260623_145550_zhigu_wuhan_3"
+        provenance: runtime_attested
+    root_expectations:
+      - {modality: trajectory, relative_pattern: "*_trajectory.json", present: true}
+    applicable_stages: [projection, world_coordinates, motion, gridmap_transform, trajectory, publish]
+    excluded_stages: [initial_annotation, tracking, fix]
+    expected_command_steps:
+      - postprocess_input_snapshot
+      - postprocess_metadata
+      - postprocess_gridmap
+      - postprocess_projection
+      - postprocess_world_coordinates
+      - postprocess_speed_direction
+      - postprocess_gridmap_transform
+      - postprocess_trajectory
+      - postprocess_final_candidate
+      - postprocess_validate_outputs
+    candidate_attestation_required: true
+    legacy_oracle_selection_required: true
+
+  - id: m2_postprocess_20260623_145550_segment_4
+    artifact_root_kind: finish_date
+    artifact_scope: "20260623_145550_zhigu_wuhan_4"
+    role_scopes:
+      legacy:
+        scope_kind: postprocessing_segment
+        artifact_scope: "20260623_145550_zhigu_wuhan_4"
+        dataset_date: "20260623"
+        source_clip: "20260623_145550"
+        internal_segment: "20260623_145550_zhigu_wuhan_4"
+        provenance: historical_unattested
+      candidate:
+        scope_kind: postprocessing_segment
+        artifact_scope: "20260623_145550_zhigu_wuhan_4"
+        dataset_date: "20270623"
+        source_clip: "20260623_145550"
+        internal_segment: "20260623_145550_zhigu_wuhan_4"
+        provenance: runtime_attested
+    root_expectations:
+      - {modality: trajectory, relative_pattern: "*_trajectory.json", present: true}
+    applicable_stages: [projection, world_coordinates, motion, gridmap_transform, trajectory, publish]
+    excluded_stages: [initial_annotation, tracking, fix]
+    expected_command_steps:
+      - postprocess_input_snapshot
+      - postprocess_metadata
+      - postprocess_gridmap
+      - postprocess_projection
+      - postprocess_world_coordinates
+      - postprocess_speed_direction
+      - postprocess_gridmap_transform
+      - postprocess_trajectory
+      - postprocess_final_candidate
+      - postprocess_validate_outputs
+    candidate_attestation_required: true
+    legacy_oracle_selection_required: true
+
+  - id: m2_postprocess_20260623_145550_segment_5
+    artifact_root_kind: finish_date
+    artifact_scope: "20260623_145550_zhigu_wuhan_5"
+    role_scopes:
+      legacy:
+        scope_kind: postprocessing_segment
+        artifact_scope: "20260623_145550_zhigu_wuhan_5"
+        dataset_date: "20260623"
+        source_clip: "20260623_145550"
+        internal_segment: "20260623_145550_zhigu_wuhan_5"
+        provenance: historical_unattested
+      candidate:
+        scope_kind: postprocessing_segment
+        artifact_scope: "20260623_145550_zhigu_wuhan_5"
+        dataset_date: "20270623"
+        source_clip: "20260623_145550"
+        internal_segment: "20260623_145550_zhigu_wuhan_5"
+        provenance: runtime_attested
+    root_expectations:
+      - {modality: trajectory, relative_pattern: "*_trajectory.json", present: true}
+    applicable_stages: [projection, world_coordinates, motion, gridmap_transform, trajectory, publish]
+    excluded_stages: [initial_annotation, tracking, fix]
+    expected_command_steps:
+      - postprocess_input_snapshot
+      - postprocess_metadata
+      - postprocess_gridmap
+      - postprocess_projection
+      - postprocess_world_coordinates
+      - postprocess_speed_direction
+      - postprocess_gridmap_transform
+      - postprocess_trajectory
+      - postprocess_final_candidate
+      - postprocess_validate_outputs
+    candidate_attestation_required: true
+    legacy_oracle_selection_required: true
 
   - id: m2_fix_20260623_145550
     sample_id: nav_20260623_145550_zhigu_wuhan_0
     artifact_root_kind: finish_date
     artifact_scope: "20260623_145550_zhigu_wuhan_0"
+    role_scopes:
+      legacy:
+        scope_kind: fix_segment
+        artifact_scope: "20260623_145550_zhigu_wuhan_0"
+        dataset_date: "20260623"
+        source_clip: "20260623_145550"
+        internal_segment: "20260623_145550_zhigu_wuhan_0"
+        provenance: historical_unattested
+      candidate:
+        scope_kind: fix_segment
+        artifact_scope: "20260623_145550_zhigu_wuhan_0"
+        dataset_date: "20270623"
+        source_clip: "20260623_145550"
+        internal_segment: "20260623_145550_zhigu_wuhan_0"
+        provenance: runtime_attested
     root_expectations:
       - modality: trajectory_fix
         relative_pattern: "*_trajectory_fix_five.json"
@@ -632,10 +881,9 @@ cases:
       - projection
       - publish
     expected_command_steps:
-      - human_review_boundary
-      - fix_calibration_snapshot
-      - fix_trajectory_0525
-      - review_decision
+      - fix_candidate
+    candidate_attestation_required: true
+    legacy_oracle_selection_required: true
 
   - id: missing_gridmap_20260714_104651
     sample_id: nav_20260714_104651_zhigu_wuhan_0

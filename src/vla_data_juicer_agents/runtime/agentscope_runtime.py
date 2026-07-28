@@ -8,6 +8,7 @@ import logging
 import re
 import sqlite3
 import time
+from collections.abc import Mapping
 from contextlib import suppress
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
@@ -32,6 +33,9 @@ from vla_data_juicer_agents.core.cancellation import CancellationContext, bind_c
 from vla_data_juicer_agents.core.events import CallbackEventSink, EventEmitter
 from vla_data_juicer_agents.core.turn_disposition import AwaitUserDispositionV1
 from vla_data_juicer_agents.navigation.agent_tools import resolve_navigation_agent_tools
+from vla_data_juicer_agents.navigation.annotation_gateway import (
+    NavigationAnnotationGateway,
+)
 from vla_data_juicer_agents.navigation.config import NavigationSettings
 from vla_data_juicer_agents.navigation.plan_execution import (
     human_decision_key,
@@ -96,6 +100,22 @@ _BACKGROUND_TOOL_ALLOWLIST = frozenset(
         "validate_navigation_outputs_tool",
     }
 )
+_EXPLICIT_LINKED_FIX_CREATE_KIND = "navigation_explicit_linked_fix_create"
+_EXPLICIT_LINKED_FIX_WAKE_KIND = "navigation_explicit_linked_fix_wake"
+_EXPLICIT_LINKED_FIX_CREATE_KEY_PREFIX = "navigation_auto_linked_fix:"
+_EXPLICIT_LINKED_FIX_WAKE_KEY_PREFIX = "navigation_auto_linked_fix_wake:"
+_EXPLICIT_LINKED_FIX_DISPATCH_KEY_PREFIX = "navigation_auto_linked_fix_dispatch:"
+_REDIS_DISPATCH_MARKER_PREFIX = "datapilot:dispatch:v1:"
+_REDIS_IDEMPOTENT_XADD_SCRIPT = """
+local marker_key = KEYS[1]
+local stream_key = KEYS[2]
+if redis.call("EXISTS", marker_key) == 1 then
+    return 0
+end
+local entry_id = redis.call("XADD", stream_key, "*", "payload", ARGV[1])
+redis.call("SET", marker_key, entry_id)
+return 1
+"""
 _logger = logging.getLogger(__name__)
 
 
@@ -151,6 +171,7 @@ class AgentScopeRuntime:
     event_cursors: dict[str, str | None] = field(default_factory=dict)
     web_session_store: Any | None = None
     web_event_bridge: Any | None = None
+    annotation_gateway: NavigationAnnotationGateway | None = None
     _active_human_decision_claims: set[str] = field(default_factory=set)
     _run_cancellations: dict[str, CancellationContext] = field(default_factory=dict)
     _router_terminal_sessions: set[str] = field(default_factory=set)
@@ -184,6 +205,12 @@ class AgentScopeRuntime:
 
     def set_web_event_bridge(self, bridge: Any | None) -> None:
         self.web_event_bridge = bridge
+
+    def set_annotation_gateway(
+        self,
+        gateway: NavigationAnnotationGateway | None,
+    ) -> None:
+        self.annotation_gateway = gateway
 
     def web_session_subscription_key(self, *, web_session_id: str) -> tuple[str, str] | None:
         return self._web_session_mapping(web_session_id)
@@ -328,6 +355,7 @@ class AgentScopeRuntime:
         dataset_date: str,
         selection: dict[str, Any],
         scene_mode: str | None,
+        requested_outcome: str = "auto",
     ) -> dict[str, Any]:
         """Durably create and delegate one task-scoped Navigation session."""
         if not self._is_contract_v1(web_session_id):
@@ -346,6 +374,18 @@ class AgentScopeRuntime:
         request = str(get_message(active_turn_id) or "").strip()
         if not request:
             raise NavigationTaskEntryError("the current user request is unavailable")
+        if requested_outcome not in {
+            "auto",
+            "extract_sync",
+            "postprocessing",
+            "postprocessing_and_fix",
+            "trajectory_fix",
+        }:
+            raise NavigationTaskEntryError("unsupported navigation requested outcome")
+        if requested_outcome == "trajectory_fix":
+            raise NavigationTaskEntryError(
+                "trajectory Fix must continue from a completed postprocessing task"
+            )
         request_context = get_context(active_turn_id)
         if scope_source not in {"request_context", "interpreted_user_text"}:
             raise NavigationTaskEntryError("unsupported navigation scope source")
@@ -430,6 +470,7 @@ class AgentScopeRuntime:
                 "scene_mode": scene_mode or "unknown",
                 "reason": reason,
                 "response_language": response_language,
+                "requested_outcome": requested_outcome,
                 "navigation_session_id": navigation_session_id,
             },
         )
@@ -466,6 +507,7 @@ class AgentScopeRuntime:
                 dry_run=self.config.navigation_dry_run,
                 web_session_id=web_session_id,
                 agentscope_session_id=navigation_session_id,
+                requested_outcome=requested_outcome,
             )
             await self.ensure_web_session(
                 web_session_id,
@@ -490,6 +532,7 @@ class AgentScopeRuntime:
                 scene_mode=scene_mode or "unknown",
                 clips=clips,
                 response_language=response_language,
+                requested_outcome=requested_outcome,
             )
             await self._start_agent_run(
                 web_session_id=web_session_id,
@@ -591,12 +634,10 @@ class AgentScopeRuntime:
             binding is None
             or binding.web_session_id != web_session_id
             or binding.task_ref != task_ref
-            or binding.slot_state != "open"
         ):
             raise RuntimeError(
                 "stale_context: focused task binding changed; refresh the task revision"
             )
-        navigation_session_id = str(_record_value(binding, "navigation_session_id"))
         task = self._navigation_task_store().get_task(task_id)
         if task is None or task.created_by_web_session_id != web_session_id:
             raise RuntimeError("the focused navigation task is unavailable")
@@ -604,6 +645,27 @@ class AgentScopeRuntime:
             raise RuntimeError(
                 "stale_context: navigation task revision changed; refresh before continuing"
             )
+        if task.status == NavigationTaskStatus.COMPLETED:
+            outcome = self._navigation_task_store().get_task_outcome(task_id)
+            if (
+                binding.slot_state == "closed"
+                and outcome is not None
+                and outcome.completion_outcome
+                == "postprocessing_completed_fix_pending"
+            ):
+                return await self._start_linked_trajectory_fix_task_v1(
+                    web_session_id=web_session_id,
+                    router_session_id=router_session_id,
+                    active_turn_id=active_turn_id,
+                    parent_task=task,
+                    parent_binding=binding,
+                )
+            raise RuntimeError("the navigation task cannot be continued from its current state")
+        if binding.slot_state != "open":
+            raise RuntimeError(
+                "stale_context: focused task binding changed; refresh the task revision"
+            )
+        navigation_session_id = str(_record_value(binding, "navigation_session_id"))
         if task.status == NavigationTaskStatus.ACTIVE:
             raise RuntimeError(
                 "the navigation task is already running; stop it before changing its instructions"
@@ -786,6 +848,750 @@ class AgentScopeRuntime:
             "error": None,
             "latest_task": self._task_summary(latest_binding, max_chars=1200),
         }
+
+    async def _start_linked_trajectory_fix_task_v1(
+        self,
+        *,
+        web_session_id: str,
+        router_session_id: str,
+        active_turn_id: str,
+        parent_task: Any,
+        parent_binding: Any,
+    ) -> dict[str, Any]:
+        """Create one linked Fix task without reopening the completed parent."""
+        if self.web_session_store is None:
+            raise RuntimeError("Web session store is unavailable")
+        if _record_value(parent_binding, "slot_state") != "closed":
+            raise RuntimeError("linked Fix requires a released postprocessing task slot")
+        list_bindings = getattr(self.web_session_store, "list_task_bindings", None)
+        if callable(list_bindings):
+            occupying = [
+                item
+                for item in list_bindings(web_session_id)
+                if item.slot_state == "open"
+            ]
+            if occupying:
+                raise RuntimeError(
+                    "another navigation task is already active; finish or cancel it first"
+                )
+        get_message = getattr(self.web_session_store, "get_turn_user_message", None)
+        if not callable(get_message):
+            raise RuntimeError("private user message store is unavailable")
+        request = str(get_message(active_turn_id) or "").strip()
+        if not request:
+            raise RuntimeError("the current user message is unavailable")
+        response_language = _resolve_response_language(None, request)
+        services = self._navigation_services()
+        gateway = services.annotation_gateway
+        if gateway is None:
+            raise RuntimeError(
+                "annotation_service_unavailable: trajectory Fix cannot start safely"
+            )
+
+        parent_task_id = str(parent_task.task_id)
+        identity_digest = hashlib.sha256(
+            f"trajectory_fix:{parent_task_id}".encode("utf-8")
+        ).hexdigest()
+        child_task_id = f"nav_fix_{identity_digest[:32]}"
+        task_ref = f"DP-{identity_digest[:12].upper()}"
+        navigation_session_id = (
+            f"{web_session_id}__task_{identity_digest[:32]}"
+            f"__{self.config.navigation_agent_id}"
+        )
+        gateway_result = gateway.begin_linked_fix(
+            parent_navigation_task_id=parent_task_id,
+            child_navigation_task_id=child_task_id,
+        )
+        if not isinstance(gateway_result, Mapping):
+            raise RuntimeError(
+                "annotation_service_invalid_response: linked Fix was not created"
+            )
+
+        create_binding = getattr(self.web_session_store, "create_task_binding", None)
+        if not callable(create_binding):
+            raise RuntimeError("contract v1 task binding store is unavailable")
+        binding_creation = create_binding(
+            web_session_id,
+            task_id=child_task_id,
+            task_ref=task_ref,
+            navigation_session_id=navigation_session_id,
+            domain="navigation",
+            navigation_agent_id=self.config.navigation_agent_id,
+            scope={
+                "date": str(parent_task.date),
+                "clips": list(parent_task.segments or []),
+                "scene_mode": (
+                    "indoor"
+                    if parent_task.scene_mode == "in"
+                    else "outdoor"
+                    if parent_task.scene_mode == "out"
+                    else "unknown"
+                ),
+                "workflow": "trajectory_fix",
+            },
+            outbox_payload={
+                "origin_turn_id": active_turn_id,
+                "request": request,
+                "target": "trajectory_review",
+                "date": str(parent_task.date),
+                "clips": list(parent_task.segments or []),
+                "scene_mode": (
+                    "indoor"
+                    if parent_task.scene_mode == "in"
+                    else "outdoor"
+                    if parent_task.scene_mode == "out"
+                    else "unknown"
+                ),
+                "reason": "用户明确要求继续三维轨迹 Fix",
+                "response_language": response_language,
+                "requested_outcome": "trajectory_fix",
+                "navigation_session_id": navigation_session_id,
+                "parent_navigation_task_id": parent_task_id,
+            },
+            outbox_idempotency_key=f"navigation_linked_fix:{parent_task_id}",
+        )
+        binding = binding_creation.binding
+        claimed_outbox = None
+        creation = None
+        run_started = False
+        outbox_worker = f"navigation-linked-fix:{child_task_id}"
+        try:
+            claimed_outbox = self.web_session_store.claim_outbox_item(
+                binding_creation.outbox.outbox_id,
+                worker_id=outbox_worker,
+                lease_seconds=300,
+            )
+            creation = services.task_store.create_linked_trajectory_fix_attempt(
+                parent_task_id=parent_task_id,
+                child_task_id=child_task_id,
+                request=request,
+                web_session_id=web_session_id,
+                agentscope_session_id=navigation_session_id,
+                dry_run=self.config.navigation_dry_run,
+            )
+            await self.ensure_web_session(
+                web_session_id,
+                agent_id=self.config.navigation_agent_id,
+                model=self.config.navigation_model,
+                task_id=child_task_id,
+                preallocated_session_id=navigation_session_id,
+            )
+            authority = self.web_session_store.get_response_authority(active_turn_id)
+            handover = getattr(
+                self.web_session_store,
+                "handover_response_authority",
+                None,
+            )
+            if not callable(handover) or authority is None:
+                raise RuntimeError("turn response authority handover is unavailable")
+            handover(
+                active_turn_id,
+                expected_producer="router",
+                expected_generation=authority.generation,
+                new_producer="navigation",
+            )
+            navigation_request = _navigation_handoff_message(
+                request=request,
+                date=str(parent_task.date),
+                scene_mode=(
+                    "indoor"
+                    if parent_task.scene_mode == "in"
+                    else "outdoor"
+                    if parent_task.scene_mode == "out"
+                    else "unknown"
+                ),
+                clips=list(parent_task.segments or []),
+                response_language=response_language,
+                requested_outcome="trajectory_fix",
+            )
+            await self._start_agent_run(
+                web_session_id=web_session_id,
+                agent_id=self.config.navigation_agent_id,
+                model=self.config.navigation_model,
+                message=navigation_request,
+                turn_id=active_turn_id,
+                task_id=child_task_id,
+                agentscope_session_id=navigation_session_id,
+            )
+            run_started = True
+        except Exception as exc:
+            if claimed_outbox is not None:
+                try:
+                    self.web_session_store.complete_outbox(
+                        claimed_outbox.outbox_id,
+                        worker_id=outbox_worker,
+                        success=False,
+                        error=type(exc).__name__,
+                    )
+                except Exception:
+                    _logger.exception(
+                        "Failed to record rejected linked Fix outbox: task_id=%s",
+                        child_task_id,
+                    )
+            if not run_started:
+                await self._handle_v1_delegation_failure(
+                    web_session_id=web_session_id,
+                    turn_id=active_turn_id,
+                    task_id=child_task_id,
+                    router_session_id=router_session_id,
+                    response_language=response_language,
+                    operation="start",
+                )
+            raise
+        try:
+            await self._publish_v1_task_state(
+                web_session_id=web_session_id,
+                task_id=child_task_id,
+                turn_id=active_turn_id,
+            )
+        except Exception:
+            _logger.exception(
+                "Linked Fix TaskStrip notification failed: task_id=%s",
+                child_task_id,
+            )
+        if claimed_outbox is not None:
+            try:
+                self.web_session_store.complete_outbox(
+                    claimed_outbox.outbox_id,
+                    worker_id=outbox_worker,
+                )
+            except Exception:
+                _logger.exception(
+                    "Linked Fix outbox completion will be recovered: task_id=%s",
+                    child_task_id,
+                )
+        self._router_terminal_sessions.add(router_session_id)
+        if creation is None:
+            raise RuntimeError("linked trajectory Fix task creation did not complete")
+        latest_binding = (
+            self.web_session_store.get_task_binding(child_task_id) or binding
+        )
+        return {
+            "ok": True,
+            "operation": "continue",
+            "accepted": True,
+            "task_id": creation.task.task_id,
+            "task_ref": str(_record_value(latest_binding, "task_ref", task_ref)),
+            "agentscope_session_id": navigation_session_id,
+            "status": creation.task.status.value,
+            "error": None,
+            "latest_task": self._task_summary(latest_binding, max_chars=1200),
+        }
+
+    async def wake_navigation_task_from_workbench(
+        self,
+        *,
+        task_id: str,
+        reason: str,
+        dispatch_idempotency_key: str | None = None,
+    ) -> bool:
+        """Wake the bound Navigation session from server-owned durable state."""
+
+        if self.web_session_store is None:
+            raise RuntimeError("Web session store is unavailable")
+        binding = self.web_session_store.get_task_binding(task_id)
+        task = self._navigation_task_store().get_task(task_id)
+        if binding is None or task is None:
+            raise RuntimeError("Navigation workbench binding is unavailable")
+        if binding.slot_state != "open":
+            return False
+        inbox_receipt = None
+        wakeup_receipt = None
+        record_receipt = None
+        if dispatch_idempotency_key is not None:
+            if not dispatch_idempotency_key.strip():
+                raise ValueError("dispatch idempotency key must not be empty")
+            record_receipt = getattr(
+                self.web_session_store,
+                "record_outbox_receipt",
+                None,
+            )
+            if not callable(record_receipt):
+                raise RuntimeError("durable workbench dispatch receipt is unavailable")
+            inbox_receipt = self.web_session_store.get_outbox_by_idempotency_key(
+                f"{dispatch_idempotency_key}:inbox"
+            )
+            wakeup_receipt = self.web_session_store.get_outbox_by_idempotency_key(
+                f"{dispatch_idempotency_key}:wakeup"
+            )
+            for receipt, kind in (
+                (inbox_receipt, "navigation_workbench_inbox_dispatched"),
+                (wakeup_receipt, "navigation_workbench_wakeup_enqueued"),
+            ):
+                if receipt is not None and (
+                    receipt.kind != kind
+                    or receipt.aggregate_id != task_id
+                    or receipt.web_session_id != binding.web_session_id
+                    or receipt.task_id != task_id
+                    or receipt.turn_id is not None
+                    or receipt.status != "completed"
+                ):
+                    raise RuntimeError(
+                        "durable workbench dispatch receipt is inconsistent"
+                    )
+        needs_publication = inbox_receipt is None or wakeup_receipt is None
+        await self.ensure_web_session(
+            binding.web_session_id,
+            agent_id=self.config.navigation_agent_id,
+            model=self.config.navigation_model,
+            task_id=task_id,
+            preallocated_session_id=binding.navigation_session_id,
+        )
+        message = UserMsg(
+            name="system",
+            content=(
+                "A durable external workbench event completed. Inspect the "
+                "authoritative Navigation task and accepted Plan ledger, then "
+                "continue only the next plan-bound action. Event kind: "
+                f"{reason}."
+            ),
+        )
+        if dispatch_idempotency_key is None:
+            await self.message_bus.inbox_push(
+                binding.navigation_session_id,
+                message.model_dump(mode="json"),
+            )
+            inbox_dispatched = True
+        else:
+            inbox_dispatched = await self._push_workbench_inbox_once(
+                session_id=binding.navigation_session_id,
+                payload=message.model_dump(mode="json"),
+                idempotency_key=f"{dispatch_idempotency_key}:inbox",
+            )
+            if inbox_receipt is None:
+                inbox_receipt = record_receipt(
+                    kind="navigation_workbench_inbox_dispatched",
+                    aggregate_type="navigation_task",
+                    aggregate_id=task_id,
+                    payload={"reason": reason},
+                    idempotency_key=f"{dispatch_idempotency_key}:inbox",
+                    web_session_id=binding.web_session_id,
+                    task_id=task_id,
+                )
+        if dispatch_idempotency_key is None:
+            await self.message_bus.enqueue_wakeup(
+                self.config.user_id,
+                binding.navigation_session_id,
+                self.config.navigation_agent_id,
+            )
+            wakeup_dispatched = True
+        else:
+            wakeup_dispatched = await self._enqueue_workbench_wakeup_once(
+                user_id=self.config.user_id,
+                session_id=binding.navigation_session_id,
+                agent_id=self.config.navigation_agent_id,
+                idempotency_key=f"{dispatch_idempotency_key}:wakeup",
+            )
+            if wakeup_receipt is None:
+                wakeup_receipt = record_receipt(
+                    kind="navigation_workbench_wakeup_enqueued",
+                    aggregate_type="navigation_task",
+                    aggregate_id=task_id,
+                    payload={"reason": reason},
+                    idempotency_key=f"{dispatch_idempotency_key}:wakeup",
+                    web_session_id=binding.web_session_id,
+                    task_id=task_id,
+                )
+        dispatched = inbox_dispatched or wakeup_dispatched
+        if dispatched or needs_publication:
+            await self._publish_v1_task_state(
+                web_session_id=binding.web_session_id,
+                task_id=task_id,
+                turn_id=None,
+            )
+        return dispatched
+
+    async def _push_workbench_inbox_once(
+        self,
+        *,
+        session_id: str,
+        payload: dict[str, Any],
+        idempotency_key: str,
+    ) -> bool:
+        push_once = getattr(self.message_bus, "inbox_push_idempotent", None)
+        if callable(push_once):
+            return bool(
+                await push_once(
+                    session_id,
+                    payload,
+                    idempotency_key=idempotency_key,
+                )
+            )
+        template = getattr(self.message_bus, "_INBOX_KEY", None)
+        if not isinstance(template, str):
+            raise RuntimeError("idempotent workbench inbox transport is unavailable")
+        try:
+            stream_key = template.format(sid=session_id)
+        except (KeyError, ValueError) as exc:
+            raise RuntimeError(
+                "idempotent workbench inbox transport is unavailable"
+            ) from exc
+        return await self._redis_xadd_once(
+            stream_key=stream_key,
+            payload=payload,
+            idempotency_key=idempotency_key,
+        )
+
+    async def _enqueue_workbench_wakeup_once(
+        self,
+        *,
+        user_id: str,
+        session_id: str,
+        agent_id: str,
+        idempotency_key: str,
+    ) -> bool:
+        enqueue_once = getattr(self.message_bus, "enqueue_wakeup_idempotent", None)
+        if callable(enqueue_once):
+            return bool(
+                await enqueue_once(
+                    user_id,
+                    session_id,
+                    agent_id,
+                    idempotency_key=idempotency_key,
+                )
+            )
+        stream_key = getattr(self.message_bus, "_WAKEUP_QUEUE_KEY", None)
+        signal_key = getattr(self.message_bus, "_WAKEUP_SIGNAL_KEY", None)
+        publish = getattr(self.message_bus, "publish", None)
+        if (
+            not isinstance(stream_key, str)
+            or not isinstance(signal_key, str)
+            or not callable(publish)
+        ):
+            raise RuntimeError("idempotent workbench wakeup transport is unavailable")
+        dispatched = await self._redis_xadd_once(
+            stream_key=stream_key,
+            payload={
+                "user_id": user_id,
+                "session_id": session_id,
+                "agent_id": agent_id,
+            },
+            idempotency_key=idempotency_key,
+        )
+        # A crash after the atomic XADD but before publish is recovered by retrying
+        # this signal and by the periodic wakeup drain.
+        await publish(signal_key, {})
+        return dispatched
+
+    async def _redis_xadd_once(
+        self,
+        *,
+        stream_key: str,
+        payload: dict[str, Any],
+        idempotency_key: str,
+    ) -> bool:
+        get_client = getattr(self.message_bus, "get_client", None)
+        if not callable(get_client):
+            raise RuntimeError("idempotent Redis transport is unavailable")
+        client = get_client()
+        if client is None or not callable(getattr(client, "eval", None)):
+            raise RuntimeError("idempotent Redis transport is unavailable")
+        marker_digest = hashlib.sha256(idempotency_key.encode("utf-8")).hexdigest()
+        marker_key = f"{_REDIS_DISPATCH_MARKER_PREFIX}{marker_digest}"
+        serialized = json.dumps(
+            payload,
+            ensure_ascii=False,
+            separators=(",", ":"),
+            sort_keys=True,
+        )
+        result = await client.eval(
+            _REDIS_IDEMPOTENT_XADD_SCRIPT,
+            2,
+            marker_key,
+            stream_key,
+            serialized,
+        )
+        try:
+            return int(result) == 1
+        except (TypeError, ValueError) as exc:
+            raise RuntimeError("idempotent Redis transport returned invalid state") from exc
+
+    async def recover_explicit_linked_fix_tasks_once(
+        self,
+        *,
+        limit: int = 20,
+    ) -> int:
+        """Recover automatic explicit Fix creation and its turnless wake saga."""
+
+        if (
+            limit < 1
+            or self.web_session_store is None
+            or self.annotation_gateway is None
+        ):
+            return 0
+        task_store = self._navigation_task_store()
+
+        # The parent query intentionally covers only the pre-lineage boundary.
+        # Once the child exists, the Web-store create/wake outboxes below are
+        # the durable recovery source and prevent the child from being stranded
+        # merely because the parent is no longer a creation candidate.
+        for parent in task_store.list_completed_explicit_fix_parents(limit=limit):
+            parent_binding = self.web_session_store.get_task_binding(parent.task_id)
+            if parent_binding is None or parent_binding.slot_state != "closed":
+                continue
+            identity_digest = hashlib.sha256(
+                f"trajectory_fix:{parent.task_id}".encode("utf-8")
+            ).hexdigest()
+            child_task_id = f"nav_fix_{identity_digest[:32]}"
+            navigation_session_id = (
+                f"{parent_binding.web_session_id}__task_{identity_digest[:32]}"
+                f"__{self.config.navigation_agent_id}"
+            )
+            self.web_session_store.create_task_binding(
+                parent_binding.web_session_id,
+                task_id=child_task_id,
+                task_ref=f"DP-{identity_digest[:12].upper()}",
+                navigation_session_id=navigation_session_id,
+                domain="navigation",
+                navigation_agent_id=self.config.navigation_agent_id,
+                scope={
+                    "date": str(parent.date),
+                    "clips": list(parent.segments or []),
+                    "scene_mode": (
+                        "indoor"
+                        if parent.scene_mode == "in"
+                        else "outdoor"
+                        if parent.scene_mode == "out"
+                        else "unknown"
+                    ),
+                    "workflow": "trajectory_fix",
+                },
+                outbox_payload={
+                    "request": "继续已完成后处理任务的三维轨迹 Fix",
+                    "target": "trajectory_review",
+                    "date": str(parent.date),
+                    "clips": list(parent.segments or []),
+                    "requested_outcome": "trajectory_fix",
+                    "navigation_session_id": navigation_session_id,
+                    "parent_navigation_task_id": parent.task_id,
+                    "automatic_explicit_fix": True,
+                },
+                outbox_idempotency_key=(
+                    f"{_EXPLICIT_LINKED_FIX_CREATE_KEY_PREFIX}{parent.task_id}"
+                ),
+                outbox_kind=_EXPLICIT_LINKED_FIX_CREATE_KIND,
+            )
+
+        list_recoveries = getattr(
+            self.web_session_store,
+            "list_explicit_linked_fix_recoveries",
+            None,
+        )
+        if not callable(list_recoveries):
+            raise RuntimeError("explicit linked Fix recovery store is unavailable")
+
+        recovered_task_ids: set[str] = set()
+        create_worker = f"navigation-explicit-fix-create:{id(self)}"
+        for item in list_recoveries(limit=limit):
+            claimed = None
+            try:
+                child_task_id, created = (
+                    self._prepare_explicit_linked_fix_wake_outbox(item)
+                )
+                if item.status != "completed":
+                    try:
+                        claimed = self.web_session_store.claim_outbox_item(
+                            item.outbox_id,
+                            worker_id=create_worker,
+                            lease_seconds=300,
+                        )
+                    except RuntimeError:
+                        latest = self.web_session_store.get_outbox(item.outbox_id)
+                        if latest is None or latest.status not in {
+                            "claimed",
+                            "completed",
+                        }:
+                            raise
+                    if claimed is not None and claimed.status != "completed":
+                        self.web_session_store.complete_outbox(
+                            claimed.outbox_id,
+                            worker_id=create_worker,
+                        )
+                if created:
+                    recovered_task_ids.add(child_task_id)
+            except Exception as exc:
+                if claimed is not None and claimed.status != "completed":
+                    with suppress(Exception):
+                        self.web_session_store.complete_outbox(
+                            claimed.outbox_id,
+                            worker_id=create_worker,
+                            success=False,
+                            error=type(exc).__name__,
+                            retry_at=datetime.now(UTC).isoformat(
+                                timespec="milliseconds"
+                            ),
+                        )
+                raise
+
+        wake_worker = f"navigation-explicit-fix-wake:{id(self)}"
+        wake_items = self.web_session_store.claim_outbox(
+            worker_id=wake_worker,
+            kinds=[_EXPLICIT_LINKED_FIX_WAKE_KIND],
+            limit=limit,
+            lease_seconds=300,
+        )
+        for item in wake_items:
+            try:
+                if item.turn_id is not None:
+                    raise RuntimeError(
+                        "automatic linked Fix wake must not own a user turn"
+                    )
+                child_task_id = str(item.task_id or "")
+                parent_task_id = str(
+                    item.payload.get("parent_navigation_task_id") or ""
+                )
+                binding = self.web_session_store.get_task_binding(child_task_id)
+                child = task_store.get_task(child_task_id)
+                lineage = task_store.get_task_lineage(child_task_id)
+                parent = task_store.get_task(parent_task_id)
+                outcome = task_store.get_task_outcome(parent_task_id)
+                if (
+                    not child_task_id
+                    or not parent_task_id
+                    or binding is None
+                    or binding.slot_state != "open"
+                    or child is None
+                    or child.status != NavigationTaskStatus.ACTIVE
+                    or lineage is None
+                    or lineage.parent_task_id != parent_task_id
+                    or lineage.relation != "trajectory_fix"
+                    or parent is None
+                    or parent.status != NavigationTaskStatus.COMPLETED
+                    or outcome is None
+                    or outcome.requested_outcome != "postprocessing_and_fix"
+                ):
+                    raise RuntimeError(
+                        "automatic linked Fix wake authority is unavailable"
+                    )
+                await self.ensure_web_session(
+                    binding.web_session_id,
+                    agent_id=self.config.navigation_agent_id,
+                    model=self.config.navigation_model,
+                    task_id=child_task_id,
+                    preallocated_session_id=binding.navigation_session_id,
+                )
+                self.web_session_store.focus_task(
+                    binding.web_session_id,
+                    task_id=child_task_id,
+                )
+                await self.wake_navigation_task_from_workbench(
+                    task_id=child_task_id,
+                    reason="explicit_postprocessing_and_fix",
+                    dispatch_idempotency_key=(
+                        f"{_EXPLICIT_LINKED_FIX_DISPATCH_KEY_PREFIX}"
+                        f"{parent_task_id}"
+                    ),
+                )
+                self.web_session_store.complete_outbox(
+                    item.outbox_id,
+                    worker_id=wake_worker,
+                )
+                recovered_task_ids.add(child_task_id)
+            except Exception as exc:
+                with suppress(Exception):
+                    self.web_session_store.complete_outbox(
+                        item.outbox_id,
+                        worker_id=wake_worker,
+                        success=False,
+                        error=type(exc).__name__,
+                        retry_at=datetime.now(UTC).isoformat(
+                            timespec="milliseconds"
+                        ),
+                    )
+                raise
+        return len(recovered_task_ids)
+
+    def _prepare_explicit_linked_fix_wake_outbox(
+        self,
+        create_item: Any,
+    ) -> tuple[str, bool]:
+        """Create the linked child and durable turnless wake sidecar."""
+
+        if self.web_session_store is None or self.annotation_gateway is None:
+            raise RuntimeError("explicit linked Fix recovery is unavailable")
+        if not create_item.idempotency_key.startswith(
+            _EXPLICIT_LINKED_FIX_CREATE_KEY_PREFIX
+        ):
+            raise RuntimeError("automatic linked Fix creation authority is unavailable")
+        task_store = self._navigation_task_store()
+        parent_task_id = str(
+            create_item.payload.get("parent_navigation_task_id") or ""
+        )
+        child_task_id = str(create_item.task_id or "")
+        binding = self.web_session_store.get_task_binding(child_task_id)
+        parent_binding = self.web_session_store.get_task_binding(parent_task_id)
+        parent = task_store.get_task(parent_task_id)
+        outcome = task_store.get_task_outcome(parent_task_id)
+        if (
+            not parent_task_id
+            or not child_task_id
+            or binding is None
+            or binding.slot_state != "open"
+            or parent_binding is None
+            or parent_binding.slot_state != "closed"
+            or parent is None
+            or parent.status != NavigationTaskStatus.COMPLETED
+            or outcome is None
+            or outcome.requested_outcome != "postprocessing_and_fix"
+            or outcome.completion_outcome
+            != "postprocessing_completed_fix_pending"
+        ):
+            raise RuntimeError("automatic linked Fix creation authority is unavailable")
+        identity_digest = hashlib.sha256(
+            f"trajectory_fix:{parent_task_id}".encode("utf-8")
+        ).hexdigest()
+        expected_child_task_id = f"nav_fix_{identity_digest[:32]}"
+        if (
+            child_task_id != expected_child_task_id
+            or binding.web_session_id != parent_binding.web_session_id
+            or create_item.web_session_id != binding.web_session_id
+            or create_item.turn_id is not None
+        ):
+            raise RuntimeError("automatic linked Fix identity is inconsistent")
+
+        existing = task_store.get_linked_child(parent_task_id)
+        created = False
+        if existing is None:
+            gateway_result = self.annotation_gateway.begin_linked_fix(
+                parent_navigation_task_id=parent_task_id,
+                child_navigation_task_id=child_task_id,
+            )
+            if not isinstance(gateway_result, Mapping):
+                raise RuntimeError(
+                    "annotation_service_invalid_response: linked Fix was not created"
+                )
+            request = str(create_item.payload.get("request") or "").strip()
+            if not request:
+                raise RuntimeError("automatic linked Fix request is unavailable")
+            creation = task_store.create_linked_trajectory_fix_attempt(
+                parent_task_id=parent_task_id,
+                child_task_id=child_task_id,
+                request=request,
+                web_session_id=binding.web_session_id,
+                agentscope_session_id=binding.navigation_session_id,
+                dry_run=self.config.navigation_dry_run,
+            )
+            existing = creation.task
+            created = creation.created
+        if existing.task_id != child_task_id:
+            raise RuntimeError("automatic linked Fix child identity is inconsistent")
+
+        self.web_session_store.enqueue_outbox(
+            kind=_EXPLICIT_LINKED_FIX_WAKE_KIND,
+            aggregate_type="navigation_task",
+            aggregate_id=child_task_id,
+            payload={
+                "parent_navigation_task_id": parent_task_id,
+                "reason": "explicit_postprocessing_and_fix",
+            },
+            idempotency_key=(
+                f"{_EXPLICIT_LINKED_FIX_WAKE_KEY_PREFIX}{parent_task_id}"
+            ),
+            web_session_id=binding.web_session_id,
+            task_id=child_task_id,
+            turn_id=None,
+        )
+        return child_task_id, created
 
     async def control_navigation_agent_task_v1(
         self,
@@ -1396,9 +2202,12 @@ class AgentScopeRuntime:
         task_id = _record_value(binding, "task_id")
         if not isinstance(task_id, str):
             return None
-        task = self._navigation_task_store().get_task(task_id)
+        task_store = self._navigation_task_store()
+        task = task_store.get_task(task_id)
         if task is None:
             return None
+        get_outcome = getattr(task_store, "get_task_outcome", None)
+        outcome = get_outcome(task_id) if callable(get_outcome) else None
         status = task.status.value
         phase = (
             "等待确认"
@@ -1411,6 +2220,19 @@ class AgentScopeRuntime:
             if status == "cancelling"
             else "需要调整方案"
             if status == "needs_replan"
+            else "后处理已完成"
+            if (
+                status == "completed"
+                and outcome is not None
+                and outcome.completion_outcome
+                == "postprocessing_completed_fix_pending"
+            )
+            else "轨迹复核已完成"
+            if (
+                status == "completed"
+                and outcome is not None
+                and outcome.completion_outcome == "trajectory_review_completed"
+            )
             else "已完成"
             if status == "completed"
             else "处理失败"
@@ -1421,6 +2243,8 @@ class AgentScopeRuntime:
             if task.accepted_plan_phase == "extract_sync"
             else "后处理"
             if task.accepted_plan_phase == "finish_processing"
+            else "轨迹复核"
+            if task.accepted_plan_phase == "trajectory_review"
             else "检查数据"
         )
         wait_cause = {
@@ -1437,6 +2261,17 @@ class AgentScopeRuntime:
             "pausing": ["cancel"],
             "needs_replan": ["adjust", "cancel"],
         }.get(status, [])
+        if (
+            status == NavigationTaskStatus.COMPLETED.value
+            and outcome is not None
+            and outcome.completion_outcome
+            == "postprocessing_completed_fix_pending"
+            and (
+                not callable(getattr(task_store, "get_linked_child", None))
+                or task_store.get_linked_child(task_id) is None
+            )
+        ):
+            available_actions = ["continue_fix"]
         latest = _record_value(binding, "latest_public_update")
         safe_clips = [
             safe
@@ -1459,6 +2294,9 @@ class AgentScopeRuntime:
                 else "outdoor"
                 if task.scene_mode == "out"
                 else None
+            ),
+            "requested_outcome": (
+                outcome.requested_outcome if outcome is not None else "auto"
             ),
             "status": status,
             "phase": phase,
@@ -2023,7 +2861,10 @@ class AgentScopeRuntime:
         return "failed"
 
     def _navigation_services(self) -> NavigationServices:
-        return build_navigation_services(self.config.workspace_root)
+        return build_navigation_services(
+            self.config.workspace_root,
+            annotation_gateway=self.annotation_gateway,
+        )
 
     def _navigation_task_store(self):
         return self._navigation_services().task_store
@@ -3081,6 +3922,19 @@ class AgentScopeRuntime:
                     )
                     recovered += 1
                     continue
+                if (
+                    item.kind == "navigation_start"
+                    and item.idempotency_key.startswith(
+                        _EXPLICIT_LINKED_FIX_CREATE_KEY_PREFIX
+                    )
+                ):
+                    self._prepare_explicit_linked_fix_wake_outbox(item)
+                    self.web_session_store.complete_outbox(
+                        item.outbox_id,
+                        worker_id=worker_id,
+                    )
+                    recovered += 1
+                    continue
                 if item.kind == "navigation_continue":
                     binding = self.web_session_store.get_task_binding(
                         str(item.task_id or "")
@@ -3236,17 +4090,35 @@ class AgentScopeRuntime:
                         if scene_mode == "outdoor"
                         else None
                     )
-                    task = self._navigation_task_store().create_task_attempt(
-                        task_id=binding.task_id,
-                        request=request,
-                        target=target,
-                        date=date,
-                        segments=list(payload.get("clips") or []),
-                        scene_mode=normalized_scene,
-                        dry_run=self.config.navigation_dry_run,
-                        web_session_id=binding.web_session_id,
-                        agentscope_session_id=binding.navigation_session_id,
-                    ).task
+                    parent_task_id = payload.get("parent_navigation_task_id")
+                    if isinstance(parent_task_id, str) and parent_task_id:
+                        task = (
+                            self._navigation_task_store()
+                            .create_linked_trajectory_fix_attempt(
+                                parent_task_id=parent_task_id,
+                                child_task_id=binding.task_id,
+                                request=request,
+                                web_session_id=binding.web_session_id,
+                                agentscope_session_id=binding.navigation_session_id,
+                                dry_run=self.config.navigation_dry_run,
+                            )
+                            .task
+                        )
+                    else:
+                        task = self._navigation_task_store().create_task_attempt(
+                            task_id=binding.task_id,
+                            request=request,
+                            target=target,
+                            date=date,
+                            segments=list(payload.get("clips") or []),
+                            scene_mode=normalized_scene,
+                            dry_run=self.config.navigation_dry_run,
+                            web_session_id=binding.web_session_id,
+                            agentscope_session_id=binding.navigation_session_id,
+                            requested_outcome=str(
+                                payload.get("requested_outcome") or "auto"
+                            ),
+                        ).task
                 await self.ensure_web_session(
                     binding.web_session_id,
                     agent_id=self.config.navigation_agent_id,
@@ -3292,6 +4164,9 @@ class AgentScopeRuntime:
                         scene_mode=str(payload.get("scene_mode") or "unknown"),
                         clips=list(payload.get("clips") or []),
                         response_language=str(payload.get("response_language") or "Chinese"),
+                        requested_outcome=str(
+                            payload.get("requested_outcome") or "auto"
+                        ),
                     )
                     await self._start_agent_run(
                         web_session_id=binding.web_session_id,
@@ -5351,6 +6226,7 @@ def _navigation_handoff_message(
     scene_mode: str | None,
     clips: list[str],
     response_language: str | None,
+    requested_outcome: str = "auto",
 ) -> str:
     clip_text = ", ".join(clips) if clips else "all"
     language = _resolve_response_language(response_language, request)
@@ -5371,6 +6247,7 @@ def _navigation_handoff_message(
             "out": "out",
             "室外": "out",
         }.get(scene_mode or ""),
+        "requested_outcome": requested_outcome,
         "response_language": language,
     }
     structured_lines = [
@@ -5385,6 +6262,7 @@ def _navigation_handoff_message(
                 f"- 数据日期: {date}",
                 f"- 场景模式: {scene_mode_text}",
                 f"- clips: {clip_text}",
+                f"- 请求结果: {requested_outcome}",
                 f"- 回复语言: {language}",
                 "请始终使用中文回复用户。",
                 *structured_lines,
@@ -5397,6 +6275,7 @@ def _navigation_handoff_message(
             f"- dataset_date: {date}",
             f"- scene_mode: {scene_mode_text}",
             f"- clips: {clip_text}",
+            f"- requested_outcome: {requested_outcome}",
             f"- response_language: {language}",
             f"Always respond to the user in {language}.",
             *structured_lines,

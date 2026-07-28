@@ -2,14 +2,14 @@ from __future__ import annotations
 
 from datetime import UTC, datetime
 from enum import StrEnum
-from typing import Literal
+from typing import Any, Literal
 
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from vla_data_juicer_agents.navigation.models import _validate_date
 
 
-TASK_SCHEMA_VERSION = 3
+TASK_SCHEMA_VERSION = 4
 
 
 def utc_now() -> str:
@@ -151,7 +151,11 @@ class NavigationTask(BaseModel):
     guidance_revision: int = 0
     state_revision: int = Field(default=0, ge=0)
     status: NavigationTaskStatus = NavigationTaskStatus.ACTIVE
-    accepted_plan_phase: Literal["extract_sync", "finish_processing"] | None = None
+    accepted_plan_phase: Literal[
+        "extract_sync",
+        "finish_processing",
+        "trajectory_review",
+    ] | None = None
     created_by_web_session_id: str
     agentscope_session_id: str
     schema_version: int = TASK_SCHEMA_VERSION
@@ -188,3 +192,39 @@ class NavigationRunningWriter(BaseModel):
     action: str
     date: str
     segments: list[str] | None = None
+
+
+class NavigationTaskOutcome(BaseModel):
+    """Immutable public-workflow outcome attached outside the core task row."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    task_id: str
+    requested_outcome: Literal[
+        "auto",
+        "extract_sync",
+        "postprocessing",
+        "postprocessing_and_fix",
+        "trajectory_fix",
+    ] = "auto"
+    completion_outcome: Literal[
+        "extract_sync_completed",
+        "postprocessing_completed_fix_pending",
+        "trajectory_review_completed",
+        "processing_completed_no_fix",
+    ] | None = None
+    revision: int = Field(default=1, ge=1)
+    metadata: dict[str, Any] = Field(default_factory=dict)
+    created_at: str = Field(default_factory=utc_now)
+    updated_at: str = Field(default_factory=utc_now)
+
+
+class NavigationTaskLineage(BaseModel):
+    """Server-owned relationship between a completed task and a linked child."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    parent_task_id: str
+    child_task_id: str
+    relation: Literal["trajectory_fix"]
+    created_at: str = Field(default_factory=utc_now)

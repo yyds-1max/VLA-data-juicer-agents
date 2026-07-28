@@ -16,6 +16,7 @@ from vla_data_juicer_agents.navigation.runtime_manifest import validate_manifest
 
 
 _PROCESSING_PROFILES = frozenset({"20260320", "20260529_go2w"})
+_FIX_PROFILES = _PROCESSING_PROFILES | frozenset({"20260409_U"})
 
 
 @dataclass(frozen=True)
@@ -52,25 +53,39 @@ class CalibrationCatalog:
             if source_root is not None
             else _optional_path("VLA_NAVIGATION_ODOM_V1_SOURCE")
         )
-        self._profiles = self._load()
+        self._profiles_by_purpose = self._load()
+        # Retain the M1 private attribute for compatibility with existing
+        # deployment checks while routing all new reads through purpose.
+        self._profiles = self._profiles_by_purpose["processing"]
 
     @classmethod
     def default(cls) -> "CalibrationCatalog":
         repository_root = Path(__file__).resolve().parents[3]
         return cls(repository_root / "runtime" / "navigation_odom_v1" / "manifest.json")
 
-    def list_profiles(self) -> list[dict[str, str]]:
+    def list_profiles(
+        self,
+        *,
+        purpose: str = "processing",
+    ) -> list[dict[str, str]]:
+        profiles = self._purpose_profiles(purpose)
         return [
-            self._profiles[key].public_projection()
-            for key in sorted(self._profiles)
+            profiles[key].public_projection()
+            for key in sorted(profiles)
         ]
 
-    def get(self, profile_ref: str, expected_sha256: str) -> CalibrationProfile:
-        profile = self._profiles.get(profile_ref)
+    def get(
+        self,
+        profile_ref: str,
+        expected_sha256: str,
+        *,
+        purpose: str = "processing",
+    ) -> CalibrationProfile:
+        profile = self._purpose_profiles(purpose).get(profile_ref)
         if profile is None:
             raise AnnotationValidationError(
                 "unknown_calibration_profile",
-                "The selected processing calibration is not available.",
+                f"The selected {purpose} calibration is not available.",
             )
         if profile.content_sha256 != expected_sha256:
             raise AnnotationConflictError(
@@ -153,43 +168,70 @@ class CalibrationCatalog:
             )
         return captured, aggregate
 
-    def _load(self) -> dict[str, CalibrationProfile]:
+    def _purpose_profiles(self, purpose: str) -> dict[str, CalibrationProfile]:
+        if purpose not in {"processing", "fix"}:
+            raise AnnotationValidationError(
+                "unsupported_calibration_inventory",
+                "The selected calibration inventory is unavailable.",
+            )
+        return self._profiles_by_purpose[purpose]
+
+    def _load(self) -> dict[str, dict[str, CalibrationProfile]]:
         try:
             document = json.loads(self.manifest_path.read_text(encoding="utf-8"))
         except (OSError, json.JSONDecodeError) as exc:
             raise RuntimeError("unable to read navigation runtime manifest") from exc
         manifest = validate_manifest(document)
-        grouped: dict[str, list[dict[str, Any]]] = {}
+        grouped: dict[str, dict[str, list[dict[str, Any]]]] = {
+            "processing": {},
+            "fix": {},
+        }
         for entry in manifest["entries"]:
             if entry["kind"] != "frozen_file" or entry["role"] != "selectable_profile":
                 continue
-            if entry["stage"] != "calibration":
+            purposes = {
+                "calibration": ("processing", "fix"),
+                "fix_calibration": ("fix",),
+            }.get(entry["stage"])
+            if purposes is None:
                 continue
             parts = Path(entry["relative_path"]).parts
             if len(parts) < 4 or parts[-2] != "sensors":
                 continue
             profile_ref = parts[-3]
-            if profile_ref in _PROCESSING_PROFILES:
-                grouped.setdefault(profile_ref, []).append(entry)
-        if set(grouped) != _PROCESSING_PROFILES:
+            for purpose in purposes:
+                expected = (
+                    _PROCESSING_PROFILES
+                    if purpose == "processing"
+                    else _FIX_PROFILES
+                )
+                if profile_ref in expected:
+                    grouped[purpose].setdefault(profile_ref, []).append(entry)
+        if set(grouped["processing"]) != _PROCESSING_PROFILES:
             raise RuntimeError("processing calibration inventory is incomplete")
-        result: dict[str, CalibrationProfile] = {}
-        for profile_ref, entries in grouped.items():
-            ordered = sorted(entries, key=lambda item: item["relative_path"])
-            file_fingerprints = [
-                {
-                    "relative_path": Path(item["relative_path"]).name,
-                    "sha256": item["sha256"],
-                    "size": item["size"],
-                }
-                for item in ordered
-            ]
-            result[profile_ref] = CalibrationProfile(
-                profile_ref=profile_ref,
-                label=profile_ref,
-                content_sha256=_canonical_sha256(file_fingerprints),
-                files=tuple(ordered),
-            )
+        if set(grouped["fix"]) != _FIX_PROFILES:
+            raise RuntimeError("fix calibration inventory is incomplete")
+        result: dict[str, dict[str, CalibrationProfile]] = {
+            "processing": {},
+            "fix": {},
+        }
+        for purpose, purpose_groups in grouped.items():
+            for profile_ref, entries in purpose_groups.items():
+                ordered = sorted(entries, key=lambda item: item["relative_path"])
+                file_fingerprints = [
+                    {
+                        "relative_path": Path(item["relative_path"]).name,
+                        "sha256": item["sha256"],
+                        "size": item["size"],
+                    }
+                    for item in ordered
+                ]
+                result[purpose][profile_ref] = CalibrationProfile(
+                    profile_ref=profile_ref,
+                    label=profile_ref,
+                    content_sha256=_canonical_sha256(file_fingerprints),
+                    files=tuple(ordered),
+                )
         return result
 
 

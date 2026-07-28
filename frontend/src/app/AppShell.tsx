@@ -18,6 +18,21 @@ const AnnotationPage = lazy(() =>
     default: AnnotationPage,
   })),
 );
+const AnnotationWorkspaceLayout = lazy(() =>
+  import("../features/annotation/AnnotationWorkspaceLayout").then(
+    ({ AnnotationWorkspaceLayout }) => ({ default: AnnotationWorkspaceLayout }),
+  ),
+);
+const AnnotationReviewsPage = lazy(() =>
+  import("../features/annotation/AnnotationReviewsPage").then(
+    ({ AnnotationReviewsPage }) => ({ default: AnnotationReviewsPage }),
+  ),
+);
+const TrajectoryFixPage = lazy(() =>
+  import("../features/annotation/TrajectoryFixPage").then(
+    ({ TrajectoryFixPage }) => ({ default: TrajectoryFixPage }),
+  ),
+);
 const DataManagementPage = lazy(() =>
   import("../features/console/pages/DataManagementPage").then(({ DataManagementPage }) => ({
     default: DataManagementPage,
@@ -114,7 +129,7 @@ export function AppShell({ children }: AppShellProps) {
     }
   }, [sidebarCollapsed]);
 
-  const activePage: ConsolePageId = location.pathname.startsWith("/annotation/jobs")
+  const activePage: ConsolePageId = location.pathname.startsWith("/annotation")
     ? "annotate"
     : location.pathname.startsWith("/agent")
       ? "agent"
@@ -148,9 +163,14 @@ export function AppShell({ children }: AppShellProps) {
             <Route path="/" element={<DashboardPage />} />
             <Route path="/agent" element={<AgentWorkflowPage onPlaceholderAction={showPlaceholderToast} />} />
             <Route path="/data" element={<DataManagementPage onPlaceholderAction={showPlaceholderToast} />} />
-            <Route path="/annotation/jobs" element={<AnnotationPage />} />
-            <Route path="/annotation/jobs/:jobRef" element={<AnnotationPage />} />
-            <Route path="/annotation/jobs/:jobRef/segments/:segmentRef" element={<AnnotationPage />} />
+            <Route path="/annotation" element={<AnnotationWorkspaceLayout />}>
+              <Route index element={<Navigate to="/annotation/jobs" replace />} />
+              <Route path="jobs" element={<AnnotationPage />} />
+              <Route path="jobs/:jobRef" element={<AnnotationPage />} />
+              <Route path="jobs/:jobRef/segments/:segmentRef" element={<AnnotationPage />} />
+              <Route path="reviews" element={<AnnotationReviewsPage />} />
+              <Route path="reviews/:reviewRef" element={<TrajectoryFixPage />} />
+            </Route>
             <Route path="/model" element={<ModelIterationPage onPlaceholderAction={showPlaceholderToast} />} />
             <Route path="/simulation" element={<SimulationPage onPlaceholderAction={showPlaceholderToast} />} />
             <Route path="*" element={<Navigate to="/" replace />} />

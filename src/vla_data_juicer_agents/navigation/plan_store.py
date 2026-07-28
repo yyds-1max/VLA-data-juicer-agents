@@ -23,6 +23,7 @@ from vla_data_juicer_agents.navigation.plan_models import (
     FinishProcessingPlanInput,
     NavigationPlanRecord,
     PlanSubmissionAttempt,
+    TrajectoryReviewPlanInput,
 )
 from vla_data_juicer_agents.navigation.task_state import NavigationTask, utc_now
 from vla_data_juicer_agents.navigation.schema import initialize_navigation_schema
@@ -38,7 +39,7 @@ from vla_data_juicer_agents.navigation.planning_context import (
 )
 
 
-PLAN_CONTRACT_VERSION = "navigation-plan-v3"
+PLAN_CONTRACT_VERSION = "navigation-plan-v4"
 MAX_EXECUTION_READ_CHARS = 4000
 MAX_RESULT_OUTBOX_CHARS = 262_144
 MAX_HUMAN_DECISION_CHARS = 16_384
@@ -51,7 +52,7 @@ _SENSITIVE_KEYS = {
     "api_key",
     "cookie",
 }
-PlanPhase = Literal["extract_sync", "finish_processing"]
+PlanPhase = Literal["extract_sync", "finish_processing", "trajectory_review"]
 ExecutionStatus = Literal[
     "pending",
     "running",
@@ -303,7 +304,12 @@ class SqliteNavigationPlanRepository:
         task: NavigationTask,
         phase: PlanPhase | str,
         observation_revision: int,
-        plan: ExtractSyncPlanInput | FinishProcessingPlanInput | dict[str, Any],
+        plan: (
+            ExtractSyncPlanInput
+            | FinishProcessingPlanInput
+            | TrajectoryReviewPlanInput
+            | dict[str, Any]
+        ),
         *, expected_web_session_id: str | None = None,
         expected_agentscope_session_id: str | None = None,
         expected_planning_context_revision: str | None = None,
@@ -1231,8 +1237,21 @@ class SqliteNavigationPlanRepository:
     ) -> StagedStepResult:
         """Durably stage a post-side-effect result before crossing to file evidence."""
         self._ensure_within_limit(result_summary, label="execution result summary")
-        if expected_statuses != ("running",):
-            raise ValueError("claimed execution results must be staged from running")
+        workflow_handoff_actions = {
+            "run_annotation_tracking_workflow",
+            "run_annotation_postprocessing_workflow",
+            "open_trajectory_fix_workbench",
+            "validate_trajectory_review_outcome",
+        }
+        if expected_statuses != ("running",) and not (
+            expected_action in workflow_handoff_actions
+            and set(expected_statuses).issubset({"pending", "waiting_user"})
+            and expected_statuses
+        ):
+            raise ValueError(
+                "execution results must be staged from a claimed run or "
+                "an authorized workflow handoff"
+            )
         canonical_full = self._canonical_json(full_result)
         if len(canonical_full.encode("utf-8")) > MAX_RESULT_OUTBOX_CHARS:
             raise ValueError(
@@ -1475,6 +1494,37 @@ class SqliteNavigationPlanRepository:
                             and terminal_validation is not None
                         ):
                             attempt_status = "completed"
+                            self._record_task_outcome_in_transaction(
+                                connection,
+                                task_id=plan_row["task_id"],
+                                completion_outcome=(
+                                    "postprocessing_completed_fix_pending"
+                                ),
+                            )
+                        elif plan_row["phase"] == "trajectory_review":
+                            review_validation = connection.execute(
+                                """SELECT 1
+                                   FROM navigation_task_steps
+                                   WHERE plan_id = ?
+                                     AND tool_name =
+                                         'validate_trajectory_review_outcome'
+                                     AND status = 'completed'
+                                     AND sequence = (
+                                         SELECT MAX(sequence)
+                                         FROM navigation_task_steps
+                                         WHERE plan_id = ?
+                                     )""",
+                                (plan_id, plan_id),
+                            ).fetchone()
+                            if review_validation is not None:
+                                attempt_status = "completed"
+                                self._record_task_outcome_in_transaction(
+                                    connection,
+                                    task_id=plan_row["task_id"],
+                                    completion_outcome=(
+                                        "trajectory_review_completed"
+                                    ),
+                                )
                         connection.execute(
                             """UPDATE navigation_tasks
                                SET status = ?, updated_at = ?
@@ -2287,6 +2337,26 @@ class SqliteNavigationPlanRepository:
                 ),
             )
 
+    @staticmethod
+    def _record_task_outcome_in_transaction(
+        connection: sqlite3.Connection,
+        *,
+        task_id: str,
+        completion_outcome: str,
+    ) -> None:
+        timestamp = utc_now()
+        connection.execute(
+            """INSERT INTO navigation_task_outcomes (
+                   task_id, requested_outcome, completion_outcome, revision,
+                   metadata_json, created_at, updated_at
+               ) VALUES (?, 'auto', ?, 1, '{}', ?, ?)
+               ON CONFLICT(task_id) DO UPDATE SET
+                   completion_outcome = excluded.completion_outcome,
+                   revision = navigation_task_outcomes.revision + 1,
+                   updated_at = excluded.updated_at""",
+            (task_id, completion_outcome, timestamp, timestamp),
+        )
+
     def _require_plan(self, plan_id: str) -> NavigationPlanRecord:
         plan = self.get(plan_id)
         if plan is None:
@@ -2296,16 +2366,29 @@ class SqliteNavigationPlanRepository:
     @staticmethod
     def _normalize_phase(phase: PlanPhase | str) -> PlanPhase:
         value = str(phase)
-        if value not in {"extract_sync", "finish_processing"}:
+        if value not in {
+            "extract_sync",
+            "finish_processing",
+            "trajectory_review",
+        }:
             raise ValueError(f"unsupported navigation plan phase: {value}")
         return cast(PlanPhase, value)
 
     @staticmethod
     def _validate_plan_for_phase(
         phase: PlanPhase,
-        plan: ExtractSyncPlanInput | FinishProcessingPlanInput | dict[str, Any],
-    ) -> ExtractSyncPlanInput | FinishProcessingPlanInput:
-        model = ExtractSyncPlanInput if phase == "extract_sync" else FinishProcessingPlanInput
+        plan: (
+            ExtractSyncPlanInput
+            | FinishProcessingPlanInput
+            | TrajectoryReviewPlanInput
+            | dict[str, Any]
+        ),
+    ) -> ExtractSyncPlanInput | FinishProcessingPlanInput | TrajectoryReviewPlanInput:
+        model = {
+            "extract_sync": ExtractSyncPlanInput,
+            "finish_processing": FinishProcessingPlanInput,
+            "trajectory_review": TrajectoryReviewPlanInput,
+        }[phase]
         return model.model_validate(plan)
 
     @staticmethod
@@ -2362,15 +2445,26 @@ class SqliteNavigationPlanRepository:
             ExtractSyncPlanInput
             if row["phase"] == "extract_sync"
             else FinishProcessingPlanInput
+            if row["phase"] == "finish_processing"
+            else TrajectoryReviewPlanInput
         )
         plan_payload = json.loads(row["plan_json"])
         if (
-            row["contract_version"] == "navigation-plan-v2"
+            row["contract_version"]
+            in {"navigation-plan-v1", "navigation-plan-v2"}
             and row["phase"] == "extract_sync"
         ):
             time_sync = plan_payload.get("decisions", {}).get("time_sync")
             if isinstance(time_sync, dict):
                 time_sync.pop("tolerance_ms", None)
+        if row["contract_version"] == "navigation-plan-v1":
+            for step in plan_payload.get("steps", []):
+                if not isinstance(step, dict):
+                    continue
+                step.setdefault("depends_on", [])
+                step.setdefault("failure_policy", "stop")
+                step.setdefault("decision_refs", [])
+                step.setdefault("arguments", {})
         return NavigationPlanRecord(
             plan_id=row["plan_id"],
             task_id=row["task_id"],

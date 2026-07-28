@@ -11,6 +11,7 @@ from navigation_agentscope_harness import ScriptedChatModel, runtime_config
 from vla_data_juicer_agents.evaluation.host import (
     EvaluationHost,
     RecordingRouterRuntime,
+    run_navigation_case,
     run_router_case,
 )
 from vla_data_juicer_agents.evaluation.trace import (
@@ -567,6 +568,212 @@ async def test_v1_multiturn_start_then_stop_reuses_runtime_context(tmp_path):
     assert len(result.model_calls) == 2
     assert sum(event["type"] == "REPLY_END" for event in result.events) == 2
     assert result.final_text == ""
+    assert result.forbidden_calls == ()
+    model.assert_exhausted()
+
+
+@pytest.mark.asyncio
+async def test_navigation_evaluation_host_records_postprocessing_plan_without_io(
+    tmp_path,
+):
+    model = ScriptedChatModel()
+    model.enqueue_tool("inspect_navigation_annotation_job_facts_tool", {})
+    model.enqueue_tool("inspect_navigation_localization_sources_tool", {})
+    model.enqueue_tool("inspect_navigation_gridmap_artifacts_tool", {})
+    model.enqueue_tool("inspect_navigation_runtime_assets_tool", {})
+    model.enqueue_tool("get_navigation_task_context_tool", {})
+    model.enqueue_tool(
+        "submit_finish_processing_plan_tool",
+        {
+            "planning_context_revision": "eval-context-5",
+            "plan": {
+                "decisions": {
+                    "localization": {
+                        "reason": "已观察到 odom 且转换能力可用",
+                        "evidence_refs": ["localization_sources:eval"],
+                        "source": "odom",
+                        "conversion": "odom_to_ins",
+                    },
+                    "gridmap": {
+                        "reason": "已有同步 gridmap 可复用",
+                        "evidence_refs": ["gridmap_artifacts:eval"],
+                        "source": "existing_gridmap",
+                    },
+                    "calibration": {
+                        "reason": "沿用 Annotation Job 冻结的处理标定快照",
+                        "evidence_refs": ["annotation_job_facts:eval"],
+                        "mode": "annotation_snapshot",
+                        "selected_sensor_source": None,
+                        "requires_user_confirmation": False,
+                    },
+                },
+                "steps": [
+                    {
+                        "step_id": "prepare_gridmap",
+                        "action": "prepare_gridmap_for_projection",
+                        "variant": "copy_existing_gridmap",
+                        "arguments": {},
+                        "depends_on": [],
+                        "failure_policy": "stop",
+                        "decision_refs": ["gridmap"],
+                    },
+                    {
+                        "step_id": "project_trajectory",
+                        "action": "run_projection_and_trajectory",
+                        "variant": "cjl_0525_with_gridmap",
+                        "arguments": {},
+                        "depends_on": ["prepare_gridmap"],
+                        "failure_policy": "stop",
+                        "decision_refs": ["localization", "calibration", "gridmap"],
+                    },
+                    {
+                        "step_id": "validate_outputs",
+                        "action": "validate_navigation_outputs",
+                        "variant": "expect_gridmap",
+                        "arguments": {},
+                        "depends_on": ["project_trajectory"],
+                        "failure_policy": "stop",
+                        "decision_refs": ["localization", "gridmap"],
+                    },
+                ],
+            },
+        },
+    )
+    model.enqueue_tool(
+        "prepare_gridmap_for_projection_tool",
+        {"plan_id": "eval-plan", "step_id": "prepare_gridmap"},
+    )
+    model.enqueue_text("Answer:\n后处理计划已验证，系统已开始执行。")
+
+    result = await run_navigation_case(
+        "执行自动标注并完成后处理",
+        config=runtime_config(tmp_path),
+        workspace_root=tmp_path,
+        web_session_id="navigation-postprocessing",
+        model_factory=_model_factory(model),
+        runtime_setup={
+            "navigation_task": {
+                "dataset_date": "20270623",
+                "selection": {
+                    "kind": "selected_clips",
+                    "clips": ["20260623_145550"],
+                },
+                "scene_mode": "out",
+                "requested_outcome": "postprocessing",
+            },
+        },
+    )
+
+    assert result.session_id == "navigation-postprocessing__navigation-data-agent"
+    assert result.handoffs == (
+        {
+            "operation": "submit_plan",
+            "phase": "finish_processing",
+            "decision_modes": {
+                "calibration": "annotation_snapshot",
+                "gridmap": "existing_gridmap",
+                "localization": "odom",
+            },
+            "step_actions": [
+                "prepare_gridmap_for_projection",
+                "run_projection_and_trajectory",
+                "validate_navigation_outputs",
+            ],
+            "step_variants": {
+                "prepare_gridmap_for_projection": "copy_existing_gridmap",
+                "run_projection_and_trajectory": "cjl_0525_with_gridmap",
+                "validate_navigation_outputs": "expect_gridmap",
+            },
+        },
+    )
+    assert [call["name"] for call in result.tool_calls][-2:] == [
+        "submit_finish_processing_plan_tool",
+        "prepare_gridmap_for_projection_tool",
+    ]
+    assert result.forbidden_calls == ()
+    model.assert_exhausted()
+
+
+@pytest.mark.asyncio
+async def test_navigation_evaluation_host_records_linked_review_plan(tmp_path):
+    model = ScriptedChatModel()
+    model.enqueue_tool("inspect_navigation_annotation_job_facts_tool", {})
+    model.enqueue_tool("get_navigation_task_context_tool", {})
+    model.enqueue_tool(
+        "submit_trajectory_review_plan_tool",
+        {
+            "planning_context_revision": "eval-context-2",
+            "plan": {
+                "decisions": {
+                    "review": {
+                        "reason": "存在待人工复核的轨迹版本",
+                        "evidence_refs": ["annotation_job_facts:eval"],
+                        "mode": "human_fix",
+                    },
+                },
+                "steps": [
+                    {
+                        "step_id": "open_fix",
+                        "action": "open_trajectory_fix_workbench",
+                        "variant": "durable_human_handoff",
+                        "arguments": {},
+                        "depends_on": [],
+                        "failure_policy": "stop",
+                        "decision_refs": ["review"],
+                    },
+                    {
+                        "step_id": "validate_review",
+                        "action": "validate_trajectory_review_outcome",
+                        "variant": "approved_or_terminal",
+                        "arguments": {},
+                        "depends_on": ["open_fix"],
+                        "failure_policy": "stop",
+                        "decision_refs": ["review"],
+                    },
+                ],
+            },
+        },
+    )
+    model.enqueue_tool(
+        "open_trajectory_fix_workbench_tool",
+        {"plan_id": "eval-plan", "step_id": "open_fix"},
+    )
+    model.enqueue_text("Answer:\n人工 Fix 工作台已经准备好。")
+
+    result = await run_navigation_case(
+        "继续 Fix",
+        config=runtime_config(tmp_path),
+        workspace_root=tmp_path,
+        web_session_id="navigation-fix",
+        model_factory=_model_factory(model),
+        runtime_setup={
+            "navigation_task": {
+                "dataset_date": "20270623",
+                "selection": {
+                    "kind": "selected_clips",
+                    "clips": ["20260623_145550"],
+                },
+                "scene_mode": "out",
+                "requested_outcome": "trajectory_fix",
+            },
+        },
+    )
+
+    assert result.handoffs == (
+        {
+            "operation": "submit_plan",
+            "phase": "trajectory_review",
+            "decision_modes": {"review": "human_fix"},
+            "step_actions": [
+                "open_trajectory_fix_workbench",
+                "validate_trajectory_review_outcome",
+            ],
+            "step_variants": {
+                "open_trajectory_fix_workbench": "durable_human_handoff",
+                "validate_trajectory_review_outcome": "approved_or_terminal",
+            },
+        },
+    )
     assert result.forbidden_calls == ()
     model.assert_exhausted()
 

@@ -454,6 +454,36 @@ def test_frontend_index_served_when_dist_provided(tmp_path: Path):
     assert api_response.status_code == 200
 
 
+def test_annotation_workspace_deep_links_serve_spa_index(tmp_path: Path):
+    dist = tmp_path / "dist"
+    dist.mkdir()
+    index = "<!doctype html><main>Annotation workspace</main>"
+    (dist / "index.html").write_text(index, encoding="utf-8")
+    app = create_app(
+        working_dir=str(tmp_path / ".djx"),
+        db_path=tmp_path / "sessions.sqlite",
+        frontend_dist=dist,
+        agentscope_runtime=FakeAgentScopeRuntime(),
+    )
+    client = TestClient(app)
+
+    for path in (
+        "/annotation",
+        "/annotation/jobs",
+        "/annotation/jobs/job_0123456789abcdef0123456789abcdef",
+        (
+            "/annotation/jobs/job_0123456789abcdef0123456789abcdef/"
+            "segments/segment_0123456789abcdef0123456789abcdef"
+        ),
+        "/annotation/reviews",
+        "/annotation/reviews/review_0123456789abcdef0123456789abcdef",
+    ):
+        response = client.get(path)
+        assert response.status_code == 200
+        assert response.text == index
+        assert response.headers["content-type"].startswith("text/html")
+
+
 def test_frontend_index_served_from_env_dist(monkeypatch, tmp_path: Path):
     dist = tmp_path / "dist"
     dist.mkdir()

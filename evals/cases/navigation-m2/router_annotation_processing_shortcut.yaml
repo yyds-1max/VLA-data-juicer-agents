@@ -1,0 +1,38 @@
+schema_version: 2
+id: router_annotation_processing_shortcut
+suite: navigation-m2
+entrypoint: router
+tags: [m2, router, annotation, shortcut, trusted-scope]
+runtime_setup:
+  request_context:
+    kind: navigation_dataset_selection_v1
+    dataset_date: "20270623"
+    selection:
+      kind: selected_clips
+      clips: ["20260623_145550"]
+conversation:
+  - role: user
+    content: 执行自动标注并完成后处理。
+limits:
+  max_model_calls: 1
+  max_tool_calls: 1
+  timeout_seconds: 180
+expectations:
+  tools:
+    allowed_calls: [start_navigation_data_task]
+    required_counts:
+      start_navigation_data_task: 1
+    handoff_count: 1
+    handoff:
+      operation: start
+      scope_source: request_context
+      dataset_date: "20270623"
+      selection:
+        kind: selected_clips
+        clips: ["20260623_145550"]
+      requested_outcome: postprocessing
+      forbidden_fields:
+        [request, target, date, clips, segments, reason, response_language, task_id, run_id]
+  response:
+    forbidden_terms:
+      [MainRouterAgent, NavigationDataAgent, start_navigation_data_task, task_id, run_id, call_id, system prompt, 系统提示词]

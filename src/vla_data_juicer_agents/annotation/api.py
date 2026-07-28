@@ -7,12 +7,19 @@ from fastapi.responses import Response
 
 from vla_data_juicer_agents.annotation.application import AnnotationApplicationService
 from vla_data_juicer_agents.annotation.models import (
+    ApplyFixCommandRequest,
     AnnotationConflictError,
     AnnotationNotFoundError,
     AnnotationValidationError,
+    ApproveReviewRequest,
+    CreateFixRevisionRequest,
+    CreateFixSessionRequest,
     CreateAnnotationJobRequest,
+    DiscardReviewRequest,
     DraftRequest,
     ExpectedJobRevisionRequest,
+    RetryPublicationRequest,
+    ReturnReviewRequest,
     SegmentRevisionRequest,
     SkipRequest,
     SubmitRequest,
@@ -36,15 +43,15 @@ def create_annotation_router(
         domain: str = Query(default="navigation"),
         purpose: str = Query(default="processing"),
     ) -> dict[str, Any]:
-        if domain != "navigation" or purpose != "processing":
+        if domain != "navigation" or purpose not in {"processing", "fix"}:
             raise HTTPException(
                 status_code=400,
                 detail={
                     "code": "unsupported_calibration_inventory",
-                    "message": "Only navigation processing calibration is available in M1.",
+                    "message": "The requested calibration inventory is unavailable.",
                 },
             )
-        return service.list_calibration_profiles()
+        return _translate(service.list_calibration_profiles, purpose=purpose)
 
     @router.post("/jobs", status_code=201)
     def create_job(
@@ -217,6 +224,158 @@ def create_annotation_router(
             "unskip",
             job_ref,
             segment_ref,
+            request,
+            idempotency_key=idempotency_key,
+        )
+
+    @router.get("/reviews")
+    def list_reviews(
+        status: str | None = Query(default=None),
+        dataset_date: str | None = Query(
+            default=None,
+            pattern=r"^[0-9]{8}$",
+        ),
+        source_clip: str | None = Query(default=None, min_length=1, max_length=200),
+    ) -> dict[str, Any]:
+        return _translate(
+            service.list_reviews,
+            status=status,
+            dataset_date=dataset_date,
+            source_clip=source_clip,
+        )
+
+    @router.get("/reviews/{review_ref}")
+    def get_review(review_ref: str) -> dict[str, Any]:
+        return _translate(service.get_review, review_ref)
+
+    @router.get("/reviews/{review_ref}/evidence/trajectory")
+    def get_review_trajectory_evidence(
+        review_ref: str,
+    ) -> dict[str, Any]:
+        return _translate(
+            service.get_review_trajectory_evidence,
+            review_ref,
+        )
+
+    @router.get(
+        "/reviews/{review_ref}/evidence/frames/{frame_index}/{kind}"
+    )
+    def get_review_evidence_file(
+        review_ref: str,
+        frame_index: int,
+        kind: str,
+    ) -> Response:
+        if frame_index < 0 or kind not in {"camera", "gridmap"}:
+            raise HTTPException(
+                status_code=404,
+                detail={
+                    "code": "annotation_not_found",
+                    "message": "Annotation evidence not found.",
+                },
+            )
+        content, etag, media_type = _translate(
+            service.resolve_review_evidence_file,
+            review_ref,
+            frame_index=frame_index,
+            kind=kind,
+        )
+        return Response(
+            content=content,
+            media_type=media_type,
+            headers={
+                "ETag": f'"{etag}"',
+                "Cache-Control": "private, no-cache",
+                "X-Content-Type-Options": "nosniff",
+            },
+        )
+
+    @router.post("/reviews/{review_ref}/fix-sessions", status_code=201)
+    def create_fix_session(
+        review_ref: str,
+        request: CreateFixSessionRequest,
+        idempotency_key: IdempotencyKey,
+    ) -> dict[str, Any]:
+        return _translate(
+            service.create_fix_session,
+            review_ref,
+            request,
+            idempotency_key=idempotency_key,
+        )
+
+    @router.post("/reviews/{review_ref}/fix-commands")
+    def apply_fix_command(
+        review_ref: str,
+        request: ApplyFixCommandRequest,
+        idempotency_key: IdempotencyKey,
+    ) -> dict[str, Any]:
+        return _translate(
+            service.apply_fix_command,
+            review_ref,
+            request,
+            idempotency_key=idempotency_key,
+        )
+
+    @router.post("/reviews/{review_ref}/fix-revisions", status_code=201)
+    def create_fix_revision(
+        review_ref: str,
+        request: CreateFixRevisionRequest,
+        idempotency_key: IdempotencyKey,
+    ) -> dict[str, Any]:
+        return _translate(
+            service.create_fix_revision,
+            review_ref,
+            request,
+            idempotency_key=idempotency_key,
+        )
+
+    @router.post("/reviews/{review_ref}/approve")
+    def approve_review(
+        review_ref: str,
+        request: ApproveReviewRequest,
+        idempotency_key: IdempotencyKey,
+    ) -> dict[str, Any]:
+        return _translate(
+            service.approve_review,
+            review_ref,
+            request,
+            idempotency_key=idempotency_key,
+        )
+
+    @router.post("/reviews/{review_ref}/return")
+    def return_review(
+        review_ref: str,
+        request: ReturnReviewRequest,
+        idempotency_key: IdempotencyKey,
+    ) -> dict[str, Any]:
+        return _translate(
+            service.return_review,
+            review_ref,
+            request,
+            idempotency_key=idempotency_key,
+        )
+
+    @router.post("/reviews/{review_ref}/discard")
+    def discard_review(
+        review_ref: str,
+        request: DiscardReviewRequest,
+        idempotency_key: IdempotencyKey,
+    ) -> dict[str, Any]:
+        return _translate(
+            service.discard_review,
+            review_ref,
+            request,
+            idempotency_key=idempotency_key,
+        )
+
+    @router.post("/reviews/{review_ref}/retry-publication")
+    def retry_publication(
+        review_ref: str,
+        request: RetryPublicationRequest,
+        idempotency_key: IdempotencyKey,
+    ) -> dict[str, Any]:
+        return _translate(
+            service.retry_publication,
+            review_ref,
             request,
             idempotency_key=idempotency_key,
         )

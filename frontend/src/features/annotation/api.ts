@@ -7,7 +7,12 @@ import type {
   AnnotationTarget,
   CalibrationProfile,
   CreateAnnotationJobRequest,
+  FixCommand,
+  TrajectoryReview,
+  TrajectoryReviewEvidence,
+  TrajectoryReviewStatus,
 } from "./types";
+import { parseTrajectoryReviewEvidence } from "./trajectoryEvidence";
 
 const ROOT = "/api/annotation";
 
@@ -86,9 +91,11 @@ export async function getAnnotationCapabilities(): Promise<AnnotationCapability>
   return requestJson<AnnotationCapability>(`${ROOT}/capabilities`);
 }
 
-export async function getCalibrationProfiles(): Promise<CalibrationProfile[]> {
+export async function getCalibrationProfiles(
+  purpose: "processing" | "fix" = "processing",
+): Promise<CalibrationProfile[]> {
   const data = await requestJson<{ profiles: CalibrationProfile[] }>(
-    `${ROOT}/calibration-profiles?domain=navigation&purpose=processing`,
+    `${ROOT}/calibration-profiles?domain=navigation&purpose=${purpose}`,
   );
   return data.profiles;
 }
@@ -207,4 +214,124 @@ export async function skipAnnotationSegment(
     }, idempotencyKey),
   );
   return unwrapSegment(data);
+}
+
+function reviewPath(reviewRef: string): string {
+  return `${ROOT}/reviews/${encodeURIComponent(reviewRef)}`;
+}
+
+function unwrapReview(
+  value: TrajectoryReview | { review: TrajectoryReview },
+): TrajectoryReview {
+  return "review" in value ? value.review : value;
+}
+
+export async function listTrajectoryReviews(filters?: {
+  status?: TrajectoryReviewStatus;
+  datasetDate?: string;
+  sourceClip?: string;
+}): Promise<TrajectoryReview[]> {
+  const params = new URLSearchParams();
+  if (filters?.status) params.set("status", filters.status);
+  if (filters?.datasetDate) params.set("dataset_date", filters.datasetDate);
+  if (filters?.sourceClip) params.set("source_clip", filters.sourceClip);
+  const query = params.size ? `?${params.toString()}` : "";
+  const data = await requestJson<
+    { reviews: TrajectoryReview[] } | TrajectoryReview[]
+  >(`${ROOT}/reviews${query}`);
+  return Array.isArray(data) ? data : data.reviews;
+}
+
+export async function getTrajectoryReview(reviewRef: string): Promise<TrajectoryReview> {
+  const data = await requestJson<TrajectoryReview | { review: TrajectoryReview }>(
+    reviewPath(reviewRef),
+  );
+  return unwrapReview(data);
+}
+
+export async function getTrajectoryReviewEvidence(
+  reviewRef: string,
+): Promise<TrajectoryReviewEvidence> {
+  const data = await requestJson<unknown>(
+    `${reviewPath(reviewRef)}/evidence/trajectory`,
+  );
+  return parseTrajectoryReviewEvidence(data, reviewRef);
+}
+
+export async function createFixSession(
+  reviewRef: string,
+  body: {
+    expected_review_revision: number;
+    calibration_profile_ref: string;
+    calibration_content_sha256: string;
+    calibration_difference_reason?: string;
+  },
+  idempotencyKey?: string,
+): Promise<TrajectoryReview> {
+  const data = await requestJson<TrajectoryReview | { review: TrajectoryReview }>(
+    `${reviewPath(reviewRef)}/fix-sessions`,
+    mutationInit(body, idempotencyKey),
+  );
+  return unwrapReview(data);
+}
+
+export async function applyFixCommand(
+  reviewRef: string,
+  body: {
+    expected_review_revision: number;
+    expected_draft_revision: number;
+    command: FixCommand;
+  },
+  idempotencyKey?: string,
+): Promise<TrajectoryReview> {
+  const data = await requestJson<TrajectoryReview | { review: TrajectoryReview }>(
+    `${reviewPath(reviewRef)}/fix-commands`,
+    mutationInit(body, idempotencyKey),
+  );
+  return unwrapReview(data);
+}
+
+export async function createFixRevision(
+  reviewRef: string,
+  body: {
+    expected_review_revision: number;
+    expected_draft_revision: number;
+  },
+  idempotencyKey?: string,
+): Promise<TrajectoryReview> {
+  const data = await requestJson<TrajectoryReview | { review: TrajectoryReview }>(
+    `${reviewPath(reviewRef)}/fix-revisions`,
+    mutationInit(body, idempotencyKey),
+  );
+  return unwrapReview(data);
+}
+
+export async function decideTrajectoryReview(
+  reviewRef: string,
+  action: "approve" | "return" | "discard",
+  body:
+    | { expected_review_revision: number; fix_revision_ref: string }
+    | { expected_review_revision: number; reason: string },
+  idempotencyKey?: string,
+): Promise<TrajectoryReview> {
+  const data = await requestJson<TrajectoryReview | { review: TrajectoryReview }>(
+    `${reviewPath(reviewRef)}/${action}`,
+    mutationInit(body, idempotencyKey),
+  );
+  return unwrapReview(data);
+}
+
+export async function retryReviewPublication(
+  reviewRef: string,
+  expectedReviewRevision: number,
+  idempotencyKey?: string,
+): Promise<TrajectoryReview> {
+  const data = await requestJson<TrajectoryReview | { review: TrajectoryReview }>(
+    `${reviewPath(reviewRef)}/retry-publication`,
+    mutationInit(
+      { expected_review_revision: expectedReviewRevision },
+      idempotencyKey,
+    ),
+  );
+  return unwrapReview(data);
 }

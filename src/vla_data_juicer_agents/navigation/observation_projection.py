@@ -164,6 +164,21 @@ def compact_observation_payload(
             "available_sources_preview": list(payload.available_sources),
             "conversion_available": payload.conversion_available,
         }
+    elif kind == "annotation_job_facts":
+        projection = {
+            "kind": kind,
+            "job_status": payload.job_status,
+            "segment_count": payload.segment_count,
+            "tracked_count": payload.tracked_count,
+            "skipped_count": payload.skipped_count,
+            "annotated_count": payload.annotated_count,
+            "ready_for_postprocessing": payload.ready_for_postprocessing,
+            "ready_for_trajectory_review": payload.ready_for_trajectory_review,
+            "processing_calibration_snapshot_available": (
+                payload.processing_calibration_snapshot_available
+            ),
+            "reviews": payload.reviews.model_dump(mode="json"),
+        }
     elif kind == "user_guidance":
         text = preview_string(payload.text)
         projection = {

@@ -62,6 +62,7 @@ _FIXED_TOOL_GROUP_BY_NAME = {
     "inspect_navigation_runtime_assets_tool": NAVIGATION_INVESTIGATION,
     "inspect_navigation_calibration_inventory_tool": NAVIGATION_INVESTIGATION,
     "inspect_navigation_localization_sources_tool": NAVIGATION_INVESTIGATION,
+    "inspect_navigation_annotation_job_facts_tool": NAVIGATION_INVESTIGATION,
     "inspect_navigation_artifact_state_tool": NAVIGATION_ARTIFACT_CHECKS,
     "inspect_navigation_gridmap_artifacts_tool": NAVIGATION_ARTIFACT_CHECKS,
     "get_navigation_task_context_tool": NAVIGATION_PLAN_AUTHORING,
@@ -70,6 +71,7 @@ _FIXED_TOOL_GROUP_BY_NAME = {
     "complete_navigation_task_tool": NAVIGATION_PLAN_AUTHORING,
     "submit_extract_sync_plan_tool": NAVIGATION_PLAN_AUTHORING,
     "submit_finish_processing_plan_tool": NAVIGATION_PLAN_AUTHORING,
+    "submit_trajectory_review_plan_tool": NAVIGATION_PLAN_AUTHORING,
     "get_plan_execution_overview_tool": NAVIGATION_EXECUTION_STATE,
     "get_current_plan_step_tool": NAVIGATION_EXECUTION_STATE,
 }

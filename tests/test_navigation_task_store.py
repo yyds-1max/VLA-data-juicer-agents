@@ -161,7 +161,7 @@ def test_task_store_idempotently_creates_supported_schema_generation(tmp_path: P
             row[1]: bool(row[2])
             for row in connection.execute("PRAGMA index_list(navigation_tasks)")
         }
-    assert generation == "navigation-attempts-final-v2"
+    assert generation == "navigation-attempts-m2-v1"
     assert task_columns == {
         "task_id",
         "request",
@@ -229,9 +229,13 @@ def test_fresh_task_store_creates_complete_final_navigation_schema(tmp_path: Pat
         "navigation_step_result_outbox",
         "navigation_human_decision_handoffs",
         "navigation_plan_submission_attempts",
+        "navigation_task_outcomes",
+        "navigation_task_lineage",
+        "navigation_schema_migrations",
+        "navigation_migration_safety",
     }
     assert triggers == NAVIGATION_AGGREGATE_REVISION_TRIGGER_NAMES
-    assert marker == [(1, "navigation-attempts-final-v2")]
+    assert marker == [(1, "navigation-attempts-m2-v1")]
 
 
 @pytest.mark.parametrize(
@@ -1001,3 +1005,120 @@ def test_task_store_round_trips_attempt_fields_and_finds_exact_session(
     assert loaded.status == NavigationTaskStatus.NEEDS_REPLAN
     assert by_session is not None
     assert by_session.task_id == updated.task_id
+
+
+def test_task_outcome_sidecar_round_trips_requested_outcome(tmp_path: Path):
+    store = SqliteNavigationTaskStore(tmp_path / "navigation_tasks.sqlite")
+
+    task = store.create_task_attempt(
+        request="执行自动标注并完成后处理",
+        target="navigation_data",
+        date="20270623",
+        segments=["clip-a"],
+        scene_mode=None,
+        dry_run=True,
+        web_session_id="web-outcome",
+        agentscope_session_id="agent-outcome",
+        requested_outcome="postprocessing_and_fix",
+    ).task
+
+    outcome = store.get_task_outcome(task.task_id)
+
+    assert outcome is not None
+    assert outcome.requested_outcome == "postprocessing_and_fix"
+    assert outcome.completion_outcome is None
+    assert outcome.metadata == {}
+
+
+def test_linked_fix_child_is_idempotent_and_does_not_reopen_parent(tmp_path: Path):
+    db_path = tmp_path / "navigation_tasks.sqlite"
+    store = SqliteNavigationTaskStore(db_path)
+    parent = store.create_task_attempt(
+        request="完成自动标注后处理",
+        target="navigation_data",
+        date="20270623",
+        segments=["clip-a", "clip-b"],
+        scene_mode="out",
+        dry_run=True,
+        web_session_id="web-linked",
+        agentscope_session_id="agent-parent",
+        requested_outcome="postprocessing",
+    ).task
+    parent = store.update_task_for_session(
+        parent.task_id,
+        web_session_id="web-linked",
+        agentscope_session_id="agent-parent",
+        expected_state_revision=parent.state_revision,
+        status=NavigationTaskStatus.COMPLETED,
+        accepted_plan_phase="finish_processing",
+    )
+    with sqlite3.connect(db_path) as connection:
+        connection.execute(
+            """UPDATE navigation_task_outcomes
+               SET completion_outcome = 'postprocessing_completed_fix_pending',
+                   revision = revision + 1
+               WHERE task_id = ?""",
+            (parent.task_id,),
+        )
+
+    first = store.create_linked_trajectory_fix_attempt(
+        parent_task_id=parent.task_id,
+        child_task_id="nav-fix-child",
+        request="继续 Fix",
+        web_session_id="web-linked",
+        agentscope_session_id="agent-child",
+    )
+    replay = store.create_linked_trajectory_fix_attempt(
+        parent_task_id=parent.task_id,
+        child_task_id="different-id-is-ignored-on-replay",
+        request="继续 Fix",
+        web_session_id="web-linked",
+        agentscope_session_id="agent-child",
+    )
+
+    durable_parent = store.get_task(parent.task_id)
+    child_outcome = store.get_task_outcome(first.task.task_id)
+    lineage = store.get_task_lineage(first.task.task_id)
+    assert first.created is True
+    assert replay.created is False
+    assert replay.task.task_id == first.task.task_id
+    assert durable_parent is not None
+    assert durable_parent.status == NavigationTaskStatus.COMPLETED
+    assert durable_parent.accepted_plan_phase == "finish_processing"
+    assert first.task.target == "trajectory_review"
+    assert first.task.date == durable_parent.date
+    assert first.task.segments == durable_parent.segments
+    assert child_outcome is not None
+    assert child_outcome.requested_outcome == "trajectory_fix"
+    assert lineage is not None
+    assert lineage.parent_task_id == parent.task_id
+    assert lineage.relation == "trajectory_fix"
+
+
+def test_linked_fix_child_requires_completed_postprocessing_outcome(tmp_path: Path):
+    store = SqliteNavigationTaskStore(tmp_path / "navigation_tasks.sqlite")
+    parent = store.create_task_attempt(
+        request="只做拆解同步",
+        target="navigation_data",
+        date="20270623",
+        segments=["clip-a"],
+        scene_mode=None,
+        dry_run=True,
+        web_session_id="web-ineligible",
+        agentscope_session_id="agent-ineligible",
+        requested_outcome="extract_sync",
+    ).task
+
+    with pytest.raises(
+        ValueError,
+        match="completed postprocessing parent",
+    ):
+        store.create_linked_trajectory_fix_attempt(
+            parent_task_id=parent.task_id,
+            child_task_id="nav-fix-ineligible",
+            request="继续 Fix",
+            web_session_id="web-ineligible",
+            agentscope_session_id="agent-fix",
+        )
+
+    assert store.get_linked_child(parent.task_id) is None

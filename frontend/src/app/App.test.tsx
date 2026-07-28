@@ -959,15 +959,44 @@ test("data management image drawer ignores listing that resolves after close", a
   expect(screen.queryByText("late.jpg")).not.toBeInTheDocument();
 });
 
-test("annotation page replaces fixtures with the real M1 task entry", async () => {
+test("annotation page exposes the M2 DataPilot-owned processing entry", async () => {
   await renderAppWithDashboardSettled();
 
   fireEvent.click(screen.getByRole("button", { name: "自动标注" }));
   expect(await screen.findByText("自动标注任务")).toBeVisible();
-  expect(screen.getByText("从已同步数据开始，完成 Web 首帧标注与 Tracking。")).toBeVisible();
+  expect(screen.getByText(/DataPilot 负责任务调查、规划和后处理/)).toBeVisible();
+  expect(screen.getByRole("button", { name: "交给 DataPilot 处理" })).toBeVisible();
+  expect(screen.queryByRole("button", { name: "新建任务" })).not.toBeInTheDocument();
   expect(screen.queryByText("视觉检测")).not.toBeInTheDocument();
   expect(window.location.pathname).toBe("/annotation/jobs");
-  expect(await screen.findByText("当前服务器暂不能创建处理任务")).toBeVisible();
+  expect(await screen.findByText("当前处理环境尚未通过预检")).toBeVisible();
+});
+
+test("annotation shortcut sends the selected scope with its dedicated entrypoint", async () => {
+  await renderAppWithDashboardSettled();
+  fireEvent.click(screen.getByRole("button", { name: "自动标注" }));
+  fireEvent.click(await screen.findByRole("button", { name: "交给 DataPilot 处理" }));
+  chooseNavigationDate("20270515");
+  fireEvent.click(screen.getByRole("checkbox", { name: "clip_a" }));
+  fireEvent.click(screen.getByRole("button", { name: "确定" }));
+
+  const message = [
+    "请对选中的导航数据执行自动标注并完成后处理。",
+    "",
+    "数据日期：20270515",
+    "指定 clips：",
+    "- clip_a",
+  ].join("\n");
+  await waitFor(() => expect(apiMocks.createSession).toHaveBeenCalledWith(
+    message,
+    "annotation_processing_shortcut",
+    {
+      kind: "navigation_dataset_selection_v1",
+      dataset_date: "20270515",
+      selection: { kind: "selected_clips", clips: ["clip_a"] },
+    },
+  ));
+  expect(screen.queryByLabelText("当天处理标定")).not.toBeInTheDocument();
 });
 
 test("model iteration page renders versions training and compare tabs", async () => {

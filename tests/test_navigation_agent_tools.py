@@ -70,6 +70,7 @@ PLANNING_TOOL_NAMES = {
     "inspect_navigation_runtime_assets_tool",
     "inspect_navigation_calibration_inventory_tool",
     "inspect_navigation_localization_sources_tool",
+    "inspect_navigation_annotation_job_facts_tool",
     "get_navigation_task_context_tool",
     "list_observation_evidence_tool",
     "read_observation_evidence_tool",
@@ -78,6 +79,7 @@ PLANNING_TOOL_NAMES = {
     "complete_navigation_task_tool",
     "submit_extract_sync_plan_tool",
     "submit_finish_processing_plan_tool",
+    "submit_trajectory_review_plan_tool",
 }
 
 
@@ -240,6 +242,7 @@ def test_navigation_handoff_message_includes_structured_json_for_task_entry():
             "clips": ["20260605_152856"],
         },
         "scene_mode": "out",
+        "requested_outcome": "auto",
         "response_language": "Chinese",
     }
 
@@ -1392,7 +1395,8 @@ def test_activity_resolver_fresh_attempt_exposes_all_planning_tools_without_muta
         "inspect_navigation_gridmap_artifacts_tool",
         "inspect_navigation_runtime_assets_tool",
         "inspect_navigation_calibration_inventory_tool",
-        "inspect_navigation_localization_sources_tool",
+            "inspect_navigation_localization_sources_tool",
+            "inspect_navigation_annotation_job_facts_tool",
         "get_navigation_task_context_tool",
         "list_observation_evidence_tool",
         "read_observation_evidence_tool",
@@ -1400,7 +1404,8 @@ def test_activity_resolver_fresh_attempt_exposes_all_planning_tools_without_muta
         "record_navigation_user_guidance_tool",
         "complete_navigation_task_tool",
         "submit_extract_sync_plan_tool",
-        "submit_finish_processing_plan_tool",
+            "submit_finish_processing_plan_tool",
+            "submit_trajectory_review_plan_tool",
     }
     assert services.task_store.get_task(task.task_id) == before
     assert services.observation_store.latest(task.task_id) is None

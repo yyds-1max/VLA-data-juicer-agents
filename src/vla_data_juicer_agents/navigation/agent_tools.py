@@ -41,6 +41,7 @@ _OBSERVATION_FIXED_TOOL_NAMES = {
     "inspect_navigation_runtime_assets_tool",
     "inspect_navigation_calibration_inventory_tool",
     "inspect_navigation_localization_sources_tool",
+    "inspect_navigation_annotation_job_facts_tool",
     "inspect_navigation_artifact_state_tool",
     "inspect_navigation_gridmap_artifacts_tool",
     "get_navigation_task_context_tool",
@@ -57,6 +58,7 @@ _FIXED_TOOL_NAMES_BY_ACTIVITY = {
         "complete_navigation_task_tool",
         "submit_extract_sync_plan_tool",
         "submit_finish_processing_plan_tool",
+        "submit_trajectory_review_plan_tool",
     },
     "execution": _OBSERVATION_FIXED_TOOL_NAMES | _EXECUTION_STATE_TOOL_NAMES,
     "recovery_required": _OBSERVATION_FIXED_TOOL_NAMES
@@ -201,6 +203,7 @@ def build_navigation_tool_groups(
         observation_store=services.observation_store,
         evidence_store=services.evidence_store,
         settings=services.settings,
+        annotation_gateway=services.annotation_gateway,
         expected_web_session_id=web_session_id,
         expected_agentscope_session_id=agentscope_session_id,
     )
@@ -253,6 +256,7 @@ def build_navigation_tool_groups(
             cancellation=cancellation,
             web_session_id=web_session_id,
             agentscope_session_id=agentscope_session_id,
+            annotation_gateway=services.annotation_gateway,
         )
 
     trusted_fixed_tools = _trust(fixed_tools)

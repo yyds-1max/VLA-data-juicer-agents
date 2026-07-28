@@ -31,6 +31,13 @@ class NavigationTaskEntry(BaseModel):
         discriminator="kind",
     )
     scene_mode: Literal["in", "out"] | None = None
+    requested_outcome: Literal[
+        "auto",
+        "extract_sync",
+        "postprocessing",
+        "postprocessing_and_fix",
+        "trajectory_fix",
+    ] = "auto"
     response_language: str
 
 

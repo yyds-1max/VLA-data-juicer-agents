@@ -5,6 +5,7 @@ import type {
   ChatMessageRecord,
   PendingInteraction,
   SessionDetail,
+  SessionEntrypoint,
   SessionRecord,
   SessionRequestContext,
   TaskSnapshot,
@@ -25,6 +26,7 @@ export interface DataPilotInvocation {
   invocationId: string;
   message: string;
   requestContext: SessionRequestContext;
+  entrypoint: Exclude<SessionEntrypoint, "chat">;
   status: DataPilotInvocationStatus;
   sessionId?: string;
   error?: string;
@@ -67,6 +69,7 @@ export interface DataPilotStoreState {
     invocationId: string,
     message: string,
     requestContext: SessionRequestContext,
+    entrypoint?: Exclude<SessionEntrypoint, "chat">,
   ) => boolean;
   claimDataPilotInvocation: (invocationId: string) => boolean;
   setDataPilotInvocationSession: (invocationId: string, sessionId: string) => void;
@@ -226,7 +229,12 @@ export function createDataPilotStore() {
         run: remapRunTurnId(state.run, localTurnId, turnId),
       })),
 
-    launchDataPilotRequest: (invocationId, message, requestContext) => {
+    launchDataPilotRequest: (
+      invocationId,
+      message,
+      requestContext,
+      entrypoint = "data_management_shortcut",
+    ) => {
       const current = get().pendingInvocation;
       if (current?.status === "queued" || current?.status === "submitting") {
         set({ open: true });
@@ -234,7 +242,13 @@ export function createDataPilotStore() {
       }
       set({
         open: true,
-        pendingInvocation: { invocationId, message, requestContext, status: "queued" },
+        pendingInvocation: {
+          invocationId,
+          message,
+          requestContext,
+          entrypoint,
+          status: "queued",
+        },
       });
       return true;
     },

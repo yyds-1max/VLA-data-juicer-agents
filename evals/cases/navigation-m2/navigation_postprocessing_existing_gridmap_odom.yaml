@@ -1,0 +1,59 @@
+schema_version: 2
+id: navigation_postprocessing_existing_gridmap_odom
+suite: navigation-m2
+entrypoint: navigation
+tags: [m2, navigation, tracked-start, postprocessing, existing-gridmap, odom]
+runtime_setup:
+  navigation_task:
+    dataset_date: "20270623"
+    selection:
+      kind: selected_clips
+      clips: ["20260623_145550"]
+    scene_mode: out
+    requested_outcome: postprocessing
+conversation:
+  - role: user
+    content: 执行自动标注并完成后处理。
+limits:
+  max_model_calls: 12
+  max_tool_calls: 12
+  timeout_seconds: 300
+expectations:
+  tools:
+    allowed_calls:
+      - inspect_navigation_raw_metadata_tool
+      - inspect_navigation_sensor_candidates_tool
+      - inspect_navigation_topic_candidates_tool
+      - inspect_navigation_runtime_assets_tool
+      - inspect_navigation_calibration_inventory_tool
+      - inspect_navigation_localization_sources_tool
+      - inspect_navigation_annotation_job_facts_tool
+      - inspect_navigation_artifact_state_tool
+      - inspect_navigation_gridmap_artifacts_tool
+      - get_navigation_task_context_tool
+      - describe_processing_action_tool
+      - submit_finish_processing_plan_tool
+      - prepare_gridmap_for_projection_tool
+    required_counts:
+      submit_finish_processing_plan_tool: 1
+    handoff_count: 1
+    handoff:
+      operation: submit_plan
+      phase: finish_processing
+      decision_modes:
+        calibration: annotation_snapshot
+        gridmap: existing_gridmap
+        localization: odom
+      step_actions:
+        - prepare_gridmap_for_projection
+        - run_projection_and_trajectory
+        - validate_navigation_outputs
+      step_variants:
+        prepare_gridmap_for_projection: copy_existing_gridmap
+        run_projection_and_trajectory: cjl_0525_with_gridmap
+        validate_navigation_outputs: expect_gridmap
+      forbidden_fields: [task_id, job_ref, segment_ref, path, command, script]
+  response:
+    language: Chinese
+    forbidden_terms:
+      [task_id, job_ref, segment_ref, /media/, run_odom.sh, pcd_to_grid.py, MainRouterAgent, NavigationDataAgent]

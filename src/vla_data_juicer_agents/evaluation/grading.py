@@ -80,10 +80,26 @@ def grade_case(
     if expected_tools.handoff is not None and len(handoffs) == 1:
         payload = handoffs[0]
         expected = expected_tools.handoff
-        fields = (
-            ("operation", "scope_source", "dataset_date", "selection", "status")
-            if expected.operation is not None
-            else (
+        if expected.operation == "submit_plan":
+            fields = (
+                "operation",
+                "phase",
+                "decision_modes",
+                "step_actions",
+                "step_variants",
+            )
+        elif expected.operation is not None:
+            fields = (
+                "operation",
+                "scope_source",
+                "dataset_date",
+                "selection",
+                "status",
+                "requested_outcome",
+                "linked_fix",
+            )
+        else:
+            fields = (
                 "request",
                 "target",
                 "date",
@@ -91,7 +107,6 @@ def grade_case(
                 "response_language",
                 "missing_fields",
             )
-        )
         for field in fields:
             wanted = getattr(expected, field)
             if wanted is None:

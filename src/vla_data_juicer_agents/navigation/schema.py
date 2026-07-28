@@ -6,7 +6,9 @@ from functools import lru_cache
 from pathlib import Path
 
 
-NAVIGATION_STATE_SCHEMA_GENERATION = "navigation-attempts-final-v2"
+NAVIGATION_STATE_SCHEMA_GENERATION = "navigation-attempts-m2-v1"
+PREVIOUS_NAVIGATION_STATE_SCHEMA_GENERATION = "navigation-attempts-final-v2"
+LATEST_NAVIGATION_SCHEMA_VERSION = 1
 _RESET_MESSAGE_MAX_CHARS = 1000
 
 
@@ -23,6 +25,18 @@ class NavigationStateResetRequired(RuntimeError):
             "remove it, then restart to create a fresh navigation-state database."
         )
         super().__init__(message[:_RESET_MESSAGE_MAX_CHARS])
+
+
+class NavigationOfflineMigrationRequired(RuntimeError):
+    """The stopped service must run the explicit Navigation schema migrator."""
+
+
+class UnsupportedNavigationSchemaVersion(RuntimeError):
+    """The database was written by a newer or unknown Navigation schema."""
+
+
+class NavigationMigrationSafetyError(RuntimeError):
+    """A committed migration is not verified and must be restored or inspected."""
 
 
 NAVIGATION_TABLE_SQL = {
@@ -91,7 +105,9 @@ NAVIGATION_TABLE_SQL = {
     "navigation_plans": """CREATE TABLE navigation_plans (
         plan_id TEXT PRIMARY KEY,
         task_id TEXT NOT NULL,
-        phase TEXT NOT NULL CHECK (phase IN ('extract_sync', 'finish_processing')),
+        phase TEXT NOT NULL CHECK (
+            phase IN ('extract_sync', 'finish_processing', 'trajectory_review')
+        ),
         plan_revision INTEGER NOT NULL,
         contract_version TEXT NOT NULL,
         observation_revision INTEGER NOT NULL,
@@ -158,13 +174,65 @@ NAVIGATION_TABLE_SQL = {
     "navigation_plan_submission_attempts": """CREATE TABLE navigation_plan_submission_attempts (
         attempt_id TEXT PRIMARY KEY,
         task_id TEXT NOT NULL,
-        phase TEXT NOT NULL CHECK (phase IN ('extract_sync', 'finish_processing')),
+        phase TEXT NOT NULL CHECK (
+            phase IN ('extract_sync', 'finish_processing', 'trajectory_review')
+        ),
         planning_context_revision TEXT NOT NULL,
         candidate_json TEXT NOT NULL,
         validation_json TEXT NOT NULL,
         created_at TEXT NOT NULL,
         FOREIGN KEY (task_id) REFERENCES navigation_tasks(task_id)
             ON DELETE CASCADE
+    )""",
+    "navigation_task_outcomes": """CREATE TABLE navigation_task_outcomes (
+        task_id TEXT PRIMARY KEY,
+        requested_outcome TEXT NOT NULL CHECK (
+            requested_outcome IN (
+                'auto', 'extract_sync', 'postprocessing',
+                'postprocessing_and_fix', 'trajectory_fix'
+            )
+        ),
+        completion_outcome TEXT CHECK (
+            completion_outcome IS NULL OR completion_outcome IN (
+                'extract_sync_completed',
+                'postprocessing_completed_fix_pending',
+                'trajectory_review_completed',
+                'processing_completed_no_fix'
+            )
+        ),
+        revision INTEGER NOT NULL CHECK (revision >= 1),
+        metadata_json TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL,
+        FOREIGN KEY (task_id) REFERENCES navigation_tasks(task_id)
+            ON DELETE CASCADE
+    )""",
+    "navigation_task_lineage": """CREATE TABLE navigation_task_lineage (
+        child_task_id TEXT PRIMARY KEY,
+        parent_task_id TEXT NOT NULL,
+        relation TEXT NOT NULL CHECK (relation IN ('trajectory_fix')),
+        created_at TEXT NOT NULL,
+        UNIQUE (parent_task_id, relation),
+        FOREIGN KEY (parent_task_id) REFERENCES navigation_tasks(task_id)
+            ON DELETE CASCADE,
+        FOREIGN KEY (child_task_id) REFERENCES navigation_tasks(task_id)
+            ON DELETE CASCADE,
+        CHECK (parent_task_id <> child_task_id)
+    )""",
+    "navigation_schema_migrations": """CREATE TABLE navigation_schema_migrations (
+        version INTEGER PRIMARY KEY CHECK (version >= 1),
+        name TEXT NOT NULL,
+        source_generation TEXT NOT NULL,
+        target_generation TEXT NOT NULL,
+        applied_at TEXT NOT NULL
+    )""",
+    "navigation_migration_safety": """CREATE TABLE navigation_migration_safety (
+        singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+        schema_version INTEGER NOT NULL CHECK (schema_version >= 1),
+        status TEXT NOT NULL CHECK (
+            status IN ('pending_integrity_check', 'verified')
+        ),
+        verified_at TEXT
     )""",
 }
 
@@ -202,6 +270,9 @@ NAVIGATION_INDEX_SQL = {
     "idx_navigation_plan_attempts_task_phase_created": """CREATE INDEX
         idx_navigation_plan_attempts_task_phase_created
         ON navigation_plan_submission_attempts (task_id, phase, created_at)""",
+    "idx_navigation_task_lineage_parent": """CREATE INDEX
+        idx_navigation_task_lineage_parent
+        ON navigation_task_lineage (parent_task_id, relation, created_at)""",
 }
 
 
@@ -213,6 +284,8 @@ _CHILD_TASK_ID_COLUMNS = {
     "navigation_task_steps": "task_id",
     "navigation_step_result_outbox": "task_id",
     "navigation_human_decision_handoffs": "task_id",
+    "navigation_task_outcomes": "task_id",
+    "navigation_task_lineage": "child_task_id",
 }
 NAVIGATION_TRIGGER_SQL = {
     f"trg_{table}_aggregate_revision_after_{operation.lower()}": f"""CREATE TRIGGER
@@ -258,6 +331,66 @@ def _create_schema_objects(connection: sqlite3.Connection) -> None:
         connection.execute(statement)
     for statement in NAVIGATION_TRIGGER_SQL.values():
         connection.execute(statement)
+
+
+_M1_PLAN_SQL = """CREATE TABLE navigation_plans (
+    plan_id TEXT PRIMARY KEY,
+    task_id TEXT NOT NULL,
+    phase TEXT NOT NULL CHECK (phase IN ('extract_sync', 'finish_processing')),
+    plan_revision INTEGER NOT NULL,
+    contract_version TEXT NOT NULL,
+    observation_revision INTEGER NOT NULL,
+    plan_json TEXT NOT NULL,
+    validation_summary_json TEXT NOT NULL,
+    status TEXT NOT NULL CHECK (
+        status IN ('active', 'superseded', 'completed', 'invalidated')
+    ),
+    invalidation_reason TEXT,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    UNIQUE (task_id, phase, plan_revision),
+    FOREIGN KEY (task_id) REFERENCES navigation_tasks(task_id)
+        ON DELETE CASCADE
+)"""
+_M1_PLAN_ATTEMPT_SQL = """CREATE TABLE navigation_plan_submission_attempts (
+    attempt_id TEXT PRIMARY KEY,
+    task_id TEXT NOT NULL,
+    phase TEXT NOT NULL CHECK (phase IN ('extract_sync', 'finish_processing')),
+    planning_context_revision TEXT NOT NULL,
+    candidate_json TEXT NOT NULL,
+    validation_json TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    FOREIGN KEY (task_id) REFERENCES navigation_tasks(task_id)
+        ON DELETE CASCADE
+)"""
+M1_NAVIGATION_TABLE_SQL = {
+    name: (
+        _M1_PLAN_SQL
+        if name == "navigation_plans"
+        else _M1_PLAN_ATTEMPT_SQL
+        if name == "navigation_plan_submission_attempts"
+        else statement
+    )
+    for name, statement in NAVIGATION_TABLE_SQL.items()
+    if name
+    not in {
+        "navigation_task_outcomes",
+        "navigation_task_lineage",
+        "navigation_schema_migrations",
+        "navigation_migration_safety",
+    }
+}
+M1_NAVIGATION_INDEX_SQL = {
+    name: statement
+    for name, statement in NAVIGATION_INDEX_SQL.items()
+    if name != "idx_navigation_task_lineage_parent"
+}
+M1_NAVIGATION_TRIGGER_SQL = {
+    name: statement
+    for name, statement in NAVIGATION_TRIGGER_SQL.items()
+    if "navigation_task_outcomes" not in name
+    and "navigation_task_lineage" not in name
+}
 
 
 def _read_table_contract(connection: sqlite3.Connection, table: str) -> _TableContract:
@@ -336,6 +469,33 @@ def _supported_contract() -> tuple[dict[str, _TableContract], dict[str, str]]:
         connection.close()
 
 
+@lru_cache(maxsize=1)
+def _m1_supported_contract() -> tuple[dict[str, _TableContract], dict[str, str]]:
+    connection = sqlite3.connect(":memory:")
+    connection.row_factory = sqlite3.Row
+    connection.execute("PRAGMA foreign_keys = ON")
+    try:
+        for statement in M1_NAVIGATION_TABLE_SQL.values():
+            connection.execute(statement)
+        for statement in M1_NAVIGATION_INDEX_SQL.values():
+            connection.execute(statement)
+        for statement in M1_NAVIGATION_TRIGGER_SQL.values():
+            connection.execute(statement)
+        tables = {
+            name: _read_table_contract(connection, name)
+            for name in M1_NAVIGATION_TABLE_SQL
+        }
+        triggers = {
+            row["name"]: _normalize_sql(row["sql"])
+            for row in connection.execute(
+                "SELECT name, sql FROM sqlite_master WHERE type = 'trigger'"
+            ).fetchall()
+        }
+        return tables, triggers
+    finally:
+        connection.close()
+
+
 def _navigation_table_names(connection: sqlite3.Connection) -> set[str]:
     return {
         row["name"]
@@ -346,9 +506,14 @@ def _navigation_table_names(connection: sqlite3.Connection) -> set[str]:
     }
 
 
-def _schema_contract_violation(connection: sqlite3.Connection) -> str | None:
+def _contract_violation(
+    connection: sqlite3.Connection,
+    *,
+    expected_generation: str,
+    supported: tuple[dict[str, _TableContract], dict[str, str]],
+) -> str | None:
     tables = _navigation_table_names(connection)
-    expected_tables, expected_triggers = _supported_contract()
+    expected_tables, expected_triggers = supported
     if tables != set(expected_tables):
         return (
             "navigation tables do not match the generation contract "
@@ -372,9 +537,62 @@ def _schema_contract_violation(connection: sqlite3.Connection) -> str | None:
     ).fetchall()
     if len(marker_rows) != 1 or marker_rows[0]["singleton"] != 1:
         return "navigation state schema marker is missing or ambiguous"
-    if marker_rows[0]["generation"] != NAVIGATION_STATE_SCHEMA_GENERATION:
+    if marker_rows[0]["generation"] != expected_generation:
         return f"unsupported navigation state generation {marker_rows[0]['generation']!r}"
     return None
+
+
+def _schema_contract_violation(connection: sqlite3.Connection) -> str | None:
+    return _contract_violation(
+        connection,
+        expected_generation=NAVIGATION_STATE_SCHEMA_GENERATION,
+        supported=_supported_contract(),
+    )
+
+
+def _m1_schema_contract_violation(connection: sqlite3.Connection) -> str | None:
+    return _contract_violation(
+        connection,
+        expected_generation=PREVIOUS_NAVIGATION_STATE_SCHEMA_GENERATION,
+        supported=_m1_supported_contract(),
+    )
+
+
+def _current_migration_ledger_violation(
+    connection: sqlite3.Connection,
+) -> tuple[str | None, bool]:
+    rows = connection.execute(
+        """
+        SELECT version, target_generation
+        FROM navigation_schema_migrations
+        ORDER BY version
+        """
+    ).fetchall()
+    versions = [int(row["version"]) for row in rows]
+    if versions and versions[-1] > LATEST_NAVIGATION_SCHEMA_VERSION:
+        return "navigation schema version is newer than supported", True
+    if versions != list(range(1, LATEST_NAVIGATION_SCHEMA_VERSION + 1)):
+        return f"navigation migration ledger is not current: {versions}", False
+    if any(
+        row["target_generation"] != NAVIGATION_STATE_SCHEMA_GENERATION
+        for row in rows
+    ):
+        return "navigation migration ledger target generation is invalid", False
+    safety = connection.execute(
+        """
+        SELECT schema_version, status
+        FROM navigation_migration_safety
+        WHERE singleton = 1
+        """
+    ).fetchall()
+    if len(safety) != 1:
+        return "navigation migration safety marker is missing or ambiguous", False
+    if (
+        int(safety[0]["schema_version"]) != LATEST_NAVIGATION_SCHEMA_VERSION
+        or safety[0]["status"] != "verified"
+    ):
+        return "navigation migration safety verification is incomplete", False
+    return None, False
 
 
 def _connect(db_path: Path, *, read_only: bool = False) -> sqlite3.Connection:
@@ -396,11 +614,47 @@ def initialize_navigation_schema(db_path: str | Path) -> None:
         try:
             with _connect(path, read_only=True) as connection:
                 if _navigation_table_names(connection):
-                    violation = _schema_contract_violation(connection)
-                    if violation is not None:
-                        raise NavigationStateResetRequired(path, violation)
-                    return
+                    marker = connection.execute(
+                        """
+                        SELECT generation
+                        FROM navigation_state_schema
+                        WHERE singleton = 1
+                        """
+                    ).fetchone()
+                    generation = marker["generation"] if marker is not None else None
+                    if generation == NAVIGATION_STATE_SCHEMA_GENERATION:
+                        violation = _schema_contract_violation(connection)
+                        if violation is not None:
+                            raise NavigationStateResetRequired(path, violation)
+                        ledger_violation, newer = _current_migration_ledger_violation(
+                            connection
+                        )
+                        if ledger_violation is not None:
+                            if newer:
+                                raise UnsupportedNavigationSchemaVersion(
+                                    ledger_violation
+                                )
+                            raise NavigationMigrationSafetyError(ledger_violation)
+                        return
+                    if generation == PREVIOUS_NAVIGATION_STATE_SCHEMA_GENERATION:
+                        violation = _m1_schema_contract_violation(connection)
+                        if violation is not None:
+                            raise NavigationStateResetRequired(path, violation)
+                        raise NavigationOfflineMigrationRequired(
+                            "navigation database requires the stopped-service "
+                            "M1-to-M2 offline migration"
+                        )
+                    raise NavigationStateResetRequired(
+                        path,
+                        f"unsupported navigation state generation {generation!r}",
+                    )
         except NavigationStateResetRequired:
+            raise
+        except (
+            NavigationMigrationSafetyError,
+            NavigationOfflineMigrationRequired,
+            UnsupportedNavigationSchemaVersion,
+        ):
             raise
         except sqlite3.DatabaseError as error:
             raise NavigationStateResetRequired(
@@ -421,6 +675,25 @@ def initialize_navigation_schema(db_path: str | Path) -> None:
         connection.execute(
             "INSERT INTO navigation_state_schema (singleton, generation) VALUES (1, ?)",
             (NAVIGATION_STATE_SCHEMA_GENERATION,),
+        )
+        connection.execute(
+            """
+            INSERT INTO navigation_schema_migrations (
+                version, name, source_generation, target_generation, applied_at
+            ) VALUES (1, 'navigation_m2_v1', ?, ?, CURRENT_TIMESTAMP)
+            """,
+            (
+                NAVIGATION_STATE_SCHEMA_GENERATION,
+                NAVIGATION_STATE_SCHEMA_GENERATION,
+            ),
+        )
+        connection.execute(
+            """
+            INSERT INTO navigation_migration_safety (
+                singleton, schema_version, status, verified_at
+            ) VALUES (1, ?, 'verified', CURRENT_TIMESTAMP)
+            """,
+            (LATEST_NAVIGATION_SCHEMA_VERSION,),
         )
         connection.commit()
     except Exception:
