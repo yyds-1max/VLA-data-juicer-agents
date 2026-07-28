@@ -15,6 +15,7 @@ from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
 import vla_data_juicer_agents.web.app as web_app_module
+from vla_data_juicer_agents.navigation import dataset_catalog
 from vla_data_juicer_agents.annotation.maintenance import (
     AnnotationServiceOnlineError,
 )
@@ -721,6 +722,74 @@ def test_navigation_date_returns_clip_detail_and_raw_only_status(tmp_path: Path,
     assert clips["raw_clip"]["has_tmp_dir"] is False
     assert clips["raw_clip"]["sync_frame_counts"]["image"] == 0
     assert clips["synced_clip"]["status"] == "synced"
+
+
+@pytest.mark.parametrize(
+    "endpoint",
+    [
+        "/api/navigation/datasets/summary",
+        "/api/navigation/datasets/20270605",
+    ],
+)
+def test_navigation_dataset_success_response_does_not_expose_missing_metadata_path(
+    endpoint: str,
+    tmp_path: Path,
+    monkeypatch,
+):
+    root = tmp_path / "private-user-heying-VLADatasets"
+    (root / "raw_data" / "20270605" / "missing_metadata").mkdir(parents=True)
+    monkeypatch.setenv("VLA_VLADATASETS_ROOT", str(root))
+    client = make_client(tmp_path)
+
+    response = client.get(endpoint)
+
+    assert response.status_code == 200
+    body = response.json()
+    clips = body["dates"][0]["clips"] if endpoint.endswith("summary") else body["clips"]
+    assert clips[0]["status"] == "error"
+    assert clips[0]["errors"] == ["metadata.yaml: file not found"]
+    assert str(root) not in response.text
+    assert "/private-user-heying-" not in response.text
+
+
+def test_navigation_date_success_response_does_not_expose_sync_scan_error(
+    tmp_path: Path,
+    monkeypatch,
+):
+    root = tmp_path / "VLADatasets"
+    _write_dataset_metadata(root / "raw_data" / "20270605" / "private_clip")
+    _write_sync_file(
+        root,
+        "20270605",
+        "private_clip",
+        "0001",
+        "front.jpg",
+        b"jpg-bytes",
+    )
+    private_error = "/media/heying/private/data Bearer secret-navigation-token"
+    original_visible_files = dataset_catalog._visible_files
+
+    def fail_for_sync_scan(path: Path):
+        if path.name == "fisheye_front":
+            raise OSError(private_error)
+        return original_visible_files(path)
+
+    monkeypatch.setattr(dataset_catalog, "_visible_files", fail_for_sync_scan)
+    monkeypatch.setenv("VLA_VLADATASETS_ROOT", str(root))
+    client = make_client(tmp_path)
+
+    response = client.get("/api/navigation/datasets/20270605")
+
+    assert response.status_code == 200
+    clip = response.json()["clips"][0]
+    assert clip["status"] == "error"
+    assert clip["errors"] == [
+        "sync_data: unreadable",
+        "clip_data exists without tmp_dir or synced frames",
+    ]
+    assert private_error not in response.text
+    assert "/media/" not in response.text
+    assert "Bearer" not in response.text
 
 
 def test_navigation_sync_images_listing_and_file_route_serves_bytes(tmp_path: Path, monkeypatch):

@@ -212,7 +212,7 @@ def _scan_clip(date: str, clip: str, raw_clip_dir: Path, clip_data_dir: Path) ->
     try:
         duration_ns, raw_message_count, topics = _read_metadata(raw_clip_dir / "metadata.yaml")
     except EXPECTED_SCAN_ERRORS as exc:
-        errors.append(f"metadata.yaml: {exc}")
+        errors.append(_public_scan_error("metadata.yaml", exc))
 
     has_tmp_dir = False
     has_sync_data = False
@@ -224,7 +224,7 @@ def _scan_clip(date: str, clip: str, raw_clip_dir: Path, clip_data_dir: Path) ->
         sequences = _scan_sync_sequences(clip_data_dir / "sync_data")
         sync_frame_counts = _sum_counts(sequence.frame_counts for sequence in sequences)
     except EXPECTED_SCAN_ERRORS as exc:
-        errors.append(f"sync_data: {exc}")
+        errors.append(_public_scan_error("sync_data", exc))
 
     if clip_data_dir.exists() and not has_tmp_dir and sync_frame_counts.total == 0:
         errors.append("clip_data exists without tmp_dir or synced frames")
@@ -251,6 +251,24 @@ def _scan_clip(date: str, clip: str, raw_clip_dir: Path, clip_data_dir: Path) ->
         status=status,
         errors=errors,
     )
+
+
+def _public_scan_error(
+    source: Literal["metadata.yaml", "sync_data"],
+    exc: Exception,
+) -> str:
+    """Project private filesystem exceptions into stable public diagnostics."""
+    if isinstance(exc, FileNotFoundError):
+        reason = "file not found"
+    elif isinstance(exc, OSError):
+        reason = "unreadable"
+    elif isinstance(exc, yaml.YAMLError):
+        reason = "invalid YAML"
+    elif isinstance(exc, (KeyError, TypeError, ValueError)):
+        reason = "invalid structure"
+    else:
+        reason = "unavailable"
+    return f"{source}: {reason}"
 
 
 def _read_metadata(metadata_path: Path) -> tuple[int, int, list[TopicSummary]]:
