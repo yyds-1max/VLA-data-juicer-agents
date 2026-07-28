@@ -1,7 +1,7 @@
 # 自动标注板块总体开发路线
 
-> 状态：已批准；M1 已完成功能冻结，M1.5 服务器功能验收通过、完整冻结暂缓
-> 最后更新：2026-07-27
+> 状态：已批准；M1、M1.5 已完整冻结，下一步进入 M2 任务级规划
+> 最后更新：2026-07-28
 > 适用范围：导航数据自动标注、后处理、三维轨迹复核/Fix，以及后续可复用的标注领域能力  
 > 优先级：本文件在自动标注范围内优先于 `architecture.md` 中的历史占位描述
 
@@ -398,7 +398,7 @@ AppleDouble 文件不属于业务输入，拆包发现与 raw 同源比较均须
 - M1.5 只进行前端基础设施迁移，不得修改本次冻结的 Annotation/Tracking 业务
   契约。
 
-### M1.5（2026-07-27，服务器功能验收通过、完整冻结暂缓）
+### M1.5（2026-07-27～2026-07-28，完整冻结）
 
 - 开发基线固定为 `a7315ca`，开发分支为
   `codex/automatic-annotation-m1-5`；
@@ -422,14 +422,14 @@ AppleDouble 文件不属于业务输入，拆包发现与 raw 同源比较均须
   compileall 和 diff-check 均通过；
 - 生产依赖审计没有 high/critical，仍有 React Router 6 的 2 个 moderate
   公告；自动修复会升级到不兼容的 Router 7，因此不在 M1.5 强制升级；
-- Annotation 领域文件只有 Tailwind utility 的机械迁移与 Dialog import
-  合并，API、CAS、revision、Runtime、Router 和后端均未修改，也未运行真实
-  Tracking 或服务器 writer；
+- 前端主体提交 `a7315ca..17325f9` 中，Annotation 领域文件只有 Tailwind
+  utility 的机械迁移与 Dialog import 合并，API、CAS、revision、Runtime、
+  Router 和后端均未修改，也未运行真实 Tracking 或服务器 writer；
 - 服务器已从干净的 `a7315ca` 切换到 `17325f9`，旧 `dist` 和 lockfile 已保留
   为可回退副本；服务器与本地候选 `dist` tree hash 一致；
-- 用户级 Node `24.18.0` / npm `11.16.0` 安装完成，未修改共享账号默认的
-  Node 20；`npm ci`、前端 `218 passed`、production build 和 bundle gate
-  均通过；
+- 用户级 Node `24.18.0` / npm `11.16.0` 安装完成，未替换系统 Node 10，也
+  未改变账号原有 nvm 默认 Node 20；M1.5 只通过显式路径绑定 Node 24。
+  `npm ci`、前端 `218 passed`、production build 和 bundle gate 均通过；
 - `run_web.sh` 的精确版本预检已在真实服务器构建中通过。未加载既有 M1 Runtime
   配置时 capability 正确 fail closed；加载冻结配置后重启，
   `navigation_odom_v1 available=true`；
@@ -437,12 +437,21 @@ AppleDouble 文件不属于业务输入，拆包发现与 raw 同源比较均须
   数据摘要、会话历史和 DataPilot 非模态浮窗均通过只读 smoke；未知路由保持
   404，浏览器控制台无错误；
 - 重启和浏览器验收前后，Annotation、Session 和 Navigation 三个 SQLite 主文件
-  hash 完全一致；仍为 9 个 cancelled Job、2 个 tracked Job、9 个 active
-  Session，且无 Runtime/Session lease。服务日志没有 POST/PUT/DELETE；
+  hash 完全一致；仍为 9 个 cancelled Job、2 个 tracked Job、9 条
+  `status=active` Session 记录，但无 running/waiting turn、非终态 task 或
+  Runtime/Session lease。服务日志没有 POST/PUT/DELETE；
 - 扩大后的公开响应扫描发现一项早于 M1.5 的问题：
   `/api/navigation/datasets/summary` 中 20260403 的 `recordings` clip
   `errors[0]` 含绝对路径。M1.5 没有任何后端 diff，回滚不能消除该问题；
   Annotation、Session 与本次其他抽查响应未发现同类泄漏；
-- 因公开路径泄漏违反系统脱敏原则，M1.5 前端基础设施的部署与功能验收可判通过，
-  但完整冻结暂缓。该问题必须作为独立的小范围安全修复处理并回归后，才能宣布
-  M1.5 完整冻结和开始 M2 实施。
+- 该既有问题已在独立提交
+  `c75712eda79c211d42f766d7dfd736611e57634c` 中闭环：异常原文改为稳定公开
+  文案，不改变 schema、状态、计数、扫描或处理逻辑。最终本地门禁为 targeted
+  `49 passed`、Python `1536 passed`、前端 `218 passed`、Playwright
+  `7 passed`、Router `17 cases validated`；
+- 2026-07-28 服务器只读复核确认 `/summary` 与 `/20260403` 的目标 clip
+  仍为 `status=error`、`error_count=1`，但不再含绝对路径；扩大抽查的
+  Navigation、Annotation、Job 和 Session 响应无路径或凭据标记，三个数据库
+  hash 未变，Runtime capability 仍为 true，服务和工作树正常；
+- M1.5 至此完整冻结。相邻的独立公开 DTO、字段感知输入净化和前端第二道错误
+  脱敏属于后续纵深防御候选，不扩大为 M1.5 或 M2 的隐含范围。

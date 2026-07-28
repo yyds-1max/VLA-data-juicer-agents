@@ -1,8 +1,8 @@
 # DataPilot 前端设计系统基线
 
-> 状态：服务器前端验收通过；M1.5 完整冻结因既有公开路径泄漏暂缓
+> 状态：M1.5 完整冻结
 > 适用范围：DataPilot Console、自动标注及后续领域页面
-> 最后更新：2026-07-27
+> 最后更新：2026-07-28
 
 ## 1. 工具链
 
@@ -26,6 +26,18 @@ JavaScript Tailwind config。
 
 这里的“移除 PostCSS”指移除项目直接配置和生产构建入口；Vite/Vitest
 依赖树中可能仍包含 PostCSS 传递开发包，不应为了追求依赖树字面为零而强制删除。
+
+### 冻结事实
+
+前端主体冻结提交为 `17325f9`。本地和服务器前端测试均为 `218 passed`，
+最大 JavaScript chunk 为 `376304 / 512000` 字节；服务器 production build
+产物 tree SHA-256 为
+`310ec7e7dceff609646178b25eadaf89db3c5df3e308d22c375fc136c3d304ec`，
+并与同工具链本地产物一致。
+
+后续安全提交 `c75712e` 仅收敛 Navigation dataset catalog 的公开错误投影，
+没有前端 diff；服务器复用上述 `dist` 完成只读安全复核，数据库 hash 和业务
+状态均未变化。M1.5 于 2026-07-28 正式冻结。
 
 ## 2. 组件层级
 

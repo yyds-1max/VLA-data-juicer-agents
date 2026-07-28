@@ -1,7 +1,8 @@
 # 自动标注 M1.5：Tailwind 4 与 Radix/shadcn 设计系统基线
 
-> 状态：服务器功能验收通过；完整冻结因既有公开路径泄漏暂缓
+> 状态：完整冻结；服务器安全复核通过，可进入 M2 任务级规划
 > 开始日期：2026-07-27
+> 冻结日期：2026-07-28
 > 开发基线：`a7315ca`
 > 开发分支：`codex/automatic-annotation-m1-5`
 > 上游里程碑：M1 Web 首帧标注与 Tracking 功能冻结
@@ -396,8 +397,8 @@ production npm audit high+     0
 到 Router 7，属于破坏性主版本变更，因此本里程碑记录风险但不执行
 `npm audit fix --force`。
 
-批次 8 的服务器轻量验收结果记录在下一节。由于验收扩大扫描发现既有公开路径
-泄漏，M1.5 尚不能宣布完整冻结或进入 M2 实施。
+批次 8 的首次服务器轻量验收结果记录在下一节。验收扩大扫描发现的既有公开
+路径泄漏，已通过第 14 节的独立安全小修和服务器复核闭环。
 
 ## 13. 服务器轻量验收结果
 
@@ -443,11 +444,46 @@ GET /api/navigation/datasets/summary
 服务器部署造成的回归，回滚到旧提交也不会消除。
 
 根据“公开响应不得泄漏绝对路径”的系统原则，不以“既有问题”为由放宽门禁。
-后续应建立一个独立、最小的安全修复：
+当时决定建立一个独立、最小的安全修复：
 
-- dataset summary 只返回稳定的公开错误码和无路径文案；
-- 私有诊断保留在服务器日志或内部审计中；
+- dataset summary 只返回稳定的无路径文案；
+- 异常原文不得进入公开领域模型或 API；
 - 增加异常 metadata/sync_data 的路径脱敏 API 测试；
 - 回归 Data Management、Router 基线、Python 全量和服务器只读泄漏扫描。
 
-该修复通过前，状态保持“服务器功能验收通过、完整冻结暂缓”。
+该条件已于 2026-07-28 满足，最终事实记录如下。
+
+## 14. 安全修复与最终冻结
+
+独立安全修复提交为
+`c75712eda79c211d42f766d7dfd736611e57634c`：
+
+- 只修改 Navigation dataset catalog 的两处公开错误投影；缺失、不可读、
+  YAML 无效和结构无效分别映射为固定文案，不再拼接异常原文；
+- `ClipSummary.errors` schema、错误条数、状态、计数、扫描范围、聚合和数据处理
+  逻辑均未改变；不需要重新运行 Tracking；
+- catalog 与 Web API 两层测试覆盖缺失 metadata、非法 YAML、非法结构，以及
+  携绝对路径和凭据文本的 metadata/sync_data 异常；
+- 本地最终门禁为 targeted `49 passed`、Python `1536 passed`、前端
+  `218 passed`、Playwright `7 passed`、Router `17 cases validated`；
+  production build、bundle gate、compileall 和 diff-check 均通过。
+
+2026-07-28 把该提交以完整 Git bundle 快进部署到服务器。该提交没有前端 diff，
+服务复用上一轮已验收的 `frontend/dist`，未执行 `npm ci`、新建 Job、标注、
+Tracking 或其他 writer：
+
+- 修复前，`/api/navigation/datasets/summary` 中目标 clip 仍为
+  `status=error`、`error_count=1`，并检测到绝对路径标记；
+- 修复后，`/summary` 与 `/api/navigation/datasets/20260403` 中相同目标仍为
+  `status=error`、`error_count=1`，错误固定为
+  `metadata.yaml: file not found`，不再包含绝对路径；
+- 扩大抽查 Navigation summary/date、Annotation capability、Annotation Job 和
+  Session 响应，均未发现 `/media/`、`/home/` 或凭据标记；
+- `/`、`/data`、`/annotation/jobs` 均为 200，
+  `navigation_odom_v1 available=true`；
+- Annotation、Session、Navigation 三个 SQLite 主文件 SHA-256 与复核前完全
+  一致；服务日志没有 POST、PUT、DELETE、Traceback 或 fatal；
+- 服务器停机、快进、重启和复核后工作树干净，服务正常运行。
+
+至此 M1.5 的全部退出条件满足，设计系统基线正式冻结。下一步只进入 M2
+任务级需求与架构规划，不在本里程碑继续扩大安全或前端改造范围。
