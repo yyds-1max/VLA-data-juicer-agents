@@ -22,13 +22,12 @@ expectations:
   tools:
     allowed_calls:
       - inspect_navigation_annotation_job_facts_tool
-      - inspect_navigation_artifact_state_tool
       - get_navigation_task_context_tool
-      - describe_processing_action_tool
       - submit_trajectory_review_plan_tool
       - open_trajectory_fix_workbench_tool
     required_counts:
       submit_trajectory_review_plan_tool: 1
+      open_trajectory_fix_workbench_tool: 1
     handoff_count: 1
     handoff:
       operation: submit_plan

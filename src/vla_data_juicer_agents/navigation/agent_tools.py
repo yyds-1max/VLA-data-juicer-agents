@@ -51,6 +51,14 @@ _EXECUTION_STATE_TOOL_NAMES = {
     "get_plan_execution_overview_tool",
     "get_current_plan_step_tool",
 }
+_TRAJECTORY_REVIEW_PLANNING_TOOL_NAMES = {
+    "inspect_navigation_annotation_job_facts_tool",
+    "get_navigation_task_context_tool",
+    "submit_trajectory_review_plan_tool",
+}
+_TRAJECTORY_REVIEW_EXECUTION_STATE_TOOL_NAMES = {
+    "get_current_plan_step_tool",
+}
 _FIXED_TOOL_NAMES_BY_ACTIVITY = {
     "planning": _OBSERVATION_FIXED_TOOL_NAMES
     | {
@@ -198,6 +206,7 @@ def build_navigation_tool_groups(
     agentscope_session_id: str,
 ) -> dict[str, NavigationToolGroupDefinition]:
     task = snapshot.task
+    is_trajectory_review = task.target == "trajectory_review"
     observation_tools = build_navigation_observation_tools(
         task=task,
         observation_store=services.observation_store,
@@ -259,10 +268,44 @@ def build_navigation_tool_groups(
             annotation_gateway=services.annotation_gateway,
         )
 
+    if is_trajectory_review:
+        if snapshot.activity == "planning":
+            fixed_tools = [
+                tool
+                for tool in fixed_tools
+                if tool.name in _TRAJECTORY_REVIEW_PLANNING_TOOL_NAMES
+            ]
+        elif snapshot.activity in {"execution", "recovery_required"}:
+            fixed_tools = [
+                tool
+                for tool in fixed_tools
+                if tool.name in _TRAJECTORY_REVIEW_EXECUTION_STATE_TOOL_NAMES
+            ]
+        if snapshot.activity == "execution":
+            current_step = snapshot.current
+            current_action = (
+                current_step.get("step", {}).get("action")
+                if isinstance(current_step, dict)
+                else None
+            )
+            execution_tools = [
+                tool
+                for tool in execution_tools
+                if tool.name == f"{current_action}_tool"
+            ]
+
     trusted_fixed_tools = _trust(fixed_tools)
     classified = classify_fixed_navigation_tools(trusted_fixed_tools)
     actual_fixed_names = {tool.name for tool in trusted_fixed_tools}
-    expected_fixed_names = _FIXED_TOOL_NAMES_BY_ACTIVITY[snapshot.activity]
+    if is_trajectory_review and snapshot.activity == "planning":
+        expected_fixed_names = _TRAJECTORY_REVIEW_PLANNING_TOOL_NAMES
+    elif is_trajectory_review and snapshot.activity in {
+        "execution",
+        "recovery_required",
+    }:
+        expected_fixed_names = _TRAJECTORY_REVIEW_EXECUTION_STATE_TOOL_NAMES
+    else:
+        expected_fixed_names = _FIXED_TOOL_NAMES_BY_ACTIVITY[snapshot.activity]
     if actual_fixed_names != expected_fixed_names:
         missing = sorted(expected_fixed_names - actual_fixed_names)
         unexpected = sorted(actual_fixed_names - expected_fixed_names)
@@ -291,10 +334,23 @@ def build_navigation_tool_groups(
         ),
     }[snapshot.activity]
     for group_name in fixed_group_names:
+        instructions = None
+        if is_trajectory_review and snapshot.activity == "planning":
+            if group_name == NAVIGATION_INVESTIGATION:
+                instructions = (
+                    "Inspect only the bound Annotation Job facts for linked "
+                    "trajectory-review readiness."
+                )
+            elif group_name == NAVIGATION_PLAN_AUTHORING:
+                instructions = (
+                    "Read the latest task context, submit one complete "
+                    "trajectory-review Plan, then execute the accepted first step."
+                )
         groups[group_name] = NavigationToolGroupDefinition(
             name=group_name,
             description=_GROUP_DESCRIPTIONS[group_name],
             tools=classified[group_name],
+            instructions=instructions,
         )
 
     if snapshot.activity in {"execution", "recovery_required"}:

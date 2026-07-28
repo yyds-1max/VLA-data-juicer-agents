@@ -39,9 +39,10 @@ expectations:
       - get_navigation_task_context_tool
       - describe_processing_action_tool
       - submit_finish_processing_plan_tool
-      - prepare_gridmap_for_projection_tool
+      - run_annotation_postprocessing_workflow_tool
     required_counts:
       submit_finish_processing_plan_tool: 1
+      run_annotation_postprocessing_workflow_tool: 1
     handoff_count: 1
     handoff:
       operation: submit_plan
@@ -51,12 +52,10 @@ expectations:
         gridmap: generated_from_pcd
         localization: odom
       step_actions:
-        - prepare_gridmap_for_projection
-        - run_projection_and_trajectory
+        - run_annotation_postprocessing_workflow
         - validate_navigation_outputs
       step_variants:
-        prepare_gridmap_for_projection: generate_from_pcd
-        run_projection_and_trajectory: cjl_0525_with_gridmap
+        run_annotation_postprocessing_workflow: plan_bound_runtime
         validate_navigation_outputs: expect_gridmap
       forbidden_fields: [task_id, job_ref, segment_ref, path, command, script]
   response:

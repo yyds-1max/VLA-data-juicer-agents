@@ -30,11 +30,14 @@ from vla_data_juicer_agents.navigation.services import (
 from vla_data_juicer_agents.navigation.plan_models import (
     ExtractSyncPlanInput,
     FinishProcessingPlanInput,
+    TrajectoryReviewPlanInput,
 )
 from vla_data_juicer_agents.navigation.plan_store import StepClaimOutcome
 from vla_data_juicer_agents.navigation.evidence_store import FileNavigationEvidenceStore
 from vla_data_juicer_agents.navigation.observation_models import (
+    AnnotationJobFactsObservation,
     ArtifactStateObservation,
+    EvidenceWrite,
 )
 from vla_data_juicer_agents.navigation.observation_store import (
     SqliteNavigationObservationStore,
@@ -79,6 +82,11 @@ PLANNING_TOOL_NAMES = {
     "complete_navigation_task_tool",
     "submit_extract_sync_plan_tool",
     "submit_finish_processing_plan_tool",
+    "submit_trajectory_review_plan_tool",
+}
+TRAJECTORY_REVIEW_PLANNING_TOOL_NAMES = {
+    "inspect_navigation_annotation_job_facts_tool",
+    "get_navigation_task_context_tool",
     "submit_trajectory_review_plan_tool",
 }
 
@@ -374,6 +382,76 @@ def _surface(services, session_id):
     )
 
 
+def _trajectory_review_services(tmp_path, session_id="review-session"):
+    services = build_navigation_services(tmp_path)
+    task = services.task_store.create_task_attempt(
+        request="继续 Fix。",
+        target="trajectory_review",
+        date="20270623",
+        segments=["20260623_145550"],
+        scene_mode="out",
+        dry_run=True,
+        web_session_id=session_id,
+        agentscope_session_id=session_id,
+        requested_outcome="trajectory_fix",
+    ).task
+    facts = AnnotationJobFactsObservation(
+        job_status="annotated",
+        segment_count=1,
+        tracked_count=1,
+        annotated_count=1,
+        ready_for_trajectory_review=True,
+    )
+    observation = services.observation_store.append(
+        task.task_id,
+        "annotation_job_facts",
+        [facts],
+        [
+            EvidenceWrite(
+                kind="annotation_job_facts",
+                source_tool="inspect_navigation_annotation_job_facts_tool",
+                payload=facts.model_dump(mode="json"),
+                summary="Linked trajectory review is ready.",
+            )
+        ],
+        services.evidence_store,
+        expected_web_session_id=session_id,
+        expected_agentscope_session_id=session_id,
+    )
+    plan = TrajectoryReviewPlanInput.model_validate(
+        {
+            "decisions": {
+                "review": {
+                    "mode": "human_fix",
+                    "reason": "Open the linked Web workbench.",
+                    "evidence_refs": [observation.evidence_refs[0]],
+                }
+            },
+            "steps": [
+                {
+                    "step_id": "open_fix",
+                    "action": "open_trajectory_fix_workbench",
+                    "variant": "durable_human_handoff",
+                    "arguments": {},
+                    "depends_on": [],
+                    "failure_policy": "stop",
+                    "decision_refs": ["review"],
+                },
+                {
+                    "step_id": "validate_review",
+                    "action": "validate_trajectory_review_outcome",
+                    "variant": "approved_or_terminal",
+                    "arguments": {},
+                    "depends_on": ["open_fix"],
+                    "failure_policy": "stop",
+                    "decision_refs": ["review"],
+                },
+            ],
+        }
+    )
+    return services, task, observation, plan
+
+
 def _group_tool_names(surface):
     return {
         group.name: {tool.name for tool in group.tools}
@@ -422,6 +500,52 @@ def test_grouped_surface_resolves_planning_catalog(tmp_path):
     }
     with pytest.raises(LookupError):
         planning.group(NAVIGATION_EXECUTION_ACTIONS)
+
+
+def test_trajectory_review_planning_surface_exposes_only_review_tools(tmp_path):
+    services, _task, _observation, _plan = _trajectory_review_services(tmp_path)
+
+    planning = _surface(services, "review-session")
+
+    assert planning is not None
+    assert planning.activity == "planning"
+    assert {
+        tool.name for tool in planning.flatten_active_tools()
+    } == TRAJECTORY_REVIEW_PLANNING_TOOL_NAMES
+    assert {
+        tool.name for tool in planning.group(NAVIGATION_PLAN_AUTHORING).tools
+    } == {
+        "get_navigation_task_context_tool",
+        "submit_trajectory_review_plan_tool",
+    }
+    assert planning.group(NAVIGATION_ARTIFACT_CHECKS).tools == ()
+
+
+def test_trajectory_review_execution_surface_exposes_only_current_review_action(
+    tmp_path,
+):
+    services, task, observation, plan = _trajectory_review_services(tmp_path)
+    services.plan_store.activate(
+        task,
+        "trajectory_review",
+        observation.revision,
+        plan,
+        expected_web_session_id="review-session",
+        expected_agentscope_session_id="review-session",
+    )
+
+    execution = _surface(services, "review-session")
+
+    assert execution is not None
+    assert execution.activity == "execution"
+    names_by_group = _group_tool_names(execution)
+    assert names_by_group[NAVIGATION_EXECUTION_STATE] == {
+        "get_current_plan_step_tool",
+    }
+    assert names_by_group[NAVIGATION_EXECUTION_ACTIONS] == {
+        "open_trajectory_fix_workbench_tool",
+    }
+    assert execution.group(NAVIGATION_ARTIFACT_CHECKS).tools == ()
 
 
 def test_grouped_surface_resolves_execution_catalog(tmp_path):

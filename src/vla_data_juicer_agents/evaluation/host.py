@@ -665,6 +665,7 @@ class RecordingNavigationRuntime:
             if isinstance(payload, Mapping):
                 self._tool_results[str(name)] = dict(payload)
         self._submitted_plan: dict[str, Any] | None = None
+        self._submitted_first_step_id: str | None = None
 
     def _default_tool_results(self) -> dict[str, dict[str, Any]]:
         selection = dict(self.task.get("selection") or {"kind": "all_clips"})
@@ -890,6 +891,9 @@ class RecordingNavigationRuntime:
         canonical_plan = plan_model.model_validate(plan)
         summary = self._plan_summary(phase=phase, plan=canonical_plan)
         self._submitted_plan = summary
+        self._submitted_first_step_id = (
+            canonical_plan.steps[0].step_id if canonical_plan.steps else None
+        )
         self.recorder.record_handoff(summary)
         first_action = summary["step_actions"][0] if summary["step_actions"] else None
         return {
@@ -971,30 +975,52 @@ class RecordingNavigationRuntime:
                 plan=plan,
             )
 
-        def _run_first_step(plan_id: str, step_id: str) -> dict[str, Any]:
+        def _run_first_step(
+            plan_id: str,
+            step_id: str,
+            *,
+            expected_action: str,
+        ) -> dict[str, Any]:
             if plan_id != "eval-plan" or self._submitted_plan is None:
                 return {"ok": False, "error_type": "inactive_navigation_plan"}
-            expected_action = self._submitted_plan["step_actions"][0]
+            first_action = self._submitted_plan["step_actions"][0]
+            if (
+                first_action != expected_action
+                or step_id != self._submitted_first_step_id
+            ):
+                return {
+                    "ok": False,
+                    "error_type": "step_action_mismatch",
+                    "next_action": first_action,
+                }
             return {
                 "ok": True,
                 "status": "running_in_background",
                 "step_id": step_id,
-                "action": expected_action,
+                "action": first_action,
             }
 
-        def prepare_gridmap_for_projection_tool(
+        def run_annotation_postprocessing_workflow_tool(
             plan_id: str,
             step_id: str,
         ) -> dict[str, Any]:
-            """Execute the accepted gridmap preparation step."""
-            return _run_first_step(plan_id, step_id)
+            """Start the accepted plan-bound postprocessing workflow."""
+            return _run_first_step(
+                plan_id,
+                step_id,
+                expected_action="run_annotation_postprocessing_workflow",
+            )
 
         def open_trajectory_fix_workbench_tool(
             plan_id: str,
             step_id: str,
         ) -> dict[str, Any]:
             """Open the accepted durable human Fix workbench handoff."""
-            return _run_first_step(plan_id, step_id)
+            return _run_first_step(
+                plan_id,
+                step_id,
+                expected_action="open_trajectory_fix_workbench",
+            )
 
         extract_plan_tool = FunctionTool(
             submit_extract_sync_plan_tool,
@@ -1034,7 +1060,7 @@ class RecordingNavigationRuntime:
                 finish_plan_tool,
                 review_plan_tool,
                 FunctionTool(
-                    prepare_gridmap_for_projection_tool,
+                    run_annotation_postprocessing_workflow_tool,
                     is_concurrency_safe=False,
                 ),
                 FunctionTool(
@@ -1043,6 +1069,18 @@ class RecordingNavigationRuntime:
                 ),
             ],
         )
+        if self.task.get("requested_outcome") == "trajectory_fix":
+            trajectory_review_tool_names = {
+                "inspect_navigation_annotation_job_facts_tool",
+                "get_navigation_task_context_tool",
+                "submit_trajectory_review_plan_tool",
+                "open_trajectory_fix_workbench_tool",
+            }
+            tools = [
+                tool
+                for tool in tools
+                if tool.name in trajectory_review_tool_names
+            ]
         for tool in tools:
             tool.input_schema["additionalProperties"] = False
         return [_TrustedNavigationTool(tool) for tool in tools]

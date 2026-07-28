@@ -176,6 +176,19 @@ def test_router_prompt_routes_product_outcome_and_linked_fix_without_new_tools()
     assert "never reopens the completed parent" in prompt
 
 
+def test_router_prompt_distinguishes_linked_fix_authorization_from_deferral() -> None:
+    prompt = main_router_v1_prompt()
+    normalized_prompt = " ".join(prompt.split())
+
+    assert "affirmatively authorizes starting Fix now" in prompt
+    assert "call no task tool and answer directly" in normalized_prompt
+    assert '"暂不"' in prompt
+    assert '"之后需要时再做"' in prompt
+    assert "A future possibility is not present authorization" in prompt
+    assert "separate from a `waiting_user` task's blocking question" in prompt
+    assert "negative answer to a blocking question still goes to" in prompt
+
+
 def test_router_v1_continue_and_control_schemas_do_not_expose_runtime_identity() -> None:
     continue_schema = ContinueNavigationDataTaskV1Tool.input_schema
     control_schema = ControlNavigationDataTaskV1Tool.input_schema

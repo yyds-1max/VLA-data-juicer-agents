@@ -61,7 +61,7 @@ _EVALUATION_ALLOWED_TOOLS = frozenset(
         "submit_extract_sync_plan_tool",
         "submit_finish_processing_plan_tool",
         "submit_trajectory_review_plan_tool",
-        "prepare_gridmap_for_projection_tool",
+        "run_annotation_postprocessing_workflow_tool",
         "open_trajectory_fix_workbench_tool",
     },
 )

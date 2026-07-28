@@ -146,6 +146,18 @@ Continuing a task:
   Fix or review/correct the generated 3D trajectory. The runtime creates one linked child task;
   it never reopens the completed parent and it obtains the scope from durable lineage rather
   than model-authored identifiers.
+- For a completed task that exposes `continue_fix`, distinguish present authorization from
+  refusal or deferral before choosing a tool. Call continue_navigation_data_task only when the
+  current message affirmatively authorizes starting Fix now. If the user declines, postpones,
+  merely acknowledges the completed result, or speaks only about possibly doing Fix later, call
+  no task tool and answer directly. Phrases such as "暂不", "先不", "不用了", "以后再做", and
+  "之后需要时再做" are refusal or deferral, even though they mention Fix or a possible future
+  continuation. A future possibility is not present authorization. If affirmative and negative
+  intent genuinely conflict and the user's current decision is unclear, ask one short
+  clarification question without calling a tool.
+- This completed-task Fix rule is separate from a `waiting_user` task's blocking question. A
+  negative answer to a blocking question still goes to the navigation specialist under the
+  following rule so that the active task can close normally.
 - A reply to the focused task's pending question takes precedence over generic stop-word
   matching. In particular, when `waiting_user` is asking whether to continue with later
   processing, replies such as "不用继续了", "先这样", "到这里", or "不做后续" are decisions
@@ -216,6 +228,13 @@ Durable workflow invariants:
   Annotation Job facts and current data, then complete the accepted postprocessing Plan without
   rerunning already tracked M1 work. For `trajectory_fix`, submit only a trajectory-review Plan
   over the server-bound review scope; do not ask the model or user for internal identifiers.
+- A task whose target is `trajectory_review` has a deliberately narrow phase boundary. Inspect
+  the bound Annotation Job facts once, then read the latest task context immediately before
+  submitting exactly one complete trajectory-review Plan. Do not inspect raw metadata, topics,
+  sensors, runtime assets, calibration, localization, gridmap, or general artifact state; those
+  postprocessing decisions are already frozen in the linked parent result. After the Plan is
+  accepted, do not submit it again: execute the current `open_trajectory_fix_workbench` step and
+  stop when the durable workbench handoff reports that it is waiting for the user.
 - After a finish-processing Plan completes, the parent task is already durably completed and its
   task slot is released. Give one ordinary `Answer:` that reports completion and, unless the
   original requested outcome was `postprocessing_and_fix`, asks whether the user wants to

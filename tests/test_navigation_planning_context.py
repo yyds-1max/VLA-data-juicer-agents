@@ -8,6 +8,7 @@ from vla_data_juicer_agents.navigation.catalog import (
     ToolVariantCapability,
 )
 from vla_data_juicer_agents.navigation.observation_models import (
+    AnnotationJobFactsObservation,
     EvidenceDescriptor,
     NavigationObservationRevision,
     RawMetadataObservation,
@@ -140,6 +141,66 @@ def test_fresh_attempt_builds_revision_zero_context_with_request_facts():
     ]
     assert context.evidence_catalog == []
     assert context.evidence_next_cursor is None
+
+
+def test_trajectory_review_context_projects_only_review_facts_and_stage():
+    task = _task().model_copy(update={"target": "trajectory_review"})
+    revision = NavigationObservationRevision(
+        task_id=task.task_id,
+        revision=4,
+        completed_kinds=[
+            "raw_metadata",
+            "artifact_state",
+            "annotation_job_facts",
+        ],
+        payloads=[
+            RawMetadataObservation(
+                segments=["20260710_120000"],
+                topics=[TopicMeasurement(topic="/lidar/points", message_count=42)],
+            ),
+            AnnotationJobFactsObservation(
+                job_status="annotated",
+                segment_count=1,
+                tracked_count=1,
+                annotated_count=1,
+                ready_for_trajectory_review=True,
+            ),
+        ],
+    )
+    evidence = [
+        EvidenceDescriptor(
+            ref="raw-evidence",
+            task_id=task.task_id,
+            observation_revision=4,
+            kind="raw_metadata",
+            summary="raw metadata",
+            byte_size=12,
+            source_tool="inspect_navigation_raw_metadata_tool",
+            created_at="2026-07-10T00:00:00+00:00",
+        ),
+        EvidenceDescriptor(
+            ref="review-evidence",
+            task_id=task.task_id,
+            observation_revision=4,
+            kind="annotation_job_facts",
+            summary="review facts",
+            byte_size=12,
+            source_tool="inspect_navigation_annotation_job_facts_tool",
+            created_at="2026-07-10T00:00:01+00:00",
+        ),
+    ]
+
+    context = build_navigation_task_context(
+        task=task,
+        observation=revision,
+        evidence=evidence,
+        capabilities=_caps(),
+    )
+
+    assert context.available_stage_ids == ["trajectory_review"]
+    assert context.observed_kinds == ["annotation_job_facts"]
+    assert set(context.fact_summary) == {"annotation_job_facts"}
+    assert [item.ref for item in context.evidence_catalog] == ["review-evidence"]
 
 
 def test_planning_context_schema_has_no_code_authored_recommendations():

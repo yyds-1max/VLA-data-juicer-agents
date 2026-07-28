@@ -118,6 +118,17 @@ def test_navigation_prompt_distinguishes_new_stage_gate_from_existing_products()
     assert "the runtime owns the state transition" in prompt
 
 
+def test_navigation_prompt_keeps_trajectory_review_in_its_narrow_phase():
+    prompt = navigation_agent_prompt()
+
+    assert "target is `trajectory_review`" in prompt
+    assert "bound Annotation Job facts once" in prompt
+    assert "submitting exactly one complete trajectory-review Plan" in prompt
+    assert "Do not inspect raw metadata, topics" in prompt
+    assert "do not submit it again" in prompt
+    assert "execute the current `open_trajectory_fix_workbench` step" in prompt
+
+
 def test_router_start_schema_omits_dry_run_and_model_restatements():
     schema = StartNavigationDataTaskV1Tool.input_schema
 

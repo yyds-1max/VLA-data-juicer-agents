@@ -38,6 +38,7 @@ AVAILABLE_STAGE_IDS: list[NavigationStageId] = [
     "finish_processing",
     "trajectory_review",
 ]
+TRAJECTORY_REVIEW_OBSERVATION_KINDS = frozenset({"annotation_job_facts"})
 
 
 class NavigationTaskContext(StrictModel):
@@ -117,6 +118,27 @@ def build_navigation_task_context(
         if descriptor.observation_revision <= observation_revision
     ]
     payloads = list(observation.payloads) if observation is not None else []
+    available_stage_ids = list(AVAILABLE_STAGE_IDS)
+    observed_kinds = (
+        list(observation.completed_kinds) if observation is not None else []
+    )
+    if task.target == "trajectory_review":
+        descriptors = [
+            descriptor
+            for descriptor in descriptors
+            if descriptor.kind in TRAJECTORY_REVIEW_OBSERVATION_KINDS
+        ]
+        payloads = [
+            payload
+            for payload in payloads
+            if payload.kind in TRAJECTORY_REVIEW_OBSERVATION_KINDS
+        ]
+        available_stage_ids = ["trajectory_review"]
+        observed_kinds = [
+            kind
+            for kind in observed_kinds
+            if kind in TRAJECTORY_REVIEW_OBSERVATION_KINDS
+        ]
     request, target, segments = _bounded_task_identity(task)
     context = NavigationTaskContext(
         task_id=task.task_id,
@@ -131,9 +153,9 @@ def build_navigation_task_context(
             capability_revision=_capability_revision(capabilities),
         ),
         observation_revision=observation_revision,
-        observed_kinds=(list(observation.completed_kinds) if observation is not None else []),
+        observed_kinds=observed_kinds,
         fact_summary=_minimal_fact_summary(payloads),
-        available_stage_ids=list(AVAILABLE_STAGE_IDS),
+        available_stage_ids=available_stage_ids,
         evidence_catalog=[],
         evidence_next_cursor=0 if descriptors else None,
     )

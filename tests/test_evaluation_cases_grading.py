@@ -130,10 +130,61 @@ def test_load_navigation_m2_suite_with_router_and_specialist_entrypoints():
     handoff = pcd_case.expectations.tools.handoff
     assert handoff is not None
     assert handoff.step_variants == {
-        "prepare_gridmap_for_projection": "generate_from_pcd",
-        "run_projection_and_trajectory": "cjl_0525_with_gridmap",
+        "run_annotation_postprocessing_workflow": "plan_bound_runtime",
         "validate_navigation_outputs": "expect_gridmap",
     }
+    for case_id, gridmap_source in (
+        ("navigation_postprocessing_existing_gridmap_odom", "existing_gridmap"),
+        ("navigation_postprocessing_generate_gridmap_odom", "generated_from_pcd"),
+    ):
+        postprocessing = cases[case_id]
+        expected_handoff = postprocessing.expectations.tools.handoff
+        assert expected_handoff is not None
+        assert expected_handoff.decision_modes == {
+            "calibration": "annotation_snapshot",
+            "gridmap": gridmap_source,
+            "localization": "odom",
+        }
+        assert expected_handoff.step_actions == [
+            "run_annotation_postprocessing_workflow",
+            "validate_navigation_outputs",
+        ]
+        assert postprocessing.expectations.tools.required_counts == {
+            "submit_finish_processing_plan_tool": 1,
+            "run_annotation_postprocessing_workflow_tool": 1,
+        }
+    review = cases["navigation_trajectory_review_handoff"]
+    assert review.expectations.tools.allowed_calls == [
+        "inspect_navigation_annotation_job_facts_tool",
+        "get_navigation_task_context_tool",
+        "submit_trajectory_review_plan_tool",
+        "open_trajectory_fix_workbench_tool",
+    ]
+    assert review.expectations.tools.required_counts == {
+        "submit_trajectory_review_plan_tool": 1,
+        "open_trajectory_fix_workbench_tool": 1,
+    }
+    decline = cases["router_decline_linked_fix"]
+    assert decline.expectations.response.required_any_groups == [
+        [
+            "暂不",
+            "先不",
+            "延后",
+            "暂缓",
+            "不会开始",
+            "不会继续",
+            "之后需要时",
+            "需要时再",
+            "待复核",
+        ]
+    ]
+    assert {
+        "已开始 Fix",
+        "已经开始 Fix",
+        "正在进行 Fix",
+        "正在继续 Fix",
+        "已经继续 Fix",
+    } <= set(decline.expectations.response.forbidden_terms)
 
 
 def test_case_schema_rejects_unknown_fields():
@@ -488,6 +539,10 @@ def test_navigation_plan_grading_requires_exact_business_variants():
                     name="submit_finish_processing_plan_tool",
                     arguments={},
                 ),
+                ToolCallObservation(
+                    name="run_annotation_postprocessing_workflow_tool",
+                    arguments={},
+                ),
             ],
             handoffs=[payload],
             model_calls=1,
@@ -498,7 +553,7 @@ def test_navigation_plan_grading_requires_exact_business_variants():
     wrong_variant = dict(payload)
     wrong_variant["step_variants"] = {
         **dict(expected.step_variants or {}),
-        "run_projection_and_trajectory": "cjl_with_gridmap",
+        "run_annotation_postprocessing_workflow": "durable_web_handoff",
     }
     failing = grade_case(
         case,
@@ -507,6 +562,10 @@ def test_navigation_plan_grading_requires_exact_business_variants():
             tool_calls=[
                 ToolCallObservation(
                     name="submit_finish_processing_plan_tool",
+                    arguments={},
+                ),
+                ToolCallObservation(
+                    name="run_annotation_postprocessing_workflow_tool",
                     arguments={},
                 ),
             ],

@@ -609,20 +609,11 @@ async def test_navigation_evaluation_host_records_postprocessing_plan_without_io
                 },
                 "steps": [
                     {
-                        "step_id": "prepare_gridmap",
-                        "action": "prepare_gridmap_for_projection",
-                        "variant": "copy_existing_gridmap",
+                        "step_id": "run_postprocessing",
+                        "action": "run_annotation_postprocessing_workflow",
+                        "variant": "plan_bound_runtime",
                         "arguments": {},
                         "depends_on": [],
-                        "failure_policy": "stop",
-                        "decision_refs": ["gridmap"],
-                    },
-                    {
-                        "step_id": "project_trajectory",
-                        "action": "run_projection_and_trajectory",
-                        "variant": "cjl_0525_with_gridmap",
-                        "arguments": {},
-                        "depends_on": ["prepare_gridmap"],
                         "failure_policy": "stop",
                         "decision_refs": ["localization", "calibration", "gridmap"],
                     },
@@ -631,7 +622,7 @@ async def test_navigation_evaluation_host_records_postprocessing_plan_without_io
                         "action": "validate_navigation_outputs",
                         "variant": "expect_gridmap",
                         "arguments": {},
-                        "depends_on": ["project_trajectory"],
+                        "depends_on": ["run_postprocessing"],
                         "failure_policy": "stop",
                         "decision_refs": ["localization", "gridmap"],
                     },
@@ -640,8 +631,8 @@ async def test_navigation_evaluation_host_records_postprocessing_plan_without_io
         },
     )
     model.enqueue_tool(
-        "prepare_gridmap_for_projection_tool",
-        {"plan_id": "eval-plan", "step_id": "prepare_gridmap"},
+        "run_annotation_postprocessing_workflow_tool",
+        {"plan_id": "eval-plan", "step_id": "run_postprocessing"},
     )
     model.enqueue_text("Answer:\n后处理计划已验证，系统已开始执行。")
 
@@ -665,6 +656,9 @@ async def test_navigation_evaluation_host_records_postprocessing_plan_without_io
     )
 
     assert result.session_id == "navigation-postprocessing__navigation-data-agent"
+    visible_tools = set(result.model_calls[0]["tools"])
+    assert "run_annotation_postprocessing_workflow_tool" in visible_tools
+    assert "prepare_gridmap_for_projection_tool" not in visible_tools
     assert result.handoffs == (
         {
             "operation": "submit_plan",
@@ -675,21 +669,23 @@ async def test_navigation_evaluation_host_records_postprocessing_plan_without_io
                 "localization": "odom",
             },
             "step_actions": [
-                "prepare_gridmap_for_projection",
-                "run_projection_and_trajectory",
+                "run_annotation_postprocessing_workflow",
                 "validate_navigation_outputs",
             ],
             "step_variants": {
-                "prepare_gridmap_for_projection": "copy_existing_gridmap",
-                "run_projection_and_trajectory": "cjl_0525_with_gridmap",
+                "run_annotation_postprocessing_workflow": "plan_bound_runtime",
                 "validate_navigation_outputs": "expect_gridmap",
             },
         },
     )
     assert [call["name"] for call in result.tool_calls][-2:] == [
         "submit_finish_processing_plan_tool",
-        "prepare_gridmap_for_projection_tool",
+        "run_annotation_postprocessing_workflow_tool",
     ]
+    assert '"status": "running_in_background"' in result.tool_calls[-1]["result"]
+    assert '"action": "run_annotation_postprocessing_workflow"' in (
+        result.tool_calls[-1]["result"]
+    )
     assert result.forbidden_calls == ()
     model.assert_exhausted()
 
@@ -774,6 +770,28 @@ async def test_navigation_evaluation_host_records_linked_review_plan(tmp_path):
             },
         },
     )
+    visible_tools = set(result.model_calls[0]["tools"])
+    assert {
+        "inspect_navigation_annotation_job_facts_tool",
+        "get_navigation_task_context_tool",
+        "submit_trajectory_review_plan_tool",
+        "open_trajectory_fix_workbench_tool",
+    } <= visible_tools
+    assert {
+        "inspect_navigation_raw_metadata_tool",
+        "inspect_navigation_sensor_candidates_tool",
+        "inspect_navigation_topic_candidates_tool",
+        "inspect_navigation_runtime_assets_tool",
+        "inspect_navigation_calibration_inventory_tool",
+        "inspect_navigation_localization_sources_tool",
+        "inspect_navigation_artifact_state_tool",
+        "inspect_navigation_gridmap_artifacts_tool",
+        "describe_processing_action_tool",
+        "submit_extract_sync_plan_tool",
+        "submit_finish_processing_plan_tool",
+        "prepare_gridmap_for_projection_tool",
+        "run_annotation_postprocessing_workflow_tool",
+    }.isdisjoint(visible_tools)
     assert result.forbidden_calls == ()
     model.assert_exhausted()
 
