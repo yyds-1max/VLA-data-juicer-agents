@@ -526,7 +526,7 @@ AppleDouble 文件不属于业务输入，拆包发现与 raw 同源比较均须
 - processing owner 唯一约束、精确 clip scope 复用、迁移完整性安全标记、后处理
   writer 锁边界、既有 tracked Job owner 绑定，以及 linked Fix 两阶段和 Redis
   原子幂等恢复均已补充回归；
-- 本地门禁为 Python `1635 passed`、Annotation `284 passed`、前端
+- 本地门禁为 Python `1636 passed`、Annotation `284 passed`、前端
   `238 passed, 8 skipped`、Playwright 全量 `9 passed`、production build 通过，
   三套评测分别验证 `4 / 17 / 7` 个 case schema；
 - 服务器旧 Navigation `final-v2` 真实库已完成只读副本迁移演练：7 个 task、

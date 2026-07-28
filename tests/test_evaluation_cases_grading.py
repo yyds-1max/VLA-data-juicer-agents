@@ -9,6 +9,7 @@ from pydantic import ValidationError
 
 from vla_data_juicer_agents.evaluation.cases import (
     CaseLoadError,
+    cases_sha256,
     default_cases_root,
     load_suite,
 )
@@ -95,6 +96,18 @@ def test_load_datapilot_v1_suite_without_rewriting_historical_suite():
         "kind": "selected_clips",
         "clips": ["20260605_152856", "route_A_07"],
     }
+
+
+def test_datapilot_v1_case_hash_ignores_m2_model_extensions():
+    cases = list(_v1_cases().values())
+
+    # This is the exact hash produced at the M1.5 base commit after the
+    # separately approved conflict-synonym case expansion. M2's shared model
+    # defaults must not move it again.
+    assert (
+        cases_sha256(cases)
+        == "cbba56291d0688aa21050fffc9181fbd93b71183a860e24085ddcbe783c47eb6"
+    )
 
 
 def test_load_navigation_m2_suite_with_router_and_specialist_entrypoints():

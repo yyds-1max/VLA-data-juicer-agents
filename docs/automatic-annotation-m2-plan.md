@@ -624,7 +624,7 @@ M4 才上线 DataPilot/模型辅助复核、置信度和
 
 本地门禁结果：
 
-- Python 全量：`1635 passed`；
+- Python 全量：`1636 passed`；
 - Annotation 专项：`284 passed`；
 - 前端 Vitest：`238 passed, 8 skipped`；
 - Playwright 全量：`9 passed`（其中 M2 新增 `2 passed`）；
@@ -643,6 +643,12 @@ M4 才上线 DataPilot/模型辅助复核、置信度和
 - 演练后 foreign key 为空、integrity 为 `ok`、migration safety 为
   `verified`，M2 Store 可打开；
 - 该演练不代替正式停机迁移，也没有修改服务器数据库。
+
+评测 case 模型在 M2 增加 Navigation 专用可选字段时，`datapilot-v1`
+的 canonical hash 显式忽略这些新默认字段，保证未变化的旧 YAML 不因共享模型
+扩展再次漂移。M1.5 基线之后单独批准过的冲突场景同义词扩展仍会形成一次真实
+case-set 变更，不能伪装成与旧 baseline 兼容；本轮需要对其余旧 case 做
+差异审计，并在明确批准后再决定是否晋升新 baseline。
 
 上述评测结果中的 `navigation-m2` 仅表示 case、host 和确定性 grader 本地门禁
 通过；真实模型重复运行和基线晋升尚未执行。真实 Annotation DB 离线迁移、冻结

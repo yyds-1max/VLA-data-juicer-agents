@@ -67,6 +67,29 @@ def cases_sha256(cases: Sequence[EvaluationCase]) -> str:
     canonical_cases: list[dict] = []
     for case in cases:
         payload = case.model_dump(mode="json")
+        if case.suite == "datapilot-v1":
+            # datapilot-v1 is a frozen evaluation contract. M2 extends the
+            # shared strict models with Navigation-only optional fields, but
+            # those defaults must not make unchanged V1 YAML incompatible
+            # with its committed baseline.
+            runtime_setup = payload.get("runtime_setup")
+            if isinstance(runtime_setup, dict):
+                runtime_setup.pop("navigation_task", None)
+                focused_task = runtime_setup.get("focused_task")
+                if isinstance(focused_task, dict):
+                    focused_task.pop("requested_outcome", None)
+                    focused_task.pop("completion_outcome", None)
+            handoff = payload["expectations"]["tools"].get("handoff")
+            if isinstance(handoff, dict):
+                for field in (
+                    "requested_outcome",
+                    "phase",
+                    "decision_modes",
+                    "step_actions",
+                    "step_variants",
+                    "linked_fix",
+                ):
+                    handoff.pop(field, None)
         if case.schema_version == 1:
             # Schema v1 is frozen. New optional v2 model fields must not change
             # the hash of the historical router-smoke cases/baseline.
