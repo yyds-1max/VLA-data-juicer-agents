@@ -86,6 +86,7 @@ class SessionDetail(SessionRecord):
     turns: list[TurnRecord] = Field(default_factory=list)
     tasks: list[dict[str, Any]] = Field(default_factory=list)
     pending_interaction: dict[str, Any] | None = None
+    snapshot_seq: int = Field(default=0, ge=0)
 
 
 class CreateSessionResponse(BaseModel):

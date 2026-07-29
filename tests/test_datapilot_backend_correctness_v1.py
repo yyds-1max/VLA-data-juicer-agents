@@ -7,6 +7,7 @@ import sqlite3
 from types import SimpleNamespace
 
 import pytest
+from agentscope.message import HintBlock
 
 from vla_data_juicer_agents.navigation.task_state import NavigationTaskStatus
 from vla_data_juicer_agents.navigation.task_entry import NavigationTaskEntryError
@@ -2114,11 +2115,34 @@ async def test_workbench_dispatch_uses_atomic_redis_marker_and_xadd(
         reason="explicit_postprocessing_and_fix",
         dispatch_idempotency_key=dispatch_key,
     )
+    inbox_payload = bus.client.streams[
+        "agentscope:inbox:navigation-redis-dispatch"
+    ][0]
+    validated_hint = HintBlock.model_validate_json(inbox_payload)
+    assert validated_hint.source == "datapilot_workbench"
+    assert "explicit_postprocessing_and_fix" in str(validated_hint.hint)
+    milestone_events = [
+        event
+        for event in store.get_session(session.id).events
+        if str(event.payload.get("phase", "")).startswith("workflow_")
+    ]
+    assert [event.type for event in milestone_events] == [
+        "progress_start",
+        "progress_end",
+    ]
+    assert milestone_events[0].payload["summary"] == (
+        "后处理已完成，DataPilot 将继续处理轨迹 Fix。"
+    )
     assert not await runtime.wake_navigation_task_from_workbench(
         task_id=binding.task_id,
         reason="explicit_postprocessing_and_fix",
         dispatch_idempotency_key=dispatch_key,
     )
+    assert len([
+        event
+        for event in store.get_session(session.id).events
+        if str(event.payload.get("phase", "")).startswith("workflow_")
+    ]) == 2
     assert len(bus.client.streams["agentscope:inbox:navigation-redis-dispatch"]) == 1
     assert len(bus.client.streams["agentscope:wakeups"]) == 1
     assert bus.signals == 2

@@ -2773,7 +2773,14 @@ async def test_create_session_creates_compatible_record_and_persists(tmp_path: P
     detail = store.get_session(session.id)
     assert detail is not None
     assert detail.model_dump(
-        exclude={"messages", "events", "turns", "tasks", "pending_interaction"}
+        exclude={
+            "messages",
+            "events",
+            "turns",
+            "tasks",
+            "pending_interaction",
+            "snapshot_seq",
+        }
     ) == session.model_dump()
     assert detail.messages == []
     assert detail.events == []

@@ -20,8 +20,36 @@ export function MessageList({ messages, turns = [], run, hasTaskOverlay = false 
   // Contract v1 welcomes may intentionally be session-scoped instead of Turn-scoped.
   // Render them as messages only; never synthesize a legacy Turn around them.
   const sessionMessages = messages.filter((message) => !message.turn_id || !turnIds.has(message.turn_id));
+  const sessionMilestones = run.timeline.filter(
+    (item) => !item.turnId && item.kind === "progress" && item.text !== "正在理解你的请求",
+  );
+  const conversationEntries = [
+    ...sessionMessages.map((message, index) => ({
+      kind: "message" as const,
+      key: `message:${message.id}`,
+      createdAt: message.created_at,
+      order: index,
+      message,
+    })),
+    ...displayTurns.map((turn, index) => ({
+      kind: "turn" as const,
+      key: `turn:${turn.id}`,
+      createdAt: turn.started_at,
+      order: sessionMessages.length + index,
+      turn,
+    })),
+    ...sessionMilestones.map((milestone, index) => ({
+      kind: "milestone" as const,
+      key: `milestone:${milestone.sequence ?? index}:${milestone.text}`,
+      createdAt: milestone.createdAt ?? "",
+      order: sessionMessages.length + displayTurns.length + (milestone.sequence ?? index),
+      milestone,
+    })),
+  ].sort((left, right) => (
+    left.createdAt.localeCompare(right.createdAt) || left.order - right.order
+  ));
   const placeholderTurnId = latestEmptyUserTurnId(displayTurns, messages, run.timeline);
-  const hasContent = messages.length > 0 || run.timeline.length > 0 || displayTurns.length > 0;
+  const hasContent = conversationEntries.length > 0 || run.timeline.length > 0;
   const scrollAreaRef = useRef<HTMLDivElement | null>(null);
   const shouldStickToBottomRef = useRef(true);
 
@@ -49,16 +77,23 @@ export function MessageList({ messages, turns = [], run, hasTaskOverlay = false 
     >
       {hasContent ? (
         <>
-          {sessionMessages.map((message) => <MessageBubble key={message.id} message={message} />)}
-          {displayTurns.map((turn) => (
-            <TurnConversation
-              key={turn.id}
-              turn={turn}
-              messages={messages}
-              run={run}
-              allowEmptyPlaceholder={turn.id === placeholderTurnId}
-            />
-          ))}
+          {conversationEntries.map((entry) => {
+            if (entry.kind === "message") {
+              return <MessageBubble key={entry.key} message={entry.message} />;
+            }
+            if (entry.kind === "milestone") {
+              return <MilestoneBubble key={entry.key} item={entry.milestone} />;
+            }
+            return (
+              <TurnConversation
+                key={entry.key}
+                turn={entry.turn}
+                messages={messages}
+                run={run}
+                allowEmptyPlaceholder={entry.turn.id === placeholderTurnId}
+              />
+            );
+          })}
         </>
       ) : (
         <div className="mt-auto rounded-lg border border-console-line bg-console-panel px-3 py-3 text-sm text-console-muted shadow-xs">
@@ -66,6 +101,15 @@ export function MessageList({ messages, turns = [], run, hasTaskOverlay = false 
         </div>
       )}
     </div>
+  );
+}
+
+function MilestoneBubble({ item }: { item: TimelineItem }) {
+  return (
+    <article className="mr-auto max-w-[88%] rounded-lg border border-emerald-200 bg-emerald-50/70 px-3 py-2 text-sm leading-6 text-console-text shadow-xs">
+      <div className="mb-1 text-[11px] font-medium text-emerald-700">DataPilot · 状态更新</div>
+      <p className="whitespace-pre-wrap wrap-break-word">{withoutPercentages(item.text)}</p>
+    </article>
   );
 }
 

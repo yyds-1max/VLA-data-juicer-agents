@@ -22,7 +22,14 @@ from agentscope.app.message_bus import RedisMessageBus
 from agentscope.app.storage import ChatModelConfig, RedisStorage, SessionConfig
 from agentscope.app.workspace_manager import LocalWorkspaceManager
 from agentscope.event import ExternalExecutionResultEvent
-from agentscope.message import TextBlock, ToolCallState, ToolResultBlock, ToolResultState, UserMsg
+from agentscope.message import (
+    HintBlock,
+    TextBlock,
+    ToolCallState,
+    ToolResultBlock,
+    ToolResultState,
+    UserMsg,
+)
 from agentscope.permission import PermissionBehavior, PermissionDecision
 from agentscope.tool import ToolBase, ToolChunk
 from agentscope.app.middleware import ToolOffloadMiddleware
@@ -106,6 +113,13 @@ _EXPLICIT_LINKED_FIX_CREATE_KEY_PREFIX = "navigation_auto_linked_fix:"
 _EXPLICIT_LINKED_FIX_WAKE_KEY_PREFIX = "navigation_auto_linked_fix_wake:"
 _EXPLICIT_LINKED_FIX_DISPATCH_KEY_PREFIX = "navigation_auto_linked_fix_dispatch:"
 _REDIS_DISPATCH_MARKER_PREFIX = "datapilot:dispatch:v1:"
+_WORKFLOW_MILESTONE_TEXT = {
+    "tracking_started": "首帧标注已全部提交，Tracking 已开始。",
+    "tracking_completed": "Tracking 已完成，DataPilot 将继续调查并执行后处理。",
+    "postprocessing_completed": "后处理已完成，待人工复核任务已经准备好。",
+    "review_updated": "人工复核状态已更新，DataPilot 将继续处理当前任务。",
+    "linked_fix_started": "后处理已完成，DataPilot 将继续处理轨迹 Fix。",
+}
 _REDIS_IDEMPOTENT_XADD_SCRIPT = """
 local marker_key = KEYS[1]
 local stream_key = KEYS[2]
@@ -1137,9 +1151,25 @@ class AgentScopeRuntime:
             task_id=task_id,
             preallocated_session_id=binding.navigation_session_id,
         )
-        message = UserMsg(
-            name="system",
-            content=(
+        milestone_code = {
+            "initial_annotation_tracking_completed": "tracking_completed",
+            "postprocessing_completed": "postprocessing_completed",
+            "trajectory_review_updated": "review_updated",
+            "explicit_postprocessing_and_fix": "linked_fix_started",
+        }.get(reason)
+        if milestone_code is not None:
+            await self.publish_navigation_workflow_milestone(
+                task_id=task_id,
+                milestone_code=milestone_code,
+                origin_key=(
+                    f"{dispatch_idempotency_key}:milestone"
+                    if dispatch_idempotency_key is not None
+                    else f"navigation_workbench:{task_id}:{reason}"
+                ),
+            )
+        message = HintBlock(
+            source="datapilot_workbench",
+            hint=(
                 "A durable external workbench event completed. Inspect the "
                 "authoritative Navigation task and accepted Plan ledger, then "
                 "continue only the next plan-bound action. Event kind: "
@@ -1200,6 +1230,53 @@ class AgentScopeRuntime:
                 turn_id=None,
             )
         return dispatched
+
+    async def publish_navigation_workflow_milestone(
+        self,
+        *,
+        task_id: str,
+        milestone_code: str,
+        origin_key: str,
+    ) -> None:
+        """Persist one deterministic workbench milestone in the bound session."""
+
+        if self.web_session_store is None:
+            raise RuntimeError("Web session store is unavailable")
+        text = _WORKFLOW_MILESTONE_TEXT.get(milestone_code)
+        if text is None:
+            raise ValueError("unsupported workflow milestone")
+        if not origin_key.strip():
+            raise ValueError("workflow milestone origin key must not be empty")
+        binding = self.web_session_store.get_task_binding(task_id)
+        if binding is None:
+            raise RuntimeError("Navigation workbench binding is unavailable")
+        phase = f"workflow_{milestone_code}"
+        start = self.web_session_store.append_timeline_event(
+            binding.web_session_id,
+            {
+                "type": "progress_start",
+                "payload": {
+                    "phase": phase,
+                    "summary": text,
+                    "task_ref": binding.task_ref,
+                },
+            },
+            origin_key=f"{origin_key}:start",
+        )
+        end = self.web_session_store.append_timeline_event(
+            binding.web_session_id,
+            {
+                "type": "progress_end",
+                "payload": {
+                    "phase": phase,
+                    "task_ref": binding.task_ref,
+                },
+            },
+            origin_key=f"{origin_key}:end",
+        )
+        publish = getattr(self.web_event_bridge, "publish_records", None)
+        if callable(publish):
+            await publish(binding.web_session_id, [start, end])
 
     async def _push_workbench_inbox_once(
         self,

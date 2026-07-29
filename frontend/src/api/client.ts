@@ -124,9 +124,15 @@ export async function submitInteractionResponse(
   );
 }
 
-export function openSessionEvents(sessionId: string, onEvent: (event: AgentEvent) => void): WebSocket {
+export function openSessionEvents(
+  sessionId: string,
+  onEvent: (event: AgentEvent) => void,
+  afterSeq = 0,
+): WebSocket {
   const protocol = window.location.protocol === "https:" ? "wss:" : "ws:";
-  const socket = new WebSocket(`${protocol}//${window.location.host}${sessionPath(sessionId)}/events`);
+  const socket = new WebSocket(
+    `${protocol}//${window.location.host}${sessionPath(sessionId)}/events?after_seq=${afterSeq}`,
+  );
   socket.addEventListener("message", (message) => {
     try {
       onEvent(JSON.parse(message.data) as AgentEvent);

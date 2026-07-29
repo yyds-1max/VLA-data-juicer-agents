@@ -198,6 +198,55 @@ test("renders public ReAct progress text with its semantic action", async ({ pag
   await expect(page.getByText(/agent_start|tool_start|call_id|navigation\.extract_sync/i)).toHaveCount(0);
 });
 
+test("a same-tab reload restores the active session and its pending confirmation", async ({ page }) => {
+  const session = sessionRecord("session-reload", "刷新恢复");
+  const snapshot = {
+    ...sessionSnapshot(session, {
+      messages: [{
+        id: "message-reload",
+        session_id: session.id,
+        turn_id: null,
+        role: "assistant",
+        content: "请确认当天处理标定。",
+        created_at: now,
+      }],
+      events: [],
+      turns: [],
+      tasks: [navigationTask("DP-RELOAD1", "waiting_user", "确认标定")],
+    }),
+    snapshot_seq: 0,
+    pending_interaction: {
+      interaction_id: "interaction-reload",
+      task_ref: "DP-RELOAD1",
+      kind: "calibration_confirmation",
+      blocking: true,
+      risk: "medium",
+      title: "确认当天处理标定",
+      summary: "确认后继续执行当前计划。",
+      options: [
+        { option_id: "confirm", label: "确认并继续", tone: "primary" },
+        { option_id: "stop", label: "暂不处理" },
+      ],
+      interaction_revision: 1,
+      expected_task_revision: 2,
+      expires_at: null,
+    },
+  };
+
+  await openActiveSnapshot(page, session, snapshot);
+  await expect(page.getByRole("heading", { name: "确认当天处理标定" })).toBeVisible();
+  await expect.poll(() => page.evaluate(() => (
+    window.sessionStorage.getItem("datapilot.session-view.v1")
+  ))).toContain(session.id);
+
+  await page.reload();
+  await page.getByRole("button", { name: "Open DataPilot" }).click();
+
+  await expect(page.getByText("请确认当天处理标定。", { exact: true })).toBeVisible();
+  await expect(page.getByRole("heading", { name: "确认当天处理标定" })).toBeVisible();
+  await expect(page.getByRole("button", { name: "确认并继续" })).toBeVisible();
+});
+
 async function installWebSocketStub(page: Page) {
   await page.addInitScript(() => {
     type EventEmitterWindow = Window & {

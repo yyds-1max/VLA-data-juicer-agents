@@ -108,8 +108,35 @@ function activeJob(status: AnnotationJobStatus): boolean {
     status === "preparing"
     || status === "waiting_initial_annotation"
     || status === "tracking"
+    || status === "tracked"
     || status === "postprocessing"
   );
+}
+
+function cancellableJob(status: AnnotationJobStatus): boolean {
+  return (
+    status === "preparing"
+    || status === "waiting_initial_annotation"
+    || status === "tracking"
+    || status === "postprocessing"
+  );
+}
+
+function useForegroundRefresh(refresh: () => void | Promise<void>, enabled = true) {
+  useEffect(() => {
+    if (!enabled) return undefined;
+    const refreshWhenVisible = () => {
+      if (document.visibilityState === "visible") void refresh();
+    };
+    window.addEventListener("focus", refreshWhenVisible);
+    window.addEventListener("online", refreshWhenVisible);
+    document.addEventListener("visibilitychange", refreshWhenVisible);
+    return () => {
+      window.removeEventListener("focus", refreshWhenVisible);
+      window.removeEventListener("online", refreshWhenVisible);
+      document.removeEventListener("visibilitychange", refreshWhenVisible);
+    };
+  }, [enabled, refresh]);
 }
 
 function preferMonotonicJob<T extends AnnotationJobSummary>(
@@ -371,6 +398,15 @@ function JobsPage() {
       ? activeInvocation.error ?? "提交失败，请重试。"
       : null;
 
+  const refreshJobs = useCallback(async () => {
+    try {
+      const nextJobs = await listAnnotationJobs();
+      setJobs((current) => mergeMonotonicJobs(current, nextJobs));
+    } catch (requestError) {
+      setPageError(safeError(requestError, "读取自动标注任务失败"));
+    }
+  }, []);
+
   const refresh = useCallback(async (invalidateDataset = false) => {
     if (invalidateDataset) resetNavigationDatasetSummaryCache();
     const results = await Promise.allSettled([
@@ -411,9 +447,11 @@ function JobsPage() {
 
   useEffect(() => {
     if (!jobs.some((job) => activeJob(job.status))) return;
-    const timer = window.setInterval(() => void refresh(false), POLL_INTERVAL_MS);
+    const timer = window.setInterval(() => void refreshJobs(), POLL_INTERVAL_MS);
     return () => window.clearInterval(timer);
-  }, [jobs, refresh]);
+  }, [jobs, refreshJobs]);
+
+  useForegroundRefresh(refreshJobs);
 
   useEffect(() => {
     if (
@@ -460,11 +498,11 @@ function JobsPage() {
     || job.status === "tracking"
     || job.status === "postprocessing"
   ));
+  const continuingJobs = jobs.filter((job) => job.status === "tracked");
   const failedJobs = jobs.filter((job) => job.status === "failed");
   const historyJobs = jobs
     .filter((job) => (
-      job.status === "tracked"
-      || job.status === "annotated"
+      job.status === "annotated"
       || job.status === "cancelled"
     ))
     .sort((left, right) => right.updated_at.localeCompare(left.updated_at));
@@ -571,6 +609,12 @@ function JobsPage() {
               title="DataPilot 处理中"
               jobs={runningJobs}
               empty="当前没有运行中的处理任务。"
+              onOpen={(jobRef) => navigate(`/annotation/jobs/${encodeURIComponent(jobRef)}`)}
+            />
+            <JobsSection
+              title="等待 DataPilot 继续"
+              jobs={continuingJobs}
+              empty="当前没有等待继续后处理的任务。"
               onOpen={(jobRef) => navigate(`/annotation/jobs/${encodeURIComponent(jobRef)}`)}
             />
             {failedJobs.length > 0 && (
@@ -731,7 +775,7 @@ function JobActions({
             无可处理目标
           </ConsoleButton>
         )}
-        {(activeJob(job.status) || (
+        {(cancellableJob(job.status) || (
           job.status === "failed" && !recoveryQuarantined
         )) && (
           <ConsoleButton disabled={acting} onClick={() => void mutate("cancel")}>
@@ -793,6 +837,8 @@ function JobPage({ jobRef }: { jobRef: string }) {
     const interval = window.setInterval(() => void refresh(), POLL_INTERVAL_MS);
     return () => window.clearInterval(interval);
   }, [job, refresh]);
+
+  useForegroundRefresh(refresh);
 
   if (loading) {
     return <section className="mx-auto max-w-7xl px-4 py-6 md:px-6"><PageMessage icon={LoaderCircle} title="正在读取任务…" /></section>;

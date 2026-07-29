@@ -98,6 +98,20 @@ class AnnotationWorkflowCoordinator:
                         f"datapilot:auto_tracking:{handoff['handoff_ref']}"
                     ),
                 )
+                publish_milestone = getattr(
+                    self.agentscope_runtime,
+                    "publish_navigation_workflow_milestone",
+                    None,
+                )
+                if callable(publish_milestone):
+                    await publish_milestone(
+                        task_id=str(handoff["navigation_task_ref"]),
+                        milestone_code="tracking_started",
+                        origin_key=(
+                            "annotation_workbench_milestone:"
+                            f"{handoff['handoff_ref']}:tracking_started"
+                        ),
+                    )
             elif kind == "tracking_completed":
                 await self._complete_and_wake(
                     handoff,
@@ -172,5 +186,9 @@ class AnnotationWorkflowCoordinator:
                 else "postprocessing_completed"
                 if action == "run_annotation_postprocessing_workflow"
                 else "trajectory_review_updated"
+            ),
+            dispatch_idempotency_key=(
+                "annotation_workbench_dispatch:"
+                f"{handoff['handoff_ref']}:{task_id}:{handoff['kind']}"
             ),
         )

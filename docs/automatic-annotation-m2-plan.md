@@ -6,6 +6,8 @@
 > 开发分支：`codex/automatic-annotation-m2`
 > 上游里程碑：M1.5 完整冻结
 > 上位路线：`docs/automatic-annotation-roadmap.md`
+> 会话与实时状态返修：
+> `docs/automatic-annotation-m2-session-reliability-plan.md`
 
 ## 1. 目标、原则与边界
 
@@ -590,6 +592,8 @@ normalization。
 M2 只有在以下条件全部满足后才可冻结：
 
 - DataPilot 可从 synced 或已有 tracked 事实调查并执行到 annotated；
+- 页面和会话对同一任务的阶段投影一致，同一标签页刷新可恢复当前会话、确认和
+  持久里程碑；
 - Navigation 选择的 gridmap/localization/trajectory variant 经过系统校验；
 - 首帧与 Fix 均通过 durable Web handoff；
 - 后处理结束后正确询问，或按明确完整请求自动创建 linked Fix Task；

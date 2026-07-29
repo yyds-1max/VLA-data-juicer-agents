@@ -48,6 +48,7 @@ export interface DataPilotStoreState {
   turns: TurnRecord[];
   tasks: TaskSnapshot[];
   pendingInteraction: PendingInteraction | null;
+  lastEventSeq: number;
   run: RunState;
   pendingInvocation: DataPilotInvocation | null;
   floatingOffset: { x: number; y: number };
@@ -91,6 +92,7 @@ export function createDataPilotStore() {
     turns: [],
     tasks: [],
     pendingInteraction: null,
+    lastEventSeq: 0,
     run: createEmptyRunState(),
     pendingInvocation: null,
     floatingOffset: { x: 0, y: 0 },
@@ -111,6 +113,7 @@ export function createDataPilotStore() {
         turns: [],
         tasks: [],
         pendingInteraction: null,
+        lastEventSeq: 0,
         run: createEmptyRunState(),
       })),
 
@@ -124,6 +127,7 @@ export function createDataPilotStore() {
         turns: [],
         tasks: [],
         pendingInteraction: null,
+        lastEventSeq: 0,
         run: createEmptyRunState(),
       })),
 
@@ -135,14 +139,21 @@ export function createDataPilotStore() {
 
         const turns = mergeTurns(state.turns, session.turns ?? []);
         const run = session.events?.length ? mergeRunFromEvents(state.run, session.events) : state.run;
+        const snapshotSeq = sessionSnapshotSeq(session);
+        const snapshotCanResolveInteraction = snapshotSeq >= state.lastEventSeq;
         return {
           sessions: upsertSession(state.sessions, session),
           messages: mergeMessages(state.messages, session.messages),
           turns,
           tasks: session.tasks ? mergeTasks(state.tasks, session.tasks) : state.tasks,
           pendingInteraction: session.pending_interaction !== undefined
-            ? session.pending_interaction
+            ? (
+                snapshotCanResolveInteraction
+                  ? preferPendingInteraction(state.pendingInteraction, session.pending_interaction)
+                  : state.pendingInteraction
+              )
             : state.pendingInteraction,
+          lastEventSeq: Math.max(state.lastEventSeq, snapshotSeq),
           ...(run !== state.run ? { run } : {}),
         };
       }),
@@ -151,6 +162,7 @@ export function createDataPilotStore() {
       set((state) => {
         const turns = "turns" in session ? [...(session.turns ?? [])] : [];
         const run = runFromEvents("events" in session ? (session.events ?? []) : []);
+        const lastEventSeq = "events" in session ? sessionSnapshotSeq(session) : 0;
         return {
           mode: "active_session",
           currentSessionId: session.id,
@@ -162,6 +174,7 @@ export function createDataPilotStore() {
           pendingInteraction: "pending_interaction" in session
             ? (session.pending_interaction ?? null)
             : null,
+          lastEventSeq,
           run,
         };
       }),
@@ -178,6 +191,7 @@ export function createDataPilotStore() {
         pendingInteraction: "pending_interaction" in session
           ? (session.pending_interaction ?? null)
           : null,
+        lastEventSeq: "events" in session ? sessionSnapshotSeq(session) : 0,
         run: runFromEvents("events" in session ? (session.events ?? []) : []),
       })),
 
@@ -305,12 +319,14 @@ export function createDataPilotStore() {
         const turns = applyTurnEvent(reconciled.turns, event, state.currentSessionId);
         const tasks = applyTaskEvent(state.tasks, event);
         const pendingInteraction = applyInteractionEvent(state.pendingInteraction, event);
+        const eventSeq = typeof event.seq === "number" ? event.seq : 0;
         return {
           run,
           messages: reconciled.messages,
           turns,
           tasks,
           pendingInteraction,
+          lastEventSeq: Math.max(state.lastEventSeq, eventSeq),
         };
       }),
   }));
@@ -386,7 +402,7 @@ function applyInteractionEvent(
   const risk = interactionRisk(payload.risk);
   const options = interactionOptions(payload.options);
   if (!interactionId || !taskRef || !kind || !risk || options.length === 0) return pending;
-  return {
+  return preferPendingInteraction(pending, {
     interaction_id: interactionId,
     task_ref: taskRef,
     kind,
@@ -402,13 +418,42 @@ function applyInteractionEvent(
       payload.expected_task_revision ?? payload.expectedTaskRevision,
     ),
     expires_at: optionalText(payload.expires_at ?? payload.expiresAt) ?? null,
-  };
+  });
 }
 
 function mergeTasks(existing: TaskSnapshot[], incoming: TaskSnapshot[]): TaskSnapshot[] {
   const byRef = new Map(existing.map((task) => [task.task_ref, task]));
-  for (const task of incoming) byRef.set(task.task_ref, task);
+  for (const task of incoming) {
+    const current = byRef.get(task.task_ref);
+    if (!current || task.state_revision >= current.state_revision) {
+      byRef.set(task.task_ref, task);
+    }
+  }
   return [...byRef.values()].sort((left, right) => right.updated_at.localeCompare(left.updated_at));
+}
+
+function preferPendingInteraction(
+  current: PendingInteraction | null,
+  incoming: PendingInteraction | null,
+): PendingInteraction | null {
+  if (!current || !incoming) return incoming;
+  if (current.interaction_id === incoming.interaction_id) {
+    return incoming.interaction_revision >= current.interaction_revision ? incoming : current;
+  }
+  if (incoming.expected_task_revision < current.expected_task_revision) {
+    return current;
+  }
+  return incoming;
+}
+
+function sessionSnapshotSeq(session: Pick<SessionDetail, "events" | "snapshot_seq">): number {
+  if (typeof session.snapshot_seq === "number" && Number.isFinite(session.snapshot_seq)) {
+    return session.snapshot_seq;
+  }
+  return session.events.reduce(
+    (maximum, event) => Math.max(maximum, event.seq),
+    0,
+  );
 }
 
 function recordValue(value: unknown): Record<string, unknown> | null {
@@ -571,9 +616,21 @@ function cloneRunState(run: RunState): RunState {
 function mergeTurns(existing: TurnRecord[], persisted: TurnRecord[]): TurnRecord[] {
   const byId = new Map(existing.map((turn) => [turn.id, turn]));
   for (const turn of persisted) {
+    const current = byId.get(turn.id);
+    if (
+      current
+      && isTerminalTurnStatus(current.status)
+      && !isTerminalTurnStatus(turn.status)
+    ) {
+      continue;
+    }
     byId.set(turn.id, turn);
   }
   return [...byId.values()].sort((left, right) => left.started_at.localeCompare(right.started_at));
+}
+
+function isTerminalTurnStatus(status: TurnRecord["status"]): boolean {
+  return status === "completed" || status === "failed" || status === "interrupted";
 }
 
 function applyTurnEvent(

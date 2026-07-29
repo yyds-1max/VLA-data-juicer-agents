@@ -506,8 +506,15 @@ def create_app(
             return HumanDecisionRecoveryResponse.model_validate(result)
 
         @app.websocket("/api/sessions/{session_id}/events")
-        async def session_events(websocket: WebSocket, session_id: str) -> None:
+        async def session_events(
+            websocket: WebSocket,
+            session_id: str,
+            after_seq: int = 0,
+        ) -> None:
             await websocket.accept()
+            if after_seq < 0:
+                await websocket.close(code=1008, reason="after_seq must be non-negative")
+                return
             if getattr(manager, "event_bridge", None) is None:
                 _create_logged_task(
                     manager.forward_events_until_idle(session_id),
@@ -515,8 +522,37 @@ def create_app(
                 )
             try:
                 async with bus.subscribe(session_id) as queue:
+                    last_seq = after_seq
+                    try:
+                        replay = store.list_timeline_events_after(
+                            session_id,
+                            after_seq=last_seq,
+                        )
+                    except KeyError:
+                        await websocket.close(code=1008, reason="Session not found")
+                        return
+                    for record in replay:
+                        await websocket.send_json(record.model_dump(mode="json"))
+                        last_seq = record.seq
                     while True:
-                        await websocket.send_json(await queue.get())
+                        event = await queue.get()
+                        event_seq = event.get("seq")
+                        if isinstance(event_seq, int):
+                            if event_seq <= last_seq:
+                                continue
+                            if event_seq > last_seq + 1:
+                                for record in store.list_timeline_events_after(
+                                    session_id,
+                                    after_seq=last_seq,
+                                ):
+                                    if record.seq >= event_seq:
+                                        break
+                                    await websocket.send_json(record.model_dump(mode="json"))
+                                    last_seq = record.seq
+                            if event_seq <= last_seq:
+                                continue
+                            last_seq = event_seq
+                        await websocket.send_json(event)
             except WebSocketDisconnect:
                 return
 

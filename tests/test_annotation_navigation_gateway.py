@@ -537,10 +537,14 @@ class _HandoffService:
 class _WakeRuntime:
     def __init__(self) -> None:
         self.wakes: list[dict[str, str]] = []
+        self.milestones: list[dict[str, str]] = []
 
     async def wake_navigation_task_from_workbench(self, **kwargs) -> bool:
         self.wakes.append(dict(kwargs))
         return True
+
+    async def publish_navigation_workflow_milestone(self, **kwargs) -> None:
+        self.milestones.append(dict(kwargs))
 
 
 def test_initial_annotation_handoff_starts_tracking_without_web_action(
@@ -556,13 +560,24 @@ def test_initial_annotation_handoff_starts_tracking_without_web_action(
         "payload": {},
     }
     service = _HandoffService(handoff)
+    runtime = _WakeRuntime()
     coordinator = AnnotationWorkflowCoordinator(
         service=service,
-        agentscope_runtime=_WakeRuntime(),
+        agentscope_runtime=runtime,
         navigation_workspace_root=tmp_path / "navigation",
     )
 
     assert asyncio.run(coordinator.process_once()) is True
+    assert runtime.milestones == [
+        {
+            "task_id": "nav-task",
+            "milestone_code": "tracking_started",
+            "origin_key": (
+                "annotation_workbench_milestone:"
+                f"{handoff['handoff_ref']}:tracking_started"
+            ),
+        }
+    ]
 
     assert len(service.actions) == 1
     action, job_ref, request, kwargs = service.actions[0]
@@ -1097,6 +1112,10 @@ def test_tracking_completion_finalizes_plan_step_and_wakes_navigation(
         {
             "task_id": "nav-task",
             "reason": "initial_annotation_tracking_completed",
+            "dispatch_idempotency_key": (
+                "annotation_workbench_dispatch:"
+                f"{handoff['handoff_ref']}:nav-task:tracking_completed"
+            ),
         }
     ]
     assert service.store.completed[-1]["success"] is True
@@ -1157,6 +1176,10 @@ def test_review_handoffs_release_workbench_wait_and_wake_linked_child(
         {
             "task_id": "linked-fix-child",
             "reason": "trajectory_review_updated",
+            "dispatch_idempotency_key": (
+                "annotation_workbench_dispatch:"
+                f"{handoff['handoff_ref']}:linked-fix-child:{kind}"
+            ),
         }
     ]
     assert service.store.completed[-1]["success"] is True
@@ -1194,6 +1217,10 @@ def test_review_handoff_before_plan_is_delivered_after_durable_child_wakeup(
         {
             "task_id": "linked-fix-child",
             "reason": "trajectory_review_updated",
+            "dispatch_idempotency_key": (
+                "annotation_workbench_dispatch:"
+                f"{handoff['handoff_ref']}:linked-fix-child:review_completed"
+            ),
         }
     ]
     assert service.store.completed[-1]["success"] is True
@@ -1598,6 +1625,10 @@ def test_review_event_end_to_end_resumes_linked_child_and_validates_all_reviews(
     assert runtime.wakes[-1] == {
         "task_id": task.task_id,
         "reason": "trajectory_review_updated",
+        "dispatch_idempotency_key": (
+            "annotation_workbench_dispatch:"
+            f"{returned_handoff['handoff_ref']}:{task.task_id}:review_returned"
+        ),
     }
     assert task_store.get_task(task.task_id).status.value == "active"
 

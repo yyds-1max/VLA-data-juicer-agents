@@ -447,4 +447,80 @@ describe("contract-v1 DataPilot store", () => {
       "本地新消息",
     ]);
   });
+
+  it("does not let an older snapshot clear a newer live interaction", () => {
+    const store = createDataPilotStore();
+    store.getState().setActiveSession(session());
+    store.getState().applyEvent(persistedEvent(
+      "event-interaction",
+      5,
+      "interaction_required",
+      {
+        interaction_ref: "interaction-1",
+        task_ref: "DP-A7K2",
+        kind: "calibration_preview",
+        blocking: true,
+        risk: "high",
+        title: "确认标定参数",
+        summary: "确认后继续。",
+        options: [{ option_id: "confirm", label: "确认" }],
+        interaction_revision: 2,
+        expected_task_revision: 4,
+      },
+    ));
+
+    store.getState().refreshActiveSession(detail({
+      snapshot_seq: 4,
+      events: [persistedEvent("event-old", 4, "task_state_updated", {
+        task_ref: "DP-A7K2",
+        status: "active",
+      })],
+      pending_interaction: null,
+    }));
+
+    expect(store.getState().pendingInteraction).toMatchObject({
+      interaction_id: "interaction-1",
+      interaction_revision: 2,
+    });
+    expect(store.getState().lastEventSeq).toBe(5);
+  });
+
+  it("keeps the highest task revision when a stale snapshot arrives", () => {
+    const store = createDataPilotStore();
+    store.getState().restoreActiveSession(detail({
+      tasks: [{
+        task_ref: "DP-A7K2",
+        domain: "navigation",
+        dataset_date: "20270605",
+        selection: { kind: "all_clips" },
+        scene_mode: null,
+        status: "waiting_user",
+        phase: "等待首帧标注",
+        state_revision: 8,
+        started_at: "2026-06-26T00:00:00Z",
+        updated_at: "2026-06-26T00:08:00Z",
+      }],
+    }));
+
+    store.getState().refreshActiveSession(detail({
+      tasks: [{
+        task_ref: "DP-A7K2",
+        domain: "navigation",
+        dataset_date: "20270605",
+        selection: { kind: "all_clips" },
+        scene_mode: null,
+        status: "active",
+        phase: "准备数据",
+        state_revision: 7,
+        started_at: "2026-06-26T00:00:00Z",
+        updated_at: "2026-06-26T00:07:00Z",
+      }],
+    }));
+
+    expect(store.getState().tasks[0]).toMatchObject({
+      status: "waiting_user",
+      phase: "等待首帧标注",
+      state_revision: 8,
+    });
+  });
 });

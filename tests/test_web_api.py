@@ -598,6 +598,29 @@ def test_session_events_websocket_receives_background_turn_events(tmp_path: Path
     assert events[-1]["payload"]["text"] == "完成: 开始处理"
 
 
+def test_session_events_websocket_replays_persisted_events_after_sequence(
+    tmp_path: Path,
+):
+    client = make_client(tmp_path)
+    session_id = _create_session(client)
+    response = client.post(
+        f"/api/sessions/{session_id}/turns",
+        json={"message": "开始处理"},
+    )
+    assert response.status_code == 200
+    detail = client.get(f"/api/sessions/{session_id}").json()["session"]
+    assert detail["snapshot_seq"] == 2
+
+    with client.websocket_connect(
+        f"/api/sessions/{session_id}/events?after_seq=1"
+    ) as websocket:
+        replayed = websocket.receive_json()
+
+    assert replayed["seq"] == 2
+    assert replayed["type"] == "final"
+    assert replayed["payload"]["text"] == "完成: 开始处理"
+
+
 def test_list_sessions_returns_session_records(tmp_path: Path):
     client = make_client(tmp_path)
     client.post("/api/sessions", json={"message": "处理 20270605 的室外导航数据"})

@@ -194,10 +194,10 @@ describe("api client", () => {
     });
 
     const onEvent = vi.fn();
-    const socket = openSessionEvents("session/with space", onEvent);
+    const socket = openSessionEvents("session/with space", onEvent, 7);
 
     expect(WebSocketMock).toHaveBeenCalledWith(
-      "wss://example.test/api/sessions/session%2Fwith%20space/events",
+      "wss://example.test/api/sessions/session%2Fwith%20space/events?after_seq=7",
     );
     expect(addEventListener).toHaveBeenCalledWith("message", expect.any(Function));
     expect(socket).toEqual({ addEventListener });

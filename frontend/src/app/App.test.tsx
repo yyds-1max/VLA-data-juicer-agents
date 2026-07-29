@@ -15,6 +15,7 @@ import {
 import type { SessionDetail } from "../api/types";
 import { Composer } from "../components/datapilot/Composer";
 import { MessageList } from "../components/datapilot/MessageList";
+import { writeSessionRecovery } from "../components/datapilot/sessionRecovery";
 import { resetNavigationDatasetSummaryCache } from "../features/console/navigationDatasetSummaryCache";
 import { createEmptyRunState } from "../store/eventReducer";
 import { datapilotStore } from "../store/datapilotStore";
@@ -118,6 +119,7 @@ async function renderAppWithDashboardSettled() {
 beforeEach(() => {
   window.history.replaceState({}, "", "/");
   window.localStorage.clear();
+  window.sessionStorage.clear();
   vi.clearAllMocks();
   resetNavigationDatasetSummaryCache();
   Object.defineProperty(window, "innerWidth", { configurable: true, writable: true, value: 1280 });
@@ -238,6 +240,7 @@ beforeEach(() => {
     turns: [],
     tasks: [],
     pendingInteraction: null,
+    lastEventSeq: 0,
     run: createEmptyRunState(),
     pendingInvocation: null,
     floatingOffset: { x: 0, y: 0 },
@@ -1191,6 +1194,59 @@ test("opens DataPilot draft window from the floating button", async () => {
   expect(screen.queryByText("VLA 主智能体")).not.toBeInTheDocument();
 });
 
+test("restores the current active session after a same-tab page reload", async () => {
+  writeSessionRecovery({
+    sessionId: "session-restore",
+    mode: "active_session",
+  });
+  apiMocks.getSession.mockResolvedValue(sessionDetailFixture({
+    id: "session-restore",
+    title: "恢复中的任务",
+    created_at: "2026-06-26T01:00:00Z",
+    updated_at: "2026-06-26T01:01:00Z",
+    status: "active",
+    messages: [{
+      id: "message-restore",
+      session_id: "session-restore",
+      role: "assistant",
+      content: "请确认标定参数",
+      created_at: "2026-06-26T01:01:00Z",
+      turn_id: null,
+    }],
+    pending_interaction: {
+      interaction_id: "interaction-restore",
+      task_ref: "NAV-RESTORE",
+      kind: "calibration_confirmation",
+      blocking: true,
+      risk: "medium",
+      title: "确认当天处理标定",
+      summary: "确认后继续执行当前任务。",
+      options: [
+        { option_id: "confirm", label: "确认并继续", tone: "primary" },
+        { option_id: "stop", label: "暂不处理" },
+      ],
+      interaction_revision: 2,
+      expected_task_revision: 5,
+      expires_at: null,
+    },
+  }));
+
+  await renderAppWithDashboardSettled();
+  await waitFor(() => expect(datapilotStore.getState().currentSessionId).toBe("session-restore"));
+
+  fireEvent.click(screen.getByRole("button", { name: "Open DataPilot" }));
+
+  expect(await screen.findByText("请确认标定参数")).toBeVisible();
+  expect(screen.getByRole("heading", { name: "确认当天处理标定" })).toBeVisible();
+  expect(screen.getByRole("button", { name: "确认并继续" })).toBeVisible();
+  expect(apiMocks.getSession).toHaveBeenCalledWith("session-restore");
+  expect(apiMocks.openSessionEvents).toHaveBeenCalledWith(
+    "session-restore",
+    expect.any(Function),
+    0,
+  );
+});
+
 test("active session renders messages and does not render draft start content", async () => {
   datapilotStore.setState({
     open: true,
@@ -1285,7 +1341,7 @@ test("closing the DataPilot window closes the active event stream", async () => 
     target: { value: "继续清洗" },
   });
   fireEvent.click(screen.getByRole("button", { name: "Send message" }));
-  await waitFor(() => expect(apiMocks.openSessionEvents).toHaveBeenCalledWith("session-1", expect.any(Function)));
+  await waitFor(() => expect(apiMocks.openSessionEvents).toHaveBeenCalledWith("session-1", expect.any(Function), 0));
 
   fireEvent.click(screen.getByRole("button", { name: "Close DataPilot" }));
 
@@ -1347,7 +1403,7 @@ test("new session closes the active event stream", async () => {
     target: { value: "继续清洗" },
   });
   fireEvent.click(screen.getByRole("button", { name: "Send message" }));
-  await waitFor(() => expect(apiMocks.openSessionEvents).toHaveBeenCalledWith("session-1", expect.any(Function)));
+  await waitFor(() => expect(apiMocks.openSessionEvents).toHaveBeenCalledWith("session-1", expect.any(Function), 0));
 
   fireEvent.click(screen.getByRole("button", { name: "New session" }));
 
@@ -1365,7 +1421,7 @@ test("submitting the first draft message creates a session, opens events, submit
 
   expect(apiMocks.createSession).toHaveBeenCalledWith("清洗 VLA 数据");
   await waitFor(() => expect(apiMocks.submitTurn).toHaveBeenCalledWith("session-created", "清洗 VLA 数据"));
-  expect(apiMocks.openSessionEvents).toHaveBeenCalledWith("session-created", expect.any(Function));
+  expect(apiMocks.openSessionEvents).toHaveBeenCalledWith("session-created", expect.any(Function), 0);
   expect(datapilotStore.getState().mode).toBe("active_session");
   expect(screen.getByText("清洗 VLA 数据")).toBeVisible();
   expect(screen.queryByText("开始一个任务")).not.toBeInTheDocument();
@@ -1576,13 +1632,13 @@ test("reopening an active session reopens the event stream before another turn i
   });
 
   await renderAppWithDashboardSettled();
-  await waitFor(() => expect(apiMocks.openSessionEvents).toHaveBeenCalledWith("session-1", expect.any(Function)));
+  await waitFor(() => expect(apiMocks.openSessionEvents).toHaveBeenCalledWith("session-1", expect.any(Function), 0));
   fireEvent.click(screen.getByRole("button", { name: "Close DataPilot" }));
   await waitFor(() => expect(close).toHaveBeenCalledTimes(1));
   fireEvent.click(screen.getByRole("button", { name: "Open DataPilot" }));
 
   await waitFor(() => expect(apiMocks.openSessionEvents).toHaveBeenCalledTimes(2));
-  expect(apiMocks.openSessionEvents).toHaveBeenLastCalledWith("session-1", expect.any(Function));
+  expect(apiMocks.openSessionEvents).toHaveBeenLastCalledWith("session-1", expect.any(Function), 0);
   expect(apiMocks.submitTurn).not.toHaveBeenCalled();
 });
 
@@ -1875,7 +1931,7 @@ test("selecting a history session closes the active event stream before loading 
     target: { value: "先打开流" },
   });
   fireEvent.click(screen.getByRole("button", { name: "Send message" }));
-  await waitFor(() => expect(apiMocks.openSessionEvents).toHaveBeenCalledWith("session-1", expect.any(Function)));
+  await waitFor(() => expect(apiMocks.openSessionEvents).toHaveBeenCalledWith("session-1", expect.any(Function), 0));
 
   fireEvent.click(screen.getByRole("button", { name: "History" }));
   fireEvent.click(await screen.findByRole("button", { name: /历史任务/ }));

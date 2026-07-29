@@ -977,7 +977,35 @@ class WebSessionStore:
             messages=[self._message_from_row(row) for row in message_rows],
             events=[self._timeline_event_from_row(row) for row in event_rows],
             turns=[self._turn_from_row(row) for row in turn_rows],
+            snapshot_seq=int(event_rows[-1]["seq"]) if event_rows else 0,
         )
+
+    def list_timeline_events_after(
+        self,
+        session_id: str,
+        *,
+        after_seq: int,
+    ) -> list[TimelineEventRecord]:
+        if after_seq < 0:
+            raise ValueError("after_seq must be non-negative")
+        with self._connect() as connection:
+            exists = connection.execute(
+                "SELECT 1 FROM sessions WHERE id = ?",
+                (session_id,),
+            ).fetchone()
+            if exists is None:
+                raise KeyError(session_id)
+            rows = connection.execute(
+                """
+                SELECT id, session_id, turn_id, seq, type, source, run_id,
+                       parent_run_id, timestamp, payload_json, created_at
+                FROM timeline_events
+                WHERE session_id = ? AND seq > ?
+                ORDER BY seq ASC, rowid ASC
+                """,
+                (session_id, after_seq),
+            ).fetchall()
+        return [self._timeline_event_from_row(row) for row in rows]
 
     def append_message(
         self,
@@ -1031,7 +1059,13 @@ class WebSessionStore:
             )
         return record
 
-    def append_timeline_event(self, session_id: str, event: dict) -> TimelineEventRecord:
+    def append_timeline_event(
+        self,
+        session_id: str,
+        event: dict,
+        *,
+        origin_key: str | None = None,
+    ) -> TimelineEventRecord:
         timestamp = _now()
         payload = event.get("payload")
         safe_payload = payload if isinstance(payload, dict) else {}
@@ -1049,6 +1083,22 @@ class WebSessionStore:
             ).fetchone()
             if exists is None:
                 raise KeyError(session_id)
+            if origin_key is not None:
+                existing = connection.execute(
+                    """
+                    SELECT id, session_id, turn_id, seq, type, source, run_id,
+                           parent_run_id, timestamp, payload_json, created_at
+                    FROM timeline_events
+                    WHERE origin_key = ?
+                    """,
+                    (origin_key,),
+                ).fetchone()
+                if existing is not None:
+                    if existing["session_id"] != session_id:
+                        raise RuntimeError(
+                            "timeline event origin belongs to another session"
+                        )
+                    return self._timeline_event_from_row(existing)
             duplicate = self._duplicate_human_decision_event(
                 connection,
                 session_id=session_id,
@@ -1074,6 +1124,7 @@ class WebSessionStore:
                     session_id,
                     turn_id,
                     seq,
+                    origin_key,
                     type,
                     source,
                     run_id,
@@ -1082,13 +1133,14 @@ class WebSessionStore:
                     payload_json,
                     created_at
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     record_id,
                     session_id,
                     turn_id,
                     seq,
+                    origin_key,
                     str(event.get("type", "")),
                     _optional_text(event.get("source")),
                     _optional_text(event.get("run_id")),

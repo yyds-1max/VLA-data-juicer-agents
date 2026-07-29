@@ -414,14 +414,15 @@ test.skip("M1 list layout is superseded by the M2 DataPilot-owned workspace", as
   );
 
   expect(await screen.findByRole("heading", { name: "需要我处理" })).toBeVisible();
-  expect(screen.getByRole("heading", { name: "系统运行中" })).toBeVisible();
+  expect(screen.getByRole("heading", { name: "DataPilot 处理中" })).toBeVisible();
+  expect(screen.getByRole("heading", { name: "等待 DataPilot 继续" })).toBeVisible();
   expect(screen.getByRole("heading", { name: "异常任务" })).toBeVisible();
   expect(screen.getByText("waiting_clip")).toBeVisible();
   expect(screen.getByText("running_clip")).toBeVisible();
   expect(screen.getByText("running_clip").closest("[data-testid='annotation-job-row']")).toHaveTextContent("3/3");
   expect(screen.getByText("failed_clip")).toBeVisible();
   expect(screen.getByText("archived_clip")).toBeVisible();
-  expect(screen.getAllByText("更新时间")).toHaveLength(4);
+  expect(screen.getAllByText("更新时间")).toHaveLength(5);
   expect(screen.getAllByText(/2026-07-23/)).toHaveLength(4);
   const firstHeader = screen.getAllByTestId("annotation-job-table-header")[0];
   expect(firstHeader).toHaveClass("bg-slate-100/80");
@@ -1169,6 +1170,30 @@ test("tracked jobs cannot be cancelled", async () => {
 
   expect(await screen.findByRole("heading", { name: "Tracking 已完成" })).toBeVisible();
   expect(screen.queryByRole("button", { name: /取消任务|放弃任务/ })).not.toBeInTheDocument();
+});
+
+test("a tracked job refreshes into postprocessing when the tab returns to the foreground", async () => {
+  const tracked = jobFixture({ status: "tracked", state_revision: 8 });
+  const postprocessing = jobFixture({ status: "postprocessing", state_revision: 9 });
+  apiMocks.getAnnotationJob
+    .mockResolvedValueOnce(tracked)
+    .mockResolvedValue(postprocessing);
+
+  render(
+    <MemoryRouter
+      initialEntries={[`/annotation/jobs/${tracked.job_ref}`]}
+      future={{ v7_relativeSplatPath: true, v7_startTransition: true }}
+    >
+      <Routes>
+        <Route path="/annotation/jobs/:jobRef" element={<AnnotationPage />} />
+      </Routes>
+    </MemoryRouter>,
+  );
+
+  expect(await screen.findByRole("heading", { name: "Tracking 已完成" })).toBeVisible();
+  fireEvent.focus(window);
+
+  expect(await screen.findByRole("heading", { name: "DataPilot 正在执行后处理" })).toBeVisible();
 });
 
 test.skip("M1 direct-create refresh is superseded by the shared DataPilot selection dialog", async () => {

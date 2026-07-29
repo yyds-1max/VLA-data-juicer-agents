@@ -100,4 +100,29 @@ describe("MessageList contract v1 processing", () => {
     expect(screen.getByText("已核对现有产物，接下来提取并同步导航数据。")).toBeVisible();
     expect(screen.getByText("正在提取并同步导航数据")).toBeVisible();
   });
+
+  test("renders a durable turnless workflow milestone in conversation order", () => {
+    const run = createEmptyRunState();
+    run.timeline = [{
+      kind: "progress",
+      text: "Tracking 已完成，DataPilot 将继续调查并执行后处理。",
+      turnId: null,
+      progressPhase: "completed",
+      createdAt: "2026-07-20T00:00:03.000Z",
+      sequence: 7,
+    }];
+
+    render(
+      <MessageList
+        messages={[userMessage("message-1", "turn-1")]}
+        turns={[turn("turn-1")]}
+        run={run}
+      />,
+    );
+
+    expect(screen.getByText("DataPilot · 状态更新")).toBeVisible();
+    expect(screen.getByText(
+      "Tracking 已完成，DataPilot 将继续调查并执行后处理。",
+    )).toBeVisible();
+  });
 });

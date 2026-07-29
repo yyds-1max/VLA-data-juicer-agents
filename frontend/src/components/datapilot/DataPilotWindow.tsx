@@ -23,6 +23,11 @@ import { SessionHeader } from "./SessionHeader";
 import { SessionHistoryPanel } from "./SessionHistoryPanel";
 import { TaskStrip } from "./TaskStrip";
 import { currentViewport, visibleFloatingOffset, visibleWindowOffset } from "./floatingPosition";
+import {
+  clearSessionRecovery,
+  readSessionRecovery,
+  writeSessionRecovery,
+} from "./sessionRecovery";
 
 type DragState = {
   pointerId: number;
@@ -52,6 +57,9 @@ export function DataPilotWindow() {
   const [closing, setClosing] = useState(false);
   const [submittingInteraction, setSubmittingInteraction] = useState(false);
   const [interactionError, setInteractionError] = useState("");
+  const [storedRecovery] = useState(() => readSessionRecovery());
+  const [startupInvocation] = useState(() => pendingInvocation);
+  const [recoveryComplete, setRecoveryComplete] = useState(storedRecovery === null);
   const [viewport, setViewport] = useState(() => ({
     width: typeof window === "undefined" ? 1280 : window.innerWidth,
     height: typeof window === "undefined" ? 900 : window.innerHeight,
@@ -65,6 +73,54 @@ export function DataPilotWindow() {
   const running = runRunning || turns.some(
     (turn) => turn.status === "running" || turn.status === "waiting",
   );
+
+  useEffect(() => {
+    if (startupInvocation) {
+      clearSessionRecovery();
+      setRecoveryComplete(true);
+      return;
+    }
+    const recovery = storedRecovery;
+    if (!recovery) {
+      setRecoveryComplete(true);
+      return;
+    }
+    let cancelled = false;
+    void getSession(recovery.sessionId)
+      .then((detail) => {
+        if (cancelled) return;
+        if (recovery.mode === "active_session" && detail.status === "active") {
+          datapilotStore.getState().restoreActiveSession(detail, detail.messages);
+          setRecoveryComplete(true);
+          return;
+        }
+        datapilotStore.getState().restoreHistory(detail, detail.messages);
+        setRecoveryComplete(true);
+      })
+      .catch((error) => {
+        if (error instanceof ApiResponseError && error.status === 404) {
+          clearSessionRecovery();
+          setRecoveryComplete(true);
+          return;
+        }
+        console.error("Failed to restore DataPilot same-tab session", error);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [startupInvocation, storedRecovery]);
+
+  useEffect(() => {
+    if (!recoveryComplete) return;
+    if (mode === "draft_new_session" || !currentSessionId) {
+      clearSessionRecovery();
+      return;
+    }
+    writeSessionRecovery({
+      sessionId: currentSessionId,
+      mode,
+    });
+  }, [currentSessionId, mode, recoveryComplete]);
 
   useEffect(() => {
     const previous = previousInteractionRef.current;
@@ -116,7 +172,11 @@ export function DataPilotWindow() {
 
       closeSocket();
       clearReconnectTimer();
-      const socket = openSessionEvents(sessionId, (event) => datapilotStore.getState().applyEvent(event));
+      const socket = openSessionEvents(
+        sessionId,
+        (event) => datapilotStore.getState().applyEvent(event),
+        datapilotStore.getState().lastEventSeq,
+      );
       socketRef.current = {
         sessionId,
         socket,
@@ -127,12 +187,12 @@ export function DataPilotWindow() {
           return;
         }
         socketRef.current = null;
-        void refreshSessionSnapshot(sessionId);
         reconnectTimerRef.current = window.setTimeout(() => {
           reconnectTimerRef.current = null;
           const state = datapilotStore.getState();
           if (state.open && state.mode === "active_session" && state.currentSessionId === sessionId) {
             openEvents(sessionId);
+            void refreshSessionSnapshot(sessionId);
           }
         }, 100);
       };
