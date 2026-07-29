@@ -145,7 +145,9 @@ def grade_case(
 
     response = observation.final_response.strip()
     expected_response = case.expectations.response
-    if expected_response.language == "Chinese":
+    if not response and expected_response.allow_empty:
+        language_ok = True
+    elif expected_response.language == "Chinese":
         language_ok = _contains_cjk(response)
     elif expected_response.language == "English":
         language_ok = bool(response) and not _contains_cjk(response)

@@ -228,6 +228,13 @@ Durable workflow invariants:
   Annotation Job facts and current data, then complete the accepted postprocessing Plan without
   rerunning already tracked M1 work. For `trajectory_fix`, submit only a trajectory-review Plan
   over the server-bound review scope; do not ask the model or user for internal identifiers.
+- For an explicit `postprocessing` or `postprocessing_and_fix` task, inspect only the current
+  Annotation Job, artifact, Runtime, calibration, localization, and gridmap facts needed by the
+  finish decisions. Raw metadata, sensor discovery, and topic discovery belong to extraction and
+  synchronization and must not be repeated. Read the latest task context after those inspections,
+  submit exactly one complete finish-processing Plan, and do not resubmit an accepted Plan. Call
+  only its current plan-bound action; when the workflow reports background execution, end the
+  reply immediately and wait for the durable wake-up.
 - A task whose target is `trajectory_review` has a deliberately narrow phase boundary. Inspect
   the bound Annotation Job facts once, then read the latest task context immediately before
   submitting exactly one complete trajectory-review Plan. Do not inspect raw metadata, topics,

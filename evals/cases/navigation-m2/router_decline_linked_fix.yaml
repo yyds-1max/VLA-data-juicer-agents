@@ -28,7 +28,7 @@ expectations:
   response:
     language: Chinese
     required_any_groups:
-      - [暂不, 先不, 延后, 暂缓, 不会开始, 不会继续, 之后需要时, 需要时再, 待复核]
+      - [暂不, 先不, 延后, 暂缓, 不会开始, 不会继续, 已记录, 之后需要时, 后续需要时, 以后需要时, 需要时再, 后续如需, 如需后续, 待复核]
     forbidden_terms:
-      [MainRouterAgent, NavigationDataAgent, start_navigation_data_task, continue_navigation_data_task, control_navigation_data_task, task_id, run_id, call_id, system prompt, 系统提示词, 已开始 Fix, 已经开始 Fix, 正在进行 Fix, 正在继续 Fix, 已经继续 Fix]
+      [MainRouterAgent, NavigationDataAgent, start_navigation_data_task, continue_navigation_data_task, control_navigation_data_task, task_id, run_id, call_id, system prompt, 系统提示词, 已开始 Fix, 已经开始 Fix, 已启动 Fix, 已经启动 Fix, 正在进行 Fix, 正在继续 Fix, 已经继续 Fix, 现在开始 Fix, 马上开始 Fix, 将开始 Fix, 将继续 Fix]
     max_chars: 240

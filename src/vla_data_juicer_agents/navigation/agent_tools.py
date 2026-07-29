@@ -56,7 +56,17 @@ _TRAJECTORY_REVIEW_PLANNING_TOOL_NAMES = {
     "get_navigation_task_context_tool",
     "submit_trajectory_review_plan_tool",
 }
-_TRAJECTORY_REVIEW_EXECUTION_STATE_TOOL_NAMES = {
+_FINISH_PROCESSING_PLANNING_TOOL_NAMES = {
+    "inspect_navigation_annotation_job_facts_tool",
+    "inspect_navigation_artifact_state_tool",
+    "inspect_navigation_runtime_assets_tool",
+    "inspect_navigation_calibration_inventory_tool",
+    "inspect_navigation_localization_sources_tool",
+    "inspect_navigation_gridmap_artifacts_tool",
+    "get_navigation_task_context_tool",
+    "submit_finish_processing_plan_tool",
+}
+_NARROW_EXECUTION_STATE_TOOL_NAMES = {
     "get_current_plan_step_tool",
 }
 _FIXED_TOOL_NAMES_BY_ACTIVITY = {
@@ -206,7 +216,25 @@ def build_navigation_tool_groups(
     agentscope_session_id: str,
 ) -> dict[str, NavigationToolGroupDefinition]:
     task = snapshot.task
+    task_outcome = services.task_store.get_task_outcome(task.task_id)
     is_trajectory_review = task.target == "trajectory_review"
+    is_finish_processing = bool(
+        task_outcome
+        and task_outcome.requested_outcome
+        in {"postprocessing", "postprocessing_and_fix"}
+    )
+    finish_processing_planning_tool_names = set(
+        _FINISH_PROCESSING_PLANNING_TOOL_NAMES
+    )
+    if is_finish_processing and task.scene_mode not in {"in", "out"}:
+        finish_processing_planning_tool_names.add(
+            "record_navigation_user_guidance_tool"
+        )
+    has_narrow_execution_surface = is_trajectory_review or is_finish_processing
+    narrow_task_is_terminal = (
+        has_narrow_execution_surface
+        and task.status.value in {"completed", "failed", "cancelled", "superseded"}
+    )
     observation_tools = build_navigation_observation_tools(
         task=task,
         observation_store=services.observation_store,
@@ -268,42 +296,56 @@ def build_navigation_tool_groups(
             annotation_gateway=services.annotation_gateway,
         )
 
-    if is_trajectory_review:
-        if snapshot.activity == "planning":
-            fixed_tools = [
-                tool
-                for tool in fixed_tools
-                if tool.name in _TRAJECTORY_REVIEW_PLANNING_TOOL_NAMES
-            ]
-        elif snapshot.activity in {"execution", "recovery_required"}:
-            fixed_tools = [
-                tool
-                for tool in fixed_tools
-                if tool.name in _TRAJECTORY_REVIEW_EXECUTION_STATE_TOOL_NAMES
-            ]
-        if snapshot.activity == "execution":
-            current_step = snapshot.current
-            current_action = (
-                current_step.get("step", {}).get("action")
-                if isinstance(current_step, dict)
-                else None
-            )
-            execution_tools = [
-                tool
-                for tool in execution_tools
-                if tool.name == f"{current_action}_tool"
-            ]
+    if snapshot.activity == "planning" and narrow_task_is_terminal:
+        fixed_tools = []
+    elif snapshot.activity == "planning" and is_trajectory_review:
+        fixed_tools = [
+            tool
+            for tool in fixed_tools
+            if tool.name in _TRAJECTORY_REVIEW_PLANNING_TOOL_NAMES
+        ]
+    elif snapshot.activity == "planning" and is_finish_processing:
+        fixed_tools = [
+            tool
+            for tool in fixed_tools
+            if tool.name in finish_processing_planning_tool_names
+        ]
+    elif (
+        snapshot.activity in {"execution", "recovery_required"}
+        and has_narrow_execution_surface
+    ):
+        fixed_tools = [
+            tool
+            for tool in fixed_tools
+            if tool.name in _NARROW_EXECUTION_STATE_TOOL_NAMES
+        ]
+    if snapshot.activity == "execution" and has_narrow_execution_surface:
+        current_step = snapshot.current
+        current_action = (
+            current_step.get("step", {}).get("action")
+            if isinstance(current_step, dict)
+            else None
+        )
+        execution_tools = [
+            tool
+            for tool in execution_tools
+            if tool.name == f"{current_action}_tool"
+        ]
 
     trusted_fixed_tools = _trust(fixed_tools)
     classified = classify_fixed_navigation_tools(trusted_fixed_tools)
     actual_fixed_names = {tool.name for tool in trusted_fixed_tools}
-    if is_trajectory_review and snapshot.activity == "planning":
+    if snapshot.activity == "planning" and narrow_task_is_terminal:
+        expected_fixed_names: set[str] = set()
+    elif is_trajectory_review and snapshot.activity == "planning":
         expected_fixed_names = _TRAJECTORY_REVIEW_PLANNING_TOOL_NAMES
-    elif is_trajectory_review and snapshot.activity in {
+    elif is_finish_processing and snapshot.activity == "planning":
+        expected_fixed_names = finish_processing_planning_tool_names
+    elif has_narrow_execution_surface and snapshot.activity in {
         "execution",
         "recovery_required",
     }:
-        expected_fixed_names = _TRAJECTORY_REVIEW_EXECUTION_STATE_TOOL_NAMES
+        expected_fixed_names = _NARROW_EXECUTION_STATE_TOOL_NAMES
     else:
         expected_fixed_names = _FIXED_TOOL_NAMES_BY_ACTIVITY[snapshot.activity]
     if actual_fixed_names != expected_fixed_names:
@@ -335,16 +377,37 @@ def build_navigation_tool_groups(
     }[snapshot.activity]
     for group_name in fixed_group_names:
         instructions = None
-        if is_trajectory_review and snapshot.activity == "planning":
+        if snapshot.activity == "planning" and (
+            is_trajectory_review or is_finish_processing
+        ):
             if group_name == NAVIGATION_INVESTIGATION:
                 instructions = (
-                    "Inspect only the bound Annotation Job facts for linked "
-                    "trajectory-review readiness."
+                    (
+                        "Inspect only the bound Annotation Job facts for linked "
+                        "trajectory-review readiness."
+                    )
+                    if is_trajectory_review
+                    else (
+                        "Inspect only Annotation, Runtime, calibration, and "
+                        "localization facts needed for postprocessing decisions."
+                    )
+                )
+            elif group_name == NAVIGATION_ARTIFACT_CHECKS and is_finish_processing:
+                instructions = (
+                    "Inspect current artifact and gridmap facts needed for "
+                    "postprocessing decisions."
                 )
             elif group_name == NAVIGATION_PLAN_AUTHORING:
                 instructions = (
-                    "Read the latest task context, submit one complete "
-                    "trajectory-review Plan, then execute the accepted first step."
+                    (
+                        "Read the latest task context, submit one complete "
+                        "trajectory-review Plan, then execute the accepted first step."
+                    )
+                    if is_trajectory_review
+                    else (
+                        "Read the latest task context, submit one complete "
+                        "finish-processing Plan, then execute the accepted first step."
+                    )
                 )
         groups[group_name] = NavigationToolGroupDefinition(
             name=group_name,

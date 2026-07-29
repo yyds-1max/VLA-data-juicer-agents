@@ -801,6 +801,8 @@ def _validate_dependencies(
 ) -> list[PlanValidationIssue]:
     errors: list[PlanValidationIssue] = []
     positions: dict[str, int] = {}
+    action_positions: dict[str, int] = {}
+    duplicate_actions_reported: set[str] = set()
     for index, step in enumerate(plan.steps):
         if step.step_id in positions:
             errors.append(
@@ -812,6 +814,20 @@ def _validate_dependencies(
             )
         else:
             positions[step.step_id] = index
+        if (
+            step.action in action_positions
+            and step.action not in duplicate_actions_reported
+        ):
+            errors.append(
+                _plan_issue(
+                    f"plan.steps.{index}.action",
+                    "duplicate_action",
+                    "A business action may appear only once in one Plan",
+                )
+            )
+            duplicate_actions_reported.add(step.action)
+        else:
+            action_positions.setdefault(step.action, index)
 
     unknown_dependencies = False
     for index, step in enumerate(plan.steps):
@@ -959,17 +975,10 @@ def _validate_finish_business_order(
             )
         )
 
+    errors.extend(validate_finish_plan_internal_consistency(plan))
+
     confirmation = positions.get("confirm_navigation_calibration_params")
-    if plan.decisions.calibration.requires_user_confirmation and confirmation is None:
-        errors.append(
-            _plan_issue(
-                "plan.steps",
-                "missing_calibration_confirmation",
-                "Plan requires a calibration confirmation step",
-                ["confirm_navigation_calibration_params"],
-            )
-        )
-    elif confirmation is not None and confirmation != 0:
+    if confirmation is not None and confirmation != 0:
         errors.append(
             _plan_issue(
                 f"plan.steps.{confirmation}",
@@ -1030,6 +1039,42 @@ def _validate_finish_business_order(
                     "A finish Plan cannot mix legacy script actions with the "
                     "Annotation Application Service workflow"
                 ),
+            )
+        )
+    return errors
+
+
+def validate_finish_plan_internal_consistency(
+    plan: FinishProcessingPlanInput,
+) -> list[PlanValidationIssue]:
+    """Validate cross-field finish rules that do not require observed facts."""
+    positions = {step.action: index for index, step in enumerate(plan.steps)}
+    errors: list[PlanValidationIssue] = []
+    confirmation = positions.get("confirm_navigation_calibration_params")
+    if (
+        not plan.decisions.calibration.requires_user_confirmation
+        and confirmation is not None
+    ):
+        errors.append(
+            _plan_issue(
+                f"plan.steps.{confirmation}",
+                "unexpected_calibration_confirmation",
+                (
+                    "Plan must not request calibration confirmation when the "
+                    "calibration decision does not require it"
+                ),
+            )
+        )
+    elif (
+        plan.decisions.calibration.requires_user_confirmation
+        and confirmation is None
+    ):
+        errors.append(
+            _plan_issue(
+                "plan.steps",
+                "missing_calibration_confirmation",
+                "Plan requires a calibration confirmation step",
+                ["confirm_navigation_calibration_params"],
             )
         )
     return errors

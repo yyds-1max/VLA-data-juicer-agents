@@ -243,6 +243,7 @@ class ToolExpectations(StrictModel):
 
 class ResponseExpectations(StrictModel):
     language: Literal["Chinese", "English"] | None = None
+    allow_empty: bool = False
     required_any_groups: list[list[str]] = Field(default_factory=list)
     forbidden_terms: list[str] = Field(default_factory=list)
     require_question: bool = False

@@ -285,17 +285,36 @@ async def test_reasoning_resolves_fresh_surface_on_every_call(
 
 
 @pytest.mark.asyncio
-async def test_reasoning_stops_without_model_call_while_step_is_running(
+@pytest.mark.parametrize(
+    ("suspended_status", "expected_phrase", "forbidden_phrase"),
+    [
+        (
+            "running",
+            "Background navigation processing is still running",
+            "waiting for required user input",
+        ),
+        (
+            "waiting_user",
+            "waiting for required user input",
+            "Background navigation processing is still running",
+        ),
+    ],
+)
+async def test_reasoning_stops_without_model_call_while_step_is_suspended(
     monkeypatch,
     record,
     generic_tools,
     agent_state,
+    suspended_status,
+    expected_phrase,
+    forbidden_phrase,
 ):
     waiting = NavigationToolSurface(
         activity="execution",
         groups=(),
         active_group_names=(),
         waiting_for_running_step=True,
+        suspended_step_status=suspended_status,
     )
     resolver = SequenceResolver(waiting)
     middleware = _middleware(monkeypatch, resolver)
@@ -321,7 +340,10 @@ async def test_reasoning_stops_without_model_call_while_step_is_running(
     assert resolver.calls == 1
     assert len(events) == 1
     assert events[0].role == "assistant"
-    assert "resume automatically" in events[0].content[0].text
+    message = events[0].content[0].text
+    assert expected_phrase in message
+    assert forbidden_phrase not in message
+    assert "resume automatically" in message
     assert [group.name for group in agent.toolkit.tool_groups] == ["basic"]
     assert agent.toolkit.tool_groups[0].tools == []
     assert agent.state.tool_context.activated_groups == []

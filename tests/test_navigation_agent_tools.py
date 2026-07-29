@@ -89,6 +89,16 @@ TRAJECTORY_REVIEW_PLANNING_TOOL_NAMES = {
     "get_navigation_task_context_tool",
     "submit_trajectory_review_plan_tool",
 }
+FINISH_PROCESSING_PLANNING_TOOL_NAMES = {
+    "inspect_navigation_annotation_job_facts_tool",
+    "inspect_navigation_artifact_state_tool",
+    "inspect_navigation_runtime_assets_tool",
+    "inspect_navigation_calibration_inventory_tool",
+    "inspect_navigation_localization_sources_tool",
+    "inspect_navigation_gridmap_artifacts_tool",
+    "get_navigation_task_context_tool",
+    "submit_finish_processing_plan_tool",
+}
 
 
 @pytest.fixture(autouse=True)
@@ -459,6 +469,26 @@ def _group_tool_names(surface):
     }
 
 
+def _set_requested_outcome(services, task_id, requested_outcome):
+    with sqlite3.connect(services.plan_store.db_path) as connection:
+        connection.execute(
+            """UPDATE navigation_task_outcomes
+               SET requested_outcome = ?
+               WHERE task_id = ?""",
+            (requested_outcome, task_id),
+        )
+
+
+def _set_scene_mode(services, task_id, scene_mode):
+    with sqlite3.connect(services.plan_store.db_path) as connection:
+        connection.execute(
+            """UPDATE navigation_tasks
+               SET scene_mode = ?, state_revision = state_revision + 1
+               WHERE task_id = ?""",
+            (scene_mode, task_id),
+        )
+
+
 def _terminalize_plan(services, plan, session_id):
     for step in plan.plan.steps:
         assert services.plan_store.claim_step(
@@ -546,6 +576,121 @@ def test_trajectory_review_execution_surface_exposes_only_current_review_action(
         "open_trajectory_fix_workbench_tool",
     }
     assert execution.group(NAVIGATION_ARTIFACT_CHECKS).tools == ()
+
+
+@pytest.mark.parametrize(
+    "requested_outcome",
+    ["postprocessing", "postprocessing_and_fix"],
+)
+def test_explicit_postprocessing_planning_surface_hides_ingestion_tools(
+    tmp_path,
+    requested_outcome,
+):
+    services, task, _built = _resolver_services_from_complete(
+        tmp_path,
+        phase="finish_processing",
+    )
+    _set_requested_outcome(services, task.task_id, requested_outcome)
+
+    planning = _surface(services, "as-session-1")
+
+    assert planning is not None
+    assert {
+        tool.name for tool in planning.flatten_active_tools()
+    } == FINISH_PROCESSING_PLANNING_TOOL_NAMES
+    assert {
+        "inspect_navigation_raw_metadata_tool",
+        "inspect_navigation_sensor_candidates_tool",
+        "inspect_navigation_topic_candidates_tool",
+        "submit_extract_sync_plan_tool",
+        "submit_trajectory_review_plan_tool",
+        "describe_processing_action_tool",
+        "record_navigation_user_guidance_tool",
+    }.isdisjoint(
+        tool.name for tool in planning.flatten_active_tools()
+    )
+
+
+@pytest.mark.parametrize(
+    "requested_outcome",
+    ["postprocessing", "postprocessing_and_fix"],
+)
+def test_explicit_postprocessing_without_scene_mode_exposes_guidance_tool(
+    tmp_path,
+    requested_outcome,
+):
+    services, task, _built = _resolver_services_from_complete(
+        tmp_path,
+        phase="finish_processing",
+    )
+    _set_requested_outcome(services, task.task_id, requested_outcome)
+    _set_scene_mode(services, task.task_id, None)
+
+    planning = _surface(services, "as-session-1")
+
+    assert planning is not None
+    assert {
+        tool.name for tool in planning.flatten_active_tools()
+    } == FINISH_PROCESSING_PLANNING_TOOL_NAMES | {
+        "record_navigation_user_guidance_tool",
+    }
+
+
+def test_explicit_postprocessing_execution_exposes_only_current_action(tmp_path):
+    services, task, built = _resolver_services_from_complete(
+        tmp_path,
+        phase="finish_processing",
+    )
+    _set_requested_outcome(services, task.task_id, "postprocessing")
+    observation = services.observation_store.latest(task.task_id)
+    assert observation is not None
+    plan = services.plan_store.activate(
+        task,
+        "finish_processing",
+        observation.revision,
+        FinishProcessingPlanInput.model_validate(valid_finish_plan_payload(built)),
+        expected_web_session_id="as-session-1",
+        expected_agentscope_session_id="as-session-1",
+    )
+
+    execution = _surface(services, "as-session-1")
+
+    assert execution is not None
+    current_action = plan.plan.steps[0].action
+    assert {
+        tool.name
+        for tool in execution.group(NAVIGATION_EXECUTION_ACTIONS).tools
+    } == {f"{current_action}_tool"}
+    assert {
+        tool.name
+        for tool in execution.group(NAVIGATION_EXECUTION_STATE).tools
+    } == {"get_current_plan_step_tool"}
+    assert execution.group(NAVIGATION_ARTIFACT_CHECKS).tools == ()
+
+
+def test_completed_explicit_postprocessing_exposes_no_resubmission_tools(tmp_path):
+    services, task, built = _resolver_services_from_complete(
+        tmp_path,
+        phase="finish_processing",
+    )
+    _set_requested_outcome(services, task.task_id, "postprocessing")
+    observation = services.observation_store.latest(task.task_id)
+    assert observation is not None
+    plan = services.plan_store.activate(
+        task,
+        "finish_processing",
+        observation.revision,
+        FinishProcessingPlanInput.model_validate(valid_finish_plan_payload(built)),
+        expected_web_session_id="as-session-1",
+        expected_agentscope_session_id="as-session-1",
+    )
+    _terminalize_plan(services, plan, "as-session-1")
+
+    completed = _surface(services, "as-session-1")
+
+    assert completed is not None
+    assert completed.activity == "planning"
+    assert completed.flatten_active_tools() == []
 
 
 def test_grouped_surface_resolves_execution_catalog(tmp_path):

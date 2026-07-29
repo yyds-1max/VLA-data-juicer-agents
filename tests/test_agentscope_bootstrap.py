@@ -129,6 +129,17 @@ def test_navigation_prompt_keeps_trajectory_review_in_its_narrow_phase():
     assert "execute the current `open_trajectory_fix_workbench` step" in prompt
 
 
+def test_navigation_prompt_keeps_explicit_postprocessing_in_finish_phase():
+    prompt = navigation_agent_prompt()
+
+    assert "`postprocessing` or `postprocessing_and_fix` task" in prompt
+    assert "Annotation Job, artifact, Runtime, calibration, localization" in prompt
+    assert "Raw metadata, sensor discovery, and topic discovery" in prompt
+    assert "submit exactly one complete finish-processing Plan" in prompt
+    assert "do not resubmit an accepted Plan" in prompt
+    assert "when the workflow reports background execution" in prompt
+
+
 def test_router_start_schema_omits_dry_run_and_model_restatements():
     schema = StartNavigationDataTaskV1Tool.input_schema
 

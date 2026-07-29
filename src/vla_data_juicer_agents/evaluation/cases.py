@@ -80,6 +80,7 @@ def cases_sha256(cases: Sequence[EvaluationCase]) -> str:
                     focused_task.pop("requested_outcome", None)
                     focused_task.pop("completion_outcome", None)
             handoff = payload["expectations"]["tools"].get("handoff")
+            payload["expectations"]["response"].pop("allow_empty", None)
             if isinstance(handoff, dict):
                 for field in (
                     "requested_outcome",
@@ -94,6 +95,7 @@ def cases_sha256(cases: Sequence[EvaluationCase]) -> str:
             # Schema v1 is frozen. New optional v2 model fields must not change
             # the hash of the historical router-smoke cases/baseline.
             payload.pop("runtime_setup", None)
+            payload["expectations"]["response"].pop("allow_empty", None)
             handoff = payload["expectations"]["tools"].get("handoff")
             if isinstance(handoff, dict):
                 for field in (

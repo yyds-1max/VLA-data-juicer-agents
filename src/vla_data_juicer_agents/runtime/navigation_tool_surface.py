@@ -38,7 +38,7 @@ class NavigationToolSurfaceMiddleware(MiddlewareBase):
         agent.toolkit.tool_groups[:] = [ToolGroup(name="basic")]
         agent.state.tool_context.activated_groups[:] = []
 
-    def _synchronize(self, agent: Agent) -> bool:
+    def _synchronize(self, agent: Agent) -> str | None:
         try:
             surface = resolve_navigation_tool_surface(
                 services=self._services,
@@ -50,7 +50,7 @@ class NavigationToolSurfaceMiddleware(MiddlewareBase):
                 raise LookupError("missing authorized navigation attempt")
             if surface.waiting_for_running_step:
                 self._clear(agent)
-                return True
+                return surface.suspended_step_status or "running"
             groups = [
                 ToolGroup(
                     name=definition.name,
@@ -64,7 +64,7 @@ class NavigationToolSurfaceMiddleware(MiddlewareBase):
             agent.state.tool_context.activated_groups[:] = list(
                 surface.active_group_names
             )
-            return False
+            return None
         except Exception as error:
             self._clear(agent)
             raise NavigationToolSurfaceSyncError(
@@ -77,14 +77,22 @@ class NavigationToolSurfaceMiddleware(MiddlewareBase):
             yield item
 
     async def on_reasoning(self, agent, input_kwargs, next_handler):
-        if self._synchronize(agent):
+        suspended_status = self._synchronize(agent)
+        if suspended_status is not None:
+            message = (
+                "The navigation workflow is waiting for required user input "
+                "and the session will resume automatically after that input "
+                "is submitted."
+                if suspended_status == "waiting_user"
+                else (
+                    "Background navigation processing is still running; "
+                    "the session will resume automatically after completion."
+                )
+            )
             yield AssistantMsg(
                 id=agent.state.reply_id,
                 name=agent.name,
-                content=(
-                    "Background navigation processing is still running; "
-                    "the session will resume automatically after completion."
-                ),
+                content=message,
             )
             return
         async for item in next_handler(**input_kwargs):

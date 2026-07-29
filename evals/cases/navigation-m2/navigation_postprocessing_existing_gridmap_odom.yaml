@@ -21,9 +21,6 @@ limits:
 expectations:
   tools:
     allowed_calls:
-      - inspect_navigation_raw_metadata_tool
-      - inspect_navigation_sensor_candidates_tool
-      - inspect_navigation_topic_candidates_tool
       - inspect_navigation_runtime_assets_tool
       - inspect_navigation_calibration_inventory_tool
       - inspect_navigation_localization_sources_tool
@@ -31,11 +28,12 @@ expectations:
       - inspect_navigation_artifact_state_tool
       - inspect_navigation_gridmap_artifacts_tool
       - get_navigation_task_context_tool
-      - describe_processing_action_tool
       - submit_finish_processing_plan_tool
+      - get_current_plan_step_tool
       - run_annotation_postprocessing_workflow_tool
     required_counts:
       submit_finish_processing_plan_tool: 1
+      get_current_plan_step_tool: 1
       run_annotation_postprocessing_workflow_tool: 1
     handoff_count: 1
     handoff:
@@ -54,5 +52,6 @@ expectations:
       forbidden_fields: [task_id, job_ref, segment_ref, path, command, script]
   response:
     language: Chinese
+    allow_empty: true
     forbidden_terms:
       [task_id, job_ref, segment_ref, /media/, run_odom.sh, pcd_to_grid.py, MainRouterAgent, NavigationDataAgent]

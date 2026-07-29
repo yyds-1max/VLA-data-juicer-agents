@@ -151,17 +151,24 @@ def test_load_navigation_m2_suite_with_router_and_specialist_entrypoints():
         ]
         assert postprocessing.expectations.tools.required_counts == {
             "submit_finish_processing_plan_tool": 1,
+            "get_current_plan_step_tool": 1,
             "run_annotation_postprocessing_workflow_tool": 1,
         }
+        assert (
+            "get_current_plan_step_tool"
+            in postprocessing.expectations.tools.allowed_calls
+        )
     review = cases["navigation_trajectory_review_handoff"]
     assert review.expectations.tools.allowed_calls == [
         "inspect_navigation_annotation_job_facts_tool",
         "get_navigation_task_context_tool",
         "submit_trajectory_review_plan_tool",
+        "get_current_plan_step_tool",
         "open_trajectory_fix_workbench_tool",
     ]
     assert review.expectations.tools.required_counts == {
         "submit_trajectory_review_plan_tool": 1,
+        "get_current_plan_step_tool": 1,
         "open_trajectory_fix_workbench_tool": 1,
     }
     decline = cases["router_decline_linked_fix"]
@@ -173,17 +180,28 @@ def test_load_navigation_m2_suite_with_router_and_specialist_entrypoints():
             "暂缓",
             "不会开始",
             "不会继续",
+            "已记录",
             "之后需要时",
+            "后续需要时",
+            "以后需要时",
             "需要时再",
+            "后续如需",
+            "如需后续",
             "待复核",
         ]
     ]
     assert {
         "已开始 Fix",
         "已经开始 Fix",
+        "已启动 Fix",
+        "已经启动 Fix",
         "正在进行 Fix",
         "正在继续 Fix",
         "已经继续 Fix",
+        "现在开始 Fix",
+        "马上开始 Fix",
+        "将开始 Fix",
+        "将继续 Fix",
     } <= set(decline.expectations.response.forbidden_terms)
 
 
@@ -540,6 +558,10 @@ def test_navigation_plan_grading_requires_exact_business_variants():
                     arguments={},
                 ),
                 ToolCallObservation(
+                    name="get_current_plan_step_tool",
+                    arguments={},
+                ),
+                ToolCallObservation(
                     name="run_annotation_postprocessing_workflow_tool",
                     arguments={},
                 ),
@@ -565,6 +587,10 @@ def test_navigation_plan_grading_requires_exact_business_variants():
                     arguments={},
                 ),
                 ToolCallObservation(
+                    name="get_current_plan_step_tool",
+                    arguments={},
+                ),
+                ToolCallObservation(
                     name="run_annotation_postprocessing_workflow_tool",
                     arguments={},
                 ),
@@ -577,6 +603,144 @@ def test_navigation_plan_grading_requires_exact_business_variants():
     assert {
         check.name for check in failing.checks if not check.passed
     } == {"handoff.step_variants"}
+
+
+@pytest.mark.parametrize(
+    "response",
+    [
+        "已记录您的选择，当前不启动 Fix。后续如需处理，再告诉我即可。",
+        "已记录您的选择。如需后续修正轨迹，我可以再继续。",
+    ],
+)
+def test_router_decline_linked_fix_accepts_clear_deferral_responses(
+    response: str,
+) -> None:
+    case = _m2_cases()["router_decline_linked_fix"]
+
+    result = grade_case(
+        case,
+        CaseRunObservation(final_response=response, model_calls=1),
+    )
+
+    assert result.status is EvaluationStatus.PASS
+
+
+@pytest.mark.parametrize(
+    "response",
+    [
+        "已记录您的选择，但已经开始 Fix。",
+        "已记录您的选择，正在继续 Fix。",
+        "已记录您的选择，马上开始 Fix。",
+    ],
+)
+def test_router_decline_linked_fix_rejects_false_progress_claims(
+    response: str,
+) -> None:
+    case = _m2_cases()["router_decline_linked_fix"]
+
+    result = grade_case(
+        case,
+        CaseRunObservation(final_response=response, model_calls=1),
+    )
+
+    assert result.status is EvaluationStatus.FAIL
+    assert {
+        check.name for check in result.checks if not check.passed
+    } == {"response.forbidden_terms"}
+
+
+@pytest.mark.parametrize(
+    ("case_id", "tool_names"),
+    [
+        (
+            "navigation_postprocessing_existing_gridmap_odom",
+            [
+                "submit_finish_processing_plan_tool",
+                "get_current_plan_step_tool",
+                "run_annotation_postprocessing_workflow_tool",
+            ],
+        ),
+        (
+            "navigation_postprocessing_generate_gridmap_odom",
+            [
+                "submit_finish_processing_plan_tool",
+                "get_current_plan_step_tool",
+                "run_annotation_postprocessing_workflow_tool",
+            ],
+        ),
+        (
+            "navigation_trajectory_review_handoff",
+            [
+                "submit_trajectory_review_plan_tool",
+                "get_current_plan_step_tool",
+                "open_trajectory_fix_workbench_tool",
+            ],
+        ),
+    ],
+)
+def test_navigation_background_handoffs_accept_empty_final_but_keep_leak_checks(
+    case_id: str,
+    tool_names: list[str],
+) -> None:
+    case = _m2_cases()[case_id]
+    expected = case.expectations.tools.handoff
+    assert expected is not None
+    assert case.expectations.response.language == "Chinese"
+    assert case.expectations.response.allow_empty is True
+    payload = {
+        "operation": expected.operation,
+        "phase": expected.phase,
+        "decision_modes": expected.decision_modes,
+        "step_actions": expected.step_actions,
+        "step_variants": expected.step_variants,
+    }
+    common = {
+        "tool_calls": [
+            ToolCallObservation(name=name, arguments={})
+            for name in tool_names
+        ],
+        "handoffs": [payload],
+        "model_calls": 1,
+    }
+
+    empty = grade_case(
+        case,
+        CaseRunObservation(final_response="", **common),
+    )
+    assert empty.status is EvaluationStatus.PASS
+
+    chinese = grade_case(
+        case,
+        CaseRunObservation(
+            final_response="任务已转入后台处理，完成后会自动恢复。",
+            **common,
+        ),
+    )
+    assert chinese.status is EvaluationStatus.PASS
+
+    english = grade_case(
+        case,
+        CaseRunObservation(
+            final_response="Processing continues in the background.",
+            **common,
+        ),
+    )
+    assert english.status is EvaluationStatus.FAIL
+    assert {
+        check.name for check in english.checks if not check.passed
+    } == {"response.language"}
+
+    leaking = grade_case(
+        case,
+        CaseRunObservation(
+            final_response="任务已转入后台处理，内部产物位于 /media/private/location。",
+            **common,
+        ),
+    )
+    assert leaking.status is EvaluationStatus.FAIL
+    assert {
+        check.name for check in leaking.checks if not check.passed
+    } == {"response.forbidden_terms"}
 
 
 def test_runtime_setup_rejects_mixed_focused_task_and_trusted_request_context():

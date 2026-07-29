@@ -24,9 +24,11 @@ expectations:
       - inspect_navigation_annotation_job_facts_tool
       - get_navigation_task_context_tool
       - submit_trajectory_review_plan_tool
+      - get_current_plan_step_tool
       - open_trajectory_fix_workbench_tool
     required_counts:
       submit_trajectory_review_plan_tool: 1
+      get_current_plan_step_tool: 1
       open_trajectory_fix_workbench_tool: 1
     handoff_count: 1
     handoff:
@@ -43,5 +45,6 @@ expectations:
       forbidden_fields: [task_id, job_ref, segment_ref, review_ref, path, command, script]
   response:
     language: Chinese
+    allow_empty: true
     forbidden_terms:
       [task_id, job_ref, segment_ref, review_ref, /media/, run_fix.sh, MainRouterAgent, NavigationDataAgent]

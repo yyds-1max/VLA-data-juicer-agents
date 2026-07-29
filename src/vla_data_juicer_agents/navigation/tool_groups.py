@@ -38,6 +38,7 @@ class NavigationToolSurface:
     groups: tuple[NavigationToolGroupDefinition, ...]
     active_group_names: tuple[str, ...]
     waiting_for_running_step: bool = False
+    suspended_step_status: Literal["running", "waiting_user"] | None = None
 
     def group(self, name: str) -> NavigationToolGroupDefinition:
         for group in self.groups:
@@ -135,12 +136,16 @@ class NavigationToolSurfacePolicy:
         *,
         current_step_status: str | None = None,
     ) -> NavigationToolSurface:
-        if activity == "execution" and current_step_status == "running":
+        if activity == "execution" and current_step_status in {
+            "running",
+            "waiting_user",
+        }:
             return NavigationToolSurface(
                 activity=activity,
                 groups=(),
                 active_group_names=(),
                 waiting_for_running_step=True,
+                suspended_step_status=current_step_status,
             )
         try:
             group_names = cls._GROUP_NAMES_BY_ACTIVITY[activity]
