@@ -677,7 +677,7 @@ async def test_plan_acceptance_switches_to_execution_within_same_reply(
         "prepare_raw_data_tool",
         lambda messages: {
             "plan_id": latest_tool_result_json(messages)["plan_id"],
-            "step_id": latest_tool_result_json(messages)["step"]["step_id"],
+            "step_id": latest_tool_result_json(messages)["step_id"],
         },
     )
     model.enqueue_text("第一步执行完成。")

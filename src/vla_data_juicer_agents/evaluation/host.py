@@ -56,12 +56,17 @@ from vla_data_juicer_agents.navigation.plan_models import (
     FinishProcessingPlanInput,
     TrajectoryReviewPlanInput,
 )
+from vla_data_juicer_agents.navigation.plan_store import (
+    project_actionable_plan_step,
+)
 from vla_data_juicer_agents.navigation.agent_tools import _TrustedNavigationTool
 from vla_data_juicer_agents.navigation.plan_validation import (
     validate_navigation_plan,
 )
 from vla_data_juicer_agents.navigation.planning_context import (
     build_navigation_task_context,
+    m2_annotation_ready_for_postprocessing,
+    m2_finish_observations_complete,
 )
 from vla_data_juicer_agents.navigation.task_state import NavigationTask, utc_now
 from vla_data_juicer_agents.runtime.agentscope_bootstrap import (
@@ -913,7 +918,23 @@ class RecordingNavigationRuntime:
             return self._TRAJECTORY_REVIEW_PLANNING_TOOL_NAMES
         if requested_outcome in {"postprocessing", "postprocessing_and_fix"}:
             names = set(self._POSTPROCESSING_PLANNING_TOOL_NAMES)
-            if self.task.get("scene_mode") not in {"in", "out"}:
+            observation = self._observation_revision()
+            annotation_ready = m2_annotation_ready_for_postprocessing(
+                observation
+            )
+            submission_ready = m2_finish_observations_complete(
+                observation
+            ) and (
+                annotation_ready
+                or self.task.get("scene_mode") in {"in", "out"}
+            )
+            if not submission_ready:
+                names.discard("submit_finish_processing_plan_tool")
+            if (
+                not annotation_ready
+                and "annotation_job_facts" in observation.completed_kinds
+                and self.task.get("scene_mode") not in {"in", "out"}
+            ):
                 names.add("record_navigation_user_guidance_tool")
             return frozenset(names)
         return frozenset(
@@ -1180,29 +1201,21 @@ class RecordingNavigationRuntime:
             }
 
         def get_current_plan_step_tool(plan_id: str) -> dict[str, Any]:
-            """Read the accepted actionable first step without polling."""
+            """Read the accepted identity; use top-level plan_id and step_id unchanged."""
             if plan_id != "eval-plan" or self._submitted_plan is None:
                 return {"ok": False, "error_type": "inactive_navigation_plan"}
             actions = self._submitted_plan.get("step_actions") or []
             if not actions or self._submitted_first_step_id is None:
                 return {"ok": False, "error_type": "inactive_navigation_plan"}
-            return {
+            return project_actionable_plan_step({
                 "plan_id": "eval-plan",
-                "plan_revision": 1,
                 "step": {
                     "id": "eval-step-record",
-                    "plan_id": "eval-plan",
-                    "plan_revision": 1,
-                    "sequence": 0,
                     "step_id": self._submitted_first_step_id,
                     "action": actions[0],
                     "status": "pending",
-                    "result_summary": None,
-                    "result_ref": None,
-                    "retry_count": 0,
                 },
-                "decision_refs": [],
-            }
+            })
 
         def submit_extract_sync_plan_tool(
             planning_context_revision: str,

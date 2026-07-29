@@ -489,6 +489,32 @@ def _set_scene_mode(services, task_id, scene_mode):
         )
 
 
+def _append_annotation_job_facts(services, task, *, ready):
+    facts = AnnotationJobFactsObservation(
+        job_status="tracked" if ready else "missing",
+        segment_count=1 if ready else 0,
+        tracked_count=1 if ready else 0,
+        ready_for_postprocessing=ready,
+        processing_calibration_snapshot_available=ready,
+    )
+    return services.observation_store.append(
+        task.task_id,
+        "annotation_job_facts",
+        [facts],
+        [
+            EvidenceWrite(
+                kind="annotation_job_facts",
+                source_tool="inspect_navigation_annotation_job_facts_tool",
+                payload=facts.model_dump(mode="json"),
+                summary="Bounded Annotation Job readiness facts.",
+            )
+        ],
+        services.evidence_store,
+        expected_web_session_id=task.created_by_web_session_id,
+        expected_agentscope_session_id=task.agentscope_session_id,
+    )
+
+
 def _terminalize_plan(services, plan, session_id):
     for step in plan.plan.steps:
         assert services.plan_store.claim_step(
@@ -597,7 +623,9 @@ def test_explicit_postprocessing_planning_surface_hides_ingestion_tools(
     assert planning is not None
     assert {
         tool.name for tool in planning.flatten_active_tools()
-    } == FINISH_PROCESSING_PLANNING_TOOL_NAMES
+    } == FINISH_PROCESSING_PLANNING_TOOL_NAMES - {
+        "submit_finish_processing_plan_tool",
+    }
     assert {
         "inspect_navigation_raw_metadata_tool",
         "inspect_navigation_sensor_candidates_tool",
@@ -625,15 +653,61 @@ def test_explicit_postprocessing_without_scene_mode_exposes_guidance_tool(
     )
     _set_requested_outcome(services, task.task_id, requested_outcome)
     _set_scene_mode(services, task.task_id, None)
+    _append_annotation_job_facts(services, task, ready=False)
 
     planning = _surface(services, "as-session-1")
 
     assert planning is not None
     assert {
         tool.name for tool in planning.flatten_active_tools()
-    } == FINISH_PROCESSING_PLANNING_TOOL_NAMES | {
+    } == (
+        FINISH_PROCESSING_PLANNING_TOOL_NAMES
+        - {"submit_finish_processing_plan_tool"}
+    ) | {
         "record_navigation_user_guidance_tool",
     }
+
+
+@pytest.mark.parametrize(
+    "requested_outcome",
+    ["postprocessing", "postprocessing_and_fix"],
+)
+def test_ready_tracked_annotation_unlocks_finish_submit_without_scene_guidance(
+    tmp_path,
+    requested_outcome,
+):
+    services, task, _built = _resolver_services_from_complete(
+        tmp_path,
+        phase="finish_processing",
+    )
+    _set_requested_outcome(services, task.task_id, requested_outcome)
+    _set_scene_mode(services, task.task_id, None)
+    _append_annotation_job_facts(services, task, ready=True)
+
+    planning = _surface(services, "as-session-1")
+
+    assert planning is not None
+    assert {
+        tool.name for tool in planning.flatten_active_tools()
+    } == FINISH_PROCESSING_PLANNING_TOOL_NAMES
+
+
+def test_missing_annotation_job_can_submit_creation_plan_after_scene_is_known(
+    tmp_path,
+):
+    services, task, _built = _resolver_services_from_complete(
+        tmp_path,
+        phase="finish_processing",
+    )
+    _set_requested_outcome(services, task.task_id, "postprocessing")
+    _append_annotation_job_facts(services, task, ready=False)
+
+    planning = _surface(services, "as-session-1")
+
+    assert planning is not None
+    assert {
+        tool.name for tool in planning.flatten_active_tools()
+    } == FINISH_PROCESSING_PLANNING_TOOL_NAMES
 
 
 def test_explicit_postprocessing_execution_exposes_only_current_action(tmp_path):
@@ -642,6 +716,7 @@ def test_explicit_postprocessing_execution_exposes_only_current_action(tmp_path)
         phase="finish_processing",
     )
     _set_requested_outcome(services, task.task_id, "postprocessing")
+    _append_annotation_job_facts(services, task, ready=True)
     observation = services.observation_store.latest(task.task_id)
     assert observation is not None
     plan = services.plan_store.activate(
@@ -674,6 +749,7 @@ def test_completed_explicit_postprocessing_exposes_no_resubmission_tools(tmp_pat
         phase="finish_processing",
     )
     _set_requested_outcome(services, task.task_id, "postprocessing")
+    _append_annotation_job_facts(services, task, ready=True)
     observation = services.observation_store.latest(task.task_id)
     assert observation is not None
     plan = services.plan_store.activate(
@@ -1628,6 +1704,41 @@ def test_resolved_execution_reads_are_explicitly_bounded_to_4000_chars(tmp_path)
 
     assert len(json.dumps(overview, separators=(",", ":"))) <= 4000
     assert len(json.dumps(current, separators=(",", ":"))) <= 4000
+
+
+def test_current_step_tool_projects_only_actionable_identity(tmp_path):
+    services, task, built = _resolver_services_from_complete(tmp_path)
+    plan = services.plan_store.activate(
+        task,
+        "extract_sync",
+        4,
+        ExtractSyncPlanInput.model_validate(valid_extract_plan_payload(built)),
+        expected_web_session_id="as-session-1",
+        expected_agentscope_session_id="as-session-1",
+    )
+    first_step = plan.plan.steps[0]
+    tools = {
+        tool.name: tool
+        for tool in resolve_navigation_agent_tools(
+            services=services,
+            agentscope_session_id="as-session-1",
+            web_session_id="as-session-1",
+            cancellation=None,
+        )
+    }
+
+    current = _decode_tool_payload(
+        asyncio.run(
+            tools["get_current_plan_step_tool"](plan_id=plan.plan_id)
+        )
+    )
+
+    assert current == {
+        "plan_id": plan.plan_id,
+        "step_id": first_step.step_id,
+        "action": first_step.action,
+        "status": "pending",
+    }
 
 
 def test_activity_resolver_fresh_attempt_exposes_all_planning_tools_without_mutation(

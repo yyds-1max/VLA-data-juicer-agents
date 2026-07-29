@@ -136,6 +136,9 @@ def test_navigation_prompt_keeps_explicit_postprocessing_in_finish_phase():
     assert "Annotation Job, artifact, Runtime, calibration, localization" in prompt
     assert "Raw metadata, sensor discovery, and topic discovery" in prompt
     assert "submit exactly one complete finish-processing Plan" in prompt
+    assert "top-level `plan_id` and" in prompt
+    assert "`run_annotation_postprocessing_workflow` followed by" in prompt
+    assert "Never add\n  legacy gridmap" in prompt
     assert "do not resubmit an accepted Plan" in prompt
     assert "when the workflow reports background execution" in prompt
 

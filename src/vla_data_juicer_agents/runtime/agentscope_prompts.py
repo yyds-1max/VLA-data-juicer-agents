@@ -221,6 +221,8 @@ Durable workflow invariants:
 - Treat the planning_context_revision returned by get_navigation_task_context_tool as a one-time optimistic-concurrency token for the context observed at that moment. Any later investigation or user-guidance update makes that revision stale. You may continue investigating as needed; after all investigation is complete, call get_navigation_task_context_tool again immediately before submitting a Plan and use its latest revision.
 - Choose one of the three stage-specific submission tools and submit one complete strict JSON Plan. Never send a draft or patch. If validation fails, use the bounded errors and resubmit the whole Plan as a corrected replacement.
 - Plan submission never starts processing. After a complete Plan is accepted, continue the same reply, read the accepted Plan's current step, and call the matching plan-bound tool with only its Plan and step identity.
+- The current-step tool returns one flat actionable identity. Copy its top-level `plan_id` and
+  `step_id` exactly into the matching action tool; never infer or substitute another record ID.
 - When a tool reports that it is running in the background, end the current reply immediately without calling any other tool. In particular, never poll with get_current_plan_step_tool or get_plan_execution_overview_tool; the system will wake the same session automatically with the completion result.
 - Treat tool availability as the current system-managed phase boundary; do not use generic shell or file tools, task tools, skills, or MCP workarounds.
 - Once execution returns after the last Plan step completes, investigation/planning tools become available again; then verify the produced outputs, report what completed and remains, and decide the next conversational action. After extract/sync is newly completed and verified in this task attempt, enforce a mandatory stage gate: use `AwaitUser:` to report the completed boundary, ask whether to continue, and collect any missing finish-processing inputs such as `scene_mode` before authoring finish work.
@@ -235,6 +237,11 @@ Durable workflow invariants:
   submit exactly one complete finish-processing Plan, and do not resubmit an accepted Plan. Call
   only its current plan-bound action; when the workflow reports background execution, end the
   reply immediately and wait for the durable wake-up.
+- When those facts show a tracked Annotation Job with `ready_for_postprocessing=true`, encode
+  localization and gridmap choices only in the Plan decisions. The Plan steps must be exactly
+  `run_annotation_postprocessing_workflow` followed by `validate_navigation_outputs`. Never add
+  legacy gridmap, projection, Tracking, GUI, or finish-preparation actions; the Annotation
+  Application Service maps the accepted decisions to the frozen Runtime internally.
 - A task whose target is `trajectory_review` has a deliberately narrow phase boundary. Inspect
   the bound Annotation Job facts once, then read the latest task context immediately before
   submitting exactly one complete trajectory-review Plan. Do not inspect raw metadata, topics,

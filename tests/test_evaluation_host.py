@@ -649,7 +649,7 @@ async def test_navigation_evaluation_host_records_postprocessing_plan_without_io
         "run_annotation_postprocessing_workflow_tool",
         lambda messages: {
             "plan_id": latest_tool_result_json(messages)["plan_id"],
-            "step_id": latest_tool_result_json(messages)["step"]["step_id"],
+            "step_id": latest_tool_result_json(messages)["step_id"],
         },
     )
 
@@ -682,8 +682,11 @@ async def test_navigation_evaluation_host_records_postprocessing_plan_without_io
         "inspect_navigation_localization_sources_tool",
         "inspect_navigation_gridmap_artifacts_tool",
         "get_navigation_task_context_tool",
-        "submit_finish_processing_plan_tool",
     }
+    assert any(
+        "submit_finish_processing_plan_tool" in model_call["tools"]
+        for model_call in result.model_calls[1:]
+    )
     assert set(result.model_calls[-1]["tools"]) == {
         "get_current_plan_step_tool",
         "run_annotation_postprocessing_workflow_tool",
@@ -735,6 +738,14 @@ async def test_navigation_evaluation_host_records_postprocessing_plan_without_io
         "get_current_plan_step_tool",
         "run_annotation_postprocessing_workflow_tool",
     ]
+    current_step = json.loads(result.tool_calls[-2]["result"])
+    assert current_step == {
+        "plan_id": "eval-plan",
+        "step_id": "run_postprocessing",
+        "action": "run_annotation_postprocessing_workflow",
+        "status": "pending",
+    }
+    assert "eval-step-record" not in result.tool_calls[-2]["result"]
     assert '"status": "running_in_background"' in result.tool_calls[-1]["result"]
     assert '"action": "run_annotation_postprocessing_workflow"' in (
         result.tool_calls[-1]["result"]
@@ -906,7 +917,7 @@ async def test_navigation_evaluation_host_records_linked_review_plan(tmp_path):
         "open_trajectory_fix_workbench_tool",
         lambda messages: {
             "plan_id": latest_tool_result_json(messages)["plan_id"],
-            "step_id": latest_tool_result_json(messages)["step"]["step_id"],
+            "step_id": latest_tool_result_json(messages)["step_id"],
         },
     )
 

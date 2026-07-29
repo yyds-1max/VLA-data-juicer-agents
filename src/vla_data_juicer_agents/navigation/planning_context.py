@@ -14,6 +14,7 @@ from vla_data_juicer_agents.navigation.context_budget import (
     serialized_chars,
 )
 from vla_data_juicer_agents.navigation.observation_models import (
+    AnnotationJobFactsObservation,
     EvidenceDescriptor,
     NavigationObservationRevision,
     ObservationKind,
@@ -73,6 +74,36 @@ PLAN_REQUIRED_OBSERVATIONS: dict[str, tuple[ObservationKind, ...]] = {
     ),
     "trajectory_review": ("annotation_job_facts",),
 }
+M2_FINISH_REQUIRED_OBSERVATIONS = frozenset(
+    {
+        *PLAN_REQUIRED_OBSERVATIONS["finish_processing"],
+        "annotation_job_facts",
+    }
+)
+
+
+def m2_finish_observations_complete(
+    observation: NavigationObservationRevision | None,
+) -> bool:
+    """Return whether the explicit M2 finish surface has all typed fact families."""
+    if observation is None:
+        return False
+    completed_kinds = set(observation.completed_kinds)
+    payload_kinds = {payload.kind for payload in observation.payloads}
+    return M2_FINISH_REQUIRED_OBSERVATIONS <= completed_kinds & payload_kinds
+
+
+def m2_annotation_ready_for_postprocessing(
+    observation: NavigationObservationRevision | None,
+) -> bool:
+    """Return the bounded Annotation readiness fact used by the M2 surface."""
+    if observation is None:
+        return False
+    return any(
+        isinstance(payload, AnnotationJobFactsObservation)
+        and payload.ready_for_postprocessing
+        for payload in observation.payloads
+    )
 
 
 def compute_planning_context_revision(

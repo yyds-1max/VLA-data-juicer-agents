@@ -127,6 +127,28 @@ class CompactExecutionOverview(_StrictReadModel):
     steps: list[CompactExecutionStep]
 
 
+class ActionablePlanStep(_StrictReadModel):
+    """Minimal model-facing identity for one authorized execution step."""
+
+    plan_id: str
+    step_id: str
+    action: str
+    status: ExecutionStatus
+
+
+def project_actionable_plan_step(current: dict[str, Any]) -> dict[str, Any]:
+    """Remove ledger identifiers and result metadata from a current-step snapshot."""
+    step = current.get("step")
+    if not isinstance(step, dict):
+        raise ValueError("current navigation step is malformed")
+    return ActionablePlanStep(
+        plan_id=current["plan_id"],
+        step_id=step["step_id"],
+        action=step["action"],
+        status=step["status"],
+    ).model_dump(mode="json")
+
+
 @dataclass(frozen=True)
 class NavigationExecutionSnapshot:
     task: NavigationTask
