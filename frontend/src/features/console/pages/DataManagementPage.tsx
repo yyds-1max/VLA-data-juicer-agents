@@ -882,7 +882,7 @@ export function DataManagementPage({ onPlaceholderAction }: DataManagementPagePr
   const submittingToDataPilot =
     activeInvocation?.status === "queued" || activeInvocation?.status === "submitting";
   const dataPilotInvocationError =
-    activeInvocation?.status === "failed" || activeInvocation?.status === "blocked"
+    activeInvocation?.status === "failed"
       ? activeInvocation.error ?? "提交失败，请重试。"
       : null;
 
@@ -944,7 +944,7 @@ export function DataManagementPage({ onPlaceholderAction }: DataManagementPagePr
     if (
       activeInvocationId &&
       pendingInvocation?.invocationId === activeInvocationId &&
-      (pendingInvocation.status === "failed" || pendingInvocation.status === "blocked")
+      pendingInvocation.status === "failed"
     ) {
       datapilotStore.getState().clearDataPilotInvocation(activeInvocationId);
       setActiveInvocationId(null);
@@ -958,7 +958,7 @@ export function DataManagementPage({ onPlaceholderAction }: DataManagementPagePr
       activeInvocationId &&
       pendingInvocation?.invocationId === activeInvocationId &&
       pendingInvocation.message === message &&
-      (pendingInvocation.status === "failed" || pendingInvocation.status === "blocked")
+      pendingInvocation.status === "failed"
     ) {
       datapilotStore.getState().retryDataPilotInvocation(activeInvocationId);
       return;

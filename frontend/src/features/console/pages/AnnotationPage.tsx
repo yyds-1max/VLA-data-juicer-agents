@@ -367,7 +367,7 @@ function JobsPage() {
   const submitting =
     activeInvocation?.status === "queued" || activeInvocation?.status === "submitting";
   const invocationError =
-    activeInvocation?.status === "failed" || activeInvocation?.status === "blocked"
+    activeInvocation?.status === "failed"
       ? activeInvocation.error ?? "提交失败，请重试。"
       : null;
 
@@ -435,7 +435,7 @@ function JobsPage() {
       activeInvocationId
       && pendingInvocation?.invocationId === activeInvocationId
       && pendingInvocation.message === message
-      && (pendingInvocation.status === "failed" || pendingInvocation.status === "blocked")
+      && pendingInvocation.status === "failed"
     ) {
       datapilotStore.getState().retryDataPilotInvocation(activeInvocationId);
       return;
@@ -610,7 +610,7 @@ function JobsPage() {
           if (
             activeInvocationId
             && pendingInvocation?.invocationId === activeInvocationId
-            && (pendingInvocation.status === "failed" || pendingInvocation.status === "blocked")
+            && pendingInvocation.status === "failed"
           ) {
             datapilotStore.getState().clearDataPilotInvocation(activeInvocationId);
             setActiveInvocationId(null);

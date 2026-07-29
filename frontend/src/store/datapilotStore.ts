@@ -19,8 +19,7 @@ export type DataPilotInvocationStatus =
   | "queued"
   | "submitting"
   | "submitted"
-  | "failed"
-  | "blocked";
+  | "failed";
 
 export interface DataPilotInvocation {
   invocationId: string;
@@ -44,7 +43,6 @@ export interface DataPilotStoreState {
   mode: SessionMode;
   currentSessionId: string | null;
   previousActiveSessionId: string | null;
-  knownRunningSessionId: string | null;
   sessions: SessionRecord[];
   messages: ChatMessageRecord[];
   turns: TurnRecord[];
@@ -75,10 +73,8 @@ export interface DataPilotStoreState {
   setDataPilotInvocationSession: (invocationId: string, sessionId: string) => void;
   completeDataPilotInvocation: (invocationId: string) => void;
   failDataPilotInvocation: (invocationId: string, error: string) => void;
-  blockDataPilotInvocation: (invocationId: string, error: string) => void;
   retryDataPilotInvocation: (invocationId: string) => boolean;
   clearDataPilotInvocation: (invocationId?: string) => void;
-  updateKnownRunningSession: (sessionId: string, running: boolean) => void;
   applyEvent: (event: AgentEvent) => void;
 }
 
@@ -90,7 +86,6 @@ export function createDataPilotStore() {
     mode: "draft_new_session",
     currentSessionId: null,
     previousActiveSessionId: null,
-    knownRunningSessionId: null,
     sessions: [],
     messages: [],
     turns: [],
@@ -140,9 +135,6 @@ export function createDataPilotStore() {
 
         const turns = mergeTurns(state.turns, session.turns ?? []);
         const run = session.events?.length ? mergeRunFromEvents(state.run, session.events) : state.run;
-        const running = (session.turns
-          ? hasRunningTurn(session.turns)
-          : run.running || hasRunningTurn(turns)) || hasOpenTask(session.tasks ?? state.tasks);
         return {
           sessions: upsertSession(state.sessions, session),
           messages: mergeMessages(state.messages, session.messages),
@@ -152,11 +144,6 @@ export function createDataPilotStore() {
             ? session.pending_interaction
             : state.pendingInteraction,
           ...(run !== state.run ? { run } : {}),
-          knownRunningSessionId: running
-            ? session.id
-            : state.knownRunningSessionId === session.id
-              ? null
-              : state.knownRunningSessionId,
         };
       }),
 
@@ -164,9 +151,6 @@ export function createDataPilotStore() {
       set((state) => {
         const turns = "turns" in session ? [...(session.turns ?? [])] : [];
         const run = runFromEvents("events" in session ? (session.events ?? []) : []);
-        const running = hasRunningTurn(turns) || run.running || hasOpenTask(
-          "tasks" in session ? (session.tasks ?? []) : [],
-        );
         return {
           mode: "active_session",
           currentSessionId: session.id,
@@ -179,11 +163,6 @@ export function createDataPilotStore() {
             ? (session.pending_interaction ?? null)
             : null,
           run,
-          knownRunningSessionId: running
-            ? session.id
-            : state.knownRunningSessionId === session.id
-              ? null
-              : state.knownRunningSessionId,
         };
       }),
 
@@ -295,24 +274,11 @@ export function createDataPilotStore() {
           : {},
       ),
 
-    blockDataPilotInvocation: (invocationId, error) =>
-      set((state) =>
-        state.pendingInvocation?.invocationId === invocationId
-          ? {
-              pendingInvocation: {
-                ...state.pendingInvocation,
-                status: "blocked",
-                error,
-              },
-            }
-          : {},
-      ),
-
     retryDataPilotInvocation: (invocationId) => {
       const current = get().pendingInvocation;
       if (
         current?.invocationId !== invocationId ||
-        (current.status !== "failed" && current.status !== "blocked")
+        current.status !== "failed"
       ) {
         return false;
       }
@@ -331,15 +297,6 @@ export function createDataPilotStore() {
         return { pendingInvocation: null };
       }),
 
-    updateKnownRunningSession: (sessionId, running) =>
-      set((state) => ({
-        knownRunningSessionId: running
-          ? sessionId
-          : state.knownRunningSessionId === sessionId
-            ? null
-            : state.knownRunningSessionId,
-      })),
-
     applyEvent: (event) =>
       set((state) => {
         const reconciled = reconcileOptimisticTurn(state.messages, state.turns, state.run, event);
@@ -348,36 +305,18 @@ export function createDataPilotStore() {
         const turns = applyTurnEvent(reconciled.turns, event, state.currentSessionId);
         const tasks = applyTaskEvent(state.tasks, event);
         const pendingInteraction = applyInteractionEvent(state.pendingInteraction, event);
-        const running = run.running || hasRunningTurn(turns) || hasOpenTask(tasks);
         return {
           run,
           messages: reconciled.messages,
           turns,
           tasks,
           pendingInteraction,
-          knownRunningSessionId: state.currentSessionId
-            ? running
-              ? state.currentSessionId
-              : state.knownRunningSessionId === state.currentSessionId
-                ? null
-                : state.knownRunningSessionId
-            : state.knownRunningSessionId,
         };
       }),
   }));
 }
 
 export const datapilotStore = createDataPilotStore();
-
-function hasRunningTurn(turns: TurnRecord[]): boolean {
-  return turns.some((turn) => turn.status === "running" || turn.status === "waiting");
-}
-
-function hasOpenTask(tasks: TaskSnapshot[]): boolean {
-  return tasks.some(
-    (task) => !["cancelled", "completed", "failed", "superseded"].includes(task.status),
-  );
-}
 
 function applyTaskEvent(tasks: TaskSnapshot[], event: AgentEvent): TaskSnapshot[] {
   if (event.type !== "task_state_updated") return tasks;

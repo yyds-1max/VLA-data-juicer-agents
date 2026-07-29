@@ -233,7 +233,6 @@ beforeEach(() => {
     mode: "draft_new_session",
     currentSessionId: null,
     previousActiveSessionId: null,
-    knownRunningSessionId: null,
     sessions: [],
     messages: [],
     turns: [],
@@ -456,35 +455,41 @@ test("data management shortcut claims a double click only once", async () => {
   await waitFor(() => expect(screen.queryByRole("dialog", { name: "交给 DataPilot" })).not.toBeInTheDocument());
 });
 
-test("data management shortcut opens DataPilot but does not submit while its known task is running", async () => {
-  const runningDetail = sessionDetailFixture({
-    id: "session-running",
-    title: "Running session",
-    created_at: "2026-06-26T00:00:00Z",
-    updated_at: "2026-06-26T00:01:00Z",
-    status: "active" as const,
-    messages: [],
-    turns: [
-      {
-        id: "turn-running",
-        web_session_id: "session-running",
-        origin: "user" as const,
-        status: "running" as const,
-        started_at: "2026-06-26T00:01:00Z",
-        finished_at: null,
-        final_message_id: null,
-      },
-    ],
+test("data management shortcut creates and submits despite another session waiting for work", async () => {
+  const oldSession = sessionDetailFixture({
+    id: "session-old",
+    title: "Waiting session",
+    status: "active",
+    turns: [{
+      id: "turn-waiting",
+      web_session_id: "session-old",
+      origin: "user",
+      status: "waiting",
+      started_at: "2026-06-26T00:01:00Z",
+      finished_at: null,
+      final_message_id: null,
+    }],
+    tasks: [{
+      task_ref: "DP-OLD",
+      domain: "navigation",
+      dataset_date: "20270605",
+      selection: { kind: "all_clips" },
+      scene_mode: null,
+      status: "waiting_user",
+      phase: "等待首帧标注",
+      state_revision: 3,
+      started_at: "2026-06-26T00:00:00Z",
+      updated_at: "2026-06-26T00:01:00Z",
+    }],
   });
-  apiMocks.getSession.mockResolvedValue(runningDetail);
   datapilotStore.setState({
     open: false,
     mode: "active_session",
-    currentSessionId: "session-running",
+    currentSessionId: "session-old",
     previousActiveSessionId: null,
-    knownRunningSessionId: "session-running",
-    sessions: [runningDetail],
-    turns: runningDetail.turns,
+    sessions: [oldSession],
+    turns: oldSession.turns,
+    tasks: oldSession.tasks,
     run: { ...createEmptyRunState(), running: true },
   });
 
@@ -495,97 +500,13 @@ test("data management shortcut opens DataPilot but does not submit while its kno
   fireEvent.click(screen.getByRole("checkbox", { name: "全选" }));
   fireEvent.click(screen.getByRole("button", { name: "确定" }));
 
-  await waitFor(() => expect(screen.getAllByText("当前任务正在执行，请等待完成或停止后再发起。").length).toBeGreaterThan(0));
-  expect(apiMocks.createSession).not.toHaveBeenCalled();
-  expect(apiMocks.submitTurn).not.toHaveBeenCalled();
-  expect(datapilotStore.getState().open).toBe(true);
-  expect(screen.getByRole("button", { name: "确定" })).toBeEnabled();
-});
-
-test("data management shortcut still blocks a running session after viewing history", async () => {
-  const runningDetail = sessionDetailFixture({
-    id: "session-running",
-    title: "Running session",
-    created_at: "2026-06-26T00:00:00Z",
-    updated_at: "2026-06-26T00:01:00Z",
-    status: "active" as const,
-    messages: [],
-    turns: [
-      {
-        id: "turn-running",
-        web_session_id: "session-running",
-        origin: "user" as const,
-        status: "running" as const,
-        started_at: "2026-06-26T00:01:00Z",
-        finished_at: null,
-        final_message_id: null,
-      },
-    ],
-  });
-  apiMocks.getSession.mockResolvedValue(runningDetail);
-  datapilotStore.setState({
-    open: false,
-    mode: "history_session",
-    currentSessionId: "session-history",
-    previousActiveSessionId: null,
-    knownRunningSessionId: "session-running",
-    sessions: [
-      runningDetail,
-      {
-        id: "session-history",
-        title: "History",
-        created_at: "2026-06-25T00:00:00Z",
-        updated_at: "2026-06-25T00:01:00Z",
-        status: "historical",
-        contract_version: 1,
-      },
-    ],
-    turns: [],
-    run: createEmptyRunState(),
-  });
-
-  await renderAppWithDashboardSettled();
-  fireEvent.click(screen.getByRole("button", { name: "数据管理" }));
-  fireEvent.click(await screen.findByRole("button", { name: "交给 DataPilot" }));
-  chooseNavigationDate("20270515");
-  fireEvent.click(screen.getByRole("checkbox", { name: "全选" }));
-  fireEvent.click(screen.getByRole("button", { name: "确定" }));
-
-  await waitFor(() => expect(screen.getAllByText("当前任务正在执行，请等待完成或停止后再发起。").length).toBeGreaterThan(0));
-  expect(apiMocks.getSession).toHaveBeenCalledWith("session-running");
-  expect(apiMocks.createSession).not.toHaveBeenCalled();
-  expect(apiMocks.submitTurn).not.toHaveBeenCalled();
-});
-
-test("data management shortcut fails closed when a known running session cannot be refreshed", async () => {
-  const consoleError = vi.spyOn(console, "error").mockImplementation(() => undefined);
-  apiMocks.getSession.mockRejectedValue(new Error("network unavailable"));
-  datapilotStore.setState({
-    open: false,
-    mode: "draft_new_session",
-    currentSessionId: null,
-    previousActiveSessionId: "session-running",
-    knownRunningSessionId: "session-running",
-    sessions: [],
-    turns: [],
-    run: createEmptyRunState(),
-  });
-
-  await renderAppWithDashboardSettled();
-  fireEvent.click(screen.getByRole("button", { name: "数据管理" }));
-  fireEvent.click(await screen.findByRole("button", { name: "交给 DataPilot" }));
-  chooseNavigationDate("20270515");
-  fireEvent.click(screen.getByRole("checkbox", { name: "全选" }));
-  fireEvent.click(screen.getByRole("button", { name: "确定" }));
-
-  await waitFor(() => expect(screen.getAllByText("当前任务正在执行，请等待完成或停止后再发起。").length).toBeGreaterThan(0));
-  expect(apiMocks.createSession).not.toHaveBeenCalled();
-  expect(apiMocks.submitTurn).not.toHaveBeenCalled();
-  expect(consoleError).toHaveBeenCalledWith(
-    "Failed to refresh DataPilot before shortcut submission",
-    expect.any(Error),
-  );
-  consoleError.mockRestore();
+  await waitFor(() => expect(apiMocks.createSession).toHaveBeenCalledTimes(1));
+  await waitFor(() => expect(apiMocks.submitTurn).toHaveBeenCalledWith(
+    "session-created",
+    expect.stringContaining("请处理导航数据。"),
+    expect.stringMatching(/^navigation-/),
+  ));
+  expect(datapilotStore.getState().currentSessionId).toBe("session-created");
 });
 
 test("data management shortcut retries submit in the session it already created", async () => {
@@ -972,7 +893,35 @@ test("annotation page exposes the M2 DataPilot-owned processing entry", async ()
   expect(await screen.findByText("当前处理环境尚未通过预检")).toBeVisible();
 });
 
-test("annotation shortcut sends the selected scope with its dedicated entrypoint", async () => {
+test("annotation shortcut submits a new session despite another session's active task", async () => {
+  const oldSession = sessionDetailFixture({
+    id: "session-old",
+    title: "Active session",
+    status: "active",
+    tasks: [{
+      task_ref: "DP-OLD",
+      domain: "navigation",
+      dataset_date: "20270605",
+      selection: { kind: "all_clips" },
+      scene_mode: null,
+      status: "active",
+      phase: "拆解和同步",
+      state_revision: 2,
+      started_at: "2026-06-26T00:00:00Z",
+      updated_at: "2026-06-26T00:01:00Z",
+    }],
+  });
+  datapilotStore.setState({
+    open: false,
+    mode: "active_session",
+    currentSessionId: "session-old",
+    previousActiveSessionId: null,
+    sessions: [oldSession],
+    tasks: oldSession.tasks,
+    turns: [],
+    run: createEmptyRunState(),
+  });
+
   await renderAppWithDashboardSettled();
   fireEvent.click(screen.getByRole("button", { name: "自动标注" }));
   fireEvent.click(await screen.findByRole("button", { name: "交给 DataPilot 处理" }));
@@ -995,6 +944,11 @@ test("annotation shortcut sends the selected scope with its dedicated entrypoint
       dataset_date: "20270515",
       selection: { kind: "selected_clips", clips: ["clip_a"] },
     },
+  ));
+  await waitFor(() => expect(apiMocks.submitTurn).toHaveBeenCalledWith(
+    "session-created",
+    message,
+    expect.stringMatching(/^annotation-/),
   ));
   expect(screen.queryByLabelText("当天处理标定")).not.toBeInTheDocument();
 });

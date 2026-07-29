@@ -298,57 +298,8 @@ export function DataPilotWindow() {
     }
   }, [closeSocket, openEvents]);
 
-  const refreshKnownRunningSession = useCallback(async () => {
-    const state = datapilotStore.getState();
-    const candidateSessionId =
-      state.knownRunningSessionId ??
-      (state.mode === "active_session" ? state.currentSessionId : state.previousActiveSessionId);
-    if (!candidateSessionId) {
-      return false;
-    }
-
-    const localRunning =
-      state.knownRunningSessionId === candidateSessionId ||
-      (state.currentSessionId === candidateSessionId && (
-        state.run.running ||
-        state.turns.some((turn) => turn.status === "running" || turn.status === "waiting")
-      ));
-    try {
-      const detail = await getSession(candidateSessionId);
-      const detailRunning = (detail.turns ?? []).some(
-        (turn) => turn.status === "running" || turn.status === "waiting",
-      ) || (detail.tasks ?? []).some(
-        (task) => !["cancelled", "completed", "failed", "superseded"].includes(task.status),
-      );
-      if (detailRunning) {
-        datapilotStore.getState().restoreActiveSession(detail, detail.messages);
-        openEvents(candidateSessionId);
-        return true;
-      }
-      datapilotStore.getState().updateKnownRunningSession(candidateSessionId, false);
-      if (
-        datapilotStore.getState().mode === "active_session" &&
-        datapilotStore.getState().currentSessionId === candidateSessionId
-      ) {
-        datapilotStore.getState().refreshActiveSession(detail);
-      }
-      return false;
-    } catch (error) {
-      console.error("Failed to refresh DataPilot before shortcut submission", error);
-      return localRunning;
-    }
-  }, [openEvents]);
-
   const processDataPilotInvocation = useCallback(async (invocation: DataPilotInvocation) => {
     if (!datapilotStore.getState().claimDataPilotInvocation(invocation.invocationId)) {
-      return;
-    }
-
-    if (!invocation.sessionId && await refreshKnownRunningSession()) {
-      datapilotStore.getState().blockDataPilotInvocation(
-        invocation.invocationId,
-        "当前任务正在执行，请等待完成或停止后再发起。",
-      );
       return;
     }
 
@@ -358,7 +309,7 @@ export function DataPilotWindow() {
       requestContext: invocation.requestContext,
       entrypoint: invocation.entrypoint,
     });
-  }, [refreshKnownRunningSession, submitNewSessionMessage]);
+  }, [submitNewSessionMessage]);
 
   useEffect(() => {
     if (!pendingInvocation || pendingInvocation.status !== "queued") {
@@ -563,13 +514,7 @@ export function DataPilotWindow() {
     >
       <SessionHeader onHistory={handleHistory} onNewSession={handleNewSession} onDragStart={handleDragStart} />
       {pendingInvocation?.error ? (
-        <div
-          className={`border-b px-4 py-2 text-sm ${
-            pendingInvocation.status === "blocked"
-              ? "border-amber-200 bg-amber-50 text-amber-800"
-              : "border-rose-200 bg-rose-50 text-rose-700"
-          }`}
-        >
+        <div className="border-b border-rose-200 bg-rose-50 px-4 py-2 text-sm text-rose-700">
           {pendingInvocation.error}
         </div>
       ) : null}
