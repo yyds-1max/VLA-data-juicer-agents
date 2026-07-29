@@ -288,6 +288,7 @@ class AnnotationNavigationGateway(NavigationAnnotationGateway):
                 idempotency_key=(
                     f"datapilot:begin_postprocessing:{navigation_task_id}:{plan_id}"
                 ),
+                processing_navigation_task_ref=navigation_task_id,
             )
             status = str(started["status"])
         return {

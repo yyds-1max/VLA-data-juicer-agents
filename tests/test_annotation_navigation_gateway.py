@@ -193,12 +193,14 @@ class _StoreBackedPostprocessingService:
         spec: PostprocessingSpecInput,
         *,
         idempotency_key: str,
+        processing_navigation_task_ref: str | None = None,
     ) -> dict[str, object]:
         return self.store.begin_postprocessing(
             job_ref=job_ref,
             expected_job_revision=expected_job_revision,
             spec=spec.model_dump(mode="json"),
             idempotency_key=idempotency_key,
+            processing_navigation_task_ref=processing_navigation_task_ref,
         )
 
 
@@ -259,6 +261,13 @@ def _seed_unlinked_tracked_gateway_job(
                 (job_ref,),
             ).fetchone()["id"]
         )
+        # This fixture starts at a historical tracked fact.  The synthetic
+        # create-job prepare run is outside that fact and must not masquerade
+        # as an active writer.
+        connection.execute(
+            "DELETE FROM runtime_runs WHERE job_id = ? AND kind = 'prepare'",
+            (job_id,),
+        )
         connection.execute(
             """
             UPDATE annotation_jobs
@@ -293,6 +302,45 @@ def _seed_unlinked_tracked_gateway_job(
             ),
         )
     return store.get_job(str(created["job_ref"]))
+
+
+def test_tracked_job_allows_fresh_navigation_attempt_to_take_authority(
+    tmp_path: Path,
+) -> None:
+    store = AnnotationStore(tmp_path / "annotation.sqlite")
+    job = _seed_unlinked_tracked_gateway_job(store, tmp_path)
+    for task_ref in ("historical-navigation-attempt", "fresh-navigation-attempt"):
+        assert store.link_navigation_task(
+            job_ref=str(job["job_ref"]),
+            review_ref=None,
+            navigation_task_ref=task_ref,
+            parent_navigation_task_ref=None,
+            link_kind="processing",
+            idempotency_key=f"link:{task_ref}",
+        ) == {"linked": True, "link_kind": "processing"}
+
+    with store._connect() as connection:
+        assert connection.execute(
+            """
+            SELECT l.navigation_task_ref
+            FROM annotation_processing_authorities a
+            JOIN annotation_task_links l ON l.id = a.link_id
+            """
+        ).fetchone()[0] == "fresh-navigation-attempt"
+        assert [
+            str(row["navigation_task_ref"])
+            for row in connection.execute(
+                """
+                SELECT navigation_task_ref
+                FROM annotation_task_links
+                WHERE link_kind = 'processing'
+                ORDER BY id
+                """
+            ).fetchall()
+        ] == [
+            "historical-navigation-attempt",
+            "fresh-navigation-attempt",
+        ]
 
 
 def test_existing_tracked_job_claims_processing_owner_and_delivers_completion(
@@ -344,7 +392,7 @@ def test_existing_tracked_job_claims_processing_owner_and_delivers_completion(
             plan_id="postprocessing-plan",
             step_id="postprocessing",
         )
-    assert raised.value.code == "annotation_processing_owner_conflict"
+    assert raised.value.code == "annotation_processing_active_attempt_conflict"
 
     current = store.get_job(str(job["job_ref"]))
     artifact_root = tmp_path / "postprocessing-candidate"
@@ -852,8 +900,29 @@ class _ExplodingAnnotationGateway:
         )
 
 
+class _RuntimeUnavailableAnnotationGateway:
+    @staticmethod
+    def begin_annotation_from_plan(**_kwargs):
+        raise AnnotationConflictError(
+            "annotation_runtime_unavailable",
+            "/private/runtime/config is incomplete",
+            current={
+                "capabilities": {
+                    "available": False,
+                    "reason": {
+                        "code": "processing_runtime_not_configured",
+                        "message": "/private/runtime/config is incomplete",
+                        "error_ref": "annotation_error_" + "7" * 32,
+                    },
+                },
+                "job_ref": "job_" + "8" * 32,
+            },
+        )
+
+
 def test_annotation_gateway_exception_is_not_returned_to_model(
     tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
 ) -> None:
     database = tmp_path / "navigation.sqlite"
     task_store = SqliteNavigationTaskStore(database)
@@ -905,9 +974,86 @@ def test_annotation_gateway_exception_is_not_returned_to_model(
 
     assert result["ok"] is False
     assert result["error_type"] == "annotation_workflow_start_failed"
+    assert result["next_action"] == "operator_recovery_required"
+    assert str(result["error_ref"]).startswith("annotation_error_")
     serialized = json.dumps(result)
     assert "/private/" not in serialized
     assert "job_" + "6" * 32 not in serialized
+    assert any(
+        result["error_ref"] in record.message
+        and "exception_type=OSError" in record.message
+        for record in caplog.records
+    )
+    assert "/private/" not in caplog.text
+
+
+def test_annotation_runtime_deployment_error_is_projected_for_operator_recovery(
+    tmp_path: Path,
+) -> None:
+    database = tmp_path / "navigation.sqlite"
+    task_store = SqliteNavigationTaskStore(database)
+    task = task_store.create_task_attempt(
+        request="Automatically annotate the synchronized data",
+        target="20270605",
+        date="20270605",
+        segments=["20260605_160904"],
+        scene_mode=None,
+        dry_run=True,
+        web_session_id="web-owner",
+        agentscope_session_id="navigation-owner",
+        requested_outcome="postprocessing",
+    ).task
+    plan_store = SqliteNavigationPlanRepository(database)
+    plan = plan_store.activate(
+        task,
+        "finish_processing",
+        1,
+        _annotation_tracking_plan(),
+        expected_web_session_id="web-owner",
+        expected_agentscope_session_id="navigation-owner",
+    )
+    tools = {
+        tool.name: tool
+        for tool in build_plan_bound_execution_tools(
+            task=task_store.get_task(task.task_id),
+            plan_store=plan_store,
+            evidence_store=FileNavigationEvidenceStore(tmp_path / "evidence"),
+            settings=NavigationSettings(
+                vladatasets_root=tmp_path / "datasets",
+                processing_root=tmp_path / "processing",
+            ),
+            dry_run=True,
+            cancellation=None,
+            web_session_id="web-owner",
+            agentscope_session_id="navigation-owner",
+            annotation_gateway=_RuntimeUnavailableAnnotationGateway(),
+        )
+    }
+
+    result = asyncio.run(
+        _tool_payload(
+            tools["run_annotation_tracking_workflow_tool"],
+            plan_id=plan.plan_id,
+            step_id="annotation",
+        )
+    )
+
+    assert result == {
+        "ok": False,
+        "error_type": "processing_runtime_not_configured",
+        "message": (
+            "The annotation processing runtime deployment is incomplete. "
+            "An operator must complete its configuration before processing "
+            "can continue."
+        ),
+        "next_action": "operator_recovery_required",
+        "error_ref": "annotation_error_" + "7" * 32,
+    }
+    serialized = json.dumps(result)
+    assert "/private/" not in serialized
+    assert "job_" + "8" * 32 not in serialized
+    assert plan.plan_id not in serialized
+    assert "annotation" not in result.get("next_action", "")
 
 
 def test_tracking_completion_finalizes_plan_step_and_wakes_navigation(

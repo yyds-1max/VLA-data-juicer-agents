@@ -607,16 +607,18 @@ M4 才上线 DataPilot/模型辅助复核、置信度和
 
 本计划的 9 个本地实施批次已经完成，当前实现包括：
 
-- Annotation schema v5、Navigation Plan v4、状态机、task lineage 和 durable
+- Annotation schema v6、Navigation Plan v4、状态机、task lineage 和 durable
   handoff；
-- processing owner 唯一约束、精确 clip scope 复用，以及迁移完整性安全标记；
+- processing attempt 不可变 lineage、可转移的当前 authority、精确 clip scope
+  复用，以及迁移完整性安全标记；
 - tracked 起点后处理、三种 gridmap decision、odom trajectory variant、
   私有 attempt staging、publication journal 和 Golden v2 绑定；
 - 独立 Fix 标定、领域命令、FixDraft/FixRevision、人工审核和异步兼容发布；
 - 批准与发布分离：只有兼容文件成功发布才投影为“已验证”，失败可幂等重试；
 - DataPilot 自动标注快捷入口、首帧恢复、后处理完成询问和 linked Fix child；
-- 既有 tracked Job 进入后处理前会幂等绑定唯一 processing owner，完成 handoff
-  可恢复原 Navigation Session；
+- 既有 tracked Job 进入后处理前会幂等绑定当前 processing authority；没有实际
+  queued/running RuntimeRun 时，新 Navigation attempt 可接管，handoff 仍固定
+  恢复其创建时的 Navigation Session；
 - linked Fix 的 Redis inbox/wakeup 使用稳定 dispatch token 与原子 marker/XADD，
   SQLite receipt 仅用于审计；
 - `/annotation/jobs`、`/annotation/reviews`、匿名 Segment 队列和三维 Fix 工作台；
@@ -650,7 +652,46 @@ M4 才上线 DataPilot/模型辅助复核、置信度和
 case-set 变更，不能伪装成与旧 baseline 兼容；本轮需要对其余旧 case 做
 差异审计，并在明确批准后再决定是否晋升新 baseline。
 
-上述评测结果中的 `navigation-m2` 仅表示 case、host 和确定性 grader 本地门禁
-通过；真实模型重复运行和基线晋升尚未执行。真实 Annotation DB 离线迁移、冻结
-Runtime 部署、服务器后处理/Fix writer、业务 Golden 和数据无污染审计也尚未
-执行。因此 M2 当前不能冻结，下一步必须按第 12 节另行批准并完成服务器验收。
+上述当期评测结果中的 `navigation-m2` 仅表示 case、host 和确定性 grader
+本地门禁通过。真实 Annotation DB 离线迁移、冻结 Runtime 部署、服务器
+后处理/Fix writer、业务 Golden 和数据无污染审计也尚未完成。因此 M2 当前
+不能冻结，下一步必须按第 12 节另行批准并完成服务器验收。
+
+## 15. 首轮服务器验收返修（2026-07-29）
+
+首轮 `20270623` 验收在脚本执行前安全停止。只读调查确认 M1 Runtime 可用，
+Navigation 对 localization、gridmap 和 trajectory variant 的调查与 Plan 均正确，
+但生产 `AnnotationWorker` 没有从默认 Runtime driver 取得共享配置，导致 M2
+postprocessing Runtime 未装配。本轮返修：
+
+- 默认 Runtime driver 显式暴露同一份不可变配置，生产 Worker 可据此装配
+  postprocessing、Fix 和兼容发布 Runtime；
+- Annotation schema 升级到 v6：历史 Navigation attempt 不再永久占有
+  AnnotationJob；只有真实 queued/running RuntimeRun 阻止新 attempt 接管；
+- 开始 postprocessing 时只允许当前 authority 执行，被后续会话取代的旧 attempt
+  不能在竞态中重新夺回 authority；
+- handoff 在创建时固定到当时的 processing link，后续 authority 转移不改写
+  历史投递目标；
+- Runtime/状态错误通过严格白名单投影；收到
+  `operator_recovery_required` 后由系统中间层终止 ReAct，不再调用模型或执行
+  后续工具，并生成唯一脱敏 final；
+- 公开错误引用只接受系统生成的 `annotation_error_<32hex>` 或
+  `annotation_worker_error_<32hex>`。
+
+返修后的本地门禁：
+
+- Python 全量：`1679 passed`；
+- Runtime、Annotation、Gateway、ReAct 和公开契约组合：`92 passed`；
+- 前端 Vitest：`236 passed, 8 skipped`；
+- production build：通过，最大 JavaScript chunk `376091 < 512000` bytes；
+- `datapilot-v1` 与 `navigation-m2` case schema：`17 / 7` 个 case 验证通过；
+- `navigation-m2` 使用本地 `qwen3.5-plus` 运行 `7 × 3`：
+  `17 PASS / 4 FAIL / 0 ERROR / 0 TIMEOUT`，其中 5 个 STABLE_PASS、
+  1 个 FLAKY、1 个 STABLE_FAIL。FLAKY 样本正确创建 Fix handoff，但跳过了
+  grader 要求的 current-step 读取；STABLE_FAIL 为本地模型忽略可信快捷范围并
+  重新询问日期。服务器部署模型为 `qwen3.7-plus`，该结果不作为其基线，也不在
+  本次 Runtime 返修中调整 Prompt。
+
+服务器下一步必须先停机备份并执行 Annotation v5 → v6 离线迁移，再验证 M2
+stage-specific preflight，最后用新的 DataPilot 会话继续 `20270623` 验收。旧
+失败 Navigation task 与 link 只保留为审计事实，不得删除或改写。

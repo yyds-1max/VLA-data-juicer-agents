@@ -3,7 +3,7 @@ from __future__ import annotations
 import sqlite3
 
 
-LATEST_ANNOTATION_SCHEMA_VERSION = 5
+LATEST_ANNOTATION_SCHEMA_VERSION = 6
 
 
 class UnsupportedAnnotationSchemaVersionError(RuntimeError):
@@ -1127,6 +1127,141 @@ def _migration_005_processing_owner_and_safety_marker(
     )
 
 
+def _migration_006_processing_attempt_lineage(
+    connection: sqlite3.Connection,
+) -> None:
+    connection.executescript(
+        """
+        BEGIN IMMEDIATE;
+
+        DROP INDEX idx_annotation_task_links_processing_job;
+
+        CREATE TABLE annotation_processing_authorities (
+            job_id INTEGER PRIMARY KEY,
+            link_id INTEGER NOT NULL UNIQUE,
+            revision INTEGER NOT NULL DEFAULT 0 CHECK (revision >= 0),
+            updated_at TEXT NOT NULL,
+            FOREIGN KEY (job_id) REFERENCES annotation_jobs(id),
+            FOREIGN KEY (link_id) REFERENCES annotation_task_links(id)
+        );
+
+        INSERT INTO annotation_processing_authorities (
+            job_id, link_id, revision, updated_at
+        )
+        SELECT l.job_id, l.id, 0, l.created_at
+        FROM annotation_task_links l
+        WHERE l.link_kind = 'processing'
+          AND l.id = (
+              SELECT MAX(candidate.id)
+              FROM annotation_task_links candidate
+              WHERE candidate.job_id = l.job_id
+                AND candidate.link_kind = 'processing'
+          );
+
+        CREATE TABLE workflow_handoff_processing_links (
+            handoff_id INTEGER PRIMARY KEY,
+            link_id INTEGER NOT NULL,
+            created_at TEXT NOT NULL,
+            FOREIGN KEY (handoff_id) REFERENCES workflow_handoffs(id),
+            FOREIGN KEY (link_id) REFERENCES annotation_task_links(id)
+        );
+
+        INSERT INTO workflow_handoff_processing_links (
+            handoff_id, link_id, created_at
+        )
+        SELECT h.id, a.link_id, h.created_at
+        FROM workflow_handoffs h
+        JOIN annotation_processing_authorities a ON a.job_id = h.job_id
+        WHERE h.kind IN (
+            'initial_annotation_submitted',
+            'tracking_completed',
+            'postprocessing_completed'
+        );
+
+        CREATE TRIGGER annotation_processing_authorities_guard_insert
+        BEFORE INSERT ON annotation_processing_authorities
+        WHEN NOT EXISTS (
+            SELECT 1
+            FROM annotation_task_links l
+            WHERE l.id = NEW.link_id
+              AND l.job_id = NEW.job_id
+              AND l.link_kind = 'processing'
+        )
+        BEGIN
+            SELECT RAISE(ABORT, 'invalid processing authority link');
+        END;
+        CREATE TRIGGER annotation_processing_authorities_guard_update
+        BEFORE UPDATE ON annotation_processing_authorities
+        WHEN
+            OLD.job_id IS NOT NEW.job_id
+            OR NEW.link_id = OLD.link_id
+            OR NEW.revision != OLD.revision + 1
+            OR NOT EXISTS (
+                SELECT 1
+                FROM annotation_task_links l
+                WHERE l.id = NEW.link_id
+                  AND l.job_id = NEW.job_id
+                  AND l.link_kind = 'processing'
+            )
+        BEGIN
+            SELECT RAISE(ABORT, 'invalid processing authority transition');
+        END;
+        CREATE TRIGGER annotation_processing_authorities_no_delete
+        BEFORE DELETE ON annotation_processing_authorities BEGIN
+            SELECT RAISE(ABORT, 'processing authorities cannot be deleted');
+        END;
+        CREATE TRIGGER workflow_handoff_processing_links_guard_insert
+        BEFORE INSERT ON workflow_handoff_processing_links
+        WHEN NOT EXISTS (
+            SELECT 1
+            FROM workflow_handoffs h
+            JOIN annotation_task_links l
+              ON l.id = NEW.link_id
+             AND l.job_id = h.job_id
+             AND l.link_kind = 'processing'
+            WHERE h.id = NEW.handoff_id
+              AND h.kind IN (
+                  'initial_annotation_submitted',
+                  'tracking_completed',
+                  'postprocessing_completed'
+              )
+        )
+        BEGIN
+            SELECT RAISE(ABORT, 'invalid processing handoff link');
+        END;
+        CREATE TRIGGER workflow_handoffs_pin_processing_authority
+        AFTER INSERT ON workflow_handoffs
+        WHEN NEW.kind IN (
+            'initial_annotation_submitted',
+            'tracking_completed',
+            'postprocessing_completed'
+        )
+        BEGIN
+            INSERT INTO workflow_handoff_processing_links (
+                handoff_id, link_id, created_at
+            )
+            SELECT NEW.id, a.link_id, NEW.created_at
+            FROM annotation_processing_authorities a
+            WHERE a.job_id = NEW.job_id;
+        END;
+        CREATE TRIGGER workflow_handoff_processing_links_no_update
+        BEFORE UPDATE ON workflow_handoff_processing_links BEGIN
+            SELECT RAISE(ABORT, 'processing handoff links are immutable');
+        END;
+        CREATE TRIGGER workflow_handoff_processing_links_no_delete
+        BEFORE DELETE ON workflow_handoff_processing_links BEGIN
+            SELECT RAISE(ABORT, 'processing handoff links are immutable');
+        END;
+
+        UPDATE annotation_migration_safety
+        SET schema_version = 6,
+            status = 'pending_integrity_check',
+            verified_at = NULL
+        WHERE singleton = 1 AND schema_version = 5;
+        """
+    )
+
+
 _MIGRATIONS = (
     (1, "annotation_m1", _migration_001_annotation_m1),
     (2, "runtime_step_evidence", _migration_002_runtime_step_evidence),
@@ -1140,5 +1275,10 @@ _MIGRATIONS = (
         5,
         "processing_owner_and_safety_marker",
         _migration_005_processing_owner_and_safety_marker,
+    ),
+    (
+        6,
+        "processing_attempt_lineage",
+        _migration_006_processing_attempt_lineage,
     ),
 )

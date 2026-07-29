@@ -4124,11 +4124,18 @@ class NavigationAnnotationRuntimeDriver:
         config: NavigationAnnotationRuntimeConfig | None = None,
     ) -> None:
         resolved = config or NavigationAnnotationRuntimeConfig.from_env()
+        self._config = resolved
         self._preparation = NavigationAnnotationRuntimeAdapter(resolved)
         self._tracking = NavigationTrackingRuntime(resolved)
         self._cancellation_lock = threading.RLock()
         self._active_cancellations: dict[str, CancellationContext] = {}
         self._pending_cancellations: set[str] = set()
+
+    @property
+    def config(self) -> NavigationAnnotationRuntimeConfig:
+        """Return the immutable configuration shared by all Runtime stages."""
+
+        return self._config
 
     def capabilities(self) -> RuntimeCapabilities:
         return self._preparation.capabilities()

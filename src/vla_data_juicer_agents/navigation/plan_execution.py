@@ -1,13 +1,21 @@
 from __future__ import annotations
 
 import asyncio
-import json
 import hashlib
+import json
+import logging
+import re
 from pathlib import Path
 from typing import Any, Callable
+from uuid import uuid4
 
 from agentscope.tool import FunctionTool, ToolBase
 
+from vla_data_juicer_agents.annotation.models import (
+    AnnotationConflictError,
+    AnnotationValidationError,
+    public_annotation_error_ref,
+)
 from vla_data_juicer_agents.navigation.annotation_gateway import (
     NavigationAnnotationGateway,
 )
@@ -74,6 +82,7 @@ _EXTERNAL_ACTION = "confirm_navigation_calibration_params"
 _SENSITIVE_KEYS = {
     "password", "token", "secret", "authorization", "api_key", "cookie"
 }
+_LOGGER = logging.getLogger(__name__)
 
 
 def _canonical_json(payload: Any) -> str:
@@ -138,6 +147,99 @@ def _session_mismatch_error() -> dict[str, Any]:
         "navigation_task_session_mismatch",
         "The bound navigation task is no longer the current attempt for this session.",
         next_action="inspect_current_navigation_task",
+    )
+
+
+def _annotation_workflow_start_error(
+    exc: Exception,
+    *,
+    action: str,
+) -> dict[str, Any]:
+    """Project Annotation failures without exposing its private execution state."""
+
+    if isinstance(exc, AnnotationConflictError):
+        if exc.code == "annotation_runtime_unavailable":
+            current = exc.current if isinstance(exc.current, dict) else {}
+            capabilities = current.get("capabilities")
+            capabilities = capabilities if isinstance(capabilities, dict) else {}
+            reason = capabilities.get("reason")
+            reason = reason if isinstance(reason, dict) else {}
+            reason_code = str(reason.get("code") or "")
+            stage = (
+                "postprocessing"
+                if action == "run_annotation_postprocessing_workflow"
+                else "annotation processing"
+            )
+            messages = {
+                "processing_runtime_not_configured": (
+                    f"The {stage} runtime deployment is incomplete. "
+                    "An operator must complete its configuration before "
+                    "processing can continue."
+                ),
+                "processing_worker_unavailable": (
+                    f"The {stage} service is unavailable. "
+                    "An operator must restore the service before processing "
+                    "can continue."
+                ),
+                "processing_runtime_preflight_failed": (
+                    f"The {stage} runtime did not pass its deployment "
+                    "preflight. An operator must repair the deployment before "
+                    "processing can continue."
+                ),
+            }
+            public_code = (
+                reason_code
+                if reason_code in messages
+                else "processing_runtime_unavailable"
+            )
+            details: dict[str, Any] = {
+                "next_action": "operator_recovery_required",
+            }
+            error_ref = public_annotation_error_ref(reason.get("error_ref"))
+            if error_ref is not None:
+                details["error_ref"] = error_ref
+            return _compact_error(
+                public_code,
+                messages.get(
+                    public_code,
+                    (
+                        f"The {stage} runtime is unavailable. An operator "
+                        "must restore it before processing can continue."
+                    ),
+                ),
+                **details,
+            )
+        return _compact_error(
+            "annotation_workflow_state_conflict",
+            (
+                "The authoritative annotation workflow state no longer "
+                "permits this operation. Operator recovery is required."
+            ),
+            next_action="operator_recovery_required",
+        )
+    if isinstance(exc, AnnotationValidationError):
+        return _compact_error(
+            "annotation_workflow_request_invalid",
+            (
+                "The accepted annotation workflow request could not be "
+                "started safely. Operator recovery is required."
+            ),
+            next_action="operator_recovery_required",
+        )
+    error_ref = f"annotation_error_{uuid4().hex}"
+    _LOGGER.error(
+        "Annotation workflow start failed: error_ref=%s exception_type=%s",
+        error_ref,
+        type(exc).__name__,
+    )
+    return _compact_error(
+        "annotation_workflow_start_failed",
+        (
+            "The annotation workflow could not be started safely. "
+            "Operator recovery is required."
+        ),
+        next_action="operator_recovery_required",
+        error_ref=error_ref,
     )
 
 
@@ -1370,11 +1472,10 @@ def build_plan_bound_execution_tools(
                         step_id=step.step_id,
                     )
                 )
-            except Exception:
-                return _compact_error(
-                    "annotation_workflow_start_failed",
-                    "The durable Annotation workflow could not be started safely.",
-                    next_action="inspect_current_navigation_task",
+            except Exception as exc:
+                return _annotation_workflow_start_error(
+                    exc,
+                    action=action,
                 )
             if bool(result.get("completed")):
                 payload = {

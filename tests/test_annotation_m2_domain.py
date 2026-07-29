@@ -29,6 +29,7 @@ from vla_data_juicer_agents.annotation.migrations import (
     _migration_002_runtime_step_evidence,
     _migration_003_global_writer_quarantine_audit,
     _migration_004_annotation_m2_domain,
+    _migration_005_processing_owner_and_safety_marker,
     prepare_annotation_migration_ledger,
 )
 from vla_data_juicer_agents.annotation.models import (
@@ -790,8 +791,22 @@ def test_m2_migration_preserves_m1_rows(tmp_path: Path):
         assert migrated.execute(
             """
             SELECT 1 FROM sqlite_master
+            WHERE type = 'table'
+              AND name = 'annotation_processing_authorities'
+            """
+        ).fetchone() == (1,)
+        assert migrated.execute(
+            """
+            SELECT 1 FROM sqlite_master
             WHERE type = 'index'
               AND name = 'idx_annotation_task_links_processing_job'
+            """
+        ).fetchone() is None
+        assert migrated.execute(
+            """
+            SELECT 1 FROM sqlite_master
+            WHERE type = 'trigger'
+              AND name = 'annotation_processing_authorities_guard_insert'
             """
         ).fetchone() == (1,)
     assert migration["from_version"] == 3
@@ -913,6 +928,109 @@ def test_failed_migration_integrity_check_stays_fail_closed_after_reopen(
         AnnotationStore(database)
 
 
+def test_v5_to_v6_migration_preserves_processing_lineage_and_pins_handoff(
+    tmp_path: Path,
+) -> None:
+    database = tmp_path / "annotation.sqlite"
+    connection = sqlite3.connect(database)
+    connection.execute("PRAGMA foreign_keys = ON")
+    prepare_annotation_migration_ledger(connection)
+    for version, name, migration in (
+        (1, "annotation_m1", _migration_001_annotation_m1),
+        (2, "runtime_step_evidence", _migration_002_runtime_step_evidence),
+        (3, "global_writer_quarantine_audit", _migration_003_global_writer_quarantine_audit),
+        (4, "annotation_m2_domain", _migration_004_annotation_m2_domain),
+        (5, "processing_owner_and_safety_marker", _migration_005_processing_owner_and_safety_marker),
+    ):
+        migration(connection)
+        connection.execute(
+            """
+            INSERT INTO annotation_schema_migrations(version, name, applied_at)
+            VALUES (?, ?, '2026-07-28T00:00:00+00:00')
+            """,
+            (version, name),
+        )
+        connection.commit()
+        connection.execute("PRAGMA foreign_keys = ON")
+    job_id = int(
+        connection.execute(
+            """
+            INSERT INTO annotation_jobs (
+                job_ref, dataset_date, status, created_at, updated_at
+            ) VALUES (?, '20270704', 'tracked', ?, ?)
+            """,
+            (
+                "job_" + "d" * 32,
+                "2026-07-28T00:00:00+00:00",
+                "2026-07-28T00:00:00+00:00",
+            ),
+        ).lastrowid
+    )
+    link_id = int(
+        connection.execute(
+            """
+            INSERT INTO annotation_task_links (
+                link_ref, job_id, review_id, navigation_task_ref,
+                parent_navigation_task_ref, link_kind, created_at
+            ) VALUES (?, ?, NULL, ?, NULL, 'processing', ?)
+            """,
+            (
+                "annotation_task_link_" + "d" * 32,
+                job_id,
+                "historical-navigation-attempt",
+                "2026-07-28T00:00:00+00:00",
+            ),
+        ).lastrowid
+    )
+    handoff_id = int(
+        connection.execute(
+            """
+            INSERT INTO workflow_handoffs (
+                handoff_ref, job_id, review_id, kind, payload_json,
+                content_sha256, created_at
+            ) VALUES (?, ?, NULL, 'tracking_completed', '{}', ?, ?)
+            """,
+            (
+                "handoff_" + "d" * 32,
+                job_id,
+                hashlib.sha256(b"{}").hexdigest(),
+                "2026-07-28T00:00:00+00:00",
+            ),
+        ).lastrowid
+    )
+    connection.execute(
+        """
+        UPDATE annotation_migration_safety
+        SET status = 'verified', verified_at = ?
+        WHERE singleton = 1
+        """,
+        ("2026-07-28T00:00:00+00:00",),
+    )
+    connection.commit()
+    connection.close()
+    database.chmod(0o600)
+
+    result = migrate_annotation_store_offline(
+        database,
+        backup_root=tmp_path / "v6-migration-backup",
+    )
+    assert result["from_version"] == 5
+    assert result["to_version"] == 6
+    with sqlite3.connect(database) as migrated:
+        assert migrated.execute(
+            """
+            SELECT job_id, link_id
+            FROM annotation_processing_authorities
+            """
+        ).fetchone() == (job_id, link_id)
+        assert migrated.execute(
+            """
+            SELECT handoff_id, link_id
+            FROM workflow_handoff_processing_links
+            """
+        ).fetchone() == (handoff_id, link_id)
+
+
 def test_processing_scope_requires_exact_clips_and_uses_job_order(
     tmp_path: Path,
 ) -> None:
@@ -956,7 +1074,7 @@ def test_processing_scope_requires_exact_clips_and_uses_job_order(
         assert binding_error.value.code == "annotation_scope_mismatch"
 
 
-def test_processing_link_has_one_owner_across_sessions_and_idempotent_retry(
+def test_processing_link_blocks_active_run_then_preserves_failed_attempt_lineage(
     tmp_path: Path,
 ) -> None:
     database = tmp_path / "annotation.sqlite"
@@ -1000,7 +1118,7 @@ def test_processing_link_has_one_owner_across_sessions_and_idempotent_retry(
         )
 
     assert sorted(status for _owner, status in results) == [
-        "annotation_processing_owner_conflict",
+        "annotation_processing_active_attempt_conflict",
         "linked",
     ]
     winner = next(owner for owner, status in results if status == "linked")
@@ -1013,6 +1131,13 @@ def test_processing_link_has_one_owner_across_sessions_and_idempotent_retry(
         idempotency_key="processing-owner-idempotent-retry",
     )
     assert retry == {"linked": True, "link_kind": "processing"}
+    pinned_handoff = store.create_workflow_handoff(
+        job_ref=job["job_ref"],
+        review_ref=None,
+        kind="initial_annotation_submitted",
+        payload={"status": "submitted"},
+        idempotency_key="pinned-first-owner-handoff",
+    )
 
     with sqlite3.connect(database) as connection:
         job_id = connection.execute(
@@ -1027,21 +1152,54 @@ def test_processing_link_has_one_owner_across_sessions_and_idempotent_retry(
             """,
             (job_id,),
         ).fetchall() == [(winner,)]
-        with pytest.raises(sqlite3.IntegrityError):
-            connection.execute(
-                """
-                INSERT INTO annotation_task_links (
-                    link_ref, job_id, review_id, navigation_task_ref,
-                    parent_navigation_task_ref, link_kind, created_at
-                ) VALUES (?, ?, NULL, ?, NULL, 'processing', ?)
-                """,
-                (
-                    "annotation_task_link_" + "f" * 32,
-                    job_id,
-                    "direct-second-owner",
-                    "2026-07-28T00:00:00+00:00",
-                ),
-            )
+    active = store.claim_next_run(worker_id="failed-attempt-worker")
+    assert active is not None
+    store.fail_run(
+        run_id=int(active["run_id"]),
+        code="injected_prepare_failure",
+        message="Injected prepare failure.",
+        retryable=True,
+    )
+    successor = "navigation-owner-successor"
+    assert session_a.link_navigation_task(
+        job_ref=job["job_ref"],
+        review_ref=None,
+        navigation_task_ref=successor,
+        parent_navigation_task_ref=None,
+        link_kind="processing",
+        idempotency_key="processing-owner-successor",
+    ) == {"linked": True, "link_kind": "processing"}
+    with sqlite3.connect(database) as connection:
+        assert connection.execute(
+            """
+            SELECT navigation_task_ref
+            FROM annotation_task_links
+            WHERE job_id = ? AND link_kind = 'processing'
+            ORDER BY id
+            """,
+            (job_id,),
+        ).fetchall() == [(winner,), (successor,)]
+        assert connection.execute(
+            """
+            SELECT l.navigation_task_ref
+            FROM annotation_processing_authorities a
+            JOIN annotation_task_links l ON l.id = a.link_id
+            WHERE a.job_id = ?
+            """,
+            (job_id,),
+        ).fetchone() == (successor,)
+
+    first_claim = store.claim_workflow_handoff_delivery(
+        worker_id="first-handoff-worker",
+    )
+    assert first_claim is not None
+    assert first_claim["handoff_ref"] == pinned_handoff["handoff_ref"]
+    assert first_claim["navigation_task_ref"] == winner
+    store.complete_workflow_handoff_delivery(
+        handoff_id=int(first_claim["handoff_id"]),
+        worker_id="first-handoff-worker",
+        success=True,
+    )
 
     handoff = store.create_workflow_handoff(
         job_ref=job["job_ref"],
@@ -1053,7 +1211,70 @@ def test_processing_link_has_one_owner_across_sessions_and_idempotent_retry(
     claimed = store.claim_workflow_handoff_delivery(worker_id="handoff-worker")
     assert claimed is not None
     assert claimed["handoff_ref"] == handoff["handoff_ref"]
-    assert claimed["navigation_task_ref"] == winner
+    assert claimed["navigation_task_ref"] == successor
+
+
+def test_superseded_processing_attempt_cannot_retake_authority_at_begin(
+    tmp_path: Path,
+) -> None:
+    store = AnnotationStore(tmp_path / "annotation.sqlite")
+    job = _seed_tracked_job(store, tmp_path)
+    with store._write() as connection:
+        connection.execute(
+            """
+            UPDATE runtime_runs
+            SET status = 'succeeded',
+                started_at = COALESCE(started_at, created_at),
+                finished_at = COALESCE(finished_at, created_at)
+            WHERE kind = 'prepare' AND status = 'queued'
+            """
+        )
+    historical_attempt = "navigation-historical-attempt"
+    current_attempt = "navigation-current-attempt"
+    for attempt in (historical_attempt, current_attempt):
+        assert store.link_navigation_task(
+            job_ref=job["job_ref"],
+            review_ref=None,
+            navigation_task_ref=attempt,
+            parent_navigation_task_ref=None,
+            link_kind="processing",
+            idempotency_key=f"link:{attempt}",
+        ) == {"linked": True, "link_kind": "processing"}
+
+    spec = {
+        "localization_kind": "odom",
+        "gridmap_decision": "copy_existing_gridmap",
+        "trajectory_variant": "cjl_0525_with_gridmap",
+        "plan_sha256": "d" * 64,
+        "observations_sha256": "e" * 64,
+    }
+    with pytest.raises(AnnotationConflictError) as raised:
+        store.begin_postprocessing(
+            job_ref=job["job_ref"],
+            expected_job_revision=job["state_revision"],
+            spec=spec,
+            idempotency_key="superseded-begin",
+            processing_navigation_task_ref=historical_attempt,
+        )
+    assert raised.value.code == "annotation_processing_attempt_superseded"
+    assert store.get_job(job["job_ref"])["status"] == "tracked"
+
+    started = store.begin_postprocessing(
+        job_ref=job["job_ref"],
+        expected_job_revision=job["state_revision"],
+        spec=spec,
+        idempotency_key="authoritative-begin",
+        processing_navigation_task_ref=current_attempt,
+    )
+    assert started["status"] == "postprocessing"
+    with store._connect() as connection:
+        assert connection.execute(
+            """
+            SELECT l.navigation_task_ref
+            FROM annotation_processing_authorities a
+            JOIN annotation_task_links l ON l.id = a.link_id
+            """
+        ).fetchone()[0] == current_attempt
 
 
 def test_worker_executes_store_bound_postprocessing_and_creates_review(
@@ -2073,6 +2294,62 @@ def test_postprocessing_preflight_fails_before_durable_run(
         assert connection.execute(
             "SELECT COUNT(*) FROM runtime_runs WHERE kind = 'postprocessing'"
         ).fetchone()[0] == 0
+
+
+def test_missing_postprocessing_runtime_has_specific_public_capability_reason(
+    tmp_path: Path,
+) -> None:
+    store = AnnotationStore(tmp_path / "annotation.sqlite")
+    job = _seed_tracked_job(store, tmp_path)
+    worker = FakeWorker()
+
+    def _not_configured(stage, *, decision=None):
+        assert stage == "postprocessing"
+        assert decision is not None
+        return {
+            "available": False,
+            "runtime_id": "navigation_odom_v1",
+            "reason": {
+                "code": "postprocessing_runtime_not_configured",
+                "message": "/private/runtime/config is missing",
+                "error_ref": "sk-not-an-annotation-error-reference",
+            },
+        }
+
+    worker.preflight_runtime_stage = _not_configured
+    service = AnnotationApplicationService(store=store, worker=worker)
+    spec = PostprocessingSpecInput(
+        localization_kind="odom",
+        gridmap_decision="copy_existing_gridmap",
+        trajectory_variant="cjl_0525_with_gridmap",
+        plan_sha256="d" * 64,
+        observations_sha256="e" * 64,
+    )
+
+    with pytest.raises(AnnotationConflictError) as raised:
+        service.begin_postprocessing(
+            job["job_ref"],
+            job["state_revision"],
+            spec,
+            idempotency_key="postprocessing-runtime-not-configured",
+        )
+
+    assert raised.value.code == "annotation_runtime_unavailable"
+    assert raised.value.current == {
+        "capabilities": {
+            "available": False,
+            "runtime_id": "navigation_odom_v1",
+            "reason": {
+                "code": "processing_runtime_not_configured",
+                "message": (
+                    "The processing runtime has not completed its deployment "
+                    "configuration."
+                ),
+            },
+        }
+    }
+    assert "/private/" not in json.dumps(raised.value.current)
+    assert store.get_job(job["job_ref"])["status"] == "tracked"
 
 
 def test_fix_preflight_fails_before_snapshot_or_draft_is_created(

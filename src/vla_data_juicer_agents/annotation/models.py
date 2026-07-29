@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from math import isfinite
+import re
 from typing import Annotated, Any, Literal, Protocol
 
 from pydantic import (
@@ -88,6 +89,20 @@ ColorValue = Literal[
     "khaki",
 ]
 StrictRevision = Annotated[int, Field(strict=True, ge=0)]
+_PUBLIC_ANNOTATION_ERROR_REF_RE = re.compile(
+    r"^(?:annotation_error|annotation_worker_error)_[0-9a-f]{32}$",
+)
+
+
+def public_annotation_error_ref(value: object) -> str | None:
+    """Return only an error reference issued by the Annotation runtime."""
+
+    if (
+        isinstance(value, str)
+        and _PUBLIC_ANNOTATION_ERROR_REF_RE.fullmatch(value)
+    ):
+        return value
+    return None
 
 
 class AnnotationConflictError(RuntimeError):

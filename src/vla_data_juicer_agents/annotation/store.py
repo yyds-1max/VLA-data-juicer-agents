@@ -1107,6 +1107,7 @@ class AnnotationStore:
         expected_job_revision: int,
         spec: dict[str, Any],
         idempotency_key: str,
+        processing_navigation_task_ref: str | None = None,
         actor_kind: str = "datapilot",
     ) -> dict[str, Any]:
         payload = {
@@ -1114,6 +1115,10 @@ class AnnotationStore:
             "expected_job_revision": expected_job_revision,
             "spec": spec,
         }
+        if processing_navigation_task_ref is not None:
+            payload["processing_navigation_task_ref"] = (
+                processing_navigation_task_ref
+            )
 
         def begin(connection: sqlite3.Connection) -> dict[str, Any]:
             job_id = self._job_id(connection, job_ref)
@@ -1146,6 +1151,38 @@ class AnnotationStore:
                     "invalid_postprocessing_spec",
                     "The postprocessing decision is inconsistent.",
                 )
+            if processing_navigation_task_ref is not None:
+                processing_link = connection.execute(
+                    """
+                    SELECT id
+                    FROM annotation_task_links
+                    WHERE job_id = ?
+                      AND navigation_task_ref = ?
+                      AND link_kind = 'processing'
+                    """,
+                    (job_id, processing_navigation_task_ref),
+                ).fetchone()
+                if processing_link is None:
+                    raise AnnotationValidationError(
+                        "invalid_navigation_task_binding",
+                        "The postprocessing attempt is not linked to this workflow.",
+                    )
+                authority = connection.execute(
+                    """
+                    SELECT link_id
+                    FROM annotation_processing_authorities
+                    WHERE job_id = ?
+                    """,
+                    (job_id,),
+                ).fetchone()
+                if (
+                    authority is None
+                    or int(authority["link_id"]) != int(processing_link["id"])
+                ):
+                    raise AnnotationConflictError(
+                        "annotation_processing_attempt_superseded",
+                        "This processing attempt is no longer authoritative.",
+                    )
             spec_json = _canonical_json(spec)
             timestamp = _now()
             connection.execute(
@@ -3483,16 +3520,17 @@ class AnnotationStore:
                        l.navigation_task_ref
                 FROM workflow_handoffs h
                 JOIN annotation_jobs j ON j.id = h.job_id
+                LEFT JOIN workflow_handoff_processing_links processing_link
+                  ON processing_link.handoff_id = h.id
                 JOIN annotation_task_links l
-                  ON l.job_id = h.job_id
-                 AND (
+                  ON (
                       (
                           h.kind IN (
                               'initial_annotation_submitted',
                               'tracking_completed',
                               'postprocessing_completed'
                           )
-                          AND l.link_kind = 'processing'
+                          AND l.id = processing_link.link_id
                       )
                       OR
                       (
@@ -3617,6 +3655,88 @@ class AnnotationStore:
                 ),
             )
 
+    @staticmethod
+    def _assign_processing_authority(
+        connection: sqlite3.Connection,
+        *,
+        job_id: int,
+        link_id: int,
+    ) -> None:
+        link = connection.execute(
+            """
+            SELECT job_id, link_kind
+            FROM annotation_task_links
+            WHERE id = ?
+            """,
+            (link_id,),
+        ).fetchone()
+        if (
+            link is None
+            or int(link["job_id"]) != job_id
+            or str(link["link_kind"]) != "processing"
+        ):
+            raise RuntimeError("processing authority link is invalid")
+        current = connection.execute(
+            """
+            SELECT link_id
+            FROM annotation_processing_authorities
+            WHERE job_id = ?
+            """,
+            (job_id,),
+        ).fetchone()
+        if current is None:
+            connection.execute(
+                """
+                INSERT INTO annotation_processing_authorities (
+                    job_id, link_id, revision, updated_at
+                ) VALUES (?, ?, 0, ?)
+                """,
+                (job_id, link_id, _now()),
+            )
+        elif int(current["link_id"]) != link_id:
+            active_run = connection.execute(
+                """
+                SELECT 1
+                FROM runtime_runs
+                WHERE job_id = ?
+                  AND status IN ('queued', 'running')
+                LIMIT 1
+                """,
+                (job_id,),
+            ).fetchone()
+            if active_run is not None:
+                raise AnnotationConflictError(
+                    "annotation_processing_active_attempt_conflict",
+                    "This annotation workflow already has active processing.",
+                )
+            connection.execute(
+                """
+                UPDATE annotation_processing_authorities
+                SET link_id = ?, revision = revision + 1, updated_at = ?
+                WHERE job_id = ?
+                """,
+                (link_id, _now(), job_id),
+            )
+        connection.execute(
+            """
+            INSERT OR IGNORE INTO workflow_handoff_processing_links (
+                handoff_id, link_id, created_at
+            )
+            SELECT h.id, ?, ?
+            FROM workflow_handoffs h
+            LEFT JOIN workflow_handoff_processing_links existing
+              ON existing.handoff_id = h.id
+            WHERE h.job_id = ?
+              AND h.kind IN (
+                  'initial_annotation_submitted',
+                  'tracking_completed',
+                  'postprocessing_completed'
+              )
+              AND existing.handoff_id IS NULL
+            """,
+            (link_id, _now(), job_id),
+        )
+
     def link_navigation_task(
         self,
         *,
@@ -3687,32 +3807,9 @@ class AnnotationStore:
                         "The review is outside the annotation task scope.",
                     )
             if link_kind == "processing":
-                processing_owners = connection.execute(
-                    """
-                    SELECT navigation_task_ref
-                    FROM annotation_task_links
-                    WHERE job_id = ? AND link_kind = 'processing'
-                    ORDER BY id
-                    """,
-                    (job_id,),
-                ).fetchall()
-                if len(processing_owners) > 1:
-                    raise RuntimeError(
-                        "annotation job has multiple processing Navigation owners"
-                    )
-                if processing_owners:
-                    if (
-                        str(processing_owners[0]["navigation_task_ref"])
-                        == navigation_task_ref
-                    ):
-                        return {"linked": True, "link_kind": link_kind}
-                    raise AnnotationConflictError(
-                        "annotation_processing_owner_conflict",
-                        "This annotation job already has a different processing owner.",
-                    )
                 navigation_owner = connection.execute(
                     """
-                    SELECT job_id
+                    SELECT id, job_id
                     FROM annotation_task_links
                     WHERE navigation_task_ref = ?
                       AND link_kind = 'processing'
@@ -3727,9 +3824,16 @@ class AnnotationStore:
                         "annotation_processing_owner_conflict",
                         "This Navigation task already owns a different annotation job.",
                     )
+                if navigation_owner is not None:
+                    self._assign_processing_authority(
+                        connection,
+                        job_id=job_id,
+                        link_id=int(navigation_owner["id"]),
+                    )
+                    return {"linked": True, "link_kind": link_kind}
             link_ref = _new_ref("annotation_task_link")
             try:
-                connection.execute(
+                inserted = connection.execute(
                     """
                     INSERT INTO annotation_task_links (
                         link_ref, job_id, review_id, navigation_task_ref,
@@ -3750,23 +3854,32 @@ class AnnotationStore:
                 if link_kind == "processing":
                     owner_after_conflict = connection.execute(
                         """
-                        SELECT navigation_task_ref
+                        SELECT id, job_id
                         FROM annotation_task_links
-                        WHERE job_id = ? AND link_kind = 'processing'
+                        WHERE navigation_task_ref = ?
+                          AND link_kind = 'processing'
                         """,
-                        (job_id,),
+                        (navigation_task_ref,),
                     ).fetchone()
                     if owner_after_conflict is not None:
-                        if (
-                            str(owner_after_conflict["navigation_task_ref"])
-                            == navigation_task_ref
-                        ):
+                        if int(owner_after_conflict["job_id"]) == job_id:
+                            self._assign_processing_authority(
+                                connection,
+                                job_id=job_id,
+                                link_id=int(owner_after_conflict["id"]),
+                            )
                             return {"linked": True, "link_kind": link_kind}
                         raise AnnotationConflictError(
                             "annotation_processing_owner_conflict",
                             "This annotation job already has a different processing owner.",
                         ) from exc
                 raise
+            if link_kind == "processing":
+                self._assign_processing_authority(
+                    connection,
+                    job_id=job_id,
+                    link_id=int(inserted.lastrowid),
+                )
             return {"linked": True, "link_kind": link_kind}
 
         return self.mutate(

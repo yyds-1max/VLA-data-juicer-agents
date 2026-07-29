@@ -364,10 +364,17 @@ _INTERNAL_ID_RE = re.compile(
     r"\b(?:task|plan|step|reply|session|agent|activity|request|origin|call|run|tool_call|parent_run)[_ -]?id\s*[:=：]?\s*[A-Za-z0-9_-]+",
     re.IGNORECASE,
 )
+_INTERNAL_REF_RE = re.compile(
+    r"\b(?:nav_plan_[0-9a-f]{24,64}|"
+    r"[a-z][a-z0-9_]*(?:step|phase)_[a-z0-9_-]+)\b",
+    re.IGNORECASE,
+)
 _UUID_RE = re.compile(r"\b[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}\b", re.IGNORECASE)
 _LONG_HEX_RE = re.compile(r"\b[0-9a-f]{24,64}\b", re.IGNORECASE)
 _TOOL_NAME_RE = re.compile(
-    r"\b(?:[a-z][a-z0-9_]{2,}_tool|(?:start|continue|control)_navigation_data_task)\b",
+    r"\b(?:[a-z][a-z0-9_]{2,}_tool|"
+    r"(?:start|continue|control)_navigation_data_task|"
+    r"run_annotation_(?:tracking|postprocessing)_workflow)\b",
     re.IGNORECASE,
 )
 _AGENT_NAME_RE = re.compile(r"\b(?:MainRouter|NavigationDataAgent|[A-Za-z][A-Za-z0-9]*Agent|AgentScope)\b", re.IGNORECASE)
@@ -384,7 +391,8 @@ def _contains_unsafe_public_text(text: str) -> bool:
         pattern.search(text)
         for pattern in (
             _UNIX_PATH_RE, _WINDOWS_PATH_RE, _UNC_PATH_RE, _BEARER_RE, _SECRET_RE,
-            _CN_SECRET_RE, _INTERNAL_ID_RE, _TOOL_NAME_RE, _AGENT_NAME_RE,
+            _CN_SECRET_RE, _INTERNAL_ID_RE, _INTERNAL_REF_RE, _TOOL_NAME_RE,
+            _AGENT_NAME_RE,
             _UUID_RE, _LONG_HEX_RE, _PERCENT_RE,
         )
     )
@@ -400,6 +408,7 @@ def _redact_text(text: object) -> str:
         (_SECRET_RE, "[已隐藏凭据]"),
         (_CN_SECRET_RE, "[已隐藏凭据]"),
         (_INTERNAL_ID_RE, "[已隐藏内部标识]"),
+        (_INTERNAL_REF_RE, "[已隐藏内部标识]"),
         (_UUID_RE, "[已隐藏内部标识]"),
         (_LONG_HEX_RE, "[已隐藏内部标识]"),
         (_TOOL_NAME_RE, "[已隐藏内部操作]"),

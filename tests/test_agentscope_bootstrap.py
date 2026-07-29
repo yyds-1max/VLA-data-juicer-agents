@@ -143,6 +143,18 @@ def test_navigation_prompt_keeps_explicit_postprocessing_in_finish_phase():
     assert "when the workflow reports background execution" in prompt
 
 
+def test_navigation_prompt_stops_on_operator_recovery_without_internal_leaks():
+    prompt = navigation_agent_prompt()
+
+    assert "`next_action=operator_recovery_required`" in prompt
+    assert "do not retry, replan, inspect unrelated state" in prompt
+    assert "Give exactly one" in prompt
+    assert "processing did\n  not start" in prompt
+    assert "Do not guess a cause" in prompt
+    assert "Plan/step/action" in prompt
+    assert "paths, database identifiers" in prompt
+
+
 def test_router_start_schema_omits_dry_run_and_model_restatements():
     schema = StartNavigationDataTaskV1Tool.input_schema
 

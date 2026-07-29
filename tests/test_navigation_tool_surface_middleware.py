@@ -1,11 +1,13 @@
 from __future__ import annotations
 
+import json
 from types import SimpleNamespace
 from typing import Any
 
 import pytest
-from agentscope.agent import Agent
-from agentscope.message import TextBlock, ToolCallBlock, ToolResultState
+from agentscope.agent import Agent, ContextConfig, ReActConfig
+from agentscope.message import TextBlock, ToolCallBlock, ToolResultState, UserMsg
+from agentscope.permission import PermissionMode
 from agentscope.state import AgentState
 from agentscope.tool import FunctionTool, ToolChunk, ToolResponse
 
@@ -383,6 +385,174 @@ async def test_terminal_tool_response_refreshes_before_it_is_yielded(
             seen.append(tuple(agent.state.tool_context.activated_groups))
 
     assert seen == [execution.active_group_names]
+
+
+@pytest.mark.asyncio
+async def test_operator_recovery_stops_react_loop_and_emits_system_final(
+    monkeypatch,
+    record,
+    generic_tools,
+    agent_state,
+):
+    error_ref = "annotation_error_" + "7" * 32
+
+    def recovery_tool() -> dict[str, object]:
+        return {
+            "ok": False,
+            "error_type": "processing_runtime_not_configured",
+            "message": "/private/runtime/config should never become final text",
+            "next_action": "operator_recovery_required",
+            "error_ref": error_ref,
+        }
+
+    recovery_surface = NavigationToolSurface(
+        activity="execution",
+        groups=(
+            NavigationToolGroupDefinition(
+                name="execution_actions",
+                description="Authorized execution action.",
+                instructions="Execute the current action.",
+                tools=(
+                    FunctionTool(
+                        recovery_tool,
+                        name="recovery_tool",
+                        is_read_only=True,
+                    ),
+                ),
+            ),
+        ),
+        active_group_names=("execution_actions",),
+    )
+    resolver = SequenceResolver(recovery_surface, recovery_surface)
+    monkeypatch.setattr(
+        "vla_data_juicer_agents.runtime.navigation_tool_surface."
+        "resolve_navigation_tool_surface",
+        resolver,
+    )
+    services = SimpleNamespace(
+        task_store=SimpleNamespace(
+            find_by_session=lambda **_kwargs: SimpleNamespace(
+                request="请继续处理导航数据",
+            )
+        )
+    )
+    middleware = NavigationToolSurfaceMiddleware(
+        services=services,
+        web_session_id="web-session-1",
+        agentscope_session_id="agentscope-session-1",
+        cancellation=None,
+    )
+    model = ScriptedChatModel()
+    model.enqueue_tool("recovery_tool", {})
+    # A second model call would attempt another tool.  The system-owned
+    # disposition must terminate before this response is consumed.
+    model.enqueue_tool("must_not_be_called", {})
+    agent_state.reply_id = ""
+    agent_state.permission_context.mode = PermissionMode.BYPASS
+    record.data.context_config = ContextConfig()
+    record.data.react_config = ReActConfig(max_iters=4)
+    agent = build_agent_with_middlewares(
+        record,
+        model,
+        tools=generic_tools,
+        middlewares=[middleware],
+        state=agent_state,
+    )
+    events = []
+    async for event in agent.reply_stream(
+        UserMsg(name="user", content="继续处理"),
+    ):
+        events.append(event)
+
+    assert len(model.invocations) == 1
+    assert resolver.calls == 2
+    assert (
+        sum(str(event.type).upper() == "REPLY_END" for event in events) == 1
+    ), "|".join(str(event.type) for event in events)
+    final_text = "".join(
+        str(getattr(event, "delta", ""))
+        for event in events
+        if str(event.type).upper() == "TEXT_BLOCK_DELTA"
+    )
+    assert final_text == (
+        "Answer:\n处理未启动，需要运维人员恢复处理环境后再继续。"
+        f"错误参考：{error_ref}。"
+    )
+    assert "/private/" not in final_text
+    assert "processing_runtime_not_configured" not in final_text
+    assert all(
+        getattr(event, "tool_call_name", "") != "must_not_be_called"
+        for event in events
+    )
+
+
+@pytest.mark.asyncio
+async def test_operator_recovery_rejects_later_tool_without_executing_it(
+    monkeypatch,
+    record,
+    generic_tools,
+    agent_state,
+    execution,
+):
+    middleware = _middleware(monkeypatch, SequenceResolver(execution))
+    agent = _agent(record, generic_tools, agent_state, middleware)
+
+    async def recovery_result(**_kwargs):
+        yield ToolResponse(
+            id="failed",
+            content=[
+                TextBlock(
+                    text=(
+                        '{"ok":false,"next_action":'
+                        '"operator_recovery_required",'
+                        '"error_ref":"sk-not-an-annotation-reference"}'
+                    )
+                )
+            ],
+            state=ToolResultState.ERROR,
+        )
+
+    _ = [
+        item
+        async for item in middleware.on_acting(
+            agent,
+            {
+                "tool_call": ToolCallBlock(
+                    id="failed",
+                    name="execution_actions_tool",
+                    input="{}",
+                )
+            },
+            recovery_result,
+        )
+    ]
+    later_calls = 0
+
+    async def must_not_execute(**_kwargs):
+        nonlocal later_calls
+        later_calls += 1
+        yield ToolResponse(id="later", content=[TextBlock(text="unsafe")])
+
+    responses = [
+        item
+        async for item in middleware.on_acting(
+            agent,
+            {
+                "tool_call": ToolCallBlock(
+                    id="later",
+                    name="execution_actions_tool",
+                    input="{}",
+                )
+            },
+            must_not_execute,
+        )
+    ]
+
+    assert later_calls == 0
+    assert responses[-1].state is ToolResultState.ERROR
+    payload = json.loads(responses[-1].content[0].text)
+    assert payload["next_action"] == "operator_recovery_required"
+    assert "error_ref" not in payload
 
 
 @pytest.mark.asyncio

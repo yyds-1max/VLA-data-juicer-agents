@@ -224,6 +224,11 @@ Durable workflow invariants:
 - The current-step tool returns one flat actionable identity. Copy its top-level `plan_id` and
   `step_id` exactly into the matching action tool; never infer or substitute another record ID.
 - When a tool reports that it is running in the background, end the current reply immediately without calling any other tool. In particular, never poll with get_current_plan_step_tool or get_plan_execution_overview_tool; the system will wake the same session automatically with the completion result.
+- When a plan-bound action reports `next_action=operator_recovery_required`, stop immediately
+  and do not retry, replan, inspect unrelated state, or invent a recovery tool. Give exactly one
+  concise `Answer:` based only on the public error code and message: state that processing did
+  not start and operator recovery is required. Do not guess a cause or expose Plan/step/action
+  identities, tool names or arguments, paths, database identifiers, or raw tool output.
 - Treat tool availability as the current system-managed phase boundary; do not use generic shell or file tools, task tools, skills, or MCP workarounds.
 - If a Plan-submission or final task-context tool is absent from the current tool surface, some
   required investigation or guidance is still incomplete. Continue only with the available

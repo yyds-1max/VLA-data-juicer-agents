@@ -25,6 +25,7 @@ from vla_data_juicer_agents.annotation.models import (
     ExpectedJobRevisionRequest,
     FixRuntimeState,
     PostprocessingSpecInput,
+    public_annotation_error_ref,
     RetryPublicationRequest,
     ReturnReviewRequest,
     SegmentRevisionRequest,
@@ -33,11 +34,6 @@ from vla_data_juicer_agents.annotation.models import (
 )
 from vla_data_juicer_agents.annotation.store import AnnotationStore
 from vla_data_juicer_agents.navigation.config import NavigationSettings
-
-
-_PUBLIC_CAPABILITY_ERROR_REF_RE = re.compile(
-    r"^[A-Za-z0-9][A-Za-z0-9_-]{15,127}$",
-)
 
 
 def _public_capability_reason(reason: Any) -> dict[str, str]:
@@ -56,6 +52,8 @@ def _public_capability_reason(reason: Any) -> dict[str, str]:
         "runtime_not_configured",
         "runtime_timeout_not_configured",
         "writer_lock_not_configured",
+        "postprocessing_runtime_not_configured",
+        "fix_runtime_not_configured",
     }:
         code = "processing_runtime_not_configured"
         message = (
@@ -68,11 +66,8 @@ def _public_capability_reason(reason: Any) -> dict[str, str]:
             "The processing runtime has not passed its deployment preflight."
         )
     projected = {"code": code, "message": message}
-    error_ref = reason.get("error_ref")
-    if (
-        isinstance(error_ref, str)
-        and _PUBLIC_CAPABILITY_ERROR_REF_RE.fullmatch(error_ref)
-    ):
+    error_ref = public_annotation_error_ref(reason.get("error_ref"))
+    if error_ref is not None:
         projected["error_ref"] = error_ref
     return projected
 
@@ -292,16 +287,22 @@ class AnnotationApplicationService:
         spec: PostprocessingSpecInput,
         *,
         idempotency_key: str,
+        processing_navigation_task_ref: str | None = None,
     ) -> dict[str, Any]:
         spec_payload = spec.model_dump(mode="json")
+        request_payload = {
+            "job_ref": job_ref,
+            "expected_job_revision": expected_job_revision,
+            "spec": spec_payload,
+        }
+        if processing_navigation_task_ref is not None:
+            request_payload["processing_navigation_task_ref"] = (
+                processing_navigation_task_ref
+            )
         replay = self.store.replay_receipt(
             idempotency_key=idempotency_key,
             operation="begin_postprocessing",
-            request_payload={
-                "job_ref": job_ref,
-                "expected_job_revision": expected_job_revision,
-                "spec": spec_payload,
-            },
+            request_payload=request_payload,
         )
         if replay is not None:
             return replay
@@ -314,6 +315,7 @@ class AnnotationApplicationService:
             expected_job_revision=expected_job_revision,
             spec=spec_payload,
             idempotency_key=idempotency_key,
+            processing_navigation_task_ref=processing_navigation_task_ref,
         )
 
     def complete_postprocessing(
