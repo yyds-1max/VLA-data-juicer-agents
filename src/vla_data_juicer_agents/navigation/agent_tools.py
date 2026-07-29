@@ -251,6 +251,9 @@ def build_navigation_tool_groups(
             finish_processing_planning_tool_names.discard(
                 "submit_finish_processing_plan_tool"
             )
+            finish_processing_planning_tool_names.discard(
+                "get_navigation_task_context_tool"
+            )
         if (
             not annotation_ready
             and observation is not None

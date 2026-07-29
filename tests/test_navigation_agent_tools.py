@@ -625,6 +625,7 @@ def test_explicit_postprocessing_planning_surface_hides_ingestion_tools(
         tool.name for tool in planning.flatten_active_tools()
     } == FINISH_PROCESSING_PLANNING_TOOL_NAMES - {
         "submit_finish_processing_plan_tool",
+        "get_navigation_task_context_tool",
     }
     assert {
         "inspect_navigation_raw_metadata_tool",
@@ -662,7 +663,10 @@ def test_explicit_postprocessing_without_scene_mode_exposes_guidance_tool(
         tool.name for tool in planning.flatten_active_tools()
     } == (
         FINISH_PROCESSING_PLANNING_TOOL_NAMES
-        - {"submit_finish_processing_plan_tool"}
+        - {
+            "submit_finish_processing_plan_tool",
+            "get_navigation_task_context_tool",
+        }
     ) | {
         "record_navigation_user_guidance_tool",
     }
