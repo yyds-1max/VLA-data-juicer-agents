@@ -122,6 +122,48 @@ changes; `run_web.sh` builds the installed dependency tree but does not install
 packages. The shadcn MCP and shadcn CLI are local development aids and are not
 installed or executed on the server.
 
+For a persistent server deployment, `run_web.sh` automatically reads the one
+fixed configuration file:
+
+```text
+~/.config/vla-data-juicer-agents/run-web.json
+```
+
+The application directory must be a real directory owned by the service user
+with mode `0700`; `run-web.json` must be a real, single-link regular file owned
+by that user with mode `0600`. The file is strict JSON, not a shell fragment:
+
+```json
+{
+  "WORKING_DIR": "/srv/datapilot/state",
+  "VLA_DATA_AGENT_WEB_WORKING_DIR": "/srv/datapilot/state",
+  "VLA_FRONTEND_NODE_BIN_DIR": "/home/service/.nvm/versions/node/v24.18.0/bin",
+  "VLA_ANNOTATION_WORK_ROOT": "/srv/datapilot/annotation-work",
+  "VLA_NAVIGATION_ODOM_V1_SOURCE": "/srv/datapilot/runtime/navigation_odom_v1/source",
+  "VLA_NAVIGATION_ODOM_V1_MANIFEST": "/srv/datapilot/app/runtime/navigation_odom_v1/manifest.json",
+  "VLA_NAVIGATION_WRITER_LOCK_PATH": "/srv/datapilot/locks/navigation-writer.lock",
+  "VLA_VLADATASETS_ROOT": "/srv/vla-datasets"
+}
+```
+
+Only the documented Web paths, the fixed frontend Node directory, and the
+non-secret Annotation Runtime variables are accepted. Unknown keys, duplicate
+JSON keys, symlinks, hardlinks, unsafe permissions, and oversized files make
+startup fail closed. The script never `source`s or `eval`s this file and does
+not accept an alternate configuration path. Explicit variables already
+present in the calling environment take precedence over matching JSON keys.
+`DASHSCOPE_API_KEY` is intentionally not accepted in this file; it must be
+inherited from the calling shell or injected by the deployment's credential
+manager.
+
+Treat `STATE_DIR`, `PID_FILE`, `LOG_DIR`, `LOG_FILE`, and `WORKING_DIR` as
+immutable while the service is running. Stop the service with the existing
+configuration before changing those values, otherwise the new configuration
+cannot safely identify the old process. An invalid or unsafe configuration
+intentionally blocks every action, including `status`, `logs`, and `stop`;
+repair the JSON or its ownership/permissions first, then rerun the control
+command.
+
 The default server URL is:
 
 ```text

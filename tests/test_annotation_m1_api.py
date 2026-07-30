@@ -2310,15 +2310,15 @@ def test_annotation_request_models_reject_non_integer_revisions(
         )
 
 
-def test_manifest_catalog_exposes_processing_profiles_only():
+def test_manifest_catalog_exposes_all_attested_processing_profiles():
     profiles = CalibrationCatalog.default().list_profiles()
 
     assert [profile["profile_ref"] for profile in profiles] == [
         "20260320",
+        "20260409_U",
         "20260529_go2w",
     ]
     assert all(len(profile["content_sha256"]) == 64 for profile in profiles)
-    assert "20260409_U" not in {profile["profile_ref"] for profile in profiles}
 
 
 def test_calibration_change_during_snapshot_returns_conflict_without_job(

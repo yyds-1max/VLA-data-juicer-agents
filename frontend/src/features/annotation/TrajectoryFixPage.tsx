@@ -27,6 +27,7 @@ import {
   useNavigate,
   useParams,
 } from "react-router-dom";
+import { useStore } from "zustand";
 
 import { ConsoleButton } from "../../components/console/ConsoleButton";
 import { ConsoleCard } from "../../components/console/ConsoleCard";
@@ -63,12 +64,16 @@ import {
   createFixSession,
   decideTrajectoryReview,
   getCalibrationProfiles,
-  getTrajectoryReview,
   getTrajectoryReviewEvidence,
-  listTrajectoryReviews,
   retryReviewPublication,
 } from "./api";
-import { useAnnotationEvents } from "./events";
+import {
+  annotationProjectionStore,
+  cacheTrajectoryReview,
+  loadTrajectoryReview,
+  loadTrajectoryReviews,
+  retainTrajectoryReviewProjection,
+} from "./projectionStore";
 import { trajectoryReviewPresentation } from "./reviewPresentation";
 import type {
   CalibrationProfile,
@@ -260,9 +265,22 @@ function DirtyNavigationGuard({ dirty }: { dirty: boolean }) {
   );
 }
 
-export function TrajectoryFixPage() {
-  const { reviewRef } = useParams<{ reviewRef: string }>();
+function TrajectoryFixWorkbench({
+  reviewRef,
+}: {
+  reviewRef: string | undefined;
+}) {
   const navigate = useNavigate();
+  const projectedReviews = useStore(
+    annotationProjectionStore,
+    (state) => state.reviews,
+  );
+  const projectedReview = useStore(
+    annotationProjectionStore,
+    (state) => reviewRef
+      ? state.reviewDetails[reviewRef] ?? null
+      : null,
+  );
   const [review, setReview] = useState<TrajectoryReview | null>(null);
   const [reviewQueue, setReviewQueue] = useState<TrajectoryReview[]>([]);
   const [reviewQueueError, setReviewQueueError] = useState("");
@@ -283,10 +301,41 @@ export function TrajectoryFixPage() {
   const [decision, setDecision] = useState<Decision>(null);
   const [decisionReason, setDecisionReason] = useState("");
   const reviewStateRef = useRef<TrajectoryReview | null>(null);
+  const initialRefreshCompleteRef = useRef(false);
 
   useEffect(() => {
     reviewStateRef.current = review;
   }, [review]);
+
+  useEffect(
+    () => reviewRef
+      ? retainTrajectoryReviewProjection(reviewRef)
+      : undefined,
+    [reviewRef],
+  );
+
+  useEffect(() => {
+    if (!review) return;
+    const matching = new Map<string, TrajectoryReview>();
+    for (const item of [...projectedReviews, review]) {
+      if (
+        item.dataset_date !== review.dataset_date
+        || item.source_clip !== review.source_clip
+      ) {
+        continue;
+      }
+      const current = matching.get(item.review_ref);
+      if (!current || current.state_revision <= item.state_revision) {
+        matching.set(item.review_ref, item);
+      }
+    }
+    setReviewQueue(
+      [...matching.values()].sort((left, right) => (
+        left.segment_ordinal - right.segment_ordinal
+        || left.review_ref.localeCompare(right.review_ref)
+      )),
+    );
+  }, [projectedReviews, review]);
 
   const loadEvidence = useCallback(async (
     expectedReview?: TrajectoryReview,
@@ -311,11 +360,37 @@ export function TrajectoryFixPage() {
     }
   }, [reviewRef]);
 
-  const refresh = useCallback(async (silent = false) => {
+  useEffect(() => {
+    if (!projectedReview || !initialRefreshCompleteRef.current) return;
+    const current = reviewStateRef.current;
+    if (
+      current
+      && current.review_ref === projectedReview.review_ref
+      && current.state_revision >= projectedReview.state_revision
+    ) {
+      return;
+    }
+    setReview(projectedReview);
+    reviewStateRef.current = projectedReview;
+    setSelectedProfile(
+      projectedReview.fix_draft?.calibration.profile_ref ?? "",
+    );
+    setDifferenceReason(
+      projectedReview.fix_draft?.calibration.difference_reason ?? "",
+    );
+    setError("");
+    void loadEvidence(projectedReview);
+  }, [loadEvidence, projectedReview]);
+
+  const refresh = useCallback(async (
+    silent = false,
+    force = true,
+    includeQueue = true,
+  ) => {
     if (!reviewRef) return;
     if (!silent) setLoading(true);
     const [reviewResult, profilesResult] = await Promise.allSettled([
-      getTrajectoryReview(reviewRef),
+      loadTrajectoryReview(reviewRef, { force }),
       getCalibrationProfiles("fix"),
     ]);
     let nextReview: TrajectoryReview | undefined;
@@ -331,35 +406,44 @@ export function TrajectoryFixPage() {
         owner.fix_draft?.calibration.difference_reason ?? "",
       );
       setError("");
-      try {
-        const queue = await listTrajectoryReviews({
-          datasetDate: owner.dataset_date,
-          sourceClip: owner.source_clip,
-        });
-        const matching = queue
-          .filter((item) => (
-            item.dataset_date === owner.dataset_date
-            && item.source_clip === owner.source_clip
-          ))
-          .sort((left, right) => (
-            left.segment_ordinal - right.segment_ordinal
-            || left.review_ref.localeCompare(right.review_ref)
+      if (includeQueue) {
+        try {
+          const queue = await loadTrajectoryReviews({ force });
+          const matching = queue
+            .filter((item) => (
+              item.dataset_date === owner.dataset_date
+              && item.source_clip === owner.source_clip
+            ))
+            .sort((left, right) => (
+              left.segment_ordinal - right.segment_ordinal
+              || left.review_ref.localeCompare(right.review_ref)
+            ));
+          setReviewQueue(
+            [
+              ...matching.filter((item) => item.review_ref !== owner.review_ref),
+              owner,
+            ].sort((left, right) => (
+              left.segment_ordinal - right.segment_ordinal
+              || left.review_ref.localeCompare(right.review_ref)
+            )),
+          );
+          setReviewQueueError("");
+        } catch (requestError) {
+          setReviewQueue([owner]);
+          setReviewQueueError(safeFixError(
+            requestError,
+            "读取同一外层 clip 的 Segment 队列失败",
           ));
-        setReviewQueue(
+        }
+      } else {
+        setReviewQueue((current) => (
           [
-            ...matching.filter((item) => item.review_ref !== owner.review_ref),
+            ...current.filter((item) => item.review_ref !== owner.review_ref),
             owner,
           ].sort((left, right) => (
             left.segment_ordinal - right.segment_ordinal
             || left.review_ref.localeCompare(right.review_ref)
-          )),
-        );
-        setReviewQueueError("");
-      } catch (requestError) {
-        setReviewQueue([owner]);
-        setReviewQueueError(safeFixError(
-          requestError,
-          "读取同一外层 clip 的 Segment 队列失败",
+          ))
         ));
       }
     } else {
@@ -375,19 +459,13 @@ export function TrajectoryFixPage() {
     } else {
       setEvidence(null);
     }
+    initialRefreshCompleteRef.current = true;
     if (!silent) setLoading(false);
   }, [loadEvidence, reviewRef]);
 
   useEffect(() => {
-    void refresh();
+    void refresh(false, false);
   }, [refresh]);
-
-  useAnnotationEvents({
-    enabled: Boolean(reviewRef),
-    filter: (event) => event.review_ref === reviewRef,
-    onEvent: () => refresh(true),
-    onReconcile: () => refresh(true),
-  });
 
   const projectedEvidence = useMemo(
     () => evidence ? projectTrajectoryReviewEvidence(evidence) : null,
@@ -449,6 +527,7 @@ export function TrajectoryFixPage() {
     [projectedEvidence, targetRef],
   );
   const updateFromResult = useCallback((next: TrajectoryReview) => {
+    cacheTrajectoryReview(next);
     setReview(next);
     reviewStateRef.current = next;
     setConflict(false);
@@ -871,7 +950,9 @@ export function TrajectoryFixPage() {
               variant="primary"
               onClick={async () => {
                 try {
-                  const next = await getTrajectoryReview(review.review_ref);
+                  const next = await loadTrajectoryReview(review.review_ref, {
+                    force: true,
+                  });
                   updateFromResult(next);
                   await loadEvidence(next);
                 } catch (requestError) {
@@ -1291,5 +1372,15 @@ export function TrajectoryFixPage() {
         </AlertDialogContent>
       </AlertDialog>
     </section>
+  );
+}
+
+export function TrajectoryFixPage() {
+  const { reviewRef } = useParams<{ reviewRef: string }>();
+  return (
+    <TrajectoryFixWorkbench
+      key={reviewRef ?? "missing-review"}
+      reviewRef={reviewRef}
+    />
   );
 }

@@ -681,6 +681,7 @@ async def test_navigation_evaluation_host_records_postprocessing_plan_without_io
         "inspect_navigation_calibration_inventory_tool",
         "inspect_navigation_localization_sources_tool",
         "inspect_navigation_gridmap_artifacts_tool",
+        "get_navigation_task_context_tool",
     }
     assert any(
         "submit_finish_processing_plan_tool" in model_call["tools"]

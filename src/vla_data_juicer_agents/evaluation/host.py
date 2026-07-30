@@ -930,7 +930,6 @@ class RecordingNavigationRuntime:
             )
             if not submission_ready:
                 names.discard("submit_finish_processing_plan_tool")
-                names.discard("get_navigation_task_context_tool")
             if (
                 not annotation_ready
                 and "annotation_job_facts" in observation.completed_kinds

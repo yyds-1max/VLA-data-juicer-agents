@@ -3625,6 +3625,54 @@ class AnnotationStore:
                         AND d.lease_expires_at <= ?
                     )
                   )
+                  AND NOT EXISTS (
+                    SELECT 1
+                    FROM workflow_handoffs AS earlier
+                    LEFT JOIN workflow_handoff_processing_links
+                      AS earlier_processing_link
+                      ON earlier_processing_link.handoff_id = earlier.id
+                    JOIN annotation_task_links AS earlier_link
+                      ON (
+                          (
+                              earlier.kind IN (
+                                  'initial_annotation_submitted',
+                                  'tracking_completed',
+                                  'postprocessing_completed',
+                                  'postprocessing_failed'
+                              )
+                              AND earlier_link.id =
+                                  earlier_processing_link.link_id
+                          )
+                          OR
+                          (
+                              earlier.kind IN (
+                                  'fix_revision_submitted',
+                                  'review_returned',
+                                  'review_completed'
+                              )
+                              AND earlier_link.link_kind = 'trajectory_fix'
+                              AND earlier_link.review_id = earlier.review_id
+                          )
+                      )
+                    LEFT JOIN workflow_handoff_deliveries AS earlier_delivery
+                      ON earlier_delivery.handoff_id = earlier.id
+                    WHERE earlier.id < h.id
+                      AND earlier_link.navigation_task_ref =
+                          l.navigation_task_ref
+                      AND earlier.kind IN (
+                          'initial_annotation_submitted',
+                          'tracking_completed',
+                          'postprocessing_completed',
+                          'postprocessing_failed',
+                          'fix_revision_submitted',
+                          'review_returned',
+                          'review_completed'
+                      )
+                      AND (
+                          earlier_delivery.handoff_id IS NULL
+                          OR earlier_delivery.status != 'delivered'
+                      )
+                  )
                 ORDER BY h.id
                 LIMIT 1
                 """,

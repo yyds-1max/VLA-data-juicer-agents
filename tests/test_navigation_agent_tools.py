@@ -625,7 +625,6 @@ def test_explicit_postprocessing_planning_surface_hides_ingestion_tools(
         tool.name for tool in planning.flatten_active_tools()
     } == FINISH_PROCESSING_PLANNING_TOOL_NAMES - {
         "submit_finish_processing_plan_tool",
-        "get_navigation_task_context_tool",
     }
     assert {
         "inspect_navigation_raw_metadata_tool",
@@ -665,11 +664,93 @@ def test_explicit_postprocessing_without_scene_mode_exposes_guidance_tool(
         FINISH_PROCESSING_PLANNING_TOOL_NAMES
         - {
             "submit_finish_processing_plan_tool",
-            "get_navigation_task_context_tool",
         }
     ) | {
         "record_navigation_user_guidance_tool",
     }
+
+
+def test_finish_context_diagnoses_missing_scene_then_refreshes_before_submit(
+    tmp_path,
+):
+    services, task, built = _resolver_services_from_complete(
+        tmp_path,
+        phase="finish_processing",
+    )
+    _set_requested_outcome(services, task.task_id, "postprocessing")
+    _set_scene_mode(services, task.task_id, None)
+    _append_annotation_job_facts(services, task, ready=False)
+
+    before = _surface(services, "as-session-1")
+    assert before is not None
+    before_tools = {
+        tool.name: tool for tool in before.flatten_active_tools()
+    }
+    assert "get_navigation_task_context_tool" in before_tools
+    assert "record_navigation_user_guidance_tool" in before_tools
+    assert "submit_finish_processing_plan_tool" not in before_tools
+
+    diagnostic_context = _decode_tool_payload(
+        asyncio.run(before_tools["get_navigation_task_context_tool"]())
+    )
+    assert diagnostic_context["scene_mode"] is None
+    assert {
+        "annotation_job_facts",
+        "artifact_state",
+        "runtime_assets",
+        "calibration_inventory",
+        "localization_sources",
+        "gridmap_artifacts",
+    } <= set(diagnostic_context["observed_kinds"])
+    stale_revision = diagnostic_context["planning_context_revision"]
+
+    guidance_result = _decode_tool_payload(
+        asyncio.run(
+            before_tools["record_navigation_user_guidance_tool"](
+                text="用户确认当前数据为室外场景。",
+                scene_mode="out",
+            )
+        )
+    )
+    assert guidance_result["ok"] is True
+
+    after = _surface(services, "as-session-1")
+    assert after is not None
+    after_tools = {
+        tool.name: tool for tool in after.flatten_active_tools()
+    }
+    assert "get_navigation_task_context_tool" in after_tools
+    assert "submit_finish_processing_plan_tool" in after_tools
+    assert "record_navigation_user_guidance_tool" not in after_tools
+
+    fresh_context = _decode_tool_payload(
+        asyncio.run(after_tools["get_navigation_task_context_tool"]())
+    )
+    assert fresh_context["scene_mode"] == "out"
+    assert fresh_context["planning_context_revision"] != stale_revision
+
+    stale_submission = _decode_tool_payload(
+        asyncio.run(
+            after_tools["submit_finish_processing_plan_tool"](
+                planning_context_revision=stale_revision,
+                plan=valid_finish_plan_payload(built),
+            )
+        )
+    )
+    assert stale_submission["ok"] is False
+    assert stale_submission["error_type"] == "planning_context_mismatch"
+    assert stale_submission["errors"][0]["code"] == (
+        "stale_planning_context_revision"
+    )
+    assert (
+        resolve_navigation_tool_surface(
+            services=services,
+            agentscope_session_id="different-session",
+            web_session_id="different-session",
+            cancellation=None,
+        )
+        is None
+    )
 
 
 @pytest.mark.parametrize(

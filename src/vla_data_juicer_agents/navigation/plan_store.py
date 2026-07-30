@@ -1244,6 +1244,170 @@ class SqliteNavigationPlanRepository:
             )
         return cursor.rowcount == 1
 
+    def resume_waiting_workflow_step(
+        self,
+        plan_id: str,
+        step_id: str,
+        action: str,
+        *,
+        expected_web_session_id: str | None = None,
+        expected_agentscope_session_id: str | None = None,
+    ) -> bool:
+        """Atomically transfer one external workflow from user wait to Runtime."""
+
+        connection = self._connect()
+        try:
+            connection.execute("BEGIN IMMEDIATE")
+            self._authorize_plan_write(
+                connection,
+                plan_id,
+                expected_web_session_id=expected_web_session_id,
+                expected_agentscope_session_id=expected_agentscope_session_id,
+            )
+            row = connection.execute(
+                """
+                SELECT steps.status AS step_status, tasks.status AS task_status,
+                       tasks.task_id
+                FROM navigation_task_steps AS steps
+                JOIN navigation_plans AS plans ON plans.plan_id = steps.plan_id
+                JOIN navigation_tasks AS tasks ON tasks.task_id = steps.task_id
+                WHERE steps.plan_id = ? AND steps.step_id = ?
+                  AND steps.tool_name = ? AND plans.status = 'active'
+                """,
+                (plan_id, step_id, action),
+            ).fetchone()
+            if row is None:
+                connection.rollback()
+                return False
+            if (
+                row["step_status"] == "running"
+                and row["task_status"] == "active"
+            ):
+                connection.commit()
+                return True
+            if (
+                row["step_status"] != "waiting_user"
+                or row["task_status"] not in {"waiting_user", "active"}
+            ):
+                connection.rollback()
+                return False
+            timestamp = utc_now()
+            cursor = connection.execute(
+                """
+                UPDATE navigation_task_steps
+                SET status = 'running', started_at = COALESCE(started_at, ?)
+                WHERE plan_id = ? AND step_id = ? AND tool_name = ?
+                  AND status = 'waiting_user'
+                """,
+                (timestamp, plan_id, step_id, action),
+            )
+            if cursor.rowcount != 1:
+                connection.rollback()
+                return False
+            connection.execute(
+                """
+                UPDATE navigation_tasks
+                SET status = 'active', updated_at = ?,
+                    state_revision = state_revision + 1
+                WHERE task_id = ? AND status IN ('waiting_user', 'active')
+                """,
+                (timestamp, row["task_id"]),
+            )
+            connection.commit()
+            return True
+        except Exception:
+            connection.rollback()
+            raise
+        finally:
+            connection.close()
+
+    def mark_workflow_step_waiting_user(
+        self,
+        plan_id: str,
+        step_id: str,
+        action: str,
+        *,
+        expected_web_session_id: str | None = None,
+        expected_agentscope_session_id: str | None = None,
+    ) -> bool:
+        """Atomically transfer an owned external workflow to a human wait."""
+
+        connection = self._connect()
+        try:
+            connection.execute("BEGIN IMMEDIATE")
+            self._authorize_plan_write(
+                connection,
+                plan_id,
+                expected_web_session_id=expected_web_session_id,
+                expected_agentscope_session_id=expected_agentscope_session_id,
+            )
+            row = connection.execute(
+                """
+                SELECT steps.status AS step_status, tasks.status AS task_status,
+                       tasks.task_id
+                FROM navigation_task_steps AS steps
+                JOIN navigation_plans AS plans ON plans.plan_id = steps.plan_id
+                JOIN navigation_tasks AS tasks ON tasks.task_id = steps.task_id
+                WHERE steps.plan_id = ? AND steps.step_id = ?
+                  AND steps.tool_name = ? AND plans.status = 'active'
+                """,
+                (plan_id, step_id, action),
+            ).fetchone()
+            if row is None:
+                connection.rollback()
+                return False
+            if (
+                row["step_status"] == "waiting_user"
+                and row["task_status"] == "waiting_user"
+            ):
+                connection.commit()
+                return True
+            if (
+                row["step_status"] not in {"pending", "running"}
+                or row["task_status"] not in {"active", "waiting_user"}
+            ):
+                connection.rollback()
+                return False
+            timestamp = utc_now()
+            cursor = connection.execute(
+                """
+                UPDATE navigation_task_steps
+                SET status = 'waiting_user',
+                    started_at = COALESCE(started_at, ?)
+                WHERE plan_id = ? AND step_id = ? AND tool_name = ?
+                  AND status = ?
+                """,
+                (
+                    timestamp,
+                    plan_id,
+                    step_id,
+                    action,
+                    row["step_status"],
+                ),
+            )
+            if cursor.rowcount != 1:
+                connection.rollback()
+                return False
+            task_cursor = connection.execute(
+                """
+                UPDATE navigation_tasks
+                SET status = 'waiting_user', updated_at = ?,
+                    state_revision = state_revision + 1
+                WHERE task_id = ? AND status IN ('active', 'waiting_user')
+                """,
+                (timestamp, row["task_id"]),
+            )
+            if task_cursor.rowcount != 1:
+                connection.rollback()
+                return False
+            connection.commit()
+            return True
+        except Exception:
+            connection.rollback()
+            raise
+        finally:
+            connection.close()
+
     def stage_step_result(
         self,
         plan_id: str,

@@ -28,7 +28,9 @@ import {
   skipAnnotationSegment,
   submitInitialAnnotation,
 } from "../../annotation/api";
+import { AnnotationDomainEventBridge } from "../../annotation/AnnotationDomainEventBridge";
 import type { AnnotationDomainEvent } from "../../annotation/events";
+import { resetAnnotationProjectionStore } from "../../annotation/projectionStore";
 import type { AnnotationJobDetail, AnnotationSegmentDetail } from "../../annotation/types";
 import { resetNavigationDatasetSummaryCache } from "../navigationDatasetSummaryCache";
 import { AnnotationPage } from "./AnnotationPage";
@@ -284,6 +286,7 @@ function datasetFixture(dates: NavigationDateSummary[]): NavigationDatasetSummar
 beforeEach(() => {
   vi.clearAllMocks();
   AnnotationTestEventSource.instances = [];
+  resetAnnotationProjectionStore();
   resetNavigationDatasetSummaryCache();
   apiMocks.getAnnotationCapabilities.mockResolvedValue({
     available: true,
@@ -324,6 +327,118 @@ test("restores a job detail directly from its URL", async () => {
   expect(screen.getByText("20260605_160904")).toBeVisible();
   expect(screen.getByText("20260529_go2w")).toBeVisible();
   expect(apiMocks.getAnnotationJob).toHaveBeenCalledWith(job.job_ref);
+});
+
+test("does not flash the previous job after the URL switches to another job", async () => {
+  const first = jobFixture();
+  const second = jobFixture({
+    job_ref: "job_11111111111111111111111111111111",
+    dataset_date: "20270623",
+    source_clips: ["20260623_145550"],
+  });
+  const secondResponse = deferred<AnnotationJobDetail>();
+  apiMocks.getAnnotationJob.mockImplementation((jobRef) => (
+    jobRef === first.job_ref ? Promise.resolve(first) : secondResponse.promise
+  ));
+  const router = createMemoryRouter([
+    {
+      path: "/annotation/jobs/:jobRef",
+      element: <AnnotationPage />,
+    },
+  ], {
+    initialEntries: [`/annotation/jobs/${first.job_ref}`],
+  });
+
+  render(<RouterProvider router={router} future={{ v7_startTransition: true }} />);
+
+  expect(await screen.findByRole("heading", { name: first.dataset_date })).toBeVisible();
+  await act(async () => {
+    await router.navigate(`/annotation/jobs/${second.job_ref}`);
+  });
+
+  expect(screen.queryByRole("heading", { name: first.dataset_date })).not.toBeInTheDocument();
+  expect(screen.getByRole("heading", { name: "正在读取任务…" })).toBeVisible();
+
+  await act(async () => {
+    secondResponse.resolve(second);
+  });
+  expect(await screen.findByRole("heading", { name: second.dataset_date })).toBeVisible();
+  expect(screen.getByText("20260623_145550")).toBeVisible();
+});
+
+test("keeps the task-list projection across a list-detail-list route round trip", async () => {
+  const tracked = jobFixture({ status: "tracked", state_revision: 8 });
+  apiMocks.listAnnotationJobs.mockResolvedValue([tracked]);
+  apiMocks.getAnnotationJob.mockResolvedValue(tracked);
+  const router = createMemoryRouter([
+    {
+      path: "/annotation/jobs",
+      element: <AnnotationPage />,
+    },
+    {
+      path: "/annotation/jobs/:jobRef",
+      element: <AnnotationPage />,
+    },
+  ], {
+    initialEntries: ["/annotation/jobs"],
+  });
+
+  render(<RouterProvider router={router} future={{ v7_startTransition: true }} />);
+
+  fireEvent.click(await screen.findByRole("button", {
+    name: "查看任务 20270605",
+  }));
+  expect(await screen.findByRole("heading", { name: "Tracking 已完成" })).toBeVisible();
+  fireEvent.click(screen.getByRole("button", { name: "返回自动标注任务列表" }));
+  expect(await screen.findByRole("button", { name: "查看任务 20270605" })).toBeVisible();
+  expect(apiMocks.listAnnotationJobs).toHaveBeenCalledTimes(1);
+});
+
+test("the explicit task refresh bypasses the SPA projection cache", async () => {
+  const tracked = jobFixture({ status: "tracked", state_revision: 8 });
+  apiMocks.listAnnotationJobs.mockResolvedValue([tracked]);
+
+  render(
+    <MemoryRouter
+      initialEntries={["/annotation/jobs"]}
+      future={{ v7_relativeSplatPath: true, v7_startTransition: true }}
+    >
+      <Routes>
+        <Route path="/annotation/jobs" element={<AnnotationPage />} />
+      </Routes>
+    </MemoryRouter>,
+  );
+
+  await screen.findByRole("button", { name: "查看任务 20270605" });
+  expect(apiMocks.listAnnotationJobs).toHaveBeenCalledTimes(1);
+  fireEvent.click(screen.getByRole("button", { name: "刷新标注任务" }));
+  await waitFor(() => expect(apiMocks.listAnnotationJobs).toHaveBeenCalledTimes(2));
+  expect(apiMocks.getAnnotationCapabilities).toHaveBeenCalledTimes(2);
+  expect(apiMocks.getNavigationDatasetSummary).toHaveBeenCalledTimes(2);
+});
+
+test("a simulated full browser reload starts with an empty projection cache", async () => {
+  const tracked = jobFixture({ status: "tracked", state_revision: 8 });
+  apiMocks.listAnnotationJobs.mockResolvedValue([tracked]);
+  const renderJobs = () => render(
+    <MemoryRouter
+      initialEntries={["/annotation/jobs"]}
+      future={{ v7_relativeSplatPath: true, v7_startTransition: true }}
+    >
+      <Routes>
+        <Route path="/annotation/jobs" element={<AnnotationPage />} />
+      </Routes>
+    </MemoryRouter>,
+  );
+
+  const first = renderJobs();
+  await screen.findByRole("button", { name: "查看任务 20270605" });
+  first.unmount();
+  resetAnnotationProjectionStore();
+
+  renderJobs();
+  await screen.findByRole("button", { name: "查看任务 20270605" });
+  expect(apiMocks.listAnnotationJobs).toHaveBeenCalledTimes(2);
 });
 
 test("resolved initial annotations hand control back to DataPilot without a Web Tracking button", async () => {
@@ -1120,6 +1235,7 @@ test("a late stale event refresh cannot hide a newer persisted cancellation", as
       initialEntries={[`/annotation/jobs/${tracking.job_ref}`]}
       future={{ v7_relativeSplatPath: true, v7_startTransition: true }}
     >
+      <AnnotationDomainEventBridge />
       <Routes>
         <Route path="/annotation/jobs/:jobRef" element={<AnnotationPage />} />
       </Routes>
@@ -1221,6 +1337,7 @@ test("a tracked job refreshes into postprocessing when the tab returns to the fo
       initialEntries={[`/annotation/jobs/${tracked.job_ref}`]}
       future={{ v7_relativeSplatPath: true, v7_startTransition: true }}
     >
+      <AnnotationDomainEventBridge />
       <Routes>
         <Route path="/annotation/jobs/:jobRef" element={<AnnotationPage />} />
       </Routes>

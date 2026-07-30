@@ -1257,21 +1257,49 @@ async def test_missing_annotation_job_requires_scene_guidance_before_creation_ha
         "inspect_navigation_gridmap_artifacts_tool",
     ):
         model.enqueue_tool(name, {})
+    context_revisions = {}
+    model.enqueue_tool("get_navigation_task_context_tool", {})
+
+    def record_scene_guidance(messages):
+        context = latest_tool_result_json(messages)
+        context_revisions["before_guidance"] = context[
+            "planning_context_revision"
+        ]
+        assert context["scene_mode"] is None
+        assert {
+            "annotation_job_facts",
+            "artifact_state",
+            "runtime_assets",
+            "calibration_inventory",
+            "localization_sources",
+            "gridmap_artifacts",
+        } <= set(context["observed_kinds"])
+        return {"text": "室外场景", "scene_mode": "out"}
+
     model.enqueue_tool(
         "record_navigation_user_guidance_tool",
-        {"text": "室外场景", "scene_mode": "out"},
+        record_scene_guidance,
     )
     model.enqueue_tool("get_navigation_task_context_tool", {})
-    model.enqueue_tool(
-        "submit_finish_processing_plan_tool",
-        lambda messages: {
-            "planning_context_revision": latest_tool_result_json(messages)[
+
+    def submit_creation_plan(messages):
+        context = latest_tool_result_json(messages)
+        context_revisions["after_guidance"] = context[
+            "planning_context_revision"
+        ]
+        assert context["scene_mode"] == "out"
+        return {
+            "planning_context_revision": context[
                 "planning_context_revision"
             ],
             "plan": _annotation_creation_plan(
                 _evidence_by_kind(services, built.task.task_id)
             ),
-        },
+        }
+
+    model.enqueue_tool(
+        "submit_finish_processing_plan_tool",
+        submit_creation_plan,
     )
     model.enqueue_tool(
         "get_current_plan_step_tool",
@@ -1299,21 +1327,30 @@ async def test_missing_annotation_job_requires_scene_guidance_before_creation_ha
     )
     guidance_names = schema_names(model.invocations[guidance_index].tools)
     assert "record_navigation_user_guidance_tool" in guidance_names
-    assert {
+    assert "get_navigation_task_context_tool" in guidance_names
+    assert "submit_finish_processing_plan_tool" not in guidance_names
+    diagnostic_context_index = _invocation_index_for_tool(
+        model,
         "get_navigation_task_context_tool",
-        "submit_finish_processing_plan_tool",
-    }.isdisjoint(guidance_names)
-    context_index = _invocation_index_for_tool(
+    )
+    assert diagnostic_context_index < guidance_index
+    submission_context_index = _invocation_index_for_tool(
         model,
         "get_navigation_task_context_tool",
         start=guidance_index + 1,
     )
-    context_names = schema_names(model.invocations[context_index].tools)
+    context_names = schema_names(
+        model.invocations[submission_context_index].tools
+    )
     assert {
         "get_navigation_task_context_tool",
         "submit_finish_processing_plan_tool",
     } <= context_names
     assert "record_navigation_user_guidance_tool" not in context_names
+    assert (
+        context_revisions["before_guidance"]
+        != context_revisions["after_guidance"]
+    )
 
     plan = services.plan_store.get_active_for_task(built.task.task_id)
     assert plan is not None

@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import re
 import stat
 from dataclasses import dataclass
 from pathlib import Path
@@ -12,11 +13,15 @@ from vla_data_juicer_agents.annotation.models import (
     AnnotationConflictError,
     AnnotationValidationError,
 )
-from vla_data_juicer_agents.navigation.runtime_manifest import validate_manifest
+from vla_data_juicer_agents.navigation.runtime_manifest import load_manifest
 
 
-_PROCESSING_PROFILES = frozenset({"20260320", "20260529_go2w"})
-_FIX_PROFILES = _PROCESSING_PROFILES | frozenset({"20260409_U"})
+_PROFILE_REF_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{0,99}$")
+_PROFILE_ROOT_ALIAS = "NAVIGATION_ODOM_V1_SOURCE"
+_PROFILE_STAGES = frozenset({"calibration", "fix_calibration"})
+_REQUIRED_SENSOR_FILES = frozenset(
+    {"fisheye_front.json", "r32_rslidar_points.json"}
+)
 
 
 @dataclass(frozen=True)
@@ -35,7 +40,7 @@ class CalibrationProfile:
 
 
 class CalibrationCatalog:
-    """Manifest-backed processing calibration inventory.
+    """Manifest-backed processing and Fix calibration inventories.
 
     Paths remain private.  Public callers receive only a profile ref, display
     label, and an aggregate content hash.
@@ -178,45 +183,71 @@ class CalibrationCatalog:
 
     def _load(self) -> dict[str, dict[str, CalibrationProfile]]:
         try:
-            document = json.loads(self.manifest_path.read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError) as exc:
+            manifest = load_manifest(self.manifest_path)
+        except (RuntimeError, ValueError) as exc:
             raise RuntimeError("unable to read navigation runtime manifest") from exc
-        manifest = validate_manifest(document)
-        grouped: dict[str, dict[str, list[dict[str, Any]]]] = {
-            "processing": {},
-            "fix": {},
-        }
+        grouped: dict[str, list[dict[str, Any]]] = {}
         for entry in manifest["entries"]:
-            if entry["kind"] != "frozen_file" or entry["role"] != "selectable_profile":
+            if entry["role"] != "selectable_profile":
                 continue
-            purposes = {
-                "calibration": ("processing", "fix"),
-                "fix_calibration": ("fix",),
-            }.get(entry["stage"])
-            if purposes is None:
-                continue
-            parts = Path(entry["relative_path"]).parts
-            if len(parts) < 4 or parts[-2] != "sensors":
-                continue
-            profile_ref = parts[-3]
-            for purpose in purposes:
-                expected = (
-                    _PROCESSING_PROFILES
-                    if purpose == "processing"
-                    else _FIX_PROFILES
+            if (
+                entry["kind"] != "frozen_file"
+                or entry["root_alias"] != _PROFILE_ROOT_ALIAS
+                or entry["stage"] not in _PROFILE_STAGES
+            ):
+                raise RuntimeError(
+                    "selectable calibration manifest entry is invalid"
                 )
-                if profile_ref in expected:
-                    grouped[purpose].setdefault(profile_ref, []).append(entry)
-        if set(grouped["processing"]) != _PROCESSING_PROFILES:
-            raise RuntimeError("processing calibration inventory is incomplete")
-        if set(grouped["fix"]) != _FIX_PROFILES:
-            raise RuntimeError("fix calibration inventory is incomplete")
+            parts = Path(entry["relative_path"]).parts
+            if (
+                len(parts) != 5
+                or parts[:2] != ("NoobScenes", "params")
+                or parts[-2] != "sensors"
+                or _PROFILE_REF_RE.fullmatch(parts[-3]) is None
+            ):
+                raise RuntimeError(
+                    "selectable calibration manifest path is invalid"
+                )
+            profile_ref = parts[-3]
+            grouped.setdefault(profile_ref, []).append(entry)
+        if not grouped:
+            raise RuntimeError("calibration inventory is empty")
+        manifest_fingerprints: dict[str, dict[str, dict[str, Any]]] = {}
+        for profile_ref, entries in grouped.items():
+            if len({str(entry["stage"]) for entry in entries}) != 1:
+                raise RuntimeError(
+                    "calibration profile manifest stage is inconsistent"
+                )
+            filenames = {
+                Path(str(entry["relative_path"])).name for entry in entries
+            }
+            if not _REQUIRED_SENSOR_FILES.issubset(filenames):
+                raise RuntimeError(
+                    "calibration profile is missing required sensor files"
+                )
+            if len(filenames) != len(entries):
+                raise RuntimeError(
+                    "calibration profile contains duplicate sensor files"
+                )
+            manifest_fingerprints[profile_ref] = {
+                Path(str(entry["relative_path"])).name: {
+                    "sha256": str(entry["sha256"]),
+                    "size": int(entry["size"]),
+                }
+                for entry in entries
+            }
+        if self.source_root is not None:
+            discovered = self._scan_frozen_profiles()
+            if discovered != manifest_fingerprints:
+                raise RuntimeError(
+                    "calibration directory inventory differs from the frozen manifest"
+                )
         result: dict[str, dict[str, CalibrationProfile]] = {
             "processing": {},
             "fix": {},
         }
-        for purpose, purpose_groups in grouped.items():
-            for profile_ref, entries in purpose_groups.items():
+        for purpose in ("processing", "fix"):
+            for profile_ref, entries in grouped.items():
                 ordered = sorted(entries, key=lambda item: item["relative_path"])
                 file_fingerprints = [
                     {
@@ -234,6 +265,90 @@ class CalibrationCatalog:
                 )
         return result
 
+    def _scan_frozen_profiles(
+        self,
+    ) -> dict[str, dict[str, dict[str, Any]]]:
+        assert self.source_root is not None
+        source_root = self.source_root.absolute()
+        params_root = source_root / "NoobScenes" / "params"
+        _require_real_directory(
+            source_root,
+            error="frozen runtime source is unsafe",
+        )
+        _require_real_directory(
+            source_root / "NoobScenes",
+            error="frozen calibration parent is unsafe",
+        )
+        _require_real_directory(
+            params_root,
+            error="frozen calibration directory is unsafe",
+        )
+        try:
+            children = sorted(params_root.iterdir(), key=lambda item: item.name)
+        except OSError as exc:
+            raise RuntimeError(
+                "unable to scan frozen calibration directory"
+            ) from exc
+        discovered: dict[str, dict[str, dict[str, Any]]] = {}
+        for profile_root in children:
+            if _PROFILE_REF_RE.fullmatch(profile_root.name) is None:
+                raise RuntimeError("frozen calibration profile name is invalid")
+            _require_real_directory(
+                profile_root,
+                error="frozen calibration profile is unsafe",
+            )
+            sensors_root = profile_root / "sensors"
+            _require_real_directory(
+                sensors_root,
+                error="frozen calibration sensors are unsafe",
+            )
+            try:
+                sensor_entries = sorted(
+                    sensors_root.iterdir(),
+                    key=lambda item: item.name,
+                )
+            except OSError as exc:
+                raise RuntimeError(
+                    "unable to scan frozen calibration sensors"
+                ) from exc
+            files: dict[str, dict[str, Any]] = {}
+            for sensor_file in sensor_entries:
+                try:
+                    metadata = sensor_file.lstat()
+                except OSError as exc:
+                    raise RuntimeError(
+                        "unable to inspect frozen calibration file"
+                    ) from exc
+                if (
+                    stat.S_ISLNK(metadata.st_mode)
+                    or not stat.S_ISREG(metadata.st_mode)
+                ):
+                    raise RuntimeError("frozen calibration file is unsafe")
+                try:
+                    content, _mode, _metadata = _read_frozen_regular_file(
+                        sensor_file,
+                        root=source_root,
+                    )
+                except (
+                    AnnotationValidationError,
+                    AnnotationConflictError,
+                ) as exc:
+                    raise RuntimeError(
+                        "frozen calibration file is unsafe"
+                    ) from exc
+                files[sensor_file.name] = {
+                    "sha256": hashlib.sha256(content).hexdigest(),
+                    "size": len(content),
+                }
+            if not _REQUIRED_SENSOR_FILES.issubset(files):
+                raise RuntimeError(
+                    "frozen calibration profile is missing required sensor files"
+                )
+            discovered[profile_root.name] = files
+        if not discovered:
+            raise RuntimeError("frozen calibration inventory is empty")
+        return discovered
+
 
 def _canonical_sha256(value: Any) -> str:
     encoded = json.dumps(
@@ -243,6 +358,21 @@ def _canonical_sha256(value: Any) -> str:
         separators=(",", ":"),
     ).encode("utf-8")
     return hashlib.sha256(encoded).hexdigest()
+
+
+def _require_real_directory(path: Path, *, error: str) -> None:
+    path_lexical = path.absolute()
+    try:
+        metadata = path_lexical.lstat()
+        resolved = path_lexical.resolve(strict=True)
+    except OSError as exc:
+        raise RuntimeError(error) from exc
+    if (
+        stat.S_ISLNK(metadata.st_mode)
+        or not stat.S_ISDIR(metadata.st_mode)
+        or resolved != path_lexical
+    ):
+        raise RuntimeError(error)
 
 
 def _require_regular_file(path: Path, *, root: Path) -> None:

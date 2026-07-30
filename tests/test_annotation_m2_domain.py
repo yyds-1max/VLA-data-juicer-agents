@@ -1143,6 +1143,63 @@ def test_processing_scope_requires_exact_clips_and_uses_job_order(
         assert binding_error.value.code == "annotation_scope_mismatch"
 
 
+def test_workflow_handoffs_do_not_overtake_an_earlier_running_delivery(
+    tmp_path: Path,
+) -> None:
+    store = AnnotationStore(tmp_path / "annotation.sqlite")
+    job = _seed_scope_job(
+        store,
+        tmp_path,
+        job_ref="job_" + "c" * 32,
+        dataset_date="20270703",
+        source_clips=["clip-ordered"],
+        idempotency_key="ordered-handoff-job",
+    )
+    store.link_navigation_task(
+        job_ref=job["job_ref"],
+        review_ref=None,
+        navigation_task_ref="navigation-ordered",
+        parent_navigation_task_ref=None,
+        link_kind="processing",
+        idempotency_key="ordered-handoff-link",
+    )
+    initial = store.create_workflow_handoff(
+        job_ref=job["job_ref"],
+        review_ref=None,
+        kind="initial_annotation_submitted",
+        payload={"status": "submitted"},
+        idempotency_key="ordered-initial-handoff",
+    )
+    tracking = store.create_workflow_handoff(
+        job_ref=job["job_ref"],
+        review_ref=None,
+        kind="tracking_completed",
+        payload={"status": "tracked"},
+        idempotency_key="ordered-tracking-handoff",
+    )
+
+    claimed_initial = store.claim_workflow_handoff_delivery(
+        worker_id="ordered-worker-a",
+    )
+    assert claimed_initial is not None
+    assert claimed_initial["handoff_ref"] == initial["handoff_ref"]
+    assert (
+        store.claim_workflow_handoff_delivery(worker_id="ordered-worker-b")
+        is None
+    )
+
+    store.complete_workflow_handoff_delivery(
+        handoff_id=int(claimed_initial["handoff_id"]),
+        worker_id="ordered-worker-a",
+        success=True,
+    )
+    claimed_tracking = store.claim_workflow_handoff_delivery(
+        worker_id="ordered-worker-b",
+    )
+    assert claimed_tracking is not None
+    assert claimed_tracking["handoff_ref"] == tracking["handoff_ref"]
+
+
 def test_processing_link_blocks_active_run_then_preserves_failed_attempt_lineage(
     tmp_path: Path,
 ) -> None:

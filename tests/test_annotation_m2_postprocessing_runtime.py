@@ -237,6 +237,40 @@ def test_postprocessing_step_mounts_attempt_private_tmp(
     assert (attempt_root / ".runtime" / "tmp").stat().st_mode & 0o777 == 0o700
 
 
+def test_postprocessing_xvfb_starts_after_private_tmp_is_mounted(
+    tmp_path: Path,
+) -> None:
+    runtime_source = tmp_path / "runtime"
+    runtime_source.mkdir()
+    data_env_setup = tmp_path / "data-env.sh"
+    data_env_setup.write_text("", encoding="utf-8")
+    config = replace(
+        _config(tmp_path),
+        runtime_source_root=runtime_source,
+        data_env_setup=data_env_setup,
+    )
+    runtime = NavigationPostprocessingRuntime(config)
+    attempt_root = config.work_root / "jobs" / ("job_" + "a" * 32)  # type: ignore[operator]
+    attempt_root.mkdir(parents=True)
+    private_tmp = attempt_root / ".runtime" / "tmp"
+    private_tmp.mkdir(parents=True)
+
+    command = runtime._sandbox_command(
+        staging_root=attempt_root,
+        argv=(Path("/usr/bin/python3"), Path("/runtime/trajectory.py")),
+        cwd=config.runtime_source_root,  # type: ignore[arg-type]
+        writable_bindings=((private_tmp, Path("/tmp")),),
+    )
+
+    shell = command[2]
+    assert shell.index(str(config.bwrap_path)) < shell.index(
+        str(config.xvfb_run_path)
+    )
+    assert shell.index(f"--bind {private_tmp} /tmp") < shell.index(
+        str(config.xvfb_run_path)
+    )
+
+
 def test_postprocessing_reuses_only_the_attested_m1_staging(
     tmp_path: Path,
 ) -> None:
