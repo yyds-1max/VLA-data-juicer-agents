@@ -1035,13 +1035,29 @@ class AnnotationWorker:
                     with navigation_writer_lock(
                         lock_path=self._writer_lock_path(),
                     ):
-                        return self.postprocessing_publisher.publish(
-                            job_ref=inputs["job_ref"],
-                            run_ref=run["run_ref"],
-                            dataset_date=inputs["dataset_date"],
-                            items=tuple(publication_items),
-                            journal_root=journal_root,
+                        if not self.store.begin_postprocessing_publication(
+                            run_id=run["run_id"],
+                        ):
+                            raise RuntimeExecutionError(
+                                "runtime_cancelled",
+                                "The annotation runtime was cancelled.",
+                            )
+                        publication_result = (
+                            self.postprocessing_publisher.publish(
+                                job_ref=inputs["job_ref"],
+                                run_ref=run["run_ref"],
+                                dataset_date=inputs["dataset_date"],
+                                items=tuple(publication_items),
+                                journal_root=journal_root,
+                            )
                         )
+                        self.store.finish_runtime_step(
+                            run_id=run["run_id"],
+                            safe_step_code="compatibility_publish",
+                            status="succeeded",
+                            return_code=0,
+                        )
+                        return publication_result
 
                 publication = _plain(
                     await asyncio.to_thread(publish_candidates),
@@ -1111,7 +1127,10 @@ class AnnotationWorker:
                             "artifact_sha256": artifact_sha256,
                         }
                     )
-                command_steps = list(runtime_result.get("command_steps", ()))
+                command_steps = [
+                    *runtime_result.get("command_steps", ()),
+                    "compatibility_publish",
+                ]
                 manifest = {
                     "runtime_manifest_sha256": runtime_result[
                         "runtime_manifest_sha256"

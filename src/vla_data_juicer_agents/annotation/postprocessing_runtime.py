@@ -14,7 +14,8 @@ import json
 import os
 from pathlib import Path
 import re
-from typing import Iterator, Literal, Sequence
+import subprocess
+from typing import Callable, Iterator, Literal, Sequence
 
 from vla_data_juicer_agents.annotation.runtime import (
     NavigationAnnotationRuntimeConfig,
@@ -116,6 +117,38 @@ _IDENTITY_RE = re.compile(
     r"^(?:master|other[0-9]+)_[a-z]+_[a-z]+_[a-z]+$",
 )
 _HEX_SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
+_POSTPROCESSING_REQUIRED_DISTRIBUTIONS = frozenset(
+    {
+        "Pillow",
+        "matplotlib",
+        "mmcv",
+        "numpy",
+        "nuscenes-devkit",
+        "open3d",
+        "opencv-python",
+        "pypcd",
+        "pyquaternion",
+        "scipy",
+        "similaritymeasures",
+    }
+)
+
+
+def _legacy_finish_temp_name(dataset_date: str) -> str:
+    """Preserve the temp-root basename consumed by frozen business scripts.
+
+    ``cp_gridmap.py`` derives the dataset date from ``root_data``'s basename
+    instead of accepting it as an explicit argument.  The production shell
+    therefore passes ``<dataset_date>_temp``.  The isolated Runtime must expose
+    the same basename inside its private attempt.
+    """
+
+    if _DATE_RE.fullmatch(dataset_date) is None:
+        raise RuntimeExecutionError(
+            "invalid_runtime_request",
+            "The postprocessing dataset date is invalid.",
+        )
+    return f"{dataset_date}_temp"
 
 
 @dataclass(frozen=True)
@@ -310,7 +343,10 @@ def _validate_gridmap_decision_input(
     private_clip_root: Path,
 ) -> None:
     for segment in request.segments:
-        if request.gridmap_decision == "copy_existing_gridmap":
+        if request.gridmap_decision in {
+            "copy_existing_gridmap",
+            "generate_from_pcd",
+        }:
             grid_map = (
                 private_clip_root
                 / request.dataset_date
@@ -342,6 +378,131 @@ def _validate_gridmap_decision_input(
                 "gridmap_decision_precondition_failed",
                 message,
             )
+
+
+def _gridmap_json_names(path: Path) -> tuple[str, ...]:
+    if not _regular_directory(path):
+        raise RuntimeExecutionError(
+            "postprocess_gridmap_transform_failed",
+            "The gridmap transform input is unavailable.",
+        )
+    try:
+        names = tuple(
+            sorted(
+                child.name
+                for child in path.iterdir()
+                if child.is_file()
+                and not child.is_symlink()
+                and child.suffix == ".json"
+            )
+        )
+    except OSError as exc:
+        raise RuntimeExecutionError(
+            "postprocess_gridmap_transform_failed",
+            "The gridmap transform input cannot be read safely.",
+        ) from exc
+    if not names:
+        raise RuntimeExecutionError(
+            "postprocess_gridmap_transform_failed",
+            "The gridmap transform input is unavailable.",
+        )
+    return names
+
+
+def _prepare_gridmap_transform_targets(
+    *,
+    request: PostprocessingRequest,
+    attempt_root: Path,
+    finish_temp_root: Path,
+    private_clip_root: Path,
+) -> dict[str, tuple[str, ...]]:
+    """Expose an empty destination so an exit-zero no-op cannot look valid.
+
+    The original tracked gridmap remains inside this attempt as private audit
+    evidence.  The frozen ``cp_gridmap.py`` still creates every business
+    output; this wrapper does not calculate or rewrite its numeric values.
+    """
+
+    backup_root = _ensure_private_directory_chain(
+        attempt_root,
+        (".runtime", "gridmap-before-transform"),
+    )
+    expected: dict[str, tuple[str, ...]] = {}
+    for segment in request.segments:
+        source = (
+            private_clip_root
+            / request.dataset_date
+            / segment.source_clip
+            / "sync_data"
+            / segment.private_segment_key
+            / "grid_map"
+        )
+        expected[segment.private_segment_key] = _gridmap_json_names(source)
+        target = (
+            finish_temp_root
+            / "samples"
+            / request.dataset_date
+            / segment.private_segment_key
+            / "grid_map"
+        )
+        if target.exists() or target.is_symlink():
+            if not _regular_directory(target):
+                raise RuntimeExecutionError(
+                    "postprocess_gridmap_transform_failed",
+                    "The gridmap transform destination is unsafe.",
+                )
+            backup = backup_root / segment.segment_ref
+            if backup.exists() or backup.is_symlink():
+                raise RuntimeExecutionError(
+                    "unsafe_runtime_path",
+                    "The gridmap transform backup already exists.",
+                )
+            os.replace(target, backup)
+            _fsync_directory(target.parent)
+            _fsync_directory(backup_root)
+    return expected
+
+
+def _validate_gridmap_transform_outputs(
+    *,
+    request: PostprocessingRequest,
+    finish_temp_root: Path,
+    expected_names: dict[str, tuple[str, ...]],
+) -> None:
+    for segment in request.segments:
+        target = (
+            finish_temp_root
+            / "samples"
+            / request.dataset_date
+            / segment.private_segment_key
+            / "grid_map"
+        )
+        if _gridmap_json_names(target) != expected_names.get(
+            segment.private_segment_key
+        ):
+            raise RuntimeExecutionError(
+                "postprocess_gridmap_transform_failed",
+                "The frozen gridmap transform did not produce its complete output set.",
+            )
+        for name in expected_names[segment.private_segment_key]:
+            try:
+                payload = json.loads(
+                    _read_stable_regular_bytes(target / name).decode("utf-8"),
+                )
+            except (OSError, UnicodeDecodeError, ValueError) as exc:
+                raise RuntimeExecutionError(
+                    "postprocess_gridmap_transform_failed",
+                    "A transformed gridmap output is invalid.",
+                ) from exc
+            if (
+                not isinstance(payload, dict)
+                or not isinstance(payload.get("data"), list)
+                or len(payload["data"]) != 40000
+            ):
+                raise RuntimeExecutionError(
+                    "postprocess_gridmap_transform_failed",
+                    "A transformed gridmap output is invalid.",
+                )
 
 
 def _trajectory_file(segment_root: Path) -> Path:
@@ -424,7 +585,56 @@ class NavigationPostprocessingRuntime(_RuntimeBase):
             ) from exc
         manifest_sha256 = hashlib.sha256(content).hexdigest()
         self._revalidate_postprocessing_inputs(manifest_sha256)
+        self._revalidate_postprocessing_dependencies(manifest_sha256)
         return manifest_sha256
+
+    def _revalidate_postprocessing_dependencies(
+        self,
+        expected_manifest_sha256: str,
+    ) -> None:
+        """Verify dependencies imported by the frozen M2 business scripts."""
+
+        try:
+            content = _read_stable_regular_bytes(self.config.manifest_path)
+            if hashlib.sha256(content).hexdigest() != expected_manifest_sha256:
+                raise ValueError("manifest hash changed")
+            document = json.loads(
+                content.decode("utf-8"),
+                object_pairs_hook=_manifest_object_without_duplicate_keys,
+            )
+            manifest = validate_manifest(document)
+            available = {
+                str(entry["relative_path"]).rsplit("/", 1)[-1]: str(
+                    entry["version"]
+                )
+                for entry in manifest["entries"]
+                if entry.get("kind") == "external_runtime"
+                and entry.get("role")
+                in {"python_package", "python_package_direct_dependency"}
+            }
+            if not _POSTPROCESSING_REQUIRED_DISTRIBUTIONS.issubset(available):
+                raise ValueError(
+                    "postprocessing dependency evidence is incomplete"
+                )
+            expected = {
+                name: available[name]
+                for name in sorted(_POSTPROCESSING_REQUIRED_DISTRIBUTIONS)
+            }
+            actual = self._python_package_versions(tuple(expected))
+            if actual != expected:
+                raise ValueError("postprocessing dependency versions changed")
+        except (
+            KeyError,
+            OSError,
+            RuntimeError,
+            subprocess.SubprocessError,
+            TypeError,
+            ValueError,
+        ) as exc:
+            raise RuntimeExecutionError(
+                "postprocessing_dependency_mismatch",
+                "The frozen M2 Python dependencies failed verification.",
+            ) from exc
 
     def _revalidate_postprocessing_inputs(
         self,
@@ -618,6 +828,7 @@ class NavigationPostprocessingRuntime(_RuntimeBase):
         error_code: str,
         writable_bindings: Sequence[tuple[Path, Path]] = (),
         readonly_bindings: Sequence[tuple[Path, Path]] = (),
+        postcondition: Callable[[], None] | None = None,
     ) -> None:
         with _observed_runtime_step(request.step_observer, safe_step_code):
             self._revalidate_postprocessing_inputs(
@@ -643,6 +854,8 @@ class NavigationPostprocessingRuntime(_RuntimeBase):
                 readonly_bindings=readonly_bindings,
                 error_code=error_code,
             )
+            if postcondition is not None:
+                postcondition()
             self._revalidate_postprocessing_inputs(
                 request.expected_runtime_manifest_sha256
             )
@@ -669,6 +882,12 @@ class NavigationPostprocessingRuntime(_RuntimeBase):
         runtime_manifest_sha256 = self._current_runtime_manifest_sha256(
             request.expected_runtime_manifest_sha256,
         )
+        # A durable run may wait after Application Service preflight.  Verify
+        # the data-Python environment again under the writer lease and before
+        # the attempt directory or any business-script side effect exists.
+        self._revalidate_postprocessing_dependencies(
+            runtime_manifest_sha256,
+        )
         attempt_root = (
             config.work_root
             / "jobs"
@@ -691,7 +910,7 @@ class NavigationPostprocessingRuntime(_RuntimeBase):
             )
         finish_temp_root = _ensure_private_directory_chain(
             attempt_root,
-            ("finish_temp",),
+            (_legacy_finish_temp_name(request.dataset_date),),
         )
         samples_date = _ensure_private_directory_chain(
             finish_temp_root,
@@ -791,6 +1010,11 @@ class NavigationPostprocessingRuntime(_RuntimeBase):
                     writable_bindings=(
                         (private_clip_root, config.legacy_clip_data_root),
                     ),
+                    postcondition=lambda: _validate_gridmap_decision_input(
+                        request=request,
+                        finish_temp_root=finish_temp_root,
+                        private_clip_root=private_clip_root,
+                    ),
                 )
             elif request.gridmap_decision == "copy_existing_gridmap":
                 with _observed_runtime_step(
@@ -864,20 +1088,47 @@ class NavigationPostprocessingRuntime(_RuntimeBase):
                 safe_step_code="postprocess_speed_direction",
                 error_code="postprocess_speed_direction_failed",
             )
-            self._run_step(
-                request=request,
-                attempt_root=attempt_root,
-                argv=[
-                    config.data_python,
-                    config.runtime_source_root / "other_code" / "cp_gridmap.py",
-                    "--root_data",
-                    finish_temp_root,
-                ],
-                cwd=config.runtime_source_root / "other_code",
-                safe_step_code="postprocess_gridmap_transform",
-                error_code="postprocess_gridmap_transform_failed",
-                readonly_bindings=readonly_clip_binding,
-            )
+            if request.gridmap_decision == "skip_if_projection_ready":
+                # This decision attests that the tracked staging already owns
+                # the projection-ready gridmap.  Running cp_gridmap here would
+                # silently reinterpret the decision as "copy from clip_data".
+                with _observed_runtime_step(
+                    request.step_observer,
+                    "postprocess_gridmap_transform",
+                ):
+                    _validate_gridmap_decision_input(
+                        request=request,
+                        finish_temp_root=finish_temp_root,
+                        private_clip_root=private_clip_root,
+                    )
+            else:
+                expected_gridmaps = _prepare_gridmap_transform_targets(
+                    request=request,
+                    attempt_root=attempt_root,
+                    finish_temp_root=finish_temp_root,
+                    private_clip_root=private_clip_root,
+                )
+                self._run_step(
+                    request=request,
+                    attempt_root=attempt_root,
+                    argv=[
+                        config.data_python,
+                        config.runtime_source_root
+                        / "other_code"
+                        / "cp_gridmap.py",
+                        "--root_data",
+                        finish_temp_root,
+                    ],
+                    cwd=config.runtime_source_root / "other_code",
+                    safe_step_code="postprocess_gridmap_transform",
+                    error_code="postprocess_gridmap_transform_failed",
+                    readonly_bindings=readonly_clip_binding,
+                    postcondition=lambda: _validate_gridmap_transform_outputs(
+                        request=request,
+                        finish_temp_root=finish_temp_root,
+                        expected_names=expected_gridmaps,
+                    ),
+                )
             self._run_step(
                 request=request,
                 attempt_root=attempt_root,
@@ -1071,15 +1322,13 @@ class CompatibilityPublisher:
                 "The compatibility finish root is unavailable.",
             )
         date_root = self.finish_data_root / dataset_date
+        date_root_missing = not date_root.exists()
         if date_root.exists():
             if date_root.is_symlink() or not date_root.is_dir():
                 raise RuntimeExecutionError(
                     "publication_target_unsafe",
                     "The compatibility date root is unsafe.",
                 )
-        else:
-            date_root.mkdir(mode=0o750)
-        _fsync_directory(self.finish_data_root)
 
         normalized: list[PublicationItem] = []
         seen: set[str] = set()
@@ -1162,6 +1411,9 @@ class CompatibilityPublisher:
         _write_journal(journal_path, journal)
         committed: list[str] = []
         try:
+            if date_root_missing:
+                date_root.mkdir(mode=0o750)
+                _fsync_directory(self.finish_data_root)
             # Stage every missing clip before committing any of them.  A
             # changed candidate or a copy failure therefore cannot leave an
             # earlier clip published.
@@ -1233,6 +1485,18 @@ class CompatibilityPublisher:
                         )
                     os.replace(temporary, target)
                     _fsync_directory(date_root)
+                if (
+                    not _regular_directory(target)
+                    or _tree_sha256(
+                        target,
+                        unsafe_code="publication_target_unsafe",
+                    )
+                    != item.expected_tree_sha256
+                ):
+                    raise RuntimeExecutionError(
+                        "publication_recovery_required",
+                        "A compatibility target changed after publication.",
+                    )
                 committed.append(item.source_clip)
                 cast_items = journal["items"]
                 assert isinstance(cast_items, list)
@@ -1246,7 +1510,10 @@ class CompatibilityPublisher:
                 )
                 _write_journal(journal_path, journal)
         except Exception as exc:
-            if isinstance(exc, RuntimeExecutionError):
+            if (
+                isinstance(exc, RuntimeExecutionError)
+                and exc.code == "publication_recovery_required"
+            ):
                 raise
             raise RuntimeExecutionError(
                 "publication_recovery_required",

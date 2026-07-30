@@ -8,6 +8,8 @@
 > 上位路线：`docs/automatic-annotation-roadmap.md`
 > 会话与实时状态返修：
 > `docs/automatic-annotation-m2-session-reliability-plan.md`
+> 后处理隐式运行契约：
+> `docs/automatic-annotation-m2-postprocessing-runtime-contract.md`
 
 ## 1. 目标、原则与边界
 
@@ -255,7 +257,8 @@ Application Service 将规范化决策映射到冻结脚本和精确参数；这
   最后记录 committed；
 - SQLite 无法为多个目录提供单一文件系统事务，因此这里的保证是“全批预检＋单
   clip 原子＋批次 journal 可恢复”，不宣称日期级原子提交；
-- 进程中断后根据 journal 和哈希恢复，不根据目录存在猜测成功；
+- 进程中断后根据 journal 和哈希 fail closed，不根据目录存在猜测成功；当前
+  自动 reconcile 尚未实现，M2 冻结前必须补齐自动或明确的停机运维恢复路径；
 - TrajectoryRevision 只引用已提交的 immutable manifest；
 - `annotated` 只在所有非 skipped segments 完成发布后成立；
 - 部分成功保持可恢复的失败状态，不投影为整批已标注。
@@ -699,3 +702,43 @@ postprocessing Runtime 未装配。本轮返修：
 服务器下一步必须先停机备份并执行 Annotation v5 → v6 离线迁移，再验证 M2
 stage-specific preflight，最后用新的 DataPilot 会话继续 `20270623` 验收。旧
 失败 Navigation task 与 link 只保留为审计事实，不得删除或改写。
+
+## 16. 后处理隐式运行契约加固（2026-07-30）
+
+`20270623` 的第二轮真实后处理在 `cp_gridmap.py` 阶段停止。只读调查确认前序
+投影、世界坐标、速度和方向均已完成，根因不是 sandbox 本身，而是 wrapper
+把日期临时根命名为 `finish_temp`；冻结脚本通过目录 basename 推导日期，因而
+错误查找 `samples/finish`。本轮对整条冻结后处理链重新盘点，权威结果见
+`docs/automatic-annotation-m2-postprocessing-runtime-contract.md`。
+
+本地已完成：
+
+- 日期临时根恢复为冻结脚本所需的 `${dataset_date}_temp`；
+- 固化 projection、img2world、speed/direction、条件
+  `cp_gridmap`、trajectory_0525 和 `3_move_dir` 的顺序、cwd、参数及私有
+  legacy overlay；
+- `generate_from_pcd` 退出后重新验证私有 gridmap；
+- `skip_if_projection_ready` 不再错误运行 `cp_gridmap.py`；
+- `cp_gridmap.py` 面对空目标生成结果，并要求输出 JSON 文件集合完整且
+  `data` 长度为 40000，退出 0 的静默失败不能继续进入 trajectory；
+- M2 Python 依赖在建任务 preflight 和 writer 真正执行前各验证一次；
+- 增加数据库原子 publication fence：取消与正式发布只能有一个先取得权威；
+- journal 持久化后的失败统一进入恢复门禁，rename 后复验完整外层 clip hash；
+- candidate 预检失败时不提前创建正式日期空目录；
+- 文档明确区分 semantic step ledger 与尚未实现的安全化 invocation ledger，
+  不再把静态 `command_steps` 说成完整命令事实。
+
+本地门禁：
+
+- 后处理 Runtime 与领域专项：`55 passed`；
+- Python 全量：`1702 passed`；
+- compileall 与 `git diff --check`：通过。
+
+本轮没有执行冻结业务脚本或服务器 writer。仍需在再次处理真实数据前完成：
+
+- 部署后 M2 stage-specific preflight；
+- `20260623 / 145550` byte-identical tracked 输入严格 Golden；
+- 真实 `20270623` AnnotationJob 端到端重跑；
+- 缺 gridmap 副本的 `generate_from_pcd` writer 验收；
+- publication journal 中断恢复验收；
+- 安全化 actual invocation ledger，或在 Golden 中提供等价的私有调用证明。
