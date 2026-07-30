@@ -93,8 +93,20 @@ class CalibrationDecision(DecisionBase):
                 raise ValueError(
                     "annotation_snapshot calibration does not request confirmation"
                 )
-        elif not isinstance(self.selected_sensor_source, str) or not (
-            self.selected_sensor_source.strip()
+        elif (
+            self.mode == "selected_profile"
+            and self.requires_user_confirmation
+            and self.selected_sensor_source is None
+        ):
+            # A new Annotation Job deliberately defers the authoritative
+            # profile choice to the plan-bound structured interaction.  The
+            # cross-field validator requires that interaction to be present;
+            # downstream execution consumes its durable decision rather than
+            # a model-authored default.
+            pass
+        elif (
+            not isinstance(self.selected_sensor_source, str)
+            or not self.selected_sensor_source.strip()
         ):
             raise ValueError("selected calibration source must be non-empty")
         return self

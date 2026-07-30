@@ -517,6 +517,21 @@ def test_selected_calibration_profile_still_requires_confirmation():
     assert "calibration_confirmation_required" in issue_codes(report)
 
 
+def test_selected_calibration_profile_can_defer_to_structured_confirmation():
+    payload = valid_finish_plan_payload()
+    payload["decisions"]["calibration"].update(
+        {
+            "mode": "selected_profile",
+            "selected_sensor_source": None,
+            "requires_user_confirmation": True,
+        }
+    )
+
+    report = validate_finish(payload)
+
+    assert report.ok is True
+
+
 def test_incomplete_finish_pipeline_is_rejected_when_final_outputs_are_absent():
     payload = valid_finish_plan_payload()
     payload["steps"] = [

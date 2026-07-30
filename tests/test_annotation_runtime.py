@@ -1558,6 +1558,62 @@ def test_runtime_command_uses_the_approved_timeout(
 
     assert observed["timeout_seconds"] == 300
     assert isinstance(observed["command"], list)
+    command_tmp_parent = config.work_root / ".runtime-command-tmp"
+    assert command_tmp_parent.is_dir()
+    assert list(command_tmp_parent.iterdir()) == []
+    assert not (staging / ".runtime" / "tmp").exists()
+
+
+def test_runtime_command_removes_xvfb_special_files_from_command_private_tmp(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = _config(tmp_path)
+    adapter = NavigationAnnotationRuntimeAdapter(config)
+    assert config.work_root is not None
+    assert config.runtime_source_root is not None
+    staging = (
+        config.work_root
+        / "jobs"
+        / ("job_" + "9" * 32)
+        / "attempts"
+        / ("run_" + "8" * 32)
+        / "20270605_temp"
+    )
+    staging.mkdir(parents=True)
+    observed_tmp: Path | None = None
+    original_sandbox_command = adapter._sandbox_command
+
+    def sandbox_with_x11_socket(**kwargs):
+        nonlocal observed_tmp
+        observed_tmp = kwargs["private_tmp_root"]
+        x11_root = observed_tmp / ".X11-unix"
+        x11_root.mkdir()
+        os.mkfifo(x11_root / "X99")
+        (observed_tmp / ".X99-lock").write_text("99", encoding="utf-8")
+        return original_sandbox_command(**kwargs)
+
+    monkeypatch.setattr(adapter, "_sandbox_command", sandbox_with_x11_socket)
+    monkeypatch.setattr(
+        runtime_module,
+        "run_command",
+        lambda *_args, **_kwargs: SimpleNamespace(
+            return_code=0,
+            stdout="",
+            stderr="",
+        ),
+    )
+
+    adapter._run_checked(
+        staging_root=staging,
+        argv=["/bin/true"],
+        cwd=config.runtime_source_root,
+        error_code="test_command_failed",
+    )
+
+    assert observed_tmp is not None
+    assert not observed_tmp.exists()
+    assert not (staging / ".runtime" / "tmp").exists()
 
 
 def test_runtime_command_failure_preserves_private_bounded_diagnostics(
@@ -1899,8 +1955,10 @@ def test_sandbox_command_uses_fixed_xvfb_and_read_only_host_root(
     adapter = NavigationAnnotationRuntimeAdapter(config)
     staging = config.work_root / "jobs" / ("job_" + "a" * 32) / "20270605_temp"  # type: ignore[operator]
     staging.mkdir(parents=True)
+    private_tmp = adapter._create_command_private_tmp(staging)
     command = adapter._sandbox_command(
         staging_root=staging,
+        private_tmp_root=private_tmp,
         argv=["./bin/main"],
         cwd=config.runtime_source_root / "1_onnx_tam",  # type: ignore[operator]
     )
@@ -1916,14 +1974,14 @@ def test_sandbox_command_uses_fixed_xvfb_and_read_only_host_root(
     assert shell.index(str(config.bwrap_path)) < shell.index(
         str(config.xvfb_run_path)
     )
-    private_tmp = staging / ".runtime" / "tmp"
     assert f"--bind {private_tmp} /tmp" in shell
+    assert not private_tmp.is_relative_to(staging)
     assert shell.index(f"--bind {private_tmp} /tmp") < shell.index(
         str(config.xvfb_run_path)
     )
 
 
-def test_sandbox_command_keeps_one_explicit_private_tmp_binding(
+def test_sandbox_command_rejects_caller_managed_tmp_binding(
     tmp_path: Path,
 ) -> None:
     config = _config(tmp_path)
@@ -1931,17 +1989,18 @@ def test_sandbox_command_keeps_one_explicit_private_tmp_binding(
     staging = config.work_root / "jobs" / ("job_" + "c" * 32) / "20270605_temp"  # type: ignore[operator]
     explicit_tmp = staging / "postprocess-attempt" / "tmp"
     explicit_tmp.mkdir(parents=True)
+    private_tmp = adapter._create_command_private_tmp(staging)
 
-    command = adapter._sandbox_command(
-        staging_root=staging,
-        argv=["./bin/main"],
-        cwd=config.runtime_source_root / "1_onnx_tam",  # type: ignore[operator]
-        writable_bindings=((explicit_tmp, Path("/tmp")),),
-    )
+    with pytest.raises(RuntimeExecutionError) as error:
+        adapter._sandbox_command(
+            staging_root=staging,
+            private_tmp_root=private_tmp,
+            argv=["./bin/main"],
+            cwd=config.runtime_source_root / "1_onnx_tam",  # type: ignore[operator]
+            writable_bindings=((explicit_tmp, Path("/tmp")),),
+        )
 
-    shell = command[2]
-    assert shell.count(f"--bind {explicit_tmp} /tmp") == 1
-    assert f"--bind {staging / '.runtime' / 'tmp'} /tmp" not in shell
+    assert error.value.code == "unsafe_runtime_path"
 
 
 def test_sandbox_command_creates_legacy_target_only_inside_namespace(
@@ -1961,9 +2020,11 @@ def test_sandbox_command_creates_legacy_target_only_inside_namespace(
     )
     private_data = staging / ".runtime" / "runs" / ("run_" + "c" * 32) / "Data"
     private_data.mkdir(parents=True)
+    private_tmp = adapter._create_command_private_tmp(staging)
 
     command = adapter._sandbox_command(
         staging_root=staging,
+        private_tmp_root=private_tmp,
         argv=["./bin/main"],
         cwd=config.runtime_source_root / "1_onnx_tam",
         writable_bindings=(
@@ -2019,10 +2080,12 @@ def test_sandbox_command_rejects_unregistered_sandbox_only_target(
     )
     private_data = staging / ".runtime" / "runs" / ("run_" + "e" * 32) / "Data"
     private_data.mkdir(parents=True)
+    private_tmp = adapter._create_command_private_tmp(staging)
 
     with pytest.raises(RuntimeExecutionError) as error:
         adapter._sandbox_command(
             staging_root=staging,
+            private_tmp_root=private_tmp,
             argv=["./bin/main"],
             cwd=config.runtime_source_root / "1_onnx_tam",
             sandbox_only_writable_bindings=(
@@ -2051,10 +2114,12 @@ def test_sandbox_command_rejects_configured_but_unfrozen_virtual_target(
     )
     private_data = staging / ".runtime" / "runs" / ("run_" + "1" * 32) / "Data"
     private_data.mkdir(parents=True)
+    private_tmp = adapter._create_command_private_tmp(staging)
 
     with pytest.raises(RuntimeExecutionError) as error:
         adapter._sandbox_command(
             staging_root=staging,
+            private_tmp_root=private_tmp,
             argv=["./bin/main"],
             cwd=config.runtime_source_root / "1_onnx_tam",
             sandbox_only_writable_bindings=(
@@ -2081,10 +2146,12 @@ def test_sandbox_command_rejects_other_binding_under_virtual_root(
     )
     private_data = staging / ".runtime" / "runs" / ("run_" + "3" * 32) / "Data"
     private_data.mkdir(parents=True)
+    private_tmp = adapter._create_command_private_tmp(staging)
 
     with pytest.raises(RuntimeExecutionError) as error:
         adapter._sandbox_command(
             staging_root=staging,
+            private_tmp_root=private_tmp,
             argv=["./bin/main"],
             cwd=config.runtime_source_root / "1_onnx_tam",
             writable_bindings=((private_data, Path("/mnt/other")),),

@@ -834,23 +834,11 @@ class NavigationPostprocessingRuntime(_RuntimeBase):
             self._revalidate_postprocessing_inputs(
                 request.expected_runtime_manifest_sha256
             )
-            # The sandbox root is mounted read-only.  Libraries imported by
-            # the frozen business scripts (notably matplotlib) still require
-            # a writable temporary directory during normal initialization.
-            # Keep that mutable state inside the attempt instead of exposing
-            # the host /tmp or changing the frozen scripts.
-            private_tmp_root = _ensure_private_directory_chain(
-                attempt_root,
-                (".runtime", "tmp"),
-            )
             self._run_checked(
                 staging_root=attempt_root,
                 argv=argv,
                 cwd=cwd,
-                writable_bindings=(
-                    *writable_bindings,
-                    (private_tmp_root, Path("/tmp")),
-                ),
+                writable_bindings=writable_bindings,
                 readonly_bindings=readonly_bindings,
                 error_code=error_code,
             )

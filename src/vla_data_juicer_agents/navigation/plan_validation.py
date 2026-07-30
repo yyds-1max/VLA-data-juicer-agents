@@ -602,7 +602,20 @@ def _validate_finish_references(
                 )
             )
     elif (
-        calibration is not None
+        calibration_decision.selected_sensor_source is None
+        and calibration is not None
+        and not calibration.sensor_sources
+    ):
+        errors.append(
+            _plan_issue(
+                "plan.decisions.calibration.selected_sensor_source",
+                "calibration_inventory_empty",
+                "No observed calibration profile is available for structured selection",
+            )
+        )
+    elif (
+        calibration_decision.selected_sensor_source is not None
+        and calibration is not None
         and calibration_decision.selected_sensor_source not in calibration.sensor_sources
     ):
         errors.append(
