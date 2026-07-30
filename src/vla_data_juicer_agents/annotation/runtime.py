@@ -19,6 +19,7 @@ import shutil
 import shlex
 import stat
 import subprocess
+import tempfile
 import threading
 from typing import Callable, Iterable, Iterator, Sequence
 
@@ -2906,10 +2907,105 @@ class _RuntimeBase:
             )
         return resolved
 
+    def _create_command_private_tmp(self, staging_root: Path) -> Path:
+        config = self.config
+        assert config.work_root is not None
+        staging = self._assert_under(
+            staging_root,
+            config.work_root,
+            label="job staging",
+        )
+        temp_parent = _ensure_private_directory_chain(
+            config.work_root,
+            (".runtime-command-tmp",),
+        )
+        try:
+            private_tmp = Path(
+                tempfile.mkdtemp(
+                    prefix="command-",
+                    dir=temp_parent,
+                )
+            )
+            _set_private_mode(
+                private_tmp,
+                0o700,
+                expect_directory=True,
+                error_code="unsafe_runtime_path",
+                error_message=(
+                    "A command-private Runtime directory could not be secured."
+                ),
+            )
+        except OSError as exc:
+            raise RuntimeExecutionError(
+                "runtime_temp_unavailable",
+                "A command-private Runtime directory could not be created.",
+            ) from exc
+        resolved = self._assert_under(
+            private_tmp,
+            temp_parent,
+            label="command-private temporary directory",
+        )
+        if _paths_overlap(resolved, staging):
+            try:
+                shutil.rmtree(resolved)
+            except OSError:
+                pass
+            raise RuntimeExecutionError(
+                "unsafe_runtime_path",
+                "Command-private temporary state overlaps job artifacts.",
+            )
+        return resolved
+
+    def _remove_command_private_tmp(self, private_tmp: Path) -> None:
+        config = self.config
+        assert config.work_root is not None
+        expected_parent = (
+            config.work_root / ".runtime-command-tmp"
+        ).resolve(strict=True)
+        if (
+            private_tmp.parent != expected_parent
+            or not private_tmp.name.startswith("command-")
+        ):
+            raise RuntimeExecutionError(
+                "runtime_temp_cleanup_failed",
+                "Command-private Runtime cleanup refused an unsafe path.",
+            )
+        try:
+            metadata = private_tmp.lstat()
+        except FileNotFoundError:
+            return
+        except OSError as exc:
+            raise RuntimeExecutionError(
+                "runtime_temp_cleanup_failed",
+                "Command-private Runtime state could not be inspected.",
+            ) from exc
+        if not stat.S_ISDIR(metadata.st_mode) or stat.S_ISLNK(metadata.st_mode):
+            try:
+                private_tmp.unlink()
+            except OSError as exc:
+                raise RuntimeExecutionError(
+                    "runtime_temp_cleanup_failed",
+                    "Unsafe command-private Runtime state could not be removed.",
+                ) from exc
+            raise RuntimeExecutionError(
+                "runtime_temp_cleanup_failed",
+                "Command-private Runtime state changed type during execution.",
+            )
+        try:
+            # The directory contains only command-ephemeral state.  rmtree
+            # unlinks X11 sockets and symlinks without following them.
+            shutil.rmtree(private_tmp)
+        except OSError as exc:
+            raise RuntimeExecutionError(
+                "runtime_temp_cleanup_failed",
+                "Command-private Runtime state could not be removed.",
+            ) from exc
+
     def _sandbox_command(
         self,
         *,
         staging_root: Path,
+        private_tmp_root: Path,
         argv: Sequence[str | Path],
         cwd: Path,
         writable_bindings: Sequence[tuple[Path, Path]] = (),
@@ -2946,18 +3042,26 @@ class _RuntimeBase:
             str(staging),
             str(staging),
         ]
-        effective_writable_bindings = list(writable_bindings)
-        if not any(target == Path("/tmp") for _source, target in writable_bindings):
-            private_tmp_root = _ensure_private_directory_chain(
-                staging,
-                (".runtime", "tmp"),
+        assert config.work_root is not None
+        command_private_tmp = self._assert_under(
+            private_tmp_root,
+            config.work_root / ".runtime-command-tmp",
+            label="command-private temporary directory",
+        )
+        if _paths_overlap(command_private_tmp, staging):
+            raise RuntimeExecutionError(
+                "unsafe_runtime_path",
+                "Command-private temporary state overlaps job artifacts.",
             )
-            effective_writable_bindings.insert(
-                0,
-                (private_tmp_root, Path("/tmp")),
+        if any(target == Path("/tmp") for _source, target in writable_bindings):
+            raise RuntimeExecutionError(
+                "unsafe_runtime_path",
+                "The sandbox /tmp binding is managed by the Runtime.",
             )
-        resolved_writable_bindings: list[tuple[Path, Path]] = []
-        for source, target in effective_writable_bindings:
+        resolved_writable_bindings: list[tuple[Path, Path]] = [
+            (command_private_tmp, Path("/tmp"))
+        ]
+        for source, target in writable_bindings:
             source_resolved = self._assert_under(
                 source,
                 staging,
@@ -3137,32 +3241,37 @@ class _RuntimeBase:
         readonly_bindings: Sequence[tuple[Path, Path]] = (),
         error_code: str,
     ) -> None:
+        private_tmp = self._create_command_private_tmp(staging_root)
         try:
-            record = run_command(
-                self._sandbox_command(
-                    staging_root=staging_root,
-                    argv=argv,
-                    cwd=cwd,
-                    writable_bindings=writable_bindings,
-                    sandbox_only_writable_bindings=(
-                        sandbox_only_writable_bindings
+            try:
+                record = run_command(
+                    self._sandbox_command(
+                        staging_root=staging_root,
+                        private_tmp_root=private_tmp,
+                        argv=argv,
+                        cwd=cwd,
+                        writable_bindings=writable_bindings,
+                        sandbox_only_writable_bindings=(
+                            sandbox_only_writable_bindings
+                        ),
+                        readonly_bindings=readonly_bindings,
                     ),
-                    readonly_bindings=readonly_bindings,
-                ),
-                timeout_seconds=self.config.timeout_seconds,
-            )
-        except subprocess.TimeoutExpired as exc:
-            raise RuntimeExecutionError(
-                "runtime_command_timeout",
-                "A frozen navigation Runtime command timed out.",
-                diagnostic_kind="timeout",
-                private_detail=_private_command_failure_detail(
+                    timeout_seconds=self.config.timeout_seconds,
+                )
+            except subprocess.TimeoutExpired as exc:
+                raise RuntimeExecutionError(
+                    "runtime_command_timeout",
+                    "A frozen navigation Runtime command timed out.",
                     diagnostic_kind="timeout",
-                    return_code=None,
-                    stdout=exc.output,
-                    stderr=exc.stderr,
-                ),
-            ) from exc
+                    private_detail=_private_command_failure_detail(
+                        diagnostic_kind="timeout",
+                        return_code=None,
+                        stdout=exc.output,
+                        stderr=exc.stderr,
+                    ),
+                ) from exc
+        finally:
+            self._remove_command_private_tmp(private_tmp)
         if record.return_code != 0:
             raise RuntimeExecutionError(
                 error_code,

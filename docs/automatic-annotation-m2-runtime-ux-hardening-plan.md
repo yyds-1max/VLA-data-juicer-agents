@@ -56,6 +56,9 @@
 - manifest 的 `calibration` / `fix_calibration` stage 仅记录历史来源，不再作为
   processing / Fix 的用途白名单；所有通过上述扫描和审计的 profile 均可用于
   两种目的；
+- 新 AnnotationJob 的 Plan 只声明 `selected_profile` 和结构化确认步骤，允许在
+  Plan 校验时暂不填写具体 profile；唯一权威选择来自该步骤的持久化人工决定，
+  不先通过自然语言枚举或预选一个全局默认值；
 - processing 与 Fix 各自生成独立的不可变快照。
 
 ### 2.3 Navigation 上下文
@@ -117,12 +120,16 @@ bubblewrap，而后处理 attempt 又把私有目录 bind 到 `/tmp`，因此 sa
 
 ```text
 bubblewrap
-→ bind attempt-private /tmp
+→ bind command-private /tmp（位于业务 staging 之外）
 → sandbox 内启动 xvfb-run
 → 执行冻结脚本
+→ 子进程退出后清理 X11 socket、lock 和其他临时文件
+→ 再检查并冻结业务 staging
 ```
 
-这只修正进程隔离顺序，不修改冻结业务代码。
+命令临时目录由 Runtime 统一创建和清理，调用方不能自行覆盖 `/tmp`。特殊文件
+检查继续覆盖完整业务 staging，不能通过忽略 `.runtime` 或放宽检查掩盖残留。
+这只修正进程隔离和临时状态生命周期，不修改冻结业务代码。
 
 当前 sandbox 的安全边界是“宿主根只读、网络隔离、任务写目录隔离”，不是最小
 读取权限沙盒：冻结 Runtime 仍通过 `--ro-bind / /` 读取宿主文件，设备也通过
@@ -156,7 +163,7 @@ Runtime 兼容性项目验收，不能在本轮暗改业务运行环境。
 ## 5. 本地验证结果
 
 - Python 定向组合：`658 passed`
-- Python 全量：`1749 passed`
+- Python 全量：`1752 passed`
 - 前端全量：`264 passed, 8 skipped`
 - 前端生产构建及 bundle size gate：通过
 - Playwright：`10 passed`

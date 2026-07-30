@@ -212,7 +212,7 @@ def test_postprocessing_command_contract_preserves_frozen_order() -> None:
     )
 
 
-def test_postprocessing_step_mounts_attempt_private_tmp(
+def test_postprocessing_step_delegates_tmp_lifecycle_to_runtime_base(
     tmp_path: Path,
 ) -> None:
     runtime = _RunStepProbeRuntime(_config(tmp_path))
@@ -231,10 +231,8 @@ def test_postprocessing_step_mounts_attempt_private_tmp(
 
     assert len(runtime.checked_calls) == 1
     writable = runtime.checked_calls[0]["writable_bindings"]
-    assert writable == (
-        (attempt_root / ".runtime" / "tmp", Path("/tmp")),
-    )
-    assert (attempt_root / ".runtime" / "tmp").stat().st_mode & 0o777 == 0o700
+    assert writable == ()
+    assert not (attempt_root / ".runtime" / "tmp").exists()
 
 
 def test_postprocessing_xvfb_starts_after_private_tmp_is_mounted(
@@ -252,14 +250,13 @@ def test_postprocessing_xvfb_starts_after_private_tmp_is_mounted(
     runtime = NavigationPostprocessingRuntime(config)
     attempt_root = config.work_root / "jobs" / ("job_" + "a" * 32)  # type: ignore[operator]
     attempt_root.mkdir(parents=True)
-    private_tmp = attempt_root / ".runtime" / "tmp"
-    private_tmp.mkdir(parents=True)
+    private_tmp = runtime._create_command_private_tmp(attempt_root)
 
     command = runtime._sandbox_command(
         staging_root=attempt_root,
+        private_tmp_root=private_tmp,
         argv=(Path("/usr/bin/python3"), Path("/runtime/trajectory.py")),
         cwd=config.runtime_source_root,  # type: ignore[arg-type]
-        writable_bindings=((private_tmp, Path("/tmp")),),
     )
 
     shell = command[2]
@@ -269,6 +266,7 @@ def test_postprocessing_xvfb_starts_after_private_tmp_is_mounted(
     assert shell.index(f"--bind {private_tmp} /tmp") < shell.index(
         str(config.xvfb_run_path)
     )
+    assert not private_tmp.is_relative_to(attempt_root)
 
 
 def test_postprocessing_reuses_only_the_attested_m1_staging(

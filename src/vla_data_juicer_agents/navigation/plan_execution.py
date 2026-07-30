@@ -289,19 +289,27 @@ def resolve_step_arguments(
         }
     if not isinstance(plan, FinishProcessingPlanInput):
         raise ValueError(f"finish-processing action requires a finish plan: {action}")
+    if action == _EXTERNAL_ACTION:
+        # The processing profile is intentionally selected by the durable
+        # structured interaction.  No model-authored source is required to
+        # open that interaction.
+        selected_calibration_source = (
+            confirmed_calibration_source
+            or plan.decisions.calibration.selected_sensor_source
+        )
+        if selected_calibration_source is None:
+            return date_args
+        return {
+            **date_args,
+            "selected_sensor_source": _calibration_source_path(
+                selected_calibration_source,
+                settings,
+            ),
+        }
     selected_calibration_source = (
         confirmed_calibration_source
         or plan.decisions.calibration.selected_sensor_source
     )
-    if action == _EXTERNAL_ACTION:
-        calibration_source = _calibration_source_path(
-            selected_calibration_source,
-            settings,
-        )
-        return {
-            **date_args,
-            "selected_sensor_source": calibration_source,
-        }
     if action == "assemble_finish_temp":
         calibration_source = _calibration_source_path(
             selected_calibration_source,
@@ -389,36 +397,65 @@ def verify_plan_step_preconditions(
             else settings.raw_data_root / task.date
         )
         require_segments(input_root)
-    elif action in {_EXTERNAL_ACTION, "assemble_finish_temp"}:
+    elif action == _EXTERNAL_ACTION:
+        selected_sensor_source = arguments.get("selected_sensor_source")
+        if isinstance(selected_sensor_source, Path):
+            require(selected_sensor_source)
+        else:
+            observation = SqliteNavigationObservationStore(
+                plan_store.db_path,
+                initialize=False,
+            ).get(task.task_id, plan.observation_revision)
+            observed_sources = {
+                source
+                for payload in (
+                    observation.payloads if observation is not None else []
+                )
+                if isinstance(payload, CalibrationInventoryObservation)
+                for source in payload.sensor_sources
+            }
+            available = False
+            for source in observed_sources:
+                try:
+                    source_path = _calibration_source_path(source, settings)
+                except ValueError:
+                    continue
+                if source_path.exists():
+                    available = True
+                    break
+            if not available:
+                missing.append(
+                    Path("accepted_observation:calibration_inventory")
+                )
+    elif action == "assemble_finish_temp":
         sensor_source = Path(arguments["selected_sensor_source"])
         require(sensor_source)
-        if action == "assemble_finish_temp":
-            require(sensor_source / "fisheye_front.json")
-            require(sensor_source / "r32_rslidar_points.json")
-            clip_date_root = settings.clip_data_root / task.date
-            require_segments(clip_date_root, suffix=("sync_data",))
-            segment_names = task.segments or (
-                sorted(path.name for path in clip_date_root.iterdir() if path.is_dir())
-                if clip_date_root.is_dir()
-                else []
-            )
-            for segment_name in segment_names:
-                sync_root = clip_date_root / segment_name / "sync_data"
-                if not sync_root.is_dir():
-                    continue
-                if not any(
-                    all(
-                        child.is_dir()
-                        and any(path.is_file() for path in child.iterdir())
-                        for child in (
-                            sequence / "fisheye_front",
-                            sequence / "r32_rslidar_points",
-                        )
+        require(sensor_source / "fisheye_front.json")
+        require(sensor_source / "r32_rslidar_points.json")
+        clip_date_root = settings.clip_data_root / task.date
+        require_segments(clip_date_root, suffix=("sync_data",))
+        segment_names = task.segments or (
+            sorted(path.name for path in clip_date_root.iterdir() if path.is_dir())
+            if clip_date_root.is_dir()
+            else []
+        )
+        for segment_name in segment_names:
+            sync_root = clip_date_root / segment_name / "sync_data"
+            if not sync_root.is_dir():
+                continue
+            if not any(
+                all(
+                    child.is_dir()
+                    and any(path.is_file() for path in child.iterdir())
+                    for child in (
+                        sequence / "fisheye_front",
+                        sequence / "r32_rslidar_points",
                     )
-                    for sequence in sync_root.iterdir()
-                    if sequence.is_dir()
-                ):
-                    missing.append(sync_root)
+                )
+                for sequence in sync_root.iterdir()
+                if sequence.is_dir()
+            ):
+                missing.append(sync_root)
     elif action == "prepare_gridmap_for_projection":
         observation = SqliteNavigationObservationStore(
             plan_store.db_path,
@@ -588,12 +625,21 @@ def _validate_calibration_inventory(
         if isinstance(payload, CalibrationInventoryObservation)
         for source in payload.sensor_sources
     }
-    try:
-        _calibration_source_path(selected, settings)
-    except ValueError:
+    if selected is None:
+        for candidate in observed:
+            try:
+                _calibration_source_path(candidate, settings)
+            except ValueError:
+                continue
+            return None
         valid = False
     else:
-        valid = selected in observed
+        try:
+            _calibration_source_path(selected, settings)
+        except ValueError:
+            valid = False
+        else:
+            valid = selected in observed
     if valid:
         return None
     return _compact_error(
@@ -1217,6 +1263,17 @@ def submit_plan_human_decision(
     action = decision.get("action")
     selected_sensor_source = decision.get("selected_sensor_source")
     selected_calibration_profile = decision.get("selected_calibration_profile")
+    plan_selected_sensor_source = getattr(
+        getattr(plan.plan.decisions, "calibration", None),
+        "selected_sensor_source",
+        None,
+    )
+    if (
+        action == "confirm"
+        and selected_sensor_source is None
+        and not isinstance(plan_selected_sensor_source, str)
+    ):
+        return False
     if action == "confirm" and selected_sensor_source is not None:
         if (
             not isinstance(selected_sensor_source, str)

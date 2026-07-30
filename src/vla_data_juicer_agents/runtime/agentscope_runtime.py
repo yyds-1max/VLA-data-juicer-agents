@@ -6260,15 +6260,27 @@ def _human_decision_payload_from_tool_call(
             return None
         calibration = getattr(getattr(plan.plan, "decisions", None), "calibration", None)
         selected_source = getattr(calibration, "selected_sensor_source", None)
-        if not isinstance(selected_source, str):
+        if selected_source is not None and not isinstance(selected_source, str):
             return None
+        awaiting_profile_selection = (
+            selected_source is None
+            and getattr(calibration, "mode", None) == "selected_profile"
+            and getattr(calibration, "requires_user_confirmation", False)
+        )
+        if selected_source is None and not awaiting_profile_selection:
+            return None
+        summary = (
+            "请选择本次导航数据处理使用的相机标定参数。"
+            if awaiting_profile_selection
+            else (
+                "请确认本计划选定的相机标定参数："
+                f"{selected_source[:1000]}。确认后将继续执行下一计划步骤。"
+            )
+        )
         payload = {
             "request_id": f"{plan_id}:{step_id}",
             "decision_type": "camera_params",
-            "summary": (
-                "请确认本计划选定的相机标定参数："
-                f"{selected_source[:1000]}。确认后将继续执行下一计划步骤。"
-            ),
+            "summary": summary,
             "plan_id": plan_id,
             "step_id": step_id,
         }
