@@ -56,6 +56,15 @@ class _SnapshotProbeRuntime(_ValidationRuntime):
         return expected_manifest_sha256
 
 
+class _RunStepProbeRuntime(_PreflightRuntime):
+    def __init__(self, config: NavigationAnnotationRuntimeConfig) -> None:
+        super().__init__(config)
+        self.checked_calls: list[dict[str, object]] = []
+
+    def _run_checked(self, **kwargs) -> None:
+        self.checked_calls.append(dict(kwargs))
+
+
 def _config(tmp_path: Path) -> NavigationAnnotationRuntimeConfig:
     work_root = tmp_path / "work"
     clip_root = tmp_path / "clip_data"
@@ -184,6 +193,31 @@ def test_postprocessing_command_contract_preserves_frozen_order() -> None:
     assert "NoobScenes/main_smart_odom.py" not in (
         _POSTPROCESSING_FROZEN_METADATA
     )
+
+
+def test_postprocessing_step_mounts_attempt_private_tmp(
+    tmp_path: Path,
+) -> None:
+    runtime = _RunStepProbeRuntime(_config(tmp_path))
+    request = _request(tmp_path / "request")
+    attempt_root = tmp_path / "attempt"
+    attempt_root.mkdir(mode=0o700)
+
+    runtime._run_step(
+        request=request,
+        attempt_root=attempt_root,
+        argv=(Path("/usr/bin/python3"), Path("/runtime/main.py")),
+        cwd=tmp_path,
+        safe_step_code="postprocess_projection",
+        error_code="postprocess_projection_failed",
+    )
+
+    assert len(runtime.checked_calls) == 1
+    writable = runtime.checked_calls[0]["writable_bindings"]
+    assert writable == (
+        (attempt_root / ".runtime" / "tmp", Path("/tmp")),
+    )
+    assert (attempt_root / ".runtime" / "tmp").stat().st_mode & 0o777 == 0o700
 
 
 def test_postprocessing_reuses_only_the_attested_m1_staging(

@@ -1090,6 +1090,66 @@ class AnnotationStore:
                 for row in rows
             ]
 
+    def public_event_cursor(self) -> int:
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT COALESCE(MAX(seq), 0) AS cursor "
+                "FROM annotation_public_events"
+            ).fetchone()
+            return int(row["cursor"])
+
+    def list_public_events_after(
+        self,
+        *,
+        after_seq: int,
+        limit: int = 200,
+    ) -> list[dict[str, Any]]:
+        if isinstance(after_seq, bool) or not isinstance(after_seq, int) or after_seq < 0:
+            raise ValueError("after_seq must be a non-negative integer")
+        if isinstance(limit, bool) or not isinstance(limit, int) or not 1 <= limit <= 200:
+            raise ValueError("event limit must be between 1 and 200")
+        with self._connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT
+                    seq, event_ref, event_kind, aggregate_kind,
+                    job_ref, segment_ref, review_ref,
+                    state_revision, status, occurred_at
+                FROM annotation_public_events
+                WHERE seq > ?
+                ORDER BY seq
+                LIMIT ?
+                """,
+                (after_seq, limit),
+            ).fetchall()
+            return [
+                {
+                    "seq": int(row["seq"]),
+                    "event_ref": str(row["event_ref"]),
+                    "event_kind": str(row["event_kind"]),
+                    "aggregate_kind": str(row["aggregate_kind"]),
+                    **(
+                        {"job_ref": str(row["job_ref"])}
+                        if row["job_ref"] is not None
+                        else {}
+                    ),
+                    **(
+                        {"segment_ref": str(row["segment_ref"])}
+                        if row["segment_ref"] is not None
+                        else {}
+                    ),
+                    **(
+                        {"review_ref": str(row["review_ref"])}
+                        if row["review_ref"] is not None
+                        else {}
+                    ),
+                    "state_revision": int(row["state_revision"]),
+                    "status": str(row["status"]),
+                    "occurred_at": str(row["occurred_at"]),
+                }
+                for row in rows
+            ]
+
     def get_job(self, job_ref: str) -> dict[str, Any]:
         with self._connect() as connection:
             return self._job_projection(connection, self._job_id(connection, job_ref))
@@ -3424,6 +3484,7 @@ class AnnotationStore:
             "initial_annotation_submitted",
             "tracking_completed",
             "postprocessing_completed",
+            "postprocessing_failed",
             "fix_ready",
             "fix_revision_submitted",
             "review_returned",
@@ -3528,7 +3589,8 @@ class AnnotationStore:
                           h.kind IN (
                               'initial_annotation_submitted',
                               'tracking_completed',
-                              'postprocessing_completed'
+                              'postprocessing_completed',
+                              'postprocessing_failed'
                           )
                           AND l.id = processing_link.link_id
                       )
@@ -3549,6 +3611,7 @@ class AnnotationStore:
                     'initial_annotation_submitted',
                     'tracking_completed',
                     'postprocessing_completed',
+                    'postprocessing_failed',
                     'fix_revision_submitted',
                     'review_returned',
                     'review_completed'
@@ -3730,7 +3793,8 @@ class AnnotationStore:
               AND h.kind IN (
                   'initial_annotation_submitted',
                   'tracking_completed',
-                  'postprocessing_completed'
+                  'postprocessing_completed',
+                  'postprocessing_failed'
               )
               AND existing.handoff_id IS NULL
             """,
@@ -8297,6 +8361,29 @@ class AnnotationStore:
                     """,
                     (timestamp, run["job_id"]),
                 )
+                if run["status"] == "running":
+                    handoff_payload = {
+                        "job_ref": str(job["job_ref"]),
+                        "failure_code": code,
+                        "error_ref": resolved_failure_ref,
+                        "retryable": bool(retryable),
+                    }
+                    _require_safe_handoff_payload(handoff_payload)
+                    connection.execute(
+                        """
+                        INSERT INTO workflow_handoffs (
+                            handoff_ref, job_id, kind, payload_json,
+                            content_sha256, created_at
+                        ) VALUES (?, ?, 'postprocessing_failed', ?, ?, ?)
+                        """,
+                        (
+                            _new_ref("handoff"),
+                            run["job_id"],
+                            _canonical_json(handoff_payload),
+                            _payload_hash(handoff_payload),
+                            timestamp,
+                        ),
+                    )
         connection.execute("DELETE FROM runtime_leases WHERE run_id = ?", (run_id,))
 
     def _insert_manifest(

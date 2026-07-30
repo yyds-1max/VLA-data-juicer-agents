@@ -18,6 +18,7 @@ from vla_data_juicer_agents.navigation.evidence_store import (
 )
 from vla_data_juicer_agents.navigation.plan_execution import (
     complete_annotation_workflow_step,
+    fail_annotation_workflow_step,
 )
 from vla_data_juicer_agents.navigation.plan_store import (
     SqliteNavigationPlanRepository,
@@ -124,6 +125,8 @@ class AnnotationWorkflowCoordinator:
                     action="run_annotation_postprocessing_workflow",
                     status="annotated",
                 )
+            elif kind == "postprocessing_failed":
+                await self._fail_and_wake(handoff)
             elif kind in {
                 "fix_revision_submitted",
                 "review_returned",
@@ -187,6 +190,41 @@ class AnnotationWorkflowCoordinator:
                 if action == "run_annotation_postprocessing_workflow"
                 else "trajectory_review_updated"
             ),
+            dispatch_idempotency_key=(
+                "annotation_workbench_dispatch:"
+                f"{handoff['handoff_ref']}:{task_id}:{handoff['kind']}"
+            ),
+        )
+
+    async def _fail_and_wake(self, handoff: dict[str, Any]) -> None:
+        task_id = str(handoff["navigation_task_ref"])
+        payload = dict(handoff.get("payload") or {})
+        failed = await asyncio.to_thread(
+            fail_annotation_workflow_step,
+            plan_store=self.plan_store,
+            evidence_store=self.evidence_store,
+            navigation_task_id=task_id,
+            action="run_annotation_postprocessing_workflow",
+            failure_code=str(
+                payload.get("failure_code") or "annotation_runtime_failed"
+            ),
+            failure_ref=str(
+                payload.get("error_ref") or "annotation_error_unavailable"
+            ),
+            retryable=bool(payload.get("retryable")),
+        )
+        if not failed:
+            raise RuntimeError("Navigation workflow failure could not be recorded")
+        wake = getattr(
+            self.agentscope_runtime,
+            "wake_navigation_task_from_workbench",
+            None,
+        )
+        if not callable(wake):
+            raise RuntimeError("Navigation workbench wakeup is unavailable")
+        await wake(
+            task_id=task_id,
+            reason="postprocessing_failed",
             dispatch_idempotency_key=(
                 "annotation_workbench_dispatch:"
                 f"{handoff['handoff_ref']}:{task_id}:{handoff['kind']}"

@@ -274,6 +274,20 @@ class AnnotationApplicationService:
     def list_jobs(self) -> dict[str, Any]:
         return {"jobs": self.store.list_jobs()}
 
+    def public_event_cursor(self) -> dict[str, int]:
+        return {"cursor": self.store.public_event_cursor()}
+
+    def list_public_events_after(
+        self,
+        *,
+        after_seq: int,
+        limit: int = 200,
+    ) -> list[dict[str, Any]]:
+        return self.store.list_public_events_after(
+            after_seq=after_seq,
+            limit=limit,
+        )
+
     def get_job(self, job_ref: str) -> dict[str, Any]:
         return self.store.get_job(job_ref)
 

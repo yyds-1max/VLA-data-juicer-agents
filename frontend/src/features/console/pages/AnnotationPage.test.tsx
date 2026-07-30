@@ -28,6 +28,7 @@ import {
   skipAnnotationSegment,
   submitInitialAnnotation,
 } from "../../annotation/api";
+import type { AnnotationDomainEvent } from "../../annotation/events";
 import type { AnnotationJobDetail, AnnotationSegmentDetail } from "../../annotation/types";
 import { resetNavigationDatasetSummaryCache } from "../navigationDatasetSummaryCache";
 import { AnnotationPage } from "./AnnotationPage";
@@ -70,6 +71,7 @@ const apiMocks = vi.mocked({
 });
 
 const nativeRequest = globalThis.Request;
+const nativeEventSource = globalThis.EventSource;
 
 class DataRouterTestRequest {
   readonly url: string;
@@ -91,12 +93,33 @@ class DataRouterTestRequest {
   }
 }
 
+class AnnotationTestEventSource {
+  static instances: AnnotationTestEventSource[] = [];
+
+  onopen: ((event: Event) => unknown) | null = null;
+  onmessage: ((event: MessageEvent<string>) => unknown) | null = null;
+
+  constructor(readonly url: string) {
+    AnnotationTestEventSource.instances.push(this);
+  }
+
+  close() {}
+
+  emit(event: AnnotationDomainEvent) {
+    this.onmessage?.(new MessageEvent("message", {
+      data: JSON.stringify(event),
+    }));
+  }
+}
+
 beforeAll(() => {
   vi.stubGlobal("Request", DataRouterTestRequest as unknown as typeof Request);
+  vi.stubGlobal("EventSource", AnnotationTestEventSource);
 });
 
 afterAll(() => {
   vi.stubGlobal("Request", nativeRequest);
+  vi.stubGlobal("EventSource", nativeEventSource);
 });
 
 function segmentFixture(
@@ -260,6 +283,7 @@ function datasetFixture(dates: NavigationDateSummary[]): NavigationDatasetSummar
 
 beforeEach(() => {
   vi.clearAllMocks();
+  AnnotationTestEventSource.instances = [];
   resetNavigationDatasetSummaryCache();
   apiMocks.getAnnotationCapabilities.mockResolvedValue({
     available: true,
@@ -1074,7 +1098,7 @@ test("a persisted running cancellation is visible and blocks repeated mutations"
   expect(apiMocks.mutateAnnotationJob).not.toHaveBeenCalled();
 });
 
-test("a late stale poll cannot hide a newer persisted cancellation", async () => {
+test("a late stale event refresh cannot hide a newer persisted cancellation", async () => {
   const tracking = jobFixture({
     status: "tracking",
     cancel_requested: false,
@@ -1103,8 +1127,21 @@ test("a late stale poll cannot hide a newer persisted cancellation", async () =>
   );
 
   expect(await screen.findByRole("button", { name: "取消任务" })).toBeVisible();
+  await waitFor(() => expect(AnnotationTestEventSource.instances).toHaveLength(1));
+  act(() => {
+    AnnotationTestEventSource.instances[0].emit({
+      seq: 1,
+      event_ref: "annotation_event_1",
+      event_kind: "annotation.job.changed",
+      aggregate_kind: "job",
+      job_ref: tracking.job_ref,
+      state_revision: 8,
+      status: "tracking",
+      occurred_at: "2026-07-29T00:00:00Z",
+    });
+  });
   await waitFor(() => expect(apiMocks.getAnnotationJob).toHaveBeenCalledTimes(2), {
-    timeout: 4_000,
+    timeout: 1_000,
   });
   fireEvent.click(screen.getByRole("button", { name: "取消任务" }));
   expect(await screen.findByRole("status")).toHaveTextContent("正在取消任务");

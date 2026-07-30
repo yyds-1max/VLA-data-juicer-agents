@@ -1,9 +1,11 @@
 from __future__ import annotations
 
+import asyncio
+import json
 from typing import Annotated, Any
 
-from fastapi import APIRouter, Header, HTTPException, Query
-from fastapi.responses import Response
+from fastapi import APIRouter, Header, HTTPException, Query, Request
+from fastapi.responses import Response, StreamingResponse
 
 from vla_data_juicer_agents.annotation.application import AnnotationApplicationService
 from vla_data_juicer_agents.annotation.models import (
@@ -52,6 +54,78 @@ def create_annotation_router(
                 },
             )
         return _translate(service.list_calibration_profiles, purpose=purpose)
+
+    @router.get("/events/cursor")
+    def public_event_cursor() -> dict[str, int]:
+        return service.public_event_cursor()
+
+    @router.get("/events")
+    async def public_events(
+        request: Request,
+        after_seq: int = Query(default=0, ge=0),
+        last_event_id: str | None = Header(
+            default=None,
+            alias="Last-Event-ID",
+            max_length=32,
+        ),
+    ) -> StreamingResponse:
+        cursor = after_seq
+        if last_event_id is not None:
+            try:
+                resumed_cursor = int(last_event_id, 10)
+            except ValueError as exc:
+                raise HTTPException(
+                    status_code=400,
+                    detail="Last-Event-ID must be a non-negative integer",
+                ) from exc
+            if resumed_cursor < 0:
+                raise HTTPException(
+                    status_code=400,
+                    detail="Last-Event-ID must be a non-negative integer",
+                )
+            cursor = max(cursor, resumed_cursor)
+
+        async def stream():
+            nonlocal cursor
+            loop = asyncio.get_running_loop()
+            heartbeat_at = loop.time() + 15.0
+            yield "retry: 1000\n\n"
+            while True:
+                if await request.is_disconnected():
+                    return
+                events = await asyncio.to_thread(
+                    service.list_public_events_after,
+                    after_seq=cursor,
+                )
+                for event in events:
+                    cursor = int(event["seq"])
+                    payload = json.dumps(
+                        event,
+                        ensure_ascii=False,
+                        sort_keys=True,
+                        separators=(",", ":"),
+                    )
+                    yield (
+                        f"id: {cursor}\n"
+                        "event: annotation\n"
+                        f"data: {payload}\n\n"
+                    )
+                now = loop.time()
+                if now >= heartbeat_at:
+                    yield ": keepalive\n\n"
+                    heartbeat_at = now + 15.0
+                if not events:
+                    await asyncio.sleep(0.25)
+
+        return StreamingResponse(
+            stream(),
+            media_type="text/event-stream",
+            headers={
+                "Cache-Control": "no-cache, no-transform",
+                "Connection": "keep-alive",
+                "X-Accel-Buffering": "no",
+            },
+        )
 
     @router.post("/jobs", status_code=201)
     def create_job(

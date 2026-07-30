@@ -326,6 +326,68 @@ def test_interaction_consumption_is_revision_checked_and_idempotent(tmp_path: Pa
     assert store.get_response_authority(submission.turn.id).producer == "navigation"  # type: ignore[union-attr]
 
 
+def test_interaction_background_continuation_uses_specific_safe_reply(
+    tmp_path: Path,
+) -> None:
+    store, session_id = _v1_store(tmp_path)
+    binding = _binding(store, session_id).binding
+    interaction = store.create_interaction(
+        session_id,
+        task_ref=binding.task_ref,
+        kind="confirmation",
+        blocking=True,
+        risk="low",
+        title="确认标定参数",
+        options=[{"id": "confirm", "label": "确认并继续"}],
+        expected_task_revision=0,
+    )
+    store.consume_interaction(
+        interaction.interaction_id,
+        interaction_revision=1,
+        expected_task_revision=0,
+        idempotency_key="confirm-calibration",
+        option_id="confirm",
+    )
+    submission = store.create_interaction_turn(
+        interaction.interaction_id,
+        content="已选择：确认并继续",
+    )
+    store.bind_conversation_agent_session_to_turn(
+        binding.navigation_session_id,
+        submission.turn.id,
+    )
+    store.append_projected_event_batch(
+        web_session_id=session_id,
+        agentscope_session_id=binding.navigation_session_id,
+        entry_id="interaction-background-start",
+        events=[],
+        raw_event_type="REPLY_START",
+        reply_id="interaction-background-reply",
+    )
+    records = store.append_projected_event_batch(
+        web_session_id=session_id,
+        agentscope_session_id=binding.navigation_session_id,
+        entry_id="interaction-background-end",
+        events=[],
+        raw_event_type="REPLY_END",
+        reply_id="interaction-background-reply",
+    )
+
+    assert [record.type for record in records] == ["final", "turn_state"]
+    detail = store.get_session(session_id)
+    assert detail is not None
+    answers = [
+        message.content
+        for message in detail.messages
+        if message.role == "assistant" and message.turn_id == submission.turn.id
+    ]
+    assert answers == [
+        "已收到你的选择，我会按确认结果继续处理。"
+        "下一次需要你操作时，DataPilot 会在这里提醒你。"
+    ]
+    assert "未能生成可安全展示的回复" not in answers[0]
+
+
 def test_outbox_claim_retry_and_resource_lease_ownership(tmp_path: Path):
     store, session_id = _v1_store(tmp_path)
     binding = _binding(store, session_id).binding

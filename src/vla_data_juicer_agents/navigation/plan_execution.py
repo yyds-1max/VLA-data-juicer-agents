@@ -1378,6 +1378,110 @@ def complete_annotation_workflow_step(
     return True
 
 
+def fail_annotation_workflow_step(
+    *,
+    plan_store: SqliteNavigationPlanRepository,
+    evidence_store: FileNavigationEvidenceStore,
+    navigation_task_id: str,
+    action: str,
+    failure_code: str,
+    failure_ref: str,
+    retryable: bool,
+) -> bool:
+    """Fail one Runtime-owned handoff and release its stale wait state."""
+
+    if action != "run_annotation_postprocessing_workflow":
+        raise ValueError("unsupported failed Annotation workflow action")
+    task_store = SqliteNavigationTaskStore(plan_store.db_path)
+    task = task_store.get_task(navigation_task_id)
+    if task is None:
+        return False
+    plan = plan_store.get_latest_accepted_for_task(navigation_task_id)
+    if plan is None:
+        return False
+    overview = plan_store.get_execution_overview(plan.plan_id)
+    already_failed = any(
+        item.action == action and item.status == "failed"
+        for item in overview.steps
+    )
+    if already_failed:
+        current_task = task_store.get_task(navigation_task_id)
+        if (
+            current_task is not None
+            and current_task.status.value == "waiting_user"
+        ):
+            task_store.update_task_for_session(
+                current_task.task_id,
+                web_session_id=current_task.created_by_web_session_id,
+                agentscope_session_id=current_task.agentscope_session_id,
+                expected_state_revision=current_task.state_revision,
+                status="active",
+            )
+        return True
+    if plan.status != "active":
+        return False
+    current = plan_store.get_current_step(plan.plan_id)
+    if (
+        current is None
+        or current["step"]["action"] != action
+        or current["step"]["status"] not in {"pending", "waiting_user"}
+    ):
+        return False
+    step_id = str(current["step"]["step_id"])
+    payload = {
+        "ok": False,
+        "tool_name": action,
+        "message": "The plan-bound postprocessing Runtime failed.",
+        "details": {
+            "error_type": failure_code,
+            "error_ref": failure_ref,
+            "retryable": bool(retryable),
+            "identity_source": "durable_task_binding",
+        },
+    }
+    try:
+        plan_store.stage_step_result(
+            plan.plan_id,
+            step_id,
+            expected_action=action,
+            target_status="failed",
+            full_result=payload,
+            result_summary=_result_summary(payload),
+            expected_statuses=("pending", "waiting_user"),
+            expected_web_session_id=task.created_by_web_session_id,
+            expected_agentscope_session_id=task.agentscope_session_id,
+        )
+    except RuntimeError:
+        staged = plan_store.get_staged_step_result(plan.plan_id, step_id)
+        if staged is None:
+            return False
+    result = _finalize_staged_result(
+        task=task,
+        plan=plan,
+        step=_plan_step(plan, step_id),
+        plan_store=plan_store,
+        evidence_store=evidence_store,
+        settings=None,
+        expected_web_session_id=task.created_by_web_session_id,
+        expected_agentscope_session_id=task.agentscope_session_id,
+    )
+    if result.get("status") != "failed":
+        return False
+    current_task = task_store.get_task(navigation_task_id)
+    if (
+        current_task is not None
+        and current_task.status.value == "waiting_user"
+    ):
+        task_store.update_task_for_session(
+            current_task.task_id,
+            web_session_id=current_task.created_by_web_session_id,
+            agentscope_session_id=current_task.agentscope_session_id,
+            expected_state_revision=current_task.state_revision,
+            status="active",
+        )
+    return True
+
+
 def build_plan_bound_execution_tools(
     *,
     task: NavigationTask,

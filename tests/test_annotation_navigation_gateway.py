@@ -1121,6 +1121,62 @@ def test_tracking_completion_finalizes_plan_step_and_wakes_navigation(
     assert service.store.completed[-1]["success"] is True
 
 
+def test_postprocessing_failure_fails_plan_step_and_wakes_navigation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    handoff = {
+        "handoff_id": 5,
+        "handoff_ref": "handoff_" + "5" * 32,
+        "kind": "postprocessing_failed",
+        "job_ref": "job_" + "5" * 32,
+        "job_revision": 10,
+        "navigation_task_ref": "nav-task",
+        "payload": {
+            "failure_code": "annotation_runtime_failed",
+            "error_ref": "annotation_error_" + "5" * 32,
+            "retryable": True,
+        },
+    }
+    service = _HandoffService(handoff)
+    runtime = _WakeRuntime()
+    failed: list[dict[str, object]] = []
+
+    def _fail(**kwargs) -> bool:
+        failed.append(dict(kwargs))
+        return True
+
+    monkeypatch.setattr(
+        "vla_data_juicer_agents.annotation.workflow_coordinator."
+        "fail_annotation_workflow_step",
+        _fail,
+    )
+    coordinator = AnnotationWorkflowCoordinator(
+        service=service,
+        agentscope_runtime=runtime,
+        navigation_workspace_root=tmp_path / "navigation",
+    )
+
+    assert asyncio.run(coordinator.process_once()) is True
+
+    assert failed[0]["navigation_task_id"] == "nav-task"
+    assert failed[0]["action"] == "run_annotation_postprocessing_workflow"
+    assert failed[0]["failure_code"] == "annotation_runtime_failed"
+    assert failed[0]["failure_ref"] == "annotation_error_" + "5" * 32
+    assert failed[0]["retryable"] is True
+    assert runtime.wakes == [
+        {
+            "task_id": "nav-task",
+            "reason": "postprocessing_failed",
+            "dispatch_idempotency_key": (
+                "annotation_workbench_dispatch:"
+                f"{handoff['handoff_ref']}:nav-task:postprocessing_failed"
+            ),
+        }
+    ]
+    assert service.store.completed[-1]["success"] is True
+
+
 @pytest.mark.parametrize(
     "kind,payload",
     [

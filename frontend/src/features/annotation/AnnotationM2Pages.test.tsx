@@ -1,5 +1,5 @@
 import "@testing-library/jest-dom/vitest";
-import { fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { act, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import {
   createMemoryRouter,
   MemoryRouter,
@@ -15,6 +15,7 @@ import {
   getTrajectoryReviewEvidence,
   listTrajectoryReviews,
 } from "./api";
+import type { AnnotationDomainEvent } from "./events";
 import { AnnotationReviewsPage } from "./AnnotationReviewsPage";
 import { AnnotationWorkspaceLayout } from "./AnnotationWorkspaceLayout";
 import { TrajectoryFixPage } from "./TrajectoryFixPage";
@@ -42,6 +43,25 @@ const apiMocks = vi.mocked({
   getTrajectoryReviewEvidence,
   listTrajectoryReviews,
 });
+
+class AnnotationTestEventSource {
+  static instances: AnnotationTestEventSource[] = [];
+
+  onopen: ((event: Event) => unknown) | null = null;
+  onmessage: ((event: MessageEvent<string>) => unknown) | null = null;
+
+  constructor(readonly url: string) {
+    AnnotationTestEventSource.instances.push(this);
+  }
+
+  close() {}
+
+  emit(event: AnnotationDomainEvent) {
+    this.onmessage?.(new MessageEvent("message", {
+      data: JSON.stringify(event),
+    }));
+  }
+}
 
 const review: TrajectoryReview = {
   review_ref: "review_0123456789abcdef0123456789abcdef",
@@ -100,8 +120,14 @@ function evidenceFor(owner: TrajectoryReview): TrajectoryReviewEvidence {
 
 beforeEach(() => {
   vi.clearAllMocks();
+  AnnotationTestEventSource.instances = [];
+  vi.stubGlobal("EventSource", AnnotationTestEventSource);
   apiMocks.getCalibrationProfiles.mockResolvedValue([]);
   apiMocks.listTrajectoryReviews.mockResolvedValue([]);
+});
+
+afterEach(() => {
+  vi.unstubAllGlobals();
 });
 
 test("annotation workspace exposes URL-backed workbench and review tabs", async () => {
@@ -373,7 +399,7 @@ test("Fix workbench displays the bound Gridmap PNG with declared dimensions", as
   canvasContext.mockRestore();
 });
 
-test("Fix workbench freezes mutations while a Fix run is active and polls to completion", async () => {
+test("Fix workbench freezes mutations while a Fix run is active and refreshes on completion event", async () => {
   const inProgress: TrajectoryReview = {
     ...review,
     status: "in_progress",
@@ -453,14 +479,29 @@ test("Fix workbench freezes mutations while a Fix run is active and polls to com
   expect(screen.getByRole("button", { name: "提交 Fix 版本" })).toBeDisabled();
   expect(screen.getByRole("button", { name: "通过" })).toBeDisabled();
 
+  await waitFor(() => expect(AnnotationTestEventSource.instances).toHaveLength(1));
+  act(() => {
+    AnnotationTestEventSource.instances[0].emit({
+      seq: 1,
+      event_ref: "annotation_event_fix_completed",
+      event_kind: "annotation.review.changed",
+      aggregate_kind: "review",
+      job_ref: review.job_ref,
+      segment_ref: review.segment_ref,
+      review_ref: review.review_ref,
+      state_revision: completed.state_revision,
+      status: completed.status,
+      occurred_at: "2026-07-29T00:00:00Z",
+    });
+  });
   await waitFor(() => {
     expect(screen.queryByText("Fix 版本正在等待执行")).not.toBeInTheDocument();
     expect(screen.getByLabelText("位置 X")).toBeEnabled();
-  }, { timeout: 3_500 });
+  }, { timeout: 1_000 });
   expect(apiMocks.getTrajectoryReview).toHaveBeenCalledTimes(2);
 });
 
-test("Fix workbench polls an approved publication until it is truly verified", async () => {
+test("Fix workbench refreshes an approved publication event until it is truly verified", async () => {
   const publishing: TrajectoryReview = {
     ...review,
     status: "approved",
@@ -502,10 +543,25 @@ test("Fix workbench polls an approved publication until it is truly verified", a
 
   expect(await screen.findByText("已批准，训练兼容文件正在发布")).toBeVisible();
   expect(screen.getAllByText("已批准/发布中").length).toBeGreaterThan(0);
+  await waitFor(() => expect(AnnotationTestEventSource.instances).toHaveLength(1));
+  act(() => {
+    AnnotationTestEventSource.instances[0].emit({
+      seq: 1,
+      event_ref: "annotation_event_publication_completed",
+      event_kind: "annotation.review.changed",
+      aggregate_kind: "review",
+      job_ref: review.job_ref,
+      segment_ref: review.segment_ref,
+      review_ref: review.review_ref,
+      state_revision: published.state_revision,
+      status: published.status,
+      occurred_at: "2026-07-29T00:00:00Z",
+    });
+  });
   await waitFor(() => {
     expect(screen.queryByText("已批准，训练兼容文件正在发布")).not.toBeInTheDocument();
     expect(screen.getAllByText("已验证").length).toBeGreaterThan(0);
-  }, { timeout: 3_500 });
+  }, { timeout: 1_000 });
   expect(apiMocks.getTrajectoryReview).toHaveBeenCalledTimes(2);
 });
 

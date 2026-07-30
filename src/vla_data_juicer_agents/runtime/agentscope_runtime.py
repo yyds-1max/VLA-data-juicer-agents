@@ -117,6 +117,10 @@ _WORKFLOW_MILESTONE_TEXT = {
     "tracking_started": "首帧标注已全部提交，Tracking 已开始。",
     "tracking_completed": "Tracking 已完成，DataPilot 将继续调查并执行后处理。",
     "postprocessing_completed": "后处理已完成，待人工复核任务已经准备好。",
+    "postprocessing_failed": (
+        "后处理未能完成。DataPilot 已保留任务状态和错误引用，"
+        "将根据失败事实说明下一步。"
+    ),
     "review_updated": "人工复核状态已更新，DataPilot 将继续处理当前任务。",
     "linked_fix_started": "后处理已完成，DataPilot 将继续处理轨迹 Fix。",
 }
@@ -1154,6 +1158,7 @@ class AgentScopeRuntime:
         milestone_code = {
             "initial_annotation_tracking_completed": "tracking_completed",
             "postprocessing_completed": "postprocessing_completed",
+            "postprocessing_failed": "postprocessing_failed",
             "trajectory_review_updated": "review_updated",
             "explicit_postprocessing_and_fix": "linked_fix_started",
         }.get(reason)
@@ -1167,6 +1172,20 @@ class AgentScopeRuntime:
                     else f"navigation_workbench:{task_id}:{reason}"
                 ),
             )
+        if reason == "initial_annotation_tracking_completed":
+            workflow_turn_records = (
+                self.web_session_store.begin_navigation_workflow_turn(
+                    task_id=task_id,
+                    reason=reason,
+                    idempotency_key=(
+                        dispatch_idempotency_key
+                        or f"navigation_workbench:{task_id}:{reason}"
+                    ),
+                )
+            )
+            publish = getattr(self.web_event_bridge, "publish_records", None)
+            if callable(publish) and workflow_turn_records:
+                await publish(binding.web_session_id, list(workflow_turn_records))
         message = HintBlock(
             source="datapilot_workbench",
             hint=(
@@ -4898,6 +4917,17 @@ class AgentScopeRuntime:
             _record_value(turn_record, "origin") == "system"
             or (kind == "navigation" and not isinstance(mapped_turn_id, str))
         )
+        workflow_reason_getter = getattr(
+            self.web_session_store,
+            "get_navigation_workflow_turn_reason",
+            None,
+        )
+        semantic_system_turn = bool(
+            isinstance(mapped_turn_id, str)
+            and _record_value(turn_record, "origin") == "system"
+            and callable(workflow_reason_getter)
+            and workflow_reason_getter(mapped_turn_id) is not None
+        )
         binding = None
         task_ref = None
         task = None
@@ -4973,7 +5003,7 @@ class AgentScopeRuntime:
         for index, event in enumerate(events):
             event_type = str(event.get("type") or "")
             payload = event.get("payload") if isinstance(event.get("payload"), dict) else {}
-            if background_system_turn and event_type in {
+            if background_system_turn and not semantic_system_turn and event_type in {
                 "progress_start",
                 "progress_delta",
                 "progress_end",
@@ -5218,7 +5248,11 @@ class AgentScopeRuntime:
                         enforce_terminal_outcome=not background_system_turn,
                     )
                 status = task.status.value if task is not None else "active"
-                if background_system_turn and status == "active":
+                if (
+                    background_system_turn
+                    and not semantic_system_turn
+                    and status == "active"
+                ):
                     summary = self._task_summary(binding, max_chars=1000) or {
                         "task_ref": task_ref,
                         "status": "active",

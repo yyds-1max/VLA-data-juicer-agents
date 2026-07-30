@@ -47,6 +47,17 @@ def _now() -> str:
 _SAFE_PUBLIC_REPLY_FAILURE = "本轮处理已结束，但未能生成可安全展示的回复。请重试。"
 _BACKGROUND_TURN_REPLY = "任务已转入后台继续处理，完成后会自动通知你。"
 _OPEN_TASK_STATUS_REPLY = "任务状态仍为处理中，后续状态会继续更新。"
+_INTERACTION_CONTINUATION_REPLY = (
+    "已收到你的选择，我会按确认结果继续处理。"
+    "下一次需要你操作时，DataPilot 会在这里提醒你。"
+)
+_NAVIGATION_WORKFLOW_TURN_PREFIX = "navigation_workflow:"
+_NAVIGATION_WORKFLOW_TURN_FALLBACKS = {
+    "initial_annotation_tracking_completed": (
+        "Tracking 已完成。我正在继续检查当前数据并执行后处理，"
+        "后续状态会自动更新。"
+    ),
+}
 _NAVIGATION_DATASET_SELECTION_CONTEXT = "navigation_dataset_selection_v1"
 _MAX_REQUEST_CONTEXT_BYTES = 3_000
 _logger = logging.getLogger(__name__)
@@ -132,6 +143,18 @@ def _open_task_turn_reply(status: str, *, background_tools: int = 0) -> str:
         status,
         _BACKGROUND_TURN_REPLY if background_tools > 0 else _OPEN_TASK_STATUS_REPLY,
     )
+
+
+def _navigation_workflow_reason(invocation_id: object) -> str | None:
+    if not isinstance(invocation_id, str) or not invocation_id.startswith(
+        _NAVIGATION_WORKFLOW_TURN_PREFIX
+    ):
+        return None
+    remainder = invocation_id[len(_NAVIGATION_WORKFLOW_TURN_PREFIX) :]
+    reason, separator, _idempotency_key = remainder.partition(":")
+    if not separator or reason not in _NAVIGATION_WORKFLOW_TURN_FALLBACKS:
+        return None
+    return reason
 
 
 def _normalize_turn_request_context(value: dict[str, Any]) -> dict[str, Any]:
@@ -849,6 +872,141 @@ class WebSessionStore:
                 (turn_id,),
             ).fetchone()
         return self._turn_from_row(row) if row is not None else None
+
+    def get_navigation_workflow_turn_reason(self, turn_id: str) -> str | None:
+        """Return the private semantic boundary attached to a System Turn."""
+
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT invocation_id FROM web_turns WHERE id = ?",
+                (turn_id,),
+            ).fetchone()
+        return (
+            _navigation_workflow_reason(row["invocation_id"])
+            if row is not None
+            else None
+        )
+
+    def begin_navigation_workflow_turn(
+        self,
+        *,
+        task_id: str,
+        reason: str,
+        idempotency_key: str,
+    ) -> tuple[TimelineEventRecord, ...]:
+        """Open one idempotent System Turn for a semantic workflow boundary.
+
+        The turn is created only when no user or interaction turn currently
+        owns response authority. A deterministic milestone remains available
+        when another turn is active.
+        """
+
+        if reason not in _NAVIGATION_WORKFLOW_TURN_FALLBACKS:
+            raise ValueError("unsupported navigation workflow turn reason")
+        if not idempotency_key.strip():
+            raise ValueError("workflow turn idempotency key must not be empty")
+        timestamp = _now()
+        invocation_id = (
+            f"{_NAVIGATION_WORKFLOW_TURN_PREFIX}{reason}:{idempotency_key}"
+        )
+        with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            binding = connection.execute(
+                """
+                SELECT web_session_id, navigation_session_id, slot_state
+                FROM conversation_task_bindings
+                WHERE task_id = ?
+                """,
+                (task_id,),
+            ).fetchone()
+            if binding is None:
+                raise KeyError(task_id)
+            if binding["slot_state"] != "open":
+                return ()
+            existing = connection.execute(
+                """
+                SELECT id FROM web_turns
+                WHERE web_session_id = ? AND invocation_id = ?
+                """,
+                (binding["web_session_id"], invocation_id),
+            ).fetchone()
+            if existing is not None:
+                return ()
+            if connection.execute(
+                """
+                SELECT 1 FROM web_turns
+                WHERE web_session_id = ? AND status IN ('running', 'waiting')
+                """,
+                (binding["web_session_id"],),
+            ).fetchone() is not None:
+                return ()
+            navigation = connection.execute(
+                """
+                SELECT agent_role FROM conversation_agent_sessions
+                WHERE web_session_id = ? AND task_id = ?
+                  AND agentscope_session_id = ?
+                """,
+                (
+                    binding["web_session_id"],
+                    task_id,
+                    binding["navigation_session_id"],
+                ),
+            ).fetchone()
+            if navigation is None or navigation["agent_role"] != "navigation":
+                raise RuntimeError("navigation workflow session is unavailable")
+            turn_id = f"turn_{uuid4().hex}"
+            connection.execute(
+                """
+                INSERT INTO web_turns (
+                    id, web_session_id, invocation_id, origin, status, started_at,
+                    finished_at, final_message_id
+                ) VALUES (?, ?, ?, 'system', 'running', ?, NULL, NULL)
+                """,
+                (
+                    turn_id,
+                    binding["web_session_id"],
+                    invocation_id,
+                    timestamp,
+                ),
+            )
+            self._insert_response_authority(
+                connection,
+                turn_id=turn_id,
+                producer="navigation",
+                timestamp=timestamp,
+            )
+            connection.execute(
+                """
+                UPDATE conversation_agent_sessions
+                SET active_turn_id = ?, updated_at = ?
+                WHERE web_session_id = ? AND task_id = ?
+                  AND agentscope_session_id = ?
+                """,
+                (
+                    turn_id,
+                    timestamp,
+                    binding["web_session_id"],
+                    task_id,
+                    binding["navigation_session_id"],
+                ),
+            )
+            event = self._insert_timeline_event(
+                connection,
+                session_id=str(binding["web_session_id"]),
+                turn_id=turn_id,
+                event={
+                    "type": "turn_start",
+                    "timestamp": timestamp,
+                    "payload": {"status": "running", "started_at": timestamp},
+                },
+                created_at=timestamp,
+                origin_key=f"{invocation_id}:turn-start",
+            )
+            connection.execute(
+                "UPDATE sessions SET updated_at = ? WHERE id = ?",
+                (timestamp, binding["web_session_id"]),
+            )
+        return (event,)
 
     def reconcile_stale_reply_leases(self) -> int:
         """Release pre-restart pending/running leases so a recovered run can take over."""
@@ -1938,9 +2096,14 @@ class WebSessionStore:
                     else None
                 )
                 turn_origin_row = connection.execute(
-                    "SELECT origin FROM web_turns WHERE id = ?",
+                    "SELECT origin, invocation_id FROM web_turns WHERE id = ?",
                     (turn_id,),
                 ).fetchone()
+                workflow_reason = (
+                    _navigation_workflow_reason(turn_origin_row["invocation_id"])
+                    if turn_origin_row is not None
+                    else None
+                )
                 binding_status_row = (
                     connection.execute(
                         """
@@ -1970,14 +2133,19 @@ class WebSessionStore:
                 if (
                     v1_mapping
                     and turn_origin_row is not None
-                    and turn_origin_row["origin"] == "user"
+                    and turn_origin_row["origin"] in {"user", "interaction"}
                     and reply_summary is None
                     and open_task_status is not None
                     and (background_tools > 0 or blockers == 0)
                 ):
-                    turn_reply = _open_task_turn_reply(
-                        open_task_status,
-                        background_tools=background_tools,
+                    turn_reply = (
+                        _INTERACTION_CONTINUATION_REPLY
+                        if turn_origin_row["origin"] == "interaction"
+                        and open_task_status in {"active", "waiting_user"}
+                        else _open_task_turn_reply(
+                            open_task_status,
+                            background_tools=background_tools,
+                        )
                     )
                     if open_task_status == "active" and background_tools == 0:
                         _logger.warning(
@@ -2013,6 +2181,18 @@ class WebSessionStore:
                         (timestamp, web_session_id),
                     )
                     return inserted
+                if (
+                    v1_mapping
+                    and turn_origin_row is not None
+                    and turn_origin_row["origin"] == "system"
+                    and workflow_reason is not None
+                    and reply_summary is None
+                    and blockers == 0
+                    and not waiting
+                ):
+                    reply_summary = _NAVIGATION_WORKFLOW_TURN_FALLBACKS[
+                        workflow_reason
+                    ]
                 if (
                     v1_mapping
                     and turn_origin_row is not None

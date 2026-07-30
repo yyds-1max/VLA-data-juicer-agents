@@ -664,6 +664,75 @@ def _make_m2_client(tmp_path: Path):
     return TestClient(app), store
 
 
+def test_public_domain_events_are_durable_ordered_and_redacted(
+    tmp_path: Path,
+) -> None:
+    store = AnnotationStore(tmp_path / "annotation.sqlite")
+    job = _seed_tracked_job(store, tmp_path)
+    initial = store.list_public_events_after(after_seq=0)
+
+    assert initial
+    assert [event["seq"] for event in initial] == sorted(
+        event["seq"] for event in initial
+    )
+    assert store.public_event_cursor() == initial[-1]["seq"]
+    assert {
+        event["event_kind"] for event in initial
+    } >= {
+        "annotation.job.changed",
+        "annotation.segment.changed",
+    }
+    assert all(event["job_ref"] == job["job_ref"] for event in initial)
+    serialized = json.dumps(initial, sort_keys=True)
+    assert str(tmp_path) not in serialized
+    assert "private-sequence" not in serialized
+    assert "database_id" not in serialized
+
+    service = AnnotationApplicationService(
+        store=store,
+        worker=FakeWorker(),
+        catalog=FakeM2Catalog(),
+        work_root=tmp_path / "work",
+        clip_data_root=tmp_path / "clip_data",
+        fix_runtime=DeterministicFakeFixRuntime(),
+    )
+    _complete_fake_postprocessing(service, job)
+    later = store.list_public_events_after(after_seq=initial[-1]["seq"])
+    review_events = [
+        event
+        for event in later
+        if event["event_kind"] == "annotation.review.changed"
+    ]
+    assert len(review_events) == 1
+    assert review_events[0]["status"] == "pending"
+    assert review_events[0]["job_ref"] == job["job_ref"]
+    assert review_events[0]["segment_ref"] == job["segments"][0]["segment_ref"]
+    assert review_events[0]["review_ref"].startswith("review_")
+    assert store.list_public_events_after(after_seq=later[-1]["seq"]) == []
+
+    with store._write() as connection, pytest.raises(
+        sqlite3.IntegrityError,
+        match="annotation public events are immutable",
+    ):
+        connection.execute(
+            "UPDATE annotation_public_events SET status = 'tampered' WHERE seq = 1"
+        )
+
+
+def test_public_event_cursor_api_and_resume_validation(tmp_path: Path) -> None:
+    client, store = _make_m2_client(tmp_path)
+    response = client.get("/api/annotation/events/cursor")
+    assert response.status_code == 200
+    assert response.json() == {"cursor": store.public_event_cursor()}
+
+    invalid = client.get(
+        "/api/annotation/events",
+        headers={"Last-Event-ID": "not-a-cursor"},
+    )
+    assert invalid.status_code == 400
+    assert client.get("/api/annotation/events?after_seq=-1").status_code == 422
+
+
 def _freeze_test_fix_revision(
     client: TestClient,
     store: AnnotationStore,
@@ -1015,7 +1084,7 @@ def test_v5_to_v6_migration_preserves_processing_lineage_and_pins_handoff(
         backup_root=tmp_path / "v6-migration-backup",
     )
     assert result["from_version"] == 5
-    assert result["to_version"] == 6
+    assert result["to_version"] == LATEST_ANNOTATION_SCHEMA_VERSION
     with sqlite3.connect(database) as migrated:
         assert migrated.execute(
             """
@@ -2490,6 +2559,56 @@ def test_successful_postprocessing_receipt_replays_without_new_preflight(
         assert connection.execute(
             "SELECT COUNT(*) FROM runtime_runs WHERE kind = 'postprocessing'"
         ).fetchone()[0] == 1
+
+
+def test_postprocessing_failure_creates_pinned_navigation_handoff(
+    tmp_path: Path,
+) -> None:
+    store = AnnotationStore(tmp_path / "annotation.sqlite")
+    job = _seed_tracked_job(store, tmp_path)
+    service = AnnotationApplicationService(store=store, worker=FakeWorker())
+    service.link_navigation_task(
+        job_ref=job["job_ref"],
+        review_ref=None,
+        navigation_task_ref="navigation-postprocessing-owner",
+        parent_navigation_task_ref=None,
+        link_kind="processing",
+        idempotency_key="link-postprocessing-owner",
+    )
+    service.begin_postprocessing(
+        job["job_ref"],
+        store.get_job(job["job_ref"])["state_revision"],
+        PostprocessingSpecInput(
+            localization_kind="odom",
+            gridmap_decision="copy_existing_gridmap",
+            trajectory_variant="cjl_0525_with_gridmap",
+            plan_sha256="d" * 64,
+            observations_sha256="e" * 64,
+        ),
+        idempotency_key="begin-postprocessing-for-failure-handoff",
+    )
+    claimed = store.claim_next_run(
+        worker_id="failed-postprocessing-worker",
+        writer_lock_path=tmp_path / "writer.lock",
+    )
+    assert claimed is not None and claimed["kind"] == "postprocessing"
+
+    store.fail_run(
+        run_id=claimed["run_id"],
+        code="annotation_runtime_failed",
+        message="The postprocessing Runtime failed.",
+        retryable=True,
+    )
+
+    handoff = store.claim_workflow_handoff_delivery(
+        worker_id="failure-handoff-worker",
+    )
+    assert handoff is not None
+    assert handoff["kind"] == "postprocessing_failed"
+    assert handoff["navigation_task_ref"] == "navigation-postprocessing-owner"
+    assert handoff["payload"]["failure_code"] == "annotation_runtime_failed"
+    assert handoff["payload"]["retryable"] is True
+    assert handoff["payload"]["error_ref"].startswith("annotation_error_")
 
 
 def test_postprocessing_retry_preflight_fails_before_new_run(

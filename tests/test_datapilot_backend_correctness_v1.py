@@ -2159,6 +2159,135 @@ async def test_workbench_dispatch_uses_atomic_redis_marker_and_xadd(
 
 
 @pytest.mark.asyncio
+async def test_tracking_completion_opens_one_semantic_system_turn_with_safe_fallback(
+    tmp_path: Path,
+) -> None:
+    store = WebSessionStore(tmp_path / "sessions.sqlite")
+    task_store = SqliteNavigationTaskStore(tmp_path / "navigation.sqlite")
+    session = store.create_session("Tracking 完成后继续")
+    binding = store.create_task_binding(
+        session.id,
+        task_id="task-tracking-semantic-turn",
+        task_ref="DP-TRACKING-SEMANTIC",
+        navigation_session_id="navigation-tracking-semantic",
+    ).binding
+    task_store.create_task_attempt(
+        task_id=binding.task_id,
+        request="完成自动标注和后处理",
+        target="navigation_data",
+        date="20270623",
+        segments=["20260623_145550"],
+        scene_mode="out",
+        dry_run=False,
+        web_session_id=session.id,
+        agentscope_session_id=binding.navigation_session_id,
+        requested_outcome="postprocessing",
+    )
+    runtime = _runtime(tmp_path, store, task_store)
+    bus = _IdempotentRecordingBus()
+    runtime.message_bus = bus
+
+    async def ensure_session(*_args, **kwargs):
+        return kwargs.get("preallocated_session_id")
+
+    runtime.ensure_web_session = ensure_session  # type: ignore[method-assign]
+    dispatch_key = "annotation_workbench_dispatch:tracking-semantic"
+    assert await runtime.wake_navigation_task_from_workbench(
+        task_id=binding.task_id,
+        reason="initial_annotation_tracking_completed",
+        dispatch_idempotency_key=dispatch_key,
+    )
+    detail = store.get_session(session.id)
+    assert detail is not None
+    system_turns = [turn for turn in detail.turns if turn.origin == "system"]
+    assert len(system_turns) == 1
+    assert system_turns[0].status == "running"
+    assert (
+        store.get_navigation_workflow_turn_reason(system_turns[0].id)
+        == "initial_annotation_tracking_completed"
+    )
+
+    store.append_projected_event_batch(
+        web_session_id=session.id,
+        agentscope_session_id=binding.navigation_session_id,
+        entry_id="tracking-semantic-start",
+        events=[],
+        raw_event_type="REPLY_START",
+        reply_id="tracking-semantic-reply",
+    )
+    records = store.append_projected_event_batch(
+        web_session_id=session.id,
+        agentscope_session_id=binding.navigation_session_id,
+        entry_id="tracking-semantic-end",
+        events=[],
+        raw_event_type="REPLY_END",
+        reply_id="tracking-semantic-reply",
+    )
+
+    assert [record.type for record in records] == ["final", "turn_state"]
+    detail = store.get_session(session.id)
+    assert detail is not None
+    assert [message.content for message in detail.messages if message.role == "assistant"] == [
+        "Tracking 已完成。我正在继续检查当前数据并执行后处理，后续状态会自动更新。"
+    ]
+    assert detail.turns[-1].status == "completed"
+    assert not await runtime.wake_navigation_task_from_workbench(
+        task_id=binding.task_id,
+        reason="initial_annotation_tracking_completed",
+        dispatch_idempotency_key=dispatch_key,
+    )
+    assert len([turn for turn in store.get_session(session.id).turns if turn.origin == "system"]) == 1
+
+    second_start = store.begin_navigation_workflow_turn(
+        task_id=binding.task_id,
+        reason="initial_annotation_tracking_completed",
+        idempotency_key="tracking-semantic-model-answer",
+    )
+    assert [record.type for record in second_start] == ["turn_start"]
+    store.append_projected_event_batch(
+        web_session_id=session.id,
+        agentscope_session_id=binding.navigation_session_id,
+        entry_id="tracking-semantic-model-start",
+        events=[],
+        raw_event_type="REPLY_START",
+        reply_id="tracking-semantic-model-reply",
+    )
+    projected = runtime.project_contract_v1_event_batch(
+        web_session_id=session.id,
+        agentscope_session_id=binding.navigation_session_id,
+        entry_id="tracking-semantic-model-end",
+        events=(
+            {
+                "type": "final",
+                "payload": {
+                    "text": "Tracking 已完成，我会继续检查数据并执行后处理。"
+                },
+            },
+        ),
+    )
+    assert [event["type"] for event in projected] == [
+        "task_state_updated",
+        "final",
+    ]
+    store.append_projected_event_batch(
+        web_session_id=session.id,
+        agentscope_session_id=binding.navigation_session_id,
+        entry_id="tracking-semantic-model-end",
+        events=list(projected),
+        raw_event_type="REPLY_END",
+        reply_id="tracking-semantic-model-reply",
+    )
+    assistant_messages = [
+        message.content
+        for message in store.get_session(session.id).messages
+        if message.role == "assistant"
+    ]
+    assert assistant_messages[-1] == (
+        "Tracking 已完成，我会继续检查数据并执行后处理。"
+    )
+
+
+@pytest.mark.asyncio
 async def test_postprocessing_without_explicit_fix_never_creates_automatic_child(
     tmp_path: Path,
 ) -> None:

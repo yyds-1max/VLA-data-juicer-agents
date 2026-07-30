@@ -38,6 +38,7 @@ import {
   resetNavigationDatasetSummaryCache,
 } from "../navigationDatasetSummaryCache";
 import { InitialAnnotationWorkbench } from "../../annotation/InitialAnnotationWorkbench";
+import { useAnnotationEvents } from "../../annotation/events";
 import {
   AnnotationApiError,
   getAnnotationCapabilities,
@@ -58,7 +59,6 @@ import type {
   AnnotationSegmentStatus,
 } from "../../annotation/types";
 
-const POLL_INTERVAL_MS = 2500;
 const JOB_TABLE_GRID_LARGE_CLASS =
   "lg:grid-cols-[5.5rem_minmax(7rem,1.15fr)_7rem_minmax(7.5rem,1fr)_6.75rem_7.5rem_minmax(3.5rem,.5fr)] xl:grid-cols-[6rem_9.5rem_7rem_15rem_7rem_8rem_3.5rem]";
 
@@ -103,16 +103,6 @@ function formattedTime(timestamp: string): string {
   ].join(" ");
 }
 
-function activeJob(status: AnnotationJobStatus): boolean {
-  return (
-    status === "preparing"
-    || status === "waiting_initial_annotation"
-    || status === "tracking"
-    || status === "tracked"
-    || status === "postprocessing"
-  );
-}
-
 function cancellableJob(status: AnnotationJobStatus): boolean {
   return (
     status === "preparing"
@@ -120,23 +110,6 @@ function cancellableJob(status: AnnotationJobStatus): boolean {
     || status === "tracking"
     || status === "postprocessing"
   );
-}
-
-function useForegroundRefresh(refresh: () => void | Promise<void>, enabled = true) {
-  useEffect(() => {
-    if (!enabled) return undefined;
-    const refreshWhenVisible = () => {
-      if (document.visibilityState === "visible") void refresh();
-    };
-    window.addEventListener("focus", refreshWhenVisible);
-    window.addEventListener("online", refreshWhenVisible);
-    document.addEventListener("visibilitychange", refreshWhenVisible);
-    return () => {
-      window.removeEventListener("focus", refreshWhenVisible);
-      window.removeEventListener("online", refreshWhenVisible);
-      document.removeEventListener("visibilitychange", refreshWhenVisible);
-    };
-  }, [enabled, refresh]);
 }
 
 function preferMonotonicJob<T extends AnnotationJobSummary>(
@@ -445,13 +418,13 @@ function JobsPage() {
     void refresh(false);
   }, [refresh]);
 
-  useEffect(() => {
-    if (!jobs.some((job) => activeJob(job.status))) return;
-    const timer = window.setInterval(() => void refreshJobs(), POLL_INTERVAL_MS);
-    return () => window.clearInterval(timer);
-  }, [jobs, refreshJobs]);
-
-  useForegroundRefresh(refreshJobs);
+  useAnnotationEvents({
+    filter: (event) => (
+      event.aggregate_kind === "job" || event.aggregate_kind === "segment"
+    ),
+    onEvent: refreshJobs,
+    onReconcile: refreshJobs,
+  });
 
   useEffect(() => {
     if (
@@ -832,13 +805,11 @@ function JobPage({ jobRef }: { jobRef: string }) {
     void refresh();
   }, [refresh]);
 
-  useEffect(() => {
-    if (!job || !activeJob(job.status)) return;
-    const interval = window.setInterval(() => void refresh(), POLL_INTERVAL_MS);
-    return () => window.clearInterval(interval);
-  }, [job, refresh]);
-
-  useForegroundRefresh(refresh);
+  useAnnotationEvents({
+    filter: (event) => event.job_ref === jobRef,
+    onEvent: refresh,
+    onReconcile: refresh,
+  });
 
   if (loading) {
     return <section className="mx-auto max-w-7xl px-4 py-6 md:px-6"><PageMessage icon={LoaderCircle} title="正在读取任务…" /></section>;
@@ -1016,6 +987,21 @@ function SegmentPage({ jobRef, segmentRef }: { jobRef: string; segmentRef: strin
     updateJob(nextJob);
   }, [jobRef, updateJob]);
 
+  const refreshRuntimeState = useCallback(async () => {
+    try {
+      const nextJob = await getAnnotationJob(jobRef);
+      let nextSegment: AnnotationSegmentDetail | null = null;
+      if (nextJob.status !== "waiting_initial_annotation") {
+        nextSegment = await getAnnotationSegment(jobRef, segmentRef);
+      }
+      updateJob(nextJob);
+      if (nextSegment) updateSegment(nextSegment);
+      setError("");
+    } catch (requestError) {
+      setError(safeError(requestError, "刷新任务状态失败"));
+    }
+  }, [jobRef, segmentRef, updateJob, updateSegment]);
+
   useEffect(() => {
     setExternalSubmissionNotice("");
   }, [jobRef, segmentRef]);
@@ -1043,33 +1029,11 @@ function SegmentPage({ jobRef, segmentRef }: { jobRef: string; segmentRef: strin
     };
   }, [jobRef, segmentRef, updateJob, updateSegment]);
 
-  useEffect(() => {
-    if (!job || !activeJob(job.status)) return;
-    let cancelled = false;
-    let requestGeneration = 0;
-    const interval = window.setInterval(() => {
-      const currentRequest = ++requestGeneration;
-      void getAnnotationJob(jobRef).then(async (nextJob) => {
-        let nextSegment: AnnotationSegmentDetail | null = null;
-        if (nextJob.status !== "waiting_initial_annotation") {
-          nextSegment = await getAnnotationSegment(jobRef, segmentRef);
-        }
-        if (cancelled || currentRequest !== requestGeneration) return;
-        updateJob(nextJob);
-        if (nextSegment) {
-          updateSegment(nextSegment);
-        }
-      }).catch((requestError) => {
-        if (!cancelled && currentRequest === requestGeneration) {
-          setError(safeError(requestError, "刷新任务状态失败"));
-        }
-      });
-    }, POLL_INTERVAL_MS);
-    return () => {
-      cancelled = true;
-      window.clearInterval(interval);
-    };
-  }, [job?.status, jobRef, segmentRef, updateJob, updateSegment]);
+  useAnnotationEvents({
+    filter: (event) => event.job_ref === jobRef,
+    onEvent: refreshRuntimeState,
+    onReconcile: refreshRuntimeState,
+  });
 
   const navigateSafely = async (path: string) => {
     const saved = await flushRef.current();

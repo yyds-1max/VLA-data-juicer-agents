@@ -31,6 +31,7 @@ import {
   TableRow,
 } from "../../components/ui/table";
 import { AnnotationApiError, listTrajectoryReviews } from "./api";
+import { useAnnotationEvents } from "./events";
 import {
   isVerifiedReview,
   trajectoryReviewPresentation,
@@ -108,21 +109,27 @@ export function AnnotationReviewsPage() {
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState("");
 
-  const refresh = useCallback(async () => {
-    setLoading(true);
+  const refresh = useCallback(async (silent = false) => {
+    if (!silent) setLoading(true);
     try {
       setReviews(await listTrajectoryReviews());
       setError("");
     } catch (requestError) {
       setError(safeReviewError(requestError, "读取轨迹复核任务失败"));
     } finally {
-      setLoading(false);
+      if (!silent) setLoading(false);
     }
   }, []);
 
   useEffect(() => {
     void refresh();
   }, [refresh]);
+
+  useAnnotationEvents({
+    filter: (event) => event.aggregate_kind === "review",
+    onEvent: () => refresh(true),
+    onReconcile: () => refresh(true),
+  });
 
   const counts = useMemo(() => {
     const next = {

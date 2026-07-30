@@ -3,7 +3,7 @@ from __future__ import annotations
 import sqlite3
 
 
-LATEST_ANNOTATION_SCHEMA_VERSION = 6
+LATEST_ANNOTATION_SCHEMA_VERSION = 8
 
 
 class UnsupportedAnnotationSchemaVersionError(RuntimeError):
@@ -1262,6 +1262,313 @@ def _migration_006_processing_attempt_lineage(
     )
 
 
+def _migration_007_postprocessing_failure_handoff(
+    connection: sqlite3.Connection,
+) -> None:
+    # SQLite records a deferred violation when a referenced parent table is
+    # dropped, even if an equivalent parent is recreated under the same name
+    # before commit.  Rebuild this CHECK-constrained table with FK enforcement
+    # temporarily disabled, then verify the complete graph before the caller
+    # commits the migration ledger.
+    connection.execute("PRAGMA foreign_keys = OFF")
+    connection.executescript(
+        """
+        BEGIN IMMEDIATE;
+
+        DROP TRIGGER workflow_handoffs_no_update;
+        DROP TRIGGER workflow_handoffs_no_delete;
+        DROP TRIGGER workflow_handoff_processing_links_guard_insert;
+        DROP TRIGGER workflow_handoffs_pin_processing_authority;
+
+        CREATE TABLE workflow_handoffs_v7 (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            handoff_ref TEXT NOT NULL UNIQUE,
+            job_id INTEGER NOT NULL,
+            review_id INTEGER,
+            kind TEXT NOT NULL CHECK (
+                kind IN (
+                    'initial_annotation_ready', 'initial_annotation_submitted',
+                    'tracking_completed', 'postprocessing_completed',
+                    'postprocessing_failed',
+                    'fix_ready', 'fix_revision_submitted',
+                    'review_returned', 'review_completed'
+                )
+            ),
+            payload_json TEXT NOT NULL,
+            content_sha256 TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            FOREIGN KEY (job_id) REFERENCES annotation_jobs(id),
+            FOREIGN KEY (review_id) REFERENCES trajectory_review_tasks(id)
+        );
+
+        INSERT INTO workflow_handoffs_v7 (
+            id, handoff_ref, job_id, review_id, kind, payload_json,
+            content_sha256, created_at
+        )
+        SELECT
+            id, handoff_ref, job_id, review_id, kind, payload_json,
+            content_sha256, created_at
+        FROM workflow_handoffs;
+
+        DROP TABLE workflow_handoffs;
+        ALTER TABLE workflow_handoffs_v7 RENAME TO workflow_handoffs;
+
+        CREATE INDEX idx_workflow_handoffs_job
+        ON workflow_handoffs (job_id, created_at);
+
+        CREATE TRIGGER workflow_handoffs_no_update
+        BEFORE UPDATE ON workflow_handoffs BEGIN
+            SELECT RAISE(ABORT, 'workflow handoffs are immutable');
+        END;
+        CREATE TRIGGER workflow_handoffs_no_delete
+        BEFORE DELETE ON workflow_handoffs BEGIN
+            SELECT RAISE(ABORT, 'workflow handoffs are immutable');
+        END;
+        CREATE TRIGGER workflow_handoff_processing_links_guard_insert
+        BEFORE INSERT ON workflow_handoff_processing_links
+        WHEN NOT EXISTS (
+            SELECT 1
+            FROM workflow_handoffs h
+            JOIN annotation_task_links l
+              ON l.id = NEW.link_id
+             AND l.job_id = h.job_id
+             AND l.link_kind = 'processing'
+            WHERE h.id = NEW.handoff_id
+              AND h.kind IN (
+                  'initial_annotation_submitted',
+                  'tracking_completed',
+                  'postprocessing_completed',
+                  'postprocessing_failed'
+              )
+        )
+        BEGIN
+            SELECT RAISE(ABORT, 'invalid processing handoff link');
+        END;
+        CREATE TRIGGER workflow_handoffs_pin_processing_authority
+        AFTER INSERT ON workflow_handoffs
+        WHEN NEW.kind IN (
+            'initial_annotation_submitted',
+            'tracking_completed',
+            'postprocessing_completed',
+            'postprocessing_failed'
+        )
+        BEGIN
+            INSERT INTO workflow_handoff_processing_links (
+                handoff_id, link_id, created_at
+            )
+            SELECT NEW.id, a.link_id, NEW.created_at
+            FROM annotation_processing_authorities a
+            WHERE a.job_id = NEW.job_id;
+        END;
+
+        UPDATE annotation_migration_safety
+        SET schema_version = 7,
+            status = 'pending_integrity_check',
+            verified_at = NULL
+        WHERE singleton = 1 AND schema_version = 6;
+        """
+    )
+    if connection.execute("PRAGMA foreign_key_check").fetchall():
+        raise sqlite3.IntegrityError(
+            "postprocessing failure handoff migration broke foreign keys"
+        )
+
+
+def _migration_008_public_domain_events(
+    connection: sqlite3.Connection,
+) -> None:
+    connection.executescript(
+        """
+        BEGIN IMMEDIATE;
+
+        CREATE TABLE annotation_public_events (
+            seq INTEGER PRIMARY KEY AUTOINCREMENT,
+            event_ref TEXT NOT NULL UNIQUE,
+            event_kind TEXT NOT NULL CHECK (
+                event_kind IN (
+                    'annotation.job.changed',
+                    'annotation.segment.changed',
+                    'annotation.review.changed'
+                )
+            ),
+            aggregate_kind TEXT NOT NULL CHECK (
+                aggregate_kind IN ('job', 'segment', 'review')
+            ),
+            job_ref TEXT,
+            segment_ref TEXT,
+            review_ref TEXT,
+            state_revision INTEGER NOT NULL CHECK (state_revision >= 0),
+            status TEXT NOT NULL,
+            occurred_at TEXT NOT NULL,
+            CHECK (
+                (
+                    aggregate_kind = 'job'
+                    AND job_ref IS NOT NULL
+                    AND segment_ref IS NULL
+                    AND review_ref IS NULL
+                )
+                OR (
+                    aggregate_kind = 'segment'
+                    AND job_ref IS NOT NULL
+                    AND segment_ref IS NOT NULL
+                    AND review_ref IS NULL
+                )
+                OR (
+                    aggregate_kind = 'review'
+                    AND job_ref IS NOT NULL
+                    AND segment_ref IS NOT NULL
+                    AND review_ref IS NOT NULL
+                )
+            )
+        );
+
+        CREATE TRIGGER annotation_public_events_no_update
+        BEFORE UPDATE ON annotation_public_events BEGIN
+            SELECT RAISE(ABORT, 'annotation public events are immutable');
+        END;
+        CREATE TRIGGER annotation_public_events_no_delete
+        BEFORE DELETE ON annotation_public_events BEGIN
+            SELECT RAISE(ABORT, 'annotation public events are immutable');
+        END;
+
+        CREATE TRIGGER annotation_jobs_public_event_insert
+        AFTER INSERT ON annotation_jobs
+        BEGIN
+            INSERT INTO annotation_public_events (
+                event_ref, event_kind, aggregate_kind, job_ref,
+                segment_ref, review_ref, state_revision, status, occurred_at
+            ) VALUES (
+                'annotation_event_' || lower(hex(randomblob(16))),
+                'annotation.job.changed',
+                'job',
+                NEW.job_ref,
+                NULL,
+                NULL,
+                NEW.state_revision,
+                NEW.status,
+                NEW.updated_at
+            );
+        END;
+
+        CREATE TRIGGER annotation_jobs_public_event_update
+        AFTER UPDATE OF state_revision ON annotation_jobs
+        WHEN NEW.state_revision > OLD.state_revision
+        BEGIN
+            INSERT INTO annotation_public_events (
+                event_ref, event_kind, aggregate_kind, job_ref,
+                segment_ref, review_ref, state_revision, status, occurred_at
+            ) VALUES (
+                'annotation_event_' || lower(hex(randomblob(16))),
+                'annotation.job.changed',
+                'job',
+                NEW.job_ref,
+                NULL,
+                NULL,
+                NEW.state_revision,
+                NEW.status,
+                NEW.updated_at
+            );
+        END;
+
+        CREATE TRIGGER annotation_segments_public_event_insert
+        AFTER INSERT ON annotation_segments
+        BEGIN
+            INSERT INTO annotation_public_events (
+                event_ref, event_kind, aggregate_kind, job_ref,
+                segment_ref, review_ref, state_revision, status, occurred_at
+            )
+            SELECT
+                'annotation_event_' || lower(hex(randomblob(16))),
+                'annotation.segment.changed',
+                'segment',
+                j.job_ref,
+                NEW.segment_ref,
+                NULL,
+                NEW.state_revision,
+                NEW.status,
+                NEW.updated_at
+            FROM annotation_jobs j
+            WHERE j.id = NEW.job_id;
+        END;
+
+        CREATE TRIGGER annotation_segments_public_event_update
+        AFTER UPDATE OF state_revision ON annotation_segments
+        WHEN NEW.state_revision > OLD.state_revision
+        BEGIN
+            INSERT INTO annotation_public_events (
+                event_ref, event_kind, aggregate_kind, job_ref,
+                segment_ref, review_ref, state_revision, status, occurred_at
+            )
+            SELECT
+                'annotation_event_' || lower(hex(randomblob(16))),
+                'annotation.segment.changed',
+                'segment',
+                j.job_ref,
+                NEW.segment_ref,
+                NULL,
+                NEW.state_revision,
+                NEW.status,
+                NEW.updated_at
+            FROM annotation_jobs j
+            WHERE j.id = NEW.job_id;
+        END;
+
+        CREATE TRIGGER trajectory_reviews_public_event_insert
+        AFTER INSERT ON trajectory_review_tasks
+        BEGIN
+            INSERT INTO annotation_public_events (
+                event_ref, event_kind, aggregate_kind, job_ref,
+                segment_ref, review_ref, state_revision, status, occurred_at
+            )
+            SELECT
+                'annotation_event_' || lower(hex(randomblob(16))),
+                'annotation.review.changed',
+                'review',
+                j.job_ref,
+                s.segment_ref,
+                NEW.review_ref,
+                NEW.state_revision,
+                NEW.status,
+                NEW.updated_at
+            FROM trajectory_revisions tr
+            JOIN annotation_jobs j ON j.id = tr.job_id
+            JOIN annotation_segments s ON s.id = tr.segment_id
+            WHERE tr.id = NEW.trajectory_revision_id;
+        END;
+
+        CREATE TRIGGER trajectory_reviews_public_event_update
+        AFTER UPDATE OF state_revision ON trajectory_review_tasks
+        WHEN NEW.state_revision > OLD.state_revision
+        BEGIN
+            INSERT INTO annotation_public_events (
+                event_ref, event_kind, aggregate_kind, job_ref,
+                segment_ref, review_ref, state_revision, status, occurred_at
+            )
+            SELECT
+                'annotation_event_' || lower(hex(randomblob(16))),
+                'annotation.review.changed',
+                'review',
+                j.job_ref,
+                s.segment_ref,
+                NEW.review_ref,
+                NEW.state_revision,
+                NEW.status,
+                NEW.updated_at
+            FROM trajectory_revisions tr
+            JOIN annotation_jobs j ON j.id = tr.job_id
+            JOIN annotation_segments s ON s.id = tr.segment_id
+            WHERE tr.id = NEW.trajectory_revision_id;
+        END;
+
+        UPDATE annotation_migration_safety
+        SET schema_version = 8,
+            status = 'pending_integrity_check',
+            verified_at = NULL
+        WHERE singleton = 1 AND schema_version = 7;
+        """
+    )
+
+
 _MIGRATIONS = (
     (1, "annotation_m1", _migration_001_annotation_m1),
     (2, "runtime_step_evidence", _migration_002_runtime_step_evidence),
@@ -1280,5 +1587,15 @@ _MIGRATIONS = (
         6,
         "processing_attempt_lineage",
         _migration_006_processing_attempt_lineage,
+    ),
+    (
+        7,
+        "postprocessing_failure_handoff",
+        _migration_007_postprocessing_failure_handoff,
+    ),
+    (
+        8,
+        "public_domain_events",
+        _migration_008_public_domain_events,
     ),
 )

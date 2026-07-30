@@ -68,6 +68,7 @@ import {
   listTrajectoryReviews,
   retryReviewPublication,
 } from "./api";
+import { useAnnotationEvents } from "./events";
 import { trajectoryReviewPresentation } from "./reviewPresentation";
 import type {
   CalibrationProfile,
@@ -381,6 +382,13 @@ export function TrajectoryFixPage() {
     void refresh();
   }, [refresh]);
 
+  useAnnotationEvents({
+    enabled: Boolean(reviewRef),
+    filter: (event) => event.review_ref === reviewRef,
+    onEvent: () => refresh(true),
+    onReconcile: () => refresh(true),
+  });
+
   const projectedEvidence = useMemo(
     () => evidence ? projectTrajectoryReviewEvidence(evidence) : null,
     [evidence],
@@ -440,23 +448,6 @@ export function TrajectoryFixPage() {
     () => trajectoryPositionPath(projectedEvidence, targetRef, "projected"),
     [projectedEvidence, targetRef],
   );
-  useEffect(() => {
-    if (!fixRuntimeBusy && !publicationBusy) return;
-    let cancelled = false;
-    let timer: number | undefined;
-    const poll = async () => {
-      await refresh(true);
-      if (!cancelled) {
-        timer = window.setTimeout(poll, 2_000);
-      }
-    };
-    timer = window.setTimeout(poll, 1_000);
-    return () => {
-      cancelled = true;
-      if (timer !== undefined) window.clearTimeout(timer);
-    };
-  }, [fixRuntimeBusy, publicationBusy, refresh]);
-
   const updateFromResult = useCallback((next: TrajectoryReview) => {
     setReview(next);
     reviewStateRef.current = next;
