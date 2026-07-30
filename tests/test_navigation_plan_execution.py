@@ -2968,3 +2968,77 @@ def test_plan_bound_human_decision_waits_and_transitions_ledger_exactly_once(
             (plan.plan_id,),
         ).fetchone()[0]
     assert status == expected_status
+
+
+def test_calibration_confirmation_persists_an_observed_profile_override(tmp_path):
+    settings = NavigationSettings(
+        vladatasets_root=tmp_path / "datasets",
+        processing_root=tmp_path / "processing",
+    )
+    proposed = "NoobScenes/params/20260320/sensors"
+    confirmed = "NoobScenes/params/20260529_go2w/sensors"
+    db_path = tmp_path / "navigation.sqlite"
+    task_store = SqliteNavigationTaskStore(db_path)
+    task = _create_task(
+        task_store,
+        date="20260710",
+        segments=["segment-a"],
+        scene_mode="out",
+        dry_run=True,
+    )
+    evidence_store = FileNavigationEvidenceStore(tmp_path / "evidence")
+    observation = SqliteNavigationObservationStore(db_path).append(
+        task.task_id,
+        "calibration_inventory",
+        [
+            CalibrationInventoryObservation(
+                sensor_sources=[proposed, confirmed],
+            )
+        ],
+        [],
+        evidence_store,
+        expected_web_session_id=task.created_by_web_session_id,
+        expected_agentscope_session_id=task.agentscope_session_id,
+    )
+    plan_store = SqliteNavigationPlanRepository(db_path)
+    plan = _activate_plan(
+        plan_store,
+        task,
+        "finish_processing",
+        observation.revision,
+        finish_plan(proposed),
+    )
+
+    accepted = plan_execution.submit_plan_human_decision(
+        plan_store=plan_store,
+        evidence_store=evidence_store,
+        plan_id=plan.plan_id,
+        step_id="confirm",
+        decision={
+            "action": "confirm",
+            "selected_calibration_profile": "20260529_go2w",
+            "selected_sensor_source": confirmed,
+        },
+        expected_web_session_id=task.created_by_web_session_id,
+        expected_agentscope_session_id=task.agentscope_session_id,
+    )
+
+    assert accepted is True
+    handoff = plan_store.get_human_decision_handoff(plan.plan_id, "confirm")
+    assert handoff is not None
+    assert handoff.decision["selected_calibration_profile"] == "20260529_go2w"
+    assert handoff.decision["selected_sensor_source"] == confirmed
+    assert (
+        plan_execution._confirmed_calibration_source(plan, plan_store)
+        == confirmed
+    )
+    arguments = plan_execution.resolve_step_arguments(
+        task=task,
+        plan=plan.plan,
+        step=next(step for step in plan.plan.steps if step.step_id == "assemble"),
+        settings=settings,
+        confirmed_calibration_source=confirmed,
+    )
+    assert arguments["selected_sensor_source"] == (
+        settings.processing_root / confirmed
+    ).resolve(strict=False)

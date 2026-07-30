@@ -70,4 +70,40 @@ describe("InteractionPanel", () => {
     fireEvent.click(screen.getByRole("button", { name: "提交选择" }));
     expect(onSubmit).toHaveBeenCalledWith(["one", "two"]);
   });
+
+  test("requires a calibration radio choice before explicit confirmation", () => {
+    const onSubmit = vi.fn();
+    render(
+      <InteractionPanel
+        interaction={interaction({
+          kind: "calibration_preview",
+          title: "确认标定参数",
+          options: [
+            {
+              option_id: "calibration_a",
+              label: "20260320",
+              description: "用于本次数据处理",
+            },
+            {
+              option_id: "calibration_b",
+              label: "20260529_go2w",
+              description: "用于本次数据处理",
+            },
+            { option_id: "reject", label: "停止任务" },
+          ],
+        })}
+        onSubmit={onSubmit}
+      />,
+    );
+
+    const confirm = screen.getByRole("button", {
+      name: "确认所选标定并继续",
+    });
+    expect(confirm).toBeDisabled();
+    fireEvent.click(screen.getByRole("radio", { name: /20260529_go2w/ }));
+    expect(onSubmit).not.toHaveBeenCalled();
+    expect(confirm).toBeEnabled();
+    fireEvent.click(confirm);
+    expect(onSubmit).toHaveBeenCalledWith(["calibration_b"]);
+  });
 });

@@ -25,6 +25,15 @@ class NavigationAnnotationGateway(Protocol):
     ) -> Mapping[str, Any]:
         ...
 
+    def get_processing_calibration_options(
+        self,
+        *,
+        navigation_task_id: str,
+        plan_id: str,
+    ) -> Sequence[Mapping[str, str]]:
+        """Return audited processing profiles and their private observed sources."""
+        ...
+
     def begin_annotation_from_plan(
         self,
         *,

@@ -24,6 +24,9 @@ from vla_data_juicer_agents.navigation.annotation_gateway import (
 from vla_data_juicer_agents.navigation.observation_store import (
     SqliteNavigationObservationStore,
 )
+from vla_data_juicer_agents.navigation.observation_models import (
+    CalibrationInventoryObservation,
+)
 from vla_data_juicer_agents.navigation.plan_models import (
     FinishProcessingPlanInput,
     TrajectoryReviewPlanInput,
@@ -229,6 +232,64 @@ class AnnotationNavigationGateway(NavigationAnnotationGateway):
             },
             "completed": job_status in {"tracked", "postprocessing", "annotated"},
         }
+
+    def get_processing_calibration_options(
+        self,
+        *,
+        navigation_task_id: str,
+        plan_id: str,
+    ) -> Sequence[Mapping[str, str]]:
+        task = self.task_store.get_task(navigation_task_id)
+        plan = self.plan_store.get(plan_id)
+        if task is None or plan is None or plan.task_id != task.task_id:
+            raise AnnotationValidationError(
+                "invalid_navigation_task_binding",
+                "The calibration inventory is not bound to this task.",
+            )
+        observation = self.observation_store.get(
+            navigation_task_id,
+            plan.observation_revision,
+        )
+        observed_sources = {
+            source
+            for payload in (observation.payloads if observation is not None else [])
+            if isinstance(payload, CalibrationInventoryObservation)
+            for source in payload.sensor_sources
+        }
+        selected = str(
+            getattr(
+                getattr(plan.plan.decisions, "calibration", None),
+                "selected_sensor_source",
+                "",
+            )
+            or ""
+        )
+        options: list[Mapping[str, str]] = []
+        for profile in self.service.list_calibration_profiles(
+            purpose="processing",
+        )["profiles"]:
+            profile_ref = str(profile["profile_ref"])
+            matches = sorted(
+                source
+                for source in observed_sources
+                if source == profile_ref or profile_ref in Path(source).parts
+            )
+            if len(matches) != 1:
+                continue
+            options.append(
+                {
+                    "profile_ref": profile_ref,
+                    "label": str(profile["label"]),
+                    "selected_sensor_source": matches[0],
+                    "selected": "true" if matches[0] == selected else "false",
+                }
+            )
+        if not options:
+            raise AnnotationValidationError(
+                "processing_calibration_unavailable",
+                "No audited processing calibration is available for this Plan.",
+            )
+        return options
 
     def begin_postprocessing_from_plan(
         self,
@@ -524,7 +585,7 @@ class AnnotationNavigationGateway(NavigationAnnotationGateway):
                 "annotation_snapshot_unavailable",
                 "A missing annotation job cannot use an annotation snapshot.",
             )
-        selected = str(decision.selected_sensor_source or "")
+        selected = self._confirmed_processing_calibration(plan)
         profiles = self.service.list_calibration_profiles(
             purpose="processing",
         )["profiles"]
@@ -540,6 +601,27 @@ class AnnotationNavigationGateway(NavigationAnnotationGateway):
                 "The accepted Plan does not identify one processing calibration profile.",
             )
         return dict(matches[0])
+
+    def _confirmed_processing_calibration(self, plan: Any) -> str:
+        selected = str(plan.plan.decisions.calibration.selected_sensor_source or "")
+        confirmation_step = next(
+            (
+                step
+                for step in getattr(plan.plan, "steps", [])
+                if step.action == "confirm_navigation_calibration_params"
+            ),
+            None,
+        )
+        if confirmation_step is None:
+            return selected
+        handoff = self.plan_store.get_human_decision_handoff(
+            plan.plan_id,
+            confirmation_step.step_id,
+        )
+        if handoff is None or handoff.decision.get("action") != "confirm":
+            return selected
+        confirmed = handoff.decision.get("selected_sensor_source")
+        return confirmed if isinstance(confirmed, str) and confirmed else selected
 
     def _postprocessing_spec(
         self,

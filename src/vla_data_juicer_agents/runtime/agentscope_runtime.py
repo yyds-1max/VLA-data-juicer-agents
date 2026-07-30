@@ -2233,6 +2233,73 @@ class AgentScopeRuntime:
     ) -> dict[str, Any]:
         decision_type = str(raw_payload.get("decision_type") or "confirmation")
         calibration = decision_type == "camera_params"
+        calibration_sources: dict[str, dict[str, str]] = {}
+        calibration_options: list[dict[str, Any]] = []
+        if calibration:
+            plan_id = raw_payload.get("plan_id")
+            candidates: list[Mapping[str, Any]] = []
+            if self.annotation_gateway is not None and isinstance(plan_id, str):
+                try:
+                    candidates = list(
+                        self.annotation_gateway.get_processing_calibration_options(
+                            navigation_task_id=task_id,
+                            plan_id=plan_id,
+                        )
+                    )
+                except Exception:
+                    _logger.exception(
+                        "Failed to project audited processing calibration options"
+                    )
+            for candidate in candidates:
+                profile_ref = str(candidate.get("profile_ref") or "")
+                label = str(candidate.get("label") or profile_ref)
+                selected_source = str(
+                    candidate.get("selected_sensor_source") or ""
+                )
+                if not profile_ref or not label or not selected_source:
+                    continue
+                option_id = _calibration_choice_option_id(profile_ref)
+                calibration_sources[option_id] = {
+                    "profile_ref": profile_ref,
+                    "selected_sensor_source": selected_source,
+                }
+                calibration_options.append(
+                    {
+                        "option_id": option_id,
+                        "label": label,
+                        "description": "用于本次数据处理",
+                        "destructive": False,
+                    }
+                )
+        default_options = [
+            {
+                "option_id": "confirm",
+                "label": "确认并继续",
+                "destructive": True,
+            },
+            {
+                "option_id": "reject",
+                "label": "停止",
+                "destructive": False,
+            },
+            {
+                "option_id": "adjust",
+                "label": "返回修改",
+                "destructive": False,
+            },
+        ]
+        interaction_options = (
+            [
+                *calibration_options,
+                {
+                    "option_id": "reject",
+                    "label": "停止任务",
+                    "destructive": False,
+                },
+            ]
+            if calibration_options
+            else default_options
+        )
         identity = {
             key: raw_payload.get(key)
             for key in ("request_id", "reply_id", "tool_call_id", "plan_id", "step_id")
@@ -2252,13 +2319,13 @@ class AgentScopeRuntime:
             "blocking": True,
             "risk": "high",
             "title": "确认标定参数" if calibration else "确认关键操作",
-            "summary": sanitize_progress_text(raw_payload.get("summary"))
-            or "继续前需要你的明确确认。",
-            "options": [
-                {"option_id": "confirm", "label": "确认并继续", "destructive": True},
-                {"option_id": "reject", "label": "停止", "destructive": False},
-                {"option_id": "adjust", "label": "返回修改", "destructive": False},
-            ],
+            "summary": (
+                "请选择本次导航数据处理使用的相机标定参数。"
+                if calibration and calibration_options
+                else sanitize_progress_text(raw_payload.get("summary"))
+                or "继续前需要你的明确确认。"
+            ),
+            "options": interaction_options,
             "interaction_revision": 1,
             "expected_task_revision": task_revision,
             "expires_at": None,
@@ -2281,15 +2348,22 @@ class AgentScopeRuntime:
                 ),
                 expires_at=interaction["expires_at"],
                 private_payload={
-                    key: raw_payload.get(key)
-                    for key in (
-                        "request_id",
-                        "reply_id",
-                        "tool_call_id",
-                        "plan_id",
-                        "step_id",
-                    )
-                    if raw_payload.get(key) is not None
+                    **{
+                        key: raw_payload.get(key)
+                        for key in (
+                            "request_id",
+                            "reply_id",
+                            "tool_call_id",
+                            "plan_id",
+                            "step_id",
+                        )
+                        if raw_payload.get(key) is not None
+                    },
+                    **(
+                        {"calibration_sources": calibration_sources}
+                        if calibration_sources
+                        else {}
+                    ),
                 },
             )
         return interaction
@@ -3075,11 +3149,21 @@ class AgentScopeRuntime:
         navigation_session_id = binding.navigation_session_id
         private_payload = dict(_record_value(interaction, "private_payload", {}) or {})
         selected = option_ids[0] if option_ids else ""
-        action = {
-            "confirm": "confirm",
-            "reject": "stop",
-            "adjust": "guide",
-        }.get(selected)
+        calibration_sources = private_payload.get("calibration_sources")
+        calibration_choice = (
+            calibration_sources.get(selected)
+            if isinstance(calibration_sources, dict)
+            else None
+        )
+        action = (
+            "confirm"
+            if isinstance(calibration_choice, dict)
+            else {
+                "confirm": "confirm",
+                "reject": "stop",
+                "adjust": "guide",
+            }.get(selected)
+        )
         if action is None:
             raise RuntimeError("interaction option is not supported by this specialist")
         required = ("request_id", "tool_call_id", "reply_id")
@@ -3111,6 +3195,15 @@ class AgentScopeRuntime:
             if isinstance(private_payload.get(key), str)
         }
         decision["action"] = action
+        if isinstance(calibration_choice, dict):
+            profile_ref = calibration_choice.get("profile_ref")
+            selected_source = calibration_choice.get("selected_sensor_source")
+            if not isinstance(profile_ref, str) or not isinstance(
+                selected_source, str
+            ):
+                raise RuntimeError("calibration choice is incomplete")
+            decision["selected_calibration_profile"] = profile_ref
+            decision["selected_sensor_source"] = selected_source
         if action == "guide":
             decision["text"] = "请返回修改当前方案，不要执行当前参数。"
         accepted = await self.submit_human_decision(
@@ -6042,13 +6135,22 @@ def _human_decision_claim_key(agentscope_session_id: str, decision: dict[str, An
 
 
 def _durable_plan_decision(decision: dict[str, Any]) -> dict[str, Any]:
-    return {
+    durable = {
         "action": decision.get("action"),
         "text": decision.get("text"),
         "request_id": decision.get("request_id"),
         "plan_id": decision.get("plan_id"),
         "step_id": decision.get("step_id"),
     }
+    for key in ("selected_calibration_profile", "selected_sensor_source"):
+        if isinstance(decision.get(key), str):
+            durable[key] = decision[key]
+    return durable
+
+
+def _calibration_choice_option_id(profile_ref: str) -> str:
+    digest = hashlib.sha256(profile_ref.encode("utf-8")).hexdigest()[:16]
+    return f"calibration_{digest}"
 
 
 def _human_decision_payload_from_tool_call(
@@ -6166,6 +6268,9 @@ def _human_decision_tool_output(tool_name: str, decision: dict[str, Any]) -> dic
         "text": decision.get("text"),
         "request_id": decision["request_id"],
     }
+    for key in ("selected_calibration_profile", "selected_sensor_source"):
+        if isinstance(decision.get(key), str):
+            output[key] = decision[key]
     if isinstance(decision.get("plan_id"), str) and isinstance(decision.get("step_id"), str):
         output["plan_id"] = decision["plan_id"]
         output["step_id"] = decision["step_id"]

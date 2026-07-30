@@ -265,6 +265,7 @@ def resolve_step_arguments(
     plan: ExtractSyncPlanInput | FinishProcessingPlanInput,
     step: Any,
     settings: NavigationSettings,
+    confirmed_calibration_source: str | None = None,
 ) -> dict[str, Any]:
     """Resolve canonical processing arguments without accepting model copies."""
     common = {"settings": settings, "dry_run": task.dry_run}
@@ -288,9 +289,13 @@ def resolve_step_arguments(
         }
     if not isinstance(plan, FinishProcessingPlanInput):
         raise ValueError(f"finish-processing action requires a finish plan: {action}")
+    selected_calibration_source = (
+        confirmed_calibration_source
+        or plan.decisions.calibration.selected_sensor_source
+    )
     if action == _EXTERNAL_ACTION:
         calibration_source = _calibration_source_path(
-            plan.decisions.calibration.selected_sensor_source,
+            selected_calibration_source,
             settings,
         )
         return {
@@ -299,7 +304,7 @@ def resolve_step_arguments(
         }
     if action == "assemble_finish_temp":
         calibration_source = _calibration_source_path(
-            plan.decisions.calibration.selected_sensor_source,
+            selected_calibration_source,
             settings,
         )
         return {
@@ -351,6 +356,10 @@ def verify_plan_step_preconditions(
         plan=plan.plan,
         step=step,
         settings=settings,
+        confirmed_calibration_source=_confirmed_calibration_source(
+            plan,
+            plan_store,
+        ),
     )
     missing: list[Path] = []
 
@@ -568,7 +577,7 @@ def _validate_calibration_inventory(
 ) -> dict[str, Any] | None:
     if not isinstance(plan.plan, FinishProcessingPlanInput):
         return None
-    selected = plan.plan.decisions.calibration.selected_sensor_source
+    selected = _confirmed_calibration_source(plan, plan_store)
     observation = SqliteNavigationObservationStore(plan_store.db_path).get(
         task.task_id,
         plan.observation_revision,
@@ -592,6 +601,33 @@ def _validate_calibration_inventory(
         "The stored calibration source does not exactly match the plan observation revision or escapes processing_root.",
         next_action="submit_complete_plan",
     )
+
+
+def _confirmed_calibration_source(
+    plan: NavigationPlanRecord,
+    plan_store: SqliteNavigationPlanRepository,
+) -> str | None:
+    if not isinstance(plan.plan, FinishProcessingPlanInput):
+        return None
+    selected = plan.plan.decisions.calibration.selected_sensor_source
+    confirmation_step = next(
+        (
+            step
+            for step in plan.plan.steps
+            if step.action == _EXTERNAL_ACTION
+        ),
+        None,
+    )
+    if confirmation_step is None:
+        return selected
+    handoff = plan_store.get_human_decision_handoff(
+        plan.plan_id,
+        confirmation_step.step_id,
+    )
+    if handoff is None or handoff.decision.get("action") != "confirm":
+        return selected
+    confirmed = handoff.decision.get("selected_sensor_source")
+    return confirmed if isinstance(confirmed, str) and confirmed else selected
 
 
 def _gate_step(
@@ -935,6 +971,10 @@ def _invoke_plan_step(
             plan=plan.plan,
             step=step,
             settings=settings,
+            confirmed_calibration_source=_confirmed_calibration_source(
+                plan,
+                plan_store,
+            ),
         )
         with bind_cancellation(active_cancellation):
             if active_cancellation is not None:
@@ -1175,6 +1215,32 @@ def submit_plan_human_decision(
     if step is None or step.action != _EXTERNAL_ACTION:
         return False
     action = decision.get("action")
+    selected_sensor_source = decision.get("selected_sensor_source")
+    selected_calibration_profile = decision.get("selected_calibration_profile")
+    if action == "confirm" and selected_sensor_source is not None:
+        if (
+            not isinstance(selected_sensor_source, str)
+            or not selected_sensor_source
+            or not isinstance(plan.plan, FinishProcessingPlanInput)
+        ):
+            return False
+        observation = SqliteNavigationObservationStore(plan_store.db_path).get(
+            plan.task_id,
+            plan.observation_revision,
+        )
+        observed_sources = {
+            source
+            for observation_payload in (
+                observation.payloads if observation is not None else []
+            )
+            if isinstance(
+                observation_payload,
+                CalibrationInventoryObservation,
+            )
+            for source in observation_payload.sensor_sources
+        }
+        if selected_sensor_source not in observed_sources:
+            return False
     error_type = (
         None
         if action == "confirm"
@@ -1196,15 +1262,31 @@ def submit_plan_human_decision(
             "action": action,
             "text": decision.get("text"),
             "error_type": error_type,
+            **(
+                {
+                    "selected_sensor_source": selected_sensor_source,
+                    "selected_calibration_profile": selected_calibration_profile,
+                }
+                if action == "confirm" and selected_sensor_source is not None
+                else {}
+            ),
         },
     }
-    normalized_decision = _redact_sensitive({
+    normalized_decision_payload = {
         "action": action,
         "text": decision.get("text"),
         "request_id": decision.get("request_id"),
         "plan_id": plan_id,
         "step_id": step_id,
-    })
+    }
+    if action == "confirm" and selected_sensor_source is not None:
+        normalized_decision_payload.update(
+            {
+                "selected_sensor_source": selected_sensor_source,
+                "selected_calibration_profile": selected_calibration_profile,
+            }
+        )
+    normalized_decision = _redact_sensitive(normalized_decision_payload)
     decision_key = human_decision_key(normalized_decision)
     existing_handoff = plan_store.get_human_decision_handoff(plan_id, step_id)
     if existing_handoff is None:
