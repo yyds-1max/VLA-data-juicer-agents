@@ -1453,6 +1453,124 @@ def test_worker_executes_store_bound_postprocessing_and_creates_review(
         assert str(tmp_path) not in evidence_response.text
 
 
+def test_postprocessing_cancel_before_publish_does_not_write_finish_data(
+    tmp_path: Path,
+) -> None:
+    store = AnnotationStore(tmp_path / "annotation.sqlite")
+    job = _seed_tracked_job(store, tmp_path)
+    service = AnnotationApplicationService(store=store, worker=FakeWorker())
+    started = service.begin_postprocessing(
+        job["job_ref"],
+        job["state_revision"],
+        PostprocessingSpecInput(
+            localization_kind="odom",
+            gridmap_decision="copy_existing_gridmap",
+            trajectory_variant="cjl_0525_with_gridmap",
+            plan_sha256="d" * 64,
+            observations_sha256="e" * 64,
+        ),
+        idempotency_key="worker-postprocessing-cancel-fence",
+    )
+
+    class CancellingRuntime(FakePostprocessingRuntime):
+        def run(self, request):
+            result = super().run(request)
+            current = store.get_job(request.job_ref)
+            store.cancel_job(
+                job_ref=request.job_ref,
+                expected_job_revision=current["state_revision"],
+                idempotency_key="cancel-before-postprocessing-publication",
+            )
+            return result
+
+    class RecordingPublisher(FakePostprocessingPublisher):
+        calls = 0
+
+        def publish(self, **kwargs):
+            self.calls += 1
+            return super().publish(**kwargs)
+
+    finish_root = tmp_path / "finish_data"
+    publisher = RecordingPublisher(finish_root)
+    worker = AnnotationWorker(
+        store,
+        FakeM1Runtime(tmp_path / "writer.lock"),
+        postprocessing_runtime=CancellingRuntime(tmp_path / "post-runtime"),
+        postprocessing_publisher=publisher,
+    )
+
+    assert asyncio.run(worker.run_once()) is True
+
+    cancelled = store.get_job(started["job_ref"])
+    assert cancelled["status"] == "cancelled"
+    assert publisher.calls == 0
+    assert list(finish_root.iterdir()) == []
+    assert store.list_reviews() == []
+
+
+def test_postprocessing_publication_fence_rejects_late_cancel(
+    tmp_path: Path,
+) -> None:
+    store = AnnotationStore(tmp_path / "annotation.sqlite")
+    job = _seed_tracked_job(store, tmp_path)
+    service = AnnotationApplicationService(store=store, worker=FakeWorker())
+    started = service.begin_postprocessing(
+        job["job_ref"],
+        job["state_revision"],
+        PostprocessingSpecInput(
+            localization_kind="odom",
+            gridmap_decision="copy_existing_gridmap",
+            trajectory_variant="cjl_0525_with_gridmap",
+            plan_sha256="d" * 64,
+            observations_sha256="e" * 64,
+        ),
+        idempotency_key="worker-postprocessing-publication-fence",
+    )
+    entered = threading.Event()
+    release = threading.Event()
+
+    class BlockingPublisher(FakePostprocessingPublisher):
+        def publish(self, **kwargs):
+            entered.set()
+            if not release.wait(timeout=5):
+                raise RuntimeError("test publication release timed out")
+            return super().publish(**kwargs)
+
+    finish_root = tmp_path / "finish_data"
+    worker = AnnotationWorker(
+        store,
+        FakeM1Runtime(tmp_path / "writer.lock"),
+        postprocessing_runtime=FakePostprocessingRuntime(
+            tmp_path / "post-runtime",
+        ),
+        postprocessing_publisher=BlockingPublisher(finish_root),
+    )
+
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        future = executor.submit(asyncio.run, worker.run_once())
+        assert entered.wait(timeout=5)
+        current = store.get_job(started["job_ref"])
+        try:
+            with pytest.raises(AnnotationConflictError) as failure:
+                store.cancel_job(
+                    job_ref=started["job_ref"],
+                    expected_job_revision=current["state_revision"],
+                    idempotency_key="late-cancel-after-publication-fence",
+                )
+            assert (
+                failure.value.code
+                == "postprocessing_publication_in_progress"
+            )
+        finally:
+            release.set()
+        assert future.result(timeout=5) is True
+
+    completed = store.get_job(started["job_ref"])
+    assert completed["status"] == "annotated"
+    assert len(store.list_reviews()) == 1
+    assert any(finish_root.rglob("*_trajectory.json"))
+
+
 def test_worker_generates_store_bound_fix_revision_from_command_log(
     tmp_path: Path,
 ) -> None:

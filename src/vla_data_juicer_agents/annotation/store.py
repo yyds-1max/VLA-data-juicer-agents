@@ -5308,6 +5308,66 @@ class AnnotationStore:
                 ),
             )
 
+    def begin_postprocessing_publication(self, *, run_id: int) -> bool:
+        """Atomically choose publication or a previously requested cancel.
+
+        Once this durable fence is recorded, cancellation must no longer turn
+        the Job into ``cancelled``: compatibility output may be committed at
+        any point after the transaction returns.
+        """
+
+        with self._write() as connection:
+            run = self._running_run(connection, run_id)
+            if run["kind"] != "postprocessing":
+                raise RuntimeError(
+                    "publication fence belongs to a different run kind"
+                )
+            job = self._job_row(connection, int(run["job_id"]))
+            if job["status"] != "postprocessing":
+                raise RuntimeError(
+                    "publication fence requires an active postprocessing job"
+                )
+            if bool(job["cancel_requested"]):
+                return False
+            existing = connection.execute(
+                """
+                SELECT 1 FROM runtime_run_steps
+                WHERE run_id = ? AND safe_step_code = 'compatibility_publish'
+                """,
+                (run_id,),
+            ).fetchone()
+            if existing is not None:
+                raise RuntimeError(
+                    "postprocessing publication fence was already recorded"
+                )
+            ordinal_row = connection.execute(
+                """
+                SELECT COALESCE(MAX(ordinal), 0) + 1 AS ordinal
+                FROM runtime_run_steps WHERE run_id = ?
+                """,
+                (run_id,),
+            ).fetchone()
+            timestamp = _now()
+            connection.execute(
+                """
+                INSERT INTO runtime_run_steps (
+                    run_id, ordinal, safe_step_code, status,
+                    artifact_sha256, return_code, diagnostic_ref,
+                    created_at, updated_at
+                ) VALUES (
+                    ?, ?, 'compatibility_publish', 'started',
+                    NULL, NULL, NULL, ?, ?
+                )
+                """,
+                (
+                    run_id,
+                    int(ordinal_row["ordinal"]),
+                    timestamp,
+                    timestamp,
+                ),
+            )
+            return True
+
     def finish_runtime_step(
         self,
         *,
@@ -8087,7 +8147,7 @@ class AnnotationStore:
         timestamp = _now()
         active = connection.execute(
             """
-            SELECT 1 FROM runtime_runs
+            SELECT id, kind FROM runtime_runs
             WHERE job_id = ? AND status = 'running'
             LIMIT 1
             """,
@@ -8106,6 +8166,23 @@ class AnnotationStore:
                 raise RuntimeError(
                     "cannot release a source scope while its Runtime is active",
                 )
+            if active["kind"] == "postprocessing":
+                publication_fence = connection.execute(
+                    """
+                    SELECT 1 FROM runtime_run_steps
+                    WHERE run_id = ?
+                      AND safe_step_code = 'compatibility_publish'
+                    LIMIT 1
+                    """,
+                    (active["id"],),
+                ).fetchone()
+                if publication_fence is not None:
+                    raise AnnotationConflictError(
+                        "postprocessing_publication_in_progress",
+                        "Postprocessing publication has started and can no "
+                        "longer be cancelled.",
+                        current=self._job_projection(connection, job_id),
+                    )
             connection.execute(
                 """
                 UPDATE annotation_jobs

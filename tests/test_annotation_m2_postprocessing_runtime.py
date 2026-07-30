@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+from dataclasses import replace
 import hashlib
+import json
 from pathlib import Path
 import threading
 
@@ -15,6 +17,8 @@ from vla_data_juicer_agents.annotation.postprocessing_runtime import (
     PostprocessingSegmentInput,
     PublicationItem,
     _POSTPROCESSING_FROZEN_METADATA,
+    _POSTPROCESSING_REQUIRED_DISTRIBUTIONS,
+    _legacy_finish_temp_name,
     _validate_gridmap_decision_input,
 )
 from vla_data_juicer_agents.annotation.runtime import (
@@ -40,12 +44,19 @@ class _PreflightRuntime(_ValidationRuntime):
     def __init__(self, config: NavigationAnnotationRuntimeConfig) -> None:
         super().__init__(config)
         self.revalidated: list[str] = []
+        self.dependencies_revalidated: list[str] = []
 
     def _revalidate_postprocessing_inputs(
         self,
         expected_manifest_sha256: str,
     ) -> None:
         self.revalidated.append(expected_manifest_sha256)
+
+    def _revalidate_postprocessing_dependencies(
+        self,
+        expected_manifest_sha256: str,
+    ) -> None:
+        self.dependencies_revalidated.append(expected_manifest_sha256)
 
 
 class _SnapshotProbeRuntime(_ValidationRuntime):
@@ -54,6 +65,12 @@ class _SnapshotProbeRuntime(_ValidationRuntime):
         expected_manifest_sha256: str,
     ) -> str:
         return expected_manifest_sha256
+
+    def _revalidate_postprocessing_dependencies(
+        self,
+        expected_manifest_sha256: str,
+    ) -> None:
+        return None
 
 
 class _RunStepProbeRuntime(_PreflightRuntime):
@@ -300,6 +317,42 @@ def test_existing_gridmap_does_not_accept_projection_ready_only(
     assert failure.value.code == "gridmap_decision_precondition_failed"
 
 
+def test_generated_gridmap_is_revalidated_in_private_clip_mirror(
+    tmp_path: Path,
+) -> None:
+    request = replace(
+        _request(tmp_path),
+        gridmap_decision="generate_from_pcd",
+    )
+    finish_temp = tmp_path / "candidate"
+    private_clip = tmp_path / "private-clip"
+    generated = (
+        private_clip
+        / request.dataset_date
+        / request.segments[0].source_clip
+        / "sync_data"
+        / request.segments[0].private_segment_key
+        / "grid_map"
+    )
+    generated.mkdir(parents=True)
+    (generated / "000001.json").write_text("{}", encoding="utf-8")
+
+    _validate_gridmap_decision_input(
+        request=request,
+        finish_temp_root=finish_temp,
+        private_clip_root=private_clip,
+    )
+
+    (generated / "000001.json").unlink()
+    with pytest.raises(RuntimeExecutionError) as failure:
+        _validate_gridmap_decision_input(
+            request=request,
+            finish_temp_root=finish_temp,
+            private_clip_root=private_clip,
+        )
+    assert failure.value.code == "gridmap_decision_precondition_failed"
+
+
 def test_compatibility_publication_is_journaled_and_idempotent_by_hash(
     tmp_path: Path,
 ) -> None:
@@ -384,6 +437,141 @@ def test_compatibility_publication_stops_on_existing_difference(
     ).hexdigest() == hashlib.sha256(b'{"old":true}\n').hexdigest()
 
 
+def test_invalid_publication_candidate_does_not_create_empty_date_root(
+    tmp_path: Path,
+) -> None:
+    finish_root = tmp_path / "finish_data"
+    journal_root = tmp_path / "journal"
+    candidate = tmp_path / "candidate" / "20260605_160904"
+    finish_root.mkdir()
+    journal_root.mkdir(mode=0o700)
+    candidate.mkdir(parents=True)
+    (candidate / "artifact.json").write_text(
+        '{"candidate":true}\n',
+        encoding="utf-8",
+    )
+
+    with pytest.raises(RuntimeExecutionError) as failure:
+        CompatibilityPublisher(finish_root).publish(
+            job_ref="job_" + "1" * 32,
+            run_ref="run_" + "2" * 32,
+            dataset_date="20270605",
+            items=(
+                PublicationItem(
+                    source_clip="20260605_160904",
+                    candidate_root=candidate,
+                    expected_tree_sha256="0" * 64,
+                ),
+            ),
+            journal_root=journal_root,
+        )
+
+    assert failure.value.code == "publication_candidate_changed"
+    assert not (finish_root / "20270605").exists()
+    assert list(journal_root.iterdir()) == []
+
+
+def test_publication_failure_after_journal_requires_recovery(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    finish_root = tmp_path / "finish_data"
+    journal_root = tmp_path / "journal"
+    candidate = tmp_path / "candidate" / "20260605_160904"
+    finish_root.mkdir()
+    journal_root.mkdir(mode=0o700)
+    candidate.mkdir(parents=True)
+    (candidate / "artifact.json").write_text(
+        '{"candidate":true}\n',
+        encoding="utf-8",
+    )
+
+    def fail_copy(_source: Path, _destination: Path) -> None:
+        raise OSError("copy failed")
+
+    monkeypatch.setattr(postprocessing_module, "_copy_tree_bytes", fail_copy)
+    with pytest.raises(RuntimeExecutionError) as failure:
+        CompatibilityPublisher(finish_root).publish(
+            job_ref="job_" + "1" * 32,
+            run_ref="run_" + "2" * 32,
+            dataset_date="20270605",
+            items=(
+                PublicationItem(
+                    source_clip="20260605_160904",
+                    candidate_root=candidate,
+                    expected_tree_sha256=_tree_sha256(candidate),
+                ),
+            ),
+            journal_root=journal_root,
+        )
+
+    assert failure.value.code == "publication_recovery_required"
+    assert not (
+        finish_root / "20270605" / "20260605_160904"
+    ).exists()
+    journals = list(journal_root.glob("publication-*.json"))
+    assert len(journals) == 1
+    assert b'"state":"intent"' in journals[0].read_bytes()
+
+
+def test_publication_revalidates_outer_clip_after_atomic_rename(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    finish_root = tmp_path / "finish_data"
+    journal_root = tmp_path / "journal"
+    candidate = tmp_path / "candidate" / "20260605_160904"
+    finish_root.mkdir()
+    journal_root.mkdir(mode=0o700)
+    candidate.mkdir(parents=True)
+    (candidate / "artifact.json").write_text(
+        '{"candidate":true}\n',
+        encoding="utf-8",
+    )
+    real_replace = postprocessing_module.os.replace
+
+    def replace_then_tamper(source: Path, destination: Path) -> None:
+        real_replace(source, destination)
+        if Path(source).name.startswith(".annotation-"):
+            (Path(destination) / "unexpected.txt").write_text(
+                "changed",
+                encoding="utf-8",
+            )
+
+    monkeypatch.setattr(
+        postprocessing_module.os,
+        "replace",
+        replace_then_tamper,
+    )
+    with pytest.raises(RuntimeExecutionError) as failure:
+        CompatibilityPublisher(finish_root).publish(
+            job_ref="job_" + "1" * 32,
+            run_ref="run_" + "2" * 32,
+            dataset_date="20270605",
+            items=(
+                PublicationItem(
+                    source_clip="20260605_160904",
+                    candidate_root=candidate,
+                    expected_tree_sha256=_tree_sha256(candidate),
+                ),
+            ),
+            journal_root=journal_root,
+        )
+
+    assert failure.value.code == "publication_recovery_required"
+    assert (
+        finish_root
+        / "20270605"
+        / "20260605_160904"
+        / "unexpected.txt"
+    ).is_file()
+    journals = list(journal_root.glob("publication-*.json"))
+    assert len(journals) == 1
+    journal = json.loads(journals[0].read_text(encoding="utf-8"))
+    assert journal["state"] == "staged"
+    assert journal["items"][0]["state"] == "staged"
+
+
 def test_multi_clip_publication_preflights_every_target_before_first_write(
     tmp_path: Path,
 ) -> None:
@@ -442,6 +630,7 @@ def test_postprocessing_preflight_attests_manifest_and_rejects_ins(
         trajectory_variant="cjl_0525_with_gridmap",
     ) == expected
     assert runtime.revalidated == [expected]
+    assert runtime.dependencies_revalidated == [expected]
 
     with pytest.raises(RuntimeExecutionError) as failure:
         runtime.preflight(
@@ -451,6 +640,73 @@ def test_postprocessing_preflight_attests_manifest_and_rejects_ins(
         )
     assert failure.value.code == "unsupported_runtime_variant"
     assert runtime.revalidated == [expected]
+    assert runtime.dependencies_revalidated == [expected]
+
+
+def test_postprocessing_dependency_contract_includes_frozen_script_imports(
+    tmp_path: Path,
+) -> None:
+    manifest_path = (
+        Path(__file__).resolve().parents[1]
+        / "runtime"
+        / "navigation_odom_v1"
+        / "manifest.json"
+    )
+    document = json.loads(manifest_path.read_text(encoding="utf-8"))
+    available = {
+        str(entry["relative_path"]).rsplit("/", 1)[-1]: str(entry["version"])
+        for entry in document["entries"]
+        if entry["kind"] == "external_runtime"
+        and entry["role"]
+        in {"python_package", "python_package_direct_dependency"}
+    }
+    probes: list[tuple[str, ...]] = []
+
+    def package_probe(distributions: tuple[str, ...]) -> dict[str, str]:
+        probes.append(distributions)
+        return {name: available[name] for name in distributions}
+
+    config = replace(
+        _config(tmp_path),
+        manifest_path=manifest_path,
+        package_probe=package_probe,
+    )
+    runtime = _ValidationRuntime(config)
+    expected_sha256 = hashlib.sha256(manifest_path.read_bytes()).hexdigest()
+
+    runtime._revalidate_postprocessing_dependencies(expected_sha256)
+
+    assert probes == [tuple(sorted(_POSTPROCESSING_REQUIRED_DISTRIBUTIONS))]
+    assert {"matplotlib", "pypcd", "similaritymeasures"}.issubset(probes[0])
+
+    mismatched = _ValidationRuntime(
+        replace(
+            config,
+            package_probe=lambda distributions: {
+                name: (
+                    "unexpected"
+                    if name == "matplotlib"
+                    else available[name]
+                )
+                for name in distributions
+            },
+        )
+    )
+    with pytest.raises(RuntimeExecutionError) as failure:
+        mismatched._revalidate_postprocessing_dependencies(expected_sha256)
+    assert failure.value.code == "postprocessing_dependency_mismatch"
+
+    unavailable = _ValidationRuntime(
+        replace(
+            config,
+            package_probe=lambda _distributions: (_ for _ in ()).throw(
+                RuntimeError("probe failed")
+            ),
+        )
+    )
+    with pytest.raises(RuntimeExecutionError) as failure:
+        unavailable._revalidate_postprocessing_dependencies(expected_sha256)
+    assert failure.value.code == "postprocessing_dependency_mismatch"
 
 
 def test_compatibility_publisher_preflight_rejects_symlink_root(
@@ -471,6 +727,66 @@ class _SnapshotProbeComplete(RuntimeError):
     pass
 
 
+class _LegacyPathProbeComplete(RuntimeError):
+    pass
+
+
+class _LegacyPathProbeRuntime(_SnapshotProbeRuntime):
+    def __init__(self, config: NavigationAnnotationRuntimeConfig) -> None:
+        super().__init__(config)
+        self.step_calls: list[dict[str, object]] = []
+
+    def _run_step(self, **kwargs) -> None:
+        self.step_calls.append(dict(kwargs))
+        if kwargs["safe_step_code"] == "postprocess_gridmap":
+            private_clip_root = Path(kwargs["writable_bindings"][0][0])
+            for segment_root in private_clip_root.glob("*/*/sync_data/*"):
+                grid_map = segment_root / "grid_map"
+                grid_map.mkdir()
+                (grid_map / "000001.json").write_text(
+                    '{"data":[0]}\n',
+                    encoding="utf-8",
+                )
+        if kwargs["safe_step_code"] == "postprocess_gridmap_transform":
+            root = Path(kwargs["argv"][-1])
+            samples = root / "samples"
+            for segment_root in samples.glob("*/*"):
+                grid_map = segment_root / "grid_map"
+                grid_map.mkdir()
+                (grid_map / "000001.json").write_text(
+                    json.dumps({"data": [0] * 40000}),
+                    encoding="utf-8",
+                )
+        postcondition = kwargs.get("postcondition")
+        if postcondition is not None:
+            postcondition()
+        if kwargs["safe_step_code"] == "postprocess_final_candidate":
+            raise _LegacyPathProbeComplete
+
+
+class _SilentGridmapTransformProbeRuntime(_SnapshotProbeRuntime):
+    def __init__(self, config: NavigationAnnotationRuntimeConfig) -> None:
+        super().__init__(config)
+        self.called_steps: list[str] = []
+
+    def _run_step(self, **kwargs) -> None:
+        self.called_steps.append(str(kwargs["safe_step_code"]))
+        postcondition = kwargs.get("postcondition")
+        if postcondition is not None:
+            postcondition()
+
+
+class _DependencyDriftProbeRuntime(_SnapshotProbeRuntime):
+    def _revalidate_postprocessing_dependencies(
+        self,
+        expected_manifest_sha256: str,
+    ) -> None:
+        raise RuntimeExecutionError(
+            "postprocessing_dependency_mismatch",
+            "The frozen M2 Python dependencies failed verification.",
+        )
+
+
 def _runtime_for_snapshot_probe(
     tmp_path: Path,
 ) -> tuple[_SnapshotProbeRuntime, PostprocessingRequest, Path, Path]:
@@ -486,6 +802,9 @@ def _runtime_for_snapshot_probe(
     )
     source.mkdir(parents=True)
     (source / "source.bin").write_bytes(b"synchronized-source")
+    grid_map = source / "grid_map"
+    grid_map.mkdir()
+    (grid_map / "000001.json").write_text("{}", encoding="utf-8")
     runtime_root = tmp_path / "runtime"
     runtime_root.mkdir()
     lock_parent = tmp_path / "writer-coordination"
@@ -503,6 +822,326 @@ def _runtime_for_snapshot_probe(
         )
     )
     return runtime, request, clip_root, lock_path
+
+
+def _refresh_request_attestations(
+    request: PostprocessingRequest,
+) -> PostprocessingRequest:
+    segments = tuple(
+        replace(
+            segment,
+            expected_tree_sha256=_tree_sha256(segment.tracked_segment_root),
+        )
+        for segment in request.segments
+    )
+    targets = tuple(
+        TrackingTarget(
+            segment_root=segment.tracked_segment_root,
+            yaml_path=segment.tracked_segment_root / f"{identity}.yaml",
+            identity=identity,
+            expected_yaml_sha256="0" * 64,
+        )
+        for segment in segments
+        for identity in segment.tracking_identities
+    )
+    return replace(
+        request,
+        segments=segments,
+        expected_prepared_artifact_tree_sha256=(
+            prepared_staging_artifact_sha256(
+                request.tracked_staging_root,
+                targets,
+            )
+        ),
+    )
+
+
+def _add_shared_tracked_inputs(request: PostprocessingRequest) -> None:
+    maps = request.tracked_staging_root / "maps"
+    metadata = request.tracked_staging_root / "v1.0-trainval"
+    maps.mkdir()
+    metadata.mkdir()
+    (maps / "map.png").write_bytes(b"map")
+    (metadata / "scene.json").write_text("[]", encoding="utf-8")
+
+
+def test_frozen_postprocessing_receives_legacy_date_named_temp_root(
+    tmp_path: Path,
+) -> None:
+    runtime, request, _clip_root, _lock_path = _runtime_for_snapshot_probe(
+        tmp_path
+    )
+    _add_shared_tracked_inputs(request)
+    tracked_gridmap = request.segments[0].tracked_segment_root / "grid_map"
+    tracked_gridmap.mkdir()
+    (tracked_gridmap / "000001.json").write_text(
+        '{"data":[1]}\n',
+        encoding="utf-8",
+    )
+    request = _refresh_request_attestations(request)
+    probe = _LegacyPathProbeRuntime(runtime.config)
+
+    with pytest.raises(_LegacyPathProbeComplete):
+        probe.run(request)
+
+    expected_name = _legacy_finish_temp_name(request.dataset_date)
+    expected_steps = [
+        "postprocess_projection",
+        "postprocess_world_coordinates",
+        "postprocess_speed_direction",
+        "postprocess_gridmap_transform",
+        "postprocess_trajectory",
+        "postprocess_final_candidate",
+    ]
+    assert [
+        str(call["safe_step_code"]) for call in probe.step_calls
+    ] == expected_steps
+    calls = {
+        str(call["safe_step_code"]): call for call in probe.step_calls
+    }
+    for step in (
+        "postprocess_projection",
+        "postprocess_world_coordinates",
+        "postprocess_speed_direction",
+        "postprocess_gridmap_transform",
+        "postprocess_trajectory",
+    ):
+        argv = calls[step]["argv"]
+        assert Path(argv[-1]).name == expected_name
+    final_argv = calls["postprocess_final_candidate"]["argv"]
+    assert Path(final_argv[-1]).name == expected_name
+    assert Path(final_argv[-3]).name == request.dataset_date
+
+    runtime_root = probe.config.runtime_source_root
+    assert runtime_root is not None
+    assert calls["postprocess_projection"]["cwd"] == (
+        runtime_root / "NuscenesAanlysis_smart_pts_project"
+    )
+    for step in (
+        "postprocess_world_coordinates",
+        "postprocess_speed_direction",
+        "postprocess_trajectory",
+        "postprocess_final_candidate",
+    ):
+        assert calls[step]["cwd"] == runtime_root / "2_pt_project"
+    assert calls["postprocess_gridmap_transform"]["cwd"] == (
+        runtime_root / "other_code"
+    )
+    data_python = probe.config.data_python
+    assert calls["postprocess_projection"]["argv"] == [
+        data_python,
+        runtime_root / "NuscenesAanlysis_smart_pts_project" / "main.py",
+        "--data_root",
+        calls["postprocess_projection"]["argv"][-1],
+    ]
+    assert calls["postprocess_world_coordinates"]["argv"] == [
+        data_python,
+        runtime_root / "2_pt_project" / "0_img2world.py",
+        calls["postprocess_world_coordinates"]["argv"][-1],
+    ]
+    assert calls["postprocess_speed_direction"]["argv"] == [
+        data_python,
+        runtime_root / "2_pt_project" / "4_speed_direction_odom.py",
+        calls["postprocess_speed_direction"]["argv"][-1],
+    ]
+    assert calls["postprocess_gridmap_transform"]["argv"] == [
+        data_python,
+        runtime_root / "other_code" / "cp_gridmap.py",
+        "--root_data",
+        calls["postprocess_gridmap_transform"]["argv"][-1],
+    ]
+    assert calls["postprocess_trajectory"]["argv"] == [
+        data_python,
+        runtime_root / "2_pt_project" / "2_othermethod_cjl_0525.py",
+        calls["postprocess_trajectory"]["argv"][-1],
+    ]
+    assert calls["postprocess_final_candidate"]["argv"] == [
+        data_python,
+        runtime_root / "2_pt_project" / "3_move_dir.py",
+        "--root_path",
+        calls["postprocess_final_candidate"]["argv"][-3],
+        "--temp_path",
+        calls["postprocess_final_candidate"]["argv"][-1],
+    ]
+
+    gridmap_bindings = calls["postprocess_gridmap_transform"][
+        "readonly_bindings"
+    ]
+    final_bindings = calls["postprocess_final_candidate"][
+        "readonly_bindings"
+    ]
+    assert gridmap_bindings == final_bindings
+    assert len(gridmap_bindings) == 1
+    private_clip_root, legacy_clip_root = gridmap_bindings[0]
+    assert Path(private_clip_root).parts[-2:] == (".runtime", "clip_data")
+    assert legacy_clip_root == probe.config.legacy_clip_data_root
+
+
+def test_runtime_dependency_drift_stops_before_attempt_creation(
+    tmp_path: Path,
+) -> None:
+    runtime, request, _clip_root, _lock_path = _runtime_for_snapshot_probe(
+        tmp_path
+    )
+    _add_shared_tracked_inputs(request)
+    request = _refresh_request_attestations(request)
+    probe = _DependencyDriftProbeRuntime(runtime.config)
+
+    with pytest.raises(RuntimeExecutionError) as failure:
+        probe.run(request)
+
+    assert failure.value.code == "postprocessing_dependency_mismatch"
+    attempt_root = (
+        probe.config.work_root
+        / "jobs"
+        / request.job_ref
+        / "postprocessing"
+        / request.run_ref
+    )
+    assert not attempt_root.exists()
+
+
+def test_gridmap_transform_exit_zero_without_outputs_stops_before_trajectory(
+    tmp_path: Path,
+) -> None:
+    runtime, request, _clip_root, _lock_path = _runtime_for_snapshot_probe(
+        tmp_path
+    )
+    _add_shared_tracked_inputs(request)
+    tracked_gridmap = request.segments[0].tracked_segment_root / "grid_map"
+    tracked_gridmap.mkdir()
+    (tracked_gridmap / "000001.json").write_text(
+        '{"data":[1]}\n',
+        encoding="utf-8",
+    )
+    request = _refresh_request_attestations(request)
+    probe = _SilentGridmapTransformProbeRuntime(runtime.config)
+
+    with pytest.raises(RuntimeExecutionError) as failure:
+        probe.run(request)
+
+    assert failure.value.code == "postprocess_gridmap_transform_failed"
+    assert probe.called_steps == [
+        "postprocess_projection",
+        "postprocess_world_coordinates",
+        "postprocess_speed_direction",
+        "postprocess_gridmap_transform",
+    ]
+    attempt_root = (
+        probe.config.work_root
+        / "jobs"
+        / request.job_ref
+        / "postprocessing"
+        / request.run_ref
+    )
+    backup = (
+        attempt_root
+        / ".runtime"
+        / "gridmap-before-transform"
+        / request.segments[0].segment_ref
+    )
+    assert _tree_sha256(backup) == _tree_sha256(tracked_gridmap)
+
+
+def test_generated_gridmap_exit_zero_without_output_stops_before_projection(
+    tmp_path: Path,
+) -> None:
+    runtime, request, clip_root, _lock_path = _runtime_for_snapshot_probe(
+        tmp_path
+    )
+    source_gridmap = (
+        clip_root
+        / request.dataset_date
+        / request.segments[0].source_clip
+        / "sync_data"
+        / request.segments[0].private_segment_key
+        / "grid_map"
+    )
+    (source_gridmap / "000001.json").unlink()
+    source_gridmap.rmdir()
+    _add_shared_tracked_inputs(request)
+    request = _refresh_request_attestations(
+        replace(request, gridmap_decision="generate_from_pcd")
+    )
+    probe = _SilentGridmapTransformProbeRuntime(runtime.config)
+
+    with pytest.raises(RuntimeExecutionError) as failure:
+        probe.run(request)
+
+    assert failure.value.code == "gridmap_decision_precondition_failed"
+    assert probe.called_steps == ["postprocess_gridmap"]
+
+
+def test_generated_gridmap_uses_private_writable_legacy_overlay(
+    tmp_path: Path,
+) -> None:
+    runtime, request, clip_root, _lock_path = _runtime_for_snapshot_probe(
+        tmp_path
+    )
+    source_gridmap = (
+        clip_root
+        / request.dataset_date
+        / request.segments[0].source_clip
+        / "sync_data"
+        / request.segments[0].private_segment_key
+        / "grid_map"
+    )
+    (source_gridmap / "000001.json").unlink()
+    source_gridmap.rmdir()
+    _add_shared_tracked_inputs(request)
+    request = _refresh_request_attestations(
+        replace(request, gridmap_decision="generate_from_pcd")
+    )
+    probe = _LegacyPathProbeRuntime(runtime.config)
+
+    with pytest.raises(_LegacyPathProbeComplete):
+        probe.run(request)
+
+    gridmap_call = probe.step_calls[0]
+    assert gridmap_call["safe_step_code"] == "postprocess_gridmap"
+    assert gridmap_call["argv"][:2] == [
+        probe.config.data_python,
+        probe.config.runtime_source_root / "other_code" / "pcd_to_grid.py",
+    ]
+    assert gridmap_call["argv"][2:6] == [
+        "--base-path",
+        gridmap_call["argv"][3],
+        "--date",
+        request.dataset_date,
+    ]
+    assert gridmap_call["argv"][6:] == [
+        "--segments",
+        request.segments[0].source_clip,
+    ]
+    writable = gridmap_call["writable_bindings"]
+    assert len(writable) == 1
+    assert Path(writable[0][0]).parts[-2:] == (".runtime", "clip_data")
+    assert writable[0][1] == probe.config.legacy_clip_data_root
+
+
+def test_projection_ready_does_not_recopy_or_retransform_gridmap(
+    tmp_path: Path,
+) -> None:
+    runtime, request, _clip_root, _lock_path = _runtime_for_snapshot_probe(
+        tmp_path
+    )
+    _add_shared_tracked_inputs(request)
+    grid_map = request.segments[0].tracked_segment_root / "grid_map"
+    grid_map.mkdir()
+    (grid_map / "000001.json").write_text("{}", encoding="utf-8")
+    request = _refresh_request_attestations(
+        replace(request, gridmap_decision="skip_if_projection_ready")
+    )
+    probe = _LegacyPathProbeRuntime(runtime.config)
+
+    with pytest.raises(_LegacyPathProbeComplete):
+        probe.run(request)
+
+    called_steps = {
+        str(call["safe_step_code"]) for call in probe.step_calls
+    }
+    assert "postprocess_gridmap_transform" not in called_steps
+    assert "postprocess_trajectory" in called_steps
 
 
 def test_clip_snapshot_copy_holds_writer_lock_and_exception_releases_it(
