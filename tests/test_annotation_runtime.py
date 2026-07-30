@@ -1913,6 +1913,35 @@ def test_sandbox_command_uses_fixed_xvfb_and_read_only_host_root(
     assert "--die-with-parent" in shell
     assert "--unshare-net" in shell
     assert "XQuartz" not in shell
+    assert shell.index(str(config.bwrap_path)) < shell.index(
+        str(config.xvfb_run_path)
+    )
+    private_tmp = staging / ".runtime" / "tmp"
+    assert f"--bind {private_tmp} /tmp" in shell
+    assert shell.index(f"--bind {private_tmp} /tmp") < shell.index(
+        str(config.xvfb_run_path)
+    )
+
+
+def test_sandbox_command_keeps_one_explicit_private_tmp_binding(
+    tmp_path: Path,
+) -> None:
+    config = _config(tmp_path)
+    adapter = NavigationAnnotationRuntimeAdapter(config)
+    staging = config.work_root / "jobs" / ("job_" + "c" * 32) / "20270605_temp"  # type: ignore[operator]
+    explicit_tmp = staging / "postprocess-attempt" / "tmp"
+    explicit_tmp.mkdir(parents=True)
+
+    command = adapter._sandbox_command(
+        staging_root=staging,
+        argv=["./bin/main"],
+        cwd=config.runtime_source_root / "1_onnx_tam",  # type: ignore[operator]
+        writable_bindings=((explicit_tmp, Path("/tmp")),),
+    )
+
+    shell = command[2]
+    assert shell.count(f"--bind {explicit_tmp} /tmp") == 1
+    assert f"--bind {staging / '.runtime' / 'tmp'} /tmp" not in shell
 
 
 def test_sandbox_command_creates_legacy_target_only_inside_namespace(

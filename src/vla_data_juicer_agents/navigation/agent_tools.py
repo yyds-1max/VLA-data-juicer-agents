@@ -251,9 +251,6 @@ def build_navigation_tool_groups(
             finish_processing_planning_tool_names.discard(
                 "submit_finish_processing_plan_tool"
             )
-            finish_processing_planning_tool_names.discard(
-                "get_navigation_task_context_tool"
-            )
         if (
             not annotation_ready
             and observation is not None
@@ -438,8 +435,13 @@ def build_navigation_tool_groups(
                     )
                     if is_trajectory_review
                     else (
-                        "Read the latest task context, submit one complete "
-                        "finish-processing Plan, then execute the accepted first step."
+                        "Use the latest task context to diagnose missing scene_mode "
+                        "or observation facts. If the finish-Plan submission tool is "
+                        "absent, continue only with available bounded inspection or "
+                        "guidance tools and do not guess hidden submission or "
+                        "execution tools. Immediately before submission, read the "
+                        "task context again, submit one complete finish-processing "
+                        "Plan, then execute the accepted first step."
                     )
                 )
         groups[group_name] = NavigationToolGroupDefinition(

@@ -1111,8 +1111,6 @@ class AgentScopeRuntime:
         task = self._navigation_task_store().get_task(task_id)
         if binding is None or task is None:
             raise RuntimeError("Navigation workbench binding is unavailable")
-        if binding.slot_state != "open":
-            return False
         inbox_receipt = None
         wakeup_receipt = None
         record_receipt = None
@@ -1147,6 +1145,12 @@ class AgentScopeRuntime:
                     raise RuntimeError(
                         "durable workbench dispatch receipt is inconsistent"
                     )
+        if binding.slot_state != "open":
+            if inbox_receipt is not None and wakeup_receipt is not None:
+                return False
+            raise RuntimeError(
+                "Navigation workbench binding closed before durable dispatch"
+            )
         needs_publication = inbox_receipt is None or wakeup_receipt is None
         await self.ensure_web_session(
             binding.web_session_id,
@@ -2192,6 +2196,21 @@ class AgentScopeRuntime:
         if callable(publish):
             await publish(web_session_id, [record])
 
+    async def publish_navigation_task_state(self, *, task_id: str) -> None:
+        """Publish the latest authoritative task projection after a system handoff."""
+
+        if self.web_session_store is None:
+            return
+        binding = self.web_session_store.get_task_binding(task_id)
+        web_session_id = _record_value(binding, "web_session_id")
+        if not isinstance(web_session_id, str):
+            return
+        await self._publish_v1_task_state(
+            web_session_id=web_session_id,
+            task_id=task_id,
+            turn_id=None,
+        )
+
     def pending_interaction_snapshot(self, web_session_id: str) -> dict[str, Any] | None:
         if self.web_session_store is None:
             return None
@@ -2379,6 +2398,27 @@ class AgentScopeRuntime:
         get_outcome = getattr(task_store, "get_task_outcome", None)
         outcome = get_outcome(task_id) if callable(get_outcome) else None
         status = task.status.value
+        current_action: str | None = None
+        current_step_status: str | None = None
+        try:
+            plan_store = SqliteNavigationPlanRepository(
+                task_store.db_path,
+                initialize=False,
+            )
+            plan = plan_store.get_latest_accepted_for_task(task_id)
+            current = (
+                plan_store.get_current_step(plan.plan_id)
+                if plan is not None and plan.status == "active"
+                else None
+            )
+            if current is not None:
+                current_action = str(current["step"]["action"])
+                current_step_status = str(current["step"]["status"])
+        except Exception:
+            _logger.exception(
+                "Navigation task phase projection failed: task_id=%s",
+                task_id,
+            )
         phase = (
             "等待确认"
             if status == "waiting_user"
@@ -2417,6 +2457,22 @@ class AgentScopeRuntime:
             if task.accepted_plan_phase == "trajectory_review"
             else "检查数据"
         )
+        if status in {"active", "waiting_user"}:
+            if current_action == "confirm_navigation_calibration_params":
+                phase = "确认标定参数"
+            elif current_action == "run_annotation_tracking_workflow":
+                phase = (
+                    "Tracking"
+                    if current_step_status == "running"
+                    else "等待首帧标注"
+                )
+            elif current_action == "run_annotation_postprocessing_workflow":
+                phase = "后处理"
+            elif current_action in {
+                "open_trajectory_fix_workbench",
+                "validate_trajectory_review_outcome",
+            }:
+                phase = "等待人工复核"
         wait_cause = {
             "waiting_user": "等待你补充信息或作出选择",
             "paused": "任务已暂停",
@@ -2424,6 +2480,16 @@ class AgentScopeRuntime:
             "needs_replan": "现有方案需要调整",
             "cancelling": "正在安全取消",
         }.get(status)
+        if status == "waiting_user":
+            if current_action == "confirm_navigation_calibration_params":
+                wait_cause = "等待你选择并确认标定参数"
+            elif current_action == "run_annotation_tracking_workflow":
+                wait_cause = "等待你提交全部首帧标注"
+            elif current_action in {
+                "open_trajectory_fix_workbench",
+                "validate_trajectory_review_outcome",
+            }:
+                wait_cause = "等待你在人工复核工作台完成操作"
         available_actions = {
             "active": ["stop", "cancel"],
             "waiting_user": ["provide_input", "cancel"],

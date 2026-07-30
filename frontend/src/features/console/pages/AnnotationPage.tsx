@@ -38,19 +38,24 @@ import {
   resetNavigationDatasetSummaryCache,
 } from "../navigationDatasetSummaryCache";
 import { InitialAnnotationWorkbench } from "../../annotation/InitialAnnotationWorkbench";
-import { useAnnotationEvents } from "../../annotation/events";
 import {
   AnnotationApiError,
-  getAnnotationCapabilities,
-  getAnnotationJob,
-  getAnnotationSegment,
-  listAnnotationJobs,
   mutateAnnotationJob,
   mutateAnnotationSegment,
   skipAnnotationSegment,
 } from "../../annotation/api";
+import {
+  annotationProjectionStore,
+  cacheAnnotationJob,
+  cacheAnnotationSegment,
+  loadAnnotationCapability,
+  loadAnnotationJob,
+  loadAnnotationJobs,
+  loadAnnotationSegment,
+  retainAnnotationJobProjection,
+  retainAnnotationSegmentProjection,
+} from "../../annotation/projectionStore";
 import type {
-  AnnotationCapability,
   AnnotationJobDetail,
   AnnotationJobStatus,
   AnnotationJobSummary,
@@ -126,14 +131,6 @@ function preferMonotonicJob<T extends AnnotationJobSummary>(
     return current;
   }
   return next;
-}
-
-function mergeMonotonicJobs(
-  current: AnnotationJobSummary[],
-  next: AnnotationJobSummary[],
-): AnnotationJobSummary[] {
-  const currentByRef = new Map(current.map((job) => [job.job_ref, job]));
-  return next.map((job) => preferMonotonicJob(currentByRef.get(job.job_ref), job));
 }
 
 function resolvedSegmentCount(job: Pick<AnnotationJobSummary, "counts">): number {
@@ -351,10 +348,15 @@ function JobsSection({
 
 function JobsPage() {
   const navigate = useNavigate();
-  const [jobs, setJobs] = useState<AnnotationJobSummary[]>([]);
-  const [capability, setCapability] = useState<AnnotationCapability | null>(null);
+  const jobs = useStore(annotationProjectionStore, (state) => state.jobs);
+  const jobsLoaded = useStore(annotationProjectionStore, (state) => state.jobsLoaded);
+  const capability = useStore(annotationProjectionStore, (state) => state.capability);
+  const capabilityLoaded = useStore(
+    annotationProjectionStore,
+    (state) => state.capabilityLoaded,
+  );
   const [dates, setDates] = useState<NavigationDateSummary[]>([]);
-  const [loading, setLoading] = useState(true);
+  const [loading, setLoading] = useState(!jobsLoaded || !capabilityLoaded);
   const [pageError, setPageError] = useState("");
   const [dialogOpen, setDialogOpen] = useState(false);
   const [activeInvocationId, setActiveInvocationId] = useState<string | null>(null);
@@ -371,38 +373,23 @@ function JobsPage() {
       ? activeInvocation.error ?? "提交失败，请重试。"
       : null;
 
-  const refreshJobs = useCallback(async () => {
-    try {
-      const nextJobs = await listAnnotationJobs();
-      setJobs((current) => mergeMonotonicJobs(current, nextJobs));
-    } catch (requestError) {
-      setPageError(safeError(requestError, "读取自动标注任务失败"));
-    }
-  }, []);
-
   const refresh = useCallback(async (invalidateDataset = false) => {
     if (invalidateDataset) resetNavigationDatasetSummaryCache();
     const results = await Promise.allSettled([
-      listAnnotationJobs(),
-      getAnnotationCapabilities(),
+      loadAnnotationJobs({ force: invalidateDataset }),
+      loadAnnotationCapability({ force: invalidateDataset }),
       getNavigationDatasetSummaryCached(),
     ]);
     const [jobsResult, capabilityResult, datasetResult] = results;
-    if (jobsResult.status === "fulfilled") {
-      setJobs((current) => mergeMonotonicJobs(current, jobsResult.value));
-    } else {
+    if (jobsResult.status === "rejected") {
       setPageError(safeError(jobsResult.reason, "读取自动标注任务失败"));
     }
-    setCapability(capabilityResult.status === "fulfilled"
-      ? capabilityResult.value
-      : {
-          available: false,
-          runtime_id: "navigation_odom_v1",
-          reason: {
-            code: "capability_unavailable",
-            message: "暂时无法确认处理环境状态。",
-          },
-        });
+    if (capabilityResult.status === "rejected") {
+      setPageError((current) => current || safeError(
+        capabilityResult.reason,
+        "读取处理环境状态失败",
+      ));
+    }
     if (datasetResult.status === "fulfilled") {
       setDates(datasetResult.value.dates.filter((date) => date.synced_clip_count > 0));
     } else {
@@ -417,14 +404,6 @@ function JobsPage() {
   useEffect(() => {
     void refresh(false);
   }, [refresh]);
-
-  useAnnotationEvents({
-    filter: (event) => (
-      event.aggregate_kind === "job" || event.aggregate_kind === "segment"
-    ),
-    onEvent: refreshJobs,
-    onReconcile: refreshJobs,
-  });
 
   useEffect(() => {
     if (
@@ -782,16 +761,26 @@ function JobActions({
 
 function JobPage({ jobRef }: { jobRef: string }) {
   const navigate = useNavigate();
-  const [job, setJob] = useState<AnnotationJobDetail | null>(null);
-  const [loading, setLoading] = useState(true);
+  const projectedJob = useStore(
+    annotationProjectionStore,
+    (state) => state.jobDetails[jobRef] ?? null,
+  );
+  const [job, setJob] = useState<AnnotationJobDetail | null>(projectedJob);
+  const [loading, setLoading] = useState(projectedJob === null);
   const [error, setError] = useState("");
   const updateJob = useCallback((nextJob: AnnotationJobDetail) => {
-    setJob((current) => preferMonotonicJob(current, nextJob));
+    const cached = cacheAnnotationJob(nextJob);
+    setJob((current) => preferMonotonicJob(current, cached));
   }, []);
+
+  useEffect(
+    () => retainAnnotationJobProjection(jobRef),
+    [jobRef],
+  );
 
   const refresh = useCallback(async () => {
     try {
-      const nextJob = await getAnnotationJob(jobRef);
+      const nextJob = await loadAnnotationJob(jobRef);
       updateJob(nextJob);
       setError("");
     } catch (requestError) {
@@ -805,11 +794,9 @@ function JobPage({ jobRef }: { jobRef: string }) {
     void refresh();
   }, [refresh]);
 
-  useAnnotationEvents({
-    filter: (event) => event.job_ref === jobRef,
-    onEvent: refresh,
-    onReconcile: refresh,
-  });
+  useEffect(() => {
+    if (projectedJob) updateJob(projectedJob);
+  }, [projectedJob, updateJob]);
 
   if (loading) {
     return <section className="mx-auto max-w-7xl px-4 py-6 md:px-6"><PageMessage icon={LoaderCircle} title="正在读取任务…" /></section>;
@@ -946,9 +933,17 @@ function JobPage({ jobRef }: { jobRef: string }) {
 
 function SegmentPage({ jobRef, segmentRef }: { jobRef: string; segmentRef: string }) {
   const navigate = useNavigate();
-  const [job, setJob] = useState<AnnotationJobDetail | null>(null);
-  const [segment, setSegment] = useState<AnnotationSegmentDetail | null>(null);
-  const [loading, setLoading] = useState(true);
+  const projectedJob = useStore(
+    annotationProjectionStore,
+    (state) => state.jobDetails[jobRef] ?? null,
+  );
+  const projectedSegment = useStore(
+    annotationProjectionStore,
+    (state) => state.segmentDetails[`${jobRef}:${segmentRef}`] ?? null,
+  );
+  const [job, setJob] = useState<AnnotationJobDetail | null>(projectedJob);
+  const [segment, setSegment] = useState<AnnotationSegmentDetail | null>(projectedSegment);
+  const [loading, setLoading] = useState(!projectedJob || !projectedSegment);
   const [error, setError] = useState("");
   const [actionError, setActionError] = useState("");
   const [externalSubmissionNotice, setExternalSubmissionNotice] = useState("");
@@ -967,40 +962,37 @@ function SegmentPage({ jobRef, segmentRef }: { jobRef: string; segmentRef: strin
   );
   const flushForNavigation = useCallback(() => flushRef.current(), []);
   const updateJob = useCallback((nextJob: AnnotationJobDetail) => {
-    setJob((current) => preferMonotonicJob(current, nextJob));
+    const cached = cacheAnnotationJob(nextJob);
+    setJob((current) => preferMonotonicJob(current, cached));
   }, []);
   const updateSegment = useCallback((nextSegment: AnnotationSegmentDetail) => {
+    const cached = cacheAnnotationSegment(jobRef, nextSegment);
     const current = currentSegmentRef.current;
     if (
       current
-      && current.segment_ref === nextSegment.segment_ref
-      && nextSegment.state_revision < current.state_revision
+      && current.segment_ref === cached.segment_ref
+      && cached.state_revision < current.state_revision
     ) {
       return;
     }
-    currentSegmentRef.current = nextSegment;
-    setSegment(nextSegment);
-  }, []);
+    currentSegmentRef.current = cached;
+    setSegment(cached);
+  }, [jobRef]);
+
+  useEffect(
+    () => retainAnnotationJobProjection(jobRef),
+    [jobRef],
+  );
+
+  useEffect(
+    () => retainAnnotationSegmentProjection(jobRef, segmentRef),
+    [jobRef, segmentRef],
+  );
 
   const refreshJob = useCallback(async () => {
-    const nextJob = await getAnnotationJob(jobRef);
+    const nextJob = await loadAnnotationJob(jobRef, { force: true });
     updateJob(nextJob);
   }, [jobRef, updateJob]);
-
-  const refreshRuntimeState = useCallback(async () => {
-    try {
-      const nextJob = await getAnnotationJob(jobRef);
-      let nextSegment: AnnotationSegmentDetail | null = null;
-      if (nextJob.status !== "waiting_initial_annotation") {
-        nextSegment = await getAnnotationSegment(jobRef, segmentRef);
-      }
-      updateJob(nextJob);
-      if (nextSegment) updateSegment(nextSegment);
-      setError("");
-    } catch (requestError) {
-      setError(safeError(requestError, "刷新任务状态失败"));
-    }
-  }, [jobRef, segmentRef, updateJob, updateSegment]);
 
   useEffect(() => {
     setExternalSubmissionNotice("");
@@ -1010,8 +1002,8 @@ function SegmentPage({ jobRef, segmentRef }: { jobRef: string; segmentRef: strin
     let cancelled = false;
     setLoading(true);
     void Promise.all([
-      getAnnotationJob(jobRef),
-      getAnnotationSegment(jobRef, segmentRef),
+      loadAnnotationJob(jobRef),
+      loadAnnotationSegment(jobRef, segmentRef),
     ]).then(([nextJob, nextSegment]) => {
       if (cancelled) return;
       updateJob(nextJob);
@@ -1029,11 +1021,13 @@ function SegmentPage({ jobRef, segmentRef }: { jobRef: string; segmentRef: strin
     };
   }, [jobRef, segmentRef, updateJob, updateSegment]);
 
-  useAnnotationEvents({
-    filter: (event) => event.job_ref === jobRef,
-    onEvent: refreshRuntimeState,
-    onReconcile: refreshRuntimeState,
-  });
+  useEffect(() => {
+    if (projectedJob) updateJob(projectedJob);
+  }, [projectedJob, updateJob]);
+
+  useEffect(() => {
+    if (projectedSegment) updateSegment(projectedSegment);
+  }, [projectedSegment, updateSegment]);
 
   const navigateSafely = async (path: string) => {
     const saved = await flushRef.current();
@@ -1321,6 +1315,6 @@ export function AnnotationPage() {
   if (jobRef && segmentRef) {
     return <SegmentPage key={`${jobRef}:${segmentRef}`} jobRef={jobRef} segmentRef={segmentRef} />;
   }
-  if (jobRef) return <JobPage jobRef={jobRef} />;
+  if (jobRef) return <JobPage key={jobRef} jobRef={jobRef} />;
   return <JobsPage />;
 }

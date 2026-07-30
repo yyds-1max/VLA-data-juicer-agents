@@ -3,6 +3,20 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT_DIR="$(cd "${SCRIPT_DIR}/.." && pwd)"
+CONFIG_HELPER="${ROOT_DIR}/scripts/run_web_config.py"
+
+if [[ "${VLA_RUN_WEB_CONFIG_LOADED:-}" != "1" ]]; then
+  if [[ -x "${ROOT_DIR}/.venv/bin/python" ]]; then
+    CONFIG_PYTHON="${ROOT_DIR}/.venv/bin/python"
+  elif command -v python3 >/dev/null 2>&1; then
+    CONFIG_PYTHON="$(command -v python3)"
+  else
+    echo "Python 3 is required to load the Web deployment configuration." >&2
+    exit 127
+  fi
+  exec "${CONFIG_PYTHON}" "${CONFIG_HELPER}" -- \
+    bash "${SCRIPT_DIR}/run_web.sh" "$@"
+fi
 
 ACTION="${1:-start}"
 HOST="${HOST:-0.0.0.0}"
@@ -61,6 +75,13 @@ Environment:
   WEB_CMD               Override vla-data-agent-web command path.
   RUN_WEB_CONTROL_PYTHON
                         Python 3 used for safe PID/control operations.
+
+Before evaluating these settings, the script loads the optional fixed
+~/.config/vla-data-juicer-agents/run-web.json as inert JSON. The file must be
+owned by the current user with mode 0600, inside an owner-controlled directory
+with mode 0700. Explicit values already present in the calling environment take
+precedence. DASHSCOPE_API_KEY is never read from this file and must be inherited
+from the calling shell.
 
 New WORKING_DIR, STATE_DIR, and LOG_DIR paths are created under umask 077.
 Existing directory permissions are not changed.

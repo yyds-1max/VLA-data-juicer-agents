@@ -565,6 +565,13 @@ def test_calibration_interaction_uses_audited_processing_profile_choices() -> No
                     ),
                 },
                 {
+                    "profile_ref": "20260409_U",
+                    "label": "20260409_U",
+                    "selected_sensor_source": (
+                        "NoobScenes/params/20260409_U/sensors"
+                    ),
+                },
+                {
                     "profile_ref": "20260529_go2w",
                     "label": "20260529_go2w",
                     "selected_sensor_source": (
@@ -597,6 +604,7 @@ def test_calibration_interaction_uses_audited_processing_profile_choices() -> No
     )
     assert [option["label"] for option in interaction["options"]] == [
         "20260320",
+        "20260409_U",
         "20260529_go2w",
         "停止任务",
     ]

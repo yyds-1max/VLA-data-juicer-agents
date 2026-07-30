@@ -228,8 +228,8 @@ class AnnotationNavigationGateway(NavigationAnnotationGateway):
             in {
                 "preparing",
                 "waiting_initial_annotation",
-                "tracking",
             },
+            "waiting_for_runtime": job_status == "tracking",
             "completed": job_status in {"tracked", "postprocessing", "annotated"},
         }
 

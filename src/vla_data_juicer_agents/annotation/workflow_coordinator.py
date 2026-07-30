@@ -19,6 +19,7 @@ from vla_data_juicer_agents.navigation.evidence_store import (
 from vla_data_juicer_agents.navigation.plan_execution import (
     complete_annotation_workflow_step,
     fail_annotation_workflow_step,
+    resume_annotation_workflow_step,
 )
 from vla_data_juicer_agents.navigation.plan_store import (
     SqliteNavigationPlanRepository,
@@ -99,6 +100,27 @@ class AnnotationWorkflowCoordinator:
                         f"datapilot:auto_tracking:{handoff['handoff_ref']}"
                     ),
                 )
+                resumed = await asyncio.to_thread(
+                    resume_annotation_workflow_step,
+                    plan_store=self.plan_store,
+                    navigation_task_id=str(
+                        handoff["navigation_task_ref"]
+                    ),
+                    action="run_annotation_tracking_workflow",
+                )
+                if not resumed:
+                    raise RuntimeError(
+                        "Navigation workflow did not transfer to Tracking"
+                    )
+                publish_task_state = getattr(
+                    self.agentscope_runtime,
+                    "publish_navigation_task_state",
+                    None,
+                )
+                if callable(publish_task_state):
+                    await publish_task_state(
+                        task_id=str(handoff["navigation_task_ref"]),
+                    )
                 publish_milestone = getattr(
                     self.agentscope_runtime,
                     "publish_navigation_workflow_milestone",

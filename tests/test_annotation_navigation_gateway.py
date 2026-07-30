@@ -27,6 +27,7 @@ from vla_data_juicer_agents.navigation.evidence_store import (
 from vla_data_juicer_agents.navigation.plan_execution import (
     build_plan_bound_execution_tools,
     complete_annotation_workflow_step,
+    resume_annotation_workflow_step,
 )
 from vla_data_juicer_agents.navigation.plan_models import (
     FinishProcessingPlanInput,
@@ -34,6 +35,7 @@ from vla_data_juicer_agents.navigation.plan_models import (
 )
 from vla_data_juicer_agents.navigation.plan_store import (
     SqliteNavigationPlanRepository,
+    StepClaimOutcome,
 )
 from vla_data_juicer_agents.navigation.task_store import (
     SqliteNavigationTaskStore,
@@ -538,6 +540,7 @@ class _WakeRuntime:
     def __init__(self) -> None:
         self.wakes: list[dict[str, str]] = []
         self.milestones: list[dict[str, str]] = []
+        self.task_states: list[dict[str, str]] = []
 
     async def wake_navigation_task_from_workbench(self, **kwargs) -> bool:
         self.wakes.append(dict(kwargs))
@@ -546,9 +549,13 @@ class _WakeRuntime:
     async def publish_navigation_workflow_milestone(self, **kwargs) -> None:
         self.milestones.append(dict(kwargs))
 
+    async def publish_navigation_task_state(self, **kwargs) -> None:
+        self.task_states.append(dict(kwargs))
+
 
 def test_initial_annotation_handoff_starts_tracking_without_web_action(
     tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     handoff = {
         "handoff_id": 1,
@@ -566,8 +573,22 @@ def test_initial_annotation_handoff_starts_tracking_without_web_action(
         agentscope_runtime=runtime,
         navigation_workspace_root=tmp_path / "navigation",
     )
+    resumed: list[dict[str, object]] = []
+
+    def _resume(**kwargs) -> bool:
+        resumed.append(dict(kwargs))
+        return True
+
+    monkeypatch.setattr(
+        "vla_data_juicer_agents.annotation.workflow_coordinator."
+        "resume_annotation_workflow_step",
+        _resume,
+    )
 
     assert asyncio.run(coordinator.process_once()) is True
+    assert resumed[0]["navigation_task_id"] == "nav-task"
+    assert resumed[0]["action"] == "run_annotation_tracking_workflow"
+    assert runtime.task_states == [{"task_id": "nav-task"}]
     assert runtime.milestones == [
         {
             "task_id": "nav-task",
@@ -933,6 +954,264 @@ class _RuntimeUnavailableAnnotationGateway:
                 "job_ref": "job_" + "8" * 32,
             },
         )
+
+
+class _WaitingAnnotationGateway:
+    @staticmethod
+    def begin_annotation_from_plan(**_kwargs):
+        return {
+            "ok": True,
+            "status": "waiting_initial_annotation",
+            "waiting_for_workbench": True,
+            "waiting_for_runtime": False,
+            "completed": False,
+        }
+
+
+class _RunningPostprocessingGateway:
+    @staticmethod
+    def begin_postprocessing_from_plan(**_kwargs):
+        return {
+            "ok": True,
+            "status": "postprocessing",
+            "waiting_for_runtime": True,
+            "completed": False,
+        }
+
+
+class _RecordingPostprocessingGateway:
+    def __init__(self) -> None:
+        self.calls = 0
+
+    def begin_postprocessing_from_plan(self, **_kwargs):
+        self.calls += 1
+        return {
+            "ok": True,
+            "status": "postprocessing",
+            "waiting_for_runtime": True,
+            "completed": False,
+        }
+
+
+def _annotation_postprocessing_plan() -> FinishProcessingPlanInput:
+    payload = _annotation_tracking_plan().model_dump(mode="json")
+    payload["steps"] = [
+        {
+            "step_id": "postprocess",
+            "action": "run_annotation_postprocessing_workflow",
+            "variant": "plan_bound_runtime",
+            "arguments": {},
+            "depends_on": [],
+            "failure_policy": "stop",
+            "decision_refs": ["localization", "gridmap", "calibration"],
+        },
+        {
+            "step_id": "validate",
+            "action": "validate_navigation_outputs",
+            "variant": "expect_gridmap",
+            "arguments": {},
+            "depends_on": ["postprocess"],
+            "failure_policy": "stop",
+            "decision_refs": ["localization", "gridmap", "calibration"],
+        },
+    ]
+    return FinishProcessingPlanInput.model_validate(payload)
+
+
+def test_workbench_submission_transfers_waiting_task_to_tracking(
+    tmp_path: Path,
+) -> None:
+    database = tmp_path / "navigation.sqlite"
+    task_store = SqliteNavigationTaskStore(database)
+    task = task_store.create_task_attempt(
+        request="Automatically annotate the synchronized data",
+        target="20270605",
+        date="20270605",
+        segments=["20260605_160904"],
+        scene_mode=None,
+        dry_run=True,
+        web_session_id="web-owner",
+        agentscope_session_id="navigation-owner",
+        requested_outcome="postprocessing",
+    ).task
+    plan_store = SqliteNavigationPlanRepository(database)
+    plan = plan_store.activate(
+        task,
+        "finish_processing",
+        1,
+        _annotation_tracking_plan(),
+        expected_web_session_id="web-owner",
+        expected_agentscope_session_id="navigation-owner",
+    )
+    tools = {
+        tool.name: tool
+        for tool in build_plan_bound_execution_tools(
+            task=task_store.get_task(task.task_id),
+            plan_store=plan_store,
+            evidence_store=FileNavigationEvidenceStore(tmp_path / "evidence"),
+            settings=NavigationSettings(
+                vladatasets_root=tmp_path / "datasets",
+                processing_root=tmp_path / "processing",
+            ),
+            dry_run=True,
+            cancellation=None,
+            web_session_id="web-owner",
+            agentscope_session_id="navigation-owner",
+            annotation_gateway=_WaitingAnnotationGateway(),
+        )
+    }
+
+    waiting = asyncio.run(
+        _tool_payload(
+            tools["run_annotation_tracking_workflow_tool"],
+            plan_id=plan.plan_id,
+            step_id="annotation",
+        )
+    )
+    assert waiting["status"] == "waiting_user"
+    assert task_store.get_task(task.task_id).status.value == "waiting_user"
+
+    assert resume_annotation_workflow_step(
+        plan_store=plan_store,
+        navigation_task_id=task.task_id,
+        action="run_annotation_tracking_workflow",
+    )
+    current = plan_store.get_current_step(plan.plan_id)
+    assert current is not None
+    assert current["step"]["status"] == "running"
+    assert task_store.get_task(task.task_id).status.value == "active"
+
+
+def test_postprocessing_runtime_is_running_not_waiting_for_user(
+    tmp_path: Path,
+) -> None:
+    database = tmp_path / "navigation.sqlite"
+    task_store = SqliteNavigationTaskStore(database)
+    task = task_store.create_task_attempt(
+        request="Continue postprocessing",
+        target="20270623",
+        date="20270623",
+        segments=["20260623_145550"],
+        scene_mode="out",
+        dry_run=True,
+        web_session_id="web-owner",
+        agentscope_session_id="navigation-owner",
+        requested_outcome="postprocessing",
+    ).task
+    plan_store = SqliteNavigationPlanRepository(database)
+    plan = plan_store.activate(
+        task,
+        "finish_processing",
+        1,
+        _annotation_postprocessing_plan(),
+        expected_web_session_id="web-owner",
+        expected_agentscope_session_id="navigation-owner",
+    )
+    evidence_store = FileNavigationEvidenceStore(tmp_path / "evidence")
+    tools = {
+        tool.name: tool
+        for tool in build_plan_bound_execution_tools(
+            task=task_store.get_task(task.task_id),
+            plan_store=plan_store,
+            evidence_store=evidence_store,
+            settings=NavigationSettings(
+                vladatasets_root=tmp_path / "datasets",
+                processing_root=tmp_path / "processing",
+            ),
+            dry_run=True,
+            cancellation=None,
+            web_session_id="web-owner",
+            agentscope_session_id="navigation-owner",
+            annotation_gateway=_RunningPostprocessingGateway(),
+        )
+    }
+
+    running = asyncio.run(
+        _tool_payload(
+            tools["run_annotation_postprocessing_workflow_tool"],
+            plan_id=plan.plan_id,
+            step_id="postprocess",
+        )
+    )
+    assert running["status"] == "running"
+    assert running["next_action"] == "wait_for_runtime"
+    assert task_store.get_task(task.task_id).status.value == "active"
+    current = plan_store.get_current_step(plan.plan_id)
+    assert current is not None
+    assert current["step"]["status"] == "running"
+
+    assert complete_annotation_workflow_step(
+        plan_store=plan_store,
+        evidence_store=evidence_store,
+        navigation_task_id=task.task_id,
+        action="run_annotation_postprocessing_workflow",
+        status="annotated",
+    )
+    current = plan_store.get_current_step(plan.plan_id)
+    assert current is not None
+    assert current["step"]["step_id"] == "validate"
+
+
+def test_postprocessing_runtime_does_not_start_before_the_plan_step_is_claimed(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    database = tmp_path / "navigation.sqlite"
+    task_store = SqliteNavigationTaskStore(database)
+    task = task_store.create_task_attempt(
+        request="Continue postprocessing",
+        target="20270623",
+        date="20270623",
+        segments=["20260623_145550"],
+        scene_mode="out",
+        dry_run=False,
+        web_session_id="web-owner",
+        agentscope_session_id="navigation-owner",
+        requested_outcome="postprocessing",
+    ).task
+    plan_store = SqliteNavigationPlanRepository(database)
+    plan = plan_store.activate(
+        task,
+        "finish_processing",
+        1,
+        _annotation_postprocessing_plan(),
+        expected_web_session_id="web-owner",
+        expected_agentscope_session_id="navigation-owner",
+    )
+    gateway = _RecordingPostprocessingGateway()
+    monkeypatch.setattr(
+        plan_store,
+        "claim_step",
+        lambda *_args, **_kwargs: StepClaimOutcome.NAVIGATION_DATA_BUSY,
+    )
+    tools = {
+        tool.name: tool
+        for tool in build_plan_bound_execution_tools(
+            task=task_store.get_task(task.task_id),
+            plan_store=plan_store,
+            evidence_store=FileNavigationEvidenceStore(tmp_path / "evidence"),
+            settings=NavigationSettings(
+                vladatasets_root=tmp_path / "datasets",
+                processing_root=tmp_path / "processing",
+            ),
+            dry_run=False,
+            cancellation=None,
+            web_session_id="web-owner",
+            agentscope_session_id="navigation-owner",
+            annotation_gateway=gateway,
+        )
+    }
+
+    result = asyncio.run(
+        _tool_payload(
+            tools["run_annotation_postprocessing_workflow_tool"],
+            plan_id=plan.plan_id,
+            step_id="postprocess",
+        )
+    )
+
+    assert result["error_type"] == "navigation_data_busy"
+    assert gateway.calls == 0
 
 
 def test_annotation_gateway_exception_is_not_returned_to_model(

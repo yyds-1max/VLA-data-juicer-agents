@@ -11,6 +11,7 @@ import {
 } from "lucide-react";
 import { useCallback, useEffect, useMemo, useState } from "react";
 import { useNavigate } from "react-router-dom";
+import { useStore } from "zustand";
 
 import { ConsoleButton } from "../../components/console/ConsoleButton";
 import { ConsoleCard } from "../../components/console/ConsoleCard";
@@ -30,8 +31,11 @@ import {
   TableHeader,
   TableRow,
 } from "../../components/ui/table";
-import { AnnotationApiError, listTrajectoryReviews } from "./api";
-import { useAnnotationEvents } from "./events";
+import { AnnotationApiError } from "./api";
+import {
+  annotationProjectionStore,
+  loadTrajectoryReviews,
+} from "./projectionStore";
 import {
   isVerifiedReview,
   trajectoryReviewPresentation,
@@ -102,17 +106,21 @@ function matchesStatus(review: TrajectoryReview, filter: StatusFilter): boolean 
 
 export function AnnotationReviewsPage() {
   const navigate = useNavigate();
-  const [reviews, setReviews] = useState<TrajectoryReview[]>([]);
+  const reviews = useStore(annotationProjectionStore, (state) => state.reviews);
+  const reviewsLoaded = useStore(
+    annotationProjectionStore,
+    (state) => state.reviewsLoaded,
+  );
   const [statusFilter, setStatusFilter] = useState<StatusFilter>("active");
   const [dateFilter, setDateFilter] = useState("");
   const [query, setQuery] = useState("");
-  const [loading, setLoading] = useState(true);
+  const [loading, setLoading] = useState(!reviewsLoaded);
   const [error, setError] = useState("");
 
-  const refresh = useCallback(async (silent = false) => {
+  const refresh = useCallback(async (force = false, silent = false) => {
     if (!silent) setLoading(true);
     try {
-      setReviews(await listTrajectoryReviews());
+      await loadTrajectoryReviews({ force });
       setError("");
     } catch (requestError) {
       setError(safeReviewError(requestError, "读取轨迹复核任务失败"));
@@ -122,14 +130,8 @@ export function AnnotationReviewsPage() {
   }, []);
 
   useEffect(() => {
-    void refresh();
+    void refresh(false);
   }, [refresh]);
-
-  useAnnotationEvents({
-    filter: (event) => event.aggregate_kind === "review",
-    onEvent: () => refresh(true),
-    onReconcile: () => refresh(true),
-  });
 
   const counts = useMemo(() => {
     const next = {
@@ -194,7 +196,7 @@ export function AnnotationReviewsPage() {
             对后处理生成的三维轨迹进行人工 Fix、提交和最终审批。
           </p>
         </div>
-        <ConsoleButton onClick={() => void refresh()}>
+        <ConsoleButton onClick={() => void refresh(true)}>
           <RefreshCw aria-hidden="true" className="h-4 w-4" />
           刷新
         </ConsoleButton>

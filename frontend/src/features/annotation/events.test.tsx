@@ -78,6 +78,17 @@ function Probe({
   return null;
 }
 
+function UnfilteredProbe({
+  onEvent,
+  onReconcile = () => undefined,
+}: {
+  onEvent: (next: AnnotationDomainEvent) => void;
+  onReconcile?: () => void;
+}) {
+  useAnnotationEvents({ onEvent, onReconcile });
+  return null;
+}
+
 beforeEach(() => {
   FakeEventSource.instances = [];
   vi.stubGlobal("EventSource", FakeEventSource);
@@ -153,6 +164,78 @@ test("coalesces a burst of relevant named events into one invalidation", async (
   });
   expect(onEvent).toHaveBeenCalledTimes(1);
   expect(onEvent).toHaveBeenCalledWith(expect.objectContaining({ seq: 15 }));
+});
+
+test("retains every affected aggregate in one debounce batch", async () => {
+  vi.useFakeTimers();
+  const onEvent = vi.fn();
+  render(<UnfilteredProbe onEvent={onEvent} />);
+
+  await act(async () => {
+    await Promise.resolve();
+    await Promise.resolve();
+  });
+  const source = FakeEventSource.instances[0];
+
+  act(() => {
+    source.emit(event(13, { job_ref: "job_a" }));
+    source.emit(event(14, { job_ref: "job_b" }));
+    source.emit(event(15, {
+      aggregate_kind: "segment",
+      job_ref: "job_a",
+      segment_ref: "segment_c",
+    }));
+    source.emit(event(16, { job_ref: "job_a", state_revision: 16 }));
+    vi.advanceTimersByTime(ANNOTATION_EVENT_DEBOUNCE_MS);
+  });
+
+  expect(onEvent).toHaveBeenCalledTimes(3);
+  expect(onEvent).toHaveBeenCalledWith(expect.objectContaining({
+    aggregate_kind: "job",
+    job_ref: "job_a",
+    seq: 16,
+  }));
+  expect(onEvent).toHaveBeenCalledWith(expect.objectContaining({
+    aggregate_kind: "job",
+    job_ref: "job_b",
+  }));
+  expect(onEvent).toHaveBeenCalledWith(expect.objectContaining({
+    aggregate_kind: "segment",
+    segment_ref: "segment_c",
+  }));
+});
+
+test("shares one EventSource across route-level subscribers", async () => {
+  const first = vi.fn();
+  const second = vi.fn();
+  render(
+    <>
+      <UnfilteredProbe onEvent={first} />
+      <UnfilteredProbe onEvent={second} />
+    </>,
+  );
+
+  await act(async () => {
+    await Promise.resolve();
+    await Promise.resolve();
+  });
+
+  expect(FakeEventSource.instances).toHaveLength(1);
+});
+
+test("reconciles when the event stream or browser connectivity recovers", async () => {
+  const onReconcile = vi.fn();
+  render(<UnfilteredProbe onEvent={vi.fn()} onReconcile={onReconcile} />);
+
+  await act(async () => {
+    await Promise.resolve();
+    await Promise.resolve();
+  });
+  const source = FakeEventSource.instances[0];
+
+  act(() => source.open());
+  act(() => window.dispatchEvent(new Event("online")));
+  expect(onReconcile).toHaveBeenCalledTimes(2);
 });
 
 test("uses a low-frequency reconciliation fallback", async () => {

@@ -2037,6 +2037,49 @@ async def test_linked_fix_transport_replays_after_redis_state_loss_despite_recei
 
 
 @pytest.mark.asyncio
+async def test_workbench_dispatch_rejects_a_closed_binding_without_receipts(
+    tmp_path: Path,
+) -> None:
+    store = WebSessionStore(tmp_path / "sessions.sqlite")
+    task_store = SqliteNavigationTaskStore(tmp_path / "navigation.sqlite")
+    session = store.create_session("关闭的工作台绑定")
+    binding = store.create_task_binding(
+        session.id,
+        task_id="task-closed-workbench",
+        task_ref="DP-CLOSED",
+        navigation_session_id="navigation-closed-workbench",
+    ).binding
+    task_store.create_task_attempt(
+        task_id=binding.task_id,
+        request="继续工作台任务",
+        target="navigation_data",
+        date="20270623",
+        segments=["20260623_145550"],
+        scene_mode="out",
+        dry_run=False,
+        web_session_id=session.id,
+        agentscope_session_id=binding.navigation_session_id,
+        requested_outcome="postprocessing",
+    )
+    store.mark_task_binding_terminal(
+        binding.task_id,
+        expected_revision=binding.state_revision,
+        status="cancelled",
+    )
+    runtime = _runtime(tmp_path, store, task_store)
+
+    with pytest.raises(
+        RuntimeError,
+        match="closed before durable dispatch",
+    ):
+        await runtime.wake_navigation_task_from_workbench(
+            task_id=binding.task_id,
+            reason="initial_annotation_tracking_completed",
+            dispatch_idempotency_key="closed-workbench-dispatch",
+        )
+
+
+@pytest.mark.asyncio
 async def test_workbench_dispatch_uses_atomic_redis_marker_and_xadd(
     tmp_path: Path,
 ) -> None:

@@ -16,8 +16,13 @@ import {
   listTrajectoryReviews,
 } from "./api";
 import type { AnnotationDomainEvent } from "./events";
+import { AnnotationDomainEventBridge } from "./AnnotationDomainEventBridge";
 import { AnnotationReviewsPage } from "./AnnotationReviewsPage";
 import { AnnotationWorkspaceLayout } from "./AnnotationWorkspaceLayout";
+import {
+  cacheTrajectoryReview,
+  resetAnnotationProjectionStore,
+} from "./projectionStore";
 import { TrajectoryFixPage } from "./TrajectoryFixPage";
 import type {
   TrajectoryReview,
@@ -121,6 +126,7 @@ function evidenceFor(owner: TrajectoryReview): TrajectoryReviewEvidence {
 beforeEach(() => {
   vi.clearAllMocks();
   AnnotationTestEventSource.instances = [];
+  resetAnnotationProjectionStore();
   vi.stubGlobal("EventSource", AnnotationTestEventSource);
   apiMocks.getCalibrationProfiles.mockResolvedValue([]);
   apiMocks.listTrajectoryReviews.mockResolvedValue([]);
@@ -220,6 +226,44 @@ test("Fix workbench provides an anonymous same-clip Segment queue across active 
   const secondSegment = screen.getByRole("button", { name: "切换到 Segment 02" });
   expect(secondSegment).toHaveTextContent("已验证");
   expect(screen.queryByText(terminalReview.segment_ref)).not.toBeInTheDocument();
+});
+
+test("Fix workbench keeps sibling Segment statuses synchronized with the shared projection", async () => {
+  const sibling: TrajectoryReview = {
+    ...review,
+    review_ref: "review_11111111111111111111111111111111",
+    segment_ref: "segment_11111111111111111111111111111111",
+    segment_ordinal: 2,
+  };
+  apiMocks.listTrajectoryReviews.mockResolvedValue([review, sibling]);
+  apiMocks.getTrajectoryReview.mockResolvedValue(review);
+  apiMocks.getTrajectoryReviewEvidence.mockResolvedValue(evidenceFor(review));
+  const router = createMemoryRouter([
+    {
+      path: "/annotation/reviews/:reviewRef",
+      element: <TrajectoryFixPage />,
+    },
+  ], {
+    initialEntries: [`/annotation/reviews/${review.review_ref}`],
+  });
+
+  render(<RouterProvider router={router} future={{ v7_startTransition: true }} />);
+
+  const siblingButton = await screen.findByRole("button", {
+    name: "切换到 Segment 02",
+  });
+  expect(siblingButton).toHaveTextContent("待复核");
+
+  act(() => {
+    cacheTrajectoryReview({
+      ...sibling,
+      status: "returned",
+      state_revision: 2,
+      updated_at: "2026-07-28T00:01:00Z",
+    });
+  });
+
+  await waitFor(() => expect(siblingButton).toHaveTextContent("已退回"));
 });
 
 test("only a successfully published approved review is counted and labelled as verified", async () => {
@@ -466,7 +510,12 @@ test("Fix workbench freezes mutations while a Fix run is active and refreshes on
   const router = createMemoryRouter([
     {
       path: "/annotation/reviews/:reviewRef",
-      element: <TrajectoryFixPage />,
+      element: (
+        <>
+          <AnnotationDomainEventBridge />
+          <TrajectoryFixPage />
+        </>
+      ),
     },
   ], {
     initialEntries: [`/annotation/reviews/${review.review_ref}`],
@@ -533,7 +582,12 @@ test("Fix workbench refreshes an approved publication event until it is truly ve
   const router = createMemoryRouter([
     {
       path: "/annotation/reviews/:reviewRef",
-      element: <TrajectoryFixPage />,
+      element: (
+        <>
+          <AnnotationDomainEventBridge />
+          <TrajectoryFixPage />
+        </>
+      ),
     },
   ], {
     initialEntries: [`/annotation/reviews/${review.review_ref}`],

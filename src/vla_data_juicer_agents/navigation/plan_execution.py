@@ -1374,7 +1374,11 @@ def complete_annotation_workflow_step(
     if (
         current is None
         or current["step"]["action"] != action
-        or current["step"]["status"] not in {"pending", "waiting_user"}
+        or current["step"]["status"] not in {
+            "pending",
+            "waiting_user",
+            "running",
+        }
     ):
         overview = plan_store.get_execution_overview(plan.plan_id)
         completed = any(
@@ -1423,7 +1427,7 @@ def complete_annotation_workflow_step(
             target_status="completed",
             full_result=payload,
             result_summary=_result_summary(payload),
-            expected_statuses=("pending", "waiting_user"),
+            expected_statuses=(str(current["step"]["status"]),),
             expected_web_session_id=task.created_by_web_session_id,
             expected_agentscope_session_id=task.agentscope_session_id,
         )
@@ -1458,6 +1462,38 @@ def complete_annotation_workflow_step(
             status="active",
         )
     return True
+
+
+def resume_annotation_workflow_step(
+    *,
+    plan_store: SqliteNavigationPlanRepository,
+    navigation_task_id: str,
+    action: str,
+) -> bool:
+    """Transfer a durable workbench wait to its background Runtime owner."""
+
+    task = SqliteNavigationTaskStore(plan_store.db_path).get_task(
+        navigation_task_id
+    )
+    if task is None:
+        return False
+    plan = plan_store.get_latest_accepted_for_task(navigation_task_id)
+    if plan is None or plan.status != "active":
+        return False
+    current = plan_store.get_current_step(plan.plan_id)
+    if (
+        current is None
+        or current["step"]["action"] != action
+        or current["step"]["status"] not in {"waiting_user", "running"}
+    ):
+        return False
+    return plan_store.resume_waiting_workflow_step(
+        plan.plan_id,
+        str(current["step"]["step_id"]),
+        action,
+        expected_web_session_id=task.created_by_web_session_id,
+        expected_agentscope_session_id=task.agentscope_session_id,
+    )
 
 
 def fail_annotation_workflow_step(
@@ -1506,7 +1542,11 @@ def fail_annotation_workflow_step(
     if (
         current is None
         or current["step"]["action"] != action
-        or current["step"]["status"] not in {"pending", "waiting_user"}
+        or current["step"]["status"] not in {
+            "pending",
+            "waiting_user",
+            "running",
+        }
     ):
         return False
     step_id = str(current["step"]["step_id"])
@@ -1529,7 +1569,7 @@ def fail_annotation_workflow_step(
             target_status="failed",
             full_result=payload,
             result_summary=_result_summary(payload),
-            expected_statuses=("pending", "waiting_user"),
+            expected_statuses=(str(current["step"]["status"]),),
             expected_web_session_id=task.created_by_web_session_id,
             expected_agentscope_session_id=task.agentscope_session_id,
         )
@@ -1635,15 +1675,29 @@ def build_plan_bound_execution_tools(
                     expected_agentscope_session_id=agentscope_session_id,
                 )
             current_status = (snapshot.current or {}).get("step", {}).get("status")
-            if current_status == "waiting_user":
-                return {
-                    "ok": True,
-                    "status": "waiting_user",
-                    "message": (
-                        "The durable Annotation workflow is still in progress."
-                    ),
-                    "next_action": "wait_for_workbench",
-                }
+            if current_status == "pending":
+                claim_outcome = plan_store.claim_step(
+                    plan.plan_id,
+                    step.step_id,
+                    action,
+                    expected_web_session_id=web_session_id,
+                    expected_agentscope_session_id=agentscope_session_id,
+                )
+                if claim_outcome is StepClaimOutcome.NAVIGATION_DATA_BUSY:
+                    return _compact_error(
+                        "navigation_data_busy",
+                        "An overlapping navigation data write is already running.",
+                        retry="wait_and_reinspect",
+                    )
+                if claim_outcome is not StepClaimOutcome.CLAIMED:
+                    if plan_store.read_execution_snapshot(
+                        web_session_id=web_session_id,
+                        agentscope_session_id=agentscope_session_id,
+                        task_id=durable_task.task_id,
+                    ) is None:
+                        return _session_mismatch_error()
+                    return _terminal_error(plan_store, plan.plan_id)
+                current_status = "running"
             try:
                 result = dict(
                     annotation_gateway.begin_annotation_from_plan(
@@ -1659,10 +1713,40 @@ def build_plan_bound_execution_tools(
                     )
                 )
             except Exception as exc:
-                return _annotation_workflow_start_error(
+                error = _annotation_workflow_start_error(
                     exc,
                     action=action,
                 )
+                if current_status != "running":
+                    return error
+                try:
+                    plan_store.stage_step_result(
+                        plan.plan_id,
+                        step.step_id,
+                        expected_action=action,
+                        target_status="failed",
+                        full_result=error,
+                        result_summary=_result_summary(error),
+                        expected_statuses=("running",),
+                        expected_web_session_id=web_session_id,
+                        expected_agentscope_session_id=agentscope_session_id,
+                    )
+                    _finalize_staged_result(
+                        task=durable_task,
+                        plan=plan,
+                        step=step,
+                        plan_store=plan_store,
+                        evidence_store=evidence_store,
+                        settings=None,
+                        expected_web_session_id=web_session_id,
+                        expected_agentscope_session_id=agentscope_session_id,
+                    )
+                    return error
+                except Exception:
+                    _LOGGER.exception(
+                        "Unable to close a claimed Annotation workflow start failure"
+                    )
+                    return error
             if bool(result.get("completed")):
                 payload = {
                     "ok": True,
@@ -1679,7 +1763,12 @@ def build_plan_bound_execution_tools(
                     target_status="completed",
                     full_result=payload,
                     result_summary=_result_summary(payload),
-                    expected_statuses=("pending",),
+                    expected_statuses=(
+                        str(current_status)
+                        if current_status
+                        in {"pending", "waiting_user", "running"}
+                        else "pending",
+                    ),
                     expected_web_session_id=web_session_id,
                     expected_agentscope_session_id=agentscope_session_id,
                 )
@@ -1693,7 +1782,47 @@ def build_plan_bound_execution_tools(
                     expected_web_session_id=web_session_id,
                     expected_agentscope_session_id=agentscope_session_id,
                 )
-            marked = plan_store.mark_waiting_user(
+            if bool(result.get("waiting_for_runtime")):
+                running = current_status == "running"
+                if current_status == "waiting_user":
+                    running = plan_store.resume_waiting_workflow_step(
+                        plan.plan_id,
+                        step.step_id,
+                        action,
+                        expected_web_session_id=web_session_id,
+                        expected_agentscope_session_id=agentscope_session_id,
+                    )
+                if not running:
+                    refreshed = plan_store.get_current_step(plan.plan_id)
+                    if (
+                        refreshed is None
+                        or refreshed["step"]["step_id"] != step.step_id
+                        or refreshed["step"]["status"] != "running"
+                    ):
+                        return _terminal_error(plan_store, plan.plan_id)
+                return {
+                    "ok": True,
+                    "status": "running",
+                    "message": (
+                        "Tracking is running in the durable Annotation Runtime."
+                        if action == "run_annotation_tracking_workflow"
+                        else (
+                            "The plan-bound postprocessing Runtime is running."
+                        )
+                    ),
+                    "next_action": "wait_for_runtime",
+                }
+            if current_status == "waiting_user":
+                return {
+                    "ok": True,
+                    "status": "waiting_user",
+                    "message": (
+                        "The durable Annotation workflow is still waiting for "
+                        "the Web workbench."
+                    ),
+                    "next_action": "wait_for_workbench",
+                }
+            marked = plan_store.mark_workflow_step_waiting_user(
                 plan.plan_id,
                 step.step_id,
                 action,
@@ -1702,17 +1831,6 @@ def build_plan_bound_execution_tools(
             )
             if not marked:
                 return _terminal_error(plan_store, plan.plan_id)
-            current_task = SqliteNavigationTaskStore(plan_store.db_path).get_task(
-                durable_task.task_id
-            )
-            if current_task is not None and current_task.status.value == "active":
-                SqliteNavigationTaskStore(plan_store.db_path).update_task_for_session(
-                    current_task.task_id,
-                    web_session_id=current_task.created_by_web_session_id,
-                    agentscope_session_id=current_task.agentscope_session_id,
-                    expected_state_revision=current_task.state_revision,
-                    status="waiting_user",
-                )
             return {
                 "ok": True,
                 "status": "waiting_user",
@@ -1720,10 +1838,7 @@ def build_plan_bound_execution_tools(
                     "Complete the initial annotation in the Web workbench; "
                     "DataPilot will resume Tracking automatically."
                     if action == "run_annotation_tracking_workflow"
-                    else (
-                        "The plan-bound postprocessing Runtime is running; "
-                        "DataPilot will resume from its durable completion event."
-                    )
+                    else "The durable workflow is waiting for the Web workbench."
                 ),
                 "next_action": "wait_for_workbench",
             }

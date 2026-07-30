@@ -5,6 +5,7 @@ import { Navigate, Route, Routes, useLocation } from "react-router-dom";
 import { ConsoleHeader } from "../components/console/ConsoleHeader";
 import { ConsoleSidebar } from "../components/console/ConsoleSidebar";
 import { ConsoleToast } from "../components/console/ConsoleToast";
+import { AnnotationDomainEventBridge } from "../features/annotation/AnnotationDomainEventBridge";
 import type { ConsolePageId, StatusTone } from "../features/console/consoleTypes";
 import { cn } from "../lib/utils";
 
@@ -144,6 +145,7 @@ export function AppShell({ children }: AppShellProps) {
 
   return (
     <div className="min-h-screen bg-console-bg text-console-text">
+      <AnnotationDomainEventBridge />
       <ConsoleSidebar
         activePage={activePage}
         collapsed={sidebarCollapsed}

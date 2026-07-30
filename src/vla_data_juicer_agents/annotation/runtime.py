@@ -2927,9 +2927,6 @@ class _RuntimeBase:
             label="job staging",
         )
         command = [
-            str(config.xvfb_run_path),
-            "--auto-servernum",
-            "--server-args=-screen 0 1920x1536x24 -nolisten tcp -noreset",
             str(config.bwrap_path),
             "--die-with-parent",
             "--unshare-pid",
@@ -2949,8 +2946,18 @@ class _RuntimeBase:
             str(staging),
             str(staging),
         ]
+        effective_writable_bindings = list(writable_bindings)
+        if not any(target == Path("/tmp") for _source, target in writable_bindings):
+            private_tmp_root = _ensure_private_directory_chain(
+                staging,
+                (".runtime", "tmp"),
+            )
+            effective_writable_bindings.insert(
+                0,
+                (private_tmp_root, Path("/tmp")),
+            )
         resolved_writable_bindings: list[tuple[Path, Path]] = []
-        for source, target in writable_bindings:
+        for source, target in effective_writable_bindings:
             source_resolved = self._assert_under(
                 source,
                 staging,
@@ -3092,7 +3099,20 @@ class _RuntimeBase:
             command.extend(
                 ["--ro-bind", str(source_resolved), str(target)],
             )
-        command.extend(["--chdir", str(cwd), *[str(item) for item in argv]])
+        # Xvfb must start inside the sandbox after an attempt-private /tmp has
+        # been mounted.  Starting it outside bubblewrap creates the X11 socket
+        # in the host /tmp; frozen Tk/Matplotlib code then inherits DISPLAY but
+        # cannot see that socket through the private /tmp binding.
+        command.extend(
+            [
+                "--chdir",
+                str(cwd),
+                str(config.xvfb_run_path),
+                "--auto-servernum",
+                "--server-args=-screen 0 1920x1536x24 -nolisten tcp -noreset",
+                *[str(item) for item in argv],
+            ]
+        )
         quoted = " ".join(shlex.quote(item) for item in command)
         return [
             "/bin/bash",

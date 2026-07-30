@@ -10,6 +10,8 @@
 > `docs/automatic-annotation-m2-session-reliability-plan.md`
 > 后处理隐式运行契约：
 > `docs/automatic-annotation-m2-postprocessing-runtime-contract.md`
+> Runtime 与交互收口：
+> `docs/automatic-annotation-m2-runtime-ux-hardening-plan.md`
 
 ## 1. 目标、原则与边界
 

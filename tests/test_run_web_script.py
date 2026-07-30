@@ -30,6 +30,7 @@ SCRIPT_ENV_KEYS = (
     "VLA_FRONTEND_NODE_BIN_DIR",
     "WEB_CMD",
     "RUN_WEB_CONTROL_PYTHON",
+    "VLA_RUN_WEB_CONFIG_LOADED",
     "VLA_RUN_WEB_CONTROL_LOCKED",
     "VLA_RUN_WEB_LOCKED_PID_PATH",
     "VLA_RUN_WEB_LOCKED_PARENT_IDENTITY",
@@ -140,6 +141,68 @@ def test_run_web_script_builds_with_configured_frontend_toolchain(
     assert npm_log.read_text(encoding="utf-8") == (
         f"{ROOT / 'frontend'}|run build\n"
     )
+
+
+def test_run_web_script_loads_fixed_config_and_preserves_explicit_override(
+    tmp_path: Path,
+) -> None:
+    home = tmp_path / "home"
+    config_dir = home / ".config" / "vla-data-juicer-agents"
+    config_dir.mkdir(parents=True, mode=0o700)
+    (home / ".config").chmod(0o700)
+    config_dir.chmod(0o700)
+    configured_node = tmp_path / "configured-node"
+    write_fake_frontend_toolchain(configured_node)
+    configured_working = tmp_path / "configured-working"
+    explicit_working = tmp_path / "explicit-working"
+    config_path = config_dir / "run-web.json"
+    config_path.write_text(
+        json.dumps(
+            {
+                "WORKING_DIR": str(configured_working),
+                "VLA_FRONTEND_NODE_BIN_DIR": str(configured_node),
+            }
+        ),
+        encoding="utf-8",
+    )
+    config_path.chmod(0o600)
+    npm_log = tmp_path / "npm.log"
+
+    result = run_script(
+        "foreground",
+        env={
+            "HOME": str(home),
+            "WORKING_DIR": str(explicit_working),
+            "FAKE_NPM_LOG": str(npm_log),
+            "WEB_CMD": ECHO_COMMAND,
+        },
+    )
+
+    assert result.returncode == 0, (result.stdout, result.stderr)
+    assert f"--working-dir {explicit_working}" in result.stdout
+    assert configured_working.as_posix() not in result.stdout
+    assert npm_log.read_text(encoding="utf-8") == (
+        f"{ROOT / 'frontend'}|run build\n"
+    )
+
+
+def test_run_web_script_fails_closed_for_control_actions_when_config_is_invalid(
+    tmp_path: Path,
+) -> None:
+    home = tmp_path / "home"
+    config_dir = home / ".config" / "vla-data-juicer-agents"
+    config_dir.mkdir(parents=True, mode=0o700)
+    (home / ".config").chmod(0o700)
+    config_dir.chmod(0o700)
+    config_path = config_dir / "run-web.json"
+    config_path.write_text("{invalid-json", encoding="utf-8")
+    config_path.chmod(0o600)
+
+    result = run_script("status", env={"HOME": str(home)})
+
+    assert result.returncode == 2
+    assert "run_web config error" in result.stderr
+    assert "not valid UTF-8 JSON" in result.stderr
 
 
 def test_run_web_script_rejects_frontend_toolchain_version_mismatch(
