@@ -1,7 +1,8 @@
 # 自动标注 M2：DataPilot 主导的后处理与三维人工复核/Fix 开发计划
 
-> 状态：本地实现与回归通过，待停机迁移和服务器 Golden/writer 验收
+> 状态：已完成服务器验收并冻结；M3 暂不启动
 > 开始日期：2026-07-28
+> 冻结日期：2026-07-31
 > 开发基线：`a2d4ccd`
 > 开发分支：`codex/automatic-annotation-m2`
 > 上游里程碑：M1.5 完整冻结
@@ -622,11 +623,14 @@ M2 只有在以下条件全部满足后才可冻结：
 - 用户无需 XQuartz 即可完成三维人工 Fix、批准和发布；
 - 正式生成兼容 `_trajectory_fix_five.json`；
 - 原始数据、同步数据、历史 oracle、同事源码和公共 scratch 未被修改；
-- 严格 Golden、本地全量回归和服务器验收全部通过。
+- 用户批准范围内的 Golden、完整本地回归和服务器验收全部通过；本次因新旧
+  首帧人工框选、目标选择与服饰颜色存在主观差异，不宣称不同人工输入之间的
+  轨迹数值或图片哈希严格相等。文件树、Schema、帧数、Runtime 决策、状态、
+  revision、发布结果和数据无污染仍是严格门禁。
 
-M2 冻结后才规划 M3 的数据管理、仪表盘、部分完成投影、历史导入和跨页面深链；
-M4 才上线 DataPilot/模型辅助复核、置信度和
-`AIProposedFixRevision`。
+M2 已于 2026-07-31 冻结。M3 的数据管理、仪表盘、部分完成投影、历史导入和
+跨页面深链暂不启动；在此之前独立进行小功能、智能体交互和前端 UI/交互重构。
+M4 才上线 DataPilot/模型辅助复核、置信度和 `AIProposedFixRevision`。
 
 ## 14. 本地实现结果（2026-07-28）
 
@@ -677,10 +681,9 @@ M4 才上线 DataPilot/模型辅助复核、置信度和
 case-set 变更，不能伪装成与旧 baseline 兼容；本轮需要对其余旧 case 做
 差异审计，并在明确批准后再决定是否晋升新 baseline。
 
-上述当期评测结果中的 `navigation-m2` 仅表示 case、host 和确定性 grader
-本地门禁通过。真实 Annotation DB 离线迁移、冻结 Runtime 部署、服务器
-后处理/Fix writer、业务 Golden 和数据无污染审计也尚未完成。因此 M2 当前
-不能冻结，下一步必须按第 12 节另行批准并完成服务器验收。
+上述内容是 2026-07-28 当期快照：当时 `navigation-m2` 仅表示 case、host 和
+确定性 grader 本地门禁通过，尚不能冻结。真实迁移、Runtime writer、业务
+Golden 与数据无污染审计的后续结果见第 18 节。
 
 ## 15. 首轮服务器验收返修（2026-07-29）
 
@@ -717,9 +720,9 @@ postprocessing Runtime 未装配。本轮返修：
   重新询问日期。服务器部署模型为 `qwen3.7-plus`，该结果不作为其基线，也不在
   本次 Runtime 返修中调整 Prompt。
 
-服务器下一步必须先停机备份并执行 Annotation v5 → v6 离线迁移，再验证 M2
-stage-specific preflight，最后用新的 DataPilot 会话继续 `20270623` 验收。旧
-失败 Navigation task 与 link 只保留为审计事实，不得删除或改写。
+这是首轮返修时的后续要求；停机迁移、stage-specific preflight 和新的
+`20270623` 验收已在后续轮次完成。旧失败 Navigation task 与 link 仍保留为
+审计事实，仅按第 18.3 节执行终态收口，没有删除历史记录。
 
 ## 16. 后处理隐式运行契约加固（2026-07-30）
 
@@ -752,7 +755,7 @@ stage-specific preflight，最后用新的 DataPilot 会话继续 `20270623` 验
 - Python 全量：`1702 passed`；
 - compileall 与 `git diff --check`：通过。
 
-本轮没有执行冻结业务脚本或服务器 writer。仍需在再次处理真实数据前完成：
+本轮没有执行冻结业务脚本或服务器 writer。当时在再次处理真实数据前仍需完成：
 
 - 部署后 M2 stage-specific preflight；
 - `20260623 / 145550` byte-identical tracked 输入严格 Golden；
@@ -760,6 +763,8 @@ stage-specific preflight，最后用新的 DataPilot 会话继续 `20270623` 验
 - 缺 gridmap 副本的 `generate_from_pcd` writer 验收；
 - publication journal 中断恢复验收；
 - 安全化 actual invocation ledger，或在 Golden 中提供等价的私有调用证明。
+
+这些事项的最终验收范围、批准偏差与冻结结论统一以第 18 节为准。
 
 ## 17. Fix 工作台旧 GUI 语义收口（2026-07-31）
 
@@ -785,6 +790,90 @@ stage-specific preflight，最后用新的 DataPilot 会话继续 `20270623` 验
   `398926 < 512000` bytes；
 - compileall 与 `git diff --check`：通过。
 
-本轮未连接服务器，也未运行冻结业务 writer。服务器仍需对一个非正式测试
-Segment 执行“拖动位置、拖动方向、补回缺失目标、标记 pass、生成预览、批准
-发布”的完整人工验收，并与旧 GUI 的同输入同操作序列做数值对比。
+本节记录的是当时的本地阶段结果；其服务器待办已在第 18 节完成并按用户批准的
+Golden 口径收口，不再作为未完成项。
+
+## 18. 最终服务器验收与冻结结论（2026-07-31）
+
+### 18.1 真实链路结果
+
+服务器使用 `20270623 / 20260623_145550` 完成六个内部 Segment 的真实验收：
+
+- Annotation schema 已迁移到 v8，Navigation generation 为
+  `navigation-attempts-m2-v1`；三个领域数据库可正常打开，最终复核时
+  `integrity_check=ok` 且 foreign key check 为空；
+- prepare、首帧 Web 标注、Tracking、`generate_from_pcd`、odom
+  `cjl_0525_with_gridmap` 后处理和 final 发布完成；
+- AnnotationJob 为 `annotated/postprocessing_complete`，六个 Segment 均为
+  `annotated`；
+- 三维复核最终为 5 个 `approved`、1 个 `discarded`；其中覆盖退回后继续修改、
+  直接认可原轨迹、无修改生成预览、位置/方向拖动、缺失目标补回、`pass`、删除
+  目标和 Fix 预览重算；
+- 5 个批准单元均通过 publication journal 成功发布兼容
+  `*_trajectory_fix_five.json`，废弃单元不发布训练兼容文件；
+- workflow handoff 均已投递，原 Navigation 后处理任务和关联轨迹复核任务均已
+  完成，Runtime capability 为 `navigation_odom_v1/available`；
+- raw、`clip_data`、历史 oracle、同事业务源码和公共 scratch 未作为新 Runtime
+  的可写工作目录，正式写入只经私有 candidate 与 publication journal 完成。
+
+最终本地门禁：Python `1763 passed, 1 warning`；前端 Vitest
+`267 passed, 8 skipped`；Playwright `10 passed`；production build 与 bundle
+gate 通过；`datapilot-v1/navigation-m2` 分别验证 `17/7` 个 case schema。
+
+### 18.2 Golden 冻结口径
+
+本次新旧数据的首帧框、人物选择和服饰颜色由不同人工标注，因此用户明确批准
+以“业务结构、状态与 Runtime 行为等价”完成 M2 产品冻结：严格比较文件树、
+Schema、Segment/帧/gridmap 数量、决策变体、状态迁移、revision、发布账本和
+训练兼容文件存在性；人工输入导致的人物属性、轨迹数值和投影图片差异不作为
+本次失败。该批准不等于放宽未来算法变更：后续若修改冻结 Runtime、旧业务脚本、
+数值方法、Legacy YAML 或训练出口，仍必须使用相同输入执行严格 Golden。
+
+### 18.3 陈旧状态收口
+
+两条早期失败验收遗留的 Navigation task 原为 `waiting_user`，其绑定的
+AnnotationJob 已分别由用户取消。停机备份 Navigation 与 Session 数据库后，
+通过现有 Navigation Task Store 将两条任务精确迁移为
+`waiting_user → cancelling → cancelled`，并关闭对应会话任务槽；未删除任务、
+会话、Plan 或历史账本。收口后 `20270623` 的 `waiting_user` 数量为 0，两个
+数据库 `integrity_check=ok`、foreign key check 为空，服务重启和 Runtime
+capability 检查通过。
+
+### 18.4 生产隔离策略冻结
+
+以下措施属于生产可靠性边界，M2 完成后仍长期保留：
+
+- 系统专用、内容可审计的冻结 Runtime 与 SHA-256 manifest，不直接执行同事可
+  修改的业务目录；
+- 每个 Job/attempt 独立 staging、禁止 hardlink/symlink 污染输入、原始与同步
+  数据只读、candidate 校验后原子发布；
+- bubblewrap 只读宿主/Runtime 和私有 legacy overlay；旧二进制仍依赖图形环境时
+  继续使用固定 Xvfb，不回退 XQuartz；
+- Navigation 与 Annotation 共用 writer lock，重型 writer capacity 保持 1；
+  人工等待、页面查询、LLM 调查等非 writer 工作不占锁；
+- 独立数据库、migration ledger、CAS、幂等键、lease、outbox、revision、
+  publication journal、备份和恢复审计；
+- Python 项目虚拟环境、前端 lockfile 与固定 Node/npm 主版本；shadcn MCP 仅用于
+  开发，生成并审查后的组件源码进入仓库，服务器不部署 MCP；
+- 公开随机 refs、错误白名单和路径/内部 ID/命令/凭据脱敏；
+- Runtime、标定、输入和产物哈希绑定，以及启动/建任务/writer 前的 fail-closed
+  preflight。
+
+以下开发期做法可以在不降低上述边界的前提下收缩：
+
+- 把手工选择 ROS、Node、Python 和逐项 export 环境变量收进 `run_web.sh`、受控
+  env file 或 systemd unit，保留版本校验但恢复一条命令启停；
+- 将固定 Xvfb 包安装和依赖摘要烘焙进部署镜像或一次性 Runtime payload，不必
+  每次部署手工安装；
+- 将固定 100 GiB 空间门槛改为“选中输入估算＋attempt 预留＋可配置安全余量”；
+  该门槛是 fail-closed 检查，不是预分配磁盘；
+- tracked/failed staging 从永久保留改为按 manifest、终态和保留期归档/清理，
+  但正式 revision、账本、失败诊断和发布记录不得删除；
+- UI、文案和纯前端依赖变更只跑本地全量与前端回归；严格 Runtime Golden 仅在
+  Runtime、wrapper、标定、输入适配或训练出口变化时重跑；
+- 当前全局 writer=1 只能在 Tracking/Fix 全局 scratch、GPU 和发布目标完成资源
+  隔离并通过并发 Golden 后，逐步放宽为按 GPU/资源队列并发；在此之前不得取消。
+
+M2 至此冻结。上述“可收缩”均是运维体验优化，不授权关闭 sandbox、绕过
+publication journal、直接写 `clip_data`/正式 `finish_data`，或重新依赖同事的
+可变业务目录。

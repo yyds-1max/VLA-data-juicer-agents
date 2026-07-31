@@ -1,7 +1,7 @@
 # 自动标注板块总体开发路线
 
-> 状态：已批准；M1、M1.5 已完整冻结，M2 权威任务级计划已建立并进入开发
-> 最后更新：2026-07-28
+> 状态：M0～M2 已冻结；M3、M4 暂不启动
+> 最后更新：2026-07-31
 > 适用范围：导航数据自动标注、后处理、三维轨迹复核/Fix，以及后续可复用的标注领域能力  
 > 优先级：本文件在自动标注范围内优先于 `architecture.md` 中的历史占位描述
 
@@ -509,7 +509,7 @@ AppleDouble 文件不属于业务输入，拆包发现与 raw 同源比较均须
 - M1.5 至此完整冻结。相邻的独立公开 DTO、字段感知输入净化和前端第二道错误
   脱敏属于后续纵深防御候选，不扩大为 M1.5 或 M2 的隐含范围。
 
-### M2（2026-07-28，本地实现完成，待服务器验收）
+### M2（2026-07-28～2026-07-31，完整冻结）
 
 - 开发基线为 M1.5 冻结提交 `a2d4ccd`，开发分支为
   `codex/automatic-annotation-m2`；
@@ -520,7 +520,7 @@ AppleDouble 文件不属于业务输入，拆包发现与 raw 同源比较均须
   前移到 M2；M3 收窄为数据管理、仪表盘和跨页面状态整合；
 - M2 的人工复核页不提供模型复核按钮；DataPilot/模型辅助复核、置信度和
   `AIProposedFixRevision` 保留到 M4；
-- 本地已经完成 Annotation schema v5、Navigation Plan v4 领域迁移、后处理、
+- 本地已经完成 Annotation schema v8、Navigation Plan v4 领域迁移、后处理、
   人工 Fix、异步兼容发布、durable handoff、linked Fix Task、M2 前端和最小
   评测实现；
 - processing owner 唯一约束、精确 clip scope 复用、迁移完整性安全标记、后处理
@@ -529,9 +529,28 @@ AppleDouble 文件不属于业务输入，拆包发现与 raw 同源比较均须
 - 本地门禁为 Python `1636 passed`、Annotation `284 passed`、前端
   `238 passed, 8 skipped`、Playwright 全量 `9 passed`、production build 通过，
   三套评测分别验证 `4 / 17 / 7` 个 case schema；
-- 服务器旧 Navigation `final-v2` 真实库已完成只读副本迁移演练：7 个 task、
+- 正式迁移前，服务器旧 Navigation `final-v2` 真实库已完成只读副本迁移演练：
+  7 个 task、
   6 个 Plan、24 个 step、53 个 observation、53 个 evidence 和 10 个
   submission attempt 除 generation marker 外逐行不变，外键、完整性和安全
-  标记均通过；正式停机迁移仍待执行；
-- 真实模型重复评测、服务器停机迁移、冻结 Runtime writer、严格业务 Golden 和
-  无污染审计尚未执行，因此 M2 仍未冻结，也不能提前进入 M3。
+  标记均通过；后续正式停机迁移已完成；
+- 服务器已完成 Annotation v8 与 Navigation M2 正式迁移、真实
+  `20270623 / 20260623_145550` 六 Segment 的 prepare、Web 首帧标注、Tracking、
+  `generate_from_pcd`、odom 后处理、三维人工 Fix/复核和兼容发布；
+- 最终复核为 5 个批准、1 个废弃，5 个批准单元均发布
+  `*_trajectory_fix_five.json`；任务、handoff、revision、publication 和公开状态
+  闭环一致；
+- 最终本地门禁为 Python `1763 passed, 1 warning`、前端
+  `267 passed, 8 skipped`、Playwright `10 passed`、production build/bundle gate
+  通过，`datapilot-v1/navigation-m2` 分别验证 `17/7` 个 case schema；
+- 本次因新旧首帧框、目标与服饰颜色来自不同人工输入，经用户批准按文件树、
+  Schema、数量、Runtime 决策、状态、revision、发布和无污染完成 Golden；不宣称
+  不同人工输入的数值/图片哈希严格相等。未来 Runtime 或算法变更仍需相同输入的
+  严格 Golden；
+- 两条早期失败验收遗留的 `waiting_user` 任务已在停机备份后通过既有 Task Store
+  转为 `cancelled` 并关闭任务槽，未删除历史账本；完整性、外键、服务启动和
+  Runtime capability 均复核通过；
+- 生产隔离策略的保留与可收缩边界已冻结在
+  `docs/automatic-annotation-m2-plan.md` 第 18.4 节；
+- M2 至此完整冻结。M3 暂不启动；下一阶段先独立进行小功能、智能体模块和前端
+  UI/交互优化，不能借此扩大或改写 M3/M4 范围。
