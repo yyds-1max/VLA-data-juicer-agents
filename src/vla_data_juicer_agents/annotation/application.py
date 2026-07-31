@@ -370,6 +370,10 @@ class AnnotationApplicationService:
         review_ref: str,
     ) -> dict[str, Any]:
         from vla_data_juicer_agents.annotation.runtime import _tree_sha256
+        from vla_data_juicer_agents.annotation.trajectory_evidence import (
+            gridmap_metadata,
+            resolve_evidence_file,
+        )
 
         private = self.store.review_evidence_private(review_ref)
         artifact_root = Path(private["private_artifact_path"])
@@ -395,27 +399,62 @@ class AnnotationApplicationService:
                 "trajectory_evidence_unavailable",
                 "The trajectory evidence index is unavailable.",
             )
-        image_size: tuple[int, int] | None = None
+        camera_size: tuple[int, int] | None = None
+        projection_size: tuple[int, int] | None = None
+        fallback_gridmap_metadata: dict[str, Any] | None = None
+        available_paths: dict[tuple[int, str], Path] = {}
         for index, frame in enumerate(frames):
-            if not isinstance(frame, dict) or not frame.get("camera_available"):
+            if not isinstance(frame, dict):
                 continue
-            try:
-                content, _etag, media_type = self.resolve_review_evidence_file(
-                    review_ref,
-                    frame_index=index,
-                    kind="camera",
-                    verify_tree=False,
-                )
-                image_format, width, height = _image_dimensions_from_bytes(content)
-                if (
-                    (image_format == "jpeg" and media_type != "image/jpeg")
-                    or (image_format == "png" and media_type != "image/png")
+            for kind in ("camera", "projection", "gridmap"):
+                try:
+                    path = resolve_evidence_file(
+                        artifact_root,
+                        state,
+                        frame_index=index,
+                        kind=kind,
+                    )
+                    available_paths[(index, kind)] = path
+                    if kind == "camera" and camera_size is None:
+                        content = _read_regular_descendant(
+                            path,
+                            root=artifact_root,
+                        )
+                        image_format, width, height = (
+                            _image_dimensions_from_bytes(content)
+                        )
+                        if image_format not in {"jpeg", "png"}:
+                            raise ValueError("unsupported camera image")
+                        camera_size = (width, height)
+                    elif kind == "projection" and projection_size is None:
+                        content = _read_regular_descendant(
+                            path,
+                            root=artifact_root,
+                        )
+                        image_format, width, height = (
+                            _image_dimensions_from_bytes(content)
+                        )
+                        if image_format != "png":
+                            raise ValueError("unsupported projection image")
+                        projection_size = (width, height)
+                    elif (
+                        kind == "gridmap"
+                        and fallback_gridmap_metadata is None
+                    ):
+                        fallback_gridmap_metadata = gridmap_metadata(
+                            _read_regular_descendant(
+                                path,
+                                root=artifact_root,
+                            )
+                        )
+                except (
+                    AnnotationConflictError,
+                    AnnotationValidationError,
+                    OSError,
+                    RuntimeError,
+                    ValueError,
                 ):
-                    raise ValueError("image media type mismatch")
-                image_size = (width, height)
-                break
-            except (AnnotationConflictError, AnnotationValidationError, ValueError):
-                continue
+                    available_paths.pop((index, kind), None)
         public_frames: list[dict[str, Any]] = []
         for frame in frames:
             if not isinstance(frame, dict):
@@ -456,19 +495,50 @@ class AnnotationApplicationService:
                 )
             )
             camera = None
-            if frame.get("camera_available"):
+            if (frame_index, "camera") in available_paths:
                 camera = {
                     "url": (
                         f"/api/annotation/reviews/{review_ref}/evidence/"
                         f"frames/{frame_index}/camera"
                     ),
-                    "width": image_size[0] if image_size else None,
-                    "height": image_size[1] if image_size else None,
+                    "width": camera_size[0] if camera_size else None,
+                    "height": camera_size[1] if camera_size else None,
+                }
+            projection = None
+            if (frame_index, "projection") in available_paths:
+                projection = {
+                    "url": (
+                        f"/api/annotation/reviews/{review_ref}/evidence/"
+                        f"frames/{frame_index}/projection"
+                    ),
+                    "width": (
+                        projection_size[0] if projection_size else None
+                    ),
+                    "height": (
+                        projection_size[1] if projection_size else None
+                    ),
                 }
             gridmap = None
-            if frame.get("gridmap_available"):
-                gridmap_width = frame.get("gridmap_width")
-                gridmap_height = frame.get("gridmap_height")
+            if (frame_index, "gridmap") in available_paths:
+                gridmap_metadata_value = {
+                    "width": frame.get("gridmap_width"),
+                    "height": frame.get("gridmap_height"),
+                    "resolution": frame.get("gridmap_resolution"),
+                    "x_range": frame.get("gridmap_x_range"),
+                    "y_range": frame.get("gridmap_y_range"),
+                }
+                if any(
+                    value is None
+                    for value in gridmap_metadata_value.values()
+                ):
+                    gridmap_metadata_value = (
+                        fallback_gridmap_metadata or {}
+                    )
+                gridmap_width = gridmap_metadata_value.get("width")
+                gridmap_height = gridmap_metadata_value.get("height")
+                gridmap_resolution = gridmap_metadata_value.get("resolution")
+                gridmap_x_range = gridmap_metadata_value.get("x_range")
+                gridmap_y_range = gridmap_metadata_value.get("y_range")
                 if (
                     not isinstance(gridmap_width, int)
                     or isinstance(gridmap_width, bool)
@@ -476,6 +546,12 @@ class AnnotationApplicationService:
                     or not isinstance(gridmap_height, int)
                     or isinstance(gridmap_height, bool)
                     or gridmap_height < 1
+                    or not isinstance(gridmap_resolution, (int, float))
+                    or isinstance(gridmap_resolution, bool)
+                    or not isinstance(gridmap_x_range, list)
+                    or len(gridmap_x_range) != 2
+                    or not isinstance(gridmap_y_range, list)
+                    or len(gridmap_y_range) != 2
                 ):
                     raise AnnotationConflictError(
                         "trajectory_evidence_unavailable",
@@ -488,12 +564,16 @@ class AnnotationApplicationService:
                     ),
                     "width": gridmap_width,
                     "height": gridmap_height,
+                    "resolution": gridmap_resolution,
+                    "x_range": gridmap_x_range,
+                    "y_range": gridmap_y_range,
                 }
             public_frames.append(
                 {
                     "frame_index": frame_index,
                     "pass": bool(frame.get("pass", False)),
                     "camera": camera,
+                    "projection": projection,
                     "gridmap": gridmap,
                     "targets": targets,
                 }
@@ -560,6 +640,14 @@ class AnnotationApplicationService:
             content = _read_regular_descendant(path, root=artifact_root)
             if kind == "gridmap":
                 content, _width, _height = render_gridmap_png(content)
+            elif kind == "projection":
+                image_format, _width, _height = (
+                    _image_dimensions_from_bytes(content)
+                )
+                if image_format != "png":
+                    raise ValueError(
+                        "projection evidence must be a PNG image"
+                    )
         except AnnotationValidationError as exc:
             raise AnnotationValidationError(
                 "trajectory_evidence_unavailable",

@@ -78,7 +78,7 @@ import { trajectoryReviewPresentation } from "./reviewPresentation";
 import type {
   CalibrationProfile,
   FixCommand,
-  TrajectoryPoint,
+  TrajectoryEvidenceGridmap,
   TrajectoryReview,
   TrajectoryReviewEvidence,
 } from "./types";
@@ -86,7 +86,6 @@ import {
   cameraCanRender,
   evidenceMatchesReview,
   projectTrajectoryReviewEvidence,
-  trajectoryPositionPath,
 } from "./trajectoryEvidence";
 import type {
   ProjectedTrajectoryFrame,
@@ -136,96 +135,114 @@ function latestRevision(review: TrajectoryReview) {
   return review.fix_revisions.at(-1) ?? null;
 }
 
-function TrajectoryCanvas({
-  original,
-  current,
+function GridmapEvidenceView({
+  gridmap,
+  target,
 }: {
-  original: Array<TrajectoryPoint | null>;
-  current: Array<TrajectoryPoint | null>;
+  gridmap: TrajectoryEvidenceGridmap;
+  target: ProjectedTrajectoryTarget | null;
 }) {
-  const ref = useRef<HTMLCanvasElement | null>(null);
-
-  useEffect(() => {
-    const canvas = ref.current;
-    if (!canvas) return;
-    const context = canvas.getContext("2d");
-    if (!context) return;
-    const ratio = window.devicePixelRatio || 1;
-    const width = Math.max(1, canvas.clientWidth);
-    const height = Math.max(1, canvas.clientHeight);
-    canvas.width = Math.round(width * ratio);
-    canvas.height = Math.round(height * ratio);
-    context.scale(ratio, ratio);
-    context.clearRect(0, 0, width, height);
-    context.fillStyle = "#f8fafc";
-    context.fillRect(0, 0, width, height);
-    context.strokeStyle = "#e2e8f0";
-    context.lineWidth = 1;
-    for (let x = 24; x < width; x += 24) {
-      context.beginPath();
-      context.moveTo(x, 0);
-      context.lineTo(x, height);
-      context.stroke();
-    }
-    for (let y = 24; y < height; y += 24) {
-      context.beginPath();
-      context.moveTo(0, y);
-      context.lineTo(width, y);
-      context.stroke();
-    }
-
-    const points = [...original, ...current].filter(
-      (point): point is TrajectoryPoint => point !== null,
-    );
-    if (!points.length) return;
-    const xs = points.map((point) => point.x);
-    const ys = points.map((point) => point.y);
-    const minX = Math.min(...xs);
-    const maxX = Math.max(...xs);
-    const minY = Math.min(...ys);
-    const maxY = Math.max(...ys);
-    const scaleX = (width - 32) / Math.max(maxX - minX, 1);
-    const scaleY = (height - 32) / Math.max(maxY - minY, 1);
-    const scale = Math.min(scaleX, scaleY);
-    const draw = (
-      series: Array<TrajectoryPoint | null>,
-      color: string,
-      dashed: boolean,
-    ) => {
-      if (!series.some((point) => point !== null)) return;
-      context.strokeStyle = color;
-      context.lineWidth = 2;
-      context.setLineDash(dashed ? [6, 4] : []);
-      let active = false;
-      series.forEach((point) => {
-        if (point === null) {
-          if (active) context.stroke();
-          active = false;
-          return;
-        }
-        const x = 16 + (point.x - minX) * scale;
-        const y = height - 16 - (point.y - minY) * scale;
-        if (!active) {
-          context.beginPath();
-          context.moveTo(x, y);
-          active = true;
-        } else {
-          context.lineTo(x, y);
-        }
-      });
-      if (active) context.stroke();
+  const toDisplay = useCallback((x: number, y: number) => {
+    const xSpan = gridmap.x_range[1] - gridmap.x_range[0];
+    const ySpan = gridmap.y_range[1] - gridmap.y_range[0];
+    return {
+      x: (1 - (y - gridmap.y_range[0]) / ySpan) * gridmap.width,
+      y: (1 - (x - gridmap.x_range[0]) / xSpan) * gridmap.height,
     };
-    draw(original, "#64748b", true);
-    draw(current, "#2563eb", false);
-    context.setLineDash([]);
-  }, [current, original]);
+  }, [gridmap]);
+  const trajectory = (target?.trajectory_points ?? []).map((point) => (
+    toDisplay(point[0], point[1])
+  ));
+  const original = target?.original_position
+    ? toDisplay(target.original_position.x, target.original_position.y)
+    : null;
+  const current = target?.position
+    ? toDisplay(target.position.x, target.position.y)
+    : null;
+  const dog = toDisplay(0, 0);
+  const directionEnd = (
+    target?.position
+    && target.direction !== null
+  ) ? toDisplay(
+      target.position.x + Math.cos(target.direction) * 0.6,
+      target.position.y + Math.sin(target.direction) * 0.6,
+    ) : null;
+  const trajectoryPoints = trajectory
+    .map((point) => `${point.x},${point.y}`)
+    .join(" ");
 
   return (
-    <canvas
-      ref={ref}
-      aria-label="轨迹对比视图"
-      className="h-72 w-full rounded-lg border border-console-line bg-slate-50"
-    />
+    <div
+      className="relative mx-auto w-full max-w-[62rem] overflow-hidden rounded-xl border border-console-line bg-slate-950"
+      style={{ aspectRatio: `${gridmap.width} / ${gridmap.height}` }}
+      aria-label="当前帧 Gridmap 与轨迹证据"
+    >
+      <img
+        src={gridmap.url}
+        width={gridmap.width}
+        height={gridmap.height}
+        alt="当前帧 Gridmap 鸟瞰图"
+        className="absolute inset-0 h-full w-full object-fill [image-rendering:pixelated]"
+      />
+      <svg
+        aria-hidden="true"
+        className="absolute inset-0 h-full w-full"
+        viewBox={`0 0 ${gridmap.width} ${gridmap.height}`}
+        preserveAspectRatio="none"
+      >
+        {trajectory.length > 1 && (
+          <polyline
+            points={trajectoryPoints}
+            fill="none"
+            stroke="#2563eb"
+            strokeWidth={Math.max(1.5, gridmap.width / 150)}
+            vectorEffect="non-scaling-stroke"
+          />
+        )}
+        <circle
+          cx={dog.x}
+          cy={dog.y}
+          r={Math.max(2.5, gridmap.width / 80)}
+          fill="#0f172a"
+          stroke="#ffffff"
+          strokeWidth="1.5"
+          vectorEffect="non-scaling-stroke"
+        />
+        {original && (
+          <circle
+            cx={original.x}
+            cy={original.y}
+            r={Math.max(3, gridmap.width / 65)}
+            fill="#ffffff"
+            stroke="#475569"
+            strokeWidth="2"
+            vectorEffect="non-scaling-stroke"
+          />
+        )}
+        {current && (
+          <circle
+            cx={current.x}
+            cy={current.y}
+            r={Math.max(2.5, gridmap.width / 80)}
+            fill="#f97316"
+            stroke="#ffffff"
+            strokeWidth="1.5"
+            vectorEffect="non-scaling-stroke"
+          />
+        )}
+        {current && directionEnd && (
+          <line
+            x1={current.x}
+            y1={current.y}
+            x2={directionEnd.x}
+            y2={directionEnd.y}
+            stroke="#f97316"
+            strokeWidth="2"
+            vectorEffect="non-scaling-stroke"
+          />
+        )}
+      </svg>
+    </div>
   );
 }
 
@@ -518,14 +535,6 @@ function TrajectoryFixWorkbench({
     && selectedTarget
     && !fixRuntimeBusy
   );
-  const originalTrajectory = useMemo(
-    () => trajectoryPositionPath(projectedEvidence, targetRef, "original"),
-    [projectedEvidence, targetRef],
-  );
-  const projectedTrajectory = useMemo(
-    () => trajectoryPositionPath(projectedEvidence, targetRef, "projected"),
-    [projectedEvidence, targetRef],
-  );
   const updateFromResult = useCallback((next: TrajectoryReview) => {
     cacheTrajectoryReview(next);
     setReview(next);
@@ -672,6 +681,14 @@ function TrajectoryFixWorkbench({
   const renderableCamera = cameraCanRender(currentCamera)
     ? currentCamera
     : null;
+  const currentProjection = currentFrame?.projection ?? null;
+  const renderableProjection = cameraCanRender(currentProjection)
+    ? currentProjection
+    : null;
+  const projectionContainsBev = Boolean(
+    renderableProjection
+    && renderableProjection.width / renderableProjection.height > 2,
+  );
 
   const startSession = async () => {
     if (!selectedCalibration || !canStart) return;
@@ -743,7 +760,7 @@ function TrajectoryFixWorkbench({
   };
 
   return (
-    <section className="mx-auto max-w-360 space-y-4 px-3 pb-28 pt-4 md:px-4 lg:px-5">
+    <section className="mx-auto max-w-[1900px] space-y-4 px-3 pb-28 pt-4 md:px-4 lg:px-5">
       <DirtyNavigationGuard dirty={pageDirty} />
 
       <div className="flex flex-col gap-3 lg:flex-row lg:items-start lg:justify-between">
@@ -1036,7 +1053,7 @@ function TrajectoryFixWorkbench({
       )}
 
       {(review.status === "in_progress" || terminal) && (
-        <div className="grid gap-4 xl:grid-cols-[17rem_minmax(0,1fr)_20rem]">
+        <div className="grid gap-4 xl:grid-cols-[14rem_minmax(0,1fr)_21rem]">
           <ConsoleCard className="p-0">
             <div className="border-b border-console-line p-4">
               <h3 className="text-sm font-semibold text-console-text">帧与目标</h3>
@@ -1122,46 +1139,79 @@ function TrajectoryFixWorkbench({
                 </TabsList>
               </div>
               <TabsContent value="camera" className="p-4">
-                {renderableCamera ? (
-                  <div className="flex min-h-96 items-center justify-center overflow-hidden rounded-lg bg-slate-950">
-                    <img
-                      src={renderableCamera.url}
-                      width={renderableCamera.width}
-                      height={renderableCamera.height}
-                      alt={`第 ${frameIndex + 1} 帧相机投影`}
-                      className="max-h-[36rem] max-w-full object-contain"
-                    />
+                {renderableProjection ? (
+                  <div>
+                    <div
+                      className={`relative mx-auto w-full overflow-hidden rounded-xl bg-slate-950 ${
+                        projectionContainsBev
+                          ? "aspect-[5/4]"
+                          : "min-h-[32rem]"
+                      }`}
+                    >
+                      {projectionContainsBev ? (
+                        <img
+                          src={renderableProjection.url}
+                          width={renderableProjection.width}
+                          height={renderableProjection.height}
+                          alt={`第 ${frameIndex + 1} 帧原后处理投影`}
+                          className="absolute inset-y-0 left-0 h-full w-[200%] max-w-none -translate-x-1/2 object-fill"
+                        />
+                      ) : (
+                        <img
+                          src={renderableProjection.url}
+                          width={renderableProjection.width}
+                          height={renderableProjection.height}
+                          alt={`第 ${frameIndex + 1} 帧原后处理投影`}
+                          className="h-full max-h-[56rem] w-full object-contain"
+                        />
+                      )}
+                    </div>
+                    <p className="mt-3 text-xs leading-5 text-console-muted">
+                      这是冻结后处理产物中的原始投影，使用后处理标定。草稿数值会在提交 Fix
+                      版本后由冻结 Runtime 重新计算，不在浏览器中近似重算。
+                    </p>
+                  </div>
+                ) : renderableCamera ? (
+                  <div>
+                    <div className="flex min-h-[32rem] items-center justify-center overflow-hidden rounded-xl bg-slate-950">
+                      <img
+                        src={renderableCamera.url}
+                        width={renderableCamera.width}
+                        height={renderableCamera.height}
+                        alt={`第 ${frameIndex + 1} 帧原始相机画面`}
+                        className="max-h-[56rem] max-w-full object-contain"
+                      />
+                    </div>
+                    <p className="mt-3 text-xs text-amber-700">
+                      当前帧缺少原后处理投影，暂时展示原始相机画面。
+                    </p>
                   </div>
                 ) : (
-                  <div className="flex min-h-96 items-center justify-center rounded-lg border border-dashed border-console-line text-sm text-console-muted">
-                    当前帧没有可公开的相机投影证据。
+                  <div className="flex min-h-[32rem] items-center justify-center rounded-lg border border-dashed border-console-line text-sm text-console-muted">
+                    当前帧没有可公开的相机或投影证据。
                   </div>
                 )}
               </TabsContent>
               <TabsContent value="gridmap" className="space-y-4 p-4">
                 {currentFrame?.gridmap ? (
-                  <div className="flex min-h-48 items-center justify-center overflow-hidden rounded-lg border border-console-line bg-slate-950">
-                    <img
-                      src={currentFrame.gridmap.url}
-                      width={currentFrame.gridmap.width}
-                      height={currentFrame.gridmap.height}
-                      alt={`第 ${frameIndex + 1} 帧 Gridmap 鸟瞰图`}
-                      className="max-h-96 max-w-full object-contain [image-rendering:pixelated]"
-                    />
-                  </div>
+                  <GridmapEvidenceView
+                    gridmap={currentFrame.gridmap}
+                    target={selectedTarget}
+                  />
                 ) : (
-                  <div className="flex min-h-36 items-center justify-center rounded-lg border border-dashed border-console-line text-sm text-console-muted">
+                  <div className="flex min-h-[32rem] items-center justify-center rounded-lg border border-dashed border-console-line text-sm text-console-muted">
                     当前帧没有可公开的 Gridmap 鸟瞰图。
                   </div>
                 )}
-                <TrajectoryCanvas
-                  original={originalTrajectory}
-                  current={projectedTrajectory}
-                />
-                <div className="flex gap-4 text-xs text-console-muted">
-                  <span><span className="mr-1 inline-block h-0.5 w-5 bg-slate-500 align-middle" />原始位置序列</span>
-                  <span><span className="mr-1 inline-block h-0.5 w-5 bg-blue-600 align-middle" />草稿命令投影</span>
+                <div className="flex flex-wrap gap-x-5 gap-y-2 text-xs text-console-muted">
+                  <span><span className="mr-1 inline-block h-2.5 w-2.5 rounded-full border-2 border-slate-600 bg-white align-middle" />原始目标</span>
+                  <span><span className="mr-1 inline-block h-2.5 w-2.5 rounded-full bg-orange-500 align-middle" />当前草稿目标与方向</span>
+                  <span><span className="mr-1 inline-block h-0.5 w-5 bg-blue-600 align-middle" />当前帧原始规划轨迹</span>
+                  <span><span className="mr-1 inline-block h-2.5 w-2.5 rounded-full bg-slate-900 align-middle" />Dog 原点</span>
                 </div>
+                <p className="text-xs leading-5 text-console-muted">
+                  浏览器只叠加原产物与明确的草稿字段；由旧 Fix 数值逻辑派生的轨迹将在提交后生成。
+                </p>
               </TabsContent>
             </Tabs>
           </ConsoleCard>

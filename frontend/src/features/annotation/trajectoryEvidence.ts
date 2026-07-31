@@ -121,12 +121,32 @@ function parseGridmap(
 ): TrajectoryEvidenceGridmap | null {
   if (value === null) return null;
   const gridmap = record(value);
-  exactKeys(gridmap, ["height", "url", "width"]);
+  exactKeys(gridmap, [
+    "height",
+    "resolution",
+    "url",
+    "width",
+    "x_range",
+    "y_range",
+  ]);
   if (nonEmptyString(gridmap.url) !== expectedUrl) contractError();
+  const xRange = tuple(gridmap.x_range, [2]);
+  const yRange = tuple(gridmap.y_range, [2]);
+  const resolution = finite(gridmap.resolution);
+  if (
+    resolution <= 0
+    || xRange[0] >= xRange[1]
+    || yRange[0] >= yRange[1]
+  ) {
+    contractError();
+  }
   return {
     url: expectedUrl,
     width: integer(gridmap.width, 1),
     height: integer(gridmap.height, 1),
+    resolution,
+    x_range: [xRange[0], xRange[1]],
+    y_range: [yRange[0], yRange[1]],
   };
 }
 
@@ -294,6 +314,7 @@ export function parseTrajectoryReviewEvidence(
         "frame_index",
         "gridmap",
         "pass",
+        "projection",
         "targets",
       ]);
       const frameIndex = integer(frame.frame_index);
@@ -326,6 +347,10 @@ export function parseTrajectoryReviewEvidence(
         camera: parseCamera(
           frame.camera,
           `${expectedBase}/${frameIndex}/camera`,
+        ),
+        projection: parseCamera(
+          frame.projection,
+          `${expectedBase}/${frameIndex}/projection`,
         ),
         gridmap: parseGridmap(
           frame.gridmap,

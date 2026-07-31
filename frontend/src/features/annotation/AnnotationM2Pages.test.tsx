@@ -107,6 +107,7 @@ function evidenceFor(owner: TrajectoryReview): TrajectoryReviewEvidence {
       frame_index: 0,
       pass: false,
       camera: null,
+      projection: null,
       gridmap: null,
       targets: [{
         target_ref: "target_0123456789abcdef0123456789abcdef",
@@ -342,6 +343,7 @@ test("Fix workbench rejects evidence bound to a stale review revision", async ()
       frame_index: 0,
       pass: false,
       camera: null,
+      projection: null,
       gridmap: null,
       targets: [{
         target_ref: "target_0123456789abcdef0123456789abcdef",
@@ -404,7 +406,19 @@ test("Fix workbench displays the bound Gridmap PNG with declared dimensions", as
         width: 1920,
         height: 1536,
       },
-      gridmap: { url: gridmapUrl, width: 320, height: 240 },
+      projection: {
+        url: `/api/annotation/reviews/${review.review_ref}/evidence/frames/0/projection`,
+        width: 3840,
+        height: 1536,
+      },
+      gridmap: {
+        url: gridmapUrl,
+        width: 320,
+        height: 240,
+        resolution: 0.1,
+        x_range: [-12, 12],
+        y_range: [-12, 12],
+      },
       targets: [{
         target_ref: "target_0123456789abcdef0123456789abcdef",
         label: "Master",
@@ -427,20 +441,24 @@ test("Fix workbench displays the bound Gridmap PNG with declared dimensions", as
     initialEntries: [`/annotation/reviews/${review.review_ref}`],
   });
 
-  const canvasContext = vi
-    .spyOn(HTMLCanvasElement.prototype, "getContext")
-    .mockReturnValue(null);
   render(<RouterProvider router={router} future={{ v7_startTransition: true }} />);
+  const projection = await screen.findByRole("img", {
+    name: "第 1 帧原后处理投影",
+  });
+  expect(projection).toHaveAttribute(
+    "src",
+    `/api/annotation/reviews/${review.review_ref}/evidence/frames/0/projection`,
+  );
+  expect(screen.getByText(/冻结后处理产物中的原始投影/)).toBeVisible();
   const gridmapTab = await screen.findByRole("tab", { name: "Gridmap / 轨迹" });
   fireEvent.mouseDown(gridmapTab, { button: 0, ctrlKey: false });
 
   const gridmap = await screen.findByRole("img", {
-    name: "第 1 帧 Gridmap 鸟瞰图",
+    name: "当前帧 Gridmap 鸟瞰图",
   });
   expect(gridmap).toHaveAttribute("src", gridmapUrl);
   expect(gridmap).toHaveAttribute("width", "320");
   expect(gridmap).toHaveAttribute("height", "240");
-  canvasContext.mockRestore();
 });
 
 test("Fix workbench freezes mutations while a Fix run is active and refreshes on completion event", async () => {
@@ -487,6 +505,7 @@ test("Fix workbench freezes mutations while a Fix run is active and refreshes on
       frame_index: 0,
       pass: false,
       camera: null,
+      projection: null,
       gridmap: null,
       targets: [{
         target_ref: "target_0123456789abcdef0123456789abcdef",
@@ -661,6 +680,7 @@ test("Fix workbench displays a sanitized Fix failure and permits draft correctio
       frame_index: 0,
       pass: false,
       camera: null,
+      projection: null,
       gridmap: null,
       targets: [{
         target_ref: "target_0123456789abcdef0123456789abcdef",
@@ -720,6 +740,7 @@ test("Fix workbench autosaves a position change through the CAS command API", as
       frame_index: 0,
       pass: false,
       camera: null,
+      projection: null,
       gridmap: null,
       targets: [{
         target_ref: "target_0123456789abcdef0123456789abcdef",
