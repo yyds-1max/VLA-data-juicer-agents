@@ -19,6 +19,9 @@ function payload(): Record<string, unknown> {
   return {
     availability: "available",
     review_ref: reviewRef,
+    evidence_kind: "trajectory_revision",
+    fix_revision_ref: null,
+    fix_revision_source_draft_revision: null,
     trajectory_revision_ref: trajectoryRef,
     review_state_revision: 6,
     draft_revision: 6,
@@ -54,6 +57,12 @@ function payload(): Record<string, unknown> {
           color: ["black", "gray", "white"],
           image_box: [10, 20, 30, 40],
           trajectory_points: [[1, 2], [3, 4, 5]],
+          camera_position: null,
+          camera_trajectory_points: [],
+          base_position: [1, 2],
+          base_direction: 0,
+          base_speed: 1,
+          base_trajectory_points: [[1, 2], [3, 4, 5]],
         }],
       },
       {
@@ -71,6 +80,12 @@ function payload(): Record<string, unknown> {
           color: [],
           image_box: null,
           trajectory_points: [],
+          camera_position: null,
+          camera_trajectory_points: [],
+          base_position: null,
+          base_direction: 1,
+          base_speed: 2,
+          base_trajectory_points: [],
         }],
       },
     ],
@@ -113,6 +128,33 @@ test("strict evidence parser preserves only the public schema", () => {
   expect(evidence.frames[0].targets[0].position).toEqual([1, 2]);
   expect(cameraCanRender(evidence.frames[0].camera)).toBe(true);
   expect(cameraCanRender(evidence.frames[1].camera)).toBe(false);
+});
+
+test("strict evidence parser accepts a Fix revision with only trailing draft commands", () => {
+  const value = payload();
+  value.evidence_kind = "fix_revision";
+  value.fix_revision_ref =
+    "fix_revision_0123456789abcdef0123456789abcdef";
+  value.fix_revision_source_draft_revision = 4;
+  value.draft_commands = (
+    value.draft_commands as Array<Record<string, unknown>>
+  ).slice(3);
+  const frames = value.frames as Array<Record<string, unknown>>;
+  const targets = frames[0].targets as Array<Record<string, unknown>>;
+  targets[0].camera_position = [100, 200];
+  targets[0].camera_trajectory_points = [[100, 200], [110, 210]];
+
+  const evidence = parseTrajectoryReviewEvidence(value, reviewRef);
+
+  expect(evidence).toMatchObject({
+    evidence_kind: "fix_revision",
+    fix_revision_ref:
+      "fix_revision_0123456789abcdef0123456789abcdef",
+    fix_revision_source_draft_revision: 4,
+    draft_revision: 6,
+  });
+  expect(evidence.draft_commands).toHaveLength(2);
+  expect(evidence.frames[0].targets[0].camera_position).toEqual([100, 200]);
 });
 
 test("draft projection replays direct commands and never invents runtime-derived positions", () => {

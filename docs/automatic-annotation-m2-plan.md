@@ -310,6 +310,17 @@ Fix 标定与处理标定独立：
 颜色、back、pass、缺失目标和轨迹点语义。不得在 FastAPI 进程中嵌入或长期运行
 旧 GUI 实例。
 
+Web 交互保持旧 GUI 的业务语义，但不机械复制桌面控件：
+
+- 在 Gridmap 上拖动目标修改位置，拖动方向端点修改方向；数值输入保留为精确
+  调整和无障碍替代入口；
+- 拖动和数值输入只更新 CAS 草稿，不在浏览器中重写旧数值算法；
+- “生成/更新 Fix 预览”统一执行旧 GUI 的 `OK` 重算与最终保存语义，并通过
+  冻结 Runtime 生成权威 FixRevision 证据；
+- `add_missing_target` 是“补回＋旧 `OK` 重算”的原子领域动作，不能留下只有
+  位置而没有派生轨迹的半成品；
+- 原 `run_fix.sh` 未向 Python 传入 `in/out`，Web Runtime 同样不虚构该参数。
+
 ### 6.3 Revision 与审核
 
 ```text
@@ -322,6 +333,10 @@ Fix 标定与处理标定独立：
 
 - draft 是可变 working copy；
 - 每次提交生成不可变 FixRevision；
+- FixRevision 必须保存由冻结旧 Runtime 生成的相机投影坐标、Gridmap 轨迹、
+  位置、方向和速度证据；相机投影与 Gridmap/轨迹在同一页面同时展示；
+- 草稿 revision 晚于 FixRevision 的 source draft revision 时，预览明确过期，
+  前端禁止批准，后端批准 API 也必须返回冲突；
 - 409 冲突不自动合并轨迹，由用户选择服务器版本或基于最新 revision 重做；
 - 退回时回到 Fix 工作台，不自动重跑后处理；
 - 废弃保留完整审计，不进入训练出口；
@@ -475,14 +490,15 @@ Fix：
 
 Fix 工作台：
 
-- 相机投影视图；
-- gridmap 鸟瞰轨迹；
-- 目标与帧时间线；
+- 相机投影视图与 gridmap 鸟瞰轨迹同屏展示；
+- 目标与帧时间线横向排列；
 - 位置、方向、速度；
 - 原始 TrajectoryRevision 与 FixDraft/FixRevision 对比；
 - 独立 Fix 标定与差异原因；
 - 草稿自动保存、CAS 冲突和脏状态导航保护；
 - 提交、批准、退回和废弃动作。
+- `pass` 是“当前帧不进入训练”的原兼容字段；“废弃 Segment”是复核任务终态，
+  两者不得混为同一动作。
 
 通用无业务状态控件优先通过 shadcn MCP 检索并审查源码：
 
@@ -744,3 +760,31 @@ stage-specific preflight，最后用新的 DataPilot 会话继续 `20270623` 验
 - 缺 gridmap 副本的 `generate_from_pcd` writer 验收；
 - publication journal 中断恢复验收；
 - 安全化 actual invocation ledger，或在 Golden 中提供等价的私有调用证明。
+
+## 17. Fix 工作台旧 GUI 语义收口（2026-07-31）
+
+针对真实 `20270623` 人工复核验收中暴露的差距，本轮完成：
+
+- Gridmap 直接拖动目标位置、拖动方向端点，同时保留精确数值输入；
+- 帧与目标横向排列，相机投影和 Gridmap/轨迹固定同屏；
+- 草稿自动保存；“生成/更新 Fix 预览”调用冻结旧 Runtime 执行权威重算，
+  不在浏览器中复制旧数值算法；
+- `add_missing_target` 原子执行旧 GUI 的补回和 `OK` 重算；
+- FixRevision 保存受哈希约束的相机投影坐标、当前轨迹和原
+  TrajectoryRevision 对比证据；
+- 草稿变更后旧预览立即失效，前后端均禁止批准过期 FixRevision；
+- UI 明确区分当前帧 `pass` 与整个 Segment 的废弃；
+- 原 `run_fix.sh` 未传递的 `in/out` 不进入新的 Fix 领域契约。
+
+本地门禁：
+
+- Python 全量：`1761 passed`；
+- 前端 Vitest：`265 passed, 8 skipped`；
+- Playwright 全量：`10 passed`；
+- production build 与 bundle gate：通过，最大 JavaScript chunk
+  `398926 < 512000` bytes；
+- compileall 与 `git diff --check`：通过。
+
+本轮未连接服务器，也未运行冻结业务 writer。服务器仍需对一个非正式测试
+Segment 执行“拖动位置、拖动方向、补回缺失目标、标记 pass、生成预览、批准
+发布”的完整人工验收，并与旧 GUI 的同输入同操作序列做数值对比。

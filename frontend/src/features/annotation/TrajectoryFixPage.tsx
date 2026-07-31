@@ -21,6 +21,7 @@ import {
   useRef,
   useState,
 } from "react";
+import type { PointerEvent as ReactPointerEvent } from "react";
 import {
   useBeforeUnload,
   useBlocker,
@@ -51,12 +52,6 @@ import {
   SelectTrigger,
   SelectValue,
 } from "../../components/ui/select";
-import {
-  Tabs,
-  TabsContent,
-  TabsList,
-  TabsTrigger,
-} from "../../components/ui/tabs";
 import {
   AnnotationApiError,
   applyFixCommand,
@@ -138,10 +133,21 @@ function latestRevision(review: TrajectoryReview) {
 function GridmapEvidenceView({
   gridmap,
   target,
+  editable,
+  onPositionPreview,
+  onDirectionPreview,
+  onDragStateChange,
 }: {
   gridmap: TrajectoryEvidenceGridmap;
   target: ProjectedTrajectoryTarget | null;
+  editable: boolean;
+  onPositionPreview: (x: number, y: number) => void;
+  onDirectionPreview: (direction: number) => void;
+  onDragStateChange: (dragging: boolean) => void;
 }) {
+  const [dragMode, setDragMode] = useState<"position" | "direction" | null>(
+    null,
+  );
   const toDisplay = useCallback((x: number, y: number) => {
     const xSpan = gridmap.x_range[1] - gridmap.x_range[0];
     const ySpan = gridmap.y_range[1] - gridmap.y_range[0];
@@ -150,7 +156,63 @@ function GridmapEvidenceView({
       y: (1 - (x - gridmap.x_range[0]) / xSpan) * gridmap.height,
     };
   }, [gridmap]);
+  const fromPointer = useCallback((
+    event: ReactPointerEvent<SVGSVGElement>,
+  ) => {
+    const bounds = event.currentTarget.getBoundingClientRect();
+    const displayX = (
+      (event.clientX - bounds.left) / Math.max(bounds.width, 1)
+    ) * gridmap.width;
+    const displayY = (
+      (event.clientY - bounds.top) / Math.max(bounds.height, 1)
+    ) * gridmap.height;
+    const xSpan = gridmap.x_range[1] - gridmap.x_range[0];
+    const ySpan = gridmap.y_range[1] - gridmap.y_range[0];
+    return {
+      x: gridmap.x_range[0]
+        + (1 - displayY / gridmap.height) * xSpan,
+      y: gridmap.y_range[0]
+        + (1 - displayX / gridmap.width) * ySpan,
+    };
+  }, [gridmap]);
+  const startDrag = (
+    event: ReactPointerEvent<SVGElement>,
+    mode: "position" | "direction",
+  ) => {
+    if (!editable || !target?.position) return;
+    event.preventDefault();
+    event.stopPropagation();
+    event.currentTarget.ownerSVGElement?.setPointerCapture(event.pointerId);
+    setDragMode(mode);
+    onDragStateChange(true);
+  };
+  const moveDrag = (event: ReactPointerEvent<SVGSVGElement>) => {
+    if (!dragMode || !target?.position) return;
+    event.preventDefault();
+    const next = fromPointer(event);
+    if (dragMode === "position") {
+      onPositionPreview(next.x, next.y);
+    } else {
+      onDirectionPreview(
+        Math.atan2(
+          next.y - target.position.y,
+          next.x - target.position.x,
+        ),
+      );
+    }
+  };
+  const finishDrag = (event: ReactPointerEvent<SVGSVGElement>) => {
+    if (!dragMode) return;
+    if (event.currentTarget.hasPointerCapture(event.pointerId)) {
+      event.currentTarget.releasePointerCapture(event.pointerId);
+    }
+    setDragMode(null);
+    onDragStateChange(false);
+  };
   const trajectory = (target?.trajectory_points ?? []).map((point) => (
+    toDisplay(point[0], point[1])
+  ));
+  const baseTrajectory = (target?.base_trajectory_points ?? []).map((point) => (
     toDisplay(point[0], point[1])
   ));
   const original = target?.original_position
@@ -185,11 +247,26 @@ function GridmapEvidenceView({
         className="absolute inset-0 h-full w-full object-fill [image-rendering:pixelated]"
       />
       <svg
-        aria-hidden="true"
-        className="absolute inset-0 h-full w-full"
+        aria-label="可拖动的当前帧 Gridmap 与轨迹"
+        className="absolute inset-0 h-full w-full touch-none select-none"
         viewBox={`0 0 ${gridmap.width} ${gridmap.height}`}
         preserveAspectRatio="none"
+        onPointerMove={moveDrag}
+        onPointerUp={finishDrag}
+        onPointerCancel={finishDrag}
       >
+        {baseTrajectory.length > 1 && (
+          <polyline
+            points={baseTrajectory
+              .map((point) => `${point.x},${point.y}`)
+              .join(" ")}
+            fill="none"
+            stroke="#64748b"
+            strokeDasharray="5 4"
+            strokeWidth={Math.max(1.25, gridmap.width / 180)}
+            vectorEffect="non-scaling-stroke"
+          />
+        )}
         {trajectory.length > 1 && (
           <polyline
             points={trajectoryPoints}
@@ -228,6 +305,9 @@ function GridmapEvidenceView({
             stroke="#ffffff"
             strokeWidth="1.5"
             vectorEffect="non-scaling-stroke"
+            className={editable ? "cursor-grab active:cursor-grabbing" : ""}
+            aria-label="拖动目标位置"
+            onPointerDown={(event) => startDrag(event, "position")}
           />
         )}
         {current && directionEnd && (
@@ -241,7 +321,110 @@ function GridmapEvidenceView({
             vectorEffect="non-scaling-stroke"
           />
         )}
+        {current && directionEnd && (
+          <circle
+            cx={directionEnd.x}
+            cy={directionEnd.y}
+            r={Math.max(3, gridmap.width / 70)}
+            fill="#ffffff"
+            stroke="#f97316"
+            strokeWidth="2"
+            vectorEffect="non-scaling-stroke"
+            className={editable ? "cursor-grab active:cursor-grabbing" : ""}
+            aria-label="拖动目标方向"
+            onPointerDown={(event) => startDrag(event, "direction")}
+          />
+        )}
       </svg>
+    </div>
+  );
+}
+
+function CameraEvidenceView({
+  frameIndex,
+  camera,
+  projection,
+  target,
+  fixRevision,
+}: {
+  frameIndex: number;
+  camera: TrajectoryReviewEvidence["frames"][number]["camera"];
+  projection: TrajectoryReviewEvidence["frames"][number]["projection"];
+  target: ProjectedTrajectoryTarget | null;
+  fixRevision: boolean;
+}) {
+  const source = fixRevision ? camera : projection ?? camera;
+  if (!cameraCanRender(source)) {
+    return (
+      <div className="flex min-h-96 items-center justify-center rounded-xl border border-dashed border-console-line text-sm text-console-muted">
+        当前帧没有可公开的相机投影证据。
+      </div>
+    );
+  }
+  const renderOverlay = (
+    fixRevision
+    && cameraCanRender(camera)
+    && camera.width !== null
+    && camera.height !== null
+  );
+  const projectionContainsBev = Boolean(
+    !fixRevision
+    && projection !== null
+    && source === projection
+    && source.width !== null
+    && source.height !== null
+    && source.width / source.height > 2,
+  );
+  const trajectory = target?.camera_trajectory_points ?? [];
+  const position = target?.camera_position ?? null;
+  return (
+    <div
+      className="relative mx-auto w-full overflow-hidden rounded-xl bg-slate-950"
+      style={{
+        aspectRatio: projectionContainsBev
+          ? "5 / 4"
+          : `${source.width ?? 16} / ${source.height ?? 9}`,
+      }}
+    >
+      <img
+        src={source.url}
+        width={source.width ?? undefined}
+        height={source.height ?? undefined}
+        alt={`第 ${frameIndex + 1} 帧${fixRevision ? "Fix 结果" : "原后处理"}投影`}
+        className={
+          projectionContainsBev
+            ? "absolute inset-y-0 left-0 h-full w-[200%] max-w-none -translate-x-1/2 object-fill"
+            : "absolute inset-0 h-full w-full object-contain"
+        }
+      />
+      {renderOverlay && (
+        <svg
+          aria-hidden="true"
+          className="absolute inset-0 h-full w-full"
+          viewBox={`0 0 ${camera.width} ${camera.height}`}
+        >
+          {trajectory.length > 1 && (
+            <polyline
+              points={trajectory.map((point) => point.join(",")).join(" ")}
+              fill="none"
+              stroke="#22c55e"
+              strokeWidth="3"
+              vectorEffect="non-scaling-stroke"
+            />
+          )}
+          {position && (
+            <circle
+              cx={position[0]}
+              cy={position[1]}
+              r="7"
+              fill="#f97316"
+              stroke="#ffffff"
+              strokeWidth="2"
+              vectorEffect="non-scaling-stroke"
+            />
+          )}
+        </svg>
+      )}
     </div>
   );
 }
@@ -308,6 +491,7 @@ function TrajectoryFixWorkbench({
   const [error, setError] = useState("");
   const [acting, setActing] = useState(false);
   const [saving, setSaving] = useState(false);
+  const [geometryDragging, setGeometryDragging] = useState(false);
   const [conflict, setConflict] = useState(false);
   const [selectedProfile, setSelectedProfile] = useState("");
   const [differenceReason, setDifferenceReason] = useState("");
@@ -498,6 +682,21 @@ function TrajectoryFixWorkbench({
     ?? currentFrame?.targets[0]
     ?? null
   ), [currentFrame, targetRef]);
+  const gridmapTarget = useMemo(() => {
+    if (!selectedTarget) return null;
+    const x = finiteValue(editor.x);
+    const y = finiteValue(editor.y);
+    const direction = finiteValue(editor.direction);
+    return {
+      ...selectedTarget,
+      position: (
+        selectedTarget.present && x !== null && y !== null
+          ? { x, y }
+          : selectedTarget.position
+      ),
+      direction: direction ?? selectedTarget.direction,
+    };
+  }, [editor.direction, editor.x, editor.y, selectedTarget]);
 
   useEffect(() => {
     if (!currentFrame) return;
@@ -580,7 +779,14 @@ function TrajectoryFixWorkbench({
   }, [loadEvidence, reviewRef, updateFromResult]);
 
   useEffect(() => {
-    if (!editable || !editorDirty || saving || conflict || !selectedTarget) return;
+    if (
+      !editable
+      || !editorDirty
+      || saving
+      || conflict
+      || geometryDragging
+      || !selectedTarget
+    ) return;
     const timer = window.setTimeout(() => {
       const x = finiteValue(editor.x);
       const y = finiteValue(editor.y);
@@ -630,6 +836,7 @@ function TrajectoryFixWorkbench({
     editor,
     editorDirty,
     frameIndex,
+    geometryDragging,
     runCommand,
     savedEditor,
     saving,
@@ -678,17 +885,15 @@ function TrajectoryFixWorkbench({
   const terminal = review.status === "approved" || review.status === "discarded";
   const reviewPresentation = trajectoryReviewPresentation(review);
   const currentCamera = currentFrame?.camera ?? null;
-  const renderableCamera = cameraCanRender(currentCamera)
-    ? currentCamera
-    : null;
   const currentProjection = currentFrame?.projection ?? null;
-  const renderableProjection = cameraCanRender(currentProjection)
-    ? currentProjection
-    : null;
-  const projectionContainsBev = Boolean(
-    renderableProjection
-    && renderableProjection.width / renderableProjection.height > 2,
+  const previewMatchesDraft = Boolean(
+    revision
+    && review.fix_draft
+    && revision.source_draft_revision === review.fix_draft.revision
+    && evidence?.evidence_kind === "fix_revision"
+    && evidence.fix_revision_ref === revision.revision_ref,
   );
+  const previewIsStale = Boolean(revision && !previewMatchesDraft);
 
   const startSession = async () => {
     if (!selectedCalibration || !canStart) return;
@@ -1053,36 +1258,38 @@ function TrajectoryFixWorkbench({
       )}
 
       {(review.status === "in_progress" || terminal) && (
-        <div className="grid gap-4 xl:grid-cols-[14rem_minmax(0,1fr)_21rem]">
+        <div className="space-y-4">
           <ConsoleCard className="p-0">
-            <div className="border-b border-console-line p-4">
-              <h3 className="text-sm font-semibold text-console-text">帧与目标</h3>
-              <p className="mt-1 text-xs text-console-muted">
-                {evidence?.frame_count ?? 0} 帧 · 当前第 {frameIndex + 1} 帧
-              </p>
-            </div>
-            <div className="flex items-center justify-between border-b border-console-line p-3">
-              <ConsoleButton
-                aria-label="上一帧"
-                disabled={!currentFrame || frameIndex <= 0}
-                onClick={() => setFrameIndex(Math.max(0, frameIndex - 1))}
-              >
-                <ChevronLeft aria-hidden="true" className="h-4 w-4" />
-              </ConsoleButton>
-              <span className="text-sm tabular-nums text-console-text">{frameIndex + 1}</span>
-              <ConsoleButton
-                aria-label="下一帧"
-                disabled={!evidence || frameIndex >= evidence.frame_count - 1}
-                onClick={() => setFrameIndex(Math.min(
-                  Math.max(0, (evidence?.frame_count ?? 1) - 1),
-                  frameIndex + 1,
-                ))}
-              >
-                <ChevronRight aria-hidden="true" className="h-4 w-4" />
-              </ConsoleButton>
-            </div>
-            <div className="border-b border-console-line px-3 py-3">
-              <label className="block">
+            <div className="flex flex-col gap-3 border-b border-console-line p-4 lg:flex-row lg:items-center">
+              <div className="flex shrink-0 items-center gap-2">
+                <div className="mr-2">
+                  <h3 className="text-sm font-semibold text-console-text">帧与目标</h3>
+                  <p className="mt-0.5 text-xs text-console-muted">
+                    {evidence?.frame_count ?? 0} 帧
+                  </p>
+                </div>
+                <ConsoleButton
+                  aria-label="上一帧"
+                  disabled={!currentFrame || frameIndex <= 0}
+                  onClick={() => setFrameIndex(Math.max(0, frameIndex - 1))}
+                >
+                  <ChevronLeft aria-hidden="true" className="h-4 w-4" />
+                </ConsoleButton>
+                <span className="min-w-20 text-center text-sm tabular-nums text-console-text">
+                  {frameIndex + 1} / {evidence?.frame_count ?? 0}
+                </span>
+                <ConsoleButton
+                  aria-label="下一帧"
+                  disabled={!evidence || frameIndex >= evidence.frame_count - 1}
+                  onClick={() => setFrameIndex(Math.min(
+                    Math.max(0, (evidence?.frame_count ?? 1) - 1),
+                    frameIndex + 1,
+                  ))}
+                >
+                  <ChevronRight aria-hidden="true" className="h-4 w-4" />
+                </ConsoleButton>
+              </div>
+              <label className="min-w-48 flex-1">
                 <span className="sr-only">轨迹帧时间线</span>
                 <input
                   type="range"
@@ -1100,13 +1307,13 @@ function TrajectoryFixWorkbench({
                 />
               </label>
             </div>
-            <ScrollArea className="h-96">
-              <div className="space-y-1 p-3">
+            <ScrollArea className="w-full">
+              <div className="flex min-w-max gap-2 p-3">
                 {(currentFrame?.targets ?? []).map((target) => (
                   <button
                     key={target.target_ref}
                     type="button"
-                    className={`w-full rounded-lg border px-3 py-2 text-left text-sm transition ${
+                    className={`min-w-48 rounded-lg border px-3 py-2 text-left text-sm transition ${
                       selectedTarget?.target_ref === target.target_ref
                         ? "border-console-cyan bg-blue-50 text-blue-800"
                         : "border-console-line bg-white text-console-text hover:bg-console-panel2"
@@ -1118,105 +1325,98 @@ function TrajectoryFixWorkbench({
                       {target.position
                         ? `${target.position.x}, ${target.position.y}`
                         : target.projection === "runtime_derived"
-                          ? "已补回；坐标由 Fix Runtime 计算"
+                          ? "已补回；待生成 Fix 预览"
                           : "本帧缺失"}
                     </span>
                   </button>
                 ))}
                 {evidenceAvailable && !currentFrame?.targets.length && (
-                  <p className="px-2 py-6 text-center text-sm text-console-muted">本帧没有公开目标。</p>
+                  <p className="px-2 py-3 text-sm text-console-muted">本帧没有公开目标。</p>
                 )}
               </div>
+              <ScrollBar orientation="horizontal" />
             </ScrollArea>
           </ConsoleCard>
 
-          <ConsoleCard className="min-w-0 p-0">
-            <Tabs defaultValue="camera" className="gap-0">
-              <div className="border-b border-console-line px-4 pt-3">
-                <TabsList variant="line">
-                  <TabsTrigger value="camera">相机投影</TabsTrigger>
-                  <TabsTrigger value="gridmap">Gridmap / 轨迹</TabsTrigger>
-                </TabsList>
-              </div>
-              <TabsContent value="camera" className="p-4">
-                {renderableProjection ? (
-                  <div>
-                    <div
-                      className={`relative mx-auto w-full overflow-hidden rounded-xl bg-slate-950 ${
-                        projectionContainsBev
-                          ? "aspect-[5/4]"
-                          : "min-h-[32rem]"
-                      }`}
-                    >
-                      {projectionContainsBev ? (
-                        <img
-                          src={renderableProjection.url}
-                          width={renderableProjection.width}
-                          height={renderableProjection.height}
-                          alt={`第 ${frameIndex + 1} 帧原后处理投影`}
-                          className="absolute inset-y-0 left-0 h-full w-[200%] max-w-none -translate-x-1/2 object-fill"
-                        />
-                      ) : (
-                        <img
-                          src={renderableProjection.url}
-                          width={renderableProjection.width}
-                          height={renderableProjection.height}
-                          alt={`第 ${frameIndex + 1} 帧原后处理投影`}
-                          className="h-full max-h-[56rem] w-full object-contain"
-                        />
-                      )}
-                    </div>
-                    <p className="mt-3 text-xs leading-5 text-console-muted">
-                      这是冻结后处理产物中的原始投影，使用后处理标定。草稿数值会在提交 Fix
-                      版本后由冻结 Runtime 重新计算，不在浏览器中近似重算。
-                    </p>
-                  </div>
-                ) : renderableCamera ? (
-                  <div>
-                    <div className="flex min-h-[32rem] items-center justify-center overflow-hidden rounded-xl bg-slate-950">
-                      <img
-                        src={renderableCamera.url}
-                        width={renderableCamera.width}
-                        height={renderableCamera.height}
-                        alt={`第 ${frameIndex + 1} 帧原始相机画面`}
-                        className="max-h-[56rem] max-w-full object-contain"
-                      />
-                    </div>
-                    <p className="mt-3 text-xs text-amber-700">
-                      当前帧缺少原后处理投影，暂时展示原始相机画面。
-                    </p>
-                  </div>
-                ) : (
-                  <div className="flex min-h-[32rem] items-center justify-center rounded-lg border border-dashed border-console-line text-sm text-console-muted">
-                    当前帧没有可公开的相机或投影证据。
-                  </div>
-                )}
-              </TabsContent>
-              <TabsContent value="gridmap" className="space-y-4 p-4">
-                {currentFrame?.gridmap ? (
-                  <GridmapEvidenceView
-                    gridmap={currentFrame.gridmap}
-                    target={selectedTarget}
-                  />
-                ) : (
-                  <div className="flex min-h-[32rem] items-center justify-center rounded-lg border border-dashed border-console-line text-sm text-console-muted">
-                    当前帧没有可公开的 Gridmap 鸟瞰图。
-                  </div>
-                )}
-                <div className="flex flex-wrap gap-x-5 gap-y-2 text-xs text-console-muted">
-                  <span><span className="mr-1 inline-block h-2.5 w-2.5 rounded-full border-2 border-slate-600 bg-white align-middle" />原始目标</span>
-                  <span><span className="mr-1 inline-block h-2.5 w-2.5 rounded-full bg-orange-500 align-middle" />当前草稿目标与方向</span>
-                  <span><span className="mr-1 inline-block h-0.5 w-5 bg-blue-600 align-middle" />当前帧原始规划轨迹</span>
-                  <span><span className="mr-1 inline-block h-2.5 w-2.5 rounded-full bg-slate-900 align-middle" />Dog 原点</span>
+          <div className="grid gap-4 xl:grid-cols-[minmax(0,1fr)_21rem]">
+            <div className="min-w-0 space-y-4">
+              {(previewMatchesDraft || previewIsStale) && (
+                <div
+                  role="status"
+                  className={`rounded-xl border px-4 py-3 text-sm ${
+                    previewMatchesDraft
+                      ? "border-emerald-200 bg-emerald-50 text-emerald-800"
+                      : "border-amber-200 bg-amber-50 text-amber-800"
+                  }`}
+                >
+                  {previewMatchesDraft
+                    ? "当前同时展示冻结 Fix Runtime 生成的权威相机投影与轨迹，可据此决定是否通过。"
+                    : "草稿已在上次 Fix 预览后发生变化；当前权威预览已过期，请重新生成后再通过。"}
                 </div>
-                <p className="text-xs leading-5 text-console-muted">
-                  浏览器只叠加原产物与明确的草稿字段；由旧 Fix 数值逻辑派生的轨迹将在提交后生成。
-                </p>
-              </TabsContent>
-            </Tabs>
-          </ConsoleCard>
+              )}
+              <div className="grid min-w-0 gap-4 2xl:grid-cols-2">
+                <ConsoleCard className="min-w-0 p-0">
+                  <div className="border-b border-console-line px-4 py-3">
+                    <h3 className="text-sm font-semibold text-console-text">相机投影</h3>
+                    <p className="mt-1 text-xs text-console-muted">
+                      {evidence?.evidence_kind === "fix_revision"
+                        ? "使用所选 Fix 标定，由冻结 Runtime 投影"
+                        : "原后处理投影；生成 Fix 预览后更新"}
+                    </p>
+                  </div>
+                  <div className="p-4">
+                    <CameraEvidenceView
+                      frameIndex={frameIndex}
+                      camera={currentCamera}
+                      projection={currentProjection}
+                      target={selectedTarget}
+                      fixRevision={evidence?.evidence_kind === "fix_revision"}
+                    />
+                  </div>
+                </ConsoleCard>
 
-          <ConsoleCard className="p-0">
+                <ConsoleCard className="min-w-0 p-0">
+                  <div className="border-b border-console-line px-4 py-3">
+                    <h3 className="text-sm font-semibold text-console-text">Gridmap / 轨迹</h3>
+                    <p className="mt-1 text-xs text-console-muted">
+                      拖动橙色目标修改位置，拖动箭头端点修改方向
+                    </p>
+                  </div>
+                  <div className="space-y-3 p-4">
+                    {currentFrame?.gridmap ? (
+                      <GridmapEvidenceView
+                        gridmap={currentFrame.gridmap}
+                        target={gridmapTarget}
+                        editable={editable && Boolean(selectedTarget?.present)}
+                        onDragStateChange={setGeometryDragging}
+                        onPositionPreview={(x, y) => setEditor((current) => ({
+                          ...current,
+                          x: String(Number(x.toFixed(6))),
+                          y: String(Number(y.toFixed(6))),
+                        }))}
+                        onDirectionPreview={(direction) => setEditor((current) => ({
+                          ...current,
+                          direction: String(Number(direction.toFixed(12))),
+                        }))}
+                      />
+                    ) : (
+                      <div className="flex min-h-96 items-center justify-center rounded-xl border border-dashed border-console-line text-sm text-console-muted">
+                        当前帧没有可公开的 Gridmap 鸟瞰图。
+                      </div>
+                    )}
+                    <div className="flex flex-wrap gap-x-4 gap-y-2 text-xs text-console-muted">
+                      <span><span className="mr-1 inline-block h-2.5 w-2.5 rounded-full border-2 border-slate-600 bg-white align-middle" />原始目标</span>
+                      <span><span className="mr-1 inline-block h-2.5 w-2.5 rounded-full bg-orange-500 align-middle" />当前草稿目标与方向</span>
+                      <span><span className="mr-1 inline-block h-0.5 w-5 border-t border-dashed border-slate-500 align-middle" />原始轨迹</span>
+                      <span><span className="mr-1 inline-block h-0.5 w-5 bg-blue-600 align-middle" />当前权威轨迹</span>
+                      <span><span className="mr-1 inline-block h-2.5 w-2.5 rounded-full bg-slate-900 align-middle" />Dog 原点</span>
+                    </div>
+                  </div>
+                </ConsoleCard>
+              </div>
+            </div>
+
+            <ConsoleCard className="h-fit p-0 xl:sticky xl:top-4">
             <div className="border-b border-console-line p-4">
               <div className="flex items-center justify-between gap-2">
                 <div>
@@ -1252,7 +1452,7 @@ function TrajectoryFixWorkbench({
                 </label>
               </div>
               <label className="block">
-                <span className="mb-1 block text-xs text-console-muted">方向</span>
+                <span className="mb-1 block text-xs text-console-muted">方向（弧度）</span>
                 <input
                   aria-label="方向"
                   inputMode="decimal"
@@ -1262,7 +1462,7 @@ function TrajectoryFixWorkbench({
                 />
               </label>
               <label className="block">
-                <span className="mb-1 block text-xs text-console-muted">速度</span>
+                <span className="mb-1 block text-xs text-console-muted">速度（m/s）</span>
                 <input
                   aria-label="速度"
                   inputMode="decimal"
@@ -1291,6 +1491,9 @@ function TrajectoryFixWorkbench({
                 />
                 将本帧标记为 pass
               </label>
+              <p className="-mt-2 text-xs leading-5 text-console-muted">
+                pass 只表示当前帧不进入训练，不是下方“废弃 Segment”。
+              </p>
               <div className="grid grid-cols-2 gap-2 border-t border-console-line pt-4">
                 <ConsoleButton
                   disabled={
@@ -1346,11 +1549,14 @@ function TrajectoryFixWorkbench({
                   onClick={() => void submitRevision()}
                 >
                   <Save aria-hidden="true" className="h-4 w-4" />
-                  提交 Fix 版本
+                  {revision ? "更新 Fix 预览" : "生成 Fix 预览"}
                 </ConsoleButton>
+                <p className="text-xs leading-5 text-console-muted">
+                  草稿自动保存；生成预览时才调用冻结旧 Runtime 重算轨迹。确认同屏结果后再通过。
+                </p>
                 <div className="grid grid-cols-3 gap-2">
                   <ConsoleButton
-                    disabled={!revision || acting || fixRuntimeBusy}
+                    disabled={!previewMatchesDraft || acting || fixRuntimeBusy}
                     onClick={() => setDecision("approve")}
                   >
                     <CheckCircle2 aria-hidden="true" className="h-4 w-4" />
@@ -1368,12 +1574,13 @@ function TrajectoryFixWorkbench({
                     onClick={() => setDecision("discard")}
                   >
                     <Trash2 aria-hidden="true" className="h-4 w-4" />
-                    废弃
+                    废弃 Segment
                   </ConsoleButton>
                 </div>
               </div>
             )}
-          </ConsoleCard>
+            </ConsoleCard>
+          </div>
         </div>
       )}
 

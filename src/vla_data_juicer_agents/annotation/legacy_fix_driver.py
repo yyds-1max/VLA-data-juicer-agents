@@ -140,7 +140,7 @@ def _apply_command_log(
     *,
     bindings: dict[str, str],
     commands: list[dict[str, Any]],
-) -> None:
+) -> dict[tuple[int, str], float]:
     speed_overrides: dict[tuple[int, str], float] = {}
 
     def recompute(frame_index: int) -> None:
@@ -189,6 +189,12 @@ def _apply_command_log(
             if frame_index == 0:
                 raise ValueError("a missing target cannot be added to frame zero")
             editor.on_add_missing_target(target_type)
+            # The legacy GUI required the operator to click OK after pressing
+            # "++ target".  The Web command is intentionally atomic: restoring
+            # a missing target must also run the same frozen trajectory
+            # recomputation, otherwise the saved target has a position but an
+            # empty trajectory.
+            recompute(frame_index)
             continue
         if kind == "set_position":
             position = (
@@ -213,6 +219,192 @@ def _apply_command_log(
             recompute(frame_index)
             continue
         raise ValueError("unsupported Fix command")
+    return speed_overrides
+
+
+def _point_list(value: Any) -> list[list[float]]:
+    if not isinstance(value, list):
+        return []
+    result: list[list[float]] = []
+    for point in value:
+        if not isinstance(point, (list, tuple)) or len(point) < 2:
+            return []
+        values: list[float] = []
+        for item in point[:3]:
+            if isinstance(item, bool) or not isinstance(item, (int, float)):
+                return []
+            number = float(item)
+            if not math.isfinite(number):
+                return []
+            values.append(number)
+        result.append(values)
+    return result
+
+
+def _project_points(editor: Any, points: list[list[float]]) -> list[list[float]]:
+    if not points:
+        return []
+    projected = editor.project_lidar_to_image(
+        points,
+        editor.sensor_params["image_size"],
+        editor.sensor_params,
+    )
+    result: list[list[float]] = []
+    for point in projected:
+        try:
+            first = float(point[0])
+            second = float(point[1])
+        except (IndexError, KeyError, TypeError, ValueError):
+            continue
+        if math.isfinite(first) and math.isfinite(second):
+            result.append([first, second])
+    return result
+
+
+def _preview_speed(
+    editor: Any,
+    *,
+    frame_index: int,
+    timestamp: str,
+    target_type: str,
+    speed_overrides: dict[tuple[int, str], float],
+) -> float:
+    override = speed_overrides.get((frame_index, target_type))
+    if override is not None:
+        return override
+    speed_info = (
+        editor.speed_direction_data.get(timestamp, {})
+        .get(target_type, {})
+        .get("speed_object", [0.0, 0.0, 0.0])
+    )
+    if not isinstance(speed_info, (list, tuple)) or len(speed_info) < 2:
+        return 0.0
+    try:
+        return float(math.hypot(float(speed_info[0]), float(speed_info[1])))
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def _write_preview_state(
+    editor: Any,
+    *,
+    bindings: dict[str, str],
+    speed_overrides: dict[tuple[int, str], float],
+    output_path: Path,
+) -> None:
+    inverse_bindings = {
+        target_type: target_ref
+        for target_ref, target_type in bindings.items()
+    }
+    frames: list[dict[str, Any]] = []
+    for frame_index, timestamp in enumerate(editor.timestamps):
+        raw_frame = editor.modified_trajectory.get(timestamp, {})
+        targets: dict[str, dict[str, Any]] = {}
+        for target_type, target_ref in inverse_bindings.items():
+            raw_target = raw_frame.get(target_type, {})
+            if not isinstance(raw_target, dict):
+                raw_target = {}
+            raw_position = editor.modified_target_points[timestamp].get(
+                target_type
+            )
+            try:
+                position_values = [
+                    float(raw_position[0]),
+                    float(raw_position[1]),
+                ]
+                position = (
+                    position_values
+                    if all(math.isfinite(value) for value in position_values)
+                    else None
+                )
+            except (IndexError, KeyError, TypeError, ValueError):
+                position = None
+            added_info = editor.added_target_info[timestamp].get(target_type)
+            raw_direction = (
+                added_info.get("dir")
+                if isinstance(added_info, dict)
+                else (
+                    editor.speed_direction_data.get(timestamp, {})
+                    .get(target_type, {})
+                    .get("direction_object", 0.0)
+                )
+            )
+            try:
+                direction_value = float(raw_direction)
+                direction = (
+                    direction_value
+                    if math.isfinite(direction_value)
+                    else 0.0
+                )
+            except (TypeError, ValueError):
+                direction = 0.0
+            trajectory = _point_list(raw_target.get("traj"))
+            camera_position = _project_points(
+                editor,
+                [[position[0], position[1], 0.0]] if position else [],
+            )
+            color = raw_target.get("color")
+            targets[target_ref] = {
+                "label": (
+                    "Master"
+                    if target_type == "master"
+                    else f"Other {target_type.removeprefix('other')}"
+                ),
+                "position": position,
+                "direction": direction,
+                "speed": _preview_speed(
+                    editor,
+                    frame_index=frame_index,
+                    timestamp=timestamp,
+                    target_type=target_type,
+                    speed_overrides=speed_overrides,
+                ),
+                "color": (
+                    [str(item) for item in color[:3]]
+                    if isinstance(color, list)
+                    else []
+                ),
+                "image_box": None,
+                "trajectory_points": trajectory,
+                "camera_position": (
+                    camera_position[0] if camera_position else None
+                ),
+                "camera_trajectory_points": _project_points(
+                    editor,
+                    trajectory,
+                ),
+            }
+        frames.append(
+            {
+                "frame_index": frame_index,
+                "private_frame_key": timestamp,
+                "camera_available": (
+                    Path(editor.fisheye_folder) / f"{timestamp}.jpg"
+                ).is_file(),
+                "gridmap_available": (
+                    Path(editor.clip_path) / "grid_map" / f"{timestamp}.json"
+                ).is_file(),
+                "pass": bool(raw_frame.get("pass", False)),
+                "targets": targets,
+            }
+        )
+    document = {
+        "schema_version": 1,
+        "source": "fix_revision",
+        "target_bindings": dict(sorted(bindings.items())),
+        "frame_count": len(frames),
+        "frames": frames,
+    }
+    with output_path.open("x", encoding="utf-8") as stream:
+        json.dump(
+            document,
+            stream,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+            allow_nan=False,
+        )
+        stream.write("\n")
 
 
 def main() -> int:
@@ -225,13 +417,19 @@ def main() -> int:
     module = _load_frozen_module(module_path, segment_root)
     editor = module.TrajectoryEditor(str(segment_root))
     try:
-        _apply_command_log(
+        speed_overrides = _apply_command_log(
             editor,
             bindings=request["target_bindings"],
             commands=request["commands"],
         )
         editor.current_index = len(editor.timestamps) - 1
         editor.on_next_click(None)
+        _write_preview_state(
+            editor,
+            bindings=request["target_bindings"],
+            speed_overrides=speed_overrides,
+            output_path=segment_root / ".system_fix_preview.json",
+        )
     finally:
         module.plt.close(editor.fig)
     return 0

@@ -99,6 +99,9 @@ function evidenceFor(owner: TrajectoryReview): TrajectoryReviewEvidence {
   return {
     availability: "available",
     review_ref: owner.review_ref,
+    evidence_kind: "trajectory_revision",
+    fix_revision_ref: null,
+    fix_revision_source_draft_revision: null,
     trajectory_revision_ref: owner.trajectory_revision.revision_ref,
     review_state_revision: owner.state_revision,
     draft_revision: owner.fix_draft?.revision ?? null,
@@ -118,6 +121,12 @@ function evidenceFor(owner: TrajectoryReview): TrajectoryReviewEvidence {
         color: [],
         image_box: null,
         trajectory_points: [],
+        camera_position: null,
+        camera_trajectory_points: [],
+        base_position: [1, 2],
+        base_direction: 0,
+        base_speed: 1,
+        base_trajectory_points: [],
       }],
     }],
     draft_commands: [],
@@ -335,6 +344,9 @@ test("Fix workbench rejects evidence bound to a stale review revision", async ()
   apiMocks.getTrajectoryReviewEvidence.mockResolvedValue({
     availability: "available",
     review_ref: review.review_ref,
+    evidence_kind: "trajectory_revision",
+    fix_revision_ref: null,
+    fix_revision_source_draft_revision: null,
     trajectory_revision_ref: review.trajectory_revision.revision_ref,
     review_state_revision: review.state_revision + 1,
     draft_revision: null,
@@ -354,6 +366,12 @@ test("Fix workbench rejects evidence bound to a stale review revision", async ()
         color: [],
         image_box: null,
         trajectory_points: [],
+        camera_position: null,
+        camera_trajectory_points: [],
+        base_position: [1, 2],
+        base_direction: 0,
+        base_speed: 1,
+        base_trajectory_points: [],
       }],
     }],
     draft_commands: [],
@@ -391,9 +409,12 @@ test("Fix workbench displays the bound Gridmap PNG with declared dimensions", as
   const gridmapUrl =
     `/api/annotation/reviews/${review.review_ref}/evidence/frames/0/gridmap`;
   apiMocks.getTrajectoryReview.mockResolvedValue(inProgress);
-  apiMocks.getTrajectoryReviewEvidence.mockResolvedValue({
+  const gridEvidence: TrajectoryReviewEvidence = {
     availability: "available",
     review_ref: review.review_ref,
+    evidence_kind: "trajectory_revision",
+    fix_revision_ref: null,
+    fix_revision_source_draft_revision: null,
     trajectory_revision_ref: review.trajectory_revision.revision_ref,
     review_state_revision: 2,
     draft_revision: 1,
@@ -428,10 +449,17 @@ test("Fix workbench displays the bound Gridmap PNG with declared dimensions", as
         color: [],
         image_box: null,
         trajectory_points: [],
+        camera_position: null,
+        camera_trajectory_points: [],
+        base_position: [1, 2],
+        base_direction: 0,
+        base_speed: 1,
+        base_trajectory_points: [],
       }],
     }],
     draft_commands: [],
-  });
+  };
+  apiMocks.getTrajectoryReviewEvidence.mockResolvedValue(gridEvidence);
   const router = createMemoryRouter([
     {
       path: "/annotation/reviews/:reviewRef",
@@ -449,9 +477,7 @@ test("Fix workbench displays the bound Gridmap PNG with declared dimensions", as
     "src",
     `/api/annotation/reviews/${review.review_ref}/evidence/frames/0/projection`,
   );
-  expect(screen.getByText(/冻结后处理产物中的原始投影/)).toBeVisible();
-  const gridmapTab = await screen.findByRole("tab", { name: "Gridmap / 轨迹" });
-  fireEvent.mouseDown(gridmapTab, { button: 0, ctrlKey: false });
+  expect(screen.getByText(/原后处理投影；生成 Fix 预览后更新/)).toBeVisible();
 
   const gridmap = await screen.findByRole("img", {
     name: "当前帧 Gridmap 鸟瞰图",
@@ -459,6 +485,77 @@ test("Fix workbench displays the bound Gridmap PNG with declared dimensions", as
   expect(gridmap).toHaveAttribute("src", gridmapUrl);
   expect(gridmap).toHaveAttribute("width", "320");
   expect(gridmap).toHaveAttribute("height", "240");
+
+  const changedReview: TrajectoryReview = {
+    ...inProgress,
+    state_revision: 3,
+    fix_draft: { ...inProgress.fix_draft!, revision: 2 },
+  };
+  apiMocks.applyFixCommand.mockResolvedValue(changedReview);
+  apiMocks.getTrajectoryReviewEvidence.mockResolvedValue({
+    ...gridEvidence,
+    review_state_revision: 3,
+    draft_revision: 2,
+    draft_commands: [{
+      kind: "set_position",
+      frame_index: 0,
+      target_ref: "target_0123456789abcdef0123456789abcdef",
+      x: 0,
+      y: 0,
+    }],
+  });
+  const overlay = screen.getByLabelText("可拖动的当前帧 Gridmap 与轨迹");
+  Object.defineProperty(overlay, "getBoundingClientRect", {
+    configurable: true,
+    value: () => ({
+      left: 0,
+      top: 0,
+      width: 320,
+      height: 240,
+      right: 320,
+      bottom: 240,
+      x: 0,
+      y: 0,
+      toJSON: () => ({}),
+    }),
+  });
+  Object.defineProperty(overlay, "setPointerCapture", {
+    configurable: true,
+    value: vi.fn(),
+  });
+  Object.defineProperty(overlay, "hasPointerCapture", {
+    configurable: true,
+    value: () => false,
+  });
+  fireEvent.pointerDown(screen.getByLabelText("拖动目标位置"), {
+    pointerId: 1,
+    clientX: 147,
+    clientY: 110,
+  });
+  fireEvent.pointerMove(overlay, {
+    pointerId: 1,
+    clientX: 160,
+    clientY: 120,
+  });
+  fireEvent.pointerUp(overlay, {
+    pointerId: 1,
+    clientX: 160,
+    clientY: 120,
+  });
+  await waitFor(() => expect(apiMocks.applyFixCommand).toHaveBeenCalledWith(
+    review.review_ref,
+    {
+      expected_review_revision: 2,
+      expected_draft_revision: 1,
+      command: {
+        kind: "set_position",
+        frame_index: 0,
+        target_ref: "target_0123456789abcdef0123456789abcdef",
+        x: 0,
+        y: 0,
+      },
+    },
+  ), { timeout: 2_500 });
 });
 
 test("Fix workbench freezes mutations while a Fix run is active and refreshes on completion event", async () => {
@@ -497,6 +594,9 @@ test("Fix workbench freezes mutations while a Fix run is active and refreshes on
   const evidence = (stateRevision: number): TrajectoryReviewEvidence => ({
     availability: "available",
     review_ref: review.review_ref,
+    evidence_kind: "trajectory_revision",
+    fix_revision_ref: null,
+    fix_revision_source_draft_revision: null,
     trajectory_revision_ref: review.trajectory_revision.revision_ref,
     review_state_revision: stateRevision,
     draft_revision: 1,
@@ -516,6 +616,12 @@ test("Fix workbench freezes mutations while a Fix run is active and refreshes on
         color: [],
         image_box: null,
         trajectory_points: [],
+        camera_position: null,
+        camera_trajectory_points: [],
+        base_position: [1, 2],
+        base_direction: 0,
+        base_speed: 1,
+        base_trajectory_points: [],
       }],
     }],
     draft_commands: [],
@@ -544,7 +650,7 @@ test("Fix workbench freezes mutations while a Fix run is active and refreshes on
 
   expect(await screen.findByText("Fix 版本正在等待执行")).toBeVisible();
   expect(screen.getByLabelText("位置 X")).toBeDisabled();
-  expect(screen.getByRole("button", { name: "提交 Fix 版本" })).toBeDisabled();
+  expect(screen.getByRole("button", { name: "生成 Fix 预览" })).toBeDisabled();
   expect(screen.getByRole("button", { name: "通过" })).toBeDisabled();
 
   await waitFor(() => expect(AnnotationTestEventSource.instances).toHaveLength(1));
@@ -672,6 +778,9 @@ test("Fix workbench displays a sanitized Fix failure and permits draft correctio
   apiMocks.getTrajectoryReviewEvidence.mockResolvedValue({
     availability: "available",
     review_ref: review.review_ref,
+    evidence_kind: "trajectory_revision",
+    fix_revision_ref: null,
+    fix_revision_source_draft_revision: null,
     trajectory_revision_ref: review.trajectory_revision.revision_ref,
     review_state_revision: 3,
     draft_revision: 1,
@@ -691,6 +800,12 @@ test("Fix workbench displays a sanitized Fix failure and permits draft correctio
         color: [],
         image_box: null,
         trajectory_points: [],
+        camera_position: null,
+        camera_trajectory_points: [],
+        base_position: [1, 2],
+        base_direction: 0,
+        base_speed: 1,
+        base_trajectory_points: [],
       }],
     }],
     draft_commands: [],
@@ -732,6 +847,9 @@ test("Fix workbench autosaves a position change through the CAS command API", as
   const baseEvidence: TrajectoryReviewEvidence = {
     availability: "available",
     review_ref: review.review_ref,
+    evidence_kind: "trajectory_revision",
+    fix_revision_ref: null,
+    fix_revision_source_draft_revision: null,
     trajectory_revision_ref: review.trajectory_revision.revision_ref,
     review_state_revision: 2,
     draft_revision: 1,
@@ -751,6 +869,12 @@ test("Fix workbench autosaves a position change through the CAS command API", as
         color: ["black", "black", "black"],
         image_box: [1, 2, 3, 4] as [number, number, number, number],
         trajectory_points: [[1, 2] as [number, number]],
+        camera_position: null,
+        camera_trajectory_points: [],
+        base_position: [1, 2],
+        base_direction: 0,
+        base_speed: 1,
+        base_trajectory_points: [],
       }],
     }],
     draft_commands: [],

@@ -1483,6 +1483,9 @@ def test_worker_executes_store_bound_postprocessing_and_creates_review(
         assert set(evidence) == {
             "availability",
             "review_ref",
+            "evidence_kind",
+            "fix_revision_ref",
+            "fix_revision_source_draft_revision",
             "trajectory_revision_ref",
             "review_state_revision",
             "draft_revision",
@@ -1959,6 +1962,139 @@ def test_legacy_frozen_evidence_state_is_enhanced_without_rewrite(
     assert "gridmap_width" not in frozen_state["frames"][0]
 
 
+def test_latest_fix_revision_exposes_frozen_candidate_evidence(
+    tmp_path: Path,
+):
+    base_root = tmp_path / "base-segment"
+    candidate_root = tmp_path / "fix-segment"
+    (base_root / "grid_map").mkdir(parents=True)
+    frame_key = "1.000000"
+    gridmap_content = json.dumps(
+        {
+            "data": [-1, 0, 1, 2],
+            "grid_size": 2,
+            "resolution": 1,
+            "x_range": [0, 2],
+            "y_range": [0, 2],
+        }
+    ).encode()
+    (base_root / "grid_map" / f"{frame_key}.json").write_bytes(
+        gridmap_content
+    )
+    shutil.copytree(base_root, candidate_root)
+    frozen_state = {
+        "schema_version": 1,
+        "target_bindings": {TARGET_REF: "master"},
+        "frame_count": 1,
+        "frames": [{
+            "frame_index": 0,
+            "private_frame_key": frame_key,
+            "camera_available": False,
+            "gridmap_available": True,
+            "pass": False,
+            "targets": {
+                TARGET_REF: {
+                    "label": "Master",
+                    "position": [1.0, 1.0],
+                    "direction": 0.0,
+                    "speed": 1.0,
+                    "color": [],
+                    "image_box": None,
+                    "trajectory_points": [[1.0, 1.0]],
+                }
+            },
+        }],
+    }
+    preview = {
+        "schema_version": 1,
+        "source": "fix_revision",
+        "target_bindings": {TARGET_REF: "master"},
+        "frame_count": 1,
+        "frames": [{
+            "frame_index": 0,
+            "private_frame_key": frame_key,
+            "camera_available": False,
+            "gridmap_available": True,
+            "pass": True,
+            "targets": {
+                TARGET_REF: {
+                    "label": "Master",
+                    "position": [1.5, 0.5],
+                    "direction": 0.25,
+                    "speed": 2.0,
+                    "color": [],
+                    "image_box": None,
+                    "trajectory_points": [[1.5, 0.5], [1.75, 0.75]],
+                    "camera_position": [100.0, 200.0],
+                    "camera_trajectory_points": [
+                        [100.0, 200.0],
+                        [110.0, 210.0],
+                    ],
+                }
+            },
+        }],
+    }
+    (
+        candidate_root / ".system_fix_preview.json"
+    ).write_text(json.dumps(preview), encoding="utf-8")
+    fix_revision_ref = "fix_revision_" + "4" * 32
+
+    class CandidateEvidenceStore:
+        db_path = tmp_path / "annotation.sqlite"
+
+        def review_evidence_private(self, review_ref):
+            return {
+                "review_ref": review_ref,
+                "status": "in_progress",
+                "state_revision": 4,
+                "trajectory_revision_ref": (
+                    "trajectory_revision_" + "3" * 32
+                ),
+                "trajectory_state": frozen_state,
+                "private_artifact_path": str(base_root),
+                "artifact_sha256": _tree_sha256(base_root),
+                "draft_state": {
+                    "commands": [{
+                        "kind": "set_position",
+                        "frame_index": 0,
+                        "target_ref": TARGET_REF,
+                        "x": 1.5,
+                        "y": 0.5,
+                    }],
+                },
+                "draft_revision": 2,
+                "fix_revision": {
+                    "revision_ref": fix_revision_ref,
+                    "source_draft_revision": 2,
+                    "private_artifact_path": str(candidate_root),
+                    "artifact_sha256": _tree_sha256(candidate_root),
+                },
+            }
+
+    service = AnnotationApplicationService(
+        store=CandidateEvidenceStore(),
+        worker=FakeWorker(),
+    )
+    evidence = service.get_review_trajectory_evidence(
+        "review_" + "2" * 32
+    )
+
+    assert evidence["evidence_kind"] == "fix_revision"
+    assert evidence["fix_revision_ref"] == fix_revision_ref
+    assert evidence["fix_revision_source_draft_revision"] == 2
+    assert evidence["draft_commands"] == []
+    assert evidence["frames"][0]["projection"] is None
+    target = evidence["frames"][0]["targets"][0]
+    assert target["position"] == [1.5, 0.5]
+    assert target["base_position"] == [1.0, 1.0]
+    assert target["base_trajectory_points"] == [[1.0, 1.0]]
+    assert target["camera_position"] == [100.0, 200.0]
+    assert target["camera_trajectory_points"] == [
+        [100.0, 200.0],
+        [110.0, 210.0],
+    ]
+
+
 @pytest.mark.parametrize(
     "override",
     [
@@ -2184,6 +2320,47 @@ def test_review_fix_cas_idempotency_and_approval_api(tmp_path: Path):
             WHERE kind = 'compatibility_publish'
             """
         ).fetchone()[0] == 1
+
+
+def test_approval_rejects_fix_revision_older_than_current_draft(
+    tmp_path: Path,
+) -> None:
+    client, store = _make_m2_client(tmp_path)
+    with client:
+        review, completed = _freeze_test_fix_revision(
+            client,
+            store,
+            tmp_path,
+            key_prefix="stale-preview",
+        )
+        changed = client.post(
+            f"/api/annotation/reviews/{review['review_ref']}/fix-commands",
+            headers={"Idempotency-Key": "stale-preview-command"},
+            json={
+                "expected_review_revision": completed["state_revision"],
+                "expected_draft_revision": completed["fix_draft"]["revision"],
+                "command": {
+                    "kind": "set_speed",
+                    "frame_index": 0,
+                    "target_ref": TARGET_REF,
+                    "speed": 3.0,
+                },
+            },
+        )
+        assert changed.status_code == 200
+        rejected = client.post(
+            f"/api/annotation/reviews/{review['review_ref']}/approve",
+            headers={"Idempotency-Key": "stale-preview-approve"},
+            json={
+                "expected_review_revision": changed.json()["state_revision"],
+                "fix_revision_ref": completed[
+                    "submitted_fix_revision_ref"
+                ],
+            },
+        )
+
+    assert rejected.status_code == 409
+    assert rejected.json()["detail"]["code"] == "fix_revision_stale"
 
 
 def test_failed_publication_keeps_approval_terminal_and_retry_is_idempotent(

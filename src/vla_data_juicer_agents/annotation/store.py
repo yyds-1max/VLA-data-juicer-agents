@@ -1848,6 +1848,17 @@ class AnnotationStore:
                 ):
                     raise RuntimeError("Fix draft state hash changed")
                 draft_revision = int(draft_row["draft_revision"])
+            fix_revision_row = connection.execute(
+                """
+                SELECT revision_ref, source_draft_revision,
+                       private_artifact_path, artifact_sha256
+                FROM fix_revisions
+                WHERE review_id = ?
+                ORDER BY revision_number DESC
+                LIMIT 1
+                """,
+                (review_id,),
+            ).fetchone()
             return {
                 "review_ref": str(row["review_ref"]),
                 "status": str(row["status"]),
@@ -1858,6 +1869,24 @@ class AnnotationStore:
                 "artifact_sha256": str(row["artifact_sha256"]),
                 "draft_state": draft_state,
                 "draft_revision": draft_revision,
+                "fix_revision": (
+                    {
+                        "revision_ref": str(
+                            fix_revision_row["revision_ref"]
+                        ),
+                        "source_draft_revision": int(
+                            fix_revision_row["source_draft_revision"]
+                        ),
+                        "private_artifact_path": str(
+                            fix_revision_row["private_artifact_path"]
+                        ),
+                        "artifact_sha256": str(
+                            fix_revision_row["artifact_sha256"]
+                        ),
+                    }
+                    if fix_revision_row is not None
+                    else None
+                ),
             }
 
     def fix_runtime_input(self, review_ref: str) -> dict[str, Any]:
@@ -3010,6 +3039,24 @@ class AnnotationStore:
             ).fetchone()
             if fix_revision is None:
                 raise AnnotationNotFoundError("Fix revision not found")
+            active_draft = connection.execute(
+                """
+                SELECT draft_revision
+                FROM fix_drafts
+                WHERE id = ?
+                """,
+                (review["active_fix_draft_id"],),
+            ).fetchone()
+            if (
+                active_draft is None
+                or int(fix_revision["source_draft_revision"])
+                != int(active_draft["draft_revision"])
+            ):
+                raise AnnotationConflictError(
+                    "fix_revision_stale",
+                    "Generate a Fix preview for the latest draft before approval.",
+                    current=self._review_projection(connection, review_id),
+                )
             existing_publication = connection.execute(
                 """
                 SELECT 1 FROM compatibility_publications

@@ -248,6 +248,12 @@ export type TrajectoryEvidenceTarget = {
   color: string[];
   image_box: [number, number, number, number] | null;
   trajectory_points: TrajectoryCoordinate[];
+  camera_position: [number, number] | null;
+  camera_trajectory_points: Array<[number, number]>;
+  base_position: [number, number] | null;
+  base_direction: number | null;
+  base_speed: number | null;
+  base_trajectory_points: TrajectoryCoordinate[];
 };
 
 export type TrajectoryEvidenceCamera = {
@@ -279,6 +285,9 @@ export type TrajectoryEvidenceFrame = {
 export type TrajectoryReviewEvidence = {
   availability: "available";
   review_ref: string;
+  evidence_kind: "trajectory_revision" | "fix_revision";
+  fix_revision_ref: string | null;
+  fix_revision_source_draft_revision: number | null;
   trajectory_revision_ref: string;
   review_state_revision: number;
   draft_revision: number | null;

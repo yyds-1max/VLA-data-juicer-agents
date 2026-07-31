@@ -365,33 +365,168 @@ class AnnotationApplicationService:
     def get_review(self, review_ref: str) -> dict[str, Any]:
         return self.store.get_review(review_ref)
 
+    def _review_evidence_source(
+        self,
+        review_ref: str,
+    ) -> dict[str, Any]:
+        from vla_data_juicer_agents.annotation.runtime import (
+            RuntimeExecutionError,
+            _tree_sha256,
+        )
+        from vla_data_juicer_agents.annotation.trajectory_evidence import (
+            load_fix_revision_preview_state,
+        )
+
+        private = self.store.review_evidence_private(review_ref)
+        base_root = Path(private["private_artifact_path"])
+        try:
+            if _tree_sha256(
+                base_root,
+                unsafe_code="trajectory_revision_changed",
+            ) != private["artifact_sha256"]:
+                raise ValueError("base artifact changed")
+        except Exception as exc:
+            raise AnnotationConflictError(
+                "trajectory_revision_changed",
+                "The trajectory evidence changed after it was frozen.",
+            ) from exc
+
+        private["evidence_kind"] = "trajectory_revision"
+        private["fix_revision_ref"] = None
+        private["fix_revision_source_draft_revision"] = None
+        fix_revision = private.get("fix_revision")
+        if not isinstance(fix_revision, dict):
+            return private
+        fix_root = Path(str(fix_revision["private_artifact_path"]))
+        try:
+            if _tree_sha256(
+                fix_root,
+                unsafe_code="fix_revision_changed",
+            ) != fix_revision["artifact_sha256"]:
+                raise ValueError("Fix artifact changed")
+        except Exception as exc:
+            raise AnnotationConflictError(
+                "fix_revision_changed",
+                "The Fix revision evidence changed after it was frozen.",
+            ) from exc
+        bindings = private["trajectory_state"].get("target_bindings")
+        if not isinstance(bindings, dict):
+            raise AnnotationConflictError(
+                "trajectory_evidence_unavailable",
+                "The trajectory target binding is unavailable.",
+            )
+        try:
+            fix_state = load_fix_revision_preview_state(
+                fix_root,
+                expected_target_bindings=bindings,
+            )
+        except (OSError, RuntimeExecutionError):
+            # Revisions created before authoritative preview evidence was
+            # introduced remain readable through their immutable base
+            # trajectory.  They are never misrepresented as a Fix preview.
+            return private
+
+        base_frames = private["trajectory_state"].get("frames")
+        fix_frames = fix_state.get("frames")
+        if (
+            not isinstance(base_frames, list)
+            or not isinstance(fix_frames, list)
+            or len(base_frames) != len(fix_frames)
+        ):
+            raise AnnotationConflictError(
+                "fix_revision_changed",
+                "The Fix revision frame lineage is inconsistent.",
+            )
+        for base_frame, fix_frame in zip(base_frames, fix_frames, strict=True):
+            base_targets = (
+                base_frame.get("targets")
+                if isinstance(base_frame, dict)
+                else None
+            )
+            fix_targets = (
+                fix_frame.get("targets")
+                if isinstance(fix_frame, dict)
+                else None
+            )
+            if not isinstance(base_targets, dict) or not isinstance(
+                fix_targets,
+                dict,
+            ):
+                raise AnnotationConflictError(
+                    "fix_revision_changed",
+                    "The Fix revision target lineage is inconsistent.",
+                )
+            for target_ref, fix_target in fix_targets.items():
+                base_target = base_targets.get(target_ref)
+                if not isinstance(fix_target, dict) or not isinstance(
+                    base_target,
+                    dict,
+                ):
+                    raise AnnotationConflictError(
+                        "fix_revision_changed",
+                        "The Fix revision target lineage is inconsistent.",
+                    )
+                fix_target.update(
+                    {
+                        "base_position": base_target.get("position"),
+                        "base_direction": base_target.get("direction"),
+                        "base_speed": base_target.get("speed"),
+                        "base_trajectory_points": base_target.get(
+                            "trajectory_points",
+                            [],
+                        ),
+                    }
+                )
+
+        draft_state = private.get("draft_state")
+        commands = (
+            draft_state.get("commands")
+            if isinstance(draft_state, dict)
+            and isinstance(draft_state.get("commands"), list)
+            else []
+        )
+        source_draft_revision = int(
+            fix_revision["source_draft_revision"]
+        )
+        applied_command_count = source_draft_revision - 1
+        if (
+            applied_command_count < 0
+            or applied_command_count > len(commands)
+        ):
+            raise AnnotationConflictError(
+                "fix_revision_changed",
+                "The Fix revision command lineage is inconsistent.",
+            )
+        private.update(
+            {
+                "evidence_kind": "fix_revision",
+                "fix_revision_ref": str(fix_revision["revision_ref"]),
+                "fix_revision_source_draft_revision": (
+                    source_draft_revision
+                ),
+                "trajectory_state": fix_state,
+                "private_artifact_path": str(fix_root),
+                "artifact_sha256": str(
+                    fix_revision["artifact_sha256"]
+                ),
+                "draft_state": {
+                    "commands": commands[applied_command_count:],
+                },
+            }
+        )
+        return private
+
     def get_review_trajectory_evidence(
         self,
         review_ref: str,
     ) -> dict[str, Any]:
-        from vla_data_juicer_agents.annotation.runtime import _tree_sha256
         from vla_data_juicer_agents.annotation.trajectory_evidence import (
             gridmap_metadata,
             resolve_evidence_file,
         )
 
-        private = self.store.review_evidence_private(review_ref)
+        private = self._review_evidence_source(review_ref)
         artifact_root = Path(private["private_artifact_path"])
-        try:
-            actual_artifact_sha256 = _tree_sha256(
-                artifact_root,
-                unsafe_code="trajectory_revision_changed",
-            )
-        except Exception as exc:
-            raise AnnotationConflictError(
-                "trajectory_revision_changed",
-                "The trajectory evidence is no longer available.",
-            ) from exc
-        if actual_artifact_sha256 != private["artifact_sha256"]:
-            raise AnnotationConflictError(
-                "trajectory_revision_changed",
-                "The trajectory evidence changed after it was frozen.",
-            )
         state = private["trajectory_state"]
         frames = state.get("frames")
         if not isinstance(frames, list):
@@ -407,6 +542,11 @@ class AnnotationApplicationService:
             if not isinstance(frame, dict):
                 continue
             for kind in ("camera", "projection", "gridmap"):
+                if (
+                    kind == "projection"
+                    and private["evidence_kind"] == "fix_revision"
+                ):
+                    continue
                 try:
                     path = resolve_evidence_file(
                         artifact_root,
@@ -484,6 +624,27 @@ class AnnotationApplicationService:
                     "color": target.get("color"),
                     "image_box": target.get("image_box"),
                     "trajectory_points": target.get("trajectory_points"),
+                    "camera_position": target.get("camera_position"),
+                    "camera_trajectory_points": target.get(
+                        "camera_trajectory_points",
+                        [],
+                    ),
+                    "base_position": target.get(
+                        "base_position",
+                        target.get("position"),
+                    ),
+                    "base_direction": target.get(
+                        "base_direction",
+                        target.get("direction"),
+                    ),
+                    "base_speed": target.get(
+                        "base_speed",
+                        target.get("speed"),
+                    ),
+                    "base_trajectory_points": target.get(
+                        "base_trajectory_points",
+                        target.get("trajectory_points"),
+                    ),
                 }
                 for target_ref, target in raw_targets.items()
                 if isinstance(target_ref, str) and isinstance(target, dict)
@@ -588,6 +749,11 @@ class AnnotationApplicationService:
         return {
             "availability": "available",
             "review_ref": review_ref,
+            "evidence_kind": private["evidence_kind"],
+            "fix_revision_ref": private["fix_revision_ref"],
+            "fix_revision_source_draft_revision": private[
+                "fix_revision_source_draft_revision"
+            ],
             "trajectory_revision_ref": private[
                 "trajectory_revision_ref"
             ],
@@ -612,8 +778,16 @@ class AnnotationApplicationService:
             resolve_evidence_file,
         )
 
-        private = self.store.review_evidence_private(review_ref)
+        private = self._review_evidence_source(review_ref)
         artifact_root = Path(private["private_artifact_path"])
+        if (
+            kind == "projection"
+            and private["evidence_kind"] == "fix_revision"
+        ):
+            raise AnnotationValidationError(
+                "trajectory_evidence_unavailable",
+                "The original projection is not authoritative for this Fix revision.",
+            )
         if verify_tree:
             try:
                 actual_sha256 = _tree_sha256(

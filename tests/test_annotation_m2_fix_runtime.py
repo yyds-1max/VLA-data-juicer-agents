@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import json
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -13,6 +14,7 @@ from vla_data_juicer_agents.annotation.fix_runtime import (
 )
 from vla_data_juicer_agents.annotation.legacy_fix_driver import (
     _apply_command_log,
+    _write_preview_state,
 )
 from vla_data_juicer_agents.annotation.runtime import (
     NavigationAnnotationRuntimeConfig,
@@ -54,11 +56,22 @@ class _FakeFrozenEditor:
             "2.0": {"pass": False, "master": {"traj": []}},
         }
         self.speed_direction_data: dict[str, Any] = {}
+        self.sensor_params = {"image_size": [1920, 1536]}
+        self.fisheye_folder = "/missing/fisheye_front"
+        self.clip_path = "/missing/segment"
         self.target_speed_inputs = {
             "1.0": {"master": SimpleNamespace(text="1.0")},
             "2.0": {"master": SimpleNamespace(text="1.0")},
         }
         self.recomputed: list[tuple[int, str]] = []
+
+    def project_lidar_to_image(
+        self,
+        points: list[list[float]],
+        _image_size: list[int],
+        _sensor_params: dict[str, Any],
+    ) -> list[list[float]]:
+        return [[point[0] * 10, point[1] * 10] for point in points]
 
     def on_ok_click(self, _event: object) -> None:
         timestamp = self.timestamps[self.current_index]
@@ -144,7 +157,12 @@ def test_fix_driver_replays_domain_commands_through_frozen_operations() -> None:
     assert editor.added_target_info["1.0"]["master"]["dir"] == 1.5
     assert editor.modified_trajectory["1.0"]["pass"] is True
     assert editor.modified_target_points["2.0"]["master"] is None
-    assert editor.recomputed == [(0, "1.0"), (0, "1.0"), (0, "2.5")]
+    assert editor.recomputed == [
+        (0, "1.0"),
+        (0, "1.0"),
+        (0, "2.5"),
+        (1, "1.0"),
+    ]
 
 
 def test_fix_driver_restore_clears_frame_speed_override() -> None:
@@ -173,6 +191,35 @@ def test_fix_driver_restore_clears_frame_speed_override() -> None:
     )
 
     assert editor.recomputed == [(0, "2.5"), (0, "1.0")]
+
+
+def test_fix_driver_writes_authoritative_candidate_preview(
+    tmp_path: Path,
+) -> None:
+    editor = _FakeFrozenEditor()
+    target_ref = "target_" + "1" * 32
+    editor.modified_trajectory["1.0"]["master"]["traj"] = [
+        [1.0, 2.0, 0.0],
+        [3.0, 4.0, 0.0],
+    ]
+    output = tmp_path / ".system_fix_preview.json"
+
+    _write_preview_state(
+        editor,
+        bindings={target_ref: "master"},
+        speed_overrides={(0, "master"): 2.5},
+        output_path=output,
+    )
+
+    preview = json.loads(output.read_text(encoding="utf-8"))
+    target = preview["frames"][0]["targets"][target_ref]
+    assert target["position"] == [1.0, 2.0]
+    assert target["speed"] == 2.5
+    assert target["camera_position"] == [10.0, 20.0]
+    assert target["camera_trajectory_points"] == [
+        [10.0, 20.0],
+        [30.0, 40.0],
+    ]
 
 
 def test_approved_fix_publication_is_atomic_and_hash_bound(
