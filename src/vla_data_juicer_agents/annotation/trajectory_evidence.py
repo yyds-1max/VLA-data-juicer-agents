@@ -31,6 +31,7 @@ _MAX_DOCUMENT_BYTES = 64 * 1024 * 1024
 _MAX_FRAMES = 100_000
 _MAX_TRAJECTORY_POINTS = 10_000
 _MAX_GRID_SIDE = 2_048
+_FIX_PREVIEW_FILE = ".system_fix_preview.json"
 
 
 @dataclass(frozen=True)
@@ -542,6 +543,168 @@ def build_trajectory_revision_state(
     return {
         "schema_version": 1,
         "target_bindings": dict(sorted(target_bindings.items())),
+        "frame_count": len(frames),
+        "frames": frames,
+    }
+
+
+def load_fix_revision_preview_state(
+    segment_root: Path,
+    *,
+    expected_target_bindings: dict[str, str],
+) -> dict[str, Any]:
+    """Load the bounded evidence emitted by the frozen Fix adapter.
+
+    The adapter derives all trajectory and camera projection points by calling
+    the legacy editor itself.  This reader only validates and exposes that
+    already-produced evidence; it does not reproduce Fix math.
+    """
+
+    if not _regular_directory(segment_root):
+        raise RuntimeExecutionError(
+            "trajectory_evidence_unavailable",
+            "The Fix revision artifact is unavailable.",
+        )
+    preview = _load_object(
+        segment_root / _FIX_PREVIEW_FILE,
+        label="Fix revision preview",
+    )
+    if (
+        preview.get("schema_version") != 1
+        or preview.get("source") != "fix_revision"
+        or preview.get("target_bindings")
+        != dict(sorted(expected_target_bindings.items()))
+        or not isinstance(preview.get("frames"), list)
+        or preview.get("frame_count") != len(preview["frames"])
+        or not preview["frames"]
+        or len(preview["frames"]) > _MAX_FRAMES
+    ):
+        raise RuntimeExecutionError(
+            "trajectory_evidence_unavailable",
+            "The Fix revision preview contract is invalid.",
+        )
+    expected_refs = set(expected_target_bindings)
+    frames: list[dict[str, Any]] = []
+    frame_keys: set[str] = set()
+    for expected_index, raw_frame in enumerate(preview["frames"]):
+        if not isinstance(raw_frame, dict):
+            raise RuntimeExecutionError(
+                "trajectory_evidence_unavailable",
+                "A Fix revision preview frame is invalid.",
+            )
+        frame_key = raw_frame.get("private_frame_key")
+        raw_targets = raw_frame.get("targets")
+        if (
+            raw_frame.get("frame_index") != expected_index
+            or not isinstance(frame_key, str)
+            or not frame_key
+            or Path(frame_key).name != frame_key
+            or frame_key in frame_keys
+            or not isinstance(raw_targets, dict)
+            or set(raw_targets) != expected_refs
+        ):
+            raise RuntimeExecutionError(
+                "trajectory_evidence_unavailable",
+                "A Fix revision preview frame identity is invalid.",
+            )
+        frame_keys.add(frame_key)
+        targets: dict[str, dict[str, Any]] = {}
+        for target_ref, raw_target in raw_targets.items():
+            if not isinstance(raw_target, dict):
+                raise RuntimeExecutionError(
+                    "trajectory_evidence_unavailable",
+                    "A Fix revision preview target is invalid.",
+                )
+            position = (
+                _number_pair(raw_target.get("position"))
+                if raw_target.get("position") is not None
+                else None
+            )
+            direction = _finite_number(raw_target.get("direction"))
+            speed = _finite_number(raw_target.get("speed"))
+            camera_position = (
+                _number_pair(raw_target.get("camera_position"))
+                if raw_target.get("camera_position") is not None
+                else None
+            )
+            camera_trajectory = _trajectory_points(
+                raw_target.get("camera_trajectory_points"),
+            )
+            trajectory = _trajectory_points(
+                raw_target.get("trajectory_points"),
+            )
+            label = raw_target.get("label")
+            color = raw_target.get("color")
+            if (
+                not isinstance(label, str)
+                or not label
+                or (raw_target.get("position") is not None and position is None)
+                or direction is None
+                or speed is None
+                or speed < 0
+                or (
+                    raw_target.get("camera_position") is not None
+                    and camera_position is None
+                )
+                or not isinstance(color, list)
+                or any(not isinstance(item, str) for item in color[:3])
+            ):
+                raise RuntimeExecutionError(
+                    "trajectory_evidence_unavailable",
+                    "A Fix revision preview target value is invalid.",
+                )
+            targets[target_ref] = {
+                "label": label,
+                "position": position,
+                "direction": direction,
+                "speed": speed,
+                "color": [str(item) for item in color[:3]],
+                "image_box": None,
+                "trajectory_points": trajectory,
+                "camera_position": camera_position,
+                "camera_trajectory_points": camera_trajectory,
+            }
+
+        camera = segment_root / "fisheye_front" / f"{frame_key}.jpg"
+        gridmap = segment_root / "grid_map" / f"{frame_key}.json"
+        gridmap_available = gridmap.is_file() and not gridmap.is_symlink()
+        gridmap_width = None
+        gridmap_height = None
+        gridmap_resolution = None
+        gridmap_x_range = None
+        gridmap_y_range = None
+        if gridmap_available:
+            try:
+                payload = _gridmap_payload(_read_stable_regular_bytes(gridmap))
+                gridmap_width = payload.height
+                gridmap_height = payload.width
+                gridmap_resolution = payload.resolution
+                gridmap_x_range = list(payload.x_range)
+                gridmap_y_range = list(payload.y_range)
+            except (OSError, RuntimeExecutionError):
+                gridmap_available = False
+        frames.append(
+            {
+                "frame_index": expected_index,
+                "private_frame_key": frame_key,
+                "camera_available": (
+                    camera.is_file() and not camera.is_symlink()
+                ),
+                "projection_available": False,
+                "gridmap_available": gridmap_available,
+                "gridmap_width": gridmap_width,
+                "gridmap_height": gridmap_height,
+                "gridmap_resolution": gridmap_resolution,
+                "gridmap_x_range": gridmap_x_range,
+                "gridmap_y_range": gridmap_y_range,
+                "pass": bool(raw_frame.get("pass", False)),
+                "targets": targets,
+            }
+        )
+    return {
+        "schema_version": 1,
+        "source": "fix_revision",
+        "target_bindings": dict(sorted(expected_target_bindings.items())),
         "frame_count": len(frames),
         "frames": frames,
     }

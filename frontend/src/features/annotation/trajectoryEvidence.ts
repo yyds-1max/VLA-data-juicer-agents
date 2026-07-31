@@ -11,6 +11,7 @@ import type {
 
 const REVIEW_REF = /^review_[0-9a-f]{32}$/;
 const TRAJECTORY_REVISION_REF = /^trajectory_revision_[0-9a-f]{32}$/;
+const FIX_REVISION_REF = /^fix_revision_[0-9a-f]{32}$/;
 const TARGET_REF = /^target_[0-9a-f]{32}$/;
 const MAX_FRAMES = 100_000;
 const MAX_TRAJECTORY_POINTS = 10_000;
@@ -153,6 +154,12 @@ function parseGridmap(
 function parseTarget(value: unknown): TrajectoryEvidenceTarget {
   const target = record(value);
   exactKeys(target, [
+    "base_direction",
+    "base_position",
+    "base_speed",
+    "base_trajectory_points",
+    "camera_position",
+    "camera_trajectory_points",
     "color",
     "direction",
     "image_box",
@@ -178,10 +185,38 @@ function parseTarget(value: unknown): TrajectoryEvidenceTarget {
       ? [values[0], values[1]] as [number, number]
       : [values[0], values[1], values[2]] as [number, number, number];
   });
+  if (
+    !Array.isArray(target.camera_trajectory_points)
+    || target.camera_trajectory_points.length > MAX_TRAJECTORY_POINTS
+  ) {
+    return contractError();
+  }
+  const cameraTrajectoryPoints = target.camera_trajectory_points.map(
+    (point) => {
+      const values = tuple(point, [2]);
+      return [values[0], values[1]] as [number, number];
+    },
+  );
+  if (
+    !Array.isArray(target.base_trajectory_points)
+    || target.base_trajectory_points.length > MAX_TRAJECTORY_POINTS
+  ) {
+    return contractError();
+  }
+  const baseTrajectoryPoints = target.base_trajectory_points.map((item) => {
+    const values = tuple(item, [2, 3]);
+    return values.length === 2
+      ? [values[0], values[1]] as [number, number]
+      : [values[0], values[1], values[2]] as [number, number, number];
+  });
   const position = nullableTuple(target.position, 2);
+  const cameraPosition = nullableTuple(target.camera_position, 2);
+  const basePosition = nullableTuple(target.base_position, 2);
   const imageBox = nullableTuple(target.image_box, 4);
   const speed = nullableFinite(target.speed);
+  const baseSpeed = nullableFinite(target.base_speed);
   if (speed !== null && speed < 0) contractError();
+  if (baseSpeed !== null && baseSpeed < 0) contractError();
   return {
     target_ref: opaqueRef(target.target_ref, TARGET_REF),
     label: nonEmptyString(target.label),
@@ -195,6 +230,16 @@ function parseTarget(value: unknown): TrajectoryEvidenceTarget {
       ? null
       : [imageBox[0], imageBox[1], imageBox[2], imageBox[3]],
     trajectory_points: trajectoryPoints,
+    camera_position: cameraPosition === null
+      ? null
+      : [cameraPosition[0], cameraPosition[1]],
+    camera_trajectory_points: cameraTrajectoryPoints,
+    base_position: basePosition === null
+      ? null
+      : [basePosition[0], basePosition[1]],
+    base_direction: nullableFinite(target.base_direction),
+    base_speed: baseSpeed,
+    base_trajectory_points: baseTrajectoryPoints,
   };
 }
 
@@ -280,6 +325,9 @@ export function parseTrajectoryReviewEvidence(
     "availability",
     "draft_commands",
     "draft_revision",
+    "evidence_kind",
+    "fix_revision_ref",
+    "fix_revision_source_draft_revision",
     "frame_count",
     "frames",
     "review_ref",
@@ -287,6 +335,12 @@ export function parseTrajectoryReviewEvidence(
     "trajectory_revision_ref",
   ]);
   if (evidence.availability !== "available") contractError();
+  if (
+    evidence.evidence_kind !== "trajectory_revision"
+    && evidence.evidence_kind !== "fix_revision"
+  ) {
+    contractError();
+  }
   const reviewRef = opaqueRef(evidence.review_ref, REVIEW_REF);
   if (reviewRef !== expectedReviewRef) contractError();
   const trajectoryRevisionRef = opaqueRef(
@@ -297,6 +351,30 @@ export function parseTrajectoryReviewEvidence(
   const draftRevision = evidence.draft_revision === null
     ? null
     : integer(evidence.draft_revision, 1);
+  const fixRevisionRef = evidence.fix_revision_ref === null
+    ? null
+    : opaqueRef(evidence.fix_revision_ref, FIX_REVISION_REF);
+  const fixRevisionSourceDraftRevision = (
+    evidence.fix_revision_source_draft_revision === null
+      ? null
+      : integer(evidence.fix_revision_source_draft_revision, 1)
+  );
+  if (
+    (evidence.evidence_kind === "trajectory_revision"
+      && (
+        fixRevisionRef !== null
+        || fixRevisionSourceDraftRevision !== null
+      ))
+    || (
+      evidence.evidence_kind === "fix_revision"
+      && (
+        fixRevisionRef === null
+        || fixRevisionSourceDraftRevision === null
+      )
+    )
+  ) {
+    contractError();
+  }
   const frameCount = integer(evidence.frame_count, 1);
   if (frameCount > MAX_FRAMES || !Array.isArray(evidence.frames)) {
     return contractError();
@@ -369,7 +447,17 @@ export function parseTrajectoryReviewEvidence(
   ));
   if (
     (draftRevision === null && draftCommands.length !== 0)
-    || (draftRevision !== null && draftRevision !== draftCommands.length + 1)
+    || (
+      draftRevision !== null
+      && evidence.evidence_kind === "trajectory_revision"
+      && draftRevision !== draftCommands.length + 1
+    )
+    || (
+      draftRevision !== null
+      && evidence.evidence_kind === "fix_revision"
+      && draftRevision
+        !== fixRevisionSourceDraftRevision! + draftCommands.length
+    )
   ) {
     contractError();
   }
@@ -377,6 +465,9 @@ export function parseTrajectoryReviewEvidence(
   return {
     availability: "available",
     review_ref: reviewRef,
+    evidence_kind: evidence.evidence_kind,
+    fix_revision_ref: fixRevisionRef,
+    fix_revision_source_draft_revision: fixRevisionSourceDraftRevision,
     trajectory_revision_ref: trajectoryRevisionRef,
     review_state_revision: reviewStateRevision,
     draft_revision: draftRevision,
@@ -461,13 +552,13 @@ export function projectTrajectoryReviewEvidence(
     ...frame,
     original_pass: frame.pass,
     targets: frame.targets.map((target) => {
-      const originalPosition = point(target.position);
+      const originalPosition = point(target.base_position);
       return {
         ...target,
         original_position: originalPosition,
         position: originalPosition ? { ...originalPosition } : null,
-        original_direction: target.direction,
-        original_speed: target.speed,
+        original_direction: target.base_direction,
+        original_speed: target.base_speed,
         present: originalPosition !== null,
         projection: "original" as const,
       };
