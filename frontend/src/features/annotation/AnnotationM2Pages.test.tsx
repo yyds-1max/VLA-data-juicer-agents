@@ -10,6 +10,7 @@ import {
 
 import {
   applyFixCommand,
+  createFixRevision,
   getCalibrationProfiles,
   getTrajectoryReview,
   getTrajectoryReviewEvidence,
@@ -34,6 +35,7 @@ vi.mock("./api", async (importOriginal) => {
   return {
     ...actual,
     applyFixCommand: vi.fn(),
+    createFixRevision: vi.fn(),
     getCalibrationProfiles: vi.fn(),
     getTrajectoryReview: vi.fn(),
     getTrajectoryReviewEvidence: vi.fn(),
@@ -43,6 +45,7 @@ vi.mock("./api", async (importOriginal) => {
 
 const apiMocks = vi.mocked({
   applyFixCommand,
+  createFixRevision,
   getCalibrationProfiles,
   getTrajectoryReview,
   getTrajectoryReviewEvidence,
@@ -933,4 +936,125 @@ test("Fix workbench autosaves a position change through the CAS command API", as
       },
     },
   ), { timeout: 2500 });
+});
+
+test("restoring a missing target automatically queues the authoritative Fix preview", async () => {
+  const targetRef = "target_0123456789abcdef0123456789abcdef";
+  const inProgress: TrajectoryReview = {
+    ...review,
+    status: "in_progress",
+    state_revision: 2,
+    fix_draft: {
+      revision: 1,
+      content_sha256: "c".repeat(64),
+      calibration: {
+        ...review.processing_calibration,
+        differs_from_processing: false,
+        difference_reason: null,
+      },
+    },
+  };
+  const baseEvidence: TrajectoryReviewEvidence = {
+    availability: "available",
+    review_ref: review.review_ref,
+    evidence_kind: "trajectory_revision",
+    fix_revision_ref: null,
+    fix_revision_source_draft_revision: null,
+    trajectory_revision_ref: review.trajectory_revision.revision_ref,
+    review_state_revision: 2,
+    draft_revision: 1,
+    frame_count: 2,
+    frames: [0, 1].map((frameIndex) => ({
+      frame_index: frameIndex,
+      pass: false,
+      camera: null,
+      projection: null,
+      gridmap: null,
+      targets: [{
+        target_ref: targetRef,
+        label: "Master",
+        position: frameIndex === 0 ? [1, 2] : null,
+        direction: 0,
+        speed: 1,
+        color: [],
+        image_box: null,
+        trajectory_points: [],
+        camera_position: null,
+        camera_trajectory_points: [],
+        base_position: frameIndex === 0 ? [1, 2] : null,
+        base_direction: 0,
+        base_speed: 1,
+        base_trajectory_points: [],
+      }],
+    })),
+    draft_commands: [],
+  };
+  const commandApplied: TrajectoryReview = {
+    ...inProgress,
+    state_revision: 3,
+    fix_draft: { ...inProgress.fix_draft!, revision: 2 },
+  };
+  const queued: TrajectoryReview = {
+    ...commandApplied,
+    state_revision: 4,
+    active_fix_run: {
+      status: "queued",
+      failure: null,
+      created_at: "2026-07-31T00:00:01Z",
+      updated_at: "2026-07-31T00:00:01Z",
+    },
+  };
+  const pendingEvidence = {
+    ...baseEvidence,
+    review_state_revision: 3,
+    draft_revision: 2,
+    draft_commands: [{
+      kind: "add_missing_target" as const,
+      frame_index: 1,
+      target_ref: targetRef,
+    }],
+  };
+  apiMocks.getTrajectoryReview.mockResolvedValue(inProgress);
+  apiMocks.getTrajectoryReviewEvidence
+    .mockResolvedValueOnce(baseEvidence)
+    .mockResolvedValueOnce(pendingEvidence)
+    .mockResolvedValueOnce({
+      ...pendingEvidence,
+      review_state_revision: 4,
+    });
+  apiMocks.applyFixCommand.mockResolvedValue(commandApplied);
+  apiMocks.createFixRevision.mockResolvedValue(queued);
+  const router = createMemoryRouter([
+    {
+      path: "/annotation/reviews/:reviewRef",
+      element: <TrajectoryFixPage />,
+    },
+  ], {
+    initialEntries: [`/annotation/reviews/${review.review_ref}`],
+  });
+
+  render(<RouterProvider router={router} future={{ v7_startTransition: true }} />);
+  fireEvent.click(await screen.findByRole("button", { name: "下一帧" }));
+  fireEvent.click(await screen.findByRole("button", { name: "补回目标" }));
+
+  await waitFor(() => expect(apiMocks.applyFixCommand).toHaveBeenCalledWith(
+    review.review_ref,
+    {
+      expected_review_revision: 2,
+      expected_draft_revision: 1,
+      command: {
+        kind: "add_missing_target",
+        frame_index: 1,
+        target_ref: targetRef,
+      },
+    },
+  ));
+  await waitFor(() => expect(apiMocks.createFixRevision).toHaveBeenCalledWith(
+    review.review_ref,
+    {
+      expected_review_revision: 3,
+      expected_draft_revision: 2,
+    },
+  ));
+  expect(await screen.findByText("Fix 版本正在等待执行")).toBeVisible();
 });

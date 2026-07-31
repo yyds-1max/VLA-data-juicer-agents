@@ -966,6 +966,7 @@ function TrajectoryFixWorkbench({
   const submitRevision = async () => {
     if (!review.fix_draft || editorDirty || saving || fixRuntimeBusy) return;
     setActing(true);
+    setError("");
     try {
       const next = await createFixRevision(review.review_ref, {
         expected_review_revision: review.state_revision,
@@ -975,6 +976,42 @@ function TrajectoryFixWorkbench({
       await loadEvidence(next);
     } catch (requestError) {
       setError(safeFixError(requestError, "提交 Fix 版本失败"));
+    } finally {
+      setActing(false);
+    }
+  };
+
+  const restoreMissingTarget = async () => {
+    if (!selectedTarget || frameIndex < 1) return;
+    const saved = await runCommand({
+      kind: "add_missing_target",
+      frame_index: frameIndex,
+      target_ref: selectedTarget.target_ref,
+    });
+    if (!saved) return;
+    const current = reviewStateRef.current;
+    if (
+      !current?.fix_draft
+      || current.status !== "in_progress"
+      || current.active_fix_run?.status === "queued"
+      || current.active_fix_run?.status === "running"
+    ) {
+      return;
+    }
+    setActing(true);
+    setError("");
+    try {
+      const next = await createFixRevision(current.review_ref, {
+        expected_review_revision: current.state_revision,
+        expected_draft_revision: current.fix_draft.revision,
+      });
+      updateFromResult(next);
+      await loadEvidence(next);
+    } catch (requestError) {
+      setError(safeFixError(
+        requestError,
+        "补回目标已保存，但生成权威 Fix 预览失败，请重试生成预览。",
+      ));
     } finally {
       setActing(false);
     }
@@ -1546,15 +1583,14 @@ function TrajectoryFixWorkbench({
                     !selectedTarget
                     || frameIndex < 1
                     || selectedTarget.present
+                    || acting
                   }
-                  onClick={() => selectedTarget && void runCommand({
-                    kind: "add_missing_target",
-                    frame_index: frameIndex,
-                    target_ref: selectedTarget.target_ref,
-                  })}
+                  onClick={() => void restoreMissingTarget()}
                 >
-                  <UserPlus aria-hidden="true" className="h-4 w-4" />
-                  补回目标
+                  {acting
+                    ? <LoaderCircle aria-hidden="true" className="h-4 w-4 animate-spin" />
+                    : <UserPlus aria-hidden="true" className="h-4 w-4" />}
+                  {acting ? "正在补回…" : "补回目标"}
                 </ConsoleButton>
                 <ConsoleButton
                   disabled={!selectedTarget || !selectedTarget.present}
