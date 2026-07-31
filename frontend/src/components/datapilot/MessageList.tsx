@@ -23,6 +23,10 @@ export function MessageList({ messages, turns = [], run, hasTaskOverlay = false 
   const sessionMilestones = run.timeline.filter(
     (item) => !item.turnId && item.kind === "progress" && item.text !== "正在理解你的请求",
   );
+  const { milestonesByTurn, unboundMilestones } = partitionSessionMilestones(
+    displayTurns,
+    sessionMilestones,
+  );
   const conversationEntries = [
     ...sessionMessages.map((message, index) => ({
       kind: "message" as const,
@@ -38,7 +42,7 @@ export function MessageList({ messages, turns = [], run, hasTaskOverlay = false 
       order: sessionMessages.length + index,
       turn,
     })),
-    ...sessionMilestones.map((milestone, index) => ({
+    ...unboundMilestones.map((milestone, index) => ({
       kind: "milestone" as const,
       key: `milestone:${milestone.sequence ?? index}:${milestone.text}`,
       createdAt: milestone.createdAt ?? "",
@@ -90,6 +94,7 @@ export function MessageList({ messages, turns = [], run, hasTaskOverlay = false 
                 turn={entry.turn}
                 messages={messages}
                 run={run}
+                milestones={milestonesByTurn.get(entry.turn.id) ?? []}
                 allowEmptyPlaceholder={entry.turn.id === placeholderTurnId}
               />
             );
@@ -117,11 +122,13 @@ function TurnConversation({
   turn,
   messages,
   run,
+  milestones,
   allowEmptyPlaceholder,
 }: {
   turn: TurnRecord;
   messages: ChatMessageRecord[];
   run: RunState;
+  milestones: TimelineItem[];
   allowEmptyPlaceholder: boolean;
 }) {
   const userMessages = messages.filter(
@@ -150,6 +157,12 @@ function TurnConversation({
   return (
     <div className="contents">
       {userMessages.map((message) => <MessageBubble key={message.id} message={message} />)}
+      {milestones.map((item, index) => (
+        <MilestoneBubble
+          key={`milestone:${item.sequence ?? index}:${item.text}`}
+          item={item}
+        />
+      ))}
       {showDisclosure ? (
         <ProcessingDisclosure
           turn={turn}
@@ -167,6 +180,50 @@ function TurnConversation({
       ))}
     </div>
   );
+}
+
+function partitionSessionMilestones(
+  turns: TurnRecord[],
+  milestones: TimelineItem[],
+): {
+  milestonesByTurn: Map<string, TimelineItem[]>;
+  unboundMilestones: TimelineItem[];
+} {
+  const milestonesByTurn = new Map<string, TimelineItem[]>();
+  const unboundMilestones: TimelineItem[] = [];
+  const sortedMilestones = [...milestones].sort(compareTimelineItems);
+
+  sortedMilestones.forEach((milestone) => {
+    if (!milestone.createdAt) {
+      unboundMilestones.push(milestone);
+      return;
+    }
+
+    let owner: TurnRecord | undefined;
+    for (let index = turns.length - 1; index >= 0; index -= 1) {
+      if (turns[index].started_at <= milestone.createdAt) {
+        owner = turns[index];
+        break;
+      }
+    }
+
+    if (!owner) {
+      unboundMilestones.push(milestone);
+      return;
+    }
+
+    const owned = milestonesByTurn.get(owner.id) ?? [];
+    owned.push(milestone);
+    milestonesByTurn.set(owner.id, owned);
+  });
+
+  return { milestonesByTurn, unboundMilestones };
+}
+
+function compareTimelineItems(left: TimelineItem, right: TimelineItem): number {
+  const createdAtOrder = (left.createdAt ?? "").localeCompare(right.createdAt ?? "");
+  if (createdAtOrder !== 0) return createdAtOrder;
+  return (left.sequence ?? Number.MAX_SAFE_INTEGER) - (right.sequence ?? Number.MAX_SAFE_INTEGER);
 }
 
 function latestEmptyUserTurnId(

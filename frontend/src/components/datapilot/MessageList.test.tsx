@@ -31,6 +31,21 @@ function userMessage(id: string, turnId: string): ChatMessageRecord {
   };
 }
 
+function assistantMessage(id: string, turnId: string, content: string): ChatMessageRecord {
+  return {
+    id,
+    session_id: sessionId,
+    turn_id: turnId,
+    role: "assistant",
+    content,
+    created_at: "2026-07-20T00:00:04.000Z",
+  };
+}
+
+function expectBefore(first: HTMLElement, second: HTMLElement) {
+  expect(first.compareDocumentPosition(second) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+}
+
 afterEach(() => {
   vi.useRealTimers();
 });
@@ -101,28 +116,87 @@ describe("MessageList contract v1 processing", () => {
     expect(screen.getByText("正在提取并同步导航数据")).toBeVisible();
   });
 
-  test("renders a durable turnless workflow milestone in conversation order", () => {
+  test("restores a durable workflow milestone inside its turn before later processing and final reply", () => {
     const run = createEmptyRunState();
-    run.timeline = [{
-      kind: "progress",
-      text: "Tracking 已完成，DataPilot 将继续调查并执行后处理。",
-      turnId: null,
-      progressPhase: "completed",
-      createdAt: "2026-07-20T00:00:03.000Z",
-      sequence: 7,
-    }];
+    run.timeline = [
+      {
+        kind: "progress",
+        text: "人工复核状态已更新，DataPilot 将继续处理当前任务。",
+        turnId: null,
+        progressPhase: "completed",
+        createdAt: "2026-07-20T00:00:03.000Z",
+        sequence: 7,
+      },
+      {
+        kind: "progress",
+        text: "正在核对人工复核结果。",
+        turnId: "turn-1",
+        createdAt: "2026-07-20T00:00:03.500Z",
+        sequence: 8,
+      },
+    ];
 
     render(
       <MessageList
-        messages={[userMessage("message-1", "turn-1")]}
+        messages={[
+          userMessage("message-1", "turn-1"),
+          assistantMessage("message-2", "turn-1", "轨迹复核已完成收口。"),
+        ]}
         turns={[turn("turn-1")]}
         run={run}
       />,
     );
 
+    const user = screen.getByText("request message-1");
+    const milestone = screen.getByText(
+      "人工复核状态已更新，DataPilot 将继续处理当前任务。",
+    );
+    const processing = screen.getByText("正在核对人工复核结果。");
+    const finalReply = screen.getByText("轨迹复核已完成收口。");
+
     expect(screen.getByText("DataPilot · 状态更新")).toBeVisible();
-    expect(screen.getByText(
-      "Tracking 已完成，DataPilot 将继续调查并执行后处理。",
-    )).toBeVisible();
+    expectBefore(user, milestone);
+    expectBefore(milestone, processing);
+    expectBefore(processing, finalReply);
+  });
+
+  test("keeps a live workflow milestone ahead of processing details when the turn updates", () => {
+    const run = createEmptyRunState();
+    run.running = true;
+    const messages = [userMessage("message-1", "turn-1")];
+    const { rerender } = render(
+      <MessageList messages={messages} turns={[turn("turn-1")]} run={run} />,
+    );
+
+    const updatedRun = createEmptyRunState();
+    updatedRun.running = true;
+    updatedRun.timeline = [
+      {
+        kind: "progress",
+        text: "人工复核状态已更新，DataPilot 将继续处理当前任务。",
+        turnId: null,
+        createdAt: "2026-07-20T00:00:03.000Z",
+        sequence: 9,
+      },
+      {
+        kind: "action",
+        text: "核对人工复核结果",
+        actionRef: "review-result",
+        actionDisplayName: "核对人工复核结果",
+        actionStatus: "running",
+        turnId: "turn-1",
+        createdAt: "2026-07-20T00:00:03.500Z",
+        sequence: 10,
+      },
+    ];
+
+    rerender(<MessageList messages={messages} turns={[turn("turn-1")]} run={updatedRun} />);
+
+    const milestone = screen.getByText(
+      "人工复核状态已更新，DataPilot 将继续处理当前任务。",
+    );
+    const action = screen.getByText("正在核对人工复核结果");
+    expectBefore(screen.getByText("request message-1"), milestone);
+    expectBefore(milestone, action);
   });
 });
