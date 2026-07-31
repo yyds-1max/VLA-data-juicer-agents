@@ -19,6 +19,8 @@ from vla_data_juicer_agents.navigation.task_state import (
     TASK_SCHEMA_VERSION,
     NavigationRunningWriter,
     NavigationTask,
+    NavigationTaskLineage,
+    NavigationTaskOutcome,
     NavigationTaskStatus,
     NavigationTaskTransitionError,
     TaskAttemptCreation,
@@ -189,6 +191,7 @@ class SqliteNavigationTaskStore:
         dry_run: bool,
         web_session_id: str,
         agentscope_session_id: str,
+        requested_outcome: str = "auto",
     ) -> TaskAttemptCreation:
         if not isinstance(web_session_id, str) or not web_session_id.strip():
             raise ValueError("web_session_id must be a non-empty string")
@@ -232,6 +235,20 @@ class SqliteNavigationTaskStore:
                 updated_at=timestamp,
             )
             self._insert_task(connection, task)
+            outcome = NavigationTaskOutcome(
+                task_id=task.task_id,
+                requested_outcome=requested_outcome,
+                created_at=timestamp,
+                updated_at=timestamp,
+            )
+            self._insert_task_outcome(connection, outcome)
+            durable_row = connection.execute(
+                "SELECT * FROM navigation_tasks WHERE task_id = ?",
+                (task.task_id,),
+            ).fetchone()
+            if durable_row is None:
+                raise KeyError(task.task_id)
+            task = self._task_from_row(durable_row)
             connection.commit()
             return TaskAttemptCreation(task=task, created=True)
         except Exception:
@@ -324,6 +341,171 @@ class SqliteNavigationTaskStore:
                 (task_id,),
             ).fetchone()
         return self._task_from_row(row) if row is not None else None
+
+    def get_task_outcome(self, task_id: str) -> NavigationTaskOutcome | None:
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT * FROM navigation_task_outcomes WHERE task_id = ?",
+                (task_id,),
+            ).fetchone()
+        return self._task_outcome_from_row(row) if row is not None else None
+
+    def get_task_lineage(self, child_task_id: str) -> NavigationTaskLineage | None:
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT * FROM navigation_task_lineage WHERE child_task_id = ?",
+                (child_task_id,),
+            ).fetchone()
+        return self._task_lineage_from_row(row) if row is not None else None
+
+    def get_linked_child(
+        self,
+        parent_task_id: str,
+        *,
+        relation: str = "trajectory_fix",
+    ) -> NavigationTask | None:
+        with self._connect() as connection:
+            row = connection.execute(
+                """SELECT tasks.*
+                   FROM navigation_task_lineage AS lineage
+                   JOIN navigation_tasks AS tasks
+                     ON tasks.task_id = lineage.child_task_id
+                   WHERE lineage.parent_task_id = ? AND lineage.relation = ?""",
+                (parent_task_id, relation),
+            ).fetchone()
+        return self._task_from_row(row) if row is not None else None
+
+    def list_completed_explicit_fix_parents(
+        self,
+        *,
+        limit: int = 20,
+    ) -> list[NavigationTask]:
+        """Return completed processing tasks whose requested Fix child is missing."""
+
+        with self._connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT tasks.*
+                FROM navigation_tasks tasks
+                JOIN navigation_task_outcomes outcomes
+                  ON outcomes.task_id = tasks.task_id
+                LEFT JOIN navigation_task_lineage lineage
+                  ON lineage.parent_task_id = tasks.task_id
+                 AND lineage.relation = 'trajectory_fix'
+                WHERE tasks.status = 'completed'
+                  AND outcomes.requested_outcome = 'postprocessing_and_fix'
+                  AND outcomes.completion_outcome =
+                      'postprocessing_completed_fix_pending'
+                  AND lineage.child_task_id IS NULL
+                ORDER BY tasks.updated_at, tasks.task_id
+                LIMIT ?
+                """,
+                (limit,),
+            ).fetchall()
+        return [self._task_from_row(row) for row in rows]
+
+    def create_linked_trajectory_fix_attempt(
+        self,
+        *,
+        parent_task_id: str,
+        child_task_id: str,
+        request: str,
+        web_session_id: str,
+        agentscope_session_id: str,
+        dry_run: bool | None = None,
+    ) -> TaskAttemptCreation:
+        """Idempotently create a child without mutating or reopening its parent."""
+        if not web_session_id.strip() or not agentscope_session_id.strip():
+            raise ValueError("linked task session identities must be non-empty")
+        connection = self._connect()
+        try:
+            connection.execute("BEGIN IMMEDIATE")
+            existing = connection.execute(
+                """SELECT tasks.*
+                   FROM navigation_task_lineage AS lineage
+                   JOIN navigation_tasks AS tasks
+                     ON tasks.task_id = lineage.child_task_id
+                   WHERE lineage.parent_task_id = ?
+                     AND lineage.relation = 'trajectory_fix'""",
+                (parent_task_id,),
+            ).fetchone()
+            if existing is not None:
+                connection.commit()
+                return TaskAttemptCreation(
+                    task=self._task_from_row(existing),
+                    created=False,
+                )
+            parent_row = connection.execute(
+                "SELECT * FROM navigation_tasks WHERE task_id = ?",
+                (parent_task_id,),
+            ).fetchone()
+            if parent_row is None:
+                raise KeyError(parent_task_id)
+            parent = self._task_from_row(parent_row)
+            outcome_row = connection.execute(
+                "SELECT * FROM navigation_task_outcomes WHERE task_id = ?",
+                (parent_task_id,),
+            ).fetchone()
+            outcome = (
+                self._task_outcome_from_row(outcome_row)
+                if outcome_row is not None
+                else None
+            )
+            if (
+                parent.status != NavigationTaskStatus.COMPLETED
+                or outcome is None
+                or outcome.completion_outcome
+                != "postprocessing_completed_fix_pending"
+            ):
+                raise ValueError(
+                    "linked trajectory Fix requires a completed postprocessing parent"
+                )
+            timestamp = utc_now()
+            child = NavigationTask(
+                task_id=child_task_id,
+                request=request,
+                target="trajectory_review",
+                date=parent.date,
+                segments=parent.segments,
+                scene_mode=parent.scene_mode,
+                dry_run=parent.dry_run if dry_run is None else dry_run,
+                state_revision=1,
+                status=NavigationTaskStatus.ACTIVE,
+                created_by_web_session_id=web_session_id.strip(),
+                agentscope_session_id=agentscope_session_id.strip(),
+                created_at=timestamp,
+                updated_at=timestamp,
+            )
+            self._insert_task(connection, child)
+            self._insert_task_outcome(
+                connection,
+                NavigationTaskOutcome(
+                    task_id=child.task_id,
+                    requested_outcome="trajectory_fix",
+                    created_at=timestamp,
+                    updated_at=timestamp,
+                ),
+            )
+            connection.execute(
+                """INSERT INTO navigation_task_lineage (
+                       child_task_id, parent_task_id, relation, created_at
+                   ) VALUES (?, ?, 'trajectory_fix', ?)""",
+                (child.task_id, parent.task_id, timestamp),
+            )
+            durable_row = connection.execute(
+                "SELECT * FROM navigation_tasks WHERE task_id = ?",
+                (child.task_id,),
+            ).fetchone()
+            if durable_row is None:
+                raise KeyError(child.task_id)
+            child = self._task_from_row(durable_row)
+            connection.commit()
+            return TaskAttemptCreation(task=child, created=True)
+        except Exception:
+            connection.rollback()
+            raise
+        finally:
+            connection.close()
 
     def update_task_for_session(
         self,
@@ -447,6 +629,27 @@ class SqliteNavigationTaskStore:
             self._task_values(task),
         )
 
+    def _insert_task_outcome(
+        self,
+        connection: sqlite3.Connection,
+        outcome: NavigationTaskOutcome,
+    ) -> None:
+        connection.execute(
+            """INSERT INTO navigation_task_outcomes (
+                   task_id, requested_outcome, completion_outcome, revision,
+                   metadata_json, created_at, updated_at
+               ) VALUES (?, ?, ?, ?, ?, ?, ?)""",
+            (
+                outcome.task_id,
+                outcome.requested_outcome,
+                outcome.completion_outcome,
+                outcome.revision,
+                _json_dump(outcome.metadata) or "{}",
+                outcome.created_at,
+                outcome.updated_at,
+            ),
+        )
+
     def _update_task(
         self,
         connection: sqlite3.Connection,
@@ -518,4 +721,25 @@ class SqliteNavigationTaskStore:
             schema_version=row["schema_version"],
             created_at=row["created_at"],
             updated_at=row["updated_at"],
+        )
+
+    @staticmethod
+    def _task_outcome_from_row(row: sqlite3.Row) -> NavigationTaskOutcome:
+        return NavigationTaskOutcome(
+            task_id=row["task_id"],
+            requested_outcome=row["requested_outcome"],
+            completion_outcome=row["completion_outcome"],
+            revision=row["revision"],
+            metadata=_json_load(row["metadata_json"]) or {},
+            created_at=row["created_at"],
+            updated_at=row["updated_at"],
+        )
+
+    @staticmethod
+    def _task_lineage_from_row(row: sqlite3.Row) -> NavigationTaskLineage:
+        return NavigationTaskLineage(
+            parent_task_id=row["parent_task_id"],
+            child_task_id=row["child_task_id"],
+            relation=row["relation"],
+            created_at=row["created_at"],
         )

@@ -8,16 +8,24 @@ DataPilot Router V1 prompt, RouterContextEnvelope middleware, and exact
 operations but never starts navigation processing, so it does **not** require
 Redis, FastAPI, the frontend, or navigation processing scripts.
 
-Case Schema v2 supports one or more Router user turns and one optional safe
-runtime setup: either a focused-task snapshot or a trusted shortcut
-`request_context`. Assistant turns are always produced by the host; fixtures
-cannot inject them. The trusted context is exposed only through the production
-RouterContextEnvelope shape and its date/clip scope is enforced exactly by the
-evaluation runtime. Navigation and end-to-end execution still require a
-separate specialist simulator and are rejected rather than silently
-approximated. Schema v1 and the `router-smoke` cases/baseline remain untouched as
-historical artifacts. They are not the CLI default and are not a DataPilot V1
-release gate.
+Case Schema v2 supports one or more user turns and one optional safe runtime
+setup: a Router focused-task snapshot, a trusted shortcut `request_context`, or
+a bounded Navigation task/fact snapshot. Assistant turns are always produced by
+the host; fixtures cannot inject them. The trusted shortcut context is exposed
+only through the production RouterContextEnvelope shape and its date/clip scope
+is enforced exactly by the evaluation runtime.
+
+The `navigation-m2` suite runs the production NavigationDataAgent prompt and
+strict Plan schemas against an in-memory specialist boundary. Its inspection
+results contain only fixture facts; Plan submission records a safe decision,
+action, and variant summary; the first accepted execution step returns a
+simulated background result. It cannot access processing scripts, source data,
+Annotation databases, writer locks, or the filesystem outside its disposable
+workspace. This is a planning/routing quality gate, not a substitute for
+Runtime Golden or server writer acceptance.
+
+Schema v1 and the `router-smoke` cases/baseline remain untouched as historical
+artifacts. They are not the CLI default and are not a DataPilot V1 release gate.
 
 The V1 suite covers capability answers, missing-date clarification, date-only
 all-clips routing, single and multiple selected clips, clip/date prefix
@@ -27,6 +35,14 @@ task, waiting-user continuation and normal close after rejecting
 post-processing, paused-task resume, stop/cancel, occupied task-slot conflicts,
 and the navigation generic-tool prohibition. Exact scope, allowed tool sets,
 tool-call counts, and implementation-detail leakage are deterministic gates.
+
+The M2 suite separately covers trusted automatic-annotation shortcuts,
+explicit postprocessing-plus-Fix intent, continuation from a completed
+postprocessing parent, declining the optional linked Fix without a tool call,
+tracked-job postprocessing without rerunning M1,
+existing-versus-PCD-generated gridmap decisions, odom trajectory-variant
+selection, and the durable human Fix workbench handoff. It does not modify the
+frozen `datapilot-v1` baseline.
 
 ## Environment
 
@@ -51,6 +67,7 @@ Validate case schemas and grader configuration without calling a model:
 ```bash
 vla-agent-eval validate
 # Equivalent: vla-agent-eval validate --suite datapilot-v1
+vla-agent-eval validate --suite navigation-m2
 ```
 
 Run all cases once, or select/repeat a case:
@@ -58,6 +75,7 @@ Run all cases once, or select/repeat a case:
 ```bash
 vla-agent-eval run
 vla-agent-eval run --case router_start_selected_cross_date_prefix --repeat 3
+vla-agent-eval run --suite navigation-m2 --repeat 3
 ```
 
 Repeated runs include a per-case stability summary in stdout and

@@ -6,6 +6,10 @@ from pathlib import Path
 
 from vla_data_juicer_agents.core.cancellation import TurnCancelled, current_cancellation
 from vla_data_juicer_agents.navigation.models import CommandRecord
+from vla_data_juicer_agents.navigation.writer_lock import (
+    active_writer_lock_fds,
+    quarantine_active_writer,
+)
 
 
 OUTPUT_LIMIT = 8000
@@ -45,7 +49,16 @@ def _terminate_process_group(process: subprocess.Popen[str]) -> None:
             os.killpg(pgid, signal.SIGKILL)
         except (PermissionError, ProcessLookupError):
             pass
-    process.wait(timeout=1.0)
+    try:
+        process.wait(timeout=1.0)
+    except subprocess.TimeoutExpired:
+        pass
+    deadline = time.monotonic() + 1.0
+    while time.monotonic() < deadline and _process_group_exists(pgid):
+        process.poll()
+        time.sleep(0.05)
+    if _process_group_exists(pgid):
+        raise RuntimeError("writer process group termination could not be verified")
 
 
 def run_command(
@@ -61,33 +74,49 @@ def run_command(
     if cancellation is not None:
         cancellation.raise_if_cancelled()
 
-    process = subprocess.Popen(
-        command,
-        cwd=cwd,
-        text=True,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        start_new_session=True,
-    )
-    started = time.monotonic()
-    while True:
-        try:
-            stdout, stderr = process.communicate(timeout=0.1)
-            break
-        except subprocess.TimeoutExpired:
-            if cancellation is not None and cancellation.cancelled:
+    process: subprocess.Popen[str] | None = None
+    try:
+        process = subprocess.Popen(
+            command,
+            cwd=cwd,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            start_new_session=True,
+            pass_fds=active_writer_lock_fds(),
+        )
+        started = time.monotonic()
+        while True:
+            try:
+                stdout, stderr = process.communicate(timeout=0.1)
+                break
+            except subprocess.TimeoutExpired:
+                if cancellation is not None and cancellation.cancelled:
+                    _terminate_process_group(process)
+                    process.communicate()
+                    raise TurnCancelled("The current turn was interrupted.")
+                if (
+                    timeout_seconds is not None
+                    and time.monotonic() - started >= timeout_seconds
+                ):
+                    _terminate_process_group(process)
+                    stdout, stderr = process.communicate()
+                    raise subprocess.TimeoutExpired(
+                        command,
+                        timeout_seconds,
+                        output=_tail(stdout),
+                        stderr=_tail(stderr),
+                    )
+    except BaseException:
+        if process is not None and (
+            process.poll() is None or _process_group_exists(process.pid)
+        ):
+            try:
                 _terminate_process_group(process)
                 process.communicate()
-                raise TurnCancelled("The current turn was interrupted.")
-            if timeout_seconds is not None and time.monotonic() - started >= timeout_seconds:
-                _terminate_process_group(process)
-                stdout, stderr = process.communicate()
-                raise subprocess.TimeoutExpired(
-                    command,
-                    timeout_seconds,
-                    output=_tail(stdout),
-                    stderr=_tail(stderr),
-                )
+            except BaseException:
+                quarantine_active_writer()
+        raise
 
     return CommandRecord(
         command=command,

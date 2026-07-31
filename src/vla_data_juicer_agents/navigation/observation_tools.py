@@ -7,6 +7,10 @@ from typing import Any
 
 from agentscope.tool import FunctionTool
 
+from vla_data_juicer_agents.navigation.annotation_gateway import (
+    AnnotationGatewayUnavailable,
+    NavigationAnnotationGateway,
+)
 from vla_data_juicer_agents.navigation.catalog import (
     list_navigation_tool_capabilities,
 )
@@ -29,6 +33,7 @@ from vla_data_juicer_agents.navigation.inspection import (
     inspect_runtime_assets,
 )
 from vla_data_juicer_agents.navigation.observation_models import (
+    AnnotationJobFactsObservation,
     ArtifactStateObservation,
     EvidenceWrite,
     GridmapArtifactsObservation,
@@ -114,6 +119,7 @@ def build_navigation_observation_tools(
     observation_store: SqliteNavigationObservationStore,
     evidence_store: FileNavigationEvidenceStore,
     settings: NavigationSettings,
+    annotation_gateway: NavigationAnnotationGateway | None = None,
     expected_web_session_id: str | None = None,
     expected_agentscope_session_id: str | None = None,
 ) -> list[FunctionTool]:
@@ -307,6 +313,31 @@ def build_navigation_observation_tools(
             summary=f"Found {len(payload.available_sources)} localization source kind(s).",
         )
 
+    def inspect_annotation_job_facts() -> dict[str, Any]:
+        """Read bounded Annotation workflow facts without exposing refs or paths."""
+        if annotation_gateway is None:
+            raise AnnotationGatewayUnavailable(
+                "Annotation Application Service is not configured"
+            )
+        raw = dict(
+            annotation_gateway.get_processing_facts(
+                dataset_date=task.date,
+                source_clips=task.segments,
+                navigation_task_id=task.task_id,
+            )
+        )
+        payload = AnnotationJobFactsObservation.model_validate(raw)
+        return append_observation(
+            kind="annotation_job_facts",
+            payload=payload,
+            raw_payload=payload.model_dump(mode="json"),
+            source_tool="inspect_navigation_annotation_job_facts_tool",
+            summary=(
+                "Annotation workflow facts: "
+                f"status={payload.job_status}, segments={payload.segment_count}."
+            ),
+        )
+
     def get_navigation_task_context() -> dict[str, Any]:
         """Return the bounded factual, stage-neutral context for the bound task."""
         observation = observation_store.latest(task.task_id)
@@ -432,6 +463,7 @@ def build_navigation_observation_tools(
         _make_tool(bounded_inspection(inspect_runtime_asset_inventory), "inspect_navigation_runtime_assets_tool"),
         _make_tool(bounded_inspection(inspect_calibration_inventory), "inspect_navigation_calibration_inventory_tool"),
         _make_tool(bounded_inspection(inspect_localization_inventory), "inspect_navigation_localization_sources_tool"),
+        _make_tool(bounded_inspection(inspect_annotation_job_facts), "inspect_navigation_annotation_job_facts_tool"),
         _make_tool(get_navigation_task_context, "get_navigation_task_context_tool"),
         _make_tool(list_observation_evidence, "list_observation_evidence_tool"),
         _make_tool(read_observation_evidence, "read_observation_evidence_tool"),
@@ -453,38 +485,17 @@ def _bounded_inspection_failure(error: Exception) -> dict[str, Any]:
     """Build a sanitized three-field failure that cannot exceed the tool budget."""
     try:
         error_type = _inspection_error_type(error)
-        message = "".join(
-            character if character.isprintable() else " "
-            for character in str(error)
-        ).strip()
-        if not message:
-            message = _INSPECTION_FAILURE_FALLBACK["message"]
-        result = {
+        messages = {
+            "permission_error": "Inspection was denied.",
+            "file_not_found": "Required inspection input was not found.",
+            "invalid_inspection_request": "Inspection request was invalid.",
+            "inspection_failed": "Inspection failed.",
+        }
+        return {
             "ok": False,
             "error_type": error_type,
-            "message": message,
+            "message": messages[error_type],
         }
-        if serialized_chars(result) <= INSPECTION_RESULT_MAX_CHARS:
-            return result
-
-        low = 0
-        high = len(message)
-        while low < high:
-            midpoint = (low + high + 1) // 2
-            candidate = {
-                **result,
-                "message": f"{message[:midpoint]}…",
-            }
-            if serialized_chars(candidate) <= INSPECTION_RESULT_MAX_CHARS:
-                low = midpoint
-            else:
-                high = midpoint - 1
-        bounded = {
-            **result,
-            "message": f"{message[:low]}…",
-        }
-        if serialized_chars(bounded) <= INSPECTION_RESULT_MAX_CHARS:
-            return bounded
     except BaseException:
         pass
     return dict(_INSPECTION_FAILURE_FALLBACK)

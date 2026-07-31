@@ -118,6 +118,43 @@ def test_navigation_prompt_distinguishes_new_stage_gate_from_existing_products()
     assert "the runtime owns the state transition" in prompt
 
 
+def test_navigation_prompt_keeps_trajectory_review_in_its_narrow_phase():
+    prompt = navigation_agent_prompt()
+
+    assert "target is `trajectory_review`" in prompt
+    assert "bound Annotation Job facts once" in prompt
+    assert "submitting exactly one complete trajectory-review Plan" in prompt
+    assert "Do not inspect raw metadata, topics" in prompt
+    assert "do not submit it again" in prompt
+    assert "execute the current `open_trajectory_fix_workbench` step" in prompt
+
+
+def test_navigation_prompt_keeps_explicit_postprocessing_in_finish_phase():
+    prompt = navigation_agent_prompt()
+
+    assert "`postprocessing` or `postprocessing_and_fix` task" in prompt
+    assert "Annotation Job, artifact, Runtime, calibration, localization" in prompt
+    assert "Raw metadata, sensor discovery, and topic discovery" in prompt
+    assert "submit exactly one complete finish-processing Plan" in prompt
+    assert "top-level `plan_id` and" in prompt
+    assert "`run_annotation_postprocessing_workflow` followed by" in prompt
+    assert "Never add\n  legacy gridmap" in prompt
+    assert "do not resubmit an accepted Plan" in prompt
+    assert "when the workflow reports background execution" in prompt
+
+
+def test_navigation_prompt_stops_on_operator_recovery_without_internal_leaks():
+    prompt = navigation_agent_prompt()
+
+    assert "`next_action=operator_recovery_required`" in prompt
+    assert "do not retry, replan, inspect unrelated state" in prompt
+    assert "Give exactly one" in prompt
+    assert "processing did\n  not start" in prompt
+    assert "Do not guess a cause" in prompt
+    assert "Plan/step/action" in prompt
+    assert "paths, database identifiers" in prompt
+
+
 def test_router_start_schema_omits_dry_run_and_model_restatements():
     schema = StartNavigationDataTaskV1Tool.input_schema
 
@@ -242,7 +279,7 @@ async def test_bootstrap_injects_navigation_guidance_once_and_never_into_router(
     assert guidance_marker not in router_prompt
     assert navigation_prompt.count(guidance_marker) == 1
     assert navigation_prompt.count("## Product dependency map") == 1
-    assert navigation_prompt.count("## Four bounded few-shots") == 1
+    assert navigation_prompt.count("## Six bounded few-shots") == 1
     assert navigation_prompt.count("### Few-shot 4: invalid complete Plan") == 1
 
 

@@ -1,16 +1,59 @@
 import type { ReactNode } from "react";
-import { useCallback, useEffect, useRef, useState } from "react";
+import { lazy, Suspense, useCallback, useEffect, useRef, useState } from "react";
+import { Navigate, Route, Routes, useLocation } from "react-router-dom";
 
 import { ConsoleHeader } from "../components/console/ConsoleHeader";
 import { ConsoleSidebar } from "../components/console/ConsoleSidebar";
 import { ConsoleToast } from "../components/console/ConsoleToast";
+import { AnnotationDomainEventBridge } from "../features/annotation/AnnotationDomainEventBridge";
 import type { ConsolePageId, StatusTone } from "../features/console/consoleTypes";
-import { AgentWorkflowPage } from "../features/console/pages/AgentWorkflowPage";
-import { AnnotationPage } from "../features/console/pages/AnnotationPage";
-import { DataManagementPage } from "../features/console/pages/DataManagementPage";
-import { DashboardPage } from "../features/console/pages/DashboardPage";
-import { ModelIterationPage } from "../features/console/pages/ModelIterationPage";
-import { SimulationPage } from "../features/console/pages/SimulationPage";
+import { cn } from "../lib/utils";
+
+const AgentWorkflowPage = lazy(() =>
+  import("../features/console/pages/AgentWorkflowPage").then(({ AgentWorkflowPage }) => ({
+    default: AgentWorkflowPage,
+  })),
+);
+const AnnotationPage = lazy(() =>
+  import("../features/console/pages/AnnotationPage").then(({ AnnotationPage }) => ({
+    default: AnnotationPage,
+  })),
+);
+const AnnotationWorkspaceLayout = lazy(() =>
+  import("../features/annotation/AnnotationWorkspaceLayout").then(
+    ({ AnnotationWorkspaceLayout }) => ({ default: AnnotationWorkspaceLayout }),
+  ),
+);
+const AnnotationReviewsPage = lazy(() =>
+  import("../features/annotation/AnnotationReviewsPage").then(
+    ({ AnnotationReviewsPage }) => ({ default: AnnotationReviewsPage }),
+  ),
+);
+const TrajectoryFixPage = lazy(() =>
+  import("../features/annotation/TrajectoryFixPage").then(
+    ({ TrajectoryFixPage }) => ({ default: TrajectoryFixPage }),
+  ),
+);
+const DataManagementPage = lazy(() =>
+  import("../features/console/pages/DataManagementPage").then(({ DataManagementPage }) => ({
+    default: DataManagementPage,
+  })),
+);
+const DashboardPage = lazy(() =>
+  import("../features/console/pages/DashboardPage").then(({ DashboardPage }) => ({
+    default: DashboardPage,
+  })),
+);
+const ModelIterationPage = lazy(() =>
+  import("../features/console/pages/ModelIterationPage").then(({ ModelIterationPage }) => ({
+    default: ModelIterationPage,
+  })),
+);
+const SimulationPage = lazy(() =>
+  import("../features/console/pages/SimulationPage").then(({ SimulationPage }) => ({
+    default: SimulationPage,
+  })),
+);
 
 type AppShellProps = {
   children?: ReactNode;
@@ -18,65 +61,44 @@ type AppShellProps = {
 
 type ToastState = { message: string; tone: StatusTone } | null;
 
-const pageCopy: Record<ConsolePageId, { title: string; text: string }> = {
-  dashboard: {
-    title: "闭环仪表盘",
-    text: "汇总数据闭环、Agent 协作、模型迭代与仿真验证的核心状态。完整仪表盘将在后续任务接入。",
-  },
-  agent: {
-    title: "Agent 工作流",
-    text: "编排数据源、预处理、自动标注、质量检查、训练和评估节点。当前为迁移壳层占位。",
-  },
-  data: {
-    title: "数据管理",
-    text: "管理多模态数据批次、质量门禁和解锁状态。完整数据页面将在后续任务替换。",
-  },
-  annotate: {
-    title: "自动标注",
-    text: "承载自动标注任务、模型输出和人工复核入口。当前仅保留页面占位。",
-  },
-  model: {
-    title: "模型迭代",
-    text: "跟踪训练版本、部署状态和指标曲线。后续任务会接入真实模型迭代内容。",
-  },
-  simulation: {
-    title: "测试/仿真",
-    text: "展示测试用例、仿真报告和发布前验证结果。当前为最小可导航占位。",
-  },
+const CONSOLE_SIDEBAR_STORAGE_KEY = "vla-console-sidebar";
+
+function readInitialSidebarCollapsed(): boolean {
+  if (typeof window === "undefined") {
+    return false;
+  }
+
+  try {
+    return window.localStorage.getItem(CONSOLE_SIDEBAR_STORAGE_KEY) === "collapsed";
+  } catch {
+    return false;
+  }
+}
+
+const pageCopy: Record<ConsolePageId, { title: string }> = {
+  dashboard: { title: "闭环仪表盘" },
+  agent: { title: "Agent 工作流" },
+  data: { title: "数据管理" },
+  annotate: { title: "自动标注" },
+  model: { title: "模型迭代" },
+  simulation: { title: "测试/仿真" },
 };
 
-function PagePlaceholder({ pageId, onRequestToast }: { pageId: ConsolePageId; onRequestToast: () => void }) {
-  const page = pageCopy[pageId];
-
+function RouteLoadingFallback() {
   return (
-    <section className="mx-auto max-w-7xl px-4 py-6 md:px-6">
-      <div className="grid min-h-[calc(100vh-13rem)] gap-4 lg:grid-cols-[1fr_20rem]">
-        <div className="rounded-lg border border-console-line bg-console-panel p-5 shadow-sm">
-          <div className="mb-4 h-1.5 w-28 rounded-full bg-console-cyan/30" />
-          <p className="text-xs font-medium uppercase tracking-[0.12em] text-console-muted">Console route</p>
-          <p className="mt-3 max-w-3xl text-sm leading-6 text-console-muted">{page.text}</p>
-          <button
-            type="button"
-            className="mt-5 rounded-lg border border-console-line bg-console-panel2 px-3 py-2 text-sm text-console-text transition hover:border-console-cyan/45 hover:text-console-cyan focus:outline-none focus:ring-2 focus:ring-console-cyan"
-            onClick={onRequestToast}
-          >
-            查看接入状态
-          </button>
-        </div>
-
-        <aside className="rounded-lg border border-console-line bg-console-panel p-4 shadow-sm">
-          <h2 className="text-sm font-semibold">迁移状态</h2>
-          <p className="mt-3 text-sm leading-6 text-console-muted">
-            壳层导航、顶部栏、背景视觉和浮层入口已在 React 中就位。页面主体保持轻量占位，等待后续任务迁入完整内容。
-          </p>
-        </aside>
-      </div>
-    </section>
+    <div
+      aria-live="polite"
+      className="flex min-h-[50vh] items-center justify-center px-6 text-sm text-console-muted"
+      role="status"
+    >
+      正在加载页面…
+    </div>
   );
 }
 
 export function AppShell({ children }: AppShellProps) {
-  const [activePage, setActivePage] = useState<ConsolePageId>("dashboard");
+  const location = useLocation();
+  const [sidebarCollapsed, setSidebarCollapsed] = useState(readInitialSidebarCollapsed);
   const [toast, setToast] = useState<ToastState>(null);
   const toastTimeoutRef = useRef<number | null>(null);
 
@@ -100,34 +122,62 @@ export function AppShell({ children }: AppShellProps) {
     };
   }, []);
 
-  const activeTitle = pageCopy[activePage].title;
-
-  const renderActivePage = () => {
-    switch (activePage) {
-      case "dashboard":
-        return <DashboardPage />;
-      case "agent":
-        return <AgentWorkflowPage onPlaceholderAction={showPlaceholderToast} />;
-      case "data":
-        return <DataManagementPage onPlaceholderAction={showPlaceholderToast} />;
-      case "annotate":
-        return <AnnotationPage onPlaceholderAction={showPlaceholderToast} />;
-      case "model":
-        return <ModelIterationPage onPlaceholderAction={showPlaceholderToast} />;
-      case "simulation":
-        return <SimulationPage onPlaceholderAction={showPlaceholderToast} />;
-      default:
-        return <PagePlaceholder pageId={activePage} onRequestToast={() => showPlaceholderToast()} />;
+  useEffect(() => {
+    try {
+      window.localStorage.setItem(CONSOLE_SIDEBAR_STORAGE_KEY, sidebarCollapsed ? "collapsed" : "expanded");
+    } catch {
+      // Storage can be unavailable in hardened or private browser contexts.
     }
-  };
+  }, [sidebarCollapsed]);
+
+  const activePage: ConsolePageId = location.pathname.startsWith("/annotation")
+    ? "annotate"
+    : location.pathname.startsWith("/agent")
+      ? "agent"
+      : location.pathname.startsWith("/data")
+        ? "data"
+        : location.pathname.startsWith("/model")
+          ? "model"
+          : location.pathname.startsWith("/simulation")
+            ? "simulation"
+            : "dashboard";
+  const activeTitle = pageCopy[activePage].title;
 
   return (
     <div className="min-h-screen bg-console-bg text-console-text">
-      <ConsoleSidebar activePage={activePage} onChange={setActivePage} />
+      <AnnotationDomainEventBridge />
+      <ConsoleSidebar
+        activePage={activePage}
+        collapsed={sidebarCollapsed}
+        onCollapsedChange={setSidebarCollapsed}
+      />
 
-      <main className="relative z-10 pt-28 md:ml-64 md:pt-0">
+      <main
+        data-testid="console-main"
+        className={cn(
+          "relative z-10 pt-28 md:pt-0 md:transition-[margin-left] md:duration-200",
+          sidebarCollapsed ? "md:ml-20" : "md:ml-64",
+        )}
+      >
         <ConsoleHeader title={activeTitle} />
-        {renderActivePage()}
+        <Suspense fallback={<RouteLoadingFallback />}>
+          <Routes>
+            <Route path="/" element={<DashboardPage />} />
+            <Route path="/agent" element={<AgentWorkflowPage onPlaceholderAction={showPlaceholderToast} />} />
+            <Route path="/data" element={<DataManagementPage onPlaceholderAction={showPlaceholderToast} />} />
+            <Route path="/annotation" element={<AnnotationWorkspaceLayout />}>
+              <Route index element={<Navigate to="/annotation/jobs" replace />} />
+              <Route path="jobs" element={<AnnotationPage />} />
+              <Route path="jobs/:jobRef" element={<AnnotationPage />} />
+              <Route path="jobs/:jobRef/segments/:segmentRef" element={<AnnotationPage />} />
+              <Route path="reviews" element={<AnnotationReviewsPage />} />
+              <Route path="reviews/:reviewRef" element={<TrajectoryFixPage />} />
+            </Route>
+            <Route path="/model" element={<ModelIterationPage onPlaceholderAction={showPlaceholderToast} />} />
+            <Route path="/simulation" element={<SimulationPage onPlaceholderAction={showPlaceholderToast} />} />
+            <Route path="*" element={<Navigate to="/" replace />} />
+          </Routes>
+        </Suspense>
       </main>
 
       {children}

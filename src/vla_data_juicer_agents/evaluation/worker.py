@@ -105,10 +105,6 @@ async def _execute(request: dict[str, Any]) -> CaseResult:
         AgentScopeRuntimeConfig.from_env(workspace_root=workspace_root),
         user_id=f"eval-{case.id}-{attempt}",
     )
-    if case.entrypoint != "router":
-        raise ValueError(
-            f"the first evaluation milestone only supports router cases, got {case.entrypoint!r}",
-        )
     messages = [turn.content for turn in case.conversation]
     started = time.monotonic()
     web_session_id = f"eval-{case.id}-{attempt}"
@@ -120,6 +116,7 @@ async def _execute(request: dict[str, Any]) -> CaseResult:
             if case.runtime_setup is not None
             else None
         ),
+        entrypoint=case.entrypoint,
     )
     try:
         host_result = await host.run(messages, web_session_id=web_session_id)
@@ -127,7 +124,10 @@ async def _execute(request: dict[str, Any]) -> CaseResult:
         duration_ms = max(0, round((time.monotonic() - started) * 1000))
         observation = _to_observation(
             host.snapshot(
-                session_id=f"{web_session_id}__{config.main_router_agent_id}",
+                session_id=(
+                    f"{web_session_id}__"
+                    f"{config.main_router_agent_id if case.entrypoint == 'router' else config.navigation_agent_id}"
+                ),
             ),
             duration_ms=duration_ms,
         )

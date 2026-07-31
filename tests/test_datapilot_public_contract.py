@@ -522,3 +522,17 @@ def test_final_sanitizer_preserves_counts_but_removes_paths_credentials_and_ids(
     assert "super-secret" not in text
     assert "abcdefgh" not in text
     assert "0123456789abcdef" not in text
+
+
+def test_final_sanitizer_redacts_plan_step_and_action_tokens() -> None:
+    plan_ref = "nav_plan_" + "a" * 32
+    text = sanitize_final_text(
+        "后处理未启动，请检查 "
+        f"{plan_ref}、postprocess_step_1 和 "
+        "run_annotation_postprocessing_workflow。"
+    )
+
+    assert plan_ref not in text
+    assert "postprocess_step_1" not in text
+    assert "run_annotation_postprocessing_workflow" not in text
+    assert "后处理未启动" in text

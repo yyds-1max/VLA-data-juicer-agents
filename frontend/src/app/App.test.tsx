@@ -15,6 +15,7 @@ import {
 import type { SessionDetail } from "../api/types";
 import { Composer } from "../components/datapilot/Composer";
 import { MessageList } from "../components/datapilot/MessageList";
+import { writeSessionRecovery } from "../components/datapilot/sessionRecovery";
 import { resetNavigationDatasetSummaryCache } from "../features/console/navigationDatasetSummaryCache";
 import { createEmptyRunState } from "../store/eventReducer";
 import { datapilotStore } from "../store/datapilotStore";
@@ -107,7 +108,7 @@ function mockScrollableElement(element: HTMLElement) {
 }
 
 async function renderAppWithDashboardSettled() {
-  const result = render(<App />);
+  const result = render(<App routerMode="declarative" />);
 
   await waitFor(() => expect(apiMocks.getNavigationDatasetSummary).toHaveBeenCalled());
   await waitFor(() => expect(screen.getByText("3.5 秒")).toBeInTheDocument());
@@ -116,6 +117,9 @@ async function renderAppWithDashboardSettled() {
 }
 
 beforeEach(() => {
+  window.history.replaceState({}, "", "/");
+  window.localStorage.clear();
+  window.sessionStorage.clear();
   vi.clearAllMocks();
   resetNavigationDatasetSummaryCache();
   Object.defineProperty(window, "innerWidth", { configurable: true, writable: true, value: 1280 });
@@ -231,12 +235,12 @@ beforeEach(() => {
     mode: "draft_new_session",
     currentSessionId: null,
     previousActiveSessionId: null,
-    knownRunningSessionId: null,
     sessions: [],
     messages: [],
     turns: [],
     tasks: [],
     pendingInteraction: null,
+    lastEventSeq: 0,
     run: createEmptyRunState(),
     pendingInvocation: null,
     floatingOffset: { x: 0, y: 0 },
@@ -287,10 +291,56 @@ test("sidebar navigation switches console pages", async () => {
   await renderAppWithDashboardSettled();
 
   fireEvent.click(screen.getByRole("button", { name: "Agent 工作流" }));
-  expect(screen.getByRole("heading", { name: "Agent 工作流" })).toBeVisible();
+  expect(await screen.findByRole("heading", { name: "Agent 工作流" })).toBeVisible();
 
   fireEvent.click(screen.getByRole("button", { name: "测试/仿真" }));
-  expect(screen.getByRole("heading", { name: "测试/仿真" })).toBeVisible();
+  expect(await screen.findByRole("heading", { name: "测试/仿真" })).toBeVisible();
+});
+
+test("direct page deep links keep the console shell eager while the page loads", async () => {
+  window.history.replaceState({}, "", "/model");
+
+  render(<App routerMode="declarative" />);
+
+  expect(screen.getByTestId("console-sidebar")).toBeVisible();
+  expect(screen.getByRole("button", { name: "Open DataPilot" })).toBeVisible();
+  expect(screen.getByRole("button", { name: "模型迭代" })).toHaveAttribute("aria-current", "page");
+  expect(window.location.pathname).toBe("/model");
+  expect(await screen.findByText("当前部署")).toBeVisible();
+});
+
+test("desktop sidebar collapse follows navigation and persists across remounts", async () => {
+  const { unmount } = await renderAppWithDashboardSettled();
+
+  const sidebar = screen.getByTestId("console-sidebar");
+  const main = screen.getByTestId("console-main");
+  const collapseButton = screen.getByRole("button", { name: "收起侧边栏" });
+  expect(collapseButton.parentElement).toHaveClass("hidden", "md:flex");
+  expect(collapseButton.className).not.toContain("focus:ring");
+  expect(collapseButton.className).not.toContain("ring-console-cyan");
+
+  fireEvent.click(collapseButton);
+
+  expect(sidebar).toHaveAttribute("data-collapsed", "true");
+  expect(sidebar).toHaveClass("md:w-20");
+  expect(main).toHaveClass("md:ml-20");
+  expect(window.localStorage.getItem("vla-console-sidebar")).toBe("collapsed");
+  expect(screen.getByText("WISEXPLORE").parentElement).toHaveClass("md:hidden");
+  expect(screen.getByRole("button", { name: "闭环仪表盘" }).querySelector("span")).toHaveClass("md:sr-only");
+  expect(screen.getByText("智瀚星途数据处理系统").parentElement).toHaveClass("md:hidden");
+
+  fireEvent.click(screen.getByRole("button", { name: "Agent 工作流" }));
+  expect(await screen.findByRole("heading", { name: "Agent 工作流" })).toBeVisible();
+  expect(sidebar).toHaveAttribute("data-collapsed", "true");
+
+  unmount();
+  render(<App routerMode="declarative" />);
+
+  expect(screen.getByTestId("console-sidebar")).toHaveAttribute("data-collapsed", "true");
+  fireEvent.click(screen.getByRole("button", { name: "展开侧边栏" }));
+  expect(screen.getByTestId("console-sidebar")).toHaveAttribute("data-collapsed", "false");
+  expect(screen.getByTestId("console-main")).toHaveClass("md:ml-64");
+  expect(window.localStorage.getItem("vla-console-sidebar")).toBe("expanded");
 });
 
 test("data management renders navigation dataset date and clip details", async () => {
@@ -303,7 +353,7 @@ test("data management renders navigation dataset date and clip details", async (
   expect(screen.getByText("原始 clip")).toBeVisible();
   expect(screen.getByText("已同步 clip")).toBeVisible();
   expect(screen.getByTestId("navigation-summary-strip")).toHaveClass("bg-transparent");
-  expect(screen.getByTestId("navigation-summary-strip")).not.toHaveClass("rounded-lg", "border", "shadow-sm");
+  expect(screen.getByTestId("navigation-summary-strip")).not.toHaveClass("rounded-lg", "border", "shadow-xs");
   expect(screen.getByTestId("navigation-summary-strip")).toHaveTextContent("总采集时长3.5 秒");
   expect(screen.getByTestId("navigation-summary-strip")).toHaveTextContent("同步图像帧3");
   expect(screen.getByTestId("navigation-process-overview")).toHaveTextContent("raw_data");
@@ -408,35 +458,41 @@ test("data management shortcut claims a double click only once", async () => {
   await waitFor(() => expect(screen.queryByRole("dialog", { name: "交给 DataPilot" })).not.toBeInTheDocument());
 });
 
-test("data management shortcut opens DataPilot but does not submit while its known task is running", async () => {
-  const runningDetail = sessionDetailFixture({
-    id: "session-running",
-    title: "Running session",
-    created_at: "2026-06-26T00:00:00Z",
-    updated_at: "2026-06-26T00:01:00Z",
-    status: "active" as const,
-    messages: [],
-    turns: [
-      {
-        id: "turn-running",
-        web_session_id: "session-running",
-        origin: "user" as const,
-        status: "running" as const,
-        started_at: "2026-06-26T00:01:00Z",
-        finished_at: null,
-        final_message_id: null,
-      },
-    ],
+test("data management shortcut creates and submits despite another session waiting for work", async () => {
+  const oldSession = sessionDetailFixture({
+    id: "session-old",
+    title: "Waiting session",
+    status: "active",
+    turns: [{
+      id: "turn-waiting",
+      web_session_id: "session-old",
+      origin: "user",
+      status: "waiting",
+      started_at: "2026-06-26T00:01:00Z",
+      finished_at: null,
+      final_message_id: null,
+    }],
+    tasks: [{
+      task_ref: "DP-OLD",
+      domain: "navigation",
+      dataset_date: "20270605",
+      selection: { kind: "all_clips" },
+      scene_mode: null,
+      status: "waiting_user",
+      phase: "等待首帧标注",
+      state_revision: 3,
+      started_at: "2026-06-26T00:00:00Z",
+      updated_at: "2026-06-26T00:01:00Z",
+    }],
   });
-  apiMocks.getSession.mockResolvedValue(runningDetail);
   datapilotStore.setState({
     open: false,
     mode: "active_session",
-    currentSessionId: "session-running",
+    currentSessionId: "session-old",
     previousActiveSessionId: null,
-    knownRunningSessionId: "session-running",
-    sessions: [runningDetail],
-    turns: runningDetail.turns,
+    sessions: [oldSession],
+    turns: oldSession.turns,
+    tasks: oldSession.tasks,
     run: { ...createEmptyRunState(), running: true },
   });
 
@@ -447,97 +503,13 @@ test("data management shortcut opens DataPilot but does not submit while its kno
   fireEvent.click(screen.getByRole("checkbox", { name: "全选" }));
   fireEvent.click(screen.getByRole("button", { name: "确定" }));
 
-  await waitFor(() => expect(screen.getAllByText("当前任务正在执行，请等待完成或停止后再发起。").length).toBeGreaterThan(0));
-  expect(apiMocks.createSession).not.toHaveBeenCalled();
-  expect(apiMocks.submitTurn).not.toHaveBeenCalled();
-  expect(datapilotStore.getState().open).toBe(true);
-  expect(screen.getByRole("button", { name: "确定" })).toBeEnabled();
-});
-
-test("data management shortcut still blocks a running session after viewing history", async () => {
-  const runningDetail = sessionDetailFixture({
-    id: "session-running",
-    title: "Running session",
-    created_at: "2026-06-26T00:00:00Z",
-    updated_at: "2026-06-26T00:01:00Z",
-    status: "active" as const,
-    messages: [],
-    turns: [
-      {
-        id: "turn-running",
-        web_session_id: "session-running",
-        origin: "user" as const,
-        status: "running" as const,
-        started_at: "2026-06-26T00:01:00Z",
-        finished_at: null,
-        final_message_id: null,
-      },
-    ],
-  });
-  apiMocks.getSession.mockResolvedValue(runningDetail);
-  datapilotStore.setState({
-    open: false,
-    mode: "history_session",
-    currentSessionId: "session-history",
-    previousActiveSessionId: null,
-    knownRunningSessionId: "session-running",
-    sessions: [
-      runningDetail,
-      {
-        id: "session-history",
-        title: "History",
-        created_at: "2026-06-25T00:00:00Z",
-        updated_at: "2026-06-25T00:01:00Z",
-        status: "historical",
-        contract_version: 1,
-      },
-    ],
-    turns: [],
-    run: createEmptyRunState(),
-  });
-
-  await renderAppWithDashboardSettled();
-  fireEvent.click(screen.getByRole("button", { name: "数据管理" }));
-  fireEvent.click(await screen.findByRole("button", { name: "交给 DataPilot" }));
-  chooseNavigationDate("20270515");
-  fireEvent.click(screen.getByRole("checkbox", { name: "全选" }));
-  fireEvent.click(screen.getByRole("button", { name: "确定" }));
-
-  await waitFor(() => expect(screen.getAllByText("当前任务正在执行，请等待完成或停止后再发起。").length).toBeGreaterThan(0));
-  expect(apiMocks.getSession).toHaveBeenCalledWith("session-running");
-  expect(apiMocks.createSession).not.toHaveBeenCalled();
-  expect(apiMocks.submitTurn).not.toHaveBeenCalled();
-});
-
-test("data management shortcut fails closed when a known running session cannot be refreshed", async () => {
-  const consoleError = vi.spyOn(console, "error").mockImplementation(() => undefined);
-  apiMocks.getSession.mockRejectedValue(new Error("network unavailable"));
-  datapilotStore.setState({
-    open: false,
-    mode: "draft_new_session",
-    currentSessionId: null,
-    previousActiveSessionId: "session-running",
-    knownRunningSessionId: "session-running",
-    sessions: [],
-    turns: [],
-    run: createEmptyRunState(),
-  });
-
-  await renderAppWithDashboardSettled();
-  fireEvent.click(screen.getByRole("button", { name: "数据管理" }));
-  fireEvent.click(await screen.findByRole("button", { name: "交给 DataPilot" }));
-  chooseNavigationDate("20270515");
-  fireEvent.click(screen.getByRole("checkbox", { name: "全选" }));
-  fireEvent.click(screen.getByRole("button", { name: "确定" }));
-
-  await waitFor(() => expect(screen.getAllByText("当前任务正在执行，请等待完成或停止后再发起。").length).toBeGreaterThan(0));
-  expect(apiMocks.createSession).not.toHaveBeenCalled();
-  expect(apiMocks.submitTurn).not.toHaveBeenCalled();
-  expect(consoleError).toHaveBeenCalledWith(
-    "Failed to refresh DataPilot before shortcut submission",
-    expect.any(Error),
-  );
-  consoleError.mockRestore();
+  await waitFor(() => expect(apiMocks.createSession).toHaveBeenCalledTimes(1));
+  await waitFor(() => expect(apiMocks.submitTurn).toHaveBeenCalledWith(
+    "session-created",
+    expect.stringContaining("请处理导航数据。"),
+    expect.stringMatching(/^navigation-/),
+  ));
+  expect(datapilotStore.getState().currentSessionId).toBe("session-created");
 });
 
 test("data management shortcut retries submit in the session it already created", async () => {
@@ -799,7 +771,7 @@ test("navigation dataset summary is reused while switching console pages", async
   expect(apiMocks.getNavigationDatasetSummary).toHaveBeenCalledTimes(1);
 
   fireEvent.click(screen.getByRole("button", { name: "自动标注" }));
-  expect(screen.getByText("视觉检测")).toBeVisible();
+  expect(await screen.findByText("自动标注任务")).toBeVisible();
 
   fireEvent.click(screen.getByRole("button", { name: "闭环仪表盘" }));
   expect(await screen.findByText("3.5 秒")).toBeVisible();
@@ -911,25 +883,85 @@ test("data management image drawer ignores listing that resolves after close", a
   expect(screen.queryByText("late.jpg")).not.toBeInTheDocument();
 });
 
-test("annotation page switches pipeline results and review views", async () => {
+test("annotation page exposes the M2 DataPilot-owned processing entry", async () => {
   await renderAppWithDashboardSettled();
 
   fireEvent.click(screen.getByRole("button", { name: "自动标注" }));
-  expect(screen.getByText("视觉检测")).toBeVisible();
+  expect(await screen.findByText("自动标注任务")).toBeVisible();
+  expect(screen.getByText(/DataPilot 负责任务调查、规划和后处理/)).toBeVisible();
+  expect(screen.getByRole("button", { name: "交给 DataPilot 处理" })).toBeVisible();
+  expect(screen.queryByRole("button", { name: "新建任务" })).not.toBeInTheDocument();
+  expect(screen.queryByText("视觉检测")).not.toBeInTheDocument();
+  expect(window.location.pathname).toBe("/annotation/jobs");
+  expect(await screen.findByText("当前处理环境尚未通过预检")).toBeVisible();
+});
 
-  fireEvent.click(screen.getByRole("tab", { name: "标注结果" }));
-  expect(screen.getByText("ANN-82401")).toBeVisible();
+test("annotation shortcut submits a new session despite another session's active task", async () => {
+  const oldSession = sessionDetailFixture({
+    id: "session-old",
+    title: "Active session",
+    status: "active",
+    tasks: [{
+      task_ref: "DP-OLD",
+      domain: "navigation",
+      dataset_date: "20270605",
+      selection: { kind: "all_clips" },
+      scene_mode: null,
+      status: "active",
+      phase: "拆解和同步",
+      state_revision: 2,
+      started_at: "2026-06-26T00:00:00Z",
+      updated_at: "2026-06-26T00:01:00Z",
+    }],
+  });
+  datapilotStore.setState({
+    open: false,
+    mode: "active_session",
+    currentSessionId: "session-old",
+    previousActiveSessionId: null,
+    sessions: [oldSession],
+    tasks: oldSession.tasks,
+    turns: [],
+    run: createEmptyRunState(),
+  });
 
-  fireEvent.click(screen.getByRole("tab", { name: "人工复核" }));
-  expect(screen.getByText("待复核样本")).toBeVisible();
+  await renderAppWithDashboardSettled();
+  fireEvent.click(screen.getByRole("button", { name: "自动标注" }));
+  fireEvent.click(await screen.findByRole("button", { name: "交给 DataPilot 处理" }));
+  chooseNavigationDate("20270515");
+  fireEvent.click(screen.getByRole("checkbox", { name: "clip_a" }));
+  fireEvent.click(screen.getByRole("button", { name: "确定" }));
+
+  const message = [
+    "请对选中的导航数据执行自动标注并完成后处理。",
+    "",
+    "数据日期：20270515",
+    "指定 clips：",
+    "- clip_a",
+  ].join("\n");
+  await waitFor(() => expect(apiMocks.createSession).toHaveBeenCalledWith(
+    message,
+    "annotation_processing_shortcut",
+    {
+      kind: "navigation_dataset_selection_v1",
+      dataset_date: "20270515",
+      selection: { kind: "selected_clips", clips: ["clip_a"] },
+    },
+  ));
+  await waitFor(() => expect(apiMocks.submitTurn).toHaveBeenCalledWith(
+    "session-created",
+    message,
+    expect.stringMatching(/^annotation-/),
+  ));
+  expect(screen.queryByLabelText("当天处理标定")).not.toBeInTheDocument();
 });
 
 test("model iteration page renders versions training and compare tabs", async () => {
   await renderAppWithDashboardSettled();
 
   fireEvent.click(screen.getByRole("button", { name: "模型迭代" }));
+  expect(await screen.findByText("当前部署")).toBeVisible();
   expect(screen.getByText("v47")).toBeVisible();
-  expect(screen.getByText("当前部署")).toBeVisible();
 
   fireEvent.click(screen.getByRole("tab", { name: "训练监控" }));
   expect(screen.getByText("训练损失曲线")).toBeVisible();
@@ -943,8 +975,9 @@ test("agent workflow page selects nodes and keeps execute action placeholder-onl
   await renderAppWithDashboardSettled();
 
   fireEvent.click(screen.getByRole("button", { name: "Agent 工作流" }));
-  expect(screen.getByText("节点库")).toBeVisible();
+  expect(await screen.findByText("节点库")).toBeVisible();
   expect(screen.getByText("工作流画布")).toBeVisible();
+  expect(screen.getByTestId("agent-workflow-grid")).toHaveClass("min-w-0");
   expect(screen.getByRole("button", { name: "数据源接入" })).toHaveAttribute("aria-pressed", "true");
   expect(screen.getByRole("button", { name: "画布节点 数据源接入" })).toHaveAttribute("aria-pressed", "true");
 
@@ -965,7 +998,7 @@ test("simulation page switches config running and results views", async () => {
   await renderAppWithDashboardSettled();
 
   fireEvent.click(screen.getByRole("button", { name: "测试/仿真" }));
-  expect(screen.getByText("仿真场景配置")).toBeVisible();
+  expect(await screen.findByText("仿真场景配置")).toBeVisible();
 
   fireEvent.click(screen.getByRole("tab", { name: "运行监控" }));
   expect(screen.getByText("实时任务日志")).toBeVisible();
@@ -978,7 +1011,7 @@ test("DataPilot opens only from the floating button after console migration", as
   await renderAppWithDashboardSettled();
 
   fireEvent.click(screen.getByRole("button", { name: "测试/仿真" }));
-  fireEvent.click(screen.getByRole("button", { name: "启动仿真" }));
+  fireEvent.click(await screen.findByRole("button", { name: "启动仿真" }));
   expect(screen.queryByRole("dialog", { name: "DataPilot" })).not.toBeInTheDocument();
 
   fireEvent.click(screen.getByRole("button", { name: "Open DataPilot" }));
@@ -992,7 +1025,7 @@ test("DataPilot window remains above the console content", async () => {
 
   const dialog = screen.getByRole("dialog", { name: "DataPilot" });
   expect(dialog.className).toContain("fixed");
-  expect(dialog.className).toContain("z-[80]");
+  expect(dialog.className).toContain("z-80");
 });
 
 test("DataPilot window can be dragged from its title bar", async () => {
@@ -1161,6 +1194,59 @@ test("opens DataPilot draft window from the floating button", async () => {
   expect(screen.queryByText("VLA 主智能体")).not.toBeInTheDocument();
 });
 
+test("restores the current active session after a same-tab page reload", async () => {
+  writeSessionRecovery({
+    sessionId: "session-restore",
+    mode: "active_session",
+  });
+  apiMocks.getSession.mockResolvedValue(sessionDetailFixture({
+    id: "session-restore",
+    title: "恢复中的任务",
+    created_at: "2026-06-26T01:00:00Z",
+    updated_at: "2026-06-26T01:01:00Z",
+    status: "active",
+    messages: [{
+      id: "message-restore",
+      session_id: "session-restore",
+      role: "assistant",
+      content: "请确认标定参数",
+      created_at: "2026-06-26T01:01:00Z",
+      turn_id: null,
+    }],
+    pending_interaction: {
+      interaction_id: "interaction-restore",
+      task_ref: "NAV-RESTORE",
+      kind: "calibration_confirmation",
+      blocking: true,
+      risk: "medium",
+      title: "确认当天处理标定",
+      summary: "确认后继续执行当前任务。",
+      options: [
+        { option_id: "confirm", label: "确认并继续", tone: "primary" },
+        { option_id: "stop", label: "暂不处理" },
+      ],
+      interaction_revision: 2,
+      expected_task_revision: 5,
+      expires_at: null,
+    },
+  }));
+
+  await renderAppWithDashboardSettled();
+  await waitFor(() => expect(datapilotStore.getState().currentSessionId).toBe("session-restore"));
+
+  fireEvent.click(screen.getByRole("button", { name: "Open DataPilot" }));
+
+  expect(await screen.findByText("请确认标定参数")).toBeVisible();
+  expect(screen.getByRole("heading", { name: "确认当天处理标定" })).toBeVisible();
+  expect(screen.getByRole("button", { name: "确认并继续" })).toBeVisible();
+  expect(apiMocks.getSession).toHaveBeenCalledWith("session-restore");
+  expect(apiMocks.openSessionEvents).toHaveBeenCalledWith(
+    "session-restore",
+    expect.any(Function),
+    0,
+  );
+});
+
 test("active session renders messages and does not render draft start content", async () => {
   datapilotStore.setState({
     open: true,
@@ -1255,7 +1341,7 @@ test("closing the DataPilot window closes the active event stream", async () => 
     target: { value: "继续清洗" },
   });
   fireEvent.click(screen.getByRole("button", { name: "Send message" }));
-  await waitFor(() => expect(apiMocks.openSessionEvents).toHaveBeenCalledWith("session-1", expect.any(Function)));
+  await waitFor(() => expect(apiMocks.openSessionEvents).toHaveBeenCalledWith("session-1", expect.any(Function), 0));
 
   fireEvent.click(screen.getByRole("button", { name: "Close DataPilot" }));
 
@@ -1317,7 +1403,7 @@ test("new session closes the active event stream", async () => {
     target: { value: "继续清洗" },
   });
   fireEvent.click(screen.getByRole("button", { name: "Send message" }));
-  await waitFor(() => expect(apiMocks.openSessionEvents).toHaveBeenCalledWith("session-1", expect.any(Function)));
+  await waitFor(() => expect(apiMocks.openSessionEvents).toHaveBeenCalledWith("session-1", expect.any(Function), 0));
 
   fireEvent.click(screen.getByRole("button", { name: "New session" }));
 
@@ -1335,7 +1421,7 @@ test("submitting the first draft message creates a session, opens events, submit
 
   expect(apiMocks.createSession).toHaveBeenCalledWith("清洗 VLA 数据");
   await waitFor(() => expect(apiMocks.submitTurn).toHaveBeenCalledWith("session-created", "清洗 VLA 数据"));
-  expect(apiMocks.openSessionEvents).toHaveBeenCalledWith("session-created", expect.any(Function));
+  expect(apiMocks.openSessionEvents).toHaveBeenCalledWith("session-created", expect.any(Function), 0);
   expect(datapilotStore.getState().mode).toBe("active_session");
   expect(screen.getByText("清洗 VLA 数据")).toBeVisible();
   expect(screen.queryByText("开始一个任务")).not.toBeInTheDocument();
@@ -1546,13 +1632,13 @@ test("reopening an active session reopens the event stream before another turn i
   });
 
   await renderAppWithDashboardSettled();
-  await waitFor(() => expect(apiMocks.openSessionEvents).toHaveBeenCalledWith("session-1", expect.any(Function)));
+  await waitFor(() => expect(apiMocks.openSessionEvents).toHaveBeenCalledWith("session-1", expect.any(Function), 0));
   fireEvent.click(screen.getByRole("button", { name: "Close DataPilot" }));
   await waitFor(() => expect(close).toHaveBeenCalledTimes(1));
   fireEvent.click(screen.getByRole("button", { name: "Open DataPilot" }));
 
   await waitFor(() => expect(apiMocks.openSessionEvents).toHaveBeenCalledTimes(2));
-  expect(apiMocks.openSessionEvents).toHaveBeenLastCalledWith("session-1", expect.any(Function));
+  expect(apiMocks.openSessionEvents).toHaveBeenLastCalledWith("session-1", expect.any(Function), 0);
   expect(apiMocks.submitTurn).not.toHaveBeenCalled();
 });
 
@@ -1845,7 +1931,7 @@ test("selecting a history session closes the active event stream before loading 
     target: { value: "先打开流" },
   });
   fireEvent.click(screen.getByRole("button", { name: "Send message" }));
-  await waitFor(() => expect(apiMocks.openSessionEvents).toHaveBeenCalledWith("session-1", expect.any(Function)));
+  await waitFor(() => expect(apiMocks.openSessionEvents).toHaveBeenCalledWith("session-1", expect.any(Function), 0));
 
   fireEvent.click(screen.getByRole("button", { name: "History" }));
   fireEvent.click(await screen.findByRole("button", { name: /历史任务/ }));

@@ -83,7 +83,7 @@ function VersionsPanel({ onPlaceholderAction }: ModelIterationPageProps) {
             const status = statusMeta[version.status];
 
             return (
-              <article key={version.ver} className="grid gap-3 rounded border border-console-line bg-console-panel2/70 p-3 lg:grid-cols-[4.5rem_6rem_7rem_7rem_7rem_1fr] lg:items-center">
+              <article key={version.ver} className="grid gap-3 rounded-sm border border-console-line bg-console-panel2/70 p-3 lg:grid-cols-[4.5rem_6rem_7rem_7rem_7rem_1fr] lg:items-center">
                 <div>
                   <p className="text-sm font-semibold text-console-text">{version.ver}</p>
                   <p className="mt-1 text-xs text-console-muted">{version.date}</p>
@@ -192,7 +192,7 @@ function ComparePanel() {
             { label: "平均延迟变化", value: "-8ms", tone: "success" as const },
             { label: "部署风险", value: "中低", tone: "warning" as const },
           ].map((item) => (
-            <div key={item.label} className="flex items-center justify-between gap-3 rounded border border-console-line bg-console-panel2/70 p-3">
+            <div key={item.label} className="flex items-center justify-between gap-3 rounded-sm border border-console-line bg-console-panel2/70 p-3">
               <span className="text-sm text-console-muted">{item.label}</span>
               <StatusTag tone={item.tone}>{item.value}</StatusTag>
             </div>

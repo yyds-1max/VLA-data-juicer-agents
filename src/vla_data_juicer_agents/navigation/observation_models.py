@@ -21,6 +21,7 @@ ObservationKind = Literal[
     "runtime_assets",
     "calibration_inventory",
     "localization_sources",
+    "annotation_job_facts",
     "user_guidance",
 ]
 
@@ -101,6 +102,39 @@ class LocalizationSourcesObservation(StrictModel):
     conversion_available: bool
 
 
+class AnnotationReviewCounts(StrictModel):
+    pending: int = Field(default=0, ge=0)
+    in_progress: int = Field(default=0, ge=0)
+    returned: int = Field(default=0, ge=0)
+    approved: int = Field(default=0, ge=0)
+    discarded: int = Field(default=0, ge=0)
+
+
+class AnnotationJobFactsObservation(StrictModel):
+    """Bounded Annotation facts; never contains refs, paths, or geometry."""
+
+    kind: Literal["annotation_job_facts"] = "annotation_job_facts"
+    job_status: Literal[
+        "missing",
+        "preparing",
+        "waiting_initial_annotation",
+        "tracking",
+        "tracked",
+        "postprocessing",
+        "annotated",
+        "failed",
+        "cancelled",
+    ]
+    segment_count: int = Field(default=0, ge=0)
+    tracked_count: int = Field(default=0, ge=0)
+    skipped_count: int = Field(default=0, ge=0)
+    annotated_count: int = Field(default=0, ge=0)
+    ready_for_postprocessing: bool = False
+    ready_for_trajectory_review: bool = False
+    processing_calibration_snapshot_available: bool = False
+    reviews: AnnotationReviewCounts = Field(default_factory=AnnotationReviewCounts)
+
+
 class UserGuidanceObservation(StrictModel):
     kind: Literal["user_guidance"] = "user_guidance"
     guidance_revision: int
@@ -116,6 +150,7 @@ ObservationPayload = Annotated[
     | RuntimeAssetsObservation
     | CalibrationInventoryObservation
     | LocalizationSourcesObservation
+    | AnnotationJobFactsObservation
     | UserGuidanceObservation,
     Field(discriminator="kind"),
 ]

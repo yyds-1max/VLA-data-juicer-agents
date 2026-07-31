@@ -37,11 +37,33 @@ class ExpectedHandoff(StrictModel):
         min_length=1,
     )
     # DataPilot session contract v1 operation fields.
-    operation: Literal["start", "continue", "stop", "cancel"] | None = None
+    operation: Literal[
+        "start",
+        "continue",
+        "stop",
+        "cancel",
+        "submit_plan",
+    ] | None = None
     scope_source: Literal["request_context", "interpreted_user_text"] | None = None
     dataset_date: str | None = Field(default=None, pattern=r"^[0-9]{8}$")
     selection: dict[str, Any] | None = None
     status: str | None = None
+    requested_outcome: Literal[
+        "auto",
+        "extract_sync",
+        "postprocessing",
+        "postprocessing_and_fix",
+        "trajectory_fix",
+    ] | None = None
+    phase: Literal[
+        "extract_sync",
+        "finish_processing",
+        "trajectory_review",
+    ] | None = None
+    decision_modes: dict[str, str] | None = None
+    step_actions: list[str] | None = None
+    step_variants: dict[str, str] | None = None
+    linked_fix: bool | None = None
     forbidden_fields: list[str] = Field(default_factory=list)
 
     @model_validator(mode="after")
@@ -69,15 +91,92 @@ class ExpectedHandoff(StrictModel):
             ):
                 return self
             raise ValueError("start selection must be all_clips or non-empty selected_clips")
+        if self.operation == "submit_plan":
+            if (
+                self.phase is None
+                or self.decision_modes is None
+                or self.step_actions is None
+                or self.step_variants is None
+            ):
+                raise ValueError(
+                    "submit_plan expectations require phase, decision_modes, "
+                    "step_actions, and step_variants",
+                )
         return self
 
 
 class FocusedTaskSetup(StrictModel):
     task_ref: str = "DP-EVAL-FOCUSED"
-    status: Literal["active", "waiting_user", "paused", "needs_replan"]
+    status: Literal[
+        "active",
+        "waiting_user",
+        "paused",
+        "needs_replan",
+        "completed",
+    ]
     dataset_date: str = Field(default="20260718", pattern=r"^[0-9]{8}$")
     selection: dict[str, Any] = Field(default_factory=lambda: {"kind": "all_clips"})
     wait_cause: str | None = None
+    requested_outcome: Literal[
+        "auto",
+        "extract_sync",
+        "postprocessing",
+        "postprocessing_and_fix",
+        "trajectory_fix",
+    ] = "auto"
+    completion_outcome: Literal[
+        "extract_sync_completed",
+        "postprocessing_completed_fix_pending",
+        "trajectory_review_completed",
+        "processing_completed_no_fix",
+    ] | None = None
+
+
+class NavigationTaskSetup(StrictModel):
+    dataset_date: str = Field(pattern=r"^[0-9]{8}$")
+    selection: dict[str, Any]
+    scene_mode: Literal["in", "out"] | None = None
+    requested_outcome: Literal[
+        "postprocessing",
+        "postprocessing_and_fix",
+        "trajectory_fix",
+    ]
+    tool_results: dict[str, dict[str, Any]] = Field(default_factory=dict)
+
+    @model_validator(mode="after")
+    def validate_selection_and_tools(self) -> "NavigationTaskSetup":
+        kind = self.selection.get("kind")
+        clips = self.selection.get("clips")
+        valid_selection = (
+            kind == "all_clips"
+            and set(self.selection) == {"kind"}
+        ) or (
+            kind == "selected_clips"
+            and set(self.selection) == {"kind", "clips"}
+            and isinstance(clips, list)
+            and bool(clips)
+            and all(isinstance(item, str) and item for item in clips)
+        )
+        if not valid_selection:
+            raise ValueError("navigation evaluation selection is invalid")
+        allowed_tools = {
+            "inspect_navigation_raw_metadata_tool",
+            "inspect_navigation_sensor_candidates_tool",
+            "inspect_navigation_topic_candidates_tool",
+            "inspect_navigation_runtime_assets_tool",
+            "inspect_navigation_calibration_inventory_tool",
+            "inspect_navigation_localization_sources_tool",
+            "inspect_navigation_annotation_job_facts_tool",
+            "inspect_navigation_artifact_state_tool",
+            "inspect_navigation_gridmap_artifacts_tool",
+        }
+        unexpected = sorted(set(self.tool_results) - allowed_tools)
+        if unexpected:
+            raise ValueError(
+                "navigation evaluation tool_results contains unsupported tools: "
+                + ", ".join(unexpected),
+            )
+        return self
 
 
 class TrustedRequestContextSetup(StrictModel):
@@ -108,12 +207,21 @@ class TrustedRequestContextSetup(StrictModel):
 class EvaluationRuntimeSetup(StrictModel):
     focused_task: FocusedTaskSetup | None = None
     request_context: TrustedRequestContextSetup | None = None
+    navigation_task: NavigationTaskSetup | None = None
 
     @model_validator(mode="after")
     def validate_exclusive_setup(self) -> "EvaluationRuntimeSetup":
-        if self.focused_task is not None and self.request_context is not None:
+        configured = sum(
+            item is not None
+            for item in (
+                self.focused_task,
+                self.request_context,
+                self.navigation_task,
+            )
+        )
+        if configured > 1:
             raise ValueError(
-                "focused_task and request_context cannot be seeded together",
+                "focused_task, request_context, and navigation_task are exclusive",
             )
         return self
 
@@ -135,6 +243,7 @@ class ToolExpectations(StrictModel):
 
 class ResponseExpectations(StrictModel):
     language: Literal["Chinese", "English"] | None = None
+    allow_empty: bool = False
     required_any_groups: list[list[str]] = Field(default_factory=list)
     forbidden_terms: list[str] = Field(default_factory=list)
     require_question: bool = False
@@ -156,7 +265,7 @@ class EvaluationCase(StrictModel):
     schema_version: Literal[1, 2]
     id: str = Field(pattern=r"^[a-z][a-z0-9_-]*$")
     suite: str = Field(pattern=r"^[a-z][a-z0-9_-]*$")
-    entrypoint: Literal["router"]
+    entrypoint: Literal["router", "navigation"]
     tags: list[str] = Field(default_factory=list)
     conversation: list[ConversationTurn] = Field(min_length=1)
     runtime_setup: EvaluationRuntimeSetup | None = None
@@ -179,6 +288,21 @@ class EvaluationCase(StrictModel):
             raise ValueError(
                 "evaluation case schema v2 conversations contain user turns only; "
                 "assistant turns are produced by the host",
+            )
+        if self.entrypoint == "navigation":
+            if (
+                self.runtime_setup is None
+                or self.runtime_setup.navigation_task is None
+            ):
+                raise ValueError(
+                    "navigation evaluation cases require runtime_setup.navigation_task",
+                )
+        elif (
+            self.runtime_setup is not None
+            and self.runtime_setup.navigation_task is not None
+        ):
+            raise ValueError(
+                "router evaluation cases cannot seed a navigation_task",
             )
         return self
 

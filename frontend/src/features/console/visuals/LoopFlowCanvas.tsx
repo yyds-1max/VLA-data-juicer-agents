@@ -101,7 +101,7 @@ export function LoopFlowCanvas() {
   }, []);
 
   return (
-    <div className="relative min-h-[20rem] overflow-hidden rounded-lg border border-console-line bg-console-panel2/70">
+    <div className="relative min-h-80 overflow-hidden rounded-lg border border-console-line bg-console-panel2/70">
       <canvas ref={canvasRef} aria-hidden="true" className="absolute inset-0 h-full w-full" />
       {flowNodes.map((node) => {
         const Icon = node.icon;
@@ -109,7 +109,7 @@ export function LoopFlowCanvas() {
         return (
           <div
             key={node.label}
-            className="absolute flex w-28 -translate-x-1/2 -translate-y-1/2 flex-col items-center gap-2 rounded-lg border border-console-line bg-console-panel px-3 py-3 text-center shadow-sm"
+            className="absolute flex w-28 -translate-x-1/2 -translate-y-1/2 flex-col items-center gap-2 rounded-lg border border-console-line bg-console-panel px-3 py-3 text-center shadow-xs"
             style={{ left: `${node.x}%`, top: `${node.y}%` }}
           >
             <span className="flex h-9 w-9 items-center justify-center rounded-lg border border-console-line bg-console-panel2 text-console-cyan">

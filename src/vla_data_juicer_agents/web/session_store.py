@@ -1,8 +1,10 @@
 from __future__ import annotations
 
-import sqlite3
 import json
 import logging
+import os
+import sqlite3
+import stat
 from datetime import UTC, datetime, timedelta
 from dataclasses import dataclass
 from pathlib import Path
@@ -45,9 +47,89 @@ def _now() -> str:
 _SAFE_PUBLIC_REPLY_FAILURE = "本轮处理已结束，但未能生成可安全展示的回复。请重试。"
 _BACKGROUND_TURN_REPLY = "任务已转入后台继续处理，完成后会自动通知你。"
 _OPEN_TASK_STATUS_REPLY = "任务状态仍为处理中，后续状态会继续更新。"
+_INTERACTION_CONTINUATION_REPLY = (
+    "已收到你的选择，我会按确认结果继续处理。"
+    "下一次需要你操作时，DataPilot 会在这里提醒你。"
+)
+_NAVIGATION_WORKFLOW_TURN_PREFIX = "navigation_workflow:"
+_NAVIGATION_WORKFLOW_TURN_FALLBACKS = {
+    "initial_annotation_tracking_completed": (
+        "Tracking 已完成。我正在继续检查当前数据并执行后处理，"
+        "后续状态会自动更新。"
+    ),
+}
 _NAVIGATION_DATASET_SELECTION_CONTEXT = "navigation_dataset_selection_v1"
 _MAX_REQUEST_CONTEXT_BYTES = 3_000
 _logger = logging.getLogger(__name__)
+
+
+def _private_session_sqlite_path(path: Path) -> Path:
+    candidate = path if path.is_absolute() else Path.cwd() / path
+    parent = candidate.parent
+    try:
+        parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+        metadata = parent.lstat()
+        canonical_parent = parent.resolve(strict=True)
+    except OSError as exc:
+        raise RuntimeError("session database parent is unavailable") from exc
+    if (
+        stat.S_ISLNK(metadata.st_mode)
+        or not stat.S_ISDIR(metadata.st_mode)
+        or canonical_parent != parent
+        or metadata.st_uid != os.geteuid()
+        or metadata.st_mode & (stat.S_IWGRP | stat.S_IWOTH)
+    ):
+        raise RuntimeError("session database parent is unsafe")
+    return canonical_parent / candidate.name
+
+
+def _secure_session_sqlite_file(path: Path, *, create: bool) -> None:
+    try:
+        existing = path.lstat()
+    except FileNotFoundError:
+        if not create:
+            return
+    except OSError as exc:
+        raise RuntimeError("session database storage is unavailable") from exc
+    else:
+        if stat.S_ISLNK(existing.st_mode) or not stat.S_ISREG(existing.st_mode):
+            raise RuntimeError(
+                "session database storage must be a regular file",
+            )
+
+    flags = os.O_RDWR
+    if create:
+        flags |= os.O_CREAT
+    if hasattr(os, "O_CLOEXEC"):
+        flags |= os.O_CLOEXEC
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    descriptor: int | None = None
+    try:
+        descriptor = os.open(path, flags, 0o600)
+        opened = os.fstat(descriptor)
+        current = path.stat(follow_symlinks=False)
+        if (
+            not stat.S_ISREG(opened.st_mode)
+            or opened.st_uid != os.geteuid()
+            or current.st_dev != opened.st_dev
+            or current.st_ino != opened.st_ino
+        ):
+            raise RuntimeError("session database storage is unsafe")
+        os.fchmod(descriptor, 0o600)
+    except RuntimeError:
+        raise
+    except OSError as exc:
+        raise RuntimeError("session database storage is unsafe") from exc
+    finally:
+        if descriptor is not None:
+            os.close(descriptor)
+
+
+def _secure_session_sqlite_storage(path: Path) -> None:
+    _secure_session_sqlite_file(path, create=True)
+    for suffix in ("-wal", "-shm"):
+        _secure_session_sqlite_file(Path(f"{path}{suffix}"), create=False)
 
 
 def _open_task_turn_reply(status: str, *, background_tools: int = 0) -> str:
@@ -61,6 +143,18 @@ def _open_task_turn_reply(status: str, *, background_tools: int = 0) -> str:
         status,
         _BACKGROUND_TURN_REPLY if background_tools > 0 else _OPEN_TASK_STATUS_REPLY,
     )
+
+
+def _navigation_workflow_reason(invocation_id: object) -> str | None:
+    if not isinstance(invocation_id, str) or not invocation_id.startswith(
+        _NAVIGATION_WORKFLOW_TURN_PREFIX
+    ):
+        return None
+    remainder = invocation_id[len(_NAVIGATION_WORKFLOW_TURN_PREFIX) :]
+    reason, separator, _idempotency_key = remainder.partition(":")
+    if not separator or reason not in _NAVIGATION_WORKFLOW_TURN_FALLBACKS:
+        return None
+    return reason
 
 
 def _normalize_turn_request_context(value: dict[str, Any]) -> dict[str, Any]:
@@ -153,9 +247,12 @@ class UnsupportedLegacySessionError(RuntimeError):
 
 class WebSessionStore:
     def __init__(self, db_path: Path | str) -> None:
-        self.db_path = Path(db_path)
-        self.db_path.parent.mkdir(parents=True, exist_ok=True)
-        self._init_schema()
+        self.db_path = _private_session_sqlite_path(Path(db_path))
+        _secure_session_sqlite_storage(self.db_path)
+        try:
+            self._init_schema()
+        finally:
+            _secure_session_sqlite_storage(self.db_path)
 
     def _connect(self) -> sqlite3.Connection:
         connection = sqlite3.connect(self.db_path)
@@ -776,6 +873,141 @@ class WebSessionStore:
             ).fetchone()
         return self._turn_from_row(row) if row is not None else None
 
+    def get_navigation_workflow_turn_reason(self, turn_id: str) -> str | None:
+        """Return the private semantic boundary attached to a System Turn."""
+
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT invocation_id FROM web_turns WHERE id = ?",
+                (turn_id,),
+            ).fetchone()
+        return (
+            _navigation_workflow_reason(row["invocation_id"])
+            if row is not None
+            else None
+        )
+
+    def begin_navigation_workflow_turn(
+        self,
+        *,
+        task_id: str,
+        reason: str,
+        idempotency_key: str,
+    ) -> tuple[TimelineEventRecord, ...]:
+        """Open one idempotent System Turn for a semantic workflow boundary.
+
+        The turn is created only when no user or interaction turn currently
+        owns response authority. A deterministic milestone remains available
+        when another turn is active.
+        """
+
+        if reason not in _NAVIGATION_WORKFLOW_TURN_FALLBACKS:
+            raise ValueError("unsupported navigation workflow turn reason")
+        if not idempotency_key.strip():
+            raise ValueError("workflow turn idempotency key must not be empty")
+        timestamp = _now()
+        invocation_id = (
+            f"{_NAVIGATION_WORKFLOW_TURN_PREFIX}{reason}:{idempotency_key}"
+        )
+        with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            binding = connection.execute(
+                """
+                SELECT web_session_id, navigation_session_id, slot_state
+                FROM conversation_task_bindings
+                WHERE task_id = ?
+                """,
+                (task_id,),
+            ).fetchone()
+            if binding is None:
+                raise KeyError(task_id)
+            if binding["slot_state"] != "open":
+                return ()
+            existing = connection.execute(
+                """
+                SELECT id FROM web_turns
+                WHERE web_session_id = ? AND invocation_id = ?
+                """,
+                (binding["web_session_id"], invocation_id),
+            ).fetchone()
+            if existing is not None:
+                return ()
+            if connection.execute(
+                """
+                SELECT 1 FROM web_turns
+                WHERE web_session_id = ? AND status IN ('running', 'waiting')
+                """,
+                (binding["web_session_id"],),
+            ).fetchone() is not None:
+                return ()
+            navigation = connection.execute(
+                """
+                SELECT agent_role FROM conversation_agent_sessions
+                WHERE web_session_id = ? AND task_id = ?
+                  AND agentscope_session_id = ?
+                """,
+                (
+                    binding["web_session_id"],
+                    task_id,
+                    binding["navigation_session_id"],
+                ),
+            ).fetchone()
+            if navigation is None or navigation["agent_role"] != "navigation":
+                raise RuntimeError("navigation workflow session is unavailable")
+            turn_id = f"turn_{uuid4().hex}"
+            connection.execute(
+                """
+                INSERT INTO web_turns (
+                    id, web_session_id, invocation_id, origin, status, started_at,
+                    finished_at, final_message_id
+                ) VALUES (?, ?, ?, 'system', 'running', ?, NULL, NULL)
+                """,
+                (
+                    turn_id,
+                    binding["web_session_id"],
+                    invocation_id,
+                    timestamp,
+                ),
+            )
+            self._insert_response_authority(
+                connection,
+                turn_id=turn_id,
+                producer="navigation",
+                timestamp=timestamp,
+            )
+            connection.execute(
+                """
+                UPDATE conversation_agent_sessions
+                SET active_turn_id = ?, updated_at = ?
+                WHERE web_session_id = ? AND task_id = ?
+                  AND agentscope_session_id = ?
+                """,
+                (
+                    turn_id,
+                    timestamp,
+                    binding["web_session_id"],
+                    task_id,
+                    binding["navigation_session_id"],
+                ),
+            )
+            event = self._insert_timeline_event(
+                connection,
+                session_id=str(binding["web_session_id"]),
+                turn_id=turn_id,
+                event={
+                    "type": "turn_start",
+                    "timestamp": timestamp,
+                    "payload": {"status": "running", "started_at": timestamp},
+                },
+                created_at=timestamp,
+                origin_key=f"{invocation_id}:turn-start",
+            )
+            connection.execute(
+                "UPDATE sessions SET updated_at = ? WHERE id = ?",
+                (timestamp, binding["web_session_id"]),
+            )
+        return (event,)
+
     def reconcile_stale_reply_leases(self) -> int:
         """Release pre-restart pending/running leases so a recovered run can take over."""
         timestamp = _now()
@@ -903,7 +1135,35 @@ class WebSessionStore:
             messages=[self._message_from_row(row) for row in message_rows],
             events=[self._timeline_event_from_row(row) for row in event_rows],
             turns=[self._turn_from_row(row) for row in turn_rows],
+            snapshot_seq=int(event_rows[-1]["seq"]) if event_rows else 0,
         )
+
+    def list_timeline_events_after(
+        self,
+        session_id: str,
+        *,
+        after_seq: int,
+    ) -> list[TimelineEventRecord]:
+        if after_seq < 0:
+            raise ValueError("after_seq must be non-negative")
+        with self._connect() as connection:
+            exists = connection.execute(
+                "SELECT 1 FROM sessions WHERE id = ?",
+                (session_id,),
+            ).fetchone()
+            if exists is None:
+                raise KeyError(session_id)
+            rows = connection.execute(
+                """
+                SELECT id, session_id, turn_id, seq, type, source, run_id,
+                       parent_run_id, timestamp, payload_json, created_at
+                FROM timeline_events
+                WHERE session_id = ? AND seq > ?
+                ORDER BY seq ASC, rowid ASC
+                """,
+                (session_id, after_seq),
+            ).fetchall()
+        return [self._timeline_event_from_row(row) for row in rows]
 
     def append_message(
         self,
@@ -957,7 +1217,13 @@ class WebSessionStore:
             )
         return record
 
-    def append_timeline_event(self, session_id: str, event: dict) -> TimelineEventRecord:
+    def append_timeline_event(
+        self,
+        session_id: str,
+        event: dict,
+        *,
+        origin_key: str | None = None,
+    ) -> TimelineEventRecord:
         timestamp = _now()
         payload = event.get("payload")
         safe_payload = payload if isinstance(payload, dict) else {}
@@ -975,6 +1241,22 @@ class WebSessionStore:
             ).fetchone()
             if exists is None:
                 raise KeyError(session_id)
+            if origin_key is not None:
+                existing = connection.execute(
+                    """
+                    SELECT id, session_id, turn_id, seq, type, source, run_id,
+                           parent_run_id, timestamp, payload_json, created_at
+                    FROM timeline_events
+                    WHERE origin_key = ?
+                    """,
+                    (origin_key,),
+                ).fetchone()
+                if existing is not None:
+                    if existing["session_id"] != session_id:
+                        raise RuntimeError(
+                            "timeline event origin belongs to another session"
+                        )
+                    return self._timeline_event_from_row(existing)
             duplicate = self._duplicate_human_decision_event(
                 connection,
                 session_id=session_id,
@@ -1000,6 +1282,7 @@ class WebSessionStore:
                     session_id,
                     turn_id,
                     seq,
+                    origin_key,
                     type,
                     source,
                     run_id,
@@ -1008,13 +1291,14 @@ class WebSessionStore:
                     payload_json,
                     created_at
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     record_id,
                     session_id,
                     turn_id,
                     seq,
+                    origin_key,
                     str(event.get("type", "")),
                     _optional_text(event.get("source")),
                     _optional_text(event.get("run_id")),
@@ -1812,9 +2096,14 @@ class WebSessionStore:
                     else None
                 )
                 turn_origin_row = connection.execute(
-                    "SELECT origin FROM web_turns WHERE id = ?",
+                    "SELECT origin, invocation_id FROM web_turns WHERE id = ?",
                     (turn_id,),
                 ).fetchone()
+                workflow_reason = (
+                    _navigation_workflow_reason(turn_origin_row["invocation_id"])
+                    if turn_origin_row is not None
+                    else None
+                )
                 binding_status_row = (
                     connection.execute(
                         """
@@ -1844,14 +2133,19 @@ class WebSessionStore:
                 if (
                     v1_mapping
                     and turn_origin_row is not None
-                    and turn_origin_row["origin"] == "user"
+                    and turn_origin_row["origin"] in {"user", "interaction"}
                     and reply_summary is None
                     and open_task_status is not None
                     and (background_tools > 0 or blockers == 0)
                 ):
-                    turn_reply = _open_task_turn_reply(
-                        open_task_status,
-                        background_tools=background_tools,
+                    turn_reply = (
+                        _INTERACTION_CONTINUATION_REPLY
+                        if turn_origin_row["origin"] == "interaction"
+                        and open_task_status in {"active", "waiting_user"}
+                        else _open_task_turn_reply(
+                            open_task_status,
+                            background_tools=background_tools,
+                        )
                     )
                     if open_task_status == "active" and background_tools == 0:
                         _logger.warning(
@@ -1887,6 +2181,18 @@ class WebSessionStore:
                         (timestamp, web_session_id),
                     )
                     return inserted
+                if (
+                    v1_mapping
+                    and turn_origin_row is not None
+                    and turn_origin_row["origin"] == "system"
+                    and workflow_reason is not None
+                    and reply_summary is None
+                    and blockers == 0
+                    and not waiting
+                ):
+                    reply_summary = _NAVIGATION_WORKFLOW_TURN_FALLBACKS[
+                        workflow_reason
+                    ]
                 if (
                     v1_mapping
                     and turn_origin_row is not None
@@ -3575,7 +3881,10 @@ class WebSessionStore:
         scope: dict | None = None,
         outbox_payload: dict | None = None,
         outbox_idempotency_key: str | None = None,
+        outbox_kind: str = "navigation_start",
     ) -> TaskBindingCreation:
+        if not outbox_kind.strip():
+            raise ValueError("outbox_kind must not be empty")
         timestamp = _now()
         agent_session_id = f"conversation_agent_session_{uuid4().hex}"
         outbox_id = f"outbox_{uuid4().hex}"
@@ -3680,7 +3989,7 @@ class WebSessionStore:
                 self._insert_outbox(
                     connection,
                     outbox_id=outbox_id,
-                    kind="navigation_start",
+                    kind=outbox_kind,
                     aggregate_type="task",
                     aggregate_id=task_id,
                     web_session_id=web_session_id,
@@ -4709,6 +5018,75 @@ class WebSessionStore:
         assert row is not None
         return self._outbox_from_row(row)
 
+    def record_outbox_receipt(
+        self,
+        *,
+        kind: str,
+        aggregate_type: str,
+        aggregate_id: str,
+        payload: dict,
+        idempotency_key: str,
+        web_session_id: str | None = None,
+        task_id: str | None = None,
+    ) -> RuntimeOutboxItem:
+        """Atomically record one completed, idempotent transport receipt."""
+
+        if not kind.strip() or not idempotency_key.strip():
+            raise ValueError("receipt kind and idempotency key must not be empty")
+        timestamp = _now()
+        outbox_id = f"outbox_{uuid4().hex}"
+        with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            existing = connection.execute(
+                "SELECT * FROM runtime_outbox WHERE idempotency_key = ?",
+                (idempotency_key,),
+            ).fetchone()
+            if existing is not None:
+                receipt = self._outbox_from_row(existing)
+                if (
+                    receipt.kind != kind
+                    or receipt.aggregate_type != aggregate_type
+                    or receipt.aggregate_id != aggregate_id
+                    or receipt.web_session_id != web_session_id
+                    or receipt.task_id != task_id
+                    or receipt.turn_id is not None
+                    or receipt.status != "completed"
+                ):
+                    raise ContractConflictError(
+                        "outbox_receipt_conflict",
+                        "idempotency key is already used by another outbox record",
+                        current=receipt,
+                    )
+                return receipt
+            self._insert_outbox(
+                connection,
+                outbox_id=outbox_id,
+                kind=kind,
+                aggregate_type=aggregate_type,
+                aggregate_id=aggregate_id,
+                web_session_id=web_session_id,
+                task_id=task_id,
+                turn_id=None,
+                payload=payload,
+                idempotency_key=idempotency_key,
+                available_at=timestamp,
+                timestamp=timestamp,
+            )
+            connection.execute(
+                """
+                UPDATE runtime_outbox
+                SET status = 'completed', completed_at = ?, updated_at = ?
+                WHERE outbox_id = ?
+                """,
+                (timestamp, timestamp, outbox_id),
+            )
+            row = connection.execute(
+                "SELECT * FROM runtime_outbox WHERE outbox_id = ?",
+                (outbox_id,),
+            ).fetchone()
+        assert row is not None
+        return self._outbox_from_row(row)
+
     def claim_outbox(
         self,
         *,
@@ -4881,6 +5259,44 @@ class WebSessionStore:
                 (idempotency_key,),
             ).fetchone()
         return self._outbox_from_row(row) if row is not None else None
+
+    def list_explicit_linked_fix_recoveries(
+        self,
+        *,
+        limit: int = 20,
+    ) -> list[RuntimeOutboxItem]:
+        """List automatic linked-Fix creations whose turnless wake is unfinished."""
+
+        if limit < 1:
+            return []
+        with self._connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT creation.*
+                FROM runtime_outbox AS creation
+                JOIN conversation_task_bindings AS bindings
+                  ON bindings.task_id = creation.task_id
+                WHERE creation.idempotency_key
+                          GLOB 'navigation_auto_linked_fix:*'
+                  AND creation.kind IN (
+                      'navigation_start',
+                      'navigation_explicit_linked_fix_create'
+                  )
+                  AND bindings.slot_state = 'open'
+                  AND NOT EXISTS (
+                      SELECT 1
+                      FROM runtime_outbox AS wake
+                      WHERE wake.kind =
+                                'navigation_explicit_linked_fix_wake'
+                        AND wake.task_id = creation.task_id
+                        AND wake.status = 'completed'
+                  )
+                ORDER BY creation.created_at, creation.outbox_id
+                LIMIT ?
+                """,
+                (limit,),
+            ).fetchall()
+        return [self._outbox_from_row(row) for row in rows]
 
     def transfer_waiting_reply_to_turn(
         self,

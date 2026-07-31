@@ -148,12 +148,60 @@ def test_invalid_metadata_marks_clip_error_without_failing_summary_or_date_scan(
     by_clip = {clip.clip: clip for clip in date_summary.clips}
 
     assert by_clip["bad_clip"].status == "error"
-    assert by_clip["bad_clip"].errors
+    assert by_clip["bad_clip"].errors == ["metadata.yaml: invalid YAML"]
     assert by_clip["good_clip"].status == "raw_only"
     assert date_summary.status == "error"
     assert date_summary.total_duration_ns == 42
     assert summary.totals.clip_count == 2
     assert summary.totals.total_duration_ns == 42
+
+
+def test_invalid_metadata_structure_uses_stable_public_error(tmp_path: Path):
+    root = tmp_path / "VLADatasets"
+    bad_clip = root / "raw_data" / "20270605" / "bad_clip"
+    bad_clip.mkdir(parents=True)
+    (bad_clip / "metadata.yaml").write_text("{}", encoding="utf-8")
+
+    date_summary = scan_navigation_date("20270605", settings_for(root))
+
+    assert date_summary.status == "error"
+    assert date_summary.clips[0].errors == ["metadata.yaml: invalid structure"]
+
+
+def test_missing_metadata_uses_stable_public_error_without_private_path(tmp_path: Path):
+    root = tmp_path / "private-VLADatasets"
+    missing_metadata_clip = root / "raw_data" / "20270605" / "missing_metadata"
+    missing_metadata_clip.mkdir(parents=True)
+
+    date_summary = scan_navigation_date("20270605", settings_for(root))
+    payload = date_summary.model_dump_json()
+
+    assert date_summary.status == "error"
+    assert date_summary.clips[0].errors == ["metadata.yaml: file not found"]
+    assert str(root) not in payload
+
+
+def test_metadata_os_error_does_not_expose_private_diagnostics(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    root = tmp_path / "VLADatasets"
+    write_metadata(root / "raw_data" / "20270605" / "private_clip")
+    private_error = "/media/heying/private/data Bearer secret-navigation-token"
+
+    def fail_to_read_metadata(_path: Path):
+        raise PermissionError(private_error)
+
+    monkeypatch.setattr(dataset_catalog, "_read_metadata", fail_to_read_metadata)
+
+    date_summary = scan_navigation_date("20270605", settings_for(root))
+    payload = date_summary.model_dump_json()
+
+    assert date_summary.status == "error"
+    assert date_summary.clips[0].errors == ["metadata.yaml: unreadable"]
+    assert private_error not in payload
+    assert "/media/" not in payload
+    assert "Bearer" not in payload
 
 
 def test_existing_clip_data_without_tmp_dir_or_sync_counts_is_error_not_raw_only(tmp_path: Path):
@@ -177,10 +225,11 @@ def test_sync_scan_error_marks_clip_error_without_failing_date_scan(
     write_metadata(root / "raw_data" / "20270605" / "bad_sync_clip")
     write_metadata(root / "raw_data" / "20270605" / "good_clip")
     (root / "clip_data" / "20270605" / "bad_sync_clip" / "sync_data" / "0001").mkdir(parents=True)
+    private_error = "/media/heying/private/fisheye_front Bearer secret-navigation-token"
 
     def fail_for_sequence(path: Path) -> list[Path]:
         if path.name == "fisheye_front":
-            raise OSError("cannot read fisheye_front")
+            raise OSError(private_error)
         return []
 
     monkeypatch.setattr(dataset_catalog, "_visible_files", fail_for_sequence)
@@ -189,7 +238,11 @@ def test_sync_scan_error_marks_clip_error_without_failing_date_scan(
     by_clip = {clip.clip: clip for clip in date_summary.clips}
 
     assert by_clip["bad_sync_clip"].status == "error"
-    assert any("sync_data" in error and "cannot read fisheye_front" in error for error in by_clip["bad_sync_clip"].errors)
+    assert by_clip["bad_sync_clip"].errors == [
+        "sync_data: unreadable",
+        "clip_data exists without tmp_dir or synced frames",
+    ]
+    assert private_error not in by_clip["bad_sync_clip"].model_dump_json()
     assert by_clip["good_clip"].status == "raw_only"
     assert date_summary.status == "error"
 

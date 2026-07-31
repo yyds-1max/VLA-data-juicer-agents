@@ -23,6 +23,7 @@ from vla_data_juicer_agents.navigation.plan_models import (
     PlanSubmissionAttempt,
     PlanValidationIssue,
     PlanValidationReport,
+    TrajectoryReviewPlanInput,
 )
 from vla_data_juicer_agents.navigation.plan_store import (
     SqliteNavigationPlanRepository,
@@ -39,7 +40,7 @@ from vla_data_juicer_agents.navigation.task_state import NavigationTask, utc_now
 
 MAX_PLAN_VALIDATION_FAILURE_CHARS = 3_000
 MAX_PLAN_SUBMISSION_SUCCESS_CHARS = 4_000
-PlanPhase = Literal["extract_sync", "finish_processing"]
+PlanPhase = Literal["extract_sync", "finish_processing", "trajectory_review"]
 
 
 def _canonical_json(payload: Any) -> str:
@@ -209,7 +210,12 @@ def build_navigation_plan_submission_tools(
         *,
         phase: PlanPhase,
         planning_context_revision: str,
-        plan: ExtractSyncPlanInput | FinishProcessingPlanInput | dict[str, Any],
+        plan: (
+            ExtractSyncPlanInput
+            | FinishProcessingPlanInput
+            | TrajectoryReviewPlanInput
+            | dict[str, Any]
+        ),
     ) -> dict[str, Any]:
         candidate = _candidate_dict(plan)
         observation = observation_store.latest(task.task_id)
@@ -221,10 +227,19 @@ def build_navigation_plan_submission_tools(
         )
         error_type = "planning_context_mismatch"
         validation = context_report
-        canonical_plan: ExtractSyncPlanInput | FinishProcessingPlanInput | None = None
+        canonical_plan: (
+            ExtractSyncPlanInput
+            | FinishProcessingPlanInput
+            | TrajectoryReviewPlanInput
+            | None
+        ) = None
 
         if context_report.ok:
-            model = ExtractSyncPlanInput if phase == "extract_sync" else FinishProcessingPlanInput
+            model = {
+                "extract_sync": ExtractSyncPlanInput,
+                "finish_processing": FinishProcessingPlanInput,
+                "trajectory_review": TrajectoryReviewPlanInput,
+            }[phase]
             try:
                 canonical_plan = model.model_validate(candidate)
             except ValidationError as error:
@@ -324,6 +339,17 @@ def build_navigation_plan_submission_tools(
             plan=plan,
         )
 
+    def submit_trajectory_review_plan_tool(
+        planning_context_revision: str,
+        plan: TrajectoryReviewPlanInput,
+    ) -> dict[str, Any]:
+        """Validate and atomically activate one linked trajectory-review plan."""
+        return _submit_complete_plan(
+            phase="trajectory_review",
+            planning_context_revision=planning_context_revision,
+            plan=plan,
+        )
+
     tools = [
         FunctionTool(
             submit_extract_sync_plan_tool,
@@ -334,7 +360,12 @@ def build_navigation_plan_submission_tools(
             submit_finish_processing_plan_tool,
             name="submit_finish_processing_plan_tool",
             is_concurrency_safe=False,
-        )
+        ),
+        FunctionTool(
+            submit_trajectory_review_plan_tool,
+            name="submit_trajectory_review_plan_tool",
+            is_concurrency_safe=False,
+        ),
     ]
     for tool in tools:
         tool.input_schema["additionalProperties"] = False

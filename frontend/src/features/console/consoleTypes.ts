@@ -9,6 +9,7 @@ export type NavItem = {
   label: string;
   group: string;
   icon: LucideIcon;
+  path: string;
 };
 
 export type TabItem<T extends string> = {

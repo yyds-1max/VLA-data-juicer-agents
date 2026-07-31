@@ -540,6 +540,26 @@
     },
     {
       "root_alias": "NAVIGATION_ODOM_V1_SOURCE",
+      "relative_path": "Data/3_param/ost.yaml",
+      "kind": "frozen_file",
+      "role": "tracking_compatibility_config",
+      "stage": "tracking",
+      "sha256": "9a1d25967da58715f917736577f2542277f873baea9370eaf0219f6e9e36fa36",
+      "size": 392,
+      "executable": true
+    },
+    {
+      "root_alias": "NAVIGATION_ODOM_V1_SOURCE",
+      "relative_path": "Data/3_param/camera_extrinsics.yaml",
+      "kind": "frozen_file",
+      "role": "tracking_compatibility_config",
+      "stage": "tracking",
+      "sha256": "61672119470f3cd5bac55e7ad93774c3f4b552af2e059909b34ccdd2a43a078c",
+      "size": 341,
+      "executable": true
+    },
+    {
+      "root_alias": "NAVIGATION_ODOM_V1_SOURCE",
       "relative_path": "NoobScenes/samples",
       "kind": "generated_mutable",
       "role": "active_dataset_link",
@@ -621,6 +641,57 @@
       "sha256": "298a9e830ed52f36c299427565485d717d1ce0179c0597cc16560513eb780b06",
       "size": 5490456,
       "executable": true
+    },
+    {
+      "root_alias": "SYSTEM_RUNTIME",
+      "relative_path": "install/xvfb_2%3a1.20.13-1ubuntu1~20.04.20_amd64.deb",
+      "kind": "external_runtime",
+      "role": "xvfb_deb_package",
+      "stage": "all",
+      "version": "2:1.20.13-1ubuntu1~20.04.20",
+      "sha256": "b671759ad2b8280723b0b55361368dc69c12cb301ea9a6a5e443e4f8d2745a2d",
+      "size": 780884,
+      "executable": false
+    },
+    {
+      "root_alias": "SYSTEM_RUNTIME",
+      "relative_path": "usr/bin/Xvfb",
+      "kind": "external_runtime",
+      "role": "xvfb_server_binary",
+      "stage": "all",
+      "sha256": "d341ff11d9235f85edfd481c884517a80af0ca862350a432f3b22cea624c55a4",
+      "size": 2056648,
+      "executable": true
+    },
+    {
+      "root_alias": "SYSTEM_RUNTIME",
+      "relative_path": "usr/bin/xvfb-run",
+      "kind": "external_runtime",
+      "role": "xvfb_launcher",
+      "stage": "all",
+      "sha256": "48ee444c30fdaaede4cc311644b30e554162e956f949b206858e37eb8ba1ae05",
+      "size": 5701,
+      "executable": true
+    },
+    {
+      "root_alias": "SYSTEM_RUNTIME",
+      "relative_path": "usr/bin/bwrap",
+      "kind": "external_runtime",
+      "role": "sandbox_binary",
+      "stage": "all",
+      "sha256": "af662c55cd85178a58da083220a9348c4a7d3c24333fd0bc7badb18c93392987",
+      "size": 68032,
+      "executable": true
+    },
+    {
+      "root_alias": "SYSTEM_RUNTIME",
+      "relative_path": "install/runtime-dependencies.json",
+      "kind": "external_runtime",
+      "role": "runtime_dependency_summary",
+      "stage": "all",
+      "sha256": "04f79d26200ff993732fd5fb3e184589ec9bb9d5886e154f0f99fe64fd06bb00",
+      "size": 2211,
+      "executable": false
     },
     {
       "root_alias": "SYSTEM_RUNTIME",

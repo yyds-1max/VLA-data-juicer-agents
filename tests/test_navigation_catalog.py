@@ -58,11 +58,14 @@ def test_catalog_marks_every_data_mutating_processing_action_as_target_locking()
         "extract_and_sync_navigation_data",
         "assemble_finish_temp",
         "run_noobscene_preprocessing",
-        "run_initial_annotation_gui",
-        "run_tracking",
-        "prepare_gridmap_for_projection",
-        "run_projection_and_trajectory",
-    }
+            "run_initial_annotation_gui",
+            "run_tracking",
+            "run_annotation_tracking_workflow",
+            "prepare_gridmap_for_projection",
+            "run_projection_and_trajectory",
+            "run_annotation_postprocessing_workflow",
+            "open_trajectory_fix_workbench",
+        }
 
 
 def test_catalog_never_locks_read_validation_or_human_decision_actions():
@@ -113,10 +116,10 @@ def test_catalog_tool_returns_json_serializable_payload():
     assert list_navigation_tool_capabilities_tool.name == "list_navigation_tool_capabilities_tool"
 
 
-def test_v3_catalog_exposes_factual_observation_capabilities():
+def test_v5_catalog_exposes_factual_observation_capabilities():
     capabilities = _capability_by_stage()
 
-    assert CAPABILITY_CATALOG_REVISION == "navigation-capabilities-v3"
+    assert CAPABILITY_CATALOG_REVISION == "navigation-capabilities-v5"
     assert capabilities["inspect_navigation_sensor_candidates"].phase == "extract_sync"
     assert capabilities["inspect_navigation_sensor_candidates"].declared_output_kinds == ["sensor_candidates"]
     assert capabilities["inspect_navigation_topic_candidates"].phase == "extract_sync"
@@ -135,6 +138,9 @@ def test_v3_catalog_exposes_factual_observation_capabilities():
     assert capabilities["inspect_navigation_localization_sources"].phase == "finish_processing"
     assert capabilities["inspect_navigation_localization_sources"].declared_output_kinds == [
         "localization_sources"
+    ]
+    assert capabilities["inspect_navigation_annotation_job_facts"].declared_output_kinds == [
+        "annotation_job_facts"
     ]
 
 

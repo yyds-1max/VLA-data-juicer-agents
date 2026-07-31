@@ -21,14 +21,38 @@
 [自动标注总体路线](automatic-annotation-roadmap.md)为权威，主要流程为：
 待处理->已拆解->已同步->处理中/待首帧标注->已标注/待轨迹复核->已验证。
 同一日期或 clip 内部进度不一致时展示“部分完成”，不能仅根据文件是否存在推断审核状态。
-数据表后续同时提供进入标注工作台和发起智能体处理的入口，两者最终调用同一个
-Annotation Application Service；具体接入顺序以自动标注总体路线为准。
+数据表后续提供交给 DataPilot 处理、进入标注工作台、进入人工复核和查看已验证
+版本的入口。DataPilot 是处理任务的唯一所有者；工作台只采集人工标注/Fix 输入，
+不形成独立的手动处理流水线。具体接入顺序以自动标注总体路线为准。
 
 4. 自动标注
 该板块从导航同步产物开始，不重复执行拆解、同步。V1 先支持 Web 首帧标注、
 Tracking、既有导航后处理，以及后处理完成后的三维轨迹人工复核/Fix；不建设二维
-人工复核或二维 AI。页面手动入口和智能体入口最终调用同一个 Annotation
-Application Service，几何标注和轨迹编辑走专用业务 API。
+人工复核或二维 AI。
+
+处理链保持唯一：
+
+```text
+用户选择日期和外层 clips
+→ DataPilot / MainRouter
+→ NavigationDataAgent 调查并选择规范化领域决策
+→ Application Service 校验
+→ 冻结 Runtime 执行
+→ Web 工作台采集首帧标注或人工 Fix
+```
+
+页面不得让用户选择脚本、gridmap 处理策略、轨迹变体或直接启动 Tracking/
+后处理。LLM 负责理解、调查与规划，系统负责精确映射脚本、参数、路径、状态和
+产物。自动标注模块保持一个侧栏入口，内部使用：
+
+```text
+/annotation/jobs                 标注工作台
+/annotation/reviews              人工复核
+/annotation/reviews/{review_ref} 三维 Fix 工作台
+```
+
+M2 的人工复核页只提供人工 Fix；DataPilot/模型辅助复核按钮、置信度和 AI
+候选修正统一在 M4 上线。
 
 自动标注的已确认边界、工程约束、状态语义和分阶段路线见
 [自动标注总体路线](automatic-annotation-roadmap.md)。
@@ -40,3 +64,10 @@ Application Service，几何标注和轨迹编辑走专用业务 API。
 智能体模块的设计参考goal.md文档。
 
 智能体模块遵循明确的职责边界：LLM/多模态模型负责意图理解、规划、推理，并可基于系统提供的受控证据执行辅助审核；确定性系统负责数据搬运、格式转换、参数精确传递、状态迁移、校验和恢复。几何标注、轨迹、路径、内部 ID 和工具参数不得依赖 LLM 在自然语言中精确转述。模型辅助审核需要保留证据与 revision 绑定、结构化报告、置信度和审计记录。模型可以通过受约束的领域指令生成独立候选修正版，但不能原地修改正式业务产物、发布训练文件或代替人工最终批准。
+
+M2 起由 DataPilot 统一拥有自动标注处理任务。NavigationDataAgent 调查
+localization、gridmap、已有产物和 Runtime 能力，只选择系统公布的
+`GridmapDecision` 与 trajectory variant；系统验证事实与决策一致后才执行冻结
+业务 Runtime。后处理完成时原处理任务结束并释放任务槽，DataPilot 询问是否继续
+Fix；用户确认后创建关联的新 Fix Task，不能复活旧任务或让 pending 复核长期占用
+会话活动任务。

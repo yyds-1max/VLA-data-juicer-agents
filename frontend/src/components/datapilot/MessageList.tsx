@@ -20,8 +20,40 @@ export function MessageList({ messages, turns = [], run, hasTaskOverlay = false 
   // Contract v1 welcomes may intentionally be session-scoped instead of Turn-scoped.
   // Render them as messages only; never synthesize a legacy Turn around them.
   const sessionMessages = messages.filter((message) => !message.turn_id || !turnIds.has(message.turn_id));
+  const sessionMilestones = run.timeline.filter(
+    (item) => !item.turnId && item.kind === "progress" && item.text !== "正在理解你的请求",
+  );
+  const { milestonesByTurn, unboundMilestones } = partitionSessionMilestones(
+    displayTurns,
+    sessionMilestones,
+  );
+  const conversationEntries = [
+    ...sessionMessages.map((message, index) => ({
+      kind: "message" as const,
+      key: `message:${message.id}`,
+      createdAt: message.created_at,
+      order: index,
+      message,
+    })),
+    ...displayTurns.map((turn, index) => ({
+      kind: "turn" as const,
+      key: `turn:${turn.id}`,
+      createdAt: turn.started_at,
+      order: sessionMessages.length + index,
+      turn,
+    })),
+    ...unboundMilestones.map((milestone, index) => ({
+      kind: "milestone" as const,
+      key: `milestone:${milestone.sequence ?? index}:${milestone.text}`,
+      createdAt: milestone.createdAt ?? "",
+      order: sessionMessages.length + displayTurns.length + (milestone.sequence ?? index),
+      milestone,
+    })),
+  ].sort((left, right) => (
+    left.createdAt.localeCompare(right.createdAt) || left.order - right.order
+  ));
   const placeholderTurnId = latestEmptyUserTurnId(displayTurns, messages, run.timeline);
-  const hasContent = messages.length > 0 || run.timeline.length > 0 || displayTurns.length > 0;
+  const hasContent = conversationEntries.length > 0 || run.timeline.length > 0;
   const scrollAreaRef = useRef<HTMLDivElement | null>(null);
   const shouldStickToBottomRef = useRef(true);
 
@@ -49,19 +81,27 @@ export function MessageList({ messages, turns = [], run, hasTaskOverlay = false 
     >
       {hasContent ? (
         <>
-          {sessionMessages.map((message) => <MessageBubble key={message.id} message={message} />)}
-          {displayTurns.map((turn) => (
-            <TurnConversation
-              key={turn.id}
-              turn={turn}
-              messages={messages}
-              run={run}
-              allowEmptyPlaceholder={turn.id === placeholderTurnId}
-            />
-          ))}
+          {conversationEntries.map((entry) => {
+            if (entry.kind === "message") {
+              return <MessageBubble key={entry.key} message={entry.message} />;
+            }
+            if (entry.kind === "milestone") {
+              return <MilestoneBubble key={entry.key} item={entry.milestone} />;
+            }
+            return (
+              <TurnConversation
+                key={entry.key}
+                turn={entry.turn}
+                messages={messages}
+                run={run}
+                milestones={milestonesByTurn.get(entry.turn.id) ?? []}
+                allowEmptyPlaceholder={entry.turn.id === placeholderTurnId}
+              />
+            );
+          })}
         </>
       ) : (
-        <div className="mt-auto rounded-lg border border-console-line bg-console-panel px-3 py-3 text-sm text-console-muted shadow-sm">
+        <div className="mt-auto rounded-lg border border-console-line bg-console-panel px-3 py-3 text-sm text-console-muted shadow-xs">
           这个会话还没有消息。
         </div>
       )}
@@ -69,15 +109,26 @@ export function MessageList({ messages, turns = [], run, hasTaskOverlay = false 
   );
 }
 
+function MilestoneBubble({ item }: { item: TimelineItem }) {
+  return (
+    <article className="mr-auto max-w-[88%] rounded-lg border border-emerald-200 bg-emerald-50/70 px-3 py-2 text-sm leading-6 text-console-text shadow-xs">
+      <div className="mb-1 text-[11px] font-medium text-emerald-700">DataPilot · 状态更新</div>
+      <p className="whitespace-pre-wrap wrap-break-word">{withoutPercentages(item.text)}</p>
+    </article>
+  );
+}
+
 function TurnConversation({
   turn,
   messages,
   run,
+  milestones,
   allowEmptyPlaceholder,
 }: {
   turn: TurnRecord;
   messages: ChatMessageRecord[];
   run: RunState;
+  milestones: TimelineItem[];
   allowEmptyPlaceholder: boolean;
 }) {
   const userMessages = messages.filter(
@@ -106,6 +157,12 @@ function TurnConversation({
   return (
     <div className="contents">
       {userMessages.map((message) => <MessageBubble key={message.id} message={message} />)}
+      {milestones.map((item, index) => (
+        <MilestoneBubble
+          key={`milestone:${item.sequence ?? index}:${item.text}`}
+          item={item}
+        />
+      ))}
       {showDisclosure ? (
         <ProcessingDisclosure
           turn={turn}
@@ -123,6 +180,50 @@ function TurnConversation({
       ))}
     </div>
   );
+}
+
+function partitionSessionMilestones(
+  turns: TurnRecord[],
+  milestones: TimelineItem[],
+): {
+  milestonesByTurn: Map<string, TimelineItem[]>;
+  unboundMilestones: TimelineItem[];
+} {
+  const milestonesByTurn = new Map<string, TimelineItem[]>();
+  const unboundMilestones: TimelineItem[] = [];
+  const sortedMilestones = [...milestones].sort(compareTimelineItems);
+
+  sortedMilestones.forEach((milestone) => {
+    if (!milestone.createdAt) {
+      unboundMilestones.push(milestone);
+      return;
+    }
+
+    let owner: TurnRecord | undefined;
+    for (let index = turns.length - 1; index >= 0; index -= 1) {
+      if (turns[index].started_at <= milestone.createdAt) {
+        owner = turns[index];
+        break;
+      }
+    }
+
+    if (!owner) {
+      unboundMilestones.push(milestone);
+      return;
+    }
+
+    const owned = milestonesByTurn.get(owner.id) ?? [];
+    owned.push(milestone);
+    milestonesByTurn.set(owner.id, owned);
+  });
+
+  return { milestonesByTurn, unboundMilestones };
+}
+
+function compareTimelineItems(left: TimelineItem, right: TimelineItem): number {
+  const createdAtOrder = (left.createdAt ?? "").localeCompare(right.createdAt ?? "");
+  if (createdAtOrder !== 0) return createdAtOrder;
+  return (left.sequence ?? Number.MAX_SAFE_INTEGER) - (right.sequence ?? Number.MAX_SAFE_INTEGER);
 }
 
 function latestEmptyUserTurnId(
@@ -154,9 +255,9 @@ function isInitialProgress(item: TimelineItem): boolean {
 
 function AssistantBubble({ text }: { text: string }) {
   return (
-    <article className="mr-auto max-w-[88%] rounded-lg border border-console-line bg-console-panel px-3 py-2 text-sm leading-6 text-console-text shadow-sm">
+    <article className="mr-auto max-w-[88%] rounded-lg border border-console-line bg-console-panel px-3 py-2 text-sm leading-6 text-console-text shadow-xs">
       <div className="mb-1 text-[11px] font-medium text-console-muted">DataPilot</div>
-      <p className="whitespace-pre-wrap break-words">{withoutPercentages(text)}</p>
+      <p className="whitespace-pre-wrap wrap-break-word">{withoutPercentages(text)}</p>
     </article>
   );
 }
@@ -166,7 +267,7 @@ function MessageBubble({ message }: { message: ChatMessageRecord }) {
   return (
     <article
       className={cn(
-        "max-w-[88%] rounded-lg border px-3 py-2 text-sm leading-6 shadow-sm",
+        "max-w-[88%] rounded-lg border px-3 py-2 text-sm leading-6 shadow-xs",
         isUser
           ? "ml-auto border-console-cyan/25 bg-blue-50 text-console-text"
           : "mr-auto border-console-line bg-console-panel text-console-text",
@@ -175,7 +276,7 @@ function MessageBubble({ message }: { message: ChatMessageRecord }) {
       <div className="mb-1 text-[11px] font-medium text-console-muted">
         {isUser ? "You" : "DataPilot"}
       </div>
-      <p className="whitespace-pre-wrap break-words">
+      <p className="whitespace-pre-wrap wrap-break-word">
         {isUser ? message.content : withoutPercentages(message.content)}
       </p>
     </article>

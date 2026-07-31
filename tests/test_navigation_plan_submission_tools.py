@@ -493,26 +493,31 @@ def _ledger_count(services: Services) -> int:
         ).fetchone()[0]
 
 
-def test_builder_exposes_both_phase_specific_complete_typed_schemas(tmp_path):
+def test_builder_exposes_all_phase_specific_complete_typed_schemas(tmp_path):
     services = build_services(tmp_path, "extract_sync")
 
     assert set(services.tools) == {
         "submit_extract_sync_plan_tool",
         "submit_finish_processing_plan_tool",
+        "submit_trajectory_review_plan_tool",
     }
     extract_schema = services.tools["submit_extract_sync_plan_tool"].input_schema
     finish_schema = services.tools["submit_finish_processing_plan_tool"].input_schema
-    for schema in (extract_schema, finish_schema):
+    review_schema = services.tools["submit_trajectory_review_plan_tool"].input_schema
+    for schema in (extract_schema, finish_schema, review_schema):
         assert set(schema["properties"]) == {"planning_context_revision", "plan"}
         assert set(schema["required"]) == {"planning_context_revision", "plan"}
         assert schema["additionalProperties"] is False
         assert "task_id" not in schema["properties"]
     extract_serialized = json.dumps(extract_schema)
     finish_serialized = json.dumps(finish_schema)
+    review_serialized = json.dumps(review_schema)
     assert "ExtractSyncPlanInput" in extract_serialized
     assert "FinishProcessingPlanInput" not in extract_serialized
     assert "FinishProcessingPlanInput" in finish_serialized
     assert "ExtractSyncPlanInput" not in finish_serialized
+    assert "TrajectoryReviewPlanInput" in review_serialized
+    assert "FinishProcessingPlanInput" not in review_serialized
 
 
 def test_valid_extract_submission_returns_exact_six_field_success_contract(tmp_path):

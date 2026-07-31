@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import math
+from pathlib import Path
 from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
@@ -112,6 +113,107 @@ class GoldenSample(StrictModel):
         return self
 
 
+class GoldenRoleScope(StrictModel):
+    """Role-specific identity and artifact scope for paired 2026/2027 runs."""
+
+    scope_kind: Literal[
+        "segment",
+        "postprocessing_segment",
+        "fix_segment",
+        "prepare_maps",
+        "prepare_metadata",
+    ] = "segment"
+    artifact_scope: str = "."
+    dataset_date: str = Field(pattern=r"^[0-9]{8}$")
+    source_clip: str = Field(pattern=r"^[A-Za-z0-9][A-Za-z0-9_-]*$")
+    internal_segment: str | None = Field(
+        default=None,
+        pattern=r"^[A-Za-z0-9][A-Za-z0-9_-]*$",
+    )
+    provenance: Literal[
+        "historical_unattested",
+        "runtime_attested",
+        "synthetic",
+    ]
+
+    @field_validator("artifact_scope")
+    @classmethod
+    def validate_scope(cls, value: str) -> str:
+        normalized = value.replace("\\", "/")
+        if normalized.startswith("/") or ".." in normalized.split("/"):
+            raise ValueError("role artifact scope must stay relative to the supplied root")
+        return normalized or "."
+
+    @model_validator(mode="after")
+    def validate_scope_identity(self) -> "GoldenRoleScope":
+        if self.scope_kind in {
+            "segment",
+            "postprocessing_segment",
+            "fix_segment",
+        }:
+            if self.internal_segment is None:
+                raise ValueError(
+                    "segment-like role scope requires internal_segment",
+                )
+            return self
+        expected_scope = {
+            "prepare_maps": "maps",
+            "prepare_metadata": "v1.0-trainval",
+        }[self.scope_kind]
+        if self.internal_segment is not None:
+            raise ValueError("prepare-global role scope cannot name a segment")
+        if self.artifact_scope != expected_scope:
+            raise ValueError(
+                f"{self.scope_kind} role scope must be exactly {expected_scope!r}",
+            )
+        return self
+
+
+class GoldenRoleScopes(StrictModel):
+    legacy: GoldenRoleScope
+    candidate: GoldenRoleScope
+
+
+class DocumentNormalization(StrictModel):
+    """One narrow, reviewed non-business document normalization."""
+
+    path_pattern: str
+    selector: Literal['$["paths"]["img2video_mp4"]']
+    strategy: Literal["artifact_local_file"]
+    expected_relative_path: Literal["dog.mp4"]
+
+    @field_validator("path_pattern")
+    @classmethod
+    def validate_path_pattern(cls, value: str) -> str:
+        normalized = value.replace("\\", "/")
+        if (
+            not normalized
+            or normalized.startswith("/")
+            or ".." in normalized.split("/")
+        ):
+            raise ValueError(
+                "document normalization path patterns must stay relative",
+            )
+        return normalized
+
+
+class ArtifactStageRule(StrictModel):
+    path_pattern: str
+    stage: str = Field(pattern=r"^[a-z][a-z0-9_-]*$")
+
+    @field_validator("path_pattern")
+    @classmethod
+    def validate_path_pattern(cls, value: str) -> str:
+        normalized = value.replace("\\", "/")
+        if (
+            not normalized
+            or normalized.startswith("/")
+            or ".." in normalized.split("/")
+        ):
+            raise ValueError("artifact stage patterns must stay relative")
+        return normalized
+
+
 class GoldenCase(StrictModel):
     id: str = Field(pattern=r"^[a-z][a-z0-9_-]*$")
     sample_id: str | None = Field(
@@ -125,6 +227,7 @@ class GoldenCase(StrictModel):
         "staged_sync_segment",
     ] = "synthetic"
     artifact_scope: str = "."
+    role_scopes: GoldenRoleScopes | None = None
     patterns: ArtifactPatterns = Field(default_factory=ArtifactPatterns)
     gridmap_tolerance: NumericTolerance = Field(default_factory=NumericTolerance)
     trajectory_tolerance: NumericTolerance = Field(default_factory=NumericTolerance)
@@ -133,6 +236,13 @@ class GoldenCase(StrictModel):
     applicable_stages: list[str] = Field(default_factory=list)
     excluded_stages: list[str] = Field(default_factory=list)
     expected_command_steps: list[str] = Field(default_factory=list)
+    document_normalizations: list[DocumentNormalization] = Field(
+        default_factory=list,
+    )
+    dimensions_only_image_patterns: list[str] = Field(default_factory=list)
+    artifact_stage_rules: list[ArtifactStageRule] = Field(default_factory=list)
+    candidate_attestation_required: bool = False
+    legacy_oracle_selection_required: bool = False
 
     @field_validator("artifact_scope")
     @classmethod
@@ -142,7 +252,10 @@ class GoldenCase(StrictModel):
             raise ValueError("artifact_scope must stay relative to the supplied root")
         return normalized or "."
 
-    @field_validator("ignored_artifact_patterns")
+    @field_validator(
+        "ignored_artifact_patterns",
+        "dimensions_only_image_patterns",
+    )
     @classmethod
     def validate_ignored_artifact_patterns(cls, values: list[str]) -> list[str]:
         for value in values:
@@ -185,11 +298,20 @@ class GoldenCase(StrictModel):
         ]
         if len(set(modalities)) != len(modalities):
             raise ValueError("root expectation modalities must be unique")
+        normalization_keys = [
+            (item.path_pattern, item.selector)
+            for item in self.document_normalizations
+        ]
+        if len(set(normalization_keys)) != len(normalization_keys):
+            raise ValueError("document normalizations must be unique")
+        stage_patterns = [item.path_pattern for item in self.artifact_stage_rules]
+        if len(set(stage_patterns)) != len(stage_patterns):
+            raise ValueError("artifact stage patterns must be unique")
         return self
 
 
 class GoldenCaseBundle(StrictModel):
-    schema_version: Literal[1]
+    schema_version: Literal[1, 2]
     runtime_id: str = Field(pattern=r"^[a-z][a-z0-9_-]*$")
     samples: list[GoldenSample] = Field(default_factory=list)
     cases: list[GoldenCase] = Field(min_length=1)
@@ -216,6 +338,75 @@ class GoldenCaseBundle(StrictModel):
                 "Golden cases reference unknown sample IDs: "
                 + ", ".join(unknown_samples),
             )
+        if self.schema_version == 1:
+            v2_cases = [
+                case.id
+                for case in self.cases
+                if case.role_scopes is not None
+                or case.document_normalizations
+                or case.dimensions_only_image_patterns
+                or case.artifact_stage_rules
+                or case.candidate_attestation_required
+                or case.legacy_oracle_selection_required
+            ]
+            if v2_cases:
+                raise ValueError(
+                    "Golden schema v1 cannot declare v2 comparison policies",
+                )
+        for case in self.cases:
+            if case.role_scopes is not None:
+                legacy_scope = case.role_scopes.legacy
+                candidate_scope = case.role_scopes.candidate
+                if legacy_scope.scope_kind != candidate_scope.scope_kind:
+                    raise ValueError(
+                        "Golden role scope kinds must match",
+                    )
+                if (
+                    legacy_scope.scope_kind
+                    not in {
+                        "segment",
+                        "postprocessing_segment",
+                        "fix_segment",
+                    }
+                    and case.artifact_root_kind != "finish_temp_date"
+                ):
+                    raise ValueError(
+                        "prepare-global scopes require finish_temp_date roots",
+                    )
+            if case.candidate_attestation_required and case.role_scopes is None:
+                raise ValueError(
+                    "candidate attestation requires role-specific scopes",
+                )
+            if (
+                case.role_scopes is not None
+                and case.role_scopes.candidate.provenance != "runtime_attested"
+                and case.candidate_attestation_required
+            ):
+                raise ValueError(
+                    "candidate attestation requires runtime_attested provenance",
+                )
+            if self.schema_version == 2:
+                if case.ignored_artifact_patterns:
+                    raise ValueError(
+                        "Golden schema v2 forbids ignored artifact patterns",
+                    )
+                if (
+                    case.gridmap_tolerance.abs_tol != 0
+                    or case.gridmap_tolerance.rel_tol != 0
+                    or case.trajectory_tolerance.abs_tol != 0
+                    or case.trajectory_tolerance.rel_tol != 0
+                ):
+                    raise ValueError(
+                        "Golden schema v2 requires exact numeric comparison",
+                    )
+                if any(
+                    pattern != "tracking_img_*/*"
+                    for pattern in case.dimensions_only_image_patterns
+                ):
+                    raise ValueError(
+                        "Golden schema v2 only permits the registered "
+                        "Tracking dynamic-image policy",
+                    )
         return self
 
 
@@ -254,13 +445,24 @@ class GoldenEntry(StrictModel):
     image: ImageFingerprint | None = None
     document: DocumentFingerprint | None = None
     numeric: NumericFingerprint | None = None
+    normalized_representation_sha256: str | None = Field(
+        default=None,
+        pattern=r"^[0-9a-f]{64}$",
+    )
 
     @model_validator(mode="after")
     def validate_kind_payload(self) -> "GoldenEntry":
         if self.kind == "directory":
             if self.semantic_type != "directory" or any(
                 value is not None
-                for value in (self.size, self.sha256, self.image, self.document, self.numeric)
+                for value in (
+                    self.size,
+                    self.sha256,
+                    self.image,
+                    self.document,
+                    self.numeric,
+                    self.normalized_representation_sha256,
+                )
             ):
                 raise ValueError("directory entries cannot contain file fingerprints")
             return self
@@ -270,7 +472,7 @@ class GoldenEntry(StrictModel):
 
 
 class GoldenSnapshot(StrictModel):
-    schema_version: Literal[1] = 1
+    schema_version: Literal[1, 2] = 1
     case_id: str
     role: Literal["legacy", "candidate"]
     runtime_id: str
@@ -281,6 +483,27 @@ class GoldenSnapshot(StrictModel):
     command_sequence_sha256: str | None = Field(
         default=None,
         pattern=r"^[0-9a-f]{64}$",
+    )
+    calibration_snapshot_sha256: str | None = Field(
+        default=None,
+        pattern=r"^[0-9a-f]{64}$",
+    )
+    annotation_revision_set_sha256: str | None = Field(
+        default=None,
+        pattern=r"^[0-9a-f]{64}$",
+    )
+    runtime_run_ref: str | None = Field(
+        default=None,
+        pattern=r"^[A-Za-z0-9][A-Za-z0-9_-]{15,127}$",
+    )
+    provenance: Literal[
+        "historical_unattested",
+        "runtime_attested",
+        "synthetic",
+    ] | None = None
+    oracle_ref: str | None = Field(
+        default=None,
+        pattern=r"^[A-Za-z0-9][A-Za-z0-9_-]{15,127}$",
     )
     tree_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
     entries: list[GoldenEntry]
@@ -293,7 +516,7 @@ class GoldenDifference(StrictModel):
 
 
 class GoldenComparison(StrictModel):
-    schema_version: Literal[1] = 1
+    schema_version: Literal[1, 2] = 1
     case_id: str
     runtime_id: str
     verdict: Literal["EQUIVALENT", "DIFFERENT"]
@@ -301,7 +524,193 @@ class GoldenComparison(StrictModel):
     business_equivalence: bool
     baseline_tree_sha256: str
     candidate_tree_sha256: str
+    candidate_run_ref: str | None = Field(
+        default=None,
+        pattern=r"^[A-Za-z0-9][A-Za-z0-9_-]{15,127}$",
+    )
+    oracle_ref: str | None = Field(
+        default=None,
+        pattern=r"^[A-Za-z0-9][A-Za-z0-9_-]{15,127}$",
+    )
+    runtime_manifest_sha256: str | None = Field(
+        default=None,
+        pattern=r"^[0-9a-f]{64}$",
+    )
+    calibration_snapshot_sha256: str | None = Field(
+        default=None,
+        pattern=r"^[0-9a-f]{64}$",
+    )
+    annotation_revision_set_sha256: str | None = Field(
+        default=None,
+        pattern=r"^[0-9a-f]{64}$",
+    )
     difference_count: int = Field(ge=0)
     warning_count: int = Field(ge=0)
     differences: list[GoldenDifference]
     warnings: list[GoldenDifference]
+
+
+class RuntimeRunAttestation(StrictModel):
+    """Safe projection of a committed RuntimeRun execution ledger."""
+
+    source: Literal["runtime_run"]
+    run_ref: str = Field(pattern=r"^[A-Za-z0-9][A-Za-z0-9_-]{15,127}$")
+    committed: Literal[True]
+    runtime_manifest_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    calibration_snapshot_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    annotation_revision_set_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    command_steps: list[str] = Field(min_length=1)
+
+    @field_validator("command_steps")
+    @classmethod
+    def validate_command_steps(cls, values: list[str]) -> list[str]:
+        import re
+
+        if len(set(values)) != len(values):
+            raise ValueError("attested command steps must be unique")
+        if any(
+            not re.fullmatch(r"[a-z][a-z0-9_-]*", value)
+            for value in values
+        ):
+            raise ValueError("attested command steps must be normalized IDs")
+        return values
+
+
+class StoreBoundSegment(StrictModel):
+    source_clip: str = Field(pattern=r"^[A-Za-z0-9][A-Za-z0-9_-]*$")
+    internal_segment: str = Field(pattern=r"^[A-Za-z0-9][A-Za-z0-9_-]*$")
+    artifact_scope: str
+
+    @field_validator("artifact_scope")
+    @classmethod
+    def validate_artifact_scope(cls, value: str) -> str:
+        normalized = value.replace("\\", "/")
+        if (
+            not normalized
+            or normalized.startswith("/")
+            or ".." in normalized.split("/")
+        ):
+            raise ValueError("bound segment scope must stay relative to staging")
+        return normalized
+
+
+class StoreBoundCandidate(StrictModel):
+    """Private, process-local projection binding a case to Store-owned artifacts.
+
+    ``staging_root`` and ``artifact_scope`` are deliberately not copied into
+    ``GoldenComparison``.  They exist only long enough for the comparator to
+    open the committed candidate tree.
+    """
+
+    source: Literal["annotation_store"]
+    run_ref: str = Field(pattern=r"^[A-Za-z0-9][A-Za-z0-9_-]{15,127}$")
+    dataset_date: str = Field(pattern=r"^[0-9]{8}$")
+    source_clips: list[str] = Field(min_length=1)
+    source_clip: str = Field(pattern=r"^[A-Za-z0-9][A-Za-z0-9_-]*$")
+    scope_kind: Literal[
+        "segment",
+        "postprocessing_segment",
+        "fix_segment",
+        "prepare_maps",
+        "prepare_metadata",
+    ] = "segment"
+    internal_segment: str | None = Field(
+        default=None,
+        pattern=r"^[A-Za-z0-9][A-Za-z0-9_-]*$",
+    )
+    staging_root: Path
+    artifact_scope: str
+    segments: list[StoreBoundSegment] = Field(min_length=1)
+    attestation: RuntimeRunAttestation
+
+    @field_validator("source_clips")
+    @classmethod
+    def validate_source_clips(cls, values: list[str]) -> list[str]:
+        if len(values) != len(set(values)):
+            raise ValueError("bound source clips must be unique")
+        if any(
+            not value
+            or value in {".", ".."}
+            or "/" in value
+            or "\\" in value
+            for value in values
+        ):
+            raise ValueError("bound source clips must be safe components")
+        return values
+
+    @field_validator("artifact_scope")
+    @classmethod
+    def validate_artifact_scope(cls, value: str) -> str:
+        normalized = value.replace("\\", "/")
+        if (
+            not normalized
+            or normalized.startswith("/")
+            or ".." in normalized.split("/")
+        ):
+            raise ValueError("bound artifact scope must stay relative to staging")
+        return normalized
+
+    @field_validator("staging_root")
+    @classmethod
+    def validate_staging_root(cls, value: Path) -> Path:
+        if not value.is_absolute():
+            raise ValueError("bound staging root must be absolute")
+        return value
+
+    @model_validator(mode="after")
+    def validate_binding_identity(self) -> "StoreBoundCandidate":
+        if self.attestation.run_ref != self.run_ref:
+            raise ValueError("bound RuntimeRun identity mismatch")
+        if self.source_clip not in self.source_clips:
+            raise ValueError("bound source clip is not selected by the job")
+        segment_keys = [
+            segment.internal_segment for segment in self.segments
+        ]
+        segment_scopes = [
+            segment.artifact_scope for segment in self.segments
+        ]
+        if (
+            len(segment_keys) != len(set(segment_keys))
+            or len(segment_scopes) != len(set(segment_scopes))
+            or any(
+                segment.source_clip not in self.source_clips
+                for segment in self.segments
+            )
+        ):
+            raise ValueError("bound segment mapping is inconsistent")
+        if self.scope_kind in {
+            "segment",
+            "postprocessing_segment",
+            "fix_segment",
+        }:
+            if self.internal_segment is None:
+                raise ValueError(
+                    "bound segment-like scope requires an internal segment",
+                )
+            if self.artifact_scope.replace("\\", "/").split("/")[-1] != (
+                self.internal_segment
+            ):
+                raise ValueError("bound artifact scope does not name the segment")
+            selected = [
+                segment
+                for segment in self.segments
+                if segment.internal_segment == self.internal_segment
+            ]
+            if (
+                len(selected) != 1
+                or selected[0].source_clip != self.source_clip
+                or selected[0].artifact_scope != self.artifact_scope
+            ):
+                raise ValueError("selected segment is not in the Store segment mapping")
+            return self
+        expected_scope = {
+            "prepare_maps": "maps",
+            "prepare_metadata": "v1.0-trainval",
+        }[self.scope_kind]
+        if self.internal_segment is not None:
+            raise ValueError("bound prepare-global scope cannot name a segment")
+        if self.artifact_scope != expected_scope:
+            raise ValueError(
+                "bound prepare-global scope does not match its registered kind",
+            )
+        return self

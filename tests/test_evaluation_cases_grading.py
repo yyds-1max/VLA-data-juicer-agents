@@ -9,6 +9,7 @@ from pydantic import ValidationError
 
 from vla_data_juicer_agents.evaluation.cases import (
     CaseLoadError,
+    cases_sha256,
     default_cases_root,
     load_suite,
 )
@@ -30,6 +31,7 @@ from vla_data_juicer_agents.evaluation.reporting import (
 
 SUITE = "router-smoke"
 V1_SUITE = "datapilot-v1"
+M2_SUITE = "navigation-m2"
 
 
 def _cases() -> dict[str, EvaluationCase]:
@@ -38,6 +40,10 @@ def _cases() -> dict[str, EvaluationCase]:
 
 def _v1_cases() -> dict[str, EvaluationCase]:
     return {case.id: case for case in load_suite(default_cases_root(), V1_SUITE)}
+
+
+def _m2_cases() -> dict[str, EvaluationCase]:
+    return {case.id: case for case in load_suite(default_cases_root(), M2_SUITE)}
 
 
 def test_load_router_smoke_suite_with_strict_versioned_schema():
@@ -92,6 +98,113 @@ def test_load_datapilot_v1_suite_without_rewriting_historical_suite():
     }
 
 
+def test_datapilot_v1_case_hash_ignores_m2_model_extensions():
+    cases = list(_v1_cases().values())
+
+    # This is the exact hash produced at the M1.5 base commit after the
+    # separately approved conflict-synonym case expansion. M2's shared model
+    # defaults must not move it again.
+    assert (
+        cases_sha256(cases)
+        == "cbba56291d0688aa21050fffc9181fbd93b71183a860e24085ddcbe783c47eb6"
+    )
+
+
+def test_load_navigation_m2_suite_with_router_and_specialist_entrypoints():
+    cases = _m2_cases()
+
+    assert set(cases) == {
+        "router_annotation_processing_shortcut",
+        "router_annotation_processing_and_fix_shortcut",
+        "router_continue_linked_fix",
+        "router_decline_linked_fix",
+        "navigation_postprocessing_existing_gridmap_odom",
+        "navigation_postprocessing_generate_gridmap_odom",
+        "navigation_trajectory_review_handoff",
+    }
+    assert all(case.schema_version == 2 for case in cases.values())
+    assert {
+        case.entrypoint for case in cases.values()
+    } == {"router", "navigation"}
+    pcd_case = cases["navigation_postprocessing_generate_gridmap_odom"]
+    handoff = pcd_case.expectations.tools.handoff
+    assert handoff is not None
+    assert handoff.step_variants == {
+        "run_annotation_postprocessing_workflow": "plan_bound_runtime",
+        "validate_navigation_outputs": "expect_gridmap",
+    }
+    for case_id, gridmap_source in (
+        ("navigation_postprocessing_existing_gridmap_odom", "existing_gridmap"),
+        ("navigation_postprocessing_generate_gridmap_odom", "generated_from_pcd"),
+    ):
+        postprocessing = cases[case_id]
+        expected_handoff = postprocessing.expectations.tools.handoff
+        assert expected_handoff is not None
+        assert expected_handoff.decision_modes == {
+            "calibration": "annotation_snapshot",
+            "gridmap": gridmap_source,
+            "localization": "odom",
+        }
+        assert expected_handoff.step_actions == [
+            "run_annotation_postprocessing_workflow",
+            "validate_navigation_outputs",
+        ]
+        assert postprocessing.expectations.tools.required_counts == {
+            "submit_finish_processing_plan_tool": 1,
+            "get_current_plan_step_tool": 1,
+            "run_annotation_postprocessing_workflow_tool": 1,
+        }
+        assert (
+            "get_current_plan_step_tool"
+            in postprocessing.expectations.tools.allowed_calls
+        )
+    review = cases["navigation_trajectory_review_handoff"]
+    assert review.expectations.tools.allowed_calls == [
+        "inspect_navigation_annotation_job_facts_tool",
+        "get_navigation_task_context_tool",
+        "submit_trajectory_review_plan_tool",
+        "get_current_plan_step_tool",
+        "open_trajectory_fix_workbench_tool",
+    ]
+    assert review.expectations.tools.required_counts == {
+        "submit_trajectory_review_plan_tool": 1,
+        "get_current_plan_step_tool": 1,
+        "open_trajectory_fix_workbench_tool": 1,
+    }
+    decline = cases["router_decline_linked_fix"]
+    assert decline.expectations.response.required_any_groups == [
+        [
+            "暂不",
+            "先不",
+            "延后",
+            "暂缓",
+            "不会开始",
+            "不会继续",
+            "已记录",
+            "之后需要时",
+            "后续需要时",
+            "以后需要时",
+            "需要时再",
+            "后续如需",
+            "如需后续",
+            "待复核",
+        ]
+    ]
+    assert {
+        "已开始 Fix",
+        "已经开始 Fix",
+        "已启动 Fix",
+        "已经启动 Fix",
+        "正在进行 Fix",
+        "正在继续 Fix",
+        "已经继续 Fix",
+        "现在开始 Fix",
+        "马上开始 Fix",
+        "将开始 Fix",
+        "将继续 Fix",
+    } <= set(decline.expectations.response.forbidden_terms)
+
+
 def test_case_schema_rejects_unknown_fields():
     raw = _cases()["router_capability_no_handoff"].model_dump(mode="python")
     raw["surprise"] = True
@@ -100,12 +213,24 @@ def test_case_schema_rejects_unknown_fields():
         EvaluationCase.model_validate(raw)
 
 
-@pytest.mark.parametrize("entrypoint", ["navigation", "end_to_end"])
+@pytest.mark.parametrize("entrypoint", ["end_to_end"])
 def test_v1_case_schema_rejects_unimplemented_entrypoints(entrypoint):
     raw = _cases()["router_capability_no_handoff"].model_dump(mode="python")
     raw["entrypoint"] = entrypoint
 
     with pytest.raises(ValidationError, match="literal_error"):
+        EvaluationCase.model_validate(raw)
+
+
+def test_navigation_case_schema_requires_navigation_runtime_setup():
+    raw = _cases()["router_capability_no_handoff"].model_dump(mode="python")
+    raw["schema_version"] = 2
+    raw["entrypoint"] = "navigation"
+
+    with pytest.raises(
+        ValidationError,
+        match="require runtime_setup.navigation_task",
+    ):
         EvaluationCase.model_validate(raw)
 
 
@@ -412,6 +537,212 @@ def test_datapilot_v1_contextual_direct_answers_are_strictly_tool_free(
     assert {"tools.allowed", "limits.tool_calls"} <= failed_names
 
 
+def test_navigation_plan_grading_requires_exact_business_variants():
+    case = _m2_cases()["navigation_postprocessing_generate_gridmap_odom"]
+    expected = case.expectations.tools.handoff
+    assert expected is not None
+    payload = {
+        "operation": "submit_plan",
+        "phase": expected.phase,
+        "decision_modes": expected.decision_modes,
+        "step_actions": expected.step_actions,
+        "step_variants": expected.step_variants,
+    }
+    passing = grade_case(
+        case,
+        CaseRunObservation(
+            final_response="后处理计划已验证，系统已开始执行。",
+            tool_calls=[
+                ToolCallObservation(
+                    name="submit_finish_processing_plan_tool",
+                    arguments={},
+                ),
+                ToolCallObservation(
+                    name="get_current_plan_step_tool",
+                    arguments={},
+                ),
+                ToolCallObservation(
+                    name="run_annotation_postprocessing_workflow_tool",
+                    arguments={},
+                ),
+            ],
+            handoffs=[payload],
+            model_calls=1,
+        ),
+    )
+    assert passing.status is EvaluationStatus.PASS
+
+    wrong_variant = dict(payload)
+    wrong_variant["step_variants"] = {
+        **dict(expected.step_variants or {}),
+        "run_annotation_postprocessing_workflow": "durable_web_handoff",
+    }
+    failing = grade_case(
+        case,
+        CaseRunObservation(
+            final_response="后处理计划已验证，系统已开始执行。",
+            tool_calls=[
+                ToolCallObservation(
+                    name="submit_finish_processing_plan_tool",
+                    arguments={},
+                ),
+                ToolCallObservation(
+                    name="get_current_plan_step_tool",
+                    arguments={},
+                ),
+                ToolCallObservation(
+                    name="run_annotation_postprocessing_workflow_tool",
+                    arguments={},
+                ),
+            ],
+            handoffs=[wrong_variant],
+            model_calls=1,
+        ),
+    )
+    assert failing.status is EvaluationStatus.FAIL
+    assert {
+        check.name for check in failing.checks if not check.passed
+    } == {"handoff.step_variants"}
+
+
+@pytest.mark.parametrize(
+    "response",
+    [
+        "已记录您的选择，当前不启动 Fix。后续如需处理，再告诉我即可。",
+        "已记录您的选择。如需后续修正轨迹，我可以再继续。",
+    ],
+)
+def test_router_decline_linked_fix_accepts_clear_deferral_responses(
+    response: str,
+) -> None:
+    case = _m2_cases()["router_decline_linked_fix"]
+
+    result = grade_case(
+        case,
+        CaseRunObservation(final_response=response, model_calls=1),
+    )
+
+    assert result.status is EvaluationStatus.PASS
+
+
+@pytest.mark.parametrize(
+    "response",
+    [
+        "已记录您的选择，但已经开始 Fix。",
+        "已记录您的选择，正在继续 Fix。",
+        "已记录您的选择，马上开始 Fix。",
+    ],
+)
+def test_router_decline_linked_fix_rejects_false_progress_claims(
+    response: str,
+) -> None:
+    case = _m2_cases()["router_decline_linked_fix"]
+
+    result = grade_case(
+        case,
+        CaseRunObservation(final_response=response, model_calls=1),
+    )
+
+    assert result.status is EvaluationStatus.FAIL
+    assert {
+        check.name for check in result.checks if not check.passed
+    } == {"response.forbidden_terms"}
+
+
+@pytest.mark.parametrize(
+    ("case_id", "tool_names"),
+    [
+        (
+            "navigation_postprocessing_existing_gridmap_odom",
+            [
+                "submit_finish_processing_plan_tool",
+                "get_current_plan_step_tool",
+                "run_annotation_postprocessing_workflow_tool",
+            ],
+        ),
+        (
+            "navigation_postprocessing_generate_gridmap_odom",
+            [
+                "submit_finish_processing_plan_tool",
+                "get_current_plan_step_tool",
+                "run_annotation_postprocessing_workflow_tool",
+            ],
+        ),
+        (
+            "navigation_trajectory_review_handoff",
+            [
+                "submit_trajectory_review_plan_tool",
+                "get_current_plan_step_tool",
+                "open_trajectory_fix_workbench_tool",
+            ],
+        ),
+    ],
+)
+def test_navigation_background_handoffs_accept_empty_final_but_keep_leak_checks(
+    case_id: str,
+    tool_names: list[str],
+) -> None:
+    case = _m2_cases()[case_id]
+    expected = case.expectations.tools.handoff
+    assert expected is not None
+    assert case.expectations.response.language == "Chinese"
+    assert case.expectations.response.allow_empty is True
+    payload = {
+        "operation": expected.operation,
+        "phase": expected.phase,
+        "decision_modes": expected.decision_modes,
+        "step_actions": expected.step_actions,
+        "step_variants": expected.step_variants,
+    }
+    common = {
+        "tool_calls": [
+            ToolCallObservation(name=name, arguments={})
+            for name in tool_names
+        ],
+        "handoffs": [payload],
+        "model_calls": 1,
+    }
+
+    empty = grade_case(
+        case,
+        CaseRunObservation(final_response="", **common),
+    )
+    assert empty.status is EvaluationStatus.PASS
+
+    chinese = grade_case(
+        case,
+        CaseRunObservation(
+            final_response="任务已转入后台处理，完成后会自动恢复。",
+            **common,
+        ),
+    )
+    assert chinese.status is EvaluationStatus.PASS
+
+    english = grade_case(
+        case,
+        CaseRunObservation(
+            final_response="Processing continues in the background.",
+            **common,
+        ),
+    )
+    assert english.status is EvaluationStatus.FAIL
+    assert {
+        check.name for check in english.checks if not check.passed
+    } == {"response.language"}
+
+    leaking = grade_case(
+        case,
+        CaseRunObservation(
+            final_response="任务已转入后台处理，内部产物位于 /media/private/location。",
+            **common,
+        ),
+    )
+    assert leaking.status is EvaluationStatus.FAIL
+    assert {
+        check.name for check in leaking.checks if not check.passed
+    } == {"response.forbidden_terms"}
+
+
 def test_runtime_setup_rejects_mixed_focused_task_and_trusted_request_context():
     case = _v1_cases()["router_shortcut_trusted_context_exact_scope"]
     raw = case.model_dump(mode="python")
@@ -422,7 +753,7 @@ def test_runtime_setup_rejects_mixed_focused_task_and_trusted_request_context():
         "selection": {"kind": "all_clips"},
     }
 
-    with pytest.raises(ValidationError, match="cannot be seeded together"):
+    with pytest.raises(ValidationError, match="are exclusive"):
         EvaluationCase.model_validate(raw)
 
 

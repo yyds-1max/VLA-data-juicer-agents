@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from typing import Annotated, Any, Literal
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 
 class StrictModel(BaseModel):
@@ -74,9 +74,42 @@ class GridmapDecision(DecisionBase):
 
 
 class CalibrationDecision(DecisionBase):
-    mode: Literal["hardcoded_with_user_confirmation", "selected_profile"]
-    selected_sensor_source: str
+    mode: Literal[
+        "hardcoded_with_user_confirmation",
+        "selected_profile",
+        "annotation_snapshot",
+    ]
+    selected_sensor_source: str | None
     requires_user_confirmation: bool
+
+    @model_validator(mode="after")
+    def validate_source_contract(self) -> "CalibrationDecision":
+        if self.mode == "annotation_snapshot":
+            if self.selected_sensor_source is not None:
+                raise ValueError(
+                    "annotation_snapshot calibration is resolved server-side"
+                )
+            if self.requires_user_confirmation:
+                raise ValueError(
+                    "annotation_snapshot calibration does not request confirmation"
+                )
+        elif (
+            self.mode == "selected_profile"
+            and self.requires_user_confirmation
+            and self.selected_sensor_source is None
+        ):
+            # A new Annotation Job deliberately defers the authoritative
+            # profile choice to the plan-bound structured interaction.  The
+            # cross-field validator requires that interaction to be present;
+            # downstream execution consumes its durable decision rather than
+            # a model-authored default.
+            pass
+        elif (
+            not isinstance(self.selected_sensor_source, str)
+            or not self.selected_sensor_source.strip()
+        ):
+            raise ValueError("selected calibration source must be non-empty")
+        return self
 
 
 class EmptyArguments(StrictModel):
@@ -136,6 +169,12 @@ class TrackingStep(StepBase):
     arguments: EmptyArguments
 
 
+class AnnotationTrackingWorkflowStep(StepBase):
+    action: Literal["run_annotation_tracking_workflow"]
+    variant: Literal["durable_web_handoff"]
+    arguments: EmptyArguments
+
+
 class PrepareGridmapStep(StepBase):
     action: Literal["prepare_gridmap_for_projection"]
     variant: Literal["copy_existing_gridmap", "generate_from_pcd", "skip_if_projection_ready"]
@@ -148,9 +187,27 @@ class ProjectionStep(StepBase):
     arguments: EmptyArguments
 
 
+class AnnotationPostprocessingWorkflowStep(StepBase):
+    action: Literal["run_annotation_postprocessing_workflow"]
+    variant: Literal["plan_bound_runtime"]
+    arguments: EmptyArguments
+
+
 class ValidateOutputsStep(StepBase):
     action: Literal["validate_navigation_outputs"]
     variant: Literal["expect_gridmap"]
+    arguments: EmptyArguments
+
+
+class OpenTrajectoryFixWorkbenchStep(StepBase):
+    action: Literal["open_trajectory_fix_workbench"]
+    variant: Literal["durable_human_handoff"]
+    arguments: EmptyArguments
+
+
+class ValidateTrajectoryReviewOutcomeStep(StepBase):
+    action: Literal["validate_trajectory_review_outcome"]
+    variant: Literal["approved_or_terminal"]
     arguments: EmptyArguments
 
 
@@ -164,9 +221,15 @@ FinishProcessingStepInput = Annotated[
     | NoobscenePreprocessingStep
     | InitialAnnotationStep
     | TrackingStep
+    | AnnotationTrackingWorkflowStep
     | PrepareGridmapStep
     | ProjectionStep
+    | AnnotationPostprocessingWorkflowStep
     | ValidateOutputsStep,
+    Field(discriminator="action"),
+]
+TrajectoryReviewStepInput = Annotated[
+    OpenTrajectoryFixWorkbenchStep | ValidateTrajectoryReviewOutcomeStep,
     Field(discriminator="action"),
 ]
 
@@ -183,6 +246,14 @@ class FinishProcessingDecisions(StrictModel):
     calibration: CalibrationDecision
 
 
+class TrajectoryReviewDecision(DecisionBase):
+    mode: Literal["human_fix"]
+
+
+class TrajectoryReviewDecisions(StrictModel):
+    review: TrajectoryReviewDecision
+
+
 class ExtractSyncPlanInput(StrictModel):
     decisions: ExtractSyncDecisions
     steps: list[ExtractSyncStepInput] = Field(min_length=1)
@@ -191,6 +262,11 @@ class ExtractSyncPlanInput(StrictModel):
 class FinishProcessingPlanInput(StrictModel):
     decisions: FinishProcessingDecisions
     steps: list[FinishProcessingStepInput] = Field(min_length=1)
+
+
+class TrajectoryReviewPlanInput(StrictModel):
+    decisions: TrajectoryReviewDecisions
+    steps: list[TrajectoryReviewStepInput] = Field(min_length=1)
 
 
 class PlanValidationIssue(StrictModel):
@@ -209,19 +285,19 @@ class PlanValidationReport(StrictModel):
 class NavigationPlanRecord(StrictModel):
     plan_id: str
     task_id: str
-    phase: Literal["extract_sync", "finish_processing"]
+    phase: Literal["extract_sync", "finish_processing", "trajectory_review"]
     plan_revision: int
     contract_version: str
     observation_revision: int
     status: Literal["active", "superseded", "completed", "invalidated"]
-    plan: ExtractSyncPlanInput | FinishProcessingPlanInput
+    plan: ExtractSyncPlanInput | FinishProcessingPlanInput | TrajectoryReviewPlanInput
     created_at: str
 
 
 class PlanSubmissionAttempt(StrictModel):
     attempt_id: str
     task_id: str
-    phase: Literal["extract_sync", "finish_processing"]
+    phase: Literal["extract_sync", "finish_processing", "trajectory_review"]
     planning_context_revision: str
     candidate: dict[str, Any]
     validation: PlanValidationReport

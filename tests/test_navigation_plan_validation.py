@@ -8,6 +8,7 @@ from vla_data_juicer_agents.navigation.catalog import (
     list_navigation_tool_capabilities,
 )
 from vla_data_juicer_agents.navigation.observation_models import (
+    AnnotationJobFactsObservation,
     ArtifactStateObservation,
     CalibrationInventoryObservation,
     EvidenceDescriptor,
@@ -26,6 +27,7 @@ from vla_data_juicer_agents.navigation.plan_models import (
     ExtractSyncPlanInput,
     FinishProcessingPlanInput,
     PlanValidationIssue,
+    TrajectoryReviewPlanInput,
 )
 from vla_data_juicer_agents.navigation.plan_validation import validate_navigation_plan
 from vla_data_juicer_agents.navigation.task_state import (
@@ -366,6 +368,72 @@ def valid_finish_plan_payload() -> dict:
     }
 
 
+def valid_trajectory_review_plan_payload() -> dict:
+    return {
+        "decisions": {
+            "review": {
+                "mode": "human_fix",
+                "reason": "Open the linked Web workbench.",
+                "evidence_refs": ["evidence:annotation-review"],
+            }
+        },
+        "steps": [
+            {
+                "step_id": "open_fix",
+                "action": "open_trajectory_fix_workbench",
+                "variant": "durable_human_handoff",
+                "arguments": {},
+                "depends_on": [],
+                "failure_policy": "stop",
+                "decision_refs": ["review"],
+            },
+            {
+                "step_id": "validate_review",
+                "action": "validate_trajectory_review_outcome",
+                "variant": "approved_or_terminal",
+                "arguments": {},
+                "depends_on": ["open_fix"],
+                "failure_policy": "stop",
+                "decision_refs": ["review"],
+            },
+        ],
+    }
+
+
+def trajectory_review_observation() -> NavigationObservationRevision:
+    return NavigationObservationRevision(
+        task_id="nav-plan-1",
+        revision=1,
+        completed_kinds=["annotation_job_facts"],
+        payloads=[
+            AnnotationJobFactsObservation(
+                job_status="annotated",
+                segment_count=1,
+                tracked_count=1,
+                annotated_count=1,
+                ready_for_trajectory_review=True,
+            )
+        ],
+    )
+
+
+def validate_trajectory_review(payload: dict):
+    plan = TrajectoryReviewPlanInput.model_validate(payload)
+    return validate_navigation_plan(
+        task=finish_task().model_copy(update={"target": "trajectory_review"}),
+        observation=trajectory_review_observation(),
+        plan=plan,
+        evidence=[
+            descriptor(
+                "evidence:annotation-review",
+                1,
+                kind="annotation_job_facts",
+            )
+        ],
+        capabilities=list_navigation_tool_capabilities(),
+    )
+
+
 def validate_extract(
     payload: dict | None = None,
     *,
@@ -447,6 +515,21 @@ def test_selected_calibration_profile_still_requires_confirmation():
     report = validate_finish(payload)
 
     assert "calibration_confirmation_required" in issue_codes(report)
+
+
+def test_selected_calibration_profile_can_defer_to_structured_confirmation():
+    payload = valid_finish_plan_payload()
+    payload["decisions"]["calibration"].update(
+        {
+            "mode": "selected_profile",
+            "selected_sensor_source": None,
+            "requires_user_confirmation": True,
+        }
+    )
+
+    report = validate_finish(payload)
+
+    assert report.ok is True
 
 
 def test_incomplete_finish_pipeline_is_rejected_when_final_outputs_are_absent():
@@ -769,6 +852,37 @@ def test_duplicate_step_ids_are_rejected_without_collapsing_the_graph():
     assert report.errors[0].code == "duplicate_step_id"
 
 
+@pytest.mark.parametrize(
+    ("payload_factory", "validator"),
+    [
+        (valid_extract_plan_payload, validate_extract),
+        (valid_finish_plan_payload, validate_finish),
+        (valid_trajectory_review_plan_payload, validate_trajectory_review),
+    ],
+    ids=["extract_sync", "finish_processing", "trajectory_review"],
+)
+def test_each_plan_phase_rejects_a_repeated_business_action(
+    payload_factory,
+    validator,
+):
+    payload = payload_factory()
+    duplicate_index = len(payload["steps"])
+    duplicate = {
+        **payload["steps"][0],
+        "step_id": "duplicate_business_action",
+        "depends_on": [payload["steps"][-1]["step_id"]],
+    }
+    payload["steps"].append(duplicate)
+
+    report = validator(payload)
+
+    assert any(
+        issue.path == f"plan.steps.{duplicate_index}.action"
+        and issue.code == "duplicate_action"
+        for issue in report.errors
+    )
+
+
 def test_unknown_dependencies_are_rejected_at_dependency_index():
     payload = valid_extract_plan_payload()
     payload["steps"][1]["depends_on"] = ["missing"]
@@ -796,6 +910,21 @@ def test_required_calibration_confirmation_step_cannot_be_omitted():
     report = validate_finish(payload)
 
     assert "missing_calibration_confirmation" in issue_codes(report)
+
+
+def test_annotation_snapshot_cannot_include_calibration_confirmation_step():
+    payload = valid_finish_plan_payload()
+    payload["decisions"]["calibration"].update(
+        {
+            "mode": "annotation_snapshot",
+            "selected_sensor_source": None,
+            "requires_user_confirmation": False,
+        }
+    )
+
+    report = validate_finish(payload)
+
+    assert "unexpected_calibration_confirmation" in issue_codes(report)
 
 
 @pytest.mark.parametrize(

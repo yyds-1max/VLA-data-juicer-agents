@@ -100,8 +100,69 @@ For server use, run the bundled web script from the repository root. It builds t
 the backend with `frontend/dist` mounted, and records a PID/log under `.djx`:
 
 ```bash
+nvm install
+nvm use
+npm install --global npm@11.16.0
+cd frontend
+npm ci
+cd ..
 ./scripts/run_web.sh start
 ```
+
+Frontend builds are pinned to Node.js `24.18.0` and npm `11.16.0`. The
+repository `.nvmrc` selects the required Node.js version. In a non-interactive
+server environment, set `VLA_FRONTEND_NODE_BIN_DIR` to that installation's
+absolute `bin` directory; `run_web.sh` prepends it only for the frontend build
+and rejects a mismatched toolchain before invoking npm. Set
+`SKIP_FRONTEND_BUILD=1` only to reuse an already verified `frontend/dist`; that
+path does not require Node.js or npm.
+
+Run `npm ci` on the first deployment and whenever `frontend/package-lock.json`
+changes; `run_web.sh` builds the installed dependency tree but does not install
+packages. The shadcn MCP and shadcn CLI are local development aids and are not
+installed or executed on the server.
+
+For a persistent server deployment, `run_web.sh` automatically reads the one
+fixed configuration file:
+
+```text
+~/.config/vla-data-juicer-agents/run-web.json
+```
+
+The application directory must be a real directory owned by the service user
+with mode `0700`; `run-web.json` must be a real, single-link regular file owned
+by that user with mode `0600`. The file is strict JSON, not a shell fragment:
+
+```json
+{
+  "WORKING_DIR": "/srv/datapilot/state",
+  "VLA_DATA_AGENT_WEB_WORKING_DIR": "/srv/datapilot/state",
+  "VLA_FRONTEND_NODE_BIN_DIR": "/home/service/.nvm/versions/node/v24.18.0/bin",
+  "VLA_ANNOTATION_WORK_ROOT": "/srv/datapilot/annotation-work",
+  "VLA_NAVIGATION_ODOM_V1_SOURCE": "/srv/datapilot/runtime/navigation_odom_v1/source",
+  "VLA_NAVIGATION_ODOM_V1_MANIFEST": "/srv/datapilot/app/runtime/navigation_odom_v1/manifest.json",
+  "VLA_NAVIGATION_WRITER_LOCK_PATH": "/srv/datapilot/locks/navigation-writer.lock",
+  "VLA_VLADATASETS_ROOT": "/srv/vla-datasets"
+}
+```
+
+Only the documented Web paths, the fixed frontend Node directory, and the
+non-secret Annotation Runtime variables are accepted. Unknown keys, duplicate
+JSON keys, symlinks, hardlinks, unsafe permissions, and oversized files make
+startup fail closed. The script never `source`s or `eval`s this file and does
+not accept an alternate configuration path. Explicit variables already
+present in the calling environment take precedence over matching JSON keys.
+`DASHSCOPE_API_KEY` is intentionally not accepted in this file; it must be
+inherited from the calling shell or injected by the deployment's credential
+manager.
+
+Treat `STATE_DIR`, `PID_FILE`, `LOG_DIR`, `LOG_FILE`, and `WORKING_DIR` as
+immutable while the service is running. Stop the service with the existing
+configuration before changing those values, otherwise the new configuration
+cannot safely identify the old process. An invalid or unsafe configuration
+intentionally blocks every action, including `status`, `logs`, and `stop`;
+repair the JSON or its ownership/permissions first, then rerun the control
+command.
 
 The default server URL is:
 
@@ -138,6 +199,39 @@ Override settings with environment variables when needed:
 ```bash
 HOST=0.0.0.0 PORT=8765 VLA_VLADATASETS_ROOT=/media/heying/hy_data1/VLADatasets ./scripts/run_web.sh start
 ```
+
+`WORKING_DIR` is the script's authoritative `--working-dir` value. If it is
+unset, the script adopts `VLA_DATA_AGENT_WEB_WORKING_DIR`; if both variables are
+set, their values must match exactly or `start`, `foreground`, and `restart`
+fail before the frontend build. `stop`, `status`, and `logs` remain available
+under a stale conflicting environment so operators can inspect or stop an
+existing service. When neither is set, `WORKING_DIR` defaults to `STATE_DIR`.
+The PID and log paths remain controlled separately by `STATE_DIR`, `PID_FILE`,
+and `LOG_FILE`.
+
+The script creates new `WORKING_DIR`, `STATE_DIR`, and log directories under
+`umask 077`. It does not change permissions on directories that already exist;
+server operators must make sure an existing Web working directory already meets
+the backend's ownership and permission checks.
+
+Background `start`, `stop`, `restart`, and `status` operations are serialized by
+`scripts/run_web_control.py`. The helper requires the PID-file parent to be a
+real, current-user-owned directory that is not group/other writable, and rejects
+symlinked, non-regular, multiply linked, foreign-owned, or group/other-writable
+PID/control/instance files. A PID record is valid only when it contains one
+canonical decimal PID greater than 1 and matches both the live instance lock
+held by the Web process and its recorded OS process-birth identity (Linux boot
+ID plus `/proc/<pid>/stat` start time, or the macOS kernel process start time).
+Stale or reused PIDs are never signalled; Linux signalling additionally uses a
+pidfd. A stale instance record that is still locked blocks a new start and is
+preserved for operator review. The helper uses an exclusive lock on the stable
+`/usr` directory inode before the per-PID control lock, so concurrent lifecycle
+commands remain serialized even if a state directory is renamed and recreated.
+Its internal lifecycle action also verifies the inherited anchor, PID-parent,
+and control-lock file descriptors rather than trusting an environment marker.
+Those control descriptors are closed before the Web process is launched. The
+server must therefore support POSIX `flock` on `/usr`; verify this during
+deployment preflight.
 
 For local frontend development, run the backend API from the repository root:
 

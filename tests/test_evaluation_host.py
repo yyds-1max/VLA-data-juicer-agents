@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
 import pytest
@@ -7,10 +8,15 @@ from agentscope.app._manager import BackgroundTaskManager, SchedulerManager
 from agentscope.app.workspace_manager import LocalWorkspaceManager
 from agentscope.message import ToolCallBlock, ToolResultState
 
-from navigation_agentscope_harness import ScriptedChatModel, runtime_config
+from navigation_agentscope_harness import (
+    ScriptedChatModel,
+    latest_tool_result_json,
+    runtime_config,
+)
 from vla_data_juicer_agents.evaluation.host import (
     EvaluationHost,
     RecordingRouterRuntime,
+    run_navigation_case,
     run_router_case,
 )
 from vla_data_juicer_agents.evaluation.trace import (
@@ -566,6 +572,419 @@ async def test_v1_multiturn_start_then_stop_reuses_runtime_context(tmp_path):
     assert [handoff["operation"] for handoff in result.handoffs] == ["start", "stop"]
     assert len(result.model_calls) == 2
     assert sum(event["type"] == "REPLY_END" for event in result.events) == 2
+    assert result.final_text == ""
+    assert result.forbidden_calls == ()
+    model.assert_exhausted()
+
+
+@pytest.mark.asyncio
+async def test_navigation_evaluation_host_records_postprocessing_plan_without_io(
+    tmp_path,
+):
+    model = ScriptedChatModel()
+    model.enqueue_tool("inspect_navigation_annotation_job_facts_tool", {})
+    model.enqueue_tool("inspect_navigation_localization_sources_tool", {})
+    model.enqueue_tool("inspect_navigation_gridmap_artifacts_tool", {})
+    model.enqueue_tool("inspect_navigation_runtime_assets_tool", {})
+    model.enqueue_tool("inspect_navigation_artifact_state_tool", {})
+    model.enqueue_tool("inspect_navigation_calibration_inventory_tool", {})
+    model.enqueue_tool("get_navigation_task_context_tool", {})
+    model.enqueue_tool(
+        "submit_finish_processing_plan_tool",
+        lambda messages: {
+            "planning_context_revision": latest_tool_result_json(messages)[
+                "planning_context_revision"
+            ],
+            "plan": {
+                "decisions": {
+                    "localization": {
+                        "reason": "已观察到 odom 且转换能力可用",
+                        "evidence_refs": ["localization_sources:eval"],
+                        "source": "odom",
+                        "conversion": "odom_to_ins",
+                    },
+                    "gridmap": {
+                        "reason": "已有同步 gridmap 可复用",
+                        "evidence_refs": ["gridmap_artifacts:eval"],
+                        "source": "existing_gridmap",
+                    },
+                    "calibration": {
+                        "reason": "沿用 Annotation Job 冻结的处理标定快照",
+                        "evidence_refs": ["annotation_job_facts:eval"],
+                        "mode": "annotation_snapshot",
+                        "selected_sensor_source": None,
+                        "requires_user_confirmation": False,
+                    },
+                },
+                "steps": [
+                    {
+                        "step_id": "run_postprocessing",
+                        "action": "run_annotation_postprocessing_workflow",
+                        "variant": "plan_bound_runtime",
+                        "arguments": {},
+                        "depends_on": [],
+                        "failure_policy": "stop",
+                        "decision_refs": ["localization", "calibration", "gridmap"],
+                    },
+                    {
+                        "step_id": "validate_outputs",
+                        "action": "validate_navigation_outputs",
+                        "variant": "expect_gridmap",
+                        "arguments": {},
+                        "depends_on": ["run_postprocessing"],
+                        "failure_policy": "stop",
+                        "decision_refs": ["localization", "gridmap"],
+                    },
+                ],
+            },
+        },
+    )
+    model.enqueue_tool(
+        "get_current_plan_step_tool",
+        lambda messages: {
+            "plan_id": latest_tool_result_json(messages)["plan_id"],
+        },
+    )
+    model.enqueue_tool(
+        "run_annotation_postprocessing_workflow_tool",
+        lambda messages: {
+            "plan_id": latest_tool_result_json(messages)["plan_id"],
+            "step_id": latest_tool_result_json(messages)["step_id"],
+        },
+    )
+
+    result = await run_navigation_case(
+        "执行自动标注并完成后处理",
+        config=runtime_config(tmp_path),
+        workspace_root=tmp_path,
+        web_session_id="navigation-postprocessing",
+        model_factory=_model_factory(model),
+        runtime_setup={
+            "navigation_task": {
+                "dataset_date": "20270623",
+                "selection": {
+                    "kind": "selected_clips",
+                    "clips": ["20260623_145550"],
+                },
+                "scene_mode": "out",
+                "requested_outcome": "postprocessing",
+            },
+        },
+    )
+
+    assert result.session_id == "navigation-postprocessing__navigation-data-agent"
+    visible_tools = set(result.model_calls[0]["tools"])
+    assert visible_tools == {
+        "inspect_navigation_annotation_job_facts_tool",
+        "inspect_navigation_artifact_state_tool",
+        "inspect_navigation_runtime_assets_tool",
+        "inspect_navigation_calibration_inventory_tool",
+        "inspect_navigation_localization_sources_tool",
+        "inspect_navigation_gridmap_artifacts_tool",
+        "get_navigation_task_context_tool",
+    }
+    assert any(
+        "submit_finish_processing_plan_tool" in model_call["tools"]
+        for model_call in result.model_calls[1:]
+    )
+    assert set(result.model_calls[-1]["tools"]) == {
+        "get_current_plan_step_tool",
+        "run_annotation_postprocessing_workflow_tool",
+    }
+    context_result = json.loads(
+        next(
+            call["result"]
+            for call in result.tool_calls
+            if call["name"] == "get_navigation_task_context_tool"
+        )
+    )
+    assert {
+        "task_id",
+        "request",
+        "target",
+        "date",
+        "segments",
+        "scene_mode",
+        "planning_context_revision",
+        "observation_revision",
+        "observed_kinds",
+        "fact_summary",
+        "available_stage_ids",
+        "evidence_catalog",
+        "evidence_next_cursor",
+    } == set(context_result)
+    assert "task" not in context_result
+    assert result.handoffs == (
+        {
+            "operation": "submit_plan",
+            "phase": "finish_processing",
+            "decision_modes": {
+                "calibration": "annotation_snapshot",
+                "gridmap": "existing_gridmap",
+                "localization": "odom",
+            },
+            "step_actions": [
+                "run_annotation_postprocessing_workflow",
+                "validate_navigation_outputs",
+            ],
+            "step_variants": {
+                "run_annotation_postprocessing_workflow": "plan_bound_runtime",
+                "validate_navigation_outputs": "expect_gridmap",
+            },
+        },
+    )
+    assert [call["name"] for call in result.tool_calls][-3:] == [
+        "submit_finish_processing_plan_tool",
+        "get_current_plan_step_tool",
+        "run_annotation_postprocessing_workflow_tool",
+    ]
+    current_step = json.loads(result.tool_calls[-2]["result"])
+    assert current_step == {
+        "plan_id": "eval-plan",
+        "step_id": "run_postprocessing",
+        "action": "run_annotation_postprocessing_workflow",
+        "status": "pending",
+    }
+    assert "eval-step-record" not in result.tool_calls[-2]["result"]
+    assert '"status": "running_in_background"' in result.tool_calls[-1]["result"]
+    assert '"action": "run_annotation_postprocessing_workflow"' in (
+        result.tool_calls[-1]["result"]
+    )
+    assert result.final_text == ""
+    assert result.forbidden_calls == ()
+    model.assert_exhausted()
+
+
+@pytest.mark.asyncio
+async def test_navigation_evaluation_host_rejects_inconsistent_finish_plan(
+    tmp_path,
+):
+    model = ScriptedChatModel()
+    for name in (
+        "inspect_navigation_annotation_job_facts_tool",
+        "inspect_navigation_artifact_state_tool",
+        "inspect_navigation_runtime_assets_tool",
+        "inspect_navigation_calibration_inventory_tool",
+        "inspect_navigation_localization_sources_tool",
+        "inspect_navigation_gridmap_artifacts_tool",
+        "get_navigation_task_context_tool",
+    ):
+        model.enqueue_tool(name, {})
+    model.enqueue_tool(
+        "submit_finish_processing_plan_tool",
+        lambda messages: {
+            "planning_context_revision": latest_tool_result_json(messages)[
+                "planning_context_revision"
+            ],
+            "plan": {
+                "decisions": {
+                    "localization": {
+                        "reason": "已观察到 odom",
+                        "evidence_refs": ["localization_sources:eval"],
+                        "source": "odom",
+                        "conversion": "odom_to_ins",
+                    },
+                    "gridmap": {
+                        "reason": "已有同步 gridmap",
+                        "evidence_refs": ["gridmap_artifacts:eval"],
+                        "source": "existing_gridmap",
+                    },
+                    "calibration": {
+                        "reason": "沿用冻结的处理标定",
+                        "evidence_refs": ["annotation_job_facts:eval"],
+                        "mode": "annotation_snapshot",
+                        "selected_sensor_source": None,
+                        "requires_user_confirmation": False,
+                    },
+                },
+                "steps": [
+                    {
+                        "step_id": "confirm_calibration",
+                        "action": "confirm_navigation_calibration_params",
+                        "variant": "default",
+                        "arguments": {},
+                        "depends_on": [],
+                        "failure_policy": "stop",
+                        "decision_refs": ["calibration"],
+                    },
+                    {
+                        "step_id": "run_postprocessing",
+                        "action": "run_annotation_postprocessing_workflow",
+                        "variant": "plan_bound_runtime",
+                        "arguments": {},
+                        "depends_on": ["confirm_calibration"],
+                        "failure_policy": "stop",
+                        "decision_refs": [
+                            "localization",
+                            "calibration",
+                            "gridmap",
+                        ],
+                    },
+                    {
+                        "step_id": "validate_outputs",
+                        "action": "validate_navigation_outputs",
+                        "variant": "expect_gridmap",
+                        "arguments": {},
+                        "depends_on": ["run_postprocessing"],
+                        "failure_policy": "stop",
+                        "decision_refs": ["localization", "gridmap"],
+                    },
+                ],
+            },
+        },
+    )
+    model.enqueue_text("Answer:\n计划存在冲突，需要重新规划。")
+
+    result = await run_navigation_case(
+        "执行自动标注并完成后处理",
+        config=runtime_config(tmp_path),
+        workspace_root=tmp_path,
+        web_session_id="navigation-invalid-plan",
+        model_factory=_model_factory(model),
+        runtime_setup={
+            "navigation_task": {
+                "dataset_date": "20270623",
+                "selection": {
+                    "kind": "selected_clips",
+                    "clips": ["20260623_145550"],
+                },
+                "scene_mode": "out",
+                "requested_outcome": "postprocessing",
+            },
+        },
+    )
+
+    assert result.handoffs == ()
+    assert result.final_text == "计划存在冲突，需要重新规划。"
+    assert "unexpected_calibration_confirmation" in (
+        result.tool_calls[-1]["result"]
+    )
+    assert "run_annotation_postprocessing_workflow_tool" not in {
+        call["name"] for call in result.tool_calls
+    }
+    model.assert_exhausted()
+
+
+@pytest.mark.asyncio
+async def test_navigation_evaluation_host_records_linked_review_plan(tmp_path):
+    model = ScriptedChatModel()
+    model.enqueue_tool("inspect_navigation_annotation_job_facts_tool", {})
+    model.enqueue_tool("get_navigation_task_context_tool", {})
+    model.enqueue_tool(
+        "submit_trajectory_review_plan_tool",
+        lambda messages: {
+            "planning_context_revision": latest_tool_result_json(messages)[
+                "planning_context_revision"
+            ],
+            "plan": {
+                "decisions": {
+                    "review": {
+                        "reason": "存在待人工复核的轨迹版本",
+                        "evidence_refs": ["annotation_job_facts:eval"],
+                        "mode": "human_fix",
+                    },
+                },
+                "steps": [
+                    {
+                        "step_id": "open_fix",
+                        "action": "open_trajectory_fix_workbench",
+                        "variant": "durable_human_handoff",
+                        "arguments": {},
+                        "depends_on": [],
+                        "failure_policy": "stop",
+                        "decision_refs": ["review"],
+                    },
+                    {
+                        "step_id": "validate_review",
+                        "action": "validate_trajectory_review_outcome",
+                        "variant": "approved_or_terminal",
+                        "arguments": {},
+                        "depends_on": ["open_fix"],
+                        "failure_policy": "stop",
+                        "decision_refs": ["review"],
+                    },
+                ],
+            },
+        },
+    )
+    model.enqueue_tool(
+        "get_current_plan_step_tool",
+        lambda messages: {
+            "plan_id": latest_tool_result_json(messages)["plan_id"],
+        },
+    )
+    model.enqueue_tool(
+        "open_trajectory_fix_workbench_tool",
+        lambda messages: {
+            "plan_id": latest_tool_result_json(messages)["plan_id"],
+            "step_id": latest_tool_result_json(messages)["step_id"],
+        },
+    )
+
+    result = await run_navigation_case(
+        "继续 Fix",
+        config=runtime_config(tmp_path),
+        workspace_root=tmp_path,
+        web_session_id="navigation-fix",
+        model_factory=_model_factory(model),
+        runtime_setup={
+            "navigation_task": {
+                "dataset_date": "20270623",
+                "selection": {
+                    "kind": "selected_clips",
+                    "clips": ["20260623_145550"],
+                },
+                "scene_mode": "out",
+                "requested_outcome": "trajectory_fix",
+            },
+        },
+    )
+
+    assert result.handoffs == (
+        {
+            "operation": "submit_plan",
+            "phase": "trajectory_review",
+            "decision_modes": {"review": "human_fix"},
+            "step_actions": [
+                "open_trajectory_fix_workbench",
+                "validate_trajectory_review_outcome",
+            ],
+            "step_variants": {
+                "open_trajectory_fix_workbench": "durable_human_handoff",
+                "validate_trajectory_review_outcome": "approved_or_terminal",
+            },
+        },
+    )
+    visible_tools = set(result.model_calls[0]["tools"])
+    assert visible_tools == {
+        "inspect_navigation_annotation_job_facts_tool",
+        "get_navigation_task_context_tool",
+        "submit_trajectory_review_plan_tool",
+    }
+    assert set(result.model_calls[-1]["tools"]) == {
+        "get_current_plan_step_tool",
+        "open_trajectory_fix_workbench_tool",
+    }
+    assert {
+        "inspect_navigation_raw_metadata_tool",
+        "inspect_navigation_sensor_candidates_tool",
+        "inspect_navigation_topic_candidates_tool",
+        "inspect_navigation_runtime_assets_tool",
+        "inspect_navigation_calibration_inventory_tool",
+        "inspect_navigation_localization_sources_tool",
+        "inspect_navigation_artifact_state_tool",
+        "inspect_navigation_gridmap_artifacts_tool",
+        "describe_processing_action_tool",
+        "submit_extract_sync_plan_tool",
+        "submit_finish_processing_plan_tool",
+        "prepare_gridmap_for_projection_tool",
+        "run_annotation_postprocessing_workflow_tool",
+    }.isdisjoint(visible_tools)
+    assert [call["name"] for call in result.tool_calls][-3:] == [
+        "submit_trajectory_review_plan_tool",
+        "get_current_plan_step_tool",
+        "open_trajectory_fix_workbench_tool",
+    ]
     assert result.final_text == ""
     assert result.forbidden_calls == ()
     model.assert_exhausted()

@@ -8,6 +8,7 @@ from pydantic import BaseModel, ValidationError
 
 from vla_data_juicer_agents.navigation.catalog import ToolCapability
 from vla_data_juicer_agents.navigation.observation_models import (
+    AnnotationJobFactsObservation,
     ArtifactStateObservation,
     CalibrationInventoryObservation,
     EvidenceDescriptor,
@@ -26,6 +27,7 @@ from vla_data_juicer_agents.navigation.plan_models import (
     FinishProcessingPlanInput,
     PlanValidationIssue,
     PlanValidationReport,
+    TrajectoryReviewPlanInput,
 )
 from vla_data_juicer_agents.navigation.planning_context import PLAN_REQUIRED_OBSERVATIONS
 from vla_data_juicer_agents.navigation.profiles import topic_route
@@ -51,6 +53,7 @@ _REQUIRED_PAYLOAD_TYPES: dict[str, type[BaseModel]] = {
     "runtime_assets": RuntimeAssetsObservation,
     "calibration_inventory": CalibrationInventoryObservation,
     "localization_sources": LocalizationSourcesObservation,
+    "annotation_job_facts": AnnotationJobFactsObservation,
 }
 
 
@@ -174,7 +177,7 @@ def _capability_items(
 
 
 def _decision_entries(
-    plan: ExtractSyncPlanInput | FinishProcessingPlanInput,
+    plan: ExtractSyncPlanInput | FinishProcessingPlanInput | TrajectoryReviewPlanInput,
 ) -> list[tuple[str, Any]]:
     names = type(plan.decisions).model_fields
     return [(name, getattr(plan.decisions, name)) for name in names]
@@ -184,7 +187,7 @@ def _validate_evidence_refs(
     *,
     task: NavigationTask,
     observation: NavigationObservationRevision,
-    plan: ExtractSyncPlanInput | FinishProcessingPlanInput,
+    plan: ExtractSyncPlanInput | FinishProcessingPlanInput | TrajectoryReviewPlanInput,
     evidence: Sequence[EvidenceDescriptor],
 ) -> list[PlanValidationIssue]:
     errors: list[PlanValidationIssue] = []
@@ -473,6 +476,10 @@ def _validate_finish_references(
     gridmap = _payload_of_type(observation, GridmapArtifactsObservation)
     runtime = _payload_of_type(observation, RuntimeAssetsObservation)
     calibration = _payload_of_type(observation, CalibrationInventoryObservation)
+    annotation_facts = _payload_of_type(
+        observation,
+        AnnotationJobFactsObservation,
+    )
 
     localization_decision = plan.decisions.localization
     if (
@@ -580,8 +587,35 @@ def _validate_finish_references(
         )
 
     calibration_decision = plan.decisions.calibration
-    if (
-        calibration is not None
+    if calibration_decision.mode == "annotation_snapshot":
+        if (
+            annotation_facts is None
+            or not annotation_facts.ready_for_postprocessing
+            or not annotation_facts.processing_calibration_snapshot_available
+        ):
+            errors.append(
+                _plan_issue(
+                    "plan.decisions.calibration.mode",
+                    "annotation_calibration_snapshot_unavailable",
+                    "A tracked Annotation Job calibration snapshot is required",
+                    ["annotation_snapshot"],
+                )
+            )
+    elif (
+        calibration_decision.selected_sensor_source is None
+        and calibration is not None
+        and not calibration.sensor_sources
+    ):
+        errors.append(
+            _plan_issue(
+                "plan.decisions.calibration.selected_sensor_source",
+                "calibration_inventory_empty",
+                "No observed calibration profile is available for structured selection",
+            )
+        )
+    elif (
+        calibration_decision.selected_sensor_source is not None
+        and calibration is not None
         and calibration_decision.selected_sensor_source not in calibration.sensor_sources
     ):
         errors.append(
@@ -599,7 +633,10 @@ def _validate_finish_references(
                 ),
             )
         )
-    if not calibration_decision.requires_user_confirmation:
+    if (
+        calibration_decision.mode != "annotation_snapshot"
+        and not calibration_decision.requires_user_confirmation
+    ):
         errors.append(
             _plan_issue(
                 "plan.decisions.calibration.requires_user_confirmation",
@@ -682,7 +719,7 @@ def _validate_finish_references(
 def _validate_capability_contracts(
     *,
     phase: str,
-    plan: ExtractSyncPlanInput | FinishProcessingPlanInput,
+    plan: ExtractSyncPlanInput | FinishProcessingPlanInput | TrajectoryReviewPlanInput,
     capabilities: Sequence[ToolCapability] | dict[str, Any],
 ) -> list[PlanValidationIssue]:
     errors: list[PlanValidationIssue] = []
@@ -773,10 +810,12 @@ def _validate_capability_contracts(
 
 
 def _validate_dependencies(
-    plan: ExtractSyncPlanInput | FinishProcessingPlanInput,
+    plan: ExtractSyncPlanInput | FinishProcessingPlanInput | TrajectoryReviewPlanInput,
 ) -> list[PlanValidationIssue]:
     errors: list[PlanValidationIssue] = []
     positions: dict[str, int] = {}
+    action_positions: dict[str, int] = {}
+    duplicate_actions_reported: set[str] = set()
     for index, step in enumerate(plan.steps):
         if step.step_id in positions:
             errors.append(
@@ -788,6 +827,20 @@ def _validate_dependencies(
             )
         else:
             positions[step.step_id] = index
+        if (
+            step.action in action_positions
+            and step.action not in duplicate_actions_reported
+        ):
+            errors.append(
+                _plan_issue(
+                    f"plan.steps.{index}.action",
+                    "duplicate_action",
+                    "A business action may appear only once in one Plan",
+                )
+            )
+            duplicate_actions_reported.add(step.action)
+        else:
+            action_positions.setdefault(step.action, index)
 
     unknown_dependencies = False
     for index, step in enumerate(plan.steps):
@@ -855,12 +908,16 @@ def _validate_finish_business_order(
         positions.setdefault(step.action, index)
 
     artifact = _payload_of_type(observation, ArtifactStateObservation)
+    annotation_facts = _payload_of_type(
+        observation,
+        AnnotationJobFactsObservation,
+    )
     final_outputs_complete = bool(
         artifact
         and artifact.snapshot.final_outputs_exist
         and artifact.snapshot.final_grid_map_exists
     )
-    full_pipeline = [
+    legacy_full_pipeline = [
         "confirm_navigation_calibration_params",
         "assemble_finish_temp",
         "run_noobscene_preprocessing",
@@ -870,7 +927,29 @@ def _validate_finish_business_order(
         "run_projection_and_trajectory",
         "validate_navigation_outputs",
     ]
-    required_actions = ["validate_navigation_outputs"] if final_outputs_complete else full_pipeline
+    application_pipeline = [
+        "confirm_navigation_calibration_params",
+        "run_annotation_tracking_workflow",
+        "run_annotation_postprocessing_workflow",
+        "validate_navigation_outputs",
+    ]
+    tracked_annotation_job = bool(
+        annotation_facts
+        and annotation_facts.ready_for_postprocessing
+        and annotation_facts.job_status == "tracked"
+    )
+    required_actions = (
+        ["validate_navigation_outputs"]
+        if final_outputs_complete
+        else [
+            "run_annotation_postprocessing_workflow",
+            "validate_navigation_outputs",
+        ]
+        if tracked_annotation_job
+        else application_pipeline
+        if annotation_facts is not None
+        else legacy_full_pipeline
+    )
     missing_actions = [action for action in required_actions if action not in positions]
     if missing_actions:
         errors.append(
@@ -884,7 +963,18 @@ def _validate_finish_business_order(
             )
         )
 
-    present_pipeline = [action for action in full_pipeline if action in positions]
+    canonical_pipeline = (
+        application_pipeline
+        if any(
+            action in positions
+            for action in {
+                "run_annotation_tracking_workflow",
+                "run_annotation_postprocessing_workflow",
+            }
+        )
+        else legacy_full_pipeline
+    )
+    present_pipeline = [action for action in canonical_pipeline if action in positions]
     if any(
         positions[earlier] >= positions[later]
         for earlier, later in zip(present_pipeline, present_pipeline[1:])
@@ -894,21 +984,14 @@ def _validate_finish_business_order(
                 "plan.steps",
                 "invalid_finish_pipeline_order",
                 "Finish processing actions must follow the canonical business order",
-                full_pipeline,
+                canonical_pipeline,
             )
         )
 
+    errors.extend(validate_finish_plan_internal_consistency(plan))
+
     confirmation = positions.get("confirm_navigation_calibration_params")
-    if plan.decisions.calibration.requires_user_confirmation and confirmation is None:
-        errors.append(
-            _plan_issue(
-                "plan.steps",
-                "missing_calibration_confirmation",
-                "Plan requires a calibration confirmation step",
-                ["confirm_navigation_calibration_params"],
-            )
-        )
-    elif confirmation is not None and confirmation != 0:
+    if confirmation is not None and confirmation != 0:
         errors.append(
             _plan_issue(
                 f"plan.steps.{confirmation}",
@@ -945,6 +1028,99 @@ def _validate_finish_business_order(
                 "Output validation must be the final plan step",
             )
         )
+    legacy_runtime_actions = {
+        "assemble_finish_temp",
+        "run_noobscene_preprocessing",
+        "run_initial_annotation_gui",
+        "run_tracking",
+        "prepare_gridmap_for_projection",
+        "run_projection_and_trajectory",
+    }
+    application_runtime_actions = {
+        "run_annotation_tracking_workflow",
+        "run_annotation_postprocessing_workflow",
+    }
+    if (
+        any(action in positions for action in legacy_runtime_actions)
+        and any(action in positions for action in application_runtime_actions)
+    ):
+        errors.append(
+            _plan_issue(
+                "plan.steps",
+                "mixed_finish_runtime_ownership",
+                (
+                    "A finish Plan cannot mix legacy script actions with the "
+                    "Annotation Application Service workflow"
+                ),
+            )
+        )
+    return errors
+
+
+def validate_finish_plan_internal_consistency(
+    plan: FinishProcessingPlanInput,
+) -> list[PlanValidationIssue]:
+    """Validate cross-field finish rules that do not require observed facts."""
+    positions = {step.action: index for index, step in enumerate(plan.steps)}
+    errors: list[PlanValidationIssue] = []
+    confirmation = positions.get("confirm_navigation_calibration_params")
+    if (
+        not plan.decisions.calibration.requires_user_confirmation
+        and confirmation is not None
+    ):
+        errors.append(
+            _plan_issue(
+                f"plan.steps.{confirmation}",
+                "unexpected_calibration_confirmation",
+                (
+                    "Plan must not request calibration confirmation when the "
+                    "calibration decision does not require it"
+                ),
+            )
+        )
+    elif (
+        plan.decisions.calibration.requires_user_confirmation
+        and confirmation is None
+    ):
+        errors.append(
+            _plan_issue(
+                "plan.steps",
+                "missing_calibration_confirmation",
+                "Plan requires a calibration confirmation step",
+                ["confirm_navigation_calibration_params"],
+            )
+        )
+    return errors
+
+
+def _validate_trajectory_review_business_order(
+    plan: TrajectoryReviewPlanInput,
+    observation: NavigationObservationRevision,
+) -> list[PlanValidationIssue]:
+    facts = _payload_of_type(observation, AnnotationJobFactsObservation)
+    errors: list[PlanValidationIssue] = []
+    if facts is None or not facts.ready_for_trajectory_review:
+        errors.append(
+            _plan_issue(
+                "observation.annotation_job_facts",
+                "trajectory_review_not_ready",
+                "The linked Annotation workflow is not ready for trajectory review",
+            )
+        )
+    actions = [step.action for step in plan.steps]
+    required = [
+        "open_trajectory_fix_workbench",
+        "validate_trajectory_review_outcome",
+    ]
+    if actions != required:
+        errors.append(
+            _plan_issue(
+                "plan.steps",
+                "invalid_trajectory_review_pipeline",
+                "Trajectory review must open the durable workbench and validate its outcome",
+                required,
+            )
+        )
     return errors
 
 
@@ -952,7 +1128,7 @@ def validate_navigation_plan(
     *,
     task: NavigationTask,
     observation: NavigationObservationRevision,
-    plan: ExtractSyncPlanInput | FinishProcessingPlanInput,
+    plan: ExtractSyncPlanInput | FinishProcessingPlanInput | TrajectoryReviewPlanInput,
     evidence: Sequence[EvidenceDescriptor],
     capabilities: Sequence[ToolCapability] | dict[str, Any],
 ) -> PlanValidationReport:
@@ -962,6 +1138,8 @@ def validate_navigation_plan(
         phase = "extract_sync"
     elif isinstance(plan, FinishProcessingPlanInput):
         phase = "finish_processing"
+    elif isinstance(plan, TrajectoryReviewPlanInput):
+        phase = "trajectory_review"
     else:
         return _report(
             [
@@ -993,7 +1171,18 @@ def validate_navigation_plan(
                 missing,
             )
         )
-    if phase == "finish_processing" and task.scene_mode not in {"in", "out"}:
+    annotation_facts = _payload_of_type(
+        observation,
+        AnnotationJobFactsObservation,
+    )
+    if (
+        phase == "finish_processing"
+        and task.scene_mode not in {"in", "out"}
+        and not (
+            annotation_facts is not None
+            and annotation_facts.ready_for_postprocessing
+        )
+    ):
         errors.append(
             _plan_issue(
                 "task.scene_mode",
@@ -1026,7 +1215,7 @@ def validate_navigation_plan(
     # Stage 3: references selected by the model must exist in observed facts.
     if isinstance(plan, ExtractSyncPlanInput):
         errors.extend(_validate_extract_references(observation, plan, evidence))
-    else:
+    elif isinstance(plan, FinishProcessingPlanInput):
         errors.extend(_validate_finish_references(observation, plan, evidence))
 
     # Stage 4: selected actions, variants, arguments, and decision links.
@@ -1042,4 +1231,6 @@ def validate_navigation_plan(
     errors.extend(_validate_dependencies(plan))
     if isinstance(plan, FinishProcessingPlanInput):
         errors.extend(_validate_finish_business_order(plan, observation))
+    elif isinstance(plan, TrajectoryReviewPlanInput):
+        errors.extend(_validate_trajectory_review_business_order(plan, observation))
     return _report(errors)

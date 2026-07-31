@@ -1,5 +1,8 @@
 export type SessionStatus = "draft" | "active" | "historical";
-export type SessionEntrypoint = "chat" | "data_management_shortcut";
+export type SessionEntrypoint =
+  | "chat"
+  | "data_management_shortcut"
+  | "annotation_processing_shortcut";
 
 export type NavigationClipSelection =
   | { kind: "all_clips" }
@@ -57,9 +60,14 @@ export interface SessionDetail extends SessionRecord {
   turns: TurnRecord[];
   tasks: TaskSnapshot[];
   pending_interaction: PendingInteraction | null;
+  snapshot_seq?: number;
 }
 
 export interface AgentEvent {
+  id?: string;
+  session_id?: string;
+  seq?: number;
+  created_at?: string;
   type: string;
   contract_version: 1;
   timestamp?: string | null;

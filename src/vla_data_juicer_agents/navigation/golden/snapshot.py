@@ -4,6 +4,7 @@ import hashlib
 import json
 import math
 import os
+from copy import deepcopy
 from pathlib import Path, PurePosixPath
 import stat
 from typing import Any
@@ -20,6 +21,7 @@ from .models import (
     ImageFingerprint,
     InputExpectation,
     NumericFingerprint,
+    RuntimeRunAttestation,
 )
 
 
@@ -250,11 +252,48 @@ def _safe_root(root: Path, *, label: str) -> Path:
     return resolved_root
 
 
-def _safe_scope(root: Path, case: GoldenCase) -> Path:
+def _role_scope(
+    case: GoldenCase,
+    role: str,
+    *,
+    bound_artifact_scope: str | None = None,
+) -> str:
+    if bound_artifact_scope is not None:
+        normalized = bound_artifact_scope.replace("\\", "/")
+        if (
+            role != "candidate"
+            or not normalized
+            or normalized.startswith("/")
+            or ".." in normalized.split("/")
+        ):
+            raise GoldenError("invalid Store-bound candidate artifact scope")
+        return normalized
+    if case.role_scopes is None:
+        return case.artifact_scope
+    if role == "legacy":
+        return case.role_scopes.legacy.artifact_scope
+    if role == "candidate":
+        return case.role_scopes.candidate.artifact_scope
+    raise GoldenError("Golden role must be legacy or candidate")
+
+
+def _safe_scope(
+    root: Path,
+    case: GoldenCase,
+    *,
+    role: str,
+    bound_artifact_scope: str | None = None,
+) -> Path:
     resolved_root = _safe_root(root, label="artifact")
 
     scope = resolved_root
-    scope_parts = PurePosixPath(case.artifact_scope).parts
+    scope_parts = PurePosixPath(
+        _role_scope(
+            case,
+            role,
+            bound_artifact_scope=bound_artifact_scope,
+        ),
+    ).parts
     for component in scope_parts:
         if component == ".":
             continue
@@ -363,13 +402,21 @@ def _validate_case_root(
     scope: Path,
     bundle: GoldenCaseBundle,
     case: GoldenCase,
+    role: str,
 ) -> None:
     sample = _sample_for_case(bundle, case)
-    if (
-        sample is not None
-        and sample.internal_segment is not None
-        and scope.name != sample.internal_segment
-    ):
+    expected_segment = (
+        (
+            case.role_scopes.legacy.internal_segment
+            if role == "legacy"
+            else case.role_scopes.candidate.internal_segment
+        )
+        if case.role_scopes is not None
+        else sample.internal_segment
+        if sample is not None
+        else None
+    )
+    if expected_segment is not None and scope.name != expected_segment:
         raise GoldenError("Golden root name does not match the registered sample")
 
     _validate_expectations(scope=scope, expectations=case.root_expectations)
@@ -380,6 +427,7 @@ def _validate_source_root(
     source_root: Path | None,
     bundle: GoldenCaseBundle,
     case: GoldenCase,
+    role: str,
 ) -> None:
     sample = _sample_for_case(bundle, case)
     if sample is None or not sample.source_expectations:
@@ -387,10 +435,16 @@ def _validate_source_root(
     if source_root is None:
         raise GoldenError("this Golden sample requires a source root")
     resolved_source = _safe_root(source_root, label="source")
-    if (
-        sample.internal_segment is not None
-        and resolved_source.name != sample.internal_segment
-    ):
+    expected_segment = (
+        (
+            case.role_scopes.legacy.internal_segment
+            if role == "legacy"
+            else case.role_scopes.candidate.internal_segment
+        )
+        if case.role_scopes is not None
+        else sample.internal_segment
+    )
+    if expected_segment is not None and resolved_source.name != expected_segment:
         raise GoldenError(
             "Golden source root name does not match the registered sample",
         )
@@ -404,7 +458,118 @@ def command_sequence_sha256(steps: list[str]) -> str | None:
     return _sha256_json(steps) if steps else None
 
 
-def capture_snapshot(
+def _normalized_document(
+    *,
+    value: Any,
+    relative_path: str,
+    scope: Path,
+    case: GoldenCase,
+) -> Any:
+    matching = [
+        policy
+        for policy in case.document_normalizations
+        if _matches(relative_path, [policy.path_pattern])
+    ]
+    if not matching:
+        return value
+    normalized = deepcopy(value)
+    for policy in matching:
+        # The schema intentionally permits exactly this one selector and
+        # strategy.  Keeping the traversal explicit prevents a future generic
+        # "ignore arbitrary field" escape hatch.
+        if not isinstance(normalized, dict):
+            raise GoldenError(
+                "registered document normalization requires a mapping",
+            )
+        paths = normalized.get("paths")
+        if not isinstance(paths, dict):
+            raise GoldenError(
+                "registered document normalization selector is missing",
+            )
+        raw_value = paths.get("img2video_mp4")
+        if not isinstance(raw_value, str) or not Path(raw_value).is_absolute():
+            raise GoldenError(
+                "registered artifact-local path must be absolute",
+            )
+        expected_path = (
+            scope / policy.expected_relative_path
+        ).resolve(strict=False)
+        actual_path = Path(raw_value).resolve(strict=False)
+        if actual_path != expected_path:
+            raise GoldenError(
+                "registered artifact-local path points outside its artifact scope",
+            )
+        paths["img2video_mp4"] = "artifact://dog.mp4"
+    return normalized
+
+
+def _normalized_document_representation_sha256(
+    *,
+    path: Path,
+    value: Any,
+    relative_path: str,
+    scope: Path,
+    case: GoldenCase,
+) -> str:
+    """Hash document bytes after only the registered path substitution.
+
+    Semantic canonicalization intentionally cannot prove representation
+    equivalence: YAML key ordering or whitespace changes may reveal that the
+    replacement adapter no longer emits the frozen legacy format.  For v2 we
+    therefore preserve every source byte except the one explicitly registered
+    artifact-local path scalar.
+    """
+
+    try:
+        representation = path.read_text(encoding="utf-8")
+    except (OSError, UnicodeError) as exc:
+        raise GoldenError(
+            f"cannot read document representation {path.name}: "
+            f"{type(exc).__name__}",
+        ) from exc
+    matching = [
+        policy
+        for policy in case.document_normalizations
+        if _matches(relative_path, [policy.path_pattern])
+    ]
+    for policy in matching:
+        if not isinstance(value, dict):
+            raise GoldenError(
+                "registered document normalization requires a mapping",
+            )
+        paths = value.get("paths")
+        if not isinstance(paths, dict):
+            raise GoldenError(
+                "registered document normalization selector is missing",
+            )
+        raw_value = paths.get("img2video_mp4")
+        if not isinstance(raw_value, str) or not Path(raw_value).is_absolute():
+            raise GoldenError(
+                "registered artifact-local path must be absolute",
+            )
+        expected_path = (
+            scope / policy.expected_relative_path
+        ).resolve(strict=False)
+        if Path(raw_value).resolve(strict=False) != expected_path:
+            raise GoldenError(
+                "registered artifact-local path points outside its artifact scope",
+            )
+        # Refuse to guess which occurrence is the selected scalar.  A generic
+        # text replacement could otherwise hide an unrelated business field.
+        if representation.count(raw_value) != 1:
+            raise GoldenError(
+                "registered artifact-local path must occur exactly once "
+                "in the document representation",
+            )
+        representation = representation.replace(
+            raw_value,
+            "artifact://dog.mp4",
+            1,
+        )
+    return hashlib.sha256(representation.encode("utf-8")).hexdigest()
+
+
+def _capture_snapshot(
     *,
     root: Path,
     bundle: GoldenCaseBundle,
@@ -413,16 +578,80 @@ def capture_snapshot(
     runtime_manifest_sha256: str | None = None,
     command_steps: list[str] | None = None,
     source_root: Path | None = None,
+    attestation: RuntimeRunAttestation | None = None,
+    oracle_ref: str | None = None,
+    bound_artifact_scope: str | None = None,
 ) -> GoldenSnapshot:
-    scope = _safe_scope(root, case)
-    _validate_case_root(scope=scope, bundle=bundle, case=case)
+    if role not in {"legacy", "candidate"}:
+        raise GoldenError("Golden role must be legacy or candidate")
+    if (
+        role == "candidate"
+        and case.role_scopes is not None
+        and case.role_scopes.candidate.scope_kind
+        in {"postprocessing_segment", "fix_segment"}
+        and bound_artifact_scope is None
+    ):
+        raise GoldenError(
+            "M2 Golden candidates must be resolved from AnnotationStore",
+        )
+    if role == "legacy" and case.legacy_oracle_selection_required:
+        if oracle_ref is None:
+            raise GoldenError(
+                "this Golden case requires explicit legacy oracle selection",
+            )
+    elif oracle_ref is not None:
+        raise GoldenError(
+            "legacy oracle reference is not accepted by this role/case",
+        )
+    if bound_artifact_scope is not None and (
+        role != "candidate" or attestation is None
+    ):
+        raise GoldenError(
+            "artifact scope overrides require a Store-attested candidate",
+        )
+    scope = _safe_scope(
+        root,
+        case,
+        role=role,
+        bound_artifact_scope=bound_artifact_scope,
+    )
+    _validate_case_root(
+        scope=scope,
+        bundle=bundle,
+        case=case,
+        role=role,
+    )
     _validate_source_root(
         source_root=source_root,
         bundle=bundle,
         case=case,
+        role=role,
     )
     supplied_steps = list(command_steps or [])
-    if case.expected_command_steps and not supplied_steps:
+    if role == "candidate" and case.candidate_attestation_required:
+        if attestation is None:
+            raise GoldenError(
+                "this Golden candidate requires a committed RuntimeRun attestation",
+            )
+        if supplied_steps or runtime_manifest_sha256 is not None:
+            raise GoldenError(
+                "attested candidates cannot accept caller-declared runtime facts",
+            )
+        supplied_steps = list(attestation.command_steps)
+        runtime_manifest_sha256 = attestation.runtime_manifest_sha256
+    elif attestation is not None:
+        raise GoldenError(
+            "RuntimeRun attestation is only accepted by an attested candidate",
+        )
+    require_command_sequence = (
+        bool(case.expected_command_steps)
+        and not (
+            role == "legacy"
+            and case.role_scopes is not None
+            and case.role_scopes.legacy.provenance == "historical_unattested"
+        )
+    )
+    if require_command_sequence and not supplied_steps:
         raise GoldenError("this Golden case requires a normalized command sequence")
     if supplied_steps and any(step not in case.expected_command_steps for step in supplied_steps):
         raise GoldenError("command sequence contains an unrecognized step ID")
@@ -464,6 +693,7 @@ def capture_snapshot(
         image = None
         document = None
         numeric = None
+        normalized_representation_sha256 = None
         if kind == "image":
             try:
                 image_format, width, height = image_dimensions(path)
@@ -474,6 +704,22 @@ def capture_snapshot(
             image = ImageFingerprint(format=image_format, width=width, height=height)
         elif kind in {"json", "yaml", "gridmap", "trajectory"}:
             value = load_document_for_type(path, kind)
+            if bundle.schema_version == 2 and kind in {"json", "yaml"}:
+                normalized_representation_sha256 = (
+                    _normalized_document_representation_sha256(
+                        path=path,
+                        value=value,
+                        relative_path=relative_path,
+                        scope=scope,
+                        case=case,
+                    )
+                )
+            value = _normalized_document(
+                value=value,
+                relative_path=relative_path,
+                scope=scope,
+                case=case,
+            )
             document, numeric = document_fingerprint(value)
 
         content_sha256 = _sha256_file(path)
@@ -505,6 +751,9 @@ def capture_snapshot(
                 image=image,
                 document=document,
                 numeric=numeric if kind in {"gridmap", "trajectory"} else None,
+                normalized_representation_sha256=(
+                    normalized_representation_sha256
+                ),
             ),
         )
 
@@ -513,11 +762,64 @@ def capture_snapshot(
         for entry in entries
     ]
     return GoldenSnapshot(
+        schema_version=bundle.schema_version,
         case_id=case.id,
         role=role,
         runtime_id=bundle.runtime_id,
         runtime_manifest_sha256=runtime_manifest_sha256,
         command_sequence_sha256=command_sequence_sha256(supplied_steps),
+        calibration_snapshot_sha256=(
+            attestation.calibration_snapshot_sha256
+            if attestation is not None
+            else None
+        ),
+        annotation_revision_set_sha256=(
+            attestation.annotation_revision_set_sha256
+            if attestation is not None
+            else None
+        ),
+        runtime_run_ref=attestation.run_ref if attestation is not None else None,
+        provenance=(
+            (
+                case.role_scopes.legacy.provenance
+                if role == "legacy"
+                else case.role_scopes.candidate.provenance
+            )
+            if case.role_scopes is not None
+            else None
+        ),
+        oracle_ref=oracle_ref,
         tree_sha256=_sha256_json(tree_payload),
         entries=entries,
+    )
+
+
+def capture_snapshot(
+    *,
+    root: Path,
+    bundle: GoldenCaseBundle,
+    case: GoldenCase,
+    role: str,
+    runtime_manifest_sha256: str | None = None,
+    command_steps: list[str] | None = None,
+    source_root: Path | None = None,
+    attestation: RuntimeRunAttestation | None = None,
+    oracle_ref: str | None = None,
+) -> GoldenSnapshot:
+    """Capture a case-declared scope.
+
+    Store-bound scope remapping is intentionally private to the production
+    comparison entry point.
+    """
+
+    return _capture_snapshot(
+        root=root,
+        bundle=bundle,
+        case=case,
+        role=role,
+        runtime_manifest_sha256=runtime_manifest_sha256,
+        command_steps=command_steps,
+        source_root=source_root,
+        attestation=attestation,
+        oracle_ref=oracle_ref,
     )

@@ -108,6 +108,7 @@ def test_builder_exposes_factual_and_cognitive_tools_without_semantic_inference(
         "inspect_navigation_runtime_assets_tool",
         "inspect_navigation_calibration_inventory_tool",
         "inspect_navigation_localization_sources_tool",
+        "inspect_navigation_annotation_job_facts_tool",
         "get_navigation_task_context_tool",
         "list_observation_evidence_tool",
         "read_observation_evidence_tool",
@@ -237,7 +238,11 @@ def test_extract_observation_tools_complete_phase_without_selecting_params(tmp_p
         "sensor_candidates",
         "topic_candidates",
     ]
-    assert context["available_stage_ids"] == ["extract_sync", "finish_processing"]
+    assert context["available_stage_ids"] == [
+        "extract_sync",
+        "finish_processing",
+        "trajectory_review",
+    ]
     assert len(context["evidence_catalog"]) == 4
 
 

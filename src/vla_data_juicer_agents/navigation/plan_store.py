@@ -23,6 +23,7 @@ from vla_data_juicer_agents.navigation.plan_models import (
     FinishProcessingPlanInput,
     NavigationPlanRecord,
     PlanSubmissionAttempt,
+    TrajectoryReviewPlanInput,
 )
 from vla_data_juicer_agents.navigation.task_state import NavigationTask, utc_now
 from vla_data_juicer_agents.navigation.schema import initialize_navigation_schema
@@ -38,7 +39,7 @@ from vla_data_juicer_agents.navigation.planning_context import (
 )
 
 
-PLAN_CONTRACT_VERSION = "navigation-plan-v3"
+PLAN_CONTRACT_VERSION = "navigation-plan-v4"
 MAX_EXECUTION_READ_CHARS = 4000
 MAX_RESULT_OUTBOX_CHARS = 262_144
 MAX_HUMAN_DECISION_CHARS = 16_384
@@ -51,7 +52,7 @@ _SENSITIVE_KEYS = {
     "api_key",
     "cookie",
 }
-PlanPhase = Literal["extract_sync", "finish_processing"]
+PlanPhase = Literal["extract_sync", "finish_processing", "trajectory_review"]
 ExecutionStatus = Literal[
     "pending",
     "running",
@@ -124,6 +125,28 @@ class CompactExecutionOverview(_StrictReadModel):
     completed_steps: int
     current_step_id: str | None
     steps: list[CompactExecutionStep]
+
+
+class ActionablePlanStep(_StrictReadModel):
+    """Minimal model-facing identity for one authorized execution step."""
+
+    plan_id: str
+    step_id: str
+    action: str
+    status: ExecutionStatus
+
+
+def project_actionable_plan_step(current: dict[str, Any]) -> dict[str, Any]:
+    """Remove ledger identifiers and result metadata from a current-step snapshot."""
+    step = current.get("step")
+    if not isinstance(step, dict):
+        raise ValueError("current navigation step is malformed")
+    return ActionablePlanStep(
+        plan_id=current["plan_id"],
+        step_id=step["step_id"],
+        action=step["action"],
+        status=step["status"],
+    ).model_dump(mode="json")
 
 
 @dataclass(frozen=True)
@@ -303,7 +326,12 @@ class SqliteNavigationPlanRepository:
         task: NavigationTask,
         phase: PlanPhase | str,
         observation_revision: int,
-        plan: ExtractSyncPlanInput | FinishProcessingPlanInput | dict[str, Any],
+        plan: (
+            ExtractSyncPlanInput
+            | FinishProcessingPlanInput
+            | TrajectoryReviewPlanInput
+            | dict[str, Any]
+        ),
         *, expected_web_session_id: str | None = None,
         expected_agentscope_session_id: str | None = None,
         expected_planning_context_revision: str | None = None,
@@ -1216,6 +1244,170 @@ class SqliteNavigationPlanRepository:
             )
         return cursor.rowcount == 1
 
+    def resume_waiting_workflow_step(
+        self,
+        plan_id: str,
+        step_id: str,
+        action: str,
+        *,
+        expected_web_session_id: str | None = None,
+        expected_agentscope_session_id: str | None = None,
+    ) -> bool:
+        """Atomically transfer one external workflow from user wait to Runtime."""
+
+        connection = self._connect()
+        try:
+            connection.execute("BEGIN IMMEDIATE")
+            self._authorize_plan_write(
+                connection,
+                plan_id,
+                expected_web_session_id=expected_web_session_id,
+                expected_agentscope_session_id=expected_agentscope_session_id,
+            )
+            row = connection.execute(
+                """
+                SELECT steps.status AS step_status, tasks.status AS task_status,
+                       tasks.task_id
+                FROM navigation_task_steps AS steps
+                JOIN navigation_plans AS plans ON plans.plan_id = steps.plan_id
+                JOIN navigation_tasks AS tasks ON tasks.task_id = steps.task_id
+                WHERE steps.plan_id = ? AND steps.step_id = ?
+                  AND steps.tool_name = ? AND plans.status = 'active'
+                """,
+                (plan_id, step_id, action),
+            ).fetchone()
+            if row is None:
+                connection.rollback()
+                return False
+            if (
+                row["step_status"] == "running"
+                and row["task_status"] == "active"
+            ):
+                connection.commit()
+                return True
+            if (
+                row["step_status"] != "waiting_user"
+                or row["task_status"] not in {"waiting_user", "active"}
+            ):
+                connection.rollback()
+                return False
+            timestamp = utc_now()
+            cursor = connection.execute(
+                """
+                UPDATE navigation_task_steps
+                SET status = 'running', started_at = COALESCE(started_at, ?)
+                WHERE plan_id = ? AND step_id = ? AND tool_name = ?
+                  AND status = 'waiting_user'
+                """,
+                (timestamp, plan_id, step_id, action),
+            )
+            if cursor.rowcount != 1:
+                connection.rollback()
+                return False
+            connection.execute(
+                """
+                UPDATE navigation_tasks
+                SET status = 'active', updated_at = ?,
+                    state_revision = state_revision + 1
+                WHERE task_id = ? AND status IN ('waiting_user', 'active')
+                """,
+                (timestamp, row["task_id"]),
+            )
+            connection.commit()
+            return True
+        except Exception:
+            connection.rollback()
+            raise
+        finally:
+            connection.close()
+
+    def mark_workflow_step_waiting_user(
+        self,
+        plan_id: str,
+        step_id: str,
+        action: str,
+        *,
+        expected_web_session_id: str | None = None,
+        expected_agentscope_session_id: str | None = None,
+    ) -> bool:
+        """Atomically transfer an owned external workflow to a human wait."""
+
+        connection = self._connect()
+        try:
+            connection.execute("BEGIN IMMEDIATE")
+            self._authorize_plan_write(
+                connection,
+                plan_id,
+                expected_web_session_id=expected_web_session_id,
+                expected_agentscope_session_id=expected_agentscope_session_id,
+            )
+            row = connection.execute(
+                """
+                SELECT steps.status AS step_status, tasks.status AS task_status,
+                       tasks.task_id
+                FROM navigation_task_steps AS steps
+                JOIN navigation_plans AS plans ON plans.plan_id = steps.plan_id
+                JOIN navigation_tasks AS tasks ON tasks.task_id = steps.task_id
+                WHERE steps.plan_id = ? AND steps.step_id = ?
+                  AND steps.tool_name = ? AND plans.status = 'active'
+                """,
+                (plan_id, step_id, action),
+            ).fetchone()
+            if row is None:
+                connection.rollback()
+                return False
+            if (
+                row["step_status"] == "waiting_user"
+                and row["task_status"] == "waiting_user"
+            ):
+                connection.commit()
+                return True
+            if (
+                row["step_status"] not in {"pending", "running"}
+                or row["task_status"] not in {"active", "waiting_user"}
+            ):
+                connection.rollback()
+                return False
+            timestamp = utc_now()
+            cursor = connection.execute(
+                """
+                UPDATE navigation_task_steps
+                SET status = 'waiting_user',
+                    started_at = COALESCE(started_at, ?)
+                WHERE plan_id = ? AND step_id = ? AND tool_name = ?
+                  AND status = ?
+                """,
+                (
+                    timestamp,
+                    plan_id,
+                    step_id,
+                    action,
+                    row["step_status"],
+                ),
+            )
+            if cursor.rowcount != 1:
+                connection.rollback()
+                return False
+            task_cursor = connection.execute(
+                """
+                UPDATE navigation_tasks
+                SET status = 'waiting_user', updated_at = ?,
+                    state_revision = state_revision + 1
+                WHERE task_id = ? AND status IN ('active', 'waiting_user')
+                """,
+                (timestamp, row["task_id"]),
+            )
+            if task_cursor.rowcount != 1:
+                connection.rollback()
+                return False
+            connection.commit()
+            return True
+        except Exception:
+            connection.rollback()
+            raise
+        finally:
+            connection.close()
+
     def stage_step_result(
         self,
         plan_id: str,
@@ -1231,8 +1423,21 @@ class SqliteNavigationPlanRepository:
     ) -> StagedStepResult:
         """Durably stage a post-side-effect result before crossing to file evidence."""
         self._ensure_within_limit(result_summary, label="execution result summary")
-        if expected_statuses != ("running",):
-            raise ValueError("claimed execution results must be staged from running")
+        workflow_handoff_actions = {
+            "run_annotation_tracking_workflow",
+            "run_annotation_postprocessing_workflow",
+            "open_trajectory_fix_workbench",
+            "validate_trajectory_review_outcome",
+        }
+        if expected_statuses != ("running",) and not (
+            expected_action in workflow_handoff_actions
+            and set(expected_statuses).issubset({"pending", "waiting_user"})
+            and expected_statuses
+        ):
+            raise ValueError(
+                "execution results must be staged from a claimed run or "
+                "an authorized workflow handoff"
+            )
         canonical_full = self._canonical_json(full_result)
         if len(canonical_full.encode("utf-8")) > MAX_RESULT_OUTBOX_CHARS:
             raise ValueError(
@@ -1475,6 +1680,37 @@ class SqliteNavigationPlanRepository:
                             and terminal_validation is not None
                         ):
                             attempt_status = "completed"
+                            self._record_task_outcome_in_transaction(
+                                connection,
+                                task_id=plan_row["task_id"],
+                                completion_outcome=(
+                                    "postprocessing_completed_fix_pending"
+                                ),
+                            )
+                        elif plan_row["phase"] == "trajectory_review":
+                            review_validation = connection.execute(
+                                """SELECT 1
+                                   FROM navigation_task_steps
+                                   WHERE plan_id = ?
+                                     AND tool_name =
+                                         'validate_trajectory_review_outcome'
+                                     AND status = 'completed'
+                                     AND sequence = (
+                                         SELECT MAX(sequence)
+                                         FROM navigation_task_steps
+                                         WHERE plan_id = ?
+                                     )""",
+                                (plan_id, plan_id),
+                            ).fetchone()
+                            if review_validation is not None:
+                                attempt_status = "completed"
+                                self._record_task_outcome_in_transaction(
+                                    connection,
+                                    task_id=plan_row["task_id"],
+                                    completion_outcome=(
+                                        "trajectory_review_completed"
+                                    ),
+                                )
                         connection.execute(
                             """UPDATE navigation_tasks
                                SET status = ?, updated_at = ?
@@ -2287,6 +2523,26 @@ class SqliteNavigationPlanRepository:
                 ),
             )
 
+    @staticmethod
+    def _record_task_outcome_in_transaction(
+        connection: sqlite3.Connection,
+        *,
+        task_id: str,
+        completion_outcome: str,
+    ) -> None:
+        timestamp = utc_now()
+        connection.execute(
+            """INSERT INTO navigation_task_outcomes (
+                   task_id, requested_outcome, completion_outcome, revision,
+                   metadata_json, created_at, updated_at
+               ) VALUES (?, 'auto', ?, 1, '{}', ?, ?)
+               ON CONFLICT(task_id) DO UPDATE SET
+                   completion_outcome = excluded.completion_outcome,
+                   revision = navigation_task_outcomes.revision + 1,
+                   updated_at = excluded.updated_at""",
+            (task_id, completion_outcome, timestamp, timestamp),
+        )
+
     def _require_plan(self, plan_id: str) -> NavigationPlanRecord:
         plan = self.get(plan_id)
         if plan is None:
@@ -2296,16 +2552,29 @@ class SqliteNavigationPlanRepository:
     @staticmethod
     def _normalize_phase(phase: PlanPhase | str) -> PlanPhase:
         value = str(phase)
-        if value not in {"extract_sync", "finish_processing"}:
+        if value not in {
+            "extract_sync",
+            "finish_processing",
+            "trajectory_review",
+        }:
             raise ValueError(f"unsupported navigation plan phase: {value}")
         return cast(PlanPhase, value)
 
     @staticmethod
     def _validate_plan_for_phase(
         phase: PlanPhase,
-        plan: ExtractSyncPlanInput | FinishProcessingPlanInput | dict[str, Any],
-    ) -> ExtractSyncPlanInput | FinishProcessingPlanInput:
-        model = ExtractSyncPlanInput if phase == "extract_sync" else FinishProcessingPlanInput
+        plan: (
+            ExtractSyncPlanInput
+            | FinishProcessingPlanInput
+            | TrajectoryReviewPlanInput
+            | dict[str, Any]
+        ),
+    ) -> ExtractSyncPlanInput | FinishProcessingPlanInput | TrajectoryReviewPlanInput:
+        model = {
+            "extract_sync": ExtractSyncPlanInput,
+            "finish_processing": FinishProcessingPlanInput,
+            "trajectory_review": TrajectoryReviewPlanInput,
+        }[phase]
         return model.model_validate(plan)
 
     @staticmethod
@@ -2362,15 +2631,26 @@ class SqliteNavigationPlanRepository:
             ExtractSyncPlanInput
             if row["phase"] == "extract_sync"
             else FinishProcessingPlanInput
+            if row["phase"] == "finish_processing"
+            else TrajectoryReviewPlanInput
         )
         plan_payload = json.loads(row["plan_json"])
         if (
-            row["contract_version"] == "navigation-plan-v2"
+            row["contract_version"]
+            in {"navigation-plan-v1", "navigation-plan-v2"}
             and row["phase"] == "extract_sync"
         ):
             time_sync = plan_payload.get("decisions", {}).get("time_sync")
             if isinstance(time_sync, dict):
                 time_sync.pop("tolerance_ms", None)
+        if row["contract_version"] == "navigation-plan-v1":
+            for step in plan_payload.get("steps", []):
+                if not isinstance(step, dict):
+                    continue
+                step.setdefault("depends_on", [])
+                step.setdefault("failure_policy", "stop")
+                step.setdefault("decision_refs", [])
+                step.setdefault("arguments", {})
         return NavigationPlanRecord(
             plan_id=row["plan_id"],
             task_id=row["task_id"],

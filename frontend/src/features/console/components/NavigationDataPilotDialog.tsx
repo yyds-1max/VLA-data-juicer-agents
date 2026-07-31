@@ -1,4 +1,4 @@
-import * as Dialog from "@radix-ui/react-dialog";
+import { Dialog } from "radix-ui";
 import { Check, ChevronDown, X } from "lucide-react";
 import { type KeyboardEvent as ReactKeyboardEvent, useEffect, useMemo, useRef, useState } from "react";
 
@@ -240,13 +240,13 @@ export function NavigationDataPilotDialog({
     >
       <Dialog.Portal>
         <Dialog.Overlay
-          className="fixed inset-0 z-[90] bg-slate-950/25"
+          className="fixed inset-0 z-90 bg-slate-950/25"
           data-testid="navigation-datapilot-overlay"
           onMouseDown={handleOutsideAttention}
         />
         <Dialog.Content
           aria-describedby="navigation-datapilot-description"
-          className={`fixed left-1/2 top-1/2 z-[91] flex h-[min(35rem,calc(100vh-2rem))] w-[calc(100vw-2rem)] max-w-xl -translate-x-1/2 -translate-y-1/2 flex-col overflow-hidden rounded-xl border border-console-line bg-console-panel shadow-2xl outline outline-2 outline-offset-2 outline-transparent focus:outline-none ${
+          className={`fixed left-1/2 top-1/2 z-91 flex h-[min(35rem,calc(100vh-2rem))] w-[calc(100vw-2rem)] max-w-xl -translate-x-1/2 -translate-y-1/2 flex-col overflow-hidden rounded-xl border border-console-line bg-console-panel shadow-2xl outline outline-2 outline-offset-2 outline-transparent focus:outline-hidden ${
             attentionPulse === 1
               ? "animate-[navigation-dialog-attention-a_760ms_ease-in-out] motion-reduce:animate-none motion-reduce:outline-slate-400"
               : attentionPulse === 2
@@ -278,7 +278,7 @@ export function NavigationDataPilotDialog({
             <Dialog.Close asChild>
               <button
                 aria-label="关闭数据选择"
-                className="flex h-8 w-8 shrink-0 items-center justify-center rounded-lg text-console-muted transition hover:bg-console-panel2 hover:text-console-text focus:outline-none focus-visible:bg-console-panel2 focus-visible:text-console-text disabled:cursor-not-allowed disabled:opacity-40"
+                className="flex h-8 w-8 shrink-0 items-center justify-center rounded-lg text-console-muted transition hover:bg-console-panel2 hover:text-console-text focus:outline-hidden focus-visible:bg-console-panel2 focus-visible:text-console-text disabled:cursor-not-allowed disabled:opacity-40"
                 disabled={submitting}
                 type="button"
               >
@@ -295,7 +295,7 @@ export function NavigationDataPilotDialog({
                 aria-expanded={dateMenuOpen}
                 aria-haspopup="listbox"
                 aria-label="数据日期"
-                className="flex h-10 w-full items-center justify-between rounded-lg border border-console-line bg-console-panel px-3 text-left text-sm text-console-text outline-none transition focus:border-console-cyan focus:ring-2 focus:ring-console-cyan/20 disabled:cursor-not-allowed disabled:opacity-60"
+                className="flex h-10 w-full items-center justify-between rounded-lg border border-console-line bg-console-panel px-3 text-left text-sm text-console-text outline-hidden transition focus:border-console-cyan focus:ring-2 focus:ring-console-cyan/20 disabled:cursor-not-allowed disabled:opacity-60"
                 disabled={submitting}
                 type="button"
                 onClick={() => dateMenuOpen ? setDateMenuOpen(false) : openDateMenu()}
@@ -314,7 +314,7 @@ export function NavigationDataPilotDialog({
               <div
                 ref={dateMenuRef}
                 aria-label="可选数据日期"
-                className="absolute inset-x-5 bottom-5 top-[5.75rem] z-20 overflow-hidden rounded-lg border border-console-line bg-console-panel shadow-lg"
+                className="absolute inset-x-5 bottom-5 top-23 z-20 overflow-hidden rounded-lg border border-console-line bg-console-panel shadow-lg"
                 data-testid="navigation-date-menu"
                 role="listbox"
               >
@@ -326,7 +326,7 @@ export function NavigationDataPilotDialog({
                       key={date.date}
                       ref={(element) => { dateOptionRefs.current[index] = element; }}
                       aria-selected={date.date === selectedDate}
-                      className={`block w-full rounded-md px-3 py-2 text-left text-sm transition focus:outline-none focus-visible:bg-console-panel2 ${
+                      className={`block w-full rounded-md px-3 py-2 text-left text-sm transition focus:outline-hidden focus-visible:bg-console-panel2 ${
                         date.date === selectedDate
                           ? "bg-console-panel2 font-semibold text-console-text"
                           : "text-console-muted hover:bg-console-panel2 hover:text-console-text"
@@ -354,7 +354,7 @@ export function NavigationDataPilotDialog({
                 ) : (
                   <div className="flex min-h-0 flex-1 flex-col overflow-hidden rounded-lg border border-console-line">
                     <label className="flex cursor-pointer items-center gap-3 border-b border-console-line bg-console-panel2/70 px-4 py-3 text-sm font-semibold text-console-text">
-                      <span className={`flex h-4 w-4 items-center justify-center rounded border ${wholeDate ? "border-console-cyan bg-console-cyan text-white" : "border-console-line bg-white"}`}>
+                      <span className={`flex h-4 w-4 items-center justify-center rounded-sm border ${wholeDate ? "border-console-cyan bg-console-cyan text-white" : "border-console-line bg-white"}`}>
                         {wholeDate ? <Check aria-hidden="true" className="h-3 w-3" /> : null}
                       </span>
                       <input
@@ -370,7 +370,7 @@ export function NavigationDataPilotDialog({
                         const checked = wholeDate || selectedClips.has(clip.clip);
                         return (
                           <label key={clip.clip} className="flex cursor-pointer items-center gap-3 px-4 py-3 text-sm text-console-text hover:bg-console-panel2/60">
-                            <span className={`flex h-4 w-4 items-center justify-center rounded border ${checked ? "border-console-cyan bg-console-cyan text-white" : "border-console-line bg-white"}`}>
+                            <span className={`flex h-4 w-4 items-center justify-center rounded-sm border ${checked ? "border-console-cyan bg-console-cyan text-white" : "border-console-line bg-white"}`}>
                               {checked ? <Check aria-hidden="true" className="h-3 w-3" /> : null}
                             </span>
                             <input

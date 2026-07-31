@@ -533,3 +533,112 @@ def test_task_summary_clips_are_bounded_and_sanitized(tmp_path: Path) -> None:
         "task-summary-secret-key",
     ):
         assert secret not in rendered
+
+
+@pytest.mark.parametrize(
+    (
+        "task_status",
+        "step_action",
+        "step_status",
+        "expected_phase",
+        "expected_wait_cause",
+    ),
+    (
+        (
+            NavigationTaskStatus.WAITING_USER,
+            "confirm_navigation_calibration_params",
+            "waiting_user",
+            "确认标定参数",
+            "等待你选择并确认标定参数",
+        ),
+        (
+            NavigationTaskStatus.WAITING_USER,
+            "run_annotation_tracking_workflow",
+            "waiting_user",
+            "等待首帧标注",
+            "等待你提交全部首帧标注",
+        ),
+        (
+            NavigationTaskStatus.ACTIVE,
+            "run_annotation_tracking_workflow",
+            "running",
+            "Tracking",
+            None,
+        ),
+        (
+            NavigationTaskStatus.ACTIVE,
+            "run_annotation_postprocessing_workflow",
+            "running",
+            "后处理",
+            None,
+        ),
+        (
+            NavigationTaskStatus.FAILED,
+            "run_annotation_postprocessing_workflow",
+            "failed",
+            "处理失败",
+            None,
+        ),
+        (
+            NavigationTaskStatus.NEEDS_REPLAN,
+            "run_annotation_tracking_workflow",
+            "needs_replan",
+            "需要调整方案",
+            "现有方案需要调整",
+        ),
+    ),
+)
+def test_task_summary_projects_the_current_durable_workflow_step(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    task_status: NavigationTaskStatus,
+    step_action: str,
+    step_status: str,
+    expected_phase: str,
+    expected_wait_cause: str | None,
+) -> None:
+    store = WebSessionStore(tmp_path / "sessions.sqlite")
+    task_store = SqliteNavigationTaskStore(tmp_path / "navigation.sqlite")
+    session = store.create_session("状态投影", contract_version=1)
+    binding, task = _create_navigation_task(
+        store=store,
+        task_store=task_store,
+        web_session_id=session.id,
+    )
+    task_store.update_task_for_session(
+        task.task_id,
+        web_session_id=session.id,
+        agentscope_session_id=binding.navigation_session_id,
+        expected_state_revision=task.state_revision,
+        status=task_status,
+    )
+
+    class _PlanStoreProjection:
+        def __init__(self, *_args, **_kwargs) -> None:
+            pass
+
+        @staticmethod
+        def get_latest_accepted_for_task(_task_id: str):
+            return SimpleNamespace(plan_id="plan-private-1", status="active")
+
+        @staticmethod
+        def get_current_step(_plan_id: str):
+            return {
+                "step": {
+                    "action": step_action,
+                    "status": step_status,
+                }
+            }
+
+    monkeypatch.setattr(
+        "vla_data_juicer_agents.runtime.agentscope_runtime."
+        "SqliteNavigationPlanRepository",
+        _PlanStoreProjection,
+    )
+    runtime = _runtime(tmp_path, store=store, task_store=task_store)
+
+    summary = runtime._task_summary(binding, max_chars=1200)
+
+    assert summary is not None
+    assert summary["phase"] == expected_phase
+    assert summary.get("wait_cause") == expected_wait_cause

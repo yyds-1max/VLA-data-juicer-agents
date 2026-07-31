@@ -34,7 +34,7 @@ describe("TaskStrip", () => {
       "duration-300",
     );
     expect(screen.getByRole("tooltip")).toHaveClass("bg-console-panel");
-    expect(screen.getByRole("tooltip")).not.toHaveClass("backdrop-blur-sm");
+    expect(screen.getByRole("tooltip")).not.toHaveClass("backdrop-blur-xs");
     expect(container).not.toHaveTextContent(/[%％]/);
     expect(screen.queryByRole("progressbar")).not.toBeInTheDocument();
     expect(screen.queryByRole("button", { name: /继续|恢复|Resume/i })).not.toBeInTheDocument();

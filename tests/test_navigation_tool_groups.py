@@ -161,14 +161,18 @@ def test_policy_rejects_a_missing_required_group_definition():
         NavigationToolSurfacePolicy.resolve("planning", all_groups)
 
 
-def test_policy_hides_every_tool_while_the_current_step_is_running():
+@pytest.mark.parametrize("current_step_status", ["running", "waiting_user"])
+def test_policy_hides_every_tool_while_the_current_step_cannot_be_reentered(
+    current_step_status,
+):
     surface = NavigationToolSurfacePolicy.resolve(
         "execution",
         _all_groups(),
-        current_step_status="running",
+        current_step_status=current_step_status,
     )
 
     assert surface.waiting_for_running_step is True
+    assert surface.suspended_step_status == current_step_status
     assert surface.groups == ()
     assert surface.active_group_names == ()
     assert surface.flatten_active_tools() == []

@@ -678,6 +678,101 @@ def test_checked_in_golden_registry_freezes_three_private_sample_identities() ->
     assert missing_gridmap_case.root_expectations[0].present is True
     assert all(case.gridmap_tolerance.abs_tol == 0 for case in bundle.cases)
     assert all(case.trajectory_tolerance.abs_tol == 0 for case in bundle.cases)
+    clip_cases = [
+        case
+        for case in bundle.cases
+        if case.id == "m1_tracking_20260623_145550"
+        or case.id.startswith("m1_tracking_20260623_145550_segment_")
+    ]
+    assert len(clip_cases) == 6
+    assert {
+        case.role_scopes.legacy.internal_segment
+        for case in clip_cases
+        if case.role_scopes is not None
+    } == {
+        f"20260623_145550_zhigu_wuhan_{index}"
+        for index in range(6)
+    }
+    assert all(case.legacy_oracle_selection_required for case in clip_cases)
+    main_gate = next(
+        case
+        for case in bundle.cases
+        if case.id == "m1_tracking_20260605_160904"
+    )
+    assert main_gate.legacy_oracle_selection_required is True
+    prepare_global_cases = [
+        case
+        for case in bundle.cases
+        if case.id.startswith("m1_prepare_")
+    ]
+    assert {
+        (
+            case.role_scopes.candidate.dataset_date,
+            case.role_scopes.candidate.source_clip,
+            case.role_scopes.candidate.scope_kind,
+            case.role_scopes.candidate.artifact_scope,
+        )
+        for case in prepare_global_cases
+        if case.role_scopes is not None
+    } == {
+        ("20270605", "20260605_160904", "prepare_maps", "maps"),
+        (
+            "20270605",
+            "20260605_160904",
+            "prepare_metadata",
+            "v1.0-trainval",
+        ),
+        ("20270623", "20260623_145550", "prepare_maps", "maps"),
+        (
+            "20270623",
+            "20260623_145550",
+            "prepare_metadata",
+            "v1.0-trainval",
+        ),
+    }
+    assert all(
+        case.legacy_oracle_selection_required
+        and case.candidate_attestation_required
+        for case in prepare_global_cases
+    )
+    postprocessing_cases = [
+        case
+        for case in bundle.cases
+        if case.id == "m2_postprocess_20260623_145550"
+        or case.id.startswith("m2_postprocess_20260623_145550_segment_")
+    ]
+    assert len(postprocessing_cases) == 6
+    assert {
+        case.role_scopes.candidate.internal_segment
+        for case in postprocessing_cases
+        if case.role_scopes is not None
+    } == {
+        f"20260623_145550_zhigu_wuhan_{index}"
+        for index in range(6)
+    }
+    assert all(
+        case.role_scopes is not None
+        and case.role_scopes.legacy.scope_kind == "postprocessing_segment"
+        and case.role_scopes.candidate.scope_kind == "postprocessing_segment"
+        and case.root_expectations[0].relative_pattern == "*_trajectory.json"
+        and case.candidate_attestation_required
+        and case.legacy_oracle_selection_required
+        for case in postprocessing_cases
+    )
+    fix_cases = [
+        case for case in bundle.cases if case.id.startswith("m2_fix_")
+    ]
+    assert len(fix_cases) == 2
+    assert all(
+        case.role_scopes is not None
+        and case.role_scopes.legacy.scope_kind == "fix_segment"
+        and case.role_scopes.candidate.scope_kind == "fix_segment"
+        and case.root_expectations[0].relative_pattern
+        == "*_trajectory_fix_five.json"
+        and case.candidate_attestation_required
+        and case.legacy_oracle_selection_required
+        for case in fix_cases
+    )
 
 
 def test_bundle_rejects_unknown_sample_reference() -> None:

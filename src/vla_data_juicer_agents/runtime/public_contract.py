@@ -228,6 +228,7 @@ _ACTION_DEFINITIONS = (
     PublicActionDefinition("inspect_navigation_runtime_assets_tool", "inspect_environment", "检查处理环境", ActionVisibility.GROUPED, "environment_inspection", "inspection"),
     PublicActionDefinition("inspect_navigation_calibration_inventory_tool", "inspect_parameters", "核对标定参数", ActionVisibility.GROUPED, "parameter_inspection", "inspection"),
     PublicActionDefinition("inspect_navigation_localization_sources_tool", "inspect_localization", "核对定位数据", ActionVisibility.GROUPED, "localization_inspection", "inspection"),
+    PublicActionDefinition("inspect_navigation_annotation_job_facts_tool", "inspect_annotation_state", "核对标注任务状态", ActionVisibility.GROUPED, "annotation_inspection", "inspection"),
     PublicActionDefinition("list_observation_evidence_tool", "read_evidence", "汇总检查依据", ActionVisibility.GROUPED, "evidence_read", "inspection"),
     PublicActionDefinition("read_observation_evidence_tool", "read_evidence", "汇总检查依据", ActionVisibility.GROUPED, "evidence_read", "inspection"),
     PublicActionDefinition("describe_processing_action_tool", "review_capability", "核对处理条件", ActionVisibility.GROUPED, "capability_review", "inspection"),
@@ -235,6 +236,7 @@ _ACTION_DEFINITIONS = (
     PublicActionDefinition("complete_navigation_task_tool", "complete_task", "完成导航数据任务", ActionVisibility.SILENT, "task_state", "verification"),
     PublicActionDefinition("submit_extract_sync_plan_tool", "prepare_plan", "生成并校验处理方案", ActionVisibility.VISIBLE, "planning", "planning"),
     PublicActionDefinition("submit_finish_processing_plan_tool", "prepare_plan", "生成并校验处理方案", ActionVisibility.VISIBLE, "planning", "planning"),
+    PublicActionDefinition("submit_trajectory_review_plan_tool", "prepare_review_plan", "生成并校验轨迹复核方案", ActionVisibility.VISIBLE, "planning", "planning"),
     PublicActionDefinition("prepare_raw_data_tool", "prepare_data", "准备原始数据", ActionVisibility.VISIBLE, "preparation", "preparation"),
     PublicActionDefinition("extract_and_sync_navigation_data_tool", "extract_sync", "提取并同步导航数据", ActionVisibility.VISIBLE, "extract_sync", "extract_sync"),
     PublicActionDefinition("assemble_finish_temp_tool", "assemble_data", "整理中间数据", ActionVisibility.VISIBLE, "finish_assembly", "finish_assembly"),
@@ -243,9 +245,13 @@ _ACTION_DEFINITIONS = (
     PublicActionDefinition("request_human_decision", "confirm_parameters", "确认关键处理选项", ActionVisibility.VISIBLE, "human_decision", "human_decision"),
     PublicActionDefinition("run_initial_annotation_gui_tool", "annotate_data", "生成初始标注", ActionVisibility.VISIBLE, "annotation", "annotation"),
     PublicActionDefinition("run_tracking_tool", "track_trajectory", "计算轨迹与跟踪结果", ActionVisibility.VISIBLE, "tracking", "tracking"),
+    PublicActionDefinition("run_annotation_tracking_workflow_tool", "annotation_workbench", "等待首帧标注并继续跟踪", ActionVisibility.VISIBLE, "annotation", "annotation"),
     PublicActionDefinition("prepare_gridmap_for_projection_tool", "prepare_projection", "准备投影数据", ActionVisibility.VISIBLE, "projection", "projection"),
     PublicActionDefinition("run_projection_and_trajectory_tool", "project_trajectory", "生成投影与轨迹结果", ActionVisibility.VISIBLE, "projection", "projection"),
+    PublicActionDefinition("run_annotation_postprocessing_workflow_tool", "postprocess_trajectory", "执行后处理并生成轨迹", ActionVisibility.VISIBLE, "projection", "projection"),
     PublicActionDefinition("validate_navigation_outputs_tool", "verify_outputs", "核对输出完整性", ActionVisibility.VISIBLE, "verification", "verification"),
+    PublicActionDefinition("open_trajectory_fix_workbench_tool", "open_fix_workbench", "进入轨迹修正工作台", ActionVisibility.VISIBLE, "human_decision", "human_decision"),
+    PublicActionDefinition("validate_trajectory_review_outcome_tool", "verify_review_outcome", "核对轨迹复核结果", ActionVisibility.VISIBLE, "verification", "verification"),
     # State reads are internal mechanics and never need their own public row.
     PublicActionDefinition("get_navigation_task_context_tool", "read_task_state", "读取任务状态", ActionVisibility.SILENT, "execution_state", "setup"),
     PublicActionDefinition("get_plan_execution_overview_tool", "read_execution_state", "读取执行状态", ActionVisibility.SILENT, "execution_state", "generic"),
@@ -358,10 +364,17 @@ _INTERNAL_ID_RE = re.compile(
     r"\b(?:task|plan|step|reply|session|agent|activity|request|origin|call|run|tool_call|parent_run)[_ -]?id\s*[:=：]?\s*[A-Za-z0-9_-]+",
     re.IGNORECASE,
 )
+_INTERNAL_REF_RE = re.compile(
+    r"\b(?:nav_plan_[0-9a-f]{24,64}|"
+    r"[a-z][a-z0-9_]*(?:step|phase)_[a-z0-9_-]+)\b",
+    re.IGNORECASE,
+)
 _UUID_RE = re.compile(r"\b[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}\b", re.IGNORECASE)
 _LONG_HEX_RE = re.compile(r"\b[0-9a-f]{24,64}\b", re.IGNORECASE)
 _TOOL_NAME_RE = re.compile(
-    r"\b(?:[a-z][a-z0-9_]{2,}_tool|(?:start|continue|control)_navigation_data_task)\b",
+    r"\b(?:[a-z][a-z0-9_]{2,}_tool|"
+    r"(?:start|continue|control)_navigation_data_task|"
+    r"run_annotation_(?:tracking|postprocessing)_workflow)\b",
     re.IGNORECASE,
 )
 _AGENT_NAME_RE = re.compile(r"\b(?:MainRouter|NavigationDataAgent|[A-Za-z][A-Za-z0-9]*Agent|AgentScope)\b", re.IGNORECASE)
@@ -378,7 +391,8 @@ def _contains_unsafe_public_text(text: str) -> bool:
         pattern.search(text)
         for pattern in (
             _UNIX_PATH_RE, _WINDOWS_PATH_RE, _UNC_PATH_RE, _BEARER_RE, _SECRET_RE,
-            _CN_SECRET_RE, _INTERNAL_ID_RE, _TOOL_NAME_RE, _AGENT_NAME_RE,
+            _CN_SECRET_RE, _INTERNAL_ID_RE, _INTERNAL_REF_RE, _TOOL_NAME_RE,
+            _AGENT_NAME_RE,
             _UUID_RE, _LONG_HEX_RE, _PERCENT_RE,
         )
     )
@@ -394,6 +408,7 @@ def _redact_text(text: object) -> str:
         (_SECRET_RE, "[已隐藏凭据]"),
         (_CN_SECRET_RE, "[已隐藏凭据]"),
         (_INTERNAL_ID_RE, "[已隐藏内部标识]"),
+        (_INTERNAL_REF_RE, "[已隐藏内部标识]"),
         (_UUID_RE, "[已隐藏内部标识]"),
         (_LONG_HEX_RE, "[已隐藏内部标识]"),
         (_TOOL_NAME_RE, "[已隐藏内部操作]"),

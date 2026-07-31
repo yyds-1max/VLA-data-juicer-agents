@@ -174,7 +174,7 @@ export function DashboardPage() {
           </div>
           <ol className="space-y-3">
             {activityFeed.map((item) => (
-              <li key={item.id} className="flex gap-3 rounded border border-console-line bg-console-panel2/70 p-3">
+              <li key={item.id} className="flex gap-3 rounded-sm border border-console-line bg-console-panel2/70 p-3">
                 <StatusTag tone={item.tone} className="mt-0.5 shrink-0">
                   {item.time}
                 </StatusTag>

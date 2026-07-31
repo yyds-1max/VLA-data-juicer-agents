@@ -252,6 +252,7 @@ _TOOL_PHASES: dict[str, str] = {
     "complete_navigation_task_tool": "verification",
     "submit_extract_sync_plan_tool": "planning",
     "submit_finish_processing_plan_tool": "planning",
+    "submit_trajectory_review_plan_tool": "planning",
     "get_plan_execution_overview_tool": "silent_execution_state",
     "get_current_plan_step_tool": "silent_execution_state",
     "prepare_raw_data_tool": "preparation",
@@ -265,6 +266,8 @@ _TOOL_PHASES: dict[str, str] = {
     "prepare_gridmap_for_projection_tool": "projection",
     "run_projection_and_trajectory_tool": "projection",
     "validate_navigation_outputs_tool": "verification",
+    "open_trajectory_fix_workbench_tool": "human_decision",
+    "validate_trajectory_review_outcome_tool": "verification",
 }
 _PHASE_START_TEXT: dict[str, str] = {
     "setup": "正在确认任务范围并建立处理上下文。",

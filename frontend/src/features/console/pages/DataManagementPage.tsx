@@ -333,7 +333,7 @@ function DatasetTable({
   const datasetScrollbar = useScrollbarProximity();
 
   return (
-    <section className="overflow-hidden rounded-lg border border-console-line bg-console-panel shadow-sm">
+    <section className="overflow-hidden rounded-lg border border-console-line bg-console-panel shadow-xs">
       <div className="flex flex-col items-start justify-between gap-3 border-b border-console-line px-4 py-3 sm:flex-row sm:items-center">
         <p className="text-sm text-console-muted">
           共 <span className="font-semibold text-console-text">{formatCount(dates.length)}</span> 个日期批次
@@ -385,7 +385,7 @@ function DatasetTable({
                         <button
                           aria-expanded={isExpanded}
                           aria-label={`${isExpanded ? "收起" : "展开"} ${date.date}`}
-                          className="flex h-7 w-7 shrink-0 items-center justify-center rounded-md text-console-muted transition hover:bg-console-panel2 hover:text-console-cyan focus:outline-none focus:ring-2 focus:ring-console-cyan"
+                          className="flex h-7 w-7 shrink-0 items-center justify-center rounded-md text-console-muted transition hover:bg-console-panel2 hover:text-console-cyan focus:outline-hidden focus:ring-2 focus:ring-console-cyan"
                           onClick={() => onToggleDate(date.date)}
                           type="button"
                         >
@@ -497,13 +497,13 @@ function DataSurfaceSwitch({
 }) {
   return (
     <div
-      className="relative grid h-10 w-[15rem] grid-cols-2 rounded-lg bg-console-panel2 p-1 ring-1 ring-inset ring-console-line"
+      className="relative grid h-10 w-60 grid-cols-2 rounded-lg bg-console-panel2 p-1 ring-1 ring-inset ring-console-line"
       role="tablist"
       aria-label="数据类型"
     >
       <span
         aria-hidden="true"
-        className={`pointer-events-none absolute bottom-1 left-1 top-1 w-[calc(50%_-_0.25rem)] rounded-md border border-console-line/80 bg-console-panel shadow-sm transition-transform duration-200 ease-out ${
+        className={`pointer-events-none absolute bottom-1 left-1 top-1 w-[calc(50%-0.25rem)] rounded-md border border-console-line/80 bg-console-panel shadow-xs transition-transform duration-200 ease-out ${
           activeSurface === "robotic_arm" ? "translate-x-full" : "translate-x-0"
         }`}
       />
@@ -516,7 +516,7 @@ function DataSurfaceSwitch({
             type="button"
             role="tab"
             aria-selected={active}
-            className={`relative z-10 inline-flex h-8 items-center justify-center rounded-md px-3 text-sm font-semibold transition focus:outline-none focus-visible:ring-2 focus-visible:ring-slate-300 ${
+            className={`relative z-10 inline-flex h-8 items-center justify-center rounded-md px-3 text-sm font-semibold transition focus:outline-hidden focus-visible:ring-2 focus-visible:ring-slate-300 ${
               active ? "text-console-text" : "text-console-muted hover:text-console-text"
             }`}
             onClick={() => onChange(surface.id)}
@@ -708,7 +708,7 @@ function SyncImageDrawer({
           </div>
           <button
             aria-label="关闭同步图像浏览"
-            className="inline-flex h-8 items-center justify-center gap-2 rounded-lg border border-console-line bg-console-panel px-2 text-sm font-medium text-console-text shadow-sm transition hover:border-console-cyan/40 hover:bg-console-panel2 focus:outline-none focus:ring-2 focus:ring-console-cyan"
+            className="inline-flex h-8 items-center justify-center gap-2 rounded-lg border border-console-line bg-console-panel px-2 text-sm font-medium text-console-text shadow-xs transition hover:border-console-cyan/40 hover:bg-console-panel2 focus:outline-hidden focus:ring-2 focus:ring-console-cyan"
             onClick={onClose}
             ref={closeButtonRef}
             type="button"
@@ -733,7 +733,7 @@ function SyncImageDrawer({
                     return (
                       <button
                         aria-selected={isActive}
-                        className={`rounded-lg border px-3 py-1.5 text-sm transition focus:outline-none focus:ring-2 focus:ring-console-cyan ${
+                        className={`rounded-lg border px-3 py-1.5 text-sm transition focus:outline-hidden focus:ring-2 focus:ring-console-cyan ${
                           isActive
                             ? "border-console-cyan bg-console-cyan/10 text-console-text"
                             : "border-console-line bg-console-panel2 text-console-muted hover:text-console-text"
@@ -753,15 +753,15 @@ function SyncImageDrawer({
               <div className="grid min-h-0 gap-4 lg:grid-cols-[16rem_1fr]">
                 <div className="rounded-lg border border-console-line bg-console-panel2/60 p-3">
                   <div className="mb-2 text-xs font-medium text-console-muted">图像文件</div>
-                  <div className="max-h-[34rem] space-y-1 overflow-y-auto">
+                  <div className="max-h-136 space-y-1 overflow-y-auto">
                     {images.map((image, index) => {
                       const isActive = index === selectedImageIndex;
                       return (
                         <button
                           aria-pressed={isActive}
-                          className={`block w-full truncate rounded-md border px-2 py-1.5 text-left text-sm transition focus:outline-none focus:ring-2 focus:ring-console-cyan ${
+                          className={`block w-full truncate rounded-md border px-2 py-1.5 text-left text-sm transition focus:outline-hidden focus:ring-2 focus:ring-console-cyan ${
                             isActive
-                              ? "border-console-cyan bg-white text-console-text shadow-sm"
+                              ? "border-console-cyan bg-white text-console-text shadow-xs"
                               : "border-transparent bg-transparent text-console-muted hover:bg-white hover:text-console-text"
                           }`}
                           key={image}
@@ -776,7 +776,7 @@ function SyncImageDrawer({
                   </div>
                 </div>
 
-                <div className="min-w-0 rounded-lg border border-console-line bg-white p-4 shadow-sm">
+                <div className="min-w-0 rounded-lg border border-console-line bg-white p-4 shadow-xs">
                   <div className="mb-3 flex flex-wrap items-center justify-between gap-2">
                     <div className="min-w-0">
                       <p className="truncate text-sm font-semibold text-console-text">{selectedImage}</p>
@@ -882,7 +882,7 @@ export function DataManagementPage({ onPlaceholderAction }: DataManagementPagePr
   const submittingToDataPilot =
     activeInvocation?.status === "queued" || activeInvocation?.status === "submitting";
   const dataPilotInvocationError =
-    activeInvocation?.status === "failed" || activeInvocation?.status === "blocked"
+    activeInvocation?.status === "failed"
       ? activeInvocation.error ?? "提交失败，请重试。"
       : null;
 
@@ -944,7 +944,7 @@ export function DataManagementPage({ onPlaceholderAction }: DataManagementPagePr
     if (
       activeInvocationId &&
       pendingInvocation?.invocationId === activeInvocationId &&
-      (pendingInvocation.status === "failed" || pendingInvocation.status === "blocked")
+      pendingInvocation.status === "failed"
     ) {
       datapilotStore.getState().clearDataPilotInvocation(activeInvocationId);
       setActiveInvocationId(null);
@@ -958,7 +958,7 @@ export function DataManagementPage({ onPlaceholderAction }: DataManagementPagePr
       activeInvocationId &&
       pendingInvocation?.invocationId === activeInvocationId &&
       pendingInvocation.message === message &&
-      (pendingInvocation.status === "failed" || pendingInvocation.status === "blocked")
+      pendingInvocation.status === "failed"
     ) {
       datapilotStore.getState().retryDataPilotInvocation(activeInvocationId);
       return;
@@ -985,7 +985,7 @@ export function DataManagementPage({ onPlaceholderAction }: DataManagementPagePr
           <div className="relative w-full min-w-0 sm:w-96 sm:flex-none">
             <Search aria-hidden="true" className="pointer-events-none absolute left-3 top-1/2 h-4 w-4 -translate-y-1/2 text-console-muted" />
             <input
-              className="h-10 w-full rounded-lg border border-console-line bg-console-panel px-9 text-sm text-console-text shadow-sm outline-none transition placeholder:text-console-muted focus:border-console-cyan focus:ring-2 focus:ring-console-cyan/20"
+              className="h-10 w-full rounded-lg border border-console-line bg-console-panel px-9 text-sm text-console-text shadow-xs outline-hidden transition placeholder:text-console-muted focus:border-console-cyan focus:ring-2 focus:ring-console-cyan/20"
               placeholder="按日期或 clip 搜索"
               value={searchQuery}
               onChange={(event) => {

@@ -38,10 +38,27 @@ from vla_data_juicer_agents.navigation.plan_store import (
 )
 from vla_data_juicer_agents.navigation.task_state import NavigationTask
 from vla_data_juicer_agents.navigation.task_store import SqliteNavigationTaskStore
+from vla_data_juicer_agents.navigation.writer_lock import (
+    clear_navigation_writer_quarantine,
+    ensure_navigation_writer_quarantine,
+)
 from vla_data_juicer_agents.runtime.agentscope_runtime import (
     _enrich_plan_human_decision_event,
     _human_decision_payload_from_tool_call,
 )
+
+
+@pytest.fixture(autouse=True)
+def _private_navigation_writer_lock(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    lock_root = tmp_path / "writer-lock"
+    lock_root.mkdir(mode=0o700)
+    monkeypatch.setenv(
+        "VLA_NAVIGATION_WRITER_LOCK_PATH",
+        str(lock_root / "navigation.lock"),
+    )
 
 
 def _decode_tool_payload(payload):
@@ -748,6 +765,79 @@ def test_plan_bound_writer_returns_compact_busy_without_invocation(monkeypatch, 
         "retry": "wait_and_reinspect",
     }
     assert invoked == []
+
+
+def test_navigation_plan_writer_is_blocked_by_global_quarantine(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    settings = NavigationSettings(
+        vladatasets_root=tmp_path / "datasets",
+        processing_root=tmp_path / "processing",
+    )
+    date, segment = "20260710", "segment-a"
+    (settings.raw_data_root / date / segment).mkdir(parents=True)
+    database = tmp_path / "navigation.sqlite"
+    task_store = SqliteNavigationTaskStore(database)
+    task = _create_task(
+        task_store,
+        date=date,
+        segments=[segment],
+        scene_mode=None,
+        dry_run=False,
+    )
+    plan_store = SqliteNavigationPlanRepository(database)
+    plan = _activate_plan(
+        plan_store,
+        task,
+        "extract_sync",
+        1,
+        extract_plan(two_steps=True),
+    )
+    invoked: list[dict] = []
+    monkeypatch.setattr(
+        plan_execution,
+        "prepare_raw_data",
+        lambda **kwargs: invoked.append(kwargs)
+        or ok_result("prepare_raw_data"),
+    )
+    lock_path = tmp_path / "writer-lock" / "navigation.lock"
+    ensure_navigation_writer_quarantine(
+        lock_path,
+        recovery_ref="annotation_recovery",
+    )
+    tools = {
+        tool.name: tool
+        for tool in plan_execution.build_plan_bound_execution_tools(
+            task=task,
+            plan_store=plan_store,
+            evidence_store=FileNavigationEvidenceStore(tmp_path / "evidence"),
+            settings=settings,
+            dry_run=False,
+            cancellation=None,
+            web_session_id=task.created_by_web_session_id,
+            agentscope_session_id=task.agentscope_session_id,
+        )
+    }
+
+    result = call_tool(
+        tools["prepare_raw_data_tool"],
+        plan_id=plan.plan_id,
+        step_id="prepare",
+    )
+
+    assert result == {
+        "ok": False,
+        "error_type": "navigation_writer_coordination_unavailable",
+        "message": "Navigation writes require an operator safety check.",
+        "retry": "operator_recovery_required",
+    }
+    assert invoked == []
+    assert plan_store.get_current_step(plan.plan_id)["step"]["status"] == "pending"
+    assert clear_navigation_writer_quarantine(
+        lock_path,
+        all_writer_process_groups_absent=True,
+    )
 
 
 def test_finish_plan_execution_permission_does_not_infer_phase_from_artifacts(tmp_path):
@@ -2878,3 +2968,173 @@ def test_plan_bound_human_decision_waits_and_transitions_ledger_exactly_once(
             (plan.plan_id,),
         ).fetchone()[0]
     assert status == expected_status
+
+
+def test_calibration_confirmation_persists_an_observed_profile_override(tmp_path):
+    settings = NavigationSettings(
+        vladatasets_root=tmp_path / "datasets",
+        processing_root=tmp_path / "processing",
+    )
+    proposed = "NoobScenes/params/20260320/sensors"
+    confirmed = "NoobScenes/params/20260529_go2w/sensors"
+    db_path = tmp_path / "navigation.sqlite"
+    task_store = SqliteNavigationTaskStore(db_path)
+    task = _create_task(
+        task_store,
+        date="20260710",
+        segments=["segment-a"],
+        scene_mode="out",
+        dry_run=True,
+    )
+    evidence_store = FileNavigationEvidenceStore(tmp_path / "evidence")
+    observation = SqliteNavigationObservationStore(db_path).append(
+        task.task_id,
+        "calibration_inventory",
+        [
+            CalibrationInventoryObservation(
+                sensor_sources=[proposed, confirmed],
+            )
+        ],
+        [],
+        evidence_store,
+        expected_web_session_id=task.created_by_web_session_id,
+        expected_agentscope_session_id=task.agentscope_session_id,
+    )
+    plan_store = SqliteNavigationPlanRepository(db_path)
+    plan = _activate_plan(
+        plan_store,
+        task,
+        "finish_processing",
+        observation.revision,
+        finish_plan(proposed),
+    )
+
+    accepted = plan_execution.submit_plan_human_decision(
+        plan_store=plan_store,
+        evidence_store=evidence_store,
+        plan_id=plan.plan_id,
+        step_id="confirm",
+        decision={
+            "action": "confirm",
+            "selected_calibration_profile": "20260529_go2w",
+            "selected_sensor_source": confirmed,
+        },
+        expected_web_session_id=task.created_by_web_session_id,
+        expected_agentscope_session_id=task.agentscope_session_id,
+    )
+
+    assert accepted is True
+    handoff = plan_store.get_human_decision_handoff(plan.plan_id, "confirm")
+    assert handoff is not None
+    assert handoff.decision["selected_calibration_profile"] == "20260529_go2w"
+    assert handoff.decision["selected_sensor_source"] == confirmed
+    assert (
+        plan_execution._confirmed_calibration_source(plan, plan_store)
+        == confirmed
+    )
+    arguments = plan_execution.resolve_step_arguments(
+        task=task,
+        plan=plan.plan,
+        step=next(step for step in plan.plan.steps if step.step_id == "assemble"),
+        settings=settings,
+        confirmed_calibration_source=confirmed,
+    )
+    assert arguments["selected_sensor_source"] == (
+        settings.processing_root / confirmed
+    ).resolve(strict=False)
+
+
+def test_deferred_calibration_requires_and_persists_structured_selection(tmp_path):
+    settings = NavigationSettings(
+        vladatasets_root=tmp_path / "datasets",
+        processing_root=tmp_path / "processing",
+    )
+    selected = "NoobScenes/params/20260529_go2w/sensors"
+    (settings.processing_root / selected).mkdir(parents=True)
+    db_path = tmp_path / "navigation.sqlite"
+    task_store = SqliteNavigationTaskStore(db_path)
+    task = _create_task(
+        task_store,
+        date="20260710",
+        segments=["segment-a"],
+        scene_mode="out",
+        dry_run=True,
+    )
+    evidence_store = FileNavigationEvidenceStore(tmp_path / "evidence")
+    observation = SqliteNavigationObservationStore(db_path).append(
+        task.task_id,
+        "calibration_inventory",
+        [CalibrationInventoryObservation(sensor_sources=[selected])],
+        [],
+        evidence_store,
+        expected_web_session_id=task.created_by_web_session_id,
+        expected_agentscope_session_id=task.agentscope_session_id,
+    )
+    payload = finish_plan(selected).model_dump(mode="json")
+    payload["decisions"]["calibration"].update(
+        {
+            "mode": "selected_profile",
+            "selected_sensor_source": None,
+            "requires_user_confirmation": True,
+        }
+    )
+    plan_store = SqliteNavigationPlanRepository(db_path)
+    plan = _activate_plan(
+        plan_store,
+        task,
+        "finish_processing",
+        observation.revision,
+        FinishProcessingPlanInput.model_validate(payload),
+    )
+
+    permission_error = plan_execution.prepare_plan_human_decision(
+        task=task,
+        plan_store=plan_store,
+        evidence_store=evidence_store,
+        settings=settings,
+        plan_id=plan.plan_id,
+        step_id="confirm",
+        expected_web_session_id=task.created_by_web_session_id,
+        expected_agentscope_session_id=task.agentscope_session_id,
+    )
+    metadata = _human_decision_payload_from_tool_call(
+        SimpleNamespace(
+            name="confirm_navigation_calibration_params_tool",
+            input={"plan_id": plan.plan_id, "step_id": "confirm"},
+        ),
+        plan_store=plan_store,
+    )
+    missing_selection = plan_execution.submit_plan_human_decision(
+        plan_store=plan_store,
+        evidence_store=evidence_store,
+        plan_id=plan.plan_id,
+        step_id="confirm",
+        decision={"action": "confirm"},
+        expected_web_session_id=task.created_by_web_session_id,
+        expected_agentscope_session_id=task.agentscope_session_id,
+    )
+    accepted = plan_execution.submit_plan_human_decision(
+        plan_store=plan_store,
+        evidence_store=evidence_store,
+        plan_id=plan.plan_id,
+        step_id="confirm",
+        decision={
+            "action": "confirm",
+            "selected_calibration_profile": "20260529_go2w",
+            "selected_sensor_source": selected,
+        },
+        expected_web_session_id=task.created_by_web_session_id,
+        expected_agentscope_session_id=task.agentscope_session_id,
+    )
+
+    assert permission_error is None
+    assert metadata == {
+        "request_id": f"{plan.plan_id}:confirm",
+        "decision_type": "camera_params",
+        "summary": "请选择本次导航数据处理使用的相机标定参数。",
+        "plan_id": plan.plan_id,
+        "step_id": "confirm",
+    }
+    assert missing_selection is False
+    assert accepted is True
+    assert plan_execution._confirmed_calibration_source(plan, plan_store) == selected

@@ -1,3 +1,5 @@
+import { Progress } from "@/components/ui/progress";
+
 import type { StatusTone } from "../../features/console/consoleTypes";
 import { cn } from "../../lib/utils";
 
@@ -23,16 +25,12 @@ export function ProgressBar({ value, tone = "success", label, className }: Progr
   return (
     <div className={cn("space-y-1.5", className)}>
       {label ? <div className="text-xs text-console-muted">{label}</div> : null}
-      <div
-        className="h-2 overflow-hidden rounded-full bg-slate-100"
-        role="progressbar"
-        aria-valuenow={normalizedValue}
-        aria-valuemin={0}
-        aria-valuemax={100}
+      <Progress
+        className="h-2 bg-slate-100"
+        indicatorClassName={fillClasses[tone]}
+        value={normalizedValue}
         aria-label={label}
-      >
-        <div className={cn("h-full rounded-full transition-[width]", fillClasses[tone])} style={{ width: `${normalizedValue}%` }} />
-      </div>
+      />
     </div>
   );
 }

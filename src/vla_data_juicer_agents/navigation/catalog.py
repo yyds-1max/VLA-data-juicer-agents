@@ -8,8 +8,12 @@ from pydantic import BaseModel, Field
 
 CapabilityStatus = Literal["available", "planned", "placeholder", "deprecated"]
 ToolEffect = Literal["read", "write", "execute", "external"]
-CapabilityPhase = Literal["extract_sync", "finish_processing"]
-CAPABILITY_CATALOG_REVISION = "navigation-capabilities-v3"
+CapabilityPhase = Literal[
+    "extract_sync",
+    "finish_processing",
+    "trajectory_review",
+]
+CAPABILITY_CATALOG_REVISION = "navigation-capabilities-v5"
 
 
 class ToolVariantCapability(BaseModel):
@@ -114,6 +118,14 @@ NAVIGATION_TOOL_CAPABILITIES: tuple[ToolCapability, ...] = (
         declared_output_kinds=["localization_sources"],
     ),
     ToolCapability(
+        tool_name="inspect_navigation_annotation_job_facts",
+        stage_kind="inspect_navigation_annotation_job_facts",
+        effects="read",
+        variants=[ToolVariantCapability(id="bounded_application_facts")],
+        plan_agent_allowed=True,
+        declared_output_kinds=["annotation_job_facts"],
+    ),
+    ToolCapability(
         tool_name="prepare_raw_data",
         stage_kind="prepare_raw_data",
         effects="write",
@@ -215,6 +227,19 @@ NAVIGATION_TOOL_CAPABILITIES: tuple[ToolCapability, ...] = (
         declared_output_kinds=["tracking_outputs"],
     ),
     ToolCapability(
+        tool_name="run_annotation_tracking_workflow",
+        stage_kind="run_annotation_tracking_workflow",
+        effects="external",
+        variants=[ToolVariantCapability(id="durable_web_handoff")],
+        supports_dry_run=True,
+        executor_agent_allowed=True,
+        human_blocking=True,
+        locks_navigation_target=True,
+        phase="finish_processing",
+        argument_model="EmptyArguments",
+        declared_output_kinds=["tracked_annotation_job"],
+    ),
+    ToolCapability(
         tool_name="prepare_gridmap_for_projection",
         stage_kind="prepare_gridmap_for_projection",
         effects="execute",
@@ -263,6 +288,18 @@ NAVIGATION_TOOL_CAPABILITIES: tuple[ToolCapability, ...] = (
         declared_output_kinds=["finish_data", "trajectory"],
     ),
     ToolCapability(
+        tool_name="run_annotation_postprocessing_workflow",
+        stage_kind="run_annotation_postprocessing_workflow",
+        effects="execute",
+        variants=[ToolVariantCapability(id="plan_bound_runtime")],
+        supports_dry_run=True,
+        executor_agent_allowed=True,
+        locks_navigation_target=True,
+        phase="finish_processing",
+        argument_model="EmptyArguments",
+        declared_output_kinds=["finish_data", "trajectory", "trajectory_review"],
+    ),
+    ToolCapability(
         tool_name="validate_navigation_outputs",
         stage_kind="validate_navigation_outputs",
         effects="read",
@@ -273,6 +310,30 @@ NAVIGATION_TOOL_CAPABILITIES: tuple[ToolCapability, ...] = (
         phase="finish_processing",
         argument_model="EmptyArguments",
         declared_output_kinds=["validated_navigation_outputs"],
+    ),
+    ToolCapability(
+        tool_name="open_trajectory_fix_workbench",
+        stage_kind="open_trajectory_fix_workbench",
+        effects="external",
+        variants=[ToolVariantCapability(id="durable_human_handoff")],
+        supports_dry_run=True,
+        executor_agent_allowed=True,
+        human_blocking=True,
+        locks_navigation_target=True,
+        phase="trajectory_review",
+        argument_model="EmptyArguments",
+        declared_output_kinds=["trajectory_review_handoff"],
+    ),
+    ToolCapability(
+        tool_name="validate_trajectory_review_outcome",
+        stage_kind="validate_trajectory_review_outcome",
+        effects="read",
+        variants=[ToolVariantCapability(id="approved_or_terminal")],
+        supports_dry_run=True,
+        executor_agent_allowed=True,
+        phase="trajectory_review",
+        argument_model="EmptyArguments",
+        declared_output_kinds=["validated_trajectory_review"],
     ),
 )
 

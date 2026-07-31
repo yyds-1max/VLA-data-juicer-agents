@@ -28,7 +28,10 @@ def _config(tmp_path) -> AgentScopeRuntimeConfig:
     )
 
 
-@pytest.mark.parametrize("entrypoint", ["chat", "data_management_shortcut"])
+@pytest.mark.parametrize(
+    "entrypoint",
+    ["chat", "data_management_shortcut", "annotation_processing_shortcut"],
+)
 def test_all_new_sessions_use_contract_v1(
     tmp_path,
     entrypoint: str,
@@ -42,7 +45,7 @@ def test_all_new_sessions_use_contract_v1(
         agentscope_runtime=runtime,
     )
     payload: dict[str, Any] = {"message": "处理导航数据", "entrypoint": entrypoint}
-    if entrypoint == "data_management_shortcut":
+    if entrypoint != "chat":
         payload["request_context"] = {
             "kind": "navigation_dataset_selection_v1",
             "dataset_date": "20260720",
@@ -76,12 +79,29 @@ def test_shortcut_requires_private_scope_and_chat_rejects_it(tmp_path) -> None:
             "/api/sessions",
             json={"message": "处理选中数据", "entrypoint": "data_management_shortcut"},
         )
+        annotation_missing = client.post(
+            "/api/sessions",
+            json={
+                "message": "执行自动标注并完成后处理",
+                "entrypoint": "annotation_processing_shortcut",
+            },
+        )
+        annotation_ok = client.post(
+            "/api/sessions",
+            json={
+                "message": "执行自动标注并完成后处理",
+                "entrypoint": "annotation_processing_shortcut",
+                "request_context": context,
+            },
+        )
         unexpected = client.post(
             "/api/sessions",
             json={"message": "处理选中数据", "entrypoint": "chat", "request_context": context},
         )
 
     assert missing.status_code == 422
+    assert annotation_missing.status_code == 422
+    assert annotation_ok.status_code == 200
     assert unexpected.status_code == 422
 
 

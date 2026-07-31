@@ -76,11 +76,25 @@ EXECUTION_TOOL_NAMES = {
     "run_noobscene_preprocessing_tool",
     "run_initial_annotation_gui_tool",
     "run_tracking_tool",
+    "run_annotation_tracking_workflow_tool",
     "prepare_gridmap_for_projection_tool",
     "run_projection_and_trajectory_tool",
+    "run_annotation_postprocessing_workflow_tool",
     "validate_navigation_outputs_tool",
+    "open_trajectory_fix_workbench_tool",
+    "validate_trajectory_review_outcome_tool",
 }
 GENERIC_OR_RESET_TOOL_NAMES = {"bash", "read", "task", "reset_tools"}
+
+
+@pytest.fixture(autouse=True)
+def _private_navigation_writer_lock(tmp_path, monkeypatch):
+    lock_root = tmp_path / "writer-lock"
+    lock_root.mkdir(mode=0o700)
+    monkeypatch.setenv(
+        "VLA_NAVIGATION_WRITER_LOCK_PATH",
+        str(lock_root / "navigation.lock"),
+    )
 
 
 class ProcessingSpy:
@@ -106,6 +120,38 @@ class ProcessingSpy:
             )
 
         return invoke
+
+
+class AnnotationGatewaySpy:
+    """Minimal Annotation boundary used by the M2 chat-surface integration test."""
+
+    def __init__(self) -> None:
+        self.tracking_calls: list[dict[str, str]] = []
+
+    def get_processing_facts(self, **_kwargs) -> dict[str, object]:
+        return {
+            "job_status": "missing",
+            "segment_count": 0,
+            "tracked_count": 0,
+            "ready_for_postprocessing": False,
+            "processing_calibration_snapshot_available": False,
+        }
+
+    def begin_annotation_from_plan(
+        self,
+        *,
+        navigation_task_id: str,
+        plan_id: str,
+        step_id: str,
+    ) -> dict[str, object]:
+        self.tracking_calls.append(
+            {
+                "navigation_task_id": navigation_task_id,
+                "plan_id": plan_id,
+                "step_id": step_id,
+            }
+        )
+        return {"status": "waiting_initial_annotation"}
 
 
 class ModelInputProbe(ScriptedChatModel):
@@ -279,7 +325,77 @@ def _minimal_finish_plan(evidence: dict[str, str]) -> dict:
     }
 
 
-async def _real_chat_service_case(monkeypatch, tmp_path, *, web_session_id: str):
+def _annotation_creation_plan(evidence: dict[str, str]) -> dict:
+    """The only valid M2 application-owned path when an Annotation Job is absent."""
+    return {
+        "decisions": {
+            "localization": {
+                "source": "odom",
+                "conversion": "odom_to_ins",
+                "reason": "Use the observed odometry converter.",
+                "evidence_refs": [evidence["localization_sources"]],
+            },
+            "gridmap": {
+                "source": "existing_gridmap",
+                "reason": "Use the observed synchronized gridmap.",
+                "evidence_refs": [evidence["gridmap_artifacts"]],
+            },
+            "calibration": {
+                "mode": "hardcoded_with_user_confirmation",
+                "selected_sensor_source": "NoobScenes/params/selected/sensors",
+                "requires_user_confirmation": True,
+                "reason": "Confirm the observed processing profile before use.",
+                "evidence_refs": [evidence["calibration_inventory"]],
+            },
+        },
+        "steps": [
+            {
+                "step_id": "confirm_calibration",
+                "action": "confirm_navigation_calibration_params",
+                "variant": "default",
+                "arguments": {},
+                "depends_on": [],
+                "failure_policy": "stop",
+                "decision_refs": ["calibration"],
+            },
+            {
+                "step_id": "annotation_tracking",
+                "action": "run_annotation_tracking_workflow",
+                "variant": "durable_web_handoff",
+                "arguments": {},
+                "depends_on": ["confirm_calibration"],
+                "failure_policy": "stop",
+                "decision_refs": ["localization", "calibration"],
+            },
+            {
+                "step_id": "postprocess",
+                "action": "run_annotation_postprocessing_workflow",
+                "variant": "plan_bound_runtime",
+                "arguments": {},
+                "depends_on": ["annotation_tracking"],
+                "failure_policy": "stop",
+                "decision_refs": ["localization", "gridmap", "calibration"],
+            },
+            {
+                "step_id": "validate_outputs",
+                "action": "validate_navigation_outputs",
+                "variant": "expect_gridmap",
+                "arguments": {},
+                "depends_on": ["postprocess"],
+                "failure_policy": "stop",
+                "decision_refs": ["gridmap"],
+            },
+        ],
+    }
+
+
+async def _real_chat_service_case(
+    monkeypatch,
+    tmp_path,
+    *,
+    web_session_id: str,
+    annotation_gateway=None,
+):
     data_root = tmp_path / "datasets"
     processing_root = tmp_path / "processing"
     monkeypatch.setenv("VLA_VLADATASETS_ROOT", str(data_root))
@@ -314,6 +430,7 @@ async def _real_chat_service_case(monkeypatch, tmp_path, *, web_session_id: str)
         workspace_manager=workspace_manager,
         app=None,
     )
+    runtime.set_annotation_gateway(annotation_gateway)
     services = runtime._navigation_services()
     task = services.task_store.create_task_attempt(
         request="Process navigation data",
@@ -663,7 +780,7 @@ async def test_plan_acceptance_switches_to_execution_within_same_reply(
         "prepare_raw_data_tool",
         lambda messages: {
             "plan_id": latest_tool_result_json(messages)["plan_id"],
-            "step_id": latest_tool_result_json(messages)["step"]["step_id"],
+            "step_id": latest_tool_result_json(messages)["step_id"],
         },
     )
     model.enqueue_text("第一步执行完成。")
@@ -1104,6 +1221,214 @@ async def test_later_same_session_finish_plan_executes_and_closes_task(
     )
     assert services.plan_store.get_active_for_task(built.task.task_id) is None
     assert model.compact_event_count == 0
+    model.assert_exhausted()
+
+
+@pytest.mark.asyncio
+async def test_missing_annotation_job_requires_scene_guidance_before_creation_handoff(
+    monkeypatch,
+    tmp_path,
+):
+    gateway = AnnotationGatewaySpy()
+    config, session_id, built, services, storage, bus, service = (
+        await _real_chat_service_case(
+            monkeypatch,
+            tmp_path,
+            web_session_id="web-m2-missing-annotation",
+            annotation_gateway=gateway,
+        )
+    )
+    with sqlite3.connect(services.plan_store.db_path) as connection:
+        connection.execute(
+            """UPDATE navigation_task_outcomes
+               SET requested_outcome = 'postprocessing'
+               WHERE task_id = ?""",
+            (built.task.task_id,),
+        )
+    _write_finish_inputs(services.settings)
+
+    model = ScriptedChatModel()
+    for name in (
+        "inspect_navigation_annotation_job_facts_tool",
+        "inspect_navigation_artifact_state_tool",
+        "inspect_navigation_runtime_assets_tool",
+        "inspect_navigation_calibration_inventory_tool",
+        "inspect_navigation_localization_sources_tool",
+        "inspect_navigation_gridmap_artifacts_tool",
+    ):
+        model.enqueue_tool(name, {})
+    context_revisions = {}
+    model.enqueue_tool("get_navigation_task_context_tool", {})
+
+    def record_scene_guidance(messages):
+        context = latest_tool_result_json(messages)
+        context_revisions["before_guidance"] = context[
+            "planning_context_revision"
+        ]
+        assert context["scene_mode"] is None
+        assert {
+            "annotation_job_facts",
+            "artifact_state",
+            "runtime_assets",
+            "calibration_inventory",
+            "localization_sources",
+            "gridmap_artifacts",
+        } <= set(context["observed_kinds"])
+        return {"text": "室外场景", "scene_mode": "out"}
+
+    model.enqueue_tool(
+        "record_navigation_user_guidance_tool",
+        record_scene_guidance,
+    )
+    model.enqueue_tool("get_navigation_task_context_tool", {})
+
+    def submit_creation_plan(messages):
+        context = latest_tool_result_json(messages)
+        context_revisions["after_guidance"] = context[
+            "planning_context_revision"
+        ]
+        assert context["scene_mode"] == "out"
+        return {
+            "planning_context_revision": context[
+                "planning_context_revision"
+            ],
+            "plan": _annotation_creation_plan(
+                _evidence_by_kind(services, built.task.task_id)
+            ),
+        }
+
+    model.enqueue_tool(
+        "submit_finish_processing_plan_tool",
+        submit_creation_plan,
+    )
+    model.enqueue_tool(
+        "get_current_plan_step_tool",
+        lambda messages: {"plan_id": latest_tool_result_json(messages)["plan_id"]},
+    )
+    model.enqueue_tool(
+        "confirm_navigation_calibration_params_tool",
+        lambda messages: {
+            "plan_id": latest_tool_result_json(messages)["plan_id"],
+            "step_id": latest_tool_result_json(messages)["step_id"],
+        },
+    )
+    _patch_assembly(monkeypatch, model)
+
+    await service._run_impl(
+        config.user_id,
+        session_id,
+        config.navigation_agent_id,
+        UserMsg(name="user", content="自动标注并完成后处理"),
+    )
+
+    guidance_index = _invocation_index_for_tool(
+        model,
+        "record_navigation_user_guidance_tool",
+    )
+    guidance_names = schema_names(model.invocations[guidance_index].tools)
+    assert "record_navigation_user_guidance_tool" in guidance_names
+    assert "get_navigation_task_context_tool" in guidance_names
+    assert "submit_finish_processing_plan_tool" not in guidance_names
+    diagnostic_context_index = _invocation_index_for_tool(
+        model,
+        "get_navigation_task_context_tool",
+    )
+    assert diagnostic_context_index < guidance_index
+    submission_context_index = _invocation_index_for_tool(
+        model,
+        "get_navigation_task_context_tool",
+        start=guidance_index + 1,
+    )
+    context_names = schema_names(
+        model.invocations[submission_context_index].tools
+    )
+    assert {
+        "get_navigation_task_context_tool",
+        "submit_finish_processing_plan_tool",
+    } <= context_names
+    assert "record_navigation_user_guidance_tool" not in context_names
+    assert (
+        context_revisions["before_guidance"]
+        != context_revisions["after_guidance"]
+    )
+
+    plan = services.plan_store.get_active_for_task(built.task.task_id)
+    assert plan is not None
+    current = services.plan_store.get_current_step(plan.plan_id)
+    assert current is not None
+    assert current["step"]["step_id"] == "confirm_calibration"
+    assert current["step"]["status"] == "waiting_user"
+    decision_event = next(
+        event
+        for event in reversed(bus.events)
+        if event.get("type") == "REQUIRE_EXTERNAL_EXECUTION"
+    )
+    pending_call = decision_event["tool_calls"][0]
+    assert plan_execution.submit_plan_human_decision(
+        plan_store=services.plan_store,
+        evidence_store=services.evidence_store,
+        plan_id=plan.plan_id,
+        step_id="confirm_calibration",
+        decision={"action": "confirm"},
+        expected_web_session_id=built.task.created_by_web_session_id,
+        expected_agentscope_session_id=built.task.agentscope_session_id,
+    ) is True
+
+    model.enqueue_tool(
+        "get_current_plan_step_tool",
+        {"plan_id": plan.plan_id},
+    )
+    observed_tracking_step: dict[str, object] = {}
+
+    def _start_tracking_from_current(messages):
+        observed_tracking_step.update(latest_tool_result_json(messages))
+        return {
+            "plan_id": observed_tracking_step["plan_id"],
+            "step_id": observed_tracking_step["step_id"],
+        }
+
+    model.enqueue_tool(
+        "run_annotation_tracking_workflow_tool",
+        _start_tracking_from_current,
+    )
+    external_result = ExternalExecutionResultEvent(
+        reply_id=decision_event["reply_id"],
+        execution_results=[
+            ToolResultBlock(
+                id=pending_call["id"],
+                name="confirm_navigation_calibration_params_tool",
+                output=json.dumps(
+                    {"action": "confirm", "text": "", "request_id": ""},
+                    ensure_ascii=False,
+                ),
+                state=ToolResultState.SUCCESS,
+            )
+        ],
+    )
+    await service._run_impl(
+        config.user_id,
+        session_id,
+        config.navigation_agent_id,
+        external_result,
+    )
+
+    assert observed_tracking_step == {
+        "plan_id": plan.plan_id,
+        "step_id": "annotation_tracking",
+        "action": "run_annotation_tracking_workflow",
+        "status": "pending",
+    }
+    assert gateway.tracking_calls == [
+        {
+            "navigation_task_id": built.task.task_id,
+            "plan_id": plan.plan_id,
+            "step_id": "annotation_tracking",
+        }
+    ]
+    current = services.plan_store.get_current_step(plan.plan_id)
+    assert current is not None
+    assert current["step"]["status"] == "waiting_user"
+    assert storage.updated_state is not None
     model.assert_exhausted()
 
 

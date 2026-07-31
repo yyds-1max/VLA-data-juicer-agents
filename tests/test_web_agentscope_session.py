@@ -552,6 +552,69 @@ def _runtime(
     return runtime
 
 
+def test_calibration_interaction_uses_audited_processing_profile_choices() -> None:
+    runtime = _runtime()
+    runtime.set_annotation_gateway(
+        SimpleNamespace(
+            get_processing_calibration_options=lambda **_kwargs: [
+                {
+                    "profile_ref": "20260320",
+                    "label": "20260320",
+                    "selected_sensor_source": (
+                        "NoobScenes/params/20260320/sensors"
+                    ),
+                },
+                {
+                    "profile_ref": "20260409_U",
+                    "label": "20260409_U",
+                    "selected_sensor_source": (
+                        "NoobScenes/params/20260409_U/sensors"
+                    ),
+                },
+                {
+                    "profile_ref": "20260529_go2w",
+                    "label": "20260529_go2w",
+                    "selected_sensor_source": (
+                        "NoobScenes/params/20260529_go2w/sensors"
+                    ),
+                },
+            ]
+        )
+    )
+
+    interaction = runtime._create_v1_interaction(
+        web_session_id="web-1",
+        turn_id="turn-1",
+        task_id="task-1",
+        task_ref="DP-ABC123",
+        task_revision=4,
+        raw_payload={
+            "decision_type": "camera_params",
+            "request_id": "request-1",
+            "reply_id": "reply-1",
+            "tool_call_id": "call-1",
+            "plan_id": "plan-1",
+            "step_id": "confirm",
+        },
+    )
+
+    assert interaction["kind"] == "calibration_preview"
+    assert interaction["summary"] == (
+        "请选择本次导航数据处理使用的相机标定参数。"
+    )
+    assert [option["label"] for option in interaction["options"]] == [
+        "20260320",
+        "20260409_U",
+        "20260529_go2w",
+        "停止任务",
+    ]
+    assert all(
+        option["option_id"].startswith("calibration_")
+        for option in interaction["options"][:2]
+    )
+    assert interaction["options"][-1]["option_id"] == "reject"
+
+
 def _plan_bound_human_runtime(tmp_path: Path, chat_run_registry: FakeChatRunRegistry):
     workspace_root = tmp_path / "workspace"
     db_path = workspace_root / "navigation-tasks.sqlite"
@@ -2773,7 +2836,14 @@ async def test_create_session_creates_compatible_record_and_persists(tmp_path: P
     detail = store.get_session(session.id)
     assert detail is not None
     assert detail.model_dump(
-        exclude={"messages", "events", "turns", "tasks", "pending_interaction"}
+        exclude={
+            "messages",
+            "events",
+            "turns",
+            "tasks",
+            "pending_interaction",
+            "snapshot_seq",
+        }
     ) == session.model_dump()
     assert detail.messages == []
     assert detail.events == []

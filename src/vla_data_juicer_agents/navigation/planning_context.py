@@ -14,6 +14,7 @@ from vla_data_juicer_agents.navigation.context_budget import (
     serialized_chars,
 )
 from vla_data_juicer_agents.navigation.observation_models import (
+    AnnotationJobFactsObservation,
     EvidenceDescriptor,
     NavigationObservationRevision,
     ObservationKind,
@@ -28,8 +29,17 @@ from vla_data_juicer_agents.navigation.task_state import NavigationTask
 
 PLANNING_CONTEXT_MAX_CHARS = 5_500
 PLANNING_IDENTITY_MAX_CHARS = 1_600
-NavigationStageId = Literal["extract_sync", "finish_processing"]
-AVAILABLE_STAGE_IDS: list[NavigationStageId] = ["extract_sync", "finish_processing"]
+NavigationStageId = Literal[
+    "extract_sync",
+    "finish_processing",
+    "trajectory_review",
+]
+AVAILABLE_STAGE_IDS: list[NavigationStageId] = [
+    "extract_sync",
+    "finish_processing",
+    "trajectory_review",
+]
+TRAJECTORY_REVIEW_OBSERVATION_KINDS = frozenset({"annotation_job_facts"})
 
 
 class NavigationTaskContext(StrictModel):
@@ -62,7 +72,38 @@ PLAN_REQUIRED_OBSERVATIONS: dict[str, tuple[ObservationKind, ...]] = {
         "calibration_inventory",
         "localization_sources",
     ),
+    "trajectory_review": ("annotation_job_facts",),
 }
+M2_FINISH_REQUIRED_OBSERVATIONS = frozenset(
+    {
+        *PLAN_REQUIRED_OBSERVATIONS["finish_processing"],
+        "annotation_job_facts",
+    }
+)
+
+
+def m2_finish_observations_complete(
+    observation: NavigationObservationRevision | None,
+) -> bool:
+    """Return whether the explicit M2 finish surface has all typed fact families."""
+    if observation is None:
+        return False
+    completed_kinds = set(observation.completed_kinds)
+    payload_kinds = {payload.kind for payload in observation.payloads}
+    return M2_FINISH_REQUIRED_OBSERVATIONS <= completed_kinds & payload_kinds
+
+
+def m2_annotation_ready_for_postprocessing(
+    observation: NavigationObservationRevision | None,
+) -> bool:
+    """Return the bounded Annotation readiness fact used by the M2 surface."""
+    if observation is None:
+        return False
+    return any(
+        isinstance(payload, AnnotationJobFactsObservation)
+        and payload.ready_for_postprocessing
+        for payload in observation.payloads
+    )
 
 
 def compute_planning_context_revision(
@@ -108,6 +149,27 @@ def build_navigation_task_context(
         if descriptor.observation_revision <= observation_revision
     ]
     payloads = list(observation.payloads) if observation is not None else []
+    available_stage_ids = list(AVAILABLE_STAGE_IDS)
+    observed_kinds = (
+        list(observation.completed_kinds) if observation is not None else []
+    )
+    if task.target == "trajectory_review":
+        descriptors = [
+            descriptor
+            for descriptor in descriptors
+            if descriptor.kind in TRAJECTORY_REVIEW_OBSERVATION_KINDS
+        ]
+        payloads = [
+            payload
+            for payload in payloads
+            if payload.kind in TRAJECTORY_REVIEW_OBSERVATION_KINDS
+        ]
+        available_stage_ids = ["trajectory_review"]
+        observed_kinds = [
+            kind
+            for kind in observed_kinds
+            if kind in TRAJECTORY_REVIEW_OBSERVATION_KINDS
+        ]
     request, target, segments = _bounded_task_identity(task)
     context = NavigationTaskContext(
         task_id=task.task_id,
@@ -122,9 +184,9 @@ def build_navigation_task_context(
             capability_revision=_capability_revision(capabilities),
         ),
         observation_revision=observation_revision,
-        observed_kinds=(list(observation.completed_kinds) if observation is not None else []),
+        observed_kinds=observed_kinds,
         fact_summary=_minimal_fact_summary(payloads),
-        available_stage_ids=list(AVAILABLE_STAGE_IDS),
+        available_stage_ids=available_stage_ids,
         evidence_catalog=[],
         evidence_next_cursor=0 if descriptors else None,
     )
@@ -273,6 +335,20 @@ def _minimal_fact_summary(
                 "available_source_count": len(payload.available_sources),
                 "available_sources_preview": list(payload.available_sources),
                 "conversion_available": payload.conversion_available,
+            }
+        elif payload.kind == "annotation_job_facts":
+            facts[payload.kind] = {
+                "job_status": payload.job_status,
+                "segment_count": payload.segment_count,
+                "tracked_count": payload.tracked_count,
+                "skipped_count": payload.skipped_count,
+                "annotated_count": payload.annotated_count,
+                "ready_for_postprocessing": payload.ready_for_postprocessing,
+                "ready_for_trajectory_review": payload.ready_for_trajectory_review,
+                "processing_calibration_snapshot_available": (
+                    payload.processing_calibration_snapshot_available
+                ),
+                "reviews": payload.reviews.model_dump(mode="json"),
             }
         elif payload.kind == "user_guidance":
             facts[payload.kind] = {

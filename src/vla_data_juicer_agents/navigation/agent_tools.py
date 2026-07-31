@@ -13,8 +13,15 @@ from vla_data_juicer_agents.navigation.catalog import list_navigation_tool_capab
 from vla_data_juicer_agents.navigation.context_budget import ensure_payload_within_limit
 from vla_data_juicer_agents.navigation.observation_tools import build_navigation_observation_tools
 from vla_data_juicer_agents.navigation.plan_execution import build_plan_bound_execution_tools
-from vla_data_juicer_agents.navigation.plan_store import NavigationExecutionSnapshot
+from vla_data_juicer_agents.navigation.plan_store import (
+    NavigationExecutionSnapshot,
+    project_actionable_plan_step,
+)
 from vla_data_juicer_agents.navigation.plan_submission_tools import build_navigation_plan_submission_tools
+from vla_data_juicer_agents.navigation.planning_context import (
+    m2_annotation_ready_for_postprocessing,
+    m2_finish_observations_complete,
+)
 from vla_data_juicer_agents.navigation.services import NavigationServices
 from vla_data_juicer_agents.navigation.task_tools import build_navigation_task_tools
 from vla_data_juicer_agents.navigation.tool_groups import (
@@ -41,6 +48,7 @@ _OBSERVATION_FIXED_TOOL_NAMES = {
     "inspect_navigation_runtime_assets_tool",
     "inspect_navigation_calibration_inventory_tool",
     "inspect_navigation_localization_sources_tool",
+    "inspect_navigation_annotation_job_facts_tool",
     "inspect_navigation_artifact_state_tool",
     "inspect_navigation_gridmap_artifacts_tool",
     "get_navigation_task_context_tool",
@@ -50,6 +58,24 @@ _EXECUTION_STATE_TOOL_NAMES = {
     "get_plan_execution_overview_tool",
     "get_current_plan_step_tool",
 }
+_TRAJECTORY_REVIEW_PLANNING_TOOL_NAMES = {
+    "inspect_navigation_annotation_job_facts_tool",
+    "get_navigation_task_context_tool",
+    "submit_trajectory_review_plan_tool",
+}
+_FINISH_PROCESSING_PLANNING_TOOL_NAMES = {
+    "inspect_navigation_annotation_job_facts_tool",
+    "inspect_navigation_artifact_state_tool",
+    "inspect_navigation_runtime_assets_tool",
+    "inspect_navigation_calibration_inventory_tool",
+    "inspect_navigation_localization_sources_tool",
+    "inspect_navigation_gridmap_artifacts_tool",
+    "get_navigation_task_context_tool",
+    "submit_finish_processing_plan_tool",
+}
+_NARROW_EXECUTION_STATE_TOOL_NAMES = {
+    "get_current_plan_step_tool",
+}
 _FIXED_TOOL_NAMES_BY_ACTIVITY = {
     "planning": _OBSERVATION_FIXED_TOOL_NAMES
     | {
@@ -57,6 +83,7 @@ _FIXED_TOOL_NAMES_BY_ACTIVITY = {
         "complete_navigation_task_tool",
         "submit_extract_sync_plan_tool",
         "submit_finish_processing_plan_tool",
+        "submit_trajectory_review_plan_tool",
     },
     "execution": _OBSERVATION_FIXED_TOOL_NAMES | _EXECUTION_STATE_TOOL_NAMES,
     "recovery_required": _OBSERVATION_FIXED_TOOL_NAMES
@@ -178,11 +205,19 @@ def _execution_state_tools(
         )
 
     def get_current_plan_step_tool(plan_id: str) -> dict[str, Any] | None:
-        """Read the actionable current step; never poll a step already marked running."""
+        """Read the actionable identity; pass its top-level plan_id and step_id unchanged."""
         current = authorized_snapshot(plan_id)
         if current is None:
             return {"ok": False, "error_type": "inactive_navigation_plan"}
-        return None if current.current is None else ensure_payload_within_limit(current.current, max_chars=4_000, label="resolved_current_plan_step")
+        return (
+            None
+            if current.current is None
+            else ensure_payload_within_limit(
+                project_actionable_plan_step(current.current),
+                max_chars=4_000,
+                label="resolved_current_plan_step",
+            )
+        )
 
     return [FunctionTool(get_plan_execution_overview_tool, is_read_only=True), FunctionTool(get_current_plan_step_tool, is_read_only=True)]
 
@@ -196,11 +231,46 @@ def build_navigation_tool_groups(
     agentscope_session_id: str,
 ) -> dict[str, NavigationToolGroupDefinition]:
     task = snapshot.task
+    task_outcome = services.task_store.get_task_outcome(task.task_id)
+    is_trajectory_review = task.target == "trajectory_review"
+    is_finish_processing = bool(
+        task_outcome
+        and task_outcome.requested_outcome
+        in {"postprocessing", "postprocessing_and_fix"}
+    )
+    finish_processing_planning_tool_names = set(
+        _FINISH_PROCESSING_PLANNING_TOOL_NAMES
+    )
+    if is_finish_processing:
+        observation = services.observation_store.latest(task.task_id)
+        annotation_ready = m2_annotation_ready_for_postprocessing(observation)
+        submission_ready = m2_finish_observations_complete(observation) and (
+            annotation_ready or task.scene_mode in {"in", "out"}
+        )
+        if not submission_ready:
+            finish_processing_planning_tool_names.discard(
+                "submit_finish_processing_plan_tool"
+            )
+        if (
+            not annotation_ready
+            and observation is not None
+            and "annotation_job_facts" in observation.completed_kinds
+            and task.scene_mode not in {"in", "out"}
+        ):
+            finish_processing_planning_tool_names.add(
+                "record_navigation_user_guidance_tool"
+            )
+    has_narrow_execution_surface = is_trajectory_review or is_finish_processing
+    narrow_task_is_terminal = (
+        has_narrow_execution_surface
+        and task.status.value in {"completed", "failed", "cancelled", "superseded"}
+    )
     observation_tools = build_navigation_observation_tools(
         task=task,
         observation_store=services.observation_store,
         evidence_store=services.evidence_store,
         settings=services.settings,
+        annotation_gateway=services.annotation_gateway,
         expected_web_session_id=web_session_id,
         expected_agentscope_session_id=agentscope_session_id,
     )
@@ -253,12 +323,61 @@ def build_navigation_tool_groups(
             cancellation=cancellation,
             web_session_id=web_session_id,
             agentscope_session_id=agentscope_session_id,
+            annotation_gateway=services.annotation_gateway,
         )
+
+    if snapshot.activity == "planning" and narrow_task_is_terminal:
+        fixed_tools = []
+    elif snapshot.activity == "planning" and is_trajectory_review:
+        fixed_tools = [
+            tool
+            for tool in fixed_tools
+            if tool.name in _TRAJECTORY_REVIEW_PLANNING_TOOL_NAMES
+        ]
+    elif snapshot.activity == "planning" and is_finish_processing:
+        fixed_tools = [
+            tool
+            for tool in fixed_tools
+            if tool.name in finish_processing_planning_tool_names
+        ]
+    elif (
+        snapshot.activity in {"execution", "recovery_required"}
+        and has_narrow_execution_surface
+    ):
+        fixed_tools = [
+            tool
+            for tool in fixed_tools
+            if tool.name in _NARROW_EXECUTION_STATE_TOOL_NAMES
+        ]
+    if snapshot.activity == "execution" and has_narrow_execution_surface:
+        current_step = snapshot.current
+        current_action = (
+            current_step.get("step", {}).get("action")
+            if isinstance(current_step, dict)
+            else None
+        )
+        execution_tools = [
+            tool
+            for tool in execution_tools
+            if tool.name == f"{current_action}_tool"
+        ]
 
     trusted_fixed_tools = _trust(fixed_tools)
     classified = classify_fixed_navigation_tools(trusted_fixed_tools)
     actual_fixed_names = {tool.name for tool in trusted_fixed_tools}
-    expected_fixed_names = _FIXED_TOOL_NAMES_BY_ACTIVITY[snapshot.activity]
+    if snapshot.activity == "planning" and narrow_task_is_terminal:
+        expected_fixed_names: set[str] = set()
+    elif is_trajectory_review and snapshot.activity == "planning":
+        expected_fixed_names = _TRAJECTORY_REVIEW_PLANNING_TOOL_NAMES
+    elif is_finish_processing and snapshot.activity == "planning":
+        expected_fixed_names = finish_processing_planning_tool_names
+    elif has_narrow_execution_surface and snapshot.activity in {
+        "execution",
+        "recovery_required",
+    }:
+        expected_fixed_names = _NARROW_EXECUTION_STATE_TOOL_NAMES
+    else:
+        expected_fixed_names = _FIXED_TOOL_NAMES_BY_ACTIVITY[snapshot.activity]
     if actual_fixed_names != expected_fixed_names:
         missing = sorted(expected_fixed_names - actual_fixed_names)
         unexpected = sorted(actual_fixed_names - expected_fixed_names)
@@ -287,10 +406,49 @@ def build_navigation_tool_groups(
         ),
     }[snapshot.activity]
     for group_name in fixed_group_names:
+        instructions = None
+        if snapshot.activity == "planning" and (
+            is_trajectory_review or is_finish_processing
+        ):
+            if group_name == NAVIGATION_INVESTIGATION:
+                instructions = (
+                    (
+                        "Inspect only the bound Annotation Job facts for linked "
+                        "trajectory-review readiness."
+                    )
+                    if is_trajectory_review
+                    else (
+                        "Inspect only Annotation, Runtime, calibration, and "
+                        "localization facts needed for postprocessing decisions."
+                    )
+                )
+            elif group_name == NAVIGATION_ARTIFACT_CHECKS and is_finish_processing:
+                instructions = (
+                    "Inspect current artifact and gridmap facts needed for "
+                    "postprocessing decisions."
+                )
+            elif group_name == NAVIGATION_PLAN_AUTHORING:
+                instructions = (
+                    (
+                        "Read the latest task context, submit one complete "
+                        "trajectory-review Plan, then execute the accepted first step."
+                    )
+                    if is_trajectory_review
+                    else (
+                        "Use the latest task context to diagnose missing scene_mode "
+                        "or observation facts. If the finish-Plan submission tool is "
+                        "absent, continue only with available bounded inspection or "
+                        "guidance tools and do not guess hidden submission or "
+                        "execution tools. Immediately before submission, read the "
+                        "task context again, submit one complete finish-processing "
+                        "Plan, then execute the accepted first step."
+                    )
+                )
         groups[group_name] = NavigationToolGroupDefinition(
             name=group_name,
             description=_GROUP_DESCRIPTIONS[group_name],
             tools=classified[group_name],
+            instructions=instructions,
         )
 
     if snapshot.activity in {"execution", "recovery_required"}:

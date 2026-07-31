@@ -30,11 +30,14 @@ from vla_data_juicer_agents.navigation.services import (
 from vla_data_juicer_agents.navigation.plan_models import (
     ExtractSyncPlanInput,
     FinishProcessingPlanInput,
+    TrajectoryReviewPlanInput,
 )
 from vla_data_juicer_agents.navigation.plan_store import StepClaimOutcome
 from vla_data_juicer_agents.navigation.evidence_store import FileNavigationEvidenceStore
 from vla_data_juicer_agents.navigation.observation_models import (
+    AnnotationJobFactsObservation,
     ArtifactStateObservation,
+    EvidenceWrite,
 )
 from vla_data_juicer_agents.navigation.observation_store import (
     SqliteNavigationObservationStore,
@@ -70,6 +73,7 @@ PLANNING_TOOL_NAMES = {
     "inspect_navigation_runtime_assets_tool",
     "inspect_navigation_calibration_inventory_tool",
     "inspect_navigation_localization_sources_tool",
+    "inspect_navigation_annotation_job_facts_tool",
     "get_navigation_task_context_tool",
     "list_observation_evidence_tool",
     "read_observation_evidence_tool",
@@ -78,7 +82,34 @@ PLANNING_TOOL_NAMES = {
     "complete_navigation_task_tool",
     "submit_extract_sync_plan_tool",
     "submit_finish_processing_plan_tool",
+    "submit_trajectory_review_plan_tool",
 }
+TRAJECTORY_REVIEW_PLANNING_TOOL_NAMES = {
+    "inspect_navigation_annotation_job_facts_tool",
+    "get_navigation_task_context_tool",
+    "submit_trajectory_review_plan_tool",
+}
+FINISH_PROCESSING_PLANNING_TOOL_NAMES = {
+    "inspect_navigation_annotation_job_facts_tool",
+    "inspect_navigation_artifact_state_tool",
+    "inspect_navigation_runtime_assets_tool",
+    "inspect_navigation_calibration_inventory_tool",
+    "inspect_navigation_localization_sources_tool",
+    "inspect_navigation_gridmap_artifacts_tool",
+    "get_navigation_task_context_tool",
+    "submit_finish_processing_plan_tool",
+}
+
+
+@pytest.fixture(autouse=True)
+def _private_navigation_writer_lock(tmp_path, monkeypatch):
+    lock_root = tmp_path / "writer-lock"
+    lock_root.mkdir(mode=0o700)
+    monkeypatch.setenv(
+        "VLA_NAVIGATION_WRITER_LOCK_PATH",
+        str(lock_root / "navigation.lock"),
+    )
+
 
 EXECUTION_OBSERVATION_TOOL_NAMES = {
     "list_observation_evidence_tool",
@@ -229,6 +260,7 @@ def test_navigation_handoff_message_includes_structured_json_for_task_entry():
             "clips": ["20260605_152856"],
         },
         "scene_mode": "out",
+        "requested_outcome": "auto",
         "response_language": "Chinese",
     }
 
@@ -360,11 +392,127 @@ def _surface(services, session_id):
     )
 
 
+def _trajectory_review_services(tmp_path, session_id="review-session"):
+    services = build_navigation_services(tmp_path)
+    task = services.task_store.create_task_attempt(
+        request="继续 Fix。",
+        target="trajectory_review",
+        date="20270623",
+        segments=["20260623_145550"],
+        scene_mode="out",
+        dry_run=True,
+        web_session_id=session_id,
+        agentscope_session_id=session_id,
+        requested_outcome="trajectory_fix",
+    ).task
+    facts = AnnotationJobFactsObservation(
+        job_status="annotated",
+        segment_count=1,
+        tracked_count=1,
+        annotated_count=1,
+        ready_for_trajectory_review=True,
+    )
+    observation = services.observation_store.append(
+        task.task_id,
+        "annotation_job_facts",
+        [facts],
+        [
+            EvidenceWrite(
+                kind="annotation_job_facts",
+                source_tool="inspect_navigation_annotation_job_facts_tool",
+                payload=facts.model_dump(mode="json"),
+                summary="Linked trajectory review is ready.",
+            )
+        ],
+        services.evidence_store,
+        expected_web_session_id=session_id,
+        expected_agentscope_session_id=session_id,
+    )
+    plan = TrajectoryReviewPlanInput.model_validate(
+        {
+            "decisions": {
+                "review": {
+                    "mode": "human_fix",
+                    "reason": "Open the linked Web workbench.",
+                    "evidence_refs": [observation.evidence_refs[0]],
+                }
+            },
+            "steps": [
+                {
+                    "step_id": "open_fix",
+                    "action": "open_trajectory_fix_workbench",
+                    "variant": "durable_human_handoff",
+                    "arguments": {},
+                    "depends_on": [],
+                    "failure_policy": "stop",
+                    "decision_refs": ["review"],
+                },
+                {
+                    "step_id": "validate_review",
+                    "action": "validate_trajectory_review_outcome",
+                    "variant": "approved_or_terminal",
+                    "arguments": {},
+                    "depends_on": ["open_fix"],
+                    "failure_policy": "stop",
+                    "decision_refs": ["review"],
+                },
+            ],
+        }
+    )
+    return services, task, observation, plan
+
+
 def _group_tool_names(surface):
     return {
         group.name: {tool.name for tool in group.tools}
         for group in surface.groups
     }
+
+
+def _set_requested_outcome(services, task_id, requested_outcome):
+    with sqlite3.connect(services.plan_store.db_path) as connection:
+        connection.execute(
+            """UPDATE navigation_task_outcomes
+               SET requested_outcome = ?
+               WHERE task_id = ?""",
+            (requested_outcome, task_id),
+        )
+
+
+def _set_scene_mode(services, task_id, scene_mode):
+    with sqlite3.connect(services.plan_store.db_path) as connection:
+        connection.execute(
+            """UPDATE navigation_tasks
+               SET scene_mode = ?, state_revision = state_revision + 1
+               WHERE task_id = ?""",
+            (scene_mode, task_id),
+        )
+
+
+def _append_annotation_job_facts(services, task, *, ready):
+    facts = AnnotationJobFactsObservation(
+        job_status="tracked" if ready else "missing",
+        segment_count=1 if ready else 0,
+        tracked_count=1 if ready else 0,
+        ready_for_postprocessing=ready,
+        processing_calibration_snapshot_available=ready,
+    )
+    return services.observation_store.append(
+        task.task_id,
+        "annotation_job_facts",
+        [facts],
+        [
+            EvidenceWrite(
+                kind="annotation_job_facts",
+                source_tool="inspect_navigation_annotation_job_facts_tool",
+                payload=facts.model_dump(mode="json"),
+                summary="Bounded Annotation Job readiness facts.",
+            )
+        ],
+        services.evidence_store,
+        expected_web_session_id=task.created_by_web_session_id,
+        expected_agentscope_session_id=task.agentscope_session_id,
+    )
 
 
 def _terminalize_plan(services, plan, session_id):
@@ -408,6 +556,302 @@ def test_grouped_surface_resolves_planning_catalog(tmp_path):
     }
     with pytest.raises(LookupError):
         planning.group(NAVIGATION_EXECUTION_ACTIONS)
+
+
+def test_trajectory_review_planning_surface_exposes_only_review_tools(tmp_path):
+    services, _task, _observation, _plan = _trajectory_review_services(tmp_path)
+
+    planning = _surface(services, "review-session")
+
+    assert planning is not None
+    assert planning.activity == "planning"
+    assert {
+        tool.name for tool in planning.flatten_active_tools()
+    } == TRAJECTORY_REVIEW_PLANNING_TOOL_NAMES
+    assert {
+        tool.name for tool in planning.group(NAVIGATION_PLAN_AUTHORING).tools
+    } == {
+        "get_navigation_task_context_tool",
+        "submit_trajectory_review_plan_tool",
+    }
+    assert planning.group(NAVIGATION_ARTIFACT_CHECKS).tools == ()
+
+
+def test_trajectory_review_execution_surface_exposes_only_current_review_action(
+    tmp_path,
+):
+    services, task, observation, plan = _trajectory_review_services(tmp_path)
+    services.plan_store.activate(
+        task,
+        "trajectory_review",
+        observation.revision,
+        plan,
+        expected_web_session_id="review-session",
+        expected_agentscope_session_id="review-session",
+    )
+
+    execution = _surface(services, "review-session")
+
+    assert execution is not None
+    assert execution.activity == "execution"
+    names_by_group = _group_tool_names(execution)
+    assert names_by_group[NAVIGATION_EXECUTION_STATE] == {
+        "get_current_plan_step_tool",
+    }
+    assert names_by_group[NAVIGATION_EXECUTION_ACTIONS] == {
+        "open_trajectory_fix_workbench_tool",
+    }
+    assert execution.group(NAVIGATION_ARTIFACT_CHECKS).tools == ()
+
+
+@pytest.mark.parametrize(
+    "requested_outcome",
+    ["postprocessing", "postprocessing_and_fix"],
+)
+def test_explicit_postprocessing_planning_surface_hides_ingestion_tools(
+    tmp_path,
+    requested_outcome,
+):
+    services, task, _built = _resolver_services_from_complete(
+        tmp_path,
+        phase="finish_processing",
+    )
+    _set_requested_outcome(services, task.task_id, requested_outcome)
+
+    planning = _surface(services, "as-session-1")
+
+    assert planning is not None
+    assert {
+        tool.name for tool in planning.flatten_active_tools()
+    } == FINISH_PROCESSING_PLANNING_TOOL_NAMES - {
+        "submit_finish_processing_plan_tool",
+    }
+    assert {
+        "inspect_navigation_raw_metadata_tool",
+        "inspect_navigation_sensor_candidates_tool",
+        "inspect_navigation_topic_candidates_tool",
+        "submit_extract_sync_plan_tool",
+        "submit_trajectory_review_plan_tool",
+        "describe_processing_action_tool",
+        "record_navigation_user_guidance_tool",
+    }.isdisjoint(
+        tool.name for tool in planning.flatten_active_tools()
+    )
+
+
+@pytest.mark.parametrize(
+    "requested_outcome",
+    ["postprocessing", "postprocessing_and_fix"],
+)
+def test_explicit_postprocessing_without_scene_mode_exposes_guidance_tool(
+    tmp_path,
+    requested_outcome,
+):
+    services, task, _built = _resolver_services_from_complete(
+        tmp_path,
+        phase="finish_processing",
+    )
+    _set_requested_outcome(services, task.task_id, requested_outcome)
+    _set_scene_mode(services, task.task_id, None)
+    _append_annotation_job_facts(services, task, ready=False)
+
+    planning = _surface(services, "as-session-1")
+
+    assert planning is not None
+    assert {
+        tool.name for tool in planning.flatten_active_tools()
+    } == (
+        FINISH_PROCESSING_PLANNING_TOOL_NAMES
+        - {
+            "submit_finish_processing_plan_tool",
+        }
+    ) | {
+        "record_navigation_user_guidance_tool",
+    }
+
+
+def test_finish_context_diagnoses_missing_scene_then_refreshes_before_submit(
+    tmp_path,
+):
+    services, task, built = _resolver_services_from_complete(
+        tmp_path,
+        phase="finish_processing",
+    )
+    _set_requested_outcome(services, task.task_id, "postprocessing")
+    _set_scene_mode(services, task.task_id, None)
+    _append_annotation_job_facts(services, task, ready=False)
+
+    before = _surface(services, "as-session-1")
+    assert before is not None
+    before_tools = {
+        tool.name: tool for tool in before.flatten_active_tools()
+    }
+    assert "get_navigation_task_context_tool" in before_tools
+    assert "record_navigation_user_guidance_tool" in before_tools
+    assert "submit_finish_processing_plan_tool" not in before_tools
+
+    diagnostic_context = _decode_tool_payload(
+        asyncio.run(before_tools["get_navigation_task_context_tool"]())
+    )
+    assert diagnostic_context["scene_mode"] is None
+    assert {
+        "annotation_job_facts",
+        "artifact_state",
+        "runtime_assets",
+        "calibration_inventory",
+        "localization_sources",
+        "gridmap_artifacts",
+    } <= set(diagnostic_context["observed_kinds"])
+    stale_revision = diagnostic_context["planning_context_revision"]
+
+    guidance_result = _decode_tool_payload(
+        asyncio.run(
+            before_tools["record_navigation_user_guidance_tool"](
+                text="用户确认当前数据为室外场景。",
+                scene_mode="out",
+            )
+        )
+    )
+    assert guidance_result["ok"] is True
+
+    after = _surface(services, "as-session-1")
+    assert after is not None
+    after_tools = {
+        tool.name: tool for tool in after.flatten_active_tools()
+    }
+    assert "get_navigation_task_context_tool" in after_tools
+    assert "submit_finish_processing_plan_tool" in after_tools
+    assert "record_navigation_user_guidance_tool" not in after_tools
+
+    fresh_context = _decode_tool_payload(
+        asyncio.run(after_tools["get_navigation_task_context_tool"]())
+    )
+    assert fresh_context["scene_mode"] == "out"
+    assert fresh_context["planning_context_revision"] != stale_revision
+
+    stale_submission = _decode_tool_payload(
+        asyncio.run(
+            after_tools["submit_finish_processing_plan_tool"](
+                planning_context_revision=stale_revision,
+                plan=valid_finish_plan_payload(built),
+            )
+        )
+    )
+    assert stale_submission["ok"] is False
+    assert stale_submission["error_type"] == "planning_context_mismatch"
+    assert stale_submission["errors"][0]["code"] == (
+        "stale_planning_context_revision"
+    )
+    assert (
+        resolve_navigation_tool_surface(
+            services=services,
+            agentscope_session_id="different-session",
+            web_session_id="different-session",
+            cancellation=None,
+        )
+        is None
+    )
+
+
+@pytest.mark.parametrize(
+    "requested_outcome",
+    ["postprocessing", "postprocessing_and_fix"],
+)
+def test_ready_tracked_annotation_unlocks_finish_submit_without_scene_guidance(
+    tmp_path,
+    requested_outcome,
+):
+    services, task, _built = _resolver_services_from_complete(
+        tmp_path,
+        phase="finish_processing",
+    )
+    _set_requested_outcome(services, task.task_id, requested_outcome)
+    _set_scene_mode(services, task.task_id, None)
+    _append_annotation_job_facts(services, task, ready=True)
+
+    planning = _surface(services, "as-session-1")
+
+    assert planning is not None
+    assert {
+        tool.name for tool in planning.flatten_active_tools()
+    } == FINISH_PROCESSING_PLANNING_TOOL_NAMES
+
+
+def test_missing_annotation_job_can_submit_creation_plan_after_scene_is_known(
+    tmp_path,
+):
+    services, task, _built = _resolver_services_from_complete(
+        tmp_path,
+        phase="finish_processing",
+    )
+    _set_requested_outcome(services, task.task_id, "postprocessing")
+    _append_annotation_job_facts(services, task, ready=False)
+
+    planning = _surface(services, "as-session-1")
+
+    assert planning is not None
+    assert {
+        tool.name for tool in planning.flatten_active_tools()
+    } == FINISH_PROCESSING_PLANNING_TOOL_NAMES
+
+
+def test_explicit_postprocessing_execution_exposes_only_current_action(tmp_path):
+    services, task, built = _resolver_services_from_complete(
+        tmp_path,
+        phase="finish_processing",
+    )
+    _set_requested_outcome(services, task.task_id, "postprocessing")
+    _append_annotation_job_facts(services, task, ready=True)
+    observation = services.observation_store.latest(task.task_id)
+    assert observation is not None
+    plan = services.plan_store.activate(
+        task,
+        "finish_processing",
+        observation.revision,
+        FinishProcessingPlanInput.model_validate(valid_finish_plan_payload(built)),
+        expected_web_session_id="as-session-1",
+        expected_agentscope_session_id="as-session-1",
+    )
+
+    execution = _surface(services, "as-session-1")
+
+    assert execution is not None
+    current_action = plan.plan.steps[0].action
+    assert {
+        tool.name
+        for tool in execution.group(NAVIGATION_EXECUTION_ACTIONS).tools
+    } == {f"{current_action}_tool"}
+    assert {
+        tool.name
+        for tool in execution.group(NAVIGATION_EXECUTION_STATE).tools
+    } == {"get_current_plan_step_tool"}
+    assert execution.group(NAVIGATION_ARTIFACT_CHECKS).tools == ()
+
+
+def test_completed_explicit_postprocessing_exposes_no_resubmission_tools(tmp_path):
+    services, task, built = _resolver_services_from_complete(
+        tmp_path,
+        phase="finish_processing",
+    )
+    _set_requested_outcome(services, task.task_id, "postprocessing")
+    _append_annotation_job_facts(services, task, ready=True)
+    observation = services.observation_store.latest(task.task_id)
+    assert observation is not None
+    plan = services.plan_store.activate(
+        task,
+        "finish_processing",
+        observation.revision,
+        FinishProcessingPlanInput.model_validate(valid_finish_plan_payload(built)),
+        expected_web_session_id="as-session-1",
+        expected_agentscope_session_id="as-session-1",
+    )
+    _terminalize_plan(services, plan, "as-session-1")
+
+    completed = _surface(services, "as-session-1")
+
+    assert completed is not None
+    assert completed.activity == "planning"
+    assert completed.flatten_active_tools() == []
 
 
 def test_grouped_surface_resolves_execution_catalog(tmp_path):
@@ -1347,6 +1791,41 @@ def test_resolved_execution_reads_are_explicitly_bounded_to_4000_chars(tmp_path)
     assert len(json.dumps(current, separators=(",", ":"))) <= 4000
 
 
+def test_current_step_tool_projects_only_actionable_identity(tmp_path):
+    services, task, built = _resolver_services_from_complete(tmp_path)
+    plan = services.plan_store.activate(
+        task,
+        "extract_sync",
+        4,
+        ExtractSyncPlanInput.model_validate(valid_extract_plan_payload(built)),
+        expected_web_session_id="as-session-1",
+        expected_agentscope_session_id="as-session-1",
+    )
+    first_step = plan.plan.steps[0]
+    tools = {
+        tool.name: tool
+        for tool in resolve_navigation_agent_tools(
+            services=services,
+            agentscope_session_id="as-session-1",
+            web_session_id="as-session-1",
+            cancellation=None,
+        )
+    }
+
+    current = _decode_tool_payload(
+        asyncio.run(
+            tools["get_current_plan_step_tool"](plan_id=plan.plan_id)
+        )
+    )
+
+    assert current == {
+        "plan_id": plan.plan_id,
+        "step_id": first_step.step_id,
+        "action": first_step.action,
+        "status": "pending",
+    }
+
+
 def test_activity_resolver_fresh_attempt_exposes_all_planning_tools_without_mutation(
     tmp_path,
 ):
@@ -1381,7 +1860,8 @@ def test_activity_resolver_fresh_attempt_exposes_all_planning_tools_without_muta
         "inspect_navigation_gridmap_artifacts_tool",
         "inspect_navigation_runtime_assets_tool",
         "inspect_navigation_calibration_inventory_tool",
-        "inspect_navigation_localization_sources_tool",
+            "inspect_navigation_localization_sources_tool",
+            "inspect_navigation_annotation_job_facts_tool",
         "get_navigation_task_context_tool",
         "list_observation_evidence_tool",
         "read_observation_evidence_tool",
@@ -1389,7 +1869,8 @@ def test_activity_resolver_fresh_attempt_exposes_all_planning_tools_without_muta
         "record_navigation_user_guidance_tool",
         "complete_navigation_task_tool",
         "submit_extract_sync_plan_tool",
-        "submit_finish_processing_plan_tool",
+            "submit_finish_processing_plan_tool",
+            "submit_trajectory_review_plan_tool",
     }
     assert services.task_store.get_task(task.task_id) == before
     assert services.observation_store.latest(task.task_id) is None

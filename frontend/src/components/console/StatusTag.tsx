@@ -1,5 +1,7 @@
 import type * as React from "react";
 
+import { Badge } from "@/components/ui/badge";
+
 import type { StatusTone } from "../../features/console/consoleTypes";
 import { cn } from "../../lib/utils";
 
@@ -20,8 +22,11 @@ const toneClasses: Record<StatusTone, string> = {
 
 export function StatusTag({ tone = "neutral", children, className }: StatusTagProps) {
   return (
-    <span className={cn("inline-flex w-fit items-center rounded-md border px-2 py-0.5 text-xs font-medium", toneClasses[tone], className)}>
+    <Badge
+      variant="unstyled"
+      className={cn("inline-flex w-fit items-center rounded-md border px-2 py-0.5 text-xs font-medium", toneClasses[tone], className)}
+    >
       {children}
-    </span>
+    </Badge>
   );
 }
