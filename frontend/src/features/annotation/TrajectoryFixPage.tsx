@@ -250,7 +250,7 @@ function GridmapEvidenceView({
             `${baseX - normalX * arrowHalfWidth},${baseY - normalY * arrowHalfWidth}`,
           ].join(" "),
           handleRadius: Math.max(1.75, gridmap.width / 180),
-          hitRadius: Math.max(7, gridmap.width / 45),
+          hitRadius: Math.max(5, gridmap.width / 85),
         };
       })()
     : null;
@@ -321,20 +321,6 @@ function GridmapEvidenceView({
             vectorEffect="non-scaling-stroke"
           />
         )}
-        {current && (
-          <circle
-            cx={current.x}
-            cy={current.y}
-            r={Math.max(2.5, gridmap.width / 80)}
-            fill="#f97316"
-            stroke="#ffffff"
-            strokeWidth="1.5"
-            vectorEffect="non-scaling-stroke"
-            className={editable ? "cursor-grab active:cursor-grabbing" : ""}
-            aria-label="拖动目标位置"
-            onPointerDown={(event) => startDrag(event, "position")}
-          />
-        )}
         {current && directionEnd && directionGeometry && (
           <line
             x1={current.x}
@@ -379,6 +365,20 @@ function GridmapEvidenceView({
             className={editable ? "cursor-grab active:cursor-grabbing" : ""}
             aria-label="拖动目标方向"
             onPointerDown={(event) => startDrag(event, "direction")}
+          />
+        )}
+        {current && (
+          <circle
+            cx={current.x}
+            cy={current.y}
+            r={Math.max(2.5, gridmap.width / 80)}
+            fill="#f97316"
+            stroke="#ffffff"
+            strokeWidth="1.5"
+            vectorEffect="non-scaling-stroke"
+            className={editable ? "cursor-grab active:cursor-grabbing" : ""}
+            aria-label="拖动目标位置"
+            onPointerDown={(event) => startDrag(event, "position")}
           />
         )}
       </svg>

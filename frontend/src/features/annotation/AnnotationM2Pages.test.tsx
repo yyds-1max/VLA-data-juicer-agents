@@ -505,6 +505,13 @@ test("Fix workbench displays the bound Gridmap PNG with declared dimensions", as
     }],
   });
   const overlay = screen.getByLabelText("可拖动的当前帧 Gridmap 与轨迹");
+  const directionHandle = screen.getByLabelText("拖动目标方向");
+  const positionHandle = screen.getByLabelText("拖动目标位置");
+  expect(directionHandle).toHaveAttribute("r", "5");
+  expect(
+    directionHandle.compareDocumentPosition(positionHandle)
+      & Node.DOCUMENT_POSITION_FOLLOWING,
+  ).toBe(Node.DOCUMENT_POSITION_FOLLOWING);
   Object.defineProperty(overlay, "getBoundingClientRect", {
     configurable: true,
     value: () => ({
