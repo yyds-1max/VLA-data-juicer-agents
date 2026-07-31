@@ -14,6 +14,7 @@ from vla_data_juicer_agents.annotation.fix_runtime import (
 )
 from vla_data_juicer_agents.annotation.legacy_fix_driver import (
     _apply_command_log,
+    _target_label,
     _write_preview_state,
 )
 from vla_data_juicer_agents.annotation.runtime import (
@@ -297,6 +298,12 @@ def test_fix_driver_writes_authoritative_candidate_preview(
         [10.0, 20.0],
         [30.0, 40.0],
     ]
+
+
+def test_fix_driver_target_labels_remain_python_38_compatible() -> None:
+    assert _target_label("master") == "Master"
+    assert _target_label("other1") == "Other 1"
+    assert _target_label("custom") == "Other custom"
 
 
 def test_approved_fix_publication_is_atomic_and_hash_bound(

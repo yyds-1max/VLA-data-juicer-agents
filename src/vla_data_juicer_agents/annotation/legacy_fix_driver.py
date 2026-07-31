@@ -269,6 +269,20 @@ def _project_points(editor: Any, points: list[list[float]]) -> list[list[float]]
     return result
 
 
+def _target_label(target_type: str) -> str:
+    if target_type == "master":
+        return "Master"
+    # This driver is executed by the frozen Runtime's Python 3.8
+    # interpreter.  Keep the equivalent of str.removeprefix() compatible
+    # with that interpreter.
+    suffix = (
+        target_type[len("other") :]
+        if target_type.startswith("other")
+        else target_type
+    )
+    return f"Other {suffix}"
+
+
 def _preview_speed(
     editor: Any,
     *,
@@ -353,11 +367,7 @@ def _write_preview_state(
             )
             color = raw_target.get("color")
             targets[target_ref] = {
-                "label": (
-                    "Master"
-                    if target_type == "master"
-                    else f"Other {target_type.removeprefix('other')}"
-                ),
+                "label": _target_label(target_type),
                 "position": position,
                 "direction": direction,
                 "speed": _preview_speed(
