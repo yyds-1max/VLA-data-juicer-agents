@@ -108,6 +108,50 @@ class _FakeFrozenEditor:
         }
 
 
+class _FakeMultiTargetFrozenEditor(_FakeFrozenEditor):
+    def __init__(self) -> None:
+        super().__init__()
+        self.target_files["other1"] = "other1.txt"
+        self.modified_target_points["1.0"]["other1"] = (7.0, 8.0)
+        self.modified_target_points["2.0"]["other1"] = None
+        self.original_target_points["1.0"]["other1"] = (7.0, 8.0)
+        self.original_target_points["2.0"]["other1"] = None
+        self.added_target_info["1.0"]["other1"] = None
+        self.added_target_info["2.0"]["other1"] = None
+        self.modified_trajectory["1.0"]["other1"] = {"traj": []}
+        self.modified_trajectory["2.0"]["other1"] = {"traj": []}
+        self.target_speed_inputs["1.0"]["other1"] = SimpleNamespace(text="1.0")
+        self.target_speed_inputs["2.0"]["other1"] = SimpleNamespace(text="1.0")
+        self.speed_direction_data = {
+            "1.0": {
+                "other1": {
+                    "direction_object": 0.75,
+                },
+            },
+        }
+        self.recomputed_targets: list[
+            tuple[int, str, tuple[float, float], float]
+        ] = []
+
+    def on_ok_click(self, _event: object) -> None:
+        timestamp = self.timestamps[self.current_index]
+        for target_type in self.target_files:
+            position = self.modified_target_points[timestamp][target_type]
+            if position is None:
+                continue
+            info = self.added_target_info[timestamp][target_type]
+            if not isinstance(info, dict):
+                raise TypeError("visible target editing metadata is uninitialized")
+            self.recomputed_targets.append(
+                (
+                    self.current_index,
+                    target_type,
+                    position,
+                    float(info["dir"]),
+                )
+            )
+
+
 def test_fix_driver_replays_domain_commands_through_frozen_operations() -> None:
     editor = _FakeFrozenEditor()
     target_ref = "target_" + "1" * 32
@@ -162,6 +206,39 @@ def test_fix_driver_replays_domain_commands_through_frozen_operations() -> None:
         (0, "1.0"),
         (0, "2.5"),
         (1, "1.0"),
+    ]
+
+
+def test_fix_driver_initializes_every_visible_target_before_recompute() -> None:
+    editor = _FakeMultiTargetFrozenEditor()
+    master_ref = "target_" + "1" * 32
+    other_ref = "target_" + "2" * 32
+
+    _apply_command_log(
+        editor,
+        bindings={
+            master_ref: "master",
+            other_ref: "other1",
+        },
+        commands=[
+            {
+                "kind": "set_position",
+                "frame_index": 0,
+                "target_ref": master_ref,
+                "x": 3.0,
+                "y": 4.0,
+            },
+        ],
+    )
+
+    assert editor.added_target_info["1.0"]["other1"] == {
+        "pos": (7.0, 8.0),
+        "dir": 0.75,
+        "arrow_line": None,
+    }
+    assert editor.recomputed_targets == [
+        (0, "master", (3.0, 4.0), 0.0),
+        (0, "other1", (7.0, 8.0), 0.75),
     ]
 
 

@@ -147,6 +147,14 @@ def _apply_command_log(
         editor.current_index = frame_index
         timestamp = editor.timestamps[frame_index]
         for target_type in editor.target_files:
+            # The frozen GUI initializes editing metadata for every visible
+            # target while rendering the frame, before the operator can press
+            # OK.  The headless adapter does not render that frame, so replay
+            # the same initialization explicitly.  Otherwise a multi-target
+            # frame fails when only one target was edited and on_ok_click()
+            # reads the untouched target's direction from a None value.
+            if editor.modified_target_points[timestamp].get(target_type) is not None:
+                _ensure_added_info(editor, timestamp, target_type)
             override = speed_overrides.get((frame_index, target_type))
             if override is not None:
                 editor.target_speed_inputs[timestamp][target_type] = (
