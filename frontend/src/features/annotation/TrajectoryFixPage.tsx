@@ -229,6 +229,31 @@ function GridmapEvidenceView({
       target.position.x + Math.cos(target.direction) * 0.6,
       target.position.y + Math.sin(target.direction) * 0.6,
     ) : null;
+  const directionGeometry = current && directionEnd
+    ? (() => {
+        const deltaX = directionEnd.x - current.x;
+        const deltaY = directionEnd.y - current.y;
+        const length = Math.hypot(deltaX, deltaY);
+        if (length < Number.EPSILON) return null;
+        const unitX = deltaX / length;
+        const unitY = deltaY / length;
+        const normalX = -unitY;
+        const normalY = unitX;
+        const arrowLength = Math.max(4.5, gridmap.width / 90);
+        const arrowHalfWidth = Math.max(2.5, gridmap.width / 170);
+        const baseX = directionEnd.x - unitX * arrowLength;
+        const baseY = directionEnd.y - unitY * arrowLength;
+        return {
+          arrowPoints: [
+            `${directionEnd.x},${directionEnd.y}`,
+            `${baseX + normalX * arrowHalfWidth},${baseY + normalY * arrowHalfWidth}`,
+            `${baseX - normalX * arrowHalfWidth},${baseY - normalY * arrowHalfWidth}`,
+          ].join(" "),
+          handleRadius: Math.max(1.75, gridmap.width / 180),
+          hitRadius: Math.max(7, gridmap.width / 45),
+        };
+      })()
+    : null;
   const trajectoryPoints = trajectory
     .map((point) => `${point.x},${point.y}`)
     .join(" ");
@@ -310,7 +335,7 @@ function GridmapEvidenceView({
             onPointerDown={(event) => startDrag(event, "position")}
           />
         )}
-        {current && directionEnd && (
+        {current && directionEnd && directionGeometry && (
           <line
             x1={current.x}
             y1={current.y}
@@ -321,15 +346,36 @@ function GridmapEvidenceView({
             vectorEffect="non-scaling-stroke"
           />
         )}
-        {current && directionEnd && (
+        {directionEnd && directionGeometry && (
+          <polygon
+            points={directionGeometry.arrowPoints}
+            fill="#f97316"
+            stroke="#ffffff"
+            strokeWidth="0.75"
+            vectorEffect="non-scaling-stroke"
+            pointerEvents="none"
+          />
+        )}
+        {directionEnd && directionGeometry && (
           <circle
             cx={directionEnd.x}
             cy={directionEnd.y}
-            r={Math.max(3, gridmap.width / 70)}
+            r={directionGeometry.handleRadius}
             fill="#ffffff"
             stroke="#f97316"
-            strokeWidth="2"
+            strokeWidth="1.5"
             vectorEffect="non-scaling-stroke"
+            pointerEvents="none"
+          />
+        )}
+        {directionEnd && directionGeometry && (
+          <circle
+            cx={directionEnd.x}
+            cy={directionEnd.y}
+            r={directionGeometry.hitRadius}
+            fill="transparent"
+            stroke="none"
+            pointerEvents="all"
             className={editable ? "cursor-grab active:cursor-grabbing" : ""}
             aria-label="拖动目标方向"
             onPointerDown={(event) => startDrag(event, "direction")}
