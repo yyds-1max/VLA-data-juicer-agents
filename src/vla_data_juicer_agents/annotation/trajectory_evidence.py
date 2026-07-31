@@ -10,7 +10,8 @@ from __future__ import annotations
 import json
 import binascii
 from collections import Counter
-from math import hypot, isfinite
+from dataclasses import dataclass
+from math import hypot, isclose, isfinite
 from pathlib import Path
 import re
 import struct
@@ -30,6 +31,17 @@ _MAX_DOCUMENT_BYTES = 64 * 1024 * 1024
 _MAX_FRAMES = 100_000
 _MAX_TRAJECTORY_POINTS = 10_000
 _MAX_GRID_SIDE = 2_048
+
+
+@dataclass(frozen=True)
+class GridmapPayload:
+    width: int
+    height: int
+    values: list[float]
+    background: float
+    resolution: float
+    x_range: tuple[float, float]
+    y_range: tuple[float, float]
 
 
 def _reject_constant(value: str) -> None:
@@ -125,7 +137,7 @@ def _trajectory_points(value: Any) -> list[list[float]]:
     return result
 
 
-def _gridmap_payload(content: bytes) -> tuple[int, int, list[float], float]:
+def _gridmap_payload(content: bytes) -> GridmapPayload:
     if len(content) > _MAX_DOCUMENT_BYTES:
         raise RuntimeExecutionError(
             "trajectory_evidence_unavailable",
@@ -156,35 +168,50 @@ def _gridmap_payload(content: bytes) -> tuple[int, int, list[float], float]:
         or resolution <= 0
         or x_range is None
         or y_range is None
-        or not isinstance(raw_grid_size, list)
-        or len(raw_grid_size) != 2
         or not isinstance(raw_data, list)
     ):
         raise RuntimeExecutionError(
             "trajectory_evidence_unavailable",
             "The gridmap evidence metadata is invalid.",
         )
-    if any(
-        isinstance(value, bool)
-        or not isinstance(value, int)
-        for value in raw_grid_size
+    x_cells = (x_range[1] - x_range[0]) / resolution
+    y_cells = (y_range[1] - y_range[0]) / resolution
+    width = round(x_cells)
+    height = round(y_cells)
+    if (
+        x_range[0] >= x_range[1]
+        or y_range[0] >= y_range[1]
+        or not isclose(x_cells, width, rel_tol=1e-9, abs_tol=1e-6)
+        or not isclose(y_cells, height, rel_tol=1e-9, abs_tol=1e-6)
+        or width < 1
+        or height < 1
+        or width > _MAX_GRID_SIDE
+        or height > _MAX_GRID_SIDE
     ):
         raise RuntimeExecutionError(
             "trajectory_evidence_unavailable",
             "The gridmap evidence dimensions are invalid.",
         )
-    # The frozen Fix editor reshapes exactly as
-    # ``data.reshape(grid_h, grid_w)`` using this field.  Do not infer the
-    # matrix shape from ranges and resolution.
-    height = int(raw_grid_size[0])
-    width = int(raw_grid_size[1])
-    if (
-        width < 1
-        or height < 1
-        or width > _MAX_GRID_SIDE
-        or height > _MAX_GRID_SIDE
-        or len(raw_data) != width * height
+    # Production gridmaps use a scalar side length.  Some historical test
+    # fixtures use the legacy [height, width] form.  The frozen Fix editor
+    # derives the matrix dimensions from ranges and resolution, so both
+    # metadata shapes must agree with those derived dimensions.
+    if isinstance(raw_grid_size, int) and not isinstance(raw_grid_size, bool):
+        grid_size_matches = (
+            width == height == raw_grid_size
+        )
+    elif (
+        isinstance(raw_grid_size, list)
+        and len(raw_grid_size) == 2
+        and all(
+            isinstance(value, int) and not isinstance(value, bool)
+            for value in raw_grid_size
+        )
     ):
+        grid_size_matches = raw_grid_size == [height, width]
+    else:
+        grid_size_matches = False
+    if not grid_size_matches or len(raw_data) != width * height:
         raise RuntimeExecutionError(
             "trajectory_evidence_unavailable",
             "The gridmap evidence dimensions are invalid.",
@@ -199,7 +226,26 @@ def _gridmap_payload(content: bytes) -> tuple[int, int, list[float], float]:
             )
         values.append(number)
     background = Counter(values).most_common(1)[0][0]
-    return width, height, values, background
+    return GridmapPayload(
+        width=width,
+        height=height,
+        values=values,
+        background=background,
+        resolution=resolution,
+        x_range=(x_range[0], x_range[1]),
+        y_range=(y_range[0], y_range[1]),
+    )
+
+
+def gridmap_metadata(content: bytes) -> dict[str, Any]:
+    payload = _gridmap_payload(content)
+    return {
+        "width": payload.height,
+        "height": payload.width,
+        "resolution": payload.resolution,
+        "x_range": list(payload.x_range),
+        "y_range": list(payload.y_range),
+    }
 
 
 def _png_chunk(kind: bytes, payload: bytes) -> bytes:
@@ -214,7 +260,11 @@ def _png_chunk(kind: bytes, payload: bytes) -> bytes:
 def render_gridmap_png(content: bytes) -> tuple[bytes, int, int]:
     """Render the legacy BEV grid orientation without changing source data."""
 
-    width, height, values, background = _gridmap_payload(content)
+    payload = _gridmap_payload(content)
+    width = payload.width
+    height = payload.height
+    values = payload.values
+    background = payload.background
     foreground = [value for value in values if value != background]
     minimum = min(foreground) if foreground else 0.0
     maximum = max(foreground) if foreground else 1.0
@@ -454,19 +504,26 @@ def build_trajectory_revision_state(
         gridmap_available = gridmap.is_file() and not gridmap.is_symlink()
         if gridmap_available:
             try:
-                (
-                    source_grid_width,
-                    source_grid_height,
-                    _values,
-                    _background,
-                ) = _gridmap_payload(_read_stable_regular_bytes(gridmap))
+                payload = _gridmap_payload(
+                    _read_stable_regular_bytes(gridmap)
+                )
                 # The legacy Fix view plots ``grid_y`` on the horizontal axis
                 # and ``grid_x`` on the vertical axis.  The safe PNG therefore
                 # has the transposed display dimensions.
-                rendered_gridmap_width = source_grid_height
-                rendered_gridmap_height = source_grid_width
+                rendered_gridmap_width = payload.height
+                rendered_gridmap_height = payload.width
+                gridmap_resolution = payload.resolution
+                gridmap_x_range = list(payload.x_range)
+                gridmap_y_range = list(payload.y_range)
             except (OSError, RuntimeExecutionError):
                 gridmap_available = False
+                gridmap_resolution = None
+                gridmap_x_range = None
+                gridmap_y_range = None
+        else:
+            gridmap_resolution = None
+            gridmap_x_range = None
+            gridmap_y_range = None
         frames.append(
             {
                 "frame_index": frame_index,
@@ -475,6 +532,9 @@ def build_trajectory_revision_state(
                 "gridmap_available": gridmap_available,
                 "gridmap_width": rendered_gridmap_width,
                 "gridmap_height": rendered_gridmap_height,
+                "gridmap_resolution": gridmap_resolution,
+                "gridmap_x_range": gridmap_x_range,
+                "gridmap_y_range": gridmap_y_range,
                 "pass": bool(raw_trajectory_frame.get("pass", False)),
                 "targets": projected_targets,
             }
@@ -494,7 +554,7 @@ def resolve_evidence_file(
     frame_index: int,
     kind: str,
 ) -> Path:
-    if kind not in {"camera", "gridmap"}:
+    if kind not in {"camera", "gridmap", "projection"}:
         raise RuntimeExecutionError(
             "trajectory_evidence_unavailable",
             "The requested evidence kind is unsupported.",
@@ -517,14 +577,18 @@ def resolve_evidence_file(
             "trajectory_evidence_unavailable",
             "The requested evidence frame is invalid.",
         )
-    relative = (
-        Path("fisheye_front", f"{frame_key}.jpg")
-        if kind == "camera"
-        else Path("grid_map", f"{frame_key}.json")
-    )
+    if kind == "camera":
+        relative = Path("fisheye_front", f"{frame_key}.jpg")
+    elif kind == "gridmap":
+        relative = Path("grid_map", f"{frame_key}.json")
+    else:
+        relative = Path("rout_plot_v2", f"{frame_key}.png")
     try:
         root = segment_root.resolve(strict=True)
-        candidate = (root / relative).resolve(strict=True)
+        lexical_candidate = root / relative
+        if lexical_candidate.is_symlink():
+            raise OSError("evidence file is a symlink")
+        candidate = lexical_candidate.resolve(strict=True)
         candidate.relative_to(root)
     except (OSError, ValueError) as exc:
         raise RuntimeExecutionError(

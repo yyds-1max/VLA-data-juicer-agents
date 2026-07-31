@@ -32,10 +32,18 @@ function payload(): Record<string, unknown> {
           width: 1920,
           height: 1536,
         },
+        projection: {
+          url: `/api/annotation/reviews/${reviewRef}/evidence/frames/0/projection`,
+          width: 3840,
+          height: 1536,
+        },
         gridmap: {
           url: `/api/annotation/reviews/${reviewRef}/evidence/frames/0/gridmap`,
           width: 320,
           height: 240,
+          resolution: 0.1,
+          x_range: [-12, 12],
+          y_range: [-12, 12],
         },
         targets: [{
           target_ref: targetRef,
@@ -52,6 +60,7 @@ function payload(): Record<string, unknown> {
         frame_index: 1,
         pass: false,
         camera: null,
+        projection: null,
         gridmap: null,
         targets: [{
           target_ref: targetRef,

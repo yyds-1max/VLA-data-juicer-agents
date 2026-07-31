@@ -256,16 +256,22 @@ export type TrajectoryEvidenceCamera = {
   height: number | null;
 };
 
+export type TrajectoryEvidenceProjection = TrajectoryEvidenceCamera;
+
 export type TrajectoryEvidenceGridmap = {
   url: string;
   width: number;
   height: number;
+  resolution: number;
+  x_range: [number, number];
+  y_range: [number, number];
 };
 
 export type TrajectoryEvidenceFrame = {
   frame_index: number;
   pass: boolean;
   camera: TrajectoryEvidenceCamera | null;
+  projection: TrajectoryEvidenceProjection | null;
   gridmap: TrajectoryEvidenceGridmap | null;
   targets: TrajectoryEvidenceTarget[];
 };

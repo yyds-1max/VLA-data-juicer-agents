@@ -339,7 +339,11 @@ def create_annotation_router(
         frame_index: int,
         kind: str,
     ) -> Response:
-        if frame_index < 0 or kind not in {"camera", "gridmap"}:
+        if frame_index < 0 or kind not in {
+            "camera",
+            "gridmap",
+            "projection",
+        }:
             raise HTTPException(
                 status_code=404,
                 detail={

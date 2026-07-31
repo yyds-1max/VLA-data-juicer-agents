@@ -239,6 +239,7 @@ class FakePostprocessingRuntime:
             )
             (candidate / "fisheye_front").mkdir(parents=True)
             (candidate / "grid_map").mkdir()
+            (candidate / "rout_plot_v2").mkdir()
             frame_key = "1.000000"
             trajectory = candidate / (
                 f"{segment.private_segment_key}_trajectory.json"
@@ -287,19 +288,25 @@ class FakePostprocessingRuntime:
                 + (8).to_bytes(2, "big")
                 + b"\xff\xd9"
             )
+            gridmap_content = json.dumps(
+                {
+                    "data": [-1, 0, 1, 2],
+                    "grid_size": 2,
+                    "resolution": 1,
+                    "x_range": [0, 2],
+                    "y_range": [0, 2],
+                }
+            ).encode()
+            (candidate / "grid_map" / f"{frame_key}.json").write_bytes(
+                gridmap_content
+            )
+            projection_png, _width, _height = render_gridmap_png(
+                gridmap_content
+            )
             (
-                candidate / "grid_map" / f"{frame_key}.json"
-            ).write_text(
-                json.dumps(
-                    {
-                        "data": [-1, 0, 1, 2, 3, 4],
-                        "grid_size": [3, 2],
-                        "resolution": 1,
-                        "x_range": [0, 2],
-                        "y_range": [0, 3],
-                    }
-                ),
-                encoding="utf-8",
+                candidate / "rout_plot_v2" / f"{frame_key}.png"
+            ).write_bytes(
+                projection_png
             )
             candidates.append(
                 TrajectoryCandidate(
@@ -1496,18 +1503,35 @@ def test_worker_executes_store_bound_postprocessing_and_creates_review(
                 f"/api/annotation/reviews/{review_ref}/evidence/"
                 "frames/0/gridmap"
             ),
-            "width": 3,
+            "width": 2,
+            "height": 2,
+            "resolution": 1.0,
+            "x_range": [0.0, 2.0],
+            "y_range": [0.0, 2.0],
+        }
+        assert evidence["frames"][0]["projection"] == {
+            "url": (
+                f"/api/annotation/reviews/{review_ref}/evidence/"
+                "frames/0/projection"
+            ),
+            "width": 2,
             "height": 2,
         }
+        projection = client.get(
+            evidence["frames"][0]["projection"]["url"]
+        )
+        assert projection.status_code == 200
+        assert projection.headers["content-type"] == "image/png"
         gridmap = client.get(evidence["frames"][0]["gridmap"]["url"])
         assert gridmap.status_code == 200
         assert gridmap.headers["content-type"] == "image/png"
         assert gridmap.headers["x-content-type-options"] == "nosniff"
         assert gridmap.content.startswith(b"\x89PNG\r\n\x1a\n")
-        assert int.from_bytes(gridmap.content[16:20], "big") == 3
+        assert int.from_bytes(gridmap.content[16:20], "big") == 2
         assert int.from_bytes(gridmap.content[20:24], "big") == 2
         assert "/media/" not in evidence_response.text
         assert str(tmp_path) not in evidence_response.text
+
 
 
 def test_postprocessing_cancel_before_publish_does_not_write_finish_data(
@@ -1835,6 +1859,127 @@ def test_gridmap_renderer_preserves_legacy_transposed_display_dimensions():
     assert png.startswith(b"\x89PNG\r\n\x1a\n")
     assert int.from_bytes(png[16:20], "big") == width
     assert int.from_bytes(png[20:24], "big") == height
+
+
+def test_gridmap_renderer_accepts_production_scalar_grid_size():
+    content = json.dumps(
+        {
+            "data": [-1] * 40_000,
+            "grid_size": 200,
+            "resolution": 0.12,
+            "x_range": [-12, 12],
+            "y_range": [-12, 12],
+        }
+    ).encode()
+
+    png, width, height = render_gridmap_png(content)
+
+    assert (width, height) == (200, 200)
+    assert png.startswith(b"\x89PNG\r\n\x1a\n")
+
+
+def test_legacy_frozen_evidence_state_is_enhanced_without_rewrite(
+    tmp_path: Path,
+):
+    artifact_root = tmp_path / "segment"
+    (artifact_root / "grid_map").mkdir(parents=True)
+    (artifact_root / "rout_plot_v2").mkdir()
+    frame_key = "1.000000"
+    gridmap_content = json.dumps(
+        {
+            "data": [-1, 0, 1, 2],
+            "grid_size": 2,
+            "resolution": 1,
+            "x_range": [0, 2],
+            "y_range": [0, 2],
+        }
+    ).encode()
+    (artifact_root / "grid_map" / f"{frame_key}.json").write_bytes(
+        gridmap_content
+    )
+    projection, _width, _height = render_gridmap_png(gridmap_content)
+    (
+        artifact_root / "rout_plot_v2" / f"{frame_key}.png"
+    ).write_bytes(projection)
+    frozen_state = {
+        "schema_version": 1,
+        "target_bindings": {TARGET_REF: "master"},
+        "frame_count": 1,
+        "frames": [{
+            "frame_index": 0,
+            "private_frame_key": frame_key,
+            "camera_available": False,
+            "gridmap_available": False,
+            "pass": False,
+            "targets": {
+                TARGET_REF: {
+                    "label": "Master",
+                    "position": [1.0, 1.0],
+                    "direction": 0.0,
+                    "speed": 1.0,
+                    "color": [],
+                    "image_box": None,
+                    "trajectory_points": [[1.0, 1.0]],
+                }
+            },
+        }],
+    }
+
+    class LegacyEvidenceStore:
+        db_path = tmp_path / "annotation.sqlite"
+
+        def review_evidence_private(self, review_ref):
+            assert review_ref == "review_" + "2" * 32
+            return {
+                "review_ref": review_ref,
+                "status": "in_progress",
+                "state_revision": 2,
+                "trajectory_revision_ref": (
+                    "trajectory_revision_" + "3" * 32
+                ),
+                "trajectory_state": frozen_state,
+                "private_artifact_path": str(artifact_root),
+                "artifact_sha256": _tree_sha256(artifact_root),
+                "draft_state": None,
+                "draft_revision": None,
+            }
+
+    service = AnnotationApplicationService(
+        store=LegacyEvidenceStore(),
+        worker=FakeWorker(),
+    )
+
+    evidence = service.get_review_trajectory_evidence(
+        "review_" + "2" * 32
+    )
+
+    assert evidence["frames"][0]["gridmap"] is not None
+    assert evidence["frames"][0]["projection"] is not None
+    assert frozen_state["frames"][0]["gridmap_available"] is False
+    assert "gridmap_width" not in frozen_state["frames"][0]
+
+
+@pytest.mark.parametrize(
+    "override",
+    [
+        {"x_range": [2, 0]},
+        {"x_range": [0, 2.4]},
+        {"grid_size": 3},
+        {"grid_size": True},
+    ],
+)
+def test_gridmap_renderer_rejects_inconsistent_production_metadata(override):
+    payload = {
+        "data": [-1, 0, 1, 2],
+        "grid_size": 2,
+        "resolution": 1,
+        "x_range": [0, 2],
+        "y_range": [0, 2],
+    }
+    payload.update(override)
+
+    with pytest.raises(RuntimeError):
+        render_gridmap_png(json.dumps(payload).encode())
 
 
 def test_postprocessing_spec_and_trajectory_records_are_immutable(tmp_path: Path):

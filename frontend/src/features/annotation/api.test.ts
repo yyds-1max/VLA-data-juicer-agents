@@ -249,10 +249,18 @@ test("evidence validates the exact dedicated public review contract", async () =
         width: 1920,
         height: 1536,
       },
+      projection: {
+        url: `/api/annotation/reviews/${review.review_ref}/evidence/frames/0/projection`,
+        width: 3840,
+        height: 1536,
+      },
       gridmap: {
         url: `/api/annotation/reviews/${review.review_ref}/evidence/frames/0/gridmap`,
         width: 320,
         height: 240,
+        resolution: 0.1,
+        x_range: [-12, 12],
+        y_range: [-12, 12],
       },
       targets: [{
         target_ref: "target_0123456789abcdef0123456789abcdef",
@@ -291,6 +299,7 @@ test("evidence rejects stale or path-like media projections", async () => {
         width: 1920,
         height: 1536,
       },
+      projection: null,
       gridmap: null,
       targets: [{
         target_ref: "target_0123456789abcdef0123456789abcdef",
