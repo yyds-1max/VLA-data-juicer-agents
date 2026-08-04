@@ -11,6 +11,7 @@ import {
 import {
   applyFixCommand,
   createFixRevision,
+  getAnnotationCapabilities,
   getCalibrationProfiles,
   getTrajectoryReview,
   getTrajectoryReviewEvidence,
@@ -36,6 +37,7 @@ vi.mock("./api", async (importOriginal) => {
     ...actual,
     applyFixCommand: vi.fn(),
     createFixRevision: vi.fn(),
+    getAnnotationCapabilities: vi.fn(),
     getCalibrationProfiles: vi.fn(),
     getTrajectoryReview: vi.fn(),
     getTrajectoryReviewEvidence: vi.fn(),
@@ -46,6 +48,7 @@ vi.mock("./api", async (importOriginal) => {
 const apiMocks = vi.mocked({
   applyFixCommand,
   createFixRevision,
+  getAnnotationCapabilities,
   getCalibrationProfiles,
   getTrajectoryReview,
   getTrajectoryReviewEvidence,
@@ -142,6 +145,11 @@ beforeEach(() => {
   resetAnnotationProjectionStore();
   vi.stubGlobal("EventSource", AnnotationTestEventSource);
   apiMocks.getCalibrationProfiles.mockResolvedValue([]);
+  apiMocks.getAnnotationCapabilities.mockResolvedValue({
+    available: true,
+    runtime_id: "navigation_odom_v1",
+    reason: null,
+  });
   apiMocks.listTrajectoryReviews.mockResolvedValue([]);
 });
 
@@ -163,11 +171,12 @@ test("annotation workspace exposes URL-backed workbench and review tabs", async 
 
   render(<RouterProvider router={router} future={{ v7_startTransition: true }} />);
 
-  expect(screen.getByRole("tab", { name: "标注工作台" })).toHaveAttribute(
+  expect(screen.getByRole("tab", { name: "标注任务" })).toHaveAttribute(
     "data-state",
     "active",
   );
   expect(screen.getByRole("tab", { name: "人工复核" })).toBeVisible();
+  expect(await screen.findByText("处理环境可用")).toBeVisible();
   expect(screen.getByText("jobs route")).toBeVisible();
 });
 

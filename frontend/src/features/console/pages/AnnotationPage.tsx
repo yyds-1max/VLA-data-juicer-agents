@@ -4,14 +4,10 @@ import {
   ArrowLeft,
   Ban,
   Check,
-  CircleCheck,
   CircleDot,
   LoaderCircle,
-  Plus,
-  RefreshCw,
   RotateCcw,
   SkipForward,
-  Tags,
   X,
 } from "lucide-react";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
@@ -63,9 +59,9 @@ import type {
   AnnotationSegmentSummary,
   AnnotationSegmentStatus,
 } from "../../annotation/types";
-
-const JOB_TABLE_GRID_LARGE_CLASS =
-  "lg:grid-cols-[5.5rem_minmax(7rem,1.15fr)_7rem_minmax(7.5rem,1fr)_6.75rem_7.5rem_minmax(3.5rem,.5fr)] xl:grid-cols-[6rem_9.5rem_7rem_15rem_7rem_8rem_3.5rem]";
+import { AnnotationJobProgress } from "../../annotation/AnnotationJobProgress";
+import { JobsIndexView } from "../../annotation/JobsIndexView";
+import { SegmentQueuePanel } from "../../annotation/SegmentQueuePanel";
 
 const JOB_STATUS: Record<AnnotationJobStatus, { label: string; tone: "success" | "info" | "warning" | "danger" | "neutral" }> = {
   preparing: { label: "准备中", tone: "info" },
@@ -96,16 +92,6 @@ function safeError(error: unknown, fallback: string): string {
   const looksPrivate = /(?:^|[\s("'`])\/(?:[^/\s]+\/){2,}|[A-Za-z]:\\/.test(message);
   if (looksPrivate) return code ? `${fallback}（${code}）` : fallback;
   return message || fallback;
-}
-
-function formattedTime(timestamp: string): string {
-  const date = new Date(timestamp);
-  if (Number.isNaN(date.valueOf())) return timestamp;
-  const padded = (value: number) => String(value).padStart(2, "0");
-  return [
-    `${date.getFullYear()}-${padded(date.getMonth() + 1)}-${padded(date.getDate())}`,
-    `${padded(date.getHours())}:${padded(date.getMinutes())}`,
-  ].join(" ");
 }
 
 function cancellableJob(status: AnnotationJobStatus): boolean {
@@ -149,10 +135,26 @@ function countsSummary(job: AnnotationJobSummary): string {
   return `${resolved}/${job.counts.total} 个 segment 已处理`;
 }
 
-function jobStatusLabel(job: AnnotationJobSummary): string {
-  if (job.cancel_requested) return "正在取消";
-  if (job.completion_outcome === "no_processable_targets") return "无可处理目标";
-  return JOB_STATUS[job.status].label;
+function annotationJobProgressHint(job: AnnotationJobDetail): string {
+  const pendingSegments = job.counts.pending_initial_annotation + job.counts.draft;
+
+  if (job.cancel_requested) return "取消请求已提交，系统正在等待当前处理安全结束。";
+  if (job.status === "failed") return "任务处理失败，请查看下方错误信息并选择安全的恢复方式。";
+  if (job.status === "cancelled") {
+    return job.completion_outcome === "no_processable_targets"
+      ? "没有发现有效处理目标，本任务已结束。"
+      : "任务已取消，已有处理记录仍会保留。";
+  }
+  if (job.status === "preparing") return "正在准备 Web 首帧，暂时无需人工操作。";
+  if (job.status === "waiting_initial_annotation") {
+    return job.ready_for_tracking
+      ? "首帧标注已全部提交，等待 DataPilot 继续 Tracking。"
+      : `还有 ${pendingSegments} 个 Segment 等待首帧标注。`;
+  }
+  if (job.status === "tracking") return "DataPilot 正在执行 Tracking，并持续保存处理检查点。";
+  if (job.status === "tracked") return "Tracking 已完成，等待 DataPilot 启动后处理。";
+  if (job.status === "postprocessing") return "DataPilot 正在执行后处理，页面可以安全关闭。";
+  return "标注结果已生成，等待进入人工复核。";
 }
 
 function countsFromSegments(segments: AnnotationSegmentSummary[]) {
@@ -222,130 +224,6 @@ function DataRouterFlushBlocker({
   return null;
 }
 
-function JobRow({
-  job,
-  onOpen,
-  actionLabel,
-}: {
-  job: AnnotationJobSummary;
-  onOpen: () => void;
-  actionLabel?: string;
-}) {
-  const status = JOB_STATUS[job.status];
-  const resolved = resolvedSegmentCount(job);
-  const progress = job.counts.total > 0
-    ? Math.round((resolved / job.counts.total) * 100)
-    : 0;
-  return (
-    <div
-      className={`grid gap-2 border-b border-console-line px-3 py-2 last:border-b-0 ${JOB_TABLE_GRID_LARGE_CLASS} lg:min-h-11 lg:items-center`}
-      data-testid="annotation-job-row"
-    >
-      <p className="text-xs font-normal tabular-nums text-console-muted">{job.dataset_date}</p>
-      <div className="min-w-0">
-        <p className="truncate text-xs font-normal text-console-muted" title={job.source_clips.join("、")}>
-          {job.source_clips.join("、")}
-        </p>
-      </div>
-      <div className="whitespace-nowrap">
-        <StatusTag tone={job.cancel_requested ? "warning" : status.tone}>
-          {jobStatusLabel(job)}
-        </StatusTag>
-      </div>
-      <div className="min-w-0">
-        <div className="flex items-center gap-2">
-          <span className="shrink-0 text-xs tabular-nums text-console-text">{resolved}/{job.counts.total}</span>
-          <span className="h-1.5 w-20 shrink-0 overflow-hidden rounded-full bg-slate-200 xl:w-28" aria-hidden="true">
-            <span className="block h-full rounded-full bg-console-cyan" style={{ width: `${progress}%` }} />
-          </span>
-        </div>
-      </div>
-      <p className="truncate text-xs text-console-muted" title={job.calibration.label}>
-        {job.calibration.label}
-      </p>
-      <p className="whitespace-nowrap text-[11px] tabular-nums text-console-muted">
-        {formattedTime(job.updated_at)}
-      </p>
-      <button
-        type="button"
-        className="justify-self-start text-sm font-medium text-console-cyan transition hover:text-blue-700 hover:underline focus:outline-hidden focus-visible:underline"
-        aria-label={actionLabel ? `${actionLabel} ${job.dataset_date}` : `查看任务 ${job.dataset_date}`}
-        onClick={onOpen}
-      >
-        {actionLabel ?? "查看"}
-      </button>
-    </div>
-  );
-}
-
-function JobsSection({
-  title,
-  jobs,
-  empty,
-  onOpen,
-  actionLabel,
-  tone = "neutral",
-}: {
-  title: string;
-  jobs: AnnotationJobSummary[];
-  empty: string;
-  onOpen: (jobRef: string) => void;
-  actionLabel?: string;
-  tone?: "neutral" | "danger";
-}) {
-  return (
-    <section className={`overflow-hidden rounded-lg border bg-console-panel ${
-      tone === "danger" ? "border-rose-200" : "border-console-line"
-    }`}>
-      <div className={`flex items-start justify-between gap-3 px-4 py-2.5 ${
-        tone === "danger" ? "bg-rose-50/70" : ""
-      }`}>
-        <div>
-          <h3 className={`text-sm font-semibold ${tone === "danger" ? "text-rose-800" : "text-console-text"}`}>
-            {title}
-          </h3>
-        </div>
-        {jobs.length > 0 && (
-          <span className={`rounded-full px-2 py-0.5 text-xs font-semibold ${
-            tone === "danger" ? "bg-rose-100 text-rose-700" : "bg-console-panel2 text-console-muted"
-          }`}>
-            {jobs.length}
-          </span>
-        )}
-      </div>
-      {jobs.length > 0 && (
-        <div className="mx-4 mb-3 overflow-x-auto border-y border-console-line">
-          <div className="min-w-188">
-            <div
-              className={`hidden gap-2 border-b border-console-line bg-slate-100/80 px-3 py-1.5 text-[11px] font-medium text-console-muted ${JOB_TABLE_GRID_LARGE_CLASS} lg:grid`}
-              data-testid="annotation-job-table-header"
-            >
-              <span>数据日期</span>
-              <span>外层 clips</span>
-              <span>状态</span>
-              <span>Segment 进度</span>
-              <span>处理标定</span>
-              <span>更新时间</span>
-              <span>操作</span>
-            </div>
-            {jobs.map((job) => (
-              <JobRow
-                key={job.job_ref}
-                job={job}
-                actionLabel={actionLabel}
-                onOpen={() => onOpen(job.job_ref)}
-              />
-            ))}
-          </div>
-        </div>
-      )}
-      {jobs.length === 0 && (
-        <p className="px-4 py-5 text-sm text-console-muted">{empty}</p>
-      )}
-    </section>
-  );
-}
-
 function JobsPage() {
   const navigate = useNavigate();
   const jobs = useStore(annotationProjectionStore, (state) => state.jobs);
@@ -357,6 +235,7 @@ function JobsPage() {
   );
   const [dates, setDates] = useState<NavigationDateSummary[]>([]);
   const [loading, setLoading] = useState(!jobsLoaded || !capabilityLoaded);
+  const [refreshing, setRefreshing] = useState(false);
   const [pageError, setPageError] = useState("");
   const [dialogOpen, setDialogOpen] = useState(false);
   const [activeInvocationId, setActiveInvocationId] = useState<string | null>(null);
@@ -374,6 +253,8 @@ function JobsPage() {
       : null;
 
   const refresh = useCallback(async (invalidateDataset = false) => {
+    setPageError("");
+    if (invalidateDataset) setRefreshing(true);
     if (invalidateDataset) resetNavigationDatasetSummaryCache();
     const results = await Promise.allSettled([
       loadAnnotationJobs({ force: invalidateDataset }),
@@ -399,6 +280,7 @@ function JobsPage() {
       ));
     }
     setLoading(false);
+    setRefreshing(false);
   }, []);
 
   useEffect(() => {
@@ -444,150 +326,21 @@ function JobsPage() {
     }
   };
 
-  const waitingJobs = jobs.filter((job) => job.status === "waiting_initial_annotation");
-  const runningJobs = jobs.filter((job) => (
-    job.status === "preparing"
-    || job.status === "tracking"
-    || job.status === "postprocessing"
-  ));
-  const continuingJobs = jobs.filter((job) => job.status === "tracked");
-  const failedJobs = jobs.filter((job) => job.status === "failed");
-  const historyJobs = jobs
-    .filter((job) => (
-      job.status === "annotated"
-      || job.status === "cancelled"
-    ))
-    .sort((left, right) => right.updated_at.localeCompare(left.updated_at));
-  const pendingSegments = waitingJobs.reduce(
-    (total, job) => total + job.counts.pending_initial_annotation + job.counts.draft,
-    0,
-  );
-  const annotatedJobs = jobs.filter((job) => job.status === "annotated").length;
-
   return (
-    <section className="mx-auto max-w-360 space-y-3 px-3 pb-28 pt-4 md:px-4 lg:px-5">
-      <div className="flex flex-col gap-3 sm:flex-row sm:items-start sm:justify-between">
-        <div>
-          <div className="flex flex-wrap items-center gap-3">
-            <h2 className="text-xl font-semibold tracking-tight text-console-text">自动标注任务</h2>
-            {capability && (
-              <span className={`inline-flex items-center gap-1.5 rounded-full border px-2.5 py-1 text-xs font-medium ${
-                capability.available
-                  ? "border-emerald-200 bg-emerald-50 text-emerald-700"
-                  : "border-amber-200 bg-amber-50 text-amber-700"
-              }`}>
-                <span className={`h-1.5 w-1.5 rounded-full ${
-                  capability.available ? "bg-emerald-500" : "bg-amber-500"
-                }`} />
-                {capability.available ? "处理环境可用" : "处理环境不可用"}
-              </span>
-            )}
-          </div>
-          <p className="mt-1.5 text-sm text-console-muted">
-            DataPilot 负责任务调查、规划和后处理；这里用于提交首帧标注。
-          </p>
-        </div>
-        <div className="flex gap-2">
-          <ConsoleButton onClick={() => void refresh(true)} aria-label="刷新标注任务">
-            <RefreshCw className="h-4 w-4" aria-hidden="true" />
-            刷新
-          </ConsoleButton>
-          <ConsoleButton
-            variant="primary"
-            aria-label="交给 DataPilot 处理"
-            onClick={() => setDialogOpen(true)}
-          >
-            <Plus className="h-4 w-4" aria-hidden="true" />
-            交给 DataPilot 处理
-          </ConsoleButton>
-        </div>
-      </div>
-
-      {capability && !capability.available && (
-        <div className="rounded-lg border border-amber-200 bg-amber-50 p-4">
-          <div className="flex items-start gap-3">
-            <AlertCircle className="mt-0.5 h-5 w-5 text-amber-700" aria-hidden="true" />
-            <div>
-              <p className="text-sm font-semibold text-amber-800">当前处理环境尚未通过预检</p>
-              <p className="mt-1 text-sm text-amber-700">
-                仍可向 DataPilot 提交范围，由它检查事实并说明阻塞；页面不会直接启动 Runtime。
-              </p>
-            </div>
-          </div>
-        </div>
-      )}
-
-      {pageError && (
-        <div role="alert" className="rounded-lg border border-rose-200 bg-rose-50 p-3 text-sm text-rose-700">
-          {pageError}
-        </div>
-      )}
-
-      {loading ? (
-        <PageMessage icon={LoaderCircle} title="正在读取标注任务…" />
-      ) : (
-        <div className="space-y-3">
-          <div className="grid overflow-hidden rounded-lg border border-console-line bg-console-panel sm:grid-cols-2 lg:grid-cols-4">
-            {[
-              { label: "待首帧标注", value: pendingSegments, icon: Tags, color: "text-amber-600" },
-              { label: "处理中", value: runningJobs.length, icon: LoaderCircle, color: "text-blue-600" },
-              { label: "异常任务", value: failedJobs.length, icon: AlertCircle, color: "text-rose-600" },
-              { label: "已标注", value: annotatedJobs, icon: CircleCheck, color: "text-emerald-600" },
-            ].map((metric, index) => (
-              <div key={metric.label} className="relative flex min-h-24 items-center gap-4 px-5 py-4">
-                {index > 0 && <span className="absolute bottom-4 left-0 top-4 hidden w-px bg-console-line lg:block" />}
-                <div className="flex h-12 w-12 shrink-0 items-center justify-center rounded-lg bg-console-panel2">
-                  <metric.icon className={`h-6 w-6 ${metric.color}`} aria-hidden="true" />
-                </div>
-                <div>
-                  <p className="text-sm font-semibold text-console-text">{metric.label}</p>
-                  <p className="mt-0.5 text-[1.7rem] font-semibold leading-none tabular-nums text-console-text">
-                    {metric.value}
-                  </p>
-                </div>
-              </div>
-            ))}
-          </div>
-
-          <div className="space-y-2">
-            <JobsSection
-              title="需要我处理"
-              jobs={waitingJobs}
-              empty="当前没有等待人工标注的任务。"
-              actionLabel="继续标注"
-              onOpen={(jobRef) => navigate(`/annotation/jobs/${encodeURIComponent(jobRef)}`)}
-            />
-            <JobsSection
-              title="DataPilot 处理中"
-              jobs={runningJobs}
-              empty="当前没有运行中的处理任务。"
-              onOpen={(jobRef) => navigate(`/annotation/jobs/${encodeURIComponent(jobRef)}`)}
-            />
-            <JobsSection
-              title="等待 DataPilot 继续"
-              jobs={continuingJobs}
-              empty="当前没有等待继续后处理的任务。"
-              onOpen={(jobRef) => navigate(`/annotation/jobs/${encodeURIComponent(jobRef)}`)}
-            />
-            {failedJobs.length > 0 && (
-              <JobsSection
-                title="异常任务"
-                jobs={failedJobs}
-                empty=""
-                actionLabel="查看处理"
-                tone="danger"
-                onOpen={(jobRef) => navigate(`/annotation/jobs/${encodeURIComponent(jobRef)}`)}
-              />
-            )}
-            <JobsSection
-              title="历史任务"
-              jobs={historyJobs}
-              empty="暂无历史任务。"
-              onOpen={(jobRef) => navigate(`/annotation/jobs/${encodeURIComponent(jobRef)}`)}
-            />
-          </div>
-        </div>
-      )}
+    <section className="mx-auto max-w-360 px-3 pb-28 pt-4 md:px-4 lg:px-5">
+      <JobsIndexView
+        jobs={jobs}
+        loading={loading}
+        refreshing={refreshing}
+        error={pageError}
+        capability={capability}
+        dataPilotDisabled={submitting}
+        onRefresh={() => void refresh(true)}
+        onOpenDataPilot={() => setDialogOpen(true)}
+        onPrimaryAction={(job) => {
+          navigate(`/annotation/jobs/${encodeURIComponent(job.job_ref)}`);
+        }}
+      />
 
       <NavigationDataPilotDialog
         dates={dates}
@@ -849,17 +602,21 @@ function JobPage({ jobRef }: { jobRef: string }) {
       )}
       {error && <div role="alert" className="rounded-lg border border-rose-200 bg-rose-50 p-3 text-sm text-rose-700">{error}</div>}
 
+      <ConsoleCard className="overflow-hidden px-4 pb-0 pt-4 sm:px-5 sm:pt-5">
+        <AnnotationJobProgress job={job} />
+        <p
+          className="mt-3 border-t border-console-line px-2 py-3 text-center text-xs leading-5 text-console-muted"
+        >
+          {annotationJobProgressHint(job)}
+        </p>
+      </ConsoleCard>
+
       <div className="grid gap-4 lg:grid-cols-[20rem_1fr]">
-        <ConsoleCard className="p-0">
-          <div className="border-b border-console-line p-4">
-            <h3 className="text-sm font-semibold text-console-text">Segment 队列</h3>
-            <p className="mt-1 text-xs text-console-muted">{countsSummary(job)}</p>
-          </div>
-          <SegmentQueue
-            job={job}
-            onNavigate={(segmentRef) => navigate(`/annotation/jobs/${encodeURIComponent(jobRef)}/segments/${encodeURIComponent(segmentRef)}`)}
-          />
-        </ConsoleCard>
+        <SegmentQueuePanel
+          job={job}
+          className="min-h-[30rem] lg:max-h-[calc(100vh-12rem)]"
+          onNavigate={(segmentRef) => navigate(`/annotation/jobs/${encodeURIComponent(jobRef)}/segments/${encodeURIComponent(segmentRef)}`)}
+        />
 
         <div className="space-y-4">
           <ConsoleCard>
@@ -1094,38 +851,39 @@ function SegmentPage({ jobRef, segmentRef }: { jobRef: string; segmentRef: strin
   const status = SEGMENT_STATUS[segment.status];
 
   return (
-    <section className="mx-auto max-w-[110rem] space-y-3 px-3 py-3 md:px-4 xl:flex xl:h-[calc(100dvh-7.5rem)] xl:min-h-176 xl:flex-col xl:overflow-hidden">
+    <section className="flex h-[calc(100dvh-124px)] min-h-168 flex-col overflow-hidden bg-[#edf0f5] md:h-dvh md:min-h-0">
       <DataRouterFlushBlocker
         enabled={Boolean(editable)}
         flush={flushForNavigation}
       />
-      <div className="flex shrink-0 flex-col gap-3 border border-console-line bg-console-panel px-3 py-3 lg:flex-row lg:items-center lg:justify-between">
-        <div className="flex min-w-0 items-center gap-3">
+      <div className="relative z-50 flex min-h-14 shrink-0 items-center justify-between gap-3 border-b border-[#e3e6ed] bg-white px-3 py-2 sm:px-4">
+        <div className="flex min-w-0 items-center gap-2">
           <ConsoleButton
-            className="h-9 w-9 shrink-0 px-0"
+            className="h-8 w-8 shrink-0 border-transparent bg-transparent px-0 shadow-none hover:border-[#dfe4ed] hover:bg-[#f4f6fa]"
             variant="ghost"
             aria-label="返回自动标注任务"
             onClick={() => void navigateSafely(`/annotation/jobs/${encodeURIComponent(jobRef)}`)}
           >
             <ArrowLeft className="h-4 w-4" aria-hidden="true" />
           </ConsoleButton>
-          <div className="min-w-0">
-            <div className="flex flex-wrap items-center gap-2">
-              <h2 className="text-base font-semibold text-console-text">首帧标注</h2>
-              <span className="text-xs text-console-muted">
-                Segment {String(segment.ordinal).padStart(2, "0")} / {job.counts.total}
-              </span>
-              <StatusTag tone={status.tone}>{status.label}</StatusTag>
-            </div>
-            <p className="mt-0.5 truncate text-xs text-console-muted" title={`${job.dataset_date} · ${segment.source_clip}`}>
-              {job.dataset_date} · {segment.source_clip}
-            </p>
-          </div>
+          <nav aria-label="标注工作台位置" className="flex min-w-0 items-center gap-2 text-xs sm:text-sm">
+            <span className="hidden font-semibold text-[#232a38] sm:inline">自动标注</span>
+            <span className="hidden text-[#a0a7b5] sm:inline" aria-hidden="true">›</span>
+            <span className="truncate font-mono text-[#667085]" title={job.dataset_date}>{job.dataset_date}</span>
+            <span className="text-[#a0a7b5]" aria-hidden="true">/</span>
+            <strong className="shrink-0 font-mono text-[#202938]">
+              Segment {String(segment.ordinal).padStart(2, "0")}
+            </strong>
+            <span className="sr-only">Segment {String(segment.ordinal).padStart(2, "0")} / {job.counts.total}</span>
+          </nav>
+          <StatusTag tone={status.tone}>{status.label}</StatusTag>
         </div>
-        <div className="flex flex-wrap gap-2">
+        <div className="flex shrink-0 items-center gap-2">
+          <span className="hidden max-w-56 truncate text-[11px] text-[#7b8494] xl:inline" title={segment.source_clip}>
+            {segment.source_clip}
+          </span>
           {editable && (
-            <ConsoleButton disabled={acting} onClick={() => setShowSkip(true)}>
-              <SkipForward className="h-4 w-4" aria-hidden="true" />
+            <ConsoleButton className="h-8 bg-white px-3 shadow-none" disabled={acting} onClick={() => setShowSkip(true)}>
               跳过此 Segment
             </ConsoleButton>
           )}
@@ -1145,7 +903,7 @@ function SegmentPage({ jobRef, segmentRef }: { jobRef: string; segmentRef: strin
       </div>
 
       {(error || actionError) && (
-        <div role="alert" className="shrink-0 border border-rose-200 bg-rose-50 px-3 py-2 text-sm text-rose-700">
+        <div role="alert" className="relative z-40 shrink-0 border-b border-rose-200 bg-rose-50 px-3 py-2 text-sm text-rose-700">
           {actionError || error}
         </div>
       )}
@@ -1153,52 +911,17 @@ function SegmentPage({ jobRef, segmentRef }: { jobRef: string; segmentRef: strin
       {externalSubmissionNotice && (
         <div
           role="alert"
-          className="shrink-0 border border-blue-200 bg-blue-50 px-3 py-2 text-sm font-medium leading-6 text-blue-800"
+          className="relative z-40 shrink-0 border-b border-blue-200 bg-blue-50 px-3 py-2 text-sm font-medium leading-6 text-blue-800"
         >
           {externalSubmissionNotice}
         </div>
       )}
 
-      <label className="block shrink-0 text-sm text-console-muted xl:hidden">
-        <span className="mb-2 block font-medium text-console-text">切换 Segment</span>
-        <select
-          aria-label="切换 Segment"
-          value={segment.segment_ref}
-          className="h-10 w-full rounded-lg border border-console-line bg-white px-3 text-sm text-console-text"
-          onChange={(event) => void navigateSafely(
-            `/annotation/jobs/${encodeURIComponent(jobRef)}/segments/${encodeURIComponent(event.target.value)}`,
-          )}
-        >
-          {job.segments.map((item) => (
-            <option key={item.segment_ref} value={item.segment_ref}>
-              Segment {String(item.ordinal).padStart(2, "0")} · {SEGMENT_STATUS[item.status].label}
-            </option>
-          ))}
-        </select>
-      </label>
-
       <div
         data-testid="annotation-studio-shell"
-        className="min-h-0 flex-1 overflow-hidden border border-console-line bg-console-panel xl:grid xl:grid-cols-[15rem_minmax(0,1fr)]"
+        className="min-h-0 flex-1 overflow-hidden bg-[#edf0f5]"
       >
-        <aside
-          aria-label="Segment 队列"
-          className="hidden min-h-0 flex-col border-r border-console-line bg-console-panel xl:flex"
-        >
-          <div className="shrink-0 border-b border-console-line px-3 py-3">
-            <h3 className="text-sm font-semibold text-console-text">Segment 队列</h3>
-            <p className="mt-0.5 text-[11px] text-console-muted">{countsSummary(job)}</p>
-          </div>
-          <SegmentQueue
-            job={job}
-            currentSegmentRef={segment.segment_ref}
-            onNavigate={(nextSegmentRef) => navigateSafely(
-              `/annotation/jobs/${encodeURIComponent(jobRef)}/segments/${encodeURIComponent(nextSegmentRef)}`,
-            )}
-          />
-        </aside>
-
-        <div className="min-h-0 min-w-0 overflow-hidden">
+        <div className="h-full min-h-0 min-w-0 overflow-hidden">
           {segment.status === "skipped" ? (
             <div className="h-full p-4">
               <PageMessage
@@ -1228,6 +951,9 @@ function SegmentPage({ jobRef, segmentRef }: { jobRef: string; segmentRef: strin
               }}
               onJobRefresh={refreshJob}
               onExternalSubmissionResolved={setExternalSubmissionNotice}
+              onNavigateSegment={(nextSegmentRef) => navigateSafely(
+                `/annotation/jobs/${encodeURIComponent(jobRef)}/segments/${encodeURIComponent(nextSegmentRef)}`,
+              )}
               registerFlush={(flush) => {
                 flushRef.current = flush;
               }}

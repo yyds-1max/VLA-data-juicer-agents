@@ -1,0 +1,231 @@
+import {
+  Area,
+  AreaChart,
+  CartesianGrid,
+  Cell,
+  Pie,
+  PieChart,
+  ReferenceLine,
+  XAxis,
+  YAxis,
+} from "recharts";
+
+import {
+  ChartContainer,
+  ChartTooltip,
+  ChartTooltipContent,
+  type ChartConfig,
+} from "../../../components/ui/chart";
+import { cn } from "../../../lib/utils";
+
+export type ModelEpochDatum = {
+  epoch: number;
+  successRate: number;
+  loss: number;
+};
+
+export type DistributionDatum = {
+  label: string;
+  value: number;
+  color: string;
+};
+
+const modelChartConfig = {
+  successRate: { label: "成功率", color: "#3156C8" },
+  loss: { label: "损失值", color: "#E8798E" },
+} satisfies ChartConfig;
+
+const percentFormatter = (value: number) => `${value}%`;
+const lossFormatter = (value: number) => value.toFixed(2);
+
+export function ModelMetricsChart({ data, className }: { data: ModelEpochDatum[]; className?: string }) {
+  if (data.length === 0) {
+    return (
+      <div className={cn("flex min-h-64 items-center justify-center text-sm text-[#626B7D]", className)} role="status">
+        暂无训练指标数据
+      </div>
+    );
+  }
+
+  return (
+    <ChartContainer
+      config={modelChartConfig}
+      className={cn("h-40 w-full aspect-auto", className)}
+      role="img"
+      aria-label="VLA v47 按 Epoch 展示的成功率和损失值折线图"
+    >
+      <AreaChart accessibilityLayer data={data} margin={{ left: 8, right: 8, top: 10, bottom: 4 }}>
+        <defs>
+          <linearGradient id="dashboard-success-area" x1="0" y1="0" x2="0" y2="1">
+            <stop offset="0%" stopColor="#3156C8" stopOpacity={0.18} />
+            <stop offset="100%" stopColor="#3156C8" stopOpacity={0.015} />
+          </linearGradient>
+          <linearGradient id="dashboard-loss-area" x1="0" y1="0" x2="0" y2="1">
+            <stop offset="0%" stopColor="#E8798E" stopOpacity={0.12} />
+            <stop offset="100%" stopColor="#E8798E" stopOpacity={0.01} />
+          </linearGradient>
+        </defs>
+        <CartesianGrid vertical={false} stroke="#E8EBF2" strokeDasharray="3 5" />
+        <XAxis
+          dataKey="epoch"
+          axisLine={false}
+          tickLine={false}
+          tickMargin={10}
+          minTickGap={20}
+          label={{ value: "Epoch", position: "insideBottom", offset: -3, fill: "#626B7D", fontSize: 11 }}
+        />
+        <YAxis
+          yAxisId="success"
+          axisLine={false}
+          tickLine={false}
+          tickMargin={8}
+          width={46}
+          domain={[0, 100]}
+          tickFormatter={percentFormatter}
+        />
+        <YAxis
+          yAxisId="loss"
+          orientation="right"
+          axisLine={false}
+          tickLine={false}
+          tickMargin={8}
+          width={40}
+          domain={[0, 1]}
+          tickFormatter={lossFormatter}
+        />
+        <ChartTooltip
+          cursor={{ stroke: "#AAB5D9", strokeDasharray: "3 4" }}
+          content={
+            <ChartTooltipContent
+              className="min-w-40 border-[#E3E6EF] bg-white text-[#202431] shadow-[0_12px_30px_rgba(36,48,82,0.14)]"
+              labelFormatter={(_, payload) => `Epoch ${payload[0]?.payload?.epoch ?? ""}`}
+              formatter={(value, name) => (
+                <div className="flex w-full items-center justify-between gap-5">
+                  <span className="text-[#626B7D]">{name === "successRate" ? "成功率" : "损失值"}</span>
+                  <span className="font-semibold tabular-nums text-[#202431]">
+                    {name === "successRate" ? `${Number(value).toFixed(1)}%` : Number(value).toFixed(2)}
+                  </span>
+                </div>
+              )}
+            />
+          }
+        />
+        <ReferenceLine x={18} stroke="#B9C4E9" strokeDasharray="3 4" />
+        <Area
+          yAxisId="success"
+          dataKey="successRate"
+          name="successRate"
+          type="monotone"
+          stroke="var(--color-successRate)"
+          strokeWidth={2.5}
+          fill="url(#dashboard-success-area)"
+          fillOpacity={1}
+          dot={false}
+          strokeLinecap="round"
+          strokeLinejoin="round"
+          activeDot={{ r: 4.5, strokeWidth: 3, stroke: "#FFFFFF", fill: "#3156C8" }}
+          isAnimationActive={false}
+        />
+        <Area
+          yAxisId="loss"
+          dataKey="loss"
+          name="loss"
+          type="monotone"
+          stroke="var(--color-loss)"
+          strokeWidth={2.25}
+          fill="url(#dashboard-loss-area)"
+          fillOpacity={1}
+          dot={false}
+          strokeLinecap="round"
+          strokeLinejoin="round"
+          activeDot={{ r: 4, strokeWidth: 3, stroke: "#FFFFFF", fill: "#E8798E" }}
+          isAnimationActive={false}
+        />
+      </AreaChart>
+    </ChartContainer>
+  );
+}
+
+export function DataDistributionChart({ data, className }: { data: DistributionDatum[]; className?: string }) {
+  const visibleData = data.filter((item) => Number.isFinite(item.value) && item.value > 0);
+  const total = visibleData.reduce((sum, item) => sum + item.value, 0);
+  const config = Object.fromEntries(
+    data.map((item, index) => [`segment${index + 1}`, { label: item.label, color: item.color }]),
+  ) satisfies ChartConfig;
+
+  return (
+    <div className={cn("grid min-w-0 grid-cols-[7rem_minmax(0,1fr)] items-center gap-3", className)}>
+      <div className="relative mx-auto h-28 w-28">
+        {total > 0 ? (
+          <ChartContainer
+            config={config}
+            className="h-28 w-28 aspect-square"
+            role="img"
+            aria-label={`数据类型分布，总计 ${total.toLocaleString("zh-CN")}`}
+          >
+            <PieChart accessibilityLayer>
+              <ChartTooltip
+                content={
+                  <ChartTooltipContent
+                    hideLabel
+                    nameKey="label"
+                    className="border-[#E3E6EF] bg-white text-[#202431] shadow-[0_12px_30px_rgba(36,48,82,0.14)]"
+                  />
+                }
+              />
+              <Pie
+                data={visibleData}
+                dataKey="value"
+                nameKey="label"
+                innerRadius={31}
+                outerRadius={46}
+                paddingAngle={2}
+                cornerRadius={3}
+                stroke="#FFFFFF"
+                strokeWidth={2}
+                isAnimationActive={false}
+              >
+                {visibleData.map((item) => (
+                  <Cell key={item.label} fill={item.color} />
+                ))}
+              </Pie>
+            </PieChart>
+          </ChartContainer>
+        ) : (
+          <div
+            className="h-28 w-28 rounded-full border-[19px] border-[#EEF1F8]"
+            role="img"
+            aria-label="数据类型分布，总计 0，暂无同步帧数据"
+          />
+        )}
+        <div className="pointer-events-none absolute inset-0 flex flex-col items-center justify-center" aria-hidden="true">
+          <span className="max-w-24 truncate text-xl font-semibold tabular-nums text-[#202431]">
+            {total.toLocaleString("zh-CN")}
+          </span>
+          <span className="mt-0.5 text-[11px] text-[#626B7D]">总数</span>
+        </div>
+      </div>
+
+      <div className="min-w-0 space-y-2" aria-label="数据类型图例">
+        {data.length > 0 ? (
+          data.map((item) => (
+            <div key={item.label} className="flex min-w-0 items-center justify-between gap-2 text-xs">
+              <span className="flex min-w-0 items-center gap-2 text-[#697186]">
+                <span
+                  className="size-2.5 shrink-0 rounded-full"
+                  data-testid="distribution-color"
+                  style={{ backgroundColor: item.color }}
+                  aria-hidden="true"
+                />
+                <span className="truncate" title={item.label}>{item.label}</span>
+              </span>
+              <span className="shrink-0 font-semibold tabular-nums text-[#202431]">{Math.max(0, item.value).toLocaleString("zh-CN")}</span>
+            </div>
+          ))
+        ) : (
+          <p className="text-sm text-[#626B7D]" role="status">暂无同步帧数据</p>
+        )}
+      </div>
+    </div>
+  );
+}

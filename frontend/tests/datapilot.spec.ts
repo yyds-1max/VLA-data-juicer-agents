@@ -26,7 +26,7 @@ test("preserves the DataPilot floating entry over the migrated console", async (
   await page.goto("/");
 
   await expect(page.getByText("智瀚星途", { exact: true })).toBeVisible();
-  await expect(page.getByRole("heading", { name: "闭环仪表盘" })).toBeVisible();
+  await expect(page.getByRole("heading", { name: "仪表盘" })).toBeVisible();
   await expect(page.getByRole("button", { name: "Open DataPilot" })).toBeVisible();
 
   await page.getByRole("button", { name: "Open DataPilot" }).click();
@@ -41,7 +41,7 @@ test("preserves the DataPilot floating entry over the migrated console", async (
   await page.mouse.wheel(0, 500);
   await expect.poll(() => page.evaluate(() => window.scrollY)).toBe(0);
 
-  await page.mouse.move(320, 720);
+  await page.mouse.move(420, 650);
   await page.mouse.wheel(0, 500);
   await expect.poll(() => page.evaluate(() => window.scrollY)).toBeGreaterThan(0);
 

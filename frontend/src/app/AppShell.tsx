@@ -75,13 +75,13 @@ function readInitialSidebarCollapsed(): boolean {
   }
 }
 
-const pageCopy: Record<ConsolePageId, { title: string }> = {
-  dashboard: { title: "闭环仪表盘" },
-  agent: { title: "Agent 工作流" },
-  data: { title: "数据管理" },
-  annotate: { title: "自动标注" },
-  model: { title: "模型迭代" },
-  simulation: { title: "测试/仿真" },
+const pageCopy: Record<ConsolePageId, { title: string; subtitle: string }> = {
+  dashboard: { title: "仪表盘", subtitle: "VLA 数据闭环运行总览" },
+  agent: { title: "Agent 工作流", subtitle: "智能体任务编排与执行" },
+  data: { title: "数据管理", subtitle: "导航数据集与处理批次" },
+  annotate: { title: "自动标注", subtitle: "数据标注任务与人工复核" },
+  model: { title: "模型训练", subtitle: "VLA 模型训练与版本管理" },
+  simulation: { title: "测试/仿真", subtitle: "模型测试、仿真与结果批复" },
 };
 
 function RouteLoadingFallback() {
@@ -141,7 +141,10 @@ export function AppShell({ children }: AppShellProps) {
           : location.pathname.startsWith("/simulation")
             ? "simulation"
             : "dashboard";
-  const activeTitle = pageCopy[activePage].title;
+  const activeCopy = pageCopy[activePage];
+  const annotationWorkbench = /^\/annotation\/jobs\/[^/]+\/segments\/[^/]+\/?$/.test(
+    location.pathname,
+  );
 
   return (
     <div className="min-h-screen bg-console-bg text-console-text">
@@ -155,11 +158,18 @@ export function AppShell({ children }: AppShellProps) {
       <main
         data-testid="console-main"
         className={cn(
-          "relative z-10 pt-28 md:pt-0 md:transition-[margin-left] md:duration-200",
+          "relative z-10 pt-[124px] md:pt-0 md:transition-[margin-left] md:duration-[240ms] md:ease-[cubic-bezier(0.2,0,0,1)] motion-reduce:transition-none",
+          annotationWorkbench && "md:h-dvh md:overflow-hidden",
           sidebarCollapsed ? "md:ml-20" : "md:ml-64",
         )}
       >
-        <ConsoleHeader title={activeTitle} />
+        {!annotationWorkbench ? (
+          <ConsoleHeader
+            title={activeCopy.title}
+            subtitle={activeCopy.subtitle}
+            onPlaceholderAction={showPlaceholderToast}
+          />
+        ) : null}
         <Suspense fallback={<RouteLoadingFallback />}>
           <Routes>
             <Route path="/" element={<DashboardPage />} />

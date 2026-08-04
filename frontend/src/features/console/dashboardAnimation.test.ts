@@ -36,6 +36,8 @@ describe("dashboard animation formatting", () => {
   });
 
   test("animates total data duration and detail while preserving final formatting", () => {
+    expect(formatAnimatedDuration(0, 0)).toBe("0 秒");
+    expect(formatAnimatedDuration(0, 1)).toBe("0 秒");
     expect(formatAnimatedDuration(summary.totals.total_duration_ns, 0)).toBe("1.0 秒");
     expect(formatAnimatedDuration(summary.totals.total_duration_ns, 1)).toBe("8.9 小时");
 

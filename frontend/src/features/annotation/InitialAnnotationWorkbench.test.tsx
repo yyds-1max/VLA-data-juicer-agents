@@ -153,6 +153,42 @@ test("renders the canvas and inspector as one integrated studio workspace", () =
   expect(screen.getByText("Segment 01")).toBeVisible();
 });
 
+test("collapses the target inspector without removing the image workspace", () => {
+  render(
+    <InitialAnnotationWorkbench
+      job={job}
+      segment={segmentFixture()}
+      onSegmentUpdated={vi.fn()}
+      onJobRefresh={vi.fn(async () => undefined)}
+    />,
+  );
+
+  fireEvent.click(screen.getByRole("button", { name: "收起目标属性" }));
+  expect(screen.getByTestId("annotation-inspector-region")).toHaveAttribute("data-collapsed", "true");
+  expect(screen.getByRole("button", { name: "展开目标属性" })).toHaveAttribute("aria-expanded", "false");
+  expect(screen.getByRole("img", { name: /resize 后首帧/ })).toBeVisible();
+});
+
+test("uses a protected focus mode for box and foreground-point interactions", () => {
+  render(
+    <InitialAnnotationWorkbench
+      job={job}
+      segment={segmentFixture()}
+      onSegmentUpdated={vi.fn()}
+      onJobRefresh={vi.fn(async () => undefined)}
+    />,
+  );
+  loadFirstFrame();
+
+  fireEvent.click(screen.getByRole("button", { name: "框选目标" }));
+  expect(screen.getByText("专注框选：在画面中拖拽创建目标框")).toBeVisible();
+  expect(screen.getByRole("button", { name: "框选目标" })).toHaveAttribute("aria-pressed", "true");
+
+  fireEvent.keyDown(window, { key: "Escape" });
+  expect(screen.queryByText("专注框选：在画面中拖拽创建目标框")).not.toBeInTheDocument();
+  expect(screen.getByRole("button", { name: "选择/调整" })).toHaveAttribute("aria-pressed", "true");
+});
+
 test("draws an ordered master target with a contract-safe ref and clamps the foreground point", async () => {
   render(
     <InitialAnnotationWorkbench

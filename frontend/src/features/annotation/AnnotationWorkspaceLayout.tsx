@@ -1,51 +1,76 @@
-import { ClipboardCheck, Tags } from "lucide-react";
+import { useEffect, useState } from "react";
 import { Outlet, useLocation, useNavigate } from "react-router-dom";
+import { useStore } from "zustand";
 
-import {
-  Tabs,
-  TabsList,
-  TabsTrigger,
-} from "../../components/ui/tabs";
+import { ConsoleSlidingTabs } from "../../components/console/ConsoleSlidingTabs";
+import { annotationProjectionStore, loadAnnotationCapability } from "./projectionStore";
 
 type WorkspaceTab = "jobs" | "reviews";
 
 export function AnnotationWorkspaceLayout() {
   const location = useLocation();
   const navigate = useNavigate();
+  const capability = useStore(annotationProjectionStore, (state) => state.capability);
+  const capabilityLoaded = useStore(
+    annotationProjectionStore,
+    (state) => state.capabilityLoaded,
+  );
+  const [capabilityRequestFailed, setCapabilityRequestFailed] = useState(false);
   const active: WorkspaceTab = location.pathname.startsWith("/annotation/reviews")
     ? "reviews"
     : "jobs";
+  const annotationWorkbench = /^\/annotation\/jobs\/[^/]+\/segments\/[^/]+\/?$/.test(
+    location.pathname,
+  );
+
+  useEffect(() => {
+    let activeRequest = true;
+    void loadAnnotationCapability()
+      .then(() => {
+        if (activeRequest) setCapabilityRequestFailed(false);
+      })
+      .catch(() => {
+        if (activeRequest) setCapabilityRequestFailed(true);
+      });
+    return () => {
+      activeRequest = false;
+    };
+  }, []);
+
+  const capabilityState = !capabilityLoaded
+    ? { label: "正在检查处理环境", dot: "bg-[#9AA3B5]" }
+    : capabilityRequestFailed
+      ? { label: "处理环境状态未知", dot: "bg-[#9AA3B5]" }
+      : capability?.available
+        ? { label: "处理环境可用", dot: "bg-emerald-500" }
+        : { label: "处理环境不可用", dot: "bg-amber-500" };
 
   return (
     <>
-      <div className="border-b border-console-line bg-console-panel/90 px-3 md:px-4 lg:px-5">
-        <div className="mx-auto max-w-360">
-          <Tabs
+      {!annotationWorkbench ? <div className="relative z-0 isolate border-b border-console-line bg-white px-3 py-3 md:px-4 lg:px-5">
+        <div className="mx-auto flex max-w-360 flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
+          <ConsoleSlidingTabs
             aria-label="自动标注页面"
             value={active}
+            items={[
+              { value: "jobs", label: "标注任务" },
+              { value: "reviews", label: "人工复核" },
+            ]}
+            listClassName="sm:min-w-60"
             onValueChange={(value) => {
               navigate(value === "reviews" ? "/annotation/reviews" : "/annotation/jobs");
             }}
+          />
+          <div
+            className="inline-flex min-h-8 items-center gap-2 self-end text-xs font-medium text-[#626B7D] sm:self-auto"
+            role="status"
+            aria-live="polite"
           >
-            <TabsList variant="line" className="h-11 gap-4">
-              <TabsTrigger
-                value="jobs"
-                className="h-10 flex-none gap-2 rounded-none px-1 text-console-muted data-active:text-console-text"
-              >
-                <Tags aria-hidden="true" className="h-4 w-4" />
-                标注工作台
-              </TabsTrigger>
-              <TabsTrigger
-                value="reviews"
-                className="h-10 flex-none gap-2 rounded-none px-1 text-console-muted data-active:text-console-text"
-              >
-                <ClipboardCheck aria-hidden="true" className="h-4 w-4" />
-                人工复核
-              </TabsTrigger>
-            </TabsList>
-          </Tabs>
+            <span className={`size-2 rounded-full ${capabilityState.dot}`} aria-hidden="true" />
+            {capabilityState.label}
+          </div>
         </div>
-      </div>
+      </div> : null}
       <Outlet />
     </>
   );

@@ -10,7 +10,6 @@ import {
   Filter,
   Images,
   Layers3,
-  Route,
   Search,
   X,
   type LucideIcon,
@@ -27,6 +26,7 @@ import type {
 } from "../../../api/types";
 import { ConsoleButton } from "../../../components/console/ConsoleButton";
 import { ConsoleCard } from "../../../components/console/ConsoleCard";
+import { ConsoleSlidingTabs } from "../../../components/console/ConsoleSlidingTabs";
 import { StatusTag } from "../../../components/console/StatusTag";
 import { datapilotStore } from "../../../store/datapilotStore";
 import type { StatusTone } from "../consoleTypes";
@@ -61,9 +61,9 @@ type SceneFilter = "all" | "outdoor" | "indoor";
 type StatusFilter = "all" | NavigationDatasetStatus;
 
 const dataSurfaces = [
-  { id: "navigation", label: "导航数据", icon: Route },
-  { id: "robotic_arm", label: "机械臂数据", icon: Bot },
-] satisfies Array<{ id: DataSurface; label: string; icon: LucideIcon }>;
+  { value: "navigation", label: "导航数据" },
+  { value: "robotic_arm", label: "机械臂数据" },
+] satisfies Array<{ value: DataSurface; label: string }>;
 
 const sceneOptions = [
   { value: "all", label: "全部场景" },
@@ -496,36 +496,13 @@ function DataSurfaceSwitch({
   onChange: (surface: DataSurface) => void;
 }) {
   return (
-    <div
-      className="relative grid h-10 w-60 grid-cols-2 rounded-lg bg-console-panel2 p-1 ring-1 ring-inset ring-console-line"
-      role="tablist"
+    <ConsoleSlidingTabs
       aria-label="数据类型"
-    >
-      <span
-        aria-hidden="true"
-        className={`pointer-events-none absolute bottom-1 left-1 top-1 w-[calc(50%-0.25rem)] rounded-md border border-console-line/80 bg-console-panel shadow-xs transition-transform duration-200 ease-out ${
-          activeSurface === "robotic_arm" ? "translate-x-full" : "translate-x-0"
-        }`}
-      />
-      {dataSurfaces.map((surface) => {
-        const active = activeSurface === surface.id;
-
-        return (
-          <button
-            key={surface.id}
-            type="button"
-            role="tab"
-            aria-selected={active}
-            className={`relative z-10 inline-flex h-8 items-center justify-center rounded-md px-3 text-sm font-semibold transition focus:outline-hidden focus-visible:ring-2 focus-visible:ring-slate-300 ${
-              active ? "text-console-text" : "text-console-muted hover:text-console-text"
-            }`}
-            onClick={() => onChange(surface.id)}
-          >
-            {surface.label}
-          </button>
-        );
-      })}
-    </div>
+      value={activeSurface}
+      items={dataSurfaces}
+      listClassName="sm:min-w-60"
+      onValueChange={onChange}
+    />
   );
 }
 
