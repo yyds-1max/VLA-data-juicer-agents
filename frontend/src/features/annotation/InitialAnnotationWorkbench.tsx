@@ -682,7 +682,8 @@ export function InitialAnnotationWorkbench({
   return (
     <section
       data-testid="annotation-workbench"
-      className="relative flex min-h-168 min-w-0 flex-1 overflow-hidden bg-[#edf0f5] lg:min-h-152 xl:h-full xl:min-h-0"
+      data-inspector-state={inspectorCollapsed ? "closed" : "open"}
+      className="annotation-workbench relative isolate flex min-h-168 min-w-0 flex-1 overflow-hidden bg-[#edf0f5] lg:min-h-152 xl:h-full xl:min-h-0"
     >
       <div
         data-testid="annotation-canvas-region"
@@ -739,9 +740,10 @@ export function InitialAnnotationWorkbench({
         </div>
 
         <div
+          data-testid="annotation-zoom-controls"
+          data-inspector-avoidance={inspectorCollapsed ? "collapsed-rail" : "panel-width"}
           className={cn(
-            "absolute right-3 top-3 z-40 flex items-center gap-1 rounded-xl border border-[#dfe4ed] bg-white/94 p-1.5 shadow-[0_8px_24px_rgba(27,39,68,0.12)] backdrop-blur-md transition-[right,opacity,transform] duration-180 ease-out motion-reduce:transition-none sm:right-4 sm:top-4",
-            !inspectorCollapsed && "lg:right-[23.5rem]",
+            "annotation-zoom-controls absolute top-4 z-40 flex items-center gap-1 rounded-xl border border-[#dfe4ed] bg-white/94 p-1 shadow-[0_8px_24px_rgba(27,39,68,0.12)] backdrop-blur-md transition-[right,opacity,transform] duration-150 ease-out motion-reduce:transition-none",
             focusMode && "pointer-events-none translate-y-1 opacity-20",
           )}
           aria-hidden={focusMode ? "true" : undefined}
@@ -773,10 +775,8 @@ export function InitialAnnotationWorkbench({
 
         <div
           data-annotation-canvas-scroll
-          className={cn(
-            "console-soft-scrollbar flex min-h-0 flex-1 items-center overflow-auto bg-[#e8ecf2] pb-20 pt-18 transition-[padding] duration-200 ease-out motion-reduce:transition-none sm:px-3 sm:pb-24 sm:pt-3",
-            !inspectorCollapsed && "sm:pr-[23rem]",
-          )}
+          data-inspector-reserves-space="false"
+          className="console-soft-scrollbar flex min-h-0 flex-1 items-center overflow-auto bg-[#e8ecf2]"
         >
           <div
             className="relative mx-auto shrink-0 overflow-hidden bg-slate-950 shadow-[0_18px_50px_rgba(15,23,42,0.22)]"
@@ -979,8 +979,7 @@ export function InitialAnnotationWorkbench({
         {onNavigateSegment ? (
           <div
             className={cn(
-              "absolute inset-x-0 bottom-3 z-40 flex justify-center px-3 transition-[opacity,transform,padding] duration-180 motion-reduce:transition-none sm:bottom-4",
-              !inspectorCollapsed && "sm:pr-[22.5rem]",
+              "absolute inset-x-0 bottom-3 z-40 flex justify-center px-3 transition-[opacity,transform] duration-180 motion-reduce:transition-none sm:bottom-4",
               focusMode && "pointer-events-none translate-y-2 opacity-20",
             )}
             aria-hidden={focusMode ? "true" : undefined}
@@ -998,10 +997,10 @@ export function InitialAnnotationWorkbench({
 
       <aside
         data-testid="annotation-inspector-region"
+        data-layout="overlay"
         data-collapsed={inspectorCollapsed ? "true" : "false"}
         className={cn(
-          "absolute inset-x-3 bottom-3 z-40 flex max-h-[70%] min-h-0 flex-col overflow-hidden rounded-2xl border border-[#dfe4ed] bg-white/96 shadow-[0_18px_50px_rgba(25,36,62,0.18)] backdrop-blur-md transition-[width,transform,opacity] duration-200 ease-out motion-reduce:transition-none sm:inset-x-auto sm:bottom-4 sm:right-4 sm:top-4 sm:max-h-none sm:w-88",
-          inspectorCollapsed && "inset-x-auto left-auto right-3 top-auto h-12 w-12 sm:right-4 sm:top-4 sm:h-12 sm:w-12",
+          "annotation-inspector-panel absolute z-50 flex min-h-0 flex-col overflow-hidden rounded-[14px] border border-[#dfe4ed] bg-white/96 shadow-[0_14px_36px_rgba(25,36,62,0.14)] backdrop-blur-md transition-[width,max-height,opacity,transform] duration-150 ease-out motion-reduce:transition-none",
           focusMode && "pointer-events-none translate-x-3 opacity-20",
         )}
         aria-label="目标属性检查器"
@@ -1009,13 +1008,15 @@ export function InitialAnnotationWorkbench({
       >
         <span className="sr-only">Segment {String(segment.ordinal).padStart(2, "0")}</span>
         <div className={cn(
-          "flex min-h-14 shrink-0 items-center justify-between gap-3 border-b border-console-line px-4 py-2",
-          inspectorCollapsed && "min-h-12 justify-center border-b-0 p-0",
+          "flex min-h-13 shrink-0 items-center justify-between gap-2 border-b border-console-line px-3.5 py-2.5",
+          inspectorCollapsed && "justify-center border-b-0 px-2.5 max-[900px]:justify-between max-[900px]:border-b max-[900px]:px-3.5",
         )}>
           <div className="flex items-center justify-between gap-3">
-            <div className={cn(inspectorCollapsed && "hidden")}>
+            <div className={cn(inspectorCollapsed && "min-[901px]:hidden")}>
               <h2 className="text-sm font-semibold text-console-text">目标属性</h2>
-              <p className="mt-0.5 text-[11px] text-console-muted">顺序决定 master / otherN</p>
+              {!inspectorCollapsed ? (
+                <p className="mt-0.5 text-[11px] text-console-muted">顺序决定 master / otherN</p>
+              ) : null}
             </div>
           </div>
           <div className="flex items-center gap-2">
@@ -1063,8 +1064,8 @@ export function InitialAnnotationWorkbench({
               <div
                 key={target.target_ref}
                 className={cn(
-                  "border bg-console-panel",
-                  isSelected ? "border-console-cyan shadow-[inset_3px_0_0_#2d6cdf]" : "border-console-line",
+                  "overflow-hidden rounded-xl border bg-console-panel transition-[border-color,box-shadow] duration-150 motion-reduce:transition-none",
+                  isSelected ? "border-[#2d6cdf] shadow-[0_0_0_1px_rgba(45,108,223,0.12)]" : "border-console-line",
                 )}
               >
                 <button
@@ -1096,7 +1097,7 @@ export function InitialAnnotationWorkbench({
                             value={target.bbox?.[fieldIndex] ?? ""}
                             disabled={!canEdit || !target.bbox}
                             min={0}
-                            className="h-8 w-full rounded-sm border border-console-line bg-white px-2 text-xs text-console-text focus:border-console-cyan focus:outline-hidden"
+                            className="h-8 w-full rounded-lg border border-console-line bg-white px-2 text-xs text-console-text focus-visible:border-console-cyan focus-visible:outline-2 focus-visible:outline-offset-1 focus-visible:outline-[#3156c8]"
                             onChange={(event) => {
                               if (!target.bbox || !firstFrame) return;
                               const next = [...target.bbox] as [number, number, number, number];
@@ -1127,7 +1128,7 @@ export function InitialAnnotationWorkbench({
                             value={target.point?.[pointIndex] ?? ""}
                             disabled={!canEdit}
                             min={0}
-                            className="h-8 w-full rounded-sm border border-console-line bg-white px-2 text-xs text-console-text focus:border-console-cyan focus:outline-hidden"
+                            className="h-8 w-full rounded-lg border border-console-line bg-white px-2 text-xs text-console-text focus-visible:border-console-cyan focus-visible:outline-2 focus-visible:outline-offset-1 focus-visible:outline-[#3156c8]"
                             onChange={(event) => {
                               if (!firstFrame) return;
                               const next: [number, number] = target.point ? [...target.point] : [0, 0];
@@ -1160,7 +1161,7 @@ export function InitialAnnotationWorkbench({
                               aria-label={`${index === 0 ? "master" : `other${index}`} ${label}`}
                               value={target.colors[field] ?? ""}
                               disabled={!canEdit}
-                              className="h-9 w-full rounded-sm border border-console-line bg-white px-2 text-sm text-console-text focus:border-console-cyan focus:outline-hidden"
+                              className="h-9 w-full rounded-lg border border-console-line bg-white px-2 text-sm text-console-text focus-visible:border-console-cyan focus-visible:outline-2 focus-visible:outline-offset-1 focus-visible:outline-[#3156c8]"
                               onChange={(event) => updateTarget(target.target_ref, (current) => ({
                                 ...current,
                                 colors: {

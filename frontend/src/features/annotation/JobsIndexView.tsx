@@ -63,12 +63,17 @@ type DisplaySelection = {
 type TransitionPhase = "idle" | "out" | "enter";
 
 function requestFrame(callback: FrameRequestCallback): number {
-  if (window.requestAnimationFrame) return window.requestAnimationFrame(callback);
+  if (typeof window.requestAnimationFrame === "function") {
+    return window.requestAnimationFrame(callback);
+  }
   return window.setTimeout(() => callback(performance.now()), 16);
 }
 
 function cancelFrame(handle: number): void {
-  if (window.cancelAnimationFrame) {
+  if (
+    typeof window.requestAnimationFrame === "function" &&
+    typeof window.cancelAnimationFrame === "function"
+  ) {
     window.cancelAnimationFrame(handle);
     return;
   }
@@ -333,6 +338,7 @@ export function JobsIndexView({
     page: 1,
     pageSize: 10,
   });
+  const displaySelectionRef = React.useRef<DisplaySelection>(displaySelection);
   const [transitionPhase, setTransitionPhase] = React.useState<TransitionPhase>("idle");
   const filterTabsRef = React.useRef<HTMLDivElement>(null);
 
@@ -352,47 +358,61 @@ export function JobsIndexView({
     [filter, jobs],
   );
   const pageCount = Math.max(1, Math.ceil(selectedJobs.length / pageSize));
+  const currentPage = Math.min(page, pageCount);
 
   React.useEffect(() => {
-    if (page > pageCount) setPage(pageCount);
-  }, [page, pageCount]);
+    if (page !== currentPage) setPage(currentPage);
+  }, [currentPage, page]);
 
   React.useEffect(() => {
-    const nextSelection = { filter, page, pageSize };
+    const nextSelection = { filter, page: currentPage, pageSize };
+    const currentSelection = displaySelectionRef.current;
     if (
-      displaySelection.filter === nextSelection.filter &&
-      displaySelection.page === nextSelection.page &&
-      displaySelection.pageSize === nextSelection.pageSize
+      currentSelection.filter === nextSelection.filter &&
+      currentSelection.page === nextSelection.page &&
+      currentSelection.pageSize === nextSelection.pageSize
     ) {
+      setTransitionPhase("idle");
       return undefined;
     }
     if (reducedMotion) {
+      displaySelectionRef.current = nextSelection;
       setDisplaySelection(nextSelection);
       setTransitionPhase("idle");
       return undefined;
     }
 
     setTransitionPhase("out");
-    let animationFrame = 0;
+    let enterFrame = 0;
+    let settleFrame = 0;
     const switchTimer = window.setTimeout(() => {
+      displaySelectionRef.current = nextSelection;
       setDisplaySelection(nextSelection);
       setTransitionPhase("enter");
-      animationFrame = requestFrame(() => {
-        setTransitionPhase("idle");
+      enterFrame = requestFrame(() => {
+        settleFrame = requestFrame(() => {
+          setTransitionPhase("idle");
+        });
       });
     }, 100);
 
     return () => {
       window.clearTimeout(switchTimer);
-      cancelFrame(animationFrame);
+      if (enterFrame) cancelFrame(enterFrame);
+      if (settleFrame) cancelFrame(settleFrame);
     };
-  }, [displaySelection, filter, page, pageSize, reducedMotion]);
+  }, [currentPage, filter, pageSize, reducedMotion]);
 
   const displayedJobs = React.useMemo(
     () => annotationJobsForFilter(jobs, displaySelection.filter),
     [displaySelection.filter, jobs],
   );
-  const firstDisplayedIndex = (displaySelection.page - 1) * displaySelection.pageSize;
+  const displayedPageCount = Math.max(
+    1,
+    Math.ceil(displayedJobs.length / displaySelection.pageSize),
+  );
+  const safeDisplayedPage = Math.min(displaySelection.page, displayedPageCount);
+  const firstDisplayedIndex = (safeDisplayedPage - 1) * displaySelection.pageSize;
   const displayedPageJobs = displayedJobs.slice(
     firstDisplayedIndex,
     firstDisplayedIndex + displaySelection.pageSize,
@@ -602,13 +622,9 @@ export function JobsIndexView({
             id="annotation-jobs-panel"
             role="tabpanel"
             aria-labelledby={`annotation-job-filter-${filter}`}
+            aria-busy={transitionPhase !== "idle" || undefined}
             tabIndex={0}
-            className={cn(
-              "min-h-[22rem] transition-[opacity,transform] duration-100 ease-out motion-reduce:transition-none",
-              transitionPhase === "out" && "translate-y-1 opacity-0",
-              transitionPhase === "enter" && "-translate-y-1 opacity-0",
-              transitionPhase === "idle" && "translate-y-0 opacity-100",
-            )}
+            className="min-h-[22rem]"
           >
             <Table
               containerAriaLabel="标注任务列表"
@@ -626,7 +642,7 @@ export function JobsIndexView({
                   <TableHead className="w-[6%] pr-5 text-right text-xs text-slate-500">详情</TableHead>
                 </TableRow>
               </TableHeader>
-              <TableBody>
+              <TableBody aria-hidden={transitionPhase !== "idle" || undefined}>
                 {displayedPageJobs.length > 0 ? (
                   displayedPageJobs.map((job, index) => {
                     const progress = annotationJobTableProgress(job);
@@ -635,9 +651,9 @@ export function JobsIndexView({
                         key={job.job_ref}
                         className={cn(
                           "h-[68px] border-slate-100 transition-[opacity,transform,background-color] duration-150 ease-out hover:bg-blue-50/35 motion-reduce:transition-none",
-                          transitionPhase === "enter"
-                            ? "translate-y-1 opacity-0"
-                            : "translate-y-0 opacity-100",
+                          transitionPhase === "out" && "translate-y-1 opacity-0",
+                          transitionPhase === "enter" && "-translate-y-1 opacity-0",
+                          transitionPhase === "idle" && "translate-y-0 opacity-100",
                         )}
                         style={
                           reducedMotion
@@ -748,21 +764,21 @@ export function JobsIndexView({
                 variant="outline"
                 size="icon-sm"
                 aria-label="上一页"
-                disabled={page <= 1 || transitionPhase !== "idle"}
+                disabled={currentPage <= 1 || transitionPhase !== "idle"}
                 onClick={() => setPage((current) => Math.max(1, current - 1))}
                 className="bg-white active:translate-y-px"
               >
                 <ArrowLeft aria-hidden="true" />
               </Button>
               <span className="min-w-20 text-center tabular-nums text-slate-600">
-                第 {page} / {pageCount} 页
+                第 {currentPage} / {pageCount} 页
               </span>
               <Button
                 type="button"
                 variant="outline"
                 size="icon-sm"
                 aria-label="下一页"
-                disabled={page >= pageCount || transitionPhase !== "idle"}
+                disabled={currentPage >= pageCount || transitionPhase !== "idle"}
                 onClick={() => setPage((current) => Math.min(pageCount, current + 1))}
                 className="bg-white active:translate-y-px"
               >

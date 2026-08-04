@@ -326,6 +326,12 @@ test("restores a job detail directly from its URL", async () => {
   expect(await screen.findByRole("heading", { name: "20270605" })).toBeVisible();
   expect(screen.getByText("20260605_160904")).toBeVisible();
   expect(screen.getByText("20260529_go2w")).toBeVisible();
+  expect(screen.getByTestId("annotation-job-detail-page")).toHaveClass(
+    "w-full",
+    "max-w-[1900px]",
+    "lg:px-6",
+    "2xl:px-8",
+  );
   expect(apiMocks.getAnnotationJob).toHaveBeenCalledWith(job.job_ref);
 });
 

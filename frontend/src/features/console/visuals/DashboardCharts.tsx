@@ -16,7 +16,9 @@ import {
   ChartTooltipContent,
   type ChartConfig,
 } from "../../../components/ui/chart";
+import { Skeleton } from "../../../components/ui/skeleton";
 import { cn } from "../../../lib/utils";
+import { animateInteger } from "../dashboardAnimation";
 
 export type ModelEpochDatum = {
   epoch: number;
@@ -29,6 +31,9 @@ export type DistributionDatum = {
   value: number;
   color: string;
 };
+
+const distributionLayoutClass =
+  "grid min-h-40 min-w-0 grid-cols-[8rem_minmax(0,1fr)] items-center gap-2";
 
 const modelChartConfig = {
   successRate: { label: "成功率", color: "#3156C8" },
@@ -146,20 +151,47 @@ export function ModelMetricsChart({ data, className }: { data: ModelEpochDatum[]
   );
 }
 
-export function DataDistributionChart({ data, className }: { data: DistributionDatum[]; className?: string }) {
+export function DataDistributionChart({
+  data,
+  animationProgress = 1,
+  className,
+}: {
+  data: DistributionDatum[];
+  animationProgress?: number;
+  className?: string;
+}) {
   const visibleData = data.filter((item) => Number.isFinite(item.value) && item.value > 0);
   const total = visibleData.reduce((sum, item) => sum + item.value, 0);
+  const normalizedProgress = Number.isFinite(animationProgress)
+    ? Math.min(1, Math.max(0, animationProgress))
+    : 1;
+  const animatedTotal = animateInteger(total, normalizedProgress);
+  const totalLabel = animatedTotal.toLocaleString("zh-CN");
+  const totalTextSize = totalLabel.length >= 11
+    ? "text-xs"
+    : totalLabel.length >= 8
+      ? "text-sm"
+      : totalLabel.length >= 6
+        ? "text-base"
+        : "text-lg";
   const config = Object.fromEntries(
     data.map((item, index) => [`segment${index + 1}`, { label: item.label, color: item.color }]),
   ) satisfies ChartConfig;
 
   return (
-    <div className={cn("grid min-w-0 grid-cols-[7rem_minmax(0,1fr)] items-center gap-3", className)}>
-      <div className="relative mx-auto h-28 w-28">
+    <div
+      data-slot="distribution-panel-body"
+      className={cn(distributionLayoutClass, className)}
+    >
+      <div
+        data-slot="distribution-donut-shell"
+        data-animation-progress={normalizedProgress.toFixed(3)}
+        className="relative mx-auto size-32"
+      >
         {total > 0 ? (
           <ChartContainer
             config={config}
-            className="h-28 w-28 aspect-square"
+            className="size-32 aspect-square"
             role="img"
             aria-label={`数据类型分布，总计 ${total.toLocaleString("zh-CN")}`}
           >
@@ -177,8 +209,10 @@ export function DataDistributionChart({ data, className }: { data: DistributionD
                 data={visibleData}
                 dataKey="value"
                 nameKey="label"
-                innerRadius={31}
-                outerRadius={46}
+                startAngle={90}
+                endAngle={90 - 360 * normalizedProgress}
+                innerRadius={40}
+                outerRadius={56}
                 paddingAngle={2}
                 cornerRadius={3}
                 stroke="#FFFFFF"
@@ -193,24 +227,34 @@ export function DataDistributionChart({ data, className }: { data: DistributionD
           </ChartContainer>
         ) : (
           <div
-            className="h-28 w-28 rounded-full border-[19px] border-[#EEF1F8]"
+            className="absolute inset-2 rounded-full border-16 border-[#EEF1F8]"
             role="img"
             aria-label="数据类型分布，总计 0，暂无同步帧数据"
           />
         )}
         <div className="pointer-events-none absolute inset-0 flex flex-col items-center justify-center" aria-hidden="true">
-          <span className="max-w-24 truncate text-xl font-semibold tabular-nums text-[#202431]">
-            {total.toLocaleString("zh-CN")}
+          <span
+            data-testid="distribution-total"
+            className={cn(
+              "max-w-[5.25rem] whitespace-nowrap font-semibold leading-none tabular-nums text-[#202431]",
+              totalTextSize,
+            )}
+          >
+            {totalLabel}
           </span>
           <span className="mt-0.5 text-[11px] text-[#626B7D]">总数</span>
         </div>
       </div>
 
-      <div className="min-w-0 space-y-2" aria-label="数据类型图例">
+      <div className="min-w-0" aria-label="数据类型图例">
         {data.length > 0 ? (
-          data.map((item) => (
-            <div key={item.label} className="flex min-w-0 items-center justify-between gap-2 text-xs">
-              <span className="flex min-w-0 items-center gap-2 text-[#697186]">
+          <dl
+            data-slot="distribution-legend"
+            className="grid min-w-0 grid-cols-[minmax(0,max-content)_auto] justify-start gap-x-4 gap-y-2 text-xs"
+          >
+            {data.map((item) => (
+              <div key={item.label} className="contents">
+                <dt className="flex min-w-0 items-center gap-1.5 text-[#697186]">
                 <span
                   className="size-2.5 shrink-0 rounded-full"
                   data-testid="distribution-color"
@@ -218,13 +262,56 @@ export function DataDistributionChart({ data, className }: { data: DistributionD
                   aria-hidden="true"
                 />
                 <span className="truncate" title={item.label}>{item.label}</span>
-              </span>
-              <span className="shrink-0 font-semibold tabular-nums text-[#202431]">{Math.max(0, item.value).toLocaleString("zh-CN")}</span>
-            </div>
-          ))
+                </dt>
+                <dd className="shrink-0 font-semibold tabular-nums text-[#202431]">
+                  {animateInteger(Math.max(0, item.value), normalizedProgress).toLocaleString("zh-CN")}
+                </dd>
+              </div>
+            ))}
+          </dl>
         ) : (
           <p className="text-sm text-[#626B7D]" role="status">暂无同步帧数据</p>
         )}
+      </div>
+    </div>
+  );
+}
+
+export function DataDistributionSkeleton({ className }: { className?: string }) {
+  return (
+    <div
+      data-slot="distribution-panel-body"
+      className={cn(distributionLayoutClass, className)}
+      role="status"
+      aria-label="数据类型分布加载中"
+    >
+      <div
+        data-slot="distribution-donut-skeleton"
+        className="relative mx-auto size-32"
+        aria-hidden="true"
+      >
+        <Skeleton className="absolute inset-2 rounded-full bg-[#EEF0F5] motion-reduce:animate-none" />
+        <span className="absolute inset-6 rounded-full bg-white" />
+        <div className="absolute inset-0 flex flex-col items-center justify-center gap-1.5">
+          <Skeleton className="h-4 w-14 rounded bg-[#EEF0F5] motion-reduce:animate-none" />
+          <Skeleton className="h-2.5 w-8 rounded bg-[#F2F3F7] motion-reduce:animate-none" />
+        </div>
+      </div>
+
+      <div
+        data-slot="distribution-legend-skeleton"
+        className="grid min-w-0 grid-cols-[minmax(0,1fr)_2rem] items-center gap-x-4 gap-y-2"
+        aria-hidden="true"
+      >
+        {Array.from({ length: 4 }, (_, index) => (
+          <div key={index} data-testid="distribution-skeleton-row" className="contents">
+            <div className="flex min-w-0 items-center gap-1.5">
+              <Skeleton className="size-2.5 shrink-0 rounded-full bg-[#EEF0F5] motion-reduce:animate-none" />
+              <Skeleton className="h-3 w-full max-w-18 rounded bg-[#F2F3F7] motion-reduce:animate-none" />
+            </div>
+            <Skeleton className="h-3 w-8 rounded bg-[#EEF0F5] motion-reduce:animate-none" />
+          </div>
+        ))}
       </div>
     </div>
   );

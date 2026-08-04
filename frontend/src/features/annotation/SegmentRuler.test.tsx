@@ -83,3 +83,23 @@ test("disables navigation while the workbench is in a protected interaction", ()
   fireEvent.keyDown(window, { key: "Enter" });
   expect(onNavigate).not.toHaveBeenCalled();
 });
+
+test("uses the reference ruler window and fades overflowing queue edges", () => {
+  const longQueue = Array.from({ length: 24 }, (_, index) => (
+    segment(index + 1, index < 8 ? "submitted" : "pending_initial_annotation")
+  ));
+  const { container } = render(
+    <SegmentRuler
+      segments={longQueue}
+      currentSegmentRef={longQueue[12].segment_ref}
+      onNavigate={vi.fn()}
+    />,
+  );
+
+  const ticks = Array.from(container.querySelectorAll<HTMLButtonElement>("button[aria-label^='Segment ']"));
+  expect(ticks).toHaveLength(21);
+  expect(ticks[0]).toHaveStyle({ opacity: "0.12" });
+  expect(ticks.at(-1)).toHaveStyle({ opacity: "0.12" });
+  expect(screen.getByRole("button", { name: "Segment 13，待标注" }))
+    .toHaveAttribute("aria-current", "step");
+});

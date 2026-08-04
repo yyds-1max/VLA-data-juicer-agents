@@ -1,7 +1,11 @@
 import "@testing-library/jest-dom/vitest";
 import { render, screen } from "@testing-library/react";
 
-import { DataDistributionChart, ModelMetricsChart } from "./DashboardCharts";
+import {
+  DataDistributionChart,
+  DataDistributionSkeleton,
+  ModelMetricsChart,
+} from "./DashboardCharts";
 
 const distribution = [
   { label: "同步图像帧", value: 42, color: "#274BC8" },
@@ -15,6 +19,9 @@ describe("dashboard charts", () => {
     render(<DataDistributionChart data={distribution} />);
 
     expect(screen.getByRole("img", { name: "数据类型分布，总计 100" })).toBeVisible();
+    expect(document.querySelector('[data-slot="distribution-donut-shell"]')).toHaveClass("size-32");
+    expect(document.querySelector('[data-slot="distribution-panel-body"]')).toHaveClass("min-h-40");
+    expect(document.querySelector('[data-slot="distribution-legend"]')).toHaveClass("gap-x-4");
     expect(screen.getByText("同步图像帧")).toBeVisible();
     expect(screen.getByText("42")).toBeVisible();
 
@@ -25,6 +32,44 @@ describe("dashboard charts", () => {
       "rgb(124, 143, 227)",
       "rgb(167, 179, 237)",
     ]);
+  });
+
+  test("renders an equal-size reduced-motion-safe distribution loading skeleton", () => {
+    render(<DataDistributionSkeleton />);
+
+    const loading = screen.getByRole("status", { name: "数据类型分布加载中" });
+    expect(loading).toHaveClass("min-h-40");
+    expect(document.querySelector('[data-slot="distribution-donut-skeleton"]')).toHaveClass("size-32");
+    expect(screen.getAllByTestId("distribution-skeleton-row")).toHaveLength(4);
+    for (const skeleton of loading.querySelectorAll('[data-slot="skeleton"]')) {
+      expect(skeleton).toHaveClass("motion-reduce:animate-none");
+    }
+  });
+
+  test("keeps a large total readable inside the enlarged donut", () => {
+    render(
+      <DataDistributionChart
+        data={distribution.map((item, index) => ({
+          ...item,
+          value: index === 0 ? 1_234_567 : 0,
+        }))}
+      />,
+    );
+
+    expect(screen.getByRole("img", { name: "数据类型分布，总计 1,234,567" })).toBeVisible();
+    expect(screen.getByTestId("distribution-total")).toHaveTextContent("1,234,567");
+    expect(screen.getByTestId("distribution-total")).toHaveClass("text-sm");
+  });
+
+  test("counts values up while the donut sweeps into view", () => {
+    render(<DataDistributionChart data={distribution} animationProgress={0.5} />);
+
+    expect(screen.getByTestId("distribution-total")).toHaveTextContent("50");
+    expect(screen.getByText("21")).toBeVisible();
+    expect(document.querySelector('[data-slot="distribution-donut-shell"]')).toHaveAttribute(
+      "data-animation-progress",
+      "0.500",
+    );
   });
 
   test("keeps an informative stable donut state when every distribution value is zero", () => {

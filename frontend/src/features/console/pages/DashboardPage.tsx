@@ -20,7 +20,6 @@ import { Button } from "../../../components/ui/button";
 import { Card, CardContent, CardHeader, CardTitle } from "../../../components/ui/card";
 import { Progress } from "../../../components/ui/progress";
 import { Separator } from "../../../components/ui/separator";
-import { Skeleton } from "../../../components/ui/skeleton";
 import {
   Table,
   TableBody,
@@ -44,6 +43,7 @@ import {
 import { DataFlowTimeline } from "../visuals/DataFlowTimeline";
 import {
   DataDistributionChart,
+  DataDistributionSkeleton,
   ModelMetricsChart,
   type DistributionDatum,
 } from "../visuals/DashboardCharts";
@@ -82,11 +82,13 @@ function DistributionPanel({
   summary,
   loading,
   error,
+  animationProgress,
   onRetry,
 }: {
   summary: NavigationDatasetSummary | null;
   loading: boolean;
   error: string | null;
+  animationProgress: number;
   onRetry: () => void;
 }) {
   const distribution = useMemo(() => distributionFromSummary(summary), [summary]);
@@ -96,16 +98,13 @@ function DistributionPanel({
       <DashboardPanelHeader title="数据类型分布" description="当前同步数据的模态构成" />
       <CardContent className="p-5 pt-4">
         {loading ? (
-          <div className="grid min-h-[17rem] place-items-center" role="status" aria-label="数据类型分布加载中">
-            <div className="flex flex-col items-center gap-4 sm:flex-row xl:flex-col">
-              <Skeleton className="size-40 rounded-full bg-[#EEF0F5]" />
-              <div className="w-40 space-y-3">
-                {Array.from({ length: 4 }, (_, index) => <Skeleton key={index} className="h-4 w-full rounded bg-[#F1F2F6]" />)}
-              </div>
-            </div>
-          </div>
+          <DataDistributionSkeleton />
         ) : error ? (
-          <div className="flex min-h-[17rem] flex-col items-center justify-center px-4 text-center" role="alert">
+          <div
+            data-slot="distribution-panel-body"
+            className="flex min-h-40 flex-col items-center justify-center px-4 text-center"
+            role="alert"
+          >
             <CircleAlert className="size-8 text-[#B93755]" aria-hidden="true" />
             <p className="mt-3 text-sm font-medium text-[#30374A]">数据分布加载失败</p>
             <p className="mt-1 max-w-56 truncate text-xs text-[#626B7D]" title={error}>无法读取同步帧汇总</p>
@@ -120,7 +119,10 @@ function DistributionPanel({
             </Button>
           </div>
         ) : (
-          <DataDistributionChart data={distribution} />
+          <DataDistributionChart
+            data={distribution}
+            animationProgress={animationProgress}
+          />
         )}
       </CardContent>
     </Card>
@@ -205,6 +207,7 @@ export function DashboardPage() {
               summary={datasetSummary}
               loading={summaryLoading}
               error={summaryError}
+              animationProgress={animationProgress}
               onRetry={() => { void reload(); }}
             />
           </div>

@@ -1,7 +1,8 @@
-import { useId, useMemo, useState } from "react";
+import { Collapsible } from "radix-ui";
+import { ChevronDown, ChevronRight, Layers3 } from "lucide-react";
+import { useEffect, useId, useMemo, useRef, useState } from "react";
 
 import { StatusTag } from "../../components/console/StatusTag";
-import { Input } from "../../components/ui/input";
 import { cn } from "../../lib/utils";
 import type {
   AnnotationJobDetail,
@@ -26,6 +27,30 @@ const segmentStatusMeta: Record<
   postprocessing_failed: { label: "后处理失败", tone: "danger" },
 };
 
+const segmentStatusDot: Record<AnnotationSegmentStatus, string> = {
+  pending_initial_annotation: "bg-[#E59A18]",
+  draft: "bg-[#E59A18]",
+  submitted: "bg-[#2FA66A]",
+  skipped: "bg-[#7B8496]",
+  tracking: "bg-[#3156C8]",
+  tracked: "bg-[#536FD7]",
+  postprocessing: "bg-[#3156C8]",
+  annotated: "bg-[#2FA66A]",
+  postprocessing_failed: "bg-[#D84A5B]",
+};
+
+const breakdownOrder: AnnotationSegmentStatus[] = [
+  "submitted",
+  "draft",
+  "pending_initial_annotation",
+  "skipped",
+  "tracking",
+  "tracked",
+  "postprocessing",
+  "annotated",
+  "postprocessing_failed",
+];
+
 function resolvedSegmentCount(job: Pick<AnnotationJobDetail, "counts">) {
   return job.counts.submitted
     + job.counts.skipped
@@ -38,6 +63,23 @@ function resolvedSegmentCount(job: Pick<AnnotationJobDetail, "counts">) {
 function displayOrdinal(ordinal: number): string {
   if (!Number.isSafeInteger(ordinal) || ordinal < 0) return "—";
   return String(ordinal).padStart(2, "0");
+}
+
+function clipStatusSummary(segments: AnnotationJobDetail["segments"]) {
+  const failed = segments.filter((segment) => segment.status === "postprocessing_failed").length;
+  const waiting = segments.filter((segment) => (
+    segment.status === "pending_initial_annotation" || segment.status === "draft"
+  )).length;
+  const processing = segments.filter((segment) => (
+    segment.status === "tracking" || segment.status === "postprocessing"
+  )).length;
+  const allAnnotated = segments.length > 0 && segments.every((segment) => segment.status === "annotated");
+
+  if (failed > 0) return `${failed} 个异常`;
+  if (waiting > 0) return `${waiting} 个待标注`;
+  if (processing > 0) return `${processing} 个处理中`;
+  if (allAnnotated) return "全部已标注";
+  return "全部已处理";
 }
 
 export interface SegmentQueuePanelProps {
@@ -54,10 +96,6 @@ export function SegmentQueuePanel({
   onNavigate,
 }: SegmentQueuePanelProps) {
   const headingId = useId();
-  const jumpInputId = useId();
-  const jumpErrorId = useId();
-  const [jumpValue, setJumpValue] = useState("");
-  const [jumpError, setJumpError] = useState("");
   const grouped = useMemo(() => {
     const result = new Map<string, typeof job.segments>();
     job.segments.forEach((segment) => {
@@ -73,45 +111,44 @@ export function SegmentQueuePanel({
       )),
     ] as const);
   }, [job.segments]);
-  const ordinalRange = useMemo(() => {
-    const ordinals = job.segments
-      .map((segment) => segment.ordinal)
-      .filter((ordinal) => Number.isSafeInteger(ordinal) && ordinal >= 0);
-
-    return ordinals.length > 0
-      ? { min: Math.min(...ordinals), max: Math.max(...ordinals) }
-      : undefined;
-  }, [job.segments]);
+  const currentSourceClip = useMemo(() => job.segments.find(
+    (segment) => segment.segment_ref === currentSegmentRef,
+  )?.source_clip, [currentSegmentRef, job.segments]);
+  const [openClips, setOpenClips] = useState<Set<string>>(() => {
+    const preferred = currentSourceClip ?? grouped[0]?.[0];
+    return preferred ? new Set([preferred]) : new Set();
+  });
+  const clipKey = grouped.map(([sourceClip]) => sourceClip).join("\u0000");
+  const previousClipKey = useRef(clipKey);
+  const previousCurrentSourceClip = useRef(currentSourceClip);
   const resolved = resolvedSegmentCount(job);
+  const breakdown = useMemo(() => breakdownOrder.map((status) => ({
+    status,
+    count: job.segments.filter((segment) => segment.status === status).length,
+  })).filter((item) => item.count > 0), [job.segments]);
 
-  const submitJump = () => {
-    const normalized = jumpValue.trim();
-    if (normalized.length === 0) {
-      setJumpError("请输入 Segment 序号。");
-      return;
-    }
-    if (!/^\d+$/.test(normalized)) {
-      setJumpError("请输入有效的整数序号。");
-      return;
-    }
-
-    const ordinal = Number(normalized);
-    if (!Number.isSafeInteger(ordinal)) {
-      setJumpError("请输入有效的整数序号。");
-      return;
-    }
-
-    const target = job.segments.find((segment) => segment.ordinal === ordinal);
-    if (!target) {
-      setJumpError("未找到该序号对应的 Segment。");
-      return;
-    }
-
-    setJumpError("");
-    if (target.segment_ref !== currentSegmentRef) {
-      void onNavigate(target.segment_ref);
-    }
-  };
+  useEffect(() => {
+    const availableClips = new Set(grouped.map(([sourceClip]) => sourceClip));
+    const preferred = currentSourceClip ?? grouped[0]?.[0];
+    const groupsChanged = previousClipKey.current !== clipKey;
+    const currentChanged = previousCurrentSourceClip.current !== currentSourceClip;
+    previousClipKey.current = clipKey;
+    previousCurrentSourceClip.current = currentSourceClip;
+    setOpenClips((current) => {
+      const next = new Set(
+        [...current].filter((sourceClip) => availableClips.has(sourceClip)),
+      );
+      if (currentChanged && currentSourceClip) next.add(currentSourceClip);
+      else if (groupsChanged && next.size === 0 && preferred) next.add(preferred);
+      if (
+        next.size === current.size
+        && [...next].every((sourceClip) => current.has(sourceClip))
+      ) {
+        return current;
+      }
+      return next;
+    });
+  }, [clipKey, currentSourceClip, grouped]);
 
   return (
     <aside
@@ -122,70 +159,14 @@ export function SegmentQueuePanel({
       )}
     >
       <div className="shrink-0 border-b border-[#E7EAF0] px-4 py-3.5">
-        <h3 id={headingId} className="text-sm font-semibold text-[#202431]">
-          Segment 队列
-        </h3>
-        <p className="mt-1 text-xs text-[#7B8496]">
-          {resolved}/{job.counts.total} 个 Segment 已处理
-        </p>
-        {job.segments.length > 0 ? (
-          <form
-            className="mt-3"
-            noValidate
-            onSubmit={(event) => {
-              event.preventDefault();
-              submitJump();
-            }}
-          >
-            <label
-              className="mb-1.5 block text-[11px] font-medium text-[#657087]"
-              htmlFor={jumpInputId}
-            >
-              跳转至序号
-            </label>
-            <div className="flex items-center gap-2">
-              <Input
-                id={jumpInputId}
-                type="number"
-                inputMode="numeric"
-                min={ordinalRange?.min}
-                max={ordinalRange?.max}
-                step={1}
-                value={jumpValue}
-                aria-describedby={jumpErrorId}
-                aria-invalid={jumpError ? true : undefined}
-                className="h-8 min-w-0 flex-1 bg-white text-xs tabular-nums"
-                placeholder={ordinalRange
-                  ? `${ordinalRange.min}–${ordinalRange.max}`
-                  : "输入序号"}
-                onChange={(event) => {
-                  setJumpValue(event.target.value);
-                  if (jumpError) setJumpError("");
-                }}
-                onKeyDown={(event) => {
-                  if (event.key === "Enter" && !event.nativeEvent.isComposing) {
-                    event.preventDefault();
-                    submitJump();
-                  }
-                }}
-              />
-              <button
-                type="submit"
-                className="inline-flex h-8 shrink-0 items-center justify-center rounded-lg border border-[#D8DEEC] bg-white px-3 text-xs font-medium text-[#3156C8] shadow-xs transition-[color,background-color,border-color,box-shadow] duration-150 hover:border-[#BCC8E6] hover:bg-[#F3F6FF] active:bg-[#E9EEFF] focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-[#3156C8] motion-reduce:transition-none"
-              >
-                跳转
-              </button>
-            </div>
-            <p
-              id={jumpErrorId}
-              aria-live="polite"
-              className="mt-1 h-4 truncate text-[11px] leading-4 text-[#D84A5B]"
-              title={jumpError || undefined}
-            >
-              {jumpError}
-            </p>
-          </form>
-        ) : null}
+        <div className="flex items-center justify-between gap-4">
+          <h3 id={headingId} className="text-sm font-semibold text-[#202431]">
+            Segment 队列
+          </h3>
+          <p className="shrink-0 text-xs font-medium tabular-nums text-[#657087]">
+            {resolved} / {job.counts.total} 完成
+          </p>
+        </div>
       </div>
 
       {job.segments.length === 0 ? (
@@ -194,67 +175,160 @@ export function SegmentQueuePanel({
         </p>
       ) : (
         <nav
-          aria-label="Segment 数字序号跳转"
-          className="console-soft-scrollbar min-h-0 flex-1 space-y-4 overflow-y-auto bg-[#F5F6F8] p-2.5"
+          aria-label="Segment 分组队列"
+          className="console-soft-scrollbar flex min-h-0 flex-1 flex-col overflow-y-auto bg-white px-4"
           data-testid="segment-queue-scroll"
         >
-          {grouped.map(([sourceClip, segments]) => (
-            <section key={sourceClip} aria-label={sourceClip}>
-              <p
-                className="mb-1.5 truncate px-2 pt-1 text-[11px] font-semibold text-[#7B8496]"
-                title={sourceClip}
-              >
-                {sourceClip}
-              </p>
-              <div className="space-y-1">
-                {segments.map((segment) => {
-                  const status = segmentStatusMeta[segment.status];
-                  const ordinal = displayOrdinal(segment.ordinal);
-                  const active = segment.segment_ref === currentSegmentRef;
+          {grouped.map(([sourceClip, segments]) => {
+            const open = openClips.has(sourceClip);
+            const summary = clipStatusSummary(segments);
 
-                  return (
+            return (
+              <Collapsible.Root
+                key={sourceClip}
+                asChild
+                open={open}
+                onOpenChange={(nextOpen) => {
+                  setOpenClips((current) => {
+                    const next = new Set(current);
+                    if (nextOpen) next.add(sourceClip);
+                    else next.delete(sourceClip);
+                    return next;
+                  });
+                }}
+              >
+                <section
+                  aria-label={sourceClip}
+                  className="my-2 overflow-hidden rounded-xl border border-[#E1E6F0] bg-white shadow-[0_1px_3px_rgba(31,42,68,0.035)] transition-[border-color,box-shadow] duration-180 data-[state=open]:border-[#CFD8EF] data-[state=open]:shadow-[0_4px_12px_rgba(49,86,200,0.06)] motion-reduce:transition-none"
+                >
+                  <Collapsible.Trigger asChild>
                     <button
-                      key={segment.segment_ref}
                       type="button"
-                      aria-current={active ? "page" : undefined}
-                      aria-label={`${active ? "当前" : "打开"} Segment ${ordinal}，${status.label}`}
-                      className={cn(
-                        "flex min-h-12 w-full items-center gap-3 rounded-lg border px-2.5 py-2 text-left transition-[color,background-color,border-color,box-shadow] duration-150 focus-visible:outline-2 focus-visible:outline-offset-1 focus-visible:outline-[#3156C8] motion-reduce:transition-none",
-                        active
-                          ? "border-[#D8DEEC] bg-white shadow-[0_2px_8px_rgba(31,42,68,0.08)]"
-                          : "border-transparent bg-transparent hover:border-[#E2E6EE] hover:bg-white/75 active:bg-white",
-                      )}
-                      onClick={() => {
-                        if (!active) void onNavigate(segment.segment_ref);
-                      }}
+                      className="flex min-h-15 w-full items-center gap-3 bg-white px-3 py-2.5 text-left transition-[background-color] duration-150 hover:bg-[#F8FAFF] active:bg-[#F1F5FF] focus-visible:relative focus-visible:z-10 focus-visible:outline-2 focus-visible:outline-offset-[-2px] focus-visible:outline-[#3156C8] data-[state=open]:bg-[#F8FAFF] motion-reduce:transition-none"
+                      aria-label={`${open ? "收起" : "展开"}外层 clip ${sourceClip}`}
                     >
-                      <span
-                        aria-hidden="true"
-                        className={cn(
-                          "flex min-w-8 shrink-0 items-center justify-center rounded-md px-1.5 py-1 text-sm font-semibold tabular-nums",
-                          active
-                            ? "bg-[#E9EEFF] text-[#3156C8]"
-                            : "bg-[#E9EBEF] text-[#657087]",
-                        )}
-                      >
-                        {ordinal}
+                      <span className="flex h-8 w-8 shrink-0 items-center justify-center rounded-lg border border-[#DCE5FA] bg-[#F1F5FF] text-[#3156C8]">
+                        <Layers3 aria-hidden="true" className="h-4 w-4" />
                       </span>
                       <span className="min-w-0 flex-1">
-                        <span className="block truncate text-xs font-medium text-[#343C4D]">
-                          Segment {ordinal}
+                        <span
+                          className="block truncate text-xs font-semibold text-[#343C4D]"
+                          title={sourceClip}
+                        >
+                          {sourceClip}
+                        </span>
+                        <span className="mt-0.5 block truncate text-[11px] text-[#7B8496]">
+                          <span className="tabular-nums">{segments.length} 个 Segment</span>
+                          <span aria-hidden="true"> · </span>
+                          {summary}
                         </span>
                       </span>
-                      <StatusTag className="shrink-0" tone={status.tone}>
-                        {status.label}
-                      </StatusTag>
+                      <span
+                        className={cn(
+                          "flex h-7 w-7 shrink-0 items-center justify-center rounded-full border transition-[color,background-color,border-color] duration-150 motion-reduce:transition-none",
+                          open
+                            ? "border-[#C8D5F5] bg-white text-[#3156C8]"
+                            : "border-transparent bg-[#F1F3F7] text-[#8B94A6]",
+                        )}
+                      >
+                        <ChevronDown
+                          aria-hidden="true"
+                          className={cn(
+                            "h-4 w-4 transition-transform duration-180 motion-reduce:transition-none",
+                            open && "rotate-180",
+                          )}
+                        />
+                      </span>
                     </button>
-                  );
-                })}
-              </div>
-            </section>
-          ))}
+                  </Collapsible.Trigger>
+                  <Collapsible.Content className="segment-clip-content overflow-hidden">
+                    <div className="divide-y divide-[#ECEFF4] border-t border-[#E7EAF0] px-2 py-1">
+                      {segments.map((segment) => {
+                        const status = segmentStatusMeta[segment.status];
+                        const ordinal = displayOrdinal(segment.ordinal);
+                        const active = segment.segment_ref === currentSegmentRef;
+
+                        return (
+                          <button
+                            key={segment.segment_ref}
+                            type="button"
+                            aria-current={active ? "page" : undefined}
+                            aria-label={`${active ? "当前" : "打开"} Segment ${ordinal}，${status.label}`}
+                            className={cn(
+                              "relative -mx-1 flex min-h-13 w-[calc(100%+0.5rem)] items-center gap-2.5 rounded-lg border px-2 py-2.5 text-left transition-[color,background-color,border-color] duration-150 focus-visible:z-10 focus-visible:outline-2 focus-visible:outline-offset-1 focus-visible:outline-[#3156C8] motion-reduce:transition-none",
+                              active
+                                ? "border-[#7C97E7] bg-[#F4F7FF]"
+                                : "border-transparent bg-white hover:border-[#D8DEEC] hover:bg-[#F8FAFF] active:bg-[#EEF3FF]",
+                            )}
+                            onClick={() => {
+                              if (!active) void onNavigate(segment.segment_ref);
+                            }}
+                          >
+                            <span
+                              aria-hidden="true"
+                              className={cn("h-2 w-2 shrink-0 rounded-full", segmentStatusDot[segment.status])}
+                            />
+                            <span
+                              aria-hidden="true"
+                              className={cn(
+                                "w-7 shrink-0 text-center text-xs font-medium tabular-nums",
+                                active ? "text-[#3156C8]" : "text-[#657087]",
+                              )}
+                            >
+                              {ordinal}
+                            </span>
+                            <span className="min-w-0 flex-1">
+                              <span className="block truncate text-xs font-medium text-[#343C4D]">
+                                Segment {ordinal}
+                              </span>
+                            </span>
+                            <StatusTag className="shrink-0" tone={status.tone}>
+                              {status.label}
+                            </StatusTag>
+                            <ChevronRight
+                              aria-hidden="true"
+                              className={cn(
+                                "h-4 w-4 shrink-0",
+                                active ? "text-[#3156C8]" : "text-[#A1A9B8]",
+                              )}
+                            />
+                          </button>
+                        );
+                      })}
+                    </div>
+                  </Collapsible.Content>
+                </section>
+              </Collapsible.Root>
+            );
+          })}
+          {openClips.size === 0 ? (
+            <div className="flex min-h-40 flex-1 flex-col items-center justify-center px-6 py-8 text-center">
+              <span className="flex h-9 w-9 items-center justify-center rounded-xl border border-[#E1E6F0] bg-[#F7F9FC] text-[#8B94A6]">
+                <Layers3 aria-hidden="true" className="h-4 w-4" />
+              </span>
+              <p className="mt-3 text-xs font-medium text-[#657087]">选择一个外层 clip</p>
+              <p className="mt-1 text-[11px] leading-5 text-[#8B94A6]">展开后查看内部 Segment 队列</p>
+            </div>
+          ) : null}
         </nav>
       )}
+
+      {job.segments.length > 0 ? (
+        <footer className="shrink-0 border-t border-[#E7EAF0] bg-white px-4 py-3">
+          <p className="text-xs text-[#657087]">
+            总计 <span className="font-semibold tabular-nums text-[#343C4D]">{job.counts.total}</span> 个 Segment
+          </p>
+          <ul aria-label="Segment 状态汇总" className="mt-2 flex flex-wrap gap-x-3 gap-y-1.5">
+            {breakdown.map(({ status, count }) => (
+              <li key={status} className="flex items-center gap-1.5 text-[11px] text-[#657087]">
+                <span aria-hidden="true" className={cn("h-2 w-2 rounded-full", segmentStatusDot[status])} />
+                <span>{segmentStatusMeta[status].label}</span>
+                <span className="font-semibold tabular-nums text-[#343C4D]">{count}</span>
+              </li>
+            ))}
+          </ul>
+        </footer>
+      ) : null}
     </aside>
   );
 }

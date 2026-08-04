@@ -149,7 +149,12 @@ test("renders the canvas and inspector as one integrated studio workspace", () =
   const workbench = screen.getByTestId("annotation-workbench");
   expect(workbench).toContainElement(screen.getByTestId("annotation-canvas-region"));
   expect(workbench).toContainElement(screen.getByTestId("annotation-inspector-region"));
-  expect(screen.getByRole("complementary", { name: "目标属性检查器" })).toBeVisible();
+  expect(screen.getByRole("complementary", { name: "目标属性检查器" }))
+    .toHaveAttribute("data-layout", "overlay");
+  expect(workbench.querySelector("[data-annotation-canvas-scroll]"))
+    .toHaveAttribute("data-inspector-reserves-space", "false");
+  expect(screen.getByTestId("annotation-zoom-controls"))
+    .toHaveAttribute("data-inspector-avoidance", "panel-width");
   expect(screen.getByText("Segment 01")).toBeVisible();
 });
 
@@ -166,7 +171,13 @@ test("collapses the target inspector without removing the image workspace", () =
   fireEvent.click(screen.getByRole("button", { name: "收起目标属性" }));
   expect(screen.getByTestId("annotation-inspector-region")).toHaveAttribute("data-collapsed", "true");
   expect(screen.getByRole("button", { name: "展开目标属性" })).toHaveAttribute("aria-expanded", "false");
+  expect(screen.getByTestId("annotation-zoom-controls"))
+    .toHaveAttribute("data-inspector-avoidance", "collapsed-rail");
   expect(screen.getByRole("img", { name: /resize 后首帧/ })).toBeVisible();
+
+  fireEvent.click(screen.getByRole("button", { name: "展开目标属性" }));
+  expect(screen.getByTestId("annotation-inspector-region")).toHaveAttribute("data-collapsed", "false");
+  expect(screen.getByRole("button", { name: "收起目标属性" })).toHaveAttribute("aria-expanded", "true");
 });
 
 test("uses a protected focus mode for box and foreground-point interactions", () => {

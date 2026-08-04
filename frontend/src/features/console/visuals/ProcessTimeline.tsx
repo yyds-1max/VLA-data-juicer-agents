@@ -2,7 +2,6 @@ import {
   AlertCircle,
   Ban,
   Check,
-  CircleDot,
   LoaderCircle,
 } from "lucide-react";
 import type { ReactNode } from "react";
@@ -75,9 +74,7 @@ function markerContent(state: ProcessTimelineStepState) {
       />
     );
   }
-  if (state === "waiting") {
-    return <CircleDot className="size-3.5" strokeWidth={2.25} />;
-  }
+  if (state === "waiting") return null;
   if (state === "error") {
     return <AlertCircle className="size-3.5" strokeWidth={2.25} />;
   }

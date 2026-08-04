@@ -100,6 +100,9 @@ test("keeps an annotated job at human review waiting rather than claiming approv
     "data-process-state",
     "waiting",
   );
+  expect(
+    screen.getByRole("listitem", { name: "人工复核，待复核" }).querySelector("svg"),
+  ).toBeNull();
   expect(screen.queryByText("已批准")).not.toBeInTheDocument();
 });
 

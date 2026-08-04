@@ -3,8 +3,6 @@ import {
   AlertCircle,
   ArrowLeft,
   Ban,
-  Check,
-  CircleDot,
   LoaderCircle,
   RotateCcw,
   SkipForward,
@@ -60,6 +58,11 @@ import type {
   AnnotationSegmentStatus,
 } from "../../annotation/types";
 import { AnnotationJobProgress } from "../../annotation/AnnotationJobProgress";
+import {
+  AnnotationJobActivity,
+  AnnotationJobNextStep,
+  buildAnnotationJobNextStep,
+} from "../../annotation/AnnotationJobDetailPanels";
 import { JobsIndexView } from "../../annotation/JobsIndexView";
 import { SegmentQueuePanel } from "../../annotation/SegmentQueuePanel";
 
@@ -552,11 +555,11 @@ function JobPage({ jobRef }: { jobRef: string }) {
   }, [projectedJob, updateJob]);
 
   if (loading) {
-    return <section className="mx-auto max-w-7xl px-4 py-6 md:px-6"><PageMessage icon={LoaderCircle} title="正在读取任务…" /></section>;
+    return <section className="mx-auto w-full max-w-[1900px] px-3 py-5 sm:px-4 md:py-6 lg:px-6 2xl:px-8"><PageMessage icon={LoaderCircle} title="正在读取任务…" /></section>;
   }
   if (!job) {
     return (
-      <section className="mx-auto max-w-7xl px-4 py-6 md:px-6">
+      <section className="mx-auto w-full max-w-[1900px] px-3 py-5 sm:px-4 md:py-6 lg:px-6 2xl:px-8">
         <PageMessage
           title="无法打开自动标注任务"
           detail={error}
@@ -568,9 +571,13 @@ function JobPage({ jobRef }: { jobRef: string }) {
 
   const status = JOB_STATUS[job.status];
   const noProcessable = job.completion_outcome === "no_processable_targets";
+  const nextStep = buildAnnotationJobNextStep(job);
 
   return (
-    <section className="mx-auto max-w-7xl space-y-4 px-4 py-6 md:px-6">
+    <section
+      className="mx-auto w-full max-w-[1900px] space-y-4 px-3 py-5 sm:px-4 md:py-6 lg:px-6 2xl:px-8"
+      data-testid="annotation-job-detail-page"
+    >
       <div className="flex flex-col gap-3 lg:flex-row lg:items-center lg:justify-between">
         <div className="flex items-start gap-3">
           <ConsoleButton aria-label="返回自动标注任务列表" onClick={() => navigate("/annotation/jobs")}>
@@ -611,77 +618,51 @@ function JobPage({ jobRef }: { jobRef: string }) {
         </p>
       </ConsoleCard>
 
-      <div className="grid gap-4 lg:grid-cols-[20rem_1fr]">
+      <div className="grid min-w-0 gap-4 xl:grid-cols-[20rem_minmax(0,1fr)] 2xl:grid-cols-[21rem_minmax(0,1fr)]">
         <SegmentQueuePanel
           job={job}
-          className="min-h-[30rem] lg:max-h-[calc(100vh-12rem)]"
+          currentSegmentRef={nextStep.segment?.segment_ref}
+          className="min-h-[26rem] xl:min-h-[32rem] xl:max-h-[calc(100vh-12rem)]"
           onNavigate={(segmentRef) => navigate(`/annotation/jobs/${encodeURIComponent(jobRef)}/segments/${encodeURIComponent(segmentRef)}`)}
         />
 
-        <div className="space-y-4">
-          <ConsoleCard>
-            <div className="grid gap-4 sm:grid-cols-2 xl:grid-cols-4">
+        <div className="min-w-0 space-y-4">
+          <div className="grid gap-3 sm:grid-cols-2 xl:grid-cols-4">
+            <ConsoleCard className="min-h-24">
               <div>
                 <p className="text-xs text-console-muted">处理标定</p>
                 <p className="mt-2 text-sm font-medium text-console-text">{job.calibration.label}</p>
               </div>
+            </ConsoleCard>
+            <ConsoleCard className="min-h-24">
               <div>
                 <p className="text-xs text-console-muted">待标注</p>
-                <p className="mt-2 text-xl font-semibold text-console-text">{job.counts.pending_initial_annotation + job.counts.draft}</p>
+                <p className="mt-2 text-xl font-semibold tabular-nums text-[#D88312]">{job.counts.pending_initial_annotation + job.counts.draft}</p>
               </div>
+            </ConsoleCard>
+            <ConsoleCard className="min-h-24">
               <div>
-                <p className="text-xs text-console-muted">已提交 / 已跳过</p>
-                <p className="mt-2 text-xl font-semibold text-console-text">{job.counts.submitted} / {job.counts.skipped}</p>
+                <p className="text-xs text-console-muted">已提交</p>
+                <p className="mt-2 text-xl font-semibold tabular-nums text-[#228B58]">{job.counts.submitted}</p>
               </div>
+            </ConsoleCard>
+            <ConsoleCard className="min-h-24">
               <div>
-                <p className="text-xs text-console-muted">Tracking 完成</p>
-                <p className="mt-2 text-xl font-semibold text-console-text">{job.counts.tracked}</p>
+                <p className="text-xs text-console-muted">已跳过</p>
+                <p className="mt-2 text-xl font-semibold tabular-nums text-[#657087]">{job.counts.skipped}</p>
               </div>
-            </div>
-          </ConsoleCard>
+            </ConsoleCard>
+          </div>
 
-          {job.cancel_requested ? (
-            <PageMessage
-              icon={LoaderCircle}
-              title="正在安全终止处理任务"
-              detail="系统正在等待 Runtime 进程确认退出；确认前会保留任务状态和数据范围。"
-            />
-          ) : job.status === "preparing" ? (
-            <PageMessage
-              icon={LoaderCircle}
-              title="正在准备 Web 首帧标注"
-              detail="系统正在隔离的 staging 中生成 resize 后首帧。此阶段不需要打开 XQuartz。"
-            />
-          ) : job.status === "waiting_initial_annotation" ? (
-            <PageMessage
-              icon={CircleDot}
-              title={job.ready_for_tracking ? "首帧标注已全部提交" : "请选择一个 Segment 开始标注"}
-              detail={job.ready_for_tracking
-                ? "提交事件已持久保存，DataPilot 将从原任务继续执行 Tracking 和后处理；无需在页面手动启动。"
-                : "完成每个 Segment 的首帧标注；全部提交后，页面会通知 DataPilot 继续处理。"}
-            />
-          ) : job.status === "tracking" ? (
-            <PageMessage
-              icon={LoaderCircle}
-              title="Tracking 正在串行执行"
-              detail="页面可以安全刷新；已完成的 target 会保存 checkpoint。"
-            />
-          ) : job.status === "tracked" ? (
-            <PageMessage icon={Check} title="Tracking 已完成" detail="DataPilot 会继续调查并执行适合当前数据的后处理方案。" />
-          ) : job.status === "postprocessing" ? (
-            <PageMessage
-              icon={LoaderCircle}
-              title="DataPilot 正在执行后处理"
-              detail="页面可以安全关闭；任务事实和恢复点已持久保存。"
-            />
-          ) : job.status === "annotated" ? (
-            <PageMessage
-              icon={Check}
-              title="后处理已完成"
-              detail="轨迹复核任务已创建，可在“人工复核”中继续 Fix。"
-              action={<ConsoleButton onClick={() => navigate("/annotation/reviews")}>进入人工复核</ConsoleButton>}
-            />
-          ) : null}
+          <AnnotationJobNextStep
+            job={job}
+            onOpenReviews={() => navigate("/annotation/reviews")}
+            onOpenSegment={(segmentRef) => navigate(`/annotation/jobs/${encodeURIComponent(jobRef)}/segments/${encodeURIComponent(segmentRef)}`)}
+          />
+          <AnnotationJobActivity
+            guidance={annotationJobProgressHint(job)}
+            job={job}
+          />
         </div>
       </div>
     </section>

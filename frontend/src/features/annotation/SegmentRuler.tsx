@@ -5,6 +5,7 @@ import { cn } from "../../lib/utils";
 import type { AnnotationSegmentStatus, AnnotationSegmentSummary } from "./types";
 
 const MAX_VISIBLE_TICKS = 21;
+const EDGE_FADE_TICKS = 5;
 const JUMP_BUFFER_TIMEOUT_MS = 900;
 
 const STATUS_META: Record<
@@ -130,16 +131,18 @@ export function SegmentRuler({
     <div
       data-testid="segment-ruler"
       className={cn(
-        "flex min-h-14 max-w-[min(46rem,calc(100vw-2rem))] items-center gap-3 rounded-2xl border border-white/15 bg-[#263143]/88 px-3 py-2 text-white shadow-[0_14px_40px_rgba(15,23,42,0.28)] backdrop-blur-md",
+        "flex min-h-14 max-w-[min(46rem,calc(100vw-2rem))] items-center gap-3 rounded-[14px] border border-white/10 bg-[#141a26]/93 px-3.5 py-2 text-white opacity-60 shadow-[0_10px_28px_rgba(15,23,42,0.28)] backdrop-blur-md transition-[opacity,background-color] duration-160 hover:opacity-100 focus-within:opacity-100 motion-reduce:transition-none",
         className,
       )}
       onWheel={onWheel}
     >
-      <div className="flex shrink-0 items-center gap-2 border-r border-white/15 pr-3">
+      <div className="flex shrink-0 items-center gap-2">
         <span className={cn("size-2 rounded-full", STATUS_META[current.status].color)} aria-hidden="true" />
-        <strong className="text-base tabular-nums">{String(current.ordinal).padStart(2, "0")}</strong>
-        <span className="text-[11px] text-white/55">/ {sorted.length}</span>
-        <span className="hidden text-[11px] text-white/65 sm:inline">{STATUS_META[current.status].label}</span>
+        <strong className="text-base font-semibold tabular-nums text-[#f0f2f7]">{String(current.ordinal).padStart(2, "0")}</strong>
+        <span className="text-[11px] tabular-nums text-[#8b95ab]">/ {sorted.length}</span>
+        <span className="hidden border-l border-white/12 pl-2 text-[11px] text-[#a7b0c4] sm:inline">
+          {STATUS_META[current.status].label}
+        </span>
       </div>
 
       <button
@@ -152,11 +155,25 @@ export function SegmentRuler({
         <ChevronLeft className="size-4" aria-hidden="true" />
       </button>
 
-      <div className="flex min-w-0 flex-1 items-end justify-center gap-1.5" aria-label="Segment 状态刻度">
-        {windowStart > 0 ? <span className="mb-1 text-[10px] text-white/35">…</span> : null}
-        {visible.map((item) => {
+      <div className="flex h-8 min-w-0 flex-1 items-end justify-center border-b border-white/16 px-0.5 pb-1" aria-label="Segment 状态刻度">
+        {visible.map((item, visibleIndex) => {
           const isCurrent = item.segment_ref === currentSegmentRef;
           const meta = STATUS_META[item.status];
+          const hasMoreBefore = windowStart > 0;
+          const hasMoreAfter = windowStart + visible.length < sorted.length;
+          let edgeOpacity = 1;
+          if (hasMoreBefore) {
+            edgeOpacity = Math.min(
+              edgeOpacity,
+              0.12 + 0.88 * Math.min(1, visibleIndex / EDGE_FADE_TICKS),
+            );
+          }
+          if (hasMoreAfter) {
+            edgeOpacity = Math.min(
+              edgeOpacity,
+              0.12 + 0.88 * Math.min(1, (visible.length - 1 - visibleIndex) / EDGE_FADE_TICKS),
+            );
+          }
           return (
             <button
               key={item.segment_ref}
@@ -165,23 +182,23 @@ export function SegmentRuler({
               aria-current={isCurrent ? "step" : undefined}
               title={`Segment ${item.ordinal} · ${meta.label}`}
               disabled={disabled}
-              className="group flex h-8 w-2.5 shrink-0 items-end justify-center rounded-sm focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-white disabled:cursor-not-allowed"
+              className="group flex h-8 w-[9px] shrink-0 items-end justify-center rounded-sm focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-white disabled:cursor-not-allowed"
+              style={{ opacity: isCurrent ? 1 : edgeOpacity }}
               onClick={() => {
                 if (item.segment_ref !== currentSegmentRef) void onNavigate(item.segment_ref);
               }}
             >
               <span
                 className={cn(
-                  "block w-1.5 rounded-full opacity-70 transition-[height,opacity,filter] duration-160 group-hover:opacity-100 group-focus-visible:opacity-100 motion-reduce:transition-none",
+                  "block h-[11px] w-[3px] rounded-sm transition-[height,width,box-shadow] duration-150 group-hover:h-[22px] motion-reduce:transition-none",
                   meta.color,
-                  item.ordinal % 5 === 0 ? "h-4" : "h-2.5",
-                  isCurrent && "h-7 w-2 opacity-100 shadow-[0_0_0_3px_rgba(255,255,255,0.12)]",
+                  (windowStart + visibleIndex) % 5 === 0 && "h-[17px]",
+                  isCurrent && "h-[27px] w-1 shadow-[0_0_0_1.5px_rgba(255,255,255,0.45)] group-hover:h-[27px]",
                 )}
               />
             </button>
           );
         })}
-        {windowStart + visible.length < sorted.length ? <span className="mb-1 text-[10px] text-white/35">…</span> : null}
       </div>
 
       <button

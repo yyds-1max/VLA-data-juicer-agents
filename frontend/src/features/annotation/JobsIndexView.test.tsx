@@ -14,17 +14,64 @@ import { JobsIndexView, type JobsIndexViewProps } from "./JobsIndexView";
 import type { AnnotationJobStatus, AnnotationJobSummary } from "./types";
 
 function mockReducedMotion(matches: boolean) {
+  let currentMatches = matches;
+  const listeners = new Set<(event: MediaQueryListEvent) => void>();
   const mediaQuery = {
-    matches,
+    get matches() {
+      return currentMatches;
+    },
     media: "(prefers-reduced-motion: reduce)",
     onchange: null,
-    addEventListener: vi.fn(),
-    removeEventListener: vi.fn(),
-    addListener: vi.fn(),
-    removeListener: vi.fn(),
+    addEventListener: vi.fn(
+      (_type: string, listener: (event: MediaQueryListEvent) => void) => listeners.add(listener),
+    ),
+    removeEventListener: vi.fn(
+      (_type: string, listener: (event: MediaQueryListEvent) => void) => listeners.delete(listener),
+    ),
+    addListener: vi.fn((listener: (event: MediaQueryListEvent) => void) => listeners.add(listener)),
+    removeListener: vi.fn((listener: (event: MediaQueryListEvent) => void) => listeners.delete(listener)),
     dispatchEvent: vi.fn(() => true),
   } as unknown as MediaQueryList;
   vi.stubGlobal("matchMedia", vi.fn(() => mediaQuery));
+  return {
+    setMatches(nextMatches: boolean) {
+      currentMatches = nextMatches;
+      const event = { matches: nextMatches, media: mediaQuery.media } as MediaQueryListEvent;
+      listeners.forEach((listener) => listener(event));
+    },
+  };
+}
+
+function mockAnimationFrames() {
+  let nextHandle = 1;
+  const callbacks = new Map<number, FrameRequestCallback>();
+  vi.stubGlobal(
+    "requestAnimationFrame",
+    vi.fn((callback: FrameRequestCallback) => {
+      const handle = nextHandle;
+      nextHandle += 1;
+      callbacks.set(handle, callback);
+      return handle;
+    }),
+  );
+  vi.stubGlobal(
+    "cancelAnimationFrame",
+    vi.fn((handle: number) => callbacks.delete(handle)),
+  );
+
+  return {
+    flushNext() {
+      const next = callbacks.entries().next();
+      if (next.done) return false;
+      const [handle, callback] = next.value;
+      callbacks.delete(handle);
+      callback(performance.now());
+      return true;
+    },
+    pendingCount() {
+      return callbacks.size;
+    },
+  };
 }
 
 function jobFixture(
@@ -249,27 +296,118 @@ describe("JobsIndexView", () => {
     expect(screen.getByRole("status")).toHaveTextContent("正在刷新标注任务列表");
   });
 
-  test("uses a staggered exit/enter transition when motion is allowed", () => {
+  test("settles a staged transition after React commits the new rows", () => {
     vi.useFakeTimers();
     vi.unstubAllGlobals();
     mockReducedMotion(false);
-    vi.stubGlobal(
-      "requestAnimationFrame",
-      vi.fn((callback: FrameRequestCallback) => window.setTimeout(() => callback(16), 16)),
-    );
-    vi.stubGlobal("cancelAnimationFrame", vi.fn((handle: number) => window.clearTimeout(handle)));
+    const animationFrames = mockAnimationFrames();
     renderView();
 
     fireEvent.click(screen.getByRole("tab", { name: /运行中/ }));
     const panel = screen.getByRole("tabpanel");
-    expect(panel).toHaveClass("opacity-0");
+    expect(panel).toHaveAttribute("aria-busy", "true");
+    expect(screen.getByRole("columnheader", { name: "数据日期" })).toBeVisible();
 
     act(() => {
-      vi.advanceTimersByTime(120);
+      vi.advanceTimersByTime(100);
     });
 
-    expect(screen.getByText("Tracking 已完成")).toBeInTheDocument();
-    expect(panel).toHaveClass("opacity-100");
+    const runningRow = screen.getByText("Tracking 已完成").closest("tr");
+    expect(runningRow).toHaveClass("opacity-0");
+    expect(animationFrames.pendingCount()).toBe(1);
+
+    act(() => {
+      expect(animationFrames.flushNext()).toBe(true);
+    });
+    expect(runningRow).toHaveClass("opacity-0");
+
+    act(() => {
+      expect(animationFrames.flushNext()).toBe(true);
+    });
+    expect(runningRow).toHaveClass("opacity-100");
+    expect(panel).not.toHaveAttribute("aria-busy");
+  });
+
+  test("cancels obsolete transitions during rapid filter changes", () => {
+    vi.useFakeTimers();
+    vi.unstubAllGlobals();
+    mockReducedMotion(false);
+    const animationFrames = mockAnimationFrames();
+    renderView();
+
+    fireEvent.click(screen.getByRole("tab", { name: "运行中" }));
+    act(() => {
+      vi.advanceTimersByTime(40);
+    });
+    fireEvent.click(screen.getByRole("tab", { name: "异常" }));
+    act(() => {
+      vi.advanceTimersByTime(100);
+    });
+
+    const failedRow = screen.getByText("处理失败").closest("tr");
+    expect(failedRow).toHaveClass("opacity-0");
+    expect(screen.queryByText("Tracking 已完成")).not.toBeInTheDocument();
+    expect(screen.getByRole("columnheader", { name: "状态" })).toBeVisible();
+
+    act(() => {
+      animationFrames.flushNext();
+      animationFrames.flushNext();
+    });
+    expect(failedRow).toHaveClass("opacity-100");
+    expect(screen.getByRole("tabpanel")).not.toHaveAttribute("aria-busy");
+  });
+
+  test("finishes the current switch immediately when reduced motion turns on", () => {
+    vi.useFakeTimers();
+    vi.unstubAllGlobals();
+    const motionPreference = mockReducedMotion(false);
+    const animationFrames = mockAnimationFrames();
+    renderView();
+
+    fireEvent.click(screen.getByRole("tab", { name: "运行中" }));
+    expect(screen.getByRole("tabpanel")).toHaveAttribute("aria-busy", "true");
+
+    act(() => {
+      motionPreference.setMatches(true);
+    });
+
+    expect(screen.getByText("Tracking 已完成").closest("tr")).toHaveClass("opacity-100");
+    expect(screen.getByRole("tabpanel")).not.toHaveAttribute("aria-busy");
+    expect(animationFrames.pendingCount()).toBe(0);
+  });
+
+  test("clamps stale pages synchronously when refreshed data becomes shorter", () => {
+    const jobs = Array.from({ length: 12 }, (_, index) =>
+      jobFixture("waiting_initial_annotation", {
+        job_ref: `job-clamp-${String(index + 1).padStart(2, "0")}`,
+        dataset_date: `202607${String(index + 1).padStart(2, "0")}`,
+        updated_at: "2026-08-01T09:00:00Z",
+      }),
+    );
+    const { props, rerender } = renderView({ jobs });
+    fireEvent.click(screen.getByRole("button", { name: "下一页" }));
+    expect(screen.getByText("20260711")).toBeInTheDocument();
+
+    rerender(<JobsIndexView {...props} jobs={jobs.slice(0, 2)} />);
+
+    expect(screen.getByText("第 1 / 1 页")).toBeInTheDocument();
+    expect(screen.getByText("20260701")).toBeInTheDocument();
+    expect(screen.getByText(/2 个任务/)).toBeInTheDocument();
+  });
+
+  test("cleans a pending switch timer when the list unmounts", () => {
+    vi.useFakeTimers();
+    vi.unstubAllGlobals();
+    mockReducedMotion(false);
+    const animationFrames = mockAnimationFrames();
+    const { unmount } = renderView();
+
+    fireEvent.click(screen.getByRole("tab", { name: "运行中" }));
+    expect(vi.getTimerCount()).toBeGreaterThan(0);
+    unmount();
+
+    expect(vi.getTimerCount()).toBe(0);
+    expect(animationFrames.pendingCount()).toBe(0);
   });
 
   test("supports arrow-key navigation across the filter tabs", async () => {
