@@ -958,7 +958,7 @@ test("annotation page exposes the M2 DataPilot-owned processing entry", async ()
   fireEvent.click(screen.getByRole("button", { name: "自动标注" }));
   expect(await screen.findByRole("heading", { name: "标注任务" })).toBeVisible();
   expect(screen.getByText(/仍可提交数据范围，由 DataPilot 检查事实并说明阻塞/)).toBeVisible();
-  expect(screen.getByRole("button", { name: "交给 DataPilot 处理" })).toBeVisible();
+  expect(screen.getByRole("button", { name: "交给 DataPilot" })).toBeVisible();
   expect(screen.queryByRole("button", { name: "新建任务" })).not.toBeInTheDocument();
   expect(screen.queryByText("视觉检测")).not.toBeInTheDocument();
   expect(window.location.pathname).toBe("/annotation/jobs");
@@ -996,7 +996,7 @@ test("annotation shortcut submits a new session despite another session's active
 
   await renderAppWithDashboardSettled();
   fireEvent.click(screen.getByRole("button", { name: "自动标注" }));
-  fireEvent.click(await screen.findByRole("button", { name: "交给 DataPilot 处理" }));
+  fireEvent.click(await screen.findByRole("button", { name: "交给 DataPilot" }));
   chooseNavigationDate("20270515");
   fireEvent.click(screen.getByRole("checkbox", { name: "clip_a" }));
   fireEvent.click(screen.getByRole("button", { name: "确定" }));
