@@ -1,5 +1,5 @@
 import "@testing-library/jest-dom/vitest";
-import { act, fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { act, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import {
   createMemoryRouter,
   MemoryRouter,
@@ -746,6 +746,8 @@ test("waits for the current draft save before changing the segment URL", async (
 
   renderSegmentRouter(`/annotation/jobs/${job.job_ref}/segments/${firstRef}`);
   await screen.findByRole("application", { name: "首帧标注画布" });
+  expect(screen.getByLabelText(`外层 clip：${firstSegment.source_clip}`)).toHaveTextContent(firstSegment.source_clip);
+  expect(screen.getByRole("button", { name: "打开标注台帮助" })).toBeVisible();
   loadPageFirstFrame();
   fireEvent.change(screen.getByLabelText("master bbox x"), { target: { value: "11" } });
   fireEvent.click(screen.getByRole("button", { name: /Segment 02/ }));
@@ -762,6 +764,37 @@ test("waits for the current draft save before changing the segment URL", async (
     },
   }));
   await waitFor(() => expect(screen.getByTestId("route-location")).toHaveTextContent(secondRef));
+});
+
+test("presents the current clip hierarchy and local Segment position consistently", async () => {
+  const firstRef = "segment_31313131313131313131313131313131";
+  const currentRef = "segment_41414141414141414141414141414141";
+  const firstClipSegment = segmentFixture(firstRef, 1, { source_clip: "outer-clip-a" });
+  const currentSegment = segmentFixture(currentRef, 100, { source_clip: "outer-clip-b" });
+  const job = jobFixture({
+    counts: {
+      total: 2,
+      pending_initial_annotation: 0,
+      draft: 2,
+      submitted: 0,
+      skipped: 0,
+      tracking: 0,
+      tracked: 0,
+    },
+    segments: [firstClipSegment, currentSegment],
+  });
+  apiMocks.getAnnotationJob.mockResolvedValue(job);
+  apiMocks.getAnnotationSegment.mockResolvedValue(currentSegment);
+
+  renderSegmentRouter(`/annotation/jobs/${job.job_ref}/segments/${currentRef}`);
+
+  const location = await screen.findByRole("navigation", { name: "标注工作台位置" });
+  expect(within(location).getByText(job.dataset_date)).toBeVisible();
+  expect(within(location).getByLabelText("外层 clip：outer-clip-b")).toBeVisible();
+  expect(within(location).getByText("Segment 01")).toBeVisible();
+  expect(within(location).getByText(/当前外层 clip 共 1 个 Segment/)).toBeInTheDocument();
+  expect(screen.getByRole("button", { name: "当前 Segment 01，草稿" })).toBeVisible();
+  expect(screen.queryByRole("button", { name: /Segment 100/ })).not.toBeInTheDocument();
 });
 
 test("skips with the revision produced by this page's flush instead of adopting unseen server changes", async () => {

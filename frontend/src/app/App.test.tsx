@@ -422,7 +422,8 @@ test("data management renders navigation dataset date and clip details", async (
   expect(screen.getAllByTestId("navigation-process-step")).toHaveLength(3);
   expect(screen.getByRole("columnheader", { name: "clip 数" })).toBeVisible();
   expect(screen.getByRole("columnheader", { name: "raw 消息" })).toBeVisible();
-  expect(screen.getByTestId("navigation-dataset-scroll")).toHaveClass("console-soft-scrollbar", "max-h-[62vh]", "overflow-auto", "pb-3");
+  expect(screen.getByTestId("navigation-dataset-scroll")).toHaveClass("console-soft-scrollbar", "max-h-[60vh]", "overflow-auto");
+  expect(screen.getByTestId("navigation-dataset-surface")).toHaveClass("border-y", "bg-white");
   const datasetScroll = screen.getByTestId("navigation-dataset-scroll");
   mockScrollableElement(datasetScroll);
 
@@ -659,8 +660,8 @@ test("data management switches between navigation and robotic arm data surfaces"
 
   expect(await screen.findByRole("tab", { name: "导航数据" })).toBeVisible();
   expect(screen.getByRole("tab", { name: "机械臂数据" })).toBeVisible();
-  expect(screen.getByRole("button", { name: "全部场景" })).toBeVisible();
-  expect(screen.getByRole("button", { name: "全部状态" })).toBeVisible();
+  expect(screen.queryByText("全部场景")).not.toBeInTheDocument();
+  expect(screen.getByRole("combobox", { name: "导航数据状态筛选" })).toHaveTextContent("全部状态");
   expect(screen.getByPlaceholderText("按日期或 clip 搜索")).toBeVisible();
 
   fireEvent.mouseDown(screen.getByRole("tab", { name: "机械臂数据" }), {
@@ -669,9 +670,8 @@ test("data management switches between navigation and robotic arm data surfaces"
   });
 
   expect(await screen.findByText("机械臂数据接入中")).toBeVisible();
-  expect(screen.getByRole("button", { name: "全部场景" })).toBeVisible();
-  expect(screen.getByRole("button", { name: "全部状态" })).toBeVisible();
-  expect(screen.getByPlaceholderText("按日期或 clip 搜索")).toBeVisible();
+  expect(screen.queryByRole("combobox", { name: "导航数据状态筛选" })).not.toBeInTheDocument();
+  expect(screen.queryByPlaceholderText("按日期或 clip 搜索")).not.toBeInTheDocument();
 });
 
 test("data management filters navigation dates by status", async () => {
@@ -744,29 +744,28 @@ test("data management filters navigation dates by status", async () => {
   expect(await screen.findByText("20270515")).toBeVisible();
   expect(screen.getByText("20270601")).toBeVisible();
 
-  fireEvent.click(screen.getByRole("button", { name: "全部状态" }));
+  fireEvent.click(screen.getByRole("combobox", { name: "导航数据状态筛选" }));
   fireEvent.click(screen.getByRole("option", { name: "待处理" }));
 
   expect(screen.getByText("20270601")).toBeVisible();
   expect(screen.queryByText("20270515")).not.toBeInTheDocument();
 });
 
-test("data management filter menus close when clicking outside", async () => {
+test("data management uses the shared status selector and removes the scene filter", async () => {
   await renderAppWithDashboardSettled();
 
   fireEvent.click(screen.getByRole("button", { name: "数据管理" }));
   await screen.findByRole("tab", { name: "导航数据" });
 
-  fireEvent.click(screen.getByRole("button", { name: "全部场景" }));
-  expect(screen.getByRole("option", { name: "室外导航" })).toBeVisible();
+  expect(screen.queryByText("全部场景")).not.toBeInTheDocument();
+  const statusSelect = screen.getByRole("combobox", { name: "导航数据状态筛选" });
+  expect(statusSelect).toHaveClass("h-10", "bg-white");
+  expect(screen.getByRole("textbox", { name: "搜索导航数据" })).toHaveClass("h-10", "bg-white");
 
-  fireEvent.pointerDown(screen.getByPlaceholderText("按日期或 clip 搜索"));
-  expect(screen.queryByRole("option", { name: "室外导航" })).not.toBeInTheDocument();
-
-  fireEvent.click(screen.getByRole("button", { name: "全部状态" }));
+  fireEvent.click(statusSelect);
   expect(screen.getByRole("option", { name: "待处理" })).toBeVisible();
 
-  fireEvent.pointerDown(screen.getByRole("heading", { name: "数据管理" }));
+  fireEvent.keyDown(document, { key: "Escape" });
   expect(screen.queryByRole("option", { name: "待处理" })).not.toBeInTheDocument();
 });
 
@@ -833,7 +832,7 @@ test("navigation dataset summary is reused while switching console pages", async
   expect(apiMocks.getNavigationDatasetSummary).toHaveBeenCalledTimes(1);
 
   fireEvent.click(screen.getByRole("button", { name: "自动标注" }));
-  expect(await screen.findByText("标注任务")).toBeVisible();
+  expect(await screen.findByRole("heading", { name: "标注任务" })).toBeVisible();
 
   fireEvent.click(screen.getByRole("button", { name: "仪表盘" }));
   expect(await screen.findByText("3.5 秒")).toBeVisible();
@@ -855,14 +854,22 @@ test("data management opens synchronized image drawer and browses sequences", as
   expect(apiMocks.getSyncImages).toHaveBeenCalledWith("20270515", "clip_a");
   expect(screen.getByRole("button", { name: "001.jpg" })).toBeVisible();
   expect(screen.getByRole("button", { name: "002.jpg" })).toBeVisible();
+  expect(screen.getByTestId("sync-sequence-scroll")).toHaveClass("flex-nowrap", "overflow-x-auto");
   expect(screen.getByText("1 / 2")).toBeVisible();
-  expect(screen.queryByRole("button", { name: "上一张" })).not.toBeInTheDocument();
-  expect(screen.getByRole("button", { name: "下一张" })).toBeVisible();
+  expect(screen.getByRole("button", { name: "上一张" })).toBeDisabled();
+  const nextImageButton = screen.getByRole("button", { name: "下一张" });
+  expect(nextImageButton).toBeEnabled();
+  expect(nextImageButton).toHaveClass("focus-visible:outline-blue-500");
+  expect(nextImageButton).toHaveClass("data-[pointer-focus=true]:outline-none");
+  expect(nextImageButton).not.toHaveClass("focus:ring-2");
 
-  fireEvent.click(screen.getByRole("button", { name: "下一张" }));
+  fireEvent.pointerDown(nextImageButton);
+  fireEvent.click(nextImageButton);
+  expect(nextImageButton).toHaveAttribute("data-pointer-focus", "true");
   expect(screen.getByText("2 / 2")).toBeVisible();
-  expect(screen.getByRole("button", { name: "上一张" })).toBeVisible();
-  expect(screen.queryByRole("button", { name: "下一张" })).not.toBeInTheDocument();
+  expect(screen.getByRole("button", { name: "002.jpg" })).toHaveAttribute("aria-current", "true");
+  expect(screen.getByRole("button", { name: "上一张" })).toBeEnabled();
+  expect(screen.getByRole("button", { name: "下一张" })).toBeDisabled();
 
   fireEvent.click(screen.getByRole("button", { name: "001.jpg" }));
   expect(screen.getByText("1 / 2")).toBeVisible();
@@ -949,7 +956,7 @@ test("annotation page exposes the M2 DataPilot-owned processing entry", async ()
   await renderAppWithDashboardSettled();
 
   fireEvent.click(screen.getByRole("button", { name: "自动标注" }));
-  expect(await screen.findByText("标注任务")).toBeVisible();
+  expect(await screen.findByRole("heading", { name: "标注任务" })).toBeVisible();
   expect(screen.getByText(/仍可提交数据范围，由 DataPilot 检查事实并说明阻塞/)).toBeVisible();
   expect(screen.getByRole("button", { name: "交给 DataPilot 处理" })).toBeVisible();
   expect(screen.queryByRole("button", { name: "新建任务" })).not.toBeInTheDocument();

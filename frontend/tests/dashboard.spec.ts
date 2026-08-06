@@ -121,8 +121,9 @@ test("dashboard keyboard states, placeholders, sidebar and links are predictable
 
   await page.getByRole("button", { name: "搜索数据、模型、任务（暂未接入）" }).click();
   await expect(page.getByText("搜索功能暂未接入")).toBeVisible();
-  await page.getByRole("button", { name: "通知（暂未接入）" }).click();
-  await expect(page.getByText("通知功能暂未接入")).toBeVisible();
+  await page.getByRole("button", { name: "通知" }).click();
+  await expect(page.getByRole("dialog", { name: "通知中心" })).toBeVisible();
+  await expect(page.getByText("暂无通知")).toBeVisible();
 
   await page.getByRole("button", { name: "查看训练详情" }).click();
   await expect(page).toHaveURL(/\/model$/);

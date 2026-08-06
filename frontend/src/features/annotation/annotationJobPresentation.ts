@@ -111,6 +111,8 @@ function makeProgress(
 }
 
 function inferredProgress(job: AnnotationJobSummary): AnnotationJobTableProgress {
+  // 失败/取消任务可能没有可靠的当前阶段字段，只能依据已出现的最远 Segment 状态
+  // 保守推断进度；这里不伪造 Runtime 内部的精确百分比。
   const { counts } = job;
   const total = countOf(counts, "pending_initial_annotation") +
     countOf(counts, "draft") +
@@ -152,6 +154,7 @@ function inferredProgress(job: AnnotationJobSummary): AnnotationJobTableProgress
 export function classifyAnnotationJob(
   job: AnnotationJobSummary,
 ): AnnotationJobListFilter {
+  // tracked 表示 Tracking 已结束但闭环尚未完成，仍属于“运行中”，不能提前归入历史。
   switch (job.status) {
     case "waiting_initial_annotation":
       return "waiting";
@@ -200,6 +203,7 @@ export function annotationJobStatusPresentation(
 export function annotationJobTableProgress(
   job: AnnotationJobSummary,
 ): AnnotationJobTableProgress {
+  // 每个阶段使用自己的完成口径；skipped 是人工确认后的已解决 Segment，计入分母与完成数。
   const total = toSafeCount(job.counts.total);
   const skipped = countOf(job.counts, "skipped");
 

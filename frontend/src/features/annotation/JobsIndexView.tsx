@@ -39,6 +39,7 @@ import {
 } from "@/components/ui/table";
 import { cn } from "@/lib/utils";
 
+import { AnnotationListPageHeader } from "./AnnotationListPageHeader";
 import {
   ANNOTATION_JOB_LIST_FILTERS,
   annotationJobListMetrics,
@@ -472,24 +473,13 @@ export function JobsIndexView({
     return `${selectedJobs.length} 条记录 · 已完成或取消 · 最近更新 ${latest}`;
   }, [filter, metrics.failedJobs, metrics.waitingSegments, selectedJobs]);
 
-  if (isInitialLoading) {
-    return <LoadingView />;
-  }
-
-  return (
-    <section
-      aria-labelledby="annotation-jobs-heading"
-      aria-busy={refreshing || undefined}
-      className={cn("space-y-4", className)}
-    >
-      <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
-        <div>
-          <p className="text-xs font-medium tracking-wide text-blue-700">AUTO ANNOTATION</p>
-          <h2 id="annotation-jobs-heading" className="mt-1 text-xl font-semibold text-slate-950">
-            标注任务
-          </h2>
-        </div>
-        <div className="flex flex-wrap items-center gap-2">
+  const pageHeader = (
+    <AnnotationListPageHeader
+      headingId="annotation-jobs-heading"
+      title="标注任务"
+      description="导航数据首帧标注、自动处理与任务状态跟踪。"
+      actions={
+        <>
           <Button
             type="button"
             variant="outline"
@@ -513,8 +503,27 @@ export function JobsIndexView({
             <Bot aria-hidden="true" />
             交给 DataPilot 处理
           </Button>
-        </div>
-      </div>
+        </>
+      }
+    />
+  );
+
+  if (isInitialLoading) {
+    return (
+      <section aria-labelledby="annotation-jobs-heading" className={cn("space-y-4", className)}>
+        {pageHeader}
+        <LoadingView />
+      </section>
+    );
+  }
+
+  return (
+    <section
+      aria-labelledby="annotation-jobs-heading"
+      aria-busy={refreshing || undefined}
+      className={cn("space-y-4", className)}
+    >
+      {pageHeader}
 
       {error ? (
         <Alert variant="destructive" className="border-rose-200 bg-rose-50/80">

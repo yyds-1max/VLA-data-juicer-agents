@@ -29,11 +29,11 @@ export function ConsoleHeader({ title, subtitle, onPlaceholderAction }: ConsoleH
           <button
             type="button"
             aria-label="通知（暂未接入）"
-            className="relative flex h-10 w-10 shrink-0 items-center justify-center rounded-xl border border-[#dfe3eb] bg-white text-[#626b7d] shadow-[0_2px_7px_rgba(30,41,59,0.04)] transition-[color,background-color,border-color,box-shadow] duration-200 ease-out hover:border-[#cdd5e3] hover:bg-[#fafbfc] hover:text-[#3156c8] active:bg-[#f1f3f7] focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-[#3156c8] motion-reduce:transition-none"
+            className="relative flex size-10 shrink-0 items-center justify-center rounded-xl border border-[#dfe3eb] bg-white text-[#657087] shadow-[0_2px_7px_rgba(30,41,59,0.04)] transition-[color,background-color,border-color,box-shadow] duration-200 ease-out hover:border-[#cdd5e3] hover:bg-[#fafbfc] hover:text-[#3156c8] active:bg-[#f3f5f8] focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-[#3156c8] motion-reduce:transition-none"
             onClick={() => onPlaceholderAction("通知功能暂未接入")}
           >
-            <Bell className="h-4 w-4" aria-hidden="true" />
-            <span className="absolute right-2.5 top-2 h-2 w-2 rounded-full border-2 border-white bg-[#e65f78]" aria-hidden="true" />
+            <Bell aria-hidden="true" className="size-4" />
+            <span aria-hidden="true" className="absolute right-2 top-2 size-1.5 rounded-full bg-[#ef4458] ring-2 ring-white" />
           </button>
 
           <div

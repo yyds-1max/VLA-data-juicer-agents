@@ -220,11 +220,22 @@ export function InitialAnnotationWorkbench({
   );
   const canEdit = editable && !submitting && imageSizeValid === true;
   const focusMode = mode === "box" || mode === "point";
+  const clipSegments = useMemo(() => job.segments
+    .filter((item) => item.source_clip === segment.source_clip)
+    .sort((left, right) => (
+      left.ordinal - right.ordinal
+      || left.segment_ref.localeCompare(right.segment_ref)
+    ))
+    .map((item, index) => ({ ...item, ordinal: index + 1 })), [job.segments, segment.source_clip]);
+  const clipSegmentOrdinal = clipSegments.find(
+    (item) => item.segment_ref === segment.segment_ref,
+  )?.ordinal ?? segment.ordinal;
+  const clipSegmentCount = Math.max(clipSegments.length, 1);
 
   useEffect(() => {
     const onShortcut = (event: KeyboardEvent) => {
       const target = event.target;
-      if (target instanceof HTMLElement && target.closest("input, textarea, select, [contenteditable='true']")) {
+      if (target instanceof HTMLElement && target.closest("input, textarea, select, [contenteditable='true'], [data-annotation-help]")) {
         return;
       }
       if (event.key === "Escape" && focusMode) {
@@ -787,7 +798,7 @@ export function InitialAnnotationWorkbench({
           >
             <img
               src={firstFrame.url}
-              alt={`Segment ${segment.ordinal} resize 后首帧`}
+              alt={`Segment ${clipSegmentOrdinal} resize 后首帧`}
               className="block h-auto w-full select-none"
               draggable={false}
               onLoad={(event) => {
@@ -986,7 +997,7 @@ export function InitialAnnotationWorkbench({
             inert={focusMode ? true : undefined}
           >
             <SegmentRuler
-              segments={job.segments}
+              segments={clipSegments}
               currentSegmentRef={segment.segment_ref}
               disabled={focusMode || submitting}
               onNavigate={onNavigateSegment}
@@ -1006,7 +1017,9 @@ export function InitialAnnotationWorkbench({
         aria-label="目标属性检查器"
         inert={focusMode ? true : undefined}
       >
-        <span className="sr-only">Segment {String(segment.ordinal).padStart(2, "0")}</span>
+        <span className="sr-only">
+          Segment {String(clipSegmentOrdinal).padStart(2, "0")} / {clipSegmentCount}
+        </span>
         <div className={cn(
           "flex min-h-13 shrink-0 items-center justify-between gap-2 border-b border-console-line px-3.5 py-2.5",
           inspectorCollapsed && "justify-center border-b-0 px-2.5 max-[900px]:justify-between max-[900px]:border-b max-[900px]:px-3.5",

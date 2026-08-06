@@ -1,5 +1,5 @@
 import "@testing-library/jest-dom/vitest";
-import { act, fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { act, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import {
   createMemoryRouter,
   MemoryRouter,
@@ -177,10 +177,33 @@ test("annotation workspace exposes URL-backed workbench and review tabs", async 
   );
   expect(screen.getByRole("tab", { name: "人工复核" })).toBeVisible();
   expect(await screen.findByText("处理环境可用")).toBeVisible();
+  expect(screen.getByTestId("annotation-workspace-switcher")).not.toHaveClass("border-b");
   expect(screen.getByText("jobs route")).toBeVisible();
 });
 
-test("review list groups internal review units by outer clip without an AI handoff button", async () => {
+test("annotation workspace hides the list switcher on the Fix workbench route", async () => {
+  const router = createMemoryRouter([
+    {
+      path: "/annotation",
+      element: <AnnotationWorkspaceLayout />,
+      children: [
+        { path: "reviews/:reviewRef", element: <div>fix route</div> },
+      ],
+    },
+  ], { initialEntries: ["/annotation/reviews/review_0123456789abcdef0123456789abcdef"] });
+
+  render(<RouterProvider router={router} future={{ v7_startTransition: true }} />);
+  await act(async () => {
+    await Promise.resolve();
+  });
+
+  expect(screen.getByText("fix route")).toBeVisible();
+  expect(screen.queryByTestId("annotation-workspace-switcher")).not.toBeInTheDocument();
+  expect(screen.queryByRole("tab", { name: "标注任务" })).not.toBeInTheDocument();
+  expect(screen.queryByRole("tab", { name: "人工复核" })).not.toBeInTheDocument();
+});
+
+test("review list groups complete outer-clip reviews and moves clip details into the popover", async () => {
   apiMocks.listTrajectoryReviews.mockResolvedValue([
     review,
     {
@@ -203,13 +226,22 @@ test("review list groups internal review units by outer clip without an AI hando
     </MemoryRouter>,
   );
 
-  expect(await screen.findByText("2 个复核单元")).toBeVisible();
-  expect(screen.getByText("20260605_160904")).toBeVisible();
+  expect(await screen.findByText("0/2")).toBeVisible();
+  expect(screen.getAllByRole("columnheader")).toHaveLength(6);
+  expect(screen.queryByRole("columnheader", { name: /外层 clip/i })).not.toBeInTheDocument();
+  expect(screen.queryByRole("heading", { name: "复核任务" })).not.toBeInTheDocument();
   expect(screen.getByRole("button", { name: "进入人工 Fix" })).toBeVisible();
+  fireEvent.click(screen.getByRole("button", {
+    name: /查看 20270605 20260605_160904 复核详情/,
+  }));
+  const popover = await screen.findByRole("dialog");
+  expect(within(popover).getByText("2 个复核单元")).toBeVisible();
+  expect(within(popover).getByText("20260605_160904")).toBeVisible();
+  expect(within(popover).getByText("尚未选择")).toBeVisible();
   expect(screen.queryByRole("button", { name: /交给 DataPilot 复核/ })).not.toBeInTheDocument();
 });
 
-test("Fix workbench provides an anonymous same-clip Segment queue across active and terminal reviews", async () => {
+test("Fix workbench provides a clip-grouped Segment queue across active and terminal reviews", async () => {
   const terminalReview: TrajectoryReview = {
     ...review,
     review_ref: "review_11111111111111111111111111111111",
@@ -244,8 +276,8 @@ test("Fix workbench provides an anonymous same-clip Segment queue across active 
 
   render(<RouterProvider router={router} future={{ v7_startTransition: true }} />);
 
-  expect(await screen.findByRole("button", { name: "当前 Segment 01" })).toBeVisible();
-  const secondSegment = screen.getByRole("button", { name: "切换到 Segment 02" });
+  expect(await screen.findByRole("button", { name: "当前 Segment 01，待复核" })).toBeVisible();
+  const secondSegment = screen.getByRole("button", { name: "打开 Segment 02，已验证" });
   expect(secondSegment).toHaveTextContent("已验证");
   expect(screen.queryByText(terminalReview.segment_ref)).not.toBeInTheDocument();
 });
@@ -272,7 +304,7 @@ test("Fix workbench keeps sibling Segment statuses synchronized with the shared 
   render(<RouterProvider router={router} future={{ v7_startTransition: true }} />);
 
   const siblingButton = await screen.findByRole("button", {
-    name: "切换到 Segment 02",
+    name: "打开 Segment 02，待复核",
   });
   expect(siblingButton).toHaveTextContent("待复核");
 
@@ -325,7 +357,7 @@ test("only a successfully published approved review is counted and labelled as v
   );
 
   expect(await screen.findByRole("button", { name: /已验证\s*1/ })).toBeVisible();
-  expect(screen.getByText("已批准/发布失败 1")).toBeVisible();
+  expect(screen.getByText("已批准/发布失败")).toBeVisible();
   expect(screen.queryByText("已验证 3")).not.toBeInTheDocument();
 });
 
@@ -400,7 +432,7 @@ test("Fix workbench rejects evidence bound to a stale review revision", async ()
   render(<RouterProvider router={router} future={{ v7_startTransition: true }} />);
 
   expect(await screen.findByRole("heading", { name: "轨迹证据不可用" })).toBeVisible();
-  expect(screen.getByText(/版本与当前复核任务不一致/)).toBeVisible();
+  expect(screen.getAllByText(/版本与当前复核任务不一致/).length).toBeGreaterThanOrEqual(1);
 });
 
 test("Fix workbench displays the bound Gridmap PNG with declared dimensions", async () => {
@@ -551,6 +583,14 @@ test("Fix workbench displays the bound Gridmap PNG with declared dimensions", as
     clientX: 147,
     clientY: 110,
   });
+  const inspector = document.querySelector<HTMLElement>("aside.fix-inspector-panel");
+  expect(inspector).not.toBeNull();
+  if (!inspector) {
+    throw new Error("轨迹属性栏未渲染");
+  }
+  expect(inspector).toHaveAttribute("aria-hidden", "true");
+  expect(inspector).toHaveAttribute("inert");
+  expect(inspector.closest("[data-focus-mode]"))?.toHaveAttribute("data-focus-mode", "true");
   fireEvent.pointerMove(overlay, {
     pointerId: 1,
     clientX: 160,
@@ -561,6 +601,9 @@ test("Fix workbench displays the bound Gridmap PNG with declared dimensions", as
     clientX: 160,
     clientY: 120,
   });
+  expect(inspector).not.toHaveAttribute("aria-hidden");
+  expect(inspector).not.toHaveAttribute("inert");
+  expect(inspector.closest("[data-focus-mode]"))?.toHaveAttribute("data-focus-mode", "false");
   await waitFor(() => expect(apiMocks.applyFixCommand).toHaveBeenCalledWith(
     review.review_ref,
     {
@@ -1043,7 +1086,26 @@ test("restoring a missing target automatically queues the authoritative Fix prev
   });
 
   render(<RouterProvider router={router} future={{ v7_startTransition: true }} />);
-  fireEvent.click(await screen.findByRole("button", { name: "下一帧" }));
+  const frameInput = await screen.findByRole("textbox", { name: "当前帧" });
+  expect(frameInput).toHaveValue("1");
+  fireEvent.change(frameInput, { target: { value: "2" } });
+  fireEvent.keyDown(frameInput, { key: "Enter" });
+  expect(frameInput).toHaveValue("2");
+  expect(screen.getByRole("slider", { name: "轨迹帧时间线" })).toHaveValue("1");
+
+  fireEvent.change(frameInput, { target: { value: "3" } });
+  fireEvent.keyDown(frameInput, { key: "Enter" });
+  expect(frameInput).toHaveValue("2");
+  expect(screen.getByText("帧序号范围为 1 至 2")).toBeVisible();
+
+  const collapseInspector = screen.getByRole("button", { name: "收起轨迹属性" });
+  fireEvent.click(collapseInspector);
+  const expandInspector = screen.getByRole("button", { name: "展开轨迹属性" });
+  expect(expandInspector).toHaveAttribute("aria-expanded", "false");
+  expect(screen.getByRole("region", { name: "相机投影证据" })).toBeVisible();
+  expect(screen.getByRole("region", { name: "Gridmap 与轨迹证据" })).toBeVisible();
+  fireEvent.click(expandInspector);
+
   fireEvent.click(await screen.findByRole("button", { name: "补回目标" }));
 
   await waitFor(() => expect(apiMocks.applyFixCommand).toHaveBeenCalledWith(
@@ -1066,4 +1128,5 @@ test("restoring a missing target automatically queues the authoritative Fix prev
     },
   ));
   expect(await screen.findByText("Fix 版本正在等待执行")).toBeVisible();
+  expect(await screen.findByText("目标已补回，Fix 预览已进入生成队列")).toBeVisible();
 });

@@ -167,7 +167,7 @@ test("reuses list projections and never regresses a newer aggregate revision", a
   });
 });
 
-test("domain events do not materialize detail projections that the SPA never loaded", async () => {
+test("review events materialize only a summary needed by global notifications", async () => {
   const job = jobFixture("job_0123456789abcdef0123456789abcdef", 2);
   const segment = segmentFixture(
     "segment_0123456789abcdef0123456789abcdef",
@@ -205,10 +205,11 @@ test("domain events do not materialize detail projections that the SPA never loa
 
   expect(apiMocks.getAnnotationJob).not.toHaveBeenCalled();
   expect(apiMocks.getAnnotationSegment).not.toHaveBeenCalled();
-  expect(apiMocks.getTrajectoryReview).not.toHaveBeenCalled();
+  expect(apiMocks.getTrajectoryReview).toHaveBeenCalledWith(review.review_ref);
   expect(annotationProjectionStore.getState().jobDetails).toEqual({});
   expect(annotationProjectionStore.getState().segmentDetails).toEqual({});
   expect(annotationProjectionStore.getState().reviewDetails).toEqual({});
+  expect(annotationProjectionStore.getState().reviews).toContainEqual(review);
 });
 
 test("domain events refresh active aggregate projections without rereading lists", async () => {

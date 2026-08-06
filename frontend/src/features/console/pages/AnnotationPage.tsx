@@ -32,6 +32,8 @@ import {
   resetNavigationDatasetSummaryCache,
 } from "../navigationDatasetSummaryCache";
 import { InitialAnnotationWorkbench } from "../../annotation/InitialAnnotationWorkbench";
+import { AnnotationWorkbenchHelp } from "../../annotation/AnnotationWorkbenchHelp";
+import { AnnotationWorkbenchLocation } from "../../annotation/AnnotationWorkbenchLocation";
 import {
   AnnotationApiError,
   mutateAnnotationJob,
@@ -330,7 +332,7 @@ function JobsPage() {
   };
 
   return (
-    <section className="mx-auto max-w-360 px-3 pb-28 pt-4 md:px-4 lg:px-5">
+    <section className="mx-auto max-w-360 px-3 pb-28 pt-2 md:px-4 lg:px-5">
       <JobsIndexView
         jobs={jobs}
         loading={loading}
@@ -830,6 +832,15 @@ function SegmentPage({ jobRef, segmentRef }: { jobRef: string; segmentRef: strin
   }
 
   const status = SEGMENT_STATUS[segment.status];
+  const clipSegments = job.segments
+    .filter((item) => item.source_clip === segment.source_clip)
+    .sort((left, right) => (
+      left.ordinal - right.ordinal
+      || left.segment_ref.localeCompare(right.segment_ref)
+    ));
+  const clipSegmentIndex = clipSegments.findIndex((item) => item.segment_ref === segment.segment_ref);
+  const clipSegmentOrdinal = clipSegmentIndex >= 0 ? clipSegmentIndex + 1 : segment.ordinal;
+  const clipSegmentCount = clipSegments.length || 1;
 
   return (
     <section className="flex h-[calc(100dvh-124px)] min-h-168 flex-col overflow-hidden bg-[#edf0f5] md:h-dvh md:min-h-0">
@@ -837,32 +848,18 @@ function SegmentPage({ jobRef, segmentRef }: { jobRef: string; segmentRef: strin
         enabled={Boolean(editable)}
         flush={flushForNavigation}
       />
-      <div className="relative z-50 flex min-h-14 shrink-0 items-center justify-between gap-3 border-b border-[#e3e6ed] bg-white px-3 py-2 sm:px-4">
-        <div className="flex min-w-0 items-center gap-2">
-          <ConsoleButton
-            className="h-8 w-8 shrink-0 border-transparent bg-transparent px-0 shadow-none hover:border-[#dfe4ed] hover:bg-[#f4f6fa]"
-            variant="ghost"
-            aria-label="返回自动标注任务"
-            onClick={() => void navigateSafely(`/annotation/jobs/${encodeURIComponent(jobRef)}`)}
-          >
-            <ArrowLeft className="h-4 w-4" aria-hidden="true" />
-          </ConsoleButton>
-          <nav aria-label="标注工作台位置" className="flex min-w-0 items-center gap-2 text-xs sm:text-sm">
-            <span className="hidden font-semibold text-[#232a38] sm:inline">自动标注</span>
-            <span className="hidden text-[#a0a7b5] sm:inline" aria-hidden="true">›</span>
-            <span className="truncate font-mono text-[#667085]" title={job.dataset_date}>{job.dataset_date}</span>
-            <span className="text-[#a0a7b5]" aria-hidden="true">/</span>
-            <strong className="shrink-0 font-mono text-[#202938]">
-              Segment {String(segment.ordinal).padStart(2, "0")}
-            </strong>
-            <span className="sr-only">Segment {String(segment.ordinal).padStart(2, "0")} / {job.counts.total}</span>
-          </nav>
-          <StatusTag tone={status.tone}>{status.label}</StatusTag>
-        </div>
-        <div className="flex shrink-0 items-center gap-2">
-          <span className="hidden max-w-56 truncate text-[11px] text-[#7b8494] xl:inline" title={segment.source_clip}>
-            {segment.source_clip}
-          </span>
+      <div className="relative z-50 min-h-16 shrink-0 border-b border-[#e3e6ed] bg-white px-3 py-2 sm:px-4">
+        <AnnotationWorkbenchLocation
+          datasetDate={job.dataset_date}
+          sourceClip={segment.source_clip}
+          segmentOrdinal={clipSegmentOrdinal}
+          segmentCount={clipSegmentCount}
+          statusLabel={status.label}
+          statusTone={status.tone}
+          backLabel="返回自动标注任务"
+          navigationLabel="标注工作台位置"
+          onBack={() => void navigateSafely(`/annotation/jobs/${encodeURIComponent(jobRef)}`)}
+          actions={<>
           {editable && (
             <ConsoleButton className="h-8 bg-white px-3 shadow-none" disabled={acting} onClick={() => setShowSkip(true)}>
               跳过此 Segment
@@ -880,7 +877,9 @@ function SegmentPage({ jobRef, segmentRef }: { jobRef: string; segmentRef: strin
               恢复标注
             </ConsoleButton>
           )}
-        </div>
+          <AnnotationWorkbenchHelp />
+          </>}
+        />
       </div>
 
       {(error || actionError) && (

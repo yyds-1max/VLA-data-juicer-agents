@@ -155,7 +155,7 @@ test("renders the canvas and inspector as one integrated studio workspace", () =
     .toHaveAttribute("data-inspector-reserves-space", "false");
   expect(screen.getByTestId("annotation-zoom-controls"))
     .toHaveAttribute("data-inspector-avoidance", "panel-width");
-  expect(screen.getByText("Segment 01")).toBeVisible();
+  expect(screen.getByText(/Segment 01/)).toBeVisible();
 });
 
 test("collapses the target inspector without removing the image workspace", () => {

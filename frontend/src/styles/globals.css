@@ -34,6 +34,9 @@
   color utility to any element that depends on these defaults.
 */
 @layer base {
+  html {
+    scrollbar-gutter: stable;
+  }
   *,
   ::after,
   ::before,
@@ -170,8 +173,17 @@ body {
   margin: 0;
   min-width: 320px;
   min-height: 100vh;
+  overflow-y: scroll;
   background: #ffffff;
   color: #202431;
+}
+
+/* Radix Select locks page scrolling while its listbox is open. Keep the
+   reserved scrollbar lane stable so opening a Select never shifts the shell. */
+html body[data-scroll-locked] {
+  margin-right: 0 !important;
+  padding-right: 0 !important;
+  overflow-y: scroll !important;
 }
 
 button,
@@ -238,6 +250,45 @@ textarea {
   animation: segment-clip-close 160ms cubic-bezier(0.4, 0, 1, 1);
 }
 
+@keyframes review-segment-horizontal-open {
+  from { width: 0; opacity: 0; transform: translateX(-6px); }
+  to { width: var(--radix-collapsible-content-width); opacity: 1; transform: translateX(0); }
+}
+
+@keyframes review-segment-horizontal-close {
+  from { width: var(--radix-collapsible-content-width); opacity: 1; transform: translateX(0); }
+  to { width: 0; opacity: 0; transform: translateX(-6px); }
+}
+
+.review-segment-horizontal-content[data-state="open"] {
+  animation: review-segment-horizontal-open 180ms cubic-bezier(0.2, 0, 0, 1);
+}
+
+.review-segment-horizontal-content[data-state="closed"] {
+  animation: review-segment-horizontal-close 160ms cubic-bezier(0.4, 0, 1, 1);
+}
+
+.review-queue-horizontal-scroll {
+  scrollbar-gutter: stable;
+  scrollbar-color: rgba(49, 86, 200, 0.55) rgba(226, 232, 240, 0.75);
+  scrollbar-width: thin;
+}
+
+.review-queue-horizontal-scroll::-webkit-scrollbar {
+  height: 8px;
+}
+
+.review-queue-horizontal-scroll::-webkit-scrollbar-track {
+  border-radius: 999px;
+  background: rgba(226, 232, 240, 0.75);
+}
+
+.review-queue-horizontal-scroll::-webkit-scrollbar-thumb {
+  border: 2px solid rgba(226, 232, 240, 0.75);
+  border-radius: 999px;
+  background: rgba(49, 86, 200, 0.62);
+}
+
 /* Annotation studio floating controls mirror annotation-workbench.html. */
 .annotation-inspector-panel {
   top: 1rem;
@@ -256,6 +307,25 @@ textarea {
 
 .annotation-workbench[data-inspector-state="closed"] .annotation-zoom-controls {
   right: 4.625rem;
+}
+
+/* Fix studio keeps evidence dimensions stable while the property panel overlays it. */
+.fix-inspector-panel {
+  top: 4.5rem;
+  right: auto;
+  bottom: 1rem;
+  left: 1rem;
+  width: min(20rem, calc(34% - 2rem));
+}
+
+.fix-inspector-panel[data-collapsed="true"] {
+  width: 2.875rem;
+}
+
+.fix-workbench[data-focus-mode="true"] .fix-inspector-panel {
+  pointer-events: none;
+  opacity: 0;
+  transform: translate3d(-0.75rem, 0, 0);
 }
 
 @media (min-width: 901px) and (max-width: 1120px) {
@@ -293,6 +363,23 @@ textarea {
   .annotation-zoom-controls,
   .annotation-workbench[data-inspector-state="closed"] .annotation-zoom-controls {
     right: 1rem;
+  }
+
+  .fix-inspector-panel,
+  .fix-inspector-panel[data-collapsed="true"] {
+    top: auto;
+    right: 0.75rem;
+    bottom: 4.75rem;
+    left: 0.75rem;
+    width: auto;
+  }
+
+  .fix-inspector-panel {
+    max-height: min(72%, 38rem);
+  }
+
+  .fix-inspector-panel[data-collapsed="true"] {
+    max-height: 2.9375rem;
   }
 }
 
@@ -337,6 +424,57 @@ textarea {
   background: rgba(100, 116, 139, 0.22);
   border: 3px solid rgba(255, 255, 255, 0.8);
   border-radius: 999px;
+}
+
+@keyframes console-notification-bubble-enter {
+  from {
+    opacity: 0;
+    transform: translateY(-0.4rem) scale(0.98);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0) scale(1);
+  }
+}
+
+@keyframes console-notification-bubble-collapse {
+  from {
+    opacity: 1;
+    transform: translateY(0) scale(1);
+  }
+  to {
+    opacity: 0;
+    transform: translateY(-2.5rem) scale(0.08);
+  }
+}
+
+@keyframes console-notification-bell-ring {
+  0%, 100% { transform: rotate(0deg); }
+  20% { transform: rotate(14deg); }
+  40% { transform: rotate(-12deg); }
+  60% { transform: rotate(8deg); }
+  80% { transform: rotate(-5deg); }
+}
+
+.console-notification-bubble {
+  animation: console-notification-bubble-enter 180ms ease-out both;
+}
+
+.console-notification-bubble[data-phase="collapsing"] {
+  animation: console-notification-bubble-collapse 420ms cubic-bezier(0.4, 0, 0.8, 0.2) forwards;
+}
+
+[data-ringing="true"] .console-notification-bell {
+  animation: console-notification-bell-ring 520ms ease-in-out;
+  transform-origin: 50% 15%;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .console-notification-bubble,
+  .console-notification-bubble[data-phase="collapsing"],
+  [data-ringing="true"] .console-notification-bell {
+    animation: none;
+  }
 }
 
 .console-soft-scrollbar.is-scrollbar-vertical-near::-webkit-scrollbar-thumb:vertical,

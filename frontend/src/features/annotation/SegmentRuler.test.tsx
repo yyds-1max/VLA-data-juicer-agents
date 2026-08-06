@@ -2,6 +2,7 @@ import "@testing-library/jest-dom/vitest";
 import { fireEvent, render, screen } from "@testing-library/react";
 
 import { SegmentRuler } from "./SegmentRuler";
+import type { SegmentRulerItem } from "./segmentRulerAdapters";
 import type { AnnotationSegmentStatus, AnnotationSegmentSummary } from "./types";
 
 function segment(
@@ -36,13 +37,13 @@ test("renders real segment states as an accessible colored ruler", () => {
     />,
   );
 
-  expect(screen.getByRole("button", { name: "Segment 01，已提交" })).toBeVisible();
-  expect(screen.getByRole("button", { name: "Segment 02，草稿" })).toHaveAttribute(
+  expect(screen.getByRole("button", { name: "切换到 Segment 01，已提交" })).toHaveTextContent("已提交");
+  expect(screen.getByRole("button", { name: "当前 Segment 02，草稿" })).toHaveAttribute(
     "aria-current",
     "step",
   );
-  expect(screen.getByRole("button", { name: "Segment 03，待标注" })).toBeVisible();
-  expect(screen.getByRole("button", { name: "Segment 04，后处理失败" })).toBeVisible();
+  expect(screen.getByRole("button", { name: "切换到 Segment 03，待标注" })).toHaveTextContent("待标注");
+  expect(screen.getByRole("button", { name: "切换到 Segment 04，后处理失败" })).toHaveTextContent("后处理失败");
 });
 
 test("supports tick, previous, next and numeric keyboard navigation", () => {
@@ -55,7 +56,7 @@ test("supports tick, previous, next and numeric keyboard navigation", () => {
     />,
   );
 
-  fireEvent.click(screen.getByRole("button", { name: "Segment 03，待标注" }));
+  fireEvent.click(screen.getByRole("button", { name: "切换到 Segment 03，待标注" }));
   fireEvent.click(screen.getByRole("button", { name: "上一个 Segment" }));
   fireEvent.click(screen.getByRole("button", { name: "下一个 Segment" }));
   fireEvent.keyDown(window, { key: "4" });
@@ -78,7 +79,7 @@ test("disables navigation while the workbench is in a protected interaction", ()
     />,
   );
 
-  fireEvent.click(screen.getByRole("button", { name: "Segment 03，待标注" }));
+  fireEvent.click(screen.getByRole("button", { name: "切换到 Segment 03，待标注" }));
   fireEvent.keyDown(window, { key: "4" });
   fireEvent.keyDown(window, { key: "Enter" });
   expect(onNavigate).not.toHaveBeenCalled();
@@ -96,10 +97,40 @@ test("uses the reference ruler window and fades overflowing queue edges", () => 
     />,
   );
 
-  const ticks = Array.from(container.querySelectorAll<HTMLButtonElement>("button[aria-label^='Segment ']"));
+  const ticks = Array.from(container.querySelectorAll<HTMLButtonElement>("[aria-label='Segment 状态刻度'] > button"));
   expect(ticks).toHaveLength(21);
   expect(ticks[0]).toHaveStyle({ opacity: "0.12" });
   expect(ticks.at(-1)).toHaveStyle({ opacity: "0.12" });
-  expect(screen.getByRole("button", { name: "Segment 13，待标注" }))
+  expect(screen.getByRole("button", { name: "当前 Segment 13，待标注" }))
     .toHaveAttribute("aria-current", "step");
+});
+
+test("renders the business-neutral model with configurable labels and resolved count", () => {
+  const items: SegmentRulerItem[] = [
+    { id: "review-b", ordinal: 2, label: "修正中", tone: "info", resolved: false },
+    { id: "review-a", ordinal: 1, label: "已验证", tone: "success", resolved: true },
+    { id: "review-c", ordinal: 3, label: "发布失败", tone: "danger", resolved: false },
+  ];
+  const onNavigate = vi.fn();
+
+  render(
+    <SegmentRuler
+      items={items}
+      currentId="review-b"
+      itemLabel="轨迹"
+      resolvedLabel="已验证"
+      onNavigate={onNavigate}
+    />,
+  );
+
+  expect(screen.getByRole("button", { name: "当前 轨迹 02，修正中" }))
+    .toHaveAttribute("aria-current", "step");
+  expect(screen.getByText("已验证", { selector: "div > div" })).toHaveTextContent("已验证 1 / 3");
+
+  fireEvent.click(screen.getByRole("button", { name: "上一个 轨迹" }));
+  fireEvent.keyDown(window, { key: "3" });
+  fireEvent.keyDown(window, { key: "Enter" });
+
+  expect(onNavigate).toHaveBeenNthCalledWith(1, "review-a");
+  expect(onNavigate).toHaveBeenNthCalledWith(2, "review-c");
 });

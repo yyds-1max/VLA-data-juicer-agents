@@ -177,6 +177,9 @@ describe("JobsIndexView", () => {
   test("renders four metrics and a fixed seven-column waiting table", () => {
     renderView();
 
+    expect(screen.getByRole("heading", { name: "标注任务" })).toBeVisible();
+    expect(screen.getByText("导航数据首帧标注、自动处理与任务状态跟踪。")).toBeVisible();
+    expect(screen.queryByText("AUTO ANNOTATION")).not.toBeInTheDocument();
     expect(screen.getAllByText("待首帧标注").length).toBeGreaterThan(0);
     expect(screen.getAllByText("运行中").length).toBeGreaterThan(0);
     expect(screen.getByText("异常任务")).toBeInTheDocument();

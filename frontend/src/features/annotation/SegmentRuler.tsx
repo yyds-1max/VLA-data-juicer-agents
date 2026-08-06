@@ -2,63 +2,86 @@ import { ChevronLeft, ChevronRight } from "lucide-react";
 import { useEffect, useMemo, useRef, useState, type WheelEvent } from "react";
 
 import { cn } from "../../lib/utils";
-import type { AnnotationSegmentStatus, AnnotationSegmentSummary } from "./types";
+import {
+  annotationSegmentsToRulerItems,
+  type SegmentRulerItem,
+  type SegmentRulerTone,
+} from "./segmentRulerAdapters";
+import type { AnnotationSegmentSummary } from "./types";
 
 const MAX_VISIBLE_TICKS = 21;
 const EDGE_FADE_TICKS = 5;
 const JUMP_BUFFER_TIMEOUT_MS = 900;
 
-const STATUS_META: Record<
-  AnnotationSegmentStatus,
-  { label: string; color: string }
-> = {
-  pending_initial_annotation: { label: "待标注", color: "bg-[#a78bfa]" },
-  draft: { label: "草稿", color: "bg-[#f2b84b]" },
-  submitted: { label: "已提交", color: "bg-[#4fc58a]" },
-  skipped: { label: "已跳过", color: "bg-[#8b95a7]" },
-  tracking: { label: "Tracking 中", color: "bg-[#39b9d6]" },
-  tracked: { label: "Tracking 完成", color: "bg-[#5c83df]" },
-  postprocessing: { label: "后处理中", color: "bg-[#586bd6]" },
-  annotated: { label: "已标注", color: "bg-[#35b779]" },
-  postprocessing_failed: { label: "后处理失败", color: "bg-[#ee6b7a]" },
+const TONE_COLOR: Record<SegmentRulerTone, string> = {
+  success: "bg-[#35b779]",
+  info: "bg-[#5c83df]",
+  warning: "bg-[#f2b84b]",
+  danger: "bg-[#ee6b7a]",
+  neutral: "bg-[#8b95a7]",
+  purple: "bg-[#a78bfa]",
+  mint: "bg-[#4fc58a]",
+  cyan: "bg-[#39b9d6]",
+  blue: "bg-[#5c83df]",
+  indigo: "bg-[#586bd6]",
 };
 
 function canUseGlobalShortcut(target: EventTarget | null): boolean {
   if (!(target instanceof HTMLElement)) return true;
-  return !target.closest("input, textarea, select, [contenteditable='true']");
+  if (target.closest("input, textarea, select, [contenteditable='true']")) return false;
+  return !document.querySelector('[role="alertdialog"], [role="dialog"], [role="listbox"]');
 }
 
-export type SegmentRulerProps = {
-  segments: AnnotationSegmentSummary[];
-  currentSegmentRef: string;
-  onNavigate: (segmentRef: string) => void | Promise<void>;
+type SegmentRulerCommonProps = {
+  onNavigate: (id: string) => void | Promise<void>;
   disabled?: boolean;
   className?: string;
+  itemLabel?: string;
+  resolvedLabel?: string;
 };
 
-export function SegmentRuler({
-  segments,
-  currentSegmentRef,
-  onNavigate,
-  disabled = false,
-  className,
-}: SegmentRulerProps) {
-  const sorted = useMemo(
-    () => [...segments].sort((left, right) => (
-      left.ordinal - right.ordinal || left.segment_ref.localeCompare(right.segment_ref)
-    )),
-    [segments],
+export type SegmentRulerModelProps = SegmentRulerCommonProps & {
+  items: SegmentRulerItem[];
+  currentId: string;
+  segments?: never;
+  currentSegmentRef?: never;
+};
+
+export type SegmentRulerLegacyProps = SegmentRulerCommonProps & {
+  segments: AnnotationSegmentSummary[];
+  currentSegmentRef: string;
+  items?: never;
+  currentId?: never;
+};
+
+export type SegmentRulerProps = SegmentRulerModelProps | SegmentRulerLegacyProps;
+
+export type { SegmentRulerItem, SegmentRulerTone } from "./segmentRulerAdapters";
+
+export function SegmentRuler(props: SegmentRulerProps) {
+  const {
+    onNavigate,
+    disabled = false,
+    className,
+    itemLabel = "Segment",
+    resolvedLabel = "完成",
+  } = props;
+  const legacySegments = props.segments;
+  const legacyItems = useMemo(
+    () => legacySegments ? annotationSegmentsToRulerItems(legacySegments) : [],
+    [legacySegments],
   );
-  const currentIndex = Math.max(0, sorted.findIndex((item) => item.segment_ref === currentSegmentRef));
+  const items = props.items ?? legacyItems;
+  const currentId = props.currentId ?? props.currentSegmentRef;
+  const sorted = useMemo(
+    () => [...items].sort((left, right) => (
+      left.ordinal - right.ordinal || left.id.localeCompare(right.id)
+    )),
+    [items],
+  );
+  const currentIndex = Math.max(0, sorted.findIndex((item) => item.id === currentId));
   const current = sorted[currentIndex];
-  const resolvedCount = sorted.filter((item) => (
-    item.status === "submitted"
-    || item.status === "skipped"
-    || item.status === "tracking"
-    || item.status === "tracked"
-    || item.status === "postprocessing"
-    || item.status === "annotated"
-  )).length;
+  const resolvedCount = sorted.filter((item) => item.resolved).length;
   const windowStart = Math.max(
     0,
     Math.min(
@@ -75,8 +98,8 @@ export function SegmentRuler({
   const navigateToIndex = (index: number) => {
     if (disabled || index < 0 || index >= sorted.length) return;
     const next = sorted[index];
-    if (next && next.segment_ref !== currentSegmentRef) {
-      void onNavigate(next.segment_ref);
+    if (next && next.id !== currentId) {
+      void onNavigate(next.id);
     }
   };
 
@@ -85,7 +108,7 @@ export function SegmentRuler({
       if (disabled || !canUseGlobalShortcut(event.target)) return;
       if (/^\d$/.test(event.key)) {
         jumpBufferRef.current = `${jumpBufferRef.current}${event.key}`.slice(-4);
-        setJumpAnnouncement(`已输入 Segment 序号 ${jumpBufferRef.current}，按回车跳转`);
+        setJumpAnnouncement(`已输入${itemLabel}序号 ${jumpBufferRef.current}，按回车跳转`);
         if (jumpTimeoutRef.current !== null) window.clearTimeout(jumpTimeoutRef.current);
         jumpTimeoutRef.current = window.setTimeout(() => {
           jumpBufferRef.current = "";
@@ -105,7 +128,7 @@ export function SegmentRuler({
         event.preventDefault();
         navigateToIndex(index);
       } else {
-        setJumpAnnouncement(`未找到 Segment ${ordinal}`);
+        setJumpAnnouncement(`未找到${itemLabel} ${ordinal}`);
       }
     };
     window.addEventListener("keydown", onKeyDown);
@@ -113,7 +136,7 @@ export function SegmentRuler({
       window.removeEventListener("keydown", onKeyDown);
       if (jumpTimeoutRef.current !== null) window.clearTimeout(jumpTimeoutRef.current);
     };
-  }, [currentSegmentRef, disabled, sorted]);
+  }, [currentId, disabled, itemLabel, sorted]);
 
   const onWheel = (event: WheelEvent<HTMLDivElement>) => {
     if (disabled || sorted.length < 2) return;
@@ -131,23 +154,26 @@ export function SegmentRuler({
     <div
       data-testid="segment-ruler"
       className={cn(
-        "flex min-h-14 max-w-[min(46rem,calc(100vw-2rem))] items-center gap-3 rounded-[14px] border border-white/10 bg-[#141a26]/93 px-3.5 py-2 text-white opacity-60 shadow-[0_10px_28px_rgba(15,23,42,0.28)] backdrop-blur-md transition-[opacity,background-color] duration-160 hover:opacity-100 focus-within:opacity-100 motion-reduce:transition-none",
+        "flex min-h-14 max-w-[min(46rem,calc(100vw-1rem))] items-center gap-1 rounded-[14px] border border-white/10 bg-[#141a26]/93 px-2 py-2 text-white opacity-60 shadow-[0_10px_28px_rgba(15,23,42,0.28)] backdrop-blur-md transition-[opacity,background-color] duration-160 hover:opacity-100 focus-within:opacity-100 sm:gap-3 sm:px-3.5 motion-reduce:transition-none",
         className,
       )}
       onWheel={onWheel}
     >
       <div className="flex shrink-0 items-center gap-2">
-        <span className={cn("size-2 rounded-full", STATUS_META[current.status].color)} aria-hidden="true" />
+        <span className={cn("size-2 rounded-full", TONE_COLOR[current.tone])} aria-hidden="true" />
         <strong className="text-base font-semibold tabular-nums text-[#f0f2f7]">{String(current.ordinal).padStart(2, "0")}</strong>
         <span className="text-[11px] tabular-nums text-[#8b95ab]">/ {sorted.length}</span>
+        <span className="text-[10px] text-[#a7b0c4] md:hidden">
+          {resolvedLabel} {resolvedCount}/{sorted.length}
+        </span>
         <span className="hidden border-l border-white/12 pl-2 text-[11px] text-[#a7b0c4] sm:inline">
-          {STATUS_META[current.status].label}
+          {current.label}
         </span>
       </div>
 
       <button
         type="button"
-        aria-label="上一个 Segment"
+        aria-label={`上一个 ${itemLabel}`}
         disabled={disabled || currentIndex === 0}
         className="flex size-8 shrink-0 items-center justify-center rounded-lg text-white/65 transition-[color,background-color,opacity] duration-150 hover:bg-white/10 hover:text-white active:bg-white/15 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-white disabled:cursor-not-allowed disabled:opacity-30 motion-reduce:transition-none"
         onClick={() => navigateToIndex(currentIndex - 1)}
@@ -155,10 +181,9 @@ export function SegmentRuler({
         <ChevronLeft className="size-4" aria-hidden="true" />
       </button>
 
-      <div className="flex h-8 min-w-0 flex-1 items-end justify-center border-b border-white/16 px-0.5 pb-1" aria-label="Segment 状态刻度">
+      <div className="flex h-8 min-w-0 flex-1 items-end justify-center border-b border-white/16 px-0.5 pb-1" aria-label={`${itemLabel} 状态刻度`}>
         {visible.map((item, visibleIndex) => {
-          const isCurrent = item.segment_ref === currentSegmentRef;
-          const meta = STATUS_META[item.status];
+          const isCurrent = item.id === currentId;
           const hasMoreBefore = windowStart > 0;
           const hasMoreAfter = windowStart + visible.length < sorted.length;
           let edgeOpacity = 1;
@@ -176,22 +201,23 @@ export function SegmentRuler({
           }
           return (
             <button
-              key={item.segment_ref}
+              key={item.id}
               type="button"
-              aria-label={`Segment ${String(item.ordinal).padStart(2, "0")}，${meta.label}`}
+              aria-label={`${isCurrent ? "当前 " : "切换到 "}${itemLabel} ${String(item.ordinal).padStart(2, "0")}，${item.label}`}
               aria-current={isCurrent ? "step" : undefined}
-              title={`Segment ${item.ordinal} · ${meta.label}`}
+              title={`${itemLabel} ${item.ordinal} · ${item.label}`}
               disabled={disabled}
-              className="group flex h-8 w-[9px] shrink-0 items-end justify-center rounded-sm focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-white disabled:cursor-not-allowed"
+              className="group flex h-8 w-[7px] shrink-0 items-end justify-center rounded-sm focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-white disabled:cursor-not-allowed sm:w-[9px]"
               style={{ opacity: isCurrent ? 1 : edgeOpacity }}
               onClick={() => {
-                if (item.segment_ref !== currentSegmentRef) void onNavigate(item.segment_ref);
+                if (item.id !== currentId) void onNavigate(item.id);
               }}
             >
+              <span className="sr-only">{item.label}</span>
               <span
                 className={cn(
                   "block h-[11px] w-[3px] rounded-sm transition-[height,width,box-shadow] duration-150 group-hover:h-[22px] motion-reduce:transition-none",
-                  meta.color,
+                  TONE_COLOR[item.tone],
                   (windowStart + visibleIndex) % 5 === 0 && "h-[17px]",
                   isCurrent && "h-[27px] w-1 shadow-[0_0_0_1.5px_rgba(255,255,255,0.45)] group-hover:h-[27px]",
                 )}
@@ -203,7 +229,7 @@ export function SegmentRuler({
 
       <button
         type="button"
-        aria-label="下一个 Segment"
+        aria-label={`下一个 ${itemLabel}`}
         disabled={disabled || currentIndex >= sorted.length - 1}
         className="flex size-8 shrink-0 items-center justify-center rounded-lg text-white/65 transition-[color,background-color,opacity] duration-150 hover:bg-white/10 hover:text-white active:bg-white/15 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-white disabled:cursor-not-allowed disabled:opacity-30 motion-reduce:transition-none"
         onClick={() => navigateToIndex(currentIndex + 1)}
@@ -212,7 +238,7 @@ export function SegmentRuler({
       </button>
 
       <div className="hidden shrink-0 border-l border-white/15 pl-3 text-[11px] text-white/60 md:block">
-        <span className="tabular-nums text-white/80">{resolvedCount}/{sorted.length}</span> 完成
+        {resolvedLabel} <span className="tabular-nums text-white/80">{resolvedCount} / {sorted.length}</span>
       </div>
       <span className="sr-only" aria-live="polite">{jumpAnnouncement}</span>
     </div>

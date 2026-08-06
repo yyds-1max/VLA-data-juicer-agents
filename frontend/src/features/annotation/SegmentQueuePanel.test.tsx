@@ -60,10 +60,10 @@ test("groups by clip and orders numeric Segment navigation by ordinal", () => {
   expect(within(navigation).getByRole("button", { name: "展开外层 clip clip-b" })).toHaveAttribute("aria-expanded", "false");
   expect(within(navigation).getByRole("button", { name: "打开 Segment 01，待标注" })).toBeVisible();
   expect(within(navigation).getByRole("button", { name: "打开 Segment 02，草稿" })).toBeVisible();
-  expect(within(navigation).queryByRole("button", { name: "打开 Segment 100，已提交" })).not.toBeInTheDocument();
+  expect(within(navigation).queryByRole("button", { name: "打开 Segment 01，已提交" })).not.toBeInTheDocument();
 
   fireEvent.click(within(navigation).getByRole("button", { name: "展开外层 clip clip-b" }));
-  expect(within(navigation).getByRole("button", { name: "打开 Segment 100，已提交" })).toBeVisible();
+  expect(within(navigation).getAllByRole("button", { name: "打开 Segment 01，已提交" })[0]).toBeVisible();
   expect(screen.getByRole("region", { name: "clip-a" })).toBeVisible();
   expect(screen.getByRole("region", { name: "clip-b" })).toBeVisible();
   expect(screen.getByTestId("segment-queue-scroll")).toHaveClass("overflow-y-auto");
@@ -103,7 +103,7 @@ test("opens the group containing the current Segment and leaves other groups col
 
   expect(screen.getByRole("button", { name: "展开外层 clip clip-a" })).toHaveAttribute("aria-expanded", "false");
   expect(screen.getByRole("button", { name: "收起外层 clip clip-b" })).toHaveAttribute("aria-expanded", "true");
-  expect(screen.getByRole("button", { name: "当前 Segment 07，草稿" })).toHaveAttribute("aria-current", "page");
+  expect(screen.getByRole("button", { name: "当前 Segment 01，草稿" })).toHaveAttribute("aria-current", "page");
 });
 
 test("shows per-clip Segment totals and supports independent expand and collapse", () => {
@@ -132,7 +132,7 @@ test("shows per-clip Segment totals and supports independent expand and collapse
 
   fireEvent.click(secondGroup);
   expect(screen.getByRole("button", { name: "收起外层 clip clip-b" })).toHaveAttribute("aria-expanded", "true");
-  expect(screen.getByRole("button", { name: "打开 Segment 03，已跳过" })).toBeVisible();
+  expect(screen.getByRole("button", { name: "打开 Segment 01，已跳过" })).toBeVisible();
   expect(screen.queryByText("选择一个外层 clip")).not.toBeInTheDocument();
 });
 

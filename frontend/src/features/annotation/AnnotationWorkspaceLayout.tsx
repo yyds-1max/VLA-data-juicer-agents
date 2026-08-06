@@ -22,6 +22,8 @@ export function AnnotationWorkspaceLayout() {
   const annotationWorkbench = /^\/annotation\/jobs\/[^/]+\/segments\/[^/]+\/?$/.test(
     location.pathname,
   );
+  const fixWorkbench = /^\/annotation\/reviews\/[^/]+\/?$/.test(location.pathname);
+  const deepWorkbench = annotationWorkbench || fixWorkbench;
 
   useEffect(() => {
     let activeRequest = true;
@@ -47,7 +49,10 @@ export function AnnotationWorkspaceLayout() {
 
   return (
     <>
-      {!annotationWorkbench ? <div className="relative z-0 isolate border-b border-console-line bg-white px-3 py-3 md:px-4 lg:px-5">
+      {!deepWorkbench ? <div
+        data-testid="annotation-workspace-switcher"
+        className="relative z-0 isolate bg-white px-3 pb-1 pt-3 md:px-4 lg:px-5"
+      >
         <div className="mx-auto flex max-w-360 flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
           <ConsoleSlidingTabs
             aria-label="自动标注页面"

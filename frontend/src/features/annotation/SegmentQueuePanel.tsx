@@ -243,9 +243,9 @@ export function SegmentQueuePanel({
                   </Collapsible.Trigger>
                   <Collapsible.Content className="segment-clip-content overflow-hidden">
                     <div className="divide-y divide-[#ECEFF4] border-t border-[#E7EAF0] px-2 py-1">
-                      {segments.map((segment) => {
+                      {segments.map((segment, index) => {
                         const status = segmentStatusMeta[segment.status];
-                        const ordinal = displayOrdinal(segment.ordinal);
+                        const ordinal = displayOrdinal(index + 1);
                         const active = segment.segment_ref === currentSegmentRef;
 
                         return (
