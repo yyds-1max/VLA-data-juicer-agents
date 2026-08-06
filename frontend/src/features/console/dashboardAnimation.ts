@@ -46,8 +46,11 @@ export function animateInteger(target: number, progress: number) {
 
 export function formatAnimatedDuration(totalDurationNs: number, progress: number) {
   const targetSeconds = Math.max(0, totalDurationNs / ONE_SECOND_NS);
+  if (targetSeconds === 0) {
+    return "0 秒";
+  }
   const animatedSeconds =
-    targetSeconds > 0 ? Math.min(targetSeconds, Math.max(Math.min(1, targetSeconds), targetSeconds * clampProgress(progress))) : 0;
+    Math.min(targetSeconds, Math.max(Math.min(1, targetSeconds), targetSeconds * clampProgress(progress)));
 
   if (animatedSeconds < 60) {
     return `${animatedSeconds.toFixed(1)} 秒`;

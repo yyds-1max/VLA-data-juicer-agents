@@ -7,10 +7,8 @@ import {
   Clock3,
   Database,
   Files,
-  Filter,
   Images,
   Layers3,
-  Route,
   Search,
   X,
   type LucideIcon,
@@ -27,7 +25,16 @@ import type {
 } from "../../../api/types";
 import { ConsoleButton } from "../../../components/console/ConsoleButton";
 import { ConsoleCard } from "../../../components/console/ConsoleCard";
+import { ConsoleSlidingTabs } from "../../../components/console/ConsoleSlidingTabs";
 import { StatusTag } from "../../../components/console/StatusTag";
+import { Input } from "../../../components/ui/input";
+import {
+  Select,
+  SelectContent,
+  SelectItem,
+  SelectTrigger,
+  SelectValue,
+} from "../../../components/ui/select";
 import { datapilotStore } from "../../../store/datapilotStore";
 import type { StatusTone } from "../consoleTypes";
 import { NavigationDataPilotDialog } from "../components/NavigationDataPilotDialog";
@@ -57,19 +64,12 @@ const statusTones: Record<NavigationDatasetStatus, StatusTone> = {
 };
 
 type DataSurface = "navigation" | "robotic_arm";
-type SceneFilter = "all" | "outdoor" | "indoor";
 type StatusFilter = "all" | NavigationDatasetStatus;
 
 const dataSurfaces = [
-  { id: "navigation", label: "导航数据", icon: Route },
-  { id: "robotic_arm", label: "机械臂数据", icon: Bot },
-] satisfies Array<{ id: DataSurface; label: string; icon: LucideIcon }>;
-
-const sceneOptions = [
-  { value: "all", label: "全部场景" },
-  { value: "outdoor", label: "室外导航" },
-  { value: "indoor", label: "室内导航" },
-] satisfies Array<{ value: SceneFilter; label: string }>;
+  { value: "navigation", label: "导航数据" },
+  { value: "robotic_arm", label: "机械臂数据" },
+] satisfies Array<{ value: DataSurface; label: string }>;
 
 const statusOptions = [
   { value: "all", label: "全部状态" },
@@ -239,13 +239,13 @@ function ClipRows({
   const clipScrollbar = useScrollbarProximity();
 
   return (
-    <tr>
-      <td colSpan={8} className="bg-console-panel2/45 px-3 py-0">
+    <tr className="border-b border-slate-200 bg-slate-50/55">
+      <td colSpan={8} className="px-0 py-0">
         {clips.length === 0 ? (
-          <div className="border-b border-console-line px-4 py-5 text-sm text-console-muted">该日期暂无 clip 明细。</div>
+          <div className="border-l-2 border-blue-200 px-16 py-6 text-sm text-slate-500">该日期暂无 clip 明细。</div>
         ) : (
           <div
-            className={`console-soft-scrollbar max-h-80 overflow-auto ${
+            className={`console-soft-scrollbar max-h-80 overflow-auto border-l-2 border-blue-200 ${
               clipScrollbar.isVerticalScrollbarNear ? "is-scrollbar-vertical-near" : ""
             } ${clipScrollbar.isHorizontalScrollbarNear ? "is-scrollbar-horizontal-near" : ""}`}
             data-testid="navigation-clip-scroll"
@@ -253,18 +253,18 @@ function ClipRows({
             onPointerLeave={clipScrollbar.onPointerLeave}
             onPointerMove={clipScrollbar.onPointerMove}
           >
-            <table className="w-full min-w-[980px] text-left text-sm">
-              <thead className="text-xs text-console-muted">
-                <tr className="border-b border-console-line bg-transparent">
-                  <th className="py-2 pl-3 pr-3 font-medium">clip 名称</th>
-                  <th className="py-2 pr-3 font-medium">时长</th>
-                  <th className="py-2 pr-3 font-medium">topic 摘要</th>
-                  <th className="py-2 pr-3 font-medium">raw 消息</th>
-                  <th className="py-2 pr-3 font-medium">tmp_dir</th>
-                  <th className="py-2 pr-3 font-medium">sync_data</th>
-                  <th className="py-2 pr-3 font-medium">同步图像帧</th>
-                  <th className="py-2 pr-3 font-medium">状态</th>
-                  <th className="py-2 pr-3 font-medium">操作</th>
+            <table className="w-full min-w-[1060px] text-left text-sm">
+              <thead className="text-xs text-slate-500">
+                <tr className="h-10 border-b border-slate-200/90 bg-slate-50/80">
+                  <th className="pl-16 pr-3 font-medium">clip 名称</th>
+                  <th className="pr-3 font-medium">时长</th>
+                  <th className="pr-3 font-medium">topic 摘要</th>
+                  <th className="pr-3 font-medium">raw 消息</th>
+                  <th className="pr-3 font-medium">tmp_dir</th>
+                  <th className="pr-3 font-medium">sync_data</th>
+                  <th className="pr-3 font-medium">同步图像帧</th>
+                  <th className="pr-3 font-medium">状态</th>
+                  <th className="pr-4 text-right font-medium">操作</th>
                 </tr>
               </thead>
               <tbody>
@@ -275,33 +275,34 @@ function ClipRows({
                   return (
                     <tr
                       key={`${clip.date}-${clip.clip}`}
-                      className={`border-b border-console-line/70 bg-console-panel/70 last:border-b-0 ${
-                        isHighlighted ? "bg-console-cyan/10 ring-1 ring-inset ring-console-cyan/25" : ""
+                      className={`h-14 border-b border-slate-200/80 bg-white/70 transition-[background-color,box-shadow] duration-150 last:border-b-0 hover:bg-blue-50/45 motion-reduce:transition-none ${
+                        isHighlighted ? "bg-console-cyan/10 bg-blue-50/80 ring-1 ring-inset ring-blue-300/60" : ""
                       }`}
                     >
-                      <td className="py-3 pl-3 pr-3 font-medium text-console-text">
+                      <td className="pl-16 pr-3 font-medium text-slate-800">
                         {clip.clip}
                       </td>
-                      <td className="py-3 pr-3 text-console-muted">{formatDuration(clip.duration_ns)}</td>
-                      <td className="max-w-[18rem] truncate py-3 pr-3 text-console-muted" title={formatTopics(clip.topics)}>
+                      <td className="pr-3 text-slate-500">{formatDuration(clip.duration_ns)}</td>
+                      <td className="max-w-[18rem] truncate pr-3 text-slate-500" title={formatTopics(clip.topics)}>
                         {formatTopics(clip.topics)}
                       </td>
-                      <td className="py-3 pr-3 text-console-muted">{formatCount(clip.raw_message_count)}</td>
-                      <td className="py-3 pr-3 text-console-muted">{clip.has_tmp_dir ? "已存在" : "缺失"}</td>
-                      <td className="py-3 pr-3 text-console-muted">{clip.has_sync_data ? "已存在" : "缺失"}</td>
-                      <td className="py-3 pr-3 text-console-muted">{formatCount(clip.sync_frame_counts.image)}</td>
-                      <td className="py-3 pr-3">
+                      <td className="pr-3 text-slate-500">{formatCount(clip.raw_message_count)}</td>
+                      <td className="pr-3 text-slate-500">{clip.has_tmp_dir ? "已存在" : "缺失"}</td>
+                      <td className="pr-3 text-slate-500">{clip.has_sync_data ? "已存在" : "缺失"}</td>
+                      <td className="pr-3 text-slate-500">{formatCount(clip.sync_frame_counts.image)}</td>
+                      <td className="pr-3">
                         <StatusCell status={clip.status} />
                       </td>
-                      <td className="py-3 pr-3">
-                        <ConsoleButton
-                          className="h-8 px-2 text-xs"
+                      <td className="pr-4 text-right">
+                        <button
+                          className="inline-flex h-8 items-center rounded-md px-2 text-xs font-medium text-blue-600 transition-[color,background-color] duration-150 hover:bg-blue-50 hover:text-blue-700 active:bg-blue-100 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-blue-500 disabled:cursor-not-allowed disabled:opacity-45 motion-reduce:transition-none"
                           disabled={clip.sync_frame_counts.image === 0}
                           aria-label={`查看 ${clip.clip} 同步图像`}
                           onClick={(event: MouseEvent<HTMLButtonElement>) => onViewSyncImages(clip, event.currentTarget)}
+                          type="button"
                         >
                           查看同步图像
-                        </ConsoleButton>
+                        </button>
                       </td>
                     </tr>
                   );
@@ -321,30 +322,25 @@ function DatasetTable({
   highlightedClip,
   onToggleDate,
   onViewSyncImages,
-  onOpenDataPilot,
 }: {
   dates: NavigationDateSummary[];
   expandedDate: string | null;
   highlightedClip: string | null;
   onToggleDate: (date: string) => void;
   onViewSyncImages: (clip: NavigationClipSummary, opener: HTMLElement) => void;
-  onOpenDataPilot: () => void;
 }) {
   const datasetScrollbar = useScrollbarProximity();
 
   return (
-    <section className="overflow-hidden rounded-lg border border-console-line bg-console-panel shadow-xs">
-      <div className="flex flex-col items-start justify-between gap-3 border-b border-console-line px-4 py-3 sm:flex-row sm:items-center">
+    <div>
+      <div className="flex flex-col items-start justify-between gap-1 border-b border-slate-200 px-4 py-3 sm:flex-row sm:items-center sm:px-5">
         <p className="text-sm text-console-muted">
           共 <span className="font-semibold text-console-text">{formatCount(dates.length)}</span> 个日期批次
         </p>
-        <ConsoleButton variant="primary" onClick={onOpenDataPilot}>
-          <Bot aria-hidden="true" className="h-4 w-4" />
-          交给 DataPilot
-        </ConsoleButton>
+        <p className="text-xs text-slate-400">展开日期可查看对应 clip 明细</p>
       </div>
       <div
-        className={`console-soft-scrollbar max-h-[62vh] overflow-auto pb-3 ${
+        className={`console-soft-scrollbar max-h-[60vh] overflow-auto ${
           datasetScrollbar.isVerticalScrollbarNear ? "is-scrollbar-vertical-near" : ""
         } ${datasetScrollbar.isHorizontalScrollbarNear ? "is-scrollbar-horizontal-near" : ""}`}
         data-testid="navigation-dataset-scroll"
@@ -352,25 +348,28 @@ function DatasetTable({
         onPointerLeave={datasetScrollbar.onPointerLeave}
         onPointerMove={datasetScrollbar.onPointerMove}
       >
-        <table className="w-full min-w-[980px] text-left text-sm">
-          <thead className="text-xs text-console-muted">
-            <tr className="border-b border-console-line bg-console-panel2/70">
-              <th className="py-3 pl-4 pr-3 font-medium">日期</th>
-              <th className="py-2 pr-3 font-medium">clip 数</th>
-              <th className="py-2 pr-3 font-medium">总时长</th>
-              <th className="py-2 pr-3 font-medium">raw 消息</th>
-              <th className="py-2 pr-3 font-medium">已拆解 clip</th>
-              <th className="py-2 pr-3 font-medium">同步 clip 数</th>
-              <th className="py-2 pr-3 font-medium">同步图像帧</th>
-              <th className="py-2 pr-4 font-medium">状态</th>
+        <table className="w-full min-w-[1040px] text-left text-sm">
+          <thead className="text-xs text-slate-500">
+            <tr className="h-11 border-b border-slate-200 bg-white">
+              <th className="pl-4 pr-3 font-medium sm:pl-5">日期</th>
+              <th className="pr-3 font-medium">clip 数</th>
+              <th className="pr-3 font-medium">总时长</th>
+              <th className="pr-3 font-medium">raw 消息</th>
+              <th className="pr-3 font-medium">已拆解 clip</th>
+              <th className="pr-3 font-medium">同步 clip 数</th>
+              <th className="pr-3 font-medium">同步图像帧</th>
+              <th className="pr-5 font-medium">状态</th>
             </tr>
           </thead>
           <tbody>
             {dates.length === 0 ? (
               <tr>
-                <td colSpan={8} className="px-4 py-10 text-center text-sm text-console-muted">
-                  <Layers3 aria-hidden="true" className="mx-auto mb-3 h-6 w-6" />
-                  暂无匹配的导航数据集。
+                <td colSpan={8} className="h-[19rem] px-4 text-center text-sm text-slate-500">
+                  <span className="mx-auto mb-3 flex size-11 items-center justify-center rounded-xl border border-slate-200 bg-slate-50 text-slate-400">
+                    <Layers3 aria-hidden="true" className="size-5" />
+                  </span>
+                  <span className="block font-medium text-slate-700">暂无匹配的导航数据</span>
+                  <span className="mt-1 block text-xs text-slate-400">请调整搜索词或状态筛选。</span>
                 </td>
               </tr>
             ) : dates.map((date) => {
@@ -379,13 +378,13 @@ function DatasetTable({
 
               return (
                 <Fragment key={date.date}>
-                  <tr className={`border-b border-console-line/70 transition-colors hover:bg-console-panel2/55 ${isExpanded ? "bg-blue-50/35" : ""}`}>
-                    <td className="py-3 pl-3 pr-3 font-medium text-console-text">
+                  <tr className={`h-[68px] border-b border-slate-100 transition-[background-color] duration-150 hover:bg-blue-50/35 motion-reduce:transition-none ${isExpanded ? "bg-blue-50/55" : ""}`}>
+                    <td className="pl-3 pr-3 font-medium text-slate-800 sm:pl-4">
                       <div className="flex items-center gap-2">
                         <button
                           aria-expanded={isExpanded}
                           aria-label={`${isExpanded ? "收起" : "展开"} ${date.date}`}
-                          className="flex h-7 w-7 shrink-0 items-center justify-center rounded-md text-console-muted transition hover:bg-console-panel2 hover:text-console-cyan focus:outline-hidden focus:ring-2 focus:ring-console-cyan"
+                          className="flex size-8 shrink-0 items-center justify-center rounded-lg border border-transparent text-slate-500 transition-[color,background-color,border-color] duration-150 hover:border-blue-100 hover:bg-blue-50 hover:text-blue-600 active:bg-blue-100 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-blue-500 motion-reduce:transition-none"
                           onClick={() => onToggleDate(date.date)}
                           type="button"
                         >
@@ -394,13 +393,13 @@ function DatasetTable({
                         <span>{date.date}</span>
                       </div>
                     </td>
-                    <td className="py-3 pr-3 text-console-muted">{formatCount(date.clip_count)}</td>
-                    <td className="py-3 pr-3 text-console-muted">{formatDuration(date.total_duration_ns)}</td>
-                    <td className="py-3 pr-3 text-console-muted">{formatCount(date.raw_message_count)}</td>
-                    <td className="py-3 pr-3 text-console-muted">{formatCount(date.extracted_clip_count)}</td>
-                    <td className="py-3 pr-3 text-console-muted">{formatCount(date.synced_clip_count)}</td>
-                    <td className="py-3 pr-3 text-console-muted">{formatCount(date.sync_frame_counts.image)}</td>
-                    <td className="py-3 pr-4">
+                    <td className="pr-3 text-slate-500">{formatCount(date.clip_count)}</td>
+                    <td className="pr-3 text-slate-500">{formatDuration(date.total_duration_ns)}</td>
+                    <td className="pr-3 text-slate-500">{formatCount(date.raw_message_count)}</td>
+                    <td className="pr-3 text-slate-500">{formatCount(date.extracted_clip_count)}</td>
+                    <td className="pr-3 text-slate-500">{formatCount(date.synced_clip_count)}</td>
+                    <td className="pr-3 text-slate-500">{formatCount(date.sync_frame_counts.image)}</td>
+                    <td className="pr-5">
                       <StatusCell status={date.status} />
                     </td>
                   </tr>
@@ -411,79 +410,6 @@ function DatasetTable({
           </tbody>
         </table>
       </div>
-    </section>
-  );
-}
-
-function SelectMenu<T extends string>({
-  label,
-  options,
-  value,
-  onChange,
-}: {
-  label: string;
-  options: Array<{ value: T; label: string }>;
-  value: T;
-  onChange: (value: T) => void;
-}) {
-  const [open, setOpen] = useState(false);
-  const menuRef = useRef<HTMLDivElement | null>(null);
-  const activeLabel = options.find((option) => option.value === value)?.label ?? label;
-
-  useEffect(() => {
-    if (!open) {
-      return;
-    }
-
-    function handlePointerDown(event: PointerEvent) {
-      if (event.target instanceof Node && !menuRef.current?.contains(event.target)) {
-        setOpen(false);
-      }
-    }
-
-    function handleKeyDown(event: globalThis.KeyboardEvent) {
-      if (event.key === "Escape") {
-        setOpen(false);
-      }
-    }
-
-    document.addEventListener("pointerdown", handlePointerDown);
-    document.addEventListener("keydown", handleKeyDown);
-
-    return () => {
-      document.removeEventListener("pointerdown", handlePointerDown);
-      document.removeEventListener("keydown", handleKeyDown);
-    };
-  }, [open]);
-
-  return (
-    <div className="relative" ref={menuRef}>
-      <ConsoleButton aria-expanded={open} aria-haspopup="listbox" onClick={() => setOpen((current) => !current)}>
-        <Filter aria-hidden="true" className="h-4 w-4" />
-        {activeLabel}
-        <ChevronDown aria-hidden="true" className="h-4 w-4" />
-      </ConsoleButton>
-      {open ? (
-        <div className="absolute left-0 top-11 z-20 min-w-36 rounded-lg border border-console-line bg-console-panel p-1 shadow-lg" role="listbox" aria-label={label}>
-          {options.map((option) => (
-            <button
-              key={option.value}
-              type="button"
-              role="option"
-              aria-selected={option.value === value}
-              className={`block w-full rounded-md px-3 py-2 text-left text-sm transition ${
-                option.value === value ? "bg-console-panel2 font-semibold text-console-text" : "text-console-muted hover:bg-console-panel2 hover:text-console-text"
-              }`}
-              onClick={() => {
-                onChange(option.value);
-                setOpen(false);
-              }}
-            >
-              {option.label}
-            </button>
-          ))}
-        </div>
-      ) : null}
     </div>
   );
 }
@@ -496,36 +422,13 @@ function DataSurfaceSwitch({
   onChange: (surface: DataSurface) => void;
 }) {
   return (
-    <div
-      className="relative grid h-10 w-60 grid-cols-2 rounded-lg bg-console-panel2 p-1 ring-1 ring-inset ring-console-line"
-      role="tablist"
+    <ConsoleSlidingTabs
       aria-label="数据类型"
-    >
-      <span
-        aria-hidden="true"
-        className={`pointer-events-none absolute bottom-1 left-1 top-1 w-[calc(50%-0.25rem)] rounded-md border border-console-line/80 bg-console-panel shadow-xs transition-transform duration-200 ease-out ${
-          activeSurface === "robotic_arm" ? "translate-x-full" : "translate-x-0"
-        }`}
-      />
-      {dataSurfaces.map((surface) => {
-        const active = activeSurface === surface.id;
-
-        return (
-          <button
-            key={surface.id}
-            type="button"
-            role="tab"
-            aria-selected={active}
-            className={`relative z-10 inline-flex h-8 items-center justify-center rounded-md px-3 text-sm font-semibold transition focus:outline-hidden focus-visible:ring-2 focus-visible:ring-slate-300 ${
-              active ? "text-console-text" : "text-console-muted hover:text-console-text"
-            }`}
-            onClick={() => onChange(surface.id)}
-          >
-            {surface.label}
-          </button>
-        );
-      })}
-    </div>
+      value={activeSurface}
+      items={dataSurfaces}
+      listClassName="sm:min-w-60"
+      onValueChange={onChange}
+    />
   );
 }
 
@@ -566,13 +469,13 @@ function SearchSuggestions({
   }
 
   return (
-    <div className="absolute left-0 right-0 top-11 z-20 rounded-lg border border-console-line bg-console-panel p-1 shadow-lg" role="listbox" aria-label="搜索建议">
+    <div className="absolute left-0 right-0 top-11 z-30 rounded-lg border border-slate-200 bg-white p-1 shadow-lg" role="listbox" aria-label="搜索建议">
       {suggestions.map((suggestion) => (
         <button
           key={`${suggestion.type}-${suggestion.label}`}
           type="button"
           role="option"
-          className="block w-full rounded-md px-3 py-2 text-left text-sm text-console-muted transition hover:bg-console-panel2 hover:text-console-text"
+          className="block w-full rounded-md px-3 py-2 text-left text-sm text-slate-600 transition-[color,background-color] duration-150 hover:bg-blue-50/70 hover:text-slate-900 focus-visible:outline-2 focus-visible:outline-offset-[-2px] focus-visible:outline-blue-500 motion-reduce:transition-none"
           onClick={() => {
             if (suggestion.type === "date") {
               onSelectDate(suggestion.date);
@@ -584,6 +487,83 @@ function SearchSuggestions({
           {suggestion.label}
         </button>
       ))}
+    </div>
+  );
+}
+
+function NavigationListToolbar({
+  dates,
+  query,
+  showSuggestions,
+  status,
+  onChangeQuery,
+  onClearQuery,
+  onFocusQuery,
+  onOpenDataPilot,
+  onSelectClip,
+  onSelectDate,
+  onStatusChange,
+}: {
+  dates: NavigationDateSummary[];
+  query: string;
+  showSuggestions: boolean;
+  status: StatusFilter;
+  onChangeQuery: (query: string) => void;
+  onClearQuery: () => void;
+  onFocusQuery: () => void;
+  onOpenDataPilot: () => void;
+  onSelectClip: (date: string, clip: string) => void;
+  onSelectDate: (date: string) => void;
+  onStatusChange: (status: StatusFilter) => void;
+}) {
+  return (
+    <div className="flex flex-col gap-3 border-b border-slate-200 px-4 py-4 sm:px-5 lg:flex-row lg:items-center">
+      <div className="relative min-w-0 flex-1 lg:max-w-sm">
+        <Search aria-hidden="true" className="pointer-events-none absolute left-3 top-1/2 z-10 size-4 -translate-y-1/2 text-slate-400" />
+        <Input
+          aria-label="搜索导航数据"
+          className="h-10 bg-white pl-9 pr-9 shadow-none"
+          placeholder="按日期或 clip 搜索"
+          value={query}
+          onChange={(event) => onChangeQuery(event.target.value)}
+          onFocus={onFocusQuery}
+        />
+        {query ? (
+          <button
+            type="button"
+            aria-label="清空搜索"
+            className="absolute right-2 top-1/2 z-10 flex size-7 -translate-y-1/2 items-center justify-center rounded-md text-slate-400 transition-[color,background-color] duration-150 hover:bg-slate-100 hover:text-slate-700 active:bg-slate-200 focus-visible:outline-2 focus-visible:outline-offset-1 focus-visible:outline-blue-500 motion-reduce:transition-none"
+            onClick={onClearQuery}
+          >
+            <X aria-hidden="true" className="size-4" />
+          </button>
+        ) : null}
+        <SearchSuggestions
+          query={query}
+          dates={dates}
+          visible={showSuggestions}
+          onSelectDate={onSelectDate}
+          onSelectClip={onSelectClip}
+        />
+      </div>
+
+      <Select value={status} onValueChange={(value) => onStatusChange(value as StatusFilter)}>
+        <SelectTrigger aria-label="导航数据状态筛选" className="h-10 w-full bg-white shadow-none lg:w-44">
+          <SelectValue />
+        </SelectTrigger>
+        <SelectContent align="start" position="popper">
+          {statusOptions.map((option) => (
+            <SelectItem key={option.value} value={option.value}>
+              {option.label}
+            </SelectItem>
+          ))}
+        </SelectContent>
+      </Select>
+
+      <ConsoleButton className="h-10 lg:ml-auto" variant="primary" onClick={onOpenDataPilot}>
+        <Bot aria-hidden="true" className="size-4" />
+        交给 DataPilot
+      </ConsoleButton>
     </div>
   );
 }
@@ -604,6 +584,41 @@ function RoboticArmPlaceholder() {
   );
 }
 
+function ImageStepButton({
+  direction,
+  disabled,
+  onClick,
+}: {
+  direction: "previous" | "next";
+  disabled: boolean;
+  onClick: () => void;
+}) {
+  const isPrevious = direction === "previous";
+  const Icon = isPrevious ? ChevronLeft : ChevronRight;
+  const label = isPrevious ? "上一张" : "下一张";
+
+  return (
+    <button
+      aria-label={label}
+      className="inline-flex h-9 min-w-20 items-center justify-center gap-1 rounded-lg border border-slate-200 bg-white px-2.5 text-sm font-medium text-slate-700 shadow-xs transition-[color,background-color,border-color,box-shadow] duration-150 hover:border-blue-200 hover:bg-blue-50/60 hover:text-blue-700 active:border-blue-300 active:bg-blue-100 disabled:cursor-not-allowed disabled:border-slate-100 disabled:bg-slate-50 disabled:text-slate-300 disabled:shadow-none focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-blue-500 data-[pointer-focus=true]:outline-none motion-reduce:transition-none"
+      disabled={disabled}
+      onBlur={(event) => {
+        delete event.currentTarget.dataset.pointerFocus;
+      }}
+      onClick={onClick}
+      onPointerDown={(event) => {
+        // 鼠标点击不保留焦点环；键盘进入时仍由 focus-visible 提供可访问焦点。
+        event.currentTarget.dataset.pointerFocus = "true";
+      }}
+      type="button"
+    >
+      {isPrevious ? <Icon aria-hidden="true" className="size-4" /> : null}
+      {label}
+      {!isPrevious ? <Icon aria-hidden="true" className="size-4" /> : null}
+    </button>
+  );
+}
+
 function SyncImageDrawer({
   clip,
   onClose,
@@ -617,6 +632,8 @@ function SyncImageDrawer({
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const closeButtonRef = useRef<HTMLButtonElement | null>(null);
+  const sequenceButtonRefs = useRef(new Map<string, HTMLButtonElement>());
+  const activeImageButtonRef = useRef<HTMLButtonElement | null>(null);
 
   useEffect(() => {
     if (!clip) {
@@ -634,6 +651,7 @@ function SyncImageDrawer({
     async function loadSyncImages() {
       try {
         const nextListing = await getSyncImages(openedClip.date, openedClip.clip);
+        // 抽屉可能在请求完成前切换到另一个 clip；只提交当前仍有效的请求结果。
         if (isMounted) {
           setListing(nextListing);
           setActiveSequence(nextListing.sequences[0]?.sequence ?? null);
@@ -663,6 +681,22 @@ function SyncImageDrawer({
     }
   }, [clip]);
 
+  useEffect(() => {
+    // 序列很多时保持单行横向队列，并让当前项自动进入可视区域。
+    const activeButton = activeSequence ? sequenceButtonRefs.current.get(activeSequence) : null;
+    if (activeButton && typeof activeButton.scrollIntoView === "function") {
+      activeButton.scrollIntoView({ block: "nearest", inline: "nearest" });
+    }
+  }, [activeSequence]);
+
+  useEffect(() => {
+    // 上一张/下一张切换后同步滚动左侧文件队列，长序列中也能定位当前帧。
+    const activeButton = activeImageButtonRef.current;
+    if (activeButton && typeof activeButton.scrollIntoView === "function") {
+      activeButton.scrollIntoView({ block: "nearest", inline: "nearest" });
+    }
+  }, [activeSequence, selectedImageIndex]);
+
   if (!clip) {
     return null;
   }
@@ -679,6 +713,28 @@ function SyncImageDrawer({
   function handleSelectSequence(sequence: string) {
     setActiveSequence(sequence);
     setSelectedImageIndex(0);
+  }
+
+  function handleSequenceKeyDown(event: KeyboardEvent<HTMLButtonElement>, index: number) {
+    let nextIndex = index;
+    if (event.key === "ArrowRight") {
+      nextIndex = Math.min(index + 1, sequences.length - 1);
+    } else if (event.key === "ArrowLeft") {
+      nextIndex = Math.max(index - 1, 0);
+    } else if (event.key === "Home") {
+      nextIndex = 0;
+    } else if (event.key === "End") {
+      nextIndex = sequences.length - 1;
+    } else {
+      return;
+    }
+
+    event.preventDefault();
+    const nextSequence = sequences[nextIndex]?.sequence;
+    if (nextSequence) {
+      handleSelectSequence(nextSequence);
+      sequenceButtonRefs.current.get(nextSequence)?.focus();
+    }
   }
 
   function handleKeyDown(event: KeyboardEvent<HTMLElement>) {
@@ -708,7 +764,7 @@ function SyncImageDrawer({
           </div>
           <button
             aria-label="关闭同步图像浏览"
-            className="inline-flex h-8 items-center justify-center gap-2 rounded-lg border border-console-line bg-console-panel px-2 text-sm font-medium text-console-text shadow-xs transition hover:border-console-cyan/40 hover:bg-console-panel2 focus:outline-hidden focus:ring-2 focus:ring-console-cyan"
+            className="inline-flex size-8 items-center justify-center rounded-lg border border-slate-200 bg-white text-slate-600 shadow-xs transition-[color,background-color,border-color] duration-150 hover:border-blue-200 hover:bg-blue-50 hover:text-blue-700 active:bg-blue-100 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-blue-500 motion-reduce:transition-none"
             onClick={onClose}
             ref={closeButtonRef}
             type="button"
@@ -727,26 +783,51 @@ function SyncImageDrawer({
           ) : (
             <div className="flex min-h-0 flex-col gap-4">
               {sequences.length > 1 ? (
-                <div className="flex flex-wrap gap-2" role="tablist" aria-label="同步图像序列">
-                  {sequences.map((sequence) => {
-                    const isActive = sequence.sequence === currentSequence?.sequence;
-                    return (
-                      <button
-                        aria-selected={isActive}
-                        className={`rounded-lg border px-3 py-1.5 text-sm transition focus:outline-hidden focus:ring-2 focus:ring-console-cyan ${
-                          isActive
-                            ? "border-console-cyan bg-console-cyan/10 text-console-text"
-                            : "border-console-line bg-console-panel2 text-console-muted hover:text-console-text"
-                        }`}
-                        key={sequence.sequence}
-                        onClick={() => handleSelectSequence(sequence.sequence)}
-                        role="tab"
-                        type="button"
-                      >
-                        {sequence.sequence}
-                      </button>
-                    );
-                  })}
+                <div className="grid min-w-0 grid-cols-[auto_minmax(0,1fr)] items-center gap-3 border-b border-slate-200 pb-1">
+                  <p className="whitespace-nowrap pb-2 text-xs font-medium text-slate-500">
+                    同步序列
+                    <span className="ml-1 font-semibold text-slate-800">
+                      {Math.max(0, sequences.findIndex((sequence) => sequence.sequence === currentSequence?.sequence)) + 1}
+                      <span className="mx-1 text-slate-300">/</span>
+                      {sequences.length}
+                    </span>
+                  </p>
+                  <div
+                    className="console-soft-scrollbar flex min-w-0 flex-nowrap gap-2 overflow-x-auto pb-2"
+                    data-testid="sync-sequence-scroll"
+                    role="tablist"
+                    aria-label="同步图像序列"
+                  >
+                    {sequences.map((sequence, index) => {
+                      const isActive = sequence.sequence === currentSequence?.sequence;
+                      return (
+                        <button
+                          aria-selected={isActive}
+                          className={`max-w-64 shrink-0 truncate rounded-lg border px-3 py-1.5 text-sm transition-[color,background-color,border-color] duration-150 active:bg-blue-100 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-blue-500 motion-reduce:transition-none ${
+                            isActive
+                              ? "border-blue-500 bg-blue-50/80 font-medium text-slate-800"
+                              : "border-slate-200 bg-slate-50 text-slate-500 hover:border-blue-200 hover:bg-blue-50/55 hover:text-slate-800"
+                          }`}
+                          key={sequence.sequence}
+                          onClick={() => handleSelectSequence(sequence.sequence)}
+                          onKeyDown={(event) => handleSequenceKeyDown(event, index)}
+                          ref={(node) => {
+                            if (node) {
+                              sequenceButtonRefs.current.set(sequence.sequence, node);
+                            } else {
+                              sequenceButtonRefs.current.delete(sequence.sequence);
+                            }
+                          }}
+                          role="tab"
+                          tabIndex={isActive ? 0 : -1}
+                          title={sequence.sequence}
+                          type="button"
+                        >
+                          {sequence.sequence}
+                        </button>
+                      );
+                    })}
+                  </div>
                 </div>
               ) : null}
 
@@ -758,14 +839,16 @@ function SyncImageDrawer({
                       const isActive = index === selectedImageIndex;
                       return (
                         <button
+                          aria-current={isActive ? "true" : undefined}
                           aria-pressed={isActive}
-                          className={`block w-full truncate rounded-md border px-2 py-1.5 text-left text-sm transition focus:outline-hidden focus:ring-2 focus:ring-console-cyan ${
+                          className={`block w-full truncate rounded-md border px-2 py-1.5 text-left text-sm transition-[color,background-color,border-color,box-shadow] duration-150 focus-visible:outline-2 focus-visible:outline-offset-1 focus-visible:outline-blue-500 motion-reduce:transition-none ${
                             isActive
-                              ? "border-console-cyan bg-white text-console-text shadow-xs"
-                              : "border-transparent bg-transparent text-console-muted hover:bg-white hover:text-console-text"
+                              ? "border-blue-500 bg-white text-slate-800 shadow-xs"
+                              : "border-transparent bg-transparent text-slate-500 hover:bg-white hover:text-slate-800"
                           }`}
                           key={image}
                           onClick={() => setSelectedImageIndex(index)}
+                          ref={isActive ? activeImageButtonRef : undefined}
                           title={image}
                           type="button"
                         >
@@ -785,22 +868,16 @@ function SyncImageDrawer({
                       </p>
                     </div>
                     <div className="flex gap-2">
-                      {selectedImageIndex > 0 ? (
-                        <ConsoleButton aria-label="上一张" className="h-8 px-2" onClick={() => setSelectedImageIndex((index) => Math.max(index - 1, 0))}>
-                          <ChevronLeft aria-hidden="true" className="h-4 w-4" />
-                          上一张
-                        </ConsoleButton>
-                      ) : null}
-                      {selectedImageIndex < totalImages - 1 ? (
-                        <ConsoleButton
-                          aria-label="下一张"
-                          className="h-8 px-2"
-                          onClick={() => setSelectedImageIndex((index) => Math.min(index + 1, totalImages - 1))}
-                        >
-                          下一张
-                          <ChevronRight aria-hidden="true" className="h-4 w-4" />
-                        </ConsoleButton>
-                      ) : null}
+                      <ImageStepButton
+                        direction="previous"
+                        disabled={selectedImageIndex === 0}
+                        onClick={() => setSelectedImageIndex((index) => Math.max(index - 1, 0))}
+                      />
+                      <ImageStepButton
+                        direction="next"
+                        disabled={selectedImageIndex >= totalImages - 1}
+                        onClick={() => setSelectedImageIndex((index) => Math.min(index + 1, totalImages - 1))}
+                      />
                     </div>
                   </div>
                   {previewUrl ? (
@@ -819,7 +896,6 @@ function SyncImageDrawer({
 export function DataManagementPage({ onPlaceholderAction }: DataManagementPageProps) {
   void onPlaceholderAction;
   const [activeSurface, setActiveSurface] = useState<DataSurface>("navigation");
-  const [sceneFilter, setSceneFilter] = useState<SceneFilter>("all");
   const [statusFilter, setStatusFilter] = useState<StatusFilter>("all");
   const [searchQuery, setSearchQuery] = useState("");
   const [showSearchSuggestions, setShowSearchSuggestions] = useState(false);
@@ -828,7 +904,7 @@ export function DataManagementPage({ onPlaceholderAction }: DataManagementPagePr
   const [syncImageClip, setSyncImageClip] = useState<NavigationClipSummary | null>(null);
   const [dataPilotDialogOpen, setDataPilotDialogOpen] = useState(false);
   const [activeInvocationId, setActiveInvocationId] = useState<string | null>(null);
-  const { summary: datasetSummary, loading, error } = useNavigationDatasetSummary();
+  const { summary: datasetSummary, loading, error, reload } = useNavigationDatasetSummary();
   const pendingInvocation = useStore(datapilotStore, (state) => state.pendingInvocation);
   const syncImageOpenerRef = useRef<HTMLElement | null>(null);
 
@@ -954,6 +1030,7 @@ export function DataManagementPage({ onPlaceholderAction }: DataManagementPagePr
   function handleConfirmDataPilot(selection: NavigationDatasetSelection) {
     const message = buildNavigationDatasetRequest(selection);
     const requestContext = buildNavigationDatasetRequestContext(selection);
+    // 同一选择提交失败时沿用原 invocation 重试，保证审计链不被重复任务拆散。
     if (
       activeInvocationId &&
       pendingInvocation?.invocationId === activeInvocationId &&
@@ -974,55 +1051,8 @@ export function DataManagementPage({ onPlaceholderAction }: DataManagementPagePr
   }
 
   return (
-    <section className="mx-auto max-w-7xl space-y-3 px-4 py-5 md:px-6">
-      <div className="space-y-4">
-        <DataSurfaceSwitch activeSurface={activeSurface} onChange={setActiveSurface} />
-        <div className="flex flex-col gap-3 lg:flex-row lg:items-center">
-          <div className="flex flex-wrap gap-2">
-            <SelectMenu label="全部场景" options={sceneOptions} value={sceneFilter} onChange={setSceneFilter} />
-            <SelectMenu label="全部状态" options={statusOptions} value={statusFilter} onChange={setStatusFilter} />
-          </div>
-          <div className="relative w-full min-w-0 sm:w-96 sm:flex-none">
-            <Search aria-hidden="true" className="pointer-events-none absolute left-3 top-1/2 h-4 w-4 -translate-y-1/2 text-console-muted" />
-            <input
-              className="h-10 w-full rounded-lg border border-console-line bg-console-panel px-9 text-sm text-console-text shadow-xs outline-hidden transition placeholder:text-console-muted focus:border-console-cyan focus:ring-2 focus:ring-console-cyan/20"
-              placeholder="按日期或 clip 搜索"
-              value={searchQuery}
-              onChange={(event) => {
-                setSearchQuery(event.target.value);
-                setShowSearchSuggestions(true);
-                setHighlightedClip(null);
-              }}
-              onFocus={() => {
-                if (searchQuery.trim()) {
-                  setShowSearchSuggestions(true);
-                }
-              }}
-            />
-            {searchQuery ? (
-              <button
-                type="button"
-                aria-label="清空搜索"
-                className="absolute right-2 top-1/2 flex h-6 w-6 -translate-y-1/2 items-center justify-center rounded-md text-console-muted hover:bg-console-panel2 hover:text-console-text"
-                onClick={() => {
-                  setSearchQuery("");
-                  setShowSearchSuggestions(false);
-                  setHighlightedClip(null);
-                }}
-              >
-                <X aria-hidden="true" className="h-4 w-4" />
-              </button>
-            ) : null}
-            <SearchSuggestions
-              query={searchQuery}
-              dates={dates}
-              visible={showSearchSuggestions}
-              onSelectDate={handleSelectSearchDate}
-              onSelectClip={handleSelectSearchClip}
-            />
-          </div>
-        </div>
-      </div>
+    <section className="mx-auto max-w-360 space-y-4 px-3 pb-28 pt-2 md:px-4 lg:px-5">
+      <DataSurfaceSwitch activeSurface={activeSurface} onChange={setActiveSurface} />
 
       {activeSurface === "navigation" ? (
         <>
@@ -1039,20 +1069,68 @@ export function DataManagementPage({ onPlaceholderAction }: DataManagementPagePr
 
           <ProcessOverview />
 
-          {loading ? (
-            <ConsoleCard className="py-8 text-center text-sm text-console-muted">正在加载导航数据集...</ConsoleCard>
-          ) : error ? (
-            <ConsoleCard className="border-rose-200 bg-rose-50/60 py-8 text-center text-sm text-rose-700">{error}</ConsoleCard>
-          ) : (
-            <DatasetTable
-              dates={visibleDates}
-              expandedDate={effectiveExpandedDate}
-              highlightedClip={highlightedClip?.clip ?? (searchQuery.trim().length > 8 ? searchQuery.trim() : null)}
-              onToggleDate={handleToggleDate}
-              onViewSyncImages={handleViewSyncImages}
+          <section className="min-h-[31rem] border-y border-slate-200 bg-white" data-testid="navigation-dataset-surface">
+            <NavigationListToolbar
+              dates={dates}
+              query={searchQuery}
+              showSuggestions={showSearchSuggestions}
+              status={statusFilter}
+              onChangeQuery={(query) => {
+                setSearchQuery(query);
+                setShowSearchSuggestions(true);
+                setHighlightedClip(null);
+              }}
+              onClearQuery={() => {
+                setSearchQuery("");
+                setShowSearchSuggestions(false);
+                setHighlightedClip(null);
+              }}
+              onFocusQuery={() => {
+                if (searchQuery.trim()) {
+                  setShowSearchSuggestions(true);
+                }
+              }}
               onOpenDataPilot={handleOpenDataPilotDialog}
+              onSelectDate={handleSelectSearchDate}
+              onSelectClip={handleSelectSearchClip}
+              onStatusChange={(status) => {
+                setStatusFilter(status);
+                setExpandedDate(null);
+                setHighlightedClip(null);
+              }}
             />
-          )}
+
+            {loading ? (
+              <div aria-live="polite" className="space-y-px" data-testid="navigation-dataset-loading">
+                <div className="h-11 animate-pulse border-b border-slate-200 bg-slate-50/70 motion-reduce:animate-none" />
+                {Array.from({ length: 4 }, (_, index) => (
+                  <div className="h-[68px] animate-pulse border-b border-slate-100 bg-white motion-reduce:animate-none" key={index}>
+                    <div className="ml-5 mt-6 h-3 w-2/3 max-w-2xl rounded bg-slate-100" />
+                  </div>
+                ))}
+                <span className="sr-only">正在加载导航数据集</span>
+              </div>
+            ) : error ? (
+              <div className="flex h-[23rem] flex-col items-center justify-center px-5 text-center" role="alert">
+                <span className="flex size-11 items-center justify-center rounded-xl border border-rose-200 bg-rose-50 text-rose-500">
+                  <Layers3 aria-hidden="true" className="size-5" />
+                </span>
+                <p className="mt-3 text-sm font-medium text-slate-800">导航数据加载失败</p>
+                <p className="mt-1 max-w-md text-xs text-slate-500">{error}</p>
+                <ConsoleButton className="mt-4" disabled={loading} onClick={() => void reload()}>
+                  重试
+                </ConsoleButton>
+              </div>
+            ) : (
+              <DatasetTable
+                dates={visibleDates}
+                expandedDate={effectiveExpandedDate}
+                highlightedClip={highlightedClip?.clip ?? (searchQuery.trim().length > 8 ? searchQuery.trim() : null)}
+                onToggleDate={handleToggleDate}
+                onViewSyncImages={handleViewSyncImages}
+              />
+            )}
+          </section>
         </>
       ) : (
         <RoboticArmPlaceholder />

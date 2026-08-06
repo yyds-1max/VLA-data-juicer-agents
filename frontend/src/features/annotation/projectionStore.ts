@@ -76,6 +76,8 @@ function runRequest<T>(
   force: boolean,
   request: () => Promise<T>,
 ): Promise<T> {
+  // 同一资源的并发请求共用一个 Promise。请求进行中再次 force 刷新时只标记 dirty，
+  // 当前请求结束后立即补拉一次，既避免请求风暴，也保证旧响应不会成为最终状态。
   if (force) gate.dirty = true;
   if (gate.pending) return gate.pending;
 
@@ -97,6 +99,7 @@ function runRequest<T>(
 }
 
 function retainRef(refs: Map<string, number>, ref: string): () => void {
+  // 只对当前页面正在观察的实体保持引用；SSE 到达时据此决定是否加载完整详情。
   refs.set(ref, (refs.get(ref) ?? 0) + 1);
   return () => {
     const count = refs.get(ref) ?? 0;
@@ -128,6 +131,7 @@ function preferRevision<T extends { state_revision: number }>(
   current: T | undefined,
   next: T,
 ): T {
+  // 所有投影合并都以服务端单调递增的 state_revision 为准，拒绝乱序旧响应覆盖新状态。
   return current && current.state_revision > next.state_revision ? current : next;
 }
 
@@ -348,6 +352,8 @@ export async function loadTrajectoryReview(
 export async function refreshAnnotationProjectionForEvent(
   event: AnnotationDomainEvent,
 ): Promise<void> {
+  // 实时事件只携带定位信息：已打开的实体刷新完整详情，列表中的实体只刷新摘要，
+  // 避免每条 SSE 都把所有任务和 Segment 详情重新拉取一遍。
   const state = annotationProjectionStore.getState();
   if (event.aggregate_kind === "review" && event.review_ref) {
     if (
@@ -355,7 +361,7 @@ export async function refreshAnnotationProjectionForEvent(
       || activeReviewRefs.has(event.review_ref)
     ) {
       await loadTrajectoryReview(event.review_ref, { force: true });
-    } else if (state.reviewsLoaded) {
+    } else {
       await requestTrajectoryReview(event.review_ref, true)
         .then(cacheTrajectoryReviewSummary);
     }
@@ -387,6 +393,8 @@ export async function refreshAnnotationProjectionForEvent(
 }
 
 export async function reconcileLoadedAnnotationProjections(): Promise<void> {
+  // SSE 重连后只对已加载列表和仍被页面引用的详情做一次对账。
+  // 单个接口失败不应阻断其他投影刷新，因此使用 allSettled。
   const state = annotationProjectionStore.getState();
   const requests: Promise<unknown>[] = [];
   if (state.jobsLoaded) requests.push(loadAnnotationJobs({ force: true }));

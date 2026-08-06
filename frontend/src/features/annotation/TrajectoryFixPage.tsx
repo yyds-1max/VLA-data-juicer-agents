@@ -1,12 +1,16 @@
 import {
   AlertCircle,
-  ArrowLeft,
   CheckCircle2,
   ChevronLeft,
   ChevronRight,
+  ChevronsLeft,
+  ChevronsRight,
+  Circle,
   CloudOff,
   LoaderCircle,
-  RefreshCw,
+  Minus,
+  PanelRightClose,
+  PanelRightOpen,
   RotateCcw,
   Save,
   Send,
@@ -32,7 +36,6 @@ import { useStore } from "zustand";
 
 import { ConsoleButton } from "../../components/console/ConsoleButton";
 import { ConsoleCard } from "../../components/console/ConsoleCard";
-import { StatusTag } from "../../components/console/StatusTag";
 import {
   AlertDialog,
   AlertDialogAction,
@@ -44,7 +47,6 @@ import {
   AlertDialogTitle,
 } from "../../components/ui/alert-dialog";
 import { Checkbox } from "../../components/ui/checkbox";
-import { ScrollArea, ScrollBar } from "../../components/ui/scroll-area";
 import {
   Select,
   SelectContent,
@@ -52,6 +54,7 @@ import {
   SelectTrigger,
   SelectValue,
 } from "../../components/ui/select";
+import { cn } from "../../lib/utils";
 import {
   AnnotationApiError,
   applyFixCommand,
@@ -69,7 +72,13 @@ import {
   loadTrajectoryReviews,
   retainTrajectoryReviewProjection,
 } from "./projectionStore";
+import {
+  buildReviewTransitionNotification,
+  type ReviewTaskNoticeTone,
+} from "./reviewNotifications";
 import { trajectoryReviewPresentation } from "./reviewPresentation";
+import { AnnotationWorkbenchLocation } from "./AnnotationWorkbenchLocation";
+import { ReviewSegmentQueuePanel } from "./ReviewSegmentQueuePanel";
 import type {
   CalibrationProfile,
   FixCommand,
@@ -97,6 +106,19 @@ type EditableTarget = {
 
 type Decision = "approve" | "return" | "discard" | null;
 
+type CommandFeedback = {
+  successTitle?: string;
+  failureTitle?: string;
+};
+
+type FixTaskNotice = {
+  id: string;
+  tone: ReviewTaskNoticeTone;
+  title: string;
+  detail?: string;
+  occurredAt: string;
+};
+
 function safeFixError(error: unknown, fallback: string): string {
   if (error instanceof AnnotationApiError) {
     return error.detail?.code ? `${fallback}（${error.detail.code}）` : fallback;
@@ -105,6 +127,53 @@ function safeFixError(error: unknown, fallback: string): string {
   return /(?:^|[\s("'`])\/(?:[^/\s]+\/){2,}|[A-Za-z]:\\/.test(message)
     ? fallback
     : message || fallback;
+}
+
+function fixActionNotice(
+  review: TrajectoryReview,
+  kind: string,
+  title: string,
+  tone: ReviewTaskNoticeTone,
+  detail?: string,
+  occurredAt?: string,
+): FixTaskNotice {
+  return {
+    id: `annotation:review:${review.review_ref}:${kind}:${review.state_revision}`,
+    tone,
+    title,
+    detail: detail ?? `${review.source_clip} · Segment ${String(review.segment_ordinal).padStart(2, "0")}`,
+    occurredAt: occurredAt ?? (
+      tone === "danger" || tone === "warning"
+        ? new Date().toISOString()
+        : review.updated_at
+    ),
+  };
+}
+
+function FixTaskNoticeBar({ notice }: { notice: FixTaskNotice }) {
+  const toneClass = {
+    success: "border-emerald-200 bg-emerald-50 text-emerald-800",
+    info: "border-blue-200 bg-blue-50 text-blue-800",
+    warning: "border-amber-200 bg-amber-50 text-amber-800",
+    danger: "border-rose-200 bg-rose-50 text-rose-800",
+  }[notice.tone];
+  return (
+    <div
+      role={notice.tone === "danger" ? "alert" : "status"}
+      className={cn(
+        "flex min-w-0 max-w-[25rem] items-center gap-2 rounded-xl border px-3 py-2 text-xs shadow-[0_2px_8px_rgba(31,42,68,0.05)]",
+        toneClass,
+      )}
+    >
+      {notice.tone === "danger" || notice.tone === "warning"
+        ? <AlertCircle aria-hidden="true" className="size-4 shrink-0" />
+        : <CheckCircle2 aria-hidden="true" className="size-4 shrink-0" />}
+      <span className="min-w-0">
+        <strong className="block truncate font-semibold">{notice.title}</strong>
+        {notice.detail && <span className="mt-0.5 block truncate opacity-80">{notice.detail}</span>}
+      </span>
+    </div>
+  );
 }
 
 function targetEditor(
@@ -134,6 +203,7 @@ function GridmapEvidenceView({
   gridmap,
   target,
   editable,
+  fill = false,
   onPositionPreview,
   onDirectionPreview,
   onDragStateChange,
@@ -141,6 +211,7 @@ function GridmapEvidenceView({
   gridmap: TrajectoryEvidenceGridmap;
   target: ProjectedTrajectoryTarget | null;
   editable: boolean;
+  fill?: boolean;
   onPositionPreview: (x: number, y: number) => void;
   onDirectionPreview: (direction: number) => void;
   onDragStateChange: (dragging: boolean) => void;
@@ -160,12 +231,22 @@ function GridmapEvidenceView({
     event: ReactPointerEvent<SVGSVGElement>,
   ) => {
     const bounds = event.currentTarget.getBoundingClientRect();
-    const displayX = (
-      (event.clientX - bounds.left) / Math.max(bounds.width, 1)
-    ) * gridmap.width;
-    const displayY = (
-      (event.clientY - bounds.top) / Math.max(bounds.height, 1)
-    ) * gridmap.height;
+    const scale = Math.min(
+      bounds.width / Math.max(gridmap.width, 1),
+      bounds.height / Math.max(gridmap.height, 1),
+    );
+    const renderedWidth = gridmap.width * scale;
+    const renderedHeight = gridmap.height * scale;
+    const offsetX = (bounds.width - renderedWidth) / 2;
+    const offsetY = (bounds.height - renderedHeight) / 2;
+    const displayX = Math.min(
+      gridmap.width,
+      Math.max(0, (event.clientX - bounds.left - offsetX) / Math.max(scale, Number.EPSILON)),
+    );
+    const displayY = Math.min(
+      gridmap.height,
+      Math.max(0, (event.clientY - bounds.top - offsetY) / Math.max(scale, Number.EPSILON)),
+    );
     const xSpan = gridmap.x_range[1] - gridmap.x_range[0];
     const ySpan = gridmap.y_range[1] - gridmap.y_range[0];
     return {
@@ -182,7 +263,7 @@ function GridmapEvidenceView({
     if (!editable || !target?.position) return;
     event.preventDefault();
     event.stopPropagation();
-    event.currentTarget.ownerSVGElement?.setPointerCapture(event.pointerId);
+    event.currentTarget.ownerSVGElement?.setPointerCapture?.(event.pointerId);
     setDragMode(mode);
     onDragStateChange(true);
   };
@@ -203,8 +284,8 @@ function GridmapEvidenceView({
   };
   const finishDrag = (event: ReactPointerEvent<SVGSVGElement>) => {
     if (!dragMode) return;
-    if (event.currentTarget.hasPointerCapture(event.pointerId)) {
-      event.currentTarget.releasePointerCapture(event.pointerId);
+    if (event.currentTarget.hasPointerCapture?.(event.pointerId)) {
+      event.currentTarget.releasePointerCapture?.(event.pointerId);
     }
     setDragMode(null);
     onDragStateChange(false);
@@ -260,8 +341,11 @@ function GridmapEvidenceView({
 
   return (
     <div
-      className="relative mx-auto w-full max-w-[62rem] overflow-hidden rounded-xl border border-console-line bg-slate-950"
-      style={{ aspectRatio: `${gridmap.width} / ${gridmap.height}` }}
+      className={cn(
+        "relative mx-auto w-full overflow-hidden bg-slate-950",
+        fill ? "h-full" : "max-w-[62rem] rounded-xl border border-console-line",
+      )}
+      style={fill ? undefined : { aspectRatio: `${gridmap.width} / ${gridmap.height}` }}
       aria-label="当前帧 Gridmap 与轨迹证据"
     >
       <img
@@ -269,13 +353,13 @@ function GridmapEvidenceView({
         width={gridmap.width}
         height={gridmap.height}
         alt="当前帧 Gridmap 鸟瞰图"
-        className="absolute inset-0 h-full w-full object-fill [image-rendering:pixelated]"
+        className="absolute inset-0 h-full w-full object-contain [image-rendering:pixelated]"
       />
       <svg
         aria-label="可拖动的当前帧 Gridmap 与轨迹"
         className="absolute inset-0 h-full w-full touch-none select-none"
         viewBox={`0 0 ${gridmap.width} ${gridmap.height}`}
-        preserveAspectRatio="none"
+        preserveAspectRatio="xMidYMid meet"
         onPointerMove={moveDrag}
         onPointerUp={finishDrag}
         onPointerCancel={finishDrag}
@@ -392,17 +476,22 @@ function CameraEvidenceView({
   projection,
   target,
   fixRevision,
+  fill = false,
 }: {
   frameIndex: number;
   camera: TrajectoryReviewEvidence["frames"][number]["camera"];
   projection: TrajectoryReviewEvidence["frames"][number]["projection"];
   target: ProjectedTrajectoryTarget | null;
   fixRevision: boolean;
+  fill?: boolean;
 }) {
   const source = fixRevision ? camera : projection ?? camera;
   if (!cameraCanRender(source)) {
     return (
-      <div className="flex min-h-96 items-center justify-center rounded-xl border border-dashed border-console-line text-sm text-console-muted">
+      <div className={cn(
+        "flex min-h-96 items-center justify-center border border-dashed border-console-line text-sm text-console-muted",
+        fill ? "h-full" : "rounded-xl",
+      )}>
         当前帧没有可公开的相机投影证据。
       </div>
     );
@@ -425,8 +514,11 @@ function CameraEvidenceView({
   const position = target?.camera_position ?? null;
   return (
     <div
-      className="relative mx-auto w-full overflow-hidden rounded-xl bg-slate-950"
-      style={{
+      className={cn(
+        "relative mx-auto w-full overflow-hidden bg-slate-950",
+        fill ? "h-full" : "rounded-xl",
+      )}
+      style={fill ? undefined : {
         aspectRatio: projectionContainsBev
           ? "5 / 4"
           : `${source.width ?? 16} / ${source.height ?? 9}`,
@@ -542,17 +634,34 @@ function TrajectoryFixWorkbench({
   const [selectedProfile, setSelectedProfile] = useState("");
   const [differenceReason, setDifferenceReason] = useState("");
   const [frameIndex, setFrameIndex] = useState(0);
+  const [frameInput, setFrameInput] = useState("1");
+  const [frameInputError, setFrameInputError] = useState("");
   const [targetRef, setTargetRef] = useState("");
+  const [inspectorCollapsed, setInspectorCollapsed] = useState(false);
+  const [taskNotice, setTaskNotice] = useState<FixTaskNotice | null>(null);
   const [editor, setEditor] = useState<EditableTarget>(() => targetEditor(null));
   const [savedEditor, setSavedEditor] = useState<EditableTarget>(() => targetEditor(null));
   const [decision, setDecision] = useState<Decision>(null);
   const [decisionReason, setDecisionReason] = useState("");
   const reviewStateRef = useRef<TrajectoryReview | null>(null);
+  const conflictEditorRef = useRef<{ targetRef: string; editor: EditableTarget } | null>(null);
   const initialRefreshCompleteRef = useRef(false);
 
   useEffect(() => {
     reviewStateRef.current = review;
   }, [review]);
+
+  const showTaskNotice = useCallback((notice: FixTaskNotice) => {
+    setTaskNotice(notice);
+  }, []);
+
+  useEffect(() => {
+    if (!taskNotice) return;
+    const timeout = window.setTimeout(() => {
+      setTaskNotice((current) => current?.id === taskNotice.id ? null : current);
+    }, taskNotice.tone === "danger" ? 7_000 : 4_800);
+    return () => window.clearTimeout(timeout);
+  }, [taskNotice]);
 
   useEffect(
     () => reviewRef
@@ -565,10 +674,7 @@ function TrajectoryFixWorkbench({
     if (!review) return;
     const matching = new Map<string, TrajectoryReview>();
     for (const item of [...projectedReviews, review]) {
-      if (
-        item.dataset_date !== review.dataset_date
-        || item.source_clip !== review.source_clip
-      ) {
+      if (item.dataset_date !== review.dataset_date) {
         continue;
       }
       const current = matching.get(item.review_ref);
@@ -578,7 +684,8 @@ function TrajectoryFixWorkbench({
     }
     setReviewQueue(
       [...matching.values()].sort((left, right) => (
-        left.segment_ordinal - right.segment_ordinal
+        left.source_clip.localeCompare(right.source_clip)
+        || left.segment_ordinal - right.segment_ordinal
         || left.review_ref.localeCompare(right.review_ref)
       )),
     );
@@ -588,9 +695,9 @@ function TrajectoryFixWorkbench({
     expectedReview?: TrajectoryReview,
   ): Promise<boolean> => {
     if (!reviewRef) return false;
+    const owner = expectedReview ?? reviewStateRef.current;
     try {
       const next = await getTrajectoryReviewEvidence(reviewRef);
-      const owner = expectedReview ?? reviewStateRef.current;
       if (!owner || !evidenceMatchesReview(next, owner)) {
         throw new Error("轨迹证据版本与当前复核任务不一致，请刷新后重试。");
       }
@@ -598,14 +705,22 @@ function TrajectoryFixWorkbench({
       setEvidenceError("");
       return true;
     } catch (requestError) {
-      setEvidence(null);
-      setEvidenceError(safeFixError(
+      const safeError = safeFixError(
         requestError,
         "服务器尚未提供该轨迹版本的公开证据，当前不能执行几何修正。",
+      );
+      setEvidence(null);
+      setEvidenceError(safeError);
+      if (owner) showTaskNotice(fixActionNotice(
+        owner,
+        "evidence-error",
+        "轨迹证据加载失败",
+        "danger",
+        safeError,
       ));
       return false;
     }
-  }, [reviewRef]);
+  }, [reviewRef, showTaskNotice]);
 
   useEffect(() => {
     if (!projectedReview || !initialRefreshCompleteRef.current) return;
@@ -617,6 +732,16 @@ function TrajectoryFixWorkbench({
     ) {
       return;
     }
+    const transition = buildReviewTransitionNotification(current, projectedReview);
+    if (transition) {
+      showTaskNotice({
+        id: transition.dedupeKey,
+        tone: transition.tone,
+        title: transition.title,
+        detail: transition.detail,
+        occurredAt: transition.occurredAt,
+      });
+    }
     setReview(projectedReview);
     reviewStateRef.current = projectedReview;
     setSelectedProfile(
@@ -627,7 +752,7 @@ function TrajectoryFixWorkbench({
     );
     setError("");
     void loadEvidence(projectedReview);
-  }, [loadEvidence, projectedReview]);
+  }, [loadEvidence, projectedReview, showTaskNotice]);
 
   const refresh = useCallback(async (
     silent = false,
@@ -657,12 +782,10 @@ function TrajectoryFixWorkbench({
         try {
           const queue = await loadTrajectoryReviews({ force });
           const matching = queue
-            .filter((item) => (
-              item.dataset_date === owner.dataset_date
-              && item.source_clip === owner.source_clip
-            ))
+            .filter((item) => item.dataset_date === owner.dataset_date)
             .sort((left, right) => (
-              left.segment_ordinal - right.segment_ordinal
+              left.source_clip.localeCompare(right.source_clip)
+              || left.segment_ordinal - right.segment_ordinal
               || left.review_ref.localeCompare(right.review_ref)
             ));
           setReviewQueue(
@@ -670,7 +793,8 @@ function TrajectoryFixWorkbench({
               ...matching.filter((item) => item.review_ref !== owner.review_ref),
               owner,
             ].sort((left, right) => (
-              left.segment_ordinal - right.segment_ordinal
+              left.source_clip.localeCompare(right.source_clip)
+              || left.segment_ordinal - right.segment_ordinal
               || left.review_ref.localeCompare(right.review_ref)
             )),
           );
@@ -679,7 +803,7 @@ function TrajectoryFixWorkbench({
           setReviewQueue([owner]);
           setReviewQueueError(safeFixError(
             requestError,
-            "读取同一外层 clip 的 Segment 队列失败",
+            "读取同一数据日期的 Segment 队列失败",
           ));
         }
       } else {
@@ -688,7 +812,8 @@ function TrajectoryFixWorkbench({
             ...current.filter((item) => item.review_ref !== owner.review_ref),
             owner,
           ].sort((left, right) => (
-            left.segment_ordinal - right.segment_ordinal
+            left.source_clip.localeCompare(right.source_clip)
+            || left.segment_ordinal - right.segment_ordinal
             || left.review_ref.localeCompare(right.review_ref)
           ))
         ));
@@ -752,7 +877,15 @@ function TrajectoryFixWorkbench({
       ?? null;
     if (nextTarget && targetRef !== nextTarget.target_ref) setTargetRef(nextTarget.target_ref);
     const nextEditor = targetEditor(nextTarget, currentFrame.pass);
-    setEditor(nextEditor);
+    const preservedConflictEditor = conflictEditorRef.current;
+    // 409 冲突刷新权威数据后，保留操作员尚未提交的输入，避免一次对账清空编辑现场。
+    if (preservedConflictEditor && nextTarget?.target_ref === preservedConflictEditor.targetRef) {
+      setEditor(preservedConflictEditor.editor);
+      conflictEditorRef.current = null;
+    } else {
+      setEditor(nextEditor);
+      if (preservedConflictEditor) conflictEditorRef.current = null;
+    }
     setSavedEditor(nextEditor);
   }, [
     currentFrame?.frame_index,
@@ -763,7 +896,15 @@ function TrajectoryFixWorkbench({
   ]);
 
   const editorDirty = JSON.stringify(editor) !== JSON.stringify(savedEditor);
-  const pageDirty = editorDirty || saving;
+  const pendingSetupDirty = Boolean(
+    review
+    && (review.status === "pending" || review.status === "returned")
+    && (
+      selectedProfile !== (review.fix_draft?.calibration.profile_ref ?? "")
+      || differenceReason !== (review.fix_draft?.calibration.difference_reason ?? "")
+    )
+  );
+  const pageDirty = editorDirty || saving || pendingSetupDirty;
   const evidenceAvailable = evidence !== null && evidenceError === "";
   const fixRuntimeBusy = (
     review?.active_fix_run?.status === "queued"
@@ -773,23 +914,92 @@ function TrajectoryFixWorkbench({
     review?.status === "approved"
     && review.latest_publication?.status === "publishing"
   );
+  const currentClipQueue = review
+    ? reviewQueue.filter((item) => item.source_clip === review.source_clip)
+    : [];
+  const reviewQueueIndex = review
+    ? currentClipQueue.findIndex((item) => item.review_ref === review.review_ref)
+    : -1;
+  const clipSegmentOrdinal = review
+    ? (reviewQueueIndex >= 0 ? reviewQueueIndex + 1 : review.segment_ordinal)
+    : 1;
   const editable = Boolean(
     review?.status === "in_progress"
     && review.fix_draft
     && evidenceAvailable
     && selectedTarget
+    && !conflict
+    && !acting
     && !fixRuntimeBusy
   );
-  const updateFromResult = useCallback((next: TrajectoryReview) => {
+  const frameCount = evidence?.frame_count ?? 0;
+  const frameNavigationLocked = Boolean(
+    // 切帧会替换当前编辑器上下文；存在未保存修改或 Runtime 正在运行时必须冻结导航。
+    !evidenceAvailable
+    || editorDirty
+    || saving
+    || geometryDragging
+    || conflict
+    || acting
+    || fixRuntimeBusy
+  );
+
+  useEffect(() => {
+    setFrameInput(String(frameIndex + 1));
+    setFrameInputError("");
+  }, [frameIndex, frameCount]);
+
+  const goToFrame = useCallback((nextIndex: number) => {
+    // 所有按钮、滑杆和数字输入统一走这个入口，保证边界与脏数据保护口径一致。
+    if (frameNavigationLocked || frameCount < 1) return false;
+    if (!Number.isSafeInteger(nextIndex) || nextIndex < 0 || nextIndex >= frameCount) {
+      return false;
+    }
+    setFrameIndex(nextIndex);
+    setFrameInput(String(nextIndex + 1));
+    setFrameInputError("");
+    return true;
+  }, [frameCount, frameNavigationLocked]);
+
+  const commitFrameInput = useCallback(() => {
+    if (!/^\d+$/.test(frameInput)) {
+      setFrameInput(String(frameIndex + 1));
+      setFrameInputError(`请输入 1 至 ${Math.max(frameCount, 1)} 的整数`);
+      return;
+    }
+    const nextFrame = Number(frameInput);
+    if (!Number.isSafeInteger(nextFrame) || nextFrame < 1 || nextFrame > frameCount) {
+      setFrameInput(String(frameIndex + 1));
+      setFrameInputError(`帧序号范围为 1 至 ${Math.max(frameCount, 1)}`);
+      return;
+    }
+    if (!goToFrame(nextFrame - 1)) {
+      setFrameInput(String(frameIndex + 1));
+      setFrameInputError("当前状态正在保存或处理，暂时不能切换帧");
+    }
+  }, [frameCount, frameIndex, frameInput, goToFrame]);
+
+  const updateFromResult = useCallback((next: TrajectoryReview, suppressNotification = false) => {
+    const transition = buildReviewTransitionNotification(reviewStateRef.current, next);
+    if (transition && !suppressNotification) {
+      showTaskNotice({
+        id: transition.dedupeKey,
+        tone: transition.tone,
+        title: transition.title,
+        detail: transition.detail,
+        occurredAt: transition.occurredAt,
+      });
+    }
     cacheTrajectoryReview(next);
     setReview(next);
     reviewStateRef.current = next;
     setConflict(false);
-  }, []);
+  }, [showTaskNotice]);
 
   const runCommand = useCallback(async (
     command: FixCommand,
     onSaved?: () => void,
+    feedback?: CommandFeedback,
   ) => {
     const current = reviewStateRef.current;
     if (
@@ -798,12 +1008,14 @@ function TrajectoryFixWorkbench({
       || current.status !== "in_progress"
       || current.active_fix_run?.status === "queued"
       || current.active_fix_run?.status === "running"
+      || conflict
     ) {
       return false;
     }
     setSaving(true);
     setError("");
     try {
+      // expected_* revision 是 Fix 写操作的 CAS 条件；服务端返回 409 时进入冲突恢复流程。
       const next = await applyFixCommand(reviewRef, {
         expected_review_revision: current.state_revision,
         expected_draft_revision: current.fix_draft.revision,
@@ -812,17 +1024,39 @@ function TrajectoryFixWorkbench({
       updateFromResult(next);
       await loadEvidence(next);
       onSaved?.();
+      if (feedback?.successTitle) {
+        showTaskNotice(fixActionNotice(
+          next,
+          `command-${command.kind}`,
+          feedback.successTitle,
+          "success",
+        ));
+      }
       return true;
     } catch (requestError) {
       if (requestError instanceof AnnotationApiError && requestError.status === 409) {
         setConflict(true);
       }
-      setError(safeFixError(requestError, "保存 Fix 修改失败"));
+      const safeError = safeFixError(requestError, "保存 Fix 修改失败");
+      setError(safeError);
+      if (feedback?.failureTitle) {
+        const owner = reviewStateRef.current;
+        if (owner) {
+          showTaskNotice(fixActionNotice(
+            owner,
+            `command-${command.kind}-failed`,
+            feedback.failureTitle,
+            "danger",
+            safeError,
+            new Date().toISOString(),
+          ));
+        }
+      }
       return false;
     } finally {
       setSaving(false);
     }
-  }, [loadEvidence, reviewRef, updateFromResult]);
+  }, [conflict, loadEvidence, reviewRef, showTaskNotice, updateFromResult]);
 
   useEffect(() => {
     if (
@@ -833,6 +1067,8 @@ function TrajectoryFixWorkbench({
       || geometryDragging
       || !selectedTarget
     ) return;
+    // 位置、方向和速度共用约 700ms 防抖自动保存；每次只发送首个发生变化的字段，
+    // 等服务端返回新 revision 后再处理后续变化，避免并行命令使用同一旧 revision。
     const timer = window.setTimeout(() => {
       const x = finiteValue(editor.x);
       const y = finiteValue(editor.y);
@@ -915,7 +1151,12 @@ function TrajectoryFixWorkbench({
     );
   }
 
-  const selectedCalibration = profiles.find((profile) => profile.profile_ref === selectedProfile);
+  const selectedCalibration = profiles.find((profile) => profile.profile_ref === selectedProfile)
+    ?? (
+      review.fix_draft?.calibration.profile_ref === selectedProfile
+        ? review.fix_draft.calibration
+        : undefined
+    );
   const calibrationDiffers = Boolean(
     selectedCalibration
     && selectedCalibration.profile_ref !== review.processing_calibration.profile_ref
@@ -939,7 +1180,27 @@ function TrajectoryFixWorkbench({
     && evidence?.evidence_kind === "fix_revision"
     && evidence.fix_revision_ref === revision.revision_ref,
   );
+  // 只有证据引用的 Fix revision 与当前草稿 revision 完全一致，才允许作出“通过”结论。
+  // 这是前端的 fail-closed 检查，不能用“曾生成过预览”替代。
   const previewIsStale = Boolean(revision && !previewMatchesDraft);
+  const previewNotice: FixTaskNotice | null = previewMatchesDraft
+    ? {
+        id: `preview-ready:${revision?.revision_ref ?? review.state_revision}`,
+        tone: "success",
+        title: "权威 Fix 预览已就绪",
+        detail: "当前展示与草稿一致，可据此作出复核结论。",
+        occurredAt: revision?.created_at ?? review.updated_at,
+      }
+    : previewIsStale
+      ? {
+          id: `preview-stale:${revision?.revision_ref ?? review.state_revision}`,
+          tone: "warning",
+          title: "Fix 预览已过期",
+          detail: "请重新生成预览后再通过。",
+          occurredAt: review.updated_at,
+        }
+      : null;
+  const headerNotice = taskNotice ?? previewNotice;
 
   const startSession = async () => {
     if (!selectedCalibration || !canStart) return;
@@ -957,7 +1218,15 @@ function TrajectoryFixWorkbench({
       updateFromResult(next);
       await loadEvidence(next);
     } catch (requestError) {
-      setError(safeFixError(requestError, "启动人工 Fix 失败"));
+      const safeError = safeFixError(requestError, "启动人工 Fix 失败");
+      setError(safeError);
+      showTaskNotice(fixActionNotice(
+        review,
+        "fix-session-failed",
+        "创建 Fix 草稿失败",
+        "danger",
+        safeError,
+      ));
     } finally {
       setActing(false);
     }
@@ -975,7 +1244,15 @@ function TrajectoryFixWorkbench({
       updateFromResult(next);
       await loadEvidence(next);
     } catch (requestError) {
-      setError(safeFixError(requestError, "提交 Fix 版本失败"));
+      const safeError = safeFixError(requestError, "提交 Fix 版本失败");
+      setError(safeError);
+      showTaskNotice(fixActionNotice(
+        review,
+        "fix-preview-submit-failed",
+        "Fix 预览提交失败",
+        "danger",
+        safeError,
+      ));
     } finally {
       setActing(false);
     }
@@ -983,12 +1260,18 @@ function TrajectoryFixWorkbench({
 
   const restoreMissingTarget = async () => {
     if (!selectedTarget || frameIndex < 1) return;
-    const saved = await runCommand({
-      kind: "add_missing_target",
-      frame_index: frameIndex,
-      target_ref: selectedTarget.target_ref,
-    });
+    const saved = await runCommand(
+      {
+        kind: "add_missing_target",
+        frame_index: frameIndex,
+        target_ref: selectedTarget.target_ref,
+      },
+      undefined,
+      { failureTitle: "补回目标失败" },
+    );
     if (!saved) return;
+    // 补回目标会改变整段权威轨迹：保存命令成功后立即串联生成 Fix 预览，
+    // 避免界面停留在“目标已恢复但证据仍是旧版本”的中间状态。
     const current = reviewStateRef.current;
     if (
       !current?.fix_draft
@@ -1005,21 +1288,39 @@ function TrajectoryFixWorkbench({
         expected_review_revision: current.state_revision,
         expected_draft_revision: current.fix_draft.revision,
       });
-      updateFromResult(next);
+      updateFromResult(next, true);
       await loadEvidence(next);
+      showTaskNotice(fixActionNotice(
+        next,
+        "target-restored-preview-queued",
+        "目标已补回，Fix 预览已进入生成队列",
+        "info",
+      ));
     } catch (requestError) {
-      setError(safeFixError(
+      const safeError = safeFixError(
         requestError,
         "补回目标已保存，但生成权威 Fix 预览失败，请重试生成预览。",
-      ));
+      );
+      setError(safeError);
+      const owner = reviewStateRef.current;
+      if (owner) {
+        showTaskNotice(fixActionNotice(
+          owner,
+          "target-restored-preview-failed",
+          "目标已补回，但 Fix 预览提交失败",
+          "warning",
+          safeError,
+        ));
+      }
     } finally {
       setActing(false);
     }
   };
 
   const applyDecision = async () => {
-    if (!decision || fixRuntimeBusy) return;
-    if (decision === "approve" && !revision) return;
+    // 通过必须绑定当前权威 Fix revision；退回和废弃必须携带人工原因。
+    if (!decision || fixRuntimeBusy || pageDirty || geometryDragging || conflict) return;
+    if (decision === "approve" && (!revision || !previewMatchesDraft)) return;
     if (decision !== "approve" && !decisionReason.trim()) return;
     setActing(true);
     try {
@@ -1041,7 +1342,15 @@ function TrajectoryFixWorkbench({
       setDecision(null);
       setDecisionReason("");
     } catch (requestError) {
-      setError(safeFixError(requestError, "提交复核结论失败"));
+      const safeError = safeFixError(requestError, "提交复核结论失败");
+      setError(safeError);
+      showTaskNotice(fixActionNotice(
+        review,
+        `decision-${decision}-failed`,
+        "提交复核结论失败",
+        "danger",
+        safeError,
+      ));
     } finally {
       setActing(false);
     }
@@ -1051,32 +1360,20 @@ function TrajectoryFixWorkbench({
     <section className="mx-auto max-w-[1900px] space-y-4 px-3 pb-28 pt-4 md:px-4 lg:px-5">
       <DirtyNavigationGuard dirty={pageDirty} />
 
-      <div className="flex flex-col gap-3 lg:flex-row lg:items-start lg:justify-between">
-        <div className="flex items-start gap-3">
-          <ConsoleButton aria-label="返回人工复核" onClick={() => navigate("/annotation/reviews")}>
-            <ArrowLeft aria-hidden="true" className="h-4 w-4" />
-          </ConsoleButton>
-          <div>
-            <div className="flex flex-wrap items-center gap-2">
-              <h2 className="text-lg font-semibold text-console-text">
-                {review.dataset_date} · {review.source_clip}
-              </h2>
-              <StatusTag tone={reviewPresentation.tone}>
-                {reviewPresentation.label}
-              </StatusTag>
-            </div>
-            <p className="mt-1 text-sm text-console-muted">
-              Segment {String(review.segment_ordinal).padStart(2, "0")} ·
-              原轨迹版本 {review.trajectory_revision.revision_ref.slice(-8)}
-            </p>
-          </div>
-        </div>
-        <div className="flex flex-wrap gap-2">
-          <ConsoleButton onClick={() => void refresh()}>
-            <RefreshCw aria-hidden="true" className="h-4 w-4" />
-            刷新
-          </ConsoleButton>
-          {review.latest_publication?.status === "failed" && (
+      <AnnotationWorkbenchLocation
+        datasetDate={review.dataset_date}
+        sourceClip={review.source_clip}
+        segmentOrdinal={clipSegmentOrdinal}
+        segmentCount={Math.max(currentClipQueue.length, 1)}
+        statusLabel={reviewPresentation.label}
+        statusTone={reviewPresentation.tone}
+        backLabel="返回人工复核"
+        navigationLabel="Fix 工作台位置"
+        onBack={() => navigate("/annotation/reviews")}
+        actions={(headerNotice || review.latest_publication?.status === "failed") ? (
+          <div className="flex min-w-0 flex-wrap items-center justify-end gap-2">
+            {headerNotice && <FixTaskNoticeBar notice={headerNotice} />}
+            {review.latest_publication?.status === "failed" && (
             <ConsoleButton
               disabled={acting || fixRuntimeBusy}
               onClick={async () => {
@@ -1089,7 +1386,15 @@ function TrajectoryFixWorkbench({
                   updateFromResult(next);
                   await loadEvidence(next);
                 } catch (requestError) {
-                  setError(safeFixError(requestError, "重试发布失败"));
+                  const safeError = safeFixError(requestError, "重试发布失败");
+                  setError(safeError);
+                  showTaskNotice(fixActionNotice(
+                    review,
+                    "publication-retry-failed",
+                    "重新提交发布失败",
+                    "danger",
+                    safeError,
+                  ));
                 } finally {
                   setActing(false);
                 }
@@ -1098,57 +1403,17 @@ function TrajectoryFixWorkbench({
               <RotateCcw aria-hidden="true" className="h-4 w-4" />
               重试发布
             </ConsoleButton>
-          )}
-        </div>
-      </div>
+            )}
+          </div>
+        ) : undefined}
+      />
 
-      <ConsoleCard className="p-0">
-        <div className="flex flex-col gap-1 border-b border-console-line px-4 py-3 sm:flex-row sm:items-center sm:justify-between">
-          <div>
-            <h3 className="text-sm font-semibold text-console-text">Segment 队列</h3>
-            <p className="mt-0.5 text-xs text-console-muted">
-              同一日期与外层 clip，共 {reviewQueue.length} 个复核单元
-            </p>
-          </div>
-          {reviewQueueError && (
-            <span className="text-xs text-amber-700">{reviewQueueError}</span>
-          )}
+      {reviewQueueError && (
+        <div role="alert" className="flex flex-wrap items-center justify-between gap-3 rounded-lg border border-amber-200 bg-amber-50 px-4 py-3 text-sm text-amber-800">
+          <span>{reviewQueueError}</span>
+          <ConsoleButton onClick={() => void refresh(false, true, true)}>重新加载 Segment 队列</ConsoleButton>
         </div>
-        <ScrollArea className="w-full whitespace-nowrap">
-          <div className="flex w-max min-w-full gap-2 p-3">
-            {reviewQueue.map((item) => {
-              const active = item.review_ref === review.review_ref;
-              const label = `Segment ${String(item.segment_ordinal).padStart(2, "0")}`;
-              const presentation = trajectoryReviewPresentation(item);
-              return (
-                <button
-                  key={item.review_ref}
-                  type="button"
-                  aria-current={active ? "page" : undefined}
-                  aria-label={`${active ? "当前" : "切换到"} ${label}`}
-                  className={`min-w-36 rounded-lg border px-3 py-2 text-left transition ${
-                    active
-                      ? "border-console-cyan bg-blue-50 ring-2 ring-console-cyan/15"
-                      : "border-console-line bg-white hover:bg-console-panel2"
-                  }`}
-                  onClick={() => {
-                    if (active) return;
-                    navigate(`/annotation/reviews/${encodeURIComponent(item.review_ref)}`);
-                  }}
-                >
-                  <span className="block text-sm font-medium text-console-text">{label}</span>
-                  <span className="mt-1 block">
-                    <StatusTag tone={presentation.tone}>
-                      {presentation.label}
-                    </StatusTag>
-                  </span>
-                </button>
-              );
-            })}
-          </div>
-          <ScrollBar orientation="horizontal" />
-        </ScrollArea>
-      </ConsoleCard>
+      )}
 
       {publicationBusy && (
         <div
@@ -1245,6 +1510,7 @@ function TrajectoryFixWorkbench({
           <div className="mt-3 flex gap-2">
             <ConsoleButton
               onClick={() => {
+                conflictEditorRef.current = null;
                 setConflict(false);
                 void refresh();
               }}
@@ -1253,14 +1519,22 @@ function TrajectoryFixWorkbench({
             </ConsoleButton>
             <ConsoleButton
               variant="primary"
+              disabled={!selectedTarget}
               onClick={async () => {
                 try {
+                  if (selectedTarget) {
+                    conflictEditorRef.current = {
+                      targetRef: selectedTarget.target_ref,
+                      editor,
+                    };
+                  }
                   const next = await loadTrajectoryReview(review.review_ref, {
                     force: true,
                   });
                   updateFromResult(next);
                   await loadEvidence(next);
                 } catch (requestError) {
+                  conflictEditorRef.current = null;
                   setError(safeFixError(requestError, "刷新复核版本失败"));
                 }
               }}
@@ -1275,19 +1549,38 @@ function TrajectoryFixWorkbench({
         <div role="status" className="rounded-lg border border-amber-200 bg-amber-50 p-4">
           <div className="flex gap-3">
             <CloudOff aria-hidden="true" className="mt-0.5 h-5 w-5 shrink-0 text-amber-700" />
-            <div>
+            <div className="min-w-0 flex-1">
               <h3 className="text-sm font-semibold text-amber-900">轨迹证据不可用</h3>
               <p className="mt-1 text-sm text-amber-800">{evidenceError}</p>
               <p className="mt-1 text-xs text-amber-700">
                 系统不会构造替代数据；相机、gridmap 和领域 Fix 命令暂时禁用。
               </p>
             </div>
+            <ConsoleButton
+              className="shrink-0"
+              disabled={acting}
+              onClick={() => void loadEvidence(review)}
+            >
+              重新加载证据
+            </ConsoleButton>
           </div>
         </div>
       )}
 
       {(review.status === "pending" || review.status === "returned") && (
-        <ConsoleCard>
+        <div className="grid min-w-0 gap-4 lg:grid-cols-[17rem_minmax(0,1fr)]">
+          <ReviewSegmentQueuePanel
+            reviews={reviewQueue}
+            currentReviewRef={review.review_ref}
+            className="min-h-[28rem] lg:max-h-[38rem]"
+            disabled={pageDirty || acting || conflict || fixRuntimeBusy}
+            onNavigate={(nextReviewRef) => {
+              if (nextReviewRef !== review.review_ref) {
+                navigate(`/annotation/reviews/${encodeURIComponent(nextReviewRef)}`);
+              }
+            }}
+          />
+          <ConsoleCard>
           <h3 className="text-sm font-semibold text-console-text">
             {review.status === "returned" ? "继续人工 Fix" : "开始人工 Fix"}
           </h3>
@@ -1337,181 +1630,211 @@ function TrajectoryFixWorkbench({
               {review.status === "returned" ? "返回 Fix 工作台" : "创建 Fix 草稿"}
             </ConsoleButton>
           </div>
-        </ConsoleCard>
+          </ConsoleCard>
+        </div>
       )}
 
       {(review.status === "in_progress" || terminal) && (
-        <div className="space-y-4">
-          <ConsoleCard className="p-0">
-            <div className="flex flex-col gap-3 border-b border-console-line p-4 lg:flex-row lg:items-center">
-              <div className="flex shrink-0 items-center gap-2">
-                <div className="mr-2">
-                  <h3 className="text-sm font-semibold text-console-text">帧与目标</h3>
-                  <p className="mt-0.5 text-xs text-console-muted">
-                    {evidence?.frame_count ?? 0} 帧
-                  </p>
-                </div>
-                <ConsoleButton
-                  aria-label="上一帧"
-                  disabled={!currentFrame || frameIndex <= 0}
-                  onClick={() => setFrameIndex(Math.max(0, frameIndex - 1))}
-                >
-                  <ChevronLeft aria-hidden="true" className="h-4 w-4" />
+        <div className="min-w-0 space-y-4">
+          <div
+            className="fix-workbench relative isolate min-h-[44rem] overflow-hidden rounded-[16px] border border-console-line bg-[#edf0f5] shadow-[0_10px_30px_rgba(31,42,68,0.06)] xl:h-[calc(100dvh-13.5rem)] xl:min-h-[46rem]"
+            data-inspector-state={inspectorCollapsed ? "closed" : "open"}
+            data-focus-mode={geometryDragging ? "true" : "false"}
+          >
+            <div className="relative z-20 flex min-h-14 flex-wrap items-center gap-2 border-b border-console-line bg-white/96 px-3 py-2.5 backdrop-blur-sm sm:px-4">
+              <span className="shrink-0 text-xs font-medium text-console-muted">Frame</span>
+              <label className="relative flex h-9 shrink-0 items-center rounded-lg border border-console-line bg-white focus-within:border-[#3156c8] focus-within:ring-2 focus-within:ring-[#3156c8]/15">
+                <span className="sr-only">当前帧</span>
+                <input
+                  aria-label="当前帧"
+                  aria-invalid={frameInputError ? "true" : undefined}
+                  aria-describedby={frameInputError ? "fix-frame-error" : undefined}
+                  className="h-full w-16 rounded-lg bg-transparent px-2 text-right text-sm font-semibold tabular-nums text-console-text outline-none disabled:cursor-not-allowed disabled:opacity-50"
+                  disabled={frameNavigationLocked || frameCount < 1}
+                  inputMode="numeric"
+                  min={1}
+                  max={Math.max(frameCount, 1)}
+                  step={1}
+                  value={frameInput}
+                  onChange={(event) => {
+                    setFrameInput(event.target.value);
+                    setFrameInputError("");
+                  }}
+                  onBlur={commitFrameInput}
+                  onKeyDown={(event) => {
+                    if (event.key === "Enter") {
+                      event.preventDefault();
+                      commitFrameInput();
+                    } else if (event.key === "Escape") {
+                      setFrameInput(String(frameIndex + 1));
+                      setFrameInputError("");
+                    }
+                  }}
+                />
+                <span className="pr-2 text-xs tabular-nums text-console-muted">/ {frameCount}</span>
+              </label>
+              <div className="flex items-center gap-1">
+                <ConsoleButton aria-label="第一帧" disabled={frameNavigationLocked || frameIndex <= 0} onClick={() => void goToFrame(0)}>
+                  <ChevronsLeft aria-hidden="true" className="size-4" />
                 </ConsoleButton>
-                <span className="min-w-20 text-center text-sm tabular-nums text-console-text">
-                  {frameIndex + 1} / {evidence?.frame_count ?? 0}
-                </span>
-                <ConsoleButton
-                  aria-label="下一帧"
-                  disabled={!evidence || frameIndex >= evidence.frame_count - 1}
-                  onClick={() => setFrameIndex(Math.min(
-                    Math.max(0, (evidence?.frame_count ?? 1) - 1),
-                    frameIndex + 1,
-                  ))}
-                >
-                  <ChevronRight aria-hidden="true" className="h-4 w-4" />
+                <ConsoleButton aria-label="上一帧" disabled={frameNavigationLocked || frameIndex <= 0} onClick={() => void goToFrame(frameIndex - 1)}>
+                  <ChevronLeft aria-hidden="true" className="size-4" />
+                </ConsoleButton>
+                <ConsoleButton aria-label="下一帧" disabled={frameNavigationLocked || frameIndex >= frameCount - 1} onClick={() => void goToFrame(frameIndex + 1)}>
+                  <ChevronRight aria-hidden="true" className="size-4" />
+                </ConsoleButton>
+                <ConsoleButton aria-label="最后一帧" disabled={frameNavigationLocked || frameIndex >= frameCount - 1} onClick={() => void goToFrame(frameCount - 1)}>
+                  <ChevronsRight aria-hidden="true" className="size-4" />
                 </ConsoleButton>
               </div>
-              <label className="min-w-48 flex-1">
+              <label className="min-w-36 flex-1 sm:min-w-56">
                 <span className="sr-only">轨迹帧时间线</span>
                 <input
                   type="range"
                   aria-label="轨迹帧时间线"
                   className="w-full accent-console-cyan"
                   min={0}
-                  max={Math.max(0, (evidence?.frame_count ?? 1) - 1)}
+                  max={Math.max(0, frameCount - 1)}
                   step={1}
-                  value={Math.min(
-                    frameIndex,
-                    Math.max(0, (evidence?.frame_count ?? 1) - 1),
-                  )}
-                  disabled={!evidenceAvailable || (evidence?.frame_count ?? 0) < 2}
-                  onChange={(event) => setFrameIndex(Number(event.target.value))}
+                  value={Math.min(frameIndex, Math.max(0, frameCount - 1))}
+                  disabled={frameNavigationLocked || frameCount < 2}
+                  onChange={(event) => void goToFrame(Number(event.target.value))}
                 />
               </label>
-            </div>
-            <ScrollArea className="w-full">
-              <div className="flex min-w-max gap-2 p-3">
-                {(currentFrame?.targets ?? []).map((target) => (
-                  <button
-                    key={target.target_ref}
-                    type="button"
-                    className={`min-w-48 rounded-lg border px-3 py-2 text-left text-sm transition ${
-                      selectedTarget?.target_ref === target.target_ref
-                        ? "border-console-cyan bg-blue-50 text-blue-800"
-                        : "border-console-line bg-white text-console-text hover:bg-console-panel2"
-                    }`}
-                    onClick={() => setTargetRef(target.target_ref)}
-                  >
-                    <span className="block font-medium">{target.label}</span>
-                    <span className="mt-0.5 block text-xs text-console-muted">
-                      {target.position
-                        ? `${target.position.x}, ${target.position.y}`
-                        : target.projection === "runtime_derived"
-                          ? "已补回；待生成 Fix 预览"
-                          : "本帧缺失"}
-                    </span>
-                  </button>
-                ))}
-                {evidenceAvailable && !currentFrame?.targets.length && (
-                  <p className="px-2 py-3 text-sm text-console-muted">本帧没有公开目标。</p>
-                )}
-              </div>
-              <ScrollBar orientation="horizontal" />
-            </ScrollArea>
-          </ConsoleCard>
-
-          <div className="grid gap-4 xl:grid-cols-[minmax(0,1fr)_21rem]">
-            <div className="min-w-0 space-y-4">
-              {(previewMatchesDraft || previewIsStale) && (
-                <div
-                  role="status"
-                  className={`rounded-xl border px-4 py-3 text-sm ${
-                    previewMatchesDraft
-                      ? "border-emerald-200 bg-emerald-50 text-emerald-800"
-                      : "border-amber-200 bg-amber-50 text-amber-800"
-                  }`}
+              <label className="hidden min-w-40 sm:block">
+                <span className="sr-only">当前目标</span>
+                <Select
+                  disabled={frameNavigationLocked}
+                  value={selectedTarget?.target_ref ?? ""}
+                  onValueChange={setTargetRef}
                 >
-                  {previewMatchesDraft
-                    ? "当前同时展示冻结 Fix Runtime 生成的权威相机投影与轨迹，可据此决定是否通过。"
-                    : "草稿已在上次 Fix 预览后发生变化；当前权威预览已过期，请重新生成后再通过。"}
-                </div>
-              )}
-              <div className="grid min-w-0 gap-4 2xl:grid-cols-2">
-                <ConsoleCard className="min-w-0 p-0">
-                  <div className="border-b border-console-line px-4 py-3">
-                    <h3 className="text-sm font-semibold text-console-text">相机投影</h3>
-                    <p className="mt-1 text-xs text-console-muted">
-                      {evidence?.evidence_kind === "fix_revision"
-                        ? "使用所选 Fix 标定，由冻结 Runtime 投影"
-                        : "原后处理投影；生成 Fix 预览后更新"}
-                    </p>
-                  </div>
-                  <div className="p-4">
-                    <CameraEvidenceView
-                      frameIndex={frameIndex}
-                      camera={currentCamera}
-                      projection={currentProjection}
-                      target={selectedTarget}
-                      fixRevision={evidence?.evidence_kind === "fix_revision"}
-                    />
-                  </div>
-                </ConsoleCard>
-
-                <ConsoleCard className="min-w-0 p-0">
-                  <div className="border-b border-console-line px-4 py-3">
-                    <h3 className="text-sm font-semibold text-console-text">Gridmap / 轨迹</h3>
-                    <p className="mt-1 text-xs text-console-muted">
-                      拖动橙色目标修改位置，拖动箭头端点修改方向
-                    </p>
-                  </div>
-                  <div className="space-y-3 p-4">
-                    {currentFrame?.gridmap ? (
-                      <GridmapEvidenceView
-                        gridmap={currentFrame.gridmap}
-                        target={gridmapTarget}
-                        editable={editable && Boolean(selectedTarget?.present)}
-                        onDragStateChange={setGeometryDragging}
-                        onPositionPreview={(x, y) => setEditor((current) => ({
-                          ...current,
-                          x: String(Number(x.toFixed(6))),
-                          y: String(Number(y.toFixed(6))),
-                        }))}
-                        onDirectionPreview={(direction) => setEditor((current) => ({
-                          ...current,
-                          direction: String(Number(direction.toFixed(12))),
-                        }))}
-                      />
-                    ) : (
-                      <div className="flex min-h-96 items-center justify-center rounded-xl border border-dashed border-console-line text-sm text-console-muted">
-                        当前帧没有可公开的 Gridmap 鸟瞰图。
-                      </div>
-                    )}
-                    <div className="flex flex-wrap gap-x-4 gap-y-2 text-xs text-console-muted">
-                      <span><span className="mr-1 inline-block h-2.5 w-2.5 rounded-full border-2 border-slate-600 bg-white align-middle" />原始目标</span>
-                      <span><span className="mr-1 inline-block h-2.5 w-2.5 rounded-full bg-orange-500 align-middle" />当前草稿目标与方向</span>
-                      <span><span className="mr-1 inline-block h-0.5 w-5 border-t border-dashed border-slate-500 align-middle" />原始轨迹</span>
-                      <span><span className="mr-1 inline-block h-0.5 w-5 bg-blue-600 align-middle" />当前权威轨迹</span>
-                      <span><span className="mr-1 inline-block h-2.5 w-2.5 rounded-full bg-slate-900 align-middle" />Dog 原点</span>
-                    </div>
-                  </div>
-                </ConsoleCard>
-              </div>
+                  <SelectTrigger aria-label="当前目标" className="h-9 bg-white">
+                    <SelectValue placeholder="暂无目标" />
+                  </SelectTrigger>
+                  <SelectContent>
+                    {(currentFrame?.targets ?? []).map((target) => (
+                      <SelectItem key={target.target_ref} value={target.target_ref}>{target.label}</SelectItem>
+                    ))}
+                  </SelectContent>
+                </Select>
+              </label>
+              <span id="fix-frame-error" aria-live="polite" className="basis-full text-xs text-rose-600 empty:hidden">
+                {frameInputError}
+              </span>
             </div>
 
-            <ConsoleCard className="h-fit p-0 xl:sticky xl:top-4">
-            <div className="border-b border-console-line p-4">
-              <div className="flex items-center justify-between gap-2">
-                <div>
+            <div className="grid h-[calc(100%-3.5rem)] min-h-[40rem] grid-rows-[minmax(13rem,1fr)_minmax(24rem,2fr)] overflow-hidden lg:grid-cols-[minmax(13rem,34fr)_minmax(0,66fr)] lg:grid-rows-1">
+              <section className="relative min-h-0 overflow-hidden border-b border-console-line bg-slate-950 lg:border-b-0 lg:border-r" aria-label="相机投影证据">
+                <div className="pointer-events-none absolute left-3 top-3 z-10 rounded-lg bg-slate-950/72 px-3 py-2 text-white backdrop-blur-sm">
+                  <h3 className="text-sm font-semibold">相机投影证据</h3>
+                  <p className="mt-0.5 text-[11px] text-white/70">
+                    {evidence?.evidence_kind === "fix_revision"
+                      ? "使用所选 Fix 标定，由冻结 Runtime 投影"
+                      : "原后处理投影；生成 Fix 预览后更新"}
+                  </p>
+                </div>
+                <CameraEvidenceView
+                  fill
+                  frameIndex={frameIndex}
+                  camera={currentCamera}
+                  projection={currentProjection}
+                  target={selectedTarget}
+                  fixRevision={evidence?.evidence_kind === "fix_revision"}
+                />
+              </section>
+
+              <section className="relative min-h-0 overflow-hidden bg-slate-950" aria-label="Gridmap 与轨迹证据">
+                <div className="pointer-events-none absolute left-3 top-3 z-10 rounded-lg bg-slate-950/72 px-3 py-2 text-white backdrop-blur-sm">
+                  <h3 className="text-sm font-semibold">Gridmap / 轨迹证据</h3>
+                  <p className="mt-0.5 text-[11px] text-white/70">
+                    {geometryDragging
+                      ? "专注调整中：其他控件已锁定，松开后自动保存"
+                      : "拖动目标修改位置，拖动方向端点修改朝向"}
+                  </p>
+                </div>
+                {currentFrame?.gridmap ? (
+                  <GridmapEvidenceView
+                    fill
+                    gridmap={currentFrame.gridmap}
+                    target={gridmapTarget}
+                    editable={editable && Boolean(selectedTarget?.present)}
+                    onDragStateChange={setGeometryDragging}
+                    onPositionPreview={(x, y) => setEditor((current) => ({
+                      ...current,
+                      x: String(Number(x.toFixed(6))),
+                      y: String(Number(y.toFixed(6))),
+                    }))}
+                    onDirectionPreview={(direction) => setEditor((current) => ({
+                      ...current,
+                      direction: String(Number(direction.toFixed(12))),
+                    }))}
+                  />
+                ) : (
+                  <div className="flex h-full min-h-96 items-center justify-center border border-dashed border-slate-700 text-sm text-slate-300">
+                    当前帧没有可公开的 Gridmap 鸟瞰图。
+                  </div>
+                )}
+                <div className="pointer-events-none absolute bottom-3 left-3 z-10 flex max-w-[calc(100%-1.5rem)] flex-wrap gap-x-3 gap-y-1 rounded-lg bg-slate-950/72 px-3 py-2 text-[11px] text-white/75 backdrop-blur-sm">
+                  <span className="inline-flex items-center gap-1"><Circle aria-hidden="true" className="size-2.5" />原始目标</span>
+                  <span className="inline-flex items-center gap-1 text-orange-300"><Circle aria-hidden="true" className="size-2.5 fill-current" />当前草稿目标</span>
+                  <span className="inline-flex items-center gap-1"><Minus aria-hidden="true" className="size-3" strokeDasharray="2 2" />原始轨迹</span>
+                  <span className="inline-flex items-center gap-1 text-blue-300"><Minus aria-hidden="true" className="size-3" />当前权威轨迹</span>
+                </div>
+              </section>
+            </div>
+
+            <aside
+              aria-label="轨迹属性"
+              aria-hidden={geometryDragging ? "true" : undefined}
+              inert={geometryDragging ? true : undefined}
+              data-collapsed={inspectorCollapsed ? "true" : "false"}
+              className="fix-inspector-panel absolute z-50 flex min-h-0 flex-col overflow-hidden rounded-[14px] border border-[#dfe4ed] bg-white/96 shadow-[0_14px_36px_rgba(25,36,62,0.16)] backdrop-blur-md transition-[width,max-height,opacity,transform] duration-180 ease-out motion-reduce:transition-none"
+            >
+            <div className={cn(
+              "flex min-h-13 shrink-0 items-center justify-between gap-2 border-b border-console-line px-3.5 py-2.5",
+              inspectorCollapsed && "justify-center border-b-0 px-2.5 max-[900px]:justify-between max-[900px]:border-b max-[900px]:px-3.5",
+            )}>
+                <div className={cn(inspectorCollapsed && "min-[901px]:hidden")}>
                   <h3 className="text-sm font-semibold text-console-text">轨迹属性</h3>
                   <p className="mt-1 text-xs text-console-muted">{selectedTarget?.label ?? "未选择目标"}</p>
                 </div>
-                <span className="text-xs text-console-muted">
-                  {saving ? "正在自动保存…" : editorDirty ? "等待自动保存" : "草稿已保存"}
-                </span>
-              </div>
+                <div className="flex items-center gap-2">
+                  {!inspectorCollapsed && (
+                    <span className="text-xs text-console-muted">
+                      {saving ? "正在自动保存…" : editorDirty ? "等待自动保存" : "草稿已保存"}
+                    </span>
+                  )}
+                  <button
+                    type="button"
+                    aria-label={inspectorCollapsed ? "展开轨迹属性" : "收起轨迹属性"}
+                    aria-expanded={!inspectorCollapsed}
+                    className="flex size-8 shrink-0 items-center justify-center rounded-lg text-[#667085] transition-[color,background-color] duration-150 hover:bg-[#f1f3f7] hover:text-[#202938] active:bg-[#e8ebf1] focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-[#3156c8] motion-reduce:transition-none"
+                    onClick={() => setInspectorCollapsed((value) => !value)}
+                  >
+                    {inspectorCollapsed
+                      ? <PanelRightOpen aria-hidden="true" className="size-4" />
+                      : <PanelRightClose aria-hidden="true" className="size-4" />}
+                  </button>
+                </div>
             </div>
-            <fieldset disabled={!editable || saving || terminal} className="space-y-4 p-4">
+            <div className={cn("console-soft-scrollbar min-h-0 flex-1 overflow-y-auto", inspectorCollapsed && "hidden")}>
+            <div className="border-b border-console-line p-3 sm:hidden">
+              <Select
+                disabled={frameNavigationLocked}
+                value={selectedTarget?.target_ref ?? ""}
+                onValueChange={setTargetRef}
+              >
+                <SelectTrigger aria-label="当前目标" className="h-9 bg-white">
+                  <SelectValue placeholder="暂无目标" />
+                </SelectTrigger>
+                <SelectContent>
+                  {(currentFrame?.targets ?? []).map((target) => (
+                    <SelectItem key={target.target_ref} value={target.target_ref}>{target.label}</SelectItem>
+                  ))}
+                </SelectContent>
+              </Select>
+            </div>
+            <fieldset disabled={!editable || saving || acting || terminal || geometryDragging} className="space-y-4 p-4">
               <div className="grid grid-cols-2 gap-3">
                 <label>
                   <span className="mb-1 block text-xs text-console-muted">位置 X</span>
@@ -1572,10 +1895,10 @@ function TrajectoryFixWorkbench({
                       });
                   }}
                 />
-                将本帧标记为 pass
+                本帧不进入训练
               </label>
               <p className="-mt-2 text-xs leading-5 text-console-muted">
-                pass 只表示当前帧不进入训练，不是下方“废弃 Segment”。
+                仅排除当前帧，不会废弃整个 Segment。
               </p>
               <div className="grid grid-cols-2 gap-2 border-t border-console-line pt-4">
                 <ConsoleButton
@@ -1594,21 +1917,26 @@ function TrajectoryFixWorkbench({
                 </ConsoleButton>
                 <ConsoleButton
                   disabled={!selectedTarget || !selectedTarget.present}
-                  onClick={() => selectedTarget && void runCommand({
-                    kind: "delete_target",
-                    frame_index: frameIndex,
-                    target_ref: selectedTarget.target_ref,
-                  })}
+                  onClick={() => selectedTarget && void runCommand(
+                    {
+                      kind: "delete_target",
+                      frame_index: frameIndex,
+                      target_ref: selectedTarget.target_ref,
+                    },
+                    undefined,
+                    { successTitle: "当前帧目标已删除", failureTitle: "删除目标失败" },
+                  )}
                 >
                   <Trash2 aria-hidden="true" className="h-4 w-4" />
                   删除目标
                 </ConsoleButton>
                 <ConsoleButton
                   className="col-span-2"
-                  onClick={() => void runCommand({
-                    kind: "restore_frame",
-                    frame_index: frameIndex,
-                  })}
+                  onClick={() => void runCommand(
+                    { kind: "restore_frame", frame_index: frameIndex },
+                    undefined,
+                    { successTitle: "当前帧已恢复", failureTitle: "恢复当前帧失败" },
+                  )}
                 >
                   <Undo2 aria-hidden="true" className="h-4 w-4" />
                   恢复当前帧
@@ -1626,6 +1954,8 @@ function TrajectoryFixWorkbench({
                     || editorDirty
                     || saving
                     || acting
+                    || conflict
+                    || geometryDragging
                     || fixRuntimeBusy
                   }
                   onClick={() => void submitRevision()}
@@ -1638,21 +1968,21 @@ function TrajectoryFixWorkbench({
                 </p>
                 <div className="grid grid-cols-3 gap-2">
                   <ConsoleButton
-                    disabled={!previewMatchesDraft || acting || fixRuntimeBusy}
+                    disabled={!previewMatchesDraft || pageDirty || acting || conflict || geometryDragging || fixRuntimeBusy}
                     onClick={() => setDecision("approve")}
                   >
                     <CheckCircle2 aria-hidden="true" className="h-4 w-4" />
                     通过
                   </ConsoleButton>
                   <ConsoleButton
-                    disabled={acting || fixRuntimeBusy}
+                    disabled={pageDirty || acting || conflict || geometryDragging || fixRuntimeBusy}
                     onClick={() => setDecision("return")}
                   >
                     <RotateCcw aria-hidden="true" className="h-4 w-4" />
                     退回
                   </ConsoleButton>
                   <ConsoleButton
-                    disabled={acting || fixRuntimeBusy}
+                    disabled={pageDirty || acting || conflict || geometryDragging || fixRuntimeBusy}
                     onClick={() => setDecision("discard")}
                   >
                     <Trash2 aria-hidden="true" className="h-4 w-4" />
@@ -1661,8 +1991,22 @@ function TrajectoryFixWorkbench({
                 </div>
               </div>
             )}
-            </ConsoleCard>
+            </div>
+            </aside>
+
           </div>
+          <ReviewSegmentQueuePanel
+            reviews={reviewQueue}
+            currentReviewRef={review.review_ref}
+            className="min-h-[13rem] max-h-[20rem]"
+            disabled={pageDirty || acting || conflict || geometryDragging || fixRuntimeBusy || decision !== null}
+            layout="horizontal"
+            onNavigate={(nextReviewRef) => {
+              if (nextReviewRef !== review.review_ref) {
+                navigate(`/annotation/reviews/${encodeURIComponent(nextReviewRef)}`);
+              }
+            }}
+          />
         </div>
       )}
 
@@ -1696,6 +2040,10 @@ function TrajectoryFixWorkbench({
               disabled={
                 acting
                 || fixRuntimeBusy
+                || pageDirty
+                || geometryDragging
+                || conflict
+                || (decision === "approve" && !previewMatchesDraft)
                 || (decision !== "approve" && !decisionReason.trim())
               }
               variant={decision === "discard" ? "destructive" : "default"}

@@ -1,5 +1,5 @@
 import "@testing-library/jest-dom/vitest";
-import { act, fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { act, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 
 import {
   createSession,
@@ -12,7 +12,7 @@ import {
   openSessionEvents,
   submitTurn,
 } from "../api/client";
-import type { SessionDetail } from "../api/types";
+import type { NavigationDatasetSummary, SessionDetail } from "../api/types";
 import { Composer } from "../components/datapilot/Composer";
 import { MessageList } from "../components/datapilot/MessageList";
 import { writeSessionRecovery } from "../components/datapilot/sessionRecovery";
@@ -81,6 +81,71 @@ function sessionDetailFixture(overrides: Partial<SessionDetail>): SessionDetail 
   };
 }
 
+function navigationDatasetSummaryFixture(
+  totalOverrides: Partial<NavigationDatasetSummary["totals"]> = {},
+): NavigationDatasetSummary {
+  return {
+    totals: {
+      date_count: 1,
+      clip_count: 2,
+      total_duration_ns: 3_500_000_000,
+      raw_message_count: 40,
+      extracted_clip_count: 1,
+      synced_clip_count: 1,
+      ...totalOverrides,
+    },
+    sync_distribution: {
+      image: 3,
+      pointcloud: 2,
+      odom: 2,
+      grid_map: 1,
+    },
+    dates: [
+      {
+        date: "20270515",
+        clip_count: 2,
+        total_duration_ns: 3_500_000_000,
+        raw_message_count: 40,
+        extracted_clip_count: 1,
+        synced_clip_count: 1,
+        sync_frame_counts: { image: 3, pointcloud: 2, odom: 2, grid_map: 1 },
+        status: "synced",
+        clips: [
+          {
+            date: "20270515",
+            clip: "clip_a",
+            duration_ns: 1_500_000_000,
+            raw_message_count: 18,
+            topics: [
+              { name: "/camera/front/image_raw", type: "sensor_msgs/msg/Image", message_count: 12 },
+              { name: "/odom", type: "nav_msgs/msg/Odometry", message_count: 6 },
+            ],
+            has_tmp_dir: true,
+            has_sync_data: true,
+            sequences: [],
+            sync_frame_counts: { image: 2, pointcloud: 0, odom: 0, grid_map: 0 },
+            status: "synced",
+            errors: [],
+          },
+          {
+            date: "20270515",
+            clip: "clip_b",
+            duration_ns: 2_000_000_000,
+            raw_message_count: 22,
+            topics: [{ name: "/camera/front/image_raw", type: "sensor_msgs/msg/Image", message_count: 22 }],
+            has_tmp_dir: true,
+            has_sync_data: false,
+            sequences: [],
+            sync_frame_counts: { image: 3, pointcloud: 2, odom: 2, grid_map: 1 },
+            status: "extracted",
+            errors: [],
+          },
+        ],
+      },
+    ],
+  };
+}
+
 function chooseNavigationDate(date: string) {
   fireEvent.click(screen.getByRole("button", { name: "数据日期" }));
   fireEvent.click(screen.getByRole("option", { name: new RegExp(date) }));
@@ -144,80 +209,7 @@ beforeEach(() => {
   apiMocks.submitTurn.mockResolvedValue("turn-1");
   apiMocks.interruptTurn.mockResolvedValue(true);
   apiMocks.openSessionEvents.mockReturnValue(activeSocket());
-  apiMocks.getNavigationDatasetSummary.mockResolvedValue({
-    totals: {
-      date_count: 1,
-      clip_count: 2,
-      total_duration_ns: 3_500_000_000,
-      raw_message_count: 40,
-      extracted_clip_count: 1,
-      synced_clip_count: 1,
-    },
-    sync_distribution: {
-      image: 3,
-      pointcloud: 2,
-      odom: 2,
-      grid_map: 1,
-    },
-    dates: [
-      {
-        date: "20270515",
-        clip_count: 2,
-        total_duration_ns: 3_500_000_000,
-        raw_message_count: 40,
-        extracted_clip_count: 1,
-        synced_clip_count: 1,
-        sync_frame_counts: {
-          image: 3,
-          pointcloud: 2,
-          odom: 2,
-          grid_map: 1,
-        },
-        status: "synced",
-        clips: [
-          {
-            date: "20270515",
-            clip: "clip_a",
-            duration_ns: 1_500_000_000,
-            raw_message_count: 18,
-            topics: [
-              { name: "/camera/front/image_raw", type: "sensor_msgs/msg/Image", message_count: 12 },
-              { name: "/odom", type: "nav_msgs/msg/Odometry", message_count: 6 },
-            ],
-            has_tmp_dir: true,
-            has_sync_data: true,
-            sequences: [],
-            sync_frame_counts: {
-              image: 2,
-              pointcloud: 0,
-              odom: 0,
-              grid_map: 0,
-            },
-            status: "synced",
-            errors: [],
-          },
-          {
-            date: "20270515",
-            clip: "clip_b",
-            duration_ns: 2_000_000_000,
-            raw_message_count: 22,
-            topics: [{ name: "/camera/front/image_raw", type: "sensor_msgs/msg/Image", message_count: 22 }],
-            has_tmp_dir: true,
-            has_sync_data: false,
-            sequences: [],
-            sync_frame_counts: {
-              image: 3,
-              pointcloud: 2,
-              odom: 2,
-              grid_map: 1,
-            },
-            status: "extracted",
-            errors: [],
-          },
-        ],
-      },
-    ],
-  });
+  apiMocks.getNavigationDatasetSummary.mockResolvedValue(navigationDatasetSummaryFixture());
   apiMocks.getSyncImages.mockResolvedValue({
     date: "20270515",
     clip: "clip_a",
@@ -255,11 +247,12 @@ test("renders the full DataLoop console shell by default", async () => {
   expect(screen.getByText("WISEXPLORE")).toBeVisible();
   expect(screen.queryByText("智瀚星途 DataLoop")).not.toBeInTheDocument();
   expect(screen.queryByText("Voyager Forge")).not.toBeInTheDocument();
-  expect(screen.getByText("智瀚星途数据处理系统")).toBeVisible();
+  expect(screen.getByText("演示用户")).toBeVisible();
+  expect(screen.getByText("数据闭环操作员")).toBeVisible();
   expect(screen.queryByText("Mock workspace")).not.toBeInTheDocument();
   expect(screen.queryByText("frontend only")).not.toBeInTheDocument();
-  expect(screen.getByRole("heading", { name: "闭环仪表盘" })).toBeVisible();
-  expect(screen.getByPlaceholderText("搜索数据、模型、任务...")).toBeVisible();
+  expect(screen.getByRole("heading", { name: "仪表盘" })).toBeVisible();
+  expect(screen.getByRole("button", { name: "搜索数据、模型、任务（暂未接入）" })).toBeVisible();
   expect(screen.getByRole("button", { name: "Open DataPilot" })).toBeVisible();
 });
 
@@ -268,7 +261,7 @@ test("dashboard renders navigation dataset summary metrics and distribution", as
 
   expect(screen.getByText("总数据量")).toBeVisible();
   expect(await screen.findByText("3.5 秒")).toBeVisible();
-  expect(screen.getByText("1 个日期 / 2 个 clip / 40 条 ROS 消息")).toBeVisible();
+  expect(screen.getByText("1 个日期 · 2 clips")).toBeVisible();
   expect(screen.getByText("数据类型分布")).toBeVisible();
   expect(screen.getByText("同步图像帧")).toBeVisible();
   expect(screen.getByText("同步点云帧")).toBeVisible();
@@ -276,15 +269,78 @@ test("dashboard renders navigation dataset summary metrics and distribution", as
   expect(screen.getByText("3")).toBeVisible();
   expect(screen.queryByText("3%")).not.toBeInTheDocument();
   expect(screen.getByText("数据闭环流程")).toBeVisible();
-  expect(screen.getByText("最近活动")).toBeVisible();
+  expect(screen.getByText("最近事件")).toBeVisible();
 });
 
-test("dashboard metric chart tabs switch between success and loss", async () => {
+test("dashboard metric chart displays success rate and loss together", async () => {
   await renderAppWithDashboardSettled();
 
-  expect(screen.getByText("Success Rate (%)")).toBeVisible();
-  fireEvent.click(screen.getByRole("tab", { name: "损失值" }));
-  expect(screen.getByText("Training Loss")).toBeVisible();
+  expect(screen.getAllByText("成功率")[0]).toBeVisible();
+  expect(screen.getByText("损失值")).toBeVisible();
+  expect(screen.getByRole("img", { name: "VLA v47 按 Epoch 展示的成功率和损失值折线图" })).toBeVisible();
+});
+
+test("dashboard keeps metric dimensions stable while the summary is loading", async () => {
+  const request = deferred<NavigationDatasetSummary>();
+  apiMocks.getNavigationDatasetSummary.mockReturnValueOnce(request.promise);
+
+  render(<App routerMode="declarative" />);
+
+  expect(screen.getByRole("status", { name: "总数据量加载中" })).toBeVisible();
+  expect(screen.getByRole("status", { name: "数据类型分布加载中" })).toBeVisible();
+
+  await act(async () => {
+    request.resolve(navigationDatasetSummaryFixture());
+    await request.promise;
+  });
+
+  expect(await screen.findByText("3.5 秒")).toBeVisible();
+});
+
+test("dashboard shows honest empty and error states and can retry the summary", async () => {
+  apiMocks.getNavigationDatasetSummary
+    .mockRejectedValueOnce(new Error("network unavailable"))
+    .mockResolvedValueOnce(navigationDatasetSummaryFixture());
+
+  const errorView = render(<App routerMode="declarative" />);
+
+  expect((await screen.findAllByRole("alert")).length).toBeGreaterThanOrEqual(2);
+  fireEvent.click(screen.getByRole("button", { name: "重试" }));
+  expect(await screen.findByText("3.5 秒")).toBeVisible();
+  expect(apiMocks.getNavigationDatasetSummary).toHaveBeenCalledTimes(2);
+  errorView.unmount();
+
+  resetNavigationDatasetSummaryCache();
+  const emptySummary = navigationDatasetSummaryFixture({
+    date_count: 0,
+    clip_count: 0,
+    total_duration_ns: 0,
+    raw_message_count: 0,
+    extracted_clip_count: 0,
+    synced_clip_count: 0,
+  });
+  emptySummary.sync_distribution = { image: 0, pointcloud: 0, odom: 0, grid_map: 0 };
+  emptySummary.dates = [];
+  apiMocks.getNavigationDatasetSummary.mockResolvedValueOnce(emptySummary);
+
+  const emptyView = render(<App routerMode="declarative" />);
+  expect(await screen.findByText("0 秒")).toBeVisible();
+  expect(screen.getByText("暂无导航数据")).toBeVisible();
+  emptyView.unmount();
+});
+
+test("dashboard placeholder controls acknowledge clicks and dashboard links navigate", async () => {
+  await renderAppWithDashboardSettled();
+
+  fireEvent.click(screen.getByRole("button", { name: "搜索数据、模型、任务（暂未接入）" }));
+  expect(screen.getByText("搜索功能暂未接入")).toBeVisible();
+
+  fireEvent.click(screen.getByRole("button", { name: "通知（暂未接入）" }));
+  expect(screen.getByText("通知功能暂未接入")).toBeVisible();
+
+  fireEvent.click(screen.getByRole("button", { name: "查看训练详情" }));
+  expect(window.location.pathname).toBe("/model");
+  expect(await screen.findByText("当前部署")).toBeVisible();
 });
 
 test("sidebar navigation switches console pages", async () => {
@@ -304,7 +360,7 @@ test("direct page deep links keep the console shell eager while the page loads",
 
   expect(screen.getByTestId("console-sidebar")).toBeVisible();
   expect(screen.getByRole("button", { name: "Open DataPilot" })).toBeVisible();
-  expect(screen.getByRole("button", { name: "模型迭代" })).toHaveAttribute("aria-current", "page");
+  expect(screen.getByRole("button", { name: "模型训练" })).toHaveAttribute("aria-current", "page");
   expect(window.location.pathname).toBe("/model");
   expect(await screen.findByText("当前部署")).toBeVisible();
 });
@@ -325,9 +381,12 @@ test("desktop sidebar collapse follows navigation and persists across remounts",
   expect(sidebar).toHaveClass("md:w-20");
   expect(main).toHaveClass("md:ml-20");
   expect(window.localStorage.getItem("vla-console-sidebar")).toBe("collapsed");
-  expect(screen.getByText("WISEXPLORE").parentElement).toHaveClass("md:hidden");
-  expect(screen.getByRole("button", { name: "闭环仪表盘" }).querySelector("span")).toHaveClass("md:sr-only");
-  expect(screen.getByText("智瀚星途数据处理系统").parentElement).toHaveClass("md:hidden");
+  expect(screen.getByText("WISEXPLORE").parentElement).toHaveClass("md:opacity-0");
+  const dashboardNavButton = screen.getByRole("button", { name: "仪表盘" });
+  expect(dashboardNavButton).toHaveClass("md:justify-start", "md:pl-[19px]");
+  expect(dashboardNavButton).not.toHaveClass("md:justify-center");
+  expect(dashboardNavButton.querySelector("span")).toHaveClass("md:opacity-0");
+  expect(screen.getByText("演示用户").parentElement).toHaveClass("md:opacity-0");
 
   fireEvent.click(screen.getByRole("button", { name: "Agent 工作流" }));
   expect(await screen.findByRole("heading", { name: "Agent 工作流" })).toBeVisible();
@@ -363,7 +422,8 @@ test("data management renders navigation dataset date and clip details", async (
   expect(screen.getAllByTestId("navigation-process-step")).toHaveLength(3);
   expect(screen.getByRole("columnheader", { name: "clip 数" })).toBeVisible();
   expect(screen.getByRole("columnheader", { name: "raw 消息" })).toBeVisible();
-  expect(screen.getByTestId("navigation-dataset-scroll")).toHaveClass("console-soft-scrollbar", "max-h-[62vh]", "overflow-auto", "pb-3");
+  expect(screen.getByTestId("navigation-dataset-scroll")).toHaveClass("console-soft-scrollbar", "max-h-[60vh]", "overflow-auto");
+  expect(screen.getByTestId("navigation-dataset-surface")).toHaveClass("border-y", "bg-white");
   const datasetScroll = screen.getByTestId("navigation-dataset-scroll");
   mockScrollableElement(datasetScroll);
 
@@ -600,16 +660,18 @@ test("data management switches between navigation and robotic arm data surfaces"
 
   expect(await screen.findByRole("tab", { name: "导航数据" })).toBeVisible();
   expect(screen.getByRole("tab", { name: "机械臂数据" })).toBeVisible();
-  expect(screen.getByRole("button", { name: "全部场景" })).toBeVisible();
-  expect(screen.getByRole("button", { name: "全部状态" })).toBeVisible();
+  expect(screen.queryByText("全部场景")).not.toBeInTheDocument();
+  expect(screen.getByRole("combobox", { name: "导航数据状态筛选" })).toHaveTextContent("全部状态");
   expect(screen.getByPlaceholderText("按日期或 clip 搜索")).toBeVisible();
 
-  fireEvent.click(screen.getByRole("tab", { name: "机械臂数据" }));
+  fireEvent.mouseDown(screen.getByRole("tab", { name: "机械臂数据" }), {
+    button: 0,
+    ctrlKey: false,
+  });
 
-  expect(screen.getByText("机械臂数据接入中")).toBeVisible();
-  expect(screen.getByRole("button", { name: "全部场景" })).toBeVisible();
-  expect(screen.getByRole("button", { name: "全部状态" })).toBeVisible();
-  expect(screen.getByPlaceholderText("按日期或 clip 搜索")).toBeVisible();
+  expect(await screen.findByText("机械臂数据接入中")).toBeVisible();
+  expect(screen.queryByRole("combobox", { name: "导航数据状态筛选" })).not.toBeInTheDocument();
+  expect(screen.queryByPlaceholderText("按日期或 clip 搜索")).not.toBeInTheDocument();
 });
 
 test("data management filters navigation dates by status", async () => {
@@ -682,29 +744,28 @@ test("data management filters navigation dates by status", async () => {
   expect(await screen.findByText("20270515")).toBeVisible();
   expect(screen.getByText("20270601")).toBeVisible();
 
-  fireEvent.click(screen.getByRole("button", { name: "全部状态" }));
+  fireEvent.click(screen.getByRole("combobox", { name: "导航数据状态筛选" }));
   fireEvent.click(screen.getByRole("option", { name: "待处理" }));
 
   expect(screen.getByText("20270601")).toBeVisible();
   expect(screen.queryByText("20270515")).not.toBeInTheDocument();
 });
 
-test("data management filter menus close when clicking outside", async () => {
+test("data management uses the shared status selector and removes the scene filter", async () => {
   await renderAppWithDashboardSettled();
 
   fireEvent.click(screen.getByRole("button", { name: "数据管理" }));
   await screen.findByRole("tab", { name: "导航数据" });
 
-  fireEvent.click(screen.getByRole("button", { name: "全部场景" }));
-  expect(screen.getByRole("option", { name: "室外导航" })).toBeVisible();
+  expect(screen.queryByText("全部场景")).not.toBeInTheDocument();
+  const statusSelect = screen.getByRole("combobox", { name: "导航数据状态筛选" });
+  expect(statusSelect).toHaveClass("h-10", "bg-white");
+  expect(screen.getByRole("textbox", { name: "搜索导航数据" })).toHaveClass("h-10", "bg-white");
 
-  fireEvent.pointerDown(screen.getByPlaceholderText("按日期或 clip 搜索"));
-  expect(screen.queryByRole("option", { name: "室外导航" })).not.toBeInTheDocument();
-
-  fireEvent.click(screen.getByRole("button", { name: "全部状态" }));
+  fireEvent.click(statusSelect);
   expect(screen.getByRole("option", { name: "待处理" })).toBeVisible();
 
-  fireEvent.pointerDown(screen.getByRole("heading", { name: "数据管理" }));
+  fireEvent.keyDown(document, { key: "Escape" });
   expect(screen.queryByRole("option", { name: "待处理" })).not.toBeInTheDocument();
 });
 
@@ -771,9 +832,9 @@ test("navigation dataset summary is reused while switching console pages", async
   expect(apiMocks.getNavigationDatasetSummary).toHaveBeenCalledTimes(1);
 
   fireEvent.click(screen.getByRole("button", { name: "自动标注" }));
-  expect(await screen.findByText("自动标注任务")).toBeVisible();
+  expect(await screen.findByRole("heading", { name: "标注任务" })).toBeVisible();
 
-  fireEvent.click(screen.getByRole("button", { name: "闭环仪表盘" }));
+  fireEvent.click(screen.getByRole("button", { name: "仪表盘" }));
   expect(await screen.findByText("3.5 秒")).toBeVisible();
   expect(apiMocks.getNavigationDatasetSummary).toHaveBeenCalledTimes(1);
 
@@ -793,14 +854,22 @@ test("data management opens synchronized image drawer and browses sequences", as
   expect(apiMocks.getSyncImages).toHaveBeenCalledWith("20270515", "clip_a");
   expect(screen.getByRole("button", { name: "001.jpg" })).toBeVisible();
   expect(screen.getByRole("button", { name: "002.jpg" })).toBeVisible();
+  expect(screen.getByTestId("sync-sequence-scroll")).toHaveClass("flex-nowrap", "overflow-x-auto");
   expect(screen.getByText("1 / 2")).toBeVisible();
-  expect(screen.queryByRole("button", { name: "上一张" })).not.toBeInTheDocument();
-  expect(screen.getByRole("button", { name: "下一张" })).toBeVisible();
+  expect(screen.getByRole("button", { name: "上一张" })).toBeDisabled();
+  const nextImageButton = screen.getByRole("button", { name: "下一张" });
+  expect(nextImageButton).toBeEnabled();
+  expect(nextImageButton).toHaveClass("focus-visible:outline-blue-500");
+  expect(nextImageButton).toHaveClass("data-[pointer-focus=true]:outline-none");
+  expect(nextImageButton).not.toHaveClass("focus:ring-2");
 
-  fireEvent.click(screen.getByRole("button", { name: "下一张" }));
+  fireEvent.pointerDown(nextImageButton);
+  fireEvent.click(nextImageButton);
+  expect(nextImageButton).toHaveAttribute("data-pointer-focus", "true");
   expect(screen.getByText("2 / 2")).toBeVisible();
-  expect(screen.getByRole("button", { name: "上一张" })).toBeVisible();
-  expect(screen.queryByRole("button", { name: "下一张" })).not.toBeInTheDocument();
+  expect(screen.getByRole("button", { name: "002.jpg" })).toHaveAttribute("aria-current", "true");
+  expect(screen.getByRole("button", { name: "上一张" })).toBeEnabled();
+  expect(screen.getByRole("button", { name: "下一张" })).toBeDisabled();
 
   fireEvent.click(screen.getByRole("button", { name: "001.jpg" }));
   expect(screen.getByText("1 / 2")).toBeVisible();
@@ -887,8 +956,8 @@ test("annotation page exposes the M2 DataPilot-owned processing entry", async ()
   await renderAppWithDashboardSettled();
 
   fireEvent.click(screen.getByRole("button", { name: "自动标注" }));
-  expect(await screen.findByText("自动标注任务")).toBeVisible();
-  expect(screen.getByText(/DataPilot 负责任务调查、规划和后处理/)).toBeVisible();
+  expect(await screen.findByRole("heading", { name: "标注任务" })).toBeVisible();
+  expect(screen.getByText(/仍可提交数据范围，由 DataPilot 检查事实并说明阻塞/)).toBeVisible();
   expect(screen.getByRole("button", { name: "交给 DataPilot 处理" })).toBeVisible();
   expect(screen.queryByRole("button", { name: "新建任务" })).not.toBeInTheDocument();
   expect(screen.queryByText("视觉检测")).not.toBeInTheDocument();
@@ -959,7 +1028,7 @@ test("annotation shortcut submits a new session despite another session's active
 test("model iteration page renders versions training and compare tabs", async () => {
   await renderAppWithDashboardSettled();
 
-  fireEvent.click(screen.getByRole("button", { name: "模型迭代" }));
+  fireEvent.click(screen.getByRole("button", { name: "模型训练" }));
   expect(await screen.findByText("当前部署")).toBeVisible();
   expect(screen.getByText("v47")).toBeVisible();
 
@@ -2392,8 +2461,9 @@ test("contract-v1 blocking interaction replaces the Composer and keeps the task 
   expect(screen.getByText("导航任务 nav-A7K2")).toBeVisible();
   expect(screen.queryByPlaceholderText("继续描述任务…")).not.toBeInTheDocument();
   expect(screen.queryByRole("button", { name: "Send message" })).not.toBeInTheDocument();
-  expect(screen.queryByRole("progressbar")).not.toBeInTheDocument();
-  expect(screen.getByRole("dialog", { name: "DataPilot" })).not.toHaveTextContent(/[%％]/);
+  const datapilotDialog = screen.getByRole("dialog", { name: "DataPilot" });
+  expect(within(datapilotDialog).queryByRole("progressbar")).not.toBeInTheDocument();
+  expect(datapilotDialog).not.toHaveTextContent(/[%％]/);
 });
 
 test("durable running turn keeps the composer locked during handoff gaps", async () => {

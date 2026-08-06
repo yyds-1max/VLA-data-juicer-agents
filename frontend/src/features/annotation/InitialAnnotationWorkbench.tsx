@@ -7,6 +7,8 @@ import {
   CircleDot,
   Minus,
   MousePointer2,
+  PanelRightClose,
+  PanelRightOpen,
   Plus,
   RotateCcw,
   Save,
@@ -25,6 +27,7 @@ import { ConsoleButton } from "../../components/console/ConsoleButton";
 import { ConsoleCard } from "../../components/console/ConsoleCard";
 import { StatusTag } from "../../components/console/StatusTag";
 import { cn } from "../../lib/utils";
+import { SegmentRuler } from "./SegmentRuler";
 import {
   AnnotationApiError,
   getAnnotationSegment,
@@ -45,6 +48,7 @@ type WorkbenchProps = {
   onJobRefresh: () => Promise<void>;
   onExternalSubmissionResolved?: (message: string) => void;
   registerFlush?: (flush: () => Promise<boolean>) => void;
+  onNavigateSegment?: (segmentRef: string) => void | Promise<void>;
 };
 
 type EditorMode = "select" | "box" | "point";
@@ -180,6 +184,7 @@ export function InitialAnnotationWorkbench({
   onJobRefresh,
   onExternalSubmissionResolved,
   registerFlush,
+  onNavigateSegment,
 }: WorkbenchProps) {
   const firstFrame = segment.first_frame;
   const [targets, setTargets] = useState<AnnotationTarget[]>(() => cloneTargets(segment.draft?.targets ?? []));
@@ -196,6 +201,7 @@ export function InitialAnnotationWorkbench({
   const [externalSubmissionResolved, setExternalSubmissionResolved] = useState(false);
   const [conflict, setConflict] = useState<ConflictState | null>(null);
   const [submitting, setSubmitting] = useState(false);
+  const [inspectorCollapsed, setInspectorCollapsed] = useState(false);
   const conflictRef = useRef<ConflictState | null>(null);
   const segmentRevisionRef = useRef(segment.state_revision);
   const draftRevisionRef = useRef(segment.draft_revision);
@@ -213,6 +219,40 @@ export function InitialAnnotationWorkbench({
     && !externalSubmissionResolved
   );
   const canEdit = editable && !submitting && imageSizeValid === true;
+  const focusMode = mode === "box" || mode === "point";
+  const clipSegments = useMemo(() => job.segments
+    .filter((item) => item.source_clip === segment.source_clip)
+    .sort((left, right) => (
+      left.ordinal - right.ordinal
+      || left.segment_ref.localeCompare(right.segment_ref)
+    ))
+    .map((item, index) => ({ ...item, ordinal: index + 1 })), [job.segments, segment.source_clip]);
+  const clipSegmentOrdinal = clipSegments.find(
+    (item) => item.segment_ref === segment.segment_ref,
+  )?.ordinal ?? segment.ordinal;
+  const clipSegmentCount = Math.max(clipSegments.length, 1);
+
+  useEffect(() => {
+    const onShortcut = (event: KeyboardEvent) => {
+      const target = event.target;
+      if (target instanceof HTMLElement && target.closest("input, textarea, select, [contenteditable='true'], [data-annotation-help]")) {
+        return;
+      }
+      if (event.key === "Escape" && focusMode) {
+        event.preventDefault();
+        setGesture(null);
+        setMode("select");
+        return;
+      }
+      if (!canEdit || event.metaKey || event.ctrlKey || event.altKey) return;
+      const key = event.key.toLowerCase();
+      if (key === "v") setMode("select");
+      if (key === "b") setMode("box");
+      if (key === "p" && selectedTargetRef) setMode("point");
+    };
+    window.addEventListener("keydown", onShortcut);
+    return () => window.removeEventListener("keydown", onShortcut);
+  }, [canEdit, focusMode, selectedTargetRef]);
 
   useEffect(() => {
     const nextTargets = cloneTargets(segment.draft?.targets ?? []);
@@ -653,25 +693,21 @@ export function InitialAnnotationWorkbench({
   return (
     <section
       data-testid="annotation-workbench"
-      className="flex min-h-168 min-w-0 flex-col overflow-hidden bg-console-panel lg:h-[min(48rem,calc(100dvh-12rem))] lg:min-h-152 lg:flex-row xl:h-full xl:min-h-0"
+      data-inspector-state={inspectorCollapsed ? "closed" : "open"}
+      className="annotation-workbench relative isolate flex min-h-168 min-w-0 flex-1 overflow-hidden bg-[#edf0f5] lg:min-h-152 xl:h-full xl:min-h-0"
     >
       <div
         data-testid="annotation-canvas-region"
-        className="flex min-h-136 min-w-0 flex-1 flex-col bg-slate-950 lg:min-h-0"
+        className="relative flex min-h-136 min-w-0 flex-1 flex-col overflow-hidden lg:min-h-0"
       >
-        <div className="flex min-h-14 flex-wrap items-center justify-between gap-3 border-b border-slate-700/80 bg-slate-900 px-3 py-2">
+        <div className="absolute left-3 top-3 z-40 flex min-h-12 max-w-[calc(100%-1.5rem)] flex-wrap items-center justify-between gap-2 rounded-xl border border-[#dfe4ed] bg-white/94 p-1.5 shadow-[0_8px_24px_rgba(27,39,68,0.12)] backdrop-blur-md sm:left-4 sm:top-4">
           <div className="flex min-w-0 flex-wrap items-center gap-2">
-            <div className="mr-1 hidden border-r border-slate-700 pr-3 sm:block">
-              <p className="text-xs font-semibold text-white">首帧标注</p>
-              <p className="mt-0.5 text-[11px] text-slate-400">
-                Segment {String(segment.ordinal).padStart(2, "0")}
-              </p>
-            </div>
             <ConsoleButton
-              variant={mode === "select" ? "primary" : "ghost"}
+              variant="ghost"
+              aria-label="选择/调整"
               className={cn(
-                "border-slate-700 bg-slate-900 text-slate-200 shadow-none hover:bg-slate-800",
-                mode === "select" && "border-console-cyan bg-console-cyan text-white hover:bg-blue-700",
+                "h-9 border-transparent bg-transparent px-2.5 text-[#374151] shadow-none hover:border-[#dfe4ed] hover:bg-[#f4f6fa] active:bg-[#e9edf4]",
+                mode === "select" && "border-[#cfe5d4] bg-[#e8f6eb] text-[#17663a] hover:border-[#b9ddc2] hover:bg-[#ddf1e2]",
               )}
               onClick={() => setMode("select")}
               disabled={!canEdit}
@@ -679,12 +715,14 @@ export function InitialAnnotationWorkbench({
             >
               <MousePointer2 className="h-4 w-4" aria-hidden="true" />
               选择/调整
+              <kbd className="ml-1 rounded border border-current/20 px-1 py-0.5 text-[9px] font-medium opacity-60">V</kbd>
             </ConsoleButton>
             <ConsoleButton
-              variant={mode === "box" ? "primary" : "ghost"}
+              variant="ghost"
+              aria-label="框选目标"
               className={cn(
-                "border-slate-700 bg-slate-900 text-slate-200 shadow-none hover:bg-slate-800",
-                mode === "box" && "border-console-cyan bg-console-cyan text-white hover:bg-blue-700",
+                "h-9 border-transparent bg-transparent px-2.5 text-[#374151] shadow-none hover:border-[#dfe4ed] hover:bg-[#f4f6fa] active:bg-[#e9edf4]",
+                mode === "box" && "border-[#bcd0fb] bg-[#e9f0ff] text-[#2456ba] hover:border-[#a9c1f5] hover:bg-[#dfe9ff]",
               )}
               onClick={() => setMode("box")}
               disabled={!canEdit}
@@ -692,12 +730,14 @@ export function InitialAnnotationWorkbench({
             >
               <BoxSelect className="h-4 w-4" aria-hidden="true" />
               框选目标
+              <kbd className="ml-1 rounded border border-current/20 px-1 py-0.5 text-[9px] font-medium opacity-60">B</kbd>
             </ConsoleButton>
             <ConsoleButton
-              variant={mode === "point" ? "primary" : "ghost"}
+              variant="ghost"
+              aria-label="前景点"
               className={cn(
-                "border-slate-700 bg-slate-900 text-slate-200 shadow-none hover:bg-slate-800",
-                mode === "point" && "border-console-cyan bg-console-cyan text-white hover:bg-blue-700",
+                "h-9 border-transparent bg-transparent px-2.5 text-[#374151] shadow-none hover:border-[#dfe4ed] hover:bg-[#f4f6fa] active:bg-[#e9edf4]",
+                mode === "point" && "border-[#bcd0fb] bg-[#e9f0ff] text-[#2456ba] hover:border-[#a9c1f5] hover:bg-[#dfe9ff]",
               )}
               onClick={() => setMode("point")}
               disabled={!canEdit || !selectedTarget}
@@ -705,45 +745,60 @@ export function InitialAnnotationWorkbench({
             >
               <CircleDot className="h-4 w-4" aria-hidden="true" />
               前景点
+              <kbd className="ml-1 rounded border border-current/20 px-1 py-0.5 text-[9px] font-medium opacity-60">P</kbd>
             </ConsoleButton>
           </div>
-          <div className="flex items-center gap-1 rounded-lg border border-slate-700 bg-slate-950/70 p-1">
+        </div>
+
+        <div
+          data-testid="annotation-zoom-controls"
+          data-inspector-avoidance={inspectorCollapsed ? "collapsed-rail" : "panel-width"}
+          className={cn(
+            "annotation-zoom-controls absolute top-4 z-40 flex items-center gap-1 rounded-xl border border-[#dfe4ed] bg-white/94 p-1 shadow-[0_8px_24px_rgba(27,39,68,0.12)] backdrop-blur-md transition-[right,opacity,transform] duration-150 ease-out motion-reduce:transition-none",
+            focusMode && "pointer-events-none translate-y-1 opacity-20",
+          )}
+          aria-hidden={focusMode ? "true" : undefined}
+          inert={focusMode ? true : undefined}
+        >
             <ConsoleButton
-              className="h-8 border-transparent bg-transparent px-2 text-slate-200 shadow-none hover:border-slate-700 hover:bg-slate-800"
+              className="h-8 border-transparent bg-transparent px-2 text-[#3d4657] shadow-none hover:border-[#dfe4ed] hover:bg-[#f4f6fa] active:bg-[#e9edf4]"
               aria-label="缩小画布"
               onClick={() => setZoom((value) => Math.max(1, value - 0.25))}
             >
               <Minus className="h-4 w-4" aria-hidden="true" />
             </ConsoleButton>
-            <span className="w-12 text-center text-xs tabular-nums text-slate-300">{Math.round(zoom * 100)}%</span>
+            <span className="w-12 text-center text-xs font-medium tabular-nums text-[#3d4657]">{Math.round(zoom * 100)}%</span>
             <ConsoleButton
-              className="h-8 border-transparent bg-transparent px-2 text-slate-200 shadow-none hover:border-slate-700 hover:bg-slate-800"
+              className="h-8 border-transparent bg-transparent px-2 text-[#3d4657] shadow-none hover:border-[#dfe4ed] hover:bg-[#f4f6fa] active:bg-[#e9edf4]"
               aria-label="放大画布"
               onClick={() => setZoom((value) => Math.min(3, value + 0.25))}
             >
               <Plus className="h-4 w-4" aria-hidden="true" />
             </ConsoleButton>
             <ConsoleButton
-              className="h-8 border-transparent bg-transparent px-2 text-slate-200 shadow-none hover:border-slate-700 hover:bg-slate-800"
+              className="h-8 border-transparent bg-transparent px-2 text-[#3d4657] shadow-none hover:border-[#dfe4ed] hover:bg-[#f4f6fa] active:bg-[#e9edf4]"
               aria-label="重置缩放"
               onClick={() => setZoom(1)}
             >
               <RotateCcw className="h-4 w-4" aria-hidden="true" />
             </ConsoleButton>
-          </div>
         </div>
 
         <div
           data-annotation-canvas-scroll
-          className="console-soft-scrollbar flex min-h-0 flex-1 items-center overflow-auto bg-slate-950 p-3 sm:p-5"
+          data-inspector-reserves-space="false"
+          className="console-soft-scrollbar flex min-h-0 flex-1 items-center overflow-auto bg-[#e8ecf2]"
         >
           <div
-            className="relative mx-auto shrink-0 overflow-hidden bg-black shadow-2xl shadow-black/40"
-            style={{ width: `${zoom * 100}%`, maxWidth: zoom === 1 ? "100%" : "none" }}
+            className="relative mx-auto shrink-0 overflow-hidden bg-slate-950 shadow-[0_18px_50px_rgba(15,23,42,0.22)]"
+            style={{
+              width: `${zoom * 100}%`,
+              maxWidth: zoom === 1 ? "100%" : "none",
+            }}
           >
             <img
               src={firstFrame.url}
-              alt={`Segment ${segment.ordinal} resize 后首帧`}
+              alt={`Segment ${clipSegmentOrdinal} resize 后首帧`}
               className="block h-auto w-full select-none"
               draggable={false}
               onLoad={(event) => {
@@ -760,7 +815,7 @@ export function InitialAnnotationWorkbench({
             />
             <svg
               className={cn(
-                "absolute inset-0 h-full w-full touch-none outline-hidden",
+                "absolute inset-0 h-full w-full touch-none focus-visible:outline-2 focus-visible:outline-offset-[-3px] focus-visible:outline-white",
                 mode === "box" && "cursor-crosshair",
                 mode === "point" && "cursor-cell",
               )}
@@ -890,40 +945,127 @@ export function InitialAnnotationWorkbench({
           </div>
         </div>
 
-        <div className="flex min-h-9 flex-wrap items-center justify-between gap-2 border-t border-slate-800 bg-slate-900 px-3 py-2 text-[11px] text-slate-400">
+        <div
+          className={cn(
+            "absolute left-3 top-17 z-30 flex max-w-[calc(100%-1.5rem)] flex-wrap items-center gap-2 rounded-lg border border-[#dfe4ed] bg-white/92 px-3 py-1.5 text-[11px] text-[#667085] shadow-sm backdrop-blur-sm transition-[opacity,transform] duration-180 motion-reduce:transition-none sm:left-4 sm:top-18",
+            focusMode && "pointer-events-none -translate-y-1 opacity-20",
+          )}
+          aria-hidden={focusMode ? "true" : undefined}
+        >
           <span className="tabular-nums">{firstFrame.width} × {firstFrame.height} · resize 后首帧坐标</span>
           {imageSizeValid === null && (
             <span aria-live="polite">正在加载并校验首帧图片…</span>
           )}
           {imageSizeValid === false && (
-            <span aria-live="assertive" className="font-medium text-rose-300">
+            <span aria-live="assertive" className="font-medium text-rose-600">
               {imageLoadError
                 ? "首帧图片加载失败，请刷新页面重试"
                 : "图片尺寸与元数据不一致，已停止编辑"}
             </span>
           )}
           {imageSizeValid === true && (
-            <span className="hidden sm:inline">方向键微调 · Shift + 方向键移动 10px</span>
+            <span className="hidden border-l border-[#dfe4ed] pl-2 sm:inline">方向键微调 · Shift ×10</span>
           )}
         </div>
+
+        {focusMode ? (
+          <div className="pointer-events-none absolute inset-x-0 bottom-22 z-30 flex justify-center px-4">
+            <div className="pointer-events-auto flex items-center gap-3 rounded-xl border border-white/25 bg-[#1f2b3d]/90 px-4 py-2 text-xs text-white shadow-[0_12px_32px_rgba(15,23,42,0.3)] backdrop-blur-md">
+              <span>
+                {mode === "box"
+                  ? "专注框选：在画面中拖拽创建目标框"
+                  : "专注前景点：在选中目标内部点击前景点"}
+              </span>
+              <button
+                type="button"
+                className="rounded-md border border-white/20 px-2 py-1 font-medium transition-[background-color,border-color] duration-150 hover:border-white/35 hover:bg-white/10 active:bg-white/15 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-white motion-reduce:transition-none"
+                onClick={() => setMode("select")}
+              >
+                Esc 退出
+              </button>
+            </div>
+          </div>
+        ) : null}
+
+        {onNavigateSegment ? (
+          <div
+            className={cn(
+              "absolute inset-x-0 bottom-3 z-40 flex justify-center px-3 transition-[opacity,transform] duration-180 motion-reduce:transition-none sm:bottom-4",
+              focusMode && "pointer-events-none translate-y-2 opacity-20",
+            )}
+            aria-hidden={focusMode ? "true" : undefined}
+            inert={focusMode ? true : undefined}
+          >
+            <SegmentRuler
+              segments={clipSegments}
+              currentSegmentRef={segment.segment_ref}
+              disabled={focusMode || submitting}
+              onNavigate={onNavigateSegment}
+            />
+          </div>
+        ) : null}
       </div>
 
       <aside
         data-testid="annotation-inspector-region"
-        className="flex min-h-136 w-full shrink-0 flex-col border-t border-console-line bg-console-panel lg:min-h-0 lg:w-88 lg:border-l lg:border-t-0"
+        data-layout="overlay"
+        data-collapsed={inspectorCollapsed ? "true" : "false"}
+        className={cn(
+          "annotation-inspector-panel absolute z-50 flex min-h-0 flex-col overflow-hidden rounded-[14px] border border-[#dfe4ed] bg-white/96 shadow-[0_14px_36px_rgba(25,36,62,0.14)] backdrop-blur-md transition-[width,max-height,opacity,transform] duration-150 ease-out motion-reduce:transition-none",
+          focusMode && "pointer-events-none translate-x-3 opacity-20",
+        )}
         aria-label="目标属性检查器"
+        inert={focusMode ? true : undefined}
       >
-        <div className="flex min-h-14 items-center justify-between gap-3 border-b border-console-line px-4 py-2">
+        <span className="sr-only">
+          Segment {String(clipSegmentOrdinal).padStart(2, "0")} / {clipSegmentCount}
+        </span>
+        <div className={cn(
+          "flex min-h-13 shrink-0 items-center justify-between gap-2 border-b border-console-line px-3.5 py-2.5",
+          inspectorCollapsed && "justify-center border-b-0 px-2.5 max-[900px]:justify-between max-[900px]:border-b max-[900px]:px-3.5",
+        )}>
           <div className="flex items-center justify-between gap-3">
-            <div>
+            <div className={cn(inspectorCollapsed && "min-[901px]:hidden")}>
               <h2 className="text-sm font-semibold text-console-text">目标属性</h2>
-              <p className="mt-0.5 text-[11px] text-console-muted">顺序决定 master / otherN</p>
+              {!inspectorCollapsed ? (
+                <p className="mt-0.5 text-[11px] text-console-muted">顺序决定 master / otherN</p>
+              ) : null}
             </div>
           </div>
-          <StatusTag tone={editable ? "info" : "neutral"}>{editable ? "编辑中" : "只读"}</StatusTag>
+          <div className="flex items-center gap-2">
+            {!inspectorCollapsed ? (
+              <StatusTag tone={editable ? "info" : "neutral"}>{editable ? "编辑中" : "只读"}</StatusTag>
+            ) : null}
+            <button
+              type="button"
+              aria-label={inspectorCollapsed ? "展开目标属性" : "收起目标属性"}
+              aria-expanded={!inspectorCollapsed}
+              className="flex size-8 shrink-0 items-center justify-center rounded-lg text-[#667085] transition-[color,background-color] duration-150 hover:bg-[#f1f3f7] hover:text-[#202938] active:bg-[#e8ebf1] focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-[#3156c8] motion-reduce:transition-none"
+              onClick={() => setInspectorCollapsed((value) => !value)}
+            >
+              {inspectorCollapsed
+                ? <PanelRightOpen className="size-4" aria-hidden="true" />
+                : <PanelRightClose className="size-4" aria-hidden="true" />}
+            </button>
+          </div>
         </div>
 
-        <div className="console-soft-scrollbar min-h-0 flex-1 space-y-2 overflow-y-auto p-3">
+        <div className={cn(
+          "console-soft-scrollbar min-h-0 flex-1 space-y-2 overflow-y-auto p-3",
+          inspectorCollapsed && "hidden",
+        )}>
+          <div className="flex min-h-8 items-center justify-between gap-3 pb-1">
+            <span className="text-xs font-medium text-console-muted">目标列表（{targets.length}）</span>
+            <button
+              type="button"
+              disabled={!canEdit}
+              className="inline-flex h-7 items-center gap-1 rounded-lg border border-console-line bg-white px-2 text-xs font-medium text-console-text transition-[color,background-color,border-color] duration-150 hover:border-[#b8c9ee] hover:bg-[#f5f8ff] hover:text-[#3156c8] active:bg-[#eaf0ff] focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-[#3156c8] disabled:cursor-not-allowed disabled:opacity-45 motion-reduce:transition-none"
+              onClick={() => setMode("box")}
+            >
+              <Plus className="size-3.5" aria-hidden="true" />
+              添加目标
+            </button>
+          </div>
           {targets.length === 0 && (
             <div className="border border-dashed border-console-line bg-console-panel2/40 p-5 text-center text-sm text-console-muted">
               点击“框选目标”，在首帧上拖出 master 框。
@@ -935,8 +1077,8 @@ export function InitialAnnotationWorkbench({
               <div
                 key={target.target_ref}
                 className={cn(
-                  "border bg-console-panel",
-                  isSelected ? "border-console-cyan shadow-[inset_3px_0_0_#2d6cdf]" : "border-console-line",
+                  "overflow-hidden rounded-xl border bg-console-panel transition-[border-color,box-shadow] duration-150 motion-reduce:transition-none",
+                  isSelected ? "border-[#2d6cdf] shadow-[0_0_0_1px_rgba(45,108,223,0.12)]" : "border-console-line",
                 )}
               >
                 <button
@@ -968,7 +1110,7 @@ export function InitialAnnotationWorkbench({
                             value={target.bbox?.[fieldIndex] ?? ""}
                             disabled={!canEdit || !target.bbox}
                             min={0}
-                            className="h-8 w-full rounded-sm border border-console-line bg-white px-2 text-xs text-console-text focus:border-console-cyan focus:outline-hidden"
+                            className="h-8 w-full rounded-lg border border-console-line bg-white px-2 text-xs text-console-text focus-visible:border-console-cyan focus-visible:outline-2 focus-visible:outline-offset-1 focus-visible:outline-[#3156c8]"
                             onChange={(event) => {
                               if (!target.bbox || !firstFrame) return;
                               const next = [...target.bbox] as [number, number, number, number];
@@ -999,7 +1141,7 @@ export function InitialAnnotationWorkbench({
                             value={target.point?.[pointIndex] ?? ""}
                             disabled={!canEdit}
                             min={0}
-                            className="h-8 w-full rounded-sm border border-console-line bg-white px-2 text-xs text-console-text focus:border-console-cyan focus:outline-hidden"
+                            className="h-8 w-full rounded-lg border border-console-line bg-white px-2 text-xs text-console-text focus-visible:border-console-cyan focus-visible:outline-2 focus-visible:outline-offset-1 focus-visible:outline-[#3156c8]"
                             onChange={(event) => {
                               if (!firstFrame) return;
                               const next: [number, number] = target.point ? [...target.point] : [0, 0];
@@ -1032,7 +1174,7 @@ export function InitialAnnotationWorkbench({
                               aria-label={`${index === 0 ? "master" : `other${index}`} ${label}`}
                               value={target.colors[field] ?? ""}
                               disabled={!canEdit}
-                              className="h-9 w-full rounded-sm border border-console-line bg-white px-2 text-sm text-console-text focus:border-console-cyan focus:outline-hidden"
+                              className="h-9 w-full rounded-lg border border-console-line bg-white px-2 text-sm text-console-text focus-visible:border-console-cyan focus-visible:outline-2 focus-visible:outline-offset-1 focus-visible:outline-[#3156c8]"
                               onChange={(event) => updateTarget(target.target_ref, (current) => ({
                                 ...current,
                                 colors: {
@@ -1100,7 +1242,10 @@ export function InitialAnnotationWorkbench({
           })}
         </div>
 
-        <div className="space-y-3 border-t border-console-line bg-console-panel px-3 py-3">
+        <div className={cn(
+          "space-y-3 border-t border-console-line bg-console-panel px-3 py-3",
+          inspectorCollapsed && "hidden",
+        )}>
           {conflict && (
             <div role="alert" className="border border-amber-200 bg-amber-50 p-3">
               <p className="text-xs font-medium text-amber-800">检测到并发修改</p>

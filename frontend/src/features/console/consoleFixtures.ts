@@ -31,17 +31,46 @@ export type ModelVersion = {
 };
 
 export const dashboardMetrics = [
-  { id: "total-data", label: "总数据量", value: "248K", delta: "+12.4%", detail: "今日新增 12,847 条" },
-  { id: "annotated-data", label: "已标注数据", value: "186K", delta: "75%", detail: "自动标注覆盖率 84%" },
-  { id: "pending-batches", label: "待解锁批次", value: "23", delta: "7 批次待审核", detail: "质量阈值 >= 0.85" },
-  { id: "model-versions", label: "模型版本", value: "v47", delta: "训练中", detail: "Epoch 18/24" },
+  { id: "total-data", label: "总数据量", value: "0 秒", detail: "暂无导航数据" },
+  { id: "annotated-data", label: "已标注数据", value: "856", detail: "自动标注覆盖率 75%" },
+  { id: "pending-batches", label: "待解锁批次", value: "23", detail: "7 批次待审核" },
+  { id: "verified-models", label: "已验证模型", value: "6", detail: "最近验证 v46" },
 ];
 
 export const dataDistribution = [
-  { label: "图像数据", value: 42, color: "#2d6cdf" },
-  { label: "点云数据", value: 28, color: "#16845b" },
-  { label: "文本指令", value: 18, color: "#b7791f" },
-  { label: "多模态数据", value: 12, color: "#6d5bd0" },
+  { label: "图像数据", value: 42, color: "#274BC8" },
+  { label: "点云数据", value: 28, color: "#536FD7" },
+  { label: "文本指令", value: 18, color: "#7C8FE3" },
+  { label: "多模态数据", value: 12, color: "#A7B3ED" },
+];
+
+export const dashboardModelEpochs = [
+  { epoch: 1, successRate: 43, loss: 0.92 },
+  { epoch: 2, successRate: 48, loss: 0.84 },
+  { epoch: 4, successRate: 52, loss: 0.64 },
+  { epoch: 6, successRate: 62, loss: 0.48 },
+  { epoch: 8, successRate: 68, loss: 0.39 },
+  { epoch: 10, successRate: 69, loss: 0.34 },
+  { epoch: 12, successRate: 77, loss: 0.26 },
+  { epoch: 14, successRate: 84, loss: 0.22 },
+  { epoch: 16, successRate: 89, loss: 0.18 },
+  { epoch: 18, successRate: 94.8, loss: 0.16 },
+  { epoch: 20, successRate: 93.8, loss: 0.17 },
+  { epoch: 22, successRate: 91.5, loss: 0.15 },
+  { epoch: 24, successRate: 95.2, loss: 0.16 },
+];
+
+export const dashboardRecentEvents = [
+  { id: "event-1", time: "3 分钟前", event: "自动标注流水线完成 2,840 条数据", target: "B-2026-017", status: "已完成", tone: "success" as const },
+  { id: "event-2", time: "15 分钟前", event: "人工复核通过", target: "B-2026-015", status: "已验证", tone: "success" as const },
+  { id: "event-3", time: "32 分钟前", event: "v47 训练至 Epoch 18/24", target: "VLA v47", status: "训练中", tone: "info" as const },
+  { id: "event-4", time: "1 小时前", event: "标注质量低于阈值", target: "B-2026-007", status: "需关注", tone: "danger" as const },
+];
+
+export const dashboardAttentionItems = [
+  { id: "attention-1", title: "38 条待首帧标注", detail: "批次 B-2026-017", tone: "warning" as const, path: "/annotation/jobs" },
+  { id: "attention-2", title: "12 条异常片段", detail: "批次 B-2026-016", tone: "danger" as const, path: "/data" },
+  { id: "attention-3", title: "v47 测试待批复", detail: "迭代 18/24", tone: "info" as const, path: "/simulation" },
 ];
 
 export const modelCurveSuccess = {
