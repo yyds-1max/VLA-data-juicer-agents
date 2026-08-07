@@ -24,10 +24,18 @@ const readonlyCapabilities: TrainingCapabilities = {
 const adminCapabilities: TrainingCapabilities = { ...readonlyCapabilities, authentication_mode: "development_admin", permissions: ["training:view", "training:manage_models", "training:create_runs", "training:stop_runs"] };
 const server: TrainingServer = { server_ref: "fake-local", name: "Fake A100 Server", kind: "simulation", gpu_count: 8 };
 const resources: TrainingServerResources = { server, sampled_at: "2026-08-06T00:00:00Z", gpus: [{ gpu_uuid: "GPU-0", index: 0, name: "A100", total_memory_mib: 81920, used_memory_mib: 1024, utilization_percent: 2, temperature_c: 45, externally_occupied: false }] };
+const secondaryServer: TrainingServer = { server_ref: "fake-west", name: "Fake L40S Server", kind: "simulation", gpu_count: 4 };
+const secondaryResources: TrainingServerResources = { server: secondaryServer, sampled_at: "2026-08-06T00:01:00Z", gpus: [{ gpu_uuid: "GPU-WEST-1", index: 1, name: "L40S", total_memory_mib: 49152, used_memory_mib: 12288, utilization_percent: 38, temperature_c: 52, externally_occupied: false }] };
 const launchTemplate = { domain: "vla", server_ref: "fake-local", working_directory: "/workspace/project", executable: "python", entrypoint: "train.py", fixed_argv: ["--deepspeed", "configs/zero3.json"], output_root: "/workspace/outputs", output_flag: "--output_dir" };
 const model: TrainingModel = { model_ref: "navila", name: "NaVILA", description: "draft model", status: "draft", latest_revision: 1, created_at: "2026-08-06T00:00:00Z", updated_at: "2026-08-06T00:00:00Z", revision: { revision: 1, created_at: "2026-08-06T00:00:00Z", fixed_argv: launchTemplate.fixed_argv, launch_template: launchTemplate, parameter_definitions: [{ key: "num_video_frames", label: "视频帧数", type: "integer", default: 4, minimum: 1, maximum: 64, editable: true, description: "控制每个训练样本使用的视频帧数。" }] } };
 const runningRun: TrainingRun = { run_ref: "run-running", model_ref: "navila", model_name: "NaVILA Running", model_revision: 1, status: "running", state_revision: 3, server_ref: "fake-local", gpu_uuids: ["GPU-0"], progress_percent: 40, current_step: 8, total_steps: 20, current_epoch: 1, total_epochs: 3, created_at: "2026-08-06T00:00:00Z", parameters: { num_video_frames: 8, learning_rate: 0.0001 }, audit_events: [{ created_at: "2026-08-06T00:01:00Z", action: "run.started", summary: "模拟训练已启动" }] };
 const succeededRun: TrainingRun = { ...runningRun, run_ref: "run-succeeded", model_name: "NaVILA Succeeded", status: "succeeded", state_revision: 5, progress_percent: 100, current_step: 20 };
+
+class TestResizeObserver {
+  observe() {}
+  unobserve() {}
+  disconnect() {}
+}
 
 function renderPlatform(path = "/model") {
   function LocationProbe() { return <span data-testid="location-path">{useLocation().pathname}</span>; }
@@ -43,7 +51,7 @@ function mockApi(capabilities = readonlyCapabilities, models: TrainingModel[] = 
 }
 
 describe("TrainingPlatform", () => {
-  beforeEach(() => { vi.clearAllMocks(); mockApi(); });
+  beforeEach(() => { vi.clearAllMocks(); vi.stubGlobal("ResizeObserver", TestResizeObserver); mockApi(); });
   afterEach(() => { vi.useRealTimers(); vi.unstubAllGlobals(); });
 
   it("shows a real-execution disabled notice and keeps write flows disabled for a read-only principal", async () => {
@@ -161,17 +169,18 @@ describe("TrainingPlatform", () => {
     fireEvent.click(screen.getByRole("tab", { name: "新建训练" }));
     fireEvent.click(await screen.findByLabelText("选择 GPU 0"));
     const frames = screen.getByLabelText("视频帧数");
-    const parameterCard = frames.closest("label");
+    const parameterCard = frames.closest<HTMLElement>('[data-parameter-field="num_video_frames"]');
     expect(parameterCard).not.toBeNull();
     expect(within(parameterCard!).getByText("num_video_frames")).toBeVisible();
     expect(within(parameterCard!).queryByText("--num_video_frames")).not.toBeInTheDocument();
     const parameterHelp = within(parameterCard!).getByLabelText("视频帧数 参数说明");
-    const parameterTooltip = within(parameterCard!).getByRole("tooltip");
-    expect(parameterCard).not.toHaveClass("group");
-    expect(parameterHelp).toHaveClass("group/help");
-    expect(parameterHelp).toHaveAttribute("aria-describedby", "training-parameter-help-num_video_frames");
-    expect(parameterTooltip).toHaveClass("group-hover/help:visible", "group-focus-within/help:visible");
+    fireEvent.focus(parameterHelp);
+    const parameterTooltip = await screen.findByRole("tooltip");
+    expect(parameterHelp).toHaveAttribute("data-state", "instant-open");
+    expect(parameterTooltip).toHaveAttribute("data-side");
     expect(parameterTooltip).toHaveTextContent("控制每个训练样本使用的视频帧数");
+    fireEvent.keyDown(parameterHelp, { key: "Escape" });
+    await waitFor(() => expect(screen.queryByRole("tooltip")).not.toBeInTheDocument());
     fireEvent.change(frames, { target: { value: "8" } });
     expect(screen.getByRole("button", { name: "启动模拟训练" })).toBeDisabled();
     fireEvent.click(screen.getByRole("button", { name: "生成预览" }));
@@ -232,12 +241,12 @@ describe("TrainingPlatform", () => {
     expect(learningRate).toBeVisible();
     expect(learningRate).toBeDisabled();
     expect(learningRate).toHaveClass("disabled:cursor-not-allowed");
-    expect(learningRate.closest("label")).toHaveClass("opacity-50");
+    expect(learningRate.closest('[data-parameter-field="learning_rate"]')).toHaveClass("opacity-50");
     expect(learningRate).toHaveAttribute("aria-describedby", "training-parameter-condition-learning_rate");
     expect(screen.getByText("仅当「启用 BF16」等于 True 时，「学习率」才可设置。")).toBeVisible();
     fireEvent.click(screen.getByLabelText("启用 BF16"));
     expect(learningRate).toBeEnabled();
-    expect(learningRate.closest("label")).not.toHaveClass("opacity-50");
+    expect(learningRate.closest('[data-parameter-field="learning_rate"]')).not.toHaveClass("opacity-50");
     fireEvent.change(screen.getByLabelText("学习率"), { target: { value: "0.00002" } });
     fireEvent.click(screen.getByRole("button", { name: "生成预览" }));
     await waitFor(() => expect(trainingApi.previewTrainingRun).toHaveBeenCalledWith(expect.objectContaining({ parameters: { bf16: true, learning_rate: 0.00002 } })));
@@ -311,7 +320,7 @@ describe("TrainingPlatform", () => {
     fireEvent.change(screen.getByLabelText("保存策略"), { target: { value: "epoch" } });
     expect(screen.getByLabelText("保存 step 间隔")).toBeVisible();
     expect(screen.getByLabelText("保存 step 间隔")).toBeDisabled();
-    expect(screen.getByLabelText("保存 step 间隔").closest("label")).toHaveClass("opacity-50");
+    expect(screen.getByLabelText("保存 step 间隔").closest('[data-parameter-field="save_steps"]')).toHaveClass("opacity-50");
     fireEvent.change(screen.getByLabelText("保存策略"), { target: { value: "steps" } });
     expect(screen.getByLabelText("保存 step 间隔")).toBeEnabled();
     expect(screen.getByLabelText("权重衰减")).not.toBeVisible();
@@ -337,6 +346,56 @@ describe("TrainingPlatform", () => {
     fireEvent.change(screen.getByLabelText("状态筛选"), { target: { value: "succeeded" } });
     expect(screen.queryByText("NaVILA Running")).not.toBeInTheDocument();
     expect(screen.getByText("NaVILA Succeeded")).toBeVisible();
+  });
+
+  it("presents training runs as a searchable operations table", async () => {
+    mockApi(readonlyCapabilities);
+    vi.mocked(trainingApi.listTrainingRuns).mockResolvedValue([runningRun, succeededRun]);
+    renderPlatform();
+
+    expect(await screen.findByRole("table")).toBeVisible();
+    expect(screen.getByRole("columnheader", { name: "任务 / 模型" })).toBeVisible();
+    expect(screen.getByRole("columnheader", { name: "训练进度" })).toBeVisible();
+    expect(screen.getByRole("region", { name: "训练概览" })).toBeVisible();
+
+    fireEvent.change(screen.getByLabelText("搜索训练任务"), { target: { value: "succeeded" } });
+    expect(screen.queryByText("NaVILA Running")).not.toBeInTheDocument();
+    expect(screen.getByText("NaVILA Succeeded")).toBeVisible();
+  });
+
+  it("switches between independently loaded server resource cards", async () => {
+    mockApi(readonlyCapabilities);
+    vi.mocked(trainingApi.listTrainingServers).mockResolvedValue([server, secondaryServer]);
+    vi.mocked(trainingApi.getTrainingServerResources).mockImplementation(async (serverRef) => serverRef === secondaryServer.server_ref ? secondaryResources : resources);
+    renderPlatform();
+    fireEvent.click(await screen.findByRole("tab", { name: "服务器资源" }));
+
+    expect(await screen.findByRole("heading", { name: "服务器资源" })).toBeVisible();
+    expect(screen.getByRole("group", { name: "选择训练服务器" })).toBeVisible();
+    const primaryGpuRegion = screen.getByRole("region", { name: "Fake A100 Server GPU 资源" });
+    expect(within(primaryGpuRegion).getByText("GPU 0")).toBeVisible();
+    expect(within(primaryGpuRegion).getByText("A100 · 45°C")).toBeVisible();
+
+    fireEvent.click(screen.getByRole("button", { name: /Fake L40S Server/ }));
+    const secondaryGpuRegion = screen.getByRole("region", { name: "Fake L40S Server GPU 资源" });
+    expect(within(secondaryGpuRegion).getByText("GPU 1")).toBeVisible();
+    expect(within(secondaryGpuRegion).getByText("L40S · 52°C")).toBeVisible();
+    expect(within(secondaryGpuRegion).queryByText("GPU 0")).not.toBeInTheDocument();
+    expect(trainingApi.getTrainingServerResources).toHaveBeenCalledWith("fake-local");
+    expect(trainingApi.getTrainingServerResources).toHaveBeenCalledWith("fake-west");
+  });
+
+  it("scopes selectable GPUs to the server chosen for a new run", async () => {
+    mockApi(adminCapabilities, [model]);
+    vi.mocked(trainingApi.listTrainingServers).mockResolvedValue([server, secondaryServer]);
+    vi.mocked(trainingApi.getTrainingServerResources).mockImplementation(async (serverRef) => serverRef === secondaryServer.server_ref ? secondaryResources : resources);
+    renderPlatform();
+    fireEvent.click(await screen.findByRole("tab", { name: "新建训练" }));
+
+    expect(screen.getByRole("checkbox", { name: "选择 GPU 0" })).toBeVisible();
+    fireEvent.change(screen.getByLabelText("服务器"), { target: { value: secondaryServer.server_ref } });
+    expect(screen.getByRole("checkbox", { name: "选择 GPU 1" })).toBeVisible();
+    expect(screen.queryByRole("checkbox", { name: "选择 GPU 0" })).not.toBeInTheDocument();
   });
 
   it("hides stop without training:stop_runs and shows run snapshots, GPU metrics and audit summary", async () => {
@@ -365,6 +424,28 @@ describe("TrainingPlatform", () => {
     expect(await screen.findByText("任务 run-running · 模型 revision 1")).toBeVisible();
     fireEvent.click(screen.getByRole("button", { name: "返回任务列表" }));
     await waitFor(() => expect(screen.getByLabelText("状态筛选")).toBeVisible());
+    expect(screen.getByTestId("location-path")).toHaveTextContent("/model");
+  });
+
+  it("leaves the run detail route when switching tabs and does not reopen it after polling", async () => {
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+    mockApi(adminCapabilities, [model]);
+    vi.mocked(trainingApi.listTrainingRuns).mockImplementation(async () => [structuredClone(runningRun)]);
+    vi.mocked(trainingApi.getTrainingRun).mockResolvedValue(runningRun);
+    vi.mocked(trainingApi.getTrainingRunLogs).mockResolvedValue([]);
+    vi.mocked(trainingApi.getTrainingRunMetrics).mockResolvedValue([]);
+
+    renderPlatform("/model/runs/run-running");
+    expect(await screen.findByText("任务 run-running · 模型 revision 1")).toBeVisible();
+    fireEvent.click(screen.getByRole("tab", { name: "模型注册" }));
+
+    expect(screen.getByRole("tab", { name: "模型注册" })).toHaveAttribute("aria-selected", "true");
+    expect(screen.getByTestId("location-path")).toHaveTextContent("/model");
+    expect(screen.queryByText("任务 run-running · 模型 revision 1")).not.toBeInTheDocument();
+
+    await act(async () => { await vi.advanceTimersByTimeAsync(2100); });
+
+    expect(screen.getByRole("tab", { name: "模型注册" })).toHaveAttribute("aria-selected", "true");
     expect(screen.getByTestId("location-path")).toHaveTextContent("/model");
   });
 
