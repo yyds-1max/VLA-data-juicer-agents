@@ -9,6 +9,17 @@ import type {
   SessionEntrypoint,
   SessionRecord,
   SessionRequestContext,
+  TrainingCapabilities,
+  TrainingEvent,
+  TrainingModel,
+  TrainingRun,
+  TrainingRunLog,
+  TrainingRunPreview,
+  TrainingServer,
+  TrainingServerResources,
+  TrainingMetricSample,
+  TrainingParameterDefinition,
+  TrainingLaunchTemplate,
 } from "./types";
 
 function sessionPath(sessionId: string): string {
@@ -165,4 +176,103 @@ export function getSyncImageUrl(
   filename: string,
 ): string {
   return `${navigationClipPath(date, clip)}/sync-images/${encodeURIComponent(sequence)}/${encodeURIComponent(filename)}`;
+}
+
+const trainingPath = "/api/training";
+const requestIdempotencyKey = () => globalThis.crypto?.randomUUID?.() ?? `${Date.now()}-${Math.random()}`;
+
+export async function getTrainingCapabilities(): Promise<TrainingCapabilities> {
+  return requestJson<TrainingCapabilities>(`${trainingPath}/capabilities`);
+}
+
+export async function listTrainingServers(): Promise<TrainingServer[]> {
+  const data = await requestJson<{ servers: TrainingServer[] }>(`${trainingPath}/servers`);
+  return data.servers;
+}
+
+export async function getTrainingServerResources(serverRef: string): Promise<TrainingServerResources> {
+  return requestJson<TrainingServerResources>(`${trainingPath}/servers/${encodeURIComponent(serverRef)}/resources`);
+}
+
+export async function listTrainingModels(): Promise<TrainingModel[]> {
+  const data = await requestJson<{ models: TrainingModel[] }>(`${trainingPath}/models`);
+  return data.models;
+}
+
+export async function getTrainingModel(modelRef: string): Promise<TrainingModel> {
+  const data = await requestJson<{ model: TrainingModel }>(`${trainingPath}/models/${encodeURIComponent(modelRef)}`);
+  return data.model;
+}
+
+export type TrainingModelDraftInput = {
+  name: string;
+  description?: string;
+  parameter_definitions: TrainingParameterDefinition[];
+  launch_template: TrainingLaunchTemplate;
+};
+
+export async function createTrainingModel(payload: TrainingModelDraftInput): Promise<TrainingModel> {
+  const data = await requestJson<{ model: TrainingModel }>(`${trainingPath}/models`, { method: "POST", body: JSON.stringify(payload) });
+  return data.model;
+}
+
+export async function updateTrainingModel(modelRef: string, payload: { expected_revision: number; name?: string; description?: string; parameter_definitions: TrainingParameterDefinition[]; launch_template: TrainingLaunchTemplate }): Promise<TrainingModel> {
+  const data = await requestJson<{ model: TrainingModel }>(`${trainingPath}/models/${encodeURIComponent(modelRef)}`, { method: "PUT", body: JSON.stringify(payload) });
+  return data.model;
+}
+
+type TrainingRunRequest = { model_ref: string; model_revision?: number; server_ref: string; gpu_uuids: string[]; parameters: Record<string, string | number | boolean>; execution_mode: "simulation" };
+
+export async function previewTrainingRun(payload: TrainingRunRequest): Promise<TrainingRunPreview> {
+  return requestJson<TrainingRunPreview>(`${trainingPath}/runs/preview`, { method: "POST", body: JSON.stringify(payload) });
+}
+
+export async function createTrainingRun(payload: TrainingRunRequest): Promise<TrainingRun> {
+  const data = await requestJson<{ run: TrainingRun }>(`${trainingPath}/runs`, { method: "POST", headers: { "Idempotency-Key": requestIdempotencyKey() }, body: JSON.stringify(payload) });
+  return data.run;
+}
+
+export async function listTrainingRuns(): Promise<TrainingRun[]> {
+  const data = await requestJson<{ runs: TrainingRun[] }>(`${trainingPath}/runs`);
+  return data.runs;
+}
+
+export async function getTrainingRun(runRef: string): Promise<TrainingRun> {
+  const data = await requestJson<{ run: TrainingRun }>(`${trainingPath}/runs/${encodeURIComponent(runRef)}`);
+  return data.run;
+}
+
+export async function stopTrainingRun(runRef: string, expectedRevision: number): Promise<TrainingRun> {
+  const data = await requestJson<{ run: TrainingRun }>(`${trainingPath}/runs/${encodeURIComponent(runRef)}/stop`, { method: "POST", headers: { "Idempotency-Key": requestIdempotencyKey() }, body: JSON.stringify({ expected_revision: expectedRevision }) });
+  return data.run;
+}
+
+export async function getTrainingRunLogs(runRef: string, afterSeq = 0): Promise<TrainingRunLog[]> {
+  const data = await requestJson<{ logs: TrainingRunLog[] }>(`${trainingPath}/runs/${encodeURIComponent(runRef)}/logs?after_seq=${afterSeq}`);
+  return data.logs;
+}
+
+export async function getTrainingRunMetrics(runRef: string, afterSeq = 0): Promise<TrainingMetricSample[]> {
+  const data = await requestJson<{ metrics: TrainingMetricSample[] }>(`${trainingPath}/runs/${encodeURIComponent(runRef)}/metrics?after_seq=${afterSeq}`);
+  return data.metrics;
+}
+
+export function openTrainingEvents(
+  onEvent: (event: TrainingEvent) => void,
+  afterSeq = 0,
+  onError?: () => void,
+): EventSource {
+  const source = new EventSource(`${trainingPath}/events?after_seq=${afterSeq}`);
+  const handleEvent = (message: MessageEvent<string>) => {
+    try {
+      onEvent(JSON.parse(message.data) as TrainingEvent);
+    } catch (error) {
+      console.error("Failed to parse training event", error);
+    }
+  };
+  for (const eventName of ["run.updated", "run.log.appended", "run.metric.appended"]) {
+    source.addEventListener(eventName, handleEvent as EventListener);
+  }
+  if (onError) source.addEventListener("error", onError);
+  return source;
 }

@@ -183,7 +183,7 @@ export function AppShell({ children }: AppShellProps) {
               <Route path="reviews" element={<AnnotationReviewsPage />} />
               <Route path="reviews/:reviewRef" element={<TrajectoryFixPage />} />
             </Route>
-            <Route path="/model" element={<ModelIterationPage onPlaceholderAction={showPlaceholderToast} />} />
+            <Route path="/model/*" element={<ModelIterationPage onPlaceholderAction={showPlaceholderToast} />} />
             <Route path="/simulation" element={<SimulationPage onPlaceholderAction={showPlaceholderToast} />} />
             <Route path="*" element={<Navigate to="/" replace />} />
           </Routes>

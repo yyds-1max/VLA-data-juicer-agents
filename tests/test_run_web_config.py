@@ -80,6 +80,8 @@ def test_fixed_config_loads_allowlisted_string_values(
             "WORKING_DIR": "/srv/datapilot/state",
             "VLA_FRONTEND_NODE_BIN_DIR": "/srv/node/bin",
             "VLA_ANNOTATION_RUNTIME_TIMEOUT_SECONDS": "21600",
+            "VLA_TRAINING_DEV_ADMIN": "0",
+            "VLA_TRAINING_SIMULATION_ENABLED": "1",
         },
     )
     monkeypatch.setenv("HOME", str(home))
@@ -88,6 +90,8 @@ def test_fixed_config_loads_allowlisted_string_values(
         "WORKING_DIR": "/srv/datapilot/state",
         "VLA_FRONTEND_NODE_BIN_DIR": "/srv/node/bin",
         "VLA_ANNOTATION_RUNTIME_TIMEOUT_SECONDS": "21600",
+        "VLA_TRAINING_DEV_ADMIN": "0",
+        "VLA_TRAINING_SIMULATION_ENABLED": "1",
     }
 
 

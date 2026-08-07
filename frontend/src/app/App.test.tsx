@@ -4,6 +4,11 @@ import { act, fireEvent, render, screen, waitFor, within } from "@testing-librar
 import {
   createSession,
   getNavigationDatasetSummary,
+  getTrainingCapabilities,
+  getTrainingServerResources,
+  listTrainingModels,
+  listTrainingRuns,
+  listTrainingServers,
   getSession,
   getSyncImages,
   getSyncImageUrl,
@@ -12,7 +17,7 @@ import {
   openSessionEvents,
   submitTurn,
 } from "../api/client";
-import type { NavigationDatasetSummary, SessionDetail } from "../api/types";
+import type { NavigationDatasetSummary, SessionDetail, TrainingCapabilities, TrainingServer, TrainingServerResources } from "../api/types";
 import { Composer } from "../components/datapilot/Composer";
 import { MessageList } from "../components/datapilot/MessageList";
 import { writeSessionRecovery } from "../components/datapilot/sessionRecovery";
@@ -24,6 +29,11 @@ import { App } from "./App";
 vi.mock("../api/client", () => ({
   createSession: vi.fn(),
   getNavigationDatasetSummary: vi.fn(),
+  getTrainingCapabilities: vi.fn(),
+  getTrainingServerResources: vi.fn(),
+  listTrainingModels: vi.fn(),
+  listTrainingRuns: vi.fn(),
+  listTrainingServers: vi.fn(),
   getSyncImages: vi.fn(),
   getSyncImageUrl: vi.fn(),
   listSessions: vi.fn(),
@@ -36,6 +46,11 @@ vi.mock("../api/client", () => ({
 const apiMocks = vi.mocked({
   createSession,
   getNavigationDatasetSummary,
+  getTrainingCapabilities,
+  getTrainingServerResources,
+  listTrainingModels,
+  listTrainingRuns,
+  listTrainingServers,
   getSyncImages,
   getSyncImageUrl,
   listSessions,
@@ -210,6 +225,29 @@ beforeEach(() => {
   apiMocks.interruptTurn.mockResolvedValue(true);
   apiMocks.openSessionEvents.mockReturnValue(activeSocket());
   apiMocks.getNavigationDatasetSummary.mockResolvedValue(navigationDatasetSummaryFixture());
+  const trainingCapabilities: TrainingCapabilities = {
+    permissions: ["training:view"],
+    authentication_mode: "read_only",
+    simulation_enabled: true,
+    real_execution_enabled: false,
+    real_execution_disabled_reason: "真实训练未配置",
+  };
+  const trainingServer: TrainingServer = {
+    server_ref: "fake-local",
+    name: "Fake A100 Server",
+    kind: "simulation",
+    gpu_count: 8,
+  };
+  const trainingResources: TrainingServerResources = {
+    server: trainingServer,
+    sampled_at: "2026-08-06T00:00:00Z",
+    gpus: [],
+  };
+  apiMocks.getTrainingCapabilities.mockResolvedValue(trainingCapabilities);
+  apiMocks.listTrainingModels.mockResolvedValue([]);
+  apiMocks.listTrainingRuns.mockResolvedValue([]);
+  apiMocks.listTrainingServers.mockResolvedValue([trainingServer]);
+  apiMocks.getTrainingServerResources.mockResolvedValue(trainingResources);
   apiMocks.getSyncImages.mockResolvedValue({
     date: "20270515",
     clip: "clip_a",
@@ -340,7 +378,7 @@ test("dashboard placeholder controls acknowledge clicks and dashboard links navi
 
   fireEvent.click(screen.getByRole("button", { name: "查看训练详情" }));
   expect(window.location.pathname).toBe("/model");
-  expect(await screen.findByText("当前部署")).toBeVisible();
+  expect(await screen.findByText("真实训练未启用")).toBeVisible();
 });
 
 test("sidebar navigation switches console pages", async () => {
@@ -362,7 +400,7 @@ test("direct page deep links keep the console shell eager while the page loads",
   expect(screen.getByRole("button", { name: "Open DataPilot" })).toBeVisible();
   expect(screen.getByRole("button", { name: "模型训练" })).toHaveAttribute("aria-current", "page");
   expect(window.location.pathname).toBe("/model");
-  expect(await screen.findByText("当前部署")).toBeVisible();
+  expect(await screen.findByText("真实训练未启用")).toBeVisible();
 });
 
 test("desktop sidebar collapse follows navigation and persists across remounts", async () => {
@@ -1025,19 +1063,16 @@ test("annotation shortcut submits a new session despite another session's active
   expect(screen.queryByLabelText("当天处理标定")).not.toBeInTheDocument();
 });
 
-test("model iteration page renders versions training and compare tabs", async () => {
+test("model iteration page renders the simulation-only training platform", async () => {
   await renderAppWithDashboardSettled();
 
   fireEvent.click(screen.getByRole("button", { name: "模型训练" }));
-  expect(await screen.findByText("当前部署")).toBeVisible();
-  expect(screen.getByText("v47")).toBeVisible();
+  expect(await screen.findByText("真实训练未启用")).toBeVisible();
+  expect(screen.getByRole("tab", { name: "训练任务" })).toBeVisible();
+  expect(screen.getByText("还没有训练任务。请从“新建训练”开始模拟运行。")).toBeVisible();
 
-  fireEvent.click(screen.getByRole("tab", { name: "训练监控" }));
-  expect(screen.getByText("训练损失曲线")).toBeVisible();
-  expect(screen.getByText("GPU 监控 (实时)")).toBeVisible();
-
-  fireEvent.click(screen.getByRole("tab", { name: "版本对比" }));
-  expect(screen.getByText("版本性能对比")).toBeVisible();
+  fireEvent.click(screen.getByRole("tab", { name: "服务器资源" }));
+  expect(screen.getByRole("heading", { name: "服务器资源" })).toBeVisible();
 });
 
 test("agent workflow page selects nodes and keeps execute action placeholder-only", async () => {

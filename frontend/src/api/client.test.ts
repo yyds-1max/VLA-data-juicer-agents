@@ -10,6 +10,7 @@ import {
   interruptTurn,
   listSessions,
   openSessionEvents,
+  openTrainingEvents,
   submitInteractionResponse,
   submitTurn,
 } from "./client";
@@ -214,6 +215,31 @@ describe("api client", () => {
     onMessage(new MessageEvent("message", { data: JSON.stringify(event) }));
 
     expect(onEvent).toHaveBeenCalledWith(event);
+  });
+
+  it("opens the training SSE stream and dispatches named events", () => {
+    const listeners = new Map<string, EventListener>();
+    const close = vi.fn();
+    const addEventListener = vi.fn((name: string, listener: EventListener) => listeners.set(name, listener));
+    const EventSourceMock = vi.fn().mockImplementation(() => ({ addEventListener, close }));
+    vi.stubGlobal("EventSource", EventSourceMock);
+    const onEvent = vi.fn();
+
+    const source = openTrainingEvents(onEvent, 7);
+
+    expect(EventSourceMock).toHaveBeenCalledWith("/api/training/events?after_seq=7");
+    expect([...listeners.keys()]).toEqual([
+      "run.updated",
+      "run.log.appended",
+      "run.metric.appended",
+    ]);
+    const event = { event_id: 8, type: "run.updated", run_ref: "run-1" } as const;
+    listeners.get("run.updated")?.(
+      new MessageEvent("run.updated", { data: JSON.stringify(event) }),
+    );
+    expect(onEvent).toHaveBeenCalledWith(event);
+    source.close();
+    expect(close).toHaveBeenCalledOnce();
   });
 
   it("gets the navigation dataset summary", async () => {

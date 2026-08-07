@@ -72,6 +72,14 @@ Environment:
   VLA_FRONTEND_NODE_BIN_DIR
                         Optional directory containing the required Node.js and npm binaries.
                         It is prepended to PATH only for the frontend build.
+  VLA_TRAINING_DEV_ADMIN
+                        Set to 1 only for local simulation write access. Default: 0.
+  VLA_TRAINING_SIMULATION_ENABLED
+                        Enable the Fake Runner simulation API. Default: 1.
+  VLA_TRAINING_FAKE_TICK_SECONDS
+                        Delay between simulated training metrics. Default: 0.25.
+  VLA_TRAINING_DB_PATH
+                        Optional absolute training SQLite path. Default: WORKING_DIR/training.sqlite.
   WEB_CMD               Override vla-data-agent-web command path.
   RUN_WEB_CONTROL_PYTHON
                         Python 3 used for safe PID/control operations.

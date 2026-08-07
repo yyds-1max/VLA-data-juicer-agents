@@ -96,6 +96,11 @@ The conversational Agent requires normal LLM settings such as `DASHSCOPE_API_KEY
 
 ## DataPilot web UI
 
+The model-training page currently provides a local, simulation-only workflow.
+It never connects to a training host or executes the displayed RunSpec. See
+[`docs/training-simulation.md`](docs/training-simulation.md) for the explicit
+development-admin switch and local acceptance flow.
+
 For server use, run the bundled web script from the repository root. It builds the frontend, starts
 the backend with `frontend/dist` mounted, and records a PID/log under `.djx`:
 

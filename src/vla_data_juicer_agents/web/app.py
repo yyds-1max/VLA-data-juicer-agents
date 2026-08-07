@@ -37,6 +37,12 @@ from vla_data_juicer_agents.navigation.dataset_catalog import (
     scan_navigation_dataset,
     scan_navigation_date,
 )
+from vla_data_juicer_agents.training.api import create_training_router
+from vla_data_juicer_agents.training.auth import TrainingSettings
+from vla_data_juicer_agents.training.resources import FakeResourceProvider
+from vla_data_juicer_agents.training.service import TrainingService
+from vla_data_juicer_agents.training.store import TrainingStore
+from vla_data_juicer_agents.training.worker import TrainingWorker
 from vla_data_juicer_agents.web.event_stream import SessionEventBus
 from vla_data_juicer_agents.web.schemas import (
     CreateSessionResponse,
@@ -69,6 +75,8 @@ def create_app(
     annotation_work_root: str | Path | None = None,
     annotation_clip_data_root: str | Path | None = None,
     annotation_catalog: Any | None = None,
+    training_db_path: str | Path | None = None,
+    training_tick_seconds: float | None = None,
 ) -> FastAPI:
     if agentscope_runtime is None:
         raise RuntimeError(
@@ -91,6 +99,14 @@ def create_app(
         Path(annotation_db_path)
         if annotation_db_path is not None
         else Path(working_dir) / "annotation.sqlite"
+    )
+    training_database_path = (
+        Path(training_db_path)
+        if training_db_path is not None
+        else Path(
+            os.environ.get("VLA_TRAINING_DB_PATH")
+            or Path(working_dir) / "training.sqlite"
+        )
     )
     annotation_maintenance = acquire_annotation_maintenance(
         annotation_database_path,
@@ -119,6 +135,22 @@ def create_app(
             work_root=annotation_work_root,
             clip_data_root=annotation_clip_data_root,
             fix_runtime=CommandLogFixDraftAdapter(),
+        )
+        training_settings = TrainingSettings.from_env()
+        training_store = TrainingStore(training_database_path)
+        training_provider = FakeResourceProvider(training_store)
+        training_service = TrainingService(
+            training_store,
+            training_provider,
+            simulation_enabled=training_settings.simulation_enabled,
+        )
+        training_worker = TrainingWorker(
+            training_store,
+            tick_seconds=(
+                training_tick_seconds
+                if training_tick_seconds is not None
+                else _training_tick_seconds_from_env()
+            ),
         )
         runtime_workspace_root = Path(
             getattr(
@@ -204,6 +236,10 @@ def create_app(
                         annotation_worker.run_forever(),
                         name="annotation-worker",
                     )
+                    training_worker_task = asyncio.create_task(
+                        training_worker.run_forever(),
+                        name="training-simulation-worker",
+                    )
                     annotation_coordinator_task = (
                         asyncio.create_task(
                             annotation_coordinator.run_forever(),
@@ -215,6 +251,9 @@ def create_app(
                     try:
                         yield
                     finally:
+                        await training_worker.stop()
+                        with suppress(asyncio.CancelledError):
+                            await training_worker_task
                         if annotation_coordinator is not None:
                             await annotation_coordinator.stop()
                         if annotation_coordinator_task is not None:
@@ -261,6 +300,11 @@ def create_app(
         app.state.annotation_worker = annotation_worker
         app.state.annotation_gateway = annotation_gateway
         app.state.annotation_workflow_coordinator = annotation_coordinator
+        app.state.training_store = training_store
+        app.state.training_provider = training_provider
+        app.state.training_service = training_service
+        app.state.training_worker = training_worker
+        app.state.training_settings = training_settings
         app.mount(
             agentscope_runtime.config.agentscope_mount_path,
             agentscope_runtime.app,
@@ -269,6 +313,12 @@ def create_app(
         # ``path`` contract (some FastAPI versions add a private include marker).
         app.router.routes.extend(
             create_annotation_router(annotation_service).routes,
+        )
+        app.router.routes.extend(
+            create_training_router(
+                training_service,
+                settings=training_settings,
+            ).routes,
         )
 
         @app.exception_handler(RequestValidationError)
@@ -283,6 +333,16 @@ def create_app(
                         "detail": {
                             "code": "invalid_annotation_request",
                             "message": "The annotation request is invalid.",
+                        }
+                    },
+                )
+            if request.url.path.startswith("/api/training"):
+                return JSONResponse(
+                    status_code=422,
+                    content={
+                        "detail": {
+                            "code": "invalid_training_request",
+                            "message": "The training request is invalid.",
                         }
                     },
                 )
@@ -596,13 +656,18 @@ def create_app(
                         include_in_schema=False,
                     )
                     @app.get("/model", include_in_schema=False)
+                    @app.get(
+                        "/model/runs/{training_run_ref}",
+                        include_in_schema=False,
+                    )
                     @app.get("/simulation", include_in_schema=False)
                     async def frontend_route(
                         job_ref: str | None = None,
                         segment_ref: str | None = None,
                         review_ref: str | None = None,
+                        training_run_ref: str | None = None,
                     ) -> FileResponse:
-                        del job_ref, segment_ref, review_ref
+                        del job_ref, segment_ref, review_ref, training_run_ref
                         return FileResponse(index_path)
 
         return app
@@ -704,3 +769,18 @@ def _raise_navigation_http_error(exc: ValueError | FileNotFoundError) -> None:
         status_code=404,
         detail="The requested navigation dataset resource was not found.",
     ) from exc
+
+
+def _training_tick_seconds_from_env() -> float:
+    raw = os.environ.get("VLA_TRAINING_FAKE_TICK_SECONDS", "0.25")
+    try:
+        value = float(raw)
+    except ValueError as exc:
+        raise RuntimeError(
+            "VLA_TRAINING_FAKE_TICK_SECONDS must be a positive number"
+        ) from exc
+    if value <= 0 or value > 60:
+        raise RuntimeError(
+            "VLA_TRAINING_FAKE_TICK_SECONDS must be between 0 and 60 seconds"
+        )
+    return value
