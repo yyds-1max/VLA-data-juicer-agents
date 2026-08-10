@@ -203,7 +203,7 @@ vla-annotation-operator \
   --annotation-db <annotation.sqlite 的绝对路径> \
   --writer-lock <共享 writer lock 的绝对路径> \
   migrate-schema \
-  --backup-dir <全新私有备份目录>
+  --backup-root <全新私有备份目录>
 
 vla-annotation-operator \
   --annotation-db <annotation.sqlite 的绝对路径> \
