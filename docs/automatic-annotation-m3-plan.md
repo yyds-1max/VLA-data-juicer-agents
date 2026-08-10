@@ -1,6 +1,6 @@
 # 自动标注 M3：数据资产状态整合开发计划
 
-> 状态：本地实现完成，待服务器迁移与验收
+> 状态：本地实现、服务器 schema/API 验收与历史导入 dry-run 已完成；待历史导入 apply 与页面人工验收
 >
 > 基线：`5253d23`
 >
@@ -238,14 +238,9 @@ vla-annotation-operator \
 - Tracking、后处理、Fix Runtime、脚本、参数和数值逻辑；
 - 兼容训练文件发布语义。
 
-服务器未连接，因此以下工作仍是 M3 冻结门禁：
-
-1. 核对服务器 commit、停止服务并备份数据库 sidecars；
-2. 执行 schema v9 停机迁移与 integrity/foreign-key 检查；
-3. 用经过业务确认的历史清单先 dry-run，再决定是否 apply；
-4. 启动服务，核对真实数据管理状态、仪表盘计数、深链和刷新行为；
-5. 检查公开 API、页面和日志投影不泄漏路径、内部 ID 或凭据；
-6. 确认迁移和只读页面验收没有启动 writer，也未改动业务产物。
+服务器冻结门禁中的数据库迁移、API 与历史导入 dry-run 已在 2026-08-10
+完成；详细结果见第 9 节。当前仍需人工确认历史清单后执行 apply，并在浏览器中
+验收数据管理、仪表盘、深链和刷新行为。
 
 本地最终门禁为：Python `1783 passed, 1 warning`；前端
 `389 passed, 8 skipped`；M3 专项 Playwright `2 passed`；production build
@@ -258,4 +253,25 @@ vla-annotation-operator \
 M3 越界重构旧页面。它们应在独立前端质量收口任务中修复后再恢复全套
 Playwright 绿色门禁。
 
-在服务器门禁完成前，本里程碑只标记为“本地实现完成”，不标记为完整冻结。
+在历史导入 apply 与页面人工验收完成前，本里程碑不标记为完整冻结。
+
+## 9. 服务器实施结果（2026-08-10）
+
+- 服务器从干净的 `main@764a426` 切换到
+  `codex/automatic-annotation-m3@5c3cad1`，没有文件覆盖式部署；
+- Web 与 Annotation Worker 停止后，CLI 从 schema v8 迁移到 v9，并在
+  `annotation.sqlite` 同目录创建全新私有备份；备份 manifest SHA-256 为
+  `43aedd4ee19658301cb3a79c4f854746ed9073d3cbf349d5d283e73ddbdbe5c0`；
+- 独立复核结果为 `integrity_check=ok`、foreign-key 违规 `0`、迁移账本连续
+  `1..9`、安全标记为 `schema_version=9/status=verified`；
+- 真实 M2 账本投影 `20270623 / 20260623_145550` 为 6 个内部单元：5 个已验证、
+  1 个已废弃，clip/date 均为“部分完成”；仪表盘聚合为 1 个已标注 clip、
+  6 个已标注单元、5 个已验证单元；
+- Runtime capability、首页、数据管理和标注任务 SPA 路由均可用；摘要、capability
+  和安全 404 响应未发现服务器绝对路径或用户名目录泄漏；
+- 历史候选仅包含真实日期 20260227～20260623，排除 2027 开发测试数据；共
+  669 个 segment、416 个外层 clip，目录深度一致且无重复 segment；
+- 历史导入 dry-run 状态为 `historical_import_validated`，manifest SHA-256 为
+  `e1091de08b7f4bb09e5e66935211e15b30b04d723bd71b32ec1bd7e08828bef7`；
+- 本轮没有执行 `--apply`，`historical_verified_assets` 仍为 0；没有修改、移动或
+  重新生成任何业务产物；服务已恢复运行。
